@@ -1,22 +1,26 @@
 //! ZTSC CLI driver: argument parsing, thread pool, phase orchestration.
 //!
-//! M0 scope: load the given files in parallel (mmap + line tables), intern
-//! their paths, and report timing (`--timing`) and arena/memory statistics
-//! (`--memory`). Parsing and later phases arrive in M1+.
+//! M1 scope: load the given files in parallel (mmap + line tables), then
+//! scan them in parallel into SoA token streams. `--timing` reports per-phase
+//! wall clock (load, scan) and `--memory` reports arena/token statistics.
+//! Parsing and later phases arrive in M2+.
 
 const std = @import("std");
 const Io = std.Io;
 const ztsc = @import("ztsc");
 const Source = ztsc.source.Source;
 const Interner = ztsc.intern.Interner;
+const scanner = ztsc.scanner;
 
 const usage =
     \\usage: ztsc [options] <files...>
     \\
     \\options:
-    \\  --timing   print per-phase wall-clock timings
-    \\  --memory   print arena / memory statistics
-    \\  --version  print version and exit
+    \\  --timing      print per-phase wall-clock timings
+    \\  --memory      print arena / memory statistics
+    \\  --workers=N   number of worker threads (default: CPU count)
+    \\  --repeat=N    scan each file N times (benchmark aid, default 1)
+    \\  --version     print version and exit
     \\
 ;
 
@@ -40,6 +44,8 @@ const Cli = struct {
     timing: bool = false,
     memory: bool = false,
     version: bool = false,
+    workers: ?usize = null,
+    repeat: usize = 1,
     paths: []const []const u8 = &.{},
 };
 
@@ -48,6 +54,8 @@ const Cli = struct {
 /// arena and is never individually freed.
 const Worker = struct {
     arena: std.heap.ArenaAllocator,
+    /// Scratch space for benchmark re-scans (`--repeat`); reset between runs.
+    scratch: std.heap.ArenaAllocator,
     thread: std.Thread = undefined,
     files_loaded: usize = 0,
 
@@ -73,6 +81,33 @@ const Worker = struct {
             // Exercise the shared interner from every worker thread.
             _ = interner.intern(io, gpa, paths[i]) catch |err| {
                 errs[i] = err;
+            };
+        }
+    }
+
+    /// Scan phase: tokenize loaded sources into SoA token streams held in
+    /// the worker's arena. `repeat > 1` re-scans into scratch (benchmarks).
+    fn scanRun(
+        w: *Worker,
+        sources: []const ?Source,
+        repeat: usize,
+        next: *std.atomic.Value(usize),
+        tokens: []?scanner.Tokens,
+        errs: []?anyerror,
+    ) void {
+        while (true) {
+            const i = next.fetchAdd(1, .monotonic);
+            if (i >= sources.len) break;
+            const src = sources[i] orelse continue;
+            var r: usize = 1;
+            while (r < repeat) : (r += 1) {
+                var toks = scanner.tokenize(w.scratch.allocator(), src.bytes) catch break;
+                std.mem.doNotOptimizeAway(&toks);
+                _ = w.scratch.reset(.retain_capacity);
+            }
+            tokens[i] = scanner.tokenize(w.arena.allocator(), src.bytes) catch |err| {
+                errs[i] = err;
+                continue;
             };
         }
     }
@@ -116,9 +151,12 @@ pub fn main(init: std.process.Init) !void {
     @memset(errs, null);
 
     const cpu_count = std.Thread.getCpuCount() catch 1;
-    const n_workers: usize = @max(1, @min(cpu_count, cli.paths.len));
+    const n_workers: usize = @max(1, @min(cli.workers orelse cpu_count, cli.paths.len));
     const workers = try arena.alloc(Worker, n_workers);
-    for (workers) |*w| w.* = .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
+    for (workers) |*w| w.* = .{
+        .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+        .scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+    };
 
     var next = std.atomic.Value(usize).init(0);
     for (workers) |*w| {
@@ -129,6 +167,21 @@ pub fn main(init: std.process.Init) !void {
     for (workers) |*w| w.thread.join();
 
     const load_ns = load_timer.readNs();
+
+    // --- Phase: scan (parallel) -------------------------------------------
+    const scan_timer = Timer.start(io);
+
+    const token_lists = try arena.alloc(?scanner.Tokens, cli.paths.len);
+    @memset(token_lists, null);
+    next.store(0, .monotonic);
+    for (workers) |*w| {
+        w.thread = try std.Thread.spawn(.{}, Worker.scanRun, .{
+            w, results, cli.repeat, &next, token_lists, errs,
+        });
+    }
+    for (workers) |*w| w.thread.join();
+
+    const scan_ns = scan_timer.readNs();
 
     // --- Aggregate statistics ----------------------------------------------
     var files_ok: usize = 0;
@@ -143,6 +196,14 @@ pub fn main(init: std.process.Init) !void {
         line_table_bytes += src.lineTableBytes();
     }
 
+    var total_tokens: usize = 0;
+    var token_bytes: usize = 0;
+    for (token_lists) |maybe_toks| {
+        const toks = maybe_toks orelse continue;
+        total_tokens += toks.len();
+        token_bytes += toks.byteSize();
+    }
+
     var failed: usize = 0;
     for (errs, cli.paths) |maybe_err, path| {
         if (maybe_err) |err| {
@@ -153,22 +214,30 @@ pub fn main(init: std.process.Init) !void {
 
     const total_ns = total_timer.readNs();
 
-    try out.print("ztsc: loaded {d} file(s), {d} lines, {d} bytes ({d} worker(s))\n", .{
-        files_ok, total_lines, total_bytes, n_workers,
+    try out.print("ztsc: loaded {d} file(s), {d} lines, {d} bytes, {d} tokens ({d} worker(s))\n", .{
+        files_ok, total_lines, total_bytes, total_tokens, n_workers,
     });
 
     if (cli.timing) {
         const load_ms = nsToMs(load_ns);
+        const scan_ms = nsToMs(scan_ns);
         const total_ms = nsToMs(total_ns);
         const load_s = @as(f64, @floatFromInt(load_ns)) / std.time.ns_per_s;
-        const lines_per_s: f64 = if (load_s > 0) @as(f64, @floatFromInt(total_lines)) / load_s else 0;
-        const mb_per_s: f64 = if (load_s > 0)
+        const scan_s = @as(f64, @floatFromInt(scan_ns)) / std.time.ns_per_s;
+        // --repeat multiplies the work done in the scan phase.
+        const scanned_lines = @as(f64, @floatFromInt(total_lines * cli.repeat));
+        const scanned_bytes = @as(f64, @floatFromInt(total_bytes * cli.repeat));
+        const load_lines_per_s: f64 = if (load_s > 0) @as(f64, @floatFromInt(total_lines)) / load_s else 0;
+        const load_mb_per_s: f64 = if (load_s > 0)
             @as(f64, @floatFromInt(total_bytes)) / (1024.0 * 1024.0) / load_s
         else
             0;
+        const scan_lines_per_s: f64 = if (scan_s > 0) scanned_lines / scan_s else 0;
+        const scan_mb_per_s: f64 = if (scan_s > 0) scanned_bytes / (1024.0 * 1024.0) / scan_s else 0;
         try out.print("\n--timing\n", .{});
         try out.print("  {s:<10} {s:>10} {s:>14} {s:>10}\n", .{ "phase", "ms", "lines/s", "MB/s" });
-        try out.print("  {s:<10} {d:>10.3} {d:>14.0} {d:>10.1}\n", .{ "load", load_ms, lines_per_s, mb_per_s });
+        try out.print("  {s:<10} {d:>10.3} {d:>14.0} {d:>10.1}\n", .{ "load", load_ms, load_lines_per_s, load_mb_per_s });
+        try out.print("  {s:<10} {d:>10.3} {d:>14.0} {d:>10.1}\n", .{ "scan", scan_ms, scan_lines_per_s, scan_mb_per_s });
         try out.print("  {s:<10} {d:>10.3}\n", .{ "total", total_ms });
     }
 
@@ -177,7 +246,7 @@ pub fn main(init: std.process.Init) !void {
         try out.print("\n--memory\n", .{});
         try out.print("  {s:<24} {s:>12}\n", .{ "arena", "bytes" });
         for (workers, 0..) |*w, i| {
-            const cap = w.arena.queryCapacity();
+            const cap = w.arena.queryCapacity() + w.scratch.queryCapacity();
             worker_arena_bytes += cap;
             try out.print("  worker[{d}] arena{s:<7} {d:>12}\n", .{ i, "", cap });
         }
@@ -185,7 +254,14 @@ pub fn main(init: std.process.Init) !void {
         try out.print("  {s:<24} {d:>12}\n", .{ "interner (total)", istats.total() });
         try out.print("  {s:<24} {d:>12}\n", .{ "  of which strings", istats.string_bytes });
         try out.print("  {s:<24} {d:>12}\n", .{ "line tables (in arenas)", line_table_bytes });
+        try out.print("  {s:<24} {d:>12}\n", .{ "token arrays (in arenas)", token_bytes });
         try out.print("  {s:<24} {d:>12}\n", .{ "mmapped source (file)", total_bytes });
+        try out.print("  {s:<24} {d:>12}\n", .{ "tokens", total_tokens });
+        const bytes_per_token: f64 = if (total_tokens > 0)
+            @as(f64, @floatFromInt(token_bytes)) / @as(f64, @floatFromInt(total_tokens))
+        else
+            0;
+        try out.print("  {s:<24} {d:>12.2}\n", .{ "bytes/token", bytes_per_token });
 
         const heap_total = worker_arena_bytes + istats.total();
         const bytes_per_line: f64 = if (total_lines > 0)
@@ -214,6 +290,15 @@ fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8) !Cli {
             cli.memory = true;
         } else if (std.mem.eql(u8, arg, "--version")) {
             cli.version = true;
+        } else if (std.mem.startsWith(u8, arg, "--workers=")) {
+            const n = std.fmt.parseInt(usize, arg["--workers=".len..], 10) catch
+                return error.BadFlagValue;
+            if (n == 0) return error.BadFlagValue;
+            cli.workers = n;
+        } else if (std.mem.startsWith(u8, arg, "--repeat=")) {
+            cli.repeat = std.fmt.parseInt(usize, arg["--repeat=".len..], 10) catch
+                return error.BadFlagValue;
+            if (cli.repeat == 0) return error.BadFlagValue;
         } else if (std.mem.startsWith(u8, arg, "--")) {
             return error.UnknownFlag;
         } else {
@@ -235,6 +320,20 @@ test "parseArgs flags and paths" {
     try std.testing.expectEqual(@as(usize, 2), cli.paths.len);
     try std.testing.expectEqualStrings("a.ts", cli.paths[0]);
     try std.testing.expectEqualStrings("b.ts", cli.paths[1]);
+}
+
+test "parseArgs workers and repeat" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const args = [_][:0]const u8{ "ztsc", "--workers=4", "--repeat=10", "a.ts" };
+    const cli = try parseArgs(arena.allocator(), &args);
+    try std.testing.expectEqual(@as(?usize, 4), cli.workers);
+    try std.testing.expectEqual(@as(usize, 10), cli.repeat);
+
+    const bad_workers = [_][:0]const u8{ "ztsc", "--workers=0" };
+    try std.testing.expectError(error.BadFlagValue, parseArgs(arena.allocator(), &bad_workers));
+    const bad_repeat = [_][:0]const u8{ "ztsc", "--repeat=x" };
+    try std.testing.expectError(error.BadFlagValue, parseArgs(arena.allocator(), &bad_repeat));
 }
 
 test "parseArgs rejects unknown flags" {
