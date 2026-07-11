@@ -1,0 +1,4 @@
+.zig-cache/
+zig-out/
+bench/corpus/
+node_modules/
