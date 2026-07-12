@@ -2,3 +2,7 @@
 zig-out/
 bench/corpus/
 node_modules/
+
+# but keep the node_modules fixtures used by conformance tests
+!test/conformance/**/node_modules/
+!test/conformance/**/node_modules/**
