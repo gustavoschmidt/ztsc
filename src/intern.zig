@@ -11,7 +11,8 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
 /// Interned string handle. Atoms are only meaningful within the interner
-/// that produced them.
+/// that produced them. Atom 0 is never produced — consumers (binder,
+/// module records) use 0 as a "none" sentinel.
 pub const Atom = u32;
 
 pub const Interner = struct {
@@ -82,8 +83,9 @@ pub const Interner = struct {
     /// since writers may grow the index list concurrently). The returned
     /// slice itself is stable for the interner's lifetime.
     pub fn lookup(self: *Interner, io: Io, atom: Atom) []const u8 {
-        const shard = &self.shards[atom & shard_mask];
-        const local = atom >> shard_bits;
+        const raw = atom - 1; // undo the +1 that keeps 0 free as a sentinel
+        const shard = &self.shards[raw & shard_mask];
+        const local = raw >> shard_bits;
         shard.mutex.lockUncancelable(io);
         defer shard.mutex.unlock(io);
         return shard.strings.items[local];
@@ -116,8 +118,9 @@ pub const Interner = struct {
     }
 
     fn atomFrom(shard_idx: u32, local: u32) Atom {
-        std.debug.assert(local < (@as(u64, 1) << (32 - @as(u6, shard_bits))));
-        return (local << shard_bits) | shard_idx;
+        std.debug.assert(local < (@as(u64, 1) << (32 - @as(u6, shard_bits))) - 1);
+        // +1 so that Atom 0 is never a real string ("none" sentinel).
+        return ((local << shard_bits) | shard_idx) + 1;
     }
 };
 

@@ -39,7 +39,28 @@ terminates with diagnostics (stress + fuzz tested). Out-of-subset syntax
 (enums, namespaces, decorators, mapped/conditional types, ...) parses to an
 `unsupported` node with a clean "not supported in ztsc v0.0.1" diagnostic.
 Parse runs ~10.5M lines/s single-thread (ReleaseFast, Apple Silicon dev
-machine), scaling ~5x at 8 workers. Binding is M3.
+machine), scaling ~5x at 8 workers.
+
+M3 (binder): per-file symbol tables, scope trees, and a tsc-style
+control-flow graph, all sealed immutable after bind. Symbols/scopes/flow
+nodes are `u32` indices in SoA arrays; scope member maps are flattened at
+seal time into atom-sorted segments looked up by binary search (no
+per-scope hash maps). Hoisting follows modern semantics (`var` to the
+function scope with order-independent var-vs-let conflict detection,
+functions in blocks block-scoped, params + destructured params in the
+function scope); let/const/class record their declaration site for M4's
+TDZ checks. Duplicate declarations get tsc-compatible codes (TS2300,
+TS2451, TS2393, TS2440, TS2492) while overloads, interface-interface
+merge, and value/type-space sharing bind into one multi-declaration
+symbol. Import/export records (named/default/namespace/re-export,
+type-only) feed M5's module graph. The flow graph covers branches, loops
+(with back edges), switch fallthrough, unreachable code, and `&&`/`||`/`!`
+condition decomposition — attached to identifier/member reads via a
+compact sorted (node, flow) map. `resolve(atom, scope)` walks the parent
+chain; unresolved names are surfaced (not errors until M5). The binder is
+total on arbitrary parser output (stress + fuzz tested). Bind runs ~12.7M
+lines/s single-thread at **~29.5 binder bytes/line** on the medium corpus,
+scaling ~4.2x at 8 workers. Checking is M4.
 
 ## Build & run
 
@@ -56,12 +77,16 @@ zig-out/bin/ztsc --timing --memory src.ts other.ts
 
 Flags:
 
-- `--timing` — per-phase wall-clock ms, lines/s, MB/s (load, scan, parse).
+- `--timing` — per-phase wall-clock ms, lines/s, MB/s (load, scan, parse,
+  bind).
 - `--memory` — per-arena bytes, interner bytes, token-array bytes,
-  bytes/token, AST node/extra_data bytes, **bytes/node**, nodes/line.
+  bytes/token, AST node/extra_data bytes, **bytes/node**, nodes/line,
+  binder symbol/scope/flow/record bytes, **bind bytes/line**.
 - `--dump-ast` — print S-expression parse trees (golden-test format).
+- `--dump-symbols` — print binder scope/symbol/flow dumps (golden-test
+  format), plus import/export records and unresolved names.
 - `--workers=N` — worker thread count (default: CPU count).
-- `--repeat=N` — re-scan/re-parse each file N times (benchmark aid).
+- `--repeat=N` — re-scan/re-parse/re-bind each file N times (benchmark aid).
 - `--version` — print version.
 
 ## Benchmarks
@@ -71,6 +96,7 @@ bench/run.sh small        # ~5k LOC synthetic corpus
 bench/run.sh medium       # ~50k LOC synthetic corpus
 bench/scan.sh medium 50   # scanner MB/s + 1/2/4/8-worker scaling
 bench/parse.sh medium 50  # parser lines/s + scaling + bytes/node
+bench/bind.sh medium 50   # binder lines/s + scaling + bytes/line
 ```
 
 The harness generates deterministic corpora with `bench/gen_corpus.js`
@@ -84,6 +110,7 @@ through them for comparison.
 src/            main.zig (CLI/pool), source.zig (mmap, line tables),
                 intern.zig (sharded interner), scanner.zig (tokenizer),
                 ast.zig (SoA nodes + dump), parser.zig (recursive descent),
+                binder.zig (symbols, scopes, flow graph),
                 diagnostics.zig (shared diagnostic type)
 bench/          harness (run.sh) + corpus generator (corpora are gitignored)
 test/           conformance runner + cases (differential vs tsc)

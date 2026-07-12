@@ -63,6 +63,19 @@ pub const Code = enum(u16) {
     /// Trailing comma or elision where the grammar forbids it.
     argument_expected,
 
+    // --- bind errors (M3), tsc-compatible codes via tsCode() ---------------
+    /// TS2300: two declarations of the same name that cannot merge
+    /// (class+class, function+var, duplicate params, type+interface, ...).
+    duplicate_identifier,
+    /// TS2451: block-scoped (let/const/class) redeclaration, incl. var-vs-let.
+    block_scoped_redeclare,
+    /// TS2393: two function (or method) declarations with bodies.
+    duplicate_function_implementation,
+    /// TS2440: import binding clashes with a local declaration.
+    import_conflict,
+    /// TS2492: redeclaring a catch-clause parameter in the catch block.
+    catch_redeclare,
+
     // --- subset boundary (PLAN §5: explicit, never a wrong answer) ---------
     unsupported_syntax,
     unsupported_satisfies,
@@ -110,8 +123,26 @@ pub const Code = enum(u16) {
             .rest_must_be_last => "a rest element must be last",
             .line_break_not_allowed => "line break not permitted here",
             .argument_expected => "argument expression expected",
+            .duplicate_identifier => "duplicate identifier",
+            .block_scoped_redeclare => "cannot redeclare block-scoped variable",
+            .duplicate_function_implementation => "duplicate function implementation",
+            .import_conflict => "import declaration conflicts with local declaration",
+            .catch_redeclare => "cannot redeclare identifier in catch clause",
             .unsupported_syntax => "syntax not supported in ztsc v0.0.1",
             .unsupported_satisfies => "'satisfies' is not supported in ztsc v0.0.1",
+        };
+    }
+
+    /// The matching tsc error number, or 0 where we have no tsc analogue
+    /// (scanner/parser codes keep their own messages for now).
+    pub fn tsCode(code: Code) u16 {
+        return switch (code) {
+            .duplicate_identifier => 2300,
+            .block_scoped_redeclare => 2451,
+            .duplicate_function_implementation => 2393,
+            .import_conflict => 2440,
+            .catch_redeclare => 2492,
+            else => 0,
         };
     }
 };
