@@ -1,22 +1,33 @@
 //! ZTSC CLI driver: argument parsing, thread pool, phase orchestration.
 //!
-//! M5 scope: the module graph is discovered wavefront-style from the CLI
-//! entry files — each wave loads/scans/parses/binds in parallel with the
-//! worker pool, then a cheap serial step resolves the wave's module
-//! specifiers (bundler-style, see modules.zig) and queues newly discovered
-//! files for the next wave. After binding, a serial `link` phase builds
-//! sealed per-file import/export tables; the check phase then partitions
-//! the program's files across N independent checker instances
+//! Module discovery is single-owner with a completion queue (ROADMAP
+//! "single-owner module discovery"): the main thread is the sole owner of
+//! the module graph and seen-set (no locks on graph state); workers run
+//! the whole per-file front end (load/scan/parse/bind) and push per-file
+//! completion messages `(file, import specifiers)`; the main thread
+//! resolves each completion's module specifiers (bundler-style, see
+//! modules.zig) as it arrives and enqueues newly discovered files
+//! immediately — no wave barrier, so already-discovered work never waits
+//! on an unrelated slow file. After discovery, files are renumbered into
+//! a deterministic graph-derived order (BFS from the entry files,
+//! tie-break = specifier order within the importing file — the same order
+//! the old wavefront discovery produced). A serial `link` phase then
+//! builds sealed per-file import/export tables; the check phase
+//! partitions the program's files across N independent checker instances
 //! (`--checkers=N`, default min(4, cores)), each with its own type
 //! store/caches, reading the shared immutable AST/binder/link data without
 //! locks (PLAN §2.3).
 //!
-//! Output determinism: every diagnostic is tagged with its file; each
-//! file's check diagnostics come from exactly the checker that owns it,
-//! and the final print is per file (in discovery order), position-sorted —
-//! byte-identical for any N. `--timing` reports per-phase wall clock plus
-//! a per-checker breakdown; `--memory` reports arena/token/AST/binder
-//! statistics plus per-checker type-store bytes and module-graph bytes.
+//! Output determinism: the file order is derived from the graph, never
+//! from scheduling; every diagnostic is tagged with its file; each file's
+//! check diagnostics come from exactly the checker that owns it, and the
+//! final print is per file (in graph order), position-sorted —
+//! byte-identical for any --workers/--checkers combination. `--timing`
+//! reports the per-phase split (load/scan/parse/bind are summed per-file
+//! worker times, since files stream through the pipeline; `discover` is
+//! the front-end wall clock) plus a per-checker breakdown; `--memory`
+//! reports arena/token/AST/binder statistics plus per-checker type-store
+//! bytes and module-graph bytes.
 
 const std = @import("std");
 const Io = std.Io;
@@ -137,136 +148,190 @@ const Emitter = struct {
     }
 };
 
+/// A unit of discovery work handed to a worker: one file to front-end.
+/// The path slice lives in the main arena and is stable for the run.
+const WorkItem = struct {
+    file: modules.FileId,
+    path: []const u8,
+};
+
+/// Per-file completion message a worker sends back to the main thread:
+/// the sealed front-end outputs plus per-phase timings. Payloads live in
+/// the worker's arena and are read-only once the message is pushed.
+const Completion = struct {
+    file: modules.FileId,
+    src: ?Source = null,
+    tokens: ?scanner.Tokens = null,
+    tree: ?*Ast = null,
+    bind: ?*Bind = null,
+    err: ?anyerror = null,
+    load_ns: u64 = 0,
+    scan_ns: u64 = 0,
+    parse_ns: u64 = 0,
+    bind_ns: u64 = 0,
+};
+
+/// Unbounded FIFO channel (mutex + condition). Buffer memory comes from
+/// the channel's own arena and is only touched under the lock, so the
+/// channel is safe with any number of producers and consumers. Message
+/// passing is the only worker<->main communication during discovery; the
+/// module graph itself stays main-thread-owned with no locks.
+fn Channel(comptime T: type) type {
+    return struct {
+        io: Io,
+        arena: std.heap.ArenaAllocator,
+        mutex: Io.Mutex = .init,
+        cond: Io.Condition = .init,
+        buf: std.ArrayList(T) = .empty,
+        head: usize = 0,
+        closed: bool = false,
+
+        const Self = @This();
+
+        fn init(io: Io) Self {
+            return .{ .io = io, .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
+        }
+
+        fn deinit(c: *Self) void {
+            c.arena.deinit();
+        }
+
+        fn push(c: *Self, item: T) error{OutOfMemory}!void {
+            c.mutex.lockUncancelable(c.io);
+            defer c.mutex.unlock(c.io);
+            try c.buf.append(c.arena.allocator(), item);
+            c.cond.signal(c.io);
+        }
+
+        /// Blocks until an item is available; null after close() once the
+        /// buffer is drained.
+        fn pop(c: *Self) ?T {
+            c.mutex.lockUncancelable(c.io);
+            defer c.mutex.unlock(c.io);
+            while (c.head == c.buf.items.len) {
+                if (c.closed) return null;
+                c.cond.waitUncancelable(c.io, &c.mutex);
+            }
+            const item = c.buf.items[c.head];
+            c.head += 1;
+            return item;
+        }
+
+        fn close(c: *Self) void {
+            c.mutex.lockUncancelable(c.io);
+            defer c.mutex.unlock(c.io);
+            c.closed = true;
+            c.cond.broadcast(c.io);
+        }
+    };
+}
+
 /// One pool worker. Each worker owns an arena allocator; everything a worker
-/// allocates while loading files (line tables, read fallbacks) lives in its
-/// arena and is never individually freed.
+/// allocates while processing files (line tables, tokens, ASTs, binder
+/// output) lives in its arena and is never individually freed. Workers pull
+/// one file at a time from the work channel, run the whole per-file front
+/// end on it, and push a completion — no phase or wave barriers.
 const Worker = struct {
     arena: std.heap.ArenaAllocator,
-    /// Scratch space for benchmark re-scans (`--repeat`); reset between runs.
+    /// Scratch space for benchmark re-runs (`--repeat`); reset between runs.
     scratch: std.heap.ArenaAllocator,
     thread: std.Thread = undefined,
     files_loaded: usize = 0,
 
-    fn run(
+    fn discoverRun(
         w: *Worker,
         io: Io,
         gpa: std.mem.Allocator,
         interner: *Interner,
-        paths: []const []const u8,
-        next: *std.atomic.Value(usize),
-        results: []?Source,
-        errs: []?anyerror,
-    ) void {
-        while (true) {
-            const i = next.fetchAdd(1, .monotonic);
-            if (i >= paths.len) break;
-            const src = Source.load(io, w.arena.allocator(), paths[i]) catch |err| {
-                errs[i] = err;
-                continue;
-            };
-            results[i] = src;
-            w.files_loaded += 1;
-            // Exercise the shared interner from every worker thread.
-            _ = interner.intern(io, gpa, paths[i]) catch |err| {
-                errs[i] = err;
-            };
-        }
-    }
-
-    /// Scan phase: tokenize loaded sources into SoA token streams held in
-    /// the worker's arena. `repeat > 1` re-scans into scratch (benchmarks).
-    fn scanRun(
-        w: *Worker,
-        sources: []const ?Source,
         repeat: usize,
-        next: *std.atomic.Value(usize),
-        tokens: []?scanner.Tokens,
-        errs: []?anyerror,
+        work: *Channel(WorkItem),
+        done: *Channel(Completion),
     ) void {
-        while (true) {
-            const i = next.fetchAdd(1, .monotonic);
-            if (i >= sources.len) break;
-            const src = sources[i] orelse continue;
-            var r: usize = 1;
-            while (r < repeat) : (r += 1) {
-                var toks = scanner.tokenize(w.scratch.allocator(), src.bytes) catch break;
-                std.mem.doNotOptimizeAway(&toks);
-                _ = w.scratch.reset(.retain_capacity);
-            }
-            tokens[i] = scanner.tokenize(w.arena.allocator(), src.bytes) catch |err| {
-                errs[i] = err;
-                continue;
-            };
+        while (work.pop()) |item| {
+            var c: Completion = .{ .file = item.file };
+            w.processFile(io, gpa, interner, item.path, repeat, &c);
+            done.push(c) catch @panic("ztsc: out of memory (completion queue)");
         }
     }
 
-    /// Parse phase: recursive descent into sealed per-file ASTs held in the
-    /// worker's arena. `repeat > 1` re-parses into scratch (benchmarks).
-    fn parseRun(
-        w: *Worker,
-        sources: []const ?Source,
-        repeat: usize,
-        next: *std.atomic.Value(usize),
-        trees: []?*Ast,
-        errs: []?anyerror,
-    ) void {
-        while (true) {
-            const i = next.fetchAdd(1, .monotonic);
-            if (i >= sources.len) break;
-            const src = sources[i] orelse continue;
-            var r: usize = 1;
-            while (r < repeat) : (r += 1) {
-                var tree = parser.parse(w.scratch.allocator(), src.bytes) catch break;
-                std.mem.doNotOptimizeAway(&tree);
-                _ = w.scratch.reset(.retain_capacity);
-            }
-            const tree = w.arena.allocator().create(Ast) catch |err| {
-                errs[i] = err;
-                continue;
-            };
-            tree.* = parser.parse(w.arena.allocator(), src.bytes) catch |err| {
-                errs[i] = err;
-                continue;
-            };
-            trees[i] = tree;
-        }
-    }
-
-    /// Bind phase: per-file binding into sealed symbol/scope/flow output
-    /// held in the worker's arena. `repeat > 1` re-binds into scratch.
-    fn bindRun(
+    /// The whole per-file front end: load -> scan -> parse -> bind.
+    /// Outputs and per-phase timings land in `c`; on the first error the
+    /// remaining phases are skipped (same per-phase skip behavior the
+    /// wavefront scheduler had). `repeat > 1` re-runs each phase into
+    /// scratch (benchmarks).
+    fn processFile(
         w: *Worker,
         io: Io,
         gpa: std.mem.Allocator,
         interner: *Interner,
-        sources: []const ?Source,
-        trees: []const ?*Ast,
+        path: []const u8,
         repeat: usize,
-        next: *std.atomic.Value(usize),
-        binds: []?*Bind,
-        errs: []?anyerror,
+        c: *Completion,
     ) void {
-        while (true) {
-            const i = next.fetchAdd(1, .monotonic);
-            if (i >= sources.len) break;
-            const src = sources[i] orelse continue;
-            const tree = trees[i] orelse continue;
-            var r: usize = 1;
-            while (r < repeat) : (r += 1) {
-                var b = binder.bind(w.scratch.allocator(), io, gpa, interner, tree, src.bytes) catch break;
-                std.mem.doNotOptimizeAway(&b);
-                _ = w.scratch.reset(.retain_capacity);
-            }
-            const b = w.arena.allocator().create(Bind) catch |err| {
-                errs[i] = err;
-                continue;
-            };
-            b.* = binder.bind(w.arena.allocator(), io, gpa, interner, tree, src.bytes) catch |err| {
-                errs[i] = err;
-                continue;
-            };
-            binds[i] = b;
+        const alloc = w.arena.allocator();
+
+        var timer = Timer.start(io);
+        const src = Source.load(io, alloc, path) catch |err| {
+            c.err = err;
+            return;
+        };
+        c.src = src;
+        w.files_loaded += 1;
+        // Exercise the shared interner from every worker thread.
+        _ = interner.intern(io, gpa, path) catch |err| {
+            c.err = err;
+            return;
+        };
+        c.load_ns = timer.readNs();
+
+        timer = Timer.start(io);
+        var r: usize = 1;
+        while (r < repeat) : (r += 1) {
+            var toks = scanner.tokenize(w.scratch.allocator(), src.bytes) catch break;
+            std.mem.doNotOptimizeAway(&toks);
+            _ = w.scratch.reset(.retain_capacity);
         }
+        c.tokens = scanner.tokenize(alloc, src.bytes) catch |err| {
+            c.err = err;
+            return;
+        };
+        c.scan_ns = timer.readNs();
+
+        timer = Timer.start(io);
+        r = 1;
+        while (r < repeat) : (r += 1) {
+            var tree = parser.parse(w.scratch.allocator(), src.bytes) catch break;
+            std.mem.doNotOptimizeAway(&tree);
+            _ = w.scratch.reset(.retain_capacity);
+        }
+        const tree = alloc.create(Ast) catch |err| {
+            c.err = err;
+            return;
+        };
+        tree.* = parser.parse(alloc, src.bytes) catch |err| {
+            c.err = err;
+            return;
+        };
+        c.tree = tree;
+        c.parse_ns = timer.readNs();
+
+        timer = Timer.start(io);
+        r = 1;
+        while (r < repeat) : (r += 1) {
+            var b = binder.bind(w.scratch.allocator(), io, gpa, interner, tree, src.bytes) catch break;
+            std.mem.doNotOptimizeAway(&b);
+            _ = w.scratch.reset(.retain_capacity);
+        }
+        const b = alloc.create(Bind) catch |err| {
+            c.err = err;
+            return;
+        };
+        b.* = binder.bind(alloc, io, gpa, interner, tree, src.bytes) catch |err| {
+            c.err = err;
+            return;
+        };
+        c.bind = b;
+        c.bind_ns = timer.readNs();
     }
 };
 
@@ -387,7 +452,7 @@ pub fn main(init: std.process.Init) !void {
     var interner = Interner.init();
     defer interner.deinit(gpa);
 
-    // Not capped by the entry count: waves discover more files (M5).
+    // Not capped by the entry count: discovery finds more files (M5).
     const cpu_count = std.Thread.getCpuCount() catch 1;
     const n_workers: usize = @max(1, cli.workers orelse cpu_count);
     const workers = try arena.alloc(Worker, n_workers);
@@ -396,7 +461,11 @@ pub fn main(init: std.process.Init) !void {
         .scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator),
     };
 
-    // --- Wavefront discovery: load/scan/parse/bind + resolve, per wave ----
+    // --- Single-owner discovery (no wave barrier) --------------------------
+    // The main thread is the sole owner of the module graph and seen-set;
+    // workers front-end one file at a time and push completions; the main
+    // thread resolves each completion as it arrives and enqueues newly
+    // discovered files immediately.
     var paths: std.ArrayList([]const u8) = .empty;
     var path_ids: std.StringHashMapUnmanaged(u32) = .empty;
     for (entry_paths) |p| {
@@ -414,7 +483,11 @@ pub fn main(init: std.process.Init) !void {
     var trees: std.ArrayList(?*Ast) = .empty;
     var binds: std.ArrayList(?*Bind) = .empty;
     var errs: std.ArrayList(?anyerror) = .empty;
-    var spec_maps: std.ArrayList(modules.SpecMap) = .empty;
+    var spec_atoms_all: std.ArrayList([]ztsc.intern.Atom) = .empty;
+    var spec_files_all: std.ArrayList([]modules.FileId) = .empty;
+    // Per-file resolved FileIds in first-occurrence specifier order
+    // (unresolved skipped) — the edges of the deterministic BFS below.
+    var edge_lists: std.ArrayList([]const modules.FileId) = .empty;
 
     var load_ns: u64 = 0;
     var scan_ns: u64 = 0;
@@ -422,93 +495,125 @@ pub fn main(init: std.process.Init) !void {
     var bind_ns: u64 = 0;
     var resolve_ns: u64 = 0;
 
-    var wave_start: usize = 0;
-    while (wave_start < paths.items.len) {
-        const wave_end = paths.items.len;
-        const n = wave_end - wave_start;
-        try results.appendNTimes(arena, null, n);
-        try token_lists.appendNTimes(arena, null, n);
-        try trees.appendNTimes(arena, null, n);
-        try binds.appendNTimes(arena, null, n);
-        try errs.appendNTimes(arena, null, n);
+    var work = Channel(WorkItem).init(io);
+    defer work.deinit();
+    var done = Channel(Completion).init(io);
+    defer done.deinit();
 
-        const wave_paths = paths.items[wave_start..wave_end];
-        const wave_results = results.items[wave_start..wave_end];
-        const wave_tokens = token_lists.items[wave_start..wave_end];
-        const wave_trees = trees.items[wave_start..wave_end];
-        const wave_binds = binds.items[wave_start..wave_end];
-        const wave_errs = errs.items[wave_start..wave_end];
+    const discover_timer = Timer.start(io);
+    for (workers) |*w| {
+        w.thread = try std.Thread.spawn(.{}, Worker.discoverRun, .{
+            w, io, gpa, &interner, cli.repeat, &work, &done,
+        });
+    }
 
-        var next = std.atomic.Value(usize).init(0);
+    var outstanding: usize = 0;
+    try growPerFile(arena, paths.items.len, &results, &token_lists, &trees, &binds, &errs, &spec_atoms_all, &spec_files_all, &edge_lists);
+    for (paths.items, 0..) |p, i| {
+        try work.push(.{ .file = @intCast(i), .path = p });
+        outstanding += 1;
+    }
 
-        // Load (parallel).
-        const load_timer = Timer.start(io);
-        for (workers) |*w| {
-            w.thread = try std.Thread.spawn(.{}, Worker.run, .{
-                w, io, gpa, &interner, wave_paths, &next, wave_results, wave_errs,
-            });
-        }
-        for (workers) |*w| w.thread.join();
-        load_ns += load_timer.readNs();
+    while (outstanding > 0) {
+        // The done channel is never closed while work is outstanding.
+        const c = done.pop().?;
+        outstanding -= 1;
+        const i = c.file;
+        results.items[i] = c.src;
+        token_lists.items[i] = c.tokens;
+        trees.items[i] = c.tree;
+        binds.items[i] = c.bind;
+        errs.items[i] = c.err;
+        load_ns += c.load_ns;
+        scan_ns += c.scan_ns;
+        parse_ns += c.parse_ns;
+        bind_ns += c.bind_ns;
 
-        // Scan (parallel).
-        const scan_timer = Timer.start(io);
-        next.store(0, .monotonic);
-        for (workers) |*w| {
-            w.thread = try std.Thread.spawn(.{}, Worker.scanRun, .{
-                w, wave_results, cli.repeat, &next, wave_tokens, wave_errs,
-            });
-        }
-        for (workers) |*w| w.thread.join();
-        scan_ns += scan_timer.readNs();
-
-        // Parse (parallel).
-        const parse_timer = Timer.start(io);
-        next.store(0, .monotonic);
-        for (workers) |*w| {
-            w.thread = try std.Thread.spawn(.{}, Worker.parseRun, .{
-                w, wave_results, cli.repeat, &next, wave_trees, wave_errs,
-            });
-        }
-        for (workers) |*w| w.thread.join();
-        parse_ns += parse_timer.readNs();
-
-        // Bind (parallel).
-        const bind_timer = Timer.start(io);
-        next.store(0, .monotonic);
-        for (workers) |*w| {
-            w.thread = try std.Thread.spawn(.{}, Worker.bindRun, .{
-                w, io, gpa, &interner, wave_results, wave_trees, cli.repeat, &next, wave_binds, wave_errs,
-            });
-        }
-        for (workers) |*w| w.thread.join();
-        bind_ns += bind_timer.readNs();
-
-        // Resolve this wave's module specifiers (serial; discovers files).
+        // Resolve this file's module specifiers (main thread only;
+        // discovers files).
         const resolve_timer = Timer.start(io);
-        for (wave_start..wave_end) |i| {
-            var atoms: std.ArrayList(ztsc.intern.Atom) = .empty;
-            var files: std.ArrayList(modules.FileId) = .empty;
-            if (binds.items[i]) |b| {
-                var seen: std.AutoHashMapUnmanaged(ztsc.intern.Atom, void) = .empty;
-                defer seen.deinit(gpa);
-                for (b.imports) |rec| {
+        var atoms: std.ArrayList(ztsc.intern.Atom) = .empty;
+        var files: std.ArrayList(modules.FileId) = .empty;
+        const known_before = paths.items.len;
+        if (binds.items[i]) |b| {
+            var seen: std.AutoHashMapUnmanaged(ztsc.intern.Atom, void) = .empty;
+            defer seen.deinit(gpa);
+            for (b.imports) |rec| {
+                try resolveSpecInto(arena, gpa, io, &interner, paths_map, paths.items[i], rec.module, &seen, &path_ids, &paths, &atoms, &files);
+            }
+            for (b.exports) |rec| {
+                if (rec.module != 0) {
                     try resolveSpecInto(arena, gpa, io, &interner, paths_map, paths.items[i], rec.module, &seen, &path_ids, &paths, &atoms, &files);
                 }
-                for (b.exports) |rec| {
-                    if (rec.module != 0) {
-                        try resolveSpecInto(arena, gpa, io, &interner, paths_map, paths.items[i], rec.module, &seen, &path_ids, &paths, &atoms, &files);
-                    }
-                }
             }
-            sortSpecPairs(atoms.items, files.items);
-            try spec_maps.append(arena, .{ .atoms = atoms.items, .files = files.items });
+        }
+        var edges: std.ArrayList(modules.FileId) = .empty;
+        for (files.items) |fid| {
+            if (fid != modules.no_file) try edges.append(arena, fid);
+        }
+        edge_lists.items[i] = edges.items;
+        sortSpecPairs(atoms.items, files.items);
+        spec_atoms_all.items[i] = atoms.items;
+        spec_files_all.items[i] = files.items;
+
+        // Enqueue newly discovered files right away.
+        try growPerFile(arena, paths.items.len, &results, &token_lists, &trees, &binds, &errs, &spec_atoms_all, &spec_files_all, &edge_lists);
+        for (known_before..paths.items.len) |nf| {
+            try work.push(.{ .file = @intCast(nf), .path = paths.items[nf] });
+            outstanding += 1;
         }
         resolve_ns += resolve_timer.readNs();
-
-        wave_start = wave_end;
     }
+    work.close();
+    for (workers) |*w| w.thread.join();
+    const discover_ns = discover_timer.readNs();
     const n_files = paths.items.len;
+
+    // --- Deterministic file order (graph-derived, not scheduling-derived) --
+    // Completion order depends on scheduling; output order must not. BFS
+    // from the entry files, tie-break = specifier order within each
+    // importing file (the exact order wavefront discovery produced), then
+    // permute every per-file table into that order. Everything downstream
+    // (link, checker partition, printing) sees only the renumbered ids, so
+    // output is byte-identical for any --workers/--checkers combination.
+    {
+        const order = try arena.alloc(u32, n_files); // BFS position -> discovery id
+        const new_ids = try arena.alloc(u32, n_files); // discovery id -> BFS position
+        @memset(new_ids, modules.no_file);
+        var tail: usize = 0;
+        for (0..n_entries) |i| {
+            new_ids[i] = @intCast(tail);
+            order[tail] = @intCast(i);
+            tail += 1;
+        }
+        var head: usize = 0;
+        while (head < tail) : (head += 1) {
+            for (edge_lists.items[order[head]]) |fid| {
+                if (new_ids[fid] != modules.no_file) continue;
+                new_ids[fid] = @intCast(tail);
+                order[tail] = fid;
+                tail += 1;
+            }
+        }
+        // Every discovered file was discovered through a recorded edge,
+        // so the BFS reaches all of them.
+        std.debug.assert(tail == n_files);
+
+        try permuteInPlace([]const u8, arena, paths.items, order);
+        try permuteInPlace(?Source, arena, results.items, order);
+        try permuteInPlace(?scanner.Tokens, arena, token_lists.items, order);
+        try permuteInPlace(?*Ast, arena, trees.items, order);
+        try permuteInPlace(?*Bind, arena, binds.items, order);
+        try permuteInPlace(?anyerror, arena, errs.items, order);
+        try permuteInPlace([]ztsc.intern.Atom, arena, spec_atoms_all.items, order);
+        try permuteInPlace([]modules.FileId, arena, spec_files_all.items, order);
+        // Remap the resolved FileIds inside the spec maps.
+        for (spec_files_all.items) |spec_files| {
+            for (spec_files) |*fid| {
+                if (fid.* != modules.no_file) fid.* = new_ids[fid.*];
+            }
+        }
+    }
 
     // --- Link (serial): program assembly + import/export tables ----------
     const link_timer = Timer.start(io);
@@ -536,7 +641,7 @@ pub fn main(init: std.process.Init) !void {
             .src = if (trees.items[i] == null) "" else src_bytes,
             .tree = tree.?,
             .bind = bnd.?,
-            .specs = spec_maps.items[i],
+            .specs = .{ .atoms = spec_atoms_all.items[i], .files = spec_files_all.items[i] },
         };
     }
     const links = try modules.link(arena, gpa, io, &interner, prog_files);
@@ -778,11 +883,15 @@ pub fn main(init: std.process.Init) !void {
         const scanned_bytes = @as(f64, @floatFromInt(total_bytes * cli.repeat));
         try out.print("\n--timing\n", .{});
         try out.print("  {s:<10} {s:>10} {s:>14} {s:>10}\n", .{ "phase", "ms", "lines/s", "MB/s" });
+        // load..bind are summed per-file worker times (files stream through
+        // the pipeline, so the phases overlap); discover is the front-end
+        // wall clock (spawn -> last completion resolved -> join).
         try printPhase(out, "load", load_ns, @floatFromInt(total_lines), @floatFromInt(total_bytes));
         try printPhase(out, "scan", scan_ns, scanned_lines, scanned_bytes);
         try printPhase(out, "parse", parse_ns, scanned_lines, scanned_bytes);
         try printPhase(out, "bind", bind_ns, scanned_lines, scanned_bytes);
         try printPhase(out, "resolve", resolve_ns, 0, 0);
+        try printPhase(out, "discover", discover_ns, @floatFromInt(total_lines), @floatFromInt(total_bytes));
         try printPhase(out, "link", link_ns, 0, 0);
         try printPhase(out, "check", check_ns, @floatFromInt(total_lines), @floatFromInt(total_bytes));
         try out.print("  {s:<10} {d:>10.3}\n", .{ "total", total_ms });
@@ -894,6 +1003,39 @@ pub fn main(init: std.process.Init) !void {
     // diagnostics were reported, 0 for a clean check.
     if (failed > 0) std.process.exit(2);
     if (parse_diags > 0 or bind_diags > 0 or link_diags > 0 or check_diags > 0) std.process.exit(1);
+}
+
+/// Grow every per-file table to `n` slots (null/empty defaults). Only the
+/// main thread touches these tables; workers communicate exclusively
+/// through the channels.
+fn growPerFile(
+    arena: std.mem.Allocator,
+    n: usize,
+    results: *std.ArrayList(?Source),
+    token_lists: *std.ArrayList(?scanner.Tokens),
+    trees: *std.ArrayList(?*Ast),
+    binds: *std.ArrayList(?*Bind),
+    errs: *std.ArrayList(?anyerror),
+    spec_atoms_all: *std.ArrayList([]ztsc.intern.Atom),
+    spec_files_all: *std.ArrayList([]modules.FileId),
+    edge_lists: *std.ArrayList([]const modules.FileId),
+) !void {
+    while (results.items.len < n) {
+        try results.append(arena, null);
+        try token_lists.append(arena, null);
+        try trees.append(arena, null);
+        try binds.append(arena, null);
+        try errs.append(arena, null);
+        try spec_atoms_all.append(arena, &.{});
+        try spec_files_all.append(arena, &.{});
+        try edge_lists.append(arena, &.{});
+    }
+}
+
+/// Reorder `items` so that items[k] becomes the old items[order[k]].
+fn permuteInPlace(comptime T: type, arena: std.mem.Allocator, items: []T, order: []const u32) !void {
+    const copy = try arena.dupe(T, items);
+    for (order, 0..) |old, k| items[k] = copy[old];
 }
 
 fn printPhase(out: *Io.Writer, name: []const u8, ns: u64, lines: f64, bytes: f64) !void {

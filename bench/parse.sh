@@ -8,6 +8,9 @@
 # bytes/node (node SoA + extra_data) and nodes/line. `repeat` re-parses each
 # file N times inside the parse phase so the measurement dominates process
 # startup and file loading (default 50).
+# Note: since single-owner discovery, the per-phase rows are summed
+# per-file worker times (throughput per core); the 'discover' row is the
+# front-end wall clock and shows the parallel scaling across workers.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -38,6 +41,6 @@ echo
 for W in 1 2 4 8; do
     echo "== parse, workers=$W =="
     $BIN --timing --memory --workers="$W" --repeat="$REPEAT" $FILES |
-        grep -E '^ztsc:|  parse |ast nodes|bytes/node|nodes/line|extra_data' || true
+        grep -E '^ztsc:|  parse |  discover |ast nodes|bytes/node|nodes/line|extra_data' || true
     echo
 done

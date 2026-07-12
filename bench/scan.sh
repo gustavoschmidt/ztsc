@@ -7,6 +7,9 @@
 # (MB/s, lines/s) at 1/2/4/8 workers, plus bytes/token. `repeat` re-scans
 # each file N times inside the scan phase so the measurement dominates
 # process startup and file loading (default 50).
+# Note: since single-owner discovery, the per-phase rows are summed
+# per-file worker times (throughput per core); the 'discover' row is the
+# front-end wall clock and shows the parallel scaling across workers.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -37,6 +40,6 @@ echo
 for W in 1 2 4 8; do
     echo "== scan, workers=$W =="
     $BIN --timing --memory --workers="$W" --repeat="$REPEAT" $FILES |
-        grep -E '^ztsc:|  scan |tokens|bytes/token' || true
+        grep -E '^ztsc:|  scan |  discover |tokens|bytes/token' || true
     echo
 done
