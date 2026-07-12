@@ -24,10 +24,15 @@ the milestone history in §4 preserves that plan's record.)
 ### Release policy — the public v0.0.1
 
 **There are no partial public releases.** The first published version,
-**v0.0.1**, ships only when the whole M7–M10 sequence below is done and
-`bunx ztsc` on a real Bun project is fast, correct, and self-contained —
-something people can run once and be amazed by. It will have bugs; it will
-not feel like a toy.
+**v0.0.1**, ships only when the whole M7–M10 sequence below is done. Its
+definition is exactly this: a user runs **`bunx ztsc <root-files>`** and
+ztsc type-checks those files and *everything they depend on* — including
+libraries — with most of TypeScript's functionality, fast and with low
+memory usage. That headline is the release. It will have bugs; it will not
+feel like a toy.
+
+v0.0.1 is a **batch checker only**: incremental checking, watch mode, and
+LSP are explicitly out of scope for it and come in future versions (§8).
 
 Until then the project is pre-release: internal builds report
 `ztsc 0.0.1-dev`, and finished milestones get history tags (`m6`, `m7`, …),
@@ -245,12 +250,10 @@ choose for you.
   from top libraries checked identically. **Benchmarks**: types/line, RSS,
   and instantiation counts on type-heavy corpora.
 
-### M10 — ship it: watch mode, bunx, release
+### M10 — ship it: bunx distribution + release
 
-- **Watch mode**: types-first-inspired incrementality (per-file interface
-  signatures cut the dependency graph; a body edit that doesn't change the
-  signature re-checks one file). Target: warm re-check of one edit on the
-  multi corpus in low double-digit ms.
+Batch checking only — no watch mode, no LSP (post-v0.0.1, §8).
+
 - **Distribution**: npm package `ztsc` with prebuilt platform binaries via
   `optionalDependencies` (the esbuild pattern) so **`bunx ztsc` works
   cold** — macOS/Linux × x64/arm64, cross-compiled by Zig in CI. Linux
@@ -306,11 +309,15 @@ every phase).
 
 ---
 
-## 8. Ideas / someday (post-v0.0.1)
+## 8. Post-v0.0.1 (deliberately out of the first release)
 
-- **LSP** — the sealed-phase architecture and single-owner discovery were
-  chosen not to preclude it; watch mode (M10) builds the incremental
-  substrate it needs.
+- **Incremental checking + watch mode** — the flagship follow-up:
+  types-first-inspired incrementality (per-file interface signatures cut
+  the dependency graph; a body edit that doesn't change the signature
+  re-checks one file). Target: warm re-check of one edit on the multi
+  corpus in low double-digit ms.
+- **LSP** — builds on the incremental substrate above; the sealed-phase
+  architecture and single-owner discovery were chosen not to preclude it.
 - **Windows** support and benchmarks.
 - **`--fix`-style quick suggestions** (TS2551 "did you mean" already
   exists; expand).

@@ -139,5 +139,7 @@ public v0.0.1 — lives in **[ROADMAP.md](ROADMAP.md)**. Next up (M7):
 `lib.d.ts` support and a "reality census" of real npm/Bun codebases that
 decides the implementation order of everything after it. Then semantic
 breadth (M8), the type-level core — conditional/mapped/template-literal
-types (M9) — and finally watch mode + `bunx ztsc` distribution (M10),
-which is the v0.0.1 release.
+types (M9) — and finally `bunx ztsc` distribution (M10), which is the
+v0.0.1 release: batch checking of your root files and all their
+dependencies, libraries included. Incremental checking, watch mode, and
+LSP come in versions after v0.0.1.
