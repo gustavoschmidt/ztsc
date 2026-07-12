@@ -8,6 +8,9 @@
 # binder bytes/line (symbol + scope + flow + record bytes over source
 # lines). `repeat` re-binds each file N times inside the bind phase so the
 # measurement dominates process startup, loading, and parsing (default 50).
+# Note: since single-owner discovery, the per-phase rows are summed
+# per-file worker times (throughput per core); the 'discover' row is the
+# front-end wall clock and shows the parallel scaling across workers.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -38,6 +41,6 @@ echo
 for W in 1 2 4 8; do
     echo "== bind, workers=$W =="
     $BIN --timing --memory --workers="$W" --repeat="$REPEAT" $FILES |
-        grep -E '^ztsc:|  bind |bind symbols|bind scopes|bind flow nodes|bind .* bytes|bind bytes/line' || true
+        grep -E '^ztsc:|  bind |  discover |bind symbols|bind scopes|bind flow nodes|bind .* bytes|bind bytes/line' || true
     echo
 done
