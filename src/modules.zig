@@ -1,6 +1,6 @@
 //! Module resolution, module graph, and cross-file symbol linking (M5).
 //!
-//! Design decisions (PLAN §2.3, M5):
+//! Design decisions (ROADMAP.md §2.3, M5):
 //!
 //! - **Resolution is bundler-style** (matches `tsc --moduleResolution
 //!   bundler` for the subset):
@@ -31,7 +31,7 @@
 //!     export is TS2305; a missing default is TS2613 (when a same-named
 //!     named export exists) or TS1192.
 //! - Checkers treat the sealed tables as read-only: no locks anywhere on
-//!   the check path (PLAN §2.3 immutability boundary).
+//!   the check path (ROADMAP.md §2.3 immutability boundary).
 //! - Out of subset (documented): `export =` / `import x = require(...)`
 //!   (parser flags them unsupported), ambient `declare module "..."`
 //!   blocks, CommonJS interop semantics.

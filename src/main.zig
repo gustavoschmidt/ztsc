@@ -16,7 +16,7 @@
 //! partitions the program's files across N independent checker instances
 //! (`--checkers=N`, default min(4, cores)), each with its own type
 //! store/caches, reading the shared immutable AST/binder/link data without
-//! locks (PLAN §2.3).
+//! locks (ROADMAP.md §2.3).
 //!
 //! Output determinism: the file order is derived from the graph, never
 //! from scheduling; every diagnostic is tagged with its file; each file's
@@ -46,7 +46,7 @@ const usage =
     \\usage: ztsc [options] [files...]
     \\
     \\With no files, ztsc looks for tsconfig.json in the current directory
-    \\and its parents (or uses --project). See PLAN.md §5 for the checked
+    \\and its parents (or uses --project). See ROADMAP.md §6 for the checked
     \\TypeScript subset.
     \\
     \\options:
@@ -423,7 +423,7 @@ pub fn main(init: std.process.Init) !void {
                 error.NotFound => std.debug.print("ztsc: cannot read '{s}'\n", .{config_path}),
                 error.SyntaxError => std.debug.print("ztsc: '{s}' is not valid JSON\n", .{config_path}),
                 error.StrictFalse => std.debug.print(
-                    "ztsc: '{s}' sets \"strict\": false, but ztsc v0.0.1 only implements strict-mode semantics.\n" ++
+                    "ztsc: '{s}' sets \"strict\": false, but ztsc only implements strict-mode semantics.\n" ++
                         "Please remove the option (or set it to true) to check this project with ztsc.\n",
                     .{config_path},
                 ),
@@ -653,7 +653,7 @@ pub fn main(init: std.process.Init) !void {
     };
     const link_ns = link_timer.readNs();
 
-    // --- Check (N independent checker instances, PLAN §2.3) ---------------
+    // --- Check (N independent checker instances, ROADMAP.md §2.3) ---------------
     const check_timer = Timer.start(io);
     const n_checkers: usize = @max(1, @min(cli.checkers orelse @min(4, cpu_count), n_files));
     const tasks = try arena.alloc(CheckerTask, n_checkers);
@@ -923,7 +923,7 @@ pub fn main(init: std.process.Init) !void {
             0;
         try out.print("  {s:<24} {d:>12.2}\n", .{ "bytes/token", bytes_per_token });
 
-        // AST statistics (PLAN M2: bytes/node is the key memory metric).
+        // AST statistics (ROADMAP §4 M2: bytes/node is the key memory metric).
         try out.print("  {s:<24} {d:>12}\n", .{ "ast nodes", total_nodes });
         try out.print("  {s:<24} {d:>12}\n", .{ "ast node SoA bytes", node_bytes });
         try out.print("  {s:<24} {d:>12}\n", .{ "ast extra_data bytes", extra_bytes });
@@ -939,7 +939,7 @@ pub fn main(init: std.process.Init) !void {
         try out.print("  {s:<24} {d:>12.2}\n", .{ "bytes/node (SoA+extra)", bytes_per_node });
         try out.print("  {s:<24} {d:>12.2}\n", .{ "nodes/line", nodes_per_line });
 
-        // Binder statistics (PLAN M3: binder bytes/line is the key metric).
+        // Binder statistics (ROADMAP §4 M3: binder bytes/line is the key metric).
         const bind_total_bytes = bind_symbol_bytes + bind_scope_bytes +
             bind_flow_bytes + bind_record_bytes;
         try out.print("  {s:<24} {d:>12}\n", .{ "bind symbols", total_symbols });

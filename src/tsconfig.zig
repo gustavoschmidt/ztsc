@@ -1,4 +1,4 @@
-//! tsconfig.json subset (M6, PLAN §M6).
+//! tsconfig.json subset (M6, ROADMAP.md §4 M6).
 //!
 //! Supported surface:
 //!
@@ -464,7 +464,7 @@ pub fn loadInDir(io: Io, arena: Allocator, base: Io.Dir, config_path: []const u8
                 {
                     try note(arena, &notes, "{s}: '{s}' accepted and ignored (ztsc always checks its fixed esnext/bundler subset)", .{ config_path, okey });
                 } else if (std.mem.eql(u8, okey, "types") or std.mem.eql(u8, okey, "lib")) {
-                    try note(arena, &notes, "{s}: '{s}' ignored (no lib support in ztsc v0.0.1)", .{ config_path, okey });
+                    try note(arena, &notes, "{s}: '{s}' ignored (no lib support yet)", .{ config_path, okey });
                 } else if (std.mem.eql(u8, okey, "baseUrl")) {
                     if (oval == .string) {
                         base_url = oval.string;
@@ -482,7 +482,7 @@ pub fn loadInDir(io: Io, arena: Allocator, base: Io.Dir, config_path: []const u8
                 }
             }
         } else if (std.mem.eql(u8, key, "extends")) {
-            try warn(arena, &warnings, "{s}: 'extends' is not supported in ztsc v0.0.1 (ignored)", .{config_path});
+            try warn(arena, &warnings, "{s}: 'extends' is not yet supported by ztsc (ignored)", .{config_path});
         } else {
             try warn(arena, &warnings, "{s}: unknown option '{s}' (ignored)", .{ config_path, key });
         }

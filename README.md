@@ -1,21 +1,25 @@
 # ZTSC — Zig TypeScript Checker
 
-**v0.0.1** — a fast, memory-lean TypeScript *type checker* (no JS emit)
-written in Zig, targeting a defined subset of TypeScript with `strict`
-semantics.
+A fast, memory-lean TypeScript *type checker* (no JS emit) written in Zig.
 
-Headline (multi corpus: 201 files / 93k lines, Apple M4 — full report with
-methodology and caveats in [BENCHMARKS.md](BENCHMARKS.md)):
+**Status: pre-release (`0.0.1-dev`).** The first published version, v0.0.1,
+ships when `bunx ztsc` works end-to-end on real Bun projects — no partial
+releases before that. Milestones M0–M6 (the subset checker, tag `m6`) are
+done; the road to v0.0.1 is [ROADMAP.md §5](ROADMAP.md).
+
+Headline from the M6 milestone (multi corpus: 201 files / 93k lines,
+Apple M4 — full report with methodology and caveats in
+[BENCHMARKS.md](BENCHMARKS.md)):
 
 | | wall | peak RSS |
 |---|---:|---:|
-| **ztsc 0.0.1** | **0.02 s** | **72 MB** |
+| **ztsc (M6)** | **0.02 s** | **72 MB** |
 | tsgo (TS 7 native preview) | 0.08 s | 205 MB |
 | tsc 5.5.4 | 0.91 s | 314 MB |
 
 That is an in-subset, synthetic-corpus comparison — read the caveats
-before quoting it. Both v0.0.1 acceptance gates (wall within 1.25× of
-tsgo, RSS ≤ 50% of tsgo) pass.
+before quoting it. Both M6 acceptance gates (wall within 1.25× of tsgo,
+RSS ≤ 50% of tsgo) pass.
 
 ## How it's built
 
@@ -26,12 +30,12 @@ tsgo, RSS ≤ 50% of tsgo) pass.
 - **Hash-consed types**: structural identity = integer equality;
   assignability memoized on `TypeId` pairs (~28 bytes/type).
 - **Parallel from the start**: per-file load/scan/parse/bind on a worker
-  pool, wavefront module discovery, then the program partitioned across
-  **N independent checker instances** (`--checkers=N`, default 4) that
-  read the sealed AST/binder data lock-free. Diagnostics are byte-identical
-  for any N.
+  pool with single-owner module discovery, then the program partitioned
+  across **N independent checker instances** (`--checkers=N`, default 4)
+  that read the sealed AST/binder data lock-free. Diagnostics are
+  byte-identical for any N.
 
-## What it checks (v0.0.1 subset)
+## What it checks today
 
 Primitives + literal types, objects/interfaces/type aliases, arrays,
 tuples, unions/intersections + discriminated unions, functions (inference,
@@ -40,13 +44,13 @@ inference, classes (fields/methods/`extends`/`implements`/visibility),
 control-flow narrowing (truthiness, `typeof`, equality, `in`,
 `instanceof`, discriminants, assignments), `keyof` / indexed access /
 `typeof`, ES modules incl. type-only imports and `.d.ts` reading —
-strict-mode semantics only. Full list: [PLAN.md §5](PLAN.md).
+strict-mode semantics only. Full list: [ROADMAP.md §6](ROADMAP.md).
 
-Out of scope for v0.0.1: conditional/mapped/template-literal types,
-`infer`, enums, namespaces, decorators, JSX, declaration merging, and —
-importantly — **`lib.d.ts`** (no global/DOM/ES types yet). Unsupported
-syntax gets a clear "not supported in ztsc v0.0.1" diagnostic, never a
-wrong answer or a crash (fuzzed at every phase).
+Not yet supported (queued in [ROADMAP.md §5](ROADMAP.md)): **`lib.d.ts`**
+(no global/DOM/ES types yet — the next milestone), conditional/mapped/
+template-literal types, `infer`, enums, namespaces, decorators, JSX,
+declaration merging. Unsupported syntax gets a clear "not yet supported"
+diagnostic, never a wrong answer or a crash (fuzzed at every phase).
 
 Conformance: **180/180** differential cases (error code + line) vs
 tsc 5.5.4, including 30 multi-file cases.
@@ -83,8 +87,8 @@ but never fail.
   excerpt, caret/tilde underline, and a final `Found N errors...` summary.
   Default: on when stderr is a TTY. `--pretty=false` keeps the stable
   one-line-per-diagnostic machine format.
-- `--timing` — per-phase wall clock (load/scan/parse/bind/resolve/link/
-  check), lines/s, MB/s, per-checker breakdown.
+- `--timing` — per-phase wall clock (discover/load/scan/parse/bind/resolve/
+  link/check), lines/s, MB/s, per-checker breakdown.
 - `--memory` — arena/interner/AST/binder/type-store accounting:
   bytes/token, bytes/node, binder bytes/line, bytes/type, cache hit rates.
 - `--workers=N` — worker threads for load/scan/parse/bind (default: CPUs).
@@ -103,10 +107,10 @@ config, or file-system errors (unknown flag, unreadable tsconfig,
 
 ## Benchmarks
 
-See **[BENCHMARKS.md](BENCHMARKS.md)** for the full v0.0.1 report:
-per-phase timings, `--checkers` scaling (1/2/4/8) with the duplicated-type
-overhead measured, memory metrics, acceptance-gate evaluation, and the
-honest caveats (subset semantics, synthetic corpora, no lib.d.ts).
+See **[BENCHMARKS.md](BENCHMARKS.md)** for the full M6 report: per-phase
+timings, `--checkers` scaling (1/2/4/8) with the duplicated-type overhead
+measured, memory metrics, acceptance-gate evaluation, and the honest
+caveats (subset semantics, synthetic corpora, no lib.d.ts).
 
 ```sh
 node bench/gen_corpus.js      # regenerate the deterministic corpora
@@ -130,8 +134,10 @@ test/           conformance runner + 180 differential cases vs tsc
 
 ## Roadmap
 
-v0.0.1 is the subset release. What's next (see [PLAN.md](PLAN.md)):
-`lib.d.ts` support, growing the subset toward real-world corpora (the
-~500k-LOC "large corpus" gate), Linux benchmarks, and eventually watch
-mode / LSP — the sealed-phase architecture is designed not to preclude
-them.
+Everything — goals, architecture, milestone history, and the path to the
+public v0.0.1 — lives in **[ROADMAP.md](ROADMAP.md)**. Next up (M7):
+`lib.d.ts` support and a "reality census" of real npm/Bun codebases that
+decides the implementation order of everything after it. Then semantic
+breadth (M8), the type-level core — conditional/mapped/template-literal
+types (M9) — and finally watch mode + `bunx ztsc` distribution (M10),
+which is the v0.0.1 release.

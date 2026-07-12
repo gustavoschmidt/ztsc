@@ -2826,7 +2826,7 @@ const Parser = struct {
         var flags: u32 = 0;
 
         // Call signature `(...)` / construct signature `new (...)` — out of
-        // subset (PLAN §5 keeps interfaces to prop/method/index signatures).
+        // subset (ROADMAP.md §6 keeps interfaces to prop/method/index signatures).
         if (p.curTag() == .l_paren or p.atLt()) {
             try p.parseFunctionTypeShapeless();
             return p.unsupportedFrom(start_tok);

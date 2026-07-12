@@ -2,10 +2,10 @@
 //! widening, control-flow narrowing, tsc-coded diagnostics; multi-file
 //! programs via the sealed module graph (M5).
 //!
-//! Scope & stance (documented deviations are intentional for v0.0.1):
+//! Scope & stance (documented deviations are intentional for the M6 subset):
 //!
 //! - **Multi-file (M5)**: a Checker instance checks a *partition* of the
-//!   program's files (PLAN §2.3). Symbols are addressed globally
+//!   program's files (ROADMAP.md §2.3). Symbols are addressed globally
 //!   (`sym_base[file] + local`); imported bindings resolve through the
 //!   sealed link tables (read-only, no locks) and foreign symbols' types
 //!   are constructed on demand in the local type store (duplicated across
@@ -1195,8 +1195,8 @@ const Checker = struct {
         return out;
     }
 
-    /// keyof T for the resolved structural type (object-ish only; PLAN
-    /// subset says non-generic keys).
+    /// keyof T for the resolved structural type (object-ish only; the M6
+    /// subset has non-generic keys).
     fn keyofType(c: *Checker, t: TypeId) Error!TypeId {
         const r = try c.resolveStructural(t);
         switch (c.ts.kind(r)) {

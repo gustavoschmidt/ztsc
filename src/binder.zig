@@ -1,6 +1,6 @@
 //! Per-file binder (M3): symbol tables, scope tree, control-flow graph.
 //!
-//! Design decisions (PLAN §2.2, M3):
+//! Design decisions (ROADMAP.md §2.2, M3):
 //!
 //! - **Everything is u32 indices in flat arrays**, matching the AST's
 //!   data-oriented style. Symbols, scopes, and flow nodes are SoA; the sealed

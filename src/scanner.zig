@@ -3,9 +3,9 @@
 //! Scans the FULL TypeScript token set (we check only a subset, but we scan
 //! everything so later phases can degrade gracefully on unsupported syntax).
 //!
-//! Design decisions (documented per PLAN.md M1):
+//! Design decisions (documented per ROADMAP §4 M1):
 //!
-//! - **Token storage is struct-of-arrays** (PLAN §2.1): `tags: []Tag` (1 byte)
+//! - **Token storage is struct-of-arrays** (ROADMAP.md §2.1): `tags: []Tag` (1 byte)
 //!   + `starts: []u32`. The preceded-by-newline flag (for ASI) is packed into
 //!   bit 31 of the start word, so sources are limited to 2 GiB
 //!   (`max_source_len`). Net: **5 bytes per token**. Token end offsets are not
@@ -844,7 +844,7 @@ pub const Scanner = struct {
     }
 };
 
-/// Struct-of-arrays token store (PLAN §2.1): 1-byte tag + 4-byte start per
+/// Struct-of-arrays token store (ROADMAP.md §2.1): 1-byte tag + 4-byte start per
 /// token; the preceded-by-newline flag lives in bit 31 of the start word.
 /// The stream always ends with a `.eof` token.
 pub const Tokens = struct {
