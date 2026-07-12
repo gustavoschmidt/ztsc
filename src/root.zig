@@ -6,6 +6,9 @@
 pub const source = @import("source.zig");
 pub const intern = @import("intern.zig");
 pub const scanner = @import("scanner.zig");
+pub const diagnostics = @import("diagnostics.zig");
+pub const ast = @import("ast.zig");
+pub const parser = @import("parser.zig");
 
 pub const version = "0.0.1";
 
@@ -13,4 +16,7 @@ test {
     _ = source;
     _ = intern;
     _ = scanner;
+    _ = diagnostics;
+    _ = ast;
+    _ = parser;
 }

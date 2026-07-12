@@ -22,7 +22,24 @@ flags, error tokens for unterminated constructs. Tokens are stored
 struct-of-arrays at **5 bytes/token** (1-byte tag + 4-byte start with the
 newline flag packed in bit 31); ends and line/col are recomputed lazily.
 The CLI scans loaded files in parallel. Fuzz + byte-soup stress tested.
-No parsing yet — that's M2+.
+
+M2 (parser + AST): recursive descent over the full PLAN §5 subset syntax —
+modules (incl. type-only imports/exports), functions/arrows/overloads,
+classes, interfaces, type aliases, generics, the type grammar, all
+statements, and the full expression grammar with correct precedence and
+optional chaining. The parser drives the scanner with grammar context
+(tsc-style rescans for regex / template parts, `>>` splitting for nested
+generics) and disambiguates arrows and generic calls by speculation with
+snapshot/restore. The AST is data-oriented per PLAN §2.1: `u32` node
+indices, `std.MultiArrayList` SoA storage (13 bytes/node fixed), shared
+`extra_data` — **~16.2 bytes/node** including extra_data on the medium
+corpus (target was ≤ 24), ~3.2 nodes/line. Error recovery synchronizes at
+statement boundaries and the parser is total: random byte/token soup always
+terminates with diagnostics (stress + fuzz tested). Out-of-subset syntax
+(enums, namespaces, decorators, mapped/conditional types, ...) parses to an
+`unsupported` node with a clean "not supported in ztsc v0.0.1" diagnostic.
+Parse runs ~10.5M lines/s single-thread (ReleaseFast, Apple Silicon dev
+machine), scaling ~5x at 8 workers. Binding is M3.
 
 ## Build & run
 
@@ -39,11 +56,12 @@ zig-out/bin/ztsc --timing --memory src.ts other.ts
 
 Flags:
 
-- `--timing` — per-phase wall-clock ms, lines/s, MB/s (load, scan).
+- `--timing` — per-phase wall-clock ms, lines/s, MB/s (load, scan, parse).
 - `--memory` — per-arena bytes, interner bytes, token-array bytes,
-  bytes/token, bytes/line of loaded source.
+  bytes/token, AST node/extra_data bytes, **bytes/node**, nodes/line.
+- `--dump-ast` — print S-expression parse trees (golden-test format).
 - `--workers=N` — worker thread count (default: CPU count).
-- `--repeat=N` — re-scan each file N times (benchmark aid).
+- `--repeat=N` — re-scan/re-parse each file N times (benchmark aid).
 - `--version` — print version.
 
 ## Benchmarks
@@ -52,6 +70,7 @@ Flags:
 bench/run.sh small        # ~5k LOC synthetic corpus
 bench/run.sh medium       # ~50k LOC synthetic corpus
 bench/scan.sh medium 50   # scanner MB/s + 1/2/4/8-worker scaling
+bench/parse.sh medium 50  # parser lines/s + scaling + bytes/node
 ```
 
 The harness generates deterministic corpora with `bench/gen_corpus.js`
@@ -63,7 +82,9 @@ through them for comparison.
 
 ```
 src/            main.zig (CLI/pool), source.zig (mmap, line tables),
-                intern.zig (sharded interner), scanner.zig (tokenizer)
+                intern.zig (sharded interner), scanner.zig (tokenizer),
+                ast.zig (SoA nodes + dump), parser.zig (recursive descent),
+                diagnostics.zig (shared diagnostic type)
 bench/          harness (run.sh) + corpus generator (corpora are gitignored)
 test/           conformance runner + cases (differential vs tsc)
 ```
