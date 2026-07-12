@@ -727,14 +727,20 @@ pub const Store = struct {
     }
 
     /// Insertion-sort 3-word (name, type, flags) records by name.
+    /// Sort the 3-word (name, ty, flags) property records by name atom.
+    /// Property names are deduplicated upstream, so keys are unique and an
+    /// unstable O(n log n) sort is deterministic. Reinterpreting the flat
+    /// words as `[3]u32` lets `std.mem.sort` move whole records with no
+    /// scratch allocation (u32 and [3]u32 share alignment).
     fn sortTriples(words: []u32) void {
-        var i: usize = 3;
-        while (i < words.len) : (i += 3) {
-            var j = i;
-            while (j >= 3 and words[j - 3] > words[j]) : (j -= 3) {
-                for (0..3) |k| std.mem.swap(u32, &words[j - 3 + k], &words[j + k]);
+        const n = words.len / 3;
+        if (n < 2) return;
+        const triples = @as([*][3]u32, @ptrCast(words.ptr))[0..n];
+        std.mem.sort([3]u32, triples, {}, struct {
+            fn lt(_: void, a: [3]u32, b: [3]u32) bool {
+                return a[0] < b[0];
             }
-        }
+        }.lt);
     }
 };
 

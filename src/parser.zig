@@ -69,23 +69,32 @@ const PE = error{ OutOfMemory, Backtrack };
 /// arena). Never fails on malformed input — only on OOM / oversized source.
 pub fn parse(gpa: Allocator, src: []const u8) error{ OutOfMemory, SourceTooLarge }!ast.Ast {
     if (src.len > scanner.max_source_len) return error.SourceTooLarge;
+    // Build the AST in a transient scratch arena so the growable lists'
+    // doubling reallocs and their final tail slack are freed here, then
+    // seal exact-size copies into `gpa` (the retained per-file arena). The
+    // AST is pointer-free u32 data, so a flat copy is self-consistent.
+    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch.deinit();
     var p: Parser = .{
-        .gpa = gpa,
+        .gpa = scratch.allocator(),
+        .out = gpa,
         .src = src,
         .scn = scanner.Scanner.init(src),
     };
-    defer p.deinit();
     p.parseRoot() catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Backtrack => unreachable, // spec == 0 at top level
     };
-    return p.toOwnedAst();
+    return p.sealInto(gpa);
 }
 
 const max_la = 4;
 
 const Parser = struct {
+    /// Transient arena: all growable lists live here during the parse.
     gpa: Allocator,
+    /// Retained per-file arena: the sealed AST is copied here.
+    out: Allocator,
     src: []const u8,
     scn: scanner.Scanner,
 
@@ -103,27 +112,29 @@ const Parser = struct {
     /// Speculation depth; > 0 makes expectation failures raise Backtrack.
     spec: u32 = 0,
 
-    fn deinit(p: *Parser) void {
-        p.tok_tags.deinit(p.gpa);
-        p.tok_starts.deinit(p.gpa);
-        p.nodes.deinit(p.gpa);
-        p.extra.deinit(p.gpa);
-        p.scratch.deinit(p.gpa);
-        p.diags.deinit(p.gpa);
-    }
+    /// Copy the parsed lists into `out` at exact size. `out` is an arena, so
+    /// each `dupe`/`setCapacity` is a single tight allocation with no slack
+    /// and no stranded intermediate buffers (those stay in the scratch arena
+    /// and are freed when `parse` returns).
+    fn sealInto(p: *Parser, out: Allocator) Error!ast.Ast {
+        const tags = try out.dupe(TokTag, p.tok_tags.items);
+        const starts = try out.dupe(u32, p.tok_starts.items);
+        const extra_data = try out.dupe(u32, p.extra.items);
+        const diags = try out.dupe(ast.Diagnostic, p.diags.items);
 
-    fn toOwnedAst(p: *Parser) Error!ast.Ast {
-        const tags = try p.tok_tags.toOwnedSlice(p.gpa);
-        errdefer p.gpa.free(tags);
-        const starts = try p.tok_starts.toOwnedSlice(p.gpa);
-        errdefer p.gpa.free(starts);
-        const extra_data = try p.extra.toOwnedSlice(p.gpa);
-        errdefer p.gpa.free(extra_data);
-        const diags = try p.diags.toOwnedSlice(p.gpa);
-        errdefer p.gpa.free(diags);
+        // Seal the node SoA: exact-size backing in `out`, field-by-field copy.
+        var nodes: std.MultiArrayList(ast.NodeItem) = .empty;
+        try nodes.setCapacity(out, p.nodes.len);
+        nodes.len = p.nodes.len;
+        const src_nodes = p.nodes.slice();
+        const dst_nodes = nodes.slice();
+        @memcpy(dst_nodes.items(.tag), src_nodes.items(.tag));
+        @memcpy(dst_nodes.items(.main_token), src_nodes.items(.main_token));
+        @memcpy(dst_nodes.items(.data), src_nodes.items(.data));
+
         return .{
             .tokens = .{ .tags = tags, .starts = starts },
-            .nodes = p.nodes.toOwnedSlice(),
+            .nodes = nodes.toOwnedSlice(),
             .extra_data = extra_data,
             .diagnostics = diags,
         };

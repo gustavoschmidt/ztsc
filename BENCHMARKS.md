@@ -149,6 +149,38 @@ bytes/type, 47.6% hit rate, 460 bytes/line.)
 
 ---
 
+## 3.4 M7 — memory & perf debt paydown
+
+Six independent fixes (ROADMAP.md §5, M7): drop the duplicate retained token
+scan; parse into a transient arena and seal exact-size into the retained AST
+arena (killing the doubling-realloc slack that an arena strands forever);
+per-file reset scratch arena for module resolution; `std.mem.sort` instead of
+insertion sort in the linker; O(1) `upsertProp` + `std.mem.sort` for object
+triples; and removing `resolveStem`'s 256-byte candidate-path cap (a latent
+wrong "module not found" — regression-tested with a ~320-byte path).
+
+Warm A/B on the same machine (Apple M4, ReleaseFast), `--timing --memory`,
+`--checkers=4`. `heap total (arenas)` is deterministic; wall figures are the
+usual ±5% noisy:
+
+| corpus | metric | before (M6) | after (M7) | Δ |
+|---|---|---:|---:|---:|
+| medium | heap total (arenas) | 23.98 MB | 11.19 MB | **−53%** |
+| | bytes/line (heap) | 505 | ~226 | −55% |
+| | check ms | 15.3 | 7.1 | equal-or-better |
+| multi | heap total (arenas) | 45.54 MB | 18.06 MB | **−60%** |
+| | bytes/line (heap) | 490 | ~193 | −61% |
+| | check ms | 17.2 | 13.6 | equal-or-better |
+
+`bytes/node` (16.03 / 16.05) and `token arrays` are unchanged by design —
+they already measured *live* size; the win is in the arena's actual resident
+capacity, which the stranded doubling buffers and the duplicate token array
+had been inflating. Check scratch high-water moved 1672 → 1996 B (still far
+under the <2 KB budget). Conformance stays green (180/180) plus one new
+long-path resolution unit test.
+
+---
+
 ## 4. Cross-checking correctness while benchmarking
 
 Before timing, all three tools were run on all three corpora:

@@ -161,7 +161,6 @@ const WorkItem = struct {
 const Completion = struct {
     file: modules.FileId,
     src: ?Source = null,
-    tokens: ?scanner.Tokens = null,
     tree: ?*Ast = null,
     bind: ?*Bind = null,
     err: ?anyerror = null,
@@ -284,6 +283,10 @@ const Worker = struct {
         };
         c.load_ns = timer.readNs();
 
+        // Standalone tokenize, timed but not retained: the parser
+        // re-tokenizes internally into `tree.tokens` (what the binder
+        // reads), so keeping a second copy in the per-file arena only
+        // wasted ~5 B/token. Token stats are derived from `tree.tokens`.
         timer = Timer.start(io);
         var r: usize = 1;
         while (r < repeat) : (r += 1) {
@@ -291,10 +294,14 @@ const Worker = struct {
             std.mem.doNotOptimizeAway(&toks);
             _ = w.scratch.reset(.retain_capacity);
         }
-        c.tokens = scanner.tokenize(alloc, src.bytes) catch |err| {
-            c.err = err;
-            return;
-        };
+        {
+            var toks = scanner.tokenize(w.scratch.allocator(), src.bytes) catch |err| {
+                c.err = err;
+                return;
+            };
+            std.mem.doNotOptimizeAway(&toks);
+            _ = w.scratch.reset(.retain_capacity);
+        }
         c.scan_ns = timer.readNs();
 
         timer = Timer.start(io);
@@ -479,7 +486,6 @@ pub fn main(init: std.process.Init) !void {
     const n_entries = paths.items.len;
 
     var results: std.ArrayList(?Source) = .empty;
-    var token_lists: std.ArrayList(?scanner.Tokens) = .empty;
     var trees: std.ArrayList(?*Ast) = .empty;
     var binds: std.ArrayList(?*Bind) = .empty;
     var errs: std.ArrayList(?anyerror) = .empty;
@@ -508,11 +514,18 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var outstanding: usize = 0;
-    try growPerFile(arena, paths.items.len, &results, &token_lists, &trees, &binds, &errs, &spec_atoms_all, &spec_files_all, &edge_lists);
+    try growPerFile(arena, paths.items.len, &results, &trees, &binds, &errs, &spec_atoms_all, &spec_files_all, &edge_lists);
     for (paths.items, 0..) |p, i| {
         try work.push(.{ .file = @intCast(i), .path = p });
         outstanding += 1;
     }
+
+    // Transient allocator for module resolution: candidate path strings and
+    // package.json bodies are discarded after each file's specifiers
+    // resolve. Mirrors the serial buildProgram path (modules.zig). Reset per
+    // file so it never grows past one file's resolution working set.
+    var resolve_scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer resolve_scratch.deinit();
 
     while (outstanding > 0) {
         // The done channel is never closed while work is outstanding.
@@ -520,7 +533,6 @@ pub fn main(init: std.process.Init) !void {
         outstanding -= 1;
         const i = c.file;
         results.items[i] = c.src;
-        token_lists.items[i] = c.tokens;
         trees.items[i] = c.tree;
         binds.items[i] = c.bind;
         errs.items[i] = c.err;
@@ -536,16 +548,18 @@ pub fn main(init: std.process.Init) !void {
         var files: std.ArrayList(modules.FileId) = .empty;
         const known_before = paths.items.len;
         if (binds.items[i]) |b| {
+            const scratch = resolve_scratch.allocator();
             var seen: std.AutoHashMapUnmanaged(ztsc.intern.Atom, void) = .empty;
             defer seen.deinit(gpa);
             for (b.imports) |rec| {
-                try resolveSpecInto(arena, gpa, io, &interner, paths_map, paths.items[i], rec.module, &seen, &path_ids, &paths, &atoms, &files);
+                try resolveSpecInto(arena, scratch, gpa, io, &interner, paths_map, paths.items[i], rec.module, &seen, &path_ids, &paths, &atoms, &files);
             }
             for (b.exports) |rec| {
                 if (rec.module != 0) {
-                    try resolveSpecInto(arena, gpa, io, &interner, paths_map, paths.items[i], rec.module, &seen, &path_ids, &paths, &atoms, &files);
+                    try resolveSpecInto(arena, scratch, gpa, io, &interner, paths_map, paths.items[i], rec.module, &seen, &path_ids, &paths, &atoms, &files);
                 }
             }
+            _ = resolve_scratch.reset(.retain_capacity);
         }
         var edges: std.ArrayList(modules.FileId) = .empty;
         for (files.items) |fid| {
@@ -557,7 +571,7 @@ pub fn main(init: std.process.Init) !void {
         spec_files_all.items[i] = files.items;
 
         // Enqueue newly discovered files right away.
-        try growPerFile(arena, paths.items.len, &results, &token_lists, &trees, &binds, &errs, &spec_atoms_all, &spec_files_all, &edge_lists);
+        try growPerFile(arena, paths.items.len, &results, &trees, &binds, &errs, &spec_atoms_all, &spec_files_all, &edge_lists);
         for (known_before..paths.items.len) |nf| {
             try work.push(.{ .file = @intCast(nf), .path = paths.items[nf] });
             outstanding += 1;
@@ -601,7 +615,6 @@ pub fn main(init: std.process.Init) !void {
 
         try permuteInPlace([]const u8, arena, paths.items, order);
         try permuteInPlace(?Source, arena, results.items, order);
-        try permuteInPlace(?scanner.Tokens, arena, token_lists.items, order);
         try permuteInPlace(?*Ast, arena, trees.items, order);
         try permuteInPlace(?*Bind, arena, binds.items, order);
         try permuteInPlace(?anyerror, arena, errs.items, order);
@@ -694,14 +707,10 @@ pub fn main(init: std.process.Init) !void {
         line_table_bytes += src.lineTableBytes();
     }
 
+    // Token stats come from the retained `tree.tokens` (the only token
+    // array kept per file now that the standalone scan is discarded).
     var total_tokens: usize = 0;
     var token_bytes: usize = 0;
-    for (token_lists.items) |maybe_toks| {
-        const toks = maybe_toks orelse continue;
-        total_tokens += toks.len();
-        token_bytes += toks.byteSize();
-    }
-
     var total_nodes: usize = 0;
     var node_bytes: usize = 0;
     var extra_bytes: usize = 0;
@@ -709,6 +718,8 @@ pub fn main(init: std.process.Init) !void {
     var parse_diags: usize = 0;
     for (trees.items) |maybe_tree| {
         const tree = maybe_tree orelse continue;
+        total_tokens += tree.tokens.len();
+        token_bytes += tree.tokens.byteSize();
         total_nodes += tree.nodes.len;
         node_bytes += tree.nodeBytes();
         extra_bytes += tree.extraBytes();
@@ -1012,7 +1023,6 @@ fn growPerFile(
     arena: std.mem.Allocator,
     n: usize,
     results: *std.ArrayList(?Source),
-    token_lists: *std.ArrayList(?scanner.Tokens),
     trees: *std.ArrayList(?*Ast),
     binds: *std.ArrayList(?*Bind),
     errs: *std.ArrayList(?anyerror),
@@ -1022,7 +1032,6 @@ fn growPerFile(
 ) !void {
     while (results.items.len < n) {
         try results.append(arena, null);
-        try token_lists.append(arena, null);
         try trees.append(arena, null);
         try binds.append(arena, null);
         try errs.append(arena, null);
@@ -1049,6 +1058,7 @@ fn printPhase(out: *Io.Writer, name: []const u8, ns: u64, lines: f64, bytes: f64
 /// discovers new files into `paths`.
 fn resolveSpecInto(
     arena: std.mem.Allocator,
+    scratch: std.mem.Allocator,
     gpa: std.mem.Allocator,
     io: Io,
     interner: *Interner,
@@ -1066,28 +1076,36 @@ fn resolveSpecInto(
     if (gop.found_existing) return;
     const spec = interner.lookup(io, module_atom);
     var fid: modules.FileId = modules.no_file;
+    // All candidate paths and package.json bodies are transient — build
+    // them in `scratch` (reset per file by the caller). Only the resolved
+    // path is retained, duped into `arena` below.
+    //
     // tsconfig `paths` mapping applies to bare specifiers first (M6);
     // unmatched or unresolved candidates fall through to normal
     // resolution, like tsc.
     var mapped: ?[]u8 = null;
     if (paths_map) |pm| {
         if (spec.len > 0 and spec[0] != '.' and spec[0] != '/') {
-            for (try pm.mapSpecifier(arena, spec)) |cand| {
-                if (try modules.resolveStem(io, arena, Io.Dir.cwd(), cand)) |r| {
+            for (try pm.mapSpecifier(scratch, spec)) |cand| {
+                if (try modules.resolveStem(io, scratch, Io.Dir.cwd(), cand)) |r| {
                     mapped = r;
                     break;
                 }
             }
         }
     }
-    if (mapped orelse try modules.resolveSpecifier(io, arena, Io.Dir.cwd(), importer, spec)) |resolved| {
+    if (mapped orelse try modules.resolveSpecifier(io, scratch, Io.Dir.cwd(), importer, spec)) |resolved| {
         const pgop = try path_ids.getOrPut(arena, resolved);
         if (pgop.found_existing) {
             fid = pgop.value_ptr.*;
         } else {
+            // Give the map a stable key and `paths` a stable slice: the
+            // scratch-owned `resolved` is about to be reset away.
+            const stable = try arena.dupe(u8, resolved);
+            pgop.key_ptr.* = stable;
             fid = @intCast(paths.items.len);
             pgop.value_ptr.* = fid;
-            try paths.append(arena, resolved);
+            try paths.append(arena, stable);
         }
     }
     try atoms.append(arena, module_atom);
