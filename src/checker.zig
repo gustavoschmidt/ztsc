@@ -1,11 +1,23 @@
-//! Checker core (M4): structural assignability, inference, literal widening,
-//! control-flow narrowing, tsc-coded diagnostics.
+//! Checker core (M4/M5): structural assignability, inference, literal
+//! widening, control-flow narrowing, tsc-coded diagnostics; multi-file
+//! programs via the sealed module graph (M5).
 //!
 //! Scope & stance (documented deviations are intentional for v0.0.1):
 //!
-//! - **Single file, single thread.** M5 adds the module graph and N-checker
-//!   partitioning. Imported bindings type as `any` here and produce no
-//!   diagnostics; everything else resolves in-file.
+//! - **Multi-file (M5)**: a Checker instance checks a *partition* of the
+//!   program's files (PLAN §2.3). Symbols are addressed globally
+//!   (`sym_base[file] + local`); imported bindings resolve through the
+//!   sealed link tables (read-only, no locks) and foreign symbols' types
+//!   are constructed on demand in the local type store (duplicated across
+//!   checker instances by design). Diagnostics are tagged with their file;
+//!   `seal` keeps only diagnostics in *owned* files, so a diagnostic is
+//!   reported exactly once — by the checker that owns the file — and the
+//!   merged output is byte-identical for any partition count.
+//!   Cross-file cuts (documented): `export =` / `import x = require()`
+//!   and ambient `declare module` are out of subset (parser flags them);
+//!   a namespace import used in *type* position (`ns.T`) types as `any`;
+//!   an unnamed `export default function/class` declaration types as
+//!   `any` when imported.
 //! - **strict semantics only**: strictNullChecks, strictFunctionTypes
 //!   (function-type parameters contravariant, *method* parameters bivariant,
 //!   like tsc), noImplicitAny (TS7006 on unannotated, uncontextual params).
@@ -54,6 +66,7 @@ const intern = @import("intern.zig");
 const binder = @import("binder.zig");
 const types = @import("types.zig");
 const source = @import("source.zig");
+const modules = @import("modules.zig");
 
 const Ast = ast.Ast;
 const Node = ast.Node;
@@ -71,9 +84,12 @@ const Store = types.Store;
 
 pub const Error = error{OutOfMemory};
 
-/// A checker diagnostic: tsc error code + span + rendered message.
+pub const FileId = modules.FileId;
+
+/// A checker diagnostic: tsc error code + file + span + rendered message.
 pub const Diag = struct {
     code: u16,
+    file: FileId = 0,
     span: Span,
     msg: []const u8,
 };
@@ -95,10 +111,12 @@ pub const Check = struct {
     stats: Stats,
 };
 
-/// Type-check one bound file. Diagnostics and message strings go into
-/// `arena`; all type storage and caches live in an internal checker arena
-/// that is freed on return (the caller keeps only diagnostics + stats).
-/// Total on arbitrary parser/binder output: never fails except on OOM.
+/// Type-check one bound file with an unlinked single-file program
+/// (imports type as `any`; no module diagnostics). Diagnostics and message
+/// strings go into `arena`; all type storage and caches live in an
+/// internal checker arena that is freed on return (the caller keeps only
+/// diagnostics + stats). Total on arbitrary parser/binder output: never
+/// fails except on OOM.
 pub fn check(
     arena: Allocator,
     io: Io,
@@ -108,9 +126,51 @@ pub fn check(
     bind: *const Bind,
     src: []const u8,
 ) Error!Check {
-    var c = try Checker.init(arena, io, gpa, interner, tree, bind, src);
+    const prog = try arena.create(modules.Program);
+    prog.* = try modules.singleFileProgram(arena, "", src, tree, bind);
+    return checkFiles(arena, io, gpa, interner, prog, &.{0});
+}
+
+/// Type-check `owned` files of a linked multi-file program. Cross-file
+/// symbol lookups go through `prog.links` (sealed, read-only); types of
+/// imported symbols are constructed on demand in this checker's local
+/// store. Only diagnostics located in owned files are returned, sorted by
+/// (file, position, code) — so concatenating the outputs of any partition
+/// of the program's files yields byte-identical diagnostics.
+pub fn checkFiles(
+    arena: Allocator,
+    io: Io,
+    gpa: Allocator,
+    interner: *Interner,
+    prog: *const modules.Program,
+    owned: []const FileId,
+) Error!Check {
+    var c = try Checker.init(arena, io, gpa, interner, prog, owned);
     defer c.deinit();
     try c.run();
+    return c.seal();
+}
+
+/// Like `checkFiles`, but also renders `--dump-types` output (a `;; path`
+/// header then one `name: type` line per file-scope value declaration,
+/// per owned file) into `w`.
+pub fn checkFilesAndDump(
+    arena: Allocator,
+    io: Io,
+    gpa: Allocator,
+    interner: *Interner,
+    prog: *const modules.Program,
+    owned: []const FileId,
+    w: *std.Io.Writer,
+) (Error || std.Io.Writer.Error)!Check {
+    var c = try Checker.init(arena, io, gpa, interner, prog, owned);
+    defer c.deinit();
+    try c.run();
+    for (owned) |f| {
+        c.setFile(f);
+        try w.print(";; {s}\n", .{prog.files[f].path});
+        try c.dumpTypes(w);
+    }
     return c.seal();
 }
 
@@ -126,7 +186,9 @@ pub fn checkAndDump(
     src: []const u8,
     w: *std.Io.Writer,
 ) (Error || std.Io.Writer.Error)!Check {
-    var c = try Checker.init(arena, io, gpa, interner, tree, bind, src);
+    const prog = try arena.create(modules.Program);
+    prog.* = try modules.singleFileProgram(arena, "", src, tree, bind);
+    var c = try Checker.init(arena, io, gpa, interner, prog, &.{0});
     defer c.deinit();
     try c.run();
     try c.dumpTypes(w);
@@ -147,6 +209,14 @@ const Checker = struct {
     io: Io,
     gpa: Allocator,
     interner: *Interner,
+    prog: *const modules.Program,
+    /// Files this checker instance owns (checks fully; only their
+    /// diagnostics survive `seal`).
+    owned: []const FileId,
+    owned_mask: []bool = &.{},
+    /// Current-file views (switched by `setFile`); all `tree`/`bind`/`src`
+    /// uses below refer to the file being traversed *right now*.
+    cur_file: FileId = 0,
     tree: *const Ast,
     bind: *const Bind,
     src: []const u8,
@@ -161,18 +231,20 @@ const Checker = struct {
     ts: Store = undefined,
 
     diags: std.ArrayList(Diag) = .empty,
-    diag_seen: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    diag_seen: std.AutoHashMapUnmanaged(u128, void) = .empty,
 
     // --- caches (checker arena) -------------------------------------------
-    /// Symbol -> declared value type. 0 = not computed.
+    /// Global symbol -> declared value type. 0 = not computed.
     sym_types: []TypeId = &.{},
     sym_state: []u8 = &.{}, // 0 = none, 1 = in progress, 2 = done
-    /// Expression node -> synthesized type (memoized; also dedupes diags).
-    node_types: std.AutoHashMapUnmanaged(Node, TypeId) = .empty,
-    /// FnProto node -> signature TypeId.
-    sig_cache: std.AutoHashMapUnmanaged(Node, TypeId) = .empty,
-    /// Owner node -> primary (lowest) scope id.
-    node_scopes: std.AutoHashMapUnmanaged(Node, ScopeId) = .empty,
+    /// (file << 32 | node) -> synthesized type (memoized; dedupes diags).
+    node_types: std.AutoHashMapUnmanaged(u64, TypeId) = .empty,
+    /// (file << 32 | FnProto node) -> signature TypeId.
+    sig_cache: std.AutoHashMapUnmanaged(u64, TypeId) = .empty,
+    /// (file << 32 | owner node) -> primary (lowest) scope id.
+    node_scopes: std.AutoHashMapUnmanaged(u64, ScopeId) = .empty,
+    /// FileId -> module namespace object type (0 = in progress).
+    ns_types: std.AutoHashMapUnmanaged(FileId, TypeId) = .empty,
     /// (source << 32 | target) -> Relation.
     relation: std.AutoHashMapUnmanaged(u64, u8) = .empty,
     /// ref TypeId -> expanded structural type.
@@ -221,18 +293,22 @@ const Checker = struct {
         io: Io,
         gpa: Allocator,
         interner: *Interner,
-        tree: *const Ast,
-        bind: *const Bind,
-        src: []const u8,
+        prog: *const modules.Program,
+        owned: []const FileId,
     ) Error!Checker {
+        const first = if (owned.len > 0) owned[0] else 0;
+        const f0 = &prog.files[first];
         var c: Checker = .{
             .out = out,
             .io = io,
             .gpa = gpa,
             .interner = interner,
-            .tree = tree,
-            .bind = bind,
-            .src = src,
+            .prog = prog,
+            .owned = owned,
+            .cur_file = first,
+            .tree = f0.tree,
+            .bind = f0.bind,
+            .src = f0.src,
             .carena = undefined,
             .scratch_arena = undefined,
         };
@@ -246,15 +322,23 @@ const Checker = struct {
         errdefer c.scratch_arena.deinit();
         const arena_alloc = c.carena.allocator();
         c.ts = try Store.init(arena_alloc);
-        c.sym_types = try arena_alloc.alloc(TypeId, bind.symbol_names.len);
+        const total_syms = prog.totalSymbols();
+        c.sym_types = try arena_alloc.alloc(TypeId, total_syms);
         @memset(c.sym_types, 0);
-        c.sym_state = try arena_alloc.alloc(u8, bind.symbol_names.len);
+        c.sym_state = try arena_alloc.alloc(u8, total_syms);
         @memset(c.sym_state, 0);
-        // Owner node -> primary scope map (first scope wins: lowest id).
-        for (bind.scope_owners, 0..) |owner, s| {
-            if (s == 0) continue;
-            const gop = try c.node_scopes.getOrPut(arena_alloc, owner);
-            if (!gop.found_existing) gop.value_ptr.* = @intCast(s);
+        c.owned_mask = try arena_alloc.alloc(bool, prog.files.len);
+        @memset(c.owned_mask, false);
+        for (owned) |f| c.owned_mask[f] = true;
+        // Owner node -> primary scope map (first scope wins: lowest id),
+        // for every program file (foreign decls are traversed on demand).
+        for (prog.files, 0..) |*pf, fi| {
+            for (pf.bind.scope_owners, 0..) |owner, s| {
+                if (s == 0) continue;
+                const key = (@as(u64, @intCast(fi)) << 32) | owner;
+                const gop = try c.node_scopes.getOrPut(arena_alloc, key);
+                if (!gop.found_existing) gop.value_ptr.* = @intCast(s);
+            }
         }
         c.atom_length = try c.atom("length");
         for (typeof_names, 0..) |n, i| c.typeof_atoms[i] = try c.atom(n);
@@ -274,18 +358,33 @@ const Checker = struct {
     }
 
     fn run(c: *Checker) Error!void {
-        for (c.tree.nodeRange(0)) |stmt| {
-            if (stmt != null_node) try c.checkStatement(stmt);
-            c.noteScratch();
-            _ = c.scratch_arena.reset(.retain_capacity);
+        for (c.owned) |f| {
+            c.setFile(f);
+            c.cur_scope = binder.file_scope;
+            c.fn_ctx = null;
+            c.this_type = 0;
+            for (c.tree.nodeRange(0)) |stmt| {
+                if (stmt != null_node) try c.checkStatement(stmt);
+                c.noteScratch();
+                _ = c.scratch_arena.reset(.retain_capacity);
+            }
         }
         // TDZ / use-before-assign / 2304 come from the walk itself.
     }
 
     fn seal(c: *Checker) Error!Check {
-        // Sort diagnostics by span for deterministic output.
+        // Keep only owned-file diagnostics (foreign spans are reported by
+        // the checker that owns them), sorted for deterministic output.
+        var w: usize = 0;
+        for (c.diags.items) |d| {
+            if (!c.owned_mask[d.file]) continue;
+            c.diags.items[w] = d;
+            w += 1;
+        }
+        c.diags.items.len = w;
         std.mem.sort(Diag, c.diags.items, {}, struct {
             fn lessThan(_: void, x: Diag, y: Diag) bool {
+                if (x.file != y.file) return x.file < y.file;
                 if (x.span.start != y.span.start) return x.span.start < y.span.start;
                 return x.code < y.code;
             }
@@ -308,6 +407,111 @@ const Checker = struct {
     }
     fn ca(c: *Checker) Allocator {
         return c.carena.allocator();
+    }
+
+    // =====================================================================
+    // multi-file context & global symbols
+    // =====================================================================
+    //
+    // SymbolIds inside the checker (and inside type payloads) are GLOBAL:
+    // `sym_base[file] + local`. Locals returned by binder lookups are
+    // converted at the boundary (`toGlobal`). Functions that traverse a
+    // symbol's declaration nodes first switch the current-file context
+    // (`enterSymFile`), so `c.tree`/`c.bind`/`c.src` always match the
+    // nodes in hand.
+
+    fn setFile(c: *Checker, f: FileId) void {
+        c.cur_file = f;
+        const pf = &c.prog.files[f];
+        c.tree = pf.tree;
+        c.bind = pf.bind;
+        c.src = pf.src;
+    }
+
+    const SavedCtx = struct { file: FileId, scope: ScopeId };
+
+    fn saveCtx(c: *const Checker) SavedCtx {
+        return .{ .file = c.cur_file, .scope = c.cur_scope };
+    }
+
+    fn restoreCtx(c: *Checker, s: SavedCtx) void {
+        if (s.file != c.cur_file) c.setFile(s.file);
+        c.cur_scope = s.scope;
+    }
+
+    /// Switch to `sym`'s file (scope untouched; callers set it).
+    fn enterSymFile(c: *Checker, sym: SymbolId) SavedCtx {
+        const saved = c.saveCtx();
+        const f = c.symFile(sym);
+        if (f != c.cur_file) c.setFile(f);
+        return saved;
+    }
+
+    /// File that owns global symbol `sym` (fast path: current file).
+    fn symFile(c: *const Checker, sym: SymbolId) FileId {
+        const base = c.prog.sym_base;
+        if (sym >= base[c.cur_file] and sym < base[c.cur_file + 1]) return c.cur_file;
+        var lo: usize = 0;
+        var hi: usize = c.prog.files.len;
+        while (hi - lo > 1) {
+            const mid = lo + (hi - lo) / 2;
+            if (base[mid] <= sym) lo = mid else hi = mid;
+        }
+        return @intCast(lo);
+    }
+
+    /// Local (per-file) id of a global symbol.
+    fn localOf(c: *const Checker, sym: SymbolId) SymbolId {
+        return sym - c.prog.sym_base[c.symFile(sym)];
+    }
+
+    /// Global id of a local symbol of the current file.
+    fn toGlobal(c: *const Checker, local: SymbolId) SymbolId {
+        if (local == binder.no_symbol) return binder.no_symbol;
+        return c.prog.sym_base[c.cur_file] + local;
+    }
+
+    fn toGlobalIn(c: *const Checker, file: FileId, local: SymbolId) SymbolId {
+        if (local == binder.no_symbol) return binder.no_symbol;
+        return c.prog.sym_base[file] + local;
+    }
+
+    fn symBind(c: *const Checker, sym: SymbolId) *const Bind {
+        return c.prog.files[c.symFile(sym)].bind;
+    }
+
+    fn symFlags(c: *const Checker, sym: SymbolId) binder.SymbolFlags {
+        const f = c.symFile(sym);
+        return c.prog.files[f].bind.symbol_flags[sym - c.prog.sym_base[f]];
+    }
+
+    fn symNameAtom(c: *const Checker, sym: SymbolId) Atom {
+        const f = c.symFile(sym);
+        return c.prog.files[f].bind.symbol_names[sym - c.prog.sym_base[f]];
+    }
+
+    /// Local scope id of `sym` within its own file.
+    fn symScope(c: *const Checker, sym: SymbolId) ScopeId {
+        const f = c.symFile(sym);
+        return c.prog.files[f].bind.symbol_scopes[sym - c.prog.sym_base[f]];
+    }
+
+    /// Decl nodes of a global symbol (valid in `symFile(sym)`'s tree).
+    fn declsOf(c: *const Checker, sym: SymbolId) []const Node {
+        const f = c.symFile(sym);
+        return c.prog.files[f].bind.declsOf(sym - c.prog.sym_base[f]);
+    }
+
+    /// (file << 32 | node) cache key for the current file.
+    fn nodeKey(c: *const Checker, node: Node) u64 {
+        return (@as(u64, c.cur_file) << 32) | node;
+    }
+
+    /// Link target of an import-binding symbol (null in unlinked mode).
+    fn importTarget(c: *const Checker, sym: SymbolId) ?modules.Target {
+        if (c.prog.links.len == 0) return null;
+        const f = c.symFile(sym);
+        return c.prog.links[f].importTarget(sym - c.prog.sym_base[f]);
     }
 
     // =====================================================================
@@ -365,15 +569,15 @@ const Checker = struct {
     }
 
     fn diagFmt(c: *Checker, code: u16, span: Span, comptime fmt: []const u8, args: anytype) Error!void {
-        const key = (@as(u64, code) << 32) | span.start;
+        const key = (@as(u128, c.cur_file) << 64) | (@as(u128, code) << 32) | span.start;
         const gop = try c.diag_seen.getOrPut(c.gpa, key);
         if (gop.found_existing) return;
         const msg = try std.fmt.allocPrint(c.out, fmt, args);
-        try c.diags.append(c.gpa, .{ .code = code, .span = span, .msg = msg });
+        try c.diags.append(c.gpa, .{ .code = code, .file = c.cur_file, .span = span, .msg = msg });
     }
 
     fn scopeOf(c: *const Checker, node: Node) ?ScopeId {
-        return c.node_scopes.get(node);
+        return c.node_scopes.get((@as(u64, c.cur_file) << 32) | node);
     }
 
     /// Nearest enclosing function/file scope (for TDZ containment).
@@ -392,6 +596,9 @@ const Checker = struct {
     // name resolution (value vs type space)
     // =====================================================================
 
+    /// Import bindings are optimistic in both spaces (the target decides;
+    /// refined at use sites via the link tables) except that a type-only
+    /// import never has value meaning (TS1361 at value uses).
     fn hasValueMeaning(f: binder.SymbolFlags) bool {
         if (f.import_binding and f.type_only) return false;
         return f.var_decl or f.let_decl or f.const_decl or f.function or f.class or
@@ -400,7 +607,7 @@ const Checker = struct {
 
     fn hasTypeMeaning(f: binder.SymbolFlags) bool {
         return f.class or f.interface or f.type_alias or f.type_param or
-            (f.import_binding and f.type_only);
+            f.import_binding;
     }
 
     const Resolved = union(enum) {
@@ -409,6 +616,7 @@ const Checker = struct {
         none,
     };
 
+    /// Resolve in the current file's scope chain; returns GLOBAL ids.
     fn resolveSpace(c: *Checker, a: Atom, from: ScopeId, want_value: bool) Resolved {
         var s = from;
         var wrong: SymbolId = binder.no_symbol;
@@ -416,13 +624,13 @@ const Checker = struct {
             if (c.bind.lookupInScope(s, a)) |sym| {
                 const f = c.bind.symbol_flags[sym];
                 const ok = if (want_value) hasValueMeaning(f) else hasTypeMeaning(f);
-                if (ok) return .{ .sym = sym };
+                if (ok) return .{ .sym = c.toGlobal(sym) };
                 if (wrong == binder.no_symbol) wrong = sym;
             }
             if (s == binder.file_scope) break;
             s = c.bind.scope_parents[s];
         }
-        if (wrong != binder.no_symbol) return .{ .wrong_space = wrong };
+        if (wrong != binder.no_symbol) return .{ .wrong_space = c.toGlobal(wrong) };
         return .none;
     }
 
@@ -716,16 +924,17 @@ const Checker = struct {
     }
 
     fn symbolName(c: *Checker, sym: u32) []const u8 {
-        if (sym == 0 or sym >= c.bind.symbol_names.len) return "?";
-        return c.atomText(c.bind.symbol_names[sym]);
+        if (sym == 0 or sym >= c.prog.totalSymbols()) return "?";
+        return c.atomText(c.symNameAtom(sym));
     }
 
     fn dumpTypes(c: *Checker, w: *std.Io.Writer) (Error || std.Io.Writer.Error)!void {
         for (1..c.bind.symbol_names.len) |i| {
-            const sym: SymbolId = @intCast(i);
-            if (c.bind.symbol_scopes[sym] != binder.file_scope) continue;
-            const f = c.bind.symbol_flags[sym];
+            const local: SymbolId = @intCast(i);
+            if (c.bind.symbol_scopes[local] != binder.file_scope) continue;
+            const f = c.bind.symbol_flags[local];
             if (!hasValueMeaning(f)) continue;
+            const sym = c.toGlobal(local);
             const t = try c.typeOfSymbol(sym);
             const str = try c.typeToString(t);
             try w.print("{s}: {s}\n", .{ c.symbolName(sym), str });
@@ -844,10 +1053,28 @@ const Checker = struct {
         }
         const a = try c.atomOfToken(tok);
         switch (c.resolveSpace(a, c.cur_scope, false)) {
-            .sym => |sym| {
-                const f = c.bind.symbol_flags[sym];
+            .sym => |sym0| {
+                var sym = sym0;
+                var f = c.symFlags(sym);
+                if (f.import_binding) {
+                    const tgt = c.importTarget(sym) orelse return types.any_type; // unlinked
+                    switch (tgt.kind) {
+                        .binding => {
+                            sym = c.toGlobalIn(tgt.file, tgt.payload);
+                            f = c.symFlags(sym);
+                            if (!hasTypeMeaning(f) or f.import_binding) {
+                                if (hasValueMeaning(f)) {
+                                    try c.diagFmt(2749, c.tokSpan(tok), "'{s}' refers to a value, but is being used as a type here. Did you mean 'typeof {s}'?", .{ c.tokenText(tok), c.tokenText(tok) });
+                                    return types.error_type;
+                                }
+                                return types.any_type;
+                            }
+                        },
+                        // Namespace-as-type / unresolved: any (documented).
+                        .namespace, .default_expr, .any => return types.any_type,
+                    }
+                }
                 if (f.type_param) return c.ts.makeTypeParam(sym);
-                if (f.import_binding and f.type_only) return types.any_type; // M5
                 if (f.type_alias) return c.aliasInstance(sym, args, tok);
                 if (f.interface or f.class) {
                     const fixed = try c.fixTypeArgs(sym, args, tok) orelse return types.error_type;
@@ -894,9 +1121,11 @@ const Checker = struct {
     };
 
     /// Type parameters of a generic symbol (class/interface/alias), from
-    /// its first declaration.
+    /// its first declaration. Symbol ids in the result are global.
     fn typeParamsOf(c: *Checker, sym: SymbolId, buf: *std.ArrayList(TypeParamInfo)) Error!void {
-        const decls = c.bind.declsOf(sym);
+        const saved = c.enterSymFile(sym);
+        defer c.restoreCtx(saved);
+        const decls = c.declsOf(sym);
         if (decls.len == 0) return;
         const decl = decls[0];
         const d = c.tree.nodeData(decl);
@@ -926,7 +1155,7 @@ const Checker = struct {
             const a = try c.atomOfToken(c.tree.nodeMainToken(tp));
             const tp_sym = c.bind.lookupInScope(decl_scope, a) orelse continue;
             const td = c.tree.nodeData(tp);
-            try buf.append(c.scratch(), .{ .sym = tp_sym, .constraint = td.lhs, .default = td.rhs });
+            try buf.append(c.scratch(), .{ .sym = c.toGlobal(tp_sym), .constraint = td.lhs, .default = td.rhs });
         }
     }
 
@@ -954,6 +1183,10 @@ const Checker = struct {
             if (i < args.len) {
                 out[i] = args[i];
             } else if (tp.default != 0) {
+                // Defaults are nodes of the declaring file; evaluate there.
+                const saved = c.enterSymFile(sym);
+                defer c.restoreCtx(saved);
+                c.cur_scope = c.symScope(tp.sym);
                 out[i] = try c.typeFromTypeNode(tp.default);
             } else {
                 out[i] = types.any_type;
@@ -1144,21 +1377,25 @@ const Checker = struct {
         report_implicit: bool,
         ctx_sig: TypeId,
     ) Error!TypeId {
-        if (c.sig_cache.get(node)) |cached| return cached;
+        if (c.sig_cache.get(c.nodeKey(node))) |cached| return cached;
         const proto = c.tree.extraData(ast.FnProto, proto_idx);
         const saved_scope = c.cur_scope;
         defer c.cur_scope = saved_scope;
         if (c.scopeOf(node)) |s| c.cur_scope = s;
 
-        // Type parameters.
+        // Type parameters (global symbol ids in the signature type).
         var tps: std.ArrayList(u32) = .empty;
         defer tps.deinit(c.scratch());
         for (c.tree.extraRange(proto.tp_start, proto.tp_end)) |tp| {
             if (tp == null_node or c.nodeTag(tp) != .type_param) continue;
             const a = try c.atomOfToken(c.tree.nodeMainToken(tp));
             if (c.bind.lookupInScope(c.cur_scope, a)) |tp_sym| {
-                try tps.append(c.scratch(), tp_sym);
+                try tps.append(c.scratch(), c.toGlobal(tp_sym));
             }
+            // Evaluate constraints eagerly so their diagnostics are
+            // partition-independent (owners always see them).
+            const td = c.tree.nodeData(tp);
+            if (td.lhs != 0) _ = try c.typeFromTypeNode(td.lhs);
         }
 
         var params: std.ArrayList(types.Param) = .empty;
@@ -1173,7 +1410,7 @@ const Checker = struct {
             // contextual/inferred type (not a re-derivation without ctx).
             if (p.name != 0) {
                 if (c.bind.lookupInScope(c.cur_scope, p.name)) |psym| {
-                    if (c.bind.symbol_flags[psym].param) c.setTypeOfSymbol(psym, p.ty);
+                    if (c.bind.symbol_flags[psym].param) c.setTypeOfSymbol(c.toGlobal(psym), p.ty);
                 }
             }
             pi += 1;
@@ -1191,7 +1428,7 @@ const Checker = struct {
         {
             // Reserve the cache slot to break recursion (self-recursive
             // unannotated functions infer any, TS7023-adjacent).
-            try c.sig_cache.put(c.ca(), node, try c.ts.makeFunction(params.items, types.any_type, tps.items, if (is_method) types.fn_flag_method else 0));
+            try c.sig_cache.put(c.ca(), c.nodeKey(node), try c.ts.makeFunction(params.items, types.any_type, tps.items, if (is_method) types.fn_flag_method else 0));
             ret = try c.inferReturnType(node, c.tree.nodeData(node).rhs);
         } else if (proto.flags & (ast.Flags.get) != 0) {
             ret = types.any_type;
@@ -1200,7 +1437,7 @@ const Checker = struct {
         }
 
         const sig = try c.ts.makeFunction(params.items, ret, tps.items, if (is_method) types.fn_flag_method else 0);
-        try c.sig_cache.put(c.ca(), node, sig);
+        try c.sig_cache.put(c.ca(), c.nodeKey(node), sig);
         return sig;
     }
 
@@ -1326,17 +1563,20 @@ const Checker = struct {
     }
 
     fn computeTypeOfSymbol(c: *Checker, sym: SymbolId) Error!TypeId {
-        const f = c.bind.symbol_flags[sym];
-        const saved_scope = c.cur_scope;
-        defer c.cur_scope = saved_scope;
-        c.cur_scope = c.bind.symbol_scopes[sym];
-
-        if (f.import_binding) return types.any_type; // M5
+        const f = c.symFlags(sym);
+        if (f.import_binding) return c.importedSymbolType(sym);
         if (f.class) return c.ts.makeClassValue(sym);
         if (f.function) return c.functionSymbolType(sym);
         if (f.property or f.method or f.getter or f.setter) return c.memberTypeOf(sym);
+
+        // The remaining cases traverse decl nodes: switch to the symbol's
+        // file and declaring scope.
+        const saved = c.enterSymFile(sym);
+        defer c.restoreCtx(saved);
+        c.cur_scope = c.symScope(sym);
+
         if (f.catch_param) {
-            const decls = c.bind.declsOf(sym);
+            const decls = c.declsOf(sym);
             if (decls.len > 0 and c.nodeTag(decls[0]) == .declarator_full) {
                 const dd = c.tree.nodeData(decls[0]);
                 const e = c.tree.extraData(ast.DeclaratorFull, dd.rhs);
@@ -1345,14 +1585,14 @@ const Checker = struct {
             return types.unknown_type; // useUnknownInCatchVariables (strict)
         }
         if (f.param) {
-            const decls = c.bind.declsOf(sym);
+            const decls = c.declsOf(sym);
             for (decls) |decl| {
                 switch (c.nodeTag(decl)) {
                     .param, .param_full => {
                         const p = try c.paramInfo(decl, 0, types.no_type, false);
                         // Pattern params: paramInfo names only identifiers;
                         // for destructured params fall through to any.
-                        if (p.name != 0 and p.name == c.bind.symbol_names[sym]) return p.ty;
+                        if (p.name != 0 and p.name == c.symNameAtom(sym)) return p.ty;
                         return c.bindingElementType(sym, decl, p.ty);
                     },
                     else => {},
@@ -1361,7 +1601,7 @@ const Checker = struct {
             return types.any_type;
         }
         if (f.var_decl or f.let_decl or f.const_decl) {
-            const decls = c.bind.declsOf(sym);
+            const decls = c.declsOf(sym);
             for (decls) |decl| {
                 const t = try c.declaratorType(sym, decl, f.const_decl);
                 if (t != types.no_type) return t;
@@ -1369,6 +1609,73 @@ const Checker = struct {
             return types.any_type;
         }
         return types.any_type;
+    }
+
+    // =====================================================================
+    // imported symbols (M5)
+    // =====================================================================
+
+    /// Value type of an import binding, via the sealed link tables.
+    fn importedSymbolType(c: *Checker, sym: SymbolId) Error!TypeId {
+        const tgt = c.importTarget(sym) orelse return types.any_type; // unlinked
+        return c.targetValueType(tgt);
+    }
+
+    fn targetValueType(c: *Checker, tgt: modules.Target) Error!TypeId {
+        switch (tgt.kind) {
+            .any => return types.any_type,
+            .binding => return c.typeOfSymbol(c.toGlobalIn(tgt.file, tgt.payload)),
+            .namespace => return c.namespaceObjectType(tgt.file),
+            .default_expr => {
+                const saved = c.saveCtx();
+                defer c.restoreCtx(saved);
+                c.setFile(tgt.file);
+                c.cur_scope = binder.file_scope;
+                const inner = c.tree.nodeData(tgt.payload).lhs;
+                switch (c.nodeTag(inner)) {
+                    .function_decl => return c.signatureOfProto(inner, c.tree.nodeData(inner).lhs, false, true),
+                    // Unnamed `export default class`: documented cut.
+                    .class_decl => return types.any_type,
+                    else => return c.widenLiteral(try c.checkExprCached(inner, types.no_type)),
+                }
+            },
+        }
+    }
+
+    /// The module namespace object of `file` (`import * as ns`): one
+    /// read-only property per value-space export. Type-space-only exports
+    /// (interfaces, aliases, `export type`) are omitted — accessing them
+    /// as values is a property error, close to tsc's behavior. Cycle-safe.
+    fn namespaceObjectType(c: *Checker, file: FileId) Error!TypeId {
+        if (c.ns_types.get(file)) |t| {
+            if (t == types.no_type) return types.any_type; // ns cycle
+            return t;
+        }
+        try c.ns_types.put(c.ca(), file, types.no_type);
+        var props: std.ArrayList(types.Prop) = .empty;
+        defer props.deinit(c.scratch());
+        if (c.prog.links.len != 0) {
+            const l = &c.prog.links[file];
+            for (l.export_atoms, l.export_targets) |name, tgt| {
+                if (tgt.type_only) continue;
+                var ty: TypeId = types.any_type;
+                switch (tgt.kind) {
+                    .binding => {
+                        const g = c.toGlobalIn(tgt.file, tgt.payload);
+                        const f = c.symFlags(g);
+                        if (!hasValueMeaning(f)) continue;
+                        ty = try c.typeOfSymbol(g);
+                    },
+                    .namespace => ty = try c.namespaceObjectType(tgt.file),
+                    .default_expr => ty = try c.targetValueType(tgt),
+                    .any => {},
+                }
+                try props.append(c.scratch(), .{ .name = name, .ty = ty, .flags = types.prop_flag_readonly });
+            }
+        }
+        const obj = try c.ts.makeObject(props.items, 0, 0, false);
+        try c.ns_types.put(c.ca(), file, obj);
+        return obj;
     }
 
     /// Type of one variable declarator for `sym` (no_type if this decl
@@ -1407,7 +1714,7 @@ const Checker = struct {
             .declarator, .declarator_init, .declarator_full, .param, .param_full => d.lhs,
             else => decl,
         };
-        const name = c.bind.symbol_names[sym];
+        const name = c.symNameAtom(sym);
         var result: TypeId = types.any_type;
         _ = try c.findBindingType(pattern, name, whole, &result);
         return result;
@@ -1486,7 +1793,10 @@ const Checker = struct {
     }
 
     fn functionSymbolType(c: *Checker, sym: SymbolId) Error!TypeId {
-        const decls = c.bind.declsOf(sym);
+        const saved = c.enterSymFile(sym);
+        defer c.restoreCtx(saved);
+        c.cur_scope = c.symScope(sym);
+        const decls = c.declsOf(sym);
         var sigs: std.ArrayList(TypeId) = .empty;
         defer sigs.deinit(c.scratch());
         var impl_sig: TypeId = types.no_type;
@@ -1508,8 +1818,11 @@ const Checker = struct {
 
     /// Type of a class/interface member symbol (unsubstituted).
     fn memberTypeOf(c: *Checker, sym: SymbolId) Error!TypeId {
-        const f = c.bind.symbol_flags[sym];
-        const decls = c.bind.declsOf(sym);
+        const saved = c.enterSymFile(sym);
+        defer c.restoreCtx(saved);
+        c.cur_scope = c.symScope(sym);
+        const f = c.symFlags(sym);
+        const decls = c.declsOf(sym);
         if (f.method) {
             var sigs: std.ArrayList(TypeId) = .empty;
             defer sigs.deinit(c.scratch());
@@ -1594,20 +1907,22 @@ const Checker = struct {
     fn aliasGeneric(c: *Checker, sym: SymbolId) Error!TypeId {
         if (c.alias_generic.get(sym)) |t| return t;
         try c.alias_state.put(c.ca(), sym, 1);
-        const decls = c.bind.declsOf(sym);
+        const saved_ctx = c.enterSymFile(sym);
+        defer c.restoreCtx(saved_ctx);
+        const decls = c.declsOf(sym);
         var result: TypeId = types.any_type;
         for (decls) |decl| {
             if (c.nodeTag(decl) != .type_alias) continue;
             const d = c.tree.nodeData(decl);
             const saved = c.cur_scope;
             defer c.cur_scope = saved;
-            if (c.scopeOf(decl)) |s| c.cur_scope = s else c.cur_scope = c.bind.symbol_scopes[sym];
+            if (c.scopeOf(decl)) |s| c.cur_scope = s else c.cur_scope = c.symScope(sym);
             result = try c.typeFromTypeNode(d.rhs);
             break;
         }
         // `type T = T` (any cycle collapsing to a self-ref) is circular.
         if (c.ts.kind(result) == .ref and c.ts.refSymbol(result) == sym) {
-            const decls2 = c.bind.declsOf(sym);
+            const decls2 = c.declsOf(sym);
             if (decls2.len > 0) {
                 const data = c.tree.extraData(ast.TypeAlias, c.tree.nodeData(decls2[0]).lhs);
                 try c.diagFmt(2456, c.tokSpan(data.name_token), "Type alias '{s}' circularly references itself.", .{c.symbolName(sym)});
@@ -1638,7 +1953,7 @@ const Checker = struct {
         try c.expansions.put(c.ca(), ref, types.no_type); // in-progress
         const sym = c.ts.refSymbol(ref);
         const args = try c.scratch().dupe(TypeId, c.ts.refArgs(ref));
-        const f = c.bind.symbol_flags[sym];
+        const f = c.symFlags(sym);
         var generic: TypeId = types.any_type;
         if (f.class) {
             generic = try c.classInstanceGeneric(sym);
@@ -1669,10 +1984,12 @@ const Checker = struct {
     /// Generic (type-params-as-themselves) instance shape of an interface,
     /// with `extends` bases merged (derived members win).
     fn interfaceGeneric(c: *Checker, sym: SymbolId) Error!TypeId {
+        const saved_ctx = c.enterSymFile(sym);
+        defer c.restoreCtx(saved_ctx);
         if (c.iface_generic.get(sym)) |t| {
             if (t == types.no_type) {
                 // Recursive base chain.
-                const decls = c.bind.declsOf(sym);
+                const decls = c.declsOf(sym);
                 if (decls.len > 0) {
                     const data = c.tree.extraData(ast.InterfaceData, c.tree.nodeData(decls[0]).lhs);
                     try c.diagFmt(2310, c.tokSpan(data.name_token), "Type '{s}' recursively references itself as a base type.", .{c.symbolName(sym)});
@@ -1688,9 +2005,7 @@ const Checker = struct {
         var bases: std.ArrayList(TypeId) = .empty;
         defer bases.deinit(c.scratch());
 
-        const saved = c.cur_scope;
-        defer c.cur_scope = saved;
-        for (c.bind.declsOf(sym)) |decl| {
+        for (c.declsOf(sym)) |decl| {
             if (c.nodeTag(decl) != .interface_decl) continue;
             const d = c.tree.nodeData(decl);
             const data = c.tree.extraData(ast.InterfaceData, d.lhs);
@@ -1714,7 +2029,7 @@ const Checker = struct {
             }
         }
         // Convert members in the (first) interface scope.
-        for (c.bind.declsOf(sym)) |decl| {
+        for (c.declsOf(sym)) |decl| {
             if (c.nodeTag(decl) == .interface_decl) {
                 if (c.scopeOf(decl)) |s| c.cur_scope = s;
                 break;
@@ -1754,16 +2069,18 @@ const Checker = struct {
             return t;
         }
         try c.class_inst_generic.put(c.ca(), sym, types.no_type);
+        const saved_ctx = c.enterSymFile(sym);
+        defer c.restoreCtx(saved_ctx);
         var props: std.ArrayList(types.Prop) = .empty;
         defer props.deinit(c.scratch());
         var result: TypeId = types.empty_object_type;
-        if (c.bind.membersScopeOf(sym)) |ms| {
+        if (c.bind.membersScopeOf(c.localOf(sym))) |ms| {
             const lo = c.bind.scope_members_start[ms];
             const hi = c.bind.scope_members_start[ms + 1];
             for (lo..hi) |i| {
-                const msym = c.bind.member_syms[i];
+                const msym = c.toGlobal(c.bind.member_syms[i]);
                 const name = c.bind.member_atoms[i];
-                const mf = c.bind.symbol_flags[msym];
+                const mf = c.symFlags(msym);
                 if (isCtorName(c, name)) continue;
                 var flags: u32 = 0;
                 if (mf.optional_member) flags |= types.prop_flag_optional;
@@ -1788,9 +2105,12 @@ const Checker = struct {
         return std.mem.eql(u8, c.atomText(name), "constructor");
     }
 
-    /// The `extends` base of a class as a ref (or null).
+    /// The `extends` base of a class as a ref (or null). The base name
+    /// resolves in the class's own file (so imported bases work).
     fn baseClassRef(c: *Checker, sym: SymbolId) Error!?TypeId {
-        for (c.bind.declsOf(sym)) |decl| {
+        const saved_ctx = c.enterSymFile(sym);
+        defer c.restoreCtx(saved_ctx);
+        for (c.declsOf(sym)) |decl| {
             if (c.nodeTag(decl) != .class_decl) continue;
             const data = c.tree.extraData(ast.ClassData, c.tree.nodeData(decl).lhs);
             if (data.extends == 0) return null;
@@ -1801,8 +2121,15 @@ const Checker = struct {
             if (c.scopeOf(decl)) |s| c.cur_scope = s;
             const a = try c.atomOfToken(c.tree.nodeMainToken(hd.lhs));
             switch (c.resolveSpace(a, c.cur_scope, true)) {
-                .sym => |base_sym| {
-                    if (!c.bind.symbol_flags[base_sym].class) return null;
+                .sym => |base_sym0| {
+                    var base_sym = base_sym0;
+                    // Follow an imported base class to its declaration.
+                    if (c.symFlags(base_sym).import_binding) {
+                        const tgt = c.importTarget(base_sym) orelse return null;
+                        if (tgt.kind != .binding) return null;
+                        base_sym = c.toGlobalIn(tgt.file, tgt.payload);
+                    }
+                    if (!c.symFlags(base_sym).class) return null;
                     var targs: std.ArrayList(TypeId) = .empty;
                     defer targs.deinit(c.scratch());
                     if (hd.rhs != 0) {
@@ -1824,14 +2151,16 @@ const Checker = struct {
     /// separately by `new` resolution).
     fn classStaticType(c: *Checker, sym: SymbolId) Error!TypeId {
         if (c.class_static_cache.get(sym)) |t| return t;
+        const saved_ctx = c.enterSymFile(sym);
+        defer c.restoreCtx(saved_ctx);
         var props: std.ArrayList(types.Prop) = .empty;
         defer props.deinit(c.scratch());
-        if (c.bind.staticsScopeOf(sym)) |ss| {
+        if (c.bind.staticsScopeOf(c.localOf(sym))) |ss| {
             const lo = c.bind.scope_members_start[ss];
             const hi = c.bind.scope_members_start[ss + 1];
             for (lo..hi) |i| {
-                const msym = c.bind.member_syms[i];
-                const mf = c.bind.symbol_flags[msym];
+                const msym = c.toGlobal(c.bind.member_syms[i]);
+                const mf = c.symFlags(msym);
                 var flags: u32 = 0;
                 if (mf.readonly_member) flags |= types.prop_flag_readonly;
                 try props.append(c.scratch(), .{
@@ -1852,7 +2181,9 @@ const Checker = struct {
         var cur = sym;
         var depth: u32 = 0;
         while (depth < 16) : (depth += 1) {
-            if (c.bind.membersScopeOf(cur)) |ms| {
+            const saved = c.enterSymFile(cur);
+            defer c.restoreCtx(saved);
+            if (c.bind.membersScopeOf(c.localOf(cur))) |ms| {
                 const lo = c.bind.scope_members_start[ms];
                 const hi = c.bind.scope_members_start[ms + 1];
                 for (lo..hi) |i| {
@@ -2082,14 +2413,14 @@ const Checker = struct {
     }
 
     fn typeParamConstraint(c: *Checker, sym: SymbolId) Error!TypeId {
-        const decls = c.bind.declsOf(sym);
+        const saved = c.enterSymFile(sym);
+        defer c.restoreCtx(saved);
+        const decls = c.declsOf(sym);
         for (decls) |decl| {
             if (c.nodeTag(decl) != .type_param) continue;
             const d = c.tree.nodeData(decl);
             if (d.lhs == 0) return types.no_type;
-            const saved = c.cur_scope;
-            defer c.cur_scope = saved;
-            c.cur_scope = c.bind.symbol_scopes[sym];
+            c.cur_scope = c.symScope(sym);
             return c.typeFromTypeNode(d.lhs);
         }
         return types.no_type;
@@ -2597,7 +2928,7 @@ const Checker = struct {
                     defer i += 1;
                     if (c.nodeTag(el) == .omitted or c.nodeTag(el) == .spread_element) continue;
                     const tt = if (rtk == .array) c.ts.arrayElem(rt) else (c.tupleElemTypeAt(rt, i) orelse continue);
-                    const et = c.node_types.get(el) orelse continue;
+                    const et = c.node_types.get(c.nodeKey(el)) orelse continue;
                     if (try c.isAssignable(et, tt)) continue;
                     if (!try c.elaborateLiteralError(el, et, tt)) {
                         try c.reportNotAssignable(2322, et, tt, c.nodeSpan(el));
@@ -2618,7 +2949,7 @@ const Checker = struct {
                     const key = try c.memberAtom(c.tree.nodeMainToken(prop));
                     const tp = c.ts.objectPropByName(rt, key) orelse continue;
                     const value_node = if (tag == .object_property) pd.rhs else pd.lhs;
-                    const vt = c.node_types.get(value_node) orelse continue;
+                    const vt = c.node_types.get(c.nodeKey(value_node)) orelse continue;
                     if (try c.isAssignable(vt, tp.ty)) continue;
                     if (!try c.elaborateLiteralError(value_node, vt, tp.ty)) {
                         try c.reportNotAssignable(2322, vt, tp.ty, c.nodeSpan(value_node));
@@ -2754,7 +3085,7 @@ const Checker = struct {
             if (tag == .object_property) {
                 const pd = c.tree.nodeData(prop);
                 if (c.nodeTag(pd.rhs) == .object_literal) {
-                    if (c.node_types.get(pd.rhs)) |nested_t| {
+                    if (c.node_types.get(c.nodeKey(pd.rhs))) |nested_t| {
                         if (try c.targetPropType(rt, key)) |tp| {
                             try c.excessPropertyCheck(pd.rhs, nested_t, tp);
                         }
@@ -2798,9 +3129,9 @@ const Checker = struct {
 
     fn checkExprCached(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         if (node == null_node) return types.any_type;
-        if (c.node_types.get(node)) |t| return t;
+        if (c.node_types.get(c.nodeKey(node))) |t| return t;
         const t = try c.checkExpr(node, ctx);
-        try c.node_types.put(c.ca(), node, t);
+        try c.node_types.put(c.ca(), c.nodeKey(node), t);
         return t;
     }
 
@@ -2903,7 +3234,25 @@ const Checker = struct {
         const a = try c.atomOfToken(tok);
         switch (c.resolveSpace(a, c.cur_scope, true)) {
             .sym => |sym| {
-                const f = c.bind.symbol_flags[sym];
+                const f = c.symFlags(sym);
+                if (f.import_binding) {
+                    if (c.importTarget(sym)) |tgt| {
+                        if (tgt.kind == .binding) {
+                            const tf = c.symFlags(c.toGlobalIn(tgt.file, tgt.payload));
+                            // A pure type target is 2693 (matches tsc even
+                            // through `export type` chains); a value target
+                            // reached through `export type` is 1362.
+                            if (!hasValueMeaning(tf) and hasTypeMeaning(tf)) {
+                                try c.diagFmt(2693, c.tokSpan(tok), "'{s}' only refers to a type, but is being used as a value here.", .{c.tokenText(tok)});
+                                return types.error_type;
+                            }
+                        }
+                        if (tgt.type_only) {
+                            try c.diagFmt(1362, c.tokSpan(tok), "'{s}' cannot be used as a value because it was exported using 'export type'.", .{c.tokenText(tok)});
+                            return types.error_type;
+                        }
+                    }
+                }
                 const declared = try c.typeOfSymbol(sym);
                 // TDZ (TS2448): block-scoped use before declaration in the
                 // same function container.
@@ -2918,8 +3267,12 @@ const Checker = struct {
                 return c.flowTypeOfReference(node, sym, declared);
             },
             .wrong_space => |sym| {
+                const wf = c.symFlags(sym);
+                if (wf.import_binding and wf.type_only) {
+                    try c.diagFmt(1361, c.tokSpan(tok), "'{s}' cannot be used as a value because it was imported using 'import type'.", .{c.tokenText(tok)});
+                    return types.error_type;
+                }
                 try c.diagFmt(2693, c.tokSpan(tok), "'{s}' only refers to a type, but is being used as a value here.", .{c.tokenText(tok)});
-                _ = sym;
                 return types.error_type;
             },
             .none => {
@@ -2935,23 +3288,25 @@ const Checker = struct {
 
     fn checkTdz(c: *Checker, sym: SymbolId, node: Node, tok: TokenIndex) Error!void {
         _ = node;
-        const decls = c.bind.declsOf(sym);
+        if (c.symFile(sym) != c.cur_file) return; // cross-file: no TDZ
+        const decls = c.declsOf(sym);
         if (decls.len == 0) return;
         const decl_span = c.nodeSpan(decls[0]);
         const use_start = c.tree.tokens.start(tok);
         if (use_start >= decl_span.start) return;
         // Uses inside a *nested function* run later — no TDZ error.
         const use_container = c.containerOf(c.cur_scope);
-        const decl_container = c.containerOf(c.bind.symbol_scopes[sym]);
+        const decl_container = c.containerOf(c.symScope(sym));
         if (use_container != decl_container) return;
-        const kindname = if (c.bind.symbol_flags[sym].class) "Class" else "Block-scoped variable";
+        const kindname = if (c.symFlags(sym).class) "Class" else "Block-scoped variable";
         try c.diagFmt(2448, c.tokSpan(tok), "{s} '{s}' used before its declaration.", .{ kindname, c.tokenText(tok) });
     }
 
     fn checkUseBeforeAssigned(c: *Checker, sym: SymbolId, node: Node, tok: TokenIndex, declared: TypeId) Error!void {
         // Only for declarations without initializer whose type excludes
         // undefined/any, used in the same function container.
-        const decls = c.bind.declsOf(sym);
+        if (c.symFile(sym) != c.cur_file) return; // cross-file: assigned
+        const decls = c.declsOf(sym);
         var has_init = false;
         var has_definite = false;
         for (decls) |decl| {
@@ -2978,7 +3333,7 @@ const Checker = struct {
         const dk = c.ts.kind(declared);
         if (dk == .any or dk == .err or dk == .unknown or dk == .void or dk == .none) return;
         if (c.containsUndefinedish(declared)) return;
-        if (c.containerOf(c.cur_scope) != c.containerOf(c.bind.symbol_scopes[sym])) return;
+        if (c.containerOf(c.cur_scope) != c.containerOf(c.symScope(sym))) return;
         const flow = c.bind.flowAt(node) orelse return;
         if (!try c.definitelyAssigned(flow, sym)) {
             try c.diagFmt(2454, c.tokSpan(tok), "Variable '{s}' is used before being assigned.", .{c.tokenText(tok)});
@@ -3277,9 +3632,10 @@ const Checker = struct {
                 // Instance access to a static member (TS2576).
                 if (k == .ref) {
                     const cls = c.ts.refSymbol(t);
-                    if (c.bind.symbol_flags[cls].class) {
-                        if (c.bind.staticsScopeOf(cls)) |ss| {
-                            if (c.bind.lookupInScope(ss, name) != null) {
+                    const cls_bind = c.symBind(cls);
+                    if (c.symFlags(cls).class) {
+                        if (cls_bind.staticsScopeOf(c.localOf(cls))) |ss| {
+                            if (cls_bind.lookupInScope(ss, name) != null) {
                                 try c.diagFmt(2576, c.tokSpan(name_tok), "Property '{s}' does not exist on type '{s}'. Did you mean to access the static member '{s}.{s}' instead?", .{
                                     c.atomText(name), try c.typeToString(t), c.symbolName(cls), c.atomText(name),
                                 });
@@ -3615,9 +3971,14 @@ const Checker = struct {
                 const a = try c.atomOfToken(tok);
                 switch (c.resolveSpace(a, c.cur_scope, true)) {
                     .sym => |sym| {
-                        if (c.bind.symbol_flags[sym].const_decl) {
+                        const sf = c.symFlags(sym);
+                        if (sf.const_decl) {
                             try c.diagFmt(2588, c.tokSpan(tok), "Cannot assign to '{s}' because it is a constant.", .{c.tokenText(tok)});
                             return types.error_type; // suppress cascading 2322
+                        }
+                        if (sf.import_binding) {
+                            try c.diagFmt(2632, c.tokSpan(tok), "Cannot assign to '{s}' because it is an import.", .{c.tokenText(tok)});
+                            return types.error_type;
                         }
                         return c.typeOfSymbol(sym);
                     },
@@ -4167,7 +4528,7 @@ const Checker = struct {
     /// single-level property path `sym.prop`.
     const RefKey = struct { sym: SymbolId, prop: Atom };
 
-    const FlowQ = struct { flow: FlowId, key: u32, declared: TypeId };
+    const FlowQ = struct { file: FileId, flow: FlowId, key: u32, declared: TypeId };
 
     fn refKeyIndex(c: *Checker, key: RefKey) Error!u32 {
         const raw = (@as(u64, key.sym) << 32) | key.prop;
@@ -4215,7 +4576,7 @@ const Checker = struct {
         if (flow == binder.no_flow) return declared;
         if (flow == binder.unreachable_flow) return types.never_type;
         if (depth > 4000) return declared; // pathological chains: stay sound
-        const q: FlowQ = .{ .flow = flow, .key = try c.refKeyIndex(key), .declared = declared };
+        const q: FlowQ = .{ .file = c.cur_file, .flow = flow, .key = try c.refKeyIndex(key), .declared = declared };
         if (c.flow_cache.get(q)) |t| {
             if (t == types.no_type) return declared; // in progress (loop)
             return t;
@@ -4281,7 +4642,7 @@ const Checker = struct {
                 if (!try c.patternBindsSym(d.lhs, root_sym)) return null;
                 if (key.prop != 0) return declared; // root re-init: reset path
                 if (c.nodeTag(d.lhs) != .identifier) return declared;
-                const vt = c.node_types.get(d.rhs) orelse try c.checkExprCached(d.rhs, types.no_type);
+                const vt = c.node_types.get(c.nodeKey(d.rhs)) orelse try c.checkExprCached(d.rhs, types.no_type);
                 return try c.assignmentReduced(declared, vt);
             },
             .declarator_full => {
@@ -4291,7 +4652,7 @@ const Checker = struct {
                 if (key.prop != 0) return declared;
                 if (e.init == 0) return declared;
                 if (c.nodeTag(d.lhs) != .identifier) return declared;
-                const vt = c.node_types.get(e.init) orelse try c.checkExprCached(e.init, types.no_type);
+                const vt = c.node_types.get(c.nodeKey(e.init)) orelse try c.checkExprCached(e.init, types.no_type);
                 return try c.assignmentReduced(declared, vt);
             },
             .assign => {
@@ -4300,7 +4661,7 @@ const Checker = struct {
                 if (key.prop != 0 and try c.refMatches(d.lhs, key)) {
                     const op = c.tree.tokens.tag(c.tree.nodeMainToken(target));
                     if (op != .eq) return declared;
-                    const vt = c.node_types.get(d.rhs) orelse try c.checkExprCached(d.rhs, types.no_type);
+                    const vt = c.node_types.get(c.nodeKey(d.rhs)) orelse try c.checkExprCached(d.rhs, types.no_type);
                     return try c.assignmentReduced(declared, vt);
                 }
                 if (c.nodeTag(d.lhs) == .identifier) {
@@ -4308,10 +4669,10 @@ const Checker = struct {
                     if (key.prop != 0) return declared; // root overwritten
                     const op = c.tree.tokens.tag(c.tree.nodeMainToken(target));
                     if (op != .eq) {
-                        const vt = c.node_types.get(target) orelse declared;
+                        const vt = c.node_types.get(c.nodeKey(target)) orelse declared;
                         return try c.assignmentReduced(declared, vt);
                     }
-                    const vt = c.node_types.get(d.rhs) orelse try c.checkExprCached(d.rhs, types.no_type);
+                    const vt = c.node_types.get(c.nodeKey(d.rhs)) orelse try c.checkExprCached(d.rhs, types.no_type);
                     return try c.assignmentReduced(declared, vt);
                 }
                 if (try c.patternBindsSym(d.lhs, root_sym)) return declared;
@@ -4467,7 +4828,7 @@ const Checker = struct {
     fn identIsSym(c: *Checker, node: Node, sym: SymbolId) Error!bool {
         if (node == null_node or c.nodeTag(node) != .identifier) return false;
         const a = try c.atomOfToken(c.tree.nodeMainToken(node));
-        if (a != c.bind.symbol_names[sym]) return false;
+        if (a != c.symNameAtom(sym)) return false;
         return switch (c.resolveSpace(a, c.cur_scope, true)) {
             .sym => |s| s == sym,
             else => false,
@@ -4477,7 +4838,7 @@ const Checker = struct {
     fn patternBindsSym(c: *Checker, pat: Node, sym: SymbolId) Error!bool {
         if (pat == null_node) return false;
         switch (c.nodeTag(pat)) {
-            .identifier => return (try c.atomOfToken(c.tree.nodeMainToken(pat))) == c.bind.symbol_names[sym],
+            .identifier => return (try c.atomOfToken(c.tree.nodeMainToken(pat))) == c.symNameAtom(sym),
             .array_pattern, .object_pattern, .array_literal, .object_literal => {
                 for (c.tree.nodeRange(pat)) |el| {
                     if (el != null_node and try c.patternBindsSym(el, sym)) return true;
@@ -4487,7 +4848,7 @@ const Checker = struct {
             .binding_property, .object_shorthand, .object_property => {
                 const d = c.tree.nodeData(pat);
                 if (d.lhs != 0) return c.patternBindsSym(d.lhs, sym);
-                return (try c.memberAtom(c.tree.nodeMainToken(pat))) == c.bind.symbol_names[sym];
+                return (try c.memberAtom(c.tree.nodeMainToken(pat))) == c.symNameAtom(sym);
             },
             .binding_default, .rest_element, .spread_element => {
                 return c.patternBindsSym(c.tree.nodeData(pat).lhs, sym);
@@ -5095,7 +5456,7 @@ const Checker = struct {
                             if (c.nodeTag(dd.lhs) == .identifier) {
                                 const a = try c.atomOfToken(c.tree.nodeMainToken(dd.lhs));
                                 if (c.bind.lookupInScope(c.cur_scope, a)) |sym| {
-                                    c.setTypeOfSymbol(sym, elem_t);
+                                    c.setTypeOfSymbol(c.toGlobal(sym), elem_t);
                                 }
                             } else {
                                 try c.assignPatternFromType(dd.lhs, elem_t);
@@ -5125,7 +5486,7 @@ const Checker = struct {
         switch (c.nodeTag(pat)) {
             .identifier => {
                 const a = try c.atomOfToken(c.tree.nodeMainToken(pat));
-                if (c.bind.lookupInScope(c.cur_scope, a)) |sym| c.setTypeOfSymbol(sym, whole);
+                if (c.bind.lookupInScope(c.cur_scope, a)) |sym| c.setTypeOfSymbol(c.toGlobal(sym), whole);
             },
             .object_pattern => {
                 for (c.tree.nodeRange(pat)) |el| {
@@ -5139,7 +5500,7 @@ const Checker = struct {
                             try c.assignPatternFromType(ed.lhs, pt);
                         } else {
                             const a = try c.memberAtom(c.tree.nodeMainToken(el));
-                            if (c.bind.lookupInScope(c.cur_scope, a)) |sym| c.setTypeOfSymbol(sym, pt);
+                            if (c.bind.lookupInScope(c.cur_scope, a)) |sym| c.setTypeOfSymbol(c.toGlobal(sym), pt);
                         }
                     }
                 }
@@ -5398,7 +5759,7 @@ const Checker = struct {
         {
             return c.typeofSwitchIsExhaustive(node, c.tree.nodeData(d.lhs).lhs);
         }
-        const disc_t0 = c.node_types.get(d.lhs) orelse return false;
+        const disc_t0 = c.node_types.get(c.nodeKey(d.lhs)) orelse return false;
         const disc_t = disc_t0;
         if (c.ts.kind(disc_t) != .union_type) return false;
         const r = c.tree.extraData(ast.SubRange, d.rhs);
@@ -5411,7 +5772,7 @@ const Checker = struct {
                 if (clause == null_node or c.nodeTag(clause) != .case_clause) continue;
                 const test_node = c.tree.nodeData(clause).lhs;
                 if (test_node == 0) continue;
-                const tt0 = c.node_types.get(test_node) orelse continue;
+                const tt0 = c.node_types.get(c.nodeKey(test_node)) orelse continue;
                 const tt = c.ts.regularLiteral(tt0) catch continue;
                 if (tt == rm) covered = true;
             }
@@ -5421,7 +5782,7 @@ const Checker = struct {
     }
 
     fn typeofSwitchIsExhaustive(c: *Checker, sw: Node, operand: Node) bool {
-        const t = c.node_types.get(operand) orelse return false;
+        const t = c.node_types.get(c.nodeKey(operand)) orelse return false;
         const r = c.tree.extraData(ast.SubRange, c.tree.nodeData(sw).rhs);
         // For each possible typeof outcome of t, require a covering case.
         for (0..typeof_names.len) |which| {
@@ -5439,7 +5800,7 @@ const Checker = struct {
                 if (clause == null_node or c.nodeTag(clause) != .case_clause) continue;
                 const test_node = c.tree.nodeData(clause).lhs;
                 if (test_node == 0) continue;
-                const tt0 = c.node_types.get(test_node) orelse continue;
+                const tt0 = c.node_types.get(c.nodeKey(test_node)) orelse continue;
                 const tt = c.ts.regularLiteral(tt0) catch continue;
                 if (c.ts.kind(tt) != .string_literal) continue;
                 if (c.ts.literalAtom(tt) == c.typeof_atoms[which]) covered = true;
@@ -5482,7 +5843,7 @@ const Checker = struct {
         if (data.name_token != 0) {
             const a = try c.atomOfToken(data.name_token);
             if (c.bind.lookupInScope(saved_scope, a)) |sym| {
-                if (c.bind.symbol_flags[sym].class) class_sym = sym;
+                if (c.bind.symbol_flags[sym].class) class_sym = c.toGlobal(sym);
             }
         }
 
@@ -5499,6 +5860,7 @@ const Checker = struct {
             // fire even for unused classes.
             _ = try c.resolveStructural(this_t);
             _ = try c.classStaticType(class_sym);
+            try c.evalTypeParamDecls(class_sym);
         }
 
         // extends: base must be a class (checked in baseClassRef); type
@@ -5582,7 +5944,8 @@ const Checker = struct {
         defer c.cur_scope = saved;
         if (c.bind.lookupInScope(c.cur_scope, a)) |sym| {
             if (c.bind.symbol_flags[sym].interface) {
-                _ = try c.interfaceGeneric(sym);
+                _ = try c.interfaceGeneric(c.toGlobal(sym));
+                try c.evalTypeParamDecls(c.toGlobal(sym));
             }
         }
     }
@@ -5594,8 +5957,26 @@ const Checker = struct {
         const a = try c.atomOfToken(data.name_token);
         if (c.bind.lookupInScope(c.cur_scope, a)) |sym| {
             if (c.bind.symbol_flags[sym].type_alias) {
-                _ = try c.aliasGeneric(sym);
+                _ = try c.aliasGeneric(c.toGlobal(sym));
+                try c.evalTypeParamDecls(c.toGlobal(sym));
             }
+        }
+    }
+
+    /// Eagerly evaluate type-parameter constraint/default annotations of a
+    /// generic declaration so their diagnostics fire during the owner's
+    /// file walk (partition-independent output; lazy paths only reach them
+    /// on instantiation).
+    fn evalTypeParamDecls(c: *Checker, sym: SymbolId) Error!void {
+        var tps: std.ArrayList(TypeParamInfo) = .empty;
+        defer tps.deinit(c.scratch());
+        try c.typeParamsOf(sym, &tps);
+        for (tps.items) |tp| {
+            const saved = c.enterSymFile(sym);
+            defer c.restoreCtx(saved);
+            c.cur_scope = c.symScope(tp.sym);
+            if (tp.constraint != 0) _ = try c.typeFromTypeNode(tp.constraint);
+            if (tp.default != 0) _ = try c.typeFromTypeNode(tp.default);
         }
     }
 };

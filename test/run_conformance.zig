@@ -1,19 +1,29 @@
-//! Conformance suite runner (M4).
+//! Conformance suite runner (M4 single-file + M5 multi-file).
 //!
 //! Discovers cases under `test/conformance/` (recursively, one directory
-//! level of area folders): each case is a `<name>.ts` source with an
-//! expected-diagnostics snapshot `<name>.expected` next to it. Snapshots
-//! are generated from real `tsc --strict --noEmit --target esnext` output
-//! (see test/conformance/README.md) and hand-verified.
+//! level of area folders). Two case shapes:
 //!
-//! Snapshot format: one diagnostic per line, `TS<code> <line>` (1-based
-//! line of the error start). `#` lines are comments. An empty or absent
-//! `.expected` file means the case must be diagnostic-free.
+//! - **Single file**: `<name>.ts` with an expected-diagnostics snapshot
+//!   `<name>.expected` next to it. Snapshot lines: `TS<code> <line>`.
+//! - **Directory (M5)**: a folder containing `entry.ts`; the whole module
+//!   graph is discovered from the entry (relative imports, case-local
+//!   `node_modules`). Snapshot file `expected` inside the folder with
+//!   lines: `TS<code> <relative-file> <line>`.
 //!
-//! Matching: the multiset of (code, line) pairs must match exactly.
+//! Snapshots are generated from real `tsc 5.5` output (`--strict --noEmit
+//! --target esnext --module esnext --moduleResolution bundler
+//! --allowImportingTsExtensions`; see test/conformance/README.md) and
+//! hand-verified. `#` lines are comments; an empty or absent snapshot
+//! means the case must be diagnostic-free.
+//!
+//! Matching: the multiset of (code, file, line) pairs must match exactly.
 //! Message text is informational and not compared (documented in PLAN §3
 //! as code+span; we compare code+line so byte-offset drift in messages
 //! doesn't churn snapshots).
+//!
+//! This file also hosts the M5 determinism and cycle-stress tests:
+//! checking a program partitioned across N ∈ {1, 2, 4, 8} checker
+//! instances must render byte-identical diagnostics.
 
 const std = @import("std");
 const Io = std.Io;
@@ -23,13 +33,15 @@ const ztsc = @import("ztsc");
 const parser = ztsc.parser;
 const binder = ztsc.binder;
 const checker = ztsc.checker;
+const modules = ztsc.modules;
 const Interner = ztsc.intern.Interner;
 
-const Expected = struct { code: u16, line: u32 };
+const Expected = struct { code: u16, file: []const u8, line: u32 };
 
 const Case = struct {
-    /// Path relative to the conformance dir (area/name.ts).
+    /// Path relative to the conformance dir (area/name.ts or area/name).
     rel: []const u8,
+    is_dir: bool,
 };
 
 fn discoverCases(io: Io, gpa: std.mem.Allocator, dir_path: []const u8) !std.ArrayList(Case) {
@@ -50,17 +62,29 @@ fn discoverCases(io: Io, gpa: std.mem.Allocator, dir_path: []const u8) !std.Arra
         switch (entry.kind) {
             .file => {
                 if (!std.mem.endsWith(u8, entry.name, ".ts")) continue;
-                try cases.append(gpa, .{ .rel = try gpa.dupe(u8, entry.name) });
+                try cases.append(gpa, .{ .rel = try gpa.dupe(u8, entry.name), .is_dir = false });
             },
             .directory => {
                 var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
                 defer sub.close(io);
                 var sit = sub.iterate();
                 while (try sit.next(io)) |sentry| {
-                    if (sentry.kind != .file) continue;
-                    if (!std.mem.endsWith(u8, sentry.name, ".ts")) continue;
-                    const rel = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ entry.name, sentry.name });
-                    try cases.append(gpa, .{ .rel = rel });
+                    switch (sentry.kind) {
+                        .file => {
+                            if (!std.mem.endsWith(u8, sentry.name, ".ts")) continue;
+                            const rel = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ entry.name, sentry.name });
+                            try cases.append(gpa, .{ .rel = rel, .is_dir = false });
+                        },
+                        .directory => {
+                            // A directory case iff it contains entry.ts.
+                            var case_dir = sub.openDir(io, sentry.name, .{}) catch continue;
+                            defer case_dir.close(io);
+                            case_dir.access(io, "entry.ts", .{}) catch continue;
+                            const rel = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ entry.name, sentry.name });
+                            try cases.append(gpa, .{ .rel = rel, .is_dir = true });
+                        },
+                        else => {},
+                    }
                 }
             },
             else => {},
@@ -74,26 +98,32 @@ fn discoverCases(io: Io, gpa: std.mem.Allocator, dir_path: []const u8) !std.Arra
     return cases;
 }
 
-fn parseExpected(alloc: std.mem.Allocator, text: []const u8) !std.ArrayList(Expected) {
+fn parseExpected(alloc: std.mem.Allocator, text: []const u8, multi_file: bool) !std.ArrayList(Expected) {
     var out: std.ArrayList(Expected) = .empty;
     errdefer out.deinit(alloc);
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line0| {
         const line = std.mem.trim(u8, line0, " \t\r");
         if (line.len == 0 or line[0] == '#') continue;
-        // "TS2322 5"
+        // "TS2322 5" or "TS2322 entry.ts 5"
         if (!std.mem.startsWith(u8, line, "TS")) return error.BadSnapshot;
         const sp = std.mem.indexOfScalar(u8, line, ' ') orelse return error.BadSnapshot;
         const code = try std.fmt.parseInt(u16, line[2..sp], 10);
-        const lineno = try std.fmt.parseInt(u32, std.mem.trim(u8, line[sp + 1 ..], " \t"), 10);
-        try out.append(alloc, .{ .code = code, .line = lineno });
+        const rest = std.mem.trim(u8, line[sp + 1 ..], " \t");
+        if (multi_file) {
+            const sp2 = std.mem.lastIndexOfScalar(u8, rest, ' ') orelse return error.BadSnapshot;
+            const file = std.mem.trim(u8, rest[0..sp2], " \t");
+            const lineno = try std.fmt.parseInt(u32, std.mem.trim(u8, rest[sp2 + 1 ..], " \t"), 10);
+            try out.append(alloc, .{ .code = code, .file = file, .line = lineno });
+        } else {
+            const lineno = try std.fmt.parseInt(u32, rest, 10);
+            try out.append(alloc, .{ .code = code, .file = "", .line = lineno });
+        }
     }
     return out;
 }
 
-/// Run the real pipeline on `src`, returning produced (code, line) pairs.
-/// Includes binder diagnostics with tsc codes (2451, 2300, ...) — tsc
-/// reports those too.
+/// Run the single-file pipeline on `src`, returning (code, line) pairs.
 fn runCase(alloc: std.mem.Allocator, io: Io, gpa: std.mem.Allocator, interner: *Interner, src: []const u8) !std.ArrayList(Expected) {
     var out: std.ArrayList(Expected) = .empty;
     errdefer out.deinit(alloc);
@@ -108,10 +138,54 @@ fn runCase(alloc: std.mem.Allocator, io: Io, gpa: std.mem.Allocator, interner: *
     for (bound.diagnostics) |d| {
         const ts = d.code.tsCode();
         if (ts == 0) continue;
-        try out.append(alloc, .{ .code = ts, .line = lineOf(line_starts, d.span.start) });
+        try out.append(alloc, .{ .code = ts, .file = "", .line = lineOf(line_starts, d.span.start) });
     }
     for (result.diagnostics) |d| {
-        try out.append(alloc, .{ .code = d.code, .line = lineOf(line_starts, d.span.start) });
+        try out.append(alloc, .{ .code = d.code, .file = "", .line = lineOf(line_starts, d.span.start) });
+    }
+    return out;
+}
+
+/// Run the full multi-file pipeline on a directory case: discover from
+/// entry.ts, link, check (single checker instance owns all files).
+/// Returned file names are relative to the case directory.
+fn runDirCase(
+    alloc: std.mem.Allocator,
+    io: Io,
+    gpa: std.mem.Allocator,
+    interner: *Interner,
+    conf_dir: Io.Dir,
+    case_rel: []const u8,
+) !std.ArrayList(Expected) {
+    var out: std.ArrayList(Expected) = .empty;
+    errdefer out.deinit(alloc);
+
+    const entry = try std.fmt.allocPrint(alloc, "{s}/entry.ts", .{case_rel});
+    const br = try modules.buildProgram(alloc, io, gpa, interner, conf_dir, &.{entry});
+    const prog = &br.program;
+
+    const owned = try alloc.alloc(modules.FileId, prog.files.len);
+    for (owned, 0..) |*f, i| f.* = @intCast(i);
+    const result = try checker.checkFiles(alloc, io, gpa, interner, prog, owned);
+
+    for (prog.files, 0..) |*pf, i| {
+        const rel = if (std.mem.startsWith(u8, pf.path, case_rel) and pf.path.len > case_rel.len + 1)
+            pf.path[case_rel.len + 1 ..]
+        else
+            pf.path;
+        const line_starts = try ztsc.source.computeLineStarts(alloc, pf.src);
+        for (pf.bind.diagnostics) |d| {
+            const ts = d.code.tsCode();
+            if (ts == 0) continue;
+            try out.append(alloc, .{ .code = ts, .file = rel, .line = lineOf(line_starts, d.span.start) });
+        }
+        for (prog.links[i].diags) |d| {
+            try out.append(alloc, .{ .code = d.code, .file = rel, .line = lineOf(line_starts, d.span.start) });
+        }
+        for (result.diagnostics) |d| {
+            if (d.file != i) continue;
+            try out.append(alloc, .{ .code = d.code, .file = rel, .line = lineOf(line_starts, d.span.start) });
+        }
     }
     return out;
 }
@@ -126,20 +200,24 @@ fn lineOf(line_starts: []const u32, offset: u32) u32 {
     return @intCast(lo + 1); // 1-based
 }
 
+fn expectedLessThan(_: void, x: Expected, y: Expected) bool {
+    switch (std.mem.order(u8, x.file, y.file)) {
+        .lt => return true,
+        .gt => return false,
+        .eq => {},
+    }
+    if (x.line != y.line) return x.line < y.line;
+    return x.code < y.code;
+}
+
 fn multisetEqual(alloc: std.mem.Allocator, a: []Expected, b: []Expected) !bool {
     if (a.len != b.len) return false;
-    const lessThan = struct {
-        fn f(_: void, x: Expected, y: Expected) bool {
-            if (x.line != y.line) return x.line < y.line;
-            return x.code < y.code;
-        }
-    }.f;
     const ac = try alloc.dupe(Expected, a);
     const bc = try alloc.dupe(Expected, b);
-    std.mem.sort(Expected, ac, {}, lessThan);
-    std.mem.sort(Expected, bc, {}, lessThan);
+    std.mem.sort(Expected, ac, {}, expectedLessThan);
+    std.mem.sort(Expected, bc, {}, expectedLessThan);
     for (ac, bc) |x, y| {
-        if (x.code != y.code or x.line != y.line) return false;
+        if (x.code != y.code or x.line != y.line or !std.mem.eql(u8, x.file, y.file)) return false;
     }
     return true;
 }
@@ -164,43 +242,230 @@ test "conformance: discover and run cases" {
 
     var failed: usize = 0;
     var ran: usize = 0;
+    var ran_multi: usize = 0;
     for (cases.items) |case| {
         const alloc = arena.allocator();
-        const src = dir.readFileAlloc(io, case.rel, alloc, .limited(1 << 20)) catch |err| {
-            std.debug.print("conformance: {s}: read failed: {s}\n", .{ case.rel, @errorName(err) });
-            failed += 1;
-            continue;
-        };
+
         // Expected snapshot (absent/empty = clean).
         var expected: std.ArrayList(Expected) = .empty;
-        const exp_path = try std.fmt.allocPrint(alloc, "{s}expected", .{case.rel[0 .. case.rel.len - 2]});
+        const exp_path = if (case.is_dir)
+            try std.fmt.allocPrint(alloc, "{s}/expected", .{case.rel})
+        else
+            try std.fmt.allocPrint(alloc, "{s}expected", .{case.rel[0 .. case.rel.len - 2]});
         if (dir.readFileAlloc(io, exp_path, alloc, .limited(1 << 20))) |exp_text| {
-            expected = parseExpected(alloc, exp_text) catch {
+            expected = parseExpected(alloc, exp_text, case.is_dir) catch {
                 std.debug.print("conformance: {s}: bad snapshot format\n", .{case.rel});
                 failed += 1;
                 continue;
             };
         } else |_| {}
 
-        const got = runCase(alloc, io, gpa, &interner, src) catch |err| {
-            std.debug.print("conformance: {s}: pipeline failed: {s}\n", .{ case.rel, @errorName(err) });
-            failed += 1;
-            continue;
+        const got = blk: {
+            if (case.is_dir) {
+                ran_multi += 1;
+                break :blk runDirCase(alloc, io, gpa, &interner, dir, case.rel) catch |err| {
+                    std.debug.print("conformance: {s}: pipeline failed: {s}\n", .{ case.rel, @errorName(err) });
+                    failed += 1;
+                    continue;
+                };
+            }
+            const src = dir.readFileAlloc(io, case.rel, alloc, .limited(1 << 20)) catch |err| {
+                std.debug.print("conformance: {s}: read failed: {s}\n", .{ case.rel, @errorName(err) });
+                failed += 1;
+                continue;
+            };
+            break :blk runCase(alloc, io, gpa, &interner, src) catch |err| {
+                std.debug.print("conformance: {s}: pipeline failed: {s}\n", .{ case.rel, @errorName(err) });
+                failed += 1;
+                continue;
+            };
         };
         ran += 1;
         if (!try multisetEqual(alloc, got.items, expected.items)) {
             failed += 1;
             std.debug.print("conformance FAIL: {s}\n  expected:", .{case.rel});
-            for (expected.items) |e| std.debug.print(" TS{d}@{d}", .{ e.code, e.line });
+            for (expected.items) |e| std.debug.print(" TS{d}@{s}:{d}", .{ e.code, e.file, e.line });
             std.debug.print("\n  got:     ", .{});
-            for (got.items) |e| std.debug.print(" TS{d}@{d}", .{ e.code, e.line });
+            for (got.items) |e| std.debug.print(" TS{d}@{s}:{d}", .{ e.code, e.file, e.line });
             std.debug.print("\n", .{});
         }
         _ = arena.reset(.retain_capacity);
     }
 
     if (ran > 0) {
-        std.debug.print("conformance: {d}/{d} cases passed\n", .{ ran - failed, ran });
+        std.debug.print("conformance: {d}/{d} cases passed ({d} multi-file)\n", .{ ran - failed, ran, ran_multi });
     }
     try std.testing.expectEqual(@as(usize, 0), failed);
+}
+
+// ===========================================================================
+// M5: determinism & cycle stress
+// ===========================================================================
+
+/// Render a program's full diagnostics (link + check) the way main.zig
+/// does: per file in id order, (position, code)-sorted, one line each.
+fn renderProgramDiags(
+    alloc: std.mem.Allocator,
+    io: Io,
+    gpa: std.mem.Allocator,
+    interner: *Interner,
+    prog: *const modules.Program,
+    n_checkers: usize,
+) ![]u8 {
+    // Round-robin partition, one checkFiles call per checker instance.
+    const results = try alloc.alloc(checker.Check, n_checkers);
+    for (0..n_checkers) |k| {
+        var owned: std.ArrayList(modules.FileId) = .empty;
+        var i: usize = k;
+        while (i < prog.files.len) : (i += n_checkers) {
+            try owned.append(alloc, @intCast(i));
+        }
+        results[k] = try checker.checkFiles(alloc, io, gpa, interner, prog, owned.items);
+    }
+
+    const Line = struct { start: u32, code: u16, msg: []const u8 };
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    for (prog.files, 0..) |*pf, i| {
+        var merged: std.ArrayList(Line) = .empty;
+        for (prog.links[i].diags) |d| {
+            try merged.append(alloc, .{ .start = d.span.start, .code = d.code, .msg = d.msg });
+        }
+        const owner = i % n_checkers;
+        for (results[owner].diagnostics) |d| {
+            if (d.file != i) continue;
+            try merged.append(alloc, .{ .start = d.span.start, .code = d.code, .msg = d.msg });
+        }
+        std.mem.sort(Line, merged.items, {}, struct {
+            fn lessThan(_: void, x: Line, y: Line) bool {
+                if (x.start != y.start) return x.start < y.start;
+                return x.code < y.code;
+            }
+        }.lessThan);
+        for (merged.items) |d| {
+            out.writer.print("{s}:{d}: TS{d}: {s}\n", .{ pf.path, d.start, d.code, d.msg }) catch
+                return error.OutOfMemory;
+        }
+    }
+    return alloc.dupe(u8, out.written());
+}
+
+test "determinism: diagnostics byte-identical for N = 1, 2, 4, 8 checkers" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const d = tmp.dir;
+
+    // A program with errors sprinkled across many files, cross-imports,
+    // re-exports, a missing module and a missing export.
+    try d.writeFile(io, .{ .sub_path = "base.ts", .data =
+        \\export interface Item { id: number; label: string; }
+        \\export function mk(id: number, label: string): Item {
+        \\  return { id: id, label: label };
+        \\}
+        \\export const seed: number = 1;
+    });
+    var name_buf: [64]u8 = undefined;
+    var body_buf: [512]u8 = undefined;
+    for (0..8) |i| {
+        const name = try std.fmt.bufPrint(&name_buf, "f{d}.ts", .{i});
+        const body = try std.fmt.bufPrint(&body_buf,
+            \\import {{ mk, seed, Item }} from "./base";
+            \\import {{ v{d} }} from "./f{d}";
+            \\export const v{d}: number = seed + {d};
+            \\const item: Item = mk(v{d}, {d});
+            \\export const bad{d}: string = seed;
+            \\const use = v{d};
+        , .{ (i + 1) % 8, (i + 1) % 8, i, i, i, i, i, (i + 1) % 8 });
+        try d.writeFile(io, .{ .sub_path = name, .data = body });
+    }
+    try d.writeFile(io, .{ .sub_path = "entry.ts", .data =
+        \\import { v0 } from "./f0";
+        \\import { v3 } from "./f3";
+        \\import { ghost } from "./base";
+        \\import { gone } from "./missing";
+        \\export { v7 } from "./f7";
+        \\const n: string = v0 + v3;
+    });
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var interner = Interner.init();
+    defer interner.deinit(gpa);
+    const alloc = arena.allocator();
+
+    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, &.{"entry.ts"});
+    try std.testing.expectEqual(@as(usize, 10), br.program.files.len);
+
+    const ref = try renderProgramDiags(alloc, io, gpa, &interner, &br.program, 1);
+    // The program must actually produce a healthy number of diagnostics
+    // spread across files for this test to mean anything.
+    try std.testing.expect(std.mem.count(u8, ref, "\n") >= 10);
+    for ([_]usize{ 2, 4, 8 }) |n| {
+        const got = try renderProgramDiags(alloc, io, gpa, &interner, &br.program, n);
+        try std.testing.expectEqualStrings(ref, got);
+    }
+}
+
+test "cycle stress: N-file import ring + diamonds terminate cleanly" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const d = tmp.dir;
+
+    // 48-file ring: each file imports the next one's export (type + value)
+    // and re-exports its own; plus diamond edges to two "hub" files.
+    const n_ring = 48;
+    try d.writeFile(io, .{ .sub_path = "hub_a.ts", .data =
+        \\export const ha: number = 1;
+        \\export interface HA { tag: "a"; n: number; }
+    });
+    try d.writeFile(io, .{ .sub_path = "hub_b.ts", .data =
+        \\export const hb: number = 2;
+        \\export interface HB { tag: "b"; n: number; }
+    });
+    var name_buf: [64]u8 = undefined;
+    var body_buf: [1024]u8 = undefined;
+    for (0..n_ring) |i| {
+        const name = try std.fmt.bufPrint(&name_buf, "r{d}.ts", .{i});
+        const body = try std.fmt.bufPrint(&body_buf,
+            \\import {{ x{d}, T{d} }} from "./r{d}";
+            \\import {{ ha, HA }} from "./hub_a";
+            \\import {{ hb, HB }} from "./hub_b";
+            \\export const x{d}: number = ha + hb;
+            \\export interface T{d} {{ v: number; prev?: T{d}; }}
+            \\export function probe{d}(t: T{d}, u: HA | HB): number {{
+            \\  if (u.tag === "a") return t.v + u.n;
+            \\  return x{d} + u.n;
+            \\}}
+            \\const back: number = x{d};
+        , .{ (i + 1) % n_ring, (i + 1) % n_ring, (i + 1) % n_ring, i, i, (i + 1) % n_ring, i, i, i, (i + 1) % n_ring });
+        try d.writeFile(io, .{ .sub_path = name, .data = body });
+    }
+    try d.writeFile(io, .{ .sub_path = "entry.ts", .data =
+        \\import { x0 } from "./r0";
+        \\import { probe7 } from "./r7";
+        \\const n: number = probe7({ v: x0 }, { tag: "a", n: 3 });
+    });
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var interner = Interner.init();
+    defer interner.deinit(gpa);
+    const alloc = arena.allocator();
+
+    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, &.{"entry.ts"});
+    try std.testing.expectEqual(@as(usize, n_ring + 3), br.program.files.len);
+
+    // Clean at N=1, and byte-identical (still clean) at higher N — no
+    // hangs, no duplicated diagnostics.
+    const ref = try renderProgramDiags(alloc, io, gpa, &interner, &br.program, 1);
+    try std.testing.expectEqualStrings("", ref);
+    for ([_]usize{ 2, 4, 8 }) |n| {
+        const got = try renderProgramDiags(alloc, io, gpa, &interner, &br.program, n);
+        try std.testing.expectEqualStrings(ref, got);
+    }
 }

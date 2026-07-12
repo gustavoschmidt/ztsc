@@ -1,13 +1,22 @@
 //! ZTSC CLI driver: argument parsing, thread pool, phase orchestration.
 //!
-//! M3 scope: load files in parallel (mmap + line tables), scan them in
-//! parallel (M1 benchmark path), parse them in parallel into sealed
-//! data-oriented ASTs, then bind them in parallel into sealed symbol
-//! tables/scope trees/flow graphs. `--timing` reports per-phase wall clock,
-//! `--memory` reports arena/token/AST/binder statistics (bytes/node,
-//! binder bytes/line), `--dump-ast` prints S-expression parse trees, and
-//! `--dump-symbols` prints the binder's scope/symbol dump. Checking arrives
-//! in M4+.
+//! M5 scope: the module graph is discovered wavefront-style from the CLI
+//! entry files — each wave loads/scans/parses/binds in parallel with the
+//! worker pool, then a cheap serial step resolves the wave's module
+//! specifiers (bundler-style, see modules.zig) and queues newly discovered
+//! files for the next wave. After binding, a serial `link` phase builds
+//! sealed per-file import/export tables; the check phase then partitions
+//! the program's files across N independent checker instances
+//! (`--checkers=N`, default min(4, cores)), each with its own type
+//! store/caches, reading the shared immutable AST/binder/link data without
+//! locks (PLAN §2.3).
+//!
+//! Output determinism: every diagnostic is tagged with its file; each
+//! file's check diagnostics come from exactly the checker that owns it,
+//! and the final print is per file (in discovery order), position-sorted —
+//! byte-identical for any N. `--timing` reports per-phase wall clock plus
+//! a per-checker breakdown; `--memory` reports arena/token/AST/binder
+//! statistics plus per-checker type-store bytes and module-graph bytes.
 
 const std = @import("std");
 const Io = std.Io;
@@ -18,6 +27,7 @@ const scanner = ztsc.scanner;
 const parser = ztsc.parser;
 const binder = ztsc.binder;
 const checker = ztsc.checker;
+const modules = ztsc.modules;
 const Ast = ztsc.ast.Ast;
 const Bind = binder.Bind;
 
@@ -31,6 +41,7 @@ const usage =
     \\  --dump-symbols  print binder scope/symbol dumps (golden-test format)
     \\  --dump-types    print per-declaration checked types (golden-test format)
     \\  --workers=N     number of worker threads (default: CPU count)
+    \\  --checkers=N    number of checker instances (default: min(4, CPUs))
     \\  --repeat=N      scan/parse/bind each file N times (benchmark aid)
     \\  --version       print version and exit
     \\
@@ -60,6 +71,7 @@ const Cli = struct {
     dump_types: bool = false,
     version: bool = false,
     workers: ?usize = null,
+    checkers: ?usize = null,
     repeat: usize = 1,
     paths: []const []const u8 = &.{},
 };
@@ -134,7 +146,7 @@ const Worker = struct {
         sources: []const ?Source,
         repeat: usize,
         next: *std.atomic.Value(usize),
-        trees: []?Ast,
+        trees: []?*Ast,
         errs: []?anyerror,
     ) void {
         while (true) {
@@ -147,10 +159,15 @@ const Worker = struct {
                 std.mem.doNotOptimizeAway(&tree);
                 _ = w.scratch.reset(.retain_capacity);
             }
-            trees[i] = parser.parse(w.arena.allocator(), src.bytes) catch |err| {
+            const tree = w.arena.allocator().create(Ast) catch |err| {
                 errs[i] = err;
                 continue;
             };
+            tree.* = parser.parse(w.arena.allocator(), src.bytes) catch |err| {
+                errs[i] = err;
+                continue;
+            };
+            trees[i] = tree;
         }
     }
 
@@ -162,28 +179,58 @@ const Worker = struct {
         gpa: std.mem.Allocator,
         interner: *Interner,
         sources: []const ?Source,
-        trees: []const ?Ast,
+        trees: []const ?*Ast,
         repeat: usize,
         next: *std.atomic.Value(usize),
-        binds: []?Bind,
+        binds: []?*Bind,
         errs: []?anyerror,
     ) void {
         while (true) {
             const i = next.fetchAdd(1, .monotonic);
             if (i >= sources.len) break;
             const src = sources[i] orelse continue;
-            const tree = &(trees[i] orelse continue);
+            const tree = trees[i] orelse continue;
             var r: usize = 1;
             while (r < repeat) : (r += 1) {
                 var b = binder.bind(w.scratch.allocator(), io, gpa, interner, tree, src.bytes) catch break;
                 std.mem.doNotOptimizeAway(&b);
                 _ = w.scratch.reset(.retain_capacity);
             }
-            binds[i] = binder.bind(w.arena.allocator(), io, gpa, interner, tree, src.bytes) catch |err| {
+            const b = w.arena.allocator().create(Bind) catch |err| {
                 errs[i] = err;
                 continue;
             };
+            b.* = binder.bind(w.arena.allocator(), io, gpa, interner, tree, src.bytes) catch |err| {
+                errs[i] = err;
+                continue;
+            };
+            binds[i] = b;
         }
+    }
+};
+
+/// One checker instance: checks its partition on its own thread.
+const CheckerTask = struct {
+    arena: std.heap.ArenaAllocator,
+    thread: std.Thread = undefined,
+    owned: []const modules.FileId = &.{},
+    result: ?checker.Check = null,
+    err: ?anyerror = null,
+    ns: u64 = 0,
+
+    fn run(
+        t: *CheckerTask,
+        io: Io,
+        gpa: std.mem.Allocator,
+        interner: *Interner,
+        prog: *const modules.Program,
+    ) void {
+        const timer = Timer.start(io);
+        t.result = checker.checkFiles(t.arena.allocator(), io, gpa, interner, prog, t.owned) catch |err| blk: {
+            t.err = err;
+            break :blk null;
+        };
+        t.ns = timer.readNs();
     }
 };
 
@@ -214,103 +261,196 @@ pub fn main(init: std.process.Init) !void {
 
     const total_timer = Timer.start(io);
 
-    // --- Phase: load (parallel) -------------------------------------------
-    const load_timer = Timer.start(io);
-
     var interner = Interner.init();
     defer interner.deinit(gpa);
-    const results = try arena.alloc(?Source, cli.paths.len);
-    @memset(results, null);
-    const errs = try arena.alloc(?anyerror, cli.paths.len);
-    @memset(errs, null);
 
+    // Not capped by the entry count: waves discover more files (M5).
     const cpu_count = std.Thread.getCpuCount() catch 1;
-    const n_workers: usize = @max(1, @min(cli.workers orelse cpu_count, cli.paths.len));
+    const n_workers: usize = @max(1, cli.workers orelse cpu_count);
     const workers = try arena.alloc(Worker, n_workers);
     for (workers) |*w| w.* = .{
         .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
         .scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator),
     };
 
-    var next = std.atomic.Value(usize).init(0);
-    for (workers) |*w| {
-        w.thread = try std.Thread.spawn(.{}, Worker.run, .{
-            w, io, gpa, &interner, cli.paths, &next, results, errs,
-        });
-    }
-    for (workers) |*w| w.thread.join();
-
-    const load_ns = load_timer.readNs();
-
-    // --- Phase: scan (parallel) -------------------------------------------
-    const scan_timer = Timer.start(io);
-
-    const token_lists = try arena.alloc(?scanner.Tokens, cli.paths.len);
-    @memset(token_lists, null);
-    next.store(0, .monotonic);
-    for (workers) |*w| {
-        w.thread = try std.Thread.spawn(.{}, Worker.scanRun, .{
-            w, results, cli.repeat, &next, token_lists, errs,
-        });
-    }
-    for (workers) |*w| w.thread.join();
-
-    const scan_ns = scan_timer.readNs();
-
-    // --- Phase: parse (parallel) ---------------------------------------------
-    const parse_timer = Timer.start(io);
-
-    const trees = try arena.alloc(?Ast, cli.paths.len);
-    @memset(trees, null);
-    next.store(0, .monotonic);
-    for (workers) |*w| {
-        w.thread = try std.Thread.spawn(.{}, Worker.parseRun, .{
-            w, results, cli.repeat, &next, trees, errs,
-        });
-    }
-    for (workers) |*w| w.thread.join();
-
-    const parse_ns = parse_timer.readNs();
-
-    // --- Phase: bind (parallel) ---------------------------------------------
-    const bind_timer = Timer.start(io);
-
-    const binds = try arena.alloc(?Bind, cli.paths.len);
-    @memset(binds, null);
-    next.store(0, .monotonic);
-    for (workers) |*w| {
-        w.thread = try std.Thread.spawn(.{}, Worker.bindRun, .{
-            w, io, gpa, &interner, results, trees, cli.repeat, &next, binds, errs,
-        });
-    }
-    for (workers) |*w| w.thread.join();
-
-    const bind_ns = bind_timer.readNs();
-
-    // --- Phase: check (single-threaded in M4; M5 partitions) ---------------
-    const check_timer = Timer.start(io);
-
-    const checks = try arena.alloc(?checker.Check, cli.paths.len);
-    @memset(checks, null);
-    var check_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer check_arena.deinit();
-    for (binds, trees, results, 0..) |maybe_bind, maybe_tree, maybe_src, i| {
-        const b = &(maybe_bind orelse continue);
-        const tree = &(maybe_tree orelse continue);
-        const src = maybe_src orelse continue;
-        var r: usize = 1;
-        while (r < cli.repeat) : (r += 1) {
-            var scratch_check = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-            defer scratch_check.deinit();
-            var res = checker.check(scratch_check.allocator(), io, gpa, &interner, tree, b, src.bytes) catch break;
-            std.mem.doNotOptimizeAway(&res);
+    // --- Wavefront discovery: load/scan/parse/bind + resolve, per wave ----
+    var paths: std.ArrayList([]const u8) = .empty;
+    var path_ids: std.StringHashMapUnmanaged(u32) = .empty;
+    for (cli.paths) |p| {
+        const norm = try modules.normalizePath(arena, p);
+        const gop = try path_ids.getOrPut(arena, norm);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = @intCast(paths.items.len);
+            try paths.append(arena, norm);
         }
-        checks[i] = checker.check(check_arena.allocator(), io, gpa, &interner, tree, b, src.bytes) catch |err| blk: {
-            errs[i] = err;
-            break :blk null;
+    }
+    const n_entries = paths.items.len;
+
+    var results: std.ArrayList(?Source) = .empty;
+    var token_lists: std.ArrayList(?scanner.Tokens) = .empty;
+    var trees: std.ArrayList(?*Ast) = .empty;
+    var binds: std.ArrayList(?*Bind) = .empty;
+    var errs: std.ArrayList(?anyerror) = .empty;
+    var spec_maps: std.ArrayList(modules.SpecMap) = .empty;
+
+    var load_ns: u64 = 0;
+    var scan_ns: u64 = 0;
+    var parse_ns: u64 = 0;
+    var bind_ns: u64 = 0;
+    var resolve_ns: u64 = 0;
+
+    var wave_start: usize = 0;
+    while (wave_start < paths.items.len) {
+        const wave_end = paths.items.len;
+        const n = wave_end - wave_start;
+        try results.appendNTimes(arena, null, n);
+        try token_lists.appendNTimes(arena, null, n);
+        try trees.appendNTimes(arena, null, n);
+        try binds.appendNTimes(arena, null, n);
+        try errs.appendNTimes(arena, null, n);
+
+        const wave_paths = paths.items[wave_start..wave_end];
+        const wave_results = results.items[wave_start..wave_end];
+        const wave_tokens = token_lists.items[wave_start..wave_end];
+        const wave_trees = trees.items[wave_start..wave_end];
+        const wave_binds = binds.items[wave_start..wave_end];
+        const wave_errs = errs.items[wave_start..wave_end];
+
+        var next = std.atomic.Value(usize).init(0);
+
+        // Load (parallel).
+        const load_timer = Timer.start(io);
+        for (workers) |*w| {
+            w.thread = try std.Thread.spawn(.{}, Worker.run, .{
+                w, io, gpa, &interner, wave_paths, &next, wave_results, wave_errs,
+            });
+        }
+        for (workers) |*w| w.thread.join();
+        load_ns += load_timer.readNs();
+
+        // Scan (parallel).
+        const scan_timer = Timer.start(io);
+        next.store(0, .monotonic);
+        for (workers) |*w| {
+            w.thread = try std.Thread.spawn(.{}, Worker.scanRun, .{
+                w, wave_results, cli.repeat, &next, wave_tokens, wave_errs,
+            });
+        }
+        for (workers) |*w| w.thread.join();
+        scan_ns += scan_timer.readNs();
+
+        // Parse (parallel).
+        const parse_timer = Timer.start(io);
+        next.store(0, .monotonic);
+        for (workers) |*w| {
+            w.thread = try std.Thread.spawn(.{}, Worker.parseRun, .{
+                w, wave_results, cli.repeat, &next, wave_trees, wave_errs,
+            });
+        }
+        for (workers) |*w| w.thread.join();
+        parse_ns += parse_timer.readNs();
+
+        // Bind (parallel).
+        const bind_timer = Timer.start(io);
+        next.store(0, .monotonic);
+        for (workers) |*w| {
+            w.thread = try std.Thread.spawn(.{}, Worker.bindRun, .{
+                w, io, gpa, &interner, wave_results, wave_trees, cli.repeat, &next, wave_binds, wave_errs,
+            });
+        }
+        for (workers) |*w| w.thread.join();
+        bind_ns += bind_timer.readNs();
+
+        // Resolve this wave's module specifiers (serial; discovers files).
+        const resolve_timer = Timer.start(io);
+        for (wave_start..wave_end) |i| {
+            var atoms: std.ArrayList(ztsc.intern.Atom) = .empty;
+            var files: std.ArrayList(modules.FileId) = .empty;
+            if (binds.items[i]) |b| {
+                var seen: std.AutoHashMapUnmanaged(ztsc.intern.Atom, void) = .empty;
+                defer seen.deinit(gpa);
+                for (b.imports) |rec| {
+                    try resolveSpecInto(arena, gpa, io, &interner, paths.items[i], rec.module, &seen, &path_ids, &paths, &atoms, &files);
+                }
+                for (b.exports) |rec| {
+                    if (rec.module != 0) {
+                        try resolveSpecInto(arena, gpa, io, &interner, paths.items[i], rec.module, &seen, &path_ids, &paths, &atoms, &files);
+                    }
+                }
+            }
+            sortSpecPairs(atoms.items, files.items);
+            try spec_maps.append(arena, .{ .atoms = atoms.items, .files = files.items });
+        }
+        resolve_ns += resolve_timer.readNs();
+
+        wave_start = wave_end;
+    }
+    const n_files = paths.items.len;
+
+    // --- Link (serial): program assembly + import/export tables ----------
+    const link_timer = Timer.start(io);
+    const prog_files = try arena.alloc(modules.ProgFile, n_files);
+    var empty_tree: ?*Ast = null;
+    var empty_bind: ?*Bind = null;
+    for (0..n_files) |i| {
+        // Substitute an empty file for load/parse failures so ids stay
+        // dense (the error is reported below).
+        var tree = trees.items[i];
+        var bnd = binds.items[i];
+        const src_bytes: []const u8 = if (results.items[i]) |s| s.bytes else "";
+        if (tree == null or bnd == null) {
+            if (empty_tree == null) {
+                empty_tree = try arena.create(Ast);
+                empty_tree.?.* = try parser.parse(arena, "");
+                empty_bind = try arena.create(Bind);
+                empty_bind.?.* = try binder.bind(arena, io, gpa, &interner, empty_tree.?, "");
+            }
+            tree = empty_tree;
+            bnd = empty_bind;
+        }
+        prog_files[i] = .{
+            .path = paths.items[i],
+            .src = if (trees.items[i] == null) "" else src_bytes,
+            .tree = tree.?,
+            .bind = bnd.?,
+            .specs = spec_maps.items[i],
         };
     }
+    const links = try modules.link(arena, gpa, io, &interner, prog_files);
+    const prog = try arena.create(modules.Program);
+    prog.* = .{
+        .files = prog_files,
+        .sym_base = try modules.computeSymBase(arena, prog_files),
+        .links = links,
+    };
+    const link_ns = link_timer.readNs();
 
+    // --- Check (N independent checker instances, PLAN §2.3) ---------------
+    const check_timer = Timer.start(io);
+    const n_checkers: usize = @max(1, @min(cli.checkers orelse @min(4, cpu_count), n_files));
+    const tasks = try arena.alloc(CheckerTask, n_checkers);
+    {
+        // Round-robin partition (deterministic).
+        const owned_lists = try arena.alloc(std.ArrayList(modules.FileId), n_checkers);
+        for (owned_lists) |*l| l.* = .empty;
+        for (0..n_files) |i| {
+            try owned_lists[i % n_checkers].append(arena, @intCast(i));
+        }
+        for (tasks, 0..) |*t, k| {
+            t.* = .{
+                .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+                .owned = owned_lists[k].items,
+            };
+        }
+    }
+    if (n_checkers == 1) {
+        tasks[0].run(io, gpa, &interner, prog);
+    } else {
+        for (tasks) |*t| {
+            t.thread = try std.Thread.spawn(.{}, CheckerTask.run, .{ t, io, gpa, &interner, prog });
+        }
+        for (tasks) |*t| t.thread.join();
+    }
     const check_ns = check_timer.readNs();
 
     // --- Aggregate statistics ----------------------------------------------
@@ -318,7 +458,7 @@ pub fn main(init: std.process.Init) !void {
     var total_bytes: usize = 0;
     var total_lines: usize = 0;
     var line_table_bytes: usize = 0;
-    for (results) |maybe_src| {
+    for (results.items) |maybe_src| {
         const src = maybe_src orelse continue;
         files_ok += 1;
         total_bytes += src.bytes.len;
@@ -328,7 +468,7 @@ pub fn main(init: std.process.Init) !void {
 
     var total_tokens: usize = 0;
     var token_bytes: usize = 0;
-    for (token_lists) |maybe_toks| {
+    for (token_lists.items) |maybe_toks| {
         const toks = maybe_toks orelse continue;
         total_tokens += toks.len();
         token_bytes += toks.byteSize();
@@ -339,7 +479,7 @@ pub fn main(init: std.process.Init) !void {
     var extra_bytes: usize = 0;
     var ast_token_bytes: usize = 0;
     var parse_diags: usize = 0;
-    for (trees) |maybe_tree| {
+    for (trees.items) |maybe_tree| {
         const tree = maybe_tree orelse continue;
         total_nodes += tree.nodes.len;
         node_bytes += tree.nodeBytes();
@@ -356,7 +496,7 @@ pub fn main(init: std.process.Init) !void {
     var bind_flow_bytes: usize = 0;
     var bind_record_bytes: usize = 0;
     var bind_diags: usize = 0;
-    for (binds) |maybe_bind| {
+    for (binds.items) |maybe_bind| {
         const b = maybe_bind orelse continue;
         total_symbols += b.symbolCount();
         total_scopes += b.scopeCount();
@@ -368,6 +508,9 @@ pub fn main(init: std.process.Init) !void {
         bind_diags += b.diagnostics.len;
     }
 
+    var link_diags: usize = 0;
+    for (links) |*l| link_diags += l.diags.len;
+
     var check_diags: usize = 0;
     var check_types: usize = 0;
     var check_type_bytes: usize = 0;
@@ -377,8 +520,8 @@ pub fn main(init: std.process.Init) !void {
     var check_rel_misses: usize = 0;
     var check_scratch_hw: usize = 0;
     var check_flow_queries: usize = 0;
-    for (checks) |maybe_check| {
-        const ck = maybe_check orelse continue;
+    for (tasks) |*t| {
+        const ck = t.result orelse continue;
         check_diags += ck.diagnostics.len;
         check_types += ck.stats.types_created;
         check_type_bytes += ck.stats.type_bytes;
@@ -391,50 +534,81 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var failed: usize = 0;
-    for (errs, cli.paths) |maybe_err, path| {
+    for (errs.items, paths.items) |maybe_err, path| {
         if (maybe_err) |err| {
             failed += 1;
             std.debug.print("ztsc: {s}: {s}\n", .{ path, @errorName(err) });
         }
     }
+    for (tasks) |*t| {
+        if (t.err) |err| {
+            failed += 1;
+            std.debug.print("ztsc: checker: {s}\n", .{@errorName(err)});
+        }
+    }
 
     const total_ns = total_timer.readNs();
 
-    // --- Parse + bind diagnostics ---------------------------------------------
-    for (trees, results, cli.paths) |maybe_tree, maybe_src, path| {
-        const tree = maybe_tree orelse continue;
-        const src = maybe_src orelse continue;
+    // --- Diagnostics: per file (discovery order), position-sorted ----------
+    // Parse diagnostics first (message-only), then bind + link + check
+    // merged by (position, code). Byte-identical for any --checkers=N.
+    const cursors = try arena.alloc(usize, n_checkers);
+    @memset(cursors, 0);
+
+    const Merged = struct {
+        code: u16,
+        start: u32,
+        msg: []const u8,
+    };
+    for (0..n_files) |i| {
+        const path = paths.items[i];
+        const src = results.items[i] orelse continue;
+        const tree = trees.items[i] orelse continue;
         for (tree.diagnostics) |d| {
             const lc = src.lineCol(@min(d.span.start, @as(u32, @intCast(src.bytes.len))));
             try out.print("{s}:{d}:{d}: error: {s}\n", .{ path, lc.line + 1, lc.col + 1, d.message() });
         }
-    }
-    for (binds, results, cli.paths) |maybe_bind, maybe_src, path| {
-        const b = maybe_bind orelse continue;
-        const src = maybe_src orelse continue;
-        for (b.diagnostics) |d| {
-            const lc = src.lineCol(@min(d.span.start, @as(u32, @intCast(src.bytes.len))));
-            const ts = d.code.tsCode();
-            if (ts != 0) {
-                try out.print("{s}:{d}:{d}: error TS{d}: {s}\n", .{ path, lc.line + 1, lc.col + 1, ts, d.message() });
-            } else {
-                try out.print("{s}:{d}:{d}: error: {s}\n", .{ path, lc.line + 1, lc.col + 1, d.message() });
+
+        var merged: std.ArrayList(Merged) = .empty;
+        defer merged.deinit(gpa);
+        if (binds.items[i]) |b| {
+            for (b.diagnostics) |d| {
+                const ts = d.code.tsCode();
+                if (ts != 0) {
+                    try merged.append(gpa, .{ .code = ts, .start = d.span.start, .msg = d.message() });
+                } else {
+                    const lc = src.lineCol(@min(d.span.start, @as(u32, @intCast(src.bytes.len))));
+                    try out.print("{s}:{d}:{d}: error: {s}\n", .{ path, lc.line + 1, lc.col + 1, d.message() });
+                }
             }
         }
-    }
-
-    for (checks, results, cli.paths) |maybe_check, maybe_src, path| {
-        const ck = maybe_check orelse continue;
-        const src = maybe_src orelse continue;
-        for (ck.diagnostics) |d| {
-            const lc = src.lineCol(@min(d.span.start, @as(u32, @intCast(src.bytes.len))));
+        for (links[i].diags) |d| {
+            try merged.append(gpa, .{ .code = d.code, .start = d.span.start, .msg = d.msg });
+        }
+        const owner = i % n_checkers;
+        if (tasks[owner].result) |ck| {
+            var cur = cursors[owner];
+            while (cur < ck.diagnostics.len and ck.diagnostics[cur].file == i) : (cur += 1) {
+                const d = ck.diagnostics[cur];
+                try merged.append(gpa, .{ .code = d.code, .start = d.span.start, .msg = d.msg });
+            }
+            cursors[owner] = cur;
+        }
+        std.mem.sort(Merged, merged.items, {}, struct {
+            fn lessThan(_: void, x: Merged, y: Merged) bool {
+                if (x.start != y.start) return x.start < y.start;
+                return x.code < y.code;
+            }
+        }.lessThan);
+        for (merged.items) |d| {
+            const lc = src.lineCol(@min(d.start, @as(u32, @intCast(src.bytes.len))));
             try out.print("{s}:{d}:{d}: error TS{d}: {s}\n", .{ path, lc.line + 1, lc.col + 1, d.code, d.msg });
         }
     }
 
     // --- AST dump (--dump-ast) ---------------------------------------------
     if (cli.dump_ast) {
-        for (trees, results, cli.paths) |maybe_tree, maybe_src, path| {
+        for (trees.items, results.items, paths.items) |maybe_tree, maybe_src, path| {
             const tree = maybe_tree orelse continue;
             const src = maybe_src orelse continue;
             try out.print(";; {s}\n", .{path});
@@ -446,69 +620,48 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    // --- Symbol dump (--dump-symbols) ------------------------------------------
+    // --- Symbol dump (--dump-symbols) ---------------------------------------
     if (cli.dump_symbols) {
-        for (binds, trees, results, cli.paths) |maybe_bind, maybe_tree, maybe_src, path| {
+        for (binds.items, trees.items, results.items, paths.items) |maybe_bind, maybe_tree, maybe_src, path| {
             const b = maybe_bind orelse continue;
             const tree = maybe_tree orelse continue;
             const src = maybe_src orelse continue;
             try out.print(";; {s}\n", .{path});
-            try b.dump(io, &interner, &tree, src.bytes, out);
+            try b.dump(io, &interner, tree, src.bytes, out);
         }
     }
 
     if (cli.dump_types) {
-        for (binds, trees, results, cli.paths) |maybe_bind, maybe_tree, maybe_src, path| {
-            const b = &(maybe_bind orelse continue);
-            const tree = &(maybe_tree orelse continue);
-            const src = maybe_src orelse continue;
-            try out.print(";; {s}\n", .{path});
-            var dump_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-            defer dump_arena.deinit();
-            _ = checker.checkAndDump(dump_arena.allocator(), io, gpa, &interner, tree, b, src.bytes, out) catch {};
-        }
+        var dump_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer dump_arena.deinit();
+        const all_files = try dump_arena.allocator().alloc(modules.FileId, n_files);
+        for (all_files, 0..) |*f, i| f.* = @intCast(i);
+        _ = checker.checkFilesAndDump(dump_arena.allocator(), io, gpa, &interner, prog, all_files, out) catch {};
     }
 
-    try out.print("ztsc: loaded {d} file(s), {d} lines, {d} bytes, {d} tokens, {d} nodes, {d} symbols, {d} parse error(s), {d} bind error(s), {d} check error(s) ({d} worker(s))\n", .{
-        files_ok, total_lines, total_bytes, total_tokens, total_nodes, total_symbols, parse_diags, bind_diags, check_diags, n_workers,
+    try out.print("ztsc: loaded {d} file(s) ({d} from CLI), {d} lines, {d} bytes, {d} tokens, {d} nodes, {d} symbols, {d} parse error(s), {d} bind error(s), {d} link error(s), {d} check error(s) ({d} worker(s), {d} checker(s))\n", .{
+        files_ok,    n_entries,  total_lines, total_bytes, total_tokens, total_nodes, total_symbols,
+        parse_diags, bind_diags, link_diags,  check_diags, n_workers,    n_checkers,
     });
 
     if (cli.timing) {
-        const load_ms = nsToMs(load_ns);
-        const scan_ms = nsToMs(scan_ns);
         const total_ms = nsToMs(total_ns);
-        const load_s = @as(f64, @floatFromInt(load_ns)) / std.time.ns_per_s;
-        const scan_s = @as(f64, @floatFromInt(scan_ns)) / std.time.ns_per_s;
-        // --repeat multiplies the work done in the scan phase.
         const scanned_lines = @as(f64, @floatFromInt(total_lines * cli.repeat));
         const scanned_bytes = @as(f64, @floatFromInt(total_bytes * cli.repeat));
-        const load_lines_per_s: f64 = if (load_s > 0) @as(f64, @floatFromInt(total_lines)) / load_s else 0;
-        const load_mb_per_s: f64 = if (load_s > 0)
-            @as(f64, @floatFromInt(total_bytes)) / (1024.0 * 1024.0) / load_s
-        else
-            0;
-        const scan_lines_per_s: f64 = if (scan_s > 0) scanned_lines / scan_s else 0;
-        const scan_mb_per_s: f64 = if (scan_s > 0) scanned_bytes / (1024.0 * 1024.0) / scan_s else 0;
-        const parse_ms = nsToMs(parse_ns);
-        const parse_s = @as(f64, @floatFromInt(parse_ns)) / std.time.ns_per_s;
-        const parse_lines_per_s: f64 = if (parse_s > 0) scanned_lines / parse_s else 0;
-        const parse_mb_per_s: f64 = if (parse_s > 0) scanned_bytes / (1024.0 * 1024.0) / parse_s else 0;
-        const bind_ms = nsToMs(bind_ns);
-        const bind_s = @as(f64, @floatFromInt(bind_ns)) / std.time.ns_per_s;
-        const bind_lines_per_s: f64 = if (bind_s > 0) scanned_lines / bind_s else 0;
-        const bind_mb_per_s: f64 = if (bind_s > 0) scanned_bytes / (1024.0 * 1024.0) / bind_s else 0;
         try out.print("\n--timing\n", .{});
         try out.print("  {s:<10} {s:>10} {s:>14} {s:>10}\n", .{ "phase", "ms", "lines/s", "MB/s" });
-        try out.print("  {s:<10} {d:>10.3} {d:>14.0} {d:>10.1}\n", .{ "load", load_ms, load_lines_per_s, load_mb_per_s });
-        try out.print("  {s:<10} {d:>10.3} {d:>14.0} {d:>10.1}\n", .{ "scan", scan_ms, scan_lines_per_s, scan_mb_per_s });
-        try out.print("  {s:<10} {d:>10.3} {d:>14.0} {d:>10.1}\n", .{ "parse", parse_ms, parse_lines_per_s, parse_mb_per_s });
-        try out.print("  {s:<10} {d:>10.3} {d:>14.0} {d:>10.1}\n", .{ "bind", bind_ms, bind_lines_per_s, bind_mb_per_s });
-        const check_ms = nsToMs(check_ns);
-        const check_s = @as(f64, @floatFromInt(check_ns)) / std.time.ns_per_s;
-        const check_lines_per_s: f64 = if (check_s > 0) scanned_lines / check_s else 0;
-        const check_mb_per_s: f64 = if (check_s > 0) scanned_bytes / (1024.0 * 1024.0) / check_s else 0;
-        try out.print("  {s:<10} {d:>10.3} {d:>14.0} {d:>10.1}\n", .{ "check", check_ms, check_lines_per_s, check_mb_per_s });
+        try printPhase(out, "load", load_ns, @floatFromInt(total_lines), @floatFromInt(total_bytes));
+        try printPhase(out, "scan", scan_ns, scanned_lines, scanned_bytes);
+        try printPhase(out, "parse", parse_ns, scanned_lines, scanned_bytes);
+        try printPhase(out, "bind", bind_ns, scanned_lines, scanned_bytes);
+        try printPhase(out, "resolve", resolve_ns, 0, 0);
+        try printPhase(out, "link", link_ns, 0, 0);
+        try printPhase(out, "check", check_ns, @floatFromInt(total_lines), @floatFromInt(total_bytes));
         try out.print("  {s:<10} {d:>10.3}\n", .{ "total", total_ms });
+        try out.print("  per checker:\n", .{});
+        for (tasks, 0..) |*t, k| {
+            try out.print("    checker[{d}] {d:>10.3} ms  {d} file(s)\n", .{ k, nsToMs(t.ns), t.owned.len });
+        }
     }
 
     if (cli.memory) {
@@ -565,8 +718,16 @@ pub fn main(init: std.process.Init) !void {
             0;
         try out.print("  {s:<24} {d:>12.2}\n", .{ "bind bytes/line", bind_bytes_per_line });
 
-        // Checker statistics (PLAN M4: bytes/type is the key memory metric).
-        try out.print("  {s:<24} {d:>12}\n", .{ "check types", check_types });
+        // Module graph (M5).
+        try out.print("  {s:<24} {d:>12}\n", .{ "module graph bytes", prog.graphBytes() });
+
+        // Checker statistics (M4 bytes/type; M5 per-checker breakdown).
+        for (tasks, 0..) |*t, k| {
+            const ck = t.result orelse continue;
+            try out.print("  checker[{d}] types        {d:>12}\n", .{ k, ck.stats.types_created });
+            try out.print("  checker[{d}] type bytes   {d:>12}\n", .{ k, ck.stats.type_bytes });
+        }
+        try out.print("  {s:<24} {d:>12}\n", .{ "check types (total)", check_types });
         try out.print("  {s:<24} {d:>12}\n", .{ "check type-arena bytes", check_type_bytes });
         const bytes_per_type: f64 = if (check_types > 0)
             @as(f64, @floatFromInt(check_type_bytes)) / @as(f64, @floatFromInt(check_types))
@@ -599,7 +760,60 @@ pub fn main(init: std.process.Init) !void {
     }
 
     try out.flush();
-    if (failed > 0 or parse_diags > 0 or bind_diags > 0 or check_diags > 0) std.process.exit(1);
+    for (tasks) |*t| t.arena.deinit();
+    if (failed > 0 or parse_diags > 0 or bind_diags > 0 or link_diags > 0 or check_diags > 0) std.process.exit(1);
+}
+
+fn printPhase(out: *Io.Writer, name: []const u8, ns: u64, lines: f64, bytes: f64) !void {
+    const s = @as(f64, @floatFromInt(ns)) / std.time.ns_per_s;
+    const lines_per_s: f64 = if (s > 0 and lines > 0) lines / s else 0;
+    const mb_per_s: f64 = if (s > 0 and bytes > 0) bytes / (1024.0 * 1024.0) / s else 0;
+    try out.print("  {s:<10} {d:>10.3} {d:>14.0} {d:>10.1}\n", .{ name, nsToMs(ns), lines_per_s, mb_per_s });
+}
+
+/// Resolve one module specifier of `importer`; appends to the spec map and
+/// discovers new files into `paths`.
+fn resolveSpecInto(
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    io: Io,
+    interner: *Interner,
+    importer: []const u8,
+    module_atom: ztsc.intern.Atom,
+    seen: *std.AutoHashMapUnmanaged(ztsc.intern.Atom, void),
+    path_ids: *std.StringHashMapUnmanaged(u32),
+    paths: *std.ArrayList([]const u8),
+    atoms: *std.ArrayList(ztsc.intern.Atom),
+    files: *std.ArrayList(modules.FileId),
+) !void {
+    if (module_atom == 0) return;
+    const gop = try seen.getOrPut(gpa, module_atom);
+    if (gop.found_existing) return;
+    const spec = interner.lookup(io, module_atom);
+    var fid: modules.FileId = modules.no_file;
+    if (try modules.resolveSpecifier(io, arena, Io.Dir.cwd(), importer, spec)) |resolved| {
+        const pgop = try path_ids.getOrPut(arena, resolved);
+        if (pgop.found_existing) {
+            fid = pgop.value_ptr.*;
+        } else {
+            fid = @intCast(paths.items.len);
+            pgop.value_ptr.* = fid;
+            try paths.append(arena, resolved);
+        }
+    }
+    try atoms.append(arena, module_atom);
+    try files.append(arena, fid);
+}
+
+fn sortSpecPairs(atoms: []ztsc.intern.Atom, files: []modules.FileId) void {
+    var i: usize = 1;
+    while (i < atoms.len) : (i += 1) {
+        var j = i;
+        while (j > 0 and atoms[j - 1] > atoms[j]) : (j -= 1) {
+            std.mem.swap(ztsc.intern.Atom, &atoms[j - 1], &atoms[j]);
+            std.mem.swap(modules.FileId, &files[j - 1], &files[j]);
+        }
+    }
 }
 
 fn nsToMs(ns: u64) f64 {
@@ -627,6 +841,11 @@ fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8) !Cli {
                 return error.BadFlagValue;
             if (n == 0) return error.BadFlagValue;
             cli.workers = n;
+        } else if (std.mem.startsWith(u8, arg, "--checkers=")) {
+            const n = std.fmt.parseInt(usize, arg["--checkers=".len..], 10) catch
+                return error.BadFlagValue;
+            if (n == 0) return error.BadFlagValue;
+            cli.checkers = n;
         } else if (std.mem.startsWith(u8, arg, "--repeat=")) {
             cli.repeat = std.fmt.parseInt(usize, arg["--repeat=".len..], 10) catch
                 return error.BadFlagValue;
@@ -654,16 +873,19 @@ test "parseArgs flags and paths" {
     try std.testing.expectEqualStrings("b.ts", cli.paths[1]);
 }
 
-test "parseArgs workers and repeat" {
+test "parseArgs workers, checkers and repeat" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const args = [_][:0]const u8{ "ztsc", "--workers=4", "--repeat=10", "a.ts" };
+    const args = [_][:0]const u8{ "ztsc", "--workers=4", "--checkers=2", "--repeat=10", "a.ts" };
     const cli = try parseArgs(arena.allocator(), &args);
     try std.testing.expectEqual(@as(?usize, 4), cli.workers);
+    try std.testing.expectEqual(@as(?usize, 2), cli.checkers);
     try std.testing.expectEqual(@as(usize, 10), cli.repeat);
 
     const bad_workers = [_][:0]const u8{ "ztsc", "--workers=0" };
     try std.testing.expectError(error.BadFlagValue, parseArgs(arena.allocator(), &bad_workers));
+    const bad_checkers = [_][:0]const u8{ "ztsc", "--checkers=0" };
+    try std.testing.expectError(error.BadFlagValue, parseArgs(arena.allocator(), &bad_checkers));
     const bad_repeat = [_][:0]const u8{ "ztsc", "--repeat=x" };
     try std.testing.expectError(error.BadFlagValue, parseArgs(arena.allocator(), &bad_repeat));
 }
