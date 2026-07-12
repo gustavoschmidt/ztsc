@@ -32,18 +32,31 @@ const Ast = ztsc.ast.Ast;
 const Bind = binder.Bind;
 
 const usage =
-    \\usage: ztsc [options] <files...>
+    \\usage: ztsc [options] [files...]
+    \\
+    \\With no files, ztsc looks for tsconfig.json in the current directory
+    \\and its parents (or uses --project). See PLAN.md §5 for the checked
+    \\TypeScript subset.
     \\
     \\options:
-    \\  --timing        print per-phase wall-clock timings
-    \\  --memory        print arena / memory statistics
-    \\  --dump-ast      print S-expression parse trees (golden-test format)
-    \\  --dump-symbols  print binder scope/symbol dumps (golden-test format)
-    \\  --dump-types    print per-declaration checked types (golden-test format)
-    \\  --workers=N     number of worker threads (default: CPU count)
-    \\  --checkers=N    number of checker instances (default: min(4, CPUs))
-    \\  --repeat=N      scan/parse/bind each file N times (benchmark aid)
-    \\  --version       print version and exit
+    \\  -p, --project <path>   use the tsconfig.json at <path> (file or dir)
+    \\  --pretty[=true|false]  tsc-style colored diagnostics with source
+    \\                         excerpts (default: on when stderr is a TTY)
+    \\  --verbose              print notes about accepted-but-ignored
+    \\                         tsconfig options
+    \\  --timing               print per-phase wall-clock timings
+    \\  --memory               print arena / memory statistics
+    \\  --dump-ast             print S-expression parse trees (golden-test format)
+    \\  --dump-symbols         print binder scope/symbol dumps (golden-test format)
+    \\  --dump-types           print per-declaration checked types (golden-test format)
+    \\  --workers=N            number of worker threads (default: CPU count)
+    \\  --checkers=N           number of checker instances (default: min(4, CPUs))
+    \\  --repeat=N             scan/parse/bind each file N times (benchmark aid)
+    \\  -h, --help             print this help and exit
+    \\  --version              print version and exit
+    \\
+    \\exit codes: 0 no errors; 1 type/syntax errors reported; 2 usage,
+    \\config, or file-system errors.
     \\
 ;
 
@@ -70,10 +83,58 @@ const Cli = struct {
     dump_symbols: bool = false,
     dump_types: bool = false,
     version: bool = false,
+    help: bool = false,
+    verbose: bool = false,
+    /// null = auto (pretty iff stderr is a TTY).
+    pretty: ?bool = null,
+    project: ?[]const u8 = null,
     workers: ?usize = null,
     checkers: ?usize = null,
     repeat: usize = 1,
     paths: []const []const u8 = &.{},
+};
+
+/// Routes diagnostics to the plain machine format or the pretty renderer,
+/// tracking totals for the tsc-style summary line.
+const Emitter = struct {
+    out: *Io.Writer,
+    pretty: bool,
+    total: usize = 0,
+    files_with: usize = 0,
+    cur_file_had: bool = false,
+    first_path: []const u8 = "",
+    first_line: u32 = 0,
+
+    fn beginFile(e: *Emitter) void {
+        e.cur_file_had = false;
+    }
+
+    fn emit(
+        e: *Emitter,
+        path: []const u8,
+        src: *const Source,
+        span: ztsc.source.Span,
+        ts_code: u16,
+        msg: []const u8,
+    ) !void {
+        const lc = src.lineCol(@min(span.start, @as(u32, @intCast(src.bytes.len))));
+        if (e.total == 0) {
+            e.first_path = path;
+            e.first_line = lc.line + 1;
+        }
+        e.total += 1;
+        if (!e.cur_file_had) {
+            e.cur_file_had = true;
+            e.files_with += 1;
+        }
+        if (e.pretty) {
+            try ztsc.render.renderPretty(e.out, true, path, src.bytes, src.line_starts, span, ts_code, msg);
+        } else if (ts_code != 0) {
+            try e.out.print("{s}:{d}:{d}: error TS{d}: {s}\n", .{ path, lc.line + 1, lc.col + 1, ts_code, msg });
+        } else {
+            try e.out.print("{s}:{d}:{d}: error: {s}\n", .{ path, lc.line + 1, lc.col + 1, msg });
+        }
+    }
 };
 
 /// One pool worker. Each worker owns an arena allocator; everything a worker
@@ -244,20 +305,82 @@ pub fn main(init: std.process.Init) !void {
     const out = &stdout_writer.interface;
 
     const args = try init.minimal.args.toSlice(arena);
-    const cli = parseArgs(arena, args) catch {
-        std.debug.print("{s}", .{usage});
+    var bad_arg: []const u8 = "";
+    const cli = parseArgs(arena, args, &bad_arg) catch |err| {
+        switch (err) {
+            error.UnknownFlag => std.debug.print("ztsc: unknown option '{s}'\n", .{bad_arg}),
+            error.BadFlagValue => std.debug.print("ztsc: bad value for option '{s}'\n", .{bad_arg}),
+            error.MissingFlagValue => std.debug.print("ztsc: option '{s}' needs a value\n", .{bad_arg}),
+            else => return err,
+        }
+        std.debug.print("try 'ztsc --help'\n", .{});
         std.process.exit(2);
     };
 
+    if (cli.help) {
+        try out.print("{s}", .{usage});
+        try out.flush();
+        return;
+    }
     if (cli.version) {
         try out.print("ztsc {s}\n", .{ztsc.version});
         try out.flush();
         return;
     }
-    if (cli.paths.len == 0) {
-        std.debug.print("ztsc: no input files\n{s}", .{usage});
+    if (cli.paths.len != 0 and cli.project != null) {
+        std.debug.print("ztsc: option '--project' cannot be mixed with source files on the command line\n", .{});
         std.process.exit(2);
     }
+
+    // With no file arguments, drive the run from a tsconfig.json (M6).
+    var entry_paths = cli.paths;
+    var paths_map: ?ztsc.tsconfig.Paths = null;
+    if (cli.paths.len == 0) {
+        const config_path: []const u8 = blk: {
+            if (cli.project) |p| {
+                // Accept either the config file or its directory.
+                if (Io.Dir.cwd().openDir(io, p, .{})) |d| {
+                    var dir = d;
+                    dir.close(io);
+                    const trimmed = std.mem.trimEnd(u8, p, "/");
+                    break :blk try std.fmt.allocPrint(arena, "{s}/tsconfig.json", .{trimmed});
+                } else |_| {
+                    break :blk p;
+                }
+            }
+            break :blk (try ztsc.tsconfig.findUpward(io, arena)) orelse {
+                std.debug.print("ztsc: no input files and no tsconfig.json found\ntry 'ztsc --help'\n", .{});
+                std.process.exit(2);
+            };
+        };
+        const cfg = ztsc.tsconfig.load(io, arena, config_path) catch |err| {
+            switch (err) {
+                error.NotFound => std.debug.print("ztsc: cannot read '{s}'\n", .{config_path}),
+                error.SyntaxError => std.debug.print("ztsc: '{s}' is not valid JSON\n", .{config_path}),
+                error.StrictFalse => std.debug.print(
+                    "ztsc: '{s}' sets \"strict\": false, but ztsc v0.0.1 only implements strict-mode semantics.\n" ++
+                        "Please remove the option (or set it to true) to check this project with ztsc.\n",
+                    .{config_path},
+                ),
+                error.OutOfMemory => return error.OutOfMemory,
+            }
+            std.process.exit(2);
+        };
+        for (cfg.warnings) |w| std.debug.print("ztsc: warning: {s}\n", .{w});
+        if (cli.verbose) {
+            for (cfg.notes) |n| std.debug.print("ztsc: note: {s}\n", .{n});
+        }
+        if (cfg.root_files.len == 0) {
+            std.debug.print("ztsc: no inputs were found in config file '{s}'\n", .{config_path});
+            std.process.exit(2);
+        }
+        entry_paths = cfg.root_files;
+        paths_map = cfg.paths;
+    }
+
+    // Pretty diagnostics: tsc-style excerpts + colors; default follows the
+    // terminal, --pretty / --pretty=false forces.
+    const pretty = cli.pretty orelse (Io.File.stderr().isTty(io) catch false);
 
     const total_timer = Timer.start(io);
 
@@ -276,7 +399,7 @@ pub fn main(init: std.process.Init) !void {
     // --- Wavefront discovery: load/scan/parse/bind + resolve, per wave ----
     var paths: std.ArrayList([]const u8) = .empty;
     var path_ids: std.StringHashMapUnmanaged(u32) = .empty;
-    for (cli.paths) |p| {
+    for (entry_paths) |p| {
         const norm = try modules.normalizePath(arena, p);
         const gop = try path_ids.getOrPut(arena, norm);
         if (!gop.found_existing) {
@@ -370,11 +493,11 @@ pub fn main(init: std.process.Init) !void {
                 var seen: std.AutoHashMapUnmanaged(ztsc.intern.Atom, void) = .empty;
                 defer seen.deinit(gpa);
                 for (b.imports) |rec| {
-                    try resolveSpecInto(arena, gpa, io, &interner, paths.items[i], rec.module, &seen, &path_ids, &paths, &atoms, &files);
+                    try resolveSpecInto(arena, gpa, io, &interner, paths_map, paths.items[i], rec.module, &seen, &path_ids, &paths, &atoms, &files);
                 }
                 for (b.exports) |rec| {
                     if (rec.module != 0) {
-                        try resolveSpecInto(arena, gpa, io, &interner, paths.items[i], rec.module, &seen, &path_ids, &paths, &atoms, &files);
+                        try resolveSpecInto(arena, gpa, io, &interner, paths_map, paths.items[i], rec.module, &seen, &path_ids, &paths, &atoms, &files);
                     }
                 }
             }
@@ -552,21 +675,25 @@ pub fn main(init: std.process.Init) !void {
     // --- Diagnostics: per file (discovery order), position-sorted ----------
     // Parse diagnostics first (message-only), then bind + link + check
     // merged by (position, code). Byte-identical for any --checkers=N.
+    // Non-pretty output is the stable machine format; --pretty renders
+    // tsc-style excerpts plus the final summary line (M6).
     const cursors = try arena.alloc(usize, n_checkers);
     @memset(cursors, 0);
 
+    var emitter: Emitter = .{ .out = out, .pretty = pretty };
     const Merged = struct {
         code: u16,
         start: u32,
+        end: u32,
         msg: []const u8,
     };
     for (0..n_files) |i| {
         const path = paths.items[i];
         const src = results.items[i] orelse continue;
         const tree = trees.items[i] orelse continue;
+        emitter.beginFile();
         for (tree.diagnostics) |d| {
-            const lc = src.lineCol(@min(d.span.start, @as(u32, @intCast(src.bytes.len))));
-            try out.print("{s}:{d}:{d}: error: {s}\n", .{ path, lc.line + 1, lc.col + 1, d.message() });
+            try emitter.emit(path, &src, d.span, 0, d.message());
         }
 
         var merged: std.ArrayList(Merged) = .empty;
@@ -575,22 +702,21 @@ pub fn main(init: std.process.Init) !void {
             for (b.diagnostics) |d| {
                 const ts = d.code.tsCode();
                 if (ts != 0) {
-                    try merged.append(gpa, .{ .code = ts, .start = d.span.start, .msg = d.message() });
+                    try merged.append(gpa, .{ .code = ts, .start = d.span.start, .end = d.span.end, .msg = d.message() });
                 } else {
-                    const lc = src.lineCol(@min(d.span.start, @as(u32, @intCast(src.bytes.len))));
-                    try out.print("{s}:{d}:{d}: error: {s}\n", .{ path, lc.line + 1, lc.col + 1, d.message() });
+                    try emitter.emit(path, &src, d.span, 0, d.message());
                 }
             }
         }
         for (links[i].diags) |d| {
-            try merged.append(gpa, .{ .code = d.code, .start = d.span.start, .msg = d.msg });
+            try merged.append(gpa, .{ .code = d.code, .start = d.span.start, .end = d.span.end, .msg = d.msg });
         }
         const owner = i % n_checkers;
         if (tasks[owner].result) |ck| {
             var cur = cursors[owner];
             while (cur < ck.diagnostics.len and ck.diagnostics[cur].file == i) : (cur += 1) {
                 const d = ck.diagnostics[cur];
-                try merged.append(gpa, .{ .code = d.code, .start = d.span.start, .msg = d.msg });
+                try merged.append(gpa, .{ .code = d.code, .start = d.span.start, .end = d.span.end, .msg = d.msg });
             }
             cursors[owner] = cur;
         }
@@ -601,9 +727,11 @@ pub fn main(init: std.process.Init) !void {
             }
         }.lessThan);
         for (merged.items) |d| {
-            const lc = src.lineCol(@min(d.start, @as(u32, @intCast(src.bytes.len))));
-            try out.print("{s}:{d}:{d}: error TS{d}: {s}\n", .{ path, lc.line + 1, lc.col + 1, d.code, d.msg });
+            try emitter.emit(path, &src, .{ .start = d.start, .end = d.end }, d.code, d.msg);
         }
+    }
+    if (pretty) {
+        try ztsc.render.renderSummary(out, true, emitter.total, emitter.files_with, emitter.first_path, emitter.first_line);
     }
 
     // --- AST dump (--dump-ast) ---------------------------------------------
@@ -761,7 +889,11 @@ pub fn main(init: std.process.Init) !void {
 
     try out.flush();
     for (tasks) |*t| t.arena.deinit();
-    if (failed > 0 or parse_diags > 0 or bind_diags > 0 or link_diags > 0 or check_diags > 0) std.process.exit(1);
+    // Exit codes (documented in --help / README): 2 for environment
+    // failures (unloadable files, internal checker errors), 1 when any
+    // diagnostics were reported, 0 for a clean check.
+    if (failed > 0) std.process.exit(2);
+    if (parse_diags > 0 or bind_diags > 0 or link_diags > 0 or check_diags > 0) std.process.exit(1);
 }
 
 fn printPhase(out: *Io.Writer, name: []const u8, ns: u64, lines: f64, bytes: f64) !void {
@@ -778,6 +910,7 @@ fn resolveSpecInto(
     gpa: std.mem.Allocator,
     io: Io,
     interner: *Interner,
+    paths_map: ?ztsc.tsconfig.Paths,
     importer: []const u8,
     module_atom: ztsc.intern.Atom,
     seen: *std.AutoHashMapUnmanaged(ztsc.intern.Atom, void),
@@ -791,7 +924,21 @@ fn resolveSpecInto(
     if (gop.found_existing) return;
     const spec = interner.lookup(io, module_atom);
     var fid: modules.FileId = modules.no_file;
-    if (try modules.resolveSpecifier(io, arena, Io.Dir.cwd(), importer, spec)) |resolved| {
+    // tsconfig `paths` mapping applies to bare specifiers first (M6);
+    // unmatched or unresolved candidates fall through to normal
+    // resolution, like tsc.
+    var mapped: ?[]u8 = null;
+    if (paths_map) |pm| {
+        if (spec.len > 0 and spec[0] != '.' and spec[0] != '/') {
+            for (try pm.mapSpecifier(arena, spec)) |cand| {
+                if (try modules.resolveStem(io, arena, Io.Dir.cwd(), cand)) |r| {
+                    mapped = r;
+                    break;
+                }
+            }
+        }
+    }
+    if (mapped orelse try modules.resolveSpecifier(io, arena, Io.Dir.cwd(), importer, spec)) |resolved| {
         const pgop = try path_ids.getOrPut(arena, resolved);
         if (pgop.found_existing) {
             fid = pgop.value_ptr.*;
@@ -820,10 +967,14 @@ fn nsToMs(ns: u64) f64 {
     return @as(f64, @floatFromInt(ns)) / std.time.ns_per_ms;
 }
 
-fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8) !Cli {
+/// Parse argv. On error, `bad_arg` names the offending argument.
+fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8, bad_arg: *[]const u8) !Cli {
     var cli: Cli = .{};
     var paths: std.ArrayList([]const u8) = .empty;
-    for (args[1..]) |arg| {
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        bad_arg.* = arg;
         if (std.mem.eql(u8, arg, "--timing")) {
             cli.timing = true;
         } else if (std.mem.eql(u8, arg, "--memory")) {
@@ -836,6 +987,27 @@ fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8) !Cli {
             cli.dump_types = true;
         } else if (std.mem.eql(u8, arg, "--version")) {
             cli.version = true;
+        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            cli.help = true;
+        } else if (std.mem.eql(u8, arg, "--verbose")) {
+            cli.verbose = true;
+        } else if (std.mem.eql(u8, arg, "--pretty")) {
+            cli.pretty = true;
+        } else if (std.mem.startsWith(u8, arg, "--pretty=")) {
+            const v = arg["--pretty=".len..];
+            if (std.mem.eql(u8, v, "true")) {
+                cli.pretty = true;
+            } else if (std.mem.eql(u8, v, "false")) {
+                cli.pretty = false;
+            } else {
+                return error.BadFlagValue;
+            }
+        } else if (std.mem.eql(u8, arg, "--project") or std.mem.eql(u8, arg, "-p")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            cli.project = args[i];
+        } else if (std.mem.startsWith(u8, arg, "--project=")) {
+            cli.project = arg["--project=".len..];
         } else if (std.mem.startsWith(u8, arg, "--workers=")) {
             const n = std.fmt.parseInt(usize, arg["--workers=".len..], 10) catch
                 return error.BadFlagValue;
@@ -850,7 +1022,7 @@ fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8) !Cli {
             cli.repeat = std.fmt.parseInt(usize, arg["--repeat=".len..], 10) catch
                 return error.BadFlagValue;
             if (cli.repeat == 0) return error.BadFlagValue;
-        } else if (std.mem.startsWith(u8, arg, "--")) {
+        } else if (std.mem.startsWith(u8, arg, "-") and arg.len > 1) {
             return error.UnknownFlag;
         } else {
             try paths.append(arena, arg);
@@ -863,8 +1035,9 @@ fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8) !Cli {
 test "parseArgs flags and paths" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
+    var bad: []const u8 = "";
     const args = [_][:0]const u8{ "ztsc", "--timing", "a.ts", "--memory", "b.ts" };
-    const cli = try parseArgs(arena.allocator(), &args);
+    const cli = try parseArgs(arena.allocator(), &args, &bad);
     try std.testing.expect(cli.timing);
     try std.testing.expect(cli.memory);
     try std.testing.expect(!cli.version);
@@ -876,25 +1049,68 @@ test "parseArgs flags and paths" {
 test "parseArgs workers, checkers and repeat" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
+    var bad: []const u8 = "";
     const args = [_][:0]const u8{ "ztsc", "--workers=4", "--checkers=2", "--repeat=10", "a.ts" };
-    const cli = try parseArgs(arena.allocator(), &args);
+    const cli = try parseArgs(arena.allocator(), &args, &bad);
     try std.testing.expectEqual(@as(?usize, 4), cli.workers);
     try std.testing.expectEqual(@as(?usize, 2), cli.checkers);
     try std.testing.expectEqual(@as(usize, 10), cli.repeat);
 
     const bad_workers = [_][:0]const u8{ "ztsc", "--workers=0" };
-    try std.testing.expectError(error.BadFlagValue, parseArgs(arena.allocator(), &bad_workers));
+    try std.testing.expectError(error.BadFlagValue, parseArgs(arena.allocator(), &bad_workers, &bad));
     const bad_checkers = [_][:0]const u8{ "ztsc", "--checkers=0" };
-    try std.testing.expectError(error.BadFlagValue, parseArgs(arena.allocator(), &bad_checkers));
+    try std.testing.expectError(error.BadFlagValue, parseArgs(arena.allocator(), &bad_checkers, &bad));
     const bad_repeat = [_][:0]const u8{ "ztsc", "--repeat=x" };
-    try std.testing.expectError(error.BadFlagValue, parseArgs(arena.allocator(), &bad_repeat));
+    try std.testing.expectError(error.BadFlagValue, parseArgs(arena.allocator(), &bad_repeat, &bad));
+    try std.testing.expectEqualStrings("--repeat=x", bad);
 }
 
 test "parseArgs rejects unknown flags" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
+    var bad: []const u8 = "";
     const args = [_][:0]const u8{ "ztsc", "--nope" };
-    try std.testing.expectError(error.UnknownFlag, parseArgs(arena.allocator(), &args));
+    try std.testing.expectError(error.UnknownFlag, parseArgs(arena.allocator(), &args, &bad));
+    try std.testing.expectEqualStrings("--nope", bad);
+    const short = [_][:0]const u8{ "ztsc", "-x" };
+    try std.testing.expectError(error.UnknownFlag, parseArgs(arena.allocator(), &short, &bad));
+}
+
+test "parseArgs M6 flags: pretty, project, help, verbose" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var bad: []const u8 = "";
+
+    const a1 = [_][:0]const u8{ "ztsc", "--pretty", "--verbose", "a.ts" };
+    const c1 = try parseArgs(arena.allocator(), &a1, &bad);
+    try std.testing.expectEqual(@as(?bool, true), c1.pretty);
+    try std.testing.expect(c1.verbose);
+
+    const a2 = [_][:0]const u8{ "ztsc", "--pretty=false" };
+    const c2 = try parseArgs(arena.allocator(), &a2, &bad);
+    try std.testing.expectEqual(@as(?bool, false), c2.pretty);
+
+    const a3 = [_][:0]const u8{"ztsc"};
+    const c3 = try parseArgs(arena.allocator(), &a3, &bad);
+    try std.testing.expectEqual(@as(?bool, null), c3.pretty);
+
+    const a4 = [_][:0]const u8{ "ztsc", "-p", "proj/dir" };
+    const c4 = try parseArgs(arena.allocator(), &a4, &bad);
+    try std.testing.expectEqualStrings("proj/dir", c4.project.?);
+
+    const a5 = [_][:0]const u8{ "ztsc", "--project=x/tsconfig.json" };
+    const c5 = try parseArgs(arena.allocator(), &a5, &bad);
+    try std.testing.expectEqualStrings("x/tsconfig.json", c5.project.?);
+
+    const a6 = [_][:0]const u8{ "ztsc", "-p" };
+    try std.testing.expectError(error.MissingFlagValue, parseArgs(arena.allocator(), &a6, &bad));
+
+    const a7 = [_][:0]const u8{ "ztsc", "--pretty=maybe" };
+    try std.testing.expectError(error.BadFlagValue, parseArgs(arena.allocator(), &a7, &bad));
+
+    const a8 = [_][:0]const u8{ "ztsc", "-h" };
+    const c8 = try parseArgs(arena.allocator(), &a8, &bad);
+    try std.testing.expect(c8.help);
 }
 
 test "arena accounting sanity: capacity grows with allocations and covers usage" {

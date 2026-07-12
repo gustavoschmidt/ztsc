@@ -13,6 +13,8 @@ pub const binder = @import("binder.zig");
 pub const types = @import("types.zig");
 pub const modules = @import("modules.zig");
 pub const checker = @import("checker.zig");
+pub const tsconfig = @import("tsconfig.zig");
+pub const render = @import("render.zig");
 
 pub const version = "0.0.1";
 
@@ -27,4 +29,6 @@ test {
     _ = types;
     _ = modules;
     _ = checker;
+    _ = tsconfig;
+    _ = render;
 }

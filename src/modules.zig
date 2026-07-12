@@ -298,8 +298,9 @@ fn tryCandidates(io: Io, alloc: Allocator, dir: Io.Dir, cands: []const []const u
 }
 
 /// Resolve a relative-or-package file stem with the documented extension
-/// order. `stem` is a normalized path relative to `dir`.
-fn resolveStem(io: Io, alloc: Allocator, dir: Io.Dir, stem: []const u8) Error!?[]u8 {
+/// order. `stem` is a normalized path relative to `dir`. Public because
+/// tsconfig `paths` mapping (M6) feeds mapped candidates through it.
+pub fn resolveStem(io: Io, alloc: Allocator, dir: Io.Dir, stem: []const u8) Error!?[]u8 {
     var buf: [4][]const u8 = undefined;
     var n: usize = 0;
     if (std.mem.endsWith(u8, stem, ".d.ts") or std.mem.endsWith(u8, stem, ".ts")) {
