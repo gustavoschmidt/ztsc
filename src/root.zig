@@ -16,7 +16,7 @@ pub const checker = @import("checker.zig");
 pub const tsconfig = @import("tsconfig.zig");
 pub const render = @import("render.zig");
 
-pub const version = "0.0.1";
+pub const version = "0.0.1-dev";
 
 test {
     _ = source;

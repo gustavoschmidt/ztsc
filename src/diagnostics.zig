@@ -76,7 +76,7 @@ pub const Code = enum(u16) {
     /// TS2492: redeclaring a catch-clause parameter in the catch block.
     catch_redeclare,
 
-    // --- subset boundary (PLAN §5: explicit, never a wrong answer) ---------
+    // --- subset boundary (ROADMAP.md §6: explicit, never a wrong answer) ---------
     unsupported_syntax,
     unsupported_satisfies,
 
@@ -128,8 +128,8 @@ pub const Code = enum(u16) {
             .duplicate_function_implementation => "duplicate function implementation",
             .import_conflict => "import declaration conflicts with local declaration",
             .catch_redeclare => "cannot redeclare identifier in catch clause",
-            .unsupported_syntax => "syntax not supported in ztsc v0.0.1",
-            .unsupported_satisfies => "'satisfies' is not supported in ztsc v0.0.1",
+            .unsupported_syntax => "syntax not yet supported by ztsc",
+            .unsupported_satisfies => "'satisfies' is not yet supported by ztsc",
         };
     }
 

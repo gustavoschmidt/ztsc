@@ -1,4 +1,4 @@
-//! Type representation + hash-consing (PLAN §2.2).
+//! Type representation + hash-consing (ROADMAP.md §2.2).
 //!
 //! Design decisions:
 //!
