@@ -303,25 +303,26 @@ fn tryCandidates(io: Io, alloc: Allocator, dir: Io.Dir, cands: []const []const u
 pub fn resolveStem(io: Io, alloc: Allocator, dir: Io.Dir, stem: []const u8) Error!?[]u8 {
     var buf: [4][]const u8 = undefined;
     var n: usize = 0;
+    // Candidate paths are built with `alloc` (a scratch arena, freed after
+    // the file's specifiers resolve). A previous fixed 256-byte buffer
+    // silently failed on deep node_modules/@types paths — a wrong "module
+    // not found" — so there is no length cap here.
     if (std.mem.endsWith(u8, stem, ".d.ts") or std.mem.endsWith(u8, stem, ".ts")) {
         buf[0] = stem;
         n = 1;
         return tryCandidates(io, alloc, dir, buf[0..n]);
     }
-    var scratch: [4][256]u8 = undefined;
     if (std.mem.endsWith(u8, stem, ".js")) {
         const base = stem[0 .. stem.len - 3];
-        if (base.len + 5 > scratch[0].len) return null;
-        buf[0] = std.fmt.bufPrint(&scratch[0], "{s}.ts", .{base}) catch return null;
-        buf[1] = std.fmt.bufPrint(&scratch[1], "{s}.d.ts", .{base}) catch return null;
+        buf[0] = try std.fmt.allocPrint(alloc, "{s}.ts", .{base});
+        buf[1] = try std.fmt.allocPrint(alloc, "{s}.d.ts", .{base});
         n = 2;
         return tryCandidates(io, alloc, dir, buf[0..n]);
     }
-    if (stem.len + 12 > scratch[0].len) return null;
-    buf[0] = std.fmt.bufPrint(&scratch[0], "{s}.ts", .{stem}) catch return null;
-    buf[1] = std.fmt.bufPrint(&scratch[1], "{s}.d.ts", .{stem}) catch return null;
-    buf[2] = std.fmt.bufPrint(&scratch[2], "{s}/index.ts", .{stem}) catch return null;
-    buf[3] = std.fmt.bufPrint(&scratch[3], "{s}/index.d.ts", .{stem}) catch return null;
+    buf[0] = try std.fmt.allocPrint(alloc, "{s}.ts", .{stem});
+    buf[1] = try std.fmt.allocPrint(alloc, "{s}.d.ts", .{stem});
+    buf[2] = try std.fmt.allocPrint(alloc, "{s}/index.ts", .{stem});
+    buf[3] = try std.fmt.allocPrint(alloc, "{s}/index.d.ts", .{stem});
     n = 4;
     return tryCandidates(io, alloc, dir, buf[0..n]);
 }
@@ -673,7 +674,7 @@ pub fn link(
         var locals: std.ArrayList(u32) = .empty;
         var targets: std.ArrayList(Target) = .empty;
         try l.linkImports(fid, &locals, &targets);
-        sortByKeyU32(locals.items, targets.items);
+        try sortByKeyU32(scratch, locals.items, targets.items);
 
         // Seal the export table sorted by atom.
         const t = &l.tables[i];
@@ -682,7 +683,7 @@ pub fn link(
         const etargets = try arena.alloc(Target, n);
         @memcpy(atoms, t.keys());
         @memcpy(etargets, t.values());
-        sortByKeyU32(atoms, etargets);
+        try sortByKeyU32(scratch, atoms, etargets);
 
         out[i] = .{
             .import_locals = try arena.dupe(u32, locals.items),
@@ -695,16 +696,25 @@ pub fn link(
     return out;
 }
 
-/// Sort parallel (key, value) arrays by key ascending (insertion sort —
-/// tables are small and nearly sorted).
-fn sortByKeyU32(keys: []u32, vals: []Target) void {
-    var i: usize = 1;
-    while (i < keys.len) : (i += 1) {
-        var j = i;
-        while (j > 0 and keys[j - 1] > keys[j]) : (j -= 1) {
-            std.mem.swap(u32, &keys[j - 1], &keys[j]);
-            std.mem.swap(Target, &vals[j - 1], &vals[j]);
+/// Sort parallel (key, value) arrays by key ascending. Export/import tables
+/// come out of an `AutoArrayHashMap` in insertion order (not nearly sorted),
+/// so use an O(n log n) sort over an index permutation (`scratch` holds the
+/// permutation and the copied-out originals; both are freed with the arena).
+fn sortByKeyU32(scratch: Allocator, keys: []u32, vals: []Target) Error!void {
+    const n = keys.len;
+    if (n < 2) return;
+    const idx = try scratch.alloc(u32, n);
+    for (idx, 0..) |*x, k| x.* = @intCast(k);
+    std.mem.sort(u32, idx, keys, struct {
+        fn lt(ks: []const u32, a: u32, b: u32) bool {
+            return ks[a] < ks[b];
         }
+    }.lt);
+    const keys_copy = try scratch.dupe(u32, keys);
+    const vals_copy = try scratch.dupe(Target, vals);
+    for (idx, 0..) |old, k| {
+        keys[k] = keys_copy[old];
+        vals[k] = vals_copy[old];
     }
 }
 
@@ -899,7 +909,11 @@ test "packageTypesField: minimal scan" {
 
 test "resolveSpecifier: relative, index, js rewrite, node_modules" {
     const io = testing.io;
-    const alloc = testing.allocator;
+    // Candidate paths are transient and owned by the passed allocator; a
+    // scratch arena mirrors how the real driver calls resolution.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const d = tmp.dir;
@@ -931,7 +945,6 @@ test "resolveSpecifier: relative, index, js rewrite, node_modules" {
     };
     for (cases) |c| {
         const got = try resolveSpecifier(io, alloc, d, "src/a.ts", c.spec);
-        defer if (got) |g| alloc.free(g);
         if (c.want) |w| {
             try testing.expect(got != null);
             try testing.expectEqualStrings(w, got.?);
@@ -939,4 +952,38 @@ test "resolveSpecifier: relative, index, js rewrite, node_modules" {
             try testing.expectEqual(@as(?[]u8, null), got);
         }
     }
+}
+
+// Regression: resolution used to build candidate paths in a fixed 256-byte
+// buffer and silently return null (a wrong "module not found") for any
+// deeper path — exactly the shape of `node_modules/@types/...` in a big
+// project. The stem here is well over 256 bytes.
+test "resolveSpecifier: path longer than the old 256-byte cap" {
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const d = tmp.dir;
+
+    // 8 segments of 40 chars each -> ~320-byte directory chain, past 256.
+    const seg = "a234567890123456789012345678901234567890"; // 40 chars
+    var deep: std.ArrayList(u8) = .empty;
+    defer deep.deinit(alloc);
+    for (0..8) |k| {
+        if (k != 0) try deep.append(alloc, '/');
+        try deep.appendSlice(alloc, seg);
+    }
+    const deep_dir = deep.items;
+    try testing.expect(deep_dir.len > 256);
+
+    try d.createDirPath(io, deep_dir);
+    const modpath = try std.fmt.allocPrint(alloc, "{s}/mod.ts", .{deep_dir});
+    try d.writeFile(io, .{ .sub_path = modpath, .data = "" });
+
+    const spec = try std.fmt.allocPrint(alloc, "./{s}/mod", .{deep_dir});
+    const got = try resolveSpecifier(io, alloc, d, "a.ts", spec);
+    try testing.expect(got != null);
+    try testing.expectEqualStrings(modpath, got.?);
 }

@@ -1297,6 +1297,8 @@ const Checker = struct {
     fn objectTypeFromMembers(c: *Checker, member_nodes: []const Node, fresh: bool) Error!TypeId {
         var props: std.ArrayList(types.Prop) = .empty;
         defer props.deinit(c.scratch());
+        var prop_index: std.AutoHashMapUnmanaged(Atom, u32) = .empty;
+        defer prop_index.deinit(c.scratch());
         var sindex: TypeId = 0;
         var nindex: TypeId = 0;
         // Method overload grouping: name -> sig list.
@@ -1319,7 +1321,7 @@ const Checker = struct {
                     if (md.rhs & ast.Flags.optional != 0) flags |= types.prop_flag_optional;
                     if (md.rhs & ast.Flags.readonly != 0) flags |= types.prop_flag_readonly;
                     const ty = if (md.lhs != 0) try c.typeFromTypeNode(md.lhs) else types.any_type;
-                    try upsertProp(c.scratch(), &props, .{ .name = name, .ty = ty, .flags = flags });
+                    try upsertProp(c.scratch(), &props, &prop_index, .{ .name = name, .ty = ty, .flags = flags });
                 },
                 .method_signature => {
                     const name = try c.memberAtom(c.tree.nodeMainToken(m));
@@ -1343,18 +1345,26 @@ const Checker = struct {
         for (order.items) |name| {
             const sigs = methods.get(name).?;
             const ty = try c.ts.makeOverloads(sigs.items);
-            try upsertProp(c.scratch(), &props, .{ .name = name, .ty = ty, .flags = 0 });
+            try upsertProp(c.scratch(), &props, &prop_index, .{ .name = name, .ty = ty, .flags = 0 });
         }
         return c.ts.makeObject(props.items, sindex, nindex, fresh);
     }
 
-    fn upsertProp(alloc: Allocator, props: *std.ArrayList(types.Prop), p: types.Prop) Error!void {
-        for (props.items) |*existing| {
-            if (existing.name == p.name) {
-                existing.* = p;
-                return;
-            }
+    /// Append `p`, replacing any existing prop with the same name. `index`
+    /// maps name atom -> slot in `props` so accumulation is O(1) amortized
+    /// instead of a linear rescan per insert (O(P^2) for large interfaces).
+    fn upsertProp(
+        alloc: Allocator,
+        props: *std.ArrayList(types.Prop),
+        index: *std.AutoHashMapUnmanaged(Atom, u32),
+        p: types.Prop,
+    ) Error!void {
+        const gop = try index.getOrPut(alloc, p.name);
+        if (gop.found_existing) {
+            props.items[gop.value_ptr.*] = p;
+            return;
         }
+        gop.value_ptr.* = @intCast(props.items.len);
         try props.append(alloc, p);
     }
 
@@ -3439,6 +3449,8 @@ const Checker = struct {
         const rctx = if (ctx != types.no_type) try c.resolveStructural(ctx) else types.no_type;
         var props: std.ArrayList(types.Prop) = .empty;
         defer props.deinit(c.scratch());
+        var prop_index: std.AutoHashMapUnmanaged(Atom, u32) = .empty;
+        defer prop_index.deinit(c.scratch());
 
         for (c.tree.nodeRange(node)) |prop| {
             if (prop == null_node) continue;
@@ -3454,7 +3466,7 @@ const Checker = struct {
                     const pctx = try c.ctxPropType(rctx, ctx, key);
                     var vt = try c.checkExprCached(pd.rhs, pctx);
                     if (!try c.keepLiteral(vt, pctx)) vt = try c.widenLiteral(vt);
-                    try upsertProp(c.scratch(), &props, .{ .name = key, .ty = vt });
+                    try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = vt });
                 },
                 .object_shorthand => {
                     const key = try c.memberAtom(c.tree.nodeMainToken(prop));
@@ -3462,7 +3474,7 @@ const Checker = struct {
                     const pctx = try c.ctxPropType(rctx, ctx, key);
                     if (!try c.keepLiteral(vt, pctx)) vt = try c.widenLiteral(vt);
                     if (pd.rhs != 0) _ = try c.checkExprCached(pd.rhs, types.no_type);
-                    try upsertProp(c.scratch(), &props, .{ .name = key, .ty = vt });
+                    try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = vt });
                 },
                 .object_method => {
                     if (pd.lhs != 0 and c.nodeTag(pd.lhs) == .computed_name) {
@@ -3472,14 +3484,14 @@ const Checker = struct {
                     const key = try c.memberAtom(c.tree.nodeMainToken(prop));
                     const pctx = try c.ctxPropType(rctx, ctx, key);
                     const mt = try c.checkExprCached(pd.rhs, pctx);
-                    try upsertProp(c.scratch(), &props, .{ .name = key, .ty = mt });
+                    try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = mt });
                 },
                 .spread_element => {
                     const st = try c.resolveStructural(try c.checkExprCached(pd.lhs, types.no_type));
                     if (c.ts.kind(st) == .object) {
                         for (0..c.ts.objectPropCount(st)) |i| {
                             const p = c.ts.objectProp(st, @intCast(i));
-                            try upsertProp(c.scratch(), &props, .{ .name = p.name, .ty = p.ty, .flags = p.flags & types.prop_flag_optional });
+                            try upsertProp(c.scratch(), &props, &prop_index, .{ .name = p.name, .ty = p.ty, .flags = p.flags & types.prop_flag_optional });
                         }
                     }
                 },
