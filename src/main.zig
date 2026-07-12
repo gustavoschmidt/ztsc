@@ -1,9 +1,11 @@
 //! ZTSC CLI driver: argument parsing, thread pool, phase orchestration.
 //!
-//! M1 scope: load the given files in parallel (mmap + line tables), then
-//! scan them in parallel into SoA token streams. `--timing` reports per-phase
-//! wall clock (load, scan) and `--memory` reports arena/token statistics.
-//! Parsing and later phases arrive in M2+.
+//! M2 scope: load files in parallel (mmap + line tables), scan them in
+//! parallel (M1 benchmark path), then parse them in parallel into sealed
+//! data-oriented ASTs. `--timing` reports per-phase wall clock (load, scan,
+//! parse), `--memory` reports arena/token/AST statistics (bytes/node!), and
+//! `--dump-ast` prints S-expression parse trees. Binding and checking arrive
+//! in M3+.
 
 const std = @import("std");
 const Io = std.Io;
@@ -11,6 +13,8 @@ const ztsc = @import("ztsc");
 const Source = ztsc.source.Source;
 const Interner = ztsc.intern.Interner;
 const scanner = ztsc.scanner;
+const parser = ztsc.parser;
+const Ast = ztsc.ast.Ast;
 
 const usage =
     \\usage: ztsc [options] <files...>
@@ -18,8 +22,9 @@ const usage =
     \\options:
     \\  --timing      print per-phase wall-clock timings
     \\  --memory      print arena / memory statistics
+    \\  --dump-ast    print S-expression parse trees (golden-test format)
     \\  --workers=N   number of worker threads (default: CPU count)
-    \\  --repeat=N    scan each file N times (benchmark aid, default 1)
+    \\  --repeat=N    scan/parse each file N times (benchmark aid, default 1)
     \\  --version     print version and exit
     \\
 ;
@@ -43,6 +48,7 @@ const Timer = struct {
 const Cli = struct {
     timing: bool = false,
     memory: bool = false,
+    dump_ast: bool = false,
     version: bool = false,
     workers: ?usize = null,
     repeat: usize = 1,
@@ -106,6 +112,33 @@ const Worker = struct {
                 _ = w.scratch.reset(.retain_capacity);
             }
             tokens[i] = scanner.tokenize(w.arena.allocator(), src.bytes) catch |err| {
+                errs[i] = err;
+                continue;
+            };
+        }
+    }
+
+    /// Parse phase: recursive descent into sealed per-file ASTs held in the
+    /// worker's arena. `repeat > 1` re-parses into scratch (benchmarks).
+    fn parseRun(
+        w: *Worker,
+        sources: []const ?Source,
+        repeat: usize,
+        next: *std.atomic.Value(usize),
+        trees: []?Ast,
+        errs: []?anyerror,
+    ) void {
+        while (true) {
+            const i = next.fetchAdd(1, .monotonic);
+            if (i >= sources.len) break;
+            const src = sources[i] orelse continue;
+            var r: usize = 1;
+            while (r < repeat) : (r += 1) {
+                var tree = parser.parse(w.scratch.allocator(), src.bytes) catch break;
+                std.mem.doNotOptimizeAway(&tree);
+                _ = w.scratch.reset(.retain_capacity);
+            }
+            trees[i] = parser.parse(w.arena.allocator(), src.bytes) catch |err| {
                 errs[i] = err;
                 continue;
             };
@@ -183,6 +216,21 @@ pub fn main(init: std.process.Init) !void {
 
     const scan_ns = scan_timer.readNs();
 
+    // --- Phase: parse (parallel) ---------------------------------------------
+    const parse_timer = Timer.start(io);
+
+    const trees = try arena.alloc(?Ast, cli.paths.len);
+    @memset(trees, null);
+    next.store(0, .monotonic);
+    for (workers) |*w| {
+        w.thread = try std.Thread.spawn(.{}, Worker.parseRun, .{
+            w, results, cli.repeat, &next, trees, errs,
+        });
+    }
+    for (workers) |*w| w.thread.join();
+
+    const parse_ns = parse_timer.readNs();
+
     // --- Aggregate statistics ----------------------------------------------
     var files_ok: usize = 0;
     var total_bytes: usize = 0;
@@ -204,6 +252,20 @@ pub fn main(init: std.process.Init) !void {
         token_bytes += toks.byteSize();
     }
 
+    var total_nodes: usize = 0;
+    var node_bytes: usize = 0;
+    var extra_bytes: usize = 0;
+    var ast_token_bytes: usize = 0;
+    var parse_diags: usize = 0;
+    for (trees) |maybe_tree| {
+        const tree = maybe_tree orelse continue;
+        total_nodes += tree.nodes.len;
+        node_bytes += tree.nodeBytes();
+        extra_bytes += tree.extraBytes();
+        ast_token_bytes += tree.tokens.byteSize();
+        parse_diags += tree.diagnostics.len;
+    }
+
     var failed: usize = 0;
     for (errs, cli.paths) |maybe_err, path| {
         if (maybe_err) |err| {
@@ -214,8 +276,32 @@ pub fn main(init: std.process.Init) !void {
 
     const total_ns = total_timer.readNs();
 
-    try out.print("ztsc: loaded {d} file(s), {d} lines, {d} bytes, {d} tokens ({d} worker(s))\n", .{
-        files_ok, total_lines, total_bytes, total_tokens, n_workers,
+    // --- Parse diagnostics ---------------------------------------------------
+    for (trees, results, cli.paths) |maybe_tree, maybe_src, path| {
+        const tree = maybe_tree orelse continue;
+        const src = maybe_src orelse continue;
+        for (tree.diagnostics) |d| {
+            const lc = src.lineCol(@min(d.span.start, @as(u32, @intCast(src.bytes.len))));
+            try out.print("{s}:{d}:{d}: error: {s}\n", .{ path, lc.line + 1, lc.col + 1, d.message() });
+        }
+    }
+
+    // --- AST dump (--dump-ast) -------------------------------------------------
+    if (cli.dump_ast) {
+        for (trees, results, cli.paths) |maybe_tree, maybe_src, path| {
+            const tree = maybe_tree orelse continue;
+            const src = maybe_src orelse continue;
+            try out.print(";; {s}\n", .{path});
+            var it = tree.childIterator(0);
+            while (it.next()) |child| {
+                try tree.dump(src.bytes, out, child);
+                try out.writeAll("\n");
+            }
+        }
+    }
+
+    try out.print("ztsc: loaded {d} file(s), {d} lines, {d} bytes, {d} tokens, {d} nodes, {d} parse error(s) ({d} worker(s))\n", .{
+        files_ok, total_lines, total_bytes, total_tokens, total_nodes, parse_diags, n_workers,
     });
 
     if (cli.timing) {
@@ -234,10 +320,15 @@ pub fn main(init: std.process.Init) !void {
             0;
         const scan_lines_per_s: f64 = if (scan_s > 0) scanned_lines / scan_s else 0;
         const scan_mb_per_s: f64 = if (scan_s > 0) scanned_bytes / (1024.0 * 1024.0) / scan_s else 0;
+        const parse_ms = nsToMs(parse_ns);
+        const parse_s = @as(f64, @floatFromInt(parse_ns)) / std.time.ns_per_s;
+        const parse_lines_per_s: f64 = if (parse_s > 0) scanned_lines / parse_s else 0;
+        const parse_mb_per_s: f64 = if (parse_s > 0) scanned_bytes / (1024.0 * 1024.0) / parse_s else 0;
         try out.print("\n--timing\n", .{});
         try out.print("  {s:<10} {s:>10} {s:>14} {s:>10}\n", .{ "phase", "ms", "lines/s", "MB/s" });
         try out.print("  {s:<10} {d:>10.3} {d:>14.0} {d:>10.1}\n", .{ "load", load_ms, load_lines_per_s, load_mb_per_s });
         try out.print("  {s:<10} {d:>10.3} {d:>14.0} {d:>10.1}\n", .{ "scan", scan_ms, scan_lines_per_s, scan_mb_per_s });
+        try out.print("  {s:<10} {d:>10.3} {d:>14.0} {d:>10.1}\n", .{ "parse", parse_ms, parse_lines_per_s, parse_mb_per_s });
         try out.print("  {s:<10} {d:>10.3}\n", .{ "total", total_ms });
     }
 
@@ -263,6 +354,22 @@ pub fn main(init: std.process.Init) !void {
             0;
         try out.print("  {s:<24} {d:>12.2}\n", .{ "bytes/token", bytes_per_token });
 
+        // AST statistics (PLAN M2: bytes/node is the key memory metric).
+        try out.print("  {s:<24} {d:>12}\n", .{ "ast nodes", total_nodes });
+        try out.print("  {s:<24} {d:>12}\n", .{ "ast node SoA bytes", node_bytes });
+        try out.print("  {s:<24} {d:>12}\n", .{ "ast extra_data bytes", extra_bytes });
+        try out.print("  {s:<24} {d:>12}\n", .{ "ast token bytes", ast_token_bytes });
+        const bytes_per_node: f64 = if (total_nodes > 0)
+            @as(f64, @floatFromInt(node_bytes + extra_bytes)) / @as(f64, @floatFromInt(total_nodes))
+        else
+            0;
+        const nodes_per_line: f64 = if (total_lines > 0)
+            @as(f64, @floatFromInt(total_nodes)) / @as(f64, @floatFromInt(total_lines))
+        else
+            0;
+        try out.print("  {s:<24} {d:>12.2}\n", .{ "bytes/node (SoA+extra)", bytes_per_node });
+        try out.print("  {s:<24} {d:>12.2}\n", .{ "nodes/line", nodes_per_line });
+
         const heap_total = worker_arena_bytes + istats.total();
         const bytes_per_line: f64 = if (total_lines > 0)
             @as(f64, @floatFromInt(heap_total)) / @as(f64, @floatFromInt(total_lines))
@@ -273,7 +380,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     try out.flush();
-    if (failed > 0) std.process.exit(1);
+    if (failed > 0 or parse_diags > 0) std.process.exit(1);
 }
 
 fn nsToMs(ns: u64) f64 {
@@ -288,6 +395,8 @@ fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8) !Cli {
             cli.timing = true;
         } else if (std.mem.eql(u8, arg, "--memory")) {
             cli.memory = true;
+        } else if (std.mem.eql(u8, arg, "--dump-ast")) {
+            cli.dump_ast = true;
         } else if (std.mem.eql(u8, arg, "--version")) {
             cli.version = true;
         } else if (std.mem.startsWith(u8, arg, "--workers=")) {
