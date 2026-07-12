@@ -11,6 +11,7 @@ pub const ast = @import("ast.zig");
 pub const parser = @import("parser.zig");
 pub const binder = @import("binder.zig");
 pub const types = @import("types.zig");
+pub const modules = @import("modules.zig");
 pub const checker = @import("checker.zig");
 
 pub const version = "0.0.1";
@@ -24,5 +25,6 @@ test {
     _ = parser;
     _ = binder;
     _ = types;
+    _ = modules;
     _ = checker;
 }
