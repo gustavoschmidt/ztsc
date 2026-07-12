@@ -60,7 +60,28 @@ compact sorted (node, flow) map. `resolve(atom, scope)` walks the parent
 chain; unresolved names are surfaced (not errors until M5). The binder is
 total on arbitrary parser output (stress + fuzz tested). Bind runs ~12.7M
 lines/s single-thread at **~29.5 binder bytes/line** on the medium corpus,
-scaling ~4.2x at 8 workers. Checking is M4.
+scaling ~4.2x at 8 workers.
+
+M4 (checker core): hash-consed types (`TypeId` = u32; structurally
+identical types intern to one id, so type equality is integer equality
+and the assignability cache keys on id pairs), structural assignability
+with tri-state relation caching (recursive types terminate), full subset
+expression inference with contextual typing, literal freshness/widening
+(tsc semantics: fresh literals widen at mutable positions, annotations
+do not), excess-property checking for fresh object literals, overload
+resolution (first match, like tsc), basic generic inference from
+arguments with constraint fallback, and control-flow narrowing over the
+M3 flow graph (truthiness, typeof, equality/discriminants incl. switch,
+`in`, `instanceof`, assignment narrowing, single-level property paths;
+loop back-edges restart from the declared type). Diagnostics carry tsc
+codes and near-tsc message text (TS2322/2345/2339/2353/2367/2448/2454/
+7006/2769/... plus the 2739/2741/2576/18048-style refinements tsc
+actually emits). The 150-case conformance suite is generated from and
+verified against real `tsc --strict` output (code + line must match).
+Single-threaded check runs ~2.1M lines/s on the medium corpus at ~25.7
+bytes/type, 0.34 types/line, 42% relation-cache hit rate. The checker is
+total on arbitrary input (stress + fuzz tested). Parallel check + module
+graph is M5.
 
 ## Build & run
 

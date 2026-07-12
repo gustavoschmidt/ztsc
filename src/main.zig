@@ -17,6 +17,7 @@ const Interner = ztsc.intern.Interner;
 const scanner = ztsc.scanner;
 const parser = ztsc.parser;
 const binder = ztsc.binder;
+const checker = ztsc.checker;
 const Ast = ztsc.ast.Ast;
 const Bind = binder.Bind;
 
@@ -28,6 +29,7 @@ const usage =
     \\  --memory        print arena / memory statistics
     \\  --dump-ast      print S-expression parse trees (golden-test format)
     \\  --dump-symbols  print binder scope/symbol dumps (golden-test format)
+    \\  --dump-types    print per-declaration checked types (golden-test format)
     \\  --workers=N     number of worker threads (default: CPU count)
     \\  --repeat=N      scan/parse/bind each file N times (benchmark aid)
     \\  --version       print version and exit
@@ -55,6 +57,7 @@ const Cli = struct {
     memory: bool = false,
     dump_ast: bool = false,
     dump_symbols: bool = false,
+    dump_types: bool = false,
     version: bool = false,
     workers: ?usize = null,
     repeat: usize = 1,
@@ -284,6 +287,32 @@ pub fn main(init: std.process.Init) !void {
 
     const bind_ns = bind_timer.readNs();
 
+    // --- Phase: check (single-threaded in M4; M5 partitions) ---------------
+    const check_timer = Timer.start(io);
+
+    const checks = try arena.alloc(?checker.Check, cli.paths.len);
+    @memset(checks, null);
+    var check_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer check_arena.deinit();
+    for (binds, trees, results, 0..) |maybe_bind, maybe_tree, maybe_src, i| {
+        const b = &(maybe_bind orelse continue);
+        const tree = &(maybe_tree orelse continue);
+        const src = maybe_src orelse continue;
+        var r: usize = 1;
+        while (r < cli.repeat) : (r += 1) {
+            var scratch_check = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer scratch_check.deinit();
+            var res = checker.check(scratch_check.allocator(), io, gpa, &interner, tree, b, src.bytes) catch break;
+            std.mem.doNotOptimizeAway(&res);
+        }
+        checks[i] = checker.check(check_arena.allocator(), io, gpa, &interner, tree, b, src.bytes) catch |err| blk: {
+            errs[i] = err;
+            break :blk null;
+        };
+    }
+
+    const check_ns = check_timer.readNs();
+
     // --- Aggregate statistics ----------------------------------------------
     var files_ok: usize = 0;
     var total_bytes: usize = 0;
@@ -339,6 +368,28 @@ pub fn main(init: std.process.Init) !void {
         bind_diags += b.diagnostics.len;
     }
 
+    var check_diags: usize = 0;
+    var check_types: usize = 0;
+    var check_type_bytes: usize = 0;
+    var check_rel_entries: usize = 0;
+    var check_rel_bytes: usize = 0;
+    var check_rel_hits: usize = 0;
+    var check_rel_misses: usize = 0;
+    var check_scratch_hw: usize = 0;
+    var check_flow_queries: usize = 0;
+    for (checks) |maybe_check| {
+        const ck = maybe_check orelse continue;
+        check_diags += ck.diagnostics.len;
+        check_types += ck.stats.types_created;
+        check_type_bytes += ck.stats.type_bytes;
+        check_rel_entries += ck.stats.relation_entries;
+        check_rel_bytes += ck.stats.relation_bytes;
+        check_rel_hits += ck.stats.relation_hits;
+        check_rel_misses += ck.stats.relation_misses;
+        if (ck.stats.scratch_high_water > check_scratch_hw) check_scratch_hw = ck.stats.scratch_high_water;
+        check_flow_queries += ck.stats.flow_queries;
+    }
+
     var failed: usize = 0;
     for (errs, cli.paths) |maybe_err, path| {
         if (maybe_err) |err| {
@@ -372,7 +423,16 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    // --- AST dump (--dump-ast) -------------------------------------------------
+    for (checks, results, cli.paths) |maybe_check, maybe_src, path| {
+        const ck = maybe_check orelse continue;
+        const src = maybe_src orelse continue;
+        for (ck.diagnostics) |d| {
+            const lc = src.lineCol(@min(d.span.start, @as(u32, @intCast(src.bytes.len))));
+            try out.print("{s}:{d}:{d}: error TS{d}: {s}\n", .{ path, lc.line + 1, lc.col + 1, d.code, d.msg });
+        }
+    }
+
+    // --- AST dump (--dump-ast) ---------------------------------------------
     if (cli.dump_ast) {
         for (trees, results, cli.paths) |maybe_tree, maybe_src, path| {
             const tree = maybe_tree orelse continue;
@@ -397,8 +457,20 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    try out.print("ztsc: loaded {d} file(s), {d} lines, {d} bytes, {d} tokens, {d} nodes, {d} symbols, {d} parse error(s), {d} bind error(s) ({d} worker(s))\n", .{
-        files_ok, total_lines, total_bytes, total_tokens, total_nodes, total_symbols, parse_diags, bind_diags, n_workers,
+    if (cli.dump_types) {
+        for (binds, trees, results, cli.paths) |maybe_bind, maybe_tree, maybe_src, path| {
+            const b = &(maybe_bind orelse continue);
+            const tree = &(maybe_tree orelse continue);
+            const src = maybe_src orelse continue;
+            try out.print(";; {s}\n", .{path});
+            var dump_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer dump_arena.deinit();
+            _ = checker.checkAndDump(dump_arena.allocator(), io, gpa, &interner, tree, b, src.bytes, out) catch {};
+        }
+    }
+
+    try out.print("ztsc: loaded {d} file(s), {d} lines, {d} bytes, {d} tokens, {d} nodes, {d} symbols, {d} parse error(s), {d} bind error(s), {d} check error(s) ({d} worker(s))\n", .{
+        files_ok, total_lines, total_bytes, total_tokens, total_nodes, total_symbols, parse_diags, bind_diags, check_diags, n_workers,
     });
 
     if (cli.timing) {
@@ -431,6 +503,11 @@ pub fn main(init: std.process.Init) !void {
         try out.print("  {s:<10} {d:>10.3} {d:>14.0} {d:>10.1}\n", .{ "scan", scan_ms, scan_lines_per_s, scan_mb_per_s });
         try out.print("  {s:<10} {d:>10.3} {d:>14.0} {d:>10.1}\n", .{ "parse", parse_ms, parse_lines_per_s, parse_mb_per_s });
         try out.print("  {s:<10} {d:>10.3} {d:>14.0} {d:>10.1}\n", .{ "bind", bind_ms, bind_lines_per_s, bind_mb_per_s });
+        const check_ms = nsToMs(check_ns);
+        const check_s = @as(f64, @floatFromInt(check_ns)) / std.time.ns_per_s;
+        const check_lines_per_s: f64 = if (check_s > 0) scanned_lines / check_s else 0;
+        const check_mb_per_s: f64 = if (check_s > 0) scanned_bytes / (1024.0 * 1024.0) / check_s else 0;
+        try out.print("  {s:<10} {d:>10.3} {d:>14.0} {d:>10.1}\n", .{ "check", check_ms, check_lines_per_s, check_mb_per_s });
         try out.print("  {s:<10} {d:>10.3}\n", .{ "total", total_ms });
     }
 
@@ -488,6 +565,30 @@ pub fn main(init: std.process.Init) !void {
             0;
         try out.print("  {s:<24} {d:>12.2}\n", .{ "bind bytes/line", bind_bytes_per_line });
 
+        // Checker statistics (PLAN M4: bytes/type is the key memory metric).
+        try out.print("  {s:<24} {d:>12}\n", .{ "check types", check_types });
+        try out.print("  {s:<24} {d:>12}\n", .{ "check type-arena bytes", check_type_bytes });
+        const bytes_per_type: f64 = if (check_types > 0)
+            @as(f64, @floatFromInt(check_type_bytes)) / @as(f64, @floatFromInt(check_types))
+        else
+            0;
+        try out.print("  {s:<24} {d:>12.2}\n", .{ "bytes/type", bytes_per_type });
+        const types_per_line: f64 = if (total_lines > 0)
+            @as(f64, @floatFromInt(check_types)) / @as(f64, @floatFromInt(total_lines))
+        else
+            0;
+        try out.print("  {s:<24} {d:>12.2}\n", .{ "types/line", types_per_line });
+        try out.print("  {s:<24} {d:>12}\n", .{ "relation cache entries", check_rel_entries });
+        try out.print("  {s:<24} {d:>12}\n", .{ "relation cache bytes", check_rel_bytes });
+        const rel_total = check_rel_hits + check_rel_misses;
+        const rel_hit_rate: f64 = if (rel_total > 0)
+            100.0 * @as(f64, @floatFromInt(check_rel_hits)) / @as(f64, @floatFromInt(rel_total))
+        else
+            0;
+        try out.print("  {s:<24} {d:>11.1}%\n", .{ "relation hit rate", rel_hit_rate });
+        try out.print("  {s:<24} {d:>12}\n", .{ "check scratch high-water", check_scratch_hw });
+        try out.print("  {s:<24} {d:>12}\n", .{ "check flow queries", check_flow_queries });
+
         const heap_total = worker_arena_bytes + istats.total();
         const bytes_per_line: f64 = if (total_lines > 0)
             @as(f64, @floatFromInt(heap_total)) / @as(f64, @floatFromInt(total_lines))
@@ -498,7 +599,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     try out.flush();
-    if (failed > 0 or parse_diags > 0 or bind_diags > 0) std.process.exit(1);
+    if (failed > 0 or parse_diags > 0 or bind_diags > 0 or check_diags > 0) std.process.exit(1);
 }
 
 fn nsToMs(ns: u64) f64 {
@@ -517,6 +618,8 @@ fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8) !Cli {
             cli.dump_ast = true;
         } else if (std.mem.eql(u8, arg, "--dump-symbols")) {
             cli.dump_symbols = true;
+        } else if (std.mem.eql(u8, arg, "--dump-types")) {
+            cli.dump_types = true;
         } else if (std.mem.eql(u8, arg, "--version")) {
             cli.version = true;
         } else if (std.mem.startsWith(u8, arg, "--workers=")) {
