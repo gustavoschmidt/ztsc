@@ -12,10 +12,11 @@
 const fs = require("fs");
 const path = require("path");
 
-// One generated module is ~76 lines.
+// One generated module is ~110 lines (lib-free: the ztsc checker has no
+// lib.d.ts, so the corpus avoids globals and primitive/array methods).
 const SIZES = {
-  small: { files: 10, modulesPerFile: 7 }, // ~5k LOC
-  medium: { files: 50, modulesPerFile: 13 }, // ~50k LOC
+  small: { files: 10, modulesPerFile: 5 }, // ~5k LOC
+  medium: { files: 50, modulesPerFile: 9 }, // ~50k LOC
 };
 
 // Deterministic PRNG (LCG) so corpora are reproducible.
@@ -29,7 +30,7 @@ function makeRng(seed) {
 
 function genModule(fileIdx, modIdx, rng) {
   const id = `F${fileIdx}M${modIdx}`;
-  const kinds = ['"circle"', '"square"', '"triangle"'];
+  const kinds = ['"circle"', '"square"'];
   const kind = kinds[Math.floor(rng() * kinds.length)];
   const n = Math.floor(rng() * 100);
   return `// module ${id}
@@ -57,15 +58,15 @@ export type Result${id} = { ok: true; value: number } | { ok: false; error: stri
 
 export function area${id}(shape: Shape${id}): number {
   if (shape.kind === "circle") {
-    return Math.PI * shape.radius * shape.radius;
+    return 3.14159 * shape.radius * shape.radius;
   }
   return shape.side * shape.side;
 }
 
 export function describe${id}(shape: Shape${id}, verbose?: boolean): string {
   const a = area${id}(shape);
-  if (verbose) {
-    return shape.kind + " with area " + a.toFixed(2);
+  if (verbose && a > ${n}) {
+    return shape.kind + "!";
   }
   return shape.kind;
 }
@@ -77,20 +78,29 @@ export function tryDivide${id}(a: number, b: number): Result${id} {
   return { ok: true, value: a / b };
 }
 
+export function unwrap${id}(r: Result${id}, fallback: number): number {
+  if (r.ok) {
+    return r.value;
+  }
+  return r.error.length === 0 ? fallback : 0 - fallback;
+}
+
 export class Registry${id}<T> {
-  private items: T[] = [];
+  items: T[] = [];
+  size: number = 0;
 
   add(item: T): number {
-    this.items.push(item);
-    return this.items.length;
+    this.items[this.size] = item;
+    this.size = this.size + 1;
+    return this.size;
   }
 
   get(index: number): T | undefined {
-    return this.items[index];
+    return index < this.size ? this.items[index] : undefined;
   }
 
   count(): number {
-    return this.items.length;
+    return this.size;
   }
 }
 
@@ -99,16 +109,41 @@ export function process${id}(input: string | number | null): string {
     return "null";
   }
   if (typeof input === "number") {
-    return input.toFixed(${n % 5});
+    return "n:" + input;
   }
-  return input.trim();
+  return input;
+}
+
+export function firstLabel${id}(points: Point${id}[]): string {
+  for (const p of points) {
+    if (p.label) {
+      return p.label;
+    }
+  }
+  return "none";
+}
+
+export function fmt${id}(x: string): string;
+export function fmt${id}(x: number): string;
+export function fmt${id}(x: string | number): string {
+  if (typeof x === "string") {
+    return x;
+  }
+  return "#" + x;
+}
+
+export function ident${id}<T>(x: T): T {
+  return x;
 }
 
 const registry${id} = new Registry${id}<Shape${id}>();
-registry${id}.add({ kind: ${kind === '"triangle"' ? '"circle"' : kind}, ${
-    kind === '"square"' ? 'origin: { x: 0, y: 0 }, side: 2' : "center: { x: 0, y: 0 }, radius: 1"
-  } } as Shape${id});
+registry${id}.add({ kind: ${kind}, ${
+    kind === '"square"' ? "origin: { x: 0, y: 0 }, side: 2" : "center: { x: 0, y: 0 }, radius: 1"
+  } });
 export const count${id}: number = registry${id}.count();
+export const desc${id}: string = describe${id}({ kind: "circle", center: { x: 1, y: 1 }, radius: 2 }, true);
+export const num${id}: number = ident${id}(${n});
+export const label${id}: string = fmt${id}(count${id});
 `;
 }
 
