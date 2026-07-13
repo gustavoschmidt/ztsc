@@ -48,6 +48,7 @@ interface String {
     replaceAll(searchValue: string, replaceValue: string): string;
     concat(...strings: string[]): string;
     split(separator: string): string[];
+    [Symbol.iterator](): IterableIterator<string>;
 }
 
 interface ReadonlyArray<T> {
@@ -66,6 +67,7 @@ interface ReadonlyArray<T> {
     findIndex(predicate: (value: T, index: number) => boolean): number;
     some(predicate: (value: T, index: number) => boolean): boolean;
     every(predicate: (value: T, index: number) => boolean): boolean;
+    [Symbol.iterator](): IterableIterator<T>;
 }
 
 interface Array<T> {
@@ -91,6 +93,7 @@ interface Array<T> {
     every(predicate: (value: T, index: number) => boolean): boolean;
     sort(compareFn?: (a: T, b: T) => number): T[];
     fill(value: T): T[];
+    [Symbol.iterator](): IterableIterator<T>;
 }
 
 interface Error {
@@ -112,18 +115,27 @@ interface IteratorResult<T> {
     value: T;
 }
 
+// `Iterator<T>` is NOT iterable (no `[Symbol.iterator]`), matching tsc: a bare
+// iterator cannot drive `for...of`. `Iterable`/`IterableIterator`/`Generator`
+// add the `[Symbol.iterator]()` protocol method the iteration walk looks for.
 interface Iterator<T> {
     next(): IteratorResult<T>;
 }
 
+interface Iterable<T> {
+    [Symbol.iterator](): Iterator<T>;
+}
+
 interface IterableIterator<T> {
     next(): IteratorResult<T>;
+    [Symbol.iterator](): IterableIterator<T>;
 }
 
 interface Generator<T> {
     next(): IteratorResult<T>;
     return(value: T): IteratorResult<T>;
     throw(e: any): IteratorResult<T>;
+    [Symbol.iterator](): Generator<T>;
 }
 
 // Map/Set/Date carry constructors, so they are declared as classes: `new` on a
@@ -140,6 +152,10 @@ declare class Map<K, V> {
     delete(key: K): boolean;
     clear(): void;
     forEach(callbackfn: (value: V, key: K) => void): void;
+    keys(): IterableIterator<K>;
+    values(): IterableIterator<V>;
+    entries(): IterableIterator<[K, V]>;
+    [Symbol.iterator](): IterableIterator<[K, V]>;
 }
 
 declare class Set<T> {
@@ -150,6 +166,10 @@ declare class Set<T> {
     delete(value: T): boolean;
     clear(): void;
     forEach(callbackfn: (value: T) => void): void;
+    keys(): IterableIterator<T>;
+    values(): IterableIterator<T>;
+    entries(): IterableIterator<[T, T]>;
+    [Symbol.iterator](): IterableIterator<T>;
 }
 
 declare class Date {

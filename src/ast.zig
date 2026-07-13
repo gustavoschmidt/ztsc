@@ -68,7 +68,24 @@ pub const Flags = struct {
     pub const rest: u32 = 1 << 15; // `...` param
     pub const accessor: u32 = 1 << 16;
     pub const const_enum: u32 = 1 << 17; // `const enum`
+    pub const computed: u32 = 1 << 18; // `[Symbol.iterator]` well-known-symbol key
 };
+
+/// Maps a well-known `Symbol` property name (the `iterator` in
+/// `[Symbol.iterator]`) to the synthetic member key the binder and checker
+/// share for it. The `__@` prefix cannot appear in a real identifier, so a
+/// synthetic key never collides with an ordinary member. Returns null for
+/// names ztsc does not model (those stay out of subset).
+pub fn wellKnownSymbolKey(name: []const u8) ?[]const u8 {
+    const pairs = [_]struct { n: []const u8, k: []const u8 }{
+        .{ .n = "iterator", .k = "__@iterator" },
+        .{ .n = "asyncIterator", .k = "__@asyncIterator" },
+    };
+    for (pairs) |p| {
+        if (std.mem.eql(u8, name, p.n)) return p.k;
+    }
+    return null;
+}
 
 pub const NodeItem = struct {
     tag: Tag,
