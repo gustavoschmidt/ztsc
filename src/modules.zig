@@ -866,16 +866,17 @@ pub fn buildProgram(
         const path = pending.items[next];
         const bytes: []const u8 = if (std.mem.eql(u8, path, lib_path))
             lib_source
-        else dir.readFileAlloc(io, path, arena, .limited(1 << 30)) catch |err| {
-            try failures.append(scratch, .{ .path = path, .err = err });
-            // Keep ids dense: substitute an empty file.
-            const tree = try arena.create(Ast);
-            tree.* = try parser.parse(arena, "");
-            const bound = try arena.create(Bind);
-            bound.* = try binder.bind(arena, io, gpa, interner, tree, "");
-            try files.append(arena, .{ .path = path, .src = "", .tree = tree, .bind = bound });
-            continue;
-        };
+        else
+            dir.readFileAlloc(io, path, arena, .limited(1 << 30)) catch |err| {
+                try failures.append(scratch, .{ .path = path, .err = err });
+                // Keep ids dense: substitute an empty file.
+                const tree = try arena.create(Ast);
+                tree.* = try parser.parse(arena, "");
+                const bound = try arena.create(Bind);
+                bound.* = try binder.bind(arena, io, gpa, interner, tree, "");
+                try files.append(arena, .{ .path = path, .src = "", .tree = tree, .bind = bound });
+                continue;
+            };
         const tree = try arena.create(Ast);
         tree.* = try parser.parseOpts(arena, bytes, parser.isJsxPath(path));
         const bound = try arena.create(Bind);

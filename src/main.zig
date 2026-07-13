@@ -279,10 +279,11 @@ const Worker = struct {
                 c.err = err;
                 return;
             }
-        else Source.load(io, alloc, path) catch |err| {
-            c.err = err;
-            return;
-        };
+        else
+            Source.load(io, alloc, path) catch |err| {
+                c.err = err;
+                return;
+            };
         c.src = src;
         w.files_loaded += 1;
         // Exercise the shared interner from every worker thread.
