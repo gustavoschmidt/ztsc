@@ -294,6 +294,10 @@ const Checker = struct {
     /// `this` type inside class methods (0 = any).
     this_type: TypeId = 0,
     inst_depth: u32 = 0,
+    /// Set while checking the operand of an `expr as const` const
+    /// assertion: object/array literals produce readonly, non-widened,
+    /// literal-typed members (recursively). Cleared at function bodies.
+    const_ctx: bool = false,
     /// Set when generic inference fell back to a constraint (tsc then
     /// reports only the first failing argument).
     infer_fell_back: bool = false,
@@ -859,6 +863,8 @@ const Checker = struct {
                 try w.writeAll("[]");
             },
             .tuple => {
+                // `as const` tuples are readonly (flag on every element).
+                if (s.tupleLen(t) > 0 and s.tupleElem(t, 0).readonly()) try w.writeAll("readonly ");
                 try w.writeAll("[");
                 for (0..s.tupleLen(t)) |i| {
                     if (i > 0) try w.writeAll(", ");
@@ -3380,6 +3386,24 @@ const Checker = struct {
         return false;
     }
 
+    /// `expr satisfies T`: same relation as `checkAssignable`, but a
+    /// top-level failure is reported as TS1360 ("does not satisfy the
+    /// expected type") rather than TS2322/2741. Nested member mismatches
+    /// and excess properties elaborate exactly like an assignment.
+    fn checkSatisfies(c: *Checker, src_t: TypeId, target: TypeId, expr_node: Node, span: Span) Error!bool {
+        if (try c.isAssignable(src_t, target)) {
+            if (expr_node != 0) try c.excessPropertyCheck(expr_node, src_t, target);
+            return true;
+        }
+        if (expr_node != 0 and try c.elaborateLiteralError(expr_node, src_t, target)) {
+            return false;
+        }
+        try c.diagFmt(1360, span, "Type '{s}' does not satisfy the expected type '{s}'.", .{
+            try c.typeToString(src_t), try c.typeToString(target),
+        });
+        return false;
+    }
+
     /// Element/property-wise TS2322 elaboration for fresh literals (what
     /// tsc reports instead of one top-level error). Returns true when at
     /// least one narrower diagnostic was emitted.
@@ -3670,12 +3694,20 @@ const Checker = struct {
                 const ot = try c.checkExprCached(d.lhs, types.no_type);
                 return c.nonNullable(ot);
             },
-            .as_expr, .satisfies_expr => {
+            .as_expr => {
+                // `expr as const`: a const assertion. Check the operand in
+                // const context (readonly/non-widened literals) and return
+                // that type; there is no target to compare against.
+                if (c.nodeTag(d.rhs) == .const_type) {
+                    const prev = c.const_ctx;
+                    c.const_ctx = true;
+                    defer c.const_ctx = prev;
+                    const et = try c.checkExprCached(d.lhs, types.no_type);
+                    // De-fresh a bare primitive literal so it does not widen.
+                    return c.ts.regularLiteral(et);
+                }
                 const et = try c.checkExprCached(d.lhs, types.no_type);
-                if (c.nodeTag(node) == .satisfies_expr) return et; // parser flags unsupported
                 const tt = try c.typeFromTypeNode(d.rhs);
-                // `x as const` is out of subset; the parser produces an
-                // identifier type "const" -> 2304 was reported; degrade.
                 if (tt == types.error_type) return et;
                 if (!try c.isComparable(try c.widenLiteral(et), tt)) {
                     try c.diagFmt(2352, c.nodeSpan(node), "Conversion of type '{s}' to type '{s}' may be a mistake because neither type sufficiently overlaps with the other. If this was intentional, convert the expression to 'unknown' first.", .{
@@ -3683,6 +3715,15 @@ const Checker = struct {
                     });
                 }
                 return tt;
+            },
+            .satisfies_expr => {
+                // `expr satisfies T`: validate assignability to T but keep
+                // the operand's own (narrow) type as the result.
+                const tt = try c.typeFromTypeNode(d.rhs);
+                const et = try c.checkExprCached(d.lhs, tt);
+                if (tt == types.error_type) return et;
+                _ = try c.checkSatisfies(et, tt, d.lhs, c.nodeSpan(d.lhs));
+                return et;
             },
             .arrow_fn, .function_expr => return c.checkFunctionLikeExpr(node, ctx),
             .class_decl => {
@@ -3818,6 +3859,9 @@ const Checker = struct {
     }
 
     fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
+        // `[...] as const`: a readonly tuple of the (non-widened) element
+        // types. Nested literals recurse because const_ctx stays set.
+        if (c.const_ctx) return c.checkConstArrayLiteral(node);
         const rctx = if (ctx != types.no_type) try c.resolveStructural(ctx) else types.no_type;
         const ctx_tuple = rctx != types.no_type and c.ts.kind(rctx) == .tuple;
         const ctx_elem: TypeId = if (rctx != types.no_type and c.ts.kind(rctx) == .array)
@@ -3876,6 +3920,38 @@ const Checker = struct {
             return c.ts.makeArray(types.any_type); // evolving arrays out of scope
         }
         return c.ts.makeArray(try c.ts.makeUnion(c.scratch(), elem_types.items));
+    }
+
+    /// `[...] as const` -> a readonly tuple. Elements keep their literal
+    /// types (de-freshened so they never widen); nested array/object
+    /// literals recurse via the still-set `const_ctx`.
+    fn checkConstArrayLiteral(c: *Checker, node: Node) Error!TypeId {
+        var elems: std.ArrayList(types.TupleElem) = .empty;
+        defer elems.deinit(c.scratch());
+        for (c.tree.nodeRange(node)) |el| {
+            if (el == null_node) continue;
+            switch (c.nodeTag(el)) {
+                .omitted => try elems.append(c.scratch(), .{ .ty = types.undefined_type, .flags = types.elem_flag_readonly }),
+                .spread_element => {
+                    const st = try c.resolveStructural(try c.checkExprCached(c.tree.nodeData(el).lhs, types.no_type));
+                    switch (c.ts.kind(st)) {
+                        .tuple => {
+                            for (0..c.ts.tupleLen(st)) |j| {
+                                const e = c.ts.tupleElem(st, @intCast(j));
+                                try elems.append(c.scratch(), .{ .ty = e.ty, .flags = e.flags | types.elem_flag_readonly });
+                            }
+                        },
+                        .array => try elems.append(c.scratch(), .{ .ty = c.ts.arrayElem(st), .flags = types.elem_flag_rest | types.elem_flag_readonly }),
+                        else => try elems.append(c.scratch(), .{ .ty = types.any_type, .flags = types.elem_flag_readonly }),
+                    }
+                },
+                else => {
+                    const et = try c.ts.regularLiteral(try c.checkExprCached(el, types.no_type));
+                    try elems.append(c.scratch(), .{ .ty = et, .flags = types.elem_flag_readonly });
+                },
+            }
+        }
+        return c.ts.makeTuple(elems.items);
     }
 
     /// Does the contextual type admit literal types of `t`'s kind, so the
@@ -3938,14 +4014,18 @@ const Checker = struct {
                     const key = try c.memberAtom(c.tree.nodeMainToken(prop));
                     const pctx = try c.ctxPropType(rctx, ctx, key);
                     var vt = try c.checkExprCached(pd.rhs, pctx);
-                    if (!try c.keepLiteral(vt, pctx)) vt = try c.widenLiteral(vt);
+                    if (c.const_ctx) {
+                        vt = try c.ts.regularLiteral(vt);
+                    } else if (!try c.keepLiteral(vt, pctx)) vt = try c.widenLiteral(vt);
                     try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = vt });
                 },
                 .object_shorthand => {
                     const key = try c.memberAtom(c.tree.nodeMainToken(prop));
                     var vt = try c.checkExprCached(pd.lhs, types.no_type);
                     const pctx = try c.ctxPropType(rctx, ctx, key);
-                    if (!try c.keepLiteral(vt, pctx)) vt = try c.widenLiteral(vt);
+                    if (c.const_ctx) {
+                        vt = try c.ts.regularLiteral(vt);
+                    } else if (!try c.keepLiteral(vt, pctx)) vt = try c.widenLiteral(vt);
                     if (pd.rhs != 0) _ = try c.checkExprCached(pd.rhs, types.no_type);
                     try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = vt });
                 },
@@ -4002,6 +4082,10 @@ const Checker = struct {
         while (git.next()) |k| {
             if (setter_keys.contains(k.*)) continue;
             if (prop_index.get(k.*)) |idx| props.items[idx].flags |= types.prop_flag_readonly;
+        }
+        // `{...} as const`: every property is readonly.
+        if (c.const_ctx) {
+            for (props.items) |*p| p.flags |= types.prop_flag_readonly;
         }
         return c.ts.makeObject(props.items, 0, 0, true);
     }
@@ -4524,6 +4608,21 @@ const Checker = struct {
                 return c.propertyTypeOf(obj_t, name, d.rhs);
             },
             .index_expr => {
+                // Writing to a readonly tuple element (from `as const`) is
+                // TS2540, like a readonly property.
+                const d = c.tree.nodeData(node);
+                const r = try c.resolveStructural(try c.checkExprCached(d.lhs, types.no_type));
+                if (c.ts.kind(r) == .tuple) {
+                    const idx_t = try c.ts.regularLiteral(try c.checkExprCached(d.rhs, types.no_type));
+                    if (c.ts.kind(idx_t) == .number_literal) {
+                        const v = c.ts.numberValue(idx_t);
+                        const iv: u32 = if (v >= 0 and v == @floor(v) and v < 4096) @intFromFloat(v) else 4096;
+                        if (iv < c.ts.tupleLen(r) and c.ts.tupleElem(r, iv).readonly()) {
+                            try c.diagFmt(2540, c.nodeSpan(d.rhs), "Cannot assign to '{d}' because it is a read-only property.", .{iv});
+                            return types.error_type;
+                        }
+                    }
+                }
                 return c.checkIndexExpr(node);
             },
             .array_literal, .object_literal, .array_pattern, .object_pattern => {
@@ -4537,6 +4636,10 @@ const Checker = struct {
     }
 
     fn checkFunctionLikeExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
+        // A const assertion does not propagate into function bodies.
+        const prev_cc = c.const_ctx;
+        c.const_ctx = false;
+        defer c.const_ctx = prev_cc;
         const d = c.tree.nodeData(node);
         var ctx_sig: TypeId = types.no_type;
         if (ctx != types.no_type) {

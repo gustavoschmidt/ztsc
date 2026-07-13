@@ -161,8 +161,11 @@ pub const Tag = enum(u8) {
     non_null,
     /// `expr as T`. main_token = `as`; lhs = expr, rhs = type.
     as_expr,
-    /// `expr satisfies T` — parsed but flagged unsupported. Same layout.
+    /// `expr satisfies T`. main_token = `satisfies`; lhs = expr, rhs = type.
     satisfies_expr,
+    /// The `const` type in an `expr as const` const assertion. Leaf;
+    /// main_token = the `const` keyword. Only valid as an `as_expr` rhs.
+    const_type,
     /// `obj.name`. main_token = `.`; lhs = object, rhs = name token.
     member_expr,
     /// `obj?.name`. main_token = `?.`; lhs = object, rhs = name token.
@@ -615,6 +618,7 @@ pub const Ast = struct {
                 .true_literal,
                 .false_literal,
                 .null_literal,
+                .const_type,
                 .this_expr,
                 .super_expr,
                 .import_expr,
