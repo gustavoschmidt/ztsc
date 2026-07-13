@@ -688,13 +688,48 @@ pub fn main(init: std.process.Init) !void {
     const check_timer = Timer.start(io);
     const n_checkers: usize = @max(1, @min(cli.checkers orelse @min(4, cpu_count), n_files));
     const tasks = try arena.alloc(CheckerTask, n_checkers);
+    // File id -> owning checker, so per-file diagnostics can be reassembled
+    // from the right checker below (replaces the old `i % n_checkers`).
+    const file_owner = try arena.alloc(u32, n_files);
     {
-        // Round-robin partition (deterministic).
+        // Cost-based partition (ROADMAP.md §5, M10): greedy longest-
+        // processing-time by per-file AST node count (≈ check cost, known
+        // post-parse). Round-robin (`i % n_checkers`) ignores file size and
+        // clumps large files whose ids share a residue mod N onto one
+        // checker; sorting files big-first and dropping each onto the
+        // currently least-loaded checker isolates a lone huge file and
+        // spreads the rest evenly. Fully deterministic: node counts are
+        // fixed post-parse and every tie breaks by file id / checker index,
+        // so any --checkers=N still yields byte-identical diagnostics.
         const owned_lists = try arena.alloc(std.ArrayList(modules.FileId), n_checkers);
         for (owned_lists) |*l| l.* = .empty;
+
+        const Item = struct { file: u32, cost: u64 };
+        const items = try arena.alloc(Item, n_files);
         for (0..n_files) |i| {
-            try owned_lists[i % n_checkers].append(arena, @intCast(i));
+            const cost: u64 = if (trees.items[i]) |tree| tree.nodes.len else 0;
+            items[i] = .{ .file = @intCast(i), .cost = cost };
         }
+        std.mem.sort(Item, items, {}, struct {
+            fn lessThan(_: void, x: Item, y: Item) bool {
+                if (x.cost != y.cost) return x.cost > y.cost; // biggest first
+                return x.file < y.file; // deterministic tie-break
+            }
+        }.lessThan);
+
+        const loads = try arena.alloc(u64, n_checkers);
+        @memset(loads, 0);
+        for (items) |it| {
+            // Least-loaded checker; ties resolve to the lowest index.
+            var best: usize = 0;
+            for (loads[1..], 1..) |l, k| {
+                if (l < loads[best]) best = k;
+            }
+            try owned_lists[best].append(arena, it.file);
+            loads[best] += it.cost;
+            file_owner[it.file] = @intCast(best);
+        }
+
         for (tasks, 0..) |*t, k| {
             t.* = .{
                 .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
@@ -849,7 +884,7 @@ pub fn main(init: std.process.Init) !void {
         for (links[i].diags) |d| {
             try merged.append(gpa, .{ .code = d.code, .start = d.span.start, .end = d.span.end, .msg = d.msg });
         }
-        const owner = i % n_checkers;
+        const owner = file_owner[i];
         if (tasks[owner].result) |ck| {
             var cur = cursors[owner];
             while (cur < ck.diagnostics.len and ck.diagnostics[cur].file == i) : (cur += 1) {
