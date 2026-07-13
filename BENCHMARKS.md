@@ -289,6 +289,48 @@ among many small, arranged so round-robin provably clumps them);
 regenerate with `node bench/gen_corpus.js`. The partition adds one sort of
 N integers on the front-end path — invisible on the uniform corpora.
 
+## 3.9 M11 — node-shaped acceptance fixture (first `.d.ts`-heavy datapoint)
+
+The M11 acceptance test (ROADMAP.md §5, "the milestone's whole point") is a
+standing conformance fixture at `test/conformance/node_accept/backend/`: a
+mini `@types/node` (a `declare global` + `namespace NodeJS` surface split
+across `globals.d.ts`/`process.d.ts`/`timers.d.ts`, ambient `declare module
+"fs"`/`"timers"`, a global `Buffer` value+type merge, chained by triple-slash
+`/// <reference path>` from `index.d.ts` and pulled in by `/// <reference
+types="node" />`), an `Express.Request`-style app-side `declare global`
+augmentation, and a backend `entry.ts` exercising `process.env`, `Buffer`,
+`fs`, and timer return types. Every "good" line type-checks clean; the four
+planted mistakes match tsc exactly (`TS2322`×3 + `TS2339`). Unlike the
+synthetic corpora this fixture is deliberately **not** lib-free — the whole
+point is the cross-file global/namespace merge that real `@types/*` packages
+are built on.
+
+Measured 2026-07-13 (ReleaseFast, `--pretty=false`, median of 3; peak RSS via
+`/usr/bin/time -l`), checking `entry.ts` and everything it pulls in
+(10 files, 412 lines):
+
+| | wall | peak RSS | diagnostics |
+|---|---:|---:|---|
+| **ztsc** | **~0.01 s** | **~7.0 MB** | 4 (match) |
+| tsc 5.5.4 | ~0.38 s | ~182 MB | 4 |
+
+Diagnostics are byte-identical for `--checkers` ∈ {1, 4, 8} (determinism
+holds through the merge layer). The RSS gap is inflated on tsc's side — tsc
+loads the full real `lib.esnext`+`lib.dom` where ztsc loads only its trimmed
+embedded ES-core lib — so read this as a "check this program end-to-end"
+datapoint, not a like-for-like lib comparison; the honest lib-size story is
+M12's job. It is recorded here as the first realistic `.d.ts`-heavy input and
+feeds M12's gates. tsgo is omitted (it would need the same case-local
+`@types` setup; added when M12's `@types/node`-scale corpus lands).
+
+The merge machinery this fixture stressed surfaced one real gap, now fixed: a
+merged global name (`NodeJS`, `Buffer`) referenced from *inside* a
+contributing file bound to the file-local declaration and bypassed the merged
+member index (so `var process: NodeJS.Process` saw only one file's `Process`
+members). The linker now emits a constituent→merged reverse index
+(`Program.mergedOf`) that `resolveSpace` consults — pay-per-use, empty when no
+name is merged.
+
 ---
 
 ## 4. Cross-checking correctness while benchmarking

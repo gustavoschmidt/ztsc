@@ -734,7 +734,15 @@ const Checker = struct {
             if (c.bind.lookupInScope(s, a)) |sym| {
                 const f = c.bind.symbol_flags[sym];
                 const ok = if (want_value) hasValueMeaning(f) else hasTypeMeaning(f);
-                if (ok) return .{ .sym = c.toGlobal(sym) };
+                if (ok) {
+                    // A reference from inside a contributing file binds to the
+                    // file-local declaration; if that declaration is a
+                    // cross-file merge constituent, route to the merged symbol
+                    // so its full member set (folded from every file) is seen
+                    // (M11a). Its OR-of-constituents flags keep `ok` valid.
+                    const g = c.toGlobal(sym);
+                    return .{ .sym = c.prog.mergedOf(g) orelse g };
+                }
                 if (wrong == binder.no_symbol) wrong = sym;
             }
             if (s == binder.file_scope) break;

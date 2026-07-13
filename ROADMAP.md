@@ -271,7 +271,13 @@ Several sections below carry `file:~line` references verified at commit
 `6aa155f` (2026-07-12 architecture review) — they drift; search for the
 named function when in doubt.
 
-### M11 — Cross-file declaration merging + module augmentation (the global-symbol layer)
+### M11 — Cross-file declaration merging + module augmentation (the global-symbol layer) ✅ DONE (2026-07-13)
+
+All four parts landed: M11a (harvest + global interface merge), M11b
+(recursive namespace merge), M11c (module augmentation + wildcard modules +
+triple-slash refs), and the acceptance test (below). Conformance 297 → 313
+(one cross-file `node_accept` acceptance case). The full M11 design and
+per-part notes are preserved below.
 
 **Why this is first (decision 2026-07-13).** v0.0.1 must check real
 backend projects, and `@types/node` is the gate: it reopens `declare
@@ -484,14 +490,31 @@ authoritative, verify each against tsc 5.5.4):**
     wildcard CSS module; `reference types` pulling in a package —
     matching tsc.
 
-**Acceptance test (the milestone's whole point):** vendor a pinned
-snapshot of `@types/node` (checked into the repo or fetched at a pinned
-version by a script) and typecheck a small real backend program —
-`process.env`, `Buffer`, `fs`, timer return types, plus an
-`Express.Request`-style `declare global` augmentation — with diagnostics
-matching tsc. Keep it as a standing fixture and record wall/RSS in
-BENCHMARKS.md: this doubles as the first realistic `.d.ts`-heavy
-benchmark and feeds M12's gates.
+**Acceptance test (the milestone's whole point). ✅ DONE (2026-07-13).**
+Standing fixture at `test/conformance/node_accept/backend/`: a mini
+`@types/node` (a `declare global` + `namespace NodeJS` surface split across
+`globals.d.ts`/`process.d.ts`/`timers.d.ts`, ambient `declare module
+"fs"`/`"timers"`, a global `Buffer` value+type merge, chained by
+triple-slash `/// <reference path>` from `index.d.ts` and pulled in by
+`/// <reference types="node" />`), an `Express.Request`-style app-side
+`declare global` augmentation, and a backend `entry.ts` exercising
+`process.env`, `Buffer`, `fs`, and timer return types. Every good line
+type-checks clean; the four planted mistakes match tsc 5.5.4 exactly
+(`TS2322`×3 + `TS2339`), byte-identical for `--checkers` ∈ {1,4,8}. Rather
+than the *real* `@types/node` (whose `.d.ts` are built on conditional/
+mapped/template-literal types — M16 territory, out of subset today, so it
+would flood `unsupported_syntax` rather than validate the merge), the
+fixture is a hand-authored node-*shaped* surface that stays in-subset and
+exercises exactly the M11 merge machinery (decision 2026-07-13). It
+surfaced one real gap — a merged global referenced from *inside* a
+contributing file bound to the file-local decl and bypassed the merged
+member index; fixed with a constituent→merged reverse index
+(`modules.Program.mergedOf`, consulted in checker `resolveSpace`).
+wall/RSS recorded in BENCHMARKS.md §3.9 (ztsc ~0.01 s / ~7 MB vs tsc
+~0.38 s / ~182 MB) as the first realistic `.d.ts`-heavy datapoint; it
+feeds M12's gates. The *real* pinned-`@types/node` typecheck graduates to
+M17's real-world validation once M16 lands the type-level features its
+declarations need.
 
 **Perf/memory expectations:** the overlay costs a few indices per merged
 name — only merged names pay, per invariant 3. M7 already fixed the two
@@ -772,11 +795,13 @@ export), async/await/`Promise` typing, basic generators, `symbol` +
 `typeof "symbol"` narrowing, the `Symbol.iterator` iteration protocol
 (`for…of`/spread over Map/Set/generators/user iterables), the `Symbol`
 global, and JSX typing in `.tsx` (intrinsic + component elements against a
-`JSX` namespace).
+`JSX` namespace). **Since M11:** general **cross-file declaration merging**
+(the global-symbol layer — `declare global`, cross-file namespace/interface
+merge including references from inside contributing files), **module
+augmentation** (ambient + wildcard `declare module`), and **triple-slash
+`/// <reference path|types>`** directives.
 
-**Not yet** (queued in §5): general **cross-file declaration merging** (the
-global-symbol layer; within-file and across-import merging already work),
-module augmentation + triple-slash refs (M11); `unique symbol`
+**Not yet** (queued in §5): `unique symbol`
 annotations, JSX polish (`-` in names, class-component props, JSX
 namespace from imported `@types`), `this`-typing, decorators (M14);
 **conditional types + `infer`** (M16a), **mapped types + `as` remapping**

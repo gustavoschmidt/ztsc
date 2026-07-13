@@ -236,10 +236,30 @@ pub const Program = struct {
     /// Ambient module export tables (M11c), indexed by `Target.ambient_ns`
     /// payloads; for `import * as ns from "<ambient>"` namespace objects.
     ambient_exports: []const AmbientExport = &.{},
+    /// Reverse merge index (M11a): merge-constituent real id → merged id,
+    /// parallel arrays sorted by key. See `mergedOf`.
+    constit_keys: []const u32 = &.{},
+    constit_vals: []const u32 = &.{},
 
     /// Count of real per-file symbols (merged ids start here).
     pub fn totalSymbols(p: *const Program) u32 {
         return p.sym_base[p.files.len];
+    }
+
+    /// If real global id `sym` is a constituent of a cross-file merge, the
+    /// merged-range id it folds into; else null. Used so a merged name
+    /// referenced from *within* a contributing file (bound to the file-local
+    /// declaration, which never reaches the global fallback) still resolves to
+    /// the merged view.
+    pub fn mergedOf(p: *const Program, sym: u32) ?u32 {
+        var lo: usize = 0;
+        var hi: usize = p.constit_keys.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (p.constit_keys[mid] == sym) return p.constit_vals[mid];
+            if (p.constit_keys[mid] < sym) lo = mid + 1 else hi = mid;
+        }
+        return null;
     }
 
     /// True for a merged-range symbol id (indexes `merged`, not a file).
@@ -291,7 +311,17 @@ pub fn libFileId(files: []const ProgFile) FileId {
 pub const GlobalMerge = struct {
     globals: Globals = .{},
     merged: []const MergedSym = &.{},
+    /// Reverse index (M11a): each merge constituent's real global id → the
+    /// merged-range id it folds into. Parallel arrays sorted by key. Lets a
+    /// reference to a merged name from *inside* a contributing file (which
+    /// binds to the file-local constituent, not the global fallback) route to
+    /// the merged view. Empty in the common case (no cross-file merges).
+    constit_keys: []const u32 = &.{},
+    constit_vals: []const u32 = &.{},
 };
+
+/// A (constituent real id → merged id) pair for the reverse index.
+const ConstitPair = struct { key: u32, val: u32 };
 
 /// FileId owning global symbol `sym` (binary search over sym_base prefix sums).
 fn fileOfGlobal(sym_base: []const u32, n_files: usize, sym: u32) FileId {
@@ -360,9 +390,22 @@ pub fn mergeGlobals(
         g_atoms[i] = atom;
         g_syms[i] = try m.mergeSet(acc.get(atom).?.items);
     }
+    std.mem.sort(ConstitPair, m.constit.items, {}, struct {
+        fn lt(_: void, a: ConstitPair, b: ConstitPair) bool {
+            return a.key < b.key;
+        }
+    }.lt);
+    const ck = try arena.alloc(u32, m.constit.items.len);
+    const cv = try arena.alloc(u32, m.constit.items.len);
+    for (m.constit.items, 0..) |pr, i| {
+        ck[i] = pr.key;
+        cv[i] = pr.val;
+    }
     return .{
         .globals = .{ .atoms = g_atoms, .syms = g_syms },
         .merged = try arena.dupe(MergedSym, m.merged.items),
+        .constit_keys = ck,
+        .constit_vals = cv,
     };
 }
 
@@ -375,6 +418,9 @@ const Merger = struct {
     files: []const ProgFile,
     sym_base: []const u32,
     merged: std.ArrayListUnmanaged(MergedSym) = .empty,
+    /// (constituent real id → merged id), accumulated in `scratch` as merges
+    /// are formed (including nested namespace-member merges), sorted at the end.
+    constit: std.ArrayListUnmanaged(ConstitPair) = .empty,
 
     fn totalSyms(m: *const Merger) u32 {
         return m.sym_base[m.files.len];
@@ -399,6 +445,7 @@ const Merger = struct {
             .parts = try m.arena.dupe(u32, parts),
             .members = members,
         });
+        for (parts) |p| try m.constit.append(m.scratch, .{ .key = p, .val = id });
         return id;
     }
 
@@ -485,7 +532,7 @@ pub fn singleWithLibProgram(
     // globals; merge diagnostics (none for the clean case) have no link table
     // to land in here and are dropped.
     const gm = try mergeGlobals(arena, arena, files, sym_base);
-    return .{ .files = files, .sym_base = sym_base, .globals = gm.globals, .merged = gm.merged };
+    return .{ .files = files, .sym_base = sym_base, .globals = gm.globals, .merged = gm.merged, .constit_keys = gm.constit_keys, .constit_vals = gm.constit_vals };
 }
 
 // ===========================================================================
@@ -1036,6 +1083,8 @@ pub const LinkResult = struct {
     globals: Globals = .{},
     merged: []const MergedSym = &.{},
     ambient_exports: []const AmbientExport = &.{},
+    constit_keys: []const u32 = &.{},
+    constit_vals: []const u32 = &.{},
 };
 
 /// Build the sealed per-file link tables and the merged global table. Serial;
@@ -1118,7 +1167,7 @@ pub fn link(
         amb[i] = .{ .atoms = atoms, .targets = tgts };
     }
 
-    return .{ .links = out, .sym_base = sym_base, .globals = gm.globals, .merged = gm.merged, .ambient_exports = amb };
+    return .{ .links = out, .sym_base = sym_base, .globals = gm.globals, .merged = gm.merged, .ambient_exports = amb, .constit_keys = gm.constit_keys, .constit_vals = gm.constit_vals };
 }
 
 /// Sort parallel (key, value) arrays by key ascending. Export/import tables
@@ -1360,6 +1409,8 @@ pub fn buildProgram(
             .globals = lr.globals,
             .merged = lr.merged,
             .ambient_exports = lr.ambient_exports,
+            .constit_keys = lr.constit_keys,
+            .constit_vals = lr.constit_vals,
         },
         .load_failures = try arena.dupe(BuildDiag, failures.items),
     };
