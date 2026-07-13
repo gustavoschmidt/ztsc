@@ -67,6 +67,7 @@ pub const Flags = struct {
     pub const type_only: u32 = 1 << 14; // `import type` / `export type`
     pub const rest: u32 = 1 << 15; // `...` param
     pub const accessor: u32 = 1 << 16;
+    pub const const_enum: u32 = 1 << 17; // `const enum`
 };
 
 pub const NodeItem = struct {
@@ -293,6 +294,12 @@ pub const Tag = enum(u8) {
     /// `type A<T> = U`. main_token = `type`; lhs = extra→TypeAlias,
     /// rhs = aliased type node.
     type_alias,
+    /// `enum E { ... }` / `const enum E { ... }`. main_token = `enum`
+    /// (or `const` for a const enum); lhs = extra→EnumData, rhs unused.
+    enum_decl,
+    /// An enum member `Name` / `Name = expr`. main_token = name token;
+    /// lhs = optional initializer expression (0 = none).
+    enum_member,
     /// Type parameter `T extends C = D`. main_token = name token;
     /// lhs = optional constraint, rhs = optional default.
     type_param,
@@ -423,6 +430,12 @@ pub const TypeAlias = struct {
     name_token: TokenIndex,
     tp_start: ExtraIndex,
     tp_end: ExtraIndex,
+};
+pub const EnumData = struct {
+    flags: u32, // Flags.declare / a const-enum marker bit (Flags.readonly)
+    name_token: TokenIndex,
+    members_start: ExtraIndex, // enum_member nodes
+    members_end: ExtraIndex,
 };
 pub const IndexSig = struct { name_token: TokenIndex, key_type: Node, value_type: Node };
 pub const ImportData = struct {
@@ -804,6 +817,11 @@ pub const Ast = struct {
                     it.pushRange(a.extraRange(e.extends_start, e.extends_end));
                     it.pushRange(a.extraRange(e.members_start, e.members_end));
                 },
+                .enum_decl => {
+                    const e = a.extraData(EnumData, d.lhs);
+                    it.pushRange(a.extraRange(e.members_start, e.members_end));
+                },
+                .enum_member => it.push(d.lhs), // optional initializer
                 .import_decl => {
                     const e = a.extraData(ImportData, d.lhs);
                     it.pushRange(a.extraRange(e.spec_start, e.spec_end));
@@ -858,6 +876,7 @@ pub const Ast = struct {
             .class_decl => l.add(a.extraData(ClassData, d.lhs).name_token),
             .interface_decl => l.add(a.extraData(InterfaceData, d.lhs).name_token),
             .type_alias => l.add(a.extraData(TypeAlias, d.lhs).name_token),
+            .enum_decl => l.add(a.extraData(EnumData, d.lhs).name_token),
             else => {},
         }
         return l;
@@ -880,6 +899,7 @@ pub const Ast = struct {
             .param_full => a.extraData(ParamFull, d.rhs).flags,
             .arrow_fn, .function_expr, .function_decl, .class_method, .function_type, .method_signature => a.extraData(FnProto, d.lhs).flags,
             .class_decl => a.extraData(ClassData, d.lhs).flags,
+            .enum_decl => a.extraData(EnumData, d.lhs).flags,
             .interface_decl => a.extraData(InterfaceData, d.lhs).flags,
             .property_signature, .index_signature, .import_specifier, .export_specifier => d.rhs,
             .import_decl => a.extraData(ImportData, d.lhs).flags,
@@ -907,6 +927,7 @@ pub const Ast = struct {
             .type_param,
             .labeled_stmt,
             .property_signature,
+            .enum_member,
             .class_field,
             .class_method,
             .method_signature,
@@ -926,6 +947,7 @@ pub const Ast = struct {
             },
             .interface_decl => try w.print(" {s}", .{a.tokenSlice(src, a.extraData(InterfaceData, d.lhs).name_token)}),
             .type_alias => try w.print(" {s}", .{a.tokenSlice(src, a.extraData(TypeAlias, d.lhs).name_token)}),
+            .enum_decl => try w.print(" {s}", .{a.tokenSlice(src, a.extraData(EnumData, d.lhs).name_token)}),
             .break_stmt, .continue_stmt => {
                 if (d.lhs != 0) try w.print(" {s}", .{a.tokenSlice(src, d.lhs)});
             },

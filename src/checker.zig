@@ -270,6 +270,10 @@ const Checker = struct {
     iface_generic: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
     class_inst_generic: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
     class_static_cache: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
+    /// Enum symbol -> value object type (the `typeof E` object with members).
+    enum_value_cache: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
+    /// Enum symbol -> computed EnumInfo (const-ness, member values).
+    enum_info_cache: std.AutoHashMapUnmanaged(SymbolId, EnumInfo) = .empty,
     alias_generic: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
     alias_state: std.AutoHashMapUnmanaged(SymbolId, u8) = .empty,
     /// Narrowed-type cache per (flow, reference, declared) query.
@@ -634,12 +638,12 @@ const Checker = struct {
     fn hasValueMeaning(f: binder.SymbolFlags) bool {
         if (f.import_binding and f.type_only) return false;
         return f.var_decl or f.let_decl or f.const_decl or f.function or f.class or
-            f.param or f.catch_param or f.import_binding;
+            f.param or f.catch_param or f.import_binding or f.enum_decl;
     }
 
     fn hasTypeMeaning(f: binder.SymbolFlags) bool {
         return f.class or f.interface or f.type_alias or f.type_param or
-            f.import_binding;
+            f.import_binding or f.enum_decl;
     }
 
     const Resolved = union(enum) {
@@ -941,6 +945,7 @@ const Checker = struct {
             },
             .type_param => try w.print("{s}", .{c.symbolName(s.typeParamSymbol(t))}),
             .class_value => try w.print("typeof {s}", .{c.symbolName(s.classSymbol(t))}),
+            .enum_type => try w.print("{s}", .{c.symbolName(s.enumSymbol(t))}),
         }
     }
 
@@ -1116,6 +1121,7 @@ const Checker = struct {
                     }
                 }
                 if (f.type_param) return c.ts.makeTypeParam(sym);
+                if (f.enum_decl) return c.ts.makeEnumType(sym);
                 if (f.type_alias) return c.aliasInstance(sym, args, tok);
                 if (f.interface or f.class) {
                     const fixed = try c.fixTypeArgs(sym, args, tok) orelse return types.error_type;
@@ -1618,6 +1624,7 @@ const Checker = struct {
     fn computeTypeOfSymbol(c: *Checker, sym: SymbolId) Error!TypeId {
         const f = c.symFlags(sym);
         if (f.import_binding) return c.importedSymbolType(sym);
+        if (f.enum_decl) return c.enumValueType(sym);
         if (f.class) return c.ts.makeClassValue(sym);
         if (f.function) return c.functionSymbolType(sym);
         if (f.property or f.method or f.getter or f.setter) return c.memberTypeOf(sym);
@@ -2210,6 +2217,211 @@ const Checker = struct {
 
     /// Static side of a class (statics as object props; construct handled
     /// separately by `new` resolution).
+    // =====================================================================
+    // enums (M11)
+    // =====================================================================
+
+    const EnumInfo = struct {
+        is_const: bool,
+        /// Every member is a string constant (nominal string enum).
+        all_string: bool,
+        /// No string members (pure numeric / auto-increment / computed).
+        all_numeric: bool,
+        /// At least one member has a non-constant initializer.
+        has_computed: bool,
+        /// Numeric member values, for numeric-literal membership checks.
+        values: []const f64,
+
+        fn hasValue(self: EnumInfo, v: f64) bool {
+            for (self.values) |x| {
+                if (x == v) return true;
+            }
+            return false;
+        }
+    };
+
+    const EnumInitKind = enum { numeric, string, computed };
+
+    /// Classify an enum member initializer for constant folding. Only literal
+    /// numbers (incl. unary `-`/`+`) and string literals fold to constants;
+    /// anything else is "computed".
+    fn classifyEnumInit(c: *Checker, node: Node) struct { kind: EnumInitKind, value: f64 } {
+        switch (c.nodeTag(node)) {
+            .number_literal => return .{ .kind = .numeric, .value = c.numberTokenValue(c.tree.nodeMainToken(node)) },
+            .prefix_unary => {
+                const d = c.tree.nodeData(node);
+                const op = c.tree.tokens.tag(c.tree.nodeMainToken(node));
+                if ((op == .minus or op == .plus) and d.lhs != 0 and c.nodeTag(d.lhs) == .number_literal) {
+                    const v = c.numberTokenValue(c.tree.nodeMainToken(d.lhs));
+                    return .{ .kind = .numeric, .value = if (op == .minus) -v else v };
+                }
+                return .{ .kind = .computed, .value = 0 };
+            },
+            .string_literal => return .{ .kind = .string, .value = 0 },
+            else => return .{ .kind = .computed, .value = 0 },
+        }
+    }
+
+    /// Const-ness, string/numeric nature, and numeric member values of an
+    /// enum symbol (all declaration blocks merged). Pure computation, cached.
+    fn enumInfo(c: *Checker, sym: SymbolId) Error!EnumInfo {
+        if (c.enum_info_cache.get(sym)) |info| return info;
+        const saved = c.enterSymFile(sym);
+        defer c.restoreCtx(saved);
+        var values: std.ArrayList(f64) = .empty;
+        defer values.deinit(c.scratch());
+        var is_const = false;
+        var has_string = false;
+        var has_computed = false;
+        var member_count: u32 = 0;
+        var auto: f64 = 0;
+        var auto_ok = true;
+        for (c.declsOf(sym)) |decl| {
+            if (c.nodeTag(decl) != .enum_decl) continue;
+            const d = c.tree.nodeData(decl);
+            const data = c.tree.extraData(ast.EnumData, d.lhs);
+            if (data.flags & ast.Flags.const_enum != 0) is_const = true;
+            for (c.tree.extraRange(data.members_start, data.members_end)) |m| {
+                if (m == null_node or c.nodeTag(m) != .enum_member) continue;
+                member_count += 1;
+                const init_node = c.tree.nodeData(m).lhs;
+                if (init_node == null_node) {
+                    if (auto_ok) {
+                        try values.append(c.scratch(), auto);
+                        auto += 1;
+                    }
+                    continue;
+                }
+                const ci = c.classifyEnumInit(init_node);
+                switch (ci.kind) {
+                    .numeric => {
+                        try values.append(c.scratch(), ci.value);
+                        auto = ci.value + 1;
+                        auto_ok = true;
+                    },
+                    .string => {
+                        has_string = true;
+                        auto_ok = false;
+                    },
+                    .computed => {
+                        has_computed = true;
+                        auto_ok = false;
+                    },
+                }
+            }
+        }
+        const info: EnumInfo = .{
+            .is_const = is_const,
+            .all_string = has_string and !has_computed and values.items.len == 0 and member_count > 0,
+            .all_numeric = !has_string,
+            .has_computed = has_computed,
+            .values = try c.ca().dupe(f64, values.items),
+        };
+        try c.enum_info_cache.put(c.ca(), sym, info);
+        return info;
+    }
+
+    /// Whether an enum has any string-valued member (non-allocating scan).
+    /// A string enum is stringish; an all-numeric enum is numberish — this
+    /// lets numeric enums take part in arithmetic/comparison like `number`.
+    fn enumHasStringMember(c: *Checker, sym: SymbolId) bool {
+        if (c.enum_info_cache.get(sym)) |info| return !info.all_numeric;
+        const saved = c.enterSymFile(sym);
+        defer c.restoreCtx(saved);
+        for (c.declsOf(sym)) |decl| {
+            if (c.nodeTag(decl) != .enum_decl) continue;
+            const data = c.tree.extraData(ast.EnumData, c.tree.nodeData(decl).lhs);
+            for (c.tree.extraRange(data.members_start, data.members_end)) |m| {
+                if (m == null_node or c.nodeTag(m) != .enum_member) continue;
+                const init_node = c.tree.nodeData(m).lhs;
+                if (init_node != null_node and c.classifyEnumInit(init_node).kind == .string) return true;
+            }
+        }
+        return false;
+    }
+
+    /// The value object of an enum (`typeof E`): one readonly property per
+    /// member, each typed as the (nominal) enum type.
+    fn enumValueType(c: *Checker, sym: SymbolId) Error!TypeId {
+        if (c.enum_value_cache.get(sym)) |t| return t;
+        const enum_t = try c.ts.makeEnumType(sym);
+        const saved = c.enterSymFile(sym);
+        defer c.restoreCtx(saved);
+        var props: std.ArrayList(types.Prop) = .empty;
+        defer props.deinit(c.scratch());
+        for (c.declsOf(sym)) |decl| {
+            if (c.nodeTag(decl) != .enum_decl) continue;
+            const d = c.tree.nodeData(decl);
+            const data = c.tree.extraData(ast.EnumData, d.lhs);
+            for (c.tree.extraRange(data.members_start, data.members_end)) |m| {
+                if (m == null_node or c.nodeTag(m) != .enum_member) continue;
+                const name = try c.memberAtom(c.tree.nodeMainToken(m));
+                var dup = false;
+                for (props.items) |p| {
+                    if (p.name == name) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (dup) continue; // first declaration wins (unique object keys)
+                try props.append(c.scratch(), .{ .name = name, .ty = enum_t, .flags = types.prop_flag_readonly });
+            }
+        }
+        const result = try c.ts.makeObject(props.items, 0, 0, false);
+        try c.enum_value_cache.put(c.ca(), sym, result);
+        return result;
+    }
+
+    /// Nominal enum assignability (identical enums are caught by `s == t`
+    /// upstream). Matches tsc 5.5: a numeric enum interconverts with `number`
+    /// (and accepts numeric literals equal to a member value); a string enum
+    /// is a subtype of `string` but nothing widens *into* it.
+    fn enumAssignable(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: types.Kind) Error!bool {
+        if (sk == .enum_type and tk == .enum_type) return false;
+        if (sk == .enum_type) {
+            const info = try c.enumInfo(c.ts.enumSymbol(s));
+            if (tk == .number and info.all_numeric) return true;
+            if (tk == .string and info.all_string) return true;
+            return false;
+        }
+        // tk == .enum_type
+        const info = try c.enumInfo(c.ts.enumSymbol(t));
+        if (info.all_numeric) {
+            if (sk == .number) return true;
+            if (sk == .number_literal or sk == .number_literal_fresh) {
+                if (info.has_computed) return true;
+                return info.hasValue(c.ts.numberValue(s));
+            }
+        }
+        return false;
+    }
+
+    /// Type-check an enum declaration: validate member initializers (TS1061)
+    /// and check any initializer expressions.
+    fn checkEnum(c: *Checker, node: Node) Error!void {
+        const d = c.tree.nodeData(node);
+        const data = c.tree.extraData(ast.EnumData, d.lhs);
+        // A member with no initializer is only legal when the previous member
+        // (or the start of the enum) is a numeric constant it can continue.
+        var prev_numeric_const = true;
+        for (c.tree.extraRange(data.members_start, data.members_end)) |m| {
+            if (m == null_node or c.nodeTag(m) != .enum_member) continue;
+            const init_node = c.tree.nodeData(m).lhs;
+            if (init_node == null_node) {
+                if (!prev_numeric_const) {
+                    try c.diagFmt(1061, c.tokSpan(c.tree.nodeMainToken(m)), "Enum member must have initializer.", .{});
+                }
+                continue; // auto-increment continues the numeric chain
+            }
+            _ = try c.checkExprCached(init_node, types.no_type);
+            // Only a string-valued member blocks a following bare member. A
+            // non-literal ("computed") initializer may still be a constant
+            // enum expression (e.g. a reference to a `const`), which tsc lets
+            // a subsequent member continue — so we don't force TS1061 there.
+            prev_numeric_const = c.classifyEnumInit(init_node).kind != .string;
+        }
+    }
+
     fn classStaticType(c: *Checker, sym: SymbolId) Error!TypeId {
         if (c.class_static_cache.get(sym)) |t| return t;
         const saved_ctx = c.enterSymFile(sym);
@@ -2472,6 +2684,12 @@ const Checker = struct {
             },
             .ref => return c.propOfType(try c.resolveStructural(t), name),
             .class_value => return c.propOfType(try c.classStaticType(s.classSymbol(t)), name),
+            .enum_type => {
+                // A value of enum type borrows its base primitive's members.
+                const info = try c.enumInfo(s.enumSymbol(t));
+                const base: TypeId = if (info.all_string) types.string_type else types.number_type;
+                return c.propOfType(base, name);
+            },
             else => return null,
         }
     }
@@ -2773,6 +2991,8 @@ const Checker = struct {
             if (rs == s and rt == t) return false;
             return c.isAssignable(rs, rt);
         }
+        // Enum types are nominal (identical enums caught by s == t earlier).
+        if (sk == .enum_type or tk == .enum_type) return c.enumAssignable(s, t, sk, tk);
         // Type parameters.
         if (sk == .type_param) {
             const constraint = try c.typeParamConstraint(c.ts.typeParamSymbol(s));
@@ -3898,6 +4118,7 @@ const Checker = struct {
             fn f(ch: *Checker, m: TypeId) bool {
                 return switch (ch.ts.kind(m)) {
                     .number, .number_literal, .number_literal_fresh, .any, .err, .never => true,
+                    .enum_type => !ch.enumHasStringMember(ch.ts.enumSymbol(m)),
                     else => false,
                 };
             }
@@ -3920,6 +4141,7 @@ const Checker = struct {
             fn f(ch: *Checker, m: TypeId) bool {
                 return switch (ch.ts.kind(m)) {
                     .string, .string_literal, .any, .err, .never => true,
+                    .enum_type => ch.enumHasStringMember(ch.ts.enumSymbol(m)),
                     else => false,
                 };
             }
@@ -5447,6 +5669,7 @@ const Checker = struct {
             .class_decl => try c.checkClass(node),
             .interface_decl => try c.checkInterfaceDecl(node),
             .type_alias => try c.checkTypeAliasDecl(node),
+            .enum_decl => try c.checkEnum(node),
             .import_decl => {}, // M5
             .export_named, .export_all => {},
             .export_decl => try c.checkStatement(d.lhs),

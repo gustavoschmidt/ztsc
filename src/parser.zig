@@ -632,6 +632,12 @@ const Parser = struct {
             .keyword_declare => {
                 if (!p.peekNewline(1)) switch (p.peekTag(1)) {
                     .keyword_var, .keyword_let, .keyword_const => {
+                        // `declare const enum ...`
+                        if (p.peekTag(1) == .keyword_const and p.peekTag(2) == .keyword_enum) {
+                            _ = try p.bump(); // `declare`
+                            _ = try p.bump(); // `const`
+                            return p.parseEnumDecl(ast.Flags.declare | ast.Flags.const_enum);
+                        }
                         _ = try p.bump();
                         return p.parseVarStatement();
                     },
@@ -661,7 +667,11 @@ const Parser = struct {
                         _ = try p.bump();
                         return p.parseTypeAlias(ast.Flags.declare);
                     },
-                    .keyword_module, .keyword_namespace, .keyword_global, .keyword_enum => {
+                    .keyword_enum => {
+                        _ = try p.bump(); // `declare`
+                        return p.parseEnumDecl(ast.Flags.declare);
+                    },
+                    .keyword_module, .keyword_namespace, .keyword_global => {
                         const start = try p.bump();
                         p.skipUnsupportedBlockish();
                         const node = try p.unsupportedFrom(start);
@@ -673,11 +683,7 @@ const Parser = struct {
             },
             .keyword_import => return p.parseImportStatement(),
             .keyword_export => return p.parseExportStatement(),
-            .keyword_enum => {
-                const start = try p.bump();
-                p.skipUnsupportedBlockish();
-                return p.unsupportedFrom(start);
-            },
+            .keyword_enum => return p.parseEnumDecl(0),
             .keyword_namespace, .keyword_module => {
                 // Only a namespace when followed by a name / string.
                 const t1 = p.peekTag(1);
@@ -758,10 +764,9 @@ const Parser = struct {
     fn parseVarDecl(p: *Parser, no_in: bool) PE!Node {
         const kw = try p.bump(); // var/let/const
         if (p.curTag() == .keyword_enum) {
-            // `const enum` — out of subset.
-            _ = try p.bump();
-            p.skipUnsupportedBlockish();
-            return p.unsupportedFrom(kw);
+            // `const enum E { ... }` — main_token stays on `const`.
+            _ = try p.bump(); // `enum`
+            return p.parseEnumDeclFrom(kw, ast.Flags.const_enum);
         }
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
@@ -1502,6 +1507,51 @@ const Parser = struct {
             .tp_end = tp.end,
         });
         return p.addNode(.{ .tag = .type_alias, .main_token = kw, .data = .{ .lhs = extra, .rhs = value } });
+    }
+
+    /// `enum E { ... }` — consumes the `enum` keyword itself.
+    fn parseEnumDecl(p: *Parser, flags: u32) PE!Node {
+        const kw = try p.bump(); // `enum`
+        return p.parseEnumDeclFrom(kw, flags);
+    }
+
+    /// Enum body parse. `kw` is the node's main token (the `enum` keyword, or
+    /// the `const` keyword for a `const enum`); the `enum` keyword must have
+    /// already been consumed by the caller.
+    fn parseEnumDeclFrom(p: *Parser, kw: u32, flags: u32) PE!Node {
+        const name_tok = try p.expectIdentLike();
+        _ = try p.expect(.l_brace, .expected_l_brace);
+        const top = p.scratchTop();
+        defer p.scratch.shrinkRetainingCapacity(top);
+        while (p.curTag() != .r_brace and p.curTag() != .eof) {
+            const before = p.curIdx();
+            try p.pushScratch(try p.parseEnumMember());
+            if (try p.eat(.comma) == null and p.curTag() != .r_brace) {
+                try p.fail(.expected_comma);
+                if (p.curIdx() == before) break;
+            }
+        }
+        _ = try p.expect(.r_brace, .expected_r_brace);
+        const members = try p.scratchToSpan(top);
+        const extra = try p.addExtra(ast.EnumData{
+            .flags = flags,
+            .name_token = name_tok,
+            .members_start = members.start,
+            .members_end = members.end,
+        });
+        return p.addNode(.{ .tag = .enum_decl, .main_token = kw, .data = .{ .lhs = extra, .rhs = 0 } });
+    }
+
+    fn parseEnumMember(p: *Parser) PE!Node {
+        // Member name: identifier(-like) or string literal.
+        if (!isIdentLike(p.curTag()) and p.curTag() != .string_literal) {
+            try p.fail(.expected_identifier);
+            return p.errorNode();
+        }
+        const name_tok = try p.bump();
+        var init: Node = null_node;
+        if (try p.eat(.eq) != null) init = try p.parseAssignExpr(.{});
+        return p.addNode(.{ .tag = .enum_member, .main_token = name_tok, .data = .{ .lhs = init, .rhs = 0 } });
     }
 
     // --- modules --------------------------------------------------------------
@@ -3701,11 +3751,18 @@ test "golden: for-of with destructuring" {
 
 // --- subset boundary: unsupported constructs never crash --------------------------
 
-test "unsupported: enums" {
-    try expectSExprWithDiags("enum Color { Red, Green }", 1,
-        \\(unsupported tokens=0..6)
+test "enums parse into enum_decl / enum_member nodes" {
+    try expectSExpr("enum Color { Red = 1, Green }",
+        \\(enum_decl Color (enum_member Red (number_literal 1)) (enum_member Green))
     );
-    try expectDiagCount("const enum Fast { A }", 1);
+    // `const enum` parses too; main token stays on `const`.
+    try expectSExpr("const enum Fast { A }",
+        \\(enum_decl Fast (enum_member A))
+    );
+    // String enum members and a trailing comma.
+    try expectSExpr("enum S { A = \"a\", B = \"b\", }",
+        \\(enum_decl S (enum_member A (string_literal "a")) (enum_member B (string_literal "b")))
+    );
 }
 
 test "unsupported: namespaces and modules" {
@@ -3754,7 +3811,7 @@ test "unsupported: class oddities" {
 test "unsupported constructs still leave following code parsable" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const src = "enum E { A }\nconst after: number = 1;";
+    const src = "namespace NS { let x = 1; }\nconst after: number = 1;";
     const tree = try parse(arena.allocator(), src);
     try testing.expect(tree.diagnostics.len >= 1);
     const got = try dumpSource(arena.allocator(), src);
