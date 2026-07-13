@@ -138,6 +138,10 @@ pub const prop_flag_optional: u32 = 1;
 pub const prop_flag_readonly: u32 = 2;
 pub const elem_flag_optional: u32 = 1;
 pub const elem_flag_rest: u32 = 2;
+/// A `readonly` tuple element (produced by `as const`). Ignored by the
+/// assignability relation (like readonly object props); enforced at write
+/// sites (indexed writes -> TS2540).
+pub const elem_flag_readonly: u32 = 4;
 pub const fn_flag_method: u32 = 1;
 pub const param_flag_optional: u32 = 1;
 pub const param_flag_rest: u32 = 2;
@@ -178,6 +182,9 @@ pub const TupleElem = struct {
     }
     pub fn rest(e: TupleElem) bool {
         return e.flags & elem_flag_rest != 0;
+    }
+    pub fn readonly(e: TupleElem) bool {
+        return e.flags & elem_flag_readonly != 0;
     }
 };
 

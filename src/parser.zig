@@ -2037,9 +2037,15 @@ const Parser = struct {
             if ((p.curTag() == .keyword_as or p.curTag() == .keyword_satisfies) and !p.nlBefore() and min_prec <= 8) {
                 const is_satisfies = p.curTag() == .keyword_satisfies;
                 const op = try p.bump();
+                // `expr as const`: the `const` contextual keyword is the
+                // "type" (a const assertion), not a type reference.
+                if (!is_satisfies and p.curTag() == .keyword_const) {
+                    const ct = try p.leaf(.const_type);
+                    lhs = try p.addNode(.{ .tag = .as_expr, .main_token = op, .data = .{ .lhs = lhs, .rhs = ct } });
+                    continue;
+                }
                 const ty = try p.parseType();
                 if (is_satisfies) {
-                    if (p.spec == 0) try p.errAtToken(.unsupported_satisfies, op);
                     lhs = try p.addNode(.{ .tag = .satisfies_expr, .main_token = op, .data = .{ .lhs = lhs, .rhs = ty } });
                 } else {
                     lhs = try p.addNode(.{ .tag = .as_expr, .main_token = op, .data = .{ .lhs = lhs, .rhs = ty } });
@@ -3260,9 +3266,12 @@ test "golden: as and satisfies" {
     try expectSExpr("x = v as string | number;",
         \\(expr_stmt (assign = (identifier x) (as_expr (identifier v) (union_type (identifier string) (identifier number)))))
     );
-    // satisfies parses but is flagged (subset boundary).
-    try expectSExprWithDiags("x = v satisfies T;", 1,
+    try expectSExpr("x = v satisfies T;",
         \\(expr_stmt (assign = (identifier x) (satisfies_expr (identifier v) (identifier T))))
+    );
+    // `as const`: the `const` keyword parses as a const-assertion type.
+    try expectSExpr("x = v as const;",
+        \\(expr_stmt (assign = (identifier x) (as_expr (identifier v) (const_type))))
     );
 }
 
