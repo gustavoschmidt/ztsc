@@ -698,6 +698,8 @@ pub fn main(init: std.process.Init) !void {
         .globals = lr.globals,
         .merged = lr.merged,
         .ambient_exports = lr.ambient_exports,
+        .constit_keys = lr.constit_keys,
+        .constit_vals = lr.constit_vals,
     };
     const link_ns = link_timer.readNs();
 
