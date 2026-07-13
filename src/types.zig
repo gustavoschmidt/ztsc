@@ -133,6 +133,10 @@ pub const Kind = enum(u8) {
     /// Enum type (nominal). a = enum symbol id. Used both for `let x: E`
     /// annotations and for the type of a member access `E.A`.
     enum_type,
+    /// `unique symbol` (M14). a = nominal identity id (a dense per-declaration
+    /// number assigned by the checker). Assignable only to itself and to
+    /// `symbol`; two distinct `unique symbol` declarations never unify.
+    unique_symbol,
 };
 
 pub const obj_flag_fresh: u32 = 1;
@@ -381,6 +385,10 @@ pub const Store = struct {
     pub fn enumSymbol(s: *const Store, id: TypeId) u32 {
         return s.dataA(id);
     }
+    /// Nominal identity id of a `unique symbol` type.
+    pub fn uniqueSymId(s: *const Store, id: TypeId) u32 {
+        return s.dataA(id);
+    }
 
     pub fn numberValue(s: *const Store, id: TypeId) f64 {
         const bits = @as(u64, s.dataA(id)) | (@as(u64, s.dataB(id)) << 32);
@@ -558,6 +566,10 @@ pub const Store = struct {
 
     pub fn makeEnumType(s: *Store, symbol: u32) Error!TypeId {
         return s.internType(.enum_type, &.{ symbol, 0 }, 0);
+    }
+
+    pub fn makeUniqueSymbol(s: *Store, id: u32) Error!TypeId {
+        return s.internType(.unique_symbol, &.{ id, 0 }, 0);
     }
 
     pub fn makeTuple(s: *Store, elems: []const TupleElem) Error!TypeId {

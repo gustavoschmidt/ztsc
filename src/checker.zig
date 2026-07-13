@@ -318,6 +318,12 @@ const Checker = struct {
     ctp_cache: std.AutoHashMapUnmanaged(TypeId, u8) = .empty,
     /// Atom cache to avoid re-locking the shared interner.
     atom_cache: std.StringHashMapUnmanaged(Atom) = .empty,
+    /// `unique symbol` nominal identity: (file << 32 | annotation node) ->
+    /// a dense id. Keyed by declaration site so a value reference to a
+    /// `unique symbol` const yields the same nominal type as its computed-key
+    /// use (`{ [k]: … }`) and element access (`o[k]`).
+    unique_sym_ids: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    unique_sym_next: u32 = 1,
 
     // --- context ------------------------------------------------------------
     cur_scope: ScopeId = binder.file_scope,
@@ -683,6 +689,73 @@ const Checker = struct {
         return c.memberAtom(tok);
     }
 
+    /// Nominal `unique symbol` type for the `unique symbol` annotation node
+    /// `ann`. Keyed by declaration site (file + node) so every resolution of
+    /// the same annotation — the declared type of the const, and thus every
+    /// value reference to it — yields the identical nominal type.
+    fn uniqueSymType(c: *Checker, ann: Node) Error!TypeId {
+        const gop = try c.unique_sym_ids.getOrPut(c.ca(), (@as(u64, c.cur_file) << 32) | ann);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = c.unique_sym_next;
+            c.unique_sym_next += 1;
+        }
+        return c.ts.makeUniqueSymbol(gop.value_ptr.*);
+    }
+
+    /// Synthetic member atom for a value whose type is a `unique symbol`, so a
+    /// computed key `{ [k]: … }` and an element access `o[k]` agree on the
+    /// property name. `__@` cannot begin a real identifier, so it never
+    /// collides with an ordinary member (mirrors `wellKnownSymbolKey`).
+    fn uniqueSymAtom(c: *Checker, t: TypeId) Error!?Atom {
+        const r = try c.ts.regular(t);
+        if (c.ts.kind(r) != .unique_symbol) return null;
+        var buf: [24]u8 = undefined;
+        const s = std.fmt.bufPrint(&buf, "__@u{d}", .{c.ts.uniqueSymId(r)}) catch unreachable;
+        return try c.atom(s);
+    }
+
+    /// Resolve a declaration's type annotation that is allowed to be a
+    /// `unique symbol` (variable / class field / interface-or-type-literal
+    /// property). When the annotation is `unique symbol`, returns its nominal
+    /// type and — unless the modifiers make it legal (`valid`) — reports the
+    /// position diagnostic `code` (TS1330/1331/1332). Any other annotation
+    /// falls through to `typeFromTypeNode`, whose default reports TS1335 for a
+    /// `unique symbol` in a disallowed position. Diagnostics dedup by span, so
+    /// resolving the same annotation on both the type and check passes is safe.
+    fn annTypeMaybeUnique(c: *Checker, ann: Node, valid: bool, code: u16, span: Span) Error!TypeId {
+        if (ann != null_node and c.nodeTag(ann) == .unique_symbol_type) {
+            if (!valid) {
+                const msg = switch (code) {
+                    1330 => "A property of an interface or type literal whose type is a 'unique symbol' type must be 'readonly'.",
+                    1331 => "A property of a class whose type is a 'unique symbol' type must be both 'static' and 'readonly'.",
+                    else => "A variable whose type is a 'unique symbol' type must be 'const'.",
+                };
+                try c.diagFmt(code, span, "{s}", .{msg});
+            }
+            return c.uniqueSymType(ann);
+        }
+        return c.typeFromTypeNode(ann);
+    }
+
+    /// Whether `node` is a fresh `Symbol(...)` / `Symbol.for(...)` call — the
+    /// only initializer tsc accepts for a `unique symbol` const without a
+    /// TS2322 (a plain `symbol` value is not assignable to `unique symbol`).
+    fn isFreshSymbolCall(c: *Checker, node: Node) bool {
+        if (node == null_node or c.nodeTag(node) != .call_expr) return false;
+        const callee = c.tree.nodeData(node).lhs;
+        switch (c.nodeTag(callee)) {
+            .identifier => return std.mem.eql(u8, c.tokenText(c.tree.nodeMainToken(callee)), "Symbol"),
+            .member_expr => {
+                const md = c.tree.nodeData(callee);
+                if (c.nodeTag(md.lhs) != .identifier) return false;
+                if (!std.mem.eql(u8, c.tokenText(c.tree.nodeMainToken(md.lhs)), "Symbol")) return false;
+                const m = c.tokenText(md.rhs);
+                return std.mem.eql(u8, m, "for");
+            },
+            else => return false,
+        }
+    }
+
     fn stripQuotes(text: []const u8) []const u8 {
         if (text.len >= 2 and (text[0] == '"' or text[0] == '\'')) {
             if (text[text.len - 1] == text[0]) return text[1 .. text.len - 1];
@@ -946,6 +1019,7 @@ const Checker = struct {
             .boolean => try w.writeAll("boolean"),
             .bigint => try w.writeAll("bigint"),
             .symbol => try w.writeAll("symbol"),
+            .unique_symbol => try w.writeAll("unique symbol"),
             .object_keyword => try w.writeAll("object"),
             .bool_true => try w.writeAll("true"),
             .bool_false => try w.writeAll("false"),
@@ -1200,6 +1274,15 @@ const Checker = struct {
             .keyof_type => return c.keyofType(try c.typeFromTypeNode(d.lhs)),
             .typeof_type => return c.typeofEntity(d.lhs),
             .readonly_type => return c.typeFromTypeNode(d.lhs), // readonly T[] ~ T[]
+            .unique_symbol_type => {
+                // A `unique symbol` reached through the generic type path is in
+                // a disallowed position (param, return, alias, array, union,
+                // …). The allowed declaration sites (const variable, static
+                // readonly field, readonly interface/type-literal property)
+                // resolve it via `annTypeMaybeUnique` and never land here.
+                try c.diagFmt(1335, c.nodeSpan(node), "'unique symbol' types are not allowed here.", .{});
+                return c.uniqueSymType(node);
+            },
             .indexed_access_type => {
                 const obj = try c.typeFromTypeNode(d.lhs);
                 const idx = try c.typeFromTypeNode(d.rhs);
@@ -1708,7 +1791,10 @@ const Checker = struct {
                     var flags: u32 = 0;
                     if (md.rhs & ast.Flags.optional != 0) flags |= types.prop_flag_optional;
                     if (md.rhs & ast.Flags.readonly != 0) flags |= types.prop_flag_readonly;
-                    const ty = if (md.lhs != 0) try c.typeFromTypeNode(md.lhs) else types.any_type;
+                    const ty = if (md.lhs != 0)
+                        try c.annTypeMaybeUnique(md.lhs, md.rhs & ast.Flags.readonly != 0, 1330, c.tokSpan(c.tree.nodeMainToken(m)))
+                    else
+                        types.any_type;
                     try upsertProp(c.scratch(), &props, &prop_index, .{ .name = name, .ty = ty, .flags = flags });
                 },
                 .method_signature => {
@@ -2239,7 +2325,7 @@ const Checker = struct {
                 const e = c.tree.extraData(ast.DeclaratorFull, d.rhs);
                 var vt: TypeId = types.any_type;
                 if (e.type_ann != 0) {
-                    vt = try c.typeFromTypeNode(e.type_ann);
+                    vt = try c.annTypeMaybeUnique(e.type_ann, is_const, 1332, c.nodeSpan(d.lhs));
                 } else if (e.init != 0) {
                     const init_t = try c.checkExprCached(e.init, types.no_type);
                     vt = if (is_const) try c.ts.regular(init_t) else try c.widenLiteral(init_t);
@@ -2411,12 +2497,18 @@ const Checker = struct {
             switch (c.nodeTag(decl)) {
                 .class_field => {
                     const e = c.tree.extraData(ast.Field, d.lhs);
-                    if (e.type_ann != 0) return c.typeFromTypeNode(e.type_ann);
+                    if (e.type_ann != 0) {
+                        const ok = e.flags & ast.Flags.static != 0 and e.flags & ast.Flags.readonly != 0;
+                        return c.annTypeMaybeUnique(e.type_ann, ok, 1331, c.tokSpan(c.tree.nodeMainToken(decl)));
+                    }
                     if (e.init != 0) return c.widenLiteral(try c.checkExprCached(e.init, types.no_type));
                     return types.any_type;
                 },
                 .property_signature => {
-                    if (d.lhs != 0) return c.typeFromTypeNode(d.lhs);
+                    if (d.lhs != 0) {
+                        const ok = d.rhs & ast.Flags.readonly != 0;
+                        return c.annTypeMaybeUnique(d.lhs, ok, 1330, c.tokSpan(c.tree.nodeMainToken(decl)));
+                    }
                     return types.any_type;
                 },
                 .param, .param_full => {
@@ -3692,6 +3784,10 @@ const Checker = struct {
 
         switch (tk) {
             .boolean => return sk == .bool_true or sk == .bool_false,
+            // A `unique symbol` widens to `symbol`; the reverse and cross-decl
+            // (distinct `unique symbol`s) are caught by the `s == t` fast path
+            // failing above, so nothing else is assignable here.
+            .symbol => return sk == .unique_symbol,
             .object_keyword => return isNonPrimitiveKind(sk),
             .array => {
                 if (sk == .array) return c.isAssignable(c.ts.arrayElem(s), c.ts.arrayElem(t));
@@ -4714,7 +4810,19 @@ const Checker = struct {
             switch (c.nodeTag(prop)) {
                 .object_property => {
                     if (pd.lhs != 0 and c.nodeTag(pd.lhs) == .computed_name) {
-                        _ = try c.checkExprCached(c.tree.nodeData(pd.lhs).lhs, types.no_type);
+                        const kt = try c.checkExprCached(c.tree.nodeData(pd.lhs).lhs, types.no_type);
+                        // A `unique symbol` key names a real, nominally-keyed
+                        // property (`{ [k]: v }`); any other computed key stays
+                        // dynamic (no static member).
+                        if (try c.uniqueSymAtom(kt)) |key| {
+                            const pctx = try c.ctxPropType(rctx, ctx, key);
+                            var vt = try c.checkExprCached(pd.rhs, pctx);
+                            if (c.const_ctx) {
+                                vt = try c.ts.regularLiteral(vt);
+                            } else if (!try c.keepLiteral(vt, pctx)) vt = try c.widenLiteral(vt);
+                            try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = vt });
+                            continue;
+                        }
                         _ = try c.checkExprCached(pd.rhs, types.no_type);
                         continue; // computed names: no static member
                     }
@@ -4982,6 +5090,20 @@ const Checker = struct {
         const rk = c.ts.kind(r);
         if (rk == .any or rk == .err) return types.any_type;
         var result: TypeId = types.any_type;
+        // `o[k]` where `k` is a `unique symbol`: resolve the nominally-keyed
+        // property (see `uniqueSymAtom`).
+        if (try c.uniqueSymAtom(idx_t)) |key| {
+            if (try c.propOfType(r, key)) |p| {
+                result = if (p.optional()) try c.makeUnion2(p.ty, types.undefined_type) else p.ty;
+            } else {
+                try c.diagFmt(2339, c.nodeSpan(d.rhs), "Property '{s}' does not exist on type '{s}'.", .{
+                    c.atomText(key), try c.typeToString(obj_t),
+                });
+                result = types.error_type;
+            }
+            if (add_undefined) return c.makeUnion2(result, types.undefined_type);
+            return result;
+        }
         const ik = c.ts.kind(try c.ts.regularLiteral(idx_t));
         switch (ik) {
             .string_literal => {
@@ -6748,16 +6870,17 @@ const Checker = struct {
 
     fn checkVarDeclStatement(c: *Checker, node: Node) Error!void {
         const d = c.tree.nodeData(node);
+        const is_const = c.tree.tokens.tag(c.tree.nodeMainToken(node)) == .keyword_const;
         if (c.nodeTag(node) == .var_decl_one) {
-            try c.checkDeclarator(d.lhs);
+            try c.checkDeclarator(d.lhs, is_const);
         } else {
             for (c.tree.nodeRange(node)) |decl| {
-                if (decl != null_node) try c.checkDeclarator(decl);
+                if (decl != null_node) try c.checkDeclarator(decl, is_const);
             }
         }
     }
 
-    fn checkDeclarator(c: *Checker, decl: Node) Error!void {
+    fn checkDeclarator(c: *Checker, decl: Node, is_const: bool) Error!void {
         const d = c.tree.nodeData(decl);
         switch (c.nodeTag(decl)) {
             .declarator => {},
@@ -6768,15 +6891,24 @@ const Checker = struct {
             },
             .declarator_full => {
                 const e = c.tree.extraData(ast.DeclaratorFull, d.rhs);
-                const ann: TypeId = if (e.type_ann != 0) try c.typeFromTypeNode(e.type_ann) else types.no_type;
+                const name_span = if (c.nodeTag(d.lhs) == .identifier)
+                    c.tokSpan(c.tree.nodeMainToken(d.lhs))
+                else
+                    c.nodeSpan(d.lhs);
+                const ann: TypeId = if (e.type_ann != 0) try c.annTypeMaybeUnique(e.type_ann, is_const, 1332, name_span) else types.no_type;
+                // A `unique symbol` const accepts only a fresh `Symbol()` /
+                // `Symbol.for()` initializer; the assignability check (a plain
+                // `symbol` is not assignable to `unique symbol`) is skipped for
+                // that one form, matching tsc.
+                if (e.init != 0 and e.type_ann != 0 and c.nodeTag(e.type_ann) == .unique_symbol_type and c.isFreshSymbolCall(e.init)) {
+                    _ = try c.checkExprCached(e.init, ann);
+                    try c.materializePatternTypes(d.lhs);
+                    return;
+                }
                 if (e.init != 0) {
                     const it = try c.checkExprCached(e.init, ann);
                     if (ann != types.no_type and ann != types.error_type) {
-                        const span = if (c.nodeTag(d.lhs) == .identifier)
-                            c.tokSpan(c.tree.nodeMainToken(d.lhs))
-                        else
-                            c.nodeSpan(d.lhs);
-                        _ = try c.checkAssignable(it, ann, e.init, span);
+                        _ = try c.checkAssignable(it, ann, e.init, name_span);
                     }
                 }
                 try c.materializePatternTypes(d.lhs);
@@ -7408,7 +7540,16 @@ const Checker = struct {
                     else
                         this_t;
                     var ann: TypeId = types.no_type;
-                    if (e.type_ann != 0) ann = try c.typeFromTypeNode(e.type_ann);
+                    if (e.type_ann != 0) {
+                        const ok = is_static and e.flags & ast.Flags.readonly != 0;
+                        ann = try c.annTypeMaybeUnique(e.type_ann, ok, 1331, c.tokSpan(c.tree.nodeMainToken(member)));
+                    }
+                    // A `unique symbol` static-readonly field, like a const,
+                    // takes only a fresh `Symbol()` initializer without TS2322.
+                    if (e.type_ann != 0 and c.nodeTag(e.type_ann) == .unique_symbol_type and e.init != 0 and c.isFreshSymbolCall(e.init)) {
+                        _ = try c.checkExprCached(e.init, ann);
+                        continue;
+                    }
                     if (e.init != 0) {
                         const it = try c.checkExprCached(e.init, ann);
                         if (ann != types.no_type and ann != types.error_type) {

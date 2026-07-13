@@ -749,16 +749,24 @@ per item:
   flag-set ⟺ words-present invariant in `makeFunctionPred`; unit test in
   `types.zig`. Zero benchmark regression (multi corpus: wall 0.02 s, RSS
   ~52.8 MB, both flat vs base).
-- **`unique symbol` annotations** (clean out-of-subset today; census 1.3% —
-  low, as the roadmap guessed). Parse
-  `unique symbol` in type position; enforce the position restriction
-  (only on `const` variables and `readonly static` members, TS1332
-  otherwise); give each `unique symbol` a *nominal* identity tied to its
-  declaration site so computed keys (`const k = Symbol(); { [k]: … }`)
-  and `obj[k]` access resolve by that identity. The `Symbol.iterator`
-  protocol already ships via *syntactic* `[Symbol.iterator]` recognition
-  (`ast.wellKnownSymbolKey`), so this is only needed for arbitrary
-  user-defined unique-symbol keys — low app-code frequency.
+- **`unique symbol` annotations** ✅ (census 1.3% — low, as guessed).
+  A new `.unique_symbol_type` leaf parses `unique symbol` in type position
+  (any other `unique T` stays out of subset). Each annotation site gets a
+  *nominal* identity (`types.unique_symbol`, keyed by a dense per-declaration
+  id via `Checker.uniqueSymType`) so a value reference, a computed key
+  (`const k: unique symbol = Symbol(); { [k]: … }`) and element access
+  (`o[k]`) all agree on a synthetic `__@u<id>` member atom. `unique symbol`
+  widens to `symbol` but two distinct declarations never unify; a const/
+  static-readonly initializer accepts only a fresh `Symbol()`/`Symbol.for()`
+  call (no TS2322). Position restriction matches tsc's **four** codes
+  (differential-tested, the roadmap's "TS1332 otherwise" was too coarse):
+  TS1332 non-`const` variable, TS1331 class field not `static readonly`,
+  TS1330 interface/type-literal property not `readonly`, TS1335 anywhere
+  else (param, return, alias, array, …). The `Symbol.iterator` protocol still
+  ships via *syntactic* `[Symbol.iterator]` recognition
+  (`ast.wellKnownSymbolKey`); this covers arbitrary user-defined keys.
+  Conformance 318 → 321 (`test/conformance/symbols/006–008`). Zero benchmark
+  drift (multi: wall 0.02 s, RSS ~52.5 MB, flat vs base).
 - **JSX polish (deferred bits).** (1) `-` in JSX names (`data-*`,
   `aria-*`) needs a JSX-identifier scan that spans `-` plus a rescan
   entry point (today `data`, `-`, `foo` lex as three tokens), and

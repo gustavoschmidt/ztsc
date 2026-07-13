@@ -3009,8 +3009,20 @@ const Parser = struct {
                 const operand = try p.parseTypeOperator();
                 return p.addNode(.{ .tag = .readonly_type, .main_token = kw, .data = .{ .lhs = operand, .rhs = 0 } });
             },
-            .keyword_unique, .keyword_infer => {
-                // unique symbol / infer T — out of subset.
+            .keyword_unique => {
+                // `unique symbol` (M14): a nominal symbol type. Any other
+                // `unique T` is out of subset.
+                if (p.peekTag(1) == .keyword_symbol) {
+                    const kw = try p.bump(); // `unique`
+                    _ = try p.bump(); // `symbol`
+                    return p.addNode(.{ .tag = .unique_symbol_type, .main_token = kw, .data = .{ .lhs = 0, .rhs = 0 } });
+                }
+                const start = try p.bump();
+                _ = try p.parseTypeOperator();
+                return p.unsupportedFrom(start);
+            },
+            .keyword_infer => {
+                // infer T — out of subset.
                 const start = try p.bump();
                 _ = try p.parseTypeOperator();
                 return p.unsupportedFrom(start);
@@ -4183,10 +4195,16 @@ test "unsupported: import= and export=" {
 
 test "unsupported: misc type-level constructs" {
     try expectDiagCount("type F = new () => Thing;", 1); // constructor type
-    try expectDiagCount("type U = unique symbol;", 1);
+    try expectDiagCount("type U = unique T;", 1); // `unique` non-symbol operand
     try expectDiagCount("interface I { (x: number): string; }", 1); // call signature
     try expectDiagCount("interface I { new (x: number): Thing; }", 1); // construct signature
     try expectDiagCount("type NT = [x: number, y: number];", 1); // named tuple members
+}
+
+test "unique symbol parses in subset" {
+    try expectDiagCount("const k: unique symbol = Symbol();", 0);
+    try expectDiagCount("let m: unique symbol;", 0); // position error is a checker concern
+    try expectDiagCount("declare const d: unique symbol;", 0);
 }
 
 test "type predicates parse cleanly" {

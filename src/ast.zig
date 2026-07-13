@@ -463,6 +463,10 @@ pub const Tag = enum(u8) {
     typeof_type,
     /// `readonly T` (type operator). lhs = operand.
     readonly_type,
+    /// `unique symbol` (type operator). main_token = `unique` keyword.
+    /// No data; nominal identity is resolved at the declaration site by the
+    /// checker (see `uniqueSymType`).
+    unique_symbol_type,
     /// `T[K]`. main_token = `[`; lhs = object type, rhs = index type.
     indexed_access_type,
     /// `(T)`. main_token = `(`; lhs = inner type.
@@ -765,6 +769,8 @@ pub const Ast = struct {
                 .jsx_text,
                 // import_type's lhs is the specifier *token*, not a node.
                 .import_type,
+                // `unique symbol` — a leaf type operator, no child nodes.
+                .unique_symbol_type,
                 => {},
 
                 // lhs only.
