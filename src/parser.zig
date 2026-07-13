@@ -457,12 +457,49 @@ const Parser = struct {
     }
 
     /// Build an `.unsupported` node spanning tokens `start_tok..last
-    /// consumed`, with the subset-boundary diagnostic.
+    /// consumed`, with the subset-boundary diagnostic. The covered construct
+    /// is classified from its first token (M13 census) and stored in `lhs`.
     fn unsupportedFrom(p: *Parser, start_tok: u32) PE!Node {
+        return p.unsupportedKindFrom(start_tok, p.classifyUnsupported(start_tok));
+    }
+
+    /// `unsupportedFrom` with an explicit construct kind — for the sites where
+    /// the construct is not inferable from its first token (a conditional type
+    /// starts at an ordinary type token, a named tuple member at its name).
+    fn unsupportedKindFrom(p: *Parser, start_tok: u32, kind: ast.UnsupportedKind) PE!Node {
         if (p.spec > 0) return error.Backtrack;
         const last = @max(start_tok, p.lastIdx());
         try p.errAtToken(.unsupported_syntax, start_tok);
-        return p.addNode(.{ .tag = .unsupported, .main_token = start_tok, .data = .{ .lhs = 0, .rhs = last } });
+        return p.addNode(.{ .tag = .unsupported, .main_token = start_tok, .data = .{ .lhs = @intFromEnum(kind), .rhs = last } });
+    }
+
+    /// Classify an out-of-subset construct from its first token, for the
+    /// census histogram. Coarse where two constructs share a leading token
+    /// (a construct signature `new (...)` and a constructor type both read as
+    /// `constructor type`); the callers that need a finer answer pass it
+    /// explicitly via `unsupportedKindFrom`.
+    fn classifyUnsupported(p: *Parser, start_tok: u32) ast.UnsupportedKind {
+        const n = p.tok_tags.items.len;
+        const t1: TokTag = if (start_tok + 1 < n) p.tokTagAt(start_tok + 1) else .eof;
+        const t2: TokTag = if (start_tok + 2 < n) p.tokTagAt(start_tok + 2) else .eof;
+        const t3: TokTag = if (start_tok + 3 < n) p.tokTagAt(start_tok + 3) else .eof;
+        return switch (p.tokTagAt(start_tok)) {
+            .at => .decorator,
+            .keyword_namespace, .keyword_module => .namespace_dotted,
+            .keyword_declare => .ambient_declare,
+            .keyword_static => .static_block,
+            .keyword_export => .export_equals,
+            .keyword_unique => .unique_symbol,
+            .keyword_infer => .infer_type,
+            .keyword_typeof => .import_type,
+            .template_head, .no_substitution_template_literal => .template_literal_type,
+            .l_bracket => .computed_member,
+            .l_paren, .lt => .call_or_construct_signature,
+            .keyword_new => if (t1 == .dot) .new_target else .constructor_type,
+            .keyword_import => if (isIdentLike(t1) and t2 == .eq) .import_equals else .import_type,
+            .l_brace => if (t1 == .l_bracket and isIdentLike(t2) and t3 == .keyword_in) .mapped_type else .unknown,
+            else => .unknown,
+        };
     }
 
     // --- classification helpers ------------------------------------------
@@ -2882,7 +2919,9 @@ const Parser = struct {
             _ = try p.parseType();
             _ = try p.expect(.colon, .expected_colon);
             _ = try p.parseType();
-            return p.unsupportedFrom(start_tok);
+            // `start_tok` is an ordinary type token, so classification can't
+            // recover this — the census's key M16a signal — pass it explicitly.
+            return p.unsupportedKindFrom(start_tok, .conditional_type);
         }
         return ty;
     }
@@ -3131,7 +3170,8 @@ const Parser = struct {
                 _ = try p.eat(.question);
                 _ = try p.bump(); // ':'
                 _ = try p.parseType();
-                try p.pushScratch(try p.unsupportedFrom(start));
+                // `start` is the member name identifier — not inferable.
+                try p.pushScratch(try p.unsupportedKindFrom(start, .named_tuple_member));
             } else {
                 var ty = try p.parseType();
                 if (p.curTag() == .question) {

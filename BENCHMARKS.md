@@ -434,6 +434,52 @@ with `@types`-heavy real inputs. A `(dir, spec)`-existence layer for the residua
 walk across *different* importer directories is a documented follow-up, gated on
 M13's census showing resolution still dominates after this memo.
 
+## 3.12 M13 — census over real `.d.ts` + real-world corpus
+
+Each `.unsupported` AST node records which construct it covers (classified at
+parse time, stored in the node's spare `lhs` slot — zero memory cost), so
+`--census` is a whole-tree scan that tallies out-of-subset syntax by construct.
+The point (ROADMAP M13): a *frequency* table over real code decides M14/M16
+order — spec order is not priority order.
+
+Real-world corpus: `bench/fetch_real.sh` vendors a pinned set of popular
+packages' published `.d.ts` (`npm pack`, gitignored like all corpora) —
+zod, hono, @types/node, @types/express, date-fns, chalk, @sinclair/typebox,
+ajv: **1693 `.d.ts`, ~77k lines**. ztsc parses+binds+checks the lot in
+**~0.03 s at ~53 MB RSS** (`--noLib --checkers=4`, median of 3), and totality
+holds — thousands of "unsupported syntax" diagnostics, zero crashes.
+(tsc/tsgo comparison pending their install here; the wall/RSS row lands with a
+tsc/tsgo-present environment.)
+
+Census over that corpus (2287 out-of-subset constructs; 449 of 1693 files carry
+any — the file count is inflated by date-fns' ~1k locale stubs):
+
+| construct | count | share | lands in |
+|---|---:|---:|---|
+| conditional type | 804 | 35.2% | M16a |
+| import() type | 482 | 21.1% | M14 |
+| infer | 331 | 14.5% | M16a |
+| call/construct signature | 237 | 10.4% | subset expansion |
+| mapped type | 160 | 7.0% | M16b |
+| computed member name | 92 | 4.0% | — |
+| constructor type | 54 | 2.4% | — |
+| template-literal type | 32 | 1.4% | M16c |
+| unique symbol | 30 | 1.3% | M14 |
+| import = require | 24 | 1.0% | — |
+| export = | 23 | 1.0% | — |
+| named tuple member | 7 | 0.3% | subset expansion |
+
+**Takeaways that steer the roadmap:** conditional types + `infer` together are
+**~50%** of everything out-of-subset — M16a is unambiguously the highest-value
+type-level milestone, exactly as the sequence assumed. **`import()` types (21%)
+are the surprise** — far more common in published `.d.ts` than their M14 billing
+suggested (packages lean on `typeof import("./x")` and `import("./y").T` to
+avoid top-level imports in declarations); they deserve to lead M14. Mapped +
+template-literal (M16b/c) are real but an order of magnitude rarer than
+conditionals, confirming M16a-first. `unique symbol` (1.3%) stays low-priority as
+the roadmap guessed. The census is now a standing tool: re-run
+`bench/fetch_real.sh census` on any package set.
+
 ---
 
 ## 4. Cross-checking correctness while benchmarking

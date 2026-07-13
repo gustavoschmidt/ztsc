@@ -100,6 +100,56 @@ pub const Data = struct {
     rhs: u32,
 };
 
+/// Which out-of-subset construct an `.unsupported` node covers. Stored in the
+/// node's `data.lhs` and read back by the M13 census (`--census`) to produce a
+/// by-construct frequency table over real code — the table that decides M14/M16
+/// implementation order. Kept coarse where two constructs are indistinguishable
+/// from the construct's first token (the parser classifies at one choke point,
+/// `unsupportedFrom`, with an explicit override only for conditional types).
+pub const UnsupportedKind = enum(u32) {
+    unknown,
+    conditional_type, // T extends U ? X : Y
+    mapped_type, // { [K in T]: V }
+    template_literal_type, // `a${T}b`
+    infer_type, // infer U
+    unique_symbol, // unique symbol
+    call_or_construct_signature, // interface call/construct signatures
+    constructor_type, // new (...) => T / abstract new
+    import_type, // import("m") / typeof import("m")
+    import_equals, // import x = require(...)
+    export_equals, // export = x
+    decorator, // @dec
+    namespace_dotted, // namespace A.B / module "x"
+    ambient_declare, // other `declare` forms
+    static_block, // static { ... }
+    new_target, // new.target
+    computed_member, // computed class/type member name
+    named_tuple_member, // [x: T] in a tuple
+
+    pub fn label(k: UnsupportedKind) []const u8 {
+        return switch (k) {
+            .unknown => "unknown/other",
+            .conditional_type => "conditional type",
+            .mapped_type => "mapped type",
+            .template_literal_type => "template-literal type",
+            .infer_type => "infer",
+            .unique_symbol => "unique symbol",
+            .call_or_construct_signature => "call/construct signature",
+            .constructor_type => "constructor type",
+            .import_type => "import() type",
+            .import_equals => "import = require",
+            .export_equals => "export =",
+            .decorator => "decorator",
+            .namespace_dotted => "dotted namespace / module name",
+            .ambient_declare => "other declare form",
+            .static_block => "static block",
+            .new_target => "new.target",
+            .computed_member => "computed member name",
+            .named_tuple_member => "named tuple member",
+        };
+    }
+};
+
 /// Node tags. Each tag documents its `main_token` and `data` layout.
 /// Legend: `lhs`/`rhs` hold a Node unless stated; `extra→T` means the field
 /// is an ExtraIndex of struct T; `range` means lhs..rhs is a SubRange of
@@ -134,7 +184,8 @@ pub const Tag = enum(u8) {
     /// but none could be parsed (a diagnostic always accompanies it).
     error_node,
     /// Out-of-subset construct, parsed over without understanding.
-    /// main_token = first token, data.rhs = last token (inclusive).
+    /// main_token = first token, data.rhs = last token (inclusive),
+    /// data.lhs = an `UnsupportedKind` (the construct, for the M13 census).
     unsupported,
 
     // --- expressions -------------------------------------------------------
@@ -530,6 +581,18 @@ pub const Ast = struct {
     }
     pub fn nodeData(a: *const Ast, node: Node) Data {
         return a.nodes.items(.data)[node];
+    }
+
+    /// The construct an `.unsupported` node covers (M13 census). Only valid on
+    /// `.unsupported` nodes; the kind is stored in `data.lhs`.
+    pub fn unsupportedKind(a: *const Ast, node: Node) UnsupportedKind {
+        return @enumFromInt(a.nodeData(node).lhs);
+    }
+
+    /// Number of nodes (node indices `0..nodeCount` are valid). For whole-tree
+    /// scans such as the M13 census.
+    pub fn nodeCount(a: *const Ast) usize {
+        return a.nodes.len;
     }
 
     /// Read a fixed-shape extra struct at `index` (all fields u32).

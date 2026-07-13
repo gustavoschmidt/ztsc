@@ -66,6 +66,7 @@ const usage =
     \\  --checkers=N           number of checker instances (default: min(4, CPUs))
     \\  --repeat=N             scan/parse/bind each file N times (benchmark aid)
     \\  --no-resolve-cache     disable the module-resolution memo (benchmark aid)
+    \\  --census               tally out-of-subset constructs by frequency
     \\  -h, --help             print this help and exit
     \\  --version              print version and exit
     \\
@@ -105,6 +106,9 @@ const Cli = struct {
     /// resolution-cache benchmark; resolution then re-walks node_modules per
     /// importer. Diagnostics are identical either way.
     no_resolve_cache: bool = false,
+    /// Print a by-construct histogram of out-of-subset syntax (M13 census) —
+    /// the frequency table that prioritizes M14/M16 feature work.
+    census: bool = false,
     /// null = auto (pretty iff stderr is a TTY).
     pretty: ?bool = null,
     project: ?[]const u8 = null,
@@ -979,6 +983,10 @@ pub fn main(init: std.process.Init) !void {
         parse_diags, bind_diags, link_diags,  check_diags, n_workers,    n_checkers,
     });
 
+    if (cli.census) {
+        try printCensus(out, trees.items, n_files, parse_diags, bind_diags, check_diags, total_lines);
+    }
+
     if (cli.timing) {
         const total_ms = nsToMs(total_ns);
         const scanned_lines = @as(f64, @floatFromInt(total_lines * cli.repeat));
@@ -1154,6 +1162,64 @@ fn permuteInPlace(comptime T: type, arena: std.mem.Allocator, items: []T, order:
     for (order, 0..) |old, k| items[k] = copy[old];
 }
 
+/// M13 census: a by-construct histogram of out-of-subset syntax across every
+/// loaded file, sorted most-frequent first — the table that prioritizes
+/// M14/M16 feature work over spec order. Each `.unsupported` AST node carries
+/// its construct kind (classified at parse time), so this is a cheap whole-tree
+/// scan, no re-parse.
+fn printCensus(
+    out: *Io.Writer,
+    trees: []const ?*Ast,
+    n_files: usize,
+    parse_diags: usize,
+    bind_diags: usize,
+    check_diags: usize,
+    total_lines: usize,
+) !void {
+    const Kind = ztsc.ast.UnsupportedKind;
+    const nkinds = @typeInfo(Kind).@"enum".fields.len;
+    var counts = [_]u64{0} ** nkinds;
+    var files_with: usize = 0;
+    var total: u64 = 0;
+    for (trees) |maybe_tree| {
+        const tree = maybe_tree orelse continue;
+        var file_has = false;
+        var i: u32 = 0;
+        const nc: u32 = @intCast(tree.nodeCount());
+        while (i < nc) : (i += 1) {
+            if (tree.nodeTag(i) == .unsupported) {
+                counts[@intFromEnum(tree.unsupportedKind(i))] += 1;
+                total += 1;
+                file_has = true;
+            }
+        }
+        if (file_has) files_with += 1;
+    }
+
+    try out.print("\n--census\n", .{});
+    try out.print("  files: {d} scanned ({d} lines), {d} with out-of-subset syntax\n", .{ n_files, total_lines, files_with });
+    try out.print("  diagnostics: {d} parse, {d} bind, {d} check\n", .{ parse_diags, bind_diags, check_diags });
+    try out.print("  out-of-subset constructs: {d} total\n", .{total});
+
+    // Sort kind indices by descending count for the priority table.
+    var order: [nkinds]usize = undefined;
+    for (0..nkinds) |k| order[k] = k;
+    std.mem.sort(usize, &order, @as(*const [nkinds]u64, &counts), struct {
+        fn desc(c: *const [nkinds]u64, a: usize, b: usize) bool {
+            return c[a] > c[b];
+        }
+    }.desc);
+
+    try out.print("  {s:<32} {s:>9} {s:>7}\n", .{ "construct", "count", "share" });
+    for (order) |k| {
+        if (counts[k] == 0) continue;
+        const kind: Kind = @enumFromInt(k);
+        const share = @as(f64, @floatFromInt(counts[k])) * 100.0 /
+            @as(f64, @floatFromInt(if (total == 0) 1 else total));
+        try out.print("  {s:<32} {d:>9} {d:>6.1}%\n", .{ kind.label(), counts[k], share });
+    }
+}
+
 fn printPhase(out: *Io.Writer, name: []const u8, ns: u64, lines: f64, bytes: f64) !void {
     const s = @as(f64, @floatFromInt(ns)) / std.time.ns_per_s;
     const lines_per_s: f64 = if (s > 0 and lines > 0) lines / s else 0;
@@ -1291,6 +1357,8 @@ fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8, bad_arg: *[]c
             cli.no_lib = true;
         } else if (std.mem.eql(u8, arg, "--no-resolve-cache")) {
             cli.no_resolve_cache = true;
+        } else if (std.mem.eql(u8, arg, "--census")) {
+            cli.census = true;
         } else if (std.mem.eql(u8, arg, "--pretty")) {
             cli.pretty = true;
         } else if (std.mem.startsWith(u8, arg, "--pretty=")) {

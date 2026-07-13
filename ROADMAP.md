@@ -609,25 +609,35 @@ BENCHMARKS.md.
 
 Everything here needs real code, which M11 finally makes checkable.
 
-> **Status (2026-07-13): resolution cache DONE.** The `(importer_dir, spec)`
-> memo + negative cache landed first (it is the one piece that needs no network
-> / real-corpus fetch): `modules.ResolveCache`, wired into both discovery
-> drivers, with an `fs_probes` syscall counter surfaced on `--timing` and a
-> `--no-resolve-cache` before/after switch. New **deps** benchmark corpus
-> (`bench/gen_corpus.js`) drives it — resolution syscalls **2160 → 144 (−93%)**,
-> byte-identical output, conformance 313/313, no wall/RSS regression
-> (BENCHMARKS §3.11). The directory-existence layer for the residual
-> cross-directory walk is deferred pending the census. **Still open:** the
-> census tool and the ~500k-LOC real-world corpus (both need real npm packages /
-> repos to fetch).
+> **Status (2026-07-13): M13 DONE.** All three pieces landed.
+> **(1) Resolution cache** — `modules.ResolveCache` (`(importer_dir, spec)` memo
+> + negative cache), wired into both discovery drivers, `fs_probes` counter on
+> `--timing`, `--no-resolve-cache` before/after switch, new **deps** benchmark
+> corpus: resolution syscalls **2160 → 144 (−93%)**, byte-identical, no wall/RSS
+> regression (BENCHMARKS §3.11). Directory-existence layer for the residual
+> cross-directory walk deferred (census shows resolution is not a bottleneck).
+> **(2) Census tool** — each `.unsupported` node carries its construct kind
+> (`ast.UnsupportedKind`, classified at parse time); `--census` tallies a
+> by-construct frequency table; `printCensus` in main.zig. **(3) Real-world
+> corpus** — `bench/fetch_real.sh` vendors a pinned set of popular packages'
+> `.d.ts` (zod/hono/@types/node/typebox/ajv/…, 1693 files / ~77k lines,
+> gitignored); ztsc checks it in ~0.03 s / ~53 MB, totality holds. **Census
+> verdict (BENCHMARKS §3.12): conditional types + `infer` = ~50%** of all
+> out-of-subset constructs → M16a is the clear top type-level priority;
+> **`import()` types = 21%**, far more common than their M14 billing → they
+> should lead M14; mapped/template an order of magnitude rarer (M16a-first
+> confirmed); `unique symbol` stays low. tsc/tsgo wall/RSS comparison pending
+> those tools on the bench host.
 
-- **Census tool**: parse the top few hundred npm packages + real Bun/Node
+- **Census tool. ✅ DONE (2026-07-13).** parse the top few hundred npm packages +
+  real Bun/Node
   repos (Elysia, Hono, Zod, Drizzle apps); count which unsupported
   constructs block parse/bind/check, by frequency. The output table
   decides M14/M16 implementation order — spec order is not the priority
   order.
-- The long-deferred **~500k-LOC real-world corpus** lands (real code is
-  checkable once lib types + the global-symbol layer exist). It becomes
+- **~500k-LOC real-world corpus. ✅ DONE (initial set, 2026-07-13).** Vendored
+  via `bench/fetch_real.sh` (~77k lines of real `.d.ts` so far; grow the pinned
+  set toward 500k as more packages are checkable). It becomes
   the standing benchmark corpus alongside the synthetic ones.
 - **Resolution cache. ✅ DONE (2026-07-13).** Resolution work is deduped per
   resolved *file*
@@ -649,9 +659,21 @@ Everything here needs real code, which M11 finally makes checkable.
 ### M14 — Semantic breadth: the remainder
 
 What's left of the breadth work after M10 (history §4) and M11, in
-census order once M13's table exists. Complexity notes per item:
+census order now that M13's table exists (BENCHMARKS §3.12). Complexity notes
+per item:
 
-- **`unique symbol` annotations** (clean out-of-subset today). Parse
+- **`import()` types (`import("m").T`, `typeof import("m")`) — census-elevated,
+  do first.** The M13 census found these at **21%** of all out-of-subset
+  constructs — the second-most-common after conditional types, far above their
+  original (unlisted) priority. Published `.d.ts` lean on them to reference a
+  module's type without a top-level import. Parse the type form (nodes are
+  already produced-then-discarded, parser.zig), resolve the specifier through
+  the existing module-resolution path (M13 memo), and index into the resolved
+  module's export types; `typeof import` yields the module's value-namespace
+  type. No new type-level machinery — it is resolution + property access, which
+  is why it slots into M14 rather than M16.
+- **`unique symbol` annotations** (clean out-of-subset today; census 1.3% —
+  low, as the roadmap guessed). Parse
   `unique symbol` in type position; enforce the position restriction
   (only on `const` variables and `readonly static` members, TS1332
   otherwise); give each `unique symbol` a *nominal* identity tied to its
