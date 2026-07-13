@@ -331,6 +331,10 @@ const Checker = struct {
     fn_ctx: ?FnCtx = null,
     /// `this` type inside class methods (0 = any).
     this_type: TypeId = 0,
+    /// Set once any method declares a polymorphic `this` return; gates the
+    /// per-property-access `this`-substitution walk so codebases without
+    /// `this` types pay nothing.
+    has_this_types: bool = false,
     inst_depth: u32 = 0,
     /// Set while checking the operand of an `expr as const` const
     /// assertion: object/array literals produce readonly, non-widened,
@@ -1150,6 +1154,7 @@ const Checker = struct {
             .type_param => try w.print("{s}", .{c.symbolName(s.typeParamSymbol(t))}),
             .class_value => try w.print("typeof {s}", .{c.symbolName(s.classSymbol(t))}),
             .enum_type => try w.print("{s}", .{c.symbolName(s.enumSymbol(t))}),
+            .this_type => try w.writeAll("this"),
         }
     }
 
@@ -1918,8 +1923,21 @@ const Checker = struct {
         defer params.deinit(c.scratch());
         const param_nodes = c.tree.extraRange(proto.params_start, proto.params_end);
         var pi: u32 = 0;
+        // A leading `this` parameter is a receiver *annotation*, not a real
+        // parameter: excluded from the param list (so it never counts toward
+        // arity) and stored on the signature for the receiver check / body.
+        var this_ty: TypeId = 0;
+        var seen_param = false;
         for (param_nodes) |pn| {
             if (pn == null_node) continue;
+            if (!seen_param) {
+                seen_param = true;
+                if (c.thisParamAnn(pn)) |ann_node| {
+                    this_ty = if (ann_node != 0) try c.typeFromTypeNode(ann_node) else types.any_type;
+                    if (this_ty == types.no_type) this_ty = types.any_type;
+                    continue;
+                }
+            }
             const p = try c.paramInfo(pn, pi, ctx_sig, report_implicit);
             try params.append(c.scratch(), p);
             // Pin the parameter symbol's type so body checking sees the
@@ -1943,6 +1961,13 @@ const Checker = struct {
             const p = try c.predicateFromNode(proto.return_type, params.items);
             pred = p;
             ret = if (p.asserts) types.void_type else types.boolean_type;
+        } else if (proto.return_type != 0 and c.nodeTag(proto.return_type) == .this_expr and
+            is_method and c.ts.kind(c.this_type) == .ref)
+        {
+            // Polymorphic `this` return (`foo(): this`). Kept as a marker so a
+            // call through a subclass receiver types as the subclass.
+            ret = try c.ts.makeThisType(c.this_type);
+            c.has_this_types = true;
         } else if (proto.return_type != 0) {
             ret = try c.typeFromTypeNode(proto.return_type);
         } else if (is_async and !is_generator) {
@@ -1977,9 +2002,25 @@ const Checker = struct {
             ret = types.any_type; // overload signature without annotation
         }
 
-        const sig = try c.ts.makeFunctionPred(params.items, ret, tps.items, if (is_method) types.fn_flag_method else 0, pred);
+        const sig = try c.ts.makeFunctionThis(params.items, ret, tps.items, if (is_method) types.fn_flag_method else 0, pred, this_ty);
         try c.sig_cache.put(c.ca(), c.nodeKey(node), .{ .ty = sig, .ctx = ctx_sig });
         return sig;
+    }
+
+    /// If `pn` is a leading `this` parameter (`this: T`), return its type
+    /// annotation node (0 when unannotated); otherwise null.
+    fn thisParamAnn(c: *Checker, pn: Node) ?Node {
+        const d = c.tree.nodeData(pn);
+        const name_node: Node = switch (c.nodeTag(pn)) {
+            .param, .param_full => d.lhs,
+            else => pn,
+        };
+        if (name_node == 0 or c.nodeTag(name_node) != .this_expr) return null;
+        return switch (c.nodeTag(pn)) {
+            .param => d.rhs,
+            .param_full => c.tree.extraData(ast.ParamFull, d.rhs).type_ann,
+            else => 0,
+        };
     }
 
     /// Resolve a `.type_predicate` return-type node into a `Predicate`:
@@ -2577,7 +2618,9 @@ const Checker = struct {
 
     /// Resolve `.ref` chains to a structural type (object/function/...).
     fn resolveStructural(c: *Checker, t0: TypeId) Error!TypeId {
-        var t = t0;
+        // A polymorphic `this` type has the apparent structure of its home
+        // class instance.
+        var t = if (c.ts.kind(t0) == .this_type) c.ts.thisTypeInstance(t0) else t0;
         var i: u32 = 0;
         while (c.ts.kind(t) == .ref) : (i += 1) {
             if (i > 16) return types.error_type;
@@ -2668,6 +2711,18 @@ const Checker = struct {
     fn interfaceConstituentObject(c: *Checker, sym: SymbolId) Error!TypeId {
         const saved_ctx = c.enterSymFile(sym);
         defer c.restoreCtx(saved_ctx);
+        // `this` in a member type node refers to this interface's generic
+        // instance (polymorphic `this` return, `this` property/param types).
+        const saved_this = c.this_type;
+        defer c.this_type = saved_this;
+        {
+            var tps: std.ArrayList(TypeParamInfo) = .empty;
+            defer tps.deinit(c.scratch());
+            try c.typeParamsOf(sym, &tps);
+            const args = try c.scratch().alloc(TypeId, tps.items.len);
+            for (tps.items, 0..) |tp, i| args[i] = try c.ts.makeTypeParam(tp.sym);
+            c.this_type = try c.ts.makeRef(sym, args);
+        }
 
         var all_members: std.ArrayList(Node) = .empty;
         defer all_members.deinit(c.scratch());
@@ -2739,6 +2794,21 @@ const Checker = struct {
         try c.class_inst_generic.put(c.ca(), sym, types.no_type);
         const saved_ctx = c.enterSymFile(sym);
         defer c.restoreCtx(saved_ctx);
+        // `this` inside member type nodes (a `foo(): this` return, a `x: this`
+        // property, a `this` parameter) refers to this class's generic
+        // instance. Set it here so member signatures pick up the polymorphic
+        // `this` marker even when they are first evaluated through instance
+        // expansion (before `checkClass`).
+        const saved_this = c.this_type;
+        defer c.this_type = saved_this;
+        {
+            var tps: std.ArrayList(TypeParamInfo) = .empty;
+            defer tps.deinit(c.scratch());
+            try c.typeParamsOf(sym, &tps);
+            const args = try c.scratch().alloc(TypeId, tps.items.len);
+            for (tps.items, 0..) |tp, i| args[i] = try c.ts.makeTypeParam(tp.sym);
+            c.this_type = try c.ts.makeRef(sym, args);
+        }
         var props: std.ArrayList(types.Prop) = .empty;
         defer props.deinit(c.scratch());
         var result: TypeId = types.empty_object_type;
@@ -3360,7 +3430,10 @@ const Checker = struct {
                 for (tps) |tp| {
                     if (tpLookup(map, tp) == null) try kept.append(c.scratch(), tp);
                 }
-                return s.makeFunction(params.items, ret, kept.items, s.fnFlags(t));
+                // Predicates are dropped on instantiation (prior behavior); the
+                // `this` type is preserved and instantiated.
+                const this_ty = s.fnThisType(t);
+                return s.makeFunctionThis(params.items, ret, kept.items, s.fnFlags(t), null, if (this_ty != 0) try c.instantiate(this_ty, map) else 0);
             },
             .ref => {
                 var args: std.ArrayList(TypeId) = .empty;
@@ -3370,6 +3443,102 @@ const Checker = struct {
             },
             else => return t,
         }
+    }
+
+    /// Replace every polymorphic `this` marker in `t` with `repl` (the concrete
+    /// receiver at a property access). Gated by `has_this_types`, so it is a
+    /// no-op cost for programs that never declare a `this`-return.
+    fn substThis(c: *Checker, t: TypeId, repl: TypeId) Error!TypeId {
+        if (!c.has_this_types) return t;
+        if (!c.containsThisType(t)) return t;
+        if (c.inst_depth > max_instantiation_depth) return types.error_type;
+        c.inst_depth += 1;
+        defer c.inst_depth -= 1;
+        const s = &c.ts;
+        switch (s.kind(t)) {
+            .this_type => return repl,
+            .union_type => {
+                var parts: std.ArrayList(TypeId) = .empty;
+                defer parts.deinit(c.scratch());
+                for (try c.memberList(t)) |m| try parts.append(c.scratch(), try c.substThis(m, repl));
+                return s.makeUnion(c.scratch(), parts.items);
+            },
+            .intersection => {
+                var parts: std.ArrayList(TypeId) = .empty;
+                defer parts.deinit(c.scratch());
+                for (try c.memberList(t)) |m| try parts.append(c.scratch(), try c.substThis(m, repl));
+                return s.makeIntersection(c.scratch(), parts.items);
+            },
+            .overloads => {
+                var parts: std.ArrayList(TypeId) = .empty;
+                defer parts.deinit(c.scratch());
+                for (try c.memberList(t)) |m| try parts.append(c.scratch(), try c.substThis(m, repl));
+                return s.makeOverloads(parts.items);
+            },
+            .array => return s.makeArray(try c.substThis(s.arrayElem(t), repl)),
+            .tuple => {
+                var elems: std.ArrayList(types.TupleElem) = .empty;
+                defer elems.deinit(c.scratch());
+                for (0..s.tupleLen(t)) |i| {
+                    const e = s.tupleElem(t, @intCast(i));
+                    try elems.append(c.scratch(), .{ .ty = try c.substThis(e.ty, repl), .flags = e.flags });
+                }
+                return s.makeTuple(elems.items);
+            },
+            .function => {
+                var params: std.ArrayList(types.Param) = .empty;
+                defer params.deinit(c.scratch());
+                for (0..s.fnParamCount(t)) |i| {
+                    const p = s.fnParam(t, @intCast(i));
+                    try params.append(c.scratch(), .{ .name = p.name, .ty = try c.substThis(p.ty, repl), .flags = p.flags });
+                }
+                const ret = try c.substThis(s.fnReturn(t), repl);
+                const this_ty = s.fnThisType(t);
+                const pred: ?types.Predicate = if (s.fnHasPredicate(t)) s.fnPredicate(t) else null;
+                return s.makeFunctionThis(params.items, ret, s.fnTypeParams(t), s.fnFlags(t), pred, this_ty);
+            },
+            .ref => {
+                var args: std.ArrayList(TypeId) = .empty;
+                defer args.deinit(c.scratch());
+                for (try c.refArgsList(t)) |a| try args.append(c.scratch(), try c.substThis(a, repl));
+                return s.makeRef(s.refSymbol(t), args.items);
+            },
+            else => return t,
+        }
+    }
+
+    fn containsThisType(c: *Checker, t: TypeId) bool {
+        const s = &c.ts;
+        return switch (s.kind(t)) {
+            .this_type => true,
+            .array => c.containsThisType(s.arrayElem(t)),
+            .union_type, .intersection, .overloads => blk: {
+                for (s.members(t)) |m| {
+                    if (c.containsThisType(m)) break :blk true;
+                }
+                break :blk false;
+            },
+            .tuple => blk: {
+                for (0..s.tupleLen(t)) |i| {
+                    if (c.containsThisType(s.tupleElem(t, @intCast(i)).ty)) break :blk true;
+                }
+                break :blk false;
+            },
+            .function => blk: {
+                if (c.containsThisType(s.fnReturn(t))) break :blk true;
+                for (0..s.fnParamCount(t)) |i| {
+                    if (c.containsThisType(s.fnParam(t, @intCast(i)).ty)) break :blk true;
+                }
+                break :blk false;
+            },
+            .ref => blk: {
+                for (s.refArgs(t)) |a| {
+                    if (c.containsThisType(a)) break :blk true;
+                }
+                break :blk false;
+            },
+            else => false,
+        };
     }
 
     // =====================================================================
@@ -3690,8 +3859,13 @@ const Checker = struct {
     }
 
     fn isAssignable(c: *Checker, s0: TypeId, t0: TypeId) Error!bool {
-        var s = try c.ts.regularLiteral(s0);
-        var t = try c.ts.regularLiteral(t0);
+        // A polymorphic `this` relates through its apparent instance type. This
+        // is a subset simplification (true `this` is nominally narrower than
+        // the base), but sound for the fluent/builder patterns we support.
+        const s1 = if (c.ts.kind(s0) == .this_type) c.ts.thisTypeInstance(s0) else s0;
+        const t1 = if (c.ts.kind(t0) == .this_type) c.ts.thisTypeInstance(t0) else t0;
+        var s = try c.ts.regularLiteral(s1);
+        var t = try c.ts.regularLiteral(t1);
         s = try c.ts.regular(s);
         t = try c.ts.regular(t);
         if (s == t) return true;
@@ -5069,7 +5243,7 @@ const Checker = struct {
                         });
                         return types.error_type;
                     };
-                    var pt = p.ty;
+                    var pt = try c.substThis(p.ty, m);
                     if (p.optional()) pt = try c.makeUnion2(pt, types.undefined_type);
                     try parts.append(c.scratch(), pt);
                 }
@@ -5079,7 +5253,7 @@ const Checker = struct {
                 const r = try c.resolveStructural(t);
                 if (c.ts.kind(r) == .any or c.ts.kind(r) == .err) return types.any_type;
                 if (try c.propOfType(r, name)) |p| {
-                    var pt = p.ty;
+                    var pt = try c.substThis(p.ty, t);
                     if (p.optional()) pt = try c.makeUnion2(pt, types.undefined_type);
                     return pt;
                 }
@@ -5732,6 +5906,28 @@ const Checker = struct {
         return result;
     }
 
+    /// Receiver check for a signature with an explicit `this` parameter
+    /// (`f(this: T, …)`): the call's receiver must be assignable to `T`
+    /// (TS2684). A member call `obj.m()` uses `obj`'s type; a bare call uses
+    /// `void` (no receiver).
+    fn checkThisArg(c: *Checker, node: Node, sig: TypeId) Error!void {
+        const this_ty = c.ts.fnThisType(sig);
+        if (this_ty == 0) return;
+        const callee = c.callShape(node).callee;
+        var recv: TypeId = types.void_type;
+        switch (c.nodeTag(callee)) {
+            .member_expr, .optional_member_expr, .index_expr, .optional_index_expr => {
+                recv = try c.checkExprCached(c.tree.nodeData(callee).lhs, types.no_type);
+            },
+            else => {},
+        }
+        if (!try c.isAssignable(recv, this_ty)) {
+            try c.diagFmt(2684, c.nodeSpan(callee), "The 'this' context of type '{s}' is not assignable to method's 'this' of type '{s}'.", .{
+                try c.typeToString(recv), try c.typeToString(this_ty),
+            });
+        }
+    }
+
     fn countArgs(arg_nodes: []const Node) usize {
         var n: usize = 0;
         for (arg_nodes) |a| {
@@ -5755,6 +5951,7 @@ const Checker = struct {
         const nargs = countArgs(arg_nodes);
         if (sigs.len == 1) {
             const inst = try c.instantiateSigForCall(sigs[0], explicit_targs, arg_nodes, node);
+            if (instance_ret == types.no_type) try c.checkThisArg(node, inst);
             try c.checkCallArguments(node, inst, arg_nodes, true);
             return if (instance_ret != types.no_type) instance_ret else c.ts.fnReturn(inst);
         }
@@ -7239,11 +7436,18 @@ const Checker = struct {
         const proto = c.tree.extraData(ast.FnProto, proto_idx);
         const saved_scope = c.cur_scope;
         const saved_ctx = c.fn_ctx;
+        const saved_this = c.this_type;
         defer {
             c.cur_scope = saved_scope;
             c.fn_ctx = saved_ctx;
+            c.this_type = saved_this;
         }
         if (try c.scopeOf(node)) |s| c.cur_scope = s;
+        // An explicit `this` parameter types `this` inside the body.
+        if (c.ts.kind(sig) == .function) {
+            const tt = c.ts.fnThisType(sig);
+            if (tt != 0) c.this_type = tt;
+        }
         const is_async = proto.flags & ast.Flags.async != 0;
         const is_generator = proto.flags & ast.Flags.generator != 0;
         const ann: TypeId = if (proto.return_type != 0) try c.typeFromTypeNode(proto.return_type) else types.no_type;
@@ -7317,7 +7521,6 @@ const Checker = struct {
                 _ = try c.checkAssignable(eff_rt, eff_ann, body, c.nodeSpan(body));
             }
         }
-        _ = sig;
     }
 
     // --- syntactic reachability (2366/return-undefined inference) ---------

@@ -788,10 +788,25 @@ per item:
   (derive from `JSX.IntrinsicAttributes` — ztsc already matches tsc without it),
   and `JSX.ElementChildrenAttribute` children typing. (3)+(4) tie together and
   belong with the lib/@types story.
-- **`this`-typing and decorators** (low priority): polymorphic `this`
-  return types / `this` parameters, and (legacy/TC39) decorators. Both
-  are uncommon in the target app code and can trail the items above —
-  or slip past v0.0.1 if the census confirms they're rare.
+- **`this`-typing** ✅ (low frequency per census). Polymorphic `this` return
+  types (`foo(): this`) for classes **and** interfaces: a new `types.this_type`
+  marker (payload = home instance ref), emitted when a member's return
+  annotation is `this` and substituted with the concrete receiver at property
+  access (`substThis`, gated by a `has_this_types` flag so no-`this` codebases
+  pay nothing), so `sub.foo().subMethod()` fluent chains keep the subclass.
+  Explicit `this` **parameters** (`function f(this: T, x)`): a new
+  `fn_flag_this` + trailing `this` word on signatures (in `shapeWords` for
+  identity, invariant kept in lockstep like the predicate word), excluded from
+  arity (no false TS2554), typed inside the body, and checked at call sites
+  (TS2684 wrong receiver). Load-bearing detail: `c.this_type` is set during
+  instance expansion (`classInstanceGeneric`/`interfaceConstituentObject`), not
+  just `checkClass`, since member sigs materialize there. Conformance 323 → 327
+  (`classes/028_polymorphic_this`, `029_this_interface`, `calls/023_this_param_arity`,
+  `024_this_param_receiver`); flat benchmark. Deferred (rare): TS2684 on
+  overloaded free functions; generic method whose `this`-param mentions a class
+  type param.
+- **decorators** (low priority): (legacy/TC39) decorators — uncommon in target
+  app code; can slip past v0.0.1 if the census confirms they're rare.
 - **Tests**: conformance grows toward ~500 cases, every feature
   differential vs tsc. **Benchmarks**: regression gates — memory/wall
   budgets must not drift as semantics widen (held so far: `--noLib` hot

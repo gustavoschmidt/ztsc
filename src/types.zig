@@ -137,6 +137,12 @@ pub const Kind = enum(u8) {
     /// number assigned by the checker). Assignable only to itself and to
     /// `symbol`; two distinct `unique symbol` declarations never unify.
     unique_symbol,
+    /// Polymorphic `this` type (M14). a = the home class's generic instance
+    /// ref (its "apparent" type). Produced for a method's `foo(): this` return
+    /// annotation; substituted with the concrete receiver at property access,
+    /// so `sub.foo()` types as the subclass. resolveStructural/assignability
+    /// fall back to the stored instance ref.
+    this_type,
 };
 
 pub const obj_flag_fresh: u32 = 1;
@@ -153,6 +159,12 @@ pub const fn_flag_method: u32 = 1;
 /// When set, the payload has three trailing words after the params:
 /// [pred_flags, pred_param, pred_type]. pred_flags bit0 = asserts.
 pub const fn_flag_predicate: u32 = 2;
+/// The signature carries an explicit `this` parameter type (`f(this: T, ...)`).
+/// When set, one extra word (the `this` type) trails the params and any
+/// predicate words. The `this` parameter is excluded from the ordinary param
+/// list, so it never counts toward arity; it is used for the call-site
+/// receiver check (TS2684) and for typing `this` inside the body.
+pub const fn_flag_this: u32 = 4;
 pub const param_flag_optional: u32 = 1;
 pub const param_flag_rest: u32 = 2;
 pub const param_flag_initializer: u32 = 4;
@@ -368,6 +380,20 @@ pub const Store = struct {
         };
     }
 
+    /// The `this`-parameter type of a signature, or 0 if it has none.
+    pub fn fnThisType(s: *const Store, id: TypeId) TypeId {
+        if (s.kind(id) != .function or s.fnFlags(id) & fn_flag_this == 0) return 0;
+        const base = s.dataA(id);
+        const tpc = s.extra.items[base + 2];
+        const pred: u32 = if (s.extra.items[base] & fn_flag_predicate != 0) 3 else 0;
+        return s.extra.items[base + 3 + tpc + 3 * s.dataB(id) + pred];
+    }
+
+    /// The stored instance ref of a polymorphic `this` type.
+    pub fn thisTypeInstance(s: *const Store, id: TypeId) TypeId {
+        return s.dataA(id);
+    }
+
     pub fn refSymbol(s: *const Store, id: TypeId) u32 {
         return s.extra.items[s.dataA(id)];
     }
@@ -452,7 +478,11 @@ pub const Store = struct {
                 // so include them in the shape or two guards differing only in
                 // the predicate would hash-cons together.
                 const pred: u32 = if (s.extra.items[a] & fn_flag_predicate != 0) 3 else 0;
-                return s.extra.items[a .. a + 3 + tpc + 3 * b + pred];
+                // A `this`-parameter type (M14) is one trailing word after the
+                // predicate; part of the identity so two signatures differing
+                // only in the `this` type do not hash-cons together.
+                const thisw: u32 = if (s.extra.items[a] & fn_flag_this != 0) 1 else 0;
+                return s.extra.items[a .. a + 3 + tpc + 3 * b + pred + thisw];
             },
             .ref => return s.extra.items[a .. a + 1 + b],
             else => {
@@ -636,11 +666,25 @@ pub const Store = struct {
         flags0: u32,
         pred: ?Predicate,
     ) Error!TypeId {
+        return s.makeFunctionThis(params, ret, type_params, flags0, pred, 0);
+    }
+
+    pub fn makeFunctionThis(
+        s: *Store,
+        params: []const Param,
+        ret: TypeId,
+        type_params: []const u32,
+        flags0: u32,
+        pred: ?Predicate,
+        this_ty: TypeId,
+    ) Error!TypeId {
         // Invariant: the predicate flag is set exactly when predicate words are
         // appended. A caller may pass `flags0` copied from a predicate source
         // (e.g. signature instantiation) while supplying no predicate — clear
-        // the bit so it never claims words that are not there.
-        const flags = if (pred != null) flags0 | fn_flag_predicate else flags0 & ~fn_flag_predicate;
+        // the bit so it never claims words that are not there. The `this` flag
+        // is likewise kept in lockstep with the trailing `this` word.
+        var flags = if (pred != null) flags0 | fn_flag_predicate else flags0 & ~fn_flag_predicate;
+        flags = if (this_ty != 0) flags | fn_flag_this else flags & ~fn_flag_this;
         const start = s.pending.items.len;
         defer s.pending.items.len = start;
         try s.pending.append(s.alloc, flags);
@@ -657,7 +701,12 @@ pub const Store = struct {
             try s.pending.append(s.alloc, pr.param);
             try s.pending.append(s.alloc, pr.ty);
         }
+        if (this_ty != 0) try s.pending.append(s.alloc, this_ty);
         return s.internType(.function, s.pending.items[start..], @intCast(params.len));
+    }
+
+    pub fn makeThisType(s: *Store, instance_ref: TypeId) Error!TypeId {
+        return s.internType(.this_type, &.{ instance_ref, 0 }, 0);
     }
 
     pub fn makeOverloads(s: *Store, fns: []const TypeId) Error!TypeId {
