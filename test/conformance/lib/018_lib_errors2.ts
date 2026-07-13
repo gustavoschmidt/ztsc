@@ -1,0 +1,15 @@
+const nums: number[] = [1, 2, 3];
+const bad1: string = nums.find((x) => x > 1);
+const bad2: string = nums.some((x) => x > 0);
+nums.sort((a, b) => a > b);
+const m: Map<string, number> = new Map<string, number>();
+m.set("a", "notnum");
+const bad3: string = m.get("a");
+const bad4: number = Object.keys(m);
+const s: string = "hi";
+const bad5: number = s.padStart(3);
+const bad6: string = Number.isInteger(5);
+const st: Set<number> = new Set<number>();
+st.add("x");
+const d: Date = new Date();
+const bad7: string = d.getTime();

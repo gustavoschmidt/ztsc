@@ -225,6 +225,27 @@ sub-millisecond front-end time (one 132-line file: +947 tokens, +494 nodes,
 +84 checker types) — swamped by run-to-run scheduling variance and slated to
 vanish once M9.2 embeds the pre-parsed blob.
 
+## 3.7 M10-lib-grow — real ES-core surface
+
+Grew `src/lib/es.core.d.ts` (127 → 220 lines) to the common ES-core surface
+that stays in-subset: constructor-side globals (`Object.keys/values/entries`,
+`Array.isArray/of`, `Number.isInteger/parseInt/…`, `String.fromCharCode`,
+`Promise.resolve/reject/all`), more `Array`/`String` instance methods, and
+`Map<K,V>`/`Set<T>`/`Date` as `declare class` (construct signatures on a
+`var` are out of subset; `declare class` gives a working `new`). Found and
+fixed a real bug: merged value+type globals (`interface Object {}` +
+`declare var Object: {…}`) resolved the *value* to `any`, silently passing
+negative cases — `computeTypeOfSymbol` now skips non-declarator decls.
+Conformance **190 → 200** (10 new lib cases), differential clean vs tsc.
+`--noLib` path flat (medium 11.2 MB / 7 ms, multi 17.2 MB / 13 ms);
+lib-loaded front-end +~0.4 ms for the bigger file (M9.2 will absorb it).
+
+Documented in-subset gaps that now gate real-world fidelity (feed M11/M13):
+index-signature inference (`Array.from`), intersection/mapped-type returns
+(`Object.assign`/`freeze`), construct signatures on object types, `this`
+return types, and the `Symbol.iterator` iteration protocol (`for…of` over
+Map/Set, spread).
+
 ---
 
 ## 4. Cross-checking correctness while benchmarking
