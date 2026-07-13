@@ -182,6 +182,36 @@ const Parser = struct {
         return @intCast(p.tok_tags.items.len);
     }
 
+    /// Source text of the n-th lookahead token (not yet consumed).
+    fn laText(p: *Parser, n: usize) []const u8 {
+        std.debug.assert(n < max_la);
+        p.fill(n);
+        const t = p.la[n];
+        const end = scanner.tokenEnd(p.src, t.tag, t.start);
+        return p.src[t.start..end];
+    }
+
+    /// If positioned at a well-known-symbol computed name `[Symbol.<name>]`
+    /// (e.g. `[Symbol.iterator]`), consume the four tokens `[ Symbol . <name>`
+    /// plus the closing `]`, and return the `<name>` token index. The member
+    /// is then keyed by a synthetic atom (see `ast.wellKnownSymbolKey`); the
+    /// `Symbol.<name>` key expression itself is discarded (it has no runtime
+    /// meaning here). Returns null — consuming nothing — if the shape does not
+    /// match or `<name>` is a well-known symbol ztsc does not model.
+    fn eatWellKnownSymbolName(p: *Parser) Error!?u32 {
+        if (p.curTag() != .l_bracket) return null;
+        if (!isNameLike(p.peekTag(1)) or !std.mem.eql(u8, p.laText(1), "Symbol")) return null;
+        if (p.peekTag(2) != .dot) return null;
+        if (!isNameLike(p.peekTag(3))) return null;
+        if (ast.wellKnownSymbolKey(p.laText(3)) == null) return null;
+        _ = try p.bump(); // [
+        _ = try p.bump(); // Symbol
+        _ = try p.bump(); // .
+        const name_tok = try p.bump(); // <name>
+        _ = try p.eat(.r_bracket); // ] (best-effort; recovery handles malformed)
+        return name_tok;
+    }
+
     /// Index of the last consumed token (0 if none yet).
     fn lastIdx(p: *Parser) u32 {
         const n = p.tok_tags.items.len;
@@ -1395,12 +1425,19 @@ const Parser = struct {
                 if (isIdentLike(p.peekTag(1)) and p.peekTag(2) == .colon) {
                     return p.parseIndexSignatureAsClassMember(flags);
                 }
-                _ = try p.bump();
-                _ = try p.parseAssignExpr(.{});
-                _ = try p.eat(.r_bracket);
-                // Computed names are out of subset; skip the rest of the line.
-                p.skipToMemberEnd();
-                return p.unsupportedFrom(start_tok);
+                // Well-known-symbol key `[Symbol.iterator]`: keyed by a
+                // synthetic atom, then parsed as an ordinary method/field.
+                if (try p.eatWellKnownSymbolName()) |ntok| {
+                    name_tok = ntok;
+                    flags |= ast.Flags.computed;
+                } else {
+                    _ = try p.bump();
+                    _ = try p.parseAssignExpr(.{});
+                    _ = try p.eat(.r_bracket);
+                    // Other computed names are out of subset; skip the member.
+                    p.skipToMemberEnd();
+                    return p.unsupportedFrom(start_tok);
+                }
             },
             .string_literal, .numeric_literal, .private_identifier => name_tok = try p.bump(),
             else => {
@@ -2967,21 +3004,30 @@ const Parser = struct {
         }
 
         // Index signature `[k: K]: V`.
+        var name_tok: u32 = 0;
         if (p.curTag() == .l_bracket) {
             if (isIdentLike(p.peekTag(1)) and p.peekTag(2) == .colon) {
                 return p.parseIndexSignature(flags);
             }
-            // Computed property in a type — out of subset.
-            _ = try p.bump();
-            _ = try p.parseAssignExpr(.{});
-            _ = try p.eat(.r_bracket);
-            if (try p.eat(.colon) != null) _ = try p.parseType();
-            return p.unsupportedFrom(start_tok);
+            // Well-known-symbol key `[Symbol.iterator](): T` — keyed by a
+            // synthetic atom, then parsed as an ordinary member below.
+            if (try p.eatWellKnownSymbolName()) |ntok| {
+                name_tok = ntok;
+                flags |= ast.Flags.computed;
+            } else {
+                // Other computed properties in a type are out of subset.
+                _ = try p.bump();
+                _ = try p.parseAssignExpr(.{});
+                _ = try p.eat(.r_bracket);
+                if (try p.eat(.colon) != null) _ = try p.parseType();
+                return p.unsupportedFrom(start_tok);
+            }
         }
 
         // Property / method name.
-        var name_tok: u32 = 0;
-        if (isNameLike(p.curTag()) or p.curTag() == .string_literal or p.curTag() == .numeric_literal) {
+        if (name_tok != 0) {
+            // already set by the well-known-symbol path above
+        } else if (isNameLike(p.curTag()) or p.curTag() == .string_literal or p.curTag() == .numeric_literal) {
             name_tok = try p.bump();
         } else {
             try p.fail(.expected_type_member);
@@ -3874,8 +3920,14 @@ test "type predicates parse cleanly" {
 
 test "unsupported: class oddities" {
     try expectDiagCount("class A { static { init(); } }", 1);
-    try expectDiagCount("class B { [Symbol.iterator]() {} }", 1); // computed member name
+    try expectDiagCount("class B { [computeKey()]() {} }", 1); // computed member name (non-symbol)
     try expectDiagCount("x = new.target;", 1);
+}
+
+test "well-known symbol computed member is in subset" {
+    // `[Symbol.iterator]` methods parse cleanly (keyed by a synthetic atom).
+    try expectDiagCount("class C { [Symbol.iterator]() {} }", 0);
+    try expectDiagCount("interface I { [Symbol.iterator](): Iterator<number>; }", 0);
 }
 
 test "unsupported constructs still leave following code parsable" {

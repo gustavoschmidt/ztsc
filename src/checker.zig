@@ -324,6 +324,9 @@ const Checker = struct {
     atom_Generator: Atom = 0,
     atom_Iterator: Atom = 0,
     atom_IterableIterator: Atom = 0,
+    atom_sym_iterator: Atom = 0,
+    atom_next: Atom = 0,
+    atom_value: Atom = 0,
 
     const typeof_names = [8][]const u8{
         "string", "number", "bigint", "boolean", "symbol", "undefined", "object", "function",
@@ -390,6 +393,9 @@ const Checker = struct {
         c.atom_Generator = try c.atom("Generator");
         c.atom_Iterator = try c.atom("Iterator");
         c.atom_IterableIterator = try c.atom("IterableIterator");
+        c.atom_sym_iterator = try c.atom(ast.wellKnownSymbolKey("iterator").?);
+        c.atom_next = try c.atom("next");
+        c.atom_value = try c.atom("value");
         for (typeof_names, 0..) |n, i| c.typeof_atoms[i] = try c.atom(n);
         var tu: [8]TypeId = undefined;
         for (c.typeof_atoms, 0..) |a, i| tu[i] = try c.ts.makeStringLiteral(a, false);
@@ -600,6 +606,16 @@ const Checker = struct {
         const text = c.tokenText(tok);
         if (c.tree.tokens.tag(tok) == .string_literal) return c.atom(stripQuotes(text));
         return c.atom(text);
+    }
+
+    /// Member-name atom honoring a `[Symbol.iterator]` computed key (mirrors the
+    /// binder's `memberKey`): with the `computed` flag set, `tok` names the
+    /// well-known symbol and the member is keyed by a synthetic `__@name` atom.
+    fn memberKey(c: *Checker, tok: TokenIndex, flags: u32) Error!Atom {
+        if (flags & ast.Flags.computed != 0) {
+            if (ast.wellKnownSymbolKey(c.tokenText(tok))) |k| return c.atom(k);
+        }
+        return c.memberAtom(tok);
     }
 
     fn stripQuotes(text: []const u8) []const u8 {
@@ -1469,7 +1485,7 @@ const Checker = struct {
             const md = c.tree.nodeData(m);
             switch (c.nodeTag(m)) {
                 .property_signature => {
-                    const name = try c.memberAtom(c.tree.nodeMainToken(m));
+                    const name = try c.memberKey(c.tree.nodeMainToken(m), md.rhs);
                     var flags: u32 = 0;
                     if (md.rhs & ast.Flags.optional != 0) flags |= types.prop_flag_optional;
                     if (md.rhs & ast.Flags.readonly != 0) flags |= types.prop_flag_readonly;
@@ -1477,7 +1493,7 @@ const Checker = struct {
                     try upsertProp(c.scratch(), &props, &prop_index, .{ .name = name, .ty = ty, .flags = flags });
                 },
                 .method_signature => {
-                    const name = try c.memberAtom(c.tree.nodeMainToken(m));
+                    const name = try c.memberKey(c.tree.nodeMainToken(m), md.rhs);
                     // `get x(): T` / `set x(v: T)` accessor signatures: the
                     // property type is the getter return (or setter param).
                     const is_get = md.rhs & ast.Flags.get != 0;
@@ -4127,8 +4143,11 @@ const Checker = struct {
                         }
                     },
                     else => {
-                        try elem_types.append(c.scratch(), types.any_type);
-                        try tuple_elems.append(c.scratch(), .{ .ty = types.any_type });
+                        // Spread of a non-array iterable (`[...set]`, `[...map]`):
+                        // its element type via the `[Symbol.iterator]` protocol.
+                        const elem = (try c.iterationElementType(st)) orelse types.any_type;
+                        try elem_types.append(c.scratch(), elem);
+                        try tuple_elems.append(c.scratch(), .{ .ty = try c.ts.makeArray(elem), .flags = types.elem_flag_rest });
                     },
                 }
                 i += 1;
@@ -6454,30 +6473,78 @@ const Checker = struct {
         }
     }
 
-    /// Element type of `for (x of expr)`: arrays, tuples, strings only
-    /// (documented; no Symbol.iterator machinery).
+    /// Element type of `for (x of expr)`, diagnosing TS2488 when `expr` is not
+    /// iterable. Arrays/tuples/strings resolve directly; everything else goes
+    /// through the `[Symbol.iterator]()` protocol (`iterationElementType`).
     fn forOfElementType(c: *Checker, rt: TypeId, right_node: Node) Error!TypeId {
+        if (try c.iterationElementType(rt)) |e| return e;
+        if (right_node != 0) {
+            try c.diagFmt(2488, c.nodeSpan(right_node), "Type '{s}' must have a '[Symbol.iterator]()' method that returns an iterator.", .{try c.typeToString(rt)});
+        }
+        return types.any_type;
+    }
+
+    /// The type produced by iterating `rt` (the `x` in `for (x of rt)` and the
+    /// element of `[...rt]`), or null when `rt` is not iterable. Handles
+    /// arrays/tuples/strings directly, `Generator`/`Iterator`/`IterableIterator`
+    /// refs, and the general `[Symbol.iterator]() -> { next(): { value } }`
+    /// protocol (so `Map`/`Set` and user-defined iterables work).
+    fn iterationElementType(c: *Checker, rt: TypeId) Error!?TypeId {
         const r = try c.resolveStructural(rt);
         switch (c.ts.kind(r)) {
             .array => return c.ts.arrayElem(r),
-            .tuple => return c.numberIndexType(r),
+            .tuple => return try c.numberIndexType(r),
             .string, .string_literal => return types.string_type,
-            .any, .err, .none => return types.any_type,
+            .any, .err => return types.any_type,
             .union_type => {
                 var parts: std.ArrayList(TypeId) = .empty;
                 defer parts.deinit(c.scratch());
                 for (try c.memberList(r)) |m| {
-                    try parts.append(c.scratch(), try c.forOfElementType(m, 0));
+                    const e = (try c.iterationElementType(m)) orelse return null;
+                    try parts.append(c.scratch(), e);
                 }
-                return c.ts.makeUnion(c.scratch(), parts.items);
+                return try c.ts.makeUnion(c.scratch(), parts.items);
             },
-            else => {
-                if (right_node != 0) {
-                    try c.diagFmt(2488, c.nodeSpan(right_node), "Type '{s}' must have a '[Symbol.iterator]()' method that returns an iterator.", .{try c.typeToString(rt)});
-                }
-                return types.any_type;
-            },
+            else => {},
         }
+        // `[Symbol.iterator](): Iterator<E>` protocol.
+        if (try c.propOfType(r, c.atom_sym_iterator)) |p| {
+            const ret = try c.callableReturn(p.ty);
+            if (ret != 0) {
+                // Lib iterables return `IterableIterator<E>`/`Iterator<E>`.
+                const y2 = c.generatorYieldType(ret);
+                if (y2 != 0) return y2;
+                // General protocol: the iterator's `next()` result `value`.
+                if (try c.iteratorNextValue(ret)) |v| return v;
+            }
+        }
+        return null;
+    }
+
+    /// Return type of a callable prop (`.function` or the first `.overloads`
+    /// signature); 0 if `ty` is not callable.
+    fn callableReturn(c: *Checker, ty: TypeId) Error!TypeId {
+        switch (c.ts.kind(ty)) {
+            .function => return c.ts.fnReturn(ty),
+            .overloads => {
+                const sigs = try c.memberList(ty);
+                return if (sigs.len > 0) c.ts.fnReturn(sigs[0]) else 0;
+            },
+            else => return 0,
+        }
+    }
+
+    /// The `value` type of an iterator's `next()` result, i.e. the yield type
+    /// of an arbitrary (non-lib-named) iterator object. Null if `iter` has no
+    /// `next(): { value }` shape.
+    fn iteratorNextValue(c: *Checker, iter: TypeId) Error!?TypeId {
+        const r = try c.resolveStructural(iter);
+        const nextp = (try c.propOfType(r, c.atom_next)) orelse return null;
+        const ret = try c.callableReturn(nextp.ty);
+        if (ret == 0) return null;
+        const rr = try c.resolveStructural(ret);
+        const valp = (try c.propOfType(rr, c.atom_value)) orelse return null;
+        return valp.ty;
     }
 
     fn checkSwitch(c: *Checker, node: Node) Error!void {

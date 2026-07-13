@@ -838,6 +838,17 @@ const Binder = struct {
         return b.atomOf(text);
     }
 
+    /// Member-name atom honoring a `[Symbol.iterator]` computed key: when the
+    /// `computed` flag is set, `tok` is the well-known-symbol property name and
+    /// the member is keyed by a synthetic `__@name` atom. (`wellKnownSymbolKey`
+    /// returns a static string, so it is a safe `atom_cache` key.)
+    fn memberNameKey(b: *Binder, tok: TokenIndex, flags: u32) Error!Atom {
+        if (flags & ast.Flags.computed != 0) {
+            if (ast.wellKnownSymbolKey(b.tokenText(tok))) |k| return b.atomOf(k);
+        }
+        return b.memberAtom(tok);
+    }
+
     /// Atom of a module-specifier string token (contents without quotes).
     fn moduleAtom(b: *Binder, tok: TokenIndex) Error!Atom {
         if (tok == 0) return 0;
@@ -1735,7 +1746,7 @@ const Binder = struct {
                     const f = b.tree.extraData(ast.Field, md.lhs);
                     const is_static = f.flags & ast.Flags.static != 0;
                     const tok = b.tree.nodeMainToken(member);
-                    _ = try b.declare(if (is_static) ss else ms, try b.memberAtom(tok), .property, member, tok, .{
+                    _ = try b.declare(if (is_static) ss else ms, try b.memberNameKey(tok, f.flags), .property, member, tok, .{
                         .static_member = is_static,
                         .optional_member = f.flags & ast.Flags.optional != 0,
                         .readonly_member = f.flags & ast.Flags.readonly != 0,
@@ -1749,7 +1760,7 @@ const Binder = struct {
                     const is_get = proto.flags & ast.Flags.get != 0;
                     const is_set = proto.flags & ast.Flags.set != 0;
                     const tok = b.tree.nodeMainToken(member);
-                    const atom = try b.memberAtom(tok);
+                    const atom = try b.memberNameKey(tok, proto.flags);
                     const kind: DeclKind = if (is_get) .getter else if (is_set) .setter else .method;
                     _ = try b.declare(if (is_static) ss else ms, atom, kind, member, tok, .{
                         .static_member = is_static,
@@ -1884,7 +1895,7 @@ const Binder = struct {
         switch (b.nodeTag(member)) {
             .property_signature => {
                 const tok = b.tree.nodeMainToken(member);
-                _ = try b.declare(ms, try b.memberAtom(tok), .property, member, tok, .{
+                _ = try b.declare(ms, try b.memberNameKey(tok, md.rhs), .property, member, tok, .{
                     .optional_member = md.rhs & ast.Flags.optional != 0,
                     .readonly_member = md.rhs & ast.Flags.readonly != 0,
                 });
@@ -1895,7 +1906,7 @@ const Binder = struct {
                 const is_get = md.rhs & ast.Flags.get != 0;
                 const is_set = md.rhs & ast.Flags.set != 0;
                 const kind: DeclKind = if (is_get) .getter else if (is_set) .setter else .method;
-                _ = try b.declare(ms, try b.memberAtom(tok), kind, member, tok, .{});
+                _ = try b.declare(ms, try b.memberNameKey(tok, md.rhs), kind, member, tok, .{});
                 try b.bindFunctionType(member, md.lhs);
             },
             .index_signature => {
