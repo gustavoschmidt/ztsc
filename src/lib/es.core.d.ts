@@ -104,6 +104,28 @@ interface Promise<T> {
     catch(onrejected: (reason: any) => void): Promise<T>;
 }
 
+// Minimal iteration protocol (M11). tsc's lib splits IteratorResult into a
+// discriminated union of yield/return results; ztsc uses the flat shape (in
+// subset: no mapped/conditional types) — enough for `function*`/`yield`.
+interface IteratorResult<T> {
+    done: boolean;
+    value: T;
+}
+
+interface Iterator<T> {
+    next(): IteratorResult<T>;
+}
+
+interface IterableIterator<T> {
+    next(): IteratorResult<T>;
+}
+
+interface Generator<T> {
+    next(): IteratorResult<T>;
+    return(value: T): IteratorResult<T>;
+    throw(e: any): IteratorResult<T>;
+}
+
 // Map/Set/Date carry constructors, so they are declared as classes: `new` on a
 // var-typed object needs a construct signature (`new (...): T`), which is out of
 // ztsc's subset. A `declare class` gives the same instance surface plus a usable

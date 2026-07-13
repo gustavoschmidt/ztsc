@@ -201,9 +201,16 @@ const max_instantiation_depth = 48;
 const max_type_string = 160;
 
 const FnCtx = struct {
-    /// Declared return type (0 = none / inferring).
+    /// Effective return-check target (0 = none / inferring). For an async
+    /// function this is the awaited *payload* `T` of the declared
+    /// `Promise<T>`, not the `Promise<T>` itself.
     ret_ann: TypeId = 0,
     is_async: bool = false,
+    is_generator: bool = false,
+    /// For a generator with an annotated `Generator<T>`/`Iterator<T>`/
+    /// `IterableIterator<T>` return: the yield element type `T` (0 = infer /
+    /// unchecked).
+    yield_type: TypeId = 0,
 };
 
 /// A memoized expression type together with the contextual type it was
@@ -312,6 +319,11 @@ const Checker = struct {
     atom_String: Atom = 0,
     atom_Number: Atom = 0,
     atom_Boolean: Atom = 0,
+    // Names of the lib interfaces async/await + generators bridge to (M11).
+    atom_Promise: Atom = 0,
+    atom_Generator: Atom = 0,
+    atom_Iterator: Atom = 0,
+    atom_IterableIterator: Atom = 0,
 
     const typeof_names = [8][]const u8{
         "string", "number", "bigint", "boolean", "symbol", "undefined", "object", "function",
@@ -374,6 +386,10 @@ const Checker = struct {
         c.atom_String = try c.atom("String");
         c.atom_Number = try c.atom("Number");
         c.atom_Boolean = try c.atom("Boolean");
+        c.atom_Promise = try c.atom("Promise");
+        c.atom_Generator = try c.atom("Generator");
+        c.atom_Iterator = try c.atom("Iterator");
+        c.atom_IterableIterator = try c.atom("IterableIterator");
         for (typeof_names, 0..) |n, i| c.typeof_atoms[i] = try c.atom(n);
         var tu: [8]TypeId = undefined;
         for (c.typeof_atoms, 0..) |a, i| tu[i] = try c.ts.makeStringLiteral(a, false);
@@ -1594,6 +1610,7 @@ const Checker = struct {
         }
 
         const is_async = proto.flags & ast.Flags.async != 0;
+        const is_generator = proto.flags & ast.Flags.generator != 0;
         var ret: TypeId = types.any_type;
         var pred: ?types.Predicate = null;
         if (proto.return_type != 0 and c.nodeTag(proto.return_type) == .type_predicate) {
@@ -1605,8 +1622,24 @@ const Checker = struct {
             ret = if (p.asserts) types.void_type else types.boolean_type;
         } else if (proto.return_type != 0) {
             ret = try c.typeFromTypeNode(proto.return_type);
-        } else if (is_async) {
-            ret = types.any_type; // Promise typing out of subset (documented)
+        } else if (is_async and !is_generator) {
+            // async without annotation → infer the payload from the body
+            // (flattening a single returned `Promise` level), wrap in the
+            // global `Promise<T>`. `async g() {}` → `Promise<void>`.
+            if (node != 0 and c.tree.nodeData(node).rhs != 0 and
+                (c.nodeTag(node) == .arrow_fn or c.nodeTag(node) == .function_expr or
+                    c.nodeTag(node) == .function_decl or c.nodeTag(node) == .class_method))
+            {
+                try c.sig_cache.put(c.ca(), c.nodeKey(node), .{ .ty = try c.ts.makeFunction(params.items, try c.makePromise(types.any_type), tps.items, if (is_method) types.fn_flag_method else 0), .ctx = ctx_sig });
+                const payload = c.awaitedType(try c.inferReturnType(node, c.tree.nodeData(node).rhs));
+                ret = try c.makePromise(payload);
+            } else {
+                ret = try c.makePromise(types.void_type);
+            }
+        } else if (is_generator) {
+            // Generator return-type inference (yield union → `Generator<T>`) is
+            // a gap: unannotated generators type as `any` (no false positives).
+            ret = types.any_type;
         } else if (node != 0 and c.tree.nodeData(node).rhs != 0 and
             (c.nodeTag(node) == .arrow_fn or c.nodeTag(node) == .function_expr or
                 c.nodeTag(node) == .function_decl or c.nodeTag(node) == .class_method))
@@ -3024,6 +3057,43 @@ const Checker = struct {
         return c.propOfType(try c.resolveStructural(ref), name);
     }
 
+    /// Wrap `payload` in the global `Promise<T>` (M11). Falls back to `any`
+    /// when the lib has no `Promise` interface (e.g. `--noLib`).
+    fn makePromise(c: *Checker, payload: TypeId) Error!TypeId {
+        const sym = c.prog.globals.lookup(c.atom_Promise) orelse return types.any_type;
+        if (!c.symFlags(sym).interface) return types.any_type;
+        return c.ts.makeRef(sym, &.{payload});
+    }
+
+    /// Single-level `Awaited<T>`: unwrap a `Promise<T>` to `T`; any other type
+    /// passes through (await on a non-thenable yields the value itself).
+    /// Deeper `Awaited<T>` recursion (`Promise<Promise<T>>`) is a known gap.
+    fn awaitedType(c: *Checker, t: TypeId) TypeId {
+        if (c.ts.kind(t) == .ref) {
+            const sym = c.prog.globals.lookup(c.atom_Promise) orelse return t;
+            if (c.ts.refSymbol(t) == sym) {
+                const args = c.ts.refArgs(t);
+                if (args.len >= 1) return args[0];
+            }
+        }
+        return t;
+    }
+
+    /// If `t` is a `Generator<T>`/`Iterator<T>`/`IterableIterator<T>` ref,
+    /// return its yield element `T`; otherwise 0.
+    fn generatorYieldType(c: *Checker, t: TypeId) TypeId {
+        if (c.ts.kind(t) != .ref) return 0;
+        const sym = c.ts.refSymbol(t);
+        const g = c.prog.globals.lookup(c.atom_Generator);
+        const it = c.prog.globals.lookup(c.atom_Iterator);
+        const ii = c.prog.globals.lookup(c.atom_IterableIterator);
+        if ((g != null and sym == g.?) or (it != null and sym == it.?) or (ii != null and sym == ii.?)) {
+            const args = c.ts.refArgs(t);
+            if (args.len >= 1) return args[0];
+        }
+        return 0;
+    }
+
     /// Union of a tuple's element types (the element type used when a tuple
     /// borrows `Array<T>` members).
     fn tupleElementUnion(c: *Checker, t: TypeId) Error!TypeId {
@@ -3880,7 +3950,18 @@ const Checker = struct {
                 return types.any_type; // class expressions: minimal support
             },
             .yield_expr => {
-                if (d.lhs != 0) _ = try c.checkExprCached(d.lhs, types.no_type);
+                // `yield x`: relate `x` to the generator's yield type `T`
+                // (`Generator<T>`). Delegation `yield* x` (rhs=1) is unchecked
+                // (iterable-protocol; a gap). `yield`'s own value type is `any`
+                // (the caller-supplied `.next(v)` value — TNext, out of subset).
+                const yt: TypeId = if (c.fn_ctx) |fc| fc.yield_type else 0;
+                const delegate = d.rhs != 0;
+                if (d.lhs != 0) {
+                    const vt = try c.checkExprCached(d.lhs, if (delegate) types.no_type else yt);
+                    if (!delegate and yt != 0 and yt != types.no_type and yt != types.error_type and c.ts.kind(yt) != .any) {
+                        _ = try c.checkAssignable(vt, yt, d.lhs, c.nodeSpan(d.lhs));
+                    }
+                }
                 return types.any_type;
             },
             .spread_element => {
@@ -4496,8 +4577,20 @@ const Checker = struct {
                 return types.boolean_type;
             },
             .keyword_await => {
-                // Promise typing out of subset: pass through (documented).
-                return c.checkExprCached(d.lhs, types.no_type);
+                // `await` legality: inside a non-async function → TS1308; at the
+                // top level of a non-module file → TS1375 (top-level await is
+                // otherwise allowed under module: esnext).
+                if (c.fn_ctx) |fc| {
+                    if (!fc.is_async) {
+                        try c.diagFmt(1308, c.nodeSpan(node), "'await' expressions are only allowed within async functions and at the top levels of modules.", .{});
+                    }
+                } else if (c.bind.imports.len == 0 and c.bind.exports.len == 0) {
+                    try c.diagFmt(1375, c.nodeSpan(node), "'await' expressions are only allowed at the top level of a file when that file is a module, but this file has no imports or exports. Consider adding an empty 'export {{}}' to make this file a module.", .{});
+                }
+                // `await e`: unwrap `Promise<T>` to `T`; a non-thenable passes
+                // through. Single-level only (deeper `Awaited<T>` is a gap).
+                const ot = try c.checkExprCached(d.lhs, types.no_type);
+                return c.awaitedType(ot);
             },
             .minus => {
                 const ot = try c.checkExprCached(d.lhs, types.no_type);
@@ -6416,22 +6509,15 @@ const Checker = struct {
             if (d.lhs != 0) _ = try c.checkExprCached(d.lhs, types.no_type);
             return;
         };
-        if (ctx.is_async) {
-            if (d.lhs != 0) _ = try c.checkExprCached(d.lhs, types.no_type);
-            return; // Promise typing out of subset
-        }
         if (d.lhs != 0) {
             const rt = try c.checkExprCached(d.lhs, ctx.ret_ann);
+            // async: `return v` in a `Promise<T>` relates the awaited `v` to the
+            // payload `T` (so `return somePromise` is not double-wrapped).
+            const eff_rt = if (ctx.is_async) c.awaitedType(rt) else rt;
             if (ctx.ret_ann != types.no_type and ctx.ret_ann != types.error_type and
                 ctx.ret_ann != types.any_type and c.ts.kind(ctx.ret_ann) != .none)
             {
-                if (c.ts.kind(ctx.ret_ann) == .void) {
-                    // Returning a value from a void function is fine in tsc
-                    // only for callbacks; for declared void it's 2322.
-                    _ = try c.checkAssignable(rt, ctx.ret_ann, d.lhs, c.nodeSpan(d.lhs));
-                } else {
-                    _ = try c.checkAssignable(rt, ctx.ret_ann, d.lhs, c.nodeSpan(d.lhs));
-                }
+                _ = try c.checkAssignable(eff_rt, ctx.ret_ann, d.lhs, c.nodeSpan(d.lhs));
             }
         } else if (ctx.ret_ann != types.no_type) {
             const k = c.ts.kind(ctx.ret_ann);
@@ -6464,8 +6550,29 @@ const Checker = struct {
         }
         if (c.scopeOf(node)) |s| c.cur_scope = s;
         const is_async = proto.flags & ast.Flags.async != 0;
+        const is_generator = proto.flags & ast.Flags.generator != 0;
         const ann: TypeId = if (proto.return_type != 0) try c.typeFromTypeNode(proto.return_type) else types.no_type;
-        c.fn_ctx = .{ .ret_ann = ann, .is_async = is_async };
+        // Effective return-check target. For async this is the awaited payload
+        // `T` of the declared `Promise<T>`; a non-Promise annotation is TS1064.
+        var eff_ann = ann;
+        var yield_type: TypeId = 0;
+        if (is_async and ann != types.no_type) {
+            const k = c.ts.kind(ann);
+            const is_promise = c.ts.kind(ann) == .ref and c.prog.globals.lookup(c.atom_Promise) != null and
+                c.ts.refSymbol(ann) == c.prog.globals.lookup(c.atom_Promise).?;
+            if (is_promise) {
+                eff_ann = c.awaitedType(ann);
+            } else if (k != .err and k != .none) {
+                try c.diagFmt(1064, c.nodeSpan(proto.return_type), "The return type of an async function or method must be the global Promise<T> type. Did you mean to write 'Promise<{s}>'?", .{try c.typeToString(ann)});
+                eff_ann = types.no_type; // suppress payload assignability noise
+            }
+        } else if (is_generator) {
+            // Generators: relate `yield x` to `T` from `Generator<T>`; return
+            // values (→ TReturn) are unchecked (gap).
+            yield_type = c.generatorYieldType(ann);
+            eff_ann = types.no_type;
+        }
+        c.fn_ctx = .{ .ret_ann = eff_ann, .is_async = is_async, .is_generator = is_generator, .yield_type = yield_type };
 
         // Check parameter initializers against annotations.
         for (c.tree.extraRange(proto.params_start, proto.params_end)) |pn| {
@@ -6483,11 +6590,12 @@ const Checker = struct {
 
         if (c.nodeTag(body) == .block) {
             for (c.tree.nodeRange(body)) |stmt| try c.checkStatement(stmt);
-            // Ending-return analysis (TS2355/2366).
-            if (!is_async and ann != types.no_type and ann != types.error_type) {
-                const k = c.ts.kind(ann);
+            // Ending-return analysis (TS2355/2366). For async the target is the
+            // Promise payload; generators do not require an ending return.
+            if (!is_generator and eff_ann != types.no_type and eff_ann != types.error_type) {
+                const k = c.ts.kind(eff_ann);
                 const exempt = k == .void or k == .any or k == .err or k == .unknown or k == .none or
-                    c.containsUndefinedish(ann);
+                    c.containsUndefinedish(eff_ann);
                 if (!exempt) {
                     var rets: std.ArrayList(Node) = .empty;
                     defer rets.deinit(c.scratch());
@@ -6506,10 +6614,12 @@ const Checker = struct {
                 }
             }
         } else {
-            // Arrow expression body.
-            const rt = try c.checkExprCached(body, ann);
-            if (ann != types.no_type and ann != types.error_type and !is_async) {
-                _ = try c.checkAssignable(rt, ann, body, c.nodeSpan(body));
+            // Arrow expression body. For async, relate the awaited body type to
+            // the Promise payload (`async () => p` returns `Promise<T>`).
+            const rt = try c.checkExprCached(body, eff_ann);
+            if (eff_ann != types.no_type and eff_ann != types.error_type) {
+                const eff_rt = if (is_async) c.awaitedType(rt) else rt;
+                _ = try c.checkAssignable(eff_rt, eff_ann, body, c.nodeSpan(body));
             }
         }
         _ = sig;
