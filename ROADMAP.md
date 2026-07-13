@@ -629,6 +629,65 @@ Everything here needs real code, which M11 finally makes checkable.
 > confirmed); `unique symbol` stays low. tsc/tsgo wall/RSS comparison pending
 > those tools on the bench host.
 
+**Census results (2026-07-13, 1693 real `.d.ts` / ~77k lines; 2287 out-of-subset
+constructs; 449/1693 files carry any — file count inflated by date-fns' ~1k
+locale stubs).** This is the table that sets M14/M16 order:
+
+| construct | count | share | lands in |
+|---|---:|---:|---|
+| conditional type | 804 | 35.2% | M16a |
+| `import()` type | 482 | 21.1% | **M14 (elevated — see below)** |
+| `infer` | 331 | 14.5% | M16a |
+| call/construct signature | 237 | 10.4% | subset expansion (interfaces) |
+| mapped type | 160 | 7.0% | M16b |
+| computed member name | 92 | 4.0% | — (mostly `[Symbol.x]`, partly handled) |
+| constructor type | 54 | 2.4% | M14-ish (`new () => T`) |
+| template-literal type | 32 | 1.4% | M16c |
+| `unique symbol` | 30 | 1.3% | M14 |
+| `import = require` | 24 | 1.0% | out of subset (CommonJS) |
+| `export =` | 23 | 1.0% | out of subset (CommonJS) |
+| named tuple member | 7 | 0.3% | subset expansion (tuples) |
+
+Reading it: **conditional + `infer` ≈ 50%** ⇒ M16a is the highest-value
+type-level work, unchanged from the planned sequence. **`import()` types 21%** is
+the one surprise — the census *reorders* M14 to lead with them (see M14). Mapped
++ template (M16b/c) are real but ~10× rarer than conditionals, so M16a-first is
+confirmed by data, not assumption. `unique symbol` at 1.3% validates keeping it
+low-priority. The long tail (`import =`/`export =`, named tuples) is small enough
+to leave deferred.
+
+**Continuation map (for the next agent — how to re-run and extend).**
+- *Classification lives at parse time.* `ast.UnsupportedKind` (src/ast.zig) is the
+  enum; it's stored in the `.unsupported` node's spare `data.lhs` (span still uses
+  `rhs`, so this is free). Emission goes through `Parser.unsupportedFrom`
+  (auto-classifies from the construct's first token via `classifyUnsupported`) or
+  `Parser.unsupportedKindFrom(tok, kind)` for sites the first token can't identify
+  — currently just `conditional_type` and `named_tuple_member`. **If you add a new
+  out-of-subset construct or split a bucket, update the enum + `label()` and pass
+  the kind explicitly where token-classification would be wrong.**
+- *Known classifier coarseness* (acceptable for prioritization, note if you
+  rely on exact splits): `import()` type and `typeof import()` share the
+  `import_type` bucket; interface construct signatures (`new():T`) fold into
+  `constructor_type`; a class body sometimes stops at the first unsupported member
+  so trailing members (e.g. a `static {}` after a decorated method) may be
+  undercounted. None of this moves the top-of-table ordering.
+- *Running it.* `zig-out/bin/ztsc --census <files…>` prints the histogram (walks
+  every loaded tree; add `--noLib` to keep it fast/quiet since the census counts
+  *syntax*, not name resolution). Aggregate over a package set with
+  `bench/fetch_real.sh census`.
+- *Corpus.* `bench/fetch_real.sh` (pinned `npm pack` set, list at the top of the
+  script) → `bench/corpus/real/` (gitignored; regenerate on demand). Grow the
+  pinned list toward the ~500k-LOC target as more packages become checkable.
+- *Resolution cache.* `modules.ResolveCache` + `fs_probes` counter (src/modules.zig);
+  `--no-resolve-cache` disables it; probe/hit stats on `--timing`'s "resolve cache"
+  line; **deps** corpus in `bench/gen_corpus.js` drives it.
+- *Open follow-ups explicitly left for later:* (a) the `(dir, spec)`-existence
+  layer for the cross-directory residual walk — deferred because the census shows
+  resolution is not a bottleneck; revisit only if a future census says otherwise.
+  (b) tsc/tsgo wall/RSS comparison over `bench/corpus/real` — just needs both tools
+  on PATH on the bench host; the ztsc-side numbers are already in BENCHMARKS §3.12.
+  (c) grow the real corpus past ~77k lines toward ~500k.
+
 - **Census tool. ✅ DONE (2026-07-13).** parse the top few hundred npm packages +
   real Bun/Node
   repos (Elysia, Hono, Zod, Drizzle apps); count which unsupported
