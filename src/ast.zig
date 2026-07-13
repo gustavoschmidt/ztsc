@@ -166,6 +166,11 @@ pub const Tag = enum(u8) {
     /// The `const` type in an `expr as const` const assertion. Leaf;
     /// main_token = the `const` keyword. Only valid as an `as_expr` rhs.
     const_type,
+    /// Type predicate in return-type position: `x is T`, `asserts x is T`,
+    /// or `asserts x`. main_token = the guarded parameter's name token (or
+    /// `this`); lhs = target type node (0 for a bare `asserts x`);
+    /// rhs = flags (bit0 = `asserts`).
+    type_predicate,
     /// `obj.name`. main_token = `.`; lhs = object, rhs = name token.
     member_expr,
     /// `obj?.name`. main_token = `?.`; lhs = object, rhs = name token.
@@ -656,6 +661,7 @@ pub const Ast = struct {
                 .export_default,
                 .new_expr_bare,
                 .var_decl_one,
+                .type_predicate,
                 => it.push(d.lhs),
 
                 // optional lhs only.

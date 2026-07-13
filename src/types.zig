@@ -115,9 +115,11 @@ pub const Kind = enum(u8) {
     object,
     /// Function/signature type. a = extra index, b = param count. extra[a..]:
     /// [flags, return_type, tp_count, tp symbol ids...,
-    ///  then per param: name_atom, type, param_flags].
-    /// Function flags: 1 = method (bivariant params). param_flags:
-    /// 1 = optional, 2 = rest, 4 = has_initializer.
+    ///  then per param: name_atom, type, param_flags,
+    ///  then (iff flags has fn_flag_predicate) pred_flags, pred_param,
+    ///  pred_type].
+    /// Function flags: 1 = method (bivariant params), 2 = predicate.
+    /// param_flags: 1 = optional, 2 = rest, 4 = has_initializer.
     function,
     /// Overload set. extra[a..b] = function TypeIds in declaration order.
     overloads,
@@ -143,6 +145,10 @@ pub const elem_flag_rest: u32 = 2;
 /// sites (indexed writes -> TS2540).
 pub const elem_flag_readonly: u32 = 4;
 pub const fn_flag_method: u32 = 1;
+/// The signature carries a type predicate (`x is T` / `asserts x[ is T]`).
+/// When set, the payload has three trailing words after the params:
+/// [pred_flags, pred_param, pred_type]. pred_flags bit0 = asserts.
+pub const fn_flag_predicate: u32 = 2;
 pub const param_flag_optional: u32 = 1;
 pub const param_flag_rest: u32 = 2;
 pub const param_flag_initializer: u32 = 4;
@@ -171,6 +177,17 @@ pub const Param = struct {
     pub fn rest(p: Param) bool {
         return p.flags & param_flag_rest != 0;
     }
+};
+
+/// A signature's type predicate. `param` names the guarded parameter by
+/// index (or `this_param` for a `this is T` guard); `ty` is the asserted
+/// type (`no_type` for a bare `asserts cond`); `asserts` distinguishes an
+/// assertion function from a plain user-defined type guard.
+pub const Predicate = struct {
+    pub const this_param: u32 = std.math.maxInt(u32);
+    param: u32,
+    ty: TypeId,
+    asserts: bool,
 };
 
 pub const TupleElem = struct {
@@ -330,6 +347,20 @@ pub const Store = struct {
             .name = s.extra.items[pbase],
             .ty = s.extra.items[pbase + 1],
             .flags = s.extra.items[pbase + 2],
+        };
+    }
+
+    pub fn fnHasPredicate(s: *const Store, id: TypeId) bool {
+        return s.kind(id) == .function and s.fnFlags(id) & fn_flag_predicate != 0;
+    }
+    pub fn fnPredicate(s: *const Store, id: TypeId) Predicate {
+        const base = s.dataA(id);
+        const tpc = s.extra.items[base + 2];
+        const pbase = base + 3 + tpc + 3 * s.dataB(id);
+        return .{
+            .asserts = s.extra.items[pbase] != 0,
+            .param = s.extra.items[pbase + 1],
+            .ty = s.extra.items[pbase + 2],
         };
     }
 
@@ -577,6 +608,18 @@ pub const Store = struct {
         type_params: []const u32,
         flags: u32,
     ) Error!TypeId {
+        return s.makeFunctionPred(params, ret, type_params, flags, null);
+    }
+
+    pub fn makeFunctionPred(
+        s: *Store,
+        params: []const Param,
+        ret: TypeId,
+        type_params: []const u32,
+        flags0: u32,
+        pred: ?Predicate,
+    ) Error!TypeId {
+        const flags = if (pred != null) flags0 | fn_flag_predicate else flags0;
         const start = s.pending.items.len;
         defer s.pending.items.len = start;
         try s.pending.append(s.alloc, flags);
@@ -587,6 +630,11 @@ pub const Store = struct {
             try s.pending.append(s.alloc, p.name);
             try s.pending.append(s.alloc, p.ty);
             try s.pending.append(s.alloc, p.flags);
+        }
+        if (pred) |pr| {
+            try s.pending.append(s.alloc, @intFromBool(pr.asserts));
+            try s.pending.append(s.alloc, pr.param);
+            try s.pending.append(s.alloc, pr.ty);
         }
         return s.internType(.function, s.pending.items[start..], @intCast(params.len));
     }

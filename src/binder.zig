@@ -265,6 +265,11 @@ pub const FlowTag = enum(u8) {
     /// Reached a switch clause. a = antecedent (pre-switch flow),
     /// b = case/default clause node.
     switch_clause,
+    /// A call statement whose callee is a dotted name — a candidate
+    /// assertion-function call. a = antecedent, b = the call node. The
+    /// checker resolves the callee lazily; a non-assertion call is a
+    /// pass-through.
+    call_stmt,
 };
 
 pub const ImportKind = enum(u8) { default, namespace, named, side_effect };
@@ -434,7 +439,7 @@ pub const Bind = struct {
     /// The AST node a flow node references (assign/condition/switch), or 0.
     pub fn flowNode(b: *const Bind, flow: FlowId) Node {
         return switch (b.flow_tags[flow]) {
-            .assign, .cond_true, .cond_false, .switch_clause, .start => b.flow_b[flow],
+            .assign, .cond_true, .cond_false, .switch_clause, .start, .call_stmt => b.flow_b[flow],
             else => 0,
         };
     }
@@ -501,6 +506,7 @@ pub const Bind = struct {
         var n_branch: usize = 0;
         var n_loop: usize = 0;
         var n_switch: usize = 0;
+        var n_call: usize = 0;
         for (b.flow_tags) |t| switch (t) {
             .start => n_start += 1,
             .assign => n_assign += 1,
@@ -508,11 +514,12 @@ pub const Bind = struct {
             .branch_label => n_branch += 1,
             .loop_label => n_loop += 1,
             .switch_clause => n_switch += 1,
+            .call_stmt => n_call += 1,
             .none, .unreachable_ => {},
         };
         try w.print(
-            "flow: nodes={d} attach={d} (start={d} assign={d} cond={d} branch={d} loop={d} switch={d})\n",
-            .{ b.flowCount(), b.flow_map_nodes.len, n_start, n_assign, n_cond, n_branch, n_loop, n_switch },
+            "flow: nodes={d} attach={d} (start={d} assign={d} cond={d} branch={d} loop={d} switch={d} call={d})\n",
+            .{ b.flowCount(), b.flow_map_nodes.len, n_start, n_assign, n_cond, n_branch, n_loop, n_switch, n_call },
         );
 
         for (b.imports) |rec| {
@@ -1086,6 +1093,17 @@ const Binder = struct {
         try b.flow_pairs.append(b.scratch, .{ .value = node, .next = b.cur_flow });
     }
 
+    /// A bare identifier or a `a.b.c` chain of them — tsc's isDottedName,
+    /// the gate for creating an assertion-candidate call flow node.
+    fn isDottedName(b: *const Binder, node: Node) bool {
+        return switch (b.nodeTag(node)) {
+            .identifier, .this_expr, .super_expr => true,
+            .paren_expr => b.isDottedName(b.tree.nodeData(node).lhs),
+            .member_expr => b.isDottedName(b.tree.nodeData(node).lhs),
+            else => false,
+        };
+    }
+
     // --- control-flow contexts (break/continue targets) -----------------------
 
     fn findBreakCtx(b: *Binder, label: Atom) ?*Ctx {
@@ -1134,7 +1152,21 @@ const Binder = struct {
                 b.popScope(saved);
             },
             .var_decl_one, .var_decl => try b.bindVarDecl(node),
-            .expr_stmt => try b.bindExpr(d.lhs),
+            .expr_stmt => {
+                try b.bindExpr(d.lhs);
+                // A call statement with a dotted-name callee may be an
+                // assertion function; record a flow node so the checker can
+                // narrow after it. Non-assertion calls pass through.
+                const inner = d.lhs;
+                switch (b.nodeTag(inner)) {
+                    .call_expr, .call_expr_targs, .optional_call => {
+                        if (b.isDottedName(b.tree.nodeData(inner).lhs)) {
+                            b.cur_flow = try b.addFlow(.call_stmt, b.cur_flow, inner);
+                        }
+                    },
+                    else => {},
+                }
+            },
             .empty_stmt, .debugger_stmt, .error_node, .unsupported, .omitted => {},
 
             .if_stmt => {
@@ -2550,7 +2582,7 @@ test "golden: var hoists out of blocks to the function scope" {
         \\    y: var
         \\    scope 2: block
         \\      z: let
-        \\flow: nodes=5 attach=0 (start=2 assign=3 cond=0 branch=0 loop=0 switch=0)
+        \\flow: nodes=5 attach=0 (start=2 assign=3 cond=0 branch=0 loop=0 switch=0 call=0)
         \\
     );
 }
@@ -2561,7 +2593,7 @@ test "golden: function declaration in a block is block-scoped (modern semantics)
         \\  scope 1: block
         \\    g: function impl
         \\    scope 2: function g
-        \\flow: nodes=2 attach=0 (start=2 assign=0 cond=0 branch=0 loop=0 switch=0)
+        \\flow: nodes=2 attach=0 (start=2 assign=0 cond=0 branch=0 loop=0 switch=0 call=0)
         \\
     );
 }
@@ -2574,7 +2606,7 @@ test "golden: let shadowing chain (TDZ names, one symbol per scope)" {
         \\    a: let
         \\    scope 2: block
         \\      a: let
-        \\flow: nodes=4 attach=3 (start=1 assign=3 cond=0 branch=0 loop=0 switch=0)
+        \\flow: nodes=4 attach=3 (start=1 assign=3 cond=0 branch=0 loop=0 switch=0 call=0)
         \\
     );
 }
@@ -2598,7 +2630,7 @@ test "golden: class members vs statics, parameter properties" {
         \\    scope 5: function s
         \\    scope 6: function constructor
         \\      z: param
-        \\flow: nodes=4 attach=0 (start=4 assign=0 cond=0 branch=0 loop=0 switch=0)
+        \\flow: nodes=4 attach=0 (start=4 assign=0 cond=0 branch=0 loop=0 switch=0 call=0)
         \\
     );
 }
@@ -2614,7 +2646,7 @@ test "golden: params, destructured params, defaults referencing earlier params" 
         \\    d: param
         \\    f2: param
         \\    g2: param
-        \\flow: nodes=2 attach=3 (start=2 assign=0 cond=0 branch=0 loop=0 switch=0)
+        \\flow: nodes=2 attach=3 (start=2 assign=0 cond=0 branch=0 loop=0 switch=0 call=0)
         \\
     );
     // The defaults' references to earlier params resolve in-file.
@@ -2629,7 +2661,7 @@ test "golden: catch parameter gets its own scope shared with the body" {
         \\  scope 1: block
         \\  scope 2: catch_clause
         \\    e: catch
-        \\flow: nodes=1 attach=3 (start=1 assign=0 cond=0 branch=0 loop=0 switch=0)
+        \\flow: nodes=4 attach=3 (start=1 assign=0 cond=0 branch=1 loop=0 switch=0 call=2)
         \\unresolved: f(1) g(1)
         \\
     );
@@ -2644,7 +2676,7 @@ test "golden: for and for-of heads scope their declarations" {
         \\  scope 3: for_head
         \\    x: const
         \\    scope 4: block
-        \\flow: nodes=8 attach=5 (start=1 assign=3 cond=2 branch=0 loop=2 switch=0)
+        \\flow: nodes=8 attach=5 (start=1 assign=3 cond=2 branch=0 loop=2 switch=0 call=0)
         \\unresolved: xs(1)
         \\
     );
@@ -2659,7 +2691,7 @@ test "golden: import records incl. type-only, namespace, side-effect" {
         \\  T: import type-only
         \\  ns: import
         \\  X: import type-only
-        \\flow: nodes=1 attach=0 (start=1 assign=0 cond=0 branch=0 loop=0 switch=0)
+        \\flow: nodes=1 attach=0 (start=1 assign=0 cond=0 branch=0 loop=0 switch=0 call=0)
         \\import local=d imported=default from="./m" default
         \\import local=a imported=a from="./m" named
         \\import local=c imported=b from="./m" named
@@ -2677,7 +2709,7 @@ test "golden: export records (decl, alias, re-export, star, default)" {
         \\  k: const exported
         \\  ef: function exported impl
         \\  scope 1: function ef
-        \\flow: nodes=3 attach=0 (start=2 assign=1 cond=0 branch=0 loop=0 switch=0)
+        \\flow: nodes=3 attach=0 (start=2 assign=1 cond=0 branch=0 loop=0 switch=0 call=0)
         \\export exported=k local=k named
         \\export exported=ef local=ef named
         \\export exported=kk local=k named
@@ -2698,7 +2730,7 @@ test "golden: overload signatures group into one symbol" {
         \\    a: param
         \\  scope 3: function ov
         \\    a: param
-        \\flow: nodes=2 attach=0 (start=2 assign=0 cond=0 branch=0 loop=0 switch=0)
+        \\flow: nodes=2 attach=0 (start=2 assign=0 cond=0 branch=0 loop=0 switch=0 call=0)
         \\
     );
 }
@@ -2714,7 +2746,7 @@ test "golden: interface-interface merge shares one members scope" {
         \\      b: property
         \\    scope 3: function m
         \\  scope 4: interface I
-        \\flow: nodes=1 attach=0 (start=1 assign=0 cond=0 branch=0 loop=0 switch=0)
+        \\flow: nodes=1 attach=0 (start=1 assign=0 cond=0 branch=0 loop=0 switch=0 call=0)
         \\
     );
 }
@@ -2726,7 +2758,7 @@ test "golden: type alias with type params" {
         \\  v: let
         \\  scope 1: type_alias Alias
         \\    T: type-param
-        \\flow: nodes=1 attach=0 (start=1 assign=0 cond=0 branch=0 loop=0 switch=0)
+        \\flow: nodes=1 attach=0 (start=1 assign=0 cond=0 branch=0 loop=0 switch=0 call=0)
         \\
     );
 }
@@ -3007,7 +3039,7 @@ fn checkBinderOnArbitraryBytes(alloc: Allocator, interner: *Interner, input: []c
                     try testing.expect(a < n_flows);
                 }
             },
-            .assign, .cond_true, .cond_false, .switch_clause => {
+            .assign, .cond_true, .cond_false, .switch_clause, .call_stmt => {
                 try testing.expect(b.flow_a[f] < n_flows);
                 try testing.expect(b.flow_b[f] < tree.nodes.len);
             },
