@@ -767,17 +767,27 @@ per item:
   (`ast.wellKnownSymbolKey`); this covers arbitrary user-defined keys.
   Conformance 318 → 321 (`test/conformance/symbols/006–008`). Zero benchmark
   drift (multi: wall 0.02 s, RSS ~52.5 MB, flat vs base).
-- **JSX polish (deferred bits).** (1) `-` in JSX names (`data-*`,
-  `aria-*`) needs a JSX-identifier scan that spans `-` plus a rescan
-  entry point (today `data`, `-`, `foo` lex as three tokens), and
-  `IntrinsicElements` entries with index signatures to type them; (2)
-  class-component props (`class C extends Component<P>`) read props from
-  the instance type (`JSX.ElementClass` / its `props` member) rather
-  than a call signature; (3) resolving the `JSX` namespace from
-  `@types/react` — unblocked by M11's global-symbol layer, mostly test
-  work once M11 lands; (4) spread-attribute type-checking (spreads
-  currently bypass excess/missing checks), `key`/`ref` special-casing,
-  and `JSX.ElementChildrenAttribute` children typing.
+- **JSX polish.** (1) ✅ **`-` in JSX names** (`data-*`, `aria-*`, custom
+  elements `<my-widget>`): a new `.jsx_name` scanner Tag + `scanJsxName`
+  scans an ident run spanning `-`, produced *only* via the parser's
+  `rescanJsxName` entry point (plain `next` still lexes `-` as subtraction
+  — regression-tested in `.tsx` mode). Hyphenated attributes skip
+  excess/assignability entirely but still have their value expression
+  checked — this is tsc's actual behavior (unconditional, index signature or
+  not; the roadmap's "needs index signatures" note was wrong). (2) ✅
+  **class-component props** (`class C extends Component<P>`): `jsxComponentProps`
+  handles `.class_value` via `jsxClassComponentProps`, reading the instance
+  member named by `JSX.ElementAttributesProperty` (`props`) off the class
+  instance type; absent selector namespace ⇒ unchecked (matches tsc).
+  Differential: TS2741 missing / TS2322 wrong-type / TS2322 excess.
+  Conformance 321 → 323 (`test/conformance/jsx/006_dashed_names`,
+  `007_class_component`); flat benchmark. **Deferred** (need @types/react-style
+  machinery not exercisable in the self-contained-`JSX` conformance harness):
+  (3) resolving `JSX` from `@types/react`; (4) spread-attribute checking
+  (needs object-spread-merge + TS2559, no existing machinery), `key`/`ref`
+  (derive from `JSX.IntrinsicAttributes` — ztsc already matches tsc without it),
+  and `JSX.ElementChildrenAttribute` children typing. (3)+(4) tie together and
+  belong with the lib/@types story.
 - **`this`-typing and decorators** (low priority): polymorphic `this`
   return types / `this` parameters, and (legacy/TC39) decorators. Both
   are uncommon in the target app code and can trail the items above —

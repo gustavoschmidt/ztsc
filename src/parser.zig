@@ -309,6 +309,24 @@ const Parser = struct {
         p.la_len = 1;
     }
 
+    /// In JSX name position (tag or attribute name), extend the current
+    /// identifier-like token over any immediately-following `-name` runs so
+    /// `data-foo`, `aria-label`, and custom-element tags `<my-widget>` lex as
+    /// one `.jsx_name` token. A no-op unless a `-` abuts the current token, so
+    /// ordinary `a-b` subtraction (only ever seen in expression position) is
+    /// untouched. Drops stale lookahead scanned past the merged name.
+    fn rescanJsxName(p: *Parser) void {
+        p.fill(0);
+        const t = p.la[0];
+        if (!isNameLike(t.tag)) return;
+        const norm_end = scanner.tokenEnd(p.src, t.tag, t.start);
+        if (norm_end >= p.src.len or p.src[norm_end] != '-') return;
+        const end = p.scn.scanJsxName(t.start);
+        p.la[0] = .{ .tag = .jsx_name, .start = t.start, .end = end, .newline_before = t.newline_before };
+        p.scn.index = end;
+        p.la_len = 1;
+    }
+
     /// Consume a `>` out of a maximal-munched `>`-family token; the
     /// remainder becomes the current token.
     fn splitGt(p: *Parser) Error!u32 {
@@ -1604,6 +1622,16 @@ const Parser = struct {
         return p.lastIdx();
     }
 
+    /// A JSX tag or attribute name: an identifier that may span `-`
+    /// (`data-foo`, `<my-widget>`). Rescans first so the hyphenated run is a
+    /// single `.jsx_name` token.
+    fn expectJsxName(p: *Parser) PE!u32 {
+        p.rescanJsxName();
+        if (p.curTag() == .jsx_name or isIdentLike(p.curTag())) return p.bump();
+        try p.fail(.expected_identifier);
+        return p.lastIdx();
+    }
+
     fn parseTypeAlias(p: *Parser, flags: u32) PE!Node {
         const kw = try p.bump(); // `type`
         const name_tok = try p.expectIdentLike();
@@ -2541,7 +2569,7 @@ const Parser = struct {
     /// Tag name: `div`, `Foo`, or a member chain `A.B.C`, as a value
     /// expression the checker resolves (lowercase leaf = intrinsic).
     fn parseJsxTagName(p: *Parser) PE!Node {
-        const tok = try p.expectIdentLike();
+        const tok = try p.expectJsxName();
         var node = try p.addNode(.{ .tag = .identifier, .main_token = tok, .data = .{ .lhs = 0, .rhs = 0 } });
         while (p.curTag() == .dot) {
             const dot = try p.bump();
@@ -2563,7 +2591,7 @@ const Parser = struct {
                 _ = try p.expect(.r_brace, .expected_r_brace);
                 try p.pushScratch(try p.addNode(.{ .tag = .jsx_spread_attribute, .main_token = lb, .data = .{ .lhs = expr, .rhs = 0 } }));
             } else {
-                const name = try p.expectIdentLike();
+                const name = try p.expectJsxName();
                 var value: Node = null_node;
                 if (try p.eat(.eq) != null) value = try p.parseJsxAttributeValue();
                 try p.pushScratch(try p.addNode(.{ .tag = .jsx_attribute, .main_token = name, .data = .{ .lhs = value, .rhs = 0 } }));
@@ -4234,6 +4262,10 @@ test "jsx parses cleanly in tsx mode" {
         "const d = <A.B prop=\"y\">child</A.B>;",
         "const e = <div {...props} id={f()} />;",
         "const g = <ul>{items.map(i => <li>{i}</li>)}</ul>;",
+        // Hyphenated JSX names: `data-*`/`aria-*` attributes and a
+        // custom-element tag lex as single names spanning `-`.
+        "const h = <div data-foo=\"x\" aria-label=\"y\" />;",
+        "const i = <my-widget data-n={1} />;",
     };
     for (cases) |src| {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -4251,6 +4283,21 @@ test "jsx parses cleanly in tsx mode" {
         defer arena.deinit();
         const tree = try parseOpts(arena.allocator(), "const a = x < y;", false);
         try testing.expectEqual(@as(usize, 0), tree.diagnostics.len);
+    }
+}
+
+test "jsx name rescan does not disturb subtraction lexing" {
+    // The `-`-spanning JSX name scan is entered only in JSX name position;
+    // in expression position `-` must still lex as subtraction, even in
+    // `.tsx` files (jsx on) where the rescan machinery is live.
+    inline for (.{ "const j = a-b;", "const k = x - 1;", "const l = a-b-c;" }) |src| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const tree = try parseOpts(arena.allocator(), src, true); // jsx on
+        try testing.expectEqual(@as(usize, 0), tree.diagnostics.len);
+        const got = try dumpSource(arena.allocator(), src);
+        // A binary `-` node, not a single merged identifier token.
+        try testing.expect(std.mem.indexOf(u8, got, "(binary -") != null);
     }
 }
 
