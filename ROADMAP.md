@@ -208,17 +208,23 @@ Apple M4, ReleaseFast; see BENCHMARKS.md for methodology.
   substrate** (deterministic atoms, pre-parsed blob, shared frozen type
   store — KB/sub-ms payoff at current 132→220-line lib). **Still open in
   M10:** census tool, ~500k real-world corpus.
-- **M11 — semantic breadth (in progress).** Six features landed, each
+- **M11 — semantic breadth (in progress).** Ten features landed, each
   differential-tested vs tsc 5.5.4, `--noLib` hot path flat: **enums**
   (`2c43581`), **accessors + abstract** (`f1ae28e`), **`as const` +
   `satisfies`** (`c009ff3`), **type guards + assertion functions**
   (`d3c2304`), **namespaces + within-file merging** (`7ede24a`),
-  **async/await/Promise + basic generators** (`acb08ea`). Conformance
-  200 → 274. **Still open in M11:** `symbol`/`unique symbol` + the
-  `Symbol.iterator` iteration protocol (`for…of`/spread over Map/Set),
-  cross-file declaration merging (the general global-symbol layer — M11e-1
-  built the sealed-bind foundation), module augmentation + triple-slash
-  refs, JSX typing.
+  **async/await/Promise + basic generators** (`acb08ea`), **`Symbol.iterator`
+  iteration protocol** (`24d0447` — `for…of`/spread over Map/Set/generators/
+  user iterables via `[Symbol.iterator]()`; bare `Iterator<T>` correctly not
+  iterable), **ambient namespace implicit export** (`c69193f` — `declare
+  namespace` members visible as `N.member` without `export`, also fixing
+  function+ambient-namespace merged property access), **`Symbol` global**
+  (`8037ead` — callable + well-known symbols via interface+function+namespace
+  merge, closing the value-`Symbol` gap). `symbol` primitive + `typeof`
+  narrowing already worked. Conformance 200 → 292. **Still open in M11:**
+  general cross-file declaration merging (the global-symbol layer — M11e-1
+  built the sealed-bind foundation), `unique symbol` annotations (clean
+  out-of-subset today), module augmentation + triple-slash refs, JSX typing.
 
 ---
 
