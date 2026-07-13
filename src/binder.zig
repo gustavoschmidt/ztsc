@@ -145,6 +145,15 @@ pub const SymbolFlags = packed struct(u32) {
     }
 };
 
+/// Strip surrounding quotes from a module-specifier string-literal token.
+fn stripModuleQuotes(text: []const u8) []const u8 {
+    if (text.len >= 2 and (text[0] == '"' or text[0] == '\'')) {
+        if (text[text.len - 1] == text[0]) return text[1 .. text.len - 1];
+        return text[1..];
+    }
+    return text;
+}
+
 fn fbits(comptime f: SymbolFlags) u32 {
     return @bitCast(f);
 }
@@ -329,6 +338,14 @@ pub const Ref = struct {
     scope: ScopeId,
 };
 
+/// One `declare module "spec" { … }` block (M11c): the specifier atom (no
+/// quotes) and the body scope whose `export`ed members are the module's
+/// exports.
+pub const AmbientModule = struct {
+    spec: Atom,
+    scope: ScopeId,
+};
+
 /// The sealed bind result for one file. All slices live in the per-file
 /// arena; nothing is freed individually and nothing mutates after `bind`.
 pub const Bind = struct {
@@ -391,6 +408,11 @@ pub const Bind = struct {
     /// app module — the linker skips such files entirely (pay-per-use).
     global_atoms: []const Atom = &.{},
     global_syms: []const SymbolId = &.{},
+    /// `declare module "spec" { … }` blocks in this file (M11c). The linker
+    /// harvests each block scope's exported members into a program ambient
+    /// module keyed by `spec`, which imports of `"spec"` resolve against (and
+    /// which augments a real module's exports when `"spec"` also resolves).
+    ambient_modules: []const AmbientModule = &.{},
 
     // --- name resolution ---------------------------------------------------
 
@@ -835,6 +857,8 @@ const Binder = struct {
     /// (M11a). Includes `export {}` (a marker export with no bindings), which
     /// is exactly how a source file opts into module semantics.
     saw_module_syntax: bool = false,
+    /// `declare module "spec" { … }` blocks collected during binding (M11c).
+    ambient_mods: std.ArrayList(AmbientModule) = .empty,
 
     // --- small helpers ------------------------------------------------------
 
@@ -1303,31 +1327,35 @@ const Binder = struct {
                 const data = b.tree.extraData(ast.NamespaceData, b.tree.nodeData(node).lhs);
                 if (data.flags & ast.Flags.global_aug != 0) {
                     try b.bindGlobalAugmentation(node);
+                } else if (data.flags & ast.Flags.ambient_module != 0) {
+                    try b.bindAmbientModule(node);
                 } else {
                     try b.bindNamespace(node);
                 }
             },
+            // Only a *top-level* import/export makes the file a module; the same
+            // syntax nested in a namespace / `declare module` block does not.
             .import_decl => {
-                b.saw_module_syntax = true;
+                if (b.cur_scope == file_scope) b.saw_module_syntax = true;
                 try b.bindImport(node);
             },
             .export_decl => {
-                b.saw_module_syntax = true;
+                if (b.cur_scope == file_scope) b.saw_module_syntax = true;
                 const saved = b.exporting_node;
                 b.exporting_node = node;
                 try b.bindStatement(d.lhs);
                 b.exporting_node = saved;
             },
             .export_default => {
-                b.saw_module_syntax = true;
+                if (b.cur_scope == file_scope) b.saw_module_syntax = true;
                 try b.bindExportDefault(node);
             },
             .export_named => {
-                b.saw_module_syntax = true;
+                if (b.cur_scope == file_scope) b.saw_module_syntax = true;
                 try b.bindExportNamed(node);
             },
             .export_all => {
-                b.saw_module_syntax = true;
+                if (b.cur_scope == file_scope) b.saw_module_syntax = true;
                 try b.bindExportAll(node);
             },
 
@@ -1937,6 +1965,38 @@ const Binder = struct {
         try b.scope_stack.append(b.scratch, gs);
         b.cur_scope = gs;
         b.var_scope = gs;
+        b.ctx_base = b.ctxs.items.len;
+        b.cur_flow = try b.addFlow(.start, no_flow, node);
+
+        for (b.tree.extraRange(data.body_start, data.body_end)) |stmt| {
+            if (stmt != null_node) try b.bindStatement(stmt);
+        }
+        b.restoreState(saved);
+    }
+
+    /// `declare module "spec" { … }` (M11c). Binds the body into a fresh scope
+    /// (ambient context, so declarations may omit bodies/initializers) and
+    /// records `(spec, scope)`. Members need explicit `export` to be module
+    /// exports — like an ambient namespace body, `exporting_node` is set per
+    /// nested `export` statement, not pinned.
+    fn bindAmbientModule(b: *Binder, node: Node) Error!void {
+        const d = b.tree.nodeData(node);
+        const data = b.tree.extraData(ast.NamespaceData, d.lhs);
+        const spec = try b.atomOf(stripModuleQuotes(b.tokenText(data.name_token)));
+        const ms = try b.newScope(.namespace, node, file_scope);
+        try b.ambient_mods.append(b.scratch, .{ .spec = spec, .scope = ms });
+
+        const saved = b.saveState();
+        const was_ambient = b.ambient;
+        b.ambient = true;
+        defer b.ambient = was_ambient;
+        const clear_export = b.exporting_node;
+        b.exporting_node = 0;
+        defer b.exporting_node = clear_export;
+
+        try b.scope_stack.append(b.scratch, ms);
+        b.cur_scope = ms;
+        b.var_scope = ms;
         b.ctx_base = b.ctxs.items.len;
         b.cur_flow = try b.addFlow(.start, no_flow, node);
 
@@ -2672,6 +2732,7 @@ const Binder = struct {
         result.imports = try arena.dupe(ImportRec, b.import_recs.items);
         result.exports = try arena.dupe(ExportRec, b.export_recs.items);
         result.diagnostics = try arena.dupe(Diagnostic, b.diags.items);
+        result.ambient_modules = try arena.dupe(AmbientModule, b.ambient_mods.items);
         return result;
     }
 

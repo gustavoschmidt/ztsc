@@ -70,6 +70,7 @@ pub const Flags = struct {
     pub const const_enum: u32 = 1 << 17; // `const enum`
     pub const computed: u32 = 1 << 18; // `[Symbol.iterator]` well-known-symbol key
     pub const global_aug: u32 = 1 << 19; // `declare global { ... }` augmentation block
+    pub const ambient_module: u32 = 1 << 20; // `declare module "spec" { ... }`
 };
 
 /// Maps a well-known `Symbol` property name (the `iterator` in

@@ -693,6 +693,11 @@ const Linker = struct {
     state: []u8,
     tables: []std.AutoArrayHashMapUnmanaged(Atom, Target),
     diags: []std.ArrayList(LinkDiag),
+    /// Ambient/augmentation module registry (M11c): specifier atom → export
+    /// table (export-name atom → Target). Built from every file's
+    /// `declare module "spec" { … }` blocks; imports of `"spec"` resolve
+    /// against it (after the on-disk module, so it augments a real module).
+    ambient: std.AutoArrayHashMapUnmanaged(Atom, std.AutoArrayHashMapUnmanaged(Atom, Target)) = .empty,
 
     const visit_limit = 256;
 
@@ -830,6 +835,60 @@ const Linker = struct {
         return .{ .kind = .any };
     }
 
+    /// Populate the ambient/augmentation registry from every file's
+    /// `declare module "spec" { … }` blocks (M11c). Each block's `export`ed
+    /// members become entries in `spec`'s export table; the first contributor
+    /// of a name wins (deterministic FileId order). Must run after all export
+    /// tables are built (member `finalizeLocal` may follow re-exports).
+    fn buildAmbient(l: *Linker) Error!void {
+        for (l.files, 0..) |*f, fi| {
+            const fid: FileId = @intCast(fi);
+            const b = f.bind;
+            for (b.ambient_modules) |am| {
+                const gop = try l.ambient.getOrPut(l.scratch, am.spec);
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                const tbl = gop.value_ptr;
+                const lo = b.scope_members_start[am.scope];
+                const hi = b.scope_members_start[am.scope + 1];
+                for (lo..hi) |i| {
+                    const local = b.member_syms[i];
+                    if (!b.symbol_flags[local].exported) continue;
+                    const name = b.member_atoms[i];
+                    if (tbl.contains(name)) continue;
+                    const tgt = try l.finalizeLocal(fid, local, name, false, 0);
+                    try tbl.put(l.scratch, name, tgt);
+                }
+            }
+        }
+    }
+
+    fn lookupAmbient(l: *Linker, spec: Atom, name: Atom) ?Target {
+        const key = l.ambientKey(spec) orelse return null;
+        return l.ambient.getPtr(key).?.get(name);
+    }
+
+    fn hasAmbient(l: *Linker, spec: Atom) bool {
+        return l.ambientKey(spec) != null;
+    }
+
+    /// The registry key matching specifier `spec`: an exact `declare module`
+    /// name, else a wildcard pattern (`declare module "*.css"`, M11c). Returns
+    /// null when no ambient module covers the specifier.
+    fn ambientKey(l: *Linker, spec: Atom) ?Atom {
+        if (l.ambient.contains(spec)) return spec;
+        const text = l.atomText(spec);
+        for (l.ambient.keys()) |pat_atom| {
+            const pat = l.atomText(pat_atom);
+            const star = std.mem.indexOfScalar(u8, pat, '*') orelse continue;
+            const prefix = pat[0..star];
+            const suffix = pat[star + 1 ..];
+            if (text.len >= prefix.len + suffix.len and
+                std.mem.startsWith(u8, text, prefix) and
+                std.mem.endsWith(u8, text, suffix)) return pat_atom;
+        }
+        return null;
+    }
+
     /// TS2307 for unresolved module specifiers, one per statement.
     /// Side-effect-only imports (`import "./x"`) are exempt — tsc does not
     /// report unresolved modules for them under bundler resolution.
@@ -852,23 +911,39 @@ const Linker = struct {
             if (stripped.len == 0) continue;
             const atom = l.interner.intern(l.io, l.gpa, stripped) catch return Error.OutOfMemory;
             if (f.specs.get(atom) != null) continue;
+            if (l.hasAmbient(atom)) continue; // resolved by a `declare module`
             try l.diag(file, 2307, l.tokSpan(file, mod_tok), "Cannot find module '{s}' or its corresponding type declarations.", .{stripped});
         }
     }
 
-    /// Link one file's import bindings.
+    /// Link one file's import bindings. A named/default import resolves first
+    /// against the on-disk module (if the specifier resolved to a file), then
+    /// against an ambient/augmentation module of the same specifier (M11c), so
+    /// `declare module "spec"` supplies exports for an unresolved specifier and
+    /// augments a resolved one. Diagnostics fire only when the module is known
+    /// (a real file or an ambient declaration); a wholly unknown specifier is
+    /// left to `reportUnresolvedModules` (TS2307).
     fn linkImports(l: *Linker, file: FileId, locals: *std.ArrayList(u32), targets: *std.ArrayList(Target)) Error!void {
         const f = &l.files[file];
         for (f.bind.imports) |rec| {
             if (rec.kind == .side_effect) continue;
             const local_sym = f.bind.lookupInScope(binder.file_scope, rec.local) orelse continue;
             var tgt: Target = .{ .kind = .any };
-            if (f.specs.get(rec.module)) |mfile| {
+            const mfile_opt = f.specs.get(rec.module);
+            const known = mfile_opt != null or l.hasAmbient(rec.module);
+            if (known) {
                 switch (rec.kind) {
-                    .namespace => tgt = .{ .kind = .namespace, .file = mfile, .type_only = rec.type_only },
+                    .namespace => {
+                        // Namespace object of a real module; an ambient module's
+                        // namespace object is not modeled yet (types as `any`).
+                        if (mfile_opt) |mfile| tgt = .{ .kind = .namespace, .file = mfile, .type_only = rec.type_only };
+                    },
                     .named => {
-                        if (try l.lookupExport(mfile, rec.imported, 0)) |found| {
-                            tgt = found;
+                        var found: ?Target = null;
+                        if (mfile_opt) |mfile| found = try l.lookupExport(mfile, rec.imported, 0);
+                        if (found == null) found = l.lookupAmbient(rec.module, rec.imported);
+                        if (found) |ff| {
+                            tgt = ff;
                             tgt.type_only = tgt.type_only or rec.type_only;
                         } else {
                             try l.diag(file, 2305, l.nodeSpan(file, rec.node), "Module '\"{s}\"' has no exported member '{s}'.", .{
@@ -877,10 +952,15 @@ const Linker = struct {
                         }
                     },
                     .default => {
-                        if (try l.lookupExport(mfile, l.atom_default, 0)) |found| {
-                            tgt = found;
+                        var found: ?Target = null;
+                        if (mfile_opt) |mfile| found = try l.lookupExport(mfile, l.atom_default, 0);
+                        if (found == null) found = l.lookupAmbient(rec.module, l.atom_default);
+                        if (found) |ff| {
+                            tgt = ff;
                             tgt.type_only = tgt.type_only or rec.type_only;
-                        } else if ((try l.lookupExport(mfile, rec.local, 0)) != null) {
+                        } else if ((mfile_opt != null and (try l.lookupExport(mfile_opt.?, rec.local, 0)) != null) or
+                            l.lookupAmbient(rec.module, rec.local) != null)
+                        {
                             try l.diag(file, 2613, l.nodeSpan(file, rec.node), "Module '\"{s}\"' has no default export. Did you mean to use 'import {{ {s} }} from \"{s}\"' instead?", .{
                                 l.atomText(rec.module), l.atomText(rec.local), l.atomText(rec.module),
                             });
@@ -944,6 +1024,9 @@ pub fn link(
 
     // Build every export table (deterministic file order).
     for (0..files.len) |i| _ = try l.table(@intCast(i));
+    // Then the ambient/augmentation module registry (M11c), which import
+    // resolution and TS2307 suppression consult below.
+    try l.buildAmbient();
 
     const out = try arena.alloc(FileLinks, files.len);
     for (0..files.len) |i| {

@@ -717,12 +717,15 @@ const Parser = struct {
                         return p.parseEnumDecl(ast.Flags.declare);
                     },
                     .keyword_module, .keyword_namespace => {
-                        // `declare namespace N { ... }` (ambient): in subset
-                        // for an identifier name; a string-module name stays
-                        // unsupported.
+                        // `declare namespace N { ... }` (ambient, identifier
+                        // name) or `declare module "spec" { ... }` (ambient
+                        // module / augmentation, M11c). Both in subset.
                         _ = try p.bump(); // `declare`
                         if (isIdentLike(p.peekTag(1)) and !p.peekNewline(1)) {
                             return p.parseNamespaceDecl(ast.Flags.declare);
+                        }
+                        if (p.peekTag(1) == .string_literal and !p.peekNewline(1)) {
+                            return p.parseAmbientModule();
                         }
                         const start = p.curIdx();
                         _ = try p.bump();
@@ -1669,6 +1672,29 @@ const Parser = struct {
         const extra = try p.addExtra(ast.NamespaceData{
             .flags = ast.Flags.declare | ast.Flags.global_aug,
             .name_token = kw,
+            .body_start = body.start,
+            .body_end = body.end,
+        });
+        return p.addNode(.{ .tag = .namespace_decl, .main_token = kw, .data = .{ .lhs = extra, .rhs = 0 } });
+    }
+
+    /// `declare module "spec" { ... }` (the `declare` already consumed).
+    /// Modeled as a `namespace_decl` flagged `ambient_module`; `name_token`
+    /// is the specifier string literal. The block's exports become an ambient
+    /// module the linker resolves imports of `"spec"` against, and merges into
+    /// a real module's exports when `"spec"` also resolves (augmentation, M11c).
+    fn parseAmbientModule(p: *Parser) PE!Node {
+        const kw = try p.bump(); // `module`
+        const spec_tok = try p.bump(); // string literal
+        _ = try p.expect(.l_brace, .expected_l_brace);
+        const top = p.scratchTop();
+        defer p.scratch.shrinkRetainingCapacity(top);
+        try p.parseStatementList(top, .r_brace);
+        _ = try p.expect(.r_brace, .expected_r_brace);
+        const body = try p.scratchToSpan(top);
+        const extra = try p.addExtra(ast.NamespaceData{
+            .flags = ast.Flags.declare | ast.Flags.ambient_module,
+            .name_token = spec_tok,
             .body_start = body.start,
             .body_end = body.end,
         });
@@ -4063,9 +4089,10 @@ test "namespaces and modules (identifier-named) parse" {
 }
 
 test "unsupported: string-module and global augmentation" {
-    // String-module names stay out of subset (M11c); `declare global` is
-    // in subset as of M11a.
-    try expectDiagCount("declare module \"foo\" { export function f(): void; }", 1);
+    // `declare module "spec"` (ambient module / augmentation) is in subset as
+    // of M11c; `declare global` since M11a. Non-`declare` string modules stay
+    // out of subset.
+    try expectDiagCount("declare module \"foo\" { export function f(): void; }", 0);
     try expectDiagCount("module \"bar\" { export const x = 1; }", 1);
     try expectDiagCount("declare global { interface Window {} }", 0);
 }
