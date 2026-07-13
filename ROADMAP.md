@@ -149,8 +149,8 @@ without a scoreboard.
   (~5k LOC), medium (~50k), multi (201 files / ~93k), skewed; real-world
   corpora arrive with M10's census.
 - **Conformance**: differential testing against tsc — every case's expected
-  diagnostics (code + line) generated from and verified against real tsc.
-  180 cases as of M6, growing every milestone.
+  diagnostics (code + line) generated from and verified against real tsc
+  (5.5.4). 180 cases at M6, **297 as of M11**; grows every milestone.
 - **CI**: every merge runs tests; benchmark history in BENCHMARKS.md.
 
 ---
@@ -237,14 +237,15 @@ Apple M4, ReleaseFast; see BENCHMARKS.md for methodology.
 
 ## 5. The road to the public v0.0.1
 
-Eight milestones. Order is deliberate: pay down measured perf/memory debt
-while it's cheap (M7), fix a latent correctness gap before it gets hot
-(M8), lay the shared-lib substrate the whole release rests on (M9), then
-usefulness (M10), breadth (M11), the caching discipline that de-risks the
-type-level core (M12), the type-level core itself (M13), and the product
-surface (M14). Lessons from prior art bake the sequence: stc and Ezno
-(Rust) died on tsc-compatibility, not performance — the differential
-conformance discipline is non-negotiable as the surface grows.
+Eight milestones (M13 split into four sub-milestones M13a–d). Order is
+deliberate: pay down measured perf/memory debt while it's cheap (M7), fix a
+latent correctness gap before it gets hot (M8), lay the shared-lib
+substrate the whole release rests on (M9), then usefulness (M10), breadth
+(M11, largely landed — conformance 200→297), the caching discipline that
+de-risks the type-level core (M12), the type-level core itself (M13a–d),
+and the product surface (M14). Lessons from prior art bake the sequence:
+stc and Ezno (Rust) died on tsc-compatibility, not performance — the
+differential conformance discipline is non-negotiable as the surface grows.
 
 M7–M9, M12, and the new items inside M10/M11 come out of the 2026-07-12
 architecture review. All findings were verified in the code at commit
@@ -437,43 +438,105 @@ The single biggest usefulness unlock: without `Array.prototype.map`,
   isolated; large-corpus wall + RSS vs tsc/tsgo; resolution syscall
   counts before/after the cache.
 
-### M11 — semantic breadth (the boring 80%)
+### M11 — semantic breadth (the boring 80%) — largely landed
 
 Everything common that isn't type-level programming, in census order.
-Expected contents: enums (incl. `const enum`), namespaces + declaration
-merging (interface/namespace/class), getters/setters, `abstract` classes,
-`this` typing, `symbol`/`unique symbol`, async/await/`Promise` return
-typing, generators, user-defined type guards (`x is T`) + assertion
-functions, `satisfies`, `as const`, module augmentation, triple-slash refs,
-JSX typing (Bun runs frontends too — via the `JSX` namespace).
 
-- **Declaration merging needs a global symbol layer — decide the design
-  before writing feature code.** The linker maps each exported name to a
-  *single* defining `Target{file, payload}` (modules.zig:~61–81,
-  ~456–517); there is no way to express "interface `Foo` = the merge of
-  declarations in files X, Y, Z." Within-file interface merging already
-  works by reusing one members scope (binder.zig:~1717–1728), but
-  cross-file merging (interface/namespace/class) has no representation.
-  And **namespaces aren't bound at all** — `bindStatement`
-  (binder.zig:~1117–1199) has no `namespace`/`module` case, so
-  `namespace X {}` merging starts from zero. The fix is a global symbol
-  layer sitting above the sealed per-file `Bind`s that the checkers
-  consult; that layer is *also* where M9.3's shared-lib symbols live, so
-  design the two together — a merged symbol is the general case of which
-  a lib symbol is the single-declaration instance. Keep per-file `Bind`s
-  sealed and immutable; the global layer references into them.
-- JSX rescanning fits the existing architecture without redesign: the
-  scanner already rescans by resetting `scn.index` to a token start and
-  re-lexing under grammar context (`reScanSlashAsRegex`,
-  `reScanTemplateToken`, and the `>>`/`<<` split surgery in the parser);
-  JSX needs only additive `scanJsxText`/`reScanJsxToken`/`scanJsxIdentifier`
-  entry points and new tags. The standalone `scanner.tokenize` heuristic
-  driver is *not* on the parser path (the parser pulls `scn.next()`
-  directly), so JSX/regex correctness work only touches the parser-driven
-  path.
+**Done** (each differential-tested vs tsc 5.5.4; commits in §4): enums
+(+`const enum`), getters/setters, `abstract` classes, `as const`,
+`satisfies`, user-defined type guards (`x is T`) + assertion functions,
+namespaces + within-file merging, **ambient-namespace implicit export**
+(`declare namespace` members visible without `export`; also fixes
+function+ambient-namespace merged property access), async/await/`Promise`
+return typing, basic generators, `symbol` primitive + `typeof` narrowing,
+the **`Symbol.iterator` iteration protocol** (`for…of`/spread over
+Map/Set/generators/user iterables; bare `Iterator<T>` correctly not
+iterable), the **`Symbol` global** (callable + well-known symbols via an
+interface+function+namespace merge), and **JSX typing** (`.tsx` — see
+below). Conformance 200 → **297**.
+
+JSX landed exactly as the architecture note predicted: additive scanner
+`scanJsxChild` (children text is scanned directly from a tracked byte
+offset; tags/attributes/`{expr}` use ordinary scanning), additive parser/
+AST nodes gated on the `.tsx` extension (`parseOpts`/`isJsxPath`), and
+checker typing — intrinsic tags via `JSX.IntrinsicElements[tag]` (unknown
+tag → TS2339), component tags via their first parameter, attributes checked
+as a fresh object assigned to props (per-value TS2322, excess → TS2322,
+missing required → TS2741/2739), result `JSX.Element`. The standalone
+`scanner.tokenize` heuristic driver was untouched (not on the parser path).
+
+**Still open, with the complexity each carries:**
+
+- **General cross-file declaration merging — the global-symbol layer (the
+  big one, mostly architectural).** *Within-file* merging works (shared
+  members scope, binder.zig) and *across-import* interface merging already
+  propagates (a merged symbol imported from module M carries all its
+  members). What is missing is *global* merge: the same global name
+  declared in two different files (`interface Global {…}` in A.ts and B.ts,
+  or `declare global {…}`, or class+namespace across files). Complexity:
+  (1) the linker maps each exported name to a *single* `Target{file,
+  payload}` (modules.zig:~61–81, ~456–517) — no representation for
+  "interface `Foo` = merge of decls in files X, Y, Z"; (2) `collectGlobals`
+  (modules.zig:~240) harvests only the *lib* file's top-level scope — user
+  files' global-scope declarations are never collected, so cross-file
+  globals don't even see each other; (3) script-vs-module must be
+  distinguished (only script files share the ambient global scope; a file
+  with any `import`/`export` is a module and its top level is local); (4)
+  merge semantics differ per kind (interface = union members, namespace =
+  merge body scopes, class+namespace, function+namespace, enum+namespace,
+  `declare global`); (5) the layer is read by N checkers concurrently, so
+  it must be sealed/immutable after link and deterministic regardless of
+  worker scheduling — which couples it to M9.1 (deterministic atoms). Keep
+  per-file `Bind`s sealed and immutable; the global layer references into
+  them. Design it together with M9.3's shared-lib symbol store — a merged
+  symbol is the general case of which a lib symbol is the
+  single-declaration instance. **Payoff:** mostly `.d.ts`/`@types`/`declare
+  global` (e.g. resolving the `JSX` namespace supplied by `@types/react`,
+  or `@types/node`'s `declare namespace NodeJS`) — less common in app code,
+  which is why it was deprioritized behind the higher-frequency wins above.
+
+- **`unique symbol` annotations** (clean out-of-subset today). Complexity:
+  parse `unique symbol` in type position; enforce the position restriction
+  (only on `const` variables and `readonly static` members, TS1332
+  otherwise); give each `unique symbol` a *nominal* identity tied to its
+  declaration site so computed keys (`const k = Symbol(); { [k]: … }`) and
+  `obj[k]` access resolve by that identity. The `Symbol.iterator` protocol
+  already ships via *syntactic* `[Symbol.iterator]` recognition
+  (`ast.wellKnownSymbolKey`), so this is only needed for arbitrary
+  user-defined unique-symbol keys — low app-code frequency.
+
+- **Module augmentation + triple-slash references.** Complexity: `declare
+  module "pkg" { … }` merges into an existing module's exports — it *needs*
+  the global-symbol-layer / cross-file-merge infrastructure above (shares
+  that work). Wildcard module declarations (`declare module "*.css"`) add a
+  glob-match on specifiers. Triple-slash `/// <reference path=… />` /
+  `<reference types=… />` are directives in leading comments — the scanner
+  currently discards comments as trivia, so they must be captured before
+  the first token and fed into the module graph as extra program inputs
+  (a modules.zig discovery concern, not just parsing). Lower app-code
+  frequency.
+
+- **JSX polish (deferred bits).** Complexity: (1) `-` in JSX names
+  (`data-*`, `aria-*`) needs a JSX-identifier scan that spans `-` plus a
+  rescan entry point (today `data`, `-`, `foo` lex as three tokens), and
+  `IntrinsicElements` entries with index signatures to type them; (2)
+  class-component props (`class C extends Component<P>`) read props from the
+  instance type (`JSX.ElementClass` / its `props` member) rather than a
+  call signature; (3) resolving the `JSX` namespace from an *imported*
+  types package (React) rather than an in-scope declaration depends on the
+  global-symbol layer; (4) spread-attribute type-checking (spreads
+  currently bypass excess/missing checks), `key`/`ref` special-casing, and
+  `JSX.ElementChildrenAttribute` children typing.
+
+- **`this`-typing and decorators** (in the original M11 wishlist, not yet
+  done, low priority): polymorphic `this` return types / `this` parameters,
+  and (legacy/TC39) decorators. Both are uncommon in the target app code
+  and can trail the items above.
+
 - **Tests**: conformance grows toward ~500 cases, every feature
   differential vs tsc. **Benchmarks**: regression gates — memory/wall
-  budgets must not drift as semantics widen.
+  budgets must not drift as semantics widen (held so far: `--noLib` hot
+  path flat across all ten M11 features).
 
 ### M12 — instantiation discipline (de-risk M13)
 
@@ -511,23 +574,76 @@ this). This corpus is reused as M13's memory scoreboard.
 
 ### M13 — the type-level core (make-or-break)
 
-Conditional types + `infer` + distributivity, mapped types (+ `as` key
-remapping), template-literal types, recursive type aliases, generic indexed
-access, `keyof` over mapped types. This is what the `.d.ts` files of Zod,
-Drizzle, Hono, and Elysia are made of — the features your *dependencies*
-choose for you.
+This is what the `.d.ts` files of Zod, Drizzle, Hono, and Elysia are made
+of — the features your *dependencies* choose for you. It is large and
+high-risk, so it is split into four sub-milestones (M13a–M13d), each
+landable and gated on its own. All four build on M12's instantiation
+caching + tsc-compatible depth/count limits, so they add features on top of
+a cache that already exists rather than retrofitting one under pressure.
 
-- **Architecture rule learned from tsc's own pain**: instantiation caching
-  keyed on `(target, type-args)`, plus tsc-compatible depth/count limits —
-  **both landed in M12**, so this milestone builds features on top of a
-  cache that already exists rather than retrofitting one under pressure.
-  Hash-consing is the memory defense; laziness is the speed defense. This
-  milestone is where the ≤50%-of-tsgo memory goal is genuinely at risk —
-  measured continuously (on M12's generics-heavy corpus plus type-heavy
-  real corpora, zod/drizzle-style), not synthetic subset corpora.
-- **Tests**: type-level torture conformance vs tsc + real `.d.ts` files
-  from top libraries checked identically. **Benchmarks**: types/line, RSS,
-  and instantiation counts on type-heavy corpora.
+**Cross-cutting architecture (applies to every sub-milestone):**
+instantiation caching keyed on `(target, type-args)` and depth/count limits
+**land in M12**. Hash-consing is the memory defense; laziness (deferring
+evaluation while the input is still generic) is the speed defense *and* the
+correctness mechanism — tsc keeps conditional/indexed/mapped types
+unresolved until their generic inputs are known, and ztsc must mirror that
+deferral rather than eagerly evaluating. This is where the ≤50%-of-tsgo
+memory goal is genuinely at risk — measured continuously on M12's
+generics-heavy corpus plus type-heavy real corpora (zod/drizzle-style), not
+synthetic subset corpora. Every sub-milestone ships type-level torture
+conformance vs tsc plus real `.d.ts` files from top libraries checked
+identically; benchmarks track types/line, RSS, and instantiation counts.
+
+- **M13a — Conditional types + `infer` + distributivity.** `T extends U ? X
+  : Y`, `infer V` capture, and distribution over a naked type-parameter
+  union (`T extends any ? … : …` applied member-wise). Parse nodes are
+  already produced-then-discarded (parser.zig:~2513), so the front-end lift
+  is small; the checker work is the substance. Complexity: (1) *deferral* —
+  when the checked type is still generic the whole conditional stays
+  unresolved and must be interned as a deferred type, resolved on
+  instantiation; (2) `infer` scoping and the assignability probe that binds
+  it (inference from the `extends` clause, with multiple `infer` sites and
+  same-name unions/intersections); (3) distributivity rules (naked type
+  param vs wrapped `[T]`), and (4) assignability *between* conditional
+  types (identity + related-when-branches-related). Prerequisite for M13b/c
+  because mapped/template types lean on conditional evaluation.
+
+- **M13b — Mapped types (+ `as` key remapping).** `{ [K in Keys]: T }` with
+  modifiers (`readonly`, `?`, and the `+`/`-` add/remove forms) and `as`
+  key remapping (`{ [K in Keys as NewKey]: T }`). Mapped-type syntax is
+  currently skipped as out-of-subset (parser.zig:~3105), so both parser and
+  checker are net-new. Complexity: (1) *homomorphic* mapped types
+  (`{ [K in keyof T]: … }`) must preserve the source's modifiers and
+  tuple/array-ness; (2) key remapping produces filtered (`never`-drops) and
+  renamed keys, which needs template-literal evaluation for the common
+  rename patterns (couples to M13c); (3) interaction with `keyof` and
+  generic index access; (4) memory — a mapped type over a large key union
+  is a materialization explosion vector, so laziness/hash-consing matter
+  most here.
+
+- **M13c — Template-literal types.** `` `prefix-${T}-suffix` `` types, the
+  intrinsic string transforms (`Uppercase`/`Lowercase`/`Capitalize`/
+  `Uncapitalize`), and inference *from* template-literal types (pattern
+  matching a string against a template to bind `infer`). Complexity: (1)
+  the combinatorial cross-product when interpolation holes are unions is a
+  bounded-but-real explosion vector (needs the M12 count limits); (2)
+  pattern-match inference (parsing a literal against `` `${infer H}-${infer
+  T}` ``) is a small string matcher but must agree with tsc's greedy/lazy
+  rules exactly; (3) assignability between template-literal types and
+  string literals/`string`.
+
+- **M13d — Recursive type aliases + generic indexed access + `keyof` over
+  mapped/generic types.** Self-referential aliases (`type Json = string |
+  number | Json[] | { [k: string]: Json }`), indexed access `T[K]` where
+  `K` (and/or `T`) is a type parameter, and `keyof` applied to mapped or
+  otherwise-generic types. Complexity: (1) *termination* — recursive
+  aliases and generic indexed access must defer (stay unresolved while
+  generic) and rely on the M12 depth limits to avoid non-termination; (2)
+  `T[K]` deferral and its distribution over unions in `K`; (3) `keyof` over
+  a mapped type must reflect the mapped key set, closing the loop with
+  M13b. This sub-milestone is mostly "make the deferral machinery from
+  M13a–c compose without blowing the depth budget," so it lands last and
+  doubles as the integration/stress pass.
 
 ### M14 — ship it: bunx distribution + release
 
@@ -546,7 +662,7 @@ Batch checking only — no watch mode, no LSP (post-v0.0.1, §8).
 
 ---
 
-## 6. Current checked subset (as of M6)
+## 6. Current checked subset (as of M11)
 
 **In:** primitives + literal types, `unknown`/`any`/`never`/`void`;
 objects, interfaces (incl. `extends`), type aliases, arrays, tuples;
@@ -557,16 +673,27 @@ classes (fields, methods, `implements`/`extends`, visibility); control-flow
 narrowing (truthiness, `typeof`, `===`/`!==`, `in`, `instanceof`,
 discriminants, assignments); `keyof`, non-generic indexed access, `typeof`
 queries; ES modules incl. type-only imports, `.d.ts` reading; strict-mode
-semantics only (strictNullChecks always on).
+semantics only (strictNullChecks always on). **Since M10/M11:** the
+embedded ES-core `lib.d.ts` (M10); enums (+`const enum`), getters/setters,
+`abstract` classes, `as const`, `satisfies`, user-defined type guards +
+assertion functions, namespaces (+ within-file merging, + ambient implicit
+export), async/await/`Promise` typing, basic generators, `symbol` +
+`typeof "symbol"` narrowing, the `Symbol.iterator` iteration protocol
+(`for…of`/spread over Map/Set/generators/user iterables), the `Symbol`
+global, and JSX typing in `.tsx` (intrinsic + component elements against a
+`JSX` namespace).
 
-**Not yet** (queued in §5): `lib.d.ts` (M10); enums, namespaces,
-declaration merging, getters/setters divergence, `this`-typing,
-async/Promise typing, `satisfies`, `as const`, JSX, decorators (M11);
-conditional, mapped, and template-literal types, `infer` (M13).
-Unsupported syntax produces a clear "not supported" diagnostic — never a
-wrong answer or a crash (fuzzed at every phase). (M7–M9 and M12 are
-perf/memory/correctness/caching milestones — they change no checked
-subset; see §5.)
+**Not yet** (queued in §5): general **cross-file declaration merging** (the
+global-symbol layer; within-file and across-import merging already work),
+`unique symbol` annotations, module augmentation + triple-slash refs, JSX
+polish (`-` in names, class-component props, JSX namespace from imported
+`@types`), `this`-typing, decorators (rest of M11); **conditional types +
+`infer`** (M13a), **mapped types + `as` remapping** (M13b),
+**template-literal types** (M13c), **recursive aliases + generic indexed
+access + `keyof` over mapped types** (M13d). Unsupported syntax produces a
+clear "not supported" diagnostic — never a wrong answer or a crash (fuzzed
+at every phase). (M7–M9 and M12 are perf/memory/correctness/caching
+milestones — they change no checked subset; see §5.)
 
 ---
 
