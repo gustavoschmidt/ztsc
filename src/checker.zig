@@ -264,8 +264,14 @@ const Checker = struct {
     /// recompute rather than return the first (stale) signature. Named
     /// declarations always pass `no_type`, so they still hit unconditionally.
     sig_cache: std.AutoHashMapUnmanaged(u64, NodeType) = .empty,
-    /// (file << 32 | owner node) -> primary (lowest) scope id.
+    /// (file << 32 | owner node) -> primary (lowest) scope id. Populated
+    /// lazily per file by `faultScopes` on the first `scopeOf` read in that
+    /// file (M12 right-sizing), so a checker only maps scopes for files it
+    /// actually traverses — not every file of the program, per instance.
     node_scopes: std.AutoHashMapUnmanaged(u64, ScopeId) = .empty,
+    /// Per-file flag: has this file's scope-owner map been faulted into
+    /// `node_scopes` yet?
+    scopes_faulted: []bool = &.{},
     /// FileId -> module namespace object type (0 = in progress).
     ns_types: std.AutoHashMapUnmanaged(FileId, TypeId) = .empty,
     /// Ambient-module namespace-object cache, keyed by ambient_exports index.
@@ -372,25 +378,29 @@ const Checker = struct {
         const arena_alloc = c.carena.allocator();
         c.ts = try Store.init(arena_alloc);
         // Sized to include the merged-symbol range (ids ≥ totalSymbols()),
-        // so merged ids are valid sym_types/sym_state indices (M11a).
+        // so merged ids are valid sym_types/sym_state indices (M11a). These
+        // are indexed by *global* SymbolId — a checker reads them for foreign
+        // (lib/import/merged) symbols too, so they must span the whole space.
+        // M12 right-sizing: allocate zero-filled from the page allocator
+        // (mmap MAP_ANON is kernel-zeroed) and skip the eager memset — the
+        // memset would fault every page resident up front, but a checker only
+        // ever touches its owned files' symbols plus the foreign ones it
+        // resolves on demand. Untouched entries read the shared zero page (no
+        // residency), so peak RSS tracks the working set, not
+        // symbolSpace()×N_checkers. Freed in `deinit`.
         const total_syms = prog.symbolSpace();
-        c.sym_types = try arena_alloc.alloc(TypeId, total_syms);
-        @memset(c.sym_types, 0);
-        c.sym_state = try arena_alloc.alloc(u8, total_syms);
-        @memset(c.sym_state, 0);
+        c.sym_types = try std.heap.page_allocator.alloc(TypeId, total_syms);
+        errdefer std.heap.page_allocator.free(c.sym_types);
+        c.sym_state = try std.heap.page_allocator.alloc(u8, total_syms);
+        errdefer std.heap.page_allocator.free(c.sym_state);
         c.owned_mask = try arena_alloc.alloc(bool, prog.files.len);
         @memset(c.owned_mask, false);
         for (owned) |f| c.owned_mask[f] = true;
-        // Owner node -> primary scope map (first scope wins: lowest id),
-        // for every program file (foreign decls are traversed on demand).
-        for (prog.files, 0..) |*pf, fi| {
-            for (pf.bind.scope_owners, 0..) |owner, s| {
-                if (s == 0) continue;
-                const key = (@as(u64, @intCast(fi)) << 32) | owner;
-                const gop = try c.node_scopes.getOrPut(arena_alloc, key);
-                if (!gop.found_existing) gop.value_ptr.* = @intCast(s);
-            }
-        }
+        // Owner node -> primary scope map is filled lazily per file by
+        // `faultScopes`; only the per-file "already faulted" flags are set up
+        // here (all false = nothing mapped yet).
+        c.scopes_faulted = try arena_alloc.alloc(bool, prog.files.len);
+        @memset(c.scopes_faulted, false);
         c.atom_length = try c.atom("length");
         c.atom_Array = try c.atom("Array");
         c.atom_String = try c.atom("String");
@@ -414,6 +424,8 @@ const Checker = struct {
     }
 
     fn deinit(c: *Checker) void {
+        std.heap.page_allocator.free(c.sym_types);
+        std.heap.page_allocator.free(c.sym_state);
         c.diag_seen.deinit(c.gpa);
         c.diags.deinit(c.gpa);
         c.carena.deinit();
@@ -686,8 +698,25 @@ const Checker = struct {
         try c.diags.append(c.gpa, .{ .code = code, .file = c.cur_file, .span = span, .msg = msg });
     }
 
-    fn scopeOf(c: *const Checker, node: Node) ?ScopeId {
+    fn scopeOf(c: *Checker, node: Node) Error!?ScopeId {
+        if (!c.scopes_faulted[c.cur_file]) try c.faultScopes(c.cur_file);
         return c.node_scopes.get((@as(u64, c.cur_file) << 32) | node);
+    }
+
+    /// Lazily map every scope-owner node of file `f` to its primary (lowest)
+    /// scope id, the first time this checker reads a scope in that file (M12
+    /// right-sizing). First scope wins because `scope_owners` is walked in
+    /// ascending scope order and only unset keys are written.
+    fn faultScopes(c: *Checker, f: FileId) Error!void {
+        const arena_alloc = c.carena.allocator();
+        const b = c.prog.files[f].bind;
+        for (b.scope_owners, 0..) |owner, s| {
+            if (s == 0) continue;
+            const key = (@as(u64, @intCast(f)) << 32) | owner;
+            const gop = try c.node_scopes.getOrPut(arena_alloc, key);
+            if (!gop.found_existing) gop.value_ptr.* = @intCast(s);
+        }
+        c.scopes_faulted[f] = true;
     }
 
     /// Nearest enclosing function/file scope (for TDZ containment).
@@ -1362,7 +1391,7 @@ const Checker = struct {
             },
             else => return,
         }
-        const decl_scope = c.scopeOf(decl) orelse return;
+        const decl_scope = (try c.scopeOf(decl)) orelse return;
         for (c.tree.extraRange(tp_start, tp_end)) |tp| {
             if (tp == null_node or c.nodeTag(tp) != .type_param) continue;
             const a = try c.atomOfToken(c.tree.nodeMainToken(tp));
@@ -1640,7 +1669,7 @@ const Checker = struct {
         const proto = c.tree.extraData(ast.FnProto, proto_idx);
         const saved_scope = c.cur_scope;
         defer c.cur_scope = saved_scope;
-        if (c.scopeOf(node)) |s| c.cur_scope = s;
+        if (try c.scopeOf(node)) |s| c.cur_scope = s;
 
         // Type parameters (global symbol ids in the signature type).
         var tps: std.ArrayList(u32) = .empty;
@@ -2294,7 +2323,7 @@ const Checker = struct {
             const d = c.tree.nodeData(decl);
             const saved = c.cur_scope;
             defer c.cur_scope = saved;
-            if (c.scopeOf(decl)) |s| c.cur_scope = s else c.cur_scope = c.symScope(sym);
+            if (try c.scopeOf(decl)) |s| c.cur_scope = s else c.cur_scope = c.symScope(sym);
             result = try c.typeFromTypeNode(d.rhs);
             break;
         }
@@ -2415,7 +2444,7 @@ const Checker = struct {
             if (c.nodeTag(decl) != .interface_decl) continue;
             const d = c.tree.nodeData(decl);
             const data = c.tree.extraData(ast.InterfaceData, d.lhs);
-            if (c.scopeOf(decl)) |s| c.cur_scope = s;
+            if (try c.scopeOf(decl)) |s| c.cur_scope = s;
             for (c.tree.extraRange(data.extends_start, data.extends_end)) |h| {
                 if (h == null_node or c.nodeTag(h) != .heritage) continue;
                 const hd = c.tree.nodeData(h);
@@ -2437,7 +2466,7 @@ const Checker = struct {
         // Convert members in the (first) interface scope.
         for (c.declsOf(sym)) |decl| {
             if (c.nodeTag(decl) == .interface_decl) {
-                if (c.scopeOf(decl)) |s| c.cur_scope = s;
+                if (try c.scopeOf(decl)) |s| c.cur_scope = s;
                 break;
             }
         }
@@ -2525,7 +2554,7 @@ const Checker = struct {
             if (c.nodeTag(hd.lhs) != .identifier) return null;
             const saved = c.cur_scope;
             defer c.cur_scope = saved;
-            if (c.scopeOf(decl)) |s| c.cur_scope = s;
+            if (try c.scopeOf(decl)) |s| c.cur_scope = s;
             const a = try c.atomOfToken(c.tree.nodeMainToken(hd.lhs));
             switch (c.resolveSpace(a, c.cur_scope, true)) {
                 .sym => |base_sym0| {
@@ -6494,7 +6523,7 @@ const Checker = struct {
             .block => {
                 const saved = c.cur_scope;
                 defer c.cur_scope = saved;
-                if (c.scopeOf(node)) |s| c.cur_scope = s;
+                if (try c.scopeOf(node)) |s| c.cur_scope = s;
                 for (c.tree.nodeRange(node)) |stmt| try c.checkStatement(stmt);
             },
             .var_decl_one, .var_decl => try c.checkVarDeclStatement(node),
@@ -6522,7 +6551,7 @@ const Checker = struct {
                 const e = c.tree.extraData(ast.For, d.lhs);
                 const saved = c.cur_scope;
                 defer c.cur_scope = saved;
-                if (c.scopeOf(node)) |s| c.cur_scope = s;
+                if (try c.scopeOf(node)) |s| c.cur_scope = s;
                 if (e.init != 0) {
                     switch (c.nodeTag(e.init)) {
                         .var_decl_one, .var_decl => try c.checkVarDeclStatement(e.init),
@@ -6543,7 +6572,7 @@ const Checker = struct {
                     const cd = c.tree.nodeData(e.catch_clause);
                     const saved = c.cur_scope;
                     defer c.cur_scope = saved;
-                    if (c.scopeOf(e.catch_clause)) |s| c.cur_scope = s;
+                    if (try c.scopeOf(e.catch_clause)) |s| c.cur_scope = s;
                     if (cd.rhs != 0) {
                         if (c.nodeTag(cd.rhs) == .block) {
                             for (c.tree.nodeRange(cd.rhs)) |stmt| try c.checkStatement(stmt);
@@ -6662,7 +6691,7 @@ const Checker = struct {
         const is_of = c.nodeTag(node) == .for_of_stmt;
         const saved = c.cur_scope;
         defer c.cur_scope = saved;
-        if (c.scopeOf(node)) |s| c.cur_scope = s;
+        if (try c.scopeOf(node)) |s| c.cur_scope = s;
 
         const rt = try c.checkExprCached(e.right, types.no_type);
         var elem_t: TypeId = types.any_type;
@@ -6841,7 +6870,7 @@ const Checker = struct {
         const disc_t = try c.checkExprCached(d.lhs, types.no_type);
         const saved = c.cur_scope;
         defer c.cur_scope = saved;
-        if (c.scopeOf(node)) |s| c.cur_scope = s;
+        if (try c.scopeOf(node)) |s| c.cur_scope = s;
         const r = c.tree.extraData(ast.SubRange, d.rhs);
         for (c.tree.extraRange(r.start, r.end)) |clause| {
             if (clause == null_node) continue;
@@ -6904,7 +6933,7 @@ const Checker = struct {
             c.cur_scope = saved_scope;
             c.fn_ctx = saved_ctx;
         }
-        if (c.scopeOf(node)) |s| c.cur_scope = s;
+        if (try c.scopeOf(node)) |s| c.cur_scope = s;
         const is_async = proto.flags & ast.Flags.async != 0;
         const is_generator = proto.flags & ast.Flags.generator != 0;
         const ann: TypeId = if (proto.return_type != 0) try c.typeFromTypeNode(proto.return_type) else types.no_type;
@@ -7138,7 +7167,7 @@ const Checker = struct {
         // The body scope is the one owned by this node, or — for a merged
         // block whose scope is owned by an earlier block — the namespace
         // symbol's members scope.
-        if (c.scopeOf(node)) |s| {
+        if (try c.scopeOf(node)) |s| {
             c.cur_scope = s;
         } else if (data.name_token != 0) {
             const a = try c.atomOfToken(data.name_token);
@@ -7160,7 +7189,7 @@ const Checker = struct {
             c.cur_scope = saved_scope;
             c.this_type = saved_this;
         }
-        if (c.scopeOf(node)) |s| c.cur_scope = s;
+        if (try c.scopeOf(node)) |s| c.cur_scope = s;
 
         var class_sym: SymbolId = binder.no_symbol;
         if (data.name_token != 0) {

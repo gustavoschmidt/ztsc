@@ -523,6 +523,11 @@ pub fn main(init: std.process.Init) !void {
     var done = Channel(Completion).init(io);
     defer done.deinit();
 
+    // M12.1 — deterministic lib atoms. Intern the lib's strings single-
+    // threaded before any worker runs so the concurrent worker that binds
+    // file 0 re-interns them into these stable, run-to-run-identical atoms.
+    if (!cli.no_lib) try modules.seedLibAtoms(io, gpa, &interner);
+
     const discover_timer = Timer.start(io);
     for (workers) |*w| {
         w.thread = try std.Thread.spawn(.{}, Worker.discoverRun, .{

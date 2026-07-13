@@ -537,6 +537,16 @@ is real and M11 makes `@types/node`-sized inputs checkable. Three pieces;
 (1) is a prerequisite of (2). Retrofitting any of this after M15–M16
 would mean reworking the instantiation caches.
 
+> **Status (2026-07-13): split.** Piece (1) *deterministic atoms* and the
+> per-checker whole-program-state **right-sizing** (the last paragraph of (3))
+> shipped as the **M12 slice** — genuine wins now, independent of lib size.
+> Pieces (2) *pre-parsed blob* and the frozen-base/overlay half of (3) are
+> **rescheduled to M14.5**, because on today's trimmed 9 KB lib the
+> type-duplication they target is <1 MB (BENCHMARKS §3.2/§3.10) — unmeasurable
+> until the full pinned `@types/node` corpus lands (post-M14). **M15 is blocked
+> on M14.5's frozen store** (see M14.5). The descriptions below are retained as
+> the design of record for M14.5.
+
 1. **Deterministic atoms.** An `Atom` encodes shard-local *insertion
    order* (intern.zig:~120–124), which depends on worker scheduling — the
    same input produces different atoms run-to-run. That blocks (2) (a
@@ -578,11 +588,16 @@ would mean reworking the instantiation caches.
    twin of M11's merged-symbol layer** — a merged symbol expanded once
    into the frozen base is the intended end state; reuse M11's merge
    table as the enumeration of what to pre-expand. This subsumes §8's
-   "shared simple-type interner" dial. While in there, right-size the
-   per-checker whole-program state: `sym_types`/`sym_state` are
-   `totalSymbols() × 5 bytes × N` and `node_scopes` is eagerly filled
-   with every scope of every file per instance (checker.zig:~325–340) —
-   size to owned files plus lazily-faulted foreign entries.
+   "shared simple-type interner" dial. **[SHIPPED in the M12 slice, the
+   part independent of the frozen store] right-size the per-checker
+   whole-program state:** `sym_types`/`sym_state` were `totalSymbols() × 5
+   bytes × N` memset up front → now allocated zero-filled (mmap MAP_ANON) with
+   the memset dropped, so only touched (owned + faulted-foreign) symbol pages
+   become resident; `node_scopes` was eagerly filled with every scope of every
+   file per instance → now faulted per file on first `scopeOf` read
+   (`faultScopes`), so a checker maps only files it traverses. Byte-identical
+   for all N; RSS win concentrates at high N (BENCHMARKS §3.10). The frozen
+   base/overlay store itself is the M14.5 part.
 
 **Gate:** diagnostics byte-identical for any N (existing test); RSS at
 N=4 within a small constant of N=1 on the multi corpus *and* the M11
@@ -650,6 +665,60 @@ census order once M13's table exists. Complexity notes per item:
   differential vs tsc. **Benchmarks**: regression gates — memory/wall
   budgets must not drift as semantics widen (held so far: `--noLib` hot
   path flat across all ten M10 features).
+
+### M14.5 — Shared-lib substrate, part 2 (deferred from M12; gates M15)
+
+The two lib-gated pieces of M12 (§M12), rescheduled here because their payoff
+is unmeasurable until a realistic large lib / `@types/node` corpus exists — on
+the trimmed 9 KB embedded lib the cross-checker type-duplication overhead is
+<1 MB (BENCHMARKS §3.2/§3.10). M12.1 (deterministic atoms) and the per-checker
+right-sizing already shipped in the M12 slice; the remaining two land once the
+full pinned `@types/node` corpus does (planned alongside M13's real-world
+corpus / M14's census output, hence *after* M14):
+
+1. **Build-time pre-parsed embedded lib blob** (was M12.2). A `build.zig` step
+   runs ztsc's own front end over the (by-then-larger) lib and `@embedFile`s
+   the sealed AST/tokens/binder outputs; startup loads the blob instead of
+   parsing+binding. Depends on M12.1's deterministic atoms (the blob references
+   stable lib atoms — already in place). Wins: near-zero cold start, no
+   doubling slack, and a serialization pass that strips the lib's orphan
+   parsed-then-discarded sub-nodes and per-construct `unsupported_syntax`
+   diagnostics.
+2. **Shared frozen-base / per-checker-overlay type store** (was M12.3). After
+   link, expand lib/`@types` types **once** into a base `Store` and freeze it;
+   per-checker overlay stores allocate TypeIds *above* the base range and probe
+   the frozen base (types + base×base relation-cache entries) before interning
+   locally. This is the type-level twin of M11's merged-symbol layer — reuse
+   the M11 merge table as the enumeration of what to pre-expand. Contained to
+   `types.zig` (checker.zig touches the store only through accessors — 0 direct
+   array reads today, so keep it that way; see layout commitments below).
+
+**Gate:** diagnostics byte-identical for any N; RSS at N=4 within a small
+constant of N=1 on the multi corpus *and* the full `@types/node` fixture; blob
+load time vs source-parse time recorded in BENCHMARKS.md. The
+`node_accept/backend` mini-fixture is too small to show the N× win (BENCHMARKS
+§3.10) — it validates the harness, not the gate.
+
+> **M15 must not start until piece 2 (the frozen store) has landed.** M15
+> reworks the instantiation caches (`expandRef`/`instantiate`/`eraseTypeParams`
+> memos), and those must be designed around the base/overlay TypeId split from
+> the outset — retrofitting the split into already-shipped instantiation caches
+> is exactly the rework the M12 header's retrofit warning calls out.
+
+**Layout commitments** (cheap insurance so the deferred pieces slot in
+mechanically — honor these in all intervening work, M13/M14 included):
+- The **seeded lib-atom prefix stays a contiguous, versioned range**: lib
+  strings occupy `[1, N_lib]` in seed order (`modules.seedLibAtoms`), assigned
+  before any user-file atom. Do not interleave user atoms into that range or
+  reorder the seed. The blob (piece 1) bakes in these atom values; a version
+  tag on the seed table lets a stale blob be detected and rejected.
+- **No new code may assume a TypeId is checker-local.** TypeIds are treated as
+  potentially spanning a shared frozen base (ids `< base_len`) plus a
+  per-checker overlay (ids `≥ base_len`). Concretely: never compare a TypeId to
+  a checker-local count to infer "mine vs theirs", never index a per-checker
+  array by a raw TypeId without the base/overlay split in mind, and keep all
+  store reads going through `types.Store` accessors (no direct
+  `.kinds/.data_a/.data_b/.extra` array indexing outside `types.zig`).
 
 ### M15 — Instantiation discipline (de-risk M16)
 

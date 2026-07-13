@@ -298,6 +298,30 @@ pub fn computeSymBase(alloc: Allocator, files: []const ProgFile) Error![]u32 {
     return base;
 }
 
+/// M12.1 — deterministic lib atoms. Intern every string the lib front end
+/// produces, single-threaded, *before* the worker pool starts. An `Atom`
+/// encodes shard-local insertion order (intern.zig), so run-to-run stability
+/// requires the lib's strings to be interned in a fixed order ahead of the
+/// concurrent user-file work; the worker that later binds the lib re-interns
+/// the same text and receives these stable atoms. This is option (a) of
+/// ROADMAP M12.1: it pins the lib's atoms (the ones a serialized lib blob,
+/// M12.2, must reference) without touching user-file atoms.
+///
+/// Seeding runs the real binder — not a token scan — so it interns exactly
+/// what binding interns, including the text transforms binding applies
+/// (`stripQuotes`, well-known-symbol keys, the "default"/"*" constants).
+/// The parse/bind products are thrown away; only their interner side effects
+/// (which are idempotent) survive. Cheap: the lib is ~9 KB.
+pub fn seedLibAtoms(io: Io, gpa: Allocator, interner: *Interner) !void {
+    var seed_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer seed_arena.deinit();
+    const sa = seed_arena.allocator();
+    const lib_tree = try parser.parse(sa, lib_source);
+    _ = try binder.bind(sa, io, gpa, interner, &lib_tree, lib_source);
+    // The lib file's own path atom is interned by the worker front end too.
+    _ = try interner.intern(io, gpa, lib_path);
+}
+
 /// FileId of the injected lib file (matched by its synthetic path), or
 /// `no_file` when no lib was injected.
 pub fn libFileId(files: []const ProgFile) FileId {
@@ -1466,6 +1490,41 @@ fn sortSpecs(atoms: []Atom, files: []FileId) void {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "seedLibAtoms: covers every atom the lib binder produces (M12.1 determinism)" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+
+    // Seed a fresh interner single-threaded, as the CLI does before spawning
+    // workers.
+    var itn1 = Interner.init();
+    defer itn1.deinit(gpa);
+    try seedLibAtoms(io, gpa, &itn1);
+    const seeded_count = itn1.count(io);
+
+    // Re-binding the lib into the seeded interner must intern *zero* new
+    // strings: seeding already produced every atom binding needs, including
+    // the transformed ones (stripQuotes, well-known-symbol keys, the
+    // "default"/"*" constants). Anything seeding missed would be interned
+    // here for the first time by a worker thread — i.e. nondeterministically.
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tree = try parser.parse(a, lib_source);
+    const b = try binder.bind(a, io, gpa, &itn1, &tree, lib_source);
+    try testing.expectEqual(seeded_count, itn1.count(io));
+
+    // A second, independent seed assigns byte-for-byte identical atom values
+    // to the lib's strings — the run-to-run stability M12.2's blob relies on.
+    var itn2 = Interner.init();
+    defer itn2.deinit(gpa);
+    try seedLibAtoms(io, gpa, &itn2);
+    try testing.expectEqual(seeded_count, itn2.count(io));
+    for (b.symbol_names[1..]) |atom| {
+        if (atom == 0) continue; // anonymous symbol, no name
+        try testing.expectEqualStrings(itn1.lookup(io, atom), itn2.lookup(io, atom));
+    }
+}
 
 test "normalizePath: lexical cleanup" {
     const alloc = testing.allocator;

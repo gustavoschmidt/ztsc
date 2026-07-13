@@ -333,6 +333,61 @@ name is merged.
 
 ---
 
+## 3.10 M12 — deterministic atoms + per-checker right-sizing
+
+M12's substrate (ROADMAP §M12) is split: M12.1 (deterministic lib atoms) and
+the per-checker whole-program-state right-sizing land now; the two lib-gated
+pieces — the pre-parsed embedded lib blob and the shared frozen-base/overlay
+type store — are **rescheduled to a slot between M14 and M15**, because their
+payoff only materializes with a realistic large lib / `@types/node` (see §3.2:
+the type-duplication overhead is <1 MB on today's trimmed 9 KB lib, so a shared
+store would be unmeasurable now).
+
+**M12.1 — deterministic atoms.** `modules.seedLibAtoms` interns every string
+the lib front end produces, single-threaded, before the worker pool starts, so
+the worker that binds file 0 re-interns them into stable run-to-run atoms.
+Zero wall/RSS change (the seed is a sub-ms parse+bind of a 9 KB file). This is
+the prerequisite for the deferred blob (a serialized lib must reference stable
+atoms).
+
+**Right-sizing.** Each of the N checker instances previously (a) `@memset` a
+`symbolSpace()`-wide `sym_types`/`sym_state` pair up front and (b) eagerly
+mapped *every* scope of *every* file into its own `node_scopes`. Both are now
+paid per working-set: the symbol arrays are allocated zero-filled (mmap
+MAP_ANON) with the memset dropped, so untouched entries read the shared zero
+page (no residency); `node_scopes` is faulted per file on first `scopeOf` read,
+so a checker only maps files it actually traverses.
+
+Multi corpus (201 files / 93k lines, ReleaseFast, peak RSS via `/usr/bin/time
+-l`); diagnostics verified **byte-identical for N ∈ {1,2,4,8}** (raw order, on a
+diagnostic-producing variant — the synthetic corpus itself is clean):
+
+| N | peak RSS before | peak RSS after | wall (unchanged) |
+|---:|---:|---:|---:|
+| 1 | 48.5 MB | 48.5 MB | 0.05 s |
+| 2 | 50.0 MB | 50.1 MB | 0.03 s |
+| 4 | 52.5 MB | 52.7 MB | 0.02 s |
+| 8 | 50.1–51.0 MB | **44.9–47.0 MB** | 0.02 s |
+
+The win concentrates at high N — more checkers means more avoided
+`symbolSpace()` memsets — which is the intended shape; at low N the front-end
+arenas dominate RSS and the delta is within run-to-run noise. Wall clock is
+unchanged (no hot-path structure change; `scopeOf` gained one predictable
+per-file branch). The absolute saving is small here because the lib is tiny —
+it scales with program symbol count, and the *type*-duplication half of the
+memory story waits on the deferred frozen store + a realistic lib.
+
+**Gate smoke-test (node-shaped fixture).** Ran the RSS gate against
+`test/conformance/node_accept/backend/` (M11's mini-`@types/node`, 10 files /
+412 lines): diagnostics byte-identical for N ∈ {1,2,4,8}; RSS 6.77 → 6.96 →
+7.11 → 7.44 MB across N. RSS *grows* slightly with N here because the fixture
+is too small for any per-checker duplication to dominate the fixed overhead —
+so this confirms the measurement harness works but, as expected, does **not**
+show the N× win. That win needs the full pinned `@types/node` corpus, which is
+still deferred (post-M14); the deferred frozen store is what will cash it in.
+
+---
+
 ## 4. Cross-checking correctness while benchmarking
 
 Before timing, all three tools were run on the corpora: `ztsc -p`,
