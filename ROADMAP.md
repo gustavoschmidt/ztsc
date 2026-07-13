@@ -721,16 +721,34 @@ What's left of the breadth work after M10 (history §4) and M11, in
 census order now that M13's table exists (BENCHMARKS §3.12). Complexity notes
 per item:
 
-- **`import()` types (`import("m").T`, `typeof import("m")`) — census-elevated,
-  do first.** The M13 census found these at **21%** of all out-of-subset
-  constructs — the second-most-common after conditional types, far above their
-  original (unlisted) priority. Published `.d.ts` lean on them to reference a
-  module's type without a top-level import. Parse the type form (nodes are
-  already produced-then-discarded, parser.zig), resolve the specifier through
-  the existing module-resolution path (M13 memo), and index into the resolved
-  module's export types; `typeof import` yields the module's value-namespace
-  type. No new type-level machinery — it is resolution + property access, which
-  is why it slots into M14 rather than M16.
+- **`import()` types (`import("m").T`, `typeof import("m")`). ✅ DONE
+  (2026-07-13).** Was census-elevated at **21%** of all out-of-subset
+  constructs (M13) — the second-most-common; it dropped to **0** after this
+  landed (post-M14 census: conditional 44.8% + infer 18.4% now lead). Landed:
+  a new `.import_type` AST node (specifier string token in `lhs`) that composes
+  with `qualified_name` (`.T`), `type_ref` (`<A>`), and `typeof_type`
+  (parser `parseImportType`); the binder emits a side-effect import record so
+  discovery pulls the module in (`bindImportType`, both discovery paths
+  unchanged); the checker resolves the specifier through `ProgFile.specs` (real
+  files) *or* an ambient `declare module` (new `Program.ambient_specs` index,
+  exact + wildcard) and indexes the module's export table — `import("m").T[<args>]`
+  via `importTypeMember`→`namedTypeFromSymbol`, nested `import("m").NS.T` via
+  `resolveTypeNamespace`, `typeof import("m")` via `namespaceObjectType`, and
+  `typeof import("m").val` via the export's `targetValueType`. Unresolved
+  module ⇒ TS2307; missing/non-type member ⇒ TS2694. No new type-level
+  machinery — resolution + property access, as planned. Differential-tested vs
+  tsc 5.5.4 (conformance 313 → 318, new `test/conformance/import_types/`: named
+  + generic type, `typeof` value, nested namespace, missing module/member,
+  bare-package via `node_modules`).
+  **Latent hash-cons bug fixed en route (soundness):** materializing cross-file
+  type-guards exposed that `types.Store.shapeWords` omitted a predicate
+  function's 3 predicate words from its shape — so `(x) => x is A` and
+  `(x) => x is B` hash-consed to the *same* TypeId (and a predicate-flagged
+  function instantiated without a predicate read out of bounds). Fixed by
+  including the predicate words in the shape and enforcing the
+  flag-set ⟺ words-present invariant in `makeFunctionPred`; unit test in
+  `types.zig`. Zero benchmark regression (multi corpus: wall 0.02 s, RSS
+  ~52.8 MB, both flat vs base).
 - **`unique symbol` annotations** (clean out-of-subset today; census 1.3% —
   low, as the roadmap guessed). Parse
   `unique symbol` in type position; enforce the position restriction

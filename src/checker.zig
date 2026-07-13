@@ -1135,6 +1135,12 @@ const Checker = struct {
                 return c.typeFromTypeName(d.lhs, args.items);
             },
             .qualified_name => return c.typeFromQualifiedName(node, &.{}),
+            .import_type => {
+                // Bare `import("m")` in type position: resolve for discovery /
+                // TS2307; the module namespace itself is not a type — `any`.
+                _ = try c.resolveImportTypeModule(node, true);
+                return types.any_type;
+            },
             .string_literal => return c.ts.makeStringLiteral(try c.memberAtom(c.tree.nodeMainToken(node)), false),
             .template_literal => return c.ts.makeStringLiteral(try c.templateAtom(c.tree.nodeMainToken(node)), false),
             .number_literal => return c.ts.makeNumberLiteral(c.numberTokenValue(c.tree.nodeMainToken(node)), false),
@@ -1293,12 +1299,100 @@ const Checker = struct {
         return c.toGlobalIn(c.symFile(ns_sym), local);
     }
 
+    /// A resolved type-position `import("m")` target: an on-disk program file
+    /// or an ambient/augmentation module (M11c).
+    const ModuleRef = union(enum) { file: FileId, ambient: u32 };
+
+    /// Resolve an `.import_type` node's specifier to its module. Reports TS2307
+    /// (deduped per span) when the specifier resolves to neither an on-disk
+    /// module nor an ambient `declare module`.
+    fn resolveImportTypeModule(c: *Checker, import_node: Node, report: bool) Error!?ModuleRef {
+        const spec_tok = c.tree.nodeData(import_node).lhs;
+        if (spec_tok == 0) return null;
+        const spec = try c.memberAtom(spec_tok);
+        if (c.prog.files.len != 0) {
+            if (c.prog.files[c.cur_file].specs.get(spec)) |mfile| return .{ .file = mfile };
+        }
+        if (c.ambientIndex(spec)) |idx| return .{ .ambient = idx };
+        if (report) {
+            try c.diagFmt(2307, c.tokSpan(spec_tok), "Cannot find module '{s}' or its corresponding type declarations.", .{stripQuotes(c.tokenText(spec_tok))});
+        }
+        return null;
+    }
+
+    /// Ambient-module registry index matching specifier `spec`: exact name,
+    /// else a wildcard pattern (`declare module "*.css"`). Mirrors the linker's
+    /// `ambientKey` so import() types resolve against the same registry.
+    fn ambientIndex(c: *Checker, spec: Atom) ?u32 {
+        const specs = c.prog.ambient_specs;
+        for (specs, 0..) |s, i| if (s == spec) return @intCast(i);
+        const text = c.atomText(spec);
+        for (specs, 0..) |s, i| {
+            const pat = c.atomText(s);
+            const star = std.mem.indexOfScalar(u8, pat, '*') orelse continue;
+            const prefix = pat[0..star];
+            const suffix = pat[star + 1 ..];
+            if (text.len >= prefix.len + suffix.len and
+                std.mem.startsWith(u8, text, prefix) and
+                std.mem.endsWith(u8, text, suffix)) return @intCast(i);
+        }
+        return null;
+    }
+
+    /// Look up export `name` in a resolved module, returning its link Target.
+    fn moduleExportTarget(c: *Checker, m: ModuleRef, name: Atom) ?modules.Target {
+        switch (m) {
+            .file => |f| {
+                if (c.prog.links.len == 0) return null;
+                return c.prog.links[f].exportTarget(name);
+            },
+            .ambient => |idx| {
+                const ae = c.prog.ambient_exports[idx];
+                var lo: usize = 0;
+                var hi: usize = ae.atoms.len;
+                while (lo < hi) {
+                    const mid = lo + (hi - lo) / 2;
+                    if (ae.atoms[mid] == name) return ae.targets[mid];
+                    if (ae.atoms[mid] < name) lo = mid + 1 else hi = mid;
+                }
+                return null;
+            },
+        }
+    }
+
+    /// The global symbol an export Target denotes (for type materialization),
+    /// or null for non-binding targets (namespace objects, default expressions).
+    fn targetTypeSym(c: *Checker, tgt: modules.Target) ?SymbolId {
+        return switch (tgt.kind) {
+            .binding => c.toGlobalIn(tgt.file, tgt.payload),
+            else => null,
+        };
+    }
+
+    /// `import("m").T[<args>]` in type position (M14): resolve the module, then
+    /// its exported type `T`. Unresolved module ⇒ TS2307 (in the resolver);
+    /// missing/non-type member ⇒ TS2694, matching tsc.
+    fn importTypeMember(c: *Checker, import_node: Node, name_tok: TokenIndex, args: []const TypeId) Error!TypeId {
+        const m = (try c.resolveImportTypeModule(import_node, true)) orelse return types.error_type;
+        const name = try c.memberAtom(name_tok);
+        if (c.moduleExportTarget(m, name)) |tgt| {
+            if (c.targetTypeSym(tgt)) |sym| {
+                if (hasTypeMeaning(c.symFlags(sym))) return c.namedTypeFromSymbol(sym, args, name_tok);
+            }
+        }
+        const spec_tok = c.tree.nodeData(import_node).lhs;
+        try c.diagFmt(2694, c.tokSpan(name_tok), "Namespace '{s}' has no exported member '{s}'.", .{ stripQuotes(c.tokenText(spec_tok)), c.atomText(name) });
+        return types.error_type;
+    }
+
     /// Resolve a qualified type name `A.B.T` (in type position) by walking
     /// namespace containers left-to-right, then building the final member's
     /// type. Missing/non-exported members report TS2694 like tsc.
     fn typeFromQualifiedName(c: *Checker, node: Node, args: []const TypeId) Error!TypeId {
         const d = c.tree.nodeData(node);
         const name_tok: TokenIndex = d.rhs;
+        // `import("m").T` — the qualifier base is a module, not a namespace sym.
+        if (c.nodeTag(d.lhs) == .import_type) return c.importTypeMember(d.lhs, name_tok, args);
         const name = try c.memberAtom(name_tok);
         const ns_sym = (try c.resolveTypeNamespace(d.lhs)) orelse return types.any_type;
         if (c.namespaceMemberSym(ns_sym, name)) |g| {
@@ -1328,8 +1422,19 @@ const Checker = struct {
             },
             .qualified_name => {
                 const d = c.tree.nodeData(node);
-                const outer = (try c.resolveTypeNamespace(d.lhs)) orelse return null;
                 const name = try c.memberAtom(d.rhs);
+                // `import("m").NS` as a namespace container: resolve the module
+                // and require its export `NS` to be a namespace.
+                if (c.nodeTag(d.lhs) == .import_type) {
+                    const m = (try c.resolveImportTypeModule(d.lhs, true)) orelse return null;
+                    if (c.moduleExportTarget(m, name)) |tgt| {
+                        if (c.targetTypeSym(tgt)) |g| {
+                            if (c.symFlags(g).namespace_decl) return g;
+                        }
+                    }
+                    return null;
+                }
+                const outer = (try c.resolveTypeNamespace(d.lhs)) orelse return null;
                 if (c.namespaceMemberSym(outer, name)) |g| {
                     const mf = c.symFlags(g);
                     if (mf.exported and mf.namespace_decl) return g;
@@ -1357,6 +1462,26 @@ const Checker = struct {
     /// `typeof entity` in type position: the entity's value type.
     fn typeofEntity(c: *Checker, node: Node) Error!TypeId {
         if (node == null_node) return types.any_type;
+        // `typeof import("m")` — the module's value-namespace object type.
+        if (c.nodeTag(node) == .import_type) {
+            const m = (try c.resolveImportTypeModule(node, true)) orelse return types.error_type;
+            return switch (m) {
+                .file => |f| c.namespaceObjectType(f),
+                .ambient => |idx| c.ambientNamespaceType(idx),
+            };
+        }
+        // `typeof import("m").val` — the value type of the export `val`.
+        if (c.nodeTag(node) == .qualified_name) {
+            const d = c.tree.nodeData(node);
+            if (c.nodeTag(d.lhs) == .import_type) {
+                const m = (try c.resolveImportTypeModule(d.lhs, true)) orelse return types.error_type;
+                const name = try c.memberAtom(d.rhs);
+                if (c.moduleExportTarget(m, name)) |tgt| return c.targetValueType(tgt);
+                const spec_tok = c.tree.nodeData(d.lhs).lhs;
+                try c.diagFmt(2694, c.tokSpan(d.rhs), "Namespace '{s}' has no exported member '{s}'.", .{ stripQuotes(c.tokenText(spec_tok)), c.atomText(name) });
+                return types.error_type;
+            }
+        }
         if (c.nodeTag(node) != .identifier) return types.any_type;
         const tok = c.tree.nodeMainToken(node);
         if (c.tree.tokens.tag(tok) == .keyword_undefined) return types.undefined_type;

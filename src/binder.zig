@@ -2472,6 +2472,7 @@ const Binder = struct {
                 // `typeof x` references the *value* x.
                 try b.bindTypeofEntity(d.lhs);
             },
+            .import_type => try b.bindImportType(node),
             .function_type, .method_signature => try b.bindFunctionType(node, d.lhs),
             .object_type => {
                 const ms = try b.newScope(.interface_members, node, b.cur_scope);
@@ -2527,8 +2528,28 @@ const Binder = struct {
                 try b.refs.append(b.scratch, .{ .atom = atom, .node = node, .scope = b.cur_scope });
             },
             .qualified_name => try b.bindTypeofEntity(b.tree.nodeData(node).lhs),
+            .import_type => try b.bindImportType(node),
             else => {},
         }
+    }
+
+    /// A type-position `import("m")` (M14): register the specifier as a module
+    /// dependency so discovery pulls `m` into the program. Emitted as a
+    /// side-effect import record (no local binding); `linkImports` skips it and
+    /// the checker resolves the module's exports lazily via `ProgFile.specs`.
+    fn bindImportType(b: *Binder, node: Node) Error!void {
+        const spec_tok = b.tree.nodeData(node).lhs;
+        if (spec_tok == 0) return; // parse error: no specifier
+        const module = try b.moduleAtom(spec_tok);
+        if (module == 0) return;
+        try b.import_recs.append(b.scratch, .{
+            .local = 0,
+            .imported = 0,
+            .module = module,
+            .node = node,
+            .kind = .side_effect,
+            .type_only = true,
+        });
     }
 
     fn isIntrinsicTypeToken(tag: scanner.Tag) bool {

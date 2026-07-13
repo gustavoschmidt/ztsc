@@ -717,6 +717,7 @@ pub fn main(init: std.process.Init) !void {
         .globals = lr.globals,
         .merged = lr.merged,
         .ambient_exports = lr.ambient_exports,
+        .ambient_specs = lr.ambient_specs,
         .constit_keys = lr.constit_keys,
         .constit_vals = lr.constit_vals,
     };

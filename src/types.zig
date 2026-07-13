@@ -439,7 +439,12 @@ pub const Store = struct {
             .object => return s.extra.items[a .. a + 3 + 3 * b],
             .function => {
                 const tpc = s.extra.items[a + 2];
-                return s.extra.items[a .. a + 3 + tpc + 3 * b];
+                // A predicate function (`x is T` / `asserts x`) stores 3 extra
+                // words after the params; they are part of the type's identity,
+                // so include them in the shape or two guards differing only in
+                // the predicate would hash-cons together.
+                const pred: u32 = if (s.extra.items[a] & fn_flag_predicate != 0) 3 else 0;
+                return s.extra.items[a .. a + 3 + tpc + 3 * b + pred];
             },
             .ref => return s.extra.items[a .. a + 1 + b],
             else => {
@@ -619,7 +624,11 @@ pub const Store = struct {
         flags0: u32,
         pred: ?Predicate,
     ) Error!TypeId {
-        const flags = if (pred != null) flags0 | fn_flag_predicate else flags0;
+        // Invariant: the predicate flag is set exactly when predicate words are
+        // appended. A caller may pass `flags0` copied from a predicate source
+        // (e.g. signature instantiation) while supplying no predicate — clear
+        // the bit so it never claims words that are not there.
+        const flags = if (pred != null) flags0 | fn_flag_predicate else flags0 & ~fn_flag_predicate;
         const start = s.pending.items.len;
         defer s.pending.items.len = start;
         try s.pending.append(s.alloc, flags);
@@ -857,6 +866,30 @@ test "interning: literals and arrays are canonical" {
     try testing.expect(arr1 != arr3);
     // Nested: number[][] interned once.
     try testing.expectEqual(try s.makeArray(arr1), try s.makeArray(arr2));
+}
+
+test "interning: predicate functions are distinct by predicate" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var s = try Store.init(arena.allocator());
+    const params = [_]Param{.{ .name = 1, .ty = unknown_type, .flags = 0 }};
+
+    // Two guards `(x) => x is string` / `(x) => x is number` share params/return
+    // but differ only in the predicate — they must NOT hash-cons together
+    // (the predicate words are part of the shape).
+    const g_str = try s.makeFunctionPred(&params, boolean_type, &.{}, 0, .{ .asserts = false, .param = 0, .ty = string_type });
+    const g_str2 = try s.makeFunctionPred(&params, boolean_type, &.{}, 0, .{ .asserts = false, .param = 0, .ty = string_type });
+    const g_num = try s.makeFunctionPred(&params, boolean_type, &.{}, 0, .{ .asserts = false, .param = 0, .ty = number_type });
+    try testing.expectEqual(g_str, g_str2); // identical guards canonicalize
+    try testing.expect(g_str != g_num); // different predicate ⇒ distinct type
+
+    // A non-predicate function built with predicate-flagged source flags must
+    // drop the flag (no predicate words appended) — else its shape would claim
+    // words that are not there (OOB / corruption).
+    const plain = try s.makeFunction(&params, boolean_type, &.{}, fn_flag_predicate);
+    try testing.expect(!s.fnHasPredicate(plain));
+    // Interning it again is stable (round-trips through the shape cleanly).
+    try testing.expectEqual(plain, try s.makeFunction(&params, boolean_type, &.{}, fn_flag_predicate));
 }
 
 test "union canonicalization: order, dups, flatten, never, true|false" {

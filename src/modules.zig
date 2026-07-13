@@ -236,6 +236,10 @@ pub const Program = struct {
     /// Ambient module export tables (M11c), indexed by `Target.ambient_ns`
     /// payloads; for `import * as ns from "<ambient>"` namespace objects.
     ambient_exports: []const AmbientExport = &.{},
+    /// Specifier atom of each `ambient_exports[i]` (the `declare module`
+    /// name/pattern, in registry order). Lets a type-position `import("m")`
+    /// (M14) resolve against an ambient module by exact or wildcard match.
+    ambient_specs: []const Atom = &.{},
     /// Reverse merge index (M11a): merge-constituent real id → merged id,
     /// parallel arrays sorted by key. See `mergedOf`.
     constit_keys: []const u32 = &.{},
@@ -1190,6 +1194,7 @@ pub const LinkResult = struct {
     globals: Globals = .{},
     merged: []const MergedSym = &.{},
     ambient_exports: []const AmbientExport = &.{},
+    ambient_specs: []const Atom = &.{},
     constit_keys: []const u32 = &.{},
     constit_vals: []const u32 = &.{},
 };
@@ -1264,6 +1269,8 @@ pub fn link(
     // Seal the ambient module export tables (M11c) in registry order, so
     // `Target.ambient_ns` payloads (assigned from `getIndex`) address them.
     const amb = try arena.alloc(AmbientExport, l.ambient.count());
+    const amb_specs = try arena.alloc(Atom, l.ambient.count());
+    @memcpy(amb_specs, l.ambient.keys());
     for (l.ambient.values(), 0..) |*tbl, i| {
         const n = tbl.count();
         const atoms = try arena.alloc(Atom, n);
@@ -1274,7 +1281,7 @@ pub fn link(
         amb[i] = .{ .atoms = atoms, .targets = tgts };
     }
 
-    return .{ .links = out, .sym_base = sym_base, .globals = gm.globals, .merged = gm.merged, .ambient_exports = amb, .constit_keys = gm.constit_keys, .constit_vals = gm.constit_vals };
+    return .{ .links = out, .sym_base = sym_base, .globals = gm.globals, .merged = gm.merged, .ambient_exports = amb, .ambient_specs = amb_specs, .constit_keys = gm.constit_keys, .constit_vals = gm.constit_vals };
 }
 
 /// Sort parallel (key, value) arrays by key ascending. Export/import tables
@@ -1517,6 +1524,7 @@ pub fn buildProgram(
             .globals = lr.globals,
             .merged = lr.merged,
             .ambient_exports = lr.ambient_exports,
+            .ambient_specs = lr.ambient_specs,
             .constit_keys = lr.constit_keys,
             .constit_vals = lr.constit_vals,
         },

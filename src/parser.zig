@@ -3058,9 +3058,9 @@ const Parser = struct {
             .keyword_typeof => {
                 const kw = try p.bump();
                 if (p.curTag() == .keyword_import) {
-                    // `typeof import("m")` — out of subset.
-                    p.skipImportTypeTail();
-                    return p.unsupportedFrom(kw);
+                    // `typeof import("m")[.value]` (M14).
+                    const inner = try p.parseImportType();
+                    return p.addNode(.{ .tag = .typeof_type, .main_token = kw, .data = .{ .lhs = inner, .rhs = 0 } });
                 }
                 const entity = try p.parseEntityName();
                 return p.addNode(.{ .tag = .typeof_type, .main_token = kw, .data = .{ .lhs = entity, .rhs = 0 } });
@@ -3079,11 +3079,7 @@ const Parser = struct {
                 _ = try p.parseTemplateExpr();
                 return p.unsupportedFrom(start);
             },
-            .keyword_import => {
-                const start = p.curIdx();
-                p.skipImportTypeTail();
-                return p.unsupportedFrom(start);
-            },
+            .keyword_import => return p.parseImportType(),
             .unknown => {
                 try p.fail(.unexpected_character);
                 _ = try p.bump();
@@ -3117,26 +3113,36 @@ const Parser = struct {
         return name;
     }
 
-    /// Consume `import("m")[.qualifier][<args>]` without building nodes.
-    fn skipImportTypeTail(p: *Parser) void {
-        _ = p.bump() catch return; // import
-        if (p.curTag() == .l_paren) {
-            _ = p.bump() catch return;
-            var depth: u32 = 1;
-            while (depth > 0) {
-                switch (p.curTag()) {
-                    .eof => return,
-                    .l_paren => depth += 1,
-                    .r_paren => depth -= 1,
-                    else => {},
-                }
-                _ = p.bump() catch return;
-            }
+    /// `import("m")[.A.B][<args>]` in type position (M14). Builds an
+    /// `.import_type` node (specifier string token in `lhs`), wraps qualifiers
+    /// in `qualified_name`, and type arguments in `type_ref` — so the checker
+    /// resolves it the same way it resolves `Ns.T<...>`.
+    fn parseImportType(p: *Parser) PE!Node {
+        const kw = try p.bump(); // import
+        _ = try p.expect(.l_paren, .expected_l_paren);
+        var spec_tok: u32 = 0;
+        if (p.curTag() == .string_literal) {
+            spec_tok = p.curIdx();
+            _ = try p.bump();
+        } else {
+            try p.fail(.expected_type);
         }
+        // Tolerate `import("m", { with: {...} })` assertions: skip to `)`.
+        while (p.curTag() != .r_paren and p.curTag() != .eof) _ = try p.bump();
+        _ = try p.expect(.r_paren, .expected_r_paren);
+        var ty = try p.addNode(.{ .tag = .import_type, .main_token = kw, .data = .{ .lhs = spec_tok, .rhs = 0 } });
         while (p.curTag() == .dot) {
-            _ = p.bump() catch return;
-            if (isNameLike(p.curTag())) _ = p.bump() catch return;
+            const dot = try p.bump();
+            const part = try p.expectMemberName();
+            ty = try p.addNode(.{ .tag = .qualified_name, .main_token = dot, .data = .{ .lhs = ty, .rhs = part } });
         }
+        if (p.atLt()) {
+            const lt_tok = p.curIdx();
+            const targs = try p.parseTypeArgs();
+            const extra = try p.addExtra(targs);
+            ty = try p.addNode(.{ .tag = .type_ref, .main_token = lt_tok, .data = .{ .lhs = ty, .rhs = extra } });
+        }
+        return ty;
     }
 
     fn parseTypeArgs(p: *Parser) PE!ast.SubRange {
@@ -3892,6 +3898,24 @@ test "golden: type alias forms" {
     );
 }
 
+test "golden: import() types (M14)" {
+    try expectSExpr("type T = import(\"m\").Foo;",
+        \\(type_alias T (qualified_name (import_type "m") Foo))
+    );
+    try expectSExpr("type T = import(\"m\").Bar<A>;",
+        \\(type_alias T (type_ref (qualified_name (import_type "m") Bar) (identifier A)))
+    );
+    try expectSExpr("type T = import(\"m\").NS.Inner;",
+        \\(type_alias T (qualified_name (qualified_name (import_type "m") NS) Inner))
+    );
+    try expectSExpr("type T = typeof import(\"m\");",
+        \\(type_alias T (typeof_type (import_type "m")))
+    );
+    try expectSExpr("type T = typeof import(\"m\").val;",
+        \\(type_alias T (typeof_type (qualified_name (import_type "m") val)))
+    );
+}
+
 // --- golden: the type grammar ----------------------------------------------------
 
 test "golden: union, intersection, precedence" {
@@ -4159,7 +4183,6 @@ test "unsupported: import= and export=" {
 
 test "unsupported: misc type-level constructs" {
     try expectDiagCount("type F = new () => Thing;", 1); // constructor type
-    try expectDiagCount("type P = typeof import(\"m\");", 1);
     try expectDiagCount("type U = unique symbol;", 1);
     try expectDiagCount("interface I { (x: number): string; }", 1); // call signature
     try expectDiagCount("interface I { new (x: number): Thing; }", 1); // construct signature

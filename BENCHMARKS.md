@@ -480,6 +480,13 @@ conditionals, confirming M16a-first. `unique symbol` (1.3%) stays low-priority a
 the roadmap guessed. The census is now a standing tool: re-run
 `bench/fetch_real.sh census` on any package set.
 
+**Post-M14 update (2026-07-13):** `import()` types now check (M14), so they
+dropped out of the census entirely — a re-run over the same corpus reports
+**0** `import() type` constructs (total out-of-subset falls ~2287 → ~1795),
+leaving **conditional type (44.8%) + infer (18.4%)** as the top pair and
+confirming M16a as the next-highest-value target. Table above preserved as the
+M13 snapshot.
+
 ---
 
 ## 4. Cross-checking correctness while benchmarking

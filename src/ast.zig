@@ -473,6 +473,12 @@ pub const Tag = enum(u8) {
     type_ref,
     /// `A.B`. main_token = `.`; lhs = left node, rhs = name token.
     qualified_name,
+    /// `import("m")` in type position (M14). main_token = `import` keyword;
+    /// lhs = the module-specifier *string token* (not a node), rhs unused.
+    /// Composes: `import("m").T` is `qualified_name{lhs=import_type}`,
+    /// `import("m").T<A>` wraps that in a `type_ref`, and `typeof import("m")`
+    /// wraps it in a `typeof_type`.
+    import_type,
 };
 
 pub const CondExpr = struct { then_expr: Node, else_expr: Node };
@@ -757,6 +763,8 @@ pub const Ast = struct {
                 .import_specifier,
                 .export_specifier,
                 .jsx_text,
+                // import_type's lhs is the specifier *token*, not a node.
+                .import_type,
                 => {},
 
                 // lhs only.
@@ -999,6 +1007,7 @@ pub const Ast = struct {
         const d = a.nodeData(node);
         switch (a.nodeTag(node)) {
             .member_expr, .optional_member_expr, .qualified_name => l.add(d.rhs),
+            .import_type => l.add(d.lhs), // module-specifier string token
             .break_stmt, .continue_stmt => l.add(d.lhs),
             .import_decl => {
                 const e = a.extraData(ImportData, d.lhs);
@@ -1117,6 +1126,7 @@ pub const Ast = struct {
                 if (d.rhs != 0) try w.writeAll(" *");
             },
             .unsupported => try w.print(" tokens={d}..{d}", .{ a.nodeMainToken(node), d.rhs }),
+            .import_type => try w.print(" {s}", .{a.tokenSlice(src, d.lhs)}),
             else => {},
         }
 
