@@ -351,7 +351,31 @@ should not trade them away):**
 diagnostic codes below are expectations — the differential harness is
 authoritative, verify each against tsc 5.5.4):**
 
-- **M11a — harvest + global interface merge.**
+- **M11a — harvest + global interface merge. ✅ DONE (2026-07-13).**
+  Landed: `declare global { … }` parsing (parser.zig, reusing the namespace
+  body machinery via a `global_aug` flag); binder script-vs-module
+  classification (`Bind.is_module`) + a sorted harvest slice
+  (`Bind.global_atoms`/`global_syms`) — whole file scope for a script/the
+  lib, `declare global` block members (bound into one shared per-file
+  scope) for a module; `mergeGlobals` folding every harvest slice in FileId
+  order into `Program.globals` + `Program.merged` (merged-range ids
+  ≥ `totalSymbols()`); checker routing of merged ids through the merge
+  table (`reprSym`, merged-aware `symFlags`/`symNameAtom`/`declsOf`, and
+  `interfaceGeneric` folding each constituent's members in its own file
+  context). Differential-tested against tsc 5.5.4 (5 fixtures under
+  `test/conformance/global_merge/`: interface merged across 2 and 3 module
+  files, a global `var`/`function` used cross-file, within-block interface
+  reopen, and lib `String` augmentation). Zero benchmark regression —
+  modules contribute empty slices and the merge path is skipped
+  (invariant 3).
+  **Deferred to a follow-up / M11b:** cross-file *conflict* diagnostics
+  (TS2300/TS2403/TS2717 — TS2403/TS2717 are type-level, a checker not a
+  linker concern); TS2669 placement enforcement; cross-file type-parameter
+  unification for generic-interface augmentation (e.g. `Array<T>`); the
+  pre-materialized merged-member index (not needed until namespace member
+  lookup in M11b — interface property lookup already collapses to a single
+  object type); script-file cross-file merge that is not reachable through
+  import discovery (needs triple-slash refs, M11c).
   - *Binder:* script-vs-module classification (any `import`/`export` ⇒
     module; expose a flag on `Bind`). Emit the harvest slice: sorted
     `(atom → local sym)` of global contributions — the whole top level

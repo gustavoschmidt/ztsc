@@ -730,10 +730,11 @@ const Parser = struct {
                         return p.unsupportedFrom(start);
                     },
                     .keyword_global => {
-                        const start = try p.bump();
-                        p.skipUnsupportedBlockish();
-                        const node = try p.unsupportedFrom(start);
-                        return node;
+                        // `declare global { ... }` — global-scope augmentation
+                        // (M11a). In subset: a block whose members merge into
+                        // the program's global symbol table at link time.
+                        _ = try p.bump(); // `declare`
+                        return p.parseGlobalAugmentation();
                     },
                     else => {},
                 };
@@ -1646,6 +1647,28 @@ const Parser = struct {
         const extra = try p.addExtra(ast.NamespaceData{
             .flags = flags,
             .name_token = name_tok,
+            .body_start = body.start,
+            .body_end = body.end,
+        });
+        return p.addNode(.{ .tag = .namespace_decl, .main_token = kw, .data = .{ .lhs = extra, .rhs = 0 } });
+    }
+
+    /// `declare global { ... }` (the `declare` already consumed). Modeled as a
+    /// `namespace_decl` flagged `global_aug`: no namespace symbol is declared;
+    /// the block's top-level declarations become global contributions the
+    /// linker merges into the program global table (M11a). `name_token` points
+    /// at the `global` keyword purely for span/dump purposes.
+    fn parseGlobalAugmentation(p: *Parser) PE!Node {
+        const kw = try p.bump(); // `global`
+        _ = try p.expect(.l_brace, .expected_l_brace);
+        const top = p.scratchTop();
+        defer p.scratch.shrinkRetainingCapacity(top);
+        try p.parseStatementList(top, .r_brace);
+        _ = try p.expect(.r_brace, .expected_r_brace);
+        const body = try p.scratchToSpan(top);
+        const extra = try p.addExtra(ast.NamespaceData{
+            .flags = ast.Flags.declare | ast.Flags.global_aug,
+            .name_token = kw,
             .body_start = body.start,
             .body_end = body.end,
         });
@@ -4040,10 +4063,11 @@ test "namespaces and modules (identifier-named) parse" {
 }
 
 test "unsupported: string-module and global augmentation" {
-    // String-module names and `global` augmentation stay out of subset.
+    // String-module names stay out of subset (M11c); `declare global` is
+    // in subset as of M11a.
     try expectDiagCount("declare module \"foo\" { export function f(): void; }", 1);
-    try expectDiagCount("declare global { interface Window {} }", 1);
     try expectDiagCount("module \"bar\" { export const x = 1; }", 1);
+    try expectDiagCount("declare global { interface Window {} }", 0);
 }
 
 test "unsupported: decorators" {

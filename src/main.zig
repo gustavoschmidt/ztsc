@@ -674,14 +674,15 @@ pub fn main(init: std.process.Init) !void {
             .specs = .{ .atoms = spec_atoms_all.items[i], .files = spec_files_all.items[i] },
         };
     }
-    const links = try modules.link(arena, gpa, io, &interner, prog_files);
-    const sym_base = try modules.computeSymBase(arena, prog_files);
+    const lr = try modules.link(arena, gpa, io, &interner, prog_files);
+    const links = lr.links;
     const prog = try arena.create(modules.Program);
     prog.* = .{
         .files = prog_files,
-        .sym_base = sym_base,
+        .sym_base = lr.sym_base,
         .links = links,
-        .globals = try modules.collectGlobals(arena, prog_files, sym_base, modules.libFileId(prog_files)),
+        .globals = lr.globals,
+        .merged = lr.merged,
     };
     const link_ns = link_timer.readNs();
 

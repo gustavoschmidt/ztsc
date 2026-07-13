@@ -369,7 +369,9 @@ const Checker = struct {
         errdefer c.scratch_arena.deinit();
         const arena_alloc = c.carena.allocator();
         c.ts = try Store.init(arena_alloc);
-        const total_syms = prog.totalSymbols();
+        // Sized to include the merged-symbol range (ids ≥ totalSymbols()),
+        // so merged ids are valid sym_types/sym_state indices (M11a).
+        const total_syms = prog.symbolSpace();
         c.sym_types = try arena_alloc.alloc(TypeId, total_syms);
         @memset(c.sym_types, 0);
         c.sym_state = try arena_alloc.alloc(u8, total_syms);
@@ -508,8 +510,26 @@ const Checker = struct {
         return saved;
     }
 
-    /// File that owns global symbol `sym` (fast path: current file).
-    fn symFile(c: *const Checker, sym: SymbolId) FileId {
+    /// Representative *real* constituent id for decl/scope/file operations on
+    /// a (possibly merged) symbol (M11a). Non-merged ids pass through; a
+    /// merged id resolves to a type-space contributor when one exists (so
+    /// interface/class/alias decl walks land on real nodes), else its first
+    /// part. Type materialization that must fold *all* constituents
+    /// (`interfaceGeneric`, merged value type) does not go through here.
+    fn reprSym(c: *const Checker, sym: SymbolId) SymbolId {
+        if (!c.prog.isMergedId(sym)) return sym;
+        const m = c.prog.mergedSym(sym);
+        for (m.parts) |p| {
+            const f = c.prog.files[c.symFile(p)].bind.symbol_flags[p - c.prog.sym_base[c.symFile(p)]];
+            if (f.interface or f.class or f.type_alias or f.enum_decl or f.namespace_decl) return p;
+        }
+        return m.parts[0];
+    }
+
+    /// File that owns global symbol `sym` (fast path: current file). A merged
+    /// id resolves via its representative constituent.
+    fn symFile(c: *const Checker, sym0: SymbolId) FileId {
+        const sym = if (c.prog.isMergedId(sym0)) c.reprSym(sym0) else sym0;
         const base = c.prog.sym_base;
         if (sym >= base[c.cur_file] and sym < base[c.cur_file + 1]) return c.cur_file;
         var lo: usize = 0;
@@ -521,9 +541,10 @@ const Checker = struct {
         return @intCast(lo);
     }
 
-    /// Local (per-file) id of a global symbol.
+    /// Local (per-file) id of a global symbol (via representative for merged).
     fn localOf(c: *const Checker, sym: SymbolId) SymbolId {
-        return sym - c.prog.sym_base[c.symFile(sym)];
+        const s = c.reprSym(sym);
+        return s - c.prog.sym_base[c.symFile(s)];
     }
 
     /// Global id of a local symbol of the current file.
@@ -541,26 +562,35 @@ const Checker = struct {
         return c.prog.files[c.symFile(sym)].bind;
     }
 
+    /// Combined symbol flags. A merged symbol reports the OR of its
+    /// constituents' flags (M11a).
     fn symFlags(c: *const Checker, sym: SymbolId) binder.SymbolFlags {
+        if (c.prog.isMergedId(sym)) return c.prog.mergedSym(sym).flags;
         const f = c.symFile(sym);
         return c.prog.files[f].bind.symbol_flags[sym - c.prog.sym_base[f]];
     }
 
     fn symNameAtom(c: *const Checker, sym: SymbolId) Atom {
+        if (c.prog.isMergedId(sym)) return c.prog.mergedSym(sym).name;
         const f = c.symFile(sym);
         return c.prog.files[f].bind.symbol_names[sym - c.prog.sym_base[f]];
     }
 
-    /// Local scope id of `sym` within its own file.
+    /// Local scope id of `sym` within its own file (via representative for
+    /// merged symbols).
     fn symScope(c: *const Checker, sym: SymbolId) ScopeId {
-        const f = c.symFile(sym);
-        return c.prog.files[f].bind.symbol_scopes[sym - c.prog.sym_base[f]];
+        const s = c.reprSym(sym);
+        const f = c.symFile(s);
+        return c.prog.files[f].bind.symbol_scopes[s - c.prog.sym_base[f]];
     }
 
-    /// Decl nodes of a global symbol (valid in `symFile(sym)`'s tree).
+    /// Decl nodes of a global symbol (valid in `symFile(sym)`'s tree). For a
+    /// merged symbol this is the representative constituent's decls; folding
+    /// *all* constituents is done by the type materializers.
     fn declsOf(c: *const Checker, sym: SymbolId) []const Node {
-        const f = c.symFile(sym);
-        return c.prog.files[f].bind.declsOf(sym - c.prog.sym_base[f]);
+        const s = c.reprSym(sym);
+        const f = c.symFile(s);
+        return c.prog.files[f].bind.declsOf(s - c.prog.sym_base[f]);
     }
 
     /// (file << 32 | node) cache key for the current file.
@@ -577,7 +607,7 @@ const Checker = struct {
 
     /// Link target of an import-binding symbol (null in unlinked mode).
     fn importTarget(c: *const Checker, sym: SymbolId) ?modules.Target {
-        if (c.prog.links.len == 0) return null;
+        if (c.prog.links.len == 0 or c.prog.isMergedId(sym)) return null;
         const f = c.symFile(sym);
         return c.prog.links[f].importTarget(sym - c.prog.sym_base[f]);
     }
@@ -1014,7 +1044,7 @@ const Checker = struct {
     }
 
     fn symbolName(c: *Checker, sym: u32) []const u8 {
-        if (sym == 0 or sym >= c.prog.totalSymbols()) return "?";
+        if (sym == 0 or sym >= c.prog.symbolSpace()) return "?";
         return c.atomText(c.symNameAtom(sym));
     }
 
@@ -1824,6 +1854,17 @@ const Checker = struct {
     }
 
     fn computeTypeOfSymbol(c: *Checker, sym: SymbolId) Error!TypeId {
+        // A merged symbol's *value* type comes from its first value-space
+        // constituent (M11a); the type space is materialized via `expandRef`
+        // /`interfaceGeneric`, which fold every constituent. (Same-type across
+        // constituents is a checker-level rule — TS2403 — deferred.)
+        if (c.prog.isMergedId(sym)) {
+            const m = c.prog.mergedSym(sym);
+            for (m.parts) |p| {
+                if (hasValueMeaning(c.symFlags(p))) return c.typeOfSymbol(p);
+            }
+            return types.any_type;
+        }
         const f = c.symFlags(sym);
         if (f.import_binding) return c.importedSymbolType(sym);
         // A namespace is a value object of its exported members, modeled as a
@@ -2285,6 +2326,34 @@ const Checker = struct {
         }
         try c.iface_generic.put(c.ca(), sym, types.no_type);
 
+        // Constituents: a within-file interface is one symbol carrying every
+        // reopened block's decls; a cross-file merged interface (M11a) is a
+        // list of per-file symbols. Each constituent's members must be
+        // converted in *its own* file context (member type nodes resolve
+        // against that file's scopes), so build one object type per
+        // constituent and union them (earlier-file members win — disjoint in
+        // the clean case; conflicting members are TS2717, deferred).
+        var one = [_]SymbolId{sym};
+        const parts: []const SymbolId = if (c.prog.isMergedId(sym)) c.prog.mergedSym(sym).parts else one[0..];
+
+        var result: TypeId = types.no_type;
+        for (parts) |csym| {
+            if (!c.symFlags(csym).interface) continue;
+            const own = try c.interfaceConstituentObject(csym);
+            result = if (result == types.no_type) own else try c.mergeBaseObject(result, own);
+        }
+        if (result == types.no_type) result = types.empty_object_type;
+        try c.iface_generic.put(c.ca(), sym, result);
+        return result;
+    }
+
+    /// Object shape of a single interface symbol (one file): union of every
+    /// reopened block's members plus `extends` bases. Runs entirely in the
+    /// symbol's own file context.
+    fn interfaceConstituentObject(c: *Checker, sym: SymbolId) Error!TypeId {
+        const saved_ctx = c.enterSymFile(sym);
+        defer c.restoreCtx(saved_ctx);
+
         var all_members: std.ArrayList(Node) = .empty;
         defer all_members.deinit(c.scratch());
         var bases: std.ArrayList(TypeId) = .empty;
@@ -2324,7 +2393,6 @@ const Checker = struct {
         for (bases.items) |base| {
             own = try c.mergeBaseObject(own, try c.resolveStructural(base));
         }
-        try c.iface_generic.put(c.ca(), sym, own);
         return own;
     }
 

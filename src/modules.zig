@@ -164,11 +164,27 @@ pub const FileLinks = struct {
     }
 };
 
+/// A cross-file merged global symbol (M11a). When 2+ files contribute the
+/// same global name, the linker allocates one of these; its program id is
+/// `totalSymbols() + index` (the merged range). `flags` is the OR of the
+/// constituents' flags; `parts` are the constituent GLOBAL SymbolIds (real
+/// ids `< totalSymbols()`) in FileId order. Checkers materialize the type by
+/// folding each constituent's declarations across files (the type-level twin
+/// of within-file merging). Merge remains a symbol-table operation — no types
+/// are compared here (ROADMAP §5 M11 invariant 1).
+pub const MergedSym = struct {
+    name: Atom,
+    flags: binder.SymbolFlags,
+    parts: []const u32,
+};
+
 /// Global (lib) name table: the top-level declarations of the injected
 /// lib file, keyed by name atom, holding GLOBAL SymbolIds. Sorted by atom
 /// for binary-search fallback in name resolution (checker `resolveSpace`).
-/// Empty when `--noLib` / no lib is injected. Kept deliberately minimal
-/// (name → SymbolId); declaration merging is a later milestone (M11).
+/// Empty when `--noLib` / no lib is injected. A name with a single
+/// contributor maps to that contributor's `(file, sym)` global id; a name
+/// with 2+ contributors maps to a merged-range id (`≥ totalSymbols()`)
+/// indexing `Program.merged` (M11a).
 pub const Globals = struct {
     atoms: []const Atom = &.{},
     syms: []const u32 = &.{},
@@ -197,9 +213,29 @@ pub const Program = struct {
     links: []const FileLinks = &.{},
     /// Lib global symbols (empty when no lib is injected).
     globals: Globals = .{},
+    /// Cross-file merged global symbols (M11a). Program id of entry `k` is
+    /// `totalSymbols() + k`. Empty in the common case (no name has 2+
+    /// contributors).
+    merged: []const MergedSym = &.{},
 
+    /// Count of real per-file symbols (merged ids start here).
     pub fn totalSymbols(p: *const Program) u32 {
         return p.sym_base[p.files.len];
+    }
+
+    /// True for a merged-range symbol id (indexes `merged`, not a file).
+    pub fn isMergedId(p: *const Program, sym: u32) bool {
+        return sym >= p.totalSymbols();
+    }
+
+    /// The merged symbol for a merged-range id.
+    pub fn mergedSym(p: *const Program, sym: u32) *const MergedSym {
+        return &p.merged[sym - p.totalSymbols()];
+    }
+
+    /// Total symbol-id space including the merged range (checker array sizing).
+    pub fn symbolSpace(p: *const Program) u32 {
+        return p.totalSymbols() + @as(u32, @intCast(p.merged.len));
     }
 
     /// Bytes of the module graph (spec maps + link tables + sym_base).
@@ -232,30 +268,98 @@ pub fn libFileId(files: []const ProgFile) FileId {
     return no_file;
 }
 
-/// Harvest the lib file's top-level (`file_scope`) declarations into the
-/// program-level global name table. The binder stores each scope's members
-/// sorted by name atom, so the lib scope's segment is copied as-is and the
-/// local SymbolIds are lifted to global ids. Returns an empty table when
-/// `lib` is `no_file`.
-pub fn collectGlobals(
+/// Result of folding every file's global contributions (M11a).
+pub const GlobalMerge = struct {
+    globals: Globals = .{},
+    merged: []const MergedSym = &.{},
+};
+
+/// FileId owning global symbol `sym` (binary search over sym_base prefix sums).
+fn fileOfGlobal(sym_base: []const u32, n_files: usize, sym: u32) FileId {
+    var lo: usize = 0;
+    var hi: usize = n_files;
+    while (hi - lo > 1) {
+        const mid = lo + (hi - lo) / 2;
+        if (sym_base[mid] <= sym) lo = mid else hi = mid;
+    }
+    return @intCast(lo);
+}
+
+fn globalSymFlags(files: []const ProgFile, sym_base: []const u32, sym: u32) binder.SymbolFlags {
+    const f = fileOfGlobal(sym_base, files.len, sym);
+    return files[f].bind.symbol_flags[sym - sym_base[f]];
+}
+
+/// Fold every file's global-contribution slice (the binder harvest) into the
+/// program global table, in FileId order (deterministic; ROADMAP §5 M11
+/// invariant 4). The lib and script files offer their whole top level;
+/// modules offer their `declare global` block members; the typical app module
+/// offers nothing and is skipped (invariant 3, pay-per-use).
+///
+/// A name with a single contributor maps directly to that contributor's
+/// `(file, sym)` global id — today's lib representation, the overwhelmingly
+/// common case. A name with 2+ contributors allocates a merged symbol (id in
+/// the merged range) carrying the OR of the constituents' flags and the
+/// constituent list; the checker materializes its type by folding each
+/// constituent's declarations across files. Merge is a pure symbol-table
+/// operation — no types are compared here (invariant 1).
+pub fn mergeGlobals(
     arena: Allocator,
+    scratch: Allocator,
     files: []const ProgFile,
     sym_base: []const u32,
-    lib: FileId,
-) Error!Globals {
-    if (lib == no_file) return .{};
-    const b = files[lib].bind;
-    const lo = b.scope_members_start[binder.file_scope];
-    const hi = b.scope_members_start[binder.file_scope + 1];
-    const n = hi - lo;
-    const atoms = try arena.alloc(Atom, n);
-    const syms = try arena.alloc(u32, n);
-    const base = sym_base[lib];
-    for (0..n) |k| {
-        atoms[k] = b.member_atoms[lo + k];
-        syms[k] = base + b.member_syms[lo + k];
+) Error!GlobalMerge {
+    const total_syms = sym_base[files.len];
+
+    // Accumulate name -> constituent global ids, contributions in FileId order.
+    var acc: std.AutoArrayHashMapUnmanaged(Atom, std.ArrayListUnmanaged(u32)) = .empty;
+    var any = false;
+    for (files, 0..) |*f, fi| {
+        const b = f.bind;
+        if (b.global_atoms.len == 0) continue;
+        any = true;
+        const base = sym_base[fi];
+        for (b.global_atoms, b.global_syms) |atom, local| {
+            const gop = try acc.getOrPut(scratch, atom);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            try gop.value_ptr.append(scratch, base + local);
+        }
     }
-    return .{ .atoms = atoms, .syms = syms };
+    if (!any) return .{};
+
+    const n = acc.count();
+    const names = try scratch.alloc(Atom, n);
+    @memcpy(names, acc.keys());
+    std.mem.sort(Atom, names, {}, struct {
+        fn lt(_: void, a: Atom, b: Atom) bool {
+            return a < b;
+        }
+    }.lt);
+
+    const g_atoms = try arena.alloc(Atom, n);
+    const g_syms = try arena.alloc(u32, n);
+    var merged_list: std.ArrayListUnmanaged(MergedSym) = .empty;
+    for (names, 0..) |atom, i| {
+        const parts = acc.get(atom).?.items;
+        g_atoms[i] = atom;
+        if (parts.len == 1) {
+            g_syms[i] = parts[0];
+            continue;
+        }
+        var flags: binder.SymbolFlags = .{};
+        for (parts) |p| flags = binder.SymbolFlags.merge(flags, globalSymFlags(files, sym_base, p));
+        const id = total_syms + @as(u32, @intCast(merged_list.items.len));
+        try merged_list.append(arena, .{
+            .name = atom,
+            .flags = flags,
+            .parts = try arena.dupe(u32, parts),
+        });
+        g_syms[i] = id;
+    }
+    return .{
+        .globals = .{ .atoms = g_atoms, .syms = g_syms },
+        .merged = try arena.dupe(MergedSym, merged_list.items),
+    };
 }
 
 /// Wrap one already-bound file as an unlinked Program (legacy M4 paths).
@@ -296,8 +400,11 @@ pub fn singleWithLibProgram(
     files[0] = .{ .path = lib_path, .src = lib_source, .tree = lib_tree, .bind = lib_bind };
     files[1] = .{ .path = path, .src = src, .tree = tree, .bind = bind };
     const sym_base = try computeSymBase(arena, files);
-    const globals = try collectGlobals(arena, files, sym_base, 0);
-    return .{ .files = files, .sym_base = sym_base, .globals = globals };
+    // Unlinked single-file path: a script user file may still augment lib
+    // globals; merge diagnostics (none for the clean case) have no link table
+    // to land in here and are dropped.
+    const gm = try mergeGlobals(arena, arena, files, sym_base);
+    return .{ .files = files, .sym_base = sym_base, .globals = gm.globals, .merged = gm.merged };
 }
 
 // ===========================================================================
@@ -730,14 +837,23 @@ fn stripQuotes(text: []const u8) []const u8 {
     return text;
 }
 
-/// Build the sealed per-file link tables. Serial; results live in `arena`.
+/// Everything the serial link phase produces for the sealed program.
+pub const LinkResult = struct {
+    links: []const FileLinks,
+    sym_base: []const u32,
+    globals: Globals = .{},
+    merged: []const MergedSym = &.{},
+};
+
+/// Build the sealed per-file link tables and the merged global table. Serial;
+/// results live in `arena`.
 pub fn link(
     arena: Allocator,
     gpa: Allocator,
     io: Io,
     interner: *Interner,
     files: []const ProgFile,
-) Error![]FileLinks {
+) Error!LinkResult {
     var scratch_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch_arena.deinit();
     const scratch = scratch_arena.allocator();
@@ -788,7 +904,11 @@ pub fn link(
             .diags = try arena.dupe(LinkDiag, l.diags[i].items),
         };
     }
-    return out;
+
+    // Cross-file global merge (M11a): fold every file's harvest slice.
+    const sym_base = try computeSymBase(arena, files);
+    const gm = try mergeGlobals(arena, scratch, files, sym_base);
+    return .{ .links = out, .sym_base = sym_base, .globals = gm.globals, .merged = gm.merged };
 }
 
 /// Sort parallel (key, value) arrays by key ascending. Export/import tables
@@ -912,15 +1032,14 @@ pub fn buildProgram(
     }
 
     const file_slice = try arena.dupe(ProgFile, files.items);
-    const links = try link(arena, gpa, io, interner, file_slice);
-    const sym_base = try computeSymBase(arena, file_slice);
-    const globals = try collectGlobals(arena, file_slice, sym_base, libFileId(file_slice));
+    const lr = try link(arena, gpa, io, interner, file_slice);
     return .{
         .program = .{
             .files = file_slice,
-            .sym_base = sym_base,
-            .links = links,
-            .globals = globals,
+            .sym_base = lr.sym_base,
+            .links = lr.links,
+            .globals = lr.globals,
+            .merged = lr.merged,
         },
         .load_failures = try arena.dupe(BuildDiag, failures.items),
     };

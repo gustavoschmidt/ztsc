@@ -379,6 +379,19 @@ pub const Bind = struct {
     unresolved: []const Ref,
     diagnostics: []const Diagnostic,
 
+    // --- global contributions (M11a) --------------------------------------
+    /// True when this file is a *module* (has any top-level import/export).
+    /// A module contributes to the program global table only through
+    /// `declare global { … }` blocks; a *script* contributes its whole top
+    /// level. Drives the linker's cross-file merge (modules.zig).
+    is_module: bool = false,
+    /// This file's global contributions, sorted by name atom, holding LOCAL
+    /// SymbolIds: the whole file scope for a script/the lib, or the union of
+    /// `declare global` block members for a module. Empty for the typical
+    /// app module — the linker skips such files entirely (pay-per-use).
+    global_atoms: []const Atom = &.{},
+    global_syms: []const SymbolId = &.{},
+
     // --- name resolution ---------------------------------------------------
 
     /// Look `atom` up in exactly one scope (binary search of the sealed,
@@ -813,6 +826,15 @@ const Binder = struct {
     /// members are implicitly exported (visible as `N.member` without an
     /// explicit `export`), matching tsc's ambient-context rule.
     ambient: bool = false,
+    /// Shared scope for all `declare global { … }` blocks in this file (0 =
+    /// none yet). One scope per file so blocks merge within the file exactly
+    /// as reopened namespaces do; its members are the file's global
+    /// contributions (M11a).
+    global_scope: ScopeId = 0,
+    /// Set once any top-level `import`/`export` is bound: the file is a module
+    /// (M11a). Includes `export {}` (a marker export with no bindings), which
+    /// is exactly how a source file opts into module semantics.
+    saw_module_syntax: bool = false,
 
     // --- small helpers ------------------------------------------------------
 
@@ -1277,17 +1299,37 @@ const Binder = struct {
             .interface_decl => try b.bindInterface(node),
             .type_alias => try b.bindTypeAlias(node),
             .enum_decl => try b.bindEnum(node),
-            .namespace_decl => try b.bindNamespace(node),
-            .import_decl => try b.bindImport(node),
+            .namespace_decl => {
+                const data = b.tree.extraData(ast.NamespaceData, b.tree.nodeData(node).lhs);
+                if (data.flags & ast.Flags.global_aug != 0) {
+                    try b.bindGlobalAugmentation(node);
+                } else {
+                    try b.bindNamespace(node);
+                }
+            },
+            .import_decl => {
+                b.saw_module_syntax = true;
+                try b.bindImport(node);
+            },
             .export_decl => {
+                b.saw_module_syntax = true;
                 const saved = b.exporting_node;
                 b.exporting_node = node;
                 try b.bindStatement(d.lhs);
                 b.exporting_node = saved;
             },
-            .export_default => try b.bindExportDefault(node),
-            .export_named => try b.bindExportNamed(node),
-            .export_all => try b.bindExportAll(node),
+            .export_default => {
+                b.saw_module_syntax = true;
+                try b.bindExportDefault(node);
+            },
+            .export_named => {
+                b.saw_module_syntax = true;
+                try b.bindExportNamed(node);
+            },
+            .export_all => {
+                b.saw_module_syntax = true;
+                try b.bindExportAll(node);
+            },
 
             // Anything else in statement position (recovery leftovers) is
             // bound as an expression — keeps the binder total.
@@ -1863,6 +1905,43 @@ const Binder = struct {
 
         for (b.tree.extraRange(data.body_start, data.body_end)) |stmt| {
             try b.bindStatement(stmt);
+        }
+        b.restoreState(saved);
+    }
+
+    /// `declare global { … }` (M11a). Binds the block's declarations into a
+    /// single shared per-file scope (so blocks merge within the file, and the
+    /// linker harvests one segment). No `global` symbol is declared: the
+    /// members are contributions to the *program* global table, resolved
+    /// cross-file at link time. The body is an ambient context.
+    fn bindGlobalAugmentation(b: *Binder, node: Node) Error!void {
+        const d = b.tree.nodeData(node);
+        const data = b.tree.extraData(ast.NamespaceData, d.lhs);
+
+        if (b.global_scope == 0) {
+            b.global_scope = try b.newScope(.namespace, node, file_scope);
+        }
+        const gs = b.global_scope;
+
+        const saved = b.saveState();
+        // Ambient body (declarations may omit initializers/bodies), but members
+        // are program globals — not `N.member` namespace exports — so
+        // `exporting_node` stays clear.
+        const was_ambient = b.ambient;
+        b.ambient = true;
+        defer b.ambient = was_ambient;
+        const clear_export = b.exporting_node;
+        b.exporting_node = 0;
+        defer b.exporting_node = clear_export;
+
+        try b.scope_stack.append(b.scratch, gs);
+        b.cur_scope = gs;
+        b.var_scope = gs;
+        b.ctx_base = b.ctxs.items.len;
+        b.cur_flow = try b.addFlow(.start, no_flow, node);
+
+        for (b.tree.extraRange(data.body_start, data.body_end)) |stmt| {
+            if (stmt != null_node) try b.bindStatement(stmt);
         }
         b.restoreState(saved);
     }
@@ -2481,6 +2560,20 @@ const Binder = struct {
             members_start[n_scopes] = @intCast(e);
         }
 
+        // Global contributions (M11a): a module offers its `declare global`
+        // block members; a script/the lib offers its whole file scope. Both
+        // segments are already sorted by atom, so we reference the subslice.
+        const is_module = b.saw_module_syntax;
+        var global_atoms: []const Atom = &.{};
+        var global_syms: []const SymbolId = &.{};
+        if (!is_module or b.global_scope != 0) {
+            const gscope: ScopeId = if (is_module) b.global_scope else file_scope;
+            const glo = members_start[gscope];
+            const ghi = members_start[gscope + 1];
+            global_atoms = member_atoms[glo..ghi];
+            global_syms = member_syms[glo..ghi];
+        }
+
         const msp = try sealPairMap(arena, b.scratch, &b.member_scopes);
         const ssp = try sealPairMap(arena, b.scratch, &b.static_scopes);
         const nsp = try sealPairMap(arena, b.scratch, &b.namespace_scopes);
@@ -2552,6 +2645,9 @@ const Binder = struct {
             .exports = &.{},
             .unresolved = &.{},
             .diagnostics = &.{},
+            .is_module = is_module,
+            .global_atoms = global_atoms,
+            .global_syms = global_syms,
         };
 
         // Resolve recorded references; keep the unresolved ones.
