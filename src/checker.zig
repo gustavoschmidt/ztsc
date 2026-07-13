@@ -1225,6 +1225,20 @@ const Checker = struct {
         }
     }
 
+    /// Resolve member `name` of namespace symbol `ns_sym` to its global id, or
+    /// null. A merged namespace (M11b) consults its merged member index; a
+    /// plain namespace looks the name up in its single (merged-within-file)
+    /// body scope. The caller filters by space/`exported`.
+    fn namespaceMemberSym(c: *Checker, ns_sym: SymbolId, name: Atom) ?SymbolId {
+        if (c.prog.isMergedId(ns_sym)) {
+            return c.prog.mergedSym(ns_sym).members.lookup(name);
+        }
+        const nb = c.symBind(ns_sym);
+        const ns = nb.namespaceScopeOf(c.localOf(ns_sym)) orelse return null;
+        const local = nb.lookupInScope(ns, name) orelse return null;
+        return c.toGlobalIn(c.symFile(ns_sym), local);
+    }
+
     /// Resolve a qualified type name `A.B.T` (in type position) by walking
     /// namespace containers left-to-right, then building the final member's
     /// type. Missing/non-exported members report TS2694 like tsc.
@@ -1233,16 +1247,10 @@ const Checker = struct {
         const name_tok: TokenIndex = d.rhs;
         const name = try c.memberAtom(name_tok);
         const ns_sym = (try c.resolveTypeNamespace(d.lhs)) orelse return types.any_type;
-        // Look the name up in the namespace's (merged) body scope, type space,
-        // and require it to be exported.
-        const nb = c.symBind(ns_sym);
-        if (nb.namespaceScopeOf(c.localOf(ns_sym))) |ns| {
-            if (nb.lookupInScope(ns, name)) |local| {
-                const g = c.toGlobalIn(c.symFile(ns_sym), local);
-                const mf = c.symFlags(g);
-                if (mf.exported and hasTypeMeaning(mf)) {
-                    return c.namedTypeFromSymbol(g, args, name_tok);
-                }
+        if (c.namespaceMemberSym(ns_sym, name)) |g| {
+            const mf = c.symFlags(g);
+            if (mf.exported and hasTypeMeaning(mf)) {
+                return c.namedTypeFromSymbol(g, args, name_tok);
             }
         }
         try c.diagFmt(2694, c.tokSpan(name_tok), "Namespace '{s}' has no exported member '{s}'.", .{ c.symbolName(ns_sym), c.atomText(name) });
@@ -1268,13 +1276,9 @@ const Checker = struct {
                 const d = c.tree.nodeData(node);
                 const outer = (try c.resolveTypeNamespace(d.lhs)) orelse return null;
                 const name = try c.memberAtom(d.rhs);
-                const ob = c.symBind(outer);
-                if (ob.namespaceScopeOf(c.localOf(outer))) |ns| {
-                    if (ob.lookupInScope(ns, name)) |local| {
-                        const g = c.toGlobalIn(c.symFile(outer), local);
-                        const mf = c.symFlags(g);
-                        if (mf.exported and mf.namespace_decl) return g;
-                    }
+                if (c.namespaceMemberSym(outer, name)) |g| {
+                    const mf = c.symFlags(g);
+                    if (mf.exported and mf.namespace_decl) return g;
                 }
                 return null;
             },
@@ -1854,12 +1858,26 @@ const Checker = struct {
     }
 
     fn computeTypeOfSymbol(c: *Checker, sym: SymbolId) Error!TypeId {
-        // A merged symbol's *value* type comes from its first value-space
-        // constituent (M11a); the type space is materialized via `expandRef`
-        // /`interfaceGeneric`, which fold every constituent. (Same-type across
-        // constituents is a checker-level rule — TS2403 — deferred.)
+        // A merged symbol's value type. For a merged *namespace* (M11b) the
+        // value object is anchored to the merged id — `classStaticType` walks
+        // the merged member index; a cross-file kind combination
+        // (function/enum/class + namespace) intersects the non-namespace
+        // constituent's value. Otherwise (M11a var/function) it is the first
+        // value-space constituent's type. Type space is materialized via
+        // `expandRef`/`interfaceGeneric`, which fold every constituent.
         if (c.prog.isMergedId(sym)) {
             const m = c.prog.mergedSym(sym);
+            if (m.flags.namespace_decl) {
+                var ns_val = try c.ts.makeClassValue(sym);
+                for (m.parts) |p| {
+                    const pf = c.symFlags(p);
+                    if (pf.function or pf.enum_decl or pf.class) {
+                        ns_val = try c.ts.makeIntersection(c.scratch(), &.{ try c.typeOfSymbol(p), ns_val });
+                        break;
+                    }
+                }
+                return ns_val;
+            }
             for (m.parts) |p| {
                 if (hasValueMeaning(c.symFlags(p))) return c.typeOfSymbol(p);
             }
@@ -2835,32 +2853,43 @@ const Checker = struct {
             }
         }
         // Namespace value members: one property per *exported* value-space
-        // member of the namespace's (merged) body scope.
+        // member. A merged namespace (M11b) draws them from its merged member
+        // index (member ids may themselves be merged); a plain namespace from
+        // its (merged-within-file) body scope.
         if (c.symFlags(sym).namespace_decl) {
-            if (c.bind.namespaceScopeOf(c.localOf(sym))) |ns| {
+            var midx_atoms: []const Atom = &.{};
+            var midx_syms: []const u32 = &.{};
+            if (c.prog.isMergedId(sym)) {
+                const idx = c.prog.mergedSym(sym).members;
+                midx_atoms = idx.atoms;
+                midx_syms = idx.syms;
+            } else if (c.bind.namespaceScopeOf(c.localOf(sym))) |ns| {
                 const lo = c.bind.scope_members_start[ns];
                 const hi = c.bind.scope_members_start[ns + 1];
-                for (lo..hi) |i| {
-                    const msym = c.toGlobal(c.bind.member_syms[i]);
-                    const mf = c.symFlags(msym);
-                    if (!mf.exported or !hasValueMeaning(mf)) continue;
-                    const name = c.bind.member_atoms[i];
-                    var dup = false;
-                    for (props.items) |p| {
-                        if (p.name == name) {
-                            dup = true;
-                            break;
-                        }
+                // Lift the body-scope segment to global ids in this file.
+                const gs = try c.scratch().alloc(u32, hi - lo);
+                for (lo..hi, 0..) |i, k| gs[k] = c.toGlobal(c.bind.member_syms[i]);
+                midx_atoms = c.bind.member_atoms[lo..hi];
+                midx_syms = gs;
+            }
+            for (midx_atoms, midx_syms) |name, msym| {
+                const mf = c.symFlags(msym);
+                if (!mf.exported or !hasValueMeaning(mf)) continue;
+                var dup = false;
+                for (props.items) |p| {
+                    if (p.name == name) {
+                        dup = true;
+                        break;
                     }
-                    if (dup) continue;
-                    var flags: u32 = 0;
-                    if (mf.const_decl or mf.readonly_member) flags |= types.prop_flag_readonly;
-                    try props.append(c.scratch(), .{
-                        .name = name,
-                        .ty = try c.typeOfSymbol(msym),
-                        .flags = flags,
-                    });
                 }
+                if (dup) continue;
+                var flags: u32 = 0;
+                if (mf.const_decl or mf.readonly_member) flags |= types.prop_flag_readonly;
+                try props.append(c.scratch(), .{
+                    .name = name,
+                    .ty = try c.typeOfSymbol(msym),
+                    .flags = flags,
+                });
             }
         }
         const result = try c.ts.makeObject(props.items, 0, 0, false);

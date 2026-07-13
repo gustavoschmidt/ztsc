@@ -404,7 +404,24 @@ authoritative, verify each against tsc 5.5.4):**
     `declare global` in a module; var and var+type collisions;
     conflicting member types; a global var whose type is a cross-file
     merged interface. All diagnostics matching tsc.
-- **M11b — recursive namespace merge + kind combinations.**
+- **M11b — recursive namespace merge + kind combinations. ✅ DONE
+  (2026-07-13).** Landed: `MergedSym.members` — a merged member index
+  (atom → global sym, itself possibly merged) built recursively at link by
+  `modules.Merger` (`mergeSet`/`buildNsMembers` fold each contributor's
+  namespace body scope, allocating nested merged ids below the parent's).
+  Checker resolves namespace members through it: `namespaceMemberSym`
+  (used by `typeFromQualifiedName` and `resolveTypeNamespace`) and the
+  merged branches of `classStaticType` (value members) and
+  `computeTypeOfSymbol` (merged-namespace value object anchored to the
+  merged id, intersected with a function/enum/class constituent for
+  cross-file kind combos). Differential-tested vs tsc 5.5.4 (conformance
+  302 → 305): mini-`NodeJS` namespace reopened across 3 files with nested
+  interfaces merged across subsets; a global `function` merged with a
+  `namespace`; a doubly-nested namespace (`Outer.Inner`) merged across
+  files. Zero benchmark regression. Deferred: cross-file class+namespace
+  static-member merge (within-file works; the value side would need the
+  class constituent's statics folded into the index — rare); conflict
+  diagnostics still deferred with M11a.
   - The link merge becomes a **recursive fixpoint**: a merged namespace's
     member index may itself contain merged symbols (`namespace NodeJS`
     reopened in several files, with a nested interface itself declared in

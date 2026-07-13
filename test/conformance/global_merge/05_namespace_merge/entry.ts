@@ -1,0 +1,10 @@
+import "./n1";
+import "./n2";
+import "./n3";
+const env: NodeJS.ProcessEnv = { HOME: "/home", PATH: "/bin" };
+const badEnv: NodeJS.ProcessEnv = { HOME: "/home" };
+const proc: NodeJS.Process = { pid: 1, title: "node" };
+const h: string = env.HOME;
+const p: string = env.PATH;
+const wrong: number = env.HOME;
+NodeJS.tick();

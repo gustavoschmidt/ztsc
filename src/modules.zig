@@ -176,6 +176,12 @@ pub const MergedSym = struct {
     name: Atom,
     flags: binder.SymbolFlags,
     parts: []const u32,
+    /// Merged member index for namespace-bearing merges (M11b): member name
+    /// atom → global sym (itself possibly a merged-range id, so a nested
+    /// interface/namespace reopened across files resolves recursively).
+    /// Sorted by atom; empty for non-namespace merges (interfaces materialize
+    /// to object types, so their members need no symbol-level index).
+    members: Globals = .{},
 };
 
 /// Global (lib) name table: the top-level declarations of the injected
@@ -309,8 +315,6 @@ pub fn mergeGlobals(
     files: []const ProgFile,
     sym_base: []const u32,
 ) Error!GlobalMerge {
-    const total_syms = sym_base[files.len];
-
     // Accumulate name -> constituent global ids, contributions in FileId order.
     var acc: std.AutoArrayHashMapUnmanaged(Atom, std.ArrayListUnmanaged(u32)) = .empty;
     var any = false;
@@ -336,30 +340,94 @@ pub fn mergeGlobals(
         }
     }.lt);
 
+    var m: Merger = .{ .arena = arena, .scratch = scratch, .files = files, .sym_base = sym_base };
     const g_atoms = try arena.alloc(Atom, n);
     const g_syms = try arena.alloc(u32, n);
-    var merged_list: std.ArrayListUnmanaged(MergedSym) = .empty;
     for (names, 0..) |atom, i| {
-        const parts = acc.get(atom).?.items;
         g_atoms[i] = atom;
-        if (parts.len == 1) {
-            g_syms[i] = parts[0];
-            continue;
-        }
-        var flags: binder.SymbolFlags = .{};
-        for (parts) |p| flags = binder.SymbolFlags.merge(flags, globalSymFlags(files, sym_base, p));
-        const id = total_syms + @as(u32, @intCast(merged_list.items.len));
-        try merged_list.append(arena, .{
-            .name = atom,
-            .flags = flags,
-            .parts = try arena.dupe(u32, parts),
-        });
-        g_syms[i] = id;
+        g_syms[i] = try m.mergeSet(acc.get(atom).?.items);
     }
     return .{
         .globals = .{ .atoms = g_atoms, .syms = g_syms },
-        .merged = try arena.dupe(MergedSym, merged_list.items),
+        .merged = try arena.dupe(MergedSym, m.merged.items),
     };
+}
+
+/// Recursive cross-file symbol merger (M11a/M11b). Assigns merged-range ids as
+/// it goes; a namespace merge recurses into member scopes so a nested
+/// interface/namespace reopened across files becomes a nested merged symbol.
+const Merger = struct {
+    arena: Allocator,
+    scratch: Allocator,
+    files: []const ProgFile,
+    sym_base: []const u32,
+    merged: std.ArrayListUnmanaged(MergedSym) = .empty,
+
+    fn totalSyms(m: *const Merger) u32 {
+        return m.sym_base[m.files.len];
+    }
+
+    /// Merge a set of contributor global ids (real ids) for one name into a
+    /// single program id: the id itself when there is one contributor, else a
+    /// fresh merged-range id.
+    fn mergeSet(m: *Merger, parts: []const u32) Error!u32 {
+        if (parts.len == 1) return parts[0];
+        var flags: binder.SymbolFlags = .{};
+        for (parts) |p| flags = binder.SymbolFlags.merge(flags, globalSymFlags(m.files, m.sym_base, p));
+        // Namespace-bearing merges need a member index so `N.member` resolves
+        // across every contributor (recursively for nested merges). Build it
+        // first so nested merged ids are allocated below this symbol's id.
+        var members: Globals = .{};
+        if (flags.namespace_decl) members = try m.buildNsMembers(parts);
+        const id = m.totalSyms() + @as(u32, @intCast(m.merged.items.len));
+        try m.merged.append(m.arena, .{
+            .name = globalSymName(m.files, m.sym_base, parts[0]),
+            .flags = flags,
+            .parts = try m.arena.dupe(u32, parts),
+            .members = members,
+        });
+        return id;
+    }
+
+    /// Build the merged member index over the namespace body scopes of the
+    /// namespace-bearing parts: member atom → merged program id.
+    fn buildNsMembers(m: *Merger, parts: []const u32) Error!Globals {
+        var acc: std.AutoArrayHashMapUnmanaged(Atom, std.ArrayListUnmanaged(u32)) = .empty;
+        for (parts) |p| {
+            const fid = fileOfGlobal(m.sym_base, m.files.len, p);
+            const b = m.files[fid].bind;
+            const base = m.sym_base[fid];
+            const ns_scope = b.namespaceScopeOf(p - base) orelse continue;
+            const lo = b.scope_members_start[ns_scope];
+            const hi = b.scope_members_start[ns_scope + 1];
+            for (lo..hi) |k| {
+                const gop = try acc.getOrPut(m.scratch, b.member_atoms[k]);
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                try gop.value_ptr.append(m.scratch, base + b.member_syms[k]);
+            }
+        }
+        const cnt = acc.count();
+        if (cnt == 0) return .{};
+        const mnames = try m.scratch.alloc(Atom, cnt);
+        @memcpy(mnames, acc.keys());
+        std.mem.sort(Atom, mnames, {}, struct {
+            fn lt(_: void, a: Atom, b: Atom) bool {
+                return a < b;
+            }
+        }.lt);
+        const atoms = try m.arena.alloc(Atom, cnt);
+        const syms = try m.arena.alloc(u32, cnt);
+        for (mnames, 0..) |atom, i| {
+            atoms[i] = atom;
+            syms[i] = try m.mergeSet(acc.get(atom).?.items);
+        }
+        return .{ .atoms = atoms, .syms = syms };
+    }
+};
+
+fn globalSymName(files: []const ProgFile, sym_base: []const u32, sym: u32) Atom {
+    const f = fileOfGlobal(sym_base, files.len, sym);
+    return files[f].bind.symbol_names[sym - sym_base[f]];
 }
 
 /// Wrap one already-bound file as an unlinked Program (legacy M4 paths).
