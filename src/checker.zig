@@ -1656,6 +1656,14 @@ const Checker = struct {
         if (f.var_decl or f.let_decl or f.const_decl) {
             const decls = c.declsOf(sym);
             for (decls) |decl| {
+                // A symbol can merge a value declaration with a type-only one
+                // (e.g. lib's `interface Object {}` + `declare var Object: {…}`).
+                // Only the variable declarators carry the value type; skip the
+                // type-space decls so they don't short-circuit to `any`.
+                switch (c.nodeTag(decl)) {
+                    .declarator, .declarator_init, .declarator_full => {},
+                    else => continue,
+                }
                 const t = try c.declaratorType(sym, decl, f.const_decl);
                 if (t != types.no_type) return t;
             }
