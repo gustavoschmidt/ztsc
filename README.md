@@ -7,19 +7,21 @@ ships when `bunx ztsc` works end-to-end on real Bun projects — no partial
 releases before that. Milestones M0–M6 (the subset checker, tag `m6`) are
 done; the road to v0.0.1 is [ROADMAP.md §5](ROADMAP.md).
 
-Headline from the M6 milestone (multi corpus: 201 files / 93k lines,
-Apple M4 — full report with methodology and caveats in
-[BENCHMARKS.md](BENCHMARKS.md)):
+Headline (multi corpus: 201 files / 93k lines, Apple M4, default
+`--checkers=4`; full report with methodology and caveats in
+[BENCHMARKS.md](BENCHMARKS.md), re-measured 2026-07-13):
 
 | | wall | peak RSS |
 |---|---:|---:|
-| **ztsc (M6)** | **0.02 s** | **72 MB** |
-| tsgo (TS 7 native preview) | 0.08 s | 205 MB |
-| tsc 5.5.4 | 0.91 s | 314 MB |
+| **ztsc** | **0.02 s** | **52 MB** |
+| tsgo (TS 7 native preview) | 0.08 s | 204 MB |
+| tsc 5.5.4 | 0.93 s | 315 MB |
 
 That is an in-subset, synthetic-corpus comparison — read the caveats
-before quoting it. Both M6 acceptance gates (wall within 1.25× of tsgo,
-RSS ≤ 50% of tsgo) pass.
+before quoting it. Both acceptance gates (wall within 1.25× of tsgo, RSS
+≤ 50% of tsgo) pass — RSS is ~26% of tsgo, and has fallen from 72 MB at M6
+even as the checker gained a real lib, enums, generics, namespaces, and
+async/await.
 
 ## How it's built
 
@@ -87,10 +89,11 @@ config, or file-system errors (unknown flag, unreadable tsconfig,
 
 ## Benchmarks
 
-See **[BENCHMARKS.md](BENCHMARKS.md)** for the full M6 report: per-phase
+See **[BENCHMARKS.md](BENCHMARKS.md)** for the full report: per-phase
 timings, `--checkers` scaling (1/2/4/8) with the duplicated-type overhead
 measured, memory metrics, acceptance-gate evaluation, and the honest
-caveats (subset semantics, synthetic corpora, no lib.d.ts).
+caveats (subset semantics, synthetic corpora, trimmed ES-core lib rather
+than the full `lib.d.ts`).
 
 ```sh
 node bench/gen_corpus.js      # regenerate the deterministic corpora

@@ -121,30 +121,35 @@ well on this corpus.
 ### 3.2 Checker scaling and the duplicated-type dial (`--checkers=N`)
 
 ROADMAP.md §2.3: N independent checker instances trade duplicated type
-construction for lock-free parallelism. Both axes, measured:
+construction for lock-free parallelism. Both axes, re-measured 2026-07-13
+(post-M12 per-checker right-sizing; check ms = min of 4 `--timing` runs, RSS =
+median of ≥5 `/usr/bin/time -l` runs — RSS is scheduling-noisy at high N):
 
 **multi (93k lines)**
 
 | N | wall | check ms | types created | type-arena bytes | dup overhead vs N=1 | peak RSS |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 0.05 s | 42.1 | 21,333 | 604,206 | — | 67.2 MB |
-| 2 | 0.03 s | 22.9 | 22,861 | 648,003 | +7.2% | 69.4 MB |
-| 4 | 0.02 s | 12.6 | 24,642 | 696,686 | +15.5% | 71.9 MB |
-| 8 | 0.02 s | 10.2 | 26,283 | 737,963 | +23.2% | 69.2 MB |
+| 1 | 0.06 s | 51.8 | 21,525 | 610,978 | — | 48.3 MB |
+| 2 | 0.04 s | 26.8 | 23,053 | 654,775 | +7.1% | 49.9 MB |
+| 4 | 0.03 s | 15.8 | 24,834 | 703,458 | +15.4% | 52.4 MB |
+| 8 | 0.02 s | 13.2 | 26,475 | 744,735 | +23.0% | 48.1 MB |
 
 **medium (50k lines)**
 
 | N | wall | check ms | types created | type-arena bytes | dup overhead vs N=1 | peak RSS |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 0.02 s | 22.4 | 12,070 | 338,659 | — | 36.3 MB |
-| 2 | 0.01 s | 11.8 | 12,401 | 344,555 | +2.7% | 36.9 MB |
-| 4 | 0.01 s | 6.9 | 12,831 | 352,363 | +6.3% | 38.1 MB |
-| 8 | 0.01 s | 5.6 | 13,332 | 361,868 | +10.5% | 37.7 MB |
+| 1 | 0.03 s | 30.4 | 12,262 | 345,431 | — | 26.7 MB |
+| 2 | 0.02 s | 15.0 | 12,593 | 351,327 | +2.7% | 26.6 MB |
+| 4 | 0.01 s | 8.1 | 13,023 | 359,135 | +6.2% | 27.3 MB |
+| 8 | 0.01 s | 5.5 | 13,524 | 368,640 | +10.3% | 25.3 MB |
 
-Check-phase speedup is near-linear to N=4 (3.3×) and tapering at N=8
-(4.1× on multi); the memory cost of duplication stays under a quarter of
-the type arena even at N=8, and the type arena itself is <1 MB — noise
-against the ~70 MB process RSS. N=4 (the default) is the sweet spot.
+Check-phase speedup is near-linear to N=4 (3.3× on multi) and tapering at N=8
+(3.9×); the *type*-duplication overhead still climbs to +23% by N=8 but the
+type arena is <1 MB, noise against the ~50 MB process RSS. What changed with
+M12's right-sizing (§3.10): peak RSS no longer grows monotonically with N —
+N=4 is now the high-water mark (four heavy concurrent working sets) while N=8,
+whose eight checkers each own a smaller slice and only page in that slice, sits
+back at the N=1 level. N=4 remains the default and the wall-clock sweet spot.
 
 ### 3.3 Memory metrics (multi corpus, N=4, `--memory`, lib-loaded, 2026-07-13)
 
@@ -365,15 +370,20 @@ Multi corpus (201 files / 93k lines, ReleaseFast, peak RSS via `/usr/bin/time
 -l`); diagnostics verified **byte-identical for N ∈ {1,2,4,8}** (raw order, on a
 diagnostic-producing variant — the synthetic corpus itself is clean):
 
+RSS values are medians of ≥5 runs (high-N RSS is scheduling-noisy — the N=8
+"after" spread across 10 runs was 44.2–51.2 MB):
+
 | N | peak RSS before | peak RSS after | wall (unchanged) |
 |---:|---:|---:|---:|
-| 1 | 48.5 MB | 48.5 MB | 0.05 s |
-| 2 | 50.0 MB | 50.1 MB | 0.03 s |
-| 4 | 52.5 MB | 52.7 MB | 0.02 s |
-| 8 | 50.1–51.0 MB | **44.9–47.0 MB** | 0.02 s |
+| 1 | 48.5 MB | 48.3 MB | 0.06 s |
+| 2 | 50.0 MB | 49.9 MB | 0.04 s |
+| 4 | 52.5 MB | 52.4 MB | 0.03 s |
+| 8 | 50.5 MB | **48.1 MB** | 0.02 s |
 
 The win concentrates at high N — more checkers means more avoided
-`symbolSpace()` memsets — which is the intended shape; at low N the front-end
+`symbolSpace()` memsets — which is the intended shape: before M12, peak RSS
+grew monotonically with N (N=8 ≈ 50.5 MB); after, N=8 drops back to ≈ the N=1
+level (~48 MB), so the high-water mark moves to N=4. At low N the front-end
 arenas dominate RSS and the delta is within run-to-run noise. Wall clock is
 unchanged (no hot-path structure change; `scopeOf` gained one predictable
 per-file branch). The absolute saving is small here because the lib is tiny —
