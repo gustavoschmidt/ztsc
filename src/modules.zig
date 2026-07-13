@@ -79,6 +79,9 @@ pub const Target = struct {
         /// An anonymous `export default <expr>`: `payload` is the
         /// `export_default` node in `file`.
         default_expr,
+        /// The namespace object of an ambient module (`import * as ns from
+        /// "fs"`, M11c): `payload` indexes `Program.ambient_exports`.
+        ambient_ns,
     };
     kind: Kind = .any,
     file: FileId = 0,
@@ -184,6 +187,13 @@ pub const MergedSym = struct {
     members: Globals = .{},
 };
 
+/// An ambient module's sealed export table (M11c), for `import * as ns`
+/// namespace objects. Entries are (export-name atom → Target), atom-sorted.
+pub const AmbientExport = struct {
+    atoms: []const Atom = &.{},
+    targets: []const Target = &.{},
+};
+
 /// Global (lib) name table: the top-level declarations of the injected
 /// lib file, keyed by name atom, holding GLOBAL SymbolIds. Sorted by atom
 /// for binary-search fallback in name resolution (checker `resolveSpace`).
@@ -223,6 +233,9 @@ pub const Program = struct {
     /// `totalSymbols() + k`. Empty in the common case (no name has 2+
     /// contributors).
     merged: []const MergedSym = &.{},
+    /// Ambient module export tables (M11c), indexed by `Target.ambient_ns`
+    /// payloads; for `import * as ns from "<ambient>"` namespace objects.
+    ambient_exports: []const AmbientExport = &.{},
 
     /// Count of real per-file symbols (merged ids start here).
     pub fn totalSymbols(p: *const Program) u32 {
@@ -848,15 +861,44 @@ const Linker = struct {
                 const gop = try l.ambient.getOrPut(l.scratch, am.spec);
                 if (!gop.found_existing) gop.value_ptr.* = .empty;
                 const tbl = gop.value_ptr;
+
+                // Declaration exports (`export function/const/interface/…`):
+                // members with the `exported` flag. Default exports are handled
+                // via the export records below, so skip them here.
                 const lo = b.scope_members_start[am.scope];
                 const hi = b.scope_members_start[am.scope + 1];
                 for (lo..hi) |i| {
                     const local = b.member_syms[i];
-                    if (!b.symbol_flags[local].exported) continue;
+                    const fl = b.symbol_flags[local];
+                    if (!fl.exported or fl.export_default) continue;
                     const name = b.member_atoms[i];
                     if (tbl.contains(name)) continue;
-                    const tgt = try l.finalizeLocal(fid, local, name, false, 0);
-                    try tbl.put(l.scratch, name, tgt);
+                    try tbl.put(l.scratch, name, try l.finalizeLocal(fid, local, name, false, 0));
+                }
+
+                // `export default …` / `export { a, b }` forms (which carry no
+                // `exported` flag): resolve each in the block scope.
+                for (b.exports[am.export_start..am.export_end]) |rec| {
+                    switch (rec.kind) {
+                        .default => {
+                            if (tbl.contains(l.atom_default)) continue;
+                            var tgt: Target = .{ .kind = .default_expr, .file = fid, .payload = rec.node };
+                            if (rec.sym != binder.no_symbol) {
+                                tgt = try l.finalizeLocal(fid, rec.sym, rec.local, rec.type_only, 0);
+                            } else if (rec.local != 0) {
+                                if (b.lookupInScope(am.scope, rec.local)) |ls| {
+                                    tgt = try l.finalizeLocal(fid, ls, rec.local, rec.type_only, 0);
+                                }
+                            }
+                            try tbl.put(l.scratch, l.atom_default, tgt);
+                        },
+                        .named => {
+                            if (tbl.contains(rec.exported)) continue;
+                            const ls = b.lookupInScope(am.scope, rec.local) orelse continue;
+                            try tbl.put(l.scratch, rec.exported, try l.finalizeLocal(fid, ls, rec.local, rec.type_only, 0));
+                        },
+                        else => {}, // re-exports from another module: unsupported
+                    }
                 }
             }
         }
@@ -934,9 +976,11 @@ const Linker = struct {
             if (known) {
                 switch (rec.kind) {
                     .namespace => {
-                        // Namespace object of a real module; an ambient module's
-                        // namespace object is not modeled yet (types as `any`).
-                        if (mfile_opt) |mfile| tgt = .{ .kind = .namespace, .file = mfile, .type_only = rec.type_only };
+                        if (mfile_opt) |mfile| {
+                            tgt = .{ .kind = .namespace, .file = mfile, .type_only = rec.type_only };
+                        } else if (l.ambientKey(rec.module)) |key| {
+                            tgt = .{ .kind = .ambient_ns, .payload = @intCast(l.ambient.getIndex(key).?), .type_only = rec.type_only };
+                        }
                     },
                     .named => {
                         var found: ?Target = null;
@@ -991,6 +1035,7 @@ pub const LinkResult = struct {
     sym_base: []const u32,
     globals: Globals = .{},
     merged: []const MergedSym = &.{},
+    ambient_exports: []const AmbientExport = &.{},
 };
 
 /// Build the sealed per-file link tables and the merged global table. Serial;
@@ -1059,7 +1104,21 @@ pub fn link(
     // Cross-file global merge (M11a): fold every file's harvest slice.
     const sym_base = try computeSymBase(arena, files);
     const gm = try mergeGlobals(arena, scratch, files, sym_base);
-    return .{ .links = out, .sym_base = sym_base, .globals = gm.globals, .merged = gm.merged };
+
+    // Seal the ambient module export tables (M11c) in registry order, so
+    // `Target.ambient_ns` payloads (assigned from `getIndex`) address them.
+    const amb = try arena.alloc(AmbientExport, l.ambient.count());
+    for (l.ambient.values(), 0..) |*tbl, i| {
+        const n = tbl.count();
+        const atoms = try arena.alloc(Atom, n);
+        const tgts = try arena.alloc(Target, n);
+        @memcpy(atoms, tbl.keys());
+        @memcpy(tgts, tbl.values());
+        try sortByKeyU32(scratch, atoms, tgts);
+        amb[i] = .{ .atoms = atoms, .targets = tgts };
+    }
+
+    return .{ .links = out, .sym_base = sym_base, .globals = gm.globals, .merged = gm.merged, .ambient_exports = amb };
 }
 
 /// Sort parallel (key, value) arrays by key ascending. Export/import tables
@@ -1300,6 +1359,7 @@ pub fn buildProgram(
             .links = lr.links,
             .globals = lr.globals,
             .merged = lr.merged,
+            .ambient_exports = lr.ambient_exports,
         },
         .load_failures = try arena.dupe(BuildDiag, failures.items),
     };

@@ -339,11 +339,14 @@ pub const Ref = struct {
 };
 
 /// One `declare module "spec" { … }` block (M11c): the specifier atom (no
-/// quotes) and the body scope whose `export`ed members are the module's
-/// exports.
+/// quotes), the body scope whose `export`ed *declarations* are exports, and
+/// the range of this block's `export` records (`export default` / `export { … }`
+/// forms that don't set an `exported` flag).
 pub const AmbientModule = struct {
     spec: Atom,
     scope: ScopeId,
+    export_start: u32,
+    export_end: u32,
 };
 
 /// The sealed bind result for one file. All slices live in the per-file
@@ -1984,7 +1987,7 @@ const Binder = struct {
         const data = b.tree.extraData(ast.NamespaceData, d.lhs);
         const spec = try b.atomOf(stripModuleQuotes(b.tokenText(data.name_token)));
         const ms = try b.newScope(.namespace, node, file_scope);
-        try b.ambient_mods.append(b.scratch, .{ .spec = spec, .scope = ms });
+        const export_start: u32 = @intCast(b.export_recs.items.len);
 
         const saved = b.saveState();
         const was_ambient = b.ambient;
@@ -2004,6 +2007,12 @@ const Binder = struct {
             if (stmt != null_node) try b.bindStatement(stmt);
         }
         b.restoreState(saved);
+        try b.ambient_mods.append(b.scratch, .{
+            .spec = spec,
+            .scope = ms,
+            .export_start = export_start,
+            .export_end = @intCast(b.export_recs.items.len),
+        });
     }
 
     fn bindInterface(b: *Binder, node: Node) Error!void {
@@ -2176,7 +2185,12 @@ const Binder = struct {
                 try b.bindStatement(inner);
                 if (local != 0) sym = b.members.get(memberKey(b.cur_scope, local)) orelse no_symbol;
             },
-            else => try b.bindExpr(inner),
+            else => {
+                try b.bindExpr(inner);
+                // Record a bare `export default <ident>` name so an ambient
+                // module can resolve it in its block scope (M11c).
+                if (b.nodeTag(inner) == .identifier) local = try b.atomOfToken(b.tree.nodeMainToken(inner));
+            },
         }
         if (sym != no_symbol) {
             b.sym_flags.items[sym].exported = true;

@@ -268,6 +268,8 @@ const Checker = struct {
     node_scopes: std.AutoHashMapUnmanaged(u64, ScopeId) = .empty,
     /// FileId -> module namespace object type (0 = in progress).
     ns_types: std.AutoHashMapUnmanaged(FileId, TypeId) = .empty,
+    /// Ambient-module namespace-object cache, keyed by ambient_exports index.
+    ambient_ns_types: std.AutoHashMapUnmanaged(u32, TypeId) = .empty,
     /// (source << 32 | target) -> Relation.
     relation: std.AutoHashMapUnmanaged(u64, u8) = .empty,
     /// ref TypeId -> expanded structural type.
@@ -1198,7 +1200,7 @@ const Checker = struct {
                             }
                         },
                         // Namespace-as-type / unresolved: any (documented).
-                        .namespace, .default_expr, .any => return types.any_type,
+                        .namespace, .default_expr, .ambient_ns, .any => return types.any_type,
                     }
                 }
                 if (f.type_param) return c.ts.makeTypeParam(sym);
@@ -1968,6 +1970,7 @@ const Checker = struct {
             .any => return types.any_type,
             .binding => return c.typeOfSymbol(c.toGlobalIn(tgt.file, tgt.payload)),
             .namespace => return c.namespaceObjectType(tgt.file),
+            .ambient_ns => return c.ambientNamespaceType(tgt.payload),
             .default_expr => {
                 const saved = c.saveCtx();
                 defer c.restoreCtx(saved);
@@ -2009,6 +2012,7 @@ const Checker = struct {
                         ty = try c.typeOfSymbol(g);
                     },
                     .namespace => ty = try c.namespaceObjectType(tgt.file),
+                    .ambient_ns => ty = try c.ambientNamespaceType(tgt.payload),
                     .default_expr => ty = try c.targetValueType(tgt),
                     .any => {},
                 }
@@ -2017,6 +2021,28 @@ const Checker = struct {
         }
         const obj = try c.ts.makeObject(props.items, 0, 0, false);
         try c.ns_types.put(c.ca(), file, obj);
+        return obj;
+    }
+
+    /// Namespace object of an ambient module (`import * as ns from "fs"`,
+    /// M11c): one read-only property per value-space export. Cycle-safe via
+    /// `ambient_ns_types`.
+    fn ambientNamespaceType(c: *Checker, idx: u32) Error!TypeId {
+        if (c.ambient_ns_types.get(idx)) |t| {
+            if (t == types.no_type) return types.any_type; // cycle
+            return t;
+        }
+        try c.ambient_ns_types.put(c.ca(), idx, types.no_type);
+        var props: std.ArrayList(types.Prop) = .empty;
+        defer props.deinit(c.scratch());
+        const ae = c.prog.ambient_exports[idx];
+        for (ae.atoms, ae.targets) |name, tgt| {
+            if (tgt.type_only) continue;
+            const ty = try c.targetValueType(tgt);
+            try props.append(c.scratch(), .{ .name = name, .ty = ty, .flags = types.prop_flag_readonly });
+        }
+        const obj = try c.ts.makeObject(props.items, 0, 0, false);
+        try c.ambient_ns_types.put(c.ca(), idx, obj);
         return obj;
     }
 

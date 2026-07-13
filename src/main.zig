@@ -697,6 +697,7 @@ pub fn main(init: std.process.Init) !void {
         .links = links,
         .globals = lr.globals,
         .merged = lr.merged,
+        .ambient_exports = lr.ambient_exports,
     };
     const link_ns = link_timer.readNs();
 

@@ -458,10 +458,13 @@ authoritative, verify each against tsc 5.5.4):**
   augmenting a real bare package, a named-export wildcard module, a `path`
   reference pulling in a `declare global` file, and a `types` reference
   pulling in a `@types/*` package that provides an ambient module.
-  **Deferred (minor):** `export default`/`export =`/named `export {}`
-  *inside* an ambient block (only named *declaration* exports are harvested
-  — the CSS `export default` idiom is uncovered), and namespace-import of an
-  ambient module (types as `any`).
+  Ambient blocks also support `export default` (declaration and bare-ident
+  forms, resolved in the block scope — the CSS `export default` idiom) and
+  named `export { … }` lists (conformance 310 → 312), and `import * as ns`
+  namespace imports of an ambient module build a namespace object from its
+  sealed export table (`Program.ambient_exports` + `Target.ambient_ns`).
+  Only `export =` (CommonJS) and re-exports *from another module* inside an
+  ambient block remain out of subset.
   - `declare module "pkg" { … }` inside a module file: harvest keyed by
     the *resolved* specifier's FileId (resolution already happens at
     discovery); at link, merge the block's exports into that module's
