@@ -809,6 +809,10 @@ const Binder = struct {
     pending_label: Atom = 0,
     /// True while binding the name(s) of an `export`ed declaration.
     exporting_node: Node = 0,
+    /// True while binding inside an ambient (`declare`) namespace body, where
+    /// members are implicitly exported (visible as `N.member` without an
+    /// explicit `export`), matching tsc's ambient-context rule.
+    ambient: bool = false,
 
     // --- small helpers ------------------------------------------------------
 
@@ -1825,8 +1829,17 @@ const Binder = struct {
         }
 
         const saved = b.saveState();
+        // In an ambient namespace (`declare namespace`, or one nested inside
+        // an ambient namespace) every member is implicitly exported: bind the
+        // body with `exporting_node` pinned to the namespace so each member's
+        // `noteExport` marks it visible as `N.member`. Otherwise members need
+        // an explicit `export` (so plain `namespace` members stay private).
+        const was_ambient = b.ambient;
+        const is_ambient = was_ambient or (data.flags & ast.Flags.declare != 0);
+        b.ambient = is_ambient;
+        defer b.ambient = was_ambient;
         const clear_export = b.exporting_node;
-        b.exporting_node = 0;
+        b.exporting_node = if (is_ambient) node else 0;
         defer b.exporting_node = clear_export;
 
         // Merged blocks bind into one shared namespace scope.
