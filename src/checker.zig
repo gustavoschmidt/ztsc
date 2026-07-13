@@ -361,6 +361,7 @@ const Checker = struct {
     atom_JSX: Atom = 0,
     atom_IntrinsicElements: Atom = 0,
     atom_Element: Atom = 0,
+    atom_ElementAttributesProperty: Atom = 0,
 
     const typeof_names = [8][]const u8{
         "string", "number", "bigint", "boolean", "symbol", "undefined", "object", "function",
@@ -437,6 +438,7 @@ const Checker = struct {
         c.atom_JSX = try c.atom("JSX");
         c.atom_IntrinsicElements = try c.atom("IntrinsicElements");
         c.atom_Element = try c.atom("Element");
+        c.atom_ElementAttributesProperty = try c.atom("ElementAttributesProperty");
         for (typeof_names, 0..) |n, i| c.typeof_atoms[i] = try c.atom(n);
         var tu: [8]TypeId = undefined;
         for (c.typeof_atoms, 0..) |a, i| tu[i] = try c.ts.makeStringLiteral(a, false);
@@ -4459,8 +4461,11 @@ const Checker = struct {
         return try c.namedTypeFromSymbol(g, &.{}, 0);
     }
 
-    /// Props type of a component tag: the first parameter of its call
-    /// signature (function components). Null when it has no discernible props.
+    /// Props type of a component tag. Function components: the first parameter
+    /// of the call signature. Class components (`class C extends Component<P>`):
+    /// the member of the instance type named by `JSX.ElementAttributesProperty`
+    /// (typically `props`). Null when it has no discernible props (so attribute
+    /// typing is skipped).
     fn jsxComponentProps(c: *Checker, tag_ty: TypeId) Error!?TypeId {
         const t = try c.resolveStructural(tag_ty);
         const sig = switch (c.ts.kind(t)) {
@@ -4469,10 +4474,39 @@ const Checker = struct {
                 const sigs = try c.memberList(t);
                 break :blk if (sigs.len > 0) sigs[0] else return null;
             },
+            .class_value => return c.jsxClassComponentProps(t),
             else => return null,
         };
         if (c.ts.fnParamCount(sig) == 0) return types.empty_object_type;
         return c.ts.fnParam(sig, 0).ty;
+    }
+
+    /// Props of a class component: read the member named by
+    /// `JSX.ElementAttributesProperty` (its single member's name, e.g. `props`)
+    /// off the class instance type. Null when the selector namespace is absent
+    /// (tsc leaves such attributes unchecked) or the class is generic (own type
+    /// params — an uncommon shape we do not model here).
+    fn jsxClassComponentProps(c: *Checker, class_val: TypeId) Error!?TypeId {
+        const name = (try c.jsxPropsMemberName()) orelse return null;
+        const cls = c.ts.classSymbol(class_val);
+        var tps: std.ArrayList(TypeParamInfo) = .empty;
+        defer tps.deinit(c.scratch());
+        try c.typeParamsOf(cls, &tps);
+        if (tps.items.len != 0) return null; // generic class component: unmodeled
+        const inst = try c.ts.makeRef(cls, &.{});
+        const rinst = try c.resolveStructural(inst);
+        if (try c.propOfType(rinst, name)) |p| return p.ty;
+        return types.empty_object_type;
+    }
+
+    /// Name of the props member per `JSX.ElementAttributesProperty` — the name
+    /// of that interface's single property (React uses `props`). Null when the
+    /// interface is absent or empty.
+    fn jsxPropsMemberName(c: *Checker) Error!?Atom {
+        const t = (try c.jsxNamespaceType(c.atom_ElementAttributesProperty)) orelse return null;
+        const rt = try c.resolveStructural(t);
+        if (c.ts.kind(rt) != .object or c.ts.objectPropCount(rt) == 0) return null;
+        return c.ts.objectProp(rt, 0).name;
     }
 
     /// Check a JSX element's attributes against its props type (`no_type` =
@@ -4498,8 +4532,12 @@ const Checker = struct {
             }
             const ad = c.tree.nodeData(attr);
             const name_tok = c.tree.nodeMainToken(attr);
-            const name = try c.memberAtom(name_tok);
             const vty = try c.jsxAttributeValueType(ad.lhs);
+            // Hyphenated names (`data-*`, `aria-*`) are exempt from excess and
+            // assignability checks (tsc), but their value expressions are still
+            // checked — `jsxAttributeValueType` above did that.
+            if (c.tree.tokens.tag(name_tok) == .jsx_name) continue;
+            const name = try c.memberAtom(name_tok);
             try built.append(c.scratch(), .{ .name = name, .ty = vty });
             if (rt == types.no_type) continue;
             if (try c.propOfType(rt, name)) |p| {

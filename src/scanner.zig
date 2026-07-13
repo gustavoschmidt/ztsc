@@ -87,6 +87,10 @@ pub const Tag = enum(u8) {
     /// JSX children text between tags (`<a>THIS<b/></a>`). Scanned only in
     /// `.tsx` files, by the parser-driven `scanJsxChild` path.
     jsx_text,
+    /// A hyphenated JSX name (`data-foo`, `aria-label`, `<my-elem>`): an
+    /// identifier run spanning `-`. Produced only by the parser's
+    /// `rescanJsxName` entry point in `.tsx` files, never by `next`.
+    jsx_name,
 
     // --- punctuation -------------------------------------------------------
     l_brace,
@@ -505,6 +509,17 @@ pub const Scanner = struct {
             s.index += 1;
         }
         return .{ .tag = .jsx_text, .start = start, .end = s.index, .newline_before = false };
+    }
+
+    /// Scan a JSX name starting at `at` (must be an identifier-start byte): an
+    /// identifier run that also spans `-` (`data-foo`, `aria-label`, custom
+    /// elements `my-widget`). Returns the byte offset just past the name.
+    /// Used only by the parser's `rescanJsxName` — plain scanning still lexes
+    /// `-` as subtraction, so non-JSX code is untouched.
+    pub fn scanJsxName(s: *const Scanner, at_index: u32) u32 {
+        var i = at_index;
+        while (i < s.src.len and (isIdentCont(s.src[i]) or s.src[i] == '-')) : (i += 1) {}
+        return i;
     }
 
     inline fn punctEnd(s: *Scanner, len: u32) u32 {
@@ -1008,6 +1023,10 @@ pub fn tokenEnd(src: []const u8, tag: Tag, start: u32) u32 {
         .jsx_text => {
             var s = Scanner{ .src = src, .index = start };
             return s.scanJsxChild(start).end;
+        },
+        .jsx_name => {
+            const s = Scanner{ .src = src, .index = start };
+            return s.scanJsxName(start);
         },
         else => {
             var s = Scanner{ .src = src, .index = start };
