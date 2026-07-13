@@ -1078,6 +1078,12 @@ const Checker = struct {
                 return c.indexedAccessType(obj, idx);
             },
             .paren_type, .optional_type, .rest_type => return c.typeFromTypeNode(d.lhs),
+            // A predicate in return-type position behaves like `boolean` for
+            // a plain guard (`x is T`), or `void` for an assertion function
+            // (`asserts ...`, rhs bit0). signatureOfProto attaches the
+            // predicate; this keeps every other consumer (TS2355, etc.)
+            // consistent.
+            .type_predicate => return if (d.rhs != 0) types.void_type else types.boolean_type,
             .this_expr => return if (c.this_type != 0) c.this_type else types.any_type,
             .error_node, .unsupported => return types.any_type,
             else => return types.any_type,
@@ -1517,7 +1523,15 @@ const Checker = struct {
 
         const is_async = proto.flags & ast.Flags.async != 0;
         var ret: TypeId = types.any_type;
-        if (proto.return_type != 0) {
+        var pred: ?types.Predicate = null;
+        if (proto.return_type != 0 and c.nodeTag(proto.return_type) == .type_predicate) {
+            // `x is T` / `asserts x[ is T]`: a plain guard returns boolean;
+            // an assertion function returns void (no value required, so no
+            // TS2355). The predicate rides along for call-site narrowing.
+            const p = try c.predicateFromNode(proto.return_type, params.items);
+            pred = p;
+            ret = if (p.asserts) types.void_type else types.boolean_type;
+        } else if (proto.return_type != 0) {
             ret = try c.typeFromTypeNode(proto.return_type);
         } else if (is_async) {
             ret = types.any_type; // Promise typing out of subset (documented)
@@ -1535,9 +1549,30 @@ const Checker = struct {
             ret = types.any_type; // overload signature without annotation
         }
 
-        const sig = try c.ts.makeFunction(params.items, ret, tps.items, if (is_method) types.fn_flag_method else 0);
+        const sig = try c.ts.makeFunctionPred(params.items, ret, tps.items, if (is_method) types.fn_flag_method else 0, pred);
         try c.sig_cache.put(c.ca(), c.nodeKey(node), .{ .ty = sig, .ctx = ctx_sig });
         return sig;
+    }
+
+    /// Resolve a `.type_predicate` return-type node into a `Predicate`:
+    /// map the guarded name to a parameter index and evaluate the target
+    /// type. `this is T` uses the `this_param` sentinel.
+    fn predicateFromNode(c: *Checker, node: Node, params: []const types.Param) Error!types.Predicate {
+        const d = c.tree.nodeData(node);
+        const asserts = d.rhs != 0;
+        const target: TypeId = if (d.lhs != 0) try c.typeFromTypeNode(d.lhs) else types.no_type;
+        const name_tok = c.tree.nodeMainToken(node);
+        var param: u32 = types.Predicate.this_param;
+        if (c.tree.tokens.tag(name_tok) != .keyword_this) {
+            const a = try c.atomOfToken(name_tok);
+            for (params, 0..) |p, i| {
+                if (p.name == a) {
+                    param = @intCast(i);
+                    break;
+                }
+            }
+        }
+        return .{ .param = param, .ty = target, .asserts = asserts };
     }
 
     fn paramInfo(c: *Checker, pn: Node, index: u32, ctx_sig: TypeId, report_implicit: bool) Error!types.Param {
@@ -5240,6 +5275,13 @@ const Checker = struct {
                 if (before == types.never_type) return before;
                 return c.narrowBySwitchClause(before, clause, key);
             },
+            .call_stmt => {
+                const call = b.flowNode(flow);
+                const ante = b.flow_a[flow];
+                const before = try c.flowType(ante, key, declared, depth + 1);
+                if (before == types.never_type) return before;
+                return c.narrowByAssertCall(before, call, key);
+            },
             .branch_label, .loop_label => {
                 var parts: std.ArrayList(TypeId) = .empty;
                 defer parts.deinit(c.scratch());
@@ -5393,7 +5435,7 @@ const Checker = struct {
                 }
             },
             .prefix_unary => return t, // `!` was decomposed by the binder
-            .call_expr, .call_expr_targs, .optional_call => return t, // type guards out of subset
+            .call_expr, .call_expr_targs, .optional_call => return c.narrowByGuardCall(t, cond, sense, key),
             else => return t,
         }
     }
@@ -5715,6 +5757,41 @@ const Checker = struct {
         return c.ts.makeUnion(c.scratch(), parts.items);
     }
 
+    /// If `call`'s callee is a predicate signature whose guarded parameter
+    /// receives `key` as its argument, return that predicate; else null.
+    /// Shared by user-defined type guards and assertion functions.
+    fn guardTargetFor(c: *Checker, call: Node, key: RefKey) Error!?types.Predicate {
+        const shape = c.callShape(call);
+        const callee_t = try c.checkExprCached(shape.callee, types.no_type);
+        if (!c.ts.fnHasPredicate(callee_t)) return null;
+        const pred = c.ts.fnPredicate(callee_t);
+        if (pred.param == types.Predicate.this_param) return null; // `this is T`: gap
+        if (pred.param >= shape.arg_nodes.len) return null;
+        const arg = shape.arg_nodes[pred.param];
+        if (arg == null_node or !try c.refMatches(arg, key)) return null;
+        return pred;
+    }
+
+    /// `if (isT(x))` — a user-defined type guard used in a condition.
+    /// True branch narrows the argument to the predicate type; the false
+    /// branch takes the complement (union filtering handles both).
+    fn narrowByGuardCall(c: *Checker, t: TypeId, call: Node, sense: bool, key: RefKey) Error!TypeId {
+        const pred = (try c.guardTargetFor(call, key)) orelse return t;
+        if (pred.asserts) return t; // assertion fns narrow after the call, not here
+        if (pred.ty == types.no_type) return t;
+        return c.narrowByInstance(t, pred.ty, sense);
+    }
+
+    /// `assertIsT(x);` — an assertion-function call statement narrows the
+    /// argument to the asserted type for the rest of the flow; a bare
+    /// `asserts cond` narrows by truthiness.
+    fn narrowByAssertCall(c: *Checker, t: TypeId, call: Node, key: RefKey) Error!TypeId {
+        const pred = (try c.guardTargetFor(call, key)) orelse return t;
+        if (!pred.asserts) return t; // plain guards don't narrow as statements
+        if (pred.ty == types.no_type) return c.getTruthyPart(t); // `asserts cond`
+        return c.narrowByInstance(t, pred.ty, true);
+    }
+
     fn narrowByInstance(c: *Checker, t: TypeId, instance: TypeId, sense: bool) Error!TypeId {
         if (c.ts.kind(t) == .union_type) {
             var parts: std.ArrayList(TypeId) = .empty;
@@ -5842,7 +5919,7 @@ const Checker = struct {
                 if (try c.assignTargetsSymForDa(target, sym)) return true;
                 return c.definitelyAssigned(b.flow_a[flow], sym);
             },
-            .cond_true, .cond_false, .switch_clause => {
+            .cond_true, .cond_false, .switch_clause, .call_stmt => {
                 return c.definitelyAssigned(b.flow_a[flow], sym);
             },
             .branch_label, .loop_label => {

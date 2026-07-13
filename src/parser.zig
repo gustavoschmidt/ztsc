@@ -1052,21 +1052,22 @@ const Parser = struct {
         });
     }
 
-    /// Return-type position: also swallows type predicates (`x is T`,
-    /// `asserts x`) as unsupported nodes.
+    /// Return-type position: parses a type, or a type predicate
+    /// (`x is T`, `asserts x is T`, `asserts x`) into a `.type_predicate`
+    /// node whose main_token names the guarded parameter.
     fn parseReturnType(p: *Parser) PE!Node {
-        const start_tok = p.curIdx();
         if (p.curTag() == .keyword_asserts and !p.peekNewline(1) and (isIdentLike(p.peekTag(1)) or p.peekTag(1) == .keyword_this)) {
             _ = try p.bump(); // asserts
-            _ = try p.bump(); // name/this
-            if (try p.eat(.keyword_is) != null) _ = try p.parseType();
-            return p.unsupportedFrom(start_tok);
+            const name_tok = try p.bump(); // name/this
+            var target: Node = null_node;
+            if (try p.eat(.keyword_is) != null) target = try p.parseType();
+            return p.addNode(.{ .tag = .type_predicate, .main_token = name_tok, .data = .{ .lhs = target, .rhs = 1 } });
         }
         if ((isIdentLike(p.curTag()) or p.curTag() == .keyword_this) and p.peekTag(1) == .keyword_is and !p.peekNewline(1)) {
-            _ = try p.bump();
+            const name_tok = try p.bump();
             _ = try p.bump(); // is
-            _ = try p.parseType();
-            return p.unsupportedFrom(start_tok);
+            const target = try p.parseType();
+            return p.addNode(.{ .tag = .type_predicate, .main_token = name_tok, .data = .{ .lhs = target, .rhs = 0 } });
         }
         return p.parseType();
     }
@@ -3805,10 +3806,16 @@ test "unsupported: misc type-level constructs" {
     try expectDiagCount("type F = new () => Thing;", 1); // constructor type
     try expectDiagCount("type P = typeof import(\"m\");", 1);
     try expectDiagCount("type U = unique symbol;", 1);
-    try expectDiagCount("function f(x: unknown): x is string { return true; }", 1); // predicate
     try expectDiagCount("interface I { (x: number): string; }", 1); // call signature
     try expectDiagCount("interface I { new (x: number): Thing; }", 1); // construct signature
     try expectDiagCount("type NT = [x: number, y: number];", 1); // named tuple members
+}
+
+test "type predicates parse cleanly" {
+    try expectDiagCount("function f(x: unknown): x is string { return true; }", 0);
+    try expectDiagCount("function f(x: unknown): asserts x is string {}", 0);
+    try expectDiagCount("function f(c: unknown): asserts c {}", 0);
+    try expectDiagCount("const f = (x: unknown): x is string => true;", 0);
 }
 
 test "unsupported: class oddities" {
