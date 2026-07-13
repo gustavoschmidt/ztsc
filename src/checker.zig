@@ -67,6 +67,7 @@ const binder = @import("binder.zig");
 const types = @import("types.zig");
 const source = @import("source.zig");
 const modules = @import("modules.zig");
+const ZeroPagedArray = @import("zeropage.zig").ZeroPagedArray;
 
 const Ast = ast.Ast;
 const Node = ast.Node;
@@ -85,6 +86,16 @@ const Store = types.Store;
 pub const Error = error{OutOfMemory};
 
 pub const FileId = modules.FileId;
+
+/// Per-symbol type-computation state (`sym_state`). `not_computed = 0` is
+/// load-bearing: `sym_state` is a demand-zeroed `ZeroPagedArray`, so an
+/// untouched entry reads as `.not_computed` without ever being written — and
+/// without faulting its page resident. Do not reorder or renumber.
+const SymState = enum(u8) {
+    not_computed = 0,
+    in_progress = 1,
+    computed = 2,
+};
 
 /// A checker diagnostic: tsc error code + file + span + rendered message.
 pub const Diag = struct {
@@ -248,8 +259,14 @@ const Checker = struct {
 
     // --- caches (checker arena) -------------------------------------------
     /// Global symbol -> declared value type. 0 = not computed.
-    sym_types: []TypeId = &.{},
-    sym_state: []u8 = &.{}, // 0 = none, 1 = in progress, 2 = done
+    /// Global symbol -> declared value type. `0` = not computed. Demand-zeroed
+    /// (see `ZeroPagedArray`): indexed by global SymbolId so it spans the whole
+    /// symbol space, but only pages for symbols this checker touches ever
+    /// become resident.
+    sym_types: ZeroPagedArray(TypeId) = .{},
+    /// Global symbol -> computation state (`.not_computed` = 0). Same
+    /// demand-zeroed backing as `sym_types`.
+    sym_state: ZeroPagedArray(SymState) = .{},
     /// (file << 32 | node) -> synthesized type + the contextual type it was
     /// checked under (memoized; dedupes diags). Keeping `ctx` on the value
     /// (rather than in the key) means a re-check under a *different* context
@@ -381,18 +398,16 @@ const Checker = struct {
         // so merged ids are valid sym_types/sym_state indices (M11a). These
         // are indexed by *global* SymbolId — a checker reads them for foreign
         // (lib/import/merged) symbols too, so they must span the whole space.
-        // M12 right-sizing: allocate zero-filled from the page allocator
-        // (mmap MAP_ANON is kernel-zeroed) and skip the eager memset — the
-        // memset would fault every page resident up front, but a checker only
-        // ever touches its owned files' symbols plus the foreign ones it
-        // resolves on demand. Untouched entries read the shared zero page (no
-        // residency), so peak RSS tracks the working set, not
-        // symbolSpace()×N_checkers. Freed in `deinit`.
+        // M12 right-sizing: a `ZeroPagedArray` maps them demand-zeroed, so the
+        // eager memset is gone — only pages for symbols this checker actually
+        // touches become resident, and the `.not_computed`/`0` initial state
+        // is the kernel's documented MAP_ANON zero-fill (not an allocator
+        // accident). Freed in `deinit`.
         const total_syms = prog.symbolSpace();
-        c.sym_types = try std.heap.page_allocator.alloc(TypeId, total_syms);
-        errdefer std.heap.page_allocator.free(c.sym_types);
-        c.sym_state = try std.heap.page_allocator.alloc(u8, total_syms);
-        errdefer std.heap.page_allocator.free(c.sym_state);
+        c.sym_types = try ZeroPagedArray(TypeId).alloc(total_syms);
+        errdefer c.sym_types.free();
+        c.sym_state = try ZeroPagedArray(SymState).alloc(total_syms);
+        errdefer c.sym_state.free();
         c.owned_mask = try arena_alloc.alloc(bool, prog.files.len);
         @memset(c.owned_mask, false);
         for (owned) |f| c.owned_mask[f] = true;
@@ -424,8 +439,8 @@ const Checker = struct {
     }
 
     fn deinit(c: *Checker) void {
-        std.heap.page_allocator.free(c.sym_types);
-        std.heap.page_allocator.free(c.sym_state);
+        c.sym_types.free();
+        c.sym_state.free();
         c.diag_seen.deinit(c.gpa);
         c.diags.deinit(c.gpa);
         c.carena.deinit();
@@ -1876,24 +1891,24 @@ const Checker = struct {
     // =====================================================================
 
     fn typeOfSymbol(c: *Checker, sym: SymbolId) Error!TypeId {
-        if (sym == binder.no_symbol or sym >= c.sym_types.len) return types.any_type;
-        if (c.sym_state[sym] == 2) return c.sym_types[sym];
-        if (c.sym_state[sym] == 1) return types.any_type; // circular
-        c.sym_state[sym] = 1;
+        if (sym == binder.no_symbol or sym >= c.sym_types.items.len) return types.any_type;
+        if (c.sym_state.items[sym] == .computed) return c.sym_types.items[sym];
+        if (c.sym_state.items[sym] == .in_progress) return types.any_type; // circular
+        c.sym_state.items[sym] = .in_progress;
         const t = c.computeTypeOfSymbol(sym) catch |err| {
-            c.sym_state[sym] = 0;
+            c.sym_state.items[sym] = .not_computed;
             return err;
         };
-        c.sym_types[sym] = t;
-        c.sym_state[sym] = 2;
+        c.sym_types.items[sym] = t;
+        c.sym_state.items[sym] = .computed;
         return t;
     }
 
     fn setTypeOfSymbol(c: *Checker, sym: SymbolId, t: TypeId) void {
-        if (sym == binder.no_symbol or sym >= c.sym_types.len) return;
-        if (c.sym_state[sym] == 2) return;
-        c.sym_types[sym] = t;
-        c.sym_state[sym] = 2;
+        if (sym == binder.no_symbol or sym >= c.sym_types.items.len) return;
+        if (c.sym_state.items[sym] == .computed) return;
+        c.sym_types.items[sym] = t;
+        c.sym_state.items[sym] = .computed;
     }
 
     fn computeTypeOfSymbol(c: *Checker, sym: SymbolId) Error!TypeId {

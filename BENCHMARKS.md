@@ -353,10 +353,13 @@ atoms).
 **Right-sizing.** Each of the N checker instances previously (a) `@memset` a
 `symbolSpace()`-wide `sym_types`/`sym_state` pair up front and (b) eagerly
 mapped *every* scope of *every* file into its own `node_scopes`. Both are now
-paid per working-set: the symbol arrays are allocated zero-filled (mmap
-MAP_ANON) with the memset dropped, so untouched entries read the shared zero
-page (no residency); `node_scopes` is faulted per file on first `scopeOf` read,
-so a checker only maps files it actually traverses.
+paid per working-set: the symbol arrays are now a `ZeroPagedArray`
+(`src/zeropage.zig`) — a fixed-length array over a private `MAP_ANONYMOUS`
+mapping, the one source where the kernel's zero-fill is a *documented*
+guarantee — with the eager memset dropped, so untouched entries are demand-zero
+(no residency) and the `.not_computed`/`0` initial state can't be an allocator
+accident; `node_scopes` is faulted per file on first `scopeOf` read, so a
+checker only maps files it actually traverses.
 
 Multi corpus (201 files / 93k lines, ReleaseFast, peak RSS via `/usr/bin/time
 -l`); diagnostics verified **byte-identical for N ∈ {1,2,4,8}** (raw order, on a
