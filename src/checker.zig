@@ -327,6 +327,9 @@ const Checker = struct {
     atom_sym_iterator: Atom = 0,
     atom_next: Atom = 0,
     atom_value: Atom = 0,
+    atom_JSX: Atom = 0,
+    atom_IntrinsicElements: Atom = 0,
+    atom_Element: Atom = 0,
 
     const typeof_names = [8][]const u8{
         "string", "number", "bigint", "boolean", "symbol", "undefined", "object", "function",
@@ -396,6 +399,9 @@ const Checker = struct {
         c.atom_sym_iterator = try c.atom(ast.wellKnownSymbolKey("iterator").?);
         c.atom_next = try c.atom("next");
         c.atom_value = try c.atom("value");
+        c.atom_JSX = try c.atom("JSX");
+        c.atom_IntrinsicElements = try c.atom("IntrinsicElements");
+        c.atom_Element = try c.atom("Element");
         for (typeof_names, 0..) |n, i| c.typeof_atoms[i] = try c.atom(n);
         var tu: [8]TypeId = undefined;
         for (c.typeof_atoms, 0..) |a, i| tu[i] = try c.ts.makeStringLiteral(a, false);
@@ -3983,12 +3989,164 @@ const Checker = struct {
             .spread_element => {
                 return c.checkExprCached(d.lhs, types.no_type);
             },
+            .jsx_element => return c.checkJsxElement(node),
             else => {
                 // Recovery leftovers: visit children, type any.
                 var it = c.tree.childIterator(node);
                 while (it.next()) |child| _ = try c.checkExprCached(child, types.no_type);
                 return types.any_type;
             },
+        }
+    }
+
+    // =====================================================================
+    // JSX (`.tsx`): elements type as `JSX.Element`; attributes are checked
+    // like an object literal assigned to the element's props type — intrinsic
+    // (`<div>`) props come from `JSX.IntrinsicElements[tag]`, component
+    // (`<Foo>`) props from the component's first parameter.
+    // =====================================================================
+
+    fn checkJsxElement(c: *Checker, node: Node) Error!TypeId {
+        const e = c.tree.extraData(ast.JsxElementData, c.tree.nodeData(node).lhs);
+        var props: TypeId = types.no_type; // no_type = unknown target (skip attr typing)
+        if (e.tag == null_node) {
+            // Fragment `<>…</>`: no attributes, no props.
+        } else if (c.isIntrinsicJsxTag(e.tag)) {
+            const tag_atom = try c.atomOfToken(c.tree.nodeMainToken(e.tag));
+            if (try c.jsxNamespaceType(c.atom_IntrinsicElements)) |ie| {
+                if (try c.propOfType(try c.resolveStructural(ie), tag_atom)) |p| {
+                    props = p.ty;
+                } else {
+                    try c.diagFmt(2339, c.nodeSpan(e.tag), "Property '{s}' does not exist on type 'JSX.IntrinsicElements'.", .{c.atomText(tag_atom)});
+                }
+            }
+        } else {
+            const tag_ty = try c.checkExprCached(e.tag, types.no_type);
+            props = (try c.jsxComponentProps(tag_ty)) orelse types.no_type;
+        }
+        try c.checkJsxAttributes(node, e, props);
+        for (c.tree.extraRange(e.children_start, e.children_end)) |ch| {
+            switch (c.nodeTag(ch)) {
+                .jsx_expr_container => {
+                    const cd = c.tree.nodeData(ch);
+                    if (cd.lhs != null_node) _ = try c.checkExprCached(cd.lhs, types.no_type);
+                },
+                .jsx_element => _ = try c.checkJsxElement(ch),
+                else => {}, // jsx_text
+            }
+        }
+        return (try c.jsxNamespaceType(c.atom_Element)) orelse types.any_type;
+    }
+
+    /// Whether a JSX tag node is an intrinsic element (simple lowercase-initial
+    /// identifier). Uppercase or dotted names are component values.
+    fn isIntrinsicJsxTag(c: *Checker, tag: Node) bool {
+        if (c.nodeTag(tag) != .identifier) return false;
+        const text = c.tokenText(c.tree.nodeMainToken(tag));
+        return text.len > 0 and text[0] >= 'a' and text[0] <= 'z';
+    }
+
+    /// Resolve the type `JSX.<member>` (e.g. `JSX.Element`,
+    /// `JSX.IntrinsicElements`) from the global `JSX` namespace, or null when
+    /// no such namespace/member exists.
+    fn jsxNamespaceType(c: *Checker, member: Atom) Error!?TypeId {
+        const jsx_sym = switch (c.resolveSpace(c.atom_JSX, c.cur_scope, false)) {
+            .sym => |s| if (c.symFlags(s).namespace_decl) s else return null,
+            else => return null,
+        };
+        const nb = c.symBind(jsx_sym);
+        const ns = nb.namespaceScopeOf(c.localOf(jsx_sym)) orelse return null;
+        const local = nb.lookupInScope(ns, member) orelse return null;
+        const g = c.toGlobalIn(c.symFile(jsx_sym), local);
+        const mf = c.symFlags(g);
+        if (!(mf.exported and hasTypeMeaning(mf))) return null;
+        return try c.namedTypeFromSymbol(g, &.{}, 0);
+    }
+
+    /// Props type of a component tag: the first parameter of its call
+    /// signature (function components). Null when it has no discernible props.
+    fn jsxComponentProps(c: *Checker, tag_ty: TypeId) Error!?TypeId {
+        const t = try c.resolveStructural(tag_ty);
+        const sig = switch (c.ts.kind(t)) {
+            .function => t,
+            .overloads => blk: {
+                const sigs = try c.memberList(t);
+                break :blk if (sigs.len > 0) sigs[0] else return null;
+            },
+            else => return null,
+        };
+        if (c.ts.fnParamCount(sig) == 0) return types.empty_object_type;
+        return c.ts.fnParam(sig, 0).ty;
+    }
+
+    /// Check a JSX element's attributes against its props type (`no_type` =
+    /// unknown target, only value expressions are checked). Mirrors tsc's
+    /// "attributes object assigned to props" model: per-attribute value
+    /// mismatches report at the value; excess/missing report the whole object.
+    fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props: TypeId) Error!void {
+        const attrs = c.tree.extraRange(e.attrs_start, e.attrs_end);
+        var built: std.ArrayList(types.Prop) = .empty;
+        defer built.deinit(c.scratch());
+        var has_spread = false;
+        const rt: TypeId = if (props != types.no_type) try c.resolveStructural(props) else types.no_type;
+        const target_open = rt != types.no_type and c.ts.kind(rt) == .object and c.ts.objectStringIndex(rt) == 0;
+        var first_excess: Span = .{ .start = 0, .end = 0 };
+        var have_excess = false;
+
+        for (attrs) |attr| {
+            if (c.nodeTag(attr) == .jsx_spread_attribute) {
+                has_spread = true;
+                const sd = c.tree.nodeData(attr);
+                if (sd.lhs != null_node) _ = try c.checkExprCached(sd.lhs, types.no_type);
+                continue;
+            }
+            const ad = c.tree.nodeData(attr);
+            const name_tok = c.tree.nodeMainToken(attr);
+            const name = try c.memberAtom(name_tok);
+            const vty = try c.jsxAttributeValueType(ad.lhs);
+            try built.append(c.scratch(), .{ .name = name, .ty = vty });
+            if (rt == types.no_type) continue;
+            if (try c.propOfType(rt, name)) |p| {
+                const vspan = if (ad.lhs != null_node) c.nodeSpan(ad.lhs) else c.tokSpan(name_tok);
+                _ = try c.checkAssignable(vty, p.ty, ad.lhs, vspan);
+            } else if (target_open) {
+                if (!have_excess) {
+                    first_excess = c.tokSpan(name_tok);
+                    have_excess = true;
+                }
+            }
+        }
+        if (rt == types.no_type or has_spread) return;
+        const attrs_obj = try c.ts.makeObject(built.items, 0, 0, true);
+        if (have_excess) {
+            try c.reportNotAssignable(2322, attrs_obj, props, first_excess);
+            return;
+        }
+        // Missing required props → TS2741/2739 at the tag (or `<`) position.
+        for (0..c.ts.objectPropCount(rt)) |i| {
+            const tp = c.ts.objectProp(rt, @intCast(i));
+            if (tp.optional()) continue;
+            if ((try c.propOfType(attrs_obj, tp.name)) == null) {
+                const span = if (e.tag != null_node) c.nodeSpan(e.tag) else c.nodeSpan(node);
+                try c.reportNotAssignable(2322, attrs_obj, props, span);
+                return;
+            }
+        }
+    }
+
+    /// Widened type of a JSX attribute value: `name` → `true`, `name="s"` →
+    /// `string`, `name={e}` → widened type of `e`, `name=<x/>` → JSX.Element.
+    fn jsxAttributeValueType(c: *Checker, value: Node) Error!TypeId {
+        if (value == null_node) return types.boolean_type; // boolean shorthand
+        switch (c.nodeTag(value)) {
+            .string_literal => return types.string_type,
+            .jsx_expr_container => {
+                const cd = c.tree.nodeData(value);
+                if (cd.lhs == null_node) return types.undefined_type;
+                return c.widenLiteral(try c.checkExprCached(cd.lhs, types.no_type));
+            },
+            .jsx_element => return c.checkJsxElement(value),
+            else => return types.any_type,
         }
     }
 

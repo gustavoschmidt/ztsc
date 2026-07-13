@@ -2218,12 +2218,30 @@ const Binder = struct {
             .debugger_stmt,
             => {},
 
+            .jsx_element => {
+                const e = b.tree.extraData(ast.JsxElementData, d.lhs);
+                // Intrinsic tags (`<div>`) are not value references; component
+                // tags (`<Foo>`, `<A.B>`) are. Attributes and children carry
+                // ordinary expressions.
+                if (e.tag != null_node and !isIntrinsicJsxTag(b, e.tag)) try b.bindExpr(e.tag);
+                for (b.tree.extraRange(e.attrs_start, e.attrs_end)) |attr| try b.bindExpr(attr);
+                for (b.tree.extraRange(e.children_start, e.children_end)) |ch| try b.bindExpr(ch);
+            },
+
             // Everything else: recurse over expression children generically.
             else => {
                 var it = b.tree.childIterator(node);
                 while (it.next()) |child| try b.bindExpr(child);
             },
         }
+    }
+
+    /// An intrinsic JSX tag is a simple lowercase-initial identifier (`div`);
+    /// uppercase or dotted names (`Foo`, `A.B`) denote component values.
+    fn isIntrinsicJsxTag(b: *Binder, tag: Node) bool {
+        if (b.nodeTag(tag) != .identifier) return false;
+        const text = b.tokenText(b.tree.nodeMainToken(tag));
+        return text.len > 0 and text[0] >= 'a' and text[0] <= 'z';
     }
 
     fn bindIdentifierRef(b: *Binder, node: Node) Error!void {

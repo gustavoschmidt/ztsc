@@ -67,7 +67,18 @@ const PE = error{ OutOfMemory, Backtrack };
 
 /// Parse `src` into a sealed Ast. All output lives in `gpa` (the per-file
 /// arena). Never fails on malformed input — only on OOM / oversized source.
+/// True for source whose extension enables JSX (`.tsx` / `.jsx`). In these
+/// files `<` in expression position begins a JSX element rather than a
+/// type assertion / relational operator.
+pub fn isJsxPath(path: []const u8) bool {
+    return std.mem.endsWith(u8, path, ".tsx") or std.mem.endsWith(u8, path, ".jsx");
+}
+
 pub fn parse(gpa: Allocator, src: []const u8) error{ OutOfMemory, SourceTooLarge }!ast.Ast {
+    return parseOpts(gpa, src, false);
+}
+
+pub fn parseOpts(gpa: Allocator, src: []const u8, jsx: bool) error{ OutOfMemory, SourceTooLarge }!ast.Ast {
     if (src.len > scanner.max_source_len) return error.SourceTooLarge;
     // Build the AST in a transient scratch arena so the growable lists'
     // doubling reallocs and their final tail slack are freed here, then
@@ -80,6 +91,7 @@ pub fn parse(gpa: Allocator, src: []const u8) error{ OutOfMemory, SourceTooLarge
         .out = gpa,
         .src = src,
         .scn = scanner.Scanner.init(src),
+        .jsx = jsx,
     };
     p.parseRoot() catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -97,6 +109,9 @@ const Parser = struct {
     out: Allocator,
     src: []const u8,
     scn: scanner.Scanner,
+    /// JSX enabled (`.tsx`/`.jsx`): `<` in expression position starts an
+    /// element. Off in `.ts`, where `<T>x` is a type assertion.
+    jsx: bool = false,
 
     /// Lookahead queue of scanned-but-not-consumed tokens; la[0] is current.
     la: [max_la]Token = undefined,
@@ -2387,7 +2402,156 @@ const Parser = struct {
         return p.addNode(.{ .tag = .new_expr_bare, .main_token = kw, .data = .{ .lhs = callee, .rhs = 0 } });
     }
 
+    // --- JSX (parsed only when `p.jsx`; entered from parsePrimaryExpr) -----
+    //
+    // Opening tags, attributes, and `{expr}` containers use ordinary
+    // trivia-skipping scanning. Children *text* does not (whitespace is
+    // significant), so it is scanned directly via `scanner.scanJsxChild`
+    // from a tracked byte offset, and lookahead is dropped when switching
+    // back to normal scanning (`jsxResync`).
+
+    /// Byte offset just past the last consumed token — where JSX child text
+    /// resumes.
+    fn lastTokEnd(p: *Parser) u32 {
+        const i = p.lastIdx();
+        const start = p.tok_starts.items[i] & scanner.Tokens.start_mask;
+        return scanner.tokenEnd(p.src, p.tok_tags.items[i], start);
+    }
+
+    /// Resume normal scanning at byte offset `pos`, dropping stale lookahead.
+    fn jsxResync(p: *Parser, pos: u32) void {
+        p.scn.index = pos;
+        p.la_len = 0;
+    }
+
+    /// `<tag ...>children</tag>`, `<tag .../>`, or `<>children</>`.
+    /// Current token is `<`.
+    fn parseJsxElement(p: *Parser) PE!Node {
+        const lt = try p.bump(); // '<'
+        var tag: Node = null_node;
+        if (p.curTag() != .gt) tag = try p.parseJsxTagName();
+        const attrs = try p.parseJsxAttributes();
+        var self_closing: u32 = 0;
+        var children: ast.SubRange = .{ .start = 0, .end = 0 };
+        if (p.curTag() == .slash) {
+            _ = try p.bump(); // '/'
+            _ = try p.expect(.gt, .expected_gt);
+            self_closing = 1;
+        } else {
+            _ = try p.expect(.gt, .expected_gt);
+            children = try p.parseJsxChildren();
+        }
+        const data = try p.addExtra(ast.JsxElementData{
+            .tag = tag,
+            .self_closing = self_closing,
+            .attrs_start = attrs.start,
+            .attrs_end = attrs.end,
+            .children_start = children.start,
+            .children_end = children.end,
+        });
+        return p.addNode(.{ .tag = .jsx_element, .main_token = lt, .data = .{ .lhs = data, .rhs = 0 } });
+    }
+
+    /// Tag name: `div`, `Foo`, or a member chain `A.B.C`, as a value
+    /// expression the checker resolves (lowercase leaf = intrinsic).
+    fn parseJsxTagName(p: *Parser) PE!Node {
+        const tok = try p.expectIdentLike();
+        var node = try p.addNode(.{ .tag = .identifier, .main_token = tok, .data = .{ .lhs = 0, .rhs = 0 } });
+        while (p.curTag() == .dot) {
+            const dot = try p.bump();
+            const name = try p.expectMemberName();
+            node = try p.addNode(.{ .tag = .member_expr, .main_token = dot, .data = .{ .lhs = node, .rhs = name } });
+        }
+        return node;
+    }
+
+    fn parseJsxAttributes(p: *Parser) PE!ast.SubRange {
+        const top = p.scratchTop();
+        defer p.scratch.shrinkRetainingCapacity(top);
+        while (p.curTag() != .gt and p.curTag() != .slash and p.curTag() != .eof) {
+            const before = p.curIdx();
+            if (p.curTag() == .l_brace) {
+                const lb = try p.bump(); // '{'
+                _ = try p.eat(.dot_dot_dot); // '...'
+                const expr = try p.parseAssignExpr(.{});
+                _ = try p.expect(.r_brace, .expected_r_brace);
+                try p.pushScratch(try p.addNode(.{ .tag = .jsx_spread_attribute, .main_token = lb, .data = .{ .lhs = expr, .rhs = 0 } }));
+            } else {
+                const name = try p.expectIdentLike();
+                var value: Node = null_node;
+                if (try p.eat(.eq) != null) value = try p.parseJsxAttributeValue();
+                try p.pushScratch(try p.addNode(.{ .tag = .jsx_attribute, .main_token = name, .data = .{ .lhs = value, .rhs = 0 } }));
+            }
+            if (p.curIdx() == before) break; // no progress: bail to avoid a loop
+        }
+        return p.scratchToSpan(top);
+    }
+
+    fn parseJsxAttributeValue(p: *Parser) PE!Node {
+        switch (p.curTag()) {
+            .string_literal => return p.leaf(.string_literal),
+            .l_brace => {
+                const lb = try p.bump();
+                const expr = try p.parseAssignExpr(.{});
+                _ = try p.expect(.r_brace, .expected_r_brace);
+                return p.addNode(.{ .tag = .jsx_expr_container, .main_token = lb, .data = .{ .lhs = expr, .rhs = 0 } });
+            },
+            .lt => return p.parseJsxElement(),
+            else => {
+                try p.fail(.expected_expression);
+                return p.errorNode();
+            },
+        }
+    }
+
+    /// Children of a non-self-closing element, up to the matching `</tag>`
+    /// (whose closing tag this consumes).
+    fn parseJsxChildren(p: *Parser) PE!ast.SubRange {
+        const top = p.scratchTop();
+        defer p.scratch.shrinkRetainingCapacity(top);
+        var pos = p.lastTokEnd(); // just past the opening '>'
+        while (true) {
+            const tok = p.scn.scanJsxChild(pos);
+            switch (tok.tag) {
+                .jsx_text => {
+                    const idx = p.curIdx();
+                    try p.appendTok(.{ .tag = .jsx_text, .start = tok.start, .end = tok.end, .newline_before = false });
+                    try p.pushScratch(try p.addNode(.{ .tag = .jsx_text, .main_token = idx, .data = .{ .lhs = 0, .rhs = 0 } }));
+                    pos = tok.end;
+                },
+                .l_brace => {
+                    p.jsxResync(tok.start);
+                    const lb = try p.bump(); // '{'
+                    var expr: Node = null_node;
+                    if (p.curTag() != .r_brace) expr = try p.parseAssignExpr(.{});
+                    _ = try p.expect(.r_brace, .expected_r_brace);
+                    try p.pushScratch(try p.addNode(.{ .tag = .jsx_expr_container, .main_token = lb, .data = .{ .lhs = expr, .rhs = 0 } }));
+                    pos = p.lastTokEnd();
+                },
+                .lt => {
+                    p.jsxResync(tok.start);
+                    if (p.peekTag(1) == .slash) {
+                        _ = try p.bump(); // '<'
+                        _ = try p.bump(); // '/'
+                        if (p.curTag() != .gt) _ = try p.parseJsxTagName();
+                        _ = try p.expect(.gt, .expected_gt);
+                        break;
+                    }
+                    try p.pushScratch(try p.parseJsxElement());
+                    pos = p.lastTokEnd();
+                },
+                else => { // eof or unexpected
+                    p.jsxResync(tok.start);
+                    try p.fail(.expected_gt);
+                    break;
+                },
+            }
+        }
+        return p.scratchToSpan(top);
+    }
+
     fn parsePrimaryExpr(p: *Parser, ctx: ExprCtx) PE!Node {
+        if (p.jsx and p.curTag() == .lt) return p.parseJsxElement();
         switch (p.curTag()) {
             .numeric_literal => return p.leaf(.number_literal),
             .bigint_literal => return p.leaf(.bigint_literal),
@@ -3928,6 +4092,34 @@ test "well-known symbol computed member is in subset" {
     // `[Symbol.iterator]` methods parse cleanly (keyed by a synthetic atom).
     try expectDiagCount("class C { [Symbol.iterator]() {} }", 0);
     try expectDiagCount("interface I { [Symbol.iterator](): Iterator<number>; }", 0);
+}
+
+test "jsx parses cleanly in tsx mode" {
+    const cases = [_][]const u8{
+        "const a = <div className=\"x\">hello</div>;",
+        "const b = <Foo count={1} name=\"y\" />;",
+        "const c = <><span>a</span>{x}</>;",
+        "const d = <A.B prop=\"y\">child</A.B>;",
+        "const e = <div {...props} id={f()} />;",
+        "const g = <ul>{items.map(i => <li>{i}</li>)}</ul>;",
+    };
+    for (cases) |src| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const tree = try parseOpts(arena.allocator(), src, true);
+        if (tree.diagnostics.len != 0) {
+            std.debug.print("--- unexpected JSX parse diag for: {s}\n", .{src});
+            for (tree.diagnostics) |d| std.debug.print("  {s}\n", .{d.message()});
+            return error.TestUnexpectedDiagnostics;
+        }
+    }
+    // `<` stays a relational/type-argument operator in `.ts` (jsx off).
+    {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const tree = try parseOpts(arena.allocator(), "const a = x < y;", false);
+        try testing.expectEqual(@as(usize, 0), tree.diagnostics.len);
+    }
 }
 
 test "unsupported constructs still leave following code parsable" {

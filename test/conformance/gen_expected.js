@@ -34,6 +34,9 @@ const options = {
   module: ts.ModuleKind.ESNext,
   moduleResolution: ts.ModuleResolutionKind.Bundler,
   allowImportingTsExtensions: true,
+  // JSX in `.tsx` cases (no effect on `.ts`). ztsc parses/types JSX from a
+  // self-contained `JSX` namespace defined in each case (no React types).
+  jsx: ts.JsxEmit.Preserve,
 };
 
 function walk(dir) {
@@ -50,7 +53,7 @@ function walk(dir) {
         files.push(...sub.files);
         dirs.push(...sub.dirs);
       }
-    } else if (e.isFile() && e.name.endsWith(".ts")) {
+    } else if (e.isFile() && (e.name.endsWith(".ts") || e.name.endsWith(".tsx"))) {
       files.push(p);
     }
   }
@@ -116,7 +119,7 @@ for (const file of files) {
     lines.push(`TS${d.code} ${line + 1}`);
   }
   const content = lines.length ? lines.join("\n") + "\n" : "";
-  emit(file.slice(0, -3) + ".expected", content, path.relative(confDir, file));
+  emit(file.replace(/\.tsx?$/, "") + ".expected", content, path.relative(confDir, file));
 }
 
 for (const dir of dirs) {

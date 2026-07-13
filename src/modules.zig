@@ -877,7 +877,7 @@ pub fn buildProgram(
             continue;
         };
         const tree = try arena.create(Ast);
-        tree.* = try parser.parse(arena, bytes);
+        tree.* = try parser.parseOpts(arena, bytes, parser.isJsxPath(path));
         const bound = try arena.create(Bind);
         bound.* = try binder.bind(arena, io, gpa, interner, tree, bytes);
 

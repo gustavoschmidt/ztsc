@@ -220,11 +220,18 @@ Apple M4, ReleaseFast; see BENCHMARKS.md for methodology.
   namespace` members visible as `N.member` without `export`, also fixing
   function+ambient-namespace merged property access), **`Symbol` global**
   (`8037ead` — callable + well-known symbols via interface+function+namespace
-  merge, closing the value-`Symbol` gap). `symbol` primitive + `typeof`
-  narrowing already worked. Conformance 200 → 292. **Still open in M11:**
-  general cross-file declaration merging (the global-symbol layer — M11e-1
-  built the sealed-bind foundation), `unique symbol` annotations (clean
-  out-of-subset today), module augmentation + triple-slash refs, JSX typing.
+  merge, closing the value-`Symbol` gap), **JSX typing** (`.tsx`) — scanner
+  `scanJsxChild`, additive parser/AST for elements/fragments/attributes/
+  expression containers, and checker typing: intrinsic tags via
+  `JSX.IntrinsicElements[tag]`, component tags via their first parameter,
+  attributes checked as an object assigned to props (TS2322/2741/2339),
+  result `JSX.Element`. `symbol` primitive + `typeof` narrowing already
+  worked. Conformance 200 → 297. **JSX subset caveats:** `-` in JSX names
+  (`data-*`/`aria-*`) and class-component props are best-effort/deferred; a
+  `JSX` namespace must be in scope. **Still open in M11:** general cross-file
+  declaration merging (the global-symbol layer — M11e-1 built the sealed-bind
+  foundation), `unique symbol` annotations (clean out-of-subset today),
+  module augmentation + triple-slash refs.
 
 ---
 

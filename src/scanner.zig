@@ -84,6 +84,9 @@ pub const Tag = enum(u8) {
     identifier,
     /// `#name`
     private_identifier,
+    /// JSX children text between tags (`<a>THIS<b/></a>`). Scanned only in
+    /// `.tsx` files, by the parser-driven `scanJsxChild` path.
+    jsx_text,
 
     // --- punctuation -------------------------------------------------------
     l_brace,
@@ -479,6 +482,34 @@ pub const Scanner = struct {
         s.index = rbrace.start;
         const tag = s.scanTemplate(false);
         return .{ .tag = tag, .start = rbrace.start, .end = s.index, .newline_before = rbrace.newline_before };
+    }
+
+    /// Scan one JSX child starting at `at`: a `<` (`.lt`) or `{` (`.l_brace`)
+    /// delimiter, `.eof`, or otherwise the run of children text up to the next
+    /// delimiter as a single `.jsx_text` token (tsc: `scanJsxToken`). The
+    /// parser drives this directly (not through `next`), resetting `s.index`
+    /// to the position after the last consumed token first — JSX text is not
+    /// trivia-skipped, so lookahead scanned in normal mode must be dropped.
+    pub fn scanJsxChild(s: *Scanner, at_index: u32) Token {
+        s.index = at_index;
+        if (s.index >= s.src.len) {
+            return .{ .tag = .eof, .start = s.index, .end = s.index, .newline_before = false };
+        }
+        switch (s.src[s.index]) {
+            '<' => return .{ .tag = .lt, .start = s.index, .end = s.punctEnd(1), .newline_before = false },
+            '{' => return .{ .tag = .l_brace, .start = s.index, .end = s.punctEnd(1), .newline_before = false },
+            else => {},
+        }
+        const start = s.index;
+        while (s.index < s.src.len and s.src[s.index] != '<' and s.src[s.index] != '{') {
+            s.index += 1;
+        }
+        return .{ .tag = .jsx_text, .start = start, .end = s.index, .newline_before = false };
+    }
+
+    inline fn punctEnd(s: *Scanner, len: u32) u32 {
+        s.index += len;
+        return s.index;
     }
 
     // --- internals -----------------------------------------------------
@@ -973,6 +1004,10 @@ pub fn tokenEnd(src: []const u8, tag: Tag, start: u32) u32 {
             var s = Scanner{ .src = src, .index = start };
             _ = s.scanRegex();
             return s.index;
+        },
+        .jsx_text => {
+            var s = Scanner{ .src = src, .index = start };
+            return s.scanJsxChild(start).end;
         },
         else => {
             var s = Scanner{ .src = src, .index = start };
