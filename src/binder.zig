@@ -1775,7 +1775,10 @@ const Binder = struct {
             },
             .method_signature => {
                 const tok = b.tree.nodeMainToken(member);
-                _ = try b.declare(ms, try b.memberAtom(tok), .method, member, tok, .{});
+                const is_get = md.rhs & ast.Flags.get != 0;
+                const is_set = md.rhs & ast.Flags.set != 0;
+                const kind: DeclKind = if (is_get) .getter else if (is_set) .setter else .method;
+                _ = try b.declare(ms, try b.memberAtom(tok), kind, member, tok, .{});
                 try b.bindFunctionType(member, md.lhs);
             },
             .index_signature => {
