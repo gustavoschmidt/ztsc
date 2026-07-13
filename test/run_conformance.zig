@@ -133,7 +133,13 @@ fn runCase(alloc: std.mem.Allocator, io: Io, gpa: std.mem.Allocator, interner: *
     tree.* = try parser.parse(alloc, src);
     const bound = try alloc.create(binder.Bind);
     bound.* = try binder.bind(alloc, io, gpa, interner, tree, src);
-    const result = try checker.check(alloc, io, gpa, interner, tree, bound, src);
+    // Single-file cases run against the injected ES-core lib (file 0), just
+    // like the CLI. Only the case file (id 1) is owned/reported.
+    const prog = try alloc.create(modules.Program);
+    prog.* = try modules.singleWithLibProgram(alloc, io, gpa, interner, "", src, tree, bound, false);
+    const owned = try alloc.alloc(modules.FileId, 1);
+    owned[0] = @intCast(prog.files.len - 1);
+    const result = try checker.checkFiles(alloc, io, gpa, interner, prog, owned);
 
     for (bound.diagnostics) |d| {
         const ts = d.code.tsCode();
@@ -161,7 +167,7 @@ fn runDirCase(
     errdefer out.deinit(alloc);
 
     const entry = try std.fmt.allocPrint(alloc, "{s}/entry.ts", .{case_rel});
-    const br = try modules.buildProgram(alloc, io, gpa, interner, conf_dir, &.{entry});
+    const br = try modules.buildProgram(alloc, io, gpa, interner, conf_dir, &.{entry}, false);
     const prog = &br.program;
 
     const owned = try alloc.alloc(modules.FileId, prog.files.len);
@@ -395,7 +401,7 @@ test "determinism: diagnostics byte-identical for N = 1, 2, 4, 8 checkers" {
     defer interner.deinit(gpa);
     const alloc = arena.allocator();
 
-    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, &.{"entry.ts"});
+    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, &.{"entry.ts"}, true);
     try std.testing.expectEqual(@as(usize, 10), br.program.files.len);
 
     const ref = try renderProgramDiags(alloc, io, gpa, &interner, &br.program, 1);
@@ -457,7 +463,7 @@ test "cycle stress: N-file import ring + diamonds terminate cleanly" {
     defer interner.deinit(gpa);
     const alloc = arena.allocator();
 
-    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, &.{"entry.ts"});
+    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, &.{"entry.ts"}, true);
     try std.testing.expectEqual(@as(usize, n_ring + 3), br.program.files.len);
 
     // Clean at N=1, and byte-identical (still clean) at higher N — no

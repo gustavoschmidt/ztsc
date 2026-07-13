@@ -991,7 +991,7 @@ test "config-driven program builds and checks (conformance-style)" {
 
     var interner = @import("intern.zig").Interner.init();
     defer interner.deinit(gpa);
-    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, cfg.root_files);
+    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, cfg.root_files, true);
     try testing.expectEqual(@as(usize, 2), br.program.files.len);
 
     const checker = @import("checker.zig");

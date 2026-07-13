@@ -60,6 +60,8 @@ const usage =
     \\  --dump-ast             print S-expression parse trees (golden-test format)
     \\  --dump-symbols         print binder scope/symbol dumps (golden-test format)
     \\  --dump-types           print per-declaration checked types (golden-test format)
+    \\  --noLib                skip the built-in ES-core lib (no globals,
+    \\                         no primitive/array methods; matches tsc)
     \\  --workers=N            number of worker threads (default: CPU count)
     \\  --checkers=N           number of checker instances (default: min(4, CPUs))
     \\  --repeat=N             scan/parse/bind each file N times (benchmark aid)
@@ -96,6 +98,8 @@ const Cli = struct {
     version: bool = false,
     help: bool = false,
     verbose: bool = false,
+    /// Skip lib injection (globals/primitive methods); matches tsc --noLib.
+    no_lib: bool = false,
     /// null = auto (pretty iff stderr is a TTY).
     pretty: ?bool = null,
     project: ?[]const u8 = null,
@@ -270,7 +274,12 @@ const Worker = struct {
         const alloc = w.arena.allocator();
 
         var timer = Timer.start(io);
-        const src = Source.load(io, alloc, path) catch |err| {
+        const src = if (std.mem.eql(u8, path, modules.lib_path))
+            Source.fromBytes(alloc, path, modules.lib_source) catch |err| {
+                c.err = err;
+                return;
+            }
+        else Source.load(io, alloc, path) catch |err| {
             c.err = err;
             return;
         };
@@ -475,6 +484,13 @@ pub fn main(init: std.process.Init) !void {
     // discovered files immediately.
     var paths: std.ArrayList([]const u8) = .empty;
     var path_ids: std.StringHashMapUnmanaged(u32) = .empty;
+    // Inject the ES-core lib as the first entry (root, file 0) unless
+    // --noLib. Its synthetic path routes to the embedded source in the
+    // worker front end; its top-level decls become the program globals.
+    if (!cli.no_lib) {
+        try path_ids.put(arena, modules.lib_path, 0);
+        try paths.append(arena, modules.lib_path);
+    }
     for (entry_paths) |p| {
         const norm = try modules.normalizePath(arena, p);
         const gop = try path_ids.getOrPut(arena, norm);
@@ -658,11 +674,13 @@ pub fn main(init: std.process.Init) !void {
         };
     }
     const links = try modules.link(arena, gpa, io, &interner, prog_files);
+    const sym_base = try modules.computeSymBase(arena, prog_files);
     const prog = try arena.create(modules.Program);
     prog.* = .{
         .files = prog_files,
-        .sym_base = try modules.computeSymBase(arena, prog_files),
+        .sym_base = sym_base,
         .links = links,
+        .globals = try modules.collectGlobals(arena, prog_files, sym_base, modules.libFileId(prog_files)),
     };
     const link_ns = link_timer.readNs();
 
@@ -1163,6 +1181,8 @@ fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8, bad_arg: *[]c
             cli.help = true;
         } else if (std.mem.eql(u8, arg, "--verbose")) {
             cli.verbose = true;
+        } else if (std.mem.eql(u8, arg, "--noLib")) {
+            cli.no_lib = true;
         } else if (std.mem.eql(u8, arg, "--pretty")) {
             cli.pretty = true;
         } else if (std.mem.startsWith(u8, arg, "--pretty=")) {
