@@ -99,6 +99,7 @@ pub const ScopeKind = enum(u8) {
     class_statics,
     interface,
     interface_members,
+    namespace,
     type_alias,
     for_head,
     catch_clause,
@@ -132,7 +133,9 @@ pub const SymbolFlags = packed struct(u32) {
     readonly_member: bool = false,
     /// `enum` / `const enum` declaration (both a value and a type).
     enum_decl: bool = false,
-    _pad: u9 = 0,
+    /// `namespace` / `module` declaration (both a value and a type container).
+    namespace_decl: bool = false,
+    _pad: u8 = 0,
 
     pub fn bits(f: SymbolFlags) u32 {
         return @bitCast(f);
@@ -151,10 +154,10 @@ const mask_let_const_class = fbits(.{ .let_decl = true }) | fbits(.{ .const_decl
 const mask_value = fbits(.{ .var_decl = true }) | mask_let_const_class |
     fbits(.{ .function = true }) | fbits(.{ .param = true }) |
     fbits(.{ .catch_param = true }) | fbits(.{ .import_binding = true }) |
-    fbits(.{ .enum_decl = true });
+    fbits(.{ .enum_decl = true }) | fbits(.{ .namespace_decl = true });
 const mask_type = fbits(.{ .class = true }) | fbits(.{ .interface = true }) |
     fbits(.{ .type_alias = true }) | fbits(.{ .type_param = true }) |
-    fbits(.{ .enum_decl = true });
+    fbits(.{ .enum_decl = true }) | fbits(.{ .namespace_decl = true });
 const mask_member = fbits(.{ .property = true }) | fbits(.{ .method = true }) |
     fbits(.{ .getter = true }) | fbits(.{ .setter = true });
 
@@ -169,6 +172,7 @@ const DeclKind = enum {
     interface,
     type_alias,
     enum_decl,
+    namespace,
     type_param,
     param,
     catch_param,
@@ -189,6 +193,7 @@ const DeclKind = enum {
             .interface => .{ .interface = true },
             .type_alias => .{ .type_alias = true },
             .enum_decl => .{ .enum_decl = true },
+            .namespace => .{ .namespace_decl = true },
             .type_param => .{ .type_param = true },
             .param => .{ .param = true },
             .catch_param => .{ .catch_param = true },
@@ -207,16 +212,27 @@ const DeclKind = enum {
     fn excludes(k: DeclKind) u32 {
         return switch (k) {
             // var+var and var+param merge; everything else valueish clashes.
+            // A namespace merges with function/class/enum/interface, so those
+            // kinds whitelist the namespace bit here (and vice-versa below).
             .var_decl => mask_value & ~(fbits(.{ .var_decl = true }) | fbits(.{ .param = true })),
             .let_decl, .const_decl => mask_value,
-            .function => mask_value & ~fbits(.{ .function = true }),
-            .class => (mask_value & ~fbits(.{ .class = true })) |
-                (mask_type & ~fbits(.{ .interface = true })),
-            .interface => mask_type & ~(fbits(.{ .interface = true }) | fbits(.{ .class = true })),
-            .type_alias => mask_type,
+            .function => mask_value & ~(fbits(.{ .function = true }) | fbits(.{ .namespace_decl = true })),
+            .class => (mask_value & ~(fbits(.{ .class = true }) | fbits(.{ .namespace_decl = true }))) |
+                (mask_type & ~(fbits(.{ .interface = true }) | fbits(.{ .namespace_decl = true }))),
+            .interface => mask_type & ~(fbits(.{ .interface = true }) | fbits(.{ .class = true }) |
+                fbits(.{ .namespace_decl = true })),
+            // A type alias also merges with a namespace (the alias carries the
+            // type meaning; the namespace the value + container meaning).
+            .type_alias => mask_type & ~fbits(.{ .namespace_decl = true }),
             // Two enum blocks (incl. const enum) with the same name merge;
-            // everything else in value or type space clashes.
-            .enum_decl => (mask_value | mask_type) & ~fbits(.{ .enum_decl = true }),
+            // everything else in value or type space clashes (bar namespace).
+            .enum_decl => (mask_value | mask_type) & ~(fbits(.{ .enum_decl = true }) | fbits(.{ .namespace_decl = true })),
+            // A namespace merges with another namespace, function, class,
+            // enum, interface, and type alias; it clashes with var/let/const.
+            .namespace => (mask_value & ~(fbits(.{ .namespace_decl = true }) |
+                fbits(.{ .function = true }) | fbits(.{ .class = true }) | fbits(.{ .enum_decl = true }))) |
+                (mask_type & ~(fbits(.{ .namespace_decl = true }) | fbits(.{ .interface = true }) |
+                    fbits(.{ .class = true }) | fbits(.{ .enum_decl = true }) | fbits(.{ .type_alias = true }))),
             .type_param => mask_type & ~fbits(.{ .class = true }),
             .param => mask_value & ~fbits(.{ .var_decl = true }),
             .catch_param => mask_value,
@@ -341,6 +357,11 @@ pub const Bind = struct {
     /// Class symbol -> statics scope, sorted by symbol id.
     static_scope_syms: []const SymbolId,
     static_scope_ids: []const ScopeId,
+    /// Namespace symbol -> (merged) body scope, sorted by symbol id. Kept
+    /// separate from member_scope_* so a class/interface merged with a
+    /// namespace keeps its own member scope distinct from the namespace body.
+    ns_scope_syms: []const SymbolId,
+    ns_scope_ids: []const ScopeId,
 
     // --- flow graph (SoA; 0 = none, 1 = shared unreachable) ---------------
     flow_tags: []const FlowTag,
@@ -394,6 +415,11 @@ pub const Bind = struct {
     /// Statics scope of a class symbol, if any.
     pub fn staticsScopeOf(b: *const Bind, sym: SymbolId) ?ScopeId {
         return searchPair(b.static_scope_syms, b.static_scope_ids, sym);
+    }
+
+    /// Body scope of a namespace symbol, if any.
+    pub fn namespaceScopeOf(b: *const Bind, sym: SymbolId) ?ScopeId {
+        return searchPair(b.ns_scope_syms, b.ns_scope_ids, sym);
     }
 
     fn searchPair(keys: []const u32, vals: []const u32, key: u32) ?u32 {
@@ -458,7 +484,8 @@ pub const Bind = struct {
             b.scope_members_start.len * @sizeOf(u32) +
             b.member_atoms.len * (@sizeOf(Atom) + @sizeOf(SymbolId)) +
             b.member_scope_syms.len * 2 * @sizeOf(u32) +
-            b.static_scope_syms.len * 2 * @sizeOf(u32);
+            b.static_scope_syms.len * 2 * @sizeOf(u32) +
+            b.ns_scope_syms.len * 2 * @sizeOf(u32);
     }
 
     /// Exact bytes of the sealed flow graph + node attachment map.
@@ -615,6 +642,7 @@ pub const Bind = struct {
             .class_decl => tree.extraData(ast.ClassData, d.lhs).name_token,
             .interface_decl => tree.extraData(ast.InterfaceData, d.lhs).name_token,
             .type_alias => tree.extraData(ast.TypeAlias, d.lhs).name_token,
+            .namespace_decl => tree.extraData(ast.NamespaceData, d.lhs).name_token,
             else => 0,
         };
         _ = kind;
@@ -753,6 +781,7 @@ const Binder = struct {
     /// class/interface symbol -> members scope (merge reuses it).
     member_scopes: std.AutoHashMapUnmanaged(SymbolId, ScopeId) = .empty,
     static_scopes: std.AutoHashMapUnmanaged(SymbolId, ScopeId) = .empty,
+    namespace_scopes: std.AutoHashMapUnmanaged(SymbolId, ScopeId) = .empty,
 
     // flow under construction
     flow_tags: std.ArrayList(FlowTag) = .empty,
@@ -1018,7 +1047,16 @@ const Binder = struct {
     /// While binding the names of `export <decl>`, emit an export record
     /// for each name bound in the file scope.
     fn noteExport(b: *Binder, sym: SymbolId, atom: Atom, scope: ScopeId) Error!void {
-        if (b.exporting_node == 0 or scope != file_scope) return;
+        if (b.exporting_node == 0) return;
+        // A member `export`ed inside a namespace is visible as `N.member`;
+        // mark the flag so the checker exposes it, but emit no cross-file
+        // ExportRec (namespaces are not module exports).
+        if (scope != file_scope) {
+            if (b.scope_kinds.items[scope] == .namespace) {
+                b.sym_flags.items[sym].exported = true;
+            }
+            return;
+        }
         if (b.sym_flags.items[sym].exported) return; // one record per symbol
         b.sym_flags.items[sym].exported = true;
         try b.export_recs.append(b.scratch, .{
@@ -1224,6 +1262,7 @@ const Binder = struct {
             .interface_decl => try b.bindInterface(node),
             .type_alias => try b.bindTypeAlias(node),
             .enum_decl => try b.bindEnum(node),
+            .namespace_decl => try b.bindNamespace(node),
             .import_decl => try b.bindImport(node),
             .export_decl => {
                 const saved = b.exporting_node;
@@ -1756,6 +1795,52 @@ const Binder = struct {
             if (member == null_node or b.nodeTag(member) != .enum_member) continue;
             try b.bindExpr(b.tree.nodeData(member).lhs); // optional initializer
         }
+    }
+
+    /// A namespace declares one symbol (both a value and a type container).
+    /// Its body is a scope; `export`ed members are visible as `N.member`.
+    /// Multiple `namespace N {}` blocks in one file (and namespace + function
+    /// /class/enum/interface merges) share a single members scope, reused via
+    /// `member_scopes` — the same one-scope pattern interface merging uses.
+    fn bindNamespace(b: *Binder, node: Node) Error!void {
+        const d = b.tree.nodeData(node);
+        const data = b.tree.extraData(ast.NamespaceData, d.lhs);
+        var sym: SymbolId = no_symbol;
+        if (data.name_token != 0) {
+            const atom = try b.atomOfToken(data.name_token);
+            // Declared (and possibly marked exported by an outer `export`)
+            // in the enclosing scope before the body clears exporting_node.
+            sym = try b.declare(b.cur_scope, atom, .namespace, node, data.name_token, .{});
+        }
+
+        const saved = b.saveState();
+        const clear_export = b.exporting_node;
+        b.exporting_node = 0;
+        defer b.exporting_node = clear_export;
+
+        // Merged blocks bind into one shared namespace scope.
+        var ns_scope: ScopeId = 0;
+        if (sym != no_symbol) {
+            if (b.namespace_scopes.get(sym)) |existing| {
+                ns_scope = existing;
+            } else {
+                ns_scope = try b.newScope(.namespace, node, b.cur_scope);
+                try b.namespace_scopes.put(b.scratch, sym, ns_scope);
+            }
+        } else {
+            ns_scope = try b.newScope(.namespace, node, b.cur_scope);
+        }
+
+        try b.scope_stack.append(b.scratch, ns_scope);
+        b.cur_scope = ns_scope;
+        b.var_scope = ns_scope; // a namespace is a var container
+        b.ctx_base = b.ctxs.items.len;
+        b.cur_flow = try b.addFlow(.start, no_flow, node);
+
+        for (b.tree.extraRange(data.body_start, data.body_end)) |stmt| {
+            try b.bindStatement(stmt);
+        }
+        b.restoreState(saved);
     }
 
     fn bindInterface(b: *Binder, node: Node) Error!void {
@@ -2356,6 +2441,7 @@ const Binder = struct {
 
         const msp = try sealPairMap(arena, b.scratch, &b.member_scopes);
         const ssp = try sealPairMap(arena, b.scratch, &b.static_scopes);
+        const nsp = try sealPairMap(arena, b.scratch, &b.namespace_scopes);
 
         // Flow: convert label pending ids into flow_extra ranges.
         const n_flows = b.flow_tags.items.len;
@@ -2412,6 +2498,8 @@ const Binder = struct {
             .member_scope_ids = msp.vals,
             .static_scope_syms = ssp.keys,
             .static_scope_ids = ssp.vals,
+            .ns_scope_syms = nsp.keys,
+            .ns_scope_ids = nsp.vals,
             .flow_tags = flow_tags,
             .flow_a = flow_a,
             .flow_b = flow_b,

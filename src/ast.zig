@@ -308,6 +308,11 @@ pub const Tag = enum(u8) {
     /// An enum member `Name` / `Name = expr`. main_token = name token;
     /// lhs = optional initializer expression (0 = none).
     enum_member,
+    /// `namespace N { ... }` / `module N { ... }` (identifier-named).
+    /// main_token = `namespace`/`module` keyword; lhs = extra→NamespaceData,
+    /// rhs unused. A namespace is both a value (an object of its exported
+    /// members) and a type/namespace container.
+    namespace_decl,
     /// Type parameter `T extends C = D`. main_token = name token;
     /// lhs = optional constraint, rhs = optional default.
     type_param,
@@ -444,6 +449,12 @@ pub const EnumData = struct {
     name_token: TokenIndex,
     members_start: ExtraIndex, // enum_member nodes
     members_end: ExtraIndex,
+};
+pub const NamespaceData = struct {
+    flags: u32, // Flags.declare
+    name_token: TokenIndex,
+    body_start: ExtraIndex, // body statement nodes
+    body_end: ExtraIndex,
 };
 pub const IndexSig = struct { name_token: TokenIndex, key_type: Node, value_type: Node };
 pub const ImportData = struct {
@@ -832,6 +843,10 @@ pub const Ast = struct {
                     it.pushRange(a.extraRange(e.members_start, e.members_end));
                 },
                 .enum_member => it.push(d.lhs), // optional initializer
+                .namespace_decl => {
+                    const e = a.extraData(NamespaceData, d.lhs);
+                    it.pushRange(a.extraRange(e.body_start, e.body_end));
+                },
                 .import_decl => {
                     const e = a.extraData(ImportData, d.lhs);
                     it.pushRange(a.extraRange(e.spec_start, e.spec_end));
@@ -887,6 +902,7 @@ pub const Ast = struct {
             .interface_decl => l.add(a.extraData(InterfaceData, d.lhs).name_token),
             .type_alias => l.add(a.extraData(TypeAlias, d.lhs).name_token),
             .enum_decl => l.add(a.extraData(EnumData, d.lhs).name_token),
+            .namespace_decl => l.add(a.extraData(NamespaceData, d.lhs).name_token),
             else => {},
         }
         return l;
@@ -910,6 +926,7 @@ pub const Ast = struct {
             .arrow_fn, .function_expr, .function_decl, .class_method, .function_type, .method_signature => a.extraData(FnProto, d.lhs).flags,
             .class_decl => a.extraData(ClassData, d.lhs).flags,
             .enum_decl => a.extraData(EnumData, d.lhs).flags,
+            .namespace_decl => a.extraData(NamespaceData, d.lhs).flags,
             .interface_decl => a.extraData(InterfaceData, d.lhs).flags,
             .property_signature, .index_signature, .import_specifier, .export_specifier => d.rhs,
             .import_decl => a.extraData(ImportData, d.lhs).flags,
@@ -958,6 +975,7 @@ pub const Ast = struct {
             .interface_decl => try w.print(" {s}", .{a.tokenSlice(src, a.extraData(InterfaceData, d.lhs).name_token)}),
             .type_alias => try w.print(" {s}", .{a.tokenSlice(src, a.extraData(TypeAlias, d.lhs).name_token)}),
             .enum_decl => try w.print(" {s}", .{a.tokenSlice(src, a.extraData(EnumData, d.lhs).name_token)}),
+            .namespace_decl => try w.print(" {s}", .{a.tokenSlice(src, a.extraData(NamespaceData, d.lhs).name_token)}),
             .break_stmt, .continue_stmt => {
                 if (d.lhs != 0) try w.print(" {s}", .{a.tokenSlice(src, d.lhs)});
             },

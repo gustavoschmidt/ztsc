@@ -671,7 +671,20 @@ const Parser = struct {
                         _ = try p.bump(); // `declare`
                         return p.parseEnumDecl(ast.Flags.declare);
                     },
-                    .keyword_module, .keyword_namespace, .keyword_global => {
+                    .keyword_module, .keyword_namespace => {
+                        // `declare namespace N { ... }` (ambient): in subset
+                        // for an identifier name; a string-module name stays
+                        // unsupported.
+                        _ = try p.bump(); // `declare`
+                        if (isIdentLike(p.peekTag(1)) and !p.peekNewline(1)) {
+                            return p.parseNamespaceDecl(ast.Flags.declare);
+                        }
+                        const start = p.curIdx();
+                        _ = try p.bump();
+                        p.skipUnsupportedBlockish();
+                        return p.unsupportedFrom(start);
+                    },
+                    .keyword_global => {
                         const start = try p.bump();
                         p.skipUnsupportedBlockish();
                         const node = try p.unsupportedFrom(start);
@@ -687,7 +700,12 @@ const Parser = struct {
             .keyword_namespace, .keyword_module => {
                 // Only a namespace when followed by a name / string.
                 const t1 = p.peekTag(1);
-                if ((isIdentLike(t1) or t1 == .string_literal) and !p.peekNewline(1)) {
+                if (isIdentLike(t1) and !p.peekNewline(1)) {
+                    return p.parseNamespaceDecl(0);
+                }
+                if (t1 == .string_literal and !p.peekNewline(1)) {
+                    // String-module name (`module "x" {}`) is augmentation:
+                    // still out of subset.
                     const start = try p.bump();
                     p.skipUnsupportedBlockish();
                     return p.unsupportedFrom(start);
@@ -1553,6 +1571,33 @@ const Parser = struct {
         var init: Node = null_node;
         if (try p.eat(.eq) != null) init = try p.parseAssignExpr(.{});
         return p.addNode(.{ .tag = .enum_member, .main_token = name_tok, .data = .{ .lhs = init, .rhs = 0 } });
+    }
+
+    /// `namespace N { ... }` / `module N { ... }`. The `namespace`/`module`
+    /// keyword must not yet be consumed. Only identifier-named namespaces are
+    /// in subset; a string-module name (`module "x" {}`, augmentation) or a
+    /// dotted name (`namespace A.B {}`) falls back to unsupported.
+    fn parseNamespaceDecl(p: *Parser, flags: u32) PE!Node {
+        const kw = try p.bump(); // `namespace` / `module`
+        const name_tok = try p.expectIdentLike();
+        // Dotted namespace name (`namespace A.B { ... }`) is deferred.
+        if (p.curTag() == .dot) {
+            p.skipUnsupportedBlockish();
+            return p.unsupportedFrom(kw);
+        }
+        _ = try p.expect(.l_brace, .expected_l_brace);
+        const top = p.scratchTop();
+        defer p.scratch.shrinkRetainingCapacity(top);
+        try p.parseStatementList(top, .r_brace);
+        _ = try p.expect(.r_brace, .expected_r_brace);
+        const body = try p.scratchToSpan(top);
+        const extra = try p.addExtra(ast.NamespaceData{
+            .flags = flags,
+            .name_token = name_tok,
+            .body_start = body.start,
+            .body_end = body.end,
+        });
+        return p.addNode(.{ .tag = .namespace_decl, .main_token = kw, .data = .{ .lhs = extra, .rhs = 0 } });
     }
 
     // --- modules --------------------------------------------------------------
@@ -3775,11 +3820,20 @@ test "enums parse into enum_decl / enum_member nodes" {
     );
 }
 
-test "unsupported: namespaces and modules" {
-    try expectDiagCount("namespace NS { export const x = 1; }", 1);
-    try expectDiagCount("module M { let y = 2; }", 1);
+test "namespaces and modules (identifier-named) parse" {
+    try expectDiagCount("namespace NS { export const x = 1; }", 0);
+    try expectDiagCount("module M { let y = 2; }", 0);
+    try expectDiagCount("declare namespace D { export const x: number; }", 0);
+    try expectSExpr("namespace NS { export const x = 1; }",
+        \\(namespace_decl NS (export_decl (var_decl_one const (declarator_init (identifier x) (number_literal 1)))))
+    );
+}
+
+test "unsupported: string-module and global augmentation" {
+    // String-module names and `global` augmentation stay out of subset.
     try expectDiagCount("declare module \"foo\" { export function f(): void; }", 1);
     try expectDiagCount("declare global { interface Window {} }", 1);
+    try expectDiagCount("module \"bar\" { export const x = 1; }", 1);
 }
 
 test "unsupported: decorators" {
@@ -3827,7 +3881,7 @@ test "unsupported: class oddities" {
 test "unsupported constructs still leave following code parsable" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const src = "namespace NS { let x = 1; }\nconst after: number = 1;";
+    const src = "type C<T> = T extends string ? 1 : 0;\nconst after: number = 1;";
     const tree = try parse(arena.allocator(), src);
     try testing.expect(tree.diagnostics.len >= 1);
     const got = try dumpSource(arena.allocator(), src);

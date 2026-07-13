@@ -642,12 +642,12 @@ const Checker = struct {
     fn hasValueMeaning(f: binder.SymbolFlags) bool {
         if (f.import_binding and f.type_only) return false;
         return f.var_decl or f.let_decl or f.const_decl or f.function or f.class or
-            f.param or f.catch_param or f.import_binding or f.enum_decl;
+            f.param or f.catch_param or f.import_binding or f.enum_decl or f.namespace_decl;
     }
 
     fn hasTypeMeaning(f: binder.SymbolFlags) bool {
         return f.class or f.interface or f.type_alias or f.type_param or
-            f.import_binding or f.enum_decl;
+            f.import_binding or f.enum_decl or f.namespace_decl;
     }
 
     const Resolved = union(enum) {
@@ -1012,7 +1012,7 @@ const Checker = struct {
                 }
                 return c.typeFromTypeName(d.lhs, args.items);
             },
-            .qualified_name => return types.any_type, // namespaces: out of subset
+            .qualified_name => return c.typeFromQualifiedName(node, &.{}),
             .string_literal => return c.ts.makeStringLiteral(try c.memberAtom(c.tree.nodeMainToken(node)), false),
             .template_literal => return c.ts.makeStringLiteral(try c.templateAtom(c.tree.nodeMainToken(node)), false),
             .number_literal => return c.ts.makeNumberLiteral(c.numberTokenValue(c.tree.nodeMainToken(node)), false),
@@ -1093,6 +1093,7 @@ const Checker = struct {
     /// A named type reference (identifier, possibly with type arguments).
     fn typeFromTypeName(c: *Checker, name_node: Node, args: []const TypeId) Error!TypeId {
         if (name_node == null_node) return types.any_type;
+        if (c.nodeTag(name_node) == .qualified_name) return c.typeFromQualifiedName(name_node, args);
         if (c.nodeTag(name_node) != .identifier) return types.any_type;
         const tok = c.tree.nodeMainToken(name_node);
         switch (c.tree.tokens.tag(tok)) {
@@ -1154,6 +1155,77 @@ const Checker = struct {
                 return types.error_type;
             },
         }
+    }
+
+    /// Resolve a qualified type name `A.B.T` (in type position) by walking
+    /// namespace containers left-to-right, then building the final member's
+    /// type. Missing/non-exported members report TS2694 like tsc.
+    fn typeFromQualifiedName(c: *Checker, node: Node, args: []const TypeId) Error!TypeId {
+        const d = c.tree.nodeData(node);
+        const name_tok: TokenIndex = d.rhs;
+        const name = try c.memberAtom(name_tok);
+        const ns_sym = (try c.resolveTypeNamespace(d.lhs)) orelse return types.any_type;
+        // Look the name up in the namespace's (merged) body scope, type space,
+        // and require it to be exported.
+        const nb = c.symBind(ns_sym);
+        if (nb.namespaceScopeOf(c.localOf(ns_sym))) |ns| {
+            if (nb.lookupInScope(ns, name)) |local| {
+                const g = c.toGlobalIn(c.symFile(ns_sym), local);
+                const mf = c.symFlags(g);
+                if (mf.exported and hasTypeMeaning(mf)) {
+                    return c.namedTypeFromSymbol(g, args, name_tok);
+                }
+            }
+        }
+        try c.diagFmt(2694, c.tokSpan(name_tok), "Namespace '{s}' has no exported member '{s}'.", .{ c.symbolName(ns_sym), c.atomText(name) });
+        return types.error_type;
+    }
+
+    /// Resolve a namespace entity (identifier or nested qualified name) to its
+    /// namespace symbol (global id), or null if it is not a namespace.
+    fn resolveTypeNamespace(c: *Checker, node: Node) Error!?SymbolId {
+        switch (c.nodeTag(node)) {
+            .identifier => {
+                const tok = c.tree.nodeMainToken(node);
+                const a = try c.atomOfToken(tok);
+                switch (c.resolveSpace(a, c.cur_scope, false)) {
+                    .sym => |sym| {
+                        if (c.symFlags(sym).namespace_decl) return sym;
+                        return null;
+                    },
+                    else => return null,
+                }
+            },
+            .qualified_name => {
+                const d = c.tree.nodeData(node);
+                const outer = (try c.resolveTypeNamespace(d.lhs)) orelse return null;
+                const name = try c.memberAtom(d.rhs);
+                const ob = c.symBind(outer);
+                if (ob.namespaceScopeOf(c.localOf(outer))) |ns| {
+                    if (ob.lookupInScope(ns, name)) |local| {
+                        const g = c.toGlobalIn(c.symFile(outer), local);
+                        const mf = c.symFlags(g);
+                        if (mf.exported and mf.namespace_decl) return g;
+                    }
+                }
+                return null;
+            },
+            else => return null,
+        }
+    }
+
+    /// Build the type of a named type symbol (interface/class/alias/enum/
+    /// type-param). Shared by bare and qualified type-name resolution.
+    fn namedTypeFromSymbol(c: *Checker, sym: SymbolId, args: []const TypeId, tok: TokenIndex) Error!TypeId {
+        const f = c.symFlags(sym);
+        if (f.type_param) return c.ts.makeTypeParam(sym);
+        if (f.enum_decl) return c.ts.makeEnumType(sym);
+        if (f.type_alias) return c.aliasInstance(sym, args, tok);
+        if (f.interface or f.class) {
+            const fixed = try c.fixTypeArgs(sym, args, tok) orelse return types.error_type;
+            return c.ts.makeRef(sym, fixed);
+        }
+        return types.any_type;
     }
 
     /// `typeof entity` in type position: the entity's value type.
@@ -1699,6 +1771,19 @@ const Checker = struct {
     fn computeTypeOfSymbol(c: *Checker, sym: SymbolId) Error!TypeId {
         const f = c.symFlags(sym);
         if (f.import_binding) return c.importedSymbolType(sym);
+        // A namespace is a value object of its exported members, modeled as a
+        // `class_value` anchored to the namespace symbol (so it prints
+        // `typeof N` and resolves members via classStaticType). When merged
+        // with a class the class_value already carries the namespace members;
+        // with a function/enum the callable/base value is intersected with
+        // the namespace object.
+        if (f.namespace_decl) {
+            const ns_val = try c.ts.makeClassValue(sym);
+            if (f.class) return ns_val;
+            if (f.function) return c.ts.makeIntersection(c.scratch(), &.{ try c.functionSymbolType(sym), ns_val });
+            if (f.enum_decl) return c.ts.makeIntersection(c.scratch(), &.{ try c.enumValueType(sym), ns_val });
+            return ns_val;
+        }
         if (f.enum_decl) return c.enumValueType(sym);
         if (f.class) return c.ts.makeClassValue(sym);
         if (f.function) return c.functionSymbolType(sym);
@@ -2624,6 +2709,35 @@ const Checker = struct {
                     .ty = try c.memberTypeOf(msym),
                     .flags = flags,
                 });
+            }
+        }
+        // Namespace value members: one property per *exported* value-space
+        // member of the namespace's (merged) body scope.
+        if (c.symFlags(sym).namespace_decl) {
+            if (c.bind.namespaceScopeOf(c.localOf(sym))) |ns| {
+                const lo = c.bind.scope_members_start[ns];
+                const hi = c.bind.scope_members_start[ns + 1];
+                for (lo..hi) |i| {
+                    const msym = c.toGlobal(c.bind.member_syms[i]);
+                    const mf = c.symFlags(msym);
+                    if (!mf.exported or !hasValueMeaning(mf)) continue;
+                    const name = c.bind.member_atoms[i];
+                    var dup = false;
+                    for (props.items) |p| {
+                        if (p.name == name) {
+                            dup = true;
+                            break;
+                        }
+                    }
+                    if (dup) continue;
+                    var flags: u32 = 0;
+                    if (mf.const_decl or mf.readonly_member) flags |= types.prop_flag_readonly;
+                    try props.append(c.scratch(), .{
+                        .name = name,
+                        .ty = try c.typeOfSymbol(msym),
+                        .flags = flags,
+                    });
+                }
             }
         }
         const result = try c.ts.makeObject(props.items, 0, 0, false);
@@ -4773,8 +4887,23 @@ const Checker = struct {
             if (c.containsNullish(callee_t)) add_undefined = true;
             callee_t = try c.nonNullable(callee_t);
         }
-        const r = try c.resolveStructural(callee_t);
-        const rk = c.ts.kind(r);
+        var r = try c.resolveStructural(callee_t);
+        var rk = c.ts.kind(r);
+        // A merged value (e.g. `function F(){}` + `namespace F {}`) types as an
+        // intersection of a callable and the namespace object; pick the
+        // callable (or constructable, for `new`) member to resolve against.
+        if (rk == .intersection) {
+            for (try c.memberList(r)) |m| {
+                const rm = try c.resolveStructural(m);
+                const mk = c.ts.kind(rm);
+                const usable = if (is_new) mk == .class_value else (mk == .function or mk == .overloads);
+                if (usable) {
+                    r = rm;
+                    rk = mk;
+                    break;
+                }
+            }
+        }
         if (rk == .any or rk == .err) {
             for (shape.arg_nodes) |an| {
                 if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
@@ -6033,6 +6162,7 @@ const Checker = struct {
             .interface_decl => try c.checkInterfaceDecl(node),
             .type_alias => try c.checkTypeAliasDecl(node),
             .enum_decl => try c.checkEnum(node),
+            .namespace_decl => try c.checkNamespace(node),
             .import_decl => {}, // M5
             .export_named, .export_all => {},
             .export_decl => try c.checkStatement(d.lhs),
@@ -6530,6 +6660,30 @@ const Checker = struct {
     }
 
     // --- classes / interfaces / aliases ------------------------------------
+
+    /// Check a namespace body: enter the (merged) namespace scope and check
+    /// each body statement there. Member visibility/typing is materialized by
+    /// classStaticType (value) and typeFromQualifiedName (type).
+    fn checkNamespace(c: *Checker, node: Node) Error!void {
+        const d = c.tree.nodeData(node);
+        const data = c.tree.extraData(ast.NamespaceData, d.lhs);
+        const saved = c.cur_scope;
+        defer c.cur_scope = saved;
+        // The body scope is the one owned by this node, or — for a merged
+        // block whose scope is owned by an earlier block — the namespace
+        // symbol's members scope.
+        if (c.scopeOf(node)) |s| {
+            c.cur_scope = s;
+        } else if (data.name_token != 0) {
+            const a = try c.atomOfToken(data.name_token);
+            if (c.bind.lookupInScope(saved, a)) |sym| {
+                if (c.bind.namespaceScopeOf(sym)) |ns| c.cur_scope = ns;
+            }
+        }
+        for (c.tree.extraRange(data.body_start, data.body_end)) |stmt| {
+            if (stmt != null_node) try c.checkStatement(stmt);
+        }
+    }
 
     fn checkClass(c: *Checker, node: Node) Error!void {
         const d = c.tree.nodeData(node);
