@@ -47,9 +47,9 @@ pub fn ZeroPagedArray(comptime T: type) type {
             if (n == 0) return .{};
             if (builtin.os.tag == .windows) @compileError(
                 "ZeroPagedArray: Windows port not implemented. VirtualAlloc(null, " ++
-                "bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) likewise returns " ++
-                "zero-initialized, demand-paged memory — wire it in here (and a " ++
-                "matching VirtualFree in `free`) when a Windows target is added.",
+                    "bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) likewise returns " ++
+                    "zero-initialized, demand-paged memory — wire it in here (and a " ++
+                    "matching VirtualFree in `free`) when a Windows target is added.",
             );
             const bytes = n * @sizeOf(T);
             const mapping = std.posix.mmap(
