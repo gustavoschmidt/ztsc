@@ -156,8 +156,9 @@ without a scoreboard.
   accounting (`--memory`): bytes/token, bytes/node, binder bytes/line,
   bytes/type, cache hit rates, scratch high-water.
 - **Corpora**: deterministic generators (`bench/gen_corpus.js`) — small
-  (~5k LOC), medium (~50k), multi (201 files / ~93k), skewed; real-world
-  corpora arrive with M13's census.
+  (~5k LOC), medium (~50k), multi (201 files / ~93k), skewed, bigfan, and
+  deps (M13: `node_modules`-heavy, for the resolution-cache scoreboard);
+  real-world corpora arrive with M13's census.
 - **Conformance**: differential testing against tsc — every case's expected
   diagnostics (code + line) generated from and verified against real tsc
   (5.5.4). 180 cases at M6, **297 as of M10**; grows every milestone.
@@ -608,6 +609,18 @@ BENCHMARKS.md.
 
 Everything here needs real code, which M11 finally makes checkable.
 
+> **Status (2026-07-13): resolution cache DONE.** The `(importer_dir, spec)`
+> memo + negative cache landed first (it is the one piece that needs no network
+> / real-corpus fetch): `modules.ResolveCache`, wired into both discovery
+> drivers, with an `fs_probes` syscall counter surfaced on `--timing` and a
+> `--no-resolve-cache` before/after switch. New **deps** benchmark corpus
+> (`bench/gen_corpus.js`) drives it — resolution syscalls **2160 → 144 (−93%)**,
+> byte-identical output, conformance 313/313, no wall/RSS regression
+> (BENCHMARKS §3.11). The directory-existence layer for the residual
+> cross-directory walk is deferred pending the census. **Still open:** the
+> census tool and the ~500k-LOC real-world corpus (both need real npm packages /
+> repos to fetch).
+
 - **Census tool**: parse the top few hundred npm packages + real Bun/Node
   repos (Elysia, Hono, Zod, Drizzle apps); count which unsupported
   constructs block parse/bind/check, by frequency. The output table
@@ -616,7 +629,8 @@ Everything here needs real code, which M11 finally makes checkable.
 - The long-deferred **~500k-LOC real-world corpus** lands (real code is
   checkable once lib types + the global-symbol layer exist). It becomes
   the standing benchmark corpus alongside the synthetic ones.
-- **Resolution cache.** Resolution work is deduped per resolved *file*
+- **Resolution cache. ✅ DONE (2026-07-13).** Resolution work is deduped per
+  resolved *file*
   (`path_ids`) but not per *specifier*: the same bare specifier imported
   from K files re-walks node_modules K times (`resolvePackage` does a
   `package.json` read + up to 4 stats per parent directory,

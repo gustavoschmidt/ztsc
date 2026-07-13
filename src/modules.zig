@@ -612,7 +612,31 @@ fn joinNormalize(alloc: Allocator, dir: []const u8, rest: []const u8) Error![]u8
 // specifier resolution (FS-backed)
 // ===========================================================================
 
+/// Count of filesystem probes issued during module resolution — every
+/// `statFile` and every `package.json` read. It is the resolution cache's
+/// scoreboard (ROADMAP M13, "resolution syscall counts before/after"): with
+/// the `(importer_dir, spec)` memo the same specifier imported from K files
+/// walks `node_modules` once, not K times, so this collapses on inputs with
+/// shared specifiers.
+///
+/// Resolution runs single-owner (the main thread in the parallel driver, the
+/// sole thread in `buildProgram`), so the counter is never truly contended,
+/// but it is atomic anyway — cheap insurance against a future parallel caller
+/// and race-free under the test runner's threads.
+var fs_probes: std.atomic.Value(u64) = .init(0);
+
+pub fn fsProbeCount() u64 {
+    return fs_probes.load(.monotonic);
+}
+pub fn resetFsProbeCount() void {
+    fs_probes.store(0, .monotonic);
+}
+inline fn bumpProbe() void {
+    _ = fs_probes.fetchAdd(1, .monotonic);
+}
+
 fn fileExists(io: Io, dir: Io.Dir, path: []const u8) bool {
+    bumpProbe();
     const st = dir.statFile(io, path, .{}) catch return false;
     return st.kind == .file;
 }
@@ -715,6 +739,7 @@ fn resolvePackage(io: Io, alloc: Allocator, dir: Io.Dir, importer_dir: []const u
             const pj = try std.fmt.allocPrint(alloc, "{s}/package.json", .{nm});
             defer alloc.free(pj);
             var resolved_types = false;
+            bumpProbe();
             if (dir.readFileAlloc(io, pj, alloc, .limited(1 << 20))) |text| {
                 defer alloc.free(text);
                 if (packageTypesField(text)) |types_rel| {
@@ -759,6 +784,64 @@ pub fn resolveSpecifier(
     }
     return resolvePackage(io, alloc, dir, importer_dir, spec);
 }
+
+/// Memoizes `resolveSpecifier` over the discovery run (ROADMAP M13). A module
+/// specifier resolves as a pure function of `(importer_dir, spec)` given a
+/// fixed filesystem — both a bare `node_modules` walk and a relative
+/// `joinNormalize` depend on nothing else — so that pair is an exact key. The
+/// win: `@types/node` (or any shared package) imported from K files walks the
+/// tree once instead of K times, and unresolvable specifiers are remembered
+/// too (the negative cache), so a bad import from K files also probes once.
+///
+/// Keyed on the *directory* rather than the importer path so sibling files in
+/// one directory share entries. Determinism is untouched: a cached path is
+/// byte-identical to the live resolution it replaces.
+///
+/// Not thread-safe by design — resolution is single-owner (see `fs_probes`).
+pub const ResolveCache = struct {
+    /// Persistent storage for keys and cached paths — outlives the per-file
+    /// scratch resets, so it must be the caller's discovery arena.
+    arena: Allocator,
+    /// `"<importer_dir>\x00<spec>"` → resolved path, or `null` (negative).
+    map: std.StringHashMapUnmanaged(?[]const u8) = .empty,
+    /// When false, every call falls straight through to `resolveSpecifier`
+    /// with no memo read or write — the "before" leg of the M13 benchmark
+    /// (`--no-resolve-cache`), and a correctness oracle for the cache.
+    enabled: bool = true,
+    lookups: u64 = 0,
+    hits: u64 = 0,
+
+    pub fn init(arena: Allocator, enabled: bool) ResolveCache {
+        return .{ .arena = arena, .enabled = enabled };
+    }
+
+    /// Cached `resolveSpecifier`. `scratch` holds the transient candidate
+    /// paths / package.json bodies (reset per file by the caller); a resolved
+    /// path is copied into `arena` so it survives that reset. The returned
+    /// slice is `arena`-owned on a miss and on every hit.
+    pub fn resolve(
+        rc: *ResolveCache,
+        io: Io,
+        scratch: Allocator,
+        dir: Io.Dir,
+        importer: []const u8,
+        spec: []const u8,
+    ) Error!?[]const u8 {
+        if (!rc.enabled) return resolveSpecifier(io, scratch, dir, importer, spec);
+        rc.lookups += 1;
+        const importer_dir = dirnamePart(importer);
+        // Build the key in scratch; only copy it into `arena` on a miss.
+        const key = try std.fmt.allocPrint(scratch, "{s}\x00{s}", .{ importer_dir, spec });
+        if (rc.map.get(key)) |cached| {
+            rc.hits += 1;
+            return cached;
+        }
+        const resolved = try resolveSpecifier(io, scratch, dir, importer, spec);
+        const owned: ?[]const u8 = if (resolved) |p| try rc.arena.dupe(u8, p) else null;
+        try rc.map.put(rc.arena, try rc.arena.dupe(u8, key), owned);
+        return owned;
+    }
+};
 
 // ===========================================================================
 // linking
@@ -1339,6 +1422,7 @@ pub fn buildProgram(
     var scratch_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch_arena.deinit();
     const scratch = scratch_arena.allocator();
+    var rcache = ResolveCache.init(arena, true);
 
     var files: std.ArrayList(ProgFile) = .empty;
     var path_ids: std.StringHashMapUnmanaged(FileId) = .empty;
@@ -1399,11 +1483,11 @@ pub fn buildProgram(
         var spec_files: std.ArrayList(FileId) = .empty;
         var seen: std.AutoHashMapUnmanaged(Atom, void) = .empty;
         for (bound.imports) |rec| {
-            try resolveOne(arena, scratch, io, interner, dir, path, rec.module, &spec_atoms, &spec_files, &seen, &path_ids, &pending);
+            try resolveOne(arena, scratch, io, &rcache, dir, interner, path, rec.module, &spec_atoms, &spec_files, &seen, &path_ids, &pending);
         }
         for (bound.exports) |rec| {
             if (rec.module != 0) {
-                try resolveOne(arena, scratch, io, interner, dir, path, rec.module, &spec_atoms, &spec_files, &seen, &path_ids, &pending);
+                try resolveOne(arena, scratch, io, &rcache, dir, interner, path, rec.module, &spec_atoms, &spec_files, &seen, &path_ids, &pending);
             }
         }
         sortSpecs(spec_atoms.items, spec_files.items);
@@ -1444,8 +1528,9 @@ fn resolveOne(
     arena: Allocator,
     scratch: Allocator,
     io: Io,
-    interner: *Interner,
+    rcache: *ResolveCache,
     dir: Io.Dir,
+    interner: *Interner,
     importer: []const u8,
     module_atom: Atom,
     spec_atoms: *std.ArrayList(Atom),
@@ -1459,7 +1544,7 @@ fn resolveOne(
     if (gop.found_existing) return;
     const spec = interner.lookup(io, module_atom);
     var fid: FileId = no_file;
-    if (try resolveSpecifier(io, scratch, dir, importer, spec)) |resolved| {
+    if (try rcache.resolve(io, scratch, dir, importer, spec)) |resolved| {
         const stable = try arena.dupe(u8, resolved);
         const pgop = try path_ids.getOrPut(scratch, stable);
         if (pgop.found_existing) {
@@ -1609,6 +1694,59 @@ test "resolveSpecifier: relative, index, js rewrite, node_modules" {
             try testing.expectEqual(@as(?[]u8, null), got);
         }
     }
+}
+
+// M13: the resolution memo serves a repeated `(importer_dir, spec)` from
+// cache with no new FS probes, caches unresolvable specifiers (negative
+// cache), and returns byte-identical results to the uncached path.
+test "ResolveCache: memo collapses repeated resolution, matches uncached" {
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const d = tmp.dir;
+    try d.createDirPath(io, "src");
+    try d.createDirPath(io, "node_modules/pkg");
+    try d.writeFile(io, .{ .sub_path = "src/a.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "src/b.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "node_modules/pkg/package.json", .data = "{ \"types\": \"main.d.ts\" }" });
+    try d.writeFile(io, .{ .sub_path = "node_modules/pkg/main.d.ts", .data = "" });
+
+    var rc = ResolveCache.init(alloc, true);
+
+    // First resolve of a bare specifier walks the tree (probes > 0).
+    resetFsProbeCount();
+    const r1 = try rc.resolve(io, alloc, d, "src/a.ts", "pkg");
+    try testing.expectEqualStrings("node_modules/pkg/main.d.ts", r1.?);
+    try testing.expect(fsProbeCount() > 0);
+
+    // Second resolve of the same (dir, spec) — a sibling importer in `src`
+    // — is served from the memo: zero additional probes, same answer.
+    resetFsProbeCount();
+    const r2 = try rc.resolve(io, alloc, d, "src/b.ts", "pkg");
+    try testing.expectEqualStrings("node_modules/pkg/main.d.ts", r2.?);
+    try testing.expectEqual(@as(u64, 0), fsProbeCount());
+    try testing.expectEqual(@as(u64, 2), rc.lookups);
+    try testing.expectEqual(@as(u64, 1), rc.hits);
+
+    // Negative caching: an unresolvable specifier probes once, then never.
+    resetFsProbeCount();
+    const n1 = try rc.resolve(io, alloc, d, "src/a.ts", "ghost");
+    try testing.expectEqual(@as(?[]const u8, null), n1);
+    const after_miss = fsProbeCount();
+    try testing.expect(after_miss > 0);
+    const n2 = try rc.resolve(io, alloc, d, "src/b.ts", "ghost");
+    try testing.expectEqual(@as(?[]const u8, null), n2);
+    try testing.expectEqual(after_miss, fsProbeCount()); // no new probes
+
+    // A disabled cache is a pure pass-through to `resolveSpecifier`.
+    var off = ResolveCache.init(alloc, false);
+    const p1 = try off.resolve(io, alloc, d, "src/a.ts", "pkg");
+    const p2 = try resolveSpecifier(io, alloc, d, "src/a.ts", "pkg");
+    try testing.expectEqualStrings(p2.?, p1.?);
+    try testing.expectEqual(@as(u64, 0), off.lookups);
 }
 
 // Regression: resolution used to build candidate paths in a fixed 256-byte

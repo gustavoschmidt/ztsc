@@ -65,6 +65,7 @@ const usage =
     \\  --workers=N            number of worker threads (default: CPU count)
     \\  --checkers=N           number of checker instances (default: min(4, CPUs))
     \\  --repeat=N             scan/parse/bind each file N times (benchmark aid)
+    \\  --no-resolve-cache     disable the module-resolution memo (benchmark aid)
     \\  -h, --help             print this help and exit
     \\  --version              print version and exit
     \\
@@ -100,6 +101,10 @@ const Cli = struct {
     verbose: bool = false,
     /// Skip lib injection (globals/primitive methods); matches tsc --noLib.
     no_lib: bool = false,
+    /// Disable the module-resolution memo (M13) — the "before" leg of the
+    /// resolution-cache benchmark; resolution then re-walks node_modules per
+    /// importer. Diagnostics are identical either way.
+    no_resolve_cache: bool = false,
     /// null = auto (pretty iff stderr is a TTY).
     pretty: ?bool = null,
     project: ?[]const u8 = null,
@@ -549,6 +554,11 @@ pub fn main(init: std.process.Init) !void {
     var resolve_scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer resolve_scratch.deinit();
 
+    // Resolution memo (M13): the same specifier imported from many files
+    // resolves once. Lives in `arena` (spans the whole discovery run).
+    var rcache = modules.ResolveCache.init(arena, !cli.no_resolve_cache);
+    modules.resetFsProbeCount();
+
     while (outstanding > 0) {
         // The done channel is never closed while work is outstanding.
         const c = done.pop().?;
@@ -575,11 +585,11 @@ pub fn main(init: std.process.Init) !void {
             var seen: std.AutoHashMapUnmanaged(ztsc.intern.Atom, void) = .empty;
             defer seen.deinit(gpa);
             for (b.imports) |rec| {
-                try resolveSpecInto(arena, scratch, gpa, io, &interner, paths_map, paths.items[i], rec.module, &seen, &path_ids, &paths, &atoms, &files);
+                try resolveSpecInto(arena, scratch, gpa, io, &interner, &rcache, paths_map, paths.items[i], rec.module, &seen, &path_ids, &paths, &atoms, &files);
             }
             for (b.exports) |rec| {
                 if (rec.module != 0) {
-                    try resolveSpecInto(arena, scratch, gpa, io, &interner, paths_map, paths.items[i], rec.module, &seen, &path_ids, &paths, &atoms, &files);
+                    try resolveSpecInto(arena, scratch, gpa, io, &interner, &rcache, paths_map, paths.items[i], rec.module, &seen, &path_ids, &paths, &atoms, &files);
                 }
             }
             // Triple-slash `/// <reference>` directives pull extra files into
@@ -991,6 +1001,14 @@ pub fn main(init: std.process.Init) !void {
         for (tasks, 0..) |*t, k| {
             try out.print("    checker[{d}] {d:>10.3} ms  {d} file(s)\n", .{ k, nsToMs(t.ns), t.owned.len });
         }
+        // Resolution cache scoreboard (M13): `probes` is FS syscalls issued
+        // (statFile + package.json reads); `lookups`/`hits` show the memo
+        // collapsing repeated specifiers. Compare probes with vs without
+        // --no-resolve-cache for the before/after number.
+        try out.print("  resolve cache: {d} probes, {d} lookups, {d} hits ({s})\n", .{
+            modules.fsProbeCount(), rcache.lookups, rcache.hits,
+            if (cli.no_resolve_cache) "disabled" else "enabled",
+        });
     }
 
     if (cli.memory) {
@@ -1151,6 +1169,7 @@ fn resolveSpecInto(
     gpa: std.mem.Allocator,
     io: Io,
     interner: *Interner,
+    rcache: *modules.ResolveCache,
     paths_map: ?ztsc.tsconfig.Paths,
     importer: []const u8,
     module_atom: ztsc.intern.Atom,
@@ -1172,7 +1191,7 @@ fn resolveSpecInto(
     // tsconfig `paths` mapping applies to bare specifiers first (M6);
     // unmatched or unresolved candidates fall through to normal
     // resolution, like tsc.
-    var mapped: ?[]u8 = null;
+    var mapped: ?[]const u8 = null;
     if (paths_map) |pm| {
         if (spec.len > 0 and spec[0] != '.' and spec[0] != '/') {
             for (try pm.mapSpecifier(scratch, spec)) |cand| {
@@ -1183,7 +1202,10 @@ fn resolveSpecInto(
             }
         }
     }
-    if (mapped orelse try modules.resolveSpecifier(io, scratch, Io.Dir.cwd(), importer, spec)) |resolved| {
+    // `paths`-mapped bare specifiers bypass the cache: their resolution is a
+    // different decision (a tsconfig remap), rare, and one `resolveStem` call.
+    // Everything else — the common case — goes through the memo.
+    if (mapped orelse try rcache.resolve(io, scratch, Io.Dir.cwd(), importer, spec)) |resolved| {
         const pgop = try path_ids.getOrPut(arena, resolved);
         if (pgop.found_existing) {
             fid = pgop.value_ptr.*;
@@ -1267,6 +1289,8 @@ fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8, bad_arg: *[]c
             cli.verbose = true;
         } else if (std.mem.eql(u8, arg, "--noLib")) {
             cli.no_lib = true;
+        } else if (std.mem.eql(u8, arg, "--no-resolve-cache")) {
+            cli.no_resolve_cache = true;
         } else if (std.mem.eql(u8, arg, "--pretty")) {
             cli.pretty = true;
         } else if (std.mem.startsWith(u8, arg, "--pretty=")) {
