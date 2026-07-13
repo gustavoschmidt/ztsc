@@ -1,0 +1,12 @@
+const s: string = "Hello World";
+const len: number = s.length;
+const up: string = s.toUpperCase();
+const lo: string = s.toLowerCase();
+const c: string = s.charAt(0);
+const i: number = s.indexOf("World");
+const has: boolean = s.includes("World");
+const starts: boolean = s.startsWith("Hello");
+const sl: string = s.slice(0, 5);
+const parts: string[] = s.split(" ");
+const t: string = s.trim();
+const r: string = s.repeat(2);

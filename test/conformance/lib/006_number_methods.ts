@@ -1,0 +1,9 @@
+const n: number = 3.14159;
+const fixed: string = n.toFixed(2);
+const str: string = n.toString();
+const bin: string = (255).toString(16);
+const v: number = n.valueOf();
+const p: number = parseInt("42", 10);
+const q: number = parseFloat("3.14");
+const nan: boolean = isNaN(n);
+const fin: boolean = isFinite(n);

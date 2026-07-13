@@ -299,6 +299,11 @@ const Checker = struct {
     atom_length: Atom = 0,
     typeof_atoms: [8]Atom = @splat(0),
     typeof_union: TypeId = 0,
+    // Names of the lib interfaces primitives/arrays bridge to (M10).
+    atom_Array: Atom = 0,
+    atom_String: Atom = 0,
+    atom_Number: Atom = 0,
+    atom_Boolean: Atom = 0,
 
     const typeof_names = [8][]const u8{
         "string", "number", "bigint", "boolean", "symbol", "undefined", "object", "function",
@@ -357,6 +362,10 @@ const Checker = struct {
             }
         }
         c.atom_length = try c.atom("length");
+        c.atom_Array = try c.atom("Array");
+        c.atom_String = try c.atom("String");
+        c.atom_Number = try c.atom("Number");
+        c.atom_Boolean = try c.atom("Boolean");
         for (typeof_names, 0..) |n, i| c.typeof_atoms[i] = try c.atom(n);
         var tu: [8]TypeId = undefined;
         for (c.typeof_atoms, 0..) |a, i| tu[i] = try c.ts.makeStringLiteral(a, false);
@@ -652,6 +661,15 @@ const Checker = struct {
             }
             if (s == binder.file_scope) break;
             s = c.bind.scope_parents[s];
+        }
+        // Global (lib) fallback: bare names not found in the file's scope
+        // chain resolve against the injected lib's top-level declarations
+        // (M10). The table already holds GLOBAL SymbolIds.
+        if (c.prog.globals.lookup(a)) |gsym| {
+            const gf = c.symFlags(gsym);
+            const ok = if (want_value) hasValueMeaning(gf) else hasTypeMeaning(gf);
+            if (ok) return .{ .sym = gsym };
+            if (wrong == binder.no_symbol) return .{ .wrong_space = gsym };
         }
         if (wrong != binder.no_symbol) return .{ .wrong_space = c.toGlobal(wrong) };
         return .none;
@@ -2434,7 +2452,10 @@ const Checker = struct {
                     }
                     return .{ .name = name, .ty = types.number_type, .flags = types.prop_flag_readonly };
                 }
-                return null;
+                return c.primitiveInterfaceProp(t, name);
+            },
+            .number, .number_literal, .number_literal_fresh, .boolean, .bool_true, .bool_false => {
+                return c.primitiveInterfaceProp(t, name);
             },
             .type_param => {
                 const constraint = try c.typeParamConstraint(s.typeParamSymbol(t));
@@ -2445,6 +2466,50 @@ const Checker = struct {
             .class_value => return c.propOfType(try c.classStaticType(s.classSymbol(t)), name),
             else => return null,
         }
+    }
+
+    /// Bridge a primitive/array/tuple to its lib interface (M10) and look
+    /// the property up there: `arr.map` -> `Array<T>.map`, `"x".toUpperCase`
+    /// -> `String.toUpperCase`, etc. Returns null when no lib is loaded or
+    /// the interface is missing, so member access degrades to TS2339 exactly
+    /// as it did lib-free.
+    fn primitiveInterfaceProp(c: *Checker, t: TypeId, name: Atom) Error!?types.Prop {
+        const s = &c.ts;
+        var iface_atom: Atom = 0;
+        var elem: TypeId = types.no_type;
+        var has_elem = false;
+        switch (s.kind(t)) {
+            .array => {
+                iface_atom = c.atom_Array;
+                elem = s.arrayElem(t);
+                has_elem = true;
+            },
+            .tuple => {
+                iface_atom = c.atom_Array;
+                elem = try c.tupleElementUnion(t);
+                has_elem = true;
+            },
+            .string, .string_literal => iface_atom = c.atom_String,
+            .number, .number_literal, .number_literal_fresh => iface_atom = c.atom_Number,
+            .boolean, .bool_true, .bool_false => iface_atom = c.atom_Boolean,
+            else => return null,
+        }
+        const sym = c.prog.globals.lookup(iface_atom) orelse return null;
+        if (!c.symFlags(sym).interface) return null;
+        const args: []const TypeId = if (has_elem) &.{elem} else &.{};
+        const ref = try s.makeRef(sym, args);
+        return c.propOfType(try c.resolveStructural(ref), name);
+    }
+
+    /// Union of a tuple's element types (the element type used when a tuple
+    /// borrows `Array<T>` members).
+    fn tupleElementUnion(c: *Checker, t: TypeId) Error!TypeId {
+        const s = &c.ts;
+        const n = s.tupleLen(t);
+        var parts: std.ArrayList(TypeId) = .empty;
+        defer parts.deinit(c.scratch());
+        for (0..n) |i| try parts.append(c.scratch(), s.tupleElem(t, @intCast(i)).ty);
+        return s.makeUnion(c.scratch(), parts.items);
     }
 
     fn typeParamConstraint(c: *Checker, sym: SymbolId) Error!TypeId {

@@ -1,0 +1,12 @@
+const nums: number[] = [1, 2, 3];
+const doubled: number[] = nums.map((x) => x * 2);
+const evens: number[] = nums.filter((x) => x % 2 === 0);
+nums.forEach((x) => { const y: number = x; });
+const joined: string = nums.join(", ");
+const n: number = nums.push(4);
+const last: number | undefined = nums.pop();
+const idx: number = nums.indexOf(2);
+const has: boolean = nums.includes(3);
+const rev: number[] = nums.reverse();
+const part: number[] = nums.slice(0, 2);
+const total: number = nums.reduce((a, b) => a + b);

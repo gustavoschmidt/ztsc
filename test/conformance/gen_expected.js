@@ -26,7 +26,10 @@ const options = {
   strict: true,
   noEmit: true,
   target: ts.ScriptTarget.ESNext,
-  lib: ["lib.esnext.d.ts"],
+  // esnext ECMAScript globals + the DOM lib (for `console`, which lives in
+  // lib.dom, not esnext). ztsc's minimal built-in lib (M10) is a subset of
+  // these, so snapshots stay a fair tsc-vs-ztsc differential.
+  lib: ["lib.esnext.d.ts", "lib.dom.d.ts"],
   types: [],
   module: ts.ModuleKind.ESNext,
   moduleResolution: ts.ModuleResolutionKind.Bundler,

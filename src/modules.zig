@@ -57,6 +57,14 @@ pub const Error = error{OutOfMemory};
 pub const FileId = u32;
 pub const no_file: FileId = std.math.maxInt(FileId);
 
+/// Synthetic path of the injected ES-core lib (M10). It has no on-disk
+/// location; the loaders special-case this exact path and use `lib_source`.
+/// The leading NUL keeps it from colliding with any real filesystem path.
+pub const lib_path = "\x00lib/es.core.d.ts";
+/// The embedded lib text (see `src/lib/es.core.d.ts`). Bound once per run;
+/// its top-level declarations become the program's global symbols.
+pub const lib_source = @embedFile("lib/es.core.d.ts");
+
 /// The final resolution of an imported/exported name.
 pub const Target = struct {
     pub const Kind = enum(u8) {
@@ -156,6 +164,27 @@ pub const FileLinks = struct {
     }
 };
 
+/// Global (lib) name table: the top-level declarations of the injected
+/// lib file, keyed by name atom, holding GLOBAL SymbolIds. Sorted by atom
+/// for binary-search fallback in name resolution (checker `resolveSpace`).
+/// Empty when `--noLib` / no lib is injected. Kept deliberately minimal
+/// (name → SymbolId); declaration merging is a later milestone (M11).
+pub const Globals = struct {
+    atoms: []const Atom = &.{},
+    syms: []const u32 = &.{},
+
+    pub fn lookup(g: *const Globals, atom: Atom) ?u32 {
+        var lo: usize = 0;
+        var hi: usize = g.atoms.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (g.atoms[mid] == atom) return g.syms[mid];
+            if (g.atoms[mid] < atom) lo = mid + 1 else hi = mid;
+        }
+        return null;
+    }
+};
+
 /// The sealed multi-file program handed to the checkers. Everything is
 /// immutable after `link`; N checkers read it concurrently without locks.
 pub const Program = struct {
@@ -166,6 +195,8 @@ pub const Program = struct {
     /// Per-file link tables; empty slice = unlinked single-file mode
     /// (imports silently type as `any` — used by legacy unit-test paths).
     links: []const FileLinks = &.{},
+    /// Lib global symbols (empty when no lib is injected).
+    globals: Globals = .{},
 
     pub fn totalSymbols(p: *const Program) u32 {
         return p.sym_base[p.files.len];
@@ -192,6 +223,41 @@ pub fn computeSymBase(alloc: Allocator, files: []const ProgFile) Error![]u32 {
     return base;
 }
 
+/// FileId of the injected lib file (matched by its synthetic path), or
+/// `no_file` when no lib was injected.
+pub fn libFileId(files: []const ProgFile) FileId {
+    for (files, 0..) |*f, i| {
+        if (std.mem.eql(u8, f.path, lib_path)) return @intCast(i);
+    }
+    return no_file;
+}
+
+/// Harvest the lib file's top-level (`file_scope`) declarations into the
+/// program-level global name table. The binder stores each scope's members
+/// sorted by name atom, so the lib scope's segment is copied as-is and the
+/// local SymbolIds are lifted to global ids. Returns an empty table when
+/// `lib` is `no_file`.
+pub fn collectGlobals(
+    arena: Allocator,
+    files: []const ProgFile,
+    sym_base: []const u32,
+    lib: FileId,
+) Error!Globals {
+    if (lib == no_file) return .{};
+    const b = files[lib].bind;
+    const lo = b.scope_members_start[binder.file_scope];
+    const hi = b.scope_members_start[binder.file_scope + 1];
+    const n = hi - lo;
+    const atoms = try arena.alloc(Atom, n);
+    const syms = try arena.alloc(u32, n);
+    const base = sym_base[lib];
+    for (0..n) |k| {
+        atoms[k] = b.member_atoms[lo + k];
+        syms[k] = base + b.member_syms[lo + k];
+    }
+    return .{ .atoms = atoms, .syms = syms };
+}
+
 /// Wrap one already-bound file as an unlinked Program (legacy M4 paths).
 pub fn singleFileProgram(
     alloc: Allocator,
@@ -203,6 +269,35 @@ pub fn singleFileProgram(
     const files = try alloc.alloc(ProgFile, 1);
     files[0] = .{ .path = path, .src = src, .tree = tree, .bind = bind };
     return .{ .files = files, .sym_base = try computeSymBase(alloc, files) };
+}
+
+/// Build a program of the injected lib (file 0) plus one already-bound
+/// source file (file 1), with the lib's globals collected. Used by the
+/// single-file test/conformance path so those cases see the same globals
+/// and primitive/array methods the CLI provides. `no_lib` reproduces the
+/// legacy lib-free single-file program.
+pub fn singleWithLibProgram(
+    arena: Allocator,
+    io: Io,
+    gpa: Allocator,
+    interner: *Interner,
+    path: []const u8,
+    src: []const u8,
+    tree: *const Ast,
+    bind: *const Bind,
+    no_lib: bool,
+) !Program {
+    if (no_lib) return singleFileProgram(arena, path, src, tree, bind);
+    const lib_tree = try arena.create(Ast);
+    lib_tree.* = try parser.parse(arena, lib_source);
+    const lib_bind = try arena.create(Bind);
+    lib_bind.* = try binder.bind(arena, io, gpa, interner, lib_tree, lib_source);
+    const files = try arena.alloc(ProgFile, 2);
+    files[0] = .{ .path = lib_path, .src = lib_source, .tree = lib_tree, .bind = lib_bind };
+    files[1] = .{ .path = path, .src = src, .tree = tree, .bind = bind };
+    const sym_base = try computeSymBase(arena, files);
+    const globals = try collectGlobals(arena, files, sym_base, 0);
+    return .{ .files = files, .sym_base = sym_base, .globals = globals };
 }
 
 // ===========================================================================
@@ -740,6 +835,7 @@ pub fn buildProgram(
     interner: *Interner,
     dir: Io.Dir,
     entries: []const []const u8,
+    no_lib: bool,
 ) !BuildResult {
     var scratch_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch_arena.deinit();
@@ -749,6 +845,12 @@ pub fn buildProgram(
     var path_ids: std.StringHashMapUnmanaged(FileId) = .empty;
     var pending: std.ArrayList([]const u8) = .empty;
     var failures: std.ArrayList(BuildDiag) = .empty;
+
+    // Inject the ES-core lib as the first entry (file 0) unless disabled.
+    if (!no_lib) {
+        try path_ids.put(scratch, lib_path, 0);
+        try pending.append(scratch, lib_path);
+    }
 
     for (entries) |e| {
         const norm = try normalizePath(arena, e);
@@ -762,7 +864,9 @@ pub fn buildProgram(
     var next: usize = 0;
     while (next < pending.items.len) : (next += 1) {
         const path = pending.items[next];
-        const bytes = dir.readFileAlloc(io, path, arena, .limited(1 << 30)) catch |err| {
+        const bytes: []const u8 = if (std.mem.eql(u8, path, lib_path))
+            lib_source
+        else dir.readFileAlloc(io, path, arena, .limited(1 << 30)) catch |err| {
             try failures.append(scratch, .{ .path = path, .err = err });
             // Keep ids dense: substitute an empty file.
             const tree = try arena.create(Ast);
@@ -808,11 +912,14 @@ pub fn buildProgram(
 
     const file_slice = try arena.dupe(ProgFile, files.items);
     const links = try link(arena, gpa, io, interner, file_slice);
+    const sym_base = try computeSymBase(arena, file_slice);
+    const globals = try collectGlobals(arena, file_slice, sym_base, libFileId(file_slice));
     return .{
         .program = .{
             .files = file_slice,
-            .sym_base = try computeSymBase(arena, file_slice),
+            .sym_base = sym_base,
             .links = links,
+            .globals = globals,
         },
         .load_failures = try arena.dupe(BuildDiag, failures.items),
     };

@@ -199,6 +199,32 @@ misses, so the check phase is unaffected). Check-phase time flat-to-better
 (~17.16 MB), medium heap within run-to-run noise (the +4 B/entry `ctx` field
 is swamped by arena page-rounding variance). Conformance 180 → **182**.
 
+## 3.6 M10-lib-core — minimal default lib (usefulness unlock)
+
+First slice of the merged M9/M10 phase: a hand-trimmed ES-core `lib.d.ts`
+(`src/lib/es.core.d.ts`, embedded via `@embedFile`) with GLOBAL-scope
+declarations, so code using `Array.prototype.map`, `String` methods,
+`console`, `Math`, `JSON`, `Promise`, etc. now checks. New machinery: a
+program-level global-symbol table (harvested from the lib file's top-level
+scope after link), a fallback hook in `resolveSpace`, and a
+primitive/array→interface bridge in `propOfType` (`.array`→`Array<elem>`,
+`.string`→`String`, …) delegating through the existing generic-instantiation
+path. Generic-method inference (`map<U>(cb:(x:T)=>U):U[]`) works. A
+`--noLib` flag (matching tsc) skips injection entirely.
+
+Differential note: the conformance harness now generates tsc snapshots with
+`lib: ["lib.esnext.d.ts", "lib.dom.d.ts"]` (was esnext-only) — `console` is a
+dom/host global, and this matches how tsc runs at `target: esnext` by
+default. All 182 pre-existing snapshots still match tsc byte-for-byte;
+8 new lib cases added. Conformance **182 → 190**.
+
+Perf: the `--noLib` path is byte-for-byte the old non-lib path — medium/multi
+land in the same heap buckets (11.2 / 17.2 MB) at the same check time
+(7 / 13 ms) as M8. Loading the lib via source costs ~15–20 KB heap and
+sub-millisecond front-end time (one 132-line file: +947 tokens, +494 nodes,
++84 checker types) — swamped by run-to-run scheduling variance and slated to
+vanish once M9.2 embeds the pre-parsed blob.
+
 ---
 
 ## 4. Cross-checking correctness while benchmarking

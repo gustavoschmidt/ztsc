@@ -1,0 +1,11 @@
+const a: number = Math.max(1, 2, 3);
+const b: number = Math.min(4, 5, 6);
+const f: number = Math.floor(3.7);
+const c: number = Math.ceil(3.2);
+const r: number = Math.round(3.5);
+const ab: number = Math.abs(-5);
+const sq: number = Math.sqrt(16);
+const pw: number = Math.pow(2, 8);
+const pi: number = Math.PI;
+const e: number = Math.E;
+const rnd: number = Math.random();
