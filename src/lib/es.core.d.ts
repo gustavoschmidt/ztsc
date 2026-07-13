@@ -11,8 +11,24 @@
 interface Object {}
 interface Function {}
 interface IArguments {}
-interface Symbol {}
 interface RegExp {}
+
+// `Symbol` is the instance-side interface (type of `symbol` values) merged
+// with a callable constructor that carries the well-known symbols. tsc splits
+// this as `interface Symbol` + `interface SymbolConstructor`/`declare var
+// Symbol`; call signatures and `unique symbol` are out of ztsc's subset, so
+// the constructor is modeled as a function + ambient namespace merge and the
+// well-known symbols are typed `symbol` (their computed-key identity is
+// tracked syntactically, see `ast.wellKnownSymbolKey`).
+interface Symbol {}
+declare function Symbol(description?: string | number): symbol;
+declare namespace Symbol {
+    const iterator: symbol;
+    const asyncIterator: symbol;
+    const hasInstance: symbol;
+    const toPrimitive: symbol;
+    const toStringTag: symbol;
+}
 
 interface Boolean {
     valueOf(): boolean;
