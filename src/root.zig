@@ -5,6 +5,7 @@
 
 pub const source = @import("source.zig");
 pub const intern = @import("intern.zig");
+pub const zeropage = @import("zeropage.zig");
 pub const scanner = @import("scanner.zig");
 pub const diagnostics = @import("diagnostics.zig");
 pub const ast = @import("ast.zig");
@@ -21,6 +22,7 @@ pub const version = "0.0.1-dev";
 test {
     _ = source;
     _ = intern;
+    _ = zeropage;
     _ = scanner;
     _ = diagnostics;
     _ = ast;
