@@ -1846,6 +1846,7 @@ const Binder = struct {
                     const is_ctor = b.tree.tokens.tag(tok) == .keyword_constructor and !is_static;
                     try b.bindFunctionLike(member, md.lhs, md.rhs, is_ctor);
                 },
+                .decorator => try b.bindExpr(md.lhs),
                 .error_node, .unsupported => {},
                 else => {},
             }

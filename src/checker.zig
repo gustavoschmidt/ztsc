@@ -7085,6 +7085,7 @@ const Checker = struct {
             .break_stmt, .continue_stmt => {},
             .labeled_stmt => try c.checkStatement(d.lhs),
             .function_decl => try c.checkFunctionDecl(node),
+            .decorator => try c.checkDecorator(node),
             .class_decl => try c.checkClass(node),
             .interface_decl => try c.checkInterfaceDecl(node),
             .type_alias => try c.checkTypeAliasDecl(node),
@@ -7817,9 +7818,26 @@ const Checker = struct {
                         try c.checkFunctionBody(member, md.lhs, md.rhs, sig);
                     }
                 },
+                .decorator => {
+                    // A member decorator expression is evaluated in the scope
+                    // surrounding the class (at class-definition time), so its
+                    // `this` is the enclosing `this`, not the instance.
+                    c.this_type = saved_this;
+                    try c.checkDecorator(member);
+                },
                 else => {},
             }
         }
+    }
+
+    /// Type-check a decorator expression (`@expr`). Standard decorators name-
+    /// resolve and type-check the expression: an undefined name ⇒ TS2304, and
+    /// the callee/args of `@factory(args)` are checked. The decorator's
+    /// signature compatibility (TS1238/1240/1241) is not modeled — those need
+    /// the decorator-context lib types absent from the harness lib.
+    fn checkDecorator(c: *Checker, node: Node) Error!void {
+        const expr = c.tree.nodeData(node).lhs;
+        if (expr != null_node) _ = try c.checkExprCached(expr, types.no_type);
     }
 
     fn checkInterfaceDecl(c: *Checker, node: Node) Error!void {

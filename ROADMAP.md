@@ -805,8 +805,21 @@ per item:
   `024_this_param_receiver`); flat benchmark. Deferred (rare): TS2684 on
   overloaded free functions; generic method whose `this`-param mentions a class
   type param.
-- **decorators** (low priority): (legacy/TC39) decorators — uncommon in target
-  app code; can slip past v0.0.1 if the census confirms they're rare.
+- **decorators** ✅ (core; low frequency per census). Target is **TC39 standard
+  decorators** (the harness runs `--target esnext`, no `experimentalDecorators`).
+  A `.decorator` node now parses `@`+LHS-expression (`@a`, `@a.b`, `@a.b(args)` —
+  no binary ops, via `parseLhsExpression`) at class/method/accessor/field/getter
+  positions instead of emitting the old out-of-subset error (**eliminates the
+  spurious one-diagnostic-per-decorator false positive** — the primary win). The
+  binder binds the decorator expression; the checker type-checks it
+  (`checkDecorator` via `checkExprCached`) in the scope surrounding the class, so
+  undefined names ⇒ TS2304 and factory `@f(args)` callee/args ⇒ TS2345/etc.
+  Conformance 327 → 331 (`test/conformance/decorators/001`–`004`); flat benchmark.
+  **Deferred (lib-gated):** the TS1238/1240/1241 "unable to resolve signature of
+  … decorator" checks and TS1206 parameter-decorator grammar error — these need
+  the decorator-context lib types (`ClassMethodDecoratorContext`, …) absent from
+  today's trimmed lib; belongs with the M14.5 lib work. ztsc under-reports these
+  but never emits a spurious error. Census `decorator → 0` after this.
 - **Tests**: conformance grows toward ~500 cases, every feature
   differential vs tsc. **Benchmarks**: regression gates — memory/wall
   budgets must not drift as semantics widen (held so far: `--noLib` hot

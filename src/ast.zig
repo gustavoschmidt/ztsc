@@ -381,6 +381,12 @@ pub const Tag = enum(u8) {
     /// Class method / constructor / accessor / overload signature.
     /// main_token = name token; lhs = extra→FnProto, rhs = optional body.
     class_method,
+    /// A decorator `@expr` (TC39 standard decorator). main_token = `@`;
+    /// lhs = the decorator expression (LHS-expression: identifier, property
+    /// access, or call). Appears as a sibling node preceding the decorated
+    /// statement (class) or as a member node preceding the decorated member;
+    /// the checker type-checks the expression (undefined name ⇒ TS2304).
+    decorator,
     /// `interface I<T> extends A, B { members }`. main_token = `interface`;
     /// lhs = extra→InterfaceData, rhs unused.
     interface_decl,
@@ -800,7 +806,7 @@ pub const Ast = struct {
                 => it.push(d.lhs),
 
                 // optional lhs only.
-                .return_stmt, .yield_expr => it.push(d.lhs),
+                .return_stmt, .yield_expr, .decorator => it.push(d.lhs),
 
                 // lhs + rhs nodes.
                 .object_property,

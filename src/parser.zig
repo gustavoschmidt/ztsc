@@ -816,14 +816,7 @@ const Parser = struct {
                 }
                 return p.parseExpressionStatement();
             },
-            .at => {
-                // Decorator: out of subset. Consume `@expr` and report.
-                const start = try p.bump();
-                if (canStartExpression(p.curTag())) {
-                    _ = try p.parseLhsExpression(.{});
-                }
-                return p.unsupportedFrom(start);
-            },
+            .at => return p.parseDecorator(),
             .unterminated_comment => {
                 try p.errAtCur(.unterminated_comment);
                 const tok = try p.bump();
@@ -1445,15 +1438,24 @@ const Parser = struct {
         return p.addNode(.{ .tag = .heritage, .main_token = start_tok, .data = .{ .lhs = expr, .rhs = targs_extra } });
     }
 
+    /// A decorator `@expr` (TC39 standard decorators). The expression is a
+    /// left-hand-side expression — identifier, property access (`@a.b`), or
+    /// call (`@a.b(args)`) — not an arbitrary expression (no binary ops). The
+    /// resulting `.decorator` node carries the expression in `data.lhs`; the
+    /// checker name-resolves and type-checks it (undefined name ⇒ TS2304).
+    fn parseDecorator(p: *Parser) PE!Node {
+        const at = try p.bump(); // `@`
+        var expr: Node = null_node;
+        if (canStartExpression(p.curTag())) expr = try p.parseLhsExpression(.{});
+        return p.addNode(.{ .tag = .decorator, .main_token = at, .data = .{ .lhs = expr, .rhs = 0 } });
+    }
+
     fn parseClassMember(p: *Parser) PE!Node {
         const start_tok = p.curIdx();
 
-        // Decorators on members: out of subset.
-        if (p.curTag() == .at) {
-            _ = try p.bump();
-            if (canStartExpression(p.curTag())) _ = try p.parseLhsExpression(.{});
-            return p.unsupportedFrom(start_tok);
-        }
+        // Decorators on members: a `.decorator` node preceding the decorated
+        // member (the body loop re-enters for the member itself).
+        if (p.curTag() == .at) return p.parseDecorator();
 
         var flags: u32 = 0;
         while (true) {
@@ -4201,9 +4203,18 @@ test "unsupported: string-module and global augmentation" {
     try expectDiagCount("declare global { interface Window {} }", 0);
 }
 
-test "unsupported: decorators" {
-    try expectDiagCount("@Component({selector: \"x\"}) class Foo {}", 1);
-    try expectDiagCount("class A { @observable x = 1; }", 1);
+test "decorators: parsed into the AST (no longer out of subset)" {
+    // A class decorator parses cleanly (no parser diagnostic) as a sibling
+    // `.decorator` node preceding the class. The expression is an LHS
+    // expression — here a decorator factory call `@Component({...})`.
+    try expectDiagCount("@Component({selector: \"x\"}) class Foo {}", 0);
+    // Member decorators become `.decorator` member nodes in the class body.
+    try expectDiagCount("class A { @observable x = 1; }", 0);
+    // Structure: `@a.b` property-access decorator + accessor member decorator.
+    try expectSExpr("@a.b class Foo {}",
+        \\(decorator (member_expr (identifier a) b))
+        \\(class_decl Foo)
+    );
 }
 
 test "unsupported: conditional and mapped types" {
