@@ -130,7 +130,9 @@ pub const SymbolFlags = packed struct(u32) {
     has_impl: bool = false,
     optional_member: bool = false,
     readonly_member: bool = false,
-    _pad: u10 = 0,
+    /// `enum` / `const enum` declaration (both a value and a type).
+    enum_decl: bool = false,
+    _pad: u9 = 0,
 
     pub fn bits(f: SymbolFlags) u32 {
         return @bitCast(f);
@@ -148,9 +150,11 @@ const mask_let_const_class = fbits(.{ .let_decl = true }) | fbits(.{ .const_decl
     fbits(.{ .class = true });
 const mask_value = fbits(.{ .var_decl = true }) | mask_let_const_class |
     fbits(.{ .function = true }) | fbits(.{ .param = true }) |
-    fbits(.{ .catch_param = true }) | fbits(.{ .import_binding = true });
+    fbits(.{ .catch_param = true }) | fbits(.{ .import_binding = true }) |
+    fbits(.{ .enum_decl = true });
 const mask_type = fbits(.{ .class = true }) | fbits(.{ .interface = true }) |
-    fbits(.{ .type_alias = true }) | fbits(.{ .type_param = true });
+    fbits(.{ .type_alias = true }) | fbits(.{ .type_param = true }) |
+    fbits(.{ .enum_decl = true });
 const mask_member = fbits(.{ .property = true }) | fbits(.{ .method = true }) |
     fbits(.{ .getter = true }) | fbits(.{ .setter = true });
 
@@ -164,6 +168,7 @@ const DeclKind = enum {
     class,
     interface,
     type_alias,
+    enum_decl,
     type_param,
     param,
     catch_param,
@@ -183,6 +188,7 @@ const DeclKind = enum {
             .class => .{ .class = true },
             .interface => .{ .interface = true },
             .type_alias => .{ .type_alias = true },
+            .enum_decl => .{ .enum_decl = true },
             .type_param => .{ .type_param = true },
             .param => .{ .param = true },
             .catch_param => .{ .catch_param = true },
@@ -208,6 +214,9 @@ const DeclKind = enum {
                 (mask_type & ~fbits(.{ .interface = true })),
             .interface => mask_type & ~(fbits(.{ .interface = true }) | fbits(.{ .class = true })),
             .type_alias => mask_type,
+            // Two enum blocks (incl. const enum) with the same name merge;
+            // everything else in value or type space clashes.
+            .enum_decl => (mask_value | mask_type) & ~fbits(.{ .enum_decl = true }),
             .type_param => mask_type & ~fbits(.{ .class = true }),
             .param => mask_value & ~fbits(.{ .var_decl = true }),
             .catch_param => mask_value,
@@ -1182,6 +1191,7 @@ const Binder = struct {
             .class_decl => try b.bindClass(node, true),
             .interface_decl => try b.bindInterface(node),
             .type_alias => try b.bindTypeAlias(node),
+            .enum_decl => try b.bindEnum(node),
             .import_decl => try b.bindImport(node),
             .export_decl => {
                 const saved = b.exporting_node;
@@ -1696,6 +1706,23 @@ const Binder = struct {
         if (d.rhs != 0) {
             const r = b.tree.extraData(ast.SubRange, d.rhs);
             for (b.tree.extraRange(r.start, r.end)) |arg| try b.bindType(arg);
+        }
+    }
+
+    /// An enum declares one symbol (a value and a type). Member names live in
+    /// the enum's value object, materialized by the checker from the AST; the
+    /// binder only declares the enum symbol and binds member initializers in
+    /// the enclosing scope (so references in `A = expr` resolve/flow normally).
+    fn bindEnum(b: *Binder, node: Node) Error!void {
+        const d = b.tree.nodeData(node);
+        const data = b.tree.extraData(ast.EnumData, d.lhs);
+        if (data.name_token != 0) {
+            const atom = try b.atomOfToken(data.name_token);
+            _ = try b.declare(b.cur_scope, atom, .enum_decl, node, data.name_token, .{});
+        }
+        for (b.tree.extraRange(data.members_start, data.members_end)) |member| {
+            if (member == null_node or b.nodeTag(member) != .enum_member) continue;
+            try b.bindExpr(b.tree.nodeData(member).lhs); // optional initializer
         }
     }
 
