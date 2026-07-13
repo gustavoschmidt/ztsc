@@ -246,6 +246,31 @@ index-signature inference (`Array.from`), intersection/mapped-type returns
 return types, and the `Symbol.iterator` iteration protocol (`for…of` over
 Map/Set, spread).
 
+## 3.8 M10-partition — cost-based check partition
+
+Round-robin `owned_lists[i % n_checkers]` ignored file size, so a large file
+(or several, when their ids share a residue mod N) piled onto one checker
+while the rest idled. Replaced with a **greedy longest-processing-time
+partition by per-file AST node count** (node count ≈ check cost, known after
+parse): sort files by node count descending, assign each to the
+least-loaded checker; ties break by file id / lowest checker index, so it
+stays fully deterministic. Diagnostics remain byte-identical for any
+`--checkers=N` (the reassembly loop's `i % n_checkers` owner lookup, a second
+coupling to round-robin, now reads an explicit `file_owner` map).
+
+Measured, `--checkers=4 --noLib`, greedy vs round-robin:
+
+| corpus | round-robin check | greedy check | note |
+|---|---:|---:|---|
+| skewed (1× 22k-line file) | 75.0 ms | **55.8 ms** (−26%) | huge file ends up alone; floor is that one file |
+| bigfan (4× ~5.8k-line files) | 26.6 ms | **11.0 ms** (−59%, 2.4×) | RR clumps all 4 bigs (ids ≡1 mod 4) onto one checker; greedy spreads one-per-checker |
+| medium / multi (uniform) | 13.5 / 16.4 ms | 11.3 / 15.6 ms | identical file distribution — no regression |
+
+`bigfan` is a new generated corpus (205 files / ~68k LOC: four large files
+among many small, arranged so round-robin provably clumps them);
+regenerate with `node bench/gen_corpus.js`. The partition adds one sort of
+N integers on the front-end path — invisible on the uniform corpora.
+
 ---
 
 ## 4. Cross-checking correctness while benchmarking
