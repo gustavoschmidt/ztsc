@@ -186,6 +186,28 @@ Apple M4, ReleaseFast; see BENCHMARKS.md for methodology.
 - **Single-owner module discovery** (`e3995a2`): wavefront barrier removed;
   completion-queue scheduler, graph-derived deterministic output; skewed
   corpus front-end wall −70%.
+- **M7 — Quick wins: memory & perf debt** (`6d9f778`, tag `m7`): all six
+  fixes (duplicate token scan, seal-parser-into-exact-size, resolution
+  scratch arena, linker sort, object-construction quadratics, resolveStem
+  cap). **Heap RSS −53% medium / −60% multi**, time equal-or-better.
+- **M8 — Contextual re-check cache** (`77acca4`, tag `m8`): fixed
+  context-blind `node_types` *and* `sig_cache` (spurious TS2769 on overload
+  argument trials); `{ty, ctx}` discriminator; `flow_cache`/`da_cache`
+  audited sound. Conformance 180 → 182; check-phase flat.
+- **M9/M10 — merged shared-lib + lib.d.ts phase (in progress).** Decision
+  (2026-07-12): build a minimal real lib first so the M9 substrate has
+  measurable gates, deferring the substrate itself until the lib is
+  real-sized. Landed: **lib-core** (`dd6fcbb`) — embedded ES-core
+  `lib.d.ts`, global-symbol table, `resolveSpace` fallback, array/primitive→
+  interface bridge, `--noLib`; **lib-grow** (`0721986`) — real ES-core
+  surface (constructor globals, Map/Set/Date as `declare class`), fixed a
+  merged value+type global resolving to `any`; **cost-based check
+  partition** (`1536ba3`) — greedy-by-node-count, skewed −26% / bigfan 2.4×,
+  determinism preserved. Conformance 182 → 200. **Deferred (need realistic
+  corpora): resolution cache** (corpora have 0 bare specifiers) and the **M9
+  substrate** (deterministic atoms, pre-parsed blob, shared frozen type
+  store — KB/sub-ms payoff at current 132→220-line lib). **Still open in
+  M10:** census tool, ~500k real-world corpus.
 
 ---
 
