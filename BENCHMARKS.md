@@ -399,6 +399,41 @@ so this confirms the measurement harness works but, as expected, does **not**
 show the N× win. That win needs the full pinned `@types/node` corpus, which is
 still deferred (post-M14); the deferred frozen store is what will cash it in.
 
+## 3.11 M13 — module-resolution cache
+
+A module specifier resolves as a pure function of `(importer_dir, spec)` given a
+fixed filesystem, so the same bare specifier imported from K files re-walked
+`node_modules` K times (a `package.json` read + up to four `statFile`s per
+ancestor). `modules.ResolveCache` memoizes that pair over the discovery run —
+including a negative cache for unresolvable specifiers — so each distinct
+`(dir, spec)` walks the tree once. Resolution runs single-owner (main thread in
+the parallel driver, sole thread in `buildProgram`), so the memo needs no locks;
+`--no-resolve-cache` disables it for the "before" measurement.
+
+Scoreboard: `fs_probes`, the count of resolution syscalls (`statFile` +
+`package.json` reads), reported on `--timing`'s "resolve cache" line. New
+**deps** corpus (`bench/gen_corpus.js`): 60 app files in one `src/`, each
+importing 5 of 12 shared packages by bare specifier from a generated
+`node_modules/` tree (73 files / ~15k lines). Measured 2026-07-13 (`--checkers=4`):
+
+| corpus | probes (`--no-resolve-cache`) | probes (cached) | reduction | lookups / hits |
+|---|---:|---:|---:|---:|
+| deps | 2160 | **144** | **−93% (15×)** | 360 / 288 |
+| multi | 520 | **200** | −62% | 520 / 320 |
+
+On **deps** the 300 repeated bare imports collapse to 12 `node_modules` walks
+(the 72 misses = 60 unique relative `entry→app` specs + 12 packages). **multi**
+uses only relative imports yet still gains: sibling files importing the same
+`../l{k-1}/f_NNN` share a `(dir, spec)` entry (320 hits / 520 lookups). Output is
+byte-identical with the cache on vs off and for N ∈ {1,4,8}; conformance
+**313/313**. No wall/RSS change (multi 0.02 s / ~51 MB, unchanged within noise;
+deps 0.00 s / ~12 MB): the walk was never the dominant cost on these corpora —
+the win is the syscall count itself, which matters most on the single-owner main
+thread (it is also the discovery scheduler, so workers idle behind it) and scales
+with `@types`-heavy real inputs. A `(dir, spec)`-existence layer for the residual
+walk across *different* importer directories is a documented follow-up, gated on
+M13's census showing resolution still dominates after this memo.
+
 ---
 
 ## 4. Cross-checking correctness while benchmarking
