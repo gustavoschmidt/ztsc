@@ -3,6 +3,10 @@
 ZTSC — a fast, memory-lean TypeScript type checker (no JS emit) written in Zig.
 Requires Zig 0.16.0.
 
+## Git workflow
+
+Work directly on `main` — commit and push there. No feature branches or PRs.
+
 ## Commands
 
 ```sh
