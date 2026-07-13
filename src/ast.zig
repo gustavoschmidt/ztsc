@@ -220,6 +220,21 @@ pub const Tag = enum(u8) {
     /// rhs = 1 if delegating (`yield*`).
     yield_expr,
 
+    // --- JSX (parsed only in `.tsx` files) ---------------------------------
+    /// `<tag ...>children</tag>`, `<tag ... />`, or `<>children</>`.
+    /// main_token = `<`; lhs = extra→JsxElementData.
+    jsx_element,
+    /// `name`, `name="v"`, or `name={expr}`. main_token = name token;
+    /// lhs = value node (0 = boolean shorthand).
+    jsx_attribute,
+    /// `{...expr}` in an attribute list. main_token = `{`; lhs = expr.
+    jsx_spread_attribute,
+    /// `{expr}` as an attribute value or a child. main_token = `{`;
+    /// lhs = expr (0 = empty `{}`).
+    jsx_expr_container,
+    /// Children text between JSX tags. main_token = the `jsx_text` token.
+    jsx_text,
+
     // --- patterns (declarations & params; expression LHS destructuring uses
     // the literal cover grammar: `[a,b] = c` keeps an array_literal LHS) ----
     /// `[a, b = 1, ...r]` range of elements. main_token = `[`.
@@ -433,6 +448,18 @@ pub const FnProto = struct {
     /// Optional return type node.
     return_type: Node,
 };
+/// One JSX element/fragment. `tag` is the tag expression (identifier or
+/// member_expr; 0 for a `<>…</>` fragment). `self_closing != 0` marks
+/// `<tag/>` (no children). Attributes and children are node ranges in extra.
+pub const JsxElementData = struct {
+    tag: Node,
+    self_closing: u32,
+    attrs_start: ExtraIndex,
+    attrs_end: ExtraIndex,
+    children_start: ExtraIndex,
+    children_end: ExtraIndex,
+};
+
 pub const ClassData = struct {
     flags: u32,
     name_token: TokenIndex, // 0 = anonymous class expression
@@ -664,6 +691,7 @@ pub const Ast = struct {
                 .continue_stmt,
                 .import_specifier,
                 .export_specifier,
+                .jsx_text,
                 => {},
 
                 // lhs only.
@@ -803,6 +831,15 @@ pub const Ast = struct {
                     const r = a.extraData(SubRange, d.rhs);
                     it.pushRange(a.extraRange(r.start, r.end));
                 },
+                .jsx_element => {
+                    const e = a.extraData(JsxElementData, d.lhs);
+                    it.push(e.tag);
+                    it.pushRange(a.extraRange(e.attrs_start, e.attrs_end));
+                    it.pushRange(a.extraRange(e.children_start, e.children_end));
+                },
+                // jsx_attribute lhs = value node; jsx_spread_attribute /
+                // jsx_expr_container lhs = expr node (0 = none). jsx_text is a leaf.
+                .jsx_attribute, .jsx_spread_attribute, .jsx_expr_container => it.push(d.lhs),
                 .case_clause, .default_clause => {
                     it.push(d.lhs); // 0 for default_clause
                     const r = a.extraData(SubRange, d.rhs);

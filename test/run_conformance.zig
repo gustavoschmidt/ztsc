@@ -61,7 +61,7 @@ fn discoverCases(io: Io, gpa: std.mem.Allocator, dir_path: []const u8) !std.Arra
     while (try it.next(io)) |entry| {
         switch (entry.kind) {
             .file => {
-                if (!std.mem.endsWith(u8, entry.name, ".ts")) continue;
+                if (!std.mem.endsWith(u8, entry.name, ".ts") and !std.mem.endsWith(u8, entry.name, ".tsx")) continue;
                 try cases.append(gpa, .{ .rel = try gpa.dupe(u8, entry.name), .is_dir = false });
             },
             .directory => {
@@ -71,7 +71,7 @@ fn discoverCases(io: Io, gpa: std.mem.Allocator, dir_path: []const u8) !std.Arra
                 while (try sit.next(io)) |sentry| {
                     switch (sentry.kind) {
                         .file => {
-                            if (!std.mem.endsWith(u8, sentry.name, ".ts")) continue;
+                            if (!std.mem.endsWith(u8, sentry.name, ".ts") and !std.mem.endsWith(u8, sentry.name, ".tsx")) continue;
                             const rel = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ entry.name, sentry.name });
                             try cases.append(gpa, .{ .rel = rel, .is_dir = false });
                         },
@@ -124,13 +124,13 @@ fn parseExpected(alloc: std.mem.Allocator, text: []const u8, multi_file: bool) !
 }
 
 /// Run the single-file pipeline on `src`, returning (code, line) pairs.
-fn runCase(alloc: std.mem.Allocator, io: Io, gpa: std.mem.Allocator, interner: *Interner, src: []const u8) !std.ArrayList(Expected) {
+fn runCase(alloc: std.mem.Allocator, io: Io, gpa: std.mem.Allocator, interner: *Interner, src: []const u8, jsx: bool) !std.ArrayList(Expected) {
     var out: std.ArrayList(Expected) = .empty;
     errdefer out.deinit(alloc);
 
     const line_starts = try ztsc.source.computeLineStarts(alloc, src);
     const tree = try alloc.create(ztsc.ast.Ast);
-    tree.* = try parser.parse(alloc, src);
+    tree.* = try parser.parseOpts(alloc, src, jsx);
     const bound = try alloc.create(binder.Bind);
     bound.* = try binder.bind(alloc, io, gpa, interner, tree, src);
     // Single-file cases run against the injected ES-core lib (file 0), just
@@ -254,10 +254,15 @@ test "conformance: discover and run cases" {
 
         // Expected snapshot (absent/empty = clean).
         var expected: std.ArrayList(Expected) = .empty;
+        // `<name>.ts`/`<name>.tsx` -> `<name>.expected` (keep the dot).
+        const stem = if (std.mem.endsWith(u8, case.rel, ".tsx"))
+            case.rel[0 .. case.rel.len - 3]
+        else
+            case.rel[0 .. case.rel.len - 2];
         const exp_path = if (case.is_dir)
             try std.fmt.allocPrint(alloc, "{s}/expected", .{case.rel})
         else
-            try std.fmt.allocPrint(alloc, "{s}expected", .{case.rel[0 .. case.rel.len - 2]});
+            try std.fmt.allocPrint(alloc, "{s}expected", .{stem});
         if (dir.readFileAlloc(io, exp_path, alloc, .limited(1 << 20))) |exp_text| {
             expected = parseExpected(alloc, exp_text, case.is_dir) catch {
                 std.debug.print("conformance: {s}: bad snapshot format\n", .{case.rel});
@@ -280,7 +285,7 @@ test "conformance: discover and run cases" {
                 failed += 1;
                 continue;
             };
-            break :blk runCase(alloc, io, gpa, &interner, src) catch |err| {
+            break :blk runCase(alloc, io, gpa, &interner, src, parser.isJsxPath(case.rel)) catch |err| {
                 std.debug.print("conformance: {s}: pipeline failed: {s}\n", .{ case.rel, @errorName(err) });
                 failed += 1;
                 continue;
