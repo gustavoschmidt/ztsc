@@ -1357,6 +1357,12 @@ const Checker = struct {
         }
         var order: std.ArrayList(Atom) = .empty;
         defer order.deinit(c.scratch());
+        // Accessor keys, to type a get/set pair as one property and mark a
+        // get-only accessor read-only.
+        var getter_keys: std.AutoHashMapUnmanaged(Atom, void) = .empty;
+        defer getter_keys.deinit(c.scratch());
+        var setter_keys: std.AutoHashMapUnmanaged(Atom, void) = .empty;
+        defer setter_keys.deinit(c.scratch());
 
         for (member_nodes) |m| {
             if (m == null_node) continue;
@@ -1372,6 +1378,28 @@ const Checker = struct {
                 },
                 .method_signature => {
                     const name = try c.memberAtom(c.tree.nodeMainToken(m));
+                    // `get x(): T` / `set x(v: T)` accessor signatures: the
+                    // property type is the getter return (or setter param).
+                    const is_get = md.rhs & ast.Flags.get != 0;
+                    const is_set = md.rhs & ast.Flags.set != 0;
+                    if (is_get or is_set) {
+                        const sig = try c.signatureOfProto(m, md.lhs, true, false);
+                        if (is_get) {
+                            try getter_keys.put(c.scratch(), name, {});
+                            const gt = if (c.ts.kind(sig) == .function) c.ts.fnReturn(sig) else types.any_type;
+                            try upsertProp(c.scratch(), &props, &prop_index, .{ .name = name, .ty = gt, .flags = 0 });
+                        } else {
+                            try setter_keys.put(c.scratch(), name, {});
+                            if (!getter_keys.contains(name)) {
+                                const st = if (c.ts.kind(sig) == .function and c.ts.fnParamCount(sig) > 0)
+                                    c.ts.fnParam(sig, 0).ty
+                                else
+                                    types.any_type;
+                                try upsertProp(c.scratch(), &props, &prop_index, .{ .name = name, .ty = st, .flags = 0 });
+                            }
+                        }
+                        continue;
+                    }
                     const sig = try c.signatureOfProto(m, md.lhs, true, true);
                     const gop = try methods.getOrPut(c.scratch(), name);
                     if (!gop.found_existing) {
@@ -1393,6 +1421,12 @@ const Checker = struct {
             const sigs = methods.get(name).?;
             const ty = try c.ts.makeOverloads(sigs.items);
             try upsertProp(c.scratch(), &props, &prop_index, .{ .name = name, .ty = ty, .flags = 0 });
+        }
+        // Get-only accessors are read-only properties.
+        var git = getter_keys.keyIterator();
+        while (git.next()) |k| {
+            if (setter_keys.contains(k.*)) continue;
+            if (prop_index.get(k.*)) |idx| props.items[idx].flags |= types.prop_flag_readonly;
         }
         return c.ts.makeObject(props.items, sindex, nindex, fresh);
     }
@@ -1910,16 +1944,18 @@ const Checker = struct {
         if (f.getter or f.setter) {
             // Getter return type wins; setter-only uses its param type.
             for (decls) |decl| {
-                if (c.nodeTag(decl) != .class_method) continue;
+                const tag = c.nodeTag(decl);
+                if (tag != .class_method and tag != .method_signature) continue;
                 const d = c.tree.nodeData(decl);
                 const proto = c.tree.extraData(ast.FnProto, d.lhs);
                 if (proto.flags & ast.Flags.get != 0) {
                     if (proto.return_type != 0) return c.typeFromTypeNode(proto.return_type);
-                    if (d.rhs != 0) return c.inferReturnType(decl, d.rhs);
+                    if (tag == .class_method and d.rhs != 0) return c.inferReturnType(decl, d.rhs);
                 }
             }
             for (decls) |decl| {
-                if (c.nodeTag(decl) != .class_method) continue;
+                const tag = c.nodeTag(decl);
+                if (tag != .class_method and tag != .method_signature) continue;
                 const d = c.tree.nodeData(decl);
                 const sig = try c.signatureOfProto(decl, d.lhs, true, false);
                 if (c.ts.fnParamCount(sig) > 0) return c.ts.fnParam(sig, 0).ty;
@@ -2153,6 +2189,8 @@ const Checker = struct {
                 var flags: u32 = 0;
                 if (mf.optional_member) flags |= types.prop_flag_optional;
                 if (mf.readonly_member) flags |= types.prop_flag_readonly;
+                // A get-only accessor is a read-only property (TS2540 on write).
+                if (mf.getter and !mf.setter) flags |= types.prop_flag_readonly;
                 try props.append(c.scratch(), .{
                     .name = name,
                     .ty = try c.memberTypeOf(msym),
@@ -2213,6 +2251,109 @@ const Checker = struct {
             }
         }
         return null;
+    }
+
+    /// Whether a class symbol is declared `abstract`.
+    fn classIsAbstract(c: *Checker, sym: SymbolId) Error!bool {
+        const saved_ctx = c.enterSymFile(sym);
+        defer c.restoreCtx(saved_ctx);
+        for (c.declsOf(sym)) |decl| {
+            if (c.nodeTag(decl) != .class_decl) continue;
+            const data = c.tree.extraData(ast.ClassData, c.tree.nodeData(decl).lhs);
+            return data.flags & ast.Flags.abstract != 0;
+        }
+        return false;
+    }
+
+    /// Whether a class member symbol's declaration is `abstract`.
+    fn memberIsAbstract(c: *Checker, msym: SymbolId) bool {
+        for (c.declsOf(msym)) |decl| {
+            const d = c.tree.nodeData(decl);
+            switch (c.nodeTag(decl)) {
+                .class_method => {
+                    const proto = c.tree.extraData(ast.FnProto, d.lhs);
+                    if (proto.flags & ast.Flags.abstract != 0) return true;
+                },
+                .class_field => {
+                    const f = c.tree.extraData(ast.Field, d.lhs);
+                    if (f.flags & ast.Flags.abstract != 0) return true;
+                },
+                else => {},
+            }
+        }
+        return false;
+    }
+
+    /// A concrete class extending an abstract one must implement every
+    /// still-abstract inherited member. One missing member → TS2515; two or
+    /// more → the aggregate TS2654. Both point at the derived class name.
+    fn checkAbstractImplementation(c: *Checker, class_sym: SymbolId, class_node: Node) Error!void {
+        if (try c.classIsAbstract(class_sym)) return;
+        const base_ref = try c.baseClassRef(class_sym) orelse return;
+        const direct_base = c.ts.refSymbol(base_ref);
+
+        // Names the derived class (and any concrete override on the way up)
+        // provides; walking most-derived first, the first declaration of each
+        // name wins. The derived class itself is concrete, so all its members
+        // count as implementations.
+        var seen: std.AutoHashMapUnmanaged(Atom, void) = .empty;
+        defer seen.deinit(c.scratch());
+        try c.collectClassMemberAtoms(class_sym, &seen);
+
+        var unimpl: std.ArrayList(Atom) = .empty;
+        defer unimpl.deinit(c.scratch());
+
+        var cur = direct_base;
+        var depth: u32 = 0;
+        while (depth < 64) : (depth += 1) {
+            {
+                const saved = c.enterSymFile(cur);
+                defer c.restoreCtx(saved);
+                if (c.bind.membersScopeOf(c.localOf(cur))) |ms| {
+                    const lo = c.bind.scope_members_start[ms];
+                    const hi = c.bind.scope_members_start[ms + 1];
+                    for (lo..hi) |i| {
+                        const name_atom = c.bind.member_atoms[i];
+                        if (isCtorName(c, name_atom)) continue;
+                        if (seen.contains(name_atom)) continue;
+                        try seen.put(c.scratch(), name_atom, {});
+                        const msym = c.toGlobal(c.bind.member_syms[i]);
+                        if (c.memberIsAbstract(msym)) try unimpl.append(c.scratch(), name_atom);
+                    }
+                }
+            }
+            const nb = try c.baseClassRef(cur) orelse break;
+            cur = c.ts.refSymbol(nb);
+        }
+
+        if (unimpl.items.len == 0) return;
+        const data = c.tree.extraData(ast.ClassData, c.tree.nodeData(class_node).lhs);
+        const span = c.tokSpan(data.name_token);
+        const class_name = c.symbolName(class_sym);
+        const base_name = c.symbolName(direct_base);
+        if (unimpl.items.len == 1) {
+            try c.diagFmt(2515, span, "Non-abstract class '{s}' does not implement inherited abstract member {s} from class '{s}'.", .{
+                class_name, c.atomText(unimpl.items[0]), base_name,
+            });
+        } else {
+            try c.diagFmt(2654, span, "Non-abstract class '{s}' is missing implementations for members of '{s}'.", .{
+                class_name, base_name,
+            });
+        }
+    }
+
+    /// Record every member-name of a class (instance and static) into `seen`.
+    fn collectClassMemberAtoms(c: *Checker, sym: SymbolId, seen: *std.AutoHashMapUnmanaged(Atom, void)) Error!void {
+        const saved = c.enterSymFile(sym);
+        defer c.restoreCtx(saved);
+        const local = c.localOf(sym);
+        inline for (.{ c.bind.membersScopeOf(local), c.bind.staticsScopeOf(local) }) |maybe_scope| {
+            if (maybe_scope) |ms| {
+                const lo = c.bind.scope_members_start[ms];
+                const hi = c.bind.scope_members_start[ms + 1];
+                for (lo..hi) |i| try seen.put(c.scratch(), c.bind.member_atoms[i], {});
+            }
+        }
     }
 
     /// Static side of a class (statics as object props; construct handled
@@ -2436,6 +2577,7 @@ const Checker = struct {
                 const mf = c.symFlags(msym);
                 var flags: u32 = 0;
                 if (mf.readonly_member) flags |= types.prop_flag_readonly;
+                if (mf.getter and !mf.setter) flags |= types.prop_flag_readonly;
                 try props.append(c.scratch(), .{
                     .name = c.bind.member_atoms[i],
                     .ty = try c.memberTypeOf(msym),
@@ -3776,6 +3918,12 @@ const Checker = struct {
         defer props.deinit(c.scratch());
         var prop_index: std.AutoHashMapUnmanaged(Atom, u32) = .empty;
         defer prop_index.deinit(c.scratch());
+        // Accessor keys, to type a get/set pair as one property and mark a
+        // get-only accessor read-only.
+        var getter_keys: std.AutoHashMapUnmanaged(Atom, void) = .empty;
+        defer getter_keys.deinit(c.scratch());
+        var setter_keys: std.AutoHashMapUnmanaged(Atom, void) = .empty;
+        defer setter_keys.deinit(c.scratch());
 
         for (c.tree.nodeRange(node)) |prop| {
             if (prop == null_node) continue;
@@ -3807,6 +3955,32 @@ const Checker = struct {
                         continue;
                     }
                     const key = try c.memberAtom(c.tree.nodeMainToken(prop));
+                    // Accessor shorthand (`get x() {}` / `set x(v) {}`): the
+                    // property type is the getter's return type (or the
+                    // setter's parameter type when there's no getter). A
+                    // get-only accessor is read-only.
+                    const fproto = c.tree.extraData(ast.FnProto, c.tree.nodeData(pd.rhs).lhs);
+                    const is_get = fproto.flags & ast.Flags.get != 0;
+                    const is_set = fproto.flags & ast.Flags.set != 0;
+                    if (is_get or is_set) {
+                        const sig = try c.checkExprCached(pd.rhs, types.no_type);
+                        if (is_get) {
+                            try getter_keys.put(c.scratch(), key, {});
+                            const gt = if (c.ts.kind(sig) == .function) c.ts.fnReturn(sig) else types.any_type;
+                            try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = gt });
+                        } else {
+                            try setter_keys.put(c.scratch(), key, {});
+                            // A getter, if present, wins the property type.
+                            if (!getter_keys.contains(key)) {
+                                const st = if (c.ts.kind(sig) == .function and c.ts.fnParamCount(sig) > 0)
+                                    c.ts.fnParam(sig, 0).ty
+                                else
+                                    types.any_type;
+                                try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = st });
+                            }
+                        }
+                        continue;
+                    }
                     const pctx = try c.ctxPropType(rctx, ctx, key);
                     const mt = try c.checkExprCached(pd.rhs, pctx);
                     try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = mt });
@@ -3822,6 +3996,12 @@ const Checker = struct {
                 },
                 else => _ = try c.checkExprCached(prop, types.no_type),
             }
+        }
+        // Get-only accessors are read-only properties.
+        var git = getter_keys.keyIterator();
+        while (git.next()) |k| {
+            if (setter_keys.contains(k.*)) continue;
+            if (prop_index.get(k.*)) |idx| props.items[idx].flags |= types.prop_flag_readonly;
         }
         return c.ts.makeObject(props.items, 0, 0, true);
     }
@@ -4478,6 +4658,9 @@ const Checker = struct {
         if (is_new) {
             if (rk == .class_value) {
                 const cls = c.ts.classSymbol(r);
+                if (try c.classIsAbstract(cls)) {
+                    try c.diagFmt(2511, c.nodeSpan(node), "Cannot create an instance of an abstract class.", .{});
+                }
                 var ctor_sigs: std.ArrayList(TypeId) = .empty;
                 defer ctor_sigs.deinit(c.scratch());
                 try c.ctorSignatures(cls, &ctor_sigs);
@@ -6235,6 +6418,11 @@ const Checker = struct {
             }
         }
 
+        // A concrete class must implement inherited abstract members.
+        if (class_sym != binder.no_symbol) try c.checkAbstractImplementation(class_sym, node);
+
+        const class_is_abstract = data.flags & ast.Flags.abstract != 0;
+
         // Members.
         for (c.tree.extraRange(data.members_start, data.members_end)) |member| {
             if (member == null_node) continue;
@@ -6243,6 +6431,9 @@ const Checker = struct {
                 .class_field => {
                     const e = c.tree.extraData(ast.Field, md.lhs);
                     const is_static = e.flags & ast.Flags.static != 0;
+                    if (e.flags & ast.Flags.abstract != 0 and !class_is_abstract) {
+                        try c.diagFmt(1244, c.tokSpan(c.tree.nodeMainToken(member)), "Abstract properties can only appear within an abstract class.", .{});
+                    }
                     c.this_type = if (is_static and class_sym != binder.no_symbol)
                         try c.ts.makeClassValue(class_sym)
                     else
@@ -6259,6 +6450,13 @@ const Checker = struct {
                 .class_method => {
                     const proto = c.tree.extraData(ast.FnProto, md.lhs);
                     const is_static = proto.flags & ast.Flags.static != 0;
+                    const is_abstract = proto.flags & ast.Flags.abstract != 0;
+                    if (is_abstract and !class_is_abstract) {
+                        try c.diagFmt(1244, c.tokSpan(c.tree.nodeMainToken(member)), "Abstract methods can only appear within an abstract class.", .{});
+                    }
+                    if (is_abstract and md.rhs != 0) {
+                        try c.diagFmt(1245, c.tokSpan(c.tree.nodeMainToken(member)), "Method '{s}' cannot have an implementation because it is marked abstract.", .{c.tokenText(c.tree.nodeMainToken(member))});
+                    }
                     c.this_type = if (is_static and class_sym != binder.no_symbol)
                         try c.ts.makeClassValue(class_sym)
                     else
