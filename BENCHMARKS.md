@@ -179,6 +179,26 @@ had been inflating. Check scratch high-water moved 1672 → 1996 B (still far
 under the <2 KB budget). Conformance stays green (180/180) plus one new
 long-path resolution unit test.
 
+## 3.5 M8 — contextual re-check cache (correctness)
+
+`node_types` (and, it turned out, `sig_cache`) memoized checked expression
+types/signatures keyed on the node alone, dropping the *contextual* type —
+first-check-wins. A node re-checked under a different contextual type
+(overload argument trials are the live vector) returned the stale first
+answer, producing a spurious **TS2769** where tsc reports none. Fixed by
+adding a contextual-type discriminator (`{ty, ctx}` slot per node) to both
+caches; two differential cases (`calls/021`, `calls/022`) that diverged from
+tsc now pass. Sibling caches audited: `flow_cache` (key already carries
+`declared`) and `da_cache` (pure `(flow, sym)`) are sound as-is.
+
+`--memory` now reports a `node_types` hit rate alongside the relation-cache
+one: medium 7.2%, multi 6.7% (inherently low — most nodes are checked once;
+the discriminator only converts previously-*wrong* stale hits into correct
+misses, so the check phase is unaffected). Check-phase time flat-to-better
+(multi ~16.7 → ~13.3 ms across runs, within thermal noise); multi heap flat
+(~17.16 MB), medium heap within run-to-run noise (the +4 B/entry `ctx` field
+is swamped by arena page-rounding variance). Conformance 180 → **182**.
+
 ---
 
 ## 4. Cross-checking correctness while benchmarking

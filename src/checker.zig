@@ -101,6 +101,8 @@ pub const Stats = struct {
     relation_bytes: usize = 0,
     relation_hits: usize = 0,
     relation_misses: usize = 0,
+    node_type_hits: usize = 0,
+    node_type_misses: usize = 0,
     scratch_high_water: usize = 0,
     flow_queries: usize = 0,
 };
@@ -204,6 +206,10 @@ const FnCtx = struct {
     is_async: bool = false,
 };
 
+/// A memoized expression type together with the contextual type it was
+/// synthesized under (M8: contextual re-check cache).
+const NodeType = struct { ty: TypeId, ctx: TypeId };
+
 const Checker = struct {
     out: Allocator,
     io: Io,
@@ -237,10 +243,20 @@ const Checker = struct {
     /// Global symbol -> declared value type. 0 = not computed.
     sym_types: []TypeId = &.{},
     sym_state: []u8 = &.{}, // 0 = none, 1 = in progress, 2 = done
-    /// (file << 32 | node) -> synthesized type (memoized; dedupes diags).
-    node_types: std.AutoHashMapUnmanaged(u64, TypeId) = .empty,
-    /// (file << 32 | FnProto node) -> signature TypeId.
-    sig_cache: std.AutoHashMapUnmanaged(u64, TypeId) = .empty,
+    /// (file << 32 | node) -> synthesized type + the contextual type it was
+    /// checked under (memoized; dedupes diags). Keeping `ctx` on the value
+    /// (rather than in the key) means a re-check under a *different* context
+    /// misses and recomputes — fixing the first-check-wins staleness (M8) —
+    /// while node-only readers still find the node's most-recent (canonical)
+    /// type in the single slot.
+    node_types: std.AutoHashMapUnmanaged(u64, NodeType) = .empty,
+    /// (file << 32 | FnProto node) -> signature TypeId + the contextual
+    /// signature it was built under. Arrow/function-expression signatures
+    /// depend on `ctx_sig` (contextual parameter types), so — like
+    /// `node_types` (M8) — a re-check under a different context must miss and
+    /// recompute rather than return the first (stale) signature. Named
+    /// declarations always pass `no_type`, so they still hit unconditionally.
+    sig_cache: std.AutoHashMapUnmanaged(u64, NodeType) = .empty,
     /// (file << 32 | owner node) -> primary (lowest) scope id.
     node_scopes: std.AutoHashMapUnmanaged(u64, ScopeId) = .empty,
     /// FileId -> module namespace object type (0 = in progress).
@@ -505,6 +521,13 @@ const Checker = struct {
     /// (file << 32 | node) cache key for the current file.
     fn nodeKey(c: *const Checker, node: Node) u64 {
         return (@as(u64, c.cur_file) << 32) | node;
+    }
+
+    /// Most-recent memoized type of `node` (ignoring which context produced
+    /// it) — for node-only readers (narrowing, EPC, flow, error elaboration)
+    /// that just want the type the node was last determined to have.
+    fn nodeType(c: *const Checker, node: Node) ?TypeId {
+        return if (c.node_types.get(c.nodeKey(node))) |e| e.ty else null;
     }
 
     /// Link target of an import-binding symbol (null in unlinked mode).
@@ -1387,7 +1410,9 @@ const Checker = struct {
         report_implicit: bool,
         ctx_sig: TypeId,
     ) Error!TypeId {
-        if (c.sig_cache.get(c.nodeKey(node))) |cached| return cached;
+        if (c.sig_cache.get(c.nodeKey(node))) |cached| {
+            if (cached.ctx == ctx_sig) return cached.ty;
+        }
         const proto = c.tree.extraData(ast.FnProto, proto_idx);
         const saved_scope = c.cur_scope;
         defer c.cur_scope = saved_scope;
@@ -1438,7 +1463,7 @@ const Checker = struct {
         {
             // Reserve the cache slot to break recursion (self-recursive
             // unannotated functions infer any, TS7023-adjacent).
-            try c.sig_cache.put(c.ca(), c.nodeKey(node), try c.ts.makeFunction(params.items, types.any_type, tps.items, if (is_method) types.fn_flag_method else 0));
+            try c.sig_cache.put(c.ca(), c.nodeKey(node), .{ .ty = try c.ts.makeFunction(params.items, types.any_type, tps.items, if (is_method) types.fn_flag_method else 0), .ctx = ctx_sig });
             ret = try c.inferReturnType(node, c.tree.nodeData(node).rhs);
         } else if (proto.flags & (ast.Flags.get) != 0) {
             ret = types.any_type;
@@ -1447,7 +1472,7 @@ const Checker = struct {
         }
 
         const sig = try c.ts.makeFunction(params.items, ret, tps.items, if (is_method) types.fn_flag_method else 0);
-        try c.sig_cache.put(c.ca(), c.nodeKey(node), sig);
+        try c.sig_cache.put(c.ca(), c.nodeKey(node), .{ .ty = sig, .ctx = ctx_sig });
         return sig;
     }
 
@@ -2938,7 +2963,7 @@ const Checker = struct {
                     defer i += 1;
                     if (c.nodeTag(el) == .omitted or c.nodeTag(el) == .spread_element) continue;
                     const tt = if (rtk == .array) c.ts.arrayElem(rt) else (c.tupleElemTypeAt(rt, i) orelse continue);
-                    const et = c.node_types.get(c.nodeKey(el)) orelse continue;
+                    const et = c.nodeType(el) orelse continue;
                     if (try c.isAssignable(et, tt)) continue;
                     if (!try c.elaborateLiteralError(el, et, tt)) {
                         try c.reportNotAssignable(2322, et, tt, c.nodeSpan(el));
@@ -2959,7 +2984,7 @@ const Checker = struct {
                     const key = try c.memberAtom(c.tree.nodeMainToken(prop));
                     const tp = c.ts.objectPropByName(rt, key) orelse continue;
                     const value_node = if (tag == .object_property) pd.rhs else pd.lhs;
-                    const vt = c.node_types.get(c.nodeKey(value_node)) orelse continue;
+                    const vt = c.nodeType(value_node) orelse continue;
                     if (try c.isAssignable(vt, tp.ty)) continue;
                     if (!try c.elaborateLiteralError(value_node, vt, tp.ty)) {
                         try c.reportNotAssignable(2322, vt, tp.ty, c.nodeSpan(value_node));
@@ -3095,7 +3120,7 @@ const Checker = struct {
             if (tag == .object_property) {
                 const pd = c.tree.nodeData(prop);
                 if (c.nodeTag(pd.rhs) == .object_literal) {
-                    if (c.node_types.get(c.nodeKey(pd.rhs))) |nested_t| {
+                    if (c.nodeType(pd.rhs)) |nested_t| {
                         if (try c.targetPropType(rt, key)) |tp| {
                             try c.excessPropertyCheck(pd.rhs, nested_t, tp);
                         }
@@ -3139,9 +3164,16 @@ const Checker = struct {
 
     fn checkExprCached(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         if (node == null_node) return types.any_type;
-        if (c.node_types.get(c.nodeKey(node))) |t| return t;
+        const key = c.nodeKey(node);
+        if (c.node_types.get(key)) |e| {
+            if (e.ctx == ctx) {
+                c.stats.node_type_hits += 1;
+                return e.ty;
+            }
+        }
+        c.stats.node_type_misses += 1;
         const t = try c.checkExpr(node, ctx);
-        try c.node_types.put(c.ca(), c.nodeKey(node), t);
+        try c.node_types.put(c.ca(), key, .{ .ty = t, .ctx = ctx });
         return t;
     }
 
@@ -4654,7 +4686,7 @@ const Checker = struct {
                 if (!try c.patternBindsSym(d.lhs, root_sym)) return null;
                 if (key.prop != 0) return declared; // root re-init: reset path
                 if (c.nodeTag(d.lhs) != .identifier) return declared;
-                const vt = c.node_types.get(c.nodeKey(d.rhs)) orelse try c.checkExprCached(d.rhs, types.no_type);
+                const vt = c.nodeType(d.rhs) orelse try c.checkExprCached(d.rhs, types.no_type);
                 return try c.assignmentReduced(declared, vt);
             },
             .declarator_full => {
@@ -4664,7 +4696,7 @@ const Checker = struct {
                 if (key.prop != 0) return declared;
                 if (e.init == 0) return declared;
                 if (c.nodeTag(d.lhs) != .identifier) return declared;
-                const vt = c.node_types.get(c.nodeKey(e.init)) orelse try c.checkExprCached(e.init, types.no_type);
+                const vt = c.nodeType(e.init) orelse try c.checkExprCached(e.init, types.no_type);
                 return try c.assignmentReduced(declared, vt);
             },
             .assign => {
@@ -4673,7 +4705,7 @@ const Checker = struct {
                 if (key.prop != 0 and try c.refMatches(d.lhs, key)) {
                     const op = c.tree.tokens.tag(c.tree.nodeMainToken(target));
                     if (op != .eq) return declared;
-                    const vt = c.node_types.get(c.nodeKey(d.rhs)) orelse try c.checkExprCached(d.rhs, types.no_type);
+                    const vt = c.nodeType(d.rhs) orelse try c.checkExprCached(d.rhs, types.no_type);
                     return try c.assignmentReduced(declared, vt);
                 }
                 if (c.nodeTag(d.lhs) == .identifier) {
@@ -4681,10 +4713,10 @@ const Checker = struct {
                     if (key.prop != 0) return declared; // root overwritten
                     const op = c.tree.tokens.tag(c.tree.nodeMainToken(target));
                     if (op != .eq) {
-                        const vt = c.node_types.get(c.nodeKey(target)) orelse declared;
+                        const vt = c.nodeType(target) orelse declared;
                         return try c.assignmentReduced(declared, vt);
                     }
-                    const vt = c.node_types.get(c.nodeKey(d.rhs)) orelse try c.checkExprCached(d.rhs, types.no_type);
+                    const vt = c.nodeType(d.rhs) orelse try c.checkExprCached(d.rhs, types.no_type);
                     return try c.assignmentReduced(declared, vt);
                 }
                 if (try c.patternBindsSym(d.lhs, root_sym)) return declared;
@@ -5771,7 +5803,7 @@ const Checker = struct {
         {
             return c.typeofSwitchIsExhaustive(node, c.tree.nodeData(d.lhs).lhs);
         }
-        const disc_t0 = c.node_types.get(c.nodeKey(d.lhs)) orelse return false;
+        const disc_t0 = c.nodeType(d.lhs) orelse return false;
         const disc_t = disc_t0;
         if (c.ts.kind(disc_t) != .union_type) return false;
         const r = c.tree.extraData(ast.SubRange, d.rhs);
@@ -5784,7 +5816,7 @@ const Checker = struct {
                 if (clause == null_node or c.nodeTag(clause) != .case_clause) continue;
                 const test_node = c.tree.nodeData(clause).lhs;
                 if (test_node == 0) continue;
-                const tt0 = c.node_types.get(c.nodeKey(test_node)) orelse continue;
+                const tt0 = c.nodeType(test_node) orelse continue;
                 const tt = c.ts.regularLiteral(tt0) catch continue;
                 if (tt == rm) covered = true;
             }
@@ -5794,7 +5826,7 @@ const Checker = struct {
     }
 
     fn typeofSwitchIsExhaustive(c: *Checker, sw: Node, operand: Node) bool {
-        const t = c.node_types.get(c.nodeKey(operand)) orelse return false;
+        const t = c.nodeType(operand) orelse return false;
         const r = c.tree.extraData(ast.SubRange, c.tree.nodeData(sw).rhs);
         // For each possible typeof outcome of t, require a covering case.
         for (0..typeof_names.len) |which| {
@@ -5812,7 +5844,7 @@ const Checker = struct {
                 if (clause == null_node or c.nodeTag(clause) != .case_clause) continue;
                 const test_node = c.tree.nodeData(clause).lhs;
                 if (test_node == 0) continue;
-                const tt0 = c.node_types.get(c.nodeKey(test_node)) orelse continue;
+                const tt0 = c.nodeType(test_node) orelse continue;
                 const tt = c.ts.regularLiteral(tt0) catch continue;
                 if (c.ts.kind(tt) != .string_literal) continue;
                 if (c.ts.literalAtom(tt) == c.typeof_atoms[which]) covered = true;

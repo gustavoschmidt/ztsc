@@ -757,6 +757,8 @@ pub fn main(init: std.process.Init) !void {
     var check_rel_bytes: usize = 0;
     var check_rel_hits: usize = 0;
     var check_rel_misses: usize = 0;
+    var check_nt_hits: usize = 0;
+    var check_nt_misses: usize = 0;
     var check_scratch_hw: usize = 0;
     var check_flow_queries: usize = 0;
     for (tasks) |*t| {
@@ -768,6 +770,8 @@ pub fn main(init: std.process.Init) !void {
         check_rel_bytes += ck.stats.relation_bytes;
         check_rel_hits += ck.stats.relation_hits;
         check_rel_misses += ck.stats.relation_misses;
+        check_nt_hits += ck.stats.node_type_hits;
+        check_nt_misses += ck.stats.node_type_misses;
         if (ck.stats.scratch_high_water > check_scratch_hw) check_scratch_hw = ck.stats.scratch_high_water;
         check_flow_queries += ck.stats.flow_queries;
     }
@@ -995,6 +999,14 @@ pub fn main(init: std.process.Init) !void {
         else
             0;
         try out.print("  {s:<24} {d:>11.1}%\n", .{ "relation hit rate", rel_hit_rate });
+        try out.print("  {s:<24} {d:>12}\n", .{ "node_types hits", check_nt_hits });
+        try out.print("  {s:<24} {d:>12}\n", .{ "node_types misses", check_nt_misses });
+        const nt_total = check_nt_hits + check_nt_misses;
+        const nt_hit_rate: f64 = if (nt_total > 0)
+            100.0 * @as(f64, @floatFromInt(check_nt_hits)) / @as(f64, @floatFromInt(nt_total))
+        else
+            0;
+        try out.print("  {s:<24} {d:>11.1}%\n", .{ "node_types hit rate", nt_hit_rate });
         try out.print("  {s:<24} {d:>12}\n", .{ "check scratch high-water", check_scratch_hw });
         try out.print("  {s:<24} {d:>12}\n", .{ "check flow queries", check_flow_queries });
 
