@@ -438,7 +438,7 @@ authoritative, verify each against tsc 5.5.4):**
     reopened in 3 files, a nested interface merged across 2 of them, a
     global function merged with a namespace — matching tsc.
 - **M11c — module augmentation + wildcard modules + triple-slash refs.
-  ⚙️ MOSTLY DONE (2026-07-13).** Landed: `declare module "spec" { … }`
+  ✅ DONE (2026-07-13).** Landed: `declare module "spec" { … }`
   parsing (parser, `ambient_module` flag) → `Bind.ambient_modules` (a
   per-block body scope). The linker builds a program ambient/augmentation
   registry (`Linker.ambient`: specifier atom → export table from each
@@ -448,15 +448,20 @@ authoritative, verify each against tsc 5.5.4):**
   an *unresolved* specifier (TS2307 suppressed) and augments a *resolved*
   one (bare packages; relative-spec augmentation keys on the string, an
   accepted deviation). Wildcard patterns (`declare module "*.css"`) match
-  via `ambientKey`. Differential-tested vs tsc 5.5.4 (conformance
-  305 → 308): ambient `"fs"` (named import + TS2305/TS2307), augmenting a
-  real bare package, and a named-export wildcard module. **Deferred:**
-  `export default`/`export =` and named `export {}`/re-export *inside* an
-  ambient block (only named *declaration* exports are harvested today — so
-  the CSS `export default` idiom is not yet covered), namespace-import of an
-  ambient module (types as `any`), and **triple-slash `/// <reference>`
-  directives** (a scanner + discovery subsystem, the remaining M11c piece;
-  needed for `@types/node`'s internal file wiring).
+  via `ambientKey`. **Triple-slash** `/// <reference path=… />` /
+  `<reference types=… />` are scanned from the leading trivia
+  (`modules.scanReferences`/`resolveReference`) and surfaced to *both*
+  discovery paths (`buildProgram` and main.zig's single-owner scheduler,
+  where reference targets also join the BFS edge list for deterministic
+  renumbering) as extra program inputs. Differential-tested vs tsc 5.5.4
+  (conformance 305 → 310): ambient `"fs"` (named import + TS2305/TS2307),
+  augmenting a real bare package, a named-export wildcard module, a `path`
+  reference pulling in a `declare global` file, and a `types` reference
+  pulling in a `@types/*` package that provides an ambient module.
+  **Deferred (minor):** `export default`/`export =`/named `export {}`
+  *inside* an ambient block (only named *declaration* exports are harvested
+  — the CSS `export default` idiom is uncovered), and namespace-import of an
+  ambient module (types as `any`).
   - `declare module "pkg" { … }` inside a module file: harvest keyed by
     the *resolved* specifier's FileId (resolution already happens at
     discovery); at link, merge the block's exports into that module's

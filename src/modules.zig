@@ -1085,6 +1085,102 @@ fn sortByKeyU32(scratch: Allocator, keys: []u32, vals: []Target) Error!void {
 }
 
 // ===========================================================================
+// triple-slash reference directives (M11c)
+// ===========================================================================
+
+pub const RefKind = enum { path, types };
+/// A `/// <reference path=… />` / `<reference types=… />` directive; `spec`
+/// slices into the source. `lib=` references are ignored (built-in libs).
+pub const RefDirective = struct { kind: RefKind, spec: []const u8 };
+
+/// Scan the leading `///`-comment block of `src` for reference directives.
+/// tsc only honors them before the first token, so scanning stops at the
+/// first non-trivia character. Slices into `src` (no allocation of text).
+pub fn scanReferences(alloc: Allocator, src: []const u8) Error![]RefDirective {
+    var out: std.ArrayList(RefDirective) = .empty;
+    var i: usize = 0;
+    while (i < src.len) {
+        while (i < src.len and (src[i] == ' ' or src[i] == '\t' or src[i] == '\r' or src[i] == '\n')) i += 1;
+        if (i + 1 < src.len and src[i] == '/' and src[i + 1] == '/') {
+            const start = i;
+            while (i < src.len and src[i] != '\n') i += 1;
+            const line = src[start..i];
+            // Triple-slash only.
+            if (line.len >= 3 and line[2] == '/') {
+                if (parseReference(line[3..])) |d| try out.append(alloc, d);
+            }
+            continue;
+        }
+        if (i + 1 < src.len and src[i] == '/' and src[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < src.len and !(src[i] == '*' and src[i + 1] == '/')) i += 1;
+            i = if (i + 1 < src.len) i + 2 else src.len;
+            continue;
+        }
+        break; // first real token — directives must precede it
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// Parse the body of a `///` comment (text after the three slashes) into a
+/// reference directive, or null if it is not `<reference path|types=…/>`.
+fn parseReference(body: []const u8) ?RefDirective {
+    var s = body;
+    while (s.len > 0 and (s[0] == ' ' or s[0] == '\t')) s = s[1..];
+    if (!std.mem.startsWith(u8, s, "<reference")) return null;
+    if (attrValue(s, "path")) |v| return .{ .kind = .path, .spec = v };
+    if (attrValue(s, "types")) |v| return .{ .kind = .types, .spec = v };
+    return null;
+}
+
+/// Value of a `key="…"` / `key='…'` attribute in `s`, or null.
+fn attrValue(s: []const u8, key: []const u8) ?[]const u8 {
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, s, from, key)) |at| {
+        var k = at + key.len;
+        while (k < s.len and (s[k] == ' ' or s[k] == '\t')) k += 1;
+        if (k < s.len and s[k] == '=') {
+            k += 1;
+            while (k < s.len and (s[k] == ' ' or s[k] == '\t')) k += 1;
+            if (k < s.len and (s[k] == '"' or s[k] == '\'')) {
+                const q = s[k];
+                k += 1;
+                const vstart = k;
+                while (k < s.len and s[k] != q) k += 1;
+                if (k < s.len) return s[vstart..k];
+            }
+        }
+        from = at + key.len;
+    }
+    return null;
+}
+
+/// Resolve a reference directive to a file path (owned by `alloc`), or null.
+/// `path` references resolve relative to the referencing file's directory;
+/// `types` references resolve like a bare package, preferring `@types/<name>`.
+pub fn resolveReference(
+    io: Io,
+    alloc: Allocator,
+    dir: Io.Dir,
+    importer: []const u8,
+    ref: RefDirective,
+) Error!?[]u8 {
+    switch (ref.kind) {
+        .path => {
+            const stem = try joinNormalize(alloc, dirnamePart(importer), ref.spec);
+            defer alloc.free(stem);
+            return resolveStem(io, alloc, dir, stem);
+        },
+        .types => {
+            const scoped = try std.fmt.allocPrint(alloc, "@types/{s}", .{ref.spec});
+            defer alloc.free(scoped);
+            if (try resolvePackage(io, alloc, dir, dirnamePart(importer), scoped)) |p| return p;
+            return resolvePackage(io, alloc, dir, dirnamePart(importer), ref.spec);
+        },
+    }
+}
+
+// ===========================================================================
 // serial program builder (tests, tools; main.zig runs the parallel version)
 // ===========================================================================
 
@@ -1152,6 +1248,19 @@ pub fn buildProgram(
         tree.* = try parser.parseOpts(arena, bytes, parser.isJsxPath(path));
         const bound = try arena.create(Bind);
         bound.* = try binder.bind(arena, io, gpa, interner, tree, bytes);
+
+        // Triple-slash `/// <reference>` directives pull extra files into the
+        // program (M11c) — not import bindings, just program inputs.
+        for (try scanReferences(scratch, bytes)) |ref| {
+            if (try resolveReference(io, scratch, dir, path, ref)) |resolved| {
+                const stable = try arena.dupe(u8, resolved);
+                const gop = try path_ids.getOrPut(scratch, stable);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = @intCast(pending.items.len);
+                    try pending.append(scratch, stable);
+                }
+            }
+        }
 
         // Resolve this file's specifiers; discover new files.
         var spec_atoms: std.ArrayList(Atom) = .empty;

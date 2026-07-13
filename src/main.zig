@@ -563,6 +563,7 @@ pub fn main(init: std.process.Init) !void {
         const resolve_timer = Timer.start(io);
         var atoms: std.ArrayList(ztsc.intern.Atom) = .empty;
         var files: std.ArrayList(modules.FileId) = .empty;
+        var ref_files: std.ArrayList(modules.FileId) = .empty;
         const known_before = paths.items.len;
         if (binds.items[i]) |b| {
             const scratch = resolve_scratch.allocator();
@@ -576,10 +577,23 @@ pub fn main(init: std.process.Init) !void {
                     try resolveSpecInto(arena, scratch, gpa, io, &interner, paths_map, paths.items[i], rec.module, &seen, &path_ids, &paths, &atoms, &files);
                 }
             }
+            // Triple-slash `/// <reference>` directives pull extra files into
+            // the program (M11c) — program inputs, not import bindings. Their
+            // resolved ids join the discovery edge list so the deterministic
+            // BFS renumbering below reaches them.
+            if (results.items[i]) |src| {
+                for (try modules.scanReferences(scratch, src.bytes)) |ref| {
+                    const rfid = try discoverReferenceInto(arena, scratch, io, paths.items[i], ref, &path_ids, &paths);
+                    try ref_files.append(arena, rfid);
+                }
+            }
             _ = resolve_scratch.reset(.retain_capacity);
         }
         var edges: std.ArrayList(modules.FileId) = .empty;
         for (files.items) |fid| {
+            if (fid != modules.no_file) try edges.append(arena, fid);
+        }
+        for (ref_files.items) |fid| {
             if (fid != modules.no_file) try edges.append(arena, fid);
         }
         edge_lists.items[i] = edges.items;
@@ -1177,6 +1191,31 @@ fn resolveSpecInto(
     }
     try atoms.append(arena, module_atom);
     try files.append(arena, fid);
+}
+
+/// Discover a triple-slash reference target as a program input (M11c): resolve
+/// it and, if new, append it to `paths`/`path_ids` so the scheduler enqueues
+/// it. Unlike `resolveSpecInto`, it records no import-specifier binding.
+fn discoverReferenceInto(
+    arena: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    io: Io,
+    importer: []const u8,
+    ref: modules.RefDirective,
+    path_ids: *std.StringHashMapUnmanaged(u32),
+    paths: *std.ArrayList([]const u8),
+) !modules.FileId {
+    if (try modules.resolveReference(io, scratch, Io.Dir.cwd(), importer, ref)) |resolved| {
+        const pgop = try path_ids.getOrPut(arena, resolved);
+        if (pgop.found_existing) return pgop.value_ptr.*;
+        const stable = try arena.dupe(u8, resolved);
+        pgop.key_ptr.* = stable;
+        const fid: modules.FileId = @intCast(paths.items.len);
+        pgop.value_ptr.* = fid;
+        try paths.append(arena, stable);
+        return fid;
+    }
+    return modules.no_file;
 }
 
 fn sortSpecPairs(atoms: []ztsc.intern.Atom, files: []modules.FileId) void {
