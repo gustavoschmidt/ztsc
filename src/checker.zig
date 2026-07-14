@@ -116,6 +116,10 @@ pub const Stats = struct {
     node_type_misses: usize = 0,
     scratch_high_water: usize = 0,
     flow_queries: usize = 0,
+    /// M15 instantiation-cache accounting.
+    inst_hits: usize = 0,
+    inst_misses: usize = 0,
+    inst_maps: usize = 0,
 };
 
 /// Sealed check result for one file.
@@ -141,7 +145,7 @@ pub fn check(
 ) Error!Check {
     const prog = try arena.create(modules.Program);
     prog.* = try modules.singleFileProgram(arena, "", src, tree, bind);
-    return checkFiles(arena, io, gpa, interner, prog, &.{0}, null);
+    return checkFiles(arena, io, gpa, interner, prog, &.{0}, null, true);
 }
 
 /// Type-check `owned` files of a linked multi-file program. Cross-file
@@ -158,8 +162,9 @@ pub fn checkFiles(
     prog: *const modules.Program,
     owned: []const FileId,
     base: ?*const types.Store,
+    inst_cache_on: bool,
 ) Error!Check {
-    var c = try Checker.init(arena, io, gpa, interner, prog, owned, base);
+    var c = try Checker.init(arena, io, gpa, interner, prog, owned, base, inst_cache_on);
     defer c.deinit();
     try c.run();
     return c.seal();
@@ -176,9 +181,10 @@ pub fn checkFilesAndDump(
     prog: *const modules.Program,
     owned: []const FileId,
     base: ?*const types.Store,
+    inst_cache_on: bool,
     w: *std.Io.Writer,
 ) (Error || std.Io.Writer.Error)!Check {
-    var c = try Checker.init(arena, io, gpa, interner, prog, owned, base);
+    var c = try Checker.init(arena, io, gpa, interner, prog, owned, base, inst_cache_on);
     defer c.deinit();
     try c.run();
     for (owned) |f| {
@@ -203,7 +209,7 @@ pub fn checkAndDump(
 ) (Error || std.Io.Writer.Error)!Check {
     const prog = try arena.create(modules.Program);
     prog.* = try modules.singleFileProgram(arena, "", src, tree, bind);
-    var c = try Checker.init(arena, io, gpa, interner, prog, &.{0}, null);
+    var c = try Checker.init(arena, io, gpa, interner, prog, &.{0}, null, true);
     defer c.deinit();
     try c.run();
     try c.dumpTypes(w);
@@ -233,7 +239,20 @@ pub fn buildBaseStore(store_arena: Allocator) Error!types.Store {
     return base;
 }
 
-const max_instantiation_depth = 48;
+/// Structural recursion depth limit for `instantiate`/`substThis`. Chosen to
+/// sit just above tsc's effective instantiation-depth threshold for the
+/// deeply-nested-generic shape (tsc is clean at ~100 levels, reports TS2589
+/// beyond), so ztsc stays clean where tsc is clean and reports TS2589 where
+/// tsc does. Exceeding it emits TS2589 and truncates the offending subtree to
+/// `error_type` (M15).
+const max_instantiation_depth = 100;
+/// Global cap on total `instantiate` node-visits within one checker run — a
+/// dormant M16 safety net against instantiation-count explosion (recursive
+/// conditional/mapped types, once those land). Set far above anything the
+/// current subset produces, so it never fires here (and thus can never make
+/// the `--no-inst-cache` oracle diverge: only the cache-independent depth
+/// limit fires in-subset).
+const max_instantiation_count = 5_000_000;
 const max_type_string = 160;
 
 const FnCtx = struct {
@@ -341,6 +360,30 @@ const Checker = struct {
     da_cache: std.AutoHashMapUnmanaged(u64, u8) = .empty,
     /// containsTypeParam memo: 0 unknown, 1 no, 2 yes.
     ctp_cache: std.AutoHashMapUnmanaged(TypeId, u8) = .empty,
+    /// M15 instantiation memo: `(canonical_map_id << 32 | t) -> result`. A
+    /// substitution is a pure function of `(t, map-contents)`; `map_id`
+    /// canonically identifies the map's `(type-param, arg)` set (order- and
+    /// slice-identity-independent, see `canonMapId`), so this is sound even
+    /// though results are interned permanently. Gated by `inst_cache_on`
+    /// (`--no-inst-cache` disables it — the correctness oracle / benchmark
+    /// "before" leg). Never populated for a subtree whose computation tripped
+    /// the depth/count limit (`inst_limit_tripped`).
+    inst_cache: std.AutoHashMapUnmanaged(u64, TypeId) = .empty,
+    /// Canonical substitution-map interning: packed sorted `(sym,arg)` pair
+    /// bytes -> a small stable id. The byte keys are duped into the checker
+    /// arena (scratch is reset per statement).
+    inst_map_ids: std.StringHashMapUnmanaged(u32) = .empty,
+    inst_map_next: u32 = 1,
+    /// `SymbolId -> declared constraint TypeId` (`no_type` = unconstrained).
+    /// Avoids re-resolving the constraint AST on every assignability check.
+    tp_constraint_cache: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
+    /// `(file << 32 | type-node) -> TypeId`. A type annotation resolves names
+    /// against its (lexically fixed) enclosing scope and any enclosing
+    /// interface's `this` type — both a deterministic function of the node's
+    /// location — so a node's synthesized type is context-free and memoizable
+    /// by node alone (unlike `node_types`, whose value is contextual). Gated by
+    /// `inst_cache_on` so the oracle validates it.
+    type_node_cache: std.AutoHashMapUnmanaged(u64, TypeId) = .empty,
     /// Atom cache to avoid re-locking the shared interner.
     atom_cache: std.StringHashMapUnmanaged(Atom) = .empty,
     /// `unique symbol` nominal identity: (file << 32 | annotation node) ->
@@ -361,6 +404,21 @@ const Checker = struct {
     /// `this` types pay nothing.
     has_this_types: bool = false,
     inst_depth: u32 = 0,
+    /// Total `instantiate` node-visits this run (checked against
+    /// `max_instantiation_count`).
+    inst_count: u64 = 0,
+    /// Set when the current top-level `instantiate` call tripped the depth or
+    /// count limit; suppresses memoization of the (truncated) results for that
+    /// call. Reset at each top-level entry (`inst_depth == 0`).
+    inst_limit_tripped: bool = false,
+    /// Diagnostic span used when the instantiation limit is hit (TS2589),
+    /// tracked at expression / assignability boundaries where materialization
+    /// is triggered.
+    inst_span: Span = .{ .start = 0, .end = 0 },
+    /// Master switch for the M15 caching layer (`--no-inst-cache` clears it):
+    /// the instantiate memo, map interning, constraint memo, and type-node
+    /// memo. The depth/count limits are independent of it.
+    inst_cache_on: bool = true,
     /// Set while checking the operand of an `expr as const` const
     /// assertion: object/array literals produce readonly, non-widened,
     /// literal-typed members (recursively). Cleared at function bodies.
@@ -409,6 +467,9 @@ const Checker = struct {
         /// keeps the pre-M14.5 per-checker-expands-everything path
         /// (`--no-frozen-store`).
         base: ?*const types.Store,
+        /// Enable the M15 instantiation caching layer (`false` under
+        /// `--no-inst-cache`, the correctness oracle / benchmark "before" leg).
+        inst_cache_on: bool,
     ) Error!Checker {
         const first = if (owned.len > 0) owned[0] else 0;
         const f0 = &prog.files[first];
@@ -425,6 +486,7 @@ const Checker = struct {
             .src = f0.src,
             .carena = undefined,
             .scratch_arena = undefined,
+            .inst_cache_on = inst_cache_on,
         };
         c.carena = try gpa.create(std.heap.ArenaAllocator);
         errdefer gpa.destroy(c.carena);
@@ -1233,6 +1295,48 @@ const Checker = struct {
 
     fn typeFromTypeNode(c: *Checker, node: Node) Error!TypeId {
         if (node == null_node) return types.no_type;
+        // A type annotation resolves names against its lexically-fixed scope
+        // (and any enclosing interface's `this`), both determined by the node's
+        // location — so its synthesized type is context-free and memoizable by
+        // `(file, node)` alone. (Diagnostics emitted here dedupe on
+        // `(file, code, span)`, so skipping re-evaluation is diagnostic-safe.)
+        // Only *compound* nodes are cached: leaf annotations (a bare name or a
+        // literal) recompute in O(1), so caching them is pure memory overhead —
+        // the re-walk cost the memo targets lives in the recursive kinds. This
+        // keeps the memo small on non-generic-heavy code (RSS-neutral) while
+        // still collapsing repeated walks of nested generic/object/function
+        // annotations.
+        const cacheable = c.inst_cache_on and typeNodeCacheable(c.nodeTag(node));
+        const key = c.nodeKey(node);
+        if (cacheable) {
+            if (c.type_node_cache.get(key)) |t| return t;
+        }
+        const result = try c.typeFromTypeNodeUncached(node);
+        if (cacheable) try c.type_node_cache.put(c.ca(), key, result);
+        return result;
+    }
+
+    /// Type-node kinds whose synthesis recurses into sub-nodes (so re-walking
+    /// is non-trivial and worth memoizing). Leaf kinds are excluded.
+    fn typeNodeCacheable(tag: ast.Tag) bool {
+        return switch (tag) {
+            .type_ref,
+            .qualified_name,
+            .array_type,
+            .tuple_type,
+            .union_type,
+            .intersection_type,
+            .object_type,
+            .function_type,
+            .keyof_type,
+            .typeof_type,
+            .indexed_access_type,
+            => true,
+            else => false,
+        };
+    }
+
+    fn typeFromTypeNodeUncached(c: *Checker, node: Node) Error!TypeId {
         const d = c.tree.nodeData(node);
         switch (c.nodeTag(node)) {
             .identifier => return c.typeFromTypeName(node, &.{}),
@@ -3396,55 +3500,114 @@ const Checker = struct {
         return null;
     }
 
+    /// Canonicalize a substitution map to a stable small id: sort the
+    /// `(sym, arg)` pairs and intern the packed bytes. Two maps with the same
+    /// `(sym → arg)` set (regardless of slice order or identity) get the same
+    /// id, so the id keys the instantiate memo soundly. Called once per
+    /// top-level `instantiate`; the id is threaded down the recursion unchanged.
+    fn canonMapId(c: *Checker, map: []const TpMap) Error!u32 {
+        const sorted = try c.scratch().dupe(TpMap, map);
+        std.mem.sort(TpMap, sorted, {}, struct {
+            fn lt(_: void, a: TpMap, b: TpMap) bool {
+                return a.sym < b.sym;
+            }
+        }.lt);
+        // Pack each pair as two little-endian u32 words (8 bytes/pair).
+        const bytes = try c.scratch().alloc(u8, sorted.len * 8);
+        for (sorted, 0..) |m, i| {
+            std.mem.writeInt(u32, bytes[i * 8 ..][0..4], m.sym, .little);
+            std.mem.writeInt(u32, bytes[i * 8 + 4 ..][0..4], m.ty, .little);
+        }
+        const gop = try c.inst_map_ids.getOrPut(c.ca(), bytes);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try c.ca().dupe(u8, bytes); // scratch is reset per stmt
+            gop.value_ptr.* = c.inst_map_next;
+            c.inst_map_next += 1;
+            c.stats.inst_maps += 1;
+        }
+        return gop.value_ptr.*;
+    }
+
+    /// Substitute the type parameters in `map` throughout `t`. Public entry:
+    /// canonicalizes the map (when caching is on) and dispatches to the
+    /// memoized recursive walk.
     fn instantiate(c: *Checker, t: TypeId, map: []const TpMap) Error!TypeId {
         if (map.len == 0) return t;
         if (!try c.containsTypeParam(t)) return t;
-        if (c.inst_depth > max_instantiation_depth) return types.error_type;
+        // Reset the truncation flag at each top-level entry so a limit trip in
+        // one instantiation never suppresses caching of the next.
+        if (c.inst_depth == 0) c.inst_limit_tripped = false;
+        const map_id: ?u32 = if (c.inst_cache_on) try c.canonMapId(map) else null;
+        return c.instantiateId(t, map, map_id);
+    }
+
+    /// Memoized recursive substitution. `map_id` (when non-null) canonically
+    /// identifies `map`; it keys the memo and is threaded unchanged down the
+    /// recursion. A `null` id disables the memo (`--no-inst-cache`).
+    fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) Error!TypeId {
+        if (!try c.containsTypeParam(t)) return t;
+        if (map_id) |mid| {
+            if (c.inst_cache.get((@as(u64, mid) << 32) | t)) |r| {
+                c.stats.inst_hits += 1;
+                return r;
+            }
+        }
+        c.stats.inst_misses += 1;
+        // Depth/count guard — cache-independent, so it fires identically with
+        // the memo on or off. Exceeding it is TS2589 (excessively deep /
+        // possibly infinite): report once at the materialization site and
+        // truncate this subtree to `error_type`.
+        if (c.inst_depth > max_instantiation_depth or c.inst_count > max_instantiation_count) {
+            c.inst_limit_tripped = true;
+            try c.diagFmt(2589, c.inst_span, "Type instantiation is excessively deep and possibly infinite.", .{});
+            return types.error_type;
+        }
         c.inst_depth += 1;
+        c.inst_count += 1;
         defer c.inst_depth -= 1;
         const s = &c.ts;
-        switch (s.kind(t)) {
-            .type_param => return tpLookup(map, s.typeParamSymbol(t)) orelse t,
-            .union_type => {
+        const result: TypeId = switch (s.kind(t)) {
+            .type_param => tpLookup(map, s.typeParamSymbol(t)) orelse t,
+            .union_type => blk: {
                 var parts: std.ArrayList(TypeId) = .empty;
                 defer parts.deinit(c.scratch());
-                for (try c.memberList(t)) |m| try parts.append(c.scratch(), try c.instantiate(m, map));
-                return s.makeUnion(c.scratch(), parts.items);
+                for (try c.memberList(t)) |m| try parts.append(c.scratch(), try c.instantiateId(m, map, map_id));
+                break :blk try s.makeUnion(c.scratch(), parts.items);
             },
-            .intersection => {
+            .intersection => blk: {
                 var parts: std.ArrayList(TypeId) = .empty;
                 defer parts.deinit(c.scratch());
-                for (try c.memberList(t)) |m| try parts.append(c.scratch(), try c.instantiate(m, map));
-                return s.makeIntersection(c.scratch(), parts.items);
+                for (try c.memberList(t)) |m| try parts.append(c.scratch(), try c.instantiateId(m, map, map_id));
+                break :blk try s.makeIntersection(c.scratch(), parts.items);
             },
-            .overloads => {
+            .overloads => blk: {
                 var parts: std.ArrayList(TypeId) = .empty;
                 defer parts.deinit(c.scratch());
-                for (try c.memberList(t)) |m| try parts.append(c.scratch(), try c.instantiate(m, map));
-                return s.makeOverloads(parts.items);
+                for (try c.memberList(t)) |m| try parts.append(c.scratch(), try c.instantiateId(m, map, map_id));
+                break :blk try s.makeOverloads(parts.items);
             },
-            .array => return s.makeArray(try c.instantiate(s.arrayElem(t), map)),
-            .tuple => {
+            .array => try s.makeArray(try c.instantiateId(s.arrayElem(t), map, map_id)),
+            .tuple => blk: {
                 var elems: std.ArrayList(types.TupleElem) = .empty;
                 defer elems.deinit(c.scratch());
                 for (0..s.tupleLen(t)) |i| {
                     const e = s.tupleElem(t, @intCast(i));
-                    try elems.append(c.scratch(), .{ .ty = try c.instantiate(e.ty, map), .flags = e.flags });
+                    try elems.append(c.scratch(), .{ .ty = try c.instantiateId(e.ty, map, map_id), .flags = e.flags });
                 }
-                return s.makeTuple(elems.items);
+                break :blk try s.makeTuple(elems.items);
             },
-            .object => {
+            .object => blk: {
                 var props: std.ArrayList(types.Prop) = .empty;
                 defer props.deinit(c.scratch());
                 for (0..s.objectPropCount(t)) |i| {
                     const p = s.objectProp(t, @intCast(i));
-                    try props.append(c.scratch(), .{ .name = p.name, .ty = try c.instantiate(p.ty, map), .flags = p.flags });
+                    try props.append(c.scratch(), .{ .name = p.name, .ty = try c.instantiateId(p.ty, map, map_id), .flags = p.flags });
                 }
-                const sidx = if (s.objectStringIndex(t) != 0) try c.instantiate(s.objectStringIndex(t), map) else 0;
-                const nidx = if (s.objectNumberIndex(t) != 0) try c.instantiate(s.objectNumberIndex(t), map) else 0;
-                return s.makeObject(props.items, sidx, nidx, s.objectFlags(t) & types.obj_flag_fresh != 0);
+                const sidx = if (s.objectStringIndex(t) != 0) try c.instantiateId(s.objectStringIndex(t), map, map_id) else 0;
+                const nidx = if (s.objectNumberIndex(t) != 0) try c.instantiateId(s.objectNumberIndex(t), map, map_id) else 0;
+                break :blk try s.makeObject(props.items, sidx, nidx, s.objectFlags(t) & types.obj_flag_fresh != 0);
             },
-            .function => {
+            .function => blk: {
                 var params: std.ArrayList(types.Param) = .empty;
                 defer params.deinit(c.scratch());
                 // Inner type params shadowing the map are not filtered
@@ -3452,9 +3615,9 @@ const Checker = struct {
                 // higher-order inference).
                 for (0..s.fnParamCount(t)) |i| {
                     const p = s.fnParam(t, @intCast(i));
-                    try params.append(c.scratch(), .{ .name = p.name, .ty = try c.instantiate(p.ty, map), .flags = p.flags });
+                    try params.append(c.scratch(), .{ .name = p.name, .ty = try c.instantiateId(p.ty, map, map_id), .flags = p.flags });
                 }
-                const ret = try c.instantiate(s.fnReturn(t), map);
+                const ret = try c.instantiateId(s.fnReturn(t), map, map_id);
                 const tps = s.fnTypeParams(t);
                 var kept: std.ArrayList(u32) = .empty;
                 defer kept.deinit(c.scratch());
@@ -3464,16 +3627,22 @@ const Checker = struct {
                 // Predicates are dropped on instantiation (prior behavior); the
                 // `this` type is preserved and instantiated.
                 const this_ty = s.fnThisType(t);
-                return s.makeFunctionThis(params.items, ret, kept.items, s.fnFlags(t), null, if (this_ty != 0) try c.instantiate(this_ty, map) else 0);
+                break :blk try s.makeFunctionThis(params.items, ret, kept.items, s.fnFlags(t), null, if (this_ty != 0) try c.instantiateId(this_ty, map, map_id) else 0);
             },
-            .ref => {
+            .ref => blk: {
                 var args: std.ArrayList(TypeId) = .empty;
                 defer args.deinit(c.scratch());
-                for (try c.refArgsList(t)) |a| try args.append(c.scratch(), try c.instantiate(a, map));
-                return s.makeRef(s.refSymbol(t), args.items);
+                for (try c.refArgsList(t)) |a| try args.append(c.scratch(), try c.instantiateId(a, map, map_id));
+                break :blk try s.makeRef(s.refSymbol(t), args.items);
             },
-            else => return t,
+            else => t,
+        };
+        // Memoize only when nothing below tripped the limit (a truncated result
+        // is depth-dependent, not a pure function of `(t, map)`).
+        if (map_id) |mid| {
+            if (!c.inst_limit_tripped) try c.inst_cache.put(c.ca(), (@as(u64, mid) << 32) | t, result);
         }
+        return result;
     }
 
     /// Replace every polymorphic `this` marker in `t` with `repl` (the concrete
@@ -3722,6 +3891,15 @@ const Checker = struct {
     }
 
     fn typeParamConstraint(c: *Checker, sym: SymbolId) Error!TypeId {
+        if (c.inst_cache_on) {
+            if (c.tp_constraint_cache.get(sym)) |t| return t;
+        }
+        const result = try c.typeParamConstraintUncached(sym);
+        if (c.inst_cache_on) try c.tp_constraint_cache.put(c.ca(), sym, result);
+        return result;
+    }
+
+    fn typeParamConstraintUncached(c: *Checker, sym: SymbolId) Error!TypeId {
         const saved = c.enterSymFile(sym);
         defer c.restoreCtx(saved);
         const decls = c.declsOf(sym);
@@ -4168,8 +4346,10 @@ const Checker = struct {
     }
 
     fn eraseTypeParams(c: *Checker, sig: TypeId) Error!TypeId {
-        const tps = try c.scratch().dupe(u32, c.ts.fnTypeParams(sig));
-        if (tps.len == 0) return sig;
+        // Non-generic early-out before the dupe (the common case).
+        const sig_tps = c.ts.fnTypeParams(sig);
+        if (sig_tps.len == 0) return sig;
+        const tps = try c.scratch().dupe(u32, sig_tps);
         var map = try c.scratch().alloc(TpMap, tps.len);
         for (tps, 0..) |tp, i| {
             const constraint = try c.typeParamConstraint(tp);
@@ -4215,6 +4395,9 @@ const Checker = struct {
     /// Check `source` (the type of `expr_node`, which may be 0) against
     /// `target`, reporting at `span`. Returns true when assignable.
     fn checkAssignable(c: *Checker, src_t: TypeId, target: TypeId, expr_node: Node, span: Span) Error!bool {
+        // Anchor any TS2589 raised while expanding either side (instantiation
+        // limit) at the assignment site.
+        c.inst_span = span;
         if (try c.isAssignable(src_t, target)) {
             // Excess property check for fresh object literals.
             if (expr_node != 0) {
@@ -4467,6 +4650,9 @@ const Checker = struct {
 
     fn checkExprCached(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         if (node == null_node) return types.any_type;
+        // Anchor any TS2589 raised while materializing this expression's type
+        // (instantiation limit) at the expression's span.
+        c.inst_span = c.nodeSpan(node);
         const key = c.nodeKey(node);
         if (c.node_types.get(key)) |e| {
             if (e.ctx == ctx) {
@@ -7046,6 +7232,10 @@ const Checker = struct {
 
     fn checkStatement(c: *Checker, node: Node) Error!void {
         if (node == null_node) return;
+        // Baseline anchor for any TS2589 raised while materializing types in
+        // this statement (refined to finer spans at expression / assignment
+        // boundaries).
+        c.inst_span = c.nodeSpan(node);
         const d = c.tree.nodeData(node);
         switch (c.nodeTag(node)) {
             .block => {

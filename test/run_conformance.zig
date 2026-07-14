@@ -142,7 +142,7 @@ fn runCase(alloc: std.mem.Allocator, io: Io, gpa: std.mem.Allocator, interner: *
     // Exercise the shared frozen base type store (M14.5), like the CLI default.
     const base = try alloc.create(ztsc.types.Store);
     base.* = try checker.buildBaseStore(alloc);
-    const result = try checker.checkFiles(alloc, io, gpa, interner, prog, owned, base);
+    const result = try checker.checkFiles(alloc, io, gpa, interner, prog, owned, base, true);
 
     for (bound.diagnostics) |d| {
         const ts = d.code.tsCode();
@@ -177,7 +177,7 @@ fn runDirCase(
     for (owned, 0..) |*f, i| f.* = @intCast(i);
     const base = try alloc.create(ztsc.types.Store);
     base.* = try checker.buildBaseStore(alloc);
-    const result = try checker.checkFiles(alloc, io, gpa, interner, prog, owned, base);
+    const result = try checker.checkFiles(alloc, io, gpa, interner, prog, owned, base, true);
 
     for (prog.files, 0..) |*pf, i| {
         const rel = if (std.mem.startsWith(u8, pf.path, case_rel) and pf.path.len > case_rel.len + 1)
@@ -341,7 +341,7 @@ fn renderProgramDiags(
         while (i < prog.files.len) : (i += n_checkers) {
             try owned.append(alloc, @intCast(i));
         }
-        results[k] = try checker.checkFiles(alloc, io, gpa, interner, prog, owned.items, base);
+        results[k] = try checker.checkFiles(alloc, io, gpa, interner, prog, owned.items, base, true);
     }
 
     const Line = struct { start: u32, code: u16, msg: []const u8 };

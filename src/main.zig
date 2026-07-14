@@ -69,6 +69,8 @@ const usage =
     \\  --no-resolve-cache     disable the module-resolution memo (benchmark aid)
     \\  --no-frozen-store      disable the shared frozen base type store; each
     \\                         checker re-expands lib types (benchmark aid / oracle)
+    \\  --no-inst-cache        disable the instantiation caching layer; re-run
+    \\                         every substitution (benchmark aid / oracle)
     \\  --census               tally out-of-subset constructs by frequency
     \\  -h, --help             print this help and exit
     \\  --version              print version and exit
@@ -114,6 +116,11 @@ const Cli = struct {
     /// falls back to expanding lib types into its own store. Diagnostics are
     /// byte-identical either way and across `--checkers=N`.
     no_frozen_store: bool = false,
+    /// Disable the M15 instantiation caching layer (memoized `instantiate`,
+    /// map interning, constraint + type-node memos) — the correctness oracle
+    /// and benchmark "before" leg. Diagnostics are byte-identical either way
+    /// and across `--checkers=N`; the depth/count limits stay active.
+    no_inst_cache: bool = false,
     /// Print a by-construct histogram of out-of-subset syntax (M13 census) —
     /// the frequency table that prioritizes M14/M16 feature work.
     census: bool = false,
@@ -378,6 +385,9 @@ const CheckerTask = struct {
     /// `--no-frozen-store`. Read-only; the same pointer is handed to every
     /// task so all overlays share one base.
     base: ?*const types.Store = null,
+    /// Enable the M15 instantiation caching layer (`false` under
+    /// `--no-inst-cache`).
+    inst_cache: bool = true,
     result: ?checker.Check = null,
     err: ?anyerror = null,
     ns: u64 = 0,
@@ -390,7 +400,7 @@ const CheckerTask = struct {
         prog: *const modules.Program,
     ) void {
         const timer = Timer.start(io);
-        t.result = checker.checkFiles(t.arena.allocator(), io, gpa, interner, prog, t.owned, t.base) catch |err| blk: {
+        t.result = checker.checkFiles(t.arena.allocator(), io, gpa, interner, prog, t.owned, t.base, t.inst_cache) catch |err| blk: {
             t.err = err;
             break :blk null;
         };
@@ -796,6 +806,7 @@ pub fn main(init: std.process.Init) !void {
                 .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
                 .owned = owned_lists[k].items,
                 .base = base_store,
+                .inst_cache = !cli.no_inst_cache,
             };
         }
     }
@@ -876,6 +887,9 @@ pub fn main(init: std.process.Init) !void {
     var check_nt_misses: usize = 0;
     var check_scratch_hw: usize = 0;
     var check_flow_queries: usize = 0;
+    var check_inst_hits: usize = 0;
+    var check_inst_misses: usize = 0;
+    var check_inst_maps: usize = 0;
     for (tasks) |*t| {
         const ck = t.result orelse continue;
         check_diags += ck.diagnostics.len;
@@ -889,6 +903,9 @@ pub fn main(init: std.process.Init) !void {
         check_nt_misses += ck.stats.node_type_misses;
         if (ck.stats.scratch_high_water > check_scratch_hw) check_scratch_hw = ck.stats.scratch_high_water;
         check_flow_queries += ck.stats.flow_queries;
+        check_inst_hits += ck.stats.inst_hits;
+        check_inst_misses += ck.stats.inst_misses;
+        check_inst_maps += ck.stats.inst_maps;
     }
 
     var failed: usize = 0;
@@ -999,7 +1016,7 @@ pub fn main(init: std.process.Init) !void {
         defer dump_arena.deinit();
         const all_files = try dump_arena.allocator().alloc(modules.FileId, n_files);
         for (all_files, 0..) |*f, i| f.* = @intCast(i);
-        _ = checker.checkFilesAndDump(dump_arena.allocator(), io, gpa, &interner, prog, all_files, null, out) catch {};
+        _ = checker.checkFilesAndDump(dump_arena.allocator(), io, gpa, &interner, prog, all_files, null, true, out) catch {};
     }
 
     try out.print("ztsc: loaded {d} file(s) ({d} from CLI), {d} lines, {d} bytes, {d} tokens, {d} nodes, {d} symbols, {d} parse error(s), {d} bind error(s), {d} link error(s), {d} check error(s) ({d} worker(s), {d} checker(s))\n", .{
@@ -1126,6 +1143,16 @@ pub fn main(init: std.process.Init) !void {
         else
             0;
         try out.print("  {s:<24} {d:>11.1}%\n", .{ "relation hit rate", rel_hit_rate });
+        // Instantiation cache (M15).
+        try out.print("  {s:<24} {d:>12}\n", .{ "inst cache hits", check_inst_hits });
+        try out.print("  {s:<24} {d:>12}\n", .{ "inst cache misses", check_inst_misses });
+        try out.print("  {s:<24} {d:>12}\n", .{ "inst canonical maps", check_inst_maps });
+        const inst_total = check_inst_hits + check_inst_misses;
+        const inst_hit_rate: f64 = if (inst_total > 0)
+            100.0 * @as(f64, @floatFromInt(check_inst_hits)) / @as(f64, @floatFromInt(inst_total))
+        else
+            0;
+        try out.print("  {s:<24} {d:>11.1}%\n", .{ "inst hit rate", inst_hit_rate });
         try out.print("  {s:<24} {d:>12}\n", .{ "node_types hits", check_nt_hits });
         try out.print("  {s:<24} {d:>12}\n", .{ "node_types misses", check_nt_misses });
         const nt_total = check_nt_hits + check_nt_misses;
@@ -1383,6 +1410,8 @@ fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8, bad_arg: *[]c
             cli.no_resolve_cache = true;
         } else if (std.mem.eql(u8, arg, "--no-frozen-store")) {
             cli.no_frozen_store = true;
+        } else if (std.mem.eql(u8, arg, "--no-inst-cache")) {
+            cli.no_inst_cache = true;
         } else if (std.mem.eql(u8, arg, "--census")) {
             cli.census = true;
         } else if (std.mem.eql(u8, arg, "--pretty")) {

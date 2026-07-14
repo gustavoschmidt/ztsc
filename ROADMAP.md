@@ -904,7 +904,45 @@ mechanically — honor these in all intervening work, M13/M14 included):
   store reads going through `types.Store` accessors (no direct
   `.kinds/.data_a/.data_b/.extra` array indexing outside `types.zig`).
 
-### M15 — Instantiation discipline (de-risk M16)
+### M15 — Instantiation discipline (de-risk M16) ✅ DONE (2026-07-13)
+
+**Landed (commit pending — see below).** The M16 caching architecture is in,
+built around M14.5's base/overlay TypeId split. Summary of what shipped:
+- **`instantiate` memo.** Split into a public wrapper + memoized
+  `instantiateId(t, map, map_id)`. The `[]const TpMap` substitution is
+  canonicalized once per top-level call (`canonMapId`: sort `(sym, arg)` pairs,
+  pack LE, intern the bytes → stable small id; the id threads unchanged down the
+  recursion), keying an `AutoHashMapUnmanaged(u64,TypeId)` as `(map_id<<32)|t`.
+  `expandRef`'s existing `.ref (symbol,args)` memo stays the main entry; raw
+  `instantiate` is now the memoized cache-*miss* path beneath it.
+- **Companions.** `typeParamConstraint` memoized `SymbolId→TypeId`;
+  `typeFromTypeNode` memoized `(file,node)→TypeId` (**compound nodes only** —
+  caching leaf annotations was pure RSS overhead, caught and fixed via a +4 MB
+  regression during dev). `eraseTypeParams` non-generic early-out reordered
+  before the `dupe`.
+- **Depth/count limits (TS2589).** Cache-*independent* guard in `instantiateId`:
+  `inst_depth > 100` (just above tsc's effective threshold for the nested-tuple
+  shape) or `inst_count > 5_000_000` (dormant M16 net) → emit TS2589 once at
+  `inst_span`, truncate the subtree to `error_type`, and never memoize a
+  limit-cut result (it's depth-dependent, not pure).
+- **Correctness oracle** `--no-inst-cache` (mirrors `--no-frozen-store`):
+  diagnostics byte-identical cache ON vs OFF and across `--checkers=1,2,4,8`
+  (verified: 0 mismatches over all conformance `.ts`; generics corpus + deep-2589
+  SHA-identical across N × ON/OFF). Conformance **331 → 333**
+  (`test/conformance/instantiation/001_generic_alias_reuse`,
+  `002_deep_instantiation_2589` — TS2322+TS2589, differential vs tsc). New
+  instantiation-heavy `generics` corpus in `bench/gen_corpus.js` (M16 scoreboard).
+- **Honest cost (accepted by owner):** on today's pre-M16 subset the store
+  already hash-conses, so the instantiate cache only hits ~6.4% and yields **no
+  dedup win yet** — types/bytes are *flat* not down (gate = flat-or-down, met),
+  and the caches add **~+1 MB peak RSS on multi** (wall flat). This is pure M16
+  infrastructure whose payoff arrives when M16's laziness + shared-subtree
+  re-instantiation make the memo hit hard; landing it now avoids retrofitting a
+  cache under M16 pressure (the whole point of M15). Committed as-is per owner
+  call rather than trimmed.
+
+---
+Original design notes (retained):
 
 Land the caching architecture M16 depends on *before* the type-level
 features that would otherwise explode it. Today `expandRef` already
