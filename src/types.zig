@@ -184,6 +184,13 @@ pub const Kind = enum(u8) {
     /// the argument is still generic; a concrete argument resolves to the
     /// transformed string-literal (or distributes over a union).
     string_mapping,
+    /// Deferred `keyof T` (M16d). a = the operand type, b = 0. Interned only
+    /// while the operand is still generic (a type param or another deferred
+    /// node) — a concrete object/array resolves eagerly to its key union in
+    /// `keyofType`. Resolved on instantiation (`instantiateId`'s `.keyof_op`
+    /// arm re-runs `keyofType` on the substituted operand). Its apparent
+    /// constraint is `string | number | symbol`.
+    keyof_op,
 };
 
 pub const cond_flag_distributive: u32 = 1;
@@ -635,6 +642,10 @@ pub const Store = struct {
         return s.dataB(id);
     }
 
+    pub fn keyofOperand(s: *const Store, id: TypeId) TypeId {
+        return s.dataA(id);
+    }
+
     pub fn typeParamSymbol(s: *const Store, id: TypeId) u32 {
         return s.dataA(id);
     }
@@ -986,6 +997,10 @@ pub const Store = struct {
 
     pub fn makeIndexAccess(s: *Store, obj: TypeId, idx: TypeId) Error!TypeId {
         return s.internType(.index_access, &.{ obj, idx }, 0);
+    }
+
+    pub fn makeKeyof(s: *Store, operand: TypeId) Error!TypeId {
+        return s.internType(.keyof_op, &.{ operand, 0 }, 0);
     }
 
     /// Intern a deferred mapped type. `flags` carries the modifier bits and the

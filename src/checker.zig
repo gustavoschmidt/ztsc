@@ -1328,6 +1328,10 @@ const Checker = struct {
                 try c.printType(w, s.stringMappingArg(t), depth + 1);
                 try w.writeAll(">");
             },
+            .keyof_op => {
+                try w.writeAll("keyof ");
+                try c.printTypeParen(w, s.keyofOperand(t), depth + 1, false);
+            },
         }
     }
 
@@ -1938,8 +1942,57 @@ const Checker = struct {
                 return c.ts.makeUnion(c.scratch(), parts.items);
             },
             .array, .tuple => return types.number_type, // approximation (no lib members)
-            else => return types.never_type,
+            // `keyof` of a mapped type reflects its key set (M16d, closing the
+            // loop with M16b): `keyof { [K in "a"|"b"]: X }` === `"a" | "b"`.
+            // The key set is the constraint (homomorphic → `keyof source`),
+            // possibly narrowed by an `as` remap. A generic key set stays
+            // deferred; a concrete `as` clause is applied per key.
+            .mapped => return c.keyofMapped(r),
+            // A generic operand (a type param or another deferred node) → a
+            // deferred `keyof` that resolves on instantiation. `keyof T` is not
+            // computable until `T` is known, so it must not collapse to `never`.
+            .type_param, .index_access, .conditional, .keyof_op, .infer_var, .this_type => return c.ts.makeKeyof(r),
+            else => {
+                if (try c.containsTypeParam(r)) return c.ts.makeKeyof(r);
+                return types.never_type;
+            },
         }
+    }
+
+    /// `keyof` of a (deferred) mapped type: its key set. Non-remapped maps use
+    /// the constraint directly (homomorphic → `keyof source`); an `as` clause
+    /// with concrete keys is applied per member so `Omit`-style filtering and
+    /// renames are reflected.
+    fn keyofMapped(c: *Checker, m: TypeId) Error!TypeId {
+        const s = &c.ts;
+        const homomorphic = s.mappedHomomorphic(m);
+        const constraint: TypeId = if (homomorphic)
+            try c.keyofType(s.mappedSource(m))
+        else
+            s.mappedConstraint(m);
+        const as_clause = s.mappedAs(m);
+        if (as_clause == 0) return constraint;
+        // With an `as` remap, the keys are the remapped set. Only enumerate
+        // when the constraint is a concrete literal / union of literals;
+        // otherwise defer via a keyof over the whole mapped type.
+        const key_id = s.mappedParamId(s.mappedKeyParam(m));
+        var keys_buf = [_]TypeId{constraint};
+        const keys: []const TypeId = if (s.kind(constraint) == .union_type)
+            try c.memberList(constraint)
+        else
+            keys_buf[0..];
+        var parts: std.ArrayList(TypeId) = .empty;
+        defer parts.deinit(c.scratch());
+        for (keys) |k| {
+            switch (s.kind(k)) {
+                .string_literal, .number_literal, .number_literal_fresh => {
+                    const nm = (try c.remapKey(as_clause, key_id, k)) orelse continue;
+                    try parts.append(c.scratch(), try s.makeStringLiteral(nm, false));
+                },
+                else => return c.ts.makeKeyof(m), // non-enumerable key set — defer
+            }
+        }
+        return s.makeUnion(c.scratch(), parts.items);
     }
 
     /// T[K] with literal / index-signature keys (non-generic subset).
@@ -2029,6 +2082,12 @@ const Checker = struct {
 
     fn makeUnion2(c: *Checker, a: TypeId, b: TypeId) Error!TypeId {
         return c.ts.makeUnion(c.scratch(), &.{ a, b });
+    }
+
+    /// `string | number | symbol` — the apparent constraint of a deferred
+    /// `keyof T` (M16d) and TS's `PropertyKey`.
+    fn propertyKeyType(c: *Checker) Error!TypeId {
+        return c.ts.makeUnion(c.scratch(), &.{ types.string_type, types.number_type, types.symbol_type });
     }
 
     /// Object type from interface/object-literal-type member nodes.
@@ -3658,6 +3717,7 @@ const Checker = struct {
                 return false;
             },
             .string_mapping => return c.containsTypeParam(s.stringMappingArg(t)),
+            .keyof_op => return c.containsTypeParam(s.keyofOperand(t)),
             else => return false,
         }
     }
@@ -3851,6 +3911,10 @@ const Checker = struct {
             .string_mapping => blk: {
                 const arg = try c.instantiateId(s.stringMappingArg(t), map, map_id);
                 break :blk try c.applyStringMapping(s.stringMappingKind(t), arg);
+            },
+            .keyof_op => blk: {
+                const op = try c.instantiateId(s.keyofOperand(t), map, map_id);
+                break :blk try c.keyofType(op);
             },
             else => t,
         };
@@ -4096,6 +4160,7 @@ const Checker = struct {
                 for (0..s.templateHoleCount(t)) |i| try c.collectInferVars(s.templateHole(t, @intCast(i)), out);
             },
             .string_mapping => try c.collectInferVars(s.stringMappingArg(t), out),
+            .keyof_op => try c.collectInferVars(s.keyofOperand(t), out),
             else => {},
         }
     }
@@ -4299,6 +4364,7 @@ const Checker = struct {
                 break :blk false;
             },
             .string_mapping => c.containsInfer(s.stringMappingArg(t)),
+            .keyof_op => c.containsInfer(s.keyofOperand(t)),
             else => false,
         };
     }
@@ -4387,6 +4453,7 @@ const Checker = struct {
                 return c.reduceTemplate(s.templateHead(t), holes.items, t);
             },
             .string_mapping => return c.applyStringMapping(s.stringMappingKind(t), try c.substInfer(s.stringMappingArg(t), ids, vals)),
+            .keyof_op => return c.keyofType(try c.substInfer(s.keyofOperand(t), ids, vals)),
             else => return t,
         }
     }
@@ -4616,7 +4683,24 @@ const Checker = struct {
     /// either side still mentions one), so a mapped value `T[K]` stays symbolic
     /// until each key is materialized; otherwise resolve concretely.
     fn reduceIndexedAccess(c: *Checker, obj: TypeId, idx: TypeId) Error!TypeId {
+        // Mapped-internal `T[K]` (M16b): stays symbolic until each key is
+        // materialized. Checked first because a `mapped_param` is not a free
+        // type param (so `containsTypeParam` would miss it).
         if (try c.containsMappedParam(idx) or try c.containsMappedParam(obj)) {
+            return c.ts.makeIndexAccess(obj, idx);
+        }
+        // Distribute over a union index (M16d): `Obj[A | B]` === `Obj[A] |
+        // Obj[B]`. Holds whether or not `Obj` is generic, and is how a
+        // `keyof`-derived index expands once the key union is known.
+        if (c.ts.kind(idx) == .union_type) {
+            var parts: std.ArrayList(TypeId) = .empty;
+            defer parts.deinit(c.scratch());
+            for (try c.memberList(idx)) |m| try parts.append(c.scratch(), try c.reduceIndexedAccess(obj, m));
+            return c.ts.makeUnion(c.scratch(), parts.items);
+        }
+        // Generic object and/or index (M16d): defer as `T[K]`; resolved in
+        // `instantiateId`'s `.index_access` arm once the operands are concrete.
+        if (try c.containsTypeParam(obj) or try c.containsTypeParam(idx)) {
             return c.ts.makeIndexAccess(obj, idx);
         }
         return c.indexedAccessType(obj, idx);
@@ -4673,6 +4757,7 @@ const Checker = struct {
                 break :blk false;
             },
             .string_mapping => c.containsMappedParam(s.stringMappingArg(t)),
+            .keyof_op => c.containsMappedParam(s.keyofOperand(t)),
             else => false,
         };
     }
@@ -4750,6 +4835,7 @@ const Checker = struct {
                 return c.reduceTemplate(s.templateHead(t), holes.items, t);
             },
             .string_mapping => return c.applyStringMapping(s.stringMappingKind(t), try c.substMappedKey(s.stringMappingArg(t), key_id, key_ty)),
+            .keyof_op => return c.keyofType(try c.substMappedKey(s.keyofOperand(t), key_id, key_ty)),
             else => return t,
         }
     }
@@ -5519,7 +5605,7 @@ const Checker = struct {
 
     fn isCompound(k: types.Kind) bool {
         return switch (k) {
-            .union_type, .intersection, .array, .tuple, .object, .function, .overloads, .ref, .class_value, .conditional, .mapped, .index_access, .template_literal_type => true,
+            .union_type, .intersection, .array, .tuple, .object, .function, .overloads, .ref, .class_value, .conditional, .mapped, .index_access, .template_literal_type, .keyof_op => true,
             else => false,
         };
     }
@@ -5536,6 +5622,12 @@ const Checker = struct {
             }
             return (try c.isAssignable(c.ts.condTrue(s), t)) and (try c.isAssignable(c.ts.condFalse(s), t));
         }
+        // A deferred `keyof T` source (M16d) relates through its apparent
+        // constraint `string | number | symbol`; handled before union-target
+        // distribution because `keyof T` is assignable to the whole key union,
+        // not to any single member. Identity (`keyof T <: keyof T`) is caught
+        // by the `s == t` fast path.
+        if (sk == .keyof_op) return c.isAssignable(try c.propertyKeyType(), t);
         // Source union distributes first.
         if (sk == .union_type) {
             for (try c.memberList(s)) |m| {
@@ -7690,6 +7782,15 @@ const Checker = struct {
             const at = try c.checkExprCached(an, pt_partial);
             try c.unify(pt0, at, tp_syms, candidates, 0);
         }
+        // A provisional map over the raw candidates, so an inter-dependent
+        // constraint (`K extends keyof T`, M16d) is checked with the *other*
+        // params already substituted — `keyof T` becomes `keyof {…}` before the
+        // satisfaction test, instead of staying a deferred `keyof T` that no
+        // literal is assignable to.
+        var prov = try c.scratch().alloc(TpMap, tp_syms.len);
+        for (tp_syms, 0..) |tp, i| {
+            prov[i] = .{ .sym = tp, .ty = if (candidates[i] != types.no_type) candidates[i] else types.any_type };
+        }
         for (tp_syms, 0..) |tp, i| {
             var constraint: TypeId = types.no_type;
             if (i < infos.len and infos[i].constraint != 0) {
@@ -7697,6 +7798,7 @@ const Checker = struct {
             } else {
                 constraint = try c.typeParamConstraint(tp);
             }
+            if (constraint != types.no_type) constraint = try c.instantiate(constraint, prov);
             if (candidates[i] != types.no_type) {
                 out[i] = candidates[i];
                 // Candidate violating the constraint falls back to the

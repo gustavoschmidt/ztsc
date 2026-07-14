@@ -1094,17 +1094,43 @@ identically; benchmarks track types/line, RSS, and instantiation counts.
   Unblocks M16d.
 
 - **M16d — Recursive type aliases + generic indexed access + `keyof` over
-  mapped/generic types.** Self-referential aliases (`type Json = string |
-  number | Json[] | { [k: string]: Json }`), indexed access `T[K]` where
-  `K` (and/or `T`) is a type parameter, and `keyof` applied to mapped or
-  otherwise-generic types. Complexity: (1) *termination* — recursive
-  aliases and generic indexed access must defer (stay unresolved while
-  generic) and rely on the M15 depth limits to avoid non-termination; (2)
-  `T[K]` deferral and its distribution over unions in `K`; (3) `keyof` over
-  a mapped type must reflect the mapped key set, closing the loop with
-  M16b. This sub-milestone is mostly "make the deferral machinery from
-  M16a–c compose without blowing the depth budget," so it lands last and
-  doubles as the integration/stress pass.
+  mapped/generic types.** ✅ DONE (2026-07-14, conformance 356→365). **Completes
+  M16.** (1) *Generic `T[K]`* — `reduceIndexedAccess` generalized beyond M16b's
+  mapped-internal case: union index distributes (`Obj[A|B]===Obj[A]|Obj[B]`,
+  also how a `keyof`-derived index expands), generic operand defers as
+  `.index_access`, resolves in `instantiateId`; `T[number]` on array/tuple →
+  element. (2) *`keyof` generic/mapped* — new deferred `.keyof_op` kind
+  (types.zig; inline operand, hash-cons/base-overlay via the default path); a
+  generic operand defers instead of collapsing to `never`, a **mapped** operand
+  reflects the key set (`keyof {[K in "a"|"b"]:X}==="a"|"b"`, closing the M16b
+  loop), resolved via an `instantiateId` `.keyof_op` arm; assignability relates a
+  deferred `keyof T` through its apparent `string|number|symbol` constraint. (3)
+  *Recursive aliases* — the pre-existing lazy-ref machinery (`aliasInstance`
+  state→`makeRef`; `type Bad = Bad`→TS2456) already defers self-refs correctly
+  (the `computeTypeOfSymbol` `any`-on-reentry is value-space, not the type-alias
+  path); the relation-cache `in_progress` tri-state terminates assignability into
+  recursive aliases. (4) *Integration/stress* — conditional-over-generic-indexed,
+  mapped-over-`keyof`-generic, recursive `DeepReadonly`/`DeepPartial`, `Paths` all
+  resolve/defer on the M15 budget (stress case: 454 types / 3.3 MB, instant). Also
+  fixed `inferTypeArgs` to instantiate inter-dependent constraints
+  (`K extends keyof T`) with provisional args so generic `pick` infers `K` to the
+  literal. 9 cases (`test/conformance/indexed/001`–`009`). Multi byte-identical;
+  zod/date-fns error counts unchanged (no crash/panic). **Honest deferrals
+  (orthogonal, milestone-sized):** recursive-alias *scalar rejection*
+  (`const bad: Json = ()=>1`) is blocked by a **pre-existing broad index-signature
+  assignability gap** (a bare primitive/function vacuously satisfies
+  `{[k:string]:T}`, reproduces non-recursively) — left `structuralAssignable`
+  untouched rather than destabilize it; template-`as` over an *intersection*
+  constraint (`keyof T & string`) materializes to `{}`. Termination on genuinely-
+  infinite self-reference is the same lenient stance as M16a–c (bounded, no
+  false positive, no hang).
+
+**M16 (the type-level core) COMPLETE** (2026-07-14): M16a conditional/infer/
+distributivity → M16b mapped → M16c template-literal → M16d recursive/indexed/
+keyof. Conformance 340→365, all differential vs tsc 5.5.4, multi byte-identical
+throughout, real `.d.ts` (zod/hono/date-fns) resolve without crash. Next: M17
+(bunx distribution + release) — after the pre-existing index-signature
+assignability gap (surfaced in M16d) is weighed for v0.0.1.
 
 ### M17 — Ship it: bunx distribution + release
 
