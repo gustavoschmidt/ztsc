@@ -144,6 +144,13 @@ fn runCase(alloc: std.mem.Allocator, io: Io, gpa: std.mem.Allocator, interner: *
     base.* = try checker.buildBaseStore(alloc);
     const result = try checker.checkFiles(alloc, io, gpa, interner, prog, owned, base, true);
 
+    // Parser-surfaced diagnostics with a tsc analogue (e.g. TS1206 parameter
+    // decorators); other parser codes map to tsCode 0 and are ignored.
+    for (tree.diagnostics) |d| {
+        const ts = d.code.tsCode();
+        if (ts == 0) continue;
+        try out.append(alloc, .{ .code = ts, .file = "", .line = lineOf(line_starts, d.span.start) });
+    }
     for (bound.diagnostics) |d| {
         const ts = d.code.tsCode();
         if (ts == 0) continue;
@@ -191,6 +198,11 @@ fn runDirCase(
         else
             pf.path;
         const line_starts = try ztsc.source.computeLineStarts(alloc, pf.src);
+        for (pf.tree.diagnostics) |d| {
+            const ts = d.code.tsCode();
+            if (ts == 0) continue;
+            try out.append(alloc, .{ .code = ts, .file = rel, .line = lineOf(line_starts, d.span.start) });
+        }
         for (pf.bind.diagnostics) |d| {
             const ts = d.code.tsCode();
             if (ts == 0) continue;

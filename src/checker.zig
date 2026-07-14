@@ -357,6 +357,10 @@ const Checker = struct {
     /// makes the diagnostic set a pure function of the extends graph,
     /// independent of resolution/partition order (M17.2).
     iface_stack: std.ArrayListUnmanaged(IfaceFrame) = .empty,
+    /// Class-position decorators (`@deco class C {}`) pending their target.
+    /// A decorator statement precedes its class in the same statement list;
+    /// checkStatement pushes here and checkClass consumes them (M18.3).
+    pending_class_decos: std.ArrayListUnmanaged(Node) = .empty,
     class_inst_generic: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
     class_static_cache: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
     /// Enum symbol -> value object type (the `typeof E` object with members).
@@ -9248,7 +9252,17 @@ const Checker = struct {
         // boundaries).
         c.inst_span = c.nodeSpan(node);
         const d = c.tree.nodeData(node);
-        switch (c.nodeTag(node)) {
+        const stmt_tag = c.nodeTag(node);
+        // A class-position decorator applies to the class that immediately
+        // follows it in the statement list (possibly through an `export`
+        // wrapper). Any other statement means a preceding decorator had no
+        // class target — drop the pending set so it can't attach to a later
+        // class. (`export_default` can also wrap the decorated class.)
+        switch (stmt_tag) {
+            .decorator, .class_decl, .export_decl, .export_default => {},
+            else => c.pending_class_decos.clearRetainingCapacity(),
+        }
+        switch (stmt_tag) {
             .block => {
                 const saved = c.cur_scope;
                 defer c.cur_scope = saved;
@@ -9317,7 +9331,7 @@ const Checker = struct {
             .break_stmt, .continue_stmt => {},
             .labeled_stmt => try c.checkStatement(d.lhs),
             .function_decl => try c.checkFunctionDecl(node),
-            .decorator => try c.checkDecorator(node),
+            .decorator => try c.pending_class_decos.append(c.ca(), node),
             .class_decl => try c.checkClass(node),
             .interface_decl => try c.checkInterfaceDecl(node),
             .type_alias => try c.checkTypeAliasDecl(node),
@@ -9961,6 +9975,27 @@ const Checker = struct {
             try c.evalTypeParamDecls(class_sym);
         }
 
+        // Class-position decorators (`@deco class C {}`): evaluated in the
+        // scope surrounding the class, with the enclosing `this`. Snapshot and
+        // clear the pending set first so a nested decorated class inside a
+        // member body cannot re-consume them.
+        if (c.pending_class_decos.items.len > 0) {
+            const decos = try c.scratch().dupe(Node, c.pending_class_decos.items);
+            c.pending_class_decos.clearRetainingCapacity();
+            const saved_ds = c.cur_scope;
+            c.cur_scope = saved_scope;
+            c.this_type = saved_this;
+            const class_val: TypeId = if (class_sym != binder.no_symbol)
+                try c.ts.makeClassValue(class_sym)
+            else
+                types.any_type;
+            for (decos) |deco| {
+                const dt = try c.checkDecorator(deco);
+                try c.checkDecoratorSig(deco, dt, .class, class_val);
+            }
+            c.cur_scope = saved_ds;
+        }
+
         // extends: base must be a class (checked in baseClassRef); type
         // args arity checked there too.
         if (class_sym != binder.no_symbol and data.extends != 0) {
@@ -9999,7 +10034,8 @@ const Checker = struct {
         const class_is_abstract = data.flags & ast.Flags.abstract != 0;
 
         // Members.
-        for (c.tree.extraRange(data.members_start, data.members_end)) |member| {
+        const members = c.tree.extraRange(data.members_start, data.members_end);
+        for (members, 0..) |member, mi| {
             if (member == null_node) continue;
             const md = c.tree.nodeData(member);
             switch (c.nodeTag(member)) {
@@ -10055,21 +10091,226 @@ const Checker = struct {
                     // surrounding the class (at class-definition time), so its
                     // `this` is the enclosing `this`, not the instance.
                     c.this_type = saved_this;
-                    try c.checkDecorator(member);
+                    const dt = try c.checkDecorator(member);
+                    // The decorated member is the next non-decorator member.
+                    var target: Node = null_node;
+                    var k = mi + 1;
+                    while (k < members.len) : (k += 1) {
+                        if (members[k] != null_node and c.nodeTag(members[k]) != .decorator) {
+                            target = members[k];
+                            break;
+                        }
+                    }
+                    if (target != null_node) try c.checkMemberDecoratorSig(member, dt, target, this_t, class_sym);
                 },
                 else => {},
             }
         }
     }
 
-    /// Type-check a decorator expression (`@expr`). Standard decorators name-
-    /// resolve and type-check the expression: an undefined name ⇒ TS2304, and
-    /// the callee/args of `@factory(args)` are checked. The decorator's
-    /// signature compatibility (TS1238/1240/1241) is not modeled — those need
-    /// the decorator-context lib types absent from the harness lib.
-    fn checkDecorator(c: *Checker, node: Node) Error!void {
+    /// Type-check a decorator expression (`@expr`) and return its type.
+    /// Standard decorators name-resolve and type-check the expression: an
+    /// undefined name ⇒ TS2304, and the callee/args of a factory `@f(args)`
+    /// are checked. The returned type is the decorator function itself (for a
+    /// factory, the call's return type) — the value `checkDecoratorSig` relates
+    /// against the expected context-typed decorator signature.
+    fn checkDecorator(c: *Checker, node: Node) Error!TypeId {
         const expr = c.tree.nodeData(node).lhs;
-        if (expr != null_node) _ = try c.checkExprCached(expr, types.no_type);
+        if (expr == null_node) return types.any_type;
+        return c.checkExprCached(expr, types.no_type);
+    }
+
+    /// The position a decorator is applied to. Drives which TS12xx code and
+    /// which `Class*DecoratorContext` shape apply (tsc §checkDecorators).
+    const DecoPos = enum { class, method, getter, setter, field, accessor };
+
+    fn decoCode(pos: DecoPos) u16 {
+        return switch (pos) {
+            .class => 1238, // class decorator
+            .field, .accessor => 1240, // property decorator
+            .method, .getter, .setter => 1241, // method decorator
+        };
+    }
+
+    fn decoContextName(pos: DecoPos) []const u8 {
+        return switch (pos) {
+            .class => "ClassDecoratorContext",
+            .method => "ClassMethodDecoratorContext",
+            .getter => "ClassGetterDecoratorContext",
+            .setter => "ClassSetterDecoratorContext",
+            .field => "ClassFieldDecoratorContext",
+            .accessor => "ClassAccessorDecoratorContext",
+        };
+    }
+
+    /// Signature check for a class-member decorator: classify the member's
+    /// position, build the `value` argument type tsc synthesizes for it, and
+    /// relate the decorator against the expected context-typed signature.
+    fn checkMemberDecoratorSig(c: *Checker, deco: Node, dt: TypeId, target: Node, this_t: TypeId, class_sym: SymbolId) Error!void {
+        const md = c.tree.nodeData(target);
+        var pos: DecoPos = .method;
+        var value: TypeId = types.any_type;
+        switch (c.nodeTag(target)) {
+            .class_field => {
+                const e = c.tree.extraData(ast.Field, md.lhs);
+                if (e.flags & ast.Flags.accessor != 0) {
+                    pos = .accessor;
+                    // `accessor x` decorators receive a
+                    // `ClassAccessorDecoratorTarget<This, Value>`.
+                    value = c.decoContextRef("ClassAccessorDecoratorTarget");
+                } else {
+                    pos = .field;
+                    // Field decorators receive `undefined` as the value.
+                    value = types.undefined_type;
+                }
+            },
+            .class_method => {
+                const proto = c.tree.extraData(ast.FnProto, md.lhs);
+                if (proto.flags & ast.Flags.get != 0) {
+                    pos = .getter;
+                } else if (proto.flags & ast.Flags.set != 0) {
+                    pos = .setter;
+                } else {
+                    pos = .method;
+                }
+                const is_static = proto.flags & ast.Flags.static != 0;
+                const saved = c.this_type;
+                c.this_type = if (is_static and class_sym != binder.no_symbol)
+                    try c.ts.makeClassValue(class_sym)
+                else
+                    this_t;
+                // The value is the member's own function type. Suppress TS7006
+                // here — the member's own pass reports implicit-any.
+                value = c.signatureOfProto(target, md.lhs, true, false) catch types.any_type;
+                c.this_type = saved;
+            },
+            else => return,
+        }
+        try c.checkDecoratorSig(deco, dt, pos, value);
+    }
+
+    /// Build a `.ref` to a decorator-family lib interface by name (default
+    /// type args), or `any` when absent (e.g. `--noLib`).
+    fn decoContextRef(c: *Checker, name: []const u8) TypeId {
+        const a = c.atom(name) catch return types.any_type;
+        const sym = c.prog.globals.lookup(a) orelse return types.any_type;
+        if (!c.symFlags(sym).interface) return types.any_type;
+        return c.ts.makeRef(sym, &.{}) catch types.any_type;
+    }
+
+    /// Relate a decorator against the expected `(value, context) => …` shape
+    /// for its position and emit TS1238/1240/1241 when no call signature fits
+    /// (tsc: "Unable to resolve signature of … decorator when called as an
+    /// expression."). Policy: under-report freely, never a false positive —
+    /// generic decorators and any/unknown parameter types are always accepted,
+    /// and the `value`/`context` relations run only where a mismatch is
+    /// unambiguous.
+    fn checkDecoratorSig(c: *Checker, deco: Node, dt: TypeId, pos: DecoPos, value: TypeId) Error!void {
+        const r = try c.resolveStructural(dt);
+        var sigs: std.ArrayList(TypeId) = .empty;
+        defer sigs.deinit(c.scratch());
+        switch (c.ts.kind(r)) {
+            .any, .unknown, .err => return, // permissive: no reliable shape
+            .function => try sigs.append(c.scratch(), r),
+            .overloads => {
+                for (try c.memberList(r)) |m| try sigs.append(c.scratch(), m);
+            },
+            .object => {
+                if (c.ts.objectCallSigCount(r) == 0) return; // non-callable: under-report
+                for (0..c.ts.objectCallSigCount(r)) |i| {
+                    try sigs.append(c.scratch(), c.ts.objectCallSig(r, @intCast(i)));
+                }
+            },
+            else => return, // not callable in a shape we model: under-report
+        }
+        if (sigs.items.len == 0) return;
+
+        // Expected context interface for this position (null under --noLib →
+        // context relation is skipped, value/arity relation still applies).
+        const ctx_atom = c.atom(decoContextName(pos)) catch 0;
+        const ctx_sym: ?SymbolId = if (ctx_atom != 0) c.prog.globals.lookup(ctx_atom) else null;
+
+        for (sigs.items) |sig| {
+            if (try c.decoSigMatches(sig, pos, value, ctx_sym)) return; // some overload fits
+        }
+        const expr = c.tree.nodeData(deco).lhs;
+        const span = if (expr != null_node) c.nodeSpan(expr) else c.nodeSpan(deco);
+        try c.diagFmt(decoCode(pos), span, "Unable to resolve signature of {s} decorator when called as an expression.", .{switch (pos) {
+            .class => "class",
+            .field, .accessor => "property",
+            .method, .getter, .setter => "method",
+        }});
+    }
+
+    /// Does one decorator call signature accept the runtime `(value, context)`
+    /// call? Conservative: a generic signature or any indeterminate parameter
+    /// is treated as a match (under-report, never a false positive).
+    fn decoSigMatches(c: *Checker, sig: TypeId, pos: DecoPos, value: TypeId, ctx_sym: ?SymbolId) Error!bool {
+        // Generic decorators need inference we don't model here — accept.
+        if (c.ts.fnTypeParams(sig).len > 0) return true;
+        // The runtime invokes a decorator with 2 arguments; a signature that
+        // *requires* more can never resolve (tsc: "expects N").
+        if (c.requiredParams(sig) > 2) return false;
+        // Value argument vs the first parameter.
+        if (c.paramTypeAt(sig, 0)) |p0| {
+            if (!try c.decoAcceptsValue(pos, value, p0)) return false;
+        }
+        // Context argument vs the second parameter: fail only on an
+        // unambiguous decorator-context kind mismatch.
+        if (ctx_sym != null) {
+            if (c.paramTypeAt(sig, 1)) |p1| {
+                if (c.decoContextMismatch(p1, ctx_sym.?)) return false;
+            }
+        }
+        return true;
+    }
+
+    /// True if `value` is acceptable as the first decorator argument for `p0`.
+    /// Permissive supertypes (`any`/`unknown`/`object`/`Function`, a matching
+    /// context/target ref, or a constructor-typed parameter for a class
+    /// decorator) are accepted without an assignability probe so an incomplete
+    /// relation cannot produce a false positive.
+    fn decoAcceptsValue(c: *Checker, pos: DecoPos, value: TypeId, p0: TypeId) Error!bool {
+        switch (c.ts.kind(p0)) {
+            .any, .unknown, .err, .object_keyword => return true,
+            .ref => {
+                const psym = c.ts.refSymbol(p0);
+                if (c.globalSymNamed(psym, "Function")) return true;
+                if (pos == .accessor and c.globalSymNamed(psym, "ClassAccessorDecoratorTarget")) return true;
+            },
+            .object => {
+                // A constructor-typed parameter accepts a class value.
+                if (pos == .class and c.ts.objectConstructSigCount(p0) > 0) return true;
+            },
+            else => {},
+        }
+        if (value == 0 or value == types.error_type or value == types.any_type) return true;
+        return c.isAssignable(value, p0);
+    }
+
+    /// True when `p1` is a ref to a *different* decorator-context interface
+    /// than expected (e.g. `ClassMethodDecoratorContext` where a class
+    /// decorator wants `ClassDecoratorContext`). Anything else (a union like
+    /// `DecoratorContext`, `any`, an unrelated type) is accepted.
+    fn decoContextMismatch(c: *Checker, p1: TypeId, ctx_sym: SymbolId) bool {
+        if (c.ts.kind(p1) != .ref) return false;
+        const psym = c.ts.refSymbol(p1);
+        const family = [_][]const u8{
+            "ClassDecoratorContext",       "ClassMethodDecoratorContext",
+            "ClassGetterDecoratorContext", "ClassSetterDecoratorContext",
+            "ClassFieldDecoratorContext",  "ClassAccessorDecoratorContext",
+        };
+        for (family) |name| {
+            if (c.globalSymNamed(psym, name)) return psym != ctx_sym;
+        }
+        return false;
+    }
+
+    /// Is `sym` the global interface/type named `name`?
+    fn globalSymNamed(c: *Checker, sym: SymbolId, name: []const u8) bool {
+        const a = c.atom(name) catch return false;
+        const g = c.prog.globals.lookup(a) orelse return false;
+        return g == sym;
     }
 
     fn checkInterfaceDecl(c: *Checker, node: Node) Error!void {

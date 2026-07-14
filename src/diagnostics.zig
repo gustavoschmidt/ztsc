@@ -62,6 +62,9 @@ pub const Code = enum(u16) {
     line_break_not_allowed,
     /// Trailing comma or elision where the grammar forbids it.
     argument_expected,
+    /// TS1206: a decorator in a position the grammar forbids (parameter
+    /// decorator under TC39 standard decorators).
+    decorator_not_valid_here,
 
     // --- bind errors (M3), tsc-compatible codes via tsCode() ---------------
     /// TS2300: two declarations of the same name that cannot merge
@@ -123,6 +126,7 @@ pub const Code = enum(u16) {
             .rest_must_be_last => "a rest element must be last",
             .line_break_not_allowed => "line break not permitted here",
             .argument_expected => "argument expression expected",
+            .decorator_not_valid_here => "Decorators are not valid here.",
             .duplicate_identifier => "duplicate identifier",
             .block_scoped_redeclare => "cannot redeclare block-scoped variable",
             .duplicate_function_implementation => "duplicate function implementation",
@@ -142,6 +146,7 @@ pub const Code = enum(u16) {
             .duplicate_function_implementation => 2393,
             .import_conflict => 2440,
             .catch_redeclare => 2492,
+            .decorator_not_valid_here => 1206,
             else => 0,
         };
     }

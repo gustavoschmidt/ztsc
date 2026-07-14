@@ -1512,14 +1512,50 @@ graduates the M11 acceptance test to the *real* pinned `@types/node`.
    tsgo RSS at N=4, so M21's ≤50%-of-tsgo gate holds. Full table: BENCHMARKS
    §3.13. M19 remains the mandated claw-back for the per-checker duplication +
    cold-start lib parse.
-3. **Lib-gated deferrals from M14 land now:** the TC39 decorator
-   signature checks TS1238/TS1240/TS1241 and parameter-decorator TS1206
-   (they need `ClassMethodDecoratorContext` et al., present in the real
+3. **Lib-gated deferrals from M14 land now. ✅ DONE (2026-07-14).** the TC39
+   decorator signature checks TS1238/TS1240/TS1241 and parameter-decorator
+   TS1206 (they need `ClassMethodDecoratorContext` et al., present in the real
    lib — ztsc currently under-reports, never spuriously errors). JSX
    polish items 3+4 (`JSX` namespace resolved from `@types/react`,
    spread-attribute checking/TS2559, `JSX.ElementChildrenAttribute`
    children typing) stay **deferred post-v0.0.1** unless M17's triage
    decided otherwise — backend-first.
+
+   **Landed.** *Codes & positions* (differential vs tsc 5.5.4): a decorator
+   whose call signature can't accept the runtime-supplied `(value, context)`
+   pair is TS1238 (class), TS1240 (field / auto-`accessor` → *property*
+   decorator), or TS1241 (method / getter / setter → *method* decorator).
+   *checker* (`checkDecoratorSig`): the statement-level `.decorator` arm now
+   defers to a `pending_class_decos` list that `checkClass` consumes with the
+   class value as `value` and the enclosing scope/`this`; the member loop pairs
+   each `.decorator` with its next non-decorator member and synthesizes that
+   position's `value` (class → `typeof C`; method/getter/setter → the member's
+   own function type via `signatureOfProto`; field → `undefined`; accessor →
+   `ClassAccessorDecoratorTarget`). For each call signature we relate: arity
+   (`requiredParams > 2` → no fit, matching tsc's "runtime invokes with 2
+   arguments, but the decorator expects N"), the `value` vs param 0, and — only
+   on an *unambiguous* decorator-context kind mismatch (`p1` is a ref to a
+   *different* `Class*DecoratorContext` than the position's) — the context vs
+   param 1. *Factory* decorators `@f(args)` check the call's return type. **FP
+   policy honored:** generic decorators, `any`/`unknown`/`object`/`Function`
+   params, constructor-typed class-decorator params, and `DecoratorContext` /
+   `ClassMemberDecoratorContext` union params are all accepted without an
+   assignability probe, so an incomplete relation can only *under*-report.
+   *parser* (`parseParam`): a parameter decorator `@dec x: T` is consumed
+   cleanly (no error cascade) and reported as TS1206 ("Decorators are not valid
+   here.", `decorator_not_valid_here` → tsCode 1206); the parameter still binds,
+   and tsc's suppression of name resolution on the decorator is matched (no
+   spurious TS2304). The conformance runner + `main.zig` now surface parser
+   diagnostics that carry a tsc code (only TS1206 qualifies today). **Conformance
+   384 → 387** (`decorators/005_sig_class` TS1238, `006_sig_member`
+   TS1240/1241, `007_param_decorator` TS1206 — each differential; a 20+-line
+   well-typed-decorator FP battery across every position stays clean on both
+   ztsc and tsc). **Deferred (clean under-reports, never FPs):** generic-decorator
+   value/constraint mismatches (`<T extends string>(v: T, …)` — needs inference
+   we skip); the zero-parameter TS1329 variant; `export @deco class` ordering
+   (a pre-existing parser gap, unrelated). **Benchmark flat** — corpus has no
+   decorators: multi N=1/4/8 wall 0.09/0.03/0.03 s, peak RSS 52.1/54.3/47.0 MB,
+   types(N=4) 27569, byte-for-byte the post-M18.2 baseline.
 4. **Real pinned `@types/node` acceptance** (graduates from M11, per that
    milestone's closing note). Vendor a pinned `@types/node` (already in
    `bench/fetch_real.sh`'s set) and differential-check a small real

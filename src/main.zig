@@ -961,12 +961,20 @@ pub fn main(init: std.process.Init) !void {
             continue;
         }
         emitter.beginFile();
-        for (tree.diagnostics) |d| {
-            try emitter.emit(path, &src, d.span, 0, d.message());
-        }
 
         var merged: std.ArrayList(Merged) = .empty;
         defer merged.deinit(gpa);
+        // Parser diagnostics: those with a tsc analogue (e.g. TS1206) render
+        // with their code and sort into the merged stream; the rest keep their
+        // own messages.
+        for (tree.diagnostics) |d| {
+            const ts = d.code.tsCode();
+            if (ts != 0) {
+                try merged.append(gpa, .{ .code = ts, .start = d.span.start, .end = d.span.end, .msg = d.message() });
+            } else {
+                try emitter.emit(path, &src, d.span, 0, d.message());
+            }
+        }
         if (binds.items[i]) |b| {
             for (b.diagnostics) |d| {
                 const ts = d.code.tsCode();
