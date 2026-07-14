@@ -170,9 +170,30 @@ pub const Kind = enum(u8) {
     /// resolved to a concrete object on instantiation.
     /// extra[a..]: [key_param, constraint, value, as_clause, source, flags].
     mapped,
+    /// Deferred / pattern template-literal type `` `head${h0}c0${h1}c1…` ``
+    /// (M16c). a = extra index, b = hole count N. extra[a] = head literal atom;
+    /// then per hole i: [hole_type, chunk_atom] where chunk_atom is the literal
+    /// text immediately following hole i. Interned when a hole is still generic
+    /// (deferred) OR when a hole is a non-enumerable primitive (`string` /
+    /// `number`) — the "pattern" form (`` `a${string}` ``). A fully-concrete
+    /// template never lands here (it resolves to a string-literal / union).
+    template_literal_type,
+    /// Intrinsic string-transform application (M16c): `Uppercase` /
+    /// `Lowercase` / `Capitalize` / `Uncapitalize`. a = intrinsic index
+    /// (`string_mapping_*` below), b = the argument type. Interned only while
+    /// the argument is still generic; a concrete argument resolves to the
+    /// transformed string-literal (or distributes over a union).
+    string_mapping,
 };
 
 pub const cond_flag_distributive: u32 = 1;
+
+// String-transform intrinsic indices (M16c), stored in a `string_mapping`
+// type's `data_a`.
+pub const string_mapping_uppercase: u32 = 0;
+pub const string_mapping_lowercase: u32 = 1;
+pub const string_mapping_capitalize: u32 = 2;
+pub const string_mapping_uncapitalize: u32 = 3;
 
 // Mapped-type modifier flags (M16b), stored in a mapped type's `data_b` (and
 // repeated as its final extra word so they participate in hash-cons identity).
@@ -591,6 +612,29 @@ pub const Store = struct {
         return s.mappedFlags(id) & mapped_flag_homomorphic != 0;
     }
 
+    pub fn templateHead(s: *const Store, id: TypeId) Atom {
+        if (id < s.base_len) return s.base.?.templateHead(id);
+        return s.extra.items[s.dataA(id)];
+    }
+    pub fn templateHoleCount(s: *const Store, id: TypeId) u32 {
+        return s.dataB(id);
+    }
+    pub fn templateHole(s: *const Store, id: TypeId, i: u32) TypeId {
+        if (id < s.base_len) return s.base.?.templateHole(id, i);
+        return s.extra.items[s.dataA(id) + 1 + 2 * i];
+    }
+    pub fn templateChunk(s: *const Store, id: TypeId, i: u32) Atom {
+        if (id < s.base_len) return s.base.?.templateChunk(id, i);
+        return s.extra.items[s.dataA(id) + 2 + 2 * i];
+    }
+
+    pub fn stringMappingKind(s: *const Store, id: TypeId) u32 {
+        return s.dataA(id);
+    }
+    pub fn stringMappingArg(s: *const Store, id: TypeId) TypeId {
+        return s.dataB(id);
+    }
+
     pub fn typeParamSymbol(s: *const Store, id: TypeId) u32 {
         return s.dataA(id);
     }
@@ -644,6 +688,10 @@ pub const Store = struct {
             .number_literal, .number_literal_fresh => number_type,
             .bigint_literal => bigint_type,
             .bool_true, .bool_false => boolean_type,
+            // A template-literal pattern and a string-transform intrinsic are
+            // subtypes of `string` — so `` `a${string}` `` / `Uppercase<T>` are
+            // assignable to `string` (and absorbed by `string` in a union).
+            .template_literal_type, .string_mapping => string_type,
             else => no_type,
         };
     }
@@ -680,6 +728,7 @@ pub const Store = struct {
             .ref => return s.extra.items[a .. a + 1 + b],
             .conditional => return s.extra.items[a .. a + 4],
             .mapped => return s.extra.items[a .. a + 6],
+            .template_literal_type => return s.extra.items[a .. a + 1 + 2 * b],
             else => {
                 buf[0] = a;
                 buf[1] = b;
@@ -757,7 +806,7 @@ pub const Store = struct {
                 try s.extra.appendSlice(s.alloc, words);
                 try s.appendRaw(kind_, start, @intCast(s.extra.items.len));
             },
-            .tuple, .object, .function, .ref, .conditional, .mapped => {
+            .tuple, .object, .function, .ref, .conditional, .mapped, .template_literal_type => {
                 const start: u32 = @intCast(s.extra.items.len);
                 try s.extra.appendSlice(s.alloc, words);
                 try s.appendRaw(kind_, start, b_count);
@@ -945,6 +994,26 @@ pub const Store = struct {
     /// modifier do not hash-cons together.
     pub fn makeMapped(s: *Store, key_param: TypeId, constraint: TypeId, value: TypeId, as_clause: TypeId, source: TypeId, flags: u32) Error!TypeId {
         return s.internType(.mapped, &.{ key_param, constraint, value, as_clause, source, flags }, flags);
+    }
+
+    /// Intern a deferred/pattern template-literal type. `holes[i]` is the type
+    /// of the i-th interpolation and `chunks[i]` the literal text following it;
+    /// `head` is the literal before the first hole. `holes.len == chunks.len`.
+    pub fn makeTemplateLiteral(s: *Store, head: Atom, holes: []const TypeId, chunks: []const Atom) Error!TypeId {
+        std.debug.assert(holes.len == chunks.len);
+        const n = holes.len;
+        const words = try s.alloc.alloc(u32, 1 + 2 * n);
+        defer s.alloc.free(words);
+        words[0] = head;
+        for (0..n) |i| {
+            words[1 + 2 * i] = holes[i];
+            words[2 + 2 * i] = chunks[i];
+        }
+        return s.internType(.template_literal_type, words, @intCast(n));
+    }
+
+    pub fn makeStringMapping(s: *Store, kind_idx: u32, arg: TypeId) Error!TypeId {
+        return s.internType(.string_mapping, &.{ kind_idx, arg }, 0);
     }
 
     pub fn makeOverloads(s: *Store, fns: []const TypeId) Error!TypeId {

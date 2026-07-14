@@ -3137,12 +3137,7 @@ const Parser = struct {
                 _ = try p.expect(.r_paren, .expected_r_paren);
                 return p.addNode(.{ .tag = .paren_type, .main_token = lp, .data = .{ .lhs = inner, .rhs = 0 } });
             },
-            .template_head, .no_substitution_template_literal => {
-                // Template literal type — out of subset.
-                const start = p.curIdx();
-                _ = try p.parseTemplateExpr();
-                return p.unsupportedFrom(start);
-            },
+            .template_head, .no_substitution_template_literal => return p.parseTemplateLiteralType(),
             .keyword_import => return p.parseImportType(),
             .unknown => {
                 try p.fail(.unexpected_character);
@@ -3292,6 +3287,64 @@ const Parser = struct {
         if (is_mapped) return p.parseMappedType(lb, flags);
         const members = try p.parseTypeMembersRest();
         return p.addNode(.{ .tag = .object_type, .main_token = lb, .data = .{ .lhs = members.start, .rhs = members.end } });
+    }
+
+    /// Template-literal type `` `head${T}mid${U}tail` `` (M16c). Mirrors
+    /// `parseTemplateExpr`'s head/middle/tail token loop, but each substitution
+    /// is a *type* (not an expression). The hole type nodes are stored as one
+    /// SubRange; the chunk tokens (middle/tail) as a parallel range so the
+    /// checker can read each hole's trailing literal text.
+    fn parseTemplateLiteralType(p: *Parser) PE!Node {
+        if (p.curTag() == .no_substitution_template_literal) {
+            const tok = try p.bump();
+            const extra = try p.addExtra(ast.TemplateLitType{
+                .holes_start = 0,
+                .holes_end = 0,
+                .chunks_start = 0,
+                .chunks_end = 0,
+            });
+            return p.addNode(.{ .tag = .template_literal_type_node, .main_token = tok, .data = .{ .lhs = extra, .rhs = 0 } });
+        }
+        const head = try p.bump(); // template_head
+        var chunk_toks: std.ArrayList(u32) = .empty;
+        defer chunk_toks.deinit(p.gpa);
+        const top = p.scratchTop();
+        defer p.scratch.shrinkRetainingCapacity(top);
+        while (true) {
+            try p.pushScratch(try p.parseType());
+            if (p.curTag() != .r_brace) {
+                try p.fail(.expected_r_brace);
+                break;
+            }
+            p.rescanTemplatePart();
+            switch (p.curTag()) {
+                .template_middle => {
+                    try chunk_toks.append(p.gpa, p.curIdx());
+                    _ = try p.bump();
+                    continue;
+                },
+                .template_tail => {
+                    try chunk_toks.append(p.gpa, p.curIdx());
+                    _ = try p.bump();
+                    break;
+                },
+                .unterminated_template => {
+                    try p.errAtCur(.unterminated_template);
+                    _ = try p.bump();
+                    break;
+                },
+                else => break,
+            }
+        }
+        const holes = try p.scratchToSpan(top);
+        const chunks = try p.listToSpan(chunk_toks.items);
+        const extra = try p.addExtra(ast.TemplateLitType{
+            .holes_start = holes.start,
+            .holes_end = holes.end,
+            .chunks_start = chunks.start,
+            .chunks_end = chunks.end,
+        });
+        return p.addNode(.{ .tag = .template_literal_type_node, .main_token = head, .data = .{ .lhs = extra, .rhs = 0 } });
     }
 
     /// Parse a mapped type body after `{` and any leading readonly modifier
@@ -4306,8 +4359,14 @@ test "decorators: parsed into the AST (no longer out of subset)" {
     );
 }
 
-test "unsupported: template literal types" {
-    try expectDiagCount("type T = `prefix-${string}`;", 1);
+test "template literal types parse in subset (M16c)" {
+    try expectDiagCount("type T = `prefix-${string}`;", 0);
+    try expectDiagCount("type U<A, B> = `${A}-${B}`;", 0);
+    try expectDiagCount("type P = `plain`;", 0);
+    try expectDiagCount("type N = `x${`y${1}`}z`;", 0);
+    try expectSExpr("type T = `a${string}b${number}`;",
+        \\(type_alias T (template_literal_type_node (identifier string) (identifier number)))
+    );
 }
 
 test "mapped types parse in subset (M16b)" {
@@ -4421,7 +4480,7 @@ test "jsx name rescan does not disturb subtraction lexing" {
 test "unsupported constructs still leave following code parsable" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const src = "type T = `prefix-${string}`;\nconst after: number = 1;";
+    const src = "type C = new () => number;\nconst after: number = 1;";
     const tree = try parse(arena.allocator(), src);
     try testing.expect(tree.diagnostics.len >= 1);
     const got = try dumpSource(arena.allocator(), src);

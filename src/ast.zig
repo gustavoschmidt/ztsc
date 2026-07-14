@@ -501,6 +501,12 @@ pub const Tag = enum(u8) {
     /// → MappedTypeData. The key parameter `K` is scoped to the `as` and value
     /// branches (not the constraint).
     mapped_type_node,
+    /// `` `head${h0}c0${h1}c1…` `` template-literal type (M16c). main_token =
+    /// the head token (`template_head` / `no_substitution_template_literal`);
+    /// lhs = extra → TemplateLitType. The hole type nodes are a contiguous
+    /// range; the literal chunk tokens (`template_middle` / `template_tail`)
+    /// are a parallel range read directly from the token stream at check time.
+    template_literal_type_node,
 };
 
 pub const CondExpr = struct { then_expr: Node, else_expr: Node };
@@ -512,6 +518,11 @@ pub const ConditionalType = struct { extends_type: Node, true_type: Node, false_
 /// `null_node`); `value` is the property type (or `null_node`); `flags` carries
 /// the modifier bits (`mapped_flag_*` in types.zig).
 pub const MappedTypeData = struct { key_name_token: TokenIndex, constraint: Node, as_type: Node, value: Node, flags: u32 };
+/// Payload for a `template_literal_type_node` (M16c). `holes_start..holes_end`
+/// is a SubRange of the interpolation type nodes; `chunks_start..chunks_end` is
+/// a parallel range of chunk token indices (one per hole: the `template_middle`
+/// or `template_tail` token whose cooked text follows the hole).
+pub const TemplateLitType = struct { holes_start: ExtraIndex, holes_end: ExtraIndex, chunks_start: ExtraIndex, chunks_end: ExtraIndex };
 pub const IfElse = struct { then_stmt: Node, else_stmt: Node };
 pub const For = struct { init: Node, cond: Node, update: Node }; // all optional
 pub const ForInOf = struct { left: Node, right: Node };
@@ -933,6 +944,10 @@ pub const Ast = struct {
                     it.push(e.as_type);
                     it.push(e.value);
                 },
+                .template_literal_type_node => {
+                    const e = a.extraData(TemplateLitType, d.lhs);
+                    it.pushRange(a.extraRange(e.holes_start, e.holes_end));
+                },
                 .for_stmt => {
                     const e = a.extraData(For, d.lhs);
                     it.push(e.init);
@@ -1070,6 +1085,11 @@ pub const Ast = struct {
             },
             .import_specifier, .export_specifier => l.add(d.lhs),
             .index_signature => l.add(a.extraData(IndexSig, d.lhs).name_token),
+            .template_literal_type_node => {
+                // The tail chunk token covers the closing backtick (span end).
+                const e = a.extraData(TemplateLitType, d.lhs);
+                if (e.chunks_end > e.chunks_start) l.add(a.extraRange(e.chunks_start, e.chunks_end)[e.chunks_end - e.chunks_start - 1]);
+            },
             .function_decl, .function_expr, .class_method, .method_signature => {
                 l.add(a.extraData(FnProto, d.lhs).name_token);
             },

@@ -1059,16 +1059,39 @@ identically; benchmarks track types/line, RSS, and instantiation counts.
   referential mapped types holds via the M15 depth budget (same lenient TS2589
   divergence as M16a). Unblocks M16c/d.
 
-- **M16c — Template-literal types.** `` `prefix-${T}-suffix` `` types, the
-  intrinsic string transforms (`Uppercase`/`Lowercase`/`Capitalize`/
-  `Uncapitalize`), and inference *from* template-literal types (pattern
-  matching a string against a template to bind `infer`). Complexity: (1)
-  the combinatorial cross-product when interpolation holes are unions is a
-  bounded-but-real explosion vector (needs the M15 count limits); (2)
-  pattern-match inference (parsing a literal against `` `${infer H}-${infer
-  T}` ``) is a small string matcher but must agree with tsc's greedy/lazy
-  rules exactly; (3) assignability between template-literal types and
-  string literals/`string`.
+- **M16c — Template-literal types.** ✅ DONE (2026-07-14, conformance
+  349→356). Two net-new `types.zig` kinds mirroring M16a/b:
+  `.template_literal_type` (extra `[head_atom, (hole,chunk)*]`, `data_b` = hole
+  count; the deferred/pattern form) and `.string_mapping` (`data_a` = intrinsic
+  index, `data_b` = arg; the deferred intrinsic). Parser builds a real
+  `template_literal_type_node` (hole type nodes in one SubRange, chunk
+  middle/tail tokens in a parallel range). Single eval point
+  `reduceTemplateChunks` (parallels `reduceConditional`/`reduceMapped`): defers
+  while any hole is generic, else `evalTemplate` cross-products the enumerable
+  holes and keeps non-enumerable (`string`/`number`) holes as a pattern —
+  counted against the M15 depth/count budget. All landed: (1) concrete concat
+  (number/boolean/bigint holes stringify; `boolean`→`"false"|"true"`; nested
+  templates flatten); (2) union cross-product with pattern preservation
+  (`` `${"a"|"b"}-${string}` `` = `` `a-${string}` | `b-${string}` ``), bounded
+  at tsc's 100000-member limit → **TS2590** on blowup (no hang/OOM); (3) the 4
+  intrinsics as name-recognized magic aliases (`applyStringMapping`: literal→
+  transformed, union→distribute, generic→defer); (4) deferral through
+  `instantiateId`'s `.template_literal_type`/`.string_mapping` arms (M15 memo),
+  both excluded from the `(file,node)` type-node memo; (5) assignability —
+  concrete string ↔ pattern via a backtracking matcher, pattern→`string` via
+  `literalBase`, identical patterns via hash-cons; (6) inference *from*
+  templates (`inferFromTemplate`, tsc-lazy: non-empty delimiter captures to
+  first occurrence, last hole takes the remainder, adjacent holes split one
+  char); (7) the M16b template-`as` idiom (`` [K in keyof T as
+  `get${Capitalize<K & string>}`] ``) now materializes via `remapKey`. 7 cases
+  (`test/conformance/template/001`–`007`, differential vs tsc). Multi
+  byte-identical (types/type-bytes unchanged — dormant on JS subset);
+  hono/typebox template-heavy `.d.ts` resolve with no crash/panic/explosion.
+  **Deferred (documented):** `infer V extends number` numeric-constraint
+  reinterpretation (M16a's constrained-infer gap); template escapes uncooked;
+  cross-pattern↔pattern assignability is identity-only; infer matcher is
+  first-occurrence (no backtracking) — exact for single-delimiter forms.
+  Unblocks M16d.
 
 - **M16d — Recursive type aliases + generic indexed access + `keyof` over
   mapped/generic types.** Self-referential aliases (`type Json = string |

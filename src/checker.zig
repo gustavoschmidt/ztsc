@@ -783,6 +783,14 @@ const Checker = struct {
         return gop.value_ptr.*;
     }
 
+    /// Intern text from a *transient* buffer (a scratch/stack slice). Goes
+    /// straight to the interner (which copies the bytes) instead of `atom`,
+    /// whose `atom_cache` would otherwise store the caller's slice as a key and
+    /// dangle once the buffer is freed. Use for any computed/temporary string.
+    fn internText(c: *Checker, text: []const u8) Error!Atom {
+        return c.interner.intern(c.io, c.gpa, text);
+    }
+
     fn atomText(c: *Checker, a: Atom) []const u8 {
         if (a == 0) return "";
         return c.interner.lookup(c.io, a);
@@ -1304,7 +1312,33 @@ const Checker = struct {
                 try w.writeAll(" : ");
                 try c.printType(w, s.condFalse(t), depth + 1);
             },
+            .template_literal_type => {
+                try w.writeAll("`");
+                try w.writeAll(c.atomText(s.templateHead(t)));
+                for (0..s.templateHoleCount(t)) |i| {
+                    try w.writeAll("${");
+                    try c.printType(w, s.templateHole(t, @intCast(i)), depth + 1);
+                    try w.writeAll("}");
+                    try w.writeAll(c.atomText(s.templateChunk(t, @intCast(i))));
+                }
+                try w.writeAll("`");
+            },
+            .string_mapping => {
+                try w.print("{s}<", .{stringMappingName(s.stringMappingKind(t))});
+                try c.printType(w, s.stringMappingArg(t), depth + 1);
+                try w.writeAll(">");
+            },
         }
+    }
+
+    fn stringMappingName(kind_idx: u32) []const u8 {
+        return switch (kind_idx) {
+            types.string_mapping_uppercase => "Uppercase",
+            types.string_mapping_lowercase => "Lowercase",
+            types.string_mapping_capitalize => "Capitalize",
+            types.string_mapping_uncapitalize => "Uncapitalize",
+            else => "Uppercase",
+        };
     }
 
     fn printTypeParen(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32, in_union: bool) PrintErr!void {
@@ -1489,6 +1523,7 @@ const Checker = struct {
             .conditional_type => return c.conditionalTypeFromNode(node),
             .infer_type => return c.inferVarFromNode(node),
             .mapped_type_node => return c.mappedTypeFromNode(node),
+            .template_literal_type_node => return c.templateTypeFromNode(node),
             .paren_type, .optional_type, .rest_type => return c.typeFromTypeNode(d.lhs),
             // A predicate in return-type position behaves like `boolean` for
             // a plain guard (`x is T`), or `void` for an assertion function
@@ -1571,6 +1606,15 @@ const Checker = struct {
                 return types.error_type;
             },
             .none => {
+                // The four intrinsic string transforms are magic global
+                // aliases (`type Uppercase<S extends string> = intrinsic;`),
+                // not declared in ztsc's minimal lib — recognize them by name
+                // here, after user symbols (which would shadow) had their turn.
+                if (args.len == 1) {
+                    if (intrinsicStringMapping(c.atomText(a))) |kind_idx| {
+                        return c.applyStringMapping(kind_idx, args[0]);
+                    }
+                }
                 if (c.suggestName(a, c.cur_scope, false)) |sugg| {
                     try c.diagFmt(2552, c.tokSpan(tok), "Cannot find name '{s}'. Did you mean '{s}'?", .{ c.tokenText(tok), c.atomText(sugg) });
                 } else {
@@ -3605,6 +3649,15 @@ const Checker = struct {
                 if (s.mappedSource(t) != 0 and try c.containsTypeParam(s.mappedSource(t))) return true;
                 return false;
             },
+            // A template-literal pattern / string-mapping is generic (deferred)
+            // iff a hole / the argument still mentions an outer type param.
+            .template_literal_type => {
+                for (0..s.templateHoleCount(t)) |i| {
+                    if (try c.containsTypeParam(s.templateHole(t, @intCast(i)))) return true;
+                }
+                return false;
+            },
+            .string_mapping => return c.containsTypeParam(s.stringMappingArg(t)),
             else => return false,
         }
     }
@@ -3788,6 +3841,16 @@ const Checker = struct {
                 const as_c = if (s.mappedAs(t) != 0) try c.instantiateId(s.mappedAs(t), map, map_id) else 0;
                 const src = if (s.mappedSource(t) != 0) try c.instantiateId(s.mappedSource(t), map, map_id) else 0;
                 break :blk try c.reduceMapped(kp, con, val, as_c, src, s.mappedFlags(t));
+            },
+            .template_literal_type => blk: {
+                var holes: std.ArrayList(TypeId) = .empty;
+                defer holes.deinit(c.scratch());
+                for (0..s.templateHoleCount(t)) |i| try holes.append(c.scratch(), try c.instantiateId(s.templateHole(t, @intCast(i)), map, map_id));
+                break :blk try c.reduceTemplate(s.templateHead(t), holes.items, t);
+            },
+            .string_mapping => blk: {
+                const arg = try c.instantiateId(s.stringMappingArg(t), map, map_id);
+                break :blk try c.applyStringMapping(s.stringMappingKind(t), arg);
             },
             else => t,
         };
@@ -4029,6 +4092,10 @@ const Checker = struct {
             .ref => {
                 for (try c.refArgsList(t)) |a| try c.collectInferVars(a, out);
             },
+            .template_literal_type => {
+                for (0..s.templateHoleCount(t)) |i| try c.collectInferVars(s.templateHole(t, @intCast(i)), out);
+            },
+            .string_mapping => try c.collectInferVars(s.stringMappingArg(t), out),
             else => {},
         }
     }
@@ -4119,7 +4186,64 @@ const Checker = struct {
                     if (try c.containsInfer(m)) try c.inferFromExtends(source0, m, ids, vals, contra, depth + 1);
                 }
             },
+            // `S extends `${infer H}-${infer R}`` — pattern-match the concrete
+            // source string against the template, binding each hole's infer var.
+            .template_literal_type => {
+                const src = try c.resolveStructural(source0);
+                if (try c.stringLiteralOf(src)) |atom_| {
+                    try c.inferFromTemplate(c.atomText(atom_), pattern, ids, vals);
+                }
+            },
             else => {},
+        }
+    }
+
+    /// Greedy pattern-match a concrete string against a template-literal
+    /// pattern, binding each `infer` hole (tsc's rules: a non-empty following
+    /// literal captures up to its *first* occurrence — lazy; the last hole
+    /// takes the remainder; two adjacent holes split one character to the
+    /// first). No backtracking (a documented M16c simplification, exact for
+    /// the single-delimiter forms tsc users rely on).
+    fn inferFromTemplate(c: *Checker, text: []const u8, tpl: TypeId, ids: []const u32, vals: []TypeId) Error!void {
+        const s = &c.ts;
+        const head = c.atomText(s.templateHead(tpl));
+        if (!std.mem.startsWith(u8, text, head)) return;
+        const n = s.templateHoleCount(tpl);
+        var pos: usize = head.len;
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            const hole = s.templateHole(tpl, i);
+            const chunk = c.atomText(s.templateChunk(tpl, i));
+            var cap_end: usize = undefined;
+            if (i + 1 == n) {
+                // Last hole: `chunk` is the tail literal; text must end with it.
+                if (!std.mem.endsWith(u8, text[pos..], chunk)) return;
+                cap_end = text.len - chunk.len;
+            } else if (chunk.len == 0) {
+                // Adjacent holes with no separator: capture one char.
+                cap_end = @min(pos + 1, text.len);
+            } else {
+                const rel = std.mem.indexOf(u8, text[pos..], chunk) orelse return;
+                cap_end = pos + rel;
+            }
+            const captured = text[pos..cap_end];
+            try c.bindTemplateInfer(hole, captured, ids, vals);
+            pos = cap_end + (if (i + 1 == n) chunk.len else if (chunk.len == 0) @as(usize, 0) else chunk.len);
+        }
+    }
+
+    /// Bind the infer var(s) in a template hole to a captured substring. The
+    /// common case is a bare `infer X` (→ the string-literal of the capture);
+    /// a `string`/`number` typed hole binds nothing.
+    fn bindTemplateInfer(c: *Checker, hole: TypeId, captured: []const u8, ids: []const u32, vals: []TypeId) Error!void {
+        const s = &c.ts;
+        if (s.kind(hole) != .infer_var) return;
+        const idx = indexOfId(ids, s.inferVarId(hole)) orelse return;
+        const lit = try c.ts.makeStringLiteral(try c.internText(captured), false);
+        if (vals[idx] == types.no_type) {
+            vals[idx] = lit;
+        } else {
+            vals[idx] = try c.makeUnion2(vals[idx], lit);
         }
     }
 
@@ -4168,6 +4292,13 @@ const Checker = struct {
                 if (try c.containsInfer(s.condFalse(t))) break :blk true;
                 break :blk false;
             },
+            .template_literal_type => blk: {
+                for (0..s.templateHoleCount(t)) |i| {
+                    if (try c.containsInfer(s.templateHole(t, @intCast(i)))) break :blk true;
+                }
+                break :blk false;
+            },
+            .string_mapping => c.containsInfer(s.stringMappingArg(t)),
             else => false,
         };
     }
@@ -4249,6 +4380,13 @@ const Checker = struct {
                 const idx = try c.substInfer(s.indexAccessIndex(t), ids, vals);
                 return c.reduceIndexedAccess(obj, idx);
             },
+            .template_literal_type => {
+                var holes: std.ArrayList(TypeId) = .empty;
+                defer holes.deinit(c.scratch());
+                for (0..s.templateHoleCount(t)) |i| try holes.append(c.scratch(), try c.substInfer(s.templateHole(t, @intCast(i)), ids, vals));
+                return c.reduceTemplate(s.templateHead(t), holes.items, t);
+            },
+            .string_mapping => return c.applyStringMapping(s.stringMappingKind(t), try c.substInfer(s.stringMappingArg(t), ids, vals)),
             else => return t,
         }
     }
@@ -4447,8 +4585,9 @@ const Checker = struct {
     /// Resolve a mapped type's `as` remap for one src_type key. Returns the new
     /// property-name atom, or `null` when the key should be filtered out (the
     /// remap evaluates to `never` — the `Omit`/key-filter idiom). With no `as`
-    /// clause the original key name is kept. Template-literal renames are
-    /// deferred to M16c (a template `as` clause is not in the subset yet).
+    /// clause the original key name is kept. A template-literal `as` clause
+    /// (`` as `get${Capitalize<K & string>}` ``, M16c) reduces through
+    /// `substMappedKey` to a concrete string-literal before reaching here.
     fn remapKey(c: *Checker, as_clause: TypeId, key_id: u32, key_lit: TypeId) Error!?Atom {
         if (as_clause == 0) return c.ts.literalAtom(key_lit);
         const nk0 = try c.substMappedKey(as_clause, key_id, key_lit);
@@ -4457,7 +4596,7 @@ const Checker = struct {
             .never => null, // filtered
             .string_literal => c.ts.literalAtom(nk),
             .number_literal, .number_literal_fresh => try c.numberLiteralAtom(nk),
-            else => null, // non-static key (union/template/string) — dropped
+            else => null, // non-static key (union/template pattern/string) — dropped
         };
     }
 
@@ -4468,7 +4607,9 @@ const Checker = struct {
             std.fmt.bufPrint(&buf, "{d}", .{@as(i64, @intFromFloat(v))}) catch return c.atom("0")
         else
             std.fmt.bufPrint(&buf, "{d}", .{v}) catch return c.atom("0");
-        return c.atom(txt);
+        // `txt` is a stack-buffer slice — intern (copy) rather than caching the
+        // transient slice as an `atom_cache` key.
+        return c.internText(txt);
     }
 
     /// `Obj[Idx]`: defer while the index is still a mapped key parameter (or
@@ -4525,6 +4666,13 @@ const Checker = struct {
                 if (try c.containsMappedParam(s.condFalse(t))) break :blk true;
                 break :blk false;
             },
+            .template_literal_type => blk: {
+                for (0..s.templateHoleCount(t)) |i| {
+                    if (try c.containsMappedParam(s.templateHole(t, @intCast(i)))) break :blk true;
+                }
+                break :blk false;
+            },
+            .string_mapping => c.containsMappedParam(s.stringMappingArg(t)),
             else => false,
         };
     }
@@ -4595,8 +4743,406 @@ const Checker = struct {
                 const fls = try c.substMappedKey(s.condFalse(t), key_id, key_ty);
                 return c.reduceConditional(chk, ext, tru, fls, s.condDistributive(t));
             },
+            .template_literal_type => {
+                var holes: std.ArrayList(TypeId) = .empty;
+                defer holes.deinit(c.scratch());
+                for (0..s.templateHoleCount(t)) |i| try holes.append(c.scratch(), try c.substMappedKey(s.templateHole(t, @intCast(i)), key_id, key_ty));
+                return c.reduceTemplate(s.templateHead(t), holes.items, t);
+            },
+            .string_mapping => return c.applyStringMapping(s.stringMappingKind(t), try c.substMappedKey(s.stringMappingArg(t), key_id, key_ty)),
             else => return t,
         }
+    }
+
+    // =====================================================================
+    // template-literal types + string intrinsics (M16c)
+    // =====================================================================
+
+    fn intrinsicStringMapping(name: []const u8) ?u32 {
+        if (std.mem.eql(u8, name, "Uppercase")) return types.string_mapping_uppercase;
+        if (std.mem.eql(u8, name, "Lowercase")) return types.string_mapping_lowercase;
+        if (std.mem.eql(u8, name, "Capitalize")) return types.string_mapping_capitalize;
+        if (std.mem.eql(u8, name, "Uncapitalize")) return types.string_mapping_uncapitalize;
+        return null;
+    }
+
+    /// The literal text following template hole `i` in a template-literal type
+    /// node: strip the `template_middle` (`}…${`) or `template_tail` (`}…\``)
+    /// delimiters. No unescaping (a documented M16c simplification — escapes in
+    /// template *types* are rare).
+    fn templateChunkText(c: *Checker, tok: TokenIndex) []const u8 {
+        const text = c.tokenText(tok);
+        // middle: `}...${` (drop 1 leading `}`, 2 trailing `${`);
+        // tail:   `}...\`` (drop 1 leading `}`, 1 trailing backtick).
+        return switch (c.tree.tokens.tag(tok)) {
+            .template_middle => if (text.len >= 3) text[1 .. text.len - 2] else "",
+            .template_tail => if (text.len >= 2) text[1 .. text.len - 1] else "",
+            else => text,
+        };
+    }
+
+    /// Head literal text of a template-literal type node's main token: strip
+    /// the `template_head` (`` `…${ ``) or `no_substitution` (`` `…` ``) delims.
+    fn templateHeadText(c: *Checker, tok: TokenIndex) []const u8 {
+        const text = c.tokenText(tok);
+        return switch (c.tree.tokens.tag(tok)) {
+            .template_head => if (text.len >= 3) text[1 .. text.len - 2] else "",
+            .no_substitution_template_literal => if (text.len >= 2) text[1 .. text.len - 1] else "",
+            else => text,
+        };
+    }
+
+    fn templateTypeFromNode(c: *Checker, node: Node) Error!TypeId {
+        const d = c.tree.nodeData(node);
+        const e = c.tree.extraData(ast.TemplateLitType, d.lhs);
+        const head = try c.atom(c.templateHeadText(c.tree.nodeMainToken(node)));
+        const hole_nodes = c.tree.extraRange(e.holes_start, e.holes_end);
+        const chunk_toks = c.tree.extraRange(e.chunks_start, e.chunks_end);
+        if (hole_nodes.len == 0) return c.ts.makeStringLiteral(head, false);
+        var holes: std.ArrayList(TypeId) = .empty;
+        defer holes.deinit(c.scratch());
+        var chunks: std.ArrayList(Atom) = .empty;
+        defer chunks.deinit(c.scratch());
+        for (hole_nodes, 0..) |hn, i| {
+            try holes.append(c.scratch(), try c.typeFromTypeNode(hn));
+            const ct = if (i < chunk_toks.len) try c.atom(c.templateChunkText(chunk_toks[i])) else try c.atom("");
+            try chunks.append(c.scratch(), ct);
+        }
+        return c.reduceTemplateChunks(head, holes.items, chunks.items);
+    }
+
+    /// Re-evaluate a template from an existing template-literal `tpl` (reuses
+    /// its stored chunk atoms) with fresh `holes` (post-substitution).
+    fn reduceTemplate(c: *Checker, head: Atom, holes: []const TypeId, tpl: TypeId) Error!TypeId {
+        var chunks: std.ArrayList(Atom) = .empty;
+        defer chunks.deinit(c.scratch());
+        for (0..c.ts.templateHoleCount(tpl)) |i| try chunks.append(c.scratch(), c.ts.templateChunk(tpl, @intCast(i)));
+        return c.reduceTemplateChunks(head, holes, chunks.items);
+    }
+
+    /// A partially-evaluated template builder: a concrete `head` string plus a
+    /// list of committed *pattern* holes (a non-enumerable hole type and the
+    /// literal text that follows it). Concrete/enumerable text is folded into
+    /// `head` (no pattern holes yet) or into the last hole's `chunk`.
+    const TplBuilder = struct {
+        head: std.ArrayList(u8),
+        holes: std.ArrayList(TypeId),
+        chunks: std.ArrayList(std.ArrayList(u8)),
+    };
+
+    /// The single evaluation point for a template-literal type (build time +
+    /// each instantiation). Defers (keeps the template symbolic) while any hole
+    /// is still generic; otherwise cross-products the enumerable holes and
+    /// keeps non-enumerable (`string`/`number`) holes as a pattern. Counted
+    /// against the TS2589 depth/count budget.
+    fn reduceTemplateChunks(c: *Checker, head: Atom, holes: []const TypeId, chunks: []const Atom) Error!TypeId {
+        if (c.inst_depth > max_instantiation_depth or c.inst_count > max_instantiation_count) {
+            c.inst_limit_tripped = true;
+            try c.diagFmt(2589, c.inst_span, "Type instantiation is excessively deep and possibly infinite.", .{});
+            return types.error_type;
+        }
+        c.inst_depth += 1;
+        c.inst_count += 1;
+        defer c.inst_depth -= 1;
+        // Still generic in any hole → defer (keep the deferred template type).
+        for (holes) |h| {
+            if (try c.containsTypeParam(h) or try c.containsMappedParam(h) or try c.containsInfer(h)) {
+                return c.ts.makeTemplateLiteral(head, holes, chunks);
+            }
+        }
+        return c.evalTemplate(head, holes, chunks);
+    }
+
+    /// Concrete cross-product evaluation. Produces a union of string-literal
+    /// types (all holes enumerable) and/or template-literal *pattern* types
+    /// (some hole is a bare `string`/`number`). Bounds the working set by the
+    /// M15 count limit; on explosion trips TS2589 (bounded, never hangs).
+    fn evalTemplate(c: *Checker, head: Atom, holes: []const TypeId, chunks: []const Atom) Error!TypeId {
+        const gpa = c.scratch();
+        var builders: std.ArrayList(TplBuilder) = .empty;
+        defer {
+            for (builders.items) |*b| freeBuilder(gpa, b);
+            builders.deinit(gpa);
+        }
+        {
+            var b0: TplBuilder = .{ .head = .empty, .holes = .empty, .chunks = .empty };
+            try b0.head.appendSlice(gpa, c.atomText(head));
+            try builders.append(gpa, b0);
+        }
+        // tsc caps a template-literal union at 100000 members, emitting TS2590
+        // past it. Match that so a `${D}${D}${D}${D}${D}` (10^5) blowup trips
+        // gracefully instead of materializing millions of string literals.
+        const cap: usize = 100_000;
+        for (holes, 0..) |hole, i| {
+            const chunk_text = c.atomText(chunks[i]);
+            var forms: std.ArrayList(Atom) = .empty;
+            defer forms.deinit(gpa);
+            const enumerable = try c.enumerableForms(hole, &forms);
+            var next: std.ArrayList(TplBuilder) = .empty;
+            if (enumerable) {
+                for (builders.items) |*b| {
+                    for (forms.items) |f| {
+                        var nb = try cloneBuilder(gpa, b);
+                        try appendConcrete(gpa, &nb, c.atomText(f));
+                        try appendConcrete(gpa, &nb, chunk_text);
+                        try next.append(gpa, nb);
+                    }
+                    freeBuilder(gpa, b);
+                }
+            } else {
+                for (builders.items) |*b| {
+                    var nb = try cloneBuilder(gpa, b);
+                    try nb.holes.append(gpa, hole);
+                    var ch: std.ArrayList(u8) = .empty;
+                    try ch.appendSlice(gpa, chunk_text);
+                    try nb.chunks.append(gpa, ch);
+                    try next.append(gpa, nb);
+                    freeBuilder(gpa, b);
+                }
+            }
+            builders.deinit(gpa);
+            builders = next;
+            if (builders.items.len >= cap) {
+                c.inst_limit_tripped = true;
+                try c.diagFmt(2590, c.inst_span, "Expression produces a union type that is too complex to represent.", .{});
+                return types.string_type;
+            }
+        }
+        var parts: std.ArrayList(TypeId) = .empty;
+        defer parts.deinit(gpa);
+        for (builders.items) |*b| {
+            const bhead = try c.internText(b.head.items);
+            if (b.holes.items.len == 0) {
+                try parts.append(gpa, try c.ts.makeStringLiteral(bhead, false));
+            } else {
+                var chunk_atoms: std.ArrayList(Atom) = .empty;
+                defer chunk_atoms.deinit(gpa);
+                for (b.chunks.items) |ch| try chunk_atoms.append(gpa, try c.internText(ch.items));
+                try parts.append(gpa, try c.ts.makeTemplateLiteral(bhead, b.holes.items, chunk_atoms.items));
+            }
+        }
+        return c.ts.makeUnion(gpa, parts.items);
+    }
+
+    fn cloneBuilder(gpa: std.mem.Allocator, b: *const TplBuilder) Error!TplBuilder {
+        var nb: TplBuilder = .{ .head = .empty, .holes = .empty, .chunks = .empty };
+        try nb.head.appendSlice(gpa, b.head.items);
+        try nb.holes.appendSlice(gpa, b.holes.items);
+        for (b.chunks.items) |ch| {
+            var c2: std.ArrayList(u8) = .empty;
+            try c2.appendSlice(gpa, ch.items);
+            try nb.chunks.append(gpa, c2);
+        }
+        return nb;
+    }
+
+    fn freeBuilder(gpa: std.mem.Allocator, b: *TplBuilder) void {
+        b.head.deinit(gpa);
+        b.holes.deinit(gpa);
+        for (b.chunks.items) |*ch| ch.deinit(gpa);
+        b.chunks.deinit(gpa);
+    }
+
+    /// Append concrete text: into the running `head` while no pattern hole has
+    /// been committed, otherwise onto the last committed hole's chunk.
+    fn appendConcrete(gpa: std.mem.Allocator, b: *TplBuilder, text: []const u8) Error!void {
+        if (b.chunks.items.len == 0) {
+            try b.head.appendSlice(gpa, text);
+        } else {
+            try b.chunks.items[b.chunks.items.len - 1].appendSlice(gpa, text);
+        }
+    }
+
+    /// If `hole` enumerates to a finite set of concrete strings, append them to
+    /// `out` and return true; otherwise (bare `string`/`number`, deferred
+    /// intrinsic, …) return false — the hole must stay a pattern.
+    fn enumerableForms(c: *Checker, hole0: TypeId, out: *std.ArrayList(Atom)) Error!bool {
+        const s = &c.ts;
+        const hole = try c.resolveStructural(hole0);
+        switch (s.kind(hole)) {
+            .string_literal => {
+                try out.append(c.scratch(), s.literalAtom(hole));
+                return true;
+            },
+            .number_literal, .number_literal_fresh => {
+                try out.append(c.scratch(), try c.numberLiteralAtom(hole));
+                return true;
+            },
+            .bigint_literal => {
+                try out.append(c.scratch(), s.literalAtom(hole));
+                return true;
+            },
+            .bool_true => {
+                try out.append(c.scratch(), try c.atom("true"));
+                return true;
+            },
+            .bool_false => {
+                try out.append(c.scratch(), try c.atom("false"));
+                return true;
+            },
+            // `boolean` interpolates as the union `"false" | "true"`.
+            .boolean => {
+                try out.append(c.scratch(), try c.atom("false"));
+                try out.append(c.scratch(), try c.atom("true"));
+                return true;
+            },
+            .null => {
+                try out.append(c.scratch(), try c.atom("null"));
+                return true;
+            },
+            .undefined => {
+                try out.append(c.scratch(), try c.atom("undefined"));
+                return true;
+            },
+            .union_type => {
+                for (try c.memberList(hole)) |m| {
+                    if (!try c.enumerableForms(m, out)) return false;
+                }
+                return true;
+            },
+            // `"a" & string` (the `K & string` idiom) reduces to the literal.
+            .intersection => {
+                if (try c.stringLiteralOf(hole)) |atom_| {
+                    try out.append(c.scratch(), atom_);
+                    return true;
+                }
+                return false;
+            },
+            else => return false, // string / number / pattern / mapping → keep as pattern
+        }
+    }
+
+    /// The single concrete string-literal atom `t` denotes, seeing through a
+    /// `literal & primitive` intersection (`"a" & string` → `"a"`). Null when
+    /// `t` is not a single concrete string.
+    fn stringLiteralOf(c: *Checker, t0: TypeId) Error!?Atom {
+        const s = &c.ts;
+        const t = try c.resolveStructural(t0);
+        return switch (s.kind(t)) {
+            .string_literal => s.literalAtom(t),
+            .number_literal, .number_literal_fresh => try c.numberLiteralAtom(t),
+            .intersection => blk: {
+                for (try c.memberList(t)) |m| {
+                    if (s.kind(m) == .string_literal) break :blk s.literalAtom(m);
+                }
+                break :blk null;
+            },
+            else => null,
+        };
+    }
+
+    /// Apply a string-transform intrinsic. Concrete string → transformed
+    /// string-literal; union → distribute; still-generic arg → defer as a
+    /// `string_mapping` type. `string` itself maps to `string`.
+    fn applyStringMapping(c: *Checker, kind_idx: u32, arg0: TypeId) Error!TypeId {
+        const s = &c.ts;
+        const arg = try c.resolveStructural(arg0);
+        switch (s.kind(arg)) {
+            .string => return types.string_type,
+            .any, .err => return arg,
+            .never => return types.never_type,
+            .union_type => {
+                var parts: std.ArrayList(TypeId) = .empty;
+                defer parts.deinit(c.scratch());
+                for (try c.memberList(arg)) |m| try parts.append(c.scratch(), try c.applyStringMapping(kind_idx, m));
+                return s.makeUnion(c.scratch(), parts.items);
+            },
+            else => {},
+        }
+        if (try c.stringLiteralOf(arg)) |atom_| {
+            const src = c.atomText(atom_);
+            const buf = try c.scratch().alloc(u8, src.len);
+            defer c.scratch().free(buf);
+            transformString(kind_idx, src, buf);
+            return s.makeStringLiteral(try c.internText(buf), false);
+        }
+        // Still generic (type param / mapped_param / infer / nested template
+        // pattern / another mapping) → defer.
+        return s.makeStringMapping(kind_idx, arg);
+    }
+
+    fn transformString(kind_idx: u32, src: []const u8, dst: []u8) void {
+        for (src, 0..) |ch, i| dst[i] = ch;
+        switch (kind_idx) {
+            types.string_mapping_uppercase => for (dst) |*ch| {
+                ch.* = std.ascii.toUpper(ch.*);
+            },
+            types.string_mapping_lowercase => for (dst) |*ch| {
+                ch.* = std.ascii.toLower(ch.*);
+            },
+            types.string_mapping_capitalize => if (dst.len > 0) {
+                dst[0] = std.ascii.toUpper(dst[0]);
+            },
+            types.string_mapping_uncapitalize => if (dst.len > 0) {
+                dst[0] = std.ascii.toLower(dst[0]);
+            },
+            else => {},
+        }
+    }
+
+    /// Does concrete `text` match template-literal pattern `tpl`? Used for
+    /// `"axb"`-assignable-to-`` `a${string}b` ``. Backtracks over occurrences of
+    /// each hole's following literal so multi-hole patterns match soundly.
+    fn matchTemplatePattern(c: *Checker, text: []const u8, tpl: TypeId) Error!bool {
+        const head = c.atomText(c.ts.templateHead(tpl));
+        if (!std.mem.startsWith(u8, text, head)) return false;
+        return c.matchTplHole(text[head.len..], tpl, 0);
+    }
+
+    fn matchTplHole(c: *Checker, rest: []const u8, tpl: TypeId, i: u32) Error!bool {
+        const s = &c.ts;
+        const n = s.templateHoleCount(tpl);
+        if (i == n) return rest.len == 0;
+        const hole = s.templateHole(tpl, i);
+        const chunk = c.atomText(s.templateChunk(tpl, i));
+        if (i + 1 == n) {
+            if (!std.mem.endsWith(u8, rest, chunk)) return false;
+            return c.holeAccepts(hole, rest[0 .. rest.len - chunk.len]);
+        }
+        if (chunk.len == 0) {
+            var split: usize = 0;
+            while (split <= rest.len) : (split += 1) {
+                if ((try c.holeAccepts(hole, rest[0..split])) and try c.matchTplHole(rest[split..], tpl, i + 1)) return true;
+            }
+            return false;
+        }
+        var from: usize = 0;
+        while (std.mem.indexOf(u8, rest[from..], chunk)) |rel| {
+            const pos = from + rel;
+            if ((try c.holeAccepts(hole, rest[0..pos])) and try c.matchTplHole(rest[pos + chunk.len ..], tpl, i + 1)) return true;
+            from = pos + 1;
+        }
+        return false;
+    }
+
+    /// Whether a template pattern hole type admits the substring `str`.
+    fn holeAccepts(c: *Checker, hole0: TypeId, str: []const u8) Error!bool {
+        const s = &c.ts;
+        const hole = try c.resolveStructural(hole0);
+        switch (s.kind(hole)) {
+            .string, .any, .err => return true,
+            .number => return isNumericString(str),
+            .bigint => return isNumericString(str),
+            .boolean => return std.mem.eql(u8, str, "true") or std.mem.eql(u8, str, "false"),
+            .bool_true => return std.mem.eql(u8, str, "true"),
+            .bool_false => return std.mem.eql(u8, str, "false"),
+            .string_literal => return std.mem.eql(u8, str, c.atomText(s.literalAtom(hole))),
+            .number_literal, .number_literal_fresh => return std.mem.eql(u8, str, c.atomText(try c.numberLiteralAtom(hole))),
+            .union_type => {
+                for (try c.memberList(hole)) |m| {
+                    if (try c.holeAccepts(m, str)) return true;
+                }
+                return false;
+            },
+            .template_literal_type => return c.matchTemplatePattern(str, hole),
+            else => return false,
+        }
+    }
+
+    fn isNumericString(str: []const u8) bool {
+        if (str.len == 0) return false;
+        _ = std.fmt.parseFloat(f64, str) catch return false;
+        return true;
     }
 
     // =====================================================================
@@ -4973,7 +5519,7 @@ const Checker = struct {
 
     fn isCompound(k: types.Kind) bool {
         return switch (k) {
-            .union_type, .intersection, .array, .tuple, .object, .function, .overloads, .ref, .class_value, .conditional, .mapped, .index_access => true,
+            .union_type, .intersection, .array, .tuple, .object, .function, .overloads, .ref, .class_value, .conditional, .mapped, .index_access, .template_literal_type => true,
             else => false,
         };
     }
@@ -5024,6 +5570,18 @@ const Checker = struct {
         if (tk == .conditional) {
             return (try c.isAssignable(s, c.ts.condTrue(t))) and (try c.isAssignable(s, c.ts.condFalse(t)));
         }
+        // Template-literal pattern *target* (M16c): a concrete string literal is
+        // assignable iff its text matches the pattern; `string` and non-string
+        // sources are not. (Identical patterns / `string` already resolved via
+        // `s == t` / `literalBase`.)
+        if (tk == .template_literal_type) {
+            if (try c.stringLiteralOf(s)) |atom_| return c.matchTemplatePattern(c.atomText(atom_), t);
+            return false;
+        }
+        // Template-literal pattern *source*: assignable only to `string` (fast
+        // path via `literalBase`) or an identical pattern (`s == t`). Reaching
+        // here means neither — so no.
+        if (sk == .template_literal_type or sk == .string_mapping) return false;
         // Refs: expand and recurse (cache on the ref pair terminates cycles).
         if (sk == .ref or tk == .ref) {
             const rs = try c.resolveStructural(s);
