@@ -403,6 +403,20 @@ const Checker = struct {
     /// (0 = none). `infer V` binders and bare references to them resolve
     /// against this scope; it covers the extends and true branches only.
     cur_infer_cond: u64 = 0,
+    /// Mapped-type key parameter identity (M16b): mapped-type nodeKey -> a dense
+    /// id for its `K` (stable across the memo-off re-evaluations of the node).
+    mapped_key_ids: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    mapped_key_next: u32 = 1,
+    /// The mapped key parameter currently in scope (0 = none). While building a
+    /// mapped type's `as`/value branches, a bare reference to `K` resolves to
+    /// this `mapped_param` type; the constraint is evaluated with it cleared.
+    cur_mapped_key_name: Atom = 0,
+    cur_mapped_key_ty: TypeId = 0,
+    /// While materializing a *homomorphic* mapped prop, the self-index `T[K]`
+    /// yields the source property's *declared* type (no `| undefined` for an
+    /// optional prop) — optionality is carried by the prop's modifier flags
+    /// instead, matching tsc (so `Required<{x?:T}>[x]` is `T`, not `T|undefined`).
+    homo_index_mode: bool = false,
 
     // --- context ------------------------------------------------------------
     cur_scope: ScopeId = binder.file_scope,
@@ -1260,6 +1274,27 @@ const Checker = struct {
             .enum_type => try w.print("{s}", .{c.symbolName(s.enumSymbol(t))}),
             .this_type => try w.writeAll("this"),
             .infer_var => try w.print("infer {s}", .{c.atomText(s.inferVarName(t))}),
+            .mapped_param => try w.print("{s}", .{c.atomText(s.mappedParamName(t))}),
+            .index_access => {
+                try c.printTypeParen(w, s.indexAccessObj(t), depth + 1, false);
+                try w.writeAll("[");
+                try c.printType(w, s.indexAccessIndex(t), depth + 1);
+                try w.writeAll("]");
+            },
+            .mapped => {
+                try w.writeAll("{ [");
+                try c.printType(w, s.mappedKeyParam(t), depth + 1);
+                try w.writeAll(" in ");
+                if (s.mappedHomomorphic(t)) {
+                    try w.writeAll("keyof ");
+                    try c.printType(w, s.mappedSource(t), depth + 1);
+                } else {
+                    try c.printType(w, s.mappedConstraint(t), depth + 1);
+                }
+                try w.writeAll("]: ");
+                try c.printType(w, s.mappedValue(t), depth + 1);
+                try w.writeAll(" }");
+            },
             .conditional => {
                 try c.printTypeParen(w, s.condCheck(t), depth + 1, false);
                 try w.writeAll(" extends ");
@@ -1449,10 +1484,11 @@ const Checker = struct {
             .indexed_access_type => {
                 const obj = try c.typeFromTypeNode(d.lhs);
                 const idx = try c.typeFromTypeNode(d.rhs);
-                return c.indexedAccessType(obj, idx);
+                return c.reduceIndexedAccess(obj, idx);
             },
             .conditional_type => return c.conditionalTypeFromNode(node),
             .infer_type => return c.inferVarFromNode(node),
+            .mapped_type_node => return c.mappedTypeFromNode(node),
             .paren_type, .optional_type, .rest_type => return c.typeFromTypeNode(d.lhs),
             // A predicate in return-type position behaves like `boolean` for
             // a plain guard (`x is T`), or `void` for an assertion function
@@ -1493,6 +1529,11 @@ const Checker = struct {
             if (c.infer_ids.get(.{ .cond = c.cur_infer_cond, .name = a })) |id| {
                 return c.ts.makeInferVar(id, a);
             }
+        }
+        // A mapped type's key parameter `K` is in scope in its `as`/value
+        // branches (M16b); a bare `K` there resolves to the mapped_param.
+        if (c.cur_mapped_key_name != 0 and c.cur_mapped_key_name == a and args.len == 0) {
+            return c.cur_mapped_key_ty;
         }
         switch (c.resolveSpace(a, c.cur_scope, false)) {
             .sym => |sym0| {
@@ -1871,14 +1912,30 @@ const Checker = struct {
             },
             .string_literal => {
                 if (try c.propOfType(r, c.ts.literalAtom(idx))) |p| {
-                    return if (p.optional()) c.makeUnion2(p.ty, types.undefined_type) else p.ty;
+                    return if (p.optional() and !c.homo_index_mode) c.makeUnion2(p.ty, types.undefined_type) else p.ty;
                 }
                 if (c.ts.kind(r) == .object and c.ts.objectStringIndex(r) != 0) {
                     return c.ts.objectStringIndex(r);
                 }
                 return types.any_type;
             },
-            .number, .number_literal => return c.numberIndexType(r),
+            .number_literal, .number_literal_fresh => {
+                // A concrete numeric index into a tuple selects that element
+                // (matching tsc) — this is also what makes a homomorphic map
+                // over a tuple preserve per-element types.
+                if (c.ts.kind(r) == .tuple) {
+                    const v = c.ts.numberValue(idx);
+                    if (v == @floor(v) and v >= 0) {
+                        const i: u32 = @intFromFloat(v);
+                        if (i < c.ts.tupleLen(r)) {
+                            const e = c.ts.tupleElem(r, i);
+                            return if (e.rest()) c.elemOfArrayish(e.ty) else e.ty;
+                        }
+                    }
+                }
+                return c.numberIndexType(r);
+            },
+            .number => return c.numberIndexType(r),
             .string => {
                 if (c.ts.kind(r) == .object and c.ts.objectStringIndex(r) != 0) {
                     return c.ts.objectStringIndex(r);
@@ -3530,6 +3587,24 @@ const Checker = struct {
                 if (try c.containsTypeParam(s.condFalse(t))) return true;
                 return false;
             },
+            .index_access => {
+                if (try c.containsTypeParam(s.indexAccessObj(t))) return true;
+                if (try c.containsTypeParam(s.indexAccessIndex(t))) return true;
+                return false;
+            },
+            // A deferred mapped type needs (re-)instantiation while *any* part
+            // still mentions an outer type param — the value/`as` branches as
+            // well as the key set, so a `{[K in "a"]: T}` with generic `T` is
+            // reached and its props substituted. Whether it *materializes* vs
+            // stays deferred is decided separately (by the key set) in
+            // `reduceMapped`. The `mapped_param` key is not an outer param.
+            .mapped => {
+                if (try c.containsTypeParam(s.mappedConstraint(t))) return true;
+                if (try c.containsTypeParam(s.mappedValue(t))) return true;
+                if (s.mappedAs(t) != 0 and try c.containsTypeParam(s.mappedAs(t))) return true;
+                if (s.mappedSource(t) != 0 and try c.containsTypeParam(s.mappedSource(t))) return true;
+                return false;
+            },
             else => return false,
         }
     }
@@ -3700,6 +3775,19 @@ const Checker = struct {
                 const tru = try c.instantiateId(s.condTrue(t), map, map_id);
                 const fls = try c.instantiateId(s.condFalse(t), map, map_id);
                 break :blk try c.reduceConditional(chk, ext, tru, fls, s.condDistributive(t));
+            },
+            .index_access => blk: {
+                const obj = try c.instantiateId(s.indexAccessObj(t), map, map_id);
+                const idx = try c.instantiateId(s.indexAccessIndex(t), map, map_id);
+                break :blk try c.reduceIndexedAccess(obj, idx);
+            },
+            .mapped => blk: {
+                const kp = s.mappedKeyParam(t); // key param identity is stable
+                const con = try c.instantiateId(s.mappedConstraint(t), map, map_id);
+                const val = try c.instantiateId(s.mappedValue(t), map, map_id);
+                const as_c = if (s.mappedAs(t) != 0) try c.instantiateId(s.mappedAs(t), map, map_id) else 0;
+                const src = if (s.mappedSource(t) != 0) try c.instantiateId(s.mappedSource(t), map, map_id) else 0;
+                break :blk try c.reduceMapped(kp, con, val, as_c, src, s.mappedFlags(t));
             },
             else => t,
         };
@@ -3877,7 +3965,13 @@ const Checker = struct {
         c.inst_depth += 1;
         c.inst_count += 1;
         defer c.inst_depth -= 1;
-        if (try c.containsTypeParam(chk) or try c.containsTypeParam(extends_ty)) {
+        // Defer while a mapped key parameter is still unbound (M16b): a
+        // conditional in a mapped type's `as`/value branch (`P extends K ?
+        // never : P`) must stay symbolic until each key is materialized, or it
+        // would resolve against the still-abstract `mapped_param`.
+        if (try c.containsTypeParam(chk) or try c.containsTypeParam(extends_ty) or
+            try c.containsMappedParam(chk) or try c.containsMappedParam(extends_ty))
+        {
             return c.ts.makeConditional(chk, extends_ty, true_ty, false_ty, distributive);
         }
         return c.resolveConcreteConditional(chk, extends_ty, true_ty, false_ty);
@@ -4148,6 +4242,357 @@ const Checker = struct {
                 const ext = try c.substInfer(s.condExtends(t), ids, vals);
                 const tru = try c.substInfer(s.condTrue(t), ids, vals);
                 const fls = try c.substInfer(s.condFalse(t), ids, vals);
+                return c.reduceConditional(chk, ext, tru, fls, s.condDistributive(t));
+            },
+            .index_access => {
+                const obj = try c.substInfer(s.indexAccessObj(t), ids, vals);
+                const idx = try c.substInfer(s.indexAccessIndex(t), ids, vals);
+                return c.reduceIndexedAccess(obj, idx);
+            },
+            else => return t,
+        }
+    }
+
+    // =====================================================================
+    // mapped types (M16b)
+    // =====================================================================
+
+    /// Dense, stable id for a mapped type's key parameter `K`, keyed by the
+    /// mapped-type nodeKey. Mapped nodes are excluded from the type-node memo,
+    /// so the node may be re-evaluated — the id must be stable across calls.
+    fn mappedKeyId(c: *Checker, node: Node) Error!u32 {
+        const gop = try c.mapped_key_ids.getOrPut(c.ca(), c.nodeKey(node));
+        if (!gop.found_existing) {
+            gop.value_ptr.* = c.mapped_key_next;
+            c.mapped_key_next += 1;
+        }
+        return gop.value_ptr.*;
+    }
+
+    fn mappedTypeFromNode(c: *Checker, node: Node) Error!TypeId {
+        const d = c.tree.nodeData(node);
+        const m = c.tree.extraData(ast.MappedTypeData, d.lhs);
+        const key_name = try c.atomOfToken(m.key_name_token);
+        const key_id = try c.mappedKeyId(node);
+        const key_param = try c.ts.makeMappedParam(key_id, key_name);
+
+        var flags: u32 = m.flags;
+        // Homomorphic detection: the constraint is syntactically `keyof X`.
+        // Store `X` as the src_type (so its per-prop modifiers and array/tuple-
+        // ness can be preserved) rather than pre-evaluating `keyof X`, which
+        // would collapse to `never` while `X` is a generic parameter.
+        var src_type: TypeId = 0;
+        var constraint: TypeId = 0;
+        if (c.nodeTag(m.constraint) == .keyof_type) {
+            flags |= types.mapped_flag_homomorphic;
+            src_type = try c.typeFromTypeNode(c.tree.nodeData(m.constraint).lhs);
+        } else {
+            constraint = try c.typeFromTypeNode(m.constraint);
+        }
+
+        // The key parameter is in scope in the `as` and value branches only
+        // (never in the constraint), so evaluate those with it bound.
+        const saved_name = c.cur_mapped_key_name;
+        const saved_ty = c.cur_mapped_key_ty;
+        c.cur_mapped_key_name = key_name;
+        c.cur_mapped_key_ty = key_param;
+        const as_clause = if (m.as_type != null_node) try c.typeFromTypeNode(m.as_type) else 0;
+        const value = if (m.value != null_node) try c.typeFromTypeNode(m.value) else types.any_type;
+        c.cur_mapped_key_name = saved_name;
+        c.cur_mapped_key_ty = saved_ty;
+
+        return c.reduceMapped(key_param, constraint, value, as_clause, src_type, flags);
+    }
+
+    /// The single evaluation point for a mapped type (build time + each
+    /// instantiation): defer while the key set is still generic, else
+    /// materialize. Counted against the TS2589 depth/count budget.
+    fn reduceMapped(c: *Checker, key_param: TypeId, constraint: TypeId, value: TypeId, as_clause: TypeId, src_type: TypeId, flags: u32) Error!TypeId {
+        if (c.inst_depth > max_instantiation_depth or c.inst_count > max_instantiation_count) {
+            c.inst_limit_tripped = true;
+            try c.diagFmt(2589, c.inst_span, "Type instantiation is excessively deep and possibly infinite.", .{});
+            return types.error_type;
+        }
+        c.inst_depth += 1;
+        c.inst_count += 1;
+        defer c.inst_depth -= 1;
+        const homomorphic = flags & types.mapped_flag_homomorphic != 0;
+        // Deferral is decided by the *key set* only: the value/`as` branches may
+        // still be generic (they materialize into generic-typed props).
+        const key_generic = if (homomorphic)
+            try c.containsTypeParam(src_type)
+        else
+            try c.containsTypeParam(constraint);
+        if (key_generic) {
+            return c.ts.makeMapped(key_param, constraint, value, as_clause, src_type, flags);
+        }
+        return c.materializeMapped(key_param, constraint, value, as_clause, src_type, flags);
+    }
+
+    fn applyPropModifiers(base: u32, flags: u32) u32 {
+        var f = base;
+        if (flags & types.mapped_flag_readonly_add != 0) f |= types.prop_flag_readonly;
+        if (flags & types.mapped_flag_readonly_remove != 0) f &= ~types.prop_flag_readonly;
+        if (flags & types.mapped_flag_optional_add != 0) f |= types.prop_flag_optional;
+        if (flags & types.mapped_flag_optional_remove != 0) f &= ~types.prop_flag_optional;
+        return f;
+    }
+
+    fn applyElemModifiers(base: u32, flags: u32) u32 {
+        var f = base;
+        if (flags & types.mapped_flag_readonly_add != 0) f |= types.elem_flag_readonly;
+        if (flags & types.mapped_flag_readonly_remove != 0) f &= ~types.elem_flag_readonly;
+        if (flags & types.mapped_flag_optional_add != 0) f |= types.elem_flag_optional;
+        if (flags & types.mapped_flag_optional_remove != 0) f &= ~types.elem_flag_optional;
+        return f;
+    }
+
+    /// Materialize a concrete mapped type (its key set is known). Homomorphic
+    /// maps iterate the src_type's own members (preserving modifiers and
+    /// array/tuple-ness); others iterate the constraint's literal members.
+    fn materializeMapped(c: *Checker, key_param: TypeId, constraint: TypeId, value: TypeId, as_clause: TypeId, src_type: TypeId, flags: u32) Error!TypeId {
+        const s = &c.ts;
+        const key_id = s.mappedParamId(key_param);
+        const homomorphic = flags & types.mapped_flag_homomorphic != 0;
+
+        if (homomorphic) {
+            const saved_hi = c.homo_index_mode;
+            c.homo_index_mode = true;
+            defer c.homo_index_mode = saved_hi;
+            const src = try c.resolveStructural(src_type);
+            switch (s.kind(src)) {
+                .array => {
+                    // A homomorphic map over an array yields an array; the
+                    // element is the value with `K` bound to the number index.
+                    const elem = try c.substMappedKey(value, key_id, types.number_type);
+                    return s.makeArray(elem);
+                },
+                .tuple => {
+                    var elems: std.ArrayList(types.TupleElem) = .empty;
+                    defer elems.deinit(c.scratch());
+                    for (0..s.tupleLen(src)) |i| {
+                        const e = s.tupleElem(src, @intCast(i));
+                        const key_lit = try s.makeNumberLiteral(@floatFromInt(i), false);
+                        const et = try c.substMappedKey(value, key_id, key_lit);
+                        try elems.append(c.scratch(), .{ .ty = et, .flags = applyElemModifiers(e.flags, flags) });
+                    }
+                    return s.makeTuple(elems.items);
+                },
+                .object => {
+                    var props: std.ArrayList(types.Prop) = .empty;
+                    defer props.deinit(c.scratch());
+                    for (0..s.objectPropCount(src)) |i| {
+                        const p = s.objectProp(src, @intCast(i));
+                        const key_lit = try s.makeStringLiteral(p.name, false);
+                        const name = (try c.remapKey(as_clause, key_id, key_lit)) orelse continue;
+                        const pt = try c.substMappedKey(value, key_id, key_lit);
+                        try props.append(c.scratch(), .{ .name = name, .ty = pt, .flags = applyPropModifiers(p.flags, flags) });
+                    }
+                    return c.objectFromProps(props.items);
+                },
+                else => return types.empty_object_type,
+            }
+        }
+
+        // Non-homomorphic: the key set is the constraint's members.
+        var keys_buf = [_]TypeId{constraint};
+        const keys: []const TypeId = if (s.kind(constraint) == .union_type)
+            try c.memberList(constraint)
+        else
+            keys_buf[0..];
+
+        var props: std.ArrayList(types.Prop) = .empty;
+        defer props.deinit(c.scratch());
+        var sindex: TypeId = 0;
+        var nindex: TypeId = 0;
+        for (keys) |key_lit| {
+            switch (s.kind(key_lit)) {
+                .string => sindex = try c.substMappedKey(value, key_id, key_lit),
+                .number => nindex = try c.substMappedKey(value, key_id, key_lit),
+                .string_literal => {
+                    const name = (try c.remapKey(as_clause, key_id, key_lit)) orelse continue;
+                    const pt = try c.substMappedKey(value, key_id, key_lit);
+                    try props.append(c.scratch(), .{ .name = name, .ty = pt, .flags = applyPropModifiers(0, flags) });
+                },
+                .number_literal, .number_literal_fresh => {
+                    const nm = try c.numberLiteralAtom(key_lit);
+                    const pt = try c.substMappedKey(value, key_id, key_lit);
+                    try props.append(c.scratch(), .{ .name = nm, .ty = pt, .flags = applyPropModifiers(0, flags) });
+                },
+                else => {}, // non-key member (e.g. symbol) — skip
+            }
+        }
+        if (props.items.len == 0 and sindex == 0 and nindex == 0) return types.empty_object_type;
+        return s.makeObject(props.items, sindex, nindex, false);
+    }
+
+    /// Build an object from possibly-duplicate-named props (later wins), then
+    /// intern. `as` remapping can collide keys, so dedup by name here.
+    fn objectFromProps(c: *Checker, props: []const types.Prop) Error!TypeId {
+        var index: std.AutoHashMapUnmanaged(Atom, u32) = .empty;
+        defer index.deinit(c.scratch());
+        var out: std.ArrayList(types.Prop) = .empty;
+        defer out.deinit(c.scratch());
+        for (props) |p| {
+            if (index.get(p.name)) |i| {
+                out.items[i] = p;
+            } else {
+                try index.put(c.scratch(), p.name, @intCast(out.items.len));
+                try out.append(c.scratch(), p);
+            }
+        }
+        return c.ts.makeObject(out.items, 0, 0, false);
+    }
+
+    /// Resolve a mapped type's `as` remap for one src_type key. Returns the new
+    /// property-name atom, or `null` when the key should be filtered out (the
+    /// remap evaluates to `never` — the `Omit`/key-filter idiom). With no `as`
+    /// clause the original key name is kept. Template-literal renames are
+    /// deferred to M16c (a template `as` clause is not in the subset yet).
+    fn remapKey(c: *Checker, as_clause: TypeId, key_id: u32, key_lit: TypeId) Error!?Atom {
+        if (as_clause == 0) return c.ts.literalAtom(key_lit);
+        const nk0 = try c.substMappedKey(as_clause, key_id, key_lit);
+        const nk = try c.resolveStructural(nk0);
+        return switch (c.ts.kind(nk)) {
+            .never => null, // filtered
+            .string_literal => c.ts.literalAtom(nk),
+            .number_literal, .number_literal_fresh => try c.numberLiteralAtom(nk),
+            else => null, // non-static key (union/template/string) — dropped
+        };
+    }
+
+    fn numberLiteralAtom(c: *Checker, lit: TypeId) Error!Atom {
+        var buf: [32]u8 = undefined;
+        const v = c.ts.numberValue(lit);
+        const txt = if (v == @floor(v) and std.math.isFinite(v))
+            std.fmt.bufPrint(&buf, "{d}", .{@as(i64, @intFromFloat(v))}) catch return c.atom("0")
+        else
+            std.fmt.bufPrint(&buf, "{d}", .{v}) catch return c.atom("0");
+        return c.atom(txt);
+    }
+
+    /// `Obj[Idx]`: defer while the index is still a mapped key parameter (or
+    /// either side still mentions one), so a mapped value `T[K]` stays symbolic
+    /// until each key is materialized; otherwise resolve concretely.
+    fn reduceIndexedAccess(c: *Checker, obj: TypeId, idx: TypeId) Error!TypeId {
+        if (try c.containsMappedParam(idx) or try c.containsMappedParam(obj)) {
+            return c.ts.makeIndexAccess(obj, idx);
+        }
+        return c.indexedAccessType(obj, idx);
+    }
+
+    fn containsMappedParam(c: *Checker, t: TypeId) Error!bool {
+        const s = &c.ts;
+        return switch (s.kind(t)) {
+            .mapped_param => true,
+            .array => c.containsMappedParam(s.arrayElem(t)),
+            .index_access => (try c.containsMappedParam(s.indexAccessObj(t))) or (try c.containsMappedParam(s.indexAccessIndex(t))),
+            .union_type, .intersection, .overloads => blk: {
+                for (try c.memberList(t)) |m| {
+                    if (try c.containsMappedParam(m)) break :blk true;
+                }
+                break :blk false;
+            },
+            .tuple => blk: {
+                for (0..s.tupleLen(t)) |i| {
+                    if (try c.containsMappedParam(s.tupleElem(t, @intCast(i)).ty)) break :blk true;
+                }
+                break :blk false;
+            },
+            .object => blk: {
+                for (0..s.objectPropCount(t)) |i| {
+                    if (try c.containsMappedParam(s.objectProp(t, @intCast(i)).ty)) break :blk true;
+                }
+                break :blk false;
+            },
+            .function => blk: {
+                if (try c.containsMappedParam(s.fnReturn(t))) break :blk true;
+                for (0..s.fnParamCount(t)) |i| {
+                    if (try c.containsMappedParam(s.fnParam(t, @intCast(i)).ty)) break :blk true;
+                }
+                break :blk false;
+            },
+            .ref => blk: {
+                for (s.refArgs(t)) |a| {
+                    if (try c.containsMappedParam(a)) break :blk true;
+                }
+                break :blk false;
+            },
+            .conditional => blk: {
+                if (try c.containsMappedParam(s.condCheck(t))) break :blk true;
+                if (try c.containsMappedParam(s.condExtends(t))) break :blk true;
+                if (try c.containsMappedParam(s.condTrue(t))) break :blk true;
+                if (try c.containsMappedParam(s.condFalse(t))) break :blk true;
+                break :blk false;
+            },
+            else => false,
+        };
+    }
+
+    /// Replace the mapped key parameter (`key_id`) with a concrete key type
+    /// throughout `t`, reducing any `Obj[Idx]` that becomes concrete.
+    fn substMappedKey(c: *Checker, t: TypeId, key_id: u32, key_ty: TypeId) Error!TypeId {
+        if (!try c.containsMappedParam(t)) return t;
+        const s = &c.ts;
+        switch (s.kind(t)) {
+            .mapped_param => return if (s.mappedParamId(t) == key_id) key_ty else t,
+            .index_access => {
+                const obj = try c.substMappedKey(s.indexAccessObj(t), key_id, key_ty);
+                const idx = try c.substMappedKey(s.indexAccessIndex(t), key_id, key_ty);
+                return c.reduceIndexedAccess(obj, idx);
+            },
+            .array => return s.makeArray(try c.substMappedKey(s.arrayElem(t), key_id, key_ty)),
+            .union_type => {
+                var parts: std.ArrayList(TypeId) = .empty;
+                defer parts.deinit(c.scratch());
+                for (try c.memberList(t)) |m| try parts.append(c.scratch(), try c.substMappedKey(m, key_id, key_ty));
+                return s.makeUnion(c.scratch(), parts.items);
+            },
+            .intersection => {
+                var parts: std.ArrayList(TypeId) = .empty;
+                defer parts.deinit(c.scratch());
+                for (try c.memberList(t)) |m| try parts.append(c.scratch(), try c.substMappedKey(m, key_id, key_ty));
+                return s.makeIntersection(c.scratch(), parts.items);
+            },
+            .tuple => {
+                var elems: std.ArrayList(types.TupleElem) = .empty;
+                defer elems.deinit(c.scratch());
+                for (0..s.tupleLen(t)) |i| {
+                    const e = s.tupleElem(t, @intCast(i));
+                    try elems.append(c.scratch(), .{ .ty = try c.substMappedKey(e.ty, key_id, key_ty), .flags = e.flags });
+                }
+                return s.makeTuple(elems.items);
+            },
+            .object => {
+                var props: std.ArrayList(types.Prop) = .empty;
+                defer props.deinit(c.scratch());
+                for (0..s.objectPropCount(t)) |i| {
+                    const p = s.objectProp(t, @intCast(i));
+                    try props.append(c.scratch(), .{ .name = p.name, .ty = try c.substMappedKey(p.ty, key_id, key_ty), .flags = p.flags });
+                }
+                return s.makeObject(props.items, 0, 0, false);
+            },
+            .function => {
+                var params: std.ArrayList(types.Param) = .empty;
+                defer params.deinit(c.scratch());
+                for (0..s.fnParamCount(t)) |i| {
+                    const p = s.fnParam(t, @intCast(i));
+                    try params.append(c.scratch(), .{ .name = p.name, .ty = try c.substMappedKey(p.ty, key_id, key_ty), .flags = p.flags });
+                }
+                const ret = try c.substMappedKey(s.fnReturn(t), key_id, key_ty);
+                return s.makeFunctionThis(params.items, ret, s.fnTypeParams(t), s.fnFlags(t), null, s.fnThisType(t));
+            },
+            .ref => {
+                var args: std.ArrayList(TypeId) = .empty;
+                defer args.deinit(c.scratch());
+                for (try c.refArgsList(t)) |a| try args.append(c.scratch(), try c.substMappedKey(a, key_id, key_ty));
+                return s.makeRef(s.refSymbol(t), args.items);
+            },
+            .conditional => {
+                const chk = try c.substMappedKey(s.condCheck(t), key_id, key_ty);
+                const ext = try c.substMappedKey(s.condExtends(t), key_id, key_ty);
+                const tru = try c.substMappedKey(s.condTrue(t), key_id, key_ty);
+                const fls = try c.substMappedKey(s.condFalse(t), key_id, key_ty);
                 return c.reduceConditional(chk, ext, tru, fls, s.condDistributive(t));
             },
             else => return t,
@@ -4528,7 +4973,7 @@ const Checker = struct {
 
     fn isCompound(k: types.Kind) bool {
         return switch (k) {
-            .union_type, .intersection, .array, .tuple, .object, .function, .overloads, .ref, .class_value, .conditional => true,
+            .union_type, .intersection, .array, .tuple, .object, .function, .overloads, .ref, .class_value, .conditional, .mapped, .index_access => true,
             else => false,
         };
     }

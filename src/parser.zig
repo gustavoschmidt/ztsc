@@ -52,6 +52,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const scanner = @import("scanner.zig");
 const ast = @import("ast.zig");
+const types = @import("types.zig");
 const diagnostics = @import("diagnostics.zig");
 
 const TokTag = scanner.Tag;
@@ -3261,22 +3262,89 @@ const Parser = struct {
     }
 
     fn parseObjectType(p: *Parser) PE!Node {
-        // Mapped type `{ [K in T]: V }` — out of subset.
-        if (p.curTag() == .l_brace and p.peekTag(1) == .l_bracket and
+        const lb = try p.bump(); // '{'
+        // Mapped type `{ [K in C as N]: V }` (M16b): after an optional
+        // `readonly`/`+`/`-` modifier the shape is `[ ident in`. The `readonly`
+        // form is only distinguishable from a `readonly [k: K]: V` index
+        // signature by the token after the key ident (`in` vs `:`), which is
+        // why the `{` is consumed first (so the check fits the lookahead).
+        var flags: u32 = 0;
+        var is_mapped = false;
+        if (p.curTag() == .plus and p.peekTag(1) == .keyword_readonly) {
+            _ = try p.bump();
+            _ = try p.bump();
+            flags |= types.mapped_flag_readonly_add;
+            is_mapped = true;
+        } else if (p.curTag() == .minus and p.peekTag(1) == .keyword_readonly) {
+            _ = try p.bump();
+            _ = try p.bump();
+            flags |= types.mapped_flag_readonly_remove;
+            is_mapped = true;
+        } else if (p.curTag() == .keyword_readonly and p.peekTag(1) == .l_bracket and
             isIdentLike(p.peekTag(2)) and p.peekTag(3) == .keyword_in)
         {
-            const start = p.curIdx();
-            p.skipBalancedBraces();
-            return p.unsupportedFrom(start);
+            _ = try p.bump();
+            flags |= types.mapped_flag_readonly_add;
+            is_mapped = true;
+        } else if (p.curTag() == .l_bracket and isIdentLike(p.peekTag(1)) and p.peekTag(2) == .keyword_in) {
+            is_mapped = true;
         }
-        const lb = p.curIdx();
-        const members = try p.parseTypeMemberList();
+        if (is_mapped) return p.parseMappedType(lb, flags);
+        const members = try p.parseTypeMembersRest();
         return p.addNode(.{ .tag = .object_type, .main_token = lb, .data = .{ .lhs = members.start, .rhs = members.end } });
+    }
+
+    /// Parse a mapped type body after `{` and any leading readonly modifier
+    /// have been consumed (`flags` carries the readonly modifier already).
+    fn parseMappedType(p: *Parser, lb: u32, flags_in: u32) PE!Node {
+        var flags = flags_in;
+        _ = try p.expect(.l_bracket, .expected_type);
+        const key_name_token = try p.expectIdentLike();
+        _ = try p.expect(.keyword_in, .expected_type);
+        const constraint = try p.parseType();
+        // `as N` key remap (optional).
+        var as_type: Node = null_node;
+        if (p.curTag() == .keyword_as) {
+            _ = try p.bump();
+            as_type = try p.parseType();
+        }
+        _ = try p.expect(.r_bracket, .expected_r_bracket);
+        // optional modifier: `?` / `+?` / `-?`.
+        if (p.curTag() == .plus and p.peekTag(1) == .question) {
+            _ = try p.bump();
+            _ = try p.bump();
+            flags |= types.mapped_flag_optional_add;
+        } else if (p.curTag() == .minus and p.peekTag(1) == .question) {
+            _ = try p.bump();
+            _ = try p.bump();
+            flags |= types.mapped_flag_optional_remove;
+        } else if (p.curTag() == .question) {
+            _ = try p.bump();
+            flags |= types.mapped_flag_optional_add;
+        }
+        var value: Node = null_node;
+        if (try p.eat(.colon) != null) value = try p.parseType();
+        _ = try p.eat(.semicolon);
+        _ = try p.expect(.r_brace, .expected_r_brace);
+        const extra = try p.addExtra(ast.MappedTypeData{
+            .key_name_token = key_name_token,
+            .constraint = constraint,
+            .as_type = as_type,
+            .value = value,
+            .flags = flags,
+        });
+        return p.addNode(.{ .tag = .mapped_type_node, .main_token = lb, .data = .{ .lhs = extra, .rhs = 0 } });
     }
 
     /// `{ member; member, ... }` shared by interfaces and object types.
     fn parseTypeMemberList(p: *Parser) PE!ast.SubRange {
         _ = try p.expect(.l_brace, .expected_l_brace);
+        return p.parseTypeMembersRest();
+    }
+
+    /// The member loop after the opening `{` has been consumed. Shared with the
+    /// mapped-type detection path, which must consume `{` before deciding.
+    fn parseTypeMembersRest(p: *Parser) PE!ast.SubRange {
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
         while (p.curTag() != .r_brace and p.curTag() != .eof) {
@@ -4238,9 +4306,19 @@ test "decorators: parsed into the AST (no longer out of subset)" {
     );
 }
 
-test "unsupported: mapped and template literal types" {
-    try expectDiagCount("type M = { [K in Keys]: boolean };", 1);
+test "unsupported: template literal types" {
     try expectDiagCount("type T = `prefix-${string}`;", 1);
+}
+
+test "mapped types parse in subset (M16b)" {
+    try expectDiagCount("type M = { [K in Keys]: boolean };", 0);
+    try expectDiagCount("type P<T> = { [K in keyof T]?: T[K] };", 0);
+    try expectDiagCount("type R<T> = { readonly [K in keyof T]: T[K] };", 0);
+    try expectDiagCount("type Q<T> = { -readonly [K in keyof T]-?: T[K] };", 0);
+    try expectDiagCount("type O<T, X> = { [K in keyof T as X]: T[K] };", 0);
+    try expectSExpr("type M = { [K in Keys]: boolean };",
+        \\(type_alias M (mapped_type_node (identifier Keys) (identifier boolean)))
+    );
 }
 
 test "conditional types and infer parse in subset (M16a)" {
@@ -4343,7 +4421,7 @@ test "jsx name rescan does not disturb subtraction lexing" {
 test "unsupported constructs still leave following code parsable" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const src = "type M = { [K in Keys]: boolean };\nconst after: number = 1;";
+    const src = "type T = `prefix-${string}`;\nconst after: number = 1;";
     const tree = try parse(arena.allocator(), src);
     try testing.expect(tree.diagnostics.len >= 1);
     const got = try dumpSource(arena.allocator(), src);

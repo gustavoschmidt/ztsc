@@ -1028,18 +1028,36 @@ identically; benchmarks track types/line, RSS, and instantiation counts.
   a single-level infer scope; `Array<infer U>` inference uses a single-generic-
   arg-vs-array/tuple heuristic. Prerequisite for M16b/c — now unblocked.
 
-- **M16b — Mapped types (+ `as` key remapping).** `{ [K in Keys]: T }` with
-  modifiers (`readonly`, `?`, and the `+`/`-` add/remove forms) and `as`
-  key remapping (`{ [K in Keys as NewKey]: T }`). Mapped-type syntax is
-  currently skipped as out-of-subset (parser.zig:~3105), so both parser and
-  checker are net-new. Complexity: (1) *homomorphic* mapped types
-  (`{ [K in keyof T]: … }`) must preserve the source's modifiers and
-  tuple/array-ness; (2) key remapping produces filtered (`never`-drops) and
-  renamed keys, which needs template-literal evaluation for the common
-  rename patterns (couples to M16c); (3) interaction with `keyof` and
-  generic index access; (4) memory — a mapped type over a large key union
-  is a materialization explosion vector, so laziness/hash-consing matter
-  most here.
+- **M16b — Mapped types (+ `as` key remapping).** ✅ DONE (2026-07-14,
+  conformance 340→349). Three net-new `types.zig` kinds mirroring M16a's
+  `.conditional`: `.mapped` (extra `[key_param, constraint, value, as_clause,
+  source, flags]`; the flags word is repeated into `extra` so modifiers
+  participate in hash-cons identity — verified in `shapeWords`), `.mapped_param`
+  (dense id + name atom, like `.infer_var`; not a `.type_param` so it doesn't
+  gate outer deferral), and a scoped `.index_access` (deferred `T[K]` where the
+  index is a `mapped_param` — a down-payment on M16d, plain generic `T[K]` left
+  at prior behavior). Single reduction point `reduceMapped` (parallels
+  `reduceConditional`): defers while the key set is generic, else
+  `materializeMapped`, counted against the M15 `inst_depth`/`inst_count` budget.
+  All landed: (1) concrete materialization (literal-union keys → props;
+  `string`/`number` → index signatures); (2) **homomorphic** `{[K in keyof T]}`
+  detected syntactically, storing the source `X` (never pre-evaluating `keyof X`
+  to `never` while generic), preserving per-prop modifiers AND tuple/array-ness,
+  with a `homo_index_mode` so `T[K]` yields the source prop's *declared* type
+  (`Required<{x?:T}>[x]===T`); (3) `+`/`-` modifiers incl. `-?` (strips optional
+  *and* `undefined`) and `-readonly`/`+readonly` (TS2540 on write); (4) `as`
+  remap via `remapKey` — `never`→filter (Omit idiom, TS2339 on dropped keys),
+  literal→rename, collision-dedup; (5) deferral through `instantiateId`'s
+  `.mapped`/`.index_access` arms (M15 memo), mapped nodes excluded from the
+  `(file,node)` type-node memo. `Partial`/`Required`/`Readonly`/`Pick`/`Omit`
+  reimplemented locally are the differential acceptance bar. 9 cases
+  (`test/conformance/mapped/001`–`009`). Multi byte-identical (dormant on JS
+  subset); zod/hono mapped-heavy `.d.ts` resolve with no crash/panic/explosion.
+  **Deferred (expected):** template-literal `as` renames (`` as `get${K}` ``) →
+  M16c (graceful "not yet supported", no crash); full generic indexed access +
+  `keyof` over generic/mapped types → M16d. Termination on pathological/self-
+  referential mapped types holds via the M15 depth budget (same lenient TS2589
+  divergence as M16a). Unblocks M16c/d.
 
 - **M16c — Template-literal types.** `` `prefix-${T}-suffix` `` types, the
   intrinsic string transforms (`Uppercase`/`Lowercase`/`Capitalize`/

@@ -153,9 +153,35 @@ pub const Kind = enum(u8) {
     /// only while the check type is still generic; resolved on instantiation.
     /// extra[a..]: [check, extends, true, false].
     conditional,
+    /// The key parameter `K` of a mapped type (`{ [K in …]: … }`, M16b).
+    /// a = a dense id (unique per mapped-type node), b = the name atom (for
+    /// display). Behaves like a locally-bound parameter of the mapped type:
+    /// substituted with each concrete key literal at materialization. Not a
+    /// "free type parameter" for deferral purposes (like `infer_var`).
+    mapped_param,
+    /// Deferred indexed access `Obj[Idx]` (M16b, minimal — a down-payment on
+    /// M16d). a = the object type, b = the index type. Interned by
+    /// `indexedAccessType` only while `Idx` is a mapped key parameter (so a
+    /// mapped value `T[K]` stays symbolic until each key is materialized).
+    index_access,
+    /// Deferred mapped type `{ [K in C] V }` (M16b). a = extra index,
+    /// b = modifier flags. Interned only while the key set is still generic
+    /// (constraint / homomorphic source mentions an outer type param);
+    /// resolved to a concrete object on instantiation.
+    /// extra[a..]: [key_param, constraint, value, as_clause, source, flags].
+    mapped,
 };
 
 pub const cond_flag_distributive: u32 = 1;
+
+// Mapped-type modifier flags (M16b), stored in a mapped type's `data_b` (and
+// repeated as its final extra word so they participate in hash-cons identity).
+// Set by the parser (`+`/`-`/bare) and interpreted by the checker.
+pub const mapped_flag_readonly_add: u32 = 1; // `+readonly` / `readonly`
+pub const mapped_flag_readonly_remove: u32 = 2; // `-readonly`
+pub const mapped_flag_optional_add: u32 = 4; // `+?` / `?`
+pub const mapped_flag_optional_remove: u32 = 8; // `-?`
+pub const mapped_flag_homomorphic: u32 = 16; // constraint was `keyof T`
 
 pub const obj_flag_fresh: u32 = 1;
 pub const prop_flag_optional: u32 = 1;
@@ -524,6 +550,47 @@ pub const Store = struct {
         return s.dataB(id) & cond_flag_distributive != 0;
     }
 
+    pub fn mappedParamId(s: *const Store, id: TypeId) u32 {
+        return s.dataA(id);
+    }
+    pub fn mappedParamName(s: *const Store, id: TypeId) Atom {
+        return s.dataB(id);
+    }
+
+    pub fn indexAccessObj(s: *const Store, id: TypeId) TypeId {
+        return s.dataA(id);
+    }
+    pub fn indexAccessIndex(s: *const Store, id: TypeId) TypeId {
+        return s.dataB(id);
+    }
+
+    pub fn mappedKeyParam(s: *const Store, id: TypeId) TypeId {
+        if (id < s.base_len) return s.base.?.mappedKeyParam(id);
+        return s.extra.items[s.dataA(id)];
+    }
+    pub fn mappedConstraint(s: *const Store, id: TypeId) TypeId {
+        if (id < s.base_len) return s.base.?.mappedConstraint(id);
+        return s.extra.items[s.dataA(id) + 1];
+    }
+    pub fn mappedValue(s: *const Store, id: TypeId) TypeId {
+        if (id < s.base_len) return s.base.?.mappedValue(id);
+        return s.extra.items[s.dataA(id) + 2];
+    }
+    pub fn mappedAs(s: *const Store, id: TypeId) TypeId {
+        if (id < s.base_len) return s.base.?.mappedAs(id);
+        return s.extra.items[s.dataA(id) + 3];
+    }
+    pub fn mappedSource(s: *const Store, id: TypeId) TypeId {
+        if (id < s.base_len) return s.base.?.mappedSource(id);
+        return s.extra.items[s.dataA(id) + 4];
+    }
+    pub fn mappedFlags(s: *const Store, id: TypeId) u32 {
+        return s.dataB(id);
+    }
+    pub fn mappedHomomorphic(s: *const Store, id: TypeId) bool {
+        return s.mappedFlags(id) & mapped_flag_homomorphic != 0;
+    }
+
     pub fn typeParamSymbol(s: *const Store, id: TypeId) u32 {
         return s.dataA(id);
     }
@@ -612,6 +679,7 @@ pub const Store = struct {
             },
             .ref => return s.extra.items[a .. a + 1 + b],
             .conditional => return s.extra.items[a .. a + 4],
+            .mapped => return s.extra.items[a .. a + 6],
             else => {
                 buf[0] = a;
                 buf[1] = b;
@@ -689,7 +757,7 @@ pub const Store = struct {
                 try s.extra.appendSlice(s.alloc, words);
                 try s.appendRaw(kind_, start, @intCast(s.extra.items.len));
             },
-            .tuple, .object, .function, .ref, .conditional => {
+            .tuple, .object, .function, .ref, .conditional, .mapped => {
                 const start: u32 = @intCast(s.extra.items.len);
                 try s.extra.appendSlice(s.alloc, words);
                 try s.appendRaw(kind_, start, b_count);
@@ -861,6 +929,22 @@ pub const Store = struct {
     pub fn makeConditional(s: *Store, check: TypeId, extends: TypeId, true_ty: TypeId, false_ty: TypeId, distributive: bool) Error!TypeId {
         const flags: u32 = if (distributive) cond_flag_distributive else 0;
         return s.internType(.conditional, &.{ check, extends, true_ty, false_ty }, flags);
+    }
+
+    pub fn makeMappedParam(s: *Store, id: u32, name: Atom) Error!TypeId {
+        return s.internType(.mapped_param, &.{ id, name }, 0);
+    }
+
+    pub fn makeIndexAccess(s: *Store, obj: TypeId, idx: TypeId) Error!TypeId {
+        return s.internType(.index_access, &.{ obj, idx }, 0);
+    }
+
+    /// Intern a deferred mapped type. `flags` carries the modifier bits and the
+    /// homomorphic marker; it is stored both in `data_b` and (via the last
+    /// word) in the identity payload so two mapped types differing only in a
+    /// modifier do not hash-cons together.
+    pub fn makeMapped(s: *Store, key_param: TypeId, constraint: TypeId, value: TypeId, as_clause: TypeId, source: TypeId, flags: u32) Error!TypeId {
+        return s.internType(.mapped, &.{ key_param, constraint, value, as_clause, source, flags }, flags);
     }
 
     pub fn makeOverloads(s: *Store, fns: []const TypeId) Error!TypeId {

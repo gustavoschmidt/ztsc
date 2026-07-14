@@ -497,12 +497,21 @@ pub const Tag = enum(u8) {
     /// token (a TokenIndex, not a node); rhs unused. Only meaningful inside a
     /// conditional type's extends clause.
     infer_type,
+    /// `{ [K in C as N]: V }` mapped type (M16b). main_token = `{`; lhs = extra
+    /// → MappedTypeData. The key parameter `K` is scoped to the `as` and value
+    /// branches (not the constraint).
+    mapped_type_node,
 };
 
 pub const CondExpr = struct { then_expr: Node, else_expr: Node };
 /// Payload for a `conditional_type` node (M16a): the three type nodes other
 /// than the check type (which is the node's `data.lhs`).
 pub const ConditionalType = struct { extends_type: Node, true_type: Node, false_type: Node };
+/// Payload for a `mapped_type_node` (M16b). `key_name_token` names `K`;
+/// `constraint` is the `in` operand; `as_type` is the optional remap (or
+/// `null_node`); `value` is the property type (or `null_node`); `flags` carries
+/// the modifier bits (`mapped_flag_*` in types.zig).
+pub const MappedTypeData = struct { key_name_token: TokenIndex, constraint: Node, as_type: Node, value: Node, flags: u32 };
 pub const IfElse = struct { then_stmt: Node, else_stmt: Node };
 pub const For = struct { init: Node, cond: Node, update: Node }; // all optional
 pub const ForInOf = struct { left: Node, right: Node };
@@ -917,6 +926,12 @@ pub const Ast = struct {
                     it.push(e.extends_type);
                     it.push(e.true_type);
                     it.push(e.false_type);
+                },
+                .mapped_type_node => {
+                    const e = a.extraData(MappedTypeData, d.lhs);
+                    it.push(e.constraint);
+                    it.push(e.as_type);
+                    it.push(e.value);
                 },
                 .for_stmt => {
                     const e = a.extraData(For, d.lhs);
