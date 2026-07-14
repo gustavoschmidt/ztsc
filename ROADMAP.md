@@ -26,7 +26,7 @@ commit messages before that date use the old numbers.)
 ### Release policy — the public v0.0.1
 
 **There are no partial public releases.** The first published version,
-**v0.0.1**, ships only when the whole M11–M20 sequence below is done. Its
+**v0.0.1**, ships only when the whole M11–M21 sequence below is done. Its
 definition is exactly this: a user runs **`bunx ztsc <root-files>`** and
 ztsc type-checks those files and *everything they depend on* — including
 libraries — with most of TypeScript's functionality, fast and with low
@@ -248,7 +248,7 @@ them.)
 
 ## 5. The road to the public v0.0.1
 
-M11–M16 are done (per-milestone records below). **Four remain: M17–M20.**
+M11–M16 are done (per-milestone records below). **Five remain: M17–M21.**
 The numbering has moved twice:
 
 - **2026-07-13** — linear renumbering after the backend-first decision
@@ -260,15 +260,18 @@ The numbering has moved twice:
   this-typing, decorators); old M12 → **M15**; old M13a–d → **M16a–d**;
   old M14 (ship) → M17.
 - **2026-07-14** — post-M16 re-plan: the ship milestone moved **M17 →
-  M20**, and three new milestones were inserted ahead of it out of the
-  debt M14–M16 surfaced and deliberately deferred: **M17** (correctness
-  debt: the index-signature assignability hole, raw-file-args
-  nondeterminism, predicate assignability, deferral triage), **M18** (the
-  real lib: call/construct signatures, full ES lib surface, real
-  `@types/node` acceptance), **M19** (the deferred M14.5 substrate
-  payload: structural display order, frozen-store payload, pre-parsed lib
-  blob). Notes and commit messages from 2026-07-13/14 that say "M17"
-  mean the ship milestone, now **M20**.
+  M21**, and four new milestones were inserted ahead of it: three out of
+  the debt M14–M16 surfaced and deliberately deferred — **M17**
+  (correctness debt: the index-signature assignability hole,
+  raw-file-args nondeterminism, predicate assignability, deferral
+  triage), **M18** (the real lib: call/construct signatures, full ES lib
+  surface, real `@types/node` acceptance), **M19** (the deferred M14.5
+  substrate payload: structural display order, frozen-store payload,
+  pre-parsed lib blob) — plus **M20** (pre-publish polish: license, error
+  output, README, docs cleanup — pulled forward from the post-v0.0.1
+  list so the repo v0.0.1 points at is presentable on day one). Notes
+  and commit messages from 2026-07-13/14 that say "M17" mean the ship
+  milestone, now **M21**.
 
 Order rationale (original sequence): M11 first because `@types/node`
 gates the backend goal and everything real depends on it; M12 (substrate)
@@ -281,8 +284,9 @@ M17 first because both of its headline items are wrong-answer/
 nondeterminism bugs on the exact `bunx ztsc <root-files>` path the
 release advertises; M18 before M19 because the real lib is what finally
 makes M19's wins measurable (and M19's blob + frozen store is what makes
-M18's real lib affordable); M20 ships only when the release gate holds on
-the real-lib configuration. Lessons from prior art bake the sequence: stc
+M18's real lib affordable); M20 makes the repo and its docs presentable
+once the numbers they must show are real; M21 ships only when the release
+gate holds on the real-lib configuration. Lessons from prior art bake the sequence: stc
 and Ezno (Rust) died on tsc-compatibility, not performance — the
 differential conformance discipline is non-negotiable as the surface
 grows.
@@ -1154,7 +1158,7 @@ distributivity → M16b mapped → M16c template-literal → M16d recursive/inde
 keyof. Conformance 340→365, all differential vs tsc 5.5.4, multi byte-identical
 throughout, real `.d.ts` (zod/hono/date-fns) resolve without crash. Next: M17
 (correctness debt — the pre-existing index-signature assignability gap
-surfaced in M16d is its lead item); shipping is **M20**.
+surfaced in M16d is its lead item); shipping is **M21**.
 
 ### M17 — Correctness debt: wrong answers & nondeterminism on the release path
 
@@ -1241,7 +1245,7 @@ Context: the embedded lib is still the trimmed ~9 KB ES-core surface
 built in M9, chosen when most of the real `lib.*.d.ts` was out of subset.
 M16 changed that: conditional/mapped/template-literal types — what the
 real lib's `Awaited`/`Partial`/`Parameters`/… are made of — now check.
-Real projects cannot be validated (M20) against a toy lib: they drown in
+Real projects cannot be validated (M21) against a toy lib: they drown in
 TS2339/TS2304 for `Array.prototype` methods, ES2015+ globals, and
 `Awaited`-style helpers. This milestone lands the one semantic feature
 the real lib's own declarations require, makes the lib real, and
@@ -1319,7 +1323,7 @@ every checker now re-expands and permanently interns the full real-lib
 type population — the largest population in the program, duplicated up to
 N× (the lib-free measurement was already +15.5% types at N=4 / +23% at
 N=8) — and startup pays a full real-lib parse+bind on every run. This
-milestone is the RSS and cold-start claw-back that makes M20's release
+milestone is the RSS and cold-start claw-back that makes M21's release
 gate (**≤50% of tsgo RSS**) hold on the real-lib configuration. Three
 pieces, in dependency order:
 
@@ -1365,9 +1369,67 @@ peak RSS at N=4 within a small constant of N=1 on the multi corpus
 **and** the real-`@types/node` corpus; blob-load vs source-parse
 cold-start recorded in BENCHMARKS.md; wall/RSS vs tsgo re-measured — this
 is the last stop before the release gate, so if ≤50%-of-tsgo doesn't hold
-here, the fix happens here, not in M20.
+here, the fix happens here, not in M21.
 
-### M20 — Ship it: bunx distribution + release (was M17)
+### M20 — Pre-publish polish: license, error output, README, docs cleanup
+
+Everything a first-time visitor touches. Originally earmarked for *after*
+v0.0.1; pulled forward on 2026-07-14 so the repo that v0.0.1 points at is
+presentable on day one. Scheduled after M19 deliberately: the README's
+headline graph needs the *real-lib* numbers (M18/M19), not today's
+trimmed-lib ones. Items, in working order:
+
+1. **MIT license.** Add a `LICENSE` file (MIT, Gustavo Schmidt) and the
+   `"license": "MIT"` field to the npm package metadata M21 publishes
+   (npm warns on unlicensed packages; do it here so M21's publish step is
+   mechanical).
+2. **Better error output.** The current renderer (render.zig) deliberately
+   copies tsc's format — that was for differential comparability, not a
+   design choice; the goal is to do better than a straight tsc clone
+   (clearer code frames, labeled spans, color discipline, related-info
+   grouping — survey what biome/rustc do well before designing).
+   **Constraint:** the differential conformance harness and the
+   byte-identical `--checkers`/oracle invariants compare rendered
+   diagnostics — keep the tsc-compatible renderer available (a
+   `--pretty=tsc`-style flag or internal mode) and pin the harness to it,
+   so the new default format never touches the differential machinery.
+   Diagnostic *content* (codes, spans, message text) stays tsc-matching —
+   only presentation changes.
+3. **README rewrite**, in exactly this order (decision recorded
+   2026-07-13):
+   1. Straightforward one-liner: "fast and low-memory TypeScript checker
+      written in Zig with zero external deps."
+   2. Perf + memory graph vs a **known real project** (pick one — a
+      single concrete, recognizable project beats synthetic tables; the
+      data comes from the M18/M19 real-corpus and release-gate runs).
+   3. Installation & usage — **bun and npm focus** (`bunx ztsc`,
+      `npx ztsc`, the tsconfig/`-p`/file-args forms).
+   4. Future features — incremental checking, LSP, new primitives (§8 is
+      the source; fold its content in before the ROADMAP is deleted in
+      item 5).
+   5. How to build locally (the Zig story) — last.
+4. **Benchmark docs rework** — BENCHMARKS.md leads with **real projects**
+   (the `bench/corpus/real` set and the M21 release-gate projects);
+   synthetic corpora (small/medium/multi/skewed/bigfan/deps/generics)
+   move to an appendix as methodology/regression infrastructure.
+5. **Remove ROADMAP.md and CLAUDE.md** (the last M20 commit, after
+   everything above): the public repo should carry a README, not internal
+   planning docs. Two things must be ported first, or they're lost:
+   (a) ROADMAP §8 (post-v0.0.1 plans) feeds README §4, and the M21
+   checklist below must survive somewhere actionable (agent memory or a
+   tracking issue) since deleting this file deletes it; (b) CLAUDE.md is
+   the per-session agent instruction file — its build/bench commands go
+   into the README's build section, and the **bench-before-every-commit
+   regression rule** moves to agent memory so it keeps being enforced
+   after the file is gone.
+
+**Gate:** differential conformance still green with the harness pinned to
+the tsc-compat renderer; multi/deps byte-identical across N with the new
+default renderer (its output is deterministic too); bench flat (rendering
+is off the hot path — diagnostics only); README claims spot-checked
+against BENCHMARKS.md numbers (no stale or aspirational figures).
+
+### M21 — Ship it: bunx distribution + release (was M17/M20)
 
 Batch checking only — no watch mode, no LSP (post-v0.0.1, §8).
 
