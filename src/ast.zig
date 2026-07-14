@@ -489,9 +489,20 @@ pub const Tag = enum(u8) {
     /// `import("m").T<A>` wraps that in a `type_ref`, and `typeof import("m")`
     /// wraps it in a `typeof_type`.
     import_type,
+    /// `C extends E ? T : F` conditional type (M16a). main_token = `extends`
+    /// keyword; lhs = check type node, rhs = extra→ConditionalType (extends /
+    /// true / false branches). `infer` binders live inside the extends branch.
+    conditional_type,
+    /// `infer V` (M16a). main_token = `infer` keyword; lhs = the binder's name
+    /// token (a TokenIndex, not a node); rhs unused. Only meaningful inside a
+    /// conditional type's extends clause.
+    infer_type,
 };
 
 pub const CondExpr = struct { then_expr: Node, else_expr: Node };
+/// Payload for a `conditional_type` node (M16a): the three type nodes other
+/// than the check type (which is the node's `data.lhs`).
+pub const ConditionalType = struct { extends_type: Node, true_type: Node, false_type: Node };
 pub const IfElse = struct { then_stmt: Node, else_stmt: Node };
 pub const For = struct { init: Node, cond: Node, update: Node }; // all optional
 pub const ForInOf = struct { left: Node, right: Node };
@@ -777,6 +788,8 @@ pub const Ast = struct {
                 .import_type,
                 // `unique symbol` — a leaf type operator, no child nodes.
                 .unique_symbol_type,
+                // `infer V` — lhs is the binder's name *token*, not a node.
+                .infer_type,
                 => {},
 
                 // lhs only.
@@ -897,6 +910,13 @@ pub const Ast = struct {
                     const e = a.extraData(IfElse, d.rhs);
                     it.push(e.then_stmt);
                     it.push(e.else_stmt);
+                },
+                .conditional_type => {
+                    it.push(d.lhs); // check type
+                    const e = a.extraData(ConditionalType, d.rhs);
+                    it.push(e.extends_type);
+                    it.push(e.true_type);
+                    it.push(e.false_type);
                 },
                 .for_stmt => {
                     const e = a.extraData(For, d.lhs);

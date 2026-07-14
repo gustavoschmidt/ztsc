@@ -2916,6 +2916,34 @@ const Parser = struct {
     // =====================================================================
 
     fn parseType(p: *Parser) PE!Node {
+        const ty = try p.parseNonConditionalType();
+        // Conditional type `C extends E ? T : F` (M16a). The `extends` clause
+        // is a non-conditional type (a nested conditional there needs
+        // parentheses, matching tsc); the two branches are full types. The
+        // `spec == 0` guard keeps `extends` unclaimed while speculatively
+        // parsing a function type, exactly as before.
+        if (p.curTag() == .keyword_extends and !p.nlBefore() and p.spec == 0) {
+            const ext_kw = try p.bump();
+            const extends_ty = try p.parseNonConditionalType();
+            _ = try p.expect(.question, .expected_colon);
+            const true_ty = try p.parseType();
+            _ = try p.expect(.colon, .expected_colon);
+            const false_ty = try p.parseType();
+            const extra = try p.addExtra(ast.ConditionalType{
+                .extends_type = extends_ty,
+                .true_type = true_ty,
+                .false_type = false_ty,
+            });
+            return p.addNode(.{ .tag = .conditional_type, .main_token = ext_kw, .data = .{ .lhs = ty, .rhs = extra } });
+        }
+        return ty;
+    }
+
+    /// A type minus a trailing conditional: the function-type forms plus a
+    /// union type. Shared by `parseType` (for the check and extends clauses of
+    /// a conditional) so a conditional's `extends` clause and check type both
+    /// admit function types without recursing into conditional parsing.
+    fn parseNonConditionalType(p: *Parser) PE!Node {
         // Function type `(params) => R` / `<T>(params) => R`; constructor
         // type `new (...) => R` is out of subset.
         switch (p.curTag()) {
@@ -2939,21 +2967,7 @@ const Parser = struct {
             },
             else => {},
         }
-        const ty = try p.parseUnionType();
-        // Conditional type `T extends U ? X : Y` — out of subset.
-        if (p.curTag() == .keyword_extends and !p.nlBefore() and p.spec == 0) {
-            const start_tok = p.nodes.items(.main_token)[ty];
-            _ = try p.bump();
-            _ = try p.parseUnionType();
-            _ = try p.expect(.question, .expected_colon);
-            _ = try p.parseType();
-            _ = try p.expect(.colon, .expected_colon);
-            _ = try p.parseType();
-            // `start_tok` is an ordinary type token, so classification can't
-            // recover this — the census's key M16a signal — pass it explicitly.
-            return p.unsupportedKindFrom(start_tok, .conditional_type);
-        }
-        return ty;
+        return p.parseUnionType();
     }
 
     fn tryParseFunctionType(p: *Parser) PE!?Node {
@@ -3052,10 +3066,17 @@ const Parser = struct {
                 return p.unsupportedFrom(start);
             },
             .keyword_infer => {
-                // infer T — out of subset.
-                const start = try p.bump();
-                _ = try p.parseTypeOperator();
-                return p.unsupportedFrom(start);
+                // `infer V` (M16a): a binder introduced in a conditional
+                // type's extends clause. A trailing `extends` constraint
+                // (`infer V extends C`) is out of subset — consume the
+                // constraint so the surrounding conditional still parses.
+                const kw = try p.bump();
+                const name = try p.expectIdentLike();
+                if (p.curTag() == .keyword_extends and !p.nlBefore()) {
+                    _ = try p.bump();
+                    _ = try p.parseNonConditionalType();
+                }
+                return p.addNode(.{ .tag = .infer_type, .main_token = kw, .data = .{ .lhs = name, .rhs = 0 } });
             },
             else => return p.parsePostfixType(),
         }
@@ -4217,14 +4238,21 @@ test "decorators: parsed into the AST (no longer out of subset)" {
     );
 }
 
-test "unsupported: conditional and mapped types" {
-    try expectDiagCount("type C<T> = T extends string ? 1 : 0;", 1);
+test "unsupported: mapped and template literal types" {
     try expectDiagCount("type M = { [K in Keys]: boolean };", 1);
+    try expectDiagCount("type T = `prefix-${string}`;", 1);
 }
 
-test "unsupported: template literal types and infer" {
-    try expectDiagCount("type T = `prefix-${string}`;", 1);
-    try expectDiagCount("type E<T> = T extends Array<infer U> ? U : never;", 1);
+test "conditional types and infer parse in subset (M16a)" {
+    // Conditional types and `infer` binders are now real AST nodes.
+    try expectDiagCount("type C<T> = T extends string ? 1 : 0;", 0);
+    try expectDiagCount("type E<T> = T extends Array<infer U> ? U : never;", 0);
+    try expectDiagCount("type R<T> = T extends (...a: any[]) => infer R ? R : never;", 0);
+    // Nested conditional in the true branch.
+    try expectDiagCount("type N<T> = T extends string ? T extends \"a\" ? 1 : 2 : 3;", 0);
+    try expectSExpr("type C<T> = T extends string ? 1 : 0;",
+        \\(type_alias C (type_param T) (conditional_type (identifier T) (identifier string) (number_literal 1) (number_literal 0)))
+    );
 }
 
 test "unsupported: import= and export=" {
@@ -4315,7 +4343,7 @@ test "jsx name rescan does not disturb subtraction lexing" {
 test "unsupported constructs still leave following code parsable" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const src = "type C<T> = T extends string ? 1 : 0;\nconst after: number = 1;";
+    const src = "type M = { [K in Keys]: boolean };\nconst after: number = 1;";
     const tree = try parse(arena.allocator(), src);
     try testing.expect(tree.diagnostics.len >= 1);
     const got = try dumpSource(arena.allocator(), src);

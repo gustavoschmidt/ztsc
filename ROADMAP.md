@@ -998,19 +998,35 @@ synthetic subset corpora. Every sub-milestone ships type-level torture
 conformance vs tsc plus real `.d.ts` files from top libraries checked
 identically; benchmarks track types/line, RSS, and instantiation counts.
 
-- **M16a — Conditional types + `infer` + distributivity.** `T extends U ? X
-  : Y`, `infer V` capture, and distribution over a naked type-parameter
-  union (`T extends any ? … : …` applied member-wise). Parse nodes are
-  already produced-then-discarded (parser.zig:~2513), so the front-end lift
-  is small; the checker work is the substance. Complexity: (1) *deferral* —
-  when the checked type is still generic the whole conditional stays
-  unresolved and must be interned as a deferred type, resolved on
-  instantiation; (2) `infer` scoping and the assignability probe that binds
-  it (inference from the `extends` clause, with multiple `infer` sites and
-  same-name unions/intersections); (3) distributivity rules (naked type
-  param vs wrapped `[T]`), and (4) assignability *between* conditional
-  types (identity + related-when-branches-related). Prerequisite for M16b/c
-  because mapped/template types lean on conditional evaluation.
+- **M16a — Conditional types + `infer` + distributivity.** ✅ DONE (2026-07-14,
+  conformance 333→340). New `types.zig` kinds `.conditional`
+  (payload `[check,extends,true,false]`, `data_b` bit0 = distributive) and
+  `.infer_var` (dense id + name atom; deliberately NOT a `.type_param` so it
+  doesn't count as a free param for deferral). Single reduction point
+  `reduceConditional`: interns a **deferred** `.conditional` while check/extends
+  are still generic, else resolves concretely — counting against the M15
+  `inst_depth`/`inst_count` budget so it can't hang. All four complexity areas
+  landed: (1) *deferral* (resolves in `instantiateId`'s `.conditional` arm on
+  substitution, flowing through the M15 memo keyed `(map_id, conditional_id)`);
+  (2) *`infer`* — ids keyed on `(conditional nodeKey, name atom)` so same-name
+  sites share one var; scoped to extends+true branches (`cur_infer_cond`),
+  `inferFromExtends` unions in covariant / **intersects in contravariant**
+  (function-param) positions, unmatched → `unknown`; (3) *distributivity* in the
+  `instantiateId` arm (naked-param check re-bound per union member; `never`→
+  `never`; `[T]`-wrapped suppresses); (4) conditional↔conditional *assignability*
+  (identity via hash-cons + structural + related-when-branches-related, source-
+  conditional handled before target-union distribution). Conditional/infer nodes
+  excluded from the M15 `(file,node)` type-node memo (the deferred TypeId is
+  itself the cache-safe representation). 7 differential torture cases
+  (`test/conformance/conditional/001`–`007`). Multi byte-identical (dormant on JS
+  subset); real conditional-heavy `.d.ts` (zod 111 `extends`) check with no
+  crash/panic/type-explosion. **Known divergence (lenient, documented):** on a
+  self-referential conditional tsc emits **TS2589**; ztsc terminates gracefully
+  (bounded type, no error) via lazy refs + the M15 depth budget — a *missed*
+  limit-diagnostic, never a false positive or a hang. **Deferred simplifications:**
+  constrained `infer V extends C` (constraint ignored); nested conditionals share
+  a single-level infer scope; `Array<infer U>` inference uses a single-generic-
+  arg-vs-array/tuple heuristic. Prerequisite for M16b/c — now unblocked.
 
 - **M16b — Mapped types (+ `as` key remapping).** `{ [K in Keys]: T }` with
   modifiers (`readonly`, `?`, and the `+`/`-` add/remove forms) and `as`

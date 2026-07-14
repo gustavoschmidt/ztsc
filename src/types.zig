@@ -143,7 +143,19 @@ pub const Kind = enum(u8) {
     /// so `sub.foo()` types as the subclass. resolveStructural/assignability
     /// fall back to the stored instance ref.
     this_type,
+    /// `infer V` binder (M16a). a = a dense id (unique per (conditional, name)),
+    /// b = the binder's name atom (for display). Appears only inside a
+    /// conditional type's extends/true branches; substituted away when the
+    /// conditional resolves. Not a "free type parameter" for deferral purposes.
+    infer_var,
+    /// Deferred conditional type `C extends E ? T : F` (M16a). a = extra index,
+    /// b = flags (bit0 = distributive: check was a naked type param). Interned
+    /// only while the check type is still generic; resolved on instantiation.
+    /// extra[a..]: [check, extends, true, false].
+    conditional,
 };
+
+pub const cond_flag_distributive: u32 = 1;
 
 pub const obj_flag_fresh: u32 = 1;
 pub const prop_flag_optional: u32 = 1;
@@ -485,6 +497,33 @@ pub const Store = struct {
         return s.extra.items[base + 1 .. base + 1 + s.dataB(id)];
     }
 
+    pub fn inferVarId(s: *const Store, id: TypeId) u32 {
+        return s.dataA(id);
+    }
+    pub fn inferVarName(s: *const Store, id: TypeId) Atom {
+        return s.dataB(id);
+    }
+
+    pub fn condCheck(s: *const Store, id: TypeId) TypeId {
+        if (id < s.base_len) return s.base.?.condCheck(id);
+        return s.extra.items[s.dataA(id)];
+    }
+    pub fn condExtends(s: *const Store, id: TypeId) TypeId {
+        if (id < s.base_len) return s.base.?.condExtends(id);
+        return s.extra.items[s.dataA(id) + 1];
+    }
+    pub fn condTrue(s: *const Store, id: TypeId) TypeId {
+        if (id < s.base_len) return s.base.?.condTrue(id);
+        return s.extra.items[s.dataA(id) + 2];
+    }
+    pub fn condFalse(s: *const Store, id: TypeId) TypeId {
+        if (id < s.base_len) return s.base.?.condFalse(id);
+        return s.extra.items[s.dataA(id) + 3];
+    }
+    pub fn condDistributive(s: *const Store, id: TypeId) bool {
+        return s.dataB(id) & cond_flag_distributive != 0;
+    }
+
     pub fn typeParamSymbol(s: *const Store, id: TypeId) u32 {
         return s.dataA(id);
     }
@@ -572,6 +611,7 @@ pub const Store = struct {
                 return s.extra.items[a .. a + 3 + tpc + 3 * b + pred + thisw];
             },
             .ref => return s.extra.items[a .. a + 1 + b],
+            .conditional => return s.extra.items[a .. a + 4],
             else => {
                 buf[0] = a;
                 buf[1] = b;
@@ -649,7 +689,7 @@ pub const Store = struct {
                 try s.extra.appendSlice(s.alloc, words);
                 try s.appendRaw(kind_, start, @intCast(s.extra.items.len));
             },
-            .tuple, .object, .function, .ref => {
+            .tuple, .object, .function, .ref, .conditional => {
                 const start: u32 = @intCast(s.extra.items.len);
                 try s.extra.appendSlice(s.alloc, words);
                 try s.appendRaw(kind_, start, b_count);
@@ -809,6 +849,18 @@ pub const Store = struct {
 
     pub fn makeThisType(s: *Store, instance_ref: TypeId) Error!TypeId {
         return s.internType(.this_type, &.{ instance_ref, 0 }, 0);
+    }
+
+    pub fn makeInferVar(s: *Store, id: u32, name: Atom) Error!TypeId {
+        return s.internType(.infer_var, &.{ id, name }, 0);
+    }
+
+    /// Intern a deferred conditional type. `distributive` records that the
+    /// check type was originally a naked type parameter (so it distributes
+    /// over a union once the substitution supplies one).
+    pub fn makeConditional(s: *Store, check: TypeId, extends: TypeId, true_ty: TypeId, false_ty: TypeId, distributive: bool) Error!TypeId {
+        const flags: u32 = if (distributive) cond_flag_distributive else 0;
+        return s.internType(.conditional, &.{ check, extends, true_ty, false_ty }, flags);
     }
 
     pub fn makeOverloads(s: *Store, fns: []const TypeId) Error!TypeId {
