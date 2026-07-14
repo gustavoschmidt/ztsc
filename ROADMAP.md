@@ -26,7 +26,7 @@ commit messages before that date use the old numbers.)
 ### Release policy — the public v0.0.1
 
 **There are no partial public releases.** The first published version,
-**v0.0.1**, ships only when the whole M11–M17 sequence below is done. Its
+**v0.0.1**, ships only when the whole M11–M20 sequence below is done. Its
 definition is exactly this: a user runs **`bunx ztsc <root-files>`** and
 ztsc type-checks those files and *everything they depend on* — including
 libraries — with most of TypeScript's functionality, fast and with low
@@ -248,24 +248,43 @@ them.)
 
 ## 5. The road to the public v0.0.1
 
-Seven milestones remain (M16 split into four sub-milestones M16a–d).
-Renumbered linearly on 2026-07-13 after the backend-first decision pulled
-cross-file declaration merging to the front. **Old → new mapping** for
-reading pre-2026-07-13 commits and notes: old M9 substrate → **M12**; old
-M10 open items (census, real corpus, resolution cache) → **M13**; old M11
-open items → **M11** (cross-file merging, module augmentation,
-triple-slash) and **M14** (unique symbol, JSX polish, this-typing,
-decorators); old M12 → **M15**; old M13a–d → **M16a–d**; old M14 → **M17**.
+M11–M16 are done (per-milestone records below). **Four remain: M17–M20.**
+The numbering has moved twice:
 
-Order rationale: M11 first because `@types/node` gates the backend goal
-and everything real depends on it; M12 (substrate) immediately after,
-because `@types/node`-sized inputs finally make its gates measurable and
-its shared type store keeps N-checker RSS sane on huge `.d.ts`; M13 makes
-the corpus story honest; M14 finishes semantic breadth; M15 lands the
-caching discipline that de-risks the type-level core; M16 is the
-make-or-break type-level core; M17 ships. Lessons from prior art bake the
-sequence: stc and Ezno (Rust) died on tsc-compatibility, not performance —
-the differential conformance discipline is non-negotiable as the surface
+- **2026-07-13** — linear renumbering after the backend-first decision
+  pulled cross-file declaration merging to the front. **Old → new
+  mapping** for reading pre-2026-07-13 commits and notes: old M9 substrate
+  → **M12**; old M10 open items (census, real corpus, resolution cache) →
+  **M13**; old M11 open items → **M11** (cross-file merging, module
+  augmentation, triple-slash) and **M14** (unique symbol, JSX polish,
+  this-typing, decorators); old M12 → **M15**; old M13a–d → **M16a–d**;
+  old M14 (ship) → M17.
+- **2026-07-14** — post-M16 re-plan: the ship milestone moved **M17 →
+  M20**, and three new milestones were inserted ahead of it out of the
+  debt M14–M16 surfaced and deliberately deferred: **M17** (correctness
+  debt: the index-signature assignability hole, raw-file-args
+  nondeterminism, predicate assignability, deferral triage), **M18** (the
+  real lib: call/construct signatures, full ES lib surface, real
+  `@types/node` acceptance), **M19** (the deferred M14.5 substrate
+  payload: structural display order, frozen-store payload, pre-parsed lib
+  blob). Notes and commit messages from 2026-07-13/14 that say "M17"
+  mean the ship milestone, now **M20**.
+
+Order rationale (original sequence): M11 first because `@types/node`
+gates the backend goal and everything real depends on it; M12 (substrate)
+immediately after, because `@types/node`-sized inputs finally make its
+gates measurable and its shared type store keeps N-checker RSS sane on
+huge `.d.ts`; M13 makes the corpus story honest; M14 finishes semantic
+breadth; M15 lands the caching discipline that de-risks the type-level
+core; M16 is the make-or-break type-level core. Post-M16 order rationale:
+M17 first because both of its headline items are wrong-answer/
+nondeterminism bugs on the exact `bunx ztsc <root-files>` path the
+release advertises; M18 before M19 because the real lib is what finally
+makes M19's wins measurable (and M19's blob + frozen store is what makes
+M18's real lib affordable); M20 ships only when the release gate holds on
+the real-lib configuration. Lessons from prior art bake the sequence: stc
+and Ezno (Rust) died on tsc-compatibility, not performance — the
+differential conformance discipline is non-negotiable as the surface
 grows.
 
 Several sections below carry `file:~line` references verified at commit
@@ -514,8 +533,8 @@ member index; fixed with a constituent→merged reverse index
 wall/RSS recorded in BENCHMARKS.md §3.9 (ztsc ~0.01 s / ~7 MB vs tsc
 ~0.38 s / ~182 MB) as the first realistic `.d.ts`-heavy datapoint; it
 feeds M12's gates. The *real* pinned-`@types/node` typecheck graduates to
-M17's real-world validation once M16 lands the type-level features its
-declarations need.
+**M18** (the real-lib milestone) now that M16 has landed the type-level
+features its declarations need.
 
 **Perf/memory expectations:** the overlay costs a few indices per merged
 name — only merged names pay, per invariant 3. M7 already fixed the two
@@ -827,6 +846,11 @@ per item:
 
 ### M14.5 — Shared-lib substrate, part 2 (deferred from M12; gates M15)
 
+> **Status (2026-07-14):** the architecture below is landed; the still-
+> deferred *payload* parts of both pieces (pre-parsed lib blob; frozen-base
+> pre-expansion + the structural-display-order prerequisite) are now
+> scheduled as **M19**, after M18's real lib makes them measurable.
+
 The two lib-gated pieces of M12 (§M12), rescheduled here because their payoff
 is unmeasurable until a realistic large lib / `@types/node` corpus exists — on
 the trimmed 9 KB embedded lib the cross-checker type-duplication overhead is
@@ -1129,10 +1153,221 @@ identically; benchmarks track types/line, RSS, and instantiation counts.
 distributivity → M16b mapped → M16c template-literal → M16d recursive/indexed/
 keyof. Conformance 340→365, all differential vs tsc 5.5.4, multi byte-identical
 throughout, real `.d.ts` (zod/hono/date-fns) resolve without crash. Next: M17
-(bunx distribution + release) — after the pre-existing index-signature
-assignability gap (surfaced in M16d) is weighed for v0.0.1.
+(correctness debt — the pre-existing index-signature assignability gap
+surfaced in M16d is its lead item); shipping is **M20**.
 
-### M17 — Ship it: bunx distribution + release
+### M17 — Correctness debt: wrong answers & nondeterminism on the release path
+
+Pre-release sweep. Three known bugs — two silent wrong answers, one
+nondeterminism — all surfaced during M14–M16 and deliberately deferred
+there, plus a triage pass that turns every remaining "deferred" note into
+an explicit accept-or-fix decision for v0.0.1. Rationale for doing this
+first: items (1) and (2) sit on the exact `bunx ztsc <root-files>` path
+the release headline advertises. The policy line for v0.0.1:
+**under-reporting (a missed error) is acceptable; wrong answers and
+nondeterminism are not.**
+
+1. **The index-signature assignability hole** (flagged at M16d as the
+   pre-v0.0.1 candidate; milestone-sized on its own). A bare primitive /
+   nullish / function / array / class-instance source **vacuously
+   satisfies** a string-index-signature target `{[k: string]: T}`:
+   `structuralAssignable` (checker.zig) checks the target's index
+   signature only against the source's *known properties*, so a source
+   with none passes vacuously. Reproduces non-recursively; recursive
+   aliases made it visible — `type Json = string | number | boolean |
+   null | Json[] | {[k: string]: Json}; const bad: Json = () => 1` is
+   accepted, tsc rejects with TS2322. What tsc actually does (the
+   differential harness is authoritative — sweep tsc's behavior *before*
+   coding): a source satisfies a target string index signature only via
+   (a) a compatible source string/number index signature, or (b) being an
+   object type whose every known property conforms — with tsc's *implied*
+   index signature rule for object-literal-ish types; primitives and bare
+   functions/classes without index signatures must fail. Work: the
+   source-side index-signature requirement in `structuralAssignable` +
+   the implied-index rule + a differential sweep (fresh vs non-fresh
+   literals, interfaces as source, unions/intersections as source,
+   number-vs-string index interplay, readonly index signatures). **Risk:
+   this is the hottest relation path** — expect existing conformance
+   cases to move; the gate is full-suite differential green, not local
+   plausibility. Re-run the real corpus (`bench/fetch_real.sh`)
+   before/after: any error-count delta must be explainable against tsc.
+2. **Raw-file-args discovery determinism.** Passing many unrelated
+   `.d.ts` files as raw CLI args yields **different diagnostics (content,
+   not just order)** at `--checkers=1` vs `8`: FileId assignment on the
+   raw-args path is worker-scheduling-dependent, and cross-package
+   global/ambient-decl merging is FileId-order-sensitive (M11 invariant 4
+   makes the merge a pure function of file order — the bug is that on
+   this path the *order itself* isn't deterministic). The `-p`/tsconfig
+   single-owner path is already deterministic via graph-derived BFS
+   renumbering (only the cosmetic "(N checker(s))" summary line differs).
+   Fix: give the raw-file-args path the same deterministic renumbering —
+   roots in argv order, then the existing BFS edge-list machinery in
+   main.zig's single-owner scheduler. Regression test: a many-roots
+   fixture of mutually-unrelated files with conflicting globals,
+   byte-identical for `--checkers ∈ {1,4,8}`.
+3. **Type-predicate assignability.** `(x) => x is A` is silently
+   assignable to `(x) => x is B`; tsc reports TS2322 (pre-existing gap
+   noted during M14's `import()`-types work). The identity half already
+   exists — predicate words participate in `shapeWords` since the M14
+   hash-cons soundness fix — what's missing is the *relation* check in
+   function assignability: a predicate-typed target requires a predicate
+   source with a related predicate type at the same parameter index
+   (differential-check tsc's exact variance rule). Small and contained,
+   but it's a wrong answer — in scope here.
+4. **Deferral triage — decide, don't drift.** Walk every standing
+   "deferred" note in §5 and record accept-for-v0.0.1 or fix, here, when
+   the milestone closes: cross-file conflict diagnostics
+   TS2300/TS2403/TS2717 + TS2669 placement (M11 — under-reporting,
+   default accept); lenient TS2589 on self-referential types (M16a–d —
+   bounded, never a hang or false positive, default accept); constrained
+   `infer V extends C` constraint ignored (M16a); template
+   pattern↔pattern assignability identity-only (M16c); template `as` over
+   an intersection constraint (`keyof T & string`) materializing `{}`
+   (M16d — **verify this cannot produce a false positive**, e.g. TS2339
+   on a legitimately remapped key; if it can, fix or degrade to a clean
+   deferral); `export =` / `import = require` out of subset (confirm the
+   real corpus gets a clean "not supported" diagnostic, never a wrong
+   answer).
+
+**Gate:** new differential conformance for (1)–(3); zero regressions on
+the existing suite; multi + deps corpora byte-identical across
+`--checkers ∈ {1,4,8}` and across the `--no-frozen-store` /
+`--no-inst-cache` oracles; bench wall/RSS flat vs the M16 numbers in
+BENCHMARKS.md.
+
+### M18 — The real lib: call/construct signatures, full ES lib surface, real `@types/node`
+
+Context: the embedded lib is still the trimmed ~9 KB ES-core surface
+built in M9, chosen when most of the real `lib.*.d.ts` was out of subset.
+M16 changed that: conditional/mapped/template-literal types — what the
+real lib's `Awaited`/`Partial`/`Parameters`/… are made of — now check.
+Real projects cannot be validated (M20) against a toy lib: they drown in
+TS2339/TS2304 for `Array.prototype` methods, ES2015+ globals, and
+`Awaited`-style helpers. This milestone lands the one semantic feature
+the real lib's own declarations require, makes the lib real, and
+graduates the M11 acceptance test to the *real* pinned `@types/node`.
+
+1. **Call/construct signatures in interfaces & type literals, standalone
+   constructor types.** The top remaining census buckets
+   (call/construct signature 237 = 10.4% + constructor type 54 = 2.4%,
+   BENCHMARKS §3.12 — after M14/M16 zeroed `import()` and the type-level
+   buckets, these lead what's left) and a hard prerequisite for the real
+   lib, whose global constructors are all the interface-pair pattern:
+   `interface ArrayConstructor { new <T>(…): T[]; <T>(…): T[]; readonly
+   prototype: any[] }` + `declare var Array: ArrayConstructor` (M9's
+   trimmed lib worked around exactly this with `declare class`). Work:
+   *parser* — call signatures `(a: A): R` and construct signatures
+   `new (a: A): R` as interface/type-literal members (both currently emit
+   `unsupported_syntax`), plus standalone `new (a: A) => R` (and
+   `abstract new`) in type position; *types.zig* — object types carry
+   call/construct signature lists (hybrid "callable object" types);
+   *checker* — calling a value of such a type resolves overloads through
+   the existing `resolveOverload` machinery, `new`-ing goes through the
+   construct list, assignability relates function types ↔ callable
+   object types in both directions per tsc, and property access coexists
+   with signatures (members + sigs on one type). Named tuple members
+   (census 0.3%) are a trivial parser add — take them opportunistically.
+2. **Vendor the real lib.** Replace the trimmed lib with the real
+   TypeScript **5.5.4** lib surface (same pinned version as the
+   differential oracle): ES core through esnext, **no DOM** (backend-
+   first; tsconfig `lib` selection is post-v0.0.1). Note the conformance
+   harness runs tsc with `lib: ["lib.esnext.d.ts","lib.dom.d.ts"]` (dom
+   only for `console`) — either keep a minimal console shim embedded, or
+   align the harness lib list; differential cases must see equivalent
+   libs on both sides. Acceptance for this item: `--census` over the
+   embedded lib itself reports **zero** out-of-subset constructs
+   (anything left is a to-fix list or a consciously-accepted gap recorded
+   here), and the lib parses/binds/checks under `zig build test`
+   totality. The costs this creates — startup now pays a real lib
+   parse+bind, and every checker re-expands a much larger lib type
+   population — are *expected* and are exactly what M19 exists to claw
+   back; record the before/after wall/RSS honestly in BENCHMARKS.md
+   rather than optimizing prematurely here.
+3. **Lib-gated deferrals from M14 land now:** the TC39 decorator
+   signature checks TS1238/TS1240/TS1241 and parameter-decorator TS1206
+   (they need `ClassMethodDecoratorContext` et al., present in the real
+   lib — ztsc currently under-reports, never spuriously errors). JSX
+   polish items 3+4 (`JSX` namespace resolved from `@types/react`,
+   spread-attribute checking/TS2559, `JSX.ElementChildrenAttribute`
+   children typing) stay **deferred post-v0.0.1** unless M17's triage
+   decided otherwise — backend-first.
+4. **Real pinned `@types/node` acceptance** (graduates from M11, per that
+   milestone's closing note). Vendor a pinned `@types/node` (already in
+   `bench/fetch_real.sh`'s set) and differential-check a small real
+   backend program against it, diagnostics matching tsc 5.5.4. This
+   supersedes the hand-authored `node_accept/backend` node-shaped fixture
+   as the standing gate (the fixture stays as a fast regression case).
+5. **Corpus & census refresh.** Grow `bench/fetch_real.sh`'s pinned set
+   toward the ~500k-LOC target (more packages are checkable now); re-run
+   `--census` over it. The refreshed table is the release-readiness
+   evidence: everything remaining should be consciously accepted
+   (`export =`, `import = require`, …) or trivially rare.
+
+**Gate:** the real-`@types/node` backend fixture matches tsc; census over
+lib + real corpus shows only accepted constructs; conformance grows with
+every item (differential, as always); wall/RSS re-measured and recorded —
+regressions from the bigger lib are accepted *only* as the explicit,
+written-down input to M19.
+
+### M19 — Substrate payload (completes M14.5): display order → frozen store → lib blob
+
+Context: M14.5 landed the frozen-base/overlay **architecture** (the
+TypeId split, `initOverlay`, `buildBaseStore`, the `--no-frozen-store`
+oracle) but deferred the **payload**, because on the 9 KB lib the win was
+unmeasurable (~134 KB duplication at N=8). M18 changes the economics:
+every checker now re-expands and permanently interns the full real-lib
+type population — the largest population in the program, duplicated up to
+N× (the lib-free measurement was already +15.5% types at N=4 / +23% at
+N=8) — and startup pays a full real-lib parse+bind on every run. This
+milestone is the RSS and cold-start claw-back that makes M20's release
+gate (**≤50% of tsgo RSS**) hold on the real-lib configuration. Three
+pieces, in dependency order:
+
+1. **Structural union/intersection display order** (correctness
+   prerequisite discovered during M14.5 — do it first).
+   `makeUnion`/`makeIntersection` (types.zig) sort members by **raw
+   TypeId**, and diagnostics print members in stored order — so
+   relocating lib types into low base ids would reorder e.g.
+   `LibType | userLiteral` in messages and break the byte-identical
+   invariant between frozen-on/off and across N. Make the ordering
+   **TypeId-independent**: a structural sort key (kind class + interned
+   name/shape atoms), stable across id assignment. Where differential
+   cases already pin an order against tsc, keep matching tsc; elsewhere
+   the requirement is byte-stability across configurations, not any
+   particular order. "Done" is verified by piece 2's oracle, below.
+2. **The frozen-base payload.** Post-link, `buildBaseStore` (checker.zig)
+   pre-expands the lib/`@types` types into the frozen base **once,
+   single-threaded** — enumerate what to expand via the M11 merge table /
+   `Program.globals` (that reuse was designed in from M11 invariant 6) —
+   and freeze base×base relation-cache entries as a shared read-only
+   table. Per-checker overlays already delegate ids `< base_len` and
+   intern misses locally (machinery landed and oracle-tested in M14.5);
+   this piece fills the base. Honor the layout commitments (§M12): no
+   code may assume a TypeId is checker-local; all store reads via
+   `types.Store` accessors. M15's instantiation memos were built against
+   the split (`base_len`-aware) and need no retrofit. Oracle: full
+   conformance + multi/deps/real corpora byte-identical with
+   `--no-frozen-store` on vs off and across `--checkers ∈ {1,4,8}`.
+3. **Pre-parsed embedded lib blob** (was M12.2 / M14.5 piece 1). A
+   build.zig step runs ztsc's own front end over the embedded lib and
+   `@embedFile`s the sealed tokens/AST/binder products (flat `u32`
+   arrays, no pointers — trivially serializable); startup loads
+   exact-size or zero-copy instead of parsing+binding — near-zero cold
+   start for `bunx ztsc` on small projects, where lib front-end would
+   otherwise dominate. Depends on M12.1's seeded deterministic atoms
+   (landed): the blob bakes atom values, so the seeded lib-atom prefix
+   must stay the contiguous versioned range the layout commitments
+   describe, with the seed-table version tag rejecting a stale blob.
+
+**Gate:** diagnostics byte-identical for any `--checkers` N and for both
+cache oracles on/off, on the conformance suite *and* the real corpus;
+peak RSS at N=4 within a small constant of N=1 on the multi corpus
+**and** the real-`@types/node` corpus; blob-load vs source-parse
+cold-start recorded in BENCHMARKS.md; wall/RSS vs tsgo re-measured — this
+is the last stop before the release gate, so if ≤50%-of-tsgo doesn't hold
+here, the fix happens here, not in M20.
+
+### M20 — Ship it: bunx distribution + release (was M17)
 
 Batch checking only — no watch mode, no LSP (post-v0.0.1, §8).
 
@@ -1143,14 +1378,18 @@ Batch checking only — no watch mode, no LSP (post-v0.0.1, §8).
 - **Real-world validation**: N real open-source Bun/Node projects check
   with diagnostics matching tsc (differential, wrong answers = release
   blockers) — including at least one `@types/node`-dependent backend
-  project (the M11 acceptance fixture graduates here).
+  project (M18's real-`@types/node` gate re-run against the release
+  binaries).
+- **Real-corpus benchmark record** (M13's open follow-up): tsc/tsgo
+  wall/RSS comparison over `bench/corpus/real` on the bench host,
+  recorded in BENCHMARKS.md alongside the synthetic corpora.
 - **Release gate (the whole point)**: on real projects, macOS *and* Linux —
   wall within 1.25× of tsgo, **peak RSS ≤ 50% of tsgo**, conformance green.
   Then, and only then: tag **v0.0.1**, publish to npm.
 
 ---
 
-## 6. Current checked subset (as of M10)
+## 6. Current checked subset (as of M16)
 
 **In:** primitives + literal types, `unknown`/`any`/`never`/`void`;
 objects, interfaces (incl. `extends`), type aliases, arrays, tuples;
@@ -1173,17 +1412,27 @@ global, and JSX typing in `.tsx` (intrinsic + component elements against a
 (the global-symbol layer — `declare global`, cross-file namespace/interface
 merge including references from inside contributing files), **module
 augmentation** (ambient + wildcard `declare module`), and **triple-slash
-`/// <reference path|types>`** directives.
+`/// <reference path|types>`** directives. **Since M14:** `import()`
+types (`import("m").T`, `typeof import("m")`), `unique symbol`
+annotations, JSX dashed names (`data-*`/`aria-*`/`<my-widget>`) +
+class-component props, polymorphic `this` return types + explicit `this`
+parameters, TC39 standard decorators (expression checking; signature
+checks are lib-gated → M18). **Since M16:** **conditional types +
+`infer` + distributivity**, **mapped types + `as` key remapping**,
+**template-literal types + the four string intrinsics**, **recursive type
+aliases, generic indexed access, and `keyof` over mapped/generic types**.
 
-**Not yet** (queued in §5): `unique symbol`
-annotations, JSX polish (`-` in names, class-component props, JSX
-namespace from imported `@types`), `this`-typing, decorators (M14);
-**conditional types + `infer`** (M16a), **mapped types + `as` remapping**
-(M16b), **template-literal types** (M16c), **recursive aliases + generic
-indexed access + `keyof` over mapped types** (M16d). Unsupported syntax
-produces a clear "not supported" diagnostic — never a wrong answer or a
-crash (fuzzed at every phase). (M12, M13, and M15 are perf/memory/caching
-milestones — they change no checked subset; see §5.)
+**Not yet** (queued in §5): call/construct signatures in interfaces/type
+literals + standalone constructor types (M18); the real (untrimmed) lib
+surface (M18); the index-signature assignability fix (M17 — today a bare
+primitive/function vacuously satisfies `{[k: string]: T}`); decorator
+signature checks TS1238–1241/TS1206 (M18). Consciously out for v0.0.1
+unless M17's triage says otherwise: `export =` / `import = require`
+(CommonJS interop), JSX spread-attribute checking + `JSX` namespace from
+`@types/react`. Unsupported syntax produces a clear "not supported"
+diagnostic — never a wrong answer or a crash (fuzzed at every phase).
+(M12, M13, M15, and M19 are perf/memory/caching milestones — they change
+no checked subset; see §5.)
 
 ---
 
@@ -1201,9 +1450,9 @@ milestones — they change no checked subset; see §5.)
   them); continuous RSS measurement on type-heavy real corpora;
   hash-consing.
 - **Checker duplication overhead grows with N** → it's a measured dial;
-  the shared frozen lib type store (M12.3) turns the largest duplicated
-  population — lib/`@types` types — into a read-only shared base, keeping
-  it off the per-checker N× multiplier. Simple non-lib types may follow
+  the shared frozen lib type store (M12.3, payload now M19) turns the
+  largest duplicated population — lib/`@types` types — into a read-only
+  shared base, keeping it off the per-checker N× multiplier. Simple non-lib types may follow
   the same pattern if the census shows they dominate.
 - **Zig 0.16 std churn** → version pinned in build.zig.zon and CI; upgrade
   deliberately. (Known: custom pool over `Thread.spawn`, `std.Io.Mutex`,
