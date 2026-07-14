@@ -5964,7 +5964,39 @@ const Checker = struct {
             }
         }
         const t_ret = c.ts.fnReturn(te);
+        // A void-returning target accepts any source return (tsc's early-out).
+        // An `asserts x[ is T]` predicate always returns void, so any target
+        // assertion predicate lands here and is accepted regardless of source
+        // — matching tsc, which compares predicates only after this gate.
         if (t_ret == types.void_type) return true;
+        // Type-predicate relation (M17.3). Once the target return type is
+        // non-void, a target type predicate (`x is T`, return boolean)
+        // constrains the source per tsc's `compareTypePredicateRelatedTo`:
+        //   - the source must also be a type predicate (else TS2322,
+        //     "Signature '…' must be a type predicate") — but only when the
+        //     target guards an *identifier* (`this is T` targets do not force
+        //     the source to be a predicate);
+        //   - the predicate kinds must match: same asserts-ness and the same
+        //     guarded position (`this` vs a parameter index);
+        //   - the asserted type is covariant — source type assignable to
+        //     target type.
+        // A plain-boolean source → predicate target therefore *fails* (tsc
+        // rejects it), and a predicate source → boolean target is fine (the
+        // target has no predicate, so this block is skipped).
+        if (c.ts.fnHasPredicate(te)) {
+            const tp = c.ts.fnPredicate(te);
+            if (!c.ts.fnHasPredicate(se)) {
+                if (tp.param != types.Predicate.this_param) return false;
+            } else {
+                const spd = c.ts.fnPredicate(se);
+                if (spd.asserts != tp.asserts) return false;
+                if (spd.param != tp.param) return false;
+                if (tp.ty != types.no_type) {
+                    if (spd.ty == types.no_type) return false;
+                    if (!try c.isAssignable(spd.ty, tp.ty)) return false;
+                }
+            }
+        }
         const s_ret = c.ts.fnReturn(se);
         if (s_ret == types.void_type) return t_ret == types.void_type or t_ret == types.any_type or t_ret == types.unknown_type;
         return c.isAssignable(s_ret, t_ret);

@@ -1286,15 +1286,39 @@ nondeterminism are not.**
    This is a rendering-order issue, never a change in *which* diagnostics
    fire — squarely the M19 "structural union/intersection display order"
    work, tracked there.
-3. **Type-predicate assignability.** `(x) => x is A` is silently
-   assignable to `(x) => x is B`; tsc reports TS2322 (pre-existing gap
-   noted during M14's `import()`-types work). The identity half already
-   exists — predicate words participate in `shapeWords` since the M14
-   hash-cons soundness fix — what's missing is the *relation* check in
-   function assignability: a predicate-typed target requires a predicate
-   source with a related predicate type at the same parameter index
-   (differential-check tsc's exact variance rule). Small and contained,
-   but it's a wrong answer — in scope here.
+3. ✅ **DONE (M17.3)** — **Type-predicate assignability.** Conformance
+   370 → **374** (+4 `assignability/` cases 031–034, each validated
+   against tsc 5.5.4); zero existing cases moved; type store
+   byte-identical to the M17.2 baseline (N=4 24852 types / 703744 bytes);
+   bench flat (=1 0.08s/49.7MB, =4 0.03s/52.9MB, =8 0.02s/48.0MB).
+   **The tsc sweep corrected the plan's premise:** a plain-`boolean`
+   source is *not* assignable to a predicate target — tsc rejects it
+   ("Signature '…' must be a type predicate"). **The variance rule
+   settled on (tsc `compareTypePredicateRelatedTo`, differential-verified
+   both directions):** the whole relation is gated behind the existing
+   *target-return-`void`* early-out in `signatureAssignable`
+   (checker.zig), so an `asserts x is T` target (return `void`) accepts
+   *any* source — including a mismatched-`asserts`, plain-predicate, or
+   plain-`boolean` source — with no predicate check, exactly as tsc does.
+   Only a non-void target predicate (`x is T`, return `boolean`)
+   constrains the source: (a) the source must itself be a predicate — but
+   only when the target guards an *identifier* (a `this is T` target does
+   not force it; matches tsc's `isIdentifierTypePredicate` guard); (b) the
+   predicate *kinds* must match — same `asserts`-ness (an `asserts`
+   source → plain-predicate target fails) and same guarded position
+   (`this` sentinel vs parameter index, so a `y is T` source → `x is T`
+   target fails); (c) the asserted type is *covariant* — source type
+   assignable to target type (`x is Dog` → `x is Animal` ok, reverse and
+   unrelated fail). A predicate source → plain-`boolean` target stays
+   fine (target has no predicate, block skipped; return `boolean` ↔
+   `boolean`). No new representation needed — predicate words already ride
+   in `shapeWords` (M14) and `fnHasPredicate`/`fnPredicate` already read
+   them. **Deferral (under-report, never a false positive — policy-
+   compliant):** predicates on *generic* signatures are dropped by
+   `instantiate` (checker.zig ~L3917, pre-existing "predicates dropped on
+   instantiation"), and the relation reads the erased signatures, so a
+   generic predicate target skips the check. Rare (guards are near-always
+   monomorphic) and it can only miss an error, so accepted for v0.0.1.
 4. **Deferral triage — decide, don't drift.** Walk every standing
    "deferred" note in §5 and record accept-for-v0.0.1 or fix, here, when
    the milestone closes: cross-file conflict diagnostics
