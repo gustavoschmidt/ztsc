@@ -9,13 +9,13 @@ done; the road to v0.0.1 is [ROADMAP.md §5](ROADMAP.md).
 
 Headline (multi corpus: 201 files / 93k lines, Apple M4, default
 `--checkers=4`; full report with methodology and caveats in
-[BENCHMARKS.md](BENCHMARKS.md), re-measured 2026-07-13):
+[BENCHMARKS.md](BENCHMARKS.md), re-measured 2026-07-14):
 
 | | wall | peak RSS |
 |---|---:|---:|
-| **ztsc** | **0.02 s** | **52 MB** |
-| tsgo (TS 7 native preview) | 0.08 s | 204 MB |
-| tsc 5.5.4 | 0.93 s | 315 MB |
+| **ztsc** | **0.03 s** | **54 MB** |
+| tsgo (TS 7 native preview) | 0.08 s | 205 MB |
+| tsc 5.5.4 | 0.91 s | 316 MB |
 
 That is an in-subset, synthetic-corpus comparison — read the caveats
 before quoting it. Both acceptance gates (wall within 1.25× of tsgo, RSS
