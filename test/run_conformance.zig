@@ -180,6 +180,12 @@ fn runDirCase(
     const result = try checker.checkFiles(alloc, io, gpa, interner, prog, owned, base, true);
 
     for (prog.files, 0..) |*pf, i| {
+        // Skip the injected lib (file 0): tsc does not diagnose the default
+        // lib, and neither does the CLI (main.zig print loop). The vendored
+        // real 5.5.4 lib is census-clean but trips a few ztsc-incompleteness
+        // diagnostics; suppress them here too so multi-file snapshots stay a
+        // fair user-code differential.
+        if (std.mem.eql(u8, pf.path, modules.lib_path)) continue;
         const rel = if (std.mem.startsWith(u8, pf.path, case_rel) and pf.path.len > case_rel.len + 1)
             pf.path[case_rel.len + 1 ..]
         else
