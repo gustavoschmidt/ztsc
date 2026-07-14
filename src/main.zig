@@ -39,6 +39,7 @@ const parser = ztsc.parser;
 const binder = ztsc.binder;
 const checker = ztsc.checker;
 const modules = ztsc.modules;
+const types = ztsc.types;
 const Ast = ztsc.ast.Ast;
 const Bind = binder.Bind;
 
@@ -66,6 +67,8 @@ const usage =
     \\  --checkers=N           number of checker instances (default: min(4, CPUs))
     \\  --repeat=N             scan/parse/bind each file N times (benchmark aid)
     \\  --no-resolve-cache     disable the module-resolution memo (benchmark aid)
+    \\  --no-frozen-store      disable the shared frozen base type store; each
+    \\                         checker re-expands lib types (benchmark aid / oracle)
     \\  --census               tally out-of-subset constructs by frequency
     \\  -h, --help             print this help and exit
     \\  --version              print version and exit
@@ -106,6 +109,11 @@ const Cli = struct {
     /// resolution-cache benchmark; resolution then re-walks node_modules per
     /// importer. Diagnostics are identical either way.
     no_resolve_cache: bool = false,
+    /// Disable the shared frozen base type store (M14.5) — the "before" leg of
+    /// the frozen-store benchmark and the correctness oracle: every checker
+    /// falls back to expanding lib types into its own store. Diagnostics are
+    /// byte-identical either way and across `--checkers=N`.
+    no_frozen_store: bool = false,
     /// Print a by-construct histogram of out-of-subset syntax (M13 census) —
     /// the frequency table that prioritizes M14/M16 feature work.
     census: bool = false,
@@ -366,6 +374,10 @@ const CheckerTask = struct {
     arena: std.heap.ArenaAllocator,
     thread: std.Thread = undefined,
     owned: []const modules.FileId = &.{},
+    /// Shared frozen base type store (M14.5), or null under
+    /// `--no-frozen-store`. Read-only; the same pointer is handed to every
+    /// task so all overlays share one base.
+    base: ?*const types.Store = null,
     result: ?checker.Check = null,
     err: ?anyerror = null,
     ns: u64 = 0,
@@ -378,7 +390,7 @@ const CheckerTask = struct {
         prog: *const modules.Program,
     ) void {
         const timer = Timer.start(io);
-        t.result = checker.checkFiles(t.arena.allocator(), io, gpa, interner, prog, t.owned) catch |err| blk: {
+        t.result = checker.checkFiles(t.arena.allocator(), io, gpa, interner, prog, t.owned, t.base) catch |err| blk: {
             t.err = err;
             break :blk null;
         };
@@ -769,10 +781,21 @@ pub fn main(init: std.process.Init) !void {
             file_owner[it.file] = @intCast(best);
         }
 
+        // Shared frozen base type store (M14.5, ROADMAP §M14.5 piece 2): built
+        // once, single-threaded here before any checker spawns, then handed to
+        // every task read-only. Under `--no-frozen-store` each checker instead
+        // expands lib types into its own store (the old path / oracle leg).
+        // Lives in the top-level `arena` so it outlives all overlays.
+        const base_store: ?*const types.Store = if (cli.no_frozen_store) null else blk: {
+            const bs = try arena.create(types.Store);
+            bs.* = try checker.buildBaseStore(arena);
+            break :blk bs;
+        };
         for (tasks, 0..) |*t, k| {
             t.* = .{
                 .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
                 .owned = owned_lists[k].items,
+                .base = base_store,
             };
         }
     }
@@ -976,7 +999,7 @@ pub fn main(init: std.process.Init) !void {
         defer dump_arena.deinit();
         const all_files = try dump_arena.allocator().alloc(modules.FileId, n_files);
         for (all_files, 0..) |*f, i| f.* = @intCast(i);
-        _ = checker.checkFilesAndDump(dump_arena.allocator(), io, gpa, &interner, prog, all_files, out) catch {};
+        _ = checker.checkFilesAndDump(dump_arena.allocator(), io, gpa, &interner, prog, all_files, null, out) catch {};
     }
 
     try out.print("ztsc: loaded {d} file(s) ({d} from CLI), {d} lines, {d} bytes, {d} tokens, {d} nodes, {d} symbols, {d} parse error(s), {d} bind error(s), {d} link error(s), {d} check error(s) ({d} worker(s), {d} checker(s))\n", .{
@@ -1358,6 +1381,8 @@ fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8, bad_arg: *[]c
             cli.no_lib = true;
         } else if (std.mem.eql(u8, arg, "--no-resolve-cache")) {
             cli.no_resolve_cache = true;
+        } else if (std.mem.eql(u8, arg, "--no-frozen-store")) {
+            cli.no_frozen_store = true;
         } else if (std.mem.eql(u8, arg, "--census")) {
             cli.census = true;
         } else if (std.mem.eql(u8, arg, "--pretty")) {

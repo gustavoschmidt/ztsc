@@ -141,7 +141,7 @@ pub fn check(
 ) Error!Check {
     const prog = try arena.create(modules.Program);
     prog.* = try modules.singleFileProgram(arena, "", src, tree, bind);
-    return checkFiles(arena, io, gpa, interner, prog, &.{0});
+    return checkFiles(arena, io, gpa, interner, prog, &.{0}, null);
 }
 
 /// Type-check `owned` files of a linked multi-file program. Cross-file
@@ -157,8 +157,9 @@ pub fn checkFiles(
     interner: *Interner,
     prog: *const modules.Program,
     owned: []const FileId,
+    base: ?*const types.Store,
 ) Error!Check {
-    var c = try Checker.init(arena, io, gpa, interner, prog, owned);
+    var c = try Checker.init(arena, io, gpa, interner, prog, owned, base);
     defer c.deinit();
     try c.run();
     return c.seal();
@@ -174,9 +175,10 @@ pub fn checkFilesAndDump(
     interner: *Interner,
     prog: *const modules.Program,
     owned: []const FileId,
+    base: ?*const types.Store,
     w: *std.Io.Writer,
 ) (Error || std.Io.Writer.Error)!Check {
-    var c = try Checker.init(arena, io, gpa, interner, prog, owned);
+    var c = try Checker.init(arena, io, gpa, interner, prog, owned, base);
     defer c.deinit();
     try c.run();
     for (owned) |f| {
@@ -201,11 +203,34 @@ pub fn checkAndDump(
 ) (Error || std.Io.Writer.Error)!Check {
     const prog = try arena.create(modules.Program);
     prog.* = try modules.singleFileProgram(arena, "", src, tree, bind);
-    var c = try Checker.init(arena, io, gpa, interner, prog, &.{0});
+    var c = try Checker.init(arena, io, gpa, interner, prog, &.{0}, null);
     defer c.deinit();
     try c.run();
     try c.dumpTypes(w);
     return c.seal();
+}
+
+/// Build the shared frozen base type store (M14.5, ROADMAP §M14.5 piece 2).
+/// Runs single-threaded after link, before any checker worker spawns. The
+/// returned store's arrays live in `store_arena` (which must outlive every
+/// overlay built over it); the caller freezes-and-shares it as each
+/// per-checker overlay's `base`.
+///
+/// Base payload today: the well-known intrinsics only. Because a fresh
+/// overlay then allocates its first local id at `base_len` (== the intrinsic
+/// count) exactly as a non-overlay store allocates its first non-intrinsic id,
+/// overlay TypeIds match the non-frozen path id-for-id — so diagnostics are
+/// byte-identical with the frozen store on or off. Pre-expanding the
+/// lib/`@types` body into the base (the RSS win, reusing the M11 merge table
+/// to enumerate lib symbols) is deferred to the larger embedded lib: it would
+/// relocate lib types to low base ids, which reorders union/intersection
+/// *display* (both sort by raw TypeId, printed in stored order), so it must be
+/// paired with structural display ordering. The overlay machinery is fully in
+/// place for that follow-up (see report).
+pub fn buildBaseStore(store_arena: Allocator) Error!types.Store {
+    var base = try types.Store.init(store_arena);
+    base.freeze();
+    return base;
 }
 
 const max_instantiation_depth = 48;
@@ -378,6 +403,12 @@ const Checker = struct {
         interner: *Interner,
         prog: *const modules.Program,
         owned: []const FileId,
+        /// Frozen shared base type store (M14.5). When non-null, this
+        /// checker's store is an overlay over it, so lib/`@types` types the
+        /// base already holds are shared (not re-interned per checker). Null
+        /// keeps the pre-M14.5 per-checker-expands-everything path
+        /// (`--no-frozen-store`).
+        base: ?*const types.Store,
     ) Error!Checker {
         const first = if (owned.len > 0) owned[0] else 0;
         const f0 = &prog.files[first];
@@ -404,7 +435,7 @@ const Checker = struct {
         c.scratch_arena.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         errdefer c.scratch_arena.deinit();
         const arena_alloc = c.carena.allocator();
-        c.ts = try Store.init(arena_alloc);
+        c.ts = if (base) |b| try Store.initOverlay(arena_alloc, b) else try Store.init(arena_alloc);
         // Sized to include the merged-symbol range (ids ≥ totalSymbols()),
         // so merged ids are valid sym_types/sym_state indices (M11a). These
         // are indexed by *global* SymbolId — a checker reads them for foreign

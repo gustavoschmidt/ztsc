@@ -223,6 +223,19 @@ pub const TupleElem = struct {
 
 /// The hash-consing type store. All storage comes from one allocator (the
 /// per-checker type arena); nothing is freed individually.
+///
+/// **Frozen base / per-checker overlay (M14.5).** A `Store` is either a
+/// *base* (`base == null`) — a self-contained store that owns TypeIds
+/// `[0, kinds.len)` — or an *overlay* over a frozen base. An overlay owns
+/// TypeIds `[base_len, …)` in its own SoA arrays and delegates all reads of
+/// ids `< base_len` to `base`. Interning probes the frozen base's map first,
+/// so a type structurally identical to a base type returns the *base* id
+/// (shared, no per-overlay duplication); only genuinely new types allocate an
+/// overlay id at `base_len + local_index`. The base is built and `freeze`d
+/// single-threaded before workers spawn, then shared read-only across every
+/// overlay — the type-level twin of M11's merged-symbol layer. A `TypeId`
+/// therefore spans base+overlay and is never assumed checker-local (ROADMAP
+/// M14.5 "Layout commitments").
 pub const Store = struct {
     alloc: Allocator,
     kinds: std.ArrayList(Kind) = .empty,
@@ -232,6 +245,16 @@ pub const Store = struct {
     map: std.HashMapUnmanaged(TypeId, void, MapCtx, 80) = .empty,
     /// Scratch for building candidate payloads before interning.
     pending: std.ArrayList(u32) = .empty,
+    /// Frozen base this store overlays, or null for a base store. Read-only;
+    /// shared across all overlay threads (pure reads of immutable data).
+    base: ?*const Store = null,
+    /// First TypeId this store owns. `== base.kinds.items.len` for an overlay
+    /// (base owns `[0, base_len)`), `0` for a base store. An id `< base_len`
+    /// is a base id and every accessor delegates it to `base`.
+    base_len: u32 = 0,
+    /// Set by `freeze`; a frozen store is immutable and safe to share as a
+    /// base. Guards against accidental post-freeze interning.
+    frozen: bool = false,
 
     pub fn init(alloc: Allocator) Error!Store {
         var s: Store = .{ .alloc = alloc };
@@ -254,18 +277,56 @@ pub const Store = struct {
         return s;
     }
 
+    /// A fresh overlay over a frozen `base`. The overlay owns no fixed
+    /// intrinsics — the well-known ids live in the base — and allocates its
+    /// first local type at `base_len`. `base` must already be `freeze`d and
+    /// outlive every overlay built over it.
+    pub fn initOverlay(alloc: Allocator, base: *const Store) Error!Store {
+        std.debug.assert(base.frozen);
+        std.debug.assert(base.base == null); // single base level (no chaining)
+        return .{
+            .alloc = alloc,
+            .base = base,
+            .base_len = @intCast(base.kinds.items.len),
+        };
+    }
+
+    /// Seal a base store: no further interning, safe to share read-only as the
+    /// frozen base of any number of overlays.
+    pub fn freeze(s: *Store) void {
+        s.frozen = true;
+    }
+
     fn appendRaw(s: *Store, k: Kind, a: u32, b: u32) Error!void {
         try s.kinds.append(s.alloc, k);
         try s.data_a.append(s.alloc, a);
         try s.data_b.append(s.alloc, b);
     }
 
+    /// Total types visible through this store (base + overlay), excluding the
+    /// index-0 `none` sentinel. An overlay's own contribution is
+    /// `overlayCount`; the shared base is counted once here.
     pub fn count(s: *const Store) usize {
+        if (s.base) |b| return b.count() + s.kinds.items.len;
         return s.kinds.items.len - 1;
     }
 
-    /// Exact bytes held by the sealed-style SoA arrays (not map overhead).
+    /// Types interned into this overlay's own storage (0 for a fresh overlay).
+    pub fn overlayCount(s: *const Store) usize {
+        return if (s.base == null) 0 else s.kinds.items.len;
+    }
+
+    /// Exact bytes held by the sealed-style SoA arrays (base + overlay). The
+    /// base's bytes are shared across overlays; `overlayBytes` isolates this
+    /// overlay's own footprint.
     pub fn typeBytes(s: *const Store) usize {
+        const local = s.kinds.items.len * (1 + 4 + 4) + s.extra.items.len * 4;
+        return local + if (s.base) |b| b.typeBytes() else 0;
+    }
+
+    /// Bytes held by this store's own SoA arrays (overlay-local; excludes the
+    /// shared base).
+    pub fn overlayBytes(s: *const Store) usize {
         return s.kinds.items.len * (1 + 4 + 4) + s.extra.items.len * 4;
     }
 
@@ -274,20 +335,29 @@ pub const Store = struct {
         return s.typeBytes() + s.map.capacity() * (@sizeOf(TypeId) + 1);
     }
 
+    // --- base/overlay dispatch ----------------------------------------------
+    // Reads of an id `< base_len` delegate to the frozen base (whose own
+    // `base_len` is 0, so its accessors index directly — one level, no loop);
+    // ids `>= base_len` index this overlay's arrays at `id - base_len`.
+
     pub fn kind(s: *const Store, id: TypeId) Kind {
-        return s.kinds.items[id];
+        if (id < s.base_len) return s.base.?.kind(id);
+        return s.kinds.items[id - s.base_len];
     }
     pub fn dataA(s: *const Store, id: TypeId) u32 {
-        return s.data_a.items[id];
+        if (id < s.base_len) return s.base.?.dataA(id);
+        return s.data_a.items[id - s.base_len];
     }
     pub fn dataB(s: *const Store, id: TypeId) u32 {
-        return s.data_b.items[id];
+        if (id < s.base_len) return s.base.?.dataB(id);
+        return s.data_b.items[id - s.base_len];
     }
 
     // --- payload views ------------------------------------------------------
 
     /// Union/intersection/overload members.
     pub fn members(s: *const Store, id: TypeId) []const TypeId {
+        if (id < s.base_len) return s.base.?.members(id);
         return s.extra.items[s.dataA(id)..s.dataB(id)];
     }
 
@@ -300,26 +370,31 @@ pub const Store = struct {
     }
 
     pub fn tupleElem(s: *const Store, id: TypeId, i: u32) TupleElem {
+        if (id < s.base_len) return s.base.?.tupleElem(id, i);
         const base = s.dataA(id) + 2 * i;
         return .{ .ty = s.extra.items[base], .flags = s.extra.items[base + 1] };
     }
 
     pub fn objectFlags(s: *const Store, id: TypeId) u32 {
+        if (id < s.base_len) return s.base.?.objectFlags(id);
         return s.extra.items[s.dataA(id)];
     }
     pub fn objectIsFresh(s: *const Store, id: TypeId) bool {
         return s.kind(id) == .object and s.objectFlags(id) & obj_flag_fresh != 0;
     }
     pub fn objectStringIndex(s: *const Store, id: TypeId) TypeId {
+        if (id < s.base_len) return s.base.?.objectStringIndex(id);
         return s.extra.items[s.dataA(id) + 1];
     }
     pub fn objectNumberIndex(s: *const Store, id: TypeId) TypeId {
+        if (id < s.base_len) return s.base.?.objectNumberIndex(id);
         return s.extra.items[s.dataA(id) + 2];
     }
     pub fn objectPropCount(s: *const Store, id: TypeId) u32 {
         return s.dataB(id);
     }
     pub fn objectProp(s: *const Store, id: TypeId, i: u32) Prop {
+        if (id < s.base_len) return s.base.?.objectProp(id, i);
         const base = s.dataA(id) + 3 + 3 * i;
         return .{
             .name = s.extra.items[base],
@@ -342,12 +417,15 @@ pub const Store = struct {
     }
 
     pub fn fnFlags(s: *const Store, id: TypeId) u32 {
+        if (id < s.base_len) return s.base.?.fnFlags(id);
         return s.extra.items[s.dataA(id)];
     }
     pub fn fnReturn(s: *const Store, id: TypeId) TypeId {
+        if (id < s.base_len) return s.base.?.fnReturn(id);
         return s.extra.items[s.dataA(id) + 1];
     }
     pub fn fnTypeParams(s: *const Store, id: TypeId) []const u32 {
+        if (id < s.base_len) return s.base.?.fnTypeParams(id);
         const base = s.dataA(id);
         const tpc = s.extra.items[base + 2];
         return s.extra.items[base + 3 .. base + 3 + tpc];
@@ -356,6 +434,7 @@ pub const Store = struct {
         return s.dataB(id);
     }
     pub fn fnParam(s: *const Store, id: TypeId, i: u32) Param {
+        if (id < s.base_len) return s.base.?.fnParam(id, i);
         const base = s.dataA(id);
         const tpc = s.extra.items[base + 2];
         const pbase = base + 3 + tpc + 3 * i;
@@ -370,6 +449,7 @@ pub const Store = struct {
         return s.kind(id) == .function and s.fnFlags(id) & fn_flag_predicate != 0;
     }
     pub fn fnPredicate(s: *const Store, id: TypeId) Predicate {
+        if (id < s.base_len) return s.base.?.fnPredicate(id);
         const base = s.dataA(id);
         const tpc = s.extra.items[base + 2];
         const pbase = base + 3 + tpc + 3 * s.dataB(id);
@@ -382,6 +462,7 @@ pub const Store = struct {
 
     /// The `this`-parameter type of a signature, or 0 if it has none.
     pub fn fnThisType(s: *const Store, id: TypeId) TypeId {
+        if (id < s.base_len) return s.base.?.fnThisType(id);
         if (s.kind(id) != .function or s.fnFlags(id) & fn_flag_this == 0) return 0;
         const base = s.dataA(id);
         const tpc = s.extra.items[base + 2];
@@ -395,9 +476,11 @@ pub const Store = struct {
     }
 
     pub fn refSymbol(s: *const Store, id: TypeId) u32 {
+        if (id < s.base_len) return s.base.?.refSymbol(id);
         return s.extra.items[s.dataA(id)];
     }
     pub fn refArgs(s: *const Store, id: TypeId) []const TypeId {
+        if (id < s.base_len) return s.base.?.refArgs(id);
         const base = s.dataA(id);
         return s.extra.items[base + 1 .. base + 1 + s.dataB(id)];
     }
@@ -465,9 +548,13 @@ pub const Store = struct {
     /// caller-provided buffer receives (a, b); for extra-payload kinds the
     /// stored extra words are returned.
     fn shapeWords(s: *const Store, id: TypeId, buf: *[2]u32) []const u32 {
+        // Only ever called on an id this store *owns* (its intern map holds
+        // only local ids for an overlay, only base ids for a base), so the
+        // extra-array offsets below index `s.extra` correctly. `s.kind` still
+        // dispatches so overlay ids index the local `kinds` array.
         const a = s.dataA(id);
         const b = s.dataB(id);
-        switch (s.kinds.items[id]) {
+        switch (s.kind(id)) {
             .union_type, .intersection, .overloads => return s.extra.items[a..b],
             .tuple => return s.extra.items[a .. a + 2 * b],
             .object => return s.extra.items[a .. a + 3 + 3 * b],
@@ -504,11 +591,11 @@ pub const Store = struct {
         pub fn hash(ctx: MapCtx, id: TypeId) u64 {
             var buf: [2]u32 = undefined;
             const words = ctx.store.shapeWords(id, &buf);
-            return hashShape(ctx.store.kinds.items[id], words);
+            return hashShape(ctx.store.kind(id), words);
         }
         pub fn eql(ctx: MapCtx, x: TypeId, y: TypeId) bool {
             if (x == y) return true;
-            if (ctx.store.kinds.items[x] != ctx.store.kinds.items[y]) return false;
+            if (ctx.store.kind(x) != ctx.store.kind(y)) return false;
             var bx: [2]u32 = undefined;
             var by: [2]u32 = undefined;
             const wx = ctx.store.shapeWords(x, &bx);
@@ -525,7 +612,7 @@ pub const Store = struct {
             return hashShape(ctx.kind, ctx.words);
         }
         pub fn eql(ctx: PendingCtx, _: void, existing: TypeId) bool {
-            if (ctx.store.kinds.items[existing] != ctx.kind) return false;
+            if (ctx.store.kind(existing) != ctx.kind) return false;
             var buf: [2]u32 = undefined;
             const w = ctx.store.shapeWords(existing, &buf);
             return std.mem.eql(u32, ctx.words, w);
@@ -535,6 +622,17 @@ pub const Store = struct {
     /// Intern a type whose payload words are in `words`. For inline kinds
     /// words = [a, b]; for extra kinds words are appended to `extra` on miss.
     fn internType(s: *Store, kind_: Kind, words: []const u32, b_count: u32) Error!TypeId {
+        std.debug.assert(!s.frozen);
+        // Probe the frozen base first: a type structurally identical to a base
+        // type resolves to the shared *base* id (no overlay duplication). The
+        // candidate `words` reference only sub-ids that are integer-equal to
+        // the base type's, so the raw-word hash/equality carries across stores.
+        if (s.base) |base| {
+            if (base.map.getKeyAdapted(
+                @as(void, {}),
+                PendingCtx{ .store = base, .kind = kind_, .words = words },
+            )) |base_id| return base_id;
+        }
         const gop = try s.map.getOrPutContextAdapted(
             s.alloc,
             @as(void, {}),
@@ -543,7 +641,8 @@ pub const Store = struct {
         );
         if (gop.found_existing) return gop.key_ptr.*;
 
-        const id: TypeId = @intCast(s.kinds.items.len);
+        // New overlay ids start at `base_len`; base ids at 0 (base_len == 0).
+        const id: TypeId = s.base_len + @as(u32, @intCast(s.kinds.items.len));
         switch (kind_) {
             .union_type, .intersection, .overloads => {
                 const start: u32 = @intCast(s.extra.items.len);
@@ -641,9 +740,12 @@ pub const Store = struct {
         if (!s.objectIsFresh(id)) return id;
         const a = s.dataA(id);
         const n = s.dataB(id);
+        // The fresh object may live in the frozen base; read its shape words
+        // from the owning store (base ids carry base-relative extra offsets).
+        const own = if (id < s.base_len) s.base.? else s;
         const start = s.pending.items.len;
         defer s.pending.items.len = start;
-        try s.pending.appendSlice(s.alloc, s.extra.items[a .. a + 3 + 3 * n]);
+        try s.pending.appendSlice(s.alloc, own.extra.items[a .. a + 3 + 3 * n]);
         s.pending.items[start] &= ~obj_flag_fresh;
         return s.internType(.object, s.pending.items[start..], n);
     }
@@ -1080,6 +1182,62 @@ test "refs and type params intern by symbol + args" {
     const tp1 = try s.makeTypeParam(9);
     try testing.expectEqual(tp1, try s.makeTypeParam(9));
     try testing.expectEqual(@as(u32, 9), s.typeParamSymbol(tp1));
+}
+
+test "frozen base / overlay: base ids shared, overlay ids above base_len, deterministic" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Build a base with some non-trivial structural types, then freeze it.
+    var base = try Store.init(a);
+    const base_union = try base.makeUnion(testing.allocator, &.{ string_type, number_type });
+    const base_obj = try base.makeObject(&.{.{ .name = 100, .ty = number_type }}, no_type, no_type, false);
+    const base_ref = try base.makeRef(7, &.{string_type});
+    const base_len: TypeId = @intCast(base.kinds.items.len);
+    try testing.expect(base_union < base_len);
+    try testing.expect(base_obj < base_len);
+    try testing.expect(base_ref < base_len);
+    base.freeze();
+
+    // Two independent overlays over the same frozen base.
+    var ov1 = try Store.initOverlay(a, &base);
+    var ov2 = try Store.initOverlay(a, &base);
+
+    // Well-known intrinsics resolve to their fixed base ids through the overlay.
+    try testing.expectEqual(Kind.string, ov1.kind(string_type));
+    try testing.expectEqual(Kind.number, ov1.kind(number_type));
+
+    // Interning a type structurally identical to a base type returns the BASE
+    // id (shared, < base_len) — no overlay duplication.
+    try testing.expectEqual(base_union, try ov1.makeUnion(testing.allocator, &.{ number_type, string_type }));
+    try testing.expectEqual(base_obj, try ov1.makeObject(&.{.{ .name = 100, .ty = number_type }}, no_type, no_type, false));
+    try testing.expectEqual(base_ref, try ov1.makeRef(7, &.{string_type}));
+    try testing.expectEqual(@as(usize, 0), ov1.overlayCount());
+
+    // Base payload is readable through the overlay's dispatching accessors.
+    try testing.expectEqual(number_type, ov1.objectProp(base_obj, 0).ty);
+    try testing.expectEqual(@as(u32, 7), ov1.refSymbol(base_ref));
+    try testing.expectEqualSlices(TypeId, &.{string_type}, ov1.refArgs(base_ref));
+
+    // An overlay-only type gets an id >= base_len.
+    const ov_arr1 = try ov1.makeArray(number_type);
+    try testing.expect(ov_arr1 >= base_len);
+    try testing.expectEqual(number_type, ov1.arrayElem(ov_arr1));
+
+    // Two independent overlays assign identical ids for the same structural
+    // overlay-only type (determinism across checkers over one frozen base).
+    const ov_arr2 = try ov2.makeArray(number_type);
+    try testing.expectEqual(ov_arr1, ov_arr2);
+
+    // A base structural match still wins in the second overlay too.
+    try testing.expectEqual(base_union, try ov2.makeUnion(testing.allocator, &.{ string_type, number_type }));
+
+    // Overlay-only union that mixes a base id and an overlay id interns locally
+    // and reads back through the dispatch boundary.
+    const mixed = try ov1.makeUnion(testing.allocator, &.{ base_ref, ov_arr1 });
+    try testing.expect(mixed >= base_len);
+    try testing.expectEqual(@as(usize, 2), ov1.members(mixed).len);
 }
 
 test "bytes accounting" {

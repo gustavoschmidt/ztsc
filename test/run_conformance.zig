@@ -139,7 +139,10 @@ fn runCase(alloc: std.mem.Allocator, io: Io, gpa: std.mem.Allocator, interner: *
     prog.* = try modules.singleWithLibProgram(alloc, io, gpa, interner, "", src, tree, bound, false);
     const owned = try alloc.alloc(modules.FileId, 1);
     owned[0] = @intCast(prog.files.len - 1);
-    const result = try checker.checkFiles(alloc, io, gpa, interner, prog, owned);
+    // Exercise the shared frozen base type store (M14.5), like the CLI default.
+    const base = try alloc.create(ztsc.types.Store);
+    base.* = try checker.buildBaseStore(alloc);
+    const result = try checker.checkFiles(alloc, io, gpa, interner, prog, owned, base);
 
     for (bound.diagnostics) |d| {
         const ts = d.code.tsCode();
@@ -172,7 +175,9 @@ fn runDirCase(
 
     const owned = try alloc.alloc(modules.FileId, prog.files.len);
     for (owned, 0..) |*f, i| f.* = @intCast(i);
-    const result = try checker.checkFiles(alloc, io, gpa, interner, prog, owned);
+    const base = try alloc.create(ztsc.types.Store);
+    base.* = try checker.buildBaseStore(alloc);
+    const result = try checker.checkFiles(alloc, io, gpa, interner, prog, owned, base);
 
     for (prog.files, 0..) |*pf, i| {
         const rel = if (std.mem.startsWith(u8, pf.path, case_rel) and pf.path.len > case_rel.len + 1)
@@ -323,6 +328,11 @@ fn renderProgramDiags(
     prog: *const modules.Program,
     n_checkers: usize,
 ) ![]u8 {
+    // One shared frozen base across all overlay checkers (M14.5): this is the
+    // cross-N determinism oracle — independent overlays over one frozen base
+    // must still yield byte-identical diagnostics.
+    const base = try alloc.create(ztsc.types.Store);
+    base.* = try checker.buildBaseStore(alloc);
     // Round-robin partition, one checkFiles call per checker instance.
     const results = try alloc.alloc(checker.Check, n_checkers);
     for (0..n_checkers) |k| {
@@ -331,7 +341,7 @@ fn renderProgramDiags(
         while (i < prog.files.len) : (i += n_checkers) {
             try owned.append(alloc, @intCast(i));
         }
-        results[k] = try checker.checkFiles(alloc, io, gpa, interner, prog, owned.items);
+        results[k] = try checker.checkFiles(alloc, io, gpa, interner, prog, owned.items, base);
     }
 
     const Line = struct { start: u32, code: u16, msg: []const u8 };

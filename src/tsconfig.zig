@@ -997,7 +997,7 @@ test "config-driven program builds and checks (conformance-style)" {
     const checker = @import("checker.zig");
     const owned = try alloc.alloc(modules.FileId, br.program.files.len);
     for (owned, 0..) |*f, i| f.* = @intCast(i);
-    const result = try checker.checkFiles(alloc, io, gpa, &interner, &br.program, owned);
+    const result = try checker.checkFiles(alloc, io, gpa, &interner, &br.program, owned, null);
     // Exactly the one TS2322 in main.ts line 3; skip/broken.ts is excluded.
     try testing.expectEqual(@as(usize, 1), result.diagnostics.len);
     try testing.expectEqual(@as(u16, 2322), result.diagnostics[0].code);

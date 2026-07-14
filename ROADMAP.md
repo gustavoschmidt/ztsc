@@ -843,14 +843,37 @@ corpus / M14's census output, hence *after* M14):
    doubling slack, and a serialization pass that strips the lib's orphan
    parsed-then-discarded sub-nodes and per-construct `unsupported_syntax`
    diagnostics.
-2. **Shared frozen-base / per-checker-overlay type store** (was M12.3). After
-   link, expand lib/`@types` types **once** into a base `Store` and freeze it;
-   per-checker overlay stores allocate TypeIds *above* the base range and probe
-   the frozen base (types + base×base relation-cache entries) before interning
-   locally. This is the type-level twin of M11's merged-symbol layer — reuse
-   the M11 merge table as the enumeration of what to pre-expand. Contained to
-   `types.zig` (checker.zig touches the store only through accessors — 0 direct
-   array reads today, so keep it that way; see layout commitments below).
+2. **Shared frozen-base / per-checker-overlay type store** (was M12.3).
+   **✅ ARCHITECTURE LANDED (2026-07-13) — the base/overlay TypeId split that
+   gates M15 is in.** `types.Store` gained `base: ?*const Store` / `base_len` /
+   `frozen`; `initOverlay(alloc, base)` makes a per-checker overlay whose ids
+   `< base_len` delegate to the frozen base and whose local ids start at
+   `base_len` (indexed `id - base_len`); every accessor dispatches base-vs-overlay,
+   and `internType` probes the frozen base's hash-cons map first so a type
+   structurally identical to a base type resolves to the shared **base** id (no
+   overlay duplication; sub-id words are integer-equal across stores).
+   `checker.buildBaseStore` builds+freezes the base single-threaded post-link
+   (mirrors `seedLibAtoms`); main.zig shares the one `*const Store` to every
+   `CheckerTask`. Correctness oracle `--no-frozen-store` (mirrors
+   `--no-resolve-cache`): diagnostics byte-identical ON-vs-OFF and across
+   `--checkers=1,2,4,8` (verified on multi/deps `-p` + real `.d.ts`); conformance
+   331/331; layout commitment held (0 raw store-array reads outside `types.zig`);
+   benchmark flat; unit test asserts the base-shared / overlay-above-`base_len` /
+   two-overlays-deterministic invariant.
+   **DEFERRED — the base *payload*** (pre-expanding lib/`@types` types into the
+   base + the base×base relation-cache freeze; the M11-merge-table enumeration).
+   Two honest reasons: (i) the RSS win is unmeasurable on today's 9 KB embedded
+   lib (type-dup ~134 KB at N=8) — awaits a larger embedded lib, as the roadmap
+   already framed; (ii) a **real correctness prerequisite discovered en route**:
+   union *and* intersection **display order sorts by raw TypeId**
+   (`makeUnion`/`makeIntersection`, printed in stored order), so relocating lib
+   types to low base ids would reorder e.g. `LibType | userLiteral` and break the
+   byte-identical invariant — **pre-expanding the payload must be paired with
+   making union/intersection display order structural (TypeId-independent)
+   first.** The intrinsics-only base (ids 0–16, identical in both paths)
+   sidesteps this today; the overlay machinery is ready to take the payload once
+   structural display order lands. Still contained to `types.zig` (checker.zig
+   touches the store only through accessors — keep it that way).
 
 **Gate:** diagnostics byte-identical for any N; RSS at N=4 within a small
 constant of N=1 on the multi corpus *and* the full `@types/node` fixture; blob
@@ -858,11 +881,13 @@ load time vs source-parse time recorded in BENCHMARKS.md. The
 `node_accept/backend` mini-fixture is too small to show the N× win (BENCHMARKS
 §3.10) — it validates the harness, not the gate.
 
-> **M15 must not start until piece 2 (the frozen store) has landed.** M15
-> reworks the instantiation caches (`expandRef`/`instantiate`/`eraseTypeParams`
-> memos), and those must be designed around the base/overlay TypeId split from
-> the outset — retrofitting the split into already-shipped instantiation caches
-> is exactly the rework the M12 header's retrofit warning calls out.
+> **M15 unblocked (2026-07-13):** the base/overlay TypeId split M15 must design
+> its instantiation caches around (`expandRef`/`instantiate`/`eraseTypeParams`
+> memos) is now landed (piece 2 architecture above), so M15 avoids the retrofit
+> the M12 header warns about. The deferred base *payload* does NOT block M15 —
+> M15 only needs the split to exist (ids may be base `< base_len` or overlay),
+> which it now does. When the payload later lands, M15's caches must already
+> honor the split (they will, if built now against `base_len`).
 
 **Layout commitments** (cheap insurance so the deferred pieces slot in
 mechanically — honor these in all intervening work, M13/M14 included):
