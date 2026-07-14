@@ -1,26 +1,29 @@
-# ZTSC — Benchmark Report (M7–M11)
+# ZTSC — Benchmark Report (M16)
 
-The scoreboard as of the M11 semantic-breadth work (ROADMAP.md §4): how a
+The scoreboard as of the M16 type-level work (ROADMAP.md §5): how a
 data-oriented, arena-allocated, parallel checker in Zig compares against
 `tsc` 5.5.4 and `tsgo` (the TypeScript 7 native preview) — **on the ztsc
 checked subset** (see the caveats in §6 before quoting any of these numbers).
-Re-measured 2026-07-13 on the ReleaseFast binary at HEAD; ztsc now loads its
-embedded ES-core `lib.d.ts` by default (§3.6–3.7). Milestone deltas since M6
-are detailed in §3.4–3.8; the M6 figures are kept in git history.
+Re-measured 2026-07-14 on the ReleaseFast binary at HEAD, after the M14–M16
+type-level milestones (import()/unique-symbol/JSX/decorators; conditional,
+mapped, and template-literal types + `infer`; recursive aliases). ztsc loads
+its embedded ES-core `lib.d.ts` by default (§3.6–3.7). Milestone deltas since
+M6 are detailed in §3.4–3.12; the M6 figures are kept in git history.
 
 Headline, multi corpus (201 files / 93,364 lines, cross-importing module
 graph):
 
 | | wall (median) | peak RSS |
 |---|---:|---:|
-| **ztsc** (`--checkers=4`) | **0.02 s** | **52.5 MB** |
-| tsgo 7.0.0-dev.20260707.2 | 0.08 s | 204.1 MB |
-| tsc 5.5.4 | 0.93 s | 314.6 MB |
+| **ztsc** (`--checkers=4`) | **0.03 s** | **53.9 MB** |
+| tsgo 7.0.0-dev.20260707.2 | 0.08 s | 205.1 MB |
+| tsc 5.5.4 | 0.91 s | 316.3 MB |
 
-Both acceptance gates pass (§5) with **more margin than M6**: wall ~0.25× of
-tsgo (target ≤ 1.25×), peak RSS **≈ 26% of tsgo** (target ≤ 50%) — down from
-35% at M6, because the M7 memory paydown (−53%/−60% arena heap) more than
-offset the newly-loaded lib and six M11 feature families.
+Both acceptance gates pass (§5) with **more margin than M6**: wall ~0.4× of
+tsgo at the default N=4 (0.25× at N=8; target ≤ 1.25×), peak RSS **≈ 26% of
+tsgo** (target ≤ 50%) — down from 35% at M6, because the M7 memory paydown
+(−53%/−60% arena heap) more than offset the newly-loaded lib and the M11–M16
+feature families (enums through conditional/mapped/template-literal types).
 
 ---
 
@@ -76,82 +79,94 @@ zig-out/bench/ztsc --pretty=false --timing --memory -p bench/corpus/multi
 ## 2. End-to-end: wall clock + peak RSS
 
 ztsc rows use the default `--checkers=4` (lib loaded). Medians of 5 runs,
-max RSS. Re-measured 2026-07-13.
+max RSS. Re-measured 2026-07-14.
 
 | corpus | tool | wall | vs tsgo | peak RSS | vs tsgo |
 |---|---|---:|---:|---:|---:|
-| small | **ztsc** | **0.00 s** | — | **6.0 MB** | 13% |
-| | tsgo | 0.01 s | 1.0× | 46.3 MB | 100% |
-| | tsc | 0.27 s | 27× | 143.3 MB | 309% |
-| medium | **ztsc** | **0.01 s** | ~0.25× | **29.7 MB** | 26% |
-| | tsgo | 0.04 s | 1.0× | 112.5 MB | 100% |
-| | tsc | 0.59 s | 14.8× | 224.2 MB | 199% |
-| multi | **ztsc** | **0.02 s** | ~0.25× | **52.5 MB** | 26% |
-| | tsgo | 0.08 s | 1.0× | 204.1 MB | 100% |
-| | tsc | 0.93 s | 11.6× | 314.6 MB | 154% |
+| small | **ztsc** | **0.00 s** | — | **6.2 MB** | 13% |
+| | tsgo | 0.01 s | 1.0× | 46.5 MB | 100% |
+| | tsc | 0.27 s | 27× | 143.5 MB | 309% |
+| medium | **ztsc** | **0.02 s** | ~0.5× | **26.3 MB** | 23% |
+| | tsgo | 0.04 s | 1.0× | 112.3 MB | 100% |
+| | tsc | 0.59 s | 14.8× | 224.4 MB | 200% |
+| multi | **ztsc** | **0.03 s** | ~0.4× | **53.9 MB** | 26% |
+| | tsgo | 0.08 s | 1.0× | 205.1 MB | 100% |
+| | tsc | 0.91 s | 11.4× | 316.3 MB | 154% |
 
-Peak RSS improved on every corpus vs M6 (small 6.8→6.0, medium 38.1→29.7,
-multi 71.9→52.5 MB) — and *relative* to tsgo from ~35% to ~26% — even though
-ztsc now loads a lib and checks enums, accessors, `as const`/`satisfies`,
-type guards, namespaces, and async/await that didn't exist at M6. Internal
-check-phase time (one `--timing` run): medium 7.8 ms, multi 14.7 ms.
+Peak RSS still sits at ~26% of tsgo despite three type-level milestones (M14–M16)
+landing since the M11 measurement: medium is flat (29.7→26.3 MB) and multi ticks
+up only slightly (52.5→53.9 MB, the check-time cost of the new
+conditional/mapped/template-literal machinery, see §3.3). Internal check-phase
+time rose as expected with that machinery (one warm `--timing` run): medium
+7.8→~11.0 ms, multi 14.7→~20.5 ms — still a fraction of wall and well inside the
+gate. Wall-clock at the default N=4 saturates `/usr/bin/time`'s 10 ms clock on
+small/medium; the N=8 rows (§3.2) show the residual speedup.
 
 ## 3. ztsc detail
 
-### 3.1 Per-phase timing (multi corpus, `--checkers=4`, one `--timing` run)
+### 3.1 Per-phase timing (multi corpus, `--checkers=4`, warm `--timing` run)
+
+Per-phase ms are **aggregate time-in-phase summed across the 10-worker pool**,
+so the front-end phases (which run concurrently, overlapping `discover`) sum to
+more than the `total` wall — `total` is the real end-to-end wall clock:
 
 | phase | ms | lines/s | MB/s |
 |---|---:|---:|---:|
-| load | 2.79 | 33.5 M | 802 |
-| scan | 1.85 | 50.4 M | 1206 |
-| parse | 3.49 | 26.8 M | 641 |
-| bind | 5.75 | 16.2 M | 388 |
-| resolve | 1.16 | — | — |
-| link | 1.87 | — | — |
-| check | 15.94 | 5.9 M | 140 |
-| **total** | **32.9** | | |
+| load | 7.11 | 13.2 M | 315 |
+| scan | 8.24 | 11.4 M | 272 |
+| parse | 23.87 | 3.9 M | 94 |
+| bind | 31.84 | 2.9 M | 70 |
+| resolve | 1.23 | — | — |
+| discover | 7.58 | 12.4 M | 296 |
+| link | 1.01 | — | — |
+| check | 20.47 | 4.6 M | 110 |
+| **total (wall)** | **29.3** | | |
 
-Medium corpus, same shape: load 1.19 / scan 0.56 / parse 1.14 / bind 1.80 /
-resolve 0.01 / link 0.71 / check 7.25, total 12.7 ms.
+Medium corpus, same shape: load 2.70 / scan 4.80 / parse 10.98 / bind 13.33 /
+resolve 0.02 / discover 3.57 / link 0.43 / check 11.10, total 15.3 ms.
 
-Check dominates (~50% of wall); the four checker instances finish within
-1% of each other (15.74–15.90 ms), so the round-robin partition balances
-well on this corpus.
+Check is the largest single phase (~20 ms of aggregate worker time, up from
+14.7 ms at M11 as M14–M16 added conditional/mapped/template-literal evaluation);
+the four checker instances finish within ~6% of each other (28.4–30.2 ms of
+per-checker wall on the cold `--memory` run), so the greedy node-count partition
+(§3.8) still balances this corpus well.
 
 ### 3.2 Checker scaling and the duplicated-type dial (`--checkers=N`)
 
 ROADMAP.md §2.3: N independent checker instances trade duplicated type
-construction for lock-free parallelism. Both axes, re-measured 2026-07-13
-(post-M12 per-checker right-sizing; check ms = min of 4 `--timing` runs, RSS =
-median of ≥5 `/usr/bin/time -l` runs — RSS is scheduling-noisy at high N):
+construction for lock-free parallelism. Both axes, re-measured 2026-07-14
+(post-M16 type-level work; check ms = min of 4 `--timing` runs, RSS = median of
+≥5 `/usr/bin/time -l` runs — RSS is scheduling-noisy at high N):
 
 **multi (93k lines)**
 
 | N | wall | check ms | types created | type-arena bytes | dup overhead vs N=1 | peak RSS |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 0.06 s | 51.8 | 21,525 | 610,978 | — | 48.3 MB |
-| 2 | 0.04 s | 26.8 | 23,053 | 654,775 | +7.1% | 49.9 MB |
-| 4 | 0.03 s | 15.8 | 24,834 | 703,458 | +15.4% | 52.4 MB |
-| 8 | 0.02 s | 13.2 | 26,475 | 744,735 | +23.0% | 48.1 MB |
+| 1 | 0.08 s | 69.4 | 21,539 | 611,180 | — | 49.7 MB |
+| 2 | 0.05 s | 36.8 | 23,067 | 654,977 | +7.2% | 51.3 MB |
+| 4 | 0.03 s | 20.5 | 24,848 | 703,660 | +15.1% | 53.9 MB |
+| 8 | 0.02 s | 15.4 | 26,489 | 744,937 | +21.9% | 47.9 MB |
 
 **medium (50k lines)**
 
 | N | wall | check ms | types created | type-arena bytes | dup overhead vs N=1 | peak RSS |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 0.03 s | 30.4 | 12,262 | 345,431 | — | 26.7 MB |
-| 2 | 0.02 s | 15.0 | 12,593 | 351,327 | +2.7% | 26.6 MB |
-| 4 | 0.01 s | 8.1 | 13,023 | 359,135 | +6.2% | 27.3 MB |
-| 8 | 0.01 s | 5.5 | 13,524 | 368,640 | +10.3% | 25.3 MB |
+| 1 | 0.04 s | 38.4 | 12,276 | 345,633 | — | 27.4 MB |
+| 2 | 0.02 s | 19.6 | 12,607 | 351,529 | +1.7% | 27.6 MB |
+| 4 | 0.02 s | 11.0 | 13,037 | 359,337 | +4.0% | 26.3 MB |
+| 8 | 0.01 s | 8.2 | 13,538 | 368,842 | +6.7% | 25.6 MB |
 
-Check-phase speedup is near-linear to N=4 (3.3× on multi) and tapering at N=8
-(3.9×); the *type*-duplication overhead still climbs to +23% by N=8 but the
-type arena is <1 MB, noise against the ~50 MB process RSS. What changed with
-M12's right-sizing (§3.10): peak RSS no longer grows monotonically with N —
-N=4 is now the high-water mark (four heavy concurrent working sets) while N=8,
-whose eight checkers each own a smaller slice and only page in that slice, sits
-back at the N=1 level. N=4 remains the default and the wall-clock sweet spot.
+Check-phase speedup is near-linear to N=4 (3.4× on multi, 3.5× on medium) and
+tapering at N=8 (4.5× / 4.7×); the *type*-duplication overhead still climbs to
++22% by N=8 but the type arena is <1 MB, noise against the ~50 MB process RSS.
+Absolute check ms is up ~35% vs M11 (multi N=1 51.8→69.4) — that is the M14–M16
+type-level machinery, and it parallelizes with the same near-linear shape. The
+M12 right-sizing (§3.10) still holds: peak RSS does not grow monotonically with
+N — N=4 is the high-water mark (four heavy concurrent working sets) while N=8,
+whose eight checkers each own a smaller slice, sits back at the N=1 level. N=4
+remains the default and the wall-clock sweet spot.
 
-### 3.3 Memory metrics (multi corpus, N=4, `--memory`, lib-loaded, 2026-07-13)
+### 3.3 Memory metrics (multi corpus, N=4, `--memory`, lib-loaded, 2026-07-14)
 
 The per-structure accounting behind the RSS number:
 
@@ -160,10 +175,12 @@ The per-structure accounting behind the RSS number:
 | bytes/token | 5.00 | 1-byte tag + 4-byte start, SoA (M1 target: small) |
 | bytes/AST node | 16.06 | SoA node + shared extra_data (M2 target ≤ 24) |
 | binder bytes/line | 32.96 | symbols + scopes + flow graph + records |
-| bytes/type | 28.33 | hash-consed, arena-allocated |
+| bytes/type | 28.32 | hash-consed, arena-allocated |
 | types/line | 0.27 | interning working: 0.27 types per source line |
+| relation cache hit rate | 47.0% | assignability memo on `TypeId` pairs |
+| inst cache hit rate | 26.4% | generic-instantiation memo (M15) |
 | node_types hit rate | 15.3% | contextual-keyed expression-type cache (M8) |
-| **heap total (arenas)** | **18.4 MB** | **~197 bytes/line** (M6 was 45.5 MB / 508 — see §3.4) |
+| **heap total (arenas)** | **17.8 MB** | **~190 bytes/line** (M6 was 45.5 MB / 508 — see §3.4) |
 
 The M7 paydown (§3.4) roughly halved every arena-heap figure; the
 per-structure *unit* costs (bytes/token, bytes/node, bytes/type) are
@@ -493,10 +510,13 @@ M13 snapshot.
 
 Before timing, all three tools were run on the corpora: `ztsc -p`,
 `tsc --noEmit -p`, and `tsgo --noEmit -p` all exit 0 with zero diagnostics.
-The **274-case** conformance suite (code + line differential vs tsc 5.5.4,
-including 30 multi-file cases) is green, and `gen_expected.js --check`
-confirms every snapshot still matches real tsc output. Unit tests: 236
-module tests + 4 fuzz targets, all green.
+The **365-case** conformance suite (code + line differential vs tsc 5.5.4,
+including 50 multi-file cases) is green, and `gen_expected.js --check`
+confirms every snapshot still matches real tsc output. Unit tests: 248
+module tests + 5 CLI tests, all green (`zig build test` reports 256/256
+across the three test binaries, including the 3-test conformance runner);
+determinism (diagnostics byte-identical for N ∈ {1,2,4,8}) and cycle-stress
+harness tests pass.
 
 ---
 
@@ -507,12 +527,13 @@ and peak RSS ≤ 50% of tsgo; conformance suite green.*
 
 | corpus | wall vs tsgo (≤ 1.25×) | RSS vs tsgo (≤ 50%) | verdict |
 |---|---|---|---|
-| medium | 0.01 s vs 0.04 s ≈ **0.25×** | 29.7 / 112.5 MB ≈ **26%** | **pass** |
-| multi | 0.02 s vs 0.08 s ≈ **0.25×** | 52.5 / 204.1 MB ≈ **26%** | **pass** |
+| medium | 0.02 s vs 0.04 s ≈ **0.5×** (0.25× at N=8) | 26.3 / 112.3 MB ≈ **23%** | **pass** |
+| multi | 0.03 s vs 0.08 s ≈ **0.4×** (0.25× at N=8) | 53.9 / 205.1 MB ≈ **26%** | **pass** |
 
-Conformance: **274/274** vs tsc 5.5.4 — green. The RSS margin *widened* since
-M6 (35% → 26% of tsgo) despite ztsc now loading a lib and checking enums,
-accessors, `as const`/`satisfies`, type guards, namespaces, and async/await.
+Conformance: **365/365** vs tsc 5.5.4 — green. The RSS margin *held* at ~26% of
+tsgo despite the M14–M16 type-level milestones (import()/JSX/decorators;
+conditional, mapped, and template-literal types + `infer`; recursive aliases)
+landing on top of the M6 subset — and *widened* from the 35% at M6.
 
 Honesty notes:
 
@@ -531,17 +552,21 @@ Honesty notes:
 This is a **fair-for-the-subset** comparison, not a general claim that
 ztsc is faster than tsc or tsgo:
 
-- **ztsc checks a subset** (ROADMAP.md §6). Since M6 the subset has grown
-  to include enums, accessors, `abstract`, `as const`/`satisfies`, type
-  guards, namespaces + within-file merging, and async/await — but still no
-  conditional/mapped/template-literal types, no `infer`, no cross-file
-  declaration merging, decorators, or JSX. On real-world code, tsc and tsgo
-  do substantially more type-level work per line than these corpora demand.
-- **Small `lib.d.ts`.** ztsc now loads a *trimmed* ES-core lib (~220 lines,
+- **ztsc checks a subset** (ROADMAP.md §6), but the subset has grown a lot
+  since M6: through M16 it now includes enums, accessors, `abstract`, `as
+  const`/`satisfies`, type guards, namespaces + cross-file declaration merging,
+  async/await, `import()` types, `unique symbol`, decorators, JSX, and the
+  type-level surface — conditional, mapped, and template-literal types with
+  `infer` and recursive aliases. Remaining gaps are narrower (e.g. some
+  index-signature assignability edge cases). The *corpora here* stay
+  deliberately simple, though, and exercise little of that type-level
+  machinery — so on real-world code tsc and tsgo still do more type-level work
+  per line than these synthetic projects demand.
+- **Small `lib.d.ts`.** ztsc now loads a *trimmed* ES-core lib (~280 lines,
   §3.6–3.7); tsc/tsgo load their full default libs (thousands of lines,
   including dom). Some of the RSS/wall gap is still that fixed lib-size
   difference — it shrinks in relative terms as corpora grow, and the
-  multi-corpus gap (52 vs 204 MB) is not explained by lib size alone. The
+  multi-corpus gap (54 vs 205 MB) is not explained by lib size alone. The
   corpora themselves stay lib-free so the comparison isolates checker work.
 - **The corpora are synthetic** — generated, regular code with a realistic
   import graph but less type-level diversity than human code. Relation
