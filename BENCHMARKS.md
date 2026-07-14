@@ -504,6 +504,37 @@ leaving **conditional type (44.8%) + infer (18.4%)** as the top pair and
 confirming M16a as the next-highest-value target. Table above preserved as the
 M13 snapshot.
 
+## 3.13 M18.2 — the real lib vendored (before → after)
+
+The embedded lib went from the hand-written **~9 KB** ES-core surface (M9) to
+the **real TypeScript 5.5.4** `lib.esnext` reference chain — 71 `lib.*.d.ts`
+files, ES core through esnext, DOM/webworker/scripthost excluded, plus a
+minimal `console` shim: **~527 KB / 12,171 lines**. `--census` over the
+embedded lib is **0 out-of-subset**. Startup now pays a real lib parse+bind,
+and every checker re-expands the lib types it touches — the exact costs M19
+exists to claw back. Measured on the multi corpus (median of 3, `bench/e2e.sh
+multi`, ReleaseFast), before = M18.1 baseline (§3.2), after = M18.2:
+
+| N | wall before→after | peak RSS before→after | types (N) before→after | type-bytes before→after |
+|---:|---|---|---|---|
+| 1 | 0.08 → 0.09 s | 49.7 → 52.1 MB (+4.8%) | 21,539 → 24,253 (+12.6%) | 611,180 → 706,606 (+15.6%) |
+| 2 | 0.05 → 0.05 s | 51.3 → 53.4 MB (+4.1%) | 23,067 → 25,796 (+11.8%) | 654,977 → 750,914 (+14.6%) |
+| 4 | 0.03 → 0.03 s | 53.9 → 54.3 MB (+0.7%) | 24,848 → 27,569 (+10.9%) | 703,660 → 799,205 (+13.6%) |
+| 8 | 0.02 → 0.03 s | 47.9 → 48.2 MB (+0.6%) | 26,489 → 29,266 (+10.5%) | 744,937 → 842,922 (+13.2%) |
+
+**The regression is far smaller than the roadmap feared, and is expected to
+be — ztsc materializes lib types lazily, so only the esnext surface the corpus
+actually touches (`Array`/`Map`/`Promise`/string methods) is ever interned;
+the bulk (Intl, typed arrays, Atomics, WeakRef, …) never expands.** Peak RSS
+rises **+2.4 MB at N=1** and is essentially flat at the default N=4 (+0.4 MB);
+type population is **+11% at N=4**. Wall clock is within measurement noise (the
+527 KB single-threaded lib parse+bind at startup adds ≈1 corpus-file's worth of
+front-end). This is still ~26% of tsgo's RSS at N=4, so the M21 headline gate
+(≤50% of tsgo) holds comfortably on the real-lib configuration. The numbers are
+recorded here per the M18 mandate, not optimized — M19 (frozen-base payload +
+pre-parsed lib blob) is where the per-checker duplication and the cold-start
+parse are reclaimed.
+
 ---
 
 ## 4. Cross-checking correctness while benchmarking

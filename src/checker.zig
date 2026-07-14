@@ -901,6 +901,20 @@ const Checker = struct {
         }
     }
 
+    /// If `node` is syntactically `Symbol.<wellKnownName>` (e.g.
+    /// `Symbol.iterator`), returns the synthetic member key `__@<name>` used by
+    /// the declaration side (`ast.wellKnownSymbolKey`). Matches the identifier
+    /// text `Symbol` like the binder/parser do — a purely syntactic recognizer,
+    /// independent of whether the real lib types `Symbol.iterator` as a
+    /// `unique symbol`.
+    fn wellKnownKeyOfExpr(c: *const Checker, node: Node) ?[]const u8 {
+        if (node == null_node or c.nodeTag(node) != .member_expr) return null;
+        const md = c.tree.nodeData(node);
+        if (c.nodeTag(md.lhs) != .identifier) return null;
+        if (!std.mem.eql(u8, c.tokenText(c.tree.nodeMainToken(md.lhs)), "Symbol")) return null;
+        return ast.wellKnownSymbolKey(c.tokenText(md.rhs));
+    }
+
     fn stripQuotes(text: []const u8) []const u8 {
         if (text.len >= 2 and (text[0] == '"' or text[0] == '\'')) {
             if (text[text.len - 1] == text[0]) return text[1 .. text.len - 1];
@@ -1662,7 +1676,19 @@ const Checker = struct {
                 }
                 if (f.type_param) return c.ts.makeTypeParam(sym);
                 if (f.enum_decl) return c.ts.makeEnumType(sym);
-                if (f.type_alias) return c.aliasInstance(sym, args, tok);
+                if (f.type_alias) {
+                    // The real lib declares the four string transforms as
+                    // `type Uppercase<S extends string> = intrinsic;`. Recognize
+                    // an `intrinsic`-bodied alias by name and apply the mapping
+                    // (ztsc has no general `intrinsic` mechanism). A user alias
+                    // of the same name with a real body is unaffected.
+                    if (args.len == 1) {
+                        if (intrinsicStringMapping(c.atomText(a))) |kind_idx| {
+                            if (c.aliasBodyIsIntrinsic(sym)) return c.applyStringMapping(kind_idx, args[0]);
+                        }
+                    }
+                    return c.aliasInstance(sym, args, tok);
+                }
                 if (f.interface or f.class) {
                     const fixed = try c.fixTypeArgs(sym, args, tok) orelse return types.error_type;
                     return c.ts.makeRef(sym, fixed);
@@ -1946,6 +1972,65 @@ const Checker = struct {
             const tp_sym = c.bind.lookupInScope(decl_scope, a) orelse continue;
             const td = c.tree.nodeData(tp);
             try buf.append(c.scratch(), .{ .sym = c.toGlobal(tp_sym), .constraint = td.lhs, .default = td.rhs });
+        }
+    }
+
+    /// Type-parameter symbols of a single declaration node (class/interface/
+    /// alias), in positional order, resolved in the current file context.
+    /// Reopened interface blocks each bind a *distinct* type-param symbol for
+    /// the same positional name, so an instantiation must map all of them (see
+    /// `buildInstMap`).
+    fn typeParamSymsOfDecl(c: *Checker, decl: Node, buf: *std.ArrayList(SymbolId)) Error!void {
+        const d = c.tree.nodeData(decl);
+        var tp_start: u32 = 0;
+        var tp_end: u32 = 0;
+        switch (c.nodeTag(decl)) {
+            .class_decl => {
+                const data = c.tree.extraData(ast.ClassData, d.lhs);
+                tp_start = data.tp_start;
+                tp_end = data.tp_end;
+            },
+            .interface_decl => {
+                const data = c.tree.extraData(ast.InterfaceData, d.lhs);
+                tp_start = data.tp_start;
+                tp_end = data.tp_end;
+            },
+            .type_alias => {
+                const data = c.tree.extraData(ast.TypeAlias, d.lhs);
+                tp_start = data.tp_start;
+                tp_end = data.tp_end;
+            },
+            else => return,
+        }
+        const decl_scope = (try c.scopeOf(decl)) orelse return;
+        for (c.tree.extraRange(tp_start, tp_end)) |tp| {
+            if (tp == null_node or c.nodeTag(tp) != .type_param) continue;
+            const a = try c.atomOfToken(c.tree.nodeMainToken(tp));
+            const tp_sym = c.bind.lookupInScope(decl_scope, a) orelse continue;
+            try buf.append(c.scratch(), c.toGlobal(tp_sym));
+        }
+    }
+
+    /// Build the type-parameter → argument substitution map for instantiating
+    /// generic `sym` with `args`. A reopened interface (or a cross-file merged
+    /// interface, M11a) binds a distinct type-param symbol per declaration
+    /// block, but tsc unifies them by position — so every block's i-th
+    /// type-param symbol maps to `args[i]`. Missing args fall back to `any`.
+    fn buildInstMap(c: *Checker, sym: SymbolId, args: []const TypeId, out: *std.ArrayList(TpMap)) Error!void {
+        var one = [_]SymbolId{sym};
+        const parts: []const SymbolId = if (c.prog.isMergedId(sym)) c.prog.mergedSym(sym).parts else one[0..];
+        for (parts) |csym| {
+            const saved = c.enterSymFile(csym);
+            defer c.restoreCtx(saved);
+            for (c.declsOf(csym)) |decl| {
+                var syms: std.ArrayList(SymbolId) = .empty;
+                defer syms.deinit(c.scratch());
+                try c.typeParamSymsOfDecl(decl, &syms);
+                for (syms.items, 0..) |tp_sym, i| {
+                    const ty = if (i < args.len) args[i] else types.any_type;
+                    try out.append(c.scratch(), .{ .sym = tp_sym, .ty = ty });
+                }
+            }
         }
     }
 
@@ -3056,12 +3141,12 @@ const Checker = struct {
         defer tps.deinit(c.scratch());
         try c.typeParamsOf(sym, &tps);
         if (tps.items.len > 0) {
-            const n = @min(tps.items.len, args.len);
-            var map = try c.scratch().alloc(TpMap, tps.items.len);
-            for (tps.items, 0..) |tp, i| {
-                map[i] = .{ .sym = tp.sym, .ty = if (i < n) args[i] else types.any_type };
-            }
-            result = try c.instantiate(generic, map);
+            // Map every declaration block's positional type params (reopened /
+            // merged interfaces bind a distinct symbol per block) to args.
+            var map_list: std.ArrayList(TpMap) = .empty;
+            defer map_list.deinit(c.scratch());
+            try c.buildInstMap(sym, args, &map_list);
+            result = try c.instantiate(generic, map_list.items);
         }
         try c.expansions.put(c.ca(), ref, result);
         return result;
@@ -3810,6 +3895,12 @@ const Checker = struct {
                 for (0..s.fnParamCount(t)) |i| {
                     if (try c.containsTypeParam(s.fnParam(t, @intCast(i)).ty)) return true;
                 }
+                // The type predicate's guarded type (`x is S`) can carry a type
+                // param not present anywhere else in the signature.
+                if (s.fnHasPredicate(t)) {
+                    const pr = s.fnPredicate(t);
+                    if (pr.ty != types.no_type and try c.containsTypeParam(pr.ty)) return true;
+                }
                 return false;
             },
             .ref => {
@@ -3991,10 +4082,22 @@ const Checker = struct {
                 for (tps) |tp| {
                     if (tpLookup(map, tp) == null) try kept.append(c.scratch(), tp);
                 }
-                // Predicates are dropped on instantiation (prior behavior); the
-                // `this` type is preserved and instantiated.
+                // Preserve the type predicate (`x is S`) through instantiation,
+                // substituting its guarded type (`S` → arg). Dropping it (the
+                // prior behavior) erased the guard on real-lib overloads like
+                // `filter<S extends T>(p: (v: T) => v is S): S[]`, so a plain
+                // boolean predicate spuriously matched the type-guard overload.
+                // The `this` type is likewise preserved and instantiated.
+                const pred: ?types.Predicate = if (s.fnHasPredicate(t)) blk_p: {
+                    const pr = s.fnPredicate(t);
+                    break :blk_p types.Predicate{
+                        .param = pr.param,
+                        .asserts = pr.asserts,
+                        .ty = if (pr.ty != types.no_type) try c.instantiateId(pr.ty, map, map_id) else pr.ty,
+                    };
+                } else null;
                 const this_ty = s.fnThisType(t);
-                break :blk try s.makeFunctionThis(params.items, ret, kept.items, s.fnFlags(t), null, if (this_ty != 0) try c.instantiateId(this_ty, map, map_id) else 0);
+                break :blk try s.makeFunctionThis(params.items, ret, kept.items, s.fnFlags(t), pred, if (this_ty != 0) try c.instantiateId(this_ty, map, map_id) else 0);
             },
             .ref => blk: {
                 var args: std.ArrayList(TypeId) = .empty;
@@ -5033,6 +5136,22 @@ const Checker = struct {
         if (std.mem.eql(u8, name, "Capitalize")) return types.string_mapping_capitalize;
         if (std.mem.eql(u8, name, "Uncapitalize")) return types.string_mapping_uncapitalize;
         return null;
+    }
+
+    /// Whether type alias `sym`'s body is the bare `intrinsic` keyword-identifier
+    /// (`type Uppercase<S extends string> = intrinsic;`), the marker the real lib
+    /// uses for its magic string transforms. Distinguishes them from a user alias
+    /// that merely shares the name.
+    fn aliasBodyIsIntrinsic(c: *Checker, sym: SymbolId) bool {
+        const saved = c.enterSymFile(sym);
+        defer c.restoreCtx(saved);
+        for (c.declsOf(sym)) |decl| {
+            if (c.nodeTag(decl) != .type_alias) continue;
+            const body = c.tree.nodeData(decl).rhs;
+            if (body == null_node or c.nodeTag(body) != .identifier) return false;
+            return std.mem.eql(u8, c.tokenText(c.tree.nodeMainToken(body)), "intrinsic");
+        }
+        return false;
     }
 
     /// The literal text following template hole `i` in a template-literal type
@@ -7362,6 +7481,25 @@ const Checker = struct {
         const rk = c.ts.kind(r);
         if (rk == .any or rk == .err) return types.any_type;
         var result: TypeId = types.any_type;
+        // `o[Symbol.iterator]` (and the other well-known symbols): the member
+        // is keyed syntactically by `__@iterator` on the declaration side
+        // (`wellKnownSymbolKey`), so the access side must key it the same way.
+        // In the real lib `Symbol.iterator` is typed `unique symbol`, so this
+        // must run *before* the generic `unique symbol` (`__@uN`) path below,
+        // which would otherwise look up a mismatched nominal key.
+        if (c.wellKnownKeyOfExpr(d.rhs)) |wk| {
+            const key = try c.atom(wk);
+            if (try c.propOfType(r, key)) |p| {
+                result = if (p.optional()) try c.makeUnion2(p.ty, types.undefined_type) else p.ty;
+            } else {
+                try c.diagFmt(2339, c.nodeSpan(d.rhs), "Property '{s}' does not exist on type '{s}'.", .{
+                    c.atomText(key), try c.typeToString(obj_t),
+                });
+                result = types.error_type;
+            }
+            if (add_undefined) return c.makeUnion2(result, types.undefined_type);
+            return result;
+        }
         // `o[k]` where `k` is a `unique symbol`: resolve the nominally-keyed
         // property (see `uniqueSymAtom`).
         if (try c.uniqueSymAtom(idx_t)) |key| {
@@ -8032,6 +8170,11 @@ const Checker = struct {
         }
         // Overloads: first signature whose arity fits and whose args check.
         for (sigs) |sig| {
+            // With explicit type arguments, only a signature with the matching
+            // type-parameter count is a candidate (tsc). Skips e.g. the
+            // non-generic `new (): Map<any, any>` when `new Map<K, V>()` names
+            // two type args, so the generic overload is chosen instead.
+            if (explicit_targs.len > 0 and c.ts.fnTypeParams(sig).len != explicit_targs.len) continue;
             const inst = try c.instantiateSigForCall(sig, explicit_targs, arg_nodes, node);
             if (nargs < c.requiredParams(inst) or nargs > c.paramTotal(inst)) continue;
             if (try c.argumentsMatch(inst, arg_nodes)) {

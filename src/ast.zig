@@ -79,9 +79,28 @@ pub const Flags = struct {
 /// synthetic key never collides with an ordinary member. Returns null for
 /// names ztsc does not model (those stay out of subset).
 pub fn wellKnownSymbolKey(name: []const u8) ?[]const u8 {
+    // The full ES well-known-symbol set (through esnext: `dispose`,
+    // `asyncDispose`, `metadata`). Each `[Symbol.<name>]` computed member is
+    // keyed by a synthetic `__@<name>` atom; the `__@` prefix cannot appear in
+    // a real identifier, so a synthetic key never collides with an ordinary
+    // member. The real 5.5.4 lib uses all of these (M18.2).
     const pairs = [_]struct { n: []const u8, k: []const u8 }{
         .{ .n = "iterator", .k = "__@iterator" },
         .{ .n = "asyncIterator", .k = "__@asyncIterator" },
+        .{ .n = "hasInstance", .k = "__@hasInstance" },
+        .{ .n = "isConcatSpreadable", .k = "__@isConcatSpreadable" },
+        .{ .n = "match", .k = "__@match" },
+        .{ .n = "matchAll", .k = "__@matchAll" },
+        .{ .n = "replace", .k = "__@replace" },
+        .{ .n = "search", .k = "__@search" },
+        .{ .n = "species", .k = "__@species" },
+        .{ .n = "split", .k = "__@split" },
+        .{ .n = "toPrimitive", .k = "__@toPrimitive" },
+        .{ .n = "toStringTag", .k = "__@toStringTag" },
+        .{ .n = "unscopables", .k = "__@unscopables" },
+        .{ .n = "dispose", .k = "__@dispose" },
+        .{ .n = "asyncDispose", .k = "__@asyncDispose" },
+        .{ .n = "metadata", .k = "__@metadata" },
     };
     for (pairs) |p| {
         if (std.mem.eql(u8, name, p.n)) return p.k;

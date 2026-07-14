@@ -60,10 +60,13 @@ pub const no_file: FileId = std.math.maxInt(FileId);
 /// Synthetic path of the injected ES-core lib (M10). It has no on-disk
 /// location; the loaders special-case this exact path and use `lib_source`.
 /// The leading NUL keeps it from colliding with any real filesystem path.
-pub const lib_path = "\x00lib/es.core.d.ts";
-/// The embedded lib text (see `src/lib/es.core.d.ts`). Bound once per run;
-/// its top-level declarations become the program's global symbols.
-pub const lib_source = @embedFile("lib/es.core.d.ts");
+pub const lib_path = "\x00lib/lib.esnext.d.ts";
+/// The embedded lib text (see `src/lib/lib.esnext.d.ts`, M18.2 — the real
+/// TypeScript 5.5.4 ES-core..esnext surface, DOM excluded, plus a minimal
+/// `console` shim). Bound once per run; its top-level declarations become the
+/// program's global symbols. Its own diagnostics are suppressed (like tsc's
+/// default lib) — see the print loop in main.zig.
+pub const lib_source = @embedFile("lib/lib.esnext.d.ts");
 
 /// The final resolution of an imported/exported name.
 pub const Target = struct {

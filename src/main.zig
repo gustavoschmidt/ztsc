@@ -943,6 +943,23 @@ pub fn main(init: std.process.Init) !void {
         const path = paths.items[i];
         const src = results.items[i] orelse continue;
         const tree = trees.items[i] orelse continue;
+        // Never surface diagnostics from the built-in lib itself, matching
+        // tsc, which does not diagnose the default lib. The vendored real
+        // 5.5.4 lib (M18.2) is census-clean but trips a few ztsc-incompleteness
+        // diagnostics (`intrinsic`, `globalThis`, merged-interface duplicate
+        // members); those degrade the affected lib types to `any` rather than
+        // leaking spurious errors onto every user run. Diagnostic cursor for
+        // the lib's owning checker is still advanced below so later files stay
+        // aligned. The lib is only present as file 0 (see the injection site).
+        if (std.mem.eql(u8, path, modules.lib_path)) {
+            const owner = file_owner[i];
+            if (tasks[owner].result) |ck| {
+                var cur = cursors[owner];
+                while (cur < ck.diagnostics.len and ck.diagnostics[cur].file == i) : (cur += 1) {}
+                cursors[owner] = cur;
+            }
+            continue;
+        }
         emitter.beginFile();
         for (tree.diagnostics) |d| {
             try emitter.emit(path, &src, d.span, 0, d.message());

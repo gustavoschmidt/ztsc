@@ -1448,9 +1448,9 @@ graduates the M11 acceptance test to the *real* pinned `@types/node`.
    instantiation drops sigs (the lib's XConstructor pattern is non-generic —
    generic *signatures*, not generic interfaces — so unaffected). Both are
    under-reports, policy-acceptable for v0.0.1.
-2. **Vendor the real lib.** Replace the trimmed lib with the real
-   TypeScript **5.5.4** lib surface (same pinned version as the
-   differential oracle): ES core through esnext, **no DOM** (backend-
+2. **Vendor the real lib. ✅ DONE (2026-07-14).** Replace the trimmed lib
+   with the real TypeScript **5.5.4** lib surface (same pinned version as
+   the differential oracle): ES core through esnext, **no DOM** (backend-
    first; tsconfig `lib` selection is post-v0.0.1). Note the conformance
    harness runs tsc with `lib: ["lib.esnext.d.ts","lib.dom.d.ts"]` (dom
    only for `console`) — either keep a minimal console shim embedded, or
@@ -1464,6 +1464,54 @@ graduates the M11 acceptance test to the *real* pinned `@types/node`.
    population — are *expected* and are exactly what M19 exists to claw
    back; record the before/after wall/RSS honestly in BENCHMARKS.md
    rather than optimizing prematurely here.
+
+   **Landed.** The embedded lib (`src/lib/lib.esnext.d.ts`, ~527 KB /
+   12,171 lines) is the real 5.5.4 `lib.esnext` reference chain — 71
+   `lib.*.d.ts` concatenated deps-first, DOM/webworker/scripthost excluded,
+   plus a minimal `console` shim (`console` lives in lib.dom, so both sides
+   resolve it — the harness lib list is unchanged). **Console decision:**
+   keep the embedded shim (matches the prior differential contract; the real
+   lib declares no `console`, so no conflict). `--census` over the embedded
+   lib is **0 out-of-subset** (the full well-known-symbol set —
+   `toPrimitive`/`toStringTag`/`species`/`match`/`dispose`/`metadata`/… — was
+   added to `ast.wellKnownSymbolKey`, clearing all 60 computed-member-name
+   census hits). **Lib diagnostics are suppressed like tsc's default lib**
+   (main.zig + the conformance harness skip file 0): the lib is census-clean
+   but trips a few ztsc-incompleteness diagnostics that degrade to `any` —
+   the three **accepted gaps**: (a) `intrinsic`-bodied string transforms
+   (`Uppercase`/`Lowercase`/`Capitalize`/`Uncapitalize`) — recognized by name
+   with an `intrinsic`-body check and routed to the M16c string-mapping
+   engine, so they *work* despite ztsc having no general `intrinsic`
+   mechanism; (b) `globalThis` (`DecoratorMetadata`'s `typeof globalThis`
+   conditional → `any`); (c) `NoInfer<T> = intrinsic` → `any`. **Five real
+   pre-existing checker bugs the real lib exposed, all fixed** (each isolated
+   + differential vs tsc 5.5.4): (1) **reopened/merged generic interfaces
+   dropped type-param substitution** for members from non-first declaration
+   blocks — `Array<T>`/`Map<K,V>` are declared across ~8 lib files, so
+   `filter`/`includes`/`keys` leaked raw `T` (`buildInstMap` now maps every
+   block's positional type-param symbol to the arg); (2) **`x[Symbol.iterator]`
+   element access** keyed by unique-symbol id (`__@u1`) instead of the
+   syntactic `__@iterator` the declaration uses — now recognizes `Symbol.<wk>`
+   syntactically on the access side; (3) **`instantiate` dropped type
+   predicates**, so a plain-boolean arrow spuriously matched a
+   `filter<S extends T>(p: (v) => v is S)` type-guard overload — predicates
+   are now preserved+substituted through instantiation; (4) **overload
+   resolution ignored explicit-type-arg arity** — `new Map<K,V>()` picked the
+   non-generic `new (): Map<any,any>` sig → `Map<any,any>`; a candidate now
+   must have the matching type-param count when type args are explicit; (5)
+   fell out of (1)+(3) together. **Conformance 384 → 384** (count unchanged;
+   **10 cases moved** — filter/find/array-method, Map/Set iteration,
+   `[Symbol.iterator]`, and the four intrinsic string-transform cases all
+   went red on the real lib and were driven back green by the five fixes, each
+   re-confirmed against tsc 5.5.4; the multi-file suite's lib-diag leak was
+   fixed by the harness skip). **Cost (multi, before→after, N=1/4/8):** wall
+   0.08→0.09 / 0.03→0.03 / 0.02→0.03 s; peak RSS 49.7→52.1 / 53.9→54.3 /
+   47.9→48.2 MB (**+2.4 MB at N=1, +0.4 MB at N=4**); types(N=4) 24,848→27,569
+   (**+11%**). The regression is much smaller than feared because ztsc expands
+   lib types lazily (only the touched esnext surface interns); still ~26% of
+   tsgo RSS at N=4, so M21's ≤50%-of-tsgo gate holds. Full table: BENCHMARKS
+   §3.13. M19 remains the mandated claw-back for the per-checker duplication +
+   cold-start lib parse.
 3. **Lib-gated deferrals from M14 land now:** the TC39 decorator
    signature checks TS1238/TS1240/TS1241 and parameter-decorator TS1206
    (they need `ClassMethodDecoratorContext` et al., present in the real
