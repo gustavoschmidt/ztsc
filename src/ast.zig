@@ -460,8 +460,18 @@ pub const Tag = enum(u8) {
     method_signature,
     /// `[k: K]: V`. main_token = `[`; lhs = extra→IndexSig, rhs = flags.
     index_signature,
+    /// Bare call signature `(params): R` in an interface / type literal
+    /// (M18.1). main_token = `(` or `<`; lhs = extra→FnProto, rhs unused.
+    call_signature,
+    /// Construct signature `new (params): R` in an interface / type literal
+    /// (M18.1). main_token = `new`; lhs = extra→FnProto, rhs unused.
+    construct_signature,
     /// `(params) => R`. main_token = `(` or `<`; lhs = extra→FnProto.
     function_type,
+    /// Standalone constructor type `new (params) => R` / `abstract new … => R`
+    /// in type position (M18.1). main_token = `new` (or `abstract`);
+    /// lhs = extra→FnProto, rhs = 1 iff `abstract`.
+    constructor_type,
     /// `keyof T`. lhs = operand.
     keyof_type,
     /// `typeof entity` in type position. lhs = entity name node
@@ -1007,7 +1017,7 @@ pub const Ast = struct {
                     it.pushProto(a, d.lhs);
                     it.push(d.rhs); // body (optional)
                 },
-                .function_type, .method_signature => it.pushProto(a, d.lhs),
+                .function_type, .method_signature, .call_signature, .construct_signature, .constructor_type => it.pushProto(a, d.lhs),
                 .property_signature => it.push(d.lhs),
                 .index_signature => {
                     const e = a.extraData(IndexSig, d.lhs);
@@ -1118,7 +1128,7 @@ pub const Ast = struct {
             .declarator_full => a.extraData(DeclaratorFull, d.rhs).flags,
             .class_field => a.extraData(Field, d.lhs).flags,
             .param_full => a.extraData(ParamFull, d.rhs).flags,
-            .arrow_fn, .function_expr, .function_decl, .class_method, .function_type, .method_signature => a.extraData(FnProto, d.lhs).flags,
+            .arrow_fn, .function_expr, .function_decl, .class_method, .function_type, .method_signature, .call_signature, .construct_signature, .constructor_type => a.extraData(FnProto, d.lhs).flags,
             .class_decl => a.extraData(ClassData, d.lhs).flags,
             .enum_decl => a.extraData(EnumData, d.lhs).flags,
             .namespace_decl => a.extraData(NamespaceData, d.lhs).flags,

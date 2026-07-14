@@ -2946,29 +2946,42 @@ const Parser = struct {
     /// admit function types without recursing into conditional parsing.
     fn parseNonConditionalType(p: *Parser) PE!Node {
         // Function type `(params) => R` / `<T>(params) => R`; constructor
-        // type `new (...) => R` is out of subset.
+        // type `new (...) => R` / `abstract new (...) => R` (M18.1).
         switch (p.curTag()) {
             .lt, .lt_lt => return p.parseFunctionType(),
             .l_paren => {
                 if (try p.tryParseFunctionType()) |ft| return ft;
             },
-            .keyword_new => {
-                const start = p.curIdx();
-                _ = try p.bump();
-                _ = try p.tryParseFunctionType(); // best-effort shape consume
-                return p.unsupportedFrom(start);
-            },
+            .keyword_new => return p.parseConstructorType(false),
             .keyword_abstract => {
-                if (p.peekTag(1) == .keyword_new) {
-                    const start = try p.bump();
-                    _ = try p.bump();
-                    if (try p.tryParseFunctionType()) |_| {}
-                    return p.unsupportedFrom(start);
-                }
+                if (p.peekTag(1) == .keyword_new) return p.parseConstructorType(true);
             },
             else => {},
         }
         return p.parseUnionType();
+    }
+
+    /// Standalone constructor type `new (params) => R` / `abstract new … => R`
+    /// (M18.1). `abstract` (already at cursor) is consumed first when present.
+    fn parseConstructorType(p: *Parser, is_abstract: bool) PE!Node {
+        const start_tok = p.curIdx();
+        if (is_abstract) _ = try p.bump(); // `abstract`
+        _ = try p.bump(); // `new`
+        var tp: ast.SubRange = .{ .start = 0, .end = 0 };
+        if (p.atLt()) tp = try p.parseTypeParams();
+        const params = try p.parseParams();
+        _ = try p.expect(.arrow, .expected_arrow);
+        const ret = try p.parseReturnType();
+        const proto = try p.addExtra(ast.FnProto{
+            .flags = 0,
+            .name_token = 0,
+            .tp_start = tp.start,
+            .tp_end = tp.end,
+            .params_start = params.start,
+            .params_end = params.end,
+            .return_type = ret,
+        });
+        return p.addNode(.{ .tag = .constructor_type, .main_token = start_tok, .data = .{ .lhs = proto, .rhs = @intFromBool(is_abstract) } });
     }
 
     fn tryParseFunctionType(p: *Parser) PE!?Node {
@@ -3224,19 +3237,27 @@ const Parser = struct {
             const before = p.curIdx();
             if (p.curTag() == .dot_dot_dot) {
                 const dots = try p.bump();
+                // Named rest element `...name: T[]` (M18.1): the label is
+                // cosmetic — drop it and parse the element type.
+                if (isIdentLike(p.curTag()) and p.peekTag(1) == .colon) {
+                    _ = try p.bump(); // name
+                    _ = try p.bump(); // ':'
+                }
                 const ty = try p.parseType();
                 try p.pushScratch(try p.addNode(.{ .tag = .rest_type, .main_token = dots, .data = .{ .lhs = ty, .rhs = 0 } }));
             } else if (isIdentLike(p.curTag()) and
                 (p.peekTag(1) == .colon or (p.peekTag(1) == .question and p.peekTag(2) == .colon)))
             {
-                // Named tuple member `[x: T]` — out of subset.
-                const start = p.curIdx();
-                _ = try p.bump();
-                _ = try p.eat(.question);
+                // Named tuple member `[x: T]` / `[x?: T]` (M18.1): the label is
+                // cosmetic (a display aid); the element type is `T`, optional
+                // iff `?` is present. (The all-or-none-labeled rule TS5084 is
+                // not enforced — an under-report, never a false positive.)
+                _ = try p.bump(); // name
+                const q_tok = try p.eat(.question);
                 _ = try p.bump(); // ':'
-                _ = try p.parseType();
-                // `start` is the member name identifier — not inferable.
-                try p.pushScratch(try p.unsupportedKindFrom(start, .named_tuple_member));
+                var ty = try p.parseType();
+                if (q_tok) |q| ty = try p.addNode(.{ .tag = .optional_type, .main_token = q, .data = .{ .lhs = ty, .rhs = 0 } });
+                try p.pushScratch(ty);
             } else {
                 var ty = try p.parseType();
                 if (p.curTag() == .question) {
@@ -3418,16 +3439,18 @@ const Parser = struct {
         const start_tok = p.curIdx();
         var flags: u32 = 0;
 
-        // Call signature `(...)` / construct signature `new (...)` — out of
-        // subset (ROADMAP.md §6 keeps interfaces to prop/method/index signatures).
+        // Call signature `(...): R` / `<T>(...): R` (M18.1). A bare `(`/`<`
+        // starting a member is a call signature (interfaces have no positional
+        // members, so this never conflicts with a parenthesized name).
         if (p.curTag() == .l_paren or p.atLt()) {
-            try p.parseFunctionTypeShapeless();
-            return p.unsupportedFrom(start_tok);
+            const proto = try p.parseFnProtoRest(0, 0);
+            return p.addNode(.{ .tag = .call_signature, .main_token = start_tok, .data = .{ .lhs = proto, .rhs = 0 } });
         }
+        // Construct signature `new (...): R` / `new <T>(...): R` (M18.1).
         if (p.curTag() == .keyword_new and (p.peekTag(1) == .l_paren or p.peekTag(1) == .lt or p.peekTag(1) == .lt_lt)) {
-            _ = try p.bump();
-            _ = try p.parseFunctionTypeShapeless();
-            return p.unsupportedFrom(start_tok);
+            _ = try p.bump(); // `new`
+            const proto = try p.parseFnProtoRest(0, 0);
+            return p.addNode(.{ .tag = .construct_signature, .main_token = start_tok, .data = .{ .lhs = proto, .rhs = 0 } });
         }
 
         // readonly modifier (only when a name follows).
@@ -3485,14 +3508,6 @@ const Parser = struct {
         var type_ann: Node = null_node;
         if (try p.eat(.colon) != null) type_ann = try p.parseType();
         return p.addNode(.{ .tag = .property_signature, .main_token = name_tok, .data = .{ .lhs = type_ann, .rhs = flags } });
-    }
-
-    /// Parse a `(params): R` / `<T>(params): R` signature shape, discarding
-    /// the result (used inside unsupported call/construct signatures).
-    fn parseFunctionTypeShapeless(p: *Parser) PE!void {
-        if (p.atLt()) _ = try p.parseTypeParams();
-        _ = try p.parseParams();
-        if (try p.eat(.colon) != null) _ = try p.parseReturnType();
     }
 
     fn parseIndexSignature(p: *Parser, flags: u32) PE!Node {
@@ -4398,11 +4413,32 @@ test "unsupported: import= and export=" {
 }
 
 test "unsupported: misc type-level constructs" {
-    try expectDiagCount("type F = new () => Thing;", 1); // constructor type
     try expectDiagCount("type U = unique T;", 1); // `unique` non-symbol operand
-    try expectDiagCount("interface I { (x: number): string; }", 1); // call signature
-    try expectDiagCount("interface I { new (x: number): Thing; }", 1); // construct signature
-    try expectDiagCount("type NT = [x: number, y: number];", 1); // named tuple members
+}
+
+test "named tuple members parse (M18.1)" {
+    // Labels are cosmetic — the element types are preserved, label dropped.
+    try expectDiagCount("type NT = [x: number, y: number];", 0);
+    try expectDiagCount("type NR = [head: string, ...tail: number[]];", 0);
+    try expectSExpr("type P = [x: number, y?: string];",
+        \\(type_alias P (tuple_type (identifier number) (optional_type (identifier string))))
+    );
+}
+
+test "call/construct signatures & constructor types parse (M18.1)" {
+    // Bare call signature, construct signature, standalone constructor type,
+    // and `abstract new` all parse cleanly (no more unsupported_syntax).
+    try expectDiagCount("interface I { (x: number): string; }", 0); // call signature
+    try expectDiagCount("interface I { new (x: number): Thing; }", 0); // construct signature
+    try expectDiagCount("type F = new () => Thing;", 0); // constructor type
+    try expectDiagCount("type AF = abstract new (x: number) => Thing;", 0);
+    try expectDiagCount("interface I { <T>(x: T): T; new <T>(): T[]; }", 0); // generic sigs
+    try expectSExpr("type F = new () => Thing;",
+        \\(type_alias F (constructor_type (identifier Thing)))
+    );
+    try expectSExpr("interface C { (x: number): string; new (): C; readonly p: number; }",
+        \\(interface_decl C (call_signature (param (identifier x) (identifier number)) (identifier string)) (construct_signature (identifier C)) (property_signature :readonly p (identifier number)))
+    );
 }
 
 test "unique symbol parses in subset" {
@@ -4480,7 +4516,7 @@ test "jsx name rescan does not disturb subtraction lexing" {
 test "unsupported constructs still leave following code parsable" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const src = "type C = new () => number;\nconst after: number = 1;";
+    const src = "type C = unique Foo;\nconst after: number = 1;";
     const tree = try parse(arena.allocator(), src);
     try testing.expect(tree.diagnostics.len >= 1);
     const got = try dumpSource(arena.allocator(), src);

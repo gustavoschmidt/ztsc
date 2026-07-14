@@ -1220,9 +1220,22 @@ const Checker = struct {
                 const n = s.objectPropCount(t);
                 const sidx = s.objectStringIndex(t);
                 const nidx = s.objectNumberIndex(t);
-                if (n == 0 and sidx == 0 and nidx == 0) return w.writeAll("{}");
+                const ncall = s.objectCallSigCount(t);
+                const nconstruct = s.objectConstructSigCount(t);
+                if (n == 0 and sidx == 0 and nidx == 0 and ncall == 0 and nconstruct == 0) return w.writeAll("{}");
                 try w.writeAll("{ ");
                 var first = true;
+                // Call / construct signatures (M18.1), printed member-style.
+                for (0..ncall) |i| {
+                    if (!first) try w.writeAll(" ");
+                    first = false;
+                    try c.printSigMember(w, s.objectCallSig(t, @intCast(i)), false, depth + 1);
+                }
+                for (0..nconstruct) |i| {
+                    if (!first) try w.writeAll(" ");
+                    first = false;
+                    try c.printSigMember(w, s.objectConstructSig(t, @intCast(i)), true, depth + 1);
+                }
                 for (0..n) |i| {
                     const p = s.objectProp(t, @intCast(i));
                     if (!first) try w.writeAll(" ");
@@ -1358,6 +1371,35 @@ const Checker = struct {
         };
     }
 
+    /// Print a call/construct signature in object-member form (M18.1):
+    /// `<T>(a: A): R;` for a call sig, `new <T>(a: A): R;` for a construct sig.
+    fn printSigMember(c: *Checker, w: *std.Io.Writer, sig: TypeId, is_construct: bool, depth: u32) PrintErr!void {
+        const s = c.ts;
+        if (is_construct) try w.writeAll("new ");
+        const tps = s.fnTypeParams(sig);
+        if (tps.len > 0) {
+            try w.writeAll("<");
+            for (tps, 0..) |tp, i| {
+                if (i > 0) try w.writeAll(", ");
+                try w.print("{s}", .{c.symbolName(tp)});
+            }
+            try w.writeAll(">");
+        }
+        try w.writeAll("(");
+        for (0..s.fnParamCount(sig)) |i| {
+            if (i > 0) try w.writeAll(", ");
+            const p = s.fnParam(sig, @intCast(i));
+            if (p.rest()) try w.writeAll("...");
+            if (p.name != 0) {
+                try w.print("{s}{s}: ", .{ c.atomText(p.name), if (p.flags & types.param_flag_optional != 0) "?" else "" });
+            }
+            try c.printType(w, p.ty, depth + 1);
+        }
+        try w.writeAll("): ");
+        try c.printType(w, s.fnReturn(sig), depth + 1);
+        try w.writeAll(";");
+    }
+
     fn printTypeParen(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32, in_union: bool) PrintErr!void {
         const k = c.ts.kind(t);
         const needs = switch (k) {
@@ -1435,6 +1477,7 @@ const Checker = struct {
             .intersection_type,
             .object_type,
             .function_type,
+            .constructor_type,
             .keyof_type,
             .typeof_type,
             .indexed_access_type,
@@ -1520,6 +1563,14 @@ const Checker = struct {
             },
             .object_type => return c.objectTypeFromMembers(c.tree.nodeRange(node), 0),
             .function_type => return c.signatureOfProto(node, d.lhs, false, true),
+            .constructor_type => {
+                // `new (…) => R` / `abstract new (…) => R` (M18.1): an object
+                // type with a single construct signature and no call signature.
+                // (Abstract-ness is not yet modelled — under-reports TS2511 on
+                // `new (abstractCtor)()`, never a false positive.)
+                const sig = try c.signatureOfProto(node, d.lhs, false, true);
+                return c.ts.makeObjectSigs(&.{}, 0, 0, types.obj_flag_not_inferable, &.{}, &.{sig});
+            },
             .keyof_type => return c.keyofType(try c.typeFromTypeNode(d.lhs)),
             .typeof_type => return c.typeofEntity(d.lhs),
             .readonly_type => return c.typeFromTypeNode(d.lhs), // readonly T[] ~ T[]
@@ -2120,6 +2171,11 @@ const Checker = struct {
         }
         var order: std.ArrayList(Atom) = .empty;
         defer order.deinit(c.scratch());
+        // Call / construct signature lists (M18.1), kept in declaration order.
+        var call_sigs: std.ArrayList(TypeId) = .empty;
+        defer call_sigs.deinit(c.scratch());
+        var construct_sigs: std.ArrayList(TypeId) = .empty;
+        defer construct_sigs.deinit(c.scratch());
         // Accessor keys, to type a get/set pair as one property and mark a
         // get-only accessor read-only.
         var getter_keys: std.AutoHashMapUnmanaged(Atom, void) = .empty;
@@ -2180,6 +2236,14 @@ const Checker = struct {
                     const val = try c.typeFromTypeNode(e.value_type);
                     if (key == types.number_type) nindex = val else sindex = val;
                 },
+                // Call / construct signatures (M18.1). Compared like function
+                // types (not methods), so params are contravariant.
+                .call_signature => {
+                    try call_sigs.append(c.scratch(), try c.signatureOfProto(m, md.lhs, false, true));
+                },
+                .construct_signature => {
+                    try construct_sigs.append(c.scratch(), try c.signatureOfProto(m, md.lhs, false, true));
+                },
                 else => {},
             }
         }
@@ -2194,7 +2258,7 @@ const Checker = struct {
             if (setter_keys.contains(k.*)) continue;
             if (prop_index.get(k.*)) |idx| props.items[idx].flags |= types.prop_flag_readonly;
         }
-        return c.ts.makeObject(props.items, sindex, nindex, obj_flags);
+        return c.ts.makeObjectSigs(props.items, sindex, nindex, obj_flags, call_sigs.items, construct_sigs.items);
     }
 
     /// Append `p`, replacing any existing prop with the same name. `index`
@@ -3165,7 +3229,20 @@ const Checker = struct {
         }
         const sidx = if (c.ts.objectStringIndex(derived) != 0) c.ts.objectStringIndex(derived) else c.ts.objectStringIndex(base);
         const nidx = if (c.ts.objectNumberIndex(derived) != 0) c.ts.objectNumberIndex(derived) else c.ts.objectNumberIndex(base);
-        return c.ts.makeObject(props.items, sidx, nidx, c.ts.objectFlags(derived));
+        // Preserve call/construct signatures from both sides (M18.1): a callable
+        // interface extending another accumulates every signature.
+        if (!c.ts.objectHasSigs(derived) and !c.ts.objectHasSigs(base)) {
+            return c.ts.makeObject(props.items, sidx, nidx, c.ts.objectFlags(derived) & ~types.obj_flag_has_sigs);
+        }
+        var calls: std.ArrayList(TypeId) = .empty;
+        defer calls.deinit(c.scratch());
+        var constructs: std.ArrayList(TypeId) = .empty;
+        defer constructs.deinit(c.scratch());
+        for ([2]TypeId{ derived, base }) |o| {
+            for (0..c.ts.objectCallSigCount(o)) |i| try calls.append(c.scratch(), c.ts.objectCallSig(o, @intCast(i)));
+            for (0..c.ts.objectConstructSigCount(o)) |i| try constructs.append(c.scratch(), c.ts.objectConstructSig(o, @intCast(i)));
+        }
+        return c.ts.makeObjectSigs(props.items, sidx, nidx, c.ts.objectFlags(derived) & ~types.obj_flag_has_sigs, calls.items, constructs.items);
     }
 
     /// Generic instance shape of a class: instance members + base instance.
@@ -5838,6 +5915,14 @@ const Checker = struct {
                     }
                     return false;
                 }
+                // Callable object → function type (M18.1): some call signature
+                // of the object must be assignable to the target function.
+                if (sk == .object) {
+                    for (0..c.ts.objectCallSigCount(s)) |i| {
+                        if (try c.signatureAssignable(c.ts.objectCallSig(s, @intCast(i)), t)) return true;
+                    }
+                    return false;
+                }
                 return false;
             },
             .overloads => {
@@ -5905,8 +5990,11 @@ const Checker = struct {
         const n = c.ts.objectPropCount(t);
         const sidx = c.ts.objectStringIndex(t);
         const nidx = c.ts.objectNumberIndex(t);
-        // {} accepts anything non-nullish.
-        if (n == 0 and sidx == 0 and nidx == 0) {
+        const t_calls = c.ts.objectCallSigCount(t);
+        const t_constructs = c.ts.objectConstructSigCount(t);
+        // {} accepts anything non-nullish — but a callable/constructable
+        // target with no members is not empty: its signatures must be checked.
+        if (n == 0 and sidx == 0 and nidx == 0 and t_calls == 0 and t_constructs == 0) {
             const k = c.ts.kind(s);
             return k != .null and k != .undefined and k != .void;
         }
@@ -5978,6 +6066,50 @@ const Checker = struct {
                 },
                 else => return false,
             }
+        }
+        // Target call / construct signatures (M18.1): the source must supply a
+        // matching signature for each. A source that cannot be called (or
+        // constructed) provides none and fails a non-empty requirement.
+        if (t_calls > 0 and !try c.sourceSatisfiesSigs(s, t, false)) return false;
+        if (t_constructs > 0 and !try c.sourceSatisfiesSigs(s, t, true)) return false;
+        return true;
+    }
+
+    /// Whether `s` provides a signature assignable to each of `t`'s call
+    /// (`is_construct == false`) or construct (`true`) signatures (M18.1).
+    /// Function ↔ callable-object relate in both directions; a `class_value`
+    /// satisfies construct signatures (constructable) — under-reporting exact
+    /// shape mismatches rather than spuriously rejecting a valid class value.
+    fn sourceSatisfiesSigs(c: *Checker, s: TypeId, t: TypeId, is_construct: bool) Error!bool {
+        const sk = c.ts.kind(s);
+        if (sk == .any or sk == .err) return true;
+        if (is_construct and sk == .class_value) return true;
+        var src: std.ArrayList(TypeId) = .empty;
+        defer src.deinit(c.scratch());
+        switch (sk) {
+            .function => if (!is_construct) try src.append(c.scratch(), s),
+            .overloads => if (!is_construct) {
+                for (try c.memberList(s)) |m| try src.append(c.scratch(), m);
+            },
+            .object => {
+                const cnt = if (is_construct) c.ts.objectConstructSigCount(s) else c.ts.objectCallSigCount(s);
+                for (0..cnt) |i| {
+                    try src.append(c.scratch(), if (is_construct) c.ts.objectConstructSig(s, @intCast(i)) else c.ts.objectCallSig(s, @intCast(i)));
+                }
+            },
+            else => {},
+        }
+        const t_cnt = if (is_construct) c.ts.objectConstructSigCount(t) else c.ts.objectCallSigCount(t);
+        for (0..t_cnt) |i| {
+            const tsig = if (is_construct) c.ts.objectConstructSig(t, @intCast(i)) else c.ts.objectCallSig(t, @intCast(i));
+            var matched = false;
+            for (src.items) |ssig| {
+                if (try c.signatureAssignable(ssig, tsig)) {
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) return false;
         }
         return true;
     }
@@ -7800,12 +7932,14 @@ const Checker = struct {
                 for (ctor_sigs.items) |sig| {
                     try sigs.append(c.scratch(), try c.instantiate(sig, map));
                 }
-            } else if (rk == .function or rk == .overloads) {
-                try c.diagFmt(2351, c.nodeSpan(shape.callee), "This expression is not constructable.", .{});
-                for (shape.arg_nodes) |an| {
-                    if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
+            } else if (rk == .object and c.ts.objectConstructSigCount(r) > 0) {
+                // Callable object with construct signatures (M18.1), e.g.
+                // `declare var Array: ArrayConstructor` then `new Array()`.
+                // The signature's own return type is the instance type, so no
+                // `instance_ret` override is needed (unlike a class value).
+                for (0..c.ts.objectConstructSigCount(r)) |i| {
+                    try sigs.append(c.scratch(), c.ts.objectConstructSig(r, @intCast(i)));
                 }
-                return types.error_type;
             } else {
                 try c.diagFmt(2351, c.nodeSpan(shape.callee), "This expression is not constructable.", .{});
                 for (shape.arg_nodes) |an| {
@@ -7818,6 +7952,19 @@ const Checker = struct {
                 .function => try sigs.append(c.scratch(), r),
                 .overloads => {
                     for (try c.memberList(r)) |m| try sigs.append(c.scratch(), m);
+                },
+                // Callable object with call signatures (M18.1).
+                .object => {
+                    if (c.ts.objectCallSigCount(r) == 0) {
+                        try c.diagFmt(2349, c.nodeSpan(shape.callee), "This expression is not callable.", .{});
+                        for (shape.arg_nodes) |an| {
+                            if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
+                        }
+                        return types.error_type;
+                    }
+                    for (0..c.ts.objectCallSigCount(r)) |i| {
+                        try sigs.append(c.scratch(), c.ts.objectCallSig(r, @intCast(i)));
+                    }
                 },
                 else => {
                     try c.diagFmt(2349, c.nodeSpan(shape.callee), "This expression is not callable.", .{});

@@ -109,11 +109,14 @@ pub const Kind = enum(u8) {
     tuple,
     /// Object type. a = extra index, b = property count. extra[a..]:
     /// [flags, string_index_type, number_index_type,
-    ///  then per property (sorted by name atom): name, type, prop_flags].
+    ///  (iff flags has obj_flag_has_sigs) call_count, construct_count,
+    ///  then per property (sorted by name atom): name, type, prop_flags,
+    ///  (iff obj_flag_has_sigs) then call-sig TypeIds, then construct-sig
+    ///  TypeIds — each an interned `.function` type, in declaration order].
     /// Object flags: 1 = fresh (object literal, excess-prop checked);
     /// 2 = not-inferable-index (interface / class-instance shape — has no
     /// *implied* string index for the index-signature relation, unlike
-    /// object/type literals).
+    /// object/type literals); 4 = has call/construct signatures (M18.1).
     /// prop_flags: 1 = optional, 2 = readonly.
     object,
     /// Function/signature type. a = extra index, b = param count. extra[a..]:
@@ -219,6 +222,12 @@ pub const obj_flag_fresh: u32 = 1;
 /// *implied* string index signature for the index-signature assignability
 /// relation. Object/type literals (the inferable-index case) leave this clear.
 pub const obj_flag_not_inferable: u32 = 2;
+/// The object carries call and/or construct signature lists (a hybrid
+/// "callable object" type, M18.1). When set, the payload has two extra header
+/// words after the index-signature words — `[call_count, construct_count]` —
+/// and the call-sig then construct-sig TypeIds trail the property records.
+/// Sig-less objects (the common case) leave this clear and pay no extra words.
+pub const obj_flag_has_sigs: u32 = 4;
 pub const prop_flag_optional: u32 = 1;
 pub const prop_flag_readonly: u32 = 2;
 pub const elem_flag_optional: u32 = 1;
@@ -472,14 +481,46 @@ pub const Store = struct {
     pub fn objectPropCount(s: *const Store, id: TypeId) u32 {
         return s.dataB(id);
     }
+    /// Property records start at `dataA + objectHeaderLen`: 3 header words
+    /// (flags, string index, number index), plus 2 more (call/construct
+    /// counts) when the object carries signatures (M18.1).
+    fn objectHeaderLen(s: *const Store, id: TypeId) u32 {
+        return if (s.objectFlags(id) & obj_flag_has_sigs != 0) 5 else 3;
+    }
     pub fn objectProp(s: *const Store, id: TypeId, i: u32) Prop {
         if (id < s.base_len) return s.base.?.objectProp(id, i);
-        const base = s.dataA(id) + 3 + 3 * i;
+        const base = s.dataA(id) + s.objectHeaderLen(id) + 3 * i;
         return .{
             .name = s.extra.items[base],
             .ty = s.extra.items[base + 1],
             .flags = s.extra.items[base + 2],
         };
+    }
+    /// Number of call signatures on a callable object (0 for a plain object).
+    pub fn objectCallSigCount(s: *const Store, id: TypeId) u32 {
+        if (id < s.base_len) return s.base.?.objectCallSigCount(id);
+        if (s.objectFlags(id) & obj_flag_has_sigs == 0) return 0;
+        return s.extra.items[s.dataA(id) + 3];
+    }
+    /// Number of construct signatures on a callable object.
+    pub fn objectConstructSigCount(s: *const Store, id: TypeId) u32 {
+        if (id < s.base_len) return s.base.?.objectConstructSigCount(id);
+        if (s.objectFlags(id) & obj_flag_has_sigs == 0) return 0;
+        return s.extra.items[s.dataA(id) + 4];
+    }
+    pub fn objectCallSig(s: *const Store, id: TypeId, i: u32) TypeId {
+        if (id < s.base_len) return s.base.?.objectCallSig(id, i);
+        const sigs_base = s.dataA(id) + 5 + 3 * s.dataB(id);
+        return s.extra.items[sigs_base + i];
+    }
+    pub fn objectConstructSig(s: *const Store, id: TypeId, i: u32) TypeId {
+        if (id < s.base_len) return s.base.?.objectConstructSig(id, i);
+        const sigs_base = s.dataA(id) + 5 + 3 * s.dataB(id) + s.objectCallSigCount(id);
+        return s.extra.items[sigs_base + i];
+    }
+    /// Whether the object carries any call or construct signature (M18.1).
+    pub fn objectHasSigs(s: *const Store, id: TypeId) bool {
+        return s.kind(id) == .object and s.objectFlags(id) & obj_flag_has_sigs != 0;
     }
 
     /// Binary search an object type's (atom-sorted) properties.
@@ -735,7 +776,16 @@ pub const Store = struct {
         switch (s.kind(id)) {
             .union_type, .intersection, .overloads => return s.extra.items[a..b],
             .tuple => return s.extra.items[a .. a + 2 * b],
-            .object => return s.extra.items[a .. a + 3 + 3 * b],
+            .object => {
+                // A callable object (M18.1) has 2 extra header words plus one
+                // TypeId per call/construct signature after the property
+                // records; all part of the identity shape.
+                if (s.extra.items[a] & obj_flag_has_sigs != 0) {
+                    const sig_words = s.extra.items[a + 3] + s.extra.items[a + 4];
+                    return s.extra.items[a .. a + 5 + 3 * b + sig_words];
+                }
+                return s.extra.items[a .. a + 3 + 3 * b];
+            },
             .function => {
                 const tpc = s.extra.items[a + 2];
                 // A predicate function (`x is T` / `asserts x`) stores 3 extra
@@ -900,11 +950,35 @@ pub const Store = struct {
         number_index: TypeId,
         flags: u32,
     ) Error!TypeId {
+        return s.makeObjectSigs(props, string_index, number_index, flags, &.{}, &.{});
+    }
+
+    /// A hybrid callable object (M18.1): an object with call and/or construct
+    /// signature lists (each an interned `.function` type) alongside its
+    /// properties. With empty sig lists this is exactly `makeObject`, and the
+    /// `obj_flag_has_sigs` bit stays clear so sig-less objects pay no extra
+    /// words. Signature order is preserved (overload resolution is
+    /// declaration-order sensitive); properties are still name-sorted.
+    pub fn makeObjectSigs(
+        s: *Store,
+        props: []const Prop,
+        string_index: TypeId,
+        number_index: TypeId,
+        flags0: u32,
+        call_sigs: []const TypeId,
+        construct_sigs: []const TypeId,
+    ) Error!TypeId {
+        const has_sigs = call_sigs.len != 0 or construct_sigs.len != 0;
+        const flags = if (has_sigs) flags0 | obj_flag_has_sigs else flags0 & ~obj_flag_has_sigs;
         const start = s.pending.items.len;
         defer s.pending.items.len = start;
         try s.pending.append(s.alloc, flags);
         try s.pending.append(s.alloc, string_index);
         try s.pending.append(s.alloc, number_index);
+        if (has_sigs) {
+            try s.pending.append(s.alloc, @intCast(call_sigs.len));
+            try s.pending.append(s.alloc, @intCast(construct_sigs.len));
+        }
         const pstart = s.pending.items.len;
         for (props) |p| {
             try s.pending.append(s.alloc, p.name);
@@ -913,6 +987,9 @@ pub const Store = struct {
         }
         // Sort the 3-word property records by name atom.
         sortTriples(s.pending.items[pstart..]);
+        // Signatures trail the properties in declaration order.
+        try s.pending.appendSlice(s.alloc, call_sigs);
+        try s.pending.appendSlice(s.alloc, construct_sigs);
         return s.internType(.object, s.pending.items[start..], @intCast(props.len));
     }
 
@@ -926,7 +1003,12 @@ pub const Store = struct {
         const own = if (id < s.base_len) s.base.? else s;
         const start = s.pending.items.len;
         defer s.pending.items.len = start;
-        try s.pending.appendSlice(s.alloc, own.extra.items[a .. a + 3 + 3 * n]);
+        // Copy the whole shape (header + props + any call/construct sigs).
+        const len: u32 = if (own.extra.items[a] & obj_flag_has_sigs != 0)
+            5 + 3 * n + own.extra.items[a + 3] + own.extra.items[a + 4]
+        else
+            3 + 3 * n;
+        try s.pending.appendSlice(s.alloc, own.extra.items[a .. a + len]);
         s.pending.items[start] &= ~obj_flag_fresh;
         return s.internType(.object, s.pending.items[start..], n);
     }

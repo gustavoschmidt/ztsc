@@ -2076,6 +2076,9 @@ const Binder = struct {
                 try b.bindType(e.key_type);
                 try b.bindType(e.value_type);
             },
+            // Call / construct signatures (M18.1): unnamed members carrying a
+            // proto scope, no declared symbol.
+            .call_signature, .construct_signature => try b.bindFunctionType(member, md.lhs),
             .error_node, .unsupported => {},
             else => {},
         }
@@ -2474,7 +2477,7 @@ const Binder = struct {
                 try b.bindTypeofEntity(d.lhs);
             },
             .import_type => try b.bindImportType(node),
-            .function_type, .method_signature => try b.bindFunctionType(node, d.lhs),
+            .function_type, .method_signature, .constructor_type => try b.bindFunctionType(node, d.lhs),
             .object_type => {
                 const ms = try b.newScope(.interface_members, node, b.cur_scope);
                 for (b.tree.nodeRange(node)) |member| {

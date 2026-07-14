@@ -1392,17 +1392,17 @@ the real lib's own declarations require, makes the lib real, and
 graduates the M11 acceptance test to the *real* pinned `@types/node`.
 
 1. **Call/construct signatures in interfaces & type literals, standalone
-   constructor types.** The top remaining census buckets
-   (call/construct signature 237 = 10.4% + constructor type 54 = 2.4%,
-   BENCHMARKS §3.12 — after M14/M16 zeroed `import()` and the type-level
-   buckets, these lead what's left) and a hard prerequisite for the real
-   lib, whose global constructors are all the interface-pair pattern:
-   `interface ArrayConstructor { new <T>(…): T[]; <T>(…): T[]; readonly
-   prototype: any[] }` + `declare var Array: ArrayConstructor` (M9's
-   trimmed lib worked around exactly this with `declare class`). Work:
-   *parser* — call signatures `(a: A): R` and construct signatures
-   `new (a: A): R` as interface/type-literal members (both currently emit
-   `unsupported_syntax`), plus standalone `new (a: A) => R` (and
+   constructor types. ✅ DONE (2026-07-14).** The top remaining census
+   buckets (call/construct signature 237 = 10.4% + constructor type
+   54 = 2.4%, BENCHMARKS §3.12 — after M14/M16 zeroed `import()` and the
+   type-level buckets, these lead what's left) and a hard prerequisite for
+   the real lib, whose global constructors are all the interface-pair
+   pattern: `interface ArrayConstructor { new <T>(…): T[]; <T>(…): T[];
+   readonly prototype: any[] }` + `declare var Array: ArrayConstructor`
+   (M9's trimmed lib worked around exactly this with `declare class`).
+   Work: *parser* — call signatures `(a: A): R` and construct signatures
+   `new (a: A): R` as interface/type-literal members (both previously
+   emitted `unsupported_syntax`), plus standalone `new (a: A) => R` (and
    `abstract new`) in type position; *types.zig* — object types carry
    call/construct signature lists (hybrid "callable object" types);
    *checker* — calling a value of such a type resolves overloads through
@@ -1411,6 +1411,43 @@ graduates the M11 acceptance test to the *real* pinned `@types/node`.
    object types in both directions per tsc, and property access coexists
    with signatures (members + sigs on one type). Named tuple members
    (census 0.3%) are a trivial parser add — take them opportunistically.
+
+   **Landed.** *Parser:* new AST tags `call_signature` / `construct_signature`
+   (interface & type-literal members, reusing `parseFnProtoRest`) and
+   `constructor_type` (standalone `new (…) => R` / `abstract new`,
+   `parseConstructorType`). Named tuple members `[x: T]` / `[x?: T]` /
+   `[...x: T[]]` now parse (label dropped, element type preserved) —
+   fixing a latent false-positive `unsupported_syntax`. *types.zig:* object
+   types gained an `obj_flag_has_sigs` bit; when set the payload carries two
+   header words (`call_count`, `construct_count`) plus the call-then-construct
+   signature TypeIds (each an interned `.function`) trailing the property
+   records. Sig-less objects leave the bit clear and pay **zero** extra words
+   — so the whole feature is memory-free on non-callable types (benchmark
+   type-bytes byte-identical to baseline: N=4 types 24852 / type-bytes
+   703744, RSS 49.7/53.9/48.1 MB at N=1/4/8, no regression). Signatures
+   participate in hash-cons identity via `shapeWords` (like the M14 predicate/
+   `this` words). *checker:* `objectTypeFromMembers` collects the sig lists
+   (`makeObjectSigs`); `checkCallExpr` routes a callable object's call sigs
+   and a constructable object's construct sigs through the existing
+   `resolveSignatureCall` (a construct sig's own return type is the instance,
+   so no `instance_ret` override); `structuralAssignable` +
+   `sourceSatisfiesSigs` relate function ↔ callable-object **both**
+   directions (each target sig matched by some source sig; `class_value`
+   satisfies construct sigs; `{}`-accepts-anything shortcut gated on
+   sig-lessness); the `.function` target arm accepts a callable-object source.
+   `mergeBaseObject` concatenates sigs across `extends`. Conformance
+   **376 → 384** (+8): callable interface, XConstructor pattern +
+   `declare var`, overloaded call sigs, standalone `new()=>T`, the full
+   dual generic call+construct `ArrayConstructor` shape, function↔
+   callable-object both directions, plain-object-missing-call-sig TS2322,
+   named tuples — each differential vs tsc 5.5.4. Census over the real corpus
+   (1800 files): call/construct-signature, constructor-type, **and**
+   named-tuple-member buckets all now **0** (were 237 / 54 / 7). **Deferred:**
+   `abstract`-ness of constructor types is not modelled — `new (absCtor)()`
+   under-reports TS2511 (never a false positive); generic-interface
+   instantiation drops sigs (the lib's XConstructor pattern is non-generic —
+   generic *signatures*, not generic interfaces — so unaffected). Both are
+   under-reports, policy-acceptable for v0.0.1.
 2. **Vendor the real lib.** Replace the trimmed lib with the real
    TypeScript **5.5.4** lib surface (same pinned version as the
    differential oracle): ES core through esnext, **no DOM** (backend-
