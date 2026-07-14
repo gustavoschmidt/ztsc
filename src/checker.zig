@@ -272,6 +272,9 @@ const FnCtx = struct {
 /// synthesized under (M8: contextual re-check cache).
 const NodeType = struct { ty: TypeId, ctx: TypeId };
 
+/// One in-progress `interfaceGeneric` resolution (M17.2 base-cycle detection).
+const IfaceFrame = struct { sym: SymbolId, resolving_base: bool = false };
+
 const Checker = struct {
     out: Allocator,
     io: Io,
@@ -344,6 +347,16 @@ const Checker = struct {
     /// Generic (uninstantiated) bodies per symbol: interface/class-instance/
     /// class-static/alias.
     iface_generic: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
+    /// Gray stack of interfaces currently mid-resolution in `interfaceGeneric`
+    /// (the ones marked `no_type`). Each frame records whether it is presently
+    /// resolving its `extends` bases. On a re-entry, if *every* frame from the
+    /// re-entered symbol to the top is in that base phase, the slice is a true
+    /// `extends` cycle and TS2310 fires for every member — not just whichever
+    /// symbol happened to start the traversal; a re-entry reached through a
+    /// member/type-arg edge (a legal recursive reference) fires nothing. That
+    /// makes the diagnostic set a pure function of the extends graph,
+    /// independent of resolution/partition order (M17.2).
+    iface_stack: std.ArrayListUnmanaged(IfaceFrame) = .empty,
     class_inst_generic: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
     class_static_cache: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
     /// Enum symbol -> value object type (the `typeof E` object with members).
@@ -2990,6 +3003,36 @@ const Checker = struct {
         return result;
     }
 
+    /// A re-entry into `interfaceGeneric(sym)` closed a reference loop. If the
+    /// whole loop — every gray frame from `sym` to the top — is currently
+    /// resolving an `extends` base, it is a genuine base cycle: report TS2310
+    /// for each member (tsc reports on every interface in the cycle), each
+    /// attributed to its own declaration file so `diagFmt`'s per-(file,code,
+    /// span) dedup keeps one per member and its owning checker keeps its own.
+    /// A loop that runs through a member or type-argument edge is a legal
+    /// recursive reference and reports nothing. Either way the emitted set is
+    /// a pure function of the extends graph — order- and partition-independent
+    /// (M17.2).
+    fn emitBaseCycle(c: *Checker, sym: SymbolId) Error!void {
+        const stack = c.iface_stack.items;
+        var start: usize = stack.len;
+        while (start > 0) : (start -= 1) {
+            if (stack[start - 1].sym == sym) break;
+        }
+        if (start == 0) return; // sym not on the stack (defensive; shouldn't happen)
+        for (stack[start - 1 ..]) |fr| {
+            if (!fr.resolving_base) return; // loop closes through a non-base edge
+        }
+        for (stack[start - 1 ..]) |fr| {
+            const saved = c.enterSymFile(fr.sym);
+            defer c.restoreCtx(saved);
+            const decls = c.declsOf(fr.sym);
+            if (decls.len == 0) continue;
+            const data = c.tree.extraData(ast.InterfaceData, c.tree.nodeData(decls[0]).lhs);
+            try c.diagFmt(2310, c.tokSpan(data.name_token), "Type '{s}' recursively references itself as a base type.", .{c.symbolName(fr.sym)});
+        }
+    }
+
     /// Generic (type-params-as-themselves) instance shape of an interface,
     /// with `extends` bases merged (derived members win).
     fn interfaceGeneric(c: *Checker, sym: SymbolId) Error!TypeId {
@@ -2997,17 +3040,19 @@ const Checker = struct {
         defer c.restoreCtx(saved_ctx);
         if (c.iface_generic.get(sym)) |t| {
             if (t == types.no_type) {
-                // Recursive base chain.
-                const decls = c.declsOf(sym);
-                if (decls.len > 0) {
-                    const data = c.tree.extraData(ast.InterfaceData, c.tree.nodeData(decls[0]).lhs);
-                    try c.diagFmt(2310, c.tokSpan(data.name_token), "Type '{s}' recursively references itself as a base type.", .{c.symbolName(sym)});
-                }
+                // Recursive base chain: `sym` is still on the gray stack, so
+                // the slice from it to the top is the cycle. Fire TS2310 for
+                // every member (tsc reports on each interface in the cycle),
+                // attributed to its own file — the diagnostic set no longer
+                // depends on which member the traversal entered first (M17.2).
+                try c.emitBaseCycle(sym);
                 return types.error_type;
             }
             return t;
         }
         try c.iface_generic.put(c.ca(), sym, types.no_type);
+        try c.iface_stack.append(c.ca(), .{ .sym = sym });
+        defer _ = c.iface_stack.pop();
 
         // Constituents: a within-file interface is one symbol carrying every
         // reopened block's decls; a cross-file merged interface (M11a) is a
@@ -3087,6 +3132,17 @@ const Checker = struct {
             }
         }
         var own = try c.objectTypeFromMembers(all_members.items, types.obj_flag_not_inferable);
+        // Mark the current gray frame as resolving `extends` bases so a
+        // re-entry here is recognized as a base cycle (TS2310); member and
+        // type-argument resolution above stays out of the base phase, so a
+        // recursive reference through them is legal and reports nothing
+        // (M17.2). The frame is this interface's own `interfaceGeneric`
+        // caller — the top of the stack at entry.
+        const frame_idx: ?usize = if (c.iface_stack.items.len > 0) c.iface_stack.items.len - 1 else null;
+        if (frame_idx) |fi| c.iface_stack.items[fi].resolving_base = true;
+        defer if (frame_idx) |fi| {
+            c.iface_stack.items[fi].resolving_base = false;
+        };
         for (bases.items) |base| {
             own = try c.mergeBaseObject(own, try c.resolveStructural(base));
         }

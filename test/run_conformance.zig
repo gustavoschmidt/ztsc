@@ -490,3 +490,70 @@ test "cycle stress: N-file import ring + diamonds terminate cleanly" {
         try std.testing.expectEqualStrings(ref, got);
     }
 }
+
+test "determinism: cross-file base cycles report identically for N = 1, 2, 4, 8" {
+    // Regression for M17.2. Many mutually-unrelated "packages", each a pair of
+    // files whose interfaces form a cross-file `extends` cycle (A extends B,
+    // B extends A) plus a conflicting `declare global`. A base cycle is a
+    // *content* diagnostic (TS2310), and the checker's cycle detection used to
+    // report on only whichever member the resolution reached first — a set
+    // that shifts with the checker partition, so `--checkers` changed the
+    // diagnostics themselves, not just their order. Now every interface on the
+    // cycle is reported (matching tsc), independent of order, so the output is
+    // byte-identical across N.
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const d = tmp.dir;
+
+    const clusters = 8;
+    var name_buf: [64]u8 = undefined;
+    var body_buf: [512]u8 = undefined;
+    var entry_buf: [1024]u8 = undefined;
+    var entry: std.ArrayListUnmanaged(u8) = .empty;
+    defer entry.deinit(gpa);
+    for (0..clusters) |i| {
+        // a{i}.d.ts: interface A{i} extends B{i}; conflicting global.
+        var name = try std.fmt.bufPrint(&name_buf, "a{d}.d.ts", .{i});
+        var body = try std.fmt.bufPrint(&body_buf,
+            \\import {{ B{d} }} from "./b{d}";
+            \\export interface A{d} extends B{d} {{ a{d}: number; }}
+            \\declare global {{ var conflict: {d}; }}
+            \\export {{}};
+        , .{ i, i, i, i, i, i });
+        try d.writeFile(io, .{ .sub_path = name, .data = body });
+        // b{i}.d.ts: interface B{i} extends A{i} — closes the cycle.
+        name = try std.fmt.bufPrint(&name_buf, "b{d}.d.ts", .{i});
+        body = try std.fmt.bufPrint(&body_buf,
+            \\import {{ A{d} }} from "./a{d}";
+            \\export interface B{d} extends A{d} {{ b{d}: string; }}
+            \\export {{}};
+        , .{ i, i, i, i, i });
+        try d.writeFile(io, .{ .sub_path = name, .data = body });
+        const line = try std.fmt.bufPrint(&entry_buf,
+            \\import {{ A{d} }} from "./a{d}";
+            \\import {{ B{d} }} from "./b{d}";
+            \\
+        , .{ i, i, i, i });
+        try entry.appendSlice(gpa, line);
+    }
+    try d.writeFile(io, .{ .sub_path = "entry.d.ts", .data = entry.items });
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var interner = Interner.init();
+    defer interner.deinit(gpa);
+    const alloc = arena.allocator();
+
+    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, &.{"entry.d.ts"}, true);
+
+    const ref = try renderProgramDiags(alloc, io, gpa, &interner, &br.program, 1);
+    // Every interface on every cycle is reported: 2 per cluster.
+    try std.testing.expectEqual(@as(usize, 2 * clusters), std.mem.count(u8, ref, "TS2310"));
+    for ([_]usize{ 2, 4, 8 }) |n| {
+        const got = try renderProgramDiags(alloc, io, gpa, &interner, &br.program, n);
+        try std.testing.expectEqualStrings(ref, got);
+    }
+}

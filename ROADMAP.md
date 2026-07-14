@@ -1238,20 +1238,54 @@ nondeterminism are not.**
    cases to move; the gate is full-suite differential green, not local
    plausibility. Re-run the real corpus (`bench/fetch_real.sh`)
    before/after: any error-count delta must be explainable against tsc.
-2. **Raw-file-args discovery determinism.** Passing many unrelated
-   `.d.ts` files as raw CLI args yields **different diagnostics (content,
-   not just order)** at `--checkers=1` vs `8`: FileId assignment on the
-   raw-args path is worker-scheduling-dependent, and cross-package
-   global/ambient-decl merging is FileId-order-sensitive (M11 invariant 4
-   makes the merge a pure function of file order — the bug is that on
-   this path the *order itself* isn't deterministic). The `-p`/tsconfig
-   single-owner path is already deterministic via graph-derived BFS
-   renumbering (only the cosmetic "(N checker(s))" summary line differs).
-   Fix: give the raw-file-args path the same deterministic renumbering —
-   roots in argv order, then the existing BFS edge-list machinery in
-   main.zig's single-owner scheduler. Regression test: a many-roots
-   fixture of mutually-unrelated files with conflicting globals,
-   byte-identical for `--checkers ∈ {1,4,8}`.
+2. ✅ **DONE (M17.2)** — **Raw-file-args discovery determinism.** Passing
+   many unrelated `.d.ts` files as raw CLI args yielded **different
+   diagnostics (content, not just order)** at `--checkers=1` vs `8`
+   (repro: the 1693-file `bench/corpus/real` set — a spurious TS2310 on
+   typebox's `TTemplateLiteral` appeared at N=1 but not N≥4). **Root cause
+   was not what the original plan hypothesized.** FileId assignment on the
+   raw-args path is *already* deterministic: raw args are appended to
+   `paths` in argv order before any worker runs, and the single-owner
+   scheduler's graph-derived BFS renumbering (main.zig, shared by the `-p`
+   path) then fixes every id independent of scheduling — verified
+   run-to-run stable at fixed N, and diagnostics vary only with the *check
+   partition* (`--checkers`), which cannot touch FileId order. The real
+   bug was in the **checker's base-cycle (TS2310) detection**, and it
+   reproduced on the `-p` path too (so the plan's "`-p` already
+   deterministic" premise was false for this class). `interfaceGeneric`
+   marks a symbol `no_type` while resolving it; a re-entry observing that
+   marker fired TS2310 **for whichever member the traversal reached
+   first** — a set that shifts with the partition (mutual `A extends B` /
+   `B extends A`: N=1 reported only `A`, N≥4 reported both). It was also a
+   **false positive** on legal recursion through a *member/type-arg* edge
+   (typebox's `static: TemplateLiteralStatic<T>` closing back through the
+   type-param constraint union). **What landed** (checker.zig): a gray
+   `iface_stack` of in-progress interface frames, each flagged
+   `resolving_base` only while its `extends` bases are being structurally
+   resolved. On a re-entry, if *every* frame from the re-entered symbol to
+   the top is in its base phase, it is a genuine `extends` cycle and
+   TS2310 fires for **every** member (matching tsc 5.5.4, which reports on
+   each interface in the cycle), attributed to each member's own file so
+   `diagFmt`'s per-(file,code,span) dedup keeps one per member and its
+   owning checker keeps its own; a loop closing through a member/type-arg
+   edge fires nothing. The emitted set is now a pure function of the
+   extends graph — order- and partition-independent. **Proof:** the
+   mutual-extends fixture is byte-identical across `--checkers ∈ {1,4,8}`;
+   the real corpus's diagnostic *content* (codes + `file:line:col`) is
+   byte-identical across N (the spurious typebox TS2310 is gone). Type
+   store byte-identical to the M17.1 baseline (N=4: 24852 types / 703744
+   bytes), bench flat (=1 0.08s/49.7MB, =4 0.03s/53.8MB, =8 0.02s/48MB —
+   the =4 RSS matches the pre-change binary; "~50MB" was approximate).
+   Conformance 370/370. Regression test: `test/run_conformance.zig`
+   "cross-file base cycles report identically for N = 1, 2, 4, 8".
+   **Deferral (pre-existing, not from this fix — confirmed by reproducing
+   it on the pre-M17.2 binary):** union/object-type **display-string**
+   member order is sorted by run-to-run-variable atom ids, so a *type
+   name rendered inside* a message (e.g. a zod `RawCreateParams` in a
+   TS2352) can differ full-line across N and even run-to-run at fixed N.
+   This is a rendering-order issue, never a change in *which* diagnostics
+   fire — squarely the M19 "structural union/intersection display order"
+   work, tracked there.
 3. **Type-predicate assignability.** `(x) => x is A` is silently
    assignable to `(x) => x is B`; tsc reports TS2322 (pre-existing gap
    noted during M14's `import()`-types work). The identity half already
