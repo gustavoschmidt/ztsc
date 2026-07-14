@@ -1055,7 +1055,7 @@ pub fn main(init: std.process.Init) !void {
         // collapsing repeated specifiers. Compare probes with vs without
         // --no-resolve-cache for the before/after number.
         try out.print("  resolve cache: {d} probes, {d} lookups, {d} hits ({s})\n", .{
-            modules.fsProbeCount(), rcache.lookups, rcache.hits,
+            modules.fsProbeCount(),                              rcache.lookups, rcache.hits,
             if (cli.no_resolve_cache) "disabled" else "enabled",
         });
     }
