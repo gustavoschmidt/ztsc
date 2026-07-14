@@ -1171,8 +1171,51 @@ the release headline advertises. The policy line for v0.0.1:
 **under-reporting (a missed error) is acceptable; wrong answers and
 nondeterminism are not.**
 
-1. **The index-signature assignability hole** (flagged at M16d as the
-   pre-v0.0.1 candidate; milestone-sized on its own). A bare primitive /
+1. ✅ **DONE (M17.1)** — **The index-signature assignability hole.**
+   Conformance 365 → **370** (+5 new `assignability/` cases 026–030, each
+   validated byte-identical against tsc 5.5.4); zero existing cases moved;
+   full suite differential-green; bench flat (multi: =1 0.08s/49.7MB,
+   =4 0.03s/~50MB, =8 0.02s/47.7MB; N=4 types 24852 / type-bytes 703744 —
+   +4 types / +84 bytes vs baseline, noise). **What landed:** a new
+   `obj_flag_not_inferable` bit on object types (types.zig) marks
+   interface / class-instance shapes; object/type literals leave it clear
+   (`objectHasImpliedIndex`). `makeObject`'s `fresh: bool` became a
+   `flags: u32` word so the bit survives interning, and it is preserved
+   through `regular()`, `instantiate`, `substInfer` and `mergeBaseObject`
+   (inherited-index interfaces still pass). `structuralAssignable`
+   (checker.zig) now requires the source to *actually* satisfy a target
+   index: for a **string** index — a compatible source string index, else
+   an implied-index (literal) source whose every prop conforms, else fail;
+   for a **number** index — arrays/tuples, a source number index, a source
+   string index (string keys subsume numeric), `string` (numeric indexing),
+   or an implied-index source's *numerically named* props (`isNumericPropName`
+   filter avoids false-rejecting string-keyed props); every other source
+   kind (primitive / function / class value / bare intersection) now fails
+   instead of passing vacuously. The motivating `const bad: Json = () => 1`
+   now correctly errors TS2322. **Differential sweep** (authoritative,
+   tsc 5.5.4): confirmed primitives, `()=>T`, arrays, tuples, class
+   instances, interfaces-without-index, and `typeof Class` all fail a
+   string index; object/type literals (fresh **and** widened-non-fresh),
+   inherited-index interfaces, `{}`, optional/readonly props, and
+   all-literal intersections pass; number-index interplay (string implies
+   number, numeric-name filter, `string` source) matches. **Deferrals (all
+   under-reports, never false positives — policy-compliant):** (a) a *mixed*
+   intersection `IA & {b:number}` where a single literal constituent
+   satisfies the index short-circuits to accept (tsc rejects — the
+   pre-existing intersection-source short-circuit in `isAssignableInner`
+   was left intact to avoid regressions; pure interface intersections
+   `IA & IB` *do* correctly fail); (b) a type-literal carrying only a
+   *number* index assigned to a *string* index target passes vacuously
+   (inferable, no string-named props); (c) enum-value and class-static
+   objects stay inferable (edge, and the class-*value* path already fails
+   via `.class_value`). Note: `bench/fetch_real.sh` before/after was not a
+   usable signal — passing the 1693 real `.d.ts` as raw CLI args hits the
+   separate raw-args discovery limitation that is exactly M17.2 (files
+   drop with `FileNotFound`/`NameTooLong`); the multi corpus (`-p`) is
+   diagnostic-identical before/after. Confidence rests on the tsc
+   differential sweeps + full-suite green.
+
+   A bare primitive /
    nullish / function / array / class-instance source **vacuously
    satisfies** a string-index-signature target `{[k: string]: T}`:
    `structuralAssignable` (checker.zig) checks the target's index

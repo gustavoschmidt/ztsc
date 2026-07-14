@@ -1505,7 +1505,7 @@ const Checker = struct {
                 }
                 return c.ts.makeIntersection(c.scratch(), parts.items);
             },
-            .object_type => return c.objectTypeFromMembers(c.tree.nodeRange(node), false),
+            .object_type => return c.objectTypeFromMembers(c.tree.nodeRange(node), 0),
             .function_type => return c.signatureOfProto(node, d.lhs, false, true),
             .keyof_type => return c.keyofType(try c.typeFromTypeNode(d.lhs)),
             .typeof_type => return c.typeofEntity(d.lhs),
@@ -2091,7 +2091,7 @@ const Checker = struct {
     }
 
     /// Object type from interface/object-literal-type member nodes.
-    fn objectTypeFromMembers(c: *Checker, member_nodes: []const Node, fresh: bool) Error!TypeId {
+    fn objectTypeFromMembers(c: *Checker, member_nodes: []const Node, obj_flags: u32) Error!TypeId {
         var props: std.ArrayList(types.Prop) = .empty;
         defer props.deinit(c.scratch());
         var prop_index: std.AutoHashMapUnmanaged(Atom, u32) = .empty;
@@ -2181,7 +2181,7 @@ const Checker = struct {
             if (setter_keys.contains(k.*)) continue;
             if (prop_index.get(k.*)) |idx| props.items[idx].flags |= types.prop_flag_readonly;
         }
-        return c.ts.makeObject(props.items, sindex, nindex, fresh);
+        return c.ts.makeObject(props.items, sindex, nindex, obj_flags);
     }
 
     /// Append `p`, replacing any existing prop with the same name. `index`
@@ -2650,7 +2650,7 @@ const Checker = struct {
                 try props.append(c.scratch(), .{ .name = name, .ty = ty, .flags = types.prop_flag_readonly });
             }
         }
-        const obj = try c.ts.makeObject(props.items, 0, 0, false);
+        const obj = try c.ts.makeObject(props.items, 0, 0, 0);
         try c.ns_types.put(c.ca(), file, obj);
         return obj;
     }
@@ -2672,7 +2672,7 @@ const Checker = struct {
             const ty = try c.targetValueType(tgt);
             try props.append(c.scratch(), .{ .name = name, .ty = ty, .flags = types.prop_flag_readonly });
         }
-        const obj = try c.ts.makeObject(props.items, 0, 0, false);
+        const obj = try c.ts.makeObject(props.items, 0, 0, 0);
         try c.ambient_ns_types.put(c.ca(), idx, obj);
         return obj;
     }
@@ -3025,7 +3025,9 @@ const Checker = struct {
             const own = try c.interfaceConstituentObject(csym);
             result = if (result == types.no_type) own else try c.mergeBaseObject(result, own);
         }
-        if (result == types.no_type) result = types.empty_object_type;
+        // An empty interface (no members, no bases) is still a nominal shape:
+        // it lacks the implied string index that an empty object *literal* has.
+        if (result == types.no_type) result = try c.ts.makeObject(&.{}, 0, 0, types.obj_flag_not_inferable);
         try c.iface_generic.put(c.ca(), sym, result);
         return result;
     }
@@ -3084,7 +3086,7 @@ const Checker = struct {
                 break;
             }
         }
-        var own = try c.objectTypeFromMembers(all_members.items, false);
+        var own = try c.objectTypeFromMembers(all_members.items, types.obj_flag_not_inferable);
         for (bases.items) |base| {
             own = try c.mergeBaseObject(own, try c.resolveStructural(base));
         }
@@ -3107,7 +3109,7 @@ const Checker = struct {
         }
         const sidx = if (c.ts.objectStringIndex(derived) != 0) c.ts.objectStringIndex(derived) else c.ts.objectStringIndex(base);
         const nidx = if (c.ts.objectNumberIndex(derived) != 0) c.ts.objectNumberIndex(derived) else c.ts.objectNumberIndex(base);
-        return c.ts.makeObject(props.items, sidx, nidx, false);
+        return c.ts.makeObject(props.items, sidx, nidx, c.ts.objectFlags(derived));
     }
 
     /// Generic instance shape of a class: instance members + base instance.
@@ -3136,7 +3138,10 @@ const Checker = struct {
         }
         var props: std.ArrayList(types.Prop) = .empty;
         defer props.deinit(c.scratch());
-        var result: TypeId = types.empty_object_type;
+        // A class instance is a nominal shape without the implied string index
+        // that an object/type literal carries (an empty `class C {}` must still
+        // fail assignment to `{[k:string]:T}`).
+        var result: TypeId = try c.ts.makeObject(&.{}, 0, 0, types.obj_flag_not_inferable);
         if (c.bind.membersScopeOf(c.localOf(sym))) |ms| {
             const lo = c.bind.scope_members_start[ms];
             const hi = c.bind.scope_members_start[ms + 1];
@@ -3156,7 +3161,7 @@ const Checker = struct {
                     .flags = flags,
                 });
             }
-            result = try c.ts.makeObject(props.items, 0, 0, false);
+            result = try c.ts.makeObject(props.items, 0, 0, types.obj_flag_not_inferable);
         }
         // Merge base class instance.
         if (try c.baseClassRef(sym)) |base_ref| {
@@ -3467,7 +3472,7 @@ const Checker = struct {
                 try props.append(c.scratch(), .{ .name = name, .ty = enum_t, .flags = types.prop_flag_readonly });
             }
         }
-        const result = try c.ts.makeObject(props.items, 0, 0, false);
+        const result = try c.ts.makeObject(props.items, 0, 0, 0);
         try c.enum_value_cache.put(c.ca(), sym, result);
         return result;
     }
@@ -3584,7 +3589,7 @@ const Checker = struct {
                 });
             }
         }
-        const result = try c.ts.makeObject(props.items, 0, 0, false);
+        const result = try c.ts.makeObject(props.items, 0, 0, 0);
         try c.class_static_cache.put(c.ca(), sym, result);
         return result;
     }
@@ -3834,7 +3839,7 @@ const Checker = struct {
                 }
                 const sidx = if (s.objectStringIndex(t) != 0) try c.instantiateId(s.objectStringIndex(t), map, map_id) else 0;
                 const nidx = if (s.objectNumberIndex(t) != 0) try c.instantiateId(s.objectNumberIndex(t), map, map_id) else 0;
-                break :blk try s.makeObject(props.items, sidx, nidx, s.objectFlags(t) & types.obj_flag_fresh != 0);
+                break :blk try s.makeObject(props.items, sidx, nidx, s.objectFlags(t));
             },
             .function => blk: {
                 var params: std.ArrayList(types.Param) = .empty;
@@ -4415,7 +4420,7 @@ const Checker = struct {
                 }
                 const sidx = if (s.objectStringIndex(t) != 0) try c.substInfer(s.objectStringIndex(t), ids, vals) else 0;
                 const nidx = if (s.objectNumberIndex(t) != 0) try c.substInfer(s.objectNumberIndex(t), ids, vals) else 0;
-                return s.makeObject(props.items, sidx, nidx, s.objectFlags(t) & types.obj_flag_fresh != 0);
+                return s.makeObject(props.items, sidx, nidx, s.objectFlags(t));
             },
             .function => {
                 var params: std.ArrayList(types.Param) = .empty;
@@ -4628,7 +4633,7 @@ const Checker = struct {
             }
         }
         if (props.items.len == 0 and sindex == 0 and nindex == 0) return types.empty_object_type;
-        return s.makeObject(props.items, sindex, nindex, false);
+        return s.makeObject(props.items, sindex, nindex, 0);
     }
 
     /// Build an object from possibly-duplicate-named props (later wins), then
@@ -4646,7 +4651,7 @@ const Checker = struct {
                 try out.append(c.scratch(), p);
             }
         }
-        return c.ts.makeObject(out.items, 0, 0, false);
+        return c.ts.makeObject(out.items, 0, 0, 0);
     }
 
     /// Resolve a mapped type's `as` remap for one src_type key. Returns the new
@@ -4803,7 +4808,7 @@ const Checker = struct {
                     const p = s.objectProp(t, @intCast(i));
                     try props.append(c.scratch(), .{ .name = p.name, .ty = try c.substMappedKey(p.ty, key_id, key_ty), .flags = p.flags });
                 }
-                return s.makeObject(props.items, 0, 0, false);
+                return s.makeObject(props.items, 0, 0, 0);
             },
             .function => {
                 var params: std.ArrayList(types.Param) = .empty;
@@ -5808,18 +5813,33 @@ const Checker = struct {
             if (tp.optional()) tt = try c.makeUnion2(tt, types.undefined_type);
             if (!try c.isAssignable(st, tt)) return false;
         }
+        // Target string index signature. tsc: the source satisfies it via
+        // (a) a compatible *source* string index signature, or (b) being an
+        // object with an *implied* index (object/type literal, not an
+        // interface / class-instance / array / tuple / function / primitive)
+        // whose every known property conforms. A source with neither — a bare
+        // primitive, function, class instance, or interface without an index —
+        // fails vacuously no longer: it fails, period. (M17.1)
         if (sidx != 0) {
             switch (c.ts.kind(s)) {
                 .object => {
-                    for (0..c.ts.objectPropCount(s)) |i| {
-                        const sp = c.ts.objectProp(s, @intCast(i));
-                        if (!try c.isAssignable(sp.ty, sidx)) return false;
-                    }
-                    if (c.ts.objectStringIndex(s) != 0 and !try c.isAssignable(c.ts.objectStringIndex(s), sidx)) return false;
+                    if (c.ts.objectStringIndex(s) != 0) {
+                        if (!try c.isAssignable(c.ts.objectStringIndex(s), sidx)) return false;
+                    } else if (c.ts.objectHasImpliedIndex(s)) {
+                        for (0..c.ts.objectPropCount(s)) |i| {
+                            const sp = c.ts.objectProp(s, @intCast(i));
+                            if (!try c.isAssignable(sp.ty, sidx)) return false;
+                        }
+                    } else return false; // interface / class instance, no index sig
                 },
-                else => {},
+                else => return false,
             }
         }
+        // Target number index signature. Arrays and tuples always carry a
+        // numeric index; a source `string` indexes numerically to `string`; an
+        // object satisfies via a source number index, a source string index
+        // (string keys subsume numeric ones), or — when it has an implied index
+        // — its *numerically named* properties.
         if (nidx != 0) {
             switch (c.ts.kind(s)) {
                 .array => {
@@ -5830,12 +5850,37 @@ const Checker = struct {
                         if (!try c.isAssignable(c.ts.tupleElem(s, @intCast(i)).ty, nidx)) return false;
                     }
                 },
-                .object => {
-                    if (c.ts.objectNumberIndex(s) != 0 and !try c.isAssignable(c.ts.objectNumberIndex(s), nidx)) return false;
+                .string => {
+                    if (!try c.isAssignable(types.string_type, nidx)) return false;
                 },
-                else => {},
+                .object => {
+                    if (c.ts.objectNumberIndex(s) != 0) {
+                        if (!try c.isAssignable(c.ts.objectNumberIndex(s), nidx)) return false;
+                    } else if (c.ts.objectStringIndex(s) != 0) {
+                        if (!try c.isAssignable(c.ts.objectStringIndex(s), nidx)) return false;
+                    } else if (c.ts.objectHasImpliedIndex(s)) {
+                        for (0..c.ts.objectPropCount(s)) |i| {
+                            const sp = c.ts.objectProp(s, @intCast(i));
+                            if (!isNumericPropName(c.atomText(sp.name))) continue;
+                            if (!try c.isAssignable(sp.ty, nidx)) return false;
+                        }
+                    } else return false; // interface / class instance, no index sig
+                },
+                else => return false,
             }
         }
+        return true;
+    }
+
+    /// A property name that a *number* index signature constrains: a canonical
+    /// non-negative integer string (`"0"`, `"1"`, `"42"` — not `"01"`, `"1.5"`,
+    /// `"-1"`, or any non-digit name). Conservative on purpose: a name we do not
+    /// recognise as numeric is treated as string-keyed and skipped for a number
+    /// index (an under-report, never a false rejection).
+    fn isNumericPropName(text: []const u8) bool {
+        if (text.len == 0) return false;
+        if (text.len > 1 and text[0] == '0') return false; // no leading zeros
+        for (text) |ch| if (ch < '0' or ch > '9') return false;
         return true;
     }
 
@@ -6466,7 +6511,7 @@ const Checker = struct {
             }
         }
         if (rt == types.no_type or has_spread) return;
-        const attrs_obj = try c.ts.makeObject(built.items, 0, 0, true);
+        const attrs_obj = try c.ts.makeObject(built.items, 0, 0, types.obj_flag_fresh);
         if (have_excess) {
             try c.reportNotAssignable(2322, attrs_obj, props, first_excess);
             return;
@@ -6855,7 +6900,7 @@ const Checker = struct {
         if (c.const_ctx) {
             for (props.items) |*p| p.flags |= types.prop_flag_readonly;
         }
-        return c.ts.makeObject(props.items, 0, 0, true);
+        return c.ts.makeObject(props.items, 0, 0, types.obj_flag_fresh);
     }
 
     /// Contextual type for property `key` of an object literal typed by

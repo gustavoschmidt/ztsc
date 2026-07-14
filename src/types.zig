@@ -110,7 +110,10 @@ pub const Kind = enum(u8) {
     /// Object type. a = extra index, b = property count. extra[a..]:
     /// [flags, string_index_type, number_index_type,
     ///  then per property (sorted by name atom): name, type, prop_flags].
-    /// Object flags: 1 = fresh (object literal, excess-prop checked).
+    /// Object flags: 1 = fresh (object literal, excess-prop checked);
+    /// 2 = not-inferable-index (interface / class-instance shape — has no
+    /// *implied* string index for the index-signature relation, unlike
+    /// object/type literals).
     /// prop_flags: 1 = optional, 2 = readonly.
     object,
     /// Function/signature type. a = extra index, b = param count. extra[a..]:
@@ -212,6 +215,10 @@ pub const mapped_flag_optional_remove: u32 = 8; // `-?`
 pub const mapped_flag_homomorphic: u32 = 16; // constraint was `keyof T`
 
 pub const obj_flag_fresh: u32 = 1;
+/// The object is an interface or class-instance shape: it does NOT carry an
+/// *implied* string index signature for the index-signature assignability
+/// relation. Object/type literals (the inferable-index case) leave this clear.
+pub const obj_flag_not_inferable: u32 = 2;
 pub const prop_flag_optional: u32 = 1;
 pub const prop_flag_readonly: u32 = 2;
 pub const elem_flag_optional: u32 = 1;
@@ -338,7 +345,7 @@ pub const Store = struct {
             try s.map.putContext(s.alloc, id, {}, .{ .store = &s });
         }
         // empty object {} at index 16.
-        const eo = try s.makeObject(&.{}, no_type, no_type, false);
+        const eo = try s.makeObject(&.{}, no_type, no_type, 0);
         std.debug.assert(eo == empty_object_type);
         return s;
     }
@@ -447,6 +454,12 @@ pub const Store = struct {
     }
     pub fn objectIsFresh(s: *const Store, id: TypeId) bool {
         return s.kind(id) == .object and s.objectFlags(id) & obj_flag_fresh != 0;
+    }
+    /// An object/type-literal shape carries an *implied* string index signature
+    /// for the index-signature relation; interface / class-instance shapes
+    /// (marked `obj_flag_not_inferable`) do not.
+    pub fn objectHasImpliedIndex(s: *const Store, id: TypeId) bool {
+        return s.kind(id) == .object and s.objectFlags(id) & obj_flag_not_inferable == 0;
     }
     pub fn objectStringIndex(s: *const Store, id: TypeId) TypeId {
         if (id < s.base_len) return s.base.?.objectStringIndex(id);
@@ -885,11 +898,11 @@ pub const Store = struct {
         props: []const Prop,
         string_index: TypeId,
         number_index: TypeId,
-        fresh: bool,
+        flags: u32,
     ) Error!TypeId {
         const start = s.pending.items.len;
         defer s.pending.items.len = start;
-        try s.pending.append(s.alloc, if (fresh) obj_flag_fresh else 0);
+        try s.pending.append(s.alloc, flags);
         try s.pending.append(s.alloc, string_index);
         try s.pending.append(s.alloc, number_index);
         const pstart = s.pending.items.len;
@@ -1322,8 +1335,8 @@ test "intersection canonicalization" {
     // never absorbs
     try testing.expectEqual(never_type, try s.makeIntersection(sc, &.{ string_type, never_type }));
     // order-insensitive
-    const o1 = try s.makeObject(&.{.{ .name = 1, .ty = string_type }}, 0, 0, false);
-    const o2 = try s.makeObject(&.{.{ .name = 2, .ty = number_type }}, 0, 0, false);
+    const o1 = try s.makeObject(&.{.{ .name = 1, .ty = string_type }}, 0, 0, 0);
+    const o2 = try s.makeObject(&.{.{ .name = 2, .ty = number_type }}, 0, 0, 0);
     const ix = try s.makeIntersection(sc, &.{ o1, o2 });
     const iy = try s.makeIntersection(sc, &.{ o2, o1 });
     try testing.expectEqual(ix, iy);
@@ -1342,11 +1355,11 @@ test "object interning: property order does not matter, freshness does" {
         .{ .name = 20, .ty = string_type, .flags = prop_flag_optional },
     };
     const props_ba = [_]Prop{ props_ab[1], props_ab[0] };
-    const o1 = try s.makeObject(&props_ab, 0, 0, false);
-    const o2 = try s.makeObject(&props_ba, 0, 0, false);
+    const o1 = try s.makeObject(&props_ab, 0, 0, 0);
+    const o2 = try s.makeObject(&props_ba, 0, 0, 0);
     try testing.expectEqual(o1, o2);
 
-    const fresh = try s.makeObject(&props_ab, 0, 0, true);
+    const fresh = try s.makeObject(&props_ab, 0, 0, obj_flag_fresh);
     try testing.expect(fresh != o1);
     try testing.expect(s.objectIsFresh(fresh));
     try testing.expectEqual(o1, try s.regular(fresh));
@@ -1412,7 +1425,7 @@ test "frozen base / overlay: base ids shared, overlay ids above base_len, determ
     // Build a base with some non-trivial structural types, then freeze it.
     var base = try Store.init(a);
     const base_union = try base.makeUnion(testing.allocator, &.{ string_type, number_type });
-    const base_obj = try base.makeObject(&.{.{ .name = 100, .ty = number_type }}, no_type, no_type, false);
+    const base_obj = try base.makeObject(&.{.{ .name = 100, .ty = number_type }}, no_type, no_type, 0);
     const base_ref = try base.makeRef(7, &.{string_type});
     const base_len: TypeId = @intCast(base.kinds.items.len);
     try testing.expect(base_union < base_len);
@@ -1431,7 +1444,7 @@ test "frozen base / overlay: base ids shared, overlay ids above base_len, determ
     // Interning a type structurally identical to a base type returns the BASE
     // id (shared, < base_len) — no overlay duplication.
     try testing.expectEqual(base_union, try ov1.makeUnion(testing.allocator, &.{ number_type, string_type }));
-    try testing.expectEqual(base_obj, try ov1.makeObject(&.{.{ .name = 100, .ty = number_type }}, no_type, no_type, false));
+    try testing.expectEqual(base_obj, try ov1.makeObject(&.{.{ .name = 100, .ty = number_type }}, no_type, no_type, 0));
     try testing.expectEqual(base_ref, try ov1.makeRef(7, &.{string_type}));
     try testing.expectEqual(@as(usize, 0), ov1.overlayCount());
 
