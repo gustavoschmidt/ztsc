@@ -1238,6 +1238,15 @@ const Parser = struct {
     }
 
     fn parseParam(p: *Parser) PE!Node {
+        // Parameter decorators (`@dec x: T`) are a grammar error under TC39
+        // standard decorators: consume them (so the parameter itself still
+        // parses cleanly, no cascade) and report TS1206 per decorator.
+        while (p.curTag() == .at) {
+            if (p.spec > 0) return error.Backtrack;
+            const at = try p.bump(); // `@`
+            if (canStartExpression(p.curTag())) _ = try p.parseLhsExpression(.{});
+            try p.errAtToken(.decorator_not_valid_here, at);
+        }
         const start_tok = p.curIdx();
         var flags: u32 = 0;
         // Constructor parameter properties: visibility/readonly/override.
