@@ -248,7 +248,7 @@ them.)
 
 ## 5. The road to the public v0.0.1
 
-M11–M16 are done (per-milestone records below). **Five remain: M17–M21.**
+M11–M17 are done (per-milestone records below). **Four remain: M18–M21.**
 The numbering has moved twice:
 
 - **2026-07-13** — linear renumbering after the backend-first decision
@@ -1117,7 +1117,9 @@ identically; benchmarks track types/line, RSS, and instantiation counts.
   hono/typebox template-heavy `.d.ts` resolve with no crash/panic/explosion.
   **Deferred (documented):** `infer V extends number` numeric-constraint
   reinterpretation (M16a's constrained-infer gap); template escapes uncooked;
-  cross-pattern↔pattern assignability is identity-only; infer matcher is
+  cross-pattern↔pattern assignability is identity-only (**this identity-only
+  stance was a false positive — rejected valid pattern→pattern assignments —
+  degraded to a lenient accept in M17.4**); infer matcher is
   first-occurrence (no backtracking) — exact for single-delimiter forms.
   Unblocks M16d.
 
@@ -1149,7 +1151,9 @@ identically; benchmarks track types/line, RSS, and instantiation counts.
   assignability gap** (a bare primitive/function vacuously satisfies
   `{[k:string]:T}`, reproduces non-recursively) — left `structuralAssignable`
   untouched rather than destabilize it; template-`as` over an *intersection*
-  constraint (`keyof T & string`) materializes to `{}`. Termination on genuinely-
+  constraint (`keyof T & string`) materializes to `{}` (**this was a false
+  positive — spurious TS2353/TS2339 on legitimately-remapped keys — fixed in
+  M17.4 via `collectMappedKeys`**). Termination on genuinely-
   infinite self-reference is the same lenient stance as M16a–c (bounded, no
   false positive, no hang).
 
@@ -1160,7 +1164,7 @@ throughout, real `.d.ts` (zod/hono/date-fns) resolve without crash. Next: M17
 (correctness debt — the pre-existing index-signature assignability gap
 surfaced in M16d is its lead item); shipping is **M21**.
 
-### M17 — Correctness debt: wrong answers & nondeterminism on the release path
+### M17 — Correctness debt: wrong answers & nondeterminism on the release path ✅ DONE (2026-07-14)
 
 Pre-release sweep. Three known bugs — two silent wrong answers, one
 nondeterminism — all surfaced during M14–M16 and deliberately deferred
@@ -1319,20 +1323,55 @@ nondeterminism are not.**
    instantiation"), and the relation reads the erased signatures, so a
    generic predicate target skips the check. Rare (guards are near-always
    monomorphic) and it can only miss an error, so accepted for v0.0.1.
-4. **Deferral triage — decide, don't drift.** Walk every standing
-   "deferred" note in §5 and record accept-for-v0.0.1 or fix, here, when
-   the milestone closes: cross-file conflict diagnostics
-   TS2300/TS2403/TS2717 + TS2669 placement (M11 — under-reporting,
-   default accept); lenient TS2589 on self-referential types (M16a–d —
-   bounded, never a hang or false positive, default accept); constrained
-   `infer V extends C` constraint ignored (M16a); template
-   pattern↔pattern assignability identity-only (M16c); template `as` over
-   an intersection constraint (`keyof T & string`) materializing `{}`
-   (M16d — **verify this cannot produce a false positive**, e.g. TS2339
-   on a legitimately remapped key; if it can, fix or degrade to a clean
-   deferral); `export =` / `import = require` out of subset (confirm the
-   real corpus gets a clean "not supported" diagnostic, never a wrong
-   answer).
+4. ✅ **DONE (M17.4)** — **Deferral triage — decide, don't drift.** Walked
+   every standing "deferred" note in §5 and recorded an explicit
+   accept-or-fix decision below. Policy applied: pure under-reporting (a
+   missed error, never a wrong answer or spurious diagnostic) is **accepted**
+   for v0.0.1; anything that could **reject valid code** (a false positive)
+   is a blocker and was fixed or degraded to a clean deferral. **The triage
+   surfaced two live false positives** — both hands-on-verified against tsc
+   5.5.4 and fixed (see the ✳ rows); everything else is under-reporting and
+   accepted. Conformance 374 → **376** (+2 differential cases for the fixes:
+   `mapped/010_as_constraint_intersection`, `template/008_pattern_to_pattern`).
+   Type store byte-identical to the M17.3 baseline (N=4: 24852 types / 703744
+   bytes — both fixes are dormant on the JS-subset corpus); bench flat
+   (=1 0.08s/49.7MB, =4 0.03s/53.9MB, =8 0.02s/48.0MB).
+
+   | # | Deferred note (milestone) | Kind | Decision |
+   |---|---|---|---|
+   | 1 | Cross-file conflict diagnostics TS2300/TS2403/TS2717 (M11a/b) | under-report | **accept** — missed duplicate/mismatch errors, never wrong |
+   | 2 | TS2669 augmentation-placement enforcement (M11a) | under-report | **accept** |
+   | 3 | Cross-file type-parameter unification for generic-interface augmentation (`Array<T>`, M11a) | under-report | **accept** |
+   | 4 | Cross-file class+namespace static-member merge (M11b) | under-report | **accept** — rare; within-file works |
+   | 5 | `export =` / `import = require` / `import = ns` out of subset (M11c/M13) | out-of-subset | **accept** — verified: clean `unsupported_syntax` ("syntax not yet supported by ztsc") at the construct, exit 1, no crash/wrong answer |
+   | 6 | `(dir, spec)`-existence resolution-cache layer (M13) | perf infra | **accept** — census says resolution is not a bottleneck |
+   | 7 | tsc/tsgo wall/RSS over real corpus; grow corpus past 77k LOC (M13) | bench infra | **accept** → folded into M18's corpus/census refresh |
+   | 8 | JSX polish (3) `JSX` from `@types/react` + (4) spread-attr/TS2559, `key`/`ref`, children typing (M14) | under-report | **accept** → M18/post-v0.0.1 (backend-first) |
+   | 9 | `this`-typing: TS2684 on overloaded free functions; generic method whose `this`-param mentions a class type param (M14) | under-report | **accept** |
+   | 10 | Decorator signature checks TS1238/1240/1241 + param-decorator TS1206 (M14) | under-report (lib-gated) | **accept** → land in M18 with the real lib |
+   | 11 | Lenient TS2589 on self-referential conditional/mapped/template/recursive types (M16a–d) | under-report | **accept** — bounded via the M15 depth budget; never a hang or FP, only a missed limit-diagnostic |
+   | 12 | Constrained `infer V extends C` constraint ignored (M16a) | under-report | **accept** — verified no FP: ignoring the constraint only *widens* the inferred `V`, so it can miss an error but never rejects valid code (tsc-differential: clean both sides) |
+   | 13 | Nested conditionals share a single-level infer scope; `Array<infer U>` single-arg heuristic (M16a) | under-report | **accept** |
+   | 14 | `infer V extends number` numeric-constraint reinterpretation; template escapes uncooked; infer matcher first-occurrence/no-backtracking (M16c) | under-report | **accept** |
+   | ✳15 | **Template pattern↔pattern assignability was identity-only (M16c)** | **FALSE POSITIVE** | **FIXED** — identity-only *rejected* valid pattern assignments (`` `a${string}` `` → `` `${string}` ``, `` `hi-${string}` `` → `` `${string}-${string}` `` both spurious TS2322; tsc accepts). ztsc has no pattern↔pattern matcher, so `isAssignableInner`'s pattern-target branch (checker.zig) now **accepts** a template-pattern / `string_mapping` source leniently instead of rejecting it — under-reports genuine mismatches, never false-positives. Concrete-literal→pattern still checks precisely (`template/008`). |
+   | ✳16 | **Template `as` over an intersection constraint (`keyof T & string`) materialized `{}` (M16d)** | **FALSE POSITIVE** | **FIXED** — `{ [K in keyof T & string as \`get_${K}\`]: … }` collapsed the intersection constraint to `{}`, emitting spurious TS2353 (excess property on assignment) + TS2339 (on every remapped-key access); tsc accepts. New `collectMappedKeys` (checker.zig) simplifies the constraint intersection — keeps the union literals surviving the primitive filter, mirroring tsc's `("a"\|"b") & string` → `"a"\|"b"` — so the keys materialize correctly (`mapped/010`). |
+   | 17 | Recursive-alias scalar rejection (`const bad: Json = () => 1`) blocked by the broad index-signature gap (M16d) | was wrong-answer | **already FIXED in M17.1** (the index-signature assignability hole) |
+
+   Per-item accepted deferrals recorded in place at M17.1–M17.3 (mixed-intersection index short-circuit; number-only-index vacuous string-index pass; generic-predicate target skip) remain accepted — each an under-report, none a false positive.
+
+**M17 (correctness debt) COMPLETE** (2026-07-14): M17.1 index-signature
+assignability hole → M17.2 raw-args/base-cycle (TS2310) determinism →
+M17.3 type-predicate assignability → M17.4 deferral triage. Conformance
+365 → **376**, all differential vs tsc 5.5.4; multi byte-identical across
+`--checkers ∈ {1,4,8}` throughout; type store byte-identical to the M16
+baseline on the JS subset (24852 types / 703744 bytes at N=4). The triage
+found and fixed **two release-blocking false positives** (template
+pattern↔pattern rejection; template-`as`-over-intersection `{}`
+collapse); every other standing deferral is a documented under-report,
+consciously accepted for v0.0.1 under the "wrong answers and
+nondeterminism are blockers; missed errors are not" policy. Next: M18
+(the real lib) — where the lib-gated under-reports above (decorator
+signature checks, JSX `@types/react` resolution) come due.
 
 **Gate:** new differential conformance for (1)–(3); zero regressions on
 the existing suite; multi + deps corpora byte-identical across

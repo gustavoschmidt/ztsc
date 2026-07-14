@@ -4660,12 +4660,15 @@ const Checker = struct {
             }
         }
 
-        // Non-homomorphic: the key set is the constraint's members.
-        var keys_buf = [_]TypeId{constraint};
-        const keys: []const TypeId = if (s.kind(constraint) == .union_type)
-            try c.memberList(constraint)
-        else
-            keys_buf[0..];
+        // Non-homomorphic: the key set is the constraint's members. An
+        // intersection constraint (`keyof T & string` — the string-key filter
+        // idiom) is simplified to the surviving literal members here; without
+        // it the intersection fell through to `{}` (spurious TS2353/TS2339 on
+        // legitimately-remapped keys — an M17.4 false-positive fix).
+        var keyset: std.ArrayList(TypeId) = .empty;
+        defer keyset.deinit(c.scratch());
+        try c.collectMappedKeys(constraint, &keyset);
+        const keys = keyset.items;
 
         var props: std.ArrayList(types.Prop) = .empty;
         defer props.deinit(c.scratch());
@@ -4690,6 +4693,48 @@ const Checker = struct {
         }
         if (props.items.len == 0 and sindex == 0 and nindex == 0) return types.empty_object_type;
         return s.makeObject(props.items, sindex, nindex, 0);
+    }
+
+    /// Flatten a non-homomorphic mapped-type constraint into its concrete key
+    /// members for `materializeMapped`'s prop loop. A union contributes each
+    /// member; a bare `string`/`number`/literal contributes itself; an
+    /// intersection `(K1|K2|…) & string` (the `keyof T & string` idiom that
+    /// filters `keyof T` to its string-named keys) contributes the union
+    /// literals that survive the primitive filter — string literals pass a
+    /// `string` filter, number literals a `number` filter. This mirrors tsc's
+    /// simplification of `("a"|"b") & string` to `"a"|"b"`.
+    fn collectMappedKeys(c: *Checker, constraint0: TypeId, out: *std.ArrayList(TypeId)) Error!void {
+        const s = &c.ts;
+        const constraint = try c.resolveStructural(constraint0);
+        switch (s.kind(constraint)) {
+            .union_type => for (try c.memberList(constraint)) |m| try c.collectMappedKeys(m, out),
+            .intersection => {
+                var want_string = false;
+                var want_number = false;
+                var want_symbol = false;
+                var cands: std.ArrayList(TypeId) = .empty;
+                defer cands.deinit(c.scratch());
+                for (try c.memberList(constraint)) |m0| {
+                    const m = try c.resolveStructural(m0);
+                    switch (s.kind(m)) {
+                        .string => want_string = true,
+                        .number => want_number = true,
+                        .symbol => want_symbol = true,
+                        .union_type => for (try c.memberList(m)) |lm| try cands.append(c.scratch(), lm),
+                        else => try cands.append(c.scratch(), m),
+                    }
+                }
+                for (cands.items) |cand| {
+                    const keep = switch (s.kind(try c.resolveStructural(cand))) {
+                        .string_literal => !want_number and !want_symbol,
+                        .number_literal, .number_literal_fresh => !want_string and !want_symbol,
+                        else => false,
+                    };
+                    if (keep) try out.append(c.scratch(), cand);
+                }
+            },
+            else => try out.append(c.scratch(), constraint),
+        }
     }
 
     /// Build an object from possibly-duplicate-named props (later wins), then
@@ -5729,6 +5774,15 @@ const Checker = struct {
         // `s == t` / `literalBase`.)
         if (tk == .template_literal_type) {
             if (try c.stringLiteralOf(s)) |atom_| return c.matchTemplatePattern(c.atomText(atom_), t);
+            // A template-pattern / string-mapping *source* against a pattern
+            // target (both subtypes of `string`): ztsc has no pattern↔pattern
+            // matcher, so rather than reject valid assignments — a false
+            // positive, e.g. `` `a${string}` `` → `` `${string}` `` or
+            // `` `hi-${string}` `` → `` `${string}-${string}` `` — it accepts
+            // leniently. This under-reports genuine pattern mismatches, which
+            // is policy-acceptable for v0.0.1 (identical patterns already
+            // resolved via `s == t`). M17.4: was a release-blocking FP.
+            if (sk == .template_literal_type or sk == .string_mapping) return true;
             return false;
         }
         // Template-literal pattern *source*: assignable only to `string` (fast
