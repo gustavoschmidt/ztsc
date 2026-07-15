@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ztsc — a fast, low-memory TypeScript type checker in Zig</title>
+<meta name="description" content="ztsc type-checks TypeScript in milliseconds and megabytes: 6–20% of tsgo's peak memory on real packages, and faster. A single static binary, zero dependencies, written in Zig.">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='20' fill='%23eda100'/%3E%3Ctext x='50' y='74' font-size='68' font-family='monospace' font-weight='bold' text-anchor='middle' fill='%231c1b18'%3Ez%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+
+<nav class="sitenav"><div class="navin">
+  <a class="brand" href="./">ztsc<span class="cursor">▌</span></a>
+  <div class="navlinks">
+    <a href="./" aria-current="page">overview</a>
+    <a href="usage.html">usage</a>
+    <a href="internals.html">internals</a>
+    <a href="rationale.html">rationale</a>
+    <a href="https://github.com/gustavoschmidt/ztsc">github ↗</a>
+  </div>
+</div></nav>
+
+<div class="wrap">
+
+<header class="hero">
+  <p class="eyebrow">ztsc 0.0.1-dev · pre-release · zig 0.16 · mit license</p>
+  <h1>Type-check TypeScript in milliseconds, in megabytes.</h1>
+  <p class="sub">ztsc is an extremely fast, low-memory TypeScript type checker (no JS emit),
+  written in Zig. A <strong>single static binary</strong> with <strong>zero
+  dependencies</strong> — no Node runtime, no packages, nothing but the Zig standard library.
+  It checks a large, well-defined subset of strict-mode TypeScript with diagnostics that match
+  the TypeScript compiler, byte-identical at any parallelism.</p>
+
+  <div class="ctas">
+    <a class="btn primary" href="usage.html">Get started</a>
+    <a class="btn" href="internals.html">Read the internals</a>
+    <a class="btn" href="https://github.com/gustavoschmidt/ztsc">GitHub</a>
+  </div>
+
+  <div class="stats">
+    <div class="stat">
+      <div class="k">wall clock · @types/node</div>
+      <div class="v">0.01&thinsp;<small>s</small></div>
+      <div class="c">tsgo 7.0.2 takes 0.04&thinsp;s on the same 49.6k lines of declarations — and ztsc is faster on all seven benchmark packages</div>
+    </div>
+    <div class="stat">
+      <div class="k">peak RSS · @types/node</div>
+      <div class="v">17&thinsp;<small>MB</small></div>
+      <div class="c">17% of tsgo (101&thinsp;MB); across seven real packages ztsc runs at 6–20% of tsgo's peak</div>
+    </div>
+    <div class="stat">
+      <div class="k">dependencies</div>
+      <div class="v">0</div>
+      <div class="c">the Zig source uses nothing but the Zig standard library; the binary needs nothing but your OS</div>
+    </div>
+    <div class="stat">
+      <div class="k">conformance</div>
+      <div class="v">388/388</div>
+      <div class="c">differential cases (error code + line) vs the native TypeScript compiler, tsgo 7.0.2</div>
+    </div>
+  </div>
+</header>
+
+<!-- ============================================================ -->
+<section>
+  <p class="eyebrow">benchmarks</p>
+  <h2>Real packages, identical inputs</h2>
+  <p>Each package's published <code>.d.ts</code> is vendored at a pinned version and both tools
+  check identical inputs, at their default 4 checker instances, on an Apple M4. Median of 5 runs
+  under <code>/usr/bin/time&nbsp;-l</code> after a warm-up.</p>
+
+  <figure>
+    <div class="figbox">
+    <svg viewBox="0 0 940 430" role="img" aria-label="Two-panel grouped bar chart across seven real packages at the default four checkers. Left panel, peak resident memory: ztsc uses 6 to 22 megabytes, tsgo 44 to 280 megabytes — ztsc is 6 to 20 percent of tsgo on every package. Right panel, wall clock: ztsc takes 0.00 to 0.02 seconds, tsgo 0.01 to 0.23 seconds — ztsc is 6 to 50 percent of tsgo's time.">
+      <rect x="20" y="12" width="12" height="12" rx="2" fill="var(--c-ztsc)"/>
+      <text class="t11 mut" x="38" y="22">ztsc</text>
+      <rect x="78" y="12" width="12" height="12" rx="2" fill="var(--c-tsgo)"/>
+      <text class="t11 mut" x="96" y="22">tsgo 7.0.2</text>
+      <text class="t12 dim" x="210" y="22">peak RSS · MB · lower is better</text>
+      <text class="t12 dim" x="620" y="22">wall clock · seconds</text>
+      <line class="hairv" x1="590" y1="34" x2="590" y2="390"/>
+
+      <text class="t12 dim" x="195" y="64" text-anchor="end">@types/node</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 17.0 MB · 17% of tsgo" x="210" y="44" width="18" height="14" rx="2"/>
+      <text class="barlabel" x="236" y="55">17 <tspan class="acc">· 17%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 100.6 MB" x="210" y="61" width="105" height="14" rx="2"/>
+      <text class="barlabel" x="323" y="72">101</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 0.01 s · 25% of tsgo" x="620" y="44" width="12" height="14" rx="2"/>
+      <text class="barlabel" x="640" y="55">0.01 <tspan class="acc">· 25%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 0.04 s" x="620" y="61" width="47" height="14" rx="2"/>
+      <text class="barlabel" x="675" y="72">0.04</text>
+
+      <text class="t12 dim" x="195" y="116" text-anchor="end">drizzle-orm</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 21.8 MB · 8% of tsgo" x="210" y="96" width="23" height="14" rx="2"/>
+      <text class="barlabel" x="241" y="107">22 <tspan class="acc">· 8%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 279.5 MB" x="210" y="113" width="290" height="14" rx="2"/>
+      <text class="barlabel" x="508" y="124">280</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 0.02 s · 9% of tsgo" x="620" y="96" width="23" height="14" rx="2"/>
+      <text class="barlabel" x="651" y="107">0.02 <tspan class="acc">· 9%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 0.23 s" x="620" y="113" width="270" height="14" rx="2"/>
+      <text class="barlabel" x="898" y="124">0.23</text>
+
+      <text class="t12 dim" x="195" y="168" text-anchor="end">hono</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 14.1 MB · 9% of tsgo" x="210" y="148" width="15" height="14" rx="2"/>
+      <text class="barlabel" x="233" y="159">14 <tspan class="acc">· 9%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 155.9 MB" x="210" y="165" width="162" height="14" rx="2"/>
+      <text class="barlabel" x="380" y="176">156</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 0.01 s · 6% of tsgo" x="620" y="148" width="12" height="14" rx="2"/>
+      <text class="barlabel" x="640" y="159">0.01 <tspan class="acc">· 6%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 0.17 s" x="620" y="165" width="200" height="14" rx="2"/>
+      <text class="barlabel" x="828" y="176">0.17</text>
+
+      <text class="t12 dim" x="195" y="220" text-anchor="end">@sinclair/typebox</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 14.8 MB · 19% of tsgo" x="210" y="200" width="15" height="14" rx="2"/>
+      <text class="barlabel" x="233" y="211">15 <tspan class="acc">· 19%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 78.3 MB" x="210" y="217" width="81" height="14" rx="2"/>
+      <text class="barlabel" x="299" y="228">78</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 0.01 s · 25% of tsgo" x="620" y="200" width="12" height="14" rx="2"/>
+      <text class="barlabel" x="640" y="211">0.01 <tspan class="acc">· 25%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 0.04 s" x="620" y="217" width="47" height="14" rx="2"/>
+      <text class="barlabel" x="675" y="228">0.04</text>
+
+      <text class="t12 dim" x="195" y="272" text-anchor="end">ajv</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 10.0 MB · 20% of tsgo" x="210" y="252" width="10" height="14" rx="2"/>
+      <text class="barlabel" x="228" y="263">10 <tspan class="acc">· 20%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 49.8 MB" x="210" y="269" width="52" height="14" rx="2"/>
+      <text class="barlabel" x="270" y="280">50</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 0.01 s · 50% of tsgo" x="620" y="252" width="12" height="14" rx="2"/>
+      <text class="barlabel" x="640" y="263">0.01 <tspan class="acc">· 50%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 0.02 s" x="620" y="269" width="23" height="14" rx="2"/>
+      <text class="barlabel" x="651" y="280">0.02</text>
+
+      <text class="t12 dim" x="195" y="324" text-anchor="end">zod</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 7.7 MB · 6% of tsgo" x="210" y="304" width="8" height="14" rx="2"/>
+      <text class="barlabel" x="226" y="315">8 <tspan class="acc">· 6%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 136.2 MB" x="210" y="321" width="141" height="14" rx="2"/>
+      <text class="barlabel" x="359" y="332">136</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 0.01 s · 7% of tsgo" x="620" y="304" width="12" height="14" rx="2"/>
+      <text class="barlabel" x="640" y="315">0.01 <tspan class="acc">· 7%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 0.15 s" x="620" y="321" width="176" height="14" rx="2"/>
+      <text class="barlabel" x="804" y="332">0.15</text>
+
+      <text class="t12 dim" x="195" y="376" text-anchor="end">chalk</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 6.0 MB · 14% of tsgo" x="210" y="356" width="6" height="14" rx="2"/>
+      <text class="barlabel" x="224" y="367">6 <tspan class="acc">· 14%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 44.0 MB" x="210" y="373" width="46" height="14" rx="2"/>
+      <text class="barlabel" x="264" y="384">44</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 0.00 s — below timer resolution" x="620" y="356" width="3" height="14" rx="2"/>
+      <text class="barlabel" x="631" y="367">0.00</text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 0.01 s" x="620" y="373" width="12" height="14" rx="2"/>
+      <text class="barlabel" x="640" y="384">0.01</text>
+    </svg>
+    </div>
+    <figcaption>Validators, web frameworks, an ORM, and the big <code>@types</code> packages:
+    ztsc's peak memory is <strong>6–20% of tsgo's</strong> and its wall clock
+    <strong>6–50%</strong> — faster <em>and</em> smaller on every package (time percentages are
+    coarse: most ztsc runs sit at the 10&thinsp;ms timer floor). ztsc checks a subset against an
+    esnext-only lib, so these are throughput and memory measurements on identical inputs, not a
+    diagnostic-parity claim — full methodology and caveats in
+    <a href="https://github.com/gustavoschmidt/ztsc/blob/main/BENCHMARKS.md">BENCHMARKS.md</a>.</figcaption>
+  </figure>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <p class="eyebrow">getting started</p>
+  <h2>Build it, point it at a project</h2>
+  <p>v0.0.1 is not on npm yet (once it is: <code>bunx ztsc</code>). Until then, build from
+  source — all you need is <a href="https://ziglang.org">Zig</a> 0.16.0; there are no
+  dependencies to fetch:</p>
+  <pre><code>git clone https://github.com/gustavoschmidt/ztsc
+cd ztsc
+zig build -Doptimize=ReleaseFast   # -&gt; zig-out/bin/ztsc</code></pre>
+  <p>Point it at a project and it does the rest:</p>
+  <pre><code>ztsc                       # finds tsconfig.json in cwd or a parent
+ztsc -p path/to/project    # explicit tsconfig
+ztsc src/main.ts           # or explicit entry files</code></pre>
+  <p>Diagnostics are tsc-style, with source excerpts and matching error codes:</p>
+  <pre><code>demo.ts:1:19 - error TS2322: Type 'string' is not assignable to type 'number'.
+
+1 const n: number = "hi";
+                    ~~~~</code></pre>
+
+  <div class="note">
+    <p><strong>Pre-release.</strong> ztsc is not ready for production use. It checks a large,
+    well-defined subset of strict-mode TypeScript — no DOM lib, no CommonJS interop yet — and
+    unsupported syntax produces a clear "not supported" diagnostic, never a wrong answer or a
+    crash. The full list is on the <a href="usage.html#limitations">usage page</a>.</p>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <p class="eyebrow">documentation</p>
+  <h2>Read more</h2>
+  <div class="cardgrid">
+    <a class="card" href="usage.html">
+      <h3>Usage</h3>
+      <p>Building, CLI options, the tsconfig subset, exit codes, and what's not checked yet.</p>
+    </a>
+    <a class="card" href="internals.html">
+      <h3>Internals</h3>
+      <p>A guided tour of how the checker works — the pipeline, the pointer-free data structures, the memory design, the parallelism.</p>
+    </a>
+    <a class="card" href="rationale.html">
+      <h3>Rationale</h3>
+      <p>Why this exists: the memory bet, why a measured subset, why determinism is a hard guarantee, and the experiments that didn't land.</p>
+    </a>
+    <a class="card" href="https://github.com/gustavoschmidt/ztsc/blob/main/BENCHMARKS.md">
+      <h3>Benchmarks</h3>
+      <p>Full results and methodology: the seven-package matrix over --checkers 1–8, and the honest caveats.</p>
+    </a>
+  </div>
+</section>
+
+<footer class="sitefoot">
+  ztsc · MIT license · lib and diagnostic strings derived from
+  <a href="https://github.com/microsoft/TypeScript">Microsoft TypeScript</a> (Apache-2.0, see
+  <a href="https://github.com/gustavoschmidt/ztsc/blob/main/NOTICE">NOTICE</a>) ·
+  <a href="https://github.com/gustavoschmidt/ztsc">github.com/gustavoschmidt/ztsc</a>
+</footer>
+
+</div>
+
+<div id="tip" role="status"></div>
+<script>
+  (function () {
+    var tip = document.getElementById('tip');
+    var marks = document.querySelectorAll('[data-tip]');
+    for (var i = 0; i < marks.length; i++) {
+      marks[i].addEventListener('pointermove', function (e) {
+        tip.textContent = this.getAttribute('data-tip');
+        tip.style.display = 'block';
+        var x = e.clientX + 14, y = e.clientY + 14;
+        var w = tip.offsetWidth, h = tip.offsetHeight;
+        if (x + w > window.innerWidth - 8) x = e.clientX - w - 10;
+        if (y + h > window.innerHeight - 8) y = e.clientY - h - 10;
+        tip.style.left = x + 'px';
+        tip.style.top = y + 'px';
+      });
+      marks[i].addEventListener('pointerleave', function () {
+        tip.style.display = 'none';
+      });
+    }
+  })();
+</script>
+</body>
+</html>
