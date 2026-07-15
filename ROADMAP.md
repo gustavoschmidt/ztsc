@@ -268,8 +268,8 @@ The numbering has moved twice:
   triage), **M18** (the real lib: call/construct signatures, full ES lib
   surface, real `@types/node` acceptance), **M19** (the deferred M14.5
   substrate payload: structural display order, frozen-store payload,
-  pre-parsed lib blob) — plus **M20** (pre-publish polish: license, error
-  output, README, docs cleanup — pulled forward from the post-v0.0.1
+  pre-parsed lib blob) — plus **M20** (pre-publish polish: license,
+  README, benchmark docs — pulled forward from the post-v0.0.1
   list so the repo v0.0.1 points at is presentable on day one). Notes
   and commit messages from 2026-07-13/14 that say "M17" mean the ship
   milestone, now **M21**.
@@ -1790,31 +1790,23 @@ shortfall to fix. **Net M19 status (CLOSED 2026-07-15): 19.1 landed
 ~2–4 ms front-end saving, sub-process-resolution). Pieces 2–3 measured out;
 proceed to M20.**
 
-### M20 — Pre-publish polish: license, error output, README, docs cleanup
+### M20 — Pre-publish polish: license, README, benchmark docs
 
 Everything a first-time visitor touches. Originally earmarked for *after*
 v0.0.1; pulled forward on 2026-07-14 so the repo that v0.0.1 points at is
 presentable on day one. Scheduled after M19 deliberately: the README's
 headline graph needs the *real-lib* numbers (M18/M19), not today's
-trimmed-lib ones. Items, in working order:
+trimmed-lib ones. ("Better error output" was cut from this milestone on
+2026-07-15 — moved to §8, post-v0.0.1.) Items, in working order:
 
-1. **MIT license.** Add a `LICENSE` file (MIT, Gustavo Schmidt) and the
-   `"license": "MIT"` field to the npm package metadata M21 publishes
-   (npm warns on unlicensed packages; do it here so M21's publish step is
-   mechanical).
-2. **Better error output.** The current renderer (render.zig) deliberately
-   copies tsc's format — that was for differential comparability, not a
-   design choice; the goal is to do better than a straight tsc clone
-   (clearer code frames, labeled spans, color discipline, related-info
-   grouping — survey what biome/rustc do well before designing).
-   **Constraint:** the differential conformance harness and the
-   byte-identical `--checkers`/oracle invariants compare rendered
-   diagnostics — keep the tsc-compatible renderer available (a
-   `--pretty=tsc`-style flag or internal mode) and pin the harness to it,
-   so the new default format never touches the differential machinery.
-   Diagnostic *content* (codes, spans, message text) stays tsc-matching —
-   only presentation changes.
-3. **README rewrite**, in exactly this order (decision recorded
+1. **MIT license + Apache-2.0 NOTICE.** Add a `LICENSE` file (MIT,
+   Gustavo Schmidt) and the `"license": "MIT"` field to the npm package
+   metadata M21 publishes (npm warns on unlicensed packages; do it here
+   so M21's publish step is mechanical). Diagnostic message strings are
+   copied from TypeScript (Apache-2.0), so add a `NOTICE` file crediting
+   Microsoft's TypeScript and stating what was derived — required by
+   Apache-2.0 §4, and honest besides.
+2. **README rewrite**, in exactly this order (decision recorded
    2026-07-13):
    1. Straightforward one-liner: "fast and low-memory TypeScript checker
       written in Zig with zero external deps."
@@ -1823,30 +1815,43 @@ trimmed-lib ones. Items, in working order:
       data comes from the M18/M19 real-corpus and release-gate runs).
    3. Installation & usage — **bun and npm focus** (`bunx ztsc`,
       `npx ztsc`, the tsconfig/`-p`/file-args forms).
-   4. Future features — incremental checking, LSP, new primitives (§8 is
-      the source; fold its content in before the ROADMAP is deleted in
-      item 5).
-   5. How to build locally (the Zig story) — last.
-4. **Benchmark docs rework** — BENCHMARKS.md leads with **real projects**
+   4. **Supported subset & limitations** (added 2026-07-15): port §6
+      (current checked subset) into a user-facing "what's checked /
+      what's not yet" section — a subset checker must document the
+      subset, and §6 dies with the ROADMAP otherwise.
+   5. Future features — incremental checking, LSP, new primitives (§8 is
+      the source; fold its content in before the ROADMAP is deleted).
+   6. How to build locally (the Zig story) — last.
+3. **Benchmark docs rework** — BENCHMARKS.md leads with **real projects**
    (the `bench/corpus/real` set and the M21 release-gate projects);
    synthetic corpora (small/medium/multi/skewed/bigfan/deps/generics)
    move to an appendix as methodology/regression infrastructure.
-5. **Remove ROADMAP.md and CLAUDE.md** (the last M20 commit, after
-   everything above): the public repo should carry a README, not internal
-   planning docs. Two things must be ported first, or they're lost:
-   (a) ROADMAP §8 (post-v0.0.1 plans) feeds README §4, and the M21
-   checklist below must survive somewhere actionable (agent memory or a
-   tracking issue) since deleting this file deletes it; (b) CLAUDE.md is
-   the per-session agent instruction file — its build/bench commands go
-   into the README's build section, and the **bench-before-every-commit
-   regression rule** moves to agent memory so it keeps being enforced
-   after the file is gone.
+   **Worker-count methodology** (decided 2026-07-15): headline numbers
+   are defaults-vs-defaults — ztsc `--checkers=4` (its default) vs tsgo's
+   default (tsgo grew its own `--checkers` flag, also defaulting to 4,
+   with the same speed/memory semantics) vs tsc (single-threaded, no
+   knob). Secondary table: sweep `--checkers=1,2,4,8` on **both** ztsc
+   and tsgo so the RSS-vs-wall tradeoff is compared like-for-like at
+   every N, not just at the defaults.
+4. **Docs cleanup** — CLAUDE.md is trimmed to a public-appropriate
+   minimum (build/bench commands already live in the README; keep the
+   bench-before-every-commit regression rule and the Zig version pin —
+   an in-repo agent file enforces that rule more reliably than
+   per-machine agent memory, and public repos commonly carry one).
+   **Remove ROADMAP.md** (the last M20 commit, after everything above):
+   the public repo should carry a README, not internal planning docs.
+   Port first, or it's lost: §8 (post-v0.0.1 plans) feeds README §5, and
+   §6 (checked subset) feeds README §4. **Notice: anything in this file
+   that is not done at deletion time — the M21 checklist, open deferrals,
+   in-flight decisions — must be saved to agent memory before the delete
+   commit.** **EXPERIMENTS.md** (added 2026-07-15) already preserves the
+   measured-out negative results (frozen-base payload, lib blob) with
+   revisit conditions, so deleting the ROADMAP doesn't lose them; future
+   didn't-land experiments get entries there.
 
-**Gate:** differential conformance still green with the harness pinned to
-the tsc-compat renderer; multi/deps byte-identical across N with the new
-default renderer (its output is deterministic too); bench flat (rendering
-is off the hot path — diagnostics only); README claims spot-checked
-against BENCHMARKS.md numbers (no stale or aspirational figures).
+**Gate:** differential conformance still green; bench flat (docs-only
+milestone apart from LICENSE/NOTICE); README claims spot-checked against
+BENCHMARKS.md numbers (no stale or aspirational figures).
 
 ### M21 — Ship it: bunx distribution + release (was M17/M20)
 
@@ -1959,6 +1964,14 @@ no checked subset; see §5.)
 - **Windows** support and benchmarks.
 - **`--fix`-style quick suggestions** (TS2551 "did you mean" already
   exists; expand).
+- **Better error output** (cut from M20 on 2026-07-15): the current
+  renderer (render.zig) deliberately copies tsc's format for differential
+  comparability; the goal is to beat a straight tsc clone (clearer code
+  frames, labeled spans, color discipline, related-info grouping — survey
+  biome/rustc first). Constraint carried over: the differential harness
+  and byte-identical `--checkers`/oracle invariants compare rendered
+  diagnostics, so keep the tsc-compatible renderer available and pinned
+  for the harness; only presentation changes, never content.
 - **Shared simple-type interner** across checkers — extend M12.3's frozen
   base beyond lib/`@types` to hot non-lib simple types if the census shows
   they dominate the per-checker duplication (memory dial, §7).
