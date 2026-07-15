@@ -747,12 +747,15 @@ ztsc is faster than tsc or tsgo:
 ```sh
 zig build test                      # unit + conformance (needs tsc for regen only)
 node bench/gen_corpus.js            # regenerate corpora (deterministic)
-RUNS=5 TSC=path/to/typescript/bin/tsc TSGO=path/to/native/tsgo bench/e2e.sh medium
-RUNS=5 TSC=path/to/typescript/bin/tsc TSGO=path/to/native/tsgo bench/e2e.sh multi
+RUNS=5 bench/e2e.sh medium
+RUNS=5 bench/e2e.sh multi
 zig-out/bench/ztsc --timing --memory --pretty=false -p bench/corpus/multi
 ```
 
-`bench/e2e.sh` autodetects `tsc`/`tsgo` on PATH; point `TSGO` at the
-native platform binary (`@typescript/native-preview-<platform>/lib/tsgo`)
-rather than the npm `bin/tsgo` Node shim so RSS is measured on the real
-process.
+`bench/e2e.sh` uses the pinned baselines under `bench/baselines/`
+(npm-installed on demand, node_modules gitignored): tsc 5.5.4 run via
+node, and native TypeScript ("tsgo"; since TS 7 stable it ships inside
+the `typescript` package as `@typescript/typescript-<platform>-<arch>/
+lib/tsc`) invoked as the platform binary directly — no Node wrapper —
+so RSS is measured on the real process. Override with
+`TSC=/path/to/typescript/bin/tsc` / `TSGO=/path/to/native/tsc`.
