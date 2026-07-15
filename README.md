@@ -63,7 +63,11 @@ like `tsc` — but it does not check everything yet:
 
 - **No DOM lib.** The embedded standard library is esnext-only, so browser
   globals (`Response`, `HTMLElement`, `fetch`, …) are not recognized.
-- **No CommonJS interop**: `export =` and `import x = require(…)`.
+- **CommonJS interop is checked** (`export =`, `import x = require(…)`, and
+  default/named/namespace ES imports against an `export =` module), but a couple
+  of corners degrade leniently rather than erroring: a namespace import keeps the
+  export's call signature (`ns()` is not flagged), and a member of a
+  `require`-bound namespace used in *type* position resolves to `any`.
 - **No const-symbol computed keys** (`[kind]: T` with a `unique symbol` key);
   well-known symbols like `[Symbol.iterator]` work.
 - **JSX needs a `JSX` namespace in scope** — resolving it from `@types/react`

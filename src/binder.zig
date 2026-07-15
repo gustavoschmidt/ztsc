@@ -143,6 +143,10 @@ pub const SymbolFlags = packed struct(u32) {
     pub fn merge(a: SymbolFlags, b: SymbolFlags) SymbolFlags {
         return @bitCast(a.bits() | b.bits());
     }
+    /// Whether the symbol denotes a value (for the `export =` mixing check).
+    pub fn hasValue(f: SymbolFlags) bool {
+        return (f.bits() & mask_value) != 0;
+    }
 };
 
 /// Strip surrounding quotes from a module-specifier string-literal token.
@@ -297,8 +301,8 @@ pub const FlowTag = enum(u8) {
     call_stmt,
 };
 
-pub const ImportKind = enum(u8) { default, namespace, named, side_effect };
-pub const ExportKind = enum(u8) { named, default, reexport_named, reexport_all, reexport_ns };
+pub const ImportKind = enum(u8) { default, namespace, named, side_effect, equals };
+pub const ExportKind = enum(u8) { named, default, reexport_named, reexport_all, reexport_ns, equals };
 
 /// One imported binding; feeds M5's module graph.
 pub const ImportRec = struct {
@@ -1361,6 +1365,11 @@ const Binder = struct {
                 if (b.cur_scope == file_scope) b.saw_module_syntax = true;
                 try b.bindExportAll(node);
             },
+            .export_assign => {
+                if (b.cur_scope == file_scope) b.saw_module_syntax = true;
+                try b.bindExportAssign(node);
+            },
+            .import_equals => try b.bindImportEquals(node),
 
             // Anything else in statement position (recovery leftovers) is
             // bound as an expression — keeps the binder total.
@@ -2209,6 +2218,57 @@ const Binder = struct {
             .kind = .default,
             .type_only = false,
         });
+    }
+
+    /// `export = <entity>;` (CommonJS export assignment). The module's export
+    /// *is* the named entity; the linker resolves `local` in the file scope and
+    /// stores it under the reserved `export=` key. Bind the entity reference so
+    /// it resolves like any value use.
+    fn bindExportAssign(b: *Binder, node: Node) Error!void {
+        const entity = b.tree.nodeData(node).lhs;
+        var local: Atom = 0;
+        if (entity != 0) {
+            try b.bindExpr(entity);
+            if (b.nodeTag(entity) == .identifier) {
+                local = try b.atomOfToken(b.tree.nodeMainToken(entity));
+            }
+        }
+        try b.export_recs.append(b.scratch, .{
+            .exported = 0,
+            .local = local,
+            .module = 0,
+            .sym = no_symbol,
+            .node = node,
+            .kind = .equals,
+            .type_only = false,
+        });
+    }
+
+    /// `import x = require("m");` (CommonJS import) or `import A = B.C;` (a
+    /// TS entity-name alias). The `require` form rides the module graph like an
+    /// ES import (`ImportKind.equals`); the entity-alias form is left lenient
+    /// (the local resolves to `any`, no cross-scope reference bound so no
+    /// spurious TS2304 — a documented under-report for a rare construct).
+    fn bindImportEquals(b: *Binder, node: Node) Error!void {
+        const d = b.tree.nodeData(node);
+        const data = b.tree.extraData(ast.ImportEquals, d.lhs);
+        if (b.cur_scope == file_scope) b.saw_module_syntax = true;
+        const local = try b.atomOfToken(data.name_token);
+        const sym = try b.declare(b.cur_scope, local, .import_value, node, data.name_token, .{});
+        if (data.flags & ast.Flags.exported != 0) b.sym_flags.items[sym].exported = true;
+        if (data.module_token != 0) {
+            const module = try b.moduleAtom(data.module_token);
+            if (module != 0) {
+                try b.import_recs.append(b.scratch, .{
+                    .local = local,
+                    .imported = 0,
+                    .module = module,
+                    .node = node,
+                    .kind = .equals,
+                    .type_only = false,
+                });
+            }
+        }
     }
 
     fn bindExportNamed(b: *Binder, node: Node) Error!void {

@@ -71,6 +71,7 @@ pub const Flags = struct {
     pub const computed: u32 = 1 << 18; // `[Symbol.iterator]` well-known-symbol key
     pub const global_aug: u32 = 1 << 19; // `declare global { ... }` augmentation block
     pub const ambient_module: u32 = 1 << 20; // `declare module "spec" { ... }`
+    pub const exported: u32 = 1 << 21; // `export import A = ...` (exported alias)
 };
 
 /// Maps a well-known `Symbol` property name (the `iterator` in
@@ -454,6 +455,12 @@ pub const Tag = enum(u8) {
     export_decl,
     /// `export default <expr-or-decl>`. main_token = `export`; lhs = node.
     export_default,
+    /// `export = <expr>;` (CommonJS export assignment). main_token = `export`;
+    /// lhs = entity expression node, rhs unused.
+    export_assign,
+    /// `import x = require("m");` or `import A = B.C;` (and `export import`).
+    /// main_token = `import`; lhs = extra→ImportEquals, rhs unused.
+    import_equals,
 
     // --- types -------------------------------------------------------------
     /// `T[]`. main_token = `[`; lhs = element type.
@@ -639,6 +646,15 @@ pub const ImportData = struct {
 };
 pub const ExportNamed = struct { flags: u32, spec_start: ExtraIndex, spec_end: ExtraIndex };
 pub const ExportAll = struct { flags: u32, name_token: TokenIndex };
+/// `import <name> = require("<module>")` (module_token set, entity 0) or
+/// `import <name> = <entity>` (entity set, module_token 0). `flags` carries
+/// `Flags.exported` for the `export import` form inside a namespace.
+pub const ImportEquals = struct {
+    name_token: TokenIndex,
+    module_token: TokenIndex,
+    entity: Node,
+    flags: u32,
+};
 
 /// The sealed parse result for one file. All slices live in the per-file
 /// arena; nothing is freed individually.
@@ -1074,6 +1090,11 @@ pub const Ast = struct {
                     it.pushRange(a.extraRange(e.spec_start, e.spec_end));
                 },
                 .export_all => {},
+                .export_assign => it.push(d.lhs),
+                .import_equals => {
+                    const e = a.extraData(ImportEquals, d.lhs);
+                    if (e.entity != 0) it.push(e.entity);
+                },
             }
         }
     };
@@ -1113,6 +1134,11 @@ pub const Ast = struct {
                 l.add(d.rhs);
             },
             .import_specifier, .export_specifier => l.add(d.lhs),
+            .import_equals => {
+                const e = a.extraData(ImportEquals, d.lhs);
+                l.add(e.name_token);
+                l.add(e.module_token);
+            },
             .index_signature => l.add(a.extraData(IndexSig, d.lhs).name_token),
             .template_literal_type_node => {
                 // The tail chunk token covers the closing backtick (span end).
@@ -1217,6 +1243,11 @@ pub const Ast = struct {
                 const e = a.extraData(ExportAll, d.lhs);
                 if (e.name_token != 0) try w.print(" ns={s}", .{a.tokenSlice(src, e.name_token)});
                 try w.print(" from={s}", .{a.tokenSlice(src, d.rhs)});
+            },
+            .import_equals => {
+                const e = a.extraData(ImportEquals, d.lhs);
+                try w.print(" {s}", .{a.tokenSlice(src, e.name_token)});
+                if (e.module_token != 0) try w.print(" require={s}", .{a.tokenSlice(src, e.module_token)});
             },
             .yield_expr => {
                 if (d.rhs != 0) try w.writeAll(" *");

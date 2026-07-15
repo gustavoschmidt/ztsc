@@ -1968,6 +1968,12 @@ const Checker = struct {
                 const a = try c.atomOfToken(tok);
                 switch (c.resolveSpace(a, c.cur_scope, false)) {
                     .sym => |sym| {
+                        // NB: an import-binding base (`import x = require("m")`)
+                        // is intentionally not followed here — CommonJS
+                        // namespace identity across modules is out of subset, so
+                        // `x.Member` in type position degrades to `any` (lenient,
+                        // no spurious TS2694) rather than resolving through the
+                        // binding. See M20 notes.
                         if (c.symFlags(sym).namespace_decl) return sym;
                         return null;
                     },
@@ -2923,6 +2929,7 @@ const Checker = struct {
         if (c.prog.links.len != 0) {
             const l = &c.prog.links[file];
             for (l.export_atoms, l.export_targets) |name, tgt| {
+                if (name == c.prog.export_equals_atom) continue; // reserved key
                 if (tgt.type_only) continue;
                 var ty: TypeId = types.any_type;
                 switch (tgt.kind) {
@@ -2958,6 +2965,7 @@ const Checker = struct {
         defer props.deinit(c.scratch());
         const ae = c.prog.ambient_exports[idx];
         for (ae.atoms, ae.targets) |name, tgt| {
+            if (name == c.prog.export_equals_atom) continue; // reserved key
             if (tgt.type_only) continue;
             const ty = try c.targetValueType(tgt);
             try props.append(c.scratch(), .{ .name = name, .ty = ty, .flags = types.prop_flag_readonly });

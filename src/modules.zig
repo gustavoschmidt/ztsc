@@ -247,6 +247,9 @@ pub const Program = struct {
     /// parallel arrays sorted by key. See `mergedOf`.
     constit_keys: []const u32 = &.{},
     constit_vals: []const u32 = &.{},
+    /// Reserved atom keying `export = X` entries in export/ambient tables, so
+    /// the namespace-object builders can skip it. 0 when no linker ran.
+    export_equals_atom: Atom = 0,
 
     /// Count of real per-file symbols (merged ids start here).
     pub fn totalSymbols(p: *const Program) u32 {
@@ -864,6 +867,10 @@ const Linker = struct {
     files: []const ProgFile,
 
     atom_default: Atom,
+    /// Reserved key under which a module's `export = X` target is stored in its
+    /// export/ambient table (`export=` can never be a real export name). Skipped
+    /// by the namespace-object builders and `export *` merge.
+    atom_export_equals: Atom,
     /// 0 = not built, 1 = building (cycle), 2 = done.
     state: []u8,
     tables: []std.AutoArrayHashMapUnmanaged(Atom, Target),
@@ -945,6 +952,20 @@ const Linker = struct {
                     }
                 },
                 .reexport_all => {},
+                .equals => {
+                    // `export = <entity>`: resolve the named local and store it
+                    // under the reserved `export=` key. A bare/non-identifier
+                    // entity stays lenient (`any`).
+                    var tgt: Target = .{ .kind = .any };
+                    if (rec.local != 0) {
+                        if (f.bind.lookupInScope(binder.file_scope, rec.local)) |ls| {
+                            tgt = try l.finalizeLocal(file, ls, rec.local, false, 0);
+                        }
+                    }
+                    try l.put(t, l.atom_export_equals, tgt);
+                    // TS2309: `export =` cannot coexist with a value export.
+                    try l.reportExportAssignMixing(file, rec.node);
+                },
             }
         }
 
@@ -955,7 +976,7 @@ const Linker = struct {
             if (mfile == file) continue;
             const mt = try l.table(mfile);
             for (mt.keys(), mt.values()) |name, tgt| {
-                if (name == l.atom_default) continue;
+                if (name == l.atom_default or name == l.atom_export_equals) continue;
                 if (t.contains(name)) continue;
                 var final = tgt;
                 final.type_only = final.type_only or rec.type_only;
@@ -965,6 +986,35 @@ const Linker = struct {
 
         l.state[file] = 2;
         return t;
+    }
+
+    /// TS2309: `export =` may not coexist with any *value* export in the same
+    /// module (type-only exports — interfaces, `export type` — are allowed).
+    /// Emitted at the `export =` statement. Under-reports exotic mixings
+    /// (re-exports) to stay clear of false positives.
+    fn reportExportAssignMixing(l: *Linker, file: FileId, node: ast.Node) Error!void {
+        const b = l.files[file].bind;
+        for (b.exports) |other| {
+            const is_value = switch (other.kind) {
+                .default => true,
+                .named => other.module == 0 and other.sym != binder.no_symbol and
+                    b.symbol_flags[other.sym].hasValue(),
+                else => false,
+            };
+            if (!is_value) continue;
+            try l.diag(file, 2309, l.nodeSpan(file, node), "An export assignment cannot be used in a module with other exported elements.", .{});
+            return;
+        }
+    }
+
+    /// The `export = X` entity of a known module (on-disk file first, then an
+    /// ambient `declare module "spec" { export = … }`), or null if the module
+    /// has no export assignment.
+    fn lookupExportEquals(l: *Linker, mfile_opt: ?FileId, module: Atom) Error!?Target {
+        if (mfile_opt) |mfile| {
+            if (try l.lookupExport(mfile, l.atom_export_equals, 0)) |t| return t;
+        }
+        return l.lookupAmbient(module, l.atom_export_equals);
     }
 
     fn put(l: *Linker, t: *std.AutoArrayHashMapUnmanaged(Atom, Target), name: Atom, tgt: Target) Error!void {
@@ -1003,6 +1053,16 @@ const Linker = struct {
                         return final;
                     }
                     return .{ .kind = .any };
+                },
+                .equals => {
+                    // `import x = require("m"); export = x;` — follow the chain to
+                    // m's `export =` entity (else the module namespace object).
+                    if (try l.lookupExport(mfile, l.atom_export_equals, depth + 1)) |tgt| {
+                        var final = tgt;
+                        final.type_only = final.type_only or t_only;
+                        return final;
+                    }
+                    return .{ .kind = .namespace, .file = mfile, .type_only = t_only };
                 },
                 .side_effect => break,
             }
@@ -1059,6 +1119,19 @@ const Linker = struct {
                             const ls = b.lookupInScope(am.scope, rec.local) orelse continue;
                             try tbl.put(l.scratch, rec.exported, try l.finalizeLocal(fid, ls, rec.local, rec.type_only, 0));
                         },
+                        .equals => {
+                            // `declare module "m" { export = X }`: store the
+                            // export entity under the reserved key. Makes the
+                            // module non-opaque so imports resolve through it.
+                            if (tbl.contains(l.atom_export_equals)) continue;
+                            var tgt: Target = .{ .kind = .any };
+                            if (rec.local != 0) {
+                                if (b.lookupInScope(am.scope, rec.local)) |ls| {
+                                    tgt = try l.finalizeLocal(fid, ls, rec.local, false, 0);
+                                }
+                            }
+                            try tbl.put(l.scratch, l.atom_export_equals, tgt);
+                        },
                         else => {}, // re-exports from another module: unsupported
                     }
                 }
@@ -1114,14 +1187,17 @@ const Linker = struct {
         for (tree.nodeRange(0)) |stmt| {
             if (stmt == ast.null_node) continue;
             const tag = tree.nodeTag(stmt);
-            if (tag != .import_decl and tag != .export_named and tag != .export_all) continue;
+            if (tag != .import_decl and tag != .export_named and tag != .export_all and tag != .import_equals) continue;
             var side_effect = false;
+            var mod_tok: ast.TokenIndex = tree.nodeData(stmt).rhs;
             if (tag == .import_decl) {
                 const data = tree.extraData(ast.ImportData, tree.nodeData(stmt).lhs);
                 side_effect = data.default_name_token == 0 and data.ns_name_token == 0 and
                     data.spec_start == data.spec_end;
+            } else if (tag == .import_equals) {
+                // `import x = require("m")`: the specifier is in the extra data.
+                mod_tok = tree.extraData(ast.ImportEquals, tree.nodeData(stmt).lhs).module_token;
             }
-            const mod_tok = tree.nodeData(stmt).rhs;
             if (mod_tok == 0) continue;
             const text = tree.tokenSlice(f.src, mod_tok);
             const stripped = stripQuotes(text);
@@ -1133,6 +1209,30 @@ const Linker = struct {
                 try l.diag(file, 2882, l.tokSpan(file, mod_tok), "Cannot find module or type declarations for side-effect import of '{s}'.", .{stripped});
             } else {
                 try l.diag(file, 2307, l.tokSpan(file, mod_tok), "Cannot find module '{s}' or its corresponding type declarations.", .{stripped});
+            }
+        }
+    }
+
+    /// TS1202 / TS1203: `import x = require(...)` / `export = ...` are emit
+    /// constructs illegal when targeting ECMAScript modules (the harness and
+    /// ztsc both use `module: esnext`). Reported only for non-declaration files
+    /// (a `.d.ts` never emits), at the statement, matching tsgo. Entity-name
+    /// aliases (`import A = B.C`) are not emit constructs and stay silent.
+    fn reportModuleGrammar(l: *Linker, file: FileId) Error!void {
+        const f = &l.files[file];
+        if (std.mem.endsWith(u8, f.path, ".d.ts")) return;
+        const tree = f.tree;
+        for (tree.nodeRange(0)) |stmt| {
+            if (stmt == ast.null_node) continue;
+            switch (tree.nodeTag(stmt)) {
+                .import_equals => {
+                    const e = tree.extraData(ast.ImportEquals, tree.nodeData(stmt).lhs);
+                    if (e.module_token != 0) {
+                        try l.diag(file, 1202, l.nodeSpan(file, stmt), "Import assignment cannot be used when targeting ECMAScript modules. Consider using 'import * as ns from \"mod\"', 'import {{a}} from \"mod\"', 'import d from \"mod\"', or another module format instead.", .{});
+                    }
+                },
+                .export_assign => try l.diag(file, 1203, l.nodeSpan(file, stmt), "Export assignment cannot be used when targeting ECMAScript modules. Consider using 'export default' or another module format instead.", .{}),
+                else => {},
             }
         }
     }
@@ -1153,9 +1253,32 @@ const Linker = struct {
             const mfile_opt = f.specs.get(rec.module);
             const known = mfile_opt != null or l.hasAmbient(rec.module);
             if (known) {
+                const exeq = try l.lookupExportEquals(mfile_opt, rec.module);
                 switch (rec.kind) {
+                    .equals => {
+                        // `import x = require("m")`: the whole `export =` entity
+                        // (value + type + namespace). Against a plain module it is
+                        // the module namespace object.
+                        if (exeq) |ee| {
+                            tgt = ee;
+                            tgt.type_only = tgt.type_only or rec.type_only;
+                        } else if (mfile_opt) |mfile| {
+                            tgt = .{ .kind = .namespace, .file = mfile, .type_only = rec.type_only };
+                        } else if (!l.ambientOpaque(rec.module)) {
+                            if (l.ambientKey(rec.module)) |key| {
+                                tgt = .{ .kind = .ambient_ns, .payload = @intCast(l.ambient.getIndex(key).?), .type_only = rec.type_only };
+                            }
+                        }
+                    },
                     .namespace => {
-                        if (mfile_opt) |mfile| {
+                        // A namespace import of an `export =` module reaches the
+                        // export entity (so `ns.member` works); leniently keeps
+                        // its call signature (tsgo strips it — a documented
+                        // under-report of TS2349 on `ns()`).
+                        if (exeq) |ee| {
+                            tgt = ee;
+                            tgt.type_only = tgt.type_only or rec.type_only;
+                        } else if (mfile_opt) |mfile| {
                             tgt = .{ .kind = .namespace, .file = mfile, .type_only = rec.type_only };
                         } else if (l.ambientOpaque(rec.module)) {
                             // Opaque ambient module: `import * as p` is `any`,
@@ -1172,9 +1295,10 @@ const Linker = struct {
                         if (found) |ff| {
                             tgt = ff;
                             tgt.type_only = tgt.type_only or rec.type_only;
-                        } else if (mfile_opt == null and l.ambientOpaque(rec.module)) {
-                            // Out-of-subset ambient module (export= / auto-export):
-                            // degrade to `any`, no spurious TS2305.
+                        } else if (exeq != null or (mfile_opt == null and l.ambientOpaque(rec.module))) {
+                            // A named import of an `export =` (or out-of-subset
+                            // auto-export) module degrades to `any`, no spurious
+                            // TS2305.
                             tgt = .{ .kind = .any };
                         } else {
                             try l.diag(file, 2305, l.nodeSpan(file, rec.node), "Module '\"{s}\"' has no exported member '{s}'.", .{
@@ -1186,6 +1310,10 @@ const Linker = struct {
                         var found: ?Target = null;
                         if (mfile_opt) |mfile| found = try l.lookupExport(mfile, l.atom_default, 0);
                         if (found == null) found = l.lookupAmbient(rec.module, l.atom_default);
+                        // Under `module: esnext`, a default import of an
+                        // `export =` module binds to the export entity (verified
+                        // against tsgo).
+                        if (found == null) found = exeq;
                         if (found) |ff| {
                             tgt = ff;
                             tgt.type_only = tgt.type_only or rec.type_only;
@@ -1230,6 +1358,7 @@ pub const LinkResult = struct {
     ambient_specs: []const Atom = &.{},
     constit_keys: []const u32 = &.{},
     constit_vals: []const u32 = &.{},
+    export_equals_atom: Atom = 0,
 };
 
 /// Build the sealed per-file link tables and the merged global table. Serial;
@@ -1253,6 +1382,7 @@ pub fn link(
         .interner = interner,
         .files = files,
         .atom_default = interner.intern(io, gpa, "default") catch return Error.OutOfMemory,
+        .atom_export_equals = interner.intern(io, gpa, "export=") catch return Error.OutOfMemory,
         .state = try scratch.alloc(u8, files.len),
         .tables = try scratch.alloc(std.AutoArrayHashMapUnmanaged(Atom, Target), files.len),
         .diags = try scratch.alloc(std.ArrayList(LinkDiag), files.len),
@@ -1271,6 +1401,7 @@ pub fn link(
     for (0..files.len) |i| {
         const fid: FileId = @intCast(i);
         try l.reportUnresolvedModules(fid);
+        try l.reportModuleGrammar(fid);
 
         var locals: std.ArrayList(u32) = .empty;
         var targets: std.ArrayList(Target) = .empty;
@@ -1314,7 +1445,7 @@ pub fn link(
         amb[i] = .{ .atoms = atoms, .targets = tgts };
     }
 
-    return .{ .links = out, .sym_base = sym_base, .globals = gm.globals, .merged = gm.merged, .ambient_exports = amb, .ambient_specs = amb_specs, .constit_keys = gm.constit_keys, .constit_vals = gm.constit_vals };
+    return .{ .links = out, .sym_base = sym_base, .globals = gm.globals, .merged = gm.merged, .ambient_exports = amb, .ambient_specs = amb_specs, .constit_keys = gm.constit_keys, .constit_vals = gm.constit_vals, .export_equals_atom = l.atom_export_equals };
 }
 
 /// Sort parallel (key, value) arrays by key ascending. Export/import tables
@@ -1560,6 +1691,7 @@ pub fn buildProgram(
             .ambient_specs = lr.ambient_specs,
             .constit_keys = lr.constit_keys,
             .constit_vals = lr.constit_vals,
+            .export_equals_atom = lr.export_equals_atom,
         },
         .load_failures = try arena.dupe(BuildDiag, failures.items),
     };

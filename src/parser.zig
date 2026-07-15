@@ -1837,9 +1837,7 @@ const Parser = struct {
             // `import d ...` — but `import x = require(...)` is out of subset.
             default_name = try p.bump();
             if (p.curTag() == .eq) {
-                p.skipToMemberEnd();
-                const node = try p.unsupportedFrom(kw);
-                return node;
+                return p.finishImportEquals(kw, default_name, 0);
             }
             _ = try p.eat(.comma);
         }
@@ -1874,6 +1872,32 @@ const Parser = struct {
             .spec_end = specs.end,
         });
         return p.addNode(.{ .tag = .import_decl, .main_token = kw, .data = .{ .lhs = extra, .rhs = mod } });
+    }
+
+    /// `import <name> = require("m");` or `import <name> = A.B;` (CommonJS /
+    /// TS-namespace alias). Positioned just before the `=`; `name_tok` is the
+    /// local binding, `import_kw` anchors the node span. `flags` carries
+    /// `Flags.exported` for the `export import` form.
+    fn finishImportEquals(p: *Parser, import_kw: u32, name_tok: u32, flags: u32) PE!Node {
+        _ = try p.bump(); // '='
+        var module_token: u32 = 0;
+        var entity: Node = 0;
+        if (isIdentLike(p.curTag()) and std.mem.eql(u8, p.laText(0), "require") and p.peekTag(1) == .l_paren) {
+            _ = try p.bump(); // require
+            _ = try p.expect(.l_paren, .expected_l_paren);
+            module_token = try p.expect(.string_literal, .expected_string_literal);
+            _ = try p.expect(.r_paren, .expected_r_paren);
+        } else {
+            entity = try p.parseEntityName();
+        }
+        try p.expectSemicolon();
+        const extra = try p.addExtra(ast.ImportEquals{
+            .name_token = name_tok,
+            .module_token = module_token,
+            .entity = entity,
+            .flags = flags,
+        });
+        return p.addNode(.{ .tag = .import_equals, .main_token = import_kw, .data = .{ .lhs = extra, .rhs = 0 } });
     }
 
     fn parseImportSpecifiers(p: *Parser) PE!ast.SubRange {
@@ -1947,11 +1971,21 @@ const Parser = struct {
                 return p.addNode(.{ .tag = .export_default, .main_token = kw, .data = .{ .lhs = inner, .rhs = 0 } });
             },
             .eq => {
-                // `export = x;` — out of subset.
+                // `export = <entity>;` (CommonJS export assignment).
                 _ = try p.bump();
-                if (canStartExpression(p.curTag())) _ = try p.parseAssignExpr(.{});
-                _ = try p.eat(.semicolon);
-                return p.unsupportedFrom(kw);
+                const entity = if (canStartExpression(p.curTag())) try p.parseAssignExpr(.{}) else 0;
+                try p.expectSemicolon();
+                return p.addNode(.{ .tag = .export_assign, .main_token = kw, .data = .{ .lhs = entity, .rhs = 0 } });
+            },
+            .keyword_import => {
+                // `export import A = B.C;` inside a namespace (exported alias).
+                const imp_kw = try p.bump();
+                const name_tok = try p.expectIdentLike();
+                if (p.curTag() != .eq) {
+                    try p.fail(.expected_eq);
+                    return p.addNode(.{ .tag = .export_assign, .main_token = kw, .data = .{ .lhs = 0, .rhs = 0 } });
+                }
+                return p.finishImportEquals(imp_kw, name_tok, ast.Flags.exported);
             },
             .asterisk => {
                 _ = try p.bump();
@@ -4431,9 +4465,19 @@ test "conditional types and infer parse in subset (M16a)" {
     );
 }
 
-test "unsupported: import= and export=" {
-    try expectDiagCount("import x = require(\"m\");", 1);
-    try expectDiagCount("export = thing;", 1);
+test "import= and export= parse in subset (M20 CommonJS)" {
+    try expectDiagCount("import x = require(\"m\");", 0);
+    try expectDiagCount("export = thing;", 0);
+    try expectDiagCount("import A = B.C;", 0);
+    try expectSExpr("import x = require(\"m\");",
+        \\(import_equals x require="m")
+    );
+    try expectSExpr("export = thing;",
+        \\(export_assign (identifier thing))
+    );
+    try expectSExpr("import A = B.C;",
+        \\(import_equals A (qualified_name (identifier B) C))
+    );
 }
 
 test "unsupported: misc type-level constructs" {
