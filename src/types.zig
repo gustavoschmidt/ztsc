@@ -1,4 +1,4 @@
-//! Type representation + hash-consing (ROADMAP.md §2.2).
+//! Type representation + hash-consing.
 //!
 //! Design decisions:
 //!
@@ -315,8 +315,8 @@ pub const TupleElem = struct {
 /// overlay id at `base_len + local_index`. The base is built and `freeze`d
 /// single-threaded before workers spawn, then shared read-only across every
 /// overlay — the type-level twin of the merged-symbol layer. A `TypeId`
-/// therefore spans base+overlay and is never assumed checker-local (ROADMAP
-/// "Layout commitments" note).
+/// therefore spans base+overlay and is never assumed checker-local (the
+/// frozen-base layout commitment).
 pub const Store = struct {
     alloc: Allocator,
     kinds: std.ArrayList(Kind) = .empty,

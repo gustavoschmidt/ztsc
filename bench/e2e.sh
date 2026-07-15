@@ -6,7 +6,7 @@
 #
 # Reports wall clock and peak RSS via /usr/bin/time (-l on macOS, -v on
 # Linux), plus ztsc's per-checker type counts (the duplicated-types
-# overhead of PLAN §2.3).
+# overhead of the N-independent-checkers design).
 #
 # Usage: bench/e2e.sh [corpus] [checkers...]
 #   corpus: small | medium | multi (default: multi)

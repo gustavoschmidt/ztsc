@@ -31,7 +31,7 @@
 //!     export is TS2305; a missing default is TS2613 (when a same-named
 //!     named export exists) or TS1192.
 //! - Checkers treat the sealed tables as read-only: no locks anywhere on
-//!   the check path (ROADMAP.md §2.3 immutability boundary).
+//!   the check path (the immutability boundary).
 //! - Out of subset (documented): `export =` / `import x = require(...)`
 //!   (parser flags them unsupported), ambient `declare module "..."`
 //!   blocks, CommonJS interop semantics.
@@ -177,7 +177,7 @@ pub const FileLinks = struct {
 /// ids `< totalSymbols()`) in FileId order. Checkers materialize the type by
 /// folding each constituent's declarations across files (the type-level twin
 /// of within-file merging). Merge remains a symbol-table operation — no types
-/// are compared here (merge invariant 1).
+/// are compared here (invariant: merge symbols, never types).
 pub const MergedSym = struct {
     name: Atom,
     flags: binder.SymbolFlags,
@@ -310,9 +310,9 @@ pub fn computeSymBase(alloc: Allocator, files: []const ProgFile) Error![]u32 {
 /// encodes shard-local insertion order (intern.zig), so run-to-run stability
 /// requires the lib's strings to be interned in a fixed order ahead of the
 /// concurrent user-file work; the worker that later binds the lib re-interns
-/// the same text and receives these stable atoms. This is option (a) of
-/// It pins the lib's atoms (the ones a serialized lib blob,
-/// must reference) without touching user-file atoms.
+/// the same text and receives these stable atoms. This is the seeded-interner
+/// approach (option a): it pins the lib's atoms (the ones a serialized
+/// lib blob would reference) without touching user-file atoms.
 ///
 /// Seeding runs the real binder — not a token scan — so it interns exactly
 /// what binding interns, including the text transforms binding applies
@@ -371,8 +371,9 @@ fn globalSymFlags(files: []const ProgFile, sym_base: []const u32, sym: u32) bind
 }
 
 /// Fold every file's global-contribution slice (the binder harvest) into the
-/// program global table, in FileId order (deterministic;
-/// invariant 4). The lib and script files offer their whole top level;
+/// program global table, in FileId order (deterministic by construction —
+/// the cross-file merge is a pure function of file order). The lib and script files
+/// offer their whole top level;
 /// modules offer their `declare global` block members; the typical app module
 /// offers nothing and is skipped (invariant 3, pay-per-use).
 ///

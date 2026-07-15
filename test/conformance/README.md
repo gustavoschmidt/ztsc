@@ -1,7 +1,7 @@
 # Conformance suite
 
-Differential test cases for the ztsc checker, validated against real `tsc`
-(PLAN.md §3). Cases are organized by area:
+Differential test cases for the ztsc checker, validated against real `tsc`.
+Cases are organized by area:
 
 - `assignability/` — structural assignability, unions, tuples, functions
   (strictFunctionTypes), intersections, index signatures.
@@ -22,8 +22,8 @@ Differential test cases for the ztsc checker, validated against real `tsc`
 
 **Single file** — a pair of files:
 
-- `<name>.ts` — a TypeScript source restricted to the ztsc v0.0.1 subset
-  (PLAN.md §5). Cases are lib-free: no globals (`console`, `Math`) and no
+- `<name>.ts` — a TypeScript source restricted to the ztsc v0.0.1 subset.
+  Cases are lib-free: no globals (`console`, `Math`) and no
   primitive/array methods beyond `length` — ztsc loads no lib.d.ts.
 - `<name>.expected` — expected diagnostics, one per line:
 
