@@ -23,7 +23,7 @@ ROOT = os.path.dirname(HERE)
 
 # name, wall_ztsc, wall_tsgo (ms), rss_ztsc, rss_tsgo (MB) -- defaults, 4 checkers
 DATA = [
-    ("@types/node",        16.5,  45.4, 18.0, 102.4),
+    ("@types/node",        20.2,  45.4, 18.0, 102.4),
     ("drizzle-orm",        22.8, 239.0, 22.4, 274.9),
     ("hono",               44.9, 173.3, 24.3, 155.2),
     ("@sinclair/typebox",  17.4,  48.5, 15.5,  77.4),
