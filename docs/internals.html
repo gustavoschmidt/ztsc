@@ -148,7 +148,7 @@
       <text class="t12" x="742" y="310">checker 3</text>
       <text class="t11 mut" x="742" y="326">own type store + caches</text>
 
-      <text class="t11 mut" x="822" y="366" text-anchor="middle">check · 20.5 ms aggregate · --checkers=N, default 4</text>
+      <text class="t11 mut" x="822" y="366" text-anchor="middle">check · 21.8 ms aggregate · --checkers=N, default 4</text>
       <text class="t11 mut" x="822" y="22" text-anchor="middle">files partitioned by cost, read sealed data lock-free</text>
     </svg>
     </div>
@@ -699,33 +699,33 @@ pub const Program = struct {
 
   <figure>
     <div class="figbox">
-    <svg viewBox="0 0 940 250" role="img" aria-label="Bar chart of check-phase time versus number of checker instances on the multi corpus: 69.4 milliseconds at N equals 1, 36.8 at 2, 20.5 at 4, 15.4 at 8. Duplicated-type overhead grows from 7 to 22 percent.">
+    <svg viewBox="0 0 940 250" role="img" aria-label="Bar chart of check-phase time versus number of checker instances on the multi corpus: 75.8 milliseconds at N equals 1, 40.8 at 2, 21.8 at 4, 17.4 at 8. Duplicated-type overhead grows from 6 to 20 percent.">
       <text class="t12 dim" x="20" y="26">check-phase time vs --checkers=N · multi corpus, 93k lines, real lib loaded</text>
       <line x1="130" y1="190" x2="790" y2="190" stroke="var(--base)"/>
-      <path fill="var(--c-ztsc)" data-tip="N=1 · 69.4 ms · 21,539 types" d="M150,44 L226,44 Q230,44 230,48 L230,190 L150,190 L150,48 Q150,44 154,44 Z"/>
-      <path fill="var(--c-ztsc)" data-tip="N=2 · 36.8 ms · +7.2% types vs N=1" d="M310,113 L386,113 Q390,113 390,117 L390,190 L310,190 L310,117 Q310,113 314,113 Z"/>
-      <path fill="var(--c-ztsc)" data-tip="N=4 · 20.5 ms · +15.1% types vs N=1" d="M470,147 L546,147 Q550,147 550,151 L550,190 L470,190 L470,151 Q470,147 474,147 Z"/>
-      <path fill="var(--c-ztsc)" data-tip="N=8 · 15.4 ms · +21.9% types vs N=1" d="M630,158 L706,158 Q710,158 710,162 L710,190 L630,190 L630,162 Q630,158 634,158 Z"/>
-      <text class="barlabel" x="190" y="36" text-anchor="middle">69.4 ms</text>
-      <text class="barlabel" x="350" y="105" text-anchor="middle">36.8 ms</text>
-      <text class="barlabel" x="510" y="139" text-anchor="middle">20.5 ms</text>
-      <text class="barlabel" x="670" y="150" text-anchor="middle">15.4 ms</text>
+      <path fill="var(--c-ztsc)" data-tip="N=1 · 75.8 ms · 25,384 types" d="M150,44 L226,44 Q230,44 230,48 L230,190 L150,190 L150,48 Q150,44 154,44 Z"/>
+      <path fill="var(--c-ztsc)" data-tip="N=2 · 40.8 ms · +6.1% types vs N=1" d="M310,111 L386,111 Q390,111 390,115 L390,190 L310,190 L310,115 Q310,111 314,111 Z"/>
+      <path fill="var(--c-ztsc)" data-tip="N=4 · 21.8 ms · +13.1% types vs N=1" d="M470,148 L546,148 Q550,148 550,152 L550,190 L470,190 L470,152 Q470,148 474,148 Z"/>
+      <path fill="var(--c-ztsc)" data-tip="N=8 · 17.4 ms · +19.5% types vs N=1" d="M630,157 L706,157 Q710,157 710,161 L710,190 L630,190 L630,161 Q630,157 634,157 Z"/>
+      <text class="barlabel" x="190" y="36" text-anchor="middle">75.8 ms</text>
+      <text class="barlabel" x="350" y="103" text-anchor="middle">40.8 ms</text>
+      <text class="barlabel" x="510" y="140" text-anchor="middle">21.8 ms</text>
+      <text class="barlabel" x="670" y="149" text-anchor="middle">17.4 ms</text>
       <text class="t11 dim" x="190" y="210" text-anchor="middle">N=1</text>
       <text class="t11 dim" x="350" y="210" text-anchor="middle">N=2</text>
       <text class="t11 dim" x="510" y="210" text-anchor="middle">N=4 (default)</text>
       <text class="t11 dim" x="670" y="210" text-anchor="middle">N=8</text>
       <text class="t11 mut" x="190" y="228" text-anchor="middle">— dup types</text>
-      <text class="t11 mut" x="350" y="228" text-anchor="middle">+7.2% dup types</text>
-      <text class="t11 mut" x="510" y="228" text-anchor="middle">+15.1% dup types</text>
-      <text class="t11 mut" x="670" y="228" text-anchor="middle">+21.9% dup types</text>
+      <text class="t11 mut" x="350" y="228" text-anchor="middle">+6.1% dup types</text>
+      <text class="t11 mut" x="510" y="228" text-anchor="middle">+13.1% dup types</text>
+      <text class="t11 mut" x="670" y="228" text-anchor="middle">+19.5% dup types</text>
     </svg>
     </div>
-    <figcaption>Near-linear speedup to N=4 (3.4×), tapering at N=8 (4.5×) — re-measured 2026-07-14
-    after the type-level machinery landed (check time rose ~35% in absolute
-    terms, and parallelizes with the same shape). The duplicated types stay under a quarter of the
-    type arena even at N=8 — and the whole type arena is under 1&thinsp;MB, noise against ~54&thinsp;MB
+    <figcaption>Near-linear speedup to N=4 (3.5×), tapering at N=8 (4.4×) — re-measured 2026-07-15
+    after the DOM lib and JSX front end landed (check time rose to ~76&thinsp;ms at N=1, and
+    parallelizes with the same shape). The duplicated types stay under a quarter of the
+    type arena even at N=8 — and the whole type arena is under 1&thinsp;MB, noise against ~55&thinsp;MB
     of process RSS. Since the demand-paged right-sizing, RSS doesn't even grow monotonically with N: the
-    high-water mark is N=4 (~54&thinsp;MB), while N=8 sits back at the N=1 level (~48&thinsp;MB).
+    high-water mark is N=4 (~55&thinsp;MB), while N=8 (~50&thinsp;MB) sits back near the N=1 level (~53&thinsp;MB).
     N=4 stays the default: nearly all the speed, effectively none of the memory cost.</figcaption>
   </figure>
 
