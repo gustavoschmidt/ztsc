@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 430" width="940" height="430" role="img" aria-label="Two-panel grouped bar chart across seven real packages at the default four checkers. Left panel, peak resident memory: ztsc uses 7 to 24 megabytes, tsgo 44 to 275 megabytes &#8212; ztsc is 8 to 21 percent of tsgo on every package. Right panel, wall clock: ztsc takes 11 to 45 milliseconds, tsgo 18 to 239 milliseconds &#8212; ztsc is 10 to 62 percent of tsgo's time.">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 482" width="940" height="482" role="img" aria-label="Two-panel grouped bar chart across eight real packages at the default four checkers. Left panel, peak resident memory: ztsc uses 7 to 24 megabytes, tsgo 44 to 275 megabytes &#8212; ztsc is 8 to 21 percent of tsgo on every package. Right panel, wall clock: ztsc takes 11 to 45 milliseconds, tsgo 18 to 247 milliseconds &#8212; ztsc is 10 to 62 percent of tsgo's time.">
   <style>
     text { font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace; fill: #1c1b18; }
     .t11 { font-size: 11px; }
@@ -17,70 +17,79 @@
   <text class="t11 mut" x="96" y="22">tsgo 7.0.2</text>
   <text class="t12 dim" x="210" y="22">peak RSS · MB · lower is better</text>
   <text class="t12 dim" x="620" y="22">wall clock · ms</text>
-  <line class="hairv" x1="590" y1="34" x2="590" y2="390"/>
+  <line class="hairv" x1="590" y1="34" x2="590" y2="442"/>
 
       <text class="t12 dim" x="195" y="64" text-anchor="end">@types/node</text>
       <rect class="bz" x="210" y="44" width="19" height="14" rx="2"/>
       <text class="bl" x="237" y="55">18 <tspan class="acc">· 18%</tspan></text>
       <rect class="bt" x="210" y="61" width="108" height="14" rx="2"/>
       <text class="bl" x="326" y="72">102</text>
-      <rect class="bz" x="620" y="44" width="23" height="14" rx="2"/>
-      <text class="bl" x="651" y="55">20 <tspan class="acc">· 44%</tspan></text>
-      <rect class="bt" x="620" y="61" width="51" height="14" rx="2"/>
-      <text class="bl" x="679" y="72">45</text>
-      <text class="t12 dim" x="195" y="116" text-anchor="end">drizzle-orm</text>
-      <rect class="bz" x="210" y="96" width="24" height="14" rx="2"/>
-      <text class="bl" x="242" y="107">22 <tspan class="acc">· 8%</tspan></text>
-      <rect class="bt" x="210" y="113" width="290" height="14" rx="2"/>
-      <text class="bl" x="508" y="124">275</text>
-      <rect class="bz" x="620" y="96" width="26" height="14" rx="2"/>
-      <text class="bl" x="654" y="107">23 <tspan class="acc">· 10%</tspan></text>
+      <rect class="bz" x="620" y="44" width="22" height="14" rx="2"/>
+      <text class="bl" x="650" y="55">20 <tspan class="acc">· 44%</tspan></text>
+      <rect class="bt" x="620" y="61" width="50" height="14" rx="2"/>
+      <text class="bl" x="678" y="72">45</text>
+      <text class="t12 dim" x="195" y="116" text-anchor="end">@types/react</text>
+      <rect class="bz" x="210" y="96" width="21" height="14" rx="2"/>
+      <text class="bl" x="239" y="107">20 <tspan class="acc">· 11%</tspan></text>
+      <rect class="bt" x="210" y="113" width="191" height="14" rx="2"/>
+      <text class="bl" x="409" y="124">181</text>
+      <rect class="bz" x="620" y="96" width="44" height="14" rx="2"/>
+      <text class="bl" x="672" y="107">40 <tspan class="acc">· 16%</tspan></text>
       <rect class="bt" x="620" y="113" width="270" height="14" rx="2"/>
-      <text class="bl" x="898" y="124">239</text>
-      <text class="t12 dim" x="195" y="168" text-anchor="end">hono</text>
-      <rect class="bz" x="210" y="148" width="26" height="14" rx="2"/>
-      <text class="bl" x="244" y="159">24 <tspan class="acc">· 16%</tspan></text>
-      <rect class="bt" x="210" y="165" width="164" height="14" rx="2"/>
-      <text class="bl" x="382" y="176">155</text>
-      <rect class="bz" x="620" y="148" width="51" height="14" rx="2"/>
-      <text class="bl" x="679" y="159">45 <tspan class="acc">· 26%</tspan></text>
-      <rect class="bt" x="620" y="165" width="196" height="14" rx="2"/>
-      <text class="bl" x="824" y="176">173</text>
-      <text class="t12 dim" x="195" y="220" text-anchor="end">@sinclair/typebox</text>
-      <rect class="bz" x="210" y="200" width="16" height="14" rx="2"/>
-      <text class="bl" x="234" y="211">16 <tspan class="acc">· 20%</tspan></text>
-      <rect class="bt" x="210" y="217" width="82" height="14" rx="2"/>
-      <text class="bl" x="300" y="228">77</text>
-      <rect class="bz" x="620" y="200" width="20" height="14" rx="2"/>
-      <text class="bl" x="648" y="211">17 <tspan class="acc">· 36%</tspan></text>
-      <rect class="bt" x="620" y="217" width="55" height="14" rx="2"/>
-      <text class="bl" x="683" y="228">49</text>
-      <text class="t12 dim" x="195" y="272" text-anchor="end">ajv</text>
-      <rect class="bz" x="210" y="252" width="11" height="14" rx="2"/>
-      <text class="bl" x="229" y="263">11 <tspan class="acc">· 21%</tspan></text>
-      <rect class="bt" x="210" y="269" width="52" height="14" rx="2"/>
-      <text class="bl" x="270" y="280">50</text>
-      <rect class="bz" x="620" y="252" width="16" height="14" rx="2"/>
-      <text class="bl" x="644" y="263">14 <tspan class="acc">· 60%</tspan></text>
-      <rect class="bt" x="620" y="269" width="27" height="14" rx="2"/>
-      <text class="bl" x="655" y="280">24</text>
-      <text class="t12 dim" x="195" y="324" text-anchor="end">zod</text>
-      <rect class="bz" x="210" y="304" width="22" height="14" rx="2"/>
-      <text class="bl" x="240" y="315">20 <tspan class="acc">· 15%</tspan></text>
-      <rect class="bt" x="210" y="321" width="148" height="14" rx="2"/>
-      <text class="bl" x="366" y="332">140</text>
-      <rect class="bz" x="620" y="304" width="46" height="14" rx="2"/>
-      <text class="bl" x="674" y="315">41 <tspan class="acc">· 26%</tspan></text>
-      <rect class="bt" x="620" y="321" width="174" height="14" rx="2"/>
-      <text class="bl" x="802" y="332">154</text>
-      <text class="t12 dim" x="195" y="376" text-anchor="end">chalk</text>
-      <rect class="bz" x="210" y="356" width="7" height="14" rx="2"/>
-      <text class="bl" x="225" y="367">7 <tspan class="acc">· 15%</tspan></text>
-      <rect class="bt" x="210" y="373" width="46" height="14" rx="2"/>
-      <text class="bl" x="264" y="384">44</text>
-      <rect class="bz" x="620" y="356" width="13" height="14" rx="2"/>
-      <text class="bl" x="641" y="367">11 <tspan class="acc">· 62%</tspan></text>
-      <rect class="bt" x="620" y="373" width="21" height="14" rx="2"/>
-      <text class="bl" x="649" y="384">18</text>
-  <text class="t11 mut" x="20" y="416">Apple M4 · vendored published .d.ts, identical inputs · both tools at their default 4 checkers · median of 11 wall / 5 RSS runs</text>
+      <text class="bl" x="898" y="124">247</text>
+      <text class="t12 dim" x="195" y="168" text-anchor="end">drizzle-orm</text>
+      <rect class="bz" x="210" y="148" width="24" height="14" rx="2"/>
+      <text class="bl" x="242" y="159">22 <tspan class="acc">· 8%</tspan></text>
+      <rect class="bt" x="210" y="165" width="290" height="14" rx="2"/>
+      <text class="bl" x="508" y="176">275</text>
+      <rect class="bz" x="620" y="148" width="25" height="14" rx="2"/>
+      <text class="bl" x="653" y="159">23 <tspan class="acc">· 10%</tspan></text>
+      <rect class="bt" x="620" y="165" width="261" height="14" rx="2"/>
+      <text class="bl" x="889" y="176">239</text>
+      <text class="t12 dim" x="195" y="220" text-anchor="end">hono</text>
+      <rect class="bz" x="210" y="200" width="26" height="14" rx="2"/>
+      <text class="bl" x="244" y="211">24 <tspan class="acc">· 16%</tspan></text>
+      <rect class="bt" x="210" y="217" width="164" height="14" rx="2"/>
+      <text class="bl" x="382" y="228">155</text>
+      <rect class="bz" x="620" y="200" width="49" height="14" rx="2"/>
+      <text class="bl" x="677" y="211">45 <tspan class="acc">· 26%</tspan></text>
+      <rect class="bt" x="620" y="217" width="190" height="14" rx="2"/>
+      <text class="bl" x="818" y="228">173</text>
+      <text class="t12 dim" x="195" y="272" text-anchor="end">@sinclair/typebox</text>
+      <rect class="bz" x="210" y="252" width="16" height="14" rx="2"/>
+      <text class="bl" x="234" y="263">16 <tspan class="acc">· 20%</tspan></text>
+      <rect class="bt" x="210" y="269" width="82" height="14" rx="2"/>
+      <text class="bl" x="300" y="280">77</text>
+      <rect class="bz" x="620" y="252" width="19" height="14" rx="2"/>
+      <text class="bl" x="647" y="263">17 <tspan class="acc">· 36%</tspan></text>
+      <rect class="bt" x="620" y="269" width="53" height="14" rx="2"/>
+      <text class="bl" x="681" y="280">49</text>
+      <text class="t12 dim" x="195" y="324" text-anchor="end">ajv</text>
+      <rect class="bz" x="210" y="304" width="11" height="14" rx="2"/>
+      <text class="bl" x="229" y="315">11 <tspan class="acc">· 21%</tspan></text>
+      <rect class="bt" x="210" y="321" width="52" height="14" rx="2"/>
+      <text class="bl" x="270" y="332">50</text>
+      <rect class="bz" x="620" y="304" width="15" height="14" rx="2"/>
+      <text class="bl" x="643" y="315">14 <tspan class="acc">· 60%</tspan></text>
+      <rect class="bt" x="620" y="321" width="26" height="14" rx="2"/>
+      <text class="bl" x="654" y="332">24</text>
+      <text class="t12 dim" x="195" y="376" text-anchor="end">zod</text>
+      <rect class="bz" x="210" y="356" width="22" height="14" rx="2"/>
+      <text class="bl" x="240" y="367">20 <tspan class="acc">· 15%</tspan></text>
+      <rect class="bt" x="210" y="373" width="148" height="14" rx="2"/>
+      <text class="bl" x="366" y="384">140</text>
+      <rect class="bz" x="620" y="356" width="44" height="14" rx="2"/>
+      <text class="bl" x="672" y="367">41 <tspan class="acc">· 26%</tspan></text>
+      <rect class="bt" x="620" y="373" width="168" height="14" rx="2"/>
+      <text class="bl" x="796" y="384">154</text>
+      <text class="t12 dim" x="195" y="428" text-anchor="end">chalk</text>
+      <rect class="bz" x="210" y="408" width="7" height="14" rx="2"/>
+      <text class="bl" x="225" y="419">7 <tspan class="acc">· 15%</tspan></text>
+      <rect class="bt" x="210" y="425" width="46" height="14" rx="2"/>
+      <text class="bl" x="264" y="436">44</text>
+      <rect class="bz" x="620" y="408" width="12" height="14" rx="2"/>
+      <text class="bl" x="640" y="419">11 <tspan class="acc">· 62%</tspan></text>
+      <rect class="bt" x="620" y="425" width="20" height="14" rx="2"/>
+      <text class="bl" x="648" y="436">18</text>
+  <text class="t11 mut" x="20" y="468">Apple M4 · vendored published .d.ts, identical inputs · both tools at their default 4 checkers · median of 11 wall / 5 RSS runs</text>
 </svg>

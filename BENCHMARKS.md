@@ -5,8 +5,9 @@ compiler), checking real, published packages on identical inputs. Measured
 2026-07-15 on an Apple M4.
 
 ztsc checks a subset of TypeScript, against the lib each package's tsconfig
-selects — es-core..esnext for most, plus the real DOM lib for the two packages
-that list `dom` (hono and zod), matching tsgo's target-esnext default. Its
+selects — es-core..esnext for most, plus the real DOM lib for the three packages
+that list `dom` (hono, zod, and `@types/react`), matching tsgo's target-esnext
+default. Its
 diagnostic output still differs from tsgo's on real code — these are throughput
 and memory measurements on identical inputs, not a diagnostic-parity claim
 (correctness is tracked separately by a differential conformance suite validated
@@ -20,13 +21,15 @@ millisecond-precision re-measure below for honest small-package ratios.
 ## Results
 
 Both tools default to 4 checker instances. Peak memory at that default, across
-all seven packages:
+all eight packages:
 
 ```
 peak RSS at the default 4 checkers — MB, lower is better
 
 @types/node        ztsc ████ 18
                    tsgo ████████████████████ 100
+@types/react       ztsc ████ 20
+                   tsgo ████████████████████████████████████ 181
 drizzle-orm        ztsc ████ 22
                    tsgo ████████████████████████████████████████████████████████ 278
 hono               ztsc █████ 24
@@ -49,6 +52,7 @@ At the default, ztsc's peak memory is **8–21% of tsgo's**. The full matrix ove
 | package (files / lines) | N=1 | N=2 | **N=4** | N=8 |
 |---|---|---|---|---|
 | @types/node 22.7.4 (59 / 49.6k) | 16.2 / 88.3 | 17.2 / 92.5 | **18.1 / 99.9** | 17.1 / 109.0 |
+| @types/react 18.3.11 (4 / 4.8k) | 24.7 / 178.0 | 23.2 / 185.3 | **19.9 / 187.1** | 20.0 / 182.4 |
 | drizzle-orm 0.33.0 (288 / 12.6k) | 21.0 / 165.9 | 21.0 / 231.3 | **22.4 / 277.7** | 23.7 / 402.8 |
 | hono 4.6.3 (165 / 6.3k) | 26.1 / 144.1 | 26.4 / 146.0 | **24.3 / 154.6** | 24.5 / 165.4 |
 | @sinclair/typebox 0.33.12 (241 / 3.1k) | 13.6 / 66.0 | 14.0 / 71.2 | **15.5 / 78.0** | 16.6 / 86.8 |
@@ -61,6 +65,7 @@ At the default, ztsc's peak memory is **8–21% of tsgo's**. The full matrix ove
 | package | N=1 | N=2 | **N=4** | N=8 |
 |---|---|---|---|---|
 | @types/node 22.7.4 | 0.02 / 0.07 | 0.01 / 0.05 | **0.01 / 0.05** | 0.01 / 0.04 |
+| @types/react 18.3.11 | 0.05 / 0.25 | 0.04 / 0.25 | **0.04 / 0.25** | 0.04 / 0.25 |
 | drizzle-orm 0.33.0 | 0.03 / 0.26 | 0.02 / 0.23 | **0.02 / 0.23** | 0.01 / 0.28 |
 | hono 4.6.3 | 0.05 / 0.19 | 0.04 / 0.18 | **0.04 / 0.17** | 0.04 / 0.13 |
 | @sinclair/typebox 0.33.12 | 0.01 / 0.06 | 0.01 / 0.05 | **0.01 / 0.04** | 0.01 / 0.04 |
@@ -79,12 +84,13 @@ every package.
 rounding. Re-measured with a monotonic nanosecond timer around the whole
 process (median of 11 runs after one warm-up, defaults, same corpus; RSS
 median of 5 runs re-taken in the same session — HEAD includes CommonJS
-interop, the 7.0.2 lib, and the DOM lib that hono and zod pull in via their
-tsconfig `dom` setting):
+interop, the 7.0.2 lib, and the DOM lib that hono, zod, and `@types/react`
+pull in via their tsconfig `dom` setting):
 
 | package | wall ztsc / tsgo | wall vs tsgo | peak RSS ztsc / tsgo | rss vs tsgo |
 |---|---:|---:|---:|---:|
 | @types/node 22.7.4 | 20.2 / 45.4 ms | 44% | 18.0 / 102.4 MB | 18% |
+| @types/react 18.3.11 | 40.0 / 246.9 ms | 16% | 20.0 / 180.8 MB | 11% |
 | drizzle-orm 0.33.0 | 22.8 / 239.0 ms | 10% | 22.4 / 274.9 MB | 8% |
 | hono 4.6.3 | 44.9 / 173.3 ms | 26% | 24.3 / 155.2 MB | 16% |
 | @sinclair/typebox 0.33.12 | 17.4 / 48.5 ms | 36% | 15.5 / 77.4 MB | 20% |
@@ -101,7 +107,11 @@ lists `dom`: ztsc parses, binds, and checks the 2.35 MB DOM lib for them too, a
 ~25 ms front end on top. On every package above ~3k lines ztsc is 2–10× faster;
 @types/node, the largest, sits at the low end (44% wall) because its dense
 declaration merging and interface heritage is the work ztsc closes least of the
-gap on.
+gap on. `@types/react` is the corpus's heaviest row for tsgo — its deep
+conditional types and the DOM-derived `DetailedHTMLProps` intrinsic-element
+unions cost tsgo 247 ms and 181 MB, the most of any package — yet ztsc checks
+the same surface in 40 ms and 20 MB (16% wall, 11% RSS), a 6.2× speedup at
+one-ninth the memory.
 
 ## Methodology
 

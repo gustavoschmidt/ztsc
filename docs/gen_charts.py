@@ -24,6 +24,7 @@ ROOT = os.path.dirname(HERE)
 # name, wall_ztsc, wall_tsgo (ms), rss_ztsc, rss_tsgo (MB) -- defaults, 4 checkers
 DATA = [
     ("@types/node",        20.2,  45.4, 18.0, 102.4),
+    ("@types/react",       40.0, 246.9, 20.0, 180.8),
     ("drizzle-orm",        22.8, 239.0, 22.4, 274.9),
     ("hono",               44.9, 173.3, 24.3, 155.2),
     ("@sinclair/typebox",  17.4,  48.5, 15.5,  77.4),
@@ -96,7 +97,7 @@ def aria():
     rz = [rup(r[3]) for r in DATA]; rt = [rup(r[4]) for r in DATA]
     wz = [rup(r[1]) for r in DATA]; wt = [rup(r[2]) for r in DATA]
     rp = [pct(r[3], r[4]) for r in DATA]; wp = [pct(r[1], r[2]) for r in DATA]
-    return ("Two-panel grouped bar chart across seven real packages at the default "
+    return ("Two-panel grouped bar chart across eight real packages at the default "
             "four checkers. Left panel, peak resident memory: ztsc uses %d to %d "
             "megabytes, tsgo %d to %d megabytes &#8212; ztsc is %d to %d percent of "
             "tsgo on every package. Right panel, wall clock: ztsc takes %d to %d "
@@ -105,9 +106,9 @@ def aria():
         min(rz), max(rz), min(rt), max(rt), min(rp), max(rp),
         min(wz), max(wz), min(wt), max(wt), min(wp), max(wp)))
 
-HAIRV = '<line class="hairv" x1="590" y1="34" x2="590" y2="390"/>'
+HAIRV = '<line class="hairv" x1="590" y1="34" x2="590" y2="442"/>'
 ROW_RE = re.compile(
-    r'(<line class="hairv" x1="590" y1="34" x2="590" y2="390"/>\n)(.*?)(\n\s+<text class="t11 mut" x="20" y="416")',
+    r'(<line class="hairv" x1="590" y1="34" x2="590" y2="442"/>\n)(.*?)(\n\s+<text class="t11 mut" x="20" y="468")',
     re.DOTALL)
 ARIA_RE = re.compile(r'aria-label="Two-panel grouped bar chart.*?percent of tsgo\'s time\."', re.DOTALL)
 

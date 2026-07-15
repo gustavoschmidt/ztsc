@@ -42,12 +42,12 @@
     <div class="stat">
       <div class="k">wall clock · @types/node</div>
       <div class="v">20&thinsp;<small>ms</small></div>
-      <div class="c">tsgo 7.0.2 takes 45&thinsp;ms on the same 49.6k lines of declarations — and ztsc is faster on all seven benchmark packages</div>
+      <div class="c">tsgo 7.0.2 takes 45&thinsp;ms on the same 49.6k lines of declarations — and ztsc is faster on all eight benchmark packages</div>
     </div>
     <div class="stat">
       <div class="k">peak RSS · @types/node</div>
       <div class="v">18&thinsp;<small>MB</small></div>
-      <div class="c">18% of tsgo (102&thinsp;MB); across seven real packages ztsc runs at 8–21% of tsgo's peak</div>
+      <div class="c">18% of tsgo (102&thinsp;MB); across eight real packages ztsc runs at 8–21% of tsgo's peak</div>
     </div>
     <div class="stat">
       <div class="k">dependencies</div>
@@ -74,79 +74,88 @@
 
   <figure>
     <div class="figbox">
-    <svg viewBox="0 0 940 430" role="img" aria-label="Two-panel grouped bar chart across seven real packages at the default four checkers. Left panel, peak resident memory: ztsc uses 7 to 24 megabytes, tsgo 44 to 275 megabytes &#8212; ztsc is 8 to 21 percent of tsgo on every package. Right panel, wall clock: ztsc takes 11 to 45 milliseconds, tsgo 18 to 239 milliseconds &#8212; ztsc is 10 to 62 percent of tsgo's time.">
+    <svg viewBox="0 0 940 482" role="img" aria-label="Two-panel grouped bar chart across eight real packages at the default four checkers. Left panel, peak resident memory: ztsc uses 7 to 24 megabytes, tsgo 44 to 275 megabytes &#8212; ztsc is 8 to 21 percent of tsgo on every package. Right panel, wall clock: ztsc takes 11 to 45 milliseconds, tsgo 18 to 247 milliseconds &#8212; ztsc is 10 to 62 percent of tsgo's time.">
       <rect x="20" y="12" width="12" height="12" rx="2" fill="var(--c-ztsc)"/>
       <text class="t11 mut" x="38" y="22">ztsc</text>
       <rect x="78" y="12" width="12" height="12" rx="2" fill="var(--c-tsgo)"/>
       <text class="t11 mut" x="96" y="22">tsgo 7.0.2</text>
       <text class="t12 dim" x="210" y="22">peak RSS · MB · lower is better</text>
       <text class="t12 dim" x="620" y="22">wall clock · ms</text>
-      <line class="hairv" x1="590" y1="34" x2="590" y2="390"/>
+      <line class="hairv" x1="590" y1="34" x2="590" y2="442"/>
 
       <text class="t12 dim" x="195" y="64" text-anchor="end">@types/node</text>
       <rect fill="var(--c-ztsc)" data-tip="ztsc · 18.0 MB · 18% of tsgo" x="210" y="44" width="19" height="14" rx="2"/>
       <text class="barlabel" x="237" y="55">18 <tspan class="acc">· 18%</tspan></text>
       <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 102.4 MB" x="210" y="61" width="108" height="14" rx="2"/>
       <text class="barlabel" x="326" y="72">102</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 20.2 ms · 44% of tsgo" x="620" y="44" width="23" height="14" rx="2"/>
-      <text class="barlabel" x="651" y="55">20 <tspan class="acc">· 44%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 45.4 ms" x="620" y="61" width="51" height="14" rx="2"/>
-      <text class="barlabel" x="679" y="72">45</text>
-      <text class="t12 dim" x="195" y="116" text-anchor="end">drizzle-orm</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 22.4 MB · 8% of tsgo" x="210" y="96" width="24" height="14" rx="2"/>
-      <text class="barlabel" x="242" y="107">22 <tspan class="acc">· 8%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 274.9 MB" x="210" y="113" width="290" height="14" rx="2"/>
-      <text class="barlabel" x="508" y="124">275</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 22.8 ms · 10% of tsgo" x="620" y="96" width="26" height="14" rx="2"/>
-      <text class="barlabel" x="654" y="107">23 <tspan class="acc">· 10%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 239.0 ms" x="620" y="113" width="270" height="14" rx="2"/>
-      <text class="barlabel" x="898" y="124">239</text>
-      <text class="t12 dim" x="195" y="168" text-anchor="end">hono</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 24.3 MB · 16% of tsgo" x="210" y="148" width="26" height="14" rx="2"/>
-      <text class="barlabel" x="244" y="159">24 <tspan class="acc">· 16%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 155.2 MB" x="210" y="165" width="164" height="14" rx="2"/>
-      <text class="barlabel" x="382" y="176">155</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 44.9 ms · 26% of tsgo" x="620" y="148" width="51" height="14" rx="2"/>
-      <text class="barlabel" x="679" y="159">45 <tspan class="acc">· 26%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 173.3 ms" x="620" y="165" width="196" height="14" rx="2"/>
-      <text class="barlabel" x="824" y="176">173</text>
-      <text class="t12 dim" x="195" y="220" text-anchor="end">@sinclair/typebox</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 15.5 MB · 20% of tsgo" x="210" y="200" width="16" height="14" rx="2"/>
-      <text class="barlabel" x="234" y="211">16 <tspan class="acc">· 20%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 77.4 MB" x="210" y="217" width="82" height="14" rx="2"/>
-      <text class="barlabel" x="300" y="228">77</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 17.4 ms · 36% of tsgo" x="620" y="200" width="20" height="14" rx="2"/>
-      <text class="barlabel" x="648" y="211">17 <tspan class="acc">· 36%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 48.5 ms" x="620" y="217" width="55" height="14" rx="2"/>
-      <text class="barlabel" x="683" y="228">49</text>
-      <text class="t12 dim" x="195" y="272" text-anchor="end">ajv</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 10.5 MB · 21% of tsgo" x="210" y="252" width="11" height="14" rx="2"/>
-      <text class="barlabel" x="229" y="263">11 <tspan class="acc">· 21%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 49.5 MB" x="210" y="269" width="52" height="14" rx="2"/>
-      <text class="barlabel" x="270" y="280">50</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 14.1 ms · 60% of tsgo" x="620" y="252" width="16" height="14" rx="2"/>
-      <text class="barlabel" x="644" y="263">14 <tspan class="acc">· 60%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 23.6 ms" x="620" y="269" width="27" height="14" rx="2"/>
-      <text class="barlabel" x="655" y="280">24</text>
-      <text class="t12 dim" x="195" y="324" text-anchor="end">zod</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 20.4 MB · 15% of tsgo" x="210" y="304" width="22" height="14" rx="2"/>
-      <text class="barlabel" x="240" y="315">20 <tspan class="acc">· 15%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 140.1 MB" x="210" y="321" width="148" height="14" rx="2"/>
-      <text class="barlabel" x="366" y="332">140</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 40.6 ms · 26% of tsgo" x="620" y="304" width="46" height="14" rx="2"/>
-      <text class="barlabel" x="674" y="315">41 <tspan class="acc">· 26%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 153.8 ms" x="620" y="321" width="174" height="14" rx="2"/>
-      <text class="barlabel" x="802" y="332">154</text>
-      <text class="t12 dim" x="195" y="376" text-anchor="end">chalk</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 6.5 MB · 15% of tsgo" x="210" y="356" width="7" height="14" rx="2"/>
-      <text class="barlabel" x="225" y="367">7 <tspan class="acc">· 15%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 43.6 MB" x="210" y="373" width="46" height="14" rx="2"/>
-      <text class="barlabel" x="264" y="384">44</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 11.4 ms · 62% of tsgo" x="620" y="356" width="13" height="14" rx="2"/>
-      <text class="barlabel" x="641" y="367">11 <tspan class="acc">· 62%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 18.4 ms" x="620" y="373" width="21" height="14" rx="2"/>
-      <text class="barlabel" x="649" y="384">18</text>
-      <text class="t11 mut" x="20" y="416">median of 11 wall runs (monotonic ns timer) and 5 RSS runs · Apple M4 · defaults</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 20.2 ms · 44% of tsgo" x="620" y="44" width="22" height="14" rx="2"/>
+      <text class="barlabel" x="650" y="55">20 <tspan class="acc">· 44%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 45.4 ms" x="620" y="61" width="50" height="14" rx="2"/>
+      <text class="barlabel" x="678" y="72">45</text>
+      <text class="t12 dim" x="195" y="116" text-anchor="end">@types/react</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 20.0 MB · 11% of tsgo" x="210" y="96" width="21" height="14" rx="2"/>
+      <text class="barlabel" x="239" y="107">20 <tspan class="acc">· 11%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 180.8 MB" x="210" y="113" width="191" height="14" rx="2"/>
+      <text class="barlabel" x="409" y="124">181</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 40.0 ms · 16% of tsgo" x="620" y="96" width="44" height="14" rx="2"/>
+      <text class="barlabel" x="672" y="107">40 <tspan class="acc">· 16%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 246.9 ms" x="620" y="113" width="270" height="14" rx="2"/>
+      <text class="barlabel" x="898" y="124">247</text>
+      <text class="t12 dim" x="195" y="168" text-anchor="end">drizzle-orm</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 22.4 MB · 8% of tsgo" x="210" y="148" width="24" height="14" rx="2"/>
+      <text class="barlabel" x="242" y="159">22 <tspan class="acc">· 8%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 274.9 MB" x="210" y="165" width="290" height="14" rx="2"/>
+      <text class="barlabel" x="508" y="176">275</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 22.8 ms · 10% of tsgo" x="620" y="148" width="25" height="14" rx="2"/>
+      <text class="barlabel" x="653" y="159">23 <tspan class="acc">· 10%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 239.0 ms" x="620" y="165" width="261" height="14" rx="2"/>
+      <text class="barlabel" x="889" y="176">239</text>
+      <text class="t12 dim" x="195" y="220" text-anchor="end">hono</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 24.3 MB · 16% of tsgo" x="210" y="200" width="26" height="14" rx="2"/>
+      <text class="barlabel" x="244" y="211">24 <tspan class="acc">· 16%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 155.2 MB" x="210" y="217" width="164" height="14" rx="2"/>
+      <text class="barlabel" x="382" y="228">155</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 44.9 ms · 26% of tsgo" x="620" y="200" width="49" height="14" rx="2"/>
+      <text class="barlabel" x="677" y="211">45 <tspan class="acc">· 26%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 173.3 ms" x="620" y="217" width="190" height="14" rx="2"/>
+      <text class="barlabel" x="818" y="228">173</text>
+      <text class="t12 dim" x="195" y="272" text-anchor="end">@sinclair/typebox</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 15.5 MB · 20% of tsgo" x="210" y="252" width="16" height="14" rx="2"/>
+      <text class="barlabel" x="234" y="263">16 <tspan class="acc">· 20%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 77.4 MB" x="210" y="269" width="82" height="14" rx="2"/>
+      <text class="barlabel" x="300" y="280">77</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 17.4 ms · 36% of tsgo" x="620" y="252" width="19" height="14" rx="2"/>
+      <text class="barlabel" x="647" y="263">17 <tspan class="acc">· 36%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 48.5 ms" x="620" y="269" width="53" height="14" rx="2"/>
+      <text class="barlabel" x="681" y="280">49</text>
+      <text class="t12 dim" x="195" y="324" text-anchor="end">ajv</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 10.5 MB · 21% of tsgo" x="210" y="304" width="11" height="14" rx="2"/>
+      <text class="barlabel" x="229" y="315">11 <tspan class="acc">· 21%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 49.5 MB" x="210" y="321" width="52" height="14" rx="2"/>
+      <text class="barlabel" x="270" y="332">50</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 14.1 ms · 60% of tsgo" x="620" y="304" width="15" height="14" rx="2"/>
+      <text class="barlabel" x="643" y="315">14 <tspan class="acc">· 60%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 23.6 ms" x="620" y="321" width="26" height="14" rx="2"/>
+      <text class="barlabel" x="654" y="332">24</text>
+      <text class="t12 dim" x="195" y="376" text-anchor="end">zod</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 20.4 MB · 15% of tsgo" x="210" y="356" width="22" height="14" rx="2"/>
+      <text class="barlabel" x="240" y="367">20 <tspan class="acc">· 15%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 140.1 MB" x="210" y="373" width="148" height="14" rx="2"/>
+      <text class="barlabel" x="366" y="384">140</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 40.6 ms · 26% of tsgo" x="620" y="356" width="44" height="14" rx="2"/>
+      <text class="barlabel" x="672" y="367">41 <tspan class="acc">· 26%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 153.8 ms" x="620" y="373" width="168" height="14" rx="2"/>
+      <text class="barlabel" x="796" y="384">154</text>
+      <text class="t12 dim" x="195" y="428" text-anchor="end">chalk</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 6.5 MB · 15% of tsgo" x="210" y="408" width="7" height="14" rx="2"/>
+      <text class="barlabel" x="225" y="419">7 <tspan class="acc">· 15%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 43.6 MB" x="210" y="425" width="46" height="14" rx="2"/>
+      <text class="barlabel" x="264" y="436">44</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 11.4 ms · 62% of tsgo" x="620" y="408" width="12" height="14" rx="2"/>
+      <text class="barlabel" x="640" y="419">11 <tspan class="acc">· 62%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 18.4 ms" x="620" y="425" width="20" height="14" rx="2"/>
+      <text class="barlabel" x="648" y="436">18</text>
+      <text class="t11 mut" x="20" y="468">median of 11 wall runs (monotonic ns timer) and 5 RSS runs · Apple M4 · defaults</text>
     </svg>
     </div>
     <figcaption>Validators, web frameworks, an ORM, and the big <code>@types</code> packages:
