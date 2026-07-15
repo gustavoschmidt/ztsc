@@ -900,10 +900,26 @@ const Binder = struct {
     /// the member is keyed by a synthetic `__@name` atom. (`wellKnownSymbolKey`
     /// returns a static string, so it is a safe `atom_cache` key.)
     fn memberNameKey(b: *Binder, tok: TokenIndex, flags: u32) Error!Atom {
+        if (flags & ast.Flags.computed_sym != 0) {
+            // A `[k]` computed key naming a const `unique symbol`. The binder
+            // cannot resolve nominal symbol identity, so it keys the member by
+            // a placeholder derived from the key identifier's text; the checker
+            // rekeys it to the symbol's `__@u<id>` atom when materializing the
+            // class/interface type (`nominalizeComputedKey`).
+            return b.computedSymPlaceholder(b.tokenText(tok));
+        }
         if (flags & ast.Flags.computed != 0) {
             if (ast.wellKnownSymbolKey(b.tokenText(tok))) |k| return b.atomOf(k);
         }
         return b.memberAtom(tok);
+    }
+
+    /// Placeholder member atom for a computed const-`unique symbol` key,
+    /// carrying the key identifier's text so the checker can resolve it. The
+    /// `__@k$` prefix cannot appear in a real identifier, so it never collides.
+    fn computedSymPlaceholder(b: *Binder, name: []const u8) Error!Atom {
+        const s = try std.fmt.allocPrint(b.scratch, "__@k${s}", .{name});
+        return b.atomOf(s);
     }
 
     /// Atom of a module-specifier string token (contents without quotes).

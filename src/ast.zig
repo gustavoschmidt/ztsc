@@ -72,6 +72,7 @@ pub const Flags = struct {
     pub const global_aug: u32 = 1 << 19; // `declare global { ... }` augmentation block
     pub const ambient_module: u32 = 1 << 20; // `declare module "spec" { ... }`
     pub const exported: u32 = 1 << 21; // `export import A = ...` (exported alias)
+    pub const computed_sym: u32 = 1 << 22; // `[k]` computed key naming a const `unique symbol` (main_token = the key identifier)
 };
 
 /// Maps a well-known `Symbol` property name (the `iterator` in

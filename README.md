@@ -79,8 +79,14 @@ like `tsc` — but it does not check everything yet:
   of corners degrade leniently rather than erroring: a namespace import keeps the
   export's call signature (`ns()` is not flagged), and a member of a
   `require`-bound namespace used in *type* position resolves to `any`.
-- **No const-symbol computed keys** (`[kind]: T` with a `unique symbol` key);
-  well-known symbols like `[Symbol.iterator]` work.
+- **Const-symbol computed keys are checked** (`[kind]: T` where `kind` is a
+  const `unique symbol`) — in classes, interfaces, type literals and object
+  literals, keyed by the symbol's nominal identity across files (an imported
+  key resolves to its declaring site, and reading with a *different* symbol is
+  a TS7053). One lenient corner: a computed key written as a *member
+  expression* (`[ns.member]`, e.g. `[EventEmitter.captureRejectionSymbol]`)
+  stays out of subset, and a plain non-`unique` `symbol` key is keyed by name
+  rather than as a symbol index — both under-report rather than erroring.
 - **JSX needs a `JSX` namespace in scope** — resolving it from `@types/react`
   and spread-attribute checking are not wired up yet.
 - **tsconfig subset**: `files` / `include` / `exclude` / `baseUrl` / `paths`,
