@@ -742,6 +742,7 @@ pub fn main(init: std.process.Init) !void {
         .ambient_specs = lr.ambient_specs,
         .constit_keys = lr.constit_keys,
         .constit_vals = lr.constit_vals,
+        .export_equals_atom = lr.export_equals_atom,
     };
     const link_ns = link_timer.readNs();
 
