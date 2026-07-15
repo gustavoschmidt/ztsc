@@ -5933,9 +5933,9 @@ const Checker = struct {
         if (c.ts.kind(t) != .ref) return 0;
         const sym = c.ts.refSymbol(t);
         const names = [_]Atom{
-            c.atom_Generator,          c.atom_Iterator,    c.atom_IterableIterator,
-            c.atom_IteratorObject,     c.atom_ArrayIterator, c.atom_MapIterator,
-            c.atom_SetIterator,        c.atom_StringIterator, c.atom_RegExpStringIterator,
+            c.atom_Generator,      c.atom_Iterator,       c.atom_IterableIterator,
+            c.atom_IteratorObject, c.atom_ArrayIterator,  c.atom_MapIterator,
+            c.atom_SetIterator,    c.atom_StringIterator, c.atom_RegExpStringIterator,
         };
         for (names) |name| {
             const g = c.prog.globals.lookup(name) orelse continue;
