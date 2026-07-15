@@ -10,10 +10,16 @@
 #
 # Usage: bench/e2e.sh [corpus] [checkers...]
 #   corpus: small | medium | multi (default: multi)
-#   TSC=/path/to/typescript/bin/tsc   override the tsc under test
-#   TSGO=/path/to/tsgo                override the tsgo under test
+#   TSC=/path/to/typescript/bin/tsc   override the tsc under test (a JS entry
+#                                     point run via node — not a PATH shim)
+#   TSGO=/path/to/native/tsc          override the native TypeScript binary
 #   RUNS=N                            timed runs per configuration (default 3;
 #                                     the median is what BENCHMARKS.md reports)
+#
+# Baselines default to the pinned installs under bench/baselines/ (tsc 5.5.4
+# via node; native TS — "tsgo" — invoked as the platform binary directly, no
+# Node wrapper, so RSS is measured on the real process). Installed on demand
+# with npm; node_modules stays gitignored.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -58,12 +64,39 @@ extract_wall_rss() {
     '
 }
 
-# run_median <label> <cmd...>: RUNS timed runs (after one warm-up), prints
-# "  <label>: wall <median>s  peakRSS <max>MB" plus each run in brackets.
+# ensure_baseline <dir>: npm-install the pinned baseline package under
+# bench/baselines/<dir> if its node_modules is missing. Prints nothing on
+# the happy path; returns nonzero (with a note) if npm is unavailable/fails.
+ensure_baseline() {
+    local dir="bench/baselines/$1"
+    [ -d "$dir/node_modules/typescript" ] && return 0
+    if ! command -v npm >/dev/null; then
+        echo "  npm not found — cannot install $dir baseline" >&2
+        return 1
+    fi
+    echo "  installing pinned baseline in $dir ..."
+    (cd "$dir" && npm install --no-audit --no-fund --loglevel=error >/dev/null) || {
+        echo "  npm install failed in $dir" >&2
+        return 1
+    }
+}
+
+# run_median <label> <cmd...>: RUNS timed runs (after one warm-up that also
+# sanity-checks the command), prints "  <label>: wall <median>s
+# peakRSS <max>MB" plus each run in brackets. The bench corpora are clean
+# by design, so a nonzero warm-up exit means the tool isn't actually
+# running (e.g. node choking on a PATH shim) — skip loudly instead of
+# timing the crash as a result.
 run_median() {
     local label="$1"
     shift
-    "$@" >/dev/null 2>&1 || true # warm-up (also warms the FS cache)
+    local warm_status=0
+    "$@" >/dev/null 2>&1 || warm_status=$? # warm-up (also warms the FS cache)
+    if [ "$warm_status" -ne 0 ]; then
+        echo "  $label: warm-up exited $warm_status — skipped, output was:"
+        "$@" 2>&1 | head -3 | sed 's/^/      /' || true
+        return 0
+    fi
     local walls=() rsss=()
     for _ in $(seq "$RUNS"); do
         local out stats
@@ -89,19 +122,31 @@ for n in "${CHECKERS[@]}"; do
 done
 echo
 
-echo "== tsc (--noEmit -p $CORPUS) =="
-TSC="${TSC:-$(command -v tsc || true)}"
-if [ -n "$TSC" ]; then
+echo "== tsc (-p $CORPUS, noEmit via tsconfig) =="
+if [ -z "${TSC:-}" ] && ensure_baseline tsc; then
+    TSC=bench/baselines/tsc/node_modules/typescript/bin/tsc
+fi
+if [ -n "${TSC:-}" ] && [ -f "$TSC" ]; then
     run_median "tsc $(node "$TSC" --version 2>/dev/null | awk '{print $2}')" node "$TSC" -p "$CORPUS"
 else
-    echo "  tsc not found (set TSC=/path/to/typescript/bin/tsc) — skipped"
+    echo "  tsc baseline unavailable (set TSC=/path/to/typescript/bin/tsc) — skipped"
 fi
 echo
 
-echo "== tsgo (--noEmit -p $CORPUS) =="
-TSGO="${TSGO:-$(command -v tsgo || true)}"
-if [ -n "$TSGO" ]; then
+echo "== tsgo / native tsc (-p $CORPUS, noEmit via tsconfig) =="
+if [ -z "${TSGO:-}" ] && ensure_baseline tsgo; then
+    # TS 7 stable merged tsgo into the typescript package; the platform
+    # binary is what we time (no Node wrapper), so RSS is the real process.
+    case "$(uname -m)" in
+        arm64|aarch64) ARCH=arm64 ;;
+        x86_64) ARCH=x64 ;;
+        *) ARCH="$(uname -m)" ;;
+    esac
+    PLAT="$(uname | tr '[:upper:]' '[:lower:]')"
+    TSGO="bench/baselines/tsgo/node_modules/@typescript/typescript-$PLAT-$ARCH/lib/tsc"
+fi
+if [ -n "${TSGO:-}" ] && [ -x "$TSGO" ]; then
     run_median "tsgo $("$TSGO" --version 2>/dev/null | awk '{print $2}')" "$TSGO" -p "$CORPUS"
 else
-    echo "  tsgo not found (set TSGO=/path/to/tsgo) — skipped"
+    echo "  native tsc (tsgo) baseline unavailable (set TSGO=/path/to/native/tsc) — skipped"
 fi

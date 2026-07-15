@@ -1,0 +1,8 @@
+{
+  "name": "ztsc-bench-baseline-tsgo",
+  "private": true,
+  "description": "Pinned native TypeScript (tsgo) baseline for bench/e2e.sh. TS 7 stable merged tsgo into the typescript package; e2e.sh invokes the platform binary directly, no Node wrapper. node_modules is gitignored; e2e.sh installs on demand.",
+  "dependencies": {
+    "typescript": "7.0.2"
+  }
+}
