@@ -69,11 +69,12 @@ like `tsc` — but it does not check everything yet:
   families (other families warn + ignore). With no `lib` field the default is
   ES-core + DOM, matching tsgo's target-esnext default, so browser globals
   (`Response`, `HTMLElement`, `fetch`, `document`, `console`, …) resolve.
-  `lib:["esnext"]` gives the backend configuration (no DOM). Known gap:
-  `for…of` over a DOM collection whose iterator is added by interface merging
-  (e.g. `URLSearchParams`, `Headers`) is not yet recognized (a pre-existing
-  merged-interface iterator limitation, also affecting `for await` over
-  `AsyncIterable`); single-declaration iterables like `NodeListOf` work.
+  `lib:["esnext"]` gives the backend configuration (no DOM). The full iteration
+  protocol is checked: `for…of` over any DOM collection (`URLSearchParams`,
+  `Headers`, `FormData`, `NodeListOf`, …) and `for await` over
+  `AsyncIterable`/`AsyncGenerator` (with the sync-iterable fallback, elements
+  awaited). Iterator gaps that remain: `yield*` delegation is unchecked, and
+  unannotated generator functions type as `any` — both under-report.
 - **CommonJS interop is checked** (`export =`, `import x = require(…)`, and
   default/named/namespace ES imports against an `export =` module), but a couple
   of corners degrade leniently rather than erroring: a namespace import keeps the

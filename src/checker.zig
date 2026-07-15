@@ -500,8 +500,15 @@ const Checker = struct {
     atom_StringIterator: Atom = 0,
     atom_RegExpStringIterator: Atom = 0,
     atom_sym_iterator: Atom = 0,
+    atom_sym_asyncIterator: Atom = 0,
     atom_next: Atom = 0,
     atom_value: Atom = 0,
+    atom_done: Atom = 0,
+    /// Lib async-iterator families — first type arg is the yield type.
+    atom_AsyncGenerator: Atom = 0,
+    atom_AsyncIterator: Atom = 0,
+    atom_AsyncIterableIterator: Atom = 0,
+    atom_AsyncIteratorObject: Atom = 0,
     atom_JSX: Atom = 0,
     atom_IntrinsicElements: Atom = 0,
     atom_Element: Atom = 0,
@@ -597,8 +604,14 @@ const Checker = struct {
         c.atom_StringIterator = try c.atom("StringIterator");
         c.atom_RegExpStringIterator = try c.atom("RegExpStringIterator");
         c.atom_sym_iterator = try c.atom(ast.wellKnownSymbolKey("iterator").?);
+        c.atom_sym_asyncIterator = try c.atom(ast.wellKnownSymbolKey("asyncIterator").?);
         c.atom_next = try c.atom("next");
         c.atom_value = try c.atom("value");
+        c.atom_done = try c.atom("done");
+        c.atom_AsyncGenerator = try c.atom("AsyncGenerator");
+        c.atom_AsyncIterator = try c.atom("AsyncIterator");
+        c.atom_AsyncIterableIterator = try c.atom("AsyncIterableIterator");
+        c.atom_AsyncIteratorObject = try c.atom("AsyncIteratorObject");
         c.atom_JSX = try c.atom("JSX");
         c.atom_IntrinsicElements = try c.atom("IntrinsicElements");
         c.atom_Element = try c.atom("Element");
@@ -925,11 +938,14 @@ const Checker = struct {
             // per-member guard, so a self-referential key (`[C.k]` inside `C`
             // itself, node's `[EventEmitter.captureRejectionSymbol]`) resolves
             // nominally without re-entering the class-static materialization.
-            const obj = switch (c.resolveSpace(try c.atom(name[0..dot]), scope, true)) {
+            // `name` may live in scratch (see `computedSymKey`): intern the
+            // pieces via `internText` — `atom` would store the transient
+            // slice as an `atom_cache` key and dangle after a scratch reset.
+            const obj = switch (c.resolveSpace(try c.internText(name[0..dot]), scope, true)) {
                 .sym => |s| s,
                 else => return null,
             };
-            const member = try c.atom(name[dot + 1 ..]);
+            const member = try c.internText(name[dot + 1 ..]);
             if (c.qualifiedKeyMemberSym(obj, member)) |msym| {
                 return c.uniqueSymAtom(try c.typeOfSymbol(msym));
             }
@@ -6022,6 +6038,27 @@ const Checker = struct {
         return 0;
     }
 
+    /// Async analogue of `generatorYieldType`: the first type arg of a lib
+    /// async-iterator ref (`AsyncGenerator<T>`/`AsyncIterator<T>`/
+    /// `AsyncIterableIterator<T>`/`AsyncIteratorObject<T>`), else 0.
+    fn asyncGeneratorYieldType(c: *Checker, t: TypeId) TypeId {
+        if (c.ts.kind(t) != .ref) return 0;
+        const sym = c.ts.refSymbol(t);
+        const names = [_]Atom{
+            c.atom_AsyncGenerator,        c.atom_AsyncIterator,
+            c.atom_AsyncIterableIterator, c.atom_AsyncIteratorObject,
+        };
+        for (names) |name| {
+            const g = c.prog.globals.lookup(name) orelse continue;
+            if (sym == g) {
+                const args = c.ts.refArgs(t);
+                if (args.len >= 1) return args[0];
+                return 0;
+            }
+        }
+        return 0;
+    }
+
     /// Union of a tuple's element types (the element type used when a tuple
     /// borrows `Array<T>` members).
     fn tupleElementUnion(c: *Checker, t: TypeId) Error!TypeId {
@@ -7094,11 +7131,15 @@ const Checker = struct {
                 // (iterable-protocol; a gap). `yield`'s own value type is `any`
                 // (the caller-supplied `.next(v)` value — TNext, out of subset).
                 const yt: TypeId = if (c.fn_ctx) |fc| fc.yield_type else 0;
+                const in_async = if (c.fn_ctx) |fc| fc.is_async else false;
                 const delegate = d.rhs != 0;
                 if (d.lhs != 0) {
                     const vt = try c.checkExprCached(d.lhs, if (delegate) types.no_type else yt);
                     if (!delegate and yt != 0 and yt != types.no_type and yt != types.error_type and c.ts.kind(yt) != .any) {
-                        _ = try c.checkAssignable(vt, yt, d.lhs, c.nodeSpan(d.lhs));
+                        // Async generators may yield `T | PromiseLike<T>`:
+                        // the yielded value is awaited before it is emitted.
+                        const eff_vt = if (in_async) c.awaitedType(vt) else vt;
+                        _ = try c.checkAssignable(eff_vt, yt, d.lhs, c.nodeSpan(d.lhs));
                     }
                 }
                 return types.any_type;
@@ -10159,7 +10200,7 @@ const Checker = struct {
         const rt = try c.checkExprCached(e.right, types.no_type);
         var elem_t: TypeId = types.any_type;
         if (is_of) {
-            elem_t = try c.forOfElementType(rt, e.right);
+            elem_t = try c.forOfElementType(rt, e.right, e.is_await != 0);
         } else {
             elem_t = types.string_type; // for..in keys
             const rk = c.ts.kind(try c.resolveStructural(rt));
@@ -10257,7 +10298,14 @@ const Checker = struct {
     /// Element type of `for (x of expr)`, diagnosing TS2488 when `expr` is not
     /// iterable. Arrays/tuples/strings resolve directly; everything else goes
     /// through the `[Symbol.iterator]()` protocol (`iterationElementType`).
-    fn forOfElementType(c: *Checker, rt: TypeId, right_node: Node) Error!TypeId {
+    fn forOfElementType(c: *Checker, rt: TypeId, right_node: Node, is_await: bool) Error!TypeId {
+        if (is_await) {
+            if (try c.asyncIterationElementType(rt)) |e| return e;
+            if (right_node != 0) {
+                try c.diagFmt(2504, c.nodeSpan(right_node), "Type '{s}' must have a '[Symbol.asyncIterator]()' method that returns an async iterator.", .{try c.typeToString(rt)});
+            }
+            return types.any_type;
+        }
         if (try c.iterationElementType(rt)) |e| return e;
         if (right_node != 0) {
             try c.diagFmt(2488, c.nodeSpan(right_node), "Type '{s}' must have a '[Symbol.iterator]()' method that returns an iterator.", .{try c.typeToString(rt)});
@@ -10296,9 +10344,41 @@ const Checker = struct {
                 const y2 = c.generatorYieldType(ret);
                 if (y2 != 0) return y2;
                 // General protocol: the iterator's `next()` result `value`.
-                if (try c.iteratorNextValue(ret)) |v| return v;
+                if (try c.iteratorNextValue(ret, false)) |v| return v;
             }
         }
+        return null;
+    }
+
+    /// The type produced by `for await (x of rt)`: the
+    /// `[Symbol.asyncIterator]()` protocol, falling back to the sync protocol
+    /// with `Awaited<…>` applied to the element (tsc allows `for await` over
+    /// a plain iterable). Null when `rt` is neither.
+    fn asyncIterationElementType(c: *Checker, rt: TypeId) Error!?TypeId {
+        const r = try c.resolveStructural(rt);
+        switch (c.ts.kind(r)) {
+            .any, .err => return types.any_type,
+            .union_type => {
+                var parts: std.ArrayList(TypeId) = .empty;
+                defer parts.deinit(c.scratch());
+                for (try c.memberList(r)) |m| {
+                    const e = (try c.asyncIterationElementType(m)) orelse return null;
+                    try parts.append(c.scratch(), e);
+                }
+                return try c.ts.makeUnion(c.scratch(), parts.items);
+            },
+            else => {},
+        }
+        if (try c.propOfType(r, c.atom_sym_asyncIterator)) |p| {
+            const ret = try c.callableReturn(p.ty);
+            if (ret != 0) {
+                const y = c.asyncGeneratorYieldType(ret);
+                if (y != 0) return y;
+                if (try c.iteratorNextValue(ret, true)) |v| return v;
+            }
+            return null;
+        }
+        if (try c.iterationElementType(rt)) |e| return c.awaitedType(e);
         return null;
     }
 
@@ -10317,13 +10397,33 @@ const Checker = struct {
 
     /// The `value` type of an iterator's `next()` result, i.e. the yield type
     /// of an arbitrary (non-lib-named) iterator object. Null if `iter` has no
-    /// `next(): { value }` shape.
-    fn iteratorNextValue(c: *Checker, iter: TypeId) Error!?TypeId {
+    /// `next(): { value }` shape. With `is_async`, `next()`'s `Promise<…>`
+    /// return is unwrapped first (the `AsyncIterator` protocol).
+    fn iteratorNextValue(c: *Checker, iter: TypeId, is_async: bool) Error!?TypeId {
         const r = try c.resolveStructural(iter);
         const nextp = (try c.propOfType(r, c.atom_next)) orelse return null;
-        const ret = try c.callableReturn(nextp.ty);
+        var ret = try c.callableReturn(nextp.ty);
         if (ret == 0) return null;
+        if (is_async) ret = c.awaitedType(ret);
         const rr = try c.resolveStructural(ret);
+        if (c.ts.kind(rr) == .union_type) {
+            // The lib's `next(): IteratorResult<T, TReturn>` is the union
+            // `IteratorYieldResult<T> | IteratorReturnResult<TReturn>`,
+            // discriminated on `done`: the iteration type is the `value` of
+            // the constituents whose `done` is not literally `true`.
+            var parts: std.ArrayList(TypeId) = .empty;
+            defer parts.deinit(c.scratch());
+            for (try c.memberList(rr)) |m| {
+                const rm = try c.resolveStructural(m);
+                if (try c.propOfType(rm, c.atom_done)) |dp| {
+                    if (c.ts.kind(try c.resolveStructural(dp.ty)) == .bool_true) continue;
+                }
+                const vp = (try c.propOfType(rm, c.atom_value)) orelse continue;
+                try parts.append(c.scratch(), vp.ty);
+            }
+            if (parts.items.len == 0) return null;
+            return try c.ts.makeUnion(c.scratch(), parts.items);
+        }
         const valp = (try c.propOfType(rr, c.atom_value)) orelse return null;
         return valp.ty;
     }
@@ -10411,7 +10511,13 @@ const Checker = struct {
         // `T` of the declared `Promise<T>`; a non-Promise annotation is TS1064.
         var eff_ann = ann;
         var yield_type: TypeId = 0;
-        if (is_async and ann != types.no_type) {
+        if (is_async and is_generator) {
+            // `async function*`: annotated with an AsyncGenerator-family type,
+            // not Promise — TS1064 does not apply. Relate `yield x` to its
+            // first type arg (yielded promises are awaited at the yield site).
+            yield_type = c.asyncGeneratorYieldType(ann);
+            eff_ann = types.no_type;
+        } else if (is_async and ann != types.no_type) {
             const k = c.ts.kind(ann);
             const is_promise = c.ts.kind(ann) == .ref and c.prog.globals.lookup(c.atom_Promise) != null and
                 c.ts.refSymbol(ann) == c.prog.globals.lookup(c.atom_Promise).?;
