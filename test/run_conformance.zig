@@ -141,7 +141,7 @@ fn runCase(alloc: std.mem.Allocator, io: Io, gpa: std.mem.Allocator, interner: *
     owned[0] = @intCast(prog.files.len - 1);
     // Exercise the shared frozen base type store (M14.5), like the CLI default.
     const base = try alloc.create(ztsc.types.Store);
-    base.* = try checker.buildBaseStore(alloc, io, gpa, interner, prog);
+    base.* = try checker.buildBaseStore(alloc);
     const result = try checker.checkFiles(alloc, io, gpa, interner, prog, owned, base, true);
 
     // Parser-surfaced diagnostics with a tsc analogue (e.g. TS1206 parameter
@@ -183,7 +183,7 @@ fn runDirCase(
     const owned = try alloc.alloc(modules.FileId, prog.files.len);
     for (owned, 0..) |*f, i| f.* = @intCast(i);
     const base = try alloc.create(ztsc.types.Store);
-    base.* = try checker.buildBaseStore(alloc, io, gpa, interner, prog);
+    base.* = try checker.buildBaseStore(alloc);
     const result = try checker.checkFiles(alloc, io, gpa, interner, prog, owned, base, true);
 
     for (prog.files, 0..) |*pf, i| {
@@ -350,7 +350,7 @@ fn renderProgramDiags(
     // cross-N determinism oracle — independent overlays over one frozen base
     // must still yield byte-identical diagnostics.
     const base = try alloc.create(ztsc.types.Store);
-    base.* = try checker.buildBaseStore(alloc, io, gpa, interner, prog);
+    base.* = try checker.buildBaseStore(alloc);
     // Round-robin partition, one checkFiles call per checker instance.
     const results = try alloc.alloc(checker.Check, n_checkers);
     for (0..n_checkers) |k| {

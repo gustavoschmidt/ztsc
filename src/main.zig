@@ -798,7 +798,7 @@ pub fn main(init: std.process.Init) !void {
         // Lives in the top-level `arena` so it outlives all overlays.
         const base_store: ?*const types.Store = if (cli.no_frozen_store) null else blk: {
             const bs = try arena.create(types.Store);
-            bs.* = try checker.buildBaseStore(arena, io, gpa, &interner, prog);
+            bs.* = try checker.buildBaseStore(arena);
             break :blk bs;
         };
         for (tasks, 0..) |*t, k| {
@@ -1143,33 +1143,13 @@ pub fn main(init: std.process.Init) !void {
         try out.print("  {s:<24} {d:>12}\n", .{ "module graph bytes", prog.graphBytes() });
 
         // Checker statistics (M4 bytes/type; M5 per-checker breakdown).
-        var overlay_bytes_total: usize = 0;
-        var overlay_types_total: usize = 0;
         for (tasks, 0..) |*t, k| {
             const ck = t.result orelse continue;
-            try out.print("  checker[{d}] types        {d:>12}  (overlay {d})\n", .{ k, ck.stats.types_created, ck.stats.overlay_types });
-            try out.print("  checker[{d}] type bytes   {d:>12}  (overlay {d})\n", .{ k, ck.stats.type_bytes, ck.stats.overlay_bytes });
-            overlay_bytes_total += ck.stats.overlay_bytes;
-            overlay_types_total += ck.stats.overlay_types;
+            try out.print("  checker[{d}] types        {d:>12}\n", .{ k, ck.stats.types_created });
+            try out.print("  checker[{d}] type bytes   {d:>12}\n", .{ k, ck.stats.type_bytes });
         }
         try out.print("  {s:<24} {d:>12}\n", .{ "check types (total)", check_types });
         try out.print("  {s:<24} {d:>12}\n", .{ "check type-arena bytes", check_type_bytes });
-        // Physical type-store footprint (M19): the frozen base counted once
-        // plus every overlay's own bytes — vs `--no-frozen-store`, where the
-        // base is null and this equals the sum of per-checker standalone
-        // stores. `base_type_bytes` is derived from any overlay
-        // (type_bytes = base + overlay).
-        const base_type_bytes: usize = if (!cli.no_frozen_store) blk: {
-            for (tasks) |*t| {
-                const ck = t.result orelse continue;
-                break :blk ck.stats.type_bytes - ck.stats.overlay_bytes;
-            }
-            break :blk 0;
-        } else 0;
-        try out.print("  {s:<24} {d:>12}\n", .{ "frozen base type bytes", base_type_bytes });
-        try out.print("  {s:<24} {d:>12}\n", .{ "overlay type bytes (sum)", overlay_bytes_total });
-        try out.print("  {s:<24} {d:>12}\n", .{ "physical type bytes", base_type_bytes + overlay_bytes_total });
-        try out.print("  {s:<24} {d:>12}\n", .{ "overlay types (sum)", overlay_types_total });
         const bytes_per_type: f64 = if (check_types > 0)
             @as(f64, @floatFromInt(check_type_bytes)) / @as(f64, @floatFromInt(check_types))
         else
