@@ -8,16 +8,16 @@
 # Usage: bench/fetch_real.sh          # fetch + extract
 #        bench/fetch_real.sh census   # ... then run the ztsc census over it
 #
-# The set is chosen to span the distribution the roadmap cares about: a
-# type-level-heavy validator (zod, typebox, yup), a backend framework (hono),
-# the backend gate (@types/node), an ORM (drizzle), a reactive-streams library
-# (rxjs), the big ecosystem `@types` (react/lodash/jest), and ordinary app-ish
-# libraries (date-fns, chalk). Their .d.ts are exactly the "features your
-# dependencies choose for you" (the type-level core).
+# The set is chosen to span package styles: type-level-heavy validators
+# (zod, typebox, yup), a backend framework (hono), the backend gate
+# (@types/node), an ORM (drizzle), a reactive-streams library (rxjs), the
+# big ecosystem `@types` (react/lodash/jest), and ordinary app-ish
+# libraries (date-fns, chalk). Their .d.ts are exactly the features your
+# dependencies choose for you.
 set -euo pipefail
 
-# Pinned (name@version). Grown (react/rxjs/lodash/drizzle/jest/yup)
-# toward the ~500k-LOC target as more packages became checkable.
+# Pinned (name@version). Grown toward the ~500k-LOC target as more
+# packages become checkable.
 PKGS=(
   "zod@3.23.8"
   "hono@4.6.3"
@@ -60,10 +60,10 @@ total=$(find "$root" -name '*.d.ts' | wc -l | tr -d ' ')
 lines=$(find "$root" -name '*.d.ts' -exec cat {} + | wc -l | tr -d ' ')
 echo "real corpus: $total .d.ts files, ~$lines lines in $root"
 
-# Benchmark tsconfigs (BENCHMARKS.md §2). Each of the seven measured packages
-# gets a tsconfig so all three checkers run on identical inputs via -p. The
+# Benchmark tsconfigs (see BENCHMARKS.md). Each of the seven measured packages
+# gets a tsconfig so both tools run on identical inputs via -p. The
 # corpus is gitignored, so these are (re)generated here rather than committed.
-# `lib` is the minimal set that keeps tsc/tsgo clean: DOM only where the package
+# `lib` is the minimal set that keeps tsgo clean: DOM only where the package
 # references browser globals (a web framework / validator); @types/node uses its
 # own `index.d.ts` entry (glob would pull the ts5.x alternate-version dirs and
 # collide) and esnext-only (DOM's lib globals clash with @types/node's).

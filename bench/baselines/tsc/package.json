@@ -1,8 +1,0 @@
-{
-  "name": "ztsc-bench-baseline-tsc",
-  "private": true,
-  "description": "Pinned tsc baseline for bench/e2e.sh — the version BENCHMARKS.md numbers were recorded against. node_modules is gitignored; e2e.sh installs on demand.",
-  "dependencies": {
-    "typescript": "5.5.4"
-  }
-}
