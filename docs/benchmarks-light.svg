@@ -24,8 +24,8 @@
       <text class="bl" x="237" y="55">18 <tspan class="acc">· 18%</tspan></text>
       <rect class="bt" x="210" y="61" width="108" height="14" rx="2"/>
       <text class="bl" x="326" y="72">102</text>
-      <rect class="bz" x="620" y="44" width="19" height="14" rx="2"/>
-      <text class="bl" x="647" y="55">17 <tspan class="acc">· 36%</tspan></text>
+      <rect class="bz" x="620" y="44" width="23" height="14" rx="2"/>
+      <text class="bl" x="651" y="55">20 <tspan class="acc">· 44%</tspan></text>
       <rect class="bt" x="620" y="61" width="51" height="14" rx="2"/>
       <text class="bl" x="679" y="72">45</text>
       <text class="t12 dim" x="195" y="116" text-anchor="end">drizzle-orm</text>

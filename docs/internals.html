@@ -33,7 +33,7 @@
   <div class="stats">
     <div class="stat">
       <div class="k">wall clock · @types/node</div>
-      <div class="v">17&thinsp;<small>ms</small></div>
+      <div class="v">20&thinsp;<small>ms</small></div>
       <div class="c">tsgo 7.0.2 takes 45&thinsp;ms on the same 49.6k lines of declarations — and ztsc is faster on all seven benchmark packages</div>
     </div>
     <div class="stat">
@@ -799,8 +799,8 @@ pub const Program = struct {
       <text class="barlabel" x="237" y="55">18 <tspan class="acc">· 18%</tspan></text>
       <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 102.4 MB" x="210" y="61" width="108" height="14" rx="2"/>
       <text class="barlabel" x="326" y="72">102</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 16.5 ms · 36% of tsgo" x="620" y="44" width="19" height="14" rx="2"/>
-      <text class="barlabel" x="647" y="55">17 <tspan class="acc">· 36%</tspan></text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 20.2 ms · 44% of tsgo" x="620" y="44" width="23" height="14" rx="2"/>
+      <text class="barlabel" x="651" y="55">20 <tspan class="acc">· 44%</tspan></text>
       <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 45.4 ms" x="620" y="61" width="51" height="14" rx="2"/>
       <text class="barlabel" x="679" y="72">45</text>
       <text class="t12 dim" x="195" y="116" text-anchor="end">drizzle-orm</text>
@@ -866,7 +866,7 @@ pub const Program = struct {
     highest time ratios are the two <em>smallest</em> packages (ajv, chalk): at that size both
     tools sit near their process floors — ztsc's ~13&thinsp;ms is dominated by startup plus the
     embedded 14k-line lib front end, tsgo's floor is ~20&thinsp;ms. On everything bigger ztsc is
-    <strong>3–10× faster</strong>. hono and zod list <code>dom</code> in their tsconfig, so ztsc
+    <strong>2–10× faster</strong>. hono and zod list <code>dom</code> in their tsconfig, so ztsc
     checks them against the 2.35&thinsp;MB DOM lib too — that front end is why their RSS and wall
     ratios sit near 15–26% rather than the low single digits of the esnext-only packages. Sweeping
     <code>--checkers</code> 1→8 makes the memory gap starker: tsgo's RSS climbs steeply with
@@ -879,7 +879,7 @@ pub const Program = struct {
   <table>
     <thead><tr><th>package</th><th class="num">files / lines</th><th class="num">wall ztsc / tsgo</th><th class="num">wall vs tsgo</th><th class="num">peak RSS ztsc / tsgo</th><th class="num">rss vs tsgo</th></tr></thead>
     <tbody>
-      <tr><td>@types/node 22.7.4</td><td class="num">59 / 49.6k</td><td class="num">17 / 45 ms</td><td class="num">36%</td><td class="num">18.0 / 102.4 MB</td><td class="num">18%</td></tr>
+      <tr><td>@types/node 22.7.4</td><td class="num">59 / 49.6k</td><td class="num">20 / 45 ms</td><td class="num">44%</td><td class="num">18.0 / 102.4 MB</td><td class="num">18%</td></tr>
       <tr><td>drizzle-orm 0.33.0</td><td class="num">288 / 12.6k</td><td class="num">23 / 239 ms</td><td class="num">10%</td><td class="num">22.4 / 274.9 MB</td><td class="num">8%</td></tr>
       <tr><td>hono 4.6.3</td><td class="num">165 / 6.3k</td><td class="num">45 / 173 ms</td><td class="num">26%</td><td class="num">24.3 / 155.2 MB</td><td class="num">16%</td></tr>
       <tr><td>@sinclair/typebox 0.33.12</td><td class="num">241 / 3.1k</td><td class="num">17 / 49 ms</td><td class="num">36%</td><td class="num">15.5 / 77.4 MB</td><td class="num">20%</td></tr>

@@ -84,7 +84,7 @@ tsconfig `dom` setting):
 
 | package | wall ztsc / tsgo | wall vs tsgo | peak RSS ztsc / tsgo | rss vs tsgo |
 |---|---:|---:|---:|---:|
-| @types/node 22.7.4 | 16.5 / 45.4 ms | 36% | 18.0 / 102.4 MB | 18% |
+| @types/node 22.7.4 | 20.2 / 45.4 ms | 44% | 18.0 / 102.4 MB | 18% |
 | drizzle-orm 0.33.0 | 22.8 / 239.0 ms | 10% | 22.4 / 274.9 MB | 8% |
 | hono 4.6.3 | 44.9 / 173.3 ms | 26% | 24.3 / 155.2 MB | 16% |
 | @sinclair/typebox 0.33.12 | 17.4 / 48.5 ms | 36% | 15.5 / 77.4 MB | 20% |
@@ -98,7 +98,10 @@ startup plus the embedded 14k-line lib front end; tsgo ~20 ms), so the ratio
 reflects fixed startup cost, not checking throughput. hono and zod land higher
 than their size alone suggests (26% wall, 15–16% RSS) because their tsconfig
 lists `dom`: ztsc parses, binds, and checks the 2.35 MB DOM lib for them too, a
-~25 ms front end on top. On every package above ~3k lines ztsc is 3–10× faster.
+~25 ms front end on top. On every package above ~3k lines ztsc is 2–10× faster;
+@types/node, the largest, sits at the low end (44% wall) because its dense
+declaration merging and interface heritage is the work ztsc closes least of the
+gap on.
 
 ## Methodology
 
