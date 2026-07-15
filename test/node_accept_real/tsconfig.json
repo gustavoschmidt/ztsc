@@ -4,8 +4,8 @@
     "noEmit": true,
     "target": "esnext",
     "lib": ["esnext", "dom"],
-    "module": "commonjs",
-    "moduleResolution": "node10",
+    "module": "node16",
+    "moduleResolution": "node16",
     "skipLibCheck": true,
     "types": ["node"]
   },
