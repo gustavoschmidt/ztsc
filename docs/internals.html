@@ -956,8 +956,10 @@ pub const Program = struct {
   is a frequency table of what's missing. The first census counted 2,287 unsupported constructs,
   half of them conditional types and <code>infer</code>; today <strong>every type-level
   bucket reads zero</strong>, and CommonJS interop (<code>export =</code>,
-  <code>import&nbsp;=&nbsp;require</code>) has landed as well — the census residual is down to
-  const-symbol computed keys. The acceptance bar was the real, published
+  <code>import&nbsp;=&nbsp;require</code>) has landed as well, and const-symbol computed keys
+  (drizzle's <code>[entityKind]</code>, typebox's <code>[Kind]</code>) now parse and check —
+  the census residual is a dozen member-expression computed keys
+  (<code>[ns.member]</code>). The acceptance bar was the real, published
   <code>@types/node</code>: ztsc's cross-file merge diagnostics match the TypeScript compiler on it (pinned tsgo 7.0.2 oracle).</p>
   <p>What remains out for v0.0.1 is a short, deliberate list: a couple of lenient
   CommonJS corners that degrade to <code>any</code> instead of erroring,
@@ -965,8 +967,10 @@ pub const Program = struct {
   (<code>for…of</code> over a DOM collection whose <code>[Symbol.iterator]</code> is added by a
   second interface declaration, e.g. <code>URLSearchParams</code>/<code>Headers</code>, and
   <code>for await</code> over <code>AsyncIterable</code>; single-declaration iterables like
-  <code>NodeListOf</code> work), <strong>const-symbol computed keys</strong>
-  (<code>[entityKind]: T</code>; well-known symbols like <code>[Symbol.iterator]</code> work),
+  <code>NodeListOf</code> work), <strong>member-expression computed keys</strong>
+  (<code>[ns.member]</code> such as <code>[EventEmitter.captureRejectionSymbol]</code>; a
+  const-<code>unique&nbsp;symbol</code> key written as a bare identifier — <code>[entityKind]</code>,
+  <code>[Kind]</code> — is checked with full cross-file nominal identity),
   JSX-namespace resolution from <code>@types/react</code>, and <strong>watch mode / LSP</strong>
   — both planned next, on the sealed-phase architecture that was designed not to preclude them.
   Unsupported syntax still produces a clear <em>"not supported"</em> diagnostic — never a wrong

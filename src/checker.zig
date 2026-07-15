@@ -848,6 +848,11 @@ const Checker = struct {
     /// binder's `memberKey`): with the `computed` flag set, `tok` names the
     /// well-known symbol and the member is keyed by a synthetic `__@name` atom.
     fn memberKey(c: *Checker, tok: TokenIndex, flags: u32) Error!Atom {
+        if (flags & ast.Flags.computed_sym != 0) {
+            // `[k]` computed key naming a const `unique symbol`: resolve the
+            // identifier in the current scope to its nominal `__@u<id>` atom.
+            return c.computedSymKey(tok, c.cur_scope);
+        }
         if (flags & ast.Flags.computed != 0) {
             if (ast.wellKnownSymbolKey(c.tokenText(tok))) |k| return c.atom(k);
         }
@@ -876,7 +881,56 @@ const Checker = struct {
         if (c.ts.kind(r) != .unique_symbol) return null;
         var buf: [24]u8 = undefined;
         const s = std.fmt.bufPrint(&buf, "__@u{d}", .{c.ts.uniqueSymId(r)}) catch unreachable;
-        return try c.atom(s);
+        return try c.internText(s); // stack buffer: copy, don't store as a cache key
+    }
+
+    /// Prefix of a computed-key placeholder atom (see `computedSymPlaceholder`).
+    const computed_sym_prefix = "__@k$";
+
+    /// Placeholder member atom for a computed const-`unique symbol` key, keyed
+    /// by the identifier text (matches the binder's `computedSymPlaceholder`).
+    /// Used as a lenient fallback when the key identifier can't be resolved to
+    /// a `unique symbol` (e.g. a plain `symbol`, or an unresolved import): the
+    /// member still exists and is keyed by name, degrading nominal identity to
+    /// same-name matching rather than emitting a spurious error.
+    fn computedSymPlaceholder(c: *Checker, name: []const u8) Error!Atom {
+        const s = try std.fmt.allocPrint(c.scratch(), "{s}{s}", .{ computed_sym_prefix, name });
+        return c.internText(s); // scratch slice: copy, don't store as a cache key
+    }
+
+    /// Resolve a computed-key identifier `name` (a `[k]` key) in `scope` to the
+    /// nominal `__@u<id>` atom of the const `unique symbol` it denotes. Returns
+    /// null when it does not resolve to a `unique symbol` — the caller then
+    /// falls back to the name placeholder. Resolution goes through the value
+    /// space and `typeOfSymbol`, so an imported key resolves to the *declaring*
+    /// site's nominal id, giving cross-file key identity for free.
+    fn constSymbolKeyAtom(c: *Checker, name: []const u8, scope: ScopeId) Error!?Atom {
+        const a = try c.atom(name);
+        const sym = switch (c.resolveSpace(a, scope, true)) {
+            .sym => |s| s,
+            else => return null,
+        };
+        return c.uniqueSymAtom(try c.typeOfSymbol(sym));
+    }
+
+    /// Final member atom for a computed const-symbol key identifier token,
+    /// resolved in `scope`: the nominal `__@u<id>` when the identifier denotes
+    /// a `unique symbol`, else the name placeholder.
+    fn computedSymKey(c: *Checker, tok: TokenIndex, scope: ScopeId) Error!Atom {
+        const name = c.tokenText(tok);
+        if (try c.constSymbolKeyAtom(name, scope)) |k| return k;
+        return c.computedSymPlaceholder(name);
+    }
+
+    /// Rekey a bound member atom (from the binder's member index) to its
+    /// nominal `__@u<id>` when it is a computed-key placeholder; otherwise
+    /// return it unchanged. `scope` must reach the key identifier's binding.
+    fn nominalizeComputedKey(c: *Checker, name: Atom, scope: ScopeId) Error!Atom {
+        const text = c.atomText(name);
+        if (!std.mem.startsWith(u8, text, computed_sym_prefix)) return name;
+        const ident = text[computed_sym_prefix.len..];
+        if (try c.constSymbolKeyAtom(ident, scope)) |k| return k;
+        return name;
     }
 
     /// Resolve a declaration's type annotation that is allowed to be a
@@ -3497,11 +3551,12 @@ const Checker = struct {
         // fail assignment to `{[k:string]:T}`).
         var result: TypeId = try c.ts.makeObject(&.{}, 0, 0, types.obj_flag_not_inferable);
         if (c.bind.membersScopeOf(c.localOf(sym))) |ms| {
+            const kscope = c.symScope(sym);
             const lo = c.bind.scope_members_start[ms];
             const hi = c.bind.scope_members_start[ms + 1];
             for (lo..hi) |i| {
                 const msym = c.toGlobal(c.bind.member_syms[i]);
-                const name = c.bind.member_atoms[i];
+                const name = try c.nominalizeComputedKey(c.bind.member_atoms[i], kscope);
                 const mf = c.symFlags(msym);
                 if (isCtorName(c, name)) continue;
                 var flags: u32 = 0;
@@ -3911,6 +3966,7 @@ const Checker = struct {
         var props: std.ArrayList(types.Prop) = .empty;
         defer props.deinit(c.scratch());
         if (c.bind.staticsScopeOf(c.localOf(sym))) |ss| {
+            const kscope = c.symScope(sym);
             const lo = c.bind.scope_members_start[ss];
             const hi = c.bind.scope_members_start[ss + 1];
             for (lo..hi) |i| {
@@ -3920,7 +3976,7 @@ const Checker = struct {
                 if (mf.readonly_member) flags |= types.prop_flag_readonly;
                 if (mf.getter and !mf.setter) flags |= types.prop_flag_readonly;
                 try props.append(c.scratch(), .{
-                    .name = c.bind.member_atoms[i],
+                    .name = try c.nominalizeComputedKey(c.bind.member_atoms[i], kscope),
                     .ty = try c.memberTypeOf(msym),
                     .flags = flags,
                 });
@@ -7689,8 +7745,11 @@ const Checker = struct {
             if (try c.propOfType(r, key)) |p| {
                 result = if (p.optional()) try c.makeUnion2(p.ty, types.undefined_type) else p.ty;
             } else {
-                try c.diagFmt(2339, c.nodeSpan(d.rhs), "Property '{s}' does not exist on type '{s}'.", .{
-                    c.atomText(key), try c.typeToString(obj_t),
+                // A `unique symbol` that does not key a member of the target:
+                // tsc reports TS7053 (implicit-any index) rather than TS2339,
+                // since the key is a symbol, not a named property.
+                try c.diagFmt(7053, c.nodeSpan(d.rhs), "Element implicitly has an 'any' type because expression of type 'unique symbol' can't be used to index type '{s}'.", .{
+                    try c.typeToString(obj_t),
                 });
                 result = types.error_type;
             }

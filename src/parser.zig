@@ -1531,6 +1531,15 @@ const Parser = struct {
                 if (try p.eatWellKnownSymbolName()) |ntok| {
                     name_tok = ntok;
                     flags |= ast.Flags.computed;
+                } else if (isIdentLike(p.peekTag(1)) and p.peekTag(2) == .r_bracket) {
+                    // `[k]` where `k` is a plain identifier: a computed key
+                    // naming a const `unique symbol` (drizzle's
+                    // `static readonly [entityKind]`, typebox's `[Kind]`). The
+                    // checker resolves the identifier to its nominal symbol id.
+                    _ = try p.bump(); // `[`
+                    name_tok = try p.bump(); // identifier
+                    _ = try p.eat(.r_bracket);
+                    flags |= ast.Flags.computed | ast.Flags.computed_sym;
                 } else {
                     _ = try p.bump();
                     _ = try p.parseAssignExpr(.{});
@@ -3538,6 +3547,14 @@ const Parser = struct {
             if (try p.eatWellKnownSymbolName()) |ntok| {
                 name_tok = ntok;
                 flags |= ast.Flags.computed;
+            } else if (isIdentLike(p.peekTag(1)) and p.peekTag(2) == .r_bracket) {
+                // `[k]` naming a const `unique symbol` (typebox's `[Kind]: 'X'`,
+                // drizzle's interface `[entityKind]: string`). Keyed by the
+                // symbol's nominal id, resolved by the checker.
+                _ = try p.bump(); // `[`
+                name_tok = try p.bump(); // identifier
+                _ = try p.eat(.r_bracket);
+                flags |= ast.Flags.computed | ast.Flags.computed_sym;
             } else {
                 // Other computed properties in a type are out of subset.
                 _ = try p.bump();
