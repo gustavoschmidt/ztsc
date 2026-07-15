@@ -248,7 +248,7 @@ them.)
 
 ## 5. The road to the public v0.0.1
 
-M11–M17 are done (per-milestone records below). **Four remain: M18–M21.**
+M11–M18 are done (per-milestone records below). **Three remain: M19–M21.**
 The numbering has moved twice:
 
 - **2026-07-13** — linear renumbering after the backend-first decision
@@ -678,6 +678,13 @@ the one surprise — the census *reorders* M14 to lead with them (see M14). Mapp
 confirmed by data, not assumption. `unique symbol` at 1.3% validates keeping it
 low-priority. The long tail (`import =`/`export =`, named tuples) is small enough
 to leave deferred.
+
+> **Superseded by the M18.5 refresh (2026-07-14, BENCHMARKS §3.14).** After
+> M14/M16/M18 landed, every type-level and callable-object bucket in the table
+> above has **zeroed** on a grown 131k-line corpus; only consciously-accepted
+> CommonJS interop (`export =`/`import = require`) and const-symbol computed
+> property names remain. This table is kept as the M13 snapshot that set
+> M14/M16 order.
 
 **Continuation map (for the next agent — how to re-run and extend).**
 - *Classification lives at parse time.* `ast.UnsupportedKind` (src/ast.zig) is the
@@ -1602,11 +1609,52 @@ graduates the M11 acceptance test to the *real* pinned `@types/node`.
    in the bare `declare global namespace` shape that ztsc's coarser (correct-
    for-real-`@types/node`) rule resolves, so no clean exact-match case exists
    — `node_accept_real` is the authoritative gate for that path.
-5. **Corpus & census refresh.** Grow `bench/fetch_real.sh`'s pinned set
-   toward the ~500k-LOC target (more packages are checkable now); re-run
-   `--census` over it. The refreshed table is the release-readiness
-   evidence: everything remaining should be consciously accepted
-   (`export =`, `import = require`, …) or trivially rare.
+5. **Corpus & census refresh. ✅ DONE (2026-07-14).** Grow
+   `bench/fetch_real.sh`'s pinned set toward the ~500k-LOC target (more
+   packages are checkable now); re-run `--census` over it. The refreshed
+   table is the release-readiness evidence: everything remaining should be
+   consciously accepted (`export =`, `import = require`, …) or trivially rare.
+
+   **Landed.** Pinned set grown from 8 → **14 packages** (added
+   `@types/react`, `rxjs`, `@types/lodash`, `drizzle-orm`, `@types/jest`,
+   `yup` — ORM / reactive-streams / big-ecosystem `@types` styles now
+   checkable): **77k → ~131k lines** (2945 `.d.ts`). Corpus growth to the full
+   ~500k target stays best-effort and is **carried forward to M21** (network
+   `npm pack` gated); the refresh, not the LOC number, is the deliverable.
+   `--census` over the grown corpus (full table + narrative in BENCHMARKS
+   §3.14): **every M13 type-level + callable-object bucket has zeroed** —
+   `conditional type` (was 804), `import() type` (482), `infer` (331),
+   `call/construct signature` (237), `mapped type` (160), `constructor type`
+   (54), `template-literal type` (32), `unique symbol` (30), `named tuple
+   member` (7) are all **absent**. What remains (1249 total) is entirely
+   release-ready: `export =` 57% + `import = require` 3% (= 60%, CommonJS
+   interop consciously out of subset — @types/lodash alone is 689 of the
+   `export =` hits, its whole API being `export = _`) and the const-symbol
+   **computed-property-name** family (~39%: `computed member name` 85 plus a
+   `static block` 406 bucket that is a *classifier-label artifact* — 808 of
+   those are drizzle-orm's `static readonly [entityKind]: T`, a computed key
+   on a static field labelled from its leading `static` token, needing
+   symbol-value key resolution → deferred post-v0.0.1). **No surprising new
+   construct and no easy parser win surfaced** (unlike M13's named tuples):
+   the only apparent new bucket is the "static block" mislabel, which is the
+   same computed-key story, not a new feature. Totality holds on the full
+   grown corpus (zero crashes/panics); conformance unchanged at 388;
+   measurement-only, no bench change.
+
+**M18 (the real lib) COMPLETE** (2026-07-14): item 1 call/construct
+signatures + constructor types + named tuples → item 2 the real TS 5.5.4
+`lib.esnext` surface vendored (~527 KB, `--census`-clean, five real
+checker bugs fixed) → item 3 the lib-gated decorator signature checks
+(TS1238/1240/1241/1206) → item 4 real-pinned `@types/node` acceptance
+gate → item 5 corpus & census refresh. Conformance 365→**388** across
+M17+M18 (376→388 within M18), all differential vs tsc 5.5.4; the real lib
+costs (+2.4 MB RSS at N=1, +11% type population at N=4) are recorded in
+BENCHMARKS §3.13 as the explicit, written-down input to M19's claw-back.
+The M18.5 census is the release-readiness verdict: the entire type-level
+and callable-object surface of real published `.d.ts` now checks, leaving
+only consciously-accepted CommonJS interop and const-symbol computed keys.
+Next: M19 (substrate payload) — reclaim the real-lib memory/cold-start
+cost this milestone deliberately took on.
 
 **Gate:** the real-`@types/node` backend fixture matches tsc; census over
 lib + real corpus shows only accepted constructs; conformance grows with

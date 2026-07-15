@@ -9,13 +9,15 @@
 #        bench/fetch_real.sh census   # ... then run the ztsc census over it
 #
 # The set is chosen to span the distribution the roadmap cares about: a
-# type-level-heavy validator (zod, typebox), a backend framework (hono), the
-# backend gate (@types/node), and ordinary app-ish libraries (date-fns,
-# chalk). Their .d.ts are exactly the "features your dependencies choose for
-# you" (ROADMAP M16).
+# type-level-heavy validator (zod, typebox, yup), a backend framework (hono),
+# the backend gate (@types/node), an ORM (drizzle), a reactive-streams library
+# (rxjs), the big ecosystem `@types` (react/lodash/jest), and ordinary app-ish
+# libraries (date-fns, chalk). Their .d.ts are exactly the "features your
+# dependencies choose for you" (ROADMAP M16).
 set -euo pipefail
 
-# Pinned (name@version).
+# Pinned (name@version). Grown at M18.5 (react/rxjs/lodash/drizzle/jest/yup)
+# toward the ~500k-LOC target as more packages became checkable.
 PKGS=(
   "zod@3.23.8"
   "hono@4.6.3"
@@ -25,6 +27,12 @@ PKGS=(
   "@sinclair/typebox@0.33.12"
   "@types/express@4.17.21"
   "ajv@8.17.1"
+  "@types/react@18.3.11"
+  "rxjs@7.8.1"
+  "@types/lodash@4.17.7"
+  "drizzle-orm@0.33.0"
+  "@types/jest@29.5.13"
+  "yup@1.4.0"
 )
 
 here="$(cd "$(dirname "$0")" && pwd)"
