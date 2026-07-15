@@ -841,8 +841,17 @@ pub fn main(init: std.process.Init) !void {
     var node_bytes: usize = 0;
     var extra_bytes: usize = 0;
     var ast_token_bytes: usize = 0;
+    // The injected lib's own diagnostics are never reported (the print
+    // loop below skips it, matching tsc, which does not diagnose the
+    // default lib), so they must not count toward the summary line or
+    // the exit code either — otherwise a clean project exits 1 with
+    // nothing printed.
+    const lib_file: ?usize = for (paths.items, 0..) |p, i| {
+        if (std.mem.eql(u8, p, modules.lib_path)) break i;
+    } else null;
+
     var parse_diags: usize = 0;
-    for (trees.items) |maybe_tree| {
+    for (trees.items, 0..) |maybe_tree, i| {
         const tree = maybe_tree orelse continue;
         total_tokens += tree.tokens.len();
         token_bytes += tree.tokens.byteSize();
@@ -850,7 +859,7 @@ pub fn main(init: std.process.Init) !void {
         node_bytes += tree.nodeBytes();
         extra_bytes += tree.extraBytes();
         ast_token_bytes += tree.tokens.byteSize();
-        parse_diags += tree.diagnostics.len;
+        if (lib_file != i) parse_diags += tree.diagnostics.len;
     }
 
     var total_symbols: usize = 0;
@@ -861,7 +870,7 @@ pub fn main(init: std.process.Init) !void {
     var bind_flow_bytes: usize = 0;
     var bind_record_bytes: usize = 0;
     var bind_diags: usize = 0;
-    for (binds.items) |maybe_bind| {
+    for (binds.items, 0..) |maybe_bind, i| {
         const b = maybe_bind orelse continue;
         total_symbols += b.symbolCount();
         total_scopes += b.scopeCount();
@@ -870,11 +879,13 @@ pub fn main(init: std.process.Init) !void {
         bind_scope_bytes += b.scopeBytes();
         bind_flow_bytes += b.flowBytes();
         bind_record_bytes += b.recordBytes();
-        bind_diags += b.diagnostics.len;
+        if (lib_file != i) bind_diags += b.diagnostics.len;
     }
 
     var link_diags: usize = 0;
-    for (links) |*l| link_diags += l.diags.len;
+    for (links, 0..) |*l, i| {
+        if (lib_file != i) link_diags += l.diags.len;
+    }
 
     var check_diags: usize = 0;
     var check_types: usize = 0;
@@ -892,7 +903,9 @@ pub fn main(init: std.process.Init) !void {
     var check_inst_maps: usize = 0;
     for (tasks) |*t| {
         const ck = t.result orelse continue;
-        check_diags += ck.diagnostics.len;
+        for (ck.diagnostics) |d| {
+            if (lib_file != @as(usize, d.file)) check_diags += 1;
+        }
         check_types += ck.stats.types_created;
         check_type_bytes += ck.stats.type_bytes;
         check_rel_entries += ck.stats.relation_entries;
