@@ -73,6 +73,7 @@ pub const Flags = struct {
     pub const ambient_module: u32 = 1 << 20; // `declare module "spec" { ... }`
     pub const exported: u32 = 1 << 21; // `export import A = ...` (exported alias)
     pub const computed_sym: u32 = 1 << 22; // `[k]` computed key naming a const `unique symbol` (main_token = the key identifier)
+    pub const computed_sym_qual: u32 = 1 << 23; // qualified `[a.b]` computed key (with computed_sym; main_token = the member identifier, object identifier at main_token - 2)
 };
 
 /// Maps a well-known `Symbol` property name (the `iterator` in

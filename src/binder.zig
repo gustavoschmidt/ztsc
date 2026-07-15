@@ -901,11 +901,17 @@ const Binder = struct {
     /// returns a static string, so it is a safe `atom_cache` key.)
     fn memberNameKey(b: *Binder, tok: TokenIndex, flags: u32) Error!Atom {
         if (flags & ast.Flags.computed_sym != 0) {
-            // A `[k]` computed key naming a const `unique symbol`. The binder
-            // cannot resolve nominal symbol identity, so it keys the member by
-            // a placeholder derived from the key identifier's text; the checker
-            // rekeys it to the symbol's `__@u<id>` atom when materializing the
-            // class/interface type (`nominalizeComputedKey`).
+            // A `[k]` (or qualified `[a.b]`) computed key naming a const
+            // `unique symbol`. The binder cannot resolve nominal symbol
+            // identity, so it keys the member by a placeholder derived from
+            // the key's source text; the checker rekeys it to the symbol's
+            // `__@u<id>` atom when materializing the class/interface type
+            // (`nominalizeComputedKey`). For the qualified form the object
+            // identifier sits two tokens before the member identifier.
+            if (flags & ast.Flags.computed_sym_qual != 0) {
+                const s = try std.fmt.allocPrint(b.scratch, "__@k${s}.{s}", .{ b.tokenText(tok - 2), b.tokenText(tok) });
+                return b.atomOf(s);
+            }
             return b.computedSymPlaceholder(b.tokenText(tok));
         }
         if (flags & ast.Flags.computed != 0) {

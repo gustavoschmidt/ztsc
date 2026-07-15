@@ -411,6 +411,11 @@ const Checker = struct {
     /// use (`{ [k]: … }`) and element access (`o[k]`).
     unique_sym_ids: std.AutoHashMapUnmanaged(u64, u32) = .empty,
     unique_sym_next: u32 = 1,
+    /// Recursion bound for the type-materializing fallback of qualified
+    /// computed-key resolution (`constSymbolKeyAtom`): an adversarial alias
+    /// cycle (`[A.k]` where `A`'s type materialization re-resolves the same
+    /// key) degrades to the placeholder instead of recursing unboundedly.
+    computed_key_depth: u32 = 0,
     /// `infer V` binder identity (M16a): (conditional nodeKey, name atom) -> a
     /// dense id. Keyed by (conditional, name) so the *same* infer name used at
     /// several sites in one conditional's extends clause is one variable
@@ -857,9 +862,9 @@ const Checker = struct {
     /// well-known symbol and the member is keyed by a synthetic `__@name` atom.
     fn memberKey(c: *Checker, tok: TokenIndex, flags: u32) Error!Atom {
         if (flags & ast.Flags.computed_sym != 0) {
-            // `[k]` computed key naming a const `unique symbol`: resolve the
-            // identifier in the current scope to its nominal `__@u<id>` atom.
-            return c.computedSymKey(tok, c.cur_scope);
+            // `[k]` / `[a.b]` computed key naming a const `unique symbol`:
+            // resolve it in the current scope to its nominal `__@u<id>` atom.
+            return c.computedSymKey(tok, flags, c.cur_scope);
         }
         if (flags & ast.Flags.computed != 0) {
             if (ast.wellKnownSymbolKey(c.tokenText(tok))) |k| return c.atom(k);
@@ -913,6 +918,32 @@ const Checker = struct {
     /// space and `typeOfSymbol`, so an imported key resolves to the *declaring*
     /// site's nominal id, giving cross-file key identity for free.
     fn constSymbolKeyAtom(c: *Checker, name: []const u8, scope: ScopeId) Error!?Atom {
+        if (std.mem.indexOfScalar(u8, name, '.')) |dot| {
+            // Qualified `[a.b]` key: resolve `a` in the value space, then find
+            // the member *symbol* `b` directly on it (class statics, namespace
+            // exports). Symbol-level lookup goes through `typeOfSymbol`'s
+            // per-member guard, so a self-referential key (`[C.k]` inside `C`
+            // itself, node's `[EventEmitter.captureRejectionSymbol]`) resolves
+            // nominally without re-entering the class-static materialization.
+            const obj = switch (c.resolveSpace(try c.atom(name[0..dot]), scope, true)) {
+                .sym => |s| s,
+                else => return null,
+            };
+            const member = try c.atom(name[dot + 1 ..]);
+            if (c.qualifiedKeyMemberSym(obj, member)) |msym| {
+                return c.uniqueSymAtom(try c.typeOfSymbol(msym));
+            }
+            // Fallback for a base that is not itself a class/namespace (an
+            // import binding, or a var whose *type* carries the member —
+            // rxjs's `[Symbol.observable]` on `var Symbol: SymbolConstructor`):
+            // materialize the base's type. Depth-bounded: an alias cycle
+            // re-resolving the same key degrades to the placeholder.
+            if (c.computed_key_depth >= 4) return null;
+            c.computed_key_depth += 1;
+            defer c.computed_key_depth -= 1;
+            const p = (try c.propOfType(try c.typeOfSymbol(obj), member)) orelse return null;
+            return c.uniqueSymAtom(p.ty);
+        }
         const a = try c.atom(name);
         const sym = switch (c.resolveSpace(a, scope, true)) {
             .sym => |s| s,
@@ -921,11 +952,46 @@ const Checker = struct {
         return c.uniqueSymAtom(try c.typeOfSymbol(sym));
     }
 
-    /// Final member atom for a computed const-symbol key identifier token,
-    /// resolved in `scope`: the nominal `__@u<id>` when the identifier denotes
-    /// a `unique symbol`, else the name placeholder.
-    fn computedSymKey(c: *Checker, tok: TokenIndex, scope: ScopeId) Error!Atom {
-        const name = c.tokenText(tok);
+    /// Member symbol `name` of `obj` for qualified computed-key resolution:
+    /// a class's static (own class, or the class constituent of a merge), or
+    /// a namespace export. Null when `obj` is neither, or the member is
+    /// absent — the caller then falls back to type materialization.
+    fn qualifiedKeyMemberSym(c: *Checker, obj: SymbolId, name: Atom) ?SymbolId {
+        if (c.prog.isMergedId(obj)) {
+            const m = c.prog.mergedSym(obj);
+            for (m.parts) |p| {
+                if (c.symFlags(p).class) {
+                    if (c.classStaticMemberSym(p, name)) |s| return s;
+                }
+            }
+            if (m.flags.namespace_decl) return c.namespaceMemberSym(obj, name);
+            return null;
+        }
+        const f = c.symFlags(obj);
+        if (f.class) {
+            if (c.classStaticMemberSym(obj, name)) |s| return s;
+        }
+        if (f.namespace_decl) return c.namespaceMemberSym(obj, name);
+        return null;
+    }
+
+    /// Static member `name` of class `cls` as a global symbol id, or null.
+    fn classStaticMemberSym(c: *Checker, cls: SymbolId, name: Atom) ?SymbolId {
+        const cb = c.symBind(cls);
+        const ss = cb.staticsScopeOf(c.localOf(cls)) orelse return null;
+        const local = cb.lookupInScope(ss, name) orelse return null;
+        return c.toGlobalIn(c.symFile(cls), local);
+    }
+
+    /// Final member atom for a computed const-symbol key token, resolved in
+    /// `scope`: the nominal `__@u<id>` when the key denotes a `unique symbol`,
+    /// else the name placeholder. For a qualified `[a.b]` key the object
+    /// identifier sits two tokens before the member identifier (see parser).
+    fn computedSymKey(c: *Checker, tok: TokenIndex, flags: u32, scope: ScopeId) Error!Atom {
+        const name = if (flags & ast.Flags.computed_sym_qual != 0)
+            try std.fmt.allocPrint(c.scratch(), "{s}.{s}", .{ c.tokenText(tok - 2), c.tokenText(tok) })
+        else
+            c.tokenText(tok);
         if (try c.constSymbolKeyAtom(name, scope)) |k| return k;
         return c.computedSymPlaceholder(name);
     }
