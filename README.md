@@ -83,10 +83,13 @@ like `tsc` — but it does not check everything yet:
   const `unique symbol`) — in classes, interfaces, type literals and object
   literals, keyed by the symbol's nominal identity across files (an imported
   key resolves to its declaring site, and reading with a *different* symbol is
-  a TS7053). One lenient corner: a computed key written as a *member
-  expression* (`[ns.member]`, e.g. `[EventEmitter.captureRejectionSymbol]`)
-  stays out of subset, and a plain non-`unique` `symbol` key is keyed by name
-  rather than as a symbol index — both under-report rather than erroring.
+  a TS7053). Member-expression keys are checked too: a class-static symbol
+  (`[EventEmitter.captureRejectionSymbol]`) or a namespace export
+  (`[promisify.custom]`) resolves to the same nominal identity. Two lenient
+  corners: a plain non-`unique` `symbol` key (rxjs's `[Symbol.observable]`,
+  declared `: symbol`) is keyed by name rather than as a symbol index, and a
+  deeper-qualified key (`[a.b.c]`) stays out of subset — both under-report
+  rather than erroring.
 - **JSX is checked against the real `@types/react`** — the global `JSX`
   namespace merged out of the package (`declare global` in 18.x, or any
   user-authored namespace), intrinsic props via `IntrinsicElements`

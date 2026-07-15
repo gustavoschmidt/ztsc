@@ -965,10 +965,13 @@ pub const Program = struct {
   is a frequency table of what's missing. The first census counted 2,287 unsupported constructs,
   half of them conditional types and <code>infer</code>; today <strong>every type-level
   bucket reads zero</strong>, and CommonJS interop (<code>export =</code>,
-  <code>import&nbsp;=&nbsp;require</code>) has landed as well, and const-symbol computed keys
-  (drizzle's <code>[entityKind]</code>, typebox's <code>[Kind]</code>) now parse and check —
-  the census residual is a dozen member-expression computed keys
-  (<code>[ns.member]</code>). The acceptance bar was the real, published
+  <code>import&nbsp;=&nbsp;require</code>) has landed as well, and computed property keys
+  now parse and check — bare const-symbol keys (drizzle's <code>[entityKind]</code>,
+  typebox's <code>[Kind]</code>) and member-expression keys (node's
+  <code>[EventEmitter.captureRejectionSymbol]</code>, <code>[promisify.custom]</code>) alike.
+  The census residual is eight parse-recovery artifacts of two unsupported <em>type</em>
+  forms (drizzle's <code>this['_']</code> indexed access, a hono nested conditional), not
+  computed keys at all. The acceptance bar was the real, published
   <code>@types/node</code>: ztsc's cross-file merge diagnostics match the TypeScript compiler on it (pinned tsgo 7.0.2 oracle).</p>
   <p>What remains out for v0.0.1 is a short, deliberate list: a couple of lenient
   CommonJS corners that degrade to <code>any</code> instead of erroring,
@@ -976,10 +979,11 @@ pub const Program = struct {
   (<code>for…of</code> over a DOM collection whose <code>[Symbol.iterator]</code> is added by a
   second interface declaration, e.g. <code>URLSearchParams</code>/<code>Headers</code>, and
   <code>for await</code> over <code>AsyncIterable</code>; single-declaration iterables like
-  <code>NodeListOf</code> work), <strong>member-expression computed keys</strong>
-  (<code>[ns.member]</code> such as <code>[EventEmitter.captureRejectionSymbol]</code>; a
-  const-<code>unique&nbsp;symbol</code> key written as a bare identifier — <code>[entityKind]</code>,
-  <code>[Kind]</code> — is checked with full cross-file nominal identity),
+  <code>NodeListOf</code> work), <strong>symbol-key leniencies</strong> (computed keys —
+  bare <code>[entityKind]</code> and member-expression
+  <code>[EventEmitter.captureRejectionSymbol]</code> alike — are checked with full
+  cross-file nominal identity, but a plain non-<code>unique</code> <code>symbol</code> key
+  is matched by name and a deeper-qualified <code>[a.b.c]</code> key stays out of subset),
   <strong>JSX leniencies</strong> (the <code>JSX</code> namespace resolves from the real
   <code>@types/react</code> and spread attributes are checked, but prop-type mismatches
   arriving <em>inside</em> a spread object, spreads of unions/generics, and children

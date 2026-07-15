@@ -101,7 +101,7 @@ pub fn parseOpts(gpa: Allocator, src: []const u8, jsx: bool) error{ OutOfMemory,
     return p.sealInto(gpa);
 }
 
-const max_la = 4;
+const max_la = 5; // `[a.b]` computed-key gate peeks `[ a . b ]` = 5 tokens
 
 const Parser = struct {
     /// Transient arena: all growable lists live here during the parse.
@@ -1540,6 +1540,19 @@ const Parser = struct {
                     name_tok = try p.bump(); // identifier
                     _ = try p.eat(.r_bracket);
                     flags |= ast.Flags.computed | ast.Flags.computed_sym;
+                } else if (isIdentLike(p.peekTag(1)) and p.peekTag(2) == .dot and
+                    isIdentLike(p.peekTag(3)) and p.peekTag(4) == .r_bracket)
+                {
+                    // `[a.b]` member-expression computed key (node's
+                    // `[EventEmitter.captureRejectionSymbol]`): keyed by the
+                    // member's nominal symbol id, resolved by the checker.
+                    // The object identifier sits at `name_tok - 2`.
+                    _ = try p.bump(); // `[`
+                    _ = try p.bump(); // object identifier
+                    _ = try p.bump(); // `.`
+                    name_tok = try p.bump(); // member identifier
+                    _ = try p.eat(.r_bracket);
+                    flags |= ast.Flags.computed | ast.Flags.computed_sym | ast.Flags.computed_sym_qual;
                 } else {
                     _ = try p.bump();
                     _ = try p.parseAssignExpr(.{});
@@ -1560,6 +1573,16 @@ const Parser = struct {
             },
         }
 
+        // Optional method `m?(): T` / `m?<K>(): T` (ambient/overload members).
+        if (p.curTag() == .question) {
+            switch (p.peekTag(1)) {
+                .l_paren, .lt, .lt_lt, .lt_lt_eq => {
+                    _ = try p.bump();
+                    flags |= ast.Flags.optional;
+                },
+                else => {},
+            }
+        }
         if (p.curTag() == .l_paren or p.atLt()) {
             // Method / constructor / accessor.
             const proto = try p.parseFnProtoRest(flags, name_tok);
@@ -3566,6 +3589,20 @@ const Parser = struct {
                 name_tok = try p.bump(); // identifier
                 _ = try p.eat(.r_bracket);
                 flags |= ast.Flags.computed | ast.Flags.computed_sym;
+            } else if (isIdentLike(p.peekTag(1)) and p.peekTag(2) == .dot and
+                isIdentLike(p.peekTag(3)) and p.peekTag(4) == .r_bracket)
+            {
+                // `[a.b]` member-expression computed key (util's
+                // `[promisify.custom]: TCustom`, rxjs's `[Symbol.observable]`
+                // for a non-well-known `Symbol` member). Keyed by the member's
+                // nominal symbol id, resolved by the checker; the object
+                // identifier sits at `name_tok - 2`.
+                _ = try p.bump(); // `[`
+                _ = try p.bump(); // object identifier
+                _ = try p.bump(); // `.`
+                name_tok = try p.bump(); // member identifier
+                _ = try p.eat(.r_bracket);
+                flags |= ast.Flags.computed | ast.Flags.computed_sym | ast.Flags.computed_sym_qual;
             } else {
                 // Other computed properties in a type are out of subset.
                 _ = try p.bump();
@@ -4560,6 +4597,17 @@ test "well-known symbol computed member is in subset" {
     // `[Symbol.iterator]` methods parse cleanly (keyed by a synthetic atom).
     try expectDiagCount("class C { [Symbol.iterator]() {} }", 0);
     try expectDiagCount("interface I { [Symbol.iterator](): Iterator<number>; }", 0);
+}
+
+test "member-expression computed keys are in subset" {
+    // `[a.b]` keys (node's `[EventEmitter.captureRejectionSymbol]`, util's
+    // `[promisify.custom]`, rxjs's non-well-known `[Symbol.observable]`).
+    try expectDiagCount("declare class C { [EventEmitter.captureRejectionSymbol]?<K>(error: Error): void; }", 0);
+    try expectDiagCount("interface I { [promisify.custom]: number; }", 0);
+    try expectDiagCount("interface O { [Symbol.observable]: () => number; }", 0);
+    // Deeper qualification and non-name keys stay out of subset.
+    try expectDiagCount("class B { [a.b.c]() {} }", 1);
+    try expectDiagCount("interface J { [a.b.c]: number; }", 1);
 }
 
 test "jsx parses cleanly in tsx mode" {

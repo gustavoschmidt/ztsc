@@ -166,10 +166,13 @@ ztsc src/main.ts           # or explicit entry files</code></pre>
     namespace used in <em>type</em> position resolves to <code>any</code>.</li>
     <li><strong>Const-symbol computed keys are checked</strong> (<code>[kind]: T</code> with a
     <code>unique symbol</code> key) across classes, interfaces, type literals and object
-    literals, keyed by the symbol's nominal identity across files. Lenient corner: a key
-    written as a member expression (<code>[ns.member]</code>) stays out of subset, and a
-    plain non-<code>unique</code> <code>symbol</code> key is keyed by name — both
-    under-report rather than erroring.</li>
+    literals, keyed by the symbol's nominal identity across files — including
+    member-expression keys: a class-static symbol
+    (<code>[EventEmitter.captureRejectionSymbol]</code>) or a namespace export
+    (<code>[promisify.custom]</code>). Lenient corners: a plain non-<code>unique</code>
+    <code>symbol</code> key (rxjs's <code>[Symbol.observable]</code>) is keyed by name, and
+    a deeper-qualified key (<code>[a.b.c]</code>) stays out of subset — both under-report
+    rather than erroring.</li>
     <li><strong>JSX is checked against the real <code>@types/react</code></strong> — the
     global <code>JSX</code> namespace merged out of the package, intrinsic props via
     <code>IntrinsicElements</code>, component props, spread attributes
