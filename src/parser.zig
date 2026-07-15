@@ -972,7 +972,11 @@ const Parser = struct {
 
     fn parseForStatement(p: *Parser) PE!Node {
         const kw = try p.bump();
-        if (p.curTag() == .keyword_await) _ = try p.bump(); // `for await` — parsed, checker's business
+        var is_await: u32 = 0;
+        if (p.curTag() == .keyword_await) {
+            _ = try p.bump(); // `for await` — recorded for the checker
+            is_await = 1;
+        }
         _ = try p.expect(.l_paren, .expected_l_paren);
 
         var init: Node = null_node;
@@ -988,7 +992,7 @@ const Parser = struct {
                 const right = if (is_of) try p.parseAssignExpr(.{}) else try p.parseExpression(.{});
                 _ = try p.expect(.r_paren, .expected_r_paren);
                 const body = try p.parseStatement();
-                const extra = try p.addExtra(ast.ForInOf{ .left = init, .right = right });
+                const extra = try p.addExtra(ast.ForInOf{ .left = init, .right = right, .is_await = is_await });
                 return p.addNode(.{
                     .tag = if (is_of) .for_of_stmt else .for_in_stmt,
                     .main_token = kw,
