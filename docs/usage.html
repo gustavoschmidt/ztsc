@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Usage — ztsc</title>
+<meta name="description" content="Building and using ztsc: CLI options, the tsconfig subset, diagnostics and exit codes, and current limitations.">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='20' fill='%23eda100'/%3E%3Ctext x='50' y='74' font-size='68' font-family='monospace' font-weight='bold' text-anchor='middle' fill='%231c1b18'%3Ez%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+
+<nav class="sitenav"><div class="navin">
+  <a class="brand" href="./">ztsc<span class="cursor">▌</span></a>
+  <div class="navlinks">
+    <a href="./">overview</a>
+    <a href="usage.html" aria-current="page">usage</a>
+    <a href="internals.html">internals</a>
+    <a href="rationale.html">rationale</a>
+    <a href="https://github.com/gustavoschmidt/ztsc">github ↗</a>
+  </div>
+</div></nav>
+
+<div class="wrap">
+
+<header class="hero">
+  <p class="eyebrow">usage</p>
+  <h1>Using ztsc</h1>
+  <p class="sub">One binary, one command. ztsc is a batch checker: it reads your
+  <code>tsconfig.json</code> (or explicit entry files), checks everything, prints tsc-style
+  diagnostics, and exits.</p>
+</header>
+
+<!-- ============================================================ -->
+<section>
+  <p class="eyebrow"><span class="n">01</span> · install</p>
+  <h2>Build from source</h2>
+  <p>v0.0.1 is not on npm yet. Once it is, <code>bunx ztsc</code> / <code>npx ztsc</code> will
+  work with no install step. Until then, build from source — the only requirement is
+  <a href="https://ziglang.org">Zig</a> 0.16.0. There are no dependencies to fetch:
+  <code>build.zig.zon</code> lists none, and the source uses nothing but the Zig standard
+  library.</p>
+  <pre><code>git clone https://github.com/gustavoschmidt/ztsc
+cd ztsc
+zig build -Doptimize=ReleaseFast   # -&gt; zig-out/bin/ztsc</code></pre>
+  <p>A debug build is just <code>zig build</code>; <code>zig build test</code> runs the unit
+  tests and the 388-case differential conformance suite.</p>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <p class="eyebrow"><span class="n">02</span> · invocation</p>
+  <h2>Point it at a project</h2>
+  <pre><code>ztsc                       # finds tsconfig.json in cwd or a parent
+ztsc -p path/to/project    # explicit tsconfig (file or directory)
+ztsc src/main.ts           # or explicit entry files</code></pre>
+  <p>With no files, ztsc looks for <code>tsconfig.json</code> in the current directory and its
+  parents. Imports and triple-slash references are discovered from the entry points
+  automatically, including through <code>node_modules</code> packages and <code>@types</code>.</p>
+
+  <h3>Options</h3>
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th>flag</th><th>what it does</th></tr></thead>
+    <tbody>
+      <tr><td class="num"><code>-p, --project &lt;path&gt;</code></td><td>use the <code>tsconfig.json</code> at <code>&lt;path&gt;</code> (file or directory)</td></tr>
+      <tr><td class="num"><code>--pretty[=true|false]</code></td><td>tsc-style colored diagnostics with source excerpts (default: on when stderr is a TTY)</td></tr>
+      <tr><td class="num"><code>--verbose</code></td><td>print notes about accepted-but-ignored tsconfig options</td></tr>
+      <tr><td class="num"><code>--noLib</code></td><td>skip the built-in esnext lib — no globals, no primitive/array methods (matches tsc)</td></tr>
+      <tr><td class="num"><code>--workers=N</code></td><td>worker threads for the front end (default: CPU count)</td></tr>
+      <tr><td class="num"><code>--checkers=N</code></td><td>independent checker instances (default: min(4, CPUs)); output is byte-identical for any N</td></tr>
+      <tr><td class="num"><code>-h, --help</code></td><td>print help and exit</td></tr>
+      <tr><td class="num"><code>--version</code></td><td>print version and exit</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>Introspection &amp; benchmark aids</h3>
+  <p>These exist because the project's performance claims are measured, not guessed — the same
+  flags that produced the published numbers ship in the binary:</p>
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th>flag</th><th>what it does</th></tr></thead>
+    <tbody>
+      <tr><td class="num"><code>--timing</code></td><td>per-phase wall-clock timings (load / scan / parse / bind / resolve / link / check)</td></tr>
+      <tr><td class="num"><code>--memory</code></td><td>arena and memory statistics: bytes per token / node / type, cache hit rates, heap total</td></tr>
+      <tr><td class="num"><code>--census</code></td><td>tally out-of-subset constructs by frequency — run it on your codebase to see exactly what ztsc can't check yet</td></tr>
+      <tr><td class="num"><code>--dump-ast</code></td><td>S-expression parse trees (golden-test format)</td></tr>
+      <tr><td class="num"><code>--dump-symbols</code></td><td>binder scope/symbol dumps</td></tr>
+      <tr><td class="num"><code>--dump-types</code></td><td>per-declaration checked types</td></tr>
+      <tr><td class="num"><code>--repeat=N</code></td><td>scan/parse/bind each file N times (benchmark aid)</td></tr>
+      <tr><td class="num"><code>--no-resolve-cache</code></td><td>disable the module-resolution memo (benchmark aid)</td></tr>
+      <tr><td class="num"><code>--no-frozen-store</code></td><td>disable the shared frozen base type store (benchmark aid / oracle)</td></tr>
+      <tr><td class="num"><code>--no-inst-cache</code></td><td>disable instantiation caching, re-run every substitution (benchmark aid / oracle)</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <p class="eyebrow"><span class="n">03</span> · configuration</p>
+  <h2>The tsconfig subset</h2>
+  <p>ztsc reads the options that determine <em>what to check</em>; everything else is accepted
+  and ignored (<code>--verbose</code> tells you exactly which options were ignored):</p>
+  <ul>
+    <li><code>files</code>, <code>include</code> / <code>exclude</code> — glob-driven file
+    selection, tsc-compatible semantics.</li>
+    <li><code>baseUrl</code> and <code>paths</code> — path-mapped module resolution.</li>
+    <li><strong>Strict mode only.</strong> ztsc always checks with
+    <code>strictNullChecks</code>-style semantics; there is no loose mode.</li>
+  </ul>
+  <p>The standard library is built into the binary: the real TypeScript 7.0.2
+  <code>lib.esnext</code> reference chain (ES core through esnext — no DOM). There is no
+  <code>lib</code> option to configure; <code>--noLib</code> turns it off entirely.</p>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <p class="eyebrow"><span class="n">04</span> · output</p>
+  <h2>Diagnostics and exit codes</h2>
+  <p>Diagnostics match the TypeScript compiler's codes and messages, with tsc-style source
+  excerpts when <code>--pretty</code> is on:</p>
+  <pre><code>demo.ts:1:19 - error TS2322: Type 'string' is not assignable to type 'number'.
+
+1 const n: number = "hi";
+                    ~~~~</code></pre>
+  <p>With <code>--pretty=false</code> you get one machine-friendly line per diagnostic. Either
+  way, output is <strong>deterministic</strong>: diagnostics print per file in discovery order,
+  position-sorted, and are byte-identical for any <code>--workers</code> /
+  <code>--checkers</code> value — the conformance suite asserts it.</p>
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th class="num">exit code</th><th>meaning</th></tr></thead>
+    <tbody>
+      <tr><td class="num">0</td><td>no errors</td></tr>
+      <tr><td class="num">1</td><td>type or syntax errors reported</td></tr>
+      <tr><td class="num">2</td><td>usage, config, or file-system errors</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="limitations">
+  <p class="eyebrow"><span class="n">05</span> · limitations</p>
+  <h2>What it doesn't check yet</h2>
+  <p>ztsc checks a large, well-defined subset of strict-mode TypeScript — including the full
+  type-level language: conditional types with <code>infer</code>, mapped types, template-literal
+  types, generics, narrowing, declaration merging, JSX. What it checks, it checks like the
+  TypeScript compiler. The current gaps:</p>
+  <ul>
+    <li><strong>No DOM lib.</strong> The embedded standard library is esnext-only, so browser
+    globals (<code>Response</code>, <code>HTMLElement</code>, <code>fetch</code>, …) are not
+    recognized.</li>
+    <li><strong>No CommonJS interop</strong>: <code>export =</code> and
+    <code>import x = require(…)</code>.</li>
+    <li><strong>No const-symbol computed keys</strong> (<code>[kind]: T</code> with a
+    <code>unique symbol</code> key); well-known symbols like <code>[Symbol.iterator]</code>
+    work.</li>
+    <li><strong>JSX needs a <code>JSX</code> namespace in scope</strong> — resolving it from
+    <code>@types/react</code> and spread-attribute checking are not wired up yet.</li>
+    <li><strong>tsconfig subset</strong>: <code>files</code> / <code>include</code> /
+    <code>exclude</code> / <code>baseUrl</code> / <code>paths</code>, strict mode only; other
+    options are accepted and ignored.</li>
+    <li><strong>No watch mode or LSP yet</strong> — both are planned next, on an architecture
+    built for them.</li>
+    <li>In a handful of known edge cases ztsc misses an error the TypeScript compiler would
+    report. It never reports an error on valid code.</li>
+  </ul>
+  <p>Unsupported syntax produces a clear <em>"not yet supported"</em> diagnostic — never a wrong
+  answer or a crash. Run <code>ztsc --census</code> on your project to get a frequency table of
+  exactly which unsupported constructs it contains.</p>
+</section>
+
+<footer class="sitefoot">
+  ztsc · MIT license ·
+  <a href="https://github.com/gustavoschmidt/ztsc">github.com/gustavoschmidt/ztsc</a>
+</footer>
+
+</div>
+</body>
+</html>
