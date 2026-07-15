@@ -10,11 +10,11 @@
 //!   `node_modules`). Snapshot file `expected` inside the folder with
 //!   lines: `TS<code> <relative-file> <line>`.
 //!
-//! Snapshots are generated from real `tsc 5.5` output (`--strict --noEmit
-//! --target esnext --module esnext --moduleResolution bundler
-//! --allowImportingTsExtensions`; see test/conformance/README.md) and
-//! hand-verified. `#` lines are comments; an empty or absent snapshot
-//! means the case must be diagnostic-free.
+//! Snapshots are generated from real tsgo 7.0.2 output — the pinned native
+//! compiler baseline (`--strict --noEmit --target esnext --module esnext
+//! --moduleResolution bundler --allowImportingTsExtensions`; see
+//! test/conformance/README.md) — and hand-verified. `#` lines are comments;
+//! an empty or absent snapshot means the case must be diagnostic-free.
 //!
 //! Matching: the multiset of (code, file, line) pairs must match exactly.
 //! Message text is informational and not compared (the differential contract
@@ -189,7 +189,7 @@ fn runDirCase(
     for (prog.files, 0..) |*pf, i| {
         // Skip the injected lib (file 0): tsc does not diagnose the default
         // lib, and neither does the CLI (main.zig print loop). The vendored
-        // real 5.5.4 lib is census-clean but trips a few ztsc-incompleteness
+        // real 7.0.2 lib is census-clean but trips a few ztsc-incompleteness
         // diagnostics; suppress them here too so multi-file snapshots stay a
         // fair user-code differential.
         if (std.mem.eql(u8, pf.path, modules.lib_path)) continue;

@@ -1,7 +1,8 @@
 # Conformance suite
 
-Differential test cases for the ztsc checker, validated against real `tsc`.
-Cases are organized by area:
+Differential test cases for the ztsc checker, validated against the real
+TypeScript compiler — the pinned native tsgo 7.0.2 baseline. Cases are
+organized by area:
 
 - `assignability/` — structural assignability, unions, tuples, functions
   (strictFunctionTypes), intersections, index signatures.
@@ -46,19 +47,20 @@ TS<code> <file-relative-to-case-dir> <line>
 
 ## Generating / validating snapshots
 
-Snapshots are produced by running the real TypeScript compiler
-(`strict`, `noEmit`, `target: esnext`, `lib: esnext`, and for module
-resolution `module: esnext`, `moduleResolution: bundler`,
-`allowImportingTsExtensions`) over every case:
+Snapshots are produced by running the real TypeScript compiler — the
+pinned native tsgo 7.0.2 baseline under `bench/baselines/tsgo` (`strict`,
+`noEmit`, `target: esnext`, `lib: esnext,dom`, and for module resolution
+`module: esnext`, `moduleResolution: bundler`,
+`allowImportingTsExtensions`) — over every case:
 
 ```
-node <scratch>/tsc-diff/gen_expected.js test/conformance          # write
-node <scratch>/tsc-diff/gen_expected.js test/conformance --check  # verify
+node test/conformance/gen_expected.js test/conformance          # write
+node test/conformance/gen_expected.js test/conformance --check  # verify
 ```
 
-(`gen_expected.js` lives in this directory; run it with a scratch
-`npm install typescript` prefix on NODE_PATH or copy it next to a
-node_modules containing typescript. node_modules are never checked in.)
+(`gen_expected.js` refuses to run unless the baseline binary reports
+exactly 7.0.2; `cd bench/baselines/tsgo && npm install` if node_modules is
+missing. node_modules are never checked in.)
 
 ## Runner
 

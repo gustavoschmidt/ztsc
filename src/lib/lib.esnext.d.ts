@@ -1,20 +1,19 @@
-// ZTSC embedded lib — real TypeScript 5.5.4 ES-core..esnext surface (M18.2).
+// ZTSC embedded lib — real TypeScript ES-core..esnext surface (M18.2).
+// Assembled from @typescript/typescript-darwin-arm64@7.0.2 by src/lib/gen_lib.js — do not edit by hand.
 //
-// Assembled by concatenating the lib.*.d.ts reference chain rooted at
-// lib.esnext.d.ts (71 files, deps-first), with DOM / webworker / scripthost
-// libs excluded (ztsc is backend-first; tsconfig `lib` selection is
-// post-v0.0.1). This is the same pinned TypeScript version as the
-// differential oracle (5.5.4), so ztsc and tsc see equivalent globals.
+// Concatenation of the lib.*.d.ts reference chain rooted at lib.esnext.d.ts
+// (87 files, deps-first), with DOM / webworker / scripthost libs excluded
+// (ztsc is backend-first; tsconfig `lib` selection is post-v0.0.1). This is
+// the same pinned TypeScript version as the differential oracle, so ztsc and
+// the oracle see equivalent globals.
 //
 // A minimal `console` shim is appended at the end: `console` lives in
-// lib.dom (not esnext), and the conformance harness gives tsc lib.dom purely
-// for `console` — so both sides must resolve it. See src/modules.zig.
+// lib.dom (not esnext), and the conformance harness gives the oracle lib.dom
+// purely for `console` — so both sides must resolve it. See src/modules.zig.
 //
-// --census over this file reports ZERO out-of-subset constructs. Residual
-// ztsc-incompleteness diagnostics against the lib (`intrinsic` string-manip
-// types, `globalThis`, merged-interface duplicate members) are suppressed
-// like tsc suppresses default-lib diagnostics; they degrade the affected lib
-// types to `any` and are recorded as accepted gaps in ROADMAP §M18 item 2.
+// lib.es2025.iterator.d.ts (upstream a module: `export {}` + `declare
+// global`) is rewritten to plain script globals during assembly — see the
+// transform note in gen_lib.js.
 
 //========== lib.decorators.d.ts ==========
 /*! *****************************************************************************
@@ -26,14 +25,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 /**
  * The decorator context types provided to class element decorators.
@@ -129,9 +126,9 @@ interface ClassMethodDecoratorContext<
     };
 
     /**
-     * Adds a callback to be invoked either before static initializers are run (when
-     * decorating a `static` element), or before instance initializers are run (when
-     * decorating a non-`static` element).
+     * Adds a callback to be invoked either after static methods are defined but before
+     * static initializers are run (when decorating a `static` element), or before instance
+     * initializers are run (when decorating a non-`static` element).
      *
      * @example
      * ```ts
@@ -195,9 +192,9 @@ interface ClassGetterDecoratorContext<
     };
 
     /**
-     * Adds a callback to be invoked either before static initializers are run (when
-     * decorating a `static` element), or before instance initializers are run (when
-     * decorating a non-`static` element).
+     * Adds a callback to be invoked either after static methods are defined but before
+     * static initializers are run (when decorating a `static` element), or before instance
+     * initializers are run (when decorating a non-`static` element).
      */
     addInitializer(initializer: (this: This) => void): void;
 
@@ -242,9 +239,9 @@ interface ClassSetterDecoratorContext<
     };
 
     /**
-     * Adds a callback to be invoked either before static initializers are run (when
-     * decorating a `static` element), or before instance initializers are run (when
-     * decorating a non-`static` element).
+     * Adds a callback to be invoked either after static methods are defined but before
+     * static initializers are run (when decorating a `static` element), or before instance
+     * initializers are run (when decorating a non-`static` element).
      */
     addInitializer(initializer: (this: This) => void): void;
 
@@ -298,9 +295,8 @@ interface ClassAccessorDecoratorContext<
     };
 
     /**
-     * Adds a callback to be invoked either before static initializers are run (when
-     * decorating a `static` element), or before instance initializers are run (when
-     * decorating a non-`static` element).
+     * Adds a callback to be invoked immediately after the auto `accessor` being
+     * decorated is initialized (regardless if the `accessor` is `static` or not).
      */
     addInitializer(initializer: (this: This) => void): void;
 
@@ -395,9 +391,8 @@ interface ClassFieldDecoratorContext<
     };
 
     /**
-     * Adds a callback to be invoked either before static initializers are run (when
-     * decorating a `static` element), or before instance initializers are run (when
-     * decorating a non-`static` element).
+     * Adds a callback to be invoked immediately after the field being decorated
+     * is initialized (regardless if the field is `static` or not).
      */
     addInitializer(initializer: (this: This) => void): void;
 
@@ -414,14 +409,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 declare type ClassDecorator = <TFunction extends Function>(target: TFunction) => TFunction | void;
 declare type PropertyDecorator = (target: Object, propertyKey: string | symbol) => void;
@@ -438,14 +431,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 /// <reference lib="decorators" />
 /// <reference lib="decorators.legacy" />
@@ -849,8 +840,8 @@ interface String {
     charAt(pos: number): string;
 
     /**
-     * Returns the Unicode value of the character at the specified location.
-     * @param index The zero-based index of the desired character. If there is no character at the specified index, NaN is returned.
+     * Returns the Unicode value of the character at the specified location, or NaN if the index is out of bounds.
+     * @param index The zero-based index of the desired character.
      */
     charCodeAt(index: number): number;
 
@@ -861,14 +852,14 @@ interface String {
     concat(...strings: string[]): string;
 
     /**
-     * Returns the position of the first occurrence of a substring.
+     * Returns the position of the first occurrence of a substring, or -1 if it is not present.
      * @param searchString The substring to search for in the string
      * @param position The index at which to begin searching the String object. If omitted, search starts at the beginning of the string.
      */
     indexOf(searchString: string, position?: number): number;
 
     /**
-     * Returns the last occurrence of a substring in the string.
+     * Returns the last occurrence of a substring in the string, or -1 if it is not present.
      * @param searchString The substring to search for.
      * @param position The index at which to begin searching. If omitted, the search begins at the end of the string.
      */
@@ -996,19 +987,19 @@ interface Number {
 
     /**
      * Returns a string representing a number in fixed-point notation.
-     * @param fractionDigits Number of digits after the decimal point. Must be in the range 0 - 20, inclusive.
+     * @param fractionDigits Number of digits after the decimal point. Must be in the range 0 - 100, inclusive.
      */
     toFixed(fractionDigits?: number): string;
 
     /**
      * Returns a string containing a number represented in exponential notation.
-     * @param fractionDigits Number of digits after the decimal point. Must be in the range 0 - 20, inclusive.
+     * @param fractionDigits Number of digits after the decimal point. Must be in the range 0 - 100, inclusive.
      */
     toExponential(fractionDigits?: number): string;
 
     /**
      * Returns a string containing a number represented either in exponential or fixed-point notation with a specified number of digits.
-     * @param precision Number of significant digits. Must be in the range 1 - 21, inclusive.
+     * @param precision Number of significant digits. Must be in the range 1 - 100, inclusive.
      */
     toPrecision(precision?: number): string;
 
@@ -1127,7 +1118,7 @@ interface Math {
      */
     atan(x: number): number;
     /**
-     * Returns the angle (in radians) from the X axis to a point.
+     * Returns the angle (in radians) between the X axis and the line going through both the origin and the given point.
      * @param y A numeric expression representing the cartesian y-coordinate.
      * @param x A numeric expression representing the cartesian x-coordinate.
      */
@@ -1589,6 +1580,7 @@ interface JSON {
      * @param text A valid JSON string.
      * @param reviver A function that transforms the results. This function is called for each member of the object.
      * If a member contains nested objects, the nested objects are transformed before the parent object is.
+     * @throws {SyntaxError} If `text` is not valid JSON.
      */
     parse(text: string, reviver?: (this: any, key: string, value: any) => any): any;
     /**
@@ -1596,6 +1588,7 @@ interface JSON {
      * @param value A JavaScript value, usually an object or array, to be converted.
      * @param replacer A function that transforms the results.
      * @param space Adds indentation, white space, and line break characters to the return-value JSON text to make it easier to read.
+     * @throws {TypeError} If a circular reference or a BigInt value is found.
      */
     stringify(value: any, replacer?: (this: any, key: string, value: any) => any, space?: string | number): string;
     /**
@@ -1603,6 +1596,7 @@ interface JSON {
      * @param value A JavaScript value, usually an object or array, to be converted.
      * @param replacer An array of strings and numbers that acts as an approved list for selecting the object properties that will be stringified.
      * @param space Adds indentation, white space, and line break characters to the return-value JSON text to make it easier to read.
+     * @throws {TypeError} If a circular reference or a BigInt value is found.
      */
     stringify(value: any, replacer?: (number | string)[] | null, space?: string | number): string;
 }
@@ -1691,8 +1685,8 @@ interface ReadonlyArray<T> {
     some(predicate: (value: T, index: number, array: readonly T[]) => unknown, thisArg?: any): boolean;
     /**
      * Performs the specified action for each element in an array.
-     * @param callbackfn  A function that accepts up to three arguments. forEach calls the callbackfn function one time for each element in the array.
-     * @param thisArg  An object to which the this keyword can refer in the callbackfn function. If thisArg is omitted, undefined is used as the this value.
+     * @param callbackfn A function that accepts up to three arguments. forEach calls the callbackfn function one time for each element in the array.
+     * @param thisArg An object to which the this keyword can refer in the callbackfn function. If thisArg is omitted, undefined is used as the this value.
      */
     forEach(callbackfn: (value: T, index: number, array: readonly T[]) => void, thisArg?: any): void;
     /**
@@ -1815,7 +1809,7 @@ interface Array<T> {
      * This method mutates the array and returns a reference to the same array.
      * @param compareFn Function used to determine the order of the elements. It is expected to return
      * a negative value if the first argument is less than the second argument, zero if they're equal, and a positive
-     * value otherwise. If omitted, the elements are sorted in ascending, ASCII character order.
+     * value otherwise. If omitted, the elements are sorted in ascending, UTF-16 code unit order.
      * ```ts
      * [11,2,22,1].sort((a, b) => a - b)
      * ```
@@ -1824,14 +1818,18 @@ interface Array<T> {
     /**
      * Removes elements from an array and, if necessary, inserts new elements in their place, returning the deleted elements.
      * @param start The zero-based location in the array from which to start removing elements.
-     * @param deleteCount The number of elements to remove.
+     * @param deleteCount The number of elements to remove. Omitting this argument will remove all elements from the start
+     * paramater location to end of the array. If value of this argument is either a negative number, zero, undefined, or a type
+     * that cannot be converted to an integer, the function will evaluate the argument as zero and not remove any elements.
      * @returns An array containing the elements that were deleted.
      */
     splice(start: number, deleteCount?: number): T[];
     /**
      * Removes elements from an array and, if necessary, inserts new elements in their place, returning the deleted elements.
      * @param start The zero-based location in the array from which to start removing elements.
-     * @param deleteCount The number of elements to remove.
+     * @param deleteCount The number of elements to remove. If value of this argument is either a negative number, zero,
+     * undefined, or a type that cannot be converted to an integer, the function will evaluate the argument as zero and
+     * not remove any elements.
      * @param items Elements to insert into the array in place of the deleted elements.
      * @returns An array containing the elements that were deleted.
      */
@@ -1882,8 +1880,8 @@ interface Array<T> {
     some(predicate: (value: T, index: number, array: T[]) => unknown, thisArg?: any): boolean;
     /**
      * Performs the specified action for each element in an array.
-     * @param callbackfn  A function that accepts up to three arguments. forEach calls the callbackfn function one time for each element in the array.
-     * @param thisArg  An object to which the this keyword can refer in the callbackfn function. If thisArg is omitted, undefined is used as the this value.
+     * @param callbackfn A function that accepts up to three arguments. forEach calls the callbackfn function one time for each element in the array.
+     * @param thisArg An object to which the this keyword can refer in the callbackfn function. If thisArg is omitted, undefined is used as the this value.
      */
     forEach(callbackfn: (value: T, index: number, array: T[]) => void, thisArg?: any): void;
     /**
@@ -2132,7 +2130,7 @@ interface ArrayBuffer {
     /**
      * Returns a section of an ArrayBuffer.
      */
-    slice(begin: number, end?: number): ArrayBuffer;
+    slice(begin?: number, end?: number): ArrayBuffer;
 }
 
 /**
@@ -2150,25 +2148,25 @@ interface ArrayBufferConstructor {
 }
 declare var ArrayBuffer: ArrayBufferConstructor;
 
-interface ArrayBufferView {
+interface ArrayBufferView<TArrayBuffer extends ArrayBufferLike = ArrayBufferLike> {
     /**
      * The ArrayBuffer instance referenced by the array.
      */
-    buffer: ArrayBufferLike;
+    readonly buffer: TArrayBuffer;
 
     /**
      * The length in bytes of the array.
      */
-    byteLength: number;
+    readonly byteLength: number;
 
     /**
      * The offset in bytes of the array.
      */
-    byteOffset: number;
+    readonly byteOffset: number;
 }
 
-interface DataView {
-    readonly buffer: ArrayBuffer;
+interface DataView<TArrayBuffer extends ArrayBufferLike = ArrayBufferLike> {
+    readonly buffer: TArrayBuffer;
     readonly byteLength: number;
     readonly byteOffset: number;
     /**
@@ -2294,10 +2292,9 @@ interface DataView {
      */
     setUint32(byteOffset: number, value: number, littleEndian?: boolean): void;
 }
-
 interface DataViewConstructor {
-    readonly prototype: DataView;
-    new (buffer: ArrayBufferLike & { BYTES_PER_ELEMENT?: never; }, byteOffset?: number, byteLength?: number): DataView;
+    readonly prototype: DataView<ArrayBufferLike>;
+    new <TArrayBuffer extends ArrayBufferLike & { BYTES_PER_ELEMENT?: never; }>(buffer: TArrayBuffer, byteOffset?: number, byteLength?: number): DataView<TArrayBuffer>;
 }
 declare var DataView: DataViewConstructor;
 
@@ -2305,7 +2302,7 @@ declare var DataView: DataViewConstructor;
  * A typed array of 8-bit integer values. The contents are initialized to 0. If the requested
  * number of bytes could not be allocated an exception is raised.
  */
-interface Int8Array {
+interface Int8Array<TArrayBuffer extends ArrayBufferLike = ArrayBufferLike> {
     /**
      * The size in bytes of each element in the array.
      */
@@ -2314,7 +2311,7 @@ interface Int8Array {
     /**
      * The ArrayBuffer instance referenced by the array.
      */
-    readonly buffer: ArrayBufferLike;
+    readonly buffer: TArrayBuffer;
 
     /**
      * The length in bytes of the array.
@@ -2345,7 +2342,7 @@ interface Int8Array {
      * @param thisArg An object to which the this keyword can refer in the predicate function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    every(predicate: (value: number, index: number, array: Int8Array) => unknown, thisArg?: any): boolean;
+    every(predicate: (value: number, index: number, array: this) => unknown, thisArg?: any): boolean;
 
     /**
      * Changes all array elements from `start` to `end` index to a static `value` and returns the modified array
@@ -2364,7 +2361,7 @@ interface Int8Array {
      * @param thisArg An object to which the this keyword can refer in the predicate function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    filter(predicate: (value: number, index: number, array: Int8Array) => any, thisArg?: any): Int8Array;
+    filter(predicate: (value: number, index: number, array: this) => any, thisArg?: any): Int8Array<ArrayBuffer>;
 
     /**
      * Returns the value of the first element in the array where predicate is true, and undefined
@@ -2375,7 +2372,7 @@ interface Int8Array {
      * @param thisArg If provided, it will be used as the this value for each invocation of
      * predicate. If it is not provided, undefined is used instead.
      */
-    find(predicate: (value: number, index: number, obj: Int8Array) => boolean, thisArg?: any): number | undefined;
+    find(predicate: (value: number, index: number, obj: this) => boolean, thisArg?: any): number | undefined;
 
     /**
      * Returns the index of the first element in the array where predicate is true, and -1
@@ -2386,22 +2383,22 @@ interface Int8Array {
      * @param thisArg If provided, it will be used as the this value for each invocation of
      * predicate. If it is not provided, undefined is used instead.
      */
-    findIndex(predicate: (value: number, index: number, obj: Int8Array) => boolean, thisArg?: any): number;
+    findIndex(predicate: (value: number, index: number, obj: this) => boolean, thisArg?: any): number;
 
     /**
      * Performs the specified action for each element in an array.
-     * @param callbackfn  A function that accepts up to three arguments. forEach calls the
+     * @param callbackfn A function that accepts up to three arguments. forEach calls the
      * callbackfn function one time for each element in the array.
-     * @param thisArg  An object to which the this keyword can refer in the callbackfn function.
+     * @param thisArg An object to which the this keyword can refer in the callbackfn function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    forEach(callbackfn: (value: number, index: number, array: Int8Array) => void, thisArg?: any): void;
+    forEach(callbackfn: (value: number, index: number, array: this) => void, thisArg?: any): void;
 
     /**
-     * Returns the index of the first occurrence of a value in an array.
+     * Returns the index of the first occurrence of a value in an array, or -1 if it is not present.
      * @param searchElement The value to locate in the array.
      * @param fromIndex The array index at which to begin the search. If fromIndex is omitted, the
-     *  search starts at index 0.
+     * search starts at index 0.
      */
     indexOf(searchElement: number, fromIndex?: number): number;
 
@@ -2413,7 +2410,7 @@ interface Int8Array {
     join(separator?: string): string;
 
     /**
-     * Returns the index of the last occurrence of a value in an array.
+     * Returns the index of the last occurrence of a value in an array, or -1 if it is not present.
      * @param searchElement The value to locate in the array.
      * @param fromIndex The array index at which to begin the search. If fromIndex is omitted, the
      * search starts at index 0.
@@ -2433,7 +2430,7 @@ interface Int8Array {
      * @param thisArg An object to which the this keyword can refer in the callbackfn function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    map(callbackfn: (value: number, index: number, array: Int8Array) => number, thisArg?: any): Int8Array;
+    map(callbackfn: (value: number, index: number, array: this) => number, thisArg?: any): Int8Array<ArrayBuffer>;
 
     /**
      * Calls the specified callback function for all the elements in an array. The return value of
@@ -2445,8 +2442,8 @@ interface Int8Array {
      * the accumulation. The first call to the callbackfn function provides this value as an argument
      * instead of an array value.
      */
-    reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: Int8Array) => number): number;
-    reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: Int8Array) => number, initialValue: number): number;
+    reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number): number;
+    reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number, initialValue: number): number;
 
     /**
      * Calls the specified callback function for all the elements in an array. The return value of
@@ -2458,7 +2455,7 @@ interface Int8Array {
      * the accumulation. The first call to the callbackfn function provides this value as an argument
      * instead of an array value.
      */
-    reduce<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: Int8Array) => U, initialValue: U): U;
+    reduce<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: this) => U, initialValue: U): U;
 
     /**
      * Calls the specified callback function for all the elements in an array, in descending order.
@@ -2470,8 +2467,8 @@ interface Int8Array {
      * the accumulation. The first call to the callbackfn function provides this value as an
      * argument instead of an array value.
      */
-    reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: Int8Array) => number): number;
-    reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: Int8Array) => number, initialValue: number): number;
+    reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number): number;
+    reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number, initialValue: number): number;
 
     /**
      * Calls the specified callback function for all the elements in an array, in descending order.
@@ -2483,12 +2480,12 @@ interface Int8Array {
      * the accumulation. The first call to the callbackfn function provides this value as an argument
      * instead of an array value.
      */
-    reduceRight<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: Int8Array) => U, initialValue: U): U;
+    reduceRight<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: this) => U, initialValue: U): U;
 
     /**
      * Reverses the elements in an Array.
      */
-    reverse(): Int8Array;
+    reverse(): this;
 
     /**
      * Sets a value or an array of values.
@@ -2502,7 +2499,7 @@ interface Int8Array {
      * @param start The beginning of the specified portion of the array.
      * @param end The end of the specified portion of the array. This is exclusive of the element at the index 'end'.
      */
-    slice(start?: number, end?: number): Int8Array;
+    slice(start?: number, end?: number): Int8Array<ArrayBuffer>;
 
     /**
      * Determines whether the specified callback function returns true for any element of an array.
@@ -2512,7 +2509,7 @@ interface Int8Array {
      * @param thisArg An object to which the this keyword can refer in the predicate function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    some(predicate: (value: number, index: number, array: Int8Array) => unknown, thisArg?: any): boolean;
+    some(predicate: (value: number, index: number, array: this) => unknown, thisArg?: any): boolean;
 
     /**
      * Sorts an array.
@@ -2531,7 +2528,7 @@ interface Int8Array {
      * @param begin The index of the beginning of the array.
      * @param end The index of the end of the array.
      */
-    subarray(begin?: number, end?: number): Int8Array;
+    subarray(begin?: number, end?: number): Int8Array<TArrayBuffer>;
 
     /**
      * Converts a number to a string by using the current locale.
@@ -2544,15 +2541,17 @@ interface Int8Array {
     toString(): string;
 
     /** Returns the primitive value of the specified object. */
-    valueOf(): Int8Array;
+    valueOf(): this;
 
     [index: number]: number;
 }
 interface Int8ArrayConstructor {
-    readonly prototype: Int8Array;
-    new (length: number): Int8Array;
-    new (array: ArrayLike<number> | ArrayBufferLike): Int8Array;
-    new (buffer: ArrayBufferLike, byteOffset?: number, length?: number): Int8Array;
+    readonly prototype: Int8Array<ArrayBufferLike>;
+    new (length: number): Int8Array<ArrayBuffer>;
+    new (array: ArrayLike<number>): Int8Array<ArrayBuffer>;
+    new <TArrayBuffer extends ArrayBufferLike = ArrayBuffer>(buffer: TArrayBuffer, byteOffset?: number, length?: number): Int8Array<TArrayBuffer>;
+    new (buffer: ArrayBuffer, byteOffset?: number, length?: number): Int8Array<ArrayBuffer>;
+    new (array: ArrayLike<number> | ArrayBuffer): Int8Array<ArrayBuffer>;
 
     /**
      * The size in bytes of each element in the array.
@@ -2563,21 +2562,21 @@ interface Int8ArrayConstructor {
      * Returns a new array from a set of elements.
      * @param items A set of elements to include in the new array object.
      */
-    of(...items: number[]): Int8Array;
+    of(...items: number[]): Int8Array<ArrayBuffer>;
 
     /**
      * Creates an array from an array-like or iterable object.
-     * @param arrayLike An array-like or iterable object to convert to an array.
+     * @param arrayLike An array-like object to convert to an array.
      */
-    from(arrayLike: ArrayLike<number>): Int8Array;
+    from(arrayLike: ArrayLike<number>): Int8Array<ArrayBuffer>;
 
     /**
      * Creates an array from an array-like or iterable object.
-     * @param arrayLike An array-like or iterable object to convert to an array.
+     * @param arrayLike An array-like object to convert to an array.
      * @param mapfn A mapping function to call on every element of the array.
      * @param thisArg Value of 'this' used to invoke the mapfn.
      */
-    from<T>(arrayLike: ArrayLike<T>, mapfn: (v: T, k: number) => number, thisArg?: any): Int8Array;
+    from<T>(arrayLike: ArrayLike<T>, mapfn: (v: T, k: number) => number, thisArg?: any): Int8Array<ArrayBuffer>;
 }
 declare var Int8Array: Int8ArrayConstructor;
 
@@ -2585,7 +2584,7 @@ declare var Int8Array: Int8ArrayConstructor;
  * A typed array of 8-bit unsigned integer values. The contents are initialized to 0. If the
  * requested number of bytes could not be allocated an exception is raised.
  */
-interface Uint8Array {
+interface Uint8Array<TArrayBuffer extends ArrayBufferLike = ArrayBufferLike> {
     /**
      * The size in bytes of each element in the array.
      */
@@ -2594,7 +2593,7 @@ interface Uint8Array {
     /**
      * The ArrayBuffer instance referenced by the array.
      */
-    readonly buffer: ArrayBufferLike;
+    readonly buffer: TArrayBuffer;
 
     /**
      * The length in bytes of the array.
@@ -2625,7 +2624,7 @@ interface Uint8Array {
      * @param thisArg An object to which the this keyword can refer in the predicate function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    every(predicate: (value: number, index: number, array: Uint8Array) => unknown, thisArg?: any): boolean;
+    every(predicate: (value: number, index: number, array: this) => unknown, thisArg?: any): boolean;
 
     /**
      * Changes all array elements from `start` to `end` index to a static `value` and returns the modified array
@@ -2644,7 +2643,7 @@ interface Uint8Array {
      * @param thisArg An object to which the this keyword can refer in the predicate function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    filter(predicate: (value: number, index: number, array: Uint8Array) => any, thisArg?: any): Uint8Array;
+    filter(predicate: (value: number, index: number, array: this) => any, thisArg?: any): Uint8Array<ArrayBuffer>;
 
     /**
      * Returns the value of the first element in the array where predicate is true, and undefined
@@ -2655,7 +2654,7 @@ interface Uint8Array {
      * @param thisArg If provided, it will be used as the this value for each invocation of
      * predicate. If it is not provided, undefined is used instead.
      */
-    find(predicate: (value: number, index: number, obj: Uint8Array) => boolean, thisArg?: any): number | undefined;
+    find(predicate: (value: number, index: number, obj: this) => boolean, thisArg?: any): number | undefined;
 
     /**
      * Returns the index of the first element in the array where predicate is true, and -1
@@ -2666,22 +2665,22 @@ interface Uint8Array {
      * @param thisArg If provided, it will be used as the this value for each invocation of
      * predicate. If it is not provided, undefined is used instead.
      */
-    findIndex(predicate: (value: number, index: number, obj: Uint8Array) => boolean, thisArg?: any): number;
+    findIndex(predicate: (value: number, index: number, obj: this) => boolean, thisArg?: any): number;
 
     /**
      * Performs the specified action for each element in an array.
-     * @param callbackfn  A function that accepts up to three arguments. forEach calls the
+     * @param callbackfn A function that accepts up to three arguments. forEach calls the
      * callbackfn function one time for each element in the array.
-     * @param thisArg  An object to which the this keyword can refer in the callbackfn function.
+     * @param thisArg An object to which the this keyword can refer in the callbackfn function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    forEach(callbackfn: (value: number, index: number, array: Uint8Array) => void, thisArg?: any): void;
+    forEach(callbackfn: (value: number, index: number, array: this) => void, thisArg?: any): void;
 
     /**
-     * Returns the index of the first occurrence of a value in an array.
+     * Returns the index of the first occurrence of a value in an array, or -1 if it is not present.
      * @param searchElement The value to locate in the array.
      * @param fromIndex The array index at which to begin the search. If fromIndex is omitted, the
-     *  search starts at index 0.
+     * search starts at index 0.
      */
     indexOf(searchElement: number, fromIndex?: number): number;
 
@@ -2693,7 +2692,7 @@ interface Uint8Array {
     join(separator?: string): string;
 
     /**
-     * Returns the index of the last occurrence of a value in an array.
+     * Returns the index of the last occurrence of a value in an array, or -1 if it is not present.
      * @param searchElement The value to locate in the array.
      * @param fromIndex The array index at which to begin the search. If fromIndex is omitted, the
      * search starts at index 0.
@@ -2713,7 +2712,7 @@ interface Uint8Array {
      * @param thisArg An object to which the this keyword can refer in the callbackfn function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    map(callbackfn: (value: number, index: number, array: Uint8Array) => number, thisArg?: any): Uint8Array;
+    map(callbackfn: (value: number, index: number, array: this) => number, thisArg?: any): Uint8Array<ArrayBuffer>;
 
     /**
      * Calls the specified callback function for all the elements in an array. The return value of
@@ -2725,8 +2724,8 @@ interface Uint8Array {
      * the accumulation. The first call to the callbackfn function provides this value as an argument
      * instead of an array value.
      */
-    reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: Uint8Array) => number): number;
-    reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: Uint8Array) => number, initialValue: number): number;
+    reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number): number;
+    reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number, initialValue: number): number;
 
     /**
      * Calls the specified callback function for all the elements in an array. The return value of
@@ -2738,7 +2737,7 @@ interface Uint8Array {
      * the accumulation. The first call to the callbackfn function provides this value as an argument
      * instead of an array value.
      */
-    reduce<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: Uint8Array) => U, initialValue: U): U;
+    reduce<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: this) => U, initialValue: U): U;
 
     /**
      * Calls the specified callback function for all the elements in an array, in descending order.
@@ -2750,8 +2749,8 @@ interface Uint8Array {
      * the accumulation. The first call to the callbackfn function provides this value as an
      * argument instead of an array value.
      */
-    reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: Uint8Array) => number): number;
-    reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: Uint8Array) => number, initialValue: number): number;
+    reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number): number;
+    reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number, initialValue: number): number;
 
     /**
      * Calls the specified callback function for all the elements in an array, in descending order.
@@ -2763,12 +2762,12 @@ interface Uint8Array {
      * the accumulation. The first call to the callbackfn function provides this value as an argument
      * instead of an array value.
      */
-    reduceRight<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: Uint8Array) => U, initialValue: U): U;
+    reduceRight<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: this) => U, initialValue: U): U;
 
     /**
      * Reverses the elements in an Array.
      */
-    reverse(): Uint8Array;
+    reverse(): this;
 
     /**
      * Sets a value or an array of values.
@@ -2782,7 +2781,7 @@ interface Uint8Array {
      * @param start The beginning of the specified portion of the array.
      * @param end The end of the specified portion of the array. This is exclusive of the element at the index 'end'.
      */
-    slice(start?: number, end?: number): Uint8Array;
+    slice(start?: number, end?: number): Uint8Array<ArrayBuffer>;
 
     /**
      * Determines whether the specified callback function returns true for any element of an array.
@@ -2792,7 +2791,7 @@ interface Uint8Array {
      * @param thisArg An object to which the this keyword can refer in the predicate function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    some(predicate: (value: number, index: number, array: Uint8Array) => unknown, thisArg?: any): boolean;
+    some(predicate: (value: number, index: number, array: this) => unknown, thisArg?: any): boolean;
 
     /**
      * Sorts an array.
@@ -2811,7 +2810,7 @@ interface Uint8Array {
      * @param begin The index of the beginning of the array.
      * @param end The index of the end of the array.
      */
-    subarray(begin?: number, end?: number): Uint8Array;
+    subarray(begin?: number, end?: number): Uint8Array<TArrayBuffer>;
 
     /**
      * Converts a number to a string by using the current locale.
@@ -2824,16 +2823,17 @@ interface Uint8Array {
     toString(): string;
 
     /** Returns the primitive value of the specified object. */
-    valueOf(): Uint8Array;
+    valueOf(): this;
 
     [index: number]: number;
 }
-
 interface Uint8ArrayConstructor {
-    readonly prototype: Uint8Array;
-    new (length: number): Uint8Array;
-    new (array: ArrayLike<number> | ArrayBufferLike): Uint8Array;
-    new (buffer: ArrayBufferLike, byteOffset?: number, length?: number): Uint8Array;
+    readonly prototype: Uint8Array<ArrayBufferLike>;
+    new (length: number): Uint8Array<ArrayBuffer>;
+    new (array: ArrayLike<number>): Uint8Array<ArrayBuffer>;
+    new <TArrayBuffer extends ArrayBufferLike = ArrayBuffer>(buffer: TArrayBuffer, byteOffset?: number, length?: number): Uint8Array<TArrayBuffer>;
+    new (buffer: ArrayBuffer, byteOffset?: number, length?: number): Uint8Array<ArrayBuffer>;
+    new (array: ArrayLike<number> | ArrayBuffer): Uint8Array<ArrayBuffer>;
 
     /**
      * The size in bytes of each element in the array.
@@ -2844,21 +2844,21 @@ interface Uint8ArrayConstructor {
      * Returns a new array from a set of elements.
      * @param items A set of elements to include in the new array object.
      */
-    of(...items: number[]): Uint8Array;
+    of(...items: number[]): Uint8Array<ArrayBuffer>;
 
     /**
      * Creates an array from an array-like or iterable object.
-     * @param arrayLike An array-like or iterable object to convert to an array.
+     * @param arrayLike An array-like object to convert to an array.
      */
-    from(arrayLike: ArrayLike<number>): Uint8Array;
+    from(arrayLike: ArrayLike<number>): Uint8Array<ArrayBuffer>;
 
     /**
      * Creates an array from an array-like or iterable object.
-     * @param arrayLike An array-like or iterable object to convert to an array.
+     * @param arrayLike An array-like object to convert to an array.
      * @param mapfn A mapping function to call on every element of the array.
      * @param thisArg Value of 'this' used to invoke the mapfn.
      */
-    from<T>(arrayLike: ArrayLike<T>, mapfn: (v: T, k: number) => number, thisArg?: any): Uint8Array;
+    from<T>(arrayLike: ArrayLike<T>, mapfn: (v: T, k: number) => number, thisArg?: any): Uint8Array<ArrayBuffer>;
 }
 declare var Uint8Array: Uint8ArrayConstructor;
 
@@ -2866,7 +2866,7 @@ declare var Uint8Array: Uint8ArrayConstructor;
  * A typed array of 8-bit unsigned integer (clamped) values. The contents are initialized to 0.
  * If the requested number of bytes could not be allocated an exception is raised.
  */
-interface Uint8ClampedArray {
+interface Uint8ClampedArray<TArrayBuffer extends ArrayBufferLike = ArrayBufferLike> {
     /**
      * The size in bytes of each element in the array.
      */
@@ -2875,7 +2875,7 @@ interface Uint8ClampedArray {
     /**
      * The ArrayBuffer instance referenced by the array.
      */
-    readonly buffer: ArrayBufferLike;
+    readonly buffer: TArrayBuffer;
 
     /**
      * The length in bytes of the array.
@@ -2906,7 +2906,7 @@ interface Uint8ClampedArray {
      * @param thisArg An object to which the this keyword can refer in the predicate function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    every(predicate: (value: number, index: number, array: Uint8ClampedArray) => unknown, thisArg?: any): boolean;
+    every(predicate: (value: number, index: number, array: this) => unknown, thisArg?: any): boolean;
 
     /**
      * Changes all array elements from `start` to `end` index to a static `value` and returns the modified array
@@ -2925,7 +2925,7 @@ interface Uint8ClampedArray {
      * @param thisArg An object to which the this keyword can refer in the predicate function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    filter(predicate: (value: number, index: number, array: Uint8ClampedArray) => any, thisArg?: any): Uint8ClampedArray;
+    filter(predicate: (value: number, index: number, array: this) => any, thisArg?: any): Uint8ClampedArray<ArrayBuffer>;
 
     /**
      * Returns the value of the first element in the array where predicate is true, and undefined
@@ -2936,7 +2936,7 @@ interface Uint8ClampedArray {
      * @param thisArg If provided, it will be used as the this value for each invocation of
      * predicate. If it is not provided, undefined is used instead.
      */
-    find(predicate: (value: number, index: number, obj: Uint8ClampedArray) => boolean, thisArg?: any): number | undefined;
+    find(predicate: (value: number, index: number, obj: this) => boolean, thisArg?: any): number | undefined;
 
     /**
      * Returns the index of the first element in the array where predicate is true, and -1
@@ -2947,22 +2947,22 @@ interface Uint8ClampedArray {
      * @param thisArg If provided, it will be used as the this value for each invocation of
      * predicate. If it is not provided, undefined is used instead.
      */
-    findIndex(predicate: (value: number, index: number, obj: Uint8ClampedArray) => boolean, thisArg?: any): number;
+    findIndex(predicate: (value: number, index: number, obj: this) => boolean, thisArg?: any): number;
 
     /**
      * Performs the specified action for each element in an array.
-     * @param callbackfn  A function that accepts up to three arguments. forEach calls the
+     * @param callbackfn A function that accepts up to three arguments. forEach calls the
      * callbackfn function one time for each element in the array.
-     * @param thisArg  An object to which the this keyword can refer in the callbackfn function.
+     * @param thisArg An object to which the this keyword can refer in the callbackfn function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    forEach(callbackfn: (value: number, index: number, array: Uint8ClampedArray) => void, thisArg?: any): void;
+    forEach(callbackfn: (value: number, index: number, array: this) => void, thisArg?: any): void;
 
     /**
-     * Returns the index of the first occurrence of a value in an array.
+     * Returns the index of the first occurrence of a value in an array, or -1 if it is not present.
      * @param searchElement The value to locate in the array.
      * @param fromIndex The array index at which to begin the search. If fromIndex is omitted, the
-     *  search starts at index 0.
+     * search starts at index 0.
      */
     indexOf(searchElement: number, fromIndex?: number): number;
 
@@ -2974,7 +2974,7 @@ interface Uint8ClampedArray {
     join(separator?: string): string;
 
     /**
-     * Returns the index of the last occurrence of a value in an array.
+     * Returns the index of the last occurrence of a value in an array, or -1 if it is not present.
      * @param searchElement The value to locate in the array.
      * @param fromIndex The array index at which to begin the search. If fromIndex is omitted, the
      * search starts at index 0.
@@ -2994,7 +2994,7 @@ interface Uint8ClampedArray {
      * @param thisArg An object to which the this keyword can refer in the callbackfn function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    map(callbackfn: (value: number, index: number, array: Uint8ClampedArray) => number, thisArg?: any): Uint8ClampedArray;
+    map(callbackfn: (value: number, index: number, array: this) => number, thisArg?: any): Uint8ClampedArray<ArrayBuffer>;
 
     /**
      * Calls the specified callback function for all the elements in an array. The return value of
@@ -3006,8 +3006,8 @@ interface Uint8ClampedArray {
      * the accumulation. The first call to the callbackfn function provides this value as an argument
      * instead of an array value.
      */
-    reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: Uint8ClampedArray) => number): number;
-    reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: Uint8ClampedArray) => number, initialValue: number): number;
+    reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number): number;
+    reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number, initialValue: number): number;
 
     /**
      * Calls the specified callback function for all the elements in an array. The return value of
@@ -3019,7 +3019,7 @@ interface Uint8ClampedArray {
      * the accumulation. The first call to the callbackfn function provides this value as an argument
      * instead of an array value.
      */
-    reduce<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: Uint8ClampedArray) => U, initialValue: U): U;
+    reduce<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: this) => U, initialValue: U): U;
 
     /**
      * Calls the specified callback function for all the elements in an array, in descending order.
@@ -3031,8 +3031,8 @@ interface Uint8ClampedArray {
      * the accumulation. The first call to the callbackfn function provides this value as an
      * argument instead of an array value.
      */
-    reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: Uint8ClampedArray) => number): number;
-    reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: Uint8ClampedArray) => number, initialValue: number): number;
+    reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number): number;
+    reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number, initialValue: number): number;
 
     /**
      * Calls the specified callback function for all the elements in an array, in descending order.
@@ -3044,12 +3044,12 @@ interface Uint8ClampedArray {
      * the accumulation. The first call to the callbackfn function provides this value as an argument
      * instead of an array value.
      */
-    reduceRight<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: Uint8ClampedArray) => U, initialValue: U): U;
+    reduceRight<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: this) => U, initialValue: U): U;
 
     /**
      * Reverses the elements in an Array.
      */
-    reverse(): Uint8ClampedArray;
+    reverse(): this;
 
     /**
      * Sets a value or an array of values.
@@ -3063,7 +3063,7 @@ interface Uint8ClampedArray {
      * @param start The beginning of the specified portion of the array.
      * @param end The end of the specified portion of the array. This is exclusive of the element at the index 'end'.
      */
-    slice(start?: number, end?: number): Uint8ClampedArray;
+    slice(start?: number, end?: number): Uint8ClampedArray<ArrayBuffer>;
 
     /**
      * Determines whether the specified callback function returns true for any element of an array.
@@ -3073,7 +3073,7 @@ interface Uint8ClampedArray {
      * @param thisArg An object to which the this keyword can refer in the predicate function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    some(predicate: (value: number, index: number, array: Uint8ClampedArray) => unknown, thisArg?: any): boolean;
+    some(predicate: (value: number, index: number, array: this) => unknown, thisArg?: any): boolean;
 
     /**
      * Sorts an array.
@@ -3092,7 +3092,7 @@ interface Uint8ClampedArray {
      * @param begin The index of the beginning of the array.
      * @param end The index of the end of the array.
      */
-    subarray(begin?: number, end?: number): Uint8ClampedArray;
+    subarray(begin?: number, end?: number): Uint8ClampedArray<TArrayBuffer>;
 
     /**
      * Converts a number to a string by using the current locale.
@@ -3105,16 +3105,17 @@ interface Uint8ClampedArray {
     toString(): string;
 
     /** Returns the primitive value of the specified object. */
-    valueOf(): Uint8ClampedArray;
+    valueOf(): this;
 
     [index: number]: number;
 }
-
 interface Uint8ClampedArrayConstructor {
-    readonly prototype: Uint8ClampedArray;
-    new (length: number): Uint8ClampedArray;
-    new (array: ArrayLike<number> | ArrayBufferLike): Uint8ClampedArray;
-    new (buffer: ArrayBufferLike, byteOffset?: number, length?: number): Uint8ClampedArray;
+    readonly prototype: Uint8ClampedArray<ArrayBufferLike>;
+    new (length: number): Uint8ClampedArray<ArrayBuffer>;
+    new (array: ArrayLike<number>): Uint8ClampedArray<ArrayBuffer>;
+    new <TArrayBuffer extends ArrayBufferLike = ArrayBuffer>(buffer: TArrayBuffer, byteOffset?: number, length?: number): Uint8ClampedArray<TArrayBuffer>;
+    new (buffer: ArrayBuffer, byteOffset?: number, length?: number): Uint8ClampedArray<ArrayBuffer>;
+    new (array: ArrayLike<number> | ArrayBuffer): Uint8ClampedArray<ArrayBuffer>;
 
     /**
      * The size in bytes of each element in the array.
@@ -3125,21 +3126,21 @@ interface Uint8ClampedArrayConstructor {
      * Returns a new array from a set of elements.
      * @param items A set of elements to include in the new array object.
      */
-    of(...items: number[]): Uint8ClampedArray;
+    of(...items: number[]): Uint8ClampedArray<ArrayBuffer>;
 
     /**
      * Creates an array from an array-like or iterable object.
-     * @param arrayLike An array-like or iterable object to convert to an array.
+     * @param arrayLike An array-like object to convert to an array.
      */
-    from(arrayLike: ArrayLike<number>): Uint8ClampedArray;
+    from(arrayLike: ArrayLike<number>): Uint8ClampedArray<ArrayBuffer>;
 
     /**
      * Creates an array from an array-like or iterable object.
-     * @param arrayLike An array-like or iterable object to convert to an array.
+     * @param arrayLike An array-like object to convert to an array.
      * @param mapfn A mapping function to call on every element of the array.
      * @param thisArg Value of 'this' used to invoke the mapfn.
      */
-    from<T>(arrayLike: ArrayLike<T>, mapfn: (v: T, k: number) => number, thisArg?: any): Uint8ClampedArray;
+    from<T>(arrayLike: ArrayLike<T>, mapfn: (v: T, k: number) => number, thisArg?: any): Uint8ClampedArray<ArrayBuffer>;
 }
 declare var Uint8ClampedArray: Uint8ClampedArrayConstructor;
 
@@ -3147,7 +3148,7 @@ declare var Uint8ClampedArray: Uint8ClampedArrayConstructor;
  * A typed array of 16-bit signed integer values. The contents are initialized to 0. If the
  * requested number of bytes could not be allocated an exception is raised.
  */
-interface Int16Array {
+interface Int16Array<TArrayBuffer extends ArrayBufferLike = ArrayBufferLike> {
     /**
      * The size in bytes of each element in the array.
      */
@@ -3156,7 +3157,7 @@ interface Int16Array {
     /**
      * The ArrayBuffer instance referenced by the array.
      */
-    readonly buffer: ArrayBufferLike;
+    readonly buffer: TArrayBuffer;
 
     /**
      * The length in bytes of the array.
@@ -3187,7 +3188,7 @@ interface Int16Array {
      * @param thisArg An object to which the this keyword can refer in the predicate function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    every(predicate: (value: number, index: number, array: Int16Array) => unknown, thisArg?: any): boolean;
+    every(predicate: (value: number, index: number, array: this) => unknown, thisArg?: any): boolean;
 
     /**
      * Changes all array elements from `start` to `end` index to a static `value` and returns the modified array
@@ -3206,7 +3207,7 @@ interface Int16Array {
      * @param thisArg An object to which the this keyword can refer in the predicate function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    filter(predicate: (value: number, index: number, array: Int16Array) => any, thisArg?: any): Int16Array;
+    filter(predicate: (value: number, index: number, array: this) => any, thisArg?: any): Int16Array<ArrayBuffer>;
 
     /**
      * Returns the value of the first element in the array where predicate is true, and undefined
@@ -3217,7 +3218,7 @@ interface Int16Array {
      * @param thisArg If provided, it will be used as the this value for each invocation of
      * predicate. If it is not provided, undefined is used instead.
      */
-    find(predicate: (value: number, index: number, obj: Int16Array) => boolean, thisArg?: any): number | undefined;
+    find(predicate: (value: number, index: number, obj: this) => boolean, thisArg?: any): number | undefined;
 
     /**
      * Returns the index of the first element in the array where predicate is true, and -1
@@ -3228,21 +3229,21 @@ interface Int16Array {
      * @param thisArg If provided, it will be used as the this value for each invocation of
      * predicate. If it is not provided, undefined is used instead.
      */
-    findIndex(predicate: (value: number, index: number, obj: Int16Array) => boolean, thisArg?: any): number;
+    findIndex(predicate: (value: number, index: number, obj: this) => boolean, thisArg?: any): number;
 
     /**
      * Performs the specified action for each element in an array.
-     * @param callbackfn  A function that accepts up to three arguments. forEach calls the
+     * @param callbackfn A function that accepts up to three arguments. forEach calls the
      * callbackfn function one time for each element in the array.
-     * @param thisArg  An object to which the this keyword can refer in the callbackfn function.
+     * @param thisArg An object to which the this keyword can refer in the callbackfn function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    forEach(callbackfn: (value: number, index: number, array: Int16Array) => void, thisArg?: any): void;
+    forEach(callbackfn: (value: number, index: number, array: this) => void, thisArg?: any): void;
     /**
-     * Returns the index of the first occurrence of a value in an array.
+     * Returns the index of the first occurrence of a value in an array, or -1 if it is not present.
      * @param searchElement The value to locate in the array.
      * @param fromIndex The array index at which to begin the search. If fromIndex is omitted, the
-     *  search starts at index 0.
+     * search starts at index 0.
      */
     indexOf(searchElement: number, fromIndex?: number): number;
 
@@ -3254,7 +3255,7 @@ interface Int16Array {
     join(separator?: string): string;
 
     /**
-     * Returns the index of the last occurrence of a value in an array.
+     * Returns the index of the last occurrence of a value in an array, or -1 if it is not present.
      * @param searchElement The value to locate in the array.
      * @param fromIndex The array index at which to begin the search. If fromIndex is omitted, the
      * search starts at index 0.
@@ -3274,7 +3275,7 @@ interface Int16Array {
      * @param thisArg An object to which the this keyword can refer in the callbackfn function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    map(callbackfn: (value: number, index: number, array: Int16Array) => number, thisArg?: any): Int16Array;
+    map(callbackfn: (value: number, index: number, array: this) => number, thisArg?: any): Int16Array<ArrayBuffer>;
 
     /**
      * Calls the specified callback function for all the elements in an array. The return value of
@@ -3286,8 +3287,8 @@ interface Int16Array {
      * the accumulation. The first call to the callbackfn function provides this value as an argument
      * instead of an array value.
      */
-    reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: Int16Array) => number): number;
-    reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: Int16Array) => number, initialValue: number): number;
+    reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number): number;
+    reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number, initialValue: number): number;
 
     /**
      * Calls the specified callback function for all the elements in an array. The return value of
@@ -3299,7 +3300,7 @@ interface Int16Array {
      * the accumulation. The first call to the callbackfn function provides this value as an argument
      * instead of an array value.
      */
-    reduce<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: Int16Array) => U, initialValue: U): U;
+    reduce<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: this) => U, initialValue: U): U;
 
     /**
      * Calls the specified callback function for all the elements in an array, in descending order.
@@ -3311,8 +3312,8 @@ interface Int16Array {
      * the accumulation. The first call to the callbackfn function provides this value as an
      * argument instead of an array value.
      */
-    reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: Int16Array) => number): number;
-    reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: Int16Array) => number, initialValue: number): number;
+    reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number): number;
+    reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number, initialValue: number): number;
 
     /**
      * Calls the specified callback function for all the elements in an array, in descending order.
@@ -3324,12 +3325,12 @@ interface Int16Array {
      * the accumulation. The first call to the callbackfn function provides this value as an argument
      * instead of an array value.
      */
-    reduceRight<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: Int16Array) => U, initialValue: U): U;
+    reduceRight<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: this) => U, initialValue: U): U;
 
     /**
      * Reverses the elements in an Array.
      */
-    reverse(): Int16Array;
+    reverse(): this;
 
     /**
      * Sets a value or an array of values.
@@ -3343,7 +3344,7 @@ interface Int16Array {
      * @param start The beginning of the specified portion of the array.
      * @param end The end of the specified portion of the array. This is exclusive of the element at the index 'end'.
      */
-    slice(start?: number, end?: number): Int16Array;
+    slice(start?: number, end?: number): Int16Array<ArrayBuffer>;
 
     /**
      * Determines whether the specified callback function returns true for any element of an array.
@@ -3353,7 +3354,7 @@ interface Int16Array {
      * @param thisArg An object to which the this keyword can refer in the predicate function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    some(predicate: (value: number, index: number, array: Int16Array) => unknown, thisArg?: any): boolean;
+    some(predicate: (value: number, index: number, array: this) => unknown, thisArg?: any): boolean;
 
     /**
      * Sorts an array.
@@ -3372,7 +3373,7 @@ interface Int16Array {
      * @param begin The index of the beginning of the array.
      * @param end The index of the end of the array.
      */
-    subarray(begin?: number, end?: number): Int16Array;
+    subarray(begin?: number, end?: number): Int16Array<TArrayBuffer>;
 
     /**
      * Converts a number to a string by using the current locale.
@@ -3385,16 +3386,17 @@ interface Int16Array {
     toString(): string;
 
     /** Returns the primitive value of the specified object. */
-    valueOf(): Int16Array;
+    valueOf(): this;
 
     [index: number]: number;
 }
-
 interface Int16ArrayConstructor {
-    readonly prototype: Int16Array;
-    new (length: number): Int16Array;
-    new (array: ArrayLike<number> | ArrayBufferLike): Int16Array;
-    new (buffer: ArrayBufferLike, byteOffset?: number, length?: number): Int16Array;
+    readonly prototype: Int16Array<ArrayBufferLike>;
+    new (length: number): Int16Array<ArrayBuffer>;
+    new (array: ArrayLike<number>): Int16Array<ArrayBuffer>;
+    new <TArrayBuffer extends ArrayBufferLike = ArrayBuffer>(buffer: TArrayBuffer, byteOffset?: number, length?: number): Int16Array<TArrayBuffer>;
+    new (buffer: ArrayBuffer, byteOffset?: number, length?: number): Int16Array<ArrayBuffer>;
+    new (array: ArrayLike<number> | ArrayBuffer): Int16Array<ArrayBuffer>;
 
     /**
      * The size in bytes of each element in the array.
@@ -3405,21 +3407,21 @@ interface Int16ArrayConstructor {
      * Returns a new array from a set of elements.
      * @param items A set of elements to include in the new array object.
      */
-    of(...items: number[]): Int16Array;
+    of(...items: number[]): Int16Array<ArrayBuffer>;
 
     /**
      * Creates an array from an array-like or iterable object.
-     * @param arrayLike An array-like or iterable object to convert to an array.
+     * @param arrayLike An array-like object to convert to an array.
      */
-    from(arrayLike: ArrayLike<number>): Int16Array;
+    from(arrayLike: ArrayLike<number>): Int16Array<ArrayBuffer>;
 
     /**
      * Creates an array from an array-like or iterable object.
-     * @param arrayLike An array-like or iterable object to convert to an array.
+     * @param arrayLike An array-like object to convert to an array.
      * @param mapfn A mapping function to call on every element of the array.
      * @param thisArg Value of 'this' used to invoke the mapfn.
      */
-    from<T>(arrayLike: ArrayLike<T>, mapfn: (v: T, k: number) => number, thisArg?: any): Int16Array;
+    from<T>(arrayLike: ArrayLike<T>, mapfn: (v: T, k: number) => number, thisArg?: any): Int16Array<ArrayBuffer>;
 }
 declare var Int16Array: Int16ArrayConstructor;
 
@@ -3427,7 +3429,7 @@ declare var Int16Array: Int16ArrayConstructor;
  * A typed array of 16-bit unsigned integer values. The contents are initialized to 0. If the
  * requested number of bytes could not be allocated an exception is raised.
  */
-interface Uint16Array {
+interface Uint16Array<TArrayBuffer extends ArrayBufferLike = ArrayBufferLike> {
     /**
      * The size in bytes of each element in the array.
      */
@@ -3436,7 +3438,7 @@ interface Uint16Array {
     /**
      * The ArrayBuffer instance referenced by the array.
      */
-    readonly buffer: ArrayBufferLike;
+    readonly buffer: TArrayBuffer;
 
     /**
      * The length in bytes of the array.
@@ -3467,7 +3469,7 @@ interface Uint16Array {
      * @param thisArg An object to which the this keyword can refer in the predicate function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    every(predicate: (value: number, index: number, array: Uint16Array) => unknown, thisArg?: any): boolean;
+    every(predicate: (value: number, index: number, array: this) => unknown, thisArg?: any): boolean;
 
     /**
      * Changes all array elements from `start` to `end` index to a static `value` and returns the modified array
@@ -3486,7 +3488,7 @@ interface Uint16Array {
      * @param thisArg An object to which the this keyword can refer in the predicate function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    filter(predicate: (value: number, index: number, array: Uint16Array) => any, thisArg?: any): Uint16Array;
+    filter(predicate: (value: number, index: number, array: this) => any, thisArg?: any): Uint16Array<ArrayBuffer>;
 
     /**
      * Returns the value of the first element in the array where predicate is true, and undefined
@@ -3497,7 +3499,7 @@ interface Uint16Array {
      * @param thisArg If provided, it will be used as the this value for each invocation of
      * predicate. If it is not provided, undefined is used instead.
      */
-    find(predicate: (value: number, index: number, obj: Uint16Array) => boolean, thisArg?: any): number | undefined;
+    find(predicate: (value: number, index: number, obj: this) => boolean, thisArg?: any): number | undefined;
 
     /**
      * Returns the index of the first element in the array where predicate is true, and -1
@@ -3508,22 +3510,22 @@ interface Uint16Array {
      * @param thisArg If provided, it will be used as the this value for each invocation of
      * predicate. If it is not provided, undefined is used instead.
      */
-    findIndex(predicate: (value: number, index: number, obj: Uint16Array) => boolean, thisArg?: any): number;
+    findIndex(predicate: (value: number, index: number, obj: this) => boolean, thisArg?: any): number;
 
     /**
      * Performs the specified action for each element in an array.
-     * @param callbackfn  A function that accepts up to three arguments. forEach calls the
+     * @param callbackfn A function that accepts up to three arguments. forEach calls the
      * callbackfn function one time for each element in the array.
-     * @param thisArg  An object to which the this keyword can refer in the callbackfn function.
+     * @param thisArg An object to which the this keyword can refer in the callbackfn function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    forEach(callbackfn: (value: number, index: number, array: Uint16Array) => void, thisArg?: any): void;
+    forEach(callbackfn: (value: number, index: number, array: this) => void, thisArg?: any): void;
 
     /**
-     * Returns the index of the first occurrence of a value in an array.
+     * Returns the index of the first occurrence of a value in an array, or -1 if it is not present.
      * @param searchElement The value to locate in the array.
      * @param fromIndex The array index at which to begin the search. If fromIndex is omitted, the
-     *  search starts at index 0.
+     * search starts at index 0.
      */
     indexOf(searchElement: number, fromIndex?: number): number;
 
@@ -3535,7 +3537,7 @@ interface Uint16Array {
     join(separator?: string): string;
 
     /**
-     * Returns the index of the last occurrence of a value in an array.
+     * Returns the index of the last occurrence of a value in an array, or -1 if it is not present.
      * @param searchElement The value to locate in the array.
      * @param fromIndex The array index at which to begin the search. If fromIndex is omitted, the
      * search starts at index 0.
@@ -3555,7 +3557,7 @@ interface Uint16Array {
      * @param thisArg An object to which the this keyword can refer in the callbackfn function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    map(callbackfn: (value: number, index: number, array: Uint16Array) => number, thisArg?: any): Uint16Array;
+    map(callbackfn: (value: number, index: number, array: this) => number, thisArg?: any): Uint16Array<ArrayBuffer>;
 
     /**
      * Calls the specified callback function for all the elements in an array. The return value of
@@ -3567,8 +3569,8 @@ interface Uint16Array {
      * the accumulation. The first call to the callbackfn function provides this value as an argument
      * instead of an array value.
      */
-    reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: Uint16Array) => number): number;
-    reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: Uint16Array) => number, initialValue: number): number;
+    reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number): number;
+    reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number, initialValue: number): number;
 
     /**
      * Calls the specified callback function for all the elements in an array. The return value of
@@ -3580,7 +3582,7 @@ interface Uint16Array {
      * the accumulation. The first call to the callbackfn function provides this value as an argument
      * instead of an array value.
      */
-    reduce<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: Uint16Array) => U, initialValue: U): U;
+    reduce<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: this) => U, initialValue: U): U;
 
     /**
      * Calls the specified callback function for all the elements in an array, in descending order.
@@ -3592,8 +3594,8 @@ interface Uint16Array {
      * the accumulation. The first call to the callbackfn function provides this value as an
      * argument instead of an array value.
      */
-    reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: Uint16Array) => number): number;
-    reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: Uint16Array) => number, initialValue: number): number;
+    reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number): number;
+    reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number, initialValue: number): number;
 
     /**
      * Calls the specified callback function for all the elements in an array, in descending order.
@@ -3605,12 +3607,12 @@ interface Uint16Array {
      * the accumulation. The first call to the callbackfn function provides this value as an argument
      * instead of an array value.
      */
-    reduceRight<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: Uint16Array) => U, initialValue: U): U;
+    reduceRight<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: this) => U, initialValue: U): U;
 
     /**
      * Reverses the elements in an Array.
      */
-    reverse(): Uint16Array;
+    reverse(): this;
 
     /**
      * Sets a value or an array of values.
@@ -3624,7 +3626,7 @@ interface Uint16Array {
      * @param start The beginning of the specified portion of the array.
      * @param end The end of the specified portion of the array. This is exclusive of the element at the index 'end'.
      */
-    slice(start?: number, end?: number): Uint16Array;
+    slice(start?: number, end?: number): Uint16Array<ArrayBuffer>;
 
     /**
      * Determines whether the specified callback function returns true for any element of an array.
@@ -3634,7 +3636,7 @@ interface Uint16Array {
      * @param thisArg An object to which the this keyword can refer in the predicate function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    some(predicate: (value: number, index: number, array: Uint16Array) => unknown, thisArg?: any): boolean;
+    some(predicate: (value: number, index: number, array: this) => unknown, thisArg?: any): boolean;
 
     /**
      * Sorts an array.
@@ -3653,7 +3655,7 @@ interface Uint16Array {
      * @param begin The index of the beginning of the array.
      * @param end The index of the end of the array.
      */
-    subarray(begin?: number, end?: number): Uint16Array;
+    subarray(begin?: number, end?: number): Uint16Array<TArrayBuffer>;
 
     /**
      * Converts a number to a string by using the current locale.
@@ -3666,16 +3668,17 @@ interface Uint16Array {
     toString(): string;
 
     /** Returns the primitive value of the specified object. */
-    valueOf(): Uint16Array;
+    valueOf(): this;
 
     [index: number]: number;
 }
-
 interface Uint16ArrayConstructor {
-    readonly prototype: Uint16Array;
-    new (length: number): Uint16Array;
-    new (array: ArrayLike<number> | ArrayBufferLike): Uint16Array;
-    new (buffer: ArrayBufferLike, byteOffset?: number, length?: number): Uint16Array;
+    readonly prototype: Uint16Array<ArrayBufferLike>;
+    new (length: number): Uint16Array<ArrayBuffer>;
+    new (array: ArrayLike<number>): Uint16Array<ArrayBuffer>;
+    new <TArrayBuffer extends ArrayBufferLike = ArrayBuffer>(buffer: TArrayBuffer, byteOffset?: number, length?: number): Uint16Array<TArrayBuffer>;
+    new (buffer: ArrayBuffer, byteOffset?: number, length?: number): Uint16Array<ArrayBuffer>;
+    new (array: ArrayLike<number> | ArrayBuffer): Uint16Array<ArrayBuffer>;
 
     /**
      * The size in bytes of each element in the array.
@@ -3686,28 +3689,28 @@ interface Uint16ArrayConstructor {
      * Returns a new array from a set of elements.
      * @param items A set of elements to include in the new array object.
      */
-    of(...items: number[]): Uint16Array;
+    of(...items: number[]): Uint16Array<ArrayBuffer>;
 
     /**
      * Creates an array from an array-like or iterable object.
-     * @param arrayLike An array-like or iterable object to convert to an array.
+     * @param arrayLike An array-like object to convert to an array.
      */
-    from(arrayLike: ArrayLike<number>): Uint16Array;
+    from(arrayLike: ArrayLike<number>): Uint16Array<ArrayBuffer>;
 
     /**
      * Creates an array from an array-like or iterable object.
-     * @param arrayLike An array-like or iterable object to convert to an array.
+     * @param arrayLike An array-like object to convert to an array.
      * @param mapfn A mapping function to call on every element of the array.
      * @param thisArg Value of 'this' used to invoke the mapfn.
      */
-    from<T>(arrayLike: ArrayLike<T>, mapfn: (v: T, k: number) => number, thisArg?: any): Uint16Array;
+    from<T>(arrayLike: ArrayLike<T>, mapfn: (v: T, k: number) => number, thisArg?: any): Uint16Array<ArrayBuffer>;
 }
 declare var Uint16Array: Uint16ArrayConstructor;
 /**
  * A typed array of 32-bit signed integer values. The contents are initialized to 0. If the
  * requested number of bytes could not be allocated an exception is raised.
  */
-interface Int32Array {
+interface Int32Array<TArrayBuffer extends ArrayBufferLike = ArrayBufferLike> {
     /**
      * The size in bytes of each element in the array.
      */
@@ -3716,7 +3719,7 @@ interface Int32Array {
     /**
      * The ArrayBuffer instance referenced by the array.
      */
-    readonly buffer: ArrayBufferLike;
+    readonly buffer: TArrayBuffer;
 
     /**
      * The length in bytes of the array.
@@ -3747,7 +3750,7 @@ interface Int32Array {
      * @param thisArg An object to which the this keyword can refer in the predicate function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    every(predicate: (value: number, index: number, array: Int32Array) => unknown, thisArg?: any): boolean;
+    every(predicate: (value: number, index: number, array: this) => unknown, thisArg?: any): boolean;
 
     /**
      * Changes all array elements from `start` to `end` index to a static `value` and returns the modified array
@@ -3766,7 +3769,7 @@ interface Int32Array {
      * @param thisArg An object to which the this keyword can refer in the predicate function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    filter(predicate: (value: number, index: number, array: Int32Array) => any, thisArg?: any): Int32Array;
+    filter(predicate: (value: number, index: number, array: this) => any, thisArg?: any): Int32Array<ArrayBuffer>;
 
     /**
      * Returns the value of the first element in the array where predicate is true, and undefined
@@ -3777,7 +3780,7 @@ interface Int32Array {
      * @param thisArg If provided, it will be used as the this value for each invocation of
      * predicate. If it is not provided, undefined is used instead.
      */
-    find(predicate: (value: number, index: number, obj: Int32Array) => boolean, thisArg?: any): number | undefined;
+    find(predicate: (value: number, index: number, obj: this) => boolean, thisArg?: any): number | undefined;
 
     /**
      * Returns the index of the first element in the array where predicate is true, and -1
@@ -3788,22 +3791,22 @@ interface Int32Array {
      * @param thisArg If provided, it will be used as the this value for each invocation of
      * predicate. If it is not provided, undefined is used instead.
      */
-    findIndex(predicate: (value: number, index: number, obj: Int32Array) => boolean, thisArg?: any): number;
+    findIndex(predicate: (value: number, index: number, obj: this) => boolean, thisArg?: any): number;
 
     /**
      * Performs the specified action for each element in an array.
-     * @param callbackfn  A function that accepts up to three arguments. forEach calls the
+     * @param callbackfn A function that accepts up to three arguments. forEach calls the
      * callbackfn function one time for each element in the array.
-     * @param thisArg  An object to which the this keyword can refer in the callbackfn function.
+     * @param thisArg An object to which the this keyword can refer in the callbackfn function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    forEach(callbackfn: (value: number, index: number, array: Int32Array) => void, thisArg?: any): void;
+    forEach(callbackfn: (value: number, index: number, array: this) => void, thisArg?: any): void;
 
     /**
-     * Returns the index of the first occurrence of a value in an array.
+     * Returns the index of the first occurrence of a value in an array, or -1 if it is not present.
      * @param searchElement The value to locate in the array.
      * @param fromIndex The array index at which to begin the search. If fromIndex is omitted, the
-     *  search starts at index 0.
+     * search starts at index 0.
      */
     indexOf(searchElement: number, fromIndex?: number): number;
 
@@ -3815,7 +3818,7 @@ interface Int32Array {
     join(separator?: string): string;
 
     /**
-     * Returns the index of the last occurrence of a value in an array.
+     * Returns the index of the last occurrence of a value in an array, or -1 if it is not present.
      * @param searchElement The value to locate in the array.
      * @param fromIndex The array index at which to begin the search. If fromIndex is omitted, the
      * search starts at index 0.
@@ -3835,7 +3838,7 @@ interface Int32Array {
      * @param thisArg An object to which the this keyword can refer in the callbackfn function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    map(callbackfn: (value: number, index: number, array: Int32Array) => number, thisArg?: any): Int32Array;
+    map(callbackfn: (value: number, index: number, array: this) => number, thisArg?: any): Int32Array<ArrayBuffer>;
 
     /**
      * Calls the specified callback function for all the elements in an array. The return value of
@@ -3847,8 +3850,8 @@ interface Int32Array {
      * the accumulation. The first call to the callbackfn function provides this value as an argument
      * instead of an array value.
      */
-    reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: Int32Array) => number): number;
-    reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: Int32Array) => number, initialValue: number): number;
+    reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number): number;
+    reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number, initialValue: number): number;
 
     /**
      * Calls the specified callback function for all the elements in an array. The return value of
@@ -3860,7 +3863,7 @@ interface Int32Array {
      * the accumulation. The first call to the callbackfn function provides this value as an argument
      * instead of an array value.
      */
-    reduce<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: Int32Array) => U, initialValue: U): U;
+    reduce<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: this) => U, initialValue: U): U;
 
     /**
      * Calls the specified callback function for all the elements in an array, in descending order.
@@ -3872,8 +3875,8 @@ interface Int32Array {
      * the accumulation. The first call to the callbackfn function provides this value as an
      * argument instead of an array value.
      */
-    reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: Int32Array) => number): number;
-    reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: Int32Array) => number, initialValue: number): number;
+    reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number): number;
+    reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number, initialValue: number): number;
 
     /**
      * Calls the specified callback function for all the elements in an array, in descending order.
@@ -3885,12 +3888,12 @@ interface Int32Array {
      * the accumulation. The first call to the callbackfn function provides this value as an argument
      * instead of an array value.
      */
-    reduceRight<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: Int32Array) => U, initialValue: U): U;
+    reduceRight<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: this) => U, initialValue: U): U;
 
     /**
      * Reverses the elements in an Array.
      */
-    reverse(): Int32Array;
+    reverse(): this;
 
     /**
      * Sets a value or an array of values.
@@ -3904,7 +3907,7 @@ interface Int32Array {
      * @param start The beginning of the specified portion of the array.
      * @param end The end of the specified portion of the array. This is exclusive of the element at the index 'end'.
      */
-    slice(start?: number, end?: number): Int32Array;
+    slice(start?: number, end?: number): Int32Array<ArrayBuffer>;
 
     /**
      * Determines whether the specified callback function returns true for any element of an array.
@@ -3914,7 +3917,7 @@ interface Int32Array {
      * @param thisArg An object to which the this keyword can refer in the predicate function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    some(predicate: (value: number, index: number, array: Int32Array) => unknown, thisArg?: any): boolean;
+    some(predicate: (value: number, index: number, array: this) => unknown, thisArg?: any): boolean;
 
     /**
      * Sorts an array.
@@ -3933,7 +3936,7 @@ interface Int32Array {
      * @param begin The index of the beginning of the array.
      * @param end The index of the end of the array.
      */
-    subarray(begin?: number, end?: number): Int32Array;
+    subarray(begin?: number, end?: number): Int32Array<TArrayBuffer>;
 
     /**
      * Converts a number to a string by using the current locale.
@@ -3946,16 +3949,17 @@ interface Int32Array {
     toString(): string;
 
     /** Returns the primitive value of the specified object. */
-    valueOf(): Int32Array;
+    valueOf(): this;
 
     [index: number]: number;
 }
-
 interface Int32ArrayConstructor {
-    readonly prototype: Int32Array;
-    new (length: number): Int32Array;
-    new (array: ArrayLike<number> | ArrayBufferLike): Int32Array;
-    new (buffer: ArrayBufferLike, byteOffset?: number, length?: number): Int32Array;
+    readonly prototype: Int32Array<ArrayBufferLike>;
+    new (length: number): Int32Array<ArrayBuffer>;
+    new (array: ArrayLike<number>): Int32Array<ArrayBuffer>;
+    new <TArrayBuffer extends ArrayBufferLike = ArrayBuffer>(buffer: TArrayBuffer, byteOffset?: number, length?: number): Int32Array<TArrayBuffer>;
+    new (buffer: ArrayBuffer, byteOffset?: number, length?: number): Int32Array<ArrayBuffer>;
+    new (array: ArrayLike<number> | ArrayBuffer): Int32Array<ArrayBuffer>;
 
     /**
      * The size in bytes of each element in the array.
@@ -3966,21 +3970,21 @@ interface Int32ArrayConstructor {
      * Returns a new array from a set of elements.
      * @param items A set of elements to include in the new array object.
      */
-    of(...items: number[]): Int32Array;
+    of(...items: number[]): Int32Array<ArrayBuffer>;
 
     /**
      * Creates an array from an array-like or iterable object.
-     * @param arrayLike An array-like or iterable object to convert to an array.
+     * @param arrayLike An array-like object to convert to an array.
      */
-    from(arrayLike: ArrayLike<number>): Int32Array;
+    from(arrayLike: ArrayLike<number>): Int32Array<ArrayBuffer>;
 
     /**
      * Creates an array from an array-like or iterable object.
-     * @param arrayLike An array-like or iterable object to convert to an array.
+     * @param arrayLike An array-like object to convert to an array.
      * @param mapfn A mapping function to call on every element of the array.
      * @param thisArg Value of 'this' used to invoke the mapfn.
      */
-    from<T>(arrayLike: ArrayLike<T>, mapfn: (v: T, k: number) => number, thisArg?: any): Int32Array;
+    from<T>(arrayLike: ArrayLike<T>, mapfn: (v: T, k: number) => number, thisArg?: any): Int32Array<ArrayBuffer>;
 }
 declare var Int32Array: Int32ArrayConstructor;
 
@@ -3988,7 +3992,7 @@ declare var Int32Array: Int32ArrayConstructor;
  * A typed array of 32-bit unsigned integer values. The contents are initialized to 0. If the
  * requested number of bytes could not be allocated an exception is raised.
  */
-interface Uint32Array {
+interface Uint32Array<TArrayBuffer extends ArrayBufferLike = ArrayBufferLike> {
     /**
      * The size in bytes of each element in the array.
      */
@@ -3997,7 +4001,7 @@ interface Uint32Array {
     /**
      * The ArrayBuffer instance referenced by the array.
      */
-    readonly buffer: ArrayBufferLike;
+    readonly buffer: TArrayBuffer;
 
     /**
      * The length in bytes of the array.
@@ -4028,7 +4032,7 @@ interface Uint32Array {
      * @param thisArg An object to which the this keyword can refer in the predicate function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    every(predicate: (value: number, index: number, array: Uint32Array) => unknown, thisArg?: any): boolean;
+    every(predicate: (value: number, index: number, array: this) => unknown, thisArg?: any): boolean;
 
     /**
      * Changes all array elements from `start` to `end` index to a static `value` and returns the modified array
@@ -4047,7 +4051,7 @@ interface Uint32Array {
      * @param thisArg An object to which the this keyword can refer in the predicate function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    filter(predicate: (value: number, index: number, array: Uint32Array) => any, thisArg?: any): Uint32Array;
+    filter(predicate: (value: number, index: number, array: this) => any, thisArg?: any): Uint32Array<ArrayBuffer>;
 
     /**
      * Returns the value of the first element in the array where predicate is true, and undefined
@@ -4058,7 +4062,7 @@ interface Uint32Array {
      * @param thisArg If provided, it will be used as the this value for each invocation of
      * predicate. If it is not provided, undefined is used instead.
      */
-    find(predicate: (value: number, index: number, obj: Uint32Array) => boolean, thisArg?: any): number | undefined;
+    find(predicate: (value: number, index: number, obj: this) => boolean, thisArg?: any): number | undefined;
 
     /**
      * Returns the index of the first element in the array where predicate is true, and -1
@@ -4069,21 +4073,21 @@ interface Uint32Array {
      * @param thisArg If provided, it will be used as the this value for each invocation of
      * predicate. If it is not provided, undefined is used instead.
      */
-    findIndex(predicate: (value: number, index: number, obj: Uint32Array) => boolean, thisArg?: any): number;
+    findIndex(predicate: (value: number, index: number, obj: this) => boolean, thisArg?: any): number;
 
     /**
      * Performs the specified action for each element in an array.
-     * @param callbackfn  A function that accepts up to three arguments. forEach calls the
+     * @param callbackfn A function that accepts up to three arguments. forEach calls the
      * callbackfn function one time for each element in the array.
-     * @param thisArg  An object to which the this keyword can refer in the callbackfn function.
+     * @param thisArg An object to which the this keyword can refer in the callbackfn function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    forEach(callbackfn: (value: number, index: number, array: Uint32Array) => void, thisArg?: any): void;
+    forEach(callbackfn: (value: number, index: number, array: this) => void, thisArg?: any): void;
     /**
-     * Returns the index of the first occurrence of a value in an array.
+     * Returns the index of the first occurrence of a value in an array, or -1 if it is not present.
      * @param searchElement The value to locate in the array.
      * @param fromIndex The array index at which to begin the search. If fromIndex is omitted, the
-     *  search starts at index 0.
+     * search starts at index 0.
      */
     indexOf(searchElement: number, fromIndex?: number): number;
 
@@ -4095,7 +4099,7 @@ interface Uint32Array {
     join(separator?: string): string;
 
     /**
-     * Returns the index of the last occurrence of a value in an array.
+     * Returns the index of the last occurrence of a value in an array, or -1 if it is not present.
      * @param searchElement The value to locate in the array.
      * @param fromIndex The array index at which to begin the search. If fromIndex is omitted, the
      * search starts at index 0.
@@ -4115,7 +4119,7 @@ interface Uint32Array {
      * @param thisArg An object to which the this keyword can refer in the callbackfn function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    map(callbackfn: (value: number, index: number, array: Uint32Array) => number, thisArg?: any): Uint32Array;
+    map(callbackfn: (value: number, index: number, array: this) => number, thisArg?: any): Uint32Array<ArrayBuffer>;
 
     /**
      * Calls the specified callback function for all the elements in an array. The return value of
@@ -4127,8 +4131,8 @@ interface Uint32Array {
      * the accumulation. The first call to the callbackfn function provides this value as an argument
      * instead of an array value.
      */
-    reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: Uint32Array) => number): number;
-    reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: Uint32Array) => number, initialValue: number): number;
+    reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number): number;
+    reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number, initialValue: number): number;
 
     /**
      * Calls the specified callback function for all the elements in an array. The return value of
@@ -4140,7 +4144,7 @@ interface Uint32Array {
      * the accumulation. The first call to the callbackfn function provides this value as an argument
      * instead of an array value.
      */
-    reduce<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: Uint32Array) => U, initialValue: U): U;
+    reduce<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: this) => U, initialValue: U): U;
 
     /**
      * Calls the specified callback function for all the elements in an array, in descending order.
@@ -4152,8 +4156,8 @@ interface Uint32Array {
      * the accumulation. The first call to the callbackfn function provides this value as an
      * argument instead of an array value.
      */
-    reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: Uint32Array) => number): number;
-    reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: Uint32Array) => number, initialValue: number): number;
+    reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number): number;
+    reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number, initialValue: number): number;
 
     /**
      * Calls the specified callback function for all the elements in an array, in descending order.
@@ -4165,12 +4169,12 @@ interface Uint32Array {
      * the accumulation. The first call to the callbackfn function provides this value as an argument
      * instead of an array value.
      */
-    reduceRight<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: Uint32Array) => U, initialValue: U): U;
+    reduceRight<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: this) => U, initialValue: U): U;
 
     /**
      * Reverses the elements in an Array.
      */
-    reverse(): Uint32Array;
+    reverse(): this;
 
     /**
      * Sets a value or an array of values.
@@ -4184,7 +4188,7 @@ interface Uint32Array {
      * @param start The beginning of the specified portion of the array.
      * @param end The end of the specified portion of the array. This is exclusive of the element at the index 'end'.
      */
-    slice(start?: number, end?: number): Uint32Array;
+    slice(start?: number, end?: number): Uint32Array<ArrayBuffer>;
 
     /**
      * Determines whether the specified callback function returns true for any element of an array.
@@ -4194,7 +4198,7 @@ interface Uint32Array {
      * @param thisArg An object to which the this keyword can refer in the predicate function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    some(predicate: (value: number, index: number, array: Uint32Array) => unknown, thisArg?: any): boolean;
+    some(predicate: (value: number, index: number, array: this) => unknown, thisArg?: any): boolean;
 
     /**
      * Sorts an array.
@@ -4213,7 +4217,7 @@ interface Uint32Array {
      * @param begin The index of the beginning of the array.
      * @param end The index of the end of the array.
      */
-    subarray(begin?: number, end?: number): Uint32Array;
+    subarray(begin?: number, end?: number): Uint32Array<TArrayBuffer>;
 
     /**
      * Converts a number to a string by using the current locale.
@@ -4226,16 +4230,17 @@ interface Uint32Array {
     toString(): string;
 
     /** Returns the primitive value of the specified object. */
-    valueOf(): Uint32Array;
+    valueOf(): this;
 
     [index: number]: number;
 }
-
 interface Uint32ArrayConstructor {
-    readonly prototype: Uint32Array;
-    new (length: number): Uint32Array;
-    new (array: ArrayLike<number> | ArrayBufferLike): Uint32Array;
-    new (buffer: ArrayBufferLike, byteOffset?: number, length?: number): Uint32Array;
+    readonly prototype: Uint32Array<ArrayBufferLike>;
+    new (length: number): Uint32Array<ArrayBuffer>;
+    new (array: ArrayLike<number>): Uint32Array<ArrayBuffer>;
+    new <TArrayBuffer extends ArrayBufferLike = ArrayBuffer>(buffer: TArrayBuffer, byteOffset?: number, length?: number): Uint32Array<TArrayBuffer>;
+    new (buffer: ArrayBuffer, byteOffset?: number, length?: number): Uint32Array<ArrayBuffer>;
+    new (array: ArrayLike<number> | ArrayBuffer): Uint32Array<ArrayBuffer>;
 
     /**
      * The size in bytes of each element in the array.
@@ -4246,21 +4251,21 @@ interface Uint32ArrayConstructor {
      * Returns a new array from a set of elements.
      * @param items A set of elements to include in the new array object.
      */
-    of(...items: number[]): Uint32Array;
+    of(...items: number[]): Uint32Array<ArrayBuffer>;
 
     /**
      * Creates an array from an array-like or iterable object.
-     * @param arrayLike An array-like or iterable object to convert to an array.
+     * @param arrayLike An array-like object to convert to an array.
      */
-    from(arrayLike: ArrayLike<number>): Uint32Array;
+    from(arrayLike: ArrayLike<number>): Uint32Array<ArrayBuffer>;
 
     /**
      * Creates an array from an array-like or iterable object.
-     * @param arrayLike An array-like or iterable object to convert to an array.
+     * @param arrayLike An array-like object to convert to an array.
      * @param mapfn A mapping function to call on every element of the array.
      * @param thisArg Value of 'this' used to invoke the mapfn.
      */
-    from<T>(arrayLike: ArrayLike<T>, mapfn: (v: T, k: number) => number, thisArg?: any): Uint32Array;
+    from<T>(arrayLike: ArrayLike<T>, mapfn: (v: T, k: number) => number, thisArg?: any): Uint32Array<ArrayBuffer>;
 }
 declare var Uint32Array: Uint32ArrayConstructor;
 
@@ -4268,7 +4273,7 @@ declare var Uint32Array: Uint32ArrayConstructor;
  * A typed array of 32-bit float values. The contents are initialized to 0. If the requested number
  * of bytes could not be allocated an exception is raised.
  */
-interface Float32Array {
+interface Float32Array<TArrayBuffer extends ArrayBufferLike = ArrayBufferLike> {
     /**
      * The size in bytes of each element in the array.
      */
@@ -4277,7 +4282,7 @@ interface Float32Array {
     /**
      * The ArrayBuffer instance referenced by the array.
      */
-    readonly buffer: ArrayBufferLike;
+    readonly buffer: TArrayBuffer;
 
     /**
      * The length in bytes of the array.
@@ -4308,7 +4313,7 @@ interface Float32Array {
      * @param thisArg An object to which the this keyword can refer in the predicate function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    every(predicate: (value: number, index: number, array: Float32Array) => unknown, thisArg?: any): boolean;
+    every(predicate: (value: number, index: number, array: this) => unknown, thisArg?: any): boolean;
 
     /**
      * Changes all array elements from `start` to `end` index to a static `value` and returns the modified array
@@ -4327,7 +4332,7 @@ interface Float32Array {
      * @param thisArg An object to which the this keyword can refer in the predicate function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    filter(predicate: (value: number, index: number, array: Float32Array) => any, thisArg?: any): Float32Array;
+    filter(predicate: (value: number, index: number, array: this) => any, thisArg?: any): Float32Array<ArrayBuffer>;
 
     /**
      * Returns the value of the first element in the array where predicate is true, and undefined
@@ -4338,7 +4343,7 @@ interface Float32Array {
      * @param thisArg If provided, it will be used as the this value for each invocation of
      * predicate. If it is not provided, undefined is used instead.
      */
-    find(predicate: (value: number, index: number, obj: Float32Array) => boolean, thisArg?: any): number | undefined;
+    find(predicate: (value: number, index: number, obj: this) => boolean, thisArg?: any): number | undefined;
 
     /**
      * Returns the index of the first element in the array where predicate is true, and -1
@@ -4349,22 +4354,22 @@ interface Float32Array {
      * @param thisArg If provided, it will be used as the this value for each invocation of
      * predicate. If it is not provided, undefined is used instead.
      */
-    findIndex(predicate: (value: number, index: number, obj: Float32Array) => boolean, thisArg?: any): number;
+    findIndex(predicate: (value: number, index: number, obj: this) => boolean, thisArg?: any): number;
 
     /**
      * Performs the specified action for each element in an array.
-     * @param callbackfn  A function that accepts up to three arguments. forEach calls the
+     * @param callbackfn A function that accepts up to three arguments. forEach calls the
      * callbackfn function one time for each element in the array.
-     * @param thisArg  An object to which the this keyword can refer in the callbackfn function.
+     * @param thisArg An object to which the this keyword can refer in the callbackfn function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    forEach(callbackfn: (value: number, index: number, array: Float32Array) => void, thisArg?: any): void;
+    forEach(callbackfn: (value: number, index: number, array: this) => void, thisArg?: any): void;
 
     /**
-     * Returns the index of the first occurrence of a value in an array.
+     * Returns the index of the first occurrence of a value in an array, or -1 if it is not present.
      * @param searchElement The value to locate in the array.
      * @param fromIndex The array index at which to begin the search. If fromIndex is omitted, the
-     *  search starts at index 0.
+     * search starts at index 0.
      */
     indexOf(searchElement: number, fromIndex?: number): number;
 
@@ -4376,7 +4381,7 @@ interface Float32Array {
     join(separator?: string): string;
 
     /**
-     * Returns the index of the last occurrence of a value in an array.
+     * Returns the index of the last occurrence of a value in an array, or -1 if it is not present.
      * @param searchElement The value to locate in the array.
      * @param fromIndex The array index at which to begin the search. If fromIndex is omitted, the
      * search starts at index 0.
@@ -4396,7 +4401,7 @@ interface Float32Array {
      * @param thisArg An object to which the this keyword can refer in the callbackfn function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    map(callbackfn: (value: number, index: number, array: Float32Array) => number, thisArg?: any): Float32Array;
+    map(callbackfn: (value: number, index: number, array: this) => number, thisArg?: any): Float32Array<ArrayBuffer>;
 
     /**
      * Calls the specified callback function for all the elements in an array. The return value of
@@ -4408,8 +4413,8 @@ interface Float32Array {
      * the accumulation. The first call to the callbackfn function provides this value as an argument
      * instead of an array value.
      */
-    reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: Float32Array) => number): number;
-    reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: Float32Array) => number, initialValue: number): number;
+    reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number): number;
+    reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number, initialValue: number): number;
 
     /**
      * Calls the specified callback function for all the elements in an array. The return value of
@@ -4421,7 +4426,7 @@ interface Float32Array {
      * the accumulation. The first call to the callbackfn function provides this value as an argument
      * instead of an array value.
      */
-    reduce<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: Float32Array) => U, initialValue: U): U;
+    reduce<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: this) => U, initialValue: U): U;
 
     /**
      * Calls the specified callback function for all the elements in an array, in descending order.
@@ -4433,8 +4438,8 @@ interface Float32Array {
      * the accumulation. The first call to the callbackfn function provides this value as an
      * argument instead of an array value.
      */
-    reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: Float32Array) => number): number;
-    reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: Float32Array) => number, initialValue: number): number;
+    reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number): number;
+    reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number, initialValue: number): number;
 
     /**
      * Calls the specified callback function for all the elements in an array, in descending order.
@@ -4446,12 +4451,12 @@ interface Float32Array {
      * the accumulation. The first call to the callbackfn function provides this value as an argument
      * instead of an array value.
      */
-    reduceRight<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: Float32Array) => U, initialValue: U): U;
+    reduceRight<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: this) => U, initialValue: U): U;
 
     /**
      * Reverses the elements in an Array.
      */
-    reverse(): Float32Array;
+    reverse(): this;
 
     /**
      * Sets a value or an array of values.
@@ -4465,7 +4470,7 @@ interface Float32Array {
      * @param start The beginning of the specified portion of the array.
      * @param end The end of the specified portion of the array. This is exclusive of the element at the index 'end'.
      */
-    slice(start?: number, end?: number): Float32Array;
+    slice(start?: number, end?: number): Float32Array<ArrayBuffer>;
 
     /**
      * Determines whether the specified callback function returns true for any element of an array.
@@ -4475,7 +4480,7 @@ interface Float32Array {
      * @param thisArg An object to which the this keyword can refer in the predicate function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    some(predicate: (value: number, index: number, array: Float32Array) => unknown, thisArg?: any): boolean;
+    some(predicate: (value: number, index: number, array: this) => unknown, thisArg?: any): boolean;
 
     /**
      * Sorts an array.
@@ -4494,7 +4499,7 @@ interface Float32Array {
      * @param begin The index of the beginning of the array.
      * @param end The index of the end of the array.
      */
-    subarray(begin?: number, end?: number): Float32Array;
+    subarray(begin?: number, end?: number): Float32Array<TArrayBuffer>;
 
     /**
      * Converts a number to a string by using the current locale.
@@ -4507,16 +4512,17 @@ interface Float32Array {
     toString(): string;
 
     /** Returns the primitive value of the specified object. */
-    valueOf(): Float32Array;
+    valueOf(): this;
 
     [index: number]: number;
 }
-
 interface Float32ArrayConstructor {
-    readonly prototype: Float32Array;
-    new (length: number): Float32Array;
-    new (array: ArrayLike<number> | ArrayBufferLike): Float32Array;
-    new (buffer: ArrayBufferLike, byteOffset?: number, length?: number): Float32Array;
+    readonly prototype: Float32Array<ArrayBufferLike>;
+    new (length: number): Float32Array<ArrayBuffer>;
+    new (array: ArrayLike<number>): Float32Array<ArrayBuffer>;
+    new <TArrayBuffer extends ArrayBufferLike = ArrayBuffer>(buffer: TArrayBuffer, byteOffset?: number, length?: number): Float32Array<TArrayBuffer>;
+    new (buffer: ArrayBuffer, byteOffset?: number, length?: number): Float32Array<ArrayBuffer>;
+    new (array: ArrayLike<number> | ArrayBuffer): Float32Array<ArrayBuffer>;
 
     /**
      * The size in bytes of each element in the array.
@@ -4527,21 +4533,21 @@ interface Float32ArrayConstructor {
      * Returns a new array from a set of elements.
      * @param items A set of elements to include in the new array object.
      */
-    of(...items: number[]): Float32Array;
+    of(...items: number[]): Float32Array<ArrayBuffer>;
 
     /**
      * Creates an array from an array-like or iterable object.
-     * @param arrayLike An array-like or iterable object to convert to an array.
+     * @param arrayLike An array-like object to convert to an array.
      */
-    from(arrayLike: ArrayLike<number>): Float32Array;
+    from(arrayLike: ArrayLike<number>): Float32Array<ArrayBuffer>;
 
     /**
      * Creates an array from an array-like or iterable object.
-     * @param arrayLike An array-like or iterable object to convert to an array.
+     * @param arrayLike An array-like object to convert to an array.
      * @param mapfn A mapping function to call on every element of the array.
      * @param thisArg Value of 'this' used to invoke the mapfn.
      */
-    from<T>(arrayLike: ArrayLike<T>, mapfn: (v: T, k: number) => number, thisArg?: any): Float32Array;
+    from<T>(arrayLike: ArrayLike<T>, mapfn: (v: T, k: number) => number, thisArg?: any): Float32Array<ArrayBuffer>;
 }
 declare var Float32Array: Float32ArrayConstructor;
 
@@ -4549,7 +4555,7 @@ declare var Float32Array: Float32ArrayConstructor;
  * A typed array of 64-bit float values. The contents are initialized to 0. If the requested
  * number of bytes could not be allocated an exception is raised.
  */
-interface Float64Array {
+interface Float64Array<TArrayBuffer extends ArrayBufferLike = ArrayBufferLike> {
     /**
      * The size in bytes of each element in the array.
      */
@@ -4558,7 +4564,7 @@ interface Float64Array {
     /**
      * The ArrayBuffer instance referenced by the array.
      */
-    readonly buffer: ArrayBufferLike;
+    readonly buffer: TArrayBuffer;
 
     /**
      * The length in bytes of the array.
@@ -4589,7 +4595,7 @@ interface Float64Array {
      * @param thisArg An object to which the this keyword can refer in the predicate function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    every(predicate: (value: number, index: number, array: Float64Array) => unknown, thisArg?: any): boolean;
+    every(predicate: (value: number, index: number, array: this) => unknown, thisArg?: any): boolean;
 
     /**
      * Changes all array elements from `start` to `end` index to a static `value` and returns the modified array
@@ -4608,7 +4614,7 @@ interface Float64Array {
      * @param thisArg An object to which the this keyword can refer in the predicate function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    filter(predicate: (value: number, index: number, array: Float64Array) => any, thisArg?: any): Float64Array;
+    filter(predicate: (value: number, index: number, array: this) => any, thisArg?: any): Float64Array<ArrayBuffer>;
 
     /**
      * Returns the value of the first element in the array where predicate is true, and undefined
@@ -4619,7 +4625,7 @@ interface Float64Array {
      * @param thisArg If provided, it will be used as the this value for each invocation of
      * predicate. If it is not provided, undefined is used instead.
      */
-    find(predicate: (value: number, index: number, obj: Float64Array) => boolean, thisArg?: any): number | undefined;
+    find(predicate: (value: number, index: number, obj: this) => boolean, thisArg?: any): number | undefined;
 
     /**
      * Returns the index of the first element in the array where predicate is true, and -1
@@ -4630,22 +4636,22 @@ interface Float64Array {
      * @param thisArg If provided, it will be used as the this value for each invocation of
      * predicate. If it is not provided, undefined is used instead.
      */
-    findIndex(predicate: (value: number, index: number, obj: Float64Array) => boolean, thisArg?: any): number;
+    findIndex(predicate: (value: number, index: number, obj: this) => boolean, thisArg?: any): number;
 
     /**
      * Performs the specified action for each element in an array.
-     * @param callbackfn  A function that accepts up to three arguments. forEach calls the
+     * @param callbackfn A function that accepts up to three arguments. forEach calls the
      * callbackfn function one time for each element in the array.
-     * @param thisArg  An object to which the this keyword can refer in the callbackfn function.
+     * @param thisArg An object to which the this keyword can refer in the callbackfn function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    forEach(callbackfn: (value: number, index: number, array: Float64Array) => void, thisArg?: any): void;
+    forEach(callbackfn: (value: number, index: number, array: this) => void, thisArg?: any): void;
 
     /**
-     * Returns the index of the first occurrence of a value in an array.
+     * Returns the index of the first occurrence of a value in an array, or -1 if it is not present.
      * @param searchElement The value to locate in the array.
      * @param fromIndex The array index at which to begin the search. If fromIndex is omitted, the
-     *  search starts at index 0.
+     * search starts at index 0.
      */
     indexOf(searchElement: number, fromIndex?: number): number;
 
@@ -4657,7 +4663,7 @@ interface Float64Array {
     join(separator?: string): string;
 
     /**
-     * Returns the index of the last occurrence of a value in an array.
+     * Returns the index of the last occurrence of a value in an array, or -1 if it is not present.
      * @param searchElement The value to locate in the array.
      * @param fromIndex The array index at which to begin the search. If fromIndex is omitted, the
      * search starts at index 0.
@@ -4677,7 +4683,7 @@ interface Float64Array {
      * @param thisArg An object to which the this keyword can refer in the callbackfn function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    map(callbackfn: (value: number, index: number, array: Float64Array) => number, thisArg?: any): Float64Array;
+    map(callbackfn: (value: number, index: number, array: this) => number, thisArg?: any): Float64Array<ArrayBuffer>;
 
     /**
      * Calls the specified callback function for all the elements in an array. The return value of
@@ -4689,8 +4695,8 @@ interface Float64Array {
      * the accumulation. The first call to the callbackfn function provides this value as an argument
      * instead of an array value.
      */
-    reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: Float64Array) => number): number;
-    reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: Float64Array) => number, initialValue: number): number;
+    reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number): number;
+    reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number, initialValue: number): number;
 
     /**
      * Calls the specified callback function for all the elements in an array. The return value of
@@ -4702,7 +4708,7 @@ interface Float64Array {
      * the accumulation. The first call to the callbackfn function provides this value as an argument
      * instead of an array value.
      */
-    reduce<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: Float64Array) => U, initialValue: U): U;
+    reduce<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: this) => U, initialValue: U): U;
 
     /**
      * Calls the specified callback function for all the elements in an array, in descending order.
@@ -4714,8 +4720,8 @@ interface Float64Array {
      * the accumulation. The first call to the callbackfn function provides this value as an
      * argument instead of an array value.
      */
-    reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: Float64Array) => number): number;
-    reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: Float64Array) => number, initialValue: number): number;
+    reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number): number;
+    reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number, initialValue: number): number;
 
     /**
      * Calls the specified callback function for all the elements in an array, in descending order.
@@ -4727,12 +4733,12 @@ interface Float64Array {
      * the accumulation. The first call to the callbackfn function provides this value as an argument
      * instead of an array value.
      */
-    reduceRight<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: Float64Array) => U, initialValue: U): U;
+    reduceRight<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: this) => U, initialValue: U): U;
 
     /**
      * Reverses the elements in an Array.
      */
-    reverse(): Float64Array;
+    reverse(): this;
 
     /**
      * Sets a value or an array of values.
@@ -4746,7 +4752,7 @@ interface Float64Array {
      * @param start The beginning of the specified portion of the array.
      * @param end The end of the specified portion of the array. This is exclusive of the element at the index 'end'.
      */
-    slice(start?: number, end?: number): Float64Array;
+    slice(start?: number, end?: number): Float64Array<ArrayBuffer>;
 
     /**
      * Determines whether the specified callback function returns true for any element of an array.
@@ -4756,7 +4762,7 @@ interface Float64Array {
      * @param thisArg An object to which the this keyword can refer in the predicate function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    some(predicate: (value: number, index: number, array: Float64Array) => unknown, thisArg?: any): boolean;
+    some(predicate: (value: number, index: number, array: this) => unknown, thisArg?: any): boolean;
 
     /**
      * Sorts an array.
@@ -4775,7 +4781,7 @@ interface Float64Array {
      * @param begin The index of the beginning of the array.
      * @param end The index of the end of the array.
      */
-    subarray(begin?: number, end?: number): Float64Array;
+    subarray(begin?: number, end?: number): Float64Array<TArrayBuffer>;
 
     /**
      * Converts a number to a string by using the current locale.
@@ -4788,16 +4794,17 @@ interface Float64Array {
     toString(): string;
 
     /** Returns the primitive value of the specified object. */
-    valueOf(): Float64Array;
+    valueOf(): this;
 
     [index: number]: number;
 }
-
 interface Float64ArrayConstructor {
-    readonly prototype: Float64Array;
-    new (length: number): Float64Array;
-    new (array: ArrayLike<number> | ArrayBufferLike): Float64Array;
-    new (buffer: ArrayBufferLike, byteOffset?: number, length?: number): Float64Array;
+    readonly prototype: Float64Array<ArrayBufferLike>;
+    new (length: number): Float64Array<ArrayBuffer>;
+    new (array: ArrayLike<number>): Float64Array<ArrayBuffer>;
+    new <TArrayBuffer extends ArrayBufferLike = ArrayBuffer>(buffer: TArrayBuffer, byteOffset?: number, length?: number): Float64Array<TArrayBuffer>;
+    new (buffer: ArrayBuffer, byteOffset?: number, length?: number): Float64Array<ArrayBuffer>;
+    new (array: ArrayLike<number> | ArrayBuffer): Float64Array<ArrayBuffer>;
 
     /**
      * The size in bytes of each element in the array.
@@ -4808,21 +4815,21 @@ interface Float64ArrayConstructor {
      * Returns a new array from a set of elements.
      * @param items A set of elements to include in the new array object.
      */
-    of(...items: number[]): Float64Array;
+    of(...items: number[]): Float64Array<ArrayBuffer>;
 
     /**
      * Creates an array from an array-like or iterable object.
-     * @param arrayLike An array-like or iterable object to convert to an array.
+     * @param arrayLike An array-like object to convert to an array.
      */
-    from(arrayLike: ArrayLike<number>): Float64Array;
+    from(arrayLike: ArrayLike<number>): Float64Array<ArrayBuffer>;
 
     /**
      * Creates an array from an array-like or iterable object.
-     * @param arrayLike An array-like or iterable object to convert to an array.
+     * @param arrayLike An array-like object to convert to an array.
      * @param mapfn A mapping function to call on every element of the array.
      * @param thisArg Value of 'this' used to invoke the mapfn.
      */
-    from<T>(arrayLike: ArrayLike<T>, mapfn: (v: T, k: number) => number, thisArg?: any): Float64Array;
+    from<T>(arrayLike: ArrayLike<T>, mapfn: (v: T, k: number) => number, thisArg?: any): Float64Array<ArrayBuffer>;
 }
 declare var Float64Array: Float64ArrayConstructor;
 
@@ -4837,7 +4844,7 @@ declare namespace Intl {
         numeric?: boolean | undefined;
         caseFirst?: "upper" | "lower" | "false" | undefined;
         sensitivity?: "base" | "accent" | "case" | "variant" | undefined;
-        collation?: "big5han" | "compat" | "dict" | "direct" | "ducet" | "emoji" | "eor" | "gb2312" | "phonebk" | "phonetic" | "pinyin" | "reformed" | "searchjl" | "stroke" | "trad" | "unihan" | "zhuyin" | undefined;
+        collation?: "big5han" | "compat" | "default" | "dict" | "direct" | "ducet" | "emoji" | "eor" | "gb2312" | "phonebk" | "phonetic" | "pinyin" | "reformed" | "searchjl" | "stroke" | "trad" | "unihan" | "zhuyin" | undefined;
         ignorePunctuation?: boolean | undefined;
     }
 
@@ -5025,14 +5032,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 interface Array<T> {
     /**
@@ -5130,7 +5135,7 @@ interface Math {
     imul(x: number, y: number): number;
 
     /**
-     * Returns the sign of the x, indicating whether x is positive, negative or zero.
+     * Returns the sign of x, indicating whether x is positive, negative, or zero.
      * @param x The numeric expression to test
      */
     sign(x: number): number;
@@ -5209,7 +5214,7 @@ interface Math {
     hypot(...values: number[]): number;
 
     /**
-     * Returns the integral part of the a numeric expression, x, removing any fractional digits.
+     * Returns the integral part of the numeric expression x, removing any fractional digits.
      * If x is already an integer, the result is x.
      * @param x A numeric expression.
      */
@@ -5578,39 +5583,39 @@ interface StringConstructor {
     raw(template: { raw: readonly string[] | ArrayLike<string>; }, ...substitutions: any[]): string;
 }
 
-interface Int8Array {
+interface Int8Array<TArrayBuffer extends ArrayBufferLike> {
     toLocaleString(locales: string | string[], options?: Intl.NumberFormatOptions): string;
 }
 
-interface Uint8Array {
+interface Uint8Array<TArrayBuffer extends ArrayBufferLike> {
     toLocaleString(locales: string | string[], options?: Intl.NumberFormatOptions): string;
 }
 
-interface Uint8ClampedArray {
+interface Uint8ClampedArray<TArrayBuffer extends ArrayBufferLike> {
     toLocaleString(locales: string | string[], options?: Intl.NumberFormatOptions): string;
 }
 
-interface Int16Array {
+interface Int16Array<TArrayBuffer extends ArrayBufferLike> {
     toLocaleString(locales: string | string[], options?: Intl.NumberFormatOptions): string;
 }
 
-interface Uint16Array {
+interface Uint16Array<TArrayBuffer extends ArrayBufferLike> {
     toLocaleString(locales: string | string[], options?: Intl.NumberFormatOptions): string;
 }
 
-interface Int32Array {
+interface Int32Array<TArrayBuffer extends ArrayBufferLike> {
     toLocaleString(locales: string | string[], options?: Intl.NumberFormatOptions): string;
 }
 
-interface Uint32Array {
+interface Uint32Array<TArrayBuffer extends ArrayBufferLike> {
     toLocaleString(locales: string | string[], options?: Intl.NumberFormatOptions): string;
 }
 
-interface Float32Array {
+interface Float32Array<TArrayBuffer extends ArrayBufferLike> {
     toLocaleString(locales: string | string[], options?: Intl.NumberFormatOptions): string;
 }
 
-interface Float64Array {
+interface Float64Array<TArrayBuffer extends ArrayBufferLike> {
     toLocaleString(locales: string | string[], options?: Intl.NumberFormatOptions): string;
 }
 
@@ -5624,16 +5629,17 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
 
-/// <reference no-default-lib="true"/>
-
 interface Map<K, V> {
+    /**
+     * Removes all elements from the Map.
+     */
     clear(): void;
     /**
      * @returns true if an element in the Map existed and has been removed, or false if the element does not exist.
@@ -5708,7 +5714,9 @@ interface Set<T> {
      * Appends a new element with a specified value to the end of the Set.
      */
     add(value: T): this;
-
+    /**
+     * Removes all elements from the Set.
+     */
     clear(): void;
     /**
      * Removes a specified value from the Set.
@@ -5724,7 +5732,7 @@ interface Set<T> {
      */
     has(value: T): boolean;
     /**
-     * @returns the number of (unique) elements in Set.
+     * @returns the number of (unique) elements in the Set.
      */
     readonly size: number;
 }
@@ -5736,8 +5744,17 @@ interface SetConstructor {
 declare var Set: SetConstructor;
 
 interface ReadonlySet<T> {
+    /**
+     * Executes a provided function once per each value in the ReadonlySet object, in insertion order.
+     */
     forEach(callbackfn: (value: T, value2: T, set: ReadonlySet<T>) => void, thisArg?: any): void;
+    /**
+     * @returns a boolean indicating whether an element with the specified value exists in the Set or not.
+     */
     has(value: T): boolean;
+    /**
+     * @returns the number of (unique) elements in the Set.
+     */
     readonly size: number;
 }
 
@@ -5773,14 +5790,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 interface SymbolConstructor {
     /**
@@ -5803,7 +5818,7 @@ interface SymbolConstructor {
 
     /**
      * Returns a key from the global symbol registry matching the given Symbol if found.
-     * Otherwise, returns a undefined.
+     * Otherwise, returns undefined.
      * @param sym Symbol to find the key for.
      */
     keyFor(sym: symbol): string | undefined;
@@ -5821,14 +5836,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 /// <reference lib="es2015.symbol" />
 
@@ -5852,39 +5865,59 @@ interface IteratorReturnResult<TReturn> {
 
 type IteratorResult<T, TReturn = any> = IteratorYieldResult<T> | IteratorReturnResult<TReturn>;
 
-interface Iterator<T, TReturn = any, TNext = undefined> {
+interface Iterator<T, TReturn = any, TNext = any> {
     // NOTE: 'next' is defined using a tuple to ensure we report the correct assignability errors in all places.
-    next(...args: [] | [TNext]): IteratorResult<T, TReturn>;
+    next(...[value]: [] | [TNext]): IteratorResult<T, TReturn>;
     return?(value?: TReturn): IteratorResult<T, TReturn>;
     throw?(e?: any): IteratorResult<T, TReturn>;
 }
 
-interface Iterable<T> {
-    [Symbol.iterator](): Iterator<T>;
+interface Iterable<T, TReturn = any, TNext = any> {
+    [Symbol.iterator](): Iterator<T, TReturn, TNext>;
 }
 
-interface IterableIterator<T> extends Iterator<T> {
-    [Symbol.iterator](): IterableIterator<T>;
+/**
+ * Describes a user-defined {@link Iterator} that is also iterable.
+ */
+interface IterableIterator<T, TReturn = any, TNext = any> extends Iterator<T, TReturn, TNext> {
+    [Symbol.iterator](): IterableIterator<T, TReturn, TNext>;
+}
+
+/**
+ * Describes an {@link Iterator} produced by the runtime that inherits from the intrinsic `Iterator.prototype`.
+ */
+interface IteratorObject<T, TReturn = unknown, TNext = unknown> extends Iterator<T, TReturn, TNext> {
+    [Symbol.iterator](): IteratorObject<T, TReturn, TNext>;
+}
+
+/**
+ * Defines the `TReturn` type used for built-in iterators produced by `Array`, `Map`, `Set`, and others.
+ * This is `undefined` when `strictBuiltInIteratorReturn` is `true`; otherwise, this is `any`.
+ */
+type BuiltinIteratorReturn = intrinsic;
+
+interface ArrayIterator<T> extends IteratorObject<T, BuiltinIteratorReturn, unknown> {
+    [Symbol.iterator](): ArrayIterator<T>;
 }
 
 interface Array<T> {
     /** Iterator */
-    [Symbol.iterator](): IterableIterator<T>;
+    [Symbol.iterator](): ArrayIterator<T>;
 
     /**
      * Returns an iterable of key, value pairs for every entry in the array
      */
-    entries(): IterableIterator<[number, T]>;
+    entries(): ArrayIterator<[number, T]>;
 
     /**
      * Returns an iterable of keys in the array
      */
-    keys(): IterableIterator<number>;
+    keys(): ArrayIterator<number>;
 
     /**
      * Returns an iterable of values in the array
      */
-    values(): IterableIterator<T>;
+    values(): ArrayIterator<T>;
 }
 
 interface ArrayConstructor {
@@ -5905,67 +5938,71 @@ interface ArrayConstructor {
 
 interface ReadonlyArray<T> {
     /** Iterator of values in the array. */
-    [Symbol.iterator](): IterableIterator<T>;
+    [Symbol.iterator](): ArrayIterator<T>;
 
     /**
      * Returns an iterable of key, value pairs for every entry in the array
      */
-    entries(): IterableIterator<[number, T]>;
+    entries(): ArrayIterator<[number, T]>;
 
     /**
      * Returns an iterable of keys in the array
      */
-    keys(): IterableIterator<number>;
+    keys(): ArrayIterator<number>;
 
     /**
      * Returns an iterable of values in the array
      */
-    values(): IterableIterator<T>;
+    values(): ArrayIterator<T>;
 }
 
 interface IArguments {
     /** Iterator */
-    [Symbol.iterator](): IterableIterator<any>;
+    [Symbol.iterator](): ArrayIterator<any>;
+}
+
+interface MapIterator<T> extends IteratorObject<T, BuiltinIteratorReturn, unknown> {
+    [Symbol.iterator](): MapIterator<T>;
 }
 
 interface Map<K, V> {
     /** Returns an iterable of entries in the map. */
-    [Symbol.iterator](): IterableIterator<[K, V]>;
+    [Symbol.iterator](): MapIterator<[K, V]>;
 
     /**
      * Returns an iterable of key, value pairs for every entry in the map.
      */
-    entries(): IterableIterator<[K, V]>;
+    entries(): MapIterator<[K, V]>;
 
     /**
      * Returns an iterable of keys in the map
      */
-    keys(): IterableIterator<K>;
+    keys(): MapIterator<K>;
 
     /**
      * Returns an iterable of values in the map
      */
-    values(): IterableIterator<V>;
+    values(): MapIterator<V>;
 }
 
 interface ReadonlyMap<K, V> {
     /** Returns an iterable of entries in the map. */
-    [Symbol.iterator](): IterableIterator<[K, V]>;
+    [Symbol.iterator](): MapIterator<[K, V]>;
 
     /**
      * Returns an iterable of key, value pairs for every entry in the map.
      */
-    entries(): IterableIterator<[K, V]>;
+    entries(): MapIterator<[K, V]>;
 
     /**
      * Returns an iterable of keys in the map
      */
-    keys(): IterableIterator<K>;
+    keys(): MapIterator<K>;
 
     /**
      * Returns an iterable of values in the map
      */
-    values(): IterableIterator<V>;
+    values(): MapIterator<V>;
 }
 
 interface MapConstructor {
@@ -5976,45 +6013,51 @@ interface MapConstructor {
 interface WeakMap<K extends WeakKey, V> {}
 
 interface WeakMapConstructor {
-    new <K extends WeakKey, V>(iterable: Iterable<readonly [K, V]>): WeakMap<K, V>;
+    new <K extends WeakKey = WeakKey, V = any>(iterable?: Iterable<readonly [K, V]> | null): WeakMap<K, V>;
+}
+
+interface SetIterator<T> extends IteratorObject<T, BuiltinIteratorReturn, unknown> {
+    [Symbol.iterator](): SetIterator<T>;
 }
 
 interface Set<T> {
     /** Iterates over values in the set. */
-    [Symbol.iterator](): IterableIterator<T>;
+    [Symbol.iterator](): SetIterator<T>;
+
     /**
      * Returns an iterable of [v,v] pairs for every value `v` in the set.
      */
-    entries(): IterableIterator<[T, T]>;
+    entries(): SetIterator<[T, T]>;
+
     /**
      * Despite its name, returns an iterable of the values in the set.
      */
-    keys(): IterableIterator<T>;
+    keys(): SetIterator<T>;
 
     /**
      * Returns an iterable of values in the set.
      */
-    values(): IterableIterator<T>;
+    values(): SetIterator<T>;
 }
 
 interface ReadonlySet<T> {
     /** Iterates over values in the set. */
-    [Symbol.iterator](): IterableIterator<T>;
+    [Symbol.iterator](): SetIterator<T>;
 
     /**
      * Returns an iterable of [v,v] pairs for every value `v` in the set.
      */
-    entries(): IterableIterator<[T, T]>;
+    entries(): SetIterator<[T, T]>;
 
     /**
      * Despite its name, returns an iterable of the values in the set.
      */
-    keys(): IterableIterator<T>;
+    keys(): SetIterator<T>;
 
     /**
      * Returns an iterable of values in the set.
      */
-    values(): IterableIterator<T>;
+    values(): SetIterator<T>;
 }
 
 interface SetConstructor {
@@ -6047,265 +6090,345 @@ interface PromiseConstructor {
     race<T>(values: Iterable<T | PromiseLike<T>>): Promise<Awaited<T>>;
 }
 
-interface String {
-    /** Iterator */
-    [Symbol.iterator](): IterableIterator<string>;
+interface StringIterator<T> extends IteratorObject<T, BuiltinIteratorReturn, unknown> {
+    [Symbol.iterator](): StringIterator<T>;
 }
 
-interface Int8Array {
-    [Symbol.iterator](): IterableIterator<number>;
+interface String {
+    /** Iterator */
+    [Symbol.iterator](): StringIterator<string>;
+}
+
+interface Int8Array<TArrayBuffer extends ArrayBufferLike> {
+    [Symbol.iterator](): ArrayIterator<number>;
+
     /**
      * Returns an array of key, value pairs for every entry in the array
      */
-    entries(): IterableIterator<[number, number]>;
+    entries(): ArrayIterator<[number, number]>;
+
     /**
      * Returns an list of keys in the array
      */
-    keys(): IterableIterator<number>;
+    keys(): ArrayIterator<number>;
+
     /**
      * Returns an list of values in the array
      */
-    values(): IterableIterator<number>;
+    values(): ArrayIterator<number>;
 }
 
 interface Int8ArrayConstructor {
-    new (elements: Iterable<number>): Int8Array;
+    new (elements: Iterable<number>): Int8Array<ArrayBuffer>;
 
     /**
      * Creates an array from an array-like or iterable object.
-     * @param arrayLike An array-like or iterable object to convert to an array.
+     * @param elements An iterable object to convert to an array.
+     */
+    from(elements: Iterable<number>): Int8Array<ArrayBuffer>;
+
+    /**
+     * Creates an array from an array-like or iterable object.
+     * @param elements An iterable object to convert to an array.
      * @param mapfn A mapping function to call on every element of the array.
      * @param thisArg Value of 'this' used to invoke the mapfn.
      */
-    from(arrayLike: Iterable<number>, mapfn?: (v: number, k: number) => number, thisArg?: any): Int8Array;
+    from<T>(elements: Iterable<T>, mapfn?: (v: T, k: number) => number, thisArg?: any): Int8Array<ArrayBuffer>;
 }
 
-interface Uint8Array {
-    [Symbol.iterator](): IterableIterator<number>;
+interface Uint8Array<TArrayBuffer extends ArrayBufferLike> {
+    [Symbol.iterator](): ArrayIterator<number>;
+
     /**
      * Returns an array of key, value pairs for every entry in the array
      */
-    entries(): IterableIterator<[number, number]>;
+    entries(): ArrayIterator<[number, number]>;
+
     /**
      * Returns an list of keys in the array
      */
-    keys(): IterableIterator<number>;
+    keys(): ArrayIterator<number>;
+
     /**
      * Returns an list of values in the array
      */
-    values(): IterableIterator<number>;
+    values(): ArrayIterator<number>;
 }
 
 interface Uint8ArrayConstructor {
-    new (elements: Iterable<number>): Uint8Array;
+    new (elements: Iterable<number>): Uint8Array<ArrayBuffer>;
 
     /**
      * Creates an array from an array-like or iterable object.
-     * @param arrayLike An array-like or iterable object to convert to an array.
+     * @param elements An iterable object to convert to an array.
+     */
+    from(elements: Iterable<number>): Uint8Array<ArrayBuffer>;
+
+    /**
+     * Creates an array from an array-like or iterable object.
+     * @param elements An iterable object to convert to an array.
      * @param mapfn A mapping function to call on every element of the array.
      * @param thisArg Value of 'this' used to invoke the mapfn.
      */
-    from(arrayLike: Iterable<number>, mapfn?: (v: number, k: number) => number, thisArg?: any): Uint8Array;
+    from<T>(elements: Iterable<T>, mapfn?: (v: T, k: number) => number, thisArg?: any): Uint8Array<ArrayBuffer>;
 }
 
-interface Uint8ClampedArray {
-    [Symbol.iterator](): IterableIterator<number>;
+interface Uint8ClampedArray<TArrayBuffer extends ArrayBufferLike> {
+    [Symbol.iterator](): ArrayIterator<number>;
+
     /**
      * Returns an array of key, value pairs for every entry in the array
      */
-    entries(): IterableIterator<[number, number]>;
+    entries(): ArrayIterator<[number, number]>;
 
     /**
      * Returns an list of keys in the array
      */
-    keys(): IterableIterator<number>;
+    keys(): ArrayIterator<number>;
 
     /**
      * Returns an list of values in the array
      */
-    values(): IterableIterator<number>;
+    values(): ArrayIterator<number>;
 }
 
 interface Uint8ClampedArrayConstructor {
-    new (elements: Iterable<number>): Uint8ClampedArray;
+    new (elements: Iterable<number>): Uint8ClampedArray<ArrayBuffer>;
 
     /**
      * Creates an array from an array-like or iterable object.
-     * @param arrayLike An array-like or iterable object to convert to an array.
+     * @param elements An iterable object to convert to an array.
+     */
+    from(elements: Iterable<number>): Uint8ClampedArray<ArrayBuffer>;
+
+    /**
+     * Creates an array from an array-like or iterable object.
+     * @param elements An iterable object to convert to an array.
      * @param mapfn A mapping function to call on every element of the array.
      * @param thisArg Value of 'this' used to invoke the mapfn.
      */
-    from(arrayLike: Iterable<number>, mapfn?: (v: number, k: number) => number, thisArg?: any): Uint8ClampedArray;
+    from<T>(elements: Iterable<T>, mapfn?: (v: T, k: number) => number, thisArg?: any): Uint8ClampedArray<ArrayBuffer>;
 }
 
-interface Int16Array {
-    [Symbol.iterator](): IterableIterator<number>;
+interface Int16Array<TArrayBuffer extends ArrayBufferLike> {
+    [Symbol.iterator](): ArrayIterator<number>;
     /**
      * Returns an array of key, value pairs for every entry in the array
      */
-    entries(): IterableIterator<[number, number]>;
+    entries(): ArrayIterator<[number, number]>;
 
     /**
      * Returns an list of keys in the array
      */
-    keys(): IterableIterator<number>;
+    keys(): ArrayIterator<number>;
 
     /**
      * Returns an list of values in the array
      */
-    values(): IterableIterator<number>;
+    values(): ArrayIterator<number>;
 }
 
 interface Int16ArrayConstructor {
-    new (elements: Iterable<number>): Int16Array;
+    new (elements: Iterable<number>): Int16Array<ArrayBuffer>;
 
     /**
      * Creates an array from an array-like or iterable object.
-     * @param arrayLike An array-like or iterable object to convert to an array.
+     * @param elements An iterable object to convert to an array.
+     */
+    from(elements: Iterable<number>): Int16Array<ArrayBuffer>;
+
+    /**
+     * Creates an array from an array-like or iterable object.
+     * @param elements An iterable object to convert to an array.
      * @param mapfn A mapping function to call on every element of the array.
      * @param thisArg Value of 'this' used to invoke the mapfn.
      */
-    from(arrayLike: Iterable<number>, mapfn?: (v: number, k: number) => number, thisArg?: any): Int16Array;
+    from<T>(elements: Iterable<T>, mapfn?: (v: T, k: number) => number, thisArg?: any): Int16Array<ArrayBuffer>;
 }
 
-interface Uint16Array {
-    [Symbol.iterator](): IterableIterator<number>;
+interface Uint16Array<TArrayBuffer extends ArrayBufferLike> {
+    [Symbol.iterator](): ArrayIterator<number>;
+
     /**
      * Returns an array of key, value pairs for every entry in the array
      */
-    entries(): IterableIterator<[number, number]>;
+    entries(): ArrayIterator<[number, number]>;
+
     /**
      * Returns an list of keys in the array
      */
-    keys(): IterableIterator<number>;
+    keys(): ArrayIterator<number>;
+
     /**
      * Returns an list of values in the array
      */
-    values(): IterableIterator<number>;
+    values(): ArrayIterator<number>;
 }
 
 interface Uint16ArrayConstructor {
-    new (elements: Iterable<number>): Uint16Array;
+    new (elements: Iterable<number>): Uint16Array<ArrayBuffer>;
 
     /**
      * Creates an array from an array-like or iterable object.
-     * @param arrayLike An array-like or iterable object to convert to an array.
+     * @param elements An iterable object to convert to an array.
+     */
+    from(elements: Iterable<number>): Uint16Array<ArrayBuffer>;
+
+    /**
+     * Creates an array from an array-like or iterable object.
+     * @param elements An iterable object to convert to an array.
      * @param mapfn A mapping function to call on every element of the array.
      * @param thisArg Value of 'this' used to invoke the mapfn.
      */
-    from(arrayLike: Iterable<number>, mapfn?: (v: number, k: number) => number, thisArg?: any): Uint16Array;
+    from<T>(elements: Iterable<T>, mapfn?: (v: T, k: number) => number, thisArg?: any): Uint16Array<ArrayBuffer>;
 }
 
-interface Int32Array {
-    [Symbol.iterator](): IterableIterator<number>;
+interface Int32Array<TArrayBuffer extends ArrayBufferLike> {
+    [Symbol.iterator](): ArrayIterator<number>;
+
     /**
      * Returns an array of key, value pairs for every entry in the array
      */
-    entries(): IterableIterator<[number, number]>;
+    entries(): ArrayIterator<[number, number]>;
+
     /**
      * Returns an list of keys in the array
      */
-    keys(): IterableIterator<number>;
+    keys(): ArrayIterator<number>;
+
     /**
      * Returns an list of values in the array
      */
-    values(): IterableIterator<number>;
+    values(): ArrayIterator<number>;
 }
 
 interface Int32ArrayConstructor {
-    new (elements: Iterable<number>): Int32Array;
+    new (elements: Iterable<number>): Int32Array<ArrayBuffer>;
 
     /**
      * Creates an array from an array-like or iterable object.
-     * @param arrayLike An array-like or iterable object to convert to an array.
+     * @param elements An iterable object to convert to an array.
+     */
+    from(elements: Iterable<number>): Int32Array<ArrayBuffer>;
+
+    /**
+     * Creates an array from an array-like or iterable object.
+     * @param elements An iterable object to convert to an array.
      * @param mapfn A mapping function to call on every element of the array.
      * @param thisArg Value of 'this' used to invoke the mapfn.
      */
-    from(arrayLike: Iterable<number>, mapfn?: (v: number, k: number) => number, thisArg?: any): Int32Array;
+    from<T>(elements: Iterable<T>, mapfn?: (v: T, k: number) => number, thisArg?: any): Int32Array<ArrayBuffer>;
 }
 
-interface Uint32Array {
-    [Symbol.iterator](): IterableIterator<number>;
+interface Uint32Array<TArrayBuffer extends ArrayBufferLike> {
+    [Symbol.iterator](): ArrayIterator<number>;
+
     /**
      * Returns an array of key, value pairs for every entry in the array
      */
-    entries(): IterableIterator<[number, number]>;
+    entries(): ArrayIterator<[number, number]>;
+
     /**
      * Returns an list of keys in the array
      */
-    keys(): IterableIterator<number>;
+    keys(): ArrayIterator<number>;
+
     /**
      * Returns an list of values in the array
      */
-    values(): IterableIterator<number>;
+    values(): ArrayIterator<number>;
 }
 
 interface Uint32ArrayConstructor {
-    new (elements: Iterable<number>): Uint32Array;
+    new (elements: Iterable<number>): Uint32Array<ArrayBuffer>;
 
     /**
      * Creates an array from an array-like or iterable object.
-     * @param arrayLike An array-like or iterable object to convert to an array.
+     * @param elements An iterable object to convert to an array.
+     */
+    from(elements: Iterable<number>): Uint32Array<ArrayBuffer>;
+
+    /**
+     * Creates an array from an array-like or iterable object.
+     * @param elements An iterable object to convert to an array.
      * @param mapfn A mapping function to call on every element of the array.
      * @param thisArg Value of 'this' used to invoke the mapfn.
      */
-    from(arrayLike: Iterable<number>, mapfn?: (v: number, k: number) => number, thisArg?: any): Uint32Array;
+    from<T>(elements: Iterable<T>, mapfn?: (v: T, k: number) => number, thisArg?: any): Uint32Array<ArrayBuffer>;
 }
 
-interface Float32Array {
-    [Symbol.iterator](): IterableIterator<number>;
+interface Float32Array<TArrayBuffer extends ArrayBufferLike> {
+    [Symbol.iterator](): ArrayIterator<number>;
+
     /**
      * Returns an array of key, value pairs for every entry in the array
      */
-    entries(): IterableIterator<[number, number]>;
+    entries(): ArrayIterator<[number, number]>;
+
     /**
      * Returns an list of keys in the array
      */
-    keys(): IterableIterator<number>;
+    keys(): ArrayIterator<number>;
+
     /**
      * Returns an list of values in the array
      */
-    values(): IterableIterator<number>;
+    values(): ArrayIterator<number>;
 }
 
 interface Float32ArrayConstructor {
-    new (elements: Iterable<number>): Float32Array;
+    new (elements: Iterable<number>): Float32Array<ArrayBuffer>;
 
     /**
      * Creates an array from an array-like or iterable object.
-     * @param arrayLike An array-like or iterable object to convert to an array.
+     * @param elements An iterable object to convert to an array.
+     */
+    from(elements: Iterable<number>): Float32Array<ArrayBuffer>;
+
+    /**
+     * Creates an array from an array-like or iterable object.
+     * @param elements An iterable object to convert to an array.
      * @param mapfn A mapping function to call on every element of the array.
      * @param thisArg Value of 'this' used to invoke the mapfn.
      */
-    from(arrayLike: Iterable<number>, mapfn?: (v: number, k: number) => number, thisArg?: any): Float32Array;
+    from<T>(elements: Iterable<T>, mapfn?: (v: T, k: number) => number, thisArg?: any): Float32Array<ArrayBuffer>;
 }
 
-interface Float64Array {
-    [Symbol.iterator](): IterableIterator<number>;
+interface Float64Array<TArrayBuffer extends ArrayBufferLike> {
+    [Symbol.iterator](): ArrayIterator<number>;
+
     /**
      * Returns an array of key, value pairs for every entry in the array
      */
-    entries(): IterableIterator<[number, number]>;
+    entries(): ArrayIterator<[number, number]>;
+
     /**
      * Returns an list of keys in the array
      */
-    keys(): IterableIterator<number>;
+    keys(): ArrayIterator<number>;
+
     /**
      * Returns an list of values in the array
      */
-    values(): IterableIterator<number>;
+    values(): ArrayIterator<number>;
 }
 
 interface Float64ArrayConstructor {
-    new (elements: Iterable<number>): Float64Array;
+    new (elements: Iterable<number>): Float64Array<ArrayBuffer>;
 
     /**
      * Creates an array from an array-like or iterable object.
-     * @param arrayLike An array-like or iterable object to convert to an array.
+     * @param elements An iterable object to convert to an array.
+     */
+    from(elements: Iterable<number>): Float64Array<ArrayBuffer>;
+
+    /**
+     * Creates an array from an array-like or iterable object.
+     * @param elements An iterable object to convert to an array.
      * @param mapfn A mapping function to call on every element of the array.
      * @param thisArg Value of 'this' used to invoke the mapfn.
      */
-    from(arrayLike: Iterable<number>, mapfn?: (v: number, k: number) => number, thisArg?: any): Float64Array;
+    from<T>(elements: Iterable<T>, mapfn?: (v: T, k: number) => number, thisArg?: any): Float64Array<ArrayBuffer>;
 }
 
 //========== lib.es2015.generator.d.ts ==========
@@ -6318,20 +6441,18 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
 
-/// <reference no-default-lib="true"/>
-
 /// <reference lib="es2015.iterable" />
 
-interface Generator<T = unknown, TReturn = any, TNext = unknown> extends Iterator<T, TReturn, TNext> {
+interface Generator<T = unknown, TReturn = any, TNext = any> extends IteratorObject<T, TReturn, TNext> {
     // NOTE: 'next' is defined using a tuple to ensure we report the correct assignability errors in all places.
-    next(...args: [] | [TNext]): IteratorResult<T, TReturn>;
+    next(...[value]: [] | [TNext]): IteratorResult<T, TReturn>;
     return(value: TReturn): IteratorResult<T, TReturn>;
     throw(e: any): IteratorResult<T, TReturn>;
     [Symbol.iterator](): Generator<T, TReturn, TNext>;
@@ -6397,14 +6518,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 interface PromiseConstructor {
     /**
@@ -6480,14 +6599,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 interface ProxyHandler<T extends object> {
     /**
@@ -6610,14 +6727,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 declare namespace Reflect {
     /**
@@ -6756,14 +6871,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 /// <reference lib="es2015.symbol" />
 
@@ -7018,46 +7131,46 @@ interface String {
 }
 
 interface ArrayBuffer {
+    readonly [Symbol.toStringTag]: "ArrayBuffer";
+}
+
+interface DataView<TArrayBuffer extends ArrayBufferLike> {
     readonly [Symbol.toStringTag]: string;
 }
 
-interface DataView {
-    readonly [Symbol.toStringTag]: string;
-}
-
-interface Int8Array {
+interface Int8Array<TArrayBuffer extends ArrayBufferLike> {
     readonly [Symbol.toStringTag]: "Int8Array";
 }
 
-interface Uint8Array {
+interface Uint8Array<TArrayBuffer extends ArrayBufferLike> {
     readonly [Symbol.toStringTag]: "Uint8Array";
 }
 
-interface Uint8ClampedArray {
+interface Uint8ClampedArray<TArrayBuffer extends ArrayBufferLike> {
     readonly [Symbol.toStringTag]: "Uint8ClampedArray";
 }
 
-interface Int16Array {
+interface Int16Array<TArrayBuffer extends ArrayBufferLike> {
     readonly [Symbol.toStringTag]: "Int16Array";
 }
 
-interface Uint16Array {
+interface Uint16Array<TArrayBuffer extends ArrayBufferLike> {
     readonly [Symbol.toStringTag]: "Uint16Array";
 }
 
-interface Int32Array {
+interface Int32Array<TArrayBuffer extends ArrayBufferLike> {
     readonly [Symbol.toStringTag]: "Int32Array";
 }
 
-interface Uint32Array {
+interface Uint32Array<TArrayBuffer extends ArrayBufferLike> {
     readonly [Symbol.toStringTag]: "Uint32Array";
 }
 
-interface Float32Array {
+interface Float32Array<TArrayBuffer extends ArrayBufferLike> {
     readonly [Symbol.toStringTag]: "Float32Array";
 }
 
-interface Float64Array {
+interface Float64Array<TArrayBuffer extends ArrayBufferLike> {
     readonly [Symbol.toStringTag]: "Float64Array";
 }
 
@@ -7084,14 +7197,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 /// <reference lib="es5" />
 /// <reference lib="es2015.core" />
@@ -7114,14 +7225,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 interface Array<T> {
     /**
@@ -7141,7 +7250,7 @@ interface ReadonlyArray<T> {
     includes(searchElement: T, fromIndex?: number): boolean;
 }
 
-interface Int8Array {
+interface Int8Array<TArrayBuffer extends ArrayBufferLike> {
     /**
      * Determines whether an array includes a certain element, returning true or false as appropriate.
      * @param searchElement The element to search for.
@@ -7150,7 +7259,7 @@ interface Int8Array {
     includes(searchElement: number, fromIndex?: number): boolean;
 }
 
-interface Uint8Array {
+interface Uint8Array<TArrayBuffer extends ArrayBufferLike> {
     /**
      * Determines whether an array includes a certain element, returning true or false as appropriate.
      * @param searchElement The element to search for.
@@ -7159,7 +7268,7 @@ interface Uint8Array {
     includes(searchElement: number, fromIndex?: number): boolean;
 }
 
-interface Uint8ClampedArray {
+interface Uint8ClampedArray<TArrayBuffer extends ArrayBufferLike> {
     /**
      * Determines whether an array includes a certain element, returning true or false as appropriate.
      * @param searchElement The element to search for.
@@ -7168,7 +7277,7 @@ interface Uint8ClampedArray {
     includes(searchElement: number, fromIndex?: number): boolean;
 }
 
-interface Int16Array {
+interface Int16Array<TArrayBuffer extends ArrayBufferLike> {
     /**
      * Determines whether an array includes a certain element, returning true or false as appropriate.
      * @param searchElement The element to search for.
@@ -7177,7 +7286,7 @@ interface Int16Array {
     includes(searchElement: number, fromIndex?: number): boolean;
 }
 
-interface Uint16Array {
+interface Uint16Array<TArrayBuffer extends ArrayBufferLike> {
     /**
      * Determines whether an array includes a certain element, returning true or false as appropriate.
      * @param searchElement The element to search for.
@@ -7186,7 +7295,7 @@ interface Uint16Array {
     includes(searchElement: number, fromIndex?: number): boolean;
 }
 
-interface Int32Array {
+interface Int32Array<TArrayBuffer extends ArrayBufferLike> {
     /**
      * Determines whether an array includes a certain element, returning true or false as appropriate.
      * @param searchElement The element to search for.
@@ -7195,7 +7304,7 @@ interface Int32Array {
     includes(searchElement: number, fromIndex?: number): boolean;
 }
 
-interface Uint32Array {
+interface Uint32Array<TArrayBuffer extends ArrayBufferLike> {
     /**
      * Determines whether an array includes a certain element, returning true or false as appropriate.
      * @param searchElement The element to search for.
@@ -7204,7 +7313,7 @@ interface Uint32Array {
     includes(searchElement: number, fromIndex?: number): boolean;
 }
 
-interface Float32Array {
+interface Float32Array<TArrayBuffer extends ArrayBufferLike> {
     /**
      * Determines whether an array includes a certain element, returning true or false as appropriate.
      * @param searchElement The element to search for.
@@ -7213,7 +7322,7 @@ interface Float32Array {
     includes(searchElement: number, fromIndex?: number): boolean;
 }
 
-interface Float64Array {
+interface Float64Array<TArrayBuffer extends ArrayBufferLike> {
     /**
      * Determines whether an array includes a certain element, returning true or false as appropriate.
      * @param searchElement The element to search for.
@@ -7232,14 +7341,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 declare namespace Intl {
     /**
@@ -7247,7 +7354,7 @@ declare namespace Intl {
      * the canonical locale names. Duplicates will be omitted and elements
      * will be validated as structurally valid language tags.
      *
-     * [MDN](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/getCanonicalLocales)
+     * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/getCanonicalLocales)
      *
      * @param locale A list of String values for which to get the canonical locale names
      * @returns An array containing the canonical and validated locale names.
@@ -7265,20 +7372,18 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 /// <reference lib="es2015" />
 /// <reference lib="es2016.array.include" />
 /// <reference lib="es2016.intl" />
 
-//========== lib.es2017.object.d.ts ==========
+//========== lib.es2017.arraybuffer.d.ts ==========
 /*! *****************************************************************************
 Copyright (c) Microsoft Corporation. All rights reserved.
 Licensed under the Apache License, Version 2.0 (the "License"); you may not use
@@ -7288,48 +7393,18 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
 
-/// <reference no-default-lib="true"/>
-
-interface ObjectConstructor {
-    /**
-     * Returns an array of values of the enumerable properties of an object
-     * @param o Object that contains the properties and methods. This can be an object that you created or an existing Document Object Model (DOM) object.
-     */
-    values<T>(o: { [s: string]: T; } | ArrayLike<T>): T[];
-
-    /**
-     * Returns an array of values of the enumerable properties of an object
-     * @param o Object that contains the properties and methods. This can be an object that you created or an existing Document Object Model (DOM) object.
-     */
-    values(o: {}): any[];
-
-    /**
-     * Returns an array of key/values of the enumerable properties of an object
-     * @param o Object that contains the properties and methods. This can be an object that you created or an existing Document Object Model (DOM) object.
-     */
-    entries<T>(o: { [s: string]: T; } | ArrayLike<T>): [string, T][];
-
-    /**
-     * Returns an array of key/values of the enumerable properties of an object
-     * @param o Object that contains the properties and methods. This can be an object that you created or an existing Document Object Model (DOM) object.
-     */
-    entries(o: {}): [string, any][];
-
-    /**
-     * Returns an object containing all own property descriptors of an object
-     * @param o Object that contains the properties and methods. This can be an object that you created or an existing Document Object Model (DOM) object.
-     */
-    getOwnPropertyDescriptors<T>(o: T): { [P in keyof T]: TypedPropertyDescriptor<T[P]>; } & { [x: string]: PropertyDescriptor; };
+interface ArrayBufferConstructor {
+    new (): ArrayBuffer;
 }
 
-//========== lib.es2017.sharedmemory.d.ts ==========
+//========== lib.es2017.date.d.ts ==========
 /*! *****************************************************************************
 Copyright (c) Microsoft Corporation. All rights reserved.
 Licensed under the Apache License, Version 2.0 (the "License"); you may not use
@@ -7339,178 +7414,25 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
 
-/// <reference no-default-lib="true"/>
-
-/// <reference lib="es2015.symbol" />
-/// <reference lib="es2015.symbol.wellknown" />
-
-interface SharedArrayBuffer {
+interface DateConstructor {
     /**
-     * Read-only. The length of the ArrayBuffer (in bytes).
+     * Returns the number of milliseconds between midnight, January 1, 1970 Universal Coordinated Time (UTC) (or GMT) and the specified date.
+     * @param year The full year designation is required for cross-century date accuracy. If year is between 0 and 99 is used, then year is assumed to be 1900 + year.
+     * @param monthIndex The month as a number between 0 and 11 (January to December).
+     * @param date The date as a number between 1 and 31.
+     * @param hours Must be supplied if minutes is supplied. A number from 0 to 23 (midnight to 11pm) that specifies the hour.
+     * @param minutes Must be supplied if seconds is supplied. A number from 0 to 59 that specifies the minutes.
+     * @param seconds Must be supplied if milliseconds is supplied. A number from 0 to 59 that specifies the seconds.
+     * @param ms A number from 0 to 999 that specifies the milliseconds.
      */
-    readonly byteLength: number;
-
-    /**
-     * Returns a section of an SharedArrayBuffer.
-     */
-    slice(begin: number, end?: number): SharedArrayBuffer;
-    readonly [Symbol.species]: SharedArrayBuffer;
-    readonly [Symbol.toStringTag]: "SharedArrayBuffer";
-}
-
-interface SharedArrayBufferConstructor {
-    readonly prototype: SharedArrayBuffer;
-    new (byteLength: number): SharedArrayBuffer;
-}
-declare var SharedArrayBuffer: SharedArrayBufferConstructor;
-
-interface ArrayBufferTypes {
-    SharedArrayBuffer: SharedArrayBuffer;
-}
-
-interface Atomics {
-    /**
-     * Adds a value to the value at the given position in the array, returning the original value.
-     * Until this atomic operation completes, any other read or write operation against the array
-     * will block.
-     */
-    add(typedArray: Int8Array | Uint8Array | Int16Array | Uint16Array | Int32Array | Uint32Array, index: number, value: number): number;
-
-    /**
-     * Stores the bitwise AND of a value with the value at the given position in the array,
-     * returning the original value. Until this atomic operation completes, any other read or
-     * write operation against the array will block.
-     */
-    and(typedArray: Int8Array | Uint8Array | Int16Array | Uint16Array | Int32Array | Uint32Array, index: number, value: number): number;
-
-    /**
-     * Replaces the value at the given position in the array if the original value equals the given
-     * expected value, returning the original value. Until this atomic operation completes, any
-     * other read or write operation against the array will block.
-     */
-    compareExchange(typedArray: Int8Array | Uint8Array | Int16Array | Uint16Array | Int32Array | Uint32Array, index: number, expectedValue: number, replacementValue: number): number;
-
-    /**
-     * Replaces the value at the given position in the array, returning the original value. Until
-     * this atomic operation completes, any other read or write operation against the array will
-     * block.
-     */
-    exchange(typedArray: Int8Array | Uint8Array | Int16Array | Uint16Array | Int32Array | Uint32Array, index: number, value: number): number;
-
-    /**
-     * Returns a value indicating whether high-performance algorithms can use atomic operations
-     * (`true`) or must use locks (`false`) for the given number of bytes-per-element of a typed
-     * array.
-     */
-    isLockFree(size: number): boolean;
-
-    /**
-     * Returns the value at the given position in the array. Until this atomic operation completes,
-     * any other read or write operation against the array will block.
-     */
-    load(typedArray: Int8Array | Uint8Array | Int16Array | Uint16Array | Int32Array | Uint32Array, index: number): number;
-
-    /**
-     * Stores the bitwise OR of a value with the value at the given position in the array,
-     * returning the original value. Until this atomic operation completes, any other read or write
-     * operation against the array will block.
-     */
-    or(typedArray: Int8Array | Uint8Array | Int16Array | Uint16Array | Int32Array | Uint32Array, index: number, value: number): number;
-
-    /**
-     * Stores a value at the given position in the array, returning the new value. Until this
-     * atomic operation completes, any other read or write operation against the array will block.
-     */
-    store(typedArray: Int8Array | Uint8Array | Int16Array | Uint16Array | Int32Array | Uint32Array, index: number, value: number): number;
-
-    /**
-     * Subtracts a value from the value at the given position in the array, returning the original
-     * value. Until this atomic operation completes, any other read or write operation against the
-     * array will block.
-     */
-    sub(typedArray: Int8Array | Uint8Array | Int16Array | Uint16Array | Int32Array | Uint32Array, index: number, value: number): number;
-
-    /**
-     * If the value at the given position in the array is equal to the provided value, the current
-     * agent is put to sleep causing execution to suspend until the timeout expires (returning
-     * `"timed-out"`) or until the agent is awoken (returning `"ok"`); otherwise, returns
-     * `"not-equal"`.
-     */
-    wait(typedArray: Int32Array, index: number, value: number, timeout?: number): "ok" | "not-equal" | "timed-out";
-
-    /**
-     * Wakes up sleeping agents that are waiting on the given index of the array, returning the
-     * number of agents that were awoken.
-     * @param typedArray A shared Int32Array.
-     * @param index The position in the typedArray to wake up on.
-     * @param count The number of sleeping agents to notify. Defaults to +Infinity.
-     */
-    notify(typedArray: Int32Array, index: number, count?: number): number;
-
-    /**
-     * Stores the bitwise XOR of a value with the value at the given position in the array,
-     * returning the original value. Until this atomic operation completes, any other read or write
-     * operation against the array will block.
-     */
-    xor(typedArray: Int8Array | Uint8Array | Int16Array | Uint16Array | Int32Array | Uint32Array, index: number, value: number): number;
-
-    readonly [Symbol.toStringTag]: "Atomics";
-}
-
-declare var Atomics: Atomics;
-
-//========== lib.es2017.string.d.ts ==========
-/*! *****************************************************************************
-Copyright (c) Microsoft Corporation. All rights reserved.
-Licensed under the Apache License, Version 2.0 (the "License"); you may not use
-this file except in compliance with the License. You may obtain a copy of the
-License at http://www.apache.org/licenses/LICENSE-2.0
-
-THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
-WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
-
-See the Apache Version 2.0 License for specific language governing permissions
-and limitations under the License.
-***************************************************************************** */
-
-
-/// <reference no-default-lib="true"/>
-
-interface String {
-    /**
-     * Pads the current string with a given string (possibly repeated) so that the resulting string reaches a given length.
-     * The padding is applied from the start (left) of the current string.
-     *
-     * @param maxLength The length of the resulting string once the current string has been padded.
-     *        If this parameter is smaller than the current string's length, the current string will be returned as it is.
-     *
-     * @param fillString The string to pad the current string with.
-     *        If this string is too long, it will be truncated and the left-most part will be applied.
-     *        The default value for this parameter is " " (U+0020).
-     */
-    padStart(maxLength: number, fillString?: string): string;
-
-    /**
-     * Pads the current string with a given string (possibly repeated) so that the resulting string reaches a given length.
-     * The padding is applied from the end (right) of the current string.
-     *
-     * @param maxLength The length of the resulting string once the current string has been padded.
-     *        If this parameter is smaller than the current string's length, the current string will be returned as it is.
-     *
-     * @param fillString The string to pad the current string with.
-     *        If this string is too long, it will be truncated and the left-most part will be applied.
-     *        The default value for this parameter is " " (U+0020).
-     */
-    padEnd(maxLength: number, fillString?: string): string;
+    UTC(year: number, monthIndex?: number, date?: number, hours?: number, minutes?: number, seconds?: number, ms?: number): number;
 }
 
 //========== lib.es2017.intl.d.ts ==========
@@ -7523,14 +7445,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 declare namespace Intl {
     interface DateTimeFormatPartTypesRegistry {
@@ -7559,6 +7479,239 @@ declare namespace Intl {
     }
 }
 
+//========== lib.es2017.object.d.ts ==========
+/*! *****************************************************************************
+Copyright (c) Microsoft Corporation. All rights reserved.
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License at http://www.apache.org/licenses/LICENSE-2.0
+
+THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
+WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
+MERCHANTABILITY OR NON-INFRINGEMENT.
+
+See the Apache Version 2.0 License for specific language governing permissions
+and limitations under the License.
+***************************************************************************** */
+
+
+interface ObjectConstructor {
+    /**
+     * Returns an array of values of the enumerable own properties of an object
+     * @param o Object that contains the properties and methods. This can be an object that you created or an existing Document Object Model (DOM) object.
+     */
+    values<T>(o: { [s: string]: T; } | ArrayLike<T>): T[];
+
+    /**
+     * Returns an array of values of the enumerable own properties of an object
+     * @param o Object that contains the properties and methods. This can be an object that you created or an existing Document Object Model (DOM) object.
+     */
+    values(o: {}): any[];
+
+    /**
+     * Returns an array of key/values of the enumerable own properties of an object
+     * @param o Object that contains the properties and methods. This can be an object that you created or an existing Document Object Model (DOM) object.
+     */
+    entries<T>(o: { [s: string]: T; } | ArrayLike<T>): [string, T][];
+
+    /**
+     * Returns an array of key/values of the enumerable own properties of an object
+     * @param o Object that contains the properties and methods. This can be an object that you created or an existing Document Object Model (DOM) object.
+     */
+    entries(o: {}): [string, any][];
+
+    /**
+     * Returns an object containing all own property descriptors of an object
+     * @param o Object that contains the properties and methods. This can be an object that you created or an existing Document Object Model (DOM) object.
+     */
+    getOwnPropertyDescriptors<T>(o: T): { [P in keyof T]: TypedPropertyDescriptor<T[P]>; } & { [x: string]: PropertyDescriptor; };
+}
+
+//========== lib.es2017.sharedmemory.d.ts ==========
+/*! *****************************************************************************
+Copyright (c) Microsoft Corporation. All rights reserved.
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License at http://www.apache.org/licenses/LICENSE-2.0
+
+THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
+WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
+MERCHANTABILITY OR NON-INFRINGEMENT.
+
+See the Apache Version 2.0 License for specific language governing permissions
+and limitations under the License.
+***************************************************************************** */
+
+
+/// <reference lib="es2015.symbol" />
+/// <reference lib="es2015.symbol.wellknown" />
+
+interface SharedArrayBuffer {
+    /**
+     * Read-only. The length of the ArrayBuffer (in bytes).
+     */
+    readonly byteLength: number;
+
+    /**
+     * Returns a section of an SharedArrayBuffer.
+     */
+    slice(begin?: number, end?: number): SharedArrayBuffer;
+    readonly [Symbol.toStringTag]: "SharedArrayBuffer";
+}
+
+interface SharedArrayBufferConstructor {
+    readonly prototype: SharedArrayBuffer;
+    new (byteLength?: number): SharedArrayBuffer;
+    readonly [Symbol.species]: SharedArrayBufferConstructor;
+}
+declare var SharedArrayBuffer: SharedArrayBufferConstructor;
+
+interface ArrayBufferTypes {
+    SharedArrayBuffer: SharedArrayBuffer;
+}
+
+interface Atomics {
+    /**
+     * Adds a value to the value at the given position in the array, returning the original value.
+     * Until this atomic operation completes, any other read or write operation against the array
+     * will block.
+     */
+    add(typedArray: Int8Array<ArrayBufferLike> | Uint8Array<ArrayBufferLike> | Int16Array<ArrayBufferLike> | Uint16Array<ArrayBufferLike> | Int32Array<ArrayBufferLike> | Uint32Array<ArrayBufferLike>, index: number, value: number): number;
+
+    /**
+     * Stores the bitwise AND of a value with the value at the given position in the array,
+     * returning the original value. Until this atomic operation completes, any other read or
+     * write operation against the array will block.
+     */
+    and(typedArray: Int8Array<ArrayBufferLike> | Uint8Array<ArrayBufferLike> | Int16Array<ArrayBufferLike> | Uint16Array<ArrayBufferLike> | Int32Array<ArrayBufferLike> | Uint32Array<ArrayBufferLike>, index: number, value: number): number;
+
+    /**
+     * Replaces the value at the given position in the array if the original value equals the given
+     * expected value, returning the original value. Until this atomic operation completes, any
+     * other read or write operation against the array will block.
+     */
+    compareExchange(typedArray: Int8Array<ArrayBufferLike> | Uint8Array<ArrayBufferLike> | Int16Array<ArrayBufferLike> | Uint16Array<ArrayBufferLike> | Int32Array<ArrayBufferLike> | Uint32Array<ArrayBufferLike>, index: number, expectedValue: number, replacementValue: number): number;
+
+    /**
+     * Replaces the value at the given position in the array, returning the original value. Until
+     * this atomic operation completes, any other read or write operation against the array will
+     * block.
+     */
+    exchange(typedArray: Int8Array<ArrayBufferLike> | Uint8Array<ArrayBufferLike> | Int16Array<ArrayBufferLike> | Uint16Array<ArrayBufferLike> | Int32Array<ArrayBufferLike> | Uint32Array<ArrayBufferLike>, index: number, value: number): number;
+
+    /**
+     * Returns a value indicating whether high-performance algorithms can use atomic operations
+     * (`true`) or must use locks (`false`) for the given number of bytes-per-element of a typed
+     * array.
+     */
+    isLockFree(size: number): boolean;
+
+    /**
+     * Returns the value at the given position in the array. Until this atomic operation completes,
+     * any other read or write operation against the array will block.
+     */
+    load(typedArray: Int8Array<ArrayBufferLike> | Uint8Array<ArrayBufferLike> | Int16Array<ArrayBufferLike> | Uint16Array<ArrayBufferLike> | Int32Array<ArrayBufferLike> | Uint32Array<ArrayBufferLike>, index: number): number;
+
+    /**
+     * Stores the bitwise OR of a value with the value at the given position in the array,
+     * returning the original value. Until this atomic operation completes, any other read or write
+     * operation against the array will block.
+     */
+    or(typedArray: Int8Array<ArrayBufferLike> | Uint8Array<ArrayBufferLike> | Int16Array<ArrayBufferLike> | Uint16Array<ArrayBufferLike> | Int32Array<ArrayBufferLike> | Uint32Array<ArrayBufferLike>, index: number, value: number): number;
+
+    /**
+     * Stores a value at the given position in the array, returning the new value. Until this
+     * atomic operation completes, any other read or write operation against the array will block.
+     */
+    store(typedArray: Int8Array<ArrayBufferLike> | Uint8Array<ArrayBufferLike> | Int16Array<ArrayBufferLike> | Uint16Array<ArrayBufferLike> | Int32Array<ArrayBufferLike> | Uint32Array<ArrayBufferLike>, index: number, value: number): number;
+
+    /**
+     * Subtracts a value from the value at the given position in the array, returning the original
+     * value. Until this atomic operation completes, any other read or write operation against the
+     * array will block.
+     */
+    sub(typedArray: Int8Array<ArrayBufferLike> | Uint8Array<ArrayBufferLike> | Int16Array<ArrayBufferLike> | Uint16Array<ArrayBufferLike> | Int32Array<ArrayBufferLike> | Uint32Array<ArrayBufferLike>, index: number, value: number): number;
+
+    /**
+     * If the value at the given position in the array is equal to the provided value, the current
+     * agent is put to sleep causing execution to suspend until the timeout expires (returning
+     * `"timed-out"`) or until the agent is awoken (returning `"ok"`); otherwise, returns
+     * `"not-equal"`.
+     */
+    wait(typedArray: Int32Array<ArrayBufferLike>, index: number, value: number, timeout?: number): "ok" | "not-equal" | "timed-out";
+
+    /**
+     * Wakes up sleeping agents that are waiting on the given index of the array, returning the
+     * number of agents that were awoken.
+     * @param typedArray A shared Int32Array<ArrayBufferLike>.
+     * @param index The position in the typedArray to wake up on.
+     * @param count The number of sleeping agents to notify. Defaults to +Infinity.
+     */
+    notify(typedArray: Int32Array<ArrayBufferLike>, index: number, count?: number): number;
+
+    /**
+     * Stores the bitwise XOR of a value with the value at the given position in the array,
+     * returning the original value. Until this atomic operation completes, any other read or write
+     * operation against the array will block.
+     */
+    xor(typedArray: Int8Array<ArrayBufferLike> | Uint8Array<ArrayBufferLike> | Int16Array<ArrayBufferLike> | Uint16Array<ArrayBufferLike> | Int32Array<ArrayBufferLike> | Uint32Array<ArrayBufferLike>, index: number, value: number): number;
+
+    readonly [Symbol.toStringTag]: "Atomics";
+}
+
+declare var Atomics: Atomics;
+
+//========== lib.es2017.string.d.ts ==========
+/*! *****************************************************************************
+Copyright (c) Microsoft Corporation. All rights reserved.
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License at http://www.apache.org/licenses/LICENSE-2.0
+
+THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
+WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
+MERCHANTABILITY OR NON-INFRINGEMENT.
+
+See the Apache Version 2.0 License for specific language governing permissions
+and limitations under the License.
+***************************************************************************** */
+
+
+interface String {
+    /**
+     * Pads the current string with a given string (repeated and/or truncated, if needed) so that the resulting string has a given length.
+     * The padding is applied from the start of the current string.
+     *
+     * [MDN](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/padStart)
+     *
+     * @param targetLength The length of the resulting string once the current `str` has been padded.
+     *        If the value is less than or equal to `str.length`, then `str` is returned as-is.
+     *
+     * @param padString The string to pad the current `str` with.
+     *        If `padString` is too long to stay within `targetLength`, it will be truncated from the end.
+     *        The default value is the space character (U+0020).
+     */
+    padStart(targetLength: number, padString?: string): string;
+
+    /**
+     * Pads the current string with a given string (repeated and/or truncated, if needed) so that the resulting string has a given length.
+     * The padding is applied from the end of the current string.
+     *
+     * [MDN](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/padEnd)
+     *
+     * @param targetLength The length of the resulting string once the current `str` has been padded.
+     *        If the value is less than or equal to `str.length`, then `str` is returned as-is.
+     *
+     * @param padString The string to pad the current `str` with.
+     *        If `padString` is too long to stay within `targetLength`, it will be truncated from the end.
+     *        The default value is the space character (U+0020).
+     */
+    padEnd(targetLength: number, padString?: string): string;
+}
+
 //========== lib.es2017.typedarrays.d.ts ==========
 /*! *****************************************************************************
 Copyright (c) Microsoft Corporation. All rights reserved.
@@ -7569,82 +7722,47 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
 
-/// <reference no-default-lib="true"/>
-
 interface Int8ArrayConstructor {
-    new (): Int8Array;
+    new (): Int8Array<ArrayBuffer>;
 }
 
 interface Uint8ArrayConstructor {
-    new (): Uint8Array;
+    new (): Uint8Array<ArrayBuffer>;
 }
 
 interface Uint8ClampedArrayConstructor {
-    new (): Uint8ClampedArray;
+    new (): Uint8ClampedArray<ArrayBuffer>;
 }
 
 interface Int16ArrayConstructor {
-    new (): Int16Array;
+    new (): Int16Array<ArrayBuffer>;
 }
 
 interface Uint16ArrayConstructor {
-    new (): Uint16Array;
+    new (): Uint16Array<ArrayBuffer>;
 }
 
 interface Int32ArrayConstructor {
-    new (): Int32Array;
+    new (): Int32Array<ArrayBuffer>;
 }
 
 interface Uint32ArrayConstructor {
-    new (): Uint32Array;
+    new (): Uint32Array<ArrayBuffer>;
 }
 
 interface Float32ArrayConstructor {
-    new (): Float32Array;
+    new (): Float32Array<ArrayBuffer>;
 }
 
 interface Float64ArrayConstructor {
-    new (): Float64Array;
-}
-
-//========== lib.es2017.date.d.ts ==========
-/*! *****************************************************************************
-Copyright (c) Microsoft Corporation. All rights reserved.
-Licensed under the Apache License, Version 2.0 (the "License"); you may not use
-this file except in compliance with the License. You may obtain a copy of the
-License at http://www.apache.org/licenses/LICENSE-2.0
-
-THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
-WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
-
-See the Apache Version 2.0 License for specific language governing permissions
-and limitations under the License.
-***************************************************************************** */
-
-
-/// <reference no-default-lib="true"/>
-
-interface DateConstructor {
-    /**
-     * Returns the number of milliseconds between midnight, January 1, 1970 Universal Coordinated Time (UTC) (or GMT) and the specified date.
-     * @param year The full year designation is required for cross-century date accuracy. If year is between 0 and 99 is used, then year is assumed to be 1900 + year.
-     * @param monthIndex The month as a number between 0 and 11 (January to December).
-     * @param date The date as a number between 1 and 31.
-     * @param hours Must be supplied if minutes is supplied. A number from 0 to 23 (midnight to 11pm) that specifies the hour.
-     * @param minutes Must be supplied if seconds is supplied. A number from 0 to 59 that specifies the minutes.
-     * @param seconds Must be supplied if milliseconds is supplied. A number from 0 to 59 that specifies the seconds.
-     * @param ms A number from 0 to 999 that specifies the milliseconds.
-     */
-    UTC(year: number, monthIndex?: number, date?: number, hours?: number, minutes?: number, seconds?: number, ms?: number): number;
+    new (): Float64Array<ArrayBuffer>;
 }
 
 //========== lib.es2017.d.ts ==========
@@ -7657,22 +7775,21 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
 
-/// <reference no-default-lib="true"/>
-
 /// <reference lib="es2016" />
+/// <reference lib="es2017.arraybuffer" />
+/// <reference lib="es2017.date" />
+/// <reference lib="es2017.intl" />
 /// <reference lib="es2017.object" />
 /// <reference lib="es2017.sharedmemory" />
 /// <reference lib="es2017.string" />
-/// <reference lib="es2017.intl" />
 /// <reference lib="es2017.typedarrays" />
-/// <reference lib="es2017.date" />
 
 //========== lib.es2018.asynciterable.d.ts ==========
 /*! *****************************************************************************
@@ -7684,14 +7801,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 /// <reference lib="es2015.symbol" />
 /// <reference lib="es2015.iterable" />
@@ -7704,19 +7819,29 @@ interface SymbolConstructor {
     readonly asyncIterator: unique symbol;
 }
 
-interface AsyncIterator<T, TReturn = any, TNext = undefined> {
+interface AsyncIterator<T, TReturn = any, TNext = any> {
     // NOTE: 'next' is defined using a tuple to ensure we report the correct assignability errors in all places.
-    next(...args: [] | [TNext]): Promise<IteratorResult<T, TReturn>>;
+    next(...[value]: [] | [TNext]): Promise<IteratorResult<T, TReturn>>;
     return?(value?: TReturn | PromiseLike<TReturn>): Promise<IteratorResult<T, TReturn>>;
     throw?(e?: any): Promise<IteratorResult<T, TReturn>>;
 }
 
-interface AsyncIterable<T> {
-    [Symbol.asyncIterator](): AsyncIterator<T>;
+interface AsyncIterable<T, TReturn = any, TNext = any> {
+    [Symbol.asyncIterator](): AsyncIterator<T, TReturn, TNext>;
 }
 
-interface AsyncIterableIterator<T> extends AsyncIterator<T> {
-    [Symbol.asyncIterator](): AsyncIterableIterator<T>;
+/**
+ * Describes a user-defined {@link AsyncIterator} that is also async iterable.
+ */
+interface AsyncIterableIterator<T, TReturn = any, TNext = any> extends AsyncIterator<T, TReturn, TNext> {
+    [Symbol.asyncIterator](): AsyncIterableIterator<T, TReturn, TNext>;
+}
+
+/**
+ * Describes an {@link AsyncIterator} produced by the runtime that inherits from the intrinsic `AsyncIterator.prototype`.
+ */
+interface AsyncIteratorObject<T, TReturn = unknown, TNext = unknown> extends AsyncIterator<T, TReturn, TNext> {
+    [Symbol.asyncIterator](): AsyncIteratorObject<T, TReturn, TNext>;
 }
 
 //========== lib.es2018.asyncgenerator.d.ts ==========
@@ -7729,20 +7854,18 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
 
-/// <reference no-default-lib="true"/>
-
 /// <reference lib="es2018.asynciterable" />
 
-interface AsyncGenerator<T = unknown, TReturn = any, TNext = unknown> extends AsyncIterator<T, TReturn, TNext> {
+interface AsyncGenerator<T = unknown, TReturn = any, TNext = any> extends AsyncIteratorObject<T, TReturn, TNext> {
     // NOTE: 'next' is defined using a tuple to ensure we report the correct assignability errors in all places.
-    next(...args: [] | [TNext]): Promise<IteratorResult<T, TReturn>>;
+    next(...[value]: [] | [TNext]): Promise<IteratorResult<T, TReturn>>;
     return(value: TReturn | PromiseLike<TReturn>): Promise<IteratorResult<T, TReturn>>;
     throw(e: any): Promise<IteratorResult<T, TReturn>>;
     [Symbol.asyncIterator](): AsyncGenerator<T, TReturn, TNext>;
@@ -7808,14 +7931,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 /**
  * Represents the completion of an asynchronous operation
@@ -7840,14 +7961,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 interface RegExpMatchArray {
     groups?: {
@@ -7879,14 +7998,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 declare namespace Intl {
     // http://cldr.unicode.org/index/cldr-spec/plural-rules#TOC-Determining-Plural-Categories
@@ -7964,14 +8081,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 /// <reference lib="es2017" />
 /// <reference lib="es2018.asynciterable" />
@@ -7990,14 +8105,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 type FlatArray<Arr, Depth extends number> = {
     done: Arr;
@@ -8071,14 +8184,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 /// <reference lib="es2015.iterable" />
 
@@ -8106,14 +8217,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 interface String {
     /** Removes the trailing white space and line terminator characters from a string. */
@@ -8145,14 +8254,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 interface Symbol {
     /**
@@ -8171,14 +8278,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 declare namespace Intl {
     interface DateTimeFormatPartTypesRegistry {
@@ -8196,14 +8301,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 /// <reference lib="es2018" />
 /// <reference lib="es2019.array" />
@@ -8222,14 +8325,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 /// <reference lib="es2018.intl" />
 declare namespace Intl {
@@ -8238,14 +8339,14 @@ declare namespace Intl {
      *
      * For example: "fa", "es-MX", "zh-Hant-TW".
      *
-     * See [MDN - Intl - locales argument](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl#locales_argument).
+     * See [MDN - Intl - locales argument](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl#locales_argument).
      */
     type UnicodeBCP47LocaleIdentifier = string;
 
     /**
      * Unit to use in the relative time internationalized message.
      *
-     * [MDN](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/RelativeTimeFormat/format#Parameters).
+     * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/RelativeTimeFormat/format#Parameters).
      */
     type RelativeTimeFormatUnit =
         | "year"
@@ -8272,7 +8373,7 @@ declare namespace Intl {
      * but `formatToParts` only outputs singular (e.g. "day") not plural (e.g.
      * "days").
      *
-     * [MDN](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/RelativeTimeFormat/formatToParts#Using_formatToParts).
+     * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/RelativeTimeFormat/formatToParts#Using_formatToParts).
      */
     type RelativeTimeFormatUnitSingular =
         | "year"
@@ -8294,21 +8395,21 @@ declare namespace Intl {
     /**
      * The format of output message.
      *
-     * [MDN](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/RelativeTimeFormat/RelativeTimeFormat#Parameters).
+     * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/RelativeTimeFormat/RelativeTimeFormat#Parameters).
      */
     type RelativeTimeFormatNumeric = "always" | "auto";
 
     /**
      * The length of the internationalized message.
      *
-     * [MDN](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/RelativeTimeFormat/RelativeTimeFormat#Parameters).
+     * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/RelativeTimeFormat/RelativeTimeFormat#Parameters).
      */
     type RelativeTimeFormatStyle = "long" | "short" | "narrow";
 
     /**
      * The locale or locales to use
      *
-     * See [MDN - Intl - locales argument](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl#locales_argument).
+     * See [MDN - Intl - locales argument](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl#locales_argument).
      */
     type LocalesArgument = UnicodeBCP47LocaleIdentifier | Locale | readonly (UnicodeBCP47LocaleIdentifier | Locale)[] | undefined;
 
@@ -8316,7 +8417,7 @@ declare namespace Intl {
      * An object with some or all of properties of `options` parameter
      * of `Intl.RelativeTimeFormat` constructor.
      *
-     * [MDN](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/RelativeTimeFormat/RelativeTimeFormat#Parameters).
+     * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/RelativeTimeFormat/RelativeTimeFormat#Parameters).
      */
     interface RelativeTimeFormatOptions {
         /** The locale matching algorithm to use. For information about this option, see [Intl page](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl#Locale_negotiation). */
@@ -8332,7 +8433,7 @@ declare namespace Intl {
      * and formatting options computed during initialization
      * of the `Intl.RelativeTimeFormat` object
      *
-     * [MDN](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/RelativeTimeFormat/resolvedOptions#Description).
+     * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/RelativeTimeFormat/resolvedOptions#Description).
      */
     interface ResolvedRelativeTimeFormatOptions {
         locale: UnicodeBCP47LocaleIdentifier;
@@ -8345,7 +8446,7 @@ declare namespace Intl {
      * An object representing the relative time format in parts
      * that can be used for custom locale-aware formatting.
      *
-     * [MDN](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/RelativeTimeFormat/formatToParts#Using_formatToParts).
+     * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/RelativeTimeFormat/formatToParts#Using_formatToParts).
      */
     type RelativeTimeFormatPart =
         | {
@@ -8381,27 +8482,27 @@ declare namespace Intl {
          *
          * @returns {string} Internationalized relative time message as string
          *
-         * [MDN](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/RelativeTimeFormat/format).
+         * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/RelativeTimeFormat/format).
          */
         format(value: number, unit: RelativeTimeFormatUnit): string;
 
         /**
-         *  Returns an array of objects representing the relative time format in parts that can be used for custom locale-aware formatting.
+         * Returns an array of objects representing the relative time format in parts that can be used for custom locale-aware formatting.
          *
-         *  @param value - Numeric value to use in the internationalized relative time message
+         * @param value - Numeric value to use in the internationalized relative time message
          *
-         *  @param unit - [Unit](https://tc39.es/ecma402/#sec-singularrelativetimeunit) to use in the relative time internationalized message.
+         * @param unit - [Unit](https://tc39.es/ecma402/#sec-singularrelativetimeunit) to use in the relative time internationalized message.
          *
-         *  @throws `RangeError` if `unit` was given something other than `unit` possible values
+         * @throws `RangeError` if `unit` was given something other than `unit` possible values
          *
-         *  [MDN](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/RelativeTimeFormat/formatToParts).
+         * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/RelativeTimeFormat/formatToParts).
          */
         formatToParts(value: number, unit: RelativeTimeFormatUnit): RelativeTimeFormatPart[];
 
         /**
          * Provides access to the locale and options computed during initialization of this `Intl.RelativeTimeFormat` object.
          *
-         * [MDN](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/RelativeTimeFormat/resolvedOptions).
+         * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/RelativeTimeFormat/resolvedOptions).
          */
         resolvedOptions(): ResolvedRelativeTimeFormatOptions;
     }
@@ -8410,22 +8511,22 @@ declare namespace Intl {
      * The [`Intl.RelativeTimeFormat`](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/RelativeTimeFormat)
      * object is a constructor for objects that enable language-sensitive relative time formatting.
      *
-     * [Compatibility](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/RelativeTimeFormat#Browser_compatibility).
+     * [Compatibility](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/RelativeTimeFormat#Browser_compatibility).
      */
     const RelativeTimeFormat: {
         /**
-         * Creates [Intl.RelativeTimeFormat](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/RelativeTimeFormat) objects
+         * Creates [Intl.RelativeTimeFormat](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/RelativeTimeFormat) objects
          *
          * @param locales - A string with a [BCP 47 language tag](http://tools.ietf.org/html/rfc5646), or an array of such strings.
          *  For the general form and interpretation of the locales argument,
-         *  see the [`Intl` page](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl#Locale_identification_and_negotiation).
+         *  see the [`Intl` page](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl#Locale_identification_and_negotiation).
          *
-         * @param options - An [object](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/RelativeTimeFormat/RelativeTimeFormat#Parameters)
+         * @param options - An [object](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/RelativeTimeFormat/RelativeTimeFormat#Parameters)
          *  with some or all of options of `RelativeTimeFormatOptions`.
          *
-         * @returns [Intl.RelativeTimeFormat](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/RelativeTimeFormat) object.
+         * @returns [Intl.RelativeTimeFormat](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/RelativeTimeFormat) object.
          *
-         * [MDN](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/RelativeTimeFormat/RelativeTimeFormat).
+         * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/RelativeTimeFormat/RelativeTimeFormat).
          */
         new (
             locales?: LocalesArgument,
@@ -8439,16 +8540,16 @@ declare namespace Intl {
          *
          * @param locales - A string with a [BCP 47 language tag](http://tools.ietf.org/html/rfc5646), or an array of such strings.
          *  For the general form and interpretation of the locales argument,
-         *  see the [`Intl` page](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl#Locale_identification_and_negotiation).
+         *  see the [`Intl` page](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl#Locale_identification_and_negotiation).
          *
-         * @param options - An [object](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/RelativeTimeFormat/RelativeTimeFormat#Parameters)
+         * @param options - An [object](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/RelativeTimeFormat/RelativeTimeFormat#Parameters)
          *  with some or all of options of the formatting.
          *
          * @returns An array containing those of the provided locales
          *  that are supported in date and time formatting
          *  without having to fall back to the runtime's default locale.
          *
-         * [MDN](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/RelativeTimeFormat/supportedLocalesOf).
+         * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/RelativeTimeFormat/supportedLocalesOf).
          */
         supportedLocalesOf(
             locales?: LocalesArgument,
@@ -8551,18 +8652,18 @@ declare namespace Intl {
     }
 
     /**
-     * Constructor creates [Intl.Locale](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/Locale)
+     * Constructor creates [Intl.Locale](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/Locale)
      * objects
      *
      * @param tag - A string with a [BCP 47 language tag](http://tools.ietf.org/html/rfc5646).
      *  For the general form and interpretation of the locales argument,
-     *  see the [`Intl` page](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl#Locale_identification_and_negotiation).
+     *  see the [`Intl` page](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl#Locale_identification_and_negotiation).
      *
-     * @param options - An [object](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/Locale/Locale#Parameters) with some or all of options of the locale.
+     * @param options - An [object](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/Locale/Locale#Parameters) with some or all of options of the locale.
      *
-     * @returns [Intl.Locale](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/Locale) object.
+     * @returns [Intl.Locale](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/Locale) object.
      *
-     * [MDN](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/Locale).
+     * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/Locale).
      */
     const Locale: {
         new (tag: UnicodeBCP47LocaleIdentifier | Locale, options?: LocaleOptions): Locale;
@@ -8603,7 +8704,7 @@ declare namespace Intl {
     interface DisplayNames {
         /**
          * Receives a code and returns a string based on the locale and options provided when instantiating
-         * [`Intl.DisplayNames()`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/DisplayNames)
+         * [`Intl.DisplayNames()`](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/DisplayNames)
          *
          * @param code The `code` to provide depends on the `type` passed to display name during creation:
          *  - If the type is `"region"`, code should be either an [ISO-3166 two letters region code](https://www.iso.org/iso-3166-country-codes.html),
@@ -8614,35 +8715,35 @@ declare namespace Intl {
          *    `languageCode` is either a two letters ISO 639-1 language code or a three letters ISO 639-2 language code.
          *  - If the type is `"currency"`, code should be a [3-letter ISO 4217 currency code](https://www.iso.org/iso-4217-currency-codes.html).
          *
-         * [MDN](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/DisplayNames/of).
+         * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/DisplayNames/of).
          */
         of(code: string): string | undefined;
         /**
          * Returns a new object with properties reflecting the locale and style formatting options computed during the construction of the current
-         * [`Intl/DisplayNames`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/DisplayNames) object.
+         * [`Intl/DisplayNames`](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/DisplayNames) object.
          *
-         * [MDN](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/DisplayNames/resolvedOptions).
+         * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/DisplayNames/resolvedOptions).
          */
         resolvedOptions(): ResolvedDisplayNamesOptions;
     }
 
     /**
-     * The [`Intl.DisplayNames()`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/DisplayNames)
+     * The [`Intl.DisplayNames()`](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/DisplayNames)
      * object enables the consistent translation of language, region and script display names.
      *
-     * [Compatibility](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/DisplayNames#browser_compatibility).
+     * [Compatibility](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/DisplayNames#browser_compatibility).
      */
     const DisplayNames: {
         prototype: DisplayNames;
 
         /**
          * @param locales A string with a BCP 47 language tag, or an array of such strings.
-         *   For the general form and interpretation of the `locales` argument, see the [Intl](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl#locale_identification_and_negotiation)
+         *   For the general form and interpretation of the `locales` argument, see the [Intl](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl#locale_identification_and_negotiation)
          *   page.
          *
          * @param options An object for setting up a display name.
          *
-         * [MDN](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/DisplayNames/DisplayNames).
+         * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/DisplayNames/DisplayNames).
          */
         new (locales: LocalesArgument, options: DisplayNamesOptions): DisplayNames;
 
@@ -8650,14 +8751,14 @@ declare namespace Intl {
          * Returns an array containing those of the provided locales that are supported in display names without having to fall back to the runtime's default locale.
          *
          * @param locales A string with a BCP 47 language tag, or an array of such strings.
-         *   For the general form and interpretation of the `locales` argument, see the [Intl](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl#locale_identification_and_negotiation)
+         *   For the general form and interpretation of the `locales` argument, see the [Intl](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl#locale_identification_and_negotiation)
          *   page.
          *
          * @param options An object with a locale matcher.
          *
          * @returns An array of strings representing a subset of the given locale tags that are supported in display names without having to fall back to the runtime's default locale.
          *
-         * [MDN](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/DisplayNames/supportedLocalesOf).
+         * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/DisplayNames/supportedLocalesOf).
          */
         supportedLocalesOf(locales?: LocalesArgument, options?: { localeMatcher?: RelativeTimeFormatLocaleMatcher; }): UnicodeBCP47LocaleIdentifier[];
     };
@@ -8698,20 +8799,18 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
 
-/// <reference no-default-lib="true"/>
-
 /// <reference lib="es2020.intl" />
 
 interface BigIntToLocaleStringOptions {
     /**
-     * The locale matching algorithm to use.The default is "best fit". For information about this option, see the {@link https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl#Locale_negotiation Intl page}.
+     * The locale matching algorithm to use.The default is "best fit". For information about this option, see the {@link https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl#Locale_negotiation Intl page}.
      */
     localeMatcher?: string;
     /**
@@ -8837,12 +8936,12 @@ declare var BigInt: BigIntConstructor;
  * A typed array of 64-bit signed integer values. The contents are initialized to 0. If the
  * requested number of bytes could not be allocated, an exception is raised.
  */
-interface BigInt64Array {
+interface BigInt64Array<TArrayBuffer extends ArrayBufferLike = ArrayBufferLike> {
     /** The size in bytes of each element in the array. */
     readonly BYTES_PER_ELEMENT: number;
 
     /** The ArrayBuffer instance referenced by the array. */
-    readonly buffer: ArrayBufferLike;
+    readonly buffer: TArrayBuffer;
 
     /** The length in bytes of the array. */
     readonly byteLength: number;
@@ -8862,7 +8961,7 @@ interface BigInt64Array {
     copyWithin(target: number, start: number, end?: number): this;
 
     /** Yields index, value pairs for every entry in the array. */
-    entries(): IterableIterator<[number, bigint]>;
+    entries(): ArrayIterator<[number, bigint]>;
 
     /**
      * Determines whether all the members of an array satisfy the specified test.
@@ -8872,7 +8971,7 @@ interface BigInt64Array {
      * @param thisArg An object to which the this keyword can refer in the predicate function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    every(predicate: (value: bigint, index: number, array: BigInt64Array) => boolean, thisArg?: any): boolean;
+    every(predicate: (value: bigint, index: number, array: BigInt64Array<TArrayBuffer>) => boolean, thisArg?: any): boolean;
 
     /**
      * Changes all array elements from `start` to `end` index to a static `value` and returns the modified array
@@ -8891,7 +8990,7 @@ interface BigInt64Array {
      * @param thisArg An object to which the this keyword can refer in the predicate function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    filter(predicate: (value: bigint, index: number, array: BigInt64Array) => any, thisArg?: any): BigInt64Array;
+    filter(predicate: (value: bigint, index: number, array: BigInt64Array<TArrayBuffer>) => any, thisArg?: any): BigInt64Array<ArrayBuffer>;
 
     /**
      * Returns the value of the first element in the array where predicate is true, and undefined
@@ -8902,7 +9001,7 @@ interface BigInt64Array {
      * @param thisArg If provided, it will be used as the this value for each invocation of
      * predicate. If it is not provided, undefined is used instead.
      */
-    find(predicate: (value: bigint, index: number, array: BigInt64Array) => boolean, thisArg?: any): bigint | undefined;
+    find(predicate: (value: bigint, index: number, array: BigInt64Array<TArrayBuffer>) => boolean, thisArg?: any): bigint | undefined;
 
     /**
      * Returns the index of the first element in the array where predicate is true, and -1
@@ -8913,7 +9012,7 @@ interface BigInt64Array {
      * @param thisArg If provided, it will be used as the this value for each invocation of
      * predicate. If it is not provided, undefined is used instead.
      */
-    findIndex(predicate: (value: bigint, index: number, array: BigInt64Array) => boolean, thisArg?: any): number;
+    findIndex(predicate: (value: bigint, index: number, array: BigInt64Array<TArrayBuffer>) => boolean, thisArg?: any): number;
 
     /**
      * Performs the specified action for each element in an array.
@@ -8922,7 +9021,7 @@ interface BigInt64Array {
      * @param thisArg An object to which the this keyword can refer in the callbackfn function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    forEach(callbackfn: (value: bigint, index: number, array: BigInt64Array) => void, thisArg?: any): void;
+    forEach(callbackfn: (value: bigint, index: number, array: BigInt64Array<TArrayBuffer>) => void, thisArg?: any): void;
 
     /**
      * Determines whether an array includes a certain element, returning true or false as appropriate.
@@ -8932,7 +9031,7 @@ interface BigInt64Array {
     includes(searchElement: bigint, fromIndex?: number): boolean;
 
     /**
-     * Returns the index of the first occurrence of a value in an array.
+     * Returns the index of the first occurrence of a value in an array, or -1 if it is not present.
      * @param searchElement The value to locate in the array.
      * @param fromIndex The array index at which to begin the search. If fromIndex is omitted, the
      * search starts at index 0.
@@ -8947,10 +9046,10 @@ interface BigInt64Array {
     join(separator?: string): string;
 
     /** Yields each index in the array. */
-    keys(): IterableIterator<number>;
+    keys(): ArrayIterator<number>;
 
     /**
-     * Returns the index of the last occurrence of a value in an array.
+     * Returns the index of the last occurrence of a value in an array, or -1 if it is not present.
      * @param searchElement The value to locate in the array.
      * @param fromIndex The array index at which to begin the search. If fromIndex is omitted, the
      * search starts at index 0.
@@ -8968,7 +9067,7 @@ interface BigInt64Array {
      * @param thisArg An object to which the this keyword can refer in the callbackfn function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    map(callbackfn: (value: bigint, index: number, array: BigInt64Array) => bigint, thisArg?: any): BigInt64Array;
+    map(callbackfn: (value: bigint, index: number, array: BigInt64Array<TArrayBuffer>) => bigint, thisArg?: any): BigInt64Array<ArrayBuffer>;
 
     /**
      * Calls the specified callback function for all the elements in an array. The return value of
@@ -8980,7 +9079,7 @@ interface BigInt64Array {
      * the accumulation. The first call to the callbackfn function provides this value as an argument
      * instead of an array value.
      */
-    reduce(callbackfn: (previousValue: bigint, currentValue: bigint, currentIndex: number, array: BigInt64Array) => bigint): bigint;
+    reduce(callbackfn: (previousValue: bigint, currentValue: bigint, currentIndex: number, array: BigInt64Array<TArrayBuffer>) => bigint): bigint;
 
     /**
      * Calls the specified callback function for all the elements in an array. The return value of
@@ -8992,7 +9091,7 @@ interface BigInt64Array {
      * the accumulation. The first call to the callbackfn function provides this value as an argument
      * instead of an array value.
      */
-    reduce<U>(callbackfn: (previousValue: U, currentValue: bigint, currentIndex: number, array: BigInt64Array) => U, initialValue: U): U;
+    reduce<U>(callbackfn: (previousValue: U, currentValue: bigint, currentIndex: number, array: BigInt64Array<TArrayBuffer>) => U, initialValue: U): U;
 
     /**
      * Calls the specified callback function for all the elements in an array, in descending order.
@@ -9004,7 +9103,7 @@ interface BigInt64Array {
      * the accumulation. The first call to the callbackfn function provides this value as an
      * argument instead of an array value.
      */
-    reduceRight(callbackfn: (previousValue: bigint, currentValue: bigint, currentIndex: number, array: BigInt64Array) => bigint): bigint;
+    reduceRight(callbackfn: (previousValue: bigint, currentValue: bigint, currentIndex: number, array: BigInt64Array<TArrayBuffer>) => bigint): bigint;
 
     /**
      * Calls the specified callback function for all the elements in an array, in descending order.
@@ -9016,7 +9115,7 @@ interface BigInt64Array {
      * the accumulation. The first call to the callbackfn function provides this value as an argument
      * instead of an array value.
      */
-    reduceRight<U>(callbackfn: (previousValue: U, currentValue: bigint, currentIndex: number, array: BigInt64Array) => U, initialValue: U): U;
+    reduceRight<U>(callbackfn: (previousValue: U, currentValue: bigint, currentIndex: number, array: BigInt64Array<TArrayBuffer>) => U, initialValue: U): U;
 
     /** Reverses the elements in the array. */
     reverse(): this;
@@ -9033,7 +9132,7 @@ interface BigInt64Array {
      * @param start The beginning of the specified portion of the array.
      * @param end The end of the specified portion of the array.
      */
-    slice(start?: number, end?: number): BigInt64Array;
+    slice(start?: number, end?: number): BigInt64Array<ArrayBuffer>;
 
     /**
      * Determines whether the specified callback function returns true for any element of an array.
@@ -9043,7 +9142,7 @@ interface BigInt64Array {
      * @param thisArg An object to which the this keyword can refer in the predicate function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    some(predicate: (value: bigint, index: number, array: BigInt64Array) => boolean, thisArg?: any): boolean;
+    some(predicate: (value: bigint, index: number, array: BigInt64Array<TArrayBuffer>) => boolean, thisArg?: any): boolean;
 
     /**
      * Sorts the array.
@@ -9057,7 +9156,7 @@ interface BigInt64Array {
      * @param begin The index of the beginning of the array.
      * @param end The index of the end of the array.
      */
-    subarray(begin?: number, end?: number): BigInt64Array;
+    subarray(begin?: number, end?: number): BigInt64Array<TArrayBuffer>;
 
     /** Converts the array to a string by using the current locale. */
     toLocaleString(locales?: string | string[], options?: Intl.NumberFormatOptions): string;
@@ -9066,23 +9165,24 @@ interface BigInt64Array {
     toString(): string;
 
     /** Returns the primitive value of the specified object. */
-    valueOf(): BigInt64Array;
+    valueOf(): BigInt64Array<TArrayBuffer>;
 
     /** Yields each value in the array. */
-    values(): IterableIterator<bigint>;
+    values(): ArrayIterator<bigint>;
 
-    [Symbol.iterator](): IterableIterator<bigint>;
+    [Symbol.iterator](): ArrayIterator<bigint>;
 
     readonly [Symbol.toStringTag]: "BigInt64Array";
 
     [index: number]: bigint;
 }
-
 interface BigInt64ArrayConstructor {
-    readonly prototype: BigInt64Array;
-    new (length?: number): BigInt64Array;
-    new (array: Iterable<bigint>): BigInt64Array;
-    new (buffer: ArrayBufferLike, byteOffset?: number, length?: number): BigInt64Array;
+    readonly prototype: BigInt64Array<ArrayBufferLike>;
+    new (length?: number): BigInt64Array<ArrayBuffer>;
+    new (array: ArrayLike<bigint> | Iterable<bigint>): BigInt64Array<ArrayBuffer>;
+    new <TArrayBuffer extends ArrayBufferLike = ArrayBuffer>(buffer: TArrayBuffer, byteOffset?: number, length?: number): BigInt64Array<TArrayBuffer>;
+    new (buffer: ArrayBuffer, byteOffset?: number, length?: number): BigInt64Array<ArrayBuffer>;
+    new (array: ArrayLike<bigint> | ArrayBuffer): BigInt64Array<ArrayBuffer>;
 
     /** The size in bytes of each element in the array. */
     readonly BYTES_PER_ELEMENT: number;
@@ -9091,30 +9191,48 @@ interface BigInt64ArrayConstructor {
      * Returns a new array from a set of elements.
      * @param items A set of elements to include in the new array object.
      */
-    of(...items: bigint[]): BigInt64Array;
+    of(...items: bigint[]): BigInt64Array<ArrayBuffer>;
 
     /**
      * Creates an array from an array-like or iterable object.
-     * @param arrayLike An array-like or iterable object to convert to an array.
+     * @param arrayLike An array-like object to convert to an array.
+     */
+    from(arrayLike: ArrayLike<bigint>): BigInt64Array<ArrayBuffer>;
+
+    /**
+     * Creates an array from an array-like or iterable object.
+     * @param arrayLike An array-like object to convert to an array.
      * @param mapfn A mapping function to call on every element of the array.
      * @param thisArg Value of 'this' used to invoke the mapfn.
      */
-    from(arrayLike: ArrayLike<bigint>): BigInt64Array;
-    from<U>(arrayLike: ArrayLike<U>, mapfn: (v: U, k: number) => bigint, thisArg?: any): BigInt64Array;
-}
+    from<U>(arrayLike: ArrayLike<U>, mapfn: (v: U, k: number) => bigint, thisArg?: any): BigInt64Array<ArrayBuffer>;
 
+    /**
+     * Creates an array from an array-like or iterable object.
+     * @param elements An iterable object to convert to an array.
+     */
+    from(elements: Iterable<bigint>): BigInt64Array<ArrayBuffer>;
+
+    /**
+     * Creates an array from an array-like or iterable object.
+     * @param elements An iterable object to convert to an array.
+     * @param mapfn A mapping function to call on every element of the array.
+     * @param thisArg Value of 'this' used to invoke the mapfn.
+     */
+    from<T>(elements: Iterable<T>, mapfn?: (v: T, k: number) => bigint, thisArg?: any): BigInt64Array<ArrayBuffer>;
+}
 declare var BigInt64Array: BigInt64ArrayConstructor;
 
 /**
  * A typed array of 64-bit unsigned integer values. The contents are initialized to 0. If the
  * requested number of bytes could not be allocated, an exception is raised.
  */
-interface BigUint64Array {
+interface BigUint64Array<TArrayBuffer extends ArrayBufferLike = ArrayBufferLike> {
     /** The size in bytes of each element in the array. */
     readonly BYTES_PER_ELEMENT: number;
 
     /** The ArrayBuffer instance referenced by the array. */
-    readonly buffer: ArrayBufferLike;
+    readonly buffer: TArrayBuffer;
 
     /** The length in bytes of the array. */
     readonly byteLength: number;
@@ -9134,7 +9252,7 @@ interface BigUint64Array {
     copyWithin(target: number, start: number, end?: number): this;
 
     /** Yields index, value pairs for every entry in the array. */
-    entries(): IterableIterator<[number, bigint]>;
+    entries(): ArrayIterator<[number, bigint]>;
 
     /**
      * Determines whether all the members of an array satisfy the specified test.
@@ -9144,7 +9262,7 @@ interface BigUint64Array {
      * @param thisArg An object to which the this keyword can refer in the predicate function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    every(predicate: (value: bigint, index: number, array: BigUint64Array) => boolean, thisArg?: any): boolean;
+    every(predicate: (value: bigint, index: number, array: BigUint64Array<TArrayBuffer>) => boolean, thisArg?: any): boolean;
 
     /**
      * Changes all array elements from `start` to `end` index to a static `value` and returns the modified array
@@ -9163,7 +9281,7 @@ interface BigUint64Array {
      * @param thisArg An object to which the this keyword can refer in the predicate function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    filter(predicate: (value: bigint, index: number, array: BigUint64Array) => any, thisArg?: any): BigUint64Array;
+    filter(predicate: (value: bigint, index: number, array: BigUint64Array<TArrayBuffer>) => any, thisArg?: any): BigUint64Array<ArrayBuffer>;
 
     /**
      * Returns the value of the first element in the array where predicate is true, and undefined
@@ -9174,7 +9292,7 @@ interface BigUint64Array {
      * @param thisArg If provided, it will be used as the this value for each invocation of
      * predicate. If it is not provided, undefined is used instead.
      */
-    find(predicate: (value: bigint, index: number, array: BigUint64Array) => boolean, thisArg?: any): bigint | undefined;
+    find(predicate: (value: bigint, index: number, array: BigUint64Array<TArrayBuffer>) => boolean, thisArg?: any): bigint | undefined;
 
     /**
      * Returns the index of the first element in the array where predicate is true, and -1
@@ -9185,7 +9303,7 @@ interface BigUint64Array {
      * @param thisArg If provided, it will be used as the this value for each invocation of
      * predicate. If it is not provided, undefined is used instead.
      */
-    findIndex(predicate: (value: bigint, index: number, array: BigUint64Array) => boolean, thisArg?: any): number;
+    findIndex(predicate: (value: bigint, index: number, array: BigUint64Array<TArrayBuffer>) => boolean, thisArg?: any): number;
 
     /**
      * Performs the specified action for each element in an array.
@@ -9194,7 +9312,7 @@ interface BigUint64Array {
      * @param thisArg An object to which the this keyword can refer in the callbackfn function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    forEach(callbackfn: (value: bigint, index: number, array: BigUint64Array) => void, thisArg?: any): void;
+    forEach(callbackfn: (value: bigint, index: number, array: BigUint64Array<TArrayBuffer>) => void, thisArg?: any): void;
 
     /**
      * Determines whether an array includes a certain element, returning true or false as appropriate.
@@ -9204,7 +9322,7 @@ interface BigUint64Array {
     includes(searchElement: bigint, fromIndex?: number): boolean;
 
     /**
-     * Returns the index of the first occurrence of a value in an array.
+     * Returns the index of the first occurrence of a value in an array, or -1 if it is not present.
      * @param searchElement The value to locate in the array.
      * @param fromIndex The array index at which to begin the search. If fromIndex is omitted, the
      * search starts at index 0.
@@ -9219,10 +9337,10 @@ interface BigUint64Array {
     join(separator?: string): string;
 
     /** Yields each index in the array. */
-    keys(): IterableIterator<number>;
+    keys(): ArrayIterator<number>;
 
     /**
-     * Returns the index of the last occurrence of a value in an array.
+     * Returns the index of the last occurrence of a value in an array, or -1 if it is not present.
      * @param searchElement The value to locate in the array.
      * @param fromIndex The array index at which to begin the search. If fromIndex is omitted, the
      * search starts at index 0.
@@ -9240,7 +9358,7 @@ interface BigUint64Array {
      * @param thisArg An object to which the this keyword can refer in the callbackfn function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    map(callbackfn: (value: bigint, index: number, array: BigUint64Array) => bigint, thisArg?: any): BigUint64Array;
+    map(callbackfn: (value: bigint, index: number, array: BigUint64Array<TArrayBuffer>) => bigint, thisArg?: any): BigUint64Array<ArrayBuffer>;
 
     /**
      * Calls the specified callback function for all the elements in an array. The return value of
@@ -9252,7 +9370,7 @@ interface BigUint64Array {
      * the accumulation. The first call to the callbackfn function provides this value as an argument
      * instead of an array value.
      */
-    reduce(callbackfn: (previousValue: bigint, currentValue: bigint, currentIndex: number, array: BigUint64Array) => bigint): bigint;
+    reduce(callbackfn: (previousValue: bigint, currentValue: bigint, currentIndex: number, array: BigUint64Array<TArrayBuffer>) => bigint): bigint;
 
     /**
      * Calls the specified callback function for all the elements in an array. The return value of
@@ -9264,7 +9382,7 @@ interface BigUint64Array {
      * the accumulation. The first call to the callbackfn function provides this value as an argument
      * instead of an array value.
      */
-    reduce<U>(callbackfn: (previousValue: U, currentValue: bigint, currentIndex: number, array: BigUint64Array) => U, initialValue: U): U;
+    reduce<U>(callbackfn: (previousValue: U, currentValue: bigint, currentIndex: number, array: BigUint64Array<TArrayBuffer>) => U, initialValue: U): U;
 
     /**
      * Calls the specified callback function for all the elements in an array, in descending order.
@@ -9276,7 +9394,7 @@ interface BigUint64Array {
      * the accumulation. The first call to the callbackfn function provides this value as an
      * argument instead of an array value.
      */
-    reduceRight(callbackfn: (previousValue: bigint, currentValue: bigint, currentIndex: number, array: BigUint64Array) => bigint): bigint;
+    reduceRight(callbackfn: (previousValue: bigint, currentValue: bigint, currentIndex: number, array: BigUint64Array<TArrayBuffer>) => bigint): bigint;
 
     /**
      * Calls the specified callback function for all the elements in an array, in descending order.
@@ -9288,7 +9406,7 @@ interface BigUint64Array {
      * the accumulation. The first call to the callbackfn function provides this value as an argument
      * instead of an array value.
      */
-    reduceRight<U>(callbackfn: (previousValue: U, currentValue: bigint, currentIndex: number, array: BigUint64Array) => U, initialValue: U): U;
+    reduceRight<U>(callbackfn: (previousValue: U, currentValue: bigint, currentIndex: number, array: BigUint64Array<TArrayBuffer>) => U, initialValue: U): U;
 
     /** Reverses the elements in the array. */
     reverse(): this;
@@ -9305,7 +9423,7 @@ interface BigUint64Array {
      * @param start The beginning of the specified portion of the array.
      * @param end The end of the specified portion of the array.
      */
-    slice(start?: number, end?: number): BigUint64Array;
+    slice(start?: number, end?: number): BigUint64Array<ArrayBuffer>;
 
     /**
      * Determines whether the specified callback function returns true for any element of an array.
@@ -9315,7 +9433,7 @@ interface BigUint64Array {
      * @param thisArg An object to which the this keyword can refer in the predicate function.
      * If thisArg is omitted, undefined is used as the this value.
      */
-    some(predicate: (value: bigint, index: number, array: BigUint64Array) => boolean, thisArg?: any): boolean;
+    some(predicate: (value: bigint, index: number, array: BigUint64Array<TArrayBuffer>) => boolean, thisArg?: any): boolean;
 
     /**
      * Sorts the array.
@@ -9329,7 +9447,7 @@ interface BigUint64Array {
      * @param begin The index of the beginning of the array.
      * @param end The index of the end of the array.
      */
-    subarray(begin?: number, end?: number): BigUint64Array;
+    subarray(begin?: number, end?: number): BigUint64Array<TArrayBuffer>;
 
     /** Converts the array to a string by using the current locale. */
     toLocaleString(locales?: string | string[], options?: Intl.NumberFormatOptions): string;
@@ -9338,23 +9456,24 @@ interface BigUint64Array {
     toString(): string;
 
     /** Returns the primitive value of the specified object. */
-    valueOf(): BigUint64Array;
+    valueOf(): BigUint64Array<TArrayBuffer>;
 
     /** Yields each value in the array. */
-    values(): IterableIterator<bigint>;
+    values(): ArrayIterator<bigint>;
 
-    [Symbol.iterator](): IterableIterator<bigint>;
+    [Symbol.iterator](): ArrayIterator<bigint>;
 
     readonly [Symbol.toStringTag]: "BigUint64Array";
 
     [index: number]: bigint;
 }
-
 interface BigUint64ArrayConstructor {
-    readonly prototype: BigUint64Array;
-    new (length?: number): BigUint64Array;
-    new (array: Iterable<bigint>): BigUint64Array;
-    new (buffer: ArrayBufferLike, byteOffset?: number, length?: number): BigUint64Array;
+    readonly prototype: BigUint64Array<ArrayBufferLike>;
+    new (length?: number): BigUint64Array<ArrayBuffer>;
+    new (array: ArrayLike<bigint> | Iterable<bigint>): BigUint64Array<ArrayBuffer>;
+    new <TArrayBuffer extends ArrayBufferLike = ArrayBuffer>(buffer: TArrayBuffer, byteOffset?: number, length?: number): BigUint64Array<TArrayBuffer>;
+    new (buffer: ArrayBuffer, byteOffset?: number, length?: number): BigUint64Array<ArrayBuffer>;
+    new (array: ArrayLike<bigint> | ArrayBuffer): BigUint64Array<ArrayBuffer>;
 
     /** The size in bytes of each element in the array. */
     readonly BYTES_PER_ELEMENT: number;
@@ -9363,21 +9482,39 @@ interface BigUint64ArrayConstructor {
      * Returns a new array from a set of elements.
      * @param items A set of elements to include in the new array object.
      */
-    of(...items: bigint[]): BigUint64Array;
+    of(...items: bigint[]): BigUint64Array<ArrayBuffer>;
 
     /**
      * Creates an array from an array-like or iterable object.
-     * @param arrayLike An array-like or iterable object to convert to an array.
+     * @param arrayLike An array-like object to convert to an array.
+     */
+    from(arrayLike: ArrayLike<bigint>): BigUint64Array<ArrayBuffer>;
+
+    /**
+     * Creates an array from an array-like or iterable object.
+     * @param arrayLike An array-like object to convert to an array.
      * @param mapfn A mapping function to call on every element of the array.
      * @param thisArg Value of 'this' used to invoke the mapfn.
      */
-    from(arrayLike: ArrayLike<bigint>): BigUint64Array;
-    from<U>(arrayLike: ArrayLike<U>, mapfn: (v: U, k: number) => bigint, thisArg?: any): BigUint64Array;
-}
+    from<U>(arrayLike: ArrayLike<U>, mapfn: (v: U, k: number) => bigint, thisArg?: any): BigUint64Array<ArrayBuffer>;
 
+    /**
+     * Creates an array from an array-like or iterable object.
+     * @param elements An iterable object to convert to an array.
+     */
+    from(elements: Iterable<bigint>): BigUint64Array<ArrayBuffer>;
+
+    /**
+     * Creates an array from an array-like or iterable object.
+     * @param elements An iterable object to convert to an array.
+     * @param mapfn A mapping function to call on every element of the array.
+     * @param thisArg Value of 'this' used to invoke the mapfn.
+     */
+    from<T>(elements: Iterable<T>, mapfn?: (v: T, k: number) => bigint, thisArg?: any): BigUint64Array<ArrayBuffer>;
+}
 declare var BigUint64Array: BigUint64ArrayConstructor;
 
-interface DataView {
+interface DataView<TArrayBuffer extends ArrayBufferLike> {
     /**
      * Gets the BigInt64 value at the specified byte offset from the start of the view. There is
      * no alignment constraint; multi-byte values may be fetched from any offset.
@@ -9427,14 +9564,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 /// <reference lib="es2020.intl" />
 
@@ -9471,14 +9606,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 /// <reference lib="es2020.intl" />
 
@@ -9501,14 +9634,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 interface PromiseFulfilledResult<T> {
     status: "fulfilled";
@@ -9550,14 +9681,14 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
 
-/// <reference no-default-lib="true"/>
+/// <reference lib="es2020.bigint" />
 
 interface Atomics {
     /**
@@ -9565,54 +9696,54 @@ interface Atomics {
      * Until this atomic operation completes, any other read or write operation against the array
      * will block.
      */
-    add(typedArray: BigInt64Array | BigUint64Array, index: number, value: bigint): bigint;
+    add(typedArray: BigInt64Array<ArrayBufferLike> | BigUint64Array<ArrayBufferLike>, index: number, value: bigint): bigint;
 
     /**
      * Stores the bitwise AND of a value with the value at the given position in the array,
      * returning the original value. Until this atomic operation completes, any other read or
      * write operation against the array will block.
      */
-    and(typedArray: BigInt64Array | BigUint64Array, index: number, value: bigint): bigint;
+    and(typedArray: BigInt64Array<ArrayBufferLike> | BigUint64Array<ArrayBufferLike>, index: number, value: bigint): bigint;
 
     /**
      * Replaces the value at the given position in the array if the original value equals the given
      * expected value, returning the original value. Until this atomic operation completes, any
      * other read or write operation against the array will block.
      */
-    compareExchange(typedArray: BigInt64Array | BigUint64Array, index: number, expectedValue: bigint, replacementValue: bigint): bigint;
+    compareExchange(typedArray: BigInt64Array<ArrayBufferLike> | BigUint64Array<ArrayBufferLike>, index: number, expectedValue: bigint, replacementValue: bigint): bigint;
 
     /**
      * Replaces the value at the given position in the array, returning the original value. Until
      * this atomic operation completes, any other read or write operation against the array will
      * block.
      */
-    exchange(typedArray: BigInt64Array | BigUint64Array, index: number, value: bigint): bigint;
+    exchange(typedArray: BigInt64Array<ArrayBufferLike> | BigUint64Array<ArrayBufferLike>, index: number, value: bigint): bigint;
 
     /**
      * Returns the value at the given position in the array. Until this atomic operation completes,
      * any other read or write operation against the array will block.
      */
-    load(typedArray: BigInt64Array | BigUint64Array, index: number): bigint;
+    load(typedArray: BigInt64Array<ArrayBufferLike> | BigUint64Array<ArrayBufferLike>, index: number): bigint;
 
     /**
      * Stores the bitwise OR of a value with the value at the given position in the array,
      * returning the original value. Until this atomic operation completes, any other read or write
      * operation against the array will block.
      */
-    or(typedArray: BigInt64Array | BigUint64Array, index: number, value: bigint): bigint;
+    or(typedArray: BigInt64Array<ArrayBufferLike> | BigUint64Array<ArrayBufferLike>, index: number, value: bigint): bigint;
 
     /**
      * Stores a value at the given position in the array, returning the new value. Until this
      * atomic operation completes, any other read or write operation against the array will block.
      */
-    store(typedArray: BigInt64Array | BigUint64Array, index: number, value: bigint): bigint;
+    store(typedArray: BigInt64Array<ArrayBufferLike> | BigUint64Array<ArrayBufferLike>, index: number, value: bigint): bigint;
 
     /**
      * Subtracts a value from the value at the given position in the array, returning the original
      * value. Until this atomic operation completes, any other read or write operation against the
      * array will block.
      */
-    sub(typedArray: BigInt64Array | BigUint64Array, index: number, value: bigint): bigint;
+    sub(typedArray: BigInt64Array<ArrayBufferLike> | BigUint64Array<ArrayBufferLike>, index: number, value: bigint): bigint;
 
     /**
      * If the value at the given position in the array is equal to the provided value, the current
@@ -9620,7 +9751,7 @@ interface Atomics {
      * `"timed-out"`) or until the agent is awoken (returning `"ok"`); otherwise, returns
      * `"not-equal"`.
      */
-    wait(typedArray: BigInt64Array, index: number, value: bigint, timeout?: number): "ok" | "not-equal" | "timed-out";
+    wait(typedArray: BigInt64Array<ArrayBufferLike>, index: number, value: bigint, timeout?: number): "ok" | "not-equal" | "timed-out";
 
     /**
      * Wakes up sleeping agents that are waiting on the given index of the array, returning the
@@ -9629,14 +9760,55 @@ interface Atomics {
      * @param index The position in the typedArray to wake up on.
      * @param count The number of sleeping agents to notify. Defaults to +Infinity.
      */
-    notify(typedArray: BigInt64Array, index: number, count?: number): number;
+    notify(typedArray: BigInt64Array<ArrayBufferLike>, index: number, count?: number): number;
 
     /**
      * Stores the bitwise XOR of a value with the value at the given position in the array,
      * returning the original value. Until this atomic operation completes, any other read or write
      * operation against the array will block.
      */
-    xor(typedArray: BigInt64Array | BigUint64Array, index: number, value: bigint): bigint;
+    xor(typedArray: BigInt64Array<ArrayBufferLike> | BigUint64Array<ArrayBufferLike>, index: number, value: bigint): bigint;
+}
+
+//========== lib.es2020.symbol.wellknown.d.ts ==========
+/*! *****************************************************************************
+Copyright (c) Microsoft Corporation. All rights reserved.
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License at http://www.apache.org/licenses/LICENSE-2.0
+
+THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
+WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
+MERCHANTABILITY OR NON-INFRINGEMENT.
+
+See the Apache Version 2.0 License for specific language governing permissions
+and limitations under the License.
+***************************************************************************** */
+
+
+/// <reference lib="es2015.iterable" />
+/// <reference lib="es2015.symbol" />
+
+interface SymbolConstructor {
+    /**
+     * A regular expression method that matches the regular expression against a string. Called
+     * by the String.prototype.matchAll method.
+     */
+    readonly matchAll: unique symbol;
+}
+
+interface RegExpStringIterator<T> extends IteratorObject<T, BuiltinIteratorReturn, unknown> {
+    [Symbol.iterator](): RegExpStringIterator<T>;
+}
+
+interface RegExp {
+    /**
+     * Matches a string with this regular expression, and returns an iterable of matches
+     * containing the results of that search.
+     * @param string A string to search within.
+     */
+    [Symbol.matchAll](str: string): RegExpStringIterator<RegExpExecArray>;
 }
 
 //========== lib.es2020.string.d.ts ==========
@@ -9649,24 +9821,24 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
 
-/// <reference no-default-lib="true"/>
-
 /// <reference lib="es2015.iterable" />
+/// <reference lib="es2020.intl" />
+/// <reference lib="es2020.symbol.wellknown" />
 
 interface String {
     /**
      * Matches a string with a regular expression, and returns an iterable of matches
      * containing the results of that search.
-     * @param regexp A variable name or string literal containing the regular expression pattern and flags.
+     * @param regexp A regular expression
      */
-    matchAll(regexp: RegExp): IterableIterator<RegExpExecArray>;
+    matchAll(regexp: RegExp): RegExpStringIterator<RegExpExecArray>;
 
     /** Converts all alphabetic characters to lowercase, taking into account the host environment's current locale. */
     toLocaleLowerCase(locales?: Intl.LocalesArgument): string;
@@ -9683,45 +9855,6 @@ interface String {
     localeCompare(that: string, locales?: Intl.LocalesArgument, options?: Intl.CollatorOptions): number;
 }
 
-//========== lib.es2020.symbol.wellknown.d.ts ==========
-/*! *****************************************************************************
-Copyright (c) Microsoft Corporation. All rights reserved.
-Licensed under the Apache License, Version 2.0 (the "License"); you may not use
-this file except in compliance with the License. You may obtain a copy of the
-License at http://www.apache.org/licenses/LICENSE-2.0
-
-THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
-WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
-
-See the Apache Version 2.0 License for specific language governing permissions
-and limitations under the License.
-***************************************************************************** */
-
-
-/// <reference no-default-lib="true"/>
-
-/// <reference lib="es2015.iterable" />
-/// <reference lib="es2015.symbol" />
-
-interface SymbolConstructor {
-    /**
-     * A regular expression method that matches the regular expression against a string. Called
-     * by the String.prototype.matchAll method.
-     */
-    readonly matchAll: unique symbol;
-}
-
-interface RegExp {
-    /**
-     * Matches a string with this regular expression, and returns an iterable of matches
-     * containing the results of that search.
-     * @param string A string to search within.
-     */
-    [Symbol.matchAll](str: string): IterableIterator<RegExpMatchArray>;
-}
-
 //========== lib.es2020.d.ts ==========
 /*! *****************************************************************************
 Copyright (c) Microsoft Corporation. All rights reserved.
@@ -9732,14 +9865,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 /// <reference lib="es2019" />
 /// <reference lib="es2020.bigint" />
@@ -9761,14 +9892,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 interface AggregateError extends Error {
     errors: any[];
@@ -9811,14 +9940,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 interface String {
     /**
@@ -9846,14 +9973,14 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
 
-/// <reference no-default-lib="true"/>
+/// <reference lib="es2015.symbol.wellknown" />
 
 interface WeakRef<T extends WeakKey> {
     readonly [Symbol.toStringTag]: "WeakRef";
@@ -9924,14 +10051,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 declare namespace Intl {
     interface DateTimeFormatPartTypesRegistry {
@@ -9967,28 +10092,28 @@ declare namespace Intl {
     /**
      * The locale matching algorithm to use.
      *
-     * [MDN](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/ListFormat/ListFormat#parameters).
+     * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/ListFormat/ListFormat#parameters).
      */
     type ListFormatLocaleMatcher = "lookup" | "best fit";
 
     /**
      * The format of output message.
      *
-     * [MDN](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/ListFormat/ListFormat#parameters).
+     * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/ListFormat/ListFormat#parameters).
      */
     type ListFormatType = "conjunction" | "disjunction" | "unit";
 
     /**
      * The length of the formatted message.
      *
-     * [MDN](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/ListFormat/ListFormat#parameters).
+     * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/ListFormat/ListFormat#parameters).
      */
     type ListFormatStyle = "long" | "short" | "narrow";
 
     /**
      * An object with some or all properties of the `Intl.ListFormat` constructor `options` parameter.
      *
-     * [MDN](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/ListFormat/ListFormat#parameters).
+     * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/ListFormat/ListFormat#parameters).
      */
     interface ListFormatOptions {
         /** The locale matching algorithm to use. For information about this option, see [Intl page](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl#Locale_negotiation). */
@@ -10009,26 +10134,26 @@ declare namespace Intl {
         /**
          * Returns a string with a language-specific representation of the list.
          *
-         * @param list - An iterable object, such as an [Array](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Array).
+         * @param list - An iterable object, such as an [Array](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Array).
          *
          * @throws `TypeError` if `list` includes something other than the possible values.
          *
          * @returns {string} A language-specific formatted string representing the elements of the list.
          *
-         * [MDN](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/ListFormat/format).
+         * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/ListFormat/format).
          */
         format(list: Iterable<string>): string;
 
         /**
          * Returns an Array of objects representing the different components that can be used to format a list of values in a locale-aware fashion.
          *
-         * @param list - An iterable object, such as an [Array](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Array), to be formatted according to a locale.
+         * @param list - An iterable object, such as an [Array](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Array), to be formatted according to a locale.
          *
          * @throws `TypeError` if `list` includes something other than the possible values.
          *
          * @returns {{ type: "element" | "literal", value: string; }[]} An Array of components which contains the formatted parts from the list.
          *
-         * [MDN](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/ListFormat/formatToParts).
+         * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/ListFormat/formatToParts).
          */
         formatToParts(list: Iterable<string>): { type: "element" | "literal"; value: string; }[];
 
@@ -10037,7 +10162,7 @@ declare namespace Intl {
          * formatting options computed during the construction of the current
          * `Intl.ListFormat` object.
          *
-         * [MDN](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/ListFormat/resolvedOptions).
+         * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/ListFormat/resolvedOptions).
          */
         resolvedOptions(): ResolvedListFormatOptions;
     }
@@ -10046,19 +10171,19 @@ declare namespace Intl {
         prototype: ListFormat;
 
         /**
-         * Creates [Intl.ListFormat](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/ListFormat) objects that
+         * Creates [Intl.ListFormat](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/ListFormat) objects that
          * enable language-sensitive list formatting.
          *
          * @param locales - A string with a [BCP 47 language tag](http://tools.ietf.org/html/rfc5646), or an array of such strings.
          *  For the general form and interpretation of the `locales` argument,
-         *  see the [`Intl` page](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl#Locale_identification_and_negotiation).
+         *  see the [`Intl` page](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl#Locale_identification_and_negotiation).
          *
-         * @param options - An [object](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/ListFormat/ListFormat#parameters)
+         * @param options - An [object](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/ListFormat/ListFormat#parameters)
          *  with some or all options of `ListFormatOptions`.
          *
-         * @returns [Intl.ListFormatOptions](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/ListFormat) object.
+         * @returns [Intl.ListFormatOptions](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/ListFormat) object.
          *
-         * [MDN](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/ListFormat).
+         * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/ListFormat).
          */
         new (locales?: LocalesArgument, options?: ListFormatOptions): ListFormat;
 
@@ -10068,15 +10193,15 @@ declare namespace Intl {
          *
          * @param locales - A string with a [BCP 47 language tag](http://tools.ietf.org/html/rfc5646), or an array of such strings.
          *  For the general form and interpretation of the `locales` argument,
-         *  see the [`Intl` page](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl#Locale_identification_and_negotiation).
+         *  see the [`Intl` page](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl#Locale_identification_and_negotiation).
          *
-         * @param options - An [object](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/ListFormat/supportedLocalesOf#parameters).
+         * @param options - An [object](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/ListFormat/supportedLocalesOf#parameters).
          *  with some or all possible options.
          *
          * @returns An array of strings representing a subset of the given locale tags that are supported in list
          *  formatting without having to fall back to the runtime's default locale.
          *
-         * [MDN](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/ListFormat/supportedLocalesOf).
+         * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/ListFormat/supportedLocalesOf).
          */
         supportedLocalesOf(locales: LocalesArgument, options?: Pick<ListFormatOptions, "localeMatcher">): UnicodeBCP47LocaleIdentifier[];
     };
@@ -10092,14 +10217,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 /// <reference lib="es2020" />
 /// <reference lib="es2021.promise" />
@@ -10117,14 +10240,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 interface Array<T> {
     /**
@@ -10142,7 +10263,7 @@ interface ReadonlyArray<T> {
     at(index: number): T | undefined;
 }
 
-interface Int8Array {
+interface Int8Array<TArrayBuffer extends ArrayBufferLike> {
     /**
      * Returns the item located at the specified index.
      * @param index The zero-based index of the desired code unit. A negative index will count back from the last item.
@@ -10150,7 +10271,7 @@ interface Int8Array {
     at(index: number): number | undefined;
 }
 
-interface Uint8Array {
+interface Uint8Array<TArrayBuffer extends ArrayBufferLike> {
     /**
      * Returns the item located at the specified index.
      * @param index The zero-based index of the desired code unit. A negative index will count back from the last item.
@@ -10158,7 +10279,7 @@ interface Uint8Array {
     at(index: number): number | undefined;
 }
 
-interface Uint8ClampedArray {
+interface Uint8ClampedArray<TArrayBuffer extends ArrayBufferLike> {
     /**
      * Returns the item located at the specified index.
      * @param index The zero-based index of the desired code unit. A negative index will count back from the last item.
@@ -10166,7 +10287,7 @@ interface Uint8ClampedArray {
     at(index: number): number | undefined;
 }
 
-interface Int16Array {
+interface Int16Array<TArrayBuffer extends ArrayBufferLike> {
     /**
      * Returns the item located at the specified index.
      * @param index The zero-based index of the desired code unit. A negative index will count back from the last item.
@@ -10174,7 +10295,7 @@ interface Int16Array {
     at(index: number): number | undefined;
 }
 
-interface Uint16Array {
+interface Uint16Array<TArrayBuffer extends ArrayBufferLike> {
     /**
      * Returns the item located at the specified index.
      * @param index The zero-based index of the desired code unit. A negative index will count back from the last item.
@@ -10182,7 +10303,7 @@ interface Uint16Array {
     at(index: number): number | undefined;
 }
 
-interface Int32Array {
+interface Int32Array<TArrayBuffer extends ArrayBufferLike> {
     /**
      * Returns the item located at the specified index.
      * @param index The zero-based index of the desired code unit. A negative index will count back from the last item.
@@ -10190,7 +10311,7 @@ interface Int32Array {
     at(index: number): number | undefined;
 }
 
-interface Uint32Array {
+interface Uint32Array<TArrayBuffer extends ArrayBufferLike> {
     /**
      * Returns the item located at the specified index.
      * @param index The zero-based index of the desired code unit. A negative index will count back from the last item.
@@ -10198,7 +10319,7 @@ interface Uint32Array {
     at(index: number): number | undefined;
 }
 
-interface Float32Array {
+interface Float32Array<TArrayBuffer extends ArrayBufferLike> {
     /**
      * Returns the item located at the specified index.
      * @param index The zero-based index of the desired code unit. A negative index will count back from the last item.
@@ -10206,7 +10327,7 @@ interface Float32Array {
     at(index: number): number | undefined;
 }
 
-interface Float64Array {
+interface Float64Array<TArrayBuffer extends ArrayBufferLike> {
     /**
      * Returns the item located at the specified index.
      * @param index The zero-based index of the desired code unit. A negative index will count back from the last item.
@@ -10214,7 +10335,7 @@ interface Float64Array {
     at(index: number): number | undefined;
 }
 
-interface BigInt64Array {
+interface BigInt64Array<TArrayBuffer extends ArrayBufferLike> {
     /**
      * Returns the item located at the specified index.
      * @param index The zero-based index of the desired code unit. A negative index will count back from the last item.
@@ -10222,7 +10343,7 @@ interface BigInt64Array {
     at(index: number): bigint | undefined;
 }
 
-interface BigUint64Array {
+interface BigUint64Array<TArrayBuffer extends ArrayBufferLike> {
     /**
      * Returns the item located at the specified index.
      * @param index The zero-based index of the desired code unit. A negative index will count back from the last item.
@@ -10240,14 +10361,14 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
 
-/// <reference no-default-lib="true"/>
+/// <reference lib="es2021.promise" />
 
 interface ErrorOptions {
     cause?: unknown;
@@ -10315,20 +10436,18 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
 
-/// <reference no-default-lib="true"/>
-
 declare namespace Intl {
     /**
      * An object with some or all properties of the `Intl.Segmenter` constructor `options` parameter.
      *
-     * [MDN](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/Segmenter/Segmenter#parameters)
+     * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/Segmenter/Segmenter#parameters)
      */
     interface SegmenterOptions {
         /** The locale matching algorithm to use. For information about this option, see [Intl page](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl#Locale_negotiation). */
@@ -10337,15 +10456,27 @@ declare namespace Intl {
         granularity?: "grapheme" | "word" | "sentence" | undefined;
     }
 
+    /**
+     * The `Intl.Segmenter` object enables locale-sensitive text segmentation, enabling you to get meaningful items (graphemes, words or sentences) from a string.
+     *
+     * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/Segmenter)
+     */
     interface Segmenter {
         /**
          * Returns `Segments` object containing the segments of the input string, using the segmenter's locale and granularity.
+         *
+         * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/Segmenter/segment)
          *
          * @param input - The text to be segmented as a `string`.
          *
          * @returns A new iterable Segments object containing the segments of the input string, using the segmenter's locale and granularity.
          */
         segment(input: string): Segments;
+        /**
+         * The `resolvedOptions()` method of `Intl.Segmenter` instances returns a new object with properties reflecting the options computed during initialization of this `Segmenter` object.
+         *
+         * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/Segmenter/resolvedOptions)
+         */
         resolvedOptions(): ResolvedSegmenterOptions;
     }
 
@@ -10354,16 +10485,27 @@ declare namespace Intl {
         granularity: "grapheme" | "word" | "sentence";
     }
 
+    interface SegmentIterator<T> extends IteratorObject<T, BuiltinIteratorReturn, unknown> {
+        [Symbol.iterator](): SegmentIterator<T>;
+    }
+
+    /**
+     * A `Segments` object is an iterable collection of the segments of a text string. It is returned by a call to the `segment()` method of an `Intl.Segmenter` object.
+     *
+     * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/Segmenter/segment/Segments)
+     */
     interface Segments {
         /**
          * Returns an object describing the segment in the original string that includes the code unit at a specified index.
          *
+         * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/Segmenter/segment/Segments/containing)
+         *
          * @param codeUnitIndex - A number specifying the index of the code unit in the original input string. If the value is omitted, it defaults to `0`.
          */
-        containing(codeUnitIndex?: number): SegmentData;
+        containing(codeUnitIndex?: number): SegmentData | undefined;
 
         /** Returns an iterator to iterate over the segments. */
-        [Symbol.iterator](): IterableIterator<SegmentData>;
+        [Symbol.iterator](): SegmentIterator<SegmentData>;
     }
 
     interface SegmentData {
@@ -10380,6 +10522,11 @@ declare namespace Intl {
         isWordLike?: boolean;
     }
 
+    /**
+     * The `Intl.Segmenter` object enables locale-sensitive text segmentation, enabling you to get meaningful items (graphemes, words or sentences) from a string.
+     *
+     * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/Segmenter)
+     */
     const Segmenter: {
         prototype: Segmenter;
 
@@ -10388,14 +10535,14 @@ declare namespace Intl {
          *
          * @param locales - A string with a [BCP 47 language tag](http://tools.ietf.org/html/rfc5646), or an array of such strings.
          *  For the general form and interpretation of the `locales` argument,
-         *  see the [`Intl` page](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl#Locale_identification_and_negotiation).
+         *  see the [`Intl` page](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl#Locale_identification_and_negotiation).
          *
-         * @param options - An [object](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/Segmenter/Segmenter#parameters)
+         * @param options - An [object](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/Segmenter/Segmenter#parameters)
          *  with some or all options of `SegmenterOptions`.
          *
-         * @returns [Intl.Segmenter](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/Segments) object.
+         * @returns [Intl.Segmenter](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/Segments) object.
          *
-         * [MDN](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/Segmenter).
+         * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/Segmenter).
          */
         new (locales?: LocalesArgument, options?: SegmenterOptions): Segmenter;
 
@@ -10404,19 +10551,19 @@ declare namespace Intl {
          *
          * @param locales - A string with a [BCP 47 language tag](http://tools.ietf.org/html/rfc5646), or an array of such strings.
          *  For the general form and interpretation of the `locales` argument,
-         *  see the [`Intl` page](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl#Locale_identification_and_negotiation).
+         *  see the [`Intl` page](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl#Locale_identification_and_negotiation).
          *
-         * @param options An [object](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/Segmenter/supportedLocalesOf#parameters).
+         * @param options An [object](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/Segmenter/supportedLocalesOf#parameters).
          *  with some or all possible options.
          *
-         * [MDN](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/Segmenter/supportedLocalesOf)
+         * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/Segmenter/supportedLocalesOf)
          */
         supportedLocalesOf(locales: LocalesArgument, options?: Pick<SegmenterOptions, "localeMatcher">): UnicodeBCP47LocaleIdentifier[];
     };
 
     /**
      * Returns a sorted array of the supported collation, calendar, currency, numbering system, timezones, and units by the implementation.
-     * [MDN](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/supportedValuesOf)
+     * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/supportedValuesOf)
      *
      * @param key A string indicating the category of values to return.
      * @returns A sorted array of the supported values.
@@ -10434,14 +10581,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 interface ObjectConstructor {
     /**
@@ -10450,74 +10595,6 @@ interface ObjectConstructor {
      * @param v A property name.
      */
     hasOwn(o: object, v: PropertyKey): boolean;
-}
-
-//========== lib.es2022.sharedmemory.d.ts ==========
-/*! *****************************************************************************
-Copyright (c) Microsoft Corporation. All rights reserved.
-Licensed under the Apache License, Version 2.0 (the "License"); you may not use
-this file except in compliance with the License. You may obtain a copy of the
-License at http://www.apache.org/licenses/LICENSE-2.0
-
-THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
-WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
-
-See the Apache Version 2.0 License for specific language governing permissions
-and limitations under the License.
-***************************************************************************** */
-
-
-/// <reference no-default-lib="true"/>
-
-interface Atomics {
-    /**
-     * A non-blocking, asynchronous version of wait which is usable on the main thread.
-     * Waits asynchronously on a shared memory location and returns a Promise
-     * @param typedArray A shared Int32Array or BigInt64Array.
-     * @param index The position in the typedArray to wait on.
-     * @param value The expected value to test.
-     * @param [timeout] The expected value to test.
-     */
-    waitAsync(typedArray: Int32Array, index: number, value: number, timeout?: number): { async: false; value: "not-equal" | "timed-out"; } | { async: true; value: Promise<"ok" | "timed-out">; };
-
-    /**
-     * A non-blocking, asynchronous version of wait which is usable on the main thread.
-     * Waits asynchronously on a shared memory location and returns a Promise
-     * @param typedArray A shared Int32Array or BigInt64Array.
-     * @param index The position in the typedArray to wait on.
-     * @param value The expected value to test.
-     * @param [timeout] The expected value to test.
-     */
-    waitAsync(typedArray: BigInt64Array, index: number, value: bigint, timeout?: number): { async: false; value: "not-equal" | "timed-out"; } | { async: true; value: Promise<"ok" | "timed-out">; };
-}
-
-//========== lib.es2022.string.d.ts ==========
-/*! *****************************************************************************
-Copyright (c) Microsoft Corporation. All rights reserved.
-Licensed under the Apache License, Version 2.0 (the "License"); you may not use
-this file except in compliance with the License. You may obtain a copy of the
-License at http://www.apache.org/licenses/LICENSE-2.0
-
-THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
-WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
-
-See the Apache Version 2.0 License for specific language governing permissions
-and limitations under the License.
-***************************************************************************** */
-
-
-/// <reference no-default-lib="true"/>
-
-interface String {
-    /**
-     * Returns a new String consisting of the single UTF-16 code unit located at the specified index.
-     * @param index The zero-based index of the desired code unit. A negative index will count back from the last item.
-     */
-    at(index: number): string | undefined;
 }
 
 //========== lib.es2022.regexp.d.ts ==========
@@ -10530,14 +10607,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 interface RegExpMatchArray {
     indices?: RegExpIndicesArray;
@@ -10547,7 +10622,7 @@ interface RegExpExecArray {
     indices?: RegExpIndicesArray;
 }
 
-interface RegExpIndicesArray extends Array<[number, number]> {
+interface RegExpIndicesArray extends Array<[number, number] | undefined> {
     groups?: {
         [key: string]: [number, number];
     };
@@ -10561,6 +10636,31 @@ interface RegExp {
     readonly hasIndices: boolean;
 }
 
+//========== lib.es2022.string.d.ts ==========
+/*! *****************************************************************************
+Copyright (c) Microsoft Corporation. All rights reserved.
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License at http://www.apache.org/licenses/LICENSE-2.0
+
+THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
+WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
+MERCHANTABILITY OR NON-INFRINGEMENT.
+
+See the Apache Version 2.0 License for specific language governing permissions
+and limitations under the License.
+***************************************************************************** */
+
+
+interface String {
+    /**
+     * Returns a new String consisting of the single UTF-16 code unit located at the specified index.
+     * @param index The zero-based index of the desired code unit. A negative index will count back from the last item.
+     */
+    at(index: number): string | undefined;
+}
+
 //========== lib.es2022.d.ts ==========
 /*! *****************************************************************************
 Copyright (c) Microsoft Corporation. All rights reserved.
@@ -10571,23 +10671,20 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
 
-/// <reference no-default-lib="true"/>
-
 /// <reference lib="es2021" />
 /// <reference lib="es2022.array" />
 /// <reference lib="es2022.error" />
 /// <reference lib="es2022.intl" />
 /// <reference lib="es2022.object" />
-/// <reference lib="es2022.sharedmemory" />
-/// <reference lib="es2022.string" />
 /// <reference lib="es2022.regexp" />
+/// <reference lib="es2022.string" />
 
 //========== lib.es2023.array.d.ts ==========
 /*! *****************************************************************************
@@ -10599,14 +10696,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 interface Array<T> {
     /**
@@ -10641,7 +10736,7 @@ interface Array<T> {
      * Returns a copy of an array with its elements sorted.
      * @param compareFn Function used to determine the order of the elements. It is expected to return
      * a negative value if the first argument is less than the second argument, zero if they're equal, and a positive
-     * value otherwise. If omitted, the elements are sorted in ascending, ASCII character order.
+     * value otherwise. If omitted, the elements are sorted in ascending, UTF-16 code unit order.
      * ```ts
      * [11, 2, 22, 1].toSorted((a, b) => a - b) // [1, 2, 11, 22]
      * ```
@@ -10719,7 +10814,7 @@ interface ReadonlyArray<T> {
      * Copies and sorts the array.
      * @param compareFn Function used to determine the order of the elements. It is expected to return
      * a negative value if the first argument is less than the second argument, zero if they're equal, and a positive
-     * value otherwise. If omitted, the elements are sorted in ascending, ASCII character order.
+     * value otherwise. If omitted, the elements are sorted in ascending, UTF-16 code unit order.
      * ```ts
      * [11, 2, 22, 1].toSorted((a, b) => a - b) // [1, 2, 11, 22]
      * ```
@@ -10755,7 +10850,7 @@ interface ReadonlyArray<T> {
     with(index: number, value: T): T[];
 }
 
-interface Int8Array {
+interface Int8Array<TArrayBuffer extends ArrayBufferLike> {
     /**
      * Returns the value of the last element in the array where predicate is true, and undefined
      * otherwise.
@@ -10769,12 +10864,12 @@ interface Int8Array {
         predicate: (
             value: number,
             index: number,
-            array: Int8Array,
+            array: this,
         ) => value is S,
         thisArg?: any,
     ): S | undefined;
     findLast(
-        predicate: (value: number, index: number, array: Int8Array) => unknown,
+        predicate: (value: number, index: number, array: this) => unknown,
         thisArg?: any,
     ): number | undefined;
 
@@ -10788,14 +10883,14 @@ interface Int8Array {
      * predicate. If it is not provided, undefined is used instead.
      */
     findLastIndex(
-        predicate: (value: number, index: number, array: Int8Array) => unknown,
+        predicate: (value: number, index: number, array: this) => unknown,
         thisArg?: any,
     ): number;
 
     /**
      * Copies the array and returns the copy with the elements in reverse order.
      */
-    toReversed(): Int8Array;
+    toReversed(): Int8Array<ArrayBuffer>;
 
     /**
      * Copies and sorts the array.
@@ -10807,7 +10902,7 @@ interface Int8Array {
      * myNums.toSorted((a, b) => a - b) // Int8Array(4) [1, 2, 11, 22]
      * ```
      */
-    toSorted(compareFn?: (a: number, b: number) => number): Int8Array;
+    toSorted(compareFn?: (a: number, b: number) => number): Int8Array<ArrayBuffer>;
 
     /**
      * Copies the array and inserts the given number at the provided index.
@@ -10816,10 +10911,10 @@ interface Int8Array {
      * @param value The value to insert into the copied array.
      * @returns A copy of the original array with the inserted value.
      */
-    with(index: number, value: number): Int8Array;
+    with(index: number, value: number): Int8Array<ArrayBuffer>;
 }
 
-interface Uint8Array {
+interface Uint8Array<TArrayBuffer extends ArrayBufferLike> {
     /**
      * Returns the value of the last element in the array where predicate is true, and undefined
      * otherwise.
@@ -10833,12 +10928,12 @@ interface Uint8Array {
         predicate: (
             value: number,
             index: number,
-            array: Uint8Array,
+            array: this,
         ) => value is S,
         thisArg?: any,
     ): S | undefined;
     findLast(
-        predicate: (value: number, index: number, array: Uint8Array) => unknown,
+        predicate: (value: number, index: number, array: this) => unknown,
         thisArg?: any,
     ): number | undefined;
 
@@ -10852,14 +10947,14 @@ interface Uint8Array {
      * predicate. If it is not provided, undefined is used instead.
      */
     findLastIndex(
-        predicate: (value: number, index: number, array: Uint8Array) => unknown,
+        predicate: (value: number, index: number, array: this) => unknown,
         thisArg?: any,
     ): number;
 
     /**
      * Copies the array and returns the copy with the elements in reverse order.
      */
-    toReversed(): Uint8Array;
+    toReversed(): Uint8Array<ArrayBuffer>;
 
     /**
      * Copies and sorts the array.
@@ -10871,7 +10966,7 @@ interface Uint8Array {
      * myNums.toSorted((a, b) => a - b) // Uint8Array(4) [1, 2, 11, 22]
      * ```
      */
-    toSorted(compareFn?: (a: number, b: number) => number): Uint8Array;
+    toSorted(compareFn?: (a: number, b: number) => number): Uint8Array<ArrayBuffer>;
 
     /**
      * Copies the array and inserts the given number at the provided index.
@@ -10880,10 +10975,10 @@ interface Uint8Array {
      * @param value The value to insert into the copied array.
      * @returns A copy of the original array with the inserted value.
      */
-    with(index: number, value: number): Uint8Array;
+    with(index: number, value: number): Uint8Array<ArrayBuffer>;
 }
 
-interface Uint8ClampedArray {
+interface Uint8ClampedArray<TArrayBuffer extends ArrayBufferLike> {
     /**
      * Returns the value of the last element in the array where predicate is true, and undefined
      * otherwise.
@@ -10897,7 +10992,7 @@ interface Uint8ClampedArray {
         predicate: (
             value: number,
             index: number,
-            array: Uint8ClampedArray,
+            array: this,
         ) => value is S,
         thisArg?: any,
     ): S | undefined;
@@ -10905,7 +11000,7 @@ interface Uint8ClampedArray {
         predicate: (
             value: number,
             index: number,
-            array: Uint8ClampedArray,
+            array: this,
         ) => unknown,
         thisArg?: any,
     ): number | undefined;
@@ -10923,7 +11018,7 @@ interface Uint8ClampedArray {
         predicate: (
             value: number,
             index: number,
-            array: Uint8ClampedArray,
+            array: this,
         ) => unknown,
         thisArg?: any,
     ): number;
@@ -10931,7 +11026,7 @@ interface Uint8ClampedArray {
     /**
      * Copies the array and returns the copy with the elements in reverse order.
      */
-    toReversed(): Uint8ClampedArray;
+    toReversed(): Uint8ClampedArray<ArrayBuffer>;
 
     /**
      * Copies and sorts the array.
@@ -10943,7 +11038,7 @@ interface Uint8ClampedArray {
      * myNums.toSorted((a, b) => a - b) // Uint8ClampedArray(4) [1, 2, 11, 22]
      * ```
      */
-    toSorted(compareFn?: (a: number, b: number) => number): Uint8ClampedArray;
+    toSorted(compareFn?: (a: number, b: number) => number): Uint8ClampedArray<ArrayBuffer>;
 
     /**
      * Copies the array and inserts the given number at the provided index.
@@ -10952,10 +11047,10 @@ interface Uint8ClampedArray {
      * @param value The value to insert into the copied array.
      * @returns A copy of the original array with the inserted value.
      */
-    with(index: number, value: number): Uint8ClampedArray;
+    with(index: number, value: number): Uint8ClampedArray<ArrayBuffer>;
 }
 
-interface Int16Array {
+interface Int16Array<TArrayBuffer extends ArrayBufferLike> {
     /**
      * Returns the value of the last element in the array where predicate is true, and undefined
      * otherwise.
@@ -10969,12 +11064,12 @@ interface Int16Array {
         predicate: (
             value: number,
             index: number,
-            array: Int16Array,
+            array: this,
         ) => value is S,
         thisArg?: any,
     ): S | undefined;
     findLast(
-        predicate: (value: number, index: number, array: Int16Array) => unknown,
+        predicate: (value: number, index: number, array: this) => unknown,
         thisArg?: any,
     ): number | undefined;
 
@@ -10988,14 +11083,14 @@ interface Int16Array {
      * predicate. If it is not provided, undefined is used instead.
      */
     findLastIndex(
-        predicate: (value: number, index: number, array: Int16Array) => unknown,
+        predicate: (value: number, index: number, array: this) => unknown,
         thisArg?: any,
     ): number;
 
     /**
      * Copies the array and returns the copy with the elements in reverse order.
      */
-    toReversed(): Int16Array;
+    toReversed(): Int16Array<ArrayBuffer>;
 
     /**
      * Copies and sorts the array.
@@ -11007,7 +11102,7 @@ interface Int16Array {
      * myNums.toSorted((a, b) => a - b) // Int16Array(4) [-22, 1, 2, 11]
      * ```
      */
-    toSorted(compareFn?: (a: number, b: number) => number): Int16Array;
+    toSorted(compareFn?: (a: number, b: number) => number): Int16Array<ArrayBuffer>;
 
     /**
      * Copies the array and inserts the given number at the provided index.
@@ -11016,10 +11111,10 @@ interface Int16Array {
      * @param value The value to insert into the copied array.
      * @returns A copy of the original array with the inserted value.
      */
-    with(index: number, value: number): Int16Array;
+    with(index: number, value: number): Int16Array<ArrayBuffer>;
 }
 
-interface Uint16Array {
+interface Uint16Array<TArrayBuffer extends ArrayBufferLike> {
     /**
      * Returns the value of the last element in the array where predicate is true, and undefined
      * otherwise.
@@ -11033,7 +11128,7 @@ interface Uint16Array {
         predicate: (
             value: number,
             index: number,
-            array: Uint16Array,
+            array: this,
         ) => value is S,
         thisArg?: any,
     ): S | undefined;
@@ -11041,7 +11136,7 @@ interface Uint16Array {
         predicate: (
             value: number,
             index: number,
-            array: Uint16Array,
+            array: this,
         ) => unknown,
         thisArg?: any,
     ): number | undefined;
@@ -11059,7 +11154,7 @@ interface Uint16Array {
         predicate: (
             value: number,
             index: number,
-            array: Uint16Array,
+            array: this,
         ) => unknown,
         thisArg?: any,
     ): number;
@@ -11067,7 +11162,7 @@ interface Uint16Array {
     /**
      * Copies the array and returns the copy with the elements in reverse order.
      */
-    toReversed(): Uint16Array;
+    toReversed(): Uint16Array<ArrayBuffer>;
 
     /**
      * Copies and sorts the array.
@@ -11079,7 +11174,7 @@ interface Uint16Array {
      * myNums.toSorted((a, b) => a - b) // Uint16Array(4) [1, 2, 11, 22]
      * ```
      */
-    toSorted(compareFn?: (a: number, b: number) => number): Uint16Array;
+    toSorted(compareFn?: (a: number, b: number) => number): Uint16Array<ArrayBuffer>;
 
     /**
      * Copies the array and inserts the given number at the provided index.
@@ -11088,10 +11183,10 @@ interface Uint16Array {
      * @param value The value to insert into the copied array.
      * @returns A copy of the original array with the inserted value.
      */
-    with(index: number, value: number): Uint16Array;
+    with(index: number, value: number): Uint16Array<ArrayBuffer>;
 }
 
-interface Int32Array {
+interface Int32Array<TArrayBuffer extends ArrayBufferLike> {
     /**
      * Returns the value of the last element in the array where predicate is true, and undefined
      * otherwise.
@@ -11105,12 +11200,12 @@ interface Int32Array {
         predicate: (
             value: number,
             index: number,
-            array: Int32Array,
+            array: this,
         ) => value is S,
         thisArg?: any,
     ): S | undefined;
     findLast(
-        predicate: (value: number, index: number, array: Int32Array) => unknown,
+        predicate: (value: number, index: number, array: this) => unknown,
         thisArg?: any,
     ): number | undefined;
 
@@ -11124,14 +11219,14 @@ interface Int32Array {
      * predicate. If it is not provided, undefined is used instead.
      */
     findLastIndex(
-        predicate: (value: number, index: number, array: Int32Array) => unknown,
+        predicate: (value: number, index: number, array: this) => unknown,
         thisArg?: any,
     ): number;
 
     /**
      * Copies the array and returns the copy with the elements in reverse order.
      */
-    toReversed(): Int32Array;
+    toReversed(): Int32Array<ArrayBuffer>;
 
     /**
      * Copies and sorts the array.
@@ -11143,7 +11238,7 @@ interface Int32Array {
      * myNums.toSorted((a, b) => a - b) // Int32Array(4) [-22, 1, 2, 11]
      * ```
      */
-    toSorted(compareFn?: (a: number, b: number) => number): Int32Array;
+    toSorted(compareFn?: (a: number, b: number) => number): Int32Array<ArrayBuffer>;
 
     /**
      * Copies the array and inserts the given number at the provided index.
@@ -11152,10 +11247,10 @@ interface Int32Array {
      * @param value The value to insert into the copied array.
      * @returns A copy of the original array with the inserted value.
      */
-    with(index: number, value: number): Int32Array;
+    with(index: number, value: number): Int32Array<ArrayBuffer>;
 }
 
-interface Uint32Array {
+interface Uint32Array<TArrayBuffer extends ArrayBufferLike> {
     /**
      * Returns the value of the last element in the array where predicate is true, and undefined
      * otherwise.
@@ -11169,7 +11264,7 @@ interface Uint32Array {
         predicate: (
             value: number,
             index: number,
-            array: Uint32Array,
+            array: this,
         ) => value is S,
         thisArg?: any,
     ): S | undefined;
@@ -11177,7 +11272,7 @@ interface Uint32Array {
         predicate: (
             value: number,
             index: number,
-            array: Uint32Array,
+            array: this,
         ) => unknown,
         thisArg?: any,
     ): number | undefined;
@@ -11195,7 +11290,7 @@ interface Uint32Array {
         predicate: (
             value: number,
             index: number,
-            array: Uint32Array,
+            array: this,
         ) => unknown,
         thisArg?: any,
     ): number;
@@ -11203,7 +11298,7 @@ interface Uint32Array {
     /**
      * Copies the array and returns the copy with the elements in reverse order.
      */
-    toReversed(): Uint32Array;
+    toReversed(): Uint32Array<ArrayBuffer>;
 
     /**
      * Copies and sorts the array.
@@ -11215,7 +11310,7 @@ interface Uint32Array {
      * myNums.toSorted((a, b) => a - b) // Uint32Array(4) [1, 2, 11, 22]
      * ```
      */
-    toSorted(compareFn?: (a: number, b: number) => number): Uint32Array;
+    toSorted(compareFn?: (a: number, b: number) => number): Uint32Array<ArrayBuffer>;
 
     /**
      * Copies the array and inserts the given number at the provided index.
@@ -11224,10 +11319,10 @@ interface Uint32Array {
      * @param value The value to insert into the copied array.
      * @returns A copy of the original array with the inserted value.
      */
-    with(index: number, value: number): Uint32Array;
+    with(index: number, value: number): Uint32Array<ArrayBuffer>;
 }
 
-interface Float32Array {
+interface Float32Array<TArrayBuffer extends ArrayBufferLike> {
     /**
      * Returns the value of the last element in the array where predicate is true, and undefined
      * otherwise.
@@ -11241,7 +11336,7 @@ interface Float32Array {
         predicate: (
             value: number,
             index: number,
-            array: Float32Array,
+            array: this,
         ) => value is S,
         thisArg?: any,
     ): S | undefined;
@@ -11249,7 +11344,7 @@ interface Float32Array {
         predicate: (
             value: number,
             index: number,
-            array: Float32Array,
+            array: this,
         ) => unknown,
         thisArg?: any,
     ): number | undefined;
@@ -11267,7 +11362,7 @@ interface Float32Array {
         predicate: (
             value: number,
             index: number,
-            array: Float32Array,
+            array: this,
         ) => unknown,
         thisArg?: any,
     ): number;
@@ -11275,7 +11370,7 @@ interface Float32Array {
     /**
      * Copies the array and returns the copy with the elements in reverse order.
      */
-    toReversed(): Float32Array;
+    toReversed(): Float32Array<ArrayBuffer>;
 
     /**
      * Copies and sorts the array.
@@ -11287,7 +11382,7 @@ interface Float32Array {
      * myNums.toSorted((a, b) => a - b) // Float32Array(4) [-22.5, 1, 2, 11.5]
      * ```
      */
-    toSorted(compareFn?: (a: number, b: number) => number): Float32Array;
+    toSorted(compareFn?: (a: number, b: number) => number): Float32Array<ArrayBuffer>;
 
     /**
      * Copies the array and inserts the given number at the provided index.
@@ -11296,10 +11391,10 @@ interface Float32Array {
      * @param value The value to insert into the copied array.
      * @returns A copy of the original array with the inserted value.
      */
-    with(index: number, value: number): Float32Array;
+    with(index: number, value: number): Float32Array<ArrayBuffer>;
 }
 
-interface Float64Array {
+interface Float64Array<TArrayBuffer extends ArrayBufferLike> {
     /**
      * Returns the value of the last element in the array where predicate is true, and undefined
      * otherwise.
@@ -11313,7 +11408,7 @@ interface Float64Array {
         predicate: (
             value: number,
             index: number,
-            array: Float64Array,
+            array: this,
         ) => value is S,
         thisArg?: any,
     ): S | undefined;
@@ -11321,7 +11416,7 @@ interface Float64Array {
         predicate: (
             value: number,
             index: number,
-            array: Float64Array,
+            array: this,
         ) => unknown,
         thisArg?: any,
     ): number | undefined;
@@ -11339,7 +11434,7 @@ interface Float64Array {
         predicate: (
             value: number,
             index: number,
-            array: Float64Array,
+            array: this,
         ) => unknown,
         thisArg?: any,
     ): number;
@@ -11347,7 +11442,7 @@ interface Float64Array {
     /**
      * Copies the array and returns the copy with the elements in reverse order.
      */
-    toReversed(): Float64Array;
+    toReversed(): Float64Array<ArrayBuffer>;
 
     /**
      * Copies and sorts the array.
@@ -11359,7 +11454,7 @@ interface Float64Array {
      * myNums.toSorted((a, b) => a - b) // Float64Array(4) [-22.5, 1, 2, 11.5]
      * ```
      */
-    toSorted(compareFn?: (a: number, b: number) => number): Float64Array;
+    toSorted(compareFn?: (a: number, b: number) => number): Float64Array<ArrayBuffer>;
 
     /**
      * Copies the array and inserts the given number at the provided index.
@@ -11368,10 +11463,10 @@ interface Float64Array {
      * @param value The value to insert into the copied array.
      * @returns A copy of the original array with the inserted value.
      */
-    with(index: number, value: number): Float64Array;
+    with(index: number, value: number): Float64Array<ArrayBuffer>;
 }
 
-interface BigInt64Array {
+interface BigInt64Array<TArrayBuffer extends ArrayBufferLike> {
     /**
      * Returns the value of the last element in the array where predicate is true, and undefined
      * otherwise.
@@ -11385,7 +11480,7 @@ interface BigInt64Array {
         predicate: (
             value: bigint,
             index: number,
-            array: BigInt64Array,
+            array: this,
         ) => value is S,
         thisArg?: any,
     ): S | undefined;
@@ -11393,7 +11488,7 @@ interface BigInt64Array {
         predicate: (
             value: bigint,
             index: number,
-            array: BigInt64Array,
+            array: this,
         ) => unknown,
         thisArg?: any,
     ): bigint | undefined;
@@ -11411,7 +11506,7 @@ interface BigInt64Array {
         predicate: (
             value: bigint,
             index: number,
-            array: BigInt64Array,
+            array: this,
         ) => unknown,
         thisArg?: any,
     ): number;
@@ -11419,7 +11514,7 @@ interface BigInt64Array {
     /**
      * Copies the array and returns the copy with the elements in reverse order.
      */
-    toReversed(): BigInt64Array;
+    toReversed(): BigInt64Array<ArrayBuffer>;
 
     /**
      * Copies and sorts the array.
@@ -11431,7 +11526,7 @@ interface BigInt64Array {
      * myNums.toSorted((a, b) => Number(a - b)) // BigInt64Array(4) [-22n, 1n, 2n, 11n]
      * ```
      */
-    toSorted(compareFn?: (a: bigint, b: bigint) => number): BigInt64Array;
+    toSorted(compareFn?: (a: bigint, b: bigint) => number): BigInt64Array<ArrayBuffer>;
 
     /**
      * Copies the array and inserts the given bigint at the provided index.
@@ -11440,10 +11535,10 @@ interface BigInt64Array {
      * @param value The value to insert into the copied array.
      * @returns A copy of the original array with the inserted value.
      */
-    with(index: number, value: bigint): BigInt64Array;
+    with(index: number, value: bigint): BigInt64Array<ArrayBuffer>;
 }
 
-interface BigUint64Array {
+interface BigUint64Array<TArrayBuffer extends ArrayBufferLike> {
     /**
      * Returns the value of the last element in the array where predicate is true, and undefined
      * otherwise.
@@ -11457,7 +11552,7 @@ interface BigUint64Array {
         predicate: (
             value: bigint,
             index: number,
-            array: BigUint64Array,
+            array: this,
         ) => value is S,
         thisArg?: any,
     ): S | undefined;
@@ -11465,7 +11560,7 @@ interface BigUint64Array {
         predicate: (
             value: bigint,
             index: number,
-            array: BigUint64Array,
+            array: this,
         ) => unknown,
         thisArg?: any,
     ): bigint | undefined;
@@ -11483,7 +11578,7 @@ interface BigUint64Array {
         predicate: (
             value: bigint,
             index: number,
-            array: BigUint64Array,
+            array: this,
         ) => unknown,
         thisArg?: any,
     ): number;
@@ -11491,7 +11586,7 @@ interface BigUint64Array {
     /**
      * Copies the array and returns the copy with the elements in reverse order.
      */
-    toReversed(): BigUint64Array;
+    toReversed(): BigUint64Array<ArrayBuffer>;
 
     /**
      * Copies and sorts the array.
@@ -11503,7 +11598,7 @@ interface BigUint64Array {
      * myNums.toSorted((a, b) => Number(a - b)) // BigUint64Array(4) [1n, 2n, 11n, 22n]
      * ```
      */
-    toSorted(compareFn?: (a: bigint, b: bigint) => number): BigUint64Array;
+    toSorted(compareFn?: (a: bigint, b: bigint) => number): BigUint64Array<ArrayBuffer>;
 
     /**
      * Copies the array and inserts the given bigint at the provided index.
@@ -11512,7 +11607,7 @@ interface BigUint64Array {
      * @param value The value to insert into the copied array.
      * @returns A copy of the original array with the inserted value.
      */
-    with(index: number, value: bigint): BigUint64Array;
+    with(index: number, value: bigint): BigUint64Array<ArrayBuffer>;
 }
 
 //========== lib.es2023.collection.d.ts ==========
@@ -11525,14 +11620,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 interface WeakKeyTypes {
     symbol: symbol;
@@ -11548,14 +11641,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 declare namespace Intl {
     interface NumberFormatOptionsUseGroupingRegistry {
@@ -11567,6 +11658,12 @@ declare namespace Intl {
     interface NumberFormatOptionsSignDisplayRegistry {
         negative: never;
     }
+
+    interface NumberFormatRangePartTypeRegistry extends NumberFormatPartTypeRegistry {
+        approximatelySign: never;
+    }
+
+    type NumberFormatRangePartTypes = keyof NumberFormatRangePartTypeRegistry;
 
     interface NumberFormatOptions {
         roundingPriority?: "auto" | "morePrecision" | "lessPrecision" | undefined;
@@ -11582,7 +11679,9 @@ declare namespace Intl {
         trailingZeroDisplay: "auto" | "stripIfInteger";
     }
 
-    interface NumberRangeFormatPart extends NumberFormatPart {
+    interface NumberRangeFormatPart {
+        type: NumberFormatRangePartTypes;
+        value: string;
         source: "startRange" | "endRange" | "shared";
     }
 
@@ -11606,19 +11705,1789 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
 
-/// <reference no-default-lib="true"/>
-
 /// <reference lib="es2022" />
 /// <reference lib="es2023.array" />
 /// <reference lib="es2023.collection" />
 /// <reference lib="es2023.intl" />
+
+//========== lib.es2024.arraybuffer.d.ts ==========
+/*! *****************************************************************************
+Copyright (c) Microsoft Corporation. All rights reserved.
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License at http://www.apache.org/licenses/LICENSE-2.0
+
+THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
+WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
+MERCHANTABILITY OR NON-INFRINGEMENT.
+
+See the Apache Version 2.0 License for specific language governing permissions
+and limitations under the License.
+***************************************************************************** */
+
+
+interface ArrayBuffer {
+    /**
+     * If this ArrayBuffer is resizable, returns the maximum byte length given during construction; returns the byte length if not.
+     *
+     * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/ArrayBuffer/maxByteLength)
+     */
+    get maxByteLength(): number;
+
+    /**
+     * Returns true if this ArrayBuffer can be resized.
+     *
+     * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/ArrayBuffer/resizable)
+     */
+    get resizable(): boolean;
+
+    /**
+     * Resizes the ArrayBuffer to the specified size (in bytes).
+     *
+     * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/ArrayBuffer/resize)
+     */
+    resize(newByteLength?: number): void;
+
+    /**
+     * Returns a boolean indicating whether or not this buffer has been detached (transferred).
+     *
+     * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/ArrayBuffer/detached)
+     */
+    get detached(): boolean;
+
+    /**
+     * Creates a new ArrayBuffer with the same byte content as this buffer, then detaches this buffer.
+     *
+     * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/ArrayBuffer/transfer)
+     */
+    transfer(newByteLength?: number): ArrayBuffer;
+
+    /**
+     * Creates a new non-resizable ArrayBuffer with the same byte content as this buffer, then detaches this buffer.
+     *
+     * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/ArrayBuffer/transferToFixedLength)
+     */
+    transferToFixedLength(newByteLength?: number): ArrayBuffer;
+}
+
+interface ArrayBufferConstructor {
+    new (byteLength: number, options?: { maxByteLength?: number; }): ArrayBuffer;
+}
+
+//========== lib.es2024.collection.d.ts ==========
+/*! *****************************************************************************
+Copyright (c) Microsoft Corporation. All rights reserved.
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License at http://www.apache.org/licenses/LICENSE-2.0
+
+THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
+WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
+MERCHANTABILITY OR NON-INFRINGEMENT.
+
+See the Apache Version 2.0 License for specific language governing permissions
+and limitations under the License.
+***************************************************************************** */
+
+
+interface MapConstructor {
+    /**
+     * Groups members of an iterable according to the return value of the passed callback.
+     * @param items An iterable.
+     * @param keySelector A callback which will be invoked for each item in items.
+     */
+    groupBy<K, T>(
+        items: Iterable<T>,
+        keySelector: (item: T, index: number) => K,
+    ): Map<K, T[]>;
+}
+
+//========== lib.es2024.object.d.ts ==========
+/*! *****************************************************************************
+Copyright (c) Microsoft Corporation. All rights reserved.
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License at http://www.apache.org/licenses/LICENSE-2.0
+
+THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
+WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
+MERCHANTABILITY OR NON-INFRINGEMENT.
+
+See the Apache Version 2.0 License for specific language governing permissions
+and limitations under the License.
+***************************************************************************** */
+
+
+interface ObjectConstructor {
+    /**
+     * Groups members of an iterable according to the return value of the passed callback.
+     * @param items An iterable.
+     * @param keySelector A callback which will be invoked for each item in items.
+     */
+    groupBy<K extends PropertyKey, T>(
+        items: Iterable<T>,
+        keySelector: (item: T, index: number) => K,
+    ): Partial<Record<K, T[]>>;
+}
+
+//========== lib.es2024.promise.d.ts ==========
+/*! *****************************************************************************
+Copyright (c) Microsoft Corporation. All rights reserved.
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License at http://www.apache.org/licenses/LICENSE-2.0
+
+THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
+WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
+MERCHANTABILITY OR NON-INFRINGEMENT.
+
+See the Apache Version 2.0 License for specific language governing permissions
+and limitations under the License.
+***************************************************************************** */
+
+
+interface PromiseWithResolvers<T> {
+    promise: Promise<T>;
+    resolve: (value: T | PromiseLike<T>) => void;
+    reject: (reason?: any) => void;
+}
+
+interface PromiseConstructor {
+    /**
+     * Creates a new Promise and returns it in an object, along with its resolve and reject functions.
+     * @returns An object with the properties `promise`, `resolve`, and `reject`.
+     *
+     * ```ts
+     * const { promise, resolve, reject } = Promise.withResolvers<T>();
+     * ```
+     */
+    withResolvers<T>(): PromiseWithResolvers<T>;
+}
+
+//========== lib.es2024.regexp.d.ts ==========
+/*! *****************************************************************************
+Copyright (c) Microsoft Corporation. All rights reserved.
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License at http://www.apache.org/licenses/LICENSE-2.0
+
+THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
+WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
+MERCHANTABILITY OR NON-INFRINGEMENT.
+
+See the Apache Version 2.0 License for specific language governing permissions
+and limitations under the License.
+***************************************************************************** */
+
+
+interface RegExp {
+    /**
+     * Returns a Boolean value indicating the state of the unicodeSets flag (v) used with a regular expression.
+     * Default is false. Read-only.
+     */
+    readonly unicodeSets: boolean;
+}
+
+//========== lib.es2024.sharedmemory.d.ts ==========
+/*! *****************************************************************************
+Copyright (c) Microsoft Corporation. All rights reserved.
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License at http://www.apache.org/licenses/LICENSE-2.0
+
+THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
+WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
+MERCHANTABILITY OR NON-INFRINGEMENT.
+
+See the Apache Version 2.0 License for specific language governing permissions
+and limitations under the License.
+***************************************************************************** */
+
+
+/// <reference lib="es2020.bigint" />
+
+interface Atomics {
+    /**
+     * A non-blocking, asynchronous version of wait which is usable on the main thread.
+     * Waits asynchronously on a shared memory location and returns a Promise
+     * @param typedArray A shared Int32Array or BigInt64Array.
+     * @param index The position in the typedArray to wait on.
+     * @param value The expected value to test.
+     * @param [timeout] The expected value to test.
+     */
+    waitAsync(typedArray: Int32Array, index: number, value: number, timeout?: number): { async: false; value: "not-equal" | "timed-out"; } | { async: true; value: Promise<"ok" | "timed-out">; };
+
+    /**
+     * A non-blocking, asynchronous version of wait which is usable on the main thread.
+     * Waits asynchronously on a shared memory location and returns a Promise
+     * @param typedArray A shared Int32Array or BigInt64Array.
+     * @param index The position in the typedArray to wait on.
+     * @param value The expected value to test.
+     * @param [timeout] The expected value to test.
+     */
+    waitAsync(typedArray: BigInt64Array, index: number, value: bigint, timeout?: number): { async: false; value: "not-equal" | "timed-out"; } | { async: true; value: Promise<"ok" | "timed-out">; };
+}
+
+interface SharedArrayBuffer {
+    /**
+     * Returns true if this SharedArrayBuffer can be grown.
+     *
+     * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/SharedArrayBuffer/growable)
+     */
+    get growable(): boolean;
+
+    /**
+     * If this SharedArrayBuffer is growable, returns the maximum byte length given during construction; returns the byte length if not.
+     *
+     * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/SharedArrayBuffer/maxByteLength)
+     */
+    get maxByteLength(): number;
+
+    /**
+     * Grows the SharedArrayBuffer to the specified size (in bytes).
+     *
+     * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/SharedArrayBuffer/grow)
+     */
+    grow(newByteLength?: number): void;
+}
+
+interface SharedArrayBufferConstructor {
+    new (byteLength: number, options?: { maxByteLength?: number; }): SharedArrayBuffer;
+}
+
+//========== lib.es2024.string.d.ts ==========
+/*! *****************************************************************************
+Copyright (c) Microsoft Corporation. All rights reserved.
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License at http://www.apache.org/licenses/LICENSE-2.0
+
+THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
+WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
+MERCHANTABILITY OR NON-INFRINGEMENT.
+
+See the Apache Version 2.0 License for specific language governing permissions
+and limitations under the License.
+***************************************************************************** */
+
+
+interface String {
+    /**
+     * Returns true if all leading surrogates and trailing surrogates appear paired and in order.
+     */
+    isWellFormed(): boolean;
+
+    /**
+     * Returns a string where all lone or out-of-order surrogates have been replaced by the Unicode replacement character (U+FFFD).
+     */
+    toWellFormed(): string;
+}
+
+//========== lib.es2024.d.ts ==========
+/*! *****************************************************************************
+Copyright (c) Microsoft Corporation. All rights reserved.
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License at http://www.apache.org/licenses/LICENSE-2.0
+
+THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
+WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
+MERCHANTABILITY OR NON-INFRINGEMENT.
+
+See the Apache Version 2.0 License for specific language governing permissions
+and limitations under the License.
+***************************************************************************** */
+
+
+/// <reference lib="es2023" />
+/// <reference lib="es2024.arraybuffer" />
+/// <reference lib="es2024.collection" />
+/// <reference lib="es2024.object" />
+/// <reference lib="es2024.promise" />
+/// <reference lib="es2024.regexp" />
+/// <reference lib="es2024.sharedmemory" />
+/// <reference lib="es2024.string" />
+
+//========== lib.es2025.collection.d.ts ==========
+/*! *****************************************************************************
+Copyright (c) Microsoft Corporation. All rights reserved.
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License at http://www.apache.org/licenses/LICENSE-2.0
+
+THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
+WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
+MERCHANTABILITY OR NON-INFRINGEMENT.
+
+See the Apache Version 2.0 License for specific language governing permissions
+and limitations under the License.
+***************************************************************************** */
+
+
+/// <reference lib="es2024.collection" />
+
+interface ReadonlySetLike<T> {
+    /**
+     * Despite its name, returns an iterator of the values in the set-like.
+     */
+    keys(): Iterator<T>;
+    /**
+     * @returns a boolean indicating whether an element with the specified value exists in the set-like or not.
+     */
+    has(value: T): boolean;
+    /**
+     * @returns the number of (unique) elements in the set-like.
+     */
+    readonly size: number;
+}
+
+interface Set<T> {
+    /**
+     * @returns a new Set containing all the elements in this Set and also all the elements in the argument.
+     */
+    union<U>(other: ReadonlySetLike<U>): Set<T | U>;
+    /**
+     * @returns a new Set containing all the elements which are both in this Set and in the argument.
+     */
+    intersection<U>(other: ReadonlySetLike<U>): Set<T & U>;
+    /**
+     * @returns a new Set containing all the elements in this Set which are not also in the argument.
+     */
+    difference<U>(other: ReadonlySetLike<U>): Set<T>;
+    /**
+     * @returns a new Set containing all the elements which are in either this Set or in the argument, but not in both.
+     */
+    symmetricDifference<U>(other: ReadonlySetLike<U>): Set<T | U>;
+    /**
+     * @returns a boolean indicating whether all the elements in this Set are also in the argument.
+     */
+    isSubsetOf(other: ReadonlySetLike<unknown>): boolean;
+    /**
+     * @returns a boolean indicating whether all the elements in the argument are also in this Set.
+     */
+    isSupersetOf(other: ReadonlySetLike<unknown>): boolean;
+    /**
+     * @returns a boolean indicating whether this Set has no elements in common with the argument.
+     */
+    isDisjointFrom(other: ReadonlySetLike<unknown>): boolean;
+}
+
+interface ReadonlySet<T> {
+    /**
+     * @returns a new Set containing all the elements in this Set and also all the elements in the argument.
+     */
+    union<U>(other: ReadonlySetLike<U>): Set<T | U>;
+    /**
+     * @returns a new Set containing all the elements which are both in this Set and in the argument.
+     */
+    intersection<U>(other: ReadonlySetLike<U>): Set<T & U>;
+    /**
+     * @returns a new Set containing all the elements in this Set which are not also in the argument.
+     */
+    difference<U>(other: ReadonlySetLike<U>): Set<T>;
+    /**
+     * @returns a new Set containing all the elements which are in either this Set or in the argument, but not in both.
+     */
+    symmetricDifference<U>(other: ReadonlySetLike<U>): Set<T | U>;
+    /**
+     * @returns a boolean indicating whether all the elements in this Set are also in the argument.
+     */
+    isSubsetOf(other: ReadonlySetLike<unknown>): boolean;
+    /**
+     * @returns a boolean indicating whether all the elements in the argument are also in this Set.
+     */
+    isSupersetOf(other: ReadonlySetLike<unknown>): boolean;
+    /**
+     * @returns a boolean indicating whether this Set has no elements in common with the argument.
+     */
+    isDisjointFrom(other: ReadonlySetLike<unknown>): boolean;
+}
+
+//========== lib.es2025.float16.d.ts ==========
+/*! *****************************************************************************
+Copyright (c) Microsoft Corporation. All rights reserved.
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License at http://www.apache.org/licenses/LICENSE-2.0
+
+THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
+WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
+MERCHANTABILITY OR NON-INFRINGEMENT.
+
+See the Apache Version 2.0 License for specific language governing permissions
+and limitations under the License.
+***************************************************************************** */
+
+
+/// <reference lib="es2015.symbol" />
+/// <reference lib="es2015.iterable" />
+
+/**
+ * A typed array of 16-bit float values. The contents are initialized to 0. If the requested number
+ * of bytes could not be allocated an exception is raised.
+ */
+interface Float16Array<TArrayBuffer extends ArrayBufferLike = ArrayBufferLike> {
+    /**
+     * The size in bytes of each element in the array.
+     */
+    readonly BYTES_PER_ELEMENT: number;
+
+    /**
+     * The ArrayBuffer instance referenced by the array.
+     */
+    readonly buffer: TArrayBuffer;
+
+    /**
+     * The length in bytes of the array.
+     */
+    readonly byteLength: number;
+
+    /**
+     * The offset in bytes of the array.
+     */
+    readonly byteOffset: number;
+
+    /**
+     * Returns the item located at the specified index.
+     * @param index The zero-based index of the desired code unit. A negative index will count back from the last item.
+     */
+    at(index: number): number | undefined;
+
+    /**
+     * Returns the this object after copying a section of the array identified by start and end
+     * to the same array starting at position target
+     * @param target If target is negative, it is treated as length+target where length is the
+     * length of the array.
+     * @param start If start is negative, it is treated as length+start. If end is negative, it
+     * is treated as length+end.
+     * @param end If not specified, length of the this object is used as its default value.
+     */
+    copyWithin(target: number, start: number, end?: number): this;
+
+    /**
+     * Determines whether all the members of an array satisfy the specified test.
+     * @param predicate A function that accepts up to three arguments. The every method calls
+     * the predicate function for each element in the array until the predicate returns a value
+     * which is coercible to the Boolean value false, or until the end of the array.
+     * @param thisArg An object to which the this keyword can refer in the predicate function.
+     * If thisArg is omitted, undefined is used as the this value.
+     */
+    every(predicate: (value: number, index: number, array: this) => unknown, thisArg?: any): boolean;
+
+    /**
+     * Changes all array elements from `start` to `end` index to a static `value` and returns the modified array
+     * @param value value to fill array section with
+     * @param start index to start filling the array at. If start is negative, it is treated as
+     * length+start where length is the length of the array.
+     * @param end index to stop filling the array at. If end is negative, it is treated as
+     * length+end.
+     */
+    fill(value: number, start?: number, end?: number): this;
+
+    /**
+     * Returns the elements of an array that meet the condition specified in a callback function.
+     * @param predicate A function that accepts up to three arguments. The filter method calls
+     * the predicate function one time for each element in the array.
+     * @param thisArg An object to which the this keyword can refer in the predicate function.
+     * If thisArg is omitted, undefined is used as the this value.
+     */
+    filter(predicate: (value: number, index: number, array: this) => any, thisArg?: any): Float16Array<ArrayBuffer>;
+
+    /**
+     * Returns the value of the first element in the array where predicate is true, and undefined
+     * otherwise.
+     * @param predicate find calls predicate once for each element of the array, in ascending
+     * order, until it finds one where predicate returns true. If such an element is found, find
+     * immediately returns that element value. Otherwise, find returns undefined.
+     * @param thisArg If provided, it will be used as the this value for each invocation of
+     * predicate. If it is not provided, undefined is used instead.
+     */
+    find(predicate: (value: number, index: number, obj: this) => boolean, thisArg?: any): number | undefined;
+
+    /**
+     * Returns the index of the first element in the array where predicate is true, and -1
+     * otherwise.
+     * @param predicate find calls predicate once for each element of the array, in ascending
+     * order, until it finds one where predicate returns true. If such an element is found,
+     * findIndex immediately returns that element index. Otherwise, findIndex returns -1.
+     * @param thisArg If provided, it will be used as the this value for each invocation of
+     * predicate. If it is not provided, undefined is used instead.
+     */
+    findIndex(predicate: (value: number, index: number, obj: this) => boolean, thisArg?: any): number;
+
+    /**
+     * Returns the value of the last element in the array where predicate is true, and undefined
+     * otherwise.
+     * @param predicate findLast calls predicate once for each element of the array, in descending
+     * order, until it finds one where predicate returns true. If such an element is found, findLast
+     * immediately returns that element value. Otherwise, findLast returns undefined.
+     * @param thisArg If provided, it will be used as the this value for each invocation of
+     * predicate. If it is not provided, undefined is used instead.
+     */
+    findLast<S extends number>(
+        predicate: (
+            value: number,
+            index: number,
+            array: this,
+        ) => value is S,
+        thisArg?: any,
+    ): S | undefined;
+    findLast(
+        predicate: (
+            value: number,
+            index: number,
+            array: this,
+        ) => unknown,
+        thisArg?: any,
+    ): number | undefined;
+
+    /**
+     * Returns the index of the last element in the array where predicate is true, and -1
+     * otherwise.
+     * @param predicate findLastIndex calls predicate once for each element of the array, in descending
+     * order, until it finds one where predicate returns true. If such an element is found,
+     * findLastIndex immediately returns that element index. Otherwise, findLastIndex returns -1.
+     * @param thisArg If provided, it will be used as the this value for each invocation of
+     * predicate. If it is not provided, undefined is used instead.
+     */
+    findLastIndex(
+        predicate: (
+            value: number,
+            index: number,
+            array: this,
+        ) => unknown,
+        thisArg?: any,
+    ): number;
+
+    /**
+     * Performs the specified action for each element in an array.
+     * @param callbackfn A function that accepts up to three arguments. forEach calls the
+     * callbackfn function one time for each element in the array.
+     * @param thisArg An object to which the this keyword can refer in the callbackfn function.
+     * If thisArg is omitted, undefined is used as the this value.
+     */
+    forEach(callbackfn: (value: number, index: number, array: this) => void, thisArg?: any): void;
+
+    /**
+     * Determines whether an array includes a certain element, returning true or false as appropriate.
+     * @param searchElement The element to search for.
+     * @param fromIndex The position in this array at which to begin searching for searchElement.
+     */
+    includes(searchElement: number, fromIndex?: number): boolean;
+
+    /**
+     * Returns the index of the first occurrence of a value in an array.
+     * @param searchElement The value to locate in the array.
+     * @param fromIndex The array index at which to begin the search. If fromIndex is omitted, the
+     * search starts at index 0.
+     */
+    indexOf(searchElement: number, fromIndex?: number): number;
+
+    /**
+     * Adds all the elements of an array separated by the specified separator string.
+     * @param separator A string used to separate one element of an array from the next in the
+     * resulting String. If omitted, the array elements are separated with a comma.
+     */
+    join(separator?: string): string;
+
+    /**
+     * Returns the index of the last occurrence of a value in an array.
+     * @param searchElement The value to locate in the array.
+     * @param fromIndex The array index at which to begin the search. If fromIndex is omitted, the
+     * search starts at index 0.
+     */
+    lastIndexOf(searchElement: number, fromIndex?: number): number;
+
+    /**
+     * The length of the array.
+     */
+    readonly length: number;
+
+    /**
+     * Calls a defined callback function on each element of an array, and returns an array that
+     * contains the results.
+     * @param callbackfn A function that accepts up to three arguments. The map method calls the
+     * callbackfn function one time for each element in the array.
+     * @param thisArg An object to which the this keyword can refer in the callbackfn function.
+     * If thisArg is omitted, undefined is used as the this value.
+     */
+    map(callbackfn: (value: number, index: number, array: this) => number, thisArg?: any): Float16Array<ArrayBuffer>;
+
+    /**
+     * Calls the specified callback function for all the elements in an array. The return value of
+     * the callback function is the accumulated result, and is provided as an argument in the next
+     * call to the callback function.
+     * @param callbackfn A function that accepts up to four arguments. The reduce method calls the
+     * callbackfn function one time for each element in the array.
+     * @param initialValue If initialValue is specified, it is used as the initial value to start
+     * the accumulation. The first call to the callbackfn function provides this value as an argument
+     * instead of an array value.
+     */
+    reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number): number;
+    reduce(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number, initialValue: number): number;
+
+    /**
+     * Calls the specified callback function for all the elements in an array. The return value of
+     * the callback function is the accumulated result, and is provided as an argument in the next
+     * call to the callback function.
+     * @param callbackfn A function that accepts up to four arguments. The reduce method calls the
+     * callbackfn function one time for each element in the array.
+     * @param initialValue If initialValue is specified, it is used as the initial value to start
+     * the accumulation. The first call to the callbackfn function provides this value as an argument
+     * instead of an array value.
+     */
+    reduce<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: this) => U, initialValue: U): U;
+
+    /**
+     * Calls the specified callback function for all the elements in an array, in descending order.
+     * The return value of the callback function is the accumulated result, and is provided as an
+     * argument in the next call to the callback function.
+     * @param callbackfn A function that accepts up to four arguments. The reduceRight method calls
+     * the callbackfn function one time for each element in the array.
+     * @param initialValue If initialValue is specified, it is used as the initial value to start
+     * the accumulation. The first call to the callbackfn function provides this value as an
+     * argument instead of an array value.
+     */
+    reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number): number;
+    reduceRight(callbackfn: (previousValue: number, currentValue: number, currentIndex: number, array: this) => number, initialValue: number): number;
+
+    /**
+     * Calls the specified callback function for all the elements in an array, in descending order.
+     * The return value of the callback function is the accumulated result, and is provided as an
+     * argument in the next call to the callback function.
+     * @param callbackfn A function that accepts up to four arguments. The reduceRight method calls
+     * the callbackfn function one time for each element in the array.
+     * @param initialValue If initialValue is specified, it is used as the initial value to start
+     * the accumulation. The first call to the callbackfn function provides this value as an argument
+     * instead of an array value.
+     */
+    reduceRight<U>(callbackfn: (previousValue: U, currentValue: number, currentIndex: number, array: this) => U, initialValue: U): U;
+
+    /**
+     * Reverses the elements in an Array.
+     */
+    reverse(): this;
+
+    /**
+     * Sets a value or an array of values.
+     * @param array A typed or untyped array of values to set.
+     * @param offset The index in the current array at which the values are to be written.
+     */
+    set(array: ArrayLike<number>, offset?: number): void;
+
+    /**
+     * Returns a section of an array.
+     * @param start The beginning of the specified portion of the array.
+     * @param end The end of the specified portion of the array. This is exclusive of the element at the index 'end'.
+     */
+    slice(start?: number, end?: number): Float16Array<ArrayBuffer>;
+
+    /**
+     * Determines whether the specified callback function returns true for any element of an array.
+     * @param predicate A function that accepts up to three arguments. The some method calls
+     * the predicate function for each element in the array until the predicate returns a value
+     * which is coercible to the Boolean value true, or until the end of the array.
+     * @param thisArg An object to which the this keyword can refer in the predicate function.
+     * If thisArg is omitted, undefined is used as the this value.
+     */
+    some(predicate: (value: number, index: number, array: this) => unknown, thisArg?: any): boolean;
+
+    /**
+     * Sorts an array.
+     * @param compareFn Function used to determine the order of the elements. It is expected to return
+     * a negative value if first argument is less than second argument, zero if they're equal and a positive
+     * value otherwise. If omitted, the elements are sorted in ascending order.
+     * ```ts
+     * [11,2,22,1].sort((a, b) => a - b)
+     * ```
+     */
+    sort(compareFn?: (a: number, b: number) => number): this;
+
+    /**
+     * Gets a new Float16Array view of the ArrayBuffer store for this array, referencing the elements
+     * at begin, inclusive, up to end, exclusive.
+     * @param begin The index of the beginning of the array.
+     * @param end The index of the end of the array.
+     */
+    subarray(begin?: number, end?: number): Float16Array<TArrayBuffer>;
+
+    /**
+     * Converts a number to a string by using the current locale.
+     */
+    toLocaleString(locales?: string | string[], options?: Intl.NumberFormatOptions): string;
+
+    /**
+     * Copies the array and returns the copy with the elements in reverse order.
+     */
+    toReversed(): Float16Array<ArrayBuffer>;
+
+    /**
+     * Copies and sorts the array.
+     * @param compareFn Function used to determine the order of the elements. It is expected to return
+     * a negative value if the first argument is less than the second argument, zero if they're equal, and a positive
+     * value otherwise. If omitted, the elements are sorted in ascending order.
+     * ```ts
+     * const myNums = Float16Array.from([11.25, 2, -22.5, 1]);
+     * myNums.toSorted((a, b) => a - b) // Float16Array(4) [-22.5, 1, 2, 11.5]
+     * ```
+     */
+    toSorted(compareFn?: (a: number, b: number) => number): Float16Array<ArrayBuffer>;
+
+    /**
+     * Returns a string representation of an array.
+     */
+    toString(): string;
+
+    /** Returns the primitive value of the specified object. */
+    valueOf(): this;
+
+    /**
+     * Copies the array and inserts the given number at the provided index.
+     * @param index The index of the value to overwrite. If the index is
+     * negative, then it replaces from the end of the array.
+     * @param value The value to insert into the copied array.
+     * @returns A copy of the original array with the inserted value.
+     */
+    with(index: number, value: number): Float16Array<ArrayBuffer>;
+
+    [index: number]: number;
+
+    [Symbol.iterator](): ArrayIterator<number>;
+
+    /**
+     * Returns an array of key, value pairs for every entry in the array
+     */
+    entries(): ArrayIterator<[number, number]>;
+
+    /**
+     * Returns an list of keys in the array
+     */
+    keys(): ArrayIterator<number>;
+
+    /**
+     * Returns an list of values in the array
+     */
+    values(): ArrayIterator<number>;
+
+    readonly [Symbol.toStringTag]: "Float16Array";
+}
+
+interface Float16ArrayConstructor {
+    readonly prototype: Float16Array<ArrayBufferLike>;
+    new (length?: number): Float16Array<ArrayBuffer>;
+    new (array: ArrayLike<number> | Iterable<number>): Float16Array<ArrayBuffer>;
+    new <TArrayBuffer extends ArrayBufferLike = ArrayBuffer>(buffer: TArrayBuffer, byteOffset?: number, length?: number): Float16Array<TArrayBuffer>;
+    new (buffer: ArrayBuffer, byteOffset?: number, length?: number): Float16Array<ArrayBuffer>;
+    new (array: ArrayLike<number> | ArrayBuffer): Float16Array<ArrayBuffer>;
+
+    /**
+     * The size in bytes of each element in the array.
+     */
+    readonly BYTES_PER_ELEMENT: number;
+
+    /**
+     * Returns a new array from a set of elements.
+     * @param items A set of elements to include in the new array object.
+     */
+    of(...items: number[]): Float16Array<ArrayBuffer>;
+
+    /**
+     * Creates an array from an array-like or iterable object.
+     * @param arrayLike An array-like object to convert to an array.
+     */
+    from(arrayLike: ArrayLike<number>): Float16Array<ArrayBuffer>;
+
+    /**
+     * Creates an array from an array-like or iterable object.
+     * @param arrayLike An array-like object to convert to an array.
+     * @param mapfn A mapping function to call on every element of the array.
+     * @param thisArg Value of 'this' used to invoke the mapfn.
+     */
+    from<T>(arrayLike: ArrayLike<T>, mapfn: (v: T, k: number) => number, thisArg?: any): Float16Array<ArrayBuffer>;
+
+    /**
+     * Creates an array from an array-like or iterable object.
+     * @param elements An iterable object to convert to an array.
+     */
+    from(elements: Iterable<number>): Float16Array<ArrayBuffer>;
+
+    /**
+     * Creates an array from an array-like or iterable object.
+     * @param elements An iterable object to convert to an array.
+     * @param mapfn A mapping function to call on every element of the array.
+     * @param thisArg Value of 'this' used to invoke the mapfn.
+     */
+    from<T>(elements: Iterable<T>, mapfn?: (v: T, k: number) => number, thisArg?: any): Float16Array<ArrayBuffer>;
+}
+declare var Float16Array: Float16ArrayConstructor;
+
+interface Math {
+    /**
+     * Returns the nearest half precision float representation of a number.
+     * @param x A numeric expression.
+     */
+    f16round(x: number): number;
+}
+
+interface DataView<TArrayBuffer extends ArrayBufferLike> {
+    /**
+     * Gets the Float16 value at the specified byte offset from the start of the view. There is
+     * no alignment constraint; multi-byte values may be fetched from any offset.
+     * @param byteOffset The place in the buffer at which the value should be retrieved.
+     * @param littleEndian If false or undefined, a big-endian value should be read.
+     */
+    getFloat16(byteOffset: number, littleEndian?: boolean): number;
+
+    /**
+     * Stores an Float16 value at the specified byte offset from the start of the view.
+     * @param byteOffset The place in the buffer at which the value should be set.
+     * @param value The value to set.
+     * @param littleEndian If false or undefined, a big-endian value should be written.
+     */
+    setFloat16(byteOffset: number, value: number, littleEndian?: boolean): void;
+}
+
+//========== lib.es2025.intl.d.ts ==========
+/*! *****************************************************************************
+Copyright (c) Microsoft Corporation. All rights reserved.
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License at http://www.apache.org/licenses/LICENSE-2.0
+
+THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
+WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
+MERCHANTABILITY OR NON-INFRINGEMENT.
+
+See the Apache Version 2.0 License for specific language governing permissions
+and limitations under the License.
+***************************************************************************** */
+
+
+/// <reference lib="es2018.intl" />
+
+declare namespace Intl {
+    /**
+     * The locale matching algorithm to use.
+     *
+     * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl#Locale_negotiation).
+     */
+    type DurationFormatLocaleMatcher = "lookup" | "best fit";
+
+    /**
+     * The style of the formatted duration.
+     *
+     * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/DurationFormat/DurationFormat#style).
+     */
+    type DurationFormatStyle = "long" | "short" | "narrow" | "digital";
+
+    /**
+     * Whether to always display a unit, or only if it is non-zero.
+     *
+     * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/DurationFormat/DurationFormat#display).
+     */
+    type DurationFormatDisplayOption = "always" | "auto";
+
+    /**
+     * Value of the `unit` property in duration objects
+     *
+     * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/DurationFormat/format#duration).
+     */
+    type DurationFormatUnit =
+        | "years"
+        | "months"
+        | "weeks"
+        | "days"
+        | "hours"
+        | "minutes"
+        | "seconds"
+        | "milliseconds"
+        | "microseconds"
+        | "nanoseconds";
+
+    type DurationFormatUnitSingular =
+        | "year"
+        | "month"
+        | "week"
+        | "day"
+        | "hour"
+        | "minute"
+        | "second"
+        | "millisecond"
+        | "microsecond"
+        | "nanosecond";
+
+    /**
+     * An object representing the relative time format in parts
+     * that can be used for custom locale-aware formatting.
+     *
+     * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/DurationFormat/formatToParts).
+     */
+    type DurationFormatPart =
+        | {
+            type: "literal";
+            value: string;
+            unit?: DurationFormatUnitSingular;
+        }
+        | {
+            type: Exclude<NumberFormatPartTypes, "literal">;
+            value: string;
+            unit: DurationFormatUnitSingular;
+        };
+
+    /**
+     * An object with some or all properties of the `Intl.DurationFormat` constructor `options` parameter.
+     *
+     * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/DurationFormat/DurationFormat#parameters)
+     */
+    interface DurationFormatOptions {
+        localeMatcher?: DurationFormatLocaleMatcher | undefined;
+        numberingSystem?: string | undefined;
+        style?: DurationFormatStyle | undefined;
+        years?: "long" | "short" | "narrow" | undefined;
+        yearsDisplay?: DurationFormatDisplayOption | undefined;
+        months?: "long" | "short" | "narrow" | undefined;
+        monthsDisplay?: DurationFormatDisplayOption | undefined;
+        weeks?: "long" | "short" | "narrow" | undefined;
+        weeksDisplay?: DurationFormatDisplayOption | undefined;
+        days?: "long" | "short" | "narrow" | undefined;
+        daysDisplay?: DurationFormatDisplayOption | undefined;
+        hours?: "long" | "short" | "narrow" | "numeric" | "2-digit" | undefined;
+        hoursDisplay?: DurationFormatDisplayOption | undefined;
+        minutes?: "long" | "short" | "narrow" | "numeric" | "2-digit" | undefined;
+        minutesDisplay?: DurationFormatDisplayOption | undefined;
+        seconds?: "long" | "short" | "narrow" | "numeric" | "2-digit" | undefined;
+        secondsDisplay?: DurationFormatDisplayOption | undefined;
+        milliseconds?: "long" | "short" | "narrow" | "numeric" | undefined;
+        millisecondsDisplay?: DurationFormatDisplayOption | undefined;
+        microseconds?: "long" | "short" | "narrow" | "numeric" | undefined;
+        microsecondsDisplay?: DurationFormatDisplayOption | undefined;
+        nanoseconds?: "long" | "short" | "narrow" | "numeric" | undefined;
+        nanosecondsDisplay?: DurationFormatDisplayOption | undefined;
+        fractionalDigits?: 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | undefined;
+    }
+
+    /**
+     * The Intl.DurationFormat object enables language-sensitive duration formatting.
+     *
+     * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/DurationFormat)
+     */
+    interface DurationFormat {
+        /**
+         * @param duration The duration object to be formatted. It should include some or all of the following properties: months, weeks, days, hours, minutes, seconds, milliseconds, microseconds, nanoseconds.
+         *
+         * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/DurationFormat/format).
+         */
+        format(duration: Partial<Record<DurationFormatUnit, number>>): string;
+        /**
+         * @param duration The duration object to be formatted. It should include some or all of the following properties: months, weeks, days, hours, minutes, seconds, milliseconds, microseconds, nanoseconds.
+         *
+         * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/DurationFormat/formatToParts).
+         */
+        formatToParts(duration: Partial<Record<DurationFormatUnit, number>>): DurationFormatPart[];
+        /**
+         * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/DurationFormat/resolvedOptions).
+         */
+        resolvedOptions(): ResolvedDurationFormatOptions;
+    }
+
+    interface ResolvedDurationFormatOptions {
+        locale: UnicodeBCP47LocaleIdentifier;
+        numberingSystem: string;
+        style: DurationFormatStyle;
+        years: "long" | "short" | "narrow";
+        yearsDisplay: DurationFormatDisplayOption;
+        months: "long" | "short" | "narrow";
+        monthsDisplay: DurationFormatDisplayOption;
+        weeks: "long" | "short" | "narrow";
+        weeksDisplay: DurationFormatDisplayOption;
+        days: "long" | "short" | "narrow";
+        daysDisplay: DurationFormatDisplayOption;
+        hours: "long" | "short" | "narrow" | "numeric" | "2-digit";
+        hoursDisplay: DurationFormatDisplayOption;
+        minutes: "long" | "short" | "narrow" | "numeric" | "2-digit";
+        minutesDisplay: DurationFormatDisplayOption;
+        seconds: "long" | "short" | "narrow" | "numeric" | "2-digit";
+        secondsDisplay: DurationFormatDisplayOption;
+        milliseconds: "long" | "short" | "narrow" | "numeric";
+        millisecondsDisplay: DurationFormatDisplayOption;
+        microseconds: "long" | "short" | "narrow" | "numeric";
+        microsecondsDisplay: DurationFormatDisplayOption;
+        nanoseconds: "long" | "short" | "narrow" | "numeric";
+        nanosecondsDisplay: DurationFormatDisplayOption;
+        fractionalDigits?: 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9;
+    }
+
+    const DurationFormat: {
+        prototype: DurationFormat;
+
+        /**
+         * @param locales A string with a BCP 47 language tag, or an array of such strings.
+         *   For the general form and interpretation of the `locales` argument, see the [Intl](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl#locale_identification_and_negotiation)
+         *   page.
+         *
+         * @param options An object for setting up a duration format.
+         *
+         * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/DurationFormat/DurationFormat).
+         */
+        new (locales?: LocalesArgument, options?: DurationFormatOptions): DurationFormat;
+
+        /**
+         * Returns an array containing those of the provided locales that are supported in display names without having to fall back to the runtime's default locale.
+         *
+         * @param locales A string with a BCP 47 language tag, or an array of such strings.
+         *   For the general form and interpretation of the `locales` argument, see the [Intl](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl#locale_identification_and_negotiation)
+         *   page.
+         *
+         * @param options An object with a locale matcher.
+         *
+         * @returns An array of strings representing a subset of the given locale tags that are supported in display names without having to fall back to the runtime's default locale.
+         *
+         * [MDN](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Intl/DurationFormat/supportedLocalesOf).
+         */
+        supportedLocalesOf(locales?: LocalesArgument, options?: { localeMatcher?: DurationFormatLocaleMatcher; }): UnicodeBCP47LocaleIdentifier[];
+    };
+}
+
+//========== lib.es2025.iterator.d.ts ==========
+/*! *****************************************************************************
+Copyright (c) Microsoft Corporation. All rights reserved.
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License at http://www.apache.org/licenses/LICENSE-2.0
+
+THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
+WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
+MERCHANTABILITY OR NON-INFRINGEMENT.
+
+See the Apache Version 2.0 License for specific language governing permissions
+and limitations under the License.
+***************************************************************************** */
+
+
+/// <reference lib="es2015.iterable" />
+
+// NOTE: This is specified as what is essentially an unreachable module. All actual global declarations can be found
+//       in the `declare global` section, below. This is necessary as there is currently no way to declare an `abstract`
+//       member without declaring a `class`, but declaring `class Iterator<T>` globally would conflict with TypeScript's
+//       general purpose `Iterator<T>` interface.
+
+// Abstract type that allows us to mark `next` as `abstract`
+declare abstract class __ztscIteratorAbstract<T, TResult = undefined, TNext = unknown> { // eslint-disable-line @typescript-eslint/no-unsafe-declaration-merging
+    abstract next(value?: TNext): IteratorResult<T, TResult>;
+}
+
+// Merge all members of `IteratorObject<T>` into `Iterator<T>`
+interface __ztscIteratorAbstract<T, TResult, TNext> extends IteratorObject<T, TResult, TNext> {}
+
+// Capture the `Iterator` constructor in a type we can use in the `extends` clause of `IteratorConstructor`.
+type IteratorObjectConstructor = typeof __ztscIteratorAbstract;
+
+    // Global `IteratorObject<T, TReturn, TNext>` interface that can be augmented by polyfills
+    interface IteratorObject<T, TReturn, TNext> {
+        /**
+         * Returns this iterator.
+         */
+        [Symbol.iterator](): IteratorObject<T, TReturn, TNext>;
+
+        /**
+         * Creates an iterator whose values are the result of applying the callback to the values from this iterator.
+         * @param callbackfn A function that accepts up to two arguments to be used to transform values from the underlying iterator.
+         */
+        map<U>(callbackfn: (value: T, index: number) => U): IteratorObject<U, undefined, unknown>;
+
+        /**
+         * Creates an iterator whose values are those from this iterator for which the provided predicate returns true.
+         * @param predicate A function that accepts up to two arguments to be used to test values from the underlying iterator.
+         */
+        filter<S extends T>(predicate: (value: T, index: number) => value is S): IteratorObject<S, undefined, unknown>;
+
+        /**
+         * Creates an iterator whose values are those from this iterator for which the provided predicate returns true.
+         * @param predicate A function that accepts up to two arguments to be used to test values from the underlying iterator.
+         */
+        filter(predicate: (value: T, index: number) => unknown): IteratorObject<T, undefined, unknown>;
+
+        /**
+         * Creates an iterator whose values are the values from this iterator, stopping once the provided limit is reached.
+         * @param limit The maximum number of values to yield.
+         */
+        take(limit: number): IteratorObject<T, undefined, unknown>;
+
+        /**
+         * Creates an iterator whose values are the values from this iterator after skipping the provided count.
+         * @param count The number of values to drop.
+         */
+        drop(count: number): IteratorObject<T, undefined, unknown>;
+
+        /**
+         * Creates an iterator whose values are the result of applying the callback to the values from this iterator and then flattening the resulting iterators or iterables.
+         * @param callback A function that accepts up to two arguments to be used to transform values from the underlying iterator into new iterators or iterables to be flattened into the result.
+         */
+        flatMap<U>(callback: (value: T, index: number) => Iterator<U, unknown, undefined> | Iterable<U, unknown, undefined>): IteratorObject<U, undefined, unknown>;
+
+        /**
+         * Calls the specified callback function for all the elements in this iterator. The return value of the callback function is the accumulated result, and is provided as an argument in the next call to the callback function.
+         * @param callbackfn A function that accepts up to three arguments. The reduce method calls the callbackfn function one time for each element in the iterator.
+         * @param initialValue If initialValue is specified, it is used as the initial value to start the accumulation. The first call to the callbackfn function provides this value as an argument instead of a value from the iterator.
+         */
+        reduce(callbackfn: (previousValue: T, currentValue: T, currentIndex: number) => T): T;
+        reduce(callbackfn: (previousValue: T, currentValue: T, currentIndex: number) => T, initialValue: T): T;
+
+        /**
+         * Calls the specified callback function for all the elements in this iterator. The return value of the callback function is the accumulated result, and is provided as an argument in the next call to the callback function.
+         * @param callbackfn A function that accepts up to three arguments. The reduce method calls the callbackfn function one time for each element in the iterator.
+         * @param initialValue If initialValue is specified, it is used as the initial value to start the accumulation. The first call to the callbackfn function provides this value as an argument instead of a value from the iterator.
+         */
+        reduce<U>(callbackfn: (previousValue: U, currentValue: T, currentIndex: number) => U, initialValue: U): U;
+
+        /**
+         * Creates a new array from the values yielded by this iterator.
+         */
+        toArray(): T[];
+
+        /**
+         * Performs the specified action for each element in the iterator.
+         * @param callbackfn A function that accepts up to two arguments. forEach calls the callbackfn function one time for each element in the iterator.
+         */
+        forEach(callbackfn: (value: T, index: number) => void): void;
+
+        /**
+         * Determines whether the specified callback function returns true for any element of this iterator.
+         * @param predicate A function that accepts up to two arguments. The some method calls
+         * the predicate function for each element in this iterator until the predicate returns a value
+         * true, or until the end of the iterator.
+         */
+        some(predicate: (value: T, index: number) => unknown): boolean;
+
+        /**
+         * Determines whether all the members of this iterator satisfy the specified test.
+         * @param predicate A function that accepts up to two arguments. The every method calls
+         * the predicate function for each element in this iterator until the predicate returns
+         * false, or until the end of this iterator.
+         */
+        every(predicate: (value: T, index: number) => unknown): boolean;
+
+        /**
+         * Returns the value of the first element in this iterator where predicate is true, and undefined
+         * otherwise.
+         * @param predicate find calls predicate once for each element of this iterator, in
+         * order, until it finds one where predicate returns true. If such an element is found, find
+         * immediately returns that element value. Otherwise, find returns undefined.
+         */
+        find<S extends T>(predicate: (value: T, index: number) => value is S): S | undefined;
+        find(predicate: (value: T, index: number) => unknown): T | undefined;
+
+        readonly [Symbol.toStringTag]: string;
+    }
+
+    // Global `IteratorConstructor` interface that can be augmented by polyfills
+    interface IteratorConstructor extends IteratorObjectConstructor {
+        /**
+         * Creates a native iterator from an iterator or iterable object.
+         * Returns its input if the input already inherits from the built-in Iterator class.
+         * @param value An iterator or iterable object to convert a native iterator.
+         */
+        from<T>(value: Iterator<T, unknown, undefined> | Iterable<T, unknown, undefined>): IteratorObject<T, undefined, unknown>;
+    }
+
+    var Iterator: IteratorConstructor;
+
+//========== lib.es2025.promise.d.ts ==========
+/*! *****************************************************************************
+Copyright (c) Microsoft Corporation. All rights reserved.
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License at http://www.apache.org/licenses/LICENSE-2.0
+
+THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
+WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
+MERCHANTABILITY OR NON-INFRINGEMENT.
+
+See the Apache Version 2.0 License for specific language governing permissions
+and limitations under the License.
+***************************************************************************** */
+
+
+interface PromiseConstructor {
+    /**
+     * Takes a callback of any kind (returns or throws, synchronously or asynchronously) and wraps its result
+     * in a Promise.
+     *
+     * @param callbackFn A function that is called synchronously. It can do anything: either return
+     * a value, throw an error, or return a promise.
+     * @param args Additional arguments, that will be passed to the callback.
+     *
+     * @returns A Promise that is:
+     * - Already fulfilled, if the callback synchronously returns a value.
+     * - Already rejected, if the callback synchronously throws an error.
+     * - Asynchronously fulfilled or rejected, if the callback returns a promise.
+     */
+    try<T, U extends unknown[]>(callbackFn: (...args: U) => T | PromiseLike<T>, ...args: U): Promise<Awaited<T>>;
+}
+
+//========== lib.es2025.regexp.d.ts ==========
+/*! *****************************************************************************
+Copyright (c) Microsoft Corporation. All rights reserved.
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License at http://www.apache.org/licenses/LICENSE-2.0
+
+THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
+WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
+MERCHANTABILITY OR NON-INFRINGEMENT.
+
+See the Apache Version 2.0 License for specific language governing permissions
+and limitations under the License.
+***************************************************************************** */
+
+
+interface RegExpConstructor {
+    /**
+     * Escapes any RegExp syntax characters in the input string, returning a
+     * new string that can be safely interpolated into a RegExp as a literal
+     * string to match.
+     * @example
+     * ```ts
+     * const regExp = new RegExp(RegExp.escape("foo.bar"));
+     * regExp.test("foo.bar"); // true
+     * regExp.test("foo!bar"); // false
+     * ```
+     */
+    escape(string: string): string;
+}
+
+//========== lib.es2025.d.ts ==========
+/*! *****************************************************************************
+Copyright (c) Microsoft Corporation. All rights reserved.
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License at http://www.apache.org/licenses/LICENSE-2.0
+
+THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
+WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
+MERCHANTABILITY OR NON-INFRINGEMENT.
+
+See the Apache Version 2.0 License for specific language governing permissions
+and limitations under the License.
+***************************************************************************** */
+
+
+/// <reference lib="es2024" />
+/// <reference lib="es2025.collection" />
+/// <reference lib="es2025.float16" />
+/// <reference lib="es2025.intl" />
+/// <reference lib="es2025.iterator" />
+/// <reference lib="es2025.promise" />
+/// <reference lib="es2025.regexp" />
+
+//========== lib.esnext.temporal.d.ts ==========
+/*! *****************************************************************************
+Copyright (c) Microsoft Corporation. All rights reserved.
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License at http://www.apache.org/licenses/LICENSE-2.0
+
+THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
+WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
+MERCHANTABILITY OR NON-INFRINGEMENT.
+
+See the Apache Version 2.0 License for specific language governing permissions
+and limitations under the License.
+***************************************************************************** */
+
+
+/// <reference lib="es2015.symbol.wellknown" />
+/// <reference lib="es2020.intl" />
+/// <reference lib="es2025.intl" />
+
+declare namespace Temporal {
+    type CalendarLike = PlainDate | PlainDateTime | PlainMonthDay | PlainYearMonth | ZonedDateTime | string;
+    type DurationLike = Duration | DurationLikeObject | string;
+    type InstantLike = Instant | ZonedDateTime | string;
+    type PlainDateLike = PlainDate | ZonedDateTime | PlainDateTime | DateLikeObject | string;
+    type PlainDateTimeLike = PlainDateTime | ZonedDateTime | PlainDate | DateTimeLikeObject | string;
+    type PlainMonthDayLike = PlainMonthDay | DateLikeObject | string;
+    type PlainTimeLike = PlainTime | PlainDateTime | ZonedDateTime | TimeLikeObject | string;
+    type PlainYearMonthLike = PlainYearMonth | YearMonthLikeObject | string;
+    type TimeZoneLike = ZonedDateTime | string;
+    type ZonedDateTimeLike = ZonedDateTime | ZonedDateTimeLikeObject | string;
+
+    type PartialTemporalLike<T extends object> = {
+        [P in Exclude<keyof T, "calendar" | "timeZone">]?: T[P] | undefined;
+    };
+
+    interface DateLikeObject {
+        year?: number | undefined;
+        era?: string | undefined;
+        eraYear?: number | undefined;
+        month?: number | undefined;
+        monthCode?: string | undefined;
+        day: number;
+        calendar?: string | undefined;
+    }
+
+    interface DateTimeLikeObject extends DateLikeObject, TimeLikeObject {}
+
+    interface DurationLikeObject {
+        years?: number | undefined;
+        months?: number | undefined;
+        weeks?: number | undefined;
+        days?: number | undefined;
+        hours?: number | undefined;
+        minutes?: number | undefined;
+        seconds?: number | undefined;
+        milliseconds?: number | undefined;
+        microseconds?: number | undefined;
+        nanoseconds?: number | undefined;
+    }
+
+    interface TimeLikeObject {
+        hour?: number | undefined;
+        minute?: number | undefined;
+        second?: number | undefined;
+        millisecond?: number | undefined;
+        microsecond?: number | undefined;
+        nanosecond?: number | undefined;
+    }
+
+    interface YearMonthLikeObject extends Omit<DateLikeObject, "day"> {}
+
+    interface ZonedDateTimeLikeObject extends DateTimeLikeObject {
+        timeZone: TimeZoneLike;
+        offset?: string | undefined;
+    }
+
+    type DateUnit = "year" | "month" | "week" | "day";
+    type TimeUnit = "hour" | "minute" | "second" | "millisecond" | "microsecond" | "nanosecond";
+    type PluralizeUnit<T extends DateUnit | TimeUnit> =
+        | T
+        | {
+            year: "years";
+            month: "months";
+            week: "weeks";
+            day: "days";
+            hour: "hours";
+            minute: "minutes";
+            second: "seconds";
+            millisecond: "milliseconds";
+            microsecond: "microseconds";
+            nanosecond: "nanoseconds";
+        }[T];
+
+    interface DisambiguationOptions {
+        disambiguation?: "compatible" | "earlier" | "later" | "reject" | undefined;
+    }
+
+    interface OverflowOptions {
+        overflow?: "constrain" | "reject" | undefined;
+    }
+
+    interface TransitionOptions {
+        direction: "next" | "previous";
+    }
+
+    interface RoundingOptions<Units extends DateUnit | TimeUnit> {
+        smallestUnit?: PluralizeUnit<Units> | undefined;
+        roundingIncrement?: number | undefined;
+        roundingMode?: "ceil" | "floor" | "expand" | "trunc" | "halfCeil" | "halfFloor" | "halfExpand" | "halfTrunc" | "halfEven" | undefined;
+    }
+
+    interface RoundingOptionsWithLargestUnit<Units extends DateUnit | TimeUnit> extends RoundingOptions<Units> {
+        largestUnit?: "auto" | PluralizeUnit<Units> | undefined;
+    }
+
+    interface ToStringRoundingOptions<Units extends DateUnit | TimeUnit> extends Pick<RoundingOptions<Units>, "smallestUnit" | "roundingMode"> {}
+
+    interface ToStringRoundingOptionsWithFractionalSeconds<Units extends DateUnit | TimeUnit> extends ToStringRoundingOptions<Units> {
+        fractionalSecondDigits?: "auto" | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | undefined;
+    }
+
+    namespace Now {
+        function timeZoneId(): string;
+        function instant(): Instant;
+        function plainDateTimeISO(timeZone?: TimeZoneLike): PlainDateTime;
+        function zonedDateTimeISO(timeZone?: TimeZoneLike): ZonedDateTime;
+        function plainDateISO(timeZone?: TimeZoneLike): PlainDate;
+        function plainTimeISO(timeZone?: TimeZoneLike): PlainTime;
+    }
+
+    interface PlainDateToStringOptions {
+        calendarName?: "auto" | "always" | "never" | "critical" | undefined;
+    }
+
+    interface PlainDateToZonedDateTimeOptions {
+        plainTime?: PlainTimeLike | undefined;
+        timeZone: TimeZoneLike;
+    }
+
+    interface PlainDate {
+        readonly calendarId: string;
+        readonly era: string | undefined;
+        readonly eraYear: number | undefined;
+        readonly year: number;
+        readonly month: number;
+        readonly monthCode: string;
+        readonly day: number;
+        readonly dayOfWeek: number;
+        readonly dayOfYear: number;
+        readonly weekOfYear: number | undefined;
+        readonly yearOfWeek: number | undefined;
+        readonly daysInWeek: number;
+        readonly daysInMonth: number;
+        readonly daysInYear: number;
+        readonly monthsInYear: number;
+        readonly inLeapYear: boolean;
+        toPlainYearMonth(): PlainYearMonth;
+        toPlainMonthDay(): PlainMonthDay;
+        add(duration: DurationLike, options?: OverflowOptions): PlainDate;
+        subtract(duration: DurationLike, options?: OverflowOptions): PlainDate;
+        with(dateLike: PartialTemporalLike<DateLikeObject>, options?: OverflowOptions): PlainDate;
+        withCalendar(calendarLike: CalendarLike): PlainDate;
+        until(other: PlainDateLike, options?: RoundingOptionsWithLargestUnit<DateUnit>): Duration;
+        since(other: PlainDateLike, options?: RoundingOptionsWithLargestUnit<DateUnit>): Duration;
+        equals(other: PlainDateLike): boolean;
+        toPlainDateTime(time?: PlainTimeLike): PlainDateTime;
+        toZonedDateTime(timeZone: TimeZoneLike): ZonedDateTime;
+        toZonedDateTime(item: PlainDateToZonedDateTimeOptions): ZonedDateTime;
+        toString(options?: PlainDateToStringOptions): string;
+        toLocaleString(locales?: Intl.LocalesArgument, options?: Intl.DateTimeFormatOptions): string;
+        toJSON(): string;
+        valueOf(): never;
+        readonly [Symbol.toStringTag]: "Temporal.PlainDate";
+    }
+
+    interface PlainDateConstructor {
+        new (isoYear: number, isoMonth: number, isoDay: number, calendar?: string): PlainDate;
+        readonly prototype: PlainDate;
+        from(item: PlainDateLike, options?: OverflowOptions): PlainDate;
+        compare(one: PlainDateLike, two: PlainDateLike): number;
+    }
+    var PlainDate: PlainDateConstructor;
+
+    interface PlainTimeToStringOptions extends ToStringRoundingOptionsWithFractionalSeconds<Exclude<TimeUnit, "hour">> {}
+
+    interface PlainTime {
+        readonly hour: number;
+        readonly minute: number;
+        readonly second: number;
+        readonly millisecond: number;
+        readonly microsecond: number;
+        readonly nanosecond: number;
+        add(duration: DurationLike): PlainTime;
+        subtract(duration: DurationLike): PlainTime;
+        with(timeLike: PartialTemporalLike<TimeLikeObject>, options?: OverflowOptions): PlainTime;
+        until(other: PlainTimeLike, options?: RoundingOptionsWithLargestUnit<TimeUnit>): Duration;
+        since(other: PlainTimeLike, options?: RoundingOptionsWithLargestUnit<TimeUnit>): Duration;
+        equals(other: PlainTimeLike): boolean;
+        round(roundTo: PluralizeUnit<TimeUnit>): PlainTime;
+        round(roundTo: RoundingOptions<TimeUnit>): PlainTime;
+        toString(options?: PlainTimeToStringOptions): string;
+        toLocaleString(locales?: Intl.LocalesArgument, options?: Intl.DateTimeFormatOptions): string;
+        toJSON(): string;
+        valueOf(): never;
+        readonly [Symbol.toStringTag]: "Temporal.PlainTime";
+    }
+
+    interface PlainTimeConstructor {
+        new (hour?: number, minute?: number, second?: number, millisecond?: number, microsecond?: number, nanosecond?: number): PlainTime;
+        readonly prototype: PlainTime;
+        from(item: PlainTimeLike, options?: OverflowOptions): PlainTime;
+        compare(one: PlainTimeLike, two: PlainTimeLike): number;
+    }
+    var PlainTime: PlainTimeConstructor;
+
+    interface PlainDateTimeToStringOptions extends PlainDateToStringOptions, PlainTimeToStringOptions {}
+
+    interface PlainDateTime {
+        readonly calendarId: string;
+        readonly era: string | undefined;
+        readonly eraYear: number | undefined;
+        readonly year: number;
+        readonly month: number;
+        readonly monthCode: string;
+        readonly day: number;
+        readonly hour: number;
+        readonly minute: number;
+        readonly second: number;
+        readonly millisecond: number;
+        readonly microsecond: number;
+        readonly nanosecond: number;
+        readonly dayOfWeek: number;
+        readonly dayOfYear: number;
+        readonly weekOfYear: number | undefined;
+        readonly yearOfWeek: number | undefined;
+        readonly daysInWeek: number;
+        readonly daysInMonth: number;
+        readonly daysInYear: number;
+        readonly monthsInYear: number;
+        readonly inLeapYear: boolean;
+        with(dateTimeLike: PartialTemporalLike<DateTimeLikeObject>, options?: OverflowOptions): PlainDateTime;
+        withPlainTime(plainTime?: PlainTimeLike): PlainDateTime;
+        withCalendar(calendar: CalendarLike): PlainDateTime;
+        add(duration: DurationLike, options?: OverflowOptions): PlainDateTime;
+        subtract(duration: DurationLike, options?: OverflowOptions): PlainDateTime;
+        until(other: PlainDateTimeLike, options?: RoundingOptionsWithLargestUnit<DateUnit | TimeUnit>): Duration;
+        since(other: PlainDateTimeLike, options?: RoundingOptionsWithLargestUnit<DateUnit | TimeUnit>): Duration;
+        round(roundTo: PluralizeUnit<"day" | TimeUnit>): PlainDateTime;
+        round(roundTo: RoundingOptions<"day" | TimeUnit>): PlainDateTime;
+        equals(other: PlainDateTimeLike): boolean;
+        toString(options?: PlainDateTimeToStringOptions): string;
+        toLocaleString(locales?: Intl.LocalesArgument, options?: Intl.DateTimeFormatOptions): string;
+        toJSON(): string;
+        valueOf(): never;
+        toZonedDateTime(timeZone: TimeZoneLike, options?: DisambiguationOptions): ZonedDateTime;
+        toPlainDate(): PlainDate;
+        toPlainTime(): PlainTime;
+        readonly [Symbol.toStringTag]: "Temporal.PlainDateTime";
+    }
+
+    interface PlainDateTimeConstructor {
+        new (isoYear: number, isoMonth: number, isoDay: number, hour?: number, minute?: number, second?: number, millisecond?: number, microsecond?: number, nanosecond?: number, calendar?: string): PlainDateTime;
+        readonly prototype: PlainDateTime;
+        from(item: PlainDateTimeLike, options?: OverflowOptions): PlainDateTime;
+        compare(one: PlainDateTimeLike, two: PlainDateTimeLike): number;
+    }
+    var PlainDateTime: PlainDateTimeConstructor;
+
+    interface ZonedDateTimeToStringOptions extends PlainDateTimeToStringOptions {
+        offset?: "auto" | "never" | undefined;
+        timeZoneName?: "auto" | "never" | "critical" | undefined;
+    }
+
+    interface ZonedDateTimeFromOptions extends OverflowOptions, DisambiguationOptions {
+        offset?: "use" | "ignore" | "prefer" | "reject" | undefined;
+    }
+
+    interface ZonedDateTime {
+        readonly calendarId: string;
+        readonly timeZoneId: string;
+        readonly era: string | undefined;
+        readonly eraYear: number | undefined;
+        readonly year: number;
+        readonly month: number;
+        readonly monthCode: string;
+        readonly day: number;
+        readonly hour: number;
+        readonly minute: number;
+        readonly second: number;
+        readonly millisecond: number;
+        readonly microsecond: number;
+        readonly nanosecond: number;
+        readonly epochMilliseconds: number;
+        readonly epochNanoseconds: bigint;
+        readonly dayOfWeek: number;
+        readonly dayOfYear: number;
+        readonly weekOfYear: number | undefined;
+        readonly yearOfWeek: number | undefined;
+        readonly hoursInDay: number;
+        readonly daysInWeek: number;
+        readonly daysInMonth: number;
+        readonly daysInYear: number;
+        readonly monthsInYear: number;
+        readonly inLeapYear: boolean;
+        readonly offsetNanoseconds: number;
+        readonly offset: string;
+        with(zonedDateTimeLike: PartialTemporalLike<ZonedDateTimeLikeObject>, options?: ZonedDateTimeFromOptions): ZonedDateTime;
+        withPlainTime(plainTime?: PlainTimeLike): ZonedDateTime;
+        withTimeZone(timeZone: TimeZoneLike): ZonedDateTime;
+        withCalendar(calendar: CalendarLike): ZonedDateTime;
+        add(duration: DurationLike, options?: OverflowOptions): ZonedDateTime;
+        subtract(duration: DurationLike, options?: OverflowOptions): ZonedDateTime;
+        until(other: ZonedDateTimeLike, options?: RoundingOptionsWithLargestUnit<DateUnit | TimeUnit>): Duration;
+        since(other: ZonedDateTimeLike, options?: RoundingOptionsWithLargestUnit<DateUnit | TimeUnit>): Duration;
+        round(roundTo: PluralizeUnit<"day" | TimeUnit>): ZonedDateTime;
+        round(roundTo: RoundingOptions<"day" | TimeUnit>): ZonedDateTime;
+        equals(other: ZonedDateTimeLike): boolean;
+        toString(options?: ZonedDateTimeToStringOptions): string;
+        toLocaleString(locales?: Intl.LocalesArgument, options?: Intl.DateTimeFormatOptions): string;
+        toJSON(): string;
+        valueOf(): never;
+        startOfDay(): ZonedDateTime;
+        getTimeZoneTransition(direction: "next" | "previous"): ZonedDateTime | null;
+        getTimeZoneTransition(direction: TransitionOptions): ZonedDateTime | null;
+        toInstant(): Instant;
+        toPlainDate(): PlainDate;
+        toPlainTime(): PlainTime;
+        toPlainDateTime(): PlainDateTime;
+        readonly [Symbol.toStringTag]: "Temporal.ZonedDateTime";
+    }
+
+    interface ZonedDateTimeConstructor {
+        new (epochNanoseconds: bigint, timeZone: string, calendar?: string): ZonedDateTime;
+        readonly prototype: ZonedDateTime;
+        from(item: ZonedDateTimeLike, options?: ZonedDateTimeFromOptions): ZonedDateTime;
+        compare(one: ZonedDateTimeLike, two: ZonedDateTimeLike): number;
+    }
+    var ZonedDateTime: ZonedDateTimeConstructor;
+
+    interface DurationRelativeToOptions {
+        relativeTo?: ZonedDateTimeLike | PlainDateLike | undefined;
+    }
+
+    interface DurationRoundingOptions extends DurationRelativeToOptions, RoundingOptionsWithLargestUnit<DateUnit | TimeUnit> {}
+
+    interface DurationToStringOptions extends ToStringRoundingOptionsWithFractionalSeconds<Exclude<TimeUnit, "hour" | "minute">> {}
+
+    interface DurationTotalOptions extends DurationRelativeToOptions {
+        unit: PluralizeUnit<DateUnit | TimeUnit>;
+    }
+
+    interface Duration {
+        readonly years: number;
+        readonly months: number;
+        readonly weeks: number;
+        readonly days: number;
+        readonly hours: number;
+        readonly minutes: number;
+        readonly seconds: number;
+        readonly milliseconds: number;
+        readonly microseconds: number;
+        readonly nanoseconds: number;
+        readonly sign: number;
+        readonly blank: boolean;
+        with(durationLike: PartialTemporalLike<DurationLikeObject>): Duration;
+        negated(): Duration;
+        abs(): Duration;
+        add(other: DurationLike): Duration;
+        subtract(other: DurationLike): Duration;
+        round(roundTo: PluralizeUnit<"day" | TimeUnit>): Duration;
+        round(roundTo: DurationRoundingOptions): Duration;
+        total(totalOf: PluralizeUnit<"day" | TimeUnit>): number;
+        total(totalOf: DurationTotalOptions): number;
+        toString(options?: DurationToStringOptions): string;
+        toLocaleString(locales?: Intl.LocalesArgument, options?: Intl.DurationFormatOptions): string;
+        toJSON(): string;
+        valueOf(): never;
+        readonly [Symbol.toStringTag]: "Temporal.Duration";
+    }
+
+    interface DurationConstructor {
+        new (years?: number, months?: number, weeks?: number, days?: number, hours?: number, minutes?: number, seconds?: number, milliseconds?: number, microseconds?: number, nanoseconds?: number): Duration;
+        readonly prototype: Duration;
+        from(item: DurationLike): Duration;
+        compare(one: DurationLike, two: DurationLike, options?: DurationRelativeToOptions): number;
+    }
+    var Duration: DurationConstructor;
+
+    interface InstantToStringOptions extends PlainTimeToStringOptions {
+        timeZone?: TimeZoneLike | undefined;
+    }
+
+    interface Instant {
+        readonly epochMilliseconds: number;
+        readonly epochNanoseconds: bigint;
+        add(duration: DurationLike): Instant;
+        subtract(duration: DurationLike): Instant;
+        until(other: InstantLike, options?: RoundingOptionsWithLargestUnit<TimeUnit>): Duration;
+        since(other: InstantLike, options?: RoundingOptionsWithLargestUnit<TimeUnit>): Duration;
+        round(roundTo: PluralizeUnit<TimeUnit>): Instant;
+        round(roundTo: RoundingOptions<TimeUnit>): Instant;
+        equals(other: InstantLike): boolean;
+        toString(options?: InstantToStringOptions): string;
+        toLocaleString(locales?: Intl.LocalesArgument, options?: Intl.DateTimeFormatOptions): string;
+        toJSON(): string;
+        valueOf(): never;
+        toZonedDateTimeISO(timeZone: TimeZoneLike): ZonedDateTime;
+        readonly [Symbol.toStringTag]: "Temporal.Instant";
+    }
+
+    interface InstantConstructor {
+        new (epochNanoseconds: bigint): Instant;
+        readonly prototype: Instant;
+        from(item: InstantLike): Instant;
+        fromEpochMilliseconds(epochMilliseconds: number): Instant;
+        fromEpochNanoseconds(epochNanoseconds: bigint): Instant;
+        compare(one: InstantLike, two: InstantLike): number;
+    }
+    var Instant: InstantConstructor;
+
+    interface PlainYearMonthToPlainDateOptions {
+        day: number;
+    }
+
+    interface PlainYearMonth {
+        readonly calendarId: string;
+        readonly era: string | undefined;
+        readonly eraYear: number | undefined;
+        readonly year: number;
+        readonly month: number;
+        readonly monthCode: string;
+        readonly daysInYear: number;
+        readonly daysInMonth: number;
+        readonly monthsInYear: number;
+        readonly inLeapYear: boolean;
+        with(yearMonthLike: PartialTemporalLike<YearMonthLikeObject>, options?: OverflowOptions): PlainYearMonth;
+        add(duration: DurationLike, options?: OverflowOptions): PlainYearMonth;
+        subtract(duration: DurationLike, options?: OverflowOptions): PlainYearMonth;
+        until(other: PlainYearMonthLike, options?: RoundingOptionsWithLargestUnit<"year" | "month">): Duration;
+        since(other: PlainYearMonthLike, options?: RoundingOptionsWithLargestUnit<"year" | "month">): Duration;
+        equals(other: PlainYearMonthLike): boolean;
+        toString(options?: PlainDateToStringOptions): string;
+        toLocaleString(locales?: Intl.LocalesArgument, options?: Intl.DateTimeFormatOptions): string;
+        toJSON(): string;
+        valueOf(): never;
+        toPlainDate(item: PlainYearMonthToPlainDateOptions): PlainDate;
+        readonly [Symbol.toStringTag]: "Temporal.PlainYearMonth";
+    }
+
+    interface PlainYearMonthConstructor {
+        new (isoYear: number, isoMonth: number, calendar?: string, referenceISODay?: number): PlainYearMonth;
+        readonly prototype: PlainYearMonth;
+        from(item: PlainYearMonthLike, options?: OverflowOptions): PlainYearMonth;
+        compare(one: PlainYearMonthLike, two: PlainYearMonthLike): number;
+    }
+    var PlainYearMonth: PlainYearMonthConstructor;
+
+    interface PlainMonthDayToPlainDateOptions {
+        era?: string | undefined;
+        eraYear?: number | undefined;
+        year?: number | undefined;
+    }
+
+    interface PlainMonthDay {
+        readonly calendarId: string;
+        readonly monthCode: string;
+        readonly day: number;
+        with(monthDayLike: PartialTemporalLike<DateLikeObject>, options?: OverflowOptions): PlainMonthDay;
+        equals(other: PlainMonthDayLike): boolean;
+        toString(options?: PlainDateToStringOptions): string;
+        toLocaleString(locales?: Intl.LocalesArgument, options?: Intl.DateTimeFormatOptions): string;
+        toJSON(): string;
+        valueOf(): never;
+        toPlainDate(item: PlainMonthDayToPlainDateOptions): PlainDate;
+        readonly [Symbol.toStringTag]: "Temporal.PlainMonthDay";
+    }
+
+    interface PlainMonthDayConstructor {
+        new (isoMonth: number, isoDay: number, calendar?: string, referenceISOYear?: number): PlainMonthDay;
+        readonly prototype: PlainMonthDay;
+        from(item: PlainMonthDayLike, options?: OverflowOptions): PlainMonthDay;
+    }
+    var PlainMonthDay: PlainMonthDayConstructor;
+}
 
 //========== lib.esnext.intl.d.ts ==========
 /*! *****************************************************************************
@@ -11630,17 +13499,152 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
 
-/// <reference no-default-lib="true"/>
+/// <reference lib="esnext.temporal" />
 
 declare namespace Intl {
-    // Empty
+    type FormattableTemporalObject = Temporal.PlainDate | Temporal.PlainYearMonth | Temporal.PlainMonthDay | Temporal.PlainTime | Temporal.PlainDateTime | Temporal.Instant;
+
+    interface DateTimeFormat {
+        format(date?: FormattableTemporalObject | Date | number): string;
+        formatToParts(date?: FormattableTemporalObject | Date | number): DateTimeFormatPart[];
+        formatRange(startDate: FormattableTemporalObject | Date | number, endDate: FormattableTemporalObject | Date | number): string;
+        formatRangeToParts(startDate: FormattableTemporalObject | Date | number, endDate: FormattableTemporalObject | Date | number): DateTimeRangeFormatPart[];
+    }
+
+    interface Locale {
+        /**
+         * Returns a list of one or more unique calendar identifiers for this locale.
+         *
+         * [MDN Reference](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/Locale/getCalendars)
+         */
+        getCalendars(): string[];
+        /**
+         * Returns a list of one or more collation types for this locale.
+         *
+         * [MDN Reference](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/Locale/getCollations)
+         */
+        getCollations(): string[];
+        /**
+         * Returns a list of one or more unique hour cycle identifiers for this locale.
+         *
+         * [MDN Reference](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/Locale/getHourCycles)
+         */
+        getHourCycles(): string[];
+        /**
+         * Returns a list of one or more unique numbering system identifiers for this locale.
+         *
+         * [MDN Reference](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/Locale/getNumberingSystems)
+         */
+        getNumberingSystems(): string[];
+        /**
+         * Returns the ordering of characters indicated by either ltr (left-to-right) or by rtl (right-to-left) for this locale.
+         *
+         * [MDN Reference](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/Locale/getTextInfo)
+         */
+        getTextInfo(): TextInfo;
+        /**
+         * Returns a list of supported time zones for this locale.
+         *
+         * [MDN Reference](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/Locale/getTimeZones)
+         */
+        getTimeZones(): string[] | undefined;
+        /**
+         * Returns a `WeekInfo` object with the properties `firstDay`, `weekend` and `minimalDays` for this locale.
+         *
+         * [MDN Reference](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/Locale/getWeekInfo)
+         */
+        getWeekInfo(): WeekInfo;
+    }
+
+    /**
+     * An object representing text typesetting information associated with the Locale data specified in UTS 35's Layouts Elements.
+     *
+     * [MDN Reference](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/Locale/getTextInfo#return_value)
+     */
+    interface TextInfo {
+        /**
+         * A string indicating the direction of text for the locale. Can be either "ltr" (left-to-right) or "rtl" (right-to-left).
+         *
+         * [MDN Reference](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/Locale/getTextInfo#direction)
+         */
+        direction?: "ltr" | "rtl";
+    }
+
+    /**
+     * An object representing week information associated with the Locale data specified in UTS 35's Week Elements.
+     *
+     * [MDN Reference](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/Locale/getWeekInfo#return_value)
+     */
+    interface WeekInfo {
+        /**
+         * An integer between 1 (Monday) and 7 (Sunday) indicating the first day of the week for the locale. Commonly 1, 5, 6, or 7.
+         *
+         * [MDN Reference](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/Locale/getWeekInfo#firstday)
+         */
+        firstDay: number;
+        /**
+         * An array of integers between 1 and 7 indicating the weekend days for the locale.
+         *
+         * [MDN Reference](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/Locale/getWeekInfo#weekend)
+         */
+        weekend: number[];
+    }
+}
+
+//========== lib.esnext.collection.d.ts ==========
+/*! *****************************************************************************
+Copyright (c) Microsoft Corporation. All rights reserved.
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License at http://www.apache.org/licenses/LICENSE-2.0
+
+THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
+WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
+MERCHANTABILITY OR NON-INFRINGEMENT.
+
+See the Apache Version 2.0 License for specific language governing permissions
+and limitations under the License.
+***************************************************************************** */
+
+
+/// <reference lib="es2025.collection" />
+
+interface Map<K, V> {
+    /**
+     * Returns a specified element from the Map object.
+     * If no element is associated with the specified key, a new element with the value `defaultValue` will be inserted into the Map and returned.
+     * @returns The element associated with the specified key, which will be `defaultValue` if no element previously existed.
+     */
+    getOrInsert(key: K, defaultValue: V): V;
+    /**
+     * Returns a specified element from the Map object.
+     * If no element is associated with the specified key, the result of passing the specified key to the `callback` function will be inserted into the Map and returned.
+     * @returns The element associated with the specific key, which will be the newly computed value if no element previously existed.
+     */
+    getOrInsertComputed(key: K, callback: (key: K) => V): V;
+}
+
+interface WeakMap<K extends WeakKey, V> {
+    /**
+     * Returns a specified element from the WeakMap object.
+     * If no element is associated with the specified key, a new element with the value `defaultValue` will be inserted into the WeakMap and returned.
+     * @returns The element associated with the specified key, which will be `defaultValue` if no element previously existed.
+     */
+    getOrInsert(key: K, defaultValue: V): V;
+    /**
+     * Returns a specified element from the WeakMap object.
+     * If no element is associated with the specified key, the result of passing the specified key to the `callback` function will be inserted into the WeakMap and returned.
+     * @returns The element associated with the specific key, which will be the newly computed value if no element previously existed.
+     */
+    getOrInsertComputed(key: K, callback: (key: K) => V): V;
 }
 
 //========== lib.esnext.decorators.d.ts ==========
@@ -11653,14 +13657,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 /// <reference lib="es2015.symbol" />
 /// <reference lib="decorators" />
@@ -11683,16 +13685,16 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
 
-/// <reference no-default-lib="true"/>
-
 /// <reference lib="es2015.symbol" />
+/// <reference lib="es2015.iterable" />
+/// <reference lib="es2018.asynciterable" />
 
 interface SymbolConstructor {
     /**
@@ -11860,180 +13862,10 @@ interface AsyncDisposableStackConstructor {
 }
 declare var AsyncDisposableStack: AsyncDisposableStackConstructor;
 
-//========== lib.esnext.promise.d.ts ==========
-/*! *****************************************************************************
-Copyright (c) Microsoft Corporation. All rights reserved.
-Licensed under the Apache License, Version 2.0 (the "License"); you may not use
-this file except in compliance with the License. You may obtain a copy of the
-License at http://www.apache.org/licenses/LICENSE-2.0
-
-THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
-WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
-
-See the Apache Version 2.0 License for specific language governing permissions
-and limitations under the License.
-***************************************************************************** */
-
-
-/// <reference no-default-lib="true"/>
-
-interface PromiseWithResolvers<T> {
-    promise: Promise<T>;
-    resolve: (value: T | PromiseLike<T>) => void;
-    reject: (reason?: any) => void;
+interface IteratorObject<T, TReturn, TNext> extends Disposable {
 }
 
-interface PromiseConstructor {
-    /**
-     * Creates a new Promise and returns it in an object, along with its resolve and reject functions.
-     * @returns An object with the properties `promise`, `resolve`, and `reject`.
-     *
-     * ```ts
-     * const { promise, resolve, reject } = Promise.withResolvers<T>();
-     * ```
-     */
-    withResolvers<T>(): PromiseWithResolvers<T>;
-}
-
-//========== lib.esnext.object.d.ts ==========
-/*! *****************************************************************************
-Copyright (c) Microsoft Corporation. All rights reserved.
-Licensed under the Apache License, Version 2.0 (the "License"); you may not use
-this file except in compliance with the License. You may obtain a copy of the
-License at http://www.apache.org/licenses/LICENSE-2.0
-
-THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
-WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
-
-See the Apache Version 2.0 License for specific language governing permissions
-and limitations under the License.
-***************************************************************************** */
-
-
-/// <reference no-default-lib="true"/>
-
-interface ObjectConstructor {
-    /**
-     * Groups members of an iterable according to the return value of the passed callback.
-     * @param items An iterable.
-     * @param keySelector A callback which will be invoked for each item in items.
-     */
-    groupBy<K extends PropertyKey, T>(
-        items: Iterable<T>,
-        keySelector: (item: T, index: number) => K,
-    ): Partial<Record<K, T[]>>;
-}
-
-//========== lib.esnext.collection.d.ts ==========
-/*! *****************************************************************************
-Copyright (c) Microsoft Corporation. All rights reserved.
-Licensed under the Apache License, Version 2.0 (the "License"); you may not use
-this file except in compliance with the License. You may obtain a copy of the
-License at http://www.apache.org/licenses/LICENSE-2.0
-
-THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
-WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
-
-See the Apache Version 2.0 License for specific language governing permissions
-and limitations under the License.
-***************************************************************************** */
-
-
-/// <reference no-default-lib="true"/>
-
-interface MapConstructor {
-    /**
-     * Groups members of an iterable according to the return value of the passed callback.
-     * @param items An iterable.
-     * @param keySelector A callback which will be invoked for each item in items.
-     */
-    groupBy<K, T>(
-        items: Iterable<T>,
-        keySelector: (item: T, index: number) => K,
-    ): Map<K, T[]>;
-}
-
-interface ReadonlySetLike<T> {
-    /**
-     * Despite its name, returns an iterator of the values in the set-like.
-     */
-    keys(): Iterator<T>;
-    /**
-     * @returns a boolean indicating whether an element with the specified value exists in the set-like or not.
-     */
-    has(value: T): boolean;
-    /**
-     * @returns the number of (unique) elements in the set-like.
-     */
-    readonly size: number;
-}
-
-interface Set<T> {
-    /**
-     * @returns a new Set containing all the elements in this Set and also all the elements in the argument.
-     */
-    union<U>(other: ReadonlySetLike<U>): Set<T | U>;
-    /**
-     * @returns a new Set containing all the elements which are both in this Set and in the argument.
-     */
-    intersection<U>(other: ReadonlySetLike<U>): Set<T & U>;
-    /**
-     * @returns a new Set containing all the elements in this Set which are not also in the argument.
-     */
-    difference<U>(other: ReadonlySetLike<U>): Set<T>;
-    /**
-     * @returns a new Set containing all the elements which are in either this Set or in the argument, but not in both.
-     */
-    symmetricDifference<U>(other: ReadonlySetLike<U>): Set<T | U>;
-    /**
-     * @returns a boolean indicating whether all the elements in this Set are also in the argument.
-     */
-    isSubsetOf(other: ReadonlySetLike<unknown>): boolean;
-    /**
-     * @returns a boolean indicating whether all the elements in the argument are also in this Set.
-     */
-    isSupersetOf(other: ReadonlySetLike<unknown>): boolean;
-    /**
-     * @returns a boolean indicating whether this Set has no elements in common with the argument.
-     */
-    isDisjointFrom(other: ReadonlySetLike<unknown>): boolean;
-}
-
-interface ReadonlySet<T> {
-    /**
-     * @returns a new Set containing all the elements in this Set and also all the elements in the argument.
-     */
-    union<U>(other: ReadonlySetLike<U>): Set<T | U>;
-    /**
-     * @returns a new Set containing all the elements which are both in this Set and in the argument.
-     */
-    intersection<U>(other: ReadonlySetLike<U>): Set<T & U>;
-    /**
-     * @returns a new Set containing all the elements in this Set which are not also in the argument.
-     */
-    difference<U>(other: ReadonlySetLike<U>): Set<T>;
-    /**
-     * @returns a new Set containing all the elements which are in either this Set or in the argument, but not in both.
-     */
-    symmetricDifference<U>(other: ReadonlySetLike<U>): Set<T | U>;
-    /**
-     * @returns a boolean indicating whether all the elements in this Set are also in the argument.
-     */
-    isSubsetOf(other: ReadonlySetLike<unknown>): boolean;
-    /**
-     * @returns a boolean indicating whether all the elements in the argument are also in this Set.
-     */
-    isSupersetOf(other: ReadonlySetLike<unknown>): boolean;
-    /**
-     * @returns a boolean indicating whether this Set has no elements in common with the argument.
-     */
-    isDisjointFrom(other: ReadonlySetLike<unknown>): boolean;
+interface AsyncIteratorObject<T, TReturn, TNext> extends AsyncDisposable {
 }
 
 //========== lib.esnext.array.d.ts ==========
@@ -12046,14 +13878,12 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
-
-/// <reference no-default-lib="true"/>
 
 interface ArrayConstructor {
     /**
@@ -12070,10 +13900,10 @@ interface ArrayConstructor {
      *      Each return value is awaited before being added to result array.
      * @param thisArg Value of 'this' used when executing mapfn.
      */
-    fromAsync<T, U>(iterableOrArrayLike: AsyncIterable<T> | Iterable<T> | ArrayLike<T>, mapFn: (value: Awaited<T>) => U, thisArg?: any): Promise<Awaited<U>[]>;
+    fromAsync<T, U>(iterableOrArrayLike: AsyncIterable<T> | Iterable<T> | ArrayLike<T>, mapFn: (value: Awaited<T>, index: number) => U, thisArg?: any): Promise<Awaited<U>[]>;
 }
 
-//========== lib.esnext.regexp.d.ts ==========
+//========== lib.esnext.error.d.ts ==========
 /*! *****************************************************************************
 Copyright (c) Microsoft Corporation. All rights reserved.
 Licensed under the Apache License, Version 2.0 (the "License"); you may not use
@@ -12083,24 +13913,21 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
 
-/// <reference no-default-lib="true"/>
-
-interface RegExp {
+interface ErrorConstructor {
     /**
-     * Returns a Boolean value indicating the state of the unicodeSets flag (v) used with a regular expression.
-     * Default is false. Read-only.
+     * Indicates whether the argument provided is a built-in Error instance or not.
      */
-    readonly unicodeSets: boolean;
+    isError(error: unknown): error is Error;
 }
 
-//========== lib.esnext.string.d.ts ==========
+//========== lib.esnext.sharedmemory.d.ts ==========
 /*! *****************************************************************************
 Copyright (c) Microsoft Corporation. All rights reserved.
 Licensed under the Apache License, Version 2.0 (the "License"); you may not use
@@ -12110,25 +13937,134 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
 
-/// <reference no-default-lib="true"/>
-
-interface String {
+interface Atomics {
     /**
-     * Returns true if all leading surrogates and trailing surrogates appear paired and in order.
+     * Performs a finite-time microwait by signaling to the operating system or
+     * CPU that the current executing code is in a spin-wait loop.
      */
-    isWellFormed(): boolean;
+    pause(n?: number): void;
+}
+
+//========== lib.esnext.typedarrays.d.ts ==========
+/*! *****************************************************************************
+Copyright (c) Microsoft Corporation. All rights reserved.
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License at http://www.apache.org/licenses/LICENSE-2.0
+
+THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
+WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
+MERCHANTABILITY OR NON-INFRINGEMENT.
+
+See the Apache Version 2.0 License for specific language governing permissions
+and limitations under the License.
+***************************************************************************** */
+
+
+interface Uint8Array<TArrayBuffer extends ArrayBufferLike> {
+    /**
+     * Converts the `Uint8Array` to a base64-encoded string.
+     * @param options If provided, sets the alphabet and padding behavior used.
+     * @returns A base64-encoded string.
+     */
+    toBase64(
+        options?: {
+            alphabet?: "base64" | "base64url" | undefined;
+            omitPadding?: boolean | undefined;
+        },
+    ): string;
 
     /**
-     * Returns a string where all lone or out-of-order surrogates have been replaced by the Unicode replacement character (U+FFFD).
+     * Sets the `Uint8Array` from a base64-encoded string.
+     * @param string The base64-encoded string.
+     * @param options If provided, specifies the alphabet and handling of the last chunk.
+     * @returns An object containing the number of bytes read and written.
+     * @throws {SyntaxError} If the input string contains characters outside the specified alphabet, or if the last
+     * chunk is inconsistent with the `lastChunkHandling` option.
      */
-    toWellFormed(): string;
+    setFromBase64(
+        string: string,
+        options?: {
+            alphabet?: "base64" | "base64url" | undefined;
+            lastChunkHandling?: "loose" | "strict" | "stop-before-partial" | undefined;
+        },
+    ): {
+        read: number;
+        written: number;
+    };
+
+    /**
+     * Converts the `Uint8Array` to a base16-encoded string.
+     * @returns A base16-encoded string.
+     */
+    toHex(): string;
+
+    /**
+     * Sets the `Uint8Array` from a base16-encoded string.
+     * @param string The base16-encoded string.
+     * @returns An object containing the number of bytes read and written.
+     */
+    setFromHex(string: string): {
+        read: number;
+        written: number;
+    };
+}
+
+interface Uint8ArrayConstructor {
+    /**
+     * Creates a new `Uint8Array` from a base64-encoded string.
+     * @param string The base64-encoded string.
+     * @param options If provided, specifies the alphabet and handling of the last chunk.
+     * @returns A new `Uint8Array` instance.
+     * @throws {SyntaxError} If the input string contains characters outside the specified alphabet, or if the last
+     * chunk is inconsistent with the `lastChunkHandling` option.
+     */
+    fromBase64(
+        string: string,
+        options?: {
+            alphabet?: "base64" | "base64url" | undefined;
+            lastChunkHandling?: "loose" | "strict" | "stop-before-partial" | undefined;
+        },
+    ): Uint8Array<ArrayBuffer>;
+
+    /**
+     * Creates a new `Uint8Array` from a base16-encoded string.
+     * @returns A new `Uint8Array` instance.
+     */
+    fromHex(
+        string: string,
+    ): Uint8Array<ArrayBuffer>;
+}
+
+//========== lib.esnext.date.d.ts ==========
+/*! *****************************************************************************
+Copyright (c) Microsoft Corporation. All rights reserved.
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License at http://www.apache.org/licenses/LICENSE-2.0
+
+THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
+WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
+MERCHANTABILITY OR NON-INFRINGEMENT.
+
+See the Apache Version 2.0 License for specific language governing permissions
+and limitations under the License.
+***************************************************************************** */
+
+
+/// <reference lib="esnext.temporal" />
+
+interface Date {
+    toTemporalInstant(): Temporal.Instant;
 }
 
 //========== lib.esnext.d.ts ==========
@@ -12141,25 +14077,24 @@ License at http://www.apache.org/licenses/LICENSE-2.0
 THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION ANY IMPLIED
 WARRANTIES OR CONDITIONS OF TITLE, FITNESS FOR A PARTICULAR PURPOSE,
-MERCHANTABLITY OR NON-INFRINGEMENT.
+MERCHANTABILITY OR NON-INFRINGEMENT.
 
 See the Apache Version 2.0 License for specific language governing permissions
 and limitations under the License.
 ***************************************************************************** */
 
 
-/// <reference no-default-lib="true"/>
-
-/// <reference lib="es2023" />
+/// <reference lib="es2025" />
 /// <reference lib="esnext.intl" />
+/// <reference lib="esnext.collection" />
 /// <reference lib="esnext.decorators" />
 /// <reference lib="esnext.disposable" />
-/// <reference lib="esnext.promise" />
-/// <reference lib="esnext.object" />
-/// <reference lib="esnext.collection" />
 /// <reference lib="esnext.array" />
-/// <reference lib="esnext.regexp" />
-/// <reference lib="esnext.string" />
+/// <reference lib="esnext.error" />
+/// <reference lib="esnext.sharedmemory" />
+/// <reference lib="esnext.typedarrays" />
+/// <reference lib="esnext.temporal" />
+/// <reference lib="esnext.date" />
 
 //========== ztsc console shim (backend `console`, not from DOM) ==========
 declare var console: {

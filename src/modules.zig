@@ -62,7 +62,7 @@ pub const no_file: FileId = std.math.maxInt(FileId);
 /// The leading NUL keeps it from colliding with any real filesystem path.
 pub const lib_path = "\x00lib/lib.esnext.d.ts";
 /// The embedded lib text (see `src/lib/lib.esnext.d.ts`, M18.2 — the real
-/// TypeScript 5.5.4 ES-core..esnext surface, DOM excluded, plus a minimal
+/// TypeScript 7.0.2 ES-core..esnext surface, DOM excluded, plus a minimal
 /// `console` shim). Bound once per run; its top-level declarations become the
 /// program's global symbols. Its own diagnostics are suppressed (like tsc's
 /// default lib) — see the print loop in main.zig.
@@ -1104,9 +1104,10 @@ const Linker = struct {
         return null;
     }
 
-    /// TS2307 for unresolved module specifiers, one per statement.
-    /// Side-effect-only imports (`import "./x"`) are exempt — tsc does not
-    /// report unresolved modules for them under bundler resolution.
+    /// TS2307 for unresolved module specifiers, one per statement. A
+    /// side-effect-only import (`import "./x"`) of an unresolved module gets
+    /// TS2882 instead — TS7 flags these (tsc 5.5 left them silent under
+    /// bundler resolution).
     fn reportUnresolvedModules(l: *Linker, file: FileId) Error!void {
         const f = &l.files[file];
         const tree = f.tree;
@@ -1114,10 +1115,11 @@ const Linker = struct {
             if (stmt == ast.null_node) continue;
             const tag = tree.nodeTag(stmt);
             if (tag != .import_decl and tag != .export_named and tag != .export_all) continue;
+            var side_effect = false;
             if (tag == .import_decl) {
                 const data = tree.extraData(ast.ImportData, tree.nodeData(stmt).lhs);
-                if (data.default_name_token == 0 and data.ns_name_token == 0 and
-                    data.spec_start == data.spec_end) continue;
+                side_effect = data.default_name_token == 0 and data.ns_name_token == 0 and
+                    data.spec_start == data.spec_end;
             }
             const mod_tok = tree.nodeData(stmt).rhs;
             if (mod_tok == 0) continue;
@@ -1127,7 +1129,11 @@ const Linker = struct {
             const atom = l.interner.intern(l.io, l.gpa, stripped) catch return Error.OutOfMemory;
             if (f.specs.get(atom) != null) continue;
             if (l.hasAmbient(atom)) continue; // resolved by a `declare module`
-            try l.diag(file, 2307, l.tokSpan(file, mod_tok), "Cannot find module '{s}' or its corresponding type declarations.", .{stripped});
+            if (side_effect) {
+                try l.diag(file, 2882, l.tokSpan(file, mod_tok), "Cannot find module or type declarations for side-effect import of '{s}'.", .{stripped});
+            } else {
+                try l.diag(file, 2307, l.tokSpan(file, mod_tok), "Cannot find module '{s}' or its corresponding type declarations.", .{stripped});
+            }
         }
     }
 

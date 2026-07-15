@@ -1,8 +1,11 @@
 #!/usr/bin/env node
 // Generates .expected snapshots for every case under test/conformance
-// by checking each case with the real TypeScript compiler:
-//   options: --strict --noEmit --target esnext (default lib),
-//   plus module/bundler-resolution options for multi-file cases.
+// by checking each case with the real TypeScript compiler — the pinned
+// native tsgo 7.0.2 baseline (bench/baselines/tsgo; `npm install` there
+// if node_modules is missing):
+//   options: --strict --noEmit --target esnext --lib esnext,dom
+//   (dom purely for `console`), plus module/bundler-resolution options
+//   for multi-file cases.
 //
 // Two case shapes:
 //   - single file:  <name>.ts  -> snapshot <name>.expected with lines
@@ -11,9 +14,9 @@
 //     in, incl. a case-local node_modules) -> snapshot <dir>/expected with
 //         TS<code> <relative-file> <line>
 "use strict";
-const ts = require("typescript");
 const fs = require("fs");
 const path = require("path");
+const { spawnSync } = require("child_process");
 
 const confDir = process.argv[2];
 if (!confDir) {
@@ -22,22 +25,39 @@ if (!confDir) {
 }
 const checkOnly = process.argv.includes("--check");
 
-const options = {
-  strict: true,
-  noEmit: true,
-  target: ts.ScriptTarget.ESNext,
-  // esnext ECMAScript globals + the DOM lib (for `console`, which lives in
-  // lib.dom, not esnext). ztsc's minimal built-in lib (M10) is a subset of
-  // these, so snapshots stay a fair tsc-vs-ztsc differential.
-  lib: ["lib.esnext.d.ts", "lib.dom.d.ts"],
-  types: [],
-  module: ts.ModuleKind.ESNext,
-  moduleResolution: ts.ModuleResolutionKind.Bundler,
-  allowImportingTsExtensions: true,
-  // JSX in `.tsx` cases (no effect on `.ts`). ztsc parses/types JSX from a
-  // self-contained `JSX` namespace defined in each case (no React types).
-  jsx: ts.JsxEmit.Preserve,
-};
+// The pinned native compiler (same baseline bench/e2e.sh uses). Pin-checked:
+// snapshots are only meaningful against exactly this oracle version.
+const ORACLE_VERSION = "7.0.2";
+const tsgo = path.join(
+  __dirname, "..", "..", "bench", "baselines", "tsgo", "node_modules",
+  "@typescript", `typescript-${process.platform}-${process.arch}`, "lib", "tsc",
+);
+if (!fs.existsSync(tsgo)) {
+  console.error(`tsgo baseline not found at ${tsgo}\nrun: cd bench/baselines/tsgo && npm install`);
+  process.exit(2);
+}
+{
+  const v = spawnSync(tsgo, ["--version"], { encoding: "utf8" });
+  const got = (v.stdout || "").trim().replace(/^Version\s+/, "");
+  if (got !== ORACLE_VERSION) {
+    console.error(`tsgo version mismatch: want ${ORACLE_VERSION}, got '${got || "(no output)"}' — refusing to run`);
+    process.exit(2);
+  }
+}
+
+// Mirrors the pre-migration programmatic-API options; `--types ""` = types: [].
+// esnext ECMAScript globals + the DOM lib (for `console`, which lives in
+// lib.dom, not esnext). ztsc's built-in lib (M18.2, re-vendored from the same
+// TS 7.0.2 package) is a subset of these, so snapshots stay a fair
+// tsgo-vs-ztsc differential. JSX preserve for `.tsx` cases (no effect on
+// `.ts`; cases define a self-contained `JSX` namespace, no React types).
+const OPTIONS = [
+  "--strict", "--noEmit", "--target", "esnext",
+  "--lib", "esnext,dom", "--types", "",
+  "--module", "esnext", "--moduleResolution", "bundler",
+  "--allowImportingTsExtensions", "--jsx", "preserve",
+  "--pretty", "false",
+];
 
 function walk(dir) {
   // Returns { files: [single-file cases], dirs: [directory cases] }.
@@ -60,26 +80,25 @@ function walk(dir) {
   return { files, dirs };
 }
 
-function diagLines(program, filterDir, relBase) {
-  const lines = [];
-  for (const sf of program.getSourceFiles()) {
-    const abs = path.resolve(sf.fileName);
-    if (filterDir && !abs.startsWith(path.resolve(filterDir) + path.sep)) continue;
-    const diags = [
-      ...program.getSyntacticDiagnostics(sf),
-      ...program.getSemanticDiagnostics(sf),
-    ];
-    for (const d of diags) {
-      if (d.file === undefined || d.start === undefined) continue;
-      if (d.file.fileName !== sf.fileName) continue;
-      const { line } = d.file.getLineAndCharacterOfPosition(d.start);
-      const rel = path.relative(relBase, abs).split(path.sep).join("/");
-      lines.push({ file: rel, line: line + 1, code: d.code });
-    }
+// `--pretty false` line shape: file(line,col): error TScode: message
+const DIAG_RE = /^(.+)\((\d+),(\d+)\): error TS(\d+):/;
+
+// All file-anchored diagnostics from one tsgo run, absolute file paths.
+// Global (file-less) errors don't match the regex and are skipped, exactly
+// as the old programmatic harness skipped diagnostics without file/start.
+function runOracle(entryAbs) {
+  const r = spawnSync(tsgo, [...OPTIONS, entryAbs], {
+    encoding: "utf8",
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  if (r.error) throw r.error;
+  const diags = [];
+  for (const line of ((r.stdout || "") + (r.stderr || "")).split("\n")) {
+    const m = DIAG_RE.exec(line);
+    if (!m) continue;
+    diags.push({ file: path.resolve(m[1]), line: +m[2], code: +m[4] });
   }
-  lines.sort((a, b) =>
-    a.file < b.file ? -1 : a.file > b.file ? 1 : a.line - b.line || a.code - b.code);
-  return lines.map((l) => `TS${l.code} ${l.file} ${l.line}`);
+  return diags;
 }
 
 let mismatches = 0;
@@ -90,7 +109,7 @@ function emit(expPath, content, label) {
     if (existing !== content) {
       mismatches++;
       console.log(`MISMATCH ${label}`);
-      console.log(`  tsc:      ${content.trim().split("\n").filter(Boolean).join(", ") || "(clean)"}`);
+      console.log(`  tsgo:     ${content.trim().split("\n").filter(Boolean).join(", ") || "(clean)"}`);
       console.log(`  snapshot: ${existing.trim().split("\n").filter(Boolean).join(", ") || "(clean)"}`);
     }
   } else {
@@ -105,32 +124,31 @@ files.sort();
 dirs.sort();
 
 for (const file of files) {
-  const program = ts.createProgram([file], options);
-  const sf = program.getSourceFile(file);
-  const diags = [
-    ...program.getSyntacticDiagnostics(sf),
-    ...program.getSemanticDiagnostics(sf),
-  ];
-  const lines = [];
-  for (const d of diags) {
-    if (d.file === undefined || d.start === undefined) continue;
-    if (d.file.fileName !== sf.fileName) continue; // lib errors etc.
-    const { line } = d.file.getLineAndCharacterOfPosition(d.start);
-    lines.push(`TS${d.code} ${line + 1}`);
-  }
+  const abs = path.resolve(file);
+  const diags = runOracle(abs).filter((d) => d.file === abs); // lib errors etc.
+  diags.sort((a, b) => a.line - b.line || a.code - b.code);
+  const lines = diags.map((d) => `TS${d.code} ${d.line}`);
   const content = lines.length ? lines.join("\n") + "\n" : "";
   emit(file.replace(/\.tsx?$/, "") + ".expected", content, path.relative(confDir, file));
 }
 
 for (const dir of dirs) {
-  const entry = path.join(dir, "entry.ts");
-  const program = ts.createProgram([entry], options);
-  const lines = diagLines(program, dir, dir);
+  const base = path.resolve(dir);
+  const diags = runOracle(path.join(base, "entry.ts"))
+    .filter((d) => d.file.startsWith(base + path.sep));
+  const rows = diags.map((d) => ({
+    file: path.relative(base, d.file).split(path.sep).join("/"),
+    line: d.line,
+    code: d.code,
+  }));
+  rows.sort((a, b) =>
+    a.file < b.file ? -1 : a.file > b.file ? 1 : a.line - b.line || a.code - b.code);
+  const lines = rows.map((r) => `TS${r.code} ${r.file} ${r.line}`);
   const content = lines.length ? lines.join("\n") + "\n" : "";
   emit(path.join(dir, "expected"), content, path.relative(confDir, dir));
 }
 
 if (checkOnly) {
-  console.log(mismatches ? `${mismatches} mismatch(es)` : "all snapshots match tsc");
+  console.log(mismatches ? `${mismatches} mismatch(es)` : "all snapshots match tsgo");
   process.exit(mismatches ? 1 : 0);
 }

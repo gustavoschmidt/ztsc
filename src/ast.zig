@@ -83,7 +83,7 @@ pub fn wellKnownSymbolKey(name: []const u8) ?[]const u8 {
     // `asyncDispose`, `metadata`). Each `[Symbol.<name>]` computed member is
     // keyed by a synthetic `__@<name>` atom; the `__@` prefix cannot appear in
     // a real identifier, so a synthetic key never collides with an ordinary
-    // member. The real 5.5.4 lib uses all of these (M18.2).
+    // member. The real vendored lib uses all of these (M18.2).
     const pairs = [_]struct { n: []const u8, k: []const u8 }{
         .{ .n = "iterator", .k = "__@iterator" },
         .{ .n = "asyncIterator", .k = "__@asyncIterator" },

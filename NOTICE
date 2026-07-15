@@ -23,12 +23,14 @@ subject to the Apache License, Version 2.0. Copyright for these components:
 ------------------------------------------------
 
 The file `src/lib/lib.esnext.d.ts` is redistributed, near-verbatim, from the
-TypeScript 5.5.4 standard library. It is assembled by concatenating the
-`lib.*.d.ts` reference chain rooted at `lib.esnext.d.ts` (71 files, dependency
-order; DOM / webworker / scripthost libraries excluded). Each concatenated
-section retains the original Microsoft Apache-2.0 copyright header from the
-upstream file. This file is compiled into the ztsc binary via `@embedFile`
-(see `src/modules.zig`).
+TypeScript 7.0.2 standard library (the `@typescript/typescript-*` platform
+packages of the Apache-2.0 `typescript` npm package). It is assembled by
+`src/lib/gen_lib.js` by concatenating the `lib.*.d.ts` reference chain rooted
+at `lib.esnext.d.ts` (87 files, dependency order; DOM / webworker /
+scripthost libraries excluded). Each concatenated section retains the
+original Microsoft Apache-2.0 copyright header from the upstream file. This
+file is compiled into the ztsc binary via `@embedFile` (see
+`src/modules.zig`).
 
 
 2. Diagnostic message strings

@@ -958,7 +958,7 @@ pub fn main(init: std.process.Init) !void {
         const tree = trees.items[i] orelse continue;
         // Never surface diagnostics from the built-in lib itself, matching
         // tsc, which does not diagnose the default lib. The vendored real
-        // 5.5.4 lib (M18.2) is census-clean but trips a few ztsc-incompleteness
+        // 7.0.2 lib (M18.2) is census-clean but trips a few ztsc-incompleteness
         // diagnostics (`intrinsic`, `globalThis`, merged-interface duplicate
         // members); those degrade the affected lib types to `any` rather than
         // leaking spurious errors onto every user run. Diagnostic cursor for

@@ -486,6 +486,14 @@ const Checker = struct {
     atom_Generator: Atom = 0,
     atom_Iterator: Atom = 0,
     atom_IterableIterator: Atom = 0,
+    /// TS ≥5.6 lib built-in iterator families (`IteratorObject` and the
+    /// `MapIterator`-style named iterators) — first type arg is the yield type.
+    atom_IteratorObject: Atom = 0,
+    atom_ArrayIterator: Atom = 0,
+    atom_MapIterator: Atom = 0,
+    atom_SetIterator: Atom = 0,
+    atom_StringIterator: Atom = 0,
+    atom_RegExpStringIterator: Atom = 0,
     atom_sym_iterator: Atom = 0,
     atom_next: Atom = 0,
     atom_value: Atom = 0,
@@ -573,6 +581,12 @@ const Checker = struct {
         c.atom_Generator = try c.atom("Generator");
         c.atom_Iterator = try c.atom("Iterator");
         c.atom_IterableIterator = try c.atom("IterableIterator");
+        c.atom_IteratorObject = try c.atom("IteratorObject");
+        c.atom_ArrayIterator = try c.atom("ArrayIterator");
+        c.atom_MapIterator = try c.atom("MapIterator");
+        c.atom_SetIterator = try c.atom("SetIterator");
+        c.atom_StringIterator = try c.atom("StringIterator");
+        c.atom_RegExpStringIterator = try c.atom("RegExpStringIterator");
         c.atom_sym_iterator = try c.atom(ast.wellKnownSymbolKey("iterator").?);
         c.atom_next = try c.atom("next");
         c.atom_value = try c.atom("value");
@@ -2154,13 +2168,13 @@ const Checker = struct {
         if (args.len < min or args.len > tps.items.len) {
             if (tps.items.len == 0) {
                 // Non-generic type applied to type args. Report TS2315 (as tsc
-                // does) but degrade to the base type rather than dropping it:
-                // real `@types/node` (the TS-5.7 root variant ztsc resolves)
-                // has `interface Buffer extends Uint8Array<T>` and ztsc's lib
-                // `Uint8Array` is non-generic, so dropping the base would strip
-                // every inherited member. Ignoring the args keeps `Buffer` a
-                // usable `Uint8Array`, matching what tsc 5.5.4 sees via its
-                // non-generic ts5.6 variant.
+                // does) but degrade to the base type rather than dropping it,
+                // so a `X extends NonGeneric<T>` base keeps its inherited
+                // members instead of stripping them all. (Historically this
+                // bridged @types/node's generic `Buffer<T> extends
+                // Uint8Array<T>` onto the 5.5.4 lib's non-generic
+                // `Uint8Array`; the TS 7.0.2 lib is generic, so that skew is
+                // gone, but the degradation stays the right lenient default.)
                 try c.diagFmt(2315, c.tokSpan(tok), "Type '{s}' is not generic.", .{c.symbolName(sym)});
                 return try c.scratch().dupe(TypeId, &.{});
             }
@@ -3608,14 +3622,31 @@ const Checker = struct {
                 if (c.bind.membersScopeOf(c.localOf(cur))) |ms| {
                     const lo = c.bind.scope_members_start[ms];
                     const hi = c.bind.scope_members_start[ms + 1];
+                    // Collect this base's unimplemented members in source
+                    // order (scope-member order is name-bucketed, not
+                    // declaration order) so the TS2654 list matches tsc.
+                    const Unimpl = struct { atom: Atom, start: u32 };
+                    var batch: std.ArrayList(Unimpl) = .empty;
+                    defer batch.deinit(c.scratch());
                     for (lo..hi) |i| {
                         const name_atom = c.bind.member_atoms[i];
                         if (isCtorName(c, name_atom)) continue;
                         if (seen.contains(name_atom)) continue;
                         try seen.put(c.scratch(), name_atom, {});
-                        const msym = c.toGlobal(c.bind.member_syms[i]);
-                        if (c.memberIsAbstract(msym)) try unimpl.append(c.scratch(), name_atom);
+                        const local_sym = c.bind.member_syms[i];
+                        const msym = c.toGlobal(local_sym);
+                        if (c.memberIsAbstract(msym)) {
+                            const decls = c.bind.declsOf(local_sym);
+                            const start = if (decls.len > 0) c.nodeSpan(decls[0]).start else 0;
+                            try batch.append(c.scratch(), .{ .atom = name_atom, .start = start });
+                        }
                     }
+                    std.mem.sort(Unimpl, batch.items, {}, struct {
+                        fn lessThan(_: void, x: Unimpl, y: Unimpl) bool {
+                            return x.start < y.start;
+                        }
+                    }.lessThan);
+                    for (batch.items) |u| try unimpl.append(c.scratch(), u.atom);
                 }
             }
             const nb = try c.baseClassRef(cur) orelse break;
@@ -3632,8 +3663,14 @@ const Checker = struct {
                 class_name, c.atomText(unimpl.items[0]), base_name,
             });
         } else {
-            try c.diagFmt(2654, span, "Non-abstract class '{s}' is missing implementations for members of '{s}'.", .{
-                class_name, base_name,
+            var names: std.Io.Writer.Allocating = .init(c.scratch());
+            defer names.deinit();
+            for (unimpl.items, 0..) |m, i| {
+                if (i > 0) names.writer.writeAll(", ") catch return error.OutOfMemory;
+                names.writer.print("'{s}'", .{c.atomText(m)}) catch return error.OutOfMemory;
+            }
+            try c.diagFmt(2654, span, "Non-abstract class '{s}' is missing implementations for the following members of '{s}': {s}.", .{
+                class_name, base_name, names.written(),
             });
         }
     }
@@ -5770,17 +5807,26 @@ const Checker = struct {
         return t;
     }
 
-    /// If `t` is a `Generator<T>`/`Iterator<T>`/`IterableIterator<T>` ref,
-    /// return its yield element `T`; otherwise 0.
+    /// If `t` is a ref to one of the lib's iterator interfaces whose first
+    /// type arg is the yield element (`Generator<T>`/`Iterator<T>`/
+    /// `IterableIterator<T>`, plus the TS ≥5.6 `IteratorObject<T>` and the
+    /// named built-in iterators like `MapIterator<T>`), return that `T`;
+    /// otherwise 0.
     fn generatorYieldType(c: *Checker, t: TypeId) TypeId {
         if (c.ts.kind(t) != .ref) return 0;
         const sym = c.ts.refSymbol(t);
-        const g = c.prog.globals.lookup(c.atom_Generator);
-        const it = c.prog.globals.lookup(c.atom_Iterator);
-        const ii = c.prog.globals.lookup(c.atom_IterableIterator);
-        if ((g != null and sym == g.?) or (it != null and sym == it.?) or (ii != null and sym == ii.?)) {
-            const args = c.ts.refArgs(t);
-            if (args.len >= 1) return args[0];
+        const names = [_]Atom{
+            c.atom_Generator,          c.atom_Iterator,    c.atom_IterableIterator,
+            c.atom_IteratorObject,     c.atom_ArrayIterator, c.atom_MapIterator,
+            c.atom_SetIterator,        c.atom_StringIterator, c.atom_RegExpStringIterator,
+        };
+        for (names) |name| {
+            const g = c.prog.globals.lookup(name) orelse continue;
+            if (sym == g) {
+                const args = c.ts.refArgs(t);
+                if (args.len >= 1) return args[0];
+                return 0;
+            }
         }
         return 0;
     }
@@ -6501,6 +6547,10 @@ const Checker = struct {
         if (expr_node != 0 and try c.elaborateLiteralError(expr_node, src_t, target)) {
             return false;
         }
+        // TS7 surfaces the specific missing-property error (TS2741/2739) in
+        // place of the TS1360 wrapper when the operand is an object missing
+        // required members; a primitive/non-object mismatch still gets TS1360.
+        if (try c.tryReportMissingProps(src_t, target, span)) return false;
         try c.diagFmt(1360, span, "Type '{s}' does not satisfy the expected type '{s}'.", .{
             try c.typeToString(src_t), try c.typeToString(target),
         });
@@ -6594,40 +6644,51 @@ const Checker = struct {
         return true;
     }
 
+    /// Missing-property refinement: when `src` is object-y and `target` is an
+    /// object type with required properties absent from `src`, report the
+    /// specific missing-property error (TS2741 for one, TS2739 for several) at
+    /// `span` and return true. Shared by the assignment check (in place of
+    /// TS2322), `satisfies` (in place of TS1360), and the `this`-receiver check
+    /// (in place of TS2684): TS7 surfaces this specific error where tsc 5.5
+    /// emitted the wrapper code.
+    fn tryReportMissingProps(c: *Checker, src_t: TypeId, target: TypeId, span: Span) Error!bool {
+        const rs = try c.resolveStructural(src_t);
+        const rt = try c.resolveStructural(target);
+        if (!isSourceObjecty(c.ts.kind(rs)) or c.ts.kind(rt) != .object) return false;
+        var missing: std.ArrayList(Atom) = .empty;
+        defer missing.deinit(c.scratch());
+        for (0..c.ts.objectPropCount(rt)) |i| {
+            const tp = c.ts.objectProp(rt, @intCast(i));
+            if (tp.optional()) continue;
+            if ((try c.propOfType(rs, tp.name)) == null) {
+                try missing.append(c.scratch(), tp.name);
+            }
+        }
+        if (missing.items.len == 1) {
+            try c.diagFmt(2741, span, "Property '{s}' is missing in type '{s}' but required in type '{s}'.", .{
+                c.atomText(missing.items[0]), try c.typeToString(src_t), try c.typeToString(target),
+            });
+            return true;
+        }
+        if (missing.items.len > 1) {
+            var names: std.Io.Writer.Allocating = .init(c.scratch());
+            defer names.deinit();
+            for (missing.items, 0..) |m, i| {
+                if (i > 0) names.writer.writeAll(", ") catch return error.OutOfMemory;
+                names.writer.print("{s}", .{c.atomText(m)}) catch return error.OutOfMemory;
+            }
+            try c.diagFmt(2739, span, "Type '{s}' is missing the following properties from type '{s}': {s}", .{
+                try c.typeToString(src_t), try c.typeToString(target), names.written(),
+            });
+            return true;
+        }
+        return false;
+    }
+
     fn reportNotAssignable(c: *Checker, code: u16, src_t: TypeId, target: TypeId, span: Span) Error!void {
         // Missing-property refinement (tsc: 2739 / 2741 instead of 2322).
         if (code == 2322) {
-            const rs = try c.resolveStructural(src_t);
-            const rt = try c.resolveStructural(target);
-            if (isSourceObjecty(c.ts.kind(rs)) and c.ts.kind(rt) == .object) {
-                var missing: std.ArrayList(Atom) = .empty;
-                defer missing.deinit(c.scratch());
-                for (0..c.ts.objectPropCount(rt)) |i| {
-                    const tp = c.ts.objectProp(rt, @intCast(i));
-                    if (tp.optional()) continue;
-                    if ((try c.propOfType(rs, tp.name)) == null) {
-                        try missing.append(c.scratch(), tp.name);
-                    }
-                }
-                if (missing.items.len == 1) {
-                    try c.diagFmt(2741, span, "Property '{s}' is missing in type '{s}' but required in type '{s}'.", .{
-                        c.atomText(missing.items[0]), try c.typeToString(src_t), try c.typeToString(target),
-                    });
-                    return;
-                }
-                if (missing.items.len > 1) {
-                    var names: std.Io.Writer.Allocating = .init(c.scratch());
-                    defer names.deinit();
-                    for (missing.items, 0..) |m, i| {
-                        if (i > 0) names.writer.writeAll(", ") catch return error.OutOfMemory;
-                        names.writer.print("{s}", .{c.atomText(m)}) catch return error.OutOfMemory;
-                    }
-                    try c.diagFmt(2739, span, "Type '{s}' is missing the following properties from type '{s}': {s}", .{
-                        try c.typeToString(src_t), try c.typeToString(target), names.written(),
-                    });
-                    return;
-                }
-            }
+            if (try c.tryReportMissingProps(src_t, target, span)) return;
         }
         const msg_fmt = "Type '{s}' is not assignable to type '{s}'.";
         if (code == 2345) {
@@ -8249,6 +8310,10 @@ const Checker = struct {
             else => {},
         }
         if (!try c.isAssignable(recv, this_ty)) {
+            // TS7 reports the specific missing-property error (TS2741/2739) when
+            // the receiver simply lacks required members; a member present with
+            // an incompatible type still yields the TS2684 wrapper.
+            if (try c.tryReportMissingProps(recv, this_ty, c.nodeSpan(callee))) return;
             try c.diagFmt(2684, c.nodeSpan(callee), "The 'this' context of type '{s}' is not assignable to method's 'this' of type '{s}'.", .{
                 try c.typeToString(recv), try c.typeToString(this_ty),
             });
