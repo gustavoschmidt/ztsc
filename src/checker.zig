@@ -1025,6 +1025,20 @@ const Checker = struct {
                 }
                 if (wrong == binder.no_symbol) wrong = sym;
             }
+            // A bare name unresolved in *this* file's copy of a namespace body
+            // may be declared in another file's contribution to the same
+            // cross-file-merged namespace (M11b). Real `@types/node` relies on
+            // this: `namespace NodeJS { interface ProcessEnv extends Dict<…> }`
+            // sits in `process.d.ts` while `interface Dict<T>` is declared in
+            // `globals.d.ts`'s `namespace NodeJS`. Consult the merged member
+            // index for the enclosing namespace scope.
+            if (c.bind.scope_kinds[s] == .namespace) {
+                if (c.mergedNsMemberOfScope(s, a)) |gsym| {
+                    const gf = c.symFlags(gsym);
+                    const ok = if (want_value) hasValueMeaning(gf) else hasTypeMeaning(gf);
+                    if (ok) return .{ .sym = gsym };
+                }
+            }
             if (s == binder.file_scope) break;
             s = c.bind.scope_parents[s];
         }
@@ -1737,6 +1751,25 @@ const Checker = struct {
         return c.toGlobalIn(c.symFile(ns_sym), local);
     }
 
+    /// If namespace scope `s` belongs to a symbol that is a cross-file merge
+    /// constituent, return member `a` from the merged member index (a global
+    /// id), else null. Lets a bare name inside one file's namespace body see
+    /// declarations another file contributed to the same merged namespace.
+    fn mergedNsMemberOfScope(c: *Checker, s: ScopeId, a: Atom) ?SymbolId {
+        const owner = c.bind.scope_owners[s];
+        if (owner == 0 or c.nodeTag(owner) != .namespace_decl) return null;
+        const nd = c.tree.extraData(ast.NamespaceData, c.tree.nodeData(owner).lhs);
+        // Only named namespaces merge by name; `global {}` / `declare module`
+        // blocks carry a keyword/string name_token, not an identifier.
+        if (nd.flags & (ast.Flags.global_aug | ast.Flags.ambient_module) != 0) return null;
+        if (nd.name_token == 0) return null;
+        const name = c.atomOfToken(nd.name_token) catch return null;
+        const local = c.bind.lookupInScope(c.bind.scope_parents[s], name) orelse return null;
+        const merged = c.prog.mergedOf(c.toGlobal(local)) orelse return null;
+        if (!c.prog.isMergedId(merged)) return null;
+        return c.prog.mergedSym(merged).members.lookup(a);
+    }
+
     /// A resolved type-position `import("m")` target: an on-disk program file
     /// or an ambient/augmentation module (M11c).
     const ModuleRef = union(enum) { file: FileId, ambient: u32 };
@@ -2051,10 +2084,18 @@ const Checker = struct {
         }
         if (args.len < min or args.len > tps.items.len) {
             if (tps.items.len == 0) {
+                // Non-generic type applied to type args. Report TS2315 (as tsc
+                // does) but degrade to the base type rather than dropping it:
+                // real `@types/node` (the TS-5.7 root variant ztsc resolves)
+                // has `interface Buffer extends Uint8Array<T>` and ztsc's lib
+                // `Uint8Array` is non-generic, so dropping the base would strip
+                // every inherited member. Ignoring the args keeps `Buffer` a
+                // usable `Uint8Array`, matching what tsc 5.5.4 sees via its
+                // non-generic ts5.6 variant.
                 try c.diagFmt(2315, c.tokSpan(tok), "Type '{s}' is not generic.", .{c.symbolName(sym)});
-            } else {
-                try c.diagFmt(2314, c.tokSpan(tok), "Generic type '{s}' requires {d} type argument(s).", .{ c.symbolName(sym), min });
+                return try c.scratch().dupe(TypeId, &.{});
             }
+            try c.diagFmt(2314, c.tokSpan(tok), "Generic type '{s}' requires {d} type argument(s).", .{ c.symbolName(sym), min });
             return null;
         }
         var out = try c.scratch().alloc(TypeId, tps.items.len);

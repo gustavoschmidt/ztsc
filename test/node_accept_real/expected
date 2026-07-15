@@ -1,0 +1,12 @@
+# Expected user-code diagnostics for the real-`@types/node` backend program,
+# validated against tsc 5.5.4 (--strict --noEmit --skipLibCheck, @types/node
+# @22.7.4). Format: `TS<code> <file-relative-to-src> <line>`. Only user code
+# under src/ is compared — the vendored `@types/node` .d.ts themselves are
+# skipped on both sides (tsc via `skipLibCheck`, ztsc as a default-lib-style
+# suppression), exactly as a real backend build runs. The five lines below are
+# the planted mistakes; every other line type-checks clean on both compilers.
+TS2322 index.ts 21
+TS2322 index.ts 22
+TS2322 index.ts 23
+TS2322 index.ts 24
+TS2339 index.ts 25

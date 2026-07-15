@@ -1556,12 +1556,52 @@ graduates the M11 acceptance test to the *real* pinned `@types/node`.
    (a pre-existing parser gap, unrelated). **Benchmark flat** — corpus has no
    decorators: multi N=1/4/8 wall 0.09/0.03/0.03 s, peak RSS 52.1/54.3/47.0 MB,
    types(N=4) 27569, byte-for-byte the post-M18.2 baseline.
-4. **Real pinned `@types/node` acceptance** (graduates from M11, per that
-   milestone's closing note). Vendor a pinned `@types/node` (already in
-   `bench/fetch_real.sh`'s set) and differential-check a small real
-   backend program against it, diagnostics matching tsc 5.5.4. This
-   supersedes the hand-authored `node_accept/backend` node-shaped fixture
-   as the standing gate (the fixture stays as a fast regression case).
+4. **Real pinned `@types/node` acceptance. ✅ DONE (2026-07-14).**
+   (graduates from M11, per that milestone's closing note.) Standing gate
+   at `test/node_accept_real/` (scripted `run.sh` — the real `@types/node`
+   @22.7.4 is gitignored like all corpora, so not a `zig build test` case;
+   the hand-authored `node_accept/backend` fixture stays as the committed
+   fast regression case). A small real backend program (`src/config.ts`,
+   `src/store.ts`, `src/index.ts`) exercises `process` (`pid`/`cwd()`/
+   `argv`/`platform` + `process.env.X` = `string|undefined` via
+   `NodeJS.ProcessEnv`'s inherited cross-file-merged `Dict<string>` index
+   signature), `fs` (`readFileSync`/`existsSync`/`writeFileSync` →
+   `Buffer`), the `Buffer` global (declared in a bare `global {}` nested in
+   `declare module "buffer"`), and `path`/`timers`/`events`. Five planted
+   mistakes (`index.ts` 21–25: TS2322×4 + TS2339) match tsc 5.5.4
+   `--strict --noEmit --skipLibCheck` **byte-for-byte, live-differential
+   confirmed** (`run.sh` re-runs tsc when it's on `NODE_PATH` and diffs).
+   Four real gaps the real `@types/node` exposed were fixed to reach the
+   match (all validated against tsc, none regress the 388-case suite):
+   (a) *binder* — a file now contributes **both** its `file_scope` (scripts)
+   **and** every `declare global`/bare `global {}` block's `global_scope` to
+   the global harvest (real `@types/node` puts `namespace NodeJS` in bare
+   `global {}` blocks nested in `declare module` *script* files); (b)
+   *parser* — bare `global { … }` augmentation (no leading `declare`) parses
+   when followed by `{` (contextual-keyword `global` elsewhere still an
+   ordinary ident); (c) *checker* `mergedNsMemberOfScope` — a bare name
+   unresolved in one file's copy of a merged namespace body now consults the
+   M11b merged member index, so `namespace NodeJS { interface ProcessEnv
+   extends Dict<…> }` in `process.d.ts` sees `Dict` from `globals.d.ts`
+   (**only ever resolves more names → can under-report, never a false
+   positive**); (d) *modules* `ambientOpaque` + *checker* TS2315-degrades-to-
+   base — an ambient module with no ES named exports (`export =` / auto-
+   export, out of subset: `path`/`timers`/`events`/`os`) degrades named
+   imports to `any` rather than spuriously reporting TS2305/TS2339, and a
+   non-generic type applied to type args (`Buffer extends Uint8Array<T>` in
+   the TS-5.7 root variant ztsc resolves) keeps the base type instead of
+   dropping it. New committed conformance case `global_merge/09` (bare
+   `global {}` in an ambient-module script → `TS2322`, matches tsc). Bench
+   flat vs M18.2 (N=4 51.4 MB / 27569 types). **Accepted under-reports
+   (documented in the harness README, never spurious errors):** `export =`
+   modules resolve to `any` (mistakes *through* those symbols uncaught);
+   `readFileSync(p, "utf8")` picks the `Buffer` overload (no weak-type rule);
+   `typesVersions` selects the TS-5.7 generic-`Buffer` root over the `ts5.6/`
+   variant. A minimal cross-file-namespace-`extends` conformance fixture was
+   intentionally **not** committed: tsc's exact scope rule reports `TS2304`
+   in the bare `declare global namespace` shape that ztsc's coarser (correct-
+   for-real-`@types/node`) rule resolves, so no clean exact-match case exists
+   — `node_accept_real` is the authoritative gate for that path.
 5. **Corpus & census refresh.** Grow `bench/fetch_real.sh`'s pinned set
    toward the ~500k-LOC target (more packages are checkable now); re-run
    `--census` over it. The refreshed table is the release-readiness

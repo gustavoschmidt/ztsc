@@ -1074,6 +1074,17 @@ const Linker = struct {
         return l.ambientKey(spec) != null;
     }
 
+    /// An ambient module whose block yielded no ES-style named exports — it
+    /// uses `export =` / `import = require` or the ambient auto-export rule
+    /// (top-level `let`/`function` with no `export`), all out of subset. Real
+    /// `@types/node`'s `path`/`timers`/`events`/`os`/… are all this shape.
+    /// Named imports from such a module degrade to `any` (a clean deferral)
+    /// rather than spuriously reporting TS2305 "has no exported member".
+    fn ambientOpaque(l: *Linker, spec: Atom) bool {
+        const key = l.ambientKey(spec) orelse return false;
+        return l.ambient.getPtr(key).?.count() == 0;
+    }
+
     /// The registry key matching specifier `spec`: an exact `declare module`
     /// name, else a wildcard pattern (`declare module "*.css"`, M11c). Returns
     /// null when no ambient module covers the specifier.
@@ -1139,6 +1150,10 @@ const Linker = struct {
                     .namespace => {
                         if (mfile_opt) |mfile| {
                             tgt = .{ .kind = .namespace, .file = mfile, .type_only = rec.type_only };
+                        } else if (l.ambientOpaque(rec.module)) {
+                            // Opaque ambient module: `import * as p` is `any`,
+                            // so member access doesn't spuriously TS2339.
+                            tgt = .{ .kind = .any };
                         } else if (l.ambientKey(rec.module)) |key| {
                             tgt = .{ .kind = .ambient_ns, .payload = @intCast(l.ambient.getIndex(key).?), .type_only = rec.type_only };
                         }
@@ -1150,6 +1165,10 @@ const Linker = struct {
                         if (found) |ff| {
                             tgt = ff;
                             tgt.type_only = tgt.type_only or rec.type_only;
+                        } else if (mfile_opt == null and l.ambientOpaque(rec.module)) {
+                            // Out-of-subset ambient module (export= / auto-export):
+                            // degrade to `any`, no spurious TS2305.
+                            tgt = .{ .kind = .any };
                         } else {
                             try l.diag(file, 2305, l.nodeSpan(file, rec.node), "Module '\"{s}\"' has no exported member '{s}'.", .{
                                 l.atomText(rec.module), l.atomText(rec.imported),
@@ -1163,6 +1182,10 @@ const Linker = struct {
                         if (found) |ff| {
                             tgt = ff;
                             tgt.type_only = tgt.type_only or rec.type_only;
+                        } else if (mfile_opt == null and l.ambientOpaque(rec.module)) {
+                            // `export =`-shaped ambient module: the CommonJS
+                            // export-assignment *is* the default under interop.
+                            tgt = .{ .kind = .any };
                         } else if ((mfile_opt != null and (try l.lookupExport(mfile_opt.?, rec.local, 0)) != null) or
                             l.lookupAmbient(rec.module, rec.local) != null)
                         {

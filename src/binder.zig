@@ -2662,15 +2662,39 @@ const Binder = struct {
         // Global contributions (M11a): a module offers its `declare global`
         // block members; a script/the lib offers its whole file scope. Both
         // segments are already sorted by atom, so we reference the subslice.
+        // A script/the lib offers its whole file scope; every file (module or
+        // script) also offers every `declare global {}` / bare `global {}`
+        // block, whose members land in `global_scope`. Real `@types/node`
+        // declares `namespace NodeJS` inside bare `global {}` blocks nested in
+        // `declare module "process"`/`"timers"` — files that are *scripts*
+        // (no top-level import/export), so their `global_scope` must merge in
+        // too, not just `file_scope`. Contribute both segments.
         const is_module = b.saw_module_syntax;
         var global_atoms: []const Atom = &.{};
         var global_syms: []const SymbolId = &.{};
-        if (!is_module or b.global_scope != 0) {
-            const gscope: ScopeId = if (is_module) b.global_scope else file_scope;
-            const glo = members_start[gscope];
-            const ghi = members_start[gscope + 1];
-            global_atoms = member_atoms[glo..ghi];
-            global_syms = member_syms[glo..ghi];
+        {
+            const flo = if (!is_module) members_start[file_scope] else 0;
+            const fhi = if (!is_module) members_start[file_scope + 1] else 0;
+            const glo = if (b.global_scope != 0) members_start[b.global_scope] else 0;
+            const ghi = if (b.global_scope != 0) members_start[b.global_scope + 1] else 0;
+            const fn_ = fhi - flo;
+            const gn_ = ghi - glo;
+            if (gn_ == 0) {
+                global_atoms = member_atoms[flo..fhi];
+                global_syms = member_syms[flo..fhi];
+            } else if (fn_ == 0) {
+                global_atoms = member_atoms[glo..ghi];
+                global_syms = member_syms[glo..ghi];
+            } else {
+                const ca = try arena.alloc(Atom, fn_ + gn_);
+                const cs = try arena.alloc(SymbolId, fn_ + gn_);
+                @memcpy(ca[0..fn_], member_atoms[flo..fhi]);
+                @memcpy(ca[fn_..], member_atoms[glo..ghi]);
+                @memcpy(cs[0..fn_], member_syms[flo..fhi]);
+                @memcpy(cs[fn_..], member_syms[glo..ghi]);
+                global_atoms = ca;
+                global_syms = cs;
+            }
         }
 
         const msp = try sealPairMap(arena, b.scratch, &b.member_scopes);
