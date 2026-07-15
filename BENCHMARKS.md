@@ -637,6 +637,40 @@ the interned lib surface is tiny, so the same data pattern may retire it too;
 if the isolated lib parse/bind cost at startup is negligible, M19 closes as
 "19.1 landed, pieces 2–3 measured out" and work moves to M20. See ROADMAP §5.
 
+## 3.16 M19.3 gate — cold-start lib cost: measured out (blob not built)
+
+Before implementing the pre-parsed lib blob (M19 piece 3), the roadmap gated
+it on measuring what cold-start lib processing actually costs — the base build
+is sub-ms and the interned lib surface is tiny, so the same data pattern that
+retired §3.15 might retire this. It does.
+
+Isolated with `--timing` + `--noLib` on a trivial 1-file project (`const x =
+1;`), where the embedded lib front end dominates cold start (the run loads 2
+files / 12,172 lines — all but one line is the lib). Medians of 7,
+ReleaseFast:
+
+| run | total wall (internal `--timing`) |
+|---|---:|
+| trivial file **with lib** | **8.68 ms** |
+| trivial file **`--noLib`** | **0.24 ms** |
+| ⇒ entire lib cost (load+scan+parse+bind+check) | **≈ 8.4 ms** |
+
+Phase split of the with-lib run: load ~0.3 ms, **scan ~0.5–1.0 ms + parse
+~0.9–1.6 ms + bind ~0.9–1.7 ms = the ~2–4 ms front end the blob would
+eliminate**, then check ~5 ms (the checker expanding lib types lazily — *not*
+eliminated by a blob; piece 2's base was reverted). The **whole process wall**
+(`/usr/bin/time -p` on the binary: exec + dynamic link + all internal work) is
+**0.00 s — below the 10 ms measurement resolution**.
+
+So the blob's realizable saving is **2–4 ms of lib front end**, which is (a)
+below the process-wall resolution, and (b) dwarfed by the tens of ms of
+`bunx`/`npx` resolution + runtime launch that sit *upstream* of the ztsc
+binary on the very `bunx ztsc` path the blob was meant to speed up. Against
+that, a build.zig serialization step, a versioned flat-array `@embedFile`, and
+seed-version staleness checks are real, permanent complexity for an invisible
+win. **Measured out — not built.** M19 closes: 19.1 landed, 19.2 and 19.3
+measured out. Next: M20.
+
 ---
 
 ## 4. Cross-checking correctness while benchmarking

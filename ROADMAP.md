@@ -248,7 +248,8 @@ them.)
 
 ## 5. The road to the public v0.0.1
 
-M11–M18 are done (per-milestone records below). **Three remain: M19–M21.**
+M11–M18 are done (per-milestone records below). **M19 is closed (19.1 landed;
+19.2/19.3 measured out — see §M19). Two remain: M20–M21.**
 The numbering has moved twice:
 
 - **2026-07-13** — linear renumbering after the backend-first decision
@@ -1662,7 +1663,7 @@ every item (differential, as always); wall/RSS re-measured and recorded —
 regressions from the bigger lib are accepted *only* as the explicit,
 written-down input to M19.
 
-### M19 — Substrate payload (completes M14.5): display order → frozen store → lib blob
+### M19 — Substrate payload (completes M14.5): display order → frozen store → lib blob  ✅ CLOSED (19.1 landed; 19.2/19.3 measured out, 2026-07-15)
 
 Context: M14.5 landed the frozen-base/overlay **architecture** (the
 TypeId split, `initOverlay`, `buildBaseStore`, the `--no-frozen-store`
@@ -1751,24 +1752,29 @@ pieces, in dependency order:
    was **already retired by BENCHMARKS §3.13 (M18.2)**: lazy expansion interns
    only the touched lib surface, RSS sits at **~26% of tsgo (gate ≤50% holds
    comfortably)**. Full table and rationale in **BENCHMARKS §3.15**.
-3. **Pre-parsed embedded lib blob** (was M12.2 / M14.5 piece 1) — **GATED ON
-   MEASUREMENT (2026-07-15).** Before building this: the base build is already
-   sub-ms and the lib surface interned at startup is tiny, so the same data
-   pattern that retired piece 2 may retire this. **First measure what
-   cold-start lib processing actually costs** (parse/bind of the embedded lib
-   `.d.ts` at startup, isolated); only build the blob if that cost is
-   non-negligible against total cold start. If it isn't, close M19 as "19.1
-   landed, pieces 2–3 measured out" and move to M20. The design, if it *is*
-   warranted: a
-   build.zig step runs ztsc's own front end over the embedded lib and
-   `@embedFile`s the sealed tokens/AST/binder products (flat `u32`
-   arrays, no pointers — trivially serializable); startup loads
-   exact-size or zero-copy instead of parsing+binding — near-zero cold
-   start for `bunx ztsc` on small projects, where lib front-end would
-   otherwise dominate. Depends on M12.1's seeded deterministic atoms
-   (landed): the blob bakes atom values, so the seeded lib-atom prefix
-   must stay the contiguous versioned range the layout commitments
-   describe, with the seed-table version tag rejecting a stale blob.
+3. ⛔ **MEASURED OUT (2026-07-15) — not built.** **Pre-parsed embedded lib
+   blob** (was M12.2 / M14.5 piece 1). Gated on a cold-start measurement
+   before any implementation; the measurement retired it. Isolated via
+   `--timing` + `--noLib` on a trivial 1-file project (where the lib front end
+   dominates cold start): **entire lib cost ≈ 8.4 ms** (WITH-lib total
+   8.68 ms − `--noLib` 0.24 ms), of which the blob would eliminate only the
+   **front end** (lib scan+parse+bind ≈ **2–4 ms**) — not the ~5 ms of lib
+   *checking* (the checker still expands lib types lazily; piece 2's base was
+   reverted). The **whole process wall** (exec + dynamic link + all internal
+   work) is **below `/usr/bin/time`'s 10 ms resolution**, and `bunx`/`npx`
+   resolution + runtime launch adds tens of ms *upstream* of the binary. So a
+   build.zig serialization step + versioned flat-array `@embedFile` +
+   staleness/seed-version checks — real complexity — would save 2–4 ms that is
+   invisible at the process level and dwarfed by launch overhead. The same
+   lazy/small-lib data pattern that retired piece 2 retires piece 3. Design is
+   preserved in git history (this entry) if a future scenario changes the
+   economics: a build.zig step runs ztsc's own front end over the embedded lib
+   and `@embedFile`s the sealed tokens/AST/binder products (flat `u32` arrays,
+   no pointers — trivially serializable), startup loading them instead of
+   parsing; depends on M12.1's seeded deterministic atoms (the blob bakes atom
+   values, so the seeded lib-atom prefix must stay the contiguous versioned
+   range the layout commitments describe, with a seed-table version tag
+   rejecting a stale blob). See BENCHMARKS §3.16.
 
 **Gate (revised 2026-07-15):** the original memory gate — peak RSS at N=4
 within a small constant of N=1, ≤50% of tsgo — **is already met** (~26% of
@@ -1776,11 +1782,13 @@ tsgo on the real-lib configuration, BENCHMARKS §3.13/§3.15), so M19's
 substrate pieces are no longer load-bearing for the release gate. What
 remains binding: (a) the **byte-identical** invariant (any `--checkers` N,
 both cache oracles on/off, conformance + real corpus) — held by M19.1 and
-re-proven by the M19.2 oracle; (b) the piece-3 **cold-start measurement**
-before any blob work; (c) **wall/RSS vs tsgo re-measured** at M21. The
-"fix RSS here or nowhere" framing is retired — there is no RSS shortfall to
-fix. **Net M19 status: 19.1 landed; 19.2 measured out and reverted; 19.3
-gated on the cold-start measurement (likely also measured out).**
+re-proven by the M19.2 oracle; (b) **wall/RSS vs tsgo re-measured**
+at M21. The "fix RSS here or nowhere" framing is retired — there is no RSS
+shortfall to fix. **Net M19 status (CLOSED 2026-07-15): 19.1 landed
+(structural display order); 19.2 built, verified, measured out and reverted
+(frozen-base payload — no RSS win); 19.3 measured out, not built (lib blob —
+~2–4 ms front-end saving, sub-process-resolution). Pieces 2–3 measured out;
+proceed to M20.**
 
 ### M20 — Pre-publish polish: license, error output, README, docs cleanup
 
