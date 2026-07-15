@@ -1,21 +1,30 @@
 #!/usr/bin/env node
-// Assembles src/lib/lib.esnext.d.ts — ztsc's embedded default lib — from a
-// pinned TypeScript package's lib/ directory (M18.2 originally by hand from
-// tsc 5.5.4; scripted for the TS 7.0.2 oracle migration so the next upgrade
-// is mechanical).
+// Assembles ztsc's embedded default libs from a pinned TypeScript package's
+// lib/ directory (M18.2 originally by hand from tsc 5.5.4; scripted for the
+// TS 7.0.2 oracle migration so the next upgrade is mechanical; extended in
+// M21 to also emit the DOM lib so tsconfig `lib` selection is real).
 //
 //   node src/lib/gen_lib.js <typescript-lib-dir>
 //   node src/lib/gen_lib.js bench/baselines/tsgo/node_modules/@typescript/typescript-darwin-arm64/lib
 //
-// Walks the `/// <reference lib="..." />` chain rooted at lib.esnext.d.ts
-// depth-first (deps before dependents — the same deps-first order the header
-// documents), excluding the DOM / webworker / scripthost families (ztsc is
-// backend-first; tsconfig `lib` selection is post-v0.0.1), concatenates the
-// files under `//========== lib.X.d.ts ==========` section markers with the
-// upstream copyright headers retained, and appends ztsc's minimal `console`
-// shim (`console` lives in lib.dom, not the ES chain; the conformance harness
-// gives the oracle lib.dom purely for `console`, so both sides must resolve
-// it — see src/modules.zig).
+// Emits three files next to this script, all @embedFile'd by src/modules.zig:
+//
+//   lib.esnext.d.ts   the `/// <reference lib="..." />` chain rooted at
+//                     lib.esnext.d.ts (deps-first), EXCLUDING the DOM /
+//                     webworker / scripthost families. This is the ES-core
+//                     surface; always loaded unless --noLib / lib:[].
+//   lib.dom.d.ts      the DOM chain (lib.dom + lib.dom.iterable +
+//                     lib.dom.asynciterable, deps-first), EXCLUDING its es*
+//                     reference deps (lib.dom references es2015 /
+//                     es2018.asynciterable, both already in the esnext blob —
+//                     DOM is only ever loaded alongside esnext). Provides the
+//                     browser globals plus the real `console` (a `Console`).
+//   lib.console.d.ts  a minimal `console` shim, loaded ONLY when esnext is
+//                     selected WITHOUT dom (e.g. lib:["esnext"], the backend
+//                     configuration): `console` lives in lib.dom, not the ES
+//                     chain, so without DOM there is no `console` at all. When
+//                     DOM is present its richer `Console` is used and this shim
+//                     is not loaded (avoids a duplicate `var console`).
 "use strict";
 const fs = require("fs");
 const path = require("path");
@@ -25,7 +34,6 @@ if (!libDir || !fs.existsSync(path.join(libDir, "lib.esnext.d.ts"))) {
   console.error("usage: gen_lib.js <typescript-lib-dir>  (must contain lib.esnext.d.ts)");
   process.exit(2);
 }
-const outPath = path.join(__dirname, "lib.esnext.d.ts");
 
 // Version of the source package, for the provenance header.
 function findVersion(dir) {
@@ -43,6 +51,7 @@ function findVersion(dir) {
 const provenance = findVersion(libDir);
 
 const EXCLUDE = /^(dom|webworker|scripthost)($|\.)/;
+const DOM_ONLY = /^dom($|\.)/;
 
 // Per-file transforms applied before concatenation.
 //
@@ -85,49 +94,102 @@ const TRANSFORMS = {
   },
 };
 
-const order = []; // lib names, deps-first
-const seen = new Set();
-function visit(name) {
-  if (seen.has(name)) return;
-  seen.add(name);
-  if (EXCLUDE.test(name)) return;
-  const file = path.join(libDir, `lib.${name}.d.ts`);
-  const text = fs.readFileSync(file, "utf8");
-  for (const m of text.matchAll(/^\/\/\/\s*<reference\s+lib="([^"]+)"\s*\/>/gm)) {
-    visit(m[1]);
+// Walk the `/// <reference lib="..." />` chain from `roots` depth-first
+// (deps before dependents), keeping only files that pass `keep` and are not
+// excluded outright. Returns lib names in deps-first order.
+function chain(roots, keep) {
+  const order = [];
+  const seen = new Set();
+  function visit(name) {
+    if (seen.has(name)) return;
+    seen.add(name);
+    const file = path.join(libDir, `lib.${name}.d.ts`);
+    const text = fs.readFileSync(file, "utf8");
+    for (const m of text.matchAll(/^\/\/\/\s*<reference\s+lib="([^"]+)"\s*\/>/gm)) {
+      visit(m[1]);
+    }
+    if (keep(name)) order.push(name);
   }
-  order.push(name);
+  for (const r of roots) visit(r);
+  return order;
 }
-visit("esnext");
 
-let out = `// ZTSC embedded lib — real TypeScript ES-core..esnext surface (M18.2).
+function concat(order) {
+  let out = "";
+  for (const name of order) {
+    const fname = `lib.${name}.d.ts`;
+    out += `\n//========== ${fname} ==========\n`;
+    let text = fs.readFileSync(path.join(libDir, fname), "utf8");
+    if (TRANSFORMS[name]) text = TRANSFORMS[name](text);
+    out += text;
+  }
+  return out;
+}
+
+function write(name, header, body) {
+  const p = path.join(__dirname, name);
+  fs.writeFileSync(p, header + body);
+  console.log(`wrote ${p}: ${(header + body).length} bytes`);
+}
+
+// --- esnext (ES-core) blob -------------------------------------------------
+const esOrder = chain(["esnext"], (n) => !EXCLUDE.test(n));
+write(
+  "lib.esnext.d.ts",
+  `// ZTSC embedded ES-core lib — real TypeScript ES-core..esnext surface.
 // Assembled from ${provenance} by src/lib/gen_lib.js — do not edit by hand.
 //
 // Concatenation of the lib.*.d.ts reference chain rooted at lib.esnext.d.ts
-// (${order.length} files, deps-first), with DOM / webworker / scripthost libs excluded
-// (ztsc is backend-first; tsconfig \`lib\` selection is post-v0.0.1). This is
-// the same pinned TypeScript version as the differential oracle, so ztsc and
-// the oracle see equivalent globals.
+// (${esOrder.length} files, deps-first), with DOM / webworker / scripthost libs excluded
+// (those ship as lib.dom.d.ts, loaded via tsconfig \`lib\`). Same pinned
+// TypeScript version as the differential oracle, so ztsc and the oracle see
+// equivalent globals.
 //
-// A minimal \`console\` shim is appended at the end: \`console\` lives in
-// lib.dom (not esnext), and the conformance harness gives the oracle lib.dom
-// purely for \`console\` — so both sides must resolve it. See src/modules.zig.
+// \`console\` is NOT here: it lives in lib.dom. Backend configs (lib:["esnext"])
+// get the minimal shim in lib.console.d.ts; DOM configs get lib.dom's Console.
 //
 // lib.es2025.iterator.d.ts (upstream a module: \`export {}\` + \`declare
 // global\`) is rewritten to plain script globals during assembly — see the
 // transform note in gen_lib.js.
-`;
+`,
+  concat(esOrder),
+);
 
-for (const name of order) {
-  const fname = `lib.${name}.d.ts`;
-  out += `\n//========== ${fname} ==========\n`;
-  let text = fs.readFileSync(path.join(libDir, fname), "utf8");
-  if (TRANSFORMS[name]) text = TRANSFORMS[name](text);
-  out += text;
-}
+// --- DOM blob --------------------------------------------------------------
+// DOM chain, keeping only the dom.* files (their es* reference deps are
+// already in the esnext blob, which DOM is always loaded alongside).
+const domOrder = chain(
+  ["dom", "dom.iterable", "dom.asynciterable"],
+  (n) => DOM_ONLY.test(n),
+);
+write(
+  "lib.dom.d.ts",
+  `// ZTSC embedded DOM lib — real TypeScript DOM surface (browser globals).
+// Assembled from ${provenance} by src/lib/gen_lib.js — do not edit by hand.
+//
+// Concatenation of the lib.dom.d.ts chain (${domOrder.length} files, deps-first): the
+// browser DOM globals (document, HTMLElement, Response, fetch, URLSearchParams,
+// event types, …) plus the real \`console\` (a \`Console\`). The chain's es*
+// reference deps (es2015 / es2018.asynciterable) are omitted: DOM is only ever
+// loaded together with the esnext blob, which already provides them.
+//
+// Loaded when tsconfig \`lib\` includes "dom" (or by default, matching tsgo's
+// target-esnext default which includes DOM). See src/modules.zig LibSet.
+`,
+  concat(domOrder),
+);
 
-out += `
-//========== ztsc console shim (backend \`console\`, not from DOM) ==========
+// --- console shim ----------------------------------------------------------
+write(
+  "lib.console.d.ts",
+  `// ZTSC console shim — backend \`console\` (not from DOM).
+// Generated by src/lib/gen_lib.js — do not edit by hand.
+//
+// \`console\` lives in lib.dom, not the ES chain. Loaded ONLY when esnext is
+// selected without dom (lib:["esnext"]); DOM configs use lib.dom's richer
+// \`Console\` instead, so this shim is not loaded then (no duplicate var).
+`,
+  `
 declare var console: {
     log(...data: any[]): void;
     error(...data: any[]): void;
@@ -135,7 +197,5 @@ declare var console: {
     info(...data: any[]): void;
     debug(...data: any[]): void;
 };
-`;
-
-fs.writeFileSync(outPath, out);
-console.log(`wrote ${outPath}: ${order.length} lib files + console shim, ${out.length} bytes (${provenance})`);
+`,
+);

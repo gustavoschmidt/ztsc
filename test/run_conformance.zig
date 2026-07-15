@@ -136,7 +136,13 @@ fn runCase(alloc: std.mem.Allocator, io: Io, gpa: std.mem.Allocator, interner: *
     // Single-file cases run against the injected ES-core lib (file 0), just
     // like the CLI. Only the case file (id 1) is owned/reported.
     const prog = try alloc.create(modules.Program);
-    prog.* = try modules.singleWithLibProgram(alloc, io, gpa, interner, "", src, tree, bound, false);
+    // Single-file cases use the ES-core lib + console shim. The harness checks
+    // them with `--lib esnext,dom`, but the console shim is the only DOM surface
+    // any single-file case needs (DOM-globals cases live in the `lib_dom/`
+    // directory cases, which carry an explicit tsconfig `lib`); loading the
+    // 2.35 MB DOM blob for all ~340 single-file cases would balloon the suite
+    // for zero behavioral gain.
+    prog.* = try modules.singleWithLibProgram(alloc, io, gpa, interner, "", src, tree, bound, .es_only);
     const owned = try alloc.alloc(modules.FileId, 1);
     owned[0] = @intCast(prog.files.len - 1);
     // Exercise the shared frozen base type store (M14.5), like the CLI default.
@@ -162,6 +168,25 @@ fn runCase(alloc: std.mem.Allocator, io: Io, gpa: std.mem.Allocator, interner: *
     return out;
 }
 
+/// The lib blob selection for a directory case: `compilerOptions.lib` from a
+/// case-local tsconfig.json (mapped like the CLI), or the ES-core + console
+/// shim default when the case has no tsconfig.
+fn dirCaseLibSet(alloc: std.mem.Allocator, io: Io, conf_dir: Io.Dir, case_rel: []const u8) !modules.LibSet {
+    const cfg_path = try std.fmt.allocPrint(alloc, "{s}/tsconfig.json", .{case_rel});
+    const text = conf_dir.readFileAlloc(io, cfg_path, alloc, .limited(1 << 20)) catch return .es_only;
+    const root = ztsc.tsconfig.parseJsonc(alloc, text) catch return .es_only;
+    if (root != .object) return .es_only;
+    const co = root.object.get("compilerOptions") orelse return .es_only;
+    if (co != .object) return .es_only;
+    const lib_val = co.object.get("lib") orelse return .es_only;
+    if (lib_val != .array) return .es_only;
+    var libs: std.ArrayList([]const u8) = .empty;
+    for (lib_val.array) |item| {
+        if (item == .string) try libs.append(alloc, item.string);
+    }
+    return modules.resolveLibSet(libs.items);
+}
+
 /// Run the full multi-file pipeline on a directory case: discover from
 /// entry.ts, link, check (single checker instance owns all files).
 /// Returned file names are relative to the case directory.
@@ -177,7 +202,14 @@ fn runDirCase(
     errdefer out.deinit(alloc);
 
     const entry = try std.fmt.allocPrint(alloc, "{s}/entry.ts", .{case_rel});
-    const br = try modules.buildProgram(alloc, io, gpa, interner, conf_dir, &.{entry}, false);
+    // A case may carry its own tsconfig.json with a `lib` field (e.g. the
+    // lib_dom cases toggling dom on/off); that selects the built-in lib blobs,
+    // exactly like the harness passes the same `lib` to tsgo. Absent a
+    // tsconfig, use the ES-core lib + console shim (the harness default set is
+    // esnext,dom, but the shim covers the only DOM surface non-lib_dom cases
+    // touch — see runCase).
+    const lib_set = try dirCaseLibSet(alloc, io, conf_dir, case_rel);
+    const br = try modules.buildProgram(alloc, io, gpa, interner, conf_dir, &.{entry}, lib_set);
     const prog = &br.program;
 
     const owned = try alloc.alloc(modules.FileId, prog.files.len);
@@ -187,12 +219,13 @@ fn runDirCase(
     const result = try checker.checkFiles(alloc, io, gpa, interner, prog, owned, base, true);
 
     for (prog.files, 0..) |*pf, i| {
-        // Skip the injected lib (file 0): tsc does not diagnose the default
-        // lib, and neither does the CLI (main.zig print loop). The vendored
-        // real 7.0.2 lib is census-clean but trips a few ztsc-incompleteness
-        // diagnostics; suppress them here too so multi-file snapshots stay a
-        // fair user-code differential.
-        if (std.mem.eql(u8, pf.path, modules.lib_path)) continue;
+        // Skip the injected lib files (ES-core, DOM, console shim; the first
+        // files 0..): tsc does not diagnose the default lib, and neither does
+        // the CLI (main.zig print loop). The vendored real 7.0.2 libs are
+        // census-clean but trip a few ztsc-incompleteness diagnostics; suppress
+        // them here too so multi-file snapshots stay a fair user-code
+        // differential.
+        if (modules.isLibPath(pf.path)) continue;
         const rel = if (std.mem.startsWith(u8, pf.path, case_rel) and pf.path.len > case_rel.len + 1)
             pf.path[case_rel.len + 1 ..]
         else
@@ -434,7 +467,7 @@ test "determinism: diagnostics byte-identical for N = 1, 2, 4, 8 checkers" {
     defer interner.deinit(gpa);
     const alloc = arena.allocator();
 
-    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, &.{"entry.ts"}, true);
+    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, &.{"entry.ts"}, .none);
     try std.testing.expectEqual(@as(usize, 10), br.program.files.len);
 
     const ref = try renderProgramDiags(alloc, io, gpa, &interner, &br.program, 1);
@@ -496,7 +529,7 @@ test "cycle stress: N-file import ring + diamonds terminate cleanly" {
     defer interner.deinit(gpa);
     const alloc = arena.allocator();
 
-    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, &.{"entry.ts"}, true);
+    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, &.{"entry.ts"}, .none);
     try std.testing.expectEqual(@as(usize, n_ring + 3), br.program.files.len);
 
     // Clean at N=1, and byte-identical (still clean) at higher N — no
@@ -565,7 +598,7 @@ test "determinism: cross-file base cycles report identically for N = 1, 2, 4, 8"
     defer interner.deinit(gpa);
     const alloc = arena.allocator();
 
-    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, &.{"entry.d.ts"}, true);
+    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, &.{"entry.d.ts"}, .none);
 
     const ref = try renderProgramDiags(alloc, io, gpa, &interner, &br.program, 1);
     // Every interface on every cycle is reported: 2 per cluster.

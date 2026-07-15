@@ -1,15 +1,14 @@
-// ZTSC embedded lib — real TypeScript ES-core..esnext surface (M18.2).
+// ZTSC embedded ES-core lib — real TypeScript ES-core..esnext surface.
 // Assembled from @typescript/typescript-darwin-arm64@7.0.2 by src/lib/gen_lib.js — do not edit by hand.
 //
 // Concatenation of the lib.*.d.ts reference chain rooted at lib.esnext.d.ts
 // (87 files, deps-first), with DOM / webworker / scripthost libs excluded
-// (ztsc is backend-first; tsconfig `lib` selection is post-v0.0.1). This is
-// the same pinned TypeScript version as the differential oracle, so ztsc and
-// the oracle see equivalent globals.
+// (those ship as lib.dom.d.ts, loaded via tsconfig `lib`). Same pinned
+// TypeScript version as the differential oracle, so ztsc and the oracle see
+// equivalent globals.
 //
-// A minimal `console` shim is appended at the end: `console` lives in
-// lib.dom (not esnext), and the conformance harness gives the oracle lib.dom
-// purely for `console` — so both sides must resolve it. See src/modules.zig.
+// `console` is NOT here: it lives in lib.dom. Backend configs (lib:["esnext"])
+// get the minimal shim in lib.console.d.ts; DOM configs get lib.dom's Console.
 //
 // lib.es2025.iterator.d.ts (upstream a module: `export {}` + `declare
 // global`) is rewritten to plain script globals during assembly — see the
@@ -14095,12 +14094,3 @@ and limitations under the License.
 /// <reference lib="esnext.typedarrays" />
 /// <reference lib="esnext.temporal" />
 /// <reference lib="esnext.date" />
-
-//========== ztsc console shim (backend `console`, not from DOM) ==========
-declare var console: {
-    log(...data: any[]): void;
-    error(...data: any[]): void;
-    warn(...data: any[]): void;
-    info(...data: any[]): void;
-    debug(...data: any[]): void;
-};

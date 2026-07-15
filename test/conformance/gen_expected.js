@@ -83,11 +83,35 @@ function walk(dir) {
 // `--pretty false` line shape: file(line,col): error TScode: message
 const DIAG_RE = /^(.+)\((\d+),(\d+)\): error TS(\d+):/;
 
+// A directory case may carry a tsconfig.json whose `compilerOptions.lib`
+// overrides the default `esnext,dom` — this is how the lib_dom cases toggle
+// DOM on/off. Returns the OPTIONS with `--lib` replaced (everything else, incl.
+// module/bundler resolution, stays identical to every other case), or the
+// default OPTIONS when the case has no tsconfig lib. The ztsc conformance
+// runner reads the same `lib` (test/run_conformance.zig dirCaseLibSet).
+function optionsForDir(dir) {
+  const cfgPath = path.join(dir, "tsconfig.json");
+  if (!fs.existsSync(cfgPath)) return OPTIONS;
+  let lib;
+  try {
+    const co = JSON.parse(fs.readFileSync(cfgPath, "utf8")).compilerOptions;
+    if (co && Array.isArray(co.lib)) lib = co.lib.join(",");
+  } catch {
+    return OPTIONS;
+  }
+  if (!lib) return OPTIONS;
+  const out = OPTIONS.slice();
+  const at = out.indexOf("--lib");
+  if (at >= 0) out[at + 1] = lib;
+  else out.push("--lib", lib);
+  return out;
+}
+
 // All file-anchored diagnostics from one tsgo run, absolute file paths.
 // Global (file-less) errors don't match the regex and are skipped, exactly
 // as the old programmatic harness skipped diagnostics without file/start.
-function runOracle(entryAbs) {
-  const r = spawnSync(tsgo, [...OPTIONS, entryAbs], {
+function runOracle(entryAbs, opts) {
+  const r = spawnSync(tsgo, [...(opts || OPTIONS), entryAbs], {
     encoding: "utf8",
     maxBuffer: 64 * 1024 * 1024,
   });
@@ -134,7 +158,7 @@ for (const file of files) {
 
 for (const dir of dirs) {
   const base = path.resolve(dir);
-  const diags = runOracle(path.join(base, "entry.ts"))
+  const diags = runOracle(path.join(base, "entry.ts"), optionsForDir(base))
     .filter((d) => d.file.startsWith(base + path.sep));
   const rows = diags.map((d) => ({
     file: path.relative(base, d.file).split(path.sep).join("/"),

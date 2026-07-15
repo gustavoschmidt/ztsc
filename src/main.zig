@@ -63,6 +63,9 @@ const usage =
     \\  --dump-types           print per-declaration checked types (golden-test format)
     \\  --noLib                skip the built-in ES-core lib (no globals,
     \\                         no primitive/array methods; matches tsc)
+    \\  --lib=a,b,c            select built-in libs (es*, dom); overrides the
+    \\                         tsconfig 'lib' field. Default: es-core + dom
+    \\                         (matches tsgo's target-esnext default)
     \\  --workers=N            number of worker threads (default: CPU count)
     \\  --checkers=N           number of checker instances (default: min(4, CPUs))
     \\  --repeat=N             scan/parse/bind each file N times (benchmark aid)
@@ -107,6 +110,9 @@ const Cli = struct {
     verbose: bool = false,
     /// Skip lib injection (globals/primitive methods); matches tsc --noLib.
     no_lib: bool = false,
+    /// `--lib=a,b,c`: override the built-in lib selection (else the tsconfig
+    /// `lib` field, else the default ES-core + DOM). null = not specified.
+    lib: ?[]const []const u8 = null,
     /// Disable the module-resolution memo (M13) — the "before" leg of the
     /// resolution-cache benchmark; resolution then re-walks node_modules per
     /// importer. Diagnostics are identical either way.
@@ -298,8 +304,8 @@ const Worker = struct {
         const alloc = w.arena.allocator();
 
         var timer = Timer.start(io);
-        const src = if (std.mem.eql(u8, path, modules.lib_path))
-            Source.fromBytes(alloc, path, modules.lib_source) catch |err| {
+        const src = if (modules.libSourceFor(path)) |lib_bytes|
+            Source.fromBytes(alloc, path, lib_bytes) catch |err| {
                 c.err = err;
                 return;
             }
@@ -448,6 +454,9 @@ pub fn main(init: std.process.Init) !void {
     // With no file arguments, drive the run from a tsconfig.json (M6).
     var entry_paths = cli.paths;
     var paths_map: ?ztsc.tsconfig.Paths = null;
+    // The tsconfig `lib` field (null when no config / no field), consulted below
+    // to pick the built-in lib blobs.
+    var config_lib: ?[]const []const u8 = null;
     if (cli.paths.len == 0) {
         const config_path: []const u8 = blk: {
             if (cli.project) |p| {
@@ -489,7 +498,16 @@ pub fn main(init: std.process.Init) !void {
         }
         entry_paths = cfg.root_files;
         paths_map = cfg.paths;
+        config_lib = cfg.lib;
     }
+
+    // Which built-in lib blobs to inject. Precedence: --noLib wins (nothing),
+    // then an explicit --lib flag, then the tsconfig `lib` field, else the
+    // default set (ES-core + DOM — tsgo's target-esnext default includes DOM).
+    const lib_set: modules.LibSet = if (cli.no_lib)
+        .none
+    else
+        modules.resolveLibSet(cli.lib orelse config_lib);
 
     // Pretty diagnostics: tsc-style excerpts + colors; default follows the
     // terminal, --pretty / --pretty=false forces.
@@ -516,12 +534,14 @@ pub fn main(init: std.process.Init) !void {
     // discovered files immediately.
     var paths: std.ArrayList([]const u8) = .empty;
     var path_ids: std.StringHashMapUnmanaged(u32) = .empty;
-    // Inject the ES-core lib as the first entry (root, file 0) unless
-    // --noLib. Its synthetic path routes to the embedded source in the
-    // worker front end; its top-level decls become the program globals.
-    if (!cli.no_lib) {
-        try path_ids.put(arena, modules.lib_path, 0);
-        try paths.append(arena, modules.lib_path);
+    // Inject the selected built-in lib blobs as the first entries (files 0..).
+    // Their synthetic paths route to the embedded sources in the worker front
+    // end; their top-level decls become the program globals. Empty under
+    // --noLib / lib:[].
+    var lib_buf: [3]modules.LibFile = undefined;
+    for (modules.libFiles(lib_set, &lib_buf)) |lf| {
+        try path_ids.put(arena, lf.path, @intCast(paths.items.len));
+        try paths.append(arena, lf.path);
     }
     for (entry_paths) |p| {
         const norm = try modules.normalizePath(arena, p);
@@ -557,7 +577,7 @@ pub fn main(init: std.process.Init) !void {
     // M12.1 — deterministic lib atoms. Intern the lib's strings single-
     // threaded before any worker runs so the concurrent worker that binds
     // file 0 re-interns them into these stable, run-to-run-identical atoms.
-    if (!cli.no_lib) try modules.seedLibAtoms(io, gpa, &interner);
+    try modules.seedLibAtoms(io, gpa, &interner, lib_set);
 
     const discover_timer = Timer.start(io);
     for (workers) |*w| {
@@ -842,14 +862,14 @@ pub fn main(init: std.process.Init) !void {
     var node_bytes: usize = 0;
     var extra_bytes: usize = 0;
     var ast_token_bytes: usize = 0;
-    // The injected lib's own diagnostics are never reported (the print
-    // loop below skips it, matching tsc, which does not diagnose the
+    // The injected libs' own diagnostics are never reported (the print
+    // loop below skips them, matching tsc, which does not diagnose the
     // default lib), so they must not count toward the summary line or
     // the exit code either — otherwise a clean project exits 1 with
-    // nothing printed.
-    const lib_file: ?usize = for (paths.items, 0..) |p, i| {
-        if (std.mem.eql(u8, p, modules.lib_path)) break i;
-    } else null;
+    // nothing printed. There may be several lib files (ES-core, DOM, the
+    // console shim); `is_lib[i]` flags each by its synthetic path.
+    const is_lib = try arena.alloc(bool, paths.items.len);
+    for (paths.items, 0..) |p, i| is_lib[i] = modules.isLibPath(p);
 
     var parse_diags: usize = 0;
     for (trees.items, 0..) |maybe_tree, i| {
@@ -860,7 +880,7 @@ pub fn main(init: std.process.Init) !void {
         node_bytes += tree.nodeBytes();
         extra_bytes += tree.extraBytes();
         ast_token_bytes += tree.tokens.byteSize();
-        if (lib_file != i) parse_diags += tree.diagnostics.len;
+        if (!is_lib[i]) parse_diags += tree.diagnostics.len;
     }
 
     var total_symbols: usize = 0;
@@ -880,12 +900,12 @@ pub fn main(init: std.process.Init) !void {
         bind_scope_bytes += b.scopeBytes();
         bind_flow_bytes += b.flowBytes();
         bind_record_bytes += b.recordBytes();
-        if (lib_file != i) bind_diags += b.diagnostics.len;
+        if (!is_lib[i]) bind_diags += b.diagnostics.len;
     }
 
     var link_diags: usize = 0;
     for (links, 0..) |*l, i| {
-        if (lib_file != i) link_diags += l.diags.len;
+        if (!is_lib[i]) link_diags += l.diags.len;
     }
 
     var check_diags: usize = 0;
@@ -905,7 +925,7 @@ pub fn main(init: std.process.Init) !void {
     for (tasks) |*t| {
         const ck = t.result orelse continue;
         for (ck.diagnostics) |d| {
-            if (lib_file != @as(usize, d.file)) check_diags += 1;
+            if (!is_lib[d.file]) check_diags += 1;
         }
         check_types += ck.stats.types_created;
         check_type_bytes += ck.stats.type_bytes;
@@ -964,8 +984,8 @@ pub fn main(init: std.process.Init) !void {
         // members); those degrade the affected lib types to `any` rather than
         // leaking spurious errors onto every user run. Diagnostic cursor for
         // the lib's owning checker is still advanced below so later files stay
-        // aligned. The lib is only present as file 0 (see the injection site).
-        if (std.mem.eql(u8, path, modules.lib_path)) {
+        // aligned. Libs are the first files 0.. (see the injection site).
+        if (modules.isLibPath(path)) {
             const owner = file_owner[i];
             if (tasks[owner].result) |ck| {
                 var cur = cursors[owner];
@@ -1445,6 +1465,14 @@ fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8, bad_arg: *[]c
             cli.verbose = true;
         } else if (std.mem.eql(u8, arg, "--noLib")) {
             cli.no_lib = true;
+        } else if (std.mem.startsWith(u8, arg, "--lib=")) {
+            var list: std.ArrayList([]const u8) = .empty;
+            var it = std.mem.splitScalar(u8, arg["--lib=".len..], ',');
+            while (it.next()) |name| {
+                const t = std.mem.trim(u8, name, " \t");
+                if (t.len > 0) try list.append(arena, t);
+            }
+            cli.lib = try list.toOwnedSlice(arena);
         } else if (std.mem.eql(u8, arg, "--no-resolve-cache")) {
             cli.no_resolve_cache = true;
         } else if (std.mem.eql(u8, arg, "--no-frozen-store")) {

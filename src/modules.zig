@@ -61,12 +61,107 @@ pub const no_file: FileId = std.math.maxInt(FileId);
 /// location; the loaders special-case this exact path and use `lib_source`.
 /// The leading NUL keeps it from colliding with any real filesystem path.
 pub const lib_path = "\x00lib/lib.esnext.d.ts";
-/// The embedded lib text (see `src/lib/lib.esnext.d.ts`, M18.2 — the real
-/// TypeScript 7.0.2 ES-core..esnext surface, DOM excluded, plus a minimal
-/// `console` shim). Bound once per run; its top-level declarations become the
-/// program's global symbols. Its own diagnostics are suppressed (like tsc's
-/// default lib) — see the print loop in main.zig.
+/// The embedded ES-core lib text (see `src/lib/lib.esnext.d.ts`, M18.2 — the
+/// real TypeScript 7.0.2 ES-core..esnext surface, DOM excluded). Bound once per
+/// run; its top-level declarations become the program's global symbols. Its own
+/// diagnostics are suppressed (like tsc's default lib) — see the print loop in
+/// main.zig.
 pub const lib_source = @embedFile("lib/lib.esnext.d.ts");
+
+/// Synthetic path of the injected DOM lib (M21). Loaded as an additional lib
+/// file when tsconfig `lib` selects "dom" (or by default — tsgo's target-esnext
+/// default includes DOM). Provides browser globals plus the real `console`.
+pub const dom_lib_path = "\x00lib/lib.dom.d.ts";
+/// The embedded DOM lib text (browser globals + `Console`; es* deps omitted,
+/// supplied by the esnext blob it always loads alongside).
+pub const dom_lib_source = @embedFile("lib/lib.dom.d.ts");
+
+/// Synthetic path of the minimal `console` shim (M21). Loaded ONLY when esnext
+/// is selected without dom (backend configs, lib:["esnext"]): `console` lives
+/// in lib.dom, so without DOM there is no `console`. DOM configs use lib.dom's
+/// richer `Console` and skip this (no duplicate `var console`).
+pub const console_shim_path = "\x00lib/lib.console.d.ts";
+pub const console_shim_source = @embedFile("lib/lib.console.d.ts");
+
+/// Which built-in lib blobs to inject. Derived from tsconfig `lib` (or the
+/// default) by `resolveLibSet`; consumed by `libFiles`, `seedLibAtoms`,
+/// `buildProgram`, and the CLI injection site. `dom` always implies `es`
+/// (lib.dom references es2015 / es2018.asynciterable, both in the esnext blob),
+/// and `shim` (the console shim) is present exactly when `es and !dom`.
+pub const LibSet = struct {
+    es: bool = false,
+    dom: bool = false,
+    shim: bool = false,
+
+    /// No libs at all — `--noLib` / `lib:[]`.
+    pub const none: LibSet = .{};
+    /// The tsgo default (no `lib` field, target esnext): ES-core + DOM.
+    pub const default: LibSet = .{ .es = true, .dom = true };
+    /// Backend config: ES-core + the console shim, no DOM.
+    pub const es_only: LibSet = .{ .es = true, .shim = true };
+
+    pub fn any(s: LibSet) bool {
+        return s.es or s.dom or s.shim;
+    }
+};
+
+/// One synthetic lib file (path + embedded source).
+pub const LibFile = struct { path: []const u8, source: []const u8 };
+
+/// Fill `buf` with the ordered synthetic lib files for `set`. Order is fixed
+/// (esnext, dom, console shim) so that seeded atoms (`seedLibAtoms`) and the
+/// injected file ids agree run-to-run — the determinism the seeded interner
+/// relies on. Returns the populated prefix of `buf`.
+pub fn libFiles(set: LibSet, buf: *[3]LibFile) []const LibFile {
+    var n: usize = 0;
+    if (set.es) {
+        buf[n] = .{ .path = lib_path, .source = lib_source };
+        n += 1;
+    }
+    if (set.dom) {
+        buf[n] = .{ .path = dom_lib_path, .source = dom_lib_source };
+        n += 1;
+    }
+    if (set.shim) {
+        buf[n] = .{ .path = console_shim_path, .source = console_shim_source };
+        n += 1;
+    }
+    return buf[0..n];
+}
+
+/// Embedded source for a synthetic lib path, or null for a real file path.
+pub fn libSourceFor(path: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, path, lib_path)) return lib_source;
+    if (std.mem.eql(u8, path, dom_lib_path)) return dom_lib_source;
+    if (std.mem.eql(u8, path, console_shim_path)) return console_shim_source;
+    return null;
+}
+
+/// True for any injected built-in lib path (diagnostics/stat suppression).
+pub fn isLibPath(path: []const u8) bool {
+    return libSourceFor(path) != null;
+}
+
+/// Resolve a tsconfig `lib` list (or null = not specified) to the blob set.
+/// tsc semantics: a `lib` list REPLACES the default set. We map any `es*`
+/// token to the ES-core blob and any `dom*` token to the DOM blob; other
+/// families (webworker/scripthost) are out of subset and ignored (warned at
+/// tsconfig parse). `dom` forces `es` on (its reference deps live in the es
+/// blob); the console shim fills in when es is selected without dom.
+pub fn resolveLibSet(lib: ?[]const []const u8) LibSet {
+    const list = lib orelse return LibSet.default;
+    var es = false;
+    var dom = false;
+    for (list) |name| {
+        if (std.ascii.startsWithIgnoreCase(name, "dom")) {
+            dom = true;
+        } else if (std.ascii.startsWithIgnoreCase(name, "es")) {
+            es = true;
+        }
+    }
+    if (dom) es = true;
+    return .{ .es = es, .dom = dom, .shim = es and !dom };
+}
 
 /// The final resolution of an imported/exported name.
 pub const Target = struct {
@@ -322,14 +417,17 @@ pub fn computeSymBase(alloc: Allocator, files: []const ProgFile) Error![]u32 {
 /// (`stripQuotes`, well-known-symbol keys, the "default"/"*" constants).
 /// The parse/bind products are thrown away; only their interner side effects
 /// (which are idempotent) survive. Cheap: the lib is ~9 KB.
-pub fn seedLibAtoms(io: Io, gpa: Allocator, interner: *Interner) !void {
-    var seed_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer seed_arena.deinit();
-    const sa = seed_arena.allocator();
-    const lib_tree = try parser.parse(sa, lib_source);
-    _ = try binder.bind(sa, io, gpa, interner, &lib_tree, lib_source);
-    // The lib file's own path atom is interned by the worker front end too.
-    _ = try interner.intern(io, gpa, lib_path);
+pub fn seedLibAtoms(io: Io, gpa: Allocator, interner: *Interner, set: LibSet) !void {
+    var buf: [3]LibFile = undefined;
+    for (libFiles(set, &buf)) |lf| {
+        var seed_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer seed_arena.deinit();
+        const sa = seed_arena.allocator();
+        const lib_tree = try parser.parse(sa, lf.source);
+        _ = try binder.bind(sa, io, gpa, interner, &lib_tree, lf.source);
+        // Each lib file's own path atom is interned by the worker front end too.
+        _ = try interner.intern(io, gpa, lf.path);
+    }
 }
 
 /// FileId of the injected lib file (matched by its synthetic path), or
@@ -538,11 +636,11 @@ pub fn singleFileProgram(
     return .{ .files = files, .sym_base = try computeSymBase(alloc, files) };
 }
 
-/// Build a program of the injected lib (file 0) plus one already-bound
-/// source file (file 1), with the lib's globals collected. Used by the
+/// Build a program of the selected lib blobs (files 0..) plus one already-bound
+/// source file (last file), with the libs' globals collected. Used by the
 /// single-file test/conformance path so those cases see the same globals
-/// and primitive/array methods the CLI provides. `no_lib` reproduces the
-/// legacy lib-free single-file program.
+/// and primitive/array methods the CLI provides. An empty `lib_set` reproduces
+/// the legacy lib-free single-file program.
 pub fn singleWithLibProgram(
     arena: Allocator,
     io: Io,
@@ -552,16 +650,20 @@ pub fn singleWithLibProgram(
     src: []const u8,
     tree: *const Ast,
     bind: *const Bind,
-    no_lib: bool,
+    lib_set: LibSet,
 ) !Program {
-    if (no_lib) return singleFileProgram(arena, path, src, tree, bind);
-    const lib_tree = try arena.create(Ast);
-    lib_tree.* = try parser.parse(arena, lib_source);
-    const lib_bind = try arena.create(Bind);
-    lib_bind.* = try binder.bind(arena, io, gpa, interner, lib_tree, lib_source);
-    const files = try arena.alloc(ProgFile, 2);
-    files[0] = .{ .path = lib_path, .src = lib_source, .tree = lib_tree, .bind = lib_bind };
-    files[1] = .{ .path = path, .src = src, .tree = tree, .bind = bind };
+    if (!lib_set.any()) return singleFileProgram(arena, path, src, tree, bind);
+    var buf: [3]LibFile = undefined;
+    const lib_list = libFiles(lib_set, &buf);
+    const files = try arena.alloc(ProgFile, lib_list.len + 1);
+    for (lib_list, 0..) |lf, i| {
+        const lib_tree = try arena.create(Ast);
+        lib_tree.* = try parser.parse(arena, lf.source);
+        const lib_bind = try arena.create(Bind);
+        lib_bind.* = try binder.bind(arena, io, gpa, interner, lib_tree, lf.source);
+        files[i] = .{ .path = lf.path, .src = lf.source, .tree = lib_tree, .bind = lib_bind };
+    }
+    files[lib_list.len] = .{ .path = path, .src = src, .tree = tree, .bind = bind };
     const sym_base = try computeSymBase(arena, files);
     // Unlinked single-file path: a script user file may still augment lib
     // globals; merge diagnostics (none for the clean case) have no link table
@@ -1588,7 +1690,7 @@ pub fn buildProgram(
     interner: *Interner,
     dir: Io.Dir,
     entries: []const []const u8,
-    no_lib: bool,
+    lib_set: LibSet,
 ) !BuildResult {
     var scratch_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch_arena.deinit();
@@ -1600,10 +1702,11 @@ pub fn buildProgram(
     var pending: std.ArrayList([]const u8) = .empty;
     var failures: std.ArrayList(BuildDiag) = .empty;
 
-    // Inject the ES-core lib as the first entry (file 0) unless disabled.
-    if (!no_lib) {
-        try path_ids.put(scratch, lib_path, 0);
-        try pending.append(scratch, lib_path);
+    // Inject the selected built-in lib blobs as the first entries (files 0..).
+    var lib_buf: [3]LibFile = undefined;
+    for (libFiles(lib_set, &lib_buf)) |lf| {
+        try path_ids.put(scratch, lf.path, @intCast(pending.items.len));
+        try pending.append(scratch, lf.path);
     }
 
     for (entries) |e| {
@@ -1618,8 +1721,8 @@ pub fn buildProgram(
     var next: usize = 0;
     while (next < pending.items.len) : (next += 1) {
         const path = pending.items[next];
-        const bytes: []const u8 = if (std.mem.eql(u8, path, lib_path))
-            lib_source
+        const bytes: []const u8 = if (libSourceFor(path)) |s|
+            s
         else
             dir.readFileAlloc(io, path, arena, .limited(1 << 30)) catch |err| {
                 try failures.append(scratch, .{ .path = path, .err = err });
@@ -1753,14 +1856,17 @@ test "seedLibAtoms: covers every atom the lib binder produces (M12.1 determinism
     const io = testing.io;
     const gpa = testing.allocator;
 
+    // The default runtime set (ES-core + DOM) is the widest seed; exercise it.
+    const set = LibSet.default;
+
     // Seed a fresh interner single-threaded, as the CLI does before spawning
     // workers.
     var itn1 = Interner.init();
     defer itn1.deinit(gpa);
-    try seedLibAtoms(io, gpa, &itn1);
+    try seedLibAtoms(io, gpa, &itn1, set);
     const seeded_count = itn1.count(io);
 
-    // Re-binding the lib into the seeded interner must intern *zero* new
+    // Re-binding every lib blob into the seeded interner must intern *zero* new
     // strings: seeding already produced every atom binding needs, including
     // the transformed ones (stripQuotes, well-known-symbol keys, the
     // "default"/"*" constants). Anything seeding missed would be interned
@@ -1768,17 +1874,24 @@ test "seedLibAtoms: covers every atom the lib binder produces (M12.1 determinism
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const tree = try parser.parse(a, lib_source);
-    const b = try binder.bind(a, io, gpa, &itn1, &tree, lib_source);
+    var buf: [3]LibFile = undefined;
+    var last_bind: *const Bind = undefined;
+    for (libFiles(set, &buf)) |lf| {
+        const tree = try a.create(Ast);
+        tree.* = try parser.parse(a, lf.source);
+        const b_ptr = try a.create(Bind);
+        b_ptr.* = try binder.bind(a, io, gpa, &itn1, tree, lf.source);
+        last_bind = b_ptr;
+    }
     try testing.expectEqual(seeded_count, itn1.count(io));
 
     // A second, independent seed assigns byte-for-byte identical atom values
     // to the lib's strings — the run-to-run stability M12.2's blob relies on.
     var itn2 = Interner.init();
     defer itn2.deinit(gpa);
-    try seedLibAtoms(io, gpa, &itn2);
+    try seedLibAtoms(io, gpa, &itn2, set);
     try testing.expectEqual(seeded_count, itn2.count(io));
-    for (b.symbol_names[1..]) |atom| {
+    for (last_bind.symbol_names[1..]) |atom| {
         if (atom == 0) continue; // anonymous symbol, no name
         try testing.expectEqualStrings(itn1.lookup(io, atom), itn2.lookup(io, atom));
     }

@@ -22,15 +22,23 @@ subject to the Apache License, Version 2.0. Copyright for these components:
 1. Embedded standard library type definitions
 ------------------------------------------------
 
-The file `src/lib/lib.esnext.d.ts` is redistributed, near-verbatim, from the
-TypeScript 7.0.2 standard library (the `@typescript/typescript-*` platform
-packages of the Apache-2.0 `typescript` npm package). It is assembled by
-`src/lib/gen_lib.js` by concatenating the `lib.*.d.ts` reference chain rooted
-at `lib.esnext.d.ts` (87 files, dependency order; DOM / webworker /
-scripthost libraries excluded). Each concatenated section retains the
-original Microsoft Apache-2.0 copyright header from the upstream file. This
-file is compiled into the ztsc binary via `@embedFile` (see
-`src/modules.zig`).
+The files `src/lib/lib.esnext.d.ts` and `src/lib/lib.dom.d.ts` are
+redistributed, near-verbatim, from the TypeScript 7.0.2 standard library (the
+`@typescript/typescript-*` platform packages of the Apache-2.0 `typescript`
+npm package). They are assembled by `src/lib/gen_lib.js` by concatenating
+`lib.*.d.ts` reference chains in dependency order:
+
+  - `lib.esnext.d.ts`: the chain rooted at upstream `lib.esnext.d.ts` (87
+    files; DOM / webworker / scripthost libraries excluded).
+  - `lib.dom.d.ts`: the DOM chain (`lib.dom` + `lib.dom.iterable` +
+    `lib.dom.asynciterable`, 3 files; its es* reference deps are omitted, being
+    already present in the esnext blob).
+
+Each concatenated section retains the original Microsoft Apache-2.0 copyright
+header from the upstream file. Both are compiled into the ztsc binary via
+`@embedFile` (see `src/modules.zig`); the tsconfig `lib` option selects which
+are loaded. `src/lib/lib.console.d.ts` is a small ztsc-authored `console` shim
+(not derived from TypeScript), loaded only in the DOM-less backend configuration.
 
 
 2. Diagnostic message strings
