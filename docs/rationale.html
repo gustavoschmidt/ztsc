@@ -26,7 +26,9 @@
 <header class="hero">
   <p class="eyebrow">rationale</p>
   <h1>Why ztsc exists</h1>
-  <p class="sub">TypeScript 7 already rewrote the compiler in a native language and made it fast.
+  <p class="sub">Because AI writes code fast, the tooling that checks that code has to be fast
+  and cheap to run — that observation started this project. TypeScript 7 already rewrote the
+  compiler in a native language and made it fast.
   ztsc makes a different bet: <em>memory is where a systems language beats a garbage-collected
   one</em> — and if you design for memory with total consistency, speed comes along for
   free.</p>
@@ -34,7 +36,42 @@
 
 <!-- ============================================================ -->
 <section>
-  <p class="eyebrow"><span class="n">01</span> · the bet</p>
+  <p class="eyebrow"><span class="n">01</span> · why now</p>
+  <h2>Machines call the checker now</h2>
+  <p>ztsc started from one observation: <strong>AI writes code fast, so the tooling that checks
+  that code has to be fast and cheap to run</strong>. Stated that loosely it invites pushback, so
+  here is the precise version. An agent typechecks after nearly every edit — dozens to hundreds
+  of invocations per session, not a handful per day. And agents multiply: parallel worktrees, CI
+  matrices, fleets of cloud sandboxes, all running checker instances simultaneously on the same
+  hardware. The type checker stops being a tool a person runs occasionally and becomes
+  <em>infrastructure that machines call at high frequency and high concurrency</em>. That shift
+  changes which properties matter:</p>
+  <ul>
+    <li><strong>Memory per instance is a density limit.</strong> One 280&thinsp;MB checker is
+    nothing on a laptop. Fifty concurrent memory-capped sandboxes is where 280&thinsp;MB vs
+    22&thinsp;MB decides how many agents fit on a host — and what the GB-hours cost.</li>
+    <li><strong>The per-invocation floor gets multiplied by thousands.</strong> A checker run
+    once a day can shrug off startup cost; a checker run on every agent edit pays it every
+    time. ztsc's entire process floor — start, load the embedded lib, check — is
+    ~13&thinsp;ms.</li>
+    <li><strong>Determinism is a cache key.</strong> Byte-identical output at any parallelism
+    means a harness can cache, diff, and dedupe checker results reliably. The batch CLI
+    <em>is</em> the agent interface — which is why batch shipped before the LSP.</li>
+    <li><strong>False positives are worse for agents than for people.</strong> A person shrugs
+    off a bogus error; an agent dutifully "fixes" it and damages correct code. ztsc's contract —
+    in its known gaps it under-reports, and it never errors on valid code — is exactly the
+    contract a machine-called guardrail needs.</li>
+  </ul>
+  <p>The honest caveat, stated before anyone else states it: inside a single interactive agent
+  loop, checker latency is rarely the bottleneck — model inference is. The economics live in
+  <em>frequency × concurrency × cost</em>: verification that is nearly free gets run more often,
+  and instances that are memory-lean pack more densely. Speed is the supporting act; memory is
+  the headline — which is the next section.</p>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <p class="eyebrow"><span class="n">02</span> · the bet</p>
   <h2>Memory first, speed follows</h2>
   <p>tsgo (the native TypeScript 7 compiler, written in Go) settled the speed question: a native
   batch checker runs an order of magnitude faster than tsc on Node. What it didn't change is the
@@ -61,7 +98,7 @@
 
 <!-- ============================================================ -->
 <section>
-  <p class="eyebrow"><span class="n">02</span> · one idea, five ways</p>
+  <p class="eyebrow"><span class="n">03</span> · one idea, five ways</p>
   <h2>Data-oriented design, applied with total consistency</h2>
   <p>Nothing in ztsc is exotic. The entire performance story is five ordinary decisions applied
   everywhere — the AST, the binder, the type store, the module graph — with no exceptions:</p>
@@ -100,7 +137,7 @@
 
 <!-- ============================================================ -->
 <section>
-  <p class="eyebrow"><span class="n">03</span> · the subset</p>
+  <p class="eyebrow"><span class="n">04</span> · the subset</p>
   <h2>A measured subset, not an aspirational one</h2>
   <p>A TypeScript checker that mishandles code is worse than one that refuses it. ztsc's
   contract from day one: anything out of subset parses into an explicit
@@ -123,7 +160,7 @@
 
 <!-- ============================================================ -->
 <section>
-  <p class="eyebrow"><span class="n">04</span> · determinism</p>
+  <p class="eyebrow"><span class="n">05</span> · determinism</p>
   <h2>Parallel, with one answer</h2>
   <p>Parallel compilers often buy speed with nondeterminism — output order that depends on
   thread scheduling. ztsc treats determinism as a hard guarantee instead: diagnostics print per
@@ -142,7 +179,7 @@
 
 <!-- ============================================================ -->
 <section>
-  <p class="eyebrow"><span class="n">05</span> · batch first</p>
+  <p class="eyebrow"><span class="n">06</span> · batch first</p>
   <h2>Why no watch mode or LSP yet</h2>
   <p>ztsc ships as a batch checker first because that's the piece whose value can be proven with
   numbers today — and because incremental modes built on a shaky substrate calcify the shakiness.
@@ -153,7 +190,7 @@
 
 <!-- ============================================================ -->
 <section>
-  <p class="eyebrow"><span class="n">06</span> · negative results</p>
+  <p class="eyebrow"><span class="n">07</span> · negative results</p>
   <h2>Optimizations are gated on measurement — including the ones that lose</h2>
   <p>Two plausible optimizations were seriously pursued and <em>measured out</em>, and the
   project keeps them on the record

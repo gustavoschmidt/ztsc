@@ -126,6 +126,17 @@ pre code { background: none; padding: 0; }
 
 header.hero { padding-top: 56px; }
 .hero .sub { font-size: 1.12rem; color: var(--ink2); max-width: 60ch; }
+h1 .cursor { color: var(--amber); }
+.hero .tagline {
+  font-family: var(--mono);
+  font-size: clamp(1.1rem, 2.8vw, 1.5rem);
+  font-weight: 700;
+  line-height: 1.35;
+  letter-spacing: -0.01em;
+  text-wrap: balance;
+  max-width: 44ch;
+  margin: 0 0 0.8em;
+}
 
 /* --- site navigation ------------------------------------------------ */
 .sitenav {
