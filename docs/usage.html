@@ -150,19 +150,33 @@ ztsc src/main.ts           # or explicit entry files</code></pre>
   types, generics, narrowing, declaration merging, JSX. What it checks, it checks like the
   TypeScript compiler. The current gaps:</p>
   <ul>
-    <li><strong>No DOM lib.</strong> The embedded standard library is esnext-only, so browser
-    globals (<code>Response</code>, <code>HTMLElement</code>, <code>fetch</code>, …) are not
-    recognized.</li>
+    <li><strong>Merged-interface iterables.</strong> The embedded lib includes the real
+    TypeScript DOM lib (<code>dom</code> + <code>dom.iterable</code> +
+    <code>dom.asynciterable</code>), selected via the tsconfig <code>lib</code> field, so
+    browser globals (<code>Response</code>, <code>HTMLElement</code>, <code>fetch</code>,
+    <code>document</code>, …) resolve. Known gap: <code>for…of</code> over a DOM collection
+    whose iterator is added by interface merging (e.g. <code>URLSearchParams</code>,
+    <code>Headers</code>) isn't recognized yet — nor is <code>for await</code> over
+    <code>AsyncIterable</code>; single-declaration iterables like <code>NodeListOf</code>
+    work.</li>
     <li><strong>CommonJS interop is checked</strong> (<code>export =</code>,
     <code>import x = require(…)</code>, and ES imports against an <code>export =</code>
     module), but a couple of corners degrade leniently rather than erroring: a namespace
     import keeps the export's call signature, and a member of a <code>require</code>-bound
     namespace used in <em>type</em> position resolves to <code>any</code>.</li>
-    <li><strong>No const-symbol computed keys</strong> (<code>[kind]: T</code> with a
-    <code>unique symbol</code> key); well-known symbols like <code>[Symbol.iterator]</code>
-    work.</li>
-    <li><strong>JSX needs a <code>JSX</code> namespace in scope</strong> — resolving it from
-    <code>@types/react</code> and spread-attribute checking are not wired up yet.</li>
+    <li><strong>Const-symbol computed keys are checked</strong> (<code>[kind]: T</code> with a
+    <code>unique symbol</code> key) across classes, interfaces, type literals and object
+    literals, keyed by the symbol's nominal identity across files. Lenient corner: a key
+    written as a member expression (<code>[ns.member]</code>) stays out of subset, and a
+    plain non-<code>unique</code> <code>symbol</code> key is keyed by name — both
+    under-report rather than erroring.</li>
+    <li><strong>JSX is checked against the real <code>@types/react</code></strong> — the
+    global <code>JSX</code> namespace merged out of the package, intrinsic props via
+    <code>IntrinsicElements</code>, component props, spread attributes
+    (<code>&lt;C {...p} /&gt;</code>), <code>key</code>, and children. Lenient corners
+    (under-report, never a false positive): prop <em>type</em> mismatches arriving inside a
+    spread object, spreads of unions/generics/index-signature types, and children
+    <em>value</em> typing.</li>
     <li><strong>tsconfig subset</strong>: <code>files</code> / <code>include</code> /
     <code>exclude</code> / <code>baseUrl</code> / <code>paths</code>, strict mode only; other
     options are accepted and ignored.</li>
