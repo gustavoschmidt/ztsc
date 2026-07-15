@@ -1676,18 +1676,50 @@ milestone is the RSS and cold-start claw-back that makes M21's release
 gate (**≤50% of tsgo RSS**) hold on the real-lib configuration. Three
 pieces, in dependency order:
 
-1. **Structural union/intersection display order** (correctness
-   prerequisite discovered during M14.5 — do it first).
-   `makeUnion`/`makeIntersection` (types.zig) sort members by **raw
-   TypeId**, and diagnostics print members in stored order — so
-   relocating lib types into low base ids would reorder e.g.
-   `LibType | userLiteral` in messages and break the byte-identical
-   invariant between frozen-on/off and across N. Make the ordering
-   **TypeId-independent**: a structural sort key (kind class + interned
-   name/shape atoms), stable across id assignment. Where differential
-   cases already pin an order against tsc, keep matching tsc; elsewhere
-   the requirement is byte-stability across configurations, not any
-   particular order. "Done" is verified by piece 2's oracle, below.
+1. ✅ **DONE (M19.1)** — **Structural union/intersection display order**
+   (correctness prerequisite discovered during M14.5 — done first).
+   `makeUnion`/`makeIntersection` (types.zig) still sort *stored* members
+   by raw TypeId (that ordering is the canonical hash-cons member-set
+   identity — untouched, so interning/dedup is unchanged), but the printer
+   no longer prints in stored order. **Decision: a display-time structural
+   sort, not a stored-order change** — the roadmap's safe interpretation,
+   zero identity risk, and the only thing piece 2 needs (relocating lib
+   ids must not change display). `Checker.printType` (checker.zig) now
+   orders union/intersection members via `sortMembersStructural`, keyed on
+   a **TypeId-independent** `writeSortKey`: a kind-rank byte
+   (`@intFromEnum(Kind)`, so intrinsics keep their canonical `Kind` order —
+   `string` before `number` before `boolean`), then structural content —
+   array-element recursion, an order-preserving 8-byte f64 encoding for
+   number literals, and the human rendering (symbol names / atom **text** /
+   literal text — never raw TypeIds or raw atom *values*) for everything
+   else. Unions still force `null`/`undefined` last (tsc rule). **Proof of
+   TypeId-independence:** a 25-file union-heavy fixture (interfaces unioned
+   in *scrambled* per-file source orders) that, on the **old** TypeId sort,
+   printed `Alpha | Bravo | Charlie | Delta | Echo` at `--checkers=1` but
+   `Delta | Alpha | Echo | Bravo | Charlie` at `=8` (and flipped
+   `Charlie & Delta` ↔ `Delta & Charlie`) — is now **byte-identical across
+   `--checkers ∈ {1,4,8}` and `--no-frozen-store` on/off**, every consumer
+   printing the same structural order. rxjs's two flipping union lines
+   (`Notification.ts:75`, `innerFrom.ts:67`) are likewise stable across N
+   now (rxjs retains *separate*, out-of-scope instabilities: object
+   *property* display order — sorted by run-variable atom ids — and a
+   diagnostic-*set* difference on `Subject.ts`). multi + deps remain
+   byte-identical across all six configs. **Conformance 388/388;
+   differential `--check` = "all snapshots match tsc" (snapshots are
+   code+line, so member order is not harness-enforced — the byte-identical
+   oracle is).** Only **two** message-text orderings changed vs the old
+   output, both *improvements or neutral*: `inference/017` now prints
+   `"high" | "low"` — which **matches tsc 5.5.4** (the old TypeId order
+   `"low" | "high"` did **not**); `string[] | number[]` stays correct (array
+   recursion). **One documented, irreducible divergence:** `satisfies/002`
+   `"n" | "s" | "e" | "w"` — tsc shows `"s" | "n" | "e" | "w"` (tsc-internal
+   type-creation order, reproducible by no pure structural key; tsc even
+   renders it as the alias `Dir` in that case); ztsc prints the stable
+   alphabetical `"e" | "n" | "s" | "w"`. Type store byte-identical (N=4
+   27569 types / 799205 type-bytes — unchanged, stored order untouched);
+   bench flat (sort is diagnostics-only, off the hot path). Where
+   differential cases pin an order against tsc, we match it; elsewhere the
+   binding requirement is byte-stability across configurations, met.
 2. **The frozen-base payload.** Post-link, `buildBaseStore` (checker.zig)
    pre-expands the lib/`@types` types into the frozen base **once,
    single-threaded** — enumerate what to expand via the M11 merge table /

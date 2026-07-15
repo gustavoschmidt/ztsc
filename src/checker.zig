@@ -229,10 +229,12 @@ pub fn checkAndDump(
 /// byte-identical with the frozen store on or off. Pre-expanding the
 /// lib/`@types` body into the base (the RSS win, reusing the M11 merge table
 /// to enumerate lib symbols) is deferred to the larger embedded lib: it would
-/// relocate lib types to low base ids, which reorders union/intersection
-/// *display* (both sort by raw TypeId, printed in stored order), so it must be
-/// paired with structural display ordering. The overlay machinery is fully in
-/// place for that follow-up (see report).
+/// relocate lib types to low base ids. The display-order prerequisite that used
+/// to block it — union/intersection members were printed in raw-TypeId order —
+/// is resolved (M19.1): `printType` now orders members structurally
+/// (`sortMembersStructural`/`writeSortKey`), TypeId-independent, so relocating
+/// lib ids no longer changes any message. The overlay machinery is fully in
+/// place for the payload follow-up (piece 2).
 pub fn buildBaseStore(store_arena: Allocator) Error!types.Store {
     var base = try types.Store.init(store_arena);
     base.freeze();
@@ -1204,31 +1206,42 @@ const Checker = struct {
             .bigint_literal => try w.print("{s}", .{c.atomText(s.literalAtom(t))}),
             .number_literal, .number_literal_fresh => try printNumber(w, s.numberValue(t)),
             .union_type => {
-                // tsc display order: null and undefined go last.
+                // Display order is a *structural* (TypeId-independent) sort so
+                // relocating lib types to low base ids never reorders a message
+                // (M19.1); null and undefined always go last, matching tsc.
+                const all = s.members(t);
+                const buf = c.scratch().alloc(TypeId, all.len) catch return error.WriteFailed;
+                var m: usize = 0;
+                for (all) |x| {
+                    if (s.kind(x) == .null or s.kind(x) == .undefined) continue;
+                    buf[m] = x;
+                    m += 1;
+                }
+                const sorted = try c.sortMembersStructural(buf[0..m], depth + 1);
                 var first = true;
-                for (s.members(t)) |m| {
-                    if (s.kind(m) == .null or s.kind(m) == .undefined) continue;
+                for (sorted) |x| {
                     if (!first) try w.writeAll(" | ");
                     first = false;
-                    try c.printTypeParen(w, m, depth + 1, true);
+                    try c.printTypeParen(w, x, depth + 1, true);
                 }
-                for (s.members(t)) |m| {
-                    if (s.kind(m) != .null) continue;
+                for (all) |x| {
+                    if (s.kind(x) != .null) continue;
                     if (!first) try w.writeAll(" | ");
                     first = false;
                     try w.writeAll("null");
                 }
-                for (s.members(t)) |m| {
-                    if (s.kind(m) != .undefined) continue;
+                for (all) |x| {
+                    if (s.kind(x) != .undefined) continue;
                     if (!first) try w.writeAll(" | ");
                     first = false;
                     try w.writeAll("undefined");
                 }
             },
             .intersection => {
-                for (s.members(t), 0..) |m, i| {
+                const sorted = try c.sortMembersStructural(s.members(t), depth + 1);
+                for (sorted, 0..) |x, i| {
                     if (i > 0) try w.writeAll(" & ");
-                    try c.printTypeParen(w, m, depth + 1, true);
+                    try c.printTypeParen(w, x, depth + 1, true);
                 }
             },
             .array => {
@@ -1442,6 +1455,62 @@ const Checker = struct {
         if (needs) try w.writeAll("(");
         try c.printType(w, t, depth);
         if (needs) try w.writeAll(")");
+    }
+
+    /// One display-time member of a union/intersection paired with its
+    /// structural sort key.
+    const DisplayMember = struct { ty: TypeId, key: []const u8 };
+
+    /// Order-preserving 8-byte big-endian encoding of an f64 so number-literal
+    /// sort keys compare numerically as raw bytes (`-1` < `0` < `2` < `10`).
+    fn encodeF64Key(v: f64) [8]u8 {
+        var bits: u64 = @bitCast(v);
+        bits = if (bits >> 63 != 0) ~bits else bits | (@as(u64, 1) << 63);
+        var out: [8]u8 = undefined;
+        std.mem.writeInt(u64, &out, bits, .big);
+        return out;
+    }
+
+    /// Writes a **TypeId-independent** structural sort key for `t`: a kind-rank
+    /// byte (so intrinsics keep their canonical `Kind` order — `string` before
+    /// `number` before `boolean`) followed by structural content — array
+    /// element recursion, an order-preserving numeric encoding for number
+    /// literals, and the human rendering (symbol names / atom text / literal
+    /// text, never raw TypeIds) for everything else. Keying on *structure*, not
+    /// on id assignment, is what keeps union/intersection display order stable
+    /// when lib types are relocated to low base ids (M19.1).
+    fn writeSortKey(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr!void {
+        const k = c.ts.kind(t);
+        try w.writeByte(@intFromEnum(k));
+        if (depth > 6) return;
+        switch (k) {
+            .array => try c.writeSortKey(w, c.ts.arrayElem(t), depth + 1),
+            .number_literal, .number_literal_fresh => try w.writeAll(&encodeF64Key(c.ts.numberValue(t))),
+            else => try c.printType(w, t, depth + 1),
+        }
+    }
+
+    /// Returns `members` reordered into the structural display order (see
+    /// `writeSortKey`). Keys are rendered once into scratch, then sorted; a
+    /// scratch-owned slice of the reordered TypeIds is returned. Members that
+    /// render identically produce equal keys and print byte-identically either
+    /// way, so an unstable sort stays deterministic.
+    fn sortMembersStructural(c: *Checker, members: []const TypeId, depth: u32) PrintErr![]TypeId {
+        const sc = c.scratch();
+        const items = sc.alloc(DisplayMember, members.len) catch return error.WriteFailed;
+        for (members, 0..) |mem, i| {
+            var aw: std.Io.Writer.Allocating = .init(sc);
+            try c.writeSortKey(&aw.writer, mem, depth);
+            items[i] = .{ .ty = mem, .key = aw.written() };
+        }
+        std.mem.sort(DisplayMember, items, {}, struct {
+            fn less(_: void, a: DisplayMember, b: DisplayMember) bool {
+                return std.mem.order(u8, a.key, b.key) == .lt;
+            }
+        }.less);
+        const out = sc.alloc(TypeId, members.len) catch return error.WriteFailed;
+        for (items, 0..) |it, i| out[i] = it.ty;
+        return out;
     }
 
     fn printNumber(w: *std.Io.Writer, v: f64) PrintErr!void {
