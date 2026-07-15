@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Benchmark harness for ztsc (PLAN.md §3).
+# Benchmark harness for ztsc.
 #
 # Usage: bench/run.sh [small|medium]
 #

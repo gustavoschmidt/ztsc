@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Checker micro-benchmark (PLAN.md M4).
+# Checker micro-benchmark (M4).
 #
 # Usage: bench/check.sh [small|medium] [repeat]
 #

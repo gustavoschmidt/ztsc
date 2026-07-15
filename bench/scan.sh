@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Scanner micro-benchmark (PLAN.md M1).
+# Scanner micro-benchmark (M1).
 #
 # Usage: bench/scan.sh [small|medium] [repeat]
 #

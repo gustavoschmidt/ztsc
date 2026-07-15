@@ -10,15 +10,15 @@
 //     end-to-end benchmark: `ztsc corpus/multi/entry.ts`)
 //   bench/corpus/skewed (~70k LOC: one very large file next to many small
 //     ones in import chains of mixed depth — the discovery-skew stress
-//     from ROADMAP "single-owner module discovery": under wavefront
+//     from single-owner module discovery: under wavefront
 //     scheduling the huge file's wave is a barrier and the deep chains
 //     degenerate toward serial discovery)
 //   bench/corpus/bigfan (~67k LOC: several large files among many small ones,
 //     with the large files interleaved in entry.ts so their BFS ids share a
-//     residue mod 4 — the check-partition stress from ROADMAP §5, M10:
+//     residue mod 4 — the check-partition stress from M10:
 //     round-robin (id % N) clumps the large files onto one checker while the
 //     greedy cost-based partition spreads them one per checker)
-// The generated code stays inside the ztsc v0.0.1 subset (PLAN.md §5):
+// The generated code stays inside the ztsc v0.0.1 subset:
 // interfaces, type aliases, unions, classes, functions, narrowing.
 //
 // Usage: node bench/gen_corpus.js [--force]
@@ -277,7 +277,7 @@ function genMulti(root, force) {
   return loc;
 }
 
-// --- skewed corpus (ROADMAP: single-owner discovery) --------------------------
+// --- skewed corpus (single-owner discovery) -----------------------------------
 
 const SKEWED = {
   hugeModules: 200, // one ~22k-line file
@@ -382,7 +382,7 @@ function genSkewed(root, force) {
   return loc;
 }
 
-// --- bigfan corpus (ROADMAP §5, M10: cost-based check partition) --------------
+// --- bigfan corpus (M10: cost-based check partition) --------------------------
 //
 // Several large files among many small ones, arranged so the round-robin
 // (id % N) partition clumps large files onto one checker while the greedy
@@ -479,7 +479,7 @@ function genBigfan(root, force) {
   return loc;
 }
 
-// --- deps corpus (ROADMAP §5, M13: resolution cache) --------------------------
+// --- deps corpus (M13: resolution cache) --------------------------------------
 //
 // Many app files in one `src/` directory, each importing a rotating subset of
 // shared packages by *bare specifier* from a generated `node_modules/` tree

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# End-to-end benchmark (PLAN.md M5/M6): full pipeline (tsconfig -> discover
+# End-to-end benchmark (M5/M6): full pipeline (tsconfig -> discover
 # -> load -> scan -> parse -> bind -> link -> check) on a corpus, swept
 # over --checkers=1,2,4,8, vs real tsc and tsgo (TypeScript 7 native
 # preview) when available.
 #
 # Reports wall clock and peak RSS via /usr/bin/time (-l on macOS, -v on
 # Linux), plus ztsc's per-checker type counts (the duplicated-types
-# overhead of PLAN §2.3).
+# overhead of the N-independent-checkers design).
 #
 # Usage: bench/e2e.sh [corpus] [checkers...]
 #   corpus: small | medium | multi (default: multi)

@@ -5,7 +5,7 @@
 //! Scope & stance (documented deviations are intentional for the M6 subset):
 //!
 //! - **Multi-file (M5)**: a Checker instance checks a *partition* of the
-//!   program's files (ROADMAP.md §2.3). Symbols are addressed globally
+//!   program's files. Symbols are addressed globally
 //!   (`sym_base[file] + local`); imported bindings resolve through the
 //!   sealed link tables (read-only, no locks) and foreign symbols' types
 //!   are constructed on demand in the local type store (duplicated across
@@ -216,7 +216,7 @@ pub fn checkAndDump(
     return c.seal();
 }
 
-/// Build the shared frozen base type store (M14.5, ROADMAP §M14.5 piece 2).
+/// Build the shared frozen base type store (M14.5 piece 2).
 /// Runs single-threaded after link, before any checker worker spawns. The
 /// returned store's arrays live in `store_arena` (which must outlive every
 /// overlay built over it); the caller freezes-and-shares it as each

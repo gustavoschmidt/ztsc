@@ -1,6 +1,6 @@
 //! Data-oriented AST (M2), modeled on the Zig compiler's own Ast.
 //!
-//! Design (ROADMAP.md §2.1):
+//! Design:
 //!
 //! - **Nodes are `u32` indices** (`Node`); there are no pointers anywhere.
 //! - **Storage is struct-of-arrays** (`std.MultiArrayList`): `tag` (1 byte),
@@ -21,7 +21,7 @@
 //! - Out-of-subset constructs (enums, namespaces, decorators,
 //!   conditional/mapped types, JSX, ...) become an `.unsupported` node
 //!   spanning `main_token ..= data.rhs` (a token range), paired with an
-//!   `unsupported_syntax` diagnostic — never a crash (ROADMAP.md §6).
+//!   `unsupported_syntax` diagnostic — never a crash.
 //!
 //! The AST is produced into the per-file arena by parser.zig and sealed
 //! (read-only) after parse; nothing here mutates after `Parse.parse` returns.

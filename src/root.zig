@@ -1,7 +1,6 @@
 //! ZTSC — Zig TypeScript Checker (library root).
 //!
-//! Module layout (ROADMAP.md §2.4). Only the modules that M0 uses exist;
-//! scanner/parser/binder/checker land in later milestones.
+//! Module layout: the public modules re-exported for use across the crate.
 
 pub const source = @import("source.zig");
 pub const intern = @import("intern.zig");

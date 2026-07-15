@@ -1,6 +1,6 @@
 //! Module resolution, module graph, and cross-file symbol linking (M5).
 //!
-//! Design decisions (ROADMAP.md §2.3, M5):
+//! Design decisions (M5):
 //!
 //! - **Resolution is bundler-style** (matches `tsc --moduleResolution
 //!   bundler` for the subset):
@@ -31,7 +31,7 @@
 //!     export is TS2305; a missing default is TS2613 (when a same-named
 //!     named export exists) or TS1192.
 //! - Checkers treat the sealed tables as read-only: no locks anywhere on
-//!   the check path (ROADMAP.md §2.3 immutability boundary).
+//!   the check path (the immutability boundary).
 //! - Out of subset (documented): `export =` / `import x = require(...)`
 //!   (parser flags them unsupported), ambient `declare module "..."`
 //!   blocks, CommonJS interop semantics.
@@ -177,7 +177,7 @@ pub const FileLinks = struct {
 /// ids `< totalSymbols()`) in FileId order. Checkers materialize the type by
 /// folding each constituent's declarations across files (the type-level twin
 /// of within-file merging). Merge remains a symbol-table operation — no types
-/// are compared here (ROADMAP §5 M11 invariant 1).
+/// are compared here (M11 invariant: merge symbols, never types).
 pub const MergedSym = struct {
     name: Atom,
     flags: binder.SymbolFlags,
@@ -310,9 +310,9 @@ pub fn computeSymBase(alloc: Allocator, files: []const ProgFile) Error![]u32 {
 /// encodes shard-local insertion order (intern.zig), so run-to-run stability
 /// requires the lib's strings to be interned in a fixed order ahead of the
 /// concurrent user-file work; the worker that later binds the lib re-interns
-/// the same text and receives these stable atoms. This is option (a) of
-/// ROADMAP M12.1: it pins the lib's atoms (the ones a serialized lib blob,
-/// M12.2, must reference) without touching user-file atoms.
+/// the same text and receives these stable atoms. This is the seeded-interner
+/// approach (M12.1 option a): it pins the lib's atoms (the ones a serialized
+/// lib blob would reference) without touching user-file atoms.
 ///
 /// Seeding runs the real binder — not a token scan — so it interns exactly
 /// what binding interns, including the text transforms binding applies
@@ -371,8 +371,9 @@ fn globalSymFlags(files: []const ProgFile, sym_base: []const u32, sym: u32) bind
 }
 
 /// Fold every file's global-contribution slice (the binder harvest) into the
-/// program global table, in FileId order (deterministic; ROADMAP §5 M11
-/// invariant 4). The lib and script files offer their whole top level;
+/// program global table, in FileId order (deterministic by construction —
+/// the M11 merge is a pure function of file order). The lib and script files
+/// offer their whole top level;
 /// modules offer their `declare global` block members; the typical app module
 /// offers nothing and is skipped (invariant 3, pay-per-use).
 ///
@@ -621,7 +622,7 @@ fn joinNormalize(alloc: Allocator, dir: []const u8, rest: []const u8) Error![]u8
 
 /// Count of filesystem probes issued during module resolution — every
 /// `statFile` and every `package.json` read. It is the resolution cache's
-/// scoreboard (ROADMAP M13, "resolution syscall counts before/after"): with
+/// scoreboard (M13, "resolution syscall counts before/after"): with
 /// the `(importer_dir, spec)` memo the same specifier imported from K files
 /// walks `node_modules` once, not K times, so this collapses on inputs with
 /// shared specifiers.
@@ -792,7 +793,7 @@ pub fn resolveSpecifier(
     return resolvePackage(io, alloc, dir, importer_dir, spec);
 }
 
-/// Memoizes `resolveSpecifier` over the discovery run (ROADMAP M13). A module
+/// Memoizes `resolveSpecifier` over the discovery run (M13). A module
 /// specifier resolves as a pure function of `(importer_dir, spec)` given a
 /// fixed filesystem — both a bare `node_modules` walk and a relative
 /// `joinNormalize` depend on nothing else — so that pair is an exact key. The

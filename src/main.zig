@@ -1,7 +1,7 @@
 //! ZTSC CLI driver: argument parsing, thread pool, phase orchestration.
 //!
-//! Module discovery is single-owner with a completion queue (ROADMAP
-//! "single-owner module discovery"): the main thread is the sole owner of
+//! Module discovery is single-owner with a completion queue: the main
+//! thread is the sole owner of
 //! the module graph and seen-set (no locks on graph state); workers run
 //! the whole per-file front end (load/scan/parse/bind) and push per-file
 //! completion messages `(file, import specifiers)`; the main thread
@@ -16,7 +16,7 @@
 //! partitions the program's files across N independent checker instances
 //! (`--checkers=N`, default min(4, cores)), each with its own type
 //! store/caches, reading the shared immutable AST/binder/link data without
-//! locks (ROADMAP.md §2.3).
+//! locks.
 //!
 //! Output determinism: the file order is derived from the graph, never
 //! from scheduling; every diagnostic is tagged with its file; each file's
@@ -47,7 +47,7 @@ const usage =
     \\usage: ztsc [options] [files...]
     \\
     \\With no files, ztsc looks for tsconfig.json in the current directory
-    \\and its parents (or uses --project). See ROADMAP.md §6 for the checked
+    \\and its parents (or uses --project). See the README for the checked
     \\TypeScript subset.
     \\
     \\options:
@@ -745,7 +745,7 @@ pub fn main(init: std.process.Init) !void {
     };
     const link_ns = link_timer.readNs();
 
-    // --- Check (N independent checker instances, ROADMAP.md §2.3) ---------------
+    // --- Check (N independent checker instances) --------------------------------
     const check_timer = Timer.start(io);
     const n_checkers: usize = @max(1, @min(cli.checkers orelse @min(4, cpu_count), n_files));
     const tasks = try arena.alloc(CheckerTask, n_checkers);
@@ -753,7 +753,7 @@ pub fn main(init: std.process.Init) !void {
     // from the right checker below (replaces the old `i % n_checkers`).
     const file_owner = try arena.alloc(u32, n_files);
     {
-        // Cost-based partition (ROADMAP.md §5, M10): greedy longest-
+        // Cost-based partition (M10): greedy longest-
         // processing-time by per-file AST node count (≈ check cost, known
         // post-parse). Round-robin (`i % n_checkers`) ignores file size and
         // clumps large files whose ids share a residue mod N onto one
@@ -791,7 +791,7 @@ pub fn main(init: std.process.Init) !void {
             file_owner[it.file] = @intCast(best);
         }
 
-        // Shared frozen base type store (M14.5, ROADMAP §M14.5 piece 2): built
+        // Shared frozen base type store (M14.5 piece 2): built
         // once, single-threaded here before any checker spawns, then handed to
         // every task read-only. Under `--no-frozen-store` each checker instead
         // expands lib types into its own store (the old path / oracle leg).
@@ -1120,7 +1120,7 @@ pub fn main(init: std.process.Init) !void {
             0;
         try out.print("  {s:<24} {d:>12.2}\n", .{ "bytes/token", bytes_per_token });
 
-        // AST statistics (ROADMAP §4 M2: bytes/node is the key memory metric).
+        // AST statistics (bytes/node is the key memory metric).
         try out.print("  {s:<24} {d:>12}\n", .{ "ast nodes", total_nodes });
         try out.print("  {s:<24} {d:>12}\n", .{ "ast node SoA bytes", node_bytes });
         try out.print("  {s:<24} {d:>12}\n", .{ "ast extra_data bytes", extra_bytes });
@@ -1136,7 +1136,7 @@ pub fn main(init: std.process.Init) !void {
         try out.print("  {s:<24} {d:>12.2}\n", .{ "bytes/node (SoA+extra)", bytes_per_node });
         try out.print("  {s:<24} {d:>12.2}\n", .{ "nodes/line", nodes_per_line });
 
-        // Binder statistics (ROADMAP §4 M3: binder bytes/line is the key metric).
+        // Binder statistics (binder bytes/line is the key metric).
         const bind_total_bytes = bind_symbol_bytes + bind_scope_bytes +
             bind_flow_bytes + bind_record_bytes;
         try out.print("  {s:<24} {d:>12}\n", .{ "bind symbols", total_symbols });

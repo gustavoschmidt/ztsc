@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Parser micro-benchmark (PLAN.md M2).
+# Parser micro-benchmark (M2).
 #
 # Usage: bench/parse.sh [small|medium] [repeat]
 #

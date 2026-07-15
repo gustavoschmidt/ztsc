@@ -17,8 +17,8 @@
 //! means the case must be diagnostic-free.
 //!
 //! Matching: the multiset of (code, file, line) pairs must match exactly.
-//! Message text is informational and not compared (documented in PLAN §3
-//! as code+span; we compare code+line so byte-offset drift in messages
+//! Message text is informational and not compared (the differential contract
+//! is code+span; we compare code+line so byte-offset drift in messages
 //! doesn't churn snapshots).
 //!
 //! This file also hosts the M5 determinism and cycle-stress tests:

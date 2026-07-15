@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Binder micro-benchmark (PLAN.md M3).
+# Binder micro-benchmark (M3).
 #
 # Usage: bench/bind.sh [small|medium] [repeat]
 #

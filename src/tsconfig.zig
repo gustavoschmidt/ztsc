@@ -1,4 +1,4 @@
-//! tsconfig.json subset (M6, ROADMAP.md §4 M6).
+//! tsconfig.json subset (M6).
 //!
 //! Supported surface:
 //!

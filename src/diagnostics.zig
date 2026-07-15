@@ -79,7 +79,7 @@ pub const Code = enum(u16) {
     /// TS2492: redeclaring a catch-clause parameter in the catch block.
     catch_redeclare,
 
-    // --- subset boundary (ROADMAP.md §6: explicit, never a wrong answer) ---------
+    // --- subset boundary (explicit, never a wrong answer) ------------------------
     unsupported_syntax,
     unsupported_satisfies,
 
