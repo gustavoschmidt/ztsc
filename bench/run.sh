@@ -6,8 +6,8 @@
 # - Generates the synthetic corpus if missing (bench/gen_corpus.js).
 # - Builds the ReleaseFast binary via `zig build bench`.
 # - Runs ztsc under /usr/bin/time capturing wall clock + peak RSS.
-# - If `tsgo` or `tsc` (via npx, no network install) is available, runs the
-#   same corpus through them for comparison; otherwise skips with a note.
+# - If `tsgo` is available on PATH, runs the same corpus through it for
+#   comparison; otherwise skips with a note.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -76,11 +76,4 @@ if command -v tsgo >/dev/null 2>&1; then
     run_timed "tsgo ($SIZE)" tsgo --noEmit -p "$CORPUS"
 else
     echo "note: tsgo not found on PATH; skipping tsgo comparison"
-fi
-
-# --- Comparison: tsc (only if already installed; never block on npm) --------
-if command -v npx >/dev/null 2>&1 && npx --no-install tsc --version >/dev/null 2>&1; then
-    run_timed "tsc ($SIZE)" npx --no-install tsc --noEmit -p "$CORPUS"
-else
-    echo "note: tsc not installed (npx --no-install tsc failed); skipping tsc comparison"
 fi

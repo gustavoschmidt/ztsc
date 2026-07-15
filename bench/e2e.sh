@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# End-to-end benchmark (M5/M6): full pipeline (tsconfig -> discover
-# -> load -> scan -> parse -> bind -> link -> check) on a corpus, swept
-# over --checkers=1,2,4,8, vs real tsc and tsgo (TypeScript 7 native
-# preview) when available.
+# End-to-end benchmark: full pipeline (tsconfig -> discover -> load -> scan
+# -> parse -> bind -> link -> check) on a corpus, swept over
+# --checkers=1,2,4,8, vs tsgo (the native TypeScript compiler) when
+# available.
 #
 # Reports wall clock and peak RSS via /usr/bin/time (-l on macOS, -v on
 # Linux), plus ztsc's per-checker type counts (the duplicated-types
@@ -10,16 +10,14 @@
 #
 # Usage: bench/e2e.sh [corpus] [checkers...]
 #   corpus: small | medium | multi (default: multi)
-#   TSC=/path/to/typescript/bin/tsc   override the tsc under test (a JS entry
-#                                     point run via node — not a PATH shim)
 #   TSGO=/path/to/native/tsc          override the native TypeScript binary
 #   RUNS=N                            timed runs per configuration (default 3;
 #                                     the median is what BENCHMARKS.md reports)
 #
-# Baselines default to the pinned installs under bench/baselines/ (tsc 5.5.4
-# via node; native TS — "tsgo" — invoked as the platform binary directly, no
-# Node wrapper, so RSS is measured on the real process). Installed on demand
-# with npm; node_modules stays gitignored.
+# The baseline defaults to the pinned install under bench/baselines/tsgo
+# (the platform binary invoked directly, no Node wrapper, so RSS is measured
+# on the real process). Installed on demand with npm; node_modules stays
+# gitignored.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -122,18 +120,7 @@ for n in "${CHECKERS[@]}"; do
 done
 echo
 
-echo "== tsc (-p $CORPUS, noEmit via tsconfig) =="
-if [ -z "${TSC:-}" ] && ensure_baseline tsc; then
-    TSC=bench/baselines/tsc/node_modules/typescript/bin/tsc
-fi
-if [ -n "${TSC:-}" ] && [ -f "$TSC" ]; then
-    run_median "tsc $(node "$TSC" --version 2>/dev/null | awk '{print $2}')" node "$TSC" -p "$CORPUS"
-else
-    echo "  tsc baseline unavailable (set TSC=/path/to/typescript/bin/tsc) — skipped"
-fi
-echo
-
-echo "== tsgo / native tsc (-p $CORPUS, noEmit via tsconfig) =="
+echo "== tsgo (-p $CORPUS, noEmit via tsconfig) =="
 if [ -z "${TSGO:-}" ] && ensure_baseline tsgo; then
     # TS 7 stable merged tsgo into the typescript package; the platform
     # binary is what we time (no Node wrapper), so RSS is the real process.
@@ -148,5 +135,5 @@ fi
 if [ -n "${TSGO:-}" ] && [ -x "$TSGO" ]; then
     run_median "tsgo $("$TSGO" --version 2>/dev/null | awk '{print $2}')" "$TSGO" -p "$CORPUS"
 else
-    echo "  native tsc (tsgo) baseline unavailable (set TSGO=/path/to/native/tsc) — skipped"
+    echo "  tsgo baseline unavailable (set TSGO=/path/to/native/tsc) — skipped"
 fi

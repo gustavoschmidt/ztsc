@@ -14,7 +14,7 @@ zig build                 # debug binary -> zig-out/bin/ztsc
 zig build run -- <args>   # build and run ztsc
 zig build test            # unit tests + conformance suite
 zig build bench           # ReleaseFast binary -> zig-out/bench/ztsc
-bench/e2e.sh multi        # end-to-end vs tsc/tsgo (if on PATH)
+bench/e2e.sh multi        # end-to-end vs tsgo
 ```
 
 ## Before every commit
