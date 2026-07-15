@@ -801,6 +801,21 @@ const Parser = struct {
             },
             .keyword_import => return p.parseImportStatement(),
             .keyword_export => return p.parseExportStatement(),
+            .keyword_global => {
+                // Bare `global { ... }` augmentation (no leading `declare`), as
+                // used inside ambient module blocks in real `@types/node`
+                // (`declare module "buffer" { global { var Buffer … } }`). Only
+                // when directly followed by `{`; otherwise `global` is an
+                // ordinary contextual-keyword identifier (`global.foo`, a label).
+                if (p.peekTag(1) == .l_brace) return p.parseGlobalAugmentation();
+                if (p.peekTag(1) == .colon) {
+                    const label = try p.bump();
+                    _ = try p.bump(); // ':'
+                    const body = try p.parseStatement();
+                    return p.addNode(.{ .tag = .labeled_stmt, .main_token = label, .data = .{ .lhs = body, .rhs = 0 } });
+                }
+                return p.parseExpressionStatement();
+            },
             .keyword_enum => return p.parseEnumDecl(0),
             .keyword_namespace, .keyword_module => {
                 // Only a namespace when followed by a name / string.
