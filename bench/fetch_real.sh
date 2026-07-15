@@ -96,7 +96,32 @@ write_tsconfig "drizzle-orm_0.33.0"         '["esnext"]'        '"include": ["**
 write_tsconfig "_sinclair_typebox_0.33.12"  '["esnext"]'        '"include": ["**/*.d.ts"]'
 write_tsconfig "ajv_8.17.1"                 '["esnext"]'        '"include": ["**/*.d.ts"]'
 write_tsconfig "chalk_5.3.0"                '["esnext"]'        '"include": ["**/*.d.ts"]'
-echo "wrote 7 benchmark tsconfigs (BENCHMARKS.md §2)"
+
+# @types/react is the frontend cornerstone: it lists `dom` and needs
+# `jsx: preserve`. Its `**/*.d.ts` glob would pull the `ts5.0/`
+# alternate-version dir and collide (like @types/node), so pin the standard
+# entry points a real app resolves via explicit `files`. Its deps (csstype,
+# prop-types) are vendored but left unresolved here, exactly like the other
+# packages' deps — both tools report the same two TS2307s and check on.
+react_dir="$root/_types_react_18.3.11"
+if [ -d "$react_dir" ]; then
+  cat > "$react_dir/tsconfig.json" <<'EOF'
+{
+  "compilerOptions": {
+    "noEmit": true,
+    "strict": true,
+    "target": "esnext",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "jsx": "preserve",
+    "types": [],
+    "lib": ["esnext", "dom"]
+  },
+  "files": ["index.d.ts", "jsx-runtime.d.ts", "jsx-dev-runtime.d.ts", "global.d.ts"]
+}
+EOF
+fi
+echo "wrote 8 benchmark tsconfigs (BENCHMARKS.md §2)"
 
 if [[ "${1:-}" == "census" ]]; then
   bin="$here/../zig-out/bin/ztsc"

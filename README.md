@@ -26,7 +26,7 @@ floors):
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/benchmarks-dark.svg">
-  <img alt="Peak memory and wall clock across seven packages: ztsc uses 7-24 MB where tsgo uses 44-275 MB, and takes 11-45 ms where tsgo takes 18-239 ms" src="docs/benchmarks-light.svg">
+  <img alt="Peak memory and wall clock across eight packages: ztsc uses 7-24 MB where tsgo uses 44-275 MB, and takes 11-45 ms where tsgo takes 18-247 ms" src="docs/benchmarks-light.svg">
 </picture>
 
 Full results, methodology, and limitations of the comparison:
