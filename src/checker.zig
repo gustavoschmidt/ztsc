@@ -108,6 +108,12 @@ pub const Diag = struct {
 pub const Stats = struct {
     types_created: usize = 0,
     type_bytes: usize = 0,
+    /// This checker's own store footprint, excluding the shared frozen base
+    /// (M19). Equals `types_created`/`type_bytes` under `--no-frozen-store`;
+    /// with the frozen store on it isolates the per-checker duplication that
+    /// piece 2 claws back.
+    overlay_types: usize = 0,
+    overlay_bytes: usize = 0,
     relation_entries: usize = 0,
     relation_bytes: usize = 0,
     relation_hits: usize = 0,
@@ -164,7 +170,7 @@ pub fn checkFiles(
     base: ?*const types.Store,
     inst_cache_on: bool,
 ) Error!Check {
-    var c = try Checker.init(arena, io, gpa, interner, prog, owned, base, inst_cache_on);
+    var c = try Checker.init(arena, io, gpa, interner, prog, owned, base, inst_cache_on, null);
     defer c.deinit();
     try c.run();
     return c.seal();
@@ -184,7 +190,7 @@ pub fn checkFilesAndDump(
     inst_cache_on: bool,
     w: *std.Io.Writer,
 ) (Error || std.Io.Writer.Error)!Check {
-    var c = try Checker.init(arena, io, gpa, interner, prog, owned, base, inst_cache_on);
+    var c = try Checker.init(arena, io, gpa, interner, prog, owned, base, inst_cache_on, null);
     defer c.deinit();
     try c.run();
     for (owned) |f| {
@@ -209,34 +215,60 @@ pub fn checkAndDump(
 ) (Error || std.Io.Writer.Error)!Check {
     const prog = try arena.create(modules.Program);
     prog.* = try modules.singleFileProgram(arena, "", src, tree, bind);
-    var c = try Checker.init(arena, io, gpa, interner, prog, &.{0}, null, true);
+    var c = try Checker.init(arena, io, gpa, interner, prog, &.{0}, null, true, null);
     defer c.deinit();
     try c.run();
     try c.dumpTypes(w);
     return c.seal();
 }
 
-/// Build the shared frozen base type store (M14.5, ROADMAP §M14.5 piece 2).
-/// Runs single-threaded after link, before any checker worker spawns. The
-/// returned store's arrays live in `store_arena` (which must outlive every
-/// overlay built over it); the caller freezes-and-shares it as each
-/// per-checker overlay's `base`.
+/// Build the shared frozen base type store (M14.5 architecture, M19 piece 2
+/// payload). Runs single-threaded after link, before any checker worker
+/// spawns. The returned store's arrays live in `store_arena` (which must
+/// outlive every overlay built over it); the caller freezes-and-shares it as
+/// each per-checker overlay's `base`.
 ///
-/// Base payload today: the well-known intrinsics only. Because a fresh
-/// overlay then allocates its first local id at `base_len` (== the intrinsic
-/// count) exactly as a non-overlay store allocates its first non-intrinsic id,
-/// overlay TypeIds match the non-frozen path id-for-id — so diagnostics are
-/// byte-identical with the frozen store on or off. Pre-expanding the
-/// lib/`@types` body into the base (the RSS win, reusing the M11 merge table
-/// to enumerate lib symbols) is deferred to the larger embedded lib: it would
-/// relocate lib types to low base ids. The display-order prerequisite that used
-/// to block it — union/intersection members were printed in raw-TypeId order —
-/// is resolved (M19.1): `printType` now orders members structurally
-/// (`sortMembersStructural`/`writeSortKey`), TypeId-independent, so relocating
-/// lib ids no longer changes any message. The overlay machinery is fully in
-/// place for the payload follow-up (piece 2).
-pub fn buildBaseStore(store_arena: Allocator) Error!types.Store {
-    var base = try types.Store.init(store_arena);
+/// Payload: the well-known intrinsics **plus** the pre-expanded lib/`@types`
+/// type population. A transient checker whose type store *is* the base
+/// (allocated in `store_arena`, so it survives the checker's `deinit`) walks
+/// every lib global — `Program.globals` for single-contributor names, the
+/// `Program.merged` range for cross-file merges (the M11 merge table, reused
+/// per M11 invariant 6) — and forces both its value type (`typeOfSymbol`) and
+/// its type-space instance shape (`interfaceGeneric`/`aliasGeneric`/
+/// `classInstanceGeneric`, exactly what `checkInterfaceDecl` et al. force
+/// eagerly). Each expansion interns structural types once into the base;
+/// per-checker overlays then probe the base map first (`internType`) and
+/// share those ids instead of re-interning the whole lib N times — the RSS
+/// and per-checker-duplication claw-back.
+///
+/// Relocating lib types to low base ids changes their absolute TypeId values,
+/// so a fresh overlay's ids no longer match the non-frozen path id-for-id.
+/// This is output-neutral because the only persisted state keyed on absolute
+/// TypeId order is union/intersection member *storage* order (`makeUnion`/
+/// `makeIntersection`), and M19.1 decoupled *display* from storage order:
+/// `printType` sorts members structurally (`sortMembersStructural`/
+/// `writeSortKey`), TypeId-independent. The `--no-frozen-store` oracle (this
+/// path off vs on, across `--checkers ∈ {1,4,8}`) is the empirical proof that
+/// diagnostics stay byte-identical.
+///
+/// Per-symbol expansion is best-effort: a symbol that fails to expand interns
+/// nothing extra and its overlay fills the gap lazily, so correctness never
+/// depends on completeness — only the size of the RSS win does.
+pub fn buildBaseStore(
+    store_arena: Allocator,
+    io: Io,
+    gpa: Allocator,
+    interner: *Interner,
+    prog: *const modules.Program,
+) Error!types.Store {
+    // The base builder owns no files (`run` is never called); only its type
+    // store is kept. `store_alloc = store_arena` puts that store in the arena
+    // that outlives every overlay; all other checker state (caches, arenas)
+    // lives in `carena` and is released by `deinit`.
+    var c = try Checker.init(store_arena, io, gpa, interner, prog, &.{}, null, true, store_arena);
+    defer c.deinit();
+    c.preexpandGlobals();
+    var base = c.ts;
     base.freeze();
     return base;
 }
@@ -514,6 +546,13 @@ const Checker = struct {
         /// Enable the M15 instantiation caching layer (`false` under
         /// `--no-inst-cache`, the correctness oracle / benchmark "before" leg).
         inst_cache_on: bool,
+        /// Allocator for a *non-overlay* type store whose contents must outlive
+        /// this checker — the frozen-base builder (M19 piece 2) passes the
+        /// shared store arena here so its pre-expanded lib types survive
+        /// `deinit`. Null (the normal path) keeps the store in `carena`, freed
+        /// with the checker. Ignored when `base != null` (an overlay's local
+        /// types always die with the checker, so they stay in `carena`).
+        store_alloc: ?Allocator,
     ) Error!Checker {
         const first = if (owned.len > 0) owned[0] else 0;
         const f0 = &prog.files[first];
@@ -541,7 +580,7 @@ const Checker = struct {
         c.scratch_arena.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         errdefer c.scratch_arena.deinit();
         const arena_alloc = c.carena.allocator();
-        c.ts = if (base) |b| try Store.initOverlay(arena_alloc, b) else try Store.init(arena_alloc);
+        c.ts = if (base) |b| try Store.initOverlay(arena_alloc, b) else try Store.init(store_alloc orelse arena_alloc);
         // Sized to include the merged-symbol range (ids ≥ totalSymbols()),
         // so merged ids are valid sym_types/sym_state indices (M11a). These
         // are indexed by *global* SymbolId — a checker reads them for foreign
@@ -613,6 +652,37 @@ const Checker = struct {
         // TDZ / use-before-assign / 2304 come from the walk itself.
     }
 
+    /// Pre-expand every lib/`@types` global into this checker's store (M19
+    /// piece 2). Called once by `buildBaseStore` on the transient base builder,
+    /// before `freeze`. Enumerates single-contributor names via
+    /// `Program.globals` and cross-file merges via the `Program.merged` range,
+    /// forcing each symbol's value and type-space types so the frozen base
+    /// holds them once for every overlay to share. Best-effort per symbol;
+    /// diagnostics emitted here are discarded (the builder seals only its
+    /// store, never its diags).
+    fn preexpandGlobals(c: *Checker) void {
+        for (c.prog.globals.syms) |sym| c.preexpandSym(sym);
+        const total = c.prog.totalSymbols();
+        for (0..c.prog.merged.len) |k| c.preexpandSym(total + @as(u32, @intCast(k)));
+    }
+
+    /// Force `sym`'s value and type-space types into the store, ignoring
+    /// failures (an unexpandable symbol simply interns nothing extra; its
+    /// overlay fills the gap lazily). Mirrors the eager expansion
+    /// `checkInterfaceDecl`/`checkTypeAliasDecl`/`checkClass` perform, plus the
+    /// value type for symbols with value meaning.
+    fn preexpandSym(c: *Checker, sym: SymbolId) void {
+        const f = c.symFlags(sym);
+        if (hasValueMeaning(f)) _ = c.typeOfSymbol(sym) catch {};
+        if (f.interface) {
+            _ = c.interfaceGeneric(sym) catch {};
+        } else if (f.type_alias) {
+            _ = c.aliasGeneric(sym) catch {};
+        } else if (f.class) {
+            _ = c.classInstanceGeneric(sym) catch {};
+        }
+    }
+
     fn seal(c: *Checker) Error!Check {
         // Keep only owned-file diagnostics (foreign spans are reported by
         // the checker that owns them), sorted for deterministic output.
@@ -633,6 +703,11 @@ const Checker = struct {
         const list = try c.out.dupe(Diag, c.diags.items);
         c.stats.types_created = c.ts.count();
         c.stats.type_bytes = c.ts.typeBytes();
+        // Overlay-local footprint (== whole store under `--no-frozen-store`,
+        // where `base == null` so `overlayCount`/`overlayBytes` report the
+        // full store).
+        c.stats.overlay_types = if (c.ts.base == null) c.ts.count() else c.ts.overlayCount();
+        c.stats.overlay_bytes = c.ts.overlayBytes();
         c.stats.relation_entries = c.relation.count();
         c.stats.relation_bytes = c.relation.capacity() * (8 + 1);
         return .{ .diagnostics = list, .stats = c.stats };
