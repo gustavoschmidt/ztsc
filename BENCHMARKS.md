@@ -10,7 +10,8 @@ memory measurements on identical inputs, not a diagnostic-parity claim
 (correctness is tracked separately by a 388-case differential conformance suite
 validated against the TypeScript compiler). Packages are vendored without their
 dependencies; both tools fully parse, bind, and check every file regardless of
-exit code. Wall times below ~10 ms saturate the timer's resolution.
+exit code. Wall times below ~10 ms saturate the timer's resolution — see the
+millisecond-precision re-measure below for honest small-package ratios.
 
 ## Results
 
@@ -67,6 +68,30 @@ Peak memory grows with the checker count on both tools — steeply on tsgo
 (drizzle-orm climbs 165 → 406 MB from N=1 to N=8), flatly on ztsc (20 → 22 MB).
 ztsc's entire N=1→N=8 range stays below tsgo's leanest single-checker run on
 every package.
+
+### Wall clock at millisecond precision (re-measured at HEAD, 2026-07-15)
+
+`/usr/bin/time`'s 10 ms resolution makes the small-package ratios above mostly
+rounding. Re-measured with a monotonic nanosecond timer around the whole
+process (median of 11 runs after one warm-up, defaults, same corpus; RSS
+median of 5 runs re-taken in the same session — HEAD includes CommonJS
+interop and the 7.0.2 lib):
+
+| package | wall ztsc / tsgo | wall vs tsgo | peak RSS ztsc / tsgo | rss vs tsgo |
+|---|---:|---:|---:|---:|
+| @types/node 22.7.4 | 16.8 / 48.1 ms | 35% | 17.7 / 99.7 MB | 18% |
+| drizzle-orm 0.33.0 | 24.2 / 241.8 ms | 10% | 22.4 / 275.1 MB | 8% |
+| hono 4.6.3 | 18.2 / 179.2 ms | 10% | 14.7 / 156.8 MB | 9% |
+| @sinclair/typebox 0.33.12 | 18.5 / 50.8 ms | 36% | 15.5 / 78.5 MB | 20% |
+| ajv 8.17.1 | 14.5 / 24.9 ms | 58% | 10.4 / 49.6 MB | 21% |
+| zod 3.23.8 | 13.1 / 159.1 ms | 8% | 9.0 / 141.2 MB | 6% |
+| chalk 5.3.0 | 12.6 / 21.5 ms | 58% | 6.4 / 43.2 MB | 15% |
+
+The two highest ratios are the two *smallest* packages: at that size both
+tools sit near their process floors (ztsc ~13 ms — startup plus the embedded
+14k-line lib front end; tsgo ~22 ms), so the ratio reflects fixed startup
+cost, not checking throughput. On every package above ~3k lines ztsc is
+3–12× faster.
 
 ## Methodology
 

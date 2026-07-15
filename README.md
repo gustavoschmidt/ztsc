@@ -4,13 +4,13 @@ An extremely fast, low-memory TypeScript type checker, written in Zig.
 
 **Documentation:** https://gustavoschmidt.github.io/ztsc/
 
-- **6–20% of tsgo's peak memory** (the native TypeScript 7 compiler) on real
+- **6–21% of tsgo's peak memory** (the native TypeScript 7 compiler) on real
   packages — and faster, not slower.
 - A **single static binary**. No Node runtime, no dependencies.
 - **Zero dependencies in the source, too** — the Zig code uses nothing but
   the Zig standard library; `build.zig.zon` lists no packages.
 - **Parallel by design**, with byte-identical output at any worker count.
-- Diagnostics **match the TypeScript compiler**, enforced by a 388-case
+- Diagnostics **match the TypeScript compiler**, enforced by a 396-case
   differential conformance suite.
 
 > [!WARNING]
@@ -20,12 +20,13 @@ An extremely fast, low-memory TypeScript type checker, written in Zig.
 ## Benchmarks
 
 Seven real, published packages on an Apple M4, identical inputs, both tools at
-their default 4 checkers — ztsc uses **6–20% of tsgo's peak memory** and
-**6–50% of its wall clock**:
+their default 4 checkers — ztsc uses **6–21% of tsgo's peak memory** and is **1.7–12× faster** (wall clock measured
+with a millisecond-precision timer; the smallest packages sit near both tools' process
+floors):
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/benchmarks-dark.svg">
-  <img alt="Peak memory and wall clock across seven packages: ztsc uses 6-22 MB where tsgo uses 44-280 MB, and is faster on every package" src="docs/benchmarks-light.svg">
+  <img alt="Peak memory and wall clock across seven packages: ztsc uses 6-22 MB where tsgo uses 43-275 MB, and takes 13-24 ms where tsgo takes 22-242 ms" src="docs/benchmarks-light.svg">
 </picture>
 
 Full results, methodology, and limitations of the comparison:
