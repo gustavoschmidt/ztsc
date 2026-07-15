@@ -502,7 +502,9 @@ dropped out of the census entirely — a re-run over the same corpus reports
 **0** `import() type` constructs (total out-of-subset falls ~2287 → ~1795),
 leaving **conditional type (44.8%) + infer (18.4%)** as the top pair and
 confirming M16a as the next-highest-value target. Table above preserved as the
-M13 snapshot.
+M13 snapshot. **Post-M18 refresh in §3.14** — after M14/M16/M18 landed, every
+type-level and callable-object bucket in this table has zeroed; only CommonJS
+interop and const-symbol computed keys remain.
 
 ## 3.13 M18.2 — the real lib vendored (before → after)
 
@@ -534,6 +536,49 @@ front-end). This is still ~26% of tsgo's RSS at N=4, so the M21 headline gate
 recorded here per the M18 mandate, not optimized — M19 (frozen-base payload +
 pre-parsed lib blob) is where the per-checker duplication and the cold-start
 parse are reclaimed.
+
+## 3.14 M18.5 — census refresh over the grown real corpus (release-readiness)
+
+The M13 census (§3.12) was taken *before* the semantic breadth of M14/M16/M18
+landed. Re-running `--census` after those milestones is the release-readiness
+evidence: nearly every M13 bucket should have zeroed, leaving only consciously-
+accepted constructs. The pinned set was also grown (77k → **~131k lines**) —
+added `@types/react`, `rxjs`, `@types/lodash`, `drizzle-orm`, `@types/jest`,
+`yup` alongside the original eight, since more package styles are checkable now
+(ORM, reactive-streams, the big ecosystem `@types`). Corpus growth toward the
+~500k-LOC target is best-effort and carried forward to M21; the refresh, not the
+LOC number, is the point.
+
+Census over the grown corpus (**2945 `.d.ts`, ~131k lines; 1249 out-of-subset
+constructs, 946 files carry any**):
+
+| construct | count | share | status |
+|---|---:|---:|---|
+| export = | 714 | 57.2% | **accepted** — CommonJS interop (@types/lodash is 689 of these; its entire API is `export = _`) |
+| static block | 406 | 32.5% | **accepted** — classifier coarseness: 808 of these are drizzle-orm's `static readonly [entityKind]: T` (a *computed member name* on a static field, labelled "static block" from its leading `static` token). Same const-symbol-key family as `computed member name`. |
+| computed member name | 85 | 6.8% | **accepted** — non-well-known computed keys (typebox `[Kind]`, `[ERR_ASSERTION]`, …); needs const-symbol key resolution |
+| import = require | 43 | 3.4% | **accepted** — CommonJS interop |
+| unknown/other | 1 | 0.1% | trivially rare |
+
+**Buckets that zeroed since M13** (each now absent from the table): `conditional
+type` (was 804), `import() type` (482), `infer` (331), `call/construct
+signature` (237), `mapped type` (160), `constructor type` (54),
+`template-literal type` (32), `unique symbol` (30), `named tuple member` (7).
+That is the entire type-level + callable-object surface M16 and M18.1 targeted,
+plus M14's `import()`/`unique symbol` — gone from real published `.d.ts`.
+
+**What remains is release-ready.** Every surviving bucket is either CommonJS
+interop consciously left out of subset for v0.0.1 (`export =` 57% + `import =
+require` 3% = 60% of the residual, and the well-known-symbol subset of computed
+keys already checks) or the const-symbol *computed property name* family
+(`static block` mislabel + `computed member name` = ~39%), which needs symbol-
+value resolution to know the key and is deferred post-v0.0.1. Nothing surprising
+and no easy parser win was found: the "static block" spike is a *classifier
+label* artifact of the same computed-key story, not a new construct. The
+`export =` share is inflated by one package (@types/lodash) whose declaration
+style is uniformly out of subset; excluding it the residual is dominated by
+computed keys. Totality holds on the full grown corpus — thousands of
+"unsupported syntax" diagnostics, zero crashes/panics.
 
 ---
 
