@@ -471,6 +471,12 @@ pub fn loadInDir(io: Io, arena: Allocator, base: Io.Dir, config_path: []const u8
                     std.mem.eql(u8, okey, "moduleResolution"))
                 {
                     try note(arena, &notes, "{s}: '{s}' accepted and ignored (ztsc always checks its fixed esnext/bundler subset)", .{ config_path, okey });
+                } else if (std.mem.eql(u8, okey, "jsx") or
+                    std.mem.eql(u8, okey, "jsxImportSource") or
+                    std.mem.eql(u8, okey, "jsxFactory") or
+                    std.mem.eql(u8, okey, "jsxFragmentFactory"))
+                {
+                    try note(arena, &notes, "{s}: '{s}' accepted and ignored (ztsc type-checks JSX via the ambient/global `JSX` namespace; it never emits)", .{ config_path, okey });
                 } else if (std.mem.eql(u8, okey, "lib")) {
                     if (try stringArray(arena, &warnings, config_path, okey, oval)) |libs| {
                         cfg.lib = libs;
@@ -623,7 +629,9 @@ fn preprocessInclude(arena: Allocator, pat: []const u8) Error![]const u8 {
 }
 
 fn hasTsExt(name: []const u8) bool {
-    return std.mem.endsWith(u8, name, ".ts");
+    // `.ts` (covers `.d.ts`) and `.tsx` (JSX). tsc includes both regardless
+    // of the `jsx` option — that option governs emit, which ztsc never does.
+    return std.mem.endsWith(u8, name, ".ts") or std.mem.endsWith(u8, name, ".tsx");
 }
 
 /// Walk the config directory collecting `.ts`/`.d.ts` files matching any

@@ -1,0 +1,15 @@
+# Expected user-code diagnostics for test/react_accept_real (format:
+# TS<code> <file> <line>), byte-for-byte what the pinned tsgo 7.0.2 oracle
+# reports for src/ under this tsconfig (jsx=preserve, strict) against the
+# real @types/react 18.3.11. Regenerate by running run.sh with the tsgo
+# baseline installed — it live-diffs and fails on drift.
+TS2322 app.tsx 19
+TS2322 app.tsx 23
+TS2322 app.tsx 28
+TS2322 app.tsx 34
+TS2322 app.tsx 36
+TS2698 app.tsx 28
+TS2741 app.tsx 21
+TS2741 app.tsx 26
+TS2741 app.tsx 32
+TS2783 app.tsx 30
