@@ -1,0 +1,43 @@
+ztsc
+====
+
+ztsc is licensed under the MIT License (see LICENSE).
+
+This product includes and derives from software developed by Microsoft
+Corporation as part of the TypeScript project:
+
+    https://github.com/microsoft/TypeScript
+
+TypeScript is licensed under the Apache License, Version 2.0. A copy of that
+license is available at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+The following components of ztsc are derived from TypeScript and remain
+subject to the Apache License, Version 2.0. Copyright for these components:
+
+    Copyright (c) Microsoft Corporation.
+
+
+1. Embedded standard library type definitions
+------------------------------------------------
+
+The file `src/lib/lib.esnext.d.ts` is redistributed, near-verbatim, from the
+TypeScript 5.5.4 standard library. It is assembled by concatenating the
+`lib.*.d.ts` reference chain rooted at `lib.esnext.d.ts` (71 files, dependency
+order; DOM / webworker / scripthost libraries excluded). Each concatenated
+section retains the original Microsoft Apache-2.0 copyright header from the
+upstream file. This file is compiled into the ztsc binary via `@embedFile`
+(see `src/modules.zig`).
+
+
+2. Diagnostic message strings
+------------------------------------------------
+
+The diagnostic message strings and their associated error codes (for example
+TS2304 "Cannot find name '{0}'.", TS2322 "Type '{0}' is not assignable to type
+'{1}'.", TS2339 "Property '{0}' does not exist on type '{1}'.") are copied
+from TypeScript's `diagnosticMessages.json` so that ztsc's output matches
+`tsc`. These strings appear in `src/checker.zig` and `src/diagnostics.zig`.
+Parser and scanner diagnostics that have no tsc analogue use ztsc's own
+message text and are not derived from TypeScript.
