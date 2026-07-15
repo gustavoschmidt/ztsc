@@ -44,7 +44,7 @@
 cd ztsc
 zig build -Doptimize=ReleaseFast   # -&gt; zig-out/bin/ztsc</code></pre>
   <p>A debug build is just <code>zig build</code>; <code>zig build test</code> runs the unit
-  tests and the 388-case differential conformance suite.</p>
+  tests and the 396-case differential conformance suite.</p>
 </section>
 
 <!-- ============================================================ -->
@@ -153,8 +153,11 @@ ztsc src/main.ts           # or explicit entry files</code></pre>
     <li><strong>No DOM lib.</strong> The embedded standard library is esnext-only, so browser
     globals (<code>Response</code>, <code>HTMLElement</code>, <code>fetch</code>, …) are not
     recognized.</li>
-    <li><strong>No CommonJS interop</strong>: <code>export =</code> and
-    <code>import x = require(…)</code>.</li>
+    <li><strong>CommonJS interop is checked</strong> (<code>export =</code>,
+    <code>import x = require(…)</code>, and ES imports against an <code>export =</code>
+    module), but a couple of corners degrade leniently rather than erroring: a namespace
+    import keeps the export's call signature, and a member of a <code>require</code>-bound
+    namespace used in <em>type</em> position resolves to <code>any</code>.</li>
     <li><strong>No const-symbol computed keys</strong> (<code>[kind]: T</code> with a
     <code>unique symbol</code> key); well-known symbols like <code>[Symbol.iterator]</code>
     work.</li>

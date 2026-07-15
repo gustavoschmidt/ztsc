@@ -46,7 +46,7 @@
   from 1 to 8 checkers).</p>
   <p>ztsc's answer is that a checker's live data can be tiny if nothing about the design fights
   it: 16 bytes per AST node, 5 per token, 28 per type, ~190 bytes of heap per source line
-  all-in. There is no collector, so footprint <em>equals</em> live data — 6–20% of tsgo's peak
+  all-in. There is no collector, so footprint <em>equals</em> live data — 6–21% of tsgo's peak
   on real packages, nearly flat as parallelism grows. Memory is the headline goal (the standing
   gate is ≤&thinsp;50% of tsgo; measured reality is far under it) with speed parity the
   constraint — and in practice ztsc is faster too, because the same choices that shrink memory
@@ -114,9 +114,10 @@
   @types/react, @types/lodash, rxjs, drizzle-orm, zod, hono, …) is a frequency table of what
   real code actually needs. The first census said conditional types and <code>infer</code> were
   half of everything missing — so they were built first. Today every type-level bucket in that
-  census reads zero; the residual is CommonJS interop and const-symbol computed keys,
-  consciously deferred. Correctness of what <em>is</em> checked is enforced differentially: a
-  388-case conformance suite validated against the pinned native TypeScript compiler
+  census reads zero, and CommonJS interop (<code>export =</code>,
+  <code>import = require</code>) has landed as well; the residual is const-symbol computed
+  keys, consciously deferred. Correctness of what <em>is</em> checked is enforced differentially: a
+  396-case conformance suite validated against the pinned native TypeScript compiler
   (tsgo 7.0.2), down to error codes and positions.</p>
 </section>
 
