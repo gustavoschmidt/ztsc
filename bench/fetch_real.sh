@@ -13,7 +13,7 @@
 # the backend gate (@types/node), an ORM (drizzle), a reactive-streams library
 # (rxjs), the big ecosystem `@types` (react/lodash/jest), and ordinary app-ish
 # libraries (date-fns, chalk). Their .d.ts are exactly the "features your
-# dependencies choose for you" (ROADMAP M16).
+# dependencies choose for you" (the M16 type-level core).
 set -euo pipefail
 
 # Pinned (name@version). Grown at M18.5 (react/rxjs/lodash/drizzle/jest/yup)
@@ -59,6 +59,40 @@ done
 total=$(find "$root" -name '*.d.ts' | wc -l | tr -d ' ')
 lines=$(find "$root" -name '*.d.ts' -exec cat {} + | wc -l | tr -d ' ')
 echo "real corpus: $total .d.ts files, ~$lines lines in $root"
+
+# Benchmark tsconfigs (BENCHMARKS.md §2). Each of the seven measured packages
+# gets a tsconfig so all three checkers run on identical inputs via -p. The
+# corpus is gitignored, so these are (re)generated here rather than committed.
+# `lib` is the minimal set that keeps tsc/tsgo clean: DOM only where the package
+# references browser globals (a web framework / validator); @types/node uses its
+# own `index.d.ts` entry (glob would pull the ts5.x alternate-version dirs and
+# collide) and esnext-only (DOM's lib globals clash with @types/node's).
+write_tsconfig() {  # <pkg-dir> <lib-json> <files-or-include-json>
+  local d="$root/$1"
+  [ -d "$d" ] || return 0
+  cat > "$d/tsconfig.json" <<EOF
+{
+  "compilerOptions": {
+    "noEmit": true,
+    "strict": true,
+    "target": "esnext",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "types": [],
+    "lib": $2
+  },
+  $3
+}
+EOF
+}
+write_tsconfig "_types_node_22.7.4"         '["esnext"]'        '"files": ["index.d.ts"]'
+write_tsconfig "zod_3.23.8"                 '["esnext","dom"]'  '"include": ["**/*.d.ts"]'
+write_tsconfig "hono_4.6.3"                 '["esnext","dom"]'  '"include": ["**/*.d.ts"]'
+write_tsconfig "drizzle-orm_0.33.0"         '["esnext"]'        '"include": ["**/*.d.ts"]'
+write_tsconfig "_sinclair_typebox_0.33.12"  '["esnext"]'        '"include": ["**/*.d.ts"]'
+write_tsconfig "ajv_8.17.1"                 '["esnext"]'        '"include": ["**/*.d.ts"]'
+write_tsconfig "chalk_5.3.0"                '["esnext"]'        '"include": ["**/*.d.ts"]'
+echo "wrote 7 benchmark tsconfigs (BENCHMARKS.md §2)"
 
 if [[ "${1:-}" == "census" ]]; then
   bin="$here/../zig-out/bin/ztsc"
