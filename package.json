@@ -1,0 +1,20 @@
+{
+  "name": "ztsc",
+  "version": "0.0.1",
+  "description": "A fast, low-memory TypeScript type checker written in Zig (no JS emit).",
+  "license": "MIT",
+  "author": "Gustavo Schmidt",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gustavoschmidt/ztsc.git"
+  },
+  "keywords": [
+    "typescript",
+    "type-checker",
+    "tsc",
+    "zig",
+    "cli",
+    "compiler",
+    "typecheck"
+  ]
+}
