@@ -792,29 +792,34 @@ fn tryCandidates(io: Io, alloc: Allocator, dir: Io.Dir, cands: []const []const u
 /// order. `stem` is a normalized path relative to `dir`. Public because
 /// tsconfig `paths` mapping (M6) feeds mapped candidates through it.
 pub fn resolveStem(io: Io, alloc: Allocator, dir: Io.Dir, stem: []const u8) Error!?[]u8 {
-    var buf: [4][]const u8 = undefined;
+    var buf: [6][]const u8 = undefined;
     var n: usize = 0;
     // Candidate paths are built with `alloc` (a scratch arena, freed after
     // the file's specifiers resolve). A previous fixed 256-byte buffer
     // silently failed on deep node_modules/@types paths — a wrong "module
     // not found" — so there is no length cap here.
-    if (std.mem.endsWith(u8, stem, ".d.ts") or std.mem.endsWith(u8, stem, ".ts")) {
+    if (std.mem.endsWith(u8, stem, ".d.ts") or std.mem.endsWith(u8, stem, ".ts") or
+        std.mem.endsWith(u8, stem, ".tsx"))
+    {
         buf[0] = stem;
         n = 1;
         return tryCandidates(io, alloc, dir, buf[0..n]);
     }
-    if (std.mem.endsWith(u8, stem, ".js")) {
-        const base = stem[0 .. stem.len - 3];
+    if (std.mem.endsWith(u8, stem, ".js") or std.mem.endsWith(u8, stem, ".jsx")) {
+        const base = stem[0..std.mem.lastIndexOfScalar(u8, stem, '.').?];
         buf[0] = try std.fmt.allocPrint(alloc, "{s}.ts", .{base});
-        buf[1] = try std.fmt.allocPrint(alloc, "{s}.d.ts", .{base});
-        n = 2;
+        buf[1] = try std.fmt.allocPrint(alloc, "{s}.tsx", .{base});
+        buf[2] = try std.fmt.allocPrint(alloc, "{s}.d.ts", .{base});
+        n = 3;
         return tryCandidates(io, alloc, dir, buf[0..n]);
     }
     buf[0] = try std.fmt.allocPrint(alloc, "{s}.ts", .{stem});
-    buf[1] = try std.fmt.allocPrint(alloc, "{s}.d.ts", .{stem});
-    buf[2] = try std.fmt.allocPrint(alloc, "{s}/index.ts", .{stem});
-    buf[3] = try std.fmt.allocPrint(alloc, "{s}/index.d.ts", .{stem});
-    n = 4;
+    buf[1] = try std.fmt.allocPrint(alloc, "{s}.tsx", .{stem});
+    buf[2] = try std.fmt.allocPrint(alloc, "{s}.d.ts", .{stem});
+    buf[3] = try std.fmt.allocPrint(alloc, "{s}/index.ts", .{stem});
+    buf[4] = try std.fmt.allocPrint(alloc, "{s}/index.tsx", .{stem});
+    buf[5] = try std.fmt.allocPrint(alloc, "{s}/index.d.ts", .{stem});
+    n = 6;
     return tryCandidates(io, alloc, dir, buf[0..n]);
 }
 
@@ -835,43 +840,63 @@ fn resolvePackage(io: Io, alloc: Allocator, dir: Io.Dir, importer_dir: []const u
     const pkg = spec[0..pkg_len];
     const sub = if (pkg_len < spec.len) spec[pkg_len + 1 ..] else "";
 
+    // For an unscoped bare package, tsc also resolves its typings from
+    // `@types/<pkg>` (the DefinitelyTyped fallback) when the real package has
+    // no types — e.g. `import … from "react"` → `node_modules/@types/react`.
+    // We probe `@types/<pkg>` right after `<pkg>` at each directory level.
+    const types_pkg: ?[]const u8 = if (pkg.len > 0 and pkg[0] != '@')
+        try std.fmt.allocPrint(alloc, "@types/{s}", .{pkg})
+    else
+        null;
+    defer if (types_pkg) |tp| alloc.free(tp);
+
     var d = importer_dir;
     while (true) {
-        const nm = if (d.len == 0)
-            try std.fmt.allocPrint(alloc, "node_modules/{s}", .{pkg})
-        else
-            try std.fmt.allocPrint(alloc, "{s}/node_modules/{s}", .{ d, pkg });
-        defer alloc.free(nm);
-
-        if (sub.len > 0) {
-            const stem = try joinNormalize(alloc, nm, sub);
-            defer alloc.free(stem);
-            if (try resolveStem(io, alloc, dir, stem)) |p| return p;
-        } else {
-            // package.json "types"/"typings", else index.d.ts / index.ts.
-            const pj = try std.fmt.allocPrint(alloc, "{s}/package.json", .{nm});
-            defer alloc.free(pj);
-            var resolved_types = false;
-            bumpProbe();
-            if (dir.readFileAlloc(io, pj, alloc, .limited(1 << 20))) |text| {
-                defer alloc.free(text);
-                if (packageTypesField(text)) |types_rel| {
-                    resolved_types = true;
-                    const stem = try joinNormalize(alloc, nm, types_rel);
-                    defer alloc.free(stem);
-                    if (try resolveStem(io, alloc, dir, stem)) |p| return p;
-                }
-            } else |_| {}
-            if (!resolved_types) {
-                const idx = try std.fmt.allocPrint(alloc, "{s}/index", .{nm});
-                defer alloc.free(idx);
-                if (try resolveStem(io, alloc, dir, idx)) |p| return p;
-            }
+        if (try resolvePackageAt(io, alloc, dir, d, pkg, sub)) |p| return p;
+        if (types_pkg) |tp| {
+            if (try resolvePackageAt(io, alloc, dir, d, tp, sub)) |p| return p;
         }
 
         if (d.len == 0 or std.mem.eql(u8, d, "/") or std.mem.eql(u8, d, ".")) return null;
         d = dirnamePart(d);
     }
+}
+
+/// Resolve `<pkg>/<sub>` under one directory level's `node_modules`, honoring
+/// `package.json` `"types"`/`"typings"` (for a bare package) or a relative
+/// stem (for a subpath). Null when nothing resolves at this level.
+fn resolvePackageAt(io: Io, alloc: Allocator, dir: Io.Dir, d: []const u8, pkg: []const u8, sub: []const u8) Error!?[]u8 {
+    const nm = if (d.len == 0)
+        try std.fmt.allocPrint(alloc, "node_modules/{s}", .{pkg})
+    else
+        try std.fmt.allocPrint(alloc, "{s}/node_modules/{s}", .{ d, pkg });
+    defer alloc.free(nm);
+
+    if (sub.len > 0) {
+        const stem = try joinNormalize(alloc, nm, sub);
+        defer alloc.free(stem);
+        return resolveStem(io, alloc, dir, stem);
+    }
+    // package.json "types"/"typings", else index.d.ts / index.ts.
+    const pj = try std.fmt.allocPrint(alloc, "{s}/package.json", .{nm});
+    defer alloc.free(pj);
+    var resolved_types = false;
+    bumpProbe();
+    if (dir.readFileAlloc(io, pj, alloc, .limited(1 << 20))) |text| {
+        defer alloc.free(text);
+        if (packageTypesField(text)) |types_rel| {
+            resolved_types = true;
+            const stem = try joinNormalize(alloc, nm, types_rel);
+            defer alloc.free(stem);
+            if (try resolveStem(io, alloc, dir, stem)) |p| return p;
+        }
+    } else |_| {}
+    if (!resolved_types) {
+        const idx = try std.fmt.allocPrint(alloc, "{s}/index", .{nm});
+        defer alloc.free(idx);
+        if (try resolveStem(io, alloc, dir, idx)) |p| return p;
+    }
+    return null;
 }
 
 /// Resolve module specifier `spec` from file `importer` (both relative to

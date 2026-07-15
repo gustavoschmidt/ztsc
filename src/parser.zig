@@ -2006,6 +2006,17 @@ const Parser = struct {
                 const extra = try p.addExtra(ast.ExportAll{ .flags = 0, .name_token = ns_name });
                 return p.addNode(.{ .tag = .export_all, .main_token = kw, .data = .{ .lhs = extra, .rhs = mod } });
             },
+            .keyword_as => {
+                // `export as namespace <Ident>;` — UMD global declaration.
+                // ztsc has no UMD-global model (packages like @types/react are
+                // imported explicitly), so parse and discard it. Common in the
+                // ecosystem's `export = X; export as namespace X;` shape.
+                _ = try p.bump(); // `as`
+                if (p.curTag() == .keyword_namespace) _ = try p.bump();
+                _ = try p.expectIdentLike();
+                try p.expectSemicolon();
+                return p.addNode(.{ .tag = .empty_stmt, .main_token = kw, .data = .{ .lhs = 0, .rhs = 0 } });
+            },
             .l_brace => return p.parseExportNamed(kw, 0),
             .keyword_type => {
                 const t1 = p.peekTag(1);

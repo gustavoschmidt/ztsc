@@ -87,8 +87,19 @@ like `tsc` — but it does not check everything yet:
   expression* (`[ns.member]`, e.g. `[EventEmitter.captureRejectionSymbol]`)
   stays out of subset, and a plain non-`unique` `symbol` key is keyed by name
   rather than as a symbol index — both under-report rather than erroring.
-- **JSX needs a `JSX` namespace in scope** — resolving it from `@types/react`
-  and spread-attribute checking are not wired up yet.
+- **JSX is checked against the real `@types/react`** — the global `JSX`
+  namespace merged out of the package (`declare global` in 18.x, or any
+  user-authored namespace), intrinsic props via `IntrinsicElements`
+  (including `DetailedHTMLProps` intersections), function- and
+  class-component props, spread attributes (`<C {...p} />`: required-prop
+  satisfaction, later-wins overwrites/TS2783, non-object spreads/TS2698,
+  weak-type TS2559), `key` via `IntrinsicAttributes`, and children via
+  `ElementChildrenAttribute` — differentially matched against tsgo (see
+  `test/react_accept_real`). Lenient corners (under-report, never a false
+  positive): prop *type* mismatches arriving inside a spread object, spreads
+  of unions/generics/index-signature types, children *value* typing
+  (TS2745/2746), and class-component prop mistakes report refined codes
+  (TS2741/2322) where tsgo's real-React path reports TS2769.
 - **tsconfig subset**: `files` / `include` / `exclude` / `baseUrl` / `paths`,
   strict mode only; other options are accepted and ignored.
 - **No watch mode or LSP yet** — both are planned next, on an architecture

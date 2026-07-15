@@ -28,6 +28,10 @@ PKGS=(
   "@types/express@4.17.21"
   "ajv@8.17.1"
   "@types/react@18.3.11"
+  # @types/react's own dependencies, so the react acceptance gate
+  # (test/react_accept_real) can assemble a complete node_modules.
+  "csstype@3.1.3"
+  "@types/prop-types@15.7.13"
   "rxjs@7.8.1"
   "@types/lodash@4.17.7"
   "drizzle-orm@0.33.0"
