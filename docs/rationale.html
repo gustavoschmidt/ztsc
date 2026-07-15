@@ -47,8 +47,8 @@
   <em>infrastructure that machines call at high frequency and high concurrency</em>. That shift
   changes which properties matter:</p>
   <ul>
-    <li><strong>Memory per instance is a density limit.</strong> One 280&thinsp;MB checker is
-    nothing on a laptop. Fifty concurrent memory-capped sandboxes is where 280&thinsp;MB vs
+    <li><strong>Memory per instance is a density limit.</strong> One 278&thinsp;MB checker is
+    nothing on a laptop. Fifty concurrent memory-capped sandboxes is where 278&thinsp;MB vs
     22&thinsp;MB decides how many agents fit on a host — and what the GB-hours cost.</li>
     <li><strong>The per-invocation floor gets multiplied by thousands.</strong> A checker run
     once a day can shrug off startup cost; a checker run on every agent edit pays it every
@@ -78,12 +78,12 @@
   memory model. Go's collector needs heap headroom — typically around 2× live data — and its
   AST and type objects are real heap objects: per-object headers, 64-bit pointers between them,
   allocation churn for the collector to chase. On the packages in the
-  <a href="./#benchmarks">benchmark</a>, tsgo peaks between 44 and 280&thinsp;MB; and its
-  footprint <em>grows steeply</em> with its parallelism (drizzle-orm: 165&thinsp;→&thinsp;406&thinsp;MB
+  <a href="./#benchmarks">benchmark</a>, tsgo peaks between 44 and 275&thinsp;MB; and its
+  footprint <em>grows steeply</em> with its parallelism (drizzle-orm: 166&thinsp;→&thinsp;403&thinsp;MB
   from 1 to 8 checkers).</p>
   <p>ztsc's answer is that a checker's live data can be tiny if nothing about the design fights
   it: 16 bytes per AST node, 5 per token, 28 per type, ~190 bytes of heap per source line
-  all-in. There is no collector, so footprint <em>equals</em> live data — 6–21% of tsgo's peak
+  all-in. There is no collector, so footprint <em>equals</em> live data — 8–21% of tsgo's peak
   on real packages, nearly flat as parallelism grows. Memory is the headline goal (the standing
   gate is ≤&thinsp;50% of tsgo; measured reality is far under it) with speed parity the
   constraint — and in practice ztsc is faster too, because the same choices that shrink memory
@@ -154,7 +154,7 @@
   census reads zero, and CommonJS interop (<code>export =</code>,
   <code>import = require</code>) has landed as well; the residual is const-symbol computed
   keys, consciously deferred. Correctness of what <em>is</em> checked is enforced differentially: a
-  396-case conformance suite validated against the pinned native TypeScript compiler
+  400-case conformance suite validated against the pinned native TypeScript compiler
   (tsgo 7.0.2), down to error codes and positions.</p>
 </section>
 
