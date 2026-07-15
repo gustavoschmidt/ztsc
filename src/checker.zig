@@ -4030,7 +4030,15 @@ const Checker = struct {
                 if (mf.getter and !mf.setter) flags |= types.prop_flag_readonly;
                 try props.append(c.scratch(), .{
                     .name = try c.nominalizeComputedKey(c.bind.member_atoms[i], kscope),
-                    .ty = try c.memberTypeOf(msym),
+                    // Route through typeOfSymbol (not memberTypeOf directly) so a
+                    // static field whose initializer reads a sibling static —
+                    // `static a = () => C.b; static b = 1` — re-enters the
+                    // in-progress guard (returns `any` transiently, then the
+                    // outer frame resolves the real type) instead of rebuilding
+                    // this same static object and recursing to a stack overflow.
+                    // Statics can't reference the class type params, so the
+                    // per-symbol type cache is sound here.
+                    .ty = try c.typeOfSymbol(msym),
                     .flags = flags,
                 });
             }
