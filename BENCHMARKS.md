@@ -580,6 +580,63 @@ style is uniformly out of subset; excluding it the residual is dominated by
 computed keys. Totality holds on the full grown corpus — thousands of
 "unsupported syntax" diagnostics, zero crashes/panics.
 
+## 3.15 M19.2 — frozen-base lib payload: implemented, verified, measured out
+
+M19 piece 2 (ROADMAP §5) was to fill the M14.5 frozen-base architecture with
+its deferred payload: pre-expand the whole lib/`@types` type population into
+the shared base **once**, single-threaded, so N per-checker overlays share it
+instead of each re-interning the lib. It was **built and fully verified**, then
+**reverted** — the payload does not pay off. Implementation preserved at commit
+`46fc806`; revert at `e810d9b`.
+
+**Correctness (why it was safe to trust the negative result).** Conformance
+388/388. A byte-identical oracle compared the payload build against the
+pre-change HEAD binary across `--checkers ∈ {1,4,8}` × `--no-frozen-store`
+{on,off} on multi, deps, and the real corpus: **16 of 17 projects were
+byte-identical**. The lone diff was rxjs `ajax.ts:385` — the object-property
+display-order instability §3.13's cohort already carries, **identical on HEAD**
+(it permutes with any lib-id assignment; M19.1's structural union/intersection
+sort meant relocating lib types to low base ids changed no message). So the
+measurement below is of a *correct* implementation, not a broken one.
+
+**Measurement (median of 3, ReleaseFast, `--memory` physical type-store bytes
+= frozen base counted once + every overlay's own bytes; peak RSS via
+`/usr/bin/time -l`; frozen-store ON = payload, OFF = `--no-frozen-store`):**
+
+| corpus | N | phys type-bytes OFF → ON | Δ | peak RSS OFF → ON |
+|---|---:|---|---:|---|
+| multi | 1 | 706,606 → 709,073 | **+0.3%** | 52.4 → 52.4 MB |
+| multi | 4 | 799,205 → 800,055 | **+0.1%** | 52.2 → 52.8 MB |
+| multi | 8 | 842,922 → 841,910 | −0.1% | ~equal (±noise) |
+| rxjs | 1 | 949,388 → 954,957 | +0.6% | 26.6 → 26.5 MB |
+| rxjs | 4 | 1,343,299 → 1,281,841 | **−4.6%** | ~equal |
+| rxjs | 8 | 1,616,091 → 1,504,234 | **−6.9%** | 30.5 → 28.6 MB (±noise) |
+
+The frozen base holds only **~90 KB / ~2,500 types — the entire lib**. Each
+per-checker overlay is **700 KB–1.4 MB**, dominated by *instantiations*
+(`Array<string>`, `Promise<Foo>`, …) and user/import types, all per-checker and
+impossible to pre-expand. So the shareable slice is tiny: rxjs saves ~7% of its
+type store at N=8; **multi gets slightly *worse*** because eager expansion
+interns the untouched lib tail (Intl, typed arrays, Atomics, WeakRef, …) that
+lazy checking never materializes. Either way the type store is **~1.5 MB of a
+~28 MB RSS**, so even a perfect trim is invisible in peak RSS. Wall clock is
+unchanged (the 527 KB lib expansion is sub-ms).
+
+**Why the premise didn't hold.** M19's rationale was that M18's real lib blows
+up per-checker duplication and needs a claw-back to keep the ≤50%-of-tsgo gate.
+But **§3.13 (M18.2) already retired that**: ztsc materializes lib types lazily,
+so only the touched surface interns, and RSS sits at **~26% of tsgo — the gate
+holds comfortably** without any payload. Pre-expanding the *whole* lib eagerly
+actively fights that laziness (the multi regression). The claw-back has no
+shortfall to claw back.
+
+**Disposition.** M19.1 (display order) stays. M19.2 is shelved (recoverable in
+history). M19.3 (pre-parsed lib blob) is now **gated on a cold-start
+measurement** before any implementation — the base build is already sub-ms and
+the interned lib surface is tiny, so the same data pattern may retire it too;
+if the isolated lib parse/bind cost at startup is negligible, M19 closes as
+"19.1 landed, pieces 2–3 measured out" and work moves to M20. See ROADMAP §5.
+
 ---
 
 ## 4. Cross-checking correctness while benchmarking

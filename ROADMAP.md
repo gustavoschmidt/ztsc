@@ -1720,20 +1720,46 @@ pieces, in dependency order:
    bench flat (sort is diagnostics-only, off the hot path). Where
    differential cases pin an order against tsc, we match it; elsewhere the
    binding requirement is byte-stability across configurations, met.
-2. **The frozen-base payload.** Post-link, `buildBaseStore` (checker.zig)
-   pre-expands the lib/`@types` types into the frozen base **once,
-   single-threaded** — enumerate what to expand via the M11 merge table /
-   `Program.globals` (that reuse was designed in from M11 invariant 6) —
-   and freeze base×base relation-cache entries as a shared read-only
-   table. Per-checker overlays already delegate ids `< base_len` and
-   intern misses locally (machinery landed and oracle-tested in M14.5);
-   this piece fills the base. Honor the layout commitments (§M12): no
-   code may assume a TypeId is checker-local; all store reads via
-   `types.Store` accessors. M15's instantiation memos were built against
-   the split (`base_len`-aware) and need no retrofit. Oracle: full
-   conformance + multi/deps/real corpora byte-identical with
-   `--no-frozen-store` on vs off and across `--checkers ∈ {1,4,8}`.
-3. **Pre-parsed embedded lib blob** (was M12.2 / M14.5 piece 1). A
+2. ⛔ **MEASURED OUT (M19.2, 2026-07-15) — implemented, verified, then
+   shelved.** **The frozen-base payload.** Post-link, `buildBaseStore`
+   (checker.zig) pre-expands the lib/`@types` types into the frozen base
+   **once, single-threaded** — enumerate what to expand via the M11 merge
+   table / `Program.globals` (that reuse was designed in from M11 invariant
+   6). Per-checker overlays already delegate ids `< base_len` and intern
+   misses locally (machinery landed and oracle-tested in M14.5); this piece
+   fills the base. **Built and fully verified** — a transient checker whose
+   store *is* the base (allocated in the shared arena so it survives
+   `deinit`) forced value (`typeOfSymbol`) and type-space
+   (`interfaceGeneric`/`aliasGeneric`/`classInstanceGeneric`) types for every
+   global; overlays shared the results via the `internType` base probe.
+   **Oracle passed:** conformance 388/388, and 16/17 corpora byte-identical
+   to the pre-change HEAD across `--checkers ∈ {1,4,8}` and `--no-frozen-store`
+   on/off; the only diff was rxjs `ajax.ts:385`, the pre-existing
+   object-property-display-order instability (identical on HEAD — M19.1's
+   structural sort held, so relocating lib ids to low base ids changed no
+   message). **But it did not pay off and was reverted** (implementation
+   preserved at commit `46fc806`; revert `e810d9b`). The base holds only
+   ~90 KB / ~2,500 types — the *whole* lib — while each per-checker overlay
+   is 700 KB–1.4 MB, dominated by **instantiations** (`Array<string>`…) and
+   user/import types that are per-checker and cannot be pre-expanded. Measured
+   type-store trim: rxjs N=8 **−6.9%**, N=4 −4.6%; **multi N=4 +0.1%
+   (*worse*)** — eager expansion interns the untouched lib tail
+   (Intl/Atomics/typed arrays/…), fighting the very laziness that keeps the
+   real-lib cost small. Peak RSS unchanged (the type store is ~1.5 MB of a
+   ~28 MB RSS); wall clock unchanged (base build is sub-ms). The premise —
+   that M18's real lib blows up per-checker duplication and needs claw-back —
+   was **already retired by BENCHMARKS §3.13 (M18.2)**: lazy expansion interns
+   only the touched lib surface, RSS sits at **~26% of tsgo (gate ≤50% holds
+   comfortably)**. Full table and rationale in **BENCHMARKS §3.15**.
+3. **Pre-parsed embedded lib blob** (was M12.2 / M14.5 piece 1) — **GATED ON
+   MEASUREMENT (2026-07-15).** Before building this: the base build is already
+   sub-ms and the lib surface interned at startup is tiny, so the same data
+   pattern that retired piece 2 may retire this. **First measure what
+   cold-start lib processing actually costs** (parse/bind of the embedded lib
+   `.d.ts` at startup, isolated); only build the blob if that cost is
+   non-negligible against total cold start. If it isn't, close M19 as "19.1
+   landed, pieces 2–3 measured out" and move to M20. The design, if it *is*
+   warranted: a
    build.zig step runs ztsc's own front end over the embedded lib and
    `@embedFile`s the sealed tokens/AST/binder products (flat `u32`
    arrays, no pointers — trivially serializable); startup loads
@@ -1744,13 +1770,17 @@ pieces, in dependency order:
    must stay the contiguous versioned range the layout commitments
    describe, with the seed-table version tag rejecting a stale blob.
 
-**Gate:** diagnostics byte-identical for any `--checkers` N and for both
-cache oracles on/off, on the conformance suite *and* the real corpus;
-peak RSS at N=4 within a small constant of N=1 on the multi corpus
-**and** the real-`@types/node` corpus; blob-load vs source-parse
-cold-start recorded in BENCHMARKS.md; wall/RSS vs tsgo re-measured — this
-is the last stop before the release gate, so if ≤50%-of-tsgo doesn't hold
-here, the fix happens here, not in M21.
+**Gate (revised 2026-07-15):** the original memory gate — peak RSS at N=4
+within a small constant of N=1, ≤50% of tsgo — **is already met** (~26% of
+tsgo on the real-lib configuration, BENCHMARKS §3.13/§3.15), so M19's
+substrate pieces are no longer load-bearing for the release gate. What
+remains binding: (a) the **byte-identical** invariant (any `--checkers` N,
+both cache oracles on/off, conformance + real corpus) — held by M19.1 and
+re-proven by the M19.2 oracle; (b) the piece-3 **cold-start measurement**
+before any blob work; (c) **wall/RSS vs tsgo re-measured** at M21. The
+"fix RSS here or nowhere" framing is retired — there is no RSS shortfall to
+fix. **Net M19 status: 19.1 landed; 19.2 measured out and reverted; 19.3
+gated on the cold-start measurement (likely also measured out).**
 
 ### M20 — Pre-publish polish: license, error output, README, docs cleanup
 
