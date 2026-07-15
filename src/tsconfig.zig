@@ -23,7 +23,11 @@
 //!     patterns mapped to relative directories; feeds module resolution
 //!     (tsc rule: exact match wins, else the pattern with the longest
 //!     matched prefix).
-//!   - `types` / `lib` are ignored (ztsc has no lib support yet).
+//!   - `lib` selects the built-in lib blobs (es-core + dom); the list
+//!     replaces the default set (tsc semantics). Recognized families: `es*`
+//!     (the ES-core blob) and `dom*` (the DOM blob); others warn + ignore.
+//!     Absent `lib` = the default set (ES-core + DOM, matching tsgo).
+//!   - `types` is ignored (ztsc resolves @types via imports/references).
 //!   - Anything else warns and is ignored — unknown options never fail.
 //! - Unknown top-level keys (incl. `extends`, `references`) warn + ignore.
 //!
@@ -391,6 +395,10 @@ pub const Config = struct {
     root_files: []const []const u8 = &.{},
     /// `paths`/`baseUrl` mapping for module resolution, if configured.
     paths: ?Paths = null,
+    /// `compilerOptions.lib` entries (as written), or null when the field is
+    /// absent. Fed to `modules.resolveLibSet` to pick the built-in lib blobs;
+    /// null selects the default set (ES-core + DOM, matching tsgo).
+    lib: ?[]const []const u8 = null,
     /// Non-fatal warnings (unknown options, bad shapes) for stderr.
     warnings: []const []const u8 = &.{},
     /// Accepted-and-ignored option notes, shown under --verbose only.
@@ -463,8 +471,19 @@ pub fn loadInDir(io: Io, arena: Allocator, base: Io.Dir, config_path: []const u8
                     std.mem.eql(u8, okey, "moduleResolution"))
                 {
                     try note(arena, &notes, "{s}: '{s}' accepted and ignored (ztsc always checks its fixed esnext/bundler subset)", .{ config_path, okey });
-                } else if (std.mem.eql(u8, okey, "types") or std.mem.eql(u8, okey, "lib")) {
-                    try note(arena, &notes, "{s}: '{s}' ignored (no lib support yet)", .{ config_path, okey });
+                } else if (std.mem.eql(u8, okey, "lib")) {
+                    if (try stringArray(arena, &warnings, config_path, okey, oval)) |libs| {
+                        cfg.lib = libs;
+                        for (libs) |name| {
+                            if (!std.ascii.startsWithIgnoreCase(name, "es") and
+                                !std.ascii.startsWithIgnoreCase(name, "dom"))
+                            {
+                                try note(arena, &notes, "{s}: lib '{s}' is out of subset (ignored; ztsc ships es-core + dom)", .{ config_path, name });
+                            }
+                        }
+                    }
+                } else if (std.mem.eql(u8, okey, "types")) {
+                    try note(arena, &notes, "{s}: 'types' ignored (ztsc resolves @types via imports/references)", .{config_path});
                 } else if (std.mem.eql(u8, okey, "baseUrl")) {
                     if (oval == .string) {
                         base_url = oval.string;
@@ -991,7 +1010,7 @@ test "config-driven program builds and checks (conformance-style)" {
 
     var interner = @import("intern.zig").Interner.init();
     defer interner.deinit(gpa);
-    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, cfg.root_files, true);
+    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, cfg.root_files, .none);
     try testing.expectEqual(@as(usize, 2), br.program.files.len);
 
     const checker = @import("checker.zig");

@@ -62,8 +62,18 @@ Run `ztsc --help` for all options.
 ztsc is a batch checker for strict-mode TypeScript. What it checks, it checks
 like `tsc` — but it does not check everything yet:
 
-- **No DOM lib.** The embedded standard library is esnext-only, so browser
-  globals (`Response`, `HTMLElement`, `fetch`, …) are not recognized.
+- **DOM lib via `lib`.** The embedded standard library ships the ES-core..esnext
+  surface plus the real TypeScript DOM lib (`dom` + `dom.iterable` +
+  `dom.asynciterable`). The tsconfig `compilerOptions.lib` field selects blobs:
+  a list replaces the default (tsc semantics), recognizing the `es*` and `dom*`
+  families (other families warn + ignore). With no `lib` field the default is
+  ES-core + DOM, matching tsgo's target-esnext default, so browser globals
+  (`Response`, `HTMLElement`, `fetch`, `document`, `console`, …) resolve.
+  `lib:["esnext"]` gives the backend configuration (no DOM). Known gap:
+  `for…of` over a DOM collection whose iterator is added by interface merging
+  (e.g. `URLSearchParams`, `Headers`) is not yet recognized (a pre-existing
+  merged-interface iterator limitation, also affecting `for await` over
+  `AsyncIterable`); single-declaration iterables like `NodeListOf` work.
 - **CommonJS interop is checked** (`export =`, `import x = require(…)`, and
   default/named/namespace ES imports against an `export =` module), but a couple
   of corners degrade leniently rather than erroring: a namespace import keeps the
