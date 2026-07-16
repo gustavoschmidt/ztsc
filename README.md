@@ -2,50 +2,36 @@
 
 An extremely fast, low-memory TypeScript type checker, written in Zig.
 
-**Documentation:** https://gustavoschmidt.github.io/ztsc/
+**Documentation & internals:** https://gustavoschmidt.github.io/ztsc/
 
-- **8–20% of tsgo's peak memory** (the native TypeScript 7 compiler) on real
-  packages — and faster, not slower.
-- A **single static binary**. No Node runtime, no dependencies.
-- **Zero dependencies in the source, too** — the Zig code uses nothing but
-  the Zig standard library; `build.zig.zon` lists no packages.
+- **At least 5× less peak memory** than tsgo (the native TypeScript 7
+  compiler) on real packages — up to 12×.
+- **At least 2× faster** — wall clock, defaults vs. defaults — up to 11×.
+- A **single static binary**. No Node runtime, no dependencies — and none in
+  the source either: nothing but the Zig standard library.
 - **Parallel by design**, with byte-identical output at any worker count.
 - Diagnostics **match the TypeScript compiler**, enforced by a 400-case
   differential conformance suite.
-
-> [!WARNING]
-> ztsc is pre-release and not ready for production use. It checks a large,
-> well-defined subset of TypeScript — full feature parity is in the works.
-
-## Benchmarks
-
-Eight real, published packages on an Apple M4, identical inputs, both tools at
-their default 4 checkers — ztsc uses **8–20% of tsgo's peak memory** and is **2.1–11× faster** (wall clock measured
-with a millisecond-precision timer; the smallest packages sit near both tools' process
-floors):
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/benchmarks-dark.svg">
   <img alt="Peak memory and wall clock across eight packages: ztsc uses 7-23 MB where tsgo uses 44-272 MB, and takes 9-34 ms where tsgo takes 19-248 ms" src="docs/benchmarks-light.svg">
 </picture>
 
-Full results, methodology, and limitations of the comparison:
-[BENCHMARKS.md](BENCHMARKS.md).
+> [!WARNING]
+> ztsc is pre-release and not ready for production use. It checks a large,
+> well-defined subset of TypeScript — see [Limitations](#limitations).
+> Full feature parity is in the works.
 
 ## Getting started
-
-v0.0.1 is not on npm yet. Once it is:
 
 ```sh
 bunx ztsc        # or: npx ztsc
 ```
 
-Until then, build from source — all you need is [Zig](https://ziglang.org)
-0.16.0:
-
-```sh
-zig build -Doptimize=ReleaseFast   # -> zig-out/bin/ztsc
-```
+> v0.0.1 is not on npm yet — until then, build from source with
+> [Zig](https://ziglang.org) 0.16.0:
+> `zig build -Doptimize=ReleaseFast` → `zig-out/bin/ztsc`.
 
 Point it at a project and it does the rest:
 
@@ -56,6 +42,17 @@ ztsc src/main.ts           # or explicit entry files
 ```
 
 Run `ztsc --help` for all options.
+
+## Benchmarks
+
+Eight real, published packages on an Apple M4, identical inputs, both tools at
+their default 4 checkers — ztsc uses **8–20% of tsgo's peak memory** and is
+**2.1–11× faster** (wall clock measured with a millisecond-precision timer;
+the smallest packages sit near both tools' process floors, so their ratios
+reflect fixed startup cost rather than checking throughput).
+
+Full results, methodology, and limitations of the comparison:
+[BENCHMARKS.md](BENCHMARKS.md).
 
 ## Limitations
 
