@@ -68,6 +68,40 @@ itself measured out. The whole process wall sits below `/usr/bin/time`'s
 of the binary. Real complexity (a build.zig serialization step, versioned
 layout, staleness checks) for an invisible win, so it was never built.
 
+**Re-measured after lib sharding + default-lib-check skip — smaller,
+still out.** Two later changes shrank the recoverable slice further: lib
+files are no longer type-checked by default, and the lib blobs are now
+sharded (dom×8 / esnext×4) so the lib scan→parse→bind fans out across the
+worker pool instead of running serially. The recoverable cost is exactly
+the lib share of the front-end wall — the `discover` phase, which a blob
+skips; link and lib type-forcing still run and are *not* recoverable.
+Isolated as `discover(config) − discover(--noLib)`, ReleaseFast binary, at
+default fan-out (10 workers / 8 checkers on a 10-core box), median of 15
+runs each:
+
+| config | recoverable front-end wall |
+| --- | --- |
+| trivial file, DOM (default lib) | ≈ 3.2 ms |
+| trivial file, esnext-only | ≈ 1.0 ms |
+| zod (DOM) | ≈ 2.0 ms |
+| chalk (esnext) | ≈ 1.0 ms |
+| @types/node (esnext, 61 files) | ≈ 0 ms (buried in noise; a slightly *negative* delta — removing lib files from a 10-worker pool of larger user `.d.ts` barely moves wall) |
+
+So the pre-sharding "~2–4 ms" is now the *ceiling* (trivial + DOM, where
+nothing hides the lib), and on real projects it's ~1–2 ms and vanishes
+into run-to-run noise. Sharding already spent most of the win a snapshot
+would have delivered: the lib front-end work is unchanged in total, but
+parallelism collapsed its *wall* contribution. Even at the trivial-DOM
+ceiling, the front-end is only ~3 ms of a ~15 ms internal wall — the other
+~12 ms is link + lib type-forcing + interner seed + thread/arena setup,
+none of which a front-end blob touches. Peak RSS: the DOM lib costs
+~12 MB (trivial DOM 15.3 MB vs `--noLib` 3.0 MB), esnext-only ~3 MB — but
+the lib *source* (~3 MB, already `@embedFile` rodata / clean file-backed
+pages) is not where that sits, and the type store + interner rebuild at
+runtime regardless; RSS also already runs at ~26% of tsgo against a ≤50%
+gate. Still below the ~10 ms bar by every measure, and further out than
+before — not built.
+
 **Design, preserved.** If built: depends on deterministic seeded atoms —
 the blob bakes atom values, so the seeded lib-atom prefix must stay a
 contiguous versioned range, with a seed-table version tag rejecting a
