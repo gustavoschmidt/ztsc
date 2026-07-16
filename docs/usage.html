@@ -68,7 +68,7 @@ ztsc src/main.ts           # or explicit entry files</code></pre>
       <tr><td class="num"><code>--verbose</code></td><td>print notes about accepted-but-ignored tsconfig options</td></tr>
       <tr><td class="num"><code>--noLib</code></td><td>skip the built-in esnext lib — no globals, no primitive/array methods (matches tsc)</td></tr>
       <tr><td class="num"><code>--lib=a,b,c</code></td><td>select built-in lib blobs (<code>es*</code>, <code>dom*</code> families); overrides the tsconfig <code>lib</code> field</td></tr>
-      <tr><td class="num"><code>--check-default-lib</code></td><td>also type-check the embedded lib files; skipped by default — the shipped lib is pre-verified (tsc's <code>skipDefaultLibCheck</code>)</td></tr>
+      <tr><td class="num"><code>--skip-default-lib-check</code></td><td>do <em>not</em> type-check the embedded lib files (checked by default, matching tsc/tsgo; tsc's <code>skipDefaultLibCheck</code>)</td></tr>
       <tr><td class="num"><code>--workers=N</code></td><td>worker threads for the front end (default: CPU count)</td></tr>
       <tr><td class="num"><code>--checkers=N</code></td><td>independent checker instances (default: min(4, CPUs)); output is byte-identical for any N</td></tr>
       <tr><td class="num"><code>-h, --help</code></td><td>print help and exit</td></tr>
@@ -118,11 +118,15 @@ ztsc src/main.ts           # or explicit entry files</code></pre>
   <code>lib</code> field selects blobs (<code>es*</code> and <code>dom*</code> families; the
   default is ES-core + DOM, matching tsgo's target-esnext default);
   <code>--lib=…</code> overrides it and <code>--noLib</code> turns the lib off entirely.</p>
-  <p>The <code>skipLibCheck</code> and <code>skipDefaultLibCheck</code> keys are accepted
-  (with a <code>--verbose</code> note rather than an unknown-option warning): the built-in
-  standard library is never re-checked by default — it ships pre-verified — while your
-  dependencies' <code>.d.ts</code> are still checked. The <code>--check-default-lib</code>
-  flag restores type-checking of the embedded lib files.</p>
+  <p>By default the built-in standard library <em>is</em> type-checked, matching tsc and
+  tsgo, which check their default lib at their defaults. The <code>skipLibCheck</code> and
+  <code>skipDefaultLibCheck</code> tsconfig keys (accepted with a <code>--verbose</code>
+  note rather than an unknown-option warning) — and the <code>--skip-default-lib-check</code>
+  flag — turn that off: the embedded lib is then not type-checked, while your dependencies'
+  <code>.d.ts</code> are still checked (so <code>skipLibCheck</code> is honored only
+  partially). The CLI flag overrides the tsconfig keys. Diagnostics are byte-identical
+  either way — lib diagnostics are never surfaced — so skipping only saves a few
+  milliseconds and a few MB.</p>
 </section>
 
 <!-- ============================================================ -->
@@ -187,10 +191,6 @@ ztsc src/main.ts           # or explicit entry files</code></pre>
     object, spreads of unions/generics/index-signature types, and children <em>value</em>
     typing are unchecked; class-component prop mistakes report refined codes where tsgo
     reports TS2769.</li>
-    <li><strong>The embedded lib files are not re-type-checked</strong> by default — they ship
-    pre-verified each release (tsc's <code>skipDefaultLibCheck</code>);
-    <code>--check-default-lib</code> restores the check, with byte-identical diagnostics
-    either way.</li>
     <li>A handful of other known edge cases miss an error the TypeScript compiler would
     report.</li>
   </ul>

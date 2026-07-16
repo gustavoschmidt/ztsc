@@ -4,9 +4,9 @@ A fast, low-memory TypeScript type checker, written in Zig.
 
 **Documentation & internals:** https://gustavoschmidt.github.io/ztsc/
 
-- **At least 5× less peak memory** than tsgo (the native TypeScript 7
-  compiler) on real packages — up to 12×.
-- **At least 2× faster** — wall clock, defaults vs. defaults — up to 11×.
+- **At least 4× less peak memory** than tsgo (the native TypeScript 7
+  compiler) on real packages — up to 11×.
+- **At least 2× faster** — wall clock, defaults vs. defaults — up to 10×.
 - A **single static binary**. No Node runtime, no dependencies — and none in
   the source either: nothing but the Zig standard library.
 - **Parallel by design**, with byte-identical output at any worker count.
@@ -15,7 +15,7 @@ A fast, low-memory TypeScript type checker, written in Zig.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/benchmarks-dark.svg">
-  <img alt="Peak memory and wall clock across eight packages: ztsc uses 6-22 MB where tsgo uses 44-275 MB, and takes 7-25 ms where tsgo takes 18-242 ms" src="docs/benchmarks-light.svg">
+  <img alt="Peak memory and wall clock across eight packages: ztsc uses 7-31 MB where tsgo uses 44-274 MB, and takes 8-31 ms where tsgo takes 18-249 ms" src="docs/benchmarks-light.svg">
 </picture>
 
 > [!WARNING]
@@ -46,8 +46,8 @@ Run `ztsc --help` for all options.
 ## Benchmarks
 
 Eight real, published packages on an Apple M4, identical inputs, both tools
-at their default four checker instances — ztsc uses **8–20% of tsgo's peak memory** and is
-**2.5–11× faster** (wall clock measured with a millisecond-precision timer;
+at their default four checker instances — ztsc uses **9–23% of tsgo's peak memory** and is
+**2.3–10× faster** (wall clock measured with a millisecond-precision timer;
 the smallest packages sit near both tools' process floors, so their ratios
 reflect fixed startup cost rather than checking throughput).
 
@@ -89,9 +89,6 @@ What it does **not** check yet:
   spreads of unions/generics/index-signature types, and children *value*
   typing (TS2745/2746) are unchecked; class-component prop mistakes report
   refined codes (TS2741/2322) where tsgo reports TS2769.
-- **The embedded lib files are not re-type-checked** by default — they ship
-  pre-verified each release (tsc's `skipDefaultLibCheck`); `--check-default-lib`
-  restores the check, with byte-identical diagnostics either way.
 - A handful of other known edge cases miss an error `tsc` would report.
 
 Feature parity is in the works.
