@@ -187,6 +187,35 @@ fn dirCaseLibSet(alloc: std.mem.Allocator, io: Io, conf_dir: Io.Dir, case_rel: [
     return modules.resolveLibSet(libs.items);
 }
 
+/// `compilerOptions.skipLibCheck` from a case-local tsconfig.json (false when
+/// absent). When true, the runner suppresses every diagnostic located in a
+/// non-lib `.d.ts` file, mirroring the CLI driver (main.zig `dts_skipped`) and
+/// the `--skipLibCheck` the oracle (gen_expected.js) passes for this case.
+fn dirCaseSkipLibCheck(alloc: std.mem.Allocator, io: Io, conf_dir: Io.Dir, case_rel: []const u8) !bool {
+    return dirCaseBoolOption(alloc, io, conf_dir, case_rel, "skipLibCheck");
+}
+
+/// A boolean `compilerOptions.<key>` from a case-local tsconfig.json (false when
+/// the config, the option, or a non-boolean value is absent).
+fn dirCaseBoolOption(alloc: std.mem.Allocator, io: Io, conf_dir: Io.Dir, case_rel: []const u8, key: []const u8) !bool {
+    return (try dirCaseOptBool(alloc, io, conf_dir, case_rel, key)) orelse false;
+}
+
+/// A tri-state boolean `compilerOptions.<key>`: `true`/`false` when explicitly
+/// set to a boolean, `null` when the config or option is absent. Lets the runner
+/// mirror tsc's `noImplicitAny ?? strict` (absent = inherit strict).
+fn dirCaseOptBool(alloc: std.mem.Allocator, io: Io, conf_dir: Io.Dir, case_rel: []const u8, key: []const u8) !?bool {
+    const cfg_path = try std.fmt.allocPrint(alloc, "{s}/tsconfig.json", .{case_rel});
+    const text = conf_dir.readFileAlloc(io, cfg_path, alloc, .limited(1 << 20)) catch return null;
+    const root = ztsc.tsconfig.parseJsonc(alloc, text) catch return null;
+    if (root != .object) return null;
+    const co = root.object.get("compilerOptions") orelse return null;
+    if (co != .object) return null;
+    const v = co.object.get(key) orelse return null;
+    if (v != .boolean) return null;
+    return v.boolean;
+}
+
 /// Run the full multi-file pipeline on a directory case: discover from
 /// entry.ts, link, check (single checker instance owns all files).
 /// Returned file names are relative to the case directory.
@@ -209,8 +238,21 @@ fn runDirCase(
     // esnext,dom, but the shim covers the only DOM surface non-lib_dom cases
     // touch — see runCase).
     const lib_set = try dirCaseLibSet(alloc, io, conf_dir, case_rel);
-    const br = try modules.buildProgram(alloc, io, gpa, interner, conf_dir, &.{entry}, lib_set);
+    // Honor `skipLibCheck`: like the CLI driver, suppress every diagnostic
+    // located in a non-lib `.d.ts` (they are still parsed/bound/linked, so
+    // their types flow into `.ts` checking). The oracle is generated with
+    // `--skipLibCheck` for the same case, keeping the snapshot differential.
+    const skip_lib_check = try dirCaseSkipLibCheck(alloc, io, conf_dir, case_rel);
+    const resolve_json = try dirCaseBoolOption(alloc, io, conf_dir, case_rel, "resolveJsonModule");
+    // `allowJs`: resolve JS-only dependencies as opaque `any` modules, like the
+    // CLI driver. `noImplicitAny` mirrors tsc's `?? strict` (conformance runs
+    // strict, so an absent value is on); when off, the checker suppresses the
+    // implicit-any family, matching the `--noImplicitAny false` oracle.
+    const allow_js = try dirCaseBoolOption(alloc, io, conf_dir, case_rel, "allowJs");
+    const no_implicit_any = (try dirCaseOptBool(alloc, io, conf_dir, case_rel, "noImplicitAny")) orelse true;
+    var br = try modules.buildProgram(alloc, io, gpa, interner, conf_dir, &.{entry}, lib_set, .{ .resolve_json = resolve_json, .allow_js = allow_js });
     const prog = &br.program;
+    prog.no_implicit_any = no_implicit_any;
 
     const owned = try alloc.alloc(modules.FileId, prog.files.len);
     for (owned, 0..) |*f, i| f.* = @intCast(i);
@@ -226,6 +268,8 @@ fn runDirCase(
         // them here too so multi-file snapshots stay a fair user-code
         // differential.
         if (modules.isLibPath(pf.path)) continue;
+        // skipLibCheck: drop diagnostics located in any non-lib `.d.ts`.
+        if (skip_lib_check and modules.isDeclarationPath(pf.path)) continue;
         const rel = if (std.mem.startsWith(u8, pf.path, case_rel) and pf.path.len > case_rel.len + 1)
             pf.path[case_rel.len + 1 ..]
         else
@@ -467,7 +511,7 @@ test "determinism: diagnostics byte-identical for N = 1, 2, 4, 8 checkers" {
     defer interner.deinit(gpa);
     const alloc = arena.allocator();
 
-    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, &.{"entry.ts"}, .none);
+    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, &.{"entry.ts"}, .none, .{});
     try std.testing.expectEqual(@as(usize, 10), br.program.files.len);
 
     const ref = try renderProgramDiags(alloc, io, gpa, &interner, &br.program, 1);
@@ -529,7 +573,7 @@ test "cycle stress: N-file import ring + diamonds terminate cleanly" {
     defer interner.deinit(gpa);
     const alloc = arena.allocator();
 
-    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, &.{"entry.ts"}, .none);
+    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, &.{"entry.ts"}, .none, .{});
     try std.testing.expectEqual(@as(usize, n_ring + 3), br.program.files.len);
 
     // Clean at N=1, and byte-identical (still clean) at higher N — no
@@ -598,7 +642,7 @@ test "determinism: cross-file base cycles report identically for N = 1, 2, 4, 8"
     defer interner.deinit(gpa);
     const alloc = arena.allocator();
 
-    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, &.{"entry.d.ts"}, .none);
+    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, &.{"entry.d.ts"}, .none, .{});
 
     const ref = try renderProgramDiags(alloc, io, gpa, &interner, &br.program, 1);
     // Every interface on every cycle is reported: 2 per cluster.

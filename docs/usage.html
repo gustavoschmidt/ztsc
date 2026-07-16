@@ -119,14 +119,22 @@ ztsc src/main.ts           # or explicit entry files</code></pre>
   default is ES-core + DOM, matching tsgo's target-esnext default);
   <code>--lib=…</code> overrides it and <code>--noLib</code> turns the lib off entirely.</p>
   <p>By default the built-in standard library <em>is</em> type-checked, matching tsc and
-  tsgo, which check their default lib at their defaults. The <code>skipLibCheck</code> and
-  <code>skipDefaultLibCheck</code> tsconfig keys (accepted with a <code>--verbose</code>
-  note rather than an unknown-option warning) — and the <code>--skip-default-lib-check</code>
-  flag — turn that off: the embedded lib is then not type-checked, while your dependencies'
-  <code>.d.ts</code> are still checked (so <code>skipLibCheck</code> is honored only
-  partially). The CLI flag overrides the tsconfig keys. Diagnostics are byte-identical
-  either way — lib diagnostics are never surfaced — so skipping only saves a few
-  milliseconds and a few MB.</p>
+  tsgo, which check their default lib at their defaults. The <code>--skip-default-lib-check</code>
+  flag and the tsconfig <code>skipDefaultLibCheck</code> key (accepted with a
+  <code>--verbose</code> note rather than an unknown-option warning) turn that off for the
+  <em>embedded lib only</em>: it is then not type-checked. Diagnostics are byte-identical
+  either way — lib diagnostics are never surfaced — so this only saves a few milliseconds
+  and a few MB.</p>
+  <p>The tsconfig <code>skipLibCheck</code> key is the strict superset (as in tsc): it
+  suppresses <em>all</em> diagnostics located in <em>any</em> <code>.d.ts</code> file — the
+  embedded lib, dependency <code>.d.ts</code>, and your own project <code>.d.ts</code> alike.
+  Those files are still parsed, bound, and linked, so their types flow into your
+  <code>.ts</code>/<code>.tsx</code> checking unchanged; only errors <em>reported inside</em>
+  a <code>.d.ts</code> disappear. A <code>.ts</code> error that merely <em>involves</em> a
+  <code>.d.ts</code>-declared type is still reported. Unlike tsc, ztsc also drops
+  <code>.d.ts</code> parser errors here (it cannot tell a genuine syntax error from a
+  parser-subset gap, and published <code>.d.ts</code> are valid), keeping to its
+  no-false-positives rule.</p>
 </section>
 
 <!-- ============================================================ -->

@@ -92,18 +92,40 @@ const DIAG_RE = /^(.+)\((\d+),(\d+)\): error TS(\d+):/;
 function optionsForDir(dir) {
   const cfgPath = path.join(dir, "tsconfig.json");
   if (!fs.existsSync(cfgPath)) return OPTIONS;
-  let lib;
+  let lib, skipLibCheck = false;
+  let resolveJson = false;
+  let allowJs = false;
+  let noImplicitAny; // tri-state: undefined = inherit strict
   try {
     const co = JSON.parse(fs.readFileSync(cfgPath, "utf8")).compilerOptions;
     if (co && Array.isArray(co.lib)) lib = co.lib.join(",");
+    if (co && co.skipLibCheck === true) skipLibCheck = true;
+    if (co && co.resolveJsonModule === true) resolveJson = true;
+    if (co && co.allowJs === true) allowJs = true;
+    if (co && typeof co.noImplicitAny === "boolean") noImplicitAny = co.noImplicitAny;
   } catch {
     return OPTIONS;
   }
-  if (!lib) return OPTIONS;
-  const out = OPTIONS.slice();
-  const at = out.indexOf("--lib");
-  if (at >= 0) out[at + 1] = lib;
-  else out.push("--lib", lib);
+  let out = OPTIONS.slice();
+  if (lib) {
+    const at = out.indexOf("--lib");
+    if (at >= 0) out[at + 1] = lib;
+    else out.push("--lib", lib);
+  }
+  // The ztsc conformance runner reads the same `skipLibCheck` (test/
+  // run_conformance.zig dirCaseSkipLibCheck) and suppresses .d.ts diagnostics.
+  if (skipLibCheck) out.push("--skipLibCheck");
+  // Likewise `resolveJsonModule` (dirCaseBoolOption): keeps the oracle and ztsc
+  // in agreement on `*.json` module resolution.
+  if (resolveJson) out.push("--resolveJsonModule");
+  // `allowJs`: the oracle resolves a JS-only dependency to its `.js` entry (ztsc
+  // types it opaquely as `any`; run_conformance.zig dirCaseBoolOption "allowJs").
+  if (allowJs) out.push("--allowJs");
+  // `noImplicitAny`: default OPTIONS pass `--strict` (which turns it on), so an
+  // explicit `false` must be passed to keep the oracle in step with ztsc, which
+  // suppresses the implicit-any family (run_conformance.zig no_implicit_any).
+  if (noImplicitAny === false) out.push("--noImplicitAny", "false");
+  else if (noImplicitAny === true) out.push("--noImplicitAny", "true");
   return out;
 }
 
