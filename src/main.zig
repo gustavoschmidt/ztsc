@@ -70,7 +70,9 @@ const usage =
     \\                         do NOT type-check the embedded lib files
     \\                         themselves (checked by default, matching tsc/
     \\                         tsgo; tsc's skipDefaultLibCheck). tsconfig
-    \\                         skipLibCheck/skipDefaultLibCheck do the same
+    \\                         skipDefaultLibCheck does the same; tsconfig
+    \\                         skipLibCheck is the superset — it suppresses all
+    \\                         diagnostics in every .d.ts (their types still flow)
     \\  --workers=N            number of worker threads (default: CPU count)
     \\  --checkers=N           number of checker instances (default: min(4, CPUs))
     \\  --repeat=N             scan/parse/bind each file N times (benchmark aid)
@@ -323,6 +325,14 @@ const Worker = struct {
                 c.err = err;
                 return;
             }
+        else if (modules.anyModuleSourceFor(path)) |any_bytes|
+            // A resolved JSON module (resolveJsonModule) or JS module (allowJs):
+            // type it opaquely as `any` from a synthetic body instead of parsing
+            // the raw JSON/JS as TypeScript.
+            Source.fromBytes(alloc, path, any_bytes) catch |err| {
+                c.err = err;
+                return;
+            }
         else
             Source.load(io, alloc, path) catch |err| {
                 c.err = err;
@@ -473,6 +483,14 @@ pub fn main(init: std.process.Init) !void {
     var config_lib: ?[]const []const u8 = null;
     // tsconfig skipLibCheck/skipDefaultLibCheck (false when no config / unset).
     var config_skip_lib = false;
+    // tsconfig skipLibCheck only (superset: skips ALL .d.ts, not just the lib).
+    var config_skip_all_lib = false;
+    // tsconfig resolveJsonModule + baseUrl (for `*.json` module resolution).
+    var config_resolve_json = false;
+    var config_base_url: ?[]const u8 = null;
+    // tsconfig allowJs (resolve JS-only deps as `any`) + effective noImplicitAny.
+    var config_allow_js = false;
+    var config_no_implicit_any = true;
     if (cli.paths.len == 0) {
         const config_path: []const u8 = blk: {
             if (cli.project) |p| {
@@ -516,12 +534,26 @@ pub fn main(init: std.process.Init) !void {
         paths_map = cfg.paths;
         config_lib = cfg.lib;
         config_skip_lib = cfg.skip_lib_check;
+        config_skip_all_lib = cfg.skip_all_lib_check;
+        config_resolve_json = cfg.resolve_json_module;
+        config_base_url = cfg.base_url;
+        config_allow_js = cfg.allow_js;
+        config_no_implicit_any = cfg.no_implicit_any;
     }
 
     // Effective decision: skip type-checking the embedded pre-verified lib?
     // Default is to check it (matching tsc/tsgo). The CLI flag, when given,
     // overrides the tsconfig `skipLibCheck`/`skipDefaultLibCheck` value.
     const skip_default_lib_check = cli.skip_default_lib_check orelse config_skip_lib;
+
+    // Effective decision: honor `skipLibCheck` (the superset of
+    // `skipDefaultLibCheck`)? When set, no diagnostic located in ANY `.d.ts`
+    // file is surfaced — the default lib, dependency `.d.ts`, and project-local
+    // `.d.ts` alike — so ztsc's output matches tsc's on valid `.d.ts`. Those
+    // files are still parsed/bound/linked so their types flow into `.ts`/`.tsx`
+    // checking. Only the tsconfig drives this; the `--skip-default-lib-check`
+    // CLI flag stays default-lib-only (tsc's `--skipDefaultLibCheck`).
+    const skip_all_dts_check = config_skip_all_lib;
 
     // Which built-in lib blobs to inject. Precedence: --noLib wins (nothing),
     // then an explicit --lib flag, then the tsconfig `lib` field, else the
@@ -624,7 +656,14 @@ pub fn main(init: std.process.Init) !void {
 
     // Resolution memo (M13): the same specifier imported from many files
     // resolves once. Lives in `arena` (spans the whole discovery run).
-    var rcache = modules.ResolveCache.init(arena, !cli.no_resolve_cache);
+    var rcache = modules.ResolveCache.init(arena, !cli.no_resolve_cache, .{
+        .resolve_json = config_resolve_json,
+        .base_url = config_base_url,
+        .allow_js = config_allow_js,
+    });
+    // FileId of the auto-injected `@types/node` (null until the first Node
+    // built-in import pulls it in); see the discovery loop below.
+    var node_types_fid: ?u32 = null;
     modules.resetFsProbeCount();
 
     while (outstanding > 0) {
@@ -653,11 +692,36 @@ pub fn main(init: std.process.Init) !void {
             var seen: std.AutoHashMapUnmanaged(ztsc.intern.Atom, void) = .empty;
             defer seen.deinit(gpa);
             for (b.imports) |rec| {
-                try resolveSpecInto(arena, scratch, gpa, io, &interner, &rcache, paths_map, paths.items[i], rec.module, &seen, &path_ids, &paths, &atoms, &files);
+                try resolveSpecInto(arena, scratch, gpa, io, &interner, &rcache, paths_map, config_resolve_json, paths.items[i], rec.module, &seen, &path_ids, &paths, &atoms, &files);
             }
             for (b.exports) |rec| {
                 if (rec.module != 0) {
-                    try resolveSpecInto(arena, scratch, gpa, io, &interner, &rcache, paths_map, paths.items[i], rec.module, &seen, &path_ids, &paths, &atoms, &files);
+                    try resolveSpecInto(arena, scratch, gpa, io, &interner, &rcache, paths_map, config_resolve_json, paths.items[i], rec.module, &seen, &path_ids, &paths, &atoms, &files);
+                }
+            }
+            // Pull @types/node into the program on the first Node built-in
+            // import (`node:fs`, `path`, …), like tsc auto-including @types: its
+            // ambient `declare module "fs"` / `declare module "node:fs"` blocks
+            // then resolve those specifiers. Injected once, discovered like a
+            // triple-slash reference so the deterministic BFS reaches it (and,
+            // via its own `/// <reference>` refs, every submodule .d.ts).
+            if (node_types_fid == null) {
+                for (b.imports) |rec| {
+                    if (!modules.isNodeBuiltin(interner.lookup(io, rec.module))) continue;
+                    if (try rcache.resolve(io, scratch, Io.Dir.cwd(), paths.items[i], "@types/node")) |np| {
+                        const pgop = try path_ids.getOrPut(arena, np);
+                        if (pgop.found_existing) {
+                            node_types_fid = pgop.value_ptr.*;
+                        } else {
+                            const stable = try arena.dupe(u8, np);
+                            pgop.key_ptr.* = stable;
+                            node_types_fid = @intCast(paths.items.len);
+                            pgop.value_ptr.* = node_types_fid.?;
+                            try paths.append(arena, stable);
+                        }
+                        try ref_files.append(arena, node_types_fid.?);
+                    }
+                    break;
                 }
             }
             // Triple-slash `/// <reference>` directives pull extra files into
@@ -785,6 +849,7 @@ pub fn main(init: std.process.Init) !void {
         .constit_keys = lr.constit_keys,
         .constit_vals = lr.constit_vals,
         .export_equals_atom = lr.export_equals_atom,
+        .no_implicit_any = config_no_implicit_any,
     };
     const link_ns = link_timer.readNs();
 
@@ -820,6 +885,11 @@ pub fn main(init: std.process.Init) !void {
             // skipDefaultLibCheck) drops them — pure time savings, since lib
             // diagnostics are never surfaced (tsc's skipDefaultLibCheck).
             if (skip_default_lib_check and modules.isLibPath(paths.items[i])) continue;
+            // skipLibCheck: a non-lib `.d.ts` produces no surfaced check
+            // diagnostics, and its types are resolved lazily on demand from
+            // `.ts` files (not by walking it), so its check pass is dead work —
+            // don't enqueue it. Pure time savings, deterministic (path-based).
+            if (skip_all_dts_check and modules.isDeclarationPath(paths.items[i])) continue;
             const cost: u64 = if (trees.items[i]) |tree| tree.nodes.len else 0;
             items.appendAssumeCapacity(.{ .file = @intCast(i), .cost = cost });
         }
@@ -902,6 +972,16 @@ pub fn main(init: std.process.Init) !void {
     const is_lib = try arena.alloc(bool, paths.items.len);
     for (paths.items, 0..) |p, i| is_lib[i] = modules.isLibPath(p);
 
+    // Non-lib `.d.ts` files whose diagnostics are fully suppressed by
+    // `skipLibCheck` (parse + bind + link + check), mirroring how the built-in
+    // lib is suppressed. See the emit loop for why parser diagnostics are
+    // dropped too (ztsc can't distinguish a genuine syntax error from a
+    // parser-subset-gap cascade, and valid published `.d.ts` have neither).
+    // Path-based, so identical for any --workers/--checkers count (determinism).
+    const dts_skipped = try arena.alloc(bool, paths.items.len);
+    for (paths.items, 0..) |p, i|
+        dts_skipped[i] = skip_all_dts_check and !is_lib[i] and modules.isDeclarationPath(p);
+
     var parse_diags: usize = 0;
     for (trees.items, 0..) |maybe_tree, i| {
         const tree = maybe_tree orelse continue;
@@ -911,7 +991,7 @@ pub fn main(init: std.process.Init) !void {
         node_bytes += tree.nodeBytes();
         extra_bytes += tree.extraBytes();
         ast_token_bytes += tree.tokens.byteSize();
-        if (!is_lib[i]) parse_diags += tree.diagnostics.len;
+        if (!is_lib[i] and !dts_skipped[i]) parse_diags += tree.diagnostics.len;
     }
 
     var total_symbols: usize = 0;
@@ -931,12 +1011,12 @@ pub fn main(init: std.process.Init) !void {
         bind_scope_bytes += b.scopeBytes();
         bind_flow_bytes += b.flowBytes();
         bind_record_bytes += b.recordBytes();
-        if (!is_lib[i]) bind_diags += b.diagnostics.len;
+        if (!is_lib[i] and !dts_skipped[i]) bind_diags += b.diagnostics.len;
     }
 
     var link_diags: usize = 0;
     for (links, 0..) |*l, i| {
-        if (!is_lib[i]) link_diags += l.diags.len;
+        if (!is_lib[i] and !dts_skipped[i]) link_diags += l.diags.len;
     }
 
     var check_diags: usize = 0;
@@ -956,7 +1036,7 @@ pub fn main(init: std.process.Init) !void {
     for (tasks) |*t| {
         const ck = t.result orelse continue;
         for (ck.diagnostics) |d| {
-            if (!is_lib[d.file]) check_diags += 1;
+            if (!is_lib[d.file] and !dts_skipped[d.file]) check_diags += 1;
         }
         check_types += ck.stats.types_created;
         check_type_bytes += ck.stats.type_bytes;
@@ -1016,7 +1096,18 @@ pub fn main(init: std.process.Init) !void {
         // leaking spurious errors onto every user run. Diagnostic cursor for
         // the lib's owning checker is still advanced below so later files stay
         // aligned. Libs are the first files 0.. (see the injection site).
-        if (modules.isLibPath(path)) {
+        //
+        // Under `skipLibCheck`, `dts_skipped[i]` extends the same full
+        // suppression to every non-lib `.d.ts`. tsc keeps *syntactic* errors in
+        // `.d.ts` but suppresses semantic ones; ztsc cannot tell a genuine
+        // syntax error from a parser-subset-gap cascade (both are parser
+        // diagnostics), and real published `.d.ts` are syntactically valid, so
+        // any parser diagnostic there is overwhelmingly a ztsc false positive.
+        // The no-false-positives constraint + the under-report policy make
+        // suppressing the whole file the correct call: zero surfaced `.d.ts`
+        // diagnostics, matching tsc's observable output on valid `.d.ts`. Their
+        // types still flow into `.ts` checking (they are parsed/bound/linked).
+        if (is_lib[i] or dts_skipped[i]) {
             const owner = file_owner[i];
             if (tasks[owner].result) |ck| {
                 var cur = cursors[owner];
@@ -1378,6 +1469,7 @@ fn resolveSpecInto(
     interner: *Interner,
     rcache: *modules.ResolveCache,
     paths_map: ?ztsc.tsconfig.Paths,
+    resolve_json: bool,
     importer: []const u8,
     module_atom: ztsc.intern.Atom,
     seen: *std.AutoHashMapUnmanaged(ztsc.intern.Atom, void),
@@ -1401,9 +1493,17 @@ fn resolveSpecInto(
     var mapped: ?[]const u8 = null;
     if (paths_map) |pm| {
         if (spec.len > 0 and spec[0] != '.' and spec[0] != '/') {
+            // A `paths`-mapped `*.json` (`@fixtures/apis/x.json`) resolves to the
+            // JSON file directly — `resolveStem` only probes TS/declaration
+            // extensions and would miss it.
+            const is_json = resolve_json and std.mem.endsWith(u8, spec, ".json");
             for (try pm.mapSpecifier(scratch, spec)) |cand| {
-                if (try modules.resolveStem(io, scratch, Io.Dir.cwd(), cand)) |r| {
-                    mapped = r;
+                const r = if (is_json)
+                    try modules.resolveJsonFile(io, scratch, Io.Dir.cwd(), cand)
+                else
+                    try modules.resolveStem(io, scratch, Io.Dir.cwd(), cand);
+                if (r) |rr| {
+                    mapped = rr;
                     break;
                 }
             }

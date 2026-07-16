@@ -255,6 +255,32 @@ const max_instantiation_depth = 100;
 /// the `--no-inst-cache` oracle diverge: only the cache-independent depth
 /// limit fires in-subset).
 const max_instantiation_count = 5_000_000;
+/// Recursion-depth cap for the structural assignability relation
+/// (`isAssignable`). A recursive generic alias whose recursion is *undecidable*
+/// to ztsc — react-hook-form's `PathValueImpl`/`Path` peel a generic string
+/// path param `P` that stays symbolic, so the `P extends `${infer K}.${infer
+/// R}`` guard never resolves — makes `isAssignable` walk (via its deferred-
+/// conditional and `ref` arms) an unbounded chain of *distinct* interned
+/// `conditional`/`union`/`ref` types. Each is a fresh TypeId, so neither the
+/// per-pair relation memo nor the per-ref expansion memo repeats, and the walk
+/// recurses until the stack overflows. tsc bounds the same shape by capping its
+/// own relation recursion and assuming the pair related past the limit
+/// (`recursiveTypeRelatedTo` → `Ternary.Maybe`); we mirror that. Assume-true can
+/// only *drop* diagnostics, never add a false positive. Chosen far above any
+/// depth the conformance suite reaches (its diagnostics stay byte-identical) yet
+/// far below the worker-thread stack-overflow depth, leaving a wide safety
+/// margin on the smallest (main-thread) stack.
+const max_relation_depth = 900;
+/// Recursion-depth cap for alias-instance expansion (`aliasInstance`; see the
+/// `alias_depth` field). Fires only on pathological mutually-recursive generic
+/// alias chains (e.g. `@scalar/typebox`'s conditional type modules, whose
+/// type-argument defaults chain through ~80 distinct aliases and would otherwise
+/// overflow the stack). Past the cap the expansion yields `error_type`, which
+/// suppresses cascades rather than adding a diagnostic (no false positive; tsc
+/// resolves these via deferred conditional evaluation, out of ztsc's subset).
+/// Set far above any depth in-subset code or the conformance suite reaches, well
+/// below the worker-stack overflow depth.
+const max_alias_depth = 200;
 const max_type_string = 160;
 
 const FnCtx = struct {
@@ -453,6 +479,19 @@ const Checker = struct {
     /// `this` types pay nothing.
     has_this_types: bool = false,
     inst_depth: u32 = 0,
+    /// Live recursion depth of alias-instance expansion (`aliasInstance`).
+    /// `alias_state` already breaks *direct* self-recursion with a lazy ref, but
+    /// a chain of mutually-referential generic aliases — especially conditional
+    /// aliases whose type-argument *defaults* pull in the next alias — expands
+    /// through a fresh sym at each step, so no single `alias_state` entry is ever
+    /// "in progress". Bounded here against `max_alias_depth` so such a chain
+    /// terminates (as `error_type`) instead of overflowing the worker stack.
+    alias_depth: u32 = 0,
+    /// Live recursion depth of the structural assignability relation
+    /// (`isAssignable`), checked against `max_relation_depth` to break the
+    /// otherwise-unbounded walk over an undecidable recursive alias's
+    /// expansions (see the constant's doc comment).
+    rel_depth: u32 = 0,
     /// Total `instantiate` node-visits this run (checked against
     /// `max_instantiation_count`).
     inst_count: u64 = 0,
@@ -2854,7 +2893,9 @@ const Checker = struct {
             if (c.paramTypeAt(ctx_sig, index)) |ct| ty = ct;
         }
         if (ty == types.no_type) {
-            if (report_implicit and name != 0) {
+            // `noImplicitAny: false` suppresses TS7006 — the parameter still
+            // types as `any` below, only the diagnostic is gone.
+            if (report_implicit and name != 0 and c.prog.no_implicit_any) {
                 const tok = c.tree.nodeMainToken(name_node);
                 try c.diagFmt(7006, c.tokSpan(tok), "Parameter '{s}' implicitly has an 'any' type.", .{c.tokenText(tok)});
             }
@@ -3340,6 +3381,12 @@ const Checker = struct {
     // =====================================================================
 
     fn aliasInstance(c: *Checker, sym: SymbolId, args: []const TypeId, tok: TokenIndex) Error!TypeId {
+        // Crash guard for pathological mutually-recursive generic alias chains
+        // (see `max_alias_depth`). `alias_state` only breaks direct self-
+        // recursion; a chain through distinct syms is bounded here.
+        if (c.alias_depth >= max_alias_depth) return types.error_type;
+        c.alias_depth += 1;
+        defer c.alias_depth -= 1;
         const state = c.alias_state.get(sym) orelse 0;
         if (state == 1) {
             // In-progress: recursive alias; leave a lazy ref.
@@ -6279,6 +6326,14 @@ const Checker = struct {
     }
 
     fn isAssignable(c: *Checker, s0: TypeId, t0: TypeId) Error!bool {
+        // Structural-relation recursion guard (see `max_relation_depth`). Past
+        // the cap, assume the pair related — this only drops diagnostics, never
+        // adds a false positive. Returns before the `(s,t)` relation memo below,
+        // so the capped result is never cached and a shallower re-encounter of
+        // the same pair still computes the real answer.
+        if (c.rel_depth > max_relation_depth) return true;
+        c.rel_depth += 1;
+        defer c.rel_depth -= 1;
         // A polymorphic `this` relates through its apparent instance type. This
         // is a subset simplification (true `this` is nominally narrower than
         // the base), but sound for the fluent/builder patterns we support.
@@ -8303,10 +8358,13 @@ const Checker = struct {
             } else {
                 // A `unique symbol` that does not key a member of the target:
                 // tsc reports TS7053 (implicit-any index) rather than TS2339,
-                // since the key is a symbol, not a named property.
-                try c.diagFmt(7053, c.nodeSpan(d.rhs), "Element implicitly has an 'any' type because expression of type 'unique symbol' can't be used to index type '{s}'.", .{
-                    try c.typeToString(obj_t),
-                });
+                // since the key is a symbol, not a named property. Suppressed
+                // under `noImplicitAny: false` (implicit-'any' family).
+                if (c.prog.no_implicit_any) {
+                    try c.diagFmt(7053, c.nodeSpan(d.rhs), "Element implicitly has an 'any' type because expression of type 'unique symbol' can't be used to index type '{s}'.", .{
+                        try c.typeToString(obj_t),
+                    });
+                }
                 result = types.error_type;
             }
             if (add_undefined) return c.makeUnion2(result, types.undefined_type);
@@ -8845,7 +8903,7 @@ const Checker = struct {
                     // Infer class type args from ctor arguments.
                     const ctor = if (ctor_sigs.items.len > 0) ctor_sigs.items[0] else types.no_type;
                     if (ctor != types.no_type) {
-                        try c.inferTypeArgs(ctor, tp_syms, shape.arg_nodes, inst_args, tps.items);
+                        try c.inferTypeArgs(ctor, tp_syms, shape.arg_nodes, inst_args);
                     } else {
                         for (inst_args) |*x| x.* = types.any_type;
                     }
@@ -9018,9 +9076,7 @@ const Checker = struct {
                 _ = tp;
             }
         } else {
-            var infos = try c.scratch().alloc(TypeParamInfo, tps.len);
-            for (tps, 0..) |tp, i| infos[i] = .{ .sym = tp, .constraint = 0, .default = 0 };
-            try c.inferTypeArgs(sig, tps, arg_nodes, args_buf, infos);
+            try c.inferTypeArgs(sig, tps, arg_nodes, args_buf);
         }
         var map = try c.scratch().alloc(TpMap, tps.len);
         for (tps, 0..) |tp, i| map[i] = .{ .sym = tp, .ty = args_buf[i] };
@@ -9036,7 +9092,6 @@ const Checker = struct {
         tp_syms: []const u32,
         arg_nodes: []const Node,
         out: []TypeId,
-        infos: []const TypeParamInfo,
     ) Error!void {
         const candidates = try c.scratch().alloc(TypeId, tp_syms.len);
         for (candidates) |*x| x.* = types.no_type;
@@ -9078,13 +9133,16 @@ const Checker = struct {
         for (tp_syms, 0..) |tp, i| {
             prov[i] = .{ .sym = tp, .ty = if (candidates[i] != types.no_type) candidates[i] else types.any_type };
         }
+        // `infos[i].constraint` is an AST node id in the type param's
+        // *declaring* file (e.g. a foreign generic's `.d.ts`), not in `c.tree`
+        // (the call site). It is resolved via the symbol below so the
+        // constraint is evaluated in its declaring file + declaration scope
+        // (`enterSymFile` + `symScope`, per `typeParamConstraint`); evaluating
+        // the raw node against `c.tree` reads out of bounds when the two files
+        // differ. `tp == infos[i].sym`, and the symbol's type_param decl is the
+        // very node the constraint field came from, so this is equivalent.
         for (tp_syms, 0..) |tp, i| {
-            var constraint: TypeId = types.no_type;
-            if (i < infos.len and infos[i].constraint != 0) {
-                constraint = try c.typeFromTypeNode(infos[i].constraint);
-            } else {
-                constraint = try c.typeParamConstraint(tp);
-            }
+            var constraint: TypeId = try c.typeParamConstraint(tp);
             if (constraint != types.no_type) constraint = try c.instantiate(constraint, prov);
             if (candidates[i] != types.no_type) {
                 out[i] = candidates[i];
@@ -11817,6 +11875,34 @@ test "implicit any params (7006)" {
     try expectClean("function f(x = 3): number { return x; }");
     try expectClean("const f: (x: number) => number = (x) => x + 1;");
     try expectCodes("const f = (x) => x;", &.{7006});
+}
+
+test "noImplicitAny off: TS7006 suppressed, param still types as any" {
+    const src =
+        \\function f(x) { return x.anything.at.all; }
+        \\const n: number = f(1);
+    ;
+    // Default (noImplicitAny on): the unannotated param reports TS7006.
+    try expectCodes(src, &.{7006});
+
+    // noImplicitAny off: TS7006 is suppressed. `x` still types as `any`, so the
+    // deep member access is silently allowed and nothing else cascades — the
+    // observable output is "today minus the diagnostic".
+    var t: TestCheck = undefined;
+    t.arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer t.arena.deinit();
+    t.interner = Interner.init();
+    defer t.interner.deinit(testing.allocator);
+    const alloc = t.arena.allocator();
+    const tree = try alloc.create(Ast);
+    tree.* = try parser.parse(alloc, src);
+    const bound = try alloc.create(Bind);
+    bound.* = try binder.bind(alloc, testing.io, testing.allocator, &t.interner, tree, src);
+    const prog = try alloc.create(modules.Program);
+    prog.* = try modules.singleFileProgram(alloc, "", src, tree, bound);
+    prog.no_implicit_any = false; // the effective tsconfig value
+    const result = try checkFiles(alloc, testing.io, testing.allocator, &t.interner, prog, &.{0}, null, true);
+    try testing.expectEqual(@as(usize, 0), result.diagnostics.len);
 }
 
 test "return checking: 2355 / 2366 / exhaustive switch" {
