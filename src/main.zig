@@ -66,6 +66,9 @@ const usage =
     \\  --lib=a,b,c            select built-in libs (es*, dom); overrides the
     \\                         tsconfig 'lib' field. Default: es-core + dom
     \\                         (matches tsgo's target-esnext default)
+    \\  --check-default-lib    also type-check the embedded lib files
+    \\                         themselves (skipped by default: the shipped
+    \\                         lib is pre-verified; tsc's skipDefaultLibCheck)
     \\  --workers=N            number of worker threads (default: CPU count)
     \\  --checkers=N           number of checker instances (default: min(4, CPUs))
     \\  --repeat=N             scan/parse/bind each file N times (benchmark aid)
@@ -110,6 +113,13 @@ const Cli = struct {
     verbose: bool = false,
     /// Skip lib injection (globals/primitive methods); matches tsc --noLib.
     no_lib: bool = false,
+    /// Re-enable type-checking of the embedded lib files themselves. By
+    /// default they are parsed/bound/linked (globals, lazy type expansion)
+    /// but not walked by any checker — the shipped lib is pre-verified, so
+    /// checking it again per run only costs time (tsc's skipDefaultLibCheck,
+    /// on by default here). Diagnostics are identical either way: lib-file
+    /// diagnostics were already never surfaced.
+    check_default_lib: bool = false,
     /// `--lib=a,b,c`: override the built-in lib selection (else the tsconfig
     /// `lib` field, else the default ES-core + DOM). null = not specified.
     lib: ?[]const []const u8 = null,
@@ -787,12 +797,20 @@ pub fn main(init: std.process.Init) !void {
         for (owned_lists) |*l| l.* = .empty;
 
         const Item = struct { file: u32, cost: u64 };
-        const items = try arena.alloc(Item, n_files);
+        var items: std.ArrayList(Item) = .empty;
+        try items.ensureTotalCapacity(arena, n_files);
+        @memset(file_owner, 0);
         for (0..n_files) |i| {
+            // Embedded lib files are parsed/bound/linked (globals, lazy type
+            // expansion) but by default not enqueued to any checker: the
+            // shipped lib is pre-verified and its diagnostics are never
+            // surfaced, so walking its statements is pure cost
+            // (skipDefaultLibCheck; `--check-default-lib` restores).
+            if (!cli.check_default_lib and modules.isLibPath(paths.items[i])) continue;
             const cost: u64 = if (trees.items[i]) |tree| tree.nodes.len else 0;
-            items[i] = .{ .file = @intCast(i), .cost = cost };
+            items.appendAssumeCapacity(.{ .file = @intCast(i), .cost = cost });
         }
-        std.mem.sort(Item, items, {}, struct {
+        std.mem.sort(Item, items.items, {}, struct {
             fn lessThan(_: void, x: Item, y: Item) bool {
                 if (x.cost != y.cost) return x.cost > y.cost; // biggest first
                 return x.file < y.file; // deterministic tie-break
@@ -801,7 +819,7 @@ pub fn main(init: std.process.Init) !void {
 
         const loads = try arena.alloc(u64, n_checkers);
         @memset(loads, 0);
-        for (items) |it| {
+        for (items.items) |it| {
             // Least-loaded checker; ties resolve to the lowest index.
             var best: usize = 0;
             for (loads[1..], 1..) |l, k| {
@@ -1465,6 +1483,8 @@ fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8, bad_arg: *[]c
             cli.verbose = true;
         } else if (std.mem.eql(u8, arg, "--noLib")) {
             cli.no_lib = true;
+        } else if (std.mem.eql(u8, arg, "--check-default-lib")) {
+            cli.check_default_lib = true;
         } else if (std.mem.startsWith(u8, arg, "--lib=")) {
             var list: std.ArrayList([]const u8) = .empty;
             var it = std.mem.splitScalar(u8, arg["--lib=".len..], ',');

@@ -22,15 +22,18 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
 # name, wall_ztsc, wall_tsgo (ms), rss_ztsc, rss_tsgo (MB) -- defaults, 4 checkers
+# Re-measured 2026-07-15 after skipDefaultLibCheck became ztsc's default
+# (the embedded lib is pre-verified; tsgo still checks its lib by default —
+# see BENCHMARKS.md for the tsgo --skipDefaultLibCheck parity numbers).
 DATA = [
-    ("@types/node",        20.2,  45.4, 18.0, 102.4),
-    ("@types/react",       40.0, 246.9, 20.0, 180.8),
-    ("drizzle-orm",        22.8, 239.0, 22.4, 274.9),
-    ("hono",               44.9, 173.3, 24.3, 155.2),
-    ("@sinclair/typebox",  17.4,  48.5, 15.5,  77.4),
-    ("ajv",                14.1,  23.6, 10.5,  49.5),
-    ("zod",                40.6, 153.8, 20.4, 140.1),
-    ("chalk",              11.4,  18.4,  6.5,  43.6),
+    ("@types/node",        19.4,  47.2, 16.9, 102.1),
+    ("@types/react",       31.5, 247.6, 17.0, 186.7),
+    ("drizzle-orm",        21.7, 240.2, 22.6, 271.7),
+    ("hono",               33.7, 172.9, 21.2, 156.9),
+    ("@sinclair/typebox",  16.3,  48.9, 15.6,  78.2),
+    ("ajv",                11.5,  24.7, 10.0,  49.8),
+    ("zod",                31.1, 156.7, 17.3, 135.5),
+    ("chalk",               9.1,  19.4,  6.5,  43.7),
 ]
 
 RSS_MAX_PX = 290

@@ -4,7 +4,7 @@ An extremely fast, low-memory TypeScript type checker, written in Zig.
 
 **Documentation:** https://gustavoschmidt.github.io/ztsc/
 
-- **8–21% of tsgo's peak memory** (the native TypeScript 7 compiler) on real
+- **8–20% of tsgo's peak memory** (the native TypeScript 7 compiler) on real
   packages — and faster, not slower.
 - A **single static binary**. No Node runtime, no dependencies.
 - **Zero dependencies in the source, too** — the Zig code uses nothing but
@@ -19,14 +19,14 @@ An extremely fast, low-memory TypeScript type checker, written in Zig.
 
 ## Benchmarks
 
-Seven real, published packages on an Apple M4, identical inputs, both tools at
-their default 4 checkers — ztsc uses **8–21% of tsgo's peak memory** and is **1.6–10× faster** (wall clock measured
+Eight real, published packages on an Apple M4, identical inputs, both tools at
+their default 4 checkers — ztsc uses **8–20% of tsgo's peak memory** and is **2.1–11× faster** (wall clock measured
 with a millisecond-precision timer; the smallest packages sit near both tools' process
 floors):
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/benchmarks-dark.svg">
-  <img alt="Peak memory and wall clock across eight packages: ztsc uses 7-24 MB where tsgo uses 44-275 MB, and takes 11-45 ms where tsgo takes 18-247 ms" src="docs/benchmarks-light.svg">
+  <img alt="Peak memory and wall clock across eight packages: ztsc uses 7-23 MB where tsgo uses 44-272 MB, and takes 9-34 ms where tsgo takes 19-248 ms" src="docs/benchmarks-light.svg">
 </picture>
 
 Full results, methodology, and limitations of the comparison:
@@ -74,7 +74,12 @@ like `tsc` — but it does not check everything yet:
   `Headers`, `FormData`, `NodeListOf`, …) and `for await` over
   `AsyncIterable`/`AsyncGenerator` (with the sync-iterable fallback, elements
   awaited). Iterator gaps that remain: `yield*` delegation is unchecked, and
-  unannotated generator functions type as `any` — both under-report.
+  unannotated generator functions type as `any` — both under-report. By default
+  ztsc does not *type-check* the embedded lib files themselves (they are still
+  parsed, bound, and linked, so globals and lazy type expansion are unaffected) —
+  this is tsc's `skipDefaultLibCheck`, on because the shipped lib is pre-verified
+  each release; `--check-default-lib` restores the old behavior, with
+  byte-identical diagnostics either way.
 - **CommonJS interop is checked** (`export =`, `import x = require(…)`, and
   default/named/namespace ES imports against an `export =` module), but a couple
   of corners degrade leniently rather than erroring: a namespace import keeps the

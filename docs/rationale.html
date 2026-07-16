@@ -83,7 +83,7 @@
   from 1 to 8 checkers).</p>
   <p>ztsc's answer is that a checker's live data can be tiny if nothing about the design fights
   it: 16 bytes per AST node, 5 per token, 28 per type, ~190 bytes of heap per source line
-  all-in. There is no collector, so footprint <em>equals</em> live data — 8–21% of tsgo's peak
+  all-in. There is no collector, so footprint <em>equals</em> live data — 8–20% of tsgo's peak
   on real packages, nearly flat as parallelism grows. Memory is the headline goal (the standing
   gate is ≤&thinsp;50% of tsgo; measured reality is far under it) with speed parity the
   constraint — and in practice ztsc is faster too, because the same choices that shrink memory

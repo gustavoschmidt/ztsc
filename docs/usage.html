@@ -67,6 +67,7 @@ ztsc src/main.ts           # or explicit entry files</code></pre>
       <tr><td class="num"><code>--pretty[=true|false]</code></td><td>tsc-style colored diagnostics with source excerpts (default: on when stderr is a TTY)</td></tr>
       <tr><td class="num"><code>--verbose</code></td><td>print notes about accepted-but-ignored tsconfig options</td></tr>
       <tr><td class="num"><code>--noLib</code></td><td>skip the built-in esnext lib — no globals, no primitive/array methods (matches tsc)</td></tr>
+      <tr><td class="num"><code>--check-default-lib</code></td><td>also type-check the embedded lib files; skipped by default — the shipped lib is pre-verified (tsc's <code>skipDefaultLibCheck</code>)</td></tr>
       <tr><td class="num"><code>--workers=N</code></td><td>worker threads for the front end (default: CPU count)</td></tr>
       <tr><td class="num"><code>--checkers=N</code></td><td>independent checker instances (default: min(4, CPUs)); output is byte-identical for any N</td></tr>
       <tr><td class="num"><code>-h, --help</code></td><td>print help and exit</td></tr>
@@ -111,8 +112,16 @@ ztsc src/main.ts           # or explicit entry files</code></pre>
     <code>strictNullChecks</code>-style semantics; there is no loose mode.</li>
   </ul>
   <p>The standard library is built into the binary: the real TypeScript 7.0.2
-  <code>lib.esnext</code> reference chain (ES core through esnext — no DOM). There is no
-  <code>lib</code> option to configure; <code>--noLib</code> turns it off entirely.</p>
+  <code>lib.esnext</code> reference chain (ES core through esnext) plus the real DOM lib
+  (<code>dom</code> + <code>dom.iterable</code> + <code>dom.asynciterable</code>). The tsconfig
+  <code>lib</code> field selects blobs (<code>es*</code> and <code>dom*</code> families; the
+  default is ES-core + DOM, matching tsgo's target-esnext default);
+  <code>--lib=…</code> overrides it and <code>--noLib</code> turns the lib off entirely.</p>
+  <p>The <code>skipLibCheck</code> and <code>skipDefaultLibCheck</code> keys are accepted
+  (with a <code>--verbose</code> note rather than an unknown-option warning): the built-in
+  standard library is never re-checked by default — it ships pre-verified — while your
+  dependencies' <code>.d.ts</code> are still checked. The <code>--check-default-lib</code>
+  flag restores type-checking of the embedded lib files.</p>
 </section>
 
 <!-- ============================================================ -->

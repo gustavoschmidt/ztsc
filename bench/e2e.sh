@@ -134,6 +134,9 @@ if [ -z "${TSGO:-}" ] && ensure_baseline tsgo; then
 fi
 if [ -n "${TSGO:-}" ] && [ -x "$TSGO" ]; then
     run_median "tsgo $("$TSGO" --version 2>/dev/null | awk '{print $2}')" "$TSGO" -p "$CORPUS"
+    # Parity leg: ztsc's default skips re-checking its embedded (pre-verified)
+    # lib; this is tsgo with the equivalent flag, for like-for-like reading.
+    run_median "tsgo --skipDefaultLibCheck" "$TSGO" --skipDefaultLibCheck -p "$CORPUS"
 else
     echo "  tsgo baseline unavailable (set TSGO=/path/to/native/tsc) — skipped"
 fi
