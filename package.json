@@ -3,7 +3,7 @@
   "version": "0.0.1",
   "description": "A fast, low-memory TypeScript type checker written in Zig (no JS emit).",
   "license": "MIT",
-  "author": "Gustavo Schmidt",
+  "author": "Gustavo Schmidt Joau e Silva",
   "homepage": "https://gustavoschmidt.github.io/ztsc/",
   "repository": {
     "type": "git",
