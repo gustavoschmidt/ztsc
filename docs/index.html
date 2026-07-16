@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ztsc — an extremely fast, memory-lean TypeScript type checker in Zig</title>
-<meta name="description" content="ztsc type-checks TypeScript in milliseconds and megabytes: 8–20% of tsgo's peak memory on real packages, and faster. A single static binary, zero dependencies, written in Zig.">
+<meta name="description" content="ztsc type-checks TypeScript in milliseconds and megabytes: at least 5× less peak memory than tsgo on real packages — and at least 2× faster. A single static binary, zero dependencies, written in Zig.">
 <link rel="stylesheet" href="style.css">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='20' fill='%23eda100'/%3E%3Ctext x='50' y='74' font-size='68' font-family='monospace' font-weight='bold' text-anchor='middle' fill='%231c1b18'%3Ez%3C/text%3E%3C/svg%3E">
 </head>
@@ -42,12 +42,12 @@
     <div class="stat">
       <div class="k">wall clock · @types/node</div>
       <div class="v">19&thinsp;<small>ms</small></div>
-      <div class="c">tsgo 7.0.2 takes 47&thinsp;ms on the same 49.6k lines of declarations — and ztsc is faster on all eight benchmark packages</div>
+      <div class="c">tsgo 7.0.2 takes 47&thinsp;ms on the same 49.6k lines of declarations — and ztsc is at least 2× faster on all eight benchmark packages</div>
     </div>
     <div class="stat">
       <div class="k">peak RSS · @types/node</div>
       <div class="v">17&thinsp;<small>MB</small></div>
-      <div class="c">17% of tsgo (102&thinsp;MB); across eight real packages ztsc runs at 8–20% of tsgo's peak</div>
+      <div class="c">17% of tsgo (102&thinsp;MB); across eight real packages ztsc uses at least 5× less peak memory — up to 12×</div>
     </div>
     <div class="stat">
       <div class="k">dependencies</div>
@@ -56,7 +56,7 @@
     </div>
     <div class="stat">
       <div class="k">conformance</div>
-      <div class="v">400/400</div>
+      <div class="v">414/414</div>
       <div class="c">differential cases (error code + line) vs the native TypeScript compiler, tsgo 7.0.2</div>
     </div>
   </div>
