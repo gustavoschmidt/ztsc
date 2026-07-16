@@ -70,7 +70,7 @@ ztsc src/main.ts           # or explicit entry files</code></pre>
       <tr><td class="num"><code>--lib=a,b,c</code></td><td>select built-in lib blobs (<code>es*</code>, <code>dom*</code> families); overrides the tsconfig <code>lib</code> field</td></tr>
       <tr><td class="num"><code>--check-default-lib</code></td><td>also type-check the embedded lib files; skipped by default — the shipped lib is pre-verified (tsc's <code>skipDefaultLibCheck</code>)</td></tr>
       <tr><td class="num"><code>--workers=N</code></td><td>worker threads for the front end (default: CPU count)</td></tr>
-      <tr><td class="num"><code>--checkers=N</code></td><td>independent checker instances (default: min(4, CPUs)); output is byte-identical for any N</td></tr>
+      <tr><td class="num"><code>--checkers=N</code></td><td>independent checker instances (default: min(8, CPUs)); output is byte-identical for any N</td></tr>
       <tr><td class="num"><code>-h, --help</code></td><td>print help and exit</td></tr>
       <tr><td class="num"><code>--version</code></td><td>print version and exit</td></tr>
     </tbody>
