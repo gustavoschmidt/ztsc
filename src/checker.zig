@@ -1298,6 +1298,13 @@ const Checker = struct {
             if (d < best_d) {
                 best_d = d;
                 best = p.name;
+            } else if (d == best_d and best != null and
+                std.mem.order(u8, cand_text, c.atomText(best.?)) == .lt)
+            {
+                // Tie on edit distance: prefer the lexicographically smaller
+                // name so the suggestion is byte-identical across --workers
+                // (props are iterated in atom order, which is not stable).
+                best = p.name;
             }
         }
         return best;
@@ -1478,8 +1485,16 @@ const Checker = struct {
                     first = false;
                     try c.printSigMember(w, s.objectConstructSig(t, @intCast(i)), true, depth + 1);
                 }
-                for (0..n) |i| {
-                    const p = s.objectProp(t, @intCast(i));
+                // Properties are *stored* sorted by name atom (canonical for
+                // interning), but atom ids depend on the parallel intern order,
+                // so displaying in stored order makes messages differ across
+                // --workers/--checkers. Render in name-*text* order instead:
+                // names are unique within an object, so this is a total order
+                // and byte-identical for any worker/checker count (determinism
+                // contract). Storage stays atom-sorted (lookup/interning intact).
+                const order = c.propDisplayOrder(t, n) catch return error.WriteFailed;
+                for (order) |i| {
+                    const p = s.objectProp(t, i);
                     if (!first) try w.writeAll(" ");
                     first = false;
                     try w.print("{s}{s}: ", .{ c.atomText(p.name), if (p.optional()) "?" else "" });
@@ -1683,7 +1698,16 @@ const Checker = struct {
         switch (k) {
             .array => try c.writeSortKey(w, c.ts.arrayElem(t), depth + 1),
             .number_literal, .number_literal_fresh => try w.writeAll(&encodeF64Key(c.ts.numberValue(t))),
-            else => try c.printType(w, t, depth + 1),
+            // Render the key at *exactly* the display depth (`depth`, not
+            // `depth + 1`): union/intersection members are displayed via
+            // `printType(t, depth)`, and `printType` collapses everything past
+            // depth 6 to "...". Keying one level deeper made every member at
+            // display-depth 6 hash to "..." — equal keys — so the sort fell
+            // back to `makeUnion`'s TypeId order, which differs across checker
+            // partitions (a deep-union member-order divergence across
+            // --checkers). Matching the depth makes the key equal iff the two
+            // members render identically, so order is TypeId-independent.
+            else => try c.printType(w, t, depth),
         }
     }
 
@@ -1708,6 +1732,27 @@ const Checker = struct {
         const out = sc.alloc(TypeId, members.len) catch return error.WriteFailed;
         for (items, 0..) |it, i| out[i] = it.ty;
         return out;
+    }
+
+    /// Display order for an object type's `n` properties: their stored slots
+    /// reordered by property-name *text*. Object props are stored sorted by
+    /// name *atom* (see `types.makeObject`), but atom ids are assigned in
+    /// parallel-intern order and so vary run-to-run and across --workers;
+    /// text order is content-derived and therefore byte-identical for any
+    /// worker/checker count. Names are unique within an object, so the order
+    /// is total (an unstable sort stays deterministic). Scratch-owned slice.
+    fn propDisplayOrder(c: *Checker, t: TypeId, n: usize) Error![]u32 {
+        const order = try c.scratch().alloc(u32, n);
+        for (order, 0..) |*x, i| x.* = @intCast(i);
+        const Ctx = struct { c: *Checker, t: TypeId };
+        std.mem.sort(u32, order, Ctx{ .c = c, .t = t }, struct {
+            fn less(ctx: Ctx, a: u32, b: u32) bool {
+                const na = ctx.c.atomText(ctx.c.ts.objectProp(ctx.t, a).name);
+                const nb = ctx.c.atomText(ctx.c.ts.objectProp(ctx.t, b).name);
+                return std.mem.order(u8, na, nb) == .lt;
+            }
+        }.less);
+        return order;
     }
 
     fn printNumber(w: *std.Io.Writer, v: f64) PrintErr!void {
@@ -2912,6 +2957,23 @@ const Checker = struct {
     /// body can complete normally alongside value returns.
     fn inferReturnType(c: *Checker, fn_node: Node, body: Node) Error!TypeId {
         if (body == 0) return types.any_type;
+        // Establish *this* function's async/generator context while checking
+        // its body: `await`/`yield` legality (TS1308/TS1163…) must be judged
+        // against the function being inferred, not the enclosing one. Without
+        // this, an `await` in an async arrow probed for its return type is
+        // checked under the outer (possibly non-async) `fn_ctx`, emitting a
+        // TS1308 false positive that then caches — and whether this probe or
+        // the full `checkFunctionBody` reaches the node first is cache-order
+        // dependent, so the error moved across files with --workers/--checkers.
+        const proto = c.tree.extraData(ast.FnProto, c.tree.nodeData(fn_node).lhs);
+        const saved_ctx = c.fn_ctx;
+        defer c.fn_ctx = saved_ctx;
+        c.fn_ctx = .{
+            .ret_ann = types.no_type,
+            .is_async = proto.flags & ast.Flags.async != 0,
+            .is_generator = proto.flags & ast.Flags.generator != 0,
+            .yield_type = 0,
+        };
         if (c.nodeTag(body) != .block) {
             return c.widenLiteral(try c.checkExprCached(body, types.no_type));
         }
@@ -2921,7 +2983,6 @@ const Checker = struct {
         for (c.tree.nodeRange(body)) |stmt| {
             if (stmt != null_node) try c.collectReturns(stmt, &rets, &bare_return);
         }
-        _ = fn_node;
         if (rets.items.len == 0) return types.void_type;
         var parts: std.ArrayList(TypeId) = .empty;
         defer parts.deinit(c.scratch());
@@ -6978,6 +7039,15 @@ const Checker = struct {
                 try missing.append(c.scratch(), tp.name);
             }
         }
+        // Emit the missing names in name-*text* order. They were gathered in
+        // the target's stored (atom-sorted) prop order, which varies across
+        // --workers/--checkers; text order is content-derived and stable
+        // (determinism contract). Names are unique, so the order is total.
+        std.mem.sort(Atom, missing.items, c, struct {
+            fn less(cc: *Checker, a: Atom, b: Atom) bool {
+                return std.mem.order(u8, cc.atomText(a), cc.atomText(b)) == .lt;
+            }
+        }.less);
         if (missing.items.len == 1) {
             try c.diagFmt(2741, span, "Property '{s}' is missing in type '{s}' but required in type '{s}'.", .{
                 c.atomText(missing.items[0]), try c.typeToString(src_t), try c.typeToString(target),
