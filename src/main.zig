@@ -14,7 +14,7 @@
 //! the old wavefront discovery produced). A serial `link` phase then
 //! builds sealed per-file import/export tables; the check phase
 //! partitions the program's files across N independent checker instances
-//! (`--checkers=N`, default min(8, cores)), each with its own type
+//! (`--checkers=N`, default min(4, cores)), each with its own type
 //! store/caches, reading the shared immutable AST/binder/link data without
 //! locks.
 //!
@@ -70,7 +70,7 @@ const usage =
     \\                         themselves (skipped by default: the shipped
     \\                         lib is pre-verified; tsc's skipDefaultLibCheck)
     \\  --workers=N            number of worker threads (default: CPU count)
-    \\  --checkers=N           number of checker instances (default: min(8, CPUs))
+    \\  --checkers=N           number of checker instances (default: min(4, CPUs))
     \\  --repeat=N             scan/parse/bind each file N times (benchmark aid)
     \\  --no-resolve-cache     disable the module-resolution memo (benchmark aid)
     \\  --no-frozen-store      disable the shared frozen base type store; each
@@ -778,7 +778,7 @@ pub fn main(init: std.process.Init) !void {
 
     // --- Check (N independent checker instances) --------------------------------
     const check_timer = Timer.start(io);
-    const n_checkers: usize = @max(1, @min(cli.checkers orelse @min(8, cpu_count), n_files));
+    const n_checkers: usize = @max(1, @min(cli.checkers orelse @min(4, cpu_count), n_files));
     const tasks = try arena.alloc(CheckerTask, n_checkers);
     // File id -> owning checker, so per-file diagnostics can be reassembled
     // from the right checker below (replaces the old `i % n_checkers`).
