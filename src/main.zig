@@ -66,9 +66,11 @@ const usage =
     \\  --lib=a,b,c            select built-in libs (es*, dom); overrides the
     \\                         tsconfig 'lib' field. Default: es-core + dom
     \\                         (matches tsgo's target-esnext default)
-    \\  --check-default-lib    also type-check the embedded lib files
-    \\                         themselves (skipped by default: the shipped
-    \\                         lib is pre-verified; tsc's skipDefaultLibCheck)
+    \\  --skip-default-lib-check
+    \\                         do NOT type-check the embedded lib files
+    \\                         themselves (checked by default, matching tsc/
+    \\                         tsgo; tsc's skipDefaultLibCheck). tsconfig
+    \\                         skipLibCheck/skipDefaultLibCheck do the same
     \\  --workers=N            number of worker threads (default: CPU count)
     \\  --checkers=N           number of checker instances (default: min(4, CPUs))
     \\  --repeat=N             scan/parse/bind each file N times (benchmark aid)
@@ -113,13 +115,15 @@ const Cli = struct {
     verbose: bool = false,
     /// Skip lib injection (globals/primitive methods); matches tsc --noLib.
     no_lib: bool = false,
-    /// Re-enable type-checking of the embedded lib files themselves. By
-    /// default they are parsed/bound/linked (globals, lazy type expansion)
-    /// but not walked by any checker — the shipped lib is pre-verified, so
-    /// checking it again per run only costs time (tsc's skipDefaultLibCheck,
-    /// on by default here). Diagnostics are identical either way: lib-file
-    /// diagnostics were already never surfaced.
-    check_default_lib: bool = false,
+    /// Opt out of type-checking the embedded lib files themselves. By default
+    /// they are parsed/bound/linked (globals, lazy type expansion) AND walked
+    /// by the checkers, matching tsc/tsgo, which check their default lib at
+    /// their defaults. `--skip-default-lib-check` (or the tsconfig
+    /// `skipLibCheck`/`skipDefaultLibCheck` keys) reverts to skipping them —
+    /// the shipped lib is pre-verified, so skipping only saves time.
+    /// Diagnostics are identical either way: lib-file diagnostics are never
+    /// surfaced. null = not specified on the CLI (tsconfig value, else check).
+    skip_default_lib_check: ?bool = null,
     /// `--lib=a,b,c`: override the built-in lib selection (else the tsconfig
     /// `lib` field, else the default ES-core + DOM). null = not specified.
     lib: ?[]const []const u8 = null,
@@ -467,6 +471,8 @@ pub fn main(init: std.process.Init) !void {
     // The tsconfig `lib` field (null when no config / no field), consulted below
     // to pick the built-in lib blobs.
     var config_lib: ?[]const []const u8 = null;
+    // tsconfig skipLibCheck/skipDefaultLibCheck (false when no config / unset).
+    var config_skip_lib = false;
     if (cli.paths.len == 0) {
         const config_path: []const u8 = blk: {
             if (cli.project) |p| {
@@ -509,7 +515,13 @@ pub fn main(init: std.process.Init) !void {
         entry_paths = cfg.root_files;
         paths_map = cfg.paths;
         config_lib = cfg.lib;
+        config_skip_lib = cfg.skip_lib_check;
     }
+
+    // Effective decision: skip type-checking the embedded pre-verified lib?
+    // Default is to check it (matching tsc/tsgo). The CLI flag, when given,
+    // overrides the tsconfig `skipLibCheck`/`skipDefaultLibCheck` value.
+    const skip_default_lib_check = cli.skip_default_lib_check orelse config_skip_lib;
 
     // Which built-in lib blobs to inject. Precedence: --noLib wins (nothing),
     // then an explicit --lib flag, then the tsconfig `lib` field, else the
@@ -802,11 +814,12 @@ pub fn main(init: std.process.Init) !void {
         @memset(file_owner, 0);
         for (0..n_files) |i| {
             // Embedded lib files are parsed/bound/linked (globals, lazy type
-            // expansion) but by default not enqueued to any checker: the
-            // shipped lib is pre-verified and its diagnostics are never
-            // surfaced, so walking its statements is pure cost
-            // (skipDefaultLibCheck; `--check-default-lib` restores).
-            if (!cli.check_default_lib and modules.isLibPath(paths.items[i])) continue;
+            // expansion) and, by default, also enqueued to a checker so the
+            // pre-verified lib is walked just like tsc/tsgo at their defaults.
+            // `--skip-default-lib-check` (or tsconfig skipLibCheck/
+            // skipDefaultLibCheck) drops them — pure time savings, since lib
+            // diagnostics are never surfaced (tsc's skipDefaultLibCheck).
+            if (skip_default_lib_check and modules.isLibPath(paths.items[i])) continue;
             const cost: u64 = if (trees.items[i]) |tree| tree.nodes.len else 0;
             items.appendAssumeCapacity(.{ .file = @intCast(i), .cost = cost });
         }
@@ -1483,8 +1496,8 @@ fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8, bad_arg: *[]c
             cli.verbose = true;
         } else if (std.mem.eql(u8, arg, "--noLib")) {
             cli.no_lib = true;
-        } else if (std.mem.eql(u8, arg, "--check-default-lib")) {
-            cli.check_default_lib = true;
+        } else if (std.mem.eql(u8, arg, "--skip-default-lib-check")) {
+            cli.skip_default_lib_check = true;
         } else if (std.mem.startsWith(u8, arg, "--lib=")) {
             var list: std.ArrayList([]const u8) = .empty;
             var it = std.mem.splitScalar(u8, arg["--lib=".len..], ',');
