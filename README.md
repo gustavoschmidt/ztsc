@@ -45,8 +45,8 @@ Run `ztsc --help` for all options.
 
 ## Benchmarks
 
-Eight real, published packages on an Apple M4, identical inputs, both tools at
-their default 4 checkers — ztsc uses **8–20% of tsgo's peak memory** and is
+Eight real, published packages on an Apple M4, identical inputs, both tools
+pinned to four checker instances — ztsc uses **8–20% of tsgo's peak memory** and is
 **2.1–11× faster** (wall clock measured with a millisecond-precision timer;
 the smallest packages sit near both tools' process floors, so their ratios
 reflect fixed startup cost rather than checking throughput).
