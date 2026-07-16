@@ -23,19 +23,19 @@ ROOT = os.path.dirname(HERE)
 
 # name, wall_ztsc, wall_tsgo (ms), rss_ztsc, rss_tsgo (MB)
 # Both tools at their default 4 checkers.
-# Re-measured 2026-07-16 after the embedded lib blobs were sharded
-# (dom x8, esnext x4). ztsc still skips checking its pre-verified lib by
-# default; tsgo checks its lib by default — see BENCHMARKS.md for the tsgo
-# --skipDefaultLibCheck parity numbers.
+# Re-measured 2026-07-16 after ztsc's default flipped to type-check its
+# embedded lib, matching tsc/tsgo (which check their default lib at their
+# defaults). Both tools now check their default lib — defaults are apples to
+# apples, no parity flag needed.
 DATA = [
-    ("@types/node",        15.7,  46.1, 17.1, 101.4),
-    ("@types/react",       22.9, 242.3, 18.3, 186.2),
-    ("drizzle-orm",        20.2, 238.1, 22.4, 275.0),
-    ("hono",               24.8, 173.9, 21.3, 158.6),
-    ("@sinclair/typebox",  15.0,  47.9, 15.4,  77.3),
-    ("ajv",                 9.3,  23.6,  9.9,  49.9),
-    ("zod",                21.4, 156.1, 17.9, 136.1),
-    ("chalk",               6.7,  18.1,  6.2,  43.5),
+    ("@types/node",        19.0,  44.9, 18.8, 102.4),
+    ("@types/react",       26.7, 241.4, 26.8, 183.5),
+    ("drizzle-orm",        23.9, 248.8, 23.7, 273.8),
+    ("hono",               31.0, 172.3, 31.2, 155.8),
+    ("@sinclair/typebox",  16.3,  47.7, 16.7,  78.1),
+    ("ajv",                10.2,  23.5, 11.6,  49.8),
+    ("zod",                26.7, 153.6, 25.1, 136.9),
+    ("chalk",               7.5,  18.2,  7.4,  43.7),
 ]
 
 RSS_MAX_PX = 290
