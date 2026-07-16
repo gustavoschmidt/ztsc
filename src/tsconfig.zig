@@ -490,6 +490,10 @@ pub fn loadInDir(io: Io, arena: Allocator, base: Io.Dir, config_path: []const u8
                     }
                 } else if (std.mem.eql(u8, okey, "types")) {
                     try note(arena, &notes, "{s}: 'types' ignored (ztsc resolves @types via imports/references)", .{config_path});
+                } else if (std.mem.eql(u8, okey, "skipLibCheck") or std.mem.eql(u8, okey, "skipDefaultLibCheck")) {
+                    try note(arena, &notes, "{s}: '{s}' accepted ({s}the built-in lib is never re-checked; dependency .d.ts files are still checked)", .{
+                        config_path, okey, if (std.mem.eql(u8, okey, "skipLibCheck")) "partially honored: " else "already the default: ",
+                    });
                 } else if (std.mem.eql(u8, okey, "baseUrl")) {
                     if (oval == .string) {
                         base_url = oval.string;
