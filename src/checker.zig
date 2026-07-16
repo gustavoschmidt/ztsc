@@ -8083,7 +8083,8 @@ const Checker = struct {
             obj_t = try c.checkNullishAccess(obj_t, d.lhs, node);
         }
         var pt = try c.propertyTypeOf(obj_t, name, name_tok);
-        // Property-path narrowing: `x.p` where x is an identifier.
+        // Property-path narrowing: `x.p` where x is an identifier, and
+        // `this.p` (sentinel root).
         if (c.nodeTag(d.lhs) == .identifier) {
             const base_tok = c.tree.nodeMainToken(d.lhs);
             if (c.tree.tokens.tag(base_tok) != .keyword_undefined) {
@@ -8093,6 +8094,8 @@ const Checker = struct {
                     else => {},
                 }
             }
+        } else if (c.nodeTag(d.lhs) == .this_expr) {
+            pt = try c.flowTypeOfProp(node, this_flow_root, name, pt);
         }
         if (add_undefined) return c.makeUnion2(pt, types.undefined_type);
         return pt;
@@ -8108,7 +8111,18 @@ const Checker = struct {
         if (!has_null and !has_undef) return t;
         _ = access_node;
         const span = c.nodeSpan(obj_node);
-        if (c.entityNameOf(obj_node)) |name| {
+        // tsc's entity-name codes (18047-49) apply to identifier-rooted
+        // paths only; a `this`-rooted path gets the expression codes
+        // (2531-33, "Object is possibly ...").
+        const this_rooted = blk: {
+            var n = obj_node;
+            while (c.nodeTag(n) == .member_expr or c.nodeTag(n) == .optional_member_expr or c.nodeTag(n) == .paren_expr) {
+                n = c.tree.nodeData(n).lhs;
+            }
+            break :blk c.nodeTag(n) == .this_expr;
+        };
+        const name_opt: ?[]const u8 = if (this_rooted) null else c.entityNameOf(obj_node);
+        if (name_opt) |name| {
             if (has_null and has_undef) {
                 try c.diagFmt(18049, span, "'{s}' is possibly 'null' or 'undefined'.", .{name});
             } else if (has_null) {
@@ -8154,6 +8168,9 @@ const Checker = struct {
         const k = c.ts.kind(t);
         switch (k) {
             .any, .err, .none => return types.any_type,
+            // Property access on `never` is silently `never` (tsc; typically
+            // the non-nullable remainder of a null-narrowed reference).
+            .never => return types.never_type,
             .union_type => {
                 var parts: std.ArrayList(TypeId) = .empty;
                 defer parts.deinit(c.scratch());
@@ -8841,6 +8858,14 @@ const Checker = struct {
                 .overloads => {
                     for (try c.memberList(r)) |m| try sigs.append(c.scratch(), m);
                 },
+                // Calling `never` is silently `never` (tsc; typically the
+                // non-nullable remainder of a null-narrowed reference).
+                .never => {
+                    for (shape.arg_nodes) |an| {
+                        if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
+                    }
+                    return types.never_type;
+                },
                 // Callable object with call signatures (M18.1).
                 .object => {
                     if (c.ts.objectCallSigCount(r) == 0) {
@@ -9110,15 +9135,42 @@ const Checker = struct {
             },
             .object => {
                 const ra = try c.resolveStructural(arg);
-                if (s.kind(ra) != .object) return;
+                if (s.kind(ra) == .object) {
+                    for (0..s.objectPropCount(param)) |i| {
+                        const pp = s.objectProp(param, @intCast(i));
+                        if (s.objectPropByName(ra, pp.name)) |ap| {
+                            try c.unify(pp.ty, ap.ty, tp_syms, candidates, depth + 1);
+                        }
+                    }
+                    if (s.objectStringIndex(param) != 0 and s.objectStringIndex(ra) != 0) {
+                        try c.unify(s.objectStringIndex(param), s.objectStringIndex(ra), tp_syms, candidates, depth + 1);
+                    }
+                    if (s.objectNumberIndex(param) != 0 and s.objectNumberIndex(ra) != 0) {
+                        try c.unify(s.objectNumberIndex(param), s.objectNumberIndex(ra), tp_syms, candidates, depth + 1);
+                    }
+                    return;
+                }
+                // Array/tuple/string arg against an object-shaped param
+                // (`ArrayLike<T>`, `Iterable<T>`, `{ length: number }`):
+                // the param's number index matches the element type, and
+                // its props resolve on the arg via `propOfType` (which
+                // covers the element-instantiated `Array<T>`/primitive
+                // interface members, e.g. `[Symbol.iterator]`). Fixes
+                // `Array.from(xs)` inferring `unknown[]` from an array.
+                const elem: TypeId = switch (s.kind(ra)) {
+                    .array => s.arrayElem(ra),
+                    .tuple => try c.tupleElementUnion(ra),
+                    .string, .string_literal => types.string_type,
+                    else => return,
+                };
+                if (s.objectNumberIndex(param) != 0) {
+                    try c.unify(s.objectNumberIndex(param), elem, tp_syms, candidates, depth + 1);
+                }
                 for (0..s.objectPropCount(param)) |i| {
                     const pp = s.objectProp(param, @intCast(i));
-                    if (s.objectPropByName(ra, pp.name)) |ap| {
+                    if (try c.propOfType(ra, pp.name)) |ap| {
                         try c.unify(pp.ty, ap.ty, tp_syms, candidates, depth + 1);
                     }
-                }
-                if (s.objectStringIndex(param) != 0 and s.objectStringIndex(ra) != 0) {
-                    try c.unify(s.objectStringIndex(param), s.objectStringIndex(ra), tp_syms, candidates, depth + 1);
                 }
             },
             .function => {
@@ -9223,8 +9275,13 @@ const Checker = struct {
     // =====================================================================
 
     /// A narrowable reference: an identifier (`prop == 0`) or a
-    /// single-level property path `sym.prop`.
+    /// single-level property path `sym.prop`. A `this.prop` path uses the
+    /// sentinel root `this_flow_root` (flow graphs are per-function, so the
+    /// sentinel never crosses a `this`-rebinding boundary).
     const RefKey = struct { sym: SymbolId, prop: Atom };
+
+    /// Sentinel `RefKey.sym` for `this`-rooted property paths.
+    const this_flow_root: SymbolId = std.math.maxInt(SymbolId);
 
     const FlowQ = struct { file: FileId, flow: FlowId, key: u32, declared: TypeId };
 
@@ -9531,7 +9588,9 @@ const Checker = struct {
     }
 
     fn identIsSym(c: *Checker, node: Node, sym: SymbolId) Error!bool {
-        if (node == null_node or c.nodeTag(node) != .identifier) return false;
+        if (node == null_node) return false;
+        if (sym == this_flow_root) return c.nodeTag(node) == .this_expr;
+        if (c.nodeTag(node) != .identifier) return false;
         const a = try c.atomOfToken(c.tree.nodeMainToken(node));
         if (a != c.symNameAtom(sym)) return false;
         return switch (c.resolveSpace(a, c.cur_scope, true)) {
@@ -9542,6 +9601,7 @@ const Checker = struct {
 
     fn patternBindsSym(c: *Checker, pat: Node, sym: SymbolId) Error!bool {
         if (pat == null_node) return false;
+        if (sym == this_flow_root) return false; // a pattern never binds `this`
         switch (c.nodeTag(pat)) {
             .identifier => return (try c.atomOfToken(c.tree.nodeMainToken(pat))) == c.symNameAtom(sym),
             .array_pattern, .object_pattern, .array_literal, .object_literal => {
