@@ -67,6 +67,7 @@ ztsc src/main.ts           # or explicit entry files</code></pre>
       <tr><td class="num"><code>--pretty[=true|false]</code></td><td>tsc-style colored diagnostics with source excerpts (default: on when stderr is a TTY)</td></tr>
       <tr><td class="num"><code>--verbose</code></td><td>print notes about accepted-but-ignored tsconfig options</td></tr>
       <tr><td class="num"><code>--noLib</code></td><td>skip the built-in esnext lib — no globals, no primitive/array methods (matches tsc)</td></tr>
+      <tr><td class="num"><code>--lib=a,b,c</code></td><td>select built-in lib blobs (<code>es*</code>, <code>dom*</code> families); overrides the tsconfig <code>lib</code> field</td></tr>
       <tr><td class="num"><code>--check-default-lib</code></td><td>also type-check the embedded lib files; skipped by default — the shipped lib is pre-verified (tsc's <code>skipDefaultLibCheck</code>)</td></tr>
       <tr><td class="num"><code>--workers=N</code></td><td>worker threads for the front end (default: CPU count)</td></tr>
       <tr><td class="num"><code>--checkers=N</code></td><td>independent checker instances (default: min(4, CPUs)); output is byte-identical for any N</td></tr>
@@ -191,8 +192,10 @@ ztsc src/main.ts           # or explicit entry files</code></pre>
     spread object, spreads of unions/generics/index-signature types, and children
     <em>value</em> typing.</li>
     <li><strong>tsconfig subset</strong>: <code>files</code> / <code>include</code> /
-    <code>exclude</code> / <code>baseUrl</code> / <code>paths</code>, strict mode only; other
-    options are accepted and ignored.</li>
+    <code>exclude</code> / <code>baseUrl</code> / <code>paths</code> / <code>lib</code> (plus
+    the <code>skipLibCheck</code> keys), strict mode only (<code>strict: false</code> is
+    refused); other options are accepted and ignored — <code>--verbose</code> lists
+    which.</li>
     <li><strong>No watch mode or LSP yet</strong> — both are planned next, on an architecture
     built for them.</li>
     <li>In a handful of known edge cases ztsc misses an error the TypeScript compiler would
