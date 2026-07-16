@@ -126,7 +126,6 @@ pre code { background: none; padding: 0; }
 
 header.hero { padding-top: 56px; }
 .hero .sub { font-size: 1.12rem; color: var(--ink2); max-width: 60ch; }
-h1 .cursor { color: var(--amber); }
 .hero .tagline {
   font-family: var(--mono);
   font-size: clamp(1.1rem, 2.8vw, 1.5rem);
@@ -160,7 +159,6 @@ h1 .cursor { color: var(--amber); }
   color: var(--ink);
   text-decoration: none;
 }
-.brand .cursor { color: var(--amber); }
 .navlinks {
   display: flex;
   gap: 18px;
