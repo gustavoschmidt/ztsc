@@ -1,6 +1,6 @@
 # ztsc
 
-An extremely fast, low-memory TypeScript type checker, written in Zig.
+A fast, low-memory TypeScript type checker, written in Zig.
 
 **Documentation & internals:** https://gustavoschmidt.github.io/ztsc/
 
