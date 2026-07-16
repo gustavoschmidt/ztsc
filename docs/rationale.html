@@ -79,11 +79,11 @@
   AST and type objects are real heap objects: per-object headers, 64-bit pointers between them,
   allocation churn for the collector to chase. On the packages in the
   <a href="./#benchmarks">benchmark</a>, tsgo peaks between 44 and 275&thinsp;MB; and its
-  footprint <em>grows steeply</em> with its parallelism (drizzle-orm: 166&thinsp;→&thinsp;403&thinsp;MB
+  footprint <em>grows steeply</em> with its parallelism (drizzle-orm: 168&thinsp;→&thinsp;407&thinsp;MB
   from 1 to 8 checkers).</p>
   <p>ztsc's answer is that a checker's live data can be tiny if nothing about the design fights
   it: 16 bytes per AST node, 5 per token, 28 per type, ~190 bytes of heap per source line
-  all-in. There is no collector, so footprint <em>equals</em> live data — 8–20% of tsgo's peak
+  all-in. There is no collector, so footprint <em>equals</em> live data — 9–21% of tsgo's peak
   on real packages, nearly flat as parallelism grows. Memory is the headline goal (the standing
   gate is ≤&thinsp;50% of tsgo; measured reality is far under it) with speed parity the
   constraint — and in practice ztsc is faster too, because the same choices that shrink memory

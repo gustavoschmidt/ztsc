@@ -9,7 +9,8 @@ Four copies are kept byte-in-sync by this script:
 
 Only data-driven attributes/text change; the visual design is untouched. Edit
 DATA below (medians: wall = median of 11 monotonic-ns runs, RSS = median of 5
-under /usr/bin/time -l, both at the default 4 checkers) and re-run:
+under /usr/bin/time -l, each tool at its own default: ztsc 8 checkers, tsgo 4)
+and re-run:
 
     /usr/bin/python3 docs/gen_charts.py
 
@@ -21,19 +22,21 @@ import math, re, os
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
-# name, wall_ztsc, wall_tsgo (ms), rss_ztsc, rss_tsgo (MB) -- defaults, 4 checkers
-# Re-measured 2026-07-15 after skipDefaultLibCheck became ztsc's default
-# (the embedded lib is pre-verified; tsgo still checks its lib by default —
-# see BENCHMARKS.md for the tsgo --skipDefaultLibCheck parity numbers).
+# name, wall_ztsc, wall_tsgo (ms), rss_ztsc, rss_tsgo (MB)
+# ztsc at its default 8 checkers, tsgo at its default 4 checkers.
+# Re-measured 2026-07-16 after the default --checkers rose to min(8, cores)
+# and the embedded lib blobs were sharded (dom x8, esnext x4). ztsc still
+# skips checking its pre-verified lib by default; tsgo checks its lib by
+# default — see BENCHMARKS.md for the tsgo --skipDefaultLibCheck parity numbers.
 DATA = [
-    ("@types/node",        19.4,  47.2, 16.9, 102.1),
-    ("@types/react",       31.5, 247.6, 17.0, 186.7),
-    ("drizzle-orm",        21.7, 240.2, 22.6, 271.7),
-    ("hono",               33.7, 172.9, 21.2, 156.9),
-    ("@sinclair/typebox",  16.3,  48.9, 15.6,  78.2),
-    ("ajv",                11.5,  24.7, 10.0,  49.8),
-    ("zod",                31.1, 156.7, 17.3, 135.5),
-    ("chalk",               9.1,  19.4,  6.5,  43.7),
+    ("@types/node",        14.8,  46.1, 16.9, 101.4),
+    ("@types/react",       23.1, 242.3, 18.2, 186.2),
+    ("drizzle-orm",        20.4, 238.1, 23.7, 275.0),
+    ("hono",               25.4, 173.9, 22.9, 158.6),
+    ("@sinclair/typebox",  16.1,  47.9, 15.2,  77.3),
+    ("ajv",                 9.9,  23.6, 10.7,  49.9),
+    ("zod",                22.3, 156.1, 17.0, 136.1),
+    ("chalk",               6.7,  18.1,  6.7,  43.5),
 ]
 
 RSS_MAX_PX = 290
@@ -100,8 +103,8 @@ def aria():
     rz = [rup(r[3]) for r in DATA]; rt = [rup(r[4]) for r in DATA]
     wz = [rup(r[1]) for r in DATA]; wt = [rup(r[2]) for r in DATA]
     rp = [pct(r[3], r[4]) for r in DATA]; wp = [pct(r[1], r[2]) for r in DATA]
-    return ("Two-panel grouped bar chart across eight real packages at the default "
-            "four checkers. Left panel, peak resident memory: ztsc uses %d to %d "
+    return ("Two-panel grouped bar chart across eight real packages, each tool at its "
+            "own default checker count (ztsc 8, tsgo 4). Left panel, peak resident memory: ztsc uses %d to %d "
             "megabytes, tsgo %d to %d megabytes &#8212; ztsc is %d to %d percent of "
             "tsgo on every package. Right panel, wall clock: ztsc takes %d to %d "
             "milliseconds, tsgo %d to %d milliseconds &#8212; ztsc is %d to %d "
