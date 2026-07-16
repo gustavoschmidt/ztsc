@@ -3489,51 +3489,98 @@ const Checker = struct {
 
         // Constituents: a within-file interface is one symbol carrying every
         // reopened block's decls; a cross-file merged interface (M11a) is a
-        // list of per-file symbols. Each constituent's members must be
-        // converted in *its own* file context (member type nodes resolve
-        // against that file's scopes), so build one object type per
-        // constituent and union them (earlier-file members win — disjoint in
-        // the clean case; conflicting members are TS2717, deferred).
+        // list of per-file symbols. Members are converted in *each* constituent's
+        // own file context (member type nodes resolve against that file's
+        // scopes). A merged interface must fold in TWO phases — all constituents'
+        // DIRECT members first, then every constituent's `extends` bases — so an
+        // own member (which may live on a LATER cross-file constituent, e.g. a
+        // `lib.dom.iterable` augmentation) overrides an inherited one gathered
+        // from an EARLIER constituent's base. Folding whole per-constituent
+        // objects (direct + inherited) instead would let an earlier
+        // constituent's inherited member shadow a later constituent's own
+        // member. This mirrors the single-file binder merge, where all reopened
+        // blocks' direct members are gathered before any base is applied.
         var one = [_]SymbolId{sym};
         const parts: []const SymbolId = if (c.prog.isMergedId(sym)) c.prog.mergedSym(sym).parts else one[0..];
 
+        // Phase 1: direct members of every interface constituent, unioned with
+        // earlier-file members winning on conflict (disjoint in the clean case;
+        // conflicts are TS2717, deferred).
         var result: TypeId = types.no_type;
         for (parts) |csym| {
             if (!c.symFlags(csym).interface) continue;
-            const own = try c.interfaceConstituentObject(csym);
-            result = if (result == types.no_type) own else try c.mergeBaseObject(result, own);
+            const dm = try c.interfaceConstituentDirect(csym);
+            result = if (result == types.no_type) dm else try c.mergeBaseObject(result, dm);
         }
         // An empty interface (no members, no bases) is still a nominal shape:
         // it lacks the implied string index that an empty object *literal* has.
         if (result == types.no_type) result = try c.ts.makeObject(&.{}, 0, 0, types.obj_flag_not_inferable);
+        // Phase 2: merge every constituent's `extends` bases; the phase-1 direct
+        // members win, so an own member overrides an inherited one.
+        for (parts) |csym| {
+            if (!c.symFlags(csym).interface) continue;
+            result = try c.interfaceConstituentApplyBases(csym, result);
+        }
         try c.iface_generic.put(c.ca(), sym, result);
         return result;
     }
 
-    /// Object shape of a single interface symbol (one file): union of every
-    /// reopened block's members plus `extends` bases. Runs entirely in the
-    /// symbol's own file context.
-    fn interfaceConstituentObject(c: *Checker, sym: SymbolId) Error!TypeId {
+    /// Set `this` to `sym`'s generic instance (polymorphic `this` return,
+    /// `this` property/param types). Caller saves/restores `c.this_type`.
+    fn setInterfaceThis(c: *Checker, sym: SymbolId) Error!void {
+        var tps: std.ArrayList(TypeParamInfo) = .empty;
+        defer tps.deinit(c.scratch());
+        try c.typeParamsOf(sym, &tps);
+        const args = try c.scratch().alloc(TypeId, tps.items.len);
+        for (tps.items, 0..) |tp, i| args[i] = try c.ts.makeTypeParam(tp.sym);
+        c.this_type = try c.ts.makeRef(sym, args);
+    }
+
+    /// Direct members (no `extends` bases) of one interface symbol: the union of
+    /// every reopened block's members, converted in the symbol's own file
+    /// context. See `interfaceGeneric` for why bases are applied separately.
+    fn interfaceConstituentDirect(c: *Checker, sym: SymbolId) Error!TypeId {
         const saved_ctx = c.enterSymFile(sym);
         defer c.restoreCtx(saved_ctx);
-        // `this` in a member type node refers to this interface's generic
-        // instance (polymorphic `this` return, `this` property/param types).
         const saved_this = c.this_type;
         defer c.this_type = saved_this;
-        {
-            var tps: std.ArrayList(TypeParamInfo) = .empty;
-            defer tps.deinit(c.scratch());
-            try c.typeParamsOf(sym, &tps);
-            const args = try c.scratch().alloc(TypeId, tps.items.len);
-            for (tps.items, 0..) |tp, i| args[i] = try c.ts.makeTypeParam(tp.sym);
-            c.this_type = try c.ts.makeRef(sym, args);
-        }
+        try c.setInterfaceThis(sym);
 
         var all_members: std.ArrayList(Node) = .empty;
         defer all_members.deinit(c.scratch());
+        for (c.declsOf(sym)) |decl| {
+            if (c.nodeTag(decl) != .interface_decl) continue;
+            const d = c.tree.nodeData(decl);
+            const data = c.tree.extraData(ast.InterfaceData, d.lhs);
+            for (c.tree.extraRange(data.members_start, data.members_end)) |m| {
+                if (m != null_node) try all_members.append(c.scratch(), m);
+            }
+        }
+        // Convert members in the (first) interface scope.
+        for (c.declsOf(sym)) |decl| {
+            if (c.nodeTag(decl) == .interface_decl) {
+                if (try c.scopeOf(decl)) |s| c.cur_scope = s;
+                break;
+            }
+        }
+        return c.objectTypeFromMembers(all_members.items, types.obj_flag_not_inferable);
+    }
+
+    /// Merge one interface symbol's `extends` bases into `acc` (members already
+    /// in `acc` win), converting the heritage clauses in the symbol's own file
+    /// context. Marks the current gray frame as resolving bases so a re-entry is
+    /// recognized as a base cycle (TS2310); member/type-argument resolution
+    /// stays out of the base phase, so a recursive reference through them is
+    /// legal and reports nothing (M17.2).
+    fn interfaceConstituentApplyBases(c: *Checker, sym: SymbolId, acc: TypeId) Error!TypeId {
+        const saved_ctx = c.enterSymFile(sym);
+        defer c.restoreCtx(saved_ctx);
+        const saved_this = c.this_type;
+        defer c.this_type = saved_this;
+        try c.setInterfaceThis(sym);
+
         var bases: std.ArrayList(TypeId) = .empty;
         defer bases.deinit(c.scratch());
-
         for (c.declsOf(sym)) |decl| {
             if (c.nodeTag(decl) != .interface_decl) continue;
             const d = c.tree.nodeData(decl);
@@ -3553,29 +3600,13 @@ const Checker = struct {
                 const base = try c.typeFromTypeName(hd.lhs, targs.items);
                 try bases.append(c.scratch(), base);
             }
-            for (c.tree.extraRange(data.members_start, data.members_end)) |m| {
-                if (m != null_node) try all_members.append(c.scratch(), m);
-            }
         }
-        // Convert members in the (first) interface scope.
-        for (c.declsOf(sym)) |decl| {
-            if (c.nodeTag(decl) == .interface_decl) {
-                if (try c.scopeOf(decl)) |s| c.cur_scope = s;
-                break;
-            }
-        }
-        var own = try c.objectTypeFromMembers(all_members.items, types.obj_flag_not_inferable);
-        // Mark the current gray frame as resolving `extends` bases so a
-        // re-entry here is recognized as a base cycle (TS2310); member and
-        // type-argument resolution above stays out of the base phase, so a
-        // recursive reference through them is legal and reports nothing
-        // (M17.2). The frame is this interface's own `interfaceGeneric`
-        // caller — the top of the stack at entry.
         const frame_idx: ?usize = if (c.iface_stack.items.len > 0) c.iface_stack.items.len - 1 else null;
         if (frame_idx) |fi| c.iface_stack.items[fi].resolving_base = true;
         defer if (frame_idx) |fi| {
             c.iface_stack.items[fi].resolving_base = false;
         };
+        var own = acc;
         for (bases.items) |base| {
             own = try c.mergeBaseObject(own, try c.resolveStructural(base));
         }

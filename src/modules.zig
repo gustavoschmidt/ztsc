@@ -57,24 +57,55 @@ pub const Error = error{OutOfMemory};
 pub const FileId = u32;
 pub const no_file: FileId = std.math.maxInt(FileId);
 
-/// Synthetic path of the injected ES-core lib (M10). It has no on-disk
-/// location; the loaders special-case this exact path and use `lib_source`.
-/// The leading NUL keeps it from colliding with any real filesystem path.
-pub const lib_path = "\x00lib/lib.esnext.d.ts";
-/// The embedded ES-core lib text (see `src/lib/lib.esnext.d.ts`, M18.2 — the
-/// real TypeScript 7.0.2 ES-core..esnext surface, DOM excluded). Bound once per
-/// run; its top-level declarations become the program's global symbols. Its own
-/// diagnostics are suppressed (like tsc's default lib) — see the print loop in
-/// main.zig.
-pub const lib_source = @embedFile("lib/lib.esnext.d.ts");
+// The big ES-core and DOM libs are each embedded as N shard files rather than
+// one giant blob, so the front end (scan → parse → bind) parallelizes across
+// worker threads instead of running one 2.35 MB file serially on a single
+// worker. src/lib/gen_lib.js splits them at top-level declaration boundaries
+// (byte-preserving: the shards concatenate back to the un-sharded blob) and the
+// linker merges their globals cross-file exactly as if they were one file —
+// which is in fact how tsc itself sees the lib (one SourceFile per lib.*.d.ts).
+// KEEP THESE COUNTS IN SYNC WITH src/lib/gen_lib.js (ES_SHARDS / DOM_SHARDS).
+pub const es_shard_count = 4;
+pub const dom_shard_count = 8;
 
-/// Synthetic path of the injected DOM lib (M21). Loaded as an additional lib
-/// file when tsconfig `lib` selects "dom" (or by default — tsgo's target-esnext
-/// default includes DOM). Provides browser globals plus the real `console`.
-pub const dom_lib_path = "\x00lib/lib.dom.d.ts";
-/// The embedded DOM lib text (browser globals + `Console`; es* deps omitted,
-/// supplied by the esnext blob it always loads alongside).
-pub const dom_lib_source = @embedFile("lib/lib.dom.d.ts");
+/// Synthetic paths of the injected ES-core lib shards (M10; sharded in M21.perf).
+/// They have no on-disk location; the loaders special-case these exact paths and
+/// use the matching embedded source. The leading NUL keeps them from colliding
+/// with any real filesystem path.
+pub const lib_paths = [es_shard_count][]const u8{
+    "\x00lib/lib.esnext.0.d.ts", "\x00lib/lib.esnext.1.d.ts",
+    "\x00lib/lib.esnext.2.d.ts", "\x00lib/lib.esnext.3.d.ts",
+};
+/// The embedded ES-core lib shard texts (real TypeScript 7.0.2 ES-core..esnext
+/// surface, DOM excluded). Bound once per run; their top-level declarations
+/// become the program's global symbols. Their own diagnostics are suppressed
+/// (like tsc's default lib) — see the print loop in main.zig.
+pub const lib_sources = [es_shard_count][]const u8{
+    @embedFile("lib/lib.esnext.0.d.ts"), @embedFile("lib/lib.esnext.1.d.ts"),
+    @embedFile("lib/lib.esnext.2.d.ts"), @embedFile("lib/lib.esnext.3.d.ts"),
+};
+
+/// Synthetic paths of the injected DOM lib shards (M21). Loaded when tsconfig
+/// `lib` selects "dom" (or by default — tsgo's target-esnext default includes
+/// DOM). Provide browser globals plus the real `console`.
+pub const dom_lib_paths = [dom_shard_count][]const u8{
+    "\x00lib/lib.dom.0.d.ts", "\x00lib/lib.dom.1.d.ts",
+    "\x00lib/lib.dom.2.d.ts", "\x00lib/lib.dom.3.d.ts",
+    "\x00lib/lib.dom.4.d.ts", "\x00lib/lib.dom.5.d.ts",
+    "\x00lib/lib.dom.6.d.ts", "\x00lib/lib.dom.7.d.ts",
+};
+/// The embedded DOM lib shard texts (browser globals + `Console`; es* deps
+/// omitted, supplied by the esnext blob it always loads alongside).
+pub const dom_lib_sources = [dom_shard_count][]const u8{
+    @embedFile("lib/lib.dom.0.d.ts"), @embedFile("lib/lib.dom.1.d.ts"),
+    @embedFile("lib/lib.dom.2.d.ts"), @embedFile("lib/lib.dom.3.d.ts"),
+    @embedFile("lib/lib.dom.4.d.ts"), @embedFile("lib/lib.dom.5.d.ts"),
+    @embedFile("lib/lib.dom.6.d.ts"), @embedFile("lib/lib.dom.7.d.ts"),
+};
+
+/// FileId of the first ES-core lib shard, matched by path (or `no_file`). The
+/// esnext shards are always injected as a contiguous block starting here.
+pub const lib_path = lib_paths[0];
 
 /// Synthetic path of the minimal `console` shim (M21). Loaded ONLY when esnext
 /// is selected without dom (backend configs, lib:["esnext"]): `console` lives
@@ -82,6 +113,10 @@ pub const dom_lib_source = @embedFile("lib/lib.dom.d.ts");
 /// richer `Console` and skip this (no duplicate `var console`).
 pub const console_shim_path = "\x00lib/lib.console.d.ts";
 pub const console_shim_source = @embedFile("lib/lib.console.d.ts");
+
+/// Upper bound on injected lib files: every es shard + every dom shard + the
+/// console shim. Sizes the fixed-capacity `LibFile` buffers callers pass in.
+pub const max_lib_files = es_shard_count + dom_shard_count + 1;
 
 /// Which built-in lib blobs to inject. Derived from tsconfig `lib` (or the
 /// default) by `resolveLibSet`; consumed by `libFiles`, `seedLibAtoms`,
@@ -112,15 +147,19 @@ pub const LibFile = struct { path: []const u8, source: []const u8 };
 /// (esnext, dom, console shim) so that seeded atoms (`seedLibAtoms`) and the
 /// injected file ids agree run-to-run — the determinism the seeded interner
 /// relies on. Returns the populated prefix of `buf`.
-pub fn libFiles(set: LibSet, buf: *[3]LibFile) []const LibFile {
+pub fn libFiles(set: LibSet, buf: *[max_lib_files]LibFile) []const LibFile {
     var n: usize = 0;
     if (set.es) {
-        buf[n] = .{ .path = lib_path, .source = lib_source };
-        n += 1;
+        for (lib_paths, lib_sources) |p, s| {
+            buf[n] = .{ .path = p, .source = s };
+            n += 1;
+        }
     }
     if (set.dom) {
-        buf[n] = .{ .path = dom_lib_path, .source = dom_lib_source };
-        n += 1;
+        for (dom_lib_paths, dom_lib_sources) |p, s| {
+            buf[n] = .{ .path = p, .source = s };
+            n += 1;
+        }
     }
     if (set.shim) {
         buf[n] = .{ .path = console_shim_path, .source = console_shim_source };
@@ -131,8 +170,12 @@ pub fn libFiles(set: LibSet, buf: *[3]LibFile) []const LibFile {
 
 /// Embedded source for a synthetic lib path, or null for a real file path.
 pub fn libSourceFor(path: []const u8) ?[]const u8 {
-    if (std.mem.eql(u8, path, lib_path)) return lib_source;
-    if (std.mem.eql(u8, path, dom_lib_path)) return dom_lib_source;
+    for (lib_paths, lib_sources) |p, s| {
+        if (std.mem.eql(u8, path, p)) return s;
+    }
+    for (dom_lib_paths, dom_lib_sources) |p, s| {
+        if (std.mem.eql(u8, path, p)) return s;
+    }
     if (std.mem.eql(u8, path, console_shim_path)) return console_shim_source;
     return null;
 }
@@ -418,7 +461,7 @@ pub fn computeSymBase(alloc: Allocator, files: []const ProgFile) Error![]u32 {
 /// The parse/bind products are thrown away; only their interner side effects
 /// (which are idempotent) survive. Cheap: the lib is ~9 KB.
 pub fn seedLibAtoms(io: Io, gpa: Allocator, interner: *Interner, set: LibSet) !void {
-    var buf: [3]LibFile = undefined;
+    var buf: [max_lib_files]LibFile = undefined;
     for (libFiles(set, &buf)) |lf| {
         var seed_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer seed_arena.deinit();
@@ -653,7 +696,7 @@ pub fn singleWithLibProgram(
     lib_set: LibSet,
 ) !Program {
     if (!lib_set.any()) return singleFileProgram(arena, path, src, tree, bind);
-    var buf: [3]LibFile = undefined;
+    var buf: [max_lib_files]LibFile = undefined;
     const lib_list = libFiles(lib_set, &buf);
     const files = try arena.alloc(ProgFile, lib_list.len + 1);
     for (lib_list, 0..) |lf, i| {
@@ -1728,7 +1771,7 @@ pub fn buildProgram(
     var failures: std.ArrayList(BuildDiag) = .empty;
 
     // Inject the selected built-in lib blobs as the first entries (files 0..).
-    var lib_buf: [3]LibFile = undefined;
+    var lib_buf: [max_lib_files]LibFile = undefined;
     for (libFiles(lib_set, &lib_buf)) |lf| {
         try path_ids.put(scratch, lf.path, @intCast(pending.items.len));
         try pending.append(scratch, lf.path);
@@ -1899,7 +1942,7 @@ test "seedLibAtoms: covers every atom the lib binder produces (M12.1 determinism
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var buf: [3]LibFile = undefined;
+    var buf: [max_lib_files]LibFile = undefined;
     var last_bind: *const Bind = undefined;
     for (libFiles(set, &buf)) |lf| {
         const tree = try a.create(Ast);

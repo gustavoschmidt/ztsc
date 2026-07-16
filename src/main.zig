@@ -548,7 +548,7 @@ pub fn main(init: std.process.Init) !void {
     // Their synthetic paths route to the embedded sources in the worker front
     // end; their top-level decls become the program globals. Empty under
     // --noLib / lib:[].
-    var lib_buf: [3]modules.LibFile = undefined;
+    var lib_buf: [modules.max_lib_files]modules.LibFile = undefined;
     for (modules.libFiles(lib_set, &lib_buf)) |lf| {
         try path_ids.put(arena, lf.path, @intCast(paths.items.len));
         try paths.append(arena, lf.path);

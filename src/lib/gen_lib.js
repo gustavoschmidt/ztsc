@@ -132,10 +132,138 @@ function write(name, header, body) {
   console.log(`wrote ${p}: ${(header + body).length} bytes`);
 }
 
+// --- sharding ---------------------------------------------------------------
+// The big blobs (esnext ~0.6 MB, dom ~2.35 MB) are split into N shard files so
+// the front end (scan → parse → bind) parallelizes across worker threads
+// instead of running one giant file serially on a single worker. Splits happen
+// only at TOP-LEVEL DECLARATION BOUNDARIES — never inside an interface / class
+// / module / `declare global` body — so each shard is an independently
+// parseable sequence of ambient declarations. ztsc parses/binds each shard as
+// its own SourceFile and the linker merges their globals exactly as if they
+// were one file (cross-file declaration merging already works, and this is in
+// fact how tsc itself sees the lib: one SourceFile per lib.*.d.ts).
+//
+// Byte-preserving: concatenating a blob's shards reproduces the un-sharded body
+// exactly, and the provenance header rides on shard 0 ONLY, so the un-sharded
+// `header + body` byte stream is reproduced verbatim across the shard set —
+// line/byte/token/node totals are unchanged; only the file COUNT grows (which
+// is the point). Keep the shard counts in sync with src/modules.zig
+// (es_shard_count / dom_shard_count).
+const ES_SHARDS = 4;
+const DOM_SHARDS = 8;
+
+// Split `body` into `k` slices at top-level declaration boundaries, balanced by
+// byte size; `slices.join("") === body` exactly. A cut lands at the start of a
+// top-level declaration line (column-0 `interface` / `declare` / `type` / … —
+// member lines inside a body are always indented, so a column-0 keyword is
+// always top-level — and never inside a block comment), backed up over any
+// immediately preceding comment/blank trivia so a doc-comment travels with the
+// declaration it annotates instead of being orphaned onto the previous shard.
+function splitAtDeclBoundaries(body, k) {
+  if (k <= 1) return [body];
+  const lines = body.split("\n");
+  const off = new Array(lines.length + 1);
+  off[0] = 0;
+  for (let i = 0; i < lines.length; i++) off[i + 1] = off[i] + lines[i].length + 1;
+
+  const DECL = /^(?:export\s+)?(?:declare|interface|type|abstract|class|function|namespace|enum|const|var|let)\b/;
+  const declStart = new Array(lines.length).fill(false);
+  const trivia = new Array(lines.length).fill(false);
+  let inBlock = false; // inside a /* … */ block comment (TS block comments don't nest)
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const startedInBlock = inBlock;
+    if (!startedInBlock && DECL.test(line)) declStart[i] = true;
+    const t = line.trim();
+    // A line is trivia (carried forward with the following declaration) when it
+    // holds no top-level code: a comment-block continuation/close (startedIn-
+    // Block), a blank line, a `//`/`///` line, or a `/*`/`/**` block-comment
+    // opener (whose body/closer follow on later trivia lines). Marking the
+    // OPENER as trivia is what keeps a whole JSDoc block with its declaration —
+    // otherwise the cut lands after `/**`, splitting mid-comment.
+    if (startedInBlock || t === "" || t.startsWith("//") || t.startsWith("/*")) trivia[i] = true;
+    // Advance block-comment state (TS block comments don't nest): stay in-block
+    // until a `*/` closes; enter a block at the last unterminated `/*`.
+    if (startedInBlock) {
+      inBlock = !line.includes("*/");
+    } else {
+      const o = line.lastIndexOf("/*");
+      inBlock = o !== -1 && line.indexOf("*/", o) === -1;
+    }
+  }
+
+  // Candidate cut offsets: each top-level declaration start, backed up over its
+  // leading trivia run. Strictly increasing (each decl start is code).
+  const candidates = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (!declStart[i]) continue;
+    let j = i;
+    while (j - 1 >= 0 && trivia[j - 1]) j--;
+    candidates.push(off[j]);
+  }
+
+  const total = off[lines.length];
+  const chosen = [];
+  let last = 0;
+  for (let s = 1; s < k; s++) {
+    const target = Math.round((total * s) / k);
+    let best = -1, bestd = Infinity;
+    for (const c of candidates) {
+      if (c <= last) continue;
+      const d = Math.abs(c - target);
+      if (d < bestd) { bestd = d; best = c; }
+    }
+    if (best < 0) throw new Error(`not enough declaration boundaries to split into ${k} shards`);
+    chosen.push(best);
+    last = best;
+  }
+
+  const slices = [];
+  let prev = 0;
+  for (const c of chosen) { slices.push(body.slice(prev, c)); prev = c; }
+  slices.push(body.slice(prev));
+  // Invariant checks (cheap, guard the determinism/byte-preservation contract).
+  if (slices.length !== k) throw new Error("shard count mismatch");
+  if (slices.join("") !== body) throw new Error("shards do not reconstitute the body");
+  // Every shard after the first must begin at a clean top-level boundary: a
+  // declaration keyword, a comment/reference, or a blank line — never an
+  // indented line (mid-body) or a bare `*`/`*/` (mid-block-comment). This
+  // catches any boundary that would split an interface body or a JSDoc block,
+  // which would corrupt the shard when parsed on its own.
+  const CLEAN_START = /^(?:\s*$|\/\/|\/\*|\*|(?:export\s+)?(?:declare|interface|type|abstract|class|function|namespace|enum|const|var|let)\b)/;
+  for (let i = 1; i < slices.length; i++) {
+    const first = slices[i].slice(0, slices[i].indexOf("\n") + 1 || slices[i].length);
+    if (/^[ \t]/.test(first) || first.startsWith("*")) {
+      throw new Error(`shard ${i} starts mid-body/mid-comment: ${JSON.stringify(first.slice(0, 60))}`);
+    }
+    if (!CLEAN_START.test(first)) {
+      throw new Error(`shard ${i} does not start at a top-level boundary: ${JSON.stringify(first.slice(0, 60))}`);
+    }
+  }
+  return slices;
+}
+
+function writeShards(base, header, body, k) {
+  const slices = splitAtDeclBoundaries(body, k);
+  for (let i = 0; i < k; i++) {
+    const name = `${base}.${i}.d.ts`;
+    const content = i === 0 ? header + slices[i] : slices[i];
+    fs.writeFileSync(path.join(__dirname, name), content);
+    console.log(`wrote ${name}: ${content.length} chars${i === 0 ? " (+header)" : ""}`);
+  }
+}
+
+// Remove any previously generated esnext/dom files (old single-file blobs and
+// prior shard sets) so regeneration is clean and deterministic. The console
+// shim (lib.console.d.ts) is kept.
+for (const f of fs.readdirSync(__dirname)) {
+  if (/^lib\.(esnext|dom)(\.\d+)?\.d\.ts$/.test(f)) fs.unlinkSync(path.join(__dirname, f));
+}
+
 // --- esnext (ES-core) blob -------------------------------------------------
 const esOrder = chain(["esnext"], (n) => !EXCLUDE.test(n));
-write(
-  "lib.esnext.d.ts",
+writeShards(
+  "lib.esnext",
   `// ZTSC embedded ES-core lib — real TypeScript ES-core..esnext surface.
 // Assembled from ${provenance} by src/lib/gen_lib.js — do not edit by hand.
 //
@@ -153,6 +281,7 @@ write(
 // transform note in gen_lib.js.
 `,
   concat(esOrder),
+  ES_SHARDS,
 );
 
 // --- DOM blob --------------------------------------------------------------
@@ -162,8 +291,8 @@ const domOrder = chain(
   ["dom", "dom.iterable", "dom.asynciterable"],
   (n) => DOM_ONLY.test(n),
 );
-write(
-  "lib.dom.d.ts",
+writeShards(
+  "lib.dom",
   `// ZTSC embedded DOM lib — real TypeScript DOM surface (browser globals).
 // Assembled from ${provenance} by src/lib/gen_lib.js — do not edit by hand.
 //
@@ -177,6 +306,7 @@ write(
 // target-esnext default which includes DOM). See src/modules.zig LibSet.
 `,
   concat(domOrder),
+  DOM_SHARDS,
 );
 
 // --- console shim ----------------------------------------------------------
