@@ -10,7 +10,7 @@ An extremely fast, low-memory TypeScript type checker, written in Zig.
 - A **single static binary**. No Node runtime, no dependencies — and none in
   the source either: nothing but the Zig standard library.
 - **Parallel by design**, with byte-identical output at any worker count.
-- Diagnostics **match the TypeScript compiler**, enforced by a 400-case
+- Diagnostics **match the TypeScript compiler**, enforced by a 414-case
   differential conformance suite.
 
 <picture>
