@@ -159,6 +159,12 @@ ztsc src/main.ts           # or explicit entry files</code></pre>
 <section id="limitations">
   <p class="eyebrow"><span class="n">05</span> · limitations</p>
   <h2>What it doesn't check yet</h2>
+  <p><strong>ztsc does not build or run on Windows yet.</strong> The checker's per-symbol state
+  lives in demand-zeroed anonymous memory obtained with POSIX <code>mmap</code> — untouched
+  pages never become resident, which is load-bearing for the memory numbers. Windows has an
+  exact equivalent (<code>VirtualAlloc</code> returns zero-initialized, demand-paged memory)
+  but it is not wired in yet, so a Windows target fails at compile time with a clear error.
+  macOS and Linux work today; a Windows port is planned.</p>
   <p>ztsc checks a large, well-defined subset of strict-mode TypeScript: the full type-level
   language (conditional types with <code>infer</code>, mapped types, template-literal types,
   generics, narrowing, declaration merging), the real ES-core…esnext + DOM standard library

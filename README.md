@@ -56,6 +56,14 @@ Full results, methodology, and limitations of the comparison:
 
 ## Limitations
 
+**ztsc does not build or run on Windows yet.** The checker's per-symbol state
+lives in demand-zeroed anonymous memory obtained with POSIX `mmap`
+(`src/zeropage.zig`) — untouched pages never become resident, which is
+load-bearing for the memory numbers above. Windows has an exact equivalent
+(`VirtualAlloc` returns zero-initialized, demand-paged memory) but it is not
+wired in yet, so a Windows target fails at compile time with a clear error.
+macOS and Linux work today; a Windows port is planned.
+
 ztsc checks a large, well-defined subset of strict-mode TypeScript: the full
 type-level language (conditional types with `infer`, mapped types,
 template-literal types, generics, narrowing, declaration merging), the real
