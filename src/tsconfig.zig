@@ -399,6 +399,11 @@ pub const Config = struct {
     /// absent. Fed to `modules.resolveLibSet` to pick the built-in lib blobs;
     /// null selects the default set (ES-core + DOM, matching tsgo).
     lib: ?[]const []const u8 = null,
+    /// `compilerOptions.skipLibCheck` or `skipDefaultLibCheck` set to true.
+    /// Suppresses type-checking of the embedded default lib (which ztsc checks
+    /// by default, matching tsc/tsgo). Note the honoring of `skipLibCheck` is
+    /// partial: ztsc still checks dependency `.d.ts` files under it.
+    skip_lib_check: bool = false,
     /// Non-fatal warnings (unknown options, bad shapes) for stderr.
     warnings: []const []const u8 = &.{},
     /// Accepted-and-ignored option notes, shown under --verbose only.
@@ -491,9 +496,15 @@ pub fn loadInDir(io: Io, arena: Allocator, base: Io.Dir, config_path: []const u8
                 } else if (std.mem.eql(u8, okey, "types")) {
                     try note(arena, &notes, "{s}: 'types' ignored (ztsc resolves @types via imports/references)", .{config_path});
                 } else if (std.mem.eql(u8, okey, "skipLibCheck") or std.mem.eql(u8, okey, "skipDefaultLibCheck")) {
-                    try note(arena, &notes, "{s}: '{s}' accepted ({s}the built-in lib is never re-checked; dependency .d.ts files are still checked)", .{
-                        config_path, okey, if (std.mem.eql(u8, okey, "skipLibCheck")) "partially honored: " else "already the default: ",
-                    });
+                    const on = oval == .boolean and oval.boolean;
+                    if (on) cfg.skip_lib_check = true;
+                    if (!on) {
+                        try note(arena, &notes, "{s}: '{s}' is not enabled; the embedded default lib is type-checked (matching tsc/tsgo)", .{ config_path, okey });
+                    } else if (std.mem.eql(u8, okey, "skipLibCheck")) {
+                        try note(arena, &notes, "{s}: 'skipLibCheck' partially honored: the embedded default lib is not type-checked; dependency .d.ts files are still checked", .{config_path});
+                    } else {
+                        try note(arena, &notes, "{s}: 'skipDefaultLibCheck' honored: the embedded default lib is not type-checked", .{config_path});
+                    }
                 } else if (std.mem.eql(u8, okey, "baseUrl")) {
                     if (oval == .string) {
                         base_url = oval.string;
