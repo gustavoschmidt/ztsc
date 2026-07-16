@@ -106,8 +106,9 @@ like `tsc` — but it does not check everything yet:
   of unions/generics/index-signature types, children *value* typing
   (TS2745/2746), and class-component prop mistakes report refined codes
   (TS2741/2322) where tsgo's real-React path reports TS2769.
-- **tsconfig subset**: `files` / `include` / `exclude` / `baseUrl` / `paths`,
-  strict mode only; other options are accepted and ignored.
+- **tsconfig subset**: `files` / `include` / `exclude` / `baseUrl` / `paths` /
+  `lib` (plus the `skipLibCheck` keys), strict mode only (`strict: false` is
+  refused); other options are accepted and ignored — `--verbose` lists which.
 - **No watch mode or LSP yet** — both are planned next, on an architecture
   built for them.
 - In a handful of known edge cases ztsc misses an error tsc would report. It

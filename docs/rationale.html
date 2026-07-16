@@ -151,9 +151,13 @@
   @types/react, @types/lodash, rxjs, drizzle-orm, zod, hono, …) is a frequency table of what
   real code actually needs. The first census said conditional types and <code>infer</code> were
   half of everything missing — so they were built first. Today every type-level bucket in that
-  census reads zero, and CommonJS interop (<code>export =</code>,
-  <code>import = require</code>) has landed as well; the residual is const-symbol computed
-  keys, consciously deferred. Correctness of what <em>is</em> checked is enforced differentially: a
+  census reads zero, CommonJS interop (<code>export =</code>,
+  <code>import = require</code>) has landed as well, and computed property keys — bare
+  const-symbol (<code>[entityKind]</code>) and member-expression
+  (<code>[EventEmitter.captureRejectionSymbol]</code>) alike — parse and check. The residual
+  is eight parse-recovery artifacts of two unsupported <em>type</em> forms (drizzle's
+  <code>this['_']</code> indexed access, a hono nested conditional), not computed keys.
+  Correctness of what <em>is</em> checked is enforced differentially: a
   414-case conformance suite validated against the pinned native TypeScript compiler
   (tsgo 7.0.2), down to error codes and positions.</p>
 </section>
