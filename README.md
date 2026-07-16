@@ -56,66 +56,45 @@ Full results, methodology, and limitations of the comparison:
 
 ## Limitations
 
-ztsc is a batch checker for strict-mode TypeScript. What it checks, it checks
-like `tsc` — but it does not check everything yet:
+ztsc checks a large, well-defined subset of strict-mode TypeScript: the full
+type-level language (conditional types with `infer`, mapped types,
+template-literal types, generics, narrowing, declaration merging), the real
+ES-core…esnext + DOM standard library with the full iteration protocol,
+CommonJS interop, const-symbol computed keys, and JSX against the real
+`@types/react`. What it checks, it checks like `tsc` — enforced by the
+differential conformance suite. Every gap below fails in the safe direction:
+ztsc may miss an error `tsc` would report, but it never reports an error on
+valid code, and unsupported syntax produces a clear "not yet supported"
+diagnostic — never a wrong answer or a crash.
 
-- **DOM lib via `lib`.** The embedded standard library ships the ES-core..esnext
-  surface plus the real TypeScript DOM lib (`dom` + `dom.iterable` +
-  `dom.asynciterable`). The tsconfig `compilerOptions.lib` field selects blobs:
-  a list replaces the default (tsc semantics), recognizing the `es*` and `dom*`
-  families (other families warn + ignore). With no `lib` field the default is
-  ES-core + DOM, matching tsgo's target-esnext default, so browser globals
-  (`Response`, `HTMLElement`, `fetch`, `document`, `console`, …) resolve.
-  `lib:["esnext"]` gives the backend configuration (no DOM). The full iteration
-  protocol is checked: `for…of` over any DOM collection (`URLSearchParams`,
-  `Headers`, `FormData`, `NodeListOf`, …) and `for await` over
-  `AsyncIterable`/`AsyncGenerator` (with the sync-iterable fallback, elements
-  awaited). Iterator gaps that remain: `yield*` delegation is unchecked, and
-  unannotated generator functions type as `any` — both under-report. By default
-  ztsc does not *type-check* the embedded lib files themselves (they are still
-  parsed, bound, and linked, so globals and lazy type expansion are unaffected) —
-  this is tsc's `skipDefaultLibCheck`, on because the shipped lib is pre-verified
-  each release; `--check-default-lib` restores the old behavior, with
-  byte-identical diagnostics either way.
-- **CommonJS interop is checked** (`export =`, `import x = require(…)`, and
-  default/named/namespace ES imports against an `export =` module), but a couple
-  of corners degrade leniently rather than erroring: a namespace import keeps the
+What it does **not** check yet:
+
+- **Watch mode and LSP** — ztsc is batch-only; both are planned next, on an
+  architecture built for them.
+- **tsconfig options beyond the subset** — only `files` / `include` /
+  `exclude` / `baseUrl` / `paths` / `lib` (plus the `skipLibCheck` keys) are
+  honored, strict mode only (`strict: false` is refused); everything else is
+  accepted and ignored, and `--verbose` lists which.
+- **`lib` families other than `es*` and `dom*`** (e.g. `webworker`) — they
+  warn and are ignored.
+- **Generator corners**: `yield*` delegation is unchecked, and unannotated
+  generator functions type as `any`.
+- **CommonJS corners**: a namespace import of an `export =` module keeps the
   export's call signature (`ns()` is not flagged), and a member of a
   `require`-bound namespace used in *type* position resolves to `any`.
-- **Const-symbol computed keys are checked** (`[kind]: T` where `kind` is a
-  const `unique symbol`) — in classes, interfaces, type literals and object
-  literals, keyed by the symbol's nominal identity across files (an imported
-  key resolves to its declaring site, and reading with a *different* symbol is
-  a TS7053). Member-expression keys are checked too: a class-static symbol
-  (`[EventEmitter.captureRejectionSymbol]`) or a namespace export
-  (`[promisify.custom]`) resolves to the same nominal identity. Two lenient
-  corners: a plain non-`unique` `symbol` key (rxjs's `[Symbol.observable]`,
-  declared `: symbol`) is keyed by name rather than as a symbol index, and a
-  deeper-qualified key (`[a.b.c]`) stays out of subset — both under-report
-  rather than erroring.
-- **JSX is checked against the real `@types/react`** — the global `JSX`
-  namespace merged out of the package (`declare global` in 18.x, or any
-  user-authored namespace), intrinsic props via `IntrinsicElements`
-  (including `DetailedHTMLProps` intersections), function- and
-  class-component props, spread attributes (`<C {...p} />`: required-prop
-  satisfaction, later-wins overwrites/TS2783, non-object spreads/TS2698,
-  weak-type TS2559), `key` via `IntrinsicAttributes`, and children via
-  `ElementChildrenAttribute` — differentially matched against tsgo (see
-  `test/react_accept_real`). Lenient corners (under-report, never a false
-  positive): prop *type* mismatches arriving inside a spread object, spreads
-  of unions/generics/index-signature types, children *value* typing
-  (TS2745/2746), and class-component prop mistakes report refined codes
-  (TS2741/2322) where tsgo's real-React path reports TS2769.
-- **tsconfig subset**: `files` / `include` / `exclude` / `baseUrl` / `paths` /
-  `lib` (plus the `skipLibCheck` keys), strict mode only (`strict: false` is
-  refused); other options are accepted and ignored — `--verbose` lists which.
-- **No watch mode or LSP yet** — both are planned next, on an architecture
-  built for them.
-- In a handful of known edge cases ztsc misses an error tsc would report. It
-  never reports an error on valid code.
+- **Symbol-key corners**: a plain non-`unique` `symbol` key (rxjs's
+  `[Symbol.observable]`, declared `: symbol`) is keyed by name rather than as
+  a symbol index, and a deeper-qualified key (`[a.b.c]`) is out of subset.
+- **JSX corners**: prop *type* mismatches arriving inside a spread object,
+  spreads of unions/generics/index-signature types, and children *value*
+  typing (TS2745/2746) are unchecked; class-component prop mistakes report
+  refined codes (TS2741/2322) where tsgo reports TS2769.
+- **The embedded lib files are not re-type-checked** by default — they ship
+  pre-verified each release (tsc's `skipDefaultLibCheck`); `--check-default-lib`
+  restores the check, with byte-identical diagnostics either way.
+- A handful of other known edge cases miss an error `tsc` would report.
 
-Unsupported syntax produces a clear "not yet supported" diagnostic — never a
-wrong answer or a crash. Feature parity is in the works.
+Feature parity is in the works.
 
 ## License
 
