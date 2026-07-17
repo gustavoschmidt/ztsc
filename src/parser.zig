@@ -1298,7 +1298,20 @@ const Parser = struct {
             flags |= ast.Flags.optional;
         }
         var type_ann: Node = null_node;
-        if (try p.eat(.colon) != null) type_ann = try p.parseType();
+        if (try p.eat(.colon) != null) {
+            // A parameter's type annotation is a full type — including a
+            // conditional (`x: T extends U ? A : B`). Clear the function-type
+            // speculation flag so `parseType` claims a trailing `extends` here:
+            // a parameter list can never be followed by a bare `extends`, so the
+            // conditional is unambiguous once we are past the `:`. Without this,
+            // the `spec == 0` guard in `parseType` truncated the annotation to
+            // its check type and derailed the whole param list (e.g. base-ui's
+            // `(value: Value extends number ? number : Value, …) => void`).
+            const saved_spec = p.spec;
+            p.spec = 0;
+            defer p.spec = saved_spec;
+            type_ann = try p.parseType();
+        }
         var init: Node = null_node;
         if (try p.eat(.eq) != null) init = try p.parseAssignExpr(.{});
 

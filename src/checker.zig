@@ -3812,9 +3812,27 @@ const Checker = struct {
         };
         var own = acc;
         for (bases.items) |base| {
-            own = try c.mergeBaseObject(own, try c.resolveStructural(base));
+            own = try c.mergeBaseResolved(own, try c.resolveStructural(base));
         }
         return own;
+    }
+
+    /// Merge one resolved base into `derived`. A base that reduces to an
+    /// intersection of objects (e.g. `interface X extends Omit<M, K> & { … }`,
+    /// or a `type` alias whose body is an intersection) contributes the members
+    /// of each object constituent — folded left-to-right so an earlier
+    /// constituent (and `derived` itself) wins on a name clash. Without this,
+    /// `mergeBaseObject`'s object-only guard would silently drop every inherited
+    /// member of an intersection base.
+    fn mergeBaseResolved(c: *Checker, derived: TypeId, base: TypeId) Error!TypeId {
+        if (c.ts.kind(base) == .intersection) {
+            var result = derived;
+            for (try c.memberList(base)) |m| {
+                result = try c.mergeBaseResolved(result, try c.resolveStructural(m));
+            }
+            return result;
+        }
+        return c.mergeBaseObject(derived, base);
     }
 
     /// Merge base-object members into `derived` (derived wins).
@@ -5510,6 +5528,7 @@ const Checker = struct {
             defer c.homo_index_mode = saved_hi;
             const src = try c.resolveStructural(src_type);
             switch (s.kind(src)) {
+                .any, .err => return types.any_type,
                 .array => {
                     // A homomorphic map over an array yields an array; the
                     // element is the value with `K` bound to the number index.
@@ -5527,11 +5546,20 @@ const Checker = struct {
                     }
                     return s.makeTuple(elems.items);
                 },
-                .object => {
+                .object, .intersection => {
+                    // A homomorphic map iterates the source's own members. An
+                    // intersection source (`{ [K in keyof (A & B)]: … }`) has
+                    // key set `keyof A | keyof B`; flatten every object
+                    // constituent's props so members of both survive — without
+                    // this the intersection fell through to `{}` and dropped
+                    // them all (e.g. `WithBaseUIEvent<ComponentPropsWithRef<'img'>>`,
+                    // whose argument is `ClassAttributes & ImgHTMLAttributes`).
+                    var srcprops: std.ArrayList(types.Prop) = .empty;
+                    defer srcprops.deinit(c.scratch());
+                    try c.collectHomoProps(src, &srcprops);
                     var props: std.ArrayList(types.Prop) = .empty;
                     defer props.deinit(c.scratch());
-                    for (0..s.objectPropCount(src)) |i| {
-                        const p = s.objectProp(src, @intCast(i));
+                    for (srcprops.items) |p| {
                         const key_lit = try s.makeStringLiteral(p.name, false);
                         const name = (try c.remapKey(as_clause, key_id, key_lit)) orelse continue;
                         const pt = try c.substMappedKey(value, key_id, key_lit);
@@ -5553,6 +5581,23 @@ const Checker = struct {
         try c.collectMappedKeys(constraint, &keyset);
         const keys = keyset.items;
 
+        // Modifiers-type preservation for the `Pick`/`Omit` shape. When the
+        // mapped value is `T[K]` (an indexed access whose index is this map's
+        // key parameter), `T` is the modifiers type: a source prop's
+        // optional/readonly modifier carries onto the mapped prop, mirroring how
+        // tsc copies modifiers from a mapped type's modifiers type even for a
+        // non-homomorphic `{ [P in K]: T[P] }` (`K extends keyof T`). Only ADDS
+        // a base modifier (the map's own `+/-` still applies on top via
+        // `applyPropModifiers`), so it can only relax an over-strict required
+        // prop — never a new false positive. Without it, `Pick`/`Omit` props
+        // read as required (spurious TS2739/TS2741).
+        var mod_src: TypeId = 0;
+        if (s.kind(value) == .index_access and s.kind(s.indexAccessIndex(value)) == .mapped_param) {
+            const o = try c.resolveStructural(s.indexAccessObj(value));
+            if (s.kind(o) == .object) mod_src = o;
+        }
+        const mod_mask = types.prop_flag_optional | types.prop_flag_readonly;
+
         var props: std.ArrayList(types.Prop) = .empty;
         defer props.deinit(c.scratch());
         var sindex: TypeId = 0;
@@ -5564,18 +5609,49 @@ const Checker = struct {
                 .string_literal => {
                     const name = (try c.remapKey(as_clause, key_id, key_lit)) orelse continue;
                     const pt = try c.substMappedKey(value, key_id, key_lit);
-                    try props.append(c.scratch(), .{ .name = name, .ty = pt, .flags = applyPropModifiers(0, flags) });
+                    var base: u32 = 0;
+                    if (mod_src != 0) {
+                        if (s.objectPropByName(mod_src, s.literalAtom(key_lit))) |sp| base = sp.flags & mod_mask;
+                    }
+                    try props.append(c.scratch(), .{ .name = name, .ty = pt, .flags = applyPropModifiers(base, flags) });
                 },
                 .number_literal, .number_literal_fresh => {
                     const nm = try c.numberLiteralAtom(key_lit);
                     const pt = try c.substMappedKey(value, key_id, key_lit);
-                    try props.append(c.scratch(), .{ .name = nm, .ty = pt, .flags = applyPropModifiers(0, flags) });
+                    var base: u32 = 0;
+                    if (mod_src != 0) {
+                        if (s.objectPropByName(mod_src, nm)) |sp| base = sp.flags & mod_mask;
+                    }
+                    try props.append(c.scratch(), .{ .name = nm, .ty = pt, .flags = applyPropModifiers(base, flags) });
                 },
                 else => {}, // non-key member (e.g. symbol) — skip
             }
         }
         if (props.items.len == 0 and sindex == 0 and nindex == 0) return types.empty_object_type;
         return s.makeObject(props.items, sindex, nindex, 0);
+    }
+
+    /// Collect the distinct own props of an objectish source (object, or an
+    /// intersection of objects) for a homomorphic mapped type's key iteration.
+    /// The first occurrence of each name wins its modifier flags; the mapped
+    /// value is recomputed per key against the whole source, so a colliding
+    /// name's property type stays correct regardless of which flags are kept.
+    fn collectHomoProps(c: *Checker, t: TypeId, out: *std.ArrayList(types.Prop)) Error!void {
+        const r = try c.resolveStructural(t);
+        switch (c.ts.kind(r)) {
+            .object => {
+                for (0..c.ts.objectPropCount(r)) |i| {
+                    const p = c.ts.objectProp(r, @intCast(i));
+                    for (out.items) |*o| {
+                        if (o.name == p.name) break;
+                    } else try out.append(c.scratch(), p);
+                }
+            },
+            .intersection => {
+                for (try c.memberList(r)) |m| try c.collectHomoProps(m, out);
+            },
+            else => {},
+        }
     }
 
     /// Flatten a non-homomorphic mapped-type constraint into its concrete key
