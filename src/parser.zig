@@ -2219,7 +2219,9 @@ const Parser = struct {
             },
             .keyword_async => {
                 const t1 = p.peekTag(1);
-                if (!p.peekNewline(1) and (t1 == .l_paren or isIdentLike(t1))) {
+                // `<`/`<<` covers a generic async arrow `async <T>(x) => …`;
+                // speculation backtracks if it turns out to be `async < b`.
+                if (!p.peekNewline(1) and (t1 == .l_paren or t1 == .lt or t1 == .lt_lt or isIdentLike(t1))) {
                     if (try p.tryParseArrow(ctx)) |arrow| return arrow;
                 }
             },
