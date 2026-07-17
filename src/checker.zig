@@ -2928,7 +2928,7 @@ const Checker = struct {
                     c.nodeTag(node) == .function_decl or c.nodeTag(node) == .class_method))
             {
                 try c.sig_cache.put(c.ca(), c.nodeKey(node), .{ .ty = try c.ts.makeFunction(params.items, try c.makePromise(types.any_type), tps.items, if (is_method) types.fn_flag_method else 0), .ctx = ctx_sig });
-                const payload = c.awaitedType(try c.inferReturnType(node, c.tree.nodeData(node).rhs));
+                const payload = try c.awaitedType(try c.inferReturnType(node, c.tree.nodeData(node).rhs));
                 ret = try c.makePromise(payload);
             } else {
                 ret = try c.makePromise(types.void_type);
@@ -3075,14 +3075,26 @@ const Checker = struct {
         }
         var rets: std.ArrayList(Node) = .empty;
         defer rets.deinit(c.scratch());
+        var ret_scopes: std.ArrayList(ScopeId) = .empty;
+        defer ret_scopes.deinit(c.scratch());
         var bare_return = false;
+        // Base scope for the body: a function/arrow body block binds its
+        // statements directly in the function scope (no separate block scope),
+        // so start from the function's own scope.
+        const base_scope = (try c.scopeOf(fn_node)) orelse c.cur_scope;
         for (c.tree.nodeRange(body)) |stmt| {
-            if (stmt != null_node) try c.collectReturns(stmt, &rets, &bare_return);
+            if (stmt != null_node) try c.collectReturns(stmt, &rets, &ret_scopes, &bare_return, base_scope);
         }
         if (rets.items.len == 0) return types.void_type;
         var parts: std.ArrayList(TypeId) = .empty;
         defer parts.deinit(c.scratch());
-        for (rets.items) |r| {
+        // Each return expression is resolved in the scope where its `return`
+        // statement lives (a return inside a try/if/loop block sees that
+        // block's locals), not the ambient scope of this type probe.
+        const saved_scope = c.cur_scope;
+        defer c.cur_scope = saved_scope;
+        for (rets.items, ret_scopes.items) |r, sc| {
+            c.cur_scope = sc;
             try parts.append(c.scratch(), try c.widenLiteral(try c.checkExprCached(r, types.no_type)));
         }
         if (bare_return or !c.stmtListTerminal(c.tree.nodeRange(body))) {
@@ -3091,20 +3103,26 @@ const Checker = struct {
         return c.ts.makeUnion(c.scratch(), parts.items);
     }
 
-    fn collectReturns(c: *Checker, node: Node, out: *std.ArrayList(Node), bare: *bool) Error!void {
+    fn collectReturns(c: *Checker, node: Node, out: *std.ArrayList(Node), out_scopes: ?*std.ArrayList(ScopeId), bare: *bool, scope: ScopeId) Error!void {
         if (node == null_node) return;
         switch (c.nodeTag(node)) {
             .return_stmt => {
                 const d = c.tree.nodeData(node);
-                if (d.lhs != 0) try out.append(c.scratch(), d.lhs) else bare.* = true;
+                if (d.lhs != 0) {
+                    try out.append(c.scratch(), d.lhs);
+                    if (out_scopes) |os| try os.append(c.scratch(), scope);
+                } else bare.* = true;
                 return;
             },
             // Don't descend into nested functions/classes.
             .arrow_fn, .function_expr, .function_decl, .class_decl, .class_method => return,
             else => {},
         }
+        // A return nested in a block/try/loop/switch resolves its expression in
+        // that construct's scope; track it as we descend.
+        const inner = (try c.scopeOf(node)) orelse scope;
         var it = c.tree.childIterator(node);
-        while (it.next()) |child| try c.collectReturns(child, out, bare);
+        while (it.next()) |child| try c.collectReturns(child, out, out_scopes, bare, inner);
     }
 
     // =====================================================================
@@ -6427,7 +6445,17 @@ const Checker = struct {
     /// Single-level `Awaited<T>`: unwrap a `Promise<T>` to `T`; any other type
     /// passes through (await on a non-thenable yields the value itself).
     /// Deeper `Awaited<T>` recursion (`Promise<Promise<T>>`) is a known gap.
-    fn awaitedType(c: *Checker, t: TypeId) TypeId {
+    fn awaitedType(c: *Checker, t: TypeId) Error!TypeId {
+        // `Awaited<T>` distributes over unions: `await (Promise<X> | undefined)`
+        // is `X | undefined` (tsc). Without this, a `Promise<X> | undefined`
+        // receiver — common now that optional chains yield `... | undefined` —
+        // fails to unwrap and surfaces spurious property/callable errors.
+        if (c.ts.kind(t) == .union_type) {
+            var parts: std.ArrayList(TypeId) = .empty;
+            defer parts.deinit(c.scratch());
+            for (try c.memberList(t)) |m| try parts.append(c.scratch(), try c.awaitedType(m));
+            return c.ts.makeUnion(c.scratch(), parts.items);
+        }
         if (c.ts.kind(t) == .ref) {
             const sym = c.prog.globals.lookup(c.atom_Promise) orelse return t;
             if (c.ts.refSymbol(t) == sym) {
@@ -7586,7 +7614,7 @@ const Checker = struct {
                     if (!delegate and yt != 0 and yt != types.no_type and yt != types.error_type and c.ts.kind(yt) != .any) {
                         // Async generators may yield `T | PromiseLike<T>`:
                         // the yielded value is awaited before it is emitted.
-                        const eff_vt = if (in_async) c.awaitedType(vt) else vt;
+                        const eff_vt = if (in_async) try c.awaitedType(vt) else vt;
                         _ = try c.checkAssignable(eff_vt, yt, d.lhs, c.nodeSpan(d.lhs));
                     }
                 }
@@ -8534,18 +8562,58 @@ const Checker = struct {
         }
     }
 
+    /// Does `node` denote an optional chain — i.e. does its object/callee
+    /// spine contain a `?.` link (without crossing parentheses, `!`, or `new`,
+    /// which all break the chain)? A member/element/call access whose object is
+    /// such a chain *continues* it: it short-circuits on a nullish object
+    /// rather than erroring, and propagates `undefined` to the chain's result
+    /// (tsc's `OptionalChain` node flag / optional-type marker).
+    fn isOptionalChain(c: *Checker, node: Node) bool {
+        return switch (c.nodeTag(node)) {
+            .optional_member_expr, .optional_index_expr, .optional_call => true,
+            .member_expr, .index_expr, .call_expr, .call_expr_targs => c.isOptionalChain(c.tree.nodeData(node).lhs),
+            else => false,
+        };
+    }
+
+    /// Type of a chain link's object/callee, WITHOUT the chain's short-circuit
+    /// `undefined` (that is tracked in `chained`). Only called when `node` is
+    /// itself an optional chain, so downstream declared-nullish still reports.
+    fn chainObjType(c: *Checker, node: Node, chained: *bool) Error!TypeId {
+        return switch (c.nodeTag(node)) {
+            .member_expr, .optional_member_expr => c.memberChainInner(node, chained),
+            .index_expr, .optional_index_expr => c.indexChainInner(node, chained),
+            .call_expr, .call_expr_targs, .optional_call => c.checkCallExprInner(node, false, chained),
+            else => c.checkExprCached(node, types.no_type),
+        };
+    }
+
     fn checkMemberExpr(c: *Checker, node: Node) Error!TypeId {
+        var chained = false;
+        const pt = try c.memberChainInner(node, &chained);
+        if (chained) return c.makeUnion2(pt, types.undefined_type);
+        return pt;
+    }
+
+    /// Property access, treated as a link in a (possibly single-element)
+    /// optional chain. Returns the property type WITHOUT the chain's
+    /// short-circuit `undefined`; sets `chained.*` when this `?.` link — or an
+    /// earlier one in the object spine — short-circuits on a nullish object. A
+    /// non-`?.` continuation whose object is *declared* nullish still reports
+    /// TS2532/18047-9 via `checkNullishAccess` (the marker distinguishes the
+    /// chain's own undefined from an inherently-nullable intermediate).
+    fn memberChainInner(c: *Checker, node: Node, chained: *bool) Error!TypeId {
         const d = c.tree.nodeData(node);
-        const optional = c.nodeTag(node) == .optional_member_expr;
-        var obj_t = try c.checkExprCached(d.lhs, types.no_type);
-        // Flow narrowing may apply to the property path itself (x.y as a
-        // discriminated reference) — out of subset; the root is narrowed.
+        const own_optional = c.nodeTag(node) == .optional_member_expr;
+        var obj_t = if (c.isOptionalChain(d.lhs))
+            try c.chainObjType(d.lhs, chained)
+        else
+            try c.checkExprCached(d.lhs, types.no_type);
         const name_tok: TokenIndex = d.rhs;
         const name = try c.memberAtom(name_tok);
-        var add_undefined = false;
-        if (optional) {
+        if (own_optional) {
             if (c.containsNullish(obj_t) or c.ts.kind(obj_t) == .null or c.ts.kind(obj_t) == .undefined) {
-                add_undefined = true;
+                chained.* = true;
             }
             obj_t = try c.nonNullable(obj_t);
         } else {
@@ -8566,7 +8634,6 @@ const Checker = struct {
         } else if (c.nodeTag(d.lhs) == .this_expr) {
             pt = try c.flowTypeOfProp(node, this_flow_root, name, pt);
         }
-        if (add_undefined) return c.makeUnion2(pt, types.undefined_type);
         return pt;
     }
 
@@ -8615,8 +8682,11 @@ const Checker = struct {
     fn entityNameOf(c: *Checker, node: Node) ?[]const u8 {
         switch (c.nodeTag(node)) {
             .identifier => return c.tokenText(c.tree.nodeMainToken(node)),
-            .member_expr => {
+            .member_expr, .optional_member_expr => {
                 const d = c.tree.nodeData(node);
+                // A `?.` link still roots an entity-name path, so tsc uses the
+                // named codes (18047-9) rather than the object codes (2531-3)
+                // for a nullish access on `a?.b`.
                 const base = c.entityNameOf(d.lhs) orelse return null;
                 _ = base;
                 // Rebuild from source bytes: span of the whole node.
@@ -8699,13 +8769,23 @@ const Checker = struct {
     }
 
     fn checkIndexExpr(c: *Checker, node: Node) Error!TypeId {
+        var chained = false;
+        const r = try c.indexChainInner(node, &chained);
+        if (chained) return c.makeUnion2(r, types.undefined_type);
+        return r;
+    }
+
+    /// Element access as an optional-chain link (see `memberChainInner`).
+    fn indexChainInner(c: *Checker, node: Node, chained: *bool) Error!TypeId {
         const d = c.tree.nodeData(node);
-        const optional = c.nodeTag(node) == .optional_index_expr;
-        var obj_t = try c.checkExprCached(d.lhs, types.no_type);
+        const own_optional = c.nodeTag(node) == .optional_index_expr;
+        var obj_t = if (c.isOptionalChain(d.lhs))
+            try c.chainObjType(d.lhs, chained)
+        else
+            try c.checkExprCached(d.lhs, types.no_type);
         const idx_t = try c.checkExprCached(d.rhs, types.no_type);
-        var add_undefined = false;
-        if (optional) {
-            if (c.containsNullish(obj_t)) add_undefined = true;
+        if (own_optional) {
+            if (c.containsNullish(obj_t)) chained.* = true;
             obj_t = try c.nonNullable(obj_t);
         } else {
             obj_t = try c.checkNullishAccess(obj_t, d.lhs, node);
@@ -8730,7 +8810,6 @@ const Checker = struct {
                 });
                 result = types.error_type;
             }
-            if (add_undefined) return c.makeUnion2(result, types.undefined_type);
             return result;
         }
         // `o[k]` where `k` is a `unique symbol`: resolve the nominally-keyed
@@ -8750,7 +8829,6 @@ const Checker = struct {
                 }
                 result = types.error_type;
             }
-            if (add_undefined) return c.makeUnion2(result, types.undefined_type);
             return result;
         }
         const ik = c.ts.kind(try c.ts.regularLiteral(idx_t));
@@ -8800,7 +8878,6 @@ const Checker = struct {
             },
             else => result = types.any_type,
         }
-        if (add_undefined) return c.makeUnion2(result, types.undefined_type);
         return result;
     }
 
@@ -8838,7 +8915,7 @@ const Checker = struct {
                 // `await e`: unwrap `Promise<T>` to `T`; a non-thenable passes
                 // through. Single-level only (deeper `Awaited<T>` is a gap).
                 const ot = try c.checkExprCached(d.lhs, types.no_type);
-                return c.awaitedType(ot);
+                return try c.awaitedType(ot);
             },
             .minus => {
                 const ot = try c.checkExprCached(d.lhs, types.no_type);
@@ -9221,11 +9298,24 @@ const Checker = struct {
     }
 
     fn checkCallExpr(c: *Checker, node: Node, is_new: bool) Error!TypeId {
+        var chained = false;
+        const result = try c.checkCallExprInner(node, is_new, &chained);
+        if (chained) return c.makeUnion2(result, types.undefined_type);
+        return result;
+    }
+
+    /// Call/new as an optional-chain link (see `memberChainInner`). Returns the
+    /// return type WITHOUT the chain's short-circuit `undefined`; sets
+    /// `chained.*` when this `?.()` — or an earlier link in the callee spine —
+    /// short-circuits on a nullish callee.
+    fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, chained: *bool) Error!TypeId {
         const shape = c.callShape(node);
-        var callee_t = try c.checkExprCached(shape.callee, types.no_type);
-        var add_undefined = false;
+        var callee_t = if (c.isOptionalChain(shape.callee))
+            try c.chainObjType(shape.callee, chained)
+        else
+            try c.checkExprCached(shape.callee, types.no_type);
         if (shape.optional) {
-            if (c.containsNullish(callee_t)) add_undefined = true;
+            if (c.containsNullish(callee_t)) chained.* = true;
             callee_t = try c.nonNullable(callee_t);
         }
         var r = try c.resolveStructural(callee_t);
@@ -9362,7 +9452,6 @@ const Checker = struct {
         }
 
         const result = try c.resolveSignatureCall(node, sigs.items, targs.items, shape.arg_nodes, instance_ret);
-        if (add_undefined) return c.makeUnion2(result, types.undefined_type);
         return result;
     }
 
@@ -9817,13 +9906,34 @@ const Checker = struct {
     fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth: u32) Error!TypeId {
         const b = c.bind;
         switch (b.flow_tags[flow]) {
-            .none, .start => return declared,
+            .none => return declared,
+            .start => {
+                // A function/arrow body's start records its definition-point
+                // flow as the antecedent. For a constant bare-identifier
+                // reference captured by this closure, continue analysis in the
+                // enclosing function so its narrowing is preserved (tsc narrows
+                // `const`/effectively-const references across closures, but not
+                // property paths, `this`, or reassignable variables). Namespace
+                // and file starts have `no_flow` here and stop at `declared`.
+                const ante = b.flow_a[flow];
+                if (ante == binder.no_flow) return declared;
+                if (key.prop != 0 or key.sym == this_flow_root) return declared;
+                if (!c.symFlags(key.sym).const_decl) return declared;
+                return c.flowType(ante, key, declared, depth + 1);
+            },
             .unreachable_ => return types.never_type,
             .assign => {
                 const target = b.flowNode(flow);
                 const ante = b.flow_a[flow];
-                if (try c.assignNarrows(target, key, declared)) |narrowed| {
-                    return narrowed;
+                // Re-evaluating the initializer/rhs resolves names in the scope
+                // where the assignment lives, not the reference's query scope.
+                {
+                    const saved = c.cur_scope;
+                    defer c.cur_scope = saved;
+                    c.cur_scope = b.flowScope(flow);
+                    if (try c.assignNarrows(target, key, declared)) |narrowed| {
+                        return narrowed;
+                    }
                 }
                 return c.flowType(ante, key, declared, depth + 1);
             },
@@ -9833,6 +9943,9 @@ const Checker = struct {
                 const before = try c.flowType(ante, key, declared, depth + 1);
                 if (before == types.never_type) return before;
                 const sense = b.flow_tags[flow] == .cond_true;
+                const saved = c.cur_scope;
+                defer c.cur_scope = saved;
+                c.cur_scope = b.flowScope(flow);
                 return c.narrowByCondition(before, cond, sense, key);
             },
             .switch_clause => {
@@ -9840,6 +9953,9 @@ const Checker = struct {
                 const ante = b.flow_a[flow];
                 const before = try c.flowType(ante, key, declared, depth + 1);
                 if (before == types.never_type) return before;
+                const saved = c.cur_scope;
+                defer c.cur_scope = saved;
+                c.cur_scope = b.flowScope(flow);
                 return c.narrowBySwitchClause(before, clause, key);
             },
             .call_stmt => {
@@ -9847,6 +9963,12 @@ const Checker = struct {
                 const ante = b.flow_a[flow];
                 const before = try c.flowType(ante, key, declared, depth + 1);
                 if (before == types.never_type) return before;
+                // The assertion callee is re-checked here; resolve it in the
+                // scope where the call statement lives (it may be reached via a
+                // loop back-edge from a shallower query scope).
+                const saved = c.cur_scope;
+                defer c.cur_scope = saved;
+                c.cur_scope = b.flowScope(flow);
                 return c.narrowByAssertCall(before, call, key);
             },
             .branch_label, .loop_label => {
@@ -10910,7 +11032,7 @@ const Checker = struct {
             }
             return null;
         }
-        if (try c.iterationElementType(rt)) |e| return c.awaitedType(e);
+        if (try c.iterationElementType(rt)) |e| return try c.awaitedType(e);
         return null;
     }
 
@@ -10936,7 +11058,7 @@ const Checker = struct {
         const nextp = (try c.propOfType(r, c.atom_next)) orelse return null;
         var ret = try c.callableReturn(nextp.ty);
         if (ret == 0) return null;
-        if (is_async) ret = c.awaitedType(ret);
+        if (is_async) ret = try c.awaitedType(ret);
         const rr = try c.resolveStructural(ret);
         if (c.ts.kind(rr) == .union_type) {
             // The lib's `next(): IteratorResult<T, TReturn>` is the union
@@ -10993,7 +11115,7 @@ const Checker = struct {
             const rt = try c.checkExprCached(d.lhs, ctx.ret_ann);
             // async: `return v` in a `Promise<T>` relates the awaited `v` to the
             // payload `T` (so `return somePromise` is not double-wrapped).
-            const eff_rt = if (ctx.is_async) c.awaitedType(rt) else rt;
+            const eff_rt = if (ctx.is_async) try c.awaitedType(rt) else rt;
             if (ctx.ret_ann != types.no_type and ctx.ret_ann != types.error_type and
                 ctx.ret_ann != types.any_type and c.ts.kind(ctx.ret_ann) != .none)
             {
@@ -11054,7 +11176,7 @@ const Checker = struct {
             const is_promise = c.ts.kind(ann) == .ref and c.prog.globals.lookup(c.atom_Promise) != null and
                 c.ts.refSymbol(ann) == c.prog.globals.lookup(c.atom_Promise).?;
             if (is_promise) {
-                eff_ann = c.awaitedType(ann);
+                eff_ann = try c.awaitedType(ann);
             } else if (k != .err and k != .none) {
                 try c.diagFmt(1064, c.nodeSpan(proto.return_type), "The return type of an async function or method must be the global Promise<T> type. Did you mean to write 'Promise<{s}>'?", .{try c.typeToString(ann)});
                 eff_ann = types.no_type; // suppress payload assignability noise
@@ -11094,7 +11216,7 @@ const Checker = struct {
                     defer rets.deinit(c.scratch());
                     var bare = false;
                     for (c.tree.nodeRange(body)) |stmt| {
-                        if (stmt != null_node) try c.collectReturns(stmt, &rets, &bare);
+                        if (stmt != null_node) try c.collectReturns(stmt, &rets, null, &bare, binder.file_scope);
                     }
                     const span = if (proto.name_token != 0) c.tokSpan(proto.name_token) else c.tokSpan(c.tree.nodeMainToken(node));
                     if (!c.stmtListTerminal(c.tree.nodeRange(body))) {
@@ -11111,7 +11233,7 @@ const Checker = struct {
             // the Promise payload (`async () => p` returns `Promise<T>`).
             const rt = try c.checkExprCached(body, eff_ann);
             if (eff_ann != types.no_type and eff_ann != types.error_type) {
-                const eff_rt = if (is_async) c.awaitedType(rt) else rt;
+                const eff_rt = if (is_async) try c.awaitedType(rt) else rt;
                 _ = try c.checkAssignable(eff_rt, eff_ann, body, c.nodeSpan(body));
             }
         }

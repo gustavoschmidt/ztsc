@@ -391,6 +391,13 @@ pub const Bind = struct {
     flow_tags: []const FlowTag,
     flow_a: []const u32,
     flow_b: []const u32,
+    /// Lexical scope active when each flow node was bound. Read for the
+    /// expression-bearing tags (assign/cond/call_stmt/switch_clause) so that
+    /// flow-time re-evaluation of those expressions (e.g. a guard/assertion
+    /// callee reached via a loop back-edge) resolves names in the scope where
+    /// the expression textually lives, not the ambient scope of the reference
+    /// whose flow is being computed.
+    flow_scopes: []const ScopeId,
     /// Antecedent lists for branch/loop labels.
     flow_extra: []const FlowId,
     /// Compact node -> flow attachment map, sorted by node.
@@ -512,6 +519,11 @@ pub const Bind = struct {
         };
     }
 
+    /// Lexical scope in which `flow`'s expression node was bound.
+    pub fn flowScope(b: *const Bind, flow: FlowId) ScopeId {
+        return b.flow_scopes[flow];
+    }
+
     // --- memory accounting ---------------------------------------------------
 
     /// Exact bytes of the sealed symbol arrays.
@@ -532,7 +544,7 @@ pub const Bind = struct {
 
     /// Exact bytes of the sealed flow graph + node attachment map.
     pub fn flowBytes(b: *const Bind) usize {
-        return b.flow_tags.len * (@sizeOf(FlowTag) + 2 * @sizeOf(u32)) +
+        return b.flow_tags.len * (@sizeOf(FlowTag) + 2 * @sizeOf(u32) + @sizeOf(ScopeId)) +
             b.flow_extra.len * @sizeOf(FlowId) +
             b.flow_map_nodes.len * (@sizeOf(Node) + @sizeOf(FlowId));
     }
@@ -829,6 +841,7 @@ const Binder = struct {
     flow_tags: std.ArrayList(FlowTag) = .empty,
     flow_a: std.ArrayList(u32) = .empty,
     flow_b: std.ArrayList(u32) = .empty,
+    flow_scopes: std.ArrayList(ScopeId) = .empty,
     pendings: std.ArrayList(Pending) = .empty,
     ante_links: std.ArrayList(Link) = .empty,
     flow_pairs: std.ArrayList(Link) = .empty, // value=node, next=flow
@@ -1166,6 +1179,7 @@ const Binder = struct {
         try b.flow_tags.append(b.scratch, tag);
         try b.flow_a.append(b.scratch, a);
         try b.flow_b.append(b.scratch, bb);
+        try b.flow_scopes.append(b.scratch, b.cur_scope);
     }
 
     fn addFlow(b: *Binder, tag: FlowTag, antecedent: FlowId, node: Node) Error!FlowId {
@@ -1738,6 +1752,11 @@ const Binder = struct {
     /// flow for the body. `is_ctor` adds parameter properties.
     fn bindFunctionLike(b: *Binder, node: Node, proto_idx: u32, body: Node, is_ctor: bool) Error!void {
         const proto = b.tree.extraData(ast.FnProto, proto_idx);
+        // Flow node in effect where this function expression appears — its
+        // "definition point". Recorded as the body-start's antecedent so the
+        // checker can continue flow analysis into the enclosing function for a
+        // constant reference captured by this closure (tsc: FlowStart.node).
+        const outer_flow = b.cur_flow;
         const saved = b.saveState();
         const clear_export = b.exporting_node;
         b.exporting_node = 0;
@@ -1754,7 +1773,7 @@ const Binder = struct {
         try b.bindType(proto.return_type);
 
         if (body != 0) {
-            b.cur_flow = try b.addFlow(.start, no_flow, node);
+            b.cur_flow = try b.addFlow(.start, outer_flow, node);
             if (b.nodeTag(body) == .block) {
                 // Body statements bind directly in the function scope.
                 for (b.tree.nodeRange(body)) |stmt| try b.bindStatement(stmt);
@@ -2808,6 +2827,7 @@ const Binder = struct {
             }
         }
         const flow_extra = try arena.dupe(FlowId, extra.items);
+        const flow_scopes = try arena.dupe(ScopeId, b.flow_scopes.items);
 
         // Node -> flow attachment map, sorted by node id.
         std.mem.sort(Link, b.flow_pairs.items, {}, struct {
@@ -2843,6 +2863,7 @@ const Binder = struct {
             .flow_tags = flow_tags,
             .flow_a = flow_a,
             .flow_b = flow_b,
+            .flow_scopes = flow_scopes,
             .flow_extra = flow_extra,
             .flow_map_nodes = flow_map_nodes,
             .flow_map_ids = flow_map_ids,
