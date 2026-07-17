@@ -4546,6 +4546,107 @@ const Checker = struct {
         }
     }
 
+    /// True iff `t` mentions a *free* type parameter — one not bound by an
+    /// enclosing signature's own `<...>`. Unlike `containsTypeParam`, a
+    /// signature's own params are treated as bound (not free), so
+    /// `{ f: <T>() => T }` reports **false**: it is a concrete object whose
+    /// only type variables are locally quantified. Used to decide whether an
+    /// indexed access `Obj[K]` is genuinely generic (must defer) or resolvable
+    /// now — indexing/mapping over such an object must reduce eagerly, else the
+    /// generic member is stranded as an unresolved `Obj["f"]` and lost.
+    /// `bound` is the stack of type-param symbols currently in scope.
+    fn containsFreeTypeParam(c: *Checker, t: TypeId, bound: []const u32) Error!bool {
+        const s = &c.ts;
+        // No enclosing signature scope and no free var found up to here: the
+        // cached whole-type predicate is an exact, cheaper answer.
+        if (bound.len == 0 and !try c.containsTypeParam(t)) return false;
+        switch (s.kind(t)) {
+            .type_param => {
+                const sym = s.typeParamSymbol(t);
+                for (bound) |b| {
+                    if (b == sym) return false; // bound by an enclosing signature
+                }
+                return true;
+            },
+            .union_type, .intersection, .overloads => {
+                for (try c.memberList(t)) |m| {
+                    if (try c.containsFreeTypeParam(m, bound)) return true;
+                }
+                return false;
+            },
+            .array => return c.containsFreeTypeParam(s.arrayElem(t), bound),
+            .tuple => {
+                for (0..s.tupleLen(t)) |i| {
+                    if (try c.containsFreeTypeParam(s.tupleElem(t, @intCast(i)).ty, bound)) return true;
+                }
+                return false;
+            },
+            .object => {
+                for (0..s.objectPropCount(t)) |i| {
+                    if (try c.containsFreeTypeParam(s.objectProp(t, @intCast(i)).ty, bound)) return true;
+                }
+                if (s.objectStringIndex(t) != 0 and try c.containsFreeTypeParam(s.objectStringIndex(t), bound)) return true;
+                if (s.objectNumberIndex(t) != 0 and try c.containsFreeTypeParam(s.objectNumberIndex(t), bound)) return true;
+                return false;
+            },
+            .function => {
+                // The signature's own type params shadow within its body, so
+                // extend the bound set before descending.
+                const own = s.fnTypeParams(t);
+                var scope_buf: std.ArrayList(u32) = .empty;
+                defer scope_buf.deinit(c.scratch());
+                const inner: []const u32 = if (own.len == 0) bound else blk: {
+                    try scope_buf.appendSlice(c.scratch(), bound);
+                    try scope_buf.appendSlice(c.scratch(), own);
+                    break :blk scope_buf.items;
+                };
+                if (try c.containsFreeTypeParam(s.fnReturn(t), inner)) return true;
+                for (0..s.fnParamCount(t)) |i| {
+                    if (try c.containsFreeTypeParam(s.fnParam(t, @intCast(i)).ty, inner)) return true;
+                }
+                if (s.fnHasPredicate(t)) {
+                    const pr = s.fnPredicate(t);
+                    if (pr.ty != types.no_type and try c.containsFreeTypeParam(pr.ty, inner)) return true;
+                }
+                return false;
+            },
+            .ref => {
+                for (s.refArgs(t)) |a| {
+                    if (try c.containsFreeTypeParam(a, bound)) return true;
+                }
+                return false;
+            },
+            .conditional => {
+                if (try c.containsFreeTypeParam(s.condCheck(t), bound)) return true;
+                if (try c.containsFreeTypeParam(s.condExtends(t), bound)) return true;
+                if (try c.containsFreeTypeParam(s.condTrue(t), bound)) return true;
+                if (try c.containsFreeTypeParam(s.condFalse(t), bound)) return true;
+                return false;
+            },
+            .index_access => {
+                if (try c.containsFreeTypeParam(s.indexAccessObj(t), bound)) return true;
+                if (try c.containsFreeTypeParam(s.indexAccessIndex(t), bound)) return true;
+                return false;
+            },
+            .mapped => {
+                if (try c.containsFreeTypeParam(s.mappedConstraint(t), bound)) return true;
+                if (try c.containsFreeTypeParam(s.mappedValue(t), bound)) return true;
+                if (s.mappedAs(t) != 0 and try c.containsFreeTypeParam(s.mappedAs(t), bound)) return true;
+                if (s.mappedSource(t) != 0 and try c.containsFreeTypeParam(s.mappedSource(t), bound)) return true;
+                return false;
+            },
+            .template_literal_type => {
+                for (0..s.templateHoleCount(t)) |i| {
+                    if (try c.containsFreeTypeParam(s.templateHole(t, @intCast(i)), bound)) return true;
+                }
+                return false;
+            },
+            .string_mapping => return c.containsFreeTypeParam(s.stringMappingArg(t), bound),
+            .keyof_op => return c.containsFreeTypeParam(s.keyofOperand(t), bound),
+            else => return false,
+        }
+    }
+
     fn tpLookup(map: []const TpMap, sym: SymbolId) ?TypeId {
         for (map) |m| {
             if (m.sym == sym) return m.ty;
@@ -4932,7 +5033,10 @@ const Checker = struct {
         // conditional in a mapped type's `as`/value branch (`P extends K ?
         // never : P`) must stay symbolic until each key is materialized, or it
         // would resolve against the still-abstract `mapped_param`.
-        if (try c.containsTypeParam(chk) or try c.containsTypeParam(extends_ty) or
+        // A check/extends type whose only type variables are bound within a
+        // member signature (`{ f: <T>() => T } extends ...`) is concrete for
+        // resolution purposes, so the *free* type-param test gates deferral.
+        if (try c.containsFreeTypeParam(chk, &.{}) or try c.containsFreeTypeParam(extends_ty, &.{}) or
             try c.containsMappedParam(chk) or try c.containsMappedParam(extends_ty))
         {
             return c.ts.makeConditional(chk, extends_ty, true_ty, false_ty, distributive);
@@ -5359,11 +5463,15 @@ const Checker = struct {
         defer c.inst_depth -= 1;
         const homomorphic = flags & types.mapped_flag_homomorphic != 0;
         // Deferral is decided by the *key set* only: the value/`as` branches may
-        // still be generic (they materialize into generic-typed props).
+        // still be generic (they materialize into generic-typed props). The key
+        // set of a homomorphic map is `keyof src`, which is concrete whenever
+        // `src`'s only type variables are locally bound (e.g. a namespace with a
+        // generic-signature member) — so the *free* type-param test is used, not
+        // the plain one, else the map is stranded deferred and its members lost.
         const key_generic = if (homomorphic)
-            try c.containsTypeParam(src_type)
+            try c.containsFreeTypeParam(src_type, &.{})
         else
-            try c.containsTypeParam(constraint);
+            try c.containsFreeTypeParam(constraint, &.{});
         if (key_generic) {
             return c.ts.makeMapped(key_param, constraint, value, as_clause, src_type, flags);
         }
@@ -5581,7 +5689,10 @@ const Checker = struct {
         }
         // Generic object and/or index (M16d): defer as `T[K]`; resolved in
         // `instantiateId`'s `.index_access` arm once the operands are concrete.
-        if (try c.containsTypeParam(obj) or try c.containsTypeParam(idx)) {
+        // Uses the *free* type-param test: a member that is itself a generic
+        // signature (`{ f: <T>() => T }`) does not make the object generic, so
+        // the access resolves now instead of stranding the member as `Obj["f"]`.
+        if (try c.containsFreeTypeParam(obj, &.{}) or try c.containsFreeTypeParam(idx, &.{})) {
             return c.ts.makeIndexAccess(obj, idx);
         }
         return c.indexedAccessType(obj, idx);
