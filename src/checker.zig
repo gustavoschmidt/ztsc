@@ -6925,7 +6925,14 @@ const Checker = struct {
             }
         }
         const s_ret = c.ts.fnReturn(se);
-        if (s_ret == types.void_type) return t_ret == types.void_type or t_ret == types.any_type or t_ret == types.unknown_type;
+        // Covariant return relation. A `void` source return was previously
+        // special-cased to accept only `void`/`any`/`unknown` targets — but
+        // that manual enumeration rejected union targets containing `void`
+        // (e.g. `() => void` vs `() => void | undefined`), which tsc accepts
+        // via the union's `void` member. The general relation already gets
+        // every case right (`void <: void|undefined` true, `void <: undefined`
+        // false, `void <: number` false, `void <: any/unknown` trivially
+        // true), so defer to it unconditionally.
         return c.isAssignable(s_ret, t_ret);
     }
 
