@@ -592,6 +592,11 @@ pub const FnProto = struct {
 pub const JsxElementData = struct {
     tag: Node,
     self_closing: u32,
+    /// Explicit type arguments on a component opening tag
+    /// (`<Select<string> …>`; empty range when absent). Closing tags never
+    /// carry type arguments (per TS).
+    targs_start: ExtraIndex,
+    targs_end: ExtraIndex,
     attrs_start: ExtraIndex,
     attrs_end: ExtraIndex,
     children_start: ExtraIndex,
@@ -1016,6 +1021,7 @@ pub const Ast = struct {
                 .jsx_element => {
                     const e = a.extraData(JsxElementData, d.lhs);
                     it.push(e.tag);
+                    it.pushRange(a.extraRange(e.targs_start, e.targs_end));
                     it.pushRange(a.extraRange(e.attrs_start, e.attrs_end));
                     it.pushRange(a.extraRange(e.children_start, e.children_end));
                 },
