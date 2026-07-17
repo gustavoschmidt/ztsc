@@ -2651,7 +2651,17 @@ const Parser = struct {
     fn parseJsxElement(p: *Parser) PE!Node {
         const lt = try p.bump(); // '<'
         var tag: Node = null_node;
-        if (p.curTag() != .gt) tag = try p.parseJsxTagName();
+        var targs: ast.SubRange = .{ .start = 0, .end = 0 };
+        if (p.curTag() != .gt) {
+            tag = try p.parseJsxTagName();
+            // Explicit type arguments on a component tag: `<Select<string> …>`.
+            // In a `.tsx` open tag this `<` is unambiguous (no cast ambiguity),
+            // so parse it directly with the ordinary type-argument machinery —
+            // scanning is already in normal (TS) mode here, exactly as an
+            // attribute's `{expr}` container re-enters. Type args are parsed
+            // only on the opening tag; closing tags never carry them.
+            if (p.atLt()) targs = try p.parseTypeArgs();
+        }
         const attrs = try p.parseJsxAttributes();
         var self_closing: u32 = 0;
         var children: ast.SubRange = .{ .start = 0, .end = 0 };
@@ -2666,6 +2676,8 @@ const Parser = struct {
         const data = try p.addExtra(ast.JsxElementData{
             .tag = tag,
             .self_closing = self_closing,
+            .targs_start = targs.start,
+            .targs_end = targs.end,
             .attrs_start = attrs.start,
             .attrs_end = attrs.end,
             .children_start = children.start,

@@ -7425,7 +7425,15 @@ const Checker = struct {
         } else {
             is_component = true;
             const tag_ty = try c.checkExprCached(e.tag, types.no_type);
-            props = (try c.jsxComponentProps(tag_ty)) orelse types.no_type;
+            // Explicit type arguments on the tag (`<Select<string> …>`): resolve
+            // them and instantiate the component signature so props (and the
+            // contextual types of attribute handlers) become concrete.
+            var targs: std.ArrayList(TypeId) = .empty;
+            defer targs.deinit(c.scratch());
+            for (c.tree.extraRange(e.targs_start, e.targs_end)) |tn| {
+                if (tn != null_node) try targs.append(c.scratch(), try c.typeFromTypeNode(tn));
+            }
+            props = (try c.jsxComponentProps(tag_ty, targs.items, node)) orelse types.no_type;
         }
         try c.checkJsxAttributes(node, e, props, is_component, c.jsxChildrenPresent(e));
         for (c.tree.extraRange(e.children_start, e.children_end)) |ch| {
@@ -7479,9 +7487,9 @@ const Checker = struct {
     /// the member of the instance type named by `JSX.ElementAttributesProperty`
     /// (typically `props`). Null when it has no discernible props (so attribute
     /// typing is skipped).
-    fn jsxComponentProps(c: *Checker, tag_ty: TypeId) Error!?TypeId {
+    fn jsxComponentProps(c: *Checker, tag_ty: TypeId, explicit_targs: []const TypeId, node: Node) Error!?TypeId {
         const t = try c.resolveStructural(tag_ty);
-        const sig = switch (c.ts.kind(t)) {
+        var sig = switch (c.ts.kind(t)) {
             .function => t,
             .overloads => blk: {
                 const sigs = try c.memberList(t);
@@ -7490,6 +7498,10 @@ const Checker = struct {
             .class_value => return c.jsxClassComponentProps(t),
             else => return null,
         };
+        // Bind explicit type arguments (`<Select<string> …>`) into the signature
+        // so the props type is concrete. Mirrors the explicit-targ path of a
+        // generic call; a count mismatch reports TS2558 there.
+        if (explicit_targs.len > 0) sig = try c.instantiateSigForCall(sig, explicit_targs, &.{}, node);
         if (c.ts.fnParamCount(sig) == 0) return types.empty_object_type;
         return c.ts.fnParam(sig, 0).ty;
     }
