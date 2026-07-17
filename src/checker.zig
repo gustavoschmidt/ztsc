@@ -1993,7 +1993,12 @@ const Checker = struct {
                     const tgt = c.importTarget(sym) orelse return types.any_type; // unlinked
                     switch (tgt.kind) {
                         .binding => {
-                            sym = c.toGlobalIn(tgt.file, tgt.payload);
+                            const g = c.toGlobalIn(tgt.file, tgt.payload);
+                            // Route through the cross-file merge index so an
+                            // imported interface augmented by a `declare module`
+                            // in another file resolves to the folded interface
+                            // (M11c cross-file augmentation).
+                            sym = c.prog.mergedOf(g) orelse g;
                             f = c.symFlags(sym);
                             if (!hasTypeMeaning(f) or f.import_binding) {
                                 if (hasValueMeaning(f)) {
@@ -2158,7 +2163,13 @@ const Checker = struct {
     /// or null for non-binding targets (namespace objects, default expressions).
     fn targetTypeSym(c: *Checker, tgt: modules.Target) ?SymbolId {
         return switch (tgt.kind) {
-            .binding => c.toGlobalIn(tgt.file, tgt.payload),
+            // Route through the cross-file merge index so a `ns.I` / qualified /
+            // `import("m").I` reference to an interface augmented by a
+            // `declare module` in another file sees the folded interface (M11c).
+            .binding => blk: {
+                const g = c.toGlobalIn(tgt.file, tgt.payload);
+                break :blk c.prog.mergedOf(g) orelse g;
+            },
             else => null,
         };
     }

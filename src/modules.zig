@@ -558,14 +558,13 @@ pub fn mergeGlobals(
     scratch: Allocator,
     files: []const ProgFile,
     sym_base: []const u32,
+    links: []const FileLinks,
 ) Error!GlobalMerge {
     // Accumulate name -> constituent global ids, contributions in FileId order.
     var acc: std.AutoArrayHashMapUnmanaged(Atom, std.ArrayListUnmanaged(u32)) = .empty;
-    var any = false;
     for (files, 0..) |*f, fi| {
         const b = f.bind;
         if (b.global_atoms.len == 0) continue;
-        any = true;
         const base = sym_base[fi];
         for (b.global_atoms, b.global_syms) |atom, local| {
             const gop = try acc.getOrPut(scratch, atom);
@@ -573,24 +572,36 @@ pub fn mergeGlobals(
             try gop.value_ptr.append(scratch, base + local);
         }
     }
-    if (!any) return .{};
-
-    const n = acc.count();
-    const names = try scratch.alloc(Atom, n);
-    @memcpy(names, acc.keys());
-    std.mem.sort(Atom, names, {}, struct {
-        fn lt(_: void, a: Atom, b: Atom) bool {
-            return a < b;
-        }
-    }.lt);
 
     var m: Merger = .{ .arena = arena, .scratch = scratch, .files = files, .sym_base = sym_base };
-    const g_atoms = try arena.alloc(Atom, n);
-    const g_syms = try arena.alloc(u32, n);
-    for (names, 0..) |atom, i| {
-        g_atoms[i] = atom;
-        g_syms[i] = try m.mergeSet(acc.get(atom).?.items);
+
+    // Global (declare-global / script / lib) name merge.
+    var globals: Globals = .{};
+    if (acc.count() != 0) {
+        const n = acc.count();
+        const names = try scratch.alloc(Atom, n);
+        @memcpy(names, acc.keys());
+        std.mem.sort(Atom, names, {}, struct {
+            fn lt(_: void, a: Atom, b: Atom) bool {
+                return a < b;
+            }
+        }.lt);
+        const g_atoms = try arena.alloc(Atom, n);
+        const g_syms = try arena.alloc(u32, n);
+        for (names, 0..) |atom, i| {
+            g_atoms[i] = atom;
+            g_syms[i] = try m.mergeSet(acc.get(atom).?.items);
+        }
+        globals = .{ .atoms = g_atoms, .syms = g_syms };
     }
+
+    // Cross-file module augmentation merge (M11c): fold a `declare module
+    // "spec" { interface I { … } }` block (in a MODULE-context file) into the
+    // interface `I` already exported by the real module `spec` resolves to.
+    try mergeAugmentations(&m, files, sym_base, links);
+
+    if (m.merged.items.len == 0) return .{ .globals = globals };
+
     std.mem.sort(ConstitPair, m.constit.items, {}, struct {
         fn lt(_: void, a: ConstitPair, b: ConstitPair) bool {
             return a.key < b.key;
@@ -603,11 +614,85 @@ pub fn mergeGlobals(
         cv[i] = pr.val;
     }
     return .{
-        .globals = .{ .atoms = g_atoms, .syms = g_syms },
+        .globals = globals,
         .merged = try arena.dupe(MergedSym, m.merged.items),
         .constit_keys = ck,
         .constit_vals = cv,
     };
+}
+
+/// Cross-file module augmentation merge (M11c). A `declare module "spec" { …
+/// }` block in a file that is itself a *module* (has top-level import/export)
+/// augments the module `spec` resolves to — the TypeScript rule that
+/// distinguishes an augmentation from a standalone ambient-module declaration
+/// (which lives in a *script*). For every interface declared in such a block
+/// whose name is already an interface export of the resolved real module, this
+/// forms a cross-file merged symbol `[real, aug…]` and registers both sides in
+/// the reverse index, so an `import { I }` (or `ns.I`) of the real module
+/// resolves to the folded interface (all members from every file).
+///
+/// Order-invariant: augmentation contributors are collected in FileId order and
+/// the merged member set is a union displayed name-sorted, so the observable
+/// type is independent of discovery order (only a same-name/different-type
+/// conflict's winner is order-sensitive — a deferred TS2717 under-report). New
+/// exports added by an augmentation and augmentations of an *unresolved*
+/// specifier keep their existing behavior (the ambient export-table fallback in
+/// `linkImports`); only merges into an existing real interface are handled here.
+fn mergeAugmentations(
+    m: *Merger,
+    files: []const ProgFile,
+    sym_base: []const u32,
+    links: []const FileLinks,
+) Error!void {
+    if (links.len != files.len) return; // unlinked path: no export tables
+
+    // real interface export global id → augmenting block interface global ids.
+    var aug: std.AutoArrayHashMapUnmanaged(u32, std.ArrayListUnmanaged(u32)) = .empty;
+    for (files, 0..) |*f, fi| {
+        const b = f.bind;
+        // A `declare module` is an augmentation only in a module context; in a
+        // script it is a standalone ambient module (left to the fallback path).
+        if (!b.is_module or b.ambient_modules.len == 0) continue;
+        const base = sym_base[fi];
+        for (b.ambient_modules) |am| {
+            const mfile = f.specs.get(am.spec) orelse continue; // unresolved: fallback
+            const lo = b.scope_members_start[am.scope];
+            const hi = b.scope_members_start[am.scope + 1];
+            for (lo..hi) |i| {
+                const local = b.member_syms[i];
+                // Only interface↔interface merges (value/namespace/generic
+                // type-param unification stay deferred — degrade, no crash).
+                if (!b.symbol_flags[local].interface) continue;
+                const name = b.member_atoms[i];
+                const tgt = links[mfile].exportTarget(name) orelse continue;
+                if (tgt.kind != .binding) continue;
+                const real = sym_base[tgt.file] + tgt.payload;
+                if (!globalSymFlags(files, sym_base, real).interface) continue;
+                const aug_id = base + local;
+                if (real == aug_id) continue; // self (should not happen)
+                const gop = try aug.getOrPut(m.scratch, real);
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                try gop.value_ptr.append(m.scratch, aug_id);
+            }
+        }
+    }
+    if (aug.count() == 0) return;
+
+    // Deterministic merged-id assignment: process real keys in ascending order.
+    const keys = try m.scratch.alloc(u32, aug.count());
+    @memcpy(keys, aug.keys());
+    std.mem.sort(u32, keys, {}, struct {
+        fn lt(_: void, a: u32, b: u32) bool {
+            return a < b;
+        }
+    }.lt);
+    for (keys) |real| {
+        const augs = aug.get(real).?.items; // FileId order by construction
+        const parts = try m.scratch.alloc(u32, 1 + augs.len);
+        parts[0] = real;
+        @memcpy(parts[1..], augs);
+        _ = try m.mergeSet(parts);
+    }
 }
 
 /// Recursive cross-file symbol merger (M11a/M11b). Assigns merged-range ids as
@@ -736,7 +821,7 @@ pub fn singleWithLibProgram(
     // Unlinked single-file path: a script user file may still augment lib
     // globals; merge diagnostics (none for the clean case) have no link table
     // to land in here and are dropped.
-    const gm = try mergeGlobals(arena, arena, files, sym_base);
+    const gm = try mergeGlobals(arena, arena, files, sym_base, &.{});
     return .{ .files = files, .sym_base = sym_base, .globals = gm.globals, .merged = gm.merged, .constit_keys = gm.constit_keys, .constit_vals = gm.constit_vals };
 }
 
@@ -2090,9 +2175,11 @@ pub fn link(
         };
     }
 
-    // Cross-file global merge (M11a): fold every file's harvest slice.
+    // Cross-file global merge (M11a) + module augmentation merge (M11c): fold
+    // every file's harvest slice and every `declare module` augmentation of a
+    // resolved real module. Needs the sealed export tables (`out`).
     const sym_base = try computeSymBase(arena, files);
-    const gm = try mergeGlobals(arena, scratch, files, sym_base);
+    const gm = try mergeGlobals(arena, scratch, files, sym_base, out);
 
     // Seal the ambient module export tables (M11c) in registry order, so
     // `Target.ambient_ns` payloads (assigned from `getIndex`) address them.
