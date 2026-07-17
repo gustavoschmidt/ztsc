@@ -2089,6 +2089,14 @@ const Checker = struct {
     /// or an ambient/augmentation module (M11c).
     const ModuleRef = union(enum) { file: FileId, ambient: u32 };
 
+    /// The left side of a qualified type/entity name (`A.B.T`), resolved to the
+    /// container that holds its members: either a namespace symbol or a whole
+    /// module namespace object (`import * as ns from "m"`). Unifies the two
+    /// member-lookup mechanisms (namespace scope vs module export table) so a
+    /// namespace-import qualifier reaches a named-export module's members —
+    /// e.g. `import * as mod from "./m"; interface I extends mod.Base {}`.
+    const NsContainer = union(enum) { ns: SymbolId, module: ModuleRef };
+
     /// Resolve an `.import_type` node's specifier to its module. Reports TS2307
     /// (deduped per span) when the specifier resolves to neither an on-disk
     /// module nor an ambient `declare module`.
@@ -2180,33 +2188,52 @@ const Checker = struct {
         // `import("m").T` — the qualifier base is a module, not a namespace sym.
         if (c.nodeTag(d.lhs) == .import_type) return c.importTypeMember(d.lhs, name_tok, args);
         const name = try c.memberAtom(name_tok);
-        const ns_sym = (try c.resolveTypeNamespace(d.lhs)) orelse return types.any_type;
-        if (c.namespaceMemberSym(ns_sym, name)) |g| {
-            const mf = c.symFlags(g);
-            if (mf.exported and hasTypeMeaning(mf)) {
-                return c.namedTypeFromSymbol(g, args, name_tok);
-            }
+        const container = (try c.resolveNsContainer(d.lhs)) orelse return types.any_type;
+        switch (container) {
+            .ns => |ns_sym| {
+                if (c.namespaceMemberSym(ns_sym, name)) |g| {
+                    const mf = c.symFlags(g);
+                    if (mf.exported and hasTypeMeaning(mf)) {
+                        return c.namedTypeFromSymbol(g, args, name_tok);
+                    }
+                }
+                try c.diagFmt(2694, c.tokSpan(name_tok), "Namespace '{s}' has no exported member '{s}'.", .{ c.symbolName(ns_sym), c.atomText(name) });
+                return types.error_type;
+            },
+            .module => |m| {
+                if (c.moduleExportTarget(m, name)) |tgt| {
+                    if (c.targetTypeSym(tgt)) |g| {
+                        if (hasTypeMeaning(c.symFlags(g))) return c.namedTypeFromSymbol(g, args, name_tok);
+                    }
+                }
+                // A member ztsc cannot resolve through a namespace-import module
+                // (incomplete `export *` / re-export modeling, CommonJS namespace
+                // identity out of subset) degrades to `any` rather than a
+                // spurious TS2694 — the documented M20 under-report policy. The
+                // fix is that resolvable members (`extends mod.Base`) now bind;
+                // unresolvable ones stay as lenient as the pre-fix `any`.
+                return types.any_type;
+            },
         }
-        try c.diagFmt(2694, c.tokSpan(name_tok), "Namespace '{s}' has no exported member '{s}'.", .{ c.symbolName(ns_sym), c.atomText(name) });
-        return types.error_type;
     }
 
-    /// Resolve a namespace entity (identifier or nested qualified name) to its
-    /// namespace symbol (global id), or null if it is not a namespace.
-    fn resolveTypeNamespace(c: *Checker, node: Node) Error!?SymbolId {
+    /// Resolve the qualifier of a dotted type/entity name (identifier or nested
+    /// qualified name) to the container that holds its members — a namespace
+    /// symbol or a whole-module namespace object. Follows `import * as ns` /
+    /// `import = require` bindings to the imported module so `ns.Member` reaches
+    /// a named-export module's exports (previously such a base silently degraded
+    /// to `any`, so heritage `extends ns.Base` inherited zero members). Null for
+    /// a non-namespace or unresolvable qualifier.
+    fn resolveNsContainer(c: *Checker, node: Node) Error!?NsContainer {
         switch (c.nodeTag(node)) {
             .identifier => {
-                const tok = c.tree.nodeMainToken(node);
-                const a = try c.atomOfToken(tok);
+                const a = try c.atomOfToken(c.tree.nodeMainToken(node));
                 switch (c.resolveSpace(a, c.cur_scope, false)) {
                     .sym => |sym| {
-                        // NB: an import-binding base (`import x = require("m")`)
-                        // is intentionally not followed here — CommonJS
-                        // namespace identity across modules is out of subset, so
-                        // `x.Member` in type position degrades to `any` (lenient,
-                        // no spurious TS2694) rather than resolving through the
-                        // binding. See M20 notes.
-                        if (c.symFlags(sym).namespace_decl) return sym;
+                        if (c.symFlags(sym).namespace_decl) return .{ .ns = sym };
+                        if (c.symFlags(sym).import_binding) {
+                            if (c.importTarget(sym)) |tgt| return c.containerFromImportTarget(tgt);
+                        }
                         return null;
                     },
                     else => return null,
@@ -2215,26 +2242,84 @@ const Checker = struct {
             .qualified_name, .member_expr => {
                 const d = c.tree.nodeData(node);
                 const name = try c.memberAtom(d.rhs);
-                // `import("m").NS` as a namespace container: resolve the module
-                // and require its export `NS` to be a namespace.
+                // `import("m").NS` as a namespace container: the module itself.
                 if (c.nodeTag(d.lhs) == .import_type) {
                     const m = (try c.resolveImportTypeModule(d.lhs, true)) orelse return null;
-                    if (c.moduleExportTarget(m, name)) |tgt| {
-                        if (c.targetTypeSym(tgt)) |g| {
-                            if (c.symFlags(g).namespace_decl) return g;
-                        }
-                    }
-                    return null;
+                    return c.nestNsContainer(.{ .module = m }, name);
                 }
-                const outer = (try c.resolveTypeNamespace(d.lhs)) orelse return null;
-                if (c.namespaceMemberSym(outer, name)) |g| {
-                    const mf = c.symFlags(g);
-                    if (mf.exported and mf.namespace_decl) return g;
-                }
-                return null;
+                const outer = (try c.resolveNsContainer(d.lhs)) orelse return null;
+                return c.nestNsContainer(outer, name);
             },
             else => return null,
         }
+    }
+
+    /// Follow an import-binding link target to the namespace container it
+    /// denotes: a namespace declaration symbol (the `export =` entity of an
+    /// `export =`-module, or a re-export), or the whole-module namespace object
+    /// of a plain named-export module (`import * as`). Null otherwise.
+    fn containerFromImportTarget(c: *Checker, tgt: modules.Target) ?NsContainer {
+        switch (tgt.kind) {
+            .binding => {
+                const g = c.toGlobalIn(tgt.file, tgt.payload);
+                if (c.symFlags(g).namespace_decl) return .{ .ns = g };
+                if (c.symFlags(g).import_binding) {
+                    if (c.importTarget(g)) |t2| return c.containerFromImportTarget(t2);
+                }
+                return null;
+            },
+            .namespace => return .{ .module = .{ .file = tgt.file } },
+            .ambient_ns => return .{ .module = .{ .ambient = tgt.payload } },
+            else => return null,
+        }
+    }
+
+    /// Resolve member `name` of a container to a *nested* namespace container
+    /// (for a deeper `a.b.c` qualifier). Requires the member to be an exported
+    /// namespace (or a re-export/namespace-import of one). Null otherwise.
+    fn nestNsContainer(c: *Checker, outer: NsContainer, name: Atom) ?NsContainer {
+        switch (outer) {
+            .ns => |ns| {
+                const g = c.namespaceMemberSym(ns, name) orelse return null;
+                const mf = c.symFlags(g);
+                if (!mf.exported) return null;
+                if (mf.namespace_decl) return .{ .ns = g };
+                if (mf.import_binding) {
+                    if (c.importTarget(g)) |t2| return c.containerFromImportTarget(t2);
+                }
+                return null;
+            },
+            .module => |m| {
+                const tgt = c.moduleExportTarget(m, name) orelse return null;
+                return c.containerFromImportTarget(tgt);
+            },
+        }
+    }
+
+    /// The exported member symbol `name` of a namespace container (global id),
+    /// or null. Shared by qualified-entity resolution that needs the member's
+    /// declaration symbol (class-`extends` bases) rather than its type.
+    fn containerMemberSym(c: *Checker, container: NsContainer, name: Atom) ?SymbolId {
+        switch (container) {
+            .ns => |ns| {
+                const g = c.namespaceMemberSym(ns, name) orelse return null;
+                return if (c.symFlags(g).exported) g else null;
+            },
+            .module => |m| {
+                const tgt = c.moduleExportTarget(m, name) orelse return null;
+                return c.targetTypeSym(tgt);
+            },
+        }
+    }
+
+    /// Display text of a qualified-name qualifier's trailing identifier, for
+    /// TS2694 messages (`Namespace '<here>' has no exported member '…'`).
+    fn qualifierText(c: *Checker, node: Node) []const u8 {
+        return switch (c.nodeTag(node)) {
+            .identifier => c.tokenText(c.tree.nodeMainToken(node)),
+            .qualified_name, .member_expr => c.tokenText(c.tree.nodeData(node).rhs),
+            else => "",
+        };
     }
 
     /// Build the type of a named type symbol (interface/class/alias/enum/
@@ -3869,12 +3954,14 @@ const Checker = struct {
                 }
             },
             .member_expr, .qualified_name => {
+                // `extends mod.Base` — resolve the qualifier to its container
+                // (namespace symbol or whole-module namespace of an
+                // `import * as`), then take the exported member. Shares the
+                // unified resolver so a namespace-import qualifier over a plain
+                // named-export module works, not just `export =` namespaces.
                 const d = c.tree.nodeData(node);
-                const container = (try c.classBaseEntitySym(d.lhs)) orelse return null;
-                if (!c.symFlags(container).namespace_decl) return null;
-                const g = c.namespaceMemberSym(container, try c.memberAtom(d.rhs)) orelse return null;
-                if (!c.symFlags(g).exported) return null;
-                return g;
+                const container = (try c.resolveNsContainer(d.lhs)) orelse return null;
+                return c.containerMemberSym(container, try c.memberAtom(d.rhs));
             },
             else => return null,
         }
