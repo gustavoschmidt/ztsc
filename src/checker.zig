@@ -7650,7 +7650,16 @@ const Checker = struct {
         const inst = try c.ts.makeRef(cls, &.{});
         const rinst = try c.resolveStructural(inst);
         if (try c.propOfType(rinst, name)) |p| return p.ty;
-        return types.empty_object_type;
+        // No resolvable props member — a modeling gap, not a genuinely
+        // props-less component (an empty `Component<{}>` still yields a `props`
+        // member above). This surfaces for class components whose base is a
+        // class+interface declaration merge we don't fully fold (`@types/react`
+        // `Component<P>` merges `interface Component extends ComponentLifecycle`
+        // with `class Component { readonly props: Readonly<P> }`). Leave the
+        // attributes unchecked (tsc's behavior for an unknown props target)
+        // rather than reject every attribute against `{}` — under-report over a
+        // false positive.
+        return null;
     }
 
     /// Name of the props member per `JSX.ElementAttributesProperty` — the name
