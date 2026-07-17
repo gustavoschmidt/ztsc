@@ -1762,6 +1762,37 @@ const Linker = struct {
         return l.lookupAmbient(module, l.atom_export_equals);
     }
 
+    /// Resolve member `name` against an `export = <entity>` target `exeq`, per
+    /// the TS rule that `import { name } from "m"` (m is `export = ns`) binds to
+    /// `ns.name`. Two container shapes are handled: a namespace/value `.binding`
+    /// (look the name up in the symbol's namespace body scope, then finalize the
+    /// member local so a re-exported member follows its chain) and a whole
+    /// module-namespace object `.namespace` (look the name up in that module's
+    /// export table). Returns null for any other shape or a missing member, so
+    /// the caller keeps its lenient `any` fallback. Order-invariant: reads only
+    /// sealed per-file bind data + already-built export tables.
+    fn exportEqualsMember(l: *Linker, exeq: Target, name: Atom) Error!?Target {
+        switch (exeq.kind) {
+            .binding => {
+                const b = l.files[exeq.file].bind;
+                const ns_scope = b.namespaceScopeOf(exeq.payload) orelse return null;
+                const member_local = b.lookupInScope(ns_scope, name) orelse return null;
+                var t = try l.finalizeLocal(exeq.file, member_local, name, exeq.type_only, 0);
+                t.type_only = t.type_only or exeq.type_only;
+                return t;
+            },
+            .namespace => {
+                if (try l.lookupExport(exeq.file, name, 0)) |t| {
+                    var final = t;
+                    final.type_only = final.type_only or exeq.type_only;
+                    return final;
+                }
+                return null;
+            },
+            else => return null,
+        }
+    }
+
     fn put(l: *Linker, t: *std.AutoArrayHashMapUnmanaged(Atom, Target), name: Atom, tgt: Target) Error!void {
         // Later explicit exports of the same name overwrite (duplicate
         // export names are a bind-phase diagnostic concern, not ours).
@@ -2041,6 +2072,16 @@ const Linker = struct {
                         var found: ?Target = null;
                         if (mfile_opt) |mfile| found = try l.lookupExport(mfile, rec.imported, 0);
                         if (found == null) found = l.lookupAmbient(rec.module, rec.imported);
+                        if (found == null) {
+                            // `import { X } from "m"` where `m` is `export = ns`
+                            // (a namespace): X binds to the namespace member
+                            // `ns.X` (TS semantics). jest-dom augments jest's
+                            // `Matchers` via `extends TestingLibraryMatchers`,
+                            // an interface imported this way from an `export =`
+                            // module — without member resolution the heritage
+                            // base degrades to `any` and its matchers vanish.
+                            if (exeq) |ee| found = try l.exportEqualsMember(ee, rec.imported);
+                        }
                         if (found) |ff| {
                             tgt = ff;
                             tgt.type_only = tgt.type_only or rec.type_only;
