@@ -535,6 +535,7 @@ const Checker = struct {
     atom_Boolean: Atom = 0,
     // Names of the lib interfaces async/await + generators bridge to (M11).
     atom_Promise: Atom = 0,
+    atom_PromiseLike: Atom = 0,
     atom_Generator: Atom = 0,
     atom_Iterator: Atom = 0,
     atom_IterableIterator: Atom = 0,
@@ -643,6 +644,7 @@ const Checker = struct {
         c.atom_Number = try c.atom("Number");
         c.atom_Boolean = try c.atom("Boolean");
         c.atom_Promise = try c.atom("Promise");
+        c.atom_PromiseLike = try c.atom("PromiseLike");
         c.atom_Generator = try c.atom("Generator");
         c.atom_Iterator = try c.atom("Iterator");
         c.atom_IterableIterator = try c.atom("IterableIterator");
@@ -806,6 +808,13 @@ const Checker = struct {
             if (base[mid] <= sym) lo = mid else hi = mid;
         }
         return @intCast(lo);
+    }
+
+    /// Whether a symbol is declared in a `.d.ts` declaration file (a library /
+    /// ambient type). Used to gate expansions that are safe for user source but
+    /// pathological on deeply-recursive library generics.
+    fn symInDeclFile(c: *const Checker, sym: SymbolId) bool {
+        return std.mem.endsWith(u8, c.prog.files[c.symFile(sym)].path, ".d.ts");
     }
 
     /// Local (per-file) id of a global symbol (via representative for merged).
@@ -2522,7 +2531,12 @@ const Checker = struct {
                 try c.diagFmt(2315, c.tokSpan(tok), "Type '{s}' is not generic.", .{c.symbolName(sym)});
                 return try c.scratch().dupe(TypeId, &.{});
             }
-            try c.diagFmt(2314, c.tokSpan(tok), "Generic type '{s}' requires {d} type argument(s).", .{ c.symbolName(sym), min });
+            if (min == tps.items.len) {
+                try c.diagFmt(2314, c.tokSpan(tok), "Generic type '{s}' requires {d} type argument(s).", .{ c.symbolName(sym), min });
+            } else {
+                // With defaults the valid arity is a range (tsc's TS2707).
+                try c.diagFmt(2707, c.tokSpan(tok), "Generic type '{s}' requires between {d} and {d} type arguments.", .{ c.symbolName(sym), min, tps.items.len });
+            }
             return null;
         }
         var out = try c.scratch().alloc(TypeId, tps.items.len);
@@ -2530,11 +2544,33 @@ const Checker = struct {
             if (i < args.len) {
                 out[i] = args[i];
             } else if (tp.default != 0) {
-                // Defaults are nodes of the declaring file; evaluate there.
-                const saved = c.enterSymFile(sym);
-                defer c.restoreCtx(saved);
-                c.cur_scope = c.symScope(tp.sym);
-                out[i] = try c.typeFromTypeNode(tp.default);
+                // Defaults are nodes of the declaring file; evaluate there,
+                // then substitute the already-resolved params so `B = A` sees
+                // the supplied `A` (and `C = B` the defaulted `B`).
+                var def: TypeId = undefined;
+                {
+                    const saved = c.enterSymFile(sym);
+                    defer c.restoreCtx(saved);
+                    c.cur_scope = c.symScope(tp.sym);
+                    def = try c.typeFromTypeNode(tp.default);
+                }
+                // Substitute the already-resolved params into the default so an
+                // earlier-param reference (`B = A`) sees the supplied `A`. This
+                // is gated to user (non-`.d.ts`) generics: threading a concrete
+                // arg through a library generic's chained default re-materializes
+                // deeply-recursive `.d.ts` types (e.g. react-hook-form's
+                // `UseFormReturn`/`FieldPath`), which the instantiation reducers
+                // expand breadth-first into millions of types (OOM) — the
+                // separate deep-generic-expansion work (inst redesign) tracked
+                // elsewhere. For those, keep the pre-existing unsubstituted
+                // default (identical to prior behavior, so no new blow-up).
+                if (c.symInDeclFile(sym)) {
+                    out[i] = def;
+                } else {
+                    const pmap = try c.scratch().alloc(TpMap, i);
+                    for (tps.items[0..i], 0..) |ptp, j| pmap[j] = .{ .sym = ptp.sym, .ty = out[j] };
+                    out[i] = try c.instantiate(def, pmap);
+                }
             } else {
                 out[i] = types.any_type;
             }
@@ -6523,6 +6559,20 @@ const Checker = struct {
         return c.ts.makeRef(sym, &.{payload});
     }
 
+    /// Whether `t` is a `.ref` to `Promise`/`PromiseLike` whose first type
+    /// argument is exactly the type parameter `tp_sym` (the `PromiseLike<T>`
+    /// member of a `.then` onfulfilled return `T | PromiseLike<T>`).
+    fn isPromiseLikeOf(c: *Checker, t: TypeId, tp_sym: u32) bool {
+        if (c.ts.kind(t) != .ref) return false;
+        const sym = c.ts.refSymbol(t);
+        const p = c.prog.globals.lookup(c.atom_Promise);
+        const pl = c.prog.globals.lookup(c.atom_PromiseLike);
+        if ((p == null or sym != p.?) and (pl == null or sym != pl.?)) return false;
+        const args = c.ts.refArgs(t);
+        if (args.len == 0) return false;
+        return c.ts.kind(args[0]) == .type_param and c.ts.typeParamSymbol(args[0]) == tp_sym;
+    }
+
     /// Single-level `Awaited<T>`: unwrap a `Promise<T>` to `T`; any other type
     /// passes through (await on a non-thenable yields the value itself).
     /// Deeper `Awaited<T>` recursion (`Promise<Promise<T>>`) is a known gap.
@@ -6624,6 +6674,54 @@ const Checker = struct {
             return c.typeFromTypeNode(d.lhs);
         }
         return types.no_type;
+    }
+
+    /// The default type of a type parameter (`<T = D>`), evaluated in its
+    /// declaring file + declaration scope, or `no_type` if it has none. The
+    /// result references earlier type-params as their type-param types; a
+    /// caller wanting `B = A` to see the supplied `A` must instantiate the
+    /// result under the mapping resolved so far.
+    fn typeParamDefault(c: *Checker, sym: SymbolId) Error!TypeId {
+        const saved = c.enterSymFile(sym);
+        defer c.restoreCtx(saved);
+        for (c.declsOf(sym)) |decl| {
+            if (c.nodeTag(decl) != .type_param) continue;
+            const d = c.tree.nodeData(decl);
+            if (d.rhs == 0) return types.no_type;
+            c.cur_scope = c.symScope(sym);
+            return c.typeFromTypeNode(d.rhs);
+        }
+        return types.no_type;
+    }
+
+    /// Whether a type parameter declares a default (`<T = D>`).
+    fn typeParamHasDefault(c: *Checker, sym: SymbolId) bool {
+        const saved = c.enterSymFile(sym);
+        defer c.restoreCtx(saved);
+        for (c.declsOf(sym)) |decl| {
+            if (c.nodeTag(decl) != .type_param) continue;
+            return c.tree.nodeData(decl).rhs != 0;
+        }
+        return false;
+    }
+
+    /// Minimum required type-argument count for a signature: type params up to
+    /// the first defaulted one (defaults are trailing-only, so this is the
+    /// count of params without a default).
+    fn sigMinTargs(c: *Checker, tps: []const u32) usize {
+        var min: usize = 0;
+        for (tps) |tp| {
+            if (!c.typeParamHasDefault(tp)) min += 1;
+        }
+        return min;
+    }
+
+    /// Whether `n` explicit type arguments satisfy a signature's arity given
+    /// defaults: `min <= n <= tps.len`.
+    fn sigTargArityOk(c: *Checker, sig: TypeId, n: usize) bool {
+        const tps = c.ts.fnTypeParams(sig);
+        if (n > tps.len) return false;
+        return n >= c.sigMinTargs(tps);
     }
 
     fn removeUndefined(c: *Checker, t: TypeId) Error!TypeId {
@@ -9629,7 +9727,7 @@ const Checker = struct {
             // type-parameter count is a candidate (tsc). Skips e.g. the
             // non-generic `new (): Map<any, any>` when `new Map<K, V>()` names
             // two type args, so the generic overload is chosen instead.
-            if (explicit_targs.len > 0 and c.ts.fnTypeParams(sig).len != explicit_targs.len) continue;
+            if (explicit_targs.len > 0 and !c.sigTargArityOk(sig, explicit_targs.len)) continue;
             const inst = try c.instantiateSigForCall(sig, explicit_targs, arg_nodes, node);
             if (nargs < c.requiredParams(inst) or nargs > c.paramTotal(inst)) continue;
             if (try c.argumentsMatch(inst, arg_nodes)) {
@@ -9655,12 +9753,28 @@ const Checker = struct {
         if (tps.len == 0) return sig;
         var args_buf = try c.scratch().alloc(TypeId, tps.len);
         if (explicit_targs.len > 0) {
-            if (explicit_targs.len != tps.len) {
-                try c.diagFmt(2558, c.nodeSpan(node), "Expected {d} type arguments, but got {d}.", .{ tps.len, explicit_targs.len });
+            const min = c.sigMinTargs(tps);
+            if (explicit_targs.len < min or explicit_targs.len > tps.len) {
+                if (min == tps.len) {
+                    try c.diagFmt(2558, c.nodeSpan(node), "Expected {d} type arguments, but got {d}.", .{ tps.len, explicit_targs.len });
+                } else {
+                    try c.diagFmt(2558, c.nodeSpan(node), "Expected {d}-{d} type arguments, but got {d}.", .{ min, tps.len, explicit_targs.len });
+                }
             }
             for (tps, 0..) |tp, i| {
-                args_buf[i] = if (i < explicit_targs.len) explicit_targs[i] else types.any_type;
-                _ = tp;
+                if (i < explicit_targs.len) {
+                    args_buf[i] = explicit_targs[i];
+                } else if (c.typeParamHasDefault(tp)) {
+                    // A missing trailing arg takes its default, instantiated
+                    // under the args resolved so far (so `B = A` sees the
+                    // supplied `A`, `C = B` sees the defaulted `B`).
+                    const def = try c.typeParamDefault(tp);
+                    const pmap = try c.scratch().alloc(TpMap, i);
+                    for (tps[0..i], 0..) |ptp, j| pmap[j] = .{ .sym = ptp, .ty = args_buf[j] };
+                    args_buf[i] = try c.instantiate(def, pmap);
+                } else {
+                    args_buf[i] = types.any_type;
+                }
             }
         } else {
             try c.inferTypeArgs(sig, tps, arg_nodes, args_buf);
@@ -9746,6 +9860,11 @@ const Checker = struct {
                     out[i] = constraint;
                     c.infer_fell_back = true;
                 }
+            } else if (c.typeParamHasDefault(tp)) {
+                // Uninferable param with a default takes it, instantiated under
+                // the params resolved so far (`B = A` sees the inferred `A`).
+                const def = try c.typeParamDefault(tp);
+                out[i] = try c.instantiate(def, prov);
             } else {
                 out[i] = if (constraint != types.no_type) constraint else types.unknown_type;
             }
@@ -9800,6 +9919,14 @@ const Checker = struct {
                 // doesn't already accept the arg (common: T | undefined).
                 var tp_member: TypeId = types.no_type;
                 var n_tp: usize = 0;
+                // `T | PromiseLike<T>` (the `.then` onfulfilled return shape):
+                // a promise-typed arg should infer `T` from the *awaited* value,
+                // not the whole promise — otherwise `p.then(async d => …)`
+                // infers `Promise<Promise<X>>` (tsc uses `Awaited` here). This
+                // pairs with type-parameter defaults: `then<R1 = T, …>` now
+                // fills/threads `R1`, surfacing the promise-nesting that the
+                // awaited unwrap corrects.
+                var promise_of_tp = false;
                 for (try c.memberList(param)) |m| {
                     if (s.kind(m) == .type_param and tpIndex(tp_syms, s.typeParamSymbol(m)) != null) {
                         tp_member = m;
@@ -9809,12 +9936,25 @@ const Checker = struct {
                     }
                 }
                 if (n_tp == 1) {
+                    for (try c.memberList(param)) |m| {
+                        if (m == tp_member) continue;
+                        if (c.isPromiseLikeOf(m, s.typeParamSymbol(tp_member))) promise_of_tp = true;
+                    }
                     var rest_ok = false;
                     for (try c.memberList(param)) |m| {
                         if (m == tp_member) continue;
                         if (try c.isAssignable(arg, m)) rest_ok = true;
                     }
-                    if (!rest_ok) try c.unify(tp_member, arg, tp_syms, candidates, depth + 1);
+                    if (promise_of_tp) {
+                        const awaited = try c.awaitedType(arg);
+                        if (awaited != arg) {
+                            try c.unify(tp_member, awaited, tp_syms, candidates, depth + 1);
+                        } else if (!rest_ok) {
+                            try c.unify(tp_member, arg, tp_syms, candidates, depth + 1);
+                        }
+                    } else if (!rest_ok) {
+                        try c.unify(tp_member, arg, tp_syms, candidates, depth + 1);
+                    }
                 }
             },
             .object => {
