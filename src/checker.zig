@@ -364,6 +364,14 @@ const Checker = struct {
     /// Per-file flag: has this file's scope-owner map been faulted into
     /// `node_scopes` yet?
     scopes_faulted: []bool = &.{},
+    /// Global SymbolIds that are the target of a reassignment (`x = …`, `x++`,
+    /// destructuring-assignment element) *anywhere* in their file — i.e. not
+    /// effectively `const`. Populated lazily per file by `ensureReassignScan`
+    /// (see the `.start`/closure-capture gate in `flowTypeInner`). Order-
+    /// invariant: a pure function of the file's assignment AST nodes.
+    reassigned_syms: std.AutoHashMapUnmanaged(SymbolId, void) = .empty,
+    /// Per-file flag: has this file's reassignment scan run yet?
+    reassign_scanned: []bool = &.{},
     /// FileId -> module namespace object type (0 = in progress).
     ns_types: std.AutoHashMapUnmanaged(FileId, TypeId) = .empty,
     /// Ambient-module namespace-object cache, keyed by ambient_exports index.
@@ -627,6 +635,8 @@ const Checker = struct {
         // here (all false = nothing mapped yet).
         c.scopes_faulted = try arena_alloc.alloc(bool, prog.files.len);
         @memset(c.scopes_faulted, false);
+        c.reassign_scanned = try arena_alloc.alloc(bool, prog.files.len);
+        @memset(c.reassign_scanned, false);
         c.atom_length = try c.atom("length");
         c.atom_Array = try c.atom("Array");
         c.atom_String = try c.atom("String");
@@ -2693,6 +2703,66 @@ const Checker = struct {
 
     fn makeUnion2(c: *Checker, a: TypeId, b: TypeId) Error!TypeId {
         return c.ts.makeUnion(c.scratch(), &.{ a, b });
+    }
+
+    /// tsc's `getUnionType([left, right], UnionReduction.Subtype)` — the union
+    /// reduction it applies to the `&&` / `||` / `??` result. Build the union,
+    /// then drop any member that is a subtype of another member, so
+    /// `Item[] | never[]` (and ztsc's `[] : any[]` fallback branch) collapses
+    /// into the concrete `Item[]` instead of leaving a two-array union that
+    /// later mis-reports `.map(...)` as not callable (TS2349).
+    fn logicalUnion(c: *Checker, a: TypeId, b: TypeId) Error!TypeId {
+        const u = try c.ts.makeUnion(c.scratch(), &.{ a, b });
+        return c.reduceSubtypes(u);
+    }
+
+    /// Remove union members that are subtypes of another member. Mutually
+    /// assignable members (e.g. `any[]` vs `Item[]`) collapse to exactly one
+    /// (the first kept). tsc guard mirrored from `strictSubtypeRelation`: an
+    /// *empty anonymous object type* (`{}` — the `?? {}` / `|| {}` fallback)
+    /// never absorbs another member — `T | {}` must not collapse to `{}` —
+    /// while `{}` itself is still absorbed by a member it's assignable to
+    /// (e.g. `{ [k: string]: any } | {}` -> the indexed type, matching tsc).
+    /// Order-invariant: members are already TypeId-sorted by `makeUnion`, and
+    /// the kept set is a deterministic function of that order.
+    fn reduceSubtypes(c: *Checker, t: TypeId) Error!TypeId {
+        if (c.ts.kind(t) != .union_type) return t;
+        const members = try c.memberList(t);
+        // Guard cost: `||`/`??` unions are tiny; skip pathological ones
+        // (leaving the union untouched is always sound — never a new FP).
+        if (members.len < 2 or members.len > 32) return t;
+        var kept: std.ArrayList(TypeId) = .empty;
+        defer kept.deinit(c.scratch());
+        outer: for (members, 0..) |m, i| {
+            const m_empty = c.isEmptyAnonObject(m);
+            for (members, 0..) |o, j| {
+                if (i == j) continue;
+                if (c.isEmptyAnonObject(o)) continue; // `{}` never absorbs
+                if (!try c.isAssignable(m, o)) continue; // m not a subtype of o
+                if (!m_empty and try c.isAssignable(o, m)) {
+                    // Mutually assignable: keep m only if its twin isn't kept.
+                    for (kept.items) |k| if (k == o) continue :outer;
+                } else {
+                    // Strict subtype (or the `{}` member itself): m is redundant.
+                    continue :outer;
+                }
+            }
+            try kept.append(c.scratch(), m);
+        }
+        if (kept.items.len == members.len) return t;
+        return c.ts.makeUnion(c.scratch(), kept.items);
+    }
+
+    /// tsc's `isEmptyAnonymousObjectType`: a structural object type with no
+    /// properties, no call/construct signatures, and no index signatures.
+    /// Named refs are not resolved — only literal `{}` shapes qualify (the
+    /// `|| {}` / `?? {}` fallback), matching tsc's Anonymous-flag check.
+    fn isEmptyAnonObject(c: *Checker, t: TypeId) bool {
+        const s = &c.ts;
+        if (s.kind(t) != .object) return false;
+        return s.objectPropCount(t) == 0 and
+            s.objectStringIndex(t) == 0 and s.objectNumberIndex(t) == 0 and
+            s.objectCallSigCount(t) == 0 and s.objectConstructSigCount(t) == 0;
     }
 
     /// `string | number | symbol` — the apparent constraint of a deferred
@@ -6696,6 +6766,14 @@ const Checker = struct {
             }
             return false;
         }
+        // tsc's comparable relation: `null` / `undefined` are comparable to
+        // every type, so an equality test against (or of) a nullish operand is
+        // never TS2367 — `x === null` is the idiomatic guard even when `x`'s
+        // declared type can't be null (oracle-verified: `number === null`,
+        // `string === undefined`, `null === undefined` are all clean).
+        const ka = c.ts.kind(a);
+        const kb = c.ts.kind(b);
+        if (ka == .null or ka == .undefined or kb == .null or kb == .undefined) return true;
         return c.isComparable(a, b);
     }
 
@@ -9006,18 +9084,18 @@ const Checker = struct {
                 const lt = try c.checkExprCached(d.lhs, types.no_type);
                 const rt = try c.checkExprCached(d.rhs, ctx);
                 const falsy = try c.getFalsyPart(lt, false);
-                return c.makeUnion2(falsy, rt);
+                return c.logicalUnion(falsy, rt);
             },
             .pipe_pipe => {
                 const lt = try c.checkExprCached(d.lhs, types.no_type);
                 const rt = try c.checkExprCached(d.rhs, ctx);
                 const truthy = try c.getTruthyPart(lt);
-                return c.makeUnion2(truthy, rt);
+                return c.logicalUnion(truthy, rt);
             },
             .question_question => {
                 const lt = try c.checkExprCached(d.lhs, types.no_type);
                 const rt = try c.checkExprCached(d.rhs, ctx);
-                return c.makeUnion2(try c.nonNullable(lt), rt);
+                return c.logicalUnion(try c.nonNullable(lt), rt);
             },
             .plus => {
                 const lt = try c.checkExprCached(d.lhs, types.no_type);
@@ -9918,7 +9996,38 @@ const Checker = struct {
                 const ante = b.flow_a[flow];
                 if (ante == binder.no_flow) return declared;
                 if (key.prop != 0 or key.sym == this_flow_root) return declared;
-                if (!c.symFlags(key.sym).const_decl) return declared;
+                const sf = c.symFlags(key.sym);
+                if (!sf.const_decl) {
+                    // Effectively-const let/var/param: tsc narrows a captured
+                    // reference across a closure like a `const` when the variable
+                    // is a mutable *local* that is never reassigned (matching
+                    // tsc's `isParameterOrMutableLocalVariable` + the
+                    // function-expression/arrow container walk in
+                    // `checkIdentifier`). Excluded, so the declared type stands:
+                    //   • non let/var/param/catch symbols,
+                    //   • module/global top-level or exported variables — a
+                    //     top-level `let` may be reassigned by any function, so
+                    //     tsc never trusts the narrowing across a closure (a
+                    //     top-level `const` still does, via the const path above),
+                    //   • the crossed closure being a *function declaration*
+                    //     (only function-expression/arrow/method containers extend
+                    //     the flow — a hoisted `function` captures at its
+                    //     definition point, before any guard),
+                    //   • reassignment anywhere (conservative vs tsc's
+                    //     position-based `lastAssignmentPos`; only ever
+                    //     under-narrows, never a new false positive).
+                    if (!(sf.let_decl or sf.var_decl or sf.param or sf.catch_param)) return declared;
+                    if (sf.exported) return declared;
+                    if (c.symFile(key.sym) != c.cur_file) return declared;
+                    const decl_scope = c.bind.symbol_scopes[c.localOf(key.sym)];
+                    if (c.bind.scope_kinds[c.containerOf(decl_scope)] != .function) return declared;
+                    switch (c.nodeTag(b.flowNode(flow))) {
+                        .arrow_fn, .function_expr, .object_method, .class_method => {},
+                        else => return declared, // function declaration etc.
+                    }
+                    try c.ensureReassignScan();
+                    if (c.reassigned_syms.contains(key.sym)) return declared;
+                }
                 return c.flowType(ante, key, declared, depth + 1);
             },
             .unreachable_ => return types.never_type,
@@ -10191,6 +10300,74 @@ const Checker = struct {
             .sym => |s| s == sym,
             else => false,
         };
+    }
+
+    /// Populate `reassigned_syms` for the current file: the set of value
+    /// symbols that are ever the target of a reassignment (`x = …`, `x += …`,
+    /// `x++`, or a destructuring-assignment element). Runs once per file
+    /// (`reassign_scanned`); the declarator initializer is *not* a
+    /// reassignment. Order-invariant — a pure function of the file's AST.
+    fn ensureReassignScan(c: *Checker) Error!void {
+        if (c.reassign_scanned[c.cur_file]) return;
+        c.reassign_scanned[c.cur_file] = true;
+        const b = c.bind;
+        var flow: FlowId = 0;
+        while (flow < b.flow_tags.len) : (flow += 1) {
+            if (b.flow_tags[flow] != .assign) continue;
+            const node = b.flowNode(flow);
+            if (node == null_node) continue;
+            const scope = b.flowScope(flow);
+            switch (c.nodeTag(node)) {
+                .assign => try c.markReassignTarget(c.tree.nodeData(node).lhs, scope),
+                .prefix_unary, .postfix_unary => {
+                    switch (c.tree.tokens.tag(c.tree.nodeMainToken(node))) {
+                        .plus_plus, .minus_minus => try c.markReassignTarget(c.tree.nodeData(node).lhs, scope),
+                        else => {},
+                    }
+                },
+                // declarator_init / declarator_full / for-in-of bindings are
+                // the variable's *initialization*, not a reassignment.
+                else => {},
+            }
+        }
+    }
+
+    fn markReassignTarget(c: *Checker, target: Node, scope: ScopeId) Error!void {
+        if (target == null_node) return;
+        var n = target;
+        while (c.nodeTag(n) == .paren_expr) n = c.tree.nodeData(n).lhs;
+        switch (c.nodeTag(n)) {
+            .identifier => {
+                const a = try c.atomOfToken(c.tree.nodeMainToken(n));
+                switch (c.resolveSpace(a, scope, true)) {
+                    .sym => |s| try c.reassigned_syms.put(c.ca(), s, {}),
+                    else => {},
+                }
+            },
+            // Destructuring-assignment target: `[a] = …` / `({a} = …)`.
+            .array_literal, .object_literal, .array_pattern, .object_pattern => {
+                for (c.tree.nodeRange(n)) |el| {
+                    if (el != null_node) try c.markReassignTarget(el, scope);
+                }
+            },
+            .binding_property, .object_shorthand, .object_property => {
+                const d = c.tree.nodeData(n);
+                if (d.lhs != 0) {
+                    try c.markReassignTarget(d.lhs, scope);
+                } else {
+                    const a = try c.memberAtom(c.tree.nodeMainToken(n));
+                    switch (c.resolveSpace(a, scope, true)) {
+                        .sym => |s| try c.reassigned_syms.put(c.ca(), s, {}),
+                        else => {},
+                    }
+                }
+            },
+            .binding_default, .rest_element, .spread_element => {
+                try c.markReassignTarget(c.tree.nodeData(n).lhs, scope);
+            },
+            // member_expr (`o.p = v`) reassigns a property, not a variable.
+            else => {},
+        }
     }
 
     fn patternBindsSym(c: *Checker, pat: Node, sym: SymbolId) Error!bool {
