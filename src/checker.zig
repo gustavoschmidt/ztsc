@@ -2635,7 +2635,18 @@ const Checker = struct {
                 if (c.ts.kind(r) == .object and c.ts.objectStringIndex(r) != 0) {
                     return c.ts.objectStringIndex(r);
                 }
-                return types.any_type;
+                // Property genuinely absent (no index signature). tsc's
+                // `getIndexedAccessType` resolves a missing type-level access
+                // to `unknown`, NOT `any` — decisive for a conditional check
+                // type like `TOpt['returnObjects'] extends true`: an absent
+                // property must yield the FALSE branch (`unknown extends true`
+                // is false), whereas `any extends true` wrongly took the true
+                // branch (i18next `t()` → `$SpecialObject` instead of `string`).
+                // An `any`/error object still indexes to `any`.
+                return switch (c.ts.kind(r)) {
+                    .any, .err => types.any_type,
+                    else => types.unknown_type,
+                };
             },
             .number_literal, .number_literal_fresh => {
                 // A concrete numeric index into a tuple selects that element
@@ -9717,6 +9728,13 @@ const Checker = struct {
         // the raw node against `c.tree` reads out of bounds when the two files
         // differ. `tp == infos[i].sym`, and the symbol's type_param decl is the
         // very node the constraint field came from, so this is equivalent.
+        // Resolve in declaration order, feeding each resolved arg back into
+        // `prov` so a later param's constraint that references an earlier one
+        // sees the *resolved* value, not the `any` placeholder. tsc's
+        // `getInferredTypes` works this way; without it an un-inferred `TOpt`
+        // stayed `any` inside `Ret extends TReturn<TOpt>`, so
+        // `any['returnObjects'] extends true` wrongly took the true branch
+        // (i18next `t()` → `$SpecialObject` instead of `string`).
         for (tp_syms, 0..) |tp, i| {
             var constraint: TypeId = try c.typeParamConstraint(tp);
             if (constraint != types.no_type) constraint = try c.instantiate(constraint, prov);
@@ -9728,9 +9746,10 @@ const Checker = struct {
                     out[i] = constraint;
                     c.infer_fell_back = true;
                 }
-                continue;
+            } else {
+                out[i] = if (constraint != types.no_type) constraint else types.unknown_type;
             }
-            out[i] = if (constraint != types.no_type) constraint else types.unknown_type;
+            prov[i].ty = out[i];
         }
     }
 
