@@ -6911,6 +6911,15 @@ const Checker = struct {
         // path via `literalBase`) or an identical pattern (`s == t`). Reaching
         // here means neither — so no.
         if (sk == .template_literal_type or sk == .string_mapping) return false;
+        // Any callable value — arrow/normal functions, overload sets, classes
+        // used as values, and callable object/interface types — is assignable
+        // to the global `Function` interface. tsc models this via the apparent
+        // members a function inherits from `Function`; we special-case the
+        // target so an incomplete structural relation against the `Function`
+        // interface body can't reject valid code (e.g. `TimerHandler =
+        // string | Function` for setInterval/setTimeout). Plain (non-callable)
+        // objects are intentionally excluded.
+        if (tk == .ref and c.globalSymNamed(c.ts.refSymbol(t), "Function") and try c.isCallableForFunctionIface(s, sk)) return true;
         // Refs: expand and recurse (cache on the ref pair terminates cycles).
         if (sk == .ref or tk == .ref) {
             const rs = try c.resolveStructural(s);
@@ -6987,6 +6996,23 @@ const Checker = struct {
             .object, .array, .tuple, .function, .overloads, .ref, .class_value, .intersection, .object_keyword => true,
             else => false,
         };
+    }
+
+    /// Does `s` carry a call or construct signature — i.e. is it assignable to
+    /// the global `Function` interface? Functions, overload sets and classes
+    /// used as values always qualify; object/interface types only if they
+    /// declare at least one call or construct signature (plain objects do not).
+    fn isCallableForFunctionIface(c: *Checker, s: TypeId, sk: types.Kind) Error!bool {
+        switch (sk) {
+            .function, .overloads, .class_value => return true,
+            .object => return c.ts.objectCallSigCount(s) > 0 or c.ts.objectConstructSigCount(s) > 0,
+            .ref => {
+                const r = try c.resolveStructural(s);
+                if (c.ts.kind(r) == .object) return c.ts.objectCallSigCount(r) > 0 or c.ts.objectConstructSigCount(r) > 0;
+                return false;
+            },
+            else => return false,
+        }
     }
 
     fn tupleAssignable(c: *Checker, s: TypeId, t: TypeId) Error!bool {
@@ -11439,6 +11465,21 @@ const Checker = struct {
                 return c.stmtTerminal(e.then_stmt) and c.stmtTerminal(e.else_stmt);
             },
             .labeled_stmt => return c.stmtTerminal(d.lhs),
+            .try_stmt => {
+                const e = c.tree.extraData(ast.Try, d.rhs);
+                // A `finally` that itself ends abruptly (return/throw) makes the
+                // whole statement terminal regardless of the try/catch bodies.
+                if (e.finally_block != null_node and c.stmtTerminal(e.finally_block)) return true;
+                // Otherwise the statement can complete normally if the try block
+                // can, or — when a catch exists — if the catch block can. It is
+                // terminal only when neither falls through.
+                const try_terminal = c.stmtTerminal(d.lhs);
+                if (e.catch_clause != null_node) {
+                    const catch_block = c.tree.nodeData(e.catch_clause).rhs;
+                    return try_terminal and c.stmtTerminal(catch_block);
+                }
+                return try_terminal;
+            },
             .switch_stmt => return c.switchTerminal(node),
             .while_stmt => {
                 // while (true) without break is terminal-ish.
