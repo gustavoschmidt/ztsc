@@ -3078,9 +3078,160 @@ const Checker = struct {
             ret = types.any_type; // overload signature without annotation
         }
 
+        // TS 5.5 inferred type predicate: a boolean-returning single-param
+        // callback whose body narrows that param synthesizes an implicit
+        // `x is T` guard, so `arr.filter(x => x !== null)` picks the
+        // `filter<S extends T>(…): S[]` overload. Only when no explicit
+        // predicate was written and the param has a real (contextual) type.
+        if (pred == null and tps.items.len == 0 and
+            (c.nodeTag(node) == .arrow_fn or c.nodeTag(node) == .function_expr))
+        {
+            pred = try c.inferredPredicate(params.items, ret, c.tree.nodeData(node).rhs);
+        }
+
         const sig = try c.ts.makeFunctionThis(params.items, ret, tps.items, if (is_method) types.fn_flag_method else 0, pred, this_ty);
         try c.sig_cache.put(c.ca(), c.nodeKey(node), .{ .ty = sig, .ctx = ctx_sig });
         return sig;
+    }
+
+    /// TS 5.5 inferred type predicate. Returns an implicit `x is T` guard for a
+    /// boolean-returning single-parameter arrow/function whose body narrows
+    /// that parameter, or null (the old under-reporting behavior) when the
+    /// shape is anything we are not certain about. Conservative on purpose:
+    /// only equality / `typeof` / `instanceof` / `in` guards (optionally under
+    /// `!`), gated by tsc's own soundness rule — the true-branch narrowing
+    /// must differ from the declared type AND the false branch must exclude the
+    /// narrowed type entirely. That gate rejects truthiness (`!!x`, `x => !!x`)
+    /// exactly as tsc does: the falsy branch of `number | null` keeps `number`.
+    fn inferredPredicate(c: *Checker, params: []const types.Param, ret: TypeId, body: Node) Error!?types.Predicate {
+        if (body == null_node) return null;
+        switch (c.ts.kind(ret)) {
+            .boolean, .bool_true, .bool_false => {},
+            else => return null,
+        }
+        if (params.len == 0) return null;
+
+        // The single guard expression: an expression body, or a block whose
+        // only statement is `return <expr>`.
+        var guard = body;
+        if (c.nodeTag(body) == .block) {
+            var expr: Node = null_node;
+            var count: usize = 0;
+            for (c.tree.nodeRange(body)) |st| {
+                if (st == null_node) continue;
+                count += 1;
+                if (c.nodeTag(st) == .return_stmt and c.tree.nodeData(st).lhs != 0) {
+                    expr = c.tree.nodeData(st).lhs;
+                } else return null;
+            }
+            if (count != 1 or expr == null_node) return null;
+            guard = expr;
+        }
+
+        // Unwrap parens and leading `!` (each `!` flips the narrowing sense).
+        var sense = true;
+        unwrap: while (guard != null_node) {
+            switch (c.nodeTag(guard)) {
+                .paren_expr => guard = c.tree.nodeData(guard).lhs,
+                .prefix_unary => {
+                    if (c.tree.tokens.tag(c.tree.nodeMainToken(guard)) != .bang) break :unwrap;
+                    sense = !sense;
+                    guard = c.tree.nodeData(guard).lhs;
+                },
+                else => break :unwrap,
+            }
+        }
+        if (guard == null_node) return null;
+        // Only shapes `narrowByGuardExpr`/`narrowByCondition` handle soundly
+        // (a bare identifier is allowed so truthiness reaches — and is
+        // rejected by — the gate; calls reach `narrowByGuardCall`, i.e. a
+        // callback that merely wraps a user-defined guard).
+        switch (c.nodeTag(guard)) {
+            .binary, .identifier, .member_expr, .optional_member_expr => {},
+            .call_expr, .call_expr_targs, .optional_call => {},
+            else => return null,
+        }
+
+        // tsc 5.5 narrows one parameter of a possibly multi-parameter callback
+        // (`arr.filter((x, i) => x !== null)` guards `x`; `i` is untouched).
+        // Try each parameter; synthesize only when *exactly one* passes the
+        // gate — an ambiguous guard (two params both narrowed) has no clear
+        // oracle semantics, so it keeps the old (no-predicate) behavior.
+        var found: ?types.Predicate = null;
+        for (params, 0..) |p, pi| {
+            if (p.name == 0) continue;
+            const declared = p.ty;
+            if (!c.isNarrowable(declared)) continue;
+            // The guarded parameter's symbol, resolved exactly as `identIsSym`
+            // will resolve the references inside the body.
+            const psym: SymbolId = switch (c.resolveSpace(p.name, c.cur_scope, true)) {
+                .sym => |s| s,
+                else => continue,
+            };
+            const key = RefKey{ .sym = psym, .prop = 0 };
+            const true_ty = try c.narrowByGuardExpr(declared, guard, sense, key, 0);
+            if (true_ty == declared or c.ts.kind(true_ty) == .never) continue;
+            const false_ty = try c.narrowByGuardExpr(declared, guard, !sense, key, 0);
+            // Soundness: the false branch must fully exclude the narrowed type.
+            if (try c.typesOverlap(true_ty, false_ty)) continue;
+            if (found != null) return null; // ambiguous: two params narrowed
+            found = types.Predicate{ .param = @intCast(pi), .ty = true_ty, .asserts = false };
+        }
+        return found;
+    }
+
+    /// Narrow `t` by a *guard expression* for inferred-predicate synthesis
+    /// only. Unlike flow narrowing (where the binder decomposes `&&`/`||`/`!`
+    /// into branch conditions), the whole callback body is one expression
+    /// here, so the logical operators are recursed structurally with the
+    /// exact branch semantics tsc's flow analysis produces:
+    ///   true(A && B)  = true(B) over true(A)
+    ///   false(A && B) = false(A) | false(B) over true(A)
+    /// (and the De Morgan dual for `||`). Leaves delegate to
+    /// `narrowByCondition`; unhandled shapes return `t`, which the caller's
+    /// `true_ty == declared` gate then rejects (no predicate — old behavior).
+    fn narrowByGuardExpr(c: *Checker, t: TypeId, cond: Node, sense: bool, key: RefKey, depth: u32) Error!TypeId {
+        if (cond == null_node or depth > 8) return t;
+        const d = c.tree.nodeData(cond);
+        switch (c.nodeTag(cond)) {
+            .paren_expr => return c.narrowByGuardExpr(t, d.lhs, sense, key, depth + 1),
+            .prefix_unary => {
+                if (c.tree.tokens.tag(c.tree.nodeMainToken(cond)) != .bang)
+                    return t;
+                return c.narrowByGuardExpr(t, d.lhs, !sense, key, depth + 1);
+            },
+            .binary => switch (c.tree.tokens.tag(c.tree.nodeMainToken(cond))) {
+                .amp_amp => {
+                    const a_true = try c.narrowByGuardExpr(t, d.lhs, true, key, depth + 1);
+                    if (sense) return c.narrowByGuardExpr(a_true, d.rhs, true, key, depth + 1);
+                    const a_false = try c.narrowByGuardExpr(t, d.lhs, false, key, depth + 1);
+                    const b_false = try c.narrowByGuardExpr(a_true, d.rhs, false, key, depth + 1);
+                    return c.makeUnion2(a_false, b_false);
+                },
+                .pipe_pipe => {
+                    const a_false = try c.narrowByGuardExpr(t, d.lhs, false, key, depth + 1);
+                    if (!sense) return c.narrowByGuardExpr(a_false, d.rhs, false, key, depth + 1);
+                    const a_true = try c.narrowByGuardExpr(t, d.lhs, true, key, depth + 1);
+                    const b_true = try c.narrowByGuardExpr(a_false, d.rhs, true, key, depth + 1);
+                    return c.makeUnion2(a_true, b_true);
+                },
+                else => return c.narrowByCondition(t, cond, sense, key),
+            },
+            else => return c.narrowByCondition(t, cond, sense, key),
+        }
+    }
+
+    /// True when some constituent of `a` is assignable into `b` (a non-empty
+    /// overlap). Used to reject an inferred predicate whose true and false
+    /// branches are not disjoint.
+    fn typesOverlap(c: *Checker, a: TypeId, b: TypeId) Error!bool {
+        if (c.ts.kind(a) == .union_type) {
+            for (try c.memberList(a)) |m| {
+                if (try c.isAssignable(m, b)) return true;
+            }
+            return false;
+        }
+        return c.isAssignable(a, b);
     }
 
     /// If `pn` is a leading `this` parameter (`this: T`), return its type
@@ -10152,8 +10303,28 @@ const Checker = struct {
             if (candidates[i] != types.no_type) {
                 out[i] = candidates[i];
                 // Candidate violating the constraint falls back to the
-                // constraint (tsc then re-checks args against it).
-                if (constraint != types.no_type and !try c.isAssignable(candidates[i], constraint)) {
+                // constraint (tsc then re-checks args against it). But skip
+                // the fallback when the constraint — after substituting the
+                // params inferred so far — still references an *outer* type
+                // param we cannot resolve here: e.g. a generic-interface
+                // method `filter<S extends T>` accessed on an instantiated
+                // `Array<number|null>`, whose receiver `T` is not part of this
+                // call's inference set. The constraint stays a bare `T`, so
+                // `isAssignable(number, T)` always fails and would erase the
+                // legitimately-inferred `S=number` back to `T` (`S[]` → `T[]`).
+                // tsc has the substituted bound (`S extends number|null`) and
+                // keeps `number`; we cannot recover it, so trust the candidate.
+                // The skip is deliberately narrow — only a *bare* outer type
+                // param (`S extends T`, `T` being the receiver's param). A
+                // complex constraint that merely mentions an outer param
+                // (`K extends keyof T`) still falls back, so RHF-style deep
+                // generics keep their prior (permissive) behavior.
+                const bare_outer = constraint != types.no_type and
+                    c.ts.kind(constraint) == .type_param and
+                    tpIndex(tp_syms, c.ts.typeParamSymbol(constraint)) == null;
+                if (constraint != types.no_type and !bare_outer and
+                    !try c.isAssignable(candidates[i], constraint))
+                {
                     out[i] = constraint;
                     c.infer_fell_back = true;
                 }
@@ -10371,6 +10542,16 @@ const Checker = struct {
                     try c.unify(s.fnParam(param, @intCast(i)).ty, s.fnParam(ra, @intCast(i)).ty, tp_syms, candidates, depth + 1);
                 }
                 try c.unify(s.fnReturn(param), s.fnReturn(ra), tp_syms, candidates, depth + 1);
+                // Infer type params from the *predicate guard* too:
+                // `filter<S extends T>(p: (x: T) => x is S)` gets `S` from an
+                // argument `(x): x is number`. Only plain guards (not
+                // `asserts`) with concrete guard types on both sides.
+                if (s.fnHasPredicate(param) and s.fnHasPredicate(ra)) {
+                    const pp = s.fnPredicate(param);
+                    const ap = s.fnPredicate(ra);
+                    if (!pp.asserts and !ap.asserts and pp.ty != 0 and ap.ty != 0)
+                        try c.unify(pp.ty, ap.ty, tp_syms, candidates, depth + 1);
+                }
             },
             .ref => {
                 const ra = try c.resolveStructural(arg);
@@ -11077,6 +11258,12 @@ const Checker = struct {
         const k = c.ts.kind(mt);
         if (mt == v) return v;
         if (k == .any or k == .unknown or k == .err) return v;
+        // `=== null` / `=== undefined`: only a matching nullish member (handled
+        // by `mt == v` above) survives; any other concrete member is excluded.
+        // Without this the false branch of `x !== null` stayed `number | null`,
+        // defeating the inferred-predicate disjointness gate (and under-
+        // narrowing `if (x === null)`).
+        if (c.ts.kind(v) == .null or c.ts.kind(v) == .undefined) return types.never_type;
         if (c.ts.literalBase(v) == mt) return v; // string narrowed by "a"
         if (k == .boolean and (c.ts.kind(v) == .bool_true or c.ts.kind(v) == .bool_false)) return v;
         if (c.ts.literalBase(mt) != types.no_type or k == .null or k == .undefined) {
