@@ -2646,23 +2646,12 @@ interface WeakSetConstructor {
 
 interface Promise<T> {}
 
-interface PromiseConstructor {
-    /**
-     * Creates a Promise that is resolved with an array of results when all of the provided Promises
-     * resolve, or rejected when any Promise is rejected.
-     * @param values An iterable of Promises.
-     * @returns A new Promise.
-     */
-    all<T>(values: Iterable<T | PromiseLike<T>>): Promise<Awaited<T>[]>;
-
-    /**
-     * Creates a Promise that is resolved or rejected when any of the provided Promises are resolved
-     * or rejected.
-     * @param values An iterable of Promises.
-     * @returns A new Promise.
-     */
-    race<T>(values: Iterable<T | PromiseLike<T>>): Promise<Awaited<T>>;
-}
+// NOTE (ztsc): the iterable `all`/`race` overloads that tsc declares here (in
+// lib.es2015.iterable.d.ts) are relocated *below* the tuple overloads in
+// lib.es2015.promise.d.ts. tsc/tsgo select the tuple overload for array-literal
+// arguments; ztsc resolves overloads by first declaration-order match, so the
+// tuple signature must precede the iterable one for `Promise.all([a, b])` to
+// yield `Promise<[A, B]>` instead of `Promise<Awaited<A | B>[]>`.
 
 interface StringIterator<T> extends IteratorObject<T, BuiltinIteratorReturn, unknown> {
     [Symbol.iterator](): StringIterator<T>;
@@ -3121,8 +3110,8 @@ interface PromiseConstructor {
      */
     all<T extends readonly unknown[] | []>(values: T): Promise<{ -readonly [P in keyof T]: Awaited<T[P]>; }>;
 
-    // see: lib.es2015.iterable.d.ts
-    // all<T>(values: Iterable<T | PromiseLike<T>>): Promise<Awaited<T>[]>;
+    // from lib.es2015.iterable.d.ts (relocated after the tuple overload — see note above)
+    all<T>(values: Iterable<T | PromiseLike<T>>): Promise<Awaited<T>[]>;
 
     /**
      * Creates a Promise that is resolved or rejected when any of the provided Promises are resolved
@@ -3132,8 +3121,8 @@ interface PromiseConstructor {
      */
     race<T extends readonly unknown[] | []>(values: T): Promise<Awaited<T[number]>>;
 
-    // see: lib.es2015.iterable.d.ts
-    // race<T>(values: Iterable<T | PromiseLike<T>>): Promise<Awaited<T>>;
+    // from lib.es2015.iterable.d.ts (relocated after the tuple overload — see note above)
+    race<T>(values: Iterable<T | PromiseLike<T>>): Promise<Awaited<T>>;
 
     /**
      * Creates a new rejected promise for the provided reason.
