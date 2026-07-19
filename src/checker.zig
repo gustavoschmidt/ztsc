@@ -4646,6 +4646,23 @@ const Checker = struct {
                 }
                 if (s.objectStringIndex(t) != 0 and try c.containsTypeParam(s.objectStringIndex(t))) return true;
                 if (s.objectNumberIndex(t) != 0 and try c.containsTypeParam(s.objectNumberIndex(t))) return true;
+                // A param-free call/construct signature may reference a type
+                // param that appears nowhere else (a callable interface whose
+                // only generic use is its call sig, e.g.
+                // `interface B<T,Y> { (...a:Y):T }`); without this the object is
+                // judged concrete and instantiation skips it, leaving the sig
+                // unsubstituted. Only param-free sigs are counted — matching the
+                // set `instantiateId` actually rewrites; higher-order sigs (own
+                // `<...>`) are left as-is there, so triggering instantiation for
+                // them here would gain nothing and perturb the redux hooks.
+                for (0..s.objectCallSigCount(t)) |i| {
+                    const sig = s.objectCallSig(t, @intCast(i));
+                    if (s.fnTypeParams(sig).len == 0 and try c.containsTypeParam(sig)) return true;
+                }
+                for (0..s.objectConstructSigCount(t)) |i| {
+                    const sig = s.objectConstructSig(t, @intCast(i));
+                    if (s.fnTypeParams(sig).len == 0 and try c.containsTypeParam(sig)) return true;
+                }
                 return false;
             },
             .function => {
@@ -4922,7 +4939,41 @@ const Checker = struct {
                 }
                 const sidx = if (s.objectStringIndex(t) != 0) try c.instantiateId(s.objectStringIndex(t), map, map_id) else 0;
                 const nidx = if (s.objectNumberIndex(t) != 0) try c.instantiateId(s.objectNumberIndex(t), map, map_id) else 0;
-                break :blk try s.makeObject(props.items, sidx, nidx, s.objectFlags(t));
+                // Call/construct signatures (M18.1) are `.function` types that
+                // may mention the interface's type params (e.g. jest's
+                // `Mock<T, Y, C>` call sig `(...args: Y): T`). Instantiate each
+                // and preserve them via `makeObjectSigs` — dropping them here
+                // (the prior `makeObject` path) made an instantiated callable
+                // interface non-callable, so `Mock<any, any, any>` was not
+                // assignable to any concrete function type.
+                // A signature that declares its *own* type params whose
+                // constraints/defaults reference the interface's params (e.g.
+                // react-redux's `<AD extends DispatchType = DispatchType>(): AD`)
+                // needs those constraints/defaults substituted too — a
+                // higher-order rewrite ztsc doesn't do (documented
+                // simplification). Substituting only its param/return types
+                // strands the default and the call mis-resolves. Such
+                // higher-order signatures were dropped outright before this
+                // change (the old `makeObject` path); keep dropping them so the
+                // redux/react-redux hooks behave exactly as before. Only
+                // param-free signatures — the jest `Mock` call sig
+                // `(this: C, ...args: Y): T`, this whole bucket's target — are
+                // instantiated and preserved.
+                var call_sigs: std.ArrayList(TypeId) = .empty;
+                defer call_sigs.deinit(c.scratch());
+                var construct_sigs: std.ArrayList(TypeId) = .empty;
+                defer construct_sigs.deinit(c.scratch());
+                for (0..s.objectCallSigCount(t)) |i| {
+                    const sig = s.objectCallSig(t, @intCast(i));
+                    if (s.fnTypeParams(sig).len != 0) continue; // higher-order: drop (prior behavior)
+                    try call_sigs.append(c.scratch(), try c.instantiateId(sig, map, map_id));
+                }
+                for (0..s.objectConstructSigCount(t)) |i| {
+                    const sig = s.objectConstructSig(t, @intCast(i));
+                    if (s.fnTypeParams(sig).len != 0) continue; // higher-order: drop (prior behavior)
+                    try construct_sigs.append(c.scratch(), try c.instantiateId(sig, map, map_id));
+                }
+                break :blk try s.makeObjectSigs(props.items, sidx, nidx, s.objectFlags(t), call_sigs.items, construct_sigs.items);
             },
             .function => blk: {
                 var params: std.ArrayList(types.Param) = .empty;
