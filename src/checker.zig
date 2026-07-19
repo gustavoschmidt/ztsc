@@ -3440,10 +3440,19 @@ const Checker = struct {
             const m = c.prog.mergedSym(sym);
             if (m.flags.namespace_decl) {
                 var ns_val = try c.ts.makeClassValue(sym);
+                // Intersect the first value-space constituent (a function/class/
+                // enum callable base, *or* a `var console: Console`-style
+                // variable) so a namespace merged onto a typed global keeps that
+                // global's members. Without this a `var X: T` + `namespace X {…}`
+                // merge drops `T` and every `X.member` is a phantom TS2339.
                 for (m.parts) |p| {
                     const pf = c.symFlags(p);
                     if (pf.function or pf.enum_decl or pf.class) {
                         ns_val = try c.ts.makeIntersection(c.scratch(), &.{ try c.typeOfSymbol(p), ns_val });
+                        break;
+                    }
+                    if (pf.var_decl or pf.let_decl or pf.const_decl) {
+                        ns_val = try c.ts.makeIntersection(c.scratch(), &.{ try c.variableSymbolType(p), ns_val });
                         break;
                     }
                 }
@@ -3467,6 +3476,10 @@ const Checker = struct {
             if (f.class) return ns_val;
             if (f.function) return c.ts.makeIntersection(c.scratch(), &.{ try c.functionSymbolType(sym), ns_val });
             if (f.enum_decl) return c.ts.makeIntersection(c.scratch(), &.{ try c.enumValueType(sym), ns_val });
+            // Same-file `var X: T` + `namespace X {…}` (a namespace merged onto a
+            // typed global within one file): keep T's members.
+            if (f.var_decl or f.let_decl or f.const_decl)
+                return c.ts.makeIntersection(c.scratch(), &.{ try c.variableSymbolType(sym), ns_val });
             return ns_val;
         }
         if (f.enum_decl) return c.enumValueType(sym);
@@ -3505,21 +3518,31 @@ const Checker = struct {
             }
             return types.any_type;
         }
-        if (f.var_decl or f.let_decl or f.const_decl) {
-            const decls = c.declsOf(sym);
-            for (decls) |decl| {
-                // A symbol can merge a value declaration with a type-only one
-                // (e.g. lib's `interface Object {}` + `declare var Object: {…}`).
-                // Only the variable declarators carry the value type; skip the
-                // type-space decls so they don't short-circuit to `any`.
-                switch (c.nodeTag(decl)) {
-                    .declarator, .declarator_init, .declarator_full => {},
-                    else => continue,
-                }
-                const t = try c.declaratorType(sym, decl, f.const_decl);
-                if (t != types.no_type) return t;
+        if (f.var_decl or f.let_decl or f.const_decl) return c.variableSymbolType(sym);
+        return types.any_type;
+    }
+
+    /// The declared value type of a `var`/`let`/`const` symbol. Self-contained
+    /// (switches to the symbol's file/scope) so it can also be called for a
+    /// symbol that additionally carries a `namespace` meaning (e.g. `@types/node`
+    /// declares `var console: Console` alongside `namespace console { … }`).
+    fn variableSymbolType(c: *Checker, sym: SymbolId) Error!TypeId {
+        const saved = c.enterSymFile(sym);
+        defer c.restoreCtx(saved);
+        c.cur_scope = c.symScope(sym);
+        const is_const = c.symFlags(sym).const_decl;
+        const decls = c.declsOf(sym);
+        for (decls) |decl| {
+            // A symbol can merge a value declaration with a type-only one
+            // (e.g. lib's `interface Object {}` + `declare var Object: {…}`).
+            // Only the variable declarators carry the value type; skip the
+            // type-space decls so they don't short-circuit to `any`.
+            switch (c.nodeTag(decl)) {
+                .declarator, .declarator_init, .declarator_full => {},
+                else => continue,
             }
-            return types.any_type;
+            const t = try c.declaratorType(sym, decl, is_const);
+            if (t != types.no_type) return t;
         }
         return types.any_type;
     }
