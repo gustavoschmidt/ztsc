@@ -2048,6 +2048,16 @@ const Checker = struct {
                 }
                 if (f.interface or f.class) {
                     const fixed = try c.fixTypeArgs(sym, args, tok) orelse return types.error_type;
+                    // The global `Array<T>` / `ReadonlyArray<T>` lower to `T[]`:
+                    // tsc treats `Array<T>` and `T[]` as the *same* type, and
+                    // `ReadonlyArray<T>` as `readonly T[]` (which ztsc already
+                    // folds to `T[]` — see `.readonly_type` above; array
+                    // readonly-ness is not modeled). Keeping them structural
+                    // refs instead makes `T[]` fail to relate to them through
+                    // the interface body (ref→array has no structural bridge).
+                    if (fixed.len == 1 and (c.globalSymNamed(sym, "Array") or c.globalSymNamed(sym, "ReadonlyArray"))) {
+                        return c.ts.makeArray(fixed[0]);
+                    }
                     return c.ts.makeRef(sym, fixed);
                 }
                 return types.any_type;
@@ -5162,8 +5172,13 @@ const Checker = struct {
         const true_ty = try c.typeFromTypeNode(e.true_type);
         c.cur_infer_cond = saved;
         const false_ty = try c.typeFromTypeNode(e.false_type);
-        // Distributivity is a property of a *naked type-parameter* check.
-        const distributive = c.ts.kind(chk) == .type_param;
+        // Distributivity is a property of a *naked type-parameter* check. A
+        // naked `infer` var (e.g. `F extends (...)=>any` inside Awaited, where
+        // F is captured by an enclosing conditional) behaves the same way: once
+        // F resolves to a union like `fn | undefined | null`, the branches must
+        // reflect each member.
+        const chk_k = c.ts.kind(chk);
+        const distributive = chk_k == .type_param or chk_k == .infer_var;
         return c.reduceConditional(chk, extends_ty, true_ty, false_ty, distributive);
     }
 
@@ -5182,6 +5197,28 @@ const Checker = struct {
         c.inst_depth += 1;
         c.inst_count += 1;
         defer c.inst_depth -= 1;
+        const s = &c.ts;
+        // A naked `infer`-var check belongs to an *enclosing* conditional's
+        // inference (`F extends (...)=>any` inside Awaited, where F is captured
+        // by the outer `then(onfulfilled: infer F,...)` conditional). It is not
+        // yet bound during instantiateId of the enclosing true branch; keep it
+        // symbolic so substInfer re-enters here once F resolves. Without this,
+        // it would relate against an unbound infer var and collapse to `never`.
+        if (s.kind(chk) == .infer_var) {
+            return s.makeConditional(chk, extends_ty, true_ty, false_ty, distributive);
+        }
+        // Distribute a distributive conditional over a concrete union check
+        // member-wise (the naked check resolved, via substInfer, to a union
+        // like `fn | undefined | null`). Each member is inferred independently
+        // and the results unioned — this is what lets Awaited pick the callable
+        // `then` argument out of its `| undefined | null`.
+        if (distributive and s.kind(chk) == .union_type) {
+            var parts: std.ArrayList(TypeId) = .empty;
+            defer parts.deinit(c.scratch());
+            for (try c.memberList(chk)) |m|
+                try parts.append(c.scratch(), try c.reduceConditional(m, extends_ty, true_ty, false_ty, false));
+            return s.makeUnion(c.scratch(), parts.items);
+        }
         // Defer while a mapped key parameter is still unbound (M16b): a
         // conditional in a mapped type's `as`/value branch (`P extends K ?
         // never : P`) must stay symbolic until each key is materialized, or it
@@ -5189,10 +5226,29 @@ const Checker = struct {
         // A check/extends type whose only type variables are bound within a
         // member signature (`{ f: <T>() => T } extends ...`) is concrete for
         // resolution purposes, so the *free* type-param test gates deferral.
-        if (try c.containsFreeTypeParam(chk, &.{}) or try c.containsFreeTypeParam(extends_ty, &.{}) or
-            try c.containsMappedParam(chk) or try c.containsMappedParam(extends_ty))
-        {
-            return c.ts.makeConditional(chk, extends_ty, true_ty, false_ty, distributive);
+        const ext_generic = try c.containsFreeTypeParam(extends_ty, &.{}) or try c.containsMappedParam(extends_ty);
+        const chk_generic = try c.containsFreeTypeParam(chk, &.{}) or try c.containsMappedParam(chk);
+        if (chk_generic or ext_generic) {
+            // Narrow decidability carve-out (see objectDecidablyNotExtends): a
+            // concrete-shaped object check whose free params live only in
+            // property values has a fixed shape. When the target is decidable
+            // from that shape alone, the false branch holds for every
+            // substitution, so resolve rather than defer into a conditional
+            // that can never relate (e.g. Awaited<{ data: P }> → { data: P }).
+            if (!ext_generic and s.kind(chk) == .object and try c.objectDecidablyNotExtends(chk, extends_ty)) {
+                return false_ty;
+            }
+            // A concrete *function* check (`(value: number) => Promise<R> | R`
+            // with a free `R` only in the return) is likewise non-instantiable:
+            // its relation to a function pattern is decided by its parameter
+            // shape, and free params in the return flow into the pattern's
+            // (`… => any`) return harmlessly. Resolve it rather than deferring —
+            // this is what lets Awaited unwrap a real Promise's `then` callback
+            // without erasing the method's own `TResult` params.
+            if (!ext_generic and s.kind(chk) == .function and s.kind(try c.resolveStructural(extends_ty)) == .function) {
+                return c.resolveConcreteConditional(chk, extends_ty, true_ty, false_ty);
+            }
+            return s.makeConditional(chk, extends_ty, true_ty, false_ty, distributive);
         }
         return c.resolveConcreteConditional(chk, extends_ty, true_ty, false_ty);
     }
@@ -5201,6 +5257,16 @@ const Checker = struct {
         var ids: std.ArrayList(u32) = .empty;
         defer ids.deinit(c.scratch());
         try c.collectInferVars(extends_ty, &ids);
+        // `any` as the check type takes *both* branches (tsc): infer vars bind
+        // `any`, and the result is trueBranch | falseBranch. This is what makes
+        // `Awaited<any>` collapse to `any` instead of surviving as a deferred
+        // conditional that poisons downstream inference.
+        if (c.ts.kind(chk) == .any) {
+            const any_vals = try c.scratch().alloc(TypeId, ids.items.len);
+            for (any_vals) |*v| v.* = types.any_type;
+            const t = try c.substInfer(true_ty, ids.items, any_vals);
+            return c.makeUnion2(t, false_ty);
+        }
         const vals = try c.scratch().alloc(TypeId, ids.items.len);
         for (vals) |*v| v.* = types.no_type;
         if (ids.items.len > 0) {
@@ -5214,6 +5280,52 @@ const Checker = struct {
             return c.substInfer(true_ty, ids.items, vals);
         }
         return false_ty; // infer binders are out of scope in the false branch
+    }
+
+    /// Narrow decidability rule for a deferred conditional whose *check* is a
+    /// concrete-shaped object literal (`{ data: P }`) carrying free type params
+    /// only in property VALUES. Such a check has a fixed shape, so some
+    /// `extends` targets are decidable for every substitution of those params.
+    /// Returns true when the object *definitely does not* satisfy `extends_ty`
+    /// (the conditional then takes its false branch) — the only direction we
+    /// resolve, since a "true" match could hinge on a value type that depends
+    /// on the free params. Kept deliberately shape-only:
+    ///   * an object is never `null`/`undefined` (Awaited's outer branch);
+    ///   * an object lacking a required member NAME is not assignable to a
+    ///     structural target that requires it (Awaited's `then` branch).
+    /// Anything else stays deferred (return false).
+    fn objectDecidablyNotExtends(c: *Checker, chk_obj: TypeId, extends_ty: TypeId) Error!bool {
+        const s = &c.ts;
+        const ext = try c.resolveStructural(extends_ty);
+        switch (s.kind(ext)) {
+            .null, .undefined => return true,
+            .union_type => {
+                // Decidable only if the whole target is null/undefined-shaped.
+                for (try c.memberList(ext)) |m| {
+                    const mk = s.kind(try c.resolveStructural(m));
+                    if (mk != .null and mk != .undefined) return false;
+                }
+                return true;
+            },
+            .object, .intersection => {
+                // A missing required member name is decidable regardless of the
+                // free params — but only when no index signature could supply
+                // it. If every required name is present, the value types may
+                // depend on the params, so stay deferred.
+                if (s.objectStringIndex(chk_obj) != 0 or s.objectNumberIndex(chk_obj) != 0) return false;
+                const members: []const TypeId = if (s.kind(ext) == .intersection) try c.memberList(ext) else &.{ext};
+                for (members) |mem| {
+                    if (s.kind(mem) != .object) continue;
+                    for (0..s.objectPropCount(mem)) |i| {
+                        const p = s.objectProp(mem, @intCast(i));
+                        if (p.optional()) continue;
+                        if (s.objectPropByName(chk_obj, p.name) == null) return true; // required name absent
+                    }
+                }
+                return false;
+            },
+            else => return false,
+        }
     }
 
     fn indexOfId(ids: []const u32, id: u32) ?usize {
@@ -5340,6 +5452,14 @@ const Checker = struct {
                 try c.inferFromExtends(s.fnReturn(src), s.fnReturn(pattern), ids, vals, contra, depth + 1);
             },
             .union_type => {
+                for (try c.memberList(pattern)) |m| {
+                    if (try c.containsInfer(m)) try c.inferFromExtends(source0, m, ids, vals, contra, depth + 1);
+                }
+            },
+            // `object & { then(onfulfilled: infer F, ...): any }` (Awaited): the
+            // infer binders live in one member of the intersection; match the
+            // source against each member that carries an `infer`.
+            .intersection => {
                 for (try c.memberList(pattern)) |m| {
                     if (try c.containsInfer(m)) try c.inferFromExtends(source0, m, ids, vals, contra, depth + 1);
                 }
@@ -6494,7 +6614,11 @@ const Checker = struct {
                             return .{ .name = name, .ty = try s.makeNumberLiteral(@floatFromInt(s.tupleLen(t)), false), .flags = types.prop_flag_readonly };
                         }
                     }
-                    return .{ .name = name, .ty = types.number_type, .flags = types.prop_flag_readonly };
+                    // `Array<T>.length` is *writable* in tsc (`arr.length = 0`
+                    // is idiomatic truncation); `string.length` and a fixed
+                    // tuple's length (above) are readonly.
+                    const flags: u32 = if (s.kind(t) == .array) 0 else types.prop_flag_readonly;
+                    return .{ .name = name, .ty = types.number_type, .flags = flags };
                 }
                 return c.primitiveInterfaceProp(t, name);
             },
@@ -6651,6 +6775,16 @@ const Checker = struct {
         defer parts.deinit(c.scratch());
         for (0..n) |i| try parts.append(c.scratch(), s.tupleElem(t, @intCast(i)).ty);
         return s.makeUnion(c.scratch(), parts.items);
+    }
+
+    /// Uninferred own-type-param value for contextual signature instantiation:
+    /// declared default, else constraint, else `unknown` (tsc's order).
+    fn typeParamFallback(c: *Checker, sym: SymbolId) Error!TypeId {
+        const d = try c.typeParamDefault(sym);
+        if (d != types.no_type) return d;
+        const con = try c.typeParamConstraint(sym);
+        if (con != types.no_type) return con;
+        return types.unknown_type;
     }
 
     fn typeParamConstraint(c: *Checker, sym: SymbolId) Error!TypeId {
@@ -6858,6 +6992,56 @@ const Checker = struct {
 
     fn isComparable(c: *Checker, a: TypeId, b: TypeId) Error!bool {
         return (try c.isAssignable(a, b)) or (try c.isAssignable(b, a));
+    }
+
+    /// The `as`-cast overlap test (TS2352). tsc uses its *comparable* relation
+    /// here, which is strictly more lenient than mutual assignability: an
+    /// optional source property may satisfy a required target property
+    /// (`{ legends?: X[] }` overlaps `{ legends: X[] }`). ztsc's isComparable
+    /// (assignable either way) misses exactly that case, so after the two
+    /// assignability probes fail, retry each direction with the optional→
+    /// required leniency. Kept to the cast site only — narrowing/discriminant
+    /// uses of isComparable are unchanged.
+    fn castComparable(c: *Checker, a: TypeId, b: TypeId) Error!bool {
+        if (try c.isComparable(a, b)) return true;
+        return (try c.lenientOverlap(a, b, 0)) or (try c.lenientOverlap(b, a, 0));
+    }
+
+    /// One direction of the lenient comparable relation: does source `s0`
+    /// overlap target `t0` when optional source props may satisfy required
+    /// target props? Only the object/object and array/array shapes get the
+    /// leniency (the shapes where optionality lives); anything else defers to
+    /// the ordinary comparable check. Depth-capped at 8 — beyond that it
+    /// answers `true` (under-report, per policy: a cast that deep is not worth
+    /// a false rejection).
+    fn lenientOverlap(c: *Checker, s0: TypeId, t0: TypeId, depth: u32) Error!bool {
+        if (depth > 8) return true;
+        const s = try c.resolveStructural(s0);
+        const t = try c.resolveStructural(t0);
+        const sk = c.ts.kind(s);
+        const tk = c.ts.kind(t);
+        if (sk == .array and tk == .array) {
+            return c.lenientComparable(c.ts.arrayElem(s), c.ts.arrayElem(t), depth + 1);
+        }
+        if (sk == .object and tk == .object) {
+            for (0..c.ts.objectPropCount(t)) |i| {
+                const tp = c.ts.objectProp(t, @intCast(i));
+                const sp = c.ts.objectPropByName(s, tp.name) orelse {
+                    if (tp.optional()) continue;
+                    return false; // required target member absent from source
+                };
+                // Optional→required is the leniency; prop types need only be
+                // comparable (either direction, lenient).
+                if (!try c.lenientComparable(sp.ty, tp.ty, depth + 1)) return false;
+            }
+            return true;
+        }
+        return false; // non-object shapes: the isComparable probes already ruled
+    }
+
+    fn lenientComparable(c: *Checker, a: TypeId, b: TypeId, depth: u32) Error!bool {
+        if (try c.isComparable(a, b)) return true;
+        return (try c.lenientOverlap(a, b, depth)) or (try c.lenientOverlap(b, a, depth));
     }
 
     /// Union-distributing overlap test for TS2367/TS2678: some pair of
@@ -7793,7 +7977,7 @@ const Checker = struct {
                 const et = try c.checkExprCached(d.lhs, types.no_type);
                 const tt = try c.typeFromTypeNode(d.rhs);
                 if (tt == types.error_type) return et;
-                if (!try c.isComparable(try c.widenLiteral(et), tt)) {
+                if (!try c.castComparable(try c.widenLiteral(et), tt)) {
                     try c.diagFmt(2352, c.nodeSpan(node), "Conversion of type '{s}' to type '{s}' may be a mistake because neither type sufficiently overlaps with the other. If this was intentional, convert the expression to 'unknown' first.", .{
                         try c.typeToString(et), try c.typeToString(tt),
                     });
@@ -8511,7 +8695,29 @@ const Checker = struct {
         // types. Nested literals recurse because const_ctx stays set.
         if (c.const_ctx) return c.checkConstArrayLiteral(node);
         const rctx = if (ctx != types.no_type) try c.resolveStructural(ctx) else types.no_type;
-        const ctx_tuple = rctx != types.no_type and c.ts.kind(rctx) == .tuple;
+        // Tuple context: a direct tuple contextual type, or an inference target
+        // `T` whose constraint is tuple-like. `Promise.all([a, b])` infers into
+        // `all<T extends readonly unknown[] | []>` — the `[]` member of the
+        // constraint puts the array literal in tuple context (matching tsc), so
+        // it becomes `[typeof a, typeof b]` and the tuple overload wins.
+        var ctx_tuple_ty: TypeId = if (rctx != types.no_type and c.ts.kind(rctx) == .tuple) rctx else types.no_type;
+        if (ctx_tuple_ty == types.no_type and rctx != types.no_type and c.ts.kind(rctx) == .type_param) {
+            const con = try c.typeParamConstraint(c.ts.typeParamSymbol(rctx));
+            if (con != types.no_type) {
+                const rcon = try c.resolveStructural(con);
+                if (c.ts.kind(rcon) == .tuple) {
+                    ctx_tuple_ty = rcon;
+                } else if (c.ts.kind(rcon) == .union_type) {
+                    for (try c.memberList(rcon)) |m| {
+                        if (c.ts.kind(try c.resolveStructural(m)) == .tuple) {
+                            ctx_tuple_ty = try c.resolveStructural(m);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        const ctx_tuple = ctx_tuple_ty != types.no_type;
         const ctx_elem: TypeId = if (rctx != types.no_type and c.ts.kind(rctx) == .array)
             c.ts.arrayElem(rctx)
         else
@@ -8557,7 +8763,7 @@ const Checker = struct {
             }
             var ectx: TypeId = ctx_elem;
             if (ctx_tuple) {
-                ectx = c.tupleElemTypeAt(rctx, i) orelse types.no_type;
+                ectx = c.tupleElemTypeAt(ctx_tuple_ty, i) orelse types.no_type;
             }
             var et = try c.checkExprCached(el, ectx);
             if (!try c.keepLiteral(et, ectx)) et = try c.widenLiteral(et);
@@ -8651,6 +8857,13 @@ const Checker = struct {
         defer getter_keys.deinit(c.scratch());
         var setter_keys: std.AutoHashMapUnmanaged(Atom, void) = .empty;
         defer setter_keys.deinit(c.scratch());
+        // Value types of computed keys that widen to `string`/`number` — they
+        // become the object's index signatures (`{ [layer]: v }` → `{ [x:
+        // string]: v }`), matching tsc. Multiple such keys union their values.
+        var str_index_vals: std.ArrayList(TypeId) = .empty;
+        defer str_index_vals.deinit(c.scratch());
+        var num_index_vals: std.ArrayList(TypeId) = .empty;
+        defer num_index_vals.deinit(c.scratch());
 
         for (c.tree.nodeRange(node)) |prop| {
             if (prop == null_node) continue;
@@ -8671,8 +8884,33 @@ const Checker = struct {
                             try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = vt });
                             continue;
                         }
-                        _ = try c.checkExprCached(pd.rhs, types.no_type);
-                        continue; // computed names: no static member
+                        // Non-symbol computed key (`{ [expr]: v }`): a `string`-
+                        // or `number`-widening key contributes an index
+                        // signature; a literal key names a real property. The
+                        // value is contextually typed by the target's matching
+                        // property/index (so `value: STATUS` under a `Record<…>`
+                        // context keeps its literal instead of widening).
+                        const rk = try c.resolveStructural(kt);
+                        const key_kind = c.ts.kind(rk);
+                        const pctx: TypeId = if (rctx == types.no_type) types.no_type else switch (key_kind) {
+                            .string_literal => try c.ctxPropType(rctx, ctx, c.ts.dataA(rk)),
+                            .string, .template_literal_type, .string_mapping => if (c.ts.kind(rctx) == .object and c.ts.objectStringIndex(rctx) != 0) c.ts.objectStringIndex(rctx) else types.no_type,
+                            .number, .number_literal, .number_literal_fresh => if (c.ts.kind(rctx) == .object and c.ts.objectNumberIndex(rctx) != 0) c.ts.objectNumberIndex(rctx) else types.no_type,
+                            else => types.no_type,
+                        };
+                        var vt = try c.checkExprCached(pd.rhs, pctx);
+                        if (c.const_ctx) {
+                            vt = try c.ts.regularLiteral(vt);
+                        } else if (!try c.keepLiteral(vt, pctx)) vt = try c.widenLiteral(vt);
+                        switch (key_kind) {
+                            .string_literal => {
+                                try upsertProp(c.scratch(), &props, &prop_index, .{ .name = c.ts.dataA(rk), .ty = vt });
+                            },
+                            .string, .template_literal_type, .string_mapping => try str_index_vals.append(c.scratch(), vt),
+                            .number, .number_literal, .number_literal_fresh => try num_index_vals.append(c.scratch(), vt),
+                            else => {}, // symbol/unknown/other: no static member
+                        }
+                        continue;
                     }
                     const key = try c.memberAtom(c.tree.nodeMainToken(prop));
                     const pctx = try c.ctxPropType(rctx, ctx, key);
@@ -8750,7 +8988,9 @@ const Checker = struct {
         if (c.const_ctx) {
             for (props.items) |*p| p.flags |= types.prop_flag_readonly;
         }
-        return c.ts.makeObject(props.items, 0, 0, types.obj_flag_fresh);
+        const sidx = if (str_index_vals.items.len > 0) try c.ts.makeUnion(c.scratch(), str_index_vals.items) else 0;
+        const nidx = if (num_index_vals.items.len > 0) try c.ts.makeUnion(c.scratch(), num_index_vals.items) else 0;
+        return c.ts.makeObject(props.items, sidx, nidx, types.obj_flag_fresh);
     }
 
     /// Contextual type for property `key` of an object literal typed by
@@ -9805,7 +10045,13 @@ const Checker = struct {
             const tag = c.nodeTag(an);
             if (tag == .arrow_fn or tag == .function_expr) continue;
             const pt = c.paramTypeAt(sig, ai) orelse continue;
-            const at = try c.checkExprCached(an, types.no_type);
+            // Contextually type an array literal by the parameter so a
+            // tuple-constrained target (`T extends readonly unknown[] | []`)
+            // infers a tuple, not a widened array — the crux of picking the
+            // tuple `Promise.all` overload. Other argument shapes keep the
+            // context-free inference to avoid perturbing literal widening.
+            const arg_ctx = if (c.nodeTag(an) == .array_literal) pt else types.no_type;
+            const at = try c.checkExprCached(an, arg_ctx);
             try c.unify(pt, at, tp_syms, candidates, 0);
         }
         // Phase 2: function arguments, contextually typed by the partial
@@ -9882,6 +10128,16 @@ const Checker = struct {
     fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, candidates: []TypeId, depth: u32) Error!void {
         if (depth > 16) return;
         const s = &c.ts;
+        // An `any` source infers `any` for every inference position in the
+        // pattern (tsc's inferFromTypes). Without this, `any` slips past the
+        // structural cases (it matches nothing and everything), leaving params
+        // unbound — e.g. `then`'s `TResult1 | PromiseLike<TResult1>` against an
+        // `any` callback return would bind nothing because `any` is assignable
+        // to the union's other members.
+        if (s.kind(arg) == .any) {
+            try c.bindAnyToTypeParams(param, tp_syms, candidates, depth);
+            return;
+        }
         switch (s.kind(param)) {
             .type_param => {
                 if (tpIndex(tp_syms, s.typeParamSymbol(param))) |i| {
@@ -9927,14 +10183,27 @@ const Checker = struct {
                 // fills/threads `R1`, surfacing the promise-nesting that the
                 // awaited unwrap corrects.
                 var promise_of_tp = false;
+                // Identify the single naked type-param member first so we can
+                // tell whether a *wrapper* member (`ReadonlyArray<T>` in
+                // `T | ReadonlyArray<T>`) already infers T — in which case the
+                // naked fallback must stand down (tsc infers a naked union
+                // member last, only when no other member supplied a candidate).
                 for (try c.memberList(param)) |m| {
                     if (s.kind(m) == .type_param and tpIndex(tp_syms, s.typeParamSymbol(m)) != null) {
                         tp_member = m;
                         n_tp += 1;
-                    } else if (try c.containsTypeParam(m)) {
+                    }
+                }
+                const tp_idx: ?usize = if (tp_member != types.no_type) tpIndex(tp_syms, s.typeParamSymbol(tp_member)) else null;
+                const before: TypeId = if (tp_idx) |ix| candidates[ix] else types.no_type;
+                for (try c.memberList(param)) |m| {
+                    if (m == tp_member) continue;
+                    if (try c.containsTypeParam(m)) {
                         try c.unify(m, arg, tp_syms, candidates, depth + 1);
                     }
                 }
+                // A wrapper member contributed a candidate for the naked var.
+                const wrapper_inferred = if (tp_idx) |ix| candidates[ix] != before else false;
                 if (n_tp == 1) {
                     for (try c.memberList(param)) |m| {
                         if (m == tp_member) continue;
@@ -9952,7 +10221,11 @@ const Checker = struct {
                         } else if (!rest_ok) {
                             try c.unify(tp_member, arg, tp_syms, candidates, depth + 1);
                         }
-                    } else if (!rest_ok) {
+                    } else if (!rest_ok and !wrapper_inferred) {
+                        // Naked fallback: infer `T` from the whole arg only when
+                        // no wrapper member (`ReadonlyArray<T>`, …) already did —
+                        // otherwise `T | ReadonlyArray<T>` (flatMap) would add the
+                        // whole array `X[]` alongside the correct element `X`.
                         try c.unify(tp_member, arg, tp_syms, candidates, depth + 1);
                     }
                 }
@@ -9988,18 +10261,60 @@ const Checker = struct {
                     else => return,
                 };
                 if (s.objectNumberIndex(param) != 0) {
+                    // Array-like param (`Array<T>`/`ReadonlyArray<T>`/`ArrayLike<T>`):
+                    // the element type is fully determined by the number index.
+                    // Scraping the methods too would pull `T` from partial
+                    // shapes like `at(i): T | undefined` / `find(): T | undefined`,
+                    // polluting the inference with a spurious `| undefined`
+                    // (and, for `flatMap`'s `U | ReadonlyArray<U>`, corrupting U).
                     try c.unify(s.objectNumberIndex(param), elem, tp_syms, candidates, depth + 1);
-                }
-                for (0..s.objectPropCount(param)) |i| {
-                    const pp = s.objectProp(param, @intCast(i));
-                    if (try c.propOfType(ra, pp.name)) |ap| {
-                        try c.unify(pp.ty, ap.ty, tp_syms, candidates, depth + 1);
+                } else {
+                    // No number index (`Iterable<T>`): the element flows only
+                    // through members like `[Symbol.iterator](): Iterator<T>`,
+                    // so resolve `T` by matching those props on the arg.
+                    for (0..s.objectPropCount(param)) |i| {
+                        const pp = s.objectProp(param, @intCast(i));
+                        if (try c.propOfType(ra, pp.name)) |ap| {
+                            try c.unify(pp.ty, ap.ty, tp_syms, candidates, depth + 1);
+                        }
                     }
                 }
             },
             .function => {
-                const ra = try c.resolveStructural(arg);
+                var ra = try c.resolveStructural(arg);
                 if (s.kind(ra) != .function) return;
+                // A *generic function value* passed where a function is
+                // expected (`.then(getProjectTransform)`): first instantiate
+                // its own type params from the expected parameter types
+                // (tsc's contextual signature instantiation), so its return
+                // contributes `ProjectResponse`, not a foreign free `T`.
+                const own = s.fnTypeParams(ra);
+                if (own.len > 0) {
+                    const own_syms = try c.scratch().dupe(u32, own);
+                    const own_cands = try c.scratch().alloc(TypeId, own.len);
+                    for (own_cands) |*v| v.* = types.no_type;
+                    const np = @min(s.fnParamCount(param), s.fnParamCount(ra));
+                    for (0..np) |i| {
+                        // Reversed roles: the arg's param types are the pattern,
+                        // the expected param types the source.
+                        try c.unify(s.fnParam(ra, @intCast(i)).ty, s.fnParam(param, @intCast(i)).ty, own_syms, own_cands, depth + 1);
+                    }
+                    var map_list: std.ArrayList(TpMap) = .empty;
+                    defer map_list.deinit(c.scratch());
+                    var all_unbound = true;
+                    for (own_syms, own_cands) |sym, cand| {
+                        if (cand != types.no_type) all_unbound = false;
+                        const v = if (cand != types.no_type) cand else try c.typeParamFallback(sym);
+                        try map_list.append(c.scratch(), .{ .sym = sym, .ty = v });
+                    }
+                    // Only substitute when something was actually inferred —
+                    // an unbound-everything map would erase params to their
+                    // fallbacks and *lose* inference the caller could still do.
+                    if (!all_unbound) {
+                        ra = try c.instantiate(ra, map_list.items);
+                        if (s.kind(ra) != .function) return;
+                    }
+                }
                 const n = @min(s.fnParamCount(param), s.fnParamCount(ra));
                 for (0..n) |i| {
                     try c.unify(s.fnParam(param, @intCast(i)).ty, s.fnParam(ra, @intCast(i)).ty, tp_syms, candidates, depth + 1);
@@ -10021,6 +10336,52 @@ const Checker = struct {
         }
     }
 
+    /// Bind `any` to every in-scope type param mentioned in `pattern` (tsc:
+    /// inference from an `any` source assigns `any` to all inference
+    /// positions). Structure mirrors `containsTypeParamInner`; depth-capped
+    /// like `unify` (recursive refs terminate on the cap; re-binding is
+    /// idempotent since `any | any` folds).
+    fn bindAnyToTypeParams(c: *Checker, pattern: TypeId, tp_syms: []const u32, candidates: []TypeId, depth: u32) Error!void {
+        if (depth > 16) return;
+        const s = &c.ts;
+        switch (s.kind(pattern)) {
+            .type_param => {
+                if (tpIndex(tp_syms, s.typeParamSymbol(pattern))) |i| {
+                    candidates[i] = if (candidates[i] == types.no_type)
+                        types.any_type
+                    else
+                        try c.makeUnion2(candidates[i], types.any_type);
+                }
+            },
+            .union_type, .intersection, .overloads => {
+                for (try c.memberList(pattern)) |m| try c.bindAnyToTypeParams(m, tp_syms, candidates, depth + 1);
+            },
+            .array => try c.bindAnyToTypeParams(s.arrayElem(pattern), tp_syms, candidates, depth + 1),
+            .tuple => {
+                for (0..s.tupleLen(pattern)) |i| {
+                    try c.bindAnyToTypeParams(s.tupleElem(pattern, @intCast(i)).ty, tp_syms, candidates, depth + 1);
+                }
+            },
+            .object => {
+                for (0..s.objectPropCount(pattern)) |i| {
+                    try c.bindAnyToTypeParams(s.objectProp(pattern, @intCast(i)).ty, tp_syms, candidates, depth + 1);
+                }
+                if (s.objectStringIndex(pattern) != 0) try c.bindAnyToTypeParams(s.objectStringIndex(pattern), tp_syms, candidates, depth + 1);
+                if (s.objectNumberIndex(pattern) != 0) try c.bindAnyToTypeParams(s.objectNumberIndex(pattern), tp_syms, candidates, depth + 1);
+            },
+            .function => {
+                for (0..s.fnParamCount(pattern)) |i| {
+                    try c.bindAnyToTypeParams(s.fnParam(pattern, @intCast(i)).ty, tp_syms, candidates, depth + 1);
+                }
+                try c.bindAnyToTypeParams(s.fnReturn(pattern), tp_syms, candidates, depth + 1);
+            },
+            .ref => {
+                for (s.refArgs(pattern)) |a| try c.bindAnyToTypeParams(a, tp_syms, candidates, depth + 1);
+            },
+            else => {},
+        }
+    }
+
     /// Would every argument check against `sig`? (Silent, for overload
     /// selection.)
     fn argumentsMatch(c: *Checker, sig: TypeId, arg_nodes: []const Node) Error!bool {
@@ -10031,7 +10392,11 @@ const Checker = struct {
             if (c.nodeTag(an) == .spread_element) return true; // don't reject on spreads
             const pt = c.paramTypeAt(sig, ai) orelse return false;
             const tag = c.nodeTag(an);
-            const at = if (tag == .arrow_fn or tag == .function_expr)
+            // Array literals are contextually typed by the (already-inferred)
+            // parameter, so a tuple parameter sees a tuple — otherwise the
+            // `Promise.all` tuple overload's `values: [A, B]` would be tested
+            // against a widened `(A | B)[]` and spuriously rejected.
+            const at = if (tag == .arrow_fn or tag == .function_expr or tag == .array_literal)
                 try c.checkExprCached(an, pt)
             else
                 try c.checkExprCached(an, types.no_type);
