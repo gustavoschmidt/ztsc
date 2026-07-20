@@ -11776,7 +11776,71 @@ const Checker = struct {
                 return c.narrowByDiscriminant(t, try c.memberAtom(prop_tok), other, sense);
             }
         }
+        // Optional-chain containment: `a?.….m() === <value>` narrows the chain's
+        // *receiver* `a` to non-null (tsc's narrowTypeByOptionalChainContainment).
+        // If `a` were nullish the whole chain short-circuits to `undefined`, so
+        // when the comparison to `value` can only hold for a non-undefined (and,
+        // for `==`/`!=`, non-null) `value`, the receiver did not short-circuit.
+        if (try c.optionalChainContainsRef(lhs, key)) {
+            return c.narrowByOptChainContainment(t, rhs, strict, sense);
+        }
+        if (try c.optionalChainContainsRef(rhs, key)) {
+            return c.narrowByOptChainContainment(t, lhs, strict, sense);
+        }
         return t;
+    }
+
+    /// Walks an optional chain's receiver spine (`chain.expression` at each
+    /// link), returning true when `key` matches a receiver at some optional
+    /// link — i.e. `key`'s reference is a container of the chain's short-circuit
+    /// (tsc's `optionalChainContainsReference`). Only fires for a chain that
+    /// actually has a `?.` link; a plain `a.b.c` never matches.
+    fn optionalChainContainsRef(c: *Checker, node: Node, key: RefKey) Error!bool {
+        var n = node;
+        while (c.nodeTag(n) == .paren_expr) n = c.tree.nodeData(n).lhs;
+        while (c.isOptionalChain(n)) {
+            n = c.tree.nodeData(n).lhs; // step to this link's object/callee
+            if (try c.refMatches(n, key)) return true;
+        }
+        return false;
+    }
+
+    /// Apply tsc's `narrowTypeByOptionalChainContainment`: remove `null`/
+    /// `undefined` from the receiver `t` when the comparand `value` forces the
+    /// chain to not have short-circuited in this branch. `strict` selects the
+    /// nullable set (`===`/`!==` → `undefined` only; `==`/`!=` → `null` |
+    /// `undefined`). `sense` is the already-bang-folded truthiness (so `!==`
+    /// arrives as an inverted `===`): with the operator's equals-ness folded in,
+    /// `sense` true means "narrow when every comparand constituent is
+    /// non-nullish and not any/unknown"; `sense` false means "narrow when every
+    /// comparand constituent is nullish".
+    fn narrowByOptChainContainment(c: *Checker, t: TypeId, value: Node, strict: bool, sense: bool) Error!TypeId {
+        const vt = try c.checkExprCached(value, types.no_type);
+        if (c.optChainComparandRemovesNullable(vt, strict, sense)) return c.nonNullable(t);
+        return t;
+    }
+
+    fn optChainComparandRemovesNullable(c: *Checker, vt: TypeId, strict: bool, sense: bool) bool {
+        if (c.ts.kind(vt) == .union_type) {
+            for (c.ts.members(vt)) |m| {
+                if (!c.optChainComparandConstituentOk(m, strict, sense)) return false;
+            }
+            return true;
+        }
+        return c.optChainComparandConstituentOk(vt, strict, sense);
+    }
+
+    fn optChainComparandConstituentOk(c: *Checker, m: TypeId, strict: bool, sense: bool) bool {
+        const k = c.ts.kind(m);
+        const nullish = k == .undefined or k == .void or (!strict and k == .null);
+        if (sense) {
+            // Every constituent must be non-nullish and not any/unknown/err
+            // (their domains include undefined/null, so they can't force a
+            // non-null receiver).
+            return !nullish and k != .any and k != .unknown and k != .err;
+        }
+        // Every constituent must be nullish.
+        return nullish;
     }
 
     fn typeofTargetOf(c: *Checker, node: Node, key: RefKey) Error!bool {
