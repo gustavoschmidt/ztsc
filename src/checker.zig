@@ -4059,7 +4059,19 @@ const Checker = struct {
         while (c.ts.kind(result) == .ref and iter < shrink_reexpand_ceiling) : (iter += 1) {
             const rsym = c.ts.refSymbol(result);
             if (!c.symFlags(rsym).type_alias) break;
-            if (!c.refStrictlyShrinks(prev_ref, result)) break; // not shrinking → leave lazy
+            // Cross-alias ENTRY on the first hop: when a NON-recursive wrapper
+            // alias reduced to a bare ref of a *different*, self-recursive alias
+            // (`ExtractStoreExtensions<…> → ExtractStoreExtensionsFromEnhancerTuple
+            // <Tail, Acc>`), the `orig`/`result` symbols differ and the summed
+            // metric — comparing two unrelated aliases — need not decrease, so
+            // the argument-wise recursion would never start. Expand once to
+            // "enter" the inner alias; every subsequent hop is same-alias and
+            // must pass the strict argument-wise shrink test below. The growing-
+            // argument guards (003/010) are self-recursive (same symbol as
+            // `orig`) or reduce to a union (not a bare ref), so they never take
+            // this entry — only the strict-shrink path, which correctly stops.
+            const entry = iter == 0 and c.ts.refSymbol(prev_ref) != rsym;
+            if (!entry and !c.refStrictlyShrinks(prev_ref, result)) break; // not shrinking → leave lazy
             prev_ref = result;
             result = try c.expandRef(result);
         }
