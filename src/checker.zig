@@ -457,10 +457,15 @@ const Checker = struct {
     /// node (memo off) yields stable ids.
     infer_ids: std.AutoHashMapUnmanaged(InferKey, u32) = .empty,
     infer_next: u32 = 1,
-    /// nodeKey of the conditional type whose infer scope is currently active
-    /// (0 = none). `infer V` binders and bare references to them resolve
-    /// against this scope; it covers the extends and true branches only.
-    cur_infer_cond: u64 = 0,
+    /// Stack of conditional-type nodeKeys whose infer scopes are currently
+    /// active (innermost last). `infer V` binders resolve against the top;
+    /// bare references to a `V` search the whole stack innermost-outward so a
+    /// nested conditional inside a true branch still sees the enclosing
+    /// conditional's infer vars (e.g. react-hook-form `PathValueImpl` /
+    /// `ValidPathPrefixImpl`, where `K`/`R` from an outer `P extends
+    /// `${infer K}.${infer R}`` are used deep inside nested conditionals).
+    /// Each scope covers its conditional's extends and true branches only.
+    infer_scopes: std.ArrayListUnmanaged(u64) = .empty,
     /// Mapped-type key parameter identity (M16b): mapped-type nodeKey -> a dense
     /// id for its `K` (stable across the memo-off re-evaluations of the node).
     mapped_key_ids: std.AutoHashMapUnmanaged(u64, u32) = .empty,
@@ -1993,10 +1998,17 @@ const Checker = struct {
         }
         const a = try c.atomOfToken(tok);
         // An `infer V` binder is in scope (extends + true branches) as a bare
-        // type reference to `V`. It shadows outer names, matching tsc.
-        if (c.cur_infer_cond != 0 and args.len == 0) {
-            if (c.infer_ids.get(.{ .cond = c.cur_infer_cond, .name = a })) |id| {
-                return c.ts.makeInferVar(id, a);
+        // type reference to `V`. It shadows outer names, matching tsc. Search
+        // the active conditional scopes innermost-outward: a nested conditional
+        // in an outer conditional's true branch still resolves the outer infer
+        // vars (only scopes that actually declared `V` have an entry).
+        if (args.len == 0) {
+            var i = c.infer_scopes.items.len;
+            while (i > 0) {
+                i -= 1;
+                if (c.infer_ids.get(.{ .cond = c.infer_scopes.items[i], .name = a })) |id| {
+                    return c.ts.makeInferVar(id, a);
+                }
             }
         }
         // A mapped type's key parameter `K` is in scope in its `as`/value
@@ -5377,11 +5389,13 @@ const Checker = struct {
 
     fn inferVarFromNode(c: *Checker, node: Node) Error!TypeId {
         const name = try c.atomOfToken(c.tree.nodeData(node).lhs);
-        if (c.cur_infer_cond == 0) {
+        if (c.infer_scopes.items.len == 0) {
             try c.diagFmt(1338, c.nodeSpan(node), "'infer' declarations are only permitted in the 'extends' clause of a conditional type.", .{});
             return types.any_type;
         }
-        const id = try c.inferVarId(c.cur_infer_cond, name);
+        // An `infer V` binder belongs to the immediately-enclosing conditional
+        // (top of the scope stack) — its extends clause is where it is declared.
+        const id = try c.inferVarId(c.infer_scopes.items[c.infer_scopes.items.len - 1], name);
         return c.ts.makeInferVar(id, name);
     }
 
@@ -5391,11 +5405,14 @@ const Checker = struct {
         const chk = try c.typeFromTypeNode(d.lhs);
         // The extends + true branches share this conditional's infer scope; the
         // false branch does not (infer binders are scoped to the true branch).
-        const saved = c.cur_infer_cond;
-        c.cur_infer_cond = c.nodeKey(node);
+        // Push onto the scope stack (rather than overwrite) so a nested
+        // conditional inside the true branch still resolves this conditional's
+        // infer vars — the check clause above was already evaluated under the
+        // enclosing scopes only.
+        try c.infer_scopes.append(c.ca(), c.nodeKey(node));
         const extends_ty = try c.typeFromTypeNode(e.extends_type);
         const true_ty = try c.typeFromTypeNode(e.true_type);
-        c.cur_infer_cond = saved;
+        _ = c.infer_scopes.pop();
         const false_ty = try c.typeFromTypeNode(e.false_type);
         // Distributivity is a property of a *naked type-parameter* check. A
         // naked `infer` var (e.g. `F extends (...)=>any` inside Awaited, where
@@ -5873,7 +5890,35 @@ const Checker = struct {
                 return s.makeRef(s.refSymbol(t), args.items);
             },
             .conditional => {
-                const chk = try c.substInfer(s.condCheck(t), ids, vals);
+                // Distribution over an `infer`-var check that resolves to a
+                // union (mirrors the naked type-param path in `instantiateId`):
+                // a distributive conditional whose check *is* one of the infer
+                // vars being substituted must re-bind that var per union member
+                // so the true/false branches reflect each member — not the whole
+                // union. Substituting the branches with the whole union first
+                // (the general path below) bakes `Draft<V>` into
+                // `Draft<Error | null>` before it can distribute, which is what
+                // broke immer's `WritableNonArrayDraft` value type
+                // (`T[K] extends infer V ? V extends object ? Draft<V> : V
+                // : never`): the inner `V extends object` is a distributive
+                // infer-var check.
+                const check0 = s.condCheck(t);
+                if (s.condDistributive(t) and s.kind(check0) == .infer_var) {
+                    if (indexOfId(ids, s.inferVarId(check0))) |vi| {
+                        const cv = vals[vi];
+                        if (s.kind(cv) == .union_type) {
+                            var parts: std.ArrayList(TypeId) = .empty;
+                            defer parts.deinit(c.scratch());
+                            const vals2 = try c.scratch().dupe(TypeId, vals);
+                            for (try c.memberList(cv)) |m| {
+                                vals2[vi] = m;
+                                try parts.append(c.scratch(), try c.substInfer(t, ids, vals2));
+                            }
+                            return s.makeUnion(c.scratch(), parts.items);
+                        }
+                    }
+                }
+                const chk = try c.substInfer(check0, ids, vals);
                 const ext = try c.substInfer(s.condExtends(t), ids, vals);
                 const tru = try c.substInfer(s.condTrue(t), ids, vals);
                 const fls = try c.substInfer(s.condFalse(t), ids, vals);
