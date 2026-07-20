@@ -8582,8 +8582,8 @@ const Checker = struct {
             .object_literal => return c.checkObjectLiteral(node, ctx),
             .member_expr, .optional_member_expr => return c.checkMemberExpr(node),
             .index_expr, .optional_index_expr => return c.checkIndexExpr(node),
-            .call_expr, .call_expr_targs, .optional_call => return c.checkCallExpr(node, false),
-            .new_expr, .new_expr_targs, .new_expr_bare => return c.checkCallExpr(node, true),
+            .call_expr, .call_expr_targs, .optional_call => return c.checkCallExpr(node, false, ctx),
+            .new_expr, .new_expr_targs, .new_expr_bare => return c.checkCallExpr(node, true, ctx),
             .binary => return c.checkBinary(node, ctx),
             .assign => return c.checkAssignExpr(node),
             .cond_expr => {
@@ -8772,7 +8772,7 @@ const Checker = struct {
         // Bind explicit type arguments (`<Select<string> …>`) into the signature
         // so the props type is concrete. Mirrors the explicit-targ path of a
         // generic call; a count mismatch reports TS2558 there.
-        if (explicit_targs.len > 0) sig = try c.instantiateSigForCall(sig, explicit_targs, &.{}, node);
+        if (explicit_targs.len > 0) sig = try c.instantiateSigForCall(sig, explicit_targs, &.{}, node, types.no_type);
         if (c.ts.fnParamCount(sig) == 0) return types.empty_object_type;
         return c.ts.fnParam(sig, 0).ty;
     }
@@ -9677,7 +9677,7 @@ const Checker = struct {
         return switch (c.nodeTag(node)) {
             .member_expr, .optional_member_expr => c.memberChainInner(node, chained),
             .index_expr, .optional_index_expr => c.indexChainInner(node, chained),
-            .call_expr, .call_expr_targs, .optional_call => c.checkCallExprInner(node, false, chained),
+            .call_expr, .call_expr_targs, .optional_call => c.checkCallExprInner(node, false, chained, types.no_type),
             else => c.checkExprCached(node, types.no_type),
         };
     }
@@ -10391,9 +10391,9 @@ const Checker = struct {
         }
     }
 
-    fn checkCallExpr(c: *Checker, node: Node, is_new: bool) Error!TypeId {
+    fn checkCallExpr(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Error!TypeId {
         var chained = false;
-        const result = try c.checkCallExprInner(node, is_new, &chained);
+        const result = try c.checkCallExprInner(node, is_new, &chained, ctx);
         if (chained) return c.makeUnion2(result, types.undefined_type);
         return result;
     }
@@ -10402,7 +10402,7 @@ const Checker = struct {
     /// return type WITHOUT the chain's short-circuit `undefined`; sets
     /// `chained.*` when this `?.()` — or an earlier link in the callee spine —
     /// short-circuits on a nullish callee.
-    fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, chained: *bool) Error!TypeId {
+    fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, chained: *bool, ctx: TypeId) Error!TypeId {
         const shape = c.callShape(node);
         var callee_t = if (c.isOptionalChain(shape.callee))
             try c.chainObjType(shape.callee, chained)
@@ -10470,7 +10470,7 @@ const Checker = struct {
                     // Infer class type args from ctor arguments.
                     const ctor = if (ctor_sigs.items.len > 0) ctor_sigs.items[0] else types.no_type;
                     if (ctor != types.no_type) {
-                        try c.inferTypeArgs(ctor, tp_syms, shape.arg_nodes, inst_args);
+                        try c.inferTypeArgs(ctor, tp_syms, shape.arg_nodes, inst_args, types.no_type);
                     } else {
                         for (inst_args) |*x| x.* = types.any_type;
                     }
@@ -10545,7 +10545,7 @@ const Checker = struct {
             }
         }
 
-        const result = try c.resolveSignatureCall(node, sigs.items, targs.items, shape.arg_nodes, instance_ret);
+        const result = try c.resolveSignatureCall(node, sigs.items, targs.items, shape.arg_nodes, instance_ret, if (is_new) types.no_type else ctx);
         return result;
     }
 
@@ -10593,11 +10593,12 @@ const Checker = struct {
         explicit_targs: []const TypeId,
         arg_nodes: []const Node,
         instance_ret: TypeId,
+        ret_ctx: TypeId,
     ) Error!TypeId {
         if (sigs.len == 0) return types.any_type;
         const nargs = countArgs(arg_nodes);
         if (sigs.len == 1) {
-            const inst = try c.instantiateSigForCall(sigs[0], explicit_targs, arg_nodes, node);
+            const inst = try c.instantiateSigForCall(sigs[0], explicit_targs, arg_nodes, node, ret_ctx);
             if (instance_ret == types.no_type) try c.checkThisArg(node, inst);
             try c.checkCallArguments(node, inst, arg_nodes, true);
             return if (instance_ret != types.no_type) instance_ret else c.ts.fnReturn(inst);
@@ -10609,7 +10610,7 @@ const Checker = struct {
             // non-generic `new (): Map<any, any>` when `new Map<K, V>()` names
             // two type args, so the generic overload is chosen instead.
             if (explicit_targs.len > 0 and !c.sigTargArityOk(sig, explicit_targs.len)) continue;
-            const inst = try c.instantiateSigForCall(sig, explicit_targs, arg_nodes, node);
+            const inst = try c.instantiateSigForCall(sig, explicit_targs, arg_nodes, node, ret_ctx);
             if (nargs < try c.requiredParams(inst) or nargs > c.paramTotal(inst)) continue;
             if (try c.argumentsMatch(inst, arg_nodes)) {
                 try c.checkCallArguments(node, inst, arg_nodes, true);
@@ -10618,7 +10619,7 @@ const Checker = struct {
         }
         try c.diagFmt(2769, c.nodeSpan(c.callShape(node).callee), "No overload matches this call.", .{});
         // Continue with the first signature for downstream typing.
-        const inst = try c.instantiateSigForCall(sigs[0], explicit_targs, arg_nodes, node);
+        const inst = try c.instantiateSigForCall(sigs[0], explicit_targs, arg_nodes, node, ret_ctx);
         for (arg_nodes) |an| {
             if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
         }
@@ -10628,7 +10629,7 @@ const Checker = struct {
     /// Instantiate a (possibly generic) signature for a call: explicit
     /// type args win; otherwise unify parameters against arguments
     /// (two-phase: plain args first, then context-sensitive function args).
-    fn instantiateSigForCall(c: *Checker, sig: TypeId, explicit_targs: []const TypeId, arg_nodes: []const Node, node: Node) Error!TypeId {
+    fn instantiateSigForCall(c: *Checker, sig: TypeId, explicit_targs: []const TypeId, arg_nodes: []const Node, node: Node, ret_ctx: TypeId) Error!TypeId {
         c.infer_fell_back = false;
         const tps = try c.scratch().dupe(u32, c.ts.fnTypeParams(sig));
         if (tps.len == 0) return sig;
@@ -10658,7 +10659,7 @@ const Checker = struct {
                 }
             }
         } else {
-            try c.inferTypeArgs(sig, tps, arg_nodes, args_buf);
+            try c.inferTypeArgs(sig, tps, arg_nodes, args_buf, ret_ctx);
         }
         var map = try c.scratch().alloc(TpMap, tps.len);
         for (tps, 0..) |tp, i| map[i] = .{ .sym = tp, .ty = args_buf[i] };
@@ -10674,6 +10675,7 @@ const Checker = struct {
         tp_syms: []const u32,
         arg_nodes: []const Node,
         out: []TypeId,
+        ret_ctx: TypeId,
     ) Error!void {
         const candidates = try c.scratch().alloc(TypeId, tp_syms.len);
         for (candidates) |*x| x.* = types.no_type;
@@ -10711,6 +10713,48 @@ const Checker = struct {
             const pt_partial = try c.instantiate(pt0, partial);
             const at = try c.checkExprCached(an, pt_partial);
             try c.unify(pt0, at, tp_syms, candidates, 0);
+        }
+        // Phase 3: contextual return-type inference (tsc's
+        // `InferencePriority.ReturnType`). When the call sits in a typed
+        // context, infer still-unbound type params from the signature's return
+        // type matched against that contextual type. Argument inference always
+        // wins — this only *fills* params that no argument constrained — so
+        // `union(featureCollection(xs))` recovers `featureCollection`'s `G`
+        // from the expected `FeatureCollection<Polygon | MultiPolygon>` instead
+        // of falling back to `G`'s constraint (the whole `Geometry` union).
+        if (ret_ctx != types.no_type) {
+            var any_empty = false;
+            for (candidates) |cand| {
+                if (cand == types.no_type) any_empty = true;
+            }
+            const rctx = if (any_empty) try c.resolveStructural(ret_ctx) else types.no_type;
+            const rk = c.ts.kind(rctx);
+            if (any_empty and rk != .any and rk != .unknown and rk != .err and c.ts.kind(sig) == .function) {
+                const ret = c.ts.fnReturn(sig);
+                const rc = try c.scratch().alloc(TypeId, tp_syms.len);
+                for (rc) |*x| x.* = types.no_type;
+                try c.unify(ret, rctx, tp_syms, rc, 0);
+                for (candidates, 0..) |*cand, i| {
+                    if (cand.* != types.no_type or rc[i] == types.no_type) continue;
+                    // The final resolution loop only clamps a candidate to its
+                    // constraint when that constraint is *retrievable and
+                    // concrete*; otherwise it trusts the candidate outright. A
+                    // low-priority contextual guess must not exploit that trust to
+                    // override a param's default. Skip when the constraint is a
+                    // bare outer type param, or is unretrievable while the param
+                    // has a default — the higher-order `<AD extends TBase = TBase>`
+                    // (redux `useDispatch`) shape, whose minted param keeps only
+                    // the substituted default. `featureCollection`'s `G` keeps a
+                    // concrete `Geometry` constraint, so it is still filled.
+                    const con = try c.typeParamConstraint(tp_syms[i]);
+                    const bare_outer_con = con != types.no_type and
+                        c.ts.kind(con) == .type_param and
+                        tpIndex(tp_syms, c.ts.typeParamSymbol(con)) == null;
+                    const undefendable_default = con == types.no_type and c.typeParamHasDefault(tp_syms[i]);
+                    if (bare_outer_con or undefendable_default) continue;
+                    cand.* = rc[i];
+                }
+            }
         }
         // A provisional map over the raw candidates, so an inter-dependent
         // constraint (`K extends keyof T`, M16d) is checked with the *other*
