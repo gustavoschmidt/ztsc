@@ -6053,10 +6053,32 @@ const Checker = struct {
             .function => {
                 const src = try c.resolveStructural(source0);
                 if (s.kind(src) != .function) return;
+                // A generic *source* signature must be reduced to its base
+                // signature before we infer *through* it: each of the source's
+                // own type params is erased to its constraint (or `unknown`
+                // when unconstrained), matching tsc's `getBaseSignature`.
+                // Otherwise those bound params leak into the infer results, e.g.
+                // `(<T>(x: T) => T) extends (x: infer A) => infer B` must yield
+                // `unknown, unknown` (not `T, T`), and `<T extends string>`
+                // yields `string, string`. Defaults are ignored (only the
+                // constraint erases). This only touches the source's *own*
+                // params; outer/free params still flow through untouched.
+                var base_map: std.ArrayList(TpMap) = .empty;
+                defer base_map.deinit(c.scratch());
+                for (s.fnTypeParams(src)) |p| {
+                    const con = try c.typeParamConstraint(p);
+                    const bt = if (con != types.no_type) con else types.unknown_type;
+                    try base_map.append(c.scratch(), .{ .sym = p, .ty = bt });
+                }
                 const n = @min(s.fnParamCount(src), s.fnParamCount(pattern));
-                for (0..n) |i|
-                    try c.inferFromExtends(s.fnParam(src, @intCast(i)).ty, s.fnParam(pattern, @intCast(i)).ty, ids, vals, !contra, depth + 1);
-                try c.inferFromExtends(s.fnReturn(src), s.fnReturn(pattern), ids, vals, contra, depth + 1);
+                for (0..n) |i| {
+                    var sp = s.fnParam(src, @intCast(i)).ty;
+                    if (base_map.items.len != 0) sp = try c.instantiate(sp, base_map.items);
+                    try c.inferFromExtends(sp, s.fnParam(pattern, @intCast(i)).ty, ids, vals, !contra, depth + 1);
+                }
+                var sr = s.fnReturn(src);
+                if (base_map.items.len != 0) sr = try c.instantiate(sr, base_map.items);
+                try c.inferFromExtends(sr, s.fnReturn(pattern), ids, vals, contra, depth + 1);
             },
             .union_type => {
                 for (try c.memberList(pattern)) |m| {
