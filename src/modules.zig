@@ -1422,15 +1422,15 @@ pub fn anyModuleSourceFor(path: []const u8) ?[]const u8 {
 pub fn isNodeBuiltin(spec: []const u8) bool {
     if (std.mem.startsWith(u8, spec, "node:")) return true;
     const builtins = [_][]const u8{
-        "assert",       "async_hooks",   "buffer",     "child_process", "cluster",
-        "console",      "constants",     "crypto",     "dgram",         "dns",
-        "domain",       "events",        "fs",         "http",          "http2",
-        "https",        "inspector",     "module",     "net",           "os",
-        "path",         "perf_hooks",    "process",    "punycode",      "querystring",
-        "readline",     "repl",          "stream",     "string_decoder","timers",
-        "tls",          "tty",           "url",        "util",          "v8",
-        "vm",           "worker_threads","zlib",       "fs/promises",   "dns/promises",
-        "stream/promises","timers/promises","util/types",
+        "assert",          "async_hooks",     "buffer",     "child_process",  "cluster",
+        "console",         "constants",       "crypto",     "dgram",          "dns",
+        "domain",          "events",          "fs",         "http",           "http2",
+        "https",           "inspector",       "module",     "net",            "os",
+        "path",            "perf_hooks",      "process",    "punycode",       "querystring",
+        "readline",        "repl",            "stream",     "string_decoder", "timers",
+        "tls",             "tty",             "url",        "util",           "v8",
+        "vm",              "worker_threads",  "zlib",       "fs/promises",    "dns/promises",
+        "stream/promises", "timers/promises", "util/types",
     };
     for (builtins) |b| if (std.mem.eql(u8, spec, b)) return true;
     return false;
