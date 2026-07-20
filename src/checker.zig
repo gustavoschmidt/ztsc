@@ -6131,12 +6131,63 @@ const Checker = struct {
                     if (try c.containsInfer(m)) try c.inferFromExtends(source0, m, ids, vals, contra, depth + 1);
                 }
             },
-            // `object & { then(onfulfilled: infer F, ...): any }` (Awaited): the
-            // infer binders live in one member of the intersection; match the
-            // source against each member that carries an `infer`.
+            // Intersection pattern (`object & { then(onfulfilled: infer F, …) }`
+            // for Awaited; `NextExt & infer Ext` for a redux StoreEnhancer).
+            // tsc's rule: first cancel constituents that are *identical* between
+            // source and pattern, then infer the residual source into the
+            // pattern's infer-bearing constituents. A pattern constituent that is
+            // a *foreign type variable* (a signature-local / free type param, not
+            // one of our infer ids) with no identical match in the source
+            // POISONS the inference — tsc attributes no candidate to the infer
+            // var, which then resolves to its constraint. This is what makes
+            // `StoreEnhancer<{dispatch}> extends StoreEnhancer<infer E>` yield
+            // `{}` (E's constraint) instead of dragging the whole
+            // function-return intersection (incl. `Store<unknown, …>`) into E,
+            // while an ordinary `string & infer X` still residuals to X.
             .intersection => {
+                const isrc = try c.resolveStructural(source0);
+                const src_members: []const TypeId = if (s.kind(isrc) == .intersection)
+                    try c.memberList(isrc)
+                else
+                    &.{isrc};
+                const matched = try c.scratch().alloc(bool, src_members.len);
+                for (matched) |*mm| mm.* = false;
                 for (try c.memberList(pattern)) |m| {
-                    if (try c.containsInfer(m)) try c.inferFromExtends(source0, m, ids, vals, contra, depth + 1);
+                    if (try c.containsInfer(m)) continue;
+                    var found = false;
+                    for (src_members, 0..) |sm, i| {
+                        if (!matched[i] and sm == m) {
+                            matched[i] = true;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (found) continue;
+                    // Unmatched foreign type variable → poison the whole
+                    // intersection: leave its infer vars unbound.
+                    if (s.kind(m) == .type_param or s.kind(try c.resolveStructural(m)) == .type_param) return;
+                }
+                // Residual source: the un-cancelled constituents. When nothing
+                // cancelled, reuse `source0` verbatim (preserves the Awaited path
+                // and its display exactly); otherwise rebuild from the residue.
+                var n_matched: usize = 0;
+                for (matched) |mm| {
+                    if (mm) n_matched += 1;
+                }
+                var residual_src = source0;
+                if (n_matched != 0) {
+                    var residue: std.ArrayList(TypeId) = .empty;
+                    defer residue.deinit(c.scratch());
+                    for (src_members, 0..) |sm, i| {
+                        if (!matched[i]) try residue.append(c.scratch(), sm);
+                    }
+                    residual_src = if (residue.items.len == 0)
+                        types.unknown_type
+                    else
+                        try c.ts.makeIntersection(c.scratch(), residue.items);
+                }
+                for (try c.memberList(pattern)) |m| {
+                    if (try c.containsInfer(m)) try c.inferFromExtends(residual_src, m, ids, vals, contra, depth + 1);
                 }
             },
             // `S extends `${infer H}-${infer R}`` — pattern-match the concrete
