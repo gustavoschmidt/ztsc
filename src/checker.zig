@@ -303,6 +303,10 @@ const NodeType = struct { ty: TypeId, ctx: TypeId };
 /// One in-progress `interfaceGeneric` resolution (M17.2 base-cycle detection).
 const IfaceFrame = struct { sym: SymbolId, resolving_base: bool = false };
 
+/// Bounds of a fresh higher-order type-param symbol (see `fresh_tp_ids`). The
+/// constraint/default are already `M`-instantiated TypeIds (`no_type` = none).
+const FreshTp = struct { name: Atom, constraint: TypeId, default: TypeId, has_default: bool };
+
 const Checker = struct {
     out: Allocator,
     io: Io,
@@ -430,6 +434,21 @@ const Checker = struct {
     /// `SymbolId -> declared constraint TypeId` (`no_type` = unconstrained).
     /// Avoids re-resolving the constraint AST on every assignability check.
     tp_constraint_cache: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
+    /// Higher-order type-param rewrite (M20a). When an object's generic call/
+    /// construct signature (`interface H<T>{ <U extends C<T> = D<T>>(…):… }`) is
+    /// instantiated under a map `M`, an own param `U` whose constraint/default
+    /// mentions `T` gets a *fresh* symbol whose constraint/default are the
+    /// `M`-substituted `C[T:=…]`/`D[T:=…]`. The AST readers can't express that
+    /// (the AST holds the un-substituted `C<T>`), so the fresh symbol's bounds
+    /// live here and `typeParamConstraint`/`typeParamDefault`/`…HasDefault`/
+    /// `symNameAtom` consult it first. Ids are `>= fresh_tp_base` (above the real
+    /// + merged symbol space) and are minted deterministically, keyed by
+    /// `(orig_param_sym, canonical_map_id)`, so the same instantiation reuses the
+    /// same fresh symbol (inst-cache coherent; `--no-inst-cache` agrees).
+    fresh_tp_ids: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    fresh_tp_info: std.ArrayListUnmanaged(FreshTp) = .empty,
+    fresh_tp_base: u32 = 0,
+    fresh_tp_next: u32 = 0,
     /// `(file << 32 | type-node) -> TypeId`. A type annotation resolves names
     /// against its (lexically fixed) enclosing scope and any enclosing
     /// interface's `this` type — both a deterministic function of the node's
@@ -629,6 +648,10 @@ const Checker = struct {
         // is the kernel's documented MAP_ANON zero-fill (not an allocator
         // accident). Freed in `deinit`.
         const total_syms = prog.symbolSpace();
+        // Fresh higher-order type-param symbols are minted above the whole real
+        // + merged symbol space so they never index the per-symbol arrays.
+        c.fresh_tp_base = total_syms;
+        c.fresh_tp_next = total_syms;
         c.sym_types = try ZeroPagedArray(TypeId).alloc(total_syms);
         errdefer c.sym_types.free();
         c.sym_state = try ZeroPagedArray(SymState).alloc(total_syms);
@@ -852,6 +875,7 @@ const Checker = struct {
     }
 
     fn symNameAtom(c: *const Checker, sym: SymbolId) Atom {
+        if (c.isFreshTp(sym)) return c.freshTp(sym).name;
         if (c.prog.isMergedId(sym)) return c.prog.mergedSym(sym).name;
         const f = c.symFile(sym);
         return c.prog.files[f].bind.symbol_names[sym - c.prog.sym_base[f]];
@@ -1788,6 +1812,7 @@ const Checker = struct {
     }
 
     fn symbolName(c: *Checker, sym: u32) []const u8 {
+        if (c.isFreshTp(sym)) return c.atomText(c.freshTp(sym).name);
         if (sym == 0 or sym >= c.prog.symbolSpace()) return "?";
         return c.atomText(c.symNameAtom(sym));
     }
@@ -4799,6 +4824,116 @@ const Checker = struct {
     const TpMap = struct { sym: SymbolId, ty: TypeId };
     const InferKey = struct { cond: u64, name: Atom };
 
+    /// Whether a higher-order signature is safe to instantiate-and-keep (M20a).
+    /// The rewrite substitutes the sig body and mints fresh symbols for own
+    /// params whose bounds move under the map. It is sound only when every own
+    /// param's constraint/default is *bare* (a plain type param) or absent: then
+    /// the fresh param needs no constraint enforcement (a bare bound was never
+    /// enforceable anyway — the `bare_outer` escape in `inferTypeArgs`) and its
+    /// default is a simple substitution. A sig with a *structured* bound (RHF's
+    /// `<TName extends FieldPath<TFieldValues>>`, whose `Path`/`PathValue` deep
+    /// conditional+template types ztsc can't fully reduce) is NOT eligible: it
+    /// is dropped exactly as before this rewrite, so those call sites keep their
+    /// pristine behavior (no churn) instead of trading one unreducible-type
+    /// diagnostic for another.
+    fn higherOrderSigEligible(c: *Checker, sig: TypeId) Error!bool {
+        for (c.ts.fnTypeParams(sig)) |p| {
+            const con = try c.typeParamConstraint(p);
+            if (con != types.no_type and c.ts.kind(con) != .type_param and !try c.boundReducible(con, 0)) return false;
+            const def = try c.typeParamDefault(p);
+            if (def != types.no_type and c.ts.kind(def) != .type_param and !try c.boundReducible(def, 0)) return false;
+        }
+        return true;
+    }
+
+    /// Whether an own-param *bound* (constraint/default) reduces once its
+    /// enclosing generic is substituted — the gate for whether a higher-order
+    /// sig is safe to rewrite (M20a). A *bare* bound is handled elsewhere; this
+    /// judges structured bounds. A plain conditional (`DBTypes extends DBSchema
+    /// ? … : …`, idb) or `keyof T` reduces once its check type is concrete and
+    /// is eligible. A bound whose evaluation needs recursive peeling ztsc can't
+    /// perform — a template-literal pattern (`${infer K}.${infer R}`, RHF
+    /// `Path`) or an `infer`-bearing conditional (redux
+    /// `ExtractStoreExtensionsFromEnhancerTuple`) — is not. Alias refs are
+    /// expanded (depth-capped; the cap trips to *not reducible*, the safe side,
+    /// so a deep recursive alias like `Path` is excluded).
+    fn boundReducible(c: *Checker, t: TypeId, depth: u32) Error!bool {
+        if (depth > 6) return false;
+        const s = &c.ts;
+        switch (s.kind(t)) {
+            .template_literal_type, .string_mapping, .infer_var, .mapped => return false,
+            .conditional => {
+                // An `infer` in the extends clause means the bound is peeled
+                // structurally (recursive tuple/string walks ztsc can't do).
+                if (try c.containsInfer(s.condExtends(t))) return false;
+                return (try c.boundReducible(s.condCheck(t), depth + 1)) and
+                    (try c.boundReducible(s.condExtends(t), depth + 1)) and
+                    (try c.boundReducible(s.condTrue(t), depth + 1)) and
+                    (try c.boundReducible(s.condFalse(t), depth + 1));
+            },
+            .array => return c.boundReducible(s.arrayElem(t), depth + 1),
+            .tuple => {
+                for (0..s.tupleLen(t)) |i| {
+                    if (!try c.boundReducible(s.tupleElem(t, @intCast(i)).ty, depth + 1)) return false;
+                }
+                return true;
+            },
+            .union_type, .intersection, .overloads => {
+                for (try c.memberList(t)) |m| {
+                    if (!try c.boundReducible(m, depth + 1)) return false;
+                }
+                return true;
+            },
+            .keyof_op => return c.boundReducible(s.keyofOperand(t), depth + 1),
+            .index_access => return (try c.boundReducible(s.indexAccessObj(t), depth + 1)) and
+                (try c.boundReducible(s.indexAccessIndex(t), depth + 1)),
+            .ref => {
+                // Expand a type-alias ref to inspect its body (`FieldPath<T>` →
+                // `Path<T>` → the template/infer core). Interface/class refs are
+                // structural objects — reducible, no expansion needed. Also check
+                // the ref's own type arguments.
+                const sym = s.refSymbol(t);
+                for (s.refArgs(t)) |a| {
+                    if (!try c.boundReducible(a, depth + 1)) return false;
+                }
+                if (c.symFlags(sym).type_alias) {
+                    return c.boundReducible(try c.aliasGeneric(sym), depth + 1);
+                }
+                return true;
+            },
+            else => return true,
+        }
+    }
+
+    /// Whether an object call/construct signature `sig` references a type param
+    /// bound *outside* itself — structurally (excluding its own `<...>`), or
+    /// through one of its own params' constraint/default (`<U extends C<T>>`,
+    /// where `T` is the enclosing generic's param). Such a signature must be
+    /// (re-)instantiated with the enclosing generic; one that mentions only its
+    /// own params is self-contained. `bound` is the enclosing type-param scope.
+    /// A higher-order sig that is not `higherOrderSigEligible` is treated as
+    /// self-contained (returns false) so instantiation skips it — the pristine,
+    /// pre-rewrite behavior.
+    fn sigReferencesOuterParam(c: *Checker, sig: TypeId, bound: []const u32) Error!bool {
+        const own = c.ts.fnTypeParams(sig);
+        if (own.len != 0 and !try c.higherOrderSigEligible(sig)) return false;
+        if (try c.containsFreeTypeParam(sig, bound)) return true;
+        if (own.len == 0) return false;
+        // Inside the sig, both the enclosing scope and the sig's own params are
+        // bound; a constraint/default reaching anything else is an outer ref.
+        var scope: std.ArrayList(u32) = .empty;
+        defer scope.deinit(c.scratch());
+        try scope.appendSlice(c.scratch(), bound);
+        try scope.appendSlice(c.scratch(), own);
+        for (own) |p| {
+            const con = try c.typeParamConstraint(p);
+            if (con != types.no_type and try c.containsFreeTypeParam(con, scope.items)) return true;
+            const def = try c.typeParamDefault(p);
+            if (def != types.no_type and try c.containsFreeTypeParam(def, scope.items)) return true;
+        }
+        return false;
+    }
+
     fn containsTypeParam(c: *Checker, t: TypeId) Error!bool {
         if (c.ctp_cache.get(t)) |v| {
             if (v != 0) return v == 2;
@@ -4832,22 +4967,19 @@ const Checker = struct {
                 }
                 if (s.objectStringIndex(t) != 0 and try c.containsTypeParam(s.objectStringIndex(t))) return true;
                 if (s.objectNumberIndex(t) != 0 and try c.containsTypeParam(s.objectNumberIndex(t))) return true;
-                // A param-free call/construct signature may reference a type
-                // param that appears nowhere else (a callable interface whose
-                // only generic use is its call sig, e.g.
-                // `interface B<T,Y> { (...a:Y):T }`); without this the object is
-                // judged concrete and instantiation skips it, leaving the sig
-                // unsubstituted. Only param-free sigs are counted — matching the
-                // set `instantiateId` actually rewrites; higher-order sigs (own
-                // `<...>`) are left as-is there, so triggering instantiation for
-                // them here would gain nothing and perturb the redux hooks.
+                // A call/construct signature may reference a type param that
+                // appears nowhere else (a callable interface whose only generic
+                // use is its signature, e.g. `interface B<T,Y> { (...a:Y):T }`);
+                // without this the object is judged concrete and instantiation
+                // skips it, leaving the sig unsubstituted. A *higher-order* sig
+                // (`<U extends C<T>>(…)`) counts too when it reaches the outer
+                // `T` through its own param's constraint/default — the M20a
+                // rewrite substitutes those, so instantiation must be triggered.
                 for (0..s.objectCallSigCount(t)) |i| {
-                    const sig = s.objectCallSig(t, @intCast(i));
-                    if (s.fnTypeParams(sig).len == 0 and try c.containsTypeParam(sig)) return true;
+                    if (try c.sigReferencesOuterParam(s.objectCallSig(t, @intCast(i)), &.{})) return true;
                 }
                 for (0..s.objectConstructSigCount(t)) |i| {
-                    const sig = s.objectConstructSig(t, @intCast(i));
-                    if (s.fnTypeParams(sig).len == 0 and try c.containsTypeParam(sig)) return true;
+                    if (try c.sigReferencesOuterParam(s.objectConstructSig(t, @intCast(i)), &.{})) return true;
                 }
                 return false;
             },
@@ -5048,6 +5180,39 @@ const Checker = struct {
         return gop.value_ptr.*;
     }
 
+    /// True for a fresh higher-order type-param symbol (`fresh_tp_ids`).
+    inline fn isFreshTp(c: *const Checker, sym: SymbolId) bool {
+        return c.fresh_tp_base != 0 and sym >= c.fresh_tp_base;
+    }
+
+    /// Bounds record for a fresh higher-order type-param symbol.
+    fn freshTp(c: *const Checker, sym: SymbolId) *const FreshTp {
+        return &c.fresh_tp_info.items[sym - c.fresh_tp_base];
+    }
+
+    /// Mint (or reuse) a fresh symbol for own type-param `orig` when a
+    /// signature is instantiated under `map` (canonical id `map_id`, computed
+    /// on demand when memoization is off). The fresh symbol carries the
+    /// already-`map`-substituted `constraint`/`default`. Deterministic and
+    /// memoized per `(orig, canonical map)`, so a repeat instantiation reuses
+    /// the same id (interning coherence).
+    fn mintFreshTp(c: *Checker, orig: SymbolId, map: []const TpMap, map_id: ?u32, constraint: TypeId, default: TypeId, has_default: bool) Error!u32 {
+        const mid: u32 = map_id orelse try c.canonMapId(map);
+        const key = (@as(u64, orig) << 32) | mid;
+        const gop = try c.fresh_tp_ids.getOrPut(c.ca(), key);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = c.fresh_tp_next;
+            c.fresh_tp_next += 1;
+            try c.fresh_tp_info.append(c.ca(), .{
+                .name = c.symNameAtom(orig),
+                .constraint = constraint,
+                .default = default,
+                .has_default = has_default,
+            });
+        }
+        return gop.value_ptr.*;
+    }
+
     /// Substitute the type parameters in `map` throughout `t`. Public entry:
     /// canonicalizes the map (when caching is on) and dispatches to the
     /// memoized recursive walk.
@@ -5132,52 +5297,99 @@ const Checker = struct {
                 // (the prior `makeObject` path) made an instantiated callable
                 // interface non-callable, so `Mock<any, any, any>` was not
                 // assignable to any concrete function type.
-                // A signature that declares its *own* type params whose
-                // constraints/defaults reference the interface's params (e.g.
-                // react-redux's `<AD extends DispatchType = DispatchType>(): AD`)
-                // needs those constraints/defaults substituted too — a
-                // higher-order rewrite ztsc doesn't do (documented
-                // simplification). Substituting only its param/return types
-                // strands the default and the call mis-resolves. Such
-                // higher-order signatures were dropped outright before this
-                // change (the old `makeObject` path); keep dropping them so the
-                // redux/react-redux hooks behave exactly as before. Only
-                // param-free signatures — the jest `Mock` call sig
-                // `(this: C, ...args: Y): T`, this whole bucket's target — are
-                // instantiated and preserved.
+                // A *higher-order* signature that declares its own type params
+                // whose constraints/defaults reference the interface's params
+                // (react-redux's `<AD extends DispatchType = DispatchType>(): AD`,
+                // TypedUseSelectorHook's `<S>(sel:(st:TState)=>S):S`) is
+                // instantiated the same way; the `.function` arm mints fresh
+                // symbols for the own params, carrying the substituted
+                // constraints/defaults (M20a), so the call site resolves them
+                // correctly instead of stranding the interface param.
                 var call_sigs: std.ArrayList(TypeId) = .empty;
                 defer call_sigs.deinit(c.scratch());
                 var construct_sigs: std.ArrayList(TypeId) = .empty;
                 defer construct_sigs.deinit(c.scratch());
                 for (0..s.objectCallSigCount(t)) |i| {
                     const sig = s.objectCallSig(t, @intCast(i));
-                    if (s.fnTypeParams(sig).len != 0) continue; // higher-order: drop (prior behavior)
+                    // A non-eligible higher-order sig (RHF-style deep bound) is
+                    // dropped — the pristine behavior — so its call sites are
+                    // unchanged; eligible ones and param-free ones instantiate.
+                    if (s.fnTypeParams(sig).len != 0 and !try c.higherOrderSigEligible(sig)) continue;
                     try call_sigs.append(c.scratch(), try c.instantiateId(sig, map, map_id));
                 }
                 for (0..s.objectConstructSigCount(t)) |i| {
                     const sig = s.objectConstructSig(t, @intCast(i));
-                    if (s.fnTypeParams(sig).len != 0) continue; // higher-order: drop (prior behavior)
+                    if (s.fnTypeParams(sig).len != 0 and !try c.higherOrderSigEligible(sig)) continue;
                     try construct_sigs.append(c.scratch(), try c.instantiateId(sig, map, map_id));
                 }
                 break :blk try s.makeObjectSigs(props.items, sidx, nidx, s.objectFlags(t), call_sigs.items, construct_sigs.items);
             },
             .function => blk: {
-                var params: std.ArrayList(types.Param) = .empty;
-                defer params.deinit(c.scratch());
-                // Inner type params shadowing the map are not filtered
-                // (documented simplification; the subset has no
-                // higher-order inference).
-                for (0..s.fnParamCount(t)) |i| {
-                    const p = s.fnParam(t, @intCast(i));
-                    try params.append(c.scratch(), .{ .name = p.name, .ty = try c.instantiateId(p.ty, map, map_id), .flags = p.flags });
-                }
-                const ret = try c.instantiateId(s.fnReturn(t), map, map_id);
                 const tps = s.fnTypeParams(t);
+                // Higher-order rewrite (M20a): an own type param whose
+                // constraint/default is changed by `map` (`<U extends C<T>>`
+                // under `T:=…`) gets a *fresh* symbol carrying the substituted
+                // bounds, and its references in the body are rewritten to it.
+                // Params unaffected by `map` keep their original symbol (the
+                // AST-derived constraint/default path — zero behavior change).
                 var kept: std.ArrayList(u32) = .empty;
                 defer kept.deinit(c.scratch());
+                var fresh_map: std.ArrayList(TpMap) = .empty;
+                defer fresh_map.deinit(c.scratch());
+                // Mint fresh params only for an eligible sig (all own bounds
+                // bare/absent); otherwise keep the original params + AST bounds
+                // (the pre-rewrite behavior for standalone generic functions).
+                const eligible = tps.len != 0 and map.len > 0 and try c.higherOrderSigEligible(t);
                 for (tps) |tp| {
-                    if (tpLookup(map, tp) == null) try kept.append(c.scratch(), tp);
+                    if (tpLookup(map, tp) != null) continue; // substituted away
+                    var fresh: ?u32 = null;
+                    if (eligible) {
+                        const od = try c.typeParamDefault(tp);
+                        const oc = try c.typeParamConstraint(tp);
+                        const nd = if (od != types.no_type) try c.instantiate(od, map) else od;
+                        const nc = if (oc != types.no_type) try c.instantiate(oc, map) else oc;
+                        // Fresh param carries the substituted *default* (so a
+                        // no-arg `<AD = DispatchType>()` resolves to the supplied
+                        // dispatch). Its *constraint* is enforced only when it
+                        // was a structured, reducible bound (idb `StoreName
+                        // extends StoreNames<DBTypes>` → a concrete store-name
+                        // union that makes `"requests"` assignable). A *bare*
+                        // bound (`filter<S extends T>`) carries no constraint:
+                        // it was never enforceable pre-rewrite (`bare_outer`),
+                        // and enforcing its substituted form would erase a
+                        // legitimate inference. Mint only when a bound moved.
+                        const fc = if (oc != types.no_type and c.ts.kind(oc) != .type_param) nc else types.no_type;
+                        if (nc != oc or nd != od) {
+                            fresh = try c.mintFreshTp(tp, map, map_id, fc, nd, od != types.no_type);
+                        }
+                    }
+                    if (fresh) |fid| {
+                        try kept.append(c.scratch(), fid);
+                        try fresh_map.append(c.scratch(), .{ .sym = tp, .ty = try s.makeTypeParam(fid) });
+                    } else {
+                        try kept.append(c.scratch(), tp);
+                    }
                 }
+                // Body substitution map: the incoming map plus the fresh-param
+                // rewrites. Identical to `map` when no own param was affected,
+                // so non-higher-order sigs keep their exact prior behavior.
+                var sub_map = map;
+                var sub_id = map_id;
+                if (fresh_map.items.len > 0) {
+                    var em: std.ArrayList(TpMap) = .empty;
+                    defer em.deinit(c.scratch());
+                    try em.appendSlice(c.scratch(), map);
+                    try em.appendSlice(c.scratch(), fresh_map.items);
+                    sub_map = try c.scratch().dupe(TpMap, em.items);
+                    sub_id = if (c.inst_cache_on) try c.canonMapId(sub_map) else null;
+                }
+                var params: std.ArrayList(types.Param) = .empty;
+                defer params.deinit(c.scratch());
+                for (0..s.fnParamCount(t)) |i| {
+                    const p = s.fnParam(t, @intCast(i));
+                    try params.append(c.scratch(), .{ .name = p.name, .ty = try c.instantiateId(p.ty, sub_map, sub_id), .flags = p.flags });
+                }
+                const ret = try c.instantiateId(s.fnReturn(t), sub_map, sub_id);
                 // Preserve the type predicate (`x is S`) through instantiation,
                 // substituting its guarded type (`S` → arg). Dropping it (the
                 // prior behavior) erased the guard on real-lib overloads like
@@ -5189,11 +5401,11 @@ const Checker = struct {
                     break :blk_p types.Predicate{
                         .param = pr.param,
                         .asserts = pr.asserts,
-                        .ty = if (pr.ty != types.no_type) try c.instantiateId(pr.ty, map, map_id) else pr.ty,
+                        .ty = if (pr.ty != types.no_type) try c.instantiateId(pr.ty, sub_map, sub_id) else pr.ty,
                     };
                 } else null;
                 const this_ty = s.fnThisType(t);
-                break :blk try s.makeFunctionThis(params.items, ret, kept.items, s.fnFlags(t), pred, if (this_ty != 0) try c.instantiateId(this_ty, map, map_id) else 0);
+                break :blk try s.makeFunctionThis(params.items, ret, kept.items, s.fnFlags(t), pred, if (this_ty != 0) try c.instantiateId(this_ty, sub_map, sub_id) else 0);
             },
             .ref => blk: {
                 var args: std.ArrayList(TypeId) = .empty;
@@ -7058,6 +7270,7 @@ const Checker = struct {
     }
 
     fn typeParamConstraint(c: *Checker, sym: SymbolId) Error!TypeId {
+        if (c.isFreshTp(sym)) return c.freshTp(sym).constraint;
         if (c.inst_cache_on) {
             if (c.tp_constraint_cache.get(sym)) |t| return t;
         }
@@ -7086,6 +7299,7 @@ const Checker = struct {
     /// caller wanting `B = A` to see the supplied `A` must instantiate the
     /// result under the mapping resolved so far.
     fn typeParamDefault(c: *Checker, sym: SymbolId) Error!TypeId {
+        if (c.isFreshTp(sym)) return c.freshTp(sym).default;
         const saved = c.enterSymFile(sym);
         defer c.restoreCtx(saved);
         for (c.declsOf(sym)) |decl| {
@@ -7100,6 +7314,7 @@ const Checker = struct {
 
     /// Whether a type parameter declares a default (`<T = D>`).
     fn typeParamHasDefault(c: *Checker, sym: SymbolId) bool {
+        if (c.isFreshTp(sym)) return c.freshTp(sym).has_default;
         const saved = c.enterSymFile(sym);
         defer c.restoreCtx(saved);
         for (c.declsOf(sym)) |decl| {
