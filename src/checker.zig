@@ -8116,7 +8116,7 @@ const Checker = struct {
         // Erase generics to their constraints (documented simplification).
         const se = try c.eraseTypeParams(s);
         const te = try c.eraseTypeParams(t);
-        if (c.requiredParams(se) > c.paramTotal(te)) return false;
+        if (try c.requiredParams(se) > c.paramTotal(te)) return false;
         const s_count = c.ts.fnParamCount(se);
         const t_count = c.ts.fnParamCount(te);
         const pairs = @min(c.paramTotal(se), @max(s_count, t_count));
@@ -8209,14 +8209,38 @@ const Checker = struct {
         return count;
     }
 
-    fn requiredParams(c: *Checker, sig: TypeId) u32 {
+    fn requiredParams(c: *Checker, sig: TypeId) Error!u32 {
         var n: u32 = 0;
         for (0..c.ts.fnParamCount(sig)) |i| {
             const p = c.ts.fnParam(sig, @intCast(i));
             if (p.optional() or p.rest()) break;
             n += 1;
         }
+        // tsc's `getMinArgumentCount` walks back from the last required
+        // parameter and drops any trailing parameter whose type accepts
+        // `void` — the `(x: void) => T` idiom (e.g. redux-toolkit's
+        // `ActionCreatorWithoutPayload`, `(noArgument: void) => …`) is thus
+        // callable with zero arguments and assignable to `() => T`.
+        while (n > 0) {
+            if (!try c.paramAcceptsVoid(c.ts.fnParam(sig, n - 1).ty)) break;
+            n -= 1;
+        }
         return n;
+    }
+
+    /// A parameter type "accepts void" (tsc's `acceptsVoid` via `everyType`)
+    /// when it is `void`, or a union whose every member accepts void.
+    fn paramAcceptsVoid(c: *Checker, ty: TypeId) Error!bool {
+        if (ty == types.void_type) return true;
+        const r = try c.resolveStructural(ty);
+        if (r == types.void_type) return true;
+        if (c.ts.kind(r) == .union_type) {
+            const ms = try c.memberList(r);
+            if (ms.len == 0) return false;
+            for (ms) |m| if (!try c.paramAcceptsVoid(m)) return false;
+            return true;
+        }
+        return false;
     }
 
     // =====================================================================
@@ -8342,7 +8366,7 @@ const Checker = struct {
     }
 
     fn callbackParamsCompatible(c: *Checker, s: TypeId, t: TypeId) Error!bool {
-        if (c.requiredParams(s) > c.paramTotal(t)) return false;
+        if (try c.requiredParams(s) > c.paramTotal(t)) return false;
         const pairs = @min(c.paramTotal(s), @max(c.ts.fnParamCount(s), c.ts.fnParamCount(t)));
         var i: u32 = 0;
         while (i < pairs) : (i += 1) {
@@ -10586,7 +10610,7 @@ const Checker = struct {
             // two type args, so the generic overload is chosen instead.
             if (explicit_targs.len > 0 and !c.sigTargArityOk(sig, explicit_targs.len)) continue;
             const inst = try c.instantiateSigForCall(sig, explicit_targs, arg_nodes, node);
-            if (nargs < c.requiredParams(inst) or nargs > c.paramTotal(inst)) continue;
+            if (nargs < try c.requiredParams(inst) or nargs > c.paramTotal(inst)) continue;
             if (try c.argumentsMatch(inst, arg_nodes)) {
                 try c.checkCallArguments(node, inst, arg_nodes, true);
                 return if (instance_ret != types.no_type) instance_ret else c.ts.fnReturn(inst);
@@ -11272,7 +11296,7 @@ const Checker = struct {
 
     fn checkCallArguments(c: *Checker, node: Node, sig: TypeId, arg_nodes: []const Node, report: bool) Error!void {
         const nargs = countArgs(arg_nodes);
-        const required = c.requiredParams(sig);
+        const required = try c.requiredParams(sig);
         const total = c.paramTotal(sig);
         var has_spread = false;
         for (arg_nodes) |an| {
@@ -13332,7 +13356,7 @@ const Checker = struct {
         if (c.ts.fnTypeParams(sig).len > 0) return true;
         // The runtime invokes a decorator with 2 arguments; a signature that
         // *requires* more can never resolve (tsc: "expects N").
-        if (c.requiredParams(sig) > 2) return false;
+        if (try c.requiredParams(sig) > 2) return false;
         // Value argument vs the first parameter.
         if (c.paramTypeAt(sig, 0)) |p0| {
             if (!try c.decoAcceptsValue(pos, value, p0)) return false;
