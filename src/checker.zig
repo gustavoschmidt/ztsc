@@ -3914,7 +3914,14 @@ const Checker = struct {
         if (tps.items.len == 0) return generic;
         var map = try c.scratch().alloc(TpMap, tps.items.len);
         for (tps.items, 0..) |tp, i| map[i] = .{ .sym = tp.sym, .ty = fixed[i] };
-        return c.instantiate(generic, map);
+        const result = try c.instantiate(generic, map);
+        // Same recursive shrinking-argument reduction as `expandRef` — applied
+        // here so a materialized annotation (`type A = Tail<"a.b.c">`) reduces
+        // all the way to `"c"` rather than stalling at the one-step `Tail<"b.c">`
+        // ref, keeping the displayed type and the declared type in step with the
+        // structural reduction the relation check performs.
+        const orig = try c.ts.makeRef(sym, fixed);
+        return c.reexpandShrinking(orig, result);
     }
 
     fn aliasGeneric(c: *Checker, sym: SymbolId) Error!TypeId {
@@ -3991,9 +3998,90 @@ const Checker = struct {
             defer map_list.deinit(c.scratch());
             try c.buildInstMap(sym, args, &map_list);
             result = try c.instantiate(generic, map_list.items);
+            // Recursive-reduction of a shrinking alias (see `reexpandShrinking`):
+            // `Tail<"a.b.c">` instantiates its conditional body to the bare ref
+            // `Tail<"b.c">`; eagerly re-expand while the argument metric strictly
+            // decreases so it fully reduces to `"c"`. A growing recursion
+            // (`Grow<{deeper:T}>`) never re-expands — its metric increases.
+            if (f.type_alias) result = try c.reexpandShrinking(ref, result);
         }
         try c.expansions.put(c.ca(), ref, result);
         return result;
+    }
+
+    /// Ceiling on eager recursive re-expansion of a shrinking alias — a
+    /// belt-and-braces bound on top of the strict-decrease rule (which already
+    /// guarantees termination, since the metric is a non-negative integer that
+    /// strictly decreases each hop). Hitting it stops expanding and keeps the
+    /// lazy ref — exactly the pre-fix behavior.
+    const shrink_reexpand_ceiling: u32 = 100;
+
+    /// Eagerly reduce a recursive alias reference whose argument demonstrably
+    /// SHRINKS on each hop. `result0` is what `Alias<args>` (identified by
+    /// `orig_ref`) instantiated to. When that is a bare `.ref` back to a type
+    /// alias with a STRICTLY SMALLER structural argument metric, re-expand it —
+    /// this is what carries `Tail<"a.b.c">` → `Tail<"b.c">` → `Tail<"c">` → `"c"`
+    /// and tuple peels like `[H, ...infer R]` all the way down.
+    ///
+    /// The strict-decrease test is precisely what keeps the unbounded `Grow<T> =
+    /// … Grow<{deeper:T}>` case (conformance instantiation/003 + the Grow-like
+    /// negative control) from ever eagerly expanding: its argument GROWS, so the
+    /// metric rises and we stop, leaving the lazy ref (the relation cap /
+    /// deliberate under-report handles it, unchanged). Mutual recursion (A→B→A)
+    /// re-expands whenever a hop strictly shrinks and is otherwise conservatively
+    /// left lazy (a non-decreasing hop stops the loop).
+    fn reexpandShrinking(c: *Checker, orig_ref: TypeId, result0: TypeId) Error!TypeId {
+        var result = result0;
+        if (c.ts.kind(result) != .ref) return result;
+        var prev = c.shrinkMetric(orig_ref, 0);
+        var iter: u32 = 0;
+        while (c.ts.kind(result) == .ref and iter < shrink_reexpand_ceiling) : (iter += 1) {
+            const rsym = c.ts.refSymbol(result);
+            if (!c.symFlags(rsym).type_alias) break;
+            const m = c.shrinkMetric(result, 0);
+            if (m >= prev) break; // not strictly shrinking → leave lazy (pre-fix behavior)
+            prev = m;
+            result = try c.expandRef(result);
+        }
+        return result;
+    }
+
+    /// A conservative structural size metric used only to decide whether a
+    /// recursive alias argument is shrinking. It must (a) DECREASE for the
+    /// canonical peels — string-literal length for template peels, tuple arity
+    /// for tuple peels — and (b) INCREASE for `Grow`-style wrapping. String and
+    /// number literals contribute their text length; tuples/objects/refs charge
+    /// per element so arity is visible; everything else is a small constant.
+    /// Bounded by a depth cap so a pathological argument can't blow the stack.
+    fn shrinkMetric(c: *Checker, t: TypeId, depth: u32) u64 {
+        if (depth > 40) return 1;
+        const s = &c.ts;
+        return switch (s.kind(t)) {
+            .string_literal, .bigint_literal => 1 + @as(u64, @intCast(c.atomText(s.literalAtom(t)).len)),
+            .number_literal, .number_literal_fresh => 3,
+            .tuple => blk: {
+                var sum: u64 = 1;
+                for (0..s.tupleLen(t)) |i| sum += 1 + c.shrinkMetric(s.tupleElem(t, @intCast(i)).ty, depth + 1);
+                break :blk sum;
+            },
+            .array => 2 + c.shrinkMetric(s.arrayElem(t), depth + 1),
+            .union_type, .intersection, .overloads => blk: {
+                var sum: u64 = 1;
+                for (s.members(t)) |m| sum += 1 + c.shrinkMetric(m, depth + 1);
+                break :blk sum;
+            },
+            .object => blk: {
+                var sum: u64 = 1;
+                for (0..s.objectPropCount(t)) |i| sum += 2 + c.shrinkMetric(s.objectProp(t, @intCast(i)).ty, depth + 1);
+                break :blk sum;
+            },
+            .ref => blk: {
+                var sum: u64 = 1;
+                for (s.refArgs(t)) |a| sum += c.shrinkMetric(a, depth + 1);
+                break :blk sum;
+            },
+            else => 1,
+        };
     }
 
     /// A re-entry into `interfaceGeneric(sym)` closed a reference loop. If the
@@ -5855,10 +5943,54 @@ const Checker = struct {
             },
             .tuple => {
                 const src = try c.resolveStructural(source0);
-                if (s.kind(src) == .tuple) {
-                    const n = @min(s.tupleLen(src), s.tupleLen(pattern));
+                if (s.kind(src) != .tuple) return;
+                const plen = s.tupleLen(pattern);
+                const slen = s.tupleLen(src);
+                // Locate the (at most one, per the TS grammar) rest element in
+                // the pattern. `[infer H, ...infer R]` must bind R to the rest
+                // *tuple* — not to the first rest element (the pre-fix bug):
+                // positional `@min` matching aliased `...infer R` onto src[k].
+                var rest_idx: ?u32 = null;
+                for (0..plen) |i| {
+                    if (s.tupleElem(pattern, @intCast(i)).rest()) {
+                        rest_idx = @intCast(i);
+                        break;
+                    }
+                }
+                if (rest_idx == null) {
+                    const n = @min(slen, plen);
                     for (0..n) |i|
                         try c.inferFromExtends(s.tupleElem(src, @intCast(i)).ty, s.tupleElem(pattern, @intCast(i)).ty, ids, vals, contra, depth + 1);
+                    return;
+                }
+                const ri = rest_idx.?;
+                const suffix = plen - ri - 1; // fixed pattern elements after the rest
+                if (slen < ri + suffix) return; // source too short: no valid match
+                // Prefix: pattern[0..ri] positionally against src[0..ri].
+                for (0..ri) |i|
+                    try c.inferFromExtends(s.tupleElem(src, @intCast(i)).ty, s.tupleElem(pattern, @intCast(i)).ty, ids, vals, contra, depth + 1);
+                // Suffix: pattern[ri+1..] positionally against the src tail.
+                for (0..suffix) |j|
+                    try c.inferFromExtends(s.tupleElem(src, @intCast(slen - suffix + j)).ty, s.tupleElem(pattern, @intCast(ri + 1 + j)).ty, ids, vals, contra, depth + 1);
+                // Rest: pattern[ri] captures the middle src[ri..slen-suffix] as a
+                // tuple. `...infer R` stores the infer var directly as the
+                // element type → bind R to that middle tuple; `...(infer U)[]`
+                // binds U from each middle element; anything else recurses
+                // structurally against the reconstructed middle tuple.
+                const rest_pat = s.tupleElem(pattern, ri).ty;
+                var mid: std.ArrayList(types.TupleElem) = .empty;
+                defer mid.deinit(c.scratch());
+                var k: u32 = ri;
+                while (k < slen - suffix) : (k += 1) {
+                    const e = s.tupleElem(src, k);
+                    try mid.append(c.scratch(), .{ .ty = e.ty, .flags = e.flags });
+                }
+                const mid_tuple = try s.makeTuple(mid.items);
+                if (s.kind(rest_pat) == .array) {
+                    for (mid.items) |me|
+                        try c.inferFromExtends(me.ty, s.arrayElem(rest_pat), ids, vals, contra, depth + 1);
+                } else {
+                    try c.inferFromExtends(mid_tuple, rest_pat, ids, vals, contra, depth + 1);
                 }
             },
             .ref => {
