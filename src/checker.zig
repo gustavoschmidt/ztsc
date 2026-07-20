@@ -4054,17 +4054,51 @@ const Checker = struct {
     fn reexpandShrinking(c: *Checker, orig_ref: TypeId, result0: TypeId) Error!TypeId {
         var result = result0;
         if (c.ts.kind(result) != .ref) return result;
-        var prev = c.shrinkMetric(orig_ref, 0);
+        var prev_ref = orig_ref;
         var iter: u32 = 0;
         while (c.ts.kind(result) == .ref and iter < shrink_reexpand_ceiling) : (iter += 1) {
             const rsym = c.ts.refSymbol(result);
             if (!c.symFlags(rsym).type_alias) break;
-            const m = c.shrinkMetric(result, 0);
-            if (m >= prev) break; // not strictly shrinking → leave lazy (pre-fix behavior)
-            prev = m;
+            if (!c.refStrictlyShrinks(prev_ref, result)) break; // not shrinking → leave lazy
+            prev_ref = result;
             result = try c.expandRef(result);
         }
         return result;
+    }
+
+    /// Decide whether the hop `prev_ref → cur_ref` strictly shrinks, i.e. the
+    /// recursion is making progress toward a base case and may be eagerly driven.
+    ///
+    /// For a SELF-recursive hop (both refs name the same alias), the decision is
+    /// ARGUMENT-WISE: the hop shrinks iff at least one positional argument's
+    /// structural metric strictly decreases. This is what carries an accumulator
+    /// alias `Rec<Tup, Acc> = Tup extends [infer H, ...infer T] ? Rec<T, Acc &
+    /// F<H>> : Acc` down: the tuple argument strictly shrinks each hop even
+    /// though the growing accumulator would keep a *summed* metric flat or rising
+    /// (the RTK `ExtractStoreExtensionsFromEnhancerTuple` + `Acc` and RHF
+    /// `PathInternal<V, Tr|V>` shapes). The shrinking argument is a non-negative
+    /// integer bounded below, so a single always-decreasing argument terminates;
+    /// `shrink_reexpand_ceiling` backstops any pathological alternation. The
+    /// growing-argument guards (conformance 003/010) stay safe: their sole
+    /// argument GROWS, so no argument decreases and the hop is not driven.
+    ///
+    /// For a CROSS-alias hop (mutual recursion A→B), no positional correspondence
+    /// holds, so fall back to the conservative SUMMED strict-decrease test.
+    fn refStrictlyShrinks(c: *Checker, prev_ref: TypeId, cur_ref: TypeId) bool {
+        const s = &c.ts;
+        if (s.kind(prev_ref) != .ref or s.kind(cur_ref) != .ref)
+            return c.shrinkMetric(cur_ref, 0) < c.shrinkMetric(prev_ref, 0);
+        if (s.refSymbol(prev_ref) == s.refSymbol(cur_ref)) {
+            const pargs = s.refArgs(prev_ref);
+            const cargs = s.refArgs(cur_ref);
+            if (pargs.len == cargs.len and pargs.len > 0) {
+                for (pargs, cargs) |p, q| {
+                    if (c.shrinkMetric(q, 0) < c.shrinkMetric(p, 0)) return true;
+                }
+                return false;
+            }
+        }
+        return c.shrinkMetric(cur_ref, 0) < c.shrinkMetric(prev_ref, 0);
     }
 
     /// A conservative structural size metric used only to decide whether a
@@ -6207,6 +6241,21 @@ const Checker = struct {
             },
             .string_mapping => c.containsInfer(s.stringMappingArg(t)),
             .keyof_op => c.containsInfer(s.keyofOperand(t)),
+            // A deferred mapped type / indexed access may carry an `infer` var in
+            // its key source or value; `substInfer` descends into both (their
+            // `.mapped` / `.index_access` arms), so this predicate must see them.
+            .mapped => blk: {
+                if (try c.containsInfer(s.mappedConstraint(t))) break :blk true;
+                if (try c.containsInfer(s.mappedValue(t))) break :blk true;
+                if (s.mappedAs(t) != 0 and try c.containsInfer(s.mappedAs(t))) break :blk true;
+                if (s.mappedSource(t) != 0 and try c.containsInfer(s.mappedSource(t))) break :blk true;
+                break :blk false;
+            },
+            .index_access => blk: {
+                if (try c.containsInfer(s.indexAccessObj(t))) break :blk true;
+                if (try c.containsInfer(s.indexAccessIndex(t))) break :blk true;
+                break :blk false;
+            },
             else => false,
         };
     }
@@ -6324,6 +6373,18 @@ const Checker = struct {
             },
             .string_mapping => return c.applyStringMapping(s.stringMappingKind(t), try c.substInfer(s.stringMappingArg(t), ids, vals)),
             .keyof_op => return c.keyofType(try c.substInfer(s.keyofOperand(t), ids, vals)),
+            // Re-enter `reduceMapped` with the branches' `infer` vars bound: a
+            // mapped alias deferred while its key source was still an `infer` var
+            // (see `reduceMapped`) now materializes its key set. Without this arm
+            // the map falls through unchanged and stays `{}`.
+            .mapped => {
+                const kp = s.mappedKeyParam(t); // key param identity is stable
+                const con = try c.substInfer(s.mappedConstraint(t), ids, vals);
+                const val = try c.substInfer(s.mappedValue(t), ids, vals);
+                const as_c = if (s.mappedAs(t) != 0) try c.substInfer(s.mappedAs(t), ids, vals) else 0;
+                const src = if (s.mappedSource(t) != 0) try c.substInfer(s.mappedSource(t), ids, vals) else 0;
+                return c.reduceMapped(kp, con, val, as_c, src, s.mappedFlags(t));
+            },
             else => return t,
         }
     }
@@ -6398,10 +6459,16 @@ const Checker = struct {
         // `src`'s only type variables are locally bound (e.g. a namespace with a
         // generic-signature member) — so the *free* type-param test is used, not
         // the plain one, else the map is stranded deferred and its members lost.
-        const key_generic = if (homomorphic)
-            try c.containsFreeTypeParam(src_type, &.{})
-        else
-            try c.containsFreeTypeParam(constraint, &.{});
+        // The key source is `keyof src` (homomorphic) or the constraint. It is
+        // generic — and the map must stay deferred — while it mentions a free
+        // type param OR an as-yet-unbound `infer` var. The `infer`-var case
+        // arises when a mapped alias is applied to an infer var of an enclosing
+        // conditional (`Rec<…> = … ? Acc & F<Head> : Acc`, F a mapped alias):
+        // the body is built with `Head` still symbolic, so materializing now
+        // would iterate an empty key set and freeze the map to `{}`. Deferring
+        // lets `substInfer` (its `.mapped` arm) re-enter here once `Head` binds.
+        const key_src = if (homomorphic) src_type else constraint;
+        const key_generic = try c.containsFreeTypeParam(key_src, &.{}) or try c.containsInfer(key_src);
         if (key_generic) {
             return c.ts.makeMapped(key_param, constraint, value, as_clause, src_type, flags);
         }
