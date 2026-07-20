@@ -10858,12 +10858,38 @@ const Checker = struct {
                         } else if (!rest_ok) {
                             try c.unify(tp_member, arg, tp_syms, candidates, depth + 1);
                         }
-                    } else if (!rest_ok and !wrapper_inferred) {
-                        // Naked fallback: infer `T` from the whole arg only when
-                        // no wrapper member (`ReadonlyArray<T>`, …) already did —
-                        // otherwise `T | ReadonlyArray<T>` (flatMap) would add the
-                        // whole array `X[]` alongside the correct element `X`.
-                        try c.unify(tp_member, arg, tp_syms, candidates, depth + 1);
+                    } else if (!wrapper_inferred) {
+                        // Naked fallback: infer `T` from the arg. When the param's
+                        // OTHER members are concrete (`T | undefined`) and the arg
+                        // is a union sharing some of them, infer `T` from the
+                        // REMAINDER (`X | undefined` → `T = X`), matching tsc's
+                        // union inference (identical members pair off, `T` takes
+                        // the rest). Without this, a reducer parameter
+                        // `state: S[K] | undefined` would pollute the inferred
+                        // element with a spurious `| undefined`. Falls back to the
+                        // whole arg when nothing subtracts (and infers nothing
+                        // when the whole arg is already covered — `rest_ok`), so
+                        // the `T | ReadonlyArray<T>` (flatMap) path is unchanged.
+                        var rem: std.ArrayList(TypeId) = .empty;
+                        defer rem.deinit(c.scratch());
+                        const arg_members: []const TypeId = if (s.kind(arg) == .union_type) try c.memberList(arg) else &.{arg};
+                        for (arg_members) |am| {
+                            var matched = false;
+                            for (try c.memberList(param)) |m| {
+                                if (m == tp_member) continue;
+                                if (try c.containsTypeParam(m)) continue;
+                                if (try c.isAssignable(am, m)) {
+                                    matched = true;
+                                    break;
+                                }
+                            }
+                            if (!matched) try rem.append(c.scratch(), am);
+                        }
+                        if (rem.items.len > 0 and rem.items.len < arg_members.len) {
+                            try c.unify(tp_member, try s.makeUnion(c.scratch(), rem.items), tp_syms, candidates, depth + 1);
+                        } else if (!rest_ok) {
+                            try c.unify(tp_member, arg, tp_syms, candidates, depth + 1);
+                        }
                     }
                 }
             },
@@ -10919,6 +10945,20 @@ const Checker = struct {
             },
             .function => {
                 var ra = try c.resolveStructural(arg);
+                // A callable intersection (`Reducer<S> & { … }` — RTK's
+                // `ReducerWithInitialState`): infer against its function
+                // constituent. Without this a reducer passed as a slice value
+                // would infer nothing (the reverse-mapped element stalls at
+                // `unknown`).
+                if (s.kind(ra) == .intersection) {
+                    for (try c.memberList(ra)) |m| {
+                        const rm = try c.resolveStructural(m);
+                        if (s.kind(rm) == .function) {
+                            ra = rm;
+                            break;
+                        }
+                    }
+                }
                 if (s.kind(ra) != .function) return;
                 // A *generic function value* passed where a function is
                 // expected (`.then(getProjectTransform)`): first instantiate
@@ -10979,7 +11019,185 @@ const Checker = struct {
                 }
                 try c.unify(try c.resolveStructural(param), ra, tp_syms, candidates, depth + 1);
             },
+            .conditional => {
+                // A generic conditional target (`ReducersMapObject<S> = keyof P
+                // extends keyof S ? { [K in keyof S]: … } : never`) carries its
+                // inference positions in the branches. tsc's `inferFromTypes`
+                // recurses into both; the `: never` false branch contributes
+                // nothing, while the true branch reaches the reverse-mapped
+                // inference below. This is how `configureStore({ reducer: {…} })`
+                // recovers `S` from the object-literal reducer map.
+                try c.unify(s.condTrue(param), arg, tp_syms, candidates, depth + 1);
+                try c.unify(s.condFalse(param), arg, tp_syms, candidates, depth + 1);
+            },
+            .mapped => try c.inferReverseMapped(param, arg, tp_syms, candidates, depth),
             else => {},
+        }
+    }
+
+    /// Reverse-mapped-type inference (tsc's `inferReverseMappedType`): infer the
+    /// source `S` of a HOMOMORPHIC mapped target `{ [K in keyof S]: F<S[K]> }`
+    /// from an object-literal argument. For each source property `k`, infer the
+    /// element `S[k]` by matching the argument's `k`-typed property against the
+    /// value template with `S[K]` replaced by a fresh element variable, then
+    /// reassemble `S` as `{ k: inferred, … }`. Deliberately conservative — bails
+    /// (leaving prior behavior) on any non-vanilla shape (`as`-clause rename,
+    /// non-`keyof` constraint, a source that isn't a bare inference-target type
+    /// param, a non-object argument) so it can only ADD inferences where the
+    /// param would otherwise stay unbound.
+    fn inferReverseMapped(c: *Checker, m: TypeId, arg: TypeId, tp_syms: []const u32, candidates: []TypeId, depth: u32) Error!void {
+        const s = &c.ts;
+        if (!s.mappedHomomorphic(m)) return; // only `[K in keyof S]`
+        if (s.mappedAs(m) != 0) return; // no key remap
+        const src = s.mappedSource(m);
+        if (s.kind(src) != .type_param) return; // source must be a bare param
+        const src_sym = s.typeParamSymbol(src);
+        const idx = tpIndex(tp_syms, src_sym) orelse return; // …that we're inferring
+        const ra = try c.resolveStructural(arg);
+        if (s.kind(ra) != .object) return;
+        const key_param = s.mappedKeyParam(m);
+        const key_id = s.mappedParamId(key_param);
+        const value = s.mappedValue(m);
+        // Element inference variable standing in for `S[K]` throughout the value
+        // template. A single fresh var suffices — the template is the same for
+        // every key, only the matched argument property differs.
+        const fp_sym = try c.mintReverseElemVar(s.mappedParamName(key_param));
+        const fp_ty = try s.makeTypeParam(fp_sym);
+        const template = try c.substElemAccess(value, src_sym, key_id, fp_ty, 0);
+        var props: std.ArrayList(types.Prop) = .empty;
+        defer props.deinit(c.scratch());
+        const local_syms = [_]u32{fp_sym};
+        for (0..s.objectPropCount(ra)) |i| {
+            const p = s.objectProp(ra, @intCast(i));
+            var elem = [_]TypeId{types.no_type};
+            try c.unify(template, p.ty, &local_syms, &elem, depth + 1);
+            // The inferred element is `S[k]`, which can never legitimately BE
+            // `S` itself. A bare `S` appearing in the candidate is a
+            // contextual-feedback artifact (the object literal was
+            // contextually typed with a partially-resolved `S`, injecting it
+            // into the reducer's `state:` parameter); strip it so the inferred
+            // state is the reducer's own state, not a self-referential union.
+            const et = try c.stripSourceParam(if (elem[0] != types.no_type) elem[0] else types.unknown_type, src_sym);
+            try props.append(c.scratch(), .{ .name = p.name, .ty = et, .flags = 0 });
+        }
+        if (props.items.len == 0) return;
+        const obj = try c.objectFromProps(props.items);
+        // The reverse-mapped object is the authoritative inference for a
+        // homomorphic mapped target; it wins over an uninformative `any` that a
+        // sibling union member (`Reducer<S, A, P>`) may have bound first. Union
+        // only with another genuine candidate.
+        candidates[idx] = if (candidates[idx] == types.no_type or candidates[idx] == types.any_type)
+            obj
+        else
+            try c.makeUnion2(candidates[idx], obj);
+    }
+
+    /// Drop bare `type_param` members from a reverse-mapped element inference.
+    /// The element is `S[k]` — the reducer's concrete state — so any free type
+    /// param surviving in it is a contextual-feedback artifact (the object
+    /// literal was contextually typed with a still-unresolved param, injecting
+    /// it into the reducer's `state:`/`PreloadedState` position). A union sheds
+    /// those members; a type that IS exactly a bare param degrades to `unknown`.
+    fn stripSourceParam(c: *Checker, t: TypeId, sym: u32) Error!TypeId {
+        _ = sym;
+        const s = &c.ts;
+        if (s.kind(t) == .type_param) return types.unknown_type;
+        if (s.kind(t) != .union_type) return t;
+        var kept: std.ArrayList(TypeId) = .empty;
+        defer kept.deinit(c.scratch());
+        for (try c.memberList(t)) |m| {
+            if (s.kind(m) == .type_param) continue;
+            try kept.append(c.scratch(), m);
+        }
+        if (kept.items.len == 0) return types.unknown_type;
+        return s.makeUnion(c.scratch(), kept.items);
+    }
+
+    /// Mint a throwaway element inference variable for `inferReverseMapped`.
+    /// Reuses the fresh higher-order type-param id pool (ids `>= fresh_tp_base`)
+    /// so `makeTypeParam` accepts it and name/constraint lookups stay in bounds;
+    /// the var never escapes into a result (only the concrete inferred element
+    /// does), so it needs no constraint.
+    fn mintReverseElemVar(c: *Checker, name: Atom) Error!u32 {
+        const id = c.fresh_tp_next;
+        c.fresh_tp_next += 1;
+        try c.fresh_tp_info.append(c.ca(), .{ .name = name, .constraint = types.no_type, .default = types.no_type, .has_default = false });
+        return id;
+    }
+
+    /// Replace every `S[K]` (an index access whose object is the type param
+    /// `src_sym` and whose index is this map's key param `key_id`) with `fp`.
+    /// A homomorphic mapped value references its source only through `S[K]`, so
+    /// this yields the per-element template `F<fp>`.
+    fn substElemAccess(c: *Checker, t: TypeId, src_sym: u32, key_id: u32, fp: TypeId, depth: u32) Error!TypeId {
+        if (depth > 16) return t;
+        const s = &c.ts;
+        switch (s.kind(t)) {
+            .index_access => {
+                const obj = s.indexAccessObj(t);
+                const ix = s.indexAccessIndex(t);
+                if (s.kind(obj) == .type_param and s.typeParamSymbol(obj) == src_sym and
+                    s.kind(ix) == .mapped_param and s.mappedParamId(ix) == key_id)
+                {
+                    return fp;
+                }
+                return s.makeIndexAccess(try c.substElemAccess(obj, src_sym, key_id, fp, depth + 1), try c.substElemAccess(ix, src_sym, key_id, fp, depth + 1));
+            },
+            .array => return s.makeArray(try c.substElemAccess(s.arrayElem(t), src_sym, key_id, fp, depth + 1)),
+            .union_type => {
+                var parts: std.ArrayList(TypeId) = .empty;
+                defer parts.deinit(c.scratch());
+                for (try c.memberList(t)) |mm| try parts.append(c.scratch(), try c.substElemAccess(mm, src_sym, key_id, fp, depth + 1));
+                return s.makeUnion(c.scratch(), parts.items);
+            },
+            .intersection => {
+                var parts: std.ArrayList(TypeId) = .empty;
+                defer parts.deinit(c.scratch());
+                for (try c.memberList(t)) |mm| try parts.append(c.scratch(), try c.substElemAccess(mm, src_sym, key_id, fp, depth + 1));
+                return s.makeIntersection(c.scratch(), parts.items);
+            },
+            .tuple => {
+                var elems: std.ArrayList(types.TupleElem) = .empty;
+                defer elems.deinit(c.scratch());
+                for (0..s.tupleLen(t)) |i| {
+                    const e = s.tupleElem(t, @intCast(i));
+                    try elems.append(c.scratch(), .{ .ty = try c.substElemAccess(e.ty, src_sym, key_id, fp, depth + 1), .flags = e.flags });
+                }
+                return s.makeTuple(elems.items);
+            },
+            .object => {
+                var oprops: std.ArrayList(types.Prop) = .empty;
+                defer oprops.deinit(c.scratch());
+                for (0..s.objectPropCount(t)) |i| {
+                    const p = s.objectProp(t, @intCast(i));
+                    try oprops.append(c.scratch(), .{ .name = p.name, .ty = try c.substElemAccess(p.ty, src_sym, key_id, fp, depth + 1), .flags = p.flags });
+                }
+                return s.makeObject(oprops.items, 0, 0, 0);
+            },
+            .function => {
+                var params: std.ArrayList(types.Param) = .empty;
+                defer params.deinit(c.scratch());
+                for (0..s.fnParamCount(t)) |i| {
+                    const p = s.fnParam(t, @intCast(i));
+                    try params.append(c.scratch(), .{ .name = p.name, .ty = try c.substElemAccess(p.ty, src_sym, key_id, fp, depth + 1), .flags = p.flags });
+                }
+                const ret = try c.substElemAccess(s.fnReturn(t), src_sym, key_id, fp, depth + 1);
+                return s.makeFunctionThis(params.items, ret, s.fnTypeParams(t), s.fnFlags(t), null, s.fnThisType(t));
+            },
+            .ref => {
+                var args: std.ArrayList(TypeId) = .empty;
+                defer args.deinit(c.scratch());
+                for (try c.refArgsList(t)) |a| try args.append(c.scratch(), try c.substElemAccess(a, src_sym, key_id, fp, depth + 1));
+                return s.makeRef(s.refSymbol(t), args.items);
+            },
+            .conditional => {
+                const chk = try c.substElemAccess(s.condCheck(t), src_sym, key_id, fp, depth + 1);
+                const ext = try c.substElemAccess(s.condExtends(t), src_sym, key_id, fp, depth + 1);
+                const tru = try c.substElemAccess(s.condTrue(t), src_sym, key_id, fp, depth + 1);
+                const fls = try c.substElemAccess(s.condFalse(t), src_sym, key_id, fp, depth + 1);
+                return s.makeConditional(chk, ext, tru, fls, s.condDistributive(t));
+            },
+            else => return t,
         }
     }
 
