@@ -3020,9 +3020,30 @@ const Checker = struct {
         // Type parameters (global symbol ids in the signature type).
         var tps: std.ArrayList(u32) = .empty;
         defer tps.deinit(c.scratch());
+        // A signature's own type parameter shadows an enclosing mapped-type key
+        // of the same name (tsc lexical scoping): while materializing this
+        // sig's params/return, a bare `K` that names an own type param must
+        // resolve to that param, not the outer mapped key. Without this, a
+        // generic method declared inside a mapped-type value branch (e.g.
+        // `addEventListener<K extends keyof ElementEventMap>` materialized while
+        // some `{[K in …]: …}` is being expanded) has its own `K` mis-bound to a
+        // `mapped_param`, which `containsTypeParam` misses — so `eraseTypeParams`
+        // silently no-ops and the sig never relates (order-dependent, since it
+        // only triggers when the mapped key happens to be in scope at
+        // materialization time). Cleared for the whole body via defer.
+        const saved_mkey_name = c.cur_mapped_key_name;
+        const saved_mkey_ty = c.cur_mapped_key_ty;
+        defer {
+            c.cur_mapped_key_name = saved_mkey_name;
+            c.cur_mapped_key_ty = saved_mkey_ty;
+        }
         for (c.tree.extraRange(proto.tp_start, proto.tp_end)) |tp| {
             if (tp == null_node or c.nodeTag(tp) != .type_param) continue;
             const a = try c.atomOfToken(c.tree.nodeMainToken(tp));
+            if (c.cur_mapped_key_name != 0 and c.cur_mapped_key_name == a) {
+                c.cur_mapped_key_name = 0;
+                c.cur_mapped_key_ty = 0;
+            }
             if (c.bind.lookupInScope(c.cur_scope, a)) |tp_sym| {
                 try tps.append(c.scratch(), c.toGlobal(tp_sym));
             }
