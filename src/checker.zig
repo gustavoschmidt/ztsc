@@ -11374,10 +11374,25 @@ const Checker = struct {
             // so the array literal forms a tuple, and the outer `K`/`V` then
             // infer `string`/`number` from `[string, number][]` instead of
             // collapsing to `unknown`.
-            const arg_ctx = switch (tag) {
+            var arg_ctx = switch (tag) {
                 .array_literal, .call_expr, .call_expr_targs, .optional_call, .new_expr, .new_expr_bare, .new_expr_targs => pt,
                 else => types.no_type,
             };
+            // Fresh object literal into a bare type-param parameter (`truncate<T
+            // extends AllGeoJSON>(v: T)` called with `{ type: 'Feature', … }`):
+            // contextually type it by the type param's instantiated constraint,
+            // so a discriminant property whose constraint type is a literal
+            // (`type: 'Feature'`) keeps its literal instead of widening. Without
+            // it the widened `{ type: string }` fails `T extends AllGeoJSON`, so
+            // `T` is clamped to the whole constraint union → the argument's real
+            // shape is lost. Mirrors tsc's `getContextualTypeForArgument`
+            // falling back to the instantiated constraint. A non-fresh variable
+            // argument is not an object-literal node, so it never reaches here —
+            // its already-widened type still fails the constraint (unchanged).
+            if (tag == .object_literal and c.ts.kind(try c.resolveStructural(pt)) == .type_param) {
+                const con = try c.typeParamConstraint(c.ts.typeParamSymbol(try c.resolveStructural(pt)));
+                if (con != types.no_type) arg_ctx = con;
+            }
             const at = try c.checkExprCached(an, arg_ctx);
             try c.unify(pt, at, tp_syms, candidates, 0);
         }
