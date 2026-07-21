@@ -500,6 +500,17 @@ const Checker = struct {
     /// this `mapped_param` type; the constraint is evaluated with it cleared.
     cur_mapped_key_name: Atom = 0,
     cur_mapped_key_ty: TypeId = 0,
+    /// Type-param names of the alias declaration whose (memoized) generic body
+    /// is currently being materialized. Such a param is lexically the innermost
+    /// binding of its name inside the body, so it shadows a same-named `infer`
+    /// binder or mapped key belonging to whatever *other* declaration first
+    /// referenced this alias — matching tsc lexical scoping. Without this, the
+    /// alias body (e.g. `PathImpl<K, V, Tr>`) is memoized once with its own `V`
+    /// mis-bound to an enclosing conditional's `infer V` and its `K` to an outer
+    /// mapped key, an order-dependent leak. Only *colliding* names are hidden —
+    /// non-colliding outer `infer` scopes stay visible (a blanket clear regresses
+    /// types that legitimately thread infer vars across alias refs).
+    tp_shadow: []const Atom = &.{},
     /// While materializing a *homomorphic* mapped prop, the self-index `T[K]`
     /// yields the source property's *declared* type (no `| undefined` for an
     /// optional prop) — optionality is carried by the prop's modifier flags
@@ -2033,7 +2044,11 @@ const Checker = struct {
         // the active conditional scopes innermost-outward: a nested conditional
         // in an outer conditional's true branch still resolves the outer infer
         // vars (only scopes that actually declared `V` have an entry).
-        if (args.len == 0) {
+        // A same-named type param of the alias body currently being built is
+        // more local than any outer `infer`/mapped binder, so it shadows them
+        // (tsc lexical scoping) — skip both lookups for such a name.
+        const shadowed = indexOfAtom(c.tp_shadow, a) != null;
+        if (args.len == 0 and !shadowed) {
             var i = c.infer_scopes.items.len;
             while (i > 0) {
                 i -= 1;
@@ -2044,7 +2059,7 @@ const Checker = struct {
         }
         // A mapped type's key parameter `K` is in scope in its `as`/value
         // branches (M16b); a bare `K` there resolves to the mapped_param.
-        if (c.cur_mapped_key_name != 0 and c.cur_mapped_key_name == a and args.len == 0) {
+        if (c.cur_mapped_key_name != 0 and c.cur_mapped_key_name == a and args.len == 0 and !shadowed) {
             return c.cur_mapped_key_ty;
         }
         switch (c.resolveSpace(a, c.cur_scope, false)) {
@@ -3986,6 +4001,21 @@ const Checker = struct {
         try c.alias_state.put(c.ca(), sym, 1);
         const saved_ctx = c.enterSymFile(sym);
         defer c.restoreCtx(saved_ctx);
+        // The alias body is a separate lexical declaration: its own type params
+        // shadow any same-named `infer`/mapped binder of the referencing site
+        // (see `tp_shadow`). Build the shadow name set for the duration of the
+        // body materialization.
+        var shadow_buf: std.ArrayList(Atom) = .empty;
+        defer shadow_buf.deinit(c.scratch());
+        {
+            var body_tps: std.ArrayList(TypeParamInfo) = .empty;
+            defer body_tps.deinit(c.scratch());
+            try c.typeParamsOf(sym, &body_tps);
+            for (body_tps.items) |tp| try shadow_buf.append(c.scratch(), c.symNameAtom(tp.sym));
+        }
+        const saved_shadow = c.tp_shadow;
+        c.tp_shadow = shadow_buf.items;
+        defer c.tp_shadow = saved_shadow;
         const decls = c.declsOf(sym);
         var result: TypeId = types.any_type;
         for (decls) |decl| {
@@ -5976,6 +6006,13 @@ const Checker = struct {
     fn indexOfId(ids: []const u32, id: u32) ?usize {
         for (ids, 0..) |x, i| {
             if (x == id) return i;
+        }
+        return null;
+    }
+
+    fn indexOfAtom(atoms: []const Atom, needle: Atom) ?usize {
+        for (atoms, 0..) |x, i| {
+            if (x == needle) return i;
         }
         return null;
     }
