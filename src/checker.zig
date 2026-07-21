@@ -12165,16 +12165,18 @@ const Checker = struct {
         if (try c.refMatches(rhs, key)) {
             return c.narrowByLiteralEquality(t, lhs, strict, sense);
         }
-        // x.k === <literal> narrows x (discriminant).
-        if (key.prop == 0) {
-            if (c.discriminantOf(lhs, key.sym)) |prop_tok| {
-                const other = try c.ts.regularLiteral(try c.checkExprCached(rhs, types.no_type));
-                return c.narrowByDiscriminant(t, try c.memberAtom(prop_tok), other, sense);
-            }
-            if (c.discriminantOf(rhs, key.sym)) |prop_tok| {
-                const other = try c.ts.regularLiteral(try c.checkExprCached(lhs, types.no_type));
-                return c.narrowByDiscriminant(t, try c.memberAtom(prop_tok), other, sense);
-            }
+        // <ref>.k === <literal> narrows <ref> by its discriminant. `<ref>` is
+        // the reference being tracked — either a root symbol (`x.k`, key.prop
+        // == 0) or a depth-1 member path (`f.geometry.k`, narrowing the union
+        // stored at `f.geometry`). The union `t` is `<ref>`'s type, so the same
+        // discriminant filter applies regardless of the reference's depth.
+        if (try c.discriminantOfRef(lhs, key)) |prop_tok| {
+            const other = try c.ts.regularLiteral(try c.checkExprCached(rhs, types.no_type));
+            return c.narrowByDiscriminant(t, try c.memberAtom(prop_tok), other, sense);
+        }
+        if (try c.discriminantOfRef(rhs, key)) |prop_tok| {
+            const other = try c.ts.regularLiteral(try c.checkExprCached(lhs, types.no_type));
+            return c.narrowByDiscriminant(t, try c.memberAtom(prop_tok), other, sense);
         }
         // Optional-chain containment: `a?.….m() === <value>` narrows the chain's
         // *receiver* `a` to non-null (tsc's narrowTypeByOptionalChainContainment).
@@ -12271,12 +12273,28 @@ const Checker = struct {
         return t;
     }
 
-    fn discriminantOf(c: *Checker, node: Node, sym: SymbolId) ?TokenIndex {
+    /// `<ref>.k` where `<ref>` is exactly `key`'s reference: returns the
+    /// discriminant property token `k`. Handles any tracked reference — a root
+    /// symbol (`x.k`) *or* a depth-1 member path (`f.geometry.k`) — by reusing
+    /// `refMatches` on the access base.
+    ///
+    /// A *plain* `.k` access is a discriminant read. An *optional* `?.k` access
+    /// short-circuits to `undefined` when the base is nullish, so comparing it
+    /// is the optional-chain-containment pattern (handled downstream), not a
+    /// discriminant — accepted here only for a root-symbol ref, where tsc's
+    /// `getDiscriminantPropertyAccess` still treats `x?.k === lit` as a
+    /// discriminant (and where this preserves the pre-existing behavior). For a
+    /// member-path ref, only the plain access counts, so an optional discriminant
+    /// read on the tracked member (`m?.k`) stays with the containment machinery.
+    fn discriminantOfRef(c: *Checker, node: Node, key: RefKey) Error!?TokenIndex {
         if (node == null_node) return null;
-        if (c.nodeTag(node) != .member_expr and c.nodeTag(node) != .optional_member_expr) return null;
+        switch (c.nodeTag(node)) {
+            .member_expr => {},
+            .optional_member_expr => if (key.prop != 0) return null,
+            else => return null,
+        }
         const d = c.tree.nodeData(node);
-        const is_sym = c.identIsSym(d.lhs, sym) catch return null;
-        if (!is_sym) return null;
+        if (!try c.refMatches(d.lhs, key)) return null;
         return d.rhs;
     }
 
@@ -12695,10 +12713,8 @@ const Checker = struct {
         var direct = false;
         if (try c.refMatches(disc, key)) {
             direct = true;
-        } else if (key.prop == 0) {
-            if (c.discriminantOf(disc, key.sym)) |prop_tok| {
-                prop = try c.memberAtom(prop_tok);
-            }
+        } else if (try c.discriminantOfRef(disc, key)) |prop_tok| {
+            prop = try c.memberAtom(prop_tok);
         }
         if (!direct and prop == 0 and c.nodeTag(disc) == .prefix_unary and try c.typeofTargetOf(disc, key)) {
             // switch (typeof x)
