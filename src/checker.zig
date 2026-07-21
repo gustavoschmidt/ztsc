@@ -7212,12 +7212,31 @@ const Checker = struct {
                 }
                 return true;
             },
-            // `"a" & string` (the `K & string` idiom) reduces to the literal.
+            // The `Core & string` template-hole idiom, generalized: `"a" & string`
+            // (a single literal), `("a"|"b") & string` (a literal UNION, which the
+            // single-literal `stringLiteralOf` path missed — it left the hole a
+            // malformed pattern), and — the load-bearing case for recursive
+            // path builders — `PathInternal<V, …> & string` where the non-primitive
+            // member is an alias `.ref` inside the hole. Each member is resolved
+            // structurally, which DRIVES such a ref home (e.g. `PInt<{deep}>` →
+            // `"deep"`) under the ordinary shrinking discipline; the string/number
+            // primitive constraint is absorbed and the sole literal core enumerates.
+            // Two non-primitive members (a genuine literal-vs-literal intersection)
+            // or a non-enumerable core fall back to keeping the hole a pattern.
             .intersection => {
-                if (try c.stringLiteralOf(hole)) |atom_| {
-                    try out.append(c.scratch(), atom_);
-                    return true;
+                var core: TypeId = types.no_type;
+                for (try c.memberList(hole)) |m0| {
+                    const m = try c.resolveStructural(m0);
+                    switch (s.kind(m)) {
+                        // primitive supertypes absorbed by a string/number literal
+                        .string, .number, .bigint => {},
+                        else => {
+                            if (core != types.no_type) return false;
+                            core = m;
+                        },
+                    }
                 }
+                if (core != types.no_type) return c.enumerableForms(core, out);
                 return false;
             },
             else => return false, // string / number / pattern / mapping → keep as pattern
