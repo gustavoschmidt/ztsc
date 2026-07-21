@@ -12008,8 +12008,14 @@ const Checker = struct {
             // Array literals are contextually typed by the (already-inferred)
             // parameter, so a tuple parameter sees a tuple — otherwise the
             // `Promise.all` tuple overload's `values: [A, B]` would be tested
-            // against a widened `(A | B)[]` and spuriously rejected.
-            const at = if (tag == .arrow_fn or tag == .function_expr or tag == .array_literal)
+            // against a widened `(A | B)[]` and spuriously rejected. Object
+            // literals likewise: without the contextual parameter a fresh
+            // `{ month: 'short' }` widens its string-literal properties to
+            // `string`, so an overload whose options type has literal-union
+            // members (`Intl.DateTimeFormat`'s `month?: "short" | …`) is
+            // spuriously rejected — the single-signature path already types
+            // args by `pt`, so overload probing must match it.
+            const at = if (tag == .arrow_fn or tag == .function_expr or tag == .array_literal or tag == .object_literal)
                 try c.checkExprCached(an, pt)
             else
                 try c.checkExprCached(an, types.no_type);
