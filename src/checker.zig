@@ -11636,6 +11636,28 @@ const Checker = struct {
                     for (0..n) |i| try c.unify(pa[i], aa[i], tp_syms, candidates, depth + 1);
                     return;
                 }
+                // A union argument paired against a named-type param: match the
+                // union member sharing the param's symbol and infer from *that*
+                // member's type args (tsc's `inferFromTypes` pairs union members
+                // by identity before falling back to structural inference).
+                // Crux of `Array.from(map.values())` element recovery: the
+                // iterator's `next(): IteratorResult<T, TReturn>` return is the
+                // union alias `IteratorYieldResult<T> | IteratorReturnResult<
+                // TReturn>`; without identity pairing, unifying `IteratorYield
+                // Result<T>` against that union falls to the structural arm
+                // (object-vs-union) and binds nothing, collapsing the element
+                // to `unknown`.
+                const uni: TypeId = if (s.kind(arg) == .union_type) arg else if (s.kind(ra) == .union_type) ra else 0;
+                if (uni != 0) {
+                    var matched = false;
+                    for (try c.memberList(uni)) |am| {
+                        if (s.kind(am) == .ref and s.refSymbol(am) == s.refSymbol(param)) {
+                            try c.unify(param, am, tp_syms, candidates, depth + 1);
+                            matched = true;
+                        }
+                    }
+                    if (matched) return;
+                }
                 try c.unify(try c.resolveStructural(param), ra, tp_syms, candidates, depth + 1);
             },
             .conditional => {
