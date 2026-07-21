@@ -409,6 +409,12 @@ const Checker = struct {
     enum_info_cache: std.AutoHashMapUnmanaged(SymbolId, EnumInfo) = .empty,
     alias_generic: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
     alias_state: std.AutoHashMapUnmanaged(SymbolId, u8) = .empty,
+    /// Alias symbols found to be (transitively) self-recursive while their
+    /// generic body was materialized — marked when `aliasInstance` re-enters an
+    /// in-progress alias (state == 1). Used to scope the recursion-accumulator
+    /// default substitution in `fixTypeArgs` (RHF `PathInternal<T, Tr = T>`)
+    /// away from non-recursive library defaults (redux `Reducer<S, A, P = S>`).
+    alias_recursive: std.AutoHashMapUnmanaged(SymbolId, void) = .empty,
     /// Narrowed-type cache per (flow, reference, declared) query.
     flow_cache: std.AutoHashMapUnmanaged(FlowQ, TypeId) = .empty,
     /// Interned narrowing reference keys ((sym << 32 | prop) -> index).
@@ -2601,19 +2607,46 @@ const Checker = struct {
                     c.cur_scope = c.symScope(tp.sym);
                     def = try c.typeFromTypeNode(tp.default);
                 }
-                // Substitute the already-resolved params into the default so an
-                // earlier-param reference (`B = A`) sees the supplied `A`. This
-                // is gated to user (non-`.d.ts`) generics: threading a concrete
-                // arg through a library generic's chained default re-materializes
-                // deeply-recursive `.d.ts` types (e.g. react-hook-form's
-                // `UseFormReturn`/`FieldPath`), which the instantiation reducers
-                // expand breadth-first into millions of types (OOM) — the
-                // separate deep-generic-expansion work (inst redesign) tracked
-                // elsewhere. For those, keep the pre-existing unsubstituted
-                // default (identical to prior behavior, so no new blow-up).
-                if (c.symInDeclFile(sym)) {
+                // A *bare* default reference to an earlier own param (`Tr = T`)
+                // whose alias is *self-recursive* is the recursion accumulator of
+                // RHF's `PathInternal<T, TraversedTypes = T>`: its termination
+                // guard `AnyIsEqual<Tr, V>` only fires once `Tr` is the concrete
+                // form, so the default must resolve to that param's supplied
+                // argument even for a library (`.d.ts`) generic. This is a single
+                // symbol swap (no expansion), so it cannot reintroduce the
+                // deep-generic OOM that gates `.d.ts` defaults. Scoping to
+                // recursive aliases keeps non-recursive library defaults (e.g.
+                // redux `Reducer<S, A, PreloadedState = S>`) on the pre-existing
+                // unsubstituted path — substituting those would eagerly reduce
+                // otherwise-deferred store machinery (`ExtractStoreExtensions`)
+                // that only reduces cleanly once the infer-var/poison work lands.
+                const bare_earlier: ?usize = if (c.ts.kind(def) == .type_param) blk: {
+                    const dsym = c.ts.typeParamSymbol(def);
+                    for (tps.items[0..i], 0..) |ptp, j| {
+                        if (ptp.sym == dsym) break :blk j;
+                    }
+                    break :blk null;
+                } else null;
+                // Ensure the generic body is built so self-recursion is detected
+                // (the flag is set when materialization re-enters this alias).
+                const recursive = if (bare_earlier != null and c.symInDeclFile(sym)) rec: {
+                    if ((c.alias_state.get(sym) orelse 0) != 1) _ = try c.aliasGeneric(sym);
+                    break :rec (c.alias_state.get(sym) orelse 0) == 1 or c.alias_recursive.contains(sym);
+                } else true;
+                if (bare_earlier != null and (recursive or !c.symInDeclFile(sym))) {
+                    out[i] = out[bare_earlier.?];
+                } else if (c.symInDeclFile(sym)) {
+                    // A *complex* or non-recursive library default (e.g. RTK's
+                    // `ExtractStoreExtensionsFromEnhancerTuple` tuple default, or
+                    // `Reducer`'s `PreloadedState = S`) stays unsubstituted:
+                    // threading a concrete arg through it re-materializes
+                    // deeply-recursive `.d.ts` types (the historic OOM) or unmasks
+                    // a still-deferred reduction, so keep prior lenient behavior.
                     out[i] = def;
                 } else {
+                    // Substitute the already-resolved params into the default so
+                    // an earlier-param reference (`B = A`) sees the supplied `A`
+                    // (and `C = B` the defaulted `B`) for user generics.
                     const pmap = try c.scratch().alloc(TpMap, i);
                     for (tps.items[0..i], 0..) |ptp, j| pmap[j] = .{ .sym = ptp.sym, .ty = out[j] };
                     out[i] = try c.instantiate(def, pmap);
@@ -3923,7 +3956,10 @@ const Checker = struct {
         defer c.alias_depth -= 1;
         const state = c.alias_state.get(sym) orelse 0;
         if (state == 1) {
-            // In-progress: recursive alias; leave a lazy ref.
+            // In-progress: recursive alias; leave a lazy ref. Record the
+            // self-recursion so `fixTypeArgs` can scope its accumulator-default
+            // substitution to genuinely recursive aliases.
+            try c.alias_recursive.put(c.ca(), sym, {});
             const fixed = try c.fixTypeArgs(sym, args, tok) orelse return types.error_type;
             return c.ts.makeRef(sym, fixed);
         }
