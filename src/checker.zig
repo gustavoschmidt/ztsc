@@ -597,6 +597,7 @@ const Checker = struct {
     atom_String: Atom = 0,
     atom_Number: Atom = 0,
     atom_Boolean: Atom = 0,
+    atom_Function: Atom = 0,
     // Names of the lib interfaces async/await + generators bridge to (M11).
     atom_Promise: Atom = 0,
     atom_PromiseLike: Atom = 0,
@@ -711,6 +712,7 @@ const Checker = struct {
         c.atom_String = try c.atom("String");
         c.atom_Number = try c.atom("Number");
         c.atom_Boolean = try c.atom("Boolean");
+        c.atom_Function = try c.atom("Function");
         c.atom_Promise = try c.atom("Promise");
         c.atom_PromiseLike = try c.atom("PromiseLike");
         c.atom_Generator = try c.atom("Generator");
@@ -7702,6 +7704,14 @@ const Checker = struct {
                 if (s.objectStringIndex(t) != 0) {
                     return .{ .name = name, .ty = s.objectStringIndex(t), .flags = 0 };
                 }
+                // A callable object/interface (one carrying call/construct
+                // signatures, e.g. react-i18next `TFunction`) inherits the
+                // apparent members of the global `Function` interface
+                // (`.bind`/`.call`/`.apply`/`.name`/`.length`/…). Plain
+                // (non-callable) objects do NOT — an absent member stays TS2339.
+                if (s.objectCallSigCount(t) > 0 or s.objectConstructSigCount(t) > 0) {
+                    return c.functionInterfaceProp(name);
+                }
                 return null;
             },
             .intersection => {
@@ -7755,8 +7765,24 @@ const Checker = struct {
                 const base: TypeId = if (info.all_string) types.string_type else types.number_type;
                 return c.propOfType(base, name);
             },
+            // A bare function type or overload set (arrow/normal function,
+            // `(x) => y`, an overloaded signature) has the apparent members of
+            // the global `Function` interface.
+            .function, .overloads => return c.functionInterfaceProp(name),
             else => return null,
         }
+    }
+
+    /// Look `name` up on the global `Function` interface — the apparent members
+    /// (`bind`/`call`/`apply`/`name`/`length`/`toString`/…) that tsc gives every
+    /// function-shaped type. Returns null when the lib has no `Function`
+    /// interface (`--noLib`) or the property genuinely isn't a `Function`
+    /// member, so a bogus member on a callable still degrades to TS2339.
+    fn functionInterfaceProp(c: *Checker, name: Atom) Error!?types.Prop {
+        const sym = c.prog.globals.lookup(c.atom_Function) orelse return null;
+        if (!c.symFlags(sym).interface) return null;
+        const ref = try c.ts.makeRef(sym, &.{});
+        return c.propOfType(try c.resolveStructural(ref), name);
     }
 
     /// Bridge a primitive/array/tuple to its lib interface (M10) and look
