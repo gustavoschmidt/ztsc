@@ -2642,13 +2642,26 @@ const Checker = struct {
                     }
                     break :blk null;
                 } else null;
+                // A *ground* referenced argument (no type param anywhere) can
+                // always be swapped in — this is a single symbol swap identical
+                // to the function-call default path (`inferTypeArgs` fills an
+                // uninferable default via `instantiate(def, resolved)`), so the
+                // alias annotation `UseFormReturn<P>` fills its
+                // `TTransformedValues = TFieldValues` default to the supplied `P`
+                // exactly as `useForm<P>()`'s return does, keeping the two sides
+                // structurally identical (reflexive assignability). A ground arg
+                // cannot re-materialize deferred `.d.ts` machinery (the OOM guard
+                // and the redux `ExtractStoreExtensions` unmask both require an
+                // *abstract* arg), so those concerns below don't apply here.
+                const ground_earlier = bare_earlier != null and
+                    !(try c.containsTypeParam(out[bare_earlier.?]));
                 // Ensure the generic body is built so self-recursion is detected
                 // (the flag is set when materialization re-enters this alias).
-                const recursive = if (bare_earlier != null and c.symInDeclFile(sym)) rec: {
+                const recursive = if (bare_earlier != null and !ground_earlier and c.symInDeclFile(sym)) rec: {
                     if ((c.alias_state.get(sym) orelse 0) != 1) _ = try c.aliasGeneric(sym);
                     break :rec (c.alias_state.get(sym) orelse 0) == 1 or c.alias_recursive.contains(sym);
                 } else true;
-                if (bare_earlier != null and (recursive or !c.symInDeclFile(sym))) {
+                if (bare_earlier != null and (ground_earlier or recursive or !c.symInDeclFile(sym))) {
                     out[i] = out[bare_earlier.?];
                 } else if (c.symInDeclFile(sym)) {
                     // A *complex* or non-recursive library default (e.g. RTK's
