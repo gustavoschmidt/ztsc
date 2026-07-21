@@ -7084,13 +7084,47 @@ const Checker = struct {
         }
         // Generic object and/or index (M16d): defer as `T[K]`; resolved in
         // `instantiateId`'s `.index_access` arm once the operands are concrete.
-        // Uses the *free* type-param test: a member that is itself a generic
-        // signature (`{ f: <T>() => T }`) does not make the object generic, so
-        // the access resolves now instead of stranding the member as `Obj["f"]`.
-        if (try c.containsFreeTypeParam(obj, &.{}) or try c.containsFreeTypeParam(idx, &.{})) {
+        //
+        // The index uses the deep *free* type-param test (tsc `isGenericIndexType`):
+        // a member that is itself a generic signature (`{ f: <T>() => T }`) does
+        // not make the index generic, so the access resolves now instead of
+        // stranding the member as `Obj["f"]`.
+        //
+        // The OBJECT uses a *shallow* generic test (tsc `isGenericObjectType`),
+        // NOT the deep free-type-param scan: a plain intersection/tuple/object is
+        // not a generic object type merely because a deeply-nested member type
+        // (e.g. a tuple element's complex generic signature) mentions a type
+        // variable. Property PRESENCE is instantiation-invariant, so a concrete
+        // literal key resolves to the same property now as after instantiation.
+        // Deferring on the deep scan stranded `([TFn,i18n,boolean] & {t;i18n})['i18n']`
+        // as an unreduced `.index_access`, on which member access (`.t`) then
+        // wrongly reported TS2339. Only defer when a top-level constituent is
+        // itself instantiable (a bare type variable, mapped/conditional/keyof, …).
+        if (try c.isGenericObjectForIndex(obj) or try c.containsFreeTypeParam(idx, &.{})) {
             return c.ts.makeIndexAccess(obj, idx);
         }
         return c.indexedAccessType(obj, idx);
+    }
+
+    /// Shallow analogue of tsc's `isGenericObjectType` for the object side of an
+    /// indexed access: is `t` (or a union/intersection constituent of it) an
+    /// *instantiable* type whose indexed property genuinely depends on later
+    /// instantiation? Plain object/tuple/array containers are NOT generic here
+    /// even when their members mention free type params — indexing them by a
+    /// concrete key resolves the same before and after instantiation.
+    fn isGenericObjectForIndex(c: *Checker, t0: TypeId) Error!bool {
+        const s = &c.ts;
+        const t = try c.resolveStructural(t0);
+        return switch (s.kind(t)) {
+            .type_param, .infer_var, .mapped_param, .mapped, .index_access, .conditional, .keyof_op, .string_mapping, .template_literal_type => true,
+            .union_type, .intersection => blk: {
+                for (try c.memberList(t)) |m| {
+                    if (try c.isGenericObjectForIndex(m)) break :blk true;
+                }
+                break :blk false;
+            },
+            else => false,
+        };
     }
 
     fn containsMappedParam(c: *Checker, t: TypeId) Error!bool {
