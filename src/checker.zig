@@ -11367,7 +11367,17 @@ const Checker = struct {
             // infers a tuple, not a widened array — the crux of picking the
             // tuple `Promise.all` overload. Other argument shapes keep the
             // context-free inference to avoid perturbing literal widening.
-            const arg_ctx = if (c.nodeTag(an) == .array_literal) pt else types.no_type;
+            // A nested generic *call* argument is also contextually typed by
+            // `pt` (the still-uninstantiated parameter, whose free type params
+            // act as the inference variables): `new Map(rows.map(r => [r.id,
+            // r.n]))` threads `Iterable<readonly [K,V]>` into `.map`'s callback
+            // so the array literal forms a tuple, and the outer `K`/`V` then
+            // infer `string`/`number` from `[string, number][]` instead of
+            // collapsing to `unknown`.
+            const arg_ctx = switch (tag) {
+                .array_literal, .call_expr, .call_expr_targs, .optional_call, .new_expr, .new_expr_bare, .new_expr_targs => pt,
+                else => types.no_type,
+            };
             const at = try c.checkExprCached(an, arg_ctx);
             try c.unify(pt, at, tp_syms, candidates, 0);
         }
@@ -11521,7 +11531,31 @@ const Checker = struct {
                             try c.unify(s.arrayElem(param), s.tupleElem(ra, @intCast(i)).ty, tp_syms, candidates, depth + 1);
                         }
                     },
-                    else => {},
+                    .union_type => {
+                        // A nullable/union iterable context (`Iterable<E> |
+                        // null` — the Map/Set constructor parameter shape):
+                        // infer from each constituent, ignoring the members
+                        // (`null`/`undefined`) that yield no iteration element.
+                        // Mirrors tsc's `getContextualType` mapping over union
+                        // constituents.
+                        for (try c.memberList(ra)) |m| {
+                            try c.unify(param, m, tp_syms, candidates, depth + 1);
+                        }
+                    },
+                    else => {
+                        // Array param (`U[]`) against an iterable-shaped arg
+                        // (`Iterable<E>`, `Set<E>`, `Map<K,V>`): infer `U` from
+                        // the iteration element, matching tsc's member-based
+                        // `inferFromTypes` (Array's `[Symbol.iterator]` vs the
+                        // source's). This lets a tuple contextual type thread
+                        // from `new Map(...)`'s `Iterable<readonly [K, V]>`
+                        // parameter through `.map`'s `U[]` return into the
+                        // callback body, so the returned array literal is formed
+                        // as a tuple instead of widening.
+                        if (try c.iterationElementType(ra)) |elem| {
+                            try c.unify(s.arrayElem(param), elem, tp_syms, candidates, depth + 1);
+                        }
+                    },
                 }
             },
             .tuple => {
@@ -12014,8 +12048,17 @@ const Checker = struct {
             // `string`, so an overload whose options type has literal-union
             // members (`Intl.DateTimeFormat`'s `month?: "short" | …`) is
             // spuriously rejected — the single-signature path already types
-            // args by `pt`, so overload probing must match it.
-            const at = if (tag == .arrow_fn or tag == .function_expr or tag == .array_literal or tag == .object_literal)
+            // args by `pt`, so overload probing must match it. A nested generic
+            // *call* argument is contextually typed too: `new Map(rows.map(r =>
+            // [r.id, r.n]))` needs the constructor's `Iterable<readonly [K,V]>`
+            // parameter to thread into `.map`'s callback so the returned array
+            // literal forms a tuple — without the context the callback widens
+            // to `(string|number)[]` and every Map overload is rejected.
+            const ctx_typed = switch (tag) {
+                .arrow_fn, .function_expr, .array_literal, .object_literal, .call_expr, .call_expr_targs, .optional_call, .new_expr, .new_expr_bare, .new_expr_targs => true,
+                else => false,
+            };
+            const at = if (ctx_typed)
                 try c.checkExprCached(an, pt)
             else
                 try c.checkExprCached(an, types.no_type);
