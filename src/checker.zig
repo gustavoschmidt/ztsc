@@ -12071,15 +12071,25 @@ const Checker = struct {
                 if (try c.refMatches(cond, key)) {
                     return if (sense) c.getTruthyPart(t) else c.getFalsyPart(t, true);
                 }
-                // `if (x.p)` — discriminate the root by prop truthiness.
-                if (key.prop != 0) return t;
-                if (!try c.identIsSym(d.lhs, key.sym)) return t;
-                var base = t;
-                if (c.nodeTag(cond) == .optional_member_expr and sense) {
-                    base = try c.nonNullable(base);
+                // `if (x.p)` / `if (x?.p)` — discriminate the root by prop truthiness.
+                if (key.prop == 0 and try c.identIsSym(d.lhs, key.sym)) {
+                    var base = t;
+                    if (c.nodeTag(cond) == .optional_member_expr and sense) {
+                        base = try c.nonNullable(base);
+                    }
+                    const prop = try c.memberAtom(d.rhs);
+                    return c.narrowByPropTruthiness(base, prop, sense);
                 }
-                const prop = try c.memberAtom(d.rhs);
-                return c.narrowByPropTruthiness(base, prop, sense);
+                // A truthy optional chain (`if (a?.b.c)`, `if (!a?.b.c)` else)
+                // implies its receivers did not short-circuit: narrow a contained
+                // receiver reference to non-null. This is tsc's
+                // `narrowTypeByTruthiness` optional-chain-containment rule — it
+                // fires on the true branch only (a falsy chain says nothing about
+                // whether the receiver was nullish).
+                if (sense and try c.optionalChainContainsRef(cond, key)) {
+                    return c.nonNullable(t);
+                }
+                return t;
             },
             .binary => {
                 const op = c.tree.tokens.tag(c.tree.nodeMainToken(cond));
@@ -12135,6 +12145,18 @@ const Checker = struct {
                 return c.narrowByTypeof(t, c.ts.literalAtom(lt), sense);
             }
             return t;
+        }
+        // `typeof <optional-chain-containing-ref> === "…"`: the chain short-
+        // circuits to `undefined` (so `typeof` is `"undefined"`) exactly when a
+        // receiver was nullish. If this branch forces `typeof(chain) !=
+        // "undefined"`, that receiver did not short-circuit — narrow it non-null
+        // (tsc's `narrowTypeByTypeof` optional-chain-containment rule). `sense`
+        // here is already equals-folded (`!==`/`!=` inverted by the caller).
+        if (try c.typeofChainContainsRef(lhs, key)) {
+            return c.narrowByTypeofChainContainment(t, rhs, sense);
+        }
+        if (try c.typeofChainContainsRef(rhs, key)) {
+            return c.narrowByTypeofChainContainment(t, lhs, sense);
         }
         // <ref> === <literal> / <literal> === <ref>
         if (try c.refMatches(lhs, key)) {
@@ -12225,6 +12247,28 @@ const Checker = struct {
         if (node == null_node or c.nodeTag(node) != .prefix_unary) return false;
         if (c.tree.tokens.tag(c.tree.nodeMainToken(node)) != .keyword_typeof) return false;
         return c.refMatches(c.tree.nodeData(node).lhs, key);
+    }
+
+    /// `node` is `typeof <expr>` whose `<expr>` is an optional chain containing
+    /// `key`'s reference at an optional link (but is not the ref itself — that
+    /// exact case is `typeofTargetOf`).
+    fn typeofChainContainsRef(c: *Checker, node: Node, key: RefKey) Error!bool {
+        if (node == null_node or c.nodeTag(node) != .prefix_unary) return false;
+        if (c.tree.tokens.tag(c.tree.nodeMainToken(node)) != .keyword_typeof) return false;
+        return c.optionalChainContainsRef(c.tree.nodeData(node).lhs, key);
+    }
+
+    /// Narrow a chain receiver `t` to non-null when a `typeof <chain>` branch
+    /// forces `typeof(chain) != "undefined"`. `sense` is the equals-folded
+    /// branch truthiness (true ⇒ the branch asserts `typeof(chain) == literal`).
+    /// The chain did not short-circuit iff its `typeof` is not `"undefined"`, so
+    /// narrow iff `sense == (literal != "undefined")`.
+    fn narrowByTypeofChainContainment(c: *Checker, t: TypeId, value: Node, sense: bool) Error!TypeId {
+        const rt = try c.ts.regularLiteral(try c.checkExprCached(value, types.no_type));
+        if (c.ts.kind(rt) != .string_literal) return t;
+        const is_undef_lit = c.ts.literalAtom(rt) == c.typeof_atoms[5]; // "undefined"
+        if (sense != is_undef_lit) return c.nonNullable(t);
+        return t;
     }
 
     fn discriminantOf(c: *Checker, node: Node, sym: SymbolId) ?TokenIndex {
