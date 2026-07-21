@@ -6814,7 +6814,33 @@ const Checker = struct {
                         const pt = try c.substMappedKey(value, key_id, key_lit);
                         try props.append(c.scratch(), .{ .name = name, .ty = pt, .flags = applyPropModifiers(p.flags, flags) });
                     }
-                    return c.objectFromProps(props.items);
+                    // Preserve the source's index signatures: a homomorphic map
+                    // over `Record<string, V>` / any index-signatured source
+                    // yields `{ [k: string]: mapped(V) }`, not `{}`. `keyof T`
+                    // for such a source includes `string`/`number`, so the value
+                    // `T[K]` is remapped with K bound to that primitive. An `as`
+                    // clause with no string-literal filter passes index keys
+                    // through unchanged (tsc keeps the signature). The optional
+                    // (`+?`) modifier bakes `| undefined` into the value type
+                    // (tsc's addOptionality for a mapped index info).
+                    var sindex: TypeId = 0;
+                    var nindex: TypeId = 0;
+                    if (as_clause == 0) {
+                        var src_sidx: TypeId = 0;
+                        var src_nidx: TypeId = 0;
+                        try c.collectHomoIndex(src, &src_sidx, &src_nidx);
+                        if (src_sidx != 0) {
+                            var v = try c.substMappedKey(value, key_id, types.string_type);
+                            if (flags & types.mapped_flag_optional_add != 0) v = try c.makeUnion2(v, types.undefined_type);
+                            sindex = v;
+                        }
+                        if (src_nidx != 0) {
+                            var v = try c.substMappedKey(value, key_id, types.number_type);
+                            if (flags & types.mapped_flag_optional_add != 0) v = try c.makeUnion2(v, types.undefined_type);
+                            nindex = v;
+                        }
+                    }
+                    return c.objectFromProps(props.items, sindex, nindex);
                 },
                 else => return types.empty_object_type,
             }
@@ -6903,6 +6929,25 @@ const Checker = struct {
         }
     }
 
+    /// Collect the string/number index-signature value types of a homomorphic
+    /// mapped source (object, or an intersection of objects). Sets `*sidx` /
+    /// `*nidx` to the source's index value type when present (first constituent
+    /// wins — intersection index-value merging is a rare edge left to the
+    /// source shape). Used so a homomorphic map preserves index signatures.
+    fn collectHomoIndex(c: *Checker, t: TypeId, sidx: *TypeId, nidx: *TypeId) Error!void {
+        const r = try c.resolveStructural(t);
+        switch (c.ts.kind(r)) {
+            .object => {
+                if (sidx.* == 0) sidx.* = c.ts.objectStringIndex(r);
+                if (nidx.* == 0) nidx.* = c.ts.objectNumberIndex(r);
+            },
+            .intersection => {
+                for (try c.memberList(r)) |m| try c.collectHomoIndex(m, sidx, nidx);
+            },
+            else => {},
+        }
+    }
+
     /// Flatten a non-homomorphic mapped-type constraint into its concrete key
     /// members for `materializeMapped`'s prop loop. A union contributes each
     /// member; a bare `string`/`number`/literal contributes itself; an
@@ -6947,7 +6992,10 @@ const Checker = struct {
 
     /// Build an object from possibly-duplicate-named props (later wins), then
     /// intern. `as` remapping can collide keys, so dedup by name here.
-    fn objectFromProps(c: *Checker, props: []const types.Prop) Error!TypeId {
+    /// `sindex`/`nindex` carry the string/number index-signature value types
+    /// (0 = none) — a homomorphic mapped type over an index-signatured source
+    /// must preserve those signatures, not just the named props.
+    fn objectFromProps(c: *Checker, props: []const types.Prop, sindex: TypeId, nindex: TypeId) Error!TypeId {
         var index: std.AutoHashMapUnmanaged(Atom, u32) = .empty;
         defer index.deinit(c.scratch());
         var out: std.ArrayList(types.Prop) = .empty;
@@ -6960,7 +7008,7 @@ const Checker = struct {
                 try out.append(c.scratch(), p);
             }
         }
-        return c.ts.makeObject(out.items, 0, 0, 0);
+        return c.ts.makeObject(out.items, sindex, nindex, 0);
     }
 
     /// Resolve a mapped type's `as` remap for one src_type key. Returns the new
@@ -11652,7 +11700,7 @@ const Checker = struct {
             try props.append(c.scratch(), .{ .name = p.name, .ty = et, .flags = 0 });
         }
         if (props.items.len == 0) return;
-        const obj = try c.objectFromProps(props.items);
+        const obj = try c.objectFromProps(props.items, 0, 0);
         // The reverse-mapped object is the authoritative inference for a
         // homomorphic mapped target; it wins over an uninformative `any` that a
         // sibling union member (`Reducer<S, A, P>`) may have bound first. Union
