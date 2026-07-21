@@ -8665,12 +8665,37 @@ const Checker = struct {
         const sig_tps = c.ts.fnTypeParams(sig);
         if (sig_tps.len == 0) return sig;
         const tps = try c.scratch().dupe(u32, sig_tps);
-        var map = try c.scratch().alloc(TpMap, tps.len);
+        // Fixed base-constraint mapper: each type param → its declared
+        // constraint (or `any`). Kept immutable so it can be re-applied.
+        const base_map = try c.scratch().alloc(TpMap, tps.len);
         for (tps, 0..) |tp, i| {
             const constraint = try c.typeParamConstraint(tp);
-            map[i] = .{ .sym = tp, .ty = if (constraint != types.no_type) constraint else types.any_type };
+            base_map[i] = .{ .sym = tp, .ty = if (constraint != types.no_type) constraint else types.any_type };
         }
-        return c.instantiate(sig, map);
+        // Resolve nested type-param references inside constraints to a fixed
+        // point (tsc `getBaseSignature`): a constraint like
+        // `Ret extends TOpt['returnObjects'] extends true ? object : string`
+        // still mentions `TOpt`, so a single substitution leaves a deferred
+        // conditional that never reduces. Re-applying the *same* base mapper
+        // `tps.len - 1` times drives `TOpt` down to its own constraint, letting
+        // the conditional collapse (here to `string`). Without this, the erased
+        // return type stays an unresolved conditional and a perfectly valid
+        // signature (react-i18next `TFunction`) fails to relate to a plain
+        // `(key: string) => string`.
+        const resolved = try c.scratch().alloc(TpMap, tps.len);
+        @memcpy(resolved, base_map);
+        const rounds: usize = if (tps.len > 1) tps.len - 1 else 0;
+        var iter: usize = 0;
+        while (iter < rounds) : (iter += 1) {
+            var changed = false;
+            for (resolved) |*r| {
+                const ni = try c.instantiate(r.ty, base_map);
+                if (ni != r.ty) changed = true;
+                r.ty = ni;
+            }
+            if (!changed) break;
+        }
+        return c.instantiate(sig, resolved);
     }
 
     /// i-th effective parameter type (expanding a trailing rest).
