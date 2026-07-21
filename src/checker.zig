@@ -384,6 +384,18 @@ const Checker = struct {
     relation: std.AutoHashMapUnmanaged(u64, u8) = .empty,
     /// ref TypeId -> expanded structural type.
     expansions: std.AutoHashMapUnmanaged(TypeId, TypeId) = .empty,
+    /// Instantiated interface/alias OBJECT TypeId -> its canonical origin
+    /// `makeRef(sym, canonical-args)`. Two objects that carry the SAME origin
+    /// ref denote the same nominal instantiation `G<A…>` (identical symbol AND
+    /// element-wise-equal args, since `makeRef` interns), so they are mutually
+    /// assignable by identity — regardless of any structural divergence between
+    /// them. This is what lets the relation short-circuit the one-step
+    /// (annotation `aliasInstance`/`expandRef`) vs two-step (call-return
+    /// `instantiate` of a pre-expanded signature return) materializations of the
+    /// same generic type, whose nested keyof/mapped/conditional members reduce
+    /// non-confluently into distinct interned objects. It is an identity-only
+    /// shortcut (no variance): it fires solely when both origins are equal.
+    origin: std.AutoHashMapUnmanaged(TypeId, TypeId) = .empty,
     /// Generic (uninstantiated) bodies per symbol: interface/class-instance/
     /// class-static/alias.
     iface_generic: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
@@ -556,6 +568,9 @@ const Checker = struct {
     /// the instantiate memo, map interning, constraint memo, and type-node
     /// memo. The depth/count limits are independent of it.
     inst_cache_on: bool = true,
+    /// While set, `instantiateId`'s depth/count guard truncates silently
+    /// (no TS2589) — used for origin-tag bookkeeping (`tagInstantiatedOrigin`).
+    suppress_inst_diag: bool = false,
     /// Set while checking the operand of an `expr as const` const
     /// assertion: object/array literals produce readonly, non-widened,
     /// literal-typed members (recursively). Cleared at function bodies.
@@ -4006,7 +4021,12 @@ const Checker = struct {
         // ref, keeping the displayed type and the declared type in step with the
         // structural reduction the relation check performs.
         const orig = try c.ts.makeRef(sym, fixed);
-        return c.reexpandShrinking(orig, result);
+        const reduced = try c.reexpandShrinking(orig, result);
+        // Origin tag (see `origin`): a one-step alias instantiation carries the
+        // canonical `makeRef(sym, fixed)` so the reflexive fast-path can match
+        // it against a two-step re-instantiation of the same alias object.
+        if (c.ts.kind(reduced) == .object or c.ts.kind(reduced) == .function) try c.origin.put(c.ca(), reduced, orig);
+        return reduced;
     }
 
     fn aliasGeneric(c: *Checker, sym: SymbolId) Error!TypeId {
@@ -4105,6 +4125,13 @@ const Checker = struct {
             // (`Grow<{deeper:T}>`) never re-expands — its metric increases.
             if (f.type_alias) result = try c.reexpandShrinking(ref, result);
         }
+        // Origin tag: this object is the materialization of `ref =
+        // makeRef(sym, canonical-args)` (interface refs carry default-filled
+        // args from `fixTypeArgs`). Record it so a structurally-divergent
+        // re-materialization of the SAME `ref` relates by identity. Only
+        // objects are tagged — a ref that resolved to a union/primitive/etc.
+        // is already compared by its own rules.
+        if (c.ts.kind(result) == .object or c.ts.kind(result) == .function) try c.origin.put(c.ca(), result, ref);
         try c.expansions.put(c.ca(), ref, result);
         return result;
     }
@@ -5460,6 +5487,32 @@ const Checker = struct {
         return c.instantiateId(t, map, map_id);
     }
 
+    /// Record the origin of a re-instantiated generic materialization without
+    /// charging the substitution of its origin args against the shared
+    /// instantiation budget (`inst_count`/`inst_depth`) — pure bookkeeping must
+    /// not influence whether a later, unrelated instantiation trips TS2589, nor
+    /// emit a diagnostic of its own. A trip during arg substitution just yields
+    /// a non-matching origin ref (safe: the reflexive fast-path simply won't
+    /// fire, falling back to the structural walk).
+    fn tagInstantiatedOrigin(c: *Checker, result: TypeId, orig_ref: TypeId, map: []const TpMap, map_id: ?u32) Error!void {
+        const saved_count = c.inst_count;
+        const saved_depth = c.inst_depth;
+        const saved_trip = c.inst_limit_tripped;
+        const saved_suppress = c.suppress_inst_diag;
+        c.suppress_inst_diag = true;
+        defer {
+            c.inst_count = saved_count;
+            c.inst_depth = saved_depth;
+            c.inst_limit_tripped = saved_trip;
+            c.suppress_inst_diag = saved_suppress;
+        }
+        var oargs: std.ArrayList(TypeId) = .empty;
+        defer oargs.deinit(c.scratch());
+        for (c.ts.refArgs(orig_ref)) |a| try oargs.append(c.scratch(), try c.instantiateId(a, map, map_id));
+        const new_ref = try c.ts.makeRef(c.ts.refSymbol(orig_ref), oargs.items);
+        try c.origin.put(c.ca(), result, new_ref);
+    }
+
     /// Memoized recursive substitution. `map_id` (when non-null) canonically
     /// identifies `map`; it keys the memo and is threaded unchanged down the
     /// recursion. A `null` id disables the memo (`--no-inst-cache`).
@@ -5478,7 +5531,7 @@ const Checker = struct {
         // truncate this subtree to `error_type`.
         if (c.inst_depth > max_instantiation_depth or c.inst_count > max_instantiation_count) {
             c.inst_limit_tripped = true;
-            try c.diagFmt(2589, c.inst_span, "Type instantiation is excessively deep and possibly infinite.", .{});
+            if (!c.suppress_inst_diag) try c.diagFmt(2589, c.inst_span, "Type instantiation is excessively deep and possibly infinite.", .{});
             return types.error_type;
         }
         c.inst_depth += 1;
@@ -5556,7 +5609,16 @@ const Checker = struct {
                     if (s.fnTypeParams(sig).len != 0 and !try c.higherOrderSigEligible(sig)) continue;
                     try construct_sigs.append(c.scratch(), try c.instantiateId(sig, map, map_id));
                 }
-                break :blk try s.makeObjectSigs(props.items, sidx, nidx, s.objectFlags(t), call_sigs.items, construct_sigs.items);
+                const obj = try s.makeObjectSigs(props.items, sidx, nidx, s.objectFlags(t), call_sigs.items, construct_sigs.items);
+                // Propagate the origin tag through instantiation (see `origin`):
+                // if `t` is the pre-expanded materialization of `G<A…>`, the
+                // instantiated result denotes `G<A'…>` with each arg substituted
+                // by `map`. Bookkeeping is budget-shielded so it never trips
+                // TS2589 on unrelated deep instantiations.
+                if (c.origin.get(t)) |orig_ref| {
+                    if (obj != t and c.ts.kind(obj) == .object) try c.tagInstantiatedOrigin(obj, orig_ref, map, map_id);
+                }
+                break :blk obj;
             },
             .function => blk: {
                 const tps = s.fnTypeParams(t);
@@ -5639,7 +5701,14 @@ const Checker = struct {
                     };
                 } else null;
                 const this_ty = s.fnThisType(t);
-                break :blk try s.makeFunctionThis(params.items, ret, kept.items, s.fnFlags(t), pred, if (this_ty != 0) try c.instantiateId(this_ty, sub_map, sub_id) else 0);
+                const fnres = try s.makeFunctionThis(params.items, ret, kept.items, s.fnFlags(t), pred, if (this_ty != 0) try c.instantiateId(this_ty, sub_map, sub_id) else 0);
+                // Propagate the origin tag through function instantiation (see
+                // the `.object` arm) — an aliased function member such as RHF's
+                // `UseFormClearErrors<T>` relates by identity across builds.
+                if (c.origin.get(t)) |orig_ref| {
+                    if (fnres != t and c.ts.kind(fnres) == .function) try c.tagInstantiatedOrigin(fnres, orig_ref, map, map_id);
+                }
+                break :blk fnres;
             },
             .ref => blk: {
                 var args: std.ArrayList(TypeId) = .empty;
@@ -5879,7 +5948,7 @@ const Checker = struct {
     fn reduceConditional(c: *Checker, chk: TypeId, extends_ty: TypeId, true_ty: TypeId, false_ty: TypeId, distributive: bool) Error!TypeId {
         if (c.inst_depth > max_instantiation_depth or c.inst_count > max_instantiation_count) {
             c.inst_limit_tripped = true;
-            try c.diagFmt(2589, c.inst_span, "Type instantiation is excessively deep and possibly infinite.", .{});
+            if (!c.suppress_inst_diag) try c.diagFmt(2589, c.inst_span, "Type instantiation is excessively deep and possibly infinite.", .{});
             return types.error_type;
         }
         c.inst_depth += 1;
@@ -6595,7 +6664,7 @@ const Checker = struct {
     fn reduceMapped(c: *Checker, key_param: TypeId, constraint: TypeId, value: TypeId, as_clause: TypeId, src_type: TypeId, flags: u32) Error!TypeId {
         if (c.inst_depth > max_instantiation_depth or c.inst_count > max_instantiation_count) {
             c.inst_limit_tripped = true;
-            try c.diagFmt(2589, c.inst_span, "Type instantiation is excessively deep and possibly infinite.", .{});
+            if (!c.suppress_inst_diag) try c.diagFmt(2589, c.inst_span, "Type instantiation is excessively deep and possibly infinite.", .{});
             return types.error_type;
         }
         c.inst_depth += 1;
@@ -7136,7 +7205,7 @@ const Checker = struct {
     fn reduceTemplateChunks(c: *Checker, head: Atom, holes: []const TypeId, chunks: []const Atom) Error!TypeId {
         if (c.inst_depth > max_instantiation_depth or c.inst_count > max_instantiation_count) {
             c.inst_limit_tripped = true;
-            try c.diagFmt(2589, c.inst_span, "Type instantiation is excessively deep and possibly infinite.", .{});
+            if (!c.suppress_inst_diag) try c.diagFmt(2589, c.inst_span, "Type instantiation is excessively deep and possibly infinite.", .{});
             return types.error_type;
         }
         c.inst_depth += 1;
@@ -7986,6 +8055,21 @@ const Checker = struct {
         if (s == t) return true;
         const sk = c.ts.kind(s);
         const tk = c.ts.kind(t);
+        // Reflexive origin fast-path (see `origin`): two distinct materialized
+        // types (object or function member) that both denote the same generic
+        // instantiation `G<A…>` — identical symbol AND element-wise-equal args,
+        // so identical interned origin refs — are mutually assignable by
+        // identity. This short-circuits the structural walk that would otherwise
+        // fail on non-confluent one-step vs two-step reductions of the same
+        // type. Identity-only: no variance, it fires solely when the origin refs
+        // are equal.
+        if ((sk == .object or sk == .function) and sk == tk) {
+            if (c.origin.get(s)) |os| {
+                if (c.origin.get(t)) |ot| {
+                    if (os == ot) return true;
+                }
+            }
+        }
         // Trivial targets/sources.
         switch (tk) {
             .any, .err, .unknown, .none => return true,
