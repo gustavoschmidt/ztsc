@@ -5176,11 +5176,61 @@ const Checker = struct {
     fn higherOrderSigEligible(c: *Checker, sig: TypeId) Error!bool {
         for (c.ts.fnTypeParams(sig)) |p| {
             const con = try c.typeParamConstraint(p);
-            if (con != types.no_type and c.ts.kind(con) != .type_param and !try c.boundReducible(con, 0)) return false;
+            if (con != types.no_type and c.ts.kind(con) != .type_param and !try c.boundReducible(con, 0) and !try c.boundHasReducerShape(con, 0)) return false;
             const def = try c.typeParamDefault(p);
-            if (def != types.no_type and c.ts.kind(def) != .type_param and !try c.boundReducible(def, 0)) return false;
+            if (def != types.no_type and c.ts.kind(def) != .type_param and !try c.boundReducible(def, 0) and !try c.boundHasReducerShape(def, 0)) return false;
         }
         return true;
+    }
+
+    /// Complements `boundReducible`: a structured bound the landed reducer chain
+    /// now drives home even though a static structural walk can't prove it
+    /// reduces. True when the bound contains a template-literal pattern (the RHF
+    /// `Path`/`FieldPath` dotted-path builder — reduced by template-hole
+    /// enumeration) or a mapped type (RHF `RegisterOptions`). Such a bound makes
+    /// its higher-order signature `higherOrderSigEligible`, so an instantiated
+    /// generic interface method (`register`/`watch`/`setValue` on a concrete
+    /// `UseFormReturn<F>`) relates its field-name literal against the reduced
+    /// `Path<F>` union. A bare `infer`-over-tuple bound (redux
+    /// `ExtractStoreExtensionsFromEnhancerTuple`) has neither shape and stays
+    /// gated — the reducer can't peel it, so its sig keeps the pristine drop.
+    fn boundHasReducerShape(c: *Checker, t: TypeId, depth: u32) Error!bool {
+        if (depth > 6) return false;
+        const s = &c.ts;
+        switch (s.kind(t)) {
+            .template_literal_type, .mapped => return true,
+            .conditional => return (try c.boundHasReducerShape(s.condCheck(t), depth + 1)) or
+                (try c.boundHasReducerShape(s.condExtends(t), depth + 1)) or
+                (try c.boundHasReducerShape(s.condTrue(t), depth + 1)) or
+                (try c.boundHasReducerShape(s.condFalse(t), depth + 1)),
+            .array => return c.boundHasReducerShape(s.arrayElem(t), depth + 1),
+            .tuple => {
+                for (0..s.tupleLen(t)) |i| {
+                    if (try c.boundHasReducerShape(s.tupleElem(t, @intCast(i)).ty, depth + 1)) return true;
+                }
+                return false;
+            },
+            .union_type, .intersection, .overloads => {
+                for (try c.memberList(t)) |m| {
+                    if (try c.boundHasReducerShape(m, depth + 1)) return true;
+                }
+                return false;
+            },
+            .keyof_op => return c.boundHasReducerShape(s.keyofOperand(t), depth + 1),
+            .index_access => return (try c.boundHasReducerShape(s.indexAccessObj(t), depth + 1)) or
+                (try c.boundHasReducerShape(s.indexAccessIndex(t), depth + 1)),
+            .ref => {
+                const sym = s.refSymbol(t);
+                for (s.refArgs(t)) |a| {
+                    if (try c.boundHasReducerShape(a, depth + 1)) return true;
+                }
+                if (c.symFlags(sym).type_alias) {
+                    return c.boundHasReducerShape(try c.aliasGeneric(sym), depth + 1);
+                }
+                return false;
+            },
+            else => return false,
+        }
     }
 
     /// Whether an own-param *bound* (constraint/default) reduces once its
