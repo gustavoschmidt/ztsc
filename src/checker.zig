@@ -1445,6 +1445,37 @@ const Checker = struct {
         }
     }
 
+    /// Widen a contextually-typed return expression: suppress literal widening
+    /// where the contextual return type admits the literal (tsc's
+    /// isLiteralOfContextualType), otherwise widen exactly as `widenLiteral`.
+    /// Object literals were already contextually typed member-by-member inside
+    /// `checkObjectLiteral` (and `widenLiteral` de-freshens an object without
+    /// touching its members), so only a *bare* primitive-literal return needs
+    /// suppression here (`() => 'Polygon'` under `() => 'Polygon'`); a union
+    /// distributes so a mixed `cond ? 'a' : null` keeps `'a'` under a
+    /// literal-admitting context. With no context this is `widenLiteral`.
+    fn widenToContext(c: *Checker, t: TypeId, ret_ctx: TypeId) Error!TypeId {
+        if (ret_ctx == types.no_type) return c.widenLiteral(t);
+        switch (c.ts.kind(t)) {
+            .union_type => {
+                var any_fresh = false;
+                for (try c.memberList(t)) |m| {
+                    if (c.ts.isFreshLiteral(m) or c.ts.objectIsFresh(m)) any_fresh = true;
+                }
+                if (!any_fresh) return t;
+                var list: std.ArrayList(TypeId) = .empty;
+                defer list.deinit(c.scratch());
+                for (try c.memberList(t)) |m| try list.append(c.scratch(), try c.widenToContext(m, ret_ctx));
+                return c.ts.makeUnion(c.scratch(), list.items);
+            },
+            .string_literal, .number_literal, .number_literal_fresh, .bigint_literal, .bool_true, .bool_false => {
+                if (c.ts.isFreshLiteral(t) and try c.contextAdmitsLiteral(ret_ctx, t)) return c.ts.regularLiteral(t);
+                return c.widenLiteral(t);
+            },
+            else => return c.widenLiteral(t),
+        }
+    }
+
     // =====================================================================
     // type printing
     // =====================================================================
@@ -3162,6 +3193,15 @@ const Checker = struct {
 
         const is_async = proto.flags & ast.Flags.async != 0;
         const is_generator = proto.flags & ast.Flags.generator != 0;
+        // Contextual return type: the return of the contextual signature this
+        // arrow/function expression is checked against (annotation, argument, or
+        // property position). Threaded into the body's return-type probe so
+        // return expressions are contextually typed. An async body's returns are
+        // typed by the *awaited* contextual type (`Promise<T>` context → `T`).
+        const ret_ctx: TypeId = if (ctx_sig != types.no_type and c.ts.kind(ctx_sig) == .function)
+            c.ts.fnReturn(ctx_sig)
+        else
+            types.no_type;
         var ret: TypeId = types.any_type;
         var pred: ?types.Predicate = null;
         if (proto.return_type != 0 and c.nodeTag(proto.return_type) == .type_predicate) {
@@ -3189,7 +3229,7 @@ const Checker = struct {
                     c.nodeTag(node) == .function_decl or c.nodeTag(node) == .class_method))
             {
                 try c.sig_cache.put(c.ca(), c.nodeKey(node), .{ .ty = try c.ts.makeFunction(params.items, try c.makePromise(types.any_type), tps.items, if (is_method) types.fn_flag_method else 0), .ctx = ctx_sig });
-                const payload = try c.awaitedType(try c.inferReturnType(node, c.tree.nodeData(node).rhs));
+                const payload = try c.awaitedType(try c.inferReturnType(node, c.tree.nodeData(node).rhs, if (ret_ctx != types.no_type) try c.awaitedType(ret_ctx) else types.no_type));
                 ret = try c.makePromise(payload);
             } else {
                 ret = try c.makePromise(types.void_type);
@@ -3205,7 +3245,7 @@ const Checker = struct {
             // Reserve the cache slot to break recursion (self-recursive
             // unannotated functions infer any, TS7023-adjacent).
             try c.sig_cache.put(c.ca(), c.nodeKey(node), .{ .ty = try c.ts.makeFunction(params.items, types.any_type, tps.items, if (is_method) types.fn_flag_method else 0), .ctx = ctx_sig });
-            ret = try c.inferReturnType(node, c.tree.nodeData(node).rhs);
+            ret = try c.inferReturnType(node, c.tree.nodeData(node).rhs, ret_ctx);
         } else if (proto.flags & (ast.Flags.get) != 0) {
             ret = types.any_type;
         } else if (c.tree.nodeData(node).rhs == 0 and c.nodeTag(node) != .function_type and c.nodeTag(node) != .method_signature) {
@@ -3463,7 +3503,19 @@ const Checker = struct {
 
     /// Union of return expression types (widened), plus undefined when the
     /// body can complete normally alongside value returns.
-    fn inferReturnType(c: *Checker, fn_node: Node, body: Node) Error!TypeId {
+    ///
+    /// `ret_ctx` is the *contextual return type* — the return type of the
+    /// contextual signature this function expression/arrow is being checked
+    /// against (from a variable annotation, argument position, or property
+    /// position). When present it becomes the contextual type of every return
+    /// expression, so object literals keep the literal discriminants the
+    /// context expects (`{ type: 'Polygon' }` under `() => Polygon` keeps
+    /// `type: "Polygon"` instead of widening to `string`), unions distribute,
+    /// and nested arrows inherit both param and return context via
+    /// `checkExprCached` → `checkFunctionLikeExpr`. With no context it is
+    /// `types.no_type`, and normal widening applies (tsc's
+    /// isLiteralOfContextualType).
+    fn inferReturnType(c: *Checker, fn_node: Node, body: Node, ret_ctx: TypeId) Error!TypeId {
         if (body == 0) return types.any_type;
         // Establish *this* function's async/generator context while checking
         // its body: `await`/`yield` legality (TS1308/TS1163…) must be judged
@@ -3483,7 +3535,7 @@ const Checker = struct {
             .yield_type = 0,
         };
         if (c.nodeTag(body) != .block) {
-            return c.widenLiteral(try c.checkExprCached(body, types.no_type));
+            return c.widenToContext(try c.checkExprCached(body, ret_ctx), ret_ctx);
         }
         var rets: std.ArrayList(Node) = .empty;
         defer rets.deinit(c.scratch());
@@ -3507,7 +3559,7 @@ const Checker = struct {
         defer c.cur_scope = saved_scope;
         for (rets.items, ret_scopes.items) |r, sc| {
             c.cur_scope = sc;
-            try parts.append(c.scratch(), try c.widenLiteral(try c.checkExprCached(r, types.no_type)));
+            try parts.append(c.scratch(), try c.widenToContext(try c.checkExprCached(r, ret_ctx), ret_ctx));
         }
         if (bare_return or !c.stmtListTerminal(c.tree.nodeRange(body))) {
             try parts.append(c.scratch(), types.undefined_type);
@@ -3944,7 +3996,7 @@ const Checker = struct {
                 const proto = c.tree.extraData(ast.FnProto, d.lhs);
                 if (proto.flags & ast.Flags.get != 0) {
                     if (proto.return_type != 0) return c.typeFromTypeNode(proto.return_type);
-                    if (tag == .class_method and d.rhs != 0) return c.inferReturnType(decl, d.rhs);
+                    if (tag == .class_method and d.rhs != 0) return c.inferReturnType(decl, d.rhs, types.no_type);
                 }
             }
             for (decls) |decl| {
@@ -11065,6 +11117,74 @@ const Checker = struct {
         return c.instantiate(sig, map);
     }
 
+    /// tsc's `InferencePriority.ReturnType`: infer still-unbound type params by
+    /// unifying the signature's return type against the structurally-resolved
+    /// contextual return type `ret_ctx`, writing into `target` only where it is
+    /// currently `no_type`. Used both to *seed* callback contextual typing
+    /// (before argument inference) and to *fill* leftover params (after it).
+    /// No-op when nothing is unbound or the context is `any`/`unknown`/error.
+    fn fillFromReturnContext(c: *Checker, sig: TypeId, tp_syms: []const u32, ret_ctx: TypeId, target: []TypeId, bare_callback_only: bool) Error!void {
+        if (ret_ctx == types.no_type or c.ts.kind(sig) != .function) return;
+        var any_empty = false;
+        for (target) |t| {
+            if (t == types.no_type) any_empty = true;
+        }
+        if (!any_empty) return;
+        const rctx = try c.resolveStructural(ret_ctx);
+        const rk = c.ts.kind(rctx);
+        if (rk == .any or rk == .unknown or rk == .err) return;
+        const ret = c.ts.fnReturn(sig);
+        const rc = try c.scratch().alloc(TypeId, tp_syms.len);
+        for (rc) |*x| x.* = types.no_type;
+        try c.unify(ret, rctx, tp_syms, rc, 0);
+        for (target, 0..) |*t, i| {
+            if (t.* != types.no_type or rc[i] == types.no_type) continue;
+            // Seed path (`bare_callback_only`): only fill a param that is the
+            // *bare* return type of some callback parameter — `map<U>(cb: (…) =>
+            // U)`, where seeding `U` cleanly propagates a literal-keeping
+            // contextual return into the callback body. A param buried in a
+            // union callback return (`flatMap<U>(cb: (…) => U | readonly U[])`)
+            // is left to the ordinary post-argument fill (Phase 3), so seeding
+            // never perturbs the callback's contextual type into a spurious
+            // self-mismatch on already-hard flatMap inferences.
+            if (bare_callback_only and !c.paramIsBareCallbackReturn(sig, tp_syms[i])) continue;
+            // The final resolution loop only clamps a candidate to its
+            // constraint when that constraint is *retrievable and concrete*;
+            // otherwise it trusts the candidate outright. A low-priority
+            // contextual guess must not exploit that trust to override a param's
+            // default. Skip when the constraint is a bare outer type param, or
+            // is unretrievable while the param has a default — the higher-order
+            // `<AD extends TBase = TBase>` (redux `useDispatch`) shape, whose
+            // minted param keeps only the substituted default.
+            // `featureCollection`'s `G` keeps a concrete `Geometry` constraint,
+            // so it is still filled.
+            const con = try c.typeParamConstraint(tp_syms[i]);
+            const bare_outer_con = con != types.no_type and
+                c.ts.kind(con) == .type_param and
+                tpIndex(tp_syms, c.ts.typeParamSymbol(con)) == null;
+            const undefendable_default = con == types.no_type and c.typeParamHasDefault(tp_syms[i]);
+            if (bare_outer_con or undefendable_default) continue;
+            t.* = rc[i];
+        }
+    }
+
+    /// True when `tp_sym` is the *bare* return type of some function-typed
+    /// parameter of `sig` — the `map<U>(cb: (…) => U)` shape, where seeding `U`
+    /// from the call's contextual return type cleanly makes the callback body
+    /// keep literal discriminants. A union/array-wrapped return (`flatMap`'s
+    /// `U | readonly U[]`) does not qualify.
+    fn paramIsBareCallbackReturn(c: *Checker, sig: TypeId, tp_sym: u32) bool {
+        const n = c.ts.fnParamCount(sig);
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            const pt = c.ts.fnParam(sig, i).ty;
+            if (c.ts.kind(pt) != .function) continue;
+            const r = c.ts.fnReturn(pt);
+            if (c.ts.kind(r) == .type_param and c.ts.typeParamSymbol(r) == tp_sym) return true;
+        }
+        return false;
+    }
+
     /// Basic unification: gather candidates for each type parameter from
     /// argument types matched against parameter positions; default to the
     /// constraint or `unknown`.
@@ -11096,11 +11216,30 @@ const Checker = struct {
             const at = try c.checkExprCached(an, arg_ctx);
             try c.unify(pt, at, tp_syms, candidates, 0);
         }
+        // Phase 1.5: contextual return-type *seed* (tsc's ReturnType-priority
+        // inference happens *before* callback arguments are contextually
+        // typed). A type param appearing only in a callback's return position
+        // and in the signature's return type — `Array.map<U>(cb: (…) => U):
+        // U[]` under an expected `Polygon[]` — is fixed to `Polygon` from the
+        // outer context, so the callback body is typed against `Polygon` and
+        // keeps its literal discriminants (`{ type: 'Polygon' }`) instead of
+        // widening `U` to `any` and inferring `{ type: string }`. The seed only
+        // feeds the contextual `partial` below; argument inference still writes
+        // the committed `candidates` (so argument evidence wins the final args).
+        // Allocated only when there is a contextual return to seed from — the
+        // overwhelmingly common uncontextual call keeps the original (no extra
+        // scratch) path, using `candidates` directly as the partial source.
+        const seed: []const TypeId = if (ret_ctx != types.no_type) blk: {
+            const s = try c.scratch().alloc(TypeId, tp_syms.len);
+            for (s, 0..) |*x, i| x.* = candidates[i];
+            try c.fillFromReturnContext(sig, tp_syms, ret_ctx, s, true);
+            break :blk s;
+        } else candidates;
         // Phase 2: function arguments, contextually typed by the partial
-        // instantiation.
+        // instantiation (seeded with the return-context inferences above).
         var partial = try c.scratch().alloc(TpMap, tp_syms.len);
         for (tp_syms, 0..) |tp, i| {
-            partial[i] = .{ .sym = tp, .ty = if (candidates[i] != types.no_type) candidates[i] else types.any_type };
+            partial[i] = .{ .sym = tp, .ty = if (seed[i] != types.no_type) seed[i] else types.any_type };
         }
         ai = 0;
         for (arg_nodes) |an| {
@@ -11113,48 +11252,13 @@ const Checker = struct {
             const at = try c.checkExprCached(an, pt_partial);
             try c.unify(pt0, at, tp_syms, candidates, 0);
         }
-        // Phase 3: contextual return-type inference (tsc's
-        // `InferencePriority.ReturnType`). When the call sits in a typed
-        // context, infer still-unbound type params from the signature's return
-        // type matched against that contextual type. Argument inference always
-        // wins — this only *fills* params that no argument constrained — so
+        // Phase 3: contextual return-type inference for any params still
+        // unbound after argument inference (argument inference always wins —
+        // this only *fills* params that no argument constrained) — so
         // `union(featureCollection(xs))` recovers `featureCollection`'s `G`
         // from the expected `FeatureCollection<Polygon | MultiPolygon>` instead
         // of falling back to `G`'s constraint (the whole `Geometry` union).
-        if (ret_ctx != types.no_type) {
-            var any_empty = false;
-            for (candidates) |cand| {
-                if (cand == types.no_type) any_empty = true;
-            }
-            const rctx = if (any_empty) try c.resolveStructural(ret_ctx) else types.no_type;
-            const rk = c.ts.kind(rctx);
-            if (any_empty and rk != .any and rk != .unknown and rk != .err and c.ts.kind(sig) == .function) {
-                const ret = c.ts.fnReturn(sig);
-                const rc = try c.scratch().alloc(TypeId, tp_syms.len);
-                for (rc) |*x| x.* = types.no_type;
-                try c.unify(ret, rctx, tp_syms, rc, 0);
-                for (candidates, 0..) |*cand, i| {
-                    if (cand.* != types.no_type or rc[i] == types.no_type) continue;
-                    // The final resolution loop only clamps a candidate to its
-                    // constraint when that constraint is *retrievable and
-                    // concrete*; otherwise it trusts the candidate outright. A
-                    // low-priority contextual guess must not exploit that trust to
-                    // override a param's default. Skip when the constraint is a
-                    // bare outer type param, or is unretrievable while the param
-                    // has a default — the higher-order `<AD extends TBase = TBase>`
-                    // (redux `useDispatch`) shape, whose minted param keeps only
-                    // the substituted default. `featureCollection`'s `G` keeps a
-                    // concrete `Geometry` constraint, so it is still filled.
-                    const con = try c.typeParamConstraint(tp_syms[i]);
-                    const bare_outer_con = con != types.no_type and
-                        c.ts.kind(con) == .type_param and
-                        tpIndex(tp_syms, c.ts.typeParamSymbol(con)) == null;
-                    const undefendable_default = con == types.no_type and c.typeParamHasDefault(tp_syms[i]);
-                    if (bare_outer_con or undefendable_default) continue;
-                    cand.* = rc[i];
-                }
-            }
-        }
+        try c.fillFromReturnContext(sig, tp_syms, ret_ctx, candidates, false);
         // A provisional map over the raw candidates, so an inter-dependent
         // constraint (`K extends keyof T`, M16d) is checked with the *other*
         // params already substituted — `keyof T` becomes `keyof {…}` before the
