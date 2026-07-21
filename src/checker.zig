@@ -374,6 +374,14 @@ const Checker = struct {
     /// (see the `.start`/closure-capture gate in `flowTypeInner`). Order-
     /// invariant: a pure function of the file's assignment AST nodes.
     reassigned_syms: std.AutoHashMapUnmanaged(SymbolId, void) = .empty,
+    /// `(sym, for_head_scope)` pairs where `sym` is assigned somewhere inside a
+    /// `for`/`for..of`/`for..in` whose header scope is `for_head_scope` (each
+    /// enclosing loop of an assignment is recorded, so nested loops are all
+    /// covered). Lets a loop label distinguish "reassigned *inside this loop*"
+    /// from merely "reassigned before the loop" — the latter keeps its pre-loop
+    /// narrowing across the loop (tsc), the former re-widens. Populated
+    /// alongside `reassigned_syms` in `ensureReassignScan`.
+    reassigned_in_loop: std.AutoHashMapUnmanaged(SymLoop, void) = .empty,
     /// Per-file flag: has this file's reassignment scan run yet?
     reassign_scanned: []bool = &.{},
     /// FileId -> module namespace object type (0 = in progress).
@@ -919,6 +927,20 @@ const Checker = struct {
         const s = c.reprSym(sym);
         const f = c.symFile(s);
         return c.prog.files[f].bind.symbol_scopes[s - c.prog.sym_base[f]];
+    }
+
+    /// True when `sym` is a loop-header binding — the variable of a
+    /// `for`/`for..of`/`for..in` (both declare their binding in a `.for_head`
+    /// scope). Such a variable is re-established every iteration, so its
+    /// pre-loop flow is meaningless and the loop-label narrowing shortcut (which
+    /// trusts the pre-loop entry for a loop-invariant reference) must not fire —
+    /// a `for (const x of xs)` binding is not in the reassignment scan yet is
+    /// effectively assigned by every iteration.
+    fn symDeclaredInForHead(c: *const Checker, sym: SymbolId) bool {
+        const s = c.reprSym(sym);
+        const f = c.symFile(s);
+        const b = c.prog.files[f].bind;
+        return b.scope_kinds[b.symbol_scopes[s - c.prog.sym_base[f]]] == .for_head;
     }
 
     /// Decl nodes of a global symbol (valid in `symFile(sym)`'s tree). For a
@@ -11979,6 +12001,7 @@ const Checker = struct {
     const this_flow_root: SymbolId = std.math.maxInt(SymbolId);
 
     const FlowQ = struct { file: FileId, flow: FlowId, key: u32, declared: TypeId };
+    const SymLoop = struct { sym: SymbolId, scope: ScopeId };
 
     fn refKeyIndex(c: *Checker, key: RefKey) Error!u32 {
         const raw = (@as(u64, key.sym) << 32) | key.prop;
@@ -12137,9 +12160,63 @@ const Checker = struct {
                 return c.narrowByAssertCall(before, call, key);
             },
             .branch_label, .loop_label => {
+                const antes = b.flowAntecedents(flow);
+                // A loop label whose reference is *never assigned inside the
+                // loop* keeps its pre-loop narrowing across the whole loop body
+                // (tsc `getTypeAtFlowLoopLabel`: a reference only re-widens at a
+                // back edge when the loop actually assigns it). The binder builds
+                // a loop label with antecedent[0] = the pre-loop entry edge and
+                // [1..] = back edges / `continue` jumps. For an unassigned simple
+                // reference the type is invariant around the loop, so its type at
+                // the label is exactly the entry type — take antecedent[0] alone
+                // and skip the back edges. This both preserves the narrowing
+                // (ztsc previously widened to `declared` at the in-progress back
+                // edge, dropping every loop-crossing narrowing — `x: T | null`
+                // guarded by an early return re-acquired `| null` inside a
+                // following `for`/`while`) and avoids poisoning the flow cache
+                // with an under-approximation while the label is in progress.
+                // "Assigned inside this loop" is exact for `for/for..of/for..in`
+                // (see `reassigned_in_loop` below) and a sound over-approximation
+                // (file-level `reassigned_syms`) for `while`/`do`.
+                // Loop-header bindings (a `for..of` element is not in the
+                // reassignment scan yet is re-bound every iteration) and property
+                // paths keep the full union-over-all-antecedents behavior.
+                //
+                // The shortcut fires *only when the pre-loop entry is actually
+                // narrower than the declared type* — i.e. there is a narrowing to
+                // preserve. When the entry equals `declared` the reference is
+                // un-narrowed and the ordinary union path (which re-walks the back
+                // edges and, in doing so, populates the flow cache exactly as
+                // before) reproduces the pre-fix result byte-for-byte. This keeps
+                // the change surgical: it can only ever *retain* a narrowing that
+                // the old code dropped, never perturb the cache interaction of a
+                // reference that was never narrowed before the loop (which would
+                // otherwise unmask unrelated latent FPs downstream).
+                if (b.flow_tags[flow] == .loop_label and antes.len >= 1 and key.prop == 0 and
+                    !c.symDeclaredInForHead(key.sym))
+                {
+                    try c.ensureReassignScan();
+                    // "Assigned inside *this* loop" is the exact tsc predicate. A
+                    // `for`/`for..of`/`for..in` label's own scope is the loop's
+                    // `.for_head`, so a symbol assigned before the loop but never
+                    // inside it (`let x; …; x = f(); if(!x) return; for(…) use(x)`)
+                    // keeps its narrowing. `while`/`do` push no header scope, so
+                    // there the coarse file-level "reassigned anywhere" test is
+                    // used (sound: an assignment inside the loop always lands in
+                    // the file scan → never keeps a mutated narrowing).
+                    const loop_scope = b.flowScope(flow);
+                    const assigned_in_loop = if (b.scope_kinds[loop_scope] == .for_head)
+                        c.reassigned_in_loop.contains(.{ .sym = key.sym, .scope = loop_scope })
+                    else
+                        c.reassigned_syms.contains(key.sym);
+                    if (!assigned_in_loop) {
+                        const entry_t = try c.flowType(antes[0], key, declared, depth + 1);
+                        if (entry_t != declared) return entry_t;
+                    }
+                }
                 var parts: std.ArrayList(TypeId) = .empty;
                 defer parts.deinit(c.scratch());
-                for (b.flowAntecedents(flow)) |a| {
+                for (antes) |a| {
                     const t = try c.flowType(a, key, declared, depth + 1);
                     // In-progress loop back-edges return `declared`
                     // (tsc: start from declared type at back edges).
@@ -12514,6 +12591,23 @@ const Checker = struct {
         }
     }
 
+    /// Record `sym` as reassigned, and for every `for`/`for..of`/`for..in`
+    /// header scope enclosing the assignment's `scope`, record that `sym` is
+    /// assigned *inside that loop*. The ancestor walk means an assignment nested
+    /// N loops deep marks all N enclosing loops.
+    fn recordReassign(c: *Checker, sym: SymbolId, scope: ScopeId) Error!void {
+        try c.reassigned_syms.put(c.ca(), sym, {});
+        const b = c.bind;
+        var s = scope;
+        while (true) {
+            if (b.scope_kinds[s] == .for_head)
+                try c.reassigned_in_loop.put(c.ca(), .{ .sym = sym, .scope = s }, {});
+            const p = b.scope_parents[s];
+            if (p == s) break;
+            s = p;
+        }
+    }
+
     fn markReassignTarget(c: *Checker, target: Node, scope: ScopeId) Error!void {
         if (target == null_node) return;
         var n = target;
@@ -12522,7 +12616,7 @@ const Checker = struct {
             .identifier => {
                 const a = try c.atomOfToken(c.tree.nodeMainToken(n));
                 switch (c.resolveSpace(a, scope, true)) {
-                    .sym => |s| try c.reassigned_syms.put(c.ca(), s, {}),
+                    .sym => |s| try c.recordReassign(s, scope),
                     else => {},
                 }
             },
@@ -12539,7 +12633,7 @@ const Checker = struct {
                 } else {
                     const a = try c.memberAtom(c.tree.nodeMainToken(n));
                     switch (c.resolveSpace(a, scope, true)) {
-                        .sym => |s| try c.reassigned_syms.put(c.ca(), s, {}),
+                        .sym => |s| try c.recordReassign(s, scope),
                         else => {},
                     }
                 }
