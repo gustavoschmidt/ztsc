@@ -9623,11 +9623,24 @@ const Checker = struct {
                 }
             }
         }
+        // Union contextual type (`T[] | [A, B] | T`, or the react-hook-form
+        // `Path<F> | Path<F>[]` shape): a tuple constituent puts the literal in
+        // tuple context (matching tsc's `someType(ctx, isTupleLikeType)`).
+        if (ctx_tuple_ty == types.no_type and rctx != types.no_type and c.ts.kind(rctx) == .union_type) {
+            for (try c.memberList(rctx)) |m| {
+                if (c.ts.kind(try c.resolveStructural(m)) == .tuple) {
+                    ctx_tuple_ty = try c.resolveStructural(m);
+                    break;
+                }
+            }
+        }
         const ctx_tuple = ctx_tuple_ty != types.no_type;
-        const ctx_elem: TypeId = if (rctx != types.no_type and c.ts.kind(rctx) == .array)
-            c.ts.arrayElem(rctx)
-        else
-            types.no_type;
+        // Contextual element type for a plain (non-tuple) array literal. A
+        // direct array context yields its element; a union context contributes
+        // the element type of each array-like constituent (so array-literal
+        // elements are contextually typed — literals stay literal instead of
+        // widening).
+        const ctx_elem: TypeId = if (!ctx_tuple) try c.contextualArrayElemType(rctx) else types.no_type;
 
         var elem_types: std.ArrayList(TypeId) = .empty;
         defer elem_types.deinit(c.scratch());
@@ -9683,6 +9696,30 @@ const Checker = struct {
             return c.ts.makeArray(types.any_type); // evolving arrays out of scope
         }
         return c.ts.makeArray(try c.ts.makeUnion(c.scratch(), elem_types.items));
+    }
+
+    /// The element type an array literal's elements should be contextually
+    /// typed against, given a (structurally resolved) contextual type. A direct
+    /// array yields its element type; a union contributes the element type of
+    /// every array-like constituent (mirrors tsc's per-element
+    /// `getContextualTypeForElementExpression` mapping over the union). Returns
+    /// `no_type` when nothing array-like is present.
+    fn contextualArrayElemType(c: *Checker, rctx: TypeId) Error!TypeId {
+        if (rctx == types.no_type) return types.no_type;
+        switch (c.ts.kind(rctx)) {
+            .array => return c.ts.arrayElem(rctx),
+            .union_type => {
+                var elems: std.ArrayList(TypeId) = .empty;
+                defer elems.deinit(c.scratch());
+                for (try c.memberList(rctx)) |m| {
+                    const e = try c.contextualArrayElemType(try c.resolveStructural(m));
+                    if (e != types.no_type) try elems.append(c.scratch(), e);
+                }
+                if (elems.items.len == 0) return types.no_type;
+                return c.ts.makeUnion(c.scratch(), elems.items);
+            },
+            else => return types.no_type,
+        }
     }
 
     /// `[...] as const` -> a readonly tuple. Elements keep their literal
