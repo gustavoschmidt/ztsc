@@ -255,6 +255,19 @@ const max_instantiation_depth = 100;
 /// the `--no-inst-cache` oracle diverge: only the cache-independent depth
 /// limit fires in-subset).
 const max_instantiation_count = 5_000_000;
+/// Upper bound on scratch-arena physical capacity retained across the
+/// per-statement reset (`run`). The scratch arena is a transient workspace
+/// reset after every top-level statement; with plain `.retain_capacity` the
+/// arena keeps the high-water of the single largest statement (a big JSX-return
+/// materializing generic component props can spike it to ~130 MB) resident for
+/// the whole process, so a later peak elsewhere (type arenas, other files)
+/// stacks on top of the stuck spike. Shrinking to this limit after each
+/// statement releases the spike's physical pages while retaining enough
+/// capacity that the common small-statement path never re-hits the backing
+/// allocator. Safe by construction: the shrink runs at the exact point
+/// `.retain_capacity` already logically frees everything, so nothing live is
+/// referenced past it.
+const scratch_retain_limit = 8 * 1024 * 1024;
 /// Recursion-depth cap for the structural assignability relation
 /// (`isAssignable`). A recursive generic alias whose recursion is *undecidable*
 /// to ztsc — react-hook-form's `PathValueImpl`/`Path` peel a generic string
@@ -329,7 +342,20 @@ const Checker = struct {
     /// struct moves.
     carena: *std.heap.ArenaAllocator,
     /// Scratch arena: worklists, printer buffers; reset per statement.
+    /// `scratch_arena` is a *pointer* so it can be swapped for `inst_arena`
+    /// during the outermost `instantiate()` call (see `instantiate`), routing
+    /// every transient allocation made while materializing a generic type into
+    /// a region that is released the moment the top-level substitution
+    /// finishes — bounding the per-statement scratch high-water to the largest
+    /// single instantiation instead of the sum of all of a statement's.
     scratch_arena: *std.heap.ArenaAllocator,
+    /// Dedicated arena swapped in for `scratch_arena` while the outermost
+    /// `instantiate()` runs; reset (shrunk to `scratch_retain_limit`) at that
+    /// call's exit. Never holds anything referenced past the top-level
+    /// substitution: results are interned into `ts`, persistent keys into
+    /// `carena` (the `canonMapId`/`mintFreshTp` discipline), so the reset frees
+    /// only genuinely dead intermediates.
+    inst_arena: *std.heap.ArenaAllocator,
 
     ts: Store = undefined,
 
@@ -667,6 +693,7 @@ const Checker = struct {
             .src = f0.src,
             .carena = undefined,
             .scratch_arena = undefined,
+            .inst_arena = undefined,
             .inst_cache_on = inst_cache_on,
         };
         c.carena = try gpa.create(std.heap.ArenaAllocator);
@@ -677,6 +704,10 @@ const Checker = struct {
         errdefer gpa.destroy(c.scratch_arena);
         c.scratch_arena.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         errdefer c.scratch_arena.deinit();
+        c.inst_arena = try gpa.create(std.heap.ArenaAllocator);
+        errdefer gpa.destroy(c.inst_arena);
+        c.inst_arena.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        errdefer c.inst_arena.deinit();
         const arena_alloc = c.carena.allocator();
         c.ts = if (base) |b| try Store.initOverlay(arena_alloc, b) else try Store.init(arena_alloc);
         // Sized to include the merged-symbol range (ids ≥ totalSymbols()),
@@ -757,6 +788,8 @@ const Checker = struct {
         c.gpa.destroy(c.carena);
         c.scratch_arena.deinit();
         c.gpa.destroy(c.scratch_arena);
+        c.inst_arena.deinit();
+        c.gpa.destroy(c.inst_arena);
     }
 
     fn run(c: *Checker) Error!void {
@@ -768,7 +801,7 @@ const Checker = struct {
             for (c.tree.nodeRange(0)) |stmt| {
                 if (stmt != null_node) try c.checkStatement(stmt);
                 c.noteScratch();
-                _ = c.scratch_arena.reset(.retain_capacity);
+                _ = c.scratch_arena.reset(.{ .retain_with_limit = scratch_retain_limit });
             }
         }
         // TDZ / use-before-assign / 2304 come from the walk itself.
@@ -5651,9 +5684,36 @@ const Checker = struct {
     fn instantiate(c: *Checker, t: TypeId, map: []const TpMap) Error!TypeId {
         if (map.len == 0) return t;
         if (!try c.containsTypeParam(t)) return t;
-        // Reset the truncation flag at each top-level entry so a limit trip in
-        // one instantiation never suppresses caching of the next.
-        if (c.inst_depth == 0) c.inst_limit_tripped = false;
+        // At the outermost substitution, route every transient allocation the
+        // call tree makes (worklists in `instantiateId`, the reduction helpers'
+        // scratch, `makeUnion`/`makeObject` temporaries) into `inst_arena` by
+        // swapping it in for `scratch_arena`, then release it on exit. This
+        // bounds the per-statement scratch high-water to the single largest
+        // instantiation rather than the sum of every one a statement performs
+        // (a JSX return that materializes many generic component props spiked
+        // the old shared arena to ~130 MB and it stuck for the process).
+        // Safe because the tree keeps nothing past its own return: the result
+        // is interned into `ts`, and any persistent key is copied into `carena`
+        // (`canonMapId`/`mintFreshTp`) or the permanent output arena
+        // (`diagFmt`) — the same discipline that already lets scratch reset per
+        // statement. The swap is restored (and the arena released) on every
+        // exit including errors, so `scratch_arena` is the shared arena
+        // everywhere outside a top-level `instantiate`.
+        if (c.inst_depth == 0) {
+            // Reset the truncation flag at each top-level entry so a limit trip
+            // in one instantiation never suppresses caching of the next.
+            c.inst_limit_tripped = false;
+            const saved = c.scratch_arena;
+            c.scratch_arena = c.inst_arena;
+            defer {
+                const cap = c.inst_arena.queryCapacity();
+                if (cap > c.stats.scratch_high_water) c.stats.scratch_high_water = cap;
+                _ = c.inst_arena.reset(.{ .retain_with_limit = scratch_retain_limit });
+                c.scratch_arena = saved;
+            }
+            const map_id: ?u32 = if (c.inst_cache_on) try c.canonMapId(map) else null;
+            return c.instantiateId(t, map, map_id);
+        }
         const map_id: ?u32 = if (c.inst_cache_on) try c.canonMapId(map) else null;
         return c.instantiateId(t, map, map_id);
     }
