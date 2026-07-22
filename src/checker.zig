@@ -8935,8 +8935,21 @@ const Checker = struct {
         const pairs = @min(c.paramTotal(se), @max(s_count, t_count));
         var i: u32 = 0;
         while (i < pairs) : (i += 1) {
-            const sp = c.paramTypeAt(se, i) orelse break;
+            var sp = c.paramTypeAt(se, i) orelse break;
             const tp = c.paramTypeAt(te, i) orelse break;
+            // An optional *source* parameter admits `undefined` at the call
+            // site, so its effective type for the contravariant relation is
+            // `T | undefined` — exactly as an explicit `?` target param already
+            // has undefined baked into its stored type. Without this, a
+            // default-valued source param (`b: boolean = false`, whose stored
+            // type stays the bare `boolean`) fails against an optional target
+            // param `b?: boolean` (`boolean | undefined`), a phantom TS2322 tsc
+            // does not report. A *required* source param is untouched, so it
+            // still (correctly) fails that target.
+            if (i < c.ts.fnParamCount(se)) {
+                const spar = c.ts.fnParam(se, i);
+                if (spar.optional() and !spar.rest()) sp = try c.makeUnion2(sp, types.undefined_type);
+            }
             const contra = try c.isAssignable(tp, sp);
             if (!contra) {
                 if (!bivariant) return false;
@@ -14510,14 +14523,21 @@ const Checker = struct {
     // --- syntactic reachability (2366/return-undefined inference) ---------
 
     fn stmtListTerminal(c: *Checker, stmts: []const Node) bool {
-        var i = stmts.len;
-        while (i > 0) {
-            i -= 1;
-            const s = stmts[i];
-            if (s == null_node) continue;
-            return c.stmtTerminal(s);
+        // Does control flow fall off the end of this list? Walk forward tracking
+        // reachability: the first terminal statement (return/throw/terminal
+        // loop…) kills it, and straight-line code never revives it. A terminal
+        // statement in the *middle* therefore makes the whole list terminal —
+        // trailing dead code or a hoisted `function`/type declaration after a
+        // `return` does not resurrect the endpoint (the previous "inspect the
+        // last statement only" rule wrongly did, adding a phantom `| undefined`
+        // to the inferred return type of the common
+        // `return { … }; function helper() {…}` hook pattern).
+        var reachable = true;
+        for (stmts) |s| {
+            if (s == null_node or !reachable) continue;
+            if (c.stmtTerminal(s)) reachable = false;
         }
-        return false;
+        return !reachable;
     }
 
     fn stmtTerminal(c: *Checker, node: Node) bool {
