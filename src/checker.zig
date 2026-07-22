@@ -12686,8 +12686,24 @@ const Checker = struct {
                             try c.unify(pp.ty, ap.ty, tp_syms, candidates, depth + 1);
                         }
                     }
-                    if (s.objectStringIndex(param) != 0 and s.objectStringIndex(ra) != 0) {
-                        try c.unify(s.objectStringIndex(param), s.objectStringIndex(ra), tp_syms, candidates, depth + 1);
+                    const pidx = s.objectStringIndex(param);
+                    if (pidx != 0) {
+                        if (s.objectStringIndex(ra) != 0) {
+                            try c.unify(pidx, s.objectStringIndex(ra), tp_syms, candidates, depth + 1);
+                        } else {
+                            // Reverse index-signature inference (tsc's
+                            // `inferFromIndexTypes`): a target string index
+                            // `{ [s: string]: T }` — the `Object.values`/`entries`
+                            // parameter — infers `T` from a named-property source
+                            // (`{ x: {...} }`) by matching each own property's type,
+                            // since the source has no index signature to pair with.
+                            // Without it `Object.values({x:{s:1}})` leaves `T`
+                            // unbound and the result collapses to `unknown[]`.
+                            for (0..s.objectPropCount(ra)) |i| {
+                                const ap = s.objectProp(ra, @intCast(i));
+                                try c.unify(pidx, ap.ty, tp_syms, candidates, depth + 1);
+                            }
+                        }
                     }
                     if (s.objectNumberIndex(param) != 0 and s.objectNumberIndex(ra) != 0) {
                         try c.unify(s.objectNumberIndex(param), s.objectNumberIndex(ra), tp_syms, candidates, depth + 1);
