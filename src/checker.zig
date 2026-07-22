@@ -10842,8 +10842,63 @@ const Checker = struct {
         }
     }
 
+    /// The literal type an object-literal property value denotes *syntactically*
+    /// — a string/number/boolean literal — for use as a discriminant when the
+    /// contextual type is a union. `no_type` for anything else (no full check).
+    fn discriminantLiteralOf(c: *Checker, node: Node) Error!TypeId {
+        if (node == null_node) return types.no_type;
+        return switch (c.nodeTag(node)) {
+            .string_literal => try c.ts.makeStringLiteral(try c.memberAtom(c.tree.nodeMainToken(node)), false),
+            .number_literal => try c.ts.makeNumberLiteral(c.numberTokenValue(c.tree.nodeMainToken(node)), false),
+            .true_literal => types.true_type,
+            .false_literal => types.false_type,
+            else => types.no_type,
+        };
+    }
+
+    /// Discriminant-guided contextual typing: when an object literal is typed by
+    /// a union, filter the union to the constituents whose properties accept the
+    /// literal-valued properties of the source (tsc's
+    /// `discriminateTypeByDiscriminantProperties`). Typing each property against
+    /// the surviving constituent(s) keeps its literal discriminant instead of
+    /// widening it against a union-wide property type (`'X' | string` = `string`)
+    /// that no arm's literal discriminant would then match. Only ever *narrows*
+    /// the union (each removed member has a discriminant that rejects the source
+    /// literal, so it can never be the target) — an empty result means no arm
+    /// matched, so the original union stands and the mismatch is reported.
+    fn discriminateCtxUnion(c: *Checker, node: Node, rctx: TypeId) Error!TypeId {
+        var surviving = try c.memberList(rctx);
+        var narrowed = false;
+        for (c.tree.nodeRange(node)) |prop| {
+            if (prop == null_node or c.nodeTag(prop) != .object_property) continue;
+            const pd = c.tree.nodeData(prop);
+            if (pd.lhs != 0 and c.nodeTag(pd.lhs) == .computed_name) continue;
+            const lit = try c.discriminantLiteralOf(pd.rhs);
+            if (lit == types.no_type) continue;
+            const key = try c.memberAtom(c.tree.nodeMainToken(prop));
+            var keep: std.ArrayList(TypeId) = .empty;
+            defer keep.deinit(c.scratch());
+            for (surviving) |m| {
+                if (try c.propOfType(try c.resolveStructural(m), key)) |p| {
+                    if (try c.isAssignable(lit, p.ty)) try keep.append(c.scratch(), m);
+                } else {
+                    try keep.append(c.scratch(), m); // member does not constrain `key`
+                }
+            }
+            if (keep.items.len > 0 and keep.items.len < surviving.len) {
+                surviving = try c.scratch().dupe(TypeId, keep.items);
+                narrowed = true;
+            }
+        }
+        if (!narrowed) return rctx;
+        return c.ts.makeUnion(c.scratch(), surviving);
+    }
+
     fn checkObjectLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
-        const rctx = if (ctx != types.no_type) try c.resolveStructural(ctx) else types.no_type;
+        var rctx = if (ctx != types.no_type) try c.resolveStructural(ctx) else types.no_type;
+        if (rctx != types.no_type and c.ts.kind(rctx) == .union_type) {
+            rctx = try c.discriminateCtxUnion(node, rctx);
+        }
         var props: std.ArrayList(types.Prop) = .empty;
         defer props.deinit(c.scratch());
         var prop_index: std.AutoHashMapUnmanaged(Atom, u32) = .empty;
