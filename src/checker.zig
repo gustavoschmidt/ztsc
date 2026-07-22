@@ -6994,7 +6994,15 @@ const Checker = struct {
         var mod_src: TypeId = 0;
         if (s.kind(value) == .index_access and s.kind(s.indexAccessIndex(value)) == .mapped_param) {
             const o = try c.resolveStructural(s.indexAccessObj(value));
-            if (s.kind(o) == .object) mod_src = o;
+            // The modifiers type may be an object OR an intersection of objects
+            // (`Omit<Partial<Base> & (A|B|C), K>` — react-hook-form
+            // `RegisterOptions`). For an intersection, `propOfTypeEx` merges each
+            // constituent's optional/readonly flags (required wins), so a source
+            // prop that is optional in the `Partial<…>` constituent and absent
+            // elsewhere stays optional. Without this the intersection failed the
+            // `.object` gate, `mod_src` stayed 0, and every Pick/Omit prop read as
+            // required (spurious TS2739/TS2741 on `{ required }` → `RegisterOptions`).
+            if (s.kind(o) == .object or s.kind(o) == .intersection) mod_src = o;
         }
         const mod_mask = types.prop_flag_optional | types.prop_flag_readonly;
 
@@ -7011,7 +7019,7 @@ const Checker = struct {
                     const pt = try c.substMappedKey(value, key_id, key_lit);
                     var base: u32 = 0;
                     if (mod_src != 0) {
-                        if (s.objectPropByName(mod_src, s.literalAtom(key_lit))) |sp| base = sp.flags & mod_mask;
+                        if (try c.propOfTypeEx(mod_src, s.literalAtom(key_lit), false)) |sp| base = sp.flags & mod_mask;
                     }
                     try props.append(c.scratch(), .{ .name = name, .ty = pt, .flags = applyPropModifiers(base, flags) });
                 },
@@ -7020,7 +7028,7 @@ const Checker = struct {
                     const pt = try c.substMappedKey(value, key_id, key_lit);
                     var base: u32 = 0;
                     if (mod_src != 0) {
-                        if (s.objectPropByName(mod_src, nm)) |sp| base = sp.flags & mod_mask;
+                        if (try c.propOfTypeEx(mod_src, nm, false)) |sp| base = sp.flags & mod_mask;
                     }
                     try props.append(c.scratch(), .{ .name = nm, .ty = pt, .flags = applyPropModifiers(base, flags) });
                 },
