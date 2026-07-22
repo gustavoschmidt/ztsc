@@ -8705,6 +8705,20 @@ const Checker = struct {
     /// bivariant for methods; covariant returns; `void` target returns
     /// accept anything.
     fn signatureAssignable(c: *Checker, s: TypeId, t: TypeId) Error!bool {
+        // tsc's canonical type-IDENTITY probe `(<G>() => G extends X ? A : B)`
+        // (react-hook-form's `IsEqual`, and other libraries) compares two types
+        // for identity: `IsEqual<X,Y>` reduces to `(<G>()=>G extends X?1:2)
+        // extends (<G>()=>G extends Y?1:2)`, which tsc accepts iff X and Y are
+        // identical. The general `eraseTypeParams` path below erases the lone
+        // `G` to `any`, collapsing both conditional returns to `1|2` — so the
+        // probe wrongly reported *any* two sigs assignable and `IsEqual<X,Y>`
+        // was always `true` (making RHF `Path`/`PathValue` over an `any`-valued
+        // field, `AnyIsEqual<T,Record<string,any>>`, take the wrong branch and
+        // drop the deep `` `${K}.${…}` `` members). Recognize the exact shape and
+        // relate by extends/branch identity — leaving the lenient erasure every
+        // other generic-signature relation relies on untouched (a general
+        // abstract-param relation here regresses jest/mock generic sigs).
+        if (try c.identityProbeRelated(s, t)) |res| return res;
         const bivariant = (c.ts.fnFlags(s) & types.fn_flag_method != 0) or
             (c.ts.fnFlags(t) & types.fn_flag_method != 0);
         // Erase generics to their constraints (documented simplification).
@@ -8768,6 +8782,56 @@ const Checker = struct {
         // false, `void <: number` false, `void <: any/unknown` trivially
         // true), so defer to it unconditionally.
         return c.isAssignable(s_ret, t_ret);
+    }
+
+    /// If `sig` is the type-identity probe `<G>() => (G extends X ? A : B)` — a
+    /// single type param, no value params, a conditional return checked on that
+    /// param — return its conditional; else null.
+    fn identityProbeCond(c: *Checker, sig: TypeId) ?TypeId {
+        if (c.ts.kind(sig) != .function) return null;
+        const tps = c.ts.fnTypeParams(sig);
+        if (tps.len != 1) return null;
+        if (c.ts.fnParamCount(sig) != 0) return null;
+        const ret = c.ts.fnReturn(sig);
+        if (c.ts.kind(ret) != .conditional) return null;
+        const chk = c.ts.condCheck(ret);
+        if (c.ts.kind(chk) != .type_param) return null;
+        if (c.ts.typeParamSymbol(chk) != tps[0]) return null;
+        return ret;
+    }
+
+    /// When BOTH `s` and `t` are the identity probe `<G>()=>G extends _?_:_`,
+    /// relate them by IDENTITY of the extends types and branches (tsc's rule),
+    /// returning the result; otherwise null (fall through to the normal
+    /// signature relation).
+    fn identityProbeRelated(c: *Checker, s: TypeId, t: TypeId) Error!?bool {
+        const cs = c.identityProbeCond(s) orelse return null;
+        const ct = c.identityProbeCond(t) orelse return null;
+        const xs = try c.resolveStructural(c.ts.condExtends(cs));
+        const xt = try c.resolveStructural(c.ts.condExtends(ct));
+        // Only decide when BOTH extends types are GROUND. While either is still
+        // abstract (`IsEqual<TraversedTypes, infer V>` mid-reduction) the probe
+        // must stay deferred, so leave the pre-existing erasure path untouched
+        // — this keeps the change strictly additive (it alters only the
+        // concrete `IsEqual<A,B>` case, which is the bug).
+        if (try c.containsTypeParam(xs) or try c.containsInfer(xs) or
+            try c.containsTypeParam(xt) or try c.containsInfer(xt)) return null;
+        // Structural IDENTITY (not mutual assignability): the probe holds only
+        // when the two extends types and the two branches are the SAME type.
+        // ztsc interns objects/unions/etc. structurally, so identity is TypeId
+        // equality after `resolveStructural`. Mutual assignability is too loose
+        // — an `any`-valued index signature (`Record<string,any>`) is mutually
+        // assignable to a distinct object shape yet is not identical, which is
+        // exactly the case `IsEqual` must separate.
+        const ident = struct {
+            fn eq(cc: *Checker, a: TypeId, b: TypeId) Error!bool {
+                return (try cc.resolveStructural(a)) == (try cc.resolveStructural(b));
+            }
+        }.eq;
+        if (xs != xt) return false;
+        if (!try ident(c, c.ts.condTrue(cs), c.ts.condTrue(ct))) return false;
+        if (!try ident(c, c.ts.condFalse(cs), c.ts.condFalse(ct))) return false;
+        return true;
     }
 
     fn eraseTypeParams(c: *Checker, sig: TypeId) Error!TypeId {
