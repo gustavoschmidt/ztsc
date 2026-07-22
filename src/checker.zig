@@ -11977,6 +11977,51 @@ const Checker = struct {
                         try sigs.append(c.scratch(), c.ts.objectCallSig(r, @intCast(i)));
                     }
                 },
+                // Calling a union (e.g. `(A[] | B[]).map(...)`, where the member
+                // access yields a union of the constituents' call-signature
+                // functions). tsc: the union is callable iff EVERY constituent is
+                // callable; the call resolves against the gathered signatures
+                // (overload-style). A single `any`/`err` member makes the whole
+                // call `any` (its signatures are unconstrained). A `never` member
+                // contributes nothing (callable). Any non-callable member keeps
+                // the TS2349.
+                .union_type => {
+                    var all_callable = true;
+                    var saw_any = false;
+                    for (try c.memberList(r)) |m| {
+                        const rm = try c.resolveStructural(m);
+                        switch (c.ts.kind(rm)) {
+                            .any, .err => saw_any = true,
+                            .never => {},
+                            .function => try sigs.append(c.scratch(), rm),
+                            .overloads => {
+                                for (try c.memberList(rm)) |mm| try sigs.append(c.scratch(), mm);
+                            },
+                            .object => {
+                                const n = c.ts.objectCallSigCount(rm);
+                                if (n == 0) {
+                                    all_callable = false;
+                                } else {
+                                    for (0..n) |i| try sigs.append(c.scratch(), c.ts.objectCallSig(rm, @intCast(i)));
+                                }
+                            },
+                            else => all_callable = false,
+                        }
+                    }
+                    if (!all_callable) {
+                        try c.diagFmt(2349, c.nodeSpan(shape.callee), "This expression is not callable.", .{});
+                        for (shape.arg_nodes) |an| {
+                            if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
+                        }
+                        return types.error_type;
+                    }
+                    if (saw_any or sigs.items.len == 0) {
+                        for (shape.arg_nodes) |an| {
+                            if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
+                        }
+                        return types.any_type;
+                    }
+                },
                 else => {
                     try c.diagFmt(2349, c.nodeSpan(shape.callee), "This expression is not callable.", .{});
                     for (shape.arg_nodes) |an| {
