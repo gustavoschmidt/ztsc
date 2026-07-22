@@ -4485,7 +4485,7 @@ const Checker = struct {
         for (parts) |csym| {
             if (!c.symFlags(csym).interface) continue;
             const dm = try c.interfaceConstituentDirect(csym);
-            result = if (result == types.no_type) dm else try c.mergeBaseObject(result, dm);
+            result = if (result == types.no_type) dm else try c.mergeBaseObject(result, dm, true);
         }
         // An empty interface (no members, no bases) is still a nominal shape:
         // it lacks the implied string index that an empty object *literal* has.
@@ -4603,20 +4603,59 @@ const Checker = struct {
             }
             return result;
         }
-        return c.mergeBaseObject(derived, base);
+        return c.mergeBaseObject(derived, base, false);
     }
 
-    /// Merge base-object members into `derived` (derived wins).
-    fn mergeBaseObject(c: *Checker, derived: TypeId, base: TypeId) Error!TypeId {
+    /// Combined overload set of two callable members (`.function` or
+    /// `.overloads`), `a`'s signatures before `b`'s. Returns null when either
+    /// side is not callable, so the caller falls back to earlier-wins.
+    fn unionCallableSigs(c: *Checker, a: TypeId, b: TypeId) Error!?TypeId {
+        const s = &c.ts;
+        const ka = s.kind(a);
+        const kb = s.kind(b);
+        const a_ok = ka == .function or ka == .overloads;
+        const b_ok = kb == .function or kb == .overloads;
+        if (!a_ok or !b_ok) return null;
+        var sigs: std.ArrayList(TypeId) = .empty;
+        defer sigs.deinit(c.scratch());
+        for ([2]TypeId{ a, b }) |o| {
+            if (s.kind(o) == .overloads) {
+                for (s.members(o)) |m| try sigs.append(c.scratch(), m);
+            } else {
+                try sigs.append(c.scratch(), o);
+            }
+        }
+        return try s.makeOverloads(sigs.items);
+    }
+
+    /// Merge base-object members into `derived` (derived wins). When
+    /// `union_overloads` is set (the cross-file interface-declaration Phase-1
+    /// merge), a method declared in BOTH objects contributes its signatures to
+    /// a single combined overload set (`derived`'s first) rather than the
+    /// earlier declaration hiding the later's overloads — mirroring tsc's
+    /// declaration-order overload concatenation across merged interface
+    /// declarations, and the within-file reopened-block behavior already
+    /// implemented in `objectTypeFromMembers`. Base/heritage merging keeps
+    /// `union_overloads` false: an inherited member is shadowed, not unioned.
+    fn mergeBaseObject(c: *Checker, derived: TypeId, base: TypeId, union_overloads: bool) Error!TypeId {
         if (c.ts.kind(base) != .object or c.ts.kind(derived) != .object) return derived;
         var props: std.ArrayList(types.Prop) = .empty;
         defer props.deinit(c.scratch());
+        var idx: std.AutoHashMapUnmanaged(Atom, u32) = .empty;
+        defer idx.deinit(c.scratch());
         for (0..c.ts.objectPropCount(derived)) |i| {
-            try props.append(c.scratch(), c.ts.objectProp(derived, @intCast(i)));
+            const p = c.ts.objectProp(derived, @intCast(i));
+            try idx.put(c.scratch(), p.name, @intCast(props.items.len));
+            try props.append(c.scratch(), p);
         }
         for (0..c.ts.objectPropCount(base)) |i| {
             const bp = c.ts.objectProp(base, @intCast(i));
-            if (c.ts.objectPropByName(derived, bp.name) == null) {
+            if (idx.get(bp.name)) |di| {
+                if (union_overloads) {
+                    if (try c.unionCallableSigs(props.items[di].ty, bp.ty)) |mt| props.items[di].ty = mt;
+                }
+            } else {
+                try idx.put(c.scratch(), bp.name, @intCast(props.items.len));
                 try props.append(c.scratch(), bp);
             }
         }
@@ -4692,7 +4731,7 @@ const Checker = struct {
         }
         // Merge base class instance.
         if (try c.baseClassRef(sym)) |base_ref| {
-            result = try c.mergeBaseObject(result, try c.resolveStructural(base_ref));
+            result = try c.mergeBaseObject(result, try c.resolveStructural(base_ref), false);
         }
         try c.class_inst_generic.put(c.ca(), sym, result);
         return result;
