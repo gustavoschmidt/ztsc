@@ -11000,11 +11000,36 @@ const Checker = struct {
                 var parts: std.ArrayList(TypeId) = .empty;
                 defer parts.deinit(c.scratch());
                 for (try c.memberList(rctx)) |m| {
-                    const rm = try c.resolveStructural(m);
-                    if (try c.propOfType(rm, key)) |p| try parts.append(c.scratch(), p.ty);
+                    // Recurse (not a bare `propOfType`) so a union member that
+                    // is itself an intersection — an *optional* parameter typed
+                    // `RegisterOptions | undefined` where RegisterOptions is
+                    // `Partial<C> & (A | B | C)` — routes through the
+                    // intersection arm below and finds the union-nested prop.
+                    const pt = try c.ctxPropType(try c.resolveStructural(m), ctx, key);
+                    if (pt != types.no_type) try parts.append(c.scratch(), pt);
                 }
                 if (parts.items.len == 0) return types.no_type;
                 return c.ts.makeUnion(c.scratch(), parts.items);
+            },
+            // A contextual property inside an intersection (`Partial<C> & (A |
+            // B | C)`) may live in a *union* member. `propOfType` has no union
+            // arm, so the intersection lookup below would miss it and the
+            // property would widen (react-hook-form's RegisterOptions:
+            // `valueAsNumber?: false | true`, so a fresh `valueAsNumber: true`
+            // widened to `boolean` and matched no union arm → TS2345). Recurse
+            // per member — a union member is handled by the arm above — and
+            // intersect the per-member contextual types, mirroring tsc's
+            // `getTypeOfPropertyOfContextualType` over an intersection.
+            .intersection => {
+                var parts: std.ArrayList(TypeId) = .empty;
+                defer parts.deinit(c.scratch());
+                for (try c.memberList(rctx)) |m| {
+                    const pt = try c.ctxPropType(try c.resolveStructural(m), ctx, key);
+                    if (pt != types.no_type) try parts.append(c.scratch(), pt);
+                }
+                if (parts.items.len == 0) return types.no_type;
+                if (parts.items.len == 1) return parts.items[0];
+                return c.ts.makeIntersection(c.scratch(), parts.items);
             },
             else => {
                 if (try c.propOfType(rctx, key)) |p| return p.ty;
