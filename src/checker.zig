@@ -10405,12 +10405,19 @@ const Checker = struct {
             .jsx_expr_container => {
                 const cd = c.tree.nodeData(value);
                 if (cd.lhs == null_node) return types.undefined_type;
-                // Contextually type the value by the target prop type only for a
-                // template-literal expression, so it keeps its template structure
-                // instead of widening to `string` (`<Icon name={`ns:${s}`} />`
-                // against a `` `${string}:${string}` `` prop). Every other value
-                // kind is checked context-free, exactly as before.
-                const vctx = if (c.nodeTag(cd.lhs) == .template_expr) ctx else types.no_type;
+                // Contextually type the value by the target prop type for a
+                // template-literal expression (so it keeps its template structure
+                // instead of widening to `string`, e.g. `<Icon name={`ns:${s}`} />`
+                // against a `` `${string}:${string}` `` prop) and for an object
+                // literal (so its properties are typed by the target — e.g.
+                // `style={{ position: 'absolute' }}` against `CSSProperties`, whose
+                // `position` is a union of string literals: without the context the
+                // literal widens to `string` and rejects). Other value kinds are
+                // checked context-free, exactly as before.
+                const vctx = switch (c.nodeTag(cd.lhs)) {
+                    .template_expr, .object_literal => ctx,
+                    else => types.no_type,
+                };
                 return c.checkExprCached(cd.lhs, vctx);
             },
             .jsx_element => return c.checkJsxElement(value),
