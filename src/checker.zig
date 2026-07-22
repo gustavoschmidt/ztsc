@@ -10212,6 +10212,15 @@ const Checker = struct {
                 }
                 return false;
             },
+            // A template-literal or string-mapping context is a string subtype
+            // that admits any string literal *matching the pattern* (tsc
+            // isLiteralOfContextualType final mask: TemplateLiteral/StringMapping
+            // & isTypeAssignableTo). A generic call whose parameter is
+            // constrained to such a type — react-hook-form's `name: FieldPath<T>`
+            // (a `` `${string}` ``/dotted-path template union) — keeps the fresh
+            // field-name literal so the type param infers to it rather than
+            // widening to `string`.
+            .template_literal_type, .string_mapping => return lk == .string_literal and try c.isAssignable(lit, r),
             .type_param => {
                 const constraint = try c.typeParamConstraint(c.ts.typeParamSymbol(r));
                 if (constraint == types.no_type) return false;
