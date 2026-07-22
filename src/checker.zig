@@ -2783,6 +2783,23 @@ const Checker = struct {
             // possibly narrowed by an `as` remap. A generic key set stays
             // deferred; a concrete `as` clause is applied per key.
             .mapped => return c.keyofMapped(r),
+            // `keyof (A & B) === keyof A | keyof B` (tsc `getIndexType` maps over
+            // the intersection constituents and unions the per-constituent key
+            // sets). A concrete param-free intersection would otherwise fall to
+            // the `else` arm and wrongly collapse to `never`, so a conditional
+            // `K extends keyof (A & B)` (react-hook-form `PathValue`/`FieldPath`
+            // over an intersection form type) took its false arm. Per-member
+            // deferral is automatic: a generic constituent's `keyofType` returns
+            // its own deferred `keyof`, which the union carries and reduces once
+            // that constituent is known.
+            .intersection => {
+                var parts: std.ArrayList(TypeId) = .empty;
+                defer parts.deinit(c.scratch());
+                for (c.ts.members(r)) |m| {
+                    try parts.append(c.scratch(), try c.keyofType(m));
+                }
+                return c.ts.makeUnion(c.scratch(), parts.items);
+            },
             // A generic operand (a type param or another deferred node) → a
             // deferred `keyof` that resolves on instantiation. `keyof T` is not
             // computable until `T` is known, so it must not collapse to `never`.
@@ -7775,11 +7792,22 @@ const Checker = struct {
     /// Handles objects, intersections, arrays/tuples/strings (`length`),
     /// and type params (via constraint).
     fn propOfType(c: *Checker, t: TypeId, name: Atom) Error!?types.Prop {
+        return c.propOfTypeEx(t, name, true);
+    }
+
+    /// Named-property lookup. `allow_index=true` (the member-access default)
+    /// lets a string index signature stand in for any name — `obj.foo` on a
+    /// `{ [k: string]: V }` yields `V`. `allow_index=false` is the *assignability*
+    /// rule: a source's index signature does NOT satisfy a required *named*
+    /// target property (tsc reports TS2741/TS2740), so `{ [k: string]: any }` is
+    /// not assignable to `Date`/`{ x: number }`. Only the relation callers pass
+    /// false; the index signature is related separately (indexSignaturesRelatedTo).
+    fn propOfTypeEx(c: *Checker, t: TypeId, name: Atom, allow_index: bool) Error!?types.Prop {
         const s = &c.ts;
         switch (s.kind(t)) {
             .object => {
                 if (s.objectPropByName(t, name)) |p| return p;
-                if (s.objectStringIndex(t) != 0) {
+                if (allow_index and s.objectStringIndex(t) != 0) {
                     return .{ .name = name, .ty = s.objectStringIndex(t), .flags = 0 };
                 }
                 // A callable object/interface (one carrying call/construct
@@ -7796,7 +7824,7 @@ const Checker = struct {
                 var found: ?types.Prop = null;
                 for (try c.memberList(t)) |m| {
                     const r = try c.resolveStructural(m);
-                    if (try c.propOfType(r, name)) |p| {
+                    if (try c.propOfTypeEx(r, name, allow_index)) |p| {
                         if (found == null) {
                             found = p;
                         } else {
@@ -7833,15 +7861,15 @@ const Checker = struct {
             .type_param => {
                 const constraint = try c.typeParamConstraint(s.typeParamSymbol(t));
                 if (constraint == types.no_type) return null;
-                return c.propOfType(try c.resolveStructural(constraint), name);
+                return c.propOfTypeEx(try c.resolveStructural(constraint), name, allow_index);
             },
-            .ref => return c.propOfType(try c.resolveStructural(t), name),
-            .class_value => return c.propOfType(try c.classStaticType(s.classSymbol(t)), name),
+            .ref => return c.propOfTypeEx(try c.resolveStructural(t), name, allow_index),
+            .class_value => return c.propOfTypeEx(try c.classStaticType(s.classSymbol(t)), name, allow_index),
             .enum_type => {
                 // A value of enum type borrows its base primitive's members.
                 const info = try c.enumInfo(s.enumSymbol(t));
                 const base: TypeId = if (info.all_string) types.string_type else types.number_type;
-                return c.propOfType(base, name);
+                return c.propOfTypeEx(base, name, allow_index);
             },
             // A bare function type or overload set (arrow/normal function,
             // `(x) => y`, an overloaded signature) has the apparent members of
@@ -8618,7 +8646,11 @@ const Checker = struct {
         }
         for (0..n) |i| {
             const tp = c.ts.objectProp(t, @intCast(i));
-            const sp = (try c.propOfType(s, tp.name)) orelse {
+            // A source string index signature does NOT satisfy a required named
+            // target property (tsc TS2741/TS2740); it is related separately as an
+            // index signature below. So `{ [k: string]: any }` is not assignable
+            // to `Date`/`{ x: number }`.
+            const sp = (try c.propOfTypeEx(s, tp.name, false)) orelse {
                 if (tp.optional()) continue;
                 return false;
             };
@@ -9119,7 +9151,11 @@ const Checker = struct {
         for (0..c.ts.objectPropCount(rt)) |i| {
             const tp = c.ts.objectProp(rt, @intCast(i));
             if (tp.optional()) continue;
-            if ((try c.propOfType(rs, tp.name)) == null) {
+            // A source index signature does not supply a named property (see
+            // structuralAssignable): keep the missing-property diagnostic in
+            // step with the relation so `{ [k: string]: any }` → `Date` reports
+            // the missing Date members (TS2740), not a bare TS2322.
+            if ((try c.propOfTypeEx(rs, tp.name, false)) == null) {
                 try missing.append(c.scratch(), tp.name);
             }
         }
