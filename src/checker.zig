@@ -6203,8 +6203,23 @@ const Checker = struct {
         if (distributive and s.kind(chk) == .union_type) {
             var parts: std.ArrayList(TypeId) = .empty;
             defer parts.deinit(c.scratch());
-            for (try c.memberList(chk)) |m|
-                try parts.append(c.scratch(), try c.reduceConditional(m, extends_ty, true_ty, false_ty, false));
+            for (try c.memberList(chk)) |m| {
+                // A distributive conditional's true/false branch may BE the
+                // check type (`T extends U ? never : T` = Exclude, `? T :
+                // never` = Extract). When the naked-type-param distribution in
+                // `instantiateId` was bypassed — because the instantiated check
+                // is not a naked param but a `keyof X` / indexed access that
+                // resolved to this union (the `Omit`/`Exclude<keyof T, K>`
+                // composition) — the branch was baked to the WHOLE union
+                // instead of the per-member value. Rebind a branch that IS the
+                // check to the current member so `Omit<T, K>` actually strips
+                // the excluded keys. A branch that doesn't reference the check
+                // (e.g. `never`) is untouched, so ordinary distributions
+                // (Awaited) are unchanged.
+                const tru_m = if (true_ty == chk) m else true_ty;
+                const fls_m = if (false_ty == chk) m else false_ty;
+                try parts.append(c.scratch(), try c.reduceConditional(m, extends_ty, tru_m, fls_m, false));
+            }
             return s.makeUnion(c.scratch(), parts.items);
         }
         // Defer while a mapped key parameter is still unbound (M16b): a
