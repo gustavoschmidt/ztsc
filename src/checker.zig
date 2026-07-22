@@ -7412,6 +7412,62 @@ const Checker = struct {
         };
     }
 
+    /// Does the contextual type want a template-literal-typed value? True when
+    /// `ctx` is (or a union contains) a template-literal type — the only case
+    /// in which a template *expression* should keep a template-literal type
+    /// instead of widening to `string`. Gating on this keeps every other
+    /// template expression at `string` (zero blast radius).
+    fn ctxWantsTemplate(c: *Checker, ctx: TypeId) Error!bool {
+        if (ctx == types.no_type) return false;
+        const r = try c.resolveStructural(ctx);
+        switch (c.ts.kind(r)) {
+            .template_literal_type => return true,
+            .union_type => {
+                for (try c.memberList(r)) |m| if (try c.ctxWantsTemplate(m)) return true;
+                return false;
+            },
+            else => return false,
+        }
+    }
+
+    /// The `template_middle` / `template_tail` chunk token immediately following
+    /// a substitution that ends at byte `after`. Robust under nested template
+    /// substitutions: an inner template's tokens all start before `after`, so
+    /// the first middle/tail token at or past `after` is this template's chunk.
+    fn templateChunkTokAfter(c: *Checker, head_tok: TokenIndex, after: u32) TokenIndex {
+        const n = c.tree.tokens.len();
+        var t: usize = @as(usize, head_tok) + 1;
+        while (t < n) : (t += 1) {
+            const tg = c.tree.tokens.tag(@intCast(t));
+            if ((tg == .template_middle or tg == .template_tail) and c.tree.tokens.start(@intCast(t)) >= after)
+                return @intCast(t);
+        }
+        return head_tok;
+    }
+
+    /// A template-literal *expression* (`` `head${e0}c0${e1}…` ``) contextually
+    /// typed by a template-literal type: build the corresponding template-literal
+    /// *type* (`` `head${T0}c0${T1}…` ``) from the head/chunk texts and the
+    /// substitution types, rather than widening to `string`. This lets
+    /// `` `material-symbols:${status.icon}` `` (`status.icon: string`) satisfy a
+    /// `` `${string}:${string}` `` target — matching tsc's contextual typing.
+    fn templateExprType(c: *Checker, node: Node) Error!TypeId {
+        const main_tok = c.tree.nodeMainToken(node);
+        const head = try c.atom(c.templateHeadText(main_tok));
+        var holes: std.ArrayList(TypeId) = .empty;
+        defer holes.deinit(c.scratch());
+        var chunks: std.ArrayList(Atom) = .empty;
+        defer chunks.deinit(c.scratch());
+        for (c.tree.nodeRange(node)) |sub| {
+            const st = if (sub != null_node) try c.checkExprCached(sub, types.no_type) else types.string_type;
+            try holes.append(c.scratch(), st);
+            const ctok = c.templateChunkTokAfter(main_tok, c.nodeSpan(sub).end);
+            try chunks.append(c.scratch(), try c.atom(c.templateChunkText(ctok)));
+        }
+        if (holes.items.len == 0) return c.ts.makeStringLiteral(head, false);
+        return c.reduceTemplateChunks(head, holes.items, chunks.items);
+    }
+
     fn templateTypeFromNode(c: *Checker, node: Node) Error!TypeId {
         const d = c.tree.nodeData(node);
         const e = c.tree.extraData(ast.TemplateLitType, d.lhs);
@@ -9330,6 +9386,11 @@ const Checker = struct {
                 return c.checkExprCached(d.rhs, ctx);
             },
             .template_expr => {
+                // When the contextual type wants a template-literal type, keep
+                // the expression's template structure (checkExprCached on each
+                // substitution happens inside templateExprType); otherwise a
+                // template expression is just `string`.
+                if (try c.ctxWantsTemplate(ctx)) return c.templateExprType(node);
                 for (c.tree.nodeRange(node)) |sub| {
                     if (sub != null_node) _ = try c.checkExprCached(sub, types.no_type);
                 }
@@ -9529,6 +9590,34 @@ const Checker = struct {
                 break :blk if (sigs.len > 0) sigs[0] else return null;
             },
             .class_value => return c.jsxClassComponentProps(t),
+            // A callable *object* — a call/construct-signature-bearing interface
+            // used as a component — takes its first call signature.
+            .object => if (c.ts.objectCallSigCount(t) > 0)
+                c.ts.objectCallSig(t, 0)
+            else
+                return null,
+            // A function merged with a namespace
+            // (`declare function Icon(…); declare namespace Icon { … }`) types as
+            // an *intersection* of the function value and the namespace object
+            // (`computeTypeOfSymbol`). Pull the props from the callable
+            // constituent; without this the whole props target is dropped and
+            // every attribute goes unchecked (missing/excess/value all silently
+            // pass — e.g. a bad `<Icon name>` slips through).
+            .intersection => blk: {
+                for (try c.memberList(t)) |m| {
+                    const rm = try c.resolveStructural(m);
+                    switch (c.ts.kind(rm)) {
+                        .function => break :blk rm,
+                        .overloads => {
+                            const sigs = try c.memberList(rm);
+                            if (sigs.len > 0) break :blk sigs[0];
+                        },
+                        .object => if (c.ts.objectCallSigCount(rm) > 0) break :blk c.ts.objectCallSig(rm, 0),
+                        else => {},
+                    }
+                }
+                return null;
+            },
             else => return null,
         };
         // Bind explicit type arguments (`<Select<string> …>`) into the signature
@@ -9678,7 +9767,13 @@ const Checker = struct {
             }
             const ad = c.tree.nodeData(attr);
             const name_tok = c.tree.nodeMainToken(attr);
-            const vty = try c.jsxAttributeValueType(ad.lhs);
+            // Contextual type for the value = the target prop's type (used only
+            // for a template-literal expression value; see jsxAttributeValueType).
+            const vctx: TypeId = if (rt != types.no_type and c.tree.tokens.tag(name_tok) != .jsx_name) blk: {
+                const nm = try c.memberAtom(name_tok);
+                break :blk if (try c.propOfType(rt, nm)) |p| p.ty else types.no_type;
+            } else types.no_type;
+            const vty = try c.jsxAttributeValueType(ad.lhs, vctx);
             // Hyphenated names (`data-*`, `aria-*`) are exempt from excess and
             // assignability checks (tsc), but their value expressions are still
             // checked — `jsxAttributeValueType` above did that.
@@ -9981,14 +10076,20 @@ const Checker = struct {
     /// `"s"` literal, `name={e}` → type of `e` (literals kept fresh, so
     /// literal-union props accept them; widening is display-only), `name=<x/>`
     /// → JSX.Element.
-    fn jsxAttributeValueType(c: *Checker, value: Node) Error!TypeId {
+    fn jsxAttributeValueType(c: *Checker, value: Node, ctx: TypeId) Error!TypeId {
         if (value == null_node) return types.true_type; // boolean shorthand
         switch (c.nodeTag(value)) {
             .string_literal => return c.ts.makeStringLiteral(try c.memberAtom(c.tree.nodeMainToken(value)), true),
             .jsx_expr_container => {
                 const cd = c.tree.nodeData(value);
                 if (cd.lhs == null_node) return types.undefined_type;
-                return c.checkExprCached(cd.lhs, types.no_type);
+                // Contextually type the value by the target prop type only for a
+                // template-literal expression, so it keeps its template structure
+                // instead of widening to `string` (`<Icon name={`ns:${s}`} />`
+                // against a `` `${string}:${string}` `` prop). Every other value
+                // kind is checked context-free, exactly as before.
+                const vctx = if (c.nodeTag(cd.lhs) == .template_expr) ctx else types.no_type;
+                return c.checkExprCached(cd.lhs, vctx);
             },
             .jsx_element => return c.checkJsxElement(value),
             else => return types.any_type,
