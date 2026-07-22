@@ -3299,10 +3299,26 @@ const Checker = struct {
             const p = try c.paramInfo(pn, pi, ctx_sig, report_implicit);
             try params.append(c.scratch(), p);
             // Pin the parameter symbol's type so body checking sees the
-            // contextual/inferred type (not a re-derivation without ctx).
+            // contextual/inferred type (not a re-derivation without ctx). When a
+            // contextual signature is supplied (`ctx_sig`), FORCE-overwrite any
+            // previously-pinned value: the same arrow is materialized once per
+            // overload candidate during resolution (`argumentsMatch` trials), and
+            // `setTypeOfSymbol` is first-writer-wins — so a rejected candidate's
+            // param types (e.g. reduce's non-generic `(prev:T,cur:T)=>T` pinning
+            // `acc:T`) would otherwise freeze and block the SELECTED overload's
+            // correct `acc:U` types. The last materialization is the one the body
+            // is actually checked under, so it must win.
             if (p.name != 0) {
                 if (c.bind.lookupInScope(c.cur_scope, p.name)) |psym| {
-                    if (c.bind.symbol_flags[psym].param) c.setTypeOfSymbol(c.toGlobal(psym), p.ty);
+                    if (c.bind.symbol_flags[psym].param) {
+                        const gsym = c.toGlobal(psym);
+                        if (ctx_sig != types.no_type and gsym != binder.no_symbol and gsym < c.sym_types.items.len) {
+                            c.sym_types.items[gsym] = p.ty;
+                            c.sym_state.items[gsym] = .computed;
+                        } else {
+                            c.setTypeOfSymbol(gsym, p.ty);
+                        }
+                    }
                 }
             }
             pi += 1;
