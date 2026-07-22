@@ -3121,6 +3121,34 @@ const Checker = struct {
         try props.append(alloc, p);
     }
 
+    /// Fold the properties of a spread source (`{ ...src }`) into an object
+    /// literal's property set. An intersection source contributes the props of
+    /// every constituent (a later constituent wins on a name clash, mirroring
+    /// tsc's spread over `A & B`); without this, spreading a value of an
+    /// intersection type produced an empty `{}` (the object-only guard skipped
+    /// it), which then failed assignment to the very type it was spread from.
+    fn gatherSpreadProps(
+        c: *Checker,
+        st: TypeId,
+        props: *std.ArrayList(types.Prop),
+        prop_index: *std.AutoHashMapUnmanaged(Atom, u32),
+    ) Error!void {
+        switch (c.ts.kind(st)) {
+            .object => {
+                for (0..c.ts.objectPropCount(st)) |i| {
+                    const p = c.ts.objectProp(st, @intCast(i));
+                    try upsertProp(c.scratch(), props, prop_index, .{ .name = p.name, .ty = p.ty, .flags = p.flags & types.prop_flag_optional });
+                }
+            },
+            .intersection => {
+                for (try c.memberList(st)) |m| {
+                    try c.gatherSpreadProps(try c.resolveStructural(m), props, prop_index);
+                }
+            },
+            else => {},
+        }
+    }
+
     // =====================================================================
     // signatures
     // =====================================================================
@@ -10187,6 +10215,120 @@ const Checker = struct {
         return c.ts.makeTuple(elems.items);
     }
 
+    /// Collect the free type-param symbols reachable in `t` (structural walk,
+    /// no expansion — a `ref` contributes its args, not its resolved body).
+    fn collectTypeParamSyms(c: *Checker, t: TypeId, out: *std.ArrayList(u32)) Error!void {
+        const s = &c.ts;
+        switch (s.kind(t)) {
+            .type_param => {
+                const sym = s.typeParamSymbol(t);
+                for (out.items) |x| if (x == sym) return;
+                try out.append(c.scratch(), sym);
+            },
+            .array => try c.collectTypeParamSyms(s.arrayElem(t), out),
+            .union_type, .intersection, .overloads => {
+                for (try c.memberList(t)) |m| try c.collectTypeParamSyms(m, out);
+            },
+            .tuple => {
+                for (0..s.tupleLen(t)) |i| try c.collectTypeParamSyms(s.tupleElem(t, @intCast(i)).ty, out);
+            },
+            .object => {
+                for (0..s.objectPropCount(t)) |i| try c.collectTypeParamSyms(s.objectProp(t, @intCast(i)).ty, out);
+                if (s.objectStringIndex(t) != 0) try c.collectTypeParamSyms(s.objectStringIndex(t), out);
+                if (s.objectNumberIndex(t) != 0) try c.collectTypeParamSyms(s.objectNumberIndex(t), out);
+            },
+            .function => {
+                for (0..s.fnParamCount(t)) |i| try c.collectTypeParamSyms(s.fnParam(t, @intCast(i)).ty, out);
+                try c.collectTypeParamSyms(s.fnReturn(t), out);
+            },
+            .ref => {
+                for (try c.refArgsList(t)) |a| try c.collectTypeParamSyms(a, out);
+            },
+            .template_literal_type => {
+                for (0..s.templateHoleCount(t)) |i| try c.collectTypeParamSyms(s.templateHole(t, @intCast(i)), out);
+            },
+            .string_mapping => try c.collectTypeParamSyms(s.stringMappingArg(t), out),
+            .keyof_op => try c.collectTypeParamSyms(s.keyofOperand(t), out),
+            .conditional => {
+                try c.collectTypeParamSyms(s.condCheck(t), out);
+                try c.collectTypeParamSyms(s.condExtends(t), out);
+                try c.collectTypeParamSyms(s.condTrue(t), out);
+                try c.collectTypeParamSyms(s.condFalse(t), out);
+            },
+            .index_access => {
+                try c.collectTypeParamSyms(s.indexAccessObj(t), out);
+                try c.collectTypeParamSyms(s.indexAccessIndex(t), out);
+            },
+            else => {},
+        }
+    }
+
+    /// Reduce a (possibly generic) type to its base constraint by substituting
+    /// every free type param with its own declared constraint, iterated to a
+    /// fixed point (tsc's `getBaseConstraintOfType`). Lets a deferred alias
+    /// like `FieldPath<TFieldValues>` collapse to its concrete `${string}`
+    /// template union once the abstract inner params are replaced by their
+    /// constraints, so constraint-sensitive tests can see through it.
+    fn baseConstraintOf(c: *Checker, t: TypeId) Error!TypeId {
+        var syms: std.ArrayList(u32) = .empty;
+        defer syms.deinit(c.scratch());
+        try c.collectTypeParamSyms(t, &syms);
+        if (syms.items.len == 0) return t;
+        const map = try c.scratch().alloc(TpMap, syms.items.len);
+        for (syms.items, 0..) |sym, i| {
+            const con = try c.typeParamConstraint(sym);
+            map[i] = .{ .sym = sym, .ty = if (con != types.no_type) con else types.unknown_type };
+        }
+        var cur = t;
+        var iter: usize = 0;
+        while (iter < 8) : (iter += 1) {
+            const ni = try c.instantiate(cur, map);
+            if (ni == cur) break;
+            cur = ni;
+        }
+        return cur;
+    }
+
+    /// Is `t` (resolved) a primitive / literal / template / enum type, or a
+    /// union of such — i.e. a context that keeps a matching fresh literal
+    /// (tsc's `maybeTypeOfKind(..., Literal-ish)`)?
+    fn isPrimitiveLiteralish(c: *Checker, t: TypeId) Error!bool {
+        const r = try c.resolveStructural(t);
+        return switch (c.ts.kind(r)) {
+            .string, .string_literal, .template_literal_type, .string_mapping, .number, .number_literal, .number_literal_fresh, .bigint, .bigint_literal, .boolean, .bool_true, .bool_false, .enum_type => true,
+            .union_type => blk: {
+                for (try c.memberList(r)) |m| {
+                    if (try c.isPrimitiveLiteralish(m)) break :blk true;
+                }
+                break :blk false;
+            },
+            else => false,
+        };
+    }
+
+    /// Would contextually typing an object-literal argument by `pt` preserve a
+    /// property literal that would otherwise widen? True only when `pt` (an
+    /// object) has a property whose type is a *type variable* whose base
+    /// constraint is primitive-literal-ish — the `name: TFieldName` (`TFieldName
+    /// extends FieldPath<T>`) shape. This gates the object-literal contextual
+    /// pass so it fires for react-hook-form-style literal-key inference but not
+    /// for object literals whose params are plain callbacks (`openDB({ upgrade
+    /// }))`) or unions, which contextual typing would perturb without benefit.
+    fn paramWantsLiteralCtx(c: *Checker, pt: TypeId) Error!bool {
+        const r = try c.resolveStructural(pt);
+        if (c.ts.kind(r) != .object) return false;
+        for (0..c.ts.objectPropCount(r)) |i| {
+            const p = c.ts.objectProp(r, @intCast(i));
+            const pr = try c.resolveStructural(p.ty);
+            if (c.ts.kind(pr) != .type_param) continue;
+            const con = try c.typeParamConstraint(c.ts.typeParamSymbol(pr));
+            if (con == types.no_type) continue;
+            const base = if (try c.containsTypeParam(con)) try c.baseConstraintOf(con) else con;
+            if (try c.isPrimitiveLiteralish(base)) return true;
+        }
+        return false;
+    }
+
     /// Does the contextual type admit literal types of `t`'s kind, so the
     /// fresh literal should be kept instead of widened? (tsc's
     /// isLiteralOfContextualType; contextual `boolean` counts because it
@@ -10224,7 +10366,20 @@ const Checker = struct {
             .type_param => {
                 const constraint = try c.typeParamConstraint(c.ts.typeParamSymbol(r));
                 if (constraint == types.no_type) return false;
-                return c.contextAdmitsLiteral(constraint, lit);
+                if (try c.contextAdmitsLiteral(constraint, lit)) return true;
+                // A generic constraint (`TFieldName extends FieldPath<
+                // TFieldValues>`) stays deferred while its own type params are
+                // abstract, so the resolved form is neither a literal nor a
+                // template and the test above fails. Reduce it to its base
+                // constraint (inner params → their constraints) so the alias
+                // collapses to its concrete `${string}` template union and can
+                // admit the field-name literal. Only the generic case retries —
+                // a concrete constraint already had its full say above.
+                if (try c.containsTypeParam(constraint)) {
+                    const base = try c.baseConstraintOf(constraint);
+                    if (base != constraint) return c.contextAdmitsLiteral(base, lit);
+                }
+                return false;
             },
             else => return false,
         }
@@ -10353,12 +10508,7 @@ const Checker = struct {
                 },
                 .spread_element => {
                     const st = try c.resolveStructural(try c.checkExprCached(pd.lhs, types.no_type));
-                    if (c.ts.kind(st) == .object) {
-                        for (0..c.ts.objectPropCount(st)) |i| {
-                            const p = c.ts.objectProp(st, @intCast(i));
-                            try upsertProp(c.scratch(), &props, &prop_index, .{ .name = p.name, .ty = p.ty, .flags = p.flags & types.prop_flag_optional });
-                        }
-                    }
+                    try c.gatherSpreadProps(st, &props, &prop_index);
                 },
                 else => _ = try c.checkExprCached(prop, types.no_type),
             }
@@ -11514,6 +11664,20 @@ const Checker = struct {
             // collapsing to `unknown`.
             var arg_ctx = switch (tag) {
                 .array_literal, .call_expr, .call_expr_targs, .optional_call, .new_expr, .new_expr_bare, .new_expr_targs => pt,
+                // Contextually type an object-literal argument by the parameter
+                // so a property whose parameter type is a literal-constrained
+                // inference target (`name: TFieldName`, `TFieldName extends
+                // FieldPath<T>` — a string-literal union) keeps its literal
+                // instead of widening to `string`. Without it, `useWatch({
+                // control, name: 'selectedActions' })` widens `'selectedActions'`
+                // → `string`, which fails the `FieldPath` constraint, so
+                // `TFieldName` falls back to the whole path union and the return
+                // `FieldPathValue<T, TFieldName>` collapses. Mirrors tsc's
+                // `getContextualTypeForArgument`. Gated to params that actually
+                // have a literal-keeping type-variable property so unrelated
+                // object-literal arguments (callback bags like `openDB({ upgrade
+                // })`) keep their context-free check.
+                .object_literal => if (try c.paramWantsLiteralCtx(pt)) pt else types.no_type,
                 else => types.no_type,
             };
             // Fresh object literal into a bare type-param parameter (`truncate<T
@@ -11809,6 +11973,36 @@ const Checker = struct {
             .object => {
                 const ra = try c.resolveStructural(arg);
                 if (s.kind(ra) == .object) {
+                    // Same-origin fast path (tsc's `inferFromTypes` same-reference
+                    // rule). A generic interface/alias parameter whose type args
+                    // include the signature's fresh type params is materialized as
+                    // an *expanded object* (instantiated at its own defaults via
+                    // the higher-order-sig machinery), yet its origin tag still
+                    // records the pre-default ref — e.g. `Control<TFieldValues,
+                    // any, TTransformedValues>`. When the argument is an expansion
+                    // of the SAME generic (`Control<Payload, …>`), walking the two
+                    // objects prop-by-prop cannot invert `TFieldValues` through
+                    // Control's deeply nested mapped/conditional members
+                    // (`FieldErrors<T>`, `Subjects<T>`, …). Instead pair the origin
+                    // type args positionally and infer from them — this is how
+                    // `useWatch({ control, name })` recovers `TFieldValues` from
+                    // the `control: Control<TFieldValues>` property. Identity-only:
+                    // it fires solely when both origins are refs to the SAME
+                    // symbol (a different generic falls through to the structural
+                    // walk below). Mirrors the `.ref` arm's identity pairing.
+                    if (c.origin.get(param)) |po| {
+                        if (c.origin.get(ra)) |ao| {
+                            if (s.kind(po) == .ref and s.kind(ao) == .ref and
+                                s.refSymbol(po) == s.refSymbol(ao))
+                            {
+                                const pa = try c.scratch().dupe(TypeId, s.refArgs(po));
+                                const aa = try c.scratch().dupe(TypeId, s.refArgs(ao));
+                                const n = @min(pa.len, aa.len);
+                                for (0..n) |i| try c.unify(pa[i], aa[i], tp_syms, candidates, depth + 1);
+                                return;
+                            }
+                        }
+                    }
                     for (0..s.objectPropCount(param)) |i| {
                         const pp = s.objectProp(param, @intCast(i));
                         if (s.objectPropByName(ra, pp.name)) |ap| {
