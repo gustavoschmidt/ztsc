@@ -8439,8 +8439,50 @@ const Checker = struct {
     /// required leniency. Kept to the cast site only — narrowing/discriminant
     /// uses of isComparable are unchanged.
     fn castComparable(c: *Checker, a: TypeId, b: TypeId) Error!bool {
-        if (try c.isComparable(a, b)) return true;
-        return (try c.lenientOverlap(a, b, 0)) or (try c.lenientOverlap(b, a, 0));
+        return c.castComparableRec(a, b, 0);
+    }
+
+    /// tsc's *comparable* relation distributes over unions existentially and
+    /// resolves a type parameter to its constraint. A cast `x as T` where `T`
+    /// is a type parameter is legal iff `x` is comparable to `T`'s constraint —
+    /// and an unconstrained parameter (constraint `unknown`/`any`) is
+    /// comparable to anything, since it could be instantiated to `x`'s type.
+    /// Likewise a union on either side is comparable iff SOME constituent is
+    /// (`{full_name} as ({full_name; id} | null)` overlaps the non-null branch).
+    /// Oracle-verified: a *constrained* parameter still rejects a
+    /// non-overlapping cast (`T extends {a} as {b}`), and a union rejects only
+    /// when NO constituent overlaps (`{q} as (number | boolean)`).
+    fn castComparableRec(c: *Checker, a0: TypeId, b0: TypeId, depth: u32) Error!bool {
+        if (depth > 8) return true; // under-report over false-reject, per policy
+        const a = try c.resolveStructural(a0);
+        const b = try c.resolveStructural(b0);
+        // Type parameter on either side → defer to its constraint; unconstrained
+        // (or unknown/any constraint) overlaps everything.
+        if (c.ts.kind(a) == .type_param) {
+            const con = try c.typeParamConstraint(c.ts.typeParamSymbol(a));
+            if (con == types.no_type or c.ts.kind(con) == .unknown or c.ts.kind(con) == .any or con == a) return true;
+            return c.castComparableRec(con, b0, depth + 1);
+        }
+        if (c.ts.kind(b) == .type_param) {
+            const con = try c.typeParamConstraint(c.ts.typeParamSymbol(b));
+            if (con == types.no_type or c.ts.kind(con) == .unknown or c.ts.kind(con) == .any or con == b) return true;
+            return c.castComparableRec(a0, con, depth + 1);
+        }
+        // Existential union distribution on either side.
+        if (c.ts.kind(a) == .union_type) {
+            for (try c.memberList(a)) |m| {
+                if (try c.castComparableRec(m, b0, depth + 1)) return true;
+            }
+            return false;
+        }
+        if (c.ts.kind(b) == .union_type) {
+            for (try c.memberList(b)) |m| {
+                if (try c.castComparableRec(a0, m, depth + 1)) return true;
+            }
+            return false;
+        }
+        if (try c.isComparable(a0, b0)) return true;
+        return (try c.lenientOverlap(a0, b0, depth)) or (try c.lenientOverlap(b0, a0, depth));
     }
 
     /// One direction of the lenient comparable relation: does source `s0`
@@ -8491,8 +8533,11 @@ const Checker = struct {
     }
 
     fn lenientComparable(c: *Checker, a: TypeId, b: TypeId, depth: u32) Error!bool {
-        if (try c.isComparable(a, b)) return true;
-        return (try c.lenientOverlap(a, b, depth)) or (try c.lenientOverlap(b, a, depth));
+        // Nested comparability (array elements, object props) distributes over
+        // unions and resolves type-parameter constraints exactly like the
+        // top-level cast — an array of a union of literals overlaps an array of
+        // an intersection element when SOME source constituent overlaps.
+        return c.castComparableRec(a, b, depth);
     }
 
     /// Union-distributing overlap test for TS2367/TS2678: some pair of
@@ -15878,6 +15923,14 @@ test "as-casts (2352)" {
     try expectClean("declare const n: number | string; const m = n as number;");
     try expectCodes("declare const s: string; const n = s as number;", &.{2352});
     try expectClean("declare const s: string; const n = s as unknown as number;");
+    // Cast to/from an unconstrained type parameter overlaps anything.
+    try expectClean("function f<T>(x: { a: number }): T { return x as T; }");
+    try expectClean("function f<T>(x: T): { a: number } { return x as { a: number }; }");
+    // Union target: overlaps via one constituent; rejects when none overlap.
+    try expectClean("declare const o: { name: string }; const p = o as ({ name: string; id: number } | null);");
+    try expectCodes("declare const o: { q: number }; const n = o as (number | boolean);", &.{2352});
+    // A constrained type parameter still rejects a non-overlapping cast.
+    try expectCodes("function f<T extends { a: number }>(x: T): { b: string } { return x as { b: string }; }", &.{2352});
 }
 
 test "printer goldens via diagnostics" {
