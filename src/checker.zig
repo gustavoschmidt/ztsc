@@ -11877,6 +11877,19 @@ const Checker = struct {
             }
             return if (rk == .err) types.error_type else types.any_type;
         }
+        // Calling a value of the global `Function` type: tsc treats `Function`
+        // as callable, accepting any arguments and yielding `any` (the interface
+        // body carries no call signature, so a structural resolve would report
+        // TS2349). Mirrors the assignable-to-`Function` special-case in the
+        // relation. Only for calls — `new (x: Function)` stays unmodeled.
+        if (!is_new and c.ts.kind(callee_t) == .ref and
+            c.globalSymNamed(c.ts.refSymbol(callee_t), "Function"))
+        {
+            for (shape.arg_nodes) |an| {
+                if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
+            }
+            return types.any_type;
+        }
 
         // Explicit type arguments.
         var targs: std.ArrayList(TypeId) = .empty;
@@ -15775,6 +15788,11 @@ test "calls: arity, arguments, overloads pick-first" {
         \\pick(true);
     , &.{2769});
     try expectCodes("declare const n: number; n();", &.{2349});
+    // Negative controls for the global-`Function`-is-callable fix (see the
+    // conformance fixture `calls/037_function_type_callable`): values that are
+    // genuinely not callable still report TS2349.
+    try expectCodes("declare const o: { a: number }; o();", &.{2349});
+    try expectCodes("declare const s: string; s();", &.{2349});
 }
 
 test "generic calls: basic inference and explicit args" {
