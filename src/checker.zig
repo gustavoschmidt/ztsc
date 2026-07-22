@@ -11389,6 +11389,52 @@ const Checker = struct {
         try c.diagFmt(2356, c.nodeSpan(node), "An arithmetic operand must be of type 'any', 'number', 'bigint' or an enum type.", .{});
     }
 
+    /// TS2359 gate: is `t` a valid `instanceof` right-hand side — i.e. `any`,
+    /// or a type assignable to the `Function` interface? tsc accepts any type
+    /// that carries a call or construct signature (constructor interfaces like
+    /// `ErrorConstructor`/`RegExpConstructor` behind the `Error`/`RegExp`
+    /// value globals, plain function types, class constructors), or that
+    /// declares a `[Symbol.hasInstance]` method. Refs are resolved structurally
+    /// so a value typed as a constructor interface is recognized; a union is
+    /// valid iff every constituent is, an intersection iff any is, and a
+    /// type-parameter defers to its constraint.
+    fn instanceofRhsIsFunctionLike(c: *Checker, t: TypeId, depth: u32) Error!bool {
+        if (depth > 8) return true; // give up conservatively — never over-report
+        switch (c.ts.kind(t)) {
+            .any, .err, .function, .overloads, .class_value => return true,
+            else => {},
+        }
+        const rs = try c.resolveStructural(t);
+        switch (c.ts.kind(rs)) {
+            .any, .err, .function, .overloads, .class_value => return true,
+            .object => {
+                if (c.ts.objectHasSigs(rs)) return true;
+                // A plain object with a `[Symbol.hasInstance]` method is a
+                // legal RHS (tsc), even without call/construct signatures.
+                if (c.ts.objectPropByName(rs, try c.atom("__@hasInstance")) != null) return true;
+                return false;
+            },
+            .union_type => {
+                for (try c.memberList(rs)) |m| {
+                    if (!try c.instanceofRhsIsFunctionLike(m, depth + 1)) return false;
+                }
+                return true;
+            },
+            .intersection => {
+                for (try c.memberList(rs)) |m| {
+                    if (try c.instanceofRhsIsFunctionLike(m, depth + 1)) return true;
+                }
+                return false;
+            },
+            .type_param => {
+                const con = try c.typeParamConstraint(c.ts.typeParamSymbol(rs));
+                if (con == types.no_type or con == rs or con == t) return false;
+                return c.instanceofRhsIsFunctionLike(con, depth + 1);
+            },
+            else => return false,
+        }
+    }
+
     fn checkBinary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         const d = c.tree.nodeData(node);
         const op = c.tree.tokens.tag(c.tree.nodeMainToken(node));
@@ -11484,8 +11530,7 @@ const Checker = struct {
             .keyword_instanceof => {
                 _ = try c.checkExprCached(d.lhs, types.no_type);
                 const rt = try c.checkExprCached(d.rhs, types.no_type);
-                const rk = c.ts.kind(rt);
-                if (rk != .class_value and rk != .any and rk != .err and rk != .function and rk != .overloads) {
+                if (!try c.instanceofRhsIsFunctionLike(rt, 0)) {
                     try c.diagFmt(2359, c.nodeSpan(d.rhs), "The right-hand side of an 'instanceof' expression must be of type 'any' or of a type assignable to the 'Function' interface type.", .{});
                 }
                 return types.boolean_type;
