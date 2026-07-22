@@ -530,6 +530,14 @@ const Parser = struct {
         return tag == .identifier or tag.isContextualKeyword() or tag.isStrictReservedKeyword();
     }
 
+    /// A ModuleExportName (the name/alias position of an import or export
+    /// specifier): any IdentifierName — i.e. a plain identifier OR any reserved
+    /// word, notably `default` in `export { default as x } from "m"` and
+    /// `export { x as default }` — or a string literal.
+    fn isModuleExportName(tag: TokTag) bool {
+        return tag == .identifier or tag.isKeyword() or tag == .string_literal;
+    }
+
     /// Tokens acceptable as a member/property name (any keyword works).
     fn isNameLike(tag: TokTag) bool {
         return tag == .identifier or tag == .private_identifier or tag.isKeyword();
@@ -1967,7 +1975,7 @@ const Parser = struct {
                     }
                 }
             }
-            if (!isIdentLike(p.curTag()) and p.curTag() != .string_literal) {
+            if (!isModuleExportName(p.curTag())) {
                 try p.fail(.expected_identifier);
                 if (p.curIdx() == before) break;
                 continue;
@@ -2118,7 +2126,7 @@ const Parser = struct {
                     }
                 }
             }
-            if (!isIdentLike(p.curTag()) and p.curTag() != .string_literal) {
+            if (!isModuleExportName(p.curTag())) {
                 try p.fail(.expected_identifier);
                 if (p.curIdx() == before) break;
                 continue;
@@ -2126,7 +2134,9 @@ const Parser = struct {
             const name = try p.bump();
             var alias: u32 = 0;
             if (try p.eat(.keyword_as) != null) {
-                if (isIdentLike(p.curTag()) or p.curTag() == .string_literal) {
+                // The export name (alias) is also a ModuleExportName, so
+                // `export { Foo as default }` and string aliases are legal.
+                if (isModuleExportName(p.curTag())) {
                     alias = try p.bump();
                 } else {
                     try p.fail(.expected_identifier);
@@ -4403,6 +4413,18 @@ test "golden: export forms" {
     );
     try expectSExpr("export * as ns from \"mod\";",
         \\(export_all ns=ns from="mod")
+    );
+    // ModuleExportName: `default` (a reserved word) is legal in both the name
+    // and alias positions of a specifier — the renamed-default re-export used
+    // by uuid/react-spinners barrels, and re-exporting a binding as default.
+    try expectSExpr("export { default as v4 } from \"mod\";",
+        \\(export_named from="mod" (export_specifier default as=v4))
+    );
+    try expectSExpr("export { Foo as default };",
+        \\(export_named (export_specifier Foo as=default))
+    );
+    try expectSExpr("import { default as v4 } from \"mod\";",
+        \\(import_decl from="mod" (import_specifier default as=v4))
     );
 }
 
