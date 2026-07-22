@@ -11387,10 +11387,18 @@ const Checker = struct {
                 } else if (rk == .object and c.ts.objectStringIndex(r) != 0) {
                     result = c.ts.objectStringIndex(r);
                 } else {
-                    try c.diagFmt(2339, c.nodeSpan(d.rhs), "Property '{s}' does not exist on type '{s}'.", .{
-                        c.atomText(key), try c.typeToString(obj_t),
-                    });
-                    result = types.error_type;
+                    // Element access `o['k']` with a string-literal key that is
+                    // neither a known property nor covered by a string index is,
+                    // for tsc, an implicit-'any' element access (TS7053) — NOT a
+                    // missing-property TS2339 (which is reserved for dotted `o.k`).
+                    // Suppressed under `noImplicitAny: false`; the result is `any`
+                    // either way.
+                    if (c.prog.no_implicit_any) {
+                        try c.diagFmt(7053, c.nodeSpan(node), "Element implicitly has an 'any' type because expression of type '{s}' can't be used to index type '{s}'.", .{
+                            try c.typeToString(idx_t), try c.typeToString(obj_t),
+                        });
+                    }
+                    result = types.any_type;
                 }
             },
             .number_literal => {
