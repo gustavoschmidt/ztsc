@@ -9696,10 +9696,115 @@ const Checker = struct {
         };
         // Bind explicit type arguments (`<Select<string> …>`) into the signature
         // so the props type is concrete. Mirrors the explicit-targ path of a
-        // generic call; a count mismatch reports TS2558 there.
-        if (explicit_targs.len > 0) sig = try c.instantiateSigForCall(sig, explicit_targs, &.{}, node, types.no_type);
+        // generic call; a count mismatch reports TS2558 there. With no explicit
+        // args, a *generic* component's type params are inferred from the
+        // attributes (tsc's "attributes object as the sole argument" model) —
+        // without this `<Controller name control render>` keeps its props type
+        // generic, so `control={control}` relates `Control<Form>` against the
+        // still-free `Control<TFieldValues>` and its deferred `_defaultValues`
+        // mapped-over-conditional spuriously fails (TS2322).
+        if (explicit_targs.len > 0) {
+            sig = try c.instantiateSigForCall(sig, explicit_targs, &.{}, node, types.no_type);
+        } else if (c.ts.fnTypeParams(sig).len > 0) {
+            const tps = try c.scratch().dupe(u32, c.ts.fnTypeParams(sig));
+            const e = c.tree.extraData(ast.JsxElementData, c.tree.nodeData(node).lhs);
+            sig = try c.inferJsxTargs(sig, tps, e);
+        }
         if (c.ts.fnParamCount(sig) == 0) return types.empty_object_type;
         return c.ts.fnParam(sig, 0).ty;
+    }
+
+    /// Infer a generic component's type arguments from its JSX attributes,
+    /// mirroring tsc's "attributes object as the sole argument" model, then
+    /// return the signature instantiated with them. Only non-function attribute
+    /// values drive inference (a `render` callback is contextually typed, not a
+    /// Phase-1 inference source). A param no attribute constrains falls back to
+    /// its default, else its constraint, else `unknown` — so an un-inferred
+    /// `Controller<TFieldValues, TName>` resolves to concrete
+    /// `ControllerProps<Form, FieldPath<Form>, …>` whose props relate reflexively.
+    /// Whether `t` is (or resolves to) an object whose string index signature is
+    /// `any` and which carries no required named properties — the `Record<string,
+    /// any>` shape (react-hook-form `FieldValues`). Such a constraint imposes no
+    /// real requirement, so a JSX-inferred object candidate should not be clamped
+    /// to it. Deliberately narrow: a concrete-valued index (`Record<string,
+    /// string>`) or an index-plus-required-props shape returns false.
+    fn constraintIsAnyIndex(c: *Checker, t: TypeId) Error!bool {
+        if (t == types.no_type) return false;
+        const r = try c.resolveStructural(t);
+        if (c.ts.kind(r) != .object) return false;
+        const sidx = c.ts.objectStringIndex(r);
+        if (sidx == 0 or c.ts.kind(try c.resolveStructural(sidx)) != .any) return false;
+        for (0..c.ts.objectPropCount(r)) |i| {
+            if (!c.ts.objectProp(r, @intCast(i)).optional()) return false;
+        }
+        return true;
+    }
+
+    fn inferJsxTargs(c: *Checker, sig: TypeId, tps: []const u32, e: ast.JsxElementData) Error!TypeId {
+        if (c.ts.fnParamCount(sig) == 0) return sig;
+        const rp0 = try c.resolveStructural(c.ts.fnParam(sig, 0).ty);
+        const candidates = try c.scratch().alloc(TypeId, tps.len);
+        for (candidates) |*x| x.* = types.no_type;
+        // Phase 1: unify each non-function attribute value against its target prop.
+        for (c.tree.extraRange(e.attrs_start, e.attrs_end)) |attr| {
+            if (c.nodeTag(attr) == .jsx_spread_attribute) continue;
+            const name_tok = c.tree.nodeMainToken(attr);
+            if (c.tree.tokens.tag(name_tok) == .jsx_name) continue; // hyphenated data-*/aria-*
+            const ad = c.tree.nodeData(attr);
+            // Skip a function-valued attribute (`render={() => …}`): a callback is
+            // contextually typed, not a raw inference source, and typing it here
+            // context-free would pollute the candidates.
+            if (ad.lhs != null_node and c.nodeTag(ad.lhs) == .jsx_expr_container) {
+                const cd = c.tree.nodeData(ad.lhs);
+                if (cd.lhs != null_node and (c.nodeTag(cd.lhs) == .arrow_fn or c.nodeTag(cd.lhs) == .function_expr)) continue;
+            }
+            const pt = (try c.propOfType(rp0, try c.memberAtom(name_tok))) orelse continue;
+            const vty = try c.jsxAttributeValueType(ad.lhs, types.no_type);
+            try c.unify(pt.ty, vty, tps, candidates, 0);
+        }
+        // Resolve each param: inferred candidate (clamped to its constraint when
+        // it violates it), else default, else constraint, else `unknown`. Mirrors
+        // the final resolution loop of `inferTypeArgs`, threading each resolved
+        // arg into `prov` so a later param's constraint (`TName extends
+        // FieldPath<TFieldValues>`) sees the earlier one substituted.
+        const args_buf = try c.scratch().alloc(TypeId, tps.len);
+        const prov = try c.scratch().alloc(TpMap, tps.len);
+        for (tps, 0..) |tp, i| prov[i] = .{ .sym = tp, .ty = if (candidates[i] != types.no_type) candidates[i] else types.any_type };
+        for (tps, 0..) |tp, i| {
+            var constraint: TypeId = try c.typeParamConstraint(tp);
+            if (constraint != types.no_type) constraint = try c.instantiate(constraint, prov);
+            if (candidates[i] != types.no_type) {
+                args_buf[i] = candidates[i];
+                const bare_outer = constraint != types.no_type and
+                    c.ts.kind(constraint) == .type_param and
+                    tpIndex(tps, c.ts.typeParamSymbol(constraint)) == null;
+                // An `any`-valued index-signature constraint (`TFieldValues
+                // extends FieldValues`, `FieldValues = Record<string, any>`) is
+                // satisfied by any object candidate: tsc admits a named interface
+                // there (every member is trivially assignable to `any`), so the
+                // attribute-derived candidate must NOT be clamped down to
+                // `FieldValues`. ztsc's general object→`{[x:string]:any}` relation
+                // still rejects a named interface (a separate, unrelated gap), so
+                // the clamp is bypassed explicitly here. Without this, `Controller`
+                // resolves `TFieldValues` to `FieldValues`, its `_defaultValues`
+                // stays `{[x:string]:any}`, and `control={control}` fails (TS2322).
+                const any_index_ok = try c.constraintIsAnyIndex(constraint) and
+                    c.ts.kind(try c.resolveStructural(candidates[i])) == .object;
+                if (constraint != types.no_type and !bare_outer and !any_index_ok and
+                    !try c.isAssignable(candidates[i], constraint))
+                {
+                    args_buf[i] = constraint;
+                }
+            } else if (c.typeParamHasDefault(tp)) {
+                args_buf[i] = try c.instantiate(try c.typeParamDefault(tp), prov);
+            } else {
+                args_buf[i] = if (constraint != types.no_type) constraint else types.unknown_type;
+            }
+            prov[i].ty = args_buf[i];
+        }
+        const map = try c.scratch().alloc(TpMap, tps.len);
+        for (tps, 0..) |tp, i| map[i] = .{ .sym = tp, .ty = args_buf[i] };
+        return c.instantiate(sig, map);
     }
 
     /// Props of a class component: read the member named by
