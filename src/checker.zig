@@ -6844,19 +6844,25 @@ const Checker = struct {
         const homomorphic = flags & types.mapped_flag_homomorphic != 0;
         // Deferral is decided by the *key set* only: the value/`as` branches may
         // still be generic (they materialize into generic-typed props). The key
-        // set of a homomorphic map is `keyof src`, which is concrete whenever
-        // `src`'s only type variables are locally bound (e.g. a namespace with a
-        // generic-signature member) — so the *free* type-param test is used, not
-        // the plain one, else the map is stranded deferred and its members lost.
-        // The key source is `keyof src` (homomorphic) or the constraint. It is
-        // generic — and the map must stay deferred — while it mentions a free
-        // type param OR an as-yet-unbound `infer` var. The `infer`-var case
-        // arises when a mapped alias is applied to an infer var of an enclosing
-        // conditional (`Rec<…> = … ? Acc & F<Head> : Acc`, F a mapped alias):
-        // the body is built with `Head` still symbolic, so materializing now
-        // would iterate an empty key set and freeze the map to `{}`. Deferring
-        // lets `substInfer` (its `.mapped` arm) re-enter here once `Head` binds.
-        const key_src = if (homomorphic) src_type else constraint;
+        // set of a homomorphic map is literally `keyof src` — NOT `src` itself.
+        // A concrete-keyed source with still-generic *values* (e.g.
+        // `Partial<Impl<T>>` where `Impl<T>`'s props are as-yet-unreduced
+        // conditionals from a recursive `Merge<…>`) has a fully concrete key set
+        // and MUST materialize; testing `src` directly saw the free type params
+        // buried in those value branches and stranded the whole map deferred as
+        // `{ [P in keyof {…}]: … }`, dropping every member (react-hook-form
+        // `FieldErrors<Form>` collapsing to just its `{form?;root?}` constituent).
+        // `keyofType` yields a concrete literal union for an object/array/tuple
+        // source and a deferred `keyof T` (which the tests below still flag) for a
+        // naked type param / index / conditional — so genericness is judged on the
+        // keys alone. The non-homomorphic key source is the constraint directly.
+        // The map stays deferred while its key set mentions a free type param OR
+        // an as-yet-unbound `infer` var. The `infer`-var case arises when a mapped
+        // alias is applied to an infer var of an enclosing conditional
+        // (`Rec<…> = … ? Acc & F<Head> : Acc`, F a mapped alias): `keyof (Acc &
+        // F<Head>)` carries `keyof Head`, so `containsInfer` keeps it deferred and
+        // `substInfer` (its `.mapped` arm) re-enters here once `Head` binds.
+        const key_src = if (homomorphic) try c.keyofType(src_type) else constraint;
         const key_generic = try c.containsFreeTypeParam(key_src, &.{}) or try c.containsInfer(key_src);
         if (key_generic) {
             return c.ts.makeMapped(key_param, constraint, value, as_clause, src_type, flags);
