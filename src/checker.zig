@@ -10747,6 +10747,10 @@ const Checker = struct {
         defer str_index_vals.deinit(c.scratch());
         var num_index_vals: std.ArrayList(TypeId) = .empty;
         defer num_index_vals.deinit(c.scratch());
+        // Spreading an `any`-typed source poisons the whole object literal to
+        // `any` (tsc: `{ ...anyVal, x }` has type `any`), so member access on
+        // it is unchecked. Tracked here and short-circuited after the loop.
+        var spread_any = false;
 
         for (c.tree.nodeRange(node)) |prop| {
             if (prop == null_node) continue;
@@ -10851,11 +10855,13 @@ const Checker = struct {
                 },
                 .spread_element => {
                     const st = try c.resolveStructural(try c.checkExprCached(pd.lhs, types.no_type));
+                    if (c.ts.kind(st) == .any or c.ts.kind(st) == .err) spread_any = true;
                     try c.gatherSpreadProps(st, &props, &prop_index);
                 },
                 else => _ = try c.checkExprCached(prop, types.no_type),
             }
         }
+        if (spread_any) return types.any_type;
         // Get-only accessors are read-only properties.
         var git = getter_keys.keyIterator();
         while (git.next()) |k| {
