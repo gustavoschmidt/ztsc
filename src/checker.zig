@@ -9703,7 +9703,21 @@ const Checker = struct {
             if (b.overwritten) continue; // shadowed by a later spread (TS2783)
             if (try c.propOfType(rt, b.name)) |p| {
                 const vspan = if (b.value != null_node) c.nodeSpan(b.value) else c.tokSpan(b.name_tok);
-                _ = try c.checkAssignable(b.ty, p.ty, b.value, vspan);
+                // An optional prop (`date?: Date`) admits `undefined`, so an
+                // explicit `date={maybeUndefined}` is not an error — mirrors the
+                // structural object relation and the optional indexed-access path
+                // (src/checker.zig:2864). Widen the target to `p.ty | undefined`
+                // ONLY when the value can actually be undefined: a value that
+                // never yields `undefined` (e.g. a fresh object literal) gets the
+                // identical verdict from bare `p.ty`, and keeping it off the
+                // object-to-union path avoids a distinct union-relation gap. A
+                // required prop keeps `p.ty`, so an explicit `undefined` on it
+                // still rejects.
+                const target = if (p.optional() and c.containsUndefinedish(try c.resolveStructural(b.ty)))
+                    try c.makeUnion2(p.ty, types.undefined_type)
+                else
+                    p.ty;
+                _ = try c.checkAssignable(b.ty, target, b.value, vspan);
             } else if (target_open and !containsAtom(ia_names.items, b.name)) {
                 if (!have_excess) {
                     first_excess = c.tokSpan(b.name_tok);
