@@ -12927,12 +12927,28 @@ const Checker = struct {
     /// Would every argument check against `sig`? (Silent, for overload
     /// selection.)
     fn argumentsMatch(c: *Checker, sig: TypeId, arg_nodes: []const Node) Error!bool {
+        // Overload probing: contextually type each argument by this candidate's
+        // parameter and test assignability. Checking a context-sensitive
+        // argument (an arrow/function body) under a *rejected* candidate's
+        // parameter can emit spurious diagnostics — e.g. `arr.reduce((sum, x) =>
+        // sum + x.weight_kg, 0)` probes the non-generic `reduce(cb: (T, T) => T,
+        // init: T)` overload before the generic `reduce<U>(…, init: U)`; that
+        // overload types `sum` as the element `T` (an object), so the body's `+`
+        // reports TS2365 — then the overload is rejected on `0` (not a `T`) and
+        // the generic overload wins with `sum: number`. Roll the diagnostic list
+        // back on every rejecting return so only the ACCEPTED candidate's
+        // argument diagnostics survive (emitted once here; `checkCallArguments`
+        // then cache-hits the same (node, ctx) check without duplicating them).
+        const saved_diags = c.diags.items.len;
         var ai: u32 = 0;
         for (arg_nodes) |an| {
             if (an == null_node) continue;
             defer ai += 1;
             if (c.nodeTag(an) == .spread_element) return true; // don't reject on spreads
-            const pt = c.paramTypeAt(sig, ai) orelse return false;
+            const pt = c.paramTypeAt(sig, ai) orelse {
+                c.diags.items.len = saved_diags;
+                return false;
+            };
             const tag = c.nodeTag(an);
             // Array literals are contextually typed by the (already-inferred)
             // parameter, so a tuple parameter sees a tuple — otherwise the
@@ -12957,7 +12973,10 @@ const Checker = struct {
                 try c.checkExprCached(an, pt)
             else
                 try c.checkExprCached(an, types.no_type);
-            if (!try c.isAssignable(at, pt)) return false;
+            if (!try c.isAssignable(at, pt)) {
+                c.diags.items.len = saved_diags;
+                return false;
+            }
         }
         return true;
     }
