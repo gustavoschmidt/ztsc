@@ -13523,14 +13523,26 @@ const Checker = struct {
                     .keyword_instanceof => {
                         if (!try c.refMatches(d.lhs, key)) return t;
                         const rt = try c.checkExprCached(d.rhs, types.no_type);
-                        if (c.ts.kind(rt) != .class_value) return t;
-                        const cls = c.ts.classSymbol(rt);
-                        var tps: std.ArrayList(TypeParamInfo) = .empty;
-                        defer tps.deinit(c.scratch());
-                        try c.typeParamsOf(cls, &tps);
-                        const args = try c.scratch().alloc(TypeId, tps.items.len);
-                        for (args) |*x| x.* = types.any_type;
-                        const inst = try c.ts.makeRef(cls, args);
+                        if (c.ts.kind(rt) == .class_value) {
+                            const cls = c.ts.classSymbol(rt);
+                            var tps: std.ArrayList(TypeParamInfo) = .empty;
+                            defer tps.deinit(c.scratch());
+                            try c.typeParamsOf(cls, &tps);
+                            const args = try c.scratch().alloc(TypeId, tps.items.len);
+                            for (args) |*x| x.* = types.any_type;
+                            const inst = try c.ts.makeRef(cls, args);
+                            return c.narrowByInstance(t, inst, sense);
+                        }
+                        // Lib-style constructors (`Error`, `Array`, `Date`,
+                        // `RegExp`) are `interface FooConstructor` + `declare var
+                        // Foo: FooConstructor`, not `class` — so `rt` is a callable
+                        // object, not a `.class_value`. Derive the instance type
+                        // the way tsc's getInstanceType does: the `prototype`
+                        // property type, else the union of construct-signature
+                        // return types. Leaves the TS2359 acceptance (a separate
+                        // check) untouched.
+                        const inst = try c.instanceTypeOfConstructor(rt);
+                        if (inst == types.no_type) return t;
                         return c.narrowByInstance(t, inst, sense);
                     },
                     else => return t,
@@ -14114,6 +14126,31 @@ const Checker = struct {
         if (!pred.asserts) return t; // plain guards don't narrow as statements
         if (pred.ty == types.no_type) return c.getTruthyPart(t); // `asserts cond`
         return c.narrowByInstance(t, pred.ty, true);
+    }
+
+    /// tsc's `getInstanceType(constructorType)`: prefer the `prototype`
+    /// property type (when present and not `any`), else the union of the
+    /// construct signatures' return types. Returns `no_type` when the RHS is
+    /// not a usable constructor (→ no narrowing, sound under-narrowing).
+    fn instanceTypeOfConstructor(c: *Checker, rt: TypeId) Error!TypeId {
+        if (try c.propOfType(rt, try c.internText("prototype"))) |p| {
+            const k = c.ts.kind(p.ty);
+            if (k != .any and k != .err and k != .unknown) return p.ty;
+        }
+        var obj = rt;
+        if (c.ts.kind(obj) == .ref) obj = try c.expandRef(obj);
+        if (c.ts.kind(obj) == .object) {
+            const n = c.ts.objectConstructSigCount(obj);
+            if (n > 0) {
+                var rets: std.ArrayList(TypeId) = .empty;
+                defer rets.deinit(c.scratch());
+                for (0..n) |i| {
+                    try rets.append(c.scratch(), c.ts.fnReturn(c.ts.objectConstructSig(obj, @intCast(i))));
+                }
+                return c.ts.makeUnion(c.scratch(), rets.items);
+            }
+        }
+        return types.no_type;
     }
 
     fn narrowByInstance(c: *Checker, t: TypeId, instance: TypeId, sense: bool) Error!TypeId {
