@@ -11389,11 +11389,26 @@ const Checker = struct {
             .lt, .gt, .lt_eq, .gt_eq => {
                 const lt = try c.checkExprCached(d.lhs, types.no_type);
                 const rt = try c.checkExprCached(d.rhs, types.no_type);
-                const ok = (c.isNumberish(lt) and c.isNumberish(rt)) or
-                    (c.isStringish(lt) and c.isStringish(rt)) or
-                    (c.isBigintish(lt) and c.isBigintish(rt)) or
-                    c.ts.kind(lt) == .any or c.ts.kind(rt) == .any or
-                    c.ts.kind(lt) == .err or c.ts.kind(rt) == .err;
+                // tsc's relational rule (checkBinaryLikeExpressionWorker): strip
+                // null/undefined (checkNonNullType), then the pair is legal iff
+                // BOTH sides are number/bigint-like, OR NEITHER side is
+                // number-like and one is comparable to the other. The
+                // "neither number-like" guard is essential: it rejects
+                // `{valueOf():number} > number` even though `number` is
+                // assignable to `{valueOf():number}` (oracle-verified), while
+                // still admitting `Date > Date`, `string > string`, and any two
+                // structurally-comparable object types.
+                const ls = try c.nonNullable(lt);
+                const rs = try c.nonNullable(rt);
+                const lk = c.ts.kind(ls);
+                const rk = c.ts.kind(rs);
+                const ok = lk == .any or rk == .any or lk == .err or rk == .err or blk: {
+                    const lnum = c.isNumberish(ls) or c.isBigintish(ls);
+                    const rnum = c.isNumberish(rs) or c.isBigintish(rs);
+                    if (lnum and rnum) break :blk true;
+                    if (!lnum and !rnum) break :blk (try c.isComparable(ls, rs));
+                    break :blk false;
+                };
                 if (!ok) {
                     try c.diagFmt(2365, c.nodeSpan(node), "Operator '{s}' cannot be applied to types '{s}' and '{s}'.", .{
                         c.tokenText(c.tree.nodeMainToken(node)), try c.typeToString(lt), try c.typeToString(rt),
