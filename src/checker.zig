@@ -8219,15 +8219,30 @@ const Checker = struct {
         if (sk == .array and tk == .array) {
             return c.lenientComparable(c.ts.arrayElem(s), c.ts.arrayElem(t), depth + 1);
         }
-        if (sk == .object and tk == .object) {
+        // Comparability distributes over a target intersection: the source must
+        // overlap EACH constituent (tsc `typeRelatedToEachType`). The dogfood
+        // cast `{…} as (A & { id: string })` overlaps in the `comparable(target,
+        // source)` direction — the relation *source* is then the intersection,
+        // so the object arm below reaches its members via `propOfType`.
+        if (tk == .intersection) {
+            for (try c.memberList(t)) |m| {
+                if (!try c.lenientOverlap(s0, m, depth)) return false;
+            }
+            return true;
+        }
+        if (tk == .object) {
             for (0..c.ts.objectPropCount(t)) |i| {
                 const tp = c.ts.objectProp(t, @intCast(i));
-                const sp = c.ts.objectPropByName(s, tp.name) orelse {
+                // `propOfType` (unlike `objectPropByName`) reaches through a
+                // source intersection / ref / string index signature, so the
+                // winning direction — where the intersection being cast to is
+                // the relation *source* — resolves each target member. Optional
+                // target props may be absent (the optional→required leniency);
+                // present props need only be comparable (either direction).
+                const sp = (try c.propOfType(s, tp.name)) orelse {
                     if (tp.optional()) continue;
                     return false; // required target member absent from source
                 };
-                // Optional→required is the leniency; prop types need only be
-                // comparable (either direction, lenient).
                 if (!try c.lenientComparable(sp.ty, tp.ty, depth + 1)) return false;
             }
             return true;
