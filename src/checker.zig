@@ -13200,7 +13200,19 @@ const Checker = struct {
                 }
             },
             .prefix_unary => return t, // `!` was decomposed by the binder
-            .call_expr, .call_expr_targs, .optional_call => return c.narrowByGuardCall(t, cond, sense, key),
+            .call_expr, .call_expr_targs, .optional_call => {
+                // A truthy optional-*call* chain (`if (a?.m())`, or the
+                // fall-through of `if (!a?.m()) return`) implies its receivers
+                // did not short-circuit: narrow a contained receiver to
+                // non-null. Symmetric with the optional-member arm above
+                // (tsc's `narrowTypeByTruthiness` optional-chain containment);
+                // fires on the truthy branch only. This is what lets the common
+                // `if (!raw?.trim()) return ''; …raw…` guard narrow `raw`.
+                if (sense and try c.optionalChainContainsRef(cond, key)) {
+                    return c.nonNullable(t);
+                }
+                return c.narrowByGuardCall(t, cond, sense, key);
+            },
             else => return t,
         }
     }
