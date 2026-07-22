@@ -3187,6 +3187,21 @@ const Checker = struct {
             .object => {
                 for (0..c.ts.objectPropCount(st)) |i| {
                     const p = c.ts.objectProp(st, @intCast(i));
+                    // tsc's `getSpreadType`: when a property is present in both
+                    // the accumulated left (`{ a, b, ... }`) and this spread and
+                    // the spread's property is OPTIONAL, the result keeps the
+                    // LEFT's optionality and unions the value types. So an
+                    // explicit required prop stays required even when a later
+                    // `Partial<…>` spread re-supplies it optionally — without
+                    // this, every prop of `{ id, active, ...overrides }` (with
+                    // `overrides: Partial<X>`) became optional and failed
+                    // assignment to the required target (TS2322 factory FPs).
+                    if (p.flags & types.prop_flag_optional != 0) {
+                        if (prop_index.get(p.name)) |idx| {
+                            props.items[idx].ty = try c.logicalUnion(props.items[idx].ty, try c.removeUndefined(p.ty));
+                            continue;
+                        }
+                    }
                     try upsertProp(c.scratch(), props, prop_index, .{ .name = p.name, .ty = p.ty, .flags = p.flags & types.prop_flag_optional });
                 }
             },
