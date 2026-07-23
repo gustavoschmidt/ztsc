@@ -1272,17 +1272,28 @@ fn resolvePackage(io: Io, alloc: Allocator, dir: Io.Dir, importer_dir: []const u
         null;
     defer if (types_pkg) |tp| alloc.free(tp);
 
+    // Two-phase walk (HELD RESOLVER FIX): declarations beat JS-under-allowJs at
+    // ANY depth. Phase 1 probes the real pkg (decls only) then `@types/<pkg>`
+    // across ALL levels; only if nothing typed is found does Phase 2 fall back to
+    // the JS `main`/index under allowJs.
     var d = importer_dir;
     while (true) {
-        if (try resolvePackageAt(io, alloc, dir, d, pkg, sub, allow_js)) |p| return p;
+        if (try resolvePackageAt(io, alloc, dir, d, pkg, sub, false)) |p| return p;
         if (types_pkg) |tp| {
-            // `@types/<pkg>` ships declarations only — never a JS fallback.
             if (try resolvePackageAt(io, alloc, dir, d, tp, sub, false)) |p| return p;
         }
-
-        if (d.len == 0 or std.mem.eql(u8, d, "/") or std.mem.eql(u8, d, ".")) return null;
+        if (d.len == 0 or std.mem.eql(u8, d, "/") or std.mem.eql(u8, d, ".")) break;
         d = dirnamePart(d);
     }
+    if (allow_js) {
+        d = importer_dir;
+        while (true) {
+            if (try resolvePackageAt(io, alloc, dir, d, pkg, sub, true)) |p| return p;
+            if (d.len == 0 or std.mem.eql(u8, d, "/") or std.mem.eql(u8, d, ".")) break;
+            d = dirnamePart(d);
+        }
+    }
+    return null;
 }
 
 /// Resolve `<pkg>/<sub>` under one directory level's `node_modules`, honoring
@@ -1907,10 +1918,28 @@ const Linker = struct {
                 // via the export records below, so skip them here.
                 const lo = b.scope_members_start[am.scope];
                 const hi = b.scope_members_start[am.scope + 1];
+                // tsc's ambient-module auto-export: a `declare module` block with
+                // NO explicit `export` anywhere implicitly exports every one of
+                // its top-level members (@types/leaflet-draw's `declare module
+                // "leaflet" { namespace DrawEvents … }` carries no `export`, yet
+                // `import { DrawEvents } from "leaflet"` resolves). When the block
+                // DOES use an explicit export, only the exported members leak —
+                // matching the value-augment path (`appendAugmentedModuleExports`)
+                // which folds bare-declared members like `const drawLocal` in.
+                var has_explicit = am.export_end != am.export_start;
+                if (!has_explicit) {
+                    for (lo..hi) |i| {
+                        if (b.symbol_flags[b.member_syms[i]].exported) {
+                            has_explicit = true;
+                            break;
+                        }
+                    }
+                }
                 for (lo..hi) |i| {
                     const local = b.member_syms[i];
                     const fl = b.symbol_flags[local];
-                    if (!fl.exported or fl.export_default) continue;
+                    if (fl.export_default) continue;
+                    if (has_explicit and !fl.exported) continue;
                     const name = b.member_atoms[i];
                     if (tbl.contains(name)) continue;
                     try tbl.put(l.scratch, name, try l.finalizeLocal(fid, local, name, false, 0));
