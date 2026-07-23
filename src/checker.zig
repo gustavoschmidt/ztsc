@@ -13886,11 +13886,24 @@ const Checker = struct {
         // discriminant filter applies regardless of the reference's depth.
         if (try c.discriminantOfRef(lhs, key)) |prop_tok| {
             const other = try c.ts.regularLiteral(try c.checkExprCached(rhs, types.no_type));
-            return c.narrowByDiscriminant(t, try c.memberAtom(prop_tok), other, sense);
+            const narrowed = try c.narrowByDiscriminant(t, try c.memberAtom(prop_tok), other, sense);
+            // An OPTIONAL discriminant read (`x?.k === lit`) short-circuits to
+            // `undefined` when the receiver is nullish, so the equality also
+            // forces the receiver non-nullish on the asserting branch (tsc's
+            // optional-chain containment). The discriminant filter alone keeps
+            // `undefined` (no `k` prop → conservatively kept), so strip it too.
+            if (c.nodeTag(lhs) == .optional_member_expr) {
+                return c.narrowByOptChainContainment(narrowed, rhs, strict, sense);
+            }
+            return narrowed;
         }
         if (try c.discriminantOfRef(rhs, key)) |prop_tok| {
             const other = try c.ts.regularLiteral(try c.checkExprCached(lhs, types.no_type));
-            return c.narrowByDiscriminant(t, try c.memberAtom(prop_tok), other, sense);
+            const narrowed = try c.narrowByDiscriminant(t, try c.memberAtom(prop_tok), other, sense);
+            if (c.nodeTag(rhs) == .optional_member_expr) {
+                return c.narrowByOptChainContainment(narrowed, lhs, strict, sense);
+            }
+            return narrowed;
         }
         // Optional-chain containment: `a?.….m() === <value>` narrows the chain's
         // *receiver* `a` to non-null (tsc's narrowTypeByOptionalChainContainment).
