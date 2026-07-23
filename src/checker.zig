@@ -14429,27 +14429,9 @@ const Checker = struct {
                     .keyword_instanceof => {
                         if (!try c.refMatches(d.lhs, key)) return t;
                         const rt = try c.checkExprCached(d.rhs, types.no_type);
-                        if (c.ts.kind(rt) == .class_value) {
-                            const cls = c.ts.classSymbol(rt);
-                            var tps: std.ArrayList(TypeParamInfo) = .empty;
-                            defer tps.deinit(c.scratch());
-                            try c.typeParamsOf(cls, &tps);
-                            const args = try c.scratch().alloc(TypeId, tps.items.len);
-                            for (args) |*x| x.* = types.any_type;
-                            const inst = try c.ts.makeRef(cls, args);
+                        if (try c.instanceofInstanceType(rt)) |inst|
                             return c.narrowByInstance(t, inst, sense);
-                        }
-                        // Lib-style constructors (`Error`, `Array`, `Date`,
-                        // `RegExp`) are `interface FooConstructor` + `declare var
-                        // Foo: FooConstructor`, not `class` — so `rt` is a callable
-                        // object, not a `.class_value`. Derive the instance type
-                        // the way tsc's getInstanceType does: the `prototype`
-                        // property type, else the union of construct-signature
-                        // return types. Leaves the TS2359 acceptance (a separate
-                        // check) untouched.
-                        const inst = try c.instanceTypeOfConstructor(rt);
-                        if (inst == types.no_type) return t;
-                        return c.narrowByInstance(t, inst, sense);
+                        return t;
                     },
                     else => return t,
                 }
@@ -15094,6 +15076,54 @@ const Checker = struct {
             }
         }
         return types.no_type;
+    }
+
+    /// The instance type produced by `x instanceof RHS`, or `null` when the
+    /// RHS is not a usable constructor (→ no narrowing). A plain `class`
+    /// value maps to `C<any…>`. An `.intersection` of constructors is handled
+    /// member-wise: a `declare module` augmentation merges a class declaration
+    /// with itself into `typeof C & typeof C`, and mixins yield `typeof A &
+    /// typeof B` — in both cases the constructor is NOT a `.class_value`, so
+    /// without this the narrowing collapsed (`instanceTypeOfConstructor` finds
+    /// no `prototype`/construct sig on the intersection and gives up), leaving
+    /// the operand at its declared base type.
+    fn instanceofInstanceType(c: *Checker, rt: TypeId) Error!?TypeId {
+        switch (c.ts.kind(rt)) {
+            .class_value => {
+                const cls = c.ts.classSymbol(rt);
+                var tps: std.ArrayList(TypeParamInfo) = .empty;
+                defer tps.deinit(c.scratch());
+                try c.typeParamsOf(cls, &tps);
+                const args = try c.scratch().alloc(TypeId, tps.items.len);
+                for (args) |*x| x.* = types.any_type;
+                return try c.ts.makeRef(cls, args);
+            },
+            .intersection => {
+                var insts: std.ArrayList(TypeId) = .empty;
+                defer insts.deinit(c.scratch());
+                for (try c.memberList(rt)) |m| {
+                    const mi = (try c.instanceofInstanceType(m)) orelse continue;
+                    var seen = false;
+                    for (insts.items) |e| {
+                        if (e == mi) {
+                            seen = true;
+                            break;
+                        }
+                    }
+                    if (!seen) try insts.append(c.scratch(), mi);
+                }
+                if (insts.items.len == 0) {
+                    const inst = try c.instanceTypeOfConstructor(rt);
+                    return if (inst == types.no_type) null else inst;
+                }
+                if (insts.items.len == 1) return insts.items[0];
+                return try c.ts.makeIntersection(c.scratch(), insts.items);
+            },
+            else => {
+                const inst = try c.instanceTypeOfConstructor(rt);
+                return if (inst == types.no_type) null else inst;
+            },
+        }
     }
 
     fn narrowByInstance(c: *Checker, t: TypeId, instance: TypeId, sense: bool) Error!TypeId {
