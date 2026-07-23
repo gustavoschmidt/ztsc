@@ -660,14 +660,21 @@ fn mergeAugmentations(
             const hi = b.scope_members_start[am.scope + 1];
             for (lo..hi) |i| {
                 const local = b.member_syms[i];
-                // Only interface↔interface merges (value/namespace/generic
-                // type-param unification stay deferred — degrade, no crash).
+                // The augmenting block member must be an interface (value/
+                // namespace/generic type-param unification stay deferred —
+                // degrade, no crash).
                 if (!b.symbol_flags[local].interface) continue;
                 const name = b.member_atoms[i];
                 const tgt = links[mfile].exportTarget(name) orelse continue;
                 if (tgt.kind != .binding) continue;
                 const real = sym_base[tgt.file] + tgt.payload;
-                if (!globalSymFlags(files, sym_base, real).interface) continue;
+                // The real export may be an interface (interface↔interface
+                // merge) OR a class — an interface augmentation of a class
+                // (`declare module "leaflet" { interface Map { pm } }` against
+                // `class Map`) is a declaration merge that adds instance members
+                // (folded into the class instance by `classInstanceGeneric`).
+                const rf = globalSymFlags(files, sym_base, real);
+                if (!rf.interface and !rf.class) continue;
                 const aug_id = base + local;
                 if (real == aug_id) continue; // self (should not happen)
                 const gop = try aug.getOrPut(m.scratch, real);
