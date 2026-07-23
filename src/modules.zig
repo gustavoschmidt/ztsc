@@ -1619,6 +1619,10 @@ const Linker = struct {
     files: []const ProgFile,
 
     atom_default: Atom,
+    /// Effective `allowSyntheticDefaultImports`/`esModuleInterop`: a default
+    /// import of a module with no default export binds to the module namespace
+    /// object rather than raising TS1192.
+    allow_synthetic_default: bool = false,
     /// Reserved key under which a module's `export = X` target is stored in its
     /// export/ambient table (`export=` can never be a real export name). Skipped
     /// by the namespace-object builders and `export *` merge.
@@ -2114,6 +2118,15 @@ const Linker = struct {
                         if (found) |ff| {
                             tgt = ff;
                             tgt.type_only = tgt.type_only or rec.type_only;
+                        } else if (l.allow_synthetic_default and mfile_opt != null) {
+                            // allowSyntheticDefaultImports/esModuleInterop: a
+                            // default import of a module that has no default
+                            // export binds to the module namespace object (tsc's
+                            // synthesized default). `export =` is already handled
+                            // above (via `exeq`); this covers the ES-module /
+                            // `export as namespace` shape (`import L from
+                            // "leaflet"` → the leaflet namespace object).
+                            tgt = .{ .kind = .namespace, .file = mfile_opt.?, .type_only = rec.type_only };
                         } else if (mfile_opt == null and l.ambientOpaque(rec.module)) {
                             // `export =`-shaped ambient module: the CommonJS
                             // export-assignment *is* the default under interop.
@@ -2166,6 +2179,7 @@ pub fn link(
     io: Io,
     interner: *Interner,
     files: []const ProgFile,
+    allow_synthetic_default: bool,
 ) Error!LinkResult {
     var scratch_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch_arena.deinit();
@@ -2179,6 +2193,7 @@ pub fn link(
         .interner = interner,
         .files = files,
         .atom_default = interner.intern(io, gpa, "default") catch return Error.OutOfMemory,
+        .allow_synthetic_default = allow_synthetic_default,
         .atom_export_equals = interner.intern(io, gpa, "export=") catch return Error.OutOfMemory,
         .state = try scratch.alloc(u8, files.len),
         .tables = try scratch.alloc(std.AutoArrayHashMapUnmanaged(Atom, Target), files.len),
@@ -2389,6 +2404,7 @@ pub fn buildProgram(
     entries: []const []const u8,
     lib_set: LibSet,
     resolve_opts: ResolveOpts,
+    allow_synthetic_default: bool,
 ) !BuildResult {
     var scratch_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch_arena.deinit();
@@ -2482,7 +2498,7 @@ pub fn buildProgram(
     }
 
     const file_slice = try arena.dupe(ProgFile, files.items);
-    const lr = try link(arena, gpa, io, interner, file_slice);
+    const lr = try link(arena, gpa, io, interner, file_slice, allow_synthetic_default);
     return .{
         .program = .{
             .files = file_slice,
