@@ -2568,6 +2568,8 @@ const Checker = struct {
             .sym => |sym| return c.typeOfSymbol(sym),
             .wrong_space => return types.any_type,
             .none => {
+                // `typeof globalThis` — always in scope (see checkIdentifier).
+                if (std.mem.eql(u8, c.atomText(a), "globalThis")) return types.any_type;
                 try c.diagFmt(2304, c.tokSpan(tok), "Cannot find name '{s}'.", .{c.tokenText(tok)});
                 return types.error_type;
             },
@@ -10667,6 +10669,11 @@ const Checker = struct {
                 return types.error_type;
             },
             .none => {
+                // `globalThis` is always in scope (the global-scope object).
+                // ztsc doesn't synthesize the global object type, so resolve it
+                // to `any` rather than reporting TS2304 (matches tsc's
+                // in-scope behavior; the common use is `(globalThis as any)`).
+                if (std.mem.eql(u8, c.atomText(a), "globalThis")) return types.any_type;
                 if (c.suggestName(a, c.cur_scope, true)) |sugg| {
                     try c.diagFmt(2552, c.tokSpan(tok), "Cannot find name '{s}'. Did you mean '{s}'?", .{ c.tokenText(tok), c.atomText(sugg) });
                 } else {
