@@ -5323,6 +5323,27 @@ const Checker = struct {
         return false;
     }
 
+    /// Does a string-valued member of enum `sym` have the value `val`? Used by
+    /// the *comparable* relation (TS2367): a string enum overlaps a string
+    /// literal equal to one of its member values, even though the literal is
+    /// not assignable into the nominal enum.
+    fn enumHasStringValue(c: *Checker, sym: SymbolId, val: Atom) Error!bool {
+        const saved = c.enterSymFile(sym);
+        defer c.restoreCtx(saved);
+        for (c.declsOf(sym)) |decl| {
+            if (c.nodeTag(decl) != .enum_decl) continue;
+            const d = c.tree.nodeData(decl);
+            const data = c.tree.extraData(ast.EnumData, d.lhs);
+            for (c.tree.extraRange(data.members_start, data.members_end)) |m| {
+                if (m == null_node or c.nodeTag(m) != .enum_member) continue;
+                const init_node = c.tree.nodeData(m).lhs;
+                if (init_node == null_node or c.nodeTag(init_node) != .string_literal) continue;
+                if ((try c.memberAtom(c.tree.nodeMainToken(init_node))) == val) return true;
+            }
+        }
+        return false;
+    }
+
     /// Type-check an enum declaration: validate member initializers (TS1061)
     /// and check any initializer expressions.
     fn checkEnum(c: *Checker, node: Node) Error!void {
@@ -8775,6 +8796,21 @@ const Checker = struct {
         const ka = c.ts.kind(a);
         const kb = c.ts.kind(b);
         if (ka == .null or ka == .undefined or kb == .null or kb == .undefined) return true;
+        // tsc's *comparable* relation: a string enum overlaps a string literal
+        // equal to one of its member values (`x === 'FEMALE'` where `enum
+        // CattleSex { Female = 'FEMALE' }`), even though the plain literal is not
+        // *assignable* into the nominal string enum. Only a member-value match
+        // overlaps — a non-member literal (`x === 'ZEBRA'`) stays TS2367. (The
+        // numeric-enum ↔ number-literal case already overlaps via `isComparable`
+        // → `enumAssignable`.)
+        const ra = try c.ts.regularLiteral(a);
+        const rb = try c.ts.regularLiteral(b);
+        if (c.ts.kind(ra) == .enum_type and c.ts.kind(rb) == .string_literal) {
+            if (try c.enumHasStringValue(c.ts.enumSymbol(ra), c.ts.literalAtom(rb))) return true;
+        }
+        if (c.ts.kind(rb) == .enum_type and c.ts.kind(ra) == .string_literal) {
+            if (try c.enumHasStringValue(c.ts.enumSymbol(rb), c.ts.literalAtom(ra))) return true;
+        }
         return c.isComparable(a, b);
     }
 
