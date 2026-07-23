@@ -569,6 +569,11 @@ const Checker = struct {
     fn_ctx: ?FnCtx = null,
     /// `this` type inside class methods (0 = any).
     this_type: TypeId = 0,
+    /// The class symbol whose constructor body is currently being checked
+    /// (`no_symbol` = not in a constructor). A `readonly` property may be
+    /// assigned via `this.x` inside the constructor of the class that OWNS the
+    /// declaration (tsc allows exactly this; an inherited readonly still errors).
+    ctor_class_sym: SymbolId = binder.no_symbol,
     /// Set once any method declares a polymorphic `this` return; gates the
     /// per-property-access `this`-substitution walk so codebases without
     /// `this` types pay nothing.
@@ -4905,6 +4910,23 @@ const Checker = struct {
 
     fn isCtorName(c: *Checker, name: Atom) bool {
         return std.mem.eql(u8, c.atomText(name), "constructor");
+    }
+
+    /// Is `name` an OWN instance member (field, param-property, accessor,
+    /// method) of the class whose constructor is currently being checked? Used
+    /// to permit a `readonly` assignment via `this.name` inside that
+    /// constructor (an inherited readonly is not own → still TS2540).
+    fn ctorClassOwnsMember(c: *Checker, name: Atom) bool {
+        if (c.ctor_class_sym == binder.no_symbol) return false;
+        const saved = c.enterSymFile(c.ctor_class_sym);
+        defer c.restoreCtx(saved);
+        const ms = c.bind.membersScopeOf(c.localOf(c.ctor_class_sym)) orelse return false;
+        const lo = c.bind.scope_members_start[ms];
+        const hi = c.bind.scope_members_start[ms + 1];
+        for (lo..hi) |i| {
+            if (c.bind.member_atoms[i] == name) return true;
+        }
+        return false;
     }
 
     /// The `extends` base of a class as a ref (or null). The base name
@@ -12043,7 +12065,13 @@ const Checker = struct {
                 const name = try c.memberAtom(d.rhs);
                 const r = try c.resolveStructural(obj_t);
                 if (try c.propOfType(r, name)) |p| {
-                    if (p.readonly()) {
+                    // A readonly property may be assigned via `this.x` inside the
+                    // constructor of the class that OWNS the declaration (tsc:
+                    // `checkReferenceExpression`). An inherited readonly still
+                    // errors, so the property must be an OWN member of the
+                    // constructor's class.
+                    const ctor_ok = c.nodeTag(d.lhs) == .this_expr and c.ctorClassOwnsMember(name);
+                    if (p.readonly() and !ctor_ok) {
                         try c.diagFmt(2540, c.tokSpan(d.rhs), "Cannot assign to '{s}' because it is a read-only property.", .{c.atomText(name)});
                         return types.error_type; // suppress cascading 2322
                     }
@@ -15715,6 +15743,10 @@ const Checker = struct {
                         this_t;
                     const sig = try c.signatureOfProto(member, md.lhs, true, true);
                     if (md.rhs != 0) {
+                        const is_ctor = !is_static and c.isCtorName(try c.memberAtom(c.tree.nodeMainToken(member)));
+                        const saved_ctor = c.ctor_class_sym;
+                        if (is_ctor) c.ctor_class_sym = class_sym;
+                        defer c.ctor_class_sym = saved_ctor;
                         try c.checkFunctionBody(member, md.lhs, md.rhs, sig);
                     }
                 },
