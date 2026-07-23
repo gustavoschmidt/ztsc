@@ -11137,6 +11137,14 @@ const Checker = struct {
         // `any` (tsc: `{ ...anyVal, x }` has type `any`), so member access on
         // it is unchecked. Tracked here and short-circuited after the loop.
         var spread_any = false;
+        // Spreading a bare type parameter (`{ ...data, extra }` with `data: T`)
+        // keeps `T` as a spread member in tsc's spread type — the whole literal
+        // is then assignable back to `T`. ztsc has no props to fold for a
+        // type-param source, so it is retained here and the result becomes
+        // `T & { own props }` (an intersection is assignable to any member, so
+        // `→ T` holds), matching tsc's generic-spread behavior.
+        var generic_spreads: std.ArrayList(TypeId) = .empty;
+        defer generic_spreads.deinit(c.scratch());
 
         for (c.tree.nodeRange(node)) |prop| {
             if (prop == null_node) continue;
@@ -11242,6 +11250,10 @@ const Checker = struct {
                 .spread_element => {
                     const st = try c.resolveStructural(try c.checkExprCached(pd.lhs, types.no_type));
                     if (c.ts.kind(st) == .any or c.ts.kind(st) == .err) spread_any = true;
+                    if (c.ts.kind(st) == .type_param) {
+                        try generic_spreads.append(c.scratch(), st);
+                        continue;
+                    }
                     try c.gatherSpreadProps(st, &props, &prop_index);
                 },
                 else => _ = try c.checkExprCached(prop, types.no_type),
@@ -11260,7 +11272,14 @@ const Checker = struct {
         }
         const sidx = if (str_index_vals.items.len > 0) try c.ts.makeUnion(c.scratch(), str_index_vals.items) else 0;
         const nidx = if (num_index_vals.items.len > 0) try c.ts.makeUnion(c.scratch(), num_index_vals.items) else 0;
-        return c.ts.makeObject(props.items, sidx, nidx, types.obj_flag_fresh);
+        const obj = try c.ts.makeObject(props.items, sidx, nidx, types.obj_flag_fresh);
+        // A type-parameter spread (`{ ...data, extra }`, `data: T`) yields
+        // `T & { extra }` so the literal stays assignable to `T`.
+        if (generic_spreads.items.len > 0) {
+            try generic_spreads.append(c.scratch(), obj);
+            return c.ts.makeIntersection(c.scratch(), generic_spreads.items);
+        }
+        return obj;
     }
 
     /// Contextual type for property `key` of an object literal typed by
