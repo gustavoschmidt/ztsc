@@ -6791,6 +6791,10 @@ const Checker = struct {
                 for (0..s.objectPropCount(t)) |i| try c.collectInferVars(s.objectProp(t, @intCast(i)).ty, out);
                 if (s.objectStringIndex(t) != 0) try c.collectInferVars(s.objectStringIndex(t), out);
                 if (s.objectNumberIndex(t) != 0) try c.collectInferVars(s.objectNumberIndex(t), out);
+                // Call/construct signatures carry infer vars too (`new (x: infer
+                // P) => …`, a `JSXElementConstructor` construct constituent).
+                for (0..s.objectCallSigCount(t)) |i| try c.collectInferVars(s.objectCallSig(t, @intCast(i)), out);
+                for (0..s.objectConstructSigCount(t)) |i| try c.collectInferVars(s.objectConstructSig(t, @intCast(i)), out);
             },
             .function => {
                 for (0..s.fnParamCount(t)) |i| try c.collectInferVars(s.fnParam(t, @intCast(i)).ty, out);
@@ -6924,9 +6928,31 @@ const Checker = struct {
                         try c.inferFromExtends(sp.ty, pp.ty, ids, vals, contra, depth + 1);
                     }
                 }
+                // A construct-signature pattern (`new (props: infer P) => …`,
+                // e.g. `JSXElementConstructor`'s class constituent) is an object
+                // carrying a construct signature; a call-signature pattern object
+                // (a function type with extra members) carries call sigs. Infer
+                // through both signature kinds, aligning source→pattern sigs from
+                // the end like tsc's `inferFromSignatures`.
+                try c.inferFromObjectSigs(src, pattern, false, ids, vals, contra, depth);
+                try c.inferFromObjectSigs(src, pattern, true, ids, vals, contra, depth);
             },
             .function => {
                 const src = try c.resolveStructural(source0);
+                // A callable-object source (an interface/type literal carrying
+                // call signatures — e.g. React's `ForwardRefExoticComponent<P>`,
+                // whose `(props: P): ReactNode` sig makes it a component) stands
+                // in for a bare function when matched against a function-type
+                // pattern. tsc's `inferFromSignatures` aligns source/target sigs
+                // from the end, so a single-signature pattern infers from the
+                // source's LAST call signature (the overload picked for the
+                // most-general shape). Extract it and recurse.
+                if (s.kind(src) == .object) {
+                    const ncall = s.objectCallSigCount(src);
+                    if (ncall > 0)
+                        try c.inferFromExtends(s.objectCallSig(src, ncall - 1), pattern, ids, vals, contra, depth + 1);
+                    return;
+                }
                 if (s.kind(src) != .function) return;
                 // A generic *source* signature must be reduced to its base
                 // signature before we infer *through* it: each of the source's
@@ -7031,6 +7057,26 @@ const Checker = struct {
         }
     }
 
+    /// Infer through the call (`is_construct == false`) or construct signatures
+    /// shared by a source object and a signature-bearing pattern object. tsc's
+    /// `inferFromSignatures` pairs source/target signatures aligned from the END
+    /// of each list, so an N-signature source and a 1-signature pattern infer
+    /// from the source's last signature. Each paired signature is a `.function`
+    /// TypeId, so the recursion lands back in the `.function` arm (params
+    /// contravariant, return covariant).
+    fn inferFromObjectSigs(c: *Checker, src: TypeId, pattern: TypeId, is_construct: bool, ids: []const u32, vals: []TypeId, contra: bool, depth: u32) Error!void {
+        const s = &c.ts;
+        const scount = if (is_construct) s.objectConstructSigCount(src) else s.objectCallSigCount(src);
+        const pcount = if (is_construct) s.objectConstructSigCount(pattern) else s.objectCallSigCount(pattern);
+        if (scount == 0 or pcount == 0) return;
+        const len = @min(scount, pcount);
+        for (0..len) |i| {
+            const ssig = if (is_construct) s.objectConstructSig(src, scount - len + @as(u32, @intCast(i))) else s.objectCallSig(src, scount - len + @as(u32, @intCast(i)));
+            const psig = if (is_construct) s.objectConstructSig(pattern, pcount - len + @as(u32, @intCast(i))) else s.objectCallSig(pattern, pcount - len + @as(u32, @intCast(i)));
+            try c.inferFromExtends(ssig, psig, ids, vals, contra, depth + 1);
+        }
+    }
+
     /// Greedy pattern-match a concrete string against a template-literal
     /// pattern, binding each `infer` hole (tsc's rules: a non-empty following
     /// literal captures up to its *first* occurrence — lazy; the last hole
@@ -7103,6 +7149,12 @@ const Checker = struct {
                 }
                 if (s.objectStringIndex(t) != 0 and try c.containsInfer(s.objectStringIndex(t))) break :blk true;
                 if (s.objectNumberIndex(t) != 0 and try c.containsInfer(s.objectNumberIndex(t))) break :blk true;
+                for (0..s.objectCallSigCount(t)) |i| {
+                    if (try c.containsInfer(s.objectCallSig(t, @intCast(i)))) break :blk true;
+                }
+                for (0..s.objectConstructSigCount(t)) |i| {
+                    if (try c.containsInfer(s.objectConstructSig(t, @intCast(i)))) break :blk true;
+                }
                 break :blk false;
             },
             .function => blk: {
@@ -7198,7 +7250,18 @@ const Checker = struct {
                 }
                 const sidx = if (s.objectStringIndex(t) != 0) try c.substInfer(s.objectStringIndex(t), ids, vals) else 0;
                 const nidx = if (s.objectNumberIndex(t) != 0) try c.substInfer(s.objectNumberIndex(t), ids, vals) else 0;
-                return s.makeObject(props.items, sidx, nidx, s.objectFlags(t));
+                // Preserve and substitute call/construct signatures — dropping
+                // them (the old `makeObject` path) lost the inferred `new (props:
+                // P) => …` shape needed to decide a construct-pattern conditional.
+                if (s.objectCallSigCount(t) == 0 and s.objectConstructSigCount(t) == 0)
+                    return s.makeObject(props.items, sidx, nidx, s.objectFlags(t));
+                var call_sigs: std.ArrayList(TypeId) = .empty;
+                defer call_sigs.deinit(c.scratch());
+                var construct_sigs: std.ArrayList(TypeId) = .empty;
+                defer construct_sigs.deinit(c.scratch());
+                for (0..s.objectCallSigCount(t)) |i| try call_sigs.append(c.scratch(), try c.substInfer(s.objectCallSig(t, @intCast(i)), ids, vals));
+                for (0..s.objectConstructSigCount(t)) |i| try construct_sigs.append(c.scratch(), try c.substInfer(s.objectConstructSig(t, @intCast(i)), ids, vals));
+                return s.makeObjectSigs(props.items, sidx, nidx, s.objectFlags(t), call_sigs.items, construct_sigs.items);
             },
             .function => {
                 var params: std.ArrayList(types.Param) = .empty;
