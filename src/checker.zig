@@ -2227,42 +2227,24 @@ const Checker = struct {
                         .namespace, .default_expr, .ambient_ns, .any => return types.any_type,
                     }
                 }
-                if (f.type_param) return c.ts.makeTypeParam(sym);
-                if (f.enum_decl) return c.ts.makeEnumType(sym);
-                if (f.type_alias) {
-                    // The real lib declares the four string transforms as
-                    // `type Uppercase<S extends string> = intrinsic;`. Recognize
-                    // an `intrinsic`-bodied alias by name and apply the mapping
-                    // (ztsc has no general `intrinsic` mechanism). A user alias
-                    // of the same name with a real body is unaffected.
-                    if (args.len == 1) {
-                        if (intrinsicStringMapping(c.atomText(a))) |kind_idx| {
-                            if (c.aliasBodyIsIntrinsic(sym)) return c.applyStringMapping(kind_idx, args[0]);
-                        }
-                    }
-                    return c.aliasInstance(sym, args, tok);
-                }
-                if (f.interface or f.class) {
-                    const fixed = try c.fixTypeArgs(sym, args, tok) orelse return types.error_type;
-                    // The global `Array<T>` / `ReadonlyArray<T>` lower to `T[]`:
-                    // tsc treats `Array<T>` and `T[]` as the *same* type, and
-                    // `ReadonlyArray<T>` as `readonly T[]` (which ztsc already
-                    // folds to `T[]` — see `.readonly_type` above; array
-                    // readonly-ness is not modeled). Keeping them structural
-                    // refs instead makes `T[]` fail to relate to them through
-                    // the interface body (ref→array has no structural bridge).
-                    if (fixed.len == 1 and (c.globalSymNamed(sym, "Array") or c.globalSymNamed(sym, "ReadonlyArray"))) {
-                        return c.ts.makeArray(fixed[0]);
-                    }
-                    return c.ts.makeRef(sym, fixed);
-                }
-                return types.any_type;
+                return c.materializeTypeRef(sym, args, tok, a);
             },
             .wrong_space => {
                 try c.diagFmt(2749, c.tokSpan(tok), "'{s}' refers to a value, but is being used as a type here. Did you mean 'typeof {s}'?", .{ c.tokenText(tok), c.tokenText(tok) });
                 return types.error_type;
             },
             .none => {
+                // Inside a `declare module "X"` augmentation of a real module,
+                // an unqualified name resolves against X's own exports — the
+                // augmentation shares X's symbol table in tsc. Lets `declare
+                // module "leaflet" { namespace DrawEvents { interface DrawStop
+                // extends LeafletEvent … } }` reach leaflet's `LeafletEvent`;
+                // without it the heritage base silently drops and the interface
+                // loses every inherited member (→ spurious TS2352 downstream on
+                // a `DrawStop`-typed value cast to a `LeafletEvent` handler).
+                if (try c.augmentModuleTypeSym(c.cur_scope, a)) |gsym| {
+                    return c.materializeTypeRef(gsym, args, tok, a);
+                }
                 // The four intrinsic string transforms are magic global
                 // aliases (`type Uppercase<S extends string> = intrinsic;`),
                 // not declared in ztsc's minimal lib — recognize them by name
@@ -2280,6 +2262,72 @@ const Checker = struct {
                 return types.error_type;
             },
         }
+    }
+
+    /// Materialize a resolved type-space symbol `sym` into its `TypeId`
+    /// (type-parameter / enum / alias-instance / interface-or-class ref),
+    /// applying `args`. Shared by the ordinary scope-resolution arm and the
+    /// `declare module` augmentation fallback so both build the identical type.
+    fn materializeTypeRef(c: *Checker, sym: SymbolId, args: []const TypeId, tok: TokenIndex, a: Atom) Error!TypeId {
+        const f = c.symFlags(sym);
+        if (f.type_param) return c.ts.makeTypeParam(sym);
+        if (f.enum_decl) return c.ts.makeEnumType(sym);
+        if (f.type_alias) {
+            // The real lib declares the four string transforms as
+            // `type Uppercase<S extends string> = intrinsic;`. Recognize an
+            // `intrinsic`-bodied alias by name and apply the mapping (ztsc has
+            // no general `intrinsic` mechanism). A user alias of the same name
+            // with a real body is unaffected.
+            if (args.len == 1) {
+                if (intrinsicStringMapping(c.atomText(a))) |kind_idx| {
+                    if (c.aliasBodyIsIntrinsic(sym)) return c.applyStringMapping(kind_idx, args[0]);
+                }
+            }
+            return c.aliasInstance(sym, args, tok);
+        }
+        if (f.interface or f.class) {
+            const fixed = try c.fixTypeArgs(sym, args, tok) orelse return types.error_type;
+            // The global `Array<T>` / `ReadonlyArray<T>` lower to `T[]`: tsc
+            // treats `Array<T>` and `T[]` as the *same* type, and
+            // `ReadonlyArray<T>` as `readonly T[]` (which ztsc already folds to
+            // `T[]`; array readonly-ness is not modeled). Keeping them as
+            // structural refs instead makes `T[]` fail to relate to them
+            // through the interface body (ref→array has no structural bridge).
+            if (fixed.len == 1 and (c.globalSymNamed(sym, "Array") or c.globalSymNamed(sym, "ReadonlyArray"))) {
+                return c.ts.makeArray(fixed[0]);
+            }
+            return c.ts.makeRef(sym, fixed);
+        }
+        return types.any_type;
+    }
+
+    /// Walk outward from `from` for an enclosing `declare module "X"`
+    /// augmentation block; if found, resolve the augmented module X (via the
+    /// current file's specifier map) and return export `a`'s type-space global
+    /// symbol. Powers tsc's rule that unqualified names inside a module
+    /// augmentation see the augmented module's own exports.
+    fn augmentModuleTypeSym(c: *Checker, from: ScopeId, a: Atom) Error!?SymbolId {
+        if (c.prog.files.len == 0) return null;
+        var s = from;
+        while (true) {
+            const owner = c.bind.scope_owners[s];
+            if (owner != 0 and c.nodeTag(owner) == .namespace_decl) {
+                const nd = c.tree.extraData(ast.NamespaceData, c.tree.nodeData(owner).lhs);
+                if (nd.flags & ast.Flags.ambient_module != 0 and nd.name_token != 0) {
+                    const spec = try c.memberAtom(nd.name_token);
+                    if (c.prog.files[c.cur_file].specs.get(spec)) |mfile| {
+                        if (c.moduleExportTarget(.{ .file = mfile }, a)) |tgt| {
+                            if (c.targetTypeSym(tgt)) |gsym| {
+                                if (hasTypeMeaning(c.symFlags(gsym))) return gsym;
+                            }
+                        }
+                    }
+                }
+            }
+            if (s == binder.file_scope) break;
+            s = c.bind.scope_parents[s];
+        }
+        return null;
     }
 
     /// Resolve member `name` of namespace symbol `ns_sym` to its global id, or
