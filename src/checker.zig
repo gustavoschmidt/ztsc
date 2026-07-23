@@ -3908,6 +3908,19 @@ const Checker = struct {
             return t;
         }
         try c.ns_types.put(c.ca(), file, types.no_type);
+        // `export = X` module (e.g. `@types/react` `export = React`): the value
+        // namespace object is the value type of the export-equals target, not an
+        // empty object built from the (absent) named exports. `typeof
+        // import("react").createContext` must reach React's members.
+        if (c.prog.links.len != 0) {
+            if (c.prog.links[file].exportTarget(c.prog.export_equals_atom)) |eq| {
+                if (!eq.type_only) {
+                    const t = try c.targetValueType(eq);
+                    try c.ns_types.put(c.ca(), file, t);
+                    return t;
+                }
+            }
+        }
         var props: std.ArrayList(types.Prop) = .empty;
         defer props.deinit(c.scratch());
         if (c.prog.links.len != 0) {
