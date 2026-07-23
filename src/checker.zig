@@ -4136,7 +4136,13 @@ const Checker = struct {
                             }
                         },
                         .rest_element => {
-                            if (try c.findBindingType(ed.lhs, name, whole, out)) return true;
+                            // `{a, b, ...rest}` → rest = `whole` minus the
+                            // sibling-named keys (tsc's object rest type,
+                            // `Omit<whole, "a"|"b">`). Binding it to the whole
+                            // object wrongly kept the destructured props, which
+                            // then read as duplicated by a later spread (TS2783).
+                            const rest_ty = try c.objectRestType(whole, pat);
+                            if (try c.findBindingType(ed.lhs, name, rest_ty, out)) return true;
                         },
                         else => {},
                     }
@@ -4175,6 +4181,58 @@ const Checker = struct {
             .rest_element => return c.findBindingType(d.lhs, name, whole, out),
             else => return false,
         }
+    }
+
+    /// Object binding-pattern rest type: `whole` with every key named by a
+    /// sibling `binding_property` in `pat` removed (tsc's `{a, ...rest}` →
+    /// `rest = Omit<whole, "a">`). Objects and intersections of objects are
+    /// filtered (index signatures preserved); anything else (unions, generics,
+    /// `any`) falls back to `whole` unchanged — lenient, matching how the rest
+    /// of the checker treats non-enumerable shapes.
+    fn objectRestType(c: *Checker, whole: TypeId, pat: Node) Error!TypeId {
+        const r = try c.resolveStructural(whole);
+        const kind = c.ts.kind(r);
+        if (kind != .object and kind != .intersection) return whole;
+
+        var excluded: std.ArrayList(Atom) = .empty;
+        defer excluded.deinit(c.scratch());
+        for (c.tree.nodeRange(pat)) |el| {
+            if (el == null_node) continue;
+            if (c.nodeTag(el) == .binding_property) {
+                try excluded.append(c.scratch(), try c.memberAtom(c.tree.nodeMainToken(el)));
+            }
+        }
+
+        var props: std.ArrayList(types.Prop) = .empty;
+        defer props.deinit(c.scratch());
+        var sidx: TypeId = 0;
+        var nidx: TypeId = 0;
+        // Flatten one level: a plain object contributes its own props; an
+        // intersection contributes each object member's props (later members
+        // win on a name clash, mirroring intersection member order). A member
+        // that is not a plain object makes the shape non-enumerable → bail to
+        // `whole` rather than drop constraints.
+        const members: []const TypeId = if (kind == .intersection) try c.memberList(r) else &.{r};
+        for (members) |m| {
+            const rm = try c.resolveStructural(m);
+            if (c.ts.kind(rm) != .object) return whole;
+            if (c.ts.objectStringIndex(rm) != 0) sidx = c.ts.objectStringIndex(rm);
+            if (c.ts.objectNumberIndex(rm) != 0) nidx = c.ts.objectNumberIndex(rm);
+            for (0..c.ts.objectPropCount(rm)) |i| {
+                const p = c.ts.objectProp(rm, @intCast(i));
+                if (containsAtom(excluded.items, p.name)) continue;
+                var replaced = false;
+                for (props.items) |*existing| {
+                    if (existing.name == p.name) {
+                        existing.* = p;
+                        replaced = true;
+                        break;
+                    }
+                }
+                if (!replaced) try props.append(c.scratch(), p);
+            }
+        }
+        return c.ts.makeObject(props.items, sidx, nidx, 0);
     }
 
     fn functionSymbolType(c: *Checker, sym: SymbolId) Error!TypeId {
@@ -10580,8 +10638,10 @@ const Checker = struct {
     ///
     /// Spread attributes (`<C {...p} />`) fold their object's properties into
     /// the attribute set (later wins). A spread's props count toward
-    /// required-prop satisfaction, an explicit attribute shadowed by a later
-    /// spread is TS2783, and a non-object spread is TS2698. Where a spread's
+    /// required-prop satisfaction, an explicit attribute overwritten by a later
+    /// spread's REQUIRED member is TS2783 (an OPTIONAL spread member does not
+    /// overwrite — tsc's checkSpreadPropOverrides rule), and a non-object
+    /// spread is TS2698. Where a spread's
     /// contents cannot be confidently enumerated (`any`, generics, unions,
     /// index signatures) the missing-prop check is skipped rather than risk a
     /// false positive — tsc reports fewer such cases than it would with full
@@ -10855,7 +10915,12 @@ const Checker = struct {
                 var names: std.ArrayList(Atom) = .empty;
                 for (0..c.ts.objectPropCount(rst)) |i| {
                     const p = c.ts.objectProp(rst, @intCast(i));
-                    try names.append(c.scratch(), p.name);
+                    // `names` drives the TS2783 overwrite check, which tsc
+                    // (checkSpreadPropOverrides) fires only for a REQUIRED
+                    // spread member — an optional prop in the spread does not
+                    // overwrite a prior explicit attribute. `provided` still
+                    // gets every prop (required-satisfaction reads all).
+                    if (!p.optional()) try names.append(c.scratch(), p.name);
                     try provided.append(c.scratch(), p);
                 }
                 return .{ .names = try names.toOwnedSlice(c.scratch()) };
@@ -10870,7 +10935,7 @@ const Checker = struct {
                     }
                     for (0..c.ts.objectPropCount(r)) |i| {
                         const p = c.ts.objectProp(r, @intCast(i));
-                        try names.append(c.scratch(), p.name);
+                        if (!p.optional()) try names.append(c.scratch(), p.name);
                         try provided.append(c.scratch(), p);
                     }
                 }
