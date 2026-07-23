@@ -10008,7 +10008,10 @@ const Checker = struct {
                     const vt = c.nodeType(value_node) orelse continue;
                     if (try c.isAssignable(vt, tp.ty)) continue;
                     if (!try c.elaborateLiteralError(value_node, vt, tp.ty)) {
-                        try c.reportNotAssignable(2322, vt, tp.ty, c.nodeSpan(value_node));
+                        // tsc anchors an object-literal member mismatch at the
+                        // property NAME (for shorthand the name IS the value), not
+                        // the value expression.
+                        try c.reportNotAssignable(2322, vt, tp.ty, c.tokSpan(c.tree.nodeMainToken(prop)));
                     }
                     reported = true;
                 }
@@ -10818,7 +10821,11 @@ const Checker = struct {
         for (built.items) |b| {
             if (b.overwritten) continue; // shadowed by a later spread (TS2783)
             if (try c.propOfType(rt, b.name)) |p| {
-                const vspan = if (b.value != null_node) c.nodeSpan(b.value) else c.tokSpan(b.name_tok);
+                // tsc anchors a JSX attribute value mismatch at the attribute
+                // NAME node (not the value), matching the excess-property anchor
+                // above. Per-member elaboration for object/array-literal values
+                // still points at the offending member via `b.value` below.
+                const vspan = c.tokSpan(b.name_tok);
                 // An optional prop (`date?: Date`) admits `undefined`, so an
                 // explicit `date={maybeUndefined}` is not an error — mirrors the
                 // structural object relation and the optional indexed-access path
