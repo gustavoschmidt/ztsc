@@ -463,8 +463,8 @@ const Checker = struct {
     alias_recursive: std.AutoHashMapUnmanaged(SymbolId, void) = .empty,
     /// Narrowed-type cache per (flow, reference, declared) query.
     flow_cache: std.AutoHashMapUnmanaged(FlowQ, TypeId) = .empty,
-    /// Interned narrowing reference keys ((sym << 32 | prop) -> index).
-    ref_keys: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    /// Interned narrowing reference keys (RefKey -> dense index).
+    ref_keys: std.AutoHashMapUnmanaged(RefKey, u32) = .empty,
     /// (flow << 32 | symbol) -> definitely-assigned (2 computing, 0/1 result).
     da_cache: std.AutoHashMapUnmanaged(u64, u8) = .empty,
     /// containsTypeParam memo: 0 unknown, 1 no, 2 yes.
@@ -3477,7 +3477,7 @@ const Checker = struct {
                 .sym => |s| s,
                 else => continue,
             };
-            const key = RefKey{ .sym = psym, .prop = 0 };
+            const key = RefKey{ .sym = psym };
             const true_ty = try c.narrowByGuardExpr(declared, guard, sense, key, 0);
             if (true_ty == declared or c.ts.kind(true_ty) == .never) continue;
             const false_ty = try c.narrowByGuardExpr(declared, guard, !sense, key, 0);
@@ -11394,19 +11394,10 @@ const Checker = struct {
             obj_t = try c.checkNullishAccess(obj_t, d.lhs, node);
         }
         var pt = try c.propertyTypeOf(obj_t, name, name_tok);
-        // Property-path narrowing: `x.p` where x is an identifier, and
-        // `this.p` (sentinel root).
-        if (c.nodeTag(d.lhs) == .identifier) {
-            const base_tok = c.tree.nodeMainToken(d.lhs);
-            if (c.tree.tokens.tag(base_tok) != .keyword_undefined) {
-                const a = try c.atomOfToken(base_tok);
-                switch (c.resolveSpace(a, c.cur_scope, true)) {
-                    .sym => |sym| pt = try c.flowTypeOfProp(node, sym, name, pt),
-                    else => {},
-                }
-            }
-        } else if (c.nodeTag(d.lhs) == .this_expr) {
-            pt = try c.flowTypeOfProp(node, this_flow_root, name, pt);
+        // Property-path narrowing: peel the whole access spine into a member
+        // path (`x.p`, `this.p`, `x.a.b`, …) capped at `max_ref_depth`.
+        if (try c.buildRefKey(node)) |key| {
+            pt = try c.flowTypeOfKey(node, key, pt);
         }
         return pt;
     }
@@ -13430,11 +13421,23 @@ const Checker = struct {
     // control-flow narrowing
     // =====================================================================
 
-    /// A narrowable reference: an identifier (`prop == 0`) or a
-    /// single-level property path `sym.prop`. A `this.prop` path uses the
-    /// sentinel root `this_flow_root` (flow graphs are per-function, so the
-    /// sentinel never crosses a `this`-rebinding boundary).
-    const RefKey = struct { sym: SymbolId, prop: Atom };
+    /// Maximum tracked reference-path depth. tsc caps reference narrowing;
+    /// ztsc's live need tops out at depth-2 (`a.b.c`). Paths deeper than this
+    /// are not tracked (sound under-narrowing = pre-depth-N behavior).
+    const max_ref_depth = 3;
+
+    /// A narrowable reference: a bare identifier (`len == 0`) or a member
+    /// path `sym.path[0].path[1]…` capped at `max_ref_depth`. `path[0]` is the
+    /// innermost property (closest to the root), `path[len-1]` the outermost.
+    /// A `this`-rooted path uses the sentinel root `this_flow_root` (flow
+    /// graphs are per-function, so the sentinel never crosses a `this`-rebind
+    /// boundary). Trailing `path` slots past `len` are always 0 so the struct
+    /// hashes/compares canonically as an `AutoHashMap` key.
+    const RefKey = struct {
+        sym: SymbolId,
+        path: [max_ref_depth]Atom = [_]Atom{0} ** max_ref_depth,
+        len: u8 = 0,
+    };
 
     /// Sentinel `RefKey.sym` for `this`-rooted property paths.
     const this_flow_root: SymbolId = std.math.maxInt(SymbolId);
@@ -13443,23 +13446,86 @@ const Checker = struct {
     const SymLoop = struct { sym: SymbolId, scope: ScopeId };
 
     fn refKeyIndex(c: *Checker, key: RefKey) Error!u32 {
-        const raw = (@as(u64, key.sym) << 32) | key.prop;
-        const gop = try c.ref_keys.getOrPut(c.ca(), raw);
+        const gop = try c.ref_keys.getOrPut(c.ca(), key);
         if (!gop.found_existing) gop.value_ptr.* = @intCast(c.ref_keys.count());
         return gop.value_ptr.*;
     }
 
-    /// Does `node` denote exactly this reference?
+    /// Build the tracked reference key for a member-access node by peeling its
+    /// spine right-to-left, collecting property atoms, until it bottoms out at
+    /// a bare identifier (resolved to a value symbol) or `this`. Returns null
+    /// when the root is neither (element access, call result, etc.) or the
+    /// path is deeper than `max_ref_depth` (untracked = sound under-narrowing).
+    fn buildRefKey(c: *Checker, node: Node) Error!?RefKey {
+        var atoms: [max_ref_depth]Atom = [_]Atom{0} ** max_ref_depth;
+        var count: usize = 0;
+        var n = node;
+        while (true) {
+            while (c.nodeTag(n) == .paren_expr) n = c.tree.nodeData(n).lhs;
+            const tag = c.nodeTag(n);
+            if (tag != .member_expr and tag != .optional_member_expr) break;
+            if (count >= max_ref_depth) return null; // too deep: not tracked
+            const d = c.tree.nodeData(n);
+            atoms[count] = try c.memberAtom(d.rhs);
+            count += 1;
+            n = d.lhs;
+        }
+        // `n` is the root. A bare identifier must resolve to a value symbol
+        // (skip the `undefined` keyword, which is not a reference); `this`
+        // uses the sentinel root.
+        var key: RefKey = .{ .sym = 0, .len = @intCast(count) };
+        if (c.nodeTag(n) == .identifier) {
+            const base_tok = c.tree.nodeMainToken(n);
+            if (c.tree.tokens.tag(base_tok) == .keyword_undefined) return null;
+            const a = try c.atomOfToken(base_tok);
+            switch (c.resolveSpace(a, c.cur_scope, true)) {
+                .sym => |sym| key.sym = sym,
+                else => return null,
+            }
+        } else if (c.nodeTag(n) == .this_expr) {
+            key.sym = this_flow_root;
+        } else return null;
+        // Atoms were collected outermost-first; reverse so `path[0]` is the
+        // innermost property (closest to the root).
+        var i: usize = 0;
+        while (i < count) : (i += 1) key.path[i] = atoms[count - 1 - i];
+        return key;
+    }
+
+    /// Does `node` denote exactly this reference? Peels the member spine
+    /// right-to-left, matching each property atom against the key's path
+    /// (outermost = `path[len-1]`), and bottoms out at the root identifier /
+    /// `this`.
     fn refMatches(c: *Checker, node: Node, key: RefKey) Error!bool {
         if (node == null_node) return false;
         var n = node;
         while (c.nodeTag(n) == .paren_expr) n = c.tree.nodeData(n).lhs;
-        if (key.prop == 0) return c.identIsSym(n, key.sym);
-        const tag = c.nodeTag(n);
-        if (tag != .member_expr and tag != .optional_member_expr) return false;
-        const d = c.tree.nodeData(n);
-        if (!try c.identIsSym(d.lhs, key.sym)) return false;
-        return (try c.memberAtom(d.rhs)) == key.prop;
+        if (key.len == 0) return c.identIsSym(n, key.sym);
+        var i: usize = key.len;
+        while (i > 0) : (i -= 1) {
+            while (c.nodeTag(n) == .paren_expr) n = c.tree.nodeData(n).lhs;
+            const tag = c.nodeTag(n);
+            if (tag != .member_expr and tag != .optional_member_expr) return false;
+            const d = c.tree.nodeData(n);
+            if ((try c.memberAtom(d.rhs)) != key.path[i - 1]) return false;
+            n = d.lhs;
+        }
+        return c.identIsSym(n, key.sym);
+    }
+
+    /// Is `target` a proper prefix of the tracked reference `key`? Writing any
+    /// prefix (the root, or `root.path[0..k]` for `k < len`) invalidates the
+    /// whole subtree's narrowing.
+    fn refPrefixWritten(c: *Checker, target: Node, key: RefKey) Error!bool {
+        if (key.len == 0) return false;
+        var k: u8 = 0;
+        while (k < key.len) : (k += 1) {
+            var pk: RefKey = .{ .sym = key.sym, .len = k };
+            var j: usize = 0;
+            while (j < k) : (j += 1) pk.path[j] = key.path[j];
+            if (try c.refMatches(target, pk)) return true;
+        }
+        return false;
     }
 
     /// Is narrowing worth running for this declared type?
@@ -13474,14 +13540,14 @@ const Checker = struct {
         if (!c.isNarrowable(declared)) return declared;
         const flow = c.bind.flowAt(node) orelse return declared;
         c.stats.flow_queries += 1;
-        return c.flowType(flow, .{ .sym = sym, .prop = 0 }, declared, 0);
+        return c.flowType(flow, .{ .sym = sym }, declared, 0);
     }
 
-    fn flowTypeOfProp(c: *Checker, node: Node, sym: SymbolId, prop: Atom, declared: TypeId) Error!TypeId {
+    fn flowTypeOfKey(c: *Checker, node: Node, key: RefKey, declared: TypeId) Error!TypeId {
         if (!c.isNarrowable(declared)) return declared;
         const flow = c.bind.flowAt(node) orelse return declared;
         c.stats.flow_queries += 1;
-        return c.flowType(flow, .{ .sym = sym, .prop = prop }, declared, 0);
+        return c.flowType(flow, key, declared, 0);
     }
 
     fn flowType(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth: u32) Error!TypeId {
@@ -13513,7 +13579,7 @@ const Checker = struct {
                 // and file starts have `no_flow` here and stop at `declared`.
                 const ante = b.flow_a[flow];
                 if (ante == binder.no_flow) return declared;
-                if (key.prop != 0 or key.sym == this_flow_root) return declared;
+                if (key.len != 0 or key.sym == this_flow_root) return declared;
                 const sf = c.symFlags(key.sym);
                 if (!sf.const_decl) {
                     // Effectively-const let/var/param: tsc narrows a captured
@@ -13631,7 +13697,7 @@ const Checker = struct {
                 // the old code dropped, never perturb the cache interaction of a
                 // reference that was never narrowed before the loop (which would
                 // otherwise unmask unrelated latent FPs downstream).
-                if (b.flow_tags[flow] == .loop_label and antes.len >= 1 and key.prop == 0 and
+                if (b.flow_tags[flow] == .loop_label and antes.len >= 1 and key.len == 0 and
                     !c.symDeclaredInForHead(key.sym))
                 {
                     try c.ensureReassignScan();
@@ -13677,7 +13743,7 @@ const Checker = struct {
             .declarator_init => {
                 const d = c.tree.nodeData(target);
                 if (!try c.patternBindsSym(d.lhs, root_sym)) return null;
-                if (key.prop != 0) return declared; // root re-init: reset path
+                if (key.len != 0) return declared; // root re-init: reset path
                 if (c.nodeTag(d.lhs) != .identifier) return declared;
                 const vt = c.nodeType(d.rhs) orelse try c.checkExprCached(d.rhs, types.no_type);
                 return try c.assignmentReduced(declared, vt);
@@ -13686,7 +13752,7 @@ const Checker = struct {
                 const d = c.tree.nodeData(target);
                 if (!try c.patternBindsSym(d.lhs, root_sym)) return null;
                 const e = c.tree.extraData(ast.DeclaratorFull, d.rhs);
-                if (key.prop != 0) return declared;
+                if (key.len != 0) return declared;
                 if (e.init == 0) return declared;
                 if (c.nodeTag(d.lhs) != .identifier) return declared;
                 const vt = c.nodeType(e.init) orelse try c.checkExprCached(e.init, types.no_type);
@@ -13694,16 +13760,19 @@ const Checker = struct {
             },
             .assign => {
                 const d = c.tree.nodeData(target);
-                // Full path write: x.p = v narrows key (x, p).
-                if (key.prop != 0 and try c.refMatches(d.lhs, key)) {
+                // Full path write: <ref> = v narrows the tracked reference.
+                if (key.len != 0 and try c.refMatches(d.lhs, key)) {
                     const op = c.tree.tokens.tag(c.tree.nodeMainToken(target));
                     if (op != .eq) return declared;
                     const vt = c.nodeType(d.rhs) orelse try c.checkExprCached(d.rhs, types.no_type);
                     return try c.assignmentReduced(declared, vt);
                 }
+                // Writing any proper prefix of the path (its root, or an
+                // intermediate member) invalidates the whole subtree.
+                if (try c.refPrefixWritten(d.lhs, key)) return declared;
                 if (c.nodeTag(d.lhs) == .identifier) {
                     if (!try c.identIsSym(d.lhs, root_sym)) return null;
-                    if (key.prop != 0) return declared; // root overwritten
+                    // key.len != 0 was caught above by refPrefixWritten.
                     const op = c.tree.tokens.tag(c.tree.nodeMainToken(target));
                     if (op != .eq) {
                         const vt = c.nodeType(target) orelse declared;
@@ -13720,13 +13789,13 @@ const Checker = struct {
                 if (try c.refMatches(d.lhs, key)) {
                     return try c.assignmentReduced(declared, types.number_type);
                 }
-                if (key.prop != 0 and try c.identIsSym(d.lhs, root_sym)) return declared;
+                if (try c.refPrefixWritten(d.lhs, key)) return declared;
                 return null;
             },
             // for-of / for-in left (var decl or expression).
             .var_decl_one, .var_decl => {
                 if (try c.varDeclBindsSym(target, root_sym)) {
-                    if (key.prop != 0) return declared;
+                    if (key.len != 0) return declared;
                     // The element type was computed when the statement was
                     // checked; the symbol type already reflects it.
                     return try c.typeOfSymbol(root_sym);
@@ -13761,8 +13830,9 @@ const Checker = struct {
                 if (try c.refMatches(cond, key)) {
                     return if (sense) c.getTruthyPart(t) else c.getFalsyPart(t, true);
                 }
-                // `if (x.p)` / `if (x?.p)` — discriminate the root by prop truthiness.
-                if (key.prop == 0 and try c.identIsSym(d.lhs, key.sym)) {
+                // `if (<ref>.p)` / `if (<ref>?.p)` — discriminate the tracked
+                // reference by the truthiness of an extra property `p`.
+                if (try c.refMatches(d.lhs, key)) {
                     var base = t;
                     if (c.nodeTag(cond) == .optional_member_expr and sense) {
                         base = try c.nonNullable(base);
@@ -13880,9 +13950,9 @@ const Checker = struct {
             return c.narrowByLiteralEquality(t, lhs, strict, sense);
         }
         // <ref>.k === <literal> narrows <ref> by its discriminant. `<ref>` is
-        // the reference being tracked — either a root symbol (`x.k`, key.prop
-        // == 0) or a depth-1 member path (`f.geometry.k`, narrowing the union
-        // stored at `f.geometry`). The union `t` is `<ref>`'s type, so the same
+        // the tracked reference — a root symbol (`x.k`, key.len == 0) or a
+        // member path (`f.geometry.k`, narrowing the union stored at the
+        // tracked `f.geometry`). The union `t` is `<ref>`'s type, so the same
         // discriminant filter applies regardless of the reference's depth.
         if (try c.discriminantOfRef(lhs, key)) |prop_tok| {
             const other = try c.ts.regularLiteral(try c.checkExprCached(rhs, types.no_type));
@@ -14017,7 +14087,7 @@ const Checker = struct {
         if (node == null_node) return null;
         switch (c.nodeTag(node)) {
             .member_expr => {},
-            .optional_member_expr => if (key.prop != 0) return null,
+            .optional_member_expr => if (key.len != 0) return null,
             else => return null,
         }
         const d = c.tree.nodeData(node);
@@ -14264,12 +14334,18 @@ const Checker = struct {
         return t;
     }
 
-    fn narrowByTypeof(c: *Checker, t: TypeId, str: Atom, sense: bool) Error!TypeId {
+    fn narrowByTypeof(c: *Checker, t0: TypeId, str: Atom, sense: bool) Error!TypeId {
         var which: usize = typeof_names.len;
         for (c.typeof_atoms, 0..) |a, i| {
             if (a == str) which = i;
         }
-        if (which == typeof_names.len) return t;
+        if (which == typeof_names.len) return t0;
+        // A bare type parameter (an unconstrained `T`, or `T = any`) is not
+        // disprovably a non-object: `typeofMatches` only inspects concrete
+        // kinds, so narrowing the type param directly would collapse
+        // `typeof x === 'object'` to `never`. Narrow its *constraint* instead
+        // (sound, and matches tsc's constraint-based reference narrowing).
+        const t = if (c.ts.kind(t0) == .type_param) try c.baseConstraintOf(t0) else t0;
         if (c.ts.kind(t) == .union_type) {
             var parts: std.ArrayList(TypeId) = .empty;
             defer parts.deinit(c.scratch());
