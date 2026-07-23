@@ -27,7 +27,16 @@
 //!     replaces the default set (tsc semantics). Recognized families: `es*`
 //!     (the ES-core blob) and `dom*` (the DOM blob); others warn + ignore.
 //!     Absent `lib` = the default set (ES-core + DOM, matching tsgo).
-//!   - `types` is ignored (ztsc resolves @types via imports/references).
+//!   - `types` / `typeRoots` drive auto-`@types` inclusion (tsc's default
+//!     `typeRoots`): with neither set, every `node_modules/@types/<pkg>`
+//!     visible walking up from the project becomes an ambient program root
+//!     (its `package.json` `types`/`typings`, else `index.d.ts`), so ambient
+//!     `declare module` augmentations merge the way tsc sees them. `typeRoots`
+//!     overrides the root directories; `types: [...]` restricts to the named
+//!     packages (`@scope/name` → `scope__name`); `types: []` disables it. The
+//!     set is loaded in a stable sorted order (determinism); see
+//!     `collectAutoTypes`. Loaded `.d.ts` are checked/suppressed per
+//!     `skipLibCheck` like any other `.d.ts`.
 //!   - Anything else warns and is ignored — unknown options never fail.
 //! - **`extends`**: a string or array of strings. Each base is loaded first,
 //!   then the extending config overrides it. Relative (`./`, `../`) values
