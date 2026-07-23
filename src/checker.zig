@@ -13569,6 +13569,20 @@ const Checker = struct {
                         }
                     }
                 }
+                // A callable OBJECT argument (an interface carrying call
+                // signatures rather than a bare function — e.g. `Number`, whose
+                // `NumberConstructor` has `(value?: any): number`, passed as
+                // `arr.map(Number)`) stands in for a function. Sibling of the
+                // inferFromExtends `.function` arm (da9cc33): tsc's
+                // inferFromSignatures aligns source/target sigs from the END, so
+                // a single-signature function param infers from the source's
+                // LAST call signature (the overload picked for the most-general
+                // shape). Extract it and fall through to the function inference.
+                if (s.kind(ra) == .object) {
+                    const ncall = s.objectCallSigCount(ra);
+                    if (ncall == 0) return;
+                    ra = s.objectCallSig(ra, ncall - 1);
+                }
                 if (s.kind(ra) != .function) return;
                 // A *generic function value* passed where a function is
                 // expected (`.then(getProjectTransform)`): first instantiate
