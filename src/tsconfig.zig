@@ -404,6 +404,16 @@ pub const Config = struct {
     /// Expanded root files: `files` entries first (in order), then
     /// include-matched files sorted by path; deduplicated.
     root_files: []const []const u8 = &.{},
+    /// Auto-included `@types/*` package main declaration files (base-relative,
+    /// sorted). tsc's default `typeRoots` behavior: with neither `types` nor
+    /// `typeRoots` set, every `node_modules/@types/<pkg>` visible walking up
+    /// from the project directory is an ambient program root. `typeRoots`
+    /// overrides the root directories; `types: [...]` restricts to the named
+    /// packages (`types: []` disables it). Kept separate from `root_files` so
+    /// the "no inputs" diagnostic still keys on real sources; the driver appends
+    /// these to the program roots. Skipped/checked per `skipLibCheck` like any
+    /// other `.d.ts`.
+    auto_type_files: []const []const u8 = &.{},
     /// `paths`/`baseUrl` mapping for module resolution, if configured.
     paths: ?Paths = null,
     /// `compilerOptions.lib` entries (as written), or null when the field is
@@ -615,9 +625,118 @@ pub fn loadInDir(io: Io, arena: Allocator, base: Io.Dir, config_path: []const u8
     }
 
     cfg.root_files = try root_files.toOwnedSlice(arena);
+
+    // Auto-include every visible `@types/*` package as an ambient program root
+    // (tsc's default `typeRoots`), honoring `types`/`typeRoots`.
+    const type_roots_abs: ?[]const []const u8 = if (acc.type_roots) |trs| blk: {
+        var abs: std.ArrayList([]const u8) = .empty;
+        for (trs) |r| try abs.append(arena, try joinNormalize(arena, acc.type_roots_dir, r));
+        break :blk try abs.toOwnedSlice(arena);
+    } else null;
+    cfg.auto_type_files = try collectAutoTypes(io, arena, base, cfg.dir, type_roots_abs, acc.types);
+    if (cfg.auto_type_files.len > 0) {
+        try note(arena, &notes, "auto-included {d} '@types' package(s) as ambient roots (tsc's default typeRoots); override with 'typeRoots'/'types'", .{cfg.auto_type_files.len});
+    }
+
     cfg.warnings = try warnings.toOwnedSlice(arena);
     cfg.notes = try notes.toOwnedSlice(arena);
     return cfg;
+}
+
+/// Enumerate the `@types/*` packages tsc would auto-include for this project,
+/// returning each package's main declaration file (base-relative), sorted for
+/// run-to-run determinism (directory iteration order is not stable).
+///
+/// Roots: `type_roots` when set (an explicit `typeRoots`), else every
+/// `<ancestor>/node_modules/@types` walking up from `project_dir`. A package
+/// name seen in a nearer root shadows the same name in a farther one (tsc's
+/// closest-wins). `types`, when non-null, restricts the set to the named
+/// packages (`@scope/name` maps to the `scope__name` directory convention);
+/// an empty `types` yields nothing. Symlinked package directories (pnpm) are
+/// followed like tsc's realpath resolution.
+fn collectAutoTypes(
+    io: Io,
+    arena: Allocator,
+    base: Io.Dir,
+    project_dir: []const u8,
+    type_roots: ?[]const []const u8,
+    types: ?[]const []const u8,
+) Error![]const []const u8 {
+    // The `@types` root directories to scan, nearest first.
+    var roots: std.ArrayList([]const u8) = .empty;
+    if (type_roots) |trs| {
+        for (trs) |r| try roots.append(arena, r);
+    } else {
+        var d = project_dir;
+        while (true) {
+            const at = if (d.len == 0)
+                try arena.dupe(u8, "node_modules/@types")
+            else
+                try std.fmt.allocPrint(arena, "{s}/node_modules/@types", .{d});
+            try roots.append(arena, at);
+            // Base-relative walk cannot escape the base directory ("" stops the
+            // climb); an absolute `project_dir` (the `-p /abs/path` case) climbs
+            // to the filesystem root and covers every ancestor, matching tsc.
+            if (d.len == 0 or std.mem.eql(u8, d, "/") or std.mem.eql(u8, d, ".")) break;
+            d = modules.dirnamePart(d);
+        }
+    }
+
+    // Optional restrict set: `types` package names mapped to `@types` dir names.
+    var allow: ?std.StringHashMapUnmanaged(void) = null;
+    if (types) |list| {
+        var m: std.StringHashMapUnmanaged(void) = .empty;
+        for (list) |name| try m.put(arena, try typesDirName(arena, name), {});
+        allow = m;
+    }
+
+    // Collect unique package directory names (nearest root wins) -> package dir.
+    var pkg_dirs: std.StringHashMapUnmanaged([]const u8) = .empty;
+    var out: std.ArrayList([]const u8) = .empty;
+    for (roots.items) |root| {
+        const open_path = if (root.len == 0) "." else root;
+        var dir = base.openDir(io, open_path, .{ .iterate = true }) catch continue;
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (it.next(io) catch null) |entry| {
+            if (entry.name.len == 0 or entry.name[0] == '.') continue;
+            switch (entry.kind) {
+                // pnpm stores each `@types/<pkg>` as a symlink; follow it.
+                .directory, .sym_link => {},
+                else => continue,
+            }
+            if (allow) |a| {
+                if (!a.contains(entry.name)) continue;
+            }
+            const gop = try pkg_dirs.getOrPut(arena, entry.name);
+            if (gop.found_existing) continue;
+            gop.key_ptr.* = try arena.dupe(u8, entry.name);
+            const pkg_dir = try std.fmt.allocPrint(arena, "{s}/{s}", .{ root, entry.name });
+            gop.value_ptr.* = pkg_dir;
+            if (try modules.resolveTypesPackageMain(io, arena, base, pkg_dir)) |main| {
+                try out.append(arena, main);
+            }
+        }
+    }
+
+    std.mem.sort([]const u8, out.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lessThan);
+    return out.toOwnedSlice(arena);
+}
+
+/// Map a `compilerOptions.types` entry to its `@types` subdirectory name:
+/// `"@scope/name"` → `"scope__name"` (DefinitelyTyped's scoped convention),
+/// any other name unchanged.
+fn typesDirName(arena: Allocator, name: []const u8) Error![]const u8 {
+    if (name.len > 1 and name[0] == '@') {
+        if (std.mem.indexOfScalar(u8, name, '/')) |slash| {
+            return std.fmt.allocPrint(arena, "{s}__{s}", .{ name[1..slash], name[slash + 1 ..] });
+        }
+    }
+    return name;
 }
 
 /// Accumulator for the merged config across an `extends` chain. Each field that
@@ -645,6 +764,13 @@ const Merged = struct {
     include_dir: []const u8 = "",
     exclude: ?[]const []const u8 = null,
     exclude_dir: []const u8 = "",
+    // `compilerOptions.types`: restrict auto-`@types` inclusion to the named
+    // packages (null = unset → include everything; `[]` = include nothing).
+    types: ?[]const []const u8 = null,
+    // `compilerOptions.typeRoots`: override the default walk-up set of
+    // `@types` root directories (base-relative, anchored to `type_roots_dir`).
+    type_roots: ?[]const []const u8 = null,
+    type_roots_dir: []const u8 = "",
 };
 
 /// Read, parse, and merge `config_path` (base-relative, directory `dir`) into
@@ -824,7 +950,19 @@ fn applyOwn(
                         try warn(arena, warnings, "{s}: 'allowJs' must be a boolean (ignored)", .{config_path});
                     }
                 } else if (std.mem.eql(u8, okey, "types")) {
-                    try note(arena, notes, "{s}: 'types' ignored (ztsc resolves @types via imports/references)", .{config_path});
+                    // `types: [...]` restricts auto-`@types` inclusion to the
+                    // listed packages; `types: []` disables it. Applied in
+                    // `collectAutoTypes`. A non-array is ignored (auto-include).
+                    if (try stringArray(arena, warnings, config_path, okey, oval)) |list| {
+                        acc.types = list;
+                    }
+                } else if (std.mem.eql(u8, okey, "typeRoots")) {
+                    // `typeRoots: [...]` overrides the default walk-up set of
+                    // `@types` root directories (anchored to this config's dir).
+                    if (try stringArray(arena, warnings, config_path, okey, oval)) |list| {
+                        acc.type_roots = list;
+                        acc.type_roots_dir = dir;
+                    }
                 } else if (std.mem.eql(u8, okey, "skipLibCheck") or std.mem.eql(u8, okey, "skipDefaultLibCheck")) {
                     if (oval == .boolean) {
                         // Both keys skip the default lib. `skipLibCheck` is the
@@ -1206,6 +1344,127 @@ test "config: files + include/exclude expansion" {
     try testing.expectEqualStrings("proj/src/b.d.ts", cfg.root_files[2]);
     try testing.expectEqual(@as(usize, 0), cfg.warnings.len);
     try testing.expect(cfg.notes.len > 0); // noEmit note
+}
+
+test "auto @types: default walk-up includes every visible package, sorted" {
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const d = tmp.dir;
+    try d.createDirPath(io, "proj/src");
+    // Project-level @types: `alpha` (package.json "types") and `beta` (index).
+    try d.createDirPath(io, "proj/node_modules/@types/alpha");
+    try d.createDirPath(io, "proj/node_modules/@types/beta");
+    // A parent-level @types the walk-up must also reach.
+    try d.createDirPath(io, "node_modules/@types/gamma");
+    try d.writeFile(io, .{ .sub_path = "proj/src/a.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/node_modules/@types/alpha/package.json", .data =
+        \\{ "name": "alpha", "types": "main.d.ts" }
+    });
+    try d.writeFile(io, .{ .sub_path = "proj/node_modules/@types/alpha/main.d.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/node_modules/@types/beta/index.d.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "node_modules/@types/gamma/index.d.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/tsconfig.json", .data =
+        \\{ "compilerOptions": { "strict": true }, "include": ["src"] }
+    });
+
+    const cfg = try loadInDir(io, alloc, d, "proj/tsconfig.json");
+    try testing.expectEqual(@as(usize, 3), cfg.auto_type_files.len);
+    // Sorted lexically by path: "node_modules/..." (parent gamma) precedes
+    // "proj/node_modules/..." (project alpha via its "types" field, then beta).
+    try testing.expectEqualStrings("node_modules/@types/gamma/index.d.ts", cfg.auto_type_files[0]);
+    try testing.expectEqualStrings("proj/node_modules/@types/alpha/main.d.ts", cfg.auto_type_files[1]);
+    try testing.expectEqualStrings("proj/node_modules/@types/beta/index.d.ts", cfg.auto_type_files[2]);
+}
+
+test "auto @types: nearest node_modules shadows a farther same-named package" {
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const d = tmp.dir;
+    try d.createDirPath(io, "proj/src");
+    try d.createDirPath(io, "proj/node_modules/@types/dup");
+    try d.createDirPath(io, "node_modules/@types/dup");
+    try d.writeFile(io, .{ .sub_path = "proj/src/a.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/node_modules/@types/dup/index.d.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "node_modules/@types/dup/index.d.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/tsconfig.json", .data =
+        \\{ "compilerOptions": { "strict": true }, "include": ["src"] }
+    });
+
+    const cfg = try loadInDir(io, alloc, d, "proj/tsconfig.json");
+    try testing.expectEqual(@as(usize, 1), cfg.auto_type_files.len);
+    // The nearer (project-level) copy wins.
+    try testing.expectEqualStrings("proj/node_modules/@types/dup/index.d.ts", cfg.auto_type_files[0]);
+}
+
+test "auto @types: 'types' restricts (and scoped name maps to scope__name); '[]' disables" {
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const d = tmp.dir;
+    try d.createDirPath(io, "proj/src");
+    try d.createDirPath(io, "proj/node_modules/@types/keep");
+    try d.createDirPath(io, "proj/node_modules/@types/drop");
+    try d.createDirPath(io, "proj/node_modules/@types/scope__pkg");
+    try d.writeFile(io, .{ .sub_path = "proj/src/a.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/node_modules/@types/keep/index.d.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/node_modules/@types/drop/index.d.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/node_modules/@types/scope__pkg/index.d.ts", .data = "" });
+
+    // types: ["keep", "@scope/pkg"] -> keep + scope__pkg only, drop excluded.
+    try d.writeFile(io, .{ .sub_path = "proj/tsconfig.json", .data =
+        \\{ "compilerOptions": { "strict": true, "types": ["keep", "@scope/pkg"] }, "include": ["src"] }
+    });
+    const cfg = try loadInDir(io, alloc, d, "proj/tsconfig.json");
+    try testing.expectEqual(@as(usize, 2), cfg.auto_type_files.len);
+    try testing.expectEqualStrings("proj/node_modules/@types/keep/index.d.ts", cfg.auto_type_files[0]);
+    try testing.expectEqualStrings("proj/node_modules/@types/scope__pkg/index.d.ts", cfg.auto_type_files[1]);
+
+    // types: [] disables auto-inclusion entirely.
+    try d.writeFile(io, .{ .sub_path = "proj/tsconfig.json", .data =
+        \\{ "compilerOptions": { "strict": true, "types": [] }, "include": ["src"] }
+    });
+    const cfg2 = try loadInDir(io, alloc, d, "proj/tsconfig.json");
+    try testing.expectEqual(@as(usize, 0), cfg2.auto_type_files.len);
+}
+
+test "auto @types: 'typeRoots' overrides the default @types directories" {
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const d = tmp.dir;
+    try d.createDirPath(io, "proj/src");
+    // Default location — must be ignored once typeRoots is set.
+    try d.createDirPath(io, "proj/node_modules/@types/ignored");
+    // Custom typeRoots directory — its immediate children are the packages.
+    try d.createDirPath(io, "proj/custom_types/only");
+    try d.writeFile(io, .{ .sub_path = "proj/src/a.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/node_modules/@types/ignored/index.d.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/custom_types/only/index.d.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/tsconfig.json", .data =
+        \\{ "compilerOptions": { "strict": true, "typeRoots": ["./custom_types"] }, "include": ["src"] }
+    });
+
+    const cfg = try loadInDir(io, alloc, d, "proj/tsconfig.json");
+    try testing.expectEqual(@as(usize, 1), cfg.auto_type_files.len);
+    try testing.expectEqualStrings("proj/custom_types/only/index.d.ts", cfg.auto_type_files[0]);
 }
 
 test "config: default include, node_modules excluded, unknown options warn" {

@@ -531,7 +531,16 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("ztsc: no inputs were found in config file '{s}'\n", .{config_path});
             std.process.exit(2);
         }
-        entry_paths = cfg.root_files;
+        // Real sources first (their order/emptiness drove the check above), then
+        // the auto-included `@types/*` ambient roots (tsc's default typeRoots).
+        if (cfg.auto_type_files.len == 0) {
+            entry_paths = cfg.root_files;
+        } else {
+            const combined = try arena.alloc([]const u8, cfg.root_files.len + cfg.auto_type_files.len);
+            @memcpy(combined[0..cfg.root_files.len], cfg.root_files);
+            @memcpy(combined[cfg.root_files.len..], cfg.auto_type_files);
+            entry_paths = combined;
+        }
         paths_map = cfg.paths;
         config_lib = cfg.lib;
         config_skip_lib = cfg.skip_lib_check;

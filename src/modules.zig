@@ -1360,6 +1360,31 @@ fn resolvePackageAt(io: Io, alloc: Allocator, dir: Io.Dir, d: []const u8, pkg: [
     return null;
 }
 
+/// Resolve a package *directory* (base-relative, e.g. a visible
+/// `node_modules/@types/<name>`) to its main declaration file: the
+/// `package.json` `"types"`/`"typings"` entry when present, else `index.d.ts`
+/// (via `resolveStem`). The returned path is base-relative and owned by
+/// `alloc`, or null when nothing resolves. Used by the tsconfig auto-`@types`
+/// inclusion (`tsconfig.collectAutoTypes`) to turn each visible `@types/<name>`
+/// directory into an ambient program root the way tsc's default `typeRoots`
+/// does — this is a package *directory*, not a bare specifier, so it never
+/// walks `node_modules` and never falls back to JS.
+pub fn resolveTypesPackageMain(io: Io, alloc: Allocator, dir: Io.Dir, pkg_dir: []const u8) Error!?[]u8 {
+    const pj = try std.fmt.allocPrint(alloc, "{s}/package.json", .{pkg_dir});
+    defer alloc.free(pj);
+    if (dir.readFileAlloc(io, pj, alloc, .limited(1 << 20))) |text| {
+        defer alloc.free(text);
+        if (packageTypesField(text)) |types_rel| {
+            const stem = try joinNormalize(alloc, pkg_dir, types_rel);
+            defer alloc.free(stem);
+            if (try resolveStem(io, alloc, dir, stem)) |p| return p;
+        }
+    } else |_| {}
+    const idx = try std.fmt.allocPrint(alloc, "{s}/index", .{pkg_dir});
+    defer alloc.free(idx);
+    return resolveStem(io, alloc, dir, idx);
+}
+
 /// Per-run resolution options that are not a pure function of (dir, spec):
 /// `resolveJsonModule` and the `baseUrl` bare-specifier anchor. Carried on the
 /// `ResolveCache` (set once at init) so `resolveSpecifier`'s determinism
