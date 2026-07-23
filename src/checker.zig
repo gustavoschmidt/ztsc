@@ -4904,6 +4904,18 @@ const Checker = struct {
             const ret = c.ts.fnReturn(inst);
             result = try c.mergeBaseObject(result, try c.resolveStructural(ret), false);
         }
+        // Cross-file `declare module` augmentation (M11c): an `interface Map`
+        // block in another package folds its members into the resolved class's
+        // instance type (interface-augments-class declaration merge). The class
+        // is the merged symbol's representative constituent; each interface
+        // constituent supplies augmentation members, added on top of the base
+        // and unioning any callable-signature overloads (e.g. `on(...)`).
+        if (c.prog.isMergedId(sym)) {
+            for (c.prog.mergedSym(sym).parts) |p| {
+                if (!c.symFlags(p).interface) continue;
+                result = try c.mergeBaseObject(result, try c.interfaceConstituentDirect(p), true);
+            }
+        }
         try c.class_inst_generic.put(c.ca(), sym, result);
         return result;
     }
