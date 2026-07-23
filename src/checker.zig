@@ -12083,7 +12083,18 @@ const Checker = struct {
             for (try c.memberList(r)) |m| {
                 const rm = try c.resolveStructural(m);
                 const mk = c.ts.kind(rm);
-                const usable = if (is_new) mk == .class_value else (mk == .function or mk == .overloads);
+                // A merged/curried callable can present its call signatures on
+                // an OBJECT member (an interface with call/construct sigs), not
+                // only as a `.function`/`.overloads` — e.g. RTK's
+                // `createAsyncThunk: CreateAsyncThunkFunction<C> & { withTypes }`
+                // whose callable arm is `CreateAsyncThunkFunction` (an object
+                // carrying call signatures). Accept it so the `.object` call/new
+                // arm resolves the signatures instead of falling through to
+                // TS2349/TS2351.
+                const usable = if (is_new)
+                    (mk == .class_value or (mk == .object and c.ts.objectConstructSigCount(rm) > 0))
+                else
+                    (mk == .function or mk == .overloads or (mk == .object and c.ts.objectCallSigCount(rm) > 0));
                 if (usable) {
                     r = rm;
                     rk = mk;
