@@ -822,6 +822,10 @@ const Checker = struct {
             }
         }
         // TDZ / use-before-assign / 2304 come from the walk itself.
+        // Debug-only soundness net over every composite interned this run: a
+        // member id past the id space is the fingerprint of a use-after-realloc
+        // escape into an interned type (compiled out in release).
+        c.ts.debugValidateComposites();
     }
 
     fn seal(c: *Checker) Error!Check {
@@ -2861,7 +2865,17 @@ const Checker = struct {
             .intersection => {
                 var parts: std.ArrayList(TypeId) = .empty;
                 defer parts.deinit(c.scratch());
-                for (c.ts.members(r)) |m| {
+                // `memberList` DUPES the member ids onto scratch before the loop.
+                // Iterating `c.ts.members(r)` directly would be a use-after-
+                // realloc: the recursive `keyofType(m)` interns new composite
+                // types (its own `makeUnion`, and — under instantiation — nested
+                // `instantiate` calls), which append to the store's `extra`
+                // array and can move its backing buffer, dangling a live slice
+                // captured from `members(r)`. A later iteration would then read a
+                // stale/garbage member id (in Debug a 0xAA-poison bounds panic;
+                // in ReleaseFast an unchecked garbage read). Every other member-
+                // iterating site that interns in its body already dupes first.
+                for (try c.memberList(r)) |m| {
                     try parts.append(c.scratch(), try c.keyofType(m));
                 }
                 return c.ts.makeUnion(c.scratch(), parts.items);
