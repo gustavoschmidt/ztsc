@@ -491,6 +491,7 @@ pub fn main(init: std.process.Init) !void {
     // tsconfig allowJs (resolve JS-only deps as `any`) + effective noImplicitAny.
     var config_allow_js = false;
     var config_no_implicit_any = true;
+    var config_allow_synthetic_default = false;
     if (cli.paths.len == 0) {
         const config_path: []const u8 = blk: {
             if (cli.project) |p| {
@@ -539,6 +540,7 @@ pub fn main(init: std.process.Init) !void {
         config_base_url = cfg.base_url;
         config_allow_js = cfg.allow_js;
         config_no_implicit_any = cfg.no_implicit_any;
+        config_allow_synthetic_default = cfg.allow_synthetic_default_imports;
     }
 
     // Effective decision: skip type-checking the embedded pre-verified lib?
@@ -835,7 +837,7 @@ pub fn main(init: std.process.Init) !void {
             .specs = .{ .atoms = spec_atoms_all.items[i], .files = spec_files_all.items[i] },
         };
     }
-    const lr = try modules.link(arena, gpa, io, &interner, prog_files);
+    const lr = try modules.link(arena, gpa, io, &interner, prog_files, config_allow_synthetic_default);
     const links = lr.links;
     const prog = try arena.create(modules.Program);
     prog.* = .{

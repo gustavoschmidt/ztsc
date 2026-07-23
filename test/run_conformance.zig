@@ -250,7 +250,11 @@ fn runDirCase(
     // implicit-any family, matching the `--noImplicitAny false` oracle.
     const allow_js = try dirCaseBoolOption(alloc, io, conf_dir, case_rel, "allowJs");
     const no_implicit_any = (try dirCaseOptBool(alloc, io, conf_dir, case_rel, "noImplicitAny")) orelse true;
-    var br = try modules.buildProgram(alloc, io, gpa, interner, conf_dir, &.{entry}, lib_set, .{ .resolve_json = resolve_json, .allow_js = allow_js });
+    // Effective allowSyntheticDefaultImports = explicit ?? esModuleInterop ??
+    // false (tsc's rule; esModuleInterop implies it).
+    const allow_synthetic_default = (try dirCaseOptBool(alloc, io, conf_dir, case_rel, "allowSyntheticDefaultImports")) orelse
+        (try dirCaseOptBool(alloc, io, conf_dir, case_rel, "esModuleInterop")) orelse false;
+    var br = try modules.buildProgram(alloc, io, gpa, interner, conf_dir, &.{entry}, lib_set, .{ .resolve_json = resolve_json, .allow_js = allow_js }, allow_synthetic_default);
     const prog = &br.program;
     prog.no_implicit_any = no_implicit_any;
 
@@ -511,7 +515,7 @@ test "determinism: diagnostics byte-identical for N = 1, 2, 4, 8 checkers" {
     defer interner.deinit(gpa);
     const alloc = arena.allocator();
 
-    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, &.{"entry.ts"}, .none, .{});
+    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, &.{"entry.ts"}, .none, .{}, false);
     try std.testing.expectEqual(@as(usize, 10), br.program.files.len);
 
     const ref = try renderProgramDiags(alloc, io, gpa, &interner, &br.program, 1);
@@ -573,7 +577,7 @@ test "cycle stress: N-file import ring + diamonds terminate cleanly" {
     defer interner.deinit(gpa);
     const alloc = arena.allocator();
 
-    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, &.{"entry.ts"}, .none, .{});
+    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, &.{"entry.ts"}, .none, .{}, false);
     try std.testing.expectEqual(@as(usize, n_ring + 3), br.program.files.len);
 
     // Clean at N=1, and byte-identical (still clean) at higher N — no
@@ -642,7 +646,7 @@ test "determinism: cross-file base cycles report identically for N = 1, 2, 4, 8"
     defer interner.deinit(gpa);
     const alloc = arena.allocator();
 
-    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, &.{"entry.d.ts"}, .none, .{});
+    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, &.{"entry.d.ts"}, .none, .{}, false);
 
     const ref = try renderProgramDiags(alloc, io, gpa, &interner, &br.program, 1);
     // Every interface on every cycle is reported: 2 per cluster.

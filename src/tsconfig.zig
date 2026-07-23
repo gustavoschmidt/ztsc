@@ -439,6 +439,12 @@ pub const Config = struct {
     /// `compilerOptions.resolveJsonModule`: a `*.json` import that names an
     /// existing file resolves (typed opaquely as `any`) rather than TS2307.
     resolve_json_module: bool = false,
+    /// Effective `compilerOptions.allowSyntheticDefaultImports`, i.e.
+    /// `allowSyntheticDefaultImports ?? esModuleInterop ?? false` (tsc's rule;
+    /// esModuleInterop implies it). When on, a default import of a module that
+    /// has no default export binds to the module namespace object (the
+    /// synthesized default) instead of raising TS1192.
+    allow_synthetic_default_imports: bool = false,
     /// `compilerOptions.baseUrl`, resolved to a base-relative directory (null
     /// when unset). Consulted for bare `*.json` specifiers only (`public/api/
     /// x.json`); non-json baseUrl resolution is not modeled.
@@ -500,6 +506,12 @@ pub fn loadInDir(io: Io, arena: Allocator, base: Io.Dir, config_path: []const u8
     cfg.skip_lib_check = acc.skip_lib_check orelse false;
     cfg.skip_all_lib_check = acc.skip_all_lib_check orelse false;
     cfg.resolve_json_module = acc.resolve_json_module orelse false;
+    // Effective allowSyntheticDefaultImports = explicit value ?? esModuleInterop
+    // ?? false (tsc's rule; esModuleInterop implies it).
+    cfg.allow_synthetic_default_imports = acc.allow_synthetic_default_imports orelse acc.es_module_interop orelse false;
+    if (cfg.allow_synthetic_default_imports) {
+        try note(arena, &notes, "'allowSyntheticDefaultImports'/'esModuleInterop' honored: a default import of a module with no default export binds to the module namespace object (the synthesized default)", .{});
+    }
     if (acc.base_url) |bu| {
         cfg.base_url = try joinNormalize(arena, acc.base_url_dir, bu);
     }
@@ -620,6 +632,8 @@ const Merged = struct {
     skip_lib_check: ?bool = null,
     skip_all_lib_check: ?bool = null,
     resolve_json_module: ?bool = null,
+    es_module_interop: ?bool = null,
+    allow_synthetic_default_imports: ?bool = null,
     base_url: ?[]const u8 = null,
     base_url_dir: []const u8 = "",
     paths_obj: ?Value.Object = null,
@@ -784,6 +798,18 @@ fn applyOwn(
                         acc.resolve_json_module = oval.boolean;
                     } else {
                         try warn(arena, warnings, "{s}: 'resolveJsonModule' must be a boolean (ignored)", .{config_path});
+                    }
+                } else if (std.mem.eql(u8, okey, "esModuleInterop")) {
+                    if (oval == .boolean) {
+                        acc.es_module_interop = oval.boolean;
+                    } else {
+                        try warn(arena, warnings, "{s}: 'esModuleInterop' must be a boolean (ignored)", .{config_path});
+                    }
+                } else if (std.mem.eql(u8, okey, "allowSyntheticDefaultImports")) {
+                    if (oval == .boolean) {
+                        acc.allow_synthetic_default_imports = oval.boolean;
+                    } else {
+                        try warn(arena, warnings, "{s}: 'allowSyntheticDefaultImports' must be a boolean (ignored)", .{config_path});
                     }
                 } else if (std.mem.eql(u8, okey, "noImplicitAny")) {
                     if (oval == .boolean) {
@@ -1204,9 +1230,11 @@ test "config: default include, node_modules excluded, unknown options warn" {
     try testing.expectEqual(@as(usize, 2), cfg.root_files.len);
     try testing.expectEqualStrings("a.ts", cfg.root_files[0]);
     try testing.expectEqualStrings("b.ts", cfg.root_files[1]);
-    // esModuleInterop + references warn; target is a verbose note.
-    try testing.expectEqual(@as(usize, 2), cfg.warnings.len);
-    try testing.expectEqual(@as(usize, 1), cfg.notes.len);
+    // references warns; target is a verbose note; esModuleInterop is honored
+    // (recognized, effective allowSyntheticDefaultImports on → its own note).
+    try testing.expect(cfg.allow_synthetic_default_imports);
+    try testing.expectEqual(@as(usize, 1), cfg.warnings.len);
+    try testing.expectEqual(@as(usize, 2), cfg.notes.len);
 }
 
 test "config: strict false is a hard error; missing file" {
@@ -1337,7 +1365,7 @@ test "config-driven program builds and checks (conformance-style)" {
 
     var interner = @import("intern.zig").Interner.init();
     defer interner.deinit(gpa);
-    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, cfg.root_files, .none, .{});
+    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, cfg.root_files, .none, .{}, cfg.allow_synthetic_default_imports);
     try testing.expectEqual(@as(usize, 2), br.program.files.len);
 
     const checker = @import("checker.zig");
