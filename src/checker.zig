@@ -14444,7 +14444,12 @@ const Checker = struct {
             if (try c.isAssignable(instance, t)) return instance;
             const k = c.ts.kind(t);
             if (k == .any or k == .unknown or k == .err) return instance;
-            return t;
+            // Unrelated `t` and guard `C`: tsc narrows to the intersection
+            // `t & C` (e.g. `Array.isArray(s)` with `s: string` → `string &
+            // any[]`, which carries the array members; disjoint primitives
+            // reduce to `never`). Previously kept `t`, dropping the guard, so
+            // `s.map(...)` in the true branch reported TS2339 on `string`.
+            return c.ts.makeIntersection(c.scratch(), &.{ t, instance });
         }
         return t;
     }
