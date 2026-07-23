@@ -132,7 +132,7 @@ fn runCase(alloc: std.mem.Allocator, io: Io, gpa: std.mem.Allocator, interner: *
     const tree = try alloc.create(ztsc.ast.Ast);
     tree.* = try parser.parseOpts(alloc, src, jsx);
     const bound = try alloc.create(binder.Bind);
-    bound.* = try binder.bind(alloc, io, gpa, interner, tree, src);
+    bound.* = try binder.bind(alloc, io, gpa, interner, tree, src, false);
     // Single-file cases run against the injected ES-core lib (file 0), just
     // like the CLI. Only the case file (id 1) is owned/reported.
     const prog = try alloc.create(modules.Program);

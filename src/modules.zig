@@ -492,7 +492,7 @@ pub fn seedLibAtoms(io: Io, gpa: Allocator, interner: *Interner, set: LibSet) !v
         defer seed_arena.deinit();
         const sa = seed_arena.allocator();
         const lib_tree = try parser.parse(sa, lf.source);
-        _ = try binder.bind(sa, io, gpa, interner, &lib_tree, lf.source);
+        _ = try binder.bind(sa, io, gpa, interner, &lib_tree, lf.source, true);
         // Each lib file's own path atom is interned by the worker front end too.
         _ = try interner.intern(io, gpa, lf.path);
     }
@@ -660,21 +660,27 @@ fn mergeAugmentations(
             const hi = b.scope_members_start[am.scope + 1];
             for (lo..hi) |i| {
                 const local = b.member_syms[i];
-                // The augmenting block member must be an interface (value/
-                // namespace/generic type-param unification stay deferred —
-                // degrade, no crash).
-                if (!b.symbol_flags[local].interface) continue;
+                // The augmenting block member must be an interface or a
+                // namespace. An interface merges into a real interface/class
+                // (instance members); a `namespace N { … }` block merges into a
+                // real namespace/function-namespace, adding value members
+                // reached as `N.member` (`declare module "leaflet" { namespace
+                // control { function sideBySide } }`). Value/generic type-param
+                // unification stays deferred — degrade, no crash.
+                const lf_flags = b.symbol_flags[local];
+                if (!lf_flags.interface and !lf_flags.namespace_decl) continue;
                 const name = b.member_atoms[i];
                 const tgt = links[mfile].exportTarget(name) orelse continue;
                 if (tgt.kind != .binding) continue;
                 const real = sym_base[tgt.file] + tgt.payload;
                 // The real export may be an interface (interface↔interface
-                // merge) OR a class — an interface augmentation of a class
-                // (`declare module "leaflet" { interface Map { pm } }` against
-                // `class Map`) is a declaration merge that adds instance members
-                // (folded into the class instance by `classInstanceGeneric`).
+                // merge), a class (an interface augmentation of a class —
+                // `declare module "leaflet" { interface Map { pm } }` against
+                // `class Map` — folded into the class instance by
+                // `classInstanceGeneric`), or a namespace/function-namespace
+                // (namespace↔namespace value-member merge).
                 const rf = globalSymFlags(files, sym_base, real);
-                if (!rf.interface and !rf.class) continue;
+                if (!rf.interface and !rf.class and !rf.namespace_decl) continue;
                 const aug_id = base + local;
                 if (real == aug_id) continue; // self (should not happen)
                 const gop = try aug.getOrPut(m.scratch, real);
@@ -820,7 +826,7 @@ pub fn singleWithLibProgram(
         const lib_tree = try arena.create(Ast);
         lib_tree.* = try parser.parse(arena, lf.source);
         const lib_bind = try arena.create(Bind);
-        lib_bind.* = try binder.bind(arena, io, gpa, interner, lib_tree, lf.source);
+        lib_bind.* = try binder.bind(arena, io, gpa, interner, lib_tree, lf.source, true);
         files[i] = .{ .path = lf.path, .src = lf.source, .tree = lib_tree, .bind = lib_bind };
     }
     files[lib_list.len] = .{ .path = path, .src = src, .tree = tree, .bind = bind };
@@ -2446,14 +2452,14 @@ pub fn buildProgram(
                 const tree = try arena.create(Ast);
                 tree.* = try parser.parse(arena, "");
                 const bound = try arena.create(Bind);
-                bound.* = try binder.bind(arena, io, gpa, interner, tree, "");
+                bound.* = try binder.bind(arena, io, gpa, interner, tree, "", parser.isDeclarationPath(path));
                 try files.append(arena, .{ .path = path, .src = "", .tree = tree, .bind = bound });
                 continue;
             };
         const tree = try arena.create(Ast);
         tree.* = try parser.parseOpts(arena, bytes, parser.isJsxPath(path));
         const bound = try arena.create(Bind);
-        bound.* = try binder.bind(arena, io, gpa, interner, tree, bytes);
+        bound.* = try binder.bind(arena, io, gpa, interner, tree, bytes, parser.isDeclarationPath(path));
 
         // Triple-slash `/// <reference>` directives pull extra files into the
         // program (M11c) — not import bindings, just program inputs.
@@ -2596,7 +2602,7 @@ test "seedLibAtoms: covers every atom the lib binder produces (M12.1 determinism
         const tree = try a.create(Ast);
         tree.* = try parser.parse(a, lf.source);
         const b_ptr = try a.create(Bind);
-        b_ptr.* = try binder.bind(a, io, gpa, &itn1, tree, lf.source);
+        b_ptr.* = try binder.bind(a, io, gpa, &itn1, tree, lf.source, true);
         last_bind = b_ptr;
     }
     try testing.expectEqual(seeded_count, itn1.count(io));

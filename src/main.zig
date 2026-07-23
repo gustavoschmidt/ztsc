@@ -389,7 +389,7 @@ const Worker = struct {
         timer = Timer.start(io);
         r = 1;
         while (r < repeat) : (r += 1) {
-            var b = binder.bind(w.scratch.allocator(), io, gpa, interner, tree, src.bytes) catch break;
+            var b = binder.bind(w.scratch.allocator(), io, gpa, interner, tree, src.bytes, parser.isDeclarationPath(path)) catch break;
             std.mem.doNotOptimizeAway(&b);
             _ = w.scratch.reset(.retain_capacity);
         }
@@ -397,7 +397,7 @@ const Worker = struct {
             c.err = err;
             return;
         };
-        b.* = binder.bind(alloc, io, gpa, interner, tree, src.bytes) catch |err| {
+        b.* = binder.bind(alloc, io, gpa, interner, tree, src.bytes, parser.isDeclarationPath(path)) catch |err| {
             c.err = err;
             return;
         };
@@ -824,7 +824,7 @@ pub fn main(init: std.process.Init) !void {
                 empty_tree = try arena.create(Ast);
                 empty_tree.?.* = try parser.parse(arena, "");
                 empty_bind = try arena.create(Bind);
-                empty_bind.?.* = try binder.bind(arena, io, gpa, &interner, empty_tree.?, "");
+                empty_bind.?.* = try binder.bind(arena, io, gpa, &interner, empty_tree.?, "", false);
             }
             tree = empty_tree;
             bnd = empty_bind;

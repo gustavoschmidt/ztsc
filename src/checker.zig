@@ -449,6 +449,11 @@ const Checker = struct {
     pending_class_decos: std.ArrayListUnmanaged(Node) = .empty,
     class_inst_generic: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
     class_static_cache: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
+    /// Classes whose base-static fold is on the stack, so a malformed `extends`
+    /// cycle skips the recursive base fold instead of overflowing (the result
+    /// cache stays unpoisoned — static-field-initializer re-entry must still
+    /// see the class's own members).
+    class_static_base_active: std.AutoHashMapUnmanaged(SymbolId, void) = .empty,
     /// Enum symbol -> value object type (the `typeof E` object with members).
     enum_value_cache: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
     /// Enum symbol -> computed EnumInfo (const-ness, member values).
@@ -3946,7 +3951,12 @@ const Checker = struct {
                 var ty: TypeId = types.any_type;
                 switch (tgt.kind) {
                     .binding => {
-                        const g = c.toGlobalIn(tgt.file, tgt.payload);
+                        const g0 = c.toGlobalIn(tgt.file, tgt.payload);
+                        // A cross-file `declare module` augmentation may have
+                        // merged this export (`namespace control` + a plugin's
+                        // `namespace control { sideBySide }`): use the merged
+                        // view so `L.control.sideBySide` resolves.
+                        const g = c.prog.mergedOf(g0) orelse g0;
                         const f = c.symFlags(g);
                         if (!hasValueMeaning(f)) continue;
                         ty = try c.typeOfSymbol(g);
@@ -3959,9 +3969,54 @@ const Checker = struct {
                 try props.append(c.scratch(), .{ .name = name, .ty = ty, .flags = types.prop_flag_readonly });
             }
         }
+        // Cross-package `declare module "M" { const drawLocal … }` value
+        // augmentations add fresh exports to M's namespace object that have no
+        // constituent in M's own export table (so no merge formed). Fold them
+        // in: `import L from "leaflet"; L.drawLocal` (leaflet-draw augments
+        // leaflet). Members already present as a real export are skipped (those
+        // merge through the export-table path above).
+        try c.appendAugmentedModuleExports(file, &props);
         const obj = try c.ts.makeObject(props.items, 0, 0, 0);
         try c.ns_types.put(c.ca(), file, obj);
         return obj;
+    }
+
+    /// Append value-space members contributed by cross-file `declare module`
+    /// augmentation blocks whose specifier resolves to `file`, for names not
+    /// already collected. Deterministic: files then block members in id order.
+    fn appendAugmentedModuleExports(c: *Checker, file: FileId, props: *std.ArrayList(types.Prop)) Error!void {
+        for (c.prog.files, 0..) |*pf, fi| {
+            const b = pf.bind;
+            if (!b.is_module or b.ambient_modules.len == 0) continue;
+            const base = c.prog.sym_base[fi];
+            for (b.ambient_modules) |am| {
+                const mfile = pf.specs.get(am.spec) orelse continue;
+                if (mfile != file) continue;
+                const lo = b.scope_members_start[am.scope];
+                const hi = b.scope_members_start[am.scope + 1];
+                for (lo..hi) |i| {
+                    const g = base + b.member_syms[i];
+                    const f = c.symFlags(g);
+                    if (!hasValueMeaning(f)) continue;
+                    const name = b.member_atoms[i];
+                    var dup = false;
+                    for (props.items) |p| {
+                        if (p.name == name) {
+                            dup = true;
+                            break;
+                        }
+                    }
+                    if (dup) continue;
+                    var flags: u32 = types.prop_flag_readonly;
+                    if (!f.const_decl and !f.readonly_member) flags = 0;
+                    try props.append(c.scratch(), .{
+                        .name = name,
+                        .ty = try c.typeOfSymbol(c.prog.mergedOf(g) orelse g),
+                        .flags = flags,
+                    });
+                }
+            }
+        }
     }
 
     /// Namespace object of an ambient module (`import * as ns from "fs"`,
@@ -4974,6 +5029,29 @@ const Checker = struct {
         return null;
     }
 
+    /// The base *class symbol* of `sym` (`class D extends B`), when the base
+    /// resolves to a class declaration. Mirrors `baseClassRef`'s resolution but
+    /// yields the symbol — used to inherit static members (`typeof D` includes
+    /// `typeof B`'s statics: `Map.include`/`GridLayer.extend` reach `Class`).
+    fn baseClassSym(c: *Checker, sym: SymbolId) Error!?SymbolId {
+        const saved_ctx = c.enterSymFile(sym);
+        defer c.restoreCtx(saved_ctx);
+        for (c.declsOf(sym)) |decl| {
+            if (c.nodeTag(decl) != .class_decl) continue;
+            const data = c.tree.extraData(ast.ClassData, c.tree.nodeData(decl).lhs);
+            if (data.extends == 0) return null;
+            const hd = c.tree.nodeData(data.extends);
+            const saved = c.cur_scope;
+            defer c.cur_scope = saved;
+            if (try c.scopeOf(decl)) |s| c.cur_scope = s;
+            const base_sym = (try c.classBaseEntitySym(hd.lhs)) orelse return null;
+            if (!c.symFlags(base_sym).class) return null;
+            if (base_sym == sym) return null; // self-extends: no static inherit
+            return base_sym;
+        }
+        return null;
+    }
+
     /// Resolve a class `extends` entity (identifier or dotted, e.g.
     /// `React.Component`) to its declaration symbol. Import bindings are
     /// followed; a namespace import of an `export =`-namespace module (the
@@ -5483,7 +5561,22 @@ const Checker = struct {
                 });
             }
         }
-        const result = try c.ts.makeObject(props.items, 0, 0, 0);
+        var result = try c.ts.makeObject(props.items, 0, 0, 0);
+        // Static members are inherited: `typeof D` includes `typeof Base`'s
+        // statics (own members win over inherited). This is how leaflet's
+        // `Map.include`/`GridLayer.extend` reach the static `extend`/`include`
+        // declared on the root `class Class`. Guard the recursion against a
+        // malformed `extends` cycle without poisoning the result cache — a
+        // static-field initializer that reads a sibling static re-enters this
+        // function and must still see the class's own members.
+        if (!c.class_static_base_active.contains(sym)) {
+            if (try c.baseClassSym(sym)) |base| {
+                try c.class_static_base_active.put(c.ca(), sym, {});
+                const base_static = try c.classStaticType(base);
+                _ = c.class_static_base_active.remove(sym);
+                result = try c.mergeBaseObject(result, base_static, false);
+            }
+        }
         try c.class_static_cache.put(c.ca(), sym, result);
         return result;
     }
@@ -16059,7 +16152,7 @@ const TestCheck = struct {
         const tree = try alloc.create(Ast);
         tree.* = try parser.parse(alloc, src);
         const bound = try alloc.create(Bind);
-        bound.* = try binder.bind(alloc, testing.io, testing.allocator, &t.interner, tree, src);
+        bound.* = try binder.bind(alloc, testing.io, testing.allocator, &t.interner, tree, src, false);
         t.result = try check(alloc, testing.io, testing.allocator, &t.interner, tree, bound, src);
         return t;
     }
@@ -16614,7 +16707,7 @@ test "noImplicitAny off: TS7006 suppressed, param still types as any" {
     const tree = try alloc.create(Ast);
     tree.* = try parser.parse(alloc, src);
     const bound = try alloc.create(Bind);
-    bound.* = try binder.bind(alloc, testing.io, testing.allocator, &t.interner, tree, src);
+    bound.* = try binder.bind(alloc, testing.io, testing.allocator, &t.interner, tree, src, false);
     const prog = try alloc.create(modules.Program);
     prog.* = try modules.singleFileProgram(alloc, "", src, tree, bound);
     prog.no_implicit_any = false; // the effective tsconfig value
@@ -16725,7 +16818,7 @@ test "stress: checker total on random and token soup" {
             error.SourceTooLarge => unreachable,
         };
         const bound = try alloc.create(Bind);
-        bound.* = try binder.bind(alloc, testing.io, testing.allocator, &interner, tree, buf[0..len]);
+        bound.* = try binder.bind(alloc, testing.io, testing.allocator, &interner, tree, buf[0..len], false);
         const result = try check(alloc, testing.io, testing.allocator, &interner, tree, bound, buf[0..len]);
         for (result.diagnostics) |dd| {
             try testing.expect(dd.span.start <= len + 1);
@@ -16756,7 +16849,7 @@ fn fuzzCheckerOne(_: void, smith: *std.testing.Smith) !void {
     const tree = try alloc.create(Ast);
     tree.* = parser.parse(alloc, source_buf[0..len]) catch return;
     const bound = try alloc.create(Bind);
-    bound.* = try binder.bind(alloc, testing.io, testing.allocator, &interner, tree, source_buf[0..len]);
+    bound.* = try binder.bind(alloc, testing.io, testing.allocator, &interner, tree, source_buf[0..len], false);
     _ = try check(alloc, testing.io, testing.allocator, &interner, tree, bound, source_buf[0..len]);
 }
 

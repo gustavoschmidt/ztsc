@@ -747,6 +747,7 @@ pub fn bind(
     interner: *Interner,
     tree: *const Ast,
     src: []const u8,
+    is_dts: bool,
 ) Error!Bind {
     var scratch_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch_arena.deinit();
@@ -759,6 +760,11 @@ pub fn bind(
         .interner = interner,
         .tree = tree,
         .src = src,
+        // A `.d.ts` file is entirely ambient: seed `ambient` so every top-level
+        // `namespace N { … }` treats its members as implicitly exported (visible
+        // as `N.member`), matching tsc — declaration files omit `export` on
+        // namespace members that are nonetheless part of the public shape.
+        .ambient = is_dts,
     };
 
     // Reserved entries (0-sentinel style, like the AST).
@@ -2952,7 +2958,7 @@ const TestBind = struct {
         t.interner = Interner.init();
         errdefer t.interner.deinit(testing.allocator);
         t.tree = try parser.parse(t.arena.allocator(), src);
-        t.b = try bind(t.arena.allocator(), testing.io, testing.allocator, &t.interner, &t.tree, src);
+        t.b = try bind(t.arena.allocator(), testing.io, testing.allocator, &t.interner, &t.tree, src, false);
         return t;
     }
 
@@ -3450,7 +3456,7 @@ fn checkBinderOnArbitraryBytes(alloc: Allocator, interner: *Interner, input: []c
         error.OutOfMemory => return err,
         error.SourceTooLarge => unreachable,
     };
-    const b = try bind(alloc, testing.io, testing.allocator, interner, &tree, input);
+    const b = try bind(alloc, testing.io, testing.allocator, interner, &tree, input, false);
 
     const n_syms = b.symbol_names.len;
     const n_scopes = b.scope_parents.len;

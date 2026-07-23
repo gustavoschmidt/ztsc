@@ -75,6 +75,15 @@ pub fn isJsxPath(path: []const u8) bool {
     return std.mem.endsWith(u8, path, ".tsx") or std.mem.endsWith(u8, path, ".jsx");
 }
 
+/// A `.d.ts`/`.d.mts`/`.d.cts` declaration file is an entirely ambient context:
+/// every declaration is implicitly `declare`, so namespace members are visible
+/// as `N.member` without an explicit `export` (tsc's ambient-namespace rule).
+pub fn isDeclarationPath(path: []const u8) bool {
+    return std.mem.endsWith(u8, path, ".d.ts") or
+        std.mem.endsWith(u8, path, ".d.mts") or
+        std.mem.endsWith(u8, path, ".d.cts");
+}
+
 pub fn parse(gpa: Allocator, src: []const u8) error{ OutOfMemory, SourceTooLarge }!ast.Ast {
     return parseOpts(gpa, src, false);
 }
