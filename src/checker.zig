@@ -12503,7 +12503,7 @@ const Checker = struct {
                     // Infer class type args from ctor arguments.
                     const ctor = if (ctor_sigs.items.len > 0) ctor_sigs.items[0] else types.no_type;
                     if (ctor != types.no_type) {
-                        try c.inferTypeArgs(ctor, tp_syms, shape.arg_nodes, inst_args, types.no_type);
+                        try c.inferTypeArgs(ctor, tp_syms, shape.arg_nodes, inst_args, types.no_type, types.no_type);
                     } else {
                         for (inst_args) |*x| x.* = types.any_type;
                     }
@@ -12737,7 +12737,20 @@ const Checker = struct {
                 }
             }
         } else {
-            try c.inferTypeArgs(sig, tps, arg_nodes, args_buf, ret_ctx);
+            // The receiver type feeds inference of a `this`-parameter type
+            // param (recomputed only when the signature declares one, since
+            // `checkExprCached` on the member object is otherwise wasted work).
+            var recv_ty: TypeId = types.no_type;
+            if (c.ts.fnThisType(sig) != 0) {
+                const callee = c.callShape(node).callee;
+                switch (c.nodeTag(callee)) {
+                    .member_expr, .optional_member_expr, .index_expr, .optional_index_expr => {
+                        recv_ty = try c.checkExprCached(c.tree.nodeData(callee).lhs, types.no_type);
+                    },
+                    else => {},
+                }
+            }
+            try c.inferTypeArgs(sig, tps, arg_nodes, args_buf, ret_ctx, recv_ty);
         }
         var map = try c.scratch().alloc(TpMap, tps.len);
         for (tps, 0..) |tp, i| map[i] = .{ .sym = tp, .ty = args_buf[i] };
@@ -12822,9 +12835,23 @@ const Checker = struct {
         arg_nodes: []const Node,
         out: []TypeId,
         ret_ctx: TypeId,
+        recv_ty: TypeId,
     ) Error!void {
         const candidates = try c.scratch().alloc(TypeId, tp_syms.len);
         for (candidates) |*x| x.* = types.no_type;
+
+        // Infer type parameters that appear in an explicit `this` parameter
+        // (`flat<A, D extends number = 1>(this: A, depth?: D)`) from the call's
+        // receiver — tsc treats the receiver as the `this` argument. Without it
+        // `A` stays unbound and `arr.flat()`'s `FlatArray<A, D>[]` return
+        // collapses to `unknown[]` (spurious TS2339 on every element access).
+        // Gated on a signature that actually declares a `this` type, so the
+        // common array/iterator methods (whose element type already flows from
+        // the receiver's `Array<T>` interface, no `this` param) are untouched.
+        const this_ty = c.ts.fnThisType(sig);
+        if (this_ty != 0 and recv_ty != types.no_type) {
+            try c.unify(this_ty, recv_ty, tp_syms, candidates, 0);
+        }
 
         // Phase 1: non-function arguments.
         var ai: u32 = 0;
