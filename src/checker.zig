@@ -4210,7 +4210,7 @@ const Checker = struct {
         // Origin tag (see `origin`): a one-step alias instantiation carries the
         // canonical `makeRef(sym, fixed)` so the reflexive fast-path can match
         // it against a two-step re-instantiation of the same alias object.
-        if (c.ts.kind(reduced) == .object or c.ts.kind(reduced) == .function) try c.origin.put(c.ca(), reduced, orig);
+        if (originTaggable(c.ts.kind(reduced))) try c.origin.put(c.ca(), reduced, orig);
         return reduced;
     }
 
@@ -4316,9 +4316,115 @@ const Checker = struct {
         // re-materialization of the SAME `ref` relates by identity. Only
         // objects are tagged — a ref that resolved to a union/primitive/etc.
         // is already compared by its own rules.
-        if (c.ts.kind(result) == .object or c.ts.kind(result) == .function) try c.origin.put(c.ca(), result, ref);
+        if (originTaggable(c.ts.kind(result))) try c.origin.put(c.ca(), result, ref);
         try c.expansions.put(c.ca(), ref, result);
         return result;
+    }
+
+    /// A materialized generic instantiation carries an origin tag (see `origin`)
+    /// only when it lands on a structural shape whose identity the reflexive /
+    /// equivalence fast-path can exploit: an object, a function, or an
+    /// intersection (a callable-object `Callable & {…}` alias such as RTK's
+    /// `AsyncThunk<…>` materializes to a kept intersection, and its two
+    /// route-divergent instantiations must relate by origin). Unions/primitives
+    /// are compared by their own rules and are never tagged.
+    fn originTaggable(k: types.Kind) bool {
+        return k == .object or k == .function or k == .intersection;
+    }
+
+    /// Depth ceiling on the recursive origin-arg equivalence walk (see
+    /// `originArgEquiv`) — a belt on top of the structure-only reduction, which
+    /// already terminates (each hop peels a ref/intersection/tuple layer).
+    const origin_equiv_depth: u32 = 8;
+
+    fn isEmptyObjectType(c: *Checker, t: TypeId) bool {
+        const s = &c.ts;
+        return s.kind(t) == .object and s.objectPropCount(t) == 0 and
+            s.objectStringIndex(t) == 0 and s.objectNumberIndex(t) == 0 and
+            s.objectCallSigCount(t) == 0 and s.objectConstructSigCount(t) == 0;
+    }
+
+    /// Canonicalize a type for origin-arg equivalence: resolve refs to their
+    /// structural form, and drop empty-object members from an intersection
+    /// (`T & {} ≡ T` — `{}` adds no constraint to an object member, a SOUND
+    /// rewrite). Returns the interned TypeId so two structurally-identical
+    /// reductions compare equal by identity, never by assignability.
+    fn reduceForOriginEquiv(c: *Checker, t: TypeId) Error!TypeId {
+        const r = try c.resolveStructural(t);
+        if (c.ts.kind(r) != .intersection) return r;
+        var non_empty: std.ArrayList(TypeId) = .empty;
+        defer non_empty.deinit(c.scratch());
+        for (try c.memberList(r)) |m| {
+            const rm = try c.resolveStructural(m);
+            if (!c.isEmptyObjectType(rm)) try non_empty.append(c.scratch(), rm);
+        }
+        if (non_empty.items.len == 1) return try c.reduceForOriginEquiv(non_empty.items[0]);
+        return r;
+    }
+
+    /// Are two origin args EQUAL as types? Sound, identity-based (never mutual
+    /// assignability): exact TypeId equality, OR same-symbol refs whose args are
+    /// pairwise equivalent, OR same-shape tuples elementwise, OR one is the
+    /// `T & {}` form of the other, OR two materializations sharing a same-symbol
+    /// origin tag. Anything else — including `unknown`/`any` collapse against a
+    /// concrete type — is NOT equivalent, so a genuinely different instantiation
+    /// still fails the relation.
+    fn originArgEquiv(c: *Checker, a0: TypeId, b0: TypeId, depth: u32) Error!bool {
+        if (a0 == b0) return true;
+        if (depth > origin_equiv_depth) return false;
+        const s = &c.ts;
+        // Compare same-symbol refs structurally WITHOUT expanding (so the
+        // recursion tracks arg identity, not the materialized objects).
+        if (s.kind(a0) == .ref and s.kind(b0) == .ref and s.refSymbol(a0) == s.refSymbol(b0)) {
+            const sa = s.refArgs(a0);
+            const ta = s.refArgs(b0);
+            if (sa.len == ta.len) {
+                var all = true;
+                for (sa, ta) |x, y| {
+                    if (!try c.originArgEquiv(x, y, depth + 1)) {
+                        all = false;
+                        break;
+                    }
+                }
+                if (all) return true;
+            }
+        }
+        const a = try c.reduceForOriginEquiv(a0);
+        const b = try c.reduceForOriginEquiv(b0);
+        // Identity after reduction — but not for the trivial top/bottom types,
+        // whose relation the normal walk already handles permissively (guards
+        // against a cycle-truncated `error_type` on both sides reading as equal).
+        if (a == b) {
+            return switch (s.kind(a)) {
+                .any, .err, .unknown, .never, .none => false,
+                else => true,
+            };
+        }
+        const ak = s.kind(a);
+        if (ak != s.kind(b)) return false;
+        if (ak == .tuple) {
+            if (s.tupleLen(a) != s.tupleLen(b)) return false;
+            for (0..s.tupleLen(a)) |i| {
+                const ea = s.tupleElem(a, @intCast(i));
+                const eb = s.tupleElem(b, @intCast(i));
+                if (ea.flags != eb.flags) return false;
+                if (!try c.originArgEquiv(ea.ty, eb.ty, depth + 1)) return false;
+            }
+            return true;
+        }
+        // Two distinct materializations of the same generic (each carrying an
+        // origin tag): recurse on the origin refs.
+        if (ak == .object or ak == .function or ak == .intersection) {
+            if (c.origin.get(a)) |oa| {
+                if (c.origin.get(b)) |ob| {
+                    if (oa == ob) return true;
+                    if (s.kind(oa) == .ref and s.kind(ob) == .ref and s.refSymbol(oa) == s.refSymbol(ob)) {
+                        return try c.originArgEquiv(oa, ob, depth + 1);
+                    }
+                }
+            }
+        }
+        return false;
     }
 
     /// Ceiling on eager recursive re-expansion of a shrinking alias — a
@@ -5851,7 +5957,20 @@ const Checker = struct {
                 var parts: std.ArrayList(TypeId) = .empty;
                 defer parts.deinit(c.scratch());
                 for (try c.memberList(t)) |m| try parts.append(c.scratch(), try c.instantiateId(m, map, map_id));
-                break :blk try s.makeIntersection(c.scratch(), parts.items);
+                const inter = try s.makeIntersection(c.scratch(), parts.items);
+                // Propagate the origin tag through instantiation of a callable-
+                // object alias that materializes to a kept intersection (RTK's
+                // `AsyncThunk<…>` = `AsyncThunkActionCreator<…> & {…}`): the
+                // pre-expanded sig-return `t` carries `origin[t] =
+                // makeRef(G, own-params)`, and the substituted result denotes
+                // `G<args'…>`. Without this the two route-divergent
+                // instantiations of the same alias lose all origin identity and
+                // the equivalence fast-path cannot fire. Budget-shielded like the
+                // object arm.
+                if (c.origin.get(t)) |orig_ref| {
+                    if (inter != t and c.ts.kind(inter) == .intersection) try c.tagInstantiatedOrigin(inter, orig_ref, map, map_id);
+                }
+                break :blk inter;
             },
             .overloads => blk: {
                 var parts: std.ArrayList(TypeId) = .empty;
@@ -8626,10 +8745,25 @@ const Checker = struct {
         // fail on non-confluent one-step vs two-step reductions of the same
         // type. Identity-only: no variance, it fires solely when the origin refs
         // are equal.
-        if ((sk == .object or sk == .function) and sk == tk) {
+        if (originTaggable(sk) and sk == tk) {
             if (c.origin.get(s)) |os| {
                 if (c.origin.get(t)) |ot| {
+                    // Reflexive identity: same interned origin ref (see `origin`).
                     if (os == ot) return true;
+                    // Variance-free EQUIVALENCE: both denote `G<…>` for the same
+                    // `G`, and each arg pair is equal — by TypeId identity or by a
+                    // SOUND reduction (`T & {} ≡ T`; interned structural forms
+                    // compared by identity, never by mutual assignability). Two
+                    // args that are equal types make the two instantiations the
+                    // SAME type regardless of `G`'s variance, so the relation is
+                    // reflexive. This closes the RTK non-confluence where one
+                    // instantiation carries an unreduced config `C1 = P & Omit<…>`
+                    // and the other the concrete reduction `C2 = P`.
+                    if (c.ts.kind(os) == .ref and c.ts.kind(ot) == .ref and
+                        c.ts.refSymbol(os) == c.ts.refSymbol(ot))
+                    {
+                        if (try c.originArgEquiv(os, ot, 0)) return true;
+                    }
                 }
             }
         }
