@@ -14505,7 +14505,25 @@ const Checker = struct {
     /// Shared by user-defined type guards and assertion functions.
     fn guardTargetFor(c: *Checker, call: Node, key: RefKey) Error!?types.Predicate {
         const shape = c.callShape(call);
-        const callee_t = try c.checkExprCached(shape.callee, types.no_type);
+        // Obtain the callee's type for predicate inspection. When the callee is
+        // a MEMBER/element access (`rule.abstract.startsWith`), re-checking it
+        // here — a flow-narrowing side query — would re-evaluate its receiver;
+        // if this query is a re-entrant walk of a loop back-edge triggered by
+        // the very call statement/condition being checked (loop label still in
+        // progress), the receiver is transiently re-widened to its declared
+        // type, so the member access raises a spurious TS18048/2532 and caches a
+        // poisoned type. For those callees, consult only the already-computed
+        // type: a genuine member-callee guard is checked top-down before any
+        // read whose narrowing depends on it, so it is memoized by then; an
+        // un-memoized member callee means we are in that premature re-entrant
+        // state, so skip (sound under-narrowing). A bare-identifier callee
+        // (`isT(x)`) has no receiver to re-widen and is not always memoized as a
+        // node type, so it is safe to (re-)check directly.
+        const callee = shape.callee;
+        const callee_t = switch (c.nodeTag(callee)) {
+            .member_expr, .optional_member_expr, .index_expr, .optional_index_expr => c.nodeType(callee) orelse return null,
+            else => try c.checkExprCached(callee, types.no_type),
+        };
         if (!c.ts.fnHasPredicate(callee_t)) return null;
         const pred = c.ts.fnPredicate(callee_t);
         if (pred.param == types.Predicate.this_param) return null; // `this is T`: gap
