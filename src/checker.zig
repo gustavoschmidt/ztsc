@@ -7625,6 +7625,23 @@ const Checker = struct {
                     if (keep) try out.append(c.scratch(), cand);
                 }
             },
+            // An enum key domain (`{ [P in E]: V }` / `Record<E, V>`) is
+            // materialized as an INDEX signature (`string` for a string enum,
+            // `number` for a numeric one), not named props. ztsc has no
+            // per-member enum literal type, so it cannot name the props by
+            // member value — and, symmetrically, an object literal built with
+            // computed enum-member keys (`{ [E.A]: v }`) collapses to `{}`.
+            // Emitting named props here would make every such literal fail the
+            // now-required keys (spurious TS2739). An index signature keeps both
+            // sides consistent: `Object.values`/`entries` inference recovers `V`
+            // from the index (fixing the `unknown[]`/TS2339 collapse), and a
+            // `{}`-shaped computed-key literal stays assignable. The tradeoff is
+            // under-reporting a genuinely missing enum key — acceptable, and no
+            // worse than today (the map previously collapsed to `{}` outright).
+            .enum_type => {
+                const info = try c.enumInfo(s.enumSymbol(constraint));
+                try out.append(c.scratch(), if (info.all_string) types.string_type else types.number_type);
+            },
             else => try out.append(c.scratch(), constraint),
         }
     }
