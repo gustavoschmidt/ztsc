@@ -4882,6 +4882,12 @@ const Checker = struct {
         // Merge base class instance.
         if (try c.baseClassRef(sym)) |base_ref| {
             result = try c.mergeBaseObject(result, try c.resolveStructural(base_ref), false);
+        } else if (try c.baseExprConstructType(sym)) |base_ctor| {
+            // `extends <value with construct signatures>`: the base instance is
+            // the construct signature's return type.
+            const inst = c.ts.objectConstructSig(base_ctor, 0);
+            const ret = c.ts.fnReturn(inst);
+            result = try c.mergeBaseObject(result, try c.resolveStructural(ret), false);
         }
         try c.class_inst_generic.put(c.ca(), sym, result);
         return result;
@@ -4954,6 +4960,38 @@ const Checker = struct {
             },
             else => return null,
         }
+    }
+
+    /// When a class `extends <expr>` and `<expr>` is a *value* (not a class
+    /// symbol) whose type carries construct signatures — the
+    /// `declare const Base: { new (input): R }` mixin-base pattern, e.g. the
+    /// AWS-SDK Smithy `class XCommand extends XCommand_base` where the base
+    /// const's type has a `new(input)` signature — returns that base
+    /// constructor object type (resolved structurally). The derived class then
+    /// inherits both the construct signature (for `new Derived(args)`) and the
+    /// signature's return type as its base instance. Null when there is no
+    /// extends clause, the base resolves to a class symbol (handled by
+    /// `baseClassRef`), or the base value has no construct signatures.
+    fn baseExprConstructType(c: *Checker, sym: SymbolId) Error!?TypeId {
+        const saved_ctx = c.enterSymFile(sym);
+        defer c.restoreCtx(saved_ctx);
+        for (c.declsOf(sym)) |decl| {
+            if (c.nodeTag(decl) != .class_decl) continue;
+            const data = c.tree.extraData(ast.ClassData, c.tree.nodeData(decl).lhs);
+            if (data.extends == 0) return null;
+            const hd = c.tree.nodeData(data.extends);
+            const saved = c.cur_scope;
+            defer c.cur_scope = saved;
+            if (try c.scopeOf(decl)) |s| c.cur_scope = s;
+            // A class-symbol base is `baseClassRef`'s job; skip it here.
+            if (try c.classBaseEntitySym(hd.lhs)) |bs| {
+                if (c.symFlags(bs).class) return null;
+            }
+            const bt = try c.resolveStructural(try c.checkExprCached(hd.lhs, types.no_type));
+            if (c.ts.kind(bt) == .object and c.ts.objectConstructSigCount(bt) > 0) return bt;
+            return null;
+        }
+        return null;
     }
 
     /// The declaration symbol behind an import target: a direct binding, or —
@@ -5420,7 +5458,16 @@ const Checker = struct {
                 }
             }
             // Inherit base ctor.
-            const base = try c.baseClassRef(cur) orelse return;
+            const base = try c.baseClassRef(cur) orelse {
+                // `extends <value with construct signatures>` (mixin-base):
+                // inherit the base value's construct signatures.
+                if (try c.baseExprConstructType(cur)) |base_ctor| {
+                    for (0..c.ts.objectConstructSigCount(base_ctor)) |i| {
+                        try out.append(c.scratch(), c.ts.objectConstructSig(base_ctor, @intCast(i)));
+                    }
+                }
+                return;
+            };
             cur = c.ts.refSymbol(base);
         }
     }
