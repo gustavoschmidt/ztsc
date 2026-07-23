@@ -3184,9 +3184,17 @@ const Checker = struct {
         st: TypeId,
         props: *std.ArrayList(types.Prop),
         prop_index: *std.AutoHashMapUnmanaged(Atom, u32),
+        str_index_vals: *std.ArrayList(TypeId),
+        num_index_vals: *std.ArrayList(TypeId),
     ) Error!void {
         switch (c.ts.kind(st)) {
             .object => {
+                // tsc's `getSpreadType` carries the source's index signatures
+                // into the result, so `{ ...src }` of `{ [k: string]: any }`
+                // keeps the string index (`updated.arr` stays `any`, not a
+                // missing-property TS2551/2339).
+                if (c.ts.objectStringIndex(st) != 0) try str_index_vals.append(c.scratch(), c.ts.objectStringIndex(st));
+                if (c.ts.objectNumberIndex(st) != 0) try num_index_vals.append(c.scratch(), c.ts.objectNumberIndex(st));
                 for (0..c.ts.objectPropCount(st)) |i| {
                     const p = c.ts.objectProp(st, @intCast(i));
                     // tsc's `getSpreadType`: when a property is present in both
@@ -3209,7 +3217,7 @@ const Checker = struct {
             },
             .intersection => {
                 for (try c.memberList(st)) |m| {
-                    try c.gatherSpreadProps(try c.resolveStructural(m), props, prop_index);
+                    try c.gatherSpreadProps(try c.resolveStructural(m), props, prop_index, str_index_vals, num_index_vals);
                 }
             },
             else => {},
@@ -11297,7 +11305,7 @@ const Checker = struct {
                         try generic_spreads.append(c.scratch(), st);
                         continue;
                     }
-                    try c.gatherSpreadProps(st, &props, &prop_index);
+                    try c.gatherSpreadProps(st, &props, &prop_index, &str_index_vals, &num_index_vals);
                 },
                 else => _ = try c.checkExprCached(prop, types.no_type),
             }
