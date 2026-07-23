@@ -7426,6 +7426,60 @@ const Checker = struct {
                     }
                     return s.makeTuple(elems.items);
                 },
+                .union_type => {
+                    // A homomorphic map distributes over a union source: tsc's
+                    // `mapType` yields `M<A> | M<B>` for `M<A | B>` (a homomorphic
+                    // mapped type — `{ [P in keyof T]: … }` — is applied to each
+                    // constituent). Without this a union source fell through to
+                    // `{}`, so `Readonly<A | B>` (react-pdf's `ImageProps =
+                    // ImageWithSrcProp | ImageWithSourceProp` read off a class
+                    // component's `props: Readonly<P>`) collapsed to `{}` and every
+                    // attribute read as excess against `IntrinsicAttributes & {}`.
+                    // Restricted to a union whose every constituent is a plain,
+                    // named-property object (no index signature): that is the
+                    // props-union case we need (react-pdf `ImageProps`), and it
+                    // keeps the map well-defined. A union of pure index-signature
+                    // objects (`Record<string,A> | Record<string,B>` — redux's
+                    // `SliceCaseReducers<State>` default, reached only when
+                    // `createSlice`'s reducer inference falls back to the
+                    // constraint) keeps the prior `{}` fallback: distributing it
+                    // would materialize a spurious `{ [x:string]: … }` that fails a
+                    // named-property target (a separate, pre-existing inference
+                    // gap). Under-report over a false positive.
+                    // Snapshot the members: the per-member recursion below
+                    // materializes new types, which may reallocate the type
+                    // store's member backing and invalidate a live `members(src)`
+                    // slice.
+                    const umembers = try c.scratch().dupe(TypeId, c.ts.members(src));
+                    var all_obj = true;
+                    for (umembers) |m| {
+                        const rm = try c.resolveStructural(m);
+                        // An intersection member (`PropsWithChildren<TextProps>` =
+                        // `TextProps & {children?}`) is fine — its per-member map is
+                        // the `.intersection` arm below. A plain object member must
+                        // carry named props and NO index signature; a pure
+                        // index-signature object (`Record<string,V>`) is the redux
+                        // `SliceCaseReducers` fallback and must not distribute.
+                        const ok = s.kind(rm) == .intersection or
+                            (s.kind(rm) == .object and
+                                s.objectPropCount(rm) > 0 and
+                                s.objectStringIndex(rm) == 0 and
+                                s.objectNumberIndex(rm) == 0);
+                        if (!ok) {
+                            all_obj = false;
+                            break;
+                        }
+                    }
+                    if (all_obj) {
+                        var parts: std.ArrayList(TypeId) = .empty;
+                        defer parts.deinit(c.scratch());
+                        for (umembers) |m| {
+                            try parts.append(c.scratch(), try c.materializeMapped(key_param, constraint, value, as_clause, m, flags));
+                        }
+                        return c.ts.makeUnion(c.scratch(), parts.items);
+                    }
+                    return types.empty_object_type;
+                },
                 .object, .intersection => {
                     // A homomorphic map iterates the source's own members. An
                     // intersection source (`{ [K in keyof (A & B)]: … }`) has
