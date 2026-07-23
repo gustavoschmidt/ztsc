@@ -10238,6 +10238,58 @@ const Checker = struct {
     /// real requirement, so a JSX-inferred object candidate should not be clamped
     /// to it. Deliberately narrow: a concrete-valued index (`Record<string,
     /// string>`) or an index-plus-required-props shape returns false.
+    /// Whether the type param `sym` appears at the *top level* of a signature's
+    /// return type `ret`: it is the whole return, or a member of a top-level
+    /// union/intersection (recursively). Mirrors tsc's `isTypeParameterAtTopLevel`
+    /// — a tuple element, an object property, or an array element is NOT top-level.
+    /// tsc keeps a literal inference candidate when its param is top-level in the
+    /// return (`id<T>(x: T): T` → `id(false)` stays `false`) and widens it
+    /// otherwise (`useState<S>(x): [S, …]` → `useState(false)` widens `S` to
+    /// `boolean`). A top-level named alias (`type Foo<S> = S | undefined`) is
+    /// resolved once so `S` is still found.
+    fn typeParamAtTopLevel(c: *Checker, ret: TypeId, sym: u32) Error!bool {
+        const t = if (c.ts.kind(ret) == .ref) try c.resolveStructural(ret) else ret;
+        switch (c.ts.kind(t)) {
+            .type_param => return c.ts.typeParamSymbol(t) == sym,
+            .union_type, .intersection => {
+                for (try c.memberList(t)) |m| {
+                    switch (c.ts.kind(m)) {
+                        .type_param => if (c.ts.typeParamSymbol(m) == sym) return true,
+                        .union_type, .intersection => if (try c.typeParamAtTopLevel(m, sym)) return true,
+                        else => {},
+                    }
+                }
+                return false;
+            },
+            else => return false,
+        }
+    }
+
+    /// Whether a type-parameter constraint is (or contains, through a union /
+    /// intersection) a primitive, literal, enum, template-literal, string-mapping
+    /// or `keyof` type — tsc's `hasPrimitiveConstraint`. Such a constraint makes
+    /// tsc KEEP a literal inference candidate (mapped through
+    /// `getRegularTypeOfLiteralType`, not widened): `f<T extends 'a' | 'b'>(x: T)`
+    /// called with `'a'` fixes `T` to `'a'`, and `h<T extends string>(x: T): T[]`
+    /// keeps the passed string literal. `no_type` (no constraint) is not primitive.
+    fn constraintIsPrimitive(c: *Checker, constraint: TypeId) Error!bool {
+        if (constraint == types.no_type) return false;
+        return c.typeHasPrimitive(try c.resolveStructural(constraint));
+    }
+
+    fn typeHasPrimitive(c: *Checker, t: TypeId) Error!bool {
+        return switch (c.ts.kind(t)) {
+            .string, .number, .boolean, .bigint, .symbol, .undefined, .null, .void, .never, .unique_symbol, .enum_type, .string_literal, .number_literal, .number_literal_fresh, .bigint_literal, .bool_true, .bool_false, .template_literal_type, .string_mapping, .keyof_op => true,
+            .union_type, .intersection => blk: {
+                for (try c.memberList(t)) |m| {
+                    if (try c.typeHasPrimitive(try c.resolveStructural(m))) break :blk true;
+                }
+                break :blk false;
+            },
+            else => false,
+        };
+    }
+
     fn constraintIsAnyIndex(c: *Checker, t: TypeId) Error!bool {
         if (t == types.no_type) return false;
         const r = try c.resolveStructural(t);
@@ -12856,11 +12908,33 @@ const Checker = struct {
         // stayed `any` inside `Ret extends TReturn<TOpt>`, so
         // `any['returnObjects'] extends true` wrongly took the true branch
         // (i18next `t()` → `$SpecialObject` instead of `string`).
+        // Signature return type (for the literal-widening top-level test below);
+        // `no_type` when `sig` is not a plain function (an overload set never
+        // reaches per-signature inference here).
+        const sig_ret: TypeId = if (c.ts.kind(sig) == .function) c.ts.fnReturn(sig) else types.no_type;
         for (tp_syms, 0..) |tp, i| {
             var constraint: TypeId = try c.typeParamConstraint(tp);
             if (constraint != types.no_type) constraint = try c.instantiate(constraint, prov);
             if (candidates[i] != types.no_type) {
                 out[i] = candidates[i];
+                // tsc's `getCovariantInference` widens a fresh-literal inference
+                // candidate (`getWidenedLiteralType`) before fixing the param —
+                // UNLESS the param has a primitive/literal constraint (which
+                // keeps the literal) or it appears at the top level of the
+                // signature's return type. `useState<S>(x): [S, …]` → `S` is a
+                // tuple element (not top-level), no constraint → `useState(false)`
+                // widens `S` to `boolean`, so `setX(true)` no longer spuriously
+                // fails; `id<T>(x: T): T` keeps `T` (top-level return);
+                // `f<T extends 'a' | 'b'>` keeps the literal (primitive
+                // constraint). Only fresh literals widen, so `x as const` and a
+                // `null` candidate stay narrow. An explicit type argument never
+                // reaches here (it fills `out` directly upstream).
+                if (sig_ret != types.no_type and
+                    !try c.constraintIsPrimitive(constraint) and
+                    !try c.typeParamAtTopLevel(sig_ret, tp))
+                {
+                    out[i] = try c.widenLiteral(out[i]);
+                }
                 // Candidate violating the constraint falls back to the
                 // constraint (tsc then re-checks args against it). But skip
                 // the fallback when the constraint — after substituting the
