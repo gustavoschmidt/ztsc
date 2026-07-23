@@ -13426,16 +13426,30 @@ const Checker = struct {
     /// are not tracked (sound under-narrowing = pre-depth-N behavior).
     const max_ref_depth = 3;
 
+    /// One link in a reference path: either a dotted member (`.p`, property
+    /// atom in `atom`) or a constant element access (`[i]`, index in `index`).
+    /// Only *constant* integer indices are trackable — a variable index
+    /// (`arr[i]`) is not a stable reference, so `buildRefKey` rejects it. The
+    /// unused field is always 0 so two `PathElem`s hash/compare canonically as
+    /// part of an `AutoHashMap` key.
+    const PathElem = struct {
+        is_index: bool = false,
+        atom: Atom = 0,
+        index: u32 = 0,
+    };
+
     /// A narrowable reference: a bare identifier (`len == 0`) or a member
     /// path `sym.path[0].path[1]…` capped at `max_ref_depth`. `path[0]` is the
-    /// innermost property (closest to the root), `path[len-1]` the outermost.
+    /// innermost link (closest to the root), `path[len-1]` the outermost. Each
+    /// link is a dotted member (`.p`) or a constant element access (`[i]`), so
+    /// `data.Legend[0].rules` is a depth-3 reference (`Legend`, `[0]`, `rules`).
     /// A `this`-rooted path uses the sentinel root `this_flow_root` (flow
     /// graphs are per-function, so the sentinel never crosses a `this`-rebind
-    /// boundary). Trailing `path` slots past `len` are always 0 so the struct
-    /// hashes/compares canonically as an `AutoHashMap` key.
+    /// boundary). Trailing `path` slots past `len` are always default so the
+    /// struct hashes/compares canonically as an `AutoHashMap` key.
     const RefKey = struct {
         sym: SymbolId,
-        path: [max_ref_depth]Atom = [_]Atom{0} ** max_ref_depth,
+        path: [max_ref_depth]PathElem = [_]PathElem{.{}} ** max_ref_depth,
         len: u8 = 0,
     };
 
@@ -13451,22 +13465,41 @@ const Checker = struct {
         return gop.value_ptr.*;
     }
 
-    /// Build the tracked reference key for a member-access node by peeling its
-    /// spine right-to-left, collecting property atoms, until it bottoms out at
-    /// a bare identifier (resolved to a value symbol) or `this`. Returns null
-    /// when the root is neither (element access, call result, etc.) or the
-    /// path is deeper than `max_ref_depth` (untracked = sound under-narrowing).
+    /// A constant, non-negative integer element-access index (`arr[0]`), else
+    /// null. A variable/expression index (`arr[i]`) is not a stable reference,
+    /// so it is untracked (sound under-narrowing). The 4096 bound matches the
+    /// tuple-index ceiling used by `indexChainInner`.
+    fn constIndexOf(c: *Checker, rhs: Node) ?u32 {
+        var n = rhs;
+        while (c.nodeTag(n) == .paren_expr) n = c.tree.nodeData(n).lhs;
+        if (c.nodeTag(n) != .number_literal) return null;
+        const v = c.numberTokenValue(c.tree.nodeMainToken(n));
+        if (v < 0 or v != @floor(v) or v >= 4096) return null;
+        return @intFromFloat(v);
+    }
+
+    /// Build the tracked reference key for a member/element-access node by
+    /// peeling its spine right-to-left, collecting dotted-member atoms and
+    /// constant element indices, until it bottoms out at a bare identifier
+    /// (resolved to a value symbol) or `this`. Returns null when the root is
+    /// neither (call result, non-constant index, etc.) or the path is deeper
+    /// than `max_ref_depth` (untracked = sound under-narrowing).
     fn buildRefKey(c: *Checker, node: Node) Error!?RefKey {
-        var atoms: [max_ref_depth]Atom = [_]Atom{0} ** max_ref_depth;
+        var elems: [max_ref_depth]PathElem = [_]PathElem{.{}} ** max_ref_depth;
         var count: usize = 0;
         var n = node;
         while (true) {
             while (c.nodeTag(n) == .paren_expr) n = c.tree.nodeData(n).lhs;
             const tag = c.nodeTag(n);
-            if (tag != .member_expr and tag != .optional_member_expr) break;
-            if (count >= max_ref_depth) return null; // too deep: not tracked
             const d = c.tree.nodeData(n);
-            atoms[count] = try c.memberAtom(d.rhs);
+            if (tag == .member_expr or tag == .optional_member_expr) {
+                if (count >= max_ref_depth) return null; // too deep: not tracked
+                elems[count] = .{ .atom = try c.memberAtom(d.rhs) };
+            } else if (tag == .index_expr or tag == .optional_index_expr) {
+                const iv = c.constIndexOf(d.rhs) orelse return null; // variable index: untracked
+                if (count >= max_ref_depth) return null;
+                elems[count] = .{ .is_index = true, .index = iv };
+            } else break;
             count += 1;
             n = d.lhs;
         }
@@ -13485,15 +13518,15 @@ const Checker = struct {
         } else if (c.nodeTag(n) == .this_expr) {
             key.sym = this_flow_root;
         } else return null;
-        // Atoms were collected outermost-first; reverse so `path[0]` is the
-        // innermost property (closest to the root).
+        // Links were collected outermost-first; reverse so `path[0]` is the
+        // innermost link (closest to the root).
         var i: usize = 0;
-        while (i < count) : (i += 1) key.path[i] = atoms[count - 1 - i];
+        while (i < count) : (i += 1) key.path[i] = elems[count - 1 - i];
         return key;
     }
 
-    /// Does `node` denote exactly this reference? Peels the member spine
-    /// right-to-left, matching each property atom against the key's path
+    /// Does `node` denote exactly this reference? Peels the member/element
+    /// spine right-to-left, matching each link against the key's path
     /// (outermost = `path[len-1]`), and bottoms out at the root identifier /
     /// `this`.
     fn refMatches(c: *Checker, node: Node, key: RefKey) Error!bool {
@@ -13505,9 +13538,16 @@ const Checker = struct {
         while (i > 0) : (i -= 1) {
             while (c.nodeTag(n) == .paren_expr) n = c.tree.nodeData(n).lhs;
             const tag = c.nodeTag(n);
-            if (tag != .member_expr and tag != .optional_member_expr) return false;
             const d = c.tree.nodeData(n);
-            if ((try c.memberAtom(d.rhs)) != key.path[i - 1]) return false;
+            const pe = key.path[i - 1];
+            if (pe.is_index) {
+                if (tag != .index_expr and tag != .optional_index_expr) return false;
+                const iv = c.constIndexOf(d.rhs) orelse return false;
+                if (iv != pe.index) return false;
+            } else {
+                if (tag != .member_expr and tag != .optional_member_expr) return false;
+                if ((try c.memberAtom(d.rhs)) != pe.atom) return false;
+            }
             n = d.lhs;
         }
         return c.identIsSym(n, key.sym);
