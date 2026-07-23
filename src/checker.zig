@@ -551,6 +551,13 @@ const Checker = struct {
     /// this `mapped_param` type; the constraint is evaluated with it cleared.
     cur_mapped_key_name: Atom = 0,
     cur_mapped_key_ty: TypeId = 0,
+    /// Infer-scope stack height captured when `cur_mapped_key_*` was entered.
+    /// A same-named outer `infer X` (scope index < this) is OUTER to the mapped
+    /// key `[X in K]` and is shadowed by it (lexical innermost-wins); an `infer
+    /// X` pushed by a conditional NESTED in the mapped value (index >= this)
+    /// stays inner and still wins. See the resolution site in
+    /// `typeFromTypeNodeUncached`.
+    cur_mapped_key_scope_depth: usize = 0,
     /// Type-param names of the alias declaration whose (memoized) generic body
     /// is currently being materialized. Such a param is lexically the innermost
     /// binding of its name inside the body, so it shadows a same-named `infer`
@@ -2162,18 +2169,32 @@ const Checker = struct {
         // (tsc lexical scoping) — skip both lookups for such a name.
         const shadowed = indexOfAtom(c.tp_shadow, a) != null;
         if (args.len == 0 and !shadowed) {
+            // Lexical innermost-wins between an outer conditional's `infer X`
+            // and a same-named mapped key `[X in K]`: the mapped key is
+            // declared INSIDE the branch that binds `infer X`, so within the
+            // mapped `as`/value a bare `X` is the mapped param and shadows the
+            // infer binder — matching tsc, and (crucially) making the built
+            // value route-independent. `cur_mapped_key_scope_depth` is the
+            // infer-scope stack height when the mapped key was entered: scopes
+            // below it are OUTER (mapped key shadows them); scopes at/above it
+            // belong to a conditional NESTED in the mapped value and stay inner
+            // (they still win). Without this, `{ [P in K]: T[P] }` nested in a
+            // `… infer P …` branch built its value as `T[infer_var]`; the
+            // unbound infer var collapses the indexed access to `any` at
+            // reduction → every prop dropped to required (the
+            // `--checkers`-partition-dependent TS2739/TS2322 non-confluence).
+            const mk_here = c.cur_mapped_key_name != 0 and c.cur_mapped_key_name == a;
             var i = c.infer_scopes.items.len;
             while (i > 0) {
                 i -= 1;
+                if (mk_here and i < c.cur_mapped_key_scope_depth) return c.cur_mapped_key_ty;
                 if (c.infer_ids.get(.{ .cond = c.infer_scopes.items[i], .name = a })) |id| {
                     return c.ts.makeInferVar(id, a);
                 }
             }
-        }
-        // A mapped type's key parameter `K` is in scope in its `as`/value
-        // branches (M16b); a bare `K` there resolves to the mapped_param.
-        if (c.cur_mapped_key_name != 0 and c.cur_mapped_key_name == a and args.len == 0 and !shadowed) {
-            return c.cur_mapped_key_ty;
+            // A mapped type's key parameter `K` is in scope in its `as`/value
+            // branches (M16b); a bare `K` there resolves to the mapped_param.
+            if (mk_here) return c.cur_mapped_key_ty;
         }
         switch (c.resolveSpace(a, c.cur_scope, false)) {
             .sym => |sym0| {
@@ -7301,12 +7322,15 @@ const Checker = struct {
         // (never in the constraint), so evaluate those with it bound.
         const saved_name = c.cur_mapped_key_name;
         const saved_ty = c.cur_mapped_key_ty;
+        const saved_depth = c.cur_mapped_key_scope_depth;
         c.cur_mapped_key_name = key_name;
         c.cur_mapped_key_ty = key_param;
+        c.cur_mapped_key_scope_depth = c.infer_scopes.items.len;
         const as_clause = if (m.as_type != null_node) try c.typeFromTypeNode(m.as_type) else 0;
         const value = if (m.value != null_node) try c.typeFromTypeNode(m.value) else types.any_type;
         c.cur_mapped_key_name = saved_name;
         c.cur_mapped_key_ty = saved_ty;
+        c.cur_mapped_key_scope_depth = saved_depth;
 
         return c.reduceMapped(key_param, constraint, value, as_clause, src_type, flags);
     }
