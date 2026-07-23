@@ -398,6 +398,31 @@ pub const Store = struct {
         return if (s.base == null) 0 else s.kinds.items.len;
     }
 
+    /// Debug-only soundness net: every union/intersection/overloads member id
+    /// interned into this overlay must land inside the valid id space. A member
+    /// pointing past the end is a corrupt id that reached `internType` — the
+    /// signature of a use-after-realloc escape (a live `members()` slice read
+    /// while the loop body grew `extra` and moved its buffer; see the
+    /// `keyofType` intersection arm) or an uninitialized member slot. Compiled
+    /// out entirely in release (guarded by `runtime_safety`), and O(total
+    /// composite members) when on. Call once after a check completes.
+    pub fn debugValidateComposites(s: *const Store) void {
+        if (!std.debug.runtime_safety) return;
+        const upper: TypeId = s.base_len + @as(TypeId, @intCast(s.kinds.items.len));
+        var i: usize = 0;
+        while (i < s.kinds.items.len) : (i += 1) {
+            const id: TypeId = s.base_len + @as(TypeId, @intCast(i));
+            switch (s.kinds.items[i]) {
+                .union_type, .intersection, .overloads => {
+                    for (s.members(id)) |m| {
+                        std.debug.assert(m < upper);
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+
     /// Exact bytes held by the sealed-style SoA arrays (base + overlay). The
     /// base's bytes are shared across overlays; `overlayBytes` isolates this
     /// overlay's own footprint.
