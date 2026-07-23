@@ -10868,14 +10868,17 @@ const Checker = struct {
                 // Contextually type the value by the target prop type for a
                 // template-literal expression (so it keeps its template structure
                 // instead of widening to `string`, e.g. `<Icon name={`ns:${s}`} />`
-                // against a `` `${string}:${string}` `` prop) and for an object
+                // against a `` `${string}:${string}` `` prop), for an object
                 // literal (so its properties are typed by the target — e.g.
                 // `style={{ position: 'absolute' }}` against `CSSProperties`, whose
                 // `position` is a union of string literals: without the context the
-                // literal widens to `string` and rejects). Other value kinds are
-                // checked context-free, exactly as before.
+                // literal widens to `string` and rejects), and for an array literal
+                // (so a fixed-length target picks the tuple member of a union —
+                // e.g. `radius={[8, 8, 8, 8]}` against `number | [number, number,
+                // number, number]`: without the context it widens to `number[]`
+                // and fails the tuple). Other value kinds are checked context-free.
                 const vctx = switch (c.nodeTag(cd.lhs)) {
-                    .template_expr, .object_literal => ctx,
+                    .template_expr, .object_literal, .array_literal => ctx,
                     else => types.no_type,
                 };
                 return c.checkExprCached(cd.lhs, vctx);
