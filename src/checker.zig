@@ -9576,6 +9576,20 @@ const Checker = struct {
             }
             return true;
         }
+        // A `.ref` SOURCE that resolves to a union must distribute as a source
+        // union BEFORE the target-union branch below. A lazy alias
+        // self-reference (`ref(Geom)` captured while the recursive alias
+        // `Geom = … | GeometryCollection` was still in progress, and later
+        // surfaced as the element type of a narrowed `GeometryCollection`'s
+        // `geometries: G[]`) has kind `.ref`, not `.union_type`, so without this
+        // it is treated as one opaque source and wrongly required to fit a
+        // SINGLE target-union member — a spurious TS2345/TS2322. Resolving here
+        // lets the source-union distribution above run on re-entry. Scoped to
+        // ref-source + union-target + resolves-to-a-union so nothing else moves.
+        if (sk == .ref and tk == .union_type) {
+            const rs = try c.resolveStructural(s);
+            if (rs != s and c.ts.kind(rs) == .union_type) return c.isAssignable(rs, t);
+        }
         if (tk == .union_type) {
             for (try c.memberList(t)) |m| {
                 if (try c.isAssignable(s, m)) return true;
