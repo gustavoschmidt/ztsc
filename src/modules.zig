@@ -1318,18 +1318,8 @@ fn resolvePackageAt(io: Io, alloc: Allocator, dir: Io.Dir, d: []const u8, pkg: [
     } else |_| {}
     defer if (pj_text) |t| alloc.free(t);
 
-    // (1) `exports` map — authoritative for tsc when present. On a root (".")
-    //     miss we still fall through to legacy probing (deliberate under-report;
-    //     see file header). On a *subpath* miss, however, tsc's bundler/Node16
-    //     resolution hard-fails: a package that publishes `exports` is a
-    //     closed set of entry points, so `pkg/deep/path` NOT named by the map is
-    //     unresolvable — Node/tsc do NOT fall back to walking the filesystem.
-    //     Matching that is decisive for real deps whose declaration bundles
-    //     reference an internal, un-exported subpath (e.g. cva's dist typings
-    //     import `class-variance-authority/dist/types`, which is absent from
-    //     cva's `exports` — tsc leaves that reference `any`, keeping downstream
-    //     `VariantProps<…>` permissive, whereas resolving it concretely makes
-    //     the whole component-props chain spuriously strict).
+    // (1) `exports` map — authoritative for tsc when present. On a miss we fall
+    //     through to legacy probing (deliberate under-report; see file header).
     if (pj_text) |text| {
         if (tsconfig.parseJsonc(alloc, text)) |root| switch (root) {
             .object => |ro| if (ro.get("exports")) |exports_val| {
@@ -1339,11 +1329,6 @@ fn resolvePackageAt(io: Io, alloc: Allocator, dir: Io.Dir, d: []const u8, pkg: [
                     try std.fmt.allocPrint(alloc, "./{s}", .{sub});
                 defer if (sub.len != 0) alloc.free(subpath);
                 if (try resolveExportsField(io, alloc, dir, nm, exports_val, subpath)) |p| return p;
-                // Subpath unmatched by a present `exports` map → blocked (tsc
-                // does not legacy-probe). The root (".") still falls through, so
-                // a package whose `.` entry our condition set misses is not
-                // regressed.
-                if (sub.len != 0) return null;
             },
             else => {},
         } else |_| {}
