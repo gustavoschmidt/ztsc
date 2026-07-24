@@ -410,6 +410,10 @@ const Checker = struct {
     reassigned_in_loop: std.AutoHashMapUnmanaged(SymLoop, void) = .empty,
     /// Per-file flag: has this file's reassignment scan run yet?
     reassign_scanned: []bool = &.{},
+    /// Recursion depth of TS4.4 aliased-condition narrowing (following a
+    /// `const` alias into its initializer, then possibly an alias-of-alias).
+    /// Capped like tsc's `inlineLevel` to bound alias chains.
+    alias_inline_level: u32 = 0,
     /// FileId -> module namespace object type (0 = in progress).
     ns_types: std.AutoHashMapUnmanaged(FileId, TypeId) = .empty,
     /// Ambient-module namespace-object cache, keyed by ambient_exports index.
@@ -14642,6 +14646,67 @@ const Checker = struct {
 
     /// Narrow `t` (the flow type of the reference) by a decomposed
     /// condition node.
+    /// Whether the tracked reference is a *constant reference* in tsc's sense:
+    /// a root-identifier reference to a `const`, or to a parameter / mutable
+    /// local that is never reassigned anywhere in its file. Aliased-condition
+    /// narrowing requires this — an alias snapshots the condition at its
+    /// declaration point, so a reassignable subject could make the snapshot
+    /// stale (mirrors tsc's `isConstantReference`).
+    fn isConstantRefSym(c: *Checker, key: RefKey) Error!bool {
+        if (key.len != 0) return false;
+        if (key.sym == this_flow_root) return false;
+        const sf = c.symFlags(key.sym);
+        if (sf.const_decl) return true;
+        if (!(sf.let_decl or sf.var_decl or sf.param or sf.catch_param)) return false;
+        if (sf.exported) return false; // a top-level export may be reassigned elsewhere
+        if (c.symFile(key.sym) != c.cur_file) return false;
+        try c.ensureReassignScan();
+        return !c.reassigned_syms.contains(key.sym);
+    }
+
+    /// TS4.4 aliased-condition support: if `cond` is a bare identifier bound to
+    /// a `const` variable whose declarator has an initializer and no explicit
+    /// type annotation, and the tracked reference `key` is a constant
+    /// reference, return that initializer expression so the caller can narrow
+    /// `key` by it. Any unmet precondition returns null (narrowing untouched):
+    ///   • alias must be declared `const` (a never-reassigned `let` does NOT
+    ///     narrow — verified against tsc 5.9.3),
+    ///   • the declarator must carry no explicit type annotation (`const m:
+    ///     boolean = …` does not narrow), and bind a plain identifier (no
+    ///     destructured alias),
+    ///   • same-file, non-exported (so the initializer resolves in scope).
+    fn constAliasInit(c: *Checker, cond: Node, key: RefKey) Error!?Node {
+        if (c.nodeTag(cond) != .identifier) return null;
+        if (!try c.isConstantRefSym(key)) return null;
+        const a = try c.atomOfToken(c.tree.nodeMainToken(cond));
+        const sym = switch (c.resolveSpace(a, c.cur_scope, true)) {
+            .sym => |s| s,
+            else => return null,
+        };
+        if (sym == key.sym) return null; // matched-reference case handled by the caller
+        const sf = c.symFlags(sym);
+        if (!sf.const_decl) return null;
+        if (sf.exported) return null;
+        if (c.symFile(sym) != c.cur_file) return null;
+        const decls = c.declsOf(sym);
+        if (decls.len != 1) return null;
+        const decl = decls[0];
+        const d = c.tree.nodeData(decl);
+        switch (c.nodeTag(decl)) {
+            .declarator_init => {
+                if (c.nodeTag(d.lhs) != .identifier) return null;
+                return d.rhs;
+            },
+            .declarator_full => {
+                const e = c.tree.extraData(ast.DeclaratorFull, d.rhs);
+                if (e.type_ann != 0 or e.init == 0) return null;
+                if (c.nodeTag(d.lhs) != .identifier) return null;
+                return e.init;
+            },
+            else => return null,
+        }
+    }
+
     fn narrowByCondition(c: *Checker, t: TypeId, cond: Node, sense: bool, key: RefKey) Error!TypeId {
         if (cond == null_node) return t;
         const d = c.tree.nodeData(cond);
@@ -14649,8 +14714,25 @@ const Checker = struct {
             .paren_expr => return c.narrowByCondition(t, d.lhs, sense, key),
             .non_null => return c.narrowByCondition(t, d.lhs, sense, key),
             .identifier => {
-                if (!try c.refMatches(cond, key)) return t;
-                return if (sense) c.getTruthyPart(t) else c.getFalsyPart(t, true);
+                if (try c.refMatches(cond, key)) {
+                    return if (sense) c.getTruthyPart(t) else c.getFalsyPart(t, true);
+                }
+                // Aliased-condition narrowing (tsc TS4.4 "control flow analysis
+                // of aliased conditions and discriminants"): the condition is a
+                // bare identifier bound to a `const` whose initializer is itself
+                // a narrowing expression. Narrow the tracked reference by that
+                // initializer instead. `constAliasInit` enforces tsc's rules
+                // (const alias, no explicit annotation, subject a constant
+                // reference so the snapshot cannot go stale); the level cap
+                // bounds alias-of-alias chains.
+                if (c.alias_inline_level < 5) {
+                    if (try c.constAliasInit(cond, key)) |init_expr| {
+                        c.alias_inline_level += 1;
+                        defer c.alias_inline_level -= 1;
+                        return c.narrowByCondition(t, init_expr, sense, key);
+                    }
+                }
+                return t;
             },
             .member_expr, .optional_member_expr => {
                 // The path itself is the condition.
