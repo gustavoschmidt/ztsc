@@ -7259,6 +7259,18 @@ const Checker = struct {
                     if (callable == types.no_type) return;
                     if (try c.lastCallSig(callable)) |sig| src = sig else return;
                 }
+                // A plain overload set — the type of a multiply-declared method
+                // reached through property/indexed access (`S['m']`, e.g. jest's
+                // `Service.patch` with two overload signatures) — infers through
+                // its LAST call signature, the same end-aligned rule tsc's
+                // `inferFromSignatures` applies to the callable-object and
+                // overload-intersection cases above. Without this the `.function`
+                // guard below drops it and `ReturnType<S['m']>` collapses to
+                // `unknown` (then jest's `ResolvedValue<unknown>` → `never`,
+                // wrongly rejecting `mockResolvedValueOnce(null)` as TS2769).
+                if (s.kind(src) == .overloads) {
+                    if (try c.lastCallSig(src)) |sig| src = sig else return;
+                }
                 if (s.kind(src) != .function) return;
                 // A generic *source* signature must be reduced to its base
                 // signature before we infer *through* it: each of the source's
