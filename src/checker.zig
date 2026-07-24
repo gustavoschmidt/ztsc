@@ -8791,10 +8791,31 @@ const Checker = struct {
                 return null;
             },
             .intersection => {
+                const members = try c.memberList(t);
+                // `T & {}` (NonNullable of a type parameter): the empty-object
+                // marker signals the value is non-nullish, so a type-param
+                // constituent's members come from its constraint with
+                // null/undefined stripped — `(T extends string | undefined) & {}`
+                // exposes `string`'s members. Without the marker a bare `T`
+                // resolves through its raw constraint (nullish kept).
+                var has_marker = false;
+                for (members) |m| {
+                    if (c.isEmptyObjectType(try c.resolveStructural(m))) {
+                        has_marker = true;
+                        break;
+                    }
+                }
                 var found: ?types.Prop = null;
-                for (try c.memberList(t)) |m| {
+                for (members) |m| {
                     const r = try c.resolveStructural(m);
-                    if (try c.propOfTypeEx(r, name, allow_index)) |p| {
+                    var lookup = r;
+                    if (has_marker and c.ts.kind(r) == .type_param) {
+                        const con = try c.typeParamConstraint(c.ts.typeParamSymbol(r));
+                        if (con != types.no_type) {
+                            lookup = try c.resolveStructural(try c.nonNullable(con));
+                        }
+                    }
+                    if (try c.propOfTypeEx(lookup, name, allow_index)) |p| {
                         if (found == null) {
                             found = p;
                         } else {
@@ -9089,6 +9110,18 @@ const Checker = struct {
     }
 
     fn nonNullable(c: *Checker, t: TypeId) Error!TypeId {
+        // A bare type parameter whose constraint may be nullish becomes `T & {}`
+        // (tsc's `getNonNullableType` / `NonNullable<T>`). The `& {}` marker
+        // keeps the value assignable back to a `T` slot while exposing the
+        // constraint's non-nullish apparent members (see the intersection arm of
+        // `propOfTypeEx`). A type param already known non-nullish is unchanged.
+        if (c.ts.kind(t) == .type_param) {
+            const con = try c.typeParamConstraint(c.ts.typeParamSymbol(t));
+            if (con == types.no_type or c.containsNullish(con)) {
+                return c.ts.makeIntersection(c.scratch(), &.{ t, types.empty_object_type });
+            }
+            return t;
+        }
         return c.filterUnion(t, struct {
             fn keep(ch: *Checker, m: TypeId) bool {
                 const k = ch.ts.kind(m);
