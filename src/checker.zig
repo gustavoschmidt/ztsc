@@ -13862,6 +13862,26 @@ const Checker = struct {
                     if (s.objectNumberIndex(param) != 0 and s.objectNumberIndex(ra) != 0) {
                         try c.unify(s.objectNumberIndex(param), s.objectNumberIndex(ra), tp_syms, candidates, depth + 1);
                     }
+                    // Call / construct signatures on a *callable interface* param
+                    // (`FunctionComponent<P>`, whose only `P` lives in its call
+                    // signature `(props: P, …) => …`) against a callable-object
+                    // arg (`ProviderExoticComponent<ProviderProps<Data>>`): pair
+                    // sigs from the END (tsc's `inferFromSignatures`) and infer
+                    // through each — the `.function` param arm below handles the
+                    // per-signature param/return unify. Without this,
+                    // `createElement(Ctx.Provider, { value })` leaves the props
+                    // type param at its default `{}` and the call is rejected.
+                    for ([_]bool{ false, true }) |is_ctor| {
+                        const pn = if (is_ctor) s.objectConstructSigCount(param) else s.objectCallSigCount(param);
+                        const an = if (is_ctor) s.objectConstructSigCount(ra) else s.objectCallSigCount(ra);
+                        if (pn == 0 or an == 0) continue;
+                        const len = @min(pn, an);
+                        for (0..len) |i| {
+                            const psig = if (is_ctor) s.objectConstructSig(param, @intCast(pn - len + i)) else s.objectCallSig(param, @intCast(pn - len + i));
+                            const asig = if (is_ctor) s.objectConstructSig(ra, @intCast(an - len + i)) else s.objectCallSig(ra, @intCast(an - len + i));
+                            try c.unify(psig, asig, tp_syms, candidates, depth + 1);
+                        }
+                    }
                     return;
                 }
                 // Array/tuple/string arg against an object-shaped param
