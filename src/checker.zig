@@ -9862,6 +9862,20 @@ const Checker = struct {
                         }
                     } else return false; // interface / class instance, no index sig
                 },
+                // An array/tuple relates to a target *string* index signature by
+                // its apparent-type members, not just its elements: tsc requires
+                // every property (`length: number`, the `Array.prototype`
+                // methods, and the element type) to conform to the index type.
+                // Only an `any`/`unknown` index absorbs the function-typed methods
+                // and the numeric `length`, so a concrete index (e.g.
+                // `{ [k: string]: number }`) is still rejected (conformance
+                // assignability/026). Decisive for `[…] → { [k: string]: any;
+                // …optional }` — the dogfood project's `LayerInfo`, whose
+                // `[key: string]: any` absorbs an `AxiosResponse`-derived array.
+                .array, .tuple => {
+                    const ridx = try c.resolveStructural(sidx);
+                    if (c.ts.kind(ridx) != .any and c.ts.kind(ridx) != .unknown) return false;
+                },
                 else => return false,
             }
         }
