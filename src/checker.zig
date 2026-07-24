@@ -12604,18 +12604,21 @@ const Checker = struct {
                 return try c.awaitedType(ot);
             },
             .minus => {
+                // Unary `-`/`+`/`~` are coercion operators: tsc accepts ANY
+                // operand (`-"5"`, `+({})`, `~sn`) — TS2356 is emitted only for
+                // `++`/`--` and binary arithmetic, never here (oracle-verified
+                // clean for string / string|number / {} operands). Emitting it
+                // for `.map((v: string | number) => +v)` was a false positive.
                 const ot = try c.checkExprCached(d.lhs, types.no_type);
                 const rl = try c.ts.regularLiteral(ot);
                 if (c.ts.kind(rl) == .number_literal) {
                     return c.ts.makeNumberLiteral(-c.ts.numberValue(rl), c.ts.isFreshLiteral(ot));
                 }
-                try c.checkArithmeticOperand(ot, d.lhs);
                 if (c.isBigintish(ot)) return types.bigint_type;
                 return types.number_type;
             },
             .plus, .tilde => {
-                const ot = try c.checkExprCached(d.lhs, types.no_type);
-                try c.checkArithmeticOperand(ot, d.lhs);
+                _ = try c.checkExprCached(d.lhs, types.no_type);
                 return types.number_type;
             },
             .plus_plus, .minus_minus => {
