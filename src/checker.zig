@@ -9188,6 +9188,24 @@ const Checker = struct {
         }.keep);
     }
 
+    /// Receiver narrowing for an optional-chain link (`a?.b`, `a?.[i]`, `a?.()`).
+    /// Beyond null/undefined it also drops `void`: a `.catch(() => {})` /
+    /// `.then(…)` tail types a promise `T | void`, and tsc lets `x?.prop` reach
+    /// through the `void` constituent to `T`'s members (the whole chain already
+    /// yields `… | undefined`). Scoped to the chain sites so the general
+    /// `nonNullable` used by `??`, `!`, and comparison narrowing is unaffected.
+    /// A receiver that is *only* nullish/void keeps the plain `nonNullable`
+    /// result so a bare-`void` access still behaves as before.
+    fn nonNullableChain(c: *Checker, t: TypeId) Error!TypeId {
+        const nn = try c.nonNullable(t);
+        const dropped = try c.filterUnion(nn, struct {
+            fn keep(ch: *Checker, m: TypeId) bool {
+                return ch.ts.kind(m) != .void;
+            }
+        }.keep);
+        return if (c.ts.kind(dropped) == .never) nn else dropped;
+    }
+
     fn filterUnion(c: *Checker, t: TypeId, comptime keep: fn (*Checker, TypeId) bool) Error!TypeId {
         if (c.ts.kind(t) == .union_type) {
             var parts: std.ArrayList(TypeId) = .empty;
@@ -12302,7 +12320,7 @@ const Checker = struct {
             if (c.containsNullish(obj_t) or c.ts.kind(obj_t) == .null or c.ts.kind(obj_t) == .undefined) {
                 chained.* = true;
             }
-            obj_t = try c.nonNullable(obj_t);
+            obj_t = try c.nonNullableChain(obj_t);
         } else {
             obj_t = try c.checkNullishAccess(obj_t, d.lhs, node);
         }
@@ -12464,7 +12482,7 @@ const Checker = struct {
         const idx_t = try c.checkExprCached(d.rhs, types.no_type);
         if (own_optional) {
             if (c.containsNullish(obj_t)) chained.* = true;
-            obj_t = try c.nonNullable(obj_t);
+            obj_t = try c.nonNullableChain(obj_t);
         } else {
             obj_t = try c.checkNullishAccess(obj_t, d.lhs, node);
         }
@@ -13076,7 +13094,7 @@ const Checker = struct {
             try c.checkExprCached(shape.callee, types.no_type);
         if (shape.optional) {
             if (c.containsNullish(callee_t)) chained.* = true;
-            callee_t = try c.nonNullable(callee_t);
+            callee_t = try c.nonNullableChain(callee_t);
         }
         var r = try c.resolveStructural(callee_t);
         var rk = c.ts.kind(r);
