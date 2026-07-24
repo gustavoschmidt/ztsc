@@ -11705,7 +11705,21 @@ const Checker = struct {
         }
         if (ctx_tuple) return c.ts.makeTuple(tuple_elems.items);
         if (elem_types.items.len == 0) {
-            if (ctx_elem != types.no_type) return c.ts.makeArray(ctx_elem);
+            if (ctx_elem != types.no_type) {
+                // Empty array literal under a union context with MULTIPLE
+                // array-like branches of differing element types
+                // (leaflet `polyline([], …)`: `LatLngExpression[] |
+                // LatLngExpression[][]`): folding their elements into a union
+                // element (`(E | E[])[]`) is assignable to NEITHER branch — a
+                // false TS2345. An empty literal has no elements to
+                // disambiguate, and `never[]` is assignable to every
+                // array/tuple branch (tsc's empty-array typing). A single
+                // array branch keeps its element type (display/inference).
+                if (rctx != types.no_type and c.ts.kind(rctx) == .union_type and
+                    try c.multiArrayLikeBranches(rctx))
+                    return c.ts.makeArray(types.never_type);
+                return c.ts.makeArray(ctx_elem);
+            }
             return c.ts.makeArray(types.any_type); // evolving arrays out of scope
         }
         return c.ts.makeArray(try c.ts.makeUnion(c.scratch(), elem_types.items));
@@ -11733,6 +11747,22 @@ const Checker = struct {
             },
             else => return types.no_type,
         }
+    }
+
+    /// True when a (structurally resolved) union contextual type has two or
+    /// more array-like constituents (`E[] | E[][]`, `A[] | B[]`). Used to
+    /// detect the ambiguous empty-array-literal case where folding every
+    /// branch's element type would produce an array assignable to no branch.
+    fn multiArrayLikeBranches(c: *Checker, rctx: TypeId) Error!bool {
+        if (c.ts.kind(rctx) != .union_type) return false;
+        var n: usize = 0;
+        for (try c.memberList(rctx)) |m| {
+            if (c.ts.kind(try c.resolveStructural(m)) == .array) {
+                n += 1;
+                if (n >= 2) return true;
+            }
+        }
+        return false;
     }
 
     /// `[...] as const` -> a readonly tuple. Elements keep their literal
