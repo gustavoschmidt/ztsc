@@ -10120,6 +10120,15 @@ const Checker = struct {
         // Missing-property refinement (tsc: 2739 / 2741 instead of 2322).
         if (code == 2322) {
             if (try c.tryReportMissingProps(src_t, target, span)) return;
+            // Did-you-mean morph (tsc: TS2820): a string-literal source rejected
+            // by a union of string literals with a close member. tsc's
+            // getSuggestedTypeForNonexistentStringLiteralType.
+            if (try c.stringLiteralSuggestion(src_t, target)) |sugg| {
+                try c.diagFmt(2820, span, "Type '{s}' is not assignable to type '{s}'. Did you mean '\"{s}\"'?", .{
+                    try c.typeToString(src_t), try c.typeToString(target), c.atomText(sugg),
+                });
+                return;
+            }
         }
         const msg_fmt = "Type '{s}' is not assignable to type '{s}'.";
         if (code == 2345) {
@@ -10129,6 +10138,33 @@ const Checker = struct {
         } else {
             try c.diagFmt(code, span, msg_fmt, .{ try c.typeToString(src_t), try c.typeToString(target) });
         }
+    }
+
+    /// tsc's getSuggestedTypeForNonexistentStringLiteralType: when a string
+    /// literal is rejected by a union, suggest the closest string-literal member
+    /// (drives the TS2322 -> TS2820 morph). Returns the suggested member's value
+    /// atom, or null when the source is not a string literal, the target is not
+    /// a union of string literals, or nothing is close enough.
+    fn stringLiteralSuggestion(c: *Checker, src_t: TypeId, target: TypeId) Error!?Atom {
+        const rs = try c.resolveStructural(src_t);
+        if (c.ts.kind(rs) != .string_literal) return null;
+        const rt = try c.resolveStructural(target);
+        if (c.ts.kind(rt) != .union_type) return null;
+        var cand_atoms: std.ArrayList(Atom) = .empty;
+        defer cand_atoms.deinit(c.scratch());
+        var cand_names: std.ArrayList([]const u8) = .empty;
+        defer cand_names.deinit(c.scratch());
+        for (try c.memberList(rt)) |m| {
+            const rm = try c.resolveStructural(m);
+            if (c.ts.kind(rm) != .string_literal) continue;
+            const a = c.ts.literalAtom(rm);
+            try cand_atoms.append(c.scratch(), a);
+            try cand_names.append(c.scratch(), c.atomText(a));
+        }
+        if (cand_names.items.len == 0) return null;
+        const name = c.atomText(c.ts.literalAtom(rs));
+        const idx = intern.spellingSuggestion(c.scratch(), name, cand_names.items) orelse return null;
+        return cand_atoms.items[idx];
     }
 
     fn isSourceObjecty(k: types.Kind) bool {
