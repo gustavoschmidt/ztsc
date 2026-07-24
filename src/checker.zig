@@ -3158,6 +3158,10 @@ const Checker = struct {
         }
         var order: std.ArrayList(Atom) = .empty;
         defer order.deinit(c.scratch());
+        // Method names declared optional (`m?(): T`) — tsc marks the resulting
+        // property optional (e.g. `PropertyDescriptor.get?`/`set?`).
+        var optional_methods: std.AutoHashMapUnmanaged(Atom, void) = .empty;
+        defer optional_methods.deinit(c.scratch());
         // Call / construct signature lists (M18.1), kept in declaration order.
         var call_sigs: std.ArrayList(TypeId) = .empty;
         defer call_sigs.deinit(c.scratch());
@@ -3210,6 +3214,7 @@ const Checker = struct {
                         continue;
                     }
                     const sig = try c.signatureOfProto(m, md.lhs, true, true);
+                    if (md.rhs & ast.Flags.optional != 0) try optional_methods.put(c.scratch(), name, {});
                     const gop = try methods.getOrPut(c.scratch(), name);
                     if (!gop.found_existing) {
                         gop.value_ptr.* = .empty;
@@ -3237,7 +3242,8 @@ const Checker = struct {
         for (order.items) |name| {
             const sigs = methods.get(name).?;
             const ty = try c.ts.makeOverloads(sigs.items);
-            try upsertProp(c.scratch(), &props, &prop_index, .{ .name = name, .ty = ty, .flags = 0 });
+            const mflags: u32 = if (optional_methods.contains(name)) types.prop_flag_optional else 0;
+            try upsertProp(c.scratch(), &props, &prop_index, .{ .name = name, .ty = ty, .flags = mflags });
         }
         // Get-only accessors are read-only properties.
         var git = getter_keys.keyIterator();
