@@ -3072,7 +3072,22 @@ const Checker = struct {
                         const i: u32 = @intFromFloat(v);
                         if (i < c.ts.tupleLen(r)) {
                             const e = c.ts.tupleElem(r, i);
-                            return if (e.rest()) c.elemOfArrayish(e.ty) else e.ty;
+                            if (e.rest()) return c.elemOfArrayish(e.ty);
+                            // An *optional* tuple element indexes to
+                            // `T | undefined` (tsc's `getIndexedAccessType` over
+                            // `[x?: T]` at `[0]`), the same undefined-widening the
+                            // string-literal arm applies to an optional property.
+                            // Decisive for the dogfood project's `VariantProps`
+                            // chain: with a correct `Parameters<C>` tuple whose
+                            // first element is optional (`[props?: P]`),
+                            // `Parameters<C>[0]` must be `P | undefined` so
+                            // `OmitUndefined<…>` then strips it — dropping the
+                            // `undefined` here left ztsc over-strict and rejected
+                            // valid JSX props (TS2322 `IntrinsicAttributes & X`).
+                            return if (e.optional() and !c.homo_index_mode)
+                                c.makeUnion2(e.ty, types.undefined_type)
+                            else
+                                e.ty;
                         }
                     }
                 }
@@ -7349,11 +7364,43 @@ const Checker = struct {
                     const bt = if (con != types.no_type) con else types.unknown_type;
                     try base_map.append(c.scratch(), .{ .sym = p, .ty = bt });
                 }
-                const n = @min(s.fnParamCount(src), s.fnParamCount(pattern));
+                // A trailing rest param in the *pattern* (`(...args: infer P)`,
+                // the shape `Parameters` / `ConstructorParameters` use) must
+                // bind its infer var to the TUPLE of ALL remaining source
+                // params — not 1:1 onto the single source param at that slot.
+                // Positionally aligning `...args: infer P` with `src[i]` (the
+                // pre-fix `@min` loop) made P a 1-element tuple, so
+                // `Parameters<typeof F>[1]`/`[2]` fell through to index 0's
+                // type. Mirror tsc's `inferFromParameters` + `getRestTypeAtPosition`:
+                // fixed positions infer 1:1, then the rest slot gathers the
+                // residual source params into a tuple (optional source params →
+                // optional elements, a trailing source rest param → a rest
+                // element) and infers that against the pattern's rest type.
+                const src_count = s.fnParamCount(src);
+                const pat_count = s.fnParamCount(pattern);
+                const pat_has_rest = pat_count != 0 and s.fnParam(pattern, pat_count - 1).rest();
+                const pat_fixed = if (pat_has_rest) pat_count - 1 else pat_count;
+                const n = @min(src_count, pat_fixed);
                 for (0..n) |i| {
                     var sp = s.fnParam(src, @intCast(i)).ty;
                     if (base_map.items.len != 0) sp = try c.instantiate(sp, base_map.items);
                     try c.inferFromExtends(sp, s.fnParam(pattern, @intCast(i)).ty, ids, vals, !contra, depth + 1);
+                }
+                if (pat_has_rest) {
+                    var elems: std.ArrayList(types.TupleElem) = .empty;
+                    defer elems.deinit(c.scratch());
+                    var i: u32 = pat_fixed;
+                    while (i < src_count) : (i += 1) {
+                        const sp = s.fnParam(src, i);
+                        var pty = sp.ty;
+                        if (base_map.items.len != 0) pty = try c.instantiate(pty, base_map.items);
+                        var eflags: u32 = 0;
+                        if (sp.rest()) eflags |= types.elem_flag_rest;
+                        if (sp.optional()) eflags |= types.elem_flag_optional;
+                        try elems.append(c.scratch(), .{ .ty = pty, .flags = eflags });
+                    }
+                    const src_tuple = try s.makeTuple(elems.items);
+                    try c.inferFromExtends(src_tuple, s.fnParam(pattern, pat_count - 1).ty, ids, vals, !contra, depth + 1);
                 }
                 var sr = s.fnReturn(src);
                 if (base_map.items.len != 0) sr = try c.instantiate(sr, base_map.items);

@@ -1318,8 +1318,28 @@ fn resolvePackageAt(io: Io, alloc: Allocator, dir: Io.Dir, d: []const u8, pkg: [
     } else |_| {}
     defer if (pj_text) |t| alloc.free(t);
 
-    // (1) `exports` map — authoritative for tsc when present. On a miss we fall
-    //     through to legacy probing (deliberate under-report; see file header).
+    // (1) `exports` map — authoritative for tsc when present. On a root (".")
+    //     miss we still fall through to legacy probing (deliberate under-report;
+    //     see file header). On a *subpath* miss, however, tsc's bundler/Node16
+    //     resolution hard-fails: a package that publishes `exports` is a closed
+    //     set of entry points, so `pkg/deep/path` NOT named by the map is
+    //     unresolvable — Node/tsc do NOT fall back to walking the filesystem.
+    //     Matching that is decisive for real deps whose declaration bundles
+    //     reference an internal, un-exported subpath (a dependency in the
+    //     dogfood project ships an `exports` map that omits an internal subpath
+    //     its own typings import; tsc leaves that reference `any`, keeping the
+    //     downstream generic-props helper permissive, whereas resolving it
+    //     concretely made the whole component-props chain spuriously strict).
+    //
+    //     Crash-safety: an unmatched subpath must NOT return null here. A null
+    //     leaves the specifier UNRESOLVED, which dangles a symbol in the
+    //     parallel resolution phase (order-dependent → intermittent SIGABRT in
+    //     the flow-narrowing `mergedSym` path). Instead route the blocked
+    //     subpath to a stable opaque `any` module (the JSON/allowJs any-module
+    //     machinery): the import binds concretely to `any` — matching tsc's
+    //     observable `any` at an un-exported subpath — and no symbol dangles.
+    //     Under-reports the TS2307 tsc emits for an app-level such import
+    //     (allowed: a missed error is fine, a false positive is not).
     if (pj_text) |text| {
         if (tsconfig.parseJsonc(alloc, text)) |root| switch (root) {
             .object => |ro| if (ro.get("exports")) |exports_val| {
@@ -1329,6 +1349,11 @@ fn resolvePackageAt(io: Io, alloc: Allocator, dir: Io.Dir, d: []const u8, pkg: [
                     try std.fmt.allocPrint(alloc, "./{s}", .{sub});
                 defer if (sub.len != 0) alloc.free(subpath);
                 if (try resolveExportsField(io, alloc, dir, nm, exports_val, subpath)) |p| return p;
+                // Subpath unmatched by a present `exports` map → opaque `any`
+                // module (see above; NOT null — that dangles a symbol). The
+                // root (".") still falls through to legacy probing, so a package
+                // whose `.` entry our condition set misses is not regressed.
+                if (sub.len != 0) return try blockedSubpathPath(alloc, nm, sub);
             },
             else => {},
         } else |_| {}
@@ -1454,12 +1479,42 @@ pub fn isJsModulePath(path: []const u8) bool {
     return endsWithAny(path, &.{ ".js", ".jsx", ".mjs", ".cjs" });
 }
 
-/// Embedded synthetic source for a resolved JSON or JS any-module, or null for
-/// a real file that must be read and parsed. Centralizes the loader's
-/// any-module routing (JSON via `resolveJsonModule`, JS via `allowJs`).
+/// Synthetic program-path suffix marking an `exports`-blocked subpath — a
+/// `<pkg>/<sub>` import where `<pkg>` publishes an `exports` map that does NOT
+/// name `<sub>`. A published `exports` map is a closed set of entry points, so
+/// tsc's bundler/Node16 resolution refuses to legacy-probe the filesystem for
+/// such a subpath and the reference degrades to `any`. `resolvePackageAt`
+/// mirrors that by routing the subpath to a stable opaque `any` module carrying
+/// this suffix, rather than returning null (an UNRESOLVED specifier dangles a
+/// symbol in the parallel resolution phase — an intermittent, load-dependent
+/// crash). The suffix is deliberately not a real file extension: it never
+/// collides with an on-disk file, and `anyModuleSourceFor` recognizes it so the
+/// loader substitutes the synthetic `any` body and never touches disk.
+pub const blocked_subpath_suffix = ".ztsc-exports-blocked";
+
+/// True for a synthetic exports-blocked-subpath any-module path (see
+/// `blocked_subpath_suffix`).
+pub fn isBlockedSubpathPath(path: []const u8) bool {
+    return std.mem.endsWith(u8, path, blocked_subpath_suffix);
+}
+
+/// Build the stable, deterministic synthetic program path for an
+/// `exports`-blocked subpath under `nm` (`node_modules/<pkg>`, base-relative)
+/// with import subpath `sub`. Owned by `alloc`. Recognized by
+/// `anyModuleSourceFor` as an opaque `any` module.
+fn blockedSubpathPath(alloc: Allocator, nm: []const u8, sub: []const u8) Error![]u8 {
+    return std.fmt.allocPrint(alloc, "{s}/{s}{s}", .{ nm, sub, blocked_subpath_suffix });
+}
+
+/// Embedded synthetic source for a resolved JSON or JS any-module (or an
+/// `exports`-blocked subpath), or null for a real file that must be read and
+/// parsed. Centralizes the loader's any-module routing (JSON via
+/// `resolveJsonModule`, JS via `allowJs`, blocked subpaths via a present
+/// `exports` map that omits the subpath).
 pub fn anyModuleSourceFor(path: []const u8) ?[]const u8 {
     if (isJsonModulePath(path)) return json_module_source;
     if (isJsModulePath(path)) return js_module_source;
+    if (isBlockedSubpathPath(path)) return js_module_source;
     return null;
 }
 
@@ -2871,8 +2926,11 @@ test "resolveSpecifier: package.json exports map" {
     });
     try d.writeFile(io, .{ .sub_path = NM ++ "/pjs/dist/index.d.mts", .data = "" });
 
-    // exports-miss: package with exports "." only. A subpath with no export and
-    // no on-disk file must stay unresolved (null); the covered root resolves.
+    // exports-miss: package with exports "." only. A subpath NOT named by the
+    // map (even one with an on-disk file) is blocked from legacy probing and
+    // routed to a stable opaque `any` module (the `blocked_subpath_suffix`
+    // any-module — NOT null, which would dangle a symbol under parallel
+    // resolution). The covered root still resolves concretely.
     try d.createDirPath(io, NM ++ "/onlyroot");
     try d.writeFile(io, .{ .sub_path = NM ++ "/onlyroot/package.json", .data =
         \\{ "exports": { ".": { "types":"./index.d.ts" } } }
@@ -2896,7 +2954,8 @@ test "resolveSpecifier: package.json exports map" {
         .{ .spec = "victory-vendor/d3-shape", .want = NM ++ "/victory-vendor/d3-shape.d.ts" },
         .{ .spec = "pjs", .want = NM ++ "/pjs/dist/index.d.mts" },
         .{ .spec = "onlyroot", .want = NM ++ "/onlyroot/index.d.ts" },
-        .{ .spec = "onlyroot/missing", .want = null },
+        // Blocked subpath -> opaque `any` module (crash-safe; not null).
+        .{ .spec = "onlyroot/missing", .want = NM ++ "/onlyroot/missing" ++ blocked_subpath_suffix },
         .{ .spec = "legacy", .want = NM ++ "/legacy/main.d.ts" },
     };
     for (cases) |c| {
@@ -2908,6 +2967,11 @@ test "resolveSpecifier: package.json exports map" {
             try testing.expectEqual(@as(?[]u8, null), got);
         }
     }
+    // The blocked subpath is a recognized opaque `any` module: the loader
+    // substitutes its synthetic body and never touches disk.
+    const blocked = (try resolveSpecifier(io, alloc, d, "src/a.ts", "onlyroot/missing", .{})).?;
+    try testing.expect(isBlockedSubpathPath(blocked));
+    try testing.expect(anyModuleSourceFor(blocked) != null);
 }
 
 // the resolution memo serves a repeated `(importer_dir, spec)` from
