@@ -3873,6 +3873,14 @@ const Checker = struct {
                 // variable) so a namespace merged onto a typed global keeps that
                 // global's members. Without this a `var X: T` + `namespace X {…}`
                 // merge drops `T` and every `X.member` is a phantom TS2339.
+                // A callable base that is itself declared across lib + node
+                // (`function setTimeout(): number` + node's `global{}`
+                // `setTimeout(): NodeJS.Timeout`, plus `namespace setTimeout`)
+                // folds every overload node-first, so `typeof setTimeout` stays
+                // callable with the node return type.
+                if (try c.mergedFunctionValue(m.parts)) |ft| {
+                    return c.ts.makeIntersection(c.scratch(), &.{ ft, ns_val });
+                }
                 for (m.parts) |p| {
                     const pf = c.symFlags(p);
                     if (pf.function or pf.enum_decl or pf.class) {
@@ -3886,6 +3894,11 @@ const Checker = struct {
                 }
                 return ns_val;
             }
+            // A global function declared in more than one file (lib.dom's
+            // `setInterval(): number` + @types/node's `global{}`
+            // `setInterval(): NodeJS.Timeout`) merges into one overload set,
+            // node's signatures first — see `mergedFunctionValue`.
+            if (try c.mergedFunctionValue(m.parts)) |ft| return ft;
             for (m.parts) |p| {
                 if (hasValueMeaning(c.symFlags(p))) return c.typeOfSymbol(p);
             }
@@ -3948,6 +3961,96 @@ const Checker = struct {
         }
         if (f.var_decl or f.let_decl or f.const_decl) return c.variableSymbolType(sym);
         return types.any_type;
+    }
+
+    /// Fold every callable constituent of a merged global function symbol into
+    /// one overload set, non-lib declarations before lib ones. tsc binds a
+    /// program's root files and their type-reference dependencies (@types)
+    /// before the default library, so the @types/node `global{}` timer
+    /// signatures (`setInterval(...): NodeJS.Timeout`) precede lib.dom's
+    /// `number` ones and win first-match overload resolution — the same order
+    /// tsc produces. Returns null when fewer than two constituents are callable
+    /// (the overwhelmingly common single-contributor global keeps its type via
+    /// the caller's existing first-value-constituent path).
+    fn mergedFunctionValue(c: *Checker, parts: []const u32) Error!?TypeId {
+        var nonlib: std.ArrayList(TypeId) = .empty;
+        defer nonlib.deinit(c.scratch());
+        var lib: std.ArrayList(TypeId) = .empty;
+        defer lib.deinit(c.scratch());
+        for (parts) |p| {
+            if (!c.symFlags(p).function) continue;
+            var t = try c.typeOfSymbol(p);
+            // A constituent that also carries a namespace (node's `setTimeout`
+            // is `function setTimeout` + `namespace setTimeout`) materializes as
+            // `overloads & class_value`; unwrap the callable part so its
+            // signatures still fold in.
+            if (c.ts.kind(t) == .intersection) {
+                for (try c.memberList(t)) |m| {
+                    const rm = try c.resolveStructural(m);
+                    if (c.ts.kind(rm) == .function or c.ts.kind(rm) == .overloads) {
+                        t = rm;
+                        break;
+                    }
+                }
+            }
+            const k = c.ts.kind(t);
+            if (k != .function and k != .overloads) continue;
+            if (modules.isLibPath(c.prog.files[c.symFile(p)].path))
+                try lib.append(c.scratch(), t)
+            else
+                try nonlib.append(c.scratch(), t);
+        }
+        if (nonlib.items.len + lib.items.len < 2) return null;
+        // When a non-lib file (@types/node's `global{}`) redeclares a lib
+        // global function, tsc's effective type is the node one at BOTH the
+        // call site (`setTimeout(): NodeJS.Timeout`) and through `ReturnType`
+        // — node dominates end-to-end. Use the non-lib signatures alone when
+        // present (dropping the shadowed lib.dom `number` overloads); fall back
+        // to folding all when every constituent is a lib.
+        const groups: []const *std.ArrayList(TypeId) = if (nonlib.items.len != 0)
+            &.{&nonlib}
+        else
+            &.{&lib};
+        var sigs: std.ArrayList(TypeId) = .empty;
+        defer sigs.deinit(c.scratch());
+        for (groups) |grp| {
+            for (grp.items) |o| {
+                if (c.ts.kind(o) == .overloads) {
+                    for (c.ts.members(o)) |mm| try sigs.append(c.scratch(), mm);
+                } else try sigs.append(c.scratch(), o);
+            }
+        }
+        if (sigs.items.len == 1) return sigs.items[0];
+        return try c.ts.makeOverloads(sigs.items);
+    }
+
+    /// The last call signature (a `.function` TypeId) reachable from any
+    /// callable shape: a bare function, an overload set (tsc's
+    /// `inferFromSignatures` aligns from the end, so the last wins), a
+    /// callable object carrying call signatures, or an intersection that wraps
+    /// one (`overloads & namespaceObject`). Null when nothing is callable.
+    fn lastCallSig(c: *Checker, t0: TypeId) Error!?TypeId {
+        const s = &c.ts;
+        const t = try c.resolveStructural(t0);
+        switch (s.kind(t)) {
+            .function => return t,
+            .overloads => {
+                const ms = try c.memberList(t);
+                return if (ms.len > 0) ms[ms.len - 1] else null;
+            },
+            .object => {
+                const n = s.objectCallSigCount(t);
+                return if (n > 0) s.objectCallSig(t, n - 1) else null;
+            },
+            .intersection => {
+                var found: ?TypeId = null;
+                for (try c.memberList(t)) |m| {
+                    if (try c.lastCallSig(m)) |sig| found = sig;
+                }
+                return found;
+            },
+            else => return null,
+        }
     }
 
     /// The declared value type of a `var`/`let`/`const` symbol. Self-contained
@@ -7064,7 +7167,7 @@ const Checker = struct {
                 try c.inferFromObjectSigs(src, pattern, true, ids, vals, contra, depth);
             },
             .function => {
-                const src = try c.resolveStructural(source0);
+                var src = try c.resolveStructural(source0);
                 // A callable-object source (an interface/type literal carrying
                 // call signatures — e.g. React's `ForwardRefExoticComponent<P>`,
                 // whose `(props: P): ReactNode` sig makes it a component) stands
@@ -7078,6 +7181,33 @@ const Checker = struct {
                     if (ncall > 0)
                         try c.inferFromExtends(s.objectCallSig(src, ncall - 1), pattern, ids, vals, contra, depth + 1);
                     return;
+                }
+                // An intersection whose callable part is an overload set
+                // (`typeof setTimeout` is `overloads & namespaceObject` after
+                // the lib+node timer merge): infer through its last call
+                // signature so `ReturnType<typeof setTimeout>` reads the node
+                // return type instead of collapsing to `unknown`.
+                // An intersection carrying a callable OBJECT (React's
+                // `ForwardRefExoticComponent<P> & {…}`) is left to the existing
+                // object/construct-signature inference, so `ComponentProps<typeof
+                // C>` is unaffected.
+                if (s.kind(src) == .intersection) {
+                    // Restrict to the shape the lib+node timer merge produces: an
+                    // OVERLOAD SET intersected with a namespace value object
+                    // (`typeof setTimeout` = `overloads & typeof setTimeout`).
+                    // Only the multi-signature overload case needs this routing —
+                    // a plain function intersected with its statics (every
+                    // `typeof f`, e.g. `typeof Icon`) is already inferred through
+                    // the existing object/construct-signature path, so leaving it
+                    // alone keeps `ComponentProps<typeof C>` and other conditional
+                    // types untouched.
+                    var callable: TypeId = types.no_type;
+                    for (try c.memberList(src)) |m| {
+                        const rm = try c.resolveStructural(m);
+                        if (s.kind(rm) == .overloads) callable = rm;
+                    }
+                    if (callable == types.no_type) return;
+                    if (try c.lastCallSig(callable)) |sig| src = sig else return;
                 }
                 if (s.kind(src) != .function) return;
                 // A generic *source* signature must be reduced to its base
