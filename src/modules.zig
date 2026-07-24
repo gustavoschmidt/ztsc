@@ -1691,6 +1691,47 @@ const Linker = struct {
         try l.diags[file].append(l.arena, .{ .code = code, .span = span, .msg = msg });
     }
 
+    /// A missing named import/re-export that has a close export name in the
+    /// target module gets tsc's TS2724 ("Did you mean 'X'?") in place of the
+    /// plain TS2305. Returns the suggested export name atom, or 0 when none is
+    /// close enough (tsc's getSuggestedSymbolForNonexistentModule over the
+    /// module's exports). `mfile` must be a resolved module file.
+    fn moduleExportSuggestion(l: *Linker, mfile: FileId, name: Atom) Error!Atom {
+        const et = l.table(mfile) catch return 0;
+        if (et.count() == 0) return 0;
+        var names: std.ArrayList([]const u8) = .empty;
+        defer names.deinit(l.scratch);
+        var atoms: std.ArrayList(Atom) = .empty;
+        defer atoms.deinit(l.scratch);
+        var it = et.iterator();
+        while (it.next()) |entry| {
+            const a = entry.key_ptr.*;
+            // Reserved internal keys are never named-export suggestions.
+            if (a == l.atom_default or a == l.atom_export_equals) continue;
+            try atoms.append(l.scratch, a);
+            try names.append(l.scratch, l.atomText(a));
+        }
+        if (names.items.len == 0) return 0;
+        const idx = intern.spellingSuggestion(l.scratch, l.atomText(name), names.items) orelse return 0;
+        return atoms.items[idx];
+    }
+
+    /// Emit TS2305, or TS2724 when the module has a close export name.
+    fn diagNoExportedMember(l: *Linker, file: FileId, mfile_opt: ?FileId, module: Atom, name: Atom, span: Span) Error!void {
+        if (mfile_opt) |mfile| {
+            const sugg = try l.moduleExportSuggestion(mfile, name);
+            if (sugg != 0) {
+                try l.diag(file, 2724, span, "'\"{s}\"' has no exported member named '{s}'. Did you mean '{s}'?", .{
+                    l.atomText(module), l.atomText(name), l.atomText(sugg),
+                });
+                return;
+            }
+        }
+        try l.diag(file, 2305, span, "Module '\"{s}\"' has no exported member '{s}'.", .{
+            l.atomText(module), l.atomText(name),
+        });
+    }
+
     fn nodeSpan(l: *Linker, file: FileId, node: ast.Node) Span {
         return l.files[file].tree.span(l.files[file].src, node);
     }
@@ -1736,9 +1777,7 @@ const Linker = struct {
                         final.type_only = final.type_only or rec.type_only;
                         try l.put(t, rec.exported, final);
                     } else {
-                        try l.diag(file, 2305, l.nodeSpan(file, rec.node), "Module '\"{s}\"' has no exported member '{s}'.", .{
-                            l.atomText(rec.module), l.atomText(rec.local),
-                        });
+                        try l.diagNoExportedMember(file, mfile, rec.module, rec.local, l.nodeSpan(file, rec.node));
                         try l.put(t, rec.exported, .{ .kind = .any });
                     }
                 },
@@ -2162,9 +2201,7 @@ const Linker = struct {
                             // TS2305.
                             tgt = .{ .kind = .any };
                         } else {
-                            try l.diag(file, 2305, l.nodeSpan(file, rec.node), "Module '\"{s}\"' has no exported member '{s}'.", .{
-                                l.atomText(rec.module), l.atomText(rec.imported),
-                            });
+                            try l.diagNoExportedMember(file, mfile_opt, rec.module, rec.imported, l.nodeSpan(file, rec.node));
                         }
                     },
                     .default => {

@@ -139,6 +139,126 @@ pub const InternerStats = struct {
     }
 };
 
+fn asciiLower(ch: u8) u8 {
+    return if (ch >= 'A' and ch <= 'Z') ch + 32 else ch;
+}
+
+fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if (asciiLower(x) != asciiLower(y)) return false;
+    return true;
+}
+
+/// Weighted Levenshtein in tenths (fixed-point ×10), replicating tsc's
+/// `levenshteinWithMax` costs: exact (case-sensitive) match 0, case-insensitive
+/// substitution 1, other substitution 20, insert/delete 10. Full DP (no
+/// diagonal banding): for any true distance within `cap_tenths` the banded and
+/// unbanded results are identical, so this is exact where it matters. Returns
+/// the distance, or null when it exceeds `cap_tenths`. `scratch` must hold at
+/// least `2 * (b.len + 1)` usize slots.
+fn weightedLevTenths(a: []const u8, b: []const u8, cap_tenths: usize, scratch: []usize) ?usize {
+    var prev = scratch[0 .. b.len + 1];
+    var cur = scratch[b.len + 1 .. 2 * (b.len + 1)];
+    for (0..b.len + 1) |j| prev[j] = j * 10;
+    var i: usize = 1;
+    while (i <= a.len) : (i += 1) {
+        cur[0] = i * 10;
+        var col_min = cur[0];
+        var j: usize = 1;
+        while (j <= b.len) : (j += 1) {
+            const dist = if (a[i - 1] == b[j - 1]) prev[j - 1] else blk: {
+                const sub = if (asciiLower(a[i - 1]) == asciiLower(b[j - 1])) prev[j - 1] + 1 else prev[j - 1] + 20;
+                break :blk @min(@min(prev[j] + 10, cur[j - 1] + 10), sub);
+            };
+            cur[j] = dist;
+            col_min = @min(col_min, dist);
+        }
+        if (col_min > cap_tenths) return null;
+        const tmp = prev;
+        prev = cur;
+        cur = tmp;
+    }
+    const res = prev[b.len];
+    return if (res > cap_tenths) null else res;
+}
+
+/// tsc's `getSpellingSuggestion` (core.ts): pick the closest candidate name to
+/// `name` under the weighted edit distance, or null when none is close enough.
+/// Thresholds match tsc exactly — `maximumLengthDifference = max(2,
+/// floor(len*0.34))` (a length pre-filter) and an initial best distance of
+/// `floor(len*0.4)+1`. Ties on distance are broken toward the
+/// lexicographically-smaller name so the choice is stable across --workers
+/// (the determinism contract), where tsc would take iteration order.
+/// Returns the winning index into `candidates`, or null.
+pub fn spellingSuggestion(gpa: Allocator, name: []const u8, candidates: []const []const u8) ?usize {
+    if (name.len == 0) return null;
+    const max_len_diff: usize = @max(2, name.len * 34 / 100);
+    // Initial threshold (tenths): (floor(len*0.4)+1)*10. A candidate is
+    // accepted when its distance is strictly below the current threshold, i.e.
+    // distance_tenths <= threshold_tenths - 1 (tsc's `bestDistance - 0.1`).
+    // Acceptance threshold (tenths): a candidate qualifies when its distance is
+    // strictly below `floor(len*0.4)+1` (tsc's `bestDistance - 0.1`), i.e.
+    // distance_tenths <= threshold_tenths - 1. The threshold is FIXED here (not
+    // lowered as tsc does) so every qualifying candidate competes; the global
+    // minimum is then chosen with a deterministic lexicographic tie-break. This
+    // yields tsc's global-minimum pick while staying byte-identical across
+    // --workers regardless of candidate iteration order.
+    const cap: usize = (name.len * 40 / 100 + 1) * 10 - 1;
+    var best: ?usize = null;
+    var best_d: usize = undefined;
+    // DP scratch sized for the longest candidate.
+    var max_cand: usize = 0;
+    for (candidates) |c| max_cand = @max(max_cand, c.len);
+    const scratch = gpa.alloc(usize, 2 * (max_cand + 1)) catch return null;
+    defer gpa.free(scratch);
+    for (candidates, 0..) |cand, i| {
+        const diff = if (cand.len > name.len) cand.len - name.len else name.len - cand.len;
+        if (diff > max_len_diff) continue;
+        if (std.mem.eql(u8, cand, name)) continue;
+        if (cand.len < 3 and !eqlIgnoreCase(cand, name)) continue;
+        const d = weightedLevTenths(name, cand, cap, scratch) orelse continue;
+        if (best == null or d < best_d or
+            (d == best_d and std.mem.order(u8, cand, candidates[best.?]) == .lt))
+        {
+            best_d = d;
+            best = i;
+        }
+    }
+    return best;
+}
+
+test "spellingSuggestion: matches tsc getSpellingSuggestion verdicts" {
+    const gpa = std.testing.allocator;
+    // String-literal union suggestion (TS2820 path): the close member wins.
+    try std.testing.expectEqual(
+        @as(?usize, 2),
+        spellingSuggestion(gpa, "assignment-late", &.{ "account-balance", "add", "assignment" }),
+    );
+    // No near match -> null (plain TS2322/TS2305, no "Did you mean").
+    try std.testing.expectEqual(
+        @as(?usize, null),
+        spellingSuggestion(gpa, "upload-file", &.{ "account-balance", "add", "assignment" }),
+    );
+    // A single-character export typo is within threshold (TS2724 path).
+    try std.testing.expectEqual(
+        @as(?usize, 0),
+        spellingSuggestion(gpa, "CattleHealthStatusBadge", &.{"CattleHealthStatusBadgeX"}),
+    );
+    // A distant export name is rejected — matches tsc emitting plain TS2305
+    // for `CattleHealthStatusBadge` vs only `CattleWeighingStatusBadge`.
+    try std.testing.expectEqual(
+        @as(?usize, null),
+        spellingSuggestion(gpa, "CattleHealthStatusBadge", &.{"CattleWeighingStatusBadge"}),
+    );
+    // Candidates shorter than 3 chars only match on case.
+    try std.testing.expectEqual(
+        @as(?usize, null),
+        spellingSuggestion(gpa, "ab", &.{"xy"}),
+    );
+    // Empty candidate set.
+    try std.testing.expectEqual(@as(?usize, null), spellingSuggestion(gpa, "foo", &.{}));
+}
+
 test "intern: same string same atom, different strings different atoms" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
