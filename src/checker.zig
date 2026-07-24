@@ -13147,10 +13147,32 @@ const Checker = struct {
     /// short-circuits on a nullish callee.
     fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, chained: *bool, ctx: TypeId) Error!TypeId {
         const shape = c.callShape(node);
-        var callee_t = if (c.isOptionalChain(shape.callee))
-            try c.chainObjType(shape.callee, chained)
-        else
-            try c.checkExprCached(shape.callee, types.no_type);
+        // IIFE contextual return: an inline arrow/function-expression callee
+        // that is immediately invoked (`(() => …)()`) inherits the call's own
+        // contextual type as its return context, so literal returns are checked
+        // and kept against `ctx` instead of widening to `string` (tsc's
+        // `getContextualTypeForFunctionExpression`). Bounded to the IIFE shape.
+        // A synthetic zero-parameter contextual signature carries ONLY the
+        // return type, so parameter typing — and TS7006 on any implicit-any
+        // parameter (report_implicit stays true) — is unchanged.
+        var iife_inner = shape.callee;
+        while (c.nodeTag(iife_inner) == .paren_expr) iife_inner = c.tree.nodeData(iife_inner).lhs;
+        const iife_tag = c.nodeTag(iife_inner);
+        var callee_t: TypeId = undefined;
+        if (!is_new and !shape.optional and ctx != types.no_type and
+            (iife_tag == .arrow_fn or iife_tag == .function_expr))
+        {
+            const ctx_sig = try c.ts.makeFunction(&.{}, ctx, &.{}, 0);
+            const id = c.tree.nodeData(iife_inner);
+            const sig = try c.signatureOfProtoCtx(iife_inner, id.lhs, false, true, ctx_sig);
+            try c.checkFunctionBody(iife_inner, id.lhs, id.rhs, sig);
+            try c.node_types.put(c.ca(), c.nodeKey(iife_inner), .{ .ty = sig, .ctx = types.no_type });
+            callee_t = sig;
+        } else if (c.isOptionalChain(shape.callee)) {
+            callee_t = try c.chainObjType(shape.callee, chained);
+        } else {
+            callee_t = try c.checkExprCached(shape.callee, types.no_type);
+        }
         if (shape.optional) {
             if (c.containsNullish(callee_t)) chained.* = true;
             callee_t = try c.nonNullableChain(callee_t);
