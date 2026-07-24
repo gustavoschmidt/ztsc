@@ -5622,6 +5622,52 @@ const Checker = struct {
         return info;
     }
 
+    /// The union of an enum's member *value* literals (`"a" | "b"` for a string
+    /// enum, `0 | 1` for numeric). Models an `enum_type` source in the OUT
+    /// direction of assignability: since ztsc types `E.A` as the whole enum
+    /// (member identity is not tracked), an enum value is soundly modelled by
+    /// the union of every member's value. Returns null when any member is
+    /// computed / non-constant (the enum is then opaque and the nominal rules in
+    /// `enumAssignable` apply instead).
+    fn enumValueUnion(c: *Checker, sym: SymbolId) Error!?TypeId {
+        const saved = c.enterSymFile(sym);
+        defer c.restoreCtx(saved);
+        var parts: std.ArrayList(TypeId) = .empty;
+        defer parts.deinit(c.scratch());
+        var auto: f64 = 0;
+        var auto_ok = true;
+        for (c.declsOf(sym)) |decl| {
+            if (c.nodeTag(decl) != .enum_decl) continue;
+            const data = c.tree.extraData(ast.EnumData, c.tree.nodeData(decl).lhs);
+            for (c.tree.extraRange(data.members_start, data.members_end)) |m| {
+                if (m == null_node or c.nodeTag(m) != .enum_member) continue;
+                const init_node = c.tree.nodeData(m).lhs;
+                if (init_node == null_node) {
+                    if (!auto_ok) return null; // auto-increment off a string/computed member
+                    try parts.append(c.scratch(), try c.ts.makeNumberLiteral(auto, false));
+                    auto += 1;
+                    continue;
+                }
+                const ci = c.classifyEnumInit(init_node);
+                switch (ci.kind) {
+                    .string => {
+                        const av = try c.memberAtom(c.tree.nodeMainToken(init_node));
+                        try parts.append(c.scratch(), try c.ts.makeStringLiteral(av, false));
+                        auto_ok = false;
+                    },
+                    .numeric => {
+                        try parts.append(c.scratch(), try c.ts.makeNumberLiteral(ci.value, false));
+                        auto = ci.value + 1;
+                        auto_ok = true;
+                    },
+                    .computed => return null,
+                }
+            }
+        }
+        if (parts.items.len == 0) return null;
+        return try c.ts.makeUnion(c.scratch(), parts.items);
+    }
+
     /// Whether an enum has any string-valued member (non-allocating scan).
     /// A string enum is stringish; an all-numeric enum is numberish — this
     /// lets numeric enums take part in arithmetic/comparison like `number`.
@@ -9509,6 +9555,20 @@ const Checker = struct {
         // not to any single member. Identity (`keyof T <: keyof T`) is caught
         // by the `s == t` fast path.
         if (sk == .keyof_op) return c.isAssignable(try c.propertyKeyType(), t);
+        // Enum *source* against a non-enum target: model the enum by the union
+        // of its member value literals and relate that. Handled before
+        // union-target distribution because an enum is assignable to the *whole*
+        // value union (`E` → `"a" | "b"`), not necessarily to any single member
+        // (`E` never distributes to just `"a"`). A string-enum member is a
+        // subtype of its string-literal value in tsc; ztsc loses member identity
+        // (types `E.A` as `E`), so this is the sound OUT-direction model. Falls
+        // through to the nominal `enumAssignable` when the enum is opaque
+        // (computed members → null) so `string`/`number` widening still works.
+        if (sk == .enum_type and tk != .enum_type) {
+            if (try c.enumValueUnion(c.ts.enumSymbol(s))) |vu| {
+                if (try c.isAssignable(vu, t)) return true;
+            }
+        }
         // Source union distributes first.
         if (sk == .union_type) {
             for (try c.memberList(s)) |m| {
