@@ -12712,6 +12712,11 @@ const Checker = struct {
                         try c.diagFmt(2540, c.tokSpan(d.rhs), "Cannot assign to '{s}' because it is a read-only property.", .{c.atomText(name)});
                         return types.error_type; // suppress cascading 2322
                     }
+                    // An optional property accepts `undefined` as a write target
+                    // (exactOptionalPropertyTypes is off): `x.opt = undefined` is
+                    // legal. Fold `| undefined` in exactly as the read path does,
+                    // so the write-target type is not narrower than the read type.
+                    if (p.optional()) return c.makeUnion2(p.ty, types.undefined_type);
                     return p.ty;
                 }
                 return c.propertyTypeOf(obj_t, name, d.rhs);
