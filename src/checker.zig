@@ -1543,6 +1543,41 @@ const Checker = struct {
         }
     }
 
+    /// Per-return widening for *inferred* (no-context) return types: like
+    /// `widenLiteral`, but a fresh PRIMITIVE literal is KEPT (not widened to its
+    /// base). This mirrors tsc: the fresh literal return-expression types are
+    /// unioned first, and only the *collapsed* union result is widened (see
+    /// `finalizeInferredReturn`). Objects/arrays still de-freshen exactly as in
+    /// `widenLiteral`, so object-property widening is unchanged.
+    fn widenReturnMember(c: *Checker, t: TypeId) Error!TypeId {
+        if (c.ts.isFreshLiteral(t)) return t; // keep — decide widening on the union
+        switch (c.ts.kind(t)) {
+            .union_type => {
+                var list: std.ArrayList(TypeId) = .empty;
+                defer list.deinit(c.scratch());
+                for (try c.memberList(t)) |m| try list.append(c.scratch(), try c.widenReturnMember(m));
+                return c.ts.makeUnion(c.scratch(), list.items);
+            },
+            .object => return c.ts.regular(t),
+            else => return t,
+        }
+    }
+
+    /// Finish an inferred (no-context) return type after unioning the
+    /// un-widened return members: tsc widens the union *result* only when it
+    /// collapsed to a single fresh literal (`() => "a"` ⇒ `string`; two same
+    /// literals collapse the same way), and PRESERVES a union of 2+ distinct
+    /// literals (`"a" | "b"`). The surviving union keeps its FRESH (widening)
+    /// literals — exactly as tsc, so `let x = f()` still widens to the base
+    /// while `const x: "a" | "b" = f()` stays assignable.
+    fn finalizeInferredReturn(c: *Checker, u: TypeId) Error!TypeId {
+        if (c.ts.isFreshLiteral(u)) {
+            const base = c.ts.literalBase(u);
+            return if (base != types.no_type) base else u;
+        }
+        return u;
+    }
+
     /// Widen a contextually-typed return expression: suppress literal widening
     /// where the contextual return type admits the literal (tsc's
     /// isLiteralOfContextualType), otherwise widen exactly as `widenLiteral`.
@@ -3797,7 +3832,9 @@ const Checker = struct {
             .yield_type = 0,
         };
         if (c.nodeTag(body) != .block) {
-            return c.widenToContext(try c.checkExprCached(body, ret_ctx), ret_ctx);
+            const raw = try c.checkExprCached(body, ret_ctx);
+            if (ret_ctx != types.no_type) return c.widenToContext(raw, ret_ctx);
+            return c.finalizeInferredReturn(try c.widenReturnMember(raw));
         }
         var rets: std.ArrayList(Node) = .empty;
         defer rets.deinit(c.scratch());
@@ -3821,12 +3858,20 @@ const Checker = struct {
         defer c.cur_scope = saved_scope;
         for (rets.items, ret_scopes.items) |r, sc| {
             c.cur_scope = sc;
-            try parts.append(c.scratch(), try c.widenToContext(try c.checkExprCached(r, ret_ctx), ret_ctx));
+            const rt = try c.checkExprCached(r, ret_ctx);
+            // No-context inference unions the *un-widened* fresh literals and
+            // widens only the collapsed result (finalizeInferredReturn); a
+            // contextual return keeps the per-member widenToContext behaviour.
+            try parts.append(c.scratch(), if (ret_ctx == types.no_type)
+                try c.widenReturnMember(rt)
+            else
+                try c.widenToContext(rt, ret_ctx));
         }
         if (bare_return or !c.stmtListTerminal(c.tree.nodeRange(body))) {
             try parts.append(c.scratch(), types.undefined_type);
         }
-        return c.ts.makeUnion(c.scratch(), parts.items);
+        const u = try c.ts.makeUnion(c.scratch(), parts.items);
+        return if (ret_ctx == types.no_type) c.finalizeInferredReturn(u) else u;
     }
 
     fn collectReturns(c: *Checker, node: Node, out: *std.ArrayList(Node), out_scopes: ?*std.ArrayList(ScopeId), bare: *bool, scope: ScopeId) Error!void {
