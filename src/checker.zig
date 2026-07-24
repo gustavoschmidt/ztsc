@@ -408,6 +408,21 @@ const Checker = struct {
     /// narrowing across the loop (tsc), the former re-widens. Populated
     /// alongside `reassigned_syms` in `ensureReassignScan`.
     reassigned_in_loop: std.AutoHashMapUnmanaged(SymLoop, void) = .empty,
+    /// Root symbols that are the base of a *member/element write* (`o.p = …`,
+    /// `o[i] = …`, `o.p++`) somewhere in their file — i.e. a property path
+    /// rooted at `sym` may be invalidated. Used only to decide whether a
+    /// property-path narrowing survives a `while`/`do` loop back edge (the
+    /// coarse, file-level over-approximation; `for` loops use the exact
+    /// per-scope `member_written_in_loop`). Populated alongside
+    /// `reassigned_syms` in `ensureReassignScan`.
+    member_written_syms: std.AutoHashMapUnmanaged(SymbolId, void) = .empty,
+    /// `(root_sym, for_head_scope)` pairs where a member/element write rooted at
+    /// `root_sym` occurs inside the loop whose header scope is `for_head_scope`.
+    /// Lets a `for`-loop label keep a property-path narrowing whose root is not
+    /// written inside the loop (over-conservative on the property name: any
+    /// write to *some* property of the same root blocks the shortcut, which is
+    /// sound — it can only fail to retain a narrowing, never introduce one).
+    member_written_in_loop: std.AutoHashMapUnmanaged(SymLoop, void) = .empty,
     /// Per-file flag: has this file's reassignment scan run yet?
     reassign_scanned: []bool = &.{},
     /// Recursion depth of TS4.4 aliased-condition narrowing (following a
@@ -997,6 +1012,7 @@ const Checker = struct {
     /// a `for (const x of xs)` binding is not in the reassignment scan yet is
     /// effectively assigned by every iteration.
     fn symDeclaredInForHead(c: *const Checker, sym: SymbolId) bool {
+        if (sym == this_flow_root) return false; // `this` is never a loop binding
         const s = c.reprSym(sym);
         const f = c.symFile(s);
         const b = c.prog.files[f].bind;
@@ -14834,7 +14850,7 @@ const Checker = struct {
                 // the old code dropped, never perturb the cache interaction of a
                 // reference that was never narrowed before the loop (which would
                 // otherwise unmask unrelated latent FPs downstream).
-                if (b.flow_tags[flow] == .loop_label and antes.len >= 1 and key.len == 0 and
+                if (b.flow_tags[flow] == .loop_label and antes.len >= 1 and
                     !c.symDeclaredInForHead(key.sym))
                 {
                     try c.ensureReassignScan();
@@ -14846,11 +14862,23 @@ const Checker = struct {
                     // there the coarse file-level "reassigned anywhere" test is
                     // used (sound: an assignment inside the loop always lands in
                     // the file scan → never keeps a mutated narrowing).
+                    // A property path (`key.len != 0`) additionally re-widens if
+                    // ANY member/element write rooted at the same symbol occurs
+                    // inside the loop (the root reassign test alone misses
+                    // `o.p = …`). The property-name is not distinguished — a
+                    // write to any property of the root blocks the shortcut,
+                    // which is sound (only ever fails to retain a narrowing).
                     const loop_scope = b.flowScope(flow);
-                    const assigned_in_loop = if (b.scope_kinds[loop_scope] == .for_head)
+                    const is_for = b.scope_kinds[loop_scope] == .for_head;
+                    const root_assigned = if (is_for)
                         c.reassigned_in_loop.contains(.{ .sym = key.sym, .scope = loop_scope })
                     else
                         c.reassigned_syms.contains(key.sym);
+                    const member_written = key.len != 0 and (if (is_for)
+                        c.member_written_in_loop.contains(.{ .sym = key.sym, .scope = loop_scope })
+                    else
+                        c.member_written_syms.contains(key.sym));
+                    const assigned_in_loop = root_assigned or member_written;
                     if (!assigned_in_loop) {
                         const entry_t = try c.flowType(antes[0], key, declared, depth + 1);
                         if (entry_t != declared) return entry_t;
@@ -15320,10 +15348,16 @@ const Checker = struct {
             if (node == null_node) continue;
             const scope = b.flowScope(flow);
             switch (c.nodeTag(node)) {
-                .assign => try c.markReassignTarget(c.tree.nodeData(node).lhs, scope),
+                .assign => {
+                    try c.markReassignTarget(c.tree.nodeData(node).lhs, scope);
+                    try c.markMemberWriteRoot(c.tree.nodeData(node).lhs, scope);
+                },
                 .prefix_unary, .postfix_unary => {
                     switch (c.tree.tokens.tag(c.tree.nodeMainToken(node))) {
-                        .plus_plus, .minus_minus => try c.markReassignTarget(c.tree.nodeData(node).lhs, scope),
+                        .plus_plus, .minus_minus => {
+                            try c.markReassignTarget(c.tree.nodeData(node).lhs, scope);
+                            try c.markMemberWriteRoot(c.tree.nodeData(node).lhs, scope);
+                        },
                         else => {},
                     }
                 },
@@ -15386,6 +15420,54 @@ const Checker = struct {
             },
             // member_expr (`o.p = v`) reassigns a property, not a variable.
             else => {},
+        }
+    }
+
+    /// Record the ROOT symbol of a member/element-write target (`o.p = …`,
+    /// `o[i] = …`) so property-path narrowings rooted at that symbol are known
+    /// to be potentially invalidated inside the enclosing loop(s). Peels the
+    /// member/index spine (and parens) to the base identifier / `this`.
+    fn markMemberWriteRoot(c: *Checker, target: Node, scope: ScopeId) Error!void {
+        if (target == null_node) return;
+        var n = target;
+        while (true) {
+            while (c.nodeTag(n) == .paren_expr) n = c.tree.nodeData(n).lhs;
+            const tag = c.nodeTag(n);
+            if (tag == .member_expr or tag == .optional_member_expr or
+                tag == .index_expr or tag == .optional_index_expr)
+            {
+                n = c.tree.nodeData(n).lhs;
+                continue;
+            }
+            break;
+        }
+        while (c.nodeTag(n) == .paren_expr) n = c.tree.nodeData(n).lhs;
+        if (target == n) return; // not a member/element write (bare identifier)
+        switch (c.nodeTag(n)) {
+            .identifier => {
+                const a = try c.atomOfToken(c.tree.nodeMainToken(n));
+                switch (c.resolveSpace(a, scope, true)) {
+                    .sym => |s| try c.recordMemberWrite(s, scope),
+                    else => {},
+                }
+            },
+            .this_expr => try c.recordMemberWrite(this_flow_root, scope),
+            else => {},
+        }
+    }
+
+    /// Mirror of `recordReassign` for member/element writes: record the root as
+    /// member-written file-wide and inside every enclosing `for` loop.
+    fn recordMemberWrite(c: *Checker, sym: SymbolId, scope: ScopeId) Error!void {
+        try c.member_written_syms.put(c.ca(), sym, {});
+        const b = c.bind;
+        var s = scope;
+        while (true) {
+            if (b.scope_kinds[s] == .for_head)
+                try c.member_written_in_loop.put(c.ca(), .{ .sym = sym, .scope = s }, {});
+            const p = b.scope_parents[s];
+            if (p == s) break;
+            s = p;
         }
     }
 
