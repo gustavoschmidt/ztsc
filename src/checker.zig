@@ -14391,6 +14391,16 @@ const Checker = struct {
                 // and file starts have `no_flow` here and stop at `declared`.
                 const ante = b.flow_a[flow];
                 if (ante == binder.no_flow) return declared;
+                // A closure whose textual definition point is unreachable (e.g. a
+                // hoisted `function` declared after a `return`) can still be
+                // invoked — its body runs in a fresh reachable context. Crossing
+                // into the unreachable definition-point flow would yield `never`
+                // for a captured reference, which then makes a property *write*
+                // target (`ref.current = x`) spuriously collapse to `never` (a
+                // read to `never` is silently accepted, so only writes surface it).
+                // Use the declared type instead: there is no valid narrowing at an
+                // unreachable definition point.
+                if (ante == binder.unreachable_flow) return declared;
                 if (key.len != 0 or key.sym == this_flow_root) return declared;
                 const sf = c.symFlags(key.sym);
                 if (!sf.const_decl) {
