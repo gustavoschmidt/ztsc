@@ -10175,13 +10175,26 @@ const Checker = struct {
     /// against object-ish targets; recurses into nested literal properties.
     fn excessPropertyCheck(c: *Checker, expr_node: Node, src_t: TypeId, target: TypeId) Error!void {
         var node = expr_node;
-        while (c.nodeTag(node) == .paren_expr) node = c.tree.nodeData(node).lhs;
+        // Unwrap parens and a JSX expression container (`prop={{ … }}`): the
+        // object literal inside a JSX attribute value is fresh and excess-checked
+        // exactly like a call argument or assignment RHS.
+        while (true) {
+            switch (c.nodeTag(node)) {
+                .paren_expr, .jsx_expr_container => node = c.tree.nodeData(node).lhs,
+                else => break,
+            }
+            if (node == null_node) return;
+        }
         if (c.nodeTag(node) != .object_literal) return;
         if (!c.ts.objectIsFresh(src_t)) return;
         const rt = try c.resolveStructural(target);
         switch (c.ts.kind(rt)) {
             .object => {
                 if (c.ts.objectStringIndex(rt) != 0 or c.ts.objectNumberIndex(rt) != 0) return;
+                // The empty object type `{}` accepts any properties: tsc's
+                // `hasExcessProperties` bails on `isEmptyObjectType(target)`
+                // (e.g. react-i18next's `values?: {}`). No prop is ever excess.
+                if (c.isEmptyObjectType(rt)) return;
             },
             .union_type => {
                 // Check against the union: a property is excess if no
