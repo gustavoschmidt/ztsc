@@ -9914,6 +9914,52 @@ const Checker = struct {
         return true;
     }
 
+    /// Attempt to relate a generic *source* signature to a concrete target by
+    /// inferring the source's own type params from the target signature and
+    /// relating the instantiation. Returns true only when a legal instantiation
+    /// (inferred args satisfy their constraints) relates in full; false
+    /// otherwise, so the caller falls through to the erase-to-constraint path.
+    /// Mirrors tsc's `compareSignaturesRelated`, which instantiates rather than
+    /// erases a generic source. Only fires for a generic function source against
+    /// a concrete (non-generic) function target.
+    fn genericSourceRelatesByInference(c: *Checker, s: TypeId, t: TypeId) Error!bool {
+        if (c.ts.kind(s) != .function or c.ts.kind(t) != .function) return false;
+        const tps = c.ts.fnTypeParams(s);
+        if (tps.len == 0) return false; // source not generic
+        if (c.ts.fnTypeParams(t).len != 0) return false; // target still generic
+        const tp_syms = try c.scratch().dupe(u32, tps);
+        const cand = try c.scratch().alloc(TypeId, tp_syms.len);
+        for (cand) |*x| x.* = types.no_type;
+        // Infer the source's params from the aligned target params (and the
+        // returns), pinning each type param to the concrete shape the target
+        // demands.
+        const n = @min(c.ts.fnParamCount(s), c.ts.fnParamCount(t));
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            try c.unify(c.ts.fnParam(s, i).ty, c.ts.fnParam(t, i).ty, tp_syms, cand, 0);
+        }
+        try c.unify(c.ts.fnReturn(s), c.ts.fnReturn(t), tp_syms, cand, 0);
+        // Build the substitution: an inferred arg must satisfy its constraint
+        // (else the instantiation is illegal — tsc rejects); an unbound param
+        // falls back to its constraint (or `unknown`).
+        const map = try c.scratch().alloc(TpMap, tp_syms.len);
+        for (tp_syms, 0..) |tp, k| {
+            const con = try c.typeParamConstraint(tp);
+            var val = cand[k];
+            if (val == types.no_type) {
+                val = if (con != types.no_type) con else types.unknown_type;
+            } else if (con != types.no_type and !try c.isAssignable(val, con)) {
+                return false;
+            }
+            map[k] = .{ .sym = tp, .ty = val };
+        }
+        const inst = try c.instantiate(s, map);
+        // A full map over the source's own params yields a non-generic sig; if
+        // anything remains generic, bail rather than risk recursion.
+        if (c.ts.kind(inst) != .function or c.ts.fnTypeParams(inst).len != 0) return false;
+        return c.signatureAssignable(inst, t);
+    }
+
     /// strictFunctionTypes: contravariant params for function types,
     /// bivariant for methods; covariant returns; `void` target returns
     /// accept anything.
@@ -9932,6 +9978,17 @@ const Checker = struct {
         // other generic-signature relation relies on untouched (a general
         // abstract-param relation here regresses jest/mock generic sigs).
         if (try c.identityProbeRelated(s, t)) |res| return res;
+        // A generic *source* signature may relate to a concrete target by
+        // instantiating its own type params — inferred from the target's
+        // parameters/return — instead of erasing them to their (possibly far
+        // wider) constraints. `<T extends AllGeoJSON>(f: T) => T` relates to
+        // `(v: Feature) => Feature` by inferring T = Feature; the erase-to-
+        // constraint path below instead over-widens the covariant return
+        // (`=> AllGeoJSON` ⊄ `=> Feature`) and wrongly rejects. Purely additive:
+        // only returns true, and only after verifying the inferred args satisfy
+        // their constraints and the instantiated (non-generic) source relates in
+        // full — so it never accepts what the erasure path would soundly reject.
+        if (try c.genericSourceRelatesByInference(s, t)) return true;
         const bivariant = (c.ts.fnFlags(s) & types.fn_flag_method != 0) or
             (c.ts.fnFlags(t) & types.fn_flag_method != 0);
         // Erase generics to their constraints (documented simplification).
