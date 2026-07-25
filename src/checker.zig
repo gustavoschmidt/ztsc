@@ -11314,7 +11314,8 @@ const Checker = struct {
                 if (constraint != types.no_type and !bare_outer and !any_index_ok and
                     !try c.isAssignable(candidates[i], constraint))
                 {
-                    args_buf[i] = constraint;
+                    var fell_back = false;
+                    args_buf[i] = try c.clampToConstraint(candidates[i], constraint, &fell_back);
                 }
             } else if (c.typeParamHasDefault(tp)) {
                 args_buf[i] = try c.instantiate(try c.typeParamDefault(tp), prov);
@@ -14030,8 +14031,7 @@ const Checker = struct {
                 if (constraint != types.no_type and !bare_outer and
                     !try c.isAssignable(candidates[i], constraint))
                 {
-                    out[i] = constraint;
-                    c.infer_fell_back = true;
+                    out[i] = try c.clampToConstraint(out[i], constraint, &c.infer_fell_back);
                 }
             } else if (c.typeParamHasDefault(tp)) {
                 // Uninferable param with a default takes it, instantiated under
@@ -14050,6 +14050,33 @@ const Checker = struct {
             if (s == sym) return i;
         }
         return null;
+    }
+
+    /// A candidate that violates its param's constraint is normally clamped to
+    /// the constraint. When the candidate is a UNION, prefer the
+    /// constraint-satisfying members over erasing the whole inference — this
+    /// drops contravariant-inference pollution such as a function type inferred
+    /// from a callback's PARAMETER position (`onChange: (v: T) => void` fed a
+    /// `Dispatch<SetStateAction<E>>`, contributing `E | ((p:E)=>E)` to `T`),
+    /// which the covariant candidate (`E` from `value`) should win over. tsc
+    /// keeps covariant and contravariant candidates separate and prefers
+    /// covariant; this approximates that at the resolution seam. `fell_back` is
+    /// set only when the full constraint clamp is used.
+    fn clampToConstraint(c: *Checker, cand: TypeId, constraint: TypeId, fell_back: *bool) Error!TypeId {
+        if (c.ts.kind(cand) == .union_type) {
+            const members = try c.memberList(cand);
+            var keep: std.ArrayList(TypeId) = .empty;
+            defer keep.deinit(c.scratch());
+            for (members) |m| {
+                if (try c.isAssignable(m, constraint)) try keep.append(c.scratch(), m);
+            }
+            if (keep.items.len > 0 and keep.items.len < members.len) {
+                const filtered = try c.ts.makeUnion(c.scratch(), keep.items);
+                if (try c.isAssignable(filtered, constraint)) return filtered;
+            }
+        }
+        fell_back.* = true;
+        return constraint;
     }
 
     fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, candidates: []TypeId, depth: u32) Error!void {
