@@ -11666,9 +11666,14 @@ const Checker = struct {
                 // (so a fixed-length target picks the tuple member of a union —
                 // e.g. `radius={[8, 8, 8, 8]}` against `number | [number, number,
                 // number, number]`: without the context it widens to `number[]`
-                // and fails the tuple). Other value kinds are checked context-free.
+                // and fails the tuple). A conditional expression forwards the
+                // context to both branches (`extraItems={cond ? [{…}] : []}`
+                // against `Item[]`: each branch's array/object literal must be
+                // contextually typed so its literal props don't widen — without
+                // it `icon: 'link'` widens to `string` and rejects the `IconName`
+                // prop). Other value kinds are checked context-free.
                 const vctx = switch (c.nodeTag(cd.lhs)) {
-                    .template_expr, .object_literal, .array_literal => ctx,
+                    .template_expr, .object_literal, .array_literal, .cond_expr => ctx,
                     else => types.no_type,
                 };
                 return c.checkExprCached(cd.lhs, vctx);
