@@ -493,6 +493,8 @@ const Checker = struct {
     da_cache: std.AutoHashMapUnmanaged(u64, u8) = .empty,
     /// containsTypeParam memo: 0 unknown, 1 no, 2 yes.
     ctp_cache: std.AutoHashMapUnmanaged(TypeId, u8) = .empty,
+    /// containsMappedParam memo: 0 unknown, 1 no, 2 yes.
+    cmp_cache: std.AutoHashMapUnmanaged(TypeId, u8) = .empty,
     /// Instantiation memo: `(canonical_map_id << 32 | t) -> result`. A
     /// substitution is a pure function of `(t, map-contents)`; `map_id`
     /// canonically identifies the map's `(type-param, arg)` set (order- and
@@ -8358,6 +8360,16 @@ const Checker = struct {
     }
 
     fn containsMappedParam(c: *Checker, t: TypeId) Error!bool {
+        if (c.cmp_cache.get(t)) |v| {
+            if (v != 0) return v == 2;
+        }
+        try c.cmp_cache.put(c.ca(), t, 1);
+        const r = try c.containsMappedParamInner(t);
+        try c.cmp_cache.put(c.ca(), t, if (r) 2 else 1);
+        return r;
+    }
+
+    fn containsMappedParamInner(c: *Checker, t: TypeId) Error!bool {
         const s = &c.ts;
         return switch (s.kind(t)) {
             .mapped_param => true,
