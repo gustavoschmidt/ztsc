@@ -8559,8 +8559,34 @@ const Checker = struct {
                 for (try c.memberList(r)) |m| if (try c.ctxWantsTemplate(m)) return true;
                 return false;
             },
+            // tsc's `isTemplateLiteralContextualType` also admits an
+            // instantiable type whose base constraint is string-like: a
+            // template expression inferred into `watch<N extends
+            // FieldPath<T>>` must keep `` `contacts.${number}.type` ``
+            // (widening to `string` fails the constraint, erasing `N` and
+            // rejecting the overload).
+            .type_param => {
+                const con = try c.typeParamConstraint(c.ts.typeParamSymbol(r));
+                if (con == types.no_type) return false;
+                return c.typeIsStringLike(try c.resolveStructural(con));
+            },
             else => return false,
         }
+    }
+
+    /// tsc's `TypeFlags.StringLike` over a resolved constraint (plus a
+    /// union/intersection scan, as in `maybeTypeOfKind`).
+    fn typeIsStringLike(c: *Checker, t: TypeId) Error!bool {
+        return switch (c.ts.kind(t)) {
+            .string, .string_literal, .template_literal_type, .string_mapping => true,
+            .union_type, .intersection => blk: {
+                for (try c.memberList(t)) |m| {
+                    if (try c.typeIsStringLike(try c.resolveStructural(m))) break :blk true;
+                }
+                break :blk false;
+            },
+            else => false,
+        };
     }
 
     /// The `template_middle` / `template_tail` chunk token immediately following
@@ -13900,6 +13926,13 @@ const Checker = struct {
             // collapsing to `unknown`.
             var arg_ctx = switch (tag) {
                 .array_literal, .call_expr, .call_expr_targs, .optional_call, .new_expr, .new_expr_bare, .new_expr_targs => pt,
+                // A template expression is contextually typed by the parameter
+                // so `ctxWantsTemplate` can see a string-like-constrained type
+                // param and keep the template-literal type (tsc keeps
+                // `` `x.${number}` `` for `kS<N extends string>(`x.${i}`)`;
+                // context-free checking widens it to `string` before
+                // unification ever sees it).
+                .template_expr => pt,
                 // Contextually type an object-literal argument by the parameter
                 // so a property whose parameter type is a literal-constrained
                 // inference target (`name: TFieldName`, `TFieldName extends
@@ -14751,8 +14784,13 @@ const Checker = struct {
             // parameter to thread into `.map`'s callback so the returned array
             // literal forms a tuple — without the context the callback widens
             // to `(string|number)[]` and every Map overload is rejected.
+            // A template expression needs the context for the same reason: probed
+            // context-free it widens to `string`, so an overload whose inferred
+            // parameter is a template-literal type (`watch(`contacts.${index}.type`)`
+            // against `N extends FieldPath<T>`) is spuriously rejected — again, the
+            // single-signature path already types it by `pt`.
             const ctx_typed = switch (tag) {
-                .arrow_fn, .function_expr, .array_literal, .object_literal, .call_expr, .call_expr_targs, .optional_call, .new_expr, .new_expr_bare, .new_expr_targs => true,
+                .arrow_fn, .function_expr, .array_literal, .object_literal, .template_expr, .call_expr, .call_expr_targs, .optional_call, .new_expr, .new_expr_bare, .new_expr_targs => true,
                 else => false,
             };
             const at = if (ctx_typed)
