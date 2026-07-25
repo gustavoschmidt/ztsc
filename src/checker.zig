@@ -7342,32 +7342,38 @@ const Checker = struct {
                         try c.inferFromExtends(s.objectCallSig(src, ncall - 1), pattern, ids, vals, contra, depth + 1);
                     return;
                 }
-                // An intersection whose callable part is an overload set
-                // (`typeof setTimeout` is `overloads & namespaceObject` after
-                // the lib+node timer merge): infer through its last call
-                // signature so `ReturnType<typeof setTimeout>` reads the node
-                // return type instead of collapsing to `unknown`.
-                // An intersection carrying a callable OBJECT (React's
-                // `ForwardRefExoticComponent<P> & {…}`) is left to the existing
-                // object/construct-signature inference, so `ComponentProps<typeof
-                // C>` is unaffected.
+                // A callable intersection stands in for a bare function against a
+                // function-type pattern:
+                //   * OVERLOAD SET intersected with a namespace value object
+                //     (`typeof setTimeout` = `overloads & namespaceObject` after
+                //     the lib+node timer merge) → infer through its last call
+                //     signature so `ReturnType<typeof setTimeout>` reads the node
+                //     return type instead of collapsing to `unknown`;
+                //   * a plain function intersected with its statics
+                //     (`typeof Icon` = `((props) => JSX) & typeof Icon`, a
+                //     `declare function` value carrying own properties) → infer
+                //     through that bare call-signature member, so
+                //     `ComponentProps<typeof Icon>` = its props type, not
+                //     `unknown`. (A callable OBJECT member — React's
+                //     `ForwardRefExoticComponent<P> & {…}`, whose call sig lives
+                //     INSIDE an object member rather than as a bare `.function` —
+                //     is still left to the object/construct-signature path below.)
                 if (s.kind(src) == .intersection) {
-                    // Restrict to the shape the lib+node timer merge produces: an
-                    // OVERLOAD SET intersected with a namespace value object
-                    // (`typeof setTimeout` = `overloads & typeof setTimeout`).
-                    // Only the multi-signature overload case needs this routing —
-                    // a plain function intersected with its statics (every
-                    // `typeof f`, e.g. `typeof Icon`) is already inferred through
-                    // the existing object/construct-signature path, so leaving it
-                    // alone keeps `ComponentProps<typeof C>` and other conditional
-                    // types untouched.
-                    var callable: TypeId = types.no_type;
+                    var callable: TypeId = types.no_type; // overload set
+                    var fn_member: TypeId = types.no_type; // bare call signature
                     for (try c.memberList(src)) |m| {
                         const rm = try c.resolveStructural(m);
-                        if (s.kind(rm) == .overloads) callable = rm;
+                        if (s.kind(rm) == .overloads) {
+                            callable = rm;
+                        } else if (s.kind(rm) == .function and fn_member == types.no_type) {
+                            fn_member = rm;
+                        }
                     }
-                    if (callable == types.no_type) return;
-                    if (try c.lastCallSig(callable)) |sig| src = sig else return;
+                    if (callable != types.no_type) {
+                        if (try c.lastCallSig(callable)) |sig| src = sig else return;
+                    } else if (fn_member != types.no_type) {
+                        src = fn_member;
+                    } else return;
                 }
                 // A plain overload set — the type of a multiply-declared method
                 // reached through property/indexed access (`S['m']`, e.g. jest's
