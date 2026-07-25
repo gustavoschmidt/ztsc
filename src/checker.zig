@@ -9785,6 +9785,13 @@ const Checker = struct {
             for (try c.memberList(t)) |m| {
                 if (try c.isAssignable(s, m)) return true;
             }
+            // Discriminated-union normalization: a source object whose
+            // discriminant property is a union may still be assignable to a
+            // union target that splits that discriminant across members, even
+            // though it matched no single member above.
+            if (sk == .object or sk == .ref) {
+                if (try c.discriminatedUnionAssignable(s, t)) return true;
+            }
             return false;
         }
         if (tk == .intersection) {
@@ -10079,6 +10086,106 @@ const Checker = struct {
         // constructed) provides none and fails a non-empty requirement.
         if (t_calls > 0 and !try c.sourceSatisfiesSigs(s, t, false)) return false;
         if (t_constructs > 0 and !try c.sourceSatisfiesSigs(s, t, true)) return false;
+        return true;
+    }
+
+    /// A single literal / null / undefined / unique-symbol — a "unit" type that
+    /// can serve as a discriminant value (tsc `isUnitType`).
+    fn isUnitLikeKind(k: types.Kind) bool {
+        return switch (k) {
+            .string_literal, .number_literal, .number_literal_fresh, .bigint_literal, .bool_true, .bool_false, .null, .undefined, .unique_symbol => true,
+            else => false,
+        };
+    }
+
+    /// tsc `typeRelatedToDiscriminatedType`: a source object with a union-typed
+    /// discriminant property can be assignable to a union of object members
+    /// that split that discriminant across members (differing only in the
+    /// discriminant), even when it is assignable to no single member. Each
+    /// discriminant constituent must be covered by some member, and the
+    /// source's remaining properties must be assignable to every matched
+    /// member. Handles a SINGLE discriminant property (the overwhelmingly
+    /// common shape); a multi-discriminant grid falls through to the plain
+    /// single-member path (a sound under-accept, never a false accept).
+    fn discriminatedUnionAssignable(c: *Checker, s: TypeId, t: TypeId) Error!bool {
+        const sr = try c.resolveStructural(s);
+        if (c.ts.kind(sr) != .object) return false;
+        const members = try c.memberList(t);
+        if (members.len < 2) return false;
+        const sp_count = c.ts.objectPropCount(sr);
+        for (0..sp_count) |pi| {
+            const dprop = c.ts.objectProp(sr, @intCast(pi));
+            // Candidate discriminant: present as a unit-typed property on every
+            // member, with at least two distinct member values.
+            var first_val: TypeId = 0;
+            var differs = false;
+            var ok = true;
+            for (members) |m| {
+                const mp = (try c.propOfType(m, dprop.name)) orelse {
+                    ok = false;
+                    break;
+                };
+                const mr = try c.resolveStructural(mp.ty);
+                if (!isUnitLikeKind(c.ts.kind(mr))) {
+                    ok = false;
+                    break;
+                }
+                if (first_val == 0) first_val = mr else if (mr != first_val) differs = true;
+            }
+            if (!ok or !differs) continue;
+            // Every source discriminant constituent must be covered by ≥1
+            // member, and every matched member's non-discriminant props must
+            // accept the source.
+            const src_disc = try c.resolveStructural(dprop.ty);
+            const singleton = [_]TypeId{src_disc};
+            const src_consts: []const TypeId = if (c.ts.kind(src_disc) == .union_type)
+                try c.memberList(src_disc)
+            else
+                &singleton;
+            var all_ok = true;
+            for (src_consts) |lv| {
+                var covered = false;
+                for (members) |m| {
+                    const mp = (try c.propOfType(m, dprop.name)) orelse continue;
+                    if (!try c.isAssignable(lv, mp.ty)) continue;
+                    covered = true;
+                    if (!try c.nonDiscPropsAssignable(sr, m, dprop.name)) {
+                        all_ok = false;
+                    }
+                }
+                if (!covered) {
+                    all_ok = false;
+                    break;
+                }
+            }
+            if (all_ok) return true;
+        }
+        return false;
+    }
+
+    /// Every named property of object `member` other than the discriminant
+    /// `excl` must be present on `s` and assignable. Members carrying index or
+    /// call/construct signatures are declined (return false) — the focused
+    /// check covers only named properties, so bailing keeps the relation sound.
+    fn nonDiscPropsAssignable(c: *Checker, s: TypeId, member: TypeId, excl: Atom) Error!bool {
+        const m = try c.resolveStructural(member);
+        if (c.ts.kind(m) != .object) return false;
+        if (c.ts.objectStringIndex(m) != 0 or c.ts.objectNumberIndex(m) != 0 or
+            c.ts.objectCallSigCount(m) != 0 or c.ts.objectConstructSigCount(m) != 0) return false;
+        for (0..c.ts.objectPropCount(m)) |i| {
+            const tp = c.ts.objectProp(m, @intCast(i));
+            if (tp.name == excl) continue;
+            const sp = (try c.propOfTypeEx(s, tp.name, false)) orelse {
+                if (tp.optional()) continue;
+                return false;
+            };
+            if (sp.optional() and !tp.optional()) return false;
+            var st = sp.ty;
+            if (sp.optional()) st = try c.makeUnion2(st, types.undefined_type);
+            var tt = tp.ty;
+            if (tp.optional()) tt = try c.makeUnion2(tt, types.undefined_type);
+            if (!try c.isAssignable(st, tt)) return false;
+        }
         return true;
     }
 
