@@ -1,9 +1,18 @@
-//! File loading (mmap-backed), line-offset tables, and source spans.
+//! File loading, line-offset tables, and source spans.
 //!
-//! Source bytes are memory-mapped read-only where the platform allows it;
-//! the AST will reference them by offset and we never copy source text
-//! except into the string interner. Line/column information is computed
-//! lazily from a line-offset table, never stored per token.
+//! Small files (the overwhelming majority: the mean TypeScript source in a
+//! real project is a few KB) are read into shared, never-moving `Pack`
+//! segments. One mmap per file would round every file up to a whole page,
+//! and the scanner touches every page it maps — on a 6.2k-file project that
+//! padding costs more resident memory than the text itself. Large files are
+//! still mapped read-only, where rounding is a rounding error and mapping
+//! saves the copy.
+//!
+//! Either way the bytes stay at a fixed address for the whole run: the AST
+//! references them by offset, diagnostics re-slice them when rendering
+//! excerpts, and we never copy source text except into the string interner.
+//! Line/column information is computed lazily from a line-offset table,
+//! never stored per token.
 
 const std = @import("std");
 const Io = std.Io;
@@ -29,10 +38,82 @@ pub const LineCol = struct {
 pub const Backing = union(enum) {
     /// Memory-mapped file; unmapped on deinit.
     mapped: Io.File.MemoryMap,
+    /// Bytes bump-allocated out of a shared `Pack` segment; released with
+    /// the pack, not with the source.
+    pooled,
     /// Bytes allocated from the caller's arena (fallback path, tests).
     owned,
     /// Bytes borrowed from elsewhere (e.g. static test data).
     borrowed,
+};
+
+/// Bump allocator for source text: many small files packed end to end into
+/// a few large segments instead of one page-rounded mapping each.
+///
+/// Segments are fixed-size and never resized or moved, so every slice handed
+/// out stays valid until `deinit` — which the front end relies on, since the
+/// AST, the binder and diagnostic rendering all keep offsets into the text
+/// for the whole run.
+///
+/// Not thread-safe by design: give each loader thread its own pack. Packing
+/// is content- and address-independent, so output stays byte-identical for
+/// any worker count.
+pub const Pack = struct {
+    /// Head of the segment list; the bump cursor points into this one.
+    first: ?*Segment = null,
+    /// Bytes of the head segment's payload already handed out.
+    used: usize = 0,
+    /// Payload bytes handed out to sources.
+    text_bytes: usize = 0,
+    /// Bytes requested from the OS for segments (a page multiple).
+    reserved_bytes: usize = 0,
+
+    /// Files this size or larger keep a private mapping instead.
+    pub const mmap_threshold: usize = 128 << 10;
+    /// Size of one segment, header included. A page multiple, so a segment
+    /// pays no rounding of its own. The tail abandoned when a file does not
+    /// fit is at most one file's worth (< `mmap_threshold`, ~5 KB typical).
+    pub const segment_size: usize = 1 << 20;
+
+    const Segment = struct {
+        next: ?*Segment,
+        /// Size of this allocation, header included.
+        size: usize,
+
+        fn payload(seg: *Segment) []u8 {
+            const base: [*]align(@alignOf(Segment)) u8 = @ptrCast(seg);
+            return base[@sizeOf(Segment)..seg.size];
+        }
+    };
+
+    /// Reserve `n` bytes that keep their address for the life of the pack.
+    pub fn reserve(p: *Pack, n: usize) Allocator.Error![]u8 {
+        const need_segment = if (p.first) |seg| p.used + n > seg.payload().len else true;
+        if (need_segment) {
+            const size = @max(segment_size, @sizeOf(Segment) + n);
+            const raw = try std.heap.page_allocator.alignedAlloc(u8, .of(Segment), size);
+            const seg: *Segment = @ptrCast(raw.ptr);
+            seg.* = .{ .next = p.first, .size = size };
+            p.first = seg;
+            p.used = 0;
+            p.reserved_bytes += size;
+        }
+        const buf = p.first.?.payload()[p.used..][0..n];
+        p.used += n;
+        p.text_bytes += n;
+        return buf;
+    }
+
+    /// Frees every segment. Invalidates all source text handed out.
+    pub fn deinit(p: *Pack) void {
+        var it = p.first;
+        while (it) |seg| {
+            it = seg.next;
+            const raw: [*]align(@alignOf(Segment)) u8 = @ptrCast(seg);
+            std.heap.page_allocator.free(raw[0..seg.size]);
+        }
+        p.* = .{};
+    }
 };
 
 pub const Source = struct {
@@ -55,14 +136,15 @@ pub const Source = struct {
     }
 
     /// Load a file relative to the current working directory.
-    pub fn load(io: Io, alloc: Allocator, path: []const u8) !Source {
-        return loadInDir(io, Io.Dir.cwd(), alloc, path);
+    pub fn load(io: Io, alloc: Allocator, path: []const u8, pack: ?*Pack) !Source {
+        return loadInDir(io, Io.Dir.cwd(), alloc, path, pack);
     }
 
-    /// Load a file. Tries mmap first; falls back to reading the file into
-    /// `alloc` (an arena) if mapping is unsupported. `line_starts` is always
-    /// allocated from `alloc`.
-    pub fn loadInDir(io: Io, dir: Io.Dir, alloc: Allocator, path: []const u8) !Source {
+    /// Load a file. Small files are read into `pack` (see `Pack`); larger
+    /// ones are mapped, falling back to reading into `alloc` (an arena) if
+    /// mapping is unsupported. `line_starts` is always allocated from
+    /// `alloc`. A null `pack` maps every file, as before.
+    pub fn loadInDir(io: Io, dir: Io.Dir, alloc: Allocator, path: []const u8, pack: ?*Pack) !Source {
         const file = try dir.openFile(io, path, .{});
         defer file.close(io);
 
@@ -77,6 +159,22 @@ pub const Source = struct {
                 .line_starts = try computeLineStarts(alloc, &.{}),
                 .backing = .owned,
             };
+        }
+
+        if (size < Pack.mmap_threshold) {
+            if (pack) |p| {
+                const buf = try p.reserve(size);
+                // A short read means the file shrank under us; keep what we
+                // got rather than exposing uninitialized segment bytes.
+                const n = try file.readPositionalAll(io, buf, 0);
+                const bytes = buf[0..n];
+                return .{
+                    .path = path,
+                    .bytes = bytes,
+                    .line_starts = try computeLineStarts(alloc, bytes),
+                    .backing = .pooled,
+                };
+            }
         }
 
         if (Io.File.MemoryMap.create(io, file, .{
@@ -102,11 +200,12 @@ pub const Source = struct {
     }
 
     /// Releases the mapping if any. Arena-allocated memory (line table,
-    /// fallback bytes) is released with the arena, not here.
+    /// fallback bytes) is released with the arena, and packed text with the
+    /// `Pack`, not here.
     pub fn deinit(s: *Source, io: Io) void {
         switch (s.backing) {
             .mapped => |*map| map.destroy(io),
-            .owned, .borrowed => {},
+            .pooled, .owned, .borrowed => {},
         }
         s.* = undefined;
     }
@@ -203,10 +302,61 @@ test "load via mmap round-trips file contents" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "hello.ts", .data = "const x = 1;\nconst y = 2;\n" });
 
-    var src = try Source.loadInDir(io, tmp.dir, arena.allocator(), "hello.ts");
+    var src = try Source.loadInDir(io, tmp.dir, arena.allocator(), "hello.ts", null);
     defer src.deinit(io);
 
+    try std.testing.expect(src.backing == .mapped);
     try std.testing.expectEqualStrings("const x = 1;\nconst y = 2;\n", src.bytes);
     try std.testing.expectEqual(@as(u32, 2), src.lineCount());
     try std.testing.expectEqual(LineCol{ .line = 1, .col = 6 }, src.lineCol(19));
+}
+
+test "packed load: small files share a segment, big ones stay mapped" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.ts", .data = "const a = 1;\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.ts", .data = "const b = 2;\nconst c = 3;\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "empty.ts", .data = "" });
+
+    const big = try std.testing.allocator.alloc(u8, Pack.mmap_threshold + 7);
+    defer std.testing.allocator.free(big);
+    @memset(big, 'x');
+    big[big.len - 1] = '\n';
+    try tmp.dir.writeFile(io, .{ .sub_path = "big.ts", .data = big });
+
+    var pack: Pack = .{};
+    defer pack.deinit();
+
+    const a = try Source.loadInDir(io, tmp.dir, arena.allocator(), "a.ts", &pack);
+    const b = try Source.loadInDir(io, tmp.dir, arena.allocator(), "b.ts", &pack);
+    const e = try Source.loadInDir(io, tmp.dir, arena.allocator(), "empty.ts", &pack);
+    var h = try Source.loadInDir(io, tmp.dir, arena.allocator(), "big.ts", &pack);
+    defer h.deinit(io);
+
+    try std.testing.expect(a.backing == .pooled);
+    try std.testing.expect(b.backing == .pooled);
+    try std.testing.expect(h.backing == .mapped); // over the threshold
+    try std.testing.expectEqualStrings("const a = 1;\n", a.bytes);
+    try std.testing.expectEqualStrings("const b = 2;\nconst c = 3;\n", b.bytes);
+    try std.testing.expectEqualStrings("", e.bytes);
+    try std.testing.expectEqualStrings(big, h.bytes);
+
+    // Packed end to end in one segment, no padding between files.
+    try std.testing.expectEqual(@as(usize, 1), pack.reserved_bytes / Pack.segment_size);
+    try std.testing.expectEqual(a.bytes.len + b.bytes.len, pack.text_bytes);
+    try std.testing.expectEqual(@intFromPtr(a.bytes.ptr) + a.bytes.len, @intFromPtr(b.bytes.ptr));
+
+    // Earlier text keeps its address once a later segment is added.
+    const a_ptr = a.bytes.ptr;
+    var i: usize = 0;
+    while (i < 2 * Pack.segment_size / Pack.mmap_threshold) : (i += 1) {
+        _ = try pack.reserve(Pack.mmap_threshold - 1);
+    }
+    try std.testing.expect(pack.reserved_bytes > 2 * Pack.segment_size);
+    try std.testing.expectEqual(a_ptr, a.bytes.ptr);
+    try std.testing.expectEqualStrings("const a = 1;\n", a.bytes);
 }

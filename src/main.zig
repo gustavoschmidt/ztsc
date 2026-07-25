@@ -284,6 +284,10 @@ const Worker = struct {
     arena: std.heap.ArenaAllocator,
     /// Scratch space for benchmark re-runs (`--repeat`); reset between runs.
     scratch: std.heap.ArenaAllocator,
+    /// Segments the worker's small source files are packed into, so the
+    /// front end pays no per-file page rounding. Private to the worker,
+    /// which is what makes the pack's bump cursor lock-free.
+    pack: ztsc.source.Pack = .{},
     thread: std.Thread = undefined,
     files_loaded: usize = 0,
 
@@ -334,7 +338,7 @@ const Worker = struct {
                 return;
             }
         else
-            Source.load(io, alloc, path) catch |err| {
+            Source.load(io, alloc, path, &w.pack) catch |err| {
                 c.err = err;
                 return;
             };
@@ -1266,7 +1270,15 @@ pub fn main(init: std.process.Init) !void {
         try out.print("  {s:<24} {d:>12}\n", .{ "  of which strings", istats.string_bytes });
         try out.print("  {s:<24} {d:>12}\n", .{ "line tables (in arenas)", line_table_bytes });
         try out.print("  {s:<24} {d:>12}\n", .{ "token arrays (in arenas)", token_bytes });
-        try out.print("  {s:<24} {d:>12}\n", .{ "mmapped source (file)", total_bytes });
+        var pack_text: usize = 0;
+        var pack_reserved: usize = 0;
+        for (workers) |*w| {
+            pack_text += w.pack.text_bytes;
+            pack_reserved += w.pack.reserved_bytes;
+        }
+        try out.print("  {s:<24} {d:>12}\n", .{ "source text (file)", total_bytes });
+        try out.print("  {s:<24} {d:>12}\n", .{ "  of which packed", pack_text });
+        try out.print("  {s:<24} {d:>12}\n", .{ "  pack segments", pack_reserved });
         try out.print("  {s:<24} {d:>12}\n", .{ "tokens", total_tokens });
         const bytes_per_token: f64 = if (total_tokens > 0)
             @as(f64, @floatFromInt(token_bytes)) / @as(f64, @floatFromInt(total_tokens))
