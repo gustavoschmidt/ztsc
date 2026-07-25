@@ -3054,6 +3054,20 @@ const Checker = struct {
     /// T[K] with literal / index-signature keys (non-generic subset).
     fn indexedAccessType(c: *Checker, obj: TypeId, idx: TypeId) Error!TypeId {
         const r = try c.resolveStructural(obj);
+        // An indexed access over a *union object* distributes over its members:
+        // `(A | B)[K]` = `A[K] | B[K]` (tsc's getIndexedAccessType). `propOfType`
+        // has no union arm, so without this a `(typeof arr)[number]['key']` shape
+        // (a union of object-literal element types indexed by a name) fell
+        // through to `unknown`, dropping the literal-key union — which then made
+        // `Record<that, V>`'s keys vanish from `keyof (Named & Record<…>)`.
+        if (c.ts.kind(r) == .union_type) {
+            var parts: std.ArrayList(TypeId) = .empty;
+            defer parts.deinit(c.scratch());
+            for (try c.memberList(r)) |m| {
+                try parts.append(c.scratch(), try c.indexedAccessType(m, idx));
+            }
+            return c.ts.makeUnion(c.scratch(), parts.items);
+        }
         switch (c.ts.kind(idx)) {
             .union_type => {
                 var parts: std.ArrayList(TypeId) = .empty;
