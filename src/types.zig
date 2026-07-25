@@ -378,6 +378,18 @@ pub const Store = struct {
         s.frozen = true;
     }
 
+    /// Release the store's own SoA arrays. Only meaningful when `alloc` is a
+    /// *freeing* allocator (the per-checker overlay); a store built on an arena
+    /// is released with the arena and never calls this.
+    pub fn deinit(s: *Store) void {
+        s.kinds.deinit(s.alloc);
+        s.data_a.deinit(s.alloc);
+        s.data_b.deinit(s.alloc);
+        s.extra.deinit(s.alloc);
+        s.pending.deinit(s.alloc);
+        s.map.deinit(s.alloc);
+    }
+
     fn appendRaw(s: *Store, k: Kind, a: u32, b: u32) Error!void {
         try s.kinds.append(s.alloc, k);
         try s.data_a.append(s.alloc, a);

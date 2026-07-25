@@ -767,7 +767,13 @@ const Checker = struct {
         c.inst_arena.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         errdefer c.inst_arena.deinit();
         const arena_alloc = c.carena.allocator();
-        c.ts = if (base) |b| try Store.initOverlay(arena_alloc, b) else try Store.init(arena_alloc);
+        // The store's SoA arrays are the checker's other big *growable*
+        // containers (see `cm`): `extra` alone reaches ~6 MB and, at the
+        // ArrayList 1.5× growth factor, strands ~2× that in abandoned
+        // predecessors when it lives on the arena. Overlay stores therefore
+        // grow on `cm()` and are `deinit`ed; the frozen *base* store keeps its
+        // caller-supplied arena (built once, shared read-only, never freed).
+        c.ts = if (base) |b| try Store.initOverlay(c.cm(), b) else try Store.init(arena_alloc);
         // Sized to include the merged-symbol range (ids ≥ totalSymbols()),
         // so merged ids are valid sym_types/sym_state indices. These
         // are indexed by *global* SymbolId — a checker reads them for foreign
@@ -843,6 +849,7 @@ const Checker = struct {
         c.diag_seen.deinit(c.gpa);
         c.diags.deinit(c.gpa);
         inline for (map_containers) |n| @field(c, n).deinit(c.cm());
+        if (c.ts.base != null) c.ts.deinit(); // overlay only; a base store is arena-owned
         c.carena.deinit();
         c.gpa.destroy(c.carena);
         c.scratch_arena.deinit();
