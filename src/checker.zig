@@ -320,6 +320,26 @@ const IfaceFrame = struct { sym: SymbolId, resolving_base: bool = false };
 /// constraint/default are already `M`-instantiated TypeIds (`no_type` = none).
 const FreshTp = struct { name: Atom, constraint: TypeId, default: TypeId, has_default: bool };
 
+/// Every long-lived `Checker` container whose storage comes from `cm()` (the
+/// freeing container allocator) rather than the checker arena. Listed once so
+/// `deinit` cannot fall behind the field set: a container added to `Checker`
+/// and fed from `cm()` but forgotten here leaks its whole table.
+const map_containers = [_][]const u8{
+    "node_types",             "sig_cache",          "node_scopes",
+    "reassigned_syms",        "reassigned_in_loop", "member_written_syms",
+    "member_written_in_loop", "ns_types",           "ambient_ns_types",
+    "relation",               "expansions",         "origin",
+    "iface_generic",          "iface_stack",        "pending_class_decos",
+    "class_inst_generic",     "class_static_cache", "class_static_base_active",
+    "enum_value_cache",       "enum_info_cache",    "alias_generic",
+    "alias_state",            "alias_recursive",    "flow_cache",
+    "ref_keys",               "da_cache",           "ctp_cache",
+    "cmp_cache",              "inst_cache",         "inst_map_ids",
+    "tp_constraint_cache",    "fresh_tp_ids",       "fresh_tp_info",
+    "type_node_cache",        "atom_cache",         "unique_sym_ids",
+    "infer_ids",              "infer_scopes",       "mapped_key_ids",
+};
+
 const Checker = struct {
     out: Allocator,
     io: Io,
@@ -822,6 +842,7 @@ const Checker = struct {
         c.sym_state.free();
         c.diag_seen.deinit(c.gpa);
         c.diags.deinit(c.gpa);
+        inline for (map_containers) |n| @field(c, n).deinit(c.cm());
         c.carena.deinit();
         c.gpa.destroy(c.carena);
         c.scratch_arena.deinit();
@@ -882,8 +903,32 @@ const Checker = struct {
     fn scratch(c: *Checker) Allocator {
         return c.scratch_arena.allocator();
     }
+    /// Allocator for stable, one-shot checker payload (never individually
+    /// freed): interned enum value arrays, canonical substitution-map key
+    /// bytes, the per-file flag arrays. Bump-allocated out of `carena`.
     fn ca(c: *Checker) Allocator {
         return c.carena.allocator();
+    }
+    /// Allocator for the checker's *growable* containers (`map_containers`:
+    /// every long-lived cache map / list below). These repeatedly realloc as
+    /// they double, and an arena cannot reuse a realloc predecessor's bytes —
+    /// it abandons them in place, still resident. On the dogfood project that dead tail was
+    /// ~59 MB *per checker* (~236 MB at `--checkers=4`), more than half of
+    /// every checker arena. Routing them to a freeing allocator instead makes
+    /// each grow hand the predecessor straight back (`smp_allocator` serves
+    /// anything ≥ 64 KiB — i.e. every one of these once it matters — directly
+    /// from `PageAllocator`, so the old buffer is unmapped, not pooled).
+    /// The arena keeps only what it is good at: payload that is written once
+    /// and lives to the end of the check.
+    ///
+    /// The containers must therefore be `deinit`ed (see `deinit`) — losing one
+    /// is a leak, which shows up as exactly the RSS this buys back. Safe by
+    /// construction w.r.t. output: none of them is ever *iterated* (all are
+    /// keyed point lookups) and no entry pointer is held across a later
+    /// insertion, so no diagnostic can depend on where their storage lands.
+    fn cm(c: *Checker) Allocator {
+        _ = c;
+        return std.heap.smp_allocator;
     }
 
     // =====================================================================
@@ -1054,7 +1099,7 @@ const Checker = struct {
     // =====================================================================
 
     fn atom(c: *Checker, text: []const u8) Error!Atom {
-        const gop = try c.atom_cache.getOrPut(c.ca(), text);
+        const gop = try c.atom_cache.getOrPut(c.cm(), text);
         if (!gop.found_existing) {
             gop.value_ptr.* = try c.interner.intern(c.io, c.gpa, text);
         }
@@ -1109,7 +1154,7 @@ const Checker = struct {
     /// the same annotation — the declared type of the const, and thus every
     /// value reference to it — yields the identical nominal type.
     fn uniqueSymType(c: *Checker, ann: Node) Error!TypeId {
-        const gop = try c.unique_sym_ids.getOrPut(c.ca(), (@as(u64, c.cur_file) << 32) | ann);
+        const gop = try c.unique_sym_ids.getOrPut(c.cm(), (@as(u64, c.cur_file) << 32) | ann);
         if (!gop.found_existing) {
             gop.value_ptr.* = c.unique_sym_next;
             c.unique_sym_next += 1;
@@ -1338,12 +1383,12 @@ const Checker = struct {
     /// right-sizing). First scope wins because `scope_owners` is walked in
     /// ascending scope order and only unset keys are written.
     fn faultScopes(c: *Checker, f: FileId) Error!void {
-        const arena_alloc = c.carena.allocator();
+        const map_alloc = c.cm();
         const b = c.prog.files[f].bind;
         for (b.scope_owners, 0..) |owner, s| {
             if (s == 0) continue;
             const key = (@as(u64, @intCast(f)) << 32) | owner;
-            const gop = try c.node_scopes.getOrPut(arena_alloc, key);
+            const gop = try c.node_scopes.getOrPut(map_alloc, key);
             if (!gop.found_existing) gop.value_ptr.* = @intCast(s);
         }
         c.scopes_faulted[f] = true;
@@ -2051,7 +2096,7 @@ const Checker = struct {
             if (c.type_node_cache.get(key)) |t| return t;
         }
         const result = try c.typeFromTypeNodeUncached(node);
-        if (cacheable) try c.type_node_cache.put(c.ca(), key, result);
+        if (cacheable) try c.type_node_cache.put(c.cm(), key, result);
         return result;
     }
 
@@ -3590,7 +3635,7 @@ const Checker = struct {
                 (c.nodeTag(node) == .arrow_fn or c.nodeTag(node) == .function_expr or
                     c.nodeTag(node) == .function_decl or c.nodeTag(node) == .class_method))
             {
-                try c.sig_cache.put(c.ca(), c.nodeKey(node), .{ .ty = try c.ts.makeFunction(params.items, try c.makePromise(types.any_type), tps.items, if (is_method) types.fn_flag_method else 0), .ctx = ctx_sig });
+                try c.sig_cache.put(c.cm(), c.nodeKey(node), .{ .ty = try c.ts.makeFunction(params.items, try c.makePromise(types.any_type), tps.items, if (is_method) types.fn_flag_method else 0), .ctx = ctx_sig });
                 const payload = try c.awaitedType(try c.inferReturnType(node, c.tree.nodeData(node).rhs, if (ret_ctx != types.no_type) try c.awaitedType(ret_ctx) else types.no_type));
                 ret = try c.makePromise(payload);
             } else {
@@ -3606,7 +3651,7 @@ const Checker = struct {
         {
             // Reserve the cache slot to break recursion (self-recursive
             // unannotated functions infer any, TS7023-adjacent).
-            try c.sig_cache.put(c.ca(), c.nodeKey(node), .{ .ty = try c.ts.makeFunction(params.items, types.any_type, tps.items, if (is_method) types.fn_flag_method else 0), .ctx = ctx_sig });
+            try c.sig_cache.put(c.cm(), c.nodeKey(node), .{ .ty = try c.ts.makeFunction(params.items, types.any_type, tps.items, if (is_method) types.fn_flag_method else 0), .ctx = ctx_sig });
             ret = try c.inferReturnType(node, c.tree.nodeData(node).rhs, ret_ctx);
         } else if (proto.flags & (ast.Flags.get) != 0) {
             ret = types.any_type;
@@ -3626,7 +3671,7 @@ const Checker = struct {
         }
 
         const sig = try c.ts.makeFunctionThis(params.items, ret, tps.items, if (is_method) types.fn_flag_method else 0, pred, this_ty);
-        try c.sig_cache.put(c.ca(), c.nodeKey(node), .{ .ty = sig, .ctx = ctx_sig });
+        try c.sig_cache.put(c.cm(), c.nodeKey(node), .{ .ty = sig, .ctx = ctx_sig });
         return sig;
     }
 
@@ -4249,7 +4294,7 @@ const Checker = struct {
             if (t == types.no_type) return types.any_type; // ns cycle
             return t;
         }
-        try c.ns_types.put(c.ca(), file, types.no_type);
+        try c.ns_types.put(c.cm(), file, types.no_type);
         // `export = X` module (e.g. `@types/react` `export = React`): the value
         // namespace object is the value type of the export-equals target, not an
         // empty object built from the (absent) named exports. `typeof
@@ -4258,7 +4303,7 @@ const Checker = struct {
             if (c.prog.links[file].exportTarget(c.prog.export_equals_atom)) |eq| {
                 if (!eq.type_only) {
                     const t = try c.targetValueType(eq);
-                    try c.ns_types.put(c.ca(), file, t);
+                    try c.ns_types.put(c.cm(), file, t);
                     return t;
                 }
             }
@@ -4299,7 +4344,7 @@ const Checker = struct {
         // merge through the export-table path above).
         try c.appendAugmentedModuleExports(file, &props);
         const obj = try c.ts.makeObject(props.items, 0, 0, 0);
-        try c.ns_types.put(c.ca(), file, obj);
+        try c.ns_types.put(c.cm(), file, obj);
         return obj;
     }
 
@@ -4349,7 +4394,7 @@ const Checker = struct {
             if (t == types.no_type) return types.any_type; // cycle
             return t;
         }
-        try c.ambient_ns_types.put(c.ca(), idx, types.no_type);
+        try c.ambient_ns_types.put(c.cm(), idx, types.no_type);
         var props: std.ArrayList(types.Prop) = .empty;
         defer props.deinit(c.scratch());
         const ae = c.prog.ambient_exports[idx];
@@ -4360,7 +4405,7 @@ const Checker = struct {
             try props.append(c.scratch(), .{ .name = name, .ty = ty, .flags = types.prop_flag_readonly });
         }
         const obj = try c.ts.makeObject(props.items, 0, 0, 0);
-        try c.ambient_ns_types.put(c.ca(), idx, obj);
+        try c.ambient_ns_types.put(c.cm(), idx, obj);
         return obj;
     }
 
@@ -4650,7 +4695,7 @@ const Checker = struct {
             // In-progress: recursive alias; leave a lazy ref. Record the
             // self-recursion so `fixTypeArgs` can scope its accumulator-default
             // substitution to genuinely recursive aliases.
-            try c.alias_recursive.put(c.ca(), sym, {});
+            try c.alias_recursive.put(c.cm(), sym, {});
             const fixed = try c.fixTypeArgs(sym, args, tok) orelse return types.error_type;
             return c.ts.makeRef(sym, fixed);
         }
@@ -4673,13 +4718,13 @@ const Checker = struct {
         // Origin tag (see `origin`): a one-step alias instantiation carries the
         // canonical `makeRef(sym, fixed)` so the reflexive fast-path can match
         // it against a two-step re-instantiation of the same alias object.
-        if (originTaggable(c.ts.kind(reduced))) try c.origin.put(c.ca(), reduced, orig);
+        if (originTaggable(c.ts.kind(reduced))) try c.origin.put(c.cm(), reduced, orig);
         return reduced;
     }
 
     fn aliasGeneric(c: *Checker, sym: SymbolId) Error!TypeId {
         if (c.alias_generic.get(sym)) |t| return t;
-        try c.alias_state.put(c.ca(), sym, 1);
+        try c.alias_state.put(c.cm(), sym, 1);
         const saved_ctx = c.enterSymFile(sym);
         defer c.restoreCtx(saved_ctx);
         // The alias body is a separate lexical declaration: its own type params
@@ -4717,8 +4762,8 @@ const Checker = struct {
             }
             result = types.error_type;
         }
-        try c.alias_generic.put(c.ca(), sym, result);
-        try c.alias_state.put(c.ca(), sym, 2);
+        try c.alias_generic.put(c.cm(), sym, result);
+        try c.alias_state.put(c.cm(), sym, 2);
         return result;
     }
 
@@ -4740,7 +4785,7 @@ const Checker = struct {
             if (t == types.no_type) return types.error_type; // cycle
             return t;
         }
-        try c.expansions.put(c.ca(), ref, types.no_type); // in-progress
+        try c.expansions.put(c.cm(), ref, types.no_type); // in-progress
         const sym = c.ts.refSymbol(ref);
         const args = try c.scratch().dupe(TypeId, c.ts.refArgs(ref));
         const f = c.symFlags(sym);
@@ -4779,8 +4824,8 @@ const Checker = struct {
         // re-materialization of the SAME `ref` relates by identity. Only
         // objects are tagged — a ref that resolved to a union/primitive/etc.
         // is already compared by its own rules.
-        if (originTaggable(c.ts.kind(result))) try c.origin.put(c.ca(), result, ref);
-        try c.expansions.put(c.ca(), ref, result);
+        if (originTaggable(c.ts.kind(result))) try c.origin.put(c.cm(), result, ref);
+        try c.expansions.put(c.cm(), ref, result);
         return result;
     }
 
@@ -5057,8 +5102,8 @@ const Checker = struct {
             }
             return t;
         }
-        try c.iface_generic.put(c.ca(), sym, types.no_type);
-        try c.iface_stack.append(c.ca(), .{ .sym = sym });
+        try c.iface_generic.put(c.cm(), sym, types.no_type);
+        try c.iface_stack.append(c.cm(), .{ .sym = sym });
         defer _ = c.iface_stack.pop();
 
         // Constituents: a within-file interface is one symbol carrying every
@@ -5095,7 +5140,7 @@ const Checker = struct {
             if (!c.symFlags(csym).interface) continue;
             result = try c.interfaceConstituentApplyBases(csym, result);
         }
-        try c.iface_generic.put(c.ca(), sym, result);
+        try c.iface_generic.put(c.cm(), sym, result);
         return result;
     }
 
@@ -5282,7 +5327,7 @@ const Checker = struct {
             if (t == types.no_type) return types.error_type;
             return t;
         }
-        try c.class_inst_generic.put(c.ca(), sym, types.no_type);
+        try c.class_inst_generic.put(c.cm(), sym, types.no_type);
         const saved_ctx = c.enterSymFile(sym);
         defer c.restoreCtx(saved_ctx);
         // `this` inside member type nodes (a `foo(): this` return, a `x: this`
@@ -5350,7 +5395,7 @@ const Checker = struct {
                 result = try c.mergeBaseObject(result, try c.interfaceConstituentDirect(p), true);
             }
         }
-        try c.class_inst_generic.put(c.ca(), sym, result);
+        try c.class_inst_generic.put(c.cm(), sym, result);
         return result;
     }
 
@@ -5743,7 +5788,7 @@ const Checker = struct {
             .has_computed = has_computed,
             .values = try c.ca().dupe(f64, values.items),
         };
-        try c.enum_info_cache.put(c.ca(), sym, info);
+        try c.enum_info_cache.put(c.cm(), sym, info);
         return info;
     }
 
@@ -5840,7 +5885,7 @@ const Checker = struct {
             }
         }
         const result = try c.ts.makeObject(props.items, 0, 0, 0);
-        try c.enum_value_cache.put(c.ca(), sym, result);
+        try c.enum_value_cache.put(c.cm(), sym, result);
         return result;
     }
 
@@ -5996,13 +6041,13 @@ const Checker = struct {
         // function and must still see the class's own members.
         if (!c.class_static_base_active.contains(sym)) {
             if (try c.baseClassSym(sym)) |base| {
-                try c.class_static_base_active.put(c.ca(), sym, {});
+                try c.class_static_base_active.put(c.cm(), sym, {});
                 const base_static = try c.classStaticType(base);
                 _ = c.class_static_base_active.remove(sym);
                 result = try c.mergeBaseObject(result, base_static, false);
             }
         }
-        try c.class_static_cache.put(c.ca(), sym, result);
+        try c.class_static_cache.put(c.cm(), sym, result);
         return result;
     }
 
@@ -6222,9 +6267,9 @@ const Checker = struct {
         if (c.ctp_cache.get(t)) |v| {
             if (v != 0) return v == 2;
         }
-        try c.ctp_cache.put(c.ca(), t, 1); // assume no while computing (cycles)
+        try c.ctp_cache.put(c.cm(), t, 1); // assume no while computing (cycles)
         const result = try c.containsTypeParamInner(t);
-        try c.ctp_cache.put(c.ca(), t, if (result) 2 else 1);
+        try c.ctp_cache.put(c.cm(), t, if (result) 2 else 1);
         return result;
     }
 
@@ -6454,7 +6499,7 @@ const Checker = struct {
             std.mem.writeInt(u32, bytes[i * 8 ..][0..4], m.sym, .little);
             std.mem.writeInt(u32, bytes[i * 8 + 4 ..][0..4], m.ty, .little);
         }
-        const gop = try c.inst_map_ids.getOrPut(c.ca(), bytes);
+        const gop = try c.inst_map_ids.getOrPut(c.cm(), bytes);
         if (!gop.found_existing) {
             gop.key_ptr.* = try c.ca().dupe(u8, bytes); // scratch is reset per stmt
             gop.value_ptr.* = c.inst_map_next;
@@ -6483,11 +6528,11 @@ const Checker = struct {
     fn mintFreshTp(c: *Checker, orig: SymbolId, map: []const TpMap, map_id: ?u32, constraint: TypeId, default: TypeId, has_default: bool) Error!u32 {
         const mid: u32 = map_id orelse try c.canonMapId(map);
         const key = (@as(u64, orig) << 32) | mid;
-        const gop = try c.fresh_tp_ids.getOrPut(c.ca(), key);
+        const gop = try c.fresh_tp_ids.getOrPut(c.cm(), key);
         if (!gop.found_existing) {
             gop.value_ptr.* = c.fresh_tp_next;
             c.fresh_tp_next += 1;
-            try c.fresh_tp_info.append(c.ca(), .{
+            try c.fresh_tp_info.append(c.cm(), .{
                 .name = c.symNameAtom(orig),
                 .constraint = constraint,
                 .default = default,
@@ -6560,7 +6605,7 @@ const Checker = struct {
         defer oargs.deinit(c.scratch());
         for (c.ts.refArgs(orig_ref)) |a| try oargs.append(c.scratch(), try c.instantiateId(a, map, map_id));
         const new_ref = try c.ts.makeRef(c.ts.refSymbol(orig_ref), oargs.items);
-        try c.origin.put(c.ca(), result, new_ref);
+        try c.origin.put(c.cm(), result, new_ref);
     }
 
     /// Memoized recursive substitution. `map_id` (when non-null) canonically
@@ -6836,7 +6881,7 @@ const Checker = struct {
         // Memoize only when nothing below tripped the limit (a truncated result
         // is depth-dependent, not a pure function of `(t, map)`).
         if (map_id) |mid| {
-            if (!c.inst_limit_tripped) try c.inst_cache.put(c.ca(), (@as(u64, mid) << 32) | t, result);
+            if (!c.inst_limit_tripped) try c.inst_cache.put(c.cm(), (@as(u64, mid) << 32) | t, result);
         }
         return result;
     }
@@ -6957,7 +7002,7 @@ const Checker = struct {
     /// Dense, stable id for an `infer V` binder in conditional `cond`
     /// (a nodeKey). Same (conditional, name) → same id.
     fn inferVarId(c: *Checker, cond: u64, name: Atom) Error!u32 {
-        const gop = try c.infer_ids.getOrPut(c.ca(), .{ .cond = cond, .name = name });
+        const gop = try c.infer_ids.getOrPut(c.cm(), .{ .cond = cond, .name = name });
         if (!gop.found_existing) {
             gop.value_ptr.* = c.infer_next;
             c.infer_next += 1;
@@ -6987,7 +7032,7 @@ const Checker = struct {
         // conditional inside the true branch still resolves this conditional's
         // infer vars — the check clause above was already evaluated under the
         // enclosing scopes only.
-        try c.infer_scopes.append(c.ca(), c.nodeKey(node));
+        try c.infer_scopes.append(c.cm(), c.nodeKey(node));
         const extends_ty = try c.typeFromTypeNode(e.extends_type);
         const true_ty = try c.typeFromTypeNode(e.true_type);
         _ = c.infer_scopes.pop();
@@ -7833,7 +7878,7 @@ const Checker = struct {
     /// mapped-type nodeKey. Mapped nodes are excluded from the type-node memo,
     /// so the node may be re-evaluated — the id must be stable across calls.
     fn mappedKeyId(c: *Checker, node: Node) Error!u32 {
-        const gop = try c.mapped_key_ids.getOrPut(c.ca(), c.nodeKey(node));
+        const gop = try c.mapped_key_ids.getOrPut(c.cm(), c.nodeKey(node));
         if (!gop.found_existing) {
             gop.value_ptr.* = c.mapped_key_next;
             c.mapped_key_next += 1;
@@ -8363,9 +8408,9 @@ const Checker = struct {
         if (c.cmp_cache.get(t)) |v| {
             if (v != 0) return v == 2;
         }
-        try c.cmp_cache.put(c.ca(), t, 1);
+        try c.cmp_cache.put(c.cm(), t, 1);
         const r = try c.containsMappedParamInner(t);
-        try c.cmp_cache.put(c.ca(), t, if (r) 2 else 1);
+        try c.cmp_cache.put(c.cm(), t, if (r) 2 else 1);
         return r;
     }
 
@@ -9290,7 +9335,7 @@ const Checker = struct {
             if (c.tp_constraint_cache.get(sym)) |t| return t;
         }
         const result = try c.typeParamConstraintUncached(sym);
-        if (c.inst_cache_on) try c.tp_constraint_cache.put(c.ca(), sym, result);
+        if (c.inst_cache_on) try c.tp_constraint_cache.put(c.cm(), sym, result);
         return result;
     }
 
@@ -9752,10 +9797,10 @@ const Checker = struct {
                 return v == 1;
             }
             c.stats.relation_misses += 1;
-            try c.relation.put(c.ca(), key, 2);
+            try c.relation.put(c.cm(), key, 2);
         }
         const result = try c.isAssignableInner(s, t, sk, tk);
-        if (cacheable) try c.relation.put(c.ca(), key, @intFromBool(result));
+        if (cacheable) try c.relation.put(c.cm(), key, @intFromBool(result));
         return result;
     }
 
@@ -10960,7 +11005,7 @@ const Checker = struct {
         }
         c.stats.node_type_misses += 1;
         const t = try c.checkExpr(node, ctx);
-        try c.node_types.put(c.ca(), key, .{ .ty = t, .ctx = ctx });
+        try c.node_types.put(c.cm(), key, .{ .ty = t, .ctx = ctx });
         return t;
     }
 
@@ -14629,7 +14674,7 @@ const Checker = struct {
     fn mintReverseElemVar(c: *Checker, name: Atom) Error!u32 {
         const id = c.fresh_tp_next;
         c.fresh_tp_next += 1;
-        try c.fresh_tp_info.append(c.ca(), .{ .name = name, .constraint = types.no_type, .default = types.no_type, .has_default = false });
+        try c.fresh_tp_info.append(c.cm(), .{ .name = name, .constraint = types.no_type, .default = types.no_type, .has_default = false });
         return id;
     }
 
@@ -14914,7 +14959,7 @@ const Checker = struct {
     const SymLoop = struct { sym: SymbolId, scope: ScopeId };
 
     fn refKeyIndex(c: *Checker, key: RefKey) Error!u32 {
-        const gop = try c.ref_keys.getOrPut(c.ca(), key);
+        const gop = try c.ref_keys.getOrPut(c.cm(), key);
         if (!gop.found_existing) gop.value_ptr.* = @intCast(c.ref_keys.count());
         return gop.value_ptr.*;
     }
@@ -15053,9 +15098,9 @@ const Checker = struct {
             if (t == types.no_type) return declared; // in progress (loop)
             return t;
         }
-        try c.flow_cache.put(c.ca(), q, types.no_type);
+        try c.flow_cache.put(c.cm(), q, types.no_type);
         const result = try c.flowTypeInner(flow, key, declared, depth);
-        try c.flow_cache.put(c.ca(), q, result);
+        try c.flow_cache.put(c.cm(), q, result);
         return result;
     }
 
@@ -15724,12 +15769,12 @@ const Checker = struct {
     /// assigned *inside that loop*. The ancestor walk means an assignment nested
     /// N loops deep marks all N enclosing loops.
     fn recordReassign(c: *Checker, sym: SymbolId, scope: ScopeId) Error!void {
-        try c.reassigned_syms.put(c.ca(), sym, {});
+        try c.reassigned_syms.put(c.cm(), sym, {});
         const b = c.bind;
         var s = scope;
         while (true) {
             if (b.scope_kinds[s] == .for_head)
-                try c.reassigned_in_loop.put(c.ca(), .{ .sym = sym, .scope = s }, {});
+                try c.reassigned_in_loop.put(c.cm(), .{ .sym = sym, .scope = s }, {});
             const p = b.scope_parents[s];
             if (p == s) break;
             s = p;
@@ -15810,12 +15855,12 @@ const Checker = struct {
     /// Mirror of `recordReassign` for member/element writes: record the root as
     /// member-written file-wide and inside every enclosing `for` loop.
     fn recordMemberWrite(c: *Checker, sym: SymbolId, scope: ScopeId) Error!void {
-        try c.member_written_syms.put(c.ca(), sym, {});
+        try c.member_written_syms.put(c.cm(), sym, {});
         const b = c.bind;
         var s = scope;
         while (true) {
             if (b.scope_kinds[s] == .for_head)
-                try c.member_written_in_loop.put(c.ca(), .{ .sym = sym, .scope = s }, {});
+                try c.member_written_in_loop.put(c.cm(), .{ .sym = sym, .scope = s }, {});
             const p = b.scope_parents[s];
             if (p == s) break;
             s = p;
@@ -16339,9 +16384,9 @@ const Checker = struct {
             if (v == 2) return true; // optimistic on loops
             return v == 1;
         }
-        try c.da_cache.put(c.ca(), key, 2);
+        try c.da_cache.put(c.cm(), key, 2);
         const result = try c.definitelyAssignedInner(flow, sym);
-        try c.da_cache.put(c.ca(), key, @intFromBool(result));
+        try c.da_cache.put(c.cm(), key, @intFromBool(result));
         return result;
     }
 
@@ -16480,7 +16525,7 @@ const Checker = struct {
             .break_stmt, .continue_stmt => {},
             .labeled_stmt => try c.checkStatement(d.lhs),
             .function_decl => try c.checkFunctionDecl(node),
-            .decorator => try c.pending_class_decos.append(c.ca(), node),
+            .decorator => try c.pending_class_decos.append(c.cm(), node),
             .class_decl => try c.checkClass(node),
             .interface_decl => try c.checkInterfaceDecl(node),
             .type_alias => try c.checkTypeAliasDecl(node),
