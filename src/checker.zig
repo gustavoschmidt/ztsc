@@ -9785,6 +9785,19 @@ const Checker = struct {
             for (try c.memberList(t)) |m| {
                 if (try c.isAssignable(s, m)) return true;
             }
+            // A type-parameter source whose constraint is itself a union
+            // relates to the union target as a WHOLE, not member-by-member:
+            // the loop above tries `T` against each member and misses that the
+            // constraint union satisfies the target union — the
+            // `<T extends AllGeoJSON>(f: T): T` residue where `T` flows into a
+            // generic call parameter typed by the same union constraint. Added
+            // strictly as a fallback (after single-member matching) so nothing
+            // previously accepted changes.
+            if (sk == .type_param) {
+                const constraint = try c.typeParamConstraint(c.ts.typeParamSymbol(s));
+                if (constraint != types.no_type and c.ts.kind(try c.resolveStructural(constraint)) == .union_type and
+                    try c.isAssignable(constraint, t)) return true;
+            }
             // Discriminated-union normalization: a source object whose
             // discriminant property is a union may still be assignable to a
             // union target that splits that discriminant across members, even
