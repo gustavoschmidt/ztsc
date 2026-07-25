@@ -13465,7 +13465,14 @@ const Checker = struct {
             }
         }
 
-        const result = try c.resolveSignatureCall(node, sigs.items, targs.items, shape.arg_nodes, instance_ret, if (is_new) types.no_type else ctx);
+        // For `new`, thread the contextual type only when the construct sig's
+        // own return drives inference (a construct-sig object like
+        // `PromiseConstructor`/`ArrayConstructor`, `instance_ret == no_type`).
+        // A class-value `new` already inferred its class type args and overrides
+        // the return via `instance_ret`, so contextual return inference there is
+        // both moot and a needless perturbation.
+        const call_ctx = if (is_new and instance_ret != types.no_type) types.no_type else ctx;
+        const result = try c.resolveSignatureCall(node, sigs.items, targs.items, shape.arg_nodes, instance_ret, call_ctx);
         return result;
     }
 
@@ -16588,7 +16595,19 @@ const Checker = struct {
             return;
         };
         if (d.lhs != 0) {
-            const rt = try c.checkExprCached(d.lhs, ctx.ret_ann);
+            // Contextual type of the return expression. For async, tsc's
+            // `getContextualTypeForReturnExpression` yields `T | Promise<T>`
+            // (awaited payload OR a promise of it), so a returned generic
+            // call/`new` whose own return is `Promise<R>` infers `R` from the
+            // promise arm (`return new Promise(()=>{})` → `Promise<T>`;
+            // `return axios.delete(...)` → `Promise<R=T>`). The assignability
+            // check below still relates the *awaited* value to `ctx.ret_ann`.
+            const expr_ctx = if (ctx.is_async and ctx.ret_ann != types.no_type and
+                ctx.ret_ann != types.error_type and c.ts.kind(ctx.ret_ann) != .none)
+                try c.makeUnion2(ctx.ret_ann, try c.makePromise(ctx.ret_ann))
+            else
+                ctx.ret_ann;
+            const rt = try c.checkExprCached(d.lhs, expr_ctx);
             // async: `return v` in a `Promise<T>` relates the awaited `v` to the
             // payload `T` (so `return somePromise` is not double-wrapped).
             const eff_rt = if (ctx.is_async) try c.awaitedType(rt) else rt;
