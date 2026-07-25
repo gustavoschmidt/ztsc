@@ -10331,8 +10331,17 @@ const Checker = struct {
         const bivariant = (c.ts.fnFlags(s) & types.fn_flag_method != 0) or
             (c.ts.fnFlags(t) & types.fn_flag_method != 0);
         // Erase generics to their constraints (documented simplification).
-        const se = try c.eraseTypeParams(s);
+        var se = try c.eraseTypeParams(s);
         const te = try c.eraseTypeParams(t);
+        // The source may be an arrow contextually typed by the generic target:
+        // its param/return types then reference the TARGET's type-param symbols
+        // as free params (the arrow itself carries no type params, so
+        // `eraseTypeParams(s)` left them intact). Erase those against the
+        // target's constraints too, so both sides collapse the shared params
+        // consistently — the `renderHook`/`typeof base` higher-order wrapper.
+        if (c.ts.fnTypeParams(s).len == 0 and c.ts.fnTypeParams(t).len > 0) {
+            se = try c.eraseParamsOf(se, t);
+        }
         if (try c.requiredParams(se) > c.paramTotal(te)) return false;
         const s_count = c.ts.fnParamCount(se);
         const t_count = c.ts.fnParamCount(te);
@@ -10457,8 +10466,19 @@ const Checker = struct {
     }
 
     fn eraseTypeParams(c: *Checker, sig: TypeId) Error!TypeId {
+        return c.eraseParamsOf(sig, sig);
+    }
+
+    /// Erase `sig`'s free references to the type parameters OWNED BY `owner`
+    /// (usually `sig` itself). Split out so a signature can also be erased
+    /// against ANOTHER signature's type params: an arrow contextually typed by
+    /// a generic target references the TARGET's type-param symbols as free
+    /// params (the arrow itself is non-generic), and both sides must collapse
+    /// those shared params to the same constraints to relate — tsc generalizes
+    /// the arrow over the contextual signature's type params, then erases both.
+    fn eraseParamsOf(c: *Checker, sig: TypeId, owner: TypeId) Error!TypeId {
         // Non-generic early-out before the dupe (the common case).
-        const sig_tps = c.ts.fnTypeParams(sig);
+        const sig_tps = c.ts.fnTypeParams(owner);
         if (sig_tps.len == 0) return sig;
         const tps = try c.scratch().dupe(u32, sig_tps);
         // Fixed base-constraint mapper: each type param → its declared
