@@ -598,6 +598,23 @@ pub fn main(init: std.process.Init) !void {
         .scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator),
     };
 
+    // Transient allocator for module resolution: candidate path strings and
+    // package.json bodies are discarded after each file's specifiers
+    // resolve. Mirrors the serial buildProgram path (modules.zig). Reset per
+    // file so it never grows past one file's resolution working set.
+    var resolve_scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer resolve_scratch.deinit();
+
+    // Resolution memo: the same specifier imported from many files
+    // resolves once. Lives in `arena` (spans the whole discovery run). Created
+    // before the program roots are seeded because they, too, go through its
+    // canonical-path step (see below).
+    var rcache = modules.ResolveCache.init(arena, !cli.no_resolve_cache, .{
+        .resolve_json = config_resolve_json,
+        .base_url = config_base_url,
+        .allow_js = config_allow_js,
+    });
+
     // --- Single-owner discovery (no wave barrier) --------------------------
     // The main thread is the sole owner of the module graph and seen-set;
     // workers front-end one file at a time and push completions; the main
@@ -614,14 +631,24 @@ pub fn main(init: std.process.Init) !void {
         try path_ids.put(arena, lf.path, @intCast(paths.items.len));
         try paths.append(arena, lf.path);
     }
+    // Program roots. A root under `node_modules` — in practice the auto-included
+    // `@types/*` ambient roots, which pnpm exposes as symlinks into its store —
+    // is keyed by its canonical path, the same identity the module resolver
+    // gives the very same file when an `import` reaches it. Without that step
+    // `node_modules/@types/react/index.d.ts` and the store path behind the
+    // symlink are two files with two symbol universes. Outside `node_modules`
+    // the call is a no-op, so project roots keep the path the user typed (and
+    // pay no realpath syscall).
     for (entry_paths) |p| {
         const norm = try modules.normalizePath(arena, p);
-        const gop = try path_ids.getOrPut(arena, norm);
+        const key = try rcache.canonicalPath(io, resolve_scratch.allocator(), Io.Dir.cwd(), norm);
+        const gop = try path_ids.getOrPut(arena, key);
         if (!gop.found_existing) {
             gop.value_ptr.* = @intCast(paths.items.len);
-            try paths.append(arena, norm);
+            try paths.append(arena, key);
         }
     }
+    _ = resolve_scratch.reset(.retain_capacity);
     const n_entries = paths.items.len;
 
     var results: std.ArrayList(?Source) = .empty;
@@ -664,20 +691,6 @@ pub fn main(init: std.process.Init) !void {
         outstanding += 1;
     }
 
-    // Transient allocator for module resolution: candidate path strings and
-    // package.json bodies are discarded after each file's specifiers
-    // resolve. Mirrors the serial buildProgram path (modules.zig). Reset per
-    // file so it never grows past one file's resolution working set.
-    var resolve_scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer resolve_scratch.deinit();
-
-    // Resolution memo: the same specifier imported from many files
-    // resolves once. Lives in `arena` (spans the whole discovery run).
-    var rcache = modules.ResolveCache.init(arena, !cli.no_resolve_cache, .{
-        .resolve_json = config_resolve_json,
-        .base_url = config_base_url,
-        .allow_js = config_allow_js,
-    });
     // FileId of the auto-injected `@types/node` (null until the first Node
     // built-in import pulls it in); see the discovery loop below.
     var node_types_fid: ?u32 = null;
@@ -747,7 +760,7 @@ pub fn main(init: std.process.Init) !void {
             // BFS renumbering below reaches them.
             if (results.items[i]) |src| {
                 for (try modules.scanReferences(scratch, src.bytes)) |ref| {
-                    const rfid = try discoverReferenceInto(arena, scratch, io, paths.items[i], ref, &path_ids, &paths);
+                    const rfid = try discoverReferenceInto(arena, scratch, io, &rcache, paths.items[i], ref, &path_ids, &paths);
                     try ref_files.append(arena, rfid);
                 }
             }
@@ -1565,16 +1578,19 @@ fn resolveSpecInto(
 /// Discover a triple-slash reference target as a program input: resolve
 /// it and, if new, append it to `paths`/`path_ids` so the scheduler enqueues
 /// it. Unlike `resolveSpecInto`, it records no import-specifier binding.
+/// Resolution goes through `ResolveCache.resolveRef`, so the target is keyed by
+/// its canonical path — the same identity an `import` of that file would get.
 fn discoverReferenceInto(
     arena: std.mem.Allocator,
     scratch: std.mem.Allocator,
     io: Io,
+    rcache: *modules.ResolveCache,
     importer: []const u8,
     ref: modules.RefDirective,
     path_ids: *std.StringHashMapUnmanaged(u32),
     paths: *std.ArrayList([]const u8),
 ) !modules.FileId {
-    if (try modules.resolveReference(io, scratch, Io.Dir.cwd(), importer, ref)) |resolved| {
+    if (try rcache.resolveRef(io, scratch, Io.Dir.cwd(), importer, ref)) |resolved| {
         const pgop = try path_ids.getOrPut(arena, resolved);
         if (pgop.found_existing) return pgop.value_ptr.*;
         const stable = try arena.dupe(u8, resolved);

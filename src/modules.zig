@@ -1822,6 +1822,41 @@ pub const ResolveCache = struct {
         return owned;
     }
 
+    /// Resolve a triple-slash `/// <reference>` directive to the *canonical* path
+    /// of its target — the reference-directive twin of `resolve`.
+    ///
+    /// Reference directives are the second way a file enters the module graph
+    /// (the third is a program root), and they used to skip the canonical-path
+    /// step `resolve` applies, which made every symlinked route to a package a
+    /// separate copy of it. In a pnpm workspace that is not an edge case: a
+    /// `/// <reference types="node" />` from any package resolves through the
+    /// hoisted `.pnpm/node_modules/@types/node` symlink, and the whole
+    /// `@types/node` bundle — 130+ files reached from there by `path` refs —
+    /// lands in the graph a second time, byte-identical to the copy already in
+    /// it and with its own symbol universe. Canonicalizing here collapses those
+    /// routes onto one file id, exactly like tsc's realpath-keyed file map.
+    pub fn resolveRef(
+        rc: *ResolveCache,
+        io: Io,
+        scratch: Allocator,
+        dir: Io.Dir,
+        importer: []const u8,
+        ref: RefDirective,
+    ) Error!?[]const u8 {
+        const fs: ?*FsCache = if (rc.enabled) &rc.fs else null;
+        const resolved = (try resolveReference(io, scratch, dir, importer, ref, fs)) orelse return null;
+        return try rc.canonicalize(io, scratch, dir, resolved);
+    }
+
+    /// The canonical path of an already-resolved file — for graph entry points
+    /// that bypass `resolve` (program roots, notably the auto-included
+    /// `@types/*` ambient roots, which pnpm exposes through a symlinked
+    /// `node_modules/@types/<pkg>`). Arena-owned; a no-op outside
+    /// `node_modules`, so project files keep the path the user typed.
+    pub fn canonicalPath(rc: *ResolveCache, io: Io, scratch: Allocator, dir: Io.Dir, raw: []const u8) Error![]const u8 {
+        return rc.canonicalize(io, scratch, dir, raw);
+    }
+
     /// The realpath of `dir` (cached, arena-owned) for re-relativizing canonical
     /// paths, or null if the OS call failed (then canonical paths stay absolute).
     fn dirRealBase(rc: *ResolveCache, io: Io, dir: Io.Dir) ?[]const u8 {
@@ -2687,12 +2722,19 @@ fn attrValue(s: []const u8, key: []const u8) ?[]const u8 {
 /// Resolve a reference directive to a file path (owned by `alloc`), or null.
 /// `path` references resolve relative to the referencing file's directory;
 /// `types` references resolve like a bare package, preferring `@types/<name>`.
+/// `fs` is the optional filesystem-fact memo shared with the module resolver.
+///
+/// The result is *not* canonicalized — callers that key the module graph by path
+/// must run it through `ResolveCache.canonicalPath` (or call
+/// `ResolveCache.resolveRef`, which does both), or a symlinked package
+/// directory becomes a second copy of a file already in the graph.
 pub fn resolveReference(
     io: Io,
     alloc: Allocator,
     dir: Io.Dir,
     importer: []const u8,
     ref: RefDirective,
+    fs: ?*FsCache,
 ) Error!?[]u8 {
     switch (ref.kind) {
         .path => {
@@ -2701,13 +2743,10 @@ pub fn resolveReference(
             return resolveStem(io, alloc, dir, stem);
         },
         .types => {
-            // Uncached: `types` reference directives are a handful per run (the
-            // bulk of a `.d.ts` bundle's directives are `path` refs, which never
-            // walk `node_modules`), and the caller here has no `ResolveCache`.
             const scoped = try std.fmt.allocPrint(alloc, "@types/{s}", .{ref.spec});
             defer alloc.free(scoped);
-            if (try resolvePackage(io, alloc, dir, dirnamePart(importer), scoped, false, null)) |p| return p;
-            return resolvePackage(io, alloc, dir, dirnamePart(importer), ref.spec, false, null);
+            if (try resolvePackage(io, alloc, dir, dirnamePart(importer), scoped, false, fs)) |p| return p;
+            return resolvePackage(io, alloc, dir, dirnamePart(importer), ref.spec, false, fs);
         },
     }
 }
@@ -2790,7 +2829,7 @@ pub fn buildProgram(
         // Triple-slash `/// <reference>` directives pull extra files into the
         // program — not import bindings, just program inputs.
         for (try scanReferences(scratch, bytes)) |ref| {
-            if (try resolveReference(io, scratch, dir, path, ref)) |resolved| {
+            if (try rcache.resolveRef(io, scratch, dir, path, ref)) |resolved| {
                 const stable = try arena.dupe(u8, resolved);
                 const gop = try path_ids.getOrPut(scratch, stable);
                 if (!gop.found_existing) {
@@ -3342,6 +3381,65 @@ test "ResolveCache: pnpm symlinked store resolves transitive deps via realpath" 
     var off = ResolveCache.init(alloc, false, .{});
     const dep_uncached = try off.resolve(io, alloc, d, a.?, "dep");
     try testing.expectEqualStrings(dep.?, dep_uncached.?);
+}
+
+// (b) pnpm duplicate-file dedupe: the same physical `.d.ts` is reachable by
+// several symlinked routes — the top-level `node_modules/<pkg>` link a program
+// root names, the hoisted `.pnpm/node_modules/<pkg>` link a `types` reference
+// walks onto, and the real store path an `import` canonicalizes to. Every route
+// that puts a file in the module graph must agree on one path, or the file is
+// loaded, parsed, bound and *type-checked* once per route, each copy with its
+// own symbol universe. `resolve` canonicalized; `resolveRef` and program roots
+// (via `canonicalPath`) now do too.
+test "ResolveCache: reference directives and roots canonicalize to one path" {
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const d = tmp.dir;
+
+    // One real `@types/pkg` in the store, with a `path` reference to a sibling.
+    try d.createDirPath(io, "node_modules/.pnpm/@types+pkg@1/node_modules/@types/pkg");
+    try d.writeFile(io, .{
+        .sub_path = "node_modules/.pnpm/@types+pkg@1/node_modules/@types/pkg/index.d.ts",
+        .data = "/// <reference path=\"./extra.d.ts\" />\n",
+    });
+    try d.writeFile(io, .{
+        .sub_path = "node_modules/.pnpm/@types+pkg@1/node_modules/@types/pkg/extra.d.ts",
+        .data = "export const x: number;\n",
+    });
+    // Three routes to it: the project's `@types` root, pnpm's hoisted store dir
+    // (what a `/// <reference types="pkg" />` from another package walks onto),
+    // and the real path itself.
+    try d.createDirPath(io, "node_modules/@types");
+    try d.createDirPath(io, "node_modules/.pnpm/node_modules/@types");
+    try d.symLink(io, "../.pnpm/@types+pkg@1/node_modules/@types/pkg", "node_modules/@types/pkg", .{ .is_directory = true });
+    try d.symLink(io, "../../@types+pkg@1/node_modules/@types/pkg", "node_modules/.pnpm/node_modules/@types/pkg", .{ .is_directory = true });
+    try d.createDirPath(io, "node_modules/.pnpm/other@1/node_modules/other");
+    try d.writeFile(io, .{ .sub_path = "node_modules/.pnpm/other@1/node_modules/other/index.d.ts", .data = "" });
+
+    const canonical = "node_modules/.pnpm/@types+pkg@1/node_modules/@types/pkg/index.d.ts";
+
+    var rc = ResolveCache.init(alloc, true, .{});
+    // A program root named through the project's `@types` symlink.
+    try testing.expectEqualStrings(canonical, try rc.canonicalPath(io, alloc, d, "node_modules/@types/pkg/index.d.ts"));
+    // A `types` reference from a sibling package, which finds the hoisted link.
+    const types_ref = try rc.resolveRef(io, alloc, d, "node_modules/.pnpm/other@1/node_modules/other/index.d.ts", .{ .kind = .types, .spec = "pkg" });
+    try testing.expectEqualStrings(canonical, types_ref.?);
+    // A `path` reference out of the canonical file stays canonical.
+    const path_ref = try rc.resolveRef(io, alloc, d, canonical, .{ .kind = .path, .spec = "./extra.d.ts" });
+    try testing.expectEqualStrings("node_modules/.pnpm/@types+pkg@1/node_modules/@types/pkg/extra.d.ts", path_ref.?);
+    // Project files are never canonicalized (no realpath, path as written).
+    try d.writeFile(io, .{ .sub_path = "a.ts", .data = "" });
+    try testing.expectEqualStrings("a.ts", try rc.canonicalPath(io, alloc, d, "a.ts"));
+
+    // `--no-resolve-cache` is the oracle: same answers, memos bypassed.
+    var off = ResolveCache.init(alloc, false, .{});
+    try testing.expectEqualStrings(canonical, try off.canonicalPath(io, alloc, d, "node_modules/@types/pkg/index.d.ts"));
+    const off_ref = try off.resolveRef(io, alloc, d, "node_modules/.pnpm/other@1/node_modules/other/index.d.ts", .{ .kind = .types, .spec = "pkg" });
+    try testing.expectEqualStrings(canonical, off_ref.?);
 }
 
 // (c) resolveJsonModule: a `*.json` specifier resolves to the JSON file only
