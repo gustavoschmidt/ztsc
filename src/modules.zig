@@ -48,6 +48,7 @@
 //!   blocks, CommonJS interop semantics.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const ast = @import("ast.zig");
@@ -1247,7 +1248,7 @@ fn resolveStemOrJs(io: Io, alloc: Allocator, dir: Io.Dir, stem: []const u8, allo
 
 /// Resolve a bare (package) specifier by walking `node_modules` up from
 /// the importer's directory.
-fn resolvePackage(io: Io, alloc: Allocator, dir: Io.Dir, importer_dir: []const u8, spec: []const u8, allow_js: bool) Error!?[]u8 {
+fn resolvePackage(io: Io, alloc: Allocator, dir: Io.Dir, importer_dir: []const u8, spec: []const u8, allow_js: bool, fs: ?*FsCache) Error!?[]u8 {
     // Split "pkg/sub" / "@scope/pkg/sub".
     var pkg_len: usize = spec.len;
     if (std.mem.indexOfScalar(u8, spec, '/')) |first| {
@@ -1278,9 +1279,9 @@ fn resolvePackage(io: Io, alloc: Allocator, dir: Io.Dir, importer_dir: []const u
     // the JS `main`/index under allowJs.
     var d = importer_dir;
     while (true) {
-        if (try resolvePackageAt(io, alloc, dir, d, pkg, sub, false)) |p| return p;
+        if (try resolvePackageAt(io, alloc, dir, d, pkg, sub, false, fs)) |p| return p;
         if (types_pkg) |tp| {
-            if (try resolvePackageAt(io, alloc, dir, d, tp, sub, false)) |p| return p;
+            if (try resolvePackageAt(io, alloc, dir, d, tp, sub, false, fs)) |p| return p;
         }
         if (d.len == 0 or std.mem.eql(u8, d, "/") or std.mem.eql(u8, d, ".")) break;
         d = dirnamePart(d);
@@ -1288,7 +1289,7 @@ fn resolvePackage(io: Io, alloc: Allocator, dir: Io.Dir, importer_dir: []const u
     if (allow_js) {
         d = importer_dir;
         while (true) {
-            if (try resolvePackageAt(io, alloc, dir, d, pkg, sub, true)) |p| return p;
+            if (try resolvePackageAt(io, alloc, dir, d, pkg, sub, true, fs)) |p| return p;
             if (d.len == 0 or std.mem.eql(u8, d, "/") or std.mem.eql(u8, d, ".")) break;
             d = dirnamePart(d);
         }
@@ -1299,7 +1300,15 @@ fn resolvePackage(io: Io, alloc: Allocator, dir: Io.Dir, importer_dir: []const u
 /// Resolve `<pkg>/<sub>` under one directory level's `node_modules`, honoring
 /// `package.json` `"types"`/`"typings"` (for a bare package) or a relative
 /// stem (for a subpath). Null when nothing resolves at this level.
-fn resolvePackageAt(io: Io, alloc: Allocator, dir: Io.Dir, d: []const u8, pkg: []const u8, sub: []const u8, allow_js: bool) Error!?[]u8 {
+fn resolvePackageAt(io: Io, alloc: Allocator, dir: Io.Dir, d: []const u8, pkg: []const u8, sub: []const u8, allow_js: bool, fs: ?*FsCache) Error!?[]u8 {
+    // Nothing under `<d>/node_modules` can resolve when that directory does not
+    // exist, so one memoized stat per walk level replaces every probe below.
+    // Pure short-circuit: the package.json read and all stem candidates would
+    // have failed anyway (see `FsCache.hasNodeModules`).
+    if (fs) |fc| {
+        if (!try fc.hasNodeModules(io, dir, alloc, d)) return null;
+    }
+
     const nm = if (d.len == 0)
         try std.fmt.allocPrint(alloc, "node_modules/{s}", .{pkg})
     else
@@ -1308,15 +1317,23 @@ fn resolvePackageAt(io: Io, alloc: Allocator, dir: Io.Dir, d: []const u8, pkg: [
 
     // Read package.json once — shared by the `exports` map and the legacy
     // `"types"`/`"typings"` scan. (For a subpath the legacy path skips it, but
-    // `exports` may still map the subpath, so we always read.)
+    // `exports` may still map the subpath, so we always read.) The walk revisits
+    // the same file at every level for every specifier, so the cached leg reads
+    // each path once for the run (misses included).
     const pj = try std.fmt.allocPrint(alloc, "{s}/package.json", .{nm});
     defer alloc.free(pj);
-    var pj_text: ?[]u8 = null;
-    bumpProbe();
-    if (dir.readFileAlloc(io, pj, alloc, .limited(1 << 20))) |t| {
-        pj_text = t;
-    } else |_| {}
-    defer if (pj_text) |t| alloc.free(t);
+    var pj_owned: ?[]u8 = null;
+    defer if (pj_owned) |t| alloc.free(t);
+    var pj_text: ?[]const u8 = null;
+    if (fs) |fc| {
+        pj_text = try fc.packageJson(io, dir, pj);
+    } else {
+        bumpProbe();
+        if (dir.readFileAlloc(io, pj, alloc, .limited(1 << 20))) |t| {
+            pj_owned = t;
+            pj_text = t;
+        } else |_| {}
+    }
 
     // (1) `exports` map — authoritative for tsc when present. On a root (".")
     //     miss we still fall through to legacy probing (deliberate under-report;
@@ -1561,6 +1578,21 @@ pub fn resolveSpecifier(
     spec: []const u8,
     opts: ResolveOpts,
 ) Error!?[]u8 {
+    return resolveSpecifierFs(io, alloc, dir, importer, spec, opts, null);
+}
+
+/// `resolveSpecifier` with the filesystem memos (`FsCache`) threaded into the
+/// `node_modules` walk. `fs == null` is the uncached path — identical answers,
+/// every probe re-issued.
+fn resolveSpecifierFs(
+    io: Io,
+    alloc: Allocator,
+    dir: Io.Dir,
+    importer: []const u8,
+    spec: []const u8,
+    opts: ResolveOpts,
+    fs: ?*FsCache,
+) Error!?[]u8 {
     if (spec.len == 0) return null;
     const importer_dir = dirnamePart(importer);
     const is_json = opts.resolve_json and std.mem.endsWith(u8, spec, ".json");
@@ -1595,8 +1627,131 @@ pub fn resolveSpecifier(
         defer alloc.free(stem);
         if (try resolveStemOrJs(io, alloc, dir, stem, opts.allow_js)) |p| return p;
     }
-    return resolvePackage(io, alloc, dir, importer_dir, spec, opts.allow_js);
+    return resolvePackage(io, alloc, dir, importer_dir, spec, opts.allow_js, fs);
 }
+
+/// Filesystem-shape memos shared by one resolution run (S1-lite). Resolution
+/// is a pure function of the filesystem and ztsc is a single-shot batch
+/// process, so any probe it repeats is pure waste. Where `ResolveCache` memoizes
+/// a whole `(importer_dir, spec)` answer, this memoizes the *filesystem facts*
+/// underneath it — the part a first-time specifier still pays. Three memos, each
+/// keyed on the exact path string probed today (never canonicalized: the key
+/// space IS the behavior):
+///
+///  1. `nm_dirs` — does `<d>/node_modules` exist as a directory? The bare-
+///     specifier walk climbs to the filesystem root and most levels have no
+///     `node_modules` at all; one stat per level then answers every probe that
+///     would have gone inside it. This is the big one: 169k of the dogfood
+///     project's 257k resolve-phase syscalls (~99 ms) hit a path under a
+///     `<d>/node_modules` that does not exist.
+///  2. `pkg_json` — `package.json` text by path, misses cached too.
+///     `resolvePackageAt` reads one at every walk level (27.9k reads for 616
+///     distinct existing files; ~25k of the reads are ENOENT).
+///  3. `real_dirs` — realpath keyed by DIRECTORY. Canonicalizing a resolved
+///     `node_modules` file is realpath(dirname) + "/" + basename, and every file
+///     in one package directory shares that whole symlink chain (deep under
+///     pnpm), so 6.6k realpath calls collapse onto 1.2k directories.
+///
+/// (3) is the only leg that is not identical by construction: it differs from
+/// `realPathFile(path)` exactly when the final component is itself a symlink
+/// (package *directories* are symlinked by pnpm/yarn; declaration files are
+/// not). Debug builds therefore check it against the direct call on every use,
+/// making the conformance suite a standing oracle. The synthetic
+/// `exports`-blocked subpath — which names no on-disk file — is excluded
+/// explicitly, since its parent directory does exist and would canonicalize.
+///
+/// Memory is negligible against the program: on the dogfood project 2.5 MiB
+/// (1,920 + 1,542 + 1,202 entries), ~95% of it cached `package.json` text, on a
+/// 615 MB peak RSS — measured RSS moved +2 MB. `--timing` prints the entry
+/// counts and the byte total.
+///
+/// Not thread-safe, deliberately: resolution is single-owner (the main thread in
+/// the parallel driver, the sole thread in `buildProgram`) and each program owns
+/// its own cache. Lives inside `ResolveCache` and shares its `enabled` flag, so
+/// `--no-resolve-cache` turns the entire caching layer off in one switch and
+/// stays a complete correctness oracle for it.
+pub const FsCache = struct {
+    /// Persistent storage for keys, cached `package.json` bodies and realpaths.
+    /// Must outlive the per-file resolve scratch resets — the caller's arena.
+    arena: Allocator,
+    /// `<d>` → `<d>/node_modules` exists and is a directory.
+    nm_dirs: std.StringHashMapUnmanaged(bool) = .empty,
+    /// `package.json` path → its text, or null when absent/unreadable.
+    pkg_json: std.StringHashMapUnmanaged(?[]const u8) = .empty,
+    /// directory path → its realpath (absolute), or null when the OS call failed.
+    real_dirs: std.StringHashMapUnmanaged(?[]const u8) = .empty,
+    /// Arena bytes the memos own (keys + values), for the `--timing` line.
+    bytes: usize = 0,
+
+    /// True when `<d>/node_modules` exists as a directory. When it does not, no
+    /// `resolvePackageAt` at that level can resolve anything, so the level's
+    /// entire probe set (a `package.json` read plus up to six stem candidates,
+    /// again for the `@types/` twin, again for the allowJs phase) is skipped.
+    fn hasNodeModules(fc: *FsCache, io: Io, dir: Io.Dir, scratch: Allocator, d: []const u8) Error!bool {
+        if (fc.nm_dirs.get(d)) |v| return v;
+        const path: []const u8 = if (d.len == 0)
+            "node_modules"
+        else
+            try std.fmt.allocPrint(scratch, "{s}/node_modules", .{d});
+        bumpProbe();
+        const exists = if (dir.statFile(io, path, .{})) |st| st.kind == .directory else |_| false;
+        const key = try fc.arena.dupe(u8, d);
+        fc.bytes += key.len;
+        try fc.nm_dirs.put(fc.arena, key, exists);
+        return exists;
+    }
+
+    /// `package.json` text at `path` (cache-arena owned, valid for the run), or
+    /// null when it does not exist / cannot be read. Mirrors the uncached read
+    /// exactly, including the 1 MiB limit whose overflow reads as "absent".
+    fn packageJson(fc: *FsCache, io: Io, dir: Io.Dir, path: []const u8) Error!?[]const u8 {
+        if (fc.pkg_json.get(path)) |v| return v;
+        bumpProbe();
+        const text: ?[]const u8 = if (dir.readFileAlloc(io, path, fc.arena, .limited(1 << 20))) |t| t else |_| null;
+        const key = try fc.arena.dupe(u8, path);
+        fc.bytes += key.len + if (text) |t| t.len else 0;
+        try fc.pkg_json.put(fc.arena, key, text);
+        return text;
+    }
+
+    /// Realpath of directory `d` (cache-arena owned), or null when the OS call
+    /// failed. One syscall per distinct directory for the whole run.
+    fn realDir(fc: *FsCache, io: Io, dir: Io.Dir, d: []const u8) Error!?[]const u8 {
+        if (fc.real_dirs.get(d)) |v| return v;
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        var val: ?[]const u8 = null;
+        if (dir.realPathFile(io, d, &buf)) |n| {
+            val = try fc.arena.dupe(u8, buf[0..n]);
+        } else |_| {}
+        const key = try fc.arena.dupe(u8, d);
+        fc.bytes += key.len + if (val) |v| v.len else 0;
+        try fc.real_dirs.put(fc.arena, key, val);
+        return val;
+    }
+
+    /// Canonical absolute path of the *file* `path`, as realpath(dirname) + "/"
+    /// + basename (the directory leg memoized). Null when `path` has no
+    /// directory part or its directory does not resolve — the caller then keeps
+    /// the raw path, exactly as a failed `realPathFile` does today. Result is
+    /// `scratch`-owned.
+    fn realPathOfFile(fc: *FsCache, io: Io, dir: Io.Dir, scratch: Allocator, path: []const u8) Error!?[]const u8 {
+        const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return null;
+        const d = if (slash == 0) "/" else path[0..slash];
+        const base = path[slash + 1 ..];
+        const rd = (try fc.realDir(io, dir, d)) orelse return null;
+        const sep: []const u8 = if (std.mem.endsWith(u8, rd, "/")) "" else "/";
+        return try std.fmt.allocPrint(scratch, "{s}{s}{s}", .{ rd, sep, base });
+    }
+
+    /// Entry counts for the `--timing` scoreboard.
+    pub fn entryCounts(fc: *const FsCache) struct { nm_dirs: u32, pkg_json: u32, real_dirs: u32 } {
+        return .{
+            .nm_dirs = fc.nm_dirs.count(),
+            .pkg_json = fc.pkg_json.count(),
+            .real_dirs = fc.real_dirs.count(),
+        };
+    }
+};
 
 /// Memoizes `resolveSpecifier` over the discovery run. A module
 /// specifier resolves as a pure function of `(importer_dir, spec)` given a
@@ -1623,6 +1778,9 @@ pub const ResolveCache = struct {
     enabled: bool = true,
     /// Resolution options folded into the (dir, spec, config) pure function.
     opts: ResolveOpts = .{},
+    /// Filesystem-fact memos under the specifier memo (S1-lite). Shares
+    /// `enabled`: `--no-resolve-cache` disables both layers at once.
+    fs: FsCache,
     /// Cached realpath of `dir` (arena-owned), used to re-relativize canonical
     /// paths; computed lazily on the first `node_modules` resolution.
     real_base: ?[]const u8 = null,
@@ -1631,7 +1789,7 @@ pub const ResolveCache = struct {
     hits: u64 = 0,
 
     pub fn init(arena: Allocator, enabled: bool, opts: ResolveOpts) ResolveCache {
-        return .{ .arena = arena, .enabled = enabled, .opts = opts };
+        return .{ .arena = arena, .enabled = enabled, .opts = opts, .fs = .{ .arena = arena } };
     }
 
     /// Cached `resolveSpecifier`. `scratch` holds the transient candidate
@@ -1647,8 +1805,8 @@ pub const ResolveCache = struct {
         spec: []const u8,
     ) Error!?[]const u8 {
         if (!rc.enabled) {
-            const r = (try resolveSpecifier(io, scratch, dir, importer, spec, rc.opts)) orelse return null;
-            return try rc.canonicalize(io, dir, r);
+            const r = (try resolveSpecifierFs(io, scratch, dir, importer, spec, rc.opts, null)) orelse return null;
+            return try rc.canonicalize(io, scratch, dir, r);
         }
         rc.lookups += 1;
         const importer_dir = dirnamePart(importer);
@@ -1658,8 +1816,8 @@ pub const ResolveCache = struct {
             rc.hits += 1;
             return cached;
         }
-        const resolved = try resolveSpecifier(io, scratch, dir, importer, spec, rc.opts);
-        const owned: ?[]const u8 = if (resolved) |p| try rc.canonicalize(io, dir, p) else null;
+        const resolved = try resolveSpecifierFs(io, scratch, dir, importer, spec, rc.opts, &rc.fs);
+        const owned: ?[]const u8 = if (resolved) |p| try rc.canonicalize(io, scratch, dir, p) else null;
         try rc.map.put(rc.arena, try rc.arena.dupe(u8, key), owned);
         return owned;
     }
@@ -1688,12 +1846,31 @@ pub const ResolveCache = struct {
     /// `node_modules` paths are canonicalized — nothing else is symlinked into a
     /// store, so user-file paths (and their diagnostic display) are untouched and
     /// no realpath syscall is spent on them. One syscall per resolved
-    /// `node_modules` file (the resolve memo collapses repeats), never per probe.
-    fn canonicalize(rc: *ResolveCache, io: Io, dir: Io.Dir, raw: []const u8) Error![]const u8 {
+    /// `node_modules` file (the resolve memo collapses repeats), never per probe
+    /// — and, with the `FsCache` enabled, one per resolved *directory* (the
+    /// package's whole symlink chain is shared by every file in it).
+    fn canonicalize(rc: *ResolveCache, io: Io, scratch: Allocator, dir: Io.Dir, raw: []const u8) Error![]const u8 {
         if (std.mem.indexOf(u8, raw, "node_modules") == null) return rc.arena.dupe(u8, raw);
+        // A synthetic `exports`-blocked subpath names no on-disk file: today's
+        // `realPathFile` fails on it and the raw path is kept. Skip it before the
+        // per-directory realpath, which would happily canonicalize its (existing)
+        // parent and hand back a different path. Saves a doomed syscall too.
+        if (isBlockedSubpathPath(raw)) return rc.arena.dupe(u8, raw);
         var buf: [std.fs.max_path_bytes]u8 = undefined;
-        const n = dir.realPathFile(io, raw, &buf) catch return rc.arena.dupe(u8, raw);
-        const abs = buf[0..n];
+        const abs = if (rc.enabled)
+            (try rc.fs.realPathOfFile(io, dir, scratch, raw)) orelse return rc.arena.dupe(u8, raw)
+        else abs: {
+            const n = dir.realPathFile(io, raw, &buf) catch return rc.arena.dupe(u8, raw);
+            break :abs buf[0..n];
+        };
+        // Debug-only oracle for the per-directory realpath: it can only diverge
+        // from the direct call if the file's own last component is a symlink.
+        if (builtin.mode == .Debug and rc.enabled) {
+            var vbuf: [std.fs.max_path_bytes]u8 = undefined;
+            if (dir.realPathFile(io, raw, &vbuf)) |vn| {
+                std.debug.assert(std.mem.eql(u8, vbuf[0..vn], abs));
+            } else |_| {}
+        }
         if (rc.dirRealBase(io, dir)) |b| {
             if (abs.len > b.len + 1 and std.mem.startsWith(u8, abs, b) and abs[b.len] == '/') {
                 return rc.arena.dupe(u8, abs[b.len + 1 ..]);
@@ -2524,10 +2701,13 @@ pub fn resolveReference(
             return resolveStem(io, alloc, dir, stem);
         },
         .types => {
+            // Uncached: `types` reference directives are a handful per run (the
+            // bulk of a `.d.ts` bundle's directives are `path` refs, which never
+            // walk `node_modules`), and the caller here has no `ResolveCache`.
             const scoped = try std.fmt.allocPrint(alloc, "@types/{s}", .{ref.spec});
             defer alloc.free(scoped);
-            if (try resolvePackage(io, alloc, dir, dirnamePart(importer), scoped, false)) |p| return p;
-            return resolvePackage(io, alloc, dir, dirnamePart(importer), ref.spec, false);
+            if (try resolvePackage(io, alloc, dir, dirnamePart(importer), scoped, false, null)) |p| return p;
+            return resolvePackage(io, alloc, dir, dirnamePart(importer), ref.spec, false, null);
         },
     }
 }
@@ -3025,6 +3205,64 @@ test "ResolveCache: memo collapses repeated resolution, matches uncached" {
     const p2 = try resolveSpecifier(io, alloc, d, "src/a.ts", "pkg", .{});
     try testing.expectEqualStrings(p2.?, p1.?);
     try testing.expectEqual(@as(u64, 0), off.lookups);
+}
+
+// S1-lite: the filesystem-fact memos under the specifier memo. Every leg must
+// give the same answers as the uncached walk while issuing far fewer probes;
+// `--no-resolve-cache` (enabled = false) is the oracle.
+test "FsCache: node_modules existence, package.json and realpath memos" {
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const d = tmp.dir;
+
+    // A deep source tree whose intermediate levels have NO node_modules — the
+    // shape the walk wastes almost all of its syscalls on.
+    try d.createDirPath(io, "src/a/b/c");
+    try d.createDirPath(io, "node_modules/pkg");
+    try d.writeFile(io, .{ .sub_path = "src/a/b/c/x.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "src/a/b/c/y.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "node_modules/pkg/package.json", .data = "{ \"types\": \"main.d.ts\" }" });
+    try d.writeFile(io, .{ .sub_path = "node_modules/pkg/main.d.ts", .data = "" });
+
+    var on = ResolveCache.init(alloc, true, .{});
+    var off = ResolveCache.init(alloc, false, .{});
+
+    resetFsProbeCount();
+    const cached = try on.resolve(io, alloc, d, "src/a/b/c/x.ts", "pkg");
+    const cached_probes = fsProbeCount();
+    resetFsProbeCount();
+    const uncached = try off.resolve(io, alloc, d, "src/a/b/c/x.ts", "pkg");
+    const uncached_probes = fsProbeCount();
+
+    try testing.expectEqualStrings("node_modules/pkg/main.d.ts", cached.?);
+    try testing.expectEqualStrings(uncached.?, cached.?);
+    // The four bare levels (src/a/b/c … src) short-circuit on one stat each
+    // instead of a package.json read plus six stem probes, twice.
+    try testing.expect(cached_probes < uncached_probes);
+
+    // The memos are consulted, not rebuilt: a distinct specifier from the same
+    // tree re-uses every `<d>/node_modules` verdict and package.json body.
+    const counts = on.fs.entryCounts();
+    try testing.expectEqual(@as(u32, 5), counts.nm_dirs); // src/a/b/c, src/a/b, src/a, src, ""
+    resetFsProbeCount();
+    const ghost_cached = try on.resolve(io, alloc, d, "src/a/b/c/y.ts", "ghost");
+    const ghost_cached_probes = fsProbeCount();
+    resetFsProbeCount();
+    const ghost_uncached = try off.resolve(io, alloc, d, "src/a/b/c/y.ts", "ghost");
+    try testing.expectEqual(@as(?[]const u8, null), ghost_cached);
+    try testing.expectEqual(@as(?[]const u8, null), ghost_uncached);
+    try testing.expect(ghost_cached_probes < fsProbeCount());
+    // No new `<d>/node_modules` stats: the levels were already decided.
+    try testing.expectEqual(counts.nm_dirs, on.fs.entryCounts().nm_dirs);
+
+    // The realpath memo is keyed by directory, so both files of one package
+    // canonicalize off a single entry.
+    try testing.expectEqual(@as(u32, 1), on.fs.entryCounts().real_dirs);
+    try testing.expect(on.fs.bytes > 0);
 }
 
 // Regression: resolution used to build candidate paths in a fixed 256-byte

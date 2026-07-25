@@ -76,7 +76,9 @@ const usage =
     \\  --workers=N            number of worker threads (default: CPU count)
     \\  --checkers=N           number of checker instances (default: min(4, CPUs))
     \\  --repeat=N             scan/parse/bind each file N times (benchmark aid)
-    \\  --no-resolve-cache     disable the module-resolution memo (benchmark aid)
+    \\  --no-resolve-cache     disable the module-resolution memos — the
+    \\                         specifier memo and the filesystem-fact caches
+    \\                         under it (benchmark aid / correctness oracle)
     \\  --no-frozen-store      disable the shared frozen base type store; each
     \\                         checker re-expands lib types (benchmark aid / oracle)
     \\  --no-inst-cache        disable the instantiation caching layer; re-run
@@ -1253,6 +1255,13 @@ pub fn main(init: std.process.Init) !void {
         try out.print("  resolve cache: {d} probes, {d} lookups, {d} hits ({s})\n", .{
             modules.fsProbeCount(),                              rcache.lookups, rcache.hits,
             if (cli.no_resolve_cache) "disabled" else "enabled",
+        });
+        // Filesystem-fact memos under it (S1-lite): the walk's `<d>/node_modules`
+        // existence, package.json bodies, and per-directory realpath.
+        const fs_counts = rcache.fs.entryCounts();
+        try out.print("  resolve fs memo: {d} node_modules dirs, {d} package.json, {d} realpath dirs, {d:.2} MiB\n", .{
+            fs_counts.nm_dirs,   fs_counts.pkg_json,
+            fs_counts.real_dirs, @as(f64, @floatFromInt(rcache.fs.bytes)) / (1024.0 * 1024.0),
         });
     }
 
