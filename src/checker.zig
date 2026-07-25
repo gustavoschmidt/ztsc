@@ -16833,8 +16833,15 @@ const Checker = struct {
         {
             return c.typeofSwitchIsExhaustive(node, c.tree.nodeData(d.lhs).lhs);
         }
-        const disc_t0 = c.nodeType(d.lhs) orelse return false;
-        const disc_t = disc_t0;
+        // The discriminant type may not be cached yet: `switchIsExhaustive` is
+        // reached from `inferReturnType`, a type probe that checks only the
+        // `return` expressions, never the switch discriminant. Synthesize it on
+        // demand (memoized by `checkExprCached`) so an exhaustive switch over a
+        // literal-union parameter — `switch (fmt) { case 'a': … }` covering
+        // every `FormatKey` member — is recognized as terminal, and the
+        // function's inferred return type gains no phantom `| undefined`.
+        const disc_t0 = c.nodeType(d.lhs) orelse (c.checkExprCached(d.lhs, types.no_type) catch return false);
+        const disc_t = c.resolveStructural(disc_t0) catch return false;
         if (c.ts.kind(disc_t) != .union_type) return false;
         const r = c.tree.extraData(ast.SubRange, d.rhs);
         for (c.ts.members(disc_t)) |m| {
@@ -16846,7 +16853,10 @@ const Checker = struct {
                 if (clause == null_node or c.nodeTag(clause) != .case_clause) continue;
                 const test_node = c.tree.nodeData(clause).lhs;
                 if (test_node == 0) continue;
-                const tt0 = c.nodeType(test_node) orelse continue;
+                // Case-label literals may be unchecked in the return-type probe
+                // (it types only `return` expressions) — synthesize on demand
+                // (memoized) so switch coverage is seen.
+                const tt0 = c.nodeType(test_node) orelse (c.checkExprCached(test_node, types.no_type) catch continue);
                 const tt = c.ts.regularLiteral(tt0) catch continue;
                 if (tt == rm) covered = true;
             }
@@ -16856,7 +16866,7 @@ const Checker = struct {
     }
 
     fn typeofSwitchIsExhaustive(c: *Checker, sw: Node, operand: Node) bool {
-        const t = c.nodeType(operand) orelse return false;
+        const t = c.nodeType(operand) orelse (c.checkExprCached(operand, types.no_type) catch return false);
         const r = c.tree.extraData(ast.SubRange, c.tree.nodeData(sw).rhs);
         // For each possible typeof outcome of t, require a covering case.
         for (0..typeof_names.len) |which| {
@@ -16874,7 +16884,10 @@ const Checker = struct {
                 if (clause == null_node or c.nodeTag(clause) != .case_clause) continue;
                 const test_node = c.tree.nodeData(clause).lhs;
                 if (test_node == 0) continue;
-                const tt0 = c.nodeType(test_node) orelse continue;
+                // Case-label literals may be unchecked in the return-type probe
+                // (it types only `return` expressions) — synthesize on demand
+                // (memoized) so switch coverage is seen.
+                const tt0 = c.nodeType(test_node) orelse (c.checkExprCached(test_node, types.no_type) catch continue);
                 const tt = c.ts.regularLiteral(tt0) catch continue;
                 if (c.ts.kind(tt) != .string_literal) continue;
                 if (c.ts.literalAtom(tt) == c.typeof_atoms[which]) covered = true;
