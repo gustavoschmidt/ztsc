@@ -2676,6 +2676,27 @@ const Checker = struct {
     }
 
     /// `typeof entity` in type position: the entity's value type.
+    /// tsc's `getRegularTypeOfLiteralType`: a `typeof x` type query never yields
+    /// a *fresh* (widening) literal — the const's widening-literal type is
+    /// regularized so the query result does not re-widen when later used as an
+    /// object-literal property type. De-freshens the top literal and, for a
+    /// union, each member; leaves everything else (incl. objects) untouched.
+    fn regularizeTypeQuery(c: *Checker, t: TypeId) Error!TypeId {
+        if (c.ts.isFreshLiteral(t)) return c.ts.regularLiteral(t);
+        if (c.ts.kind(t) == .union_type) {
+            var any_fresh = false;
+            for (try c.memberList(t)) |m| {
+                if (c.ts.isFreshLiteral(m)) any_fresh = true;
+            }
+            if (!any_fresh) return t;
+            var list: std.ArrayList(TypeId) = .empty;
+            defer list.deinit(c.scratch());
+            for (try c.memberList(t)) |m| try list.append(c.scratch(), try c.regularizeTypeQuery(m));
+            return c.ts.makeUnion(c.scratch(), list.items);
+        }
+        return t;
+    }
+
     fn typeofEntity(c: *Checker, node: Node) Error!TypeId {
         if (node == null_node) return types.any_type;
         // `typeof import("m")` — the module's value-namespace object type.
@@ -2703,7 +2724,7 @@ const Checker = struct {
         if (c.tree.tokens.tag(tok) == .keyword_undefined) return types.undefined_type;
         const a = try c.atomOfToken(tok);
         switch (c.resolveSpace(a, c.cur_scope, true)) {
-            .sym => |sym| return c.typeOfSymbol(sym),
+            .sym => |sym| return c.regularizeTypeQuery(try c.typeOfSymbol(sym)),
             .wrong_space => return types.any_type,
             .none => {
                 // `typeof globalThis` — always in scope (see checkIdentifier).
