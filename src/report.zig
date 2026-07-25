@@ -1,4 +1,4 @@
-//! Formatting for the `--timing` and `--memory` reports.
+//! Formatting for the `--timing`, `--memory` and `--census` reports.
 //!
 //! Pure formatting, no measurement: main.zig (the imperative shell) owns the
 //! timers, the arenas, and the per-phase / per-checker counters, and hands
@@ -8,6 +8,9 @@
 
 const std = @import("std");
 const Io = std.Io;
+
+const ast = @import("ast.zig");
+const Ast = ast.Ast;
 
 fn nsToMs(ns: u64) f64 {
     return @as(f64, @floatFromInt(ns)) / std.time.ns_per_ms;
@@ -270,6 +273,69 @@ pub fn printMemory(out: *Io.Writer, m: Memory) !void {
         0;
     try out.print("  {s:<24} {d:>12}\n", .{ "heap total (arenas)", heap_total });
     try out.print("  {s:<24} {d:>12.2}\n", .{ "bytes/line (heap)", bytes_per_line });
+}
+
+// --- --census ---------------------------------------------------------------
+
+/// The whole-run counters printed above the census histogram. The trees
+/// themselves carry the per-construct data, so this is only the header line
+/// material the driver already tallied.
+pub const CensusTotals = struct {
+    files: usize,
+    lines: usize,
+    parse_diags: usize,
+    bind_diags: usize,
+    check_diags: usize,
+};
+
+/// Census: a by-construct histogram of out-of-subset syntax across every
+/// loaded file, sorted most-frequent first — the table that prioritizes
+/// upcoming feature work over spec order. Each `.unsupported` AST node carries
+/// its construct kind (classified at parse time), so this is a cheap read-only
+/// whole-tree scan over the already-built trees, no re-parse and no allocation.
+pub fn printCensus(out: *Io.Writer, trees: []const ?*Ast, totals: CensusTotals) !void {
+    const Kind = ast.UnsupportedKind;
+    const nkinds = @typeInfo(Kind).@"enum".fields.len;
+    var counts = [_]u64{0} ** nkinds;
+    var files_with: usize = 0;
+    var total: u64 = 0;
+    for (trees) |maybe_tree| {
+        const tree = maybe_tree orelse continue;
+        var file_has = false;
+        var i: u32 = 0;
+        const nc: u32 = @intCast(tree.nodeCount());
+        while (i < nc) : (i += 1) {
+            if (tree.nodeTag(i) == .unsupported) {
+                counts[@intFromEnum(tree.unsupportedKind(i))] += 1;
+                total += 1;
+                file_has = true;
+            }
+        }
+        if (file_has) files_with += 1;
+    }
+
+    try out.print("\n--census\n", .{});
+    try out.print("  files: {d} scanned ({d} lines), {d} with out-of-subset syntax\n", .{ totals.files, totals.lines, files_with });
+    try out.print("  diagnostics: {d} parse, {d} bind, {d} check\n", .{ totals.parse_diags, totals.bind_diags, totals.check_diags });
+    try out.print("  out-of-subset constructs: {d} total\n", .{total});
+
+    // Sort kind indices by descending count for the priority table.
+    var order: [nkinds]usize = undefined;
+    for (0..nkinds) |k| order[k] = k;
+    std.mem.sort(usize, &order, @as(*const [nkinds]u64, &counts), struct {
+        fn desc(c: *const [nkinds]u64, a: usize, b: usize) bool {
+            return c[a] > c[b];
+        }
+    }.desc);
+
+    try out.print("  {s:<32} {s:>9} {s:>7}\n", .{ "construct", "count", "share" });
+    for (order) |k| {
+        if (counts[k] == 0) continue;
+        const kind: Kind = @enumFromInt(k);
+        const share = @as(f64, @floatFromInt(counts[k])) * 100.0 /
+            @as(f64, @floatFromInt(if (total == 0) 1 else total));
+        try out.print("  {s:<32} {d:>9} {d:>6.1}%\n", .{ kind.label(), counts[k], share });
+    }
 }
 
 test "printTiming renders one row per phase and per checker" {

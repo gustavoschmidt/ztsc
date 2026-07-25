@@ -1236,7 +1236,13 @@ pub fn main(init: std.process.Init) !void {
     });
 
     if (cli.census) {
-        try printCensus(out, trees.items, n_files, parse_diags, bind_diags, check_diags, total_lines);
+        try ztsc.report.printCensus(out, trees.items, .{
+            .files = n_files,
+            .lines = total_lines,
+            .parse_diags = parse_diags,
+            .bind_diags = bind_diags,
+            .check_diags = check_diags,
+        });
     }
 
     if (cli.timing) {
@@ -1370,64 +1376,6 @@ fn growPerFile(
 fn permuteInPlace(comptime T: type, arena: std.mem.Allocator, items: []T, order: []const u32) !void {
     const copy = try arena.dupe(T, items);
     for (order, 0..) |old, k| items[k] = copy[old];
-}
-
-/// Census: a by-construct histogram of out-of-subset syntax across every
-/// loaded file, sorted most-frequent first — the table that prioritizes
-/// upcoming feature work over spec order. Each `.unsupported` AST node carries
-/// its construct kind (classified at parse time), so this is a cheap whole-tree
-/// scan, no re-parse.
-fn printCensus(
-    out: *Io.Writer,
-    trees: []const ?*Ast,
-    n_files: usize,
-    parse_diags: usize,
-    bind_diags: usize,
-    check_diags: usize,
-    total_lines: usize,
-) !void {
-    const Kind = ztsc.ast.UnsupportedKind;
-    const nkinds = @typeInfo(Kind).@"enum".fields.len;
-    var counts = [_]u64{0} ** nkinds;
-    var files_with: usize = 0;
-    var total: u64 = 0;
-    for (trees) |maybe_tree| {
-        const tree = maybe_tree orelse continue;
-        var file_has = false;
-        var i: u32 = 0;
-        const nc: u32 = @intCast(tree.nodeCount());
-        while (i < nc) : (i += 1) {
-            if (tree.nodeTag(i) == .unsupported) {
-                counts[@intFromEnum(tree.unsupportedKind(i))] += 1;
-                total += 1;
-                file_has = true;
-            }
-        }
-        if (file_has) files_with += 1;
-    }
-
-    try out.print("\n--census\n", .{});
-    try out.print("  files: {d} scanned ({d} lines), {d} with out-of-subset syntax\n", .{ n_files, total_lines, files_with });
-    try out.print("  diagnostics: {d} parse, {d} bind, {d} check\n", .{ parse_diags, bind_diags, check_diags });
-    try out.print("  out-of-subset constructs: {d} total\n", .{total});
-
-    // Sort kind indices by descending count for the priority table.
-    var order: [nkinds]usize = undefined;
-    for (0..nkinds) |k| order[k] = k;
-    std.mem.sort(usize, &order, @as(*const [nkinds]u64, &counts), struct {
-        fn desc(c: *const [nkinds]u64, a: usize, b: usize) bool {
-            return c[a] > c[b];
-        }
-    }.desc);
-
-    try out.print("  {s:<32} {s:>9} {s:>7}\n", .{ "construct", "count", "share" });
-    for (order) |k| {
-        if (counts[k] == 0) continue;
-        const kind: Kind = @enumFromInt(k);
-        const share = @as(f64, @floatFromInt(counts[k])) * 100.0 /
-            @as(f64, @floatFromInt(if (total == 0) 1 else total));
-        try out.print("  {s:<32} {d:>9} {d:>6.1}%\n", .{ kind.label(), counts[k], share });
-    }
 }
 
 /// Resolve one module specifier of `importer`; appends to the spec map and
