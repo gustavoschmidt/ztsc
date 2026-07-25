@@ -44,7 +44,7 @@
 cd ztsc
 zig build -Doptimize=ReleaseFast   # -&gt; zig-out/bin/ztsc</code></pre>
   <p>A debug build is just <code>zig build</code>; <code>zig build test</code> runs the unit
-  tests and the 414-case differential conformance suite.</p>
+  tests and the 621-case differential conformance suite.</p>
 </section>
 
 <!-- ============================================================ -->
@@ -179,28 +179,41 @@ ztsc src/main.ts           # or explicit entry files</code></pre>
   with the full iteration protocol (<code>for…of</code> over every DOM collection,
   <code>for await</code> with the sync-iterable fallback), CommonJS interop, const-symbol
   computed keys, and JSX against the real <code>@types/react</code>. What it checks, it checks
-  like the TypeScript compiler. Every gap below fails in the safe direction: ztsc may miss an
-  error tsc would report, but it never reports an error on valid code.</p>
+  like the TypeScript compiler. Almost every gap below fails in the safe direction: ztsc misses
+  an error tsc would report rather than inventing one, and it never crashes. It is not yet a
+  drop-in replacement for <code>tsc --noEmit</code>: on a large production React/TypeScript
+  application it reproduces all 48 of tsc's errors byte-identically, and adds 10 false
+  positives of its own.</p>
   <p>What it does <strong>not</strong> check yet:</p>
   <ul>
     <li><strong>Watch mode and LSP</strong> — ztsc is batch-only; both are planned next, on an
     architecture built for them.</li>
-    <li><strong>tsconfig options beyond the subset</strong> — only <code>files</code> /
-    <code>include</code> / <code>exclude</code> / <code>baseUrl</code> / <code>paths</code> /
-    <code>lib</code> (plus the <code>skipLibCheck</code> keys) are honored, strict mode only
-    (<code>strict: false</code> is refused); everything else is accepted and ignored, and
-    <code>--verbose</code> lists which.</li>
+    <li><strong>~10 known false positives on real code</strong> — deep generic inference (immer
+    <code>Draft&lt;S&gt;</code> under a reducer spread, Zod v4 <code>z.infer</code>), a few CFA
+    narrowing depths, and one lib-policy divergence. Each is diagnosed and tracked; the count is
+    measured against tsc on a large private codebase, not estimated.</li>
+    <li><strong>One valid-syntax parse gap</strong>: a conditional type nested inside a
+    <em>type argument</em> in the return type of a parenthesized function type —
+    <code>type F&lt;R&gt; = () =&gt; Box&lt;R extends X ? A : B&gt;</code> — fails to parse (it
+    recovers with parse errors). <code>new () =&gt;</code>, <code>&lt;T&gt;() =&gt;</code>, and
+    call signatures are fine. rxjs's <code>bindCallback.d.ts</code> hits it.</li>
+    <li><strong>tsconfig options beyond the subset</strong> — honored: <code>files</code> /
+    <code>include</code> / <code>exclude</code> / <code>extends</code>, and the
+    <code>compilerOptions</code> keys <code>lib</code>, <code>baseUrl</code>, <code>paths</code>,
+    <code>types</code>, <code>typeRoots</code>, <code>skipLibCheck</code> /
+    <code>skipDefaultLibCheck</code>, <code>allowJs</code>, <code>esModuleInterop</code>,
+    <code>allowSyntheticDefaultImports</code>, <code>noImplicitAny</code>,
+    <code>resolveJsonModule</code>. Strict mode only (<code>strict: false</code> is refused);
+    everything else is accepted and ignored, and <code>--verbose</code> lists which.</li>
     <li><strong><code>lib</code> families other than <code>es*</code> and <code>dom*</code></strong>
-    (e.g. <code>webworker</code>) — they warn and are ignored.</li>
+    (e.g. <code>webworker</code>) — ignored, with a note under <code>--verbose</code>.</li>
     <li><strong>Generator corners</strong>: <code>yield*</code> delegation is unchecked, and
     unannotated generator functions type as <code>any</code>.</li>
     <li><strong>CommonJS corners</strong>: a namespace import of an <code>export =</code>
-    module keeps the export's call signature (<code>ns()</code> is not flagged), and a member
-    of a <code>require</code>-bound namespace used in <em>type</em> position resolves to
-    <code>any</code>.</li>
+    module keeps the export's call signature, so <code>ns()</code> is not flagged.</li>
     <li><strong>Symbol-key corners</strong>: a plain non-<code>unique</code> <code>symbol</code>
     key (rxjs's <code>[Symbol.observable]</code>) is keyed by name rather than as a symbol
-    index, and a deeper-qualified key (<code>[a.b.c]</code>) is out of subset.</li>
+    index.</li>
     <li><strong>JSX corners</strong>: prop <em>type</em> mismatches arriving inside a spread
     object, spreads of unions/generics/index-signature types, and children <em>value</em>
     typing are unchecked; class-component prop mistakes report refined codes where tsgo
@@ -208,9 +221,9 @@ ztsc src/main.ts           # or explicit entry files</code></pre>
     <li>A handful of other known edge cases miss an error the TypeScript compiler would
     report.</li>
   </ul>
-  <p>Unsupported syntax produces a clear <em>"not yet supported"</em> diagnostic — never a wrong
-  answer or a crash. Run <code>ztsc --census</code> on your project to get a frequency table of
-  exactly which unsupported constructs it contains.</p>
+  <p>Unsupported syntax produces a clear <em>"not yet supported"</em> diagnostic — never a
+  crash. Run <code>ztsc --census</code> on your project to get a frequency table of exactly
+  which unsupported constructs it contains.</p>
 </section>
 
 <footer class="sitefoot">

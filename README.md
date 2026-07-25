@@ -10,7 +10,7 @@ A fast, low-memory TypeScript type checker, written in Zig.
 - A **single static binary**. No Node runtime, no dependencies — and none in
   the source either: nothing but the Zig standard library.
 - **Parallel by design**, with byte-identical output at any worker count.
-- Diagnostics **match the TypeScript compiler**, enforced by a 414-case
+- Diagnostics **match the TypeScript compiler**, enforced by a 621-case
   differential conformance suite.
 
 <picture>
@@ -70,33 +70,46 @@ template-literal types, generics, narrowing, declaration merging), the real
 ES-core…esnext + DOM standard library with the full iteration protocol,
 CommonJS interop, const-symbol computed keys, and JSX against the real
 `@types/react`. What it checks, it checks like `tsc` — enforced by the
-differential conformance suite. Every gap below fails in the safe direction:
-ztsc may miss an error `tsc` would report, but it never reports an error on
-valid code, and unsupported syntax produces a clear "not yet supported"
-diagnostic — never a wrong answer or a crash.
+differential conformance suite. Almost every gap below fails in the safe
+direction: ztsc misses an error `tsc` would report rather than inventing one,
+unsupported syntax produces a clear "not yet supported" diagnostic, and it
+never crashes. It is not yet a drop-in replacement for `tsc --noEmit`: on a
+large production React/TypeScript application it reproduces all 48 of tsc's
+errors byte-identically, and adds 10 false positives of its own.
 
 What it does **not** check yet:
 
 - **Watch mode and LSP** — ztsc is batch-only; both are planned next, on an
   architecture built for them.
-- **tsconfig options beyond the subset** — only `files` / `include` /
-  `exclude` / `baseUrl` / `paths` / `lib` (plus the `skipLibCheck` keys) are
-  honored, strict mode only (`strict: false` is refused); everything else is
-  accepted and ignored, and `--verbose` lists which.
-- **`lib` families other than `es*` and `dom*`** (e.g. `webworker`) — they
-  warn and are ignored.
+- **~10 known false positives on real code** — deep generic inference (immer
+  `Draft<S>` under a reducer spread, Zod v4 `z.infer`), a few CFA narrowing
+  depths, and one lib-policy divergence. Each is diagnosed and tracked; the
+  count is measured against `tsc` on a large private codebase, not estimated.
+- **One valid-syntax parse gap**: a conditional type nested inside a *type
+  argument* in the return type of a parenthesized function type —
+  `type F<R> = () => Box<R extends X ? A : B>` — fails to parse (it recovers
+  with parse errors). `new () =>`, `<T>() =>`, and call signatures are fine.
+  rxjs's `bindCallback.d.ts` hits it.
+- **tsconfig options beyond the subset** — honored: `files` / `include` /
+  `exclude` / `extends`, and the `compilerOptions` keys `lib`, `baseUrl`,
+  `paths`, `types`, `typeRoots`, `skipLibCheck` / `skipDefaultLibCheck`,
+  `allowJs`, `esModuleInterop`, `allowSyntheticDefaultImports`,
+  `noImplicitAny`, `resolveJsonModule`. Strict mode only (`strict: false` is
+  refused). Everything else is accepted and ignored, and `--verbose` lists
+  which.
+- **`lib` families other than `es*` and `dom*`** (e.g. `webworker`) — ignored,
+  with a note under `--verbose`.
 - **Generator corners**: `yield*` delegation is unchecked, and unannotated
   generator functions type as `any`.
 - **CommonJS corners**: a namespace import of an `export =` module keeps the
-  export's call signature (`ns()` is not flagged), and a member of a
-  `require`-bound namespace used in *type* position resolves to `any`.
+  export's call signature, so `ns()` is not flagged.
 - **Symbol-key corners**: a plain non-`unique` `symbol` key (rxjs's
   `[Symbol.observable]`, declared `: symbol`) is keyed by name rather than as
-  a symbol index, and a deeper-qualified key (`[a.b.c]`) is out of subset.
+  a symbol index.
 - **JSX corners**: prop *type* mismatches arriving inside a spread object,
   spreads of unions/generics/index-signature types, and children *value*
-  typing (TS2745/2746) are unchecked; class-component prop mistakes report
-  refined codes (TS2741/2322) where tsgo reports TS2769.
+  typing are unchecked; class-component prop mistakes report refined codes
+  (TS2741/2322) where tsgo reports TS2769.
 - A handful of other known edge cases miss an error `tsc` would report.
 
 Feature parity is in the works.

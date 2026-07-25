@@ -142,9 +142,11 @@
   <p>A TypeScript checker that mishandles code is worse than one that refuses it. ztsc's
   contract from day one: anything out of subset parses into an explicit
   <code>unsupported</code> node with a clear diagnostic — <strong>never a wrong answer, never a
-  crash</strong> (every phase is fuzzed) — and in the handful of known edge cases where ztsc
-  can't yet reproduce an error, it <em>under-reports</em> rather than inventing errors on valid
-  code.</p>
+  crash</strong> (every phase is fuzzed) — and in the known edge cases where ztsc can't yet
+  reproduce an error, it <em>under-reports</em> rather than inventing errors on valid code. That
+  bias holds, but it is not yet absolute: on a large production React/TypeScript application
+  ztsc reproduces all 48 of tsc's errors byte-identically and still adds 10 false positives of
+  its own, each diagnosed and tracked. Closing them is the current work.</p>
   <p>What went <em>into</em> the subset was decided by measurement, not by spec order. Every
   <code>unsupported</code> node records which construct it covers, so <code>--census</code> over
   a vendored corpus of real published <code>.d.ts</code> (2,945 files, ~131k lines — @types/node,
@@ -154,12 +156,14 @@
   census reads zero, CommonJS interop (<code>export =</code>,
   <code>import = require</code>) has landed as well, and computed property keys — bare
   const-symbol (<code>[entityKind]</code>) and member-expression
-  (<code>[EventEmitter.captureRejectionSymbol]</code>) alike — parse and check. The residual
-  is eight parse-recovery artifacts of two unsupported <em>type</em> forms (drizzle's
-  <code>this['_']</code> indexed access, a hono nested conditional), not computed keys.
-  Correctness of what <em>is</em> checked is enforced differentially: a
-  414-case conformance suite validated against the pinned native TypeScript compiler
-  (tsgo 7.0.2), down to error codes and positions.</p>
+  (<code>[EventEmitter.captureRejectionSymbol]</code>) alike — parse and check. The census
+  residual is eight parse-recovery artifacts of one unsupported <em>type</em> form, drizzle's
+  <code>this['_']</code> indexed access, not computed keys; the hono nested conditional that
+  used to sit alongside it now parses. One valid form is still rejected outside the census — a
+  conditional type inside a type argument in the return type of a parenthesized function type,
+  which rxjs's <code>bindCallback.d.ts</code> uses. Correctness of what <em>is</em> checked is
+  enforced differentially: a 621-case conformance suite validated against the pinned native
+  TypeScript compiler (tsgo 7.0.2), down to error codes and positions.</p>
 </section>
 
 <!-- ============================================================ -->

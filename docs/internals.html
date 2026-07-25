@@ -48,7 +48,7 @@
     </div>
     <div class="stat">
       <div class="k">conformance</div>
-      <div class="v">414/414</div>
+      <div class="v">621/621</div>
       <div class="c">differential cases (error code + line) vs the native TypeScript compiler, tsgo 7.0.2</div>
     </div>
   </div>
@@ -397,7 +397,7 @@ pub const Program = struct {
   hand-trimmed surface, and <code>--census</code> over it reports zero out-of-subset
   constructs. <code>bench/</code> holds the corpus generator, the real-package fetcher
   (<code>fetch_real.sh</code>) and the end-to-end harnesses; <code>test/</code> holds the
-  conformance runner with 414 differential cases against the pinned native tsgo 7.0.2. A good reading order for the
+  conformance runner with 621 differential cases against the pinned native tsgo 7.0.2. A good reading order for the
   code is exactly the table above, top to bottom.</p>
 </section>
 
@@ -955,7 +955,7 @@ pub const Program = struct {
     <p><strong>Read before quoting.</strong> These are throughput and memory measurements on
     identical inputs — not a diagnostic-parity claim:</p>
     <p>ztsc checks a <em>subset</em> (against the real ES-core + DOM lib), so its diagnostic
-    output differs from tsgo's on real code; correctness is tracked separately by the 414-case
+    output differs from tsgo's on real code; correctness is tracked separately by the 621-case
     differential conformance suite validated against the TypeScript compiler. Packages are
     vendored without their dependencies — nonzero exit is expected, and both tools fully parse,
     bind, and check every file regardless. Wall clock is timed around the whole

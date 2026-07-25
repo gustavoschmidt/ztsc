@@ -56,7 +56,7 @@
     </div>
     <div class="stat">
       <div class="k">conformance</div>
-      <div class="v">414/414</div>
+      <div class="v">621/621</div>
       <div class="c">differential cases (error code + line) vs the native TypeScript compiler, tsgo 7.0.2</div>
     </div>
   </div>
@@ -198,9 +198,12 @@ ztsc src/main.ts           # or explicit entry files</code></pre>
   <div class="note">
     <p><strong>Pre-release.</strong> ztsc is not ready for production use. It checks a large,
     well-defined subset of strict-mode TypeScript — watch mode and an LSP are the biggest gaps —
-    and unsupported syntax produces a clear "not supported" diagnostic, never a wrong answer or a
-    crash. It runs on macOS and Linux; Windows is not supported yet (a port is planned). The full
-    list is on the <a href="usage.html#limitations">usage page</a>.</p>
+    and unsupported syntax produces a clear "not supported" diagnostic, never a crash. It mostly
+    under-reports rather than inventing errors, but it is not yet a drop-in replacement for
+    <code>tsc --noEmit</code>: on a large production React/TypeScript application it reproduces
+    all 48 of tsc's errors byte-identically and adds 10 false positives of its own. It runs on
+    macOS and Linux; Windows is not supported yet (a port is planned). The full list is on the
+    <a href="usage.html#limitations">usage page</a>.</p>
   </div>
 </section>
 
