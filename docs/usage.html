@@ -44,7 +44,7 @@
 cd ztsc
 zig build -Doptimize=ReleaseFast   # -&gt; zig-out/bin/ztsc</code></pre>
   <p>A debug build is just <code>zig build</code>; <code>zig build test</code> runs the unit
-  tests and the 621-case differential conformance suite.</p>
+  tests and the 622-case differential conformance suite.</p>
 </section>
 
 <!-- ============================================================ -->
@@ -192,11 +192,6 @@ ztsc src/main.ts           # or explicit entry files</code></pre>
     <code>Draft&lt;S&gt;</code> under a reducer spread, Zod v4 <code>z.infer</code>), a few CFA
     narrowing depths, and one lib-policy divergence. Each is diagnosed and tracked; the count is
     measured against tsc on a large private codebase, not estimated.</li>
-    <li><strong>One valid-syntax parse gap</strong>: a conditional type nested inside a
-    <em>type argument</em> in the return type of a parenthesized function type —
-    <code>type F&lt;R&gt; = () =&gt; Box&lt;R extends X ? A : B&gt;</code> — fails to parse (it
-    recovers with parse errors). <code>new () =&gt;</code>, <code>&lt;T&gt;() =&gt;</code>, and
-    call signatures are fine. rxjs's <code>bindCallback.d.ts</code> hits it.</li>
     <li><strong>tsconfig options beyond the subset</strong> — honored: <code>files</code> /
     <code>include</code> / <code>exclude</code> / <code>extends</code>, and the
     <code>compilerOptions</code> keys <code>lib</code>, <code>baseUrl</code>, <code>paths</code>,

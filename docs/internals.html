@@ -48,7 +48,7 @@
     </div>
     <div class="stat">
       <div class="k">conformance</div>
-      <div class="v">621/621</div>
+      <div class="v">622/622</div>
       <div class="c">differential cases (error code + line) vs the native TypeScript compiler, tsgo 7.0.2</div>
     </div>
   </div>
@@ -397,7 +397,7 @@ pub const Program = struct {
   hand-trimmed surface, and <code>--census</code> over it reports zero out-of-subset
   constructs. <code>bench/</code> holds the corpus generator, the real-package fetcher
   (<code>fetch_real.sh</code>) and the end-to-end harnesses; <code>test/</code> holds the
-  conformance runner with 621 differential cases against the pinned native tsgo 7.0.2. A good reading order for the
+  conformance runner with 622 differential cases against the pinned native tsgo 7.0.2. A good reading order for the
   code is exactly the table above, top to bottom.</p>
 </section>
 
@@ -955,7 +955,7 @@ pub const Program = struct {
     <p><strong>Read before quoting.</strong> These are throughput and memory measurements on
     identical inputs — not a diagnostic-parity claim:</p>
     <p>ztsc checks a <em>subset</em> (against the real ES-core + DOM lib), so its diagnostic
-    output differs from tsgo's on real code; correctness is tracked separately by the 621-case
+    output differs from tsgo's on real code; correctness is tracked separately by the 622-case
     differential conformance suite validated against the TypeScript compiler. Packages are
     vendored without their dependencies — nonzero exit is expected, and both tools fully parse,
     bind, and check every file regardless. Wall clock is timed around the whole
@@ -984,9 +984,11 @@ pub const Program = struct {
   now parse and check — bare const-symbol keys (drizzle's <code>[entityKind]</code>,
   typebox's <code>[Kind]</code>) and member-expression keys (node's
   <code>[EventEmitter.captureRejectionSymbol]</code>, <code>[promisify.custom]</code>) alike.
-  The census residual is eight parse-recovery artifacts of two unsupported <em>type</em>
-  forms (drizzle's <code>this['_']</code> indexed access, a hono nested conditional), not
-  computed keys at all. The acceptance bar was the real, published
+  The census now reads <strong>zero across the board</strong>: the last residual — eight
+  parse-recovery artifacts blamed on two unsupported <em>type</em> forms (drizzle's
+  <code>this['_']</code> indexed access, a nested conditional in rxjs and hono) — was one
+  bug, a speculation flag left set across a function type's return type, not a subset gap
+  at all. The acceptance bar was the real, published
   <code>@types/node</code>: ztsc's cross-file merge diagnostics match the TypeScript compiler on it (pinned tsgo 7.0.2 oracle).</p>
   <p>What remains out for v0.0.1 is a short, deliberate list: a couple of lenient
   CommonJS corners that degrade to <code>any</code> instead of erroring,

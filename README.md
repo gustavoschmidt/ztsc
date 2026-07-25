@@ -10,7 +10,7 @@ A fast, low-memory TypeScript type checker, written in Zig.
 - A **single static binary**. No Node runtime, no dependencies — and none in
   the source either: nothing but the Zig standard library.
 - **Parallel by design**, with byte-identical output at any worker count.
-- Diagnostics **match the TypeScript compiler**, enforced by a 621-case
+- Diagnostics **match the TypeScript compiler**, enforced by a 622-case
   differential conformance suite.
 
 <picture>
@@ -85,11 +85,6 @@ What it does **not** check yet:
   `Draft<S>` under a reducer spread, Zod v4 `z.infer`), a few CFA narrowing
   depths, and one lib-policy divergence. Each is diagnosed and tracked; the
   count is measured against `tsc` on a large private codebase, not estimated.
-- **One valid-syntax parse gap**: a conditional type nested inside a *type
-  argument* in the return type of a parenthesized function type —
-  `type F<R> = () => Box<R extends X ? A : B>` — fails to parse (it recovers
-  with parse errors). `new () =>`, `<T>() =>`, and call signatures are fine.
-  rxjs's `bindCallback.d.ts` hits it.
 - **tsconfig options beyond the subset** — honored: `files` / `include` /
   `exclude` / `extends`, and the `compilerOptions` keys `lib`, `baseUrl`,
   `paths`, `types`, `typeRoots`, `skipLibCheck` / `skipDefaultLibCheck`,

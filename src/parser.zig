@@ -3155,7 +3155,20 @@ const Parser = struct {
         if (p.atLt()) tp = try p.parseTypeParams();
         const params = try p.parseParams();
         _ = try p.expect(.arrow, .expected_arrow);
-        const ret = try p.parseReturnType();
+        // Past the `=>` the function type is committed — a parenthesized type
+        // is no longer a live alternative — so clear the speculation flag for
+        // the return type, exactly as `parseParam` does for a parameter's
+        // annotation. Without this the `spec == 0` guard in `parseType` refuses
+        // a conditional nested inside the return type, the enclosing type
+        // argument list then fails, and the whole function type backtracks into
+        // a parenthesized type (rxjs's `bindCallback.d.ts`:
+        // `(...arg: A) => Observable<R extends [] ? void : …>`).
+        const ret = blk: {
+            const saved_spec = p.spec;
+            p.spec = 0;
+            defer p.spec = saved_spec;
+            break :blk try p.parseReturnType();
+        };
         const proto = try p.addExtra(ast.FnProto{
             .flags = 0,
             .name_token = 0,
