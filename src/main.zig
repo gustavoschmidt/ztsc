@@ -1240,163 +1240,96 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (cli.timing) {
-        const total_ms = nsToMs(total_ns);
-        const scanned_lines = @as(f64, @floatFromInt(total_lines * cli.repeat));
-        const scanned_bytes = @as(f64, @floatFromInt(total_bytes * cli.repeat));
-        try out.print("\n--timing\n", .{});
-        try out.print("  {s:<10} {s:>10} {s:>14} {s:>10}\n", .{ "phase", "ms", "lines/s", "MB/s" });
-        // load..bind are summed per-file worker times (files stream through
-        // the pipeline, so the phases overlap); discover is the front-end
-        // wall clock (spawn -> last completion resolved -> join).
-        try printPhase(out, "load", load_ns, @floatFromInt(total_lines), @floatFromInt(total_bytes));
-        try printPhase(out, "scan", scan_ns, scanned_lines, scanned_bytes);
-        try printPhase(out, "parse", parse_ns, scanned_lines, scanned_bytes);
-        try printPhase(out, "bind", bind_ns, scanned_lines, scanned_bytes);
-        try printPhase(out, "resolve", resolve_ns, 0, 0);
-        try printPhase(out, "discover", discover_ns, @floatFromInt(total_lines), @floatFromInt(total_bytes));
-        try printPhase(out, "link", link_ns, 0, 0);
-        try printPhase(out, "check", check_ns, @floatFromInt(total_lines), @floatFromInt(total_bytes));
-        try out.print("  {s:<10} {d:>10.3}\n", .{ "total", total_ms });
-        try out.print("  per checker:\n", .{});
-        for (tasks, 0..) |*t, k| {
-            try out.print("    checker[{d}] {d:>10.3} ms  {d} file(s)\n", .{ k, nsToMs(t.ns), t.owned.len });
-        }
-        // Resolution cache scoreboard: `probes` is FS syscalls issued
-        // (statFile + package.json reads); `lookups`/`hits` show the memo
-        // collapsing repeated specifiers. Compare probes with vs without
-        // --no-resolve-cache for the before/after number.
-        try out.print("  resolve cache: {d} probes, {d} lookups, {d} hits ({s})\n", .{
-            modules.fsProbeCount(),                              rcache.lookups, rcache.hits,
-            if (cli.no_resolve_cache) "disabled" else "enabled",
-        });
-        // Filesystem-fact memos under it (S1-lite): the walk's `<d>/node_modules`
-        // existence, package.json bodies, and per-directory realpath.
+        const checker_times = try arena.alloc(ztsc.report.CheckerTime, tasks.len);
+        for (tasks, checker_times) |*t, *ct| ct.* = .{ .ns = t.ns, .files = t.owned.len };
         const fs_counts = rcache.fs.entryCounts();
-        try out.print("  resolve fs memo: {d} node_modules dirs, {d} package.json, {d} realpath dirs, {d:.2} MiB\n", .{
-            fs_counts.nm_dirs,   fs_counts.pkg_json,
-            fs_counts.real_dirs, @as(f64, @floatFromInt(rcache.fs.bytes)) / (1024.0 * 1024.0),
+        try ztsc.report.printTiming(out, .{
+            .load_ns = load_ns,
+            .scan_ns = scan_ns,
+            .parse_ns = parse_ns,
+            .bind_ns = bind_ns,
+            .resolve_ns = resolve_ns,
+            .discover_ns = discover_ns,
+            .link_ns = link_ns,
+            .check_ns = check_ns,
+            .total_ns = total_ns,
+        }, .{
+            .lines = total_lines,
+            .bytes = total_bytes,
+            .repeat = cli.repeat,
+        }, checker_times, .{
+            .probes = modules.fsProbeCount(),
+            .lookups = rcache.lookups,
+            .hits = rcache.hits,
+            .enabled = !cli.no_resolve_cache,
+            .nm_dirs = fs_counts.nm_dirs,
+            .pkg_json = fs_counts.pkg_json,
+            .real_dirs = fs_counts.real_dirs,
+            .fs_bytes = rcache.fs.bytes,
         });
     }
 
     if (cli.memory) {
-        var worker_arena_bytes: usize = 0;
-        try out.print("\n--memory\n", .{});
-        try out.print("  {s:<24} {s:>12}\n", .{ "arena", "bytes" });
-        for (workers, 0..) |*w, i| {
-            const cap = w.arena.queryCapacity() + w.scratch.queryCapacity();
-            worker_arena_bytes += cap;
-            try out.print("  worker[{d}] arena{s:<7} {d:>12}\n", .{ i, "", cap });
+        // The shell measures; report.zig only formats. Every number below is
+        // read here, in main, and handed over as a value.
+        const worker_arena_bytes = try arena.alloc(usize, workers.len);
+        for (workers, worker_arena_bytes) |*w, *cap| {
+            cap.* = w.arena.queryCapacity() + w.scratch.queryCapacity();
         }
         const istats = interner.bytesUsed(io);
-        try out.print("  {s:<24} {d:>12}\n", .{ "interner (total)", istats.total() });
-        try out.print("  {s:<24} {d:>12}\n", .{ "  of which strings", istats.string_bytes });
-        try out.print("  {s:<24} {d:>12}\n", .{ "line tables (in arenas)", line_table_bytes });
-        try out.print("  {s:<24} {d:>12}\n", .{ "token arrays (in arenas)", token_bytes });
         var pack_text: usize = 0;
         var pack_reserved: usize = 0;
         for (workers) |*w| {
             pack_text += w.pack.text_bytes;
             pack_reserved += w.pack.reserved_bytes;
         }
-        try out.print("  {s:<24} {d:>12}\n", .{ "source text (file)", total_bytes });
-        try out.print("  {s:<24} {d:>12}\n", .{ "  of which packed", pack_text });
-        try out.print("  {s:<24} {d:>12}\n", .{ "  pack segments", pack_reserved });
-        try out.print("  {s:<24} {d:>12}\n", .{ "tokens", total_tokens });
-        const bytes_per_token: f64 = if (total_tokens > 0)
-            @as(f64, @floatFromInt(token_bytes)) / @as(f64, @floatFromInt(total_tokens))
-        else
-            0;
-        try out.print("  {s:<24} {d:>12.2}\n", .{ "bytes/token", bytes_per_token });
-
-        // AST statistics (bytes/node is the key memory metric).
-        try out.print("  {s:<24} {d:>12}\n", .{ "ast nodes", total_nodes });
-        try out.print("  {s:<24} {d:>12}\n", .{ "ast node SoA bytes", node_bytes });
-        try out.print("  {s:<24} {d:>12}\n", .{ "ast extra_data bytes", extra_bytes });
-        try out.print("  {s:<24} {d:>12}\n", .{ "ast token bytes", ast_token_bytes });
-        const bytes_per_node: f64 = if (total_nodes > 0)
-            @as(f64, @floatFromInt(node_bytes + extra_bytes)) / @as(f64, @floatFromInt(total_nodes))
-        else
-            0;
-        const nodes_per_line: f64 = if (total_lines > 0)
-            @as(f64, @floatFromInt(total_nodes)) / @as(f64, @floatFromInt(total_lines))
-        else
-            0;
-        try out.print("  {s:<24} {d:>12.2}\n", .{ "bytes/node (SoA+extra)", bytes_per_node });
-        try out.print("  {s:<24} {d:>12.2}\n", .{ "nodes/line", nodes_per_line });
-
-        // Binder statistics (binder bytes/line is the key metric).
-        const bind_total_bytes = bind_symbol_bytes + bind_scope_bytes +
-            bind_flow_bytes + bind_record_bytes;
-        try out.print("  {s:<24} {d:>12}\n", .{ "bind symbols", total_symbols });
-        try out.print("  {s:<24} {d:>12}\n", .{ "bind scopes", total_scopes });
-        try out.print("  {s:<24} {d:>12}\n", .{ "bind flow nodes", total_flows });
-        try out.print("  {s:<24} {d:>12}\n", .{ "bind symbol bytes", bind_symbol_bytes });
-        try out.print("  {s:<24} {d:>12}\n", .{ "bind scope bytes", bind_scope_bytes });
-        try out.print("  {s:<24} {d:>12}\n", .{ "bind flow bytes", bind_flow_bytes });
-        try out.print("  {s:<24} {d:>12}\n", .{ "bind record bytes", bind_record_bytes });
-        const bind_bytes_per_line: f64 = if (total_lines > 0)
-            @as(f64, @floatFromInt(bind_total_bytes)) / @as(f64, @floatFromInt(total_lines))
-        else
-            0;
-        try out.print("  {s:<24} {d:>12.2}\n", .{ "bind bytes/line", bind_bytes_per_line });
-
-        // Module graph.
-        try out.print("  {s:<24} {d:>12}\n", .{ "module graph bytes", prog.graphBytes() });
-
-        // Checker statistics (bytes/type; per-checker breakdown).
+        var checker_mem: std.ArrayList(ztsc.report.CheckerMem) = .empty;
         for (tasks, 0..) |*t, k| {
             const ck = t.result orelse continue;
-            try out.print("  checker[{d}] types        {d:>12}\n", .{ k, ck.stats.types_created });
-            try out.print("  checker[{d}] type bytes   {d:>12}\n", .{ k, ck.stats.type_bytes });
+            try checker_mem.append(arena, .{
+                .index = k,
+                .types = ck.stats.types_created,
+                .type_bytes = ck.stats.type_bytes,
+            });
         }
-        try out.print("  {s:<24} {d:>12}\n", .{ "check types (total)", check_types });
-        try out.print("  {s:<24} {d:>12}\n", .{ "check type-arena bytes", check_type_bytes });
-        const bytes_per_type: f64 = if (check_types > 0)
-            @as(f64, @floatFromInt(check_type_bytes)) / @as(f64, @floatFromInt(check_types))
-        else
-            0;
-        try out.print("  {s:<24} {d:>12.2}\n", .{ "bytes/type", bytes_per_type });
-        const types_per_line: f64 = if (total_lines > 0)
-            @as(f64, @floatFromInt(check_types)) / @as(f64, @floatFromInt(total_lines))
-        else
-            0;
-        try out.print("  {s:<24} {d:>12.2}\n", .{ "types/line", types_per_line });
-        try out.print("  {s:<24} {d:>12}\n", .{ "relation cache entries", check_rel_entries });
-        try out.print("  {s:<24} {d:>12}\n", .{ "relation cache bytes", check_rel_bytes });
-        const rel_total = check_rel_hits + check_rel_misses;
-        const rel_hit_rate: f64 = if (rel_total > 0)
-            100.0 * @as(f64, @floatFromInt(check_rel_hits)) / @as(f64, @floatFromInt(rel_total))
-        else
-            0;
-        try out.print("  {s:<24} {d:>11.1}%\n", .{ "relation hit rate", rel_hit_rate });
-        // Instantiation cache.
-        try out.print("  {s:<24} {d:>12}\n", .{ "inst cache hits", check_inst_hits });
-        try out.print("  {s:<24} {d:>12}\n", .{ "inst cache misses", check_inst_misses });
-        try out.print("  {s:<24} {d:>12}\n", .{ "inst canonical maps", check_inst_maps });
-        const inst_total = check_inst_hits + check_inst_misses;
-        const inst_hit_rate: f64 = if (inst_total > 0)
-            100.0 * @as(f64, @floatFromInt(check_inst_hits)) / @as(f64, @floatFromInt(inst_total))
-        else
-            0;
-        try out.print("  {s:<24} {d:>11.1}%\n", .{ "inst hit rate", inst_hit_rate });
-        try out.print("  {s:<24} {d:>12}\n", .{ "node_types hits", check_nt_hits });
-        try out.print("  {s:<24} {d:>12}\n", .{ "node_types misses", check_nt_misses });
-        const nt_total = check_nt_hits + check_nt_misses;
-        const nt_hit_rate: f64 = if (nt_total > 0)
-            100.0 * @as(f64, @floatFromInt(check_nt_hits)) / @as(f64, @floatFromInt(nt_total))
-        else
-            0;
-        try out.print("  {s:<24} {d:>11.1}%\n", .{ "node_types hit rate", nt_hit_rate });
-        try out.print("  {s:<24} {d:>12}\n", .{ "check scratch high-water", check_scratch_hw });
-        try out.print("  {s:<24} {d:>12}\n", .{ "check flow queries", check_flow_queries });
-
-        const heap_total = worker_arena_bytes + istats.total();
-        const bytes_per_line: f64 = if (total_lines > 0)
-            @as(f64, @floatFromInt(heap_total)) / @as(f64, @floatFromInt(total_lines))
-        else
-            0;
-        try out.print("  {s:<24} {d:>12}\n", .{ "heap total (arenas)", heap_total });
-        try out.print("  {s:<24} {d:>12.2}\n", .{ "bytes/line (heap)", bytes_per_line });
+        try ztsc.report.printMemory(out, .{
+            .worker_arena_bytes = worker_arena_bytes,
+            .interner_total = istats.total(),
+            .interner_strings = istats.string_bytes,
+            .line_table_bytes = line_table_bytes,
+            .token_bytes = token_bytes,
+            .source_bytes = total_bytes,
+            .pack_text = pack_text,
+            .pack_reserved = pack_reserved,
+            .tokens = total_tokens,
+            .lines = total_lines,
+            .nodes = total_nodes,
+            .node_bytes = node_bytes,
+            .extra_bytes = extra_bytes,
+            .ast_token_bytes = ast_token_bytes,
+            .symbols = total_symbols,
+            .scopes = total_scopes,
+            .flows = total_flows,
+            .bind_symbol_bytes = bind_symbol_bytes,
+            .bind_scope_bytes = bind_scope_bytes,
+            .bind_flow_bytes = bind_flow_bytes,
+            .bind_record_bytes = bind_record_bytes,
+            .graph_bytes = prog.graphBytes(),
+            .checkers = checker_mem.items,
+            .check_types = check_types,
+            .check_type_bytes = check_type_bytes,
+            .rel_entries = check_rel_entries,
+            .rel_bytes = check_rel_bytes,
+            .rel_hits = check_rel_hits,
+            .rel_misses = check_rel_misses,
+            .inst_hits = check_inst_hits,
+            .inst_misses = check_inst_misses,
+            .inst_maps = check_inst_maps,
+            .nt_hits = check_nt_hits,
+            .nt_misses = check_nt_misses,
+            .scratch_high_water = check_scratch_hw,
+            .flow_queries = check_flow_queries,
+        });
     }
 
     try out.flush();
@@ -1495,13 +1428,6 @@ fn printCensus(
             @as(f64, @floatFromInt(if (total == 0) 1 else total));
         try out.print("  {s:<32} {d:>9} {d:>6.1}%\n", .{ kind.label(), counts[k], share });
     }
-}
-
-fn printPhase(out: *Io.Writer, name: []const u8, ns: u64, lines: f64, bytes: f64) !void {
-    const s = @as(f64, @floatFromInt(ns)) / std.time.ns_per_s;
-    const lines_per_s: f64 = if (s > 0 and lines > 0) lines / s else 0;
-    const mb_per_s: f64 = if (s > 0 and bytes > 0) bytes / (1024.0 * 1024.0) / s else 0;
-    try out.print("  {s:<10} {d:>10.3} {d:>14.0} {d:>10.1}\n", .{ name, nsToMs(ns), lines_per_s, mb_per_s });
 }
 
 /// Resolve one module specifier of `importer`; appends to the spec map and
@@ -1612,10 +1538,6 @@ fn sortSpecPairs(atoms: []ztsc.intern.Atom, files: []modules.FileId) void {
             std.mem.swap(modules.FileId, &files[j - 1], &files[j]);
         }
     }
-}
-
-fn nsToMs(ns: u64) f64 {
-    return @as(f64, @floatFromInt(ns)) / std.time.ns_per_ms;
 }
 
 /// Parse argv. On error, `bad_arg` names the offending argument.
