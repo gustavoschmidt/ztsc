@@ -15771,12 +15771,17 @@ const Checker = struct {
     }
 
     fn narrowByDiscriminant(c: *Checker, t: TypeId, prop: Atom, value: TypeId, sense: bool) Error!TypeId {
-        if (c.ts.kind(t) != .union_type) {
-            return t;
-        }
         var parts: std.ArrayList(TypeId) = .empty;
         defer parts.deinit(c.scratch());
-        for (try c.memberList(t)) |m| {
+        // Also filter a single (non-union) member: once a discriminated union
+        // has been narrowed to one constituent, an equality guard on its
+        // discriminant still refines it — the false branch of `x.type === 'C'`
+        // on `{ type: 'C' }` is `never` (tsc). A member lacking the discriminant
+        // prop (`any`/`unknown`/primitives, wide `type: string`) stays in both
+        // branches via the conservative arms below, so nothing over-narrows.
+        const single = [_]TypeId{t};
+        const members: []const TypeId = if (c.ts.kind(t) == .union_type) try c.memberList(t) else &single;
+        for (members) |m| {
             const rm = try c.resolveStructural(m);
             const p = try c.propOfType(rm, prop);
             var matches = true; // members without the prop stay (conservative)
@@ -15789,11 +15794,16 @@ const Checker = struct {
                 }
             }
             const kept = if (sense) matches else blk: {
-                // false branch removes members whose discriminant is
-                // *exactly* the value.
+                // false branch removes a member only when its discriminant is a
+                // UNIT type (literal / null / undefined) exactly equal to the
+                // value. A wide discriminant (`current: string`) is never a
+                // unit, so `x.current !== s` must keep it — dropping it to
+                // `never` is the over-narrow that a single-member `t` exposed.
                 if (p) |pp| {
                     const pv = try c.ts.regularLiteral(pp.ty);
-                    break :blk pv != value;
+                    const is_unit = c.ts.literalBase(pv) != types.no_type or
+                        c.ts.kind(pv) == .null or c.ts.kind(pv) == .undefined;
+                    break :blk !(is_unit and pv == value);
                 }
                 break :blk true;
             };
