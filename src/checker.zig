@@ -3511,7 +3511,20 @@ const Checker = struct {
                 }
             }
             const p = try c.paramInfo(pn, pi, ctx_sig, report_implicit);
-            try params.append(c.scratch(), p);
+            // A parameter with an initializer (`x = 'grey'`) is optional at the
+            // call site and accepts `undefined` — passing `undefined` triggers
+            // the default (tsc's `getTypeOfParameter` adds the optional type).
+            // The body symbol, however, keeps the non-undefined type (the
+            // default fills the gap), so widen ONLY the signature copy here and
+            // leave the body pin below on the original `p.ty`. Explicit `?`
+            // params were already unioned with undefined in `paramInfo`.
+            var sig_p = p;
+            if (p.flags & types.param_flag_initializer != 0 and
+                p.flags & types.param_flag_optional == 0)
+            {
+                sig_p.ty = try c.makeUnion2(p.ty, types.undefined_type);
+            }
+            try params.append(c.scratch(), sig_p);
             // Pin the parameter symbol's type so body checking sees the
             // contextual/inferred type (not a re-derivation without ctx). When a
             // contextual signature is supplied (`ctx_sig`), FORCE-overwrite any
