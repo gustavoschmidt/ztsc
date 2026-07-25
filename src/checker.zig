@@ -12257,11 +12257,33 @@ const Checker = struct {
             switch (c.nodeTag(prop)) {
                 .object_property => {
                     if (pd.lhs != 0 and c.nodeTag(pd.lhs) == .computed_name) {
-                        const kt = try c.checkExprCached(c.tree.nodeData(pd.lhs).lhs, types.no_type);
+                        const key_expr = c.tree.nodeData(pd.lhs).lhs;
+                        const kt = try c.checkExprCached(key_expr, types.no_type);
                         // A `unique symbol` key names a real, nominally-keyed
                         // property (`{ [k]: v }`); any other computed key stays
                         // dynamic (no static member).
                         if (try c.uniqueSymAtom(kt)) |key| {
+                            const pctx = try c.ctxPropType(rctx, ctx, key);
+                            var vt = try c.checkExprCached(pd.rhs, pctx);
+                            if (c.const_ctx) {
+                                vt = try c.ts.regularLiteral(vt);
+                            } else if (!try c.keepLiteral(vt, pctx)) vt = try c.widenLiteral(vt);
+                            try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = vt });
+                            continue;
+                        }
+                        // A qualified enum-member computed key (`{ [Breed.X]: v
+                        // }`): the member's value identity is unavailable at the
+                        // type level (kt is the whole `enum_type`), so — exactly
+                        // like the type-literal/interface member — key it by the
+                        // text-derived `__@k$<obj>.<member>` placeholder. This
+                        // makes the literal match a `{ [Breed.X]: … }` target
+                        // (whose members the binder keys the same way) instead of
+                        // dropping the property and collapsing to `{}`.
+                        if (c.ts.kind(try c.resolveStructural(kt)) == .enum_type and
+                            c.nodeTag(key_expr) == .member_expr)
+                        {
+                            const member_tok = c.tree.nodeData(key_expr).rhs;
+                            const key = try c.computedSymKey(member_tok, ast.Flags.computed_sym | ast.Flags.computed_sym_qual, c.cur_scope);
                             const pctx = try c.ctxPropType(rctx, ctx, key);
                             var vt = try c.checkExprCached(pd.rhs, pctx);
                             if (c.const_ctx) {
