@@ -671,10 +671,15 @@ const Checker = struct {
     /// count limit; suppresses memoization of the (truncated) results for that
     /// call. Reset at each top-level entry (`inst_depth == 0`).
     inst_limit_tripped: bool = false,
-    /// Diagnostic span used when the instantiation limit is hit (TS2589),
-    /// tracked at expression / assignability boundaries where materialization
-    /// is triggered.
-    inst_span: Span = .{ .start = 0, .end = 0 },
+    /// Diagnostic anchor used when the instantiation limit is hit (TS2589 /
+    /// TS2590), tracked at expression / statement / assignability boundaries
+    /// where materialization is triggered. `ast.Ast.span` walks the whole
+    /// subtree and re-scans every token it covers, so the hot boundaries
+    /// record just the node and pay for the span only if a diagnostic
+    /// actually fires. The node's file is captured too: materializing a type
+    /// can switch the current-file context (`enterSymFile`), and the anchor
+    /// must resolve against the tree it was recorded in.
+    inst_anchor: InstAnchor = .{ .span = .{ .start = 0, .end = 0 } },
     /// Master switch for the instantiation caching layer (`--no-inst-cache` clears it):
     /// the instantiate memo, map interning, constraint memo, and type-node
     /// memo. The depth/count limits are independent of it.
@@ -1394,6 +1399,27 @@ const Checker = struct {
 
     fn nodeSpan(c: *const Checker, node: Node) Span {
         return c.tree.span(c.src, node);
+    }
+
+    /// Deferred `inst_span`: either a node (span computed on demand) or an
+    /// explicit span pushed by a caller that has one in hand already.
+    const InstAnchor = union(enum) {
+        node: struct { file: FileId, node: Node },
+        span: Span,
+    };
+
+    fn instSpan(c: *const Checker) Span {
+        return switch (c.inst_anchor) {
+            .span => |s| s,
+            .node => |n| blk: {
+                const pf = &c.prog.files[n.file];
+                break :blk pf.tree.span(pf.src, n.node);
+            },
+        };
+    }
+
+    fn anchorInst(c: *Checker, node: Node) void {
+        c.inst_anchor = .{ .node = .{ .file = c.cur_file, .node = node } };
     }
 
     fn nodeTag(c: *const Checker, node: Node) ast.Tag {
@@ -6677,7 +6703,7 @@ const Checker = struct {
         // truncate this subtree to `error_type`.
         if (c.inst_depth > max_instantiation_depth or c.inst_count > max_instantiation_count) {
             c.inst_limit_tripped = true;
-            if (!c.suppress_inst_diag) try c.diagFmt(2589, c.inst_span, "Type instantiation is excessively deep and possibly infinite.", .{});
+            if (!c.suppress_inst_diag) try c.diagFmt(2589, c.instSpan(), "Type instantiation is excessively deep and possibly infinite.", .{});
             return types.error_type;
         }
         c.inst_depth += 1;
@@ -7107,7 +7133,7 @@ const Checker = struct {
     fn reduceConditional(c: *Checker, chk: TypeId, extends_ty: TypeId, true_ty: TypeId, false_ty: TypeId, distributive: bool) Error!TypeId {
         if (c.inst_depth > max_instantiation_depth or c.inst_count > max_instantiation_count) {
             c.inst_limit_tripped = true;
-            if (!c.suppress_inst_diag) try c.diagFmt(2589, c.inst_span, "Type instantiation is excessively deep and possibly infinite.", .{});
+            if (!c.suppress_inst_diag) try c.diagFmt(2589, c.instSpan(), "Type instantiation is excessively deep and possibly infinite.", .{});
             return types.error_type;
         }
         c.inst_depth += 1;
@@ -7981,7 +8007,7 @@ const Checker = struct {
     fn reduceMapped(c: *Checker, key_param: TypeId, constraint: TypeId, value: TypeId, as_clause: TypeId, src_type: TypeId, flags: u32) Error!TypeId {
         if (c.inst_depth > max_instantiation_depth or c.inst_count > max_instantiation_count) {
             c.inst_limit_tripped = true;
-            if (!c.suppress_inst_diag) try c.diagFmt(2589, c.inst_span, "Type instantiation is excessively deep and possibly infinite.", .{});
+            if (!c.suppress_inst_diag) try c.diagFmt(2589, c.instSpan(), "Type instantiation is excessively deep and possibly infinite.", .{});
             return types.error_type;
         }
         c.inst_depth += 1;
@@ -8782,7 +8808,7 @@ const Checker = struct {
     fn reduceTemplateChunks(c: *Checker, head: Atom, holes: []const TypeId, chunks: []const Atom) Error!TypeId {
         if (c.inst_depth > max_instantiation_depth or c.inst_count > max_instantiation_count) {
             c.inst_limit_tripped = true;
-            if (!c.suppress_inst_diag) try c.diagFmt(2589, c.inst_span, "Type instantiation is excessively deep and possibly infinite.", .{});
+            if (!c.suppress_inst_diag) try c.diagFmt(2589, c.instSpan(), "Type instantiation is excessively deep and possibly infinite.", .{});
             return types.error_type;
         }
         c.inst_depth += 1;
@@ -8848,7 +8874,7 @@ const Checker = struct {
             builders = next;
             if (builders.items.len >= cap) {
                 c.inst_limit_tripped = true;
-                try c.diagFmt(2590, c.inst_span, "Expression produces a union type that is too complex to represent.", .{});
+                try c.diagFmt(2590, c.instSpan(), "Expression produces a union type that is too complex to represent.", .{});
                 return types.string_type;
             }
         }
@@ -10712,7 +10738,7 @@ const Checker = struct {
     fn checkAssignable(c: *Checker, src_t: TypeId, target: TypeId, expr_node: Node, span: Span) Error!bool {
         // Anchor any TS2589 raised while expanding either side (instantiation
         // limit) at the assignment site.
-        c.inst_span = span;
+        c.inst_anchor = .{ .span = span };
         if (try c.isAssignable(src_t, target)) {
             // Excess property check for fresh object literals.
             if (expr_node != 0) {
@@ -11047,7 +11073,7 @@ const Checker = struct {
         if (node == null_node) return types.any_type;
         // Anchor any TS2589 raised while materializing this expression's type
         // (instantiation limit) at the expression's span.
-        c.inst_span = c.nodeSpan(node);
+        c.anchorInst(node);
         const key = c.nodeKey(node);
         if (c.node_types.get(key)) |e| {
             if (e.ctx == ctx) {
@@ -16579,7 +16605,7 @@ const Checker = struct {
         // Baseline anchor for any TS2589 raised while materializing types in
         // this statement (refined to finer spans at expression / assignment
         // boundaries).
-        c.inst_span = c.nodeSpan(node);
+        c.anchorInst(node);
         const d = c.tree.nodeData(node);
         const stmt_tag = c.nodeTag(node);
         // A class-position decorator applies to the class that immediately
