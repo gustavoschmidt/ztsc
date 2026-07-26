@@ -268,7 +268,19 @@ const max_instantiation_count = 5_000_000;
 /// allocator. Safe by construction: the shrink runs at the exact point
 /// `.retain_capacity` already logically frees everything, so nothing live is
 /// referenced past it.
-const scratch_retain_limit = 8 * 1024 * 1024;
+///
+/// The limit is a straight RSS/allocator-traffic trade and was measured on the
+/// dogfood project at `--checkers=4` (medians of interleaved runs, instructions
+/// retired as the load-insensitive wall proxy):
+///
+///   8 MiB (was)  236.5 MB  21.721 G ins
+///   1 MiB        235.6 MB  21.720 G ins
+///   256 KiB      229.0 MB  21.758 G ins  (+0.17%)
+///    64 KiB      227.7 MB  21.818 G ins  (+0.44%)
+///
+/// 256 KiB is the knee: below it the per-statement re-`mmap` traffic starts
+/// costing more than the pages it hands back.
+const scratch_retain_limit = 256 * 1024;
 /// Recursion-depth cap for the structural assignability relation
 /// (`isAssignable`). A recursive generic alias whose recursion is *undecidable*
 /// to ztsc — react-hook-form's `PathValueImpl`/`Path` peel a generic string
