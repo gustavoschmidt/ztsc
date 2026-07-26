@@ -749,6 +749,32 @@ pub const Ast = struct {
         return .{ .start = lo, .end = hi };
     }
 
+    /// `span(node).start` in O(1), for the node kinds whose `main_token` is
+    /// provably their leftmost covered token; null when the start genuinely
+    /// needs the subtree walk (the caller falls back to `span`).
+    ///
+    /// Only the declaration kinds the TDZ / definite-assignment checks reach
+    /// are listed: those compare a use's offset against the declaration's
+    /// start on *every* reference to a `let`/`const`/`class` binding, and
+    /// `span` would walk the whole initializer or class body each time.
+    pub fn spanStart(a: *const Ast, node: Node) ?u32 {
+        return switch (a.nodeTag(node)) {
+            // `parseDeclarator` sets main_token to the first token of the
+            // binding name — including the `{`/`[` of a pattern — and the
+            // name, `!`, type annotation and initializer all follow it.
+            .declarator,
+            .declarator_init,
+            .declarator_full,
+            // main_token = `class`; the name token, type parameters,
+            // heritage clauses and members all follow it. Decorators are
+            // *sibling* nodes, so they lie outside this node's span (as in
+            // `span`, which never sees them either).
+            .class_decl,
+            => a.tokens.start(a.nodeMainToken(node)),
+            else => null,
+        };
+    }
+
     fn coverToken(a: *const Ast, src: []const u8, tok: TokenIndex, lo: *u32, hi: *u32) void {
         const s = a.tokens.start(tok);
         const e = scanner.tokenEnd(src, a.tokens.tag(tok), s);

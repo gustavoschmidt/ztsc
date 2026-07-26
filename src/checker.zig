@@ -1413,6 +1413,19 @@ const Checker = struct {
         return c.tree.span(c.src, node);
     }
 
+    /// `nodeSpan(node).start` without the O(subtree) walk where the AST
+    /// shape makes the start derivable from `main_token`. Debug builds
+    /// cross-check every fast answer against the real span, so a wrong
+    /// `Ast.spanStart` arm trips the conformance suite instead of silently
+    /// moving a diagnostic.
+    fn nodeSpanStart(c: *const Checker, node: Node) u32 {
+        if (c.tree.spanStart(node)) |start| {
+            if (std.debug.runtime_safety) std.debug.assert(start == c.nodeSpan(node).start);
+            return start;
+        }
+        return c.nodeSpan(node).start;
+    }
+
     /// Deferred `inst_span`: either a node (span computed on demand) or an
     /// explicit span pushed by a caller that has one in hand already.
     const InstAnchor = union(enum) {
@@ -12123,9 +12136,9 @@ const Checker = struct {
         if (c.symFile(sym) != c.cur_file) return; // cross-file: no TDZ
         const decls = c.declsOf(sym);
         if (decls.len == 0) return;
-        const decl_span = c.nodeSpan(decls[0]);
+        const decl_start = c.nodeSpanStart(decls[0]);
         const use_start = c.tree.tokens.start(tok);
-        if (use_start >= decl_span.start) return;
+        if (use_start >= decl_start) return;
         // Uses inside a *nested function* run later — no TDZ error.
         const use_container = c.containerOf(c.cur_scope);
         const decl_container = c.containerOf(c.symScope(sym));
@@ -12158,8 +12171,7 @@ const Checker = struct {
         // initializer (tsc reports 2448 + 2454 together).
         var before_decl = false;
         if (decls.len > 0) {
-            const decl_span = c.nodeSpan(decls[0]);
-            if (c.tree.tokens.start(tok) < decl_span.start) before_decl = true;
+            if (c.tree.tokens.start(tok) < c.nodeSpanStart(decls[0])) before_decl = true;
         }
         if ((has_init or has_definite) and !before_decl) return;
         const dk = c.ts.kind(declared);
