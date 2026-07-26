@@ -107,6 +107,9 @@ What it does **not** check yet:
   *class value* keeps its generic `typeof C` instead of the specialized
   constructor type — `const C2 = C<string>` still infers its type argument at
   each `new C2(…)`, so the specialization under-reports rather than misfires.
+- **Class static sides are not related on `extends`**: a derived `static` that
+  shadows a base `static` with an incompatible type is accepted (`tsc` reports
+  TS2417). Instance-side heritage checking is unaffected.
 - **Symbol-key corners**: a plain non-`unique` `symbol` key (rxjs's
   `[Symbol.observable]`, declared `: symbol`) is keyed by name rather than as
   a symbol index.
@@ -114,7 +117,9 @@ What it does **not** check yet:
   spreads of unions/generics/index-signature types, and children *value*
   typing are unchecked; class-component prop mistakes report refined codes
   (TS2741/2322) where tsgo reports TS2769.
-- A handful of other known edge cases miss an error `tsc` would report.
+- A handful of other known edge cases miss an error `tsc` would report. The
+  ones the conformance suite covers are enumerated, with a reason each, in
+  `test/conformance/DEFERRED`.
 
 Feature parity is in the works.
 

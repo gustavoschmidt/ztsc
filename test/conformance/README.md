@@ -62,9 +62,46 @@ node test/conformance/gen_expected.js test/conformance --check  # verify
 exactly 7.0.2; `cd bench/baselines/tsgo && npm install` if node_modules is
 missing. node_modules are never checked in.)
 
+**Snapshots are never hand-edited.** A `.expected`/`expected` file is exactly
+what the oracle printed, so `--check` is a real gate: if it reports a
+mismatch, either the case changed or a snapshot was edited by hand, and both
+need explaining. Editing a snapshot to match ztsc silently converts the suite
+from "ztsc matches tsc" into "ztsc matches what ztsc did last time".
+
+Every case is checked with the same options, so an option a case wants to
+turn *off* has to be one the oracle can actually be told to turn off.
+`allowSyntheticDefaultImports`/`esModuleInterop` are not: this oracle version
+removed the `=false` form of both (TS5108), and the fixed
+`--moduleResolution bundler` makes the effective flag true anyway — so the
+synthesized default is on for every case, and `run_conformance.zig` defaults
+the same way.
+
+## Accepted divergences (`DEFERRED`)
+
+Deliberate, reviewed differences between the oracle and ztsc live in
+`test/conformance/DEFERRED`, one per line, each with a comment saying why:
+
+```
+<case-path>  -TS<code> [<file>] <line>   # oracle reports it, ztsc does not
+<case-path>  +TS<code> [<file>] <line>   # ztsc reports it, the oracle does not
+```
+
+The runner subtracts these before comparing. A `-` entry is an accepted
+under-report, which project policy allows when it is deterministic and
+reasoned; a `+` entry admits a diagnostic the oracle does not produce and
+needs a much stronger justification (today the only one is a report-*site*
+difference on a diagnostic that is in the snapshot at another line).
+
+The registry cannot hide a regression: the runner fails the case when an
+entry stops describing reality — ztsc started emitting a `-` line, stopped
+emitting a `+` line, the oracle no longer reports a `-` line, or the case is
+gone. Fixing the underlying gap therefore *breaks the build* until the entry
+is deleted.
+
 ## Runner
 
 `test/run_conformance.zig` (wired into `zig build test`) runs the real
 pipeline (parse → bind → check) on every `.ts` file and diffs the produced
-diagnostics against the snapshot as a multiset of (code, line) pairs.
-Message text is informational and not compared.
+diagnostics against the snapshot as a multiset of (code, line) pairs, after
+applying that case's `DEFERRED` entries. Message text is informational and
+not compared.

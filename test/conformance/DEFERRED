@@ -1,0 +1,50 @@
+# Reviewed divergences between the pinned oracle and ztsc.
+#
+# `.expected` snapshots are pure oracle output and are never hand-edited, so
+# `node test/conformance/gen_expected.js test/conformance --check` is a real
+# gate. Every deliberate difference is recorded here instead, one per line:
+#
+#   <case-path>  -TS<code> [<file>] <line>   oracle reports it, ztsc does not
+#   <case-path>  +TS<code> [<file>] <line>   ztsc reports it, the oracle does not
+#
+# (`<file>` only for directory cases, matching the snapshot format.)
+#
+# Policy: a missed error (`-`) is acceptable when it is deterministic and
+# reasoned; a false positive is not. A `+` entry therefore needs a stronger
+# justification than a `-` entry and is only defensible when the same
+# diagnostic is also present in the snapshot at a different span.
+#
+# The registry is self-cleaning: run_conformance.zig fails the case if an entry
+# stops describing reality (ztsc started emitting a `-` line, stopped emitting
+# a `+` line, the oracle dropped a `-` line, or the case is gone). It cannot be
+# used to hide a regression.
+
+# TS2417 (class static side incorrectly extends base static side) is not
+# implemented: ztsc does not relate `typeof Derived` to `typeof Base` when a
+# derived static shadows a base static incompatibly. Under-report of a whole
+# check, not a span/precision difference.
+classes/033_static_inherit.ts  -TS2417 14
+
+# TS2589 at the structural-relation recursion cap. ztsc's cap assumes the
+# relation and stays silent rather than reporting at the cap, because reporting
+# there would false-positive genuinely-valid deep recursive types the oracle
+# accepts (real form-library `PathValue` shapes). Deliberate, deterministic
+# under-report; the cases exist to prove these inputs keep checking without
+# stack-overflowing. See the comment in each case file.
+instantiation/003_recursive_alias_relation_cap.ts  -TS2589 19
+instantiation/010_growing_bareref_no_eager_expand.ts  -TS2589 12
+
+# Same diagnostic, different anchor: the oracle reports TS2589 at the deep
+# template node inside the alias declaration (line 16); ztsc reports it at the
+# annotation that triggered the instantiation (line 18). The error IS produced
+# and the TS2322 on line 18 matches — this is a report-SITE divergence on one
+# diagnostic, hand-verified, not an extra error.
+instantiation/018_growing_template_hole_no_loop.ts  -TS2589 16
+instantiation/018_growing_template_hole_no_loop.ts  +TS2589 18
+
+# An `exports`-map subpath that the map does not name is routed to an opaque
+# `any` module rather than left dangling. Dangling the specifier was not
+# crash-safe under parallel resolution (it dangled a symbol -> SIGABRT), so the
+# TS2307 the oracle emits is deliberately traded for crash safety. See the
+# comment in the case entry.ts.
+modules/39_exports_subpath_block  -TS2307 entry.ts 12

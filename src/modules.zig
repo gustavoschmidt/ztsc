@@ -1450,7 +1450,9 @@ const Linker = struct {
                         if (found) |ff| {
                             tgt = ff;
                             tgt.type_only = tgt.type_only or rec.type_only;
-                        } else if (l.allow_synthetic_default and mfile_opt != null) {
+                        } else if (l.allow_synthetic_default and mfile_opt != null and
+                            paths.isDeclarationPath(l.files[mfile_opt.?].path))
+                        {
                             // allowSyntheticDefaultImports/esModuleInterop: a
                             // default import of a module that has no default
                             // export binds to the module namespace object (tsc's
@@ -1458,6 +1460,15 @@ const Linker = struct {
                             // above (via `exeq`); this covers the ES-module /
                             // `export as namespace` shape (`import L from
                             // "leaflet"` → the leaflet namespace object).
+                            //
+                            // Only a DECLARATION file gets the synthesized
+                            // default, mirroring tsc's `canHaveSyntheticDefault`:
+                            // a `.d.ts` describes a module whose runtime shape is
+                            // unknown, so the default may exist at runtime. A real
+                            // source file in the program that carries ES-module
+                            // syntax is known not to have one, and tsc reports
+                            // TS1192/TS2613 there whatever the flag says
+                            // (conformance modules/11, modules/25).
                             tgt = .{ .kind = .namespace, .file = mfile_opt.?, .type_only = rec.type_only };
                         } else if (mfile_opt == null and l.ambientOpaque(rec.module)) {
                             // `export =`-shaped ambient module: the CommonJS

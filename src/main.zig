@@ -480,7 +480,10 @@ pub fn main(init: std.process.Init) !void {
     // tsconfig allowJs (resolve JS-only deps as `any`) + effective noImplicitAny.
     var config_allow_js = false;
     var config_no_implicit_any = true;
-    var config_allow_synthetic_default = false;
+    // Effective allowSyntheticDefaultImports. With no tsconfig (bare file
+    // arguments) ztsc still resolves with the bundler algorithm, and tsc's rule
+    // makes the flag default to true under bundler resolution.
+    var config_allow_synthetic_default = true;
     if (cli.paths.len == 0) {
         const config_path: []const u8 = blk: {
             if (cli.project) |p| {

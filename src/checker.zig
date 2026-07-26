@@ -10329,19 +10329,18 @@ const Checker = struct {
                         }
                     } else return false; // interface / class instance, no index sig
                 },
-                // An array/tuple relates to a target *string* index signature by
-                // its apparent-type members, not just its elements: tsc requires
-                // every property (`length: number`, the `Array.prototype`
-                // methods, and the element type) to conform to the index type.
-                // Only an `any`/`unknown` index absorbs the function-typed methods
-                // and the numeric `length`, so a concrete index (e.g.
-                // `{ [k: string]: number }`) is still rejected (conformance
-                // assignability/026). Decisive for `[…] → { [k: string]: any;
-                // …optional }` — the dogfood project's `LayerInfo`, whose
-                // `[key: string]: any` absorbs an `AxiosResponse`-derived array.
+                // An array/tuple has no *string* index signature of its own, so
+                // tsc rejects it against a target string index ("Index signature
+                // for type 'string' is missing in type 'T[]'") — with one
+                // exception: a target string index whose type is exactly `any`
+                // short-circuits the whole index-signature relation. `unknown`
+                // does NOT get that exemption — it is not `any` (verified
+                // against the oracle: conformance assignability/058). Decisive
+                // for
+                // `[…] → { [k: string]: any; …optional }`, the shape of a real
+                // project's `{ …optional; [key: string]: any }` catch-all.
                 .array, .tuple => {
-                    const ridx = try c.resolveStructural(sidx);
-                    if (c.ts.kind(ridx) != .any and c.ts.kind(ridx) != .unknown) return false;
+                    if (c.ts.kind(try c.resolveStructural(sidx)) != .any) return false;
                 },
                 else => return false,
             }

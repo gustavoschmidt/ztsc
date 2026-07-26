@@ -111,10 +111,17 @@ pub fn loadInDir(io: Io, arena: Allocator, base: Io.Dir, config_path: []const u8
     cfg.skip_all_lib_check = acc.skip_all_lib_check orelse false;
     cfg.resolve_json_module = acc.resolve_json_module orelse false;
     // Effective allowSyntheticDefaultImports = explicit value ?? esModuleInterop
-    // ?? false (tsc's rule; esModuleInterop implies it).
-    cfg.allow_synthetic_default_imports = acc.allow_synthetic_default_imports orelse acc.es_module_interop orelse false;
+    // ?? (module is system || moduleResolution is bundler). ztsc always resolves
+    // with the bundler algorithm (`moduleResolution` is accepted and ignored
+    // above), so the last term is unconditionally true here — the default is ON,
+    // and only an explicit `false` (for either key) turns it off. Defaulting to
+    // false false-positived TS1192 on every bundler project that omits
+    // `esModuleInterop`.
+    cfg.allow_synthetic_default_imports = acc.allow_synthetic_default_imports orelse acc.es_module_interop orelse true;
     if (cfg.allow_synthetic_default_imports) {
-        try note(arena, &notes, "'allowSyntheticDefaultImports'/'esModuleInterop' honored: a default import of a module with no default export binds to the module namespace object (the synthesized default)", .{});
+        try note(arena, &notes, "'allowSyntheticDefaultImports' is on (explicit, via 'esModuleInterop', or by default under bundler resolution): a default import of a module with no default export binds to the module namespace object (the synthesized default)", .{});
+    } else {
+        try note(arena, &notes, "'allowSyntheticDefaultImports'/'esModuleInterop' explicitly off: a default import of a module with no default export raises TS1192", .{});
     }
     if (acc.base_url) |bu| {
         cfg.base_url = try joinNormalize(arena, acc.base_url_dir, bu);
@@ -291,11 +298,13 @@ pub const Config = struct {
     /// existing file resolves (typed opaquely as `any`) rather than TS2307.
     resolve_json_module: bool = false,
     /// Effective `compilerOptions.allowSyntheticDefaultImports`, i.e.
-    /// `allowSyntheticDefaultImports ?? esModuleInterop ?? false` (tsc's rule;
-    /// esModuleInterop implies it). When on, a default import of a module that
-    /// has no default export binds to the module namespace object (the
-    /// synthesized default) instead of raising TS1192.
-    allow_synthetic_default_imports: bool = false,
+    /// `allowSyntheticDefaultImports ?? esModuleInterop ?? (module is system ||
+    /// moduleResolution is bundler)` (tsc's rule). ztsc always resolves with the
+    /// bundler algorithm, so the fallback is `true` and only an explicit `false`
+    /// turns it off. When on, a default import of a module that has no default
+    /// export binds to the module namespace object (the synthesized default)
+    /// instead of raising TS1192.
+    allow_synthetic_default_imports: bool = true,
     /// `compilerOptions.baseUrl`, resolved to a base-relative directory (null
     /// when unset). Consulted for bare `*.json` specifiers only (`public/api/
     /// x.json`); non-json baseUrl resolution is not modeled.

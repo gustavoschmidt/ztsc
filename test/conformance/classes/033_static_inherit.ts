@@ -1,5 +1,11 @@
 // Static members are inherited: `typeof Derived` includes the base class's
 // statics (own statics win over inherited on name clash).
+//
+// Note the shadowing on line 15 is *incompatible* (number vs string), which tsc
+// reports as TS2417 on the `Derived` declaration — the static sides of a class
+// and its base are related just like the instance sides. ztsc does not
+// implement that check; the under-report is registered in
+// `test/conformance/DEFERRED`.
 class Base {
   static make(): number { return 1; }
   static shared(): string { return "base"; }

@@ -7,11 +7,12 @@
 // grows the argument without bound, so the reduction must hit the shared
 // TS2589 instantiation-depth ceiling (`reduceTemplateChunks` /
 // `resolveStructural`) and STOP — exactly the guarantee that keeps the fix from
-// diverging. tsc likewise reports TS2589 (at the deep template node, line 15)
+// diverging. tsc likewise reports TS2589 (at the deep template node, line 16)
 // plus the TS2322 at the annotation; ztsc reports TS2589 at the annotation
-// site (line 17, its instantiation-trigger span) — a report-SITE difference on
-// the same diagnostic, hand-verified. If the depth guard regressed to eager
-// unbounded expansion, this input would not terminate.
+// site (line 18, its instantiation-trigger span) — a report-SITE difference on
+// the same diagnostic, hand-verified, registered as a -/+ pair in
+// `test/conformance/DEFERRED`. If the depth guard regressed to eager unbounded
+// expansion, this input would not terminate.
 type Grow<T> = [T] extends [{ stop: true }] ? "" : `a.${Grow<{ deeper: T }> & string}`;
 declare const s: string;
 const p: Grow<{ x: 1 }> = s;

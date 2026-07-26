@@ -126,6 +126,12 @@ function optionsForDir(dir) {
   // suppresses the implicit-any family (run_conformance.zig no_implicit_any).
   if (noImplicitAny === false) out.push("--noImplicitAny", "false");
   else if (noImplicitAny === true) out.push("--noImplicitAny", "true");
+  // `allowSyntheticDefaultImports`/`esModuleInterop` are deliberately NOT
+  // forwarded: this oracle version removed the `=false` form of both
+  // (TS5108 "Option 'esModuleInterop=false' has been removed"), and the default
+  // OPTIONS pass `--moduleResolution bundler`, under which the effective
+  // `allowSyntheticDefaultImports` is on. The synthesized default is therefore
+  // ON for every case, and run_conformance.zig defaults the same way.
   return out;
 }
 

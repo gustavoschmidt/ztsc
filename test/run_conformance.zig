@@ -16,6 +16,12 @@
 //! test/conformance/README.md) — and hand-verified. `#` lines are comments;
 //! an empty or absent snapshot means the case must be diagnostic-free.
 //!
+//! Snapshots are written by `gen_expected.js` and are *never* hand-edited: a
+//! snapshot is exactly what the oracle printed, so
+//! `gen_expected.js --check` stays a real gate. Deliberate, reviewed
+//! divergences live in one place instead — `test/conformance/DEFERRED` (see
+//! `parseDeferrals`).
+//!
 //! Matching: the multiset of (code, file, line) pairs must match exactly.
 //! Message text is informational and not compared (the differential contract
 //! is code+span; we compare code+line so byte-offset drift in messages
@@ -121,6 +127,90 @@ fn parseExpected(alloc: std.mem.Allocator, text: []const u8, multi_file: bool) !
         }
     }
     return out;
+}
+
+/// One reviewed divergence between the oracle snapshot and ztsc, read from
+/// `test/conformance/DEFERRED`.
+const Deferral = struct {
+    /// Case path relative to the conformance dir, exactly as `Case.rel`
+    /// spells it (`area/name.ts` for single-file, `area/name` for directory).
+    case: []const u8,
+    /// `false` (`-`): the oracle reports this diagnostic and ztsc deliberately
+    /// does not — an accepted UNDER-REPORT.
+    /// `true` (`+`): ztsc reports this diagnostic and the oracle does not.
+    extra: bool,
+    diag: Expected,
+    matched: bool = false,
+    used: bool = false,
+};
+
+/// Parses `test/conformance/DEFERRED`. One divergence per line:
+///
+///     <case-path>  -TS<code> [<file>] <line>
+///     <case-path>  +TS<code> [<file>] <line>
+///
+/// (`<file>` only for directory cases, matching the snapshot format.) `#`
+/// lines and blank lines are comments; every entry is expected to be preceded
+/// by a `#` line saying why it is accepted.
+///
+/// The registry exists so snapshots stay byte-for-byte oracle output. It is
+/// self-cleaning, and deliberately cannot be used to hide a regression: the
+/// runner fails when an entry no longer describes reality — a `-` entry whose
+/// diagnostic ztsc has started to emit, a `-` entry the oracle no longer
+/// reports, a `+` entry ztsc no longer emits, or an entry naming a case that
+/// does not exist. Adding a `+` entry means admitting a diagnostic the oracle
+/// does not produce, so it must be justified in the comment above it.
+fn parseDeferrals(alloc: std.mem.Allocator, text: []const u8) !std.ArrayList(Deferral) {
+    var out: std.ArrayList(Deferral) = .empty;
+    errdefer out.deinit(alloc);
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line0| {
+        const line = std.mem.trim(u8, line0, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        var it = std.mem.tokenizeAny(u8, line, " \t");
+        const case = it.next() orelse return error.BadDeferral;
+        const codetok = it.next() orelse return error.BadDeferral;
+        if (codetok.len < 4 or !std.mem.startsWith(u8, codetok[1..], "TS")) return error.BadDeferral;
+        const extra = switch (codetok[0]) {
+            '+' => true,
+            '-' => false,
+            else => return error.BadDeferral,
+        };
+        const code = try std.fmt.parseInt(u16, codetok[3..], 10);
+        const a = it.next() orelse return error.BadDeferral;
+        const b = it.next();
+        if (it.next() != null) return error.BadDeferral;
+        const file = if (b != null) a else "";
+        const lineno = try std.fmt.parseInt(u32, b orelse a, 10);
+        try out.append(alloc, .{
+            .case = case,
+            .extra = extra,
+            .diag = .{ .code = code, .file = file, .line = lineno },
+        });
+    }
+    return out;
+}
+
+fn sameDiag(x: Expected, y: Expected) bool {
+    return x.code == y.code and x.line == y.line and std.mem.eql(u8, x.file, y.file);
+}
+
+/// Removes the first entry equal to `d` from `list`; returns whether one was.
+fn removeDiag(list: *std.ArrayList(Expected), d: Expected) bool {
+    for (list.items, 0..) |e, i| {
+        if (sameDiag(e, d)) {
+            _ = list.orderedRemove(i);
+            return true;
+        }
+    }
+    return false;
+}
+
+fn containsDiag(list: []const Expected, d: Expected) bool {
+    for (list) |e| {
+        if (sameDiag(e, d)) return true;
+    }
+    return false;
 }
 
 /// Run the single-file pipeline on `src`, returning (code, line) pairs.
@@ -251,9 +341,13 @@ fn runDirCase(
     const allow_js = try dirCaseBoolOption(alloc, io, conf_dir, case_rel, "allowJs");
     const no_implicit_any = (try dirCaseOptBool(alloc, io, conf_dir, case_rel, "noImplicitAny")) orelse true;
     // Effective allowSyntheticDefaultImports = explicit ?? esModuleInterop ??
-    // false (tsc's rule; esModuleInterop implies it).
+    // (moduleResolution is bundler). The suite always runs bundler resolution —
+    // the oracle is invoked with `--moduleResolution bundler` — so the fallback
+    // is `true`; a case turns the flag off by setting it explicitly, which
+    // gen_expected.js forwards to the oracle as
+    // `--allowSyntheticDefaultImports false`.
     const allow_synthetic_default = (try dirCaseOptBool(alloc, io, conf_dir, case_rel, "allowSyntheticDefaultImports")) orelse
-        (try dirCaseOptBool(alloc, io, conf_dir, case_rel, "esModuleInterop")) orelse false;
+        (try dirCaseOptBool(alloc, io, conf_dir, case_rel, "esModuleInterop")) orelse true;
     var br = try modules.buildProgram(alloc, io, gpa, interner, conf_dir, &.{entry}, lib_set, .{ .resolve_json = resolve_json, .allow_js = allow_js }, allow_synthetic_default);
     const prog = &br.program;
     prog.no_implicit_any = no_implicit_any;
@@ -350,6 +444,16 @@ test "conformance: discover and run cases" {
     var interner = Interner.init();
     defer interner.deinit(gpa);
 
+    // Reviewed oracle-vs-ztsc divergences. Lives outside the per-case arena
+    // (which is reset between cases) so entries survive the whole loop.
+    const deferred_text = dir.readFileAlloc(io, "DEFERRED", gpa, .limited(1 << 20)) catch &[_]u8{};
+    defer gpa.free(deferred_text);
+    var deferrals = parseDeferrals(gpa, deferred_text) catch {
+        std.debug.print("conformance: DEFERRED: bad format\n", .{});
+        return error.TestUnexpectedResult;
+    };
+    defer deferrals.deinit(gpa);
+
     var failed: usize = 0;
     var ran: usize = 0;
     var ran_multi: usize = 0;
@@ -396,19 +500,73 @@ test "conformance: discover and run cases" {
             };
         };
         ran += 1;
-        if (!try multisetEqual(alloc, got.items, expected.items)) {
+
+        // Apply this case's reviewed divergences (test/conformance/DEFERRED).
+        // Each entry must still describe reality, or the case fails: a stale
+        // entry is a silent hole, so the registry cannot outlive its reason.
+        var actual = got;
+        var stale = false;
+        for (deferrals.items) |*df| {
+            if (!std.mem.eql(u8, df.case, case.rel)) continue;
+            df.matched = true;
+            const d = df.diag;
+            if (df.extra) {
+                if (removeDiag(&actual, d)) {
+                    df.used = true;
+                } else {
+                    stale = true;
+                    std.debug.print(
+                        "conformance DEFERRED-STALE: {s}: +TS{d}@{s}:{d} is no longer emitted by ztsc — drop the entry\n",
+                        .{ case.rel, d.code, d.file, d.line },
+                    );
+                }
+            } else if (containsDiag(actual.items, d)) {
+                stale = true;
+                std.debug.print(
+                    "conformance DEFERRED-STALE: {s}: -TS{d}@{s}:{d} is now reported by ztsc — drop the entry\n",
+                    .{ case.rel, d.code, d.file, d.line },
+                );
+            } else if (removeDiag(&expected, d)) {
+                df.used = true;
+            } else {
+                stale = true;
+                std.debug.print(
+                    "conformance DEFERRED-STALE: {s}: -TS{d}@{s}:{d} is not in the oracle snapshot — drop the entry\n",
+                    .{ case.rel, d.code, d.file, d.line },
+                );
+            }
+        }
+
+        if (stale or !try multisetEqual(alloc, actual.items, expected.items)) {
             failed += 1;
             std.debug.print("conformance FAIL: {s}\n  expected:", .{case.rel});
             for (expected.items) |e| std.debug.print(" TS{d}@{s}:{d}", .{ e.code, e.file, e.line });
             std.debug.print("\n  got:     ", .{});
-            for (got.items) |e| std.debug.print(" TS{d}@{s}:{d}", .{ e.code, e.file, e.line });
+            for (actual.items) |e| std.debug.print(" TS{d}@{s}:{d}", .{ e.code, e.file, e.line });
             std.debug.print("\n", .{});
         }
         _ = arena.reset(.retain_capacity);
     }
 
+    // A registry entry naming a case that no longer exists is also stale.
+    for (deferrals.items) |df| {
+        if (df.matched) continue;
+        failed += 1;
+        std.debug.print(
+            "conformance DEFERRED-STALE: no such case '{s}' (entry TS{d}@{s}:{d})\n",
+            .{ df.case, df.diag.code, df.diag.file, df.diag.line },
+        );
+    }
+
     if (ran > 0) {
-        std.debug.print("conformance: {d}/{d} cases passed ({d} multi-file)\n", .{ ran - failed, ran, ran_multi });
+        var deferred_count: usize = 0;
+        for (deferrals.items) |df| {
+            if (df.used) deferred_count += 1;
+        }
+        std.debug.print(
+            "conformance: {d}/{d} cases passed ({d} multi-file, {d} accepted divergences in DEFERRED)\n",
+            .{ ran - failed, ran, ran_multi, deferred_count },
+        );
     }
     try std.testing.expectEqual(@as(usize, 0), failed);
 }
