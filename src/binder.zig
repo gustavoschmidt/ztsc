@@ -2427,6 +2427,11 @@ const Binder = struct {
                 for (b.tree.extraRange(info.targs_start, info.targs_end)) |t| try b.bindType(t);
                 for (b.tree.extraRange(info.args_start, info.args_end)) |a| try b.bindExpr(a);
             },
+            .instantiation_expr => {
+                try b.bindExpr(d.lhs);
+                const r = b.tree.extraData(ast.SubRange, d.rhs);
+                for (b.tree.extraRange(r.start, r.end)) |t| try b.bindType(t);
+            },
             .object_literal => {
                 for (b.tree.nodeRange(node)) |prop| {
                     if (prop == null_node) continue;
@@ -2582,6 +2587,11 @@ const Binder = struct {
             .typeof_type => {
                 // `typeof x` references the *value* x.
                 try b.bindTypeofEntity(d.lhs);
+                // `typeof f<T>` — the type arguments are ordinary types.
+                if (d.rhs != 0) {
+                    const r = b.tree.extraData(ast.SubRange, d.rhs);
+                    for (b.tree.extraRange(r.start, r.end)) |arg| try b.bindType(arg);
+                }
             },
             .import_type => try b.bindImportType(node),
             .function_type, .method_signature, .constructor_type => try b.bindFunctionType(node, d.lhs),

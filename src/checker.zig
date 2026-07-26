@@ -2359,7 +2359,12 @@ const Checker = struct {
                 return c.ts.makeObjectSigs(&.{}, 0, 0, types.obj_flag_not_inferable, &.{}, &.{sig});
             },
             .keyof_type => return c.keyofType(try c.typeFromTypeNode(d.lhs)),
-            .typeof_type => return c.typeofEntity(d.lhs),
+            .typeof_type => {
+                const base = try c.typeofEntity(d.lhs);
+                if (d.rhs == 0) return base;
+                const r = c.tree.extraData(ast.SubRange, d.rhs);
+                return c.instantiationExprType(base, c.tree.extraRange(r.start, r.end), node);
+            },
             .readonly_type => return c.typeFromTypeNode(d.lhs), // readonly T[] ~ T[]
             .unique_symbol_type => {
                 // A `unique symbol` reached through the generic type path is in
@@ -11251,6 +11256,11 @@ const Checker = struct {
             .index_expr, .optional_index_expr => return c.checkIndexExpr(node),
             .call_expr, .call_expr_targs, .optional_call => return c.checkCallExpr(node, false, ctx),
             .new_expr, .new_expr_targs, .new_expr_bare => return c.checkCallExpr(node, true, ctx),
+            .instantiation_expr => {
+                const base = try c.checkExprCached(d.lhs, types.no_type);
+                const r = c.tree.extraData(ast.SubRange, d.rhs);
+                return c.instantiationExprType(base, c.tree.extraRange(r.start, r.end), node);
+            },
             .binary => return c.checkBinary(node, ctx),
             .assign => return c.checkAssignExpr(node),
             .cond_expr => {
@@ -14087,6 +14097,98 @@ const Checker = struct {
         var map = try c.scratch().alloc(TpMap, tps.len);
         for (tps, 0..) |tp, i| map[i] = .{ .sym = tp, .ty = args_buf[i] };
         return c.instantiate(sig, map);
+    }
+
+    /// A TS 4.7 instantiation expression: `f<T>` in value position and
+    /// `typeof f<T>` in type position both specialize the *signatures* of the
+    /// referenced value without calling it. Every signature that accepts this
+    /// many type arguments is instantiated; the rest are dropped, and a
+    /// reference left with no applicable signature is TS2635.
+    ///
+    /// Deferred, as an under-report (never a false positive): a class value.
+    /// `typeof C<T>` keeps `typeof C`, because a `.class_value` carries no
+    /// type-argument slot — tsc answers with the class's whole materialized
+    /// static side (`{ new (…): C<T>; …statics }`), which is a different type
+    /// shape, not a specialization of this one. Same for a type parameter or
+    /// a union of callables.
+    fn instantiationExprType(c: *Checker, base: TypeId, targ_nodes: []const Node, node: Node) Error!TypeId {
+        var targs: std.ArrayList(TypeId) = .empty;
+        defer targs.deinit(c.scratch());
+        for (targ_nodes) |tn| {
+            if (tn != null_node) try targs.append(c.scratch(), try c.typeFromTypeNode(tn));
+        }
+        if (targs.items.len == 0) return base;
+
+        const r = try c.resolveStructural(base);
+        var call_sigs: std.ArrayList(TypeId) = .empty;
+        defer call_sigs.deinit(c.scratch());
+        var construct_sigs: std.ArrayList(TypeId) = .empty;
+        defer construct_sigs.deinit(c.scratch());
+        var rebuild_object = false;
+        switch (c.ts.kind(r)) {
+            .function => try call_sigs.append(c.scratch(), r),
+            .overloads => for (try c.memberList(r)) |m| try call_sigs.append(c.scratch(), m),
+            .object => {
+                rebuild_object = true;
+                for (0..c.ts.objectCallSigCount(r)) |i| {
+                    try call_sigs.append(c.scratch(), c.ts.objectCallSig(r, @intCast(i)));
+                }
+                for (0..c.ts.objectConstructSigCount(r)) |i| {
+                    try construct_sigs.append(c.scratch(), c.ts.objectConstructSig(r, @intCast(i)));
+                }
+            },
+            // `any`/`err` swallow the type arguments; everything else is the
+            // deferred set above — the base type stands unchanged.
+            else => return base,
+        }
+
+        var inst_call: std.ArrayList(TypeId) = .empty;
+        defer inst_call.deinit(c.scratch());
+        var inst_construct: std.ArrayList(TypeId) = .empty;
+        defer inst_construct.deinit(c.scratch());
+        for (call_sigs.items) |sig| {
+            if (!c.sigTargArityOk(sig, targs.items.len)) continue;
+            try inst_call.append(c.scratch(), try c.instantiateSigForCall(sig, targs.items, &.{}, node, types.no_type));
+        }
+        for (construct_sigs.items) |sig| {
+            if (!c.sigTargArityOk(sig, targs.items.len)) continue;
+            try inst_construct.append(c.scratch(), try c.instantiateSigForCall(sig, targs.items, &.{}, node, types.no_type));
+        }
+
+        if (inst_call.items.len == 0 and inst_construct.items.len == 0) {
+            try c.diagFmt(2635, c.typeArgsSpan(targ_nodes, node), "Type '{s}' has no signatures for which the type argument list is applicable.", .{try c.typeToString(base)});
+            return types.error_type;
+        }
+        if (!rebuild_object) {
+            if (inst_call.items.len == 1) return inst_call.items[0];
+            return c.ts.makeOverloads(inst_call.items);
+        }
+        // A callable object keeps its properties and index signatures; only
+        // the signature lists are replaced by their applicable instantiations.
+        var props: std.ArrayList(types.Prop) = .empty;
+        defer props.deinit(c.scratch());
+        for (0..c.ts.objectPropCount(r)) |i| {
+            try props.append(c.scratch(), c.ts.objectProp(r, @intCast(i)));
+        }
+        return c.ts.makeObjectSigs(
+            props.items,
+            c.ts.objectStringIndex(r),
+            c.ts.objectNumberIndex(r),
+            c.ts.objectFlags(r),
+            inst_call.items,
+            inst_construct.items,
+        );
+    }
+
+    /// The span of a type-argument list `<A, B>`, for the diagnostics tsc
+    /// anchors there rather than on the whole expression. Falls back to the
+    /// node when the list is empty or malformed.
+    fn typeArgsSpan(c: *Checker, targ_nodes: []const Node, node: Node) Span {
+        if (targ_nodes.len == 0) return c.nodeSpan(node);
+        const first = c.nodeSpan(targ_nodes[0]);
+        const last = c.nodeSpan(targ_nodes[targ_nodes.len - 1]);
+        if (first.end == 0 or last.end == 0) return c.nodeSpan(node);
+        return .{ .start = first.start, .end = last.end };
     }
 
     /// tsc's `InferencePriority.ReturnType`: infer still-unbound type params by

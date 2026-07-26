@@ -102,6 +102,11 @@ What it does **not** check yet:
   generator functions type as `any`.
 - **CommonJS corners**: a namespace import of an `export =` module keeps the
   export's call signature, so `ns()` is not flagged.
+- **Instantiation-expression corners**: `f<T>` and `typeof f<T>` (TS 4.7)
+  specialize functions, overload sets and construct-signature objects, but a
+  *class value* keeps its generic `typeof C` instead of the specialized
+  constructor type — `const C2 = C<string>` still infers its type argument at
+  each `new C2(…)`, so the specialization under-reports rather than misfires.
 - **Symbol-key corners**: a plain non-`unique` `symbol` key (rxjs's
   `[Symbol.observable]`, declared `: symbol`) is keyed by name rather than as
   a symbol index.

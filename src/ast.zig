@@ -278,6 +278,10 @@ pub const Tag = enum(u8) {
     /// `f?.(args)` / `f?.<T>(args)`. main_token = `?.`; lhs = callee,
     /// rhs = extra→CallInfo.
     optional_call,
+    /// `f<T>` with no argument list — an instantiation expression (TS 4.7).
+    /// main_token = `<`; lhs = the instantiated expression,
+    /// rhs = extra→SubRange of type arguments (never 0).
+    instantiation_expr,
     /// `new C` (no parens). main_token = `new`; lhs = callee, rhs unused.
     new_expr_bare,
     /// `new C(args)`. main_token = `new`; lhs = callee, rhs = extra→SubRange.
@@ -503,7 +507,9 @@ pub const Tag = enum(u8) {
     /// `keyof T`. lhs = operand.
     keyof_type,
     /// `typeof entity` in type position. lhs = entity name node
-    /// (identifier / qualified_name / import_expr).
+    /// (identifier / qualified_name / import_expr); rhs = 0, or
+    /// extra→SubRange of the type arguments of a type-position
+    /// instantiation expression `typeof f<T>` (TS 4.7).
     typeof_type,
     /// `readonly T` (type operator). lhs = operand.
     readonly_type,
@@ -906,7 +912,6 @@ pub const Ast = struct {
                 .optional_type,
                 .rest_type,
                 .keyof_type,
-                .typeof_type,
                 .readonly_type,
                 .paren_type,
                 .export_decl,
@@ -983,12 +988,13 @@ pub const Ast = struct {
                     it.pushRange(a.extraRange(info.targs_start, info.targs_end));
                     it.pushRange(a.extraRange(info.args_start, info.args_end));
                 },
-                .type_ref => {
+                .type_ref, .instantiation_expr => {
                     it.push(d.lhs);
                     const r = a.extraData(SubRange, d.rhs);
                     it.pushRange(a.extraRange(r.start, r.end));
                 },
-                .heritage => {
+                // `typeof x` / `typeof f<T>`: rhs = 0 or extra→SubRange.
+                .typeof_type, .heritage => {
                     it.push(d.lhs);
                     if (d.rhs != 0) {
                         const r = a.extraData(SubRange, d.rhs);

@@ -20,13 +20,16 @@
 //!   arrays are truncated and the scanner rewound. While speculating
 //!   (`spec > 0`), grammar mismatches raise `error.Backtrack` instead of
 //!   recording diagnostics.
-//! - **Generic-call heuristic**: `expr < ...` is treated as type arguments
-//!   only if the `<...>` parses as a type list AND the next token is `(`
-//!   (so `f<T>(x)` is a generic call, and `a < b > (c)` — which also
-//!   satisfies this — parses as a generic call *exactly like tsc*). Bare
-//!   instantiation expressions (`f<T>;`) and generic tagged templates
-//!   (`f<T>\`x\``) are NOT recognized and fall back to relational operators;
-//!   this is a documented deviation from tsc 4.7+.
+//! - **Generic-call / instantiation-expression heuristic**: `expr < ...` is
+//!   treated as type arguments only if the `<...>` parses as a type list AND
+//!   the token after the closing `>` may follow a type-argument list in
+//!   expression position (`canFollowTypeArgsInExpr`, mirroring tsc's
+//!   `canFollowTypeArgumentsInExpression`). `(` and a template head keep the
+//!   type-argument reading outright — so `f<T>(x)` is a generic call and
+//!   `a < b > (c)` is one too, *exactly like tsc*; otherwise the reading wins
+//!   only when the next token starts no expression (`f<T>;`, `f<T>,`,
+//!   `f<T>)`), i.e. an instantiation expression, which is what `<` `>` `+`
+//!   `-` and any expression-starting token are excluded for.
 //! - **ASI** uses the scanner's preceded-by-newline flags: a statement may
 //!   end at `;`, `}`, EOF, or a line break. Restricted productions are
 //!   honored: no line break before postfix `++`/`--`, after `return`/
@@ -1488,9 +1491,13 @@ const Parser = struct {
     /// `extends`/`implements` entry: LHS expression + optional type args.
     fn parseHeritage(p: *Parser) PE!Node {
         const start_tok = p.curIdx();
-        const expr = try p.parseLhsExpression(.{ .no_calls = false });
+        var expr = try p.parseLhsExpression(.{ .no_calls = false });
         var targs_extra: u32 = 0;
-        if (p.atLt()) {
+        if (p.takeInstantiationTargs(&expr)) |range| {
+            // `extends A<T>, B` — the `,` let the call chain read `<T>` as an
+            // instantiation expression; the heritage clause owns it.
+            targs_extra = try p.addExtra(range);
+        } else if (p.atLt()) {
             const range = try p.parseTypeArgs();
             targs_extra = try p.addExtra(range);
         }
@@ -2499,8 +2506,8 @@ const Parser = struct {
                             lhs = try p.addNode(.{ .tag = .optional_index_expr, .main_token = qd, .data = .{ .lhs = lhs, .rhs = index } });
                         },
                         .lt, .lt_lt => {
-                            // `a?.<T>(...)`
-                            if (try p.tryParseTypeArgsInExpr()) |targs| {
+                            // `a?.<T>(...)` — a call, or nothing at all.
+                            if (try p.tryParseTypeArgsInExpr(ctx, true)) |targs| {
                                 const info = try p.parseCallInfo(targs);
                                 lhs = try p.addNode(.{ .tag = .optional_call, .main_token = qd, .data = .{ .lhs = lhs, .rhs = info } });
                             } else {
@@ -2542,9 +2549,21 @@ const Parser = struct {
                     lhs = try p.addNode(.{ .tag = .tagged_template, .main_token = p.nodes.items(.main_token)[tmpl], .data = .{ .lhs = lhs, .rhs = tmpl } });
                 },
                 .lt, .lt_lt => {
-                    if (ctx.no_calls) return lhs;
-                    // Generic call speculation: `f<T>(...)`.
-                    const targs = (try p.tryParseTypeArgsInExpr()) orelse return lhs;
+                    // Generic call / instantiation-expression speculation.
+                    const lt = p.curIdx();
+                    const targs = (try p.tryParseTypeArgsInExpr(ctx, false)) orelse return lhs;
+                    // `f<T>` with no argument list is an instantiation
+                    // expression; so is a `<T>` inside a `new` callee or a
+                    // heritage clause, whose owner claims the type arguments
+                    // back off the node (`takeInstantiationTargs`) — exactly
+                    // how tsc routes `new C<T>()` and `extends C<T>`. The loop
+                    // continues either way, so a template head still tags the
+                    // instantiation (`f<T>\`x\``).
+                    if (ctx.no_calls or p.curTag() != .l_paren) {
+                        const extra = try p.addExtra(targs);
+                        lhs = try p.addNode(.{ .tag = .instantiation_expr, .main_token = lt, .data = .{ .lhs = lhs, .rhs = extra } });
+                        continue;
+                    }
                     const lp = p.curIdx();
                     const args = try p.parseArguments();
                     const info = try p.addExtra(ast.CallInfo{
@@ -2577,13 +2596,37 @@ const Parser = struct {
         });
     }
 
-    /// `<T, ...>` accepted as type arguments only when `(` follows (see
-    /// module docs); otherwise restores and returns null.
-    fn tryParseTypeArgsInExpr(p: *Parser) PE!?ast.SubRange {
+    /// If `expr` is an instantiation expression, unwrap it in place and hand
+    /// back its type-argument range. The `<T>` of `new C<T>(…)` and of
+    /// `extends C<T>` is parsed by the call chain — the only place that can
+    /// tell type arguments from a relational `<` — and claimed here by the
+    /// construct that actually owns it, as tsc does.
+    fn takeInstantiationTargs(p: *Parser, expr: *Node) ?ast.SubRange {
+        if (p.nodes.items(.tag)[expr.*] != .instantiation_expr) return null;
+        const d = p.nodes.items(.data)[expr.*];
+        expr.* = d.lhs;
+        return .{ .start = p.extra.items[d.rhs], .end = p.extra.items[d.rhs + 1] };
+    }
+
+    /// `<T, ...>` accepted as type arguments when the token that follows the
+    /// closing `>` may follow a type-argument list in expression position
+    /// (see `canFollowTypeArgsInExpr`); otherwise the parse is undone — the
+    /// scanner, the token/node/extra/scratch/diagnostic arrays and the
+    /// speculation depth all return to their entry values — and null is
+    /// returned so the caller re-reads the `<` as a relational operator.
+    ///
+    /// `require_paren` narrows acceptance to a following `(`: the call-only
+    /// sites (`a?.<T>(…)`, `new C<T>(…)`), where the grammar admits no
+    /// instantiation expression.
+    fn tryParseTypeArgsInExpr(p: *Parser, ctx: ExprCtx, require_paren: bool) PE!?ast.SubRange {
         const state = p.save();
+        const saved_spec = p.spec;
         p.spec += 1;
         const result: PE!ast.SubRange = p.parseTypeArgs();
-        p.spec -= 1;
+        // Restore the depth unconditionally, on the error path too: a `spec`
+        // left set past a construct's end silently mis-parses everything after
+        // it (`parseType`'s `extends` guard, `unsupportedFrom`, every `fail`).
+        p.spec = saved_spec;
         const range = result catch |err| switch (err) {
             error.Backtrack => {
                 p.restore(state);
@@ -2591,11 +2634,40 @@ const Parser = struct {
             },
             error.OutOfMemory => return error.OutOfMemory,
         };
-        if (p.curTag() != .l_paren) {
+        const ok = if (require_paren) p.curTag() == .l_paren else p.canFollowTypeArgsInExpr(ctx);
+        if (!ok) {
             p.restore(state);
             return null;
         }
         return range;
+    }
+
+    /// tsc's `canFollowTypeArgumentsInExpression`: given a `<…>` that parsed
+    /// as a type-argument list, does the token after the closing `>` allow
+    /// that reading over the relational one?
+    fn canFollowTypeArgsInExpr(p: *Parser, ctx: ExprCtx) bool {
+        switch (p.curTag()) {
+            // These commit to the type-argument reading even where JavaScript
+            // would see a comparison: `f<T>(x)`, `f<T>\`x\``.
+            .l_paren, .no_substitution_template_literal, .template_head => return true,
+            // A type-argument list followed by `<` never makes sense, one
+            // followed by `>` is ambiguous with a re-scanned `>>`, and here
+            // `+`/`-` read as unary operators, not binary ones. The whole
+            // `>`-family counts as `>`: tsc's scanner emits a bare `>` and
+            // merges `>>`/`>=`/… only on demand, so `f<T> >= 1` sees a plain
+            // `>` there and takes the relational reading — this parser's
+            // maximal munch has to answer the same way.
+            .lt, .gt, .gt_gt, .gt_gt_gt, .gt_eq, .gt_gt_eq, .gt_gt_gt_eq, .plus, .minus => return false,
+            else => {},
+        }
+        // `as` / `satisfies` are binary operators at relational precedence for
+        // this test (tsc has them in `getBinaryOperatorPrecedence`), even
+        // though `parseBinaryExpr` gives them their own arm here.
+        if (p.curTag() == .keyword_as or p.curTag() == .keyword_satisfies) return true;
+        // Otherwise the type-argument reading wins when the next token cannot
+        // continue the expression: a line break, a binary operator, or
+        // anything that starts no expression at all.
+        return p.nlBefore() or binaryPrec(p.curTag(), ctx.no_in) > 0 or !canStartExpression(p.curTag());
     }
 
     fn parseArguments(p: *Parser) PE!ast.SubRange {
@@ -2637,10 +2709,10 @@ const Parser = struct {
         var callee = try p.parsePrimaryExpr(ctx);
         callee = try p.parseCallChain(callee, .{ .no_in = ctx.no_in, .no_calls = true });
 
+        // `new C<T>` / `new C<T>(…)`: the callee chain parses `<T>` under
+        // `no_calls`, so the argument list stays with the `new`.
         var targs: ast.SubRange = .{ .start = 0, .end = 0 };
-        if (p.atLt()) {
-            if (try p.tryParseTypeArgsInExpr()) |r| targs = r;
-        }
+        if (p.takeInstantiationTargs(&callee)) |r| targs = r;
         if (p.curTag() == .l_paren) {
             const args = try p.parseArguments();
             if (targs.start != targs.end) {
@@ -2654,6 +2726,16 @@ const Parser = struct {
             }
             const extra = try p.addExtra(args);
             return p.addNode(.{ .tag = .new_expr, .main_token = kw, .data = .{ .lhs = callee, .rhs = extra } });
+        }
+        if (targs.start != targs.end) {
+            // `new C<T>` with no argument list — an empty one is implied.
+            const info = try p.addExtra(ast.CallInfo{
+                .targs_start = targs.start,
+                .targs_end = targs.end,
+                .args_start = 0,
+                .args_end = 0,
+            });
+            return p.addNode(.{ .tag = .new_expr_targs, .main_token = kw, .data = .{ .lhs = callee, .rhs = info } });
         }
         return p.addNode(.{ .tag = .new_expr_bare, .main_token = kw, .data = .{ .lhs = callee, .rhs = 0 } });
     }
@@ -3298,13 +3380,19 @@ const Parser = struct {
             },
             .keyword_typeof => {
                 const kw = try p.bump();
-                if (p.curTag() == .keyword_import) {
+                const inner = if (p.curTag() == .keyword_import)
                     // `typeof import("m")[.value]`.
-                    const inner = try p.parseImportType();
-                    return p.addNode(.{ .tag = .typeof_type, .main_token = kw, .data = .{ .lhs = inner, .rhs = 0 } });
+                    try p.parseImportType()
+                else
+                    try p.parseEntityName();
+                // `typeof f<T>` — a type-position instantiation expression.
+                // A line break before the `<` ends the type query (tsc applies
+                // ASI here so the next line's `<` is not swallowed).
+                var targs: u32 = 0;
+                if (p.atLt() and !p.nlBefore()) {
+                    targs = try p.addExtra(try p.parseTypeArgs());
                 }
-                const entity = try p.parseEntityName();
-                return p.addNode(.{ .tag = .typeof_type, .main_token = kw, .data = .{ .lhs = entity, .rhs = 0 } });
+                return p.addNode(.{ .tag = .typeof_type, .main_token = kw, .data = .{ .lhs = inner, .rhs = targs } });
             },
             .l_brace => return p.parseObjectType(),
             .l_bracket => return p.parseTupleType(),
@@ -3965,6 +4053,63 @@ test "golden: generic call vs relational (documented heuristic)" {
     // Nested generic closes with `>>` split.
     try expectSExpr("f<Map<K, V>>(m);",
         \\(expr_stmt (call_expr_targs (identifier f) (type_ref (identifier Map) (identifier K) (identifier V)) (identifier m)))
+    );
+}
+
+test "golden: instantiation expressions (TS 4.7)" {
+    // No argument list, and `;` starts no expression: an instantiation
+    // expression, not `f < T > (nothing)`.
+    try expectSExpr("g = f<T>;",
+        \\(expr_stmt (assign = (identifier g) (instantiation_expr (identifier f) (identifier T))))
+    );
+    // Same where a `,` follows.
+    try expectSExpr("x = [f<T>, g<U>];",
+        \\(expr_stmt (assign = (identifier x) (array_literal (instantiation_expr (identifier f) (identifier T)) (instantiation_expr (identifier g) (identifier U)))))
+    );
+    // An identifier CAN start an expression: relational, as in tsc.
+    try expectSExpr("x = a < b > c;",
+        \\(expr_stmt (assign = (identifier x) (binary > (binary < (identifier a) (identifier b)) (identifier c))))
+    );
+    // `+` and `-` read as unary operators here, so they too keep the
+    // relational reading.
+    try expectSExpr("x = a < b > +c;",
+        \\(expr_stmt (assign = (identifier x) (binary > (binary < (identifier a) (identifier b)) (prefix_unary + (identifier c)))))
+    );
+    // An argument list still wins: a generic call, not an instantiation.
+    try expectSExpr("f<T>(x);",
+        \\(expr_stmt (call_expr_targs (identifier f) (identifier T) (identifier x)))
+    );
+    // A `new` callee's `<T>` belongs to the `new`, with or without arguments.
+    try expectSExpr("x = new C<T>;",
+        \\(expr_stmt (assign = (identifier x) (new_expr_targs (identifier C) (identifier T))))
+    );
+    try expectSExpr("x = new C<T>(a);",
+        \\(expr_stmt (assign = (identifier x) (new_expr_targs (identifier C) (identifier T) (identifier a))))
+    );
+    // A heritage clause's `<T>` belongs to the clause, even when a `,`
+    // follows and would otherwise read as an instantiation expression.
+    try expectSExpr("interface I extends A<T>, B {}",
+        \\(interface_decl I (heritage (identifier A) (identifier T)) (heritage (identifier B)))
+    );
+    // Type position: `typeof f<T>` is a type query with type arguments.
+    try expectSExpr("type R = typeof f<T>;",
+        \\(type_alias R (typeof_type (identifier f) (identifier T)))
+    );
+    // A line break before the `<` ends the type query (ASI).
+    try expectSExpr("type R = typeof f;",
+        \\(type_alias R (typeof_type (identifier f)))
+    );
+}
+
+test "instantiation speculation restores the speculation depth" {
+    // A `<…>` that backtracks must leave `spec` exactly as it found it — the
+    // `parseType` guards keyed on it (a conditional type's `extends`, the
+    // out-of-subset reporter) silently mis-parse everything after the leak.
+    // The relational statement below backtracks out of a type-argument list;
+    // the conditional type after it is the canary.
+    try expectSExpr("x = a < b > c;\ntype C<T> = T extends string ? 1 : 2;",
+        \\(expr_stmt (assign = (identifier x) (binary > (binary < (identifier a) (identifier b)) (identifier c))))
+        \\(type_alias C (type_param T) (conditional_type (identifier T) (identifier string) (number_literal 1) (number_literal 2)))
     );
 }
 
