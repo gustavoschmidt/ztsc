@@ -18,12 +18,12 @@ fn nsToMs(ns: u64) f64 {
 
 // --- --timing ---------------------------------------------------------------
 
-/// Per-phase nanosecond totals. load..bind are summed per-file worker times
-/// (files stream through the pipeline, so the phases overlap); `discover` is
-/// the front-end wall clock (spawn -> last completion resolved -> join).
+/// Per-phase nanosecond totals. load/parse/bind are summed per-file worker
+/// times (files stream through the pipeline, so the phases overlap);
+/// `discover` is the front-end wall clock (spawn -> last completion
+/// resolved -> join).
 pub const Phases = struct {
     load_ns: u64,
-    scan_ns: u64,
     parse_ns: u64,
     bind_ns: u64,
     resolve_ns: u64,
@@ -34,7 +34,7 @@ pub const Phases = struct {
 };
 
 /// The work volume the per-phase rates are computed against. `repeat` is
-/// `--repeat=N`: scan/parse/bind ran N times over the same input, so their
+/// `--repeat=N`: parse/bind ran N times over the same input, so their
 /// throughput counts the input N times.
 pub const Volume = struct {
     lines: usize,
@@ -79,14 +79,13 @@ pub fn printTiming(
     const total_ms = nsToMs(phases.total_ns);
     const lines_f: f64 = @floatFromInt(vol.lines);
     const bytes_f: f64 = @floatFromInt(vol.bytes);
-    const scanned_lines = @as(f64, @floatFromInt(vol.lines * vol.repeat));
-    const scanned_bytes = @as(f64, @floatFromInt(vol.bytes * vol.repeat));
+    const repeat_lines = @as(f64, @floatFromInt(vol.lines * vol.repeat));
+    const repeat_bytes = @as(f64, @floatFromInt(vol.bytes * vol.repeat));
     try out.print("\n--timing\n", .{});
     try out.print("  {s:<10} {s:>10} {s:>14} {s:>10}\n", .{ "phase", "ms", "lines/s", "MB/s" });
     try printPhase(out, "load", phases.load_ns, lines_f, bytes_f);
-    try printPhase(out, "scan", phases.scan_ns, scanned_lines, scanned_bytes);
-    try printPhase(out, "parse", phases.parse_ns, scanned_lines, scanned_bytes);
-    try printPhase(out, "bind", phases.bind_ns, scanned_lines, scanned_bytes);
+    try printPhase(out, "parse", phases.parse_ns, repeat_lines, repeat_bytes);
+    try printPhase(out, "bind", phases.bind_ns, repeat_lines, repeat_bytes);
     try printPhase(out, "resolve", phases.resolve_ns, 0, 0);
     try printPhase(out, "discover", phases.discover_ns, lines_f, bytes_f);
     try printPhase(out, "link", phases.link_ns, 0, 0);
@@ -368,7 +367,6 @@ test "printTiming renders one row per phase and per checker" {
         &out.writer,
         .{
             .load_ns = 1_000_000,
-            .scan_ns = 2_000_000,
             .parse_ns = 3_000_000,
             .bind_ns = 4_000_000,
             .resolve_ns = 5_000_000,

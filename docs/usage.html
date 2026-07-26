@@ -84,13 +84,13 @@ ztsc src/main.ts           # or explicit entry files</code></pre>
   <table>
     <thead><tr><th>flag</th><th>what it does</th></tr></thead>
     <tbody>
-      <tr><td class="num"><code>--timing</code></td><td>per-phase wall-clock timings (load / scan / parse / bind / resolve / link / check)</td></tr>
+      <tr><td class="num"><code>--timing</code></td><td>per-phase wall-clock timings (load / parse / bind / resolve / link / check)</td></tr>
       <tr><td class="num"><code>--memory</code></td><td>arena and memory statistics: bytes per token / node / type, cache hit rates, heap total</td></tr>
       <tr><td class="num"><code>--census</code></td><td>tally out-of-subset constructs by frequency — run it on your codebase to see exactly what ztsc can't check yet</td></tr>
       <tr><td class="num"><code>--dump-ast</code></td><td>S-expression parse trees (golden-test format)</td></tr>
       <tr><td class="num"><code>--dump-symbols</code></td><td>binder scope/symbol dumps</td></tr>
       <tr><td class="num"><code>--dump-types</code></td><td>per-declaration checked types</td></tr>
-      <tr><td class="num"><code>--repeat=N</code></td><td>scan/parse/bind each file N times (benchmark aid)</td></tr>
+      <tr><td class="num"><code>--repeat=N</code></td><td>parse/bind each file N times (benchmark aid)</td></tr>
       <tr><td class="num"><code>--no-resolve-cache</code></td><td>disable the module-resolution memo (benchmark aid)</td></tr>
       <tr><td class="num"><code>--no-frozen-store</code></td><td>disable the shared frozen base type store (benchmark aid / oracle)</td></tr>
       <tr><td class="num"><code>--no-inst-cache</code></td><td>disable instantiation caching, re-run every substitution (benchmark aid / oracle)</td></tr>

@@ -3,7 +3,7 @@
 //! Module discovery is single-owner with a completion queue: the main
 //! thread is the sole owner of
 //! the module graph and seen-set (no locks on graph state); workers run
-//! the whole per-file front end (load/scan/parse/bind) and push per-file
+//! the whole per-file front end (load/parse/bind) and push per-file
 //! completion messages `(file, import specifiers)`; the main thread
 //! resolves each completion's module specifiers (bundler-style, see
 //! modules.zig) as it arrives and enqueues newly discovered files
@@ -23,7 +23,7 @@
 //! check diagnostics come from exactly the checker that owns it, and the
 //! final print is per file (in graph order), position-sorted —
 //! byte-identical for any --workers/--checkers combination. `--timing`
-//! reports the per-phase split (load/scan/parse/bind are summed per-file
+//! reports the per-phase split (load/parse/bind are summed per-file
 //! worker times, since files stream through the pipeline; `discover` is
 //! the front-end wall clock) plus a per-checker breakdown; `--memory`
 //! reports arena/token/AST/binder statistics plus per-checker type-store
@@ -34,7 +34,6 @@ const Io = std.Io;
 const ztsc = @import("ztsc");
 const Source = ztsc.source.Source;
 const Interner = ztsc.intern.Interner;
-const scanner = ztsc.scanner;
 const parser = ztsc.parser;
 const binder = ztsc.binder;
 const checker = ztsc.checker;
@@ -77,7 +76,7 @@ const usage =
     \\                         diagnostics in every .d.ts (their types still flow)
     \\  --workers=N            number of worker threads (default: CPU count)
     \\  --checkers=N           number of checker instances (default: min(4, CPUs))
-    \\  --repeat=N             scan/parse/bind each file N times (benchmark aid)
+    \\  --repeat=N             parse/bind each file N times (benchmark aid)
     \\  --no-resolve-cache     disable the module-resolution memos — the
     \\                         specifier memo and the filesystem-fact caches
     \\                         under it (benchmark aid / correctness oracle)
@@ -219,7 +218,6 @@ const Completion = struct {
     bind: ?*Bind = null,
     err: ?anyerror = null,
     load_ns: u64 = 0,
-    scan_ns: u64 = 0,
     parse_ns: u64 = 0,
     bind_ns: u64 = 0,
 };
@@ -311,7 +309,7 @@ const Worker = struct {
         }
     }
 
-    /// The whole per-file front end: load -> scan -> parse -> bind.
+    /// The whole per-file front end: load -> parse (which tokenizes) -> bind.
     /// Outputs and per-phase timings land in `c`; on the first error the
     /// remaining phases are skipped (same per-phase skip behavior the
     /// wavefront scheduler had). `repeat > 1` re-runs each phase into
@@ -355,29 +353,12 @@ const Worker = struct {
         };
         c.load_ns = timer.readNs();
 
-        // Standalone tokenize, timed but not retained: the parser
-        // re-tokenizes internally into `tree.tokens` (what the binder
-        // reads), so keeping a second copy in the per-file arena only
-        // wasted ~5 B/token. Token stats are derived from `tree.tokens`.
+        // No standalone tokenize pass: the parser tokenizes internally
+        // into `tree.tokens` (what the binder reads), so a separate scan
+        // would be pure throwaway work (~5.8% of front-end CPU). Token
+        // stats are derived from `tree.tokens`.
         timer = Timer.start(io);
         var r: usize = 1;
-        while (r < repeat) : (r += 1) {
-            var toks = scanner.tokenize(w.scratch.allocator(), src.bytes) catch break;
-            std.mem.doNotOptimizeAway(&toks);
-            _ = w.scratch.reset(.retain_capacity);
-        }
-        {
-            var toks = scanner.tokenize(w.scratch.allocator(), src.bytes) catch |err| {
-                c.err = err;
-                return;
-            };
-            std.mem.doNotOptimizeAway(&toks);
-            _ = w.scratch.reset(.retain_capacity);
-        }
-        c.scan_ns = timer.readNs();
-
-        timer = Timer.start(io);
-        r = 1;
         while (r < repeat) : (r += 1) {
             var tree = parser.parseOpts(w.scratch.allocator(), src.bytes, parser.isJsxPath(path)) catch break;
             std.mem.doNotOptimizeAway(&tree);
@@ -664,7 +645,6 @@ pub fn main(init: std.process.Init) !void {
     var edge_lists: std.ArrayList([]const modules.FileId) = .empty;
 
     var load_ns: u64 = 0;
-    var scan_ns: u64 = 0;
     var parse_ns: u64 = 0;
     var bind_ns: u64 = 0;
     var resolve_ns: u64 = 0;
@@ -708,7 +688,6 @@ pub fn main(init: std.process.Init) !void {
         binds.items[i] = c.bind;
         errs.items[i] = c.err;
         load_ns += c.load_ns;
-        scan_ns += c.scan_ns;
         parse_ns += c.parse_ns;
         bind_ns += c.bind_ns;
 
@@ -1041,7 +1020,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Token stats come from the retained `tree.tokens` (the only token
-    // array kept per file now that the standalone scan is discarded).
+    // array the front end builds per file).
     var total_tokens: usize = 0;
     var token_bytes: usize = 0;
     var total_nodes: usize = 0;
@@ -1306,7 +1285,6 @@ pub fn main(init: std.process.Init) !void {
         const fs_counts = rcache.fs.entryCounts();
         try ztsc.report.printTiming(out, .{
             .load_ns = load_ns,
-            .scan_ns = scan_ns,
             .parse_ns = parse_ns,
             .bind_ns = bind_ns,
             .resolve_ns = resolve_ns,

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end benchmark: full pipeline (tsconfig -> discover -> load -> scan
+# End-to-end benchmark: full pipeline (tsconfig -> discover -> load
 # -> parse -> bind -> link -> check) on a corpus, swept over
 # --checkers=1,2,4,8, vs tsgo (the native TypeScript compiler) when
 # available.
