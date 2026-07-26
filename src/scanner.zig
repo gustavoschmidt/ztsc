@@ -56,6 +56,151 @@ const Allocator = std.mem.Allocator;
 /// preceded-by-newline flag.
 pub const max_source_len: usize = (1 << 31) - 1;
 
+/// Tokenize a whole source file into a SoA token stream (ends with `.eof`).
+///
+/// Applies exact template brace-depth tracking (so `}` tokens that close a
+/// `${...}` substitution are rescanned into template middle/tail parts) and
+/// the previous-token heuristic for regex-vs-division described in the module
+/// docs. Never fails on malformed input — only on OOM / oversized source.
+pub fn tokenize(alloc: Allocator, src: []const u8) error{ OutOfMemory, SourceTooLarge }!Tokens {
+    if (src.len > max_source_len) return error.SourceTooLarge;
+
+    var tags: std.ArrayList(Tag) = .empty;
+    errdefer tags.deinit(alloc);
+    var starts: std.ArrayList(u32) = .empty;
+    errdefer starts.deinit(alloc);
+    // ~4.5 source bytes per token empirically; reserve conservatively.
+    try tags.ensureTotalCapacityPrecise(alloc, src.len / 4 + 4);
+    try starts.ensureTotalCapacityPrecise(alloc, src.len / 4 + 4);
+
+    // One entry per open template substitution: the count of unmatched `{`
+    // inside it. A `}` at count 0 closes the substitution itself.
+    var template_stack: std.ArrayList(u32) = .empty;
+    defer template_stack.deinit(alloc);
+
+    var s = Scanner.init(src);
+    var prev_tag: Tag = .eof; // regex allowed at stream start
+    while (true) {
+        var tok = s.next();
+        switch (tok.tag) {
+            .slash, .slash_eq => {
+                if (!prev_tag.endsExpression()) tok = s.reScanSlashAsRegex(tok);
+            },
+            .l_brace => {
+                if (template_stack.items.len > 0) {
+                    template_stack.items[template_stack.items.len - 1] += 1;
+                }
+            },
+            .r_brace => {
+                if (template_stack.items.len > 0) {
+                    const depth = &template_stack.items[template_stack.items.len - 1];
+                    if (depth.* == 0) {
+                        tok = s.reScanTemplateToken(tok);
+                        switch (tok.tag) {
+                            .template_middle => {}, // substitution list continues
+                            .template_tail, .unterminated_template => _ = template_stack.pop(),
+                            else => unreachable,
+                        }
+                    } else {
+                        depth.* -= 1;
+                    }
+                }
+            },
+            .template_head => try template_stack.append(alloc, 0),
+            else => {},
+        }
+
+        try tags.append(alloc, tok.tag);
+        try starts.append(alloc, tok.start | @as(u32, if (tok.newline_before) Tokens.newline_flag else 0));
+        if (tok.tag == .eof) break;
+        prev_tag = tok.tag;
+    }
+
+    return .{
+        .tags = try tags.toOwnedSlice(alloc),
+        .starts = try starts.toOwnedSlice(alloc),
+    };
+}
+
+/// Recompute a token's end offset by rescanning it from its start.
+/// O(token length); used for lazy spans so we never store ends.
+pub fn tokenEnd(src: []const u8, tag: Tag, start: u32) u32 {
+    switch (tag) {
+        .eof => return start,
+        // These consume to end of file by construction.
+        .unterminated_template, .unterminated_comment => {
+            // A middle/tail rescan can also produce unterminated_template
+            // starting at `}`; either way it ends at EOF.
+            return @intCast(src.len);
+        },
+        .template_middle, .template_tail => {
+            var s = Scanner{ .src = src, .index = start };
+            _ = s.scanTemplate(false);
+            return s.index;
+        },
+        .regexp_literal, .unterminated_regexp_literal => {
+            var s = Scanner{ .src = src, .index = start };
+            _ = s.scanRegex();
+            return s.index;
+        },
+        .jsx_text => {
+            var s = Scanner{ .src = src, .index = start };
+            return s.scanJsxChild(start).end;
+        },
+        .jsx_name => {
+            const s = Scanner{ .src = src, .index = start };
+            return s.scanJsxName(start);
+        },
+        else => {
+            var s = Scanner{ .src = src, .index = start };
+            return s.next().end;
+        },
+    }
+}
+
+/// Struct-of-arrays token store: 1-byte tag + 4-byte start per
+/// token; the preceded-by-newline flag lives in bit 31 of the start word.
+/// The stream always ends with a `.eof` token.
+pub const Tokens = struct {
+    tags: []const Tag,
+    starts: []const u32,
+
+    pub const newline_flag: u32 = 1 << 31;
+    pub const start_mask: u32 = newline_flag - 1;
+
+    pub fn len(t: *const Tokens) usize {
+        return t.tags.len;
+    }
+
+    pub fn tag(t: *const Tokens, i: usize) Tag {
+        return t.tags[i];
+    }
+
+    pub fn start(t: *const Tokens, i: usize) u32 {
+        return t.starts[i] & start_mask;
+    }
+
+    pub fn precededByNewline(t: *const Tokens, i: usize) bool {
+        return t.starts[i] & newline_flag != 0;
+    }
+
+    /// Recompute the end offset of token `i` by rescanning it in `src`.
+    pub fn end(t: *const Tokens, src: []const u8, i: usize) u32 {
+        return tokenEnd(src, t.tags[i], t.start(i));
+    }
+
+    /// Exact bytes held by the token arrays (5 bytes/token).
+    pub fn byteSize(t: *const Tokens) usize {
+        return t.tags.len * @sizeOf(Tag) + t.starts.len * @sizeOf(u32);
+    }
+
+    pub fn deinit(t: *Tokens, alloc: Allocator) void {
+        alloc.free(t.tags);
+        alloc.free(t.starts);
+        t.* = undefined;
+    }
+};
+
 pub const Tag = enum(u8) {
     // --- sentinels & error tokens ---------------------------------------
     eof,
@@ -293,92 +438,6 @@ pub const Tag = enum(u8) {
         };
     }
 };
-
-const keyword_map = std.StaticStringMap(Tag).initComptime(.{
-    .{ "break", .keyword_break },
-    .{ "case", .keyword_case },
-    .{ "catch", .keyword_catch },
-    .{ "class", .keyword_class },
-    .{ "const", .keyword_const },
-    .{ "continue", .keyword_continue },
-    .{ "debugger", .keyword_debugger },
-    .{ "default", .keyword_default },
-    .{ "delete", .keyword_delete },
-    .{ "do", .keyword_do },
-    .{ "else", .keyword_else },
-    .{ "enum", .keyword_enum },
-    .{ "export", .keyword_export },
-    .{ "extends", .keyword_extends },
-    .{ "false", .keyword_false },
-    .{ "finally", .keyword_finally },
-    .{ "for", .keyword_for },
-    .{ "function", .keyword_function },
-    .{ "if", .keyword_if },
-    .{ "import", .keyword_import },
-    .{ "in", .keyword_in },
-    .{ "instanceof", .keyword_instanceof },
-    .{ "new", .keyword_new },
-    .{ "null", .keyword_null },
-    .{ "return", .keyword_return },
-    .{ "super", .keyword_super },
-    .{ "switch", .keyword_switch },
-    .{ "this", .keyword_this },
-    .{ "throw", .keyword_throw },
-    .{ "true", .keyword_true },
-    .{ "try", .keyword_try },
-    .{ "typeof", .keyword_typeof },
-    .{ "var", .keyword_var },
-    .{ "void", .keyword_void },
-    .{ "while", .keyword_while },
-    .{ "with", .keyword_with },
-    .{ "implements", .keyword_implements },
-    .{ "interface", .keyword_interface },
-    .{ "let", .keyword_let },
-    .{ "package", .keyword_package },
-    .{ "private", .keyword_private },
-    .{ "protected", .keyword_protected },
-    .{ "public", .keyword_public },
-    .{ "static", .keyword_static },
-    .{ "yield", .keyword_yield },
-    .{ "abstract", .keyword_abstract },
-    .{ "accessor", .keyword_accessor },
-    .{ "any", .keyword_any },
-    .{ "as", .keyword_as },
-    .{ "assert", .keyword_assert },
-    .{ "asserts", .keyword_asserts },
-    .{ "async", .keyword_async },
-    .{ "await", .keyword_await },
-    .{ "bigint", .keyword_bigint },
-    .{ "boolean", .keyword_boolean },
-    .{ "constructor", .keyword_constructor },
-    .{ "declare", .keyword_declare },
-    .{ "from", .keyword_from },
-    .{ "get", .keyword_get },
-    .{ "global", .keyword_global },
-    .{ "infer", .keyword_infer },
-    .{ "intrinsic", .keyword_intrinsic },
-    .{ "is", .keyword_is },
-    .{ "keyof", .keyword_keyof },
-    .{ "module", .keyword_module },
-    .{ "namespace", .keyword_namespace },
-    .{ "never", .keyword_never },
-    .{ "number", .keyword_number },
-    .{ "object", .keyword_object },
-    .{ "of", .keyword_of },
-    .{ "out", .keyword_out },
-    .{ "override", .keyword_override },
-    .{ "readonly", .keyword_readonly },
-    .{ "require", .keyword_require },
-    .{ "satisfies", .keyword_satisfies },
-    .{ "set", .keyword_set },
-    .{ "string", .keyword_string },
-    .{ "symbol", .keyword_symbol },
-    .{ "type", .keyword_type },
-    .{ "undefined", .keyword_undefined },
-    .{ "unique", .keyword_unique },
-    .{ "unknown", .keyword_unknown },
-    .{ "using", .keyword_using },
-});
 
 /// A scanned token. The SoA store (`Tokens`) keeps only `tag` and
 /// `start`+newline flag; `end` is available here at scan time for free and
@@ -890,150 +949,95 @@ pub const Scanner = struct {
     }
 };
 
-/// Struct-of-arrays token store: 1-byte tag + 4-byte start per
-/// token; the preceded-by-newline flag lives in bit 31 of the start word.
-/// The stream always ends with a `.eof` token.
-pub const Tokens = struct {
-    tags: []const Tag,
-    starts: []const u32,
+// ---------------------------------------------------------------------------
+// private implementation
+// ---------------------------------------------------------------------------
 
-    pub const newline_flag: u32 = 1 << 31;
-    pub const start_mask: u32 = newline_flag - 1;
-
-    pub fn len(t: *const Tokens) usize {
-        return t.tags.len;
-    }
-
-    pub fn tag(t: *const Tokens, i: usize) Tag {
-        return t.tags[i];
-    }
-
-    pub fn start(t: *const Tokens, i: usize) u32 {
-        return t.starts[i] & start_mask;
-    }
-
-    pub fn precededByNewline(t: *const Tokens, i: usize) bool {
-        return t.starts[i] & newline_flag != 0;
-    }
-
-    /// Recompute the end offset of token `i` by rescanning it in `src`.
-    pub fn end(t: *const Tokens, src: []const u8, i: usize) u32 {
-        return tokenEnd(src, t.tags[i], t.start(i));
-    }
-
-    /// Exact bytes held by the token arrays (5 bytes/token).
-    pub fn byteSize(t: *const Tokens) usize {
-        return t.tags.len * @sizeOf(Tag) + t.starts.len * @sizeOf(u32);
-    }
-
-    pub fn deinit(t: *Tokens, alloc: Allocator) void {
-        alloc.free(t.tags);
-        alloc.free(t.starts);
-        t.* = undefined;
-    }
-};
-
-/// Tokenize a whole source file into a SoA token stream (ends with `.eof`).
-///
-/// Applies exact template brace-depth tracking (so `}` tokens that close a
-/// `${...}` substitution are rescanned into template middle/tail parts) and
-/// the previous-token heuristic for regex-vs-division described in the module
-/// docs. Never fails on malformed input — only on OOM / oversized source.
-pub fn tokenize(alloc: Allocator, src: []const u8) error{ OutOfMemory, SourceTooLarge }!Tokens {
-    if (src.len > max_source_len) return error.SourceTooLarge;
-
-    var tags: std.ArrayList(Tag) = .empty;
-    errdefer tags.deinit(alloc);
-    var starts: std.ArrayList(u32) = .empty;
-    errdefer starts.deinit(alloc);
-    // ~4.5 source bytes per token empirically; reserve conservatively.
-    try tags.ensureTotalCapacityPrecise(alloc, src.len / 4 + 4);
-    try starts.ensureTotalCapacityPrecise(alloc, src.len / 4 + 4);
-
-    // One entry per open template substitution: the count of unmatched `{`
-    // inside it. A `}` at count 0 closes the substitution itself.
-    var template_stack: std.ArrayList(u32) = .empty;
-    defer template_stack.deinit(alloc);
-
-    var s = Scanner.init(src);
-    var prev_tag: Tag = .eof; // regex allowed at stream start
-    while (true) {
-        var tok = s.next();
-        switch (tok.tag) {
-            .slash, .slash_eq => {
-                if (!prev_tag.endsExpression()) tok = s.reScanSlashAsRegex(tok);
-            },
-            .l_brace => {
-                if (template_stack.items.len > 0) {
-                    template_stack.items[template_stack.items.len - 1] += 1;
-                }
-            },
-            .r_brace => {
-                if (template_stack.items.len > 0) {
-                    const depth = &template_stack.items[template_stack.items.len - 1];
-                    if (depth.* == 0) {
-                        tok = s.reScanTemplateToken(tok);
-                        switch (tok.tag) {
-                            .template_middle => {}, // substitution list continues
-                            .template_tail, .unterminated_template => _ = template_stack.pop(),
-                            else => unreachable,
-                        }
-                    } else {
-                        depth.* -= 1;
-                    }
-                }
-            },
-            .template_head => try template_stack.append(alloc, 0),
-            else => {},
-        }
-
-        try tags.append(alloc, tok.tag);
-        try starts.append(alloc, tok.start | @as(u32, if (tok.newline_before) Tokens.newline_flag else 0));
-        if (tok.tag == .eof) break;
-        prev_tag = tok.tag;
-    }
-
-    return .{
-        .tags = try tags.toOwnedSlice(alloc),
-        .starts = try starts.toOwnedSlice(alloc),
-    };
-}
-
-/// Recompute a token's end offset by rescanning it from its start.
-/// O(token length); used for lazy spans so we never store ends.
-pub fn tokenEnd(src: []const u8, tag: Tag, start: u32) u32 {
-    switch (tag) {
-        .eof => return start,
-        // These consume to end of file by construction.
-        .unterminated_template, .unterminated_comment => {
-            // A middle/tail rescan can also produce unterminated_template
-            // starting at `}`; either way it ends at EOF.
-            return @intCast(src.len);
-        },
-        .template_middle, .template_tail => {
-            var s = Scanner{ .src = src, .index = start };
-            _ = s.scanTemplate(false);
-            return s.index;
-        },
-        .regexp_literal, .unterminated_regexp_literal => {
-            var s = Scanner{ .src = src, .index = start };
-            _ = s.scanRegex();
-            return s.index;
-        },
-        .jsx_text => {
-            var s = Scanner{ .src = src, .index = start };
-            return s.scanJsxChild(start).end;
-        },
-        .jsx_name => {
-            const s = Scanner{ .src = src, .index = start };
-            return s.scanJsxName(start);
-        },
-        else => {
-            var s = Scanner{ .src = src, .index = start };
-            return s.next().end;
-        },
-    }
-}
+const keyword_map = std.StaticStringMap(Tag).initComptime(.{
+    .{ "break", .keyword_break },
+    .{ "case", .keyword_case },
+    .{ "catch", .keyword_catch },
+    .{ "class", .keyword_class },
+    .{ "const", .keyword_const },
+    .{ "continue", .keyword_continue },
+    .{ "debugger", .keyword_debugger },
+    .{ "default", .keyword_default },
+    .{ "delete", .keyword_delete },
+    .{ "do", .keyword_do },
+    .{ "else", .keyword_else },
+    .{ "enum", .keyword_enum },
+    .{ "export", .keyword_export },
+    .{ "extends", .keyword_extends },
+    .{ "false", .keyword_false },
+    .{ "finally", .keyword_finally },
+    .{ "for", .keyword_for },
+    .{ "function", .keyword_function },
+    .{ "if", .keyword_if },
+    .{ "import", .keyword_import },
+    .{ "in", .keyword_in },
+    .{ "instanceof", .keyword_instanceof },
+    .{ "new", .keyword_new },
+    .{ "null", .keyword_null },
+    .{ "return", .keyword_return },
+    .{ "super", .keyword_super },
+    .{ "switch", .keyword_switch },
+    .{ "this", .keyword_this },
+    .{ "throw", .keyword_throw },
+    .{ "true", .keyword_true },
+    .{ "try", .keyword_try },
+    .{ "typeof", .keyword_typeof },
+    .{ "var", .keyword_var },
+    .{ "void", .keyword_void },
+    .{ "while", .keyword_while },
+    .{ "with", .keyword_with },
+    .{ "implements", .keyword_implements },
+    .{ "interface", .keyword_interface },
+    .{ "let", .keyword_let },
+    .{ "package", .keyword_package },
+    .{ "private", .keyword_private },
+    .{ "protected", .keyword_protected },
+    .{ "public", .keyword_public },
+    .{ "static", .keyword_static },
+    .{ "yield", .keyword_yield },
+    .{ "abstract", .keyword_abstract },
+    .{ "accessor", .keyword_accessor },
+    .{ "any", .keyword_any },
+    .{ "as", .keyword_as },
+    .{ "assert", .keyword_assert },
+    .{ "asserts", .keyword_asserts },
+    .{ "async", .keyword_async },
+    .{ "await", .keyword_await },
+    .{ "bigint", .keyword_bigint },
+    .{ "boolean", .keyword_boolean },
+    .{ "constructor", .keyword_constructor },
+    .{ "declare", .keyword_declare },
+    .{ "from", .keyword_from },
+    .{ "get", .keyword_get },
+    .{ "global", .keyword_global },
+    .{ "infer", .keyword_infer },
+    .{ "intrinsic", .keyword_intrinsic },
+    .{ "is", .keyword_is },
+    .{ "keyof", .keyword_keyof },
+    .{ "module", .keyword_module },
+    .{ "namespace", .keyword_namespace },
+    .{ "never", .keyword_never },
+    .{ "number", .keyword_number },
+    .{ "object", .keyword_object },
+    .{ "of", .keyword_of },
+    .{ "out", .keyword_out },
+    .{ "override", .keyword_override },
+    .{ "readonly", .keyword_readonly },
+    .{ "require", .keyword_require },
+    .{ "satisfies", .keyword_satisfies },
+    .{ "set", .keyword_set },
+    .{ "string", .keyword_string },
+    .{ "symbol", .keyword_symbol },
+    .{ "type", .keyword_type },
+    .{ "undefined", .keyword_undefined },
+    .{ "unique", .keyword_unique },
+    .{ "unknown", .keyword_unknown },
+    .{ "using", .keyword_using },
+});
 
 // ---------------------------------------------------------------------------
 // character classes

@@ -64,8 +64,357 @@ const modules = @import("modules.zig");
 pub const Error = error{OutOfMemory};
 
 // ===========================================================================
+// config
+// ===========================================================================
+
+/// Load and expand `config_path` through the cwd.
+pub fn load(io: Io, arena: Allocator, config_path: []const u8) LoadError!Config {
+    return loadInDir(io, arena, Io.Dir.cwd(), config_path);
+}
+
+/// Load `config_path` (relative to `base`), resolve its `extends` chain,
+/// merge, and expand its file list. All returned paths are relative to `base`.
+pub fn loadInDir(io: Io, arena: Allocator, base: Io.Dir, config_path: []const u8) LoadError!Config {
+    var cfg: Config = .{
+        .path = config_path,
+        .dir = modules.dirnamePart(config_path),
+    };
+    var warnings: std.ArrayList([]const u8) = .empty;
+    var notes: std.ArrayList([]const u8) = .empty;
+
+    // Merge the `extends` chain (base configs applied first, this config last).
+    var acc: Merged = .{};
+    var chain: std.ArrayList([]const u8) = .empty;
+    try mergeConfig(io, arena, base, config_path, cfg.dir, &acc, &warnings, &notes, &chain, true);
+
+    // `strict` is evaluated on the merged value (child overrides base per-key):
+    // only an explicit final `false` is the unsupported case.
+    if (acc.strict) |s| {
+        if (!s) return error.StrictFalse;
+    }
+
+    cfg.lib = acc.lib;
+    // Effective noImplicitAny = explicit value ?? strict. ztsc only runs strict
+    // semantics (strict is true or absent — an explicit `false` errored above),
+    // so the fallback is `true`; an explicit `noImplicitAny: false` still wins.
+    cfg.no_implicit_any = acc.no_implicit_any orelse (acc.strict orelse true);
+    if (!cfg.no_implicit_any) {
+        try note(arena, &notes, "'noImplicitAny' is off: implicit-'any' diagnostics (TS7006/TS7053) are suppressed; unannotated values still type as 'any'", .{});
+    }
+    cfg.allow_js = acc.allow_js orelse false;
+    if (cfg.allow_js) {
+        try note(arena, &notes, "'allowJs' honored: a specifier resolving only to a .js file is typed opaquely as 'any' (ztsc never parses JS; 'checkJs' is unsupported)", .{});
+    }
+    cfg.skip_lib_check = acc.skip_lib_check orelse false;
+    cfg.skip_all_lib_check = acc.skip_all_lib_check orelse false;
+    cfg.resolve_json_module = acc.resolve_json_module orelse false;
+    // Effective allowSyntheticDefaultImports = explicit value ?? esModuleInterop
+    // ?? false (tsc's rule; esModuleInterop implies it).
+    cfg.allow_synthetic_default_imports = acc.allow_synthetic_default_imports orelse acc.es_module_interop orelse false;
+    if (cfg.allow_synthetic_default_imports) {
+        try note(arena, &notes, "'allowSyntheticDefaultImports'/'esModuleInterop' honored: a default import of a module with no default export binds to the module namespace object (the synthesized default)", .{});
+    }
+    if (acc.base_url) |bu| {
+        cfg.base_url = try joinNormalize(arena, acc.base_url_dir, bu);
+    }
+    if (cfg.skip_all_lib_check) {
+        try note(arena, &notes, "'skipLibCheck' honored: no diagnostics are surfaced from any .d.ts file (default lib and dependency/project .d.ts alike); their types still flow into .ts checking", .{});
+    } else if (acc.skip_lib_check) |sv| {
+        if (sv) {
+            try note(arena, &notes, "'skipDefaultLibCheck' honored: the embedded default lib is not type-checked (other .d.ts files are still checked; use 'skipLibCheck' to skip those too)", .{});
+        } else {
+            try note(arena, &notes, "'skipLibCheck'/'skipDefaultLibCheck' is not enabled; the embedded default lib is type-checked (matching tsc/tsgo)", .{});
+        }
+    }
+
+    // Build the paths map (validate: at most one '*' per key and value).
+    // tsc anchors path targets at `baseUrl` when present, else at the directory
+    // of the config that declared `paths` (both may come from different configs
+    // after an extends merge).
+    if (acc.paths_obj) |po| {
+        const paths_base: []const u8 = if (acc.base_url) |bu|
+            try joinNormalize(arena, acc.base_url_dir, bu)
+        else
+            try modules.normalizePath(arena, if (acc.paths_dir.len == 0) "." else acc.paths_dir);
+        var keys: std.ArrayList([]const u8) = .empty;
+        var vals: std.ArrayList([]const []const u8) = .empty;
+        for (po.keys, po.vals) |pkey, pval| {
+            if (std.mem.count(u8, pkey, "*") > 1) {
+                try warn(arena, &warnings, "{s}: paths pattern '{s}' has more than one '*' (ignored)", .{ acc.paths_path, pkey });
+                continue;
+            }
+            if (pval != .array) {
+                try warn(arena, &warnings, "{s}: paths entry '{s}' must be an array (ignored)", .{ acc.paths_path, pkey });
+                continue;
+            }
+            var targets: std.ArrayList([]const u8) = .empty;
+            for (pval.array) |t| {
+                if (t != .string or std.mem.count(u8, t.string, "*") > 1) {
+                    try warn(arena, &warnings, "{s}: bad substitution in paths entry '{s}' (skipped)", .{ acc.paths_path, pkey });
+                    continue;
+                }
+                try targets.append(arena, t.string);
+            }
+            try keys.append(arena, pkey);
+            try vals.append(arena, try targets.toOwnedSlice(arena));
+        }
+        if (keys.items.len > 0) {
+            cfg.paths = .{
+                .keys = try keys.toOwnedSlice(arena),
+                .vals = try vals.toOwnedSlice(arena),
+                .base = paths_base,
+            };
+        }
+    }
+
+    // Expand the root file set. `files`/`include`/`exclude` each resolve
+    // against the directory of the config that declared them (inherited entries
+    // re-anchor to the base's directory).
+    var root_files: std.ArrayList([]const u8) = .empty;
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(arena);
+    if (acc.files) |list| {
+        for (list) |f| {
+            const joined = try joinNormalize(arena, acc.files_dir, f);
+            const gop = try seen.getOrPut(arena, joined);
+            if (!gop.found_existing) try root_files.append(arena, joined);
+        }
+    }
+
+    // tsc: `include` defaults to everything only when `files` is absent.
+    var include_pats: []const []const u8 = &.{};
+    var include_dir: []const u8 = cfg.dir;
+    if (acc.include) |list| {
+        include_pats = list;
+        include_dir = acc.include_dir;
+    } else if (acc.files == null) {
+        include_pats = &default_include;
+    }
+    var exclude_pats: []const []const u8 = &default_excludes;
+    var exclude_dir: []const u8 = include_dir;
+    if (acc.exclude) |list| {
+        exclude_pats = list;
+        exclude_dir = acc.exclude_dir;
+    }
+
+    if (include_pats.len > 0) {
+        // Re-express include/exclude patterns in the base-relative space the
+        // filesystem walk produces, so patterns from different configs (and the
+        // walk root) share one coordinate system.
+        var inc_abs: std.ArrayList([]const u8) = .empty;
+        for (include_pats) |p| {
+            try inc_abs.append(arena, try joinNormalize(arena, include_dir, try preprocessInclude(arena, p)));
+        }
+        var exc_abs: std.ArrayList([]const u8) = .empty;
+        for (exclude_pats) |e| {
+            try exc_abs.append(arena, try joinNormalize(arena, exclude_dir, e));
+        }
+        const matched = try expandInclude(io, arena, base, include_dir, inc_abs.items, exc_abs.items, &warnings, cfg.path);
+        for (matched) |m| {
+            const gop = try seen.getOrPut(arena, m);
+            if (!gop.found_existing) try root_files.append(arena, m);
+        }
+    }
+
+    cfg.root_files = try root_files.toOwnedSlice(arena);
+
+    // Auto-include every visible `@types/*` package as an ambient program root
+    // (tsc's default `typeRoots`), honoring `types`/`typeRoots`.
+    const type_roots_abs: ?[]const []const u8 = if (acc.type_roots) |trs| blk: {
+        var abs: std.ArrayList([]const u8) = .empty;
+        for (trs) |r| try abs.append(arena, try joinNormalize(arena, acc.type_roots_dir, r));
+        break :blk try abs.toOwnedSlice(arena);
+    } else null;
+    cfg.auto_type_files = try collectAutoTypes(io, arena, base, cfg.dir, type_roots_abs, acc.types);
+    if (cfg.auto_type_files.len > 0) {
+        try note(arena, &notes, "auto-included {d} '@types' package(s) as ambient roots (tsc's default typeRoots); override with 'typeRoots'/'types'", .{cfg.auto_type_files.len});
+    }
+
+    cfg.warnings = try warnings.toOwnedSlice(arena);
+    cfg.notes = try notes.toOwnedSlice(arena);
+    return cfg;
+}
+
+pub const Config = struct {
+    /// Path of the tsconfig.json that was loaded (base-relative).
+    path: []const u8,
+    /// Its directory ("" = the base directory itself), base-relative.
+    dir: []const u8,
+    /// Expanded root files: `files` entries first (in order), then
+    /// include-matched files sorted by path; deduplicated.
+    root_files: []const []const u8 = &.{},
+    /// Auto-included `@types/*` package main declaration files (base-relative,
+    /// sorted). tsc's default `typeRoots` behavior: with neither `types` nor
+    /// `typeRoots` set, every `node_modules/@types/<pkg>` visible walking up
+    /// from the project directory is an ambient program root. `typeRoots`
+    /// overrides the root directories; `types: [...]` restricts to the named
+    /// packages (`types: []` disables it). Kept separate from `root_files` so
+    /// the "no inputs" diagnostic still keys on real sources; the driver appends
+    /// these to the program roots. Skipped/checked per `skipLibCheck` like any
+    /// other `.d.ts`.
+    auto_type_files: []const []const u8 = &.{},
+    /// `paths`/`baseUrl` mapping for module resolution, if configured.
+    paths: ?Paths = null,
+    /// `compilerOptions.lib` entries (as written), or null when the field is
+    /// absent. Fed to `modules.resolveLibSet` to pick the built-in lib blobs;
+    /// null selects the default set (ES-core + DOM, matching tsgo).
+    lib: ?[]const []const u8 = null,
+    /// `compilerOptions.skipLibCheck` or `skipDefaultLibCheck` set to true.
+    /// Suppresses type-checking of the embedded default lib (which ztsc checks
+    /// by default, matching tsc/tsgo). `skipLibCheck` additionally sets
+    /// `skip_all_lib_check` below (it subsumes `skipDefaultLibCheck`).
+    skip_lib_check: bool = false,
+    /// `compilerOptions.skipLibCheck` (only) set to true — the strict superset
+    /// of `skipDefaultLibCheck`. Suppresses diagnostics located in *every*
+    /// `.d.ts` file, not just the default lib, so ztsc's observable output
+    /// matches tsc's on valid `.d.ts`. tsc keeps genuine *syntactic* errors in
+    /// `.d.ts`; ztsc drops parser diagnostics there too, because it cannot
+    /// distinguish a genuine syntax error from a parser-subset-gap cascade and
+    /// published `.d.ts` are syntactically valid (no-false-positives wins over
+    /// exact syntactic parity). `.d.ts` types still flow into `.ts`/`.tsx`.
+    skip_all_lib_check: bool = false,
+    /// Effective `compilerOptions.noImplicitAny` (true = on = report). tsc's
+    /// rule is `noImplicitAny ?? strict`; ztsc only runs strict semantics, so an
+    /// absent value defaults on (strict is true or absent). When off, the
+    /// implicit-any diagnostic family (TS7006 parameter, TS7053 element index) is
+    /// suppressed — the value still becomes `any`, only the diagnostic is gone.
+    /// `strictNullChecks` etc. remain governed by `strict`, never coupled here.
+    no_implicit_any: bool = true,
+    /// `compilerOptions.allowJs`: a bare/relative specifier that resolves only to
+    /// a JavaScript file (a JS-only package, or a `./x.js` with no `.ts`/`.d.ts`
+    /// twin) is typed opaquely as `any` rather than raising TS2307. ztsc never
+    /// parses/checks the JS. `checkJs` stays unsupported.
+    allow_js: bool = false,
+    /// `compilerOptions.resolveJsonModule`: a `*.json` import that names an
+    /// existing file resolves (typed opaquely as `any`) rather than TS2307.
+    resolve_json_module: bool = false,
+    /// Effective `compilerOptions.allowSyntheticDefaultImports`, i.e.
+    /// `allowSyntheticDefaultImports ?? esModuleInterop ?? false` (tsc's rule;
+    /// esModuleInterop implies it). When on, a default import of a module that
+    /// has no default export binds to the module namespace object (the
+    /// synthesized default) instead of raising TS1192.
+    allow_synthetic_default_imports: bool = false,
+    /// `compilerOptions.baseUrl`, resolved to a base-relative directory (null
+    /// when unset). Consulted for bare `*.json` specifiers only (`public/api/
+    /// x.json`); non-json baseUrl resolution is not modeled.
+    base_url: ?[]const u8 = null,
+    /// Non-fatal warnings (unknown options, bad shapes) for stderr.
+    warnings: []const []const u8 = &.{},
+    /// Accepted-and-ignored option notes, shown under --verbose only.
+    notes: []const []const u8 = &.{},
+};
+
+/// Minimal `compilerOptions.paths` support: exact keys and single-`*`
+/// patterns, values relative to `base` (baseUrl resolved against the
+/// config directory).
+pub const Paths = struct {
+    keys: []const []const u8 = &.{},
+    vals: []const []const []const u8 = &.{},
+    /// Base-relative directory targets resolve against ("" = base dir).
+    base: []const u8 = "",
+
+    /// Map a bare specifier through the table. tsc rule: an exact-match key
+    /// wins; otherwise the `*` pattern with the longest matched prefix.
+    /// Returns candidate stem paths (base-relative, normalized) to feed
+    /// module resolution; empty slice if no key matches.
+    pub fn mapSpecifier(p: *const Paths, arena: Allocator, spec: []const u8) Error![]const []const u8 {
+        var exact: ?usize = null;
+        var best: ?usize = null;
+        var best_prefix: usize = 0;
+        for (p.keys, 0..) |key, i| {
+            if (std.mem.indexOfScalar(u8, key, '*')) |star| {
+                const prefix = key[0..star];
+                const suffix = key[star + 1 ..];
+                if (spec.len >= prefix.len + suffix.len and
+                    std.mem.startsWith(u8, spec, prefix) and
+                    std.mem.endsWith(u8, spec, suffix))
+                {
+                    if (best == null or prefix.len > best_prefix) {
+                        best = i;
+                        best_prefix = prefix.len;
+                    }
+                }
+            } else if (std.mem.eql(u8, key, spec)) {
+                exact = i;
+            }
+        }
+        const idx = exact orelse (best orelse return &.{});
+        const key = p.keys[idx];
+        var out: std.ArrayList([]const u8) = .empty;
+        for (p.vals[idx]) |val| {
+            var target: []const u8 = val;
+            if (exact == null) {
+                // Substitute the '*' capture into the value.
+                const star = std.mem.indexOfScalar(u8, key, '*').?;
+                const captured = spec[star .. spec.len - (key.len - star - 1)];
+                if (std.mem.indexOfScalar(u8, val, '*')) |vstar| {
+                    target = try std.fmt.allocPrint(arena, "{s}{s}{s}", .{
+                        val[0..vstar], captured, val[vstar + 1 ..],
+                    });
+                }
+            }
+            try out.append(arena, try joinNormalize(arena, p.base, target));
+        }
+        return out.toOwnedSlice(arena);
+    }
+};
+
+pub const LoadError = error{
+    OutOfMemory,
+    /// The file could not be read.
+    NotFound,
+    /// The file is not valid JSONC.
+    SyntaxError,
+    /// `compilerOptions.strict` is explicitly false — unsupported.
+    StrictFalse,
+};
+
+// ===========================================================================
+// discovery
+// ===========================================================================
+
+/// `findUpwardInDir` from the current working directory, walking up as many
+/// levels as the cwd path has components.
+pub fn findUpward(io: Io, arena: Allocator) Error!?[]u8 {
+    const cwd_path = std.process.currentPathAlloc(io, arena) catch return null;
+    var levels: usize = 0;
+    var it = std.mem.splitScalar(u8, cwd_path, '/');
+    while (it.next()) |seg| {
+        if (seg.len > 0) levels += 1;
+    }
+    return findUpwardInDir(io, arena, Io.Dir.cwd(), levels);
+}
+
+/// Look for `tsconfig.json` in `base`, then each parent, up to `max_levels`
+/// parents. Returns the base-relative path ("tsconfig.json",
+/// "../tsconfig.json", ...) or null.
+pub fn findUpwardInDir(io: Io, arena: Allocator, base: Io.Dir, max_levels: usize) Error!?[]u8 {
+    var prefix: std.ArrayList(u8) = .empty;
+    var level: usize = 0;
+    while (level <= max_levels) : (level += 1) {
+        const cand = try std.fmt.allocPrint(arena, "{s}tsconfig.json", .{prefix.items});
+        if (base.statFile(io, cand, .{})) |st| {
+            if (st.kind == .file) return cand;
+        } else |_| {}
+        try prefix.appendSlice(arena, "../");
+    }
+    return null;
+}
+
+// ===========================================================================
 // JSONC value parser
 // ===========================================================================
+
+/// Parse JSONC (JSON + comments + trailing commas) into an arena-backed
+/// `Value`. Strings are unescaped copies.
+pub fn parseJsonc(arena: Allocator, text: []const u8) JsonError!Value {
+    var p: JsonParser = .{ .arena = arena, .text = text };
+    p.skipWs();
+    const v = try p.parseValue(0);
+    p.skipWs();
+    if (p.pos != p.text.len) return error.SyntaxError;
+    return v;
+}
 
 pub const Value = union(enum) {
     null,
@@ -90,16 +439,25 @@ pub const Value = union(enum) {
 
 pub const JsonError = error{ SyntaxError, OutOfMemory };
 
-/// Parse JSONC (JSON + comments + trailing commas) into an arena-backed
-/// `Value`. Strings are unescaped copies.
-pub fn parseJsonc(arena: Allocator, text: []const u8) JsonError!Value {
-    var p: JsonParser = .{ .arena = arena, .text = text };
-    p.skipWs();
-    const v = try p.parseValue(0);
-    p.skipWs();
-    if (p.pos != p.text.len) return error.SyntaxError;
-    return v;
+// ===========================================================================
+// glob matcher
+// ===========================================================================
+
+/// Match a glob `pattern` against a `/`-separated relative `path` (both
+/// lexically normalized, no leading `./`). `**` matches zero or more whole
+/// segments, `*` any run of non-`/` characters, `?` exactly one non-`/`
+/// character. Wildcards never match a leading `.` of a segment.
+pub fn globMatch(pattern: []const u8, path: []const u8) bool {
+    return matchParts(pattern, path);
 }
+
+// ===========================================================================
+// private implementation
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// JSONC parser
+// ---------------------------------------------------------------------------
 
 const JsonParser = struct {
     arena: Allocator,
@@ -276,17 +634,9 @@ const JsonParser = struct {
     }
 };
 
-// ===========================================================================
-// glob matcher
-// ===========================================================================
-
-/// Match a glob `pattern` against a `/`-separated relative `path` (both
-/// lexically normalized, no leading `./`). `**` matches zero or more whole
-/// segments, `*` any run of non-`/` characters, `?` exactly one non-`/`
-/// character. Wildcards never match a leading `.` of a segment.
-pub fn globMatch(pattern: []const u8, path: []const u8) bool {
-    return matchParts(pattern, path);
-}
+// ---------------------------------------------------------------------------
+// glob matching
+// ---------------------------------------------------------------------------
 
 const Split = struct { head: []const u8, tail: ?[]const u8 };
 
@@ -346,311 +696,9 @@ fn segMatch(pat: []const u8, name: []const u8) bool {
     return pi == pat.len;
 }
 
-// ===========================================================================
-// config
-// ===========================================================================
-
-/// Minimal `compilerOptions.paths` support: exact keys and single-`*`
-/// patterns, values relative to `base` (baseUrl resolved against the
-/// config directory).
-pub const Paths = struct {
-    keys: []const []const u8 = &.{},
-    vals: []const []const []const u8 = &.{},
-    /// Base-relative directory targets resolve against ("" = base dir).
-    base: []const u8 = "",
-
-    /// Map a bare specifier through the table. tsc rule: an exact-match key
-    /// wins; otherwise the `*` pattern with the longest matched prefix.
-    /// Returns candidate stem paths (base-relative, normalized) to feed
-    /// module resolution; empty slice if no key matches.
-    pub fn mapSpecifier(p: *const Paths, arena: Allocator, spec: []const u8) Error![]const []const u8 {
-        var exact: ?usize = null;
-        var best: ?usize = null;
-        var best_prefix: usize = 0;
-        for (p.keys, 0..) |key, i| {
-            if (std.mem.indexOfScalar(u8, key, '*')) |star| {
-                const prefix = key[0..star];
-                const suffix = key[star + 1 ..];
-                if (spec.len >= prefix.len + suffix.len and
-                    std.mem.startsWith(u8, spec, prefix) and
-                    std.mem.endsWith(u8, spec, suffix))
-                {
-                    if (best == null or prefix.len > best_prefix) {
-                        best = i;
-                        best_prefix = prefix.len;
-                    }
-                }
-            } else if (std.mem.eql(u8, key, spec)) {
-                exact = i;
-            }
-        }
-        const idx = exact orelse (best orelse return &.{});
-        const key = p.keys[idx];
-        var out: std.ArrayList([]const u8) = .empty;
-        for (p.vals[idx]) |val| {
-            var target: []const u8 = val;
-            if (exact == null) {
-                // Substitute the '*' capture into the value.
-                const star = std.mem.indexOfScalar(u8, key, '*').?;
-                const captured = spec[star .. spec.len - (key.len - star - 1)];
-                if (std.mem.indexOfScalar(u8, val, '*')) |vstar| {
-                    target = try std.fmt.allocPrint(arena, "{s}{s}{s}", .{
-                        val[0..vstar], captured, val[vstar + 1 ..],
-                    });
-                }
-            }
-            try out.append(arena, try joinNormalize(arena, p.base, target));
-        }
-        return out.toOwnedSlice(arena);
-    }
-};
-
-pub const Config = struct {
-    /// Path of the tsconfig.json that was loaded (base-relative).
-    path: []const u8,
-    /// Its directory ("" = the base directory itself), base-relative.
-    dir: []const u8,
-    /// Expanded root files: `files` entries first (in order), then
-    /// include-matched files sorted by path; deduplicated.
-    root_files: []const []const u8 = &.{},
-    /// Auto-included `@types/*` package main declaration files (base-relative,
-    /// sorted). tsc's default `typeRoots` behavior: with neither `types` nor
-    /// `typeRoots` set, every `node_modules/@types/<pkg>` visible walking up
-    /// from the project directory is an ambient program root. `typeRoots`
-    /// overrides the root directories; `types: [...]` restricts to the named
-    /// packages (`types: []` disables it). Kept separate from `root_files` so
-    /// the "no inputs" diagnostic still keys on real sources; the driver appends
-    /// these to the program roots. Skipped/checked per `skipLibCheck` like any
-    /// other `.d.ts`.
-    auto_type_files: []const []const u8 = &.{},
-    /// `paths`/`baseUrl` mapping for module resolution, if configured.
-    paths: ?Paths = null,
-    /// `compilerOptions.lib` entries (as written), or null when the field is
-    /// absent. Fed to `modules.resolveLibSet` to pick the built-in lib blobs;
-    /// null selects the default set (ES-core + DOM, matching tsgo).
-    lib: ?[]const []const u8 = null,
-    /// `compilerOptions.skipLibCheck` or `skipDefaultLibCheck` set to true.
-    /// Suppresses type-checking of the embedded default lib (which ztsc checks
-    /// by default, matching tsc/tsgo). `skipLibCheck` additionally sets
-    /// `skip_all_lib_check` below (it subsumes `skipDefaultLibCheck`).
-    skip_lib_check: bool = false,
-    /// `compilerOptions.skipLibCheck` (only) set to true — the strict superset
-    /// of `skipDefaultLibCheck`. Suppresses diagnostics located in *every*
-    /// `.d.ts` file, not just the default lib, so ztsc's observable output
-    /// matches tsc's on valid `.d.ts`. tsc keeps genuine *syntactic* errors in
-    /// `.d.ts`; ztsc drops parser diagnostics there too, because it cannot
-    /// distinguish a genuine syntax error from a parser-subset-gap cascade and
-    /// published `.d.ts` are syntactically valid (no-false-positives wins over
-    /// exact syntactic parity). `.d.ts` types still flow into `.ts`/`.tsx`.
-    skip_all_lib_check: bool = false,
-    /// Effective `compilerOptions.noImplicitAny` (true = on = report). tsc's
-    /// rule is `noImplicitAny ?? strict`; ztsc only runs strict semantics, so an
-    /// absent value defaults on (strict is true or absent). When off, the
-    /// implicit-any diagnostic family (TS7006 parameter, TS7053 element index) is
-    /// suppressed — the value still becomes `any`, only the diagnostic is gone.
-    /// `strictNullChecks` etc. remain governed by `strict`, never coupled here.
-    no_implicit_any: bool = true,
-    /// `compilerOptions.allowJs`: a bare/relative specifier that resolves only to
-    /// a JavaScript file (a JS-only package, or a `./x.js` with no `.ts`/`.d.ts`
-    /// twin) is typed opaquely as `any` rather than raising TS2307. ztsc never
-    /// parses/checks the JS. `checkJs` stays unsupported.
-    allow_js: bool = false,
-    /// `compilerOptions.resolveJsonModule`: a `*.json` import that names an
-    /// existing file resolves (typed opaquely as `any`) rather than TS2307.
-    resolve_json_module: bool = false,
-    /// Effective `compilerOptions.allowSyntheticDefaultImports`, i.e.
-    /// `allowSyntheticDefaultImports ?? esModuleInterop ?? false` (tsc's rule;
-    /// esModuleInterop implies it). When on, a default import of a module that
-    /// has no default export binds to the module namespace object (the
-    /// synthesized default) instead of raising TS1192.
-    allow_synthetic_default_imports: bool = false,
-    /// `compilerOptions.baseUrl`, resolved to a base-relative directory (null
-    /// when unset). Consulted for bare `*.json` specifiers only (`public/api/
-    /// x.json`); non-json baseUrl resolution is not modeled.
-    base_url: ?[]const u8 = null,
-    /// Non-fatal warnings (unknown options, bad shapes) for stderr.
-    warnings: []const []const u8 = &.{},
-    /// Accepted-and-ignored option notes, shown under --verbose only.
-    notes: []const []const u8 = &.{},
-};
-
-pub const LoadError = error{
-    OutOfMemory,
-    /// The file could not be read.
-    NotFound,
-    /// The file is not valid JSONC.
-    SyntaxError,
-    /// `compilerOptions.strict` is explicitly false — unsupported.
-    StrictFalse,
-};
-
-/// Load and expand `config_path` through the cwd.
-pub fn load(io: Io, arena: Allocator, config_path: []const u8) LoadError!Config {
-    return loadInDir(io, arena, Io.Dir.cwd(), config_path);
-}
-
-/// Load `config_path` (relative to `base`), resolve its `extends` chain,
-/// merge, and expand its file list. All returned paths are relative to `base`.
-pub fn loadInDir(io: Io, arena: Allocator, base: Io.Dir, config_path: []const u8) LoadError!Config {
-    var cfg: Config = .{
-        .path = config_path,
-        .dir = modules.dirnamePart(config_path),
-    };
-    var warnings: std.ArrayList([]const u8) = .empty;
-    var notes: std.ArrayList([]const u8) = .empty;
-
-    // Merge the `extends` chain (base configs applied first, this config last).
-    var acc: Merged = .{};
-    var chain: std.ArrayList([]const u8) = .empty;
-    try mergeConfig(io, arena, base, config_path, cfg.dir, &acc, &warnings, &notes, &chain, true);
-
-    // `strict` is evaluated on the merged value (child overrides base per-key):
-    // only an explicit final `false` is the unsupported case.
-    if (acc.strict) |s| {
-        if (!s) return error.StrictFalse;
-    }
-
-    cfg.lib = acc.lib;
-    // Effective noImplicitAny = explicit value ?? strict. ztsc only runs strict
-    // semantics (strict is true or absent — an explicit `false` errored above),
-    // so the fallback is `true`; an explicit `noImplicitAny: false` still wins.
-    cfg.no_implicit_any = acc.no_implicit_any orelse (acc.strict orelse true);
-    if (!cfg.no_implicit_any) {
-        try note(arena, &notes, "'noImplicitAny' is off: implicit-'any' diagnostics (TS7006/TS7053) are suppressed; unannotated values still type as 'any'", .{});
-    }
-    cfg.allow_js = acc.allow_js orelse false;
-    if (cfg.allow_js) {
-        try note(arena, &notes, "'allowJs' honored: a specifier resolving only to a .js file is typed opaquely as 'any' (ztsc never parses JS; 'checkJs' is unsupported)", .{});
-    }
-    cfg.skip_lib_check = acc.skip_lib_check orelse false;
-    cfg.skip_all_lib_check = acc.skip_all_lib_check orelse false;
-    cfg.resolve_json_module = acc.resolve_json_module orelse false;
-    // Effective allowSyntheticDefaultImports = explicit value ?? esModuleInterop
-    // ?? false (tsc's rule; esModuleInterop implies it).
-    cfg.allow_synthetic_default_imports = acc.allow_synthetic_default_imports orelse acc.es_module_interop orelse false;
-    if (cfg.allow_synthetic_default_imports) {
-        try note(arena, &notes, "'allowSyntheticDefaultImports'/'esModuleInterop' honored: a default import of a module with no default export binds to the module namespace object (the synthesized default)", .{});
-    }
-    if (acc.base_url) |bu| {
-        cfg.base_url = try joinNormalize(arena, acc.base_url_dir, bu);
-    }
-    if (cfg.skip_all_lib_check) {
-        try note(arena, &notes, "'skipLibCheck' honored: no diagnostics are surfaced from any .d.ts file (default lib and dependency/project .d.ts alike); their types still flow into .ts checking", .{});
-    } else if (acc.skip_lib_check) |sv| {
-        if (sv) {
-            try note(arena, &notes, "'skipDefaultLibCheck' honored: the embedded default lib is not type-checked (other .d.ts files are still checked; use 'skipLibCheck' to skip those too)", .{});
-        } else {
-            try note(arena, &notes, "'skipLibCheck'/'skipDefaultLibCheck' is not enabled; the embedded default lib is type-checked (matching tsc/tsgo)", .{});
-        }
-    }
-
-    // Build the paths map (validate: at most one '*' per key and value).
-    // tsc anchors path targets at `baseUrl` when present, else at the directory
-    // of the config that declared `paths` (both may come from different configs
-    // after an extends merge).
-    if (acc.paths_obj) |po| {
-        const paths_base: []const u8 = if (acc.base_url) |bu|
-            try joinNormalize(arena, acc.base_url_dir, bu)
-        else
-            try modules.normalizePath(arena, if (acc.paths_dir.len == 0) "." else acc.paths_dir);
-        var keys: std.ArrayList([]const u8) = .empty;
-        var vals: std.ArrayList([]const []const u8) = .empty;
-        for (po.keys, po.vals) |pkey, pval| {
-            if (std.mem.count(u8, pkey, "*") > 1) {
-                try warn(arena, &warnings, "{s}: paths pattern '{s}' has more than one '*' (ignored)", .{ acc.paths_path, pkey });
-                continue;
-            }
-            if (pval != .array) {
-                try warn(arena, &warnings, "{s}: paths entry '{s}' must be an array (ignored)", .{ acc.paths_path, pkey });
-                continue;
-            }
-            var targets: std.ArrayList([]const u8) = .empty;
-            for (pval.array) |t| {
-                if (t != .string or std.mem.count(u8, t.string, "*") > 1) {
-                    try warn(arena, &warnings, "{s}: bad substitution in paths entry '{s}' (skipped)", .{ acc.paths_path, pkey });
-                    continue;
-                }
-                try targets.append(arena, t.string);
-            }
-            try keys.append(arena, pkey);
-            try vals.append(arena, try targets.toOwnedSlice(arena));
-        }
-        if (keys.items.len > 0) {
-            cfg.paths = .{
-                .keys = try keys.toOwnedSlice(arena),
-                .vals = try vals.toOwnedSlice(arena),
-                .base = paths_base,
-            };
-        }
-    }
-
-    // Expand the root file set. `files`/`include`/`exclude` each resolve
-    // against the directory of the config that declared them (inherited entries
-    // re-anchor to the base's directory).
-    var root_files: std.ArrayList([]const u8) = .empty;
-    var seen: std.StringHashMapUnmanaged(void) = .empty;
-    defer seen.deinit(arena);
-    if (acc.files) |list| {
-        for (list) |f| {
-            const joined = try joinNormalize(arena, acc.files_dir, f);
-            const gop = try seen.getOrPut(arena, joined);
-            if (!gop.found_existing) try root_files.append(arena, joined);
-        }
-    }
-
-    // tsc: `include` defaults to everything only when `files` is absent.
-    var include_pats: []const []const u8 = &.{};
-    var include_dir: []const u8 = cfg.dir;
-    if (acc.include) |list| {
-        include_pats = list;
-        include_dir = acc.include_dir;
-    } else if (acc.files == null) {
-        include_pats = &default_include;
-    }
-    var exclude_pats: []const []const u8 = &default_excludes;
-    var exclude_dir: []const u8 = include_dir;
-    if (acc.exclude) |list| {
-        exclude_pats = list;
-        exclude_dir = acc.exclude_dir;
-    }
-
-    if (include_pats.len > 0) {
-        // Re-express include/exclude patterns in the base-relative space the
-        // filesystem walk produces, so patterns from different configs (and the
-        // walk root) share one coordinate system.
-        var inc_abs: std.ArrayList([]const u8) = .empty;
-        for (include_pats) |p| {
-            try inc_abs.append(arena, try joinNormalize(arena, include_dir, try preprocessInclude(arena, p)));
-        }
-        var exc_abs: std.ArrayList([]const u8) = .empty;
-        for (exclude_pats) |e| {
-            try exc_abs.append(arena, try joinNormalize(arena, exclude_dir, e));
-        }
-        const matched = try expandInclude(io, arena, base, include_dir, inc_abs.items, exc_abs.items, &warnings, cfg.path);
-        for (matched) |m| {
-            const gop = try seen.getOrPut(arena, m);
-            if (!gop.found_existing) try root_files.append(arena, m);
-        }
-    }
-
-    cfg.root_files = try root_files.toOwnedSlice(arena);
-
-    // Auto-include every visible `@types/*` package as an ambient program root
-    // (tsc's default `typeRoots`), honoring `types`/`typeRoots`.
-    const type_roots_abs: ?[]const []const u8 = if (acc.type_roots) |trs| blk: {
-        var abs: std.ArrayList([]const u8) = .empty;
-        for (trs) |r| try abs.append(arena, try joinNormalize(arena, acc.type_roots_dir, r));
-        break :blk try abs.toOwnedSlice(arena);
-    } else null;
-    cfg.auto_type_files = try collectAutoTypes(io, arena, base, cfg.dir, type_roots_abs, acc.types);
-    if (cfg.auto_type_files.len > 0) {
-        try note(arena, &notes, "auto-included {d} '@types' package(s) as ambient roots (tsc's default typeRoots); override with 'typeRoots'/'types'", .{cfg.auto_type_files.len});
-    }
-
-    cfg.warnings = try warnings.toOwnedSlice(arena);
-    cfg.notes = try notes.toOwnedSlice(arena);
-    return cfg;
-}
+// ---------------------------------------------------------------------------
+// config loading, extends resolution, include expansion
+// ---------------------------------------------------------------------------
 
 /// Enumerate the `@types/*` packages tsc would auto-include for this project,
 /// returning each package's main declaration file (base-relative), sorted for
@@ -1195,38 +1243,6 @@ fn matchesAny(patterns: []const []const u8, path: []const u8) bool {
         if (globMatch(p, path)) return true;
     }
     return false;
-}
-
-// ===========================================================================
-// discovery
-// ===========================================================================
-
-/// Look for `tsconfig.json` in `base`, then each parent, up to `max_levels`
-/// parents. Returns the base-relative path ("tsconfig.json",
-/// "../tsconfig.json", ...) or null.
-pub fn findUpwardInDir(io: Io, arena: Allocator, base: Io.Dir, max_levels: usize) Error!?[]u8 {
-    var prefix: std.ArrayList(u8) = .empty;
-    var level: usize = 0;
-    while (level <= max_levels) : (level += 1) {
-        const cand = try std.fmt.allocPrint(arena, "{s}tsconfig.json", .{prefix.items});
-        if (base.statFile(io, cand, .{})) |st| {
-            if (st.kind == .file) return cand;
-        } else |_| {}
-        try prefix.appendSlice(arena, "../");
-    }
-    return null;
-}
-
-/// `findUpwardInDir` from the current working directory, walking up as many
-/// levels as the cwd path has components.
-pub fn findUpward(io: Io, arena: Allocator) Error!?[]u8 {
-    const cwd_path = std.process.currentPathAlloc(io, arena) catch return null;
-    var levels: usize = 0;
-    var it = std.mem.splitScalar(u8, cwd_path, '/');
-    while (it.next()) |seg| {
-        if (seg.len > 0) levels += 1;
-    }
-    return findUpwardInDir(io, arena, Io.Dir.cwd(), levels);
 }
 
 // ===========================================================================
