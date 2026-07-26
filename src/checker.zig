@@ -326,19 +326,20 @@ const FreshTp = struct { name: Atom, constraint: TypeId, default: TypeId, has_de
 /// `deinit` cannot fall behind the field set: a container added to `Checker`
 /// and fed from `cm()` but forgotten here leaks its whole table.
 const map_containers = [_][]const u8{
-    "node_types",             "sig_cache",          "node_scopes",
-    "reassigned_syms",        "reassigned_in_loop", "member_written_syms",
-    "member_written_in_loop", "ns_types",           "ambient_ns_types",
-    "relation",               "expansions",         "origin",
-    "iface_generic",          "iface_stack",        "pending_class_decos",
-    "class_inst_generic",     "class_static_cache", "class_static_base_active",
-    "enum_value_cache",       "enum_info_cache",    "alias_generic",
-    "alias_state",            "alias_recursive",    "flow_cache",
-    "ref_keys",               "da_cache",           "ctp_cache",
-    "cmp_cache",              "inst_cache",         "inst_map_ids",
-    "tp_constraint_cache",    "fresh_tp_ids",       "fresh_tp_info",
-    "type_node_cache",        "atom_cache",         "unique_sym_ids",
-    "infer_ids",              "infer_scopes",       "mapped_key_ids",
+    "node_types",             "sig_cache",           "node_scopes",
+    "reassigned_syms",        "reassigned_in_loop",  "member_written_syms",
+    "member_written_in_loop", "ns_types",            "ambient_ns_types",
+    "relation",               "expansions",          "origin",
+    "iface_generic",          "iface_stack",         "pending_class_decos",
+    "class_inst_generic",     "class_static_cache",  "class_static_base_active",
+    "enum_value_cache",       "enum_info_cache",     "alias_generic",
+    "alias_state",            "alias_recursive",     "flow_same",
+    "flow_narrow",            "ref_keys",            "da_cache",
+    "ctp_cache",              "cmp_cache",           "inst_cache",
+    "inst_map_ids",           "tp_constraint_cache", "fresh_tp_ids",
+    "fresh_tp_info",          "type_node_cache",     "atom_cache",
+    "unique_sym_ids",         "infer_ids",           "infer_scopes",
+    "mapped_key_ids",
 };
 
 const Checker = struct {
@@ -357,6 +358,13 @@ const Checker = struct {
     tree: *const Ast,
     bind: *const Bind,
     src: []const u8,
+    /// Prefix sums of per-file flow-node counts: `flow_base[f] + local` is a
+    /// program-global flow id. Lets `FlowQ` pack `(file, flow)` into one u32
+    /// (same idiom as `Program.sym_base`).
+    flow_base: []const u32 = &.{},
+    /// `flow_base[cur_file]`, refreshed by `setFile` — `flowType` runs on the
+    /// current file's graph and is hot enough to want the index precomputed.
+    cur_flow_base: u32 = 0,
 
     /// Checker arena: type store, caches. Freed at the end of check().
     /// Heap-allocated so `Allocator` handles stay valid when the Checker
@@ -506,10 +514,20 @@ const Checker = struct {
     /// default substitution in `fixTypeArgs` (RHF `PathInternal<T, Tr = T>`)
     /// away from non-recursive library defaults (redux `Reducer<S, A, P = S>`).
     alias_recursive: std.AutoHashMapUnmanaged(SymbolId, void) = .empty,
-    /// Narrowed-type cache per (flow, reference, declared) query.
-    flow_cache: std.AutoHashMapUnmanaged(FlowQ, TypeId) = .empty,
-    /// Interned narrowing reference keys (RefKey -> dense index).
-    ref_keys: std.AutoHashMapUnmanaged(RefKey, u32) = .empty,
+    /// Narrowed-type cache per `(flow, reference, declared)` query, split by
+    /// outcome so the overwhelmingly common one costs no value slot. See
+    /// `FlowQ` for the packed key and why the split is behaviour-preserving.
+    ///
+    /// `flow_same` holds every query whose answer is "the declared type" —
+    /// both *in progress* (the loop sentinel) and *finished, nothing narrowed*.
+    /// Those two states are observationally identical (`flowType` returns
+    /// `declared` for either), so they can share one value-less set.
+    flow_same: std.AutoHashMapUnmanaged(FlowQ, void) = .empty,
+    /// The other ~1.5%: queries that actually narrowed. Disjoint from
+    /// `flow_same` (a key is moved here when its result comes back != declared).
+    flow_narrow: std.AutoHashMapUnmanaged(FlowQ, TypeId) = .empty,
+    /// Interned narrowing reference keys (RefQ -> dense index).
+    ref_keys: std.AutoHashMapUnmanaged(RefQ, u32) = .empty,
     /// (flow << 32 | symbol) -> definitely-assigned (2 computing, 0/1 result).
     da_cache: std.AutoHashMapUnmanaged(u64, u8) = .empty,
     /// containsTypeParam memo: 0 unknown, 1 no, 2 yes.
@@ -796,6 +814,14 @@ const Checker = struct {
         c.owned_mask = try arena_alloc.alloc(bool, prog.files.len);
         @memset(c.owned_mask, false);
         for (owned) |f| c.owned_mask[f] = true;
+        // Global flow-id bases (see `flow_base`). Flow nodes are strictly
+        // fewer than symbols program-wide, so the same u32 prefix sum that
+        // `Program.sym_base` uses is equally safe here.
+        const fbase = try arena_alloc.alloc(u32, prog.files.len + 1);
+        fbase[0] = 0;
+        for (prog.files, 0..) |*pf, i| fbase[i + 1] = fbase[i] + @as(u32, @intCast(pf.bind.flow_tags.len));
+        c.flow_base = fbase;
+        c.cur_flow_base = fbase[first];
         // Owner node -> primary scope map is filled lazily per file by
         // `faultScopes`; only the per-file "already faulted" flags are set up
         // here (all false = nothing mapped yet).
@@ -956,6 +982,7 @@ const Checker = struct {
         c.tree = pf.tree;
         c.bind = pf.bind;
         c.src = pf.src;
+        c.cur_flow_base = c.flow_base[f];
     }
 
     const SavedCtx = struct { file: FileId, scope: ScopeId };
@@ -14983,11 +15010,26 @@ const Checker = struct {
     /// Sentinel `RefKey.sym` for `this`-rooted property paths.
     const this_flow_root: SymbolId = std.math.maxInt(SymbolId);
 
-    const FlowQ = struct { file: FileId, flow: FlowId, key: u32, declared: TypeId };
+    /// A flow-cache query key, packed into one u64:
+    ///   high 32 = the program-global flow id (`flow_base[file] + flow`),
+    ///   low  32 = the dense `ref_keys` index of `(reference, declared)`.
+    ///
+    /// Both halves are dense u32 counters, so the packing is a bijection on
+    /// the old `(file, flow, ref, declared)` tuple — no key can alias another.
+    /// Folding `declared` into the interned reference (rather than carrying it
+    /// as a fourth field) is what makes the tuple fit: `declared` is a function
+    /// of the reference in all but a handful of cases (measured on the dogfood project:
+    /// 50 771 distinct `(ref, declared)` pairs vs 50 718 distinct refs), so it
+    /// costs ~0.1% more `ref_keys` entries and saves 8 bytes on every one of
+    /// the ~1.8 M flow-cache slots.
+    const FlowQ = u64;
+    /// The `ref_keys` interning key: a reference *plus* the declared type it
+    /// was queried with (see `FlowQ`).
+    const RefQ = struct { key: RefKey, declared: TypeId };
     const SymLoop = struct { sym: SymbolId, scope: ScopeId };
 
-    fn refKeyIndex(c: *Checker, key: RefKey) Error!u32 {
-        const gop = try c.ref_keys.getOrPut(c.cm(), key);
+    fn refKeyIndex(c: *Checker, key: RefKey, declared: TypeId) Error!u32 {
+        const gop = try c.ref_keys.getOrPut(c.cm(), .{ .key = key, .declared = declared });
         if (!gop.found_existing) gop.value_ptr.* = @intCast(c.ref_keys.count());
         return gop.value_ptr.*;
     }
@@ -15121,14 +15163,23 @@ const Checker = struct {
         if (flow == binder.no_flow) return declared;
         if (flow == binder.unreachable_flow) return types.never_type;
         if (depth > 4000) return declared; // pathological chains: stay sound
-        const q: FlowQ = .{ .file = c.cur_file, .flow = flow, .key = try c.refKeyIndex(key), .declared = declared };
-        if (c.flow_cache.get(q)) |t| {
-            if (t == types.no_type) return declared; // in progress (loop)
-            return t;
-        }
-        try c.flow_cache.put(c.cm(), q, types.no_type);
+        const q: FlowQ = (@as(u64, c.cur_flow_base + flow) << 32) | try c.refKeyIndex(key, declared);
+        // `flow_same` covers both cached states that answer `declared`: an
+        // in-progress query (loop re-entry) and a finished query that narrowed
+        // nothing. `flow_narrow` holds the rest, and the two are disjoint.
+        if (c.flow_same.contains(q)) return declared;
+        if (c.flow_narrow.get(q)) |t| return t;
+        // Mark in progress. If the result turns out to be `declared` this
+        // entry *is* the final answer, so the common case never writes twice.
+        try c.flow_same.put(c.cm(), q, {});
         const result = try c.flowTypeInner(flow, key, declared, depth);
-        try c.flow_cache.put(c.cm(), q, result);
+        // `no_type` is not storable as a result (it was the old in-progress
+        // sentinel and still reads back as "declared"); leaving such a result
+        // in `flow_same` reproduces the previous behaviour exactly.
+        if (result != declared and result != types.no_type) {
+            _ = c.flow_same.remove(q);
+            try c.flow_narrow.put(c.cm(), q, result);
+        }
         return result;
     }
 
