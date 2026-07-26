@@ -15087,31 +15087,53 @@ const Checker = struct {
     /// `buildRefKey` rejects it.
     ///
     /// The two payloads are mutually exclusive by tag, so they share one u32
-    /// (`atom()` / `index()` assert the tag): the previous two-field form
-    /// carried a permanently-zero companion field and cost 12 bytes, which
-    /// `RefKey`'s `[3]PathElem` multiplied into a 48-byte `ref_keys` key.
-    /// Sharing makes it 8 (`RefQ` 48 -> 36). Equality is unchanged: a link was
-    /// already identified by (tag, the tag's payload), the other field being
-    /// pinned at 0, so the old and new representations are in bijection —
-    /// including the trailing default slots past `len`, which stay `{false, 0}`.
+    /// and the tag rides in that u32's high bit (`atom()` / `index()` assert
+    /// the tag): the original two-field form carried a permanently-zero
+    /// companion field and cost 12 bytes, which `RefKey`'s `[3]PathElem`
+    /// multiplied into a 48-byte `ref_keys` key; a shared payload behind a
+    /// separate `bool` tag still cost 8 (`RefQ` 36) to the bool's own field
+    /// slot. Folding the tag into bit 31 gets `PathElem` to 4 (`RefQ` 24).
+    ///
+    /// The fold is lossless because both payloads fit in 31 bits: element
+    /// indices are bounded by 4096 (`constIndexOf`), and a member atom is a
+    /// shard-interleaved interner handle (`Interner.atomFrom`), so bit 31 is
+    /// clear until a single shard holds 2^(31 - 4) = 134 M strings — hundreds
+    /// of millions of distinct identifiers. That is a size bound, not a
+    /// structural one, so `memberFits` checks it at the one construction site
+    /// instead of assuming it: an atom that does not fit makes `buildRefKey`
+    /// return null, i.e. the reference is simply not tracked (sound
+    /// under-narrowing, the same degradation as an over-deep path) — never a
+    /// silent alias with an element link.
     const PathElem = struct {
-        is_index: bool = false,
-        /// Property atom when `is_index` is false, element index when true.
-        payload: u32 = 0,
+        /// Bit 31 = tag (set: element index), bits 0..30 = payload.
+        bits: u32 = 0,
 
+        const index_tag: u32 = 1 << 31;
+        const payload_max: u32 = index_tag - 1;
+
+        /// Can this property atom be folded? (See the type doc: false only
+        /// past atom 2^31-1, where the caller stops tracking the reference.)
+        fn memberFits(a: Atom) bool {
+            return a <= payload_max;
+        }
         fn member(a: Atom) PathElem {
-            return .{ .is_index = false, .payload = a };
+            std.debug.assert(memberFits(a));
+            return .{ .bits = a };
         }
         fn element(i: u32) PathElem {
-            return .{ .is_index = true, .payload = i };
+            std.debug.assert(i <= payload_max);
+            return .{ .bits = index_tag | i };
+        }
+        fn isIndex(pe: PathElem) bool {
+            return pe.bits & index_tag != 0;
         }
         fn atom(pe: PathElem) Atom {
-            std.debug.assert(!pe.is_index);
-            return pe.payload;
+            std.debug.assert(!pe.isIndex());
+            return pe.bits;
         }
         fn index(pe: PathElem) u32 {
-            std.debug.assert(pe.is_index);
-            return pe.payload;
+            std.debug.assert(pe.isIndex());
+            return pe.bits & payload_max;
         }
     };
 
@@ -15186,7 +15208,9 @@ const Checker = struct {
             const d = c.tree.nodeData(n);
             if (tag == .member_expr or tag == .optional_member_expr) {
                 if (count >= max_ref_depth) return null; // too deep: not tracked
-                elems[count] = .member(try c.memberAtom(d.rhs));
+                const ma = try c.memberAtom(d.rhs);
+                if (!PathElem.memberFits(ma)) return null; // unfoldable atom: not tracked
+                elems[count] = .member(ma);
             } else if (tag == .index_expr or tag == .optional_index_expr) {
                 const iv = c.constIndexOf(d.rhs) orelse return null; // variable index: untracked
                 if (count >= max_ref_depth) return null;
@@ -15232,7 +15256,7 @@ const Checker = struct {
             const tag = c.nodeTag(n);
             const d = c.tree.nodeData(n);
             const pe = key.path[i - 1];
-            if (pe.is_index) {
+            if (pe.isIndex()) {
                 if (tag != .index_expr and tag != .optional_index_expr) return false;
                 const iv = c.constIndexOf(d.rhs) orelse return false;
                 if (iv != pe.index()) return false;
@@ -18213,6 +18237,26 @@ test "narrowing: in / instanceof / optional chain" {
         \\  return 0;
         \\}
     );
+}
+
+test "narrowing: PathElem tag fold is lossless and keeps RefQ at 24 bytes" {
+    const PE = Checker.PathElem;
+    // The point of the fold: one word per link, 24 bytes per interned key.
+    try testing.expectEqual(@as(usize, 4), @sizeOf(PE));
+    try testing.expectEqual(@as(usize, 24), @sizeOf(Checker.RefQ));
+    // Round-trips, and the two tags never alias on a shared payload.
+    try testing.expectEqual(@as(Atom, 7), PE.member(7).atom());
+    try testing.expectEqual(@as(u32, 7), PE.element(7).index());
+    try testing.expect(!PE.member(7).isIndex());
+    try testing.expect(PE.element(7).isIndex());
+    try testing.expect(PE.member(7).bits != PE.element(7).bits);
+    // A trailing slot past `len` is canonically a zero-atom member link, so
+    // `RefKey`'s default and `member(0)` stay the same key (as before the fold).
+    try testing.expectEqual(PE.member(0).bits, (PE{}).bits);
+    // The 31-bit bound is checked, not assumed.
+    try testing.expect(PE.memberFits(PE.payload_max));
+    try testing.expect(!PE.memberFits(PE.payload_max + 1));
+    try testing.expect(!PE.memberFits(std.math.maxInt(Atom)));
 }
 
 test "narrowing: assignment narrowing and loop widening" {
