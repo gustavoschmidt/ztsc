@@ -6198,8 +6198,10 @@ const Checker = struct {
                 (try c.boundHasReducerShape(s.indexAccessIndex(t), depth + 1)),
             .ref => {
                 const sym = s.refSymbol(t);
-                for (s.refArgs(t)) |a| {
-                    if (try c.boundHasReducerShape(a, depth + 1)) return true;
+                // Indexed: the recursion can reach `aliasGeneric` (below) and
+                // intern types, invalidating a held `refArgs` slice.
+                for (0..s.refArgCount(t)) |i| {
+                    if (try c.boundHasReducerShape(s.refArgAt(t, i), depth + 1)) return true;
                 }
                 if (c.symFlags(sym).type_alias) {
                     return c.boundHasReducerShape(try c.aliasGeneric(sym), depth + 1);
@@ -6257,8 +6259,9 @@ const Checker = struct {
                 // structural objects — reducible, no expansion needed. Also check
                 // the ref's own type arguments.
                 const sym = s.refSymbol(t);
-                for (s.refArgs(t)) |a| {
-                    if (!try c.boundReducible(a, depth + 1)) return false;
+                // Indexed: see `boundHasReducerShape` — `aliasGeneric` interns.
+                for (0..s.refArgCount(t)) |i| {
+                    if (!try c.boundReducible(s.refArgAt(t, i), depth + 1)) return false;
                 }
                 if (c.symFlags(sym).type_alias) {
                     return c.boundReducible(try c.aliasGeneric(sym), depth + 1);
@@ -6641,7 +6644,17 @@ const Checker = struct {
         }
         var oargs: std.ArrayList(TypeId) = .empty;
         defer oargs.deinit(c.scratch());
-        for (c.ts.refArgs(orig_ref)) |a| try oargs.append(c.scratch(), try c.instantiateId(a, map, map_id));
+        // Index, never a held `refArgs` slice: `instantiateId` interns types and
+        // can grow the store's `extra` array out from under it (the same
+        // iterator-invalidation class as the `memberList`/`fnParam` loops, which
+        // all index for this reason). A held slice here segfaulted on a large
+        // program once the partition put enough instantiation on one checker.
+        const n_oargs = c.ts.refArgCount(orig_ref);
+        try oargs.ensureTotalCapacity(c.scratch(), n_oargs);
+        for (0..n_oargs) |i| {
+            const a = c.ts.refArgAt(orig_ref, i);
+            oargs.appendAssumeCapacity(try c.instantiateId(a, map, map_id));
+        }
         const new_ref = try c.ts.makeRef(c.ts.refSymbol(orig_ref), oargs.items);
         try c.origin.put(c.cm(), result, new_ref);
     }
