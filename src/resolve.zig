@@ -52,6 +52,12 @@ const normalizePath = paths.normalizePath;
 /// order. `stem` is a normalized path relative to `dir`. Public because
 /// tsconfig `paths` mapping feeds mapped candidates through it.
 pub fn resolveStem(io: Io, alloc: Allocator, dir: Io.Dir, stem: []const u8) Error!?[]u8 {
+    return resolveStemFs(io, alloc, dir, stem, null);
+}
+
+/// `resolveStem` with the candidate-stat memo threaded in (`fs == null` is the
+/// uncached path: identical answers, every stat re-issued).
+fn resolveStemFs(io: Io, alloc: Allocator, dir: Io.Dir, stem: []const u8, fs: ?*FsCache) Error!?[]u8 {
     var buf: [6][]const u8 = undefined;
     var n: usize = 0;
     // Candidate paths are built with `alloc` (a scratch arena, freed after
@@ -61,7 +67,7 @@ pub fn resolveStem(io: Io, alloc: Allocator, dir: Io.Dir, stem: []const u8) Erro
     if (endsWithAny(stem, &.{ ".d.ts", ".d.mts", ".d.cts", ".ts", ".tsx", ".mts", ".cts" })) {
         buf[0] = stem;
         n = 1;
-        return tryCandidates(io, alloc, dir, buf[0..n]);
+        return tryCandidates(io, alloc, dir, buf[0..n], fs);
     }
     if (std.mem.endsWith(u8, stem, ".js") or std.mem.endsWith(u8, stem, ".jsx")) {
         const base = stem[0..std.mem.lastIndexOfScalar(u8, stem, '.').?];
@@ -69,7 +75,7 @@ pub fn resolveStem(io: Io, alloc: Allocator, dir: Io.Dir, stem: []const u8) Erro
         buf[1] = try std.fmt.allocPrint(alloc, "{s}.tsx", .{base});
         buf[2] = try std.fmt.allocPrint(alloc, "{s}.d.ts", .{base});
         n = 3;
-        return tryCandidates(io, alloc, dir, buf[0..n]);
+        return tryCandidates(io, alloc, dir, buf[0..n], fs);
     }
     // `.mjs`/`.cjs` rewrite to their declaration siblings (`.mjs`→`.mts`/`.d.mts`,
     // `.cjs`→`.cts`/`.d.cts`) — the relative-import twin of the `exports`-field
@@ -81,7 +87,7 @@ pub fn resolveStem(io: Io, alloc: Allocator, dir: Io.Dir, stem: []const u8) Erro
         buf[0] = try std.fmt.allocPrint(alloc, "{s}.{c}ts", .{ base, m });
         buf[1] = try std.fmt.allocPrint(alloc, "{s}.d.{c}ts", .{ base, m });
         n = 2;
-        return tryCandidates(io, alloc, dir, buf[0..n]);
+        return tryCandidates(io, alloc, dir, buf[0..n], fs);
     }
     buf[0] = try std.fmt.allocPrint(alloc, "{s}.ts", .{stem});
     buf[1] = try std.fmt.allocPrint(alloc, "{s}.tsx", .{stem});
@@ -90,7 +96,7 @@ pub fn resolveStem(io: Io, alloc: Allocator, dir: Io.Dir, stem: []const u8) Erro
     buf[4] = try std.fmt.allocPrint(alloc, "{s}/index.tsx", .{stem});
     buf[5] = try std.fmt.allocPrint(alloc, "{s}/index.d.ts", .{stem});
     n = 6;
-    return tryCandidates(io, alloc, dir, buf[0..n]);
+    return tryCandidates(io, alloc, dir, buf[0..n], fs);
 }
 
 /// Resolve a package *directory* (base-relative, e.g. a visible
@@ -125,7 +131,12 @@ pub fn resolveTypesPackageMain(io: Io, alloc: Allocator, dir: Io.Dir, pkg_dir: [
 /// driver can stat a `paths`-mapped `*.json` candidate (which `resolveStem`
 /// would not find).
 pub fn resolveJsonFile(io: Io, alloc: Allocator, dir: Io.Dir, stem: []const u8) Error!?[]u8 {
-    if (fileExists(io, dir, stem)) return try alloc.dupe(u8, stem);
+    return resolveJsonFileFs(io, alloc, dir, stem, null);
+}
+
+/// `resolveJsonFile` with the candidate-stat memo threaded in.
+fn resolveJsonFileFs(io: Io, alloc: Allocator, dir: Io.Dir, stem: []const u8, fs: ?*FsCache) Error!?[]u8 {
+    if (try fileExistsFs(io, dir, stem, fs)) return try alloc.dupe(u8, stem);
     return null;
 }
 
@@ -332,7 +343,7 @@ pub const ResolveCache = struct {
 /// is a pure function of the filesystem and ztsc is a single-shot batch
 /// process, so any probe it repeats is pure waste. Where `ResolveCache` memoizes
 /// a whole `(importer_dir, spec)` answer, this memoizes the *filesystem facts*
-/// underneath it — the part a first-time specifier still pays. Three memos, each
+/// underneath it — the part a first-time specifier still pays. Four memos, each
 /// keyed on the exact path string probed today (never canonicalized: the key
 /// space IS the behavior):
 ///
@@ -349,6 +360,20 @@ pub const ResolveCache = struct {
 ///     `node_modules` file is realpath(dirname) + "/" + basename, and every file
 ///     in one package directory shares that whole symlink chain (deep under
 ///     pnpm), so 6.6k realpath calls collapse onto 1.2k directories.
+///  4. `stat_files` — does this exact *candidate* path exist as a file? Once
+///     (1) has short-circuited the empty walk levels, what is left is the stem
+///     probing inside `node_modules` directories that DO exist: six candidates
+///     per stem (`.ts`, `.tsx`, `.d.ts`, `index.*`), again for `@types/<pkg>`,
+///     again per walk level, again per `exports` target. On the dogfood project
+///     that is 55.5k of the 67.2k remaining probes over 23.1k distinct paths —
+///     the same `node_modules/react/index.d.ts` re-statted by every specifier
+///     that walks past it. One stat per distinct path answers all of them.
+///
+/// A fifth memo is not a stat but the parse on top of one: `pkg_exports` holds
+/// the `exports` value of a `package.json` (`tsconfig.parseJsonc` of its text,
+/// arena-owned). (2) already made each body read once, but every walk level of
+/// every specifier re-PARSED the body it got back — thousands of parses of the
+/// same few hundred files. The memo makes it one parse per file.
 ///
 /// (3) is the only leg that is not identical by construction: it differs from
 /// `realPathFile(path)` exactly when the final component is itself a symlink
@@ -358,10 +383,16 @@ pub const ResolveCache = struct {
 /// `exports`-blocked subpath — which names no on-disk file — is excluded
 /// explicitly, since its parent directory does exist and would canonicalize.
 ///
-/// Memory is negligible against the program: on the dogfood project 2.5 MiB
-/// (1,920 + 1,542 + 1,202 entries), ~95% of it cached `package.json` text, on a
-/// 615 MB peak RSS — measured RSS moved +2 MB. `--timing` prints the entry
-/// counts and the byte total.
+/// Memory is negligible against the program: on the dogfood project 4.9 MiB
+/// (1,907 + 1,373 + 1,218 + 23,107 + 614 entries) — half of it cached
+/// `package.json` text, the rest candidate-path keys — against a ~350 MB peak
+/// RSS, which did not move outside run-to-run noise. `--timing` prints the entry
+/// counts, the byte total and the two hit rates.
+///
+/// Measured on the dogfood project (ReleaseFast, --checkers=4, medians):
+/// resolve 159 ms → 127 ms and 67,240 → 34,886 FS probes. The stat memo is
+/// 55,461 lookups / 58.3% hits (−32,354 syscalls, ~19 ms); the exports memo is
+/// 2,443 lookups / 74.9% hits (1,829 parses avoided, ~13 ms).
 ///
 /// Not thread-safe, deliberately: resolution is single-owner (the main thread in
 /// the parallel driver, the sole thread in `buildProgram`) and each program owns
@@ -378,8 +409,19 @@ pub const FsCache = struct {
     pkg_json: std.StringHashMapUnmanaged(?[]const u8) = .empty,
     /// directory path → its realpath (absolute), or null when the OS call failed.
     real_dirs: std.StringHashMapUnmanaged(?[]const u8) = .empty,
+    /// candidate path → it exists and is a regular file.
+    stat_files: std.StringHashMapUnmanaged(bool) = .empty,
+    /// `package.json` path → its `exports` value, or null when the file has no
+    /// `exports` key (or does not parse — the uncached leg ignores it too).
+    pkg_exports: std.StringHashMapUnmanaged(?tsconfig.Value) = .empty,
     /// Arena bytes the memos own (keys + values), for the `--timing` line.
     bytes: usize = 0,
+    /// `stat_files` scoreboard: calls, and calls answered from memory.
+    stat_lookups: u64 = 0,
+    stat_hits: u64 = 0,
+    /// `pkg_exports` scoreboard: `parseJsonc` calls asked for, and avoided.
+    exports_lookups: u64 = 0,
+    exports_hits: u64 = 0,
 
     /// True when `<d>/node_modules` exists as a directory. When it does not, no
     /// `resolvePackageAt` at that level can resolve anything, so the level's
@@ -412,6 +454,46 @@ pub const FsCache = struct {
         return text;
     }
 
+    /// Does `path` exist as a regular file? The memoized `fileExists`: one stat
+    /// per distinct candidate path for the run, keyed on the exact string
+    /// probed. Identical by construction — the miss leg IS `fileExists`.
+    fn statFileCached(fc: *FsCache, io: Io, dir: Io.Dir, path: []const u8) Error!bool {
+        fc.stat_lookups += 1;
+        if (fc.stat_files.get(path)) |v| {
+            fc.stat_hits += 1;
+            return v;
+        }
+        const exists = fileExists(io, dir, path);
+        const key = try fc.arena.dupe(u8, path);
+        fc.bytes += key.len;
+        try fc.stat_files.put(fc.arena, key, exists);
+        return exists;
+    }
+
+    /// The `exports` value of the `package.json` at `path`, whose text is
+    /// `text` (the `pkg_json` body). Parsed at most once per path, into the
+    /// cache arena so the value outlives the per-file scratch reset — the
+    /// parser copies every string it returns, so nothing slices into `text`.
+    /// A parse error or a non-object root reads as "no exports", exactly as the
+    /// uncached leg's `else |_| {}` / `else => {}` do.
+    fn packageExports(fc: *FsCache, path: []const u8, text: []const u8) Error!?tsconfig.Value {
+        fc.exports_lookups += 1;
+        if (fc.pkg_exports.get(path)) |v| {
+            fc.exports_hits += 1;
+            return v;
+        }
+        const val = exportsOf(fc.arena, text);
+        // Reuse the `pkg_json` key when it is already arena-owned (it always is
+        // when the body came from that memo) instead of duping the path twice.
+        const key = fc.pkg_json.getKey(path) orelse key: {
+            const k = try fc.arena.dupe(u8, path);
+            fc.bytes += k.len;
+            break :key k;
+        };
+        try fc.pkg_exports.put(fc.arena, key, val);
+        return val;
+    }
+
     /// Realpath of directory `d` (cache-arena owned), or null when the OS call
     /// failed. One syscall per distinct directory for the whole run.
     fn realDir(fc: *FsCache, io: Io, dir: Io.Dir, d: []const u8) Error!?[]const u8 {
@@ -442,14 +524,41 @@ pub const FsCache = struct {
     }
 
     /// Entry counts for the `--timing` scoreboard.
-    pub fn entryCounts(fc: *const FsCache) struct { nm_dirs: u32, pkg_json: u32, real_dirs: u32 } {
+    pub fn entryCounts(fc: *const FsCache) struct {
+        nm_dirs: u32,
+        pkg_json: u32,
+        real_dirs: u32,
+        stat_files: u32,
+        pkg_exports: u32,
+    } {
         return .{
             .nm_dirs = fc.nm_dirs.count(),
             .pkg_json = fc.pkg_json.count(),
             .real_dirs = fc.real_dirs.count(),
+            .stat_files = fc.stat_files.count(),
+            .pkg_exports = fc.pkg_exports.count(),
         };
     }
 };
+
+/// The `exports` value of a `package.json` body, or null when it has none /
+/// does not parse. Shared by the memoized and unmemoized legs so both read the
+/// file exactly the same way.
+fn exportsOf(alloc: Allocator, text: []const u8) ?tsconfig.Value {
+    // An `exports` key means the nine bytes `"exports"` appear literally in the
+    // text — unless the file uses string escapes at all, in which case the key
+    // could be spelled `"exports"`. Backslash-free text (every real
+    // `package.json`) therefore settles it without a parse: this skips the
+    // parser for the majority of packages and, more importantly, keeps their
+    // parse graphs out of the cache arena.
+    if (std.mem.indexOfScalar(u8, text, '\\') == null and
+        std.mem.indexOf(u8, text, "\"exports\"") == null) return null;
+    const root = tsconfig.parseJsonc(alloc, text) catch return null;
+    return switch (root) {
+        .object => |ro| ro.get("exports"),
+        else => null,
+    };
+}
 
 /// Per-run resolution options that are not a pure function of (dir, spec):
 /// `resolveJsonModule` and the `baseUrl` bare-specifier anchor. Carried on the
@@ -507,6 +616,14 @@ fn fileExists(io: Io, dir: Io.Dir, path: []const u8) bool {
     bumpProbe();
     const st = dir.statFile(io, path, .{}) catch return false;
     return st.kind == .file;
+}
+
+/// `fileExists` through the candidate-stat memo when one is threaded in. The
+/// memo answers from memory; without it every call is a syscall, exactly as
+/// before (`--no-resolve-cache` is the oracle).
+fn fileExistsFs(io: Io, dir: Io.Dir, path: []const u8, fs: ?*FsCache) Error!bool {
+    if (fs) |fc| return fc.statFileCached(io, dir, path);
+    return fileExists(io, dir, path);
 }
 
 /// Minimal `package.json` scan for the first string value of any of `keys`
@@ -580,18 +697,19 @@ fn resolveExportsField(
     pkg_dir: []const u8,
     exports_val: tsconfig.Value,
     subpath: []const u8,
+    fs: ?*FsCache,
 ) Error!?[]u8 {
     switch (exports_val) {
         .string => |s| {
             // Sugar: a string `exports` defines only the package root ".".
-            if (std.mem.eql(u8, subpath, ".")) return statExportTarget(io, alloc, dir, pkg_dir, s, "");
+            if (std.mem.eql(u8, subpath, ".")) return statExportTarget(io, alloc, dir, pkg_dir, s, "", fs);
             return null;
         },
         .object => |obj| {
-            if (exportsIsSubpathMap(obj)) return resolveExportsSubpath(io, alloc, dir, pkg_dir, obj, subpath);
+            if (exportsIsSubpathMap(obj)) return resolveExportsSubpath(io, alloc, dir, pkg_dir, obj, subpath, fs);
             // A bare conditions object (no "./" keys) is sugar for the "." target.
             if (!std.mem.eql(u8, subpath, ".")) return null;
-            return resolveConditionalTarget(io, alloc, dir, pkg_dir, exports_val, "");
+            return resolveConditionalTarget(io, alloc, dir, pkg_dir, exports_val, "", fs);
         },
         else => return null,
     }
@@ -607,8 +725,9 @@ fn resolveExportsSubpath(
     pkg_dir: []const u8,
     obj: tsconfig.Value.Object,
     subpath: []const u8,
+    fs: ?*FsCache,
 ) Error!?[]u8 {
-    if (obj.get(subpath)) |v| return resolveConditionalTarget(io, alloc, dir, pkg_dir, v, "");
+    if (obj.get(subpath)) |v| return resolveConditionalTarget(io, alloc, dir, pkg_dir, v, "", fs);
     var best: ?usize = null;
     var best_prefix: usize = 0;
     for (obj.keys, 0..) |key, i| {
@@ -629,7 +748,7 @@ fn resolveExportsSubpath(
         const prefix = key[0..star];
         const suffix = key[star + 1 ..];
         const capture = subpath[prefix.len .. subpath.len - suffix.len];
-        return resolveConditionalTarget(io, alloc, dir, pkg_dir, obj.vals[bi], capture);
+        return resolveConditionalTarget(io, alloc, dir, pkg_dir, obj.vals[bi], capture, fs);
     }
     return null;
 }
@@ -646,20 +765,21 @@ fn resolveConditionalTarget(
     pkg_dir: []const u8,
     target: tsconfig.Value,
     star: []const u8,
+    fs: ?*FsCache,
 ) Error!?[]u8 {
     switch (target) {
         .null => return null, // explicitly blocked (`"./esm": null`)
-        .string => |s| return statExportTarget(io, alloc, dir, pkg_dir, s, star),
+        .string => |s| return statExportTarget(io, alloc, dir, pkg_dir, s, star, fs),
         .array => |arr| {
             for (arr) |elem| {
-                if (try resolveConditionalTarget(io, alloc, dir, pkg_dir, elem, star)) |p| return p;
+                if (try resolveConditionalTarget(io, alloc, dir, pkg_dir, elem, star, fs)) |p| return p;
             }
             return null;
         },
         .object => |obj| {
             for (obj.keys, obj.vals) |key, v| {
                 if (!exportsConditionActive(key)) continue;
-                if (try resolveConditionalTarget(io, alloc, dir, pkg_dir, v, star)) |p| return p;
+                if (try resolveConditionalTarget(io, alloc, dir, pkg_dir, v, star, fs)) |p| return p;
             }
             return null;
         },
@@ -680,6 +800,7 @@ fn statExportTarget(
     pkg_dir: []const u8,
     target: []const u8,
     star: []const u8,
+    fs: ?*FsCache,
 ) Error!?[]u8 {
     // Targets must be package-relative ("./..."). Reject anything else
     // (absolute, "../escape", bare) — Node does, and it keeps resolution
@@ -745,14 +866,14 @@ fn statExportTarget(
         return null;
     }
     for (cands[0..n]) |c| {
-        if (fileExists(io, dir, c)) return try alloc.dupe(u8, c);
+        if (try fileExistsFs(io, dir, c, fs)) return try alloc.dupe(u8, c);
     }
     return null;
 }
 
-fn tryCandidates(io: Io, alloc: Allocator, dir: Io.Dir, cands: []const []const u8) Error!?[]u8 {
+fn tryCandidates(io: Io, alloc: Allocator, dir: Io.Dir, cands: []const []const u8, fs: ?*FsCache) Error!?[]u8 {
     for (cands) |cand| {
-        if (fileExists(io, dir, cand)) return try alloc.dupe(u8, cand);
+        if (try fileExistsFs(io, dir, cand, fs)) return try alloc.dupe(u8, cand);
     }
     return null;
 }
@@ -763,9 +884,9 @@ fn tryCandidates(io: Io, alloc: Allocator, dir: Io.Dir, cands: []const []const u
 /// stem probes `stem.js`/`stem.jsx` then `stem/index.js`/`stem/index.jsx`
 /// (the JS twins of `resolveStem`'s TypeScript probes). The returned path is
 /// loaded opaquely as `any` (`js_module_source`); ztsc never parses the JS.
-fn resolveJsStem(io: Io, alloc: Allocator, dir: Io.Dir, stem: []const u8) Error!?[]u8 {
+fn resolveJsStem(io: Io, alloc: Allocator, dir: Io.Dir, stem: []const u8, fs: ?*FsCache) Error!?[]u8 {
     if (endsWithAny(stem, &.{ ".js", ".jsx", ".mjs", ".cjs" })) {
-        if (fileExists(io, dir, stem)) return try alloc.dupe(u8, stem);
+        if (try fileExistsFs(io, dir, stem, fs)) return try alloc.dupe(u8, stem);
         return null;
     }
     var buf: [4][]const u8 = undefined;
@@ -773,14 +894,14 @@ fn resolveJsStem(io: Io, alloc: Allocator, dir: Io.Dir, stem: []const u8) Error!
     buf[1] = try std.fmt.allocPrint(alloc, "{s}.jsx", .{stem});
     buf[2] = try std.fmt.allocPrint(alloc, "{s}/index.js", .{stem});
     buf[3] = try std.fmt.allocPrint(alloc, "{s}/index.jsx", .{stem});
-    return tryCandidates(io, alloc, dir, buf[0..4]);
+    return tryCandidates(io, alloc, dir, buf[0..4], fs);
 }
 
 /// `resolveStem`, then — under `allow_js` — the `resolveJsStem` JavaScript
 /// fallback. Declaration/TypeScript files always win over a `.js` twin.
-fn resolveStemOrJs(io: Io, alloc: Allocator, dir: Io.Dir, stem: []const u8, allow_js: bool) Error!?[]u8 {
-    if (try resolveStem(io, alloc, dir, stem)) |p| return p;
-    if (allow_js) return resolveJsStem(io, alloc, dir, stem);
+fn resolveStemOrJs(io: Io, alloc: Allocator, dir: Io.Dir, stem: []const u8, allow_js: bool, fs: ?*FsCache) Error!?[]u8 {
+    if (try resolveStemFs(io, alloc, dir, stem, fs)) |p| return p;
+    if (allow_js) return resolveJsStem(io, alloc, dir, stem, fs);
     return null;
 }
 
@@ -895,30 +1016,33 @@ fn resolvePackageAt(io: Io, alloc: Allocator, dir: Io.Dir, d: []const u8, pkg: [
     //     observable `any` at an un-exported subpath — and no symbol dangles.
     //     Under-reports the TS2307 tsc emits for an app-level such import
     //     (allowed: a missed error is fine, a false positive is not).
+    //
+    //     The parse itself is memoized per `package.json` path (`pkg_exports`):
+    //     the body was already read once for the run, but the walk re-parsed it
+    //     at every level of every specifier. The uncached leg parses into the
+    //     per-file scratch exactly as before.
     if (pj_text) |text| {
-        if (tsconfig.parseJsonc(alloc, text)) |root| switch (root) {
-            .object => |ro| if (ro.get("exports")) |exports_val| {
-                const subpath: []const u8 = if (sub.len == 0)
-                    "."
-                else
-                    try std.fmt.allocPrint(alloc, "./{s}", .{sub});
-                defer if (sub.len != 0) alloc.free(subpath);
-                if (try resolveExportsField(io, alloc, dir, nm, exports_val, subpath)) |p| return p;
-                // Subpath unmatched by a present `exports` map → opaque `any`
-                // module (see above; NOT null — that dangles a symbol). The
-                // root (".") still falls through to legacy probing, so a package
-                // whose `.` entry our condition set misses is not regressed.
-                if (sub.len != 0) return try blockedSubpathPath(alloc, nm, sub);
-            },
-            else => {},
-        } else |_| {}
+        const exports_opt = if (fs) |fc| try fc.packageExports(pj, text) else exportsOf(alloc, text);
+        if (exports_opt) |exports_val| {
+            const subpath: []const u8 = if (sub.len == 0)
+                "."
+            else
+                try std.fmt.allocPrint(alloc, "./{s}", .{sub});
+            defer if (sub.len != 0) alloc.free(subpath);
+            if (try resolveExportsField(io, alloc, dir, nm, exports_val, subpath, fs)) |p| return p;
+            // Subpath unmatched by a present `exports` map → opaque `any`
+            // module (see above; NOT null — that dangles a symbol). The
+            // root (".") still falls through to legacy probing, so a package
+            // whose `.` entry our condition set misses is not regressed.
+            if (sub.len != 0) return try blockedSubpathPath(alloc, nm, sub);
+        }
     }
 
     // (2) Legacy resolution (exports absent or unmatched).
     if (sub.len > 0) {
         const stem = try joinNormalize(alloc, nm, sub);
         defer alloc.free(stem);
-        return resolveStemOrJs(io, alloc, dir, stem, allow_js);
+        return resolveStemOrJs(io, alloc, dir, stem, allow_js, fs);
     }
     // package.json "types"/"typings" (declaration entry — TS only), else the
     // JS "main" entry under allowJs (typed `any`), else index.d.ts/index.ts (or
@@ -929,7 +1053,7 @@ fn resolvePackageAt(io: Io, alloc: Allocator, dir: Io.Dir, d: []const u8, pkg: [
             resolved_types = true;
             const stem = try joinNormalize(alloc, nm, types_rel);
             defer alloc.free(stem);
-            if (try resolveStem(io, alloc, dir, stem)) |p| return p;
+            if (try resolveStemFs(io, alloc, dir, stem, fs)) |p| return p;
         }
     }
     if (!resolved_types) {
@@ -940,13 +1064,13 @@ fn resolvePackageAt(io: Io, alloc: Allocator, dir: Io.Dir, d: []const u8, pkg: [
                 if (packageMainField(text)) |main_rel| {
                     const stem = try joinNormalize(alloc, nm, main_rel);
                     defer alloc.free(stem);
-                    if (try resolveStemOrJs(io, alloc, dir, stem, true)) |p| return p;
+                    if (try resolveStemOrJs(io, alloc, dir, stem, true, fs)) |p| return p;
                 }
             }
         }
         const idx = try std.fmt.allocPrint(alloc, "{s}/index", .{nm});
         defer alloc.free(idx);
-        if (try resolveStemOrJs(io, alloc, dir, idx, allow_js)) |p| return p;
+        if (try resolveStemOrJs(io, alloc, dir, idx, allow_js, fs)) |p| return p;
     }
     return null;
 }
@@ -986,14 +1110,14 @@ fn resolveSpecifierFs(
     if (spec[0] == '.') {
         const stem = try joinNormalize(alloc, importer_dir, spec);
         defer alloc.free(stem);
-        if (is_json) return resolveJsonFile(io, alloc, dir, stem);
-        return resolveStemOrJs(io, alloc, dir, stem, opts.allow_js);
+        if (is_json) return resolveJsonFileFs(io, alloc, dir, stem, fs);
+        return resolveStemOrJs(io, alloc, dir, stem, opts.allow_js, fs);
     }
     if (spec[0] == '/') {
         const stem = try normalizePath(alloc, spec);
         defer alloc.free(stem);
-        if (is_json) return resolveJsonFile(io, alloc, dir, stem);
-        return resolveStemOrJs(io, alloc, dir, stem, opts.allow_js);
+        if (is_json) return resolveJsonFileFs(io, alloc, dir, stem, fs);
+        return resolveStemOrJs(io, alloc, dir, stem, opts.allow_js, fs);
     }
     // A bare `*.json` specifier resolves against `baseUrl` only (tsc's baseUrl
     // rule; the `public/api/x.json` shape) — never node_modules.
@@ -1001,7 +1125,7 @@ fn resolveSpecifierFs(
         if (opts.base_url) |bu| {
             const stem = try joinNormalize(alloc, bu, spec);
             defer alloc.free(stem);
-            if (try resolveJsonFile(io, alloc, dir, stem)) |p| return p;
+            if (try resolveJsonFileFs(io, alloc, dir, stem, fs)) |p| return p;
         }
         return null;
     }
@@ -1012,7 +1136,7 @@ fn resolveSpecifierFs(
     if (opts.base_url) |bu| {
         const stem = try joinNormalize(alloc, bu, spec);
         defer alloc.free(stem);
-        if (try resolveStemOrJs(io, alloc, dir, stem, opts.allow_js)) |p| return p;
+        if (try resolveStemOrJs(io, alloc, dir, stem, opts.allow_js, fs)) |p| return p;
     }
     return resolvePackage(io, alloc, dir, importer_dir, spec, opts.allow_js, fs);
 }
@@ -1075,7 +1199,7 @@ fn resolveReference(
         .path => {
             const stem = try joinNormalize(alloc, dirnamePart(importer), ref.spec);
             defer alloc.free(stem);
-            return resolveStem(io, alloc, dir, stem);
+            return resolveStemFs(io, alloc, dir, stem, fs);
         },
         .types => {
             const scoped = try std.fmt.allocPrint(alloc, "@types/{s}", .{ref.spec});
@@ -1384,6 +1508,76 @@ test "FsCache: node_modules existence, package.json and realpath memos" {
     // canonicalize off a single entry.
     try testing.expectEqual(@as(u32, 1), on.fs.entryCounts().real_dirs);
     try testing.expect(on.fs.bytes > 0);
+}
+
+// The 4th memo: stem candidates (`node_modules/<pkg>/index.d.ts`, …) are
+// statted once per distinct path for the whole run, however many specifiers
+// walk past them; and a `package.json` `exports` map is PARSED once per file,
+// not once per walk level. `--no-resolve-cache` stays the oracle for both.
+test "FsCache: candidate-stat and exports-parse memos" {
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const d = tmp.dir;
+
+    // Two source directories importing the same two packages: one legacy
+    // (`types` field), one with an `exports` map plus a subpath.
+    try d.createDirPath(io, "src/one");
+    try d.createDirPath(io, "src/two");
+    try d.writeFile(io, .{ .sub_path = "src/one/a.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "src/two/b.ts", .data = "" });
+    try d.createDirPath(io, "node_modules/legacy");
+    try d.writeFile(io, .{ .sub_path = "node_modules/legacy/package.json", .data = "{ \"types\": \"main.d.ts\" }" });
+    try d.writeFile(io, .{ .sub_path = "node_modules/legacy/main.d.ts", .data = "" });
+    try d.createDirPath(io, "node_modules/exp/dist");
+    try d.writeFile(io, .{ .sub_path = "node_modules/exp/package.json", .data =
+        \\{ "exports": { ".": { "types":"./dist/index.d.ts" }, "./sub": { "types":"./dist/sub.d.ts" } } }
+    });
+    try d.writeFile(io, .{ .sub_path = "node_modules/exp/dist/index.d.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "node_modules/exp/dist/sub.d.ts", .data = "" });
+
+    var on = ResolveCache.init(alloc, true, .{});
+    var off = ResolveCache.init(alloc, false, .{});
+
+    const specs = [_][]const u8{ "legacy", "exp", "exp/sub", "ghost" };
+    const importers = [_][]const u8{ "src/one/a.ts", "src/two/b.ts" };
+    resetFsProbeCount();
+    for (importers) |imp| {
+        for (specs) |s| {
+            const cached = try on.resolve(io, alloc, d, imp, s);
+            const uncached = try off.resolve(io, alloc, d, imp, s);
+            if (cached) |c| {
+                try testing.expectEqualStrings(uncached.?, c);
+            } else {
+                try testing.expectEqual(@as(?[]const u8, null), uncached);
+            }
+        }
+    }
+    const counts = on.fs.entryCounts();
+
+    // Every candidate path is statted at most once; the second directory's
+    // identical walk is served entirely from memory.
+    try testing.expect(on.fs.stat_lookups > counts.stat_files);
+    try testing.expect(on.fs.stat_hits > 0);
+    try testing.expectEqual(on.fs.stat_lookups - on.fs.stat_hits, @as(u64, counts.stat_files));
+
+    // `exp/package.json` is parsed once even though the walk asks for its
+    // `exports` map on every specifier from every importer directory.
+    try testing.expect(on.fs.exports_lookups > on.fs.exports_hits);
+    try testing.expectEqual(on.fs.exports_lookups - on.fs.exports_hits, @as(u64, counts.pkg_exports));
+    try testing.expect(counts.pkg_exports <= counts.pkg_json);
+
+    // A `package.json` with no `exports` key needs no parse at all, and the
+    // shared extractor says so for both legs.
+    try testing.expectEqual(@as(?tsconfig.Value, null), exportsOf(alloc, "{ \"types\": \"main.d.ts\" }"));
+    try testing.expect(exportsOf(alloc, "{ \"exports\": \"./index.d.ts\" }") != null);
+    // Escaped text takes the parse path (the fast path only skips backslash-free
+    // bodies, where the literal key bytes are conclusive).
+    try testing.expect(exportsOf(alloc, "{ \"a\": \"b\\nc\", \"exports\": \"./index.d.ts\" }") != null);
+    try testing.expectEqual(@as(?tsconfig.Value, null), exportsOf(alloc, "{ not json"));
 }
 
 // Regression: resolution used to build candidate paths in a fixed 256-byte

@@ -60,6 +60,12 @@ pub const ResolveStats = struct {
     nm_dirs: u32,
     pkg_json: u32,
     real_dirs: u32,
+    stat_files: u32,
+    pkg_exports: u32,
+    stat_lookups: u64,
+    stat_hits: u64,
+    exports_lookups: u64,
+    exports_hits: u64,
     fs_bytes: usize,
 };
 
@@ -98,6 +104,23 @@ pub fn printTiming(
         resolve.nm_dirs,   resolve.pkg_json,
         resolve.real_dirs, @as(f64, @floatFromInt(resolve.fs_bytes)) / (1024.0 * 1024.0),
     });
+    try out.print("  resolve stat memo: {d} paths, {d} lookups, {d} hits ({d:.1}%)\n", .{
+        resolve.stat_files,
+        resolve.stat_lookups,
+        resolve.stat_hits,
+        hitRate(resolve.stat_lookups, resolve.stat_hits),
+    });
+    try out.print("  resolve exports memo: {d} package.json, {d} lookups, {d} hits ({d:.1}%)\n", .{
+        resolve.pkg_exports,
+        resolve.exports_lookups,
+        resolve.exports_hits,
+        hitRate(resolve.exports_lookups, resolve.exports_hits),
+    });
+}
+
+fn hitRate(lookups: u64, hits: u64) f64 {
+    if (lookups == 0) return 0;
+    return @as(f64, @floatFromInt(hits)) / @as(f64, @floatFromInt(lookups)) * 100.0;
 }
 
 fn printPhase(out: *Io.Writer, name: []const u8, ns: u64, lines: f64, bytes: f64) !void {
@@ -364,6 +387,12 @@ test "printTiming renders one row per phase and per checker" {
             .nm_dirs = 1,
             .pkg_json = 2,
             .real_dirs = 3,
+            .stat_files = 4,
+            .pkg_exports = 5,
+            .stat_lookups = 100,
+            .stat_hits = 75,
+            .exports_lookups = 8,
+            .exports_hits = 6,
             .fs_bytes = 1024,
         },
     );
@@ -373,6 +402,8 @@ test "printTiming renders one row per phase and per checker" {
     try std.testing.expect(std.mem.indexOf(u8, s, "  total           9.000\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "    checker[1]      2.000 ms  4 file(s)\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "resolve cache: 11 probes, 22 lookups, 20 hits (enabled)\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "resolve stat memo: 4 paths, 100 lookups, 75 hits (75.0%)\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "resolve exports memo: 5 package.json, 8 lookups, 6 hits (75.0%)\n") != null);
 }
 
 test "printMemory sums the worker arenas into the heap total" {

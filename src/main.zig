@@ -1273,6 +1273,12 @@ pub fn main(init: std.process.Init) !void {
             .nm_dirs = fs_counts.nm_dirs,
             .pkg_json = fs_counts.pkg_json,
             .real_dirs = fs_counts.real_dirs,
+            .stat_files = fs_counts.stat_files,
+            .pkg_exports = fs_counts.pkg_exports,
+            .stat_lookups = rcache.fs.stat_lookups,
+            .stat_hits = rcache.fs.stat_hits,
+            .exports_lookups = rcache.fs.exports_lookups,
+            .exports_hits = rcache.fs.exports_hits,
             .fs_bytes = rcache.fs.bytes,
         });
     }
