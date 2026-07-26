@@ -351,7 +351,7 @@ const map_containers = [_][]const u8{
     "inst_map_ids",           "tp_constraint_cache", "fresh_tp_ids",
     "fresh_tp_info",          "type_node_cache",     "atom_cache",
     "unique_sym_ids",         "infer_ids",           "infer_scopes",
-    "mapped_key_ids",
+    "mapped_key_ids",         "inst_diag_at",
 };
 
 const Checker = struct {
@@ -402,6 +402,10 @@ const Checker = struct {
 
     diags: std.ArrayList(Diag) = .empty,
     diag_seen: std.AutoHashMapUnmanaged(u128, void) = .empty,
+    /// `(file << 32) | code` -> index into `diags` of this file's single
+    /// instantiation-limit diagnostic (see `instLimitDiag`). Indices stay
+    /// valid: `diags` only grows until `seal`.
+    inst_diag_at: std.AutoHashMapUnmanaged(u64, usize) = .empty,
 
     // --- caches (checker arena) -------------------------------------------
     /// Global symbol -> declared value type. 0 = not computed.
@@ -688,10 +692,12 @@ const Checker = struct {
     /// where materialization is triggered. `ast.Ast.span` walks the whole
     /// subtree and re-scans every token it covers, so the hot boundaries
     /// record just the node and pay for the span only if a diagnostic
-    /// actually fires. The node's file is captured too: materializing a type
-    /// can switch the current-file context (`enterSymFile`), and the anchor
-    /// must resolve against the tree it was recorded in.
-    inst_anchor: InstAnchor = .{ .span = .{ .start = 0, .end = 0 } },
+    /// actually fires. The file is captured too: materializing a type can
+    /// switch the current-file context (`enterSymFile`), and an anchor that
+    /// no longer belongs to the file being traversed is not a position at
+    /// all — `instSpanHere` discards it rather than reinterpreting the
+    /// offset against the wrong line table.
+    inst_anchor: InstAnchor = .{ .span = .{ .file = 0, .span = .{ .start = 0, .end = 0 } } },
     /// Master switch for the instantiation caching layer (`--no-inst-cache` clears it):
     /// the instantiate memo, map interning, constraint memo, and type-node
     /// memo. The depth/count limits are independent of it.
@@ -1427,20 +1433,54 @@ const Checker = struct {
     }
 
     /// Deferred `inst_span`: either a node (span computed on demand) or an
-    /// explicit span pushed by a caller that has one in hand already.
+    /// explicit span pushed by a caller that has one in hand already. Both
+    /// carry the file they were recorded in — a byte offset is only a
+    /// position in the tree it came from.
     const InstAnchor = union(enum) {
         node: struct { file: FileId, node: Node },
-        span: Span,
+        span: struct { file: FileId, span: Span },
     };
 
-    fn instSpan(c: *const Checker) Span {
+    /// The anchor as a position in the file currently being traversed, or
+    /// `null` when the anchor belongs to a different file.
+    ///
+    /// Materializing a type switches the current-file context
+    /// (`enterSymFile`) without moving the anchor, so a limit tripped deep
+    /// inside a foreign declaration still carries the *demand* site's node.
+    /// Since the diagnostic is filed under `cur_file`, using that span would
+    /// stamp one file's byte offset onto another file's line table — a
+    /// position that means nothing, and one whose survival depends on
+    /// whether this checker happens to own both files. There is nothing to
+    /// report here: the demand site's own checker reports the same trip at
+    /// its real anchor.
+    fn instSpanHere(c: *const Checker) ?Span {
         return switch (c.inst_anchor) {
-            .span => |s| s,
-            .node => |n| blk: {
-                const pf = &c.prog.files[n.file];
-                break :blk pf.tree.span(pf.src, n.node);
-            },
+            .span => |s| if (s.file == c.cur_file) s.span else null,
+            .node => |n| if (n.file == c.cur_file) c.nodeSpan(n.node) else null,
         };
+    }
+
+    /// Report an instantiation-limit diagnostic (TS2589 / TS2590) at a
+    /// canonical, partition-independent anchor: at most one per file and
+    /// code, at the lexically-first in-file anchor seen.
+    ///
+    /// The limit is a resource cap, not a property of a single expression:
+    /// `instantiateId`'s memo short-circuits before the depth guard, so
+    /// *which* of a file's several deep materializations actually trips
+    /// depends on what this checker instance already had cached — i.e. on
+    /// the partition. Collapsing a file's trips to their lexically-first
+    /// anchor makes the reported position a function of the program alone.
+    /// Costs one hash lookup per trip (a handful per run).
+    fn instLimitDiag(c: *Checker, code: u16, msg: []const u8) Error!void {
+        const span = c.instSpanHere() orelse return;
+        const gop = try c.inst_diag_at.getOrPut(c.cm(), (@as(u64, c.cur_file) << 32) | code);
+        if (gop.found_existing) {
+            const prev = &c.diags.items[gop.value_ptr.*];
+            if (span.start < prev.span.start) prev.span = span;
+            return;
+        }
+        gop.value_ptr.* = c.diags.items.len;
+        try c.diags.append(c.gpa, .{ .code = code, .file = c.cur_file, .span = span, .msg = try c.out.dupe(u8, msg) });
     }
 
     fn anchorInst(c: *Checker, node: Node) void {
@@ -6740,7 +6780,7 @@ const Checker = struct {
         // truncate this subtree to `error_type`.
         if (c.inst_depth > max_instantiation_depth or c.inst_count > max_instantiation_count) {
             c.inst_limit_tripped = true;
-            if (!c.suppress_inst_diag) try c.diagFmt(2589, c.instSpan(), "Type instantiation is excessively deep and possibly infinite.", .{});
+            if (!c.suppress_inst_diag) try c.instLimitDiag(2589, "Type instantiation is excessively deep and possibly infinite.");
             return types.error_type;
         }
         c.inst_depth += 1;
@@ -7173,7 +7213,7 @@ const Checker = struct {
     fn reduceConditional(c: *Checker, chk: TypeId, extends_ty: TypeId, true_ty: TypeId, false_ty: TypeId, distributive: bool) Error!TypeId {
         if (c.inst_depth > max_instantiation_depth or c.inst_count > max_instantiation_count) {
             c.inst_limit_tripped = true;
-            if (!c.suppress_inst_diag) try c.diagFmt(2589, c.instSpan(), "Type instantiation is excessively deep and possibly infinite.", .{});
+            if (!c.suppress_inst_diag) try c.instLimitDiag(2589, "Type instantiation is excessively deep and possibly infinite.");
             return types.error_type;
         }
         c.inst_depth += 1;
@@ -8049,7 +8089,7 @@ const Checker = struct {
     fn reduceMapped(c: *Checker, key_param: TypeId, constraint: TypeId, value: TypeId, as_clause: TypeId, src_type: TypeId, flags: u32) Error!TypeId {
         if (c.inst_depth > max_instantiation_depth or c.inst_count > max_instantiation_count) {
             c.inst_limit_tripped = true;
-            if (!c.suppress_inst_diag) try c.diagFmt(2589, c.instSpan(), "Type instantiation is excessively deep and possibly infinite.", .{});
+            if (!c.suppress_inst_diag) try c.instLimitDiag(2589, "Type instantiation is excessively deep and possibly infinite.");
             return types.error_type;
         }
         c.inst_depth += 1;
@@ -8850,7 +8890,7 @@ const Checker = struct {
     fn reduceTemplateChunks(c: *Checker, head: Atom, holes: []const TypeId, chunks: []const Atom) Error!TypeId {
         if (c.inst_depth > max_instantiation_depth or c.inst_count > max_instantiation_count) {
             c.inst_limit_tripped = true;
-            if (!c.suppress_inst_diag) try c.diagFmt(2589, c.instSpan(), "Type instantiation is excessively deep and possibly infinite.", .{});
+            if (!c.suppress_inst_diag) try c.instLimitDiag(2589, "Type instantiation is excessively deep and possibly infinite.");
             return types.error_type;
         }
         c.inst_depth += 1;
@@ -8916,7 +8956,7 @@ const Checker = struct {
             builders = next;
             if (builders.items.len >= cap) {
                 c.inst_limit_tripped = true;
-                try c.diagFmt(2590, c.instSpan(), "Expression produces a union type that is too complex to represent.", .{});
+                try c.instLimitDiag(2590, "Expression produces a union type that is too complex to represent.");
                 return types.string_type;
             }
         }
@@ -10780,7 +10820,7 @@ const Checker = struct {
     fn checkAssignable(c: *Checker, src_t: TypeId, target: TypeId, expr_node: Node, span: Span) Error!bool {
         // Anchor any TS2589 raised while expanding either side (instantiation
         // limit) at the assignment site.
-        c.inst_anchor = .{ .span = span };
+        c.inst_anchor = .{ .span = .{ .file = c.cur_file, .span = span } };
         if (try c.isAssignable(src_t, target)) {
             // Excess property check for fresh object literals.
             if (expr_node != 0) {

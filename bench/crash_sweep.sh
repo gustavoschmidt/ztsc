@@ -8,7 +8,6 @@
 #   bench/crash_sweep.sh                  # the full 128-run matrix
 #   bench/crash_sweep.sh drizzle          # one package, 16 runs (quick iteration)
 #   MAX_CHECKERS=8 bench/crash_sweep.sh   # narrow the checker sweep
-#   STRICT_SPANS=1 bench/crash_sweep.sh   # compare TS2589 spans too (see below)
 #
 # Corpus: the packages vendored by bench/fetch_real.sh (BENCHMARKS.md §2),
 # invoked exactly as the benchmark invokes them — `--pretty=false
@@ -27,21 +26,17 @@
 #
 # (3) and (4) are why this doubles as a determinism gate: the same comparison
 # that catches a checker dying under partitioning catches a checker reporting
-# different things under partitioning. Two things are normalized away before
-# comparing, and nothing else — the summary line's diagnostic *counts* are
-# load-bearing signal and stay in the compared bytes:
+# different things under partitioning. Exactly one thing is normalized away
+# before comparing — the summary line's `(N worker(s), N checker(s))` tail,
+# which *is* the configuration. Everything else, spans and diagnostic counts
+# included, is compared byte for byte.
 #
-#   * the summary line's `(N worker(s), N checker(s))` tail, which is the
-#     configuration itself, and
-#   * the *span* of a TS2589 ("excessively deep") — its file, code and
-#     position in the diagnostic list still have to match. TS2589 is a
-#     resource-limit diagnostic: which instantiation trips the depth cap is a
-#     function of what the checker instance already has cached, so the
-#     partition can legitimately move the anchor within a file. It does today:
-#     ajv's `dist/types/json-schema.d.ts` anchors at 105:4 for --checkers=1
-#     and 100:8 for most higher counts (a pre-existing divergence, present
-#     well before the lazy-anchor commit 68ba8fa). Run with STRICT_SPANS=1 to
-#     compare spans too and see it.
+# (The span of a TS2589 ("excessively deep") used to be normalized out too:
+# which instantiation trips the depth cap depends on what the checker
+# instance already has cached, so the anchor moved with the partition. It is
+# canonical now — one instantiation-limit diagnostic per file, at that file's
+# lexically-first anchor, and never a foreign file's byte offset — so the
+# comparison is strict.)
 #
 # Why this exists: at the default 4 checkers, on drizzle-orm alone, a held
 # type-parameter slice was invalidated by interning and the checker died
@@ -108,18 +103,10 @@ echo "crash sweep: ${#PKGS[@]} package(s) × --checkers=1..$MAX_CHECKERS"
 echo
 
 # normalize <stdout-file>: the compared form of a run's output — the summary
-# line's worker/checker tail (the configuration itself) and TS2589's span (a
-# resource-limit anchor the partition may legitimately move; see the head
-# comment) folded out, everything else kept, diagnostic counts included.
+# line's worker/checker tail (the configuration itself) folded out, everything
+# else kept, spans and diagnostic counts included.
 normalize() {
-    if [ -n "${STRICT_SPANS:-}" ]; then
-        sed -E 's/\([0-9]+ worker\(s\), [0-9]+ checker\(s\)\)$/(W worker(s), C checker(s))/' "$1"
-        return
-    fi
-    sed -E \
-        -e 's/\([0-9]+ worker\(s\), [0-9]+ checker\(s\)\)$/(W worker(s), C checker(s))/' \
-        -e 's/:[0-9]+:[0-9]+: error TS2589:/:<span>: error TS2589:/' \
-        "$1"
+    sed -E 's/\([0-9]+ worker\(s\), [0-9]+ checker\(s\)\)$/(W worker(s), C checker(s))/' "$1"
 }
 
 # signal_note <status>: " (SIGSEGV)"-style suffix for a signalled exit.
