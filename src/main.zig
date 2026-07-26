@@ -893,15 +893,9 @@ pub fn main(init: std.process.Init) !void {
     // from the right checker below (replaces the old `i % n_checkers`).
     const file_owner = try arena.alloc(u32, n_files);
     {
-        // Cost-based partition: greedy longest-
-        // processing-time by per-file AST node count (≈ check cost, known
-        // post-parse). Round-robin (`i % n_checkers`) ignores file size and
-        // clumps large files whose ids share a residue mod N onto one
-        // checker; sorting files big-first and dropping each onto the
-        // currently least-loaded checker isolates a lone huge file and
-        // spreads the rest evenly. Fully deterministic: node counts are
-        // fixed post-parse and every tie breaks by file id / checker index,
-        // so any --checkers=N still yields byte-identical diagnostics.
+        // Cost-based partition, weighted by per-file AST node count
+        // (≈ check cost, known post-parse) — see the run split below for how
+        // the weights are spent.
         const owned_lists = try arena.alloc(std.ArrayList(modules.FileId), n_checkers);
         for (owned_lists) |*l| l.* = .empty;
 
@@ -925,24 +919,83 @@ pub fn main(init: std.process.Init) !void {
             const cost: u64 = if (trees.items[i]) |tree| tree.nodes.len else 0;
             items.appendAssumeCapacity(.{ .file = @intCast(i), .cost = cost });
         }
-        std.mem.sort(Item, items.items, {}, struct {
-            fn lessThan(_: void, x: Item, y: Item) bool {
+        // Locality-aware, balanced partition. File ids are BFS positions in
+        // the import graph (see the renumbering above), so a contiguous id
+        // range is import-adjacent and its dependency closures largely
+        // overlap: checking that range on one checker materializes each
+        // foreign type once instead of once per checker that reaches it.
+        //
+        // Pure contiguity (one range per checker) wins the locality but
+        // loses the wall clock — node count mispredicts check time region by
+        // region, so one checker straggles. Cutting the order into two
+        // equal-node-weight runs per checker and dealing the runs
+        // longest-first onto the least-loaded checker (LPT) keeps most of the
+        // locality and pairs an expensive region with a cheap one. Measured
+        // on a 6.1k-file project at --checkers=4: check 265 -> 242 ms, peak
+        // RSS 226 -> 218 MB. k = 1 leaves a straggler; k >= 3 fragments the
+        // locality without buying the balance back, and both measured slower
+        // than k = 2, as did a boustrophedon deal, a DFS (subtree-contiguous)
+        // order, and re-weighting `.d.ts` nodes.
+        //
+        // Deterministic: the order is the file ids, the weights are fixed
+        // post-parse, and every tie breaks by run start / checker index, so
+        // any --checkers=N still yields byte-identical diagnostics.
+        const Run = struct { start: usize, end: usize, cost: u64 };
+        var runs: std.ArrayList(Run) = .empty;
+        {
+            var total_cost: u64 = 0;
+            for (items.items) |it| total_cost += it.cost;
+            const n_runs = n_checkers * 2;
+            var acc: u64 = 0;
+            var run_base: u64 = 0;
+            var start: usize = 0;
+            var r: usize = 0;
+            for (items.items, 0..) |it, idx| {
+                acc += it.cost;
+                // Cumulative target, so rounding never drifts across cuts.
+                if (acc >= total_cost * (r + 1) / n_runs and r + 1 < n_runs) {
+                    try runs.append(arena, .{ .start = start, .end = idx + 1, .cost = acc - run_base });
+                    run_base = acc;
+                    start = idx + 1;
+                    r += 1;
+                }
+            }
+            if (start < items.items.len)
+                try runs.append(arena, .{ .start = start, .end = items.items.len, .cost = acc - run_base });
+        }
+        std.mem.sort(Run, runs.items, {}, struct {
+            fn lessThan(_: void, x: Run, y: Run) bool {
                 if (x.cost != y.cost) return x.cost > y.cost; // biggest first
-                return x.file < y.file; // deterministic tie-break
+                return x.start < y.start; // deterministic tie-break
             }
         }.lessThan);
 
         const loads = try arena.alloc(u64, n_checkers);
         @memset(loads, 0);
-        for (items.items) |it| {
+        for (runs.items) |run| {
             // Least-loaded checker; ties resolve to the lowest index.
             var best: usize = 0;
             for (loads[1..], 1..) |l, k| {
                 if (l < loads[best]) best = k;
             }
-            try owned_lists[best].append(arena, it.file);
-            loads[best] += it.cost;
-            file_owner[it.file] = @intCast(best);
+            // Inside a run, walk biggest-first (the cost-partition order). Only the
+            // run permutes, so every other run's [start,end) is untouched and
+            // `run.cost` — an order-independent sum — still holds. Walk order
+            // does not move ownership, but it does move peak RSS: leading with
+            // the big files keeps their scratch peaks off the tail of a grown
+            // arena, worth ~20 MB at --checkers=1 on a 6.1k-file project.
+            const slice = items.items[run.start..run.end];
+            std.mem.sort(Item, slice, {}, struct {
+                fn lessThan(_: void, x: Item, y: Item) bool {
+                    if (x.cost != y.cost) return x.cost > y.cost; // biggest first
+                    return x.file < y.file; // deterministic tie-break
+                }
+            }.lessThan);
+            for (slice) |it| {
+                try owned_lists[best].append(arena, it.file);
+                file_owner[it.file] = @intCast(best);
+            }
+            loads[best] += run.cost;
         }
 
         // Shared frozen base type store (frozen-base piece 2): built
