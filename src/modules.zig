@@ -70,313 +70,293 @@ pub const Error = error{OutOfMemory};
 pub const FileId = u32;
 pub const no_file: FileId = std.math.maxInt(FileId);
 
-// The big ES-core and DOM libs are each embedded as N shard files rather than
-// one giant blob, so the front end (scan → parse → bind) parallelizes across
-// worker threads instead of running one 2.35 MB file serially on a single
-// worker. src/lib/gen_lib.js splits them at top-level declaration boundaries
-// (byte-preserving: the shards concatenate back to the un-sharded blob) and the
-// linker merges their globals cross-file exactly as if they were one file —
-// which is in fact how tsc itself sees the lib (one SourceFile per lib.*.d.ts).
-// KEEP THESE COUNTS IN SYNC WITH src/lib/gen_lib.js (ES_SHARDS / DOM_SHARDS).
-pub const es_shard_count = 4;
-pub const dom_shard_count = 8;
+// ===========================================================================
+// program construction & linking
+// ===========================================================================
 
-/// Synthetic paths of the injected ES-core lib shards (sharded later for the parallel front-end).
-/// They have no on-disk location; the loaders special-case these exact paths and
-/// use the matching embedded source. The leading NUL keeps them from colliding
-/// with any real filesystem path.
-pub const lib_paths = [es_shard_count][]const u8{
-    "\x00lib/lib.esnext.0.d.ts", "\x00lib/lib.esnext.1.d.ts",
-    "\x00lib/lib.esnext.2.d.ts", "\x00lib/lib.esnext.3.d.ts",
-};
-/// The embedded ES-core lib shard texts (real TypeScript 7.0.2 ES-core..esnext
-/// surface, DOM excluded). Bound once per run; their top-level declarations
-/// become the program's global symbols. Their own diagnostics are suppressed
-/// (like tsc's default lib) — see the print loop in main.zig.
-pub const lib_sources = [es_shard_count][]const u8{
-    @embedFile("lib/lib.esnext.0.d.ts"), @embedFile("lib/lib.esnext.1.d.ts"),
-    @embedFile("lib/lib.esnext.2.d.ts"), @embedFile("lib/lib.esnext.3.d.ts"),
-};
+/// Serial wavefront: load, parse, bind and resolve transitively from
+/// `entries` (paths relative to `dir`), then link. Everything lives in
+/// `arena`.
+pub fn buildProgram(
+    arena: Allocator,
+    io: Io,
+    gpa: Allocator,
+    interner: *Interner,
+    dir: Io.Dir,
+    entries: []const []const u8,
+    lib_set: LibSet,
+    resolve_opts: ResolveOpts,
+    allow_synthetic_default: bool,
+) !BuildResult {
+    var scratch_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch_arena.deinit();
+    const scratch = scratch_arena.allocator();
+    var rcache = ResolveCache.init(arena, true, resolve_opts);
 
-/// Synthetic paths of the injected DOM lib shards. Loaded when tsconfig
-/// `lib` selects "dom" (or by default — tsgo's target-esnext default includes
-/// DOM). Provide browser globals plus the real `console`.
-pub const dom_lib_paths = [dom_shard_count][]const u8{
-    "\x00lib/lib.dom.0.d.ts", "\x00lib/lib.dom.1.d.ts",
-    "\x00lib/lib.dom.2.d.ts", "\x00lib/lib.dom.3.d.ts",
-    "\x00lib/lib.dom.4.d.ts", "\x00lib/lib.dom.5.d.ts",
-    "\x00lib/lib.dom.6.d.ts", "\x00lib/lib.dom.7.d.ts",
-};
-/// The embedded DOM lib shard texts (browser globals + `Console`; es* deps
-/// omitted, supplied by the esnext blob it always loads alongside).
-pub const dom_lib_sources = [dom_shard_count][]const u8{
-    @embedFile("lib/lib.dom.0.d.ts"), @embedFile("lib/lib.dom.1.d.ts"),
-    @embedFile("lib/lib.dom.2.d.ts"), @embedFile("lib/lib.dom.3.d.ts"),
-    @embedFile("lib/lib.dom.4.d.ts"), @embedFile("lib/lib.dom.5.d.ts"),
-    @embedFile("lib/lib.dom.6.d.ts"), @embedFile("lib/lib.dom.7.d.ts"),
-};
+    var files: std.ArrayList(ProgFile) = .empty;
+    var path_ids: std.StringHashMapUnmanaged(FileId) = .empty;
+    var pending: std.ArrayList([]const u8) = .empty;
+    var failures: std.ArrayList(BuildDiag) = .empty;
 
-/// FileId of the first ES-core lib shard, matched by path (or `no_file`). The
-/// esnext shards are always injected as a contiguous block starting here.
-pub const lib_path = lib_paths[0];
-
-/// Synthetic path of the minimal `console` shim. Loaded ONLY when esnext
-/// is selected without dom (backend configs, lib:["esnext"]): `console` lives
-/// in lib.dom, so without DOM there is no `console`. DOM configs use lib.dom's
-/// richer `Console` and skip this (no duplicate `var console`).
-pub const console_shim_path = "\x00lib/lib.console.d.ts";
-pub const console_shim_source = @embedFile("lib/lib.console.d.ts");
-
-/// Upper bound on injected lib files: every es shard + every dom shard + the
-/// console shim. Sizes the fixed-capacity `LibFile` buffers callers pass in.
-pub const max_lib_files = es_shard_count + dom_shard_count + 1;
-
-/// Which built-in lib blobs to inject. Derived from tsconfig `lib` (or the
-/// default) by `resolveLibSet`; consumed by `libFiles`, `seedLibAtoms`,
-/// `buildProgram`, and the CLI injection site. `dom` always implies `es`
-/// (lib.dom references es2015 / es2018.asynciterable, both in the esnext blob),
-/// and `shim` (the console shim) is present exactly when `es and !dom`.
-pub const LibSet = struct {
-    es: bool = false,
-    dom: bool = false,
-    shim: bool = false,
-
-    /// No libs at all — `--noLib` / `lib:[]`.
-    pub const none: LibSet = .{};
-    /// The tsgo default (no `lib` field, target esnext): ES-core + DOM.
-    pub const default: LibSet = .{ .es = true, .dom = true };
-    /// Backend config: ES-core + the console shim, no DOM.
-    pub const es_only: LibSet = .{ .es = true, .shim = true };
-
-    pub fn any(s: LibSet) bool {
-        return s.es or s.dom or s.shim;
+    // Inject the selected built-in lib blobs as the first entries (files 0..).
+    var lib_buf: [max_lib_files]LibFile = undefined;
+    for (libFiles(lib_set, &lib_buf)) |lf| {
+        try path_ids.put(scratch, lf.path, @intCast(pending.items.len));
+        try pending.append(scratch, lf.path);
     }
-};
 
-/// One synthetic lib file (path + embedded source).
-pub const LibFile = struct { path: []const u8, source: []const u8 };
-
-/// Fill `buf` with the ordered synthetic lib files for `set`. Order is fixed
-/// (esnext, dom, console shim) so that seeded atoms (`seedLibAtoms`) and the
-/// injected file ids agree run-to-run — the determinism the seeded interner
-/// relies on. Returns the populated prefix of `buf`.
-pub fn libFiles(set: LibSet, buf: *[max_lib_files]LibFile) []const LibFile {
-    var n: usize = 0;
-    if (set.es) {
-        for (lib_paths, lib_sources) |p, s| {
-            buf[n] = .{ .path = p, .source = s };
-            n += 1;
+    for (entries) |e| {
+        const norm = try normalizePath(arena, e);
+        const gop = try path_ids.getOrPut(scratch, norm);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = @intCast(files.items.len + pending.items.len);
+            try pending.append(scratch, norm);
         }
     }
-    if (set.dom) {
-        for (dom_lib_paths, dom_lib_sources) |p, s| {
-            buf[n] = .{ .path = p, .source = s };
-            n += 1;
-        }
-    }
-    if (set.shim) {
-        buf[n] = .{ .path = console_shim_path, .source = console_shim_source };
-        n += 1;
-    }
-    return buf[0..n];
-}
 
-/// Embedded source for a synthetic lib path, or null for a real file path.
-pub fn libSourceFor(path: []const u8) ?[]const u8 {
-    for (lib_paths, lib_sources) |p, s| {
-        if (std.mem.eql(u8, path, p)) return s;
-    }
-    for (dom_lib_paths, dom_lib_sources) |p, s| {
-        if (std.mem.eql(u8, path, p)) return s;
-    }
-    if (std.mem.eql(u8, path, console_shim_path)) return console_shim_source;
-    return null;
-}
+    var next: usize = 0;
+    while (next < pending.items.len) : (next += 1) {
+        const path = pending.items[next];
+        const bytes: []const u8 = if (libSourceFor(path)) |s|
+            s
+        else if (anyModuleSourceFor(path)) |s|
+            s
+        else
+            dir.readFileAlloc(io, path, arena, .limited(1 << 30)) catch |err| {
+                try failures.append(scratch, .{ .path = path, .err = err });
+                // Keep ids dense: substitute an empty file.
+                const tree = try arena.create(Ast);
+                tree.* = try parser.parse(arena, "");
+                const bound = try arena.create(Bind);
+                bound.* = try binder.bind(arena, io, gpa, interner, tree, "", parser.isDeclarationPath(path));
+                try files.append(arena, .{ .path = path, .src = "", .tree = tree, .bind = bound });
+                continue;
+            };
+        const tree = try arena.create(Ast);
+        tree.* = try parser.parseOpts(arena, bytes, parser.isJsxPath(path));
+        const bound = try arena.create(Bind);
+        bound.* = try binder.bind(arena, io, gpa, interner, tree, bytes, parser.isDeclarationPath(path));
 
-/// True for any injected built-in lib path (diagnostics/stat suppression).
-pub fn isLibPath(path: []const u8) bool {
-    return libSourceFor(path) != null;
-}
-
-/// True for a TypeScript *declaration* file (`.d.ts`, `.d.mts`, `.d.cts`). These
-/// never emit and — under `skipLibCheck` — have all their diagnostics
-/// suppressed. The `.d.mts`/`.d.cts` variants matter for ESM/CJS-dual packages
-/// (redux-toolkit, zod, typebox) whose published types live in those files.
-pub fn isDeclarationPath(path: []const u8) bool {
-    return endsWithAny(path, &.{ ".d.ts", ".d.mts", ".d.cts" });
-}
-
-/// Resolve a tsconfig `lib` list (or null = not specified) to the blob set.
-/// tsc semantics: a `lib` list REPLACES the default set. We map any `es*`
-/// token to the ES-core blob and any `dom*` token to the DOM blob; other
-/// families (webworker/scripthost) are out of subset and ignored (warned at
-/// tsconfig parse). `dom` forces `es` on (its reference deps live in the es
-/// blob); the console shim fills in when es is selected without dom.
-pub fn resolveLibSet(lib: ?[]const []const u8) LibSet {
-    const list = lib orelse return LibSet.default;
-    var es = false;
-    var dom = false;
-    for (list) |name| {
-        if (std.ascii.startsWithIgnoreCase(name, "dom")) {
-            dom = true;
-        } else if (std.ascii.startsWithIgnoreCase(name, "es")) {
-            es = true;
-        }
-    }
-    if (dom) es = true;
-    return .{ .es = es, .dom = dom, .shim = es and !dom };
-}
-
-/// The final resolution of an imported/exported name.
-pub const Target = struct {
-    pub const Kind = enum(u8) {
-        /// Unresolved (missing module / missing export / out of subset).
-        /// The binding types as `any`; the diagnostic was already issued.
-        any,
-        /// A declaration symbol: `payload` is a local SymbolId in `file`.
-        binding,
-        /// The module namespace object of `file` (`import * as ns` /
-        /// `export * as ns`).
-        namespace,
-        /// An anonymous `export default <expr>`: `payload` is the
-        /// `export_default` node in `file`.
-        default_expr,
-        /// The namespace object of an ambient module (`import * as ns from
-        /// "fs"`): `payload` indexes `Program.ambient_exports`.
-        ambient_ns,
-    };
-    kind: Kind = .any,
-    file: FileId = 0,
-    payload: u32 = 0,
-    /// The chain passed through `export type` / `import type` somewhere:
-    /// value use of the binding is an error (TS1362-adjacent).
-    type_only: bool = false,
-};
-
-/// A link-phase diagnostic (2307/2305/2613/1192/2304), file-local span.
-pub const LinkDiag = struct {
-    code: u16,
-    span: Span,
-    msg: []const u8,
-};
-
-/// Module-specifier atom → resolved FileId (or `no_file`), sorted by atom.
-pub const SpecMap = struct {
-    atoms: []const Atom = &.{},
-    files: []const FileId = &.{},
-
-    pub fn get(m: *const SpecMap, atom: Atom) ?FileId {
-        var lo: usize = 0;
-        var hi: usize = m.atoms.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            if (m.atoms[mid] == atom) {
-                const f = m.files[mid];
-                return if (f == no_file) null else f;
+        // Triple-slash `/// <reference>` directives pull extra files into the
+        // program — not import bindings, just program inputs.
+        for (try scanReferences(scratch, bytes)) |ref| {
+            if (try rcache.resolveRef(io, scratch, dir, path, ref)) |resolved| {
+                const stable = try arena.dupe(u8, resolved);
+                const gop = try path_ids.getOrPut(scratch, stable);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = @intCast(pending.items.len);
+                    try pending.append(scratch, stable);
+                }
             }
-            if (m.atoms[mid] < atom) lo = mid + 1 else hi = mid;
         }
-        return null;
-    }
-};
 
-/// One program file: sealed parse/bind outputs plus its specifier map.
-pub const ProgFile = struct {
+        // Resolve this file's specifiers; discover new files.
+        var spec_atoms: std.ArrayList(Atom) = .empty;
+        var spec_files: std.ArrayList(FileId) = .empty;
+        var seen: std.AutoHashMapUnmanaged(Atom, void) = .empty;
+        for (bound.imports) |rec| {
+            try resolveOne(arena, scratch, io, &rcache, dir, interner, path, rec.module, &spec_atoms, &spec_files, &seen, &path_ids, &pending);
+        }
+        for (bound.exports) |rec| {
+            if (rec.module != 0) {
+                try resolveOne(arena, scratch, io, &rcache, dir, interner, path, rec.module, &spec_atoms, &spec_files, &seen, &path_ids, &pending);
+            }
+        }
+        sortSpecs(spec_atoms.items, spec_files.items);
+
+        try files.append(arena, .{
+            .path = path,
+            .src = bytes,
+            .tree = tree,
+            .bind = bound,
+            .specs = .{
+                .atoms = try arena.dupe(Atom, spec_atoms.items),
+                .files = try arena.dupe(FileId, spec_files.items),
+            },
+        });
+        spec_atoms.deinit(scratch);
+        spec_files.deinit(scratch);
+        seen.deinit(scratch);
+    }
+
+    const file_slice = try arena.dupe(ProgFile, files.items);
+    const lr = try link(arena, gpa, io, interner, file_slice, allow_synthetic_default);
+    return .{
+        .program = .{
+            .files = file_slice,
+            .sym_base = lr.sym_base,
+            .links = lr.links,
+            .globals = lr.globals,
+            .merged = lr.merged,
+            .ambient_exports = lr.ambient_exports,
+            .ambient_specs = lr.ambient_specs,
+            .constit_keys = lr.constit_keys,
+            .constit_vals = lr.constit_vals,
+            .export_equals_atom = lr.export_equals_atom,
+        },
+        .load_failures = try arena.dupe(BuildDiag, failures.items),
+    };
+}
+
+/// Build the sealed per-file link tables and the merged global table. Serial;
+/// results live in `arena`.
+pub fn link(
+    arena: Allocator,
+    gpa: Allocator,
+    io: Io,
+    interner: *Interner,
+    files: []const ProgFile,
+    allow_synthetic_default: bool,
+) Error!LinkResult {
+    var scratch_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch_arena.deinit();
+    const scratch = scratch_arena.allocator();
+
+    var l: Linker = .{
+        .arena = arena,
+        .scratch = scratch,
+        .io = io,
+        .gpa = gpa,
+        .interner = interner,
+        .files = files,
+        .atom_default = interner.intern(io, gpa, "default") catch return Error.OutOfMemory,
+        .allow_synthetic_default = allow_synthetic_default,
+        .atom_export_equals = interner.intern(io, gpa, "export=") catch return Error.OutOfMemory,
+        .state = try scratch.alloc(u8, files.len),
+        .tables = try scratch.alloc(std.AutoArrayHashMapUnmanaged(Atom, Target), files.len),
+        .diags = try scratch.alloc(std.ArrayList(LinkDiag), files.len),
+    };
+    @memset(l.state, 0);
+    for (l.tables) |*t| t.* = .empty;
+    for (l.diags) |*d| d.* = .empty;
+
+    // Build every export table (deterministic file order).
+    for (0..files.len) |i| _ = try l.table(@intCast(i));
+    // Then the ambient/augmentation module registry, which import
+    // resolution and TS2307 suppression consult below.
+    try l.buildAmbient();
+
+    const out = try arena.alloc(FileLinks, files.len);
+    for (0..files.len) |i| {
+        const fid: FileId = @intCast(i);
+        try l.reportUnresolvedModules(fid);
+        try l.reportModuleGrammar(fid);
+
+        var locals: std.ArrayList(u32) = .empty;
+        var targets: std.ArrayList(Target) = .empty;
+        try l.linkImports(fid, &locals, &targets);
+        try sortByKeyU32(scratch, locals.items, targets.items);
+
+        // Seal the export table sorted by atom.
+        const t = &l.tables[i];
+        const n = t.count();
+        const atoms = try arena.alloc(Atom, n);
+        const etargets = try arena.alloc(Target, n);
+        @memcpy(atoms, t.keys());
+        @memcpy(etargets, t.values());
+        try sortByKeyU32(scratch, atoms, etargets);
+
+        out[i] = .{
+            .import_locals = try arena.dupe(u32, locals.items),
+            .import_targets = try arena.dupe(Target, targets.items),
+            .export_atoms = atoms,
+            .export_targets = etargets,
+            .diags = try arena.dupe(LinkDiag, l.diags[i].items),
+        };
+    }
+
+    // Cross-file global merge + module augmentation merge: fold
+    // every file's harvest slice and every `declare module` augmentation of a
+    // resolved real module. Needs the sealed export tables (`out`).
+    const sym_base = try computeSymBase(arena, files);
+    const gm = try mergeGlobals(arena, scratch, files, sym_base, out);
+
+    // Seal the ambient module export tables in registry order, so
+    // `Target.ambient_ns` payloads (assigned from `getIndex`) address them.
+    const amb = try arena.alloc(AmbientExport, l.ambient.count());
+    const amb_specs = try arena.alloc(Atom, l.ambient.count());
+    @memcpy(amb_specs, l.ambient.keys());
+    for (l.ambient.values(), 0..) |*tbl, i| {
+        const n = tbl.count();
+        const atoms = try arena.alloc(Atom, n);
+        const tgts = try arena.alloc(Target, n);
+        @memcpy(atoms, tbl.keys());
+        @memcpy(tgts, tbl.values());
+        try sortByKeyU32(scratch, atoms, tgts);
+        amb[i] = .{ .atoms = atoms, .targets = tgts };
+    }
+
+    return .{ .links = out, .sym_base = sym_base, .globals = gm.globals, .merged = gm.merged, .ambient_exports = amb, .ambient_specs = amb_specs, .constit_keys = gm.constit_keys, .constit_vals = gm.constit_vals, .export_equals_atom = l.atom_export_equals };
+}
+
+/// Wrap one already-bound file as an unlinked Program (legacy single-file paths).
+pub fn singleFileProgram(
+    alloc: Allocator,
     path: []const u8,
     src: []const u8,
     tree: *const Ast,
     bind: *const Bind,
-    specs: SpecMap = .{},
+) Error!Program {
+    const files = try alloc.alloc(ProgFile, 1);
+    files[0] = .{ .path = path, .src = src, .tree = tree, .bind = bind };
+    return .{ .files = files, .sym_base = try computeSymBase(alloc, files) };
+}
+
+/// Build a program of the selected lib blobs (files 0..) plus one already-bound
+/// source file (last file), with the libs' globals collected. Used by the
+/// single-file test/conformance path so those cases see the same globals
+/// and primitive/array methods the CLI provides. An empty `lib_set` reproduces
+/// the legacy lib-free single-file program.
+pub fn singleWithLibProgram(
+    arena: Allocator,
+    io: Io,
+    gpa: Allocator,
+    interner: *Interner,
+    path: []const u8,
+    src: []const u8,
+    tree: *const Ast,
+    bind: *const Bind,
+    lib_set: LibSet,
+) !Program {
+    if (!lib_set.any()) return singleFileProgram(arena, path, src, tree, bind);
+    var buf: [max_lib_files]LibFile = undefined;
+    const lib_list = libFiles(lib_set, &buf);
+    const files = try arena.alloc(ProgFile, lib_list.len + 1);
+    for (lib_list, 0..) |lf, i| {
+        const lib_tree = try arena.create(Ast);
+        lib_tree.* = try parser.parse(arena, lf.source);
+        const lib_bind = try arena.create(Bind);
+        lib_bind.* = try binder.bind(arena, io, gpa, interner, lib_tree, lf.source, true);
+        files[i] = .{ .path = lf.path, .src = lf.source, .tree = lib_tree, .bind = lib_bind };
+    }
+    files[lib_list.len] = .{ .path = path, .src = src, .tree = tree, .bind = bind };
+    const sym_base = try computeSymBase(arena, files);
+    // Unlinked single-file path: a script user file may still augment lib
+    // globals; merge diagnostics (none for the clean case) have no link table
+    // to land in here and are dropped.
+    const gm = try mergeGlobals(arena, arena, files, sym_base, &.{});
+    return .{ .files = files, .sym_base = sym_base, .globals = gm.globals, .merged = gm.merged, .constit_keys = gm.constit_keys, .constit_vals = gm.constit_vals };
+}
+
+pub const BuildDiag = struct { path: []const u8, err: anyerror };
+
+pub const BuildResult = struct {
+    program: Program,
+    /// Entry files that failed to load.
+    load_failures: []const BuildDiag,
 };
 
-/// Sealed link tables for one file (read-only during check).
-pub const FileLinks = struct {
-    /// Local import-binding SymbolIds, sorted, with their targets.
-    import_locals: []const u32 = &.{},
-    import_targets: []const Target = &.{},
-    /// Flattened export table sorted by exported-name atom.
-    export_atoms: []const Atom = &.{},
-    export_targets: []const Target = &.{},
-    diags: []const LinkDiag = &.{},
-
-    pub fn importTarget(l: *const FileLinks, local: u32) ?Target {
-        var lo: usize = 0;
-        var hi: usize = l.import_locals.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            if (l.import_locals[mid] == local) return l.import_targets[mid];
-            if (l.import_locals[mid] < local) lo = mid + 1 else hi = mid;
-        }
-        return null;
-    }
-
-    pub fn exportTarget(l: *const FileLinks, atom: Atom) ?Target {
-        var lo: usize = 0;
-        var hi: usize = l.export_atoms.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            if (l.export_atoms[mid] == atom) return l.export_targets[mid];
-            if (l.export_atoms[mid] < atom) lo = mid + 1 else hi = mid;
-        }
-        return null;
-    }
-
-    /// Exact bytes of the sealed link tables.
-    pub fn bytes(l: *const FileLinks) usize {
-        return l.import_locals.len * (@sizeOf(u32) + @sizeOf(Target)) +
-            l.export_atoms.len * (@sizeOf(Atom) + @sizeOf(Target)) +
-            l.diags.len * @sizeOf(LinkDiag);
-    }
-};
-
-/// A cross-file merged global symbol. When 2+ files contribute the
-/// same global name, the linker allocates one of these; its program id is
-/// `totalSymbols() + index` (the merged range). `flags` is the OR of the
-/// constituents' flags; `parts` are the constituent GLOBAL SymbolIds (real
-/// ids `< totalSymbols()`) in FileId order. Checkers materialize the type by
-/// folding each constituent's declarations across files (the type-level twin
-/// of within-file merging). Merge remains a symbol-table operation — no types
-/// are compared here (invariant: merge symbols, never types).
-pub const MergedSym = struct {
-    name: Atom,
-    flags: binder.SymbolFlags,
-    parts: []const u32,
-    /// Merged member index for namespace-bearing merges: member name
-    /// atom → global sym (itself possibly a merged-range id, so a nested
-    /// interface/namespace reopened across files resolves recursively).
-    /// Sorted by atom; empty for non-namespace merges (interfaces materialize
-    /// to object types, so their members need no symbol-level index).
-    members: Globals = .{},
-};
-
-/// An ambient module's sealed export table, for `import * as ns`
-/// namespace objects. Entries are (export-name atom → Target), atom-sorted.
-pub const AmbientExport = struct {
-    atoms: []const Atom = &.{},
-    targets: []const Target = &.{},
-};
-
-/// Global (lib) name table: the top-level declarations of the injected
-/// lib file, keyed by name atom, holding GLOBAL SymbolIds. Sorted by atom
-/// for binary-search fallback in name resolution (checker `resolveSpace`).
-/// Empty when `--noLib` / no lib is injected. A name with a single
-/// contributor maps to that contributor's `(file, sym)` global id; a name
-/// with 2+ contributors maps to a merged-range id (`≥ totalSymbols()`)
-/// indexing `Program.merged`.
-pub const Globals = struct {
-    atoms: []const Atom = &.{},
-    syms: []const u32 = &.{},
-
-    pub fn lookup(g: *const Globals, atom: Atom) ?u32 {
-        var lo: usize = 0;
-        var hi: usize = g.atoms.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            if (g.atoms[mid] == atom) return g.syms[mid];
-            if (g.atoms[mid] < atom) lo = mid + 1 else hi = mid;
-        }
-        return null;
-    }
+/// Everything the serial link phase produces for the sealed program.
+pub const LinkResult = struct {
+    links: []const FileLinks,
+    sym_base: []const u32,
+    globals: Globals = .{},
+    merged: []const MergedSym = &.{},
+    ambient_exports: []const AmbientExport = &.{},
+    ambient_specs: []const Atom = &.{},
+    constit_keys: []const u32 = &.{},
+    constit_vals: []const u32 = &.{},
+    export_equals_atom: Atom = 0,
 };
 
 /// The sealed multi-file program handed to the checkers. Everything is
@@ -462,14 +442,231 @@ pub const Program = struct {
     }
 };
 
-/// Prefix sums of per-file symbol-array lengths (incl. the per-file dummy).
-pub fn computeSymBase(alloc: Allocator, files: []const ProgFile) Error![]u32 {
-    const base = try alloc.alloc(u32, files.len + 1);
-    base[0] = 0;
-    for (files, 0..) |*f, i| {
-        base[i + 1] = base[i] + @as(u32, @intCast(f.bind.symbol_names.len));
+/// One program file: sealed parse/bind outputs plus its specifier map.
+pub const ProgFile = struct {
+    path: []const u8,
+    src: []const u8,
+    tree: *const Ast,
+    bind: *const Bind,
+    specs: SpecMap = .{},
+};
+
+/// Sealed link tables for one file (read-only during check).
+pub const FileLinks = struct {
+    /// Local import-binding SymbolIds, sorted, with their targets.
+    import_locals: []const u32 = &.{},
+    import_targets: []const Target = &.{},
+    /// Flattened export table sorted by exported-name atom.
+    export_atoms: []const Atom = &.{},
+    export_targets: []const Target = &.{},
+    diags: []const LinkDiag = &.{},
+
+    pub fn importTarget(l: *const FileLinks, local: u32) ?Target {
+        var lo: usize = 0;
+        var hi: usize = l.import_locals.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (l.import_locals[mid] == local) return l.import_targets[mid];
+            if (l.import_locals[mid] < local) lo = mid + 1 else hi = mid;
+        }
+        return null;
     }
-    return base;
+
+    pub fn exportTarget(l: *const FileLinks, atom: Atom) ?Target {
+        var lo: usize = 0;
+        var hi: usize = l.export_atoms.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (l.export_atoms[mid] == atom) return l.export_targets[mid];
+            if (l.export_atoms[mid] < atom) lo = mid + 1 else hi = mid;
+        }
+        return null;
+    }
+
+    /// Exact bytes of the sealed link tables.
+    pub fn bytes(l: *const FileLinks) usize {
+        return l.import_locals.len * (@sizeOf(u32) + @sizeOf(Target)) +
+            l.export_atoms.len * (@sizeOf(Atom) + @sizeOf(Target)) +
+            l.diags.len * @sizeOf(LinkDiag);
+    }
+};
+
+/// The final resolution of an imported/exported name.
+pub const Target = struct {
+    pub const Kind = enum(u8) {
+        /// Unresolved (missing module / missing export / out of subset).
+        /// The binding types as `any`; the diagnostic was already issued.
+        any,
+        /// A declaration symbol: `payload` is a local SymbolId in `file`.
+        binding,
+        /// The module namespace object of `file` (`import * as ns` /
+        /// `export * as ns`).
+        namespace,
+        /// An anonymous `export default <expr>`: `payload` is the
+        /// `export_default` node in `file`.
+        default_expr,
+        /// The namespace object of an ambient module (`import * as ns from
+        /// "fs"`): `payload` indexes `Program.ambient_exports`.
+        ambient_ns,
+    };
+    kind: Kind = .any,
+    file: FileId = 0,
+    payload: u32 = 0,
+    /// The chain passed through `export type` / `import type` somewhere:
+    /// value use of the binding is an error (TS1362-adjacent).
+    type_only: bool = false,
+};
+
+/// A link-phase diagnostic (2307/2305/2613/1192/2304), file-local span.
+pub const LinkDiag = struct {
+    code: u16,
+    span: Span,
+    msg: []const u8,
+};
+
+/// Module-specifier atom → resolved FileId (or `no_file`), sorted by atom.
+pub const SpecMap = struct {
+    atoms: []const Atom = &.{},
+    files: []const FileId = &.{},
+
+    pub fn get(m: *const SpecMap, atom: Atom) ?FileId {
+        var lo: usize = 0;
+        var hi: usize = m.atoms.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (m.atoms[mid] == atom) {
+                const f = m.files[mid];
+                return if (f == no_file) null else f;
+            }
+            if (m.atoms[mid] < atom) lo = mid + 1 else hi = mid;
+        }
+        return null;
+    }
+};
+
+/// Global (lib) name table: the top-level declarations of the injected
+/// lib file, keyed by name atom, holding GLOBAL SymbolIds. Sorted by atom
+/// for binary-search fallback in name resolution (checker `resolveSpace`).
+/// Empty when `--noLib` / no lib is injected. A name with a single
+/// contributor maps to that contributor's `(file, sym)` global id; a name
+/// with 2+ contributors maps to a merged-range id (`≥ totalSymbols()`)
+/// indexing `Program.merged`.
+pub const Globals = struct {
+    atoms: []const Atom = &.{},
+    syms: []const u32 = &.{},
+
+    pub fn lookup(g: *const Globals, atom: Atom) ?u32 {
+        var lo: usize = 0;
+        var hi: usize = g.atoms.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (g.atoms[mid] == atom) return g.syms[mid];
+            if (g.atoms[mid] < atom) lo = mid + 1 else hi = mid;
+        }
+        return null;
+    }
+};
+
+/// A cross-file merged global symbol. When 2+ files contribute the
+/// same global name, the linker allocates one of these; its program id is
+/// `totalSymbols() + index` (the merged range). `flags` is the OR of the
+/// constituents' flags; `parts` are the constituent GLOBAL SymbolIds (real
+/// ids `< totalSymbols()`) in FileId order. Checkers materialize the type by
+/// folding each constituent's declarations across files (the type-level twin
+/// of within-file merging). Merge remains a symbol-table operation — no types
+/// are compared here (invariant: merge symbols, never types).
+pub const MergedSym = struct {
+    name: Atom,
+    flags: binder.SymbolFlags,
+    parts: []const u32,
+    /// Merged member index for namespace-bearing merges: member name
+    /// atom → global sym (itself possibly a merged-range id, so a nested
+    /// interface/namespace reopened across files resolves recursively).
+    /// Sorted by atom; empty for non-namespace merges (interfaces materialize
+    /// to object types, so their members need no symbol-level index).
+    members: Globals = .{},
+};
+
+/// An ambient module's sealed export table, for `import * as ns`
+/// namespace objects. Entries are (export-name atom → Target), atom-sorted.
+pub const AmbientExport = struct {
+    atoms: []const Atom = &.{},
+    targets: []const Target = &.{},
+};
+
+/// Result of folding every file's global contributions.
+pub const GlobalMerge = struct {
+    globals: Globals = .{},
+    merged: []const MergedSym = &.{},
+    /// Reverse index: each merge constituent's real global id → the
+    /// merged-range id it folds into. Parallel arrays sorted by key. Lets a
+    /// reference to a merged name from *inside* a contributing file (which
+    /// binds to the file-local constituent, not the global fallback) route to
+    /// the merged view. Empty in the common case (no cross-file merges).
+    constit_keys: []const u32 = &.{},
+    constit_vals: []const u32 = &.{},
+};
+
+// ===========================================================================
+// embedded libs (the injected lib.*.d.ts shards)
+// ===========================================================================
+
+/// Resolve a tsconfig `lib` list (or null = not specified) to the blob set.
+/// tsc semantics: a `lib` list REPLACES the default set. We map any `es*`
+/// token to the ES-core blob and any `dom*` token to the DOM blob; other
+/// families (webworker/scripthost) are out of subset and ignored (warned at
+/// tsconfig parse). `dom` forces `es` on (its reference deps live in the es
+/// blob); the console shim fills in when es is selected without dom.
+pub fn resolveLibSet(lib: ?[]const []const u8) LibSet {
+    const list = lib orelse return LibSet.default;
+    var es = false;
+    var dom = false;
+    for (list) |name| {
+        if (std.ascii.startsWithIgnoreCase(name, "dom")) {
+            dom = true;
+        } else if (std.ascii.startsWithIgnoreCase(name, "es")) {
+            es = true;
+        }
+    }
+    if (dom) es = true;
+    return .{ .es = es, .dom = dom, .shim = es and !dom };
+}
+
+/// Fill `buf` with the ordered synthetic lib files for `set`. Order is fixed
+/// (esnext, dom, console shim) so that seeded atoms (`seedLibAtoms`) and the
+/// injected file ids agree run-to-run — the determinism the seeded interner
+/// relies on. Returns the populated prefix of `buf`.
+pub fn libFiles(set: LibSet, buf: *[max_lib_files]LibFile) []const LibFile {
+    var n: usize = 0;
+    if (set.es) {
+        for (lib_paths, lib_sources) |p, s| {
+            buf[n] = .{ .path = p, .source = s };
+            n += 1;
+        }
+    }
+    if (set.dom) {
+        for (dom_lib_paths, dom_lib_sources) |p, s| {
+            buf[n] = .{ .path = p, .source = s };
+            n += 1;
+        }
+    }
+    if (set.shim) {
+        buf[n] = .{ .path = console_shim_path, .source = console_shim_source };
+        n += 1;
+    }
+    return buf[0..n];
+}
+
+/// Embedded source for a synthetic lib path, or null for a real file path.
+pub fn libSourceFor(path: []const u8) ?[]const u8 {
+    for (lib_paths, lib_sources) |p, s| {
+        if (std.mem.eql(u8, path, p)) return s;
+    }
+    for (dom_lib_paths, dom_lib_sources) |p, s| {
+        if (std.mem.eql(u8, path, p)) return s;
+    }
+    if (std.mem.eql(u8, path, console_shim_path)) return console_shim_source;
+    return null;
 }
 
 /// Deterministic lib atoms. Intern every string the lib front end
@@ -499,27 +696,692 @@ pub fn seedLibAtoms(io: Io, gpa: Allocator, interner: *Interner, set: LibSet) !v
     }
 }
 
+/// Which built-in lib blobs to inject. Derived from tsconfig `lib` (or the
+/// default) by `resolveLibSet`; consumed by `libFiles`, `seedLibAtoms`,
+/// `buildProgram`, and the CLI injection site. `dom` always implies `es`
+/// (lib.dom references es2015 / es2018.asynciterable, both in the esnext blob),
+/// and `shim` (the console shim) is present exactly when `es and !dom`.
+pub const LibSet = struct {
+    es: bool = false,
+    dom: bool = false,
+    shim: bool = false,
+
+    /// No libs at all — `--noLib` / `lib:[]`.
+    pub const none: LibSet = .{};
+    /// The tsgo default (no `lib` field, target esnext): ES-core + DOM.
+    pub const default: LibSet = .{ .es = true, .dom = true };
+    /// Backend config: ES-core + the console shim, no DOM.
+    pub const es_only: LibSet = .{ .es = true, .shim = true };
+
+    pub fn any(s: LibSet) bool {
+        return s.es or s.dom or s.shim;
+    }
+};
+
+/// One synthetic lib file (path + embedded source).
+pub const LibFile = struct { path: []const u8, source: []const u8 };
+
+// The big ES-core and DOM libs are each embedded as N shard files rather than
+// one giant blob, so the front end (scan → parse → bind) parallelizes across
+// worker threads instead of running one 2.35 MB file serially on a single
+// worker. src/lib/gen_lib.js splits them at top-level declaration boundaries
+// (byte-preserving: the shards concatenate back to the un-sharded blob) and the
+// linker merges their globals cross-file exactly as if they were one file —
+// which is in fact how tsc itself sees the lib (one SourceFile per lib.*.d.ts).
+// KEEP THESE COUNTS IN SYNC WITH src/lib/gen_lib.js (ES_SHARDS / DOM_SHARDS).
+pub const es_shard_count = 4;
+pub const dom_shard_count = 8;
+
+/// Synthetic paths of the injected ES-core lib shards (sharded later for the parallel front-end).
+/// They have no on-disk location; the loaders special-case these exact paths and
+/// use the matching embedded source. The leading NUL keeps them from colliding
+/// with any real filesystem path.
+pub const lib_paths = [es_shard_count][]const u8{
+    "\x00lib/lib.esnext.0.d.ts", "\x00lib/lib.esnext.1.d.ts",
+    "\x00lib/lib.esnext.2.d.ts", "\x00lib/lib.esnext.3.d.ts",
+};
+/// The embedded ES-core lib shard texts (real TypeScript 7.0.2 ES-core..esnext
+/// surface, DOM excluded). Bound once per run; their top-level declarations
+/// become the program's global symbols. Their own diagnostics are suppressed
+/// (like tsc's default lib) — see the print loop in main.zig.
+pub const lib_sources = [es_shard_count][]const u8{
+    @embedFile("lib/lib.esnext.0.d.ts"), @embedFile("lib/lib.esnext.1.d.ts"),
+    @embedFile("lib/lib.esnext.2.d.ts"), @embedFile("lib/lib.esnext.3.d.ts"),
+};
+
+/// Synthetic paths of the injected DOM lib shards. Loaded when tsconfig
+/// `lib` selects "dom" (or by default — tsgo's target-esnext default includes
+/// DOM). Provide browser globals plus the real `console`.
+pub const dom_lib_paths = [dom_shard_count][]const u8{
+    "\x00lib/lib.dom.0.d.ts", "\x00lib/lib.dom.1.d.ts",
+    "\x00lib/lib.dom.2.d.ts", "\x00lib/lib.dom.3.d.ts",
+    "\x00lib/lib.dom.4.d.ts", "\x00lib/lib.dom.5.d.ts",
+    "\x00lib/lib.dom.6.d.ts", "\x00lib/lib.dom.7.d.ts",
+};
+/// The embedded DOM lib shard texts (browser globals + `Console`; es* deps
+/// omitted, supplied by the esnext blob it always loads alongside).
+pub const dom_lib_sources = [dom_shard_count][]const u8{
+    @embedFile("lib/lib.dom.0.d.ts"), @embedFile("lib/lib.dom.1.d.ts"),
+    @embedFile("lib/lib.dom.2.d.ts"), @embedFile("lib/lib.dom.3.d.ts"),
+    @embedFile("lib/lib.dom.4.d.ts"), @embedFile("lib/lib.dom.5.d.ts"),
+    @embedFile("lib/lib.dom.6.d.ts"), @embedFile("lib/lib.dom.7.d.ts"),
+};
+
+/// FileId of the first ES-core lib shard, matched by path (or `no_file`). The
+/// esnext shards are always injected as a contiguous block starting here.
+pub const lib_path = lib_paths[0];
+
+/// Synthetic path of the minimal `console` shim. Loaded ONLY when esnext
+/// is selected without dom (backend configs, lib:["esnext"]): `console` lives
+/// in lib.dom, so without DOM there is no `console`. DOM configs use lib.dom's
+/// richer `Console` and skip this (no duplicate `var console`).
+pub const console_shim_path = "\x00lib/lib.console.d.ts";
+pub const console_shim_source = @embedFile("lib/lib.console.d.ts");
+
+/// Upper bound on injected lib files: every es shard + every dom shard + the
+/// console shim. Sizes the fixed-capacity `LibFile` buffers callers pass in.
+pub const max_lib_files = es_shard_count + dom_shard_count + 1;
+
+// ===========================================================================
+// path predicates & lexical path utilities
+// ===========================================================================
+
+/// True for any injected built-in lib path (diagnostics/stat suppression).
+pub fn isLibPath(path: []const u8) bool {
+    return libSourceFor(path) != null;
+}
+
+/// True for a TypeScript *declaration* file (`.d.ts`, `.d.mts`, `.d.cts`). These
+/// never emit and — under `skipLibCheck` — have all their diagnostics
+/// suppressed. The `.d.mts`/`.d.cts` variants matter for ESM/CJS-dual packages
+/// (redux-toolkit, zod, typebox) whose published types live in those files.
+pub fn isDeclarationPath(path: []const u8) bool {
+    return endsWithAny(path, &.{ ".d.ts", ".d.mts", ".d.cts" });
+}
+
+/// Directory part of a path ("" for none). Forward slashes only.
+pub fn dirnamePart(path: []const u8) []const u8 {
+    const i = std.mem.lastIndexOfScalar(u8, path, '/') orelse return "";
+    if (i == 0) return "/";
+    return path[0..i];
+}
+
+/// Lexically normalize `path`: collapse `.`, `..`, `//`. Keeps the path
+/// relative if it was relative (leading `..` segments survive).
+pub fn normalizePath(alloc: Allocator, path: []const u8) Error![]u8 {
+    var parts: std.ArrayList([]const u8) = .empty;
+    defer parts.deinit(alloc);
+    const absolute = path.len > 0 and path[0] == '/';
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |seg| {
+        if (seg.len == 0 or std.mem.eql(u8, seg, ".")) continue;
+        if (std.mem.eql(u8, seg, "..")) {
+            if (parts.items.len > 0 and !std.mem.eql(u8, parts.items[parts.items.len - 1], "..")) {
+                _ = parts.pop();
+                continue;
+            }
+            if (absolute) continue; // /.. = /
+            try parts.append(alloc, seg);
+            continue;
+        }
+        try parts.append(alloc, seg);
+    }
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    if (absolute) try out.append(alloc, '/');
+    for (parts.items, 0..) |seg, i| {
+        if (i > 0) try out.append(alloc, '/');
+        try out.appendSlice(alloc, seg);
+    }
+    if (out.items.len == 0) try out.append(alloc, '.');
+    return out.toOwnedSlice(alloc);
+}
+
+/// The Node.js built-in modules tsc resolves via an auto-included `@types/node`
+/// (its `declare module "fs"` / `declare module "node:fs"` blocks). `node:`-
+/// prefixed specifiers are always built-ins; the bare names cover the common
+/// unprefixed imports. Used by the driver to pull `@types/node` into the program
+/// on demand so those ambient blocks register and the import resolves.
+pub fn isNodeBuiltin(spec: []const u8) bool {
+    if (std.mem.startsWith(u8, spec, "node:")) return true;
+    const builtins = [_][]const u8{
+        "assert",          "async_hooks",     "buffer",     "child_process",  "cluster",
+        "console",         "constants",       "crypto",     "dgram",          "dns",
+        "domain",          "events",          "fs",         "http",           "http2",
+        "https",           "inspector",       "module",     "net",            "os",
+        "path",            "perf_hooks",      "process",    "punycode",       "querystring",
+        "readline",        "repl",            "stream",     "string_decoder", "timers",
+        "tls",             "tty",             "url",        "util",           "v8",
+        "vm",              "worker_threads",  "zlib",       "fs/promises",    "dns/promises",
+        "stream/promises", "timers/promises", "util/types",
+    };
+    for (builtins) |b| if (std.mem.eql(u8, spec, b)) return true;
+    return false;
+}
+
+/// Embedded synthetic source for a resolved JSON or JS any-module (or an
+/// `exports`-blocked subpath), or null for a real file that must be read and
+/// parsed. Centralizes the loader's any-module routing (JSON via
+/// `resolveJsonModule`, JS via `allowJs`, blocked subpaths via a present
+/// `exports` map that omits the subpath).
+pub fn anyModuleSourceFor(path: []const u8) ?[]const u8 {
+    if (isJsonModulePath(path)) return json_module_source;
+    if (isJsModulePath(path)) return js_module_source;
+    if (isBlockedSubpathPath(path)) return js_module_source;
+    return null;
+}
+
+/// Synthetic TypeScript source substituted for a resolved `*.json` module
+/// (`resolveJsonModule`). tsc synthesizes a structural type from the JSON
+/// literal; the under-report policy lets us type the module opaquely as `any`
+/// instead (a missed error is allowed, a false positive is not). `export =` (not
+/// `export default`) makes the module absorb every import form — default,
+/// namespace, and named — as `any` without a spurious TS1192/TS2305. The
+/// loaders special-case a `.json` program path to this text instead of parsing
+/// the raw JSON as TypeScript.
+pub const json_module_source = "declare const j: any;\nexport = j;\n";
+
+/// Synthetic source substituted for a resolved JavaScript module under
+/// `allowJs`. Identical shape to `json_module_source` (opaque `any` via
+/// `export =`): ztsc never parses/checks JS, so a JS-only dependency (`qs`,
+/// `leaflet.markercluster`) types as `any` instead of raising TS2307. Under
+/// `noImplicitAny` tsc emits TS7016 here; ztsc under-reports (silent `any`).
+pub const js_module_source = json_module_source;
+
+/// Synthetic program-path suffix marking an `exports`-blocked subpath — a
+/// `<pkg>/<sub>` import where `<pkg>` publishes an `exports` map that does NOT
+/// name `<sub>`. A published `exports` map is a closed set of entry points, so
+/// tsc's bundler/Node16 resolution refuses to legacy-probe the filesystem for
+/// such a subpath and the reference degrades to `any`. `resolvePackageAt`
+/// mirrors that by routing the subpath to a stable opaque `any` module carrying
+/// this suffix, rather than returning null (an UNRESOLVED specifier dangles a
+/// symbol in the parallel resolution phase — an intermittent, load-dependent
+/// crash). The suffix is deliberately not a real file extension: it never
+/// collides with an on-disk file, and `anyModuleSourceFor` recognizes it so the
+/// loader substitutes the synthetic `any` body and never touches disk.
+pub const blocked_subpath_suffix = ".ztsc-exports-blocked";
+
+// ===========================================================================
+// module resolution
+// ===========================================================================
+
+/// Resolve a relative-or-package file stem with the documented extension
+/// order. `stem` is a normalized path relative to `dir`. Public because
+/// tsconfig `paths` mapping feeds mapped candidates through it.
+pub fn resolveStem(io: Io, alloc: Allocator, dir: Io.Dir, stem: []const u8) Error!?[]u8 {
+    var buf: [6][]const u8 = undefined;
+    var n: usize = 0;
+    // Candidate paths are built with `alloc` (a scratch arena, freed after
+    // the file's specifiers resolve). A previous fixed 256-byte buffer
+    // silently failed on deep node_modules/@types paths — a wrong "module
+    // not found" — so there is no length cap here.
+    if (endsWithAny(stem, &.{ ".d.ts", ".d.mts", ".d.cts", ".ts", ".tsx", ".mts", ".cts" })) {
+        buf[0] = stem;
+        n = 1;
+        return tryCandidates(io, alloc, dir, buf[0..n]);
+    }
+    if (std.mem.endsWith(u8, stem, ".js") or std.mem.endsWith(u8, stem, ".jsx")) {
+        const base = stem[0..std.mem.lastIndexOfScalar(u8, stem, '.').?];
+        buf[0] = try std.fmt.allocPrint(alloc, "{s}.ts", .{base});
+        buf[1] = try std.fmt.allocPrint(alloc, "{s}.tsx", .{base});
+        buf[2] = try std.fmt.allocPrint(alloc, "{s}.d.ts", .{base});
+        n = 3;
+        return tryCandidates(io, alloc, dir, buf[0..n]);
+    }
+    // `.mjs`/`.cjs` rewrite to their declaration siblings (`.mjs`→`.mts`/`.d.mts`,
+    // `.cjs`→`.cts`/`.d.cts`) — the relative-import twin of the `exports`-field
+    // rule (`statExportTarget`). Needed for ESM-only packages (typebox, zod)
+    // whose `.d.mts`/`.d.cts` re-export `./x.mjs`/`./x.cjs`.
+    if (std.mem.endsWith(u8, stem, ".mjs") or std.mem.endsWith(u8, stem, ".cjs")) {
+        const base = stem[0 .. stem.len - ".mjs".len];
+        const m: u8 = stem[stem.len - 3]; // 'm' or 'c'
+        buf[0] = try std.fmt.allocPrint(alloc, "{s}.{c}ts", .{ base, m });
+        buf[1] = try std.fmt.allocPrint(alloc, "{s}.d.{c}ts", .{ base, m });
+        n = 2;
+        return tryCandidates(io, alloc, dir, buf[0..n]);
+    }
+    buf[0] = try std.fmt.allocPrint(alloc, "{s}.ts", .{stem});
+    buf[1] = try std.fmt.allocPrint(alloc, "{s}.tsx", .{stem});
+    buf[2] = try std.fmt.allocPrint(alloc, "{s}.d.ts", .{stem});
+    buf[3] = try std.fmt.allocPrint(alloc, "{s}/index.ts", .{stem});
+    buf[4] = try std.fmt.allocPrint(alloc, "{s}/index.tsx", .{stem});
+    buf[5] = try std.fmt.allocPrint(alloc, "{s}/index.d.ts", .{stem});
+    n = 6;
+    return tryCandidates(io, alloc, dir, buf[0..n]);
+}
+
+/// Resolve a package *directory* (base-relative, e.g. a visible
+/// `node_modules/@types/<name>`) to its main declaration file: the
+/// `package.json` `"types"`/`"typings"` entry when present, else `index.d.ts`
+/// (via `resolveStem`). The returned path is base-relative and owned by
+/// `alloc`, or null when nothing resolves. Used by the tsconfig auto-`@types`
+/// inclusion (`tsconfig.collectAutoTypes`) to turn each visible `@types/<name>`
+/// directory into an ambient program root the way tsc's default `typeRoots`
+/// does — this is a package *directory*, not a bare specifier, so it never
+/// walks `node_modules` and never falls back to JS.
+pub fn resolveTypesPackageMain(io: Io, alloc: Allocator, dir: Io.Dir, pkg_dir: []const u8) Error!?[]u8 {
+    const pj = try std.fmt.allocPrint(alloc, "{s}/package.json", .{pkg_dir});
+    defer alloc.free(pj);
+    if (dir.readFileAlloc(io, pj, alloc, .limited(1 << 20))) |text| {
+        defer alloc.free(text);
+        if (packageTypesField(text)) |types_rel| {
+            const stem = try joinNormalize(alloc, pkg_dir, types_rel);
+            defer alloc.free(stem);
+            if (try resolveStem(io, alloc, dir, stem)) |p| return p;
+        }
+    } else |_| {}
+    const idx = try std.fmt.allocPrint(alloc, "{s}/index", .{pkg_dir});
+    defer alloc.free(idx);
+    return resolveStem(io, alloc, dir, idx);
+}
+
+/// Stat a `*.json` stem (already `dir`-relative, ending in `.json`) as a
+/// resolved JSON module. Unlike `resolveStem`, no extension probing: the file
+/// must exist exactly as named (tsc resolves a JSON specifier only to the JSON
+/// file itself). Returns the path (owned by `alloc`) or null. Public so the CLI
+/// driver can stat a `paths`-mapped `*.json` candidate (which `resolveStem`
+/// would not find).
+pub fn resolveJsonFile(io: Io, alloc: Allocator, dir: Io.Dir, stem: []const u8) Error!?[]u8 {
+    if (fileExists(io, dir, stem)) return try alloc.dupe(u8, stem);
+    return null;
+}
+
+/// Scan the leading `///`-comment block of `src` for reference directives.
+/// tsc only honors them before the first token, so scanning stops at the
+/// first non-trivia character. Slices into `src` (no allocation of text).
+pub fn scanReferences(alloc: Allocator, src: []const u8) Error![]RefDirective {
+    var out: std.ArrayList(RefDirective) = .empty;
+    var i: usize = 0;
+    while (i < src.len) {
+        while (i < src.len and (src[i] == ' ' or src[i] == '\t' or src[i] == '\r' or src[i] == '\n')) i += 1;
+        if (i + 1 < src.len and src[i] == '/' and src[i + 1] == '/') {
+            const start = i;
+            while (i < src.len and src[i] != '\n') i += 1;
+            const line = src[start..i];
+            // Triple-slash only.
+            if (line.len >= 3 and line[2] == '/') {
+                if (parseReference(line[3..])) |d| try out.append(alloc, d);
+            }
+            continue;
+        }
+        if (i + 1 < src.len and src[i] == '/' and src[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < src.len and !(src[i] == '*' and src[i + 1] == '/')) i += 1;
+            i = if (i + 1 < src.len) i + 2 else src.len;
+            continue;
+        }
+        break; // first real token — directives must precede it
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// Memoizes `resolveSpecifier` over the discovery run. A module
+/// specifier resolves as a pure function of `(importer_dir, spec)` given a
+/// fixed filesystem — both a bare `node_modules` walk and a relative
+/// `joinNormalize` depend on nothing else — so that pair is an exact key. The
+/// win: `@types/node` (or any shared package) imported from K files walks the
+/// tree once instead of K times, and unresolvable specifiers are remembered
+/// too (the negative cache), so a bad import from K files also probes once.
+///
+/// Keyed on the *directory* rather than the importer path so sibling files in
+/// one directory share entries. Determinism is untouched: a cached path is
+/// byte-identical to the live resolution it replaces.
+///
+/// Not thread-safe by design — resolution is single-owner (see `fs_probes`).
+pub const ResolveCache = struct {
+    /// Persistent storage for keys and cached paths — outlives the per-file
+    /// scratch resets, so it must be the caller's discovery arena.
+    arena: Allocator,
+    /// `"<importer_dir>\x00<spec>"` → resolved path, or `null` (negative).
+    map: std.StringHashMapUnmanaged(?[]const u8) = .empty,
+    /// When false, every call falls straight through to `resolveSpecifier`
+    /// with no memo read or write — the "before" leg of the memo benchmark
+    /// (`--no-resolve-cache`), and a correctness oracle for the cache.
+    enabled: bool = true,
+    /// Resolution options folded into the (dir, spec, config) pure function.
+    opts: ResolveOpts = .{},
+    /// Filesystem-fact memos under the specifier memo (S1-lite). Shares
+    /// `enabled`: `--no-resolve-cache` disables both layers at once.
+    fs: FsCache,
+    /// Cached realpath of `dir` (arena-owned), used to re-relativize canonical
+    /// paths; computed lazily on the first `node_modules` resolution.
+    real_base: ?[]const u8 = null,
+    real_base_done: bool = false,
+    lookups: u64 = 0,
+    hits: u64 = 0,
+
+    pub fn init(arena: Allocator, enabled: bool, opts: ResolveOpts) ResolveCache {
+        return .{ .arena = arena, .enabled = enabled, .opts = opts, .fs = .{ .arena = arena } };
+    }
+
+    /// Cached `resolveSpecifier`. `scratch` holds the transient candidate
+    /// paths / package.json bodies (reset per file by the caller); a resolved
+    /// path is copied into `arena` so it survives that reset. The returned
+    /// slice is `arena`-owned on a miss and on every hit.
+    pub fn resolve(
+        rc: *ResolveCache,
+        io: Io,
+        scratch: Allocator,
+        dir: Io.Dir,
+        importer: []const u8,
+        spec: []const u8,
+    ) Error!?[]const u8 {
+        if (!rc.enabled) {
+            const r = (try resolveSpecifierFs(io, scratch, dir, importer, spec, rc.opts, null)) orelse return null;
+            return try rc.canonicalize(io, scratch, dir, r);
+        }
+        rc.lookups += 1;
+        const importer_dir = dirnamePart(importer);
+        // Build the key in scratch; only copy it into `arena` on a miss.
+        const key = try std.fmt.allocPrint(scratch, "{s}\x00{s}", .{ importer_dir, spec });
+        if (rc.map.get(key)) |cached| {
+            rc.hits += 1;
+            return cached;
+        }
+        const resolved = try resolveSpecifierFs(io, scratch, dir, importer, spec, rc.opts, &rc.fs);
+        const owned: ?[]const u8 = if (resolved) |p| try rc.canonicalize(io, scratch, dir, p) else null;
+        try rc.map.put(rc.arena, try rc.arena.dupe(u8, key), owned);
+        return owned;
+    }
+
+    /// Resolve a triple-slash `/// <reference>` directive to the *canonical* path
+    /// of its target — the reference-directive twin of `resolve`.
+    ///
+    /// Reference directives are the second way a file enters the module graph
+    /// (the third is a program root), and they used to skip the canonical-path
+    /// step `resolve` applies, which made every symlinked route to a package a
+    /// separate copy of it. In a pnpm workspace that is not an edge case: a
+    /// `/// <reference types="node" />` from any package resolves through the
+    /// hoisted `.pnpm/node_modules/@types/node` symlink, and the whole
+    /// `@types/node` bundle — 130+ files reached from there by `path` refs —
+    /// lands in the graph a second time, byte-identical to the copy already in
+    /// it and with its own symbol universe. Canonicalizing here collapses those
+    /// routes onto one file id, exactly like tsc's realpath-keyed file map.
+    pub fn resolveRef(
+        rc: *ResolveCache,
+        io: Io,
+        scratch: Allocator,
+        dir: Io.Dir,
+        importer: []const u8,
+        ref: RefDirective,
+    ) Error!?[]const u8 {
+        const fs: ?*FsCache = if (rc.enabled) &rc.fs else null;
+        const resolved = (try resolveReference(io, scratch, dir, importer, ref, fs)) orelse return null;
+        return try rc.canonicalize(io, scratch, dir, resolved);
+    }
+
+    /// The canonical path of an already-resolved file — for graph entry points
+    /// that bypass `resolve` (program roots, notably the auto-included
+    /// `@types/*` ambient roots, which pnpm exposes through a symlinked
+    /// `node_modules/@types/<pkg>`). Arena-owned; a no-op outside
+    /// `node_modules`, so project files keep the path the user typed.
+    pub fn canonicalPath(rc: *ResolveCache, io: Io, scratch: Allocator, dir: Io.Dir, raw: []const u8) Error![]const u8 {
+        return rc.canonicalize(io, scratch, dir, raw);
+    }
+
+    /// The realpath of `dir` (cached, arena-owned) for re-relativizing canonical
+    /// paths, or null if the OS call failed (then canonical paths stay absolute).
+    fn dirRealBase(rc: *ResolveCache, io: Io, dir: Io.Dir) ?[]const u8 {
+        if (!rc.real_base_done) {
+            rc.real_base_done = true;
+            var buf: [std.fs.max_path_bytes]u8 = undefined;
+            if (dir.realPath(io, &buf)) |n| {
+                rc.real_base = rc.arena.dupe(u8, buf[0..n]) catch null;
+            } else |_| {}
+        }
+        return rc.real_base;
+    }
+
+    /// Canonicalize a resolved path to a stable file identity by resolving
+    /// symlinks (pnpm's isolated store links a package's real location under
+    /// `.pnpm/`; only through the realpath are its sibling deps reachable by the
+    /// upward `node_modules` walk). tsc keys files by realpath for exactly this
+    /// reason. The result is re-relativized against `dir`'s realpath so a
+    /// relative-rooted run/test keeps a relative path space. Determinism holds:
+    /// realpath is a deterministic, idempotent function of the filesystem; the
+    /// cached and uncached (`--no-resolve-cache`) legs both apply it. Only
+    /// `node_modules` paths are canonicalized — nothing else is symlinked into a
+    /// store, so user-file paths (and their diagnostic display) are untouched and
+    /// no realpath syscall is spent on them. One syscall per resolved
+    /// `node_modules` file (the resolve memo collapses repeats), never per probe
+    /// — and, with the `FsCache` enabled, one per resolved *directory* (the
+    /// package's whole symlink chain is shared by every file in it).
+    fn canonicalize(rc: *ResolveCache, io: Io, scratch: Allocator, dir: Io.Dir, raw: []const u8) Error![]const u8 {
+        if (std.mem.indexOf(u8, raw, "node_modules") == null) return rc.arena.dupe(u8, raw);
+        // A synthetic `exports`-blocked subpath names no on-disk file: today's
+        // `realPathFile` fails on it and the raw path is kept. Skip it before the
+        // per-directory realpath, which would happily canonicalize its (existing)
+        // parent and hand back a different path. Saves a doomed syscall too.
+        if (isBlockedSubpathPath(raw)) return rc.arena.dupe(u8, raw);
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const abs = if (rc.enabled)
+            (try rc.fs.realPathOfFile(io, dir, scratch, raw)) orelse return rc.arena.dupe(u8, raw)
+        else abs: {
+            const n = dir.realPathFile(io, raw, &buf) catch return rc.arena.dupe(u8, raw);
+            break :abs buf[0..n];
+        };
+        // Debug-only oracle for the per-directory realpath: it can only diverge
+        // from the direct call if the file's own last component is a symlink.
+        if (builtin.mode == .Debug and rc.enabled) {
+            var vbuf: [std.fs.max_path_bytes]u8 = undefined;
+            if (dir.realPathFile(io, raw, &vbuf)) |vn| {
+                std.debug.assert(std.mem.eql(u8, vbuf[0..vn], abs));
+            } else |_| {}
+        }
+        if (rc.dirRealBase(io, dir)) |b| {
+            if (abs.len > b.len + 1 and std.mem.startsWith(u8, abs, b) and abs[b.len] == '/') {
+                return rc.arena.dupe(u8, abs[b.len + 1 ..]);
+            }
+        }
+        return rc.arena.dupe(u8, abs);
+    }
+};
+
+/// Filesystem-shape memos shared by one resolution run (S1-lite). Resolution
+/// is a pure function of the filesystem and ztsc is a single-shot batch
+/// process, so any probe it repeats is pure waste. Where `ResolveCache` memoizes
+/// a whole `(importer_dir, spec)` answer, this memoizes the *filesystem facts*
+/// underneath it — the part a first-time specifier still pays. Three memos, each
+/// keyed on the exact path string probed today (never canonicalized: the key
+/// space IS the behavior):
+///
+///  1. `nm_dirs` — does `<d>/node_modules` exist as a directory? The bare-
+///     specifier walk climbs to the filesystem root and most levels have no
+///     `node_modules` at all; one stat per level then answers every probe that
+///     would have gone inside it. This is the big one: 169k of the dogfood
+///     project's 257k resolve-phase syscalls (~99 ms) hit a path under a
+///     `<d>/node_modules` that does not exist.
+///  2. `pkg_json` — `package.json` text by path, misses cached too.
+///     `resolvePackageAt` reads one at every walk level (27.9k reads for 616
+///     distinct existing files; ~25k of the reads are ENOENT).
+///  3. `real_dirs` — realpath keyed by DIRECTORY. Canonicalizing a resolved
+///     `node_modules` file is realpath(dirname) + "/" + basename, and every file
+///     in one package directory shares that whole symlink chain (deep under
+///     pnpm), so 6.6k realpath calls collapse onto 1.2k directories.
+///
+/// (3) is the only leg that is not identical by construction: it differs from
+/// `realPathFile(path)` exactly when the final component is itself a symlink
+/// (package *directories* are symlinked by pnpm/yarn; declaration files are
+/// not). Debug builds therefore check it against the direct call on every use,
+/// making the conformance suite a standing oracle. The synthetic
+/// `exports`-blocked subpath — which names no on-disk file — is excluded
+/// explicitly, since its parent directory does exist and would canonicalize.
+///
+/// Memory is negligible against the program: on the dogfood project 2.5 MiB
+/// (1,920 + 1,542 + 1,202 entries), ~95% of it cached `package.json` text, on a
+/// 615 MB peak RSS — measured RSS moved +2 MB. `--timing` prints the entry
+/// counts and the byte total.
+///
+/// Not thread-safe, deliberately: resolution is single-owner (the main thread in
+/// the parallel driver, the sole thread in `buildProgram`) and each program owns
+/// its own cache. Lives inside `ResolveCache` and shares its `enabled` flag, so
+/// `--no-resolve-cache` turns the entire caching layer off in one switch and
+/// stays a complete correctness oracle for it.
+pub const FsCache = struct {
+    /// Persistent storage for keys, cached `package.json` bodies and realpaths.
+    /// Must outlive the per-file resolve scratch resets — the caller's arena.
+    arena: Allocator,
+    /// `<d>` → `<d>/node_modules` exists and is a directory.
+    nm_dirs: std.StringHashMapUnmanaged(bool) = .empty,
+    /// `package.json` path → its text, or null when absent/unreadable.
+    pkg_json: std.StringHashMapUnmanaged(?[]const u8) = .empty,
+    /// directory path → its realpath (absolute), or null when the OS call failed.
+    real_dirs: std.StringHashMapUnmanaged(?[]const u8) = .empty,
+    /// Arena bytes the memos own (keys + values), for the `--timing` line.
+    bytes: usize = 0,
+
+    /// True when `<d>/node_modules` exists as a directory. When it does not, no
+    /// `resolvePackageAt` at that level can resolve anything, so the level's
+    /// entire probe set (a `package.json` read plus up to six stem candidates,
+    /// again for the `@types/` twin, again for the allowJs phase) is skipped.
+    fn hasNodeModules(fc: *FsCache, io: Io, dir: Io.Dir, scratch: Allocator, d: []const u8) Error!bool {
+        if (fc.nm_dirs.get(d)) |v| return v;
+        const path: []const u8 = if (d.len == 0)
+            "node_modules"
+        else
+            try std.fmt.allocPrint(scratch, "{s}/node_modules", .{d});
+        bumpProbe();
+        const exists = if (dir.statFile(io, path, .{})) |st| st.kind == .directory else |_| false;
+        const key = try fc.arena.dupe(u8, d);
+        fc.bytes += key.len;
+        try fc.nm_dirs.put(fc.arena, key, exists);
+        return exists;
+    }
+
+    /// `package.json` text at `path` (cache-arena owned, valid for the run), or
+    /// null when it does not exist / cannot be read. Mirrors the uncached read
+    /// exactly, including the 1 MiB limit whose overflow reads as "absent".
+    fn packageJson(fc: *FsCache, io: Io, dir: Io.Dir, path: []const u8) Error!?[]const u8 {
+        if (fc.pkg_json.get(path)) |v| return v;
+        bumpProbe();
+        const text: ?[]const u8 = if (dir.readFileAlloc(io, path, fc.arena, .limited(1 << 20))) |t| t else |_| null;
+        const key = try fc.arena.dupe(u8, path);
+        fc.bytes += key.len + if (text) |t| t.len else 0;
+        try fc.pkg_json.put(fc.arena, key, text);
+        return text;
+    }
+
+    /// Realpath of directory `d` (cache-arena owned), or null when the OS call
+    /// failed. One syscall per distinct directory for the whole run.
+    fn realDir(fc: *FsCache, io: Io, dir: Io.Dir, d: []const u8) Error!?[]const u8 {
+        if (fc.real_dirs.get(d)) |v| return v;
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        var val: ?[]const u8 = null;
+        if (dir.realPathFile(io, d, &buf)) |n| {
+            val = try fc.arena.dupe(u8, buf[0..n]);
+        } else |_| {}
+        const key = try fc.arena.dupe(u8, d);
+        fc.bytes += key.len + if (val) |v| v.len else 0;
+        try fc.real_dirs.put(fc.arena, key, val);
+        return val;
+    }
+
+    /// Canonical absolute path of the *file* `path`, as realpath(dirname) + "/"
+    /// + basename (the directory leg memoized). Null when `path` has no
+    /// directory part or its directory does not resolve — the caller then keeps
+    /// the raw path, exactly as a failed `realPathFile` does today. Result is
+    /// `scratch`-owned.
+    fn realPathOfFile(fc: *FsCache, io: Io, dir: Io.Dir, scratch: Allocator, path: []const u8) Error!?[]const u8 {
+        const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return null;
+        const d = if (slash == 0) "/" else path[0..slash];
+        const base = path[slash + 1 ..];
+        const rd = (try fc.realDir(io, dir, d)) orelse return null;
+        const sep: []const u8 = if (std.mem.endsWith(u8, rd, "/")) "" else "/";
+        return try std.fmt.allocPrint(scratch, "{s}{s}{s}", .{ rd, sep, base });
+    }
+
+    /// Entry counts for the `--timing` scoreboard.
+    pub fn entryCounts(fc: *const FsCache) struct { nm_dirs: u32, pkg_json: u32, real_dirs: u32 } {
+        return .{
+            .nm_dirs = fc.nm_dirs.count(),
+            .pkg_json = fc.pkg_json.count(),
+            .real_dirs = fc.real_dirs.count(),
+        };
+    }
+};
+
+/// Per-run resolution options that are not a pure function of (dir, spec):
+/// `resolveJsonModule` and the `baseUrl` bare-specifier anchor. Carried on the
+/// `ResolveCache` (set once at init) so `resolveSpecifier`'s determinism
+/// contract — a pure function of `(dir, spec, config)` — is preserved with the
+/// config folded in explicitly.
+pub const ResolveOpts = struct {
+    /// tsconfig `resolveJsonModule`: a `*.json` specifier that names an existing
+    /// file resolves to it (typed opaquely as `any`; see `json_module_source`).
+    resolve_json: bool = false,
+    /// tsconfig `baseUrl`, already resolved to a `dir`-relative directory, or
+    /// null. A bare (non-relative) specifier probes `baseUrl/<spec>` — for both
+    /// `*.json` and TS/JS stems — AFTER `paths` (handled by the driver) and
+    /// BEFORE the `node_modules` walk, matching tsc's bundler/node order
+    /// (verified with `--traceResolution`: paths → baseUrl → node_modules).
+    base_url: ?[]const u8 = null,
+    /// tsconfig `allowJs`: when a specifier has no TS/declaration resolution but
+    /// a JavaScript file exists (a package whose entry is only `.js`, or a
+    /// `./x.js` file with no `.ts`/`.d.ts` twin), resolve to that `.js`/`.jsx`/
+    /// `.mjs`/`.cjs` file and type it opaquely as `any` (see `js_module_source`).
+    /// ztsc never parses/checks the JS source. tsc would report TS7016 under
+    /// `noImplicitAny`; ztsc under-reports (silent `any`) — a missed diagnostic,
+    /// never a false positive.
+    allow_js: bool = false,
+};
+
+pub const RefKind = enum { path, types };
+
+/// A `/// <reference path=… />` / `<reference types=… />` directive; `spec`
+/// slices into the source. `lib=` references are ignored (built-in libs).
+pub const RefDirective = struct { kind: RefKind, spec: []const u8 };
+
+// ===========================================================================
+// resolution statistics
+// ===========================================================================
+
+/// Count of filesystem probes issued during module resolution — every
+/// `statFile` and every `package.json` read. It is the resolution cache's
+/// scoreboard ("resolution syscall counts before/after"): with
+/// the `(importer_dir, spec)` memo the same specifier imported from K files
+/// walks `node_modules` once, not K times, so this collapses on inputs with
+/// shared specifiers.
+///
+/// Resolution runs single-owner (the main thread in the parallel driver, the
+/// sole thread in `buildProgram`), so the counter is never truly contended,
+/// but it is atomic anyway — cheap insurance against a future parallel caller
+/// and race-free under the test runner's threads.
+var fs_probes: std.atomic.Value(u64) = .init(0);
+
+pub fn fsProbeCount() u64 {
+    return fs_probes.load(.monotonic);
+}
+
+pub fn resetFsProbeCount() void {
+    fs_probes.store(0, .monotonic);
+}
+
+// ===========================================================================
+// private implementation
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// cross-file global merge
+// ---------------------------------------------------------------------------
+
+/// Prefix sums of per-file symbol-array lengths (incl. the per-file dummy).
+fn computeSymBase(alloc: Allocator, files: []const ProgFile) Error![]u32 {
+    const base = try alloc.alloc(u32, files.len + 1);
+    base[0] = 0;
+    for (files, 0..) |*f, i| {
+        base[i + 1] = base[i] + @as(u32, @intCast(f.bind.symbol_names.len));
+    }
+    return base;
+}
+
 /// FileId of the injected lib file (matched by its synthetic path), or
 /// `no_file` when no lib was injected.
-pub fn libFileId(files: []const ProgFile) FileId {
+fn libFileId(files: []const ProgFile) FileId {
     for (files, 0..) |*f, i| {
         if (std.mem.eql(u8, f.path, lib_path)) return @intCast(i);
     }
     return no_file;
 }
-
-/// Result of folding every file's global contributions.
-pub const GlobalMerge = struct {
-    globals: Globals = .{},
-    merged: []const MergedSym = &.{},
-    /// Reverse index: each merge constituent's real global id → the
-    /// merged-range id it folds into. Parallel arrays sorted by key. Lets a
-    /// reference to a merged name from *inside* a contributing file (which
-    /// binds to the file-local constituent, not the global fallback) route to
-    /// the merged view. Empty in the common case (no cross-file merges).
-    constit_keys: []const u32 = &.{},
-    constit_vals: []const u32 = &.{},
-};
 
 /// A (constituent real id → merged id) pair for the reverse index.
 const ConstitPair = struct { key: u32, val: u32 };
@@ -554,7 +1416,7 @@ fn globalSymFlags(files: []const ProgFile, sym_base: []const u32, sym: u32) bind
 /// constituent list; the checker materializes its type by folding each
 /// constituent's declarations across files. Merge is a pure symbol-table
 /// operation — no types are compared here (invariant 1).
-pub fn mergeGlobals(
+fn mergeGlobals(
     arena: Allocator,
     scratch: Allocator,
     files: []const ProgFile,
@@ -790,96 +1652,9 @@ fn globalSymName(files: []const ProgFile, sym_base: []const u32, sym: u32) Atom 
     return files[f].bind.symbol_names[sym - sym_base[f]];
 }
 
-/// Wrap one already-bound file as an unlinked Program (legacy single-file paths).
-pub fn singleFileProgram(
-    alloc: Allocator,
-    path: []const u8,
-    src: []const u8,
-    tree: *const Ast,
-    bind: *const Bind,
-) Error!Program {
-    const files = try alloc.alloc(ProgFile, 1);
-    files[0] = .{ .path = path, .src = src, .tree = tree, .bind = bind };
-    return .{ .files = files, .sym_base = try computeSymBase(alloc, files) };
-}
-
-/// Build a program of the selected lib blobs (files 0..) plus one already-bound
-/// source file (last file), with the libs' globals collected. Used by the
-/// single-file test/conformance path so those cases see the same globals
-/// and primitive/array methods the CLI provides. An empty `lib_set` reproduces
-/// the legacy lib-free single-file program.
-pub fn singleWithLibProgram(
-    arena: Allocator,
-    io: Io,
-    gpa: Allocator,
-    interner: *Interner,
-    path: []const u8,
-    src: []const u8,
-    tree: *const Ast,
-    bind: *const Bind,
-    lib_set: LibSet,
-) !Program {
-    if (!lib_set.any()) return singleFileProgram(arena, path, src, tree, bind);
-    var buf: [max_lib_files]LibFile = undefined;
-    const lib_list = libFiles(lib_set, &buf);
-    const files = try arena.alloc(ProgFile, lib_list.len + 1);
-    for (lib_list, 0..) |lf, i| {
-        const lib_tree = try arena.create(Ast);
-        lib_tree.* = try parser.parse(arena, lf.source);
-        const lib_bind = try arena.create(Bind);
-        lib_bind.* = try binder.bind(arena, io, gpa, interner, lib_tree, lf.source, true);
-        files[i] = .{ .path = lf.path, .src = lf.source, .tree = lib_tree, .bind = lib_bind };
-    }
-    files[lib_list.len] = .{ .path = path, .src = src, .tree = tree, .bind = bind };
-    const sym_base = try computeSymBase(arena, files);
-    // Unlinked single-file path: a script user file may still augment lib
-    // globals; merge diagnostics (none for the clean case) have no link table
-    // to land in here and are dropped.
-    const gm = try mergeGlobals(arena, arena, files, sym_base, &.{});
-    return .{ .files = files, .sym_base = sym_base, .globals = gm.globals, .merged = gm.merged, .constit_keys = gm.constit_keys, .constit_vals = gm.constit_vals };
-}
-
 // ===========================================================================
 // path utilities (lexical; no FS access)
 // ===========================================================================
-
-/// Directory part of a path ("" for none). Forward slashes only.
-pub fn dirnamePart(path: []const u8) []const u8 {
-    const i = std.mem.lastIndexOfScalar(u8, path, '/') orelse return "";
-    if (i == 0) return "/";
-    return path[0..i];
-}
-
-/// Lexically normalize `path`: collapse `.`, `..`, `//`. Keeps the path
-/// relative if it was relative (leading `..` segments survive).
-pub fn normalizePath(alloc: Allocator, path: []const u8) Error![]u8 {
-    var parts: std.ArrayList([]const u8) = .empty;
-    defer parts.deinit(alloc);
-    const absolute = path.len > 0 and path[0] == '/';
-    var it = std.mem.splitScalar(u8, path, '/');
-    while (it.next()) |seg| {
-        if (seg.len == 0 or std.mem.eql(u8, seg, ".")) continue;
-        if (std.mem.eql(u8, seg, "..")) {
-            if (parts.items.len > 0 and !std.mem.eql(u8, parts.items[parts.items.len - 1], "..")) {
-                _ = parts.pop();
-                continue;
-            }
-            if (absolute) continue; // /.. = /
-            try parts.append(alloc, seg);
-            continue;
-        }
-        try parts.append(alloc, seg);
-    }
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(alloc);
-    if (absolute) try out.append(alloc, '/');
-    for (parts.items, 0..) |seg, i| {
-        if (i > 0) try out.append(alloc, '/');
-        try out.appendSlice(alloc, seg);
-    }
-    if (out.items.len == 0) try out.append(alloc, '.');
-    return out.toOwnedSlice(alloc);
-}
 
 fn joinNormalize(alloc: Allocator, dir: []const u8, rest: []const u8) Error![]u8 {
     if (dir.len == 0) return normalizePath(alloc, rest);
@@ -892,25 +1667,6 @@ fn joinNormalize(alloc: Allocator, dir: []const u8, rest: []const u8) Error![]u8
 // specifier resolution (FS-backed)
 // ===========================================================================
 
-/// Count of filesystem probes issued during module resolution — every
-/// `statFile` and every `package.json` read. It is the resolution cache's
-/// scoreboard ("resolution syscall counts before/after"): with
-/// the `(importer_dir, spec)` memo the same specifier imported from K files
-/// walks `node_modules` once, not K times, so this collapses on inputs with
-/// shared specifiers.
-///
-/// Resolution runs single-owner (the main thread in the parallel driver, the
-/// sole thread in `buildProgram`), so the counter is never truly contended,
-/// but it is atomic anyway — cheap insurance against a future parallel caller
-/// and race-free under the test runner's threads.
-var fs_probes: std.atomic.Value(u64) = .init(0);
-
-pub fn fsProbeCount() u64 {
-    return fs_probes.load(.monotonic);
-}
-pub fn resetFsProbeCount() void {
-    fs_probes.store(0, .monotonic);
-}
 inline fn bumpProbe() void {
     _ = fs_probes.fetchAdd(1, .monotonic);
 }
@@ -1174,51 +1930,6 @@ fn tryCandidates(io: Io, alloc: Allocator, dir: Io.Dir, cands: []const []const u
     return null;
 }
 
-/// Resolve a relative-or-package file stem with the documented extension
-/// order. `stem` is a normalized path relative to `dir`. Public because
-/// tsconfig `paths` mapping feeds mapped candidates through it.
-pub fn resolveStem(io: Io, alloc: Allocator, dir: Io.Dir, stem: []const u8) Error!?[]u8 {
-    var buf: [6][]const u8 = undefined;
-    var n: usize = 0;
-    // Candidate paths are built with `alloc` (a scratch arena, freed after
-    // the file's specifiers resolve). A previous fixed 256-byte buffer
-    // silently failed on deep node_modules/@types paths — a wrong "module
-    // not found" — so there is no length cap here.
-    if (endsWithAny(stem, &.{ ".d.ts", ".d.mts", ".d.cts", ".ts", ".tsx", ".mts", ".cts" })) {
-        buf[0] = stem;
-        n = 1;
-        return tryCandidates(io, alloc, dir, buf[0..n]);
-    }
-    if (std.mem.endsWith(u8, stem, ".js") or std.mem.endsWith(u8, stem, ".jsx")) {
-        const base = stem[0..std.mem.lastIndexOfScalar(u8, stem, '.').?];
-        buf[0] = try std.fmt.allocPrint(alloc, "{s}.ts", .{base});
-        buf[1] = try std.fmt.allocPrint(alloc, "{s}.tsx", .{base});
-        buf[2] = try std.fmt.allocPrint(alloc, "{s}.d.ts", .{base});
-        n = 3;
-        return tryCandidates(io, alloc, dir, buf[0..n]);
-    }
-    // `.mjs`/`.cjs` rewrite to their declaration siblings (`.mjs`→`.mts`/`.d.mts`,
-    // `.cjs`→`.cts`/`.d.cts`) — the relative-import twin of the `exports`-field
-    // rule (`statExportTarget`). Needed for ESM-only packages (typebox, zod)
-    // whose `.d.mts`/`.d.cts` re-export `./x.mjs`/`./x.cjs`.
-    if (std.mem.endsWith(u8, stem, ".mjs") or std.mem.endsWith(u8, stem, ".cjs")) {
-        const base = stem[0 .. stem.len - ".mjs".len];
-        const m: u8 = stem[stem.len - 3]; // 'm' or 'c'
-        buf[0] = try std.fmt.allocPrint(alloc, "{s}.{c}ts", .{ base, m });
-        buf[1] = try std.fmt.allocPrint(alloc, "{s}.d.{c}ts", .{ base, m });
-        n = 2;
-        return tryCandidates(io, alloc, dir, buf[0..n]);
-    }
-    buf[0] = try std.fmt.allocPrint(alloc, "{s}.ts", .{stem});
-    buf[1] = try std.fmt.allocPrint(alloc, "{s}.tsx", .{stem});
-    buf[2] = try std.fmt.allocPrint(alloc, "{s}.d.ts", .{stem});
-    buf[3] = try std.fmt.allocPrint(alloc, "{s}/index.ts", .{stem});
-    buf[4] = try std.fmt.allocPrint(alloc, "{s}/index.tsx", .{stem});
-    buf[5] = try std.fmt.allocPrint(alloc, "{s}/index.d.ts", .{stem});
-    n = 6;
-    return tryCandidates(io, alloc, dir, buf[0..n]);
-}
-
 /// `allowJs` fallback for `resolveStem`: when no TypeScript/declaration file
 /// matched `stem`, probe the raw JavaScript file. An explicit JS-family
 /// extension (`.js`/`.jsx`/`.mjs`/`.cjs`) is statted as-is; an extensionless
@@ -1413,77 +2124,10 @@ fn resolvePackageAt(io: Io, alloc: Allocator, dir: Io.Dir, d: []const u8, pkg: [
     return null;
 }
 
-/// Resolve a package *directory* (base-relative, e.g. a visible
-/// `node_modules/@types/<name>`) to its main declaration file: the
-/// `package.json` `"types"`/`"typings"` entry when present, else `index.d.ts`
-/// (via `resolveStem`). The returned path is base-relative and owned by
-/// `alloc`, or null when nothing resolves. Used by the tsconfig auto-`@types`
-/// inclusion (`tsconfig.collectAutoTypes`) to turn each visible `@types/<name>`
-/// directory into an ambient program root the way tsc's default `typeRoots`
-/// does — this is a package *directory*, not a bare specifier, so it never
-/// walks `node_modules` and never falls back to JS.
-pub fn resolveTypesPackageMain(io: Io, alloc: Allocator, dir: Io.Dir, pkg_dir: []const u8) Error!?[]u8 {
-    const pj = try std.fmt.allocPrint(alloc, "{s}/package.json", .{pkg_dir});
-    defer alloc.free(pj);
-    if (dir.readFileAlloc(io, pj, alloc, .limited(1 << 20))) |text| {
-        defer alloc.free(text);
-        if (packageTypesField(text)) |types_rel| {
-            const stem = try joinNormalize(alloc, pkg_dir, types_rel);
-            defer alloc.free(stem);
-            if (try resolveStem(io, alloc, dir, stem)) |p| return p;
-        }
-    } else |_| {}
-    const idx = try std.fmt.allocPrint(alloc, "{s}/index", .{pkg_dir});
-    defer alloc.free(idx);
-    return resolveStem(io, alloc, dir, idx);
-}
-
-/// Per-run resolution options that are not a pure function of (dir, spec):
-/// `resolveJsonModule` and the `baseUrl` bare-specifier anchor. Carried on the
-/// `ResolveCache` (set once at init) so `resolveSpecifier`'s determinism
-/// contract — a pure function of `(dir, spec, config)` — is preserved with the
-/// config folded in explicitly.
-pub const ResolveOpts = struct {
-    /// tsconfig `resolveJsonModule`: a `*.json` specifier that names an existing
-    /// file resolves to it (typed opaquely as `any`; see `json_module_source`).
-    resolve_json: bool = false,
-    /// tsconfig `baseUrl`, already resolved to a `dir`-relative directory, or
-    /// null. A bare (non-relative) specifier probes `baseUrl/<spec>` — for both
-    /// `*.json` and TS/JS stems — AFTER `paths` (handled by the driver) and
-    /// BEFORE the `node_modules` walk, matching tsc's bundler/node order
-    /// (verified with `--traceResolution`: paths → baseUrl → node_modules).
-    base_url: ?[]const u8 = null,
-    /// tsconfig `allowJs`: when a specifier has no TS/declaration resolution but
-    /// a JavaScript file exists (a package whose entry is only `.js`, or a
-    /// `./x.js` file with no `.ts`/`.d.ts` twin), resolve to that `.js`/`.jsx`/
-    /// `.mjs`/`.cjs` file and type it opaquely as `any` (see `js_module_source`).
-    /// ztsc never parses/checks the JS source. tsc would report TS7016 under
-    /// `noImplicitAny`; ztsc under-reports (silent `any`) — a missed diagnostic,
-    /// never a false positive.
-    allow_js: bool = false,
-};
-
-/// Synthetic TypeScript source substituted for a resolved `*.json` module
-/// (`resolveJsonModule`). tsc synthesizes a structural type from the JSON
-/// literal; the under-report policy lets us type the module opaquely as `any`
-/// instead (a missed error is allowed, a false positive is not). `export =` (not
-/// `export default`) makes the module absorb every import form — default,
-/// namespace, and named — as `any` without a spurious TS1192/TS2305. The
-/// loaders special-case a `.json` program path to this text instead of parsing
-/// the raw JSON as TypeScript.
-pub const json_module_source = "declare const j: any;\nexport = j;\n";
-
-/// Synthetic source substituted for a resolved JavaScript module under
-/// `allowJs`. Identical shape to `json_module_source` (opaque `any` via
-/// `export =`): ztsc never parses/checks JS, so a JS-only dependency (`qs`,
-/// `leaflet.markercluster`) types as `any` instead of raising TS2307. Under
-/// `noImplicitAny` tsc emits TS7016 here; ztsc under-reports (silent `any`).
-pub const js_module_source = json_module_source;
-
 /// True for a program path that is a resolved JSON module (loaded as
 /// `json_module_source`, not read/parsed from disk). Only reachable when
 /// `resolveJsonModule` routed a `*.json` specifier to an on-disk file.
-pub fn isJsonModulePath(path: []const u8) bool {
+fn isJsonModulePath(path: []const u8) bool {
     return std.mem.endsWith(u8, path, ".json");
 }
 
@@ -1492,26 +2136,13 @@ pub fn isJsonModulePath(path: []const u8) bool {
 /// `allowJs`: TS/declaration resolution never returns a raw `.js`/`.jsx`/
 /// `.mjs`/`.cjs` path (it rewrites to declaration twins), so any such program
 /// path is an allowJs any-module.
-pub fn isJsModulePath(path: []const u8) bool {
+fn isJsModulePath(path: []const u8) bool {
     return endsWithAny(path, &.{ ".js", ".jsx", ".mjs", ".cjs" });
 }
 
-/// Synthetic program-path suffix marking an `exports`-blocked subpath — a
-/// `<pkg>/<sub>` import where `<pkg>` publishes an `exports` map that does NOT
-/// name `<sub>`. A published `exports` map is a closed set of entry points, so
-/// tsc's bundler/Node16 resolution refuses to legacy-probe the filesystem for
-/// such a subpath and the reference degrades to `any`. `resolvePackageAt`
-/// mirrors that by routing the subpath to a stable opaque `any` module carrying
-/// this suffix, rather than returning null (an UNRESOLVED specifier dangles a
-/// symbol in the parallel resolution phase — an intermittent, load-dependent
-/// crash). The suffix is deliberately not a real file extension: it never
-/// collides with an on-disk file, and `anyModuleSourceFor` recognizes it so the
-/// loader substitutes the synthetic `any` body and never touches disk.
-pub const blocked_subpath_suffix = ".ztsc-exports-blocked";
-
 /// True for a synthetic exports-blocked-subpath any-module path (see
 /// `blocked_subpath_suffix`).
-pub fn isBlockedSubpathPath(path: []const u8) bool {
+fn isBlockedSubpathPath(path: []const u8) bool {
     return std.mem.endsWith(u8, path, blocked_subpath_suffix);
 }
 
@@ -1523,54 +2154,9 @@ fn blockedSubpathPath(alloc: Allocator, nm: []const u8, sub: []const u8) Error![
     return std.fmt.allocPrint(alloc, "{s}/{s}{s}", .{ nm, sub, blocked_subpath_suffix });
 }
 
-/// Embedded synthetic source for a resolved JSON or JS any-module (or an
-/// `exports`-blocked subpath), or null for a real file that must be read and
-/// parsed. Centralizes the loader's any-module routing (JSON via
-/// `resolveJsonModule`, JS via `allowJs`, blocked subpaths via a present
-/// `exports` map that omits the subpath).
-pub fn anyModuleSourceFor(path: []const u8) ?[]const u8 {
-    if (isJsonModulePath(path)) return json_module_source;
-    if (isJsModulePath(path)) return js_module_source;
-    if (isBlockedSubpathPath(path)) return js_module_source;
-    return null;
-}
-
-/// The Node.js built-in modules tsc resolves via an auto-included `@types/node`
-/// (its `declare module "fs"` / `declare module "node:fs"` blocks). `node:`-
-/// prefixed specifiers are always built-ins; the bare names cover the common
-/// unprefixed imports. Used by the driver to pull `@types/node` into the program
-/// on demand so those ambient blocks register and the import resolves.
-pub fn isNodeBuiltin(spec: []const u8) bool {
-    if (std.mem.startsWith(u8, spec, "node:")) return true;
-    const builtins = [_][]const u8{
-        "assert",          "async_hooks",     "buffer",     "child_process",  "cluster",
-        "console",         "constants",       "crypto",     "dgram",          "dns",
-        "domain",          "events",          "fs",         "http",           "http2",
-        "https",           "inspector",       "module",     "net",            "os",
-        "path",            "perf_hooks",      "process",    "punycode",       "querystring",
-        "readline",        "repl",            "stream",     "string_decoder", "timers",
-        "tls",             "tty",             "url",        "util",           "v8",
-        "vm",              "worker_threads",  "zlib",       "fs/promises",    "dns/promises",
-        "stream/promises", "timers/promises", "util/types",
-    };
-    for (builtins) |b| if (std.mem.eql(u8, spec, b)) return true;
-    return false;
-}
-
-/// Stat a `*.json` stem (already `dir`-relative, ending in `.json`) as a
-/// resolved JSON module. Unlike `resolveStem`, no extension probing: the file
-/// must exist exactly as named (tsc resolves a JSON specifier only to the JSON
-/// file itself). Returns the path (owned by `alloc`) or null. Public so the CLI
-/// driver can stat a `paths`-mapped `*.json` candidate (which `resolveStem`
-/// would not find).
-pub fn resolveJsonFile(io: Io, alloc: Allocator, dir: Io.Dir, stem: []const u8) Error!?[]u8 {
-    if (fileExists(io, dir, stem)) return try alloc.dupe(u8, stem);
-    return null;
-}
-
 /// Resolve module specifier `spec` from file `importer` (both relative to
 /// `dir`). Returns the normalized path of the resolved file, or null.
-pub fn resolveSpecifier(
+fn resolveSpecifier(
     io: Io,
     alloc: Allocator,
     dir: Io.Dir,
@@ -1629,291 +2215,6 @@ fn resolveSpecifierFs(
     }
     return resolvePackage(io, alloc, dir, importer_dir, spec, opts.allow_js, fs);
 }
-
-/// Filesystem-shape memos shared by one resolution run (S1-lite). Resolution
-/// is a pure function of the filesystem and ztsc is a single-shot batch
-/// process, so any probe it repeats is pure waste. Where `ResolveCache` memoizes
-/// a whole `(importer_dir, spec)` answer, this memoizes the *filesystem facts*
-/// underneath it — the part a first-time specifier still pays. Three memos, each
-/// keyed on the exact path string probed today (never canonicalized: the key
-/// space IS the behavior):
-///
-///  1. `nm_dirs` — does `<d>/node_modules` exist as a directory? The bare-
-///     specifier walk climbs to the filesystem root and most levels have no
-///     `node_modules` at all; one stat per level then answers every probe that
-///     would have gone inside it. This is the big one: 169k of the dogfood
-///     project's 257k resolve-phase syscalls (~99 ms) hit a path under a
-///     `<d>/node_modules` that does not exist.
-///  2. `pkg_json` — `package.json` text by path, misses cached too.
-///     `resolvePackageAt` reads one at every walk level (27.9k reads for 616
-///     distinct existing files; ~25k of the reads are ENOENT).
-///  3. `real_dirs` — realpath keyed by DIRECTORY. Canonicalizing a resolved
-///     `node_modules` file is realpath(dirname) + "/" + basename, and every file
-///     in one package directory shares that whole symlink chain (deep under
-///     pnpm), so 6.6k realpath calls collapse onto 1.2k directories.
-///
-/// (3) is the only leg that is not identical by construction: it differs from
-/// `realPathFile(path)` exactly when the final component is itself a symlink
-/// (package *directories* are symlinked by pnpm/yarn; declaration files are
-/// not). Debug builds therefore check it against the direct call on every use,
-/// making the conformance suite a standing oracle. The synthetic
-/// `exports`-blocked subpath — which names no on-disk file — is excluded
-/// explicitly, since its parent directory does exist and would canonicalize.
-///
-/// Memory is negligible against the program: on the dogfood project 2.5 MiB
-/// (1,920 + 1,542 + 1,202 entries), ~95% of it cached `package.json` text, on a
-/// 615 MB peak RSS — measured RSS moved +2 MB. `--timing` prints the entry
-/// counts and the byte total.
-///
-/// Not thread-safe, deliberately: resolution is single-owner (the main thread in
-/// the parallel driver, the sole thread in `buildProgram`) and each program owns
-/// its own cache. Lives inside `ResolveCache` and shares its `enabled` flag, so
-/// `--no-resolve-cache` turns the entire caching layer off in one switch and
-/// stays a complete correctness oracle for it.
-pub const FsCache = struct {
-    /// Persistent storage for keys, cached `package.json` bodies and realpaths.
-    /// Must outlive the per-file resolve scratch resets — the caller's arena.
-    arena: Allocator,
-    /// `<d>` → `<d>/node_modules` exists and is a directory.
-    nm_dirs: std.StringHashMapUnmanaged(bool) = .empty,
-    /// `package.json` path → its text, or null when absent/unreadable.
-    pkg_json: std.StringHashMapUnmanaged(?[]const u8) = .empty,
-    /// directory path → its realpath (absolute), or null when the OS call failed.
-    real_dirs: std.StringHashMapUnmanaged(?[]const u8) = .empty,
-    /// Arena bytes the memos own (keys + values), for the `--timing` line.
-    bytes: usize = 0,
-
-    /// True when `<d>/node_modules` exists as a directory. When it does not, no
-    /// `resolvePackageAt` at that level can resolve anything, so the level's
-    /// entire probe set (a `package.json` read plus up to six stem candidates,
-    /// again for the `@types/` twin, again for the allowJs phase) is skipped.
-    fn hasNodeModules(fc: *FsCache, io: Io, dir: Io.Dir, scratch: Allocator, d: []const u8) Error!bool {
-        if (fc.nm_dirs.get(d)) |v| return v;
-        const path: []const u8 = if (d.len == 0)
-            "node_modules"
-        else
-            try std.fmt.allocPrint(scratch, "{s}/node_modules", .{d});
-        bumpProbe();
-        const exists = if (dir.statFile(io, path, .{})) |st| st.kind == .directory else |_| false;
-        const key = try fc.arena.dupe(u8, d);
-        fc.bytes += key.len;
-        try fc.nm_dirs.put(fc.arena, key, exists);
-        return exists;
-    }
-
-    /// `package.json` text at `path` (cache-arena owned, valid for the run), or
-    /// null when it does not exist / cannot be read. Mirrors the uncached read
-    /// exactly, including the 1 MiB limit whose overflow reads as "absent".
-    fn packageJson(fc: *FsCache, io: Io, dir: Io.Dir, path: []const u8) Error!?[]const u8 {
-        if (fc.pkg_json.get(path)) |v| return v;
-        bumpProbe();
-        const text: ?[]const u8 = if (dir.readFileAlloc(io, path, fc.arena, .limited(1 << 20))) |t| t else |_| null;
-        const key = try fc.arena.dupe(u8, path);
-        fc.bytes += key.len + if (text) |t| t.len else 0;
-        try fc.pkg_json.put(fc.arena, key, text);
-        return text;
-    }
-
-    /// Realpath of directory `d` (cache-arena owned), or null when the OS call
-    /// failed. One syscall per distinct directory for the whole run.
-    fn realDir(fc: *FsCache, io: Io, dir: Io.Dir, d: []const u8) Error!?[]const u8 {
-        if (fc.real_dirs.get(d)) |v| return v;
-        var buf: [std.fs.max_path_bytes]u8 = undefined;
-        var val: ?[]const u8 = null;
-        if (dir.realPathFile(io, d, &buf)) |n| {
-            val = try fc.arena.dupe(u8, buf[0..n]);
-        } else |_| {}
-        const key = try fc.arena.dupe(u8, d);
-        fc.bytes += key.len + if (val) |v| v.len else 0;
-        try fc.real_dirs.put(fc.arena, key, val);
-        return val;
-    }
-
-    /// Canonical absolute path of the *file* `path`, as realpath(dirname) + "/"
-    /// + basename (the directory leg memoized). Null when `path` has no
-    /// directory part or its directory does not resolve — the caller then keeps
-    /// the raw path, exactly as a failed `realPathFile` does today. Result is
-    /// `scratch`-owned.
-    fn realPathOfFile(fc: *FsCache, io: Io, dir: Io.Dir, scratch: Allocator, path: []const u8) Error!?[]const u8 {
-        const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return null;
-        const d = if (slash == 0) "/" else path[0..slash];
-        const base = path[slash + 1 ..];
-        const rd = (try fc.realDir(io, dir, d)) orelse return null;
-        const sep: []const u8 = if (std.mem.endsWith(u8, rd, "/")) "" else "/";
-        return try std.fmt.allocPrint(scratch, "{s}{s}{s}", .{ rd, sep, base });
-    }
-
-    /// Entry counts for the `--timing` scoreboard.
-    pub fn entryCounts(fc: *const FsCache) struct { nm_dirs: u32, pkg_json: u32, real_dirs: u32 } {
-        return .{
-            .nm_dirs = fc.nm_dirs.count(),
-            .pkg_json = fc.pkg_json.count(),
-            .real_dirs = fc.real_dirs.count(),
-        };
-    }
-};
-
-/// Memoizes `resolveSpecifier` over the discovery run. A module
-/// specifier resolves as a pure function of `(importer_dir, spec)` given a
-/// fixed filesystem — both a bare `node_modules` walk and a relative
-/// `joinNormalize` depend on nothing else — so that pair is an exact key. The
-/// win: `@types/node` (or any shared package) imported from K files walks the
-/// tree once instead of K times, and unresolvable specifiers are remembered
-/// too (the negative cache), so a bad import from K files also probes once.
-///
-/// Keyed on the *directory* rather than the importer path so sibling files in
-/// one directory share entries. Determinism is untouched: a cached path is
-/// byte-identical to the live resolution it replaces.
-///
-/// Not thread-safe by design — resolution is single-owner (see `fs_probes`).
-pub const ResolveCache = struct {
-    /// Persistent storage for keys and cached paths — outlives the per-file
-    /// scratch resets, so it must be the caller's discovery arena.
-    arena: Allocator,
-    /// `"<importer_dir>\x00<spec>"` → resolved path, or `null` (negative).
-    map: std.StringHashMapUnmanaged(?[]const u8) = .empty,
-    /// When false, every call falls straight through to `resolveSpecifier`
-    /// with no memo read or write — the "before" leg of the memo benchmark
-    /// (`--no-resolve-cache`), and a correctness oracle for the cache.
-    enabled: bool = true,
-    /// Resolution options folded into the (dir, spec, config) pure function.
-    opts: ResolveOpts = .{},
-    /// Filesystem-fact memos under the specifier memo (S1-lite). Shares
-    /// `enabled`: `--no-resolve-cache` disables both layers at once.
-    fs: FsCache,
-    /// Cached realpath of `dir` (arena-owned), used to re-relativize canonical
-    /// paths; computed lazily on the first `node_modules` resolution.
-    real_base: ?[]const u8 = null,
-    real_base_done: bool = false,
-    lookups: u64 = 0,
-    hits: u64 = 0,
-
-    pub fn init(arena: Allocator, enabled: bool, opts: ResolveOpts) ResolveCache {
-        return .{ .arena = arena, .enabled = enabled, .opts = opts, .fs = .{ .arena = arena } };
-    }
-
-    /// Cached `resolveSpecifier`. `scratch` holds the transient candidate
-    /// paths / package.json bodies (reset per file by the caller); a resolved
-    /// path is copied into `arena` so it survives that reset. The returned
-    /// slice is `arena`-owned on a miss and on every hit.
-    pub fn resolve(
-        rc: *ResolveCache,
-        io: Io,
-        scratch: Allocator,
-        dir: Io.Dir,
-        importer: []const u8,
-        spec: []const u8,
-    ) Error!?[]const u8 {
-        if (!rc.enabled) {
-            const r = (try resolveSpecifierFs(io, scratch, dir, importer, spec, rc.opts, null)) orelse return null;
-            return try rc.canonicalize(io, scratch, dir, r);
-        }
-        rc.lookups += 1;
-        const importer_dir = dirnamePart(importer);
-        // Build the key in scratch; only copy it into `arena` on a miss.
-        const key = try std.fmt.allocPrint(scratch, "{s}\x00{s}", .{ importer_dir, spec });
-        if (rc.map.get(key)) |cached| {
-            rc.hits += 1;
-            return cached;
-        }
-        const resolved = try resolveSpecifierFs(io, scratch, dir, importer, spec, rc.opts, &rc.fs);
-        const owned: ?[]const u8 = if (resolved) |p| try rc.canonicalize(io, scratch, dir, p) else null;
-        try rc.map.put(rc.arena, try rc.arena.dupe(u8, key), owned);
-        return owned;
-    }
-
-    /// Resolve a triple-slash `/// <reference>` directive to the *canonical* path
-    /// of its target — the reference-directive twin of `resolve`.
-    ///
-    /// Reference directives are the second way a file enters the module graph
-    /// (the third is a program root), and they used to skip the canonical-path
-    /// step `resolve` applies, which made every symlinked route to a package a
-    /// separate copy of it. In a pnpm workspace that is not an edge case: a
-    /// `/// <reference types="node" />` from any package resolves through the
-    /// hoisted `.pnpm/node_modules/@types/node` symlink, and the whole
-    /// `@types/node` bundle — 130+ files reached from there by `path` refs —
-    /// lands in the graph a second time, byte-identical to the copy already in
-    /// it and with its own symbol universe. Canonicalizing here collapses those
-    /// routes onto one file id, exactly like tsc's realpath-keyed file map.
-    pub fn resolveRef(
-        rc: *ResolveCache,
-        io: Io,
-        scratch: Allocator,
-        dir: Io.Dir,
-        importer: []const u8,
-        ref: RefDirective,
-    ) Error!?[]const u8 {
-        const fs: ?*FsCache = if (rc.enabled) &rc.fs else null;
-        const resolved = (try resolveReference(io, scratch, dir, importer, ref, fs)) orelse return null;
-        return try rc.canonicalize(io, scratch, dir, resolved);
-    }
-
-    /// The canonical path of an already-resolved file — for graph entry points
-    /// that bypass `resolve` (program roots, notably the auto-included
-    /// `@types/*` ambient roots, which pnpm exposes through a symlinked
-    /// `node_modules/@types/<pkg>`). Arena-owned; a no-op outside
-    /// `node_modules`, so project files keep the path the user typed.
-    pub fn canonicalPath(rc: *ResolveCache, io: Io, scratch: Allocator, dir: Io.Dir, raw: []const u8) Error![]const u8 {
-        return rc.canonicalize(io, scratch, dir, raw);
-    }
-
-    /// The realpath of `dir` (cached, arena-owned) for re-relativizing canonical
-    /// paths, or null if the OS call failed (then canonical paths stay absolute).
-    fn dirRealBase(rc: *ResolveCache, io: Io, dir: Io.Dir) ?[]const u8 {
-        if (!rc.real_base_done) {
-            rc.real_base_done = true;
-            var buf: [std.fs.max_path_bytes]u8 = undefined;
-            if (dir.realPath(io, &buf)) |n| {
-                rc.real_base = rc.arena.dupe(u8, buf[0..n]) catch null;
-            } else |_| {}
-        }
-        return rc.real_base;
-    }
-
-    /// Canonicalize a resolved path to a stable file identity by resolving
-    /// symlinks (pnpm's isolated store links a package's real location under
-    /// `.pnpm/`; only through the realpath are its sibling deps reachable by the
-    /// upward `node_modules` walk). tsc keys files by realpath for exactly this
-    /// reason. The result is re-relativized against `dir`'s realpath so a
-    /// relative-rooted run/test keeps a relative path space. Determinism holds:
-    /// realpath is a deterministic, idempotent function of the filesystem; the
-    /// cached and uncached (`--no-resolve-cache`) legs both apply it. Only
-    /// `node_modules` paths are canonicalized — nothing else is symlinked into a
-    /// store, so user-file paths (and their diagnostic display) are untouched and
-    /// no realpath syscall is spent on them. One syscall per resolved
-    /// `node_modules` file (the resolve memo collapses repeats), never per probe
-    /// — and, with the `FsCache` enabled, one per resolved *directory* (the
-    /// package's whole symlink chain is shared by every file in it).
-    fn canonicalize(rc: *ResolveCache, io: Io, scratch: Allocator, dir: Io.Dir, raw: []const u8) Error![]const u8 {
-        if (std.mem.indexOf(u8, raw, "node_modules") == null) return rc.arena.dupe(u8, raw);
-        // A synthetic `exports`-blocked subpath names no on-disk file: today's
-        // `realPathFile` fails on it and the raw path is kept. Skip it before the
-        // per-directory realpath, which would happily canonicalize its (existing)
-        // parent and hand back a different path. Saves a doomed syscall too.
-        if (isBlockedSubpathPath(raw)) return rc.arena.dupe(u8, raw);
-        var buf: [std.fs.max_path_bytes]u8 = undefined;
-        const abs = if (rc.enabled)
-            (try rc.fs.realPathOfFile(io, dir, scratch, raw)) orelse return rc.arena.dupe(u8, raw)
-        else abs: {
-            const n = dir.realPathFile(io, raw, &buf) catch return rc.arena.dupe(u8, raw);
-            break :abs buf[0..n];
-        };
-        // Debug-only oracle for the per-directory realpath: it can only diverge
-        // from the direct call if the file's own last component is a symlink.
-        if (builtin.mode == .Debug and rc.enabled) {
-            var vbuf: [std.fs.max_path_bytes]u8 = undefined;
-            if (dir.realPathFile(io, raw, &vbuf)) |vn| {
-                std.debug.assert(std.mem.eql(u8, vbuf[0..vn], abs));
-            } else |_| {}
-        }
-        if (rc.dirRealBase(io, dir)) |b| {
-            if (abs.len > b.len + 1 and std.mem.startsWith(u8, abs, b) and abs[b.len] == '/') {
-                return rc.arena.dupe(u8, abs[b.len + 1 ..]);
-            }
-        }
-        return rc.arena.dupe(u8, abs);
-    }
-};
 
 // ===========================================================================
 // linking
@@ -2522,110 +2823,6 @@ fn stripQuotes(text: []const u8) []const u8 {
     return text;
 }
 
-/// Everything the serial link phase produces for the sealed program.
-pub const LinkResult = struct {
-    links: []const FileLinks,
-    sym_base: []const u32,
-    globals: Globals = .{},
-    merged: []const MergedSym = &.{},
-    ambient_exports: []const AmbientExport = &.{},
-    ambient_specs: []const Atom = &.{},
-    constit_keys: []const u32 = &.{},
-    constit_vals: []const u32 = &.{},
-    export_equals_atom: Atom = 0,
-};
-
-/// Build the sealed per-file link tables and the merged global table. Serial;
-/// results live in `arena`.
-pub fn link(
-    arena: Allocator,
-    gpa: Allocator,
-    io: Io,
-    interner: *Interner,
-    files: []const ProgFile,
-    allow_synthetic_default: bool,
-) Error!LinkResult {
-    var scratch_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer scratch_arena.deinit();
-    const scratch = scratch_arena.allocator();
-
-    var l: Linker = .{
-        .arena = arena,
-        .scratch = scratch,
-        .io = io,
-        .gpa = gpa,
-        .interner = interner,
-        .files = files,
-        .atom_default = interner.intern(io, gpa, "default") catch return Error.OutOfMemory,
-        .allow_synthetic_default = allow_synthetic_default,
-        .atom_export_equals = interner.intern(io, gpa, "export=") catch return Error.OutOfMemory,
-        .state = try scratch.alloc(u8, files.len),
-        .tables = try scratch.alloc(std.AutoArrayHashMapUnmanaged(Atom, Target), files.len),
-        .diags = try scratch.alloc(std.ArrayList(LinkDiag), files.len),
-    };
-    @memset(l.state, 0);
-    for (l.tables) |*t| t.* = .empty;
-    for (l.diags) |*d| d.* = .empty;
-
-    // Build every export table (deterministic file order).
-    for (0..files.len) |i| _ = try l.table(@intCast(i));
-    // Then the ambient/augmentation module registry, which import
-    // resolution and TS2307 suppression consult below.
-    try l.buildAmbient();
-
-    const out = try arena.alloc(FileLinks, files.len);
-    for (0..files.len) |i| {
-        const fid: FileId = @intCast(i);
-        try l.reportUnresolvedModules(fid);
-        try l.reportModuleGrammar(fid);
-
-        var locals: std.ArrayList(u32) = .empty;
-        var targets: std.ArrayList(Target) = .empty;
-        try l.linkImports(fid, &locals, &targets);
-        try sortByKeyU32(scratch, locals.items, targets.items);
-
-        // Seal the export table sorted by atom.
-        const t = &l.tables[i];
-        const n = t.count();
-        const atoms = try arena.alloc(Atom, n);
-        const etargets = try arena.alloc(Target, n);
-        @memcpy(atoms, t.keys());
-        @memcpy(etargets, t.values());
-        try sortByKeyU32(scratch, atoms, etargets);
-
-        out[i] = .{
-            .import_locals = try arena.dupe(u32, locals.items),
-            .import_targets = try arena.dupe(Target, targets.items),
-            .export_atoms = atoms,
-            .export_targets = etargets,
-            .diags = try arena.dupe(LinkDiag, l.diags[i].items),
-        };
-    }
-
-    // Cross-file global merge + module augmentation merge: fold
-    // every file's harvest slice and every `declare module` augmentation of a
-    // resolved real module. Needs the sealed export tables (`out`).
-    const sym_base = try computeSymBase(arena, files);
-    const gm = try mergeGlobals(arena, scratch, files, sym_base, out);
-
-    // Seal the ambient module export tables in registry order, so
-    // `Target.ambient_ns` payloads (assigned from `getIndex`) address them.
-    const amb = try arena.alloc(AmbientExport, l.ambient.count());
-    const amb_specs = try arena.alloc(Atom, l.ambient.count());
-    @memcpy(amb_specs, l.ambient.keys());
-    for (l.ambient.values(), 0..) |*tbl, i| {
-        const n = tbl.count();
-        const atoms = try arena.alloc(Atom, n);
-        const tgts = try arena.alloc(Target, n);
-        @memcpy(atoms, tbl.keys());
-        @memcpy(tgts, tbl.values());
-        try sortByKeyU32(scratch, atoms, tgts);
-        amb[i] = .{ .atoms = atoms, .targets = tgts };
-    }
-
-    return .{ .links = out, .sym_base = sym_base, .globals = gm.globals, .merged = gm.merged, .ambient_exports = amb, .ambient_specs = amb_specs, .constit_keys = gm.constit_keys, .constit_vals = gm.constit_vals, .export_equals_atom = l.atom_export_equals };
-}
-
 /// Sort parallel (key, value) arrays by key ascending. Export/import tables
 /// come out of an `AutoArrayHashMap` in insertion order (not nearly sorted),
 /// so use an O(n log n) sort over an index permutation (`scratch` holds the
@@ -2651,40 +2848,6 @@ fn sortByKeyU32(scratch: Allocator, keys: []u32, vals: []Target) Error!void {
 // ===========================================================================
 // triple-slash reference directives
 // ===========================================================================
-
-pub const RefKind = enum { path, types };
-/// A `/// <reference path=… />` / `<reference types=… />` directive; `spec`
-/// slices into the source. `lib=` references are ignored (built-in libs).
-pub const RefDirective = struct { kind: RefKind, spec: []const u8 };
-
-/// Scan the leading `///`-comment block of `src` for reference directives.
-/// tsc only honors them before the first token, so scanning stops at the
-/// first non-trivia character. Slices into `src` (no allocation of text).
-pub fn scanReferences(alloc: Allocator, src: []const u8) Error![]RefDirective {
-    var out: std.ArrayList(RefDirective) = .empty;
-    var i: usize = 0;
-    while (i < src.len) {
-        while (i < src.len and (src[i] == ' ' or src[i] == '\t' or src[i] == '\r' or src[i] == '\n')) i += 1;
-        if (i + 1 < src.len and src[i] == '/' and src[i + 1] == '/') {
-            const start = i;
-            while (i < src.len and src[i] != '\n') i += 1;
-            const line = src[start..i];
-            // Triple-slash only.
-            if (line.len >= 3 and line[2] == '/') {
-                if (parseReference(line[3..])) |d| try out.append(alloc, d);
-            }
-            continue;
-        }
-        if (i + 1 < src.len and src[i] == '/' and src[i + 1] == '*') {
-            i += 2;
-            while (i + 1 < src.len and !(src[i] == '*' and src[i + 1] == '/')) i += 1;
-            i = if (i + 1 < src.len) i + 2 else src.len;
-            continue;
-        }
-        break; // first real token — directives must precede it
-    }
-    return out.toOwnedSlice(alloc);
-}
 
 /// Parse the body of a `///` comment (text after the three slashes) into a
 /// reference directive, or null if it is not `<reference path|types=…/>`.
@@ -2728,7 +2891,7 @@ fn attrValue(s: []const u8, key: []const u8) ?[]const u8 {
 /// must run it through `ResolveCache.canonicalPath` (or call
 /// `ResolveCache.resolveRef`, which does both), or a symlinked package
 /// directory becomes a second copy of a file already in the graph.
-pub fn resolveReference(
+fn resolveReference(
     io: Io,
     alloc: Allocator,
     dir: Io.Dir,
@@ -2754,138 +2917,6 @@ pub fn resolveReference(
 // ===========================================================================
 // serial program builder (tests, tools; main.zig runs the parallel version)
 // ===========================================================================
-
-pub const BuildDiag = struct { path: []const u8, err: anyerror };
-
-pub const BuildResult = struct {
-    program: Program,
-    /// Entry files that failed to load.
-    load_failures: []const BuildDiag,
-};
-
-/// Serial wavefront: load, parse, bind and resolve transitively from
-/// `entries` (paths relative to `dir`), then link. Everything lives in
-/// `arena`.
-pub fn buildProgram(
-    arena: Allocator,
-    io: Io,
-    gpa: Allocator,
-    interner: *Interner,
-    dir: Io.Dir,
-    entries: []const []const u8,
-    lib_set: LibSet,
-    resolve_opts: ResolveOpts,
-    allow_synthetic_default: bool,
-) !BuildResult {
-    var scratch_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer scratch_arena.deinit();
-    const scratch = scratch_arena.allocator();
-    var rcache = ResolveCache.init(arena, true, resolve_opts);
-
-    var files: std.ArrayList(ProgFile) = .empty;
-    var path_ids: std.StringHashMapUnmanaged(FileId) = .empty;
-    var pending: std.ArrayList([]const u8) = .empty;
-    var failures: std.ArrayList(BuildDiag) = .empty;
-
-    // Inject the selected built-in lib blobs as the first entries (files 0..).
-    var lib_buf: [max_lib_files]LibFile = undefined;
-    for (libFiles(lib_set, &lib_buf)) |lf| {
-        try path_ids.put(scratch, lf.path, @intCast(pending.items.len));
-        try pending.append(scratch, lf.path);
-    }
-
-    for (entries) |e| {
-        const norm = try normalizePath(arena, e);
-        const gop = try path_ids.getOrPut(scratch, norm);
-        if (!gop.found_existing) {
-            gop.value_ptr.* = @intCast(files.items.len + pending.items.len);
-            try pending.append(scratch, norm);
-        }
-    }
-
-    var next: usize = 0;
-    while (next < pending.items.len) : (next += 1) {
-        const path = pending.items[next];
-        const bytes: []const u8 = if (libSourceFor(path)) |s|
-            s
-        else if (anyModuleSourceFor(path)) |s|
-            s
-        else
-            dir.readFileAlloc(io, path, arena, .limited(1 << 30)) catch |err| {
-                try failures.append(scratch, .{ .path = path, .err = err });
-                // Keep ids dense: substitute an empty file.
-                const tree = try arena.create(Ast);
-                tree.* = try parser.parse(arena, "");
-                const bound = try arena.create(Bind);
-                bound.* = try binder.bind(arena, io, gpa, interner, tree, "", parser.isDeclarationPath(path));
-                try files.append(arena, .{ .path = path, .src = "", .tree = tree, .bind = bound });
-                continue;
-            };
-        const tree = try arena.create(Ast);
-        tree.* = try parser.parseOpts(arena, bytes, parser.isJsxPath(path));
-        const bound = try arena.create(Bind);
-        bound.* = try binder.bind(arena, io, gpa, interner, tree, bytes, parser.isDeclarationPath(path));
-
-        // Triple-slash `/// <reference>` directives pull extra files into the
-        // program — not import bindings, just program inputs.
-        for (try scanReferences(scratch, bytes)) |ref| {
-            if (try rcache.resolveRef(io, scratch, dir, path, ref)) |resolved| {
-                const stable = try arena.dupe(u8, resolved);
-                const gop = try path_ids.getOrPut(scratch, stable);
-                if (!gop.found_existing) {
-                    gop.value_ptr.* = @intCast(pending.items.len);
-                    try pending.append(scratch, stable);
-                }
-            }
-        }
-
-        // Resolve this file's specifiers; discover new files.
-        var spec_atoms: std.ArrayList(Atom) = .empty;
-        var spec_files: std.ArrayList(FileId) = .empty;
-        var seen: std.AutoHashMapUnmanaged(Atom, void) = .empty;
-        for (bound.imports) |rec| {
-            try resolveOne(arena, scratch, io, &rcache, dir, interner, path, rec.module, &spec_atoms, &spec_files, &seen, &path_ids, &pending);
-        }
-        for (bound.exports) |rec| {
-            if (rec.module != 0) {
-                try resolveOne(arena, scratch, io, &rcache, dir, interner, path, rec.module, &spec_atoms, &spec_files, &seen, &path_ids, &pending);
-            }
-        }
-        sortSpecs(spec_atoms.items, spec_files.items);
-
-        try files.append(arena, .{
-            .path = path,
-            .src = bytes,
-            .tree = tree,
-            .bind = bound,
-            .specs = .{
-                .atoms = try arena.dupe(Atom, spec_atoms.items),
-                .files = try arena.dupe(FileId, spec_files.items),
-            },
-        });
-        spec_atoms.deinit(scratch);
-        spec_files.deinit(scratch);
-        seen.deinit(scratch);
-    }
-
-    const file_slice = try arena.dupe(ProgFile, files.items);
-    const lr = try link(arena, gpa, io, interner, file_slice, allow_synthetic_default);
-    return .{
-        .program = .{
-            .files = file_slice,
-            .sym_base = lr.sym_base,
-            .links = lr.links,
-            .globals = lr.globals,
-            .merged = lr.merged,
-            .ambient_exports = lr.ambient_exports,
-            .ambient_specs = lr.ambient_specs,
-            .constit_keys = lr.constit_keys,
-            .constit_vals = lr.constit_vals,
-            .export_equals_atom = lr.export_equals_atom,
-        },
-        .load_failures = try arena.dupe(BuildDiag, failures.items),
-    };
-}
 
 fn resolveOne(
     arena: Allocator,
