@@ -14980,16 +14980,38 @@ const Checker = struct {
     /// are not tracked (sound under-narrowing = pre-depth-N behavior).
     const max_ref_depth = 3;
 
-    /// One link in a reference path: either a dotted member (`.p`, property
-    /// atom in `atom`) or a constant element access (`[i]`, index in `index`).
-    /// Only *constant* integer indices are trackable — a variable index
-    /// (`arr[i]`) is not a stable reference, so `buildRefKey` rejects it. The
-    /// unused field is always 0 so two `PathElem`s hash/compare canonically as
-    /// part of an `AutoHashMap` key.
+    /// One link in a reference path: either a dotted member (`.p`) or a
+    /// constant element access (`[i]`). Only *constant* integer indices are
+    /// trackable — a variable index (`arr[i]`) is not a stable reference, so
+    /// `buildRefKey` rejects it.
+    ///
+    /// The two payloads are mutually exclusive by tag, so they share one u32
+    /// (`atom()` / `index()` assert the tag): the previous two-field form
+    /// carried a permanently-zero companion field and cost 12 bytes, which
+    /// `RefKey`'s `[3]PathElem` multiplied into a 48-byte `ref_keys` key.
+    /// Sharing makes it 8 (`RefQ` 48 -> 36). Equality is unchanged: a link was
+    /// already identified by (tag, the tag's payload), the other field being
+    /// pinned at 0, so the old and new representations are in bijection —
+    /// including the trailing default slots past `len`, which stay `{false, 0}`.
     const PathElem = struct {
         is_index: bool = false,
-        atom: Atom = 0,
-        index: u32 = 0,
+        /// Property atom when `is_index` is false, element index when true.
+        payload: u32 = 0,
+
+        fn member(a: Atom) PathElem {
+            return .{ .is_index = false, .payload = a };
+        }
+        fn element(i: u32) PathElem {
+            return .{ .is_index = true, .payload = i };
+        }
+        fn atom(pe: PathElem) Atom {
+            std.debug.assert(!pe.is_index);
+            return pe.payload;
+        }
+        fn index(pe: PathElem) u32 {
+            std.debug.assert(pe.is_index);
+            return pe.payload;
+        }
     };
 
     /// A narrowable reference: a bare identifier (`len == 0`) or a member
@@ -15063,11 +15085,11 @@ const Checker = struct {
             const d = c.tree.nodeData(n);
             if (tag == .member_expr or tag == .optional_member_expr) {
                 if (count >= max_ref_depth) return null; // too deep: not tracked
-                elems[count] = .{ .atom = try c.memberAtom(d.rhs) };
+                elems[count] = .member(try c.memberAtom(d.rhs));
             } else if (tag == .index_expr or tag == .optional_index_expr) {
                 const iv = c.constIndexOf(d.rhs) orelse return null; // variable index: untracked
                 if (count >= max_ref_depth) return null;
-                elems[count] = .{ .is_index = true, .index = iv };
+                elems[count] = .element(iv);
             } else break;
             count += 1;
             n = d.lhs;
@@ -15112,10 +15134,10 @@ const Checker = struct {
             if (pe.is_index) {
                 if (tag != .index_expr and tag != .optional_index_expr) return false;
                 const iv = c.constIndexOf(d.rhs) orelse return false;
-                if (iv != pe.index) return false;
+                if (iv != pe.index()) return false;
             } else {
                 if (tag != .member_expr and tag != .optional_member_expr) return false;
-                if ((try c.memberAtom(d.rhs)) != pe.atom) return false;
+                if ((try c.memberAtom(d.rhs)) != pe.atom()) return false;
             }
             n = d.lhs;
         }
