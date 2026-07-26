@@ -23,19 +23,20 @@ ROOT = os.path.dirname(HERE)
 
 # name, wall_ztsc, wall_tsgo (ms), rss_ztsc, rss_tsgo (MB)
 # Both tools at their default 4 checkers.
-# Re-measured 2026-07-16 after ztsc's default flipped to type-check its
-# embedded lib, matching tsc/tsgo (which check their default lib at their
-# defaults). Both tools now check their default lib — defaults are apples to
-# apples, no parity flag needed.
+# Re-measured 2026-07-25 at commit 881f77d, after the check-phase memoization
+# fix, the arena-hygiene pass, packed small-file loading, the resolver caches
+# and the duplicate-file dedupe. Every ztsc RSS row fell; the wall floor on the
+# smallest packages rose with the two-phase resolver. Both tools check their
+# default lib at their defaults — apples to apples, no parity flag needed.
 DATA = [
-    ("@types/node",        19.0,  44.9, 18.8, 102.4),
-    ("@types/react",       26.7, 241.4, 26.8, 183.5),
-    ("drizzle-orm",        23.9, 248.8, 23.7, 273.8),
-    ("hono",               31.0, 172.3, 31.2, 155.8),
-    ("@sinclair/typebox",  16.3,  47.7, 16.7,  78.1),
-    ("ajv",                10.2,  23.5, 11.6,  49.8),
-    ("zod",                26.7, 153.6, 25.1, 136.9),
-    ("chalk",               7.5,  18.2,  7.4,  43.7),
+    ("@types/node",        14.5,  45.7, 17.3, 102.4),
+    ("@types/react",       28.4, 243.4, 22.7, 185.4),
+    ("drizzle-orm",        15.0, 232.4, 14.6, 272.4),
+    ("hono",               32.0, 171.2, 24.5, 153.3),
+    ("@sinclair/typebox",  18.3,  47.1, 19.6,  77.7),
+    ("ajv",                13.1,  23.4, 11.5,  49.8),
+    ("zod",                27.7, 154.2, 21.2, 139.7),
+    ("chalk",               7.8,  18.6,  7.8,  43.7),
 ]
 
 RSS_MAX_PX = 290

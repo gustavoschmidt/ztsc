@@ -24,7 +24,7 @@
 <div class="wrap">
 
 <header class="hero">
-  <p class="eyebrow">ztsc 0.0.1-dev · 15 source files · 30,772 lines of zig 0.16 · real typescript 7.0.2 esnext + dom lib embedded</p>
+  <p class="eyebrow">ztsc 0.0.1-dev · 19 source files · 40,528 lines of zig 0.16 · real typescript 7.0.2 esnext + dom lib embedded</p>
   <h1>How ZTSC works</h1>
   <p class="sub">A guided tour of the <strong>Zig TypeScript Checker</strong> — a type checker (no JS emit)
   for a strict-mode TypeScript subset. The whole design serves one bet: <em>memory is where a
@@ -33,17 +33,17 @@
   <div class="stats">
     <div class="stat">
       <div class="k">wall clock · @types/node</div>
-      <div class="v">19&thinsp;<small>ms</small></div>
-      <div class="c">tsgo 7.0.2 takes 45&thinsp;ms on the same 49.6k lines of declarations — and ztsc is faster on all eight benchmark packages</div>
+      <div class="v">15&thinsp;<small>ms</small></div>
+      <div class="c">tsgo 7.0.2 takes 46&thinsp;ms on the same 49.6k lines of declarations — and ztsc is faster on all eight benchmark packages</div>
     </div>
     <div class="stat">
       <div class="k">peak RSS · @types/node</div>
-      <div class="v">19&thinsp;<small>MB</small></div>
-      <div class="c">18% of tsgo (102&thinsp;MB); across eight real packages ztsc runs at 9–23% of tsgo's peak, against a ≤&thinsp;50% headline goal</div>
+      <div class="v">17&thinsp;<small>MB</small></div>
+      <div class="c">17% of tsgo (102&thinsp;MB); across eight real packages ztsc runs at 5–25% of tsgo's peak, against a ≤&thinsp;50% headline goal</div>
     </div>
     <div class="stat">
       <div class="k">memory per ast node</div>
-      <div class="v">16.06&thinsp;<small>B</small></div>
+      <div class="v">16.24&thinsp;<small>B</small></div>
       <div class="c">pointer-based ASTs (tsc, tsgo) run 100–200+ bytes per node</div>
     </div>
     <div class="stat">
@@ -95,12 +95,12 @@
 
       <rect class="box" x="205" y="84" width="180" height="42"/>
       <text class="t12" x="217" y="102">load <tspan class="mut">(mmap)</tspan></text>
-      <text class="t11 mut" x="217" y="117">7.4 ms · 380 MB/s</text>
+      <text class="t11 mut" x="217" y="117">7.4 ms · 381 MB/s</text>
       <line class="flow" x1="295" y1="126" x2="295" y2="138" marker-end="url(#arr)"/>
 
       <rect class="box" x="205" y="140" width="180" height="42"/>
       <text class="t12" x="217" y="158">scan</text>
-      <text class="t11 mut" x="217" y="173">9.4 ms · 11.4 M lines/s</text>
+      <text class="t11 mut" x="217" y="173">9.2 ms · 11.7 M lines/s</text>
       <line class="flow" x1="295" y1="182" x2="295" y2="194" marker-end="url(#arr)"/>
 
       <rect class="box" x="205" y="196" width="180" height="42"/>
@@ -110,7 +110,7 @@
 
       <rect class="box" x="205" y="252" width="180" height="42"/>
       <text class="t12" x="217" y="270">bind <tspan class="mut">→ symbols, flow</tspan></text>
-      <text class="t11 mut" x="217" y="285">32.6 ms · then sealed</text>
+      <text class="t11 mut" x="217" y="285">35.2 ms · then sealed</text>
 
       <!-- discovery loop -->
       <path class="flow" d="M 205,273 C 186,273 186,105 202,105" marker-end="url(#arr)"/>
@@ -121,7 +121,7 @@
       <line class="flow" x1="414" y1="184" x2="452" y2="184" marker-end="url(#arr)"/>
       <rect class="box" x="456" y="156" width="94" height="56"/>
       <text class="t12" x="503" y="180" text-anchor="middle">resolve</text>
-      <text class="t11 mut" x="503" y="196" text-anchor="middle">1.4 ms</text>
+      <text class="t11 mut" x="503" y="196" text-anchor="middle">1.9 ms</text>
       <line class="flow" x1="550" y1="184" x2="574" y2="184" marker-end="url(#arr)"/>
       <rect class="box" x="578" y="156" width="94" height="56"/>
       <text class="t12" x="625" y="180" text-anchor="middle">link</text>
@@ -148,15 +148,15 @@
       <text class="t12" x="742" y="310">checker 3</text>
       <text class="t11 mut" x="742" y="326">own type store + caches</text>
 
-      <text class="t11 mut" x="822" y="366" text-anchor="middle">check · 20.9 ms aggregate · --checkers=N, default 4</text>
+      <text class="t11 mut" x="822" y="366" text-anchor="middle">check · 26.4 ms aggregate · --checkers=N, default 4</text>
       <text class="t11 mut" x="822" y="22" text-anchor="middle">files partitioned by cost, read sealed data lock-free</text>
     </svg>
     </div>
     <figcaption>Phase timings from one <code>--timing</code> run on the multi corpus (93k lines,
-    re-measured 2026-07-16 with the real lib — now sharded into 12 blobs — loaded):
-    <strong>32.7&thinsp;ms end to end</strong>.
+    re-measured 2026-07-25 with the real lib — now sharded into 12 blobs — loaded):
+    <strong>38.5&thinsp;ms end to end</strong>.
     Per-phase ms are aggregate time-in-phase summed across the 10-worker pool, so the overlapping
-    front-end phases sum to more than the wall; check is the largest single phase. Diagnostics are
+    front-end phases sum to more than the wall; bind is the largest single phase. Diagnostics are
     printed per file in discovery order, position-sorted — <strong>byte-identical output for any
     N</strong>.</figcaption>
   </figure>
@@ -184,7 +184,7 @@
       <tr><td>scan</td><td><code>Tokens</code></td><td><code>scanner.zig</code></td><td>SoA token stream: tags + start offsets</td><td>parse, everyone via <code>Ast</code></td></tr>
       <tr><td>parse</td><td><code>Ast</code></td><td><code>ast.zig</code></td><td>SoA nodes + <code>extra_data</code> + parse diagnostics</td><td>bind, check</td></tr>
       <tr><td>bind</td><td><code>Bind</code></td><td><code>binder.zig</code></td><td>symbols, scopes, flow graph, import/export records</td><td>link, check</td></tr>
-      <tr><td>resolve + link</td><td><code>Program</code></td><td><code>modules.zig</code></td><td>all files + link tables + merged globals + ambient modules</td><td>check (×N, lock-free)</td></tr>
+      <tr><td>resolve + link</td><td><code>Program</code></td><td><code>resolve.zig</code> / <code>modules.zig</code></td><td>all files + link tables + merged globals + ambient modules</td><td>check (×N, lock-free)</td></tr>
       <tr><td>check</td><td><code>Store</code> + <code>Diag</code>s</td><td><code>types.zig</code> / <code>checker.zig</code></td><td>hash-consed types (per checker) + coded diagnostics</td><td>report</td></tr>
       <tr><td>report</td><td>terminal output</td><td><code>render.zig</code></td><td>tsc-style excerpts rendered from <code>Diag</code> + <code>Source</code></td><td>you</td></tr>
     </tbody>
@@ -283,7 +283,7 @@ pub const Ast = struct {
   declarator node. When the checker later asks "what is <code>n</code> here?", it walks this
   flow chain backwards to the assignment.</p>
 
-  <h3>resolve + link → Program (modules.zig)</h3>
+  <h3>resolve + link → Program (resolve.zig, modules.zig)</h3>
   <pre><code>pub const ProgFile = struct {      // one file's sealed front-end artifacts
     path: []const u8,
     src:  []const u8,
@@ -348,37 +348,41 @@ pub const Program = struct {
   And each struct stores only what its stage learned: positions live in <code>Tokens</code>,
   structure in <code>Ast</code>, names in <code>Bind</code>, wiring in <code>Program</code>,
   meaning in <code>Store</code> — nothing is duplicated forward, which is why the whole 93k-line
-  corpus fits in 17.8&thinsp;MB of heap.</p>
+  corpus fits in 18.3&thinsp;MB of heap.</p>
 </section>
 
 <!-- ============================================================ -->
 <section>
   <p class="eyebrow"><span class="n">03</span> · source map</p>
   <h2>Where everything lives</h2>
-  <p>Fifteen files under <code>src/</code>, one responsibility each, ordered here as data flows
+  <p>Nineteen files under <code>src/</code>, one responsibility each, ordered here as data flows
   through them. The checker is the biggest file by far — types and their relations are where a
-  type checker earns its keep — and it has grown to 11k lines as the type-level language
+  type checker earns its keep — and it has grown to 18k lines as the type-level language
   (conditional, mapped, template-literal types) landed.</p>
 
   <div class="tablewrap">
   <table>
     <thead><tr><th>file</th><th>role</th><th class="num">lines</th><th></th></tr></thead>
     <tbody>
-      <tr><td><code>main.zig</code></td><td>CLI driver, thread pool, single-owner discovery scheduler, <code>--timing</code>/<code>--memory</code>/<code>--census</code></td><td class="num">1,617</td><td><span class="locbar" style="width:14px"></span></td></tr>
-      <tr><td><code>tsconfig.zig</code></td><td>tsconfig.json subset: <code>files</code>, <code>include</code>/<code>exclude</code> globs, <code>paths</code></td><td class="num">1,023</td><td><span class="locbar" style="width:9px"></span></td></tr>
-      <tr><td><code>source.zig</code></td><td>file loading via mmap, line tables, spans</td><td class="num">212</td><td><span class="locbar" style="width:2px"></span></td></tr>
-      <tr><td><code>intern.zig</code></td><td>global string interner: text → <code>Atom</code> (u32), sharded, thread-safe</td><td class="num">238</td><td><span class="locbar" style="width:2px"></span></td></tr>
-      <tr><td><code>scanner.zig</code></td><td>tokenizer — full TS token set incl. JSX, fuzzed, never crashes</td><td class="num">1,427</td><td><span class="locbar" style="width:13px"></span></td></tr>
-      <tr><td><code>ast.zig</code></td><td>struct-of-arrays node storage, <code>extra_data</code>, node tags</td><td class="num">1,326</td><td><span class="locbar" style="width:12px"></span></td></tr>
-      <tr><td><code>parser.zig</code></td><td>recursive descent → AST, error recovery, out-of-subset → <code>unsupported</code> nodes</td><td class="num">4,894</td><td><span class="locbar" style="width:43px"></span></td></tr>
-      <tr><td><code>binder.zig</code></td><td>symbols, scope tree, control-flow graph, global-contribution slices</td><td class="num">3,612</td><td><span class="locbar" style="width:32px"></span></td></tr>
-      <tr><td><code>modules.zig</code></td><td>resolution + memo cache, linker, cross-file merging, ambient modules, <code>///</code> references, embedded lib</td><td class="num">2,070</td><td><span class="locbar" style="width:18px"></span></td></tr>
-      <tr><td><code>types.zig</code></td><td>type representation, <code>TypeId</code>, hash-consing, canonical unions, frozen-base/overlay split</td><td class="num">1,567</td><td><span class="locbar" style="width:14px"></span></td></tr>
+      <tr><td><code>main.zig</code></td><td>CLI driver, thread pool, single-owner discovery scheduler, phase timers and counters</td><td class="num">1,670</td><td><span class="locbar" style="width:9px"></span></td></tr>
+      <tr><td><code>tsconfig.zig</code></td><td>tsconfig.json subset: <code>files</code>, <code>include</code>/<code>exclude</code> globs, <code>paths</code></td><td class="num">1,909</td><td><span class="locbar" style="width:10px"></span></td></tr>
+      <tr><td><code>source.zig</code></td><td>file loading via mmap, packed segments for small files, line tables, spans</td><td class="num">362</td><td><span class="locbar" style="width:2px"></span></td></tr>
+      <tr><td><code>intern.zig</code></td><td>global string interner: text → <code>Atom</code> (u32), sharded, thread-safe</td><td class="num">358</td><td><span class="locbar" style="width:2px"></span></td></tr>
+      <tr><td><code>scanner.zig</code></td><td>tokenizer — full TS token set incl. JSX, fuzzed, never crashes</td><td class="num">1,431</td><td><span class="locbar" style="width:8px"></span></td></tr>
+      <tr><td><code>ast.zig</code></td><td>struct-of-arrays node storage, <code>extra_data</code>, node tags</td><td class="num">1,334</td><td><span class="locbar" style="width:7px"></span></td></tr>
+      <tr><td><code>parser.zig</code></td><td>recursive descent → AST, error recovery, out-of-subset → <code>unsupported</code> nodes</td><td class="num">5,045</td><td><span class="locbar" style="width:27px"></span></td></tr>
+      <tr><td><code>binder.zig</code></td><td>symbols, scope tree, control-flow graph, global-contribution slices</td><td class="num">3,661</td><td><span class="locbar" style="width:20px"></span></td></tr>
+      <tr><td><code>paths.zig</code></td><td>lexical path predicates and algebra — pure string work, no filesystem access</td><td class="num">214</td><td><span class="locbar" style="width:1px"></span></td></tr>
+      <tr><td><code>resolve.zig</code></td><td>specifier → file path: bundler-style lookup, <code>exports</code> maps, <code>///</code> references, resolution + filesystem caches</td><td class="num">1,660</td><td><span class="locbar" style="width:9px"></span></td></tr>
+      <tr><td><code>modules.zig</code></td><td>the program contract — <code>FileId</code>, <code>Program</code>, <code>ProgFile</code> — plus the linker: export/import tables, cross-file merging, ambient modules</td><td class="num">1,563</td><td><span class="locbar" style="width:8px"></span></td></tr>
+      <tr><td><code>libs.zig</code></td><td>embedded lib shards: <code>lib</code>-list → blob set, synthetic paths, atom seeding</td><td class="num">247</td><td><span class="locbar" style="width:1px"></span></td></tr>
+      <tr><td><code>types.zig</code></td><td>type representation, <code>TypeId</code>, hash-consing, canonical unions, frozen-base/overlay split</td><td class="num">1,604</td><td><span class="locbar" style="width:9px"></span></td></tr>
       <tr><td><code>zeropage.zig</code></td><td>demand-zeroed fixed arrays over <code>MAP_ANONYMOUS</code> — backs the checkers' per-symbol state</td><td class="num">106</td><td><span class="locbar" style="width:1px"></span></td></tr>
-      <tr class="hl"><td><code>checker.zig</code></td><td>assignability, inference, narrowing, generics, conditional/mapped/template types, JSX — the semantics</td><td class="num">11,269</td><td><span class="locbar" style="width:100px"></span></td></tr>
-      <tr><td><code>diagnostics.zig</code></td><td>front-end error codes (tsc-compatible where feasible)</td><td class="num">177</td><td><span class="locbar" style="width:2px"></span></td></tr>
-      <tr><td><code>render.zig</code></td><td>pretty tsc-style output: excerpts, carets, colors</td><td class="num">272</td><td><span class="locbar" style="width:2px"></span></td></tr>
-      <tr><td><code>root.zig</code></td><td>library root — re-exports the modules above</td><td class="num">35</td><td><span class="locbar" style="width:1px"></span></td></tr>
+      <tr class="hl"><td><code>checker.zig</code></td><td>assignability, inference, narrowing, generics, conditional/mapped/template types, JSX — the semantics</td><td class="num">18,446</td><td><span class="locbar" style="width:100px"></span></td></tr>
+      <tr><td><code>diagnostics.zig</code></td><td>front-end error codes (tsc-compatible where feasible)</td><td class="num">177</td><td><span class="locbar" style="width:1px"></span></td></tr>
+      <tr><td><code>report.zig</code></td><td>pure formatting for <code>--timing</code>/<code>--memory</code>/<code>--census</code> — measurement stays in main.zig</td><td class="num">426</td><td><span class="locbar" style="width:2px"></span></td></tr>
+      <tr><td><code>render.zig</code></td><td>pretty tsc-style output: excerpts, carets, colors</td><td class="num">272</td><td><span class="locbar" style="width:1px"></span></td></tr>
+      <tr><td><code>root.zig</code></td><td>library root — re-exports the modules above</td><td class="num">43</td><td><span class="locbar" style="width:1px"></span></td></tr>
     </tbody>
   </table>
   </div>
@@ -398,7 +402,9 @@ pub const Program = struct {
   constructs. <code>bench/</code> holds the corpus generator, the real-package fetcher
   (<code>fetch_real.sh</code>) and the end-to-end harnesses; <code>test/</code> holds the
   conformance runner with 622 differential cases against the pinned native tsgo 7.0.2. A good reading order for the
-  code is exactly the table above, top to bottom.</p>
+  code is exactly the table above, top to bottom; <code>ARCHITECTURE.md</code> at the repo root
+  states the contract those files are held to — a functional core of pure phase functions around
+  an imperative shell (<code>main.zig</code>) that owns every thread, timer and arena.</p>
 </section>
 
 <!-- ============================================================ -->
@@ -668,7 +674,7 @@ pub const Program = struct {
   <p>Why this wins against tsgo specifically: Go's collector needs heap headroom (typically
   ~2&times; live data), and its AST/type objects carry per-object headers and pointers. ZTSC's live
   data <em>is</em> its footprint — the entire heap (all arenas plus the interner) for the 93k-line
-  corpus is <strong>17.8&thinsp;MB, about 190 bytes per source line</strong>, all-in. That figure
+  corpus is <strong>18.3&thinsp;MB, about 178 bytes per source line</strong>, all-in. That figure
   used to be 45.5&thinsp;MB: a dedicated debt-paydown pass (seal the parser's output into exact-size arrays
   instead of stranding doubling-realloc slack in the arena, drop a duplicate token scan, reset the
   resolution scratch per file) cut arena heap by more than half without touching any per-structure
@@ -709,17 +715,17 @@ pub const Program = struct {
 
   <figure>
     <div class="figbox">
-    <svg viewBox="0 0 940 250" role="img" aria-label="Bar chart of check-phase time versus number of checker instances on the multi corpus: 75.4 milliseconds at N equals 1, 38.2 at 2, 20.9 at 4, 16.7 at 8. Duplicated-type overhead grows from 7 to 23 percent.">
+    <svg viewBox="0 0 940 250" role="img" aria-label="Bar chart of check-phase time versus number of checker instances on the multi corpus: 84.7 milliseconds at N equals 1, 44.9 at 2, 24.3 at 4, 21.8 at 8. Duplicated-type overhead grows from 7 to 23 percent.">
       <text class="t12 dim" x="20" y="26">check-phase time vs --checkers=N · multi corpus, 93k lines, real lib loaded</text>
       <line x1="130" y1="190" x2="790" y2="190" stroke="var(--base)"/>
-      <path fill="var(--c-ztsc)" data-tip="N=1 · 75.4 ms · 21,334 types" d="M150,45 L226,45 Q230,45 230,49 L230,190 L150,190 L150,49 Q150,45 154,45 Z"/>
-      <path fill="var(--c-ztsc)" data-tip="N=2 · 38.2 ms · +7.2% types vs N=1" d="M310,116 L386,116 Q390,116 390,120 L390,190 L310,190 L310,120 Q310,116 314,116 Z"/>
-      <path fill="var(--c-ztsc)" data-tip="N=4 · 20.9 ms · +15.5% types vs N=1" d="M470,150 L546,150 Q550,150 550,154 L550,190 L470,190 L470,154 Q470,150 474,150 Z"/>
-      <path fill="var(--c-ztsc)" data-tip="N=8 · 16.7 ms · +23.2% types vs N=1" d="M630,158 L706,158 Q710,158 710,162 L710,190 L630,190 L630,162 Q630,158 634,158 Z"/>
-      <text class="barlabel" x="190" y="37" text-anchor="middle">75.4 ms</text>
-      <text class="barlabel" x="350" y="108" text-anchor="middle">38.2 ms</text>
-      <text class="barlabel" x="510" y="142" text-anchor="middle">20.9 ms</text>
-      <text class="barlabel" x="670" y="150" text-anchor="middle">16.7 ms</text>
+      <path fill="var(--c-ztsc)" data-tip="N=1 · 84.7 ms · 21,335 types" d="M150,45 L226,45 Q230,45 230,49 L230,190 L150,190 L150,49 Q150,45 154,45 Z"/>
+      <path fill="var(--c-ztsc)" data-tip="N=2 · 44.9 ms · +7.2% types vs N=1" d="M310,113 L386,113 Q390,113 390,117 L390,190 L310,190 L310,117 Q310,113 314,113 Z"/>
+      <path fill="var(--c-ztsc)" data-tip="N=4 · 24.3 ms · +15.5% types vs N=1" d="M470,148 L546,148 Q550,148 550,152 L550,190 L470,190 L470,152 Q470,148 474,148 Z"/>
+      <path fill="var(--c-ztsc)" data-tip="N=8 · 21.8 ms · +23.3% types vs N=1" d="M630,153 L706,153 Q710,153 710,157 L710,190 L630,190 L630,157 Q630,153 634,153 Z"/>
+      <text class="barlabel" x="190" y="37" text-anchor="middle">84.7 ms</text>
+      <text class="barlabel" x="350" y="105" text-anchor="middle">44.9 ms</text>
+      <text class="barlabel" x="510" y="140" text-anchor="middle">24.3 ms</text>
+      <text class="barlabel" x="670" y="145" text-anchor="middle">21.8 ms</text>
       <text class="t11 dim" x="190" y="210" text-anchor="middle">N=1</text>
       <text class="t11 dim" x="350" y="210" text-anchor="middle">N=2</text>
       <text class="t11 dim" x="510" y="210" text-anchor="middle">N=4 (default)</text>
@@ -727,16 +733,16 @@ pub const Program = struct {
       <text class="t11 mut" x="190" y="228" text-anchor="middle">— dup types</text>
       <text class="t11 mut" x="350" y="228" text-anchor="middle">+7.2% dup types</text>
       <text class="t11 mut" x="510" y="228" text-anchor="middle">+15.5% dup types</text>
-      <text class="t11 mut" x="670" y="228" text-anchor="middle">+23.2% dup types</text>
+      <text class="t11 mut" x="670" y="228" text-anchor="middle">+23.3% dup types</text>
     </svg>
     </div>
-    <figcaption>Near-linear speedup to N=4 (3.6×), tapering at N=8 (4.5×) — measured with
+    <figcaption>Near-linear speedup to N=4 (3.5×), tapering at N=8 (3.9×) — measured with
     <code>--skip-default-lib-check</code> so the numbers isolate user-code check time (the
     embedded lib, which the default now type-checks, is excluded here so the scaling shape
     isn't masked by fixed lib cost). The duplicated types stay under a quarter of the
-    type arena even at N=8 — and the whole type arena is under 1&thinsp;MB, noise against ~55&thinsp;MB
+    type arena even at N=8 — and the whole type arena is under 1&thinsp;MB, noise against ~46&thinsp;MB
     of process RSS. Since the demand-paged right-sizing, RSS doesn't even grow monotonically with N: the
-    high-water mark is N=4 (~55&thinsp;MB), while N=8 (~49&thinsp;MB) sits below the N=1 level (~51&thinsp;MB).
+    high-water mark is N=4 (~46&thinsp;MB), and N=8 (~45&thinsp;MB) sits below it.
     N=4 stays the default — it matches tsgo's, so defaults-vs-defaults is apples to apples —
     and <code>--checkers=8</code> remains available for the extra speed.</figcaption>
   </figure>
@@ -788,7 +794,7 @@ pub const Program = struct {
   <p>The benchmark moved from synthetic corpora to <strong>real, published packages</strong>:
   <code>bench/fetch_real.sh</code> vendors each package's shipped <code>.d.ts</code> at a
   pinned version, writes a strict <code>tsconfig.json</code> into it, and both tools check
-  identical inputs through <code>-p</code>. Measured 2026-07-16 on Apple M4 (10 cores,
+  identical inputs through <code>-p</code>. Measured 2026-07-25 on Apple M4 (10 cores,
   32&thinsp;GB): ztsc 0.0.1-dev (ReleaseFast, native binary) vs <strong>tsgo 7.0.2</strong> (the
   native arm64 TypeScript 7 compiler, invoked directly — no Node host in the measurement). Wall clock is the median of 11 runs timed with a monotonic nanosecond timer around the
   whole process — so small-package ratios are real, not timer rounding; peak RSS is the median
@@ -797,7 +803,7 @@ pub const Program = struct {
 
   <figure>
     <div class="figbox">
-    <svg viewBox="0 0 940 482" role="img" aria-label="Two-panel grouped bar chart across eight real packages at the default four checkers. Left panel, peak resident memory: ztsc uses 7 to 31 megabytes, tsgo 44 to 274 megabytes &#8212; ztsc is 9 to 23 percent of tsgo on every package. Right panel, wall clock: ztsc takes 8 to 31 milliseconds, tsgo 18 to 249 milliseconds &#8212; ztsc is 10 to 43 percent of tsgo's time.">
+    <svg viewBox="0 0 940 482" role="img" aria-label="Two-panel grouped bar chart across eight real packages at the default four checkers. Left panel, peak resident memory: ztsc uses 8 to 25 megabytes, tsgo 44 to 272 megabytes &#8212; ztsc is 5 to 25 percent of tsgo on every package. Right panel, wall clock: ztsc takes 8 to 32 milliseconds, tsgo 19 to 243 milliseconds &#8212; ztsc is 6 to 56 percent of tsgo's time.">
       <rect x="20" y="12" width="12" height="12" rx="2" fill="var(--c-ztsc)"/>
       <text class="t11 mut" x="38" y="22">ztsc</text>
       <rect x="78" y="12" width="12" height="12" rx="2" fill="var(--c-tsgo)"/>
@@ -807,94 +813,94 @@ pub const Program = struct {
       <line class="hairv" x1="590" y1="34" x2="590" y2="442"/>
 
       <text class="t12 dim" x="195" y="64" text-anchor="end">@types/node</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 18.8 MB · 18% of tsgo" x="210" y="44" width="20" height="14" rx="2"/>
-      <text class="barlabel" x="238" y="55">19 <tspan class="acc">· 18%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 102.4 MB" x="210" y="61" width="108" height="14" rx="2"/>
-      <text class="barlabel" x="326" y="72">102</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 19.0 ms · 42% of tsgo" x="620" y="44" width="21" height="14" rx="2"/>
-      <text class="barlabel" x="649" y="55">19 <tspan class="acc">· 42%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 44.9 ms" x="620" y="61" width="49" height="14" rx="2"/>
-      <text class="barlabel" x="677" y="72">45</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 17.3 MB · 17% of tsgo" x="210" y="44" width="18" height="14" rx="2"/>
+      <text class="barlabel" x="236" y="55">17 <tspan class="acc">· 17%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 102.4 MB" x="210" y="61" width="109" height="14" rx="2"/>
+      <text class="barlabel" x="327" y="72">102</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 14.5 ms · 32% of tsgo" x="620" y="44" width="16" height="14" rx="2"/>
+      <text class="barlabel" x="644" y="55">15 <tspan class="acc">· 32%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 45.7 ms" x="620" y="61" width="51" height="14" rx="2"/>
+      <text class="barlabel" x="679" y="72">46</text>
       <text class="t12 dim" x="195" y="116" text-anchor="end">@types/react</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 26.8 MB · 15% of tsgo" x="210" y="96" width="28" height="14" rx="2"/>
-      <text class="barlabel" x="246" y="107">27 <tspan class="acc">· 15%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 183.5 MB" x="210" y="113" width="194" height="14" rx="2"/>
-      <text class="barlabel" x="412" y="124">184</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 26.7 ms · 11% of tsgo" x="620" y="96" width="29" height="14" rx="2"/>
-      <text class="barlabel" x="657" y="107">27 <tspan class="acc">· 11%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 241.4 ms" x="620" y="113" width="262" height="14" rx="2"/>
-      <text class="barlabel" x="890" y="124">241</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 22.7 MB · 12% of tsgo" x="210" y="96" width="24" height="14" rx="2"/>
+      <text class="barlabel" x="242" y="107">23 <tspan class="acc">· 12%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 185.4 MB" x="210" y="113" width="197" height="14" rx="2"/>
+      <text class="barlabel" x="415" y="124">185</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 28.4 ms · 12% of tsgo" x="620" y="96" width="32" height="14" rx="2"/>
+      <text class="barlabel" x="660" y="107">28 <tspan class="acc">· 12%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 243.4 ms" x="620" y="113" width="270" height="14" rx="2"/>
+      <text class="barlabel" x="898" y="124">243</text>
       <text class="t12 dim" x="195" y="168" text-anchor="end">drizzle-orm</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 23.7 MB · 9% of tsgo" x="210" y="148" width="25" height="14" rx="2"/>
-      <text class="barlabel" x="243" y="159">24 <tspan class="acc">· 9%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 273.8 MB" x="210" y="165" width="290" height="14" rx="2"/>
-      <text class="barlabel" x="508" y="176">274</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 23.9 ms · 10% of tsgo" x="620" y="148" width="26" height="14" rx="2"/>
-      <text class="barlabel" x="654" y="159">24 <tspan class="acc">· 10%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 248.8 ms" x="620" y="165" width="270" height="14" rx="2"/>
-      <text class="barlabel" x="898" y="176">249</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 14.6 MB · 5% of tsgo" x="210" y="148" width="16" height="14" rx="2"/>
+      <text class="barlabel" x="234" y="159">15 <tspan class="acc">· 5%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 272.4 MB" x="210" y="165" width="290" height="14" rx="2"/>
+      <text class="barlabel" x="508" y="176">272</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 15.0 ms · 6% of tsgo" x="620" y="148" width="17" height="14" rx="2"/>
+      <text class="barlabel" x="645" y="159">15 <tspan class="acc">· 6%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 232.4 ms" x="620" y="165" width="258" height="14" rx="2"/>
+      <text class="barlabel" x="886" y="176">232</text>
       <text class="t12 dim" x="195" y="220" text-anchor="end">hono</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 31.2 MB · 20% of tsgo" x="210" y="200" width="33" height="14" rx="2"/>
-      <text class="barlabel" x="251" y="211">31 <tspan class="acc">· 20%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 155.8 MB" x="210" y="217" width="165" height="14" rx="2"/>
-      <text class="barlabel" x="383" y="228">156</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 31.0 ms · 18% of tsgo" x="620" y="200" width="34" height="14" rx="2"/>
-      <text class="barlabel" x="662" y="211">31 <tspan class="acc">· 18%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 172.3 ms" x="620" y="217" width="187" height="14" rx="2"/>
-      <text class="barlabel" x="815" y="228">172</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 24.5 MB · 16% of tsgo" x="210" y="200" width="26" height="14" rx="2"/>
+      <text class="barlabel" x="244" y="211">25 <tspan class="acc">· 16%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 153.3 MB" x="210" y="217" width="163" height="14" rx="2"/>
+      <text class="barlabel" x="381" y="228">153</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 32.0 ms · 19% of tsgo" x="620" y="200" width="35" height="14" rx="2"/>
+      <text class="barlabel" x="663" y="211">32 <tspan class="acc">· 19%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 171.2 ms" x="620" y="217" width="190" height="14" rx="2"/>
+      <text class="barlabel" x="818" y="228">171</text>
       <text class="t12 dim" x="195" y="272" text-anchor="end">@sinclair/typebox</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 16.7 MB · 21% of tsgo" x="210" y="252" width="18" height="14" rx="2"/>
-      <text class="barlabel" x="236" y="263">17 <tspan class="acc">· 21%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 78.1 MB" x="210" y="269" width="83" height="14" rx="2"/>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 19.6 MB · 25% of tsgo" x="210" y="252" width="21" height="14" rx="2"/>
+      <text class="barlabel" x="239" y="263">20 <tspan class="acc">· 25%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 77.7 MB" x="210" y="269" width="83" height="14" rx="2"/>
       <text class="barlabel" x="301" y="280">78</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 16.3 ms · 34% of tsgo" x="620" y="252" width="18" height="14" rx="2"/>
-      <text class="barlabel" x="646" y="263">16 <tspan class="acc">· 34%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 47.7 ms" x="620" y="269" width="52" height="14" rx="2"/>
-      <text class="barlabel" x="680" y="280">48</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 18.3 ms · 39% of tsgo" x="620" y="252" width="20" height="14" rx="2"/>
+      <text class="barlabel" x="648" y="263">18 <tspan class="acc">· 39%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 47.1 ms" x="620" y="269" width="52" height="14" rx="2"/>
+      <text class="barlabel" x="680" y="280">47</text>
       <text class="t12 dim" x="195" y="324" text-anchor="end">ajv</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 11.6 MB · 23% of tsgo" x="210" y="304" width="12" height="14" rx="2"/>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 11.5 MB · 23% of tsgo" x="210" y="304" width="12" height="14" rx="2"/>
       <text class="barlabel" x="230" y="315">12 <tspan class="acc">· 23%</tspan></text>
       <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 49.8 MB" x="210" y="321" width="53" height="14" rx="2"/>
       <text class="barlabel" x="271" y="332">50</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 10.2 ms · 43% of tsgo" x="620" y="304" width="11" height="14" rx="2"/>
-      <text class="barlabel" x="639" y="315">10 <tspan class="acc">· 43%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 23.5 ms" x="620" y="321" width="26" height="14" rx="2"/>
-      <text class="barlabel" x="654" y="332">24</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 13.1 ms · 56% of tsgo" x="620" y="304" width="15" height="14" rx="2"/>
+      <text class="barlabel" x="643" y="315">13 <tspan class="acc">· 56%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 23.4 ms" x="620" y="321" width="26" height="14" rx="2"/>
+      <text class="barlabel" x="654" y="332">23</text>
       <text class="t12 dim" x="195" y="376" text-anchor="end">zod</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 25.1 MB · 18% of tsgo" x="210" y="356" width="27" height="14" rx="2"/>
-      <text class="barlabel" x="245" y="367">25 <tspan class="acc">· 18%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 136.9 MB" x="210" y="373" width="145" height="14" rx="2"/>
-      <text class="barlabel" x="363" y="384">137</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 26.7 ms · 17% of tsgo" x="620" y="356" width="29" height="14" rx="2"/>
-      <text class="barlabel" x="657" y="367">27 <tspan class="acc">· 17%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 153.6 ms" x="620" y="373" width="167" height="14" rx="2"/>
-      <text class="barlabel" x="795" y="384">154</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 21.2 MB · 15% of tsgo" x="210" y="356" width="23" height="14" rx="2"/>
+      <text class="barlabel" x="241" y="367">21 <tspan class="acc">· 15%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 139.7 MB" x="210" y="373" width="149" height="14" rx="2"/>
+      <text class="barlabel" x="367" y="384">140</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 27.7 ms · 18% of tsgo" x="620" y="356" width="31" height="14" rx="2"/>
+      <text class="barlabel" x="659" y="367">28 <tspan class="acc">· 18%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 154.2 ms" x="620" y="373" width="171" height="14" rx="2"/>
+      <text class="barlabel" x="799" y="384">154</text>
       <text class="t12 dim" x="195" y="428" text-anchor="end">chalk</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 7.4 MB · 17% of tsgo" x="210" y="408" width="8" height="14" rx="2"/>
-      <text class="barlabel" x="226" y="419">7 <tspan class="acc">· 17%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 43.7 MB" x="210" y="425" width="46" height="14" rx="2"/>
-      <text class="barlabel" x="264" y="436">44</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 7.5 ms · 41% of tsgo" x="620" y="408" width="8" height="14" rx="2"/>
-      <text class="barlabel" x="636" y="419">8 <tspan class="acc">· 41%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 18.2 ms" x="620" y="425" width="20" height="14" rx="2"/>
-      <text class="barlabel" x="648" y="436">18</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 7.8 MB · 18% of tsgo" x="210" y="408" width="8" height="14" rx="2"/>
+      <text class="barlabel" x="226" y="419">8 <tspan class="acc">· 18%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 43.7 MB" x="210" y="425" width="47" height="14" rx="2"/>
+      <text class="barlabel" x="265" y="436">44</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 7.8 ms · 42% of tsgo" x="620" y="408" width="9" height="14" rx="2"/>
+      <text class="barlabel" x="637" y="419">8 <tspan class="acc">· 42%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 18.6 ms" x="620" y="425" width="21" height="14" rx="2"/>
+      <text class="barlabel" x="649" y="436">19</text>
       <text class="t11 mut" x="20" y="468">median of 11 wall runs (monotonic ns timer) and 5 RSS runs · Apple M4 · defaults</text>
     </svg>
     </div>
     <figcaption>Validators, web frameworks, an ORM, and the big <code>@types</code> packages, both
     tools at the default 4 checkers and both type-checking their default lib: ztsc's peak memory is
-    <strong>9–23% of tsgo's</strong> and its wall clock <strong>10–43%</strong> — faster
+    <strong>5–25% of tsgo's</strong> and its wall clock <strong>6–56%</strong> — faster
     <em>and</em> smaller on every package. The highest time ratios are the two <em>smallest</em>
-    packages (ajv, chalk) and <code>@types/node</code>: at that size both tools sit near their
-    process floors — ztsc's ~7.5–10&thinsp;ms is dominated by startup plus its embedded lib front
+    packages (ajv, chalk) and <code>@sinclair/typebox</code>: at that size both tools sit near their
+    process floors — ztsc's ~7.8–13&thinsp;ms is dominated by startup plus its embedded lib front
     end, which it now type-checks by default just like tsgo (parsed, bound, and checked;
     <code>--skip-default-lib-check</code> skips the check for a slightly lower floor), tsgo's floor
-    is ~18&thinsp;ms. On everything bigger ztsc is <strong>2.4–10× faster</strong>. hono and zod
+    is ~19&thinsp;ms. On everything bigger ztsc is <strong>2.6–15× faster</strong>. hono and zod
     list <code>dom</code> in their tsconfig, so ztsc parses, binds, and checks the 2.35&thinsp;MB
-    DOM lib too — that front end is why their ratios sit near 17–20% rather than the low single
+    DOM lib too — that front end is why their ratios sit near 18–19% rather than the low single
     digits of drizzle or react. Sweeping <code>--checkers</code> 1→8 makes the memory gap starker:
-    tsgo's RSS climbs steeply with checker count (drizzle-orm 166&thinsp;→&thinsp;403&thinsp;MB)
-    while ztsc's barely moves (21&thinsp;→&thinsp;23&thinsp;MB) — ztsc's entire range stays below
+    tsgo's RSS climbs steeply with checker count (drizzle-orm 171&thinsp;→&thinsp;407&thinsp;MB)
+    while ztsc's barely moves (15&thinsp;→&thinsp;19&thinsp;MB) — ztsc's entire range stays below
     tsgo's leanest single-checker run on every package.</figcaption>
   </figure>
 
@@ -902,51 +908,52 @@ pub const Program = struct {
   <table>
     <thead><tr><th>package</th><th class="num">files / lines</th><th class="num">wall ztsc / tsgo</th><th class="num">wall vs tsgo</th><th class="num">peak RSS ztsc / tsgo</th><th class="num">rss vs tsgo</th></tr></thead>
     <tbody>
-      <tr><td>@types/node 22.7.4</td><td class="num">59 / 49.6k</td><td class="num">19 / 45 ms</td><td class="num">42%</td><td class="num">18.8 / 102.4 MB</td><td class="num">18%</td></tr>
-      <tr><td>@types/react 18.3.11</td><td class="num">6 / 64.1k</td><td class="num">27 / 241 ms</td><td class="num">11%</td><td class="num">26.8 / 183.5 MB</td><td class="num">15%</td></tr>
-      <tr><td>drizzle-orm 0.33.0</td><td class="num">288 / 12.6k</td><td class="num">24 / 249 ms</td><td class="num">10%</td><td class="num">23.7 / 273.8 MB</td><td class="num">9%</td></tr>
-      <tr><td>hono 4.6.3</td><td class="num">165 / 6.3k</td><td class="num">31 / 172 ms</td><td class="num">18%</td><td class="num">31.2 / 155.8 MB</td><td class="num">20%</td></tr>
-      <tr><td>@sinclair/typebox 0.33.12</td><td class="num">241 / 3.1k</td><td class="num">16 / 48 ms</td><td class="num">34%</td><td class="num">16.7 / 78.1 MB</td><td class="num">21%</td></tr>
-      <tr><td>ajv 8.17.1</td><td class="num">107 / 1.8k</td><td class="num">10 / 24 ms</td><td class="num">43%</td><td class="num">11.6 / 49.8 MB</td><td class="num">23%</td></tr>
-      <tr><td>zod 3.23.8</td><td class="num">24 / 1.6k</td><td class="num">27 / 154 ms</td><td class="num">17%</td><td class="num">25.1 / 136.9 MB</td><td class="num">18%</td></tr>
-      <tr><td>chalk 5.3.0</td><td class="num">5 / 612</td><td class="num">8 / 18 ms</td><td class="num">41%</td><td class="num">7.4 / 43.7 MB</td><td class="num">17%</td></tr>
+      <tr><td>@types/node 22.7.4</td><td class="num">59 / 49.6k</td><td class="num">15 / 46 ms</td><td class="num">32%</td><td class="num">17.3 / 102.4 MB</td><td class="num">17%</td></tr>
+      <tr><td>@types/react 18.3.11</td><td class="num">6 / 64.1k</td><td class="num">28 / 243 ms</td><td class="num">12%</td><td class="num">22.7 / 185.4 MB</td><td class="num">12%</td></tr>
+      <tr><td>drizzle-orm 0.33.0</td><td class="num">288 / 12.6k</td><td class="num">15 / 232 ms</td><td class="num">6%</td><td class="num">14.6 / 272.4 MB</td><td class="num">5%</td></tr>
+      <tr><td>hono 4.6.3</td><td class="num">165 / 6.3k</td><td class="num">32 / 171 ms</td><td class="num">19%</td><td class="num">24.5 / 153.3 MB</td><td class="num">16%</td></tr>
+      <tr><td>@sinclair/typebox 0.33.12</td><td class="num">241 / 3.1k</td><td class="num">18 / 47 ms</td><td class="num">39%</td><td class="num">19.6 / 77.7 MB</td><td class="num">25%</td></tr>
+      <tr><td>ajv 8.17.1</td><td class="num">107 / 1.8k</td><td class="num">13 / 23 ms</td><td class="num">56%</td><td class="num">11.5 / 49.8 MB</td><td class="num">23%</td></tr>
+      <tr><td>zod 3.23.8</td><td class="num">24 / 1.6k</td><td class="num">28 / 154 ms</td><td class="num">18%</td><td class="num">21.2 / 139.7 MB</td><td class="num">15%</td></tr>
+      <tr><td>chalk 5.3.0</td><td class="num">5 / 612</td><td class="num">8 / 19 ms</td><td class="num">42%</td><td class="num">7.8 / 43.7 MB</td><td class="num">18%</td></tr>
     </tbody>
   </table>
   </div>
 
   <h3>The synthetic corpora, for continuity</h3>
-  <p>The generated corpora that carried the project's earlier tuning still run (last full
-  measurement 2026-07-14, with the real lib loaded; the 7.0.2 lib re-vendor later nudged multi to 55.0 MB &mdash; 27% of tsgo, wall flat). tsc 5.5.4 was retired from the ongoing bench
-  scripts after this round — tsgo is the baseline that matters:</p>
+  <p>The generated corpora that carried the project's earlier tuning still run — ztsc and tsgo
+  re-measured 2026-07-25 with the same monotonic-ns protocol as the package table above. tsc 5.5.4
+  was retired from the ongoing bench scripts, so its rows are the 2026-07-14 figures it retired on;
+  tsgo is the baseline that matters:</p>
   <div class="tablewrap">
   <table>
     <thead><tr><th>corpus</th><th>tool</th><th class="num">wall</th><th class="num">peak RSS</th><th class="num">rss vs tsgo</th></tr></thead>
     <tbody>
-      <tr class="hl"><td>medium · 50 files / 50k lines</td><td>ztsc</td><td class="num">0.02 s</td><td class="num">26.3 MB</td><td class="num">23%</td></tr>
-      <tr><td></td><td>tsgo</td><td class="num">0.04 s</td><td class="num">112.3 MB</td><td class="num">100%</td></tr>
-      <tr><td></td><td>tsc 5.5.4</td><td class="num">0.59 s</td><td class="num">224.4 MB</td><td class="num">200%</td></tr>
-      <tr class="hl"><td>multi · 201 files / 93k lines</td><td>ztsc</td><td class="num">0.03 s <span class="m" style="color:var(--muted)">(29.3 ms)</span></td><td class="num">53.9 MB</td><td class="num">26%</td></tr>
-      <tr><td></td><td>tsgo</td><td class="num">0.08 s</td><td class="num">205.1 MB</td><td class="num">100%</td></tr>
-      <tr><td></td><td>tsc 5.5.4</td><td class="num">0.91 s</td><td class="num">316.3 MB</td><td class="num">154%</td></tr>
+      <tr class="hl"><td>medium · 50 files / 50k lines</td><td>ztsc</td><td class="num">24.0 ms</td><td class="num">27.0 MB</td><td class="num">25%</td></tr>
+      <tr><td></td><td>tsgo</td><td class="num">42.3 ms</td><td class="num">108.8 MB</td><td class="num">100%</td></tr>
+      <tr><td></td><td>tsc 5.5.4</td><td class="num">0.59 s</td><td class="num">224.4 MB</td><td class="num">206%</td></tr>
+      <tr class="hl"><td>multi · 201 files / 93k lines</td><td>ztsc</td><td class="num">39.9 ms</td><td class="num">46.0 MB</td><td class="num">24%</td></tr>
+      <tr><td></td><td>tsgo</td><td class="num">75.5 ms</td><td class="num">194.3 MB</td><td class="num">100%</td></tr>
+      <tr><td></td><td>tsc 5.5.4</td><td class="num">0.91 s</td><td class="num">316.3 MB</td><td class="num">163%</td></tr>
     </tbody>
   </table>
   </div>
 
   <h3>The per-byte accounting behind the RSS number</h3>
-  <p>From a <code>--memory</code> run on the multi corpus (N=4, real lib loaded, 2026-07-14):</p>
+  <p>From a <code>--memory</code> run on the multi corpus (N=4, real lib loaded, 2026-07-25):</p>
   <div class="tablewrap">
   <table>
     <thead><tr><th>metric</th><th class="num">value</th><th>note</th></tr></thead>
     <tbody>
       <tr><td>bytes / token</td><td class="num">5.00</td><td>u8 tag + u32 start, SoA</td></tr>
-      <tr><td>bytes / AST node</td><td class="num">16.06</td><td>target was ≤ 24</td></tr>
-      <tr><td>binder bytes / line</td><td class="num">32.96</td><td>symbols + scopes + flow graph + records</td></tr>
-      <tr><td>bytes / type</td><td class="num">28.32</td><td>hash-consed, arena-allocated</td></tr>
-      <tr><td>types / source line</td><td class="num">0.27</td><td>interning at work</td></tr>
-      <tr><td>relation cache hit rate</td><td class="num">47.0%</td><td>assignability memo on <code>(TypeId, TypeId)</code> pairs</td></tr>
-      <tr><td>instantiation cache hit rate</td><td class="num">26.4%</td><td>generic-instantiation memo</td></tr>
-      <tr><td>node_types cache hit rate</td><td class="num">15.3%</td><td>contextual-keyed expression-type cache</td></tr>
-      <tr><td>total heap (arenas + interner)</td><td class="num">17.8 MB</td><td>~190 bytes per source line, all-in — down from 45.5 MB / 508 before the arena-slack paydown</td></tr>
+      <tr><td>bytes / AST node</td><td class="num">16.24</td><td>target was ≤ 24</td></tr>
+      <tr><td>binder bytes / line</td><td class="num">32.19</td><td>symbols + scopes + flow graph + records</td></tr>
+      <tr><td>bytes / type</td><td class="num">28.90</td><td>hash-consed, arena-allocated</td></tr>
+      <tr><td>types / source line</td><td class="num">0.28</td><td>interning at work</td></tr>
+      <tr><td>relation cache hit rate</td><td class="num">48.8%</td><td>assignability memo on <code>(TypeId, TypeId)</code> pairs</td></tr>
+      <tr><td>instantiation cache hit rate</td><td class="num">30.5%</td><td>generic-instantiation memo</td></tr>
+      <tr><td>node_types cache hit rate</td><td class="num">7.2%</td><td>contextual-keyed expression-type cache</td></tr>
+      <tr><td>total heap (arenas + interner)</td><td class="num">18.3 MB</td><td>~178 bytes per source line, all-in — down from 45.5 MB / 508 before the arena-slack paydown</td></tr>
     </tbody>
   </table>
   </div>
@@ -959,7 +966,7 @@ pub const Program = struct {
     differential conformance suite validated against the TypeScript compiler. Packages are
     vendored without their dependencies — nonzero exit is expected, and both tools fully parse,
     bind, and check every file regardless. Wall clock is timed around the whole
-    process, so the ratios are real down to the smallest packages — but at the 13–25&thinsp;ms
+    process, so the ratios are real down to the smallest packages — but at the 8–23&thinsp;ms
     scale both tools are effectively instant, and the ratio mostly reflects fixed startup
     costs. Single machine, single OS — no Linux numbers yet.</p>
   </div>
@@ -1032,7 +1039,7 @@ pub const Program = struct {
 </section>
 
 <footer class="sitefoot">
-  ztsc 0.0.1-dev · sources: README.md, BENCHMARKS.md, EXPERIMENTS.md and the src/ doc comments at commit d6c66a2 (2026-07-16) · numbers are Apple M4, macOS
+  ztsc 0.0.1-dev · sources: README.md, BENCHMARKS.md, EXPERIMENTS.md ARCHITECTURE.md and the src/ doc comments at commit b0c8646 (2026-07-25) · numbers are Apple M4, macOS
 </footer>
 
 </div>
