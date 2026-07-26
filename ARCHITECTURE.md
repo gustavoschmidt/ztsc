@@ -152,9 +152,24 @@ scratch freed, no new shared state — then run the gate:
 zig fmt build.zig src test
 zig build test          # 622 conformance + unit, includes the determinism test
 bench/e2e.sh multi      # wall clock + peak RSS vs tsgo
+bench/crash_sweep.sh    # 8 packages × --checkers=1..16, crash + byte-identity
 ```
 
 Plus the byte-identical check on a real project (see `CLAUDE.md`). If a lever
 needs shared mutable state to pay off, that is a contract change: it needs the
 interner's justification — append-only, sharded, and provably unable to change
 what is reported — or it does not land.
+
+`bench/crash_sweep.sh` is required for anything that can hand a stale pointer
+or a held slice to a parallel checker — resolver, symbol, interner and checker
+changes. It runs each benchmark package (`bench/fetch_real.sh` vendors them) at
+every checker count from 1 to 16 and fails if a run exits unexpectedly, stops
+before its closing `ztsc: loaded …` summary, or reports different diagnostics
+than its siblings — a crash mid-check exits *after* printing a prefix of the
+diagnostics, so "it printed something" is not evidence it finished. That
+failure mode is why the gate exists: at the default 4 checkers, on drizzle-orm
+alone, a held type-parameter slice was invalidated by interning and the checker
+died before reporting any of its 80 diagnostics, and a published benchmark row
+timed the dead process. Its per-package tell was subtle — peak RSS at 4
+checkers equal to peak RSS at 1 — but its exit code and its truncated output
+were not.
