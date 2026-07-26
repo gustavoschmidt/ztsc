@@ -153,6 +153,7 @@ zig fmt build.zig src test
 zig build test          # 622 conformance + unit, includes the determinism test
 bench/e2e.sh multi      # wall clock + peak RSS vs tsgo
 bench/crash_sweep.sh    # 8 packages × --checkers=1..16, crash + byte-identity
+bench/repeat_sweep.sh   # 8 packages × one config × N runs, byte-identity
 ```
 
 Plus the byte-identical check on a real project (see `CLAUDE.md`). If a lever
@@ -173,3 +174,20 @@ died before reporting any of its 80 diagnostics, and a published benchmark row
 timed the dead process. Its per-package tell was subtle — peak RSS at 4
 checkers equal to peak RSS at 1 — but its exit code and its truncated output
 were not.
+
+`bench/repeat_sweep.sh` covers the other axis: the same binary, the same
+configuration, run N times. Agreement across configurations does not imply
+agreement with yourself — a single checker is still fed by a multi-threaded
+front end, so two runs of `--checkers=1` are two different interleavings.
+Concretely, the atom *set* is identical every run but the id assignment never
+is (`Interner.intern` numbers by per-shard insertion order), and atoms are
+sort keys for a scope's member table (`Binder.seal`) and for a merged
+namespace's member index (`Merger.buildNsMembers`) — so the order the checker
+reaches types in varies by design, and the contract is that nothing observable
+may depend on it. The bug that motivated the script was an internal quantity
+that did: the instantiation budget exempted origin-tagging work, so a
+memoized first visit was charged or not depending on which side of the exempt
+window it fell on, and `inst_count` moved between repeat runs on drizzle-orm.
+Diagnostics never followed it (the budget is dormant), but it gates TS2589 —
+an order-dependent decision variable is a defect whether or not it has
+surfaced yet.

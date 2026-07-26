@@ -1097,6 +1097,7 @@ pub fn main(init: std.process.Init) !void {
     var check_inst_hits: usize = 0;
     var check_inst_misses: usize = 0;
     var check_inst_maps: usize = 0;
+    var check_instantiations: usize = 0;
     for (tasks) |*t| {
         const ck = t.result orelse continue;
         for (ck.diagnostics) |d| {
@@ -1115,6 +1116,7 @@ pub fn main(init: std.process.Init) !void {
         check_inst_hits += ck.stats.inst_hits;
         check_inst_misses += ck.stats.inst_misses;
         check_inst_maps += ck.stats.inst_maps;
+        check_instantiations += ck.stats.instantiations;
     }
 
     var failed: usize = 0;
@@ -1370,6 +1372,7 @@ pub fn main(init: std.process.Init) !void {
             .inst_hits = check_inst_hits,
             .inst_misses = check_inst_misses,
             .inst_maps = check_inst_maps,
+            .instantiations = check_instantiations,
             .nt_hits = check_nt_hits,
             .nt_misses = check_nt_misses,
             .scratch_high_water = check_scratch_hw,

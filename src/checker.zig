@@ -121,6 +121,14 @@ pub const Stats = struct {
     inst_hits: usize = 0,
     inst_misses: usize = 0,
     inst_maps: usize = 0,
+    /// `Checker.inst_count` at seal: the instantiation work this instance
+    /// charged against `max_instantiation_count`, and the comparator for
+    /// tsgo's `--extendedDiagnostics` Instantiations. Reported so the quantity
+    /// that gates TS2589 is observable to a gate — it is required to be
+    /// run-to-run invariant at a fixed configuration (`bench/repeat_sweep.sh`),
+    /// and it is *not* invariant across configurations: the partition splits
+    /// it between instances and the memo suppresses repeat visits.
+    instantiations: usize = 0,
 };
 
 /// Sealed check result for one file.
@@ -255,6 +263,16 @@ const max_instantiation_depth = 100;
 /// current subset produces, so it never fires here (and thus can never make
 /// the `--no-inst-cache` oracle diverge: only the cache-independent depth
 /// limit fires in-subset).
+///
+/// It has to stay dormant, and this is not just a headroom argument. Unlike
+/// the depth limb, `inst_count` is not a property of the program alone: the
+/// memo means it counts *first* visits, so it falls with cache hits (drizzle-
+/// orm at `--checkers=1`: 57,359 with the memo, 999,191 under
+/// `--no-inst-cache`, 17×) and it is split across instances by the checker
+/// partition. Any cap it could actually reach would therefore make TS2589
+/// depend on the configuration, which the determinism contract forbids. Keep
+/// the headroom; a real budget has to be built on a partition- and
+/// cache-independent quantity.
 const max_instantiation_count = 5_000_000;
 /// Upper bound on scratch-arena physical capacity retained across the
 /// per-statement reset (`run`). The scratch arena is a transient workspace
@@ -681,7 +699,10 @@ const Checker = struct {
     /// expansions (see the constant's doc comment).
     rel_depth: u32 = 0,
     /// Total `instantiate` node-visits this run (checked against
-    /// `max_instantiation_count`).
+    /// `max_instantiation_count`). Monotonic: every visit is counted, with no
+    /// exempt window — an exempt window would make the total depend on which
+    /// side of it a memoized first visit happened to fall on, i.e. on
+    /// traversal order (see `tagInstantiatedOrigin`).
     inst_count: u64 = 0,
     /// Set when the current top-level `instantiate` call tripped the depth or
     /// count limit; suppresses memoization of the (truncated) results for that
@@ -949,6 +970,7 @@ const Checker = struct {
         c.stats.type_bytes = c.ts.typeBytes();
         c.stats.relation_entries = c.relation.count();
         c.stats.relation_bytes = c.relation.capacity() * (8 + 1);
+        c.stats.instantiations = c.inst_count;
         return .{ .diagnostics = list, .stats = c.stats };
     }
 
@@ -6726,21 +6748,37 @@ const Checker = struct {
         return c.instantiateId(t, map, map_id);
     }
 
-    /// Record the origin of a re-instantiated generic materialization without
-    /// charging the substitution of its origin args against the shared
-    /// instantiation budget (`inst_count`/`inst_depth`) — pure bookkeeping must
-    /// not influence whether a later, unrelated instantiation trips TS2589, nor
-    /// emit a diagnostic of its own. A trip during arg substitution just yields
-    /// a non-matching origin ref (safe: the reflexive fast-path simply won't
-    /// fire, falling back to the structural walk).
+    /// Record the origin of a re-instantiated generic materialization. This is
+    /// bookkeeping, so it must not *report* anything: the origin-arg
+    /// substitution runs with diagnostics suppressed and restores the caller's
+    /// live depth and truncation flag. A trip during arg substitution just
+    /// yields a non-matching origin ref (safe: the reflexive fast-path simply
+    /// won't fire, falling back to the structural walk).
+    ///
+    /// `inst_count` is deliberately *not* restored. It used to be, on the
+    /// reasoning that bookkeeping should not spend the TS2589 budget — but
+    /// that made the budget a function of traversal order rather than of the
+    /// program. Substitution results are memoized (`inst_cache`), so only the
+    /// *first* visit of a given `(map_id, type)` pair is counted; whether that
+    /// first visit lands inside one of these windows or outside it depends on
+    /// the order the checker reaches types in. That order is not run-to-run
+    /// stable: atom ids come from the interner's per-shard insertion order,
+    /// which the parallel front end varies between runs, and atoms are sort
+    /// keys for a scope's member table (`binder.Binder.seal`) and for a merged
+    /// namespace's member index (`modules.Merger.buildNsMembers`). Restoring
+    /// the count therefore subtracted a run-varying amount from it: on
+    /// drizzle-orm at `--checkers=1`, repeat runs of the same binary on the
+    /// same input charged 56,988 / 57,018 / 57,093 of an invariant 57,359
+    /// node-visits. Counting every visit, here as everywhere else, makes the
+    /// budget equal to the work the program actually demands — which *is*
+    /// run-to-run invariant — at the cost of charging origin tagging for the
+    /// visits it really performs.
     fn tagInstantiatedOrigin(c: *Checker, result: TypeId, orig_ref: TypeId, map: []const TpMap, map_id: ?u32) Error!void {
-        const saved_count = c.inst_count;
         const saved_depth = c.inst_depth;
         const saved_trip = c.inst_limit_tripped;
         const saved_suppress = c.suppress_inst_diag;
         c.suppress_inst_diag = true;
         defer {
-            c.inst_count = saved_count;
             c.inst_depth = saved_depth;
             c.inst_limit_tripped = saved_trip;
             c.suppress_inst_diag = saved_suppress;

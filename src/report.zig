@@ -179,6 +179,7 @@ pub const Memory = struct {
     inst_hits: usize,
     inst_misses: usize,
     inst_maps: usize,
+    instantiations: usize,
     nt_hits: usize,
     nt_misses: usize,
     scratch_high_water: usize,
@@ -271,6 +272,7 @@ pub fn printMemory(out: *Io.Writer, m: Memory) !void {
     try out.print("  {s:<24} {d:>12}\n", .{ "inst cache hits", m.inst_hits });
     try out.print("  {s:<24} {d:>12}\n", .{ "inst cache misses", m.inst_misses });
     try out.print("  {s:<24} {d:>12}\n", .{ "inst canonical maps", m.inst_maps });
+    try out.print("  {s:<24} {d:>12}\n", .{ "instantiations", m.instantiations });
     const inst_total = m.inst_hits + m.inst_misses;
     const inst_hit_rate: f64 = if (inst_total > 0)
         100.0 * @as(f64, @floatFromInt(m.inst_hits)) / @as(f64, @floatFromInt(inst_total))
@@ -440,6 +442,7 @@ test "printMemory sums the worker arenas into the heap total" {
         .inst_hits = 0,
         .inst_misses = 0,
         .inst_maps = 0,
+        .instantiations = 0,
         .nt_hits = 0,
         .nt_misses = 0,
         .scratch_high_water = 0,
