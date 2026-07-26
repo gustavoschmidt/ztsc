@@ -66,6 +66,7 @@ const intern = @import("intern.zig");
 const binder = @import("binder.zig");
 const types = @import("types.zig");
 const source = @import("source.zig");
+const libs = @import("libs.zig");
 const modules = @import("modules.zig");
 const ZeroPagedArray = @import("zeropage.zig").ZeroPagedArray;
 
@@ -4177,7 +4178,7 @@ const Checker = struct {
             }
             const k = c.ts.kind(t);
             if (k != .function and k != .overloads) continue;
-            if (modules.isLibPath(c.prog.files[c.symFile(p)].path))
+            if (libs.isLibPath(c.prog.files[c.symFile(p)].path))
                 try lib.append(c.scratch(), t)
             else
                 try nonlib.append(c.scratch(), t);

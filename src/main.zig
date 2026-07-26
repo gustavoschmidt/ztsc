@@ -38,7 +38,9 @@ const scanner = ztsc.scanner;
 const parser = ztsc.parser;
 const binder = ztsc.binder;
 const checker = ztsc.checker;
+const libs = ztsc.libs;
 const modules = ztsc.modules;
+const resolve = ztsc.resolve;
 const types = ztsc.types;
 const Ast = ztsc.ast.Ast;
 const Bind = binder.Bind;
@@ -326,12 +328,12 @@ const Worker = struct {
         const alloc = w.arena.allocator();
 
         var timer = Timer.start(io);
-        const src = if (modules.libSourceFor(path)) |lib_bytes|
+        const src = if (libs.libSourceFor(path)) |lib_bytes|
             Source.fromBytes(alloc, path, lib_bytes) catch |err| {
                 c.err = err;
                 return;
             }
-        else if (modules.anyModuleSourceFor(path)) |any_bytes|
+        else if (ztsc.paths.anyModuleSourceFor(path)) |any_bytes|
             // A resolved JSON module (resolveJsonModule) or JS module (allowJs):
             // type it opaquely as `any` from a synthetic body instead of parsing
             // the raw JSON/JS as TypeScript.
@@ -575,10 +577,10 @@ pub fn main(init: std.process.Init) !void {
     // Which built-in lib blobs to inject. Precedence: --noLib wins (nothing),
     // then an explicit --lib flag, then the tsconfig `lib` field, else the
     // default set (ES-core + DOM — tsgo's target-esnext default includes DOM).
-    const lib_set: modules.LibSet = if (cli.no_lib)
+    const lib_set: libs.LibSet = if (cli.no_lib)
         .none
     else
-        modules.resolveLibSet(cli.lib orelse config_lib);
+        libs.resolveLibSet(cli.lib orelse config_lib);
 
     // Pretty diagnostics: tsc-style excerpts + colors; default follows the
     // terminal, --pretty / --pretty=false forces.
@@ -609,7 +611,7 @@ pub fn main(init: std.process.Init) !void {
     // resolves once. Lives in `arena` (spans the whole discovery run). Created
     // before the program roots are seeded because they, too, go through its
     // canonical-path step (see below).
-    var rcache = modules.ResolveCache.init(arena, !cli.no_resolve_cache, .{
+    var rcache = resolve.ResolveCache.init(arena, !cli.no_resolve_cache, .{
         .resolve_json = config_resolve_json,
         .base_url = config_base_url,
         .allow_js = config_allow_js,
@@ -626,8 +628,8 @@ pub fn main(init: std.process.Init) !void {
     // Their synthetic paths route to the embedded sources in the worker front
     // end; their top-level decls become the program globals. Empty under
     // --noLib / lib:[].
-    var lib_buf: [modules.max_lib_files]modules.LibFile = undefined;
-    for (modules.libFiles(lib_set, &lib_buf)) |lf| {
+    var lib_buf: [libs.max_lib_files]libs.LibFile = undefined;
+    for (libs.libFiles(lib_set, &lib_buf)) |lf| {
         try path_ids.put(arena, lf.path, @intCast(paths.items.len));
         try paths.append(arena, lf.path);
     }
@@ -640,7 +642,7 @@ pub fn main(init: std.process.Init) !void {
     // the call is a no-op, so project roots keep the path the user typed (and
     // pay no realpath syscall).
     for (entry_paths) |p| {
-        const norm = try modules.normalizePath(arena, p);
+        const norm = try ztsc.paths.normalizePath(arena, p);
         const key = try rcache.canonicalPath(io, resolve_scratch.allocator(), Io.Dir.cwd(), norm);
         const gop = try path_ids.getOrPut(arena, key);
         if (!gop.found_existing) {
@@ -675,7 +677,7 @@ pub fn main(init: std.process.Init) !void {
     // Deterministic lib atoms. Intern the lib's strings single-
     // threaded before any worker runs so the concurrent worker that binds
     // file 0 re-interns them into these stable, run-to-run-identical atoms.
-    try modules.seedLibAtoms(io, gpa, &interner, lib_set);
+    try libs.seedLibAtoms(io, gpa, &interner, lib_set);
 
     const discover_timer = Timer.start(io);
     for (workers) |*w| {
@@ -694,7 +696,7 @@ pub fn main(init: std.process.Init) !void {
     // FileId of the auto-injected `@types/node` (null until the first Node
     // built-in import pulls it in); see the discovery loop below.
     var node_types_fid: ?u32 = null;
-    modules.resetFsProbeCount();
+    resolve.resetFsProbeCount();
 
     while (outstanding > 0) {
         // The done channel is never closed while work is outstanding.
@@ -737,7 +739,7 @@ pub fn main(init: std.process.Init) !void {
             // via its own `/// <reference>` refs, every submodule .d.ts).
             if (node_types_fid == null) {
                 for (b.imports) |rec| {
-                    if (!modules.isNodeBuiltin(interner.lookup(io, rec.module))) continue;
+                    if (!ztsc.paths.isNodeBuiltin(interner.lookup(io, rec.module))) continue;
                     if (try rcache.resolve(io, scratch, Io.Dir.cwd(), paths.items[i], "@types/node")) |np| {
                         const pgop = try path_ids.getOrPut(arena, np);
                         if (pgop.found_existing) {
@@ -759,7 +761,7 @@ pub fn main(init: std.process.Init) !void {
             // resolved ids join the discovery edge list so the deterministic
             // BFS renumbering below reaches them.
             if (results.items[i]) |src| {
-                for (try modules.scanReferences(scratch, src.bytes)) |ref| {
+                for (try resolve.scanReferences(scratch, src.bytes)) |ref| {
                     const rfid = try discoverReferenceInto(arena, scratch, io, &rcache, paths.items[i], ref, &path_ids, &paths);
                     try ref_files.append(arena, rfid);
                 }
@@ -914,12 +916,12 @@ pub fn main(init: std.process.Init) !void {
             // `--skip-default-lib-check` (or tsconfig skipLibCheck/
             // skipDefaultLibCheck) drops them — pure time savings, since lib
             // diagnostics are never surfaced (tsc's skipDefaultLibCheck).
-            if (skip_default_lib_check and modules.isLibPath(paths.items[i])) continue;
+            if (skip_default_lib_check and libs.isLibPath(paths.items[i])) continue;
             // skipLibCheck: a non-lib `.d.ts` produces no surfaced check
             // diagnostics, and its types are resolved lazily on demand from
             // `.ts` files (not by walking it), so its check pass is dead work —
             // don't enqueue it. Pure time savings, deterministic (path-based).
-            if (skip_all_dts_check and modules.isDeclarationPath(paths.items[i])) continue;
+            if (skip_all_dts_check and ztsc.paths.isDeclarationPath(paths.items[i])) continue;
             const cost: u64 = if (trees.items[i]) |tree| tree.nodes.len else 0;
             items.appendAssumeCapacity(.{ .file = @intCast(i), .cost = cost });
         }
@@ -1000,7 +1002,7 @@ pub fn main(init: std.process.Init) !void {
     // nothing printed. There may be several lib files (ES-core, DOM, the
     // console shim); `is_lib[i]` flags each by its synthetic path.
     const is_lib = try arena.alloc(bool, paths.items.len);
-    for (paths.items, 0..) |p, i| is_lib[i] = modules.isLibPath(p);
+    for (paths.items, 0..) |p, i| is_lib[i] = libs.isLibPath(p);
 
     // Non-lib `.d.ts` files whose diagnostics are fully suppressed by
     // `skipLibCheck` (parse + bind + link + check), mirroring how the built-in
@@ -1010,7 +1012,7 @@ pub fn main(init: std.process.Init) !void {
     // Path-based, so identical for any --workers/--checkers count (determinism).
     const dts_skipped = try arena.alloc(bool, paths.items.len);
     for (paths.items, 0..) |p, i|
-        dts_skipped[i] = skip_all_dts_check and !is_lib[i] and modules.isDeclarationPath(p);
+        dts_skipped[i] = skip_all_dts_check and !is_lib[i] and ztsc.paths.isDeclarationPath(p);
 
     var parse_diags: usize = 0;
     for (trees.items, 0..) |maybe_tree, i| {
@@ -1264,7 +1266,7 @@ pub fn main(init: std.process.Init) !void {
             .bytes = total_bytes,
             .repeat = cli.repeat,
         }, checker_times, .{
-            .probes = modules.fsProbeCount(),
+            .probes = resolve.fsProbeCount(),
             .lookups = rcache.lookups,
             .hits = rcache.hits,
             .enabled = !cli.no_resolve_cache,
@@ -1386,7 +1388,7 @@ fn resolveSpecInto(
     gpa: std.mem.Allocator,
     io: Io,
     interner: *Interner,
-    rcache: *modules.ResolveCache,
+    rcache: *resolve.ResolveCache,
     paths_map: ?ztsc.tsconfig.Paths,
     resolve_json: bool,
     importer: []const u8,
@@ -1418,9 +1420,9 @@ fn resolveSpecInto(
             const is_json = resolve_json and std.mem.endsWith(u8, spec, ".json");
             for (try pm.mapSpecifier(scratch, spec)) |cand| {
                 const r = if (is_json)
-                    try modules.resolveJsonFile(io, scratch, Io.Dir.cwd(), cand)
+                    try resolve.resolveJsonFile(io, scratch, Io.Dir.cwd(), cand)
                 else
-                    try modules.resolveStem(io, scratch, Io.Dir.cwd(), cand);
+                    try resolve.resolveStem(io, scratch, Io.Dir.cwd(), cand);
                 if (r) |rr| {
                     mapped = rr;
                     break;
@@ -1458,9 +1460,9 @@ fn discoverReferenceInto(
     arena: std.mem.Allocator,
     scratch: std.mem.Allocator,
     io: Io,
-    rcache: *modules.ResolveCache,
+    rcache: *resolve.ResolveCache,
     importer: []const u8,
-    ref: modules.RefDirective,
+    ref: resolve.RefDirective,
     path_ids: *std.StringHashMapUnmanaged(u32),
     paths: *std.ArrayList([]const u8),
 ) !modules.FileId {

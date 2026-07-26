@@ -60,6 +60,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const modules = @import("modules.zig");
+const paths = @import("paths.zig");
+const resolve = @import("resolve.zig");
 
 pub const Error = error{OutOfMemory};
 
@@ -77,7 +79,7 @@ pub fn load(io: Io, arena: Allocator, config_path: []const u8) LoadError!Config 
 pub fn loadInDir(io: Io, arena: Allocator, base: Io.Dir, config_path: []const u8) LoadError!Config {
     var cfg: Config = .{
         .path = config_path,
-        .dir = modules.dirnamePart(config_path),
+        .dir = paths.dirnamePart(config_path),
     };
     var warnings: std.ArrayList([]const u8) = .empty;
     var notes: std.ArrayList([]const u8) = .empty;
@@ -135,7 +137,7 @@ pub fn loadInDir(io: Io, arena: Allocator, base: Io.Dir, config_path: []const u8
         const paths_base: []const u8 = if (acc.base_url) |bu|
             try joinNormalize(arena, acc.base_url_dir, bu)
         else
-            try modules.normalizePath(arena, if (acc.paths_dir.len == 0) "." else acc.paths_dir);
+            try paths.normalizePath(arena, if (acc.paths_dir.len == 0) "." else acc.paths_dir);
         var keys: std.ArrayList([]const u8) = .empty;
         var vals: std.ArrayList([]const []const u8) = .empty;
         for (po.keys, po.vals) |pkey, pval| {
@@ -256,7 +258,7 @@ pub const Config = struct {
     /// `paths`/`baseUrl` mapping for module resolution, if configured.
     paths: ?Paths = null,
     /// `compilerOptions.lib` entries (as written), or null when the field is
-    /// absent. Fed to `modules.resolveLibSet` to pick the built-in lib blobs;
+    /// absent. Fed to `libs.resolveLibSet` to pick the built-in lib blobs;
     /// null selects the default set (ES-core + DOM, matching tsgo).
     lib: ?[]const []const u8 = null,
     /// `compilerOptions.skipLibCheck` or `skipDefaultLibCheck` set to true.
@@ -735,7 +737,7 @@ fn collectAutoTypes(
             // climb); an absolute `project_dir` (the `-p /abs/path` case) climbs
             // to the filesystem root and covers every ancestor, matching tsc.
             if (d.len == 0 or std.mem.eql(u8, d, "/") or std.mem.eql(u8, d, ".")) break;
-            d = modules.dirnamePart(d);
+            d = paths.dirnamePart(d);
         }
     }
 
@@ -770,7 +772,7 @@ fn collectAutoTypes(
             gop.key_ptr.* = try arena.dupe(u8, entry.name);
             const pkg_dir = try std.fmt.allocPrint(arena, "{s}/{s}", .{ root, entry.name });
             gop.value_ptr.* = pkg_dir;
-            if (try modules.resolveTypesPackageMain(io, arena, base, pkg_dir)) |main| {
+            if (try resolve.resolveTypesPackageMain(io, arena, base, pkg_dir)) |main| {
                 try out.append(arena, main);
             }
         }
@@ -898,7 +900,7 @@ fn mergeConfig(
                     try warn(arena, warnings, "{s}: TS18000: circularity detected resolving 'extends' to '{s}' (ignored)", .{ config_path, rp });
                     continue;
                 }
-                try mergeConfig(io, arena, base, rp, modules.dirnamePart(rp), acc, warnings, notes, chain, false);
+                try mergeConfig(io, arena, base, rp, paths.dirnamePart(rp), acc, warnings, notes, chain, false);
             } else {
                 try warn(arena, warnings, "{s}: cannot find config '{s}' referenced by 'extends' (ignored)", .{ config_path, spec });
             }
@@ -1081,7 +1083,7 @@ fn resolveExtends(io: Io, arena: Allocator, base: Io.Dir, from_dir: []const u8, 
             try std.fmt.allocPrint(arena, "{s}/node_modules", .{d});
         if (try resolveExtendsInNodeModules(io, arena, base, nm, spec)) |p| return p;
         if (d.len == 0 or std.mem.eql(u8, d, "/") or std.mem.eql(u8, d, ".")) return null;
-        d = modules.dirnamePart(d);
+        d = paths.dirnamePart(d);
     }
 }
 
@@ -1153,17 +1155,17 @@ fn stringArray(
 
 fn joinNormalize(arena: Allocator, dir: []const u8, rest: []const u8) Error![]u8 {
     if (dir.len == 0 or std.mem.eql(u8, dir, ".") or rest.len > 0 and rest[0] == '/') {
-        return modules.normalizePath(arena, rest);
+        return paths.normalizePath(arena, rest);
     }
     const joined = try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir, rest });
     defer arena.free(joined);
-    return modules.normalizePath(arena, joined);
+    return paths.normalizePath(arena, joined);
 }
 
 /// Preprocess an include pattern: normalize, and treat a directory-looking
 /// pattern (last segment without wildcard or extension) as `p/**/*`.
 fn preprocessInclude(arena: Allocator, pat: []const u8) Error![]const u8 {
-    const norm = try modules.normalizePath(arena, pat);
+    const norm = try paths.normalizePath(arena, pat);
     if (std.mem.eql(u8, norm, ".")) return "**/*";
     const last = if (std.mem.lastIndexOfScalar(u8, norm, '/')) |i| norm[i + 1 ..] else norm;
     const has_wild = std.mem.indexOfAny(u8, last, "*?") != null;
@@ -1589,7 +1591,7 @@ test "config: paths + baseUrl mapping" {
     try testing.expectEqual(@as(usize, 0), c4.len);
 
     // Candidates actually resolve through module resolution.
-    const resolved = try modules.resolveStem(io, alloc, d, c2[0]);
+    const resolved = try resolve.resolveStem(io, alloc, d, c2[0]);
     try testing.expect(resolved != null);
     try testing.expectEqualStrings("app/src/lib/util.ts", resolved.?);
 }

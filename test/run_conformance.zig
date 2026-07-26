@@ -171,7 +171,7 @@ fn runCase(alloc: std.mem.Allocator, io: Io, gpa: std.mem.Allocator, interner: *
 /// The lib blob selection for a directory case: `compilerOptions.lib` from a
 /// case-local tsconfig.json (mapped like the CLI), or the ES-core + console
 /// shim default when the case has no tsconfig.
-fn dirCaseLibSet(alloc: std.mem.Allocator, io: Io, conf_dir: Io.Dir, case_rel: []const u8) !modules.LibSet {
+fn dirCaseLibSet(alloc: std.mem.Allocator, io: Io, conf_dir: Io.Dir, case_rel: []const u8) !ztsc.libs.LibSet {
     const cfg_path = try std.fmt.allocPrint(alloc, "{s}/tsconfig.json", .{case_rel});
     const text = conf_dir.readFileAlloc(io, cfg_path, alloc, .limited(1 << 20)) catch return .es_only;
     const root = ztsc.tsconfig.parseJsonc(alloc, text) catch return .es_only;
@@ -184,7 +184,7 @@ fn dirCaseLibSet(alloc: std.mem.Allocator, io: Io, conf_dir: Io.Dir, case_rel: [
     for (lib_val.array) |item| {
         if (item == .string) try libs.append(alloc, item.string);
     }
-    return modules.resolveLibSet(libs.items);
+    return ztsc.libs.resolveLibSet(libs.items);
 }
 
 /// `compilerOptions.skipLibCheck` from a case-local tsconfig.json (false when
@@ -271,9 +271,9 @@ fn runDirCase(
         // census-clean but trip a few ztsc-incompleteness diagnostics; suppress
         // them here too so multi-file snapshots stay a fair user-code
         // differential.
-        if (modules.isLibPath(pf.path)) continue;
+        if (ztsc.libs.isLibPath(pf.path)) continue;
         // skipLibCheck: drop diagnostics located in any non-lib `.d.ts`.
-        if (skip_lib_check and modules.isDeclarationPath(pf.path)) continue;
+        if (skip_lib_check and ztsc.paths.isDeclarationPath(pf.path)) continue;
         const rel = if (std.mem.startsWith(u8, pf.path, case_rel) and pf.path.len > case_rel.len + 1)
             pf.path[case_rel.len + 1 ..]
         else

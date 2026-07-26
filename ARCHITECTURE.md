@@ -18,7 +18,7 @@ Each phase is a function: inputs it may not mutate, one value out.
 | scan | `tokenize(alloc, src) -> Tokens` | `src/scanner.zig:65` |
 | parse | `parse(gpa, src) -> Ast` / `parseOpts(gpa, src, jsx)` | `src/parser.zig:87`, `:91` |
 | bind | `bind(arena, io, gpa, interner, tree: *const Ast, src, is_dts) -> Bind` | `src/binder.zig:743` |
-| link | `link(arena, gpa, io, interner, files: []const ProgFile, allow_synthetic_default) -> LinkResult` | `src/modules.zig:203` |
+| link | `link(arena, gpa, io, interner, files: []const ProgFile, allow_synthetic_default) -> LinkResult` | `src/modules.zig:192` |
 | base store | `buildBaseStore(store_arena) -> types.Store` | `src/checker.zig:238` |
 | check | `checkFiles(arena, io, gpa, interner, prog: *const Program, owned: []const FileId, base: ?*const types.Store, inst_cache_on) -> Check` | `src/checker.zig:157` |
 
@@ -78,7 +78,7 @@ collision. Determinism does not depend on interning order — the lib's strings
 are seeded single-threaded first (`seedLibAtoms`, `src/main.zig:678`) so the
 atoms that matter are run-to-run stable.
 
-**The `fs_probes` counter** (`src/modules.zig:1349`) — a
+**The `fs_probes` counter** (`src/resolve.zig:500`) — a
 `std.atomic.Value(u64)` counting filesystem syscalls for the `--timing`
 resolve-cache scoreboard. Pure telemetry: nothing reads it to make a decision,
 so it cannot affect output. Resolution is single-owner, so it is never truly
@@ -127,6 +127,20 @@ in, then the private implementation, then the tests. `src/parser.zig` and
 functions in `modules.zig` were public with no caller anywhere in `src/` or
 `test/`; withdrawing them changed nothing but the apparent size of the module's
 API. Check that with the compiler, not with intent.
+
+A module is one concern. What was `modules.zig` is four files, each with its
+own head and its own tests:
+
+| file | concern |
+| --- | --- |
+| `src/modules.zig` | the program: `FileId`, `Program`, `ProgFile`, `Target`, `link`, `buildProgram`, the cross-file global merge |
+| `src/libs.zig` | embedded `lib.*.d.ts` shards: `LibSet`, `resolveLibSet`, `libFiles`, `libSourceFor`, `isLibPath`, `seedLibAtoms` |
+| `src/paths.zig` | lexical path predicates and algebra, no filesystem: `normalizePath`, `dirnamePart`, `joinNormalize`, `isDeclarationPath`, the any-module predicates and their synthetic sources |
+| `src/resolve.zig` | specifier resolution: `resolveStem`, `scanReferences`, the `exports`-map machinery, `ResolveCache`/`FsCache`, `fs_probes` |
+
+They import each other freely (Zig permits mutual file imports); `Error`,
+`FileId` and `Program` stay in `modules.zig` because they are the
+project-wide data contract every consumer already names.
 
 ## Adding a lever
 
