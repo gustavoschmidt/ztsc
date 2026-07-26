@@ -614,15 +614,6 @@ fn computeSymBase(alloc: Allocator, files: []const ProgFile) Error![]u32 {
     return base;
 }
 
-/// FileId of the injected lib file (matched by its synthetic path), or
-/// `no_file` when no lib was injected.
-fn libFileId(files: []const ProgFile) FileId {
-    for (files, 0..) |*f, i| {
-        if (std.mem.eql(u8, f.path, libs.lib_path)) return @intCast(i);
-    }
-    return no_file;
-}
-
 /// A (constituent real id → merged id) pair for the reverse index.
 const ConstitPair = struct { key: u32, val: u32 };
 

@@ -103,7 +103,7 @@ pub fn anyModuleSourceFor(path: []const u8) ?[]const u8 {
 /// True for a program path that is a resolved JSON module (loaded as
 /// `json_module_source`, not read/parsed from disk). Only reachable when
 /// `resolveJsonModule` routed a `*.json` specifier to an on-disk file.
-pub fn isJsonModulePath(path: []const u8) bool {
+fn isJsonModulePath(path: []const u8) bool {
     return std.mem.endsWith(u8, path, ".json");
 }
 
