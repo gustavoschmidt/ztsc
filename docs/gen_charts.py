@@ -23,20 +23,25 @@ ROOT = os.path.dirname(HERE)
 
 # name, wall_ztsc, wall_tsgo (ms), rss_ztsc, rss_tsgo (MB)
 # Both tools at their default 4 checkers.
-# Re-measured 2026-07-25 at commit 881f77d, after the check-phase memoization
-# fix, the arena-hygiene pass, packed small-file loading, the resolver caches
-# and the duplicate-file dedupe. Every ztsc RSS row fell; the wall floor on the
-# smallest packages rose with the two-phase resolver. Both tools check their
-# default lib at their defaults — apples to apples, no parity flag needed.
+# Re-measured 2026-07-26 at commit 374d2c2, after the owned-file guards, the
+# flow-cache split, the resolver stat/exports memos, the PathElem shrink, the
+# lazy TS2589 anchor span, the locality-aware checker partition, the smaller
+# scratch retain floor and the `fnTypeParams` held-slice fix. RSS fell again on
+# six of eight packages and the check phase got ~25% cheaper. drizzle-orm's row
+# rose (15.0 -> 21.5 ms, 14.6 -> 17.3 MB), but the old figures were invalid:
+# before 1f18192 the checker segfaulted mid-check on that package at the default
+# 4 checkers, so the timed process was doing only part of the work. This row is
+# the first honest one. Both tools check their default lib at their defaults —
+# apples to apples, no parity flag needed.
 DATA = [
-    ("@types/node",        14.5,  45.7, 17.3, 102.4),
-    ("@types/react",       28.4, 243.4, 22.7, 185.4),
-    ("drizzle-orm",        15.0, 232.4, 14.6, 272.4),
-    ("hono",               32.0, 171.2, 24.5, 153.3),
-    ("@sinclair/typebox",  18.3,  47.1, 19.6,  77.7),
-    ("ajv",                13.1,  23.4, 11.5,  49.8),
-    ("zod",                27.7, 154.2, 21.2, 139.7),
-    ("chalk",               7.8,  18.6,  7.8,  43.7),
+    ("@types/node",        14.5,  46.9, 16.9, 101.7),
+    ("@types/react",       28.2, 247.2, 21.8, 185.2),
+    ("drizzle-orm",        21.5, 238.1, 17.3, 275.7),
+    ("hono",               31.3, 172.1, 23.5, 155.2),
+    ("@sinclair/typebox",  16.5,  49.2, 13.4,  78.6),
+    ("ajv",                13.9,  23.9, 10.3,  49.5),
+    ("zod",                26.0, 154.6, 20.7, 136.1),
+    ("chalk",               7.5,  18.5,  7.7,  43.4),
 ]
 
 RSS_MAX_PX = 290

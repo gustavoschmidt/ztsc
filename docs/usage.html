@@ -183,7 +183,9 @@ ztsc src/main.ts           # or explicit entry files</code></pre>
   an error tsc would report rather than inventing one, and it never crashes. It is not yet a
   drop-in replacement for <code>tsc --noEmit</code>: on a large production React/TypeScript
   application it reproduces all 48 of tsc's errors byte-identically, and adds 10 false
-  positives of its own.</p>
+  positives of its own. On that same application it is also the faster tool —
+  0.43&thinsp;s and 221&thinsp;MB peak RSS against tsgo's 0.53&thinsp;s and 734&thinsp;MB,
+  both at their default four checkers.</p>
   <p>What it does <strong>not</strong> check yet:</p>
   <ul>
     <li><strong>Watch mode and LSP</strong> — ztsc is batch-only; both are planned next, on an

@@ -47,13 +47,13 @@
   <em>infrastructure that machines call at high frequency and high concurrency</em>. That shift
   changes which properties matter:</p>
   <ul>
-    <li><strong>Memory per instance is a density limit.</strong> One 272&thinsp;MB checker is
-    nothing on a laptop. Fifty concurrent memory-capped sandboxes is where 272&thinsp;MB vs
-    15&thinsp;MB decides how many agents fit on a host — and what the GB-hours cost.</li>
+    <li><strong>Memory per instance is a density limit.</strong> One 276&thinsp;MB checker is
+    nothing on a laptop. Fifty concurrent memory-capped sandboxes is where 276&thinsp;MB vs
+    17&thinsp;MB decides how many agents fit on a host — and what the GB-hours cost.</li>
     <li><strong>The per-invocation floor gets multiplied by thousands.</strong> A checker run
     once a day can shrug off startup cost; a checker run on every agent edit pays it every
     time. ztsc's entire process floor — start, load the embedded lib, check — is
-    ~8–13&thinsp;ms.</li>
+    ~7–14&thinsp;ms.</li>
     <li><strong>Determinism is a cache key.</strong> Byte-identical output at any parallelism
     means a harness can cache, diff, and dedupe checker results reliably. The batch CLI
     <em>is</em> the agent interface — which is why batch shipped before the LSP.</li>
@@ -78,12 +78,12 @@
   memory model. Go's collector needs heap headroom — typically around 2× live data — and its
   AST and type objects are real heap objects: per-object headers, 64-bit pointers between them,
   allocation churn for the collector to chase. On the packages in the
-  <a href="./#benchmarks">benchmark</a>, tsgo peaks between 44 and 272&thinsp;MB; and its
-  footprint <em>grows steeply</em> with its parallelism (drizzle-orm: 171&thinsp;→&thinsp;407&thinsp;MB
+  <a href="./#benchmarks">benchmark</a>, tsgo peaks between 43 and 276&thinsp;MB; and its
+  footprint <em>grows steeply</em> with its parallelism (drizzle-orm: 166&thinsp;→&thinsp;411&thinsp;MB
   from 1 to 8 checkers).</p>
   <p>ztsc's answer is that a checker's live data can be tiny if nothing about the design fights
-  it: 16 bytes per AST node, 5 per token, 29 per type, ~178 bytes of heap per source line
-  all-in. There is no collector, so footprint <em>equals</em> live data — 5–25% of tsgo's peak
+  it: 16 bytes per AST node, 5 per token, 28 per type, ~187 bytes of heap per source line
+  all-in. There is no collector, so footprint <em>equals</em> live data — 6–21% of tsgo's peak
   on real packages, nearly flat as parallelism grows. Memory is the headline goal (the standing
   gate is ≤&thinsp;50% of tsgo; measured reality is far under it) with speed parity the
   constraint — and in practice ztsc is faster too, because the same choices that shrink memory
@@ -146,7 +146,8 @@
   reproduce an error, it <em>under-reports</em> rather than inventing errors on valid code. That
   bias holds, but it is not yet absolute: on a large production React/TypeScript application
   ztsc reproduces all 48 of tsc's errors byte-identically and still adds 10 false positives of
-  its own, each diagnosed and tracked. Closing them is the current work.</p>
+  its own, each diagnosed and tracked — a run it finishes in 0.43&thinsp;s and 221&thinsp;MB
+  against tsgo's 0.53&thinsp;s and 734&thinsp;MB. Closing the ten is the current work.</p>
   <p>What went <em>into</em> the subset was decided by measurement, not by spec order. Every
   <code>unsupported</code> node records which construct it covers, so <code>--census</code> over
   a vendored corpus of real published <code>.d.ts</code> (2,945 files, ~131k lines — @types/node,

@@ -5,9 +5,9 @@ A fast, low-memory TypeScript type checker, written in Zig.
 **Documentation & internals:** https://gustavoschmidt.github.io/ztsc/
 
 - **At least 4× less peak memory** than tsgo (the native TypeScript 7
-  compiler) on real packages — up to 19×.
+  compiler) on real packages — up to 16×.
 - **Faster on every benchmark package** — wall clock, defaults vs. defaults —
-  by up to 15×.
+  by up to 11×.
 - A **single static binary**. No Node runtime, no dependencies — and none in
   the source either: nothing but the Zig standard library.
 - **Parallel by design**, with byte-identical output at any worker count.
@@ -16,7 +16,7 @@ A fast, low-memory TypeScript type checker, written in Zig.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/benchmarks-dark.svg">
-  <img alt="Peak memory and wall clock across eight packages: ztsc uses 8-25 MB where tsgo uses 44-272 MB, and takes 8-32 ms where tsgo takes 19-243 ms" src="docs/benchmarks-light.svg">
+  <img alt="Peak memory and wall clock across eight packages: ztsc uses 8-24 MB where tsgo uses 43-276 MB, and takes 8-31 ms where tsgo takes 19-247 ms" src="docs/benchmarks-light.svg">
 </picture>
 
 > [!WARNING]
@@ -47,11 +47,11 @@ Run `ztsc --help` for all options.
 ## Benchmarks
 
 Eight real, published packages on an Apple M4, identical inputs, both tools
-at their default four checker instances — ztsc uses **5–25% of tsgo's peak memory**
-and is **faster on all eight, by up to 15×** (wall clock is the median of 11 runs
+at their default four checker instances — ztsc uses **6–21% of tsgo's peak memory**
+and is **faster on all eight, by up to 11×** (wall clock is the median of 11 runs
 under a monotonic nanosecond timer; the smallest packages sit near both tools'
 process floors, so their ratios reflect fixed startup cost rather than checking
-throughput — excluding those, ztsc is 2.6–15× faster).
+throughput — excluding those, ztsc is 3.0–11× faster).
 
 Full results, methodology, and limitations of the comparison:
 [BENCHMARKS.md](BENCHMARKS.md).
@@ -77,7 +77,9 @@ direction: ztsc misses an error `tsc` would report rather than inventing one,
 unsupported syntax produces a clear "not yet supported" diagnostic, and it
 never crashes. It is not yet a drop-in replacement for `tsc --noEmit`: on a
 large production React/TypeScript application it reproduces all 48 of tsc's
-errors byte-identically, and adds 10 false positives of its own.
+errors byte-identically, and adds 10 false positives of its own. On that same
+application it is also the faster tool — 0.43 s and 221 MB peak RSS against
+tsgo's 0.53 s and 734 MB, both at their default four checkers.
 
 What it does **not** check yet:
 
