@@ -6189,7 +6189,13 @@ const Checker = struct {
     /// pristine behavior (no churn) instead of trading one unreducible-type
     /// diagnostic for another.
     fn higherOrderSigEligible(c: *Checker, sig: TypeId) Error!bool {
-        for (c.ts.fnTypeParams(sig)) |p| {
+        // Index, never a held `fnTypeParams` slice: resolving a bound
+        // materializes it from the AST and interns, which can grow the store's
+        // `extra` array out from under the iterator (the `memberAt` rule). A
+        // held slice here segfaulted mid-check on drizzle-orm once the
+        // partition put the right pair of files on one checker.
+        for (0..c.ts.fnTypeParamCount(sig)) |i| {
+            const p = c.ts.fnTypeParamAt(sig, i);
             const con = try c.typeParamConstraint(p);
             if (con != types.no_type and c.ts.kind(con) != .type_param and !try c.boundReducible(con, 0) and !try c.boundHasReducerShape(con, 0)) return false;
             const def = try c.typeParamDefault(p);
@@ -6320,10 +6326,13 @@ const Checker = struct {
     /// self-contained (returns false) so instantiation skips it — the pristine,
     /// pre-rewrite behavior.
     fn sigReferencesOuterParam(c: *Checker, sig: TypeId, bound: []const u32) Error!bool {
-        const own = c.ts.fnTypeParams(sig);
-        if (own.len != 0 and !try c.higherOrderSigEligible(sig)) return false;
+        const n_own = c.ts.fnTypeParamCount(sig);
+        if (n_own != 0 and !try c.higherOrderSigEligible(sig)) return false;
         if (try c.containsFreeTypeParam(sig, bound)) return true;
-        if (own.len == 0) return false;
+        if (n_own == 0) return false;
+        // Own params are copied out *after* the two calls above: both intern, and
+        // a `fnTypeParams` slice held across an intern is dead (see `memberAt`).
+        const own = try c.scratch().dupe(u32, c.ts.fnTypeParams(sig));
         // Inside the sig, both the enclosing scope and the sig's own params are
         // bound; a constraint/default reaching anything else is an outer ref.
         var scope: std.ArrayList(u32) = .empty;
@@ -6818,7 +6827,7 @@ const Checker = struct {
                 break :blk obj;
             },
             .function => blk: {
-                const tps = s.fnTypeParams(t);
+                const n_tps = s.fnTypeParamCount(t);
                 // Higher-order rewrite: an own type param whose
                 // constraint/default is changed by `map` (`<U extends C<T>>`
                 // under `T:=…`) gets a *fresh* symbol carrying the substituted
@@ -6832,8 +6841,11 @@ const Checker = struct {
                 // Mint fresh params only for an eligible sig (all own bounds
                 // bare/absent); otherwise keep the original params + AST bounds
                 // (the pre-rewrite behavior for standalone generic functions).
-                const eligible = tps.len != 0 and map.len > 0 and try c.higherOrderSigEligible(t);
-                for (tps) |tp| {
+                const eligible = n_tps != 0 and map.len > 0 and try c.higherOrderSigEligible(t);
+                // Index: the loop body resolves bounds and instantiates, both of
+                // which intern and can move `extra` (see `memberAt`).
+                for (0..n_tps) |tp_i| {
+                    const tp = s.fnTypeParamAt(t, tp_i);
                     if (tpLookup(map, tp) != null) continue; // substituted away
                     var fresh: ?u32 = null;
                     if (eligible) {
@@ -7549,7 +7561,9 @@ const Checker = struct {
                 // params; outer/free params still flow through untouched.
                 var base_map: std.ArrayList(TpMap) = .empty;
                 defer base_map.deinit(c.scratch());
-                for (s.fnTypeParams(src)) |p| {
+                // Index: resolving a constraint interns (see `memberAt`).
+                for (0..s.fnTypeParamCount(src)) |i| {
+                    const p = s.fnTypeParamAt(src, i);
                     const con = try c.typeParamConstraint(p);
                     const bt = if (con != types.no_type) con else types.unknown_type;
                     try base_map.append(c.scratch(), .{ .sym = p, .ty = bt });

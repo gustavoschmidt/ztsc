@@ -599,11 +599,27 @@ pub const Store = struct {
         if (id < s.base_len) return s.base.?.fnReturn(id);
         return s.extra.items[s.dataA(id) + 1];
     }
+    /// The signature's own type-param symbols. **Borrowed from `extra` — dead as
+    /// soon as a new type is interned**, exactly like `members`. Only hold it
+    /// across a loop that provably cannot intern; otherwise walk with
+    /// `fnTypeParamCount`/`fnTypeParamAt`, which re-derive per step. Resolving a
+    /// type param's constraint/default *does* intern (it materializes the bound
+    /// from the AST), so any loop that touches bounds must index.
     pub fn fnTypeParams(s: *const Store, id: TypeId) []const u32 {
         if (id < s.base_len) return s.base.?.fnTypeParams(id);
         const base = s.dataA(id);
         const tpc = s.extra.items[base + 2];
         return s.extra.items[base + 3 .. base + 3 + tpc];
+    }
+    /// Type-param count for a `fnTypeParamAt` walk.
+    pub fn fnTypeParamCount(s: *const Store, id: TypeId) usize {
+        return s.fnTypeParams(id).len;
+    }
+    /// One type param by index, re-deriving the slice on every call — an index
+    /// survives an intern-driven `extra` growth where a held pointer does not
+    /// (see `memberAt`).
+    pub fn fnTypeParamAt(s: *const Store, id: TypeId, i: usize) u32 {
+        return s.fnTypeParams(id)[i];
     }
     pub fn fnParamCount(s: *const Store, id: TypeId) u32 {
         return s.dataB(id);
