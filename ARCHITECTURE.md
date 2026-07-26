@@ -15,10 +15,10 @@ Each phase is a function: inputs it may not mutate, one value out.
 
 | phase | signature | where |
 | --- | --- | --- |
-| scan | `tokenize(alloc, src) -> Tokens` | `src/scanner.zig:942` |
+| scan | `tokenize(alloc, src) -> Tokens` | `src/scanner.zig:65` |
 | parse | `parse(gpa, src) -> Ast` / `parseOpts(gpa, src, jsx)` | `src/parser.zig:87`, `:91` |
 | bind | `bind(arena, io, gpa, interner, tree: *const Ast, src, is_dts) -> Bind` | `src/binder.zig:743` |
-| link | `link(arena, gpa, io, interner, files: []const ProgFile, allow_synthetic_default) -> LinkResult` | `src/modules.zig:2540` |
+| link | `link(arena, gpa, io, interner, files: []const ProgFile, allow_synthetic_default) -> LinkResult` | `src/modules.zig:203` |
 | base store | `buildBaseStore(store_arena) -> types.Store` | `src/checker.zig:238` |
 | check | `checkFiles(arena, io, gpa, interner, prog: *const Program, owned: []const FileId, base: ?*const types.Store, inst_cache_on) -> Check` | `src/checker.zig:157` |
 
@@ -78,7 +78,7 @@ collision. Determinism does not depend on interning order — the lib's strings
 are seeded single-threaded first (`seedLibAtoms`, `src/main.zig:678`) so the
 atoms that matter are run-to-run stable.
 
-**The `fs_probes` counter** (`src/modules.zig:906`) — a
+**The `fs_probes` counter** (`src/modules.zig:1349`) — a
 `std.atomic.Value(u64)` counting filesystem syscalls for the `--timing`
 resolve-cache scoreboard. Pure telemetry: nothing reads it to make a decision,
 so it cannot affect output. Resolution is single-owner, so it is never truly
@@ -114,6 +114,19 @@ it.)
 The memory numbers lean on it too: because a phase's scratch dies inside the
 phase and its output is a sealed value in a caller-owned arena, peak RSS is
 the sum of live sealed data — not of every allocator that ever ran.
+
+## File layout
+
+Every module in `src/` reads top-down in one order: the `//!` file doc
+comment, then the public entry functions, then the public types they traffic
+in, then the private implementation, then the tests. `src/parser.zig` and
+`src/checker.zig` are the reference. Types-only contract modules
+(`src/types.zig`, `src/ast.zig`) are exempt by nature — they are all surface.
+
+`pub` means "has a consumer in another file", not "looks reusable". Eight
+functions in `modules.zig` were public with no caller anywhere in `src/` or
+`test/`; withdrawing them changed nothing but the apparent size of the module's
+API. Check that with the compiler, not with intent.
 
 ## Adding a lever
 
