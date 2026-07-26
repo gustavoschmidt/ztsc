@@ -12007,14 +12007,20 @@ const Checker = struct {
                     }
                 }
                 const declared = try c.typeOfSymbol(sym);
-                // TDZ (TS2448): block-scoped use before declaration in the
-                // same function container.
-                if ((f.let_decl or f.const_decl or f.class) and !f.function and !f.var_decl and !f.param) {
-                    try c.checkTdz(sym, node, tok);
-                }
-                // Definite assignment (TS2454).
-                if ((f.let_decl or f.var_decl) and !f.param and !f.const_decl) {
-                    try c.checkUseBeforeAssigned(sym, node, tok, declared);
+                // TDZ (TS2448) and definite assignment (TS2454). Both are
+                // `void` — they contribute nothing to this identifier's type,
+                // which is `flowTypeOfReference(declared)` below either way —
+                // so the owned-file guard (see `checkJsxElement`) applies: in a
+                // file this checker does not own, `seal` drops whatever they
+                // report, and the only state they touch is `da_cache`, a pure
+                // (flow, sym) memo that every reader re-derives on miss.
+                if (c.owned_mask[c.cur_file]) {
+                    if ((f.let_decl or f.const_decl or f.class) and !f.function and !f.var_decl and !f.param) {
+                        try c.checkTdz(sym, node, tok);
+                    }
+                    if ((f.let_decl or f.var_decl) and !f.param and !f.const_decl) {
+                        try c.checkUseBeforeAssigned(sym, node, tok, declared);
+                    }
                 }
                 // Flow narrowing.
                 return c.flowTypeOfReference(node, sym, declared);
@@ -13795,6 +13801,11 @@ const Checker = struct {
     /// (TS2684). A member call `obj.m()` uses `obj`'s type; a bare call uses
     /// `void` (no receiver).
     fn checkThisArg(c: *Checker, node: Node, sig: TypeId) Error!void {
+        // Owned-file guard (see `checkJsxElement`): `void`, and its only
+        // payload is TS2684/TS2739 on the call's receiver — dropped by `seal`
+        // in a foreign file. The receiver `checkExprCached` it skips is a memo
+        // fill; `isAssignable` is a pure relation query.
+        if (!c.owned_mask[c.cur_file]) return;
         const this_ty = c.ts.fnThisType(sig);
         if (this_ty == 0) return;
         const callee = c.callShape(node).callee;
@@ -14918,6 +14929,16 @@ const Checker = struct {
     }
 
     fn checkCallArguments(c: *Checker, node: Node, sig: TypeId, arg_nodes: []const Node, report: bool) Error!void {
+        // Owned-file guard (see `checkJsxElement`). `void` result, and the
+        // call's *type* is settled before this runs: `resolveSignatureCall`
+        // returns `fnReturn(inst)`, where `inst` comes from
+        // `instantiateSigForCall` (which does its own argument unification),
+        // and overload selection uses `argumentsMatch`, not this. So arity
+        // (TS2554/2555), per-argument assignability (TS2345) and the excess
+        // property check are the entire payload here, and `seal` drops all of
+        // them in a file this checker does not own. The `checkExprCached` calls
+        // this skips only fill a memo other readers re-derive on miss.
+        if (!c.owned_mask[c.cur_file]) return;
         const nargs = countArgs(arg_nodes);
         const required = try c.requiredParams(sig);
         const total = c.paramTotal(sig);
@@ -17046,6 +17067,40 @@ const Checker = struct {
 
     fn checkFunctionBody(c: *Checker, node: Node, proto_idx: u32, body: Node, sig: TypeId) Error!void {
         if (body == 0) return;
+        // Owned-file guard (see `checkJsxElement`). This function returns
+        // `void` — its *result* is input-independent by construction, so the
+        // invariant the JSX guard needs holds trivially here. Everything it
+        // does is diagnostics (TS2355/2366, parameter-initializer and return
+        // assignability, and whatever the statement walk reports), and
+        // `diagFmt` files each one under `cur_file`, which `seal` drops unless
+        // this checker owns it.
+        //
+        // The obligation that is *not* trivial is side effects. The body walk
+        // populates `node_types` and materializes symbol types, and a foreign
+        // file is only ever entered by materializing a dependency's type — so
+        // the question is whether any later answer depends on the cache state
+        // this walk would have left behind:
+        //
+        //   * `node_types` is a memo, and every reader outside diagnostics
+        //     re-derives on miss (`checkExprCached`). The three readers that
+        //     branch on presence — `elaborateLiteralError`, `assignNarrows`'
+        //     compound-assign arm, `guardTargetFor`'s member callee — are
+        //     either diagnostics-only (dropped here) or reached from
+        //     `inferReturnType`, and `checkFunctionLikeExpr`/`checkFunctionDecl`
+        //     run that probe BEFORE this body walk, so the probe already sees
+        //     a cold cache today. Skipping the walk cannot change what it saw.
+        //   * Symbol types are materialized lazily and re-entrantly by
+        //     `typeOfSymbol`, never by the body walk being reached first: the
+        //     inferred type of anything this file exports is reachable from the
+        //     probe/`typeOfSymbol` path alone.
+        //   * `reassign_scanned`/`scopes_faulted` are per-file syntactic scans
+        //     driven by their own lazy faults, not by this walk.
+        //
+        // Byte-identity across `--checkers=N` is therefore preserved: the walk
+        // interns fewer types in a foreign file, and type identity is already
+        // required to be order-independent (that is the determinism contract
+        // every `--checkers=N` split exercises).
+        if (!c.owned_mask[c.cur_file]) return;
         const proto = c.tree.extraData(ast.FnProto, proto_idx);
         const saved_scope = c.cur_scope;
         const saved_ctx = c.fn_ctx;
