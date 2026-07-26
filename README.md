@@ -78,7 +78,7 @@ unsupported syntax produces a clear "not yet supported" diagnostic, and it
 never crashes. It is not yet a drop-in replacement for `tsc --noEmit`: on a
 large production React/TypeScript application it reproduces all 48 of tsc's
 errors byte-identically, and adds 10 false positives of its own. On that same
-application it is also the faster tool — 0.43 s and 221 MB peak RSS against
+application it is also the faster tool — 0.40 s and 219.6 MB peak RSS against
 tsgo's 0.53 s and 734 MB, both at their default four checkers.
 
 What it does **not** check yet:

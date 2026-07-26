@@ -62,8 +62,9 @@
   <p class="eyebrow"><span class="n">01</span> · the pipeline</p>
   <h2>One pass, three parallel regimes</h2>
   <p>ZTSC is a batch pipeline. Files are discovered from the entry points by a
-  <strong>single-owner completion-queue scheduler</strong>: each file's front end (load, scan,
-  parse, bind) runs as one task on the worker pool, and the <code>import</code> specifiers and
+  <strong>single-owner completion-queue scheduler</strong>: each file's front end (load, parse —
+  which tokenizes as it goes — and bind) runs as one task on the worker pool, and the
+  <code>import</code> specifiers and
   triple-slash <code>/// &lt;reference&gt;</code> directives it surfaces queue new file tasks
   immediately — no barrier between "waves", so one huge file can't stall the rest of the graph.
   Module resolution is memoized per <code>(importer&nbsp;dir, specifier)</code> — including a
@@ -75,7 +76,7 @@
 
   <figure>
     <div class="figbox">
-    <svg viewBox="0 0 940 380" role="img" aria-label="Pipeline diagram: entry files feed a per-file front end (load, scan, parse, bind) on a worker pool, with newly discovered imports and reference directives queueing more file tasks; then serial resolve and link phases; then four independent checker instances.">
+    <svg viewBox="0 0 940 380" role="img" aria-label="Pipeline diagram: entry files feed a per-file front end (load, parse, bind) on a worker pool, with newly discovered imports and reference directives queueing more file tasks; then serial resolve and link phases; then four independent checker instances.">
       <defs>
         <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
           <path d="M0,0 L10,5 L0,10 z" fill="var(--ink2)"/>
@@ -93,27 +94,22 @@
       <text class="t12" x="295" y="56" text-anchor="middle">per-file front end</text>
       <text class="t11 mut" x="295" y="71" text-anchor="middle">worker pool · --workers=CPUs</text>
 
-      <rect class="box" x="205" y="84" width="180" height="42"/>
-      <text class="t12" x="217" y="102">load <tspan class="mut">(mmap)</tspan></text>
-      <text class="t11 mut" x="217" y="117">7.3 ms · 387 MB/s</text>
-      <line class="flow" x1="295" y1="126" x2="295" y2="138" marker-end="url(#arr)"/>
+      <rect class="box" x="205" y="98" width="180" height="42"/>
+      <text class="t12" x="217" y="116">load <tspan class="mut">(mmap)</tspan></text>
+      <text class="t11 mut" x="217" y="131">7.3 ms · 387 MB/s</text>
+      <line class="flow" x1="295" y1="140" x2="295" y2="166" marker-end="url(#arr)"/>
 
-      <rect class="box" x="205" y="140" width="180" height="42"/>
-      <text class="t12" x="217" y="158">scan</text>
-      <text class="t11 mut" x="217" y="173">9.2 ms · 11.8 M lines/s</text>
-      <line class="flow" x1="295" y1="182" x2="295" y2="194" marker-end="url(#arr)"/>
+      <rect class="box" x="205" y="168" width="180" height="42"/>
+      <text class="t12" x="217" y="186">parse <tspan class="mut">→ tokens + SoA AST</tspan></text>
+      <text class="t11 mut" x="217" y="201">26.0 ms · then sealed</text>
+      <line class="flow" x1="295" y1="210" x2="295" y2="236" marker-end="url(#arr)"/>
 
-      <rect class="box" x="205" y="196" width="180" height="42"/>
-      <text class="t12" x="217" y="214">parse <tspan class="mut">→ SoA AST</tspan></text>
-      <text class="t11 mut" x="217" y="229">26.0 ms · then sealed</text>
-      <line class="flow" x1="295" y1="238" x2="295" y2="250" marker-end="url(#arr)"/>
-
-      <rect class="box" x="205" y="252" width="180" height="42"/>
-      <text class="t12" x="217" y="270">bind <tspan class="mut">→ symbols, flow</tspan></text>
-      <text class="t11 mut" x="217" y="285">34.9 ms · then sealed</text>
+      <rect class="box" x="205" y="238" width="180" height="42"/>
+      <text class="t12" x="217" y="256">bind <tspan class="mut">→ symbols, flow</tspan></text>
+      <text class="t11 mut" x="217" y="271">34.9 ms · then sealed</text>
 
       <!-- discovery loop -->
-      <path class="flow" d="M 205,273 C 186,273 186,105 202,105" marker-end="url(#arr)"/>
+      <path class="flow" d="M 205,259 C 186,259 186,119 202,119" marker-end="url(#arr)"/>
       <text class="t11 mut" x="295" y="330" text-anchor="middle">imports + /// references found</text>
       <text class="t11 mut" x="295" y="343" text-anchor="middle">here queue new file tasks</text>
 
@@ -180,8 +176,8 @@
   <table>
     <thead><tr><th>stage</th><th>output struct</th><th>defined in</th><th>what it holds</th><th>read by</th></tr></thead>
     <tbody>
-      <tr><td>load</td><td><code>Source</code></td><td><code>source.zig</code></td><td>mmapped bytes + line-start table</td><td>scan, render</td></tr>
-      <tr><td>scan</td><td><code>Tokens</code></td><td><code>scanner.zig</code></td><td>SoA token stream: tags + start offsets</td><td>parse, everyone via <code>Ast</code></td></tr>
+      <tr><td>load</td><td><code>Source</code></td><td><code>source.zig</code></td><td>mmapped bytes + line-start table</td><td>parse, render</td></tr>
+      <tr><td>scan (inside parse)</td><td><code>Tokens</code></td><td><code>scanner.zig</code></td><td>SoA token stream: tags + start offsets</td><td>parse, everyone via <code>Ast</code></td></tr>
       <tr><td>parse</td><td><code>Ast</code></td><td><code>ast.zig</code></td><td>SoA nodes + <code>extra_data</code> + parse diagnostics</td><td>bind, check</td></tr>
       <tr><td>bind</td><td><code>Bind</code></td><td><code>binder.zig</code></td><td>symbols, scopes, flow graph, import/export records</td><td>link, check</td></tr>
       <tr><td>resolve + link</td><td><code>Program</code></td><td><code>resolve.zig</code> / <code>modules.zig</code></td><td>all files + link tables + merged globals + ambient modules</td><td>check (×N, lock-free)</td></tr>
@@ -212,7 +208,10 @@ const n: number = "hi";</code></pre>
     tags:   []const Tag, // 1 B/token
     starts: []const u32, // 4 B/token · bit 31 = "newline before" (drives ASI)
 };</code></pre>
-  <p>For <code>demo.ts</code> the two arrays hold eight entries — 5 bytes per token, and no
+  <p>There is no separate tokenize pass: the parser pulls tokens from
+  <code>scanner.Scanner</code> as it goes and materializes exactly this pair of arrays into
+  <code>Ast.tokens</code>, which is what the binder and everything downstream read.
+  For <code>demo.ts</code> the two arrays hold eight entries — 5 bytes per token, and no
   <em>end</em> offsets stored (they're recomputed by rescanning the token when needed):</p>
   <pre><code>index    0              1           2      3           4    5               6          7
 tags     keyword_const  identifier  colon  identifier  eq   string_literal  semicolon  eof
@@ -1044,7 +1043,7 @@ pub const Program = struct {
 </section>
 
 <footer class="sitefoot">
-  ztsc 0.0.1-dev · sources: README.md, BENCHMARKS.md, EXPERIMENTS.md ARCHITECTURE.md and the src/ doc comments at commit 374d2c2 (2026-07-26) · numbers are Apple M4, macOS
+  ztsc 0.0.1-dev · sources: README.md, BENCHMARKS.md, EXPERIMENTS.md ARCHITECTURE.md and the src/ doc comments at commit f5adc66 (2026-07-26) · numbers are Apple M4, macOS
 </footer>
 
 </div>

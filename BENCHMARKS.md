@@ -93,8 +93,8 @@ because a crashed run stops paying for work it never did.
 ### Beyond the packages
 
 The same defaults on a large production React/TypeScript application — a whole
-app graph rather than a single package's `.d.ts` — put ztsc at **0.43 s and
-221 MB against tsgo's 0.53 s and 734 MB**, both at their default 4 checkers:
+app graph rather than a single package's `.d.ts` — put ztsc at **0.40 s and
+219.6 MB against tsgo's 0.53 s and 734 MB**, both at their default 4 checkers:
 faster than tsgo on the largest corpus measured, at 30% of its peak memory. That
 codebase is private, so the run is not reproducible from this repository; it is
 reported because it is the only measurement here taken on a full application,

@@ -23,7 +23,7 @@ Each phase is a function: inputs it may not mutate, one value out.
 | check | `checkFiles(arena, io, gpa, interner, prog: *const Program, owned: []const FileId, base: ?*const types.Store, inst_cache_on) -> Check` | `src/checker.zig:157` |
 
 The shell threads them together. A worker runs the whole per-file front end —
-load, scan, parse, bind — and pushes a completion message
+load, parse (which tokenizes), bind — and pushes a completion message
 (`Worker.discoverRun`, `src/main.zig:296`; `processFile`, `:317`). The main
 thread is the sole owner of the module graph and resolves each completion's
 specifiers as it arrives. Discovered files are then renumbered into a
