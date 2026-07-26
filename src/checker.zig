@@ -11156,6 +11156,22 @@ const Checker = struct {
     // =====================================================================
 
     fn checkJsxElement(c: *Checker, node: Node) Error!TypeId {
+        // A JSX element's *type* is unconditionally `JSX.Element` (see the
+        // return below): it does not depend on the tag's props, the attribute
+        // values, or the children. Everything between here and that return
+        // exists solely to raise diagnostics — and `diagFmt` files every
+        // diagnostic under `cur_file`, which `seal` drops unless this checker
+        // owns it. So in a file this checker does not own (reached only by
+        // materializing a dependency's inferred type) the whole body is dead
+        // work: same answer, discarded diagnostics.
+        //
+        // This is where the check phase's cross-checker duplication
+        // concentrated: at `--checkers=4` each checker walked the JSX trees of
+        // ~450 files it did not own, re-running props resolution and generic
+        // component inference (`inferJsxTargs`) that another checker was
+        // running anyway. Output is byte-identical for any `--checkers=N`
+        // because the value produced here is `JSX.Element` either way.
+        if (!c.owned_mask[c.cur_file]) return (try c.jsxNamespaceType(c.atom_Element)) orelse types.any_type;
         const e = c.tree.extraData(ast.JsxElementData, c.tree.nodeData(node).lhs);
         var props: TypeId = types.no_type; // no_type = unknown target (skip attr typing)
         var is_component = false;
