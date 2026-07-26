@@ -6285,9 +6285,12 @@ const Checker = struct {
         const s = &c.ts;
         switch (s.kind(t)) {
             .type_param => return true,
+            // Indexed walk, not a `memberList` dupe: the recursion can reach
+            // `sigReferencesOuterParam` -> `typeFromTypeNode`, which interns
+            // and may move `extra`. See `Store.memberAt`.
             .union_type, .intersection, .overloads => {
-                for (try c.memberList(t)) |m| {
-                    if (try c.containsTypeParam(m)) return true;
+                for (0..s.memberCount(t)) |i| {
+                    if (try c.containsTypeParam(s.memberAt(t, i))) return true;
                 }
                 return false;
             },
@@ -6334,8 +6337,8 @@ const Checker = struct {
                 return false;
             },
             .ref => {
-                for (s.refArgs(t)) |a| {
-                    if (try c.containsTypeParam(a)) return true;
+                for (0..s.refArgCount(t)) |i| {
+                    if (try c.containsTypeParam(s.refArgAt(t, i))) return true;
                 }
                 return false;
             },
@@ -6404,8 +6407,8 @@ const Checker = struct {
                 return true;
             },
             .union_type, .intersection, .overloads => {
-                for (try c.memberList(t)) |m| {
-                    if (try c.containsFreeTypeParam(m, bound)) return true;
+                for (0..s.memberCount(t)) |i| {
+                    if (try c.containsFreeTypeParam(s.memberAt(t, i), bound)) return true;
                 }
                 return false;
             },
@@ -6446,8 +6449,8 @@ const Checker = struct {
                 return false;
             },
             .ref => {
-                for (s.refArgs(t)) |a| {
-                    if (try c.containsFreeTypeParam(a, bound)) return true;
+                for (0..s.refArgCount(t)) |i| {
+                    if (try c.containsFreeTypeParam(s.refArgAt(t, i), bound)) return true;
                 }
                 return false;
             },
@@ -6646,13 +6649,13 @@ const Checker = struct {
             .union_type => blk: {
                 var parts: std.ArrayList(TypeId) = .empty;
                 defer parts.deinit(c.scratch());
-                for (try c.memberList(t)) |m| try parts.append(c.scratch(), try c.instantiateId(m, map, map_id));
+                for (0..s.memberCount(t)) |i| try parts.append(c.scratch(), try c.instantiateId(s.memberAt(t, i), map, map_id));
                 break :blk try s.makeUnion(c.scratch(), parts.items);
             },
             .intersection => blk: {
                 var parts: std.ArrayList(TypeId) = .empty;
                 defer parts.deinit(c.scratch());
-                for (try c.memberList(t)) |m| try parts.append(c.scratch(), try c.instantiateId(m, map, map_id));
+                for (0..s.memberCount(t)) |i| try parts.append(c.scratch(), try c.instantiateId(s.memberAt(t, i), map, map_id));
                 const inter = try s.makeIntersection(c.scratch(), parts.items);
                 // Propagate the origin tag through instantiation of a callable-
                 // object alias that materializes to a kept intersection (RTK's
@@ -6671,7 +6674,7 @@ const Checker = struct {
             .overloads => blk: {
                 var parts: std.ArrayList(TypeId) = .empty;
                 defer parts.deinit(c.scratch());
-                for (try c.memberList(t)) |m| try parts.append(c.scratch(), try c.instantiateId(m, map, map_id));
+                for (0..s.memberCount(t)) |i| try parts.append(c.scratch(), try c.instantiateId(s.memberAt(t, i), map, map_id));
                 break :blk try s.makeOverloads(parts.items);
             },
             .array => try s.makeArray(try c.instantiateId(s.arrayElem(t), map, map_id)),
@@ -7239,7 +7242,7 @@ const Checker = struct {
             },
             .array => try c.collectInferVars(s.arrayElem(t), out),
             .union_type, .intersection, .overloads => {
-                for (try c.memberList(t)) |m| try c.collectInferVars(m, out);
+                for (0..s.memberCount(t)) |i| try c.collectInferVars(s.memberAt(t, i), out);
             },
             .tuple => {
                 for (0..s.tupleLen(t)) |i| try c.collectInferVars(s.tupleElem(t, @intCast(i)).ty, out);
@@ -7258,7 +7261,7 @@ const Checker = struct {
                 try c.collectInferVars(s.fnReturn(t), out);
             },
             .ref => {
-                for (try c.refArgsList(t)) |a| try c.collectInferVars(a, out);
+                for (0..s.refArgCount(t)) |i| try c.collectInferVars(s.refArgAt(t, i), out);
             },
             .template_literal_type => {
                 for (0..s.templateHoleCount(t)) |i| try c.collectInferVars(s.templateHole(t, @intCast(i)), out);
@@ -7666,8 +7669,8 @@ const Checker = struct {
             .infer_var => true,
             .array => c.containsInfer(s.arrayElem(t)),
             .union_type, .intersection, .overloads => blk: {
-                for (try c.memberList(t)) |m| {
-                    if (try c.containsInfer(m)) break :blk true;
+                for (0..s.memberCount(t)) |i| {
+                    if (try c.containsInfer(s.memberAt(t, i))) break :blk true;
                 }
                 break :blk false;
             },
@@ -8402,9 +8405,10 @@ const Checker = struct {
         const t = try c.resolveStructural(t0);
         return switch (s.kind(t)) {
             .type_param, .infer_var, .mapped_param, .mapped, .index_access, .conditional, .keyof_op, .string_mapping, .template_literal_type => true,
+            // Indexed walk: `resolveStructural` in the recursion can intern.
             .union_type, .intersection => blk: {
-                for (try c.memberList(t)) |m| {
-                    if (try c.isGenericObjectForIndex(m)) break :blk true;
+                for (0..s.memberCount(t)) |i| {
+                    if (try c.isGenericObjectForIndex(s.memberAt(t, i))) break :blk true;
                 }
                 break :blk false;
             },
@@ -8429,8 +8433,8 @@ const Checker = struct {
             .array => c.containsMappedParam(s.arrayElem(t)),
             .index_access => (try c.containsMappedParam(s.indexAccessObj(t))) or (try c.containsMappedParam(s.indexAccessIndex(t))),
             .union_type, .intersection, .overloads => blk: {
-                for (try c.memberList(t)) |m| {
-                    if (try c.containsMappedParam(m)) break :blk true;
+                for (0..s.memberCount(t)) |i| {
+                    if (try c.containsMappedParam(s.memberAt(t, i))) break :blk true;
                 }
                 break :blk false;
             },
@@ -12267,7 +12271,7 @@ const Checker = struct {
             },
             .array => try c.collectTypeParamSyms(s.arrayElem(t), out),
             .union_type, .intersection, .overloads => {
-                for (try c.memberList(t)) |m| try c.collectTypeParamSyms(m, out);
+                for (0..s.memberCount(t)) |i| try c.collectTypeParamSyms(s.memberAt(t, i), out);
             },
             .tuple => {
                 for (0..s.tupleLen(t)) |i| try c.collectTypeParamSyms(s.tupleElem(t, @intCast(i)).ty, out);
@@ -12282,7 +12286,7 @@ const Checker = struct {
                 try c.collectTypeParamSyms(s.fnReturn(t), out);
             },
             .ref => {
-                for (try c.refArgsList(t)) |a| try c.collectTypeParamSyms(a, out);
+                for (0..s.refArgCount(t)) |i| try c.collectTypeParamSyms(s.refArgAt(t, i), out);
             },
             .template_literal_type => {
                 for (0..s.templateHoleCount(t)) |i| try c.collectTypeParamSyms(s.templateHole(t, @intCast(i)), out);

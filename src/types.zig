@@ -474,9 +474,28 @@ pub const Store = struct {
     // --- payload views ------------------------------------------------------
 
     /// Union/intersection/overload members.
+    ///
+    /// The returned slice points straight into `extra`, so it **dangles as
+    /// soon as a new type is interned** (`extra` may grow and move). Only hold
+    /// it across a loop that provably cannot intern; otherwise walk with
+    /// `memberCount`/`memberAt`, which re-derive the slice per step.
     pub fn members(s: *const Store, id: TypeId) []const TypeId {
         if (id < s.base_len) return s.base.?.members(id);
         return s.extra.items[s.dataA(id)..s.dataB(id)];
+    }
+
+    /// Member count for a `memberAt` walk.
+    pub fn memberCount(s: *const Store, id: TypeId) usize {
+        return s.members(id).len;
+    }
+
+    /// One member by index, re-deriving the slice on every call. Interning
+    /// mid-walk can grow/move `extra` — that is exactly the iterator
+    /// invalidation fixed in dceff79 — but a type's *contents* are immutable
+    /// once interned, so an index stays valid where a pointer does not.
+    /// Costs two loads instead of a scratch dupe of the whole list.
+    pub fn memberAt(s: *const Store, id: TypeId, i: usize) TypeId {
+        return s.members(id)[i];
     }
 
     pub fn arrayElem(s: *const Store, id: TypeId) TypeId {
@@ -639,6 +658,15 @@ pub const Store = struct {
         if (id < s.base_len) return s.base.?.refArgs(id);
         const base = s.dataA(id);
         return s.extra.items[base + 1 .. base + 1 + s.dataB(id)];
+    }
+
+    /// `refArgs` counterparts of `memberCount`/`memberAt` — same rationale.
+    pub fn refArgCount(s: *const Store, id: TypeId) usize {
+        return s.refArgs(id).len;
+    }
+
+    pub fn refArgAt(s: *const Store, id: TypeId, i: usize) TypeId {
+        return s.refArgs(id)[i];
     }
 
     pub fn inferVarId(s: *const Store, id: TypeId) u32 {
