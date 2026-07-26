@@ -1747,6 +1747,10 @@ const Checker = struct {
         return c.out.dupe(u8, s);
     }
 
+    /// The printer's error set deliberately EXCLUDES `Error.OutOfMemory`, so no
+    /// `Error!` (interning) function is reachable from it with `try` — which is
+    /// why the printers may hold borrowed `members`/`refArgs`/`fnTypeParams`
+    /// slices across their recursion. Keep it that way.
     const PrintErr = std.Io.Writer.Error;
 
     fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr!void {
@@ -4957,12 +4961,11 @@ const Checker = struct {
         // Compare same-symbol refs structurally WITHOUT expanding (so the
         // recursion tracks arg identity, not the materialized objects).
         if (s.kind(a0) == .ref and s.kind(b0) == .ref and s.refSymbol(a0) == s.refSymbol(b0)) {
-            const sa = s.refArgs(a0);
-            const ta = s.refArgs(b0);
-            if (sa.len == ta.len) {
+            const na = s.refArgCount(a0);
+            if (na == s.refArgCount(b0)) {
                 var all = true;
-                for (sa, ta) |x, y| {
-                    if (!try c.originArgEquiv(x, y, depth + 1)) {
+                for (0..na) |i| {
+                    if (!try c.originArgEquiv(s.refArgAt(a0, i), s.refArgAt(b0, i), depth + 1)) {
                         all = false;
                         break;
                     }
@@ -7794,8 +7797,8 @@ const Checker = struct {
                 break :blk false;
             },
             .ref => blk: {
-                for (s.refArgs(t)) |a| {
-                    if (try c.containsInfer(a)) break :blk true;
+                for (0..s.refArgCount(t)) |i| {
+                    if (try c.containsInfer(s.refArgAt(t, i))) break :blk true;
                 }
                 break :blk false;
             },
@@ -8550,8 +8553,8 @@ const Checker = struct {
                 break :blk false;
             },
             .ref => blk: {
-                for (s.refArgs(t)) |a| {
-                    if (try c.containsMappedParam(a)) break :blk true;
+                for (0..s.refArgCount(t)) |i| {
+                    if (try c.containsMappedParam(s.refArgAt(t, i))) break :blk true;
                 }
                 break :blk false;
             },
@@ -9594,8 +9597,8 @@ const Checker = struct {
 
     fn unionAnyMember(c: *Checker, t: TypeId, comptime f: fn (*Checker, TypeId) bool) bool {
         if (c.ts.kind(t) == .union_type) {
-            for (c.ts.members(t)) |m| {
-                if (f(c, m)) return true;
+            for (0..c.ts.memberCount(t)) |i| {
+                if (f(c, c.ts.memberAt(t, i))) return true;
             }
             return false;
         }
@@ -13240,8 +13243,8 @@ const Checker = struct {
 
     fn unionAnyMemberAll(c: *Checker, t: TypeId, comptime f: fn (*Checker, TypeId) bool) bool {
         if (c.ts.kind(t) == .union_type) {
-            for (c.ts.members(t)) |m| {
-                if (!f(c, m)) return false;
+            for (0..c.ts.memberCount(t)) |i| {
+                if (!f(c, c.ts.memberAt(t, i))) return false;
             }
             return true;
         }
@@ -14925,7 +14928,7 @@ const Checker = struct {
                 try c.bindAnyToTypeParams(s.fnReturn(pattern), tp_syms, candidates, depth + 1);
             },
             .ref => {
-                for (s.refArgs(pattern)) |a| try c.bindAnyToTypeParams(a, tp_syms, candidates, depth + 1);
+                for (0..s.refArgCount(pattern)) |i| try c.bindAnyToTypeParams(s.refArgAt(pattern, i), tp_syms, candidates, depth + 1);
             },
             else => {},
         }
@@ -17372,8 +17375,8 @@ const Checker = struct {
         const disc_t = c.resolveStructural(disc_t0) catch return false;
         if (c.ts.kind(disc_t) != .union_type) return false;
         const r = c.tree.extraData(ast.SubRange, d.rhs);
-        for (c.ts.members(disc_t)) |m| {
-            const rm = c.ts.regularLiteral(m) catch return false;
+        for (0..c.ts.memberCount(disc_t)) |mi| {
+            const rm = c.ts.regularLiteral(c.ts.memberAt(disc_t, mi)) catch return false;
             if (c.ts.literalBase(rm) == types.no_type and
                 c.ts.kind(rm) != .null and c.ts.kind(rm) != .undefined) return false;
             var covered = false;
