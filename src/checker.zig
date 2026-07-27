@@ -11798,6 +11798,21 @@ const Checker = struct {
                 return (try c.isAssignable(c.ts.condTrue(s), c.ts.condTrue(t))) and
                     (try c.isAssignable(c.ts.condFalse(s), c.ts.condFalse(t)));
             }
+            // A UNION target may contain the matching conditional
+            // (`T[] | (M extends X ? T : T[])`, the shape a function that
+            // widens its own conditional return type has). Apply the same
+            // branch-wise rule to each member first: the fallback below asks
+            // each branch to relate to the whole union, and a branch generally
+            // relates only to its counterpart *inside* the conditional member.
+            if (tk == .union_type) {
+                for (try c.memberList(t)) |m| {
+                    const rm = try c.resolveStructural(m);
+                    if (c.ts.kind(rm) != .conditional) continue;
+                    if (c.ts.condCheck(s) != c.ts.condCheck(rm) or c.ts.condExtends(s) != c.ts.condExtends(rm)) continue;
+                    if ((try c.isAssignable(c.ts.condTrue(s), c.ts.condTrue(rm))) and
+                        (try c.isAssignable(c.ts.condFalse(s), c.ts.condFalse(rm)))) return true;
+                }
+            }
             return (try c.isAssignable(try c.condTrueUnderExtends(s), t)) and
                 (try c.isAssignable(c.ts.condFalse(s), t));
         }
