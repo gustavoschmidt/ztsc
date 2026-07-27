@@ -3183,6 +3183,23 @@ const Checker = struct {
                 try c.diagFmt(2694, c.tokSpan(d.rhs), "Namespace '{s}' has no exported member '{s}'.", .{ stripQuotes(c.tokenText(spec_tok)), c.atomText(name) });
                 return types.error_type;
             }
+            // `typeof A.b` for any other qualified entity name (a namespace
+            // member, a namespace-import member, a nested namespace, a static):
+            // a type query names a VALUE, so the answer is property `b` on the
+            // type of `A`. This used to fall through to `any`, which erased the
+            // whole type downstream — `Radix.ComponentPropsWithoutRef<typeof
+            // Primitive.div>` (the shape every Radix component's props are
+            // built from) collapsed to `{}`, so every attribute on such a
+            // component read as excess.
+            const base = try c.typeofEntity(d.lhs);
+            const rb = try c.resolveStructural(base);
+            if (c.ts.kind(rb) == .any or c.ts.kind(rb) == .err) return rb;
+            if (try c.propOfType(rb, try c.memberAtom(d.rhs))) |p| {
+                return c.regularizeTypeQuery(p.ty);
+            }
+            // Unknown member: stay silent (`any`) rather than risk a false
+            // positive — the value-position access reports it where written.
+            return types.any_type;
         }
         if (c.nodeTag(node) != .identifier) return types.any_type;
         const tok = c.tree.nodeMainToken(node);
