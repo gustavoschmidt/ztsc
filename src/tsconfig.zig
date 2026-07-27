@@ -718,10 +718,19 @@ fn segMatch(pat: []const u8, name: []const u8) bool {
 /// Roots: `type_roots` when set (an explicit `typeRoots`), else every
 /// `<ancestor>/node_modules/@types` walking up from `project_dir`. A package
 /// name seen in a nearer root shadows the same name in a farther one (tsc's
-/// closest-wins). `types`, when non-null, restricts the set to the named
-/// packages (`@scope/name` maps to the `scope__name` directory convention);
-/// an empty `types` yields nothing. Symlinked package directories (pnpm) are
-/// followed like tsc's realpath resolution.
+/// closest-wins). Symlinked package directories (pnpm) are followed like tsc's
+/// realpath resolution.
+///
+/// `types`, when non-null, replaces the enumeration: each entry is a *type
+/// reference directive*, resolved the way tsc resolves one — the primary
+/// lookup takes the first `<typeRoot>/<name>` package directory (also trying
+/// DefinitelyTyped's `@scope/name` → `scope__name` convention), and on a miss
+/// the secondary lookup is ordinary node-module resolution of the name from
+/// the project directory (`resolve.resolveTypeDirective`). The secondary leg
+/// is what makes a non-`@types` entry work: `types: ["vitest/globals"]`
+/// resolves to `node_modules/vitest/globals.d.ts` through the package's
+/// `exports` map. An empty `types` yields nothing; an entry that resolves
+/// nowhere is skipped (tsc's TS2688 is not reported — an under-report).
 fn collectAutoTypes(
     io: Io,
     arena: Allocator,
@@ -750,17 +759,48 @@ fn collectAutoTypes(
         }
     }
 
-    // Optional restrict set: `types` package names mapped to `@types` dir names.
-    var allow: ?std.StringHashMapUnmanaged(void) = null;
+    var out: std.ArrayList([]const u8) = .empty;
+
+    // An explicit `types` list names type reference directives, not just
+    // `@types` directories: resolve each one instead of enumerating.
     if (types) |list| {
-        var m: std.StringHashMapUnmanaged(void) = .empty;
-        for (list) |name| try m.put(arena, try typesDirName(arena, name), {});
-        allow = m;
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        for (list) |name| {
+            if (name.len == 0) continue;
+            const mangled = try typesDirName(arena, name);
+            var found: ?[]u8 = null;
+            primary: for (roots.items) |root| {
+                const names: [2][]const u8 = .{ mangled, name };
+                for (names, 0..) |n, i| {
+                    if (i == 1 and std.mem.eql(u8, n, mangled)) continue;
+                    const pkg_dir = if (root.len == 0)
+                        try arena.dupe(u8, n)
+                    else
+                        try std.fmt.allocPrint(arena, "{s}/{s}", .{ root, n });
+                    if (try resolve.resolveTypesPackageMain(io, arena, base, pkg_dir)) |main| {
+                        found = main;
+                        break :primary;
+                    }
+                }
+            }
+            if (found == null) {
+                found = try resolve.resolveTypeDirective(io, arena, base, project_dir, name);
+            }
+            if (found) |f| {
+                const gop = try seen.getOrPut(arena, f);
+                if (!gop.found_existing) try out.append(arena, f);
+            }
+        }
+        std.mem.sort([]const u8, out.items, {}, struct {
+            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.order(u8, a, b) == .lt;
+            }
+        }.lessThan);
+        return out.toOwnedSlice(arena);
     }
 
     // Collect unique package directory names (nearest root wins) -> package dir.
     var pkg_dirs: std.StringHashMapUnmanaged([]const u8) = .empty;
-    var out: std.ArrayList([]const u8) = .empty;
     for (roots.items) |root| {
         const open_path = if (root.len == 0) "." else root;
         var dir = base.openDir(io, open_path, .{ .iterate = true }) catch continue;
@@ -772,9 +812,6 @@ fn collectAutoTypes(
                 // pnpm stores each `@types/<pkg>` as a symlink; follow it.
                 .directory, .sym_link => {},
                 else => continue,
-            }
-            if (allow) |a| {
-                if (!a.contains(entry.name)) continue;
             }
             const gop = try pkg_dirs.getOrPut(arena, entry.name);
             if (gop.found_existing) continue;
@@ -1475,6 +1512,49 @@ test "auto @types: 'types' restricts (and scoped name maps to scope__name); '[]'
     });
     const cfg2 = try loadInDir(io, alloc, d, "proj/tsconfig.json");
     try testing.expectEqual(@as(usize, 0), cfg2.auto_type_files.len);
+}
+
+test "auto @types: a 'types' entry that is not an @types package resolves as a package" {
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const d = tmp.dir;
+    try d.createDirPath(io, "proj/src");
+    // A real (non-DefinitelyTyped) package exposing a types-only subpath
+    // through its `exports` map — the `vitest/globals` shape.
+    try d.createDirPath(io, "proj/node_modules/vitest");
+    try d.writeFile(io, .{ .sub_path = "proj/src/a.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/node_modules/vitest/package.json", .data =
+        \\{ "name": "vitest", "types": "./dist/index.d.ts",
+        \\  "exports": { "./globals": { "types": "./globals.d.ts" } } }
+    });
+    try d.writeFile(io, .{ .sub_path = "proj/node_modules/vitest/globals.d.ts", .data = "" });
+    // A plain `"types"`-field package named without a subpath.
+    try d.createDirPath(io, "proj/node_modules/@testing-library/jest-dom");
+    try d.writeFile(io, .{ .sub_path = "proj/node_modules/@testing-library/jest-dom/package.json", .data =
+        \\{ "name": "@testing-library/jest-dom", "types": "types/index.d.ts" }
+    });
+    try d.createDirPath(io, "proj/node_modules/@testing-library/jest-dom/types");
+    try d.writeFile(io, .{ .sub_path = "proj/node_modules/@testing-library/jest-dom/types/index.d.ts", .data = "" });
+    // An @types package still wins its name through the primary (typeRoots)
+    // lookup, and an entry that resolves nowhere is simply dropped.
+    try d.createDirPath(io, "proj/node_modules/@types/node");
+    try d.writeFile(io, .{ .sub_path = "proj/node_modules/@types/node/index.d.ts", .data = "" });
+
+    try d.writeFile(io, .{ .sub_path = "proj/tsconfig.json", .data =
+        \\{ "compilerOptions": { "strict": true,
+        \\    "types": ["vitest/globals", "@testing-library/jest-dom", "node", "nope"] },
+        \\  "include": ["src"] }
+    });
+    const cfg = try loadInDir(io, alloc, d, "proj/tsconfig.json");
+    try testing.expectEqual(@as(usize, 3), cfg.auto_type_files.len);
+    try testing.expectEqualStrings("proj/node_modules/@testing-library/jest-dom/types/index.d.ts", cfg.auto_type_files[0]);
+    try testing.expectEqualStrings("proj/node_modules/@types/node/index.d.ts", cfg.auto_type_files[1]);
+    try testing.expectEqualStrings("proj/node_modules/vitest/globals.d.ts", cfg.auto_type_files[2]);
 }
 
 test "auto @types: 'typeRoots' overrides the default @types directories" {

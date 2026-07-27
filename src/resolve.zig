@@ -124,6 +124,19 @@ pub fn resolveTypesPackageMain(io: Io, alloc: Allocator, dir: Io.Dir, pkg_dir: [
     return resolveStem(io, alloc, dir, idx);
 }
 
+/// Resolve a type-reference directive name (a `compilerOptions.types` entry)
+/// through tsc's *secondary* lookup: ordinary node-module resolution of the
+/// name, walking `node_modules` up from `from_dir`. tsc treats every `types`
+/// entry as a type-reference directive — the primary lookup scans the
+/// `typeRoots` (`@types/<name>`, handled by the caller), and when that misses
+/// it resolves the name as a package, so `types: ["vitest/globals"]` reaches
+/// `node_modules/vitest/globals.d.ts` through the package's `exports` map (or
+/// its `"types"` field / `index.d.ts` for a bare name). Declarations only: a
+/// type directive never falls back to a JS `main`.
+pub fn resolveTypeDirective(io: Io, alloc: Allocator, dir: Io.Dir, from_dir: []const u8, name: []const u8) Error!?[]u8 {
+    return resolvePackage(io, alloc, dir, from_dir, name, false, null);
+}
+
 /// Stat a `*.json` stem (already `dir`-relative, ending in `.json`) as a
 /// resolved JSON module. Unlike `resolveStem`, no extension probing: the file
 /// must exist exactly as named (tsc resolves a JSON specifier only to the JSON
