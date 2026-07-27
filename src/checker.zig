@@ -5746,7 +5746,32 @@ const Checker = struct {
             }
             return result;
         }
+        // `interface RegExpMatchArray extends Array<string>` (and every
+        // user-written `interface X extends Array<T>`). ztsc models an array
+        // with a dedicated `.array` kind rather than the lib `Array<T>`
+        // interface's object, so `mergeBaseObject`'s object-only guard dropped
+        // the whole base: `m.length`, `m.slice`, `m[Symbol.iterator]` were all
+        // TS2339. Bridge to the interface object the same way a member access
+        // on a bare array does (`primitiveInterfaceProp`) and merge that.
+        if (c.ts.kind(base) == .array or c.ts.kind(base) == .tuple) {
+            const obj = (try c.arrayInterfaceObject(base)) orelse return derived;
+            return c.mergeBaseObject(derived, obj, false);
+        }
         return c.mergeBaseObject(derived, base, false);
+    }
+
+    /// The lib `Array<T>` interface's object for an array/tuple type, or null
+    /// when no lib is loaded (so the bridge degrades to today's behavior).
+    fn arrayInterfaceObject(c: *Checker, t: TypeId) Error!?TypeId {
+        const elem = switch (c.ts.kind(t)) {
+            .array => c.ts.arrayElem(t),
+            .tuple => try c.tupleElementUnion(t),
+            else => return null,
+        };
+        const sym = c.prog.globals.lookup(c.atom_Array) orelse return null;
+        if (!c.symFlags(sym).interface) return null;
+        const r = try c.resolveStructural(try c.ts.makeRef(sym, &.{elem}));
+        return if (c.ts.kind(r) == .object) r else null;
     }
 
     /// Combined overload set of two callable members (`.function` or
