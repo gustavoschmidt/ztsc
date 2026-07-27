@@ -18466,10 +18466,13 @@ const Checker = struct {
         return c.ts.makeUnion(c.scratch(), parts.items);
     }
 
-    /// If `call`'s callee is a predicate signature whose guarded parameter
-    /// receives `key` as its argument, return that predicate; else null.
-    /// Shared by user-defined type guards and assertion functions.
-    fn guardTargetFor(c: *Checker, call: Node, key: RefKey) Error!?types.Predicate {
+    /// A resolved predicate call: the callee's predicate and the argument
+    /// expression sitting in the guarded parameter's position.
+    const GuardCall = struct { pred: types.Predicate, arg: Node };
+
+    /// If `call`'s callee is a predicate signature, return that predicate
+    /// together with the argument in the guarded parameter's position.
+    fn guardCallOf(c: *Checker, call: Node) Error!?GuardCall {
         const shape = c.callShape(call);
         // Obtain the callee's type for predicate inspection. When the callee is
         // a MEMBER/element access (`rule.abstract.startsWith`), re-checking it
@@ -18495,8 +18498,17 @@ const Checker = struct {
         if (pred.param == types.Predicate.this_param) return null; // `this is T`: gap
         if (pred.param >= shape.arg_nodes.len) return null;
         const arg = shape.arg_nodes[pred.param];
-        if (arg == null_node or !try c.refMatches(arg, key)) return null;
-        return pred;
+        if (arg == null_node) return null;
+        return .{ .pred = pred, .arg = arg };
+    }
+
+    /// If `call`'s callee is a predicate signature whose guarded parameter
+    /// receives `key` as its argument, return that predicate; else null.
+    /// Shared by user-defined type guards and assertion functions.
+    fn guardTargetFor(c: *Checker, call: Node, key: RefKey) Error!?types.Predicate {
+        const g = (try c.guardCallOf(call)) orelse return null;
+        if (!try c.refMatches(g.arg, key)) return null;
+        return g.pred;
     }
 
     /// `if (isT(x))` — a user-defined type guard used in a condition.
@@ -18513,10 +18525,21 @@ const Checker = struct {
     /// argument to the asserted type for the rest of the flow; a bare
     /// `asserts cond` narrows by truthiness.
     fn narrowByAssertCall(c: *Checker, t: TypeId, call: Node, key: RefKey) Error!TypeId {
-        const pred = (try c.guardTargetFor(call, key)) orelse return t;
-        if (!pred.asserts) return t; // plain guards don't narrow as statements
-        if (pred.ty == types.no_type) return c.getTruthyPart(t); // `asserts cond`
-        return c.narrowByInstance(t, pred.ty, true);
+        const g = (try c.guardCallOf(call)) orelse return t;
+        if (!g.pred.asserts) return t; // plain guards don't narrow as statements
+        if (g.pred.ty == types.no_type) {
+            // `asserts cond` (no `is T`): tsc's `narrowTypeByAssertion` hands
+            // the ARGUMENT EXPRESSION to the condition narrower with
+            // `assumeTrue`, so `invariant(x !== null)` / `assert(typeof v ===
+            // "string")` narrows through the operator. Requiring the tracked
+            // reference to *be* the argument only ever caught the degenerate
+            // `assert(x)` — which the same call still handles, via the
+            // identifier arm's truthiness narrowing.
+            return c.narrowByCondition(t, g.arg, true, key);
+        }
+        // `asserts x is T` names its subject positionally: it must be the arg.
+        if (!try c.refMatches(g.arg, key)) return t;
+        return c.narrowByInstance(t, g.pred.ty, true);
     }
 
     /// tsc's `getInstanceType(constructorType)`: prefer the `prototype`
