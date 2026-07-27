@@ -257,23 +257,33 @@ pub fn buildBaseStore(store_arena: Allocator) Error!types.Store {
 /// tsc does. Exceeding it emits TS2589 and truncates the offending subtree to
 /// `error_type`.
 const max_instantiation_depth = 100;
-/// Global cap on total `instantiate` node-visits within one checker run — a
-/// dormant safety net against instantiation-count explosion (recursive
-/// conditional/mapped types, once those land). Set far above anything the
-/// current subset produces, so it never fires here (and thus can never make
-/// the `--no-inst-cache` oracle diverge: only the cache-independent depth
-/// limit fires in-subset).
+/// Cap on `instantiate` node-visits spent on one *source element*, reset at
+/// the top of `checkStatement` exactly as tsc resets `instantiationCount` at
+/// the top of `checkSourceElement`. The limit tsc documents is "5M type
+/// instantiations caused by the same statement" — a per-statement resource
+/// budget, not a per-compilation one.
 ///
-/// It has to stay dormant, and this is not just a headroom argument. Unlike
-/// the depth limb, `inst_count` is not a property of the program alone: the
-/// memo means it counts *first* visits, so it falls with cache hits (drizzle-
-/// orm at `--checkers=1`: 57,359 with the memo, 999,191 under
-/// `--no-inst-cache`, 17×) and it is split across instances by the checker
-/// partition. Any cap it could actually reach would therefore make TS2589
-/// depend on the configuration, which the determinism contract forbids. Keep
-/// the headroom; a real budget has to be built on a partition- and
-/// cache-independent quantity.
-const max_instantiation_count = 5_000_000;
+/// It used to be per-checker-lifetime here, and that is a different thing
+/// entirely. A single runaway annotation exhausted it while materializing one
+/// import (hoppscotch's `HoppRESTRequest`, a verzod/zod entity whose eager
+/// expansion is effectively unbounded), and from that point on *every*
+/// instantiation this checker performed — for the rest of the run, in every
+/// later file — took the guard's early exit and truncated to `error_type`.
+/// `const xs: string[] = []; xs.push("a")` three lines below the import
+/// reported `Property 'push' does not exist on type 'string[]'`. A
+/// statement-scoped budget cannot poison an unrelated later statement, which
+/// is the whole reason tsc scopes it there.
+///
+/// The value is sized against measured demand rather than inherited: ztsc's
+/// unit is one structural node visit (tsc's is a much coarser
+/// `instantiateType` call), and 5M of them intern roughly half a gigabyte of
+/// types — a cap that permits that per statement is not a cap. Per-statement
+/// maxima over the benchmark corpus at `--checkers=1` are chalk 74,
+/// @types/react 775, @types/node 830, zod 1,142, hono 3,346, drizzle-orm
+/// 4,161, typebox 15,400, ajv 21,201. 250,000 is an order of magnitude above
+/// the worst of those and two orders below the runaway, and it bounds a
+/// pathological statement to tens of megabytes instead of hundreds.
+const max_instantiation_count = 250_000;
 /// Upper bound on scratch-arena physical capacity retained across the
 /// per-statement reset (`run`). The scratch arena is a transient workspace
 /// reset after every top-level statement; with plain `.retain_capacity` the
@@ -698,12 +708,17 @@ const Checker = struct {
     /// otherwise-unbounded walk over an undecidable recursive alias's
     /// expansions (see the constant's doc comment).
     rel_depth: u32 = 0,
-    /// Total `instantiate` node-visits this run (checked against
-    /// `max_instantiation_count`). Monotonic: every visit is counted, with no
-    /// exempt window — an exempt window would make the total depend on which
-    /// side of it a memoized first visit happened to fall on, i.e. on
-    /// traversal order (see `tagInstantiatedOrigin`).
+    /// `instantiate` node-visits spent on the source element being checked
+    /// (against `max_instantiation_count`); reset by `checkStatement`. Within
+    /// a statement it is monotonic, with no exempt window — an exempt window
+    /// would make the total depend on which side of it a memoized first visit
+    /// happened to fall on, i.e. on traversal order (see
+    /// `tagInstantiatedOrigin`).
     inst_count: u64 = 0,
+    /// Every node-visit this checker performed, never reset. The budget above
+    /// is scoped to a statement; this is the work counter the `--memory`
+    /// report and `bench/repeat_sweep.sh` compare across runs.
+    inst_total: u64 = 0,
     /// Set when the current top-level `instantiate` call tripped the depth or
     /// count limit; suppresses memoization of the (truncated) results for that
     /// call. Reset at each top-level entry (`inst_depth == 0`).
@@ -970,7 +985,7 @@ const Checker = struct {
         c.stats.type_bytes = c.ts.typeBytes();
         c.stats.relation_entries = c.relation.count();
         c.stats.relation_bytes = c.relation.capacity() * (8 + 1);
-        c.stats.instantiations = c.inst_count;
+        c.stats.instantiations = c.inst_total;
         return .{ .diagnostics = list, .stats = c.stats };
     }
 
@@ -6903,6 +6918,7 @@ const Checker = struct {
         }
         c.inst_depth += 1;
         c.inst_count += 1;
+        c.inst_total += 1;
         defer c.inst_depth -= 1;
         const s = &c.ts;
         const result: TypeId = switch (s.kind(t)) {
@@ -7347,6 +7363,7 @@ const Checker = struct {
         }
         c.inst_depth += 1;
         c.inst_count += 1;
+        c.inst_total += 1;
         defer c.inst_depth -= 1;
         const s = &c.ts;
         // A naked `infer`-var check belongs to an *enclosing* conditional's
@@ -8223,6 +8240,7 @@ const Checker = struct {
         }
         c.inst_depth += 1;
         c.inst_count += 1;
+        c.inst_total += 1;
         defer c.inst_depth -= 1;
         const homomorphic = flags & types.mapped_flag_homomorphic != 0;
         // Deferral is decided by the *key set* only: the value/`as` branches may
@@ -9024,6 +9042,7 @@ const Checker = struct {
         }
         c.inst_depth += 1;
         c.inst_count += 1;
+        c.inst_total += 1;
         defer c.inst_depth -= 1;
         // Still generic in any hole → defer (keep the deferred template type).
         for (holes) |h| {
@@ -16989,8 +17008,11 @@ const Checker = struct {
         if (node == null_node) return;
         // Baseline anchor for any TS2589 raised while materializing types in
         // this statement (refined to finer spans at expression / assignment
-        // boundaries).
+        // boundaries), and the source element the instantiation budget is
+        // scoped to (`max_instantiation_count` — tsc's `checkSourceElement`
+        // resets `instantiationCount` at exactly this point).
         c.anchorInst(node);
+        c.inst_count = 0;
         const d = c.tree.nodeData(node);
         const stmt_tag = c.nodeTag(node);
         // A class-position decorator applies to the class that immediately
