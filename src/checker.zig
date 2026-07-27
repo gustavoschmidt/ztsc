@@ -3955,6 +3955,12 @@ const Checker = struct {
     /// higher-order helper forwards a call (`<T extends any[]>(fn: (...a: T) =>
     /// void)` instantiated at `[string, number]`), so the erasure removed
     /// argument checking from every such call site.
+    /// A *union* of arrayish types answers with the union of their element
+    /// types, the way tsc's `getIndexedAccessType(restType, number)`
+    /// distributes: `(...handlers: S[] | S[][])` accepts an `S` *or* an `S[]`
+    /// per position, and collapsing that to `any` left every argument — most
+    /// visibly a callback — contextually untyped, so its parameters fell to
+    /// implicit `any` (TS7006) at call sites the non-union form typed fine.
     fn elemOfArrayish(c: *Checker, t: TypeId) Error!TypeId {
         const r = if (c.ts.kind(t) == .ref) try c.resolveStructural(t) else t;
         return switch (c.ts.kind(r)) {
@@ -8571,6 +8577,17 @@ const Checker = struct {
             if (!ext_generic and s.kind(chk) == .function and s.kind(try c.resolveStructural(extends_ty)) == .function) {
                 return c.resolveConcreteConditional(chk, extends_ty, true_ty, false_ty);
             }
+            // An array/tuple check against an array pattern whose element is a
+            // bare `infer` — the lib's `FlatArray`, `Arr extends
+            // ReadonlyArray<infer InnerArr>` — is decided by the check's
+            // *shape*: an array is an array whatever its element type is, and
+            // the infer var absorbs that element. Free params in the element
+            // therefore cannot change the answer, so resolve instead of
+            // deferring. Deferring left `arr.flat()` as an unreduced
+            // conditional that related to nothing.
+            if (!ext_generic and try c.arrayDecidablyExtends(chk, extends_ty)) {
+                return c.resolveConcreteConditional(chk, extends_ty, true_ty, false_ty);
+            }
             return s.makeConditional(chk, extends_ty, true_ty, false_ty, distributive);
         }
         return c.resolveConcreteConditional(chk, extends_ty, true_ty, false_ty);
@@ -8603,6 +8620,26 @@ const Checker = struct {
             return c.substInfer(true_ty, ids.items, vals);
         }
         return false_ty; // infer binders are out of scope in the false branch
+    }
+
+    /// Decidability rule for a check against an array pattern whose element is
+    /// a bare `infer` var (`Arr extends ReadonlyArray<infer I>` — the lib's
+    /// `FlatArray`). An unconstrained `infer` accepts every element type, so
+    /// the only thing the pattern asks is "is the check an array?", and that is
+    /// settled by the check's own shape: an array/tuple always matches, a
+    /// function never does, whatever free params sit inside them. A pattern
+    /// with a *constrained* element (`ReadonlyArray<string>`) decides nothing —
+    /// whether `T[]` matches it depends on `T` — so that still defers, as does
+    /// a check whose top-level shape is itself a variable.
+    fn arrayDecidablyExtends(c: *Checker, chk: TypeId, extends_ty: TypeId) Error!bool {
+        const s = &c.ts;
+        switch (s.kind(try c.resolveStructural(chk))) {
+            .array, .tuple, .function => {},
+            else => return false,
+        }
+        const ext = try c.resolveStructural(extends_ty);
+        if (s.kind(ext) != .array) return false;
+        return s.kind(s.arrayElem(ext)) == .infer_var;
     }
 
     /// Narrow decidability rule for a deferred conditional whose *check* is a
