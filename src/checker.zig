@@ -392,6 +392,31 @@ const FnCtx = struct {
     yield_type: TypeId = 0,
 };
 
+/// A function body whose check was postponed because it was reached while
+/// *materializing* a class field's type from its initializer.
+///
+/// An un-annotated field (`toggle = () => { … this.setState(…) … }`) has its
+/// type inferred by checking the initializer, and that happens from inside
+/// `classInstanceType` — while the instance type is still being built. Walking
+/// the body there resolves every `this.<member>` against the in-progress
+/// (therefore `any`) instance, and `node_types` then caches the initializer's
+/// type so `checkClass`'s later, correct pass never re-enters the body. Every
+/// callback inside such a body lost its contextual type: `this.setState((prev)
+/// => …)` reported TS7006 on `prev`, and the whole any-receiver chain below it
+/// cascaded. Queueing the body and draining it once the instance type is
+/// complete keeps the field's type exactly as before while checking the body
+/// against the finished class.
+const DeferredBody = struct {
+    file: FileId,
+    node: Node,
+    proto_idx: u32,
+    body: Node,
+    sig: TypeId,
+    /// `this` in force where the body was found — the class's generic instance
+    /// for an instance field, whatever the ambient value was otherwise.
+    this_type: TypeId,
+};
+
 /// A memoized expression type together with the contextual type it was
 /// synthesized under (contextual re-check cache).
 const NodeType = struct { ty: TypeId, ctx: TypeId };
@@ -741,6 +766,14 @@ const Checker = struct {
     /// per-property-access `this`-substitution walk so codebases without
     /// `this` types pay nothing.
     has_this_types: bool = false,
+    /// Depth of "materializing a class field's type from its initializer"
+    /// frames. While non-zero, `checkFunctionBody` queues the body onto
+    /// `deferred_bodies` instead of walking it — see `DeferredBody`.
+    defer_bodies: u32 = 0,
+    /// Function bodies whose check was postponed out of a member-type
+    /// materialization; drained once the enclosing class's instance type is
+    /// complete. See `DeferredBody` / `drainDeferredBodies`.
+    deferred_bodies: std.ArrayList(DeferredBody) = .empty,
     inst_depth: u32 = 0,
     /// Live recursion depth of alias-instance expansion (`aliasInstance`).
     /// `alias_state` already breaks *direct* self-recursion with a lazy ref, but
@@ -1023,6 +1056,10 @@ const Checker = struct {
             c.this_type = 0;
             for (c.tree.nodeRange(0)) |stmt| {
                 if (stmt != null_node) try c.checkStatement(stmt);
+                // Every class touched by this statement now has a complete
+                // instance type, so the function bodies its field initializers
+                // deferred can be walked (see `DeferredBody`).
+                try c.drainDeferredBodies();
                 c.noteScratch();
                 _ = c.scratch_arena.reset(.{ .retain_with_limit = scratch_retain_limit });
             }
@@ -5333,7 +5370,14 @@ const Checker = struct {
                         const ok = e.flags & ast.Flags.static != 0 and e.flags & ast.Flags.readonly != 0;
                         return c.annTypeMaybeUnique(e.type_ann, ok, 1331, c.tokSpan(c.tree.nodeMainToken(decl)));
                     }
-                    if (e.init != 0) return c.widenLiteral(try c.checkExprCached(e.init, types.no_type));
+                    if (e.init != 0) {
+                        // The initializer is being typed to *build* the class's
+                        // instance type; any function body inside it must not be
+                        // walked until that type exists (see `DeferredBody`).
+                        c.defer_bodies += 1;
+                        defer c.defer_bodies -= 1;
+                        return c.widenLiteral(try c.checkExprCached(e.init, types.no_type));
+                    }
                     return types.any_type;
                 },
                 .property_signature => {
@@ -6768,6 +6812,17 @@ const Checker = struct {
         if (c.class_static_cache.get(sym)) |t| return t;
         const saved_ctx = c.enterSymFile(sym);
         defer c.restoreCtx(saved_ctx);
+        // `this` inside a static member is the class's constructor type (tsc),
+        // exactly as `checkClass` sets it for the static branch. Set it here too
+        // so a static field whose initializer is a function (`static _save = ()
+        // => this.locker…`) sees the right receiver even when its type is first
+        // materialized through static expansion rather than the class walk —
+        // otherwise `this` was whatever the ambient value happened to be at
+        // materialization time (the *enclosing* class, when one class's members
+        // pull in another's).
+        const saved_this = c.this_type;
+        defer c.this_type = saved_this;
+        c.this_type = try c.ts.makeClassValue(sym);
         var props: std.ArrayList(types.Prop) = .empty;
         defer props.deinit(c.scratch());
         if (c.bind.staticsScopeOf(c.localOf(sym))) |ss| {
@@ -18992,6 +19047,29 @@ const Checker = struct {
         }
     }
 
+    /// Walk every function body postponed by `defer_bodies`, in queue order.
+    /// Each entry restores the file and `this` it was queued under; draining a
+    /// body may queue more (a nested class, another field), so the loop reads
+    /// the list by index until it stops growing.
+    fn drainDeferredBodies(c: *Checker) Error!void {
+        if (c.deferred_bodies.items.len == 0) return;
+        std.debug.assert(c.defer_bodies == 0);
+        const saved_ctx = c.saveCtx();
+        const saved_this = c.this_type;
+        defer {
+            c.restoreCtx(saved_ctx);
+            c.this_type = saved_this;
+        }
+        var i: usize = 0;
+        while (i < c.deferred_bodies.items.len) : (i += 1) {
+            const d = c.deferred_bodies.items[i];
+            if (d.file != c.cur_file) c.setFile(d.file);
+            c.this_type = d.this_type;
+            try c.checkFunctionBody(d.node, d.proto_idx, d.body, d.sig);
+        }
+        c.deferred_bodies.clearRetainingCapacity();
+    }
+
     fn checkFunctionBody(c: *Checker, node: Node, proto_idx: u32, body: Node, sig: TypeId) Error!void {
         if (body == 0) return;
         // Owned-file guard (see `checkJsxElement`). This function returns
@@ -19028,6 +19106,19 @@ const Checker = struct {
         // required to be order-independent (that is the determinism contract
         // every `--checkers=N` split exercises).
         if (!c.owned_mask[c.cur_file]) return;
+        // Reached while materializing a class field's type: postpone the walk
+        // until the enclosing class's instance type exists (see `DeferredBody`).
+        if (c.defer_bodies > 0) {
+            try c.deferred_bodies.append(c.cm(), .{
+                .file = c.cur_file,
+                .node = node,
+                .proto_idx = proto_idx,
+                .body = body,
+                .sig = sig,
+                .this_type = c.this_type,
+            });
+            return;
+        }
         const proto = c.tree.extraData(ast.FnProto, proto_idx);
         const saved_scope = c.cur_scope;
         const saved_ctx = c.fn_ctx;
