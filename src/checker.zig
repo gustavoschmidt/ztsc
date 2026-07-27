@@ -16735,6 +16735,10 @@ const Checker = struct {
             try c.fillFromReturnContext(sig, tp_syms, ret_ctx, ret_seed, false);
         }
 
+        // Empty-array-literal candidates, demoted to a fallback (see below).
+        const empty_seed = try c.scratch().alloc(TypeId, tp_syms.len);
+        for (empty_seed) |*x| x.* = types.no_type;
+        const pre_seed = try c.scratch().alloc(TypeId, tp_syms.len);
         // Phase 1: non-function arguments.
         var ai: u32 = 0;
         for (arg_nodes) |an| {
@@ -16806,6 +16810,27 @@ const Checker = struct {
                 arg_ctx = try c.instantiateKnownParams(arg_ctx, tp_syms, candidates, ret_seed);
             }
             const at = try c.checkExprCached(an, arg_ctx);
+            // An EMPTY array literal is the accumulator seed of a fold
+            // (`arr.reduce((acc: T[], el) => …, [])`). It carries no element
+            // evidence, and its type here is `any[]`, so unioning it into the
+            // parameter's candidates buries whatever the real evidence — the
+            // callback's annotated accumulator, a sibling argument — says:
+            // `T[]` became `any[] | T[]`. tsc reaches `T[]` because it takes
+            // the common SUPERTYPE of a parameter's covariant candidates and
+            // the seed's `never[]` is a subtype of every array; ztsc unions, so
+            // instead the seed is demoted the same way a placeholder echo is —
+            // it fills the parameter only when nothing else constrained it, so
+            // `f<U>(seed: U)` called with `[]` still infers the empty array.
+            if (tag == .array_literal and c.tree.nodeRange(an).len == 0) {
+                for (candidates, 0..) |cd, i| pre_seed[i] = cd;
+                try c.unify(pt, at, tp_syms, candidates, 0);
+                for (candidates, 0..) |*cd, i| {
+                    if (cd.* == pre_seed[i]) continue;
+                    if (empty_seed[i] == types.no_type) empty_seed[i] = cd.*;
+                    cd.* = pre_seed[i];
+                }
+                continue;
+            }
             try c.unify(pt, at, tp_syms, candidates, 0);
         }
         // Phase 1.5: contextual return-type *seed* (tsc's ReturnType-priority
@@ -16889,8 +16914,10 @@ const Checker = struct {
                 if (!seeded[i] and candidates[i] != types.no_type) p.ty = candidates[i];
             }
         }
-        // Demoted placeholder echoes fill what nothing else constrained.
+        // Demoted candidates fill what nothing else constrained.
         for (candidates, 0..) |*cd, i| {
+            if (cd.* != types.no_type) continue;
+            if (empty_seed[i] != types.no_type) cd.* = empty_seed[i];
             if (cd.* == types.no_type and echo_any[i] != types.no_type) cd.* = echo_any[i];
         }
         // Phase 3: contextual return-type inference for any params still
