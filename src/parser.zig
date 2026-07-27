@@ -2360,7 +2360,22 @@ const Parser = struct {
         if (p.curTag() != .l_paren) return error.Backtrack;
         const params = try p.parseParams();
         var ret: Node = null_node;
-        if (try p.eat(.colon) != null) ret = try p.parseReturnType();
+        if (try p.eat(.colon) != null) {
+            // An arrow's return-type annotation is a full type — including a
+            // conditional (`(x: X): X extends null ? null : string => …`).
+            // Clear the speculation flag across it, the way `parseParam` and
+            // `parseFunctionType` do: the `spec == 0` guard in `parseType`
+            // otherwise leaves `extends` unclaimed, the annotation stops at
+            // its check type, no `=>` follows, and the whole arrow backtracks
+            // into a parenthesized expression. This does not commit us to an
+            // arrow — the `=>` test below still backtracks, and `restore`
+            // truncates anything the annotation parse appended, diagnostics
+            // included.
+            const saved_spec = p.spec;
+            p.spec = 0;
+            defer p.spec = saved_spec;
+            ret = try p.parseReturnType();
+        }
         if (p.curTag() != .arrow) return error.Backtrack;
         if (p.nlBefore()) {
             // A line break before `=>` is a syntax error, but once we see
