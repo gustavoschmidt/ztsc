@@ -5750,15 +5750,13 @@ const Checker = struct {
         // depends on the order files are visited, i.e. on the checker count.
         //
         // Answering with the ref in BOTH cases makes the spelling of a recursive
-        // alias one thing. Scoped to an intersection body, which is exactly the
-        // excalidraw element shape (`_ExcalidrawElementBase & { type: … }`) whose
-        // two spellings drive the partition-sensitive element-union family, and
-        // where the `origin` machinery already treats a ref and its
-        // materialization as interchangeable. An object/function body measured
-        // as a no-op; a union body must stay materialized (a `.ref` standing in
-        // for a union is not interchangeable — discriminant narrowing and the
-        // union-source arms switch on `.union_type` directly).
-        if (c.alias_recursive.contains(sym) and c.ts.kind(generic) == .intersection) {
+        // alias one thing. Scoped to an `originTaggable` body — object, function
+        // or intersection — which is exactly the set the `origin` machinery
+        // already treats as "a ref and its materialization are interchangeable".
+        // A union body must stay materialized: a `.ref` standing in for a union
+        // is NOT interchangeable, because discriminant narrowing and the
+        // union-source relation arms switch on `.union_type` directly.
+        if (c.alias_recursive.contains(sym) and originTaggable(c.ts.kind(generic))) {
             return c.ts.makeRef(sym, fixed);
         }
         var tps: std.ArrayList(TypeParamInfo) = .empty;
