@@ -1070,14 +1070,25 @@ fn resolvePackageAt(io: Io, alloc: Allocator, dir: Io.Dir, d: []const u8, pkg: [
         }
     }
     if (!resolved_types) {
-        // Under allowJs, a types-less package resolves to its `main` JS entry
-        // (a declaration twin next to it still wins — `resolveStemOrJs`).
-        if (allow_js) {
-            if (pj_text) |text| {
-                if (packageMainField(text)) |main_rel| {
-                    const stem = try joinNormalize(alloc, nm, main_rel);
-                    defer alloc.free(stem);
-                    if (try resolveStemOrJs(io, alloc, dir, stem, true, fs)) |p| return p;
+        // No `types`/`typings`: tsc falls back to `main` *even for a TypeScript
+        // resolution*, substituting declaration extensions for the runtime one
+        // (`loadFileNameFromPackageJsonField`). A package that ships only
+        // `"main": "lib/index.js"` but sits next to a `lib/index.d.ts` — a very
+        // common shape for a package that emits declarations without declaring
+        // them — resolves to that `.d.ts`. `resolveStemFs` already performs the
+        // `.js`→`.ts`/`.tsx`/`.d.ts` substitution, so this is the same probe the
+        // relative `./x.js` importer gets. Declarations only here: the raw JS
+        // twin stays behind the `allow_js` leg below, which keeps the two-phase
+        // walk's promise that a declaration anywhere beats JS everywhere.
+        if (pj_text) |text| {
+            if (packageMainField(text)) |main_rel| {
+                const stem = try joinNormalize(alloc, nm, main_rel);
+                defer alloc.free(stem);
+                if (try resolveStemFs(io, alloc, dir, stem, fs)) |p| return p;
+                // Under allowJs the same `main` resolves to the raw JS entry
+                // (typed `any`) when no declaration twin exists.
+                if (allow_js) {
+                    if (try resolveJsStem(io, alloc, dir, stem, fs)) |p| return p;
                 }
             }
         }
