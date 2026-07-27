@@ -10497,6 +10497,34 @@ const Checker = struct {
         if (tk == .conditional) {
             return (try c.isAssignable(s, c.ts.condTrue(t))) and (try c.isAssignable(s, c.ts.condFalse(t)));
         }
+        // Deferred indexed-access *target*: `S → T[K]` holds when `S` relates to
+        // the BASE-CONSTRAINT instantiation of `T[K]` (tsc
+        // `structuredTypeRelatedTo`, IndexedAccess-as-target). Inside
+        // `<T extends { version: number }>`, `const v: T["version"] = 1` is legal
+        // because `T["version"]` is constrained to `number`; without this the
+        // access stayed opaque and every write through one was a phantom
+        // TS2322/TS2345. When the object side is still generic after
+        // substitution the constraint reduces back to the same deferred access
+        // (`bc == t`) and the relation stays rejected, as before.
+        if (tk == .index_access) {
+            const obj_bc = try c.transitiveBaseConstraint(c.ts.indexAccessObj(t));
+            // The INDEX takes a single constraint step, not a fixpoint: for
+            // `K extends keyof T` that step lands on the deferred `keyof T`,
+            // which is still generic and (correctly) blocks the rule. Iterating
+            // would collapse it through `keyof unknown` to `never` and make the
+            // access look resolvable — silently accepting anything as `T[K]`.
+            const idx_bc = try c.baseConstraintOf(c.ts.indexAccessIndex(t));
+            // tsc's two guards: neither side may still be generic after taking
+            // base constraints, or the access has no meaningful constraint.
+            if (!try c.isGenericObjectForIndex(obj_bc) and !try c.containsFreeTypeParam(idx_bc, &.{})) {
+                const bc = try c.reduceIndexedAccess(obj_bc, idx_bc);
+                // `unknown` is what `indexedAccessType` yields for a property
+                // that is genuinely absent — tsc's `getIndexedAccessTypeOrUndefined`
+                // returns nothing there and the rule does not apply.
+                if (bc != t and c.ts.kind(bc) != .unknown) return c.isAssignable(s, bc);
+            }
+            return false;
+        }
         // Template-literal pattern *target*: a concrete string literal is
         // assignable iff its text matches the pattern; `string` and non-string
         // sources are not. (Identical patterns / `string` already resolved via
@@ -10596,6 +10624,21 @@ const Checker = struct {
             .class_value => return false,
             else => return false,
         }
+    }
+
+    /// tsc's `getBaseConstraintOfType`: follow constraints all the way down.
+    /// `baseConstraintOf` substitutes each type param in `t` with its
+    /// *immediate* constraint from a fixed map, so `U extends T extends Base`
+    /// only reaches `T`; re-running it to a fixpoint reaches `Base`.
+    fn transitiveBaseConstraint(c: *Checker, t: TypeId) Error!TypeId {
+        var cur = t;
+        var i: u32 = 0;
+        while (i < 8) : (i += 1) {
+            const next = try c.baseConstraintOf(cur);
+            if (next == cur) break;
+            cur = next;
+        }
+        return cur;
     }
 
     fn isNonPrimitiveKind(k: types.Kind) bool {
