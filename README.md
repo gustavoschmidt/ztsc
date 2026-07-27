@@ -9,20 +9,13 @@ TypeScript compiler, byte-identical at any parallelism.
 
 **Full documentation:** https://gustavoschmidt.github.io/ztsc/
 
-- **15 ms** wall clock on @types/node — tsgo 7.0.2 takes 47 ms on the same
-  49.6k lines of declarations, and ztsc is faster on all eight benchmark
-  packages, by up to 11×.
-- **17 MB** peak RSS on @types/node — 17% of tsgo's 102 MB; across eight real
-  packages ztsc uses 4.8–16× less peak memory.
+- **4.8–16× less peak memory** than tsgo (the native TypeScript 7 compiler)
+  on eight real benchmark packages.
+- **Faster on all eight** — wall clock, defaults vs. defaults — by up to 11×.
 - **0 dependencies** — the Zig source uses nothing but the Zig standard
   library; the binary needs nothing but your OS.
 - **630/630 conformance** — differential cases (error code + line) against the
   native TypeScript compiler, tsgo 7.0.2.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/benchmarks-dark.svg">
-  <img alt="Peak memory and wall clock across eight packages: ztsc uses 8-24 MB where tsgo uses 43-276 MB, and takes 8-31 ms where tsgo takes 19-247 ms" src="docs/benchmarks-light.svg">
-</picture>
 
 > [!WARNING]
 > ztsc is pre-release and not ready for production use. It checks a large,
@@ -37,6 +30,11 @@ packages' published `.d.ts`, vendored at pinned versions, both tools checking
 identical inputs at their default 4 checker instances on an Apple M4: ztsc's
 peak memory is **6–21% of tsgo's** and its wall clock **9–58%** — 3.0–11×
 faster on everything bigger than the process floor.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/benchmarks-dark.svg">
+  <img alt="Peak memory and wall clock across eight packages: ztsc uses 8-24 MB where tsgo uses 43-276 MB, and takes 8-31 ms where tsgo takes 19-247 ms" src="docs/benchmarks-light.svg">
+</picture>
 
 | package | wall ztsc / tsgo | peak RSS ztsc / tsgo | rss vs tsgo |
 |---|---:|---:|---:|
@@ -128,6 +126,13 @@ rather than inventing errors on valid code: on the production dogfood app it
 reproduces all 48 of tsc's errors byte-identically and adds 10 tracked false
 positives. `ztsc --census` tells you in one command exactly which unsupported
 constructs your own project contains.
+
+On Windows specifically, ztsc does not build or run yet: the checker's
+per-symbol state lives in demand-zeroed anonymous memory obtained with POSIX
+`mmap` (`src/zeropage.zig`) — untouched pages never become resident, which is
+load-bearing for the memory numbers above — and the Windows equivalent
+(`VirtualAlloc`) is not wired in, so a Windows target fails at compile time
+with a clear error. macOS and Linux work today; a Windows port is planned.
 
 The full list — every gap, how it behaves today, and what's planned:
 [limitations page](https://gustavoschmidt.github.io/ztsc/limitations.html).
