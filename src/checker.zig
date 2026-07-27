@@ -11010,6 +11010,15 @@ const Checker = struct {
             if (con == types.no_type or c.ts.kind(con) == .unknown or c.ts.kind(con) == .any or con == b) return true;
             return c.castComparableRec(a0, con, depth + 1);
         }
+        // A deferred `keyof T` compares through the key domain. tsc relates an
+        // `Index` operand via `keyofConstraintType` — `string | number |
+        // symbol` — never through `keyof <constraint>`, and the comparable
+        // relation then distributes over that union existentially. Without it
+        // the `Object.keys(o).forEach((k) => o[k as keyof T])` idiom reported
+        // TS2352: `string` is not assignable *into* `keyof T`, and the
+        // whole key union is not assignable to `string`.
+        if (c.ts.kind(a) == .keyof_op) return c.castComparableRec(try c.propertyKeyType(), b0, depth + 1);
+        if (c.ts.kind(b) == .keyof_op) return c.castComparableRec(a0, try c.propertyKeyType(), depth + 1);
         // Existential union distribution on either side.
         if (c.ts.kind(a) == .union_type) {
             for (try c.memberList(a)) |m| {
