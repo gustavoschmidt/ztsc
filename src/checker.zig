@@ -17791,6 +17791,19 @@ const Checker = struct {
                 }
                 return t;
             },
+            // An ELEMENT-access chain link (`a?.[k]`) is the same optional
+            // chain as `a?.p`, on a different node tag — so the containment
+            // rule of the member arm above applies unchanged: a truthy chain
+            // implies its receivers did not short-circuit. Without this arm
+            // `if (m?.[2]) { m[3] }` left `m` nullable while the property form
+            // `if (o?.p)` narrowed, because element access fell through to the
+            // no-op default.
+            .index_expr, .optional_index_expr => {
+                if (sense and try c.optionalChainContainsRef(cond, key)) {
+                    return c.nonNullable(t);
+                }
+                return t;
+            },
             .binary => {
                 const op = c.tree.tokens.tag(c.tree.nodeMainToken(cond));
                 switch (op) {
