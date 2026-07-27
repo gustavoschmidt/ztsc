@@ -841,6 +841,12 @@ const Checker = struct {
     /// While set, `instantiateId`'s depth/count guard truncates silently
     /// (no TS2589) — used for origin-tag bookkeeping (`tagInstantiatedOrigin`).
     suppress_inst_diag: bool = false,
+    /// Depth of an in-flight *side query*: a type looked up from inside the
+    /// flow-narrowing walk, out of the checker's top-down order (see
+    /// `declaredPathType`). While non-zero `diagFmt` drops diagnostics — the
+    /// authoritative top-down check reports at the narrowed type, and a
+    /// narrowing query must never be the thing that files an error.
+    side_query_depth: u32 = 0,
     /// Set while checking the operand of an `expr as const` const
     /// assertion: object/array literals produce readonly, non-widened,
     /// literal-typed members (recursively). Cleared at function bodies.
@@ -1669,6 +1675,9 @@ const Checker = struct {
     }
 
     fn diagFmt(c: *Checker, code: u16, span: Span, comptime fmt: []const u8, args: anytype) Error!void {
+        // A side query re-checks an expression out of order to inspect its
+        // type; the authoritative top-down check reports at the resolved type.
+        if (c.side_query_depth > 0) return;
         const key = (@as(u128, c.cur_file) << 64) | (@as(u128, code) << 32) | span.start;
         const gop = try c.diag_seen.getOrPut(c.gpa, key);
         if (gop.found_existing) return;
@@ -19388,6 +19397,64 @@ const Checker = struct {
         return c.ts.makeUnion(c.scratch(), parts.items);
     }
 
+    /// DECLARED type of a dotted path of plain names (`m.isA`, `this.a.b`),
+    /// resolved structurally: the root symbol's declared type followed by
+    /// property lookups. No expression is checked, no flow narrowing runs and
+    /// nothing is memoized, so this is safe to call from inside the flow walk
+    /// itself — where re-checking the expression would both re-enter an
+    /// in-progress flow query (a receiver transiently re-widened to its
+    /// declared type) and publish that transient answer into `node_types`.
+    ///
+    /// Returns `no_type` for anything it cannot resolve exactly; the caller
+    /// treats that as "no information" (sound under-narrowing).
+    fn declaredPathType(c: *Checker, node: Node) Error!TypeId {
+        c.side_query_depth += 1;
+        defer c.side_query_depth -= 1;
+        // A property lookup can materialize a generic instantiation and trip
+        // the instantiation limit; whether it trips *here* rather than at the
+        // authoritative check depends on what this checker already cached, so a
+        // narrowing query must not be allowed to anchor a TS2589.
+        const saved = c.suppress_inst_diag;
+        defer c.suppress_inst_diag = saved;
+        c.suppress_inst_diag = true;
+        return c.declaredPathTypeInner(node);
+    }
+
+    fn declaredPathTypeInner(c: *Checker, node: Node) Error!TypeId {
+        switch (c.nodeTag(node)) {
+            .paren_expr => return c.declaredPathTypeInner(c.tree.nodeData(node).lhs),
+            .this_expr => return if (c.this_type != 0) c.this_type else types.no_type,
+            .identifier => {
+                const tok = c.tree.nodeMainToken(node);
+                if (c.tree.tokens.tag(tok) == .keyword_undefined) return types.no_type;
+                const a = try c.atomOfToken(tok);
+                return switch (c.resolveSpace(a, c.cur_scope, true)) {
+                    .sym => |sym| blk: {
+                        // Read-only: a narrowing query must not be what *starts*
+                        // a symbol's materialization. Doing so pulls the work
+                        // into the middle of the flow walk, where a dependency
+                        // that is already in progress resolves to `any` — and
+                        // that answer is then cached as the symbol's type for
+                        // the rest of the run.
+                        if (sym == binder.no_symbol or sym >= c.sym_types.items.len) break :blk types.no_type;
+                        if (c.sym_state.items[sym] != .computed) break :blk types.no_type;
+                        break :blk c.sym_types.items[sym];
+                    },
+                    else => types.no_type,
+                };
+            },
+            .member_expr, .optional_member_expr => {
+                const d = c.tree.nodeData(node);
+                const obj = try c.declaredPathTypeInner(d.lhs);
+                if (obj == types.no_type) return types.no_type;
+                const name = try c.memberAtom(d.rhs);
+                const p = (try c.propOfType(try c.nonNullable(obj), name)) orelse return types.no_type;
+                return p.ty;
+            },
+            else => return types.no_type,
+        }
+    }
+
     /// A resolved predicate call: the callee's predicate and the argument
     /// expression sitting in the guarded parameter's position.
     const GuardCall = struct { pred: types.Predicate, arg: Node };
@@ -19403,18 +19470,25 @@ const Checker = struct {
         // the very call statement/condition being checked (loop label still in
         // progress), the receiver is transiently re-widened to its declared
         // type, so the member access raises a spurious TS18048/2532 and caches a
-        // poisoned type. For those callees, consult only the already-computed
-        // type: a genuine member-callee guard is checked top-down before any
-        // read whose narrowing depends on it, so it is memoized by then; an
-        // un-memoized member callee means we are in that premature re-entrant
-        // state, so skip (sound under-narrowing). A bare-identifier callee
-        // (`isT(x)`) has no receiver to re-widen and is not always memoized as a
-        // node type, so it is safe to (re-)check directly.
+        // poisoned type. So the memoized type is used when the callee has
+        // already been checked top-down.
+        //
+        // An un-memoized member callee is not always that re-entrant state,
+        // though: `inferReturnType` is a probe that checks a function's
+        // `return` EXPRESSIONS directly, so in a function without a return
+        // annotation `if (m.isA(e)) return e.av;` reaches here with `m.isA`
+        // never checked — and the guard was silently dropped, which is what
+        // made member-callee predicates look unsupported. Resolve the callee
+        // structurally instead (`declaredPathType`): a type predicate is a
+        // property of the declaration, so the declared type answers the
+        // question, and the lookup neither narrows, checks nor memoizes.
         const callee = shape.callee;
         const callee_t = switch (c.nodeTag(callee)) {
-            .member_expr, .optional_member_expr, .index_expr, .optional_index_expr => c.nodeType(callee) orelse return null,
+            .member_expr, .optional_member_expr, .index_expr, .optional_index_expr => c.nodeType(callee) orelse
+                try c.declaredPathType(callee),
             else => try c.checkExprCached(callee, types.no_type),
         };
+        if (callee_t == types.no_type) return null;
         if (!c.ts.fnHasPredicate(callee_t)) return null;
         const pred = c.ts.fnPredicate(callee_t);
         if (pred.param == types.Predicate.this_param) return null; // `this is T`: gap
