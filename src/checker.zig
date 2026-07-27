@@ -15124,6 +15124,39 @@ const Checker = struct {
                     }
                     return;
                 }
+                // An INTERSECTION argument against an object-shaped param —
+                // tsc's `inferFromTypes` reduces an intersection source to its
+                // apparent members and then runs the ordinary structural
+                // inference, so each constituent that actually relates to the
+                // param contributes candidates. Without this the whole arm fell
+                // through (object-vs-intersection matches nothing) and every
+                // param stayed unbound: jotai's `useAtom(atom(null))` passes a
+                // `PrimitiveAtom<V> & WithInitialValue<V>` to a
+                // `WritableAtom<V, A, R>` parameter, so `V` collapsed to
+                // `unknown` and every use of the returned value was a spurious
+                // TS2339.
+                //
+                // Constituents are tried one at a time rather than merged into a
+                // bag of members: a merge lets an unrelated constituent's
+                // same-named property overwrite the matching one, and it also
+                // destroys the origin tag that the `.object` arm above needs for
+                // its same-generic positional pairing (which is what recovers
+                // `V` here — walking `WritableAtom`'s members structurally
+                // cannot invert its `read`/`write` signatures as reliably).
+                // `constituentRelatesTo` keeps the pass conservative: only a
+                // constituent that shares the param's generic origin, one of its
+                // property names, or its callability is an inference source, so
+                // a companion member such as `{ init: V }` is skipped instead of
+                // contributing a wrong candidate that would union into the
+                // right one.
+                if (s.kind(ra) == .intersection) {
+                    for (try c.memberList(ra)) |m| {
+                        if (try c.constituentRelatesTo(param, m)) {
+                            try c.unify(param, m, tp_syms, candidates, depth + 1);
+                        }
+                    }
+                    return;
+                }
                 // A plain FUNCTION argument against a callable-interface param —
                 // the mirror image of the `.function` arm's callable-object
                 // *argument* handling. `ForwardRefRenderFunction<T, P>` is an
@@ -15297,6 +15330,35 @@ const Checker = struct {
             .mapped => try c.inferReverseMapped(param, arg, tp_syms, candidates, depth),
             else => {},
         }
+    }
+
+    /// Is intersection constituent `m` a plausible inference source for the
+    /// object-shaped parameter `param`? True when the two are materializations
+    /// of the same generic (their origin tags name the same symbol), when `m`
+    /// carries one of `param`'s own property names, or when both sides agree on
+    /// callability / an index signature. Everything else — a companion member
+    /// bolted onto the argument (`WithInitialValue<V>`'s `{ init: V }`, a brand
+    /// object) — knows nothing about `param`'s type variables, and letting it
+    /// infer would union a wrong candidate into the right one.
+    fn constituentRelatesTo(c: *Checker, param: TypeId, m: TypeId) Error!bool {
+        const s = &c.ts;
+        const rm = try c.resolveStructural(m);
+        if (s.kind(rm) == .function) return s.objectCallSigCount(param) > 0;
+        if (s.kind(rm) != .object) return false;
+        if (c.origin.get(param)) |po| {
+            if (c.origin.get(rm)) |ao| {
+                if (s.kind(po) == .ref and s.kind(ao) == .ref and
+                    s.refSymbol(po) == s.refSymbol(ao)) return true;
+            }
+        }
+        for (0..s.objectPropCount(param)) |i| {
+            if (s.objectPropByName(rm, s.objectProp(param, @intCast(i)).name) != null) return true;
+        }
+        if (s.objectCallSigCount(param) > 0 and s.objectCallSigCount(rm) > 0) return true;
+        if (s.objectConstructSigCount(param) > 0 and s.objectConstructSigCount(rm) > 0) return true;
+        if (s.objectStringIndex(param) != 0 and s.objectStringIndex(rm) != 0) return true;
+        if (s.objectNumberIndex(param) != 0 and s.objectNumberIndex(rm) != 0) return true;
+        return false;
     }
 
     /// Reverse-mapped-type inference (tsc's `inferReverseMappedType`): infer the
