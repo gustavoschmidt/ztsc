@@ -422,6 +422,13 @@ pub const Bind = struct {
     /// app module — the linker skips such files entirely (pay-per-use).
     global_atoms: []const Atom = &.{},
     global_syms: []const SymbolId = &.{},
+    /// Split point inside `global_atoms`/`global_syms`: entries below it come
+    /// from this file's own top level (a *script*'s ambient/declared globals),
+    /// entries from it on come from `declare global { … }` / bare `global { … }`
+    /// blocks. tsc merges the two classes in separate passes — every script's
+    /// top level first, then every global *augmentation* — so the linker needs
+    /// the boundary to reproduce that precedence (modules.zig `mergeGlobals`).
+    global_aug_start: u32 = 0,
     /// `declare module "spec" { … }` blocks in this file. The linker
     /// harvests each block scope's exported members into a program ambient
     /// module keyed by `spec`, which imports of `"spec"` resolve against (and
@@ -2793,6 +2800,7 @@ const Binder = struct {
         const is_module = b.saw_module_syntax;
         var global_atoms: []const Atom = &.{};
         var global_syms: []const SymbolId = &.{};
+        var global_aug_start: u32 = 0;
         {
             const flo = if (!is_module) members_start[file_scope] else 0;
             const fhi = if (!is_module) members_start[file_scope + 1] else 0;
@@ -2800,6 +2808,7 @@ const Binder = struct {
             const ghi = if (b.global_scope != 0) members_start[b.global_scope + 1] else 0;
             const fn_ = fhi - flo;
             const gn_ = ghi - glo;
+            global_aug_start = @intCast(fn_);
             if (gn_ == 0) {
                 global_atoms = member_atoms[flo..fhi];
                 global_syms = member_syms[flo..fhi];
@@ -2894,6 +2903,7 @@ const Binder = struct {
             .is_module = is_module,
             .global_atoms = global_atoms,
             .global_syms = global_syms,
+            .global_aug_start = global_aug_start,
         };
 
         // Resolve recorded references; keep the unresolved ones.

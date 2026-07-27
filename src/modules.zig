@@ -654,16 +654,32 @@ fn mergeGlobals(
     sym_base: []const u32,
     links: []const FileLinks,
 ) Error!GlobalMerge {
-    // Accumulate name -> constituent global ids, contributions in FileId order.
+    // Accumulate name -> constituent global ids in TWO passes over the files,
+    // each pass in FileId order: first every *script*'s own top level, then
+    // every `declare global { … }` augmentation block (`global_aug_start`
+    // splits each file's harvest). That is tsc's merge order — `initialize
+    // TypeChecker` folds the non-module files' locals into `globals` and only
+    // afterwards merges the collected global-scope augmentations — and merge
+    // order decides precedence: `mergeSymbol` keeps the target's existing
+    // value declaration, so a script's `declare var expect: jest.Expect` wins
+    // the *value* over a module's `declare global { const expect: … }` no
+    // matter which file was loaded first. `parts[0]` is that winner here.
+    // Type space is unaffected: every constituent still folds (interface
+    // merging is order-independent by name-sorted union).
     var acc: std.AutoArrayHashMapUnmanaged(Atom, std.ArrayListUnmanaged(u32)) = .empty;
-    for (files, 0..) |*f, fi| {
-        const b = f.bind;
-        if (b.global_atoms.len == 0) continue;
-        const base = sym_base[fi];
-        for (b.global_atoms, b.global_syms) |atom, local| {
-            const gop = try acc.getOrPut(scratch, atom);
-            if (!gop.found_existing) gop.value_ptr.* = .empty;
-            try gop.value_ptr.append(scratch, base + local);
+    for ([2]bool{ false, true }) |aug_pass| {
+        for (files, 0..) |*f, fi| {
+            const b = f.bind;
+            if (b.global_atoms.len == 0) continue;
+            const split = @min(b.global_aug_start, b.global_atoms.len);
+            const lo = if (aug_pass) split else 0;
+            const hi = if (aug_pass) b.global_atoms.len else split;
+            const base = sym_base[fi];
+            for (b.global_atoms[lo..hi], b.global_syms[lo..hi]) |atom, local| {
+                const gop = try acc.getOrPut(scratch, atom);
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                try gop.value_ptr.append(scratch, base + local);
+            }
         }
     }
 
