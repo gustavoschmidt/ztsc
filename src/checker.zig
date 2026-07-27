@@ -11297,6 +11297,27 @@ const Checker = struct {
             const rs = try c.resolveStructural(s);
             if (rs != s and c.ts.kind(rs) == .union_type) return c.isAssignable(rs, t);
         }
+        // Deferred indexed-access *source*, the mirror of the `tk ==
+        // .index_access` rule below: `T[K]` relates to a target when its
+        // BASE-CONSTRAINT instantiation does (tsc `structuredTypeRelatedTo`,
+        // IndexedAccess-as-source). Inside `<T extends { groupIds: string[] }>`
+        // a value of type `T["groupIds"]` is usable wherever a `string[]` is.
+        //
+        // Ahead of the union/intersection target arms, because they answer for
+        // the whole target and would otherwise reject the source before it is
+        // ever resolved (`T["a"]` against `number | string`). Purely additive:
+        // a source whose constraint resolves to nothing better than itself, or
+        // does not relate, falls through unchanged.
+        if (sk == .index_access) {
+            const obj_bc = try c.transitiveBaseConstraint(c.ts.indexAccessObj(s));
+            // Same two guards as the target rule: neither side may still be
+            // generic after taking base constraints.
+            const idx_bc = try c.baseConstraintOf(c.ts.indexAccessIndex(s));
+            if (!try c.isGenericObjectForIndex(obj_bc) and !try c.containsFreeTypeParam(idx_bc, &.{})) {
+                const bc = try c.reduceIndexedAccess(obj_bc, idx_bc);
+                if (bc != s and c.ts.kind(bc) != .unknown and try c.isAssignable(bc, t)) return true;
+            }
+        }
         if (tk == .union_type) {
             for (try c.memberList(t)) |m| {
                 if (try c.isAssignable(s, m)) return true;
