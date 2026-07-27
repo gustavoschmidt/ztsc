@@ -229,6 +229,15 @@ pub const obj_flag_not_inferable: u32 = 2;
 /// and the call-sig then construct-sig TypeIds trail the property records.
 /// Sig-less objects (the common case) leave this clear and pay no extra words.
 pub const obj_flag_has_sigs: u32 = 4;
+/// The global-scope object — the type of `globalThis` (and, via lib.dom's
+/// `declare var window: Window & typeof globalThis`, of `window` / `self`).
+/// A marker only: the object carries no stored properties, because the global
+/// scope's members are the *program's* merged global value declarations, a set
+/// far too large (and too self-referential — `window`'s own type mentions it)
+/// to materialize. Member lookup consults the linker's globals table instead
+/// (`Checker.propOfTypeEx`), so the type stays a single interned word and its
+/// members cost exactly what is asked for.
+pub const obj_flag_global_this: u32 = 8;
 pub const prop_flag_optional: u32 = 1;
 pub const prop_flag_readonly: u32 = 2;
 pub const elem_flag_optional: u32 = 1;

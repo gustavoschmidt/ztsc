@@ -597,6 +597,8 @@ const Checker = struct {
     /// Class symbol -> its *structural* constructor object (statics + construct
     /// signatures returning the instance). See `classConstructType`.
     class_ctor_cache: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
+    /// The interned `typeof globalThis` marker (see `globalThisType`).
+    global_this_ty: TypeId = types.no_type,
     /// Enum symbol -> value object type (the `typeof E` object with members).
     enum_value_cache: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
     /// Enum symbol -> computed EnumInfo (const-ness, member values).
@@ -2024,6 +2026,7 @@ const Checker = struct {
                 try w.writeAll("]");
             },
             .object => {
+                if (s.objectFlags(t) & types.obj_flag_global_this != 0) return w.writeAll("typeof globalThis");
                 const n = s.objectPropCount(t);
                 const sidx = s.objectStringIndex(t);
                 const nidx = s.objectNumberIndex(t);
@@ -3060,7 +3063,7 @@ const Checker = struct {
             .wrong_space => return types.any_type,
             .none => {
                 // `typeof globalThis` — always in scope (see checkIdentifier).
-                if (std.mem.eql(u8, c.atomText(a), "globalThis")) return types.any_type;
+                if (std.mem.eql(u8, c.atomText(a), "globalThis")) return c.globalThisType();
                 try c.diagFmt(2304, c.tokSpan(tok), "Cannot find name '{s}'.", .{c.tokenText(tok)});
                 return types.error_type;
             },
@@ -5255,7 +5258,60 @@ const Checker = struct {
         const s = &c.ts;
         return s.kind(t) == .object and s.objectPropCount(t) == 0 and
             s.objectStringIndex(t) == 0 and s.objectNumberIndex(t) == 0 and
-            s.objectCallSigCount(t) == 0 and s.objectConstructSigCount(t) == 0;
+            s.objectCallSigCount(t) == 0 and s.objectConstructSigCount(t) == 0 and
+            // `typeof globalThis` stores no properties but is NOT `{}` — its
+            // members live in the linker's globals table. Treating it as the
+            // empty-object marker would let `Window & typeof globalThis`
+            // reduce away the global half (and mislead the `T & {}`
+            // non-nullish marker).
+            s.objectFlags(t) & types.obj_flag_global_this == 0;
+    }
+
+    /// `typeof globalThis` — the global-scope object. A single interned marker
+    /// object with no stored properties; `propOfTypeEx` resolves its members
+    /// against `prog.globals` on demand. See `types.obj_flag_global_this`.
+    ///
+    /// Materializing the members eagerly is not an option: the program's merged
+    /// global value table is thousands of names deep with a full lib, and it is
+    /// self-referential (`declare var window: Window & typeof globalThis`), so
+    /// any eager fold would have to break the cycle at whichever point it was
+    /// first triggered — making `window`'s type depend on traversal order and
+    /// so on the checker count. Lazy lookup has neither problem.
+    fn globalThisType(c: *Checker) Error!TypeId {
+        if (c.global_this_ty == types.no_type) {
+            c.global_this_ty = try c.ts.makeObject(&.{}, 0, 0, types.obj_flag_global_this | types.obj_flag_not_inferable);
+        }
+        return c.global_this_ty;
+    }
+
+    /// A member of the global scope object: a program-global *var*, *function*,
+    /// *namespace* or `declare module` value (`prog.globals`, the same table the
+    /// bare-name fallback in `resolveSpace` consults).
+    ///
+    /// BLOCK-SCOPED globals are deliberately excluded. A global `const` / `let`
+    /// / `class` / `enum` is in lexical scope but is not a property of the
+    /// global object, and tsc reports exactly that — `globalThis.someConst` is
+    /// TS2339 while the bare `someConst` resolves (oracle-verified against the
+    /// pinned tsgo). Type-space-only globals (`interface Window`) are not
+    /// members either; those are the `globalThisHasValue` = false case, which
+    /// the access site turns into TS7017 rather than TS2339.
+    fn globalThisProp(c: *Checker, name: Atom) Error!?types.Prop {
+        const sym = c.prog.globals.lookup(name) orelse return null;
+        const f = c.symFlags(sym);
+        if (!hasValueMeaning(f)) return null;
+        if (f.const_decl or f.let_decl or f.class or f.enum_decl) return null;
+        const flags: u32 = if (f.readonly_member) types.prop_flag_readonly else 0;
+        return .{ .name = name, .ty = try c.typeOfSymbol(sym), .flags = flags };
+    }
+
+    /// Whether `name` names a program global with VALUE meaning at all —
+    /// block-scoped or not. Distinguishes tsc's two failure messages on
+    /// `globalThis.x`: a known-but-block-scoped global is TS2339 ("Property 'x'
+    /// does not exist"), an entirely unknown name is TS7017 (the implicit-any
+    /// index message).
+    fn globalThisHasValue(c: *Checker, name: Atom) bool {
+        const sym = c.prog.globals.lookup(name) orelse return false;
+        return hasValueMeaning(c.symFlags(sym));
     }
 
     /// Canonicalize a type for origin-arg equivalence: resolve refs to their
@@ -9684,6 +9740,26 @@ const Checker = struct {
         switch (s.kind(t)) {
             .object => {
                 if (s.objectPropByName(t, name)) |p| return p;
+                // The global-scope object stores no properties: its members are
+                // the program's merged global value declarations, resolved on
+                // demand (see `globalThisType`).
+                //
+                // Only for MEMBER ACCESS (`allow_index`), never for the
+                // structural relation. Resolving a global's type is a lazy,
+                // re-entrant operation and the global table is self-referential
+                // — `@types/node` declares `var AbortController: typeof
+                // globalThis extends { onmessage: any; AbortController: infer T
+                // } ? T : …`, whose own resolution asks the global object for
+                // `AbortController`. The relation walks a target's properties
+                // in stored (atom) order, and atom ids come from the parallel
+                // interner, so *which* arm of that cycle is entered first moves
+                // run to run: the diagnostics held but the work counters did
+                // not (`_types_node` repeat sweep, 19/40 runs). Keeping the
+                // relation out means `typeof globalThis` relates as the empty
+                // object it stores, which is order-free by construction.
+                if (allow_index and s.objectFlags(t) & types.obj_flag_global_this != 0) {
+                    return c.globalThisProp(name);
+                }
                 if (allow_index and s.objectStringIndex(t) != 0) {
                     return .{ .name = name, .ty = s.objectStringIndex(t), .flags = 0 };
                 }
@@ -12873,11 +12949,10 @@ const Checker = struct {
                 return types.error_type;
             },
             .none => {
-                // `globalThis` is always in scope (the global-scope object).
-                // ztsc doesn't synthesize the global object type, so resolve it
-                // to `any` rather than reporting TS2304 (matches tsc's
-                // in-scope behavior; the common use is `(globalThis as any)`).
-                if (std.mem.eql(u8, c.atomText(a), "globalThis")) return types.any_type;
+                // `globalThis` is always in scope: the global-scope object,
+                // whose members are the program's global value declarations
+                // (see `globalThisType`).
+                if (std.mem.eql(u8, c.atomText(a), "globalThis")) return c.globalThisType();
                 if (c.suggestName(a, c.cur_scope, true)) |sugg| {
                     try c.diagFmt(2552, c.tokSpan(tok), "Cannot find name '{s}'. Did you mean '{s}'?", .{ c.tokenText(tok), c.atomText(sugg) });
                 } else {
@@ -13773,6 +13848,22 @@ const Checker = struct {
                             }
                         }
                     }
+                }
+                // An unknown member of the global scope object is, for tsc, an
+                // implicit-'any' index (TS7017) — not a missing property. Only
+                // a name that has no global VALUE meaning at all takes this
+                // path: a block-scoped global (`const`/`let`/`class`/`enum`) is
+                // in scope but not a property, and stays TS2339 below.
+                // Suppressed under `noImplicitAny: false`, like its siblings.
+                if (c.ts.kind(r) == .object and c.ts.objectFlags(r) & types.obj_flag_global_this != 0 and
+                    !c.globalThisHasValue(name))
+                {
+                    if (c.prog.no_implicit_any) {
+                        try c.diagFmt(7017, c.tokSpan(name_tok), "Element implicitly has an 'any' type because type '{s}' has no index signature.", .{
+                            try c.typeToString(t),
+                        });
+                    }
+                    return types.any_type;
                 }
                 if (c.suggestProp(name, r)) |sugg| {
                     try c.diagFmt(2551, c.tokSpan(name_tok), "Property '{s}' does not exist on type '{s}'. Did you mean '{s}'?", .{
