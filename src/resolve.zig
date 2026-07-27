@@ -997,7 +997,21 @@ fn resolvePackage(io: Io, alloc: Allocator, dir: Io.Dir, importer_dir: []const u
     // the JS `main`/index under allowJs.
     var d = importer_dir;
     while (true) {
-        if (try resolvePackageAt(io, alloc, dir, d, pkg, sub, false, fs)) |p| return p;
+        if (try resolvePackageAt(io, alloc, dir, d, pkg, sub, false, fs)) |p| {
+            // An `exports`-blocked subpath means "the real package publishes no
+            // *declarations* here", not "resolution is over": tsc still consults
+            // `@types/<pkg>` for the same subpath. `react/jsx-runtime` is the
+            // canonical case — react's `exports` names `./jsx-runtime.js` (JS,
+            // no types) while @types/react ships `jsx-runtime.d.ts`, which is
+            // where the automatic runtime's `JSX` namespace lives. Returning the
+            // opaque any-module here typed the whole JSX namespace as `any`.
+            if (paths.isBlockedSubpathPath(p)) {
+                if (types_pkg) |tp| {
+                    if (try resolvePackageAt(io, alloc, dir, d, tp, sub, false, fs)) |q| return q;
+                }
+            }
+            return p;
+        }
         if (types_pkg) |tp| {
             if (try resolvePackageAt(io, alloc, dir, d, tp, sub, false, fs)) |p| return p;
         }
