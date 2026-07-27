@@ -15837,8 +15837,13 @@ const Checker = struct {
         // Phase 2: function arguments, contextually typed by the partial
         // instantiation (seeded with the return-context inferences above).
         var partial = try c.scratch().alloc(TpMap, tp_syms.len);
+        // Which params the seed already fixed. Snapshotted because `seed`
+        // ALIASES `candidates` in the uncontextual case, so it cannot be
+        // consulted again once argument inference starts writing candidates.
+        const seeded = try c.scratch().alloc(bool, tp_syms.len);
         for (tp_syms, 0..) |tp, i| {
-            partial[i] = .{ .sym = tp, .ty = if (seed[i] != types.no_type) seed[i] else types.any_type };
+            seeded[i] = seed[i] != types.no_type;
+            partial[i] = .{ .sym = tp, .ty = if (seeded[i]) seed[i] else types.any_type };
         }
         ai = 0;
         for (arg_nodes) |an| {
@@ -15850,6 +15855,19 @@ const Checker = struct {
             const pt_partial = try c.instantiate(pt0, partial);
             const at = try c.checkExprCached(an, pt_partial);
             try c.unify(pt0, at, tp_syms, candidates, 0);
+            // Feed what this argument taught us into the contextual type of the
+            // function arguments to its RIGHT — tsc's `instantiateContextualType`
+            // uses the inferences made so far, and Phase 1 already does this for
+            // non-function arguments. Without it an unresolved param stays the
+            // `any` placeholder, and `any` absorbs the union it sits in:
+            // `defaultValue: T | ((selected: boolean) => T)` became plain `any`
+            // whenever `T` was learned from an earlier CALLBACK argument, so the
+            // arrow written for it got no contextual signature and every
+            // parameter went implicit-`any`. Seeded params keep their seed (the
+            // contextual return still owns those).
+            for (partial, 0..) |*p, i| {
+                if (!seeded[i] and candidates[i] != types.no_type) p.ty = candidates[i];
+            }
         }
         // Phase 3: contextual return-type inference for any params still
         // unbound after argument inference (argument inference always wins —
