@@ -15895,6 +15895,27 @@ const Checker = struct {
     /// `candidates` (arguments seen so far) falling back to `seed` (the
     /// contextual-return pass) — leaving the rest free. tsc's
     /// `instantiateContextualType` / `nonFixingMapper`.
+    fn partialParamCtx(c: *Checker, pt0: TypeId, partial: []const TpMap) Error!TypeId {
+        const full = try c.instantiate(pt0, partial);
+        if (c.ts.kind(full) != .any) return full;
+        const r = try c.resolveStructural(pt0);
+        if (c.ts.kind(r) != .union_type) return full;
+        const members = try c.memberList(r);
+        var kept: std.ArrayList(TypeId) = .empty;
+        defer kept.deinit(c.scratch());
+        var dropped = false;
+        for (members) |m| {
+            const mi = try c.instantiate(m, partial);
+            if (c.ts.kind(m) == .type_param and c.ts.kind(mi) == .any) {
+                dropped = true;
+                continue;
+            }
+            try kept.append(c.scratch(), mi);
+        }
+        if (!dropped or kept.items.len == 0) return full;
+        return c.ts.makeUnion(c.scratch(), kept.items);
+    }
+
     fn instantiateKnownParams(
         c: *Checker,
         t: TypeId,
@@ -16083,6 +16104,11 @@ const Checker = struct {
             seeded[i] = seed[i] != types.no_type;
             partial[i] = .{ .sym = tp, .ty = if (seeded[i]) seed[i] else types.any_type };
         }
+        // Placeholder-echo candidates, demoted to a fallback (see below).
+        const echo_any = try c.scratch().alloc(TypeId, tp_syms.len);
+        for (echo_any) |*x| x.* = types.no_type;
+        const placeheld = try c.scratch().alloc(bool, tp_syms.len);
+        const before = try c.scratch().alloc(TypeId, tp_syms.len);
         ai = 0;
         for (arg_nodes) |an| {
             if (an == null_node) continue;
@@ -16090,9 +16116,31 @@ const Checker = struct {
             const tag = c.nodeTag(an);
             if (tag != .arrow_fn and tag != .function_expr) continue;
             const pt0 = try c.paramTypeAt(sig, ai) orelse continue;
-            const pt_partial = try c.instantiate(pt0, partial);
+            for (partial, 0..) |p, i| {
+                placeheld[i] = !seeded[i] and p.ty == types.any_type;
+                before[i] = candidates[i];
+            }
+            const pt_partial = try c.partialParamCtx(pt0, partial);
             const at = try c.checkExprCached(an, pt_partial);
             try c.unify(pt0, at, tp_syms, candidates, 0);
+            // Placeholder echo. A parameter with no candidate yet stands in as
+            // `any` in this argument's contextual type, so a callback that
+            // merely passes that value through infers `any` straight back —
+            // evidence the argument does not actually carry. tsc never sees it:
+            // it leaves the variable FREE, and `inferFromTypes` ignores an
+            // inference from a type to itself. The echo poisons every LATER use
+            // of the parameter: `getFormValue`'s `T` came out `any` from its
+            // `(element) => element.attr` argument, and the union parameter
+            // after it then collapsed, so its arrow lost every contextual
+            // parameter type. Demoted, not dropped — it fills the parameter
+            // after Phase 2 when nothing else constrained it, so a callback that
+            // genuinely returns `any` still infers `any`.
+            for (candidates, 0..) |*cd, i| {
+                if (!placeheld[i] or cd.* == before[i]) continue;
+                if (c.ts.kind(cd.*) != .any) continue;
+                echo_any[i] = types.any_type;
+                cd.* = before[i];
+            }
             // Feed what this argument taught us into the contextual type of the
             // function arguments to its RIGHT — tsc's `instantiateContextualType`
             // uses the inferences made so far, and Phase 1 already does this for
@@ -16106,6 +16154,10 @@ const Checker = struct {
             for (partial, 0..) |*p, i| {
                 if (!seeded[i] and candidates[i] != types.no_type) p.ty = candidates[i];
             }
+        }
+        // Demoted placeholder echoes fill what nothing else constrained.
+        for (candidates, 0..) |*cd, i| {
+            if (cd.* == types.no_type and echo_any[i] != types.no_type) cd.* = echo_any[i];
         }
         // Phase 3: contextual return-type inference for any params still
         // unbound after argument inference (argument inference always wins —
