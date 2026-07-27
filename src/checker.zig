@@ -384,6 +384,12 @@ const FnCtx = struct {
     /// function this is the awaited *payload* `T` of the declared
     /// `Promise<T>`, not the `Promise<T>` itself.
     ret_ann: TypeId = 0,
+    /// Contextual return type when the function has NO annotation but is being
+    /// checked against a contextual signature (`const f: Creator = (n) => ({…})`
+    /// — the object literal's contextual type is `Creator`'s return type). Types
+    /// the return expressions; never reported against, so an inference gap here
+    /// can only lose a contextual type, never raise a diagnostic. 0 = none.
+    ret_ctx: TypeId = 0,
     is_async: bool = false,
     is_generator: bool = false,
     /// For a generator with an annotated `Generator<T>`/`Iterator<T>`/
@@ -412,6 +418,8 @@ const DeferredBody = struct {
     proto_idx: u32,
     body: Node,
     sig: TypeId,
+    /// Contextual return type at the queue site (see `checkFunctionBody`).
+    ret_ctx: TypeId,
     /// `this` in force where the body was found — the class's generic instance
     /// for an instance field, whatever the ambient value was otherwise.
     this_type: TypeId,
@@ -15029,8 +15037,18 @@ const Checker = struct {
             }
         }
         const sig = try c.signatureOfProtoCtx(node, d.lhs, false, ctx_sig == types.no_type, ctx_sig);
-        // Check the body.
-        try c.checkFunctionBody(node, d.lhs, d.rhs, sig);
+        // Check the body. The contextual signature's return type is the
+        // contextual type of the body's return expressions, exactly as its
+        // parameters are the contextual types of this function's parameters —
+        // `signatureOfProtoCtx` already used it to *infer* the return, but the
+        // body walk re-checked the same expressions context-free, so anything
+        // nested in a returned object literal (a handler, a callback) lost its
+        // contextual type and its parameters went implicit-`any`.
+        const ctx_ret: TypeId = if (ctx_sig != types.no_type and c.ts.kind(ctx_sig) == .function)
+            c.ts.fnReturn(ctx_sig)
+        else
+            types.no_type;
+        try c.checkFunctionBody(node, d.lhs, d.rhs, sig, ctx_ret);
         return sig;
     }
 
@@ -19030,11 +19048,17 @@ const Checker = struct {
             // promise arm (`return new Promise(()=>{})` → `Promise<T>`;
             // `return axios.delete(...)` → `Promise<R=T>`). The assignability
             // check below still relates the *awaited* value to `ctx.ret_ann`.
-            const expr_ctx = if (ctx.is_async and ctx.ret_ann != types.no_type and
-                ctx.ret_ann != types.error_type and c.ts.kind(ctx.ret_ann) != .none)
-                try c.makeUnion2(ctx.ret_ann, try c.makePromise(ctx.ret_ann))
+            // With no annotation, the contextual signature's return type takes
+            // that role (`c.ret_ctx`) — it is what tsc's
+            // `getContextualTypeForReturnExpression` yields for a contextually
+            // typed function, and without it a `return { handler: (e) => … }`
+            // inside such a function lost every nested contextual type.
+            const base_ctx = if (ctx.ret_ann != types.no_type) ctx.ret_ann else ctx.ret_ctx;
+            const expr_ctx = if (ctx.is_async and base_ctx != types.no_type and
+                base_ctx != types.error_type and c.ts.kind(base_ctx) != .none)
+                try c.makeUnion2(base_ctx, try c.makePromise(base_ctx))
             else
-                ctx.ret_ann;
+                base_ctx;
             const rt = try c.checkExprCached(d.lhs, expr_ctx);
             // async: `return v` in a `Promise<T>` relates the awaited `v` to the
             // payload `T` (so `return somePromise` is not double-wrapped).
@@ -19060,7 +19084,7 @@ const Checker = struct {
         _ = try c.signatureOfProto(node, d.lhs, false, true);
         if (d.rhs != 0) {
             const sig = try c.signatureOfProto(node, d.lhs, false, true);
-            try c.checkFunctionBody(node, d.lhs, d.rhs, sig);
+            try c.checkFunctionBody(node, d.lhs, d.rhs, sig, types.no_type);
         }
     }
 
@@ -19082,12 +19106,16 @@ const Checker = struct {
             const d = c.deferred_bodies.items[i];
             if (d.file != c.cur_file) c.setFile(d.file);
             c.this_type = d.this_type;
-            try c.checkFunctionBody(d.node, d.proto_idx, d.body, d.sig);
+            try c.checkFunctionBody(d.node, d.proto_idx, d.body, d.sig, d.ret_ctx);
         }
         c.deferred_bodies.clearRetainingCapacity();
     }
 
-    fn checkFunctionBody(c: *Checker, node: Node, proto_idx: u32, body: Node, sig: TypeId) Error!void {
+    /// `ret_ctx` is the contextual signature's return type when this function
+    /// has no return annotation (0 otherwise / when there is no context). It
+    /// only supplies a contextual type to the return expressions — the
+    /// assignability checks stay on the written annotation.
+    fn checkFunctionBody(c: *Checker, node: Node, proto_idx: u32, body: Node, sig: TypeId, ret_ctx: TypeId) Error!void {
         if (body == 0) return;
         // Owned-file guard (see `checkJsxElement`). This function returns
         // `void` — its *result* is input-independent by construction, so the
@@ -19132,6 +19160,7 @@ const Checker = struct {
                 .proto_idx = proto_idx,
                 .body = body,
                 .sig = sig,
+                .ret_ctx = ret_ctx,
                 .this_type = c.this_type,
             });
             return;
@@ -19180,7 +19209,12 @@ const Checker = struct {
             yield_type = c.generatorYieldType(ann);
             eff_ann = types.no_type;
         }
-        c.fn_ctx = .{ .ret_ann = eff_ann, .is_async = is_async, .is_generator = is_generator, .yield_type = yield_type };
+        // Contextual return type: only meaningful when nothing was written and
+        // the function is not a generator. Async unwraps to the payload, as
+        // `eff_ann` does for a written `Promise<T>`.
+        var eff_ret_ctx: TypeId = if (proto.return_type == 0 and !is_generator) ret_ctx else types.no_type;
+        if (eff_ret_ctx != types.no_type and is_async) eff_ret_ctx = try c.awaitedType(eff_ret_ctx);
+        c.fn_ctx = .{ .ret_ann = eff_ann, .ret_ctx = eff_ret_ctx, .is_async = is_async, .is_generator = is_generator, .yield_type = yield_type };
 
         // Check parameter initializers against annotations.
         for (c.tree.extraRange(proto.params_start, proto.params_end)) |pn| {
@@ -19224,7 +19258,7 @@ const Checker = struct {
         } else {
             // Arrow expression body. For async, relate the awaited body type to
             // the Promise payload (`async () => p` returns `Promise<T>`).
-            const rt = try c.checkExprCached(body, eff_ann);
+            const rt = try c.checkExprCached(body, if (eff_ann != types.no_type) eff_ann else eff_ret_ctx);
             if (eff_ann != types.no_type and eff_ann != types.error_type) {
                 const eff_rt = if (is_async) try c.awaitedType(rt) else rt;
                 _ = try c.checkAssignable(eff_rt, eff_ann, body, c.nodeSpan(body));
@@ -19584,7 +19618,7 @@ const Checker = struct {
                         const saved_ctor = c.ctor_class_sym;
                         if (is_ctor) c.ctor_class_sym = class_sym;
                         defer c.ctor_class_sym = saved_ctor;
-                        try c.checkFunctionBody(member, md.lhs, md.rhs, sig);
+                        try c.checkFunctionBody(member, md.lhs, md.rhs, sig, types.no_type);
                     }
                 },
                 .decorator => {
