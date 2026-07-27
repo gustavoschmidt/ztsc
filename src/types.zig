@@ -1377,6 +1377,7 @@ pub const Store = struct {
         if (n == 1) return items[0];
         const list = items[0..n];
         if (nullishIntersectionIsEmpty(s, list)) return never_type;
+        if (distinctUnitIntersectionIsEmpty(s, list)) return never_type;
 
         // Distribute over the first union constituent, if any.
         var union_idx: usize = n;
@@ -1438,6 +1439,44 @@ pub const Store = struct {
         }
         if (!has_null and !has_undefined) return false;
         return has_other_domain or (has_null and has_undefined);
+    }
+
+    /// tsc's "two distinct unit types" rule (`addTypeToIntersection`: *"we have
+    /// seen two distinct unit types which means we should reduce to an empty
+    /// intersection"*). A unit type has exactly one value, so an intersection
+    /// containing two different ones is uninhabited: `"line" & "arrow"`,
+    /// `1 & 2`, `true & false` are all `never`.
+    ///
+    /// This is what makes a refining intersection collapse the way tsc's does:
+    /// `ExcalidrawArrowElement = ExcalidrawLinearElement & { type: "arrow" }`
+    /// distributes to `("line" & "arrow") | ("arrow" & "arrow")`, and without
+    /// the rule the dead first arm survived — so an exhaustive `switch` over
+    /// `element.type` left `"arrow" & "line"` in the default branch and
+    /// `assertNever(type)` reported TS2345.
+    ///
+    /// Freshness is not part of a unit's identity here (a fresh and a regular
+    /// `"a"` are one unit), which under-reports relative to tsc — it keys the
+    /// set on the type object, where the two are distinct — and under-reporting
+    /// is the safe direction for a rule whose output is `never`. Non-unit
+    /// members (including `.union_type`, re-entered per combination by the
+    /// cross-product below) are ignored.
+    fn distinctUnitIntersectionIsEmpty(s: *const Store, list: []const TypeId) bool {
+        var seen: ?[3]u32 = null;
+        for (list) |t| {
+            const key: [3]u32 = switch (s.kind(t)) {
+                .string_literal => .{ 1, s.dataA(t), 0 },
+                .number_literal, .number_literal_fresh => .{ 2, s.dataA(t), s.dataB(t) },
+                .bigint_literal => .{ 3, s.dataA(t), 0 },
+                .bool_true => .{ 4, 0, 0 },
+                .bool_false => .{ 5, 0, 0 },
+                .unique_symbol => .{ 6, s.dataA(t), 0 },
+                else => continue,
+            };
+            if (seen) |prev| {
+                if (!std.mem.eql(u32, &prev, &key)) return true;
+            } else seen = key;
+        }
+        return false;
     }
 
     fn indexOf(list: []const TypeId, t: TypeId) ?usize {
