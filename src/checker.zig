@@ -13223,7 +13223,10 @@ const Checker = struct {
         }
         c.stats.node_type_misses += 1;
         const t = try c.checkExpr(node, ctx);
-        try c.node_types.put(c.cm(), key, .{ .ty = t, .ctx = ctx });
+        // A side query is speculative — it runs out of the checker's top-down
+        // order — so it must not publish its answer for the authoritative
+        // check to read back.
+        if (c.side_query_depth == 0) try c.node_types.put(c.cm(), key, .{ .ty = t, .ctx = ctx });
         return t;
     }
 
@@ -14632,6 +14635,42 @@ const Checker = struct {
     /// pass so it fires for react-hook-form-style literal-key inference but not
     /// for object literals whose params are plain callbacks (`openDB({ upgrade
     /// }))`) or unions, which contextual typing would perturb without benefit.
+    /// Is object literal `node` CONTEXT SENSITIVE — does it carry a function
+    /// value with an un-annotated parameter (`{ onChange: (value) => … }`)?
+    /// tsc's `isContextSensitive` recurses into an object literal's properties
+    /// for exactly this reason: such a literal's type depends on the contextual
+    /// type it is checked against, so it must be handed one. Without it, an
+    /// object-literal argument of a GENERIC call was checked context-free (the
+    /// non-generic path types the argument by the parameter directly), and
+    /// every callback parameter inside it fell to implicit `any` — TS7006 at
+    /// call sites that are correct TypeScript.
+    fn objLitIsContextSensitive(c: *Checker, node: Node) bool {
+        for (c.tree.nodeRange(node)) |m| {
+            if (m == null_node) continue;
+            const val = switch (c.nodeTag(m)) {
+                .object_property, .object_method => c.tree.nodeData(m).rhs,
+                else => continue,
+            };
+            if (val == null_node) continue;
+            switch (c.nodeTag(val)) {
+                .arrow_fn, .function_expr => {},
+                else => continue,
+            }
+            const proto = c.tree.extraData(ast.FnProto, c.tree.nodeData(val).lhs);
+            for (c.tree.extraRange(proto.params_start, proto.params_end)) |p| {
+                if (p == null_node) continue;
+                const pd = c.tree.nodeData(p);
+                const ann: Node = switch (c.nodeTag(p)) {
+                    .param => pd.rhs,
+                    .param_full => c.tree.extraData(ast.ParamFull, pd.rhs).type_ann,
+                    else => 0,
+                };
+                if (ann == 0) return true; // parameter has no type annotation
+            }
+        }
+        return false;
+    }
+
     fn paramWantsLiteralCtx(c: *Checker, pt: TypeId) Error!bool {
         const r = try c.resolveStructural(pt);
         // A still-generic MAPPED parameter (`c: { [K in keyof T]: T[K] }`) has
@@ -16809,6 +16848,68 @@ const Checker = struct {
             if (arg_ctx != types.no_type) {
                 arg_ctx = try c.instantiateKnownParams(arg_ctx, tp_syms, candidates, ret_seed);
             }
+            // A CONTEXT-SENSITIVE object literal (`{ v: x, onChange: (value) =>
+            // … }`) needs two passes, exactly as tsc runs them. Its callback
+            // properties can only be typed once the type parameters are known,
+            // but the type parameters are inferred from this very argument — so
+            // pass one checks it context-free purely to collect candidates
+            // (quietly: every implicit-`any` it sees is an artifact of running
+            // early), and pass two re-checks it against the parameter with
+            // those candidates substituted, which is the authoritative check.
+            // Without it the callback's parameters were left implicit `any`
+            // (TS7006) at call sites that are correct TypeScript, while the
+            // NON-generic form of the same call — which types the argument by
+            // the parameter directly — was fine.
+            // Pass one's inferences are PROVISIONAL — the callback properties it
+            // saw had implicit-`any` parameters, and `any` absorbs the union it
+            // is combined with, so committing them would fix the very type
+            // parameter this argument is meant to determine. They live in a
+            // scratch copy that only builds pass two's contextual type; pass
+            // two re-derives every candidate this argument really carries.
+            if (tag == .object_literal and arg_ctx == types.no_type and
+                c.objLitIsContextSensitive(an))
+            {
+                const probe_cands = try c.scratch().alloc(TypeId, tp_syms.len);
+                for (candidates, 0..) |cd, i| probe_cands[i] = cd;
+                c.side_query_depth += 1;
+                const ctx2 = blk: {
+                    errdefer c.side_query_depth -= 1;
+                    const probe = try c.checkExprCached(an, types.no_type);
+                    try c.unify(pt, probe, tp_syms, probe_cands, 0);
+                    // Every type parameter is FIXED for pass two: one the probe
+                    // could not infer takes its default/constraint (tsc fixes a
+                    // type parameter before instantiating the contextual type of
+                    // a context-sensitive argument). Leaving it free would hand
+                    // the callback a bare type variable — `key: K` compared
+                    // against a literal is then a spurious TS2367, where the
+                    // constraint `keyof T` is exactly the domain tsc uses.
+                    // Resolved in declaration order so a later parameter's
+                    // constraint sees the earlier ones (`K extends keyof T`).
+                    var map2: std.ArrayList(TpMap) = .empty;
+                    defer map2.deinit(c.scratch());
+                    for (tp_syms, 0..) |sym, i| {
+                        var v = if (probe_cands[i] != types.no_type) probe_cands[i] else ret_seed[i];
+                        if (v == types.no_type) {
+                            // Default, else constraint, else the `any`
+                            // placeholder the contextual pass over function
+                            // ARGUMENTS already uses for an unresolved
+                            // parameter — `unknown` would be a stricter type
+                            // than the call can justify and would turn every
+                            // use of the callback's parameter into an error.
+                            v = try c.typeParamDefault(sym);
+                            if (v == types.no_type) v = try c.typeParamConstraint(sym);
+                            if (v == types.no_type) v = types.any_type;
+                            if (map2.items.len > 0) v = try c.instantiate(v, map2.items);
+                        }
+                        try map2.append(c.scratch(), .{ .sym = sym, .ty = v });
+                    }
+                    break :blk try c.instantiate(pt, map2.items);
+                };
+                c.side_query_depth -= 1;
+                const at2 = try c.checkExprCached(an, ctx2);
+                try c.unify(pt, at2, tp_syms, candidates, 0);
+                continue;
+            }
             const at = try c.checkExprCached(an, arg_ctx);
             // An EMPTY array literal is the accumulator seed of a fold
             // (`arr.reduce((acc: T[], el) => …, [])`). It carries no element
@@ -17059,6 +17160,14 @@ const Checker = struct {
         // `any` callback return would bind nothing because `any` is assignable
         // to the union's other members.
         if (s.kind(arg) == .any) {
+            // Inside a speculative inference probe an `any` is a WILDCARD, not
+            // evidence: the probe runs before the contextual type exists, so
+            // the `any` is the artifact it is trying to resolve (a callback
+            // parameter with no contextual type yet), and `any` absorbs the
+            // union it is combined with. tsc's first inference pass substitutes
+            // a wildcard for exactly these and `inferFromTypes` ignores it. The
+            // authoritative pass re-derives every candidate.
+            if (c.side_query_depth > 0) return;
             try c.bindAnyToTypeParams(param, tp_syms, candidates, depth);
             return;
         }
