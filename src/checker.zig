@@ -11454,6 +11454,21 @@ const Checker = struct {
         // whole key union is not assignable to `string`.
         if (c.ts.kind(a) == .keyof_op) return c.castComparableRec(try c.propertyKeyType(), b0, depth + 1);
         if (c.ts.kind(b) == .keyof_op) return c.castComparableRec(a0, try c.propertyKeyType(), depth + 1);
+        // A DEFERRED conditional (`T extends E[] ? E[] : E | null`, the return
+        // type of a generic overload written as one function) has no resolved
+        // form here. tsc compares against its *default constraint* — the union
+        // of the two branches — and the comparable relation then distributes
+        // over that union existentially, exactly like the union arms below.
+        // Without it, the standard idiom of casting the computed result to the
+        // declared conditional return type is a spurious TS2352.
+        if (c.ts.kind(a) == .conditional) {
+            return (try c.castComparableRec(c.ts.condTrue(a), b0, depth + 1)) or
+                (try c.castComparableRec(c.ts.condFalse(a), b0, depth + 1));
+        }
+        if (c.ts.kind(b) == .conditional) {
+            return (try c.castComparableRec(a0, c.ts.condTrue(b), depth + 1)) or
+                (try c.castComparableRec(a0, c.ts.condFalse(b), depth + 1));
+        }
         // Existential union distribution on either side.
         if (c.ts.kind(a) == .union_type) {
             for (try c.memberList(a)) |m| {
