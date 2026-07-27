@@ -1850,14 +1850,83 @@ const Checker = struct {
                     if (c.ts.isFreshLiteral(m) or c.ts.objectIsFresh(m)) any_fresh = true;
                 }
                 if (!any_fresh) return t;
+                // Sibling normalization runs while the members are still fresh
+                // (see `normalizeFreshObjectSiblings`), before they de-freshen.
+                const norm = try c.normalizeFreshObjectSiblings(t);
                 var list: std.ArrayList(TypeId) = .empty;
                 defer list.deinit(c.scratch());
-                for (try c.memberList(t)) |m| try list.append(c.scratch(), try c.widenLiteral(m));
+                for (try c.memberList(norm)) |m| try list.append(c.scratch(), try c.widenLiteral(m));
                 return c.ts.makeUnion(c.scratch(), list.items);
             },
             .object => return c.ts.regular(t),
             else => return t,
         }
+    }
+
+    /// tsc's `getWidenedTypeOfObjectLiteral` + `getUndefinedProperty`: when two
+    /// or more *fresh* object literals are widened in the same widening
+    /// context — the arms of a `?:`, the elements of an array literal, the
+    /// `return` expressions of one function — each gains its siblings' missing
+    /// property names as `name?: undefined`. That is what makes
+    ///
+    ///     function g() { if (c) return { file: x }; return { errorMessage: y }; }
+    ///     const r = g(); r.file;
+    ///
+    /// legal: both constituents carry `file`, one of them only as `undefined`.
+    /// A *declared* union (`declare const r: {file: string} | {errorMessage:
+    /// number}`) is not normalized and `r.file` really is an error — which is
+    /// exactly why this keys off freshness and runs before the members
+    /// de-freshen.
+    ///
+    /// Members that are not fresh objects are left alone and do not contribute
+    /// names, so a mixed `cond ? { a: 1 } : someDeclaredThing` normalizes
+    /// nothing. Returns `u` unchanged unless at least two fresh object members
+    /// actually differ in their key sets.
+    fn normalizeFreshObjectSiblings(c: *Checker, u: TypeId) Error!TypeId {
+        const s = &c.ts;
+        if (s.kind(u) != .union_type) return u;
+        const members = try c.memberList(u);
+        var fresh_count: u32 = 0;
+        for (members) |m| {
+            if (s.objectIsFresh(m)) fresh_count += 1;
+        }
+        if (fresh_count < 2) return u;
+        // The union of every fresh member's property names.
+        var names: std.ArrayList(Atom) = .empty;
+        defer names.deinit(c.scratch());
+        for (members) |m| {
+            if (!s.objectIsFresh(m)) continue;
+            for (0..s.objectPropCount(m)) |i| {
+                const p = s.objectProp(m, @intCast(i));
+                if (indexOfAtom(names.items, p.name) == null) try names.append(c.scratch(), p.name);
+            }
+        }
+        var out: std.ArrayList(TypeId) = .empty;
+        defer out.deinit(c.scratch());
+        var changed = false;
+        for (members) |m| {
+            if (!s.objectIsFresh(m) or s.objectPropCount(m) == names.items.len) {
+                try out.append(c.scratch(), m);
+                continue;
+            }
+            var props: std.ArrayList(types.Prop) = .empty;
+            defer props.deinit(c.scratch());
+            for (0..s.objectPropCount(m)) |i| try props.append(c.scratch(), s.objectProp(m, @intCast(i)));
+            for (names.items) |n| {
+                if (s.objectPropByName(m, n) != null) continue;
+                try props.append(c.scratch(), .{ .name = n, .ty = types.undefined_type, .flags = types.prop_flag_optional });
+            }
+            var calls: std.ArrayList(TypeId) = .empty;
+            defer calls.deinit(c.scratch());
+            for (0..s.objectCallSigCount(m)) |i| try calls.append(c.scratch(), s.objectCallSig(m, @intCast(i)));
+            var ctors: std.ArrayList(TypeId) = .empty;
+            defer ctors.deinit(c.scratch());
+            for (0..s.objectConstructSigCount(m)) |i| try ctors.append(c.scratch(), s.objectConstructSig(m, @intCast(i)));
+            changed = true;
+            try out.append(c.scratch(), try s.makeObjectSigs(props.items, s.objectStringIndex(m), s.objectNumberIndex(m), s.objectFlags(m), calls.items, ctors.items));
+        }
+        if (!changed) return u;
+        return s.makeUnion(c.scratch(), out.items);
     }
 
     /// Per-return widening for *inferred* (no-context) return types: like
@@ -1875,7 +1944,12 @@ const Checker = struct {
                 for (try c.memberList(t)) |m| try list.append(c.scratch(), try c.widenReturnMember(m));
                 return c.ts.makeUnion(c.scratch(), list.items);
             },
-            .object => return c.ts.regular(t),
+            // Fresh OBJECTS are kept too, for the same reason as fresh
+            // literals: the several `return` statements of one function form a
+            // single widening context, and the sibling-`undefined`
+            // normalization can only be computed once they are all in the
+            // union. `finalizeInferredReturn` normalizes and then de-freshens.
+            .object => return t,
             else => return t,
         }
     }
@@ -1892,7 +1966,21 @@ const Checker = struct {
             const base = c.ts.literalBase(u);
             return if (base != types.no_type) base else u;
         }
-        return u;
+        // The returns of one function are one widening context: normalize the
+        // fresh object members against each other, then de-freshen them
+        // (`widenReturnMember` deliberately left them fresh for this).
+        const norm = try c.normalizeFreshObjectSiblings(u);
+        if (c.ts.kind(norm) == .object) return c.ts.regular(norm);
+        if (c.ts.kind(norm) != .union_type) return norm;
+        var list: std.ArrayList(TypeId) = .empty;
+        defer list.deinit(c.scratch());
+        var changed = false;
+        for (try c.memberList(norm)) |m| {
+            const r = if (c.ts.kind(m) == .object) try c.ts.regular(m) else m;
+            if (r != m) changed = true;
+            try list.append(c.scratch(), r);
+        }
+        return if (changed) c.ts.makeUnion(c.scratch(), list.items) else norm;
     }
 
     /// Widen a contextually-typed return expression: suppress literal widening
@@ -4446,20 +4534,26 @@ const Checker = struct {
         defer c.cur_scope = saved_scope;
         for (rets.items, ret_scopes.items) |r, sc| {
             c.cur_scope = sc;
-            const rt = try c.checkExprCached(r, ret_ctx);
-            // No-context inference unions the *un-widened* fresh literals and
-            // widens only the collapsed result (finalizeInferredReturn); a
-            // contextual return keeps the per-member widenToContext behaviour.
-            try parts.append(c.scratch(), if (ret_ctx == types.no_type)
-                try c.widenReturnMember(rt)
-            else
-                try c.widenToContext(rt, ret_ctx));
+            try parts.append(c.scratch(), try c.checkExprCached(r, ret_ctx));
         }
         if (bare_return or !c.stmtListTerminal(c.tree.nodeRange(body))) {
             try parts.append(c.scratch(), types.undefined_type);
         }
-        const u = try c.ts.makeUnion(c.scratch(), parts.items);
-        return if (ret_ctx == types.no_type) c.finalizeInferredReturn(u) else u;
+        // The several `return` statements of one function are ONE widening
+        // context, so widening is decided on the union rather than per return
+        // expression: both `widenReturnMember` and `widenToContext` distribute
+        // over a union, so that part is the same computation — what is new is
+        // the sibling-`undefined` normalization, which needs every member at
+        // once. It applies with or without a contextual return type (a
+        // contextual type fixes primitive-literal freshness, not object-literal
+        // widening; and where the context is concrete the caller sees the
+        // annotated type anyway, so it is invisible there).
+        const raw = try c.normalizeFreshObjectSiblings(try c.ts.makeUnion(c.scratch(), parts.items));
+        // No-context inference unions the *un-widened* fresh literals and
+        // widens only the collapsed result (finalizeInferredReturn); a
+        // contextual return keeps the widenToContext behaviour.
+        if (ret_ctx == types.no_type) return c.finalizeInferredReturn(try c.widenReturnMember(raw));
+        return c.widenToContext(raw, ret_ctx);
     }
 
     fn collectReturns(c: *Checker, node: Node, out: *std.ArrayList(Node), out_scopes: ?*std.ArrayList(ScopeId), bare: *bool, scope: ScopeId) Error!void {
@@ -4981,13 +5075,23 @@ const Checker = struct {
         };
     }
 
+    /// The declared type of an un-annotated declarator's initializer. A `const`
+    /// keeps its literal types (`regular`, not `widenLiteral`), but an
+    /// initializer that is a union of *fresh object literals* — `cond ? {a} :
+    /// {b}`, `x || {b}` — is still one widening context and gets the
+    /// sibling-`undefined` normalization either way.
+    fn widenInitializer(c: *Checker, init_t: TypeId, is_const: bool) Error!TypeId {
+        const norm = try c.normalizeFreshObjectSiblings(init_t);
+        return if (is_const) c.ts.regular(norm) else c.widenLiteral(norm);
+    }
+
     fn declaratorType(c: *Checker, sym: SymbolId, decl: Node, is_const: bool) Error!TypeId {
         const d = c.tree.nodeData(decl);
         switch (c.nodeTag(decl)) {
             .declarator => return types.any_type,
             .declarator_init => {
                 const init_t = try c.checkExprCached(d.rhs, types.no_type);
-                const vt = if (is_const) try c.ts.regular(init_t) else try c.widenLiteral(init_t);
+                const vt = try c.widenInitializer(init_t, is_const);
                 if (c.nodeTag(d.lhs) == .identifier) return vt;
                 return c.bindingElementType(sym, decl, vt);
             },
@@ -4998,7 +5102,7 @@ const Checker = struct {
                     vt = try c.annTypeMaybeUnique(e.type_ann, is_const, 1332, c.nodeSpan(d.lhs));
                 } else if (e.init != 0) {
                     const init_t = try c.checkExprCached(e.init, types.no_type);
-                    vt = if (is_const) try c.ts.regular(init_t) else try c.widenLiteral(init_t);
+                    vt = try c.widenInitializer(init_t, is_const);
                 }
                 if (c.nodeTag(d.lhs) == .identifier) return vt;
                 return c.bindingElementType(sym, decl, vt);
