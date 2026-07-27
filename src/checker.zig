@@ -12329,9 +12329,15 @@ const Checker = struct {
                 // against `Item[]`: each branch's array/object literal must be
                 // contextually typed so its literal props don't widen — without
                 // it `icon: 'link'` widens to `string` and rejects the `IconName`
-                // prop). Other value kinds are checked context-free.
+                // prop). A function value (arrow or function expression) is
+                // contextually typed by the target prop's signature, so its
+                // parameters get their types from the callback type instead of
+                // going implicit-any (`onPick={(v) => …}` against
+                // `onPick?: (v: number) => void` — without the context every such
+                // parameter raises TS7006). Other value kinds are checked
+                // context-free.
                 const vctx = switch (c.nodeTag(cd.lhs)) {
-                    .template_expr, .object_literal, .array_literal, .cond_expr => ctx,
+                    .template_expr, .object_literal, .array_literal, .cond_expr, .arrow_fn, .function_expr => ctx,
                     else => types.no_type,
                 };
                 return c.checkExprCached(cd.lhs, vctx);
