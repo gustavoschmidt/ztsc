@@ -4264,13 +4264,7 @@ const Checker = struct {
                     // this, every prop of `{ id, active, ...overrides }` (with
                     // `overrides: Partial<X>`) became optional and failed
                     // assignment to the required target (TS2322 factory FPs).
-                    if (p.flags & types.prop_flag_optional != 0) {
-                        if (prop_index.get(p.name)) |idx| {
-                            props.items[idx].ty = try c.logicalUnion(props.items[idx].ty, try c.removeUndefined(p.ty));
-                            continue;
-                        }
-                    }
-                    try upsertProp(c.scratch(), props, prop_index, .{ .name = p.name, .ty = p.ty, .flags = p.flags & types.prop_flag_optional });
+                    try c.addSpreadProp(p, props, prop_index);
                 }
             },
             .intersection => {
@@ -4278,8 +4272,92 @@ const Checker = struct {
                     try c.gatherSpreadProps(try c.resolveStructural(m), props, prop_index, str_index_vals, num_index_vals);
                 }
             },
+            .union_type => {
+                // tsc's `getSpreadType` distributes over a union and yields a
+                // UNION of spread results. ztsc's object literal is one object,
+                // so the constituents are FOLDED instead: a property every
+                // member declares keeps the union of its types; one that some
+                // member lacks (or declares optional) becomes optional. That
+                // drops the correlation between properties, but the arm did not
+                // exist at all, so a union spread source contributed NOTHING —
+                // `{ ...(tool || { type: "selection" }), extra }` lost `type`
+                // entirely and failed every target that requires it.
+                //
+                // Only an all-object union folds; `null`/`undefined`/`void`
+                // members spread nothing (tsc), and anything else leaves the
+                // whole spread unmodelled exactly as before.
+                const members = try c.memberList(st);
+                var objs: std.ArrayList(TypeId) = .empty;
+                defer objs.deinit(c.scratch());
+                // A `null`/`undefined`/`void` member spreads the EMPTY object
+                // (tsc), i.e. one alternative supplies no property at all — so
+                // every folded property is optional when the union has one.
+                var has_empty = false;
+                for (members) |m| {
+                    const rm = try c.resolveStructural(m);
+                    switch (c.ts.kind(rm)) {
+                        .object => try objs.append(c.scratch(), rm),
+                        .null, .undefined, .void => has_empty = true,
+                        else => return,
+                    }
+                }
+                if (objs.items.len == 0) return;
+                var names: std.ArrayList(Atom) = .empty;
+                defer names.deinit(c.scratch());
+                var seen: std.AutoHashMapUnmanaged(Atom, void) = .empty;
+                defer seen.deinit(c.scratch());
+                for (objs.items) |o| {
+                    for (0..c.ts.objectPropCount(o)) |i| {
+                        const p = c.ts.objectProp(o, @intCast(i));
+                        const g = try seen.getOrPut(c.scratch(), p.name);
+                        if (!g.found_existing) try names.append(c.scratch(), p.name);
+                    }
+                }
+                for (names.items) |nm| {
+                    var parts: std.ArrayList(TypeId) = .empty;
+                    defer parts.deinit(c.scratch());
+                    var optional = has_empty;
+                    var readonly = false;
+                    for (objs.items) |o| {
+                        if (c.ts.objectPropByName(o, nm)) |p| {
+                            try parts.append(c.scratch(), try c.removeUndefined(p.ty));
+                            if (p.flags & types.prop_flag_optional != 0) optional = true;
+                            if (p.flags & types.prop_flag_readonly != 0) readonly = true;
+                        } else optional = true;
+                    }
+                    var flags: u8 = 0;
+                    if (optional) flags |= types.prop_flag_optional;
+                    if (readonly) flags |= types.prop_flag_readonly;
+                    try c.addSpreadProp(.{
+                        .name = nm,
+                        .ty = try c.ts.makeUnion(c.scratch(), parts.items),
+                        .flags = flags,
+                    }, props, prop_index);
+                }
+            },
             else => {},
         }
+    }
+
+    /// Fold one spread source property into the accumulated literal. tsc's
+    /// `getSpreadType`: when the property is already present on the left
+    /// (`{ a, b, ...rest }`) and the spread declares it OPTIONAL, the left
+    /// keeps its optionality and the value types union — so an explicit
+    /// required property stays required even when a later `Partial<…>` spread
+    /// re-supplies it.
+    fn addSpreadProp(
+        c: *Checker,
+        p: types.Prop,
+        props: *std.ArrayList(types.Prop),
+        prop_index: *std.AutoHashMapUnmanaged(Atom, u32),
+    ) Error!void {
+        if (p.flags & types.prop_flag_optional != 0) {
+            if (prop_index.get(p.name)) |idx| {
+                props.items[idx].ty = try c.logicalUnion(props.items[idx].ty, try c.removeUndefined(p.ty));
+                return;
+            }
+        }
+        try upsertProp(c.scratch(), props, prop_index, .{ .name = p.name, .ty = p.ty, .flags = p.flags & types.prop_flag_optional });
     }
 
     // =====================================================================
