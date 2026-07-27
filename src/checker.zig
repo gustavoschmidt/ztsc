@@ -3373,6 +3373,24 @@ const Checker = struct {
                 }
                 return c.ts.makeUnion(c.scratch(), parts.items);
             },
+            // `keyof (A | B) === keyof A & keyof B` (tsc `getIndexType` maps
+            // over the union constituents and *intersects* the per-constituent
+            // key sets — only a key present on every constituent can be read
+            // off the union). Without this arm a concrete union fell to the
+            // `else` and collapsed to `never`, so every `Omit`/`Pick`/
+            // `Required` over a discriminated union materialized as `{}` — and,
+            // through the `.intersection` arm above, `keyof (Union & {index})`
+            // came out as just `"index"`.
+            .union_type => {
+                var parts: std.ArrayList(TypeId) = .empty;
+                defer parts.deinit(c.scratch());
+                // `memberList` dupes first for the same reason as the
+                // `.intersection` arm above: `keyofType(m)` interns.
+                for (try c.memberList(r)) |m| {
+                    try parts.append(c.scratch(), try c.keyofType(m));
+                }
+                return c.intersectKeySets(parts.items);
+            },
             // A generic operand (a type param or another deferred node) → a
             // deferred `keyof` that resolves on instantiation. `keyof T` is not
             // computable until `T` is known, so it must not collapse to `never`.
@@ -3382,6 +3400,105 @@ const Checker = struct {
                 return types.never_type;
             },
         }
+    }
+
+    /// Intersect per-constituent key sets for `keyof (A | B | …)`.
+    ///
+    /// tsc builds `getIntersectionType(map(constituents, getIndexType))` and
+    /// leans on intersection reduction over literal types to collapse it to the
+    /// common keys. ztsc's `makeIntersection` is purely canonical (flatten /
+    /// dedup / sort) and does not reduce a literal-union intersection, so the
+    /// common set is computed here directly whenever it is *enumerable*:
+    /// every constituent key set consists of key literals and/or the whole
+    /// primitive key domains (`string` / `number` / `symbol`, which is what an
+    /// index signature or `keyof any` contributes). A key survives when every
+    /// other set contains it — either literally, or via the primitive domain it
+    /// belongs to, which is what makes `keyof ({ [k: string]: V } | { a: 1 })`
+    /// come out as `"a"` rather than `never`.
+    ///
+    /// A non-enumerable set (a deferred `keyof T`, a type param, …) means the
+    /// answer is not yet computable, so the intersection is left symbolic and
+    /// reduces on instantiation.
+    fn intersectKeySets(c: *Checker, parts: []const TypeId) Error!TypeId {
+        const s = &c.ts;
+        // Pick the base: the first fully-literal set (a primitive domain is a
+        // filter, never an enumeration). Bail out to a symbolic intersection as
+        // soon as any set is not enumerable.
+        var base: ?TypeId = null;
+        for (parts) |p| {
+            if (!c.keySetEnumerable(p)) return s.makeIntersection(c.scratch(), parts);
+            if (base == null and c.keySetAllLiterals(p)) base = p;
+        }
+        const b = base orelse return s.makeIntersection(c.scratch(), parts);
+        var keep: std.ArrayList(TypeId) = .empty;
+        defer keep.deinit(c.scratch());
+        for (try c.keySetMembers(b)) |k| {
+            for (parts) |p| {
+                if (p == b) continue;
+                if (!c.keySetHas(p, k)) break;
+            } else try keep.append(c.scratch(), k);
+        }
+        return s.makeUnion(c.scratch(), keep.items);
+    }
+
+    /// The constituents of a key set, as a scratch-owned slice (a lone key is
+    /// wrapped, `never` is the empty set).
+    fn keySetMembers(c: *Checker, t: TypeId) Error![]const TypeId {
+        if (c.ts.kind(t) == .union_type) return c.memberList(t);
+        if (t == types.never_type) return &.{};
+        return c.scratch().dupe(TypeId, &.{t});
+    }
+
+    /// A key set every constituent of which is a key literal or a whole
+    /// primitive key domain — the shape `intersectKeySets` can compute with.
+    fn keySetEnumerable(c: *Checker, t: TypeId) bool {
+        if (t == types.never_type) return true;
+        if (c.ts.kind(t) == .union_type) {
+            for (c.ts.members(t)) |m| if (!isKeyAtom(c.ts.kind(m))) return false;
+            return true;
+        }
+        return isKeyAtom(c.ts.kind(t));
+    }
+
+    /// As above, but rejecting the primitive domains: only such a set can serve
+    /// as the enumeration `intersectKeySets` filters.
+    fn keySetAllLiterals(c: *Checker, t: TypeId) bool {
+        if (t == types.never_type) return true;
+        if (c.ts.kind(t) == .union_type) {
+            for (c.ts.members(t)) |m| if (!isKeyLiteral(c.ts.kind(m))) return false;
+            return true;
+        }
+        return isKeyLiteral(c.ts.kind(t));
+    }
+
+    /// Does key set `set` contain key literal `k` — literally, or through the
+    /// primitive domain `k` belongs to?
+    fn keySetHas(c: *Checker, set: TypeId, k: TypeId) bool {
+        const dom: TypeId = switch (c.ts.kind(k)) {
+            .string_literal, .template_literal_type, .string_mapping => types.string_type,
+            .number_literal, .number_literal_fresh => types.number_type,
+            .unique_symbol => types.symbol_type,
+            else => 0,
+        };
+        if (c.ts.kind(set) == .union_type) {
+            for (c.ts.members(set)) |m| if (m == k or (dom != 0 and m == dom)) return true;
+            return false;
+        }
+        return set == k or (dom != 0 and set == dom);
+    }
+
+    fn isKeyLiteral(k: types.Kind) bool {
+        return switch (k) {
+            .string_literal, .number_literal, .number_literal_fresh, .unique_symbol, .template_literal_type, .string_mapping => true,
+            else => false,
+        };
+    }
+
+    fn isKeyAtom(k: types.Kind) bool {
+        return isKeyLiteral(k) or switch (k) {
+            .string, .number, .symbol => true,
+            else => false,
+        };
     }
 
     /// `keyof` of a (deferred) mapped type: its key set. Non-remapped maps use
