@@ -455,7 +455,7 @@ const map_containers = [_][]const u8{
     "fresh_tp_ids",           "fresh_tp_info",      "type_node_cache",
     "atom_cache",             "infer_ids",          "infer_scopes",
     "mapped_key_ids",         "inst_diag_at",       "infer_active",
-    "lazy_member_active",
+    "lazy_member_active",     "chain_guards",
 };
 
 const Checker = struct {
@@ -857,6 +857,11 @@ const Checker = struct {
     /// its body, are never on this stack, so inferring `U = T` from an enclosing
     /// signature's fixed `T` still works.
     infer_active: std.ArrayListUnmanaged(u32) = .empty,
+    /// References an enclosing optional chain has already guarded, while the
+    /// *sub*expression that the chain only evaluates on the non-nullish branch
+    /// is being checked (see `pushChainGuards`). Empty everywhere else, so the
+    /// narrowing hook costs one length test per reference read.
+    chain_guards: std.ArrayListUnmanaged(RefKey) = .empty,
     stats: Stats = .{},
 
     // Well-known atoms (interned once in init).
@@ -15035,7 +15040,14 @@ const Checker = struct {
             try c.chainObjType(d.lhs, chained)
         else
             try c.checkExprCached(d.lhs, types.no_type);
-        const idx_t = try c.checkExprCached(d.rhs, types.no_type);
+        // The index expression runs only on the chain's non-nullish branch, so
+        // it sees the chain's own guards (`pushChainGuards`).
+        const idx_t = idx: {
+            const saved = c.chain_guards.items.len;
+            defer c.chain_guards.shrinkRetainingCapacity(saved);
+            try c.pushChainGuards(node);
+            break :idx try c.checkExprCached(d.rhs, types.no_type);
+        };
         if (own_optional) {
             if (c.containsNullish(obj_t)) chained.* = true;
             obj_t = try c.nonNullableChain(obj_t);
@@ -17931,17 +17943,61 @@ const Checker = struct {
     }
 
     fn flowTypeOfReference(c: *Checker, node: Node, sym: SymbolId, declared: TypeId) Error!TypeId {
-        if (!c.isNarrowable(declared)) return declared;
-        const flow = c.bind.flowAt(node) orelse return declared;
-        c.stats.flow_queries += 1;
-        return c.flowType(flow, .{ .sym = sym }, declared, 0);
+        return c.flowTypeOfKey(node, .{ .sym = sym }, declared);
     }
 
     fn flowTypeOfKey(c: *Checker, node: Node, key: RefKey, declared: TypeId) Error!TypeId {
-        if (!c.isNarrowable(declared)) return declared;
-        const flow = c.bind.flowAt(node) orelse return declared;
-        c.stats.flow_queries += 1;
-        return c.flowType(flow, key, declared, 0);
+        var t = declared;
+        if (c.isNarrowable(declared)) {
+            if (c.bind.flowAt(node)) |flow| {
+                c.stats.flow_queries += 1;
+                t = try c.flowType(flow, key, declared, 0);
+            }
+        }
+        return c.applyChainGuards(key, t);
+    }
+
+    /// The binder binds optional chains linearly (see its header note), so the
+    /// non-nullish branch a `?.` opens is not a flow node. tsc's binder splits
+    /// it — `a?.b?.[i]` binds as `a && a.b && a.b[i]`, with the index
+    /// expression bound under the accumulated true-branch — which is what makes
+    /// `updates?.points?.[updates?.points?.length - 1]` legal: inside the
+    /// brackets, `updates` and `updates.points` are already known non-nullish,
+    /// so the inner chain does not re-add the short-circuit `undefined`.
+    ///
+    /// `pushChainGuards` reconstructs exactly that condition set for the one
+    /// place it is observable in an expression checker — a subexpression the
+    /// chain evaluates only on the non-nullish branch — by walking the access
+    /// spine and recording the *object* of every `?.` link, which is precisely
+    /// the expression that link asserts. Only those objects are recorded, never
+    /// the whole spine: in `a?.b[i]` the sole assertion is on `a`, and treating
+    /// `a.b` as guarded too would swallow the TS18048 that a nullish `a.b`
+    /// owes the reads inside `i`.
+    fn pushChainGuards(c: *Checker, node: Node) Error!void {
+        var n = node;
+        while (true) {
+            while (c.nodeTag(n) == .paren_expr) n = c.tree.nodeData(n).lhs;
+            const d = c.tree.nodeData(n);
+            switch (c.nodeTag(n)) {
+                .optional_member_expr, .optional_index_expr, .optional_call => {
+                    if (try c.buildRefKey(d.lhs)) |k| try c.chain_guards.append(c.cm(), k);
+                },
+                .member_expr, .index_expr, .call_expr, .call_expr_targs => {},
+                else => return,
+            }
+            n = d.lhs;
+        }
+    }
+
+    /// Non-nullish for a reference an enclosing chain has already guarded.
+    /// Applied *after* flow narrowing (and after the untracked-reference early
+    /// outs) so it composes with whatever the flow graph knows.
+    fn applyChainGuards(c: *Checker, key: RefKey, t: TypeId) Error!TypeId {
+        if (c.chain_guards.items.len == 0) return t;
+        for (c.chain_guards.items) |k| {
+            if (std.meta.eql(k, key)) return c.nonNullableChain(t);
+        }
+        return t;
     }
 
     fn flowType(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth: u32) Error!TypeId {
