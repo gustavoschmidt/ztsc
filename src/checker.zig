@@ -1887,12 +1887,23 @@ const Checker = struct {
     // literal freshness / widening helpers
     // =====================================================================
 
+    /// `Store.literalBase`, extended with the enum-member case: the base of an
+    /// enum member type `E.A` is the whole enum `E` (tsc's
+    /// `getBaseTypeOfEnumLikeType`), so a member widens to `E`, is assignable
+    /// to `E`, and counts as a unit type everywhere the store's const helper
+    /// is consulted. Interning the whole-enum type needs the store, which is
+    /// why this cannot live on `Store.literalBase`.
+    fn literalBaseOf(c: *Checker, t: TypeId) Error!TypeId {
+        if (c.ts.isEnumMember(t)) return c.ts.makeEnumType(c.ts.enumSymbol(t));
+        return c.ts.literalBase(t);
+    }
+
     /// Fresh literal -> base primitive; unions widen fresh members; fresh
     /// object literals lose freshness (their props were already widened at
     /// creation unless contextually kept).
     fn widenLiteral(c: *Checker, t: TypeId) Error!TypeId {
         if (c.ts.isFreshLiteral(t)) {
-            const base = c.ts.literalBase(t);
+            const base = try c.literalBaseOf(t);
             return if (base != types.no_type) base else t;
         }
         switch (c.ts.kind(t)) {
@@ -2015,7 +2026,7 @@ const Checker = struct {
     /// while `const x: "a" | "b" = f()` stays assignable.
     fn finalizeInferredReturn(c: *Checker, u: TypeId) Error!TypeId {
         if (c.ts.isFreshLiteral(u)) {
-            const base = c.ts.literalBase(u);
+            const base = try c.literalBaseOf(u);
             return if (base != types.no_type) base else u;
         }
         // The returns of one function are one widening context: normalize the
@@ -2268,7 +2279,10 @@ const Checker = struct {
             },
             .type_param => try w.print("{s}", .{c.symbolName(s.typeParamSymbol(t))}),
             .class_value => try w.print("typeof {s}", .{c.symbolName(s.classSymbol(t))}),
-            .enum_type => try w.print("{s}", .{c.symbolName(s.enumSymbol(t))}),
+            .enum_type => if (s.isEnumMember(t))
+                try w.print("{s}.{s}", .{ c.symbolName(s.enumSymbol(t)), c.atomText(s.enumMemberAtom(t)) })
+            else
+                try w.print("{s}", .{c.symbolName(s.enumSymbol(t))}),
             .this_type => try w.writeAll("this"),
             .infer_var => try w.print("infer {s}", .{c.atomText(s.inferVarName(t))}),
             .mapped_param => try w.print("{s}", .{c.atomText(s.mappedParamName(t))}),
@@ -3007,6 +3021,20 @@ const Checker = struct {
         // `import("m").T` — the qualifier base is a module, not a namespace sym.
         if (c.nodeTag(d.lhs) == .import_type) return c.importTypeMember(d.lhs, name_tok, args);
         const name = try c.memberAtom(name_tok);
+        // A qualified ENUM MEMBER in type position (`WS.INIT`, `NS.E.X`): the
+        // member's own nominal unit type. Checked before the namespace walk —
+        // an enum symbol is not a namespace container, so `resolveNsContainer`
+        // returns null for it and the whole annotation used to degrade to
+        // `any`, taking every union discriminated by enum members with it.
+        if (try c.enumSymOfQualifier(d.lhs)) |esym| {
+            if (try c.enumHasMemberNamed(esym, name)) return c.ts.makeEnumMember(esym, name, false);
+            // An enum merged with a namespace still has namespace members;
+            // only a pure enum can conclude "no such member" here.
+            if (!c.symFlags(esym).namespace_decl) {
+                try c.diagFmt(2694, c.tokSpan(name_tok), "Namespace '{s}' has no exported member '{s}'.", .{ c.symbolName(esym), c.atomText(name) });
+                return types.error_type;
+            }
+        }
         const container = (try c.resolveNsContainer(d.lhs)) orelse return types.any_type;
         switch (container) {
             .ns => |ns_sym| {
@@ -3034,6 +3062,44 @@ const Checker = struct {
                 return types.any_type;
             },
         }
+    }
+
+    /// The enum symbol a qualified-name qualifier denotes — `WS` in `WS.INIT`,
+    /// `NS.E` in `NS.E.X`, an `import`ed alias of either — or null when the
+    /// qualifier is not an enum.
+    fn enumSymOfQualifier(c: *Checker, node: Node) Error!?SymbolId {
+        switch (c.nodeTag(node)) {
+            .identifier => {
+                const a = try c.atomOfToken(c.tree.nodeMainToken(node));
+                switch (c.resolveSpace(a, c.cur_scope, false)) {
+                    .sym => |sym| {
+                        if (c.symFlags(sym).enum_decl) return sym;
+                        if (c.symFlags(sym).import_binding) {
+                            if (c.importTarget(sym)) |tgt| return c.enumSymFromImportTarget(tgt);
+                        }
+                        return null;
+                    },
+                    else => return null,
+                }
+            },
+            .qualified_name, .member_expr => {
+                const d = c.tree.nodeData(node);
+                const outer = (try c.resolveNsContainer(d.lhs)) orelse return null;
+                const g = c.containerMemberSym(outer, try c.memberAtom(d.rhs)) orelse return null;
+                return if (c.symFlags(g).enum_decl) g else null;
+            },
+            else => return null,
+        }
+    }
+
+    fn enumSymFromImportTarget(c: *Checker, tgt: modules.Target) ?SymbolId {
+        if (tgt.kind != .binding) return null;
+        const g = c.toGlobalIn(tgt.file, tgt.payload);
+        if (c.symFlags(g).enum_decl) return g;
+        if (c.symFlags(g).import_binding) {
+            if (c.importTarget(g)) |t2| return c.enumSymFromImportTarget(t2);
+        }
+        return null;
     }
 
     /// Resolve the qualifier of a dotted type/entity name (identifier or nested
@@ -6924,18 +6990,19 @@ const Checker = struct {
         return info;
     }
 
-    /// The union of an enum's member *value* literals (`"a" | "b"` for a string
-    /// enum, `0 | 1` for numeric). Models an `enum_type` source in the OUT
-    /// direction of assignability: since ztsc types `E.A` as the whole enum
-    /// (member identity is not tracked), an enum value is soundly modelled by
-    /// the union of every member's value. Returns null when any member is
-    /// computed / non-constant (the enum is then opaque and the nominal rules in
-    /// `enumAssignable` apply instead).
-    fn enumValueUnion(c: *Checker, sym: SymbolId) Error!?TypeId {
+    /// Walk every member of an enum symbol (all declaration blocks merged) in
+    /// declaration order, handing the callback each member's name atom and the
+    /// literal type of its constant value — `no_type` when the value is
+    /// computed (or when auto-increment ran off a string/computed member, so
+    /// the number is unknowable). The one place the auto-increment rules live.
+    fn eachEnumMember(
+        c: *Checker,
+        sym: SymbolId,
+        ctx: anytype,
+        comptime f: fn (@TypeOf(ctx), Atom, TypeId) Error!void,
+    ) Error!void {
         const saved = c.enterSymFile(sym);
         defer c.restoreCtx(saved);
-        var parts: std.ArrayList(TypeId) = .empty;
-        defer parts.deinit(c.scratch());
         var auto: f64 = 0;
         var auto_ok = true;
         for (c.declsOf(sym)) |decl| {
@@ -6943,31 +7010,92 @@ const Checker = struct {
             const data = c.tree.extraData(ast.EnumData, c.tree.nodeData(decl).lhs);
             for (c.tree.extraRange(data.members_start, data.members_end)) |m| {
                 if (m == null_node or c.nodeTag(m) != .enum_member) continue;
+                const name = try c.memberAtom(c.tree.nodeMainToken(m));
                 const init_node = c.tree.nodeData(m).lhs;
                 if (init_node == null_node) {
-                    if (!auto_ok) return null; // auto-increment off a string/computed member
-                    try parts.append(c.scratch(), try c.ts.makeNumberLiteral(auto, false));
-                    auto += 1;
+                    const v = if (auto_ok) try c.ts.makeNumberLiteral(auto, false) else types.no_type;
+                    if (auto_ok) auto += 1;
+                    try f(ctx, name, v);
                     continue;
                 }
                 const ci = c.classifyEnumInit(init_node);
                 switch (ci.kind) {
                     .string => {
                         const av = try c.memberAtom(c.tree.nodeMainToken(init_node));
-                        try parts.append(c.scratch(), try c.ts.makeStringLiteral(av, false));
                         auto_ok = false;
+                        try f(ctx, name, try c.ts.makeStringLiteral(av, false));
                     },
                     .numeric => {
-                        try parts.append(c.scratch(), try c.ts.makeNumberLiteral(ci.value, false));
                         auto = ci.value + 1;
                         auto_ok = true;
+                        try f(ctx, name, try c.ts.makeNumberLiteral(ci.value, false));
                     },
-                    .computed => return null,
+                    .computed => {
+                        auto_ok = false;
+                        try f(ctx, name, types.no_type);
+                    },
                 }
             }
         }
-        if (parts.items.len == 0) return null;
-        return try c.ts.makeUnion(c.scratch(), parts.items);
+    }
+
+    const EnumMemberLookup = struct {
+        want: Atom,
+        found: bool = false,
+        value: TypeId = types.no_type,
+        fn visit(self: *EnumMemberLookup, name: Atom, value: TypeId) Error!void {
+            if (self.found or name != self.want) return;
+            self.found = true;
+            self.value = value;
+        }
+    };
+
+    /// Does enum `sym` declare a member called `name`?
+    fn enumHasMemberNamed(c: *Checker, sym: SymbolId, name: Atom) Error!bool {
+        var look: EnumMemberLookup = .{ .want = name };
+        try c.eachEnumMember(sym, &look, EnumMemberLookup.visit);
+        return look.found;
+    }
+
+    /// The constant VALUE literal of enum member `sym.name` (`"a"` / `0`), or
+    /// null when the member is absent or its value is computed. tsc makes a
+    /// member type a subtype of exactly this literal — that is what lets
+    /// `const k: "keydown" = EVENT.KEYDOWN` type-check while
+    /// `const k: "paste" = EVENT.KEYDOWN` does not.
+    fn enumMemberValue(c: *Checker, sym: SymbolId, name: Atom) Error!?TypeId {
+        var look: EnumMemberLookup = .{ .want = name };
+        try c.eachEnumMember(sym, &look, EnumMemberLookup.visit);
+        if (!look.found or look.value == types.no_type) return null;
+        return look.value;
+    }
+
+    const EnumMemberCollect = struct {
+        c: *Checker,
+        list: *std.ArrayList(TypeId),
+        sym: SymbolId,
+        skip: Atom = 0,
+        fn visit(self: *EnumMemberCollect, name: Atom, value: TypeId) Error!void {
+            _ = value;
+            if (name == self.skip) return;
+            const t = try self.c.ts.makeEnumMember(self.sym, name, false);
+            for (self.list.items) |e| {
+                if (e == t) return; // a re-declared member name is one type
+            }
+            try self.list.append(self.c.scratch(), t);
+        }
+    };
+
+    /// The union of an enum's member TYPES (`E.A | E.B`) — tsc's actual
+    /// declared type of `E`, which is why narrowing a whole-enum reference
+    /// subtracts members and why `E` relates to `E.A | E.B`. `skip` drops one
+    /// member (the `x !== E.A` branch). Null for a member-less enum.
+    fn enumMemberTypeUnion(c: *Checker, sym: SymbolId, skip: Atom) Error!?TypeId {
+        var list: std.ArrayList(TypeId) = .empty;
+        defer list.deinit(c.scratch());
+        var collect: EnumMemberCollect = .{ .c = c, .list = &list, .sym = sym, .skip = skip };
+        try c.eachEnumMember(sym, &collect, EnumMemberCollect.visit);
+        if (list.items.len == 0) return null;
+        return try c.ts.makeUnion(c.scratch(), list.items);
     }
 
     /// Whether an enum has any string-valued member (non-allocating scan).
@@ -6990,10 +7118,12 @@ const Checker = struct {
     }
 
     /// The value object of an enum (`typeof E`): one readonly property per
-    /// member, each typed as the (nominal) enum type.
+    /// member, each typed as that member's own type `E.<name>` — FRESH, so a
+    /// member read widens to `E` at a mutable position (`let x = E.A` is `E`)
+    /// while a `const` keeps the member (`const x = E.A` is `E.A`), exactly as
+    /// a string literal does.
     fn enumValueType(c: *Checker, sym: SymbolId) Error!TypeId {
         if (c.enum_value_cache.get(sym)) |t| return t;
-        const enum_t = try c.ts.makeEnumType(sym);
         const saved = c.enterSymFile(sym);
         defer c.restoreCtx(saved);
         var props: std.ArrayList(types.Prop) = .empty;
@@ -7013,7 +7143,8 @@ const Checker = struct {
                     }
                 }
                 if (dup) continue; // first declaration wins (unique object keys)
-                try props.append(c.scratch(), .{ .name = name, .ty = enum_t, .flags = types.prop_flag_readonly });
+                const mt = try c.ts.makeEnumMember(sym, name, true);
+                try props.append(c.scratch(), .{ .name = name, .ty = mt, .flags = types.prop_flag_readonly });
             }
         }
         const result = try c.ts.makeObject(props.items, 0, 0, 0);
@@ -7021,13 +7152,27 @@ const Checker = struct {
         return result;
     }
 
-    /// Nominal enum assignability (identical enums are caught by `s == t`
-    /// upstream). Matches tsc 5.5: a numeric enum interconverts with `number`
-    /// (and accepts numeric literals equal to a member value); a string enum
-    /// is a subtype of `string` but nothing widens *into* it.
+    /// Nominal enum assignability. Identical types (same enum, same member)
+    /// are caught by `s == t` upstream, and `E.A → E` by the `literalBaseOf`
+    /// fast path, so what is left here is the widening in and out of the
+    /// primitive domain. Oracle-verified: a numeric enum (and a numeric
+    /// *member*) interconverts with `number` and accepts a numeric literal of
+    /// its own value; a string enum is a subtype of `string` but nothing —
+    /// not `string`, not the matching string literal — widens *into* it; and
+    /// `E → E.A`, `E.A → E.B` and `E1.A → E2.A` are all rejected.
     fn enumAssignable(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: types.Kind) Error!bool {
         if (sk == .enum_type and tk == .enum_type) return false;
         if (sk == .enum_type) {
+            if (c.ts.isEnumMember(s)) {
+                // A member widens to the primitive domain of its OWN value, so
+                // a string member of a mixed enum still reaches `string`.
+                if (try c.enumMemberValue(c.ts.enumSymbol(s), c.ts.enumMemberAtom(s))) |v| {
+                    return switch (c.ts.kind(v)) {
+                        .string_literal => tk == .string,
+                        else => tk == .number,
+                    };
+                }
+            }
             const info = try c.enumInfo(c.ts.enumSymbol(s));
             if (tk == .number and info.all_numeric) return true;
             if (tk == .string and info.all_string) return true;
@@ -7035,14 +7180,19 @@ const Checker = struct {
         }
         // tk == .enum_type
         const info = try c.enumInfo(c.ts.enumSymbol(t));
-        if (info.all_numeric) {
-            if (sk == .number) return true;
-            if (sk == .number_literal or sk == .number_literal_fresh) {
-                if (info.has_computed) return true;
-                return info.hasValue(c.ts.numberValue(s));
-            }
+        if (!info.all_numeric) return false;
+        if (sk == .number) return true;
+        if (sk != .number_literal and sk != .number_literal_fresh) return false;
+        if (c.ts.isEnumMember(t)) {
+            // Only the literal equal to *this* member's value: `const p: N.P = 1`
+            // is legal, `const p: N.P = 2` is not.
+            const v = (try c.enumMemberValue(c.ts.enumSymbol(t), c.ts.enumMemberAtom(t))) orelse
+                return true; // computed member: opaque, stay lenient
+            if (c.ts.kind(v) == .string_literal) return false;
+            return c.ts.numberValue(v) == c.ts.numberValue(s);
         }
-        return false;
+        if (info.has_computed) return true;
+        return info.hasValue(c.ts.numberValue(s));
     }
 
     /// Does a string-valued member of enum `sym` have the value `val`? Used by
@@ -9578,10 +9728,9 @@ const Checker = struct {
             },
             // An enum key domain (`{ [P in E]: V }` / `Record<E, V>`) is
             // materialized as an INDEX signature (`string` for a string enum,
-            // `number` for a numeric one), not named props. ztsc has no
-            // per-member enum literal type, so it cannot name the props by
-            // member value — and, symmetrically, an object literal built with
-            // computed enum-member keys (`{ [E.A]: v }`) collapses to `{}`.
+            // `number` for a numeric one), not named props: an object literal
+            // built with computed enum-member keys (`{ [E.A]: v }`) is keyed by
+            // the binder's text-derived placeholder, not by member value.
             // Emitting named props here would make every such literal fail the
             // now-required keys (spurious TS2739). An index signature keeps both
             // sides consistent: `Object.values`/`entries` inference recovers `V`
@@ -11191,12 +11340,8 @@ const Checker = struct {
         // → `enumAssignable`.)
         const ra = try c.ts.regularLiteral(a);
         const rb = try c.ts.regularLiteral(b);
-        if (c.ts.kind(ra) == .enum_type and c.ts.kind(rb) == .string_literal) {
-            if (try c.enumHasStringValue(c.ts.enumSymbol(ra), c.ts.literalAtom(rb))) return true;
-        }
-        if (c.ts.kind(rb) == .enum_type and c.ts.kind(ra) == .string_literal) {
-            if (try c.enumHasStringValue(c.ts.enumSymbol(rb), c.ts.literalAtom(ra))) return true;
-        }
+        if (try c.enumOverlapsStringLiteral(ra, rb)) return true;
+        if (try c.enumOverlapsStringLiteral(rb, ra)) return true;
         if (try c.isComparable(a, b)) return true;
         // tsc's *comparable* relation distributes EXISTENTIALLY over an
         // intersection (`someTypeRelatedToType`): the relation holds as soon as
@@ -11224,6 +11369,22 @@ const Checker = struct {
             return false;
         }
         return false;
+    }
+
+    /// tsc's *comparable* relation for the enum/string-literal pair: a string
+    /// enum overlaps a string literal equal to one of its member values
+    /// (`x === 'FEMALE'` where `enum CattleSex { Female = 'FEMALE' }`), even
+    /// though the plain literal is not *assignable* into the nominal enum. For
+    /// a MEMBER type only its own value counts, so `E.A === "b"` is still
+    /// TS2367. (The numeric-enum ↔ number-literal case already overlaps via
+    /// `isComparable` → `enumAssignable`.) Both arguments are regularized.
+    fn enumOverlapsStringLiteral(c: *Checker, e: TypeId, lit: TypeId) Error!bool {
+        if (c.ts.kind(e) != .enum_type or c.ts.kind(lit) != .string_literal) return false;
+        if (c.ts.isEnumMember(e)) {
+            const v = (try c.enumMemberValue(c.ts.enumSymbol(e), c.ts.enumMemberAtom(e))) orelse return true;
+            return v == lit;
+        }
+        return c.enumHasStringValue(c.ts.enumSymbol(e), c.ts.literalAtom(lit));
     }
 
     fn isAssignable(c: *Checker, s0: TypeId, t0: TypeId) Error!bool {
@@ -11290,7 +11451,7 @@ const Checker = struct {
         if (tk == .void) return sk == .undefined or sk == .void;
 
         // Literal -> base primitive.
-        const base = c.ts.literalBase(s);
+        const base = try c.literalBaseOf(s);
         if (base != types.no_type and base == t) return true;
 
         // Cache compound comparisons (recursion termination for refs).
@@ -11361,42 +11522,27 @@ const Checker = struct {
         // not to any single member. Identity (`keyof T <: keyof T`) is caught
         // by the `s == t` fast path.
         if (sk == .keyof_op) return c.isAssignable(try c.propertyKeyType(), t);
-        // Enum *source* against a non-enum target: model the enum by the union
-        // of its member value literals and relate that. Handled before
-        // union-target distribution because an enum is assignable to the *whole*
-        // value union (`E` → `"a" | "b"`), not necessarily to any single member
-        // (`E` never distributes to just `"a"`). A string-enum member is a
-        // subtype of its string-literal value in tsc; ztsc loses member identity
-        // (types `E.A` as `E`), so this is the sound OUT-direction model. Falls
-        // through to the nominal `enumAssignable` when the enum is opaque
-        // (computed members → null) so `string`/`number` widening still works.
+        // Enum *source* against a non-enum target. Handled before union-target
+        // distribution, because what an enum relates to is a whole union, not
+        // any single member of it.
+        //
+        // A MEMBER is a subtype of exactly the literal it is initialized with
+        // (tsc): `const k: "keydown" = EVENT.KEYDOWN` is legal,
+        // `const k: "paste" = EVENT.KEYDOWN` is not, and `EVENT.KEYDOWN` can
+        // infer `K extends keyof DocumentEventMap` in an `addEventListener`
+        // overload. The WHOLE enum is the union of its members, so it reaches
+        // `"keydown" | "paste"` but not `"keydown"` alone.
+        //
+        // Falls through to the nominal `enumAssignable` when a member's value
+        // is computed (the enum is opaque) so `string`/`number` widening still
+        // works.
         if (sk == .enum_type and tk != .enum_type) {
-            if (try c.enumValueUnion(c.ts.enumSymbol(s))) |vu| {
-                if (try c.isAssignable(vu, t)) return true;
-            }
-            // tsc's rule is per-MEMBER: a string-enum member type `E.A` is a
-            // subtype of the string literal it is initialized with, so
-            // `const k: "keydown" = EVENT.KEYDOWN` is legal and
-            // `document.addEventListener(EVENT.KEYDOWN, h)` can pick the
-            // `K extends keyof DocumentEventMap` overload. ztsc has no member
-            // identity — `E.A` types as the whole `E` — so the closest
-            // available rule is EXISTENTIAL: relate `E` to a string literal
-            // that is *some* member's value. Deliberate under-approximation
-            // (`const k: "paste" = EVENT.KEYDOWN` is accepted too); the
-            // alternative is the false positive on every correct
-            // `addEventListener(EVENT.X, …)`, which policy forbids. A literal
-            // that is NOT a member value is still rejected, and the reverse
-            // direction is untouched: `string` and `"keydown"` remain
-            // unassignable INTO the nominal enum (`enumAssignable`).
-            if (tk == .string_literal) {
-                if (try c.enumHasStringValue(c.ts.enumSymbol(s), c.ts.literalAtom(t))) return true;
-            }
-            // Same rule for a numeric enum: tsc relates the member type `N.P`
-            // to the number literal `1`. A computed member makes the value set
-            // unknown, so the enum stays opaque there.
-            if (tk == .number_literal or tk == .number_literal_fresh) {
-                const info = try c.enumInfo(c.ts.enumSymbol(s));
-                if (info.all_numeric and !info.has_computed and info.hasValue(c.ts.numberValue(t))) return true;
+            if (c.ts.isEnumMember(s)) {
+                if (try c.enumMemberValue(c.ts.enumSymbol(s), c.ts.enumMemberAtom(s))) |v| {
+                    if (try c.isAssignable(v, t)) return true;
+                }
+            } else if (try c.enumMemberTypeUnion(c.ts.enumSymbol(s), 0)) |mu| {
+                if (try c.isAssignable(mu, t)) return true;
             }
         }
         // Source union distributes first.
@@ -14313,6 +14459,10 @@ const Checker = struct {
             .number_literal, .number_literal_fresh => return lk == .number_literal or lk == .number_literal_fresh,
             .bigint_literal => return lk == .bigint_literal,
             .bool_true, .bool_false, .boolean => return lit_is_bool,
+            // An enum MEMBER context keeps a fresh member of the same enum
+            // (`const a: WS.A[] = [WS.A]`); the whole enum does not — that is
+            // the widening context (`const o = { k: WS.A }` is `{ k: WS }`).
+            .enum_type => return c.ts.isEnumMember(r) and c.ts.isEnumMember(lit),
             .union_type => {
                 for (try c.memberList(r)) |m| {
                     if (try c.contextAdmitsLiteral(m, lit)) return true;
@@ -14458,9 +14608,9 @@ const Checker = struct {
                             continue;
                         }
                         // A qualified enum-member computed key (`{ [Breed.X]: v
-                        // }`): the member's value identity is unavailable at the
-                        // type level (kt is the whole `enum_type`), so — exactly
-                        // like the type-literal/interface member — key it by the
+                        // }`): the key is the member's *value*, which a computed
+                        // member leaves unknown, so — exactly like the
+                        // type-literal/interface member — key it by the
                         // text-derived `__@k$<obj>.<member>` placeholder. This
                         // makes the literal match a `{ [Breed.X]: … }` target
                         // (whose members the binder keys the same way) instead of
@@ -18712,7 +18862,7 @@ const Checker = struct {
             }
             return c.nonNullable(t);
         }
-        const is_literal = c.ts.literalBase(ot) != types.no_type or is_nullish;
+        const is_literal = c.ts.isLiteralLike(ot) or is_nullish;
         if (!is_literal) return t;
         if (sense) {
             return c.narrowToValue(t, ot);
@@ -18741,13 +18891,13 @@ const Checker = struct {
         // defeating the inferred-predicate disjointness gate (and under-
         // narrowing `if (x === null)`).
         if (c.ts.kind(v) == .null or c.ts.kind(v) == .undefined) return types.never_type;
-        if (c.ts.literalBase(v) == mt) return v; // string narrowed by "a"
+        if (try c.literalBaseOf(v) == mt) return v; // string narrowed by "a" / `E` by `E.A`
         if (k == .boolean and (c.ts.kind(v) == .bool_true or c.ts.kind(v) == .bool_false)) return v;
-        if (c.ts.literalBase(mt) != types.no_type or k == .null or k == .undefined) {
+        if (c.ts.isLiteralLike(mt) or k == .null or k == .undefined) {
             return types.never_type; // different literal
         }
         // Non-literal member unrelated to v's base: exclude.
-        if (c.ts.literalBase(v) != types.no_type) return types.never_type;
+        if (c.ts.isLiteralLike(v)) return types.never_type;
         return mt;
     }
 
@@ -18764,6 +18914,16 @@ const Checker = struct {
         }
         const mt = try c.ts.regularLiteral(t);
         if (mt == v) return types.never_type;
+        // `x !== E.A` on a WHOLE-enum reference: the enum is the union of its
+        // members (tsc), so the branch keeps every other member —
+        // `WS.INVALID | WS.UPDATE`, not `WS`. Without this the negative branch
+        // never shrinks and a fully-covered `switch` is not exhaustive.
+        if (c.ts.isEnumMember(v) and c.ts.kind(mt) == .enum_type and !c.ts.isEnumMember(mt) and
+            c.ts.enumSymbol(mt) == c.ts.enumSymbol(v))
+        {
+            if (try c.enumMemberTypeUnion(c.ts.enumSymbol(mt), c.ts.enumMemberAtom(v))) |rest| return rest;
+            return types.never_type;
+        }
         if (c.ts.kind(mt) == .boolean) {
             if (c.ts.kind(v) == .bool_true) return types.false_type;
             if (c.ts.kind(v) == .bool_false) return types.true_type;
@@ -18846,7 +19006,7 @@ const Checker = struct {
             var matches = true; // members without the prop stay (conservative)
             if (p) |pp| {
                 const pv = try c.ts.regularLiteral(pp.ty);
-                if (c.ts.literalBase(pv) != types.no_type or c.ts.kind(pv) == .null or c.ts.kind(pv) == .undefined) {
+                if (c.ts.isLiteralLike(pv) or c.ts.kind(pv) == .null or c.ts.kind(pv) == .undefined) {
                     matches = try c.isComparable(pv, value);
                 } else {
                     matches = try c.isComparable(pp.ty, value);
@@ -18860,7 +19020,7 @@ const Checker = struct {
                 // `never` is the over-narrow that a single-member `t` exposed.
                 if (p) |pp| {
                     const pv = try c.ts.regularLiteral(pp.ty);
-                    const is_unit = c.ts.literalBase(pv) != types.no_type or
+                    const is_unit = c.ts.isLiteralLike(pv) or
                         c.ts.kind(pv) == .null or c.ts.kind(pv) == .undefined;
                     break :blk !(is_unit and pv == value);
                 }
@@ -19123,7 +19283,7 @@ const Checker = struct {
                 const test_node = c.tree.nodeData(cl).lhs;
                 if (test_node == 0) continue;
                 const vt = try c.ts.regularLiteral(try c.checkExprCached(test_node, types.no_type));
-                if (c.ts.literalBase(vt) == types.no_type and c.ts.kind(vt) != .null and c.ts.kind(vt) != .undefined) continue;
+                if (!c.ts.isLiteralLike(vt) and c.ts.kind(vt) != .null and c.ts.kind(vt) != .undefined) continue;
                 cur = if (prop == 0)
                     try c.narrowExcludeValue(cur, vt)
                 else
@@ -19134,7 +19294,7 @@ const Checker = struct {
         const test_node = c.tree.nodeData(clause).lhs;
         if (test_node == 0) return t;
         const vt = try c.ts.regularLiteral(try c.checkExprCached(test_node, types.no_type));
-        const is_lit = c.ts.literalBase(vt) != types.no_type or c.ts.kind(vt) == .null or c.ts.kind(vt) == .undefined;
+        const is_lit = c.ts.isLiteralLike(vt) or c.ts.kind(vt) == .null or c.ts.kind(vt) == .undefined;
         if (!is_lit) return t;
         return if (prop == 0)
             try c.narrowToValue(t, vt)
@@ -20040,12 +20200,19 @@ const Checker = struct {
         // every `FormatKey` member — is recognized as terminal, and the
         // function's inferred return type gains no phantom `| undefined`.
         const disc_t0 = c.nodeType(d.lhs) orelse (c.checkExprCached(d.lhs, types.no_type) catch return false);
-        const disc_t = c.resolveStructural(disc_t0) catch return false;
+        const disc_t1 = c.resolveStructural(disc_t0) catch return false;
+        // A whole-enum discriminant is the union of its member types (tsc), so
+        // `switch (e) { case E.A: … case E.B: … }` over every member IS
+        // exhaustive. Expanding here keeps the one covering loop below.
+        const disc_t = if (c.ts.kind(disc_t1) == .enum_type and !c.ts.isEnumMember(disc_t1))
+            ((c.enumMemberTypeUnion(c.ts.enumSymbol(disc_t1), 0) catch return false) orelse return false)
+        else
+            disc_t1;
         if (c.ts.kind(disc_t) != .union_type) return false;
         const r = c.tree.extraData(ast.SubRange, d.rhs);
         for (0..c.ts.memberCount(disc_t)) |mi| {
             const rm = c.ts.regularLiteral(c.ts.memberAt(disc_t, mi)) catch return false;
-            if (c.ts.literalBase(rm) == types.no_type and
+            if (!c.ts.isLiteralLike(rm) and
                 c.ts.kind(rm) != .null and c.ts.kind(rm) != .undefined) return false;
             var covered = false;
             for (c.tree.extraRange(r.start, r.end)) |clause| {

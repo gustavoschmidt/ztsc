@@ -138,8 +138,15 @@ pub const Kind = enum(u8) {
     type_param,
     /// Class value (static side / constructor). a = class symbol id.
     class_value,
-    /// Enum type (nominal). a = enum symbol id. Used both for `let x: E`
-    /// annotations and for the type of a member access `E.A`.
+    /// Enum type (nominal). a = enum symbol id.
+    /// b = 0 for the WHOLE enum (`let x: E`); otherwise this is the enum
+    /// *member* type `E.A` and b is the member's name atom, OR-ed with
+    /// `enum_member_fresh` while the type is still widening. tsc models a
+    /// member as an "enum literal": a nominal unit type that is a subtype of
+    /// its declared value literal and of the whole enum, distinct from every
+    /// sibling member. Freshness follows `string_literal`'s: a member *access*
+    /// (`E.A`) is fresh and widens to `E` at a mutable position, an annotation
+    /// (`x: E.A`) is not. Atom ids never reach 2^31, so the top bit is free.
     enum_type,
     /// `unique symbol`. a = nominal identity id (a dense per-declaration
     /// number assigned by the checker). Assignable only to itself and to
@@ -201,6 +208,9 @@ pub const Kind = enum(u8) {
 };
 
 pub const cond_flag_distributive: u32 = 1;
+
+/// Freshness bit in an `enum_type` member payload (`data_b`). See `enum_type`.
+pub const enum_member_fresh: u32 = 0x8000_0000;
 
 // String-transform intrinsic indices, stored in a `string_mapping`
 // type's `data_a`.
@@ -800,6 +810,14 @@ pub const Store = struct {
     pub fn enumSymbol(s: *const Store, id: TypeId) u32 {
         return s.dataA(id);
     }
+    /// Whether `id` is an enum *member* type (`E.A`) rather than a whole enum.
+    pub fn isEnumMember(s: *const Store, id: TypeId) bool {
+        return s.kind(id) == .enum_type and s.dataB(id) != 0;
+    }
+    /// The member name atom of an enum member type; 0 for a whole enum.
+    pub fn enumMemberAtom(s: *const Store, id: TypeId) Atom {
+        return s.dataB(id) & ~enum_member_fresh;
+    }
     /// Nominal identity id of a `unique symbol` type.
     pub fn uniqueSymId(s: *const Store, id: TypeId) u32 {
         return s.dataA(id);
@@ -820,6 +838,9 @@ pub const Store = struct {
         return switch (s.kind(id)) {
             .string_literal, .bigint_literal, .bool_true, .bool_false => s.dataB(id) == 1,
             .number_literal_fresh => true,
+            // An enum *member* access is a widening literal; the whole enum
+            // (data_b == 0) is not.
+            .enum_type => s.dataB(id) & enum_member_fresh != 0,
             else => false,
         };
     }
@@ -833,8 +854,17 @@ pub const Store = struct {
             .bool_true => true_type,
             .bool_false => false_type,
             .number_literal_fresh => s.internType(.number_literal, &.{ s.dataA(id), s.dataB(id) }, 0),
+            .enum_type => s.internType(.enum_type, &.{ s.dataA(id), s.dataB(id) & ~enum_member_fresh }, 0),
             else => unreachable,
         };
+    }
+
+    /// Whether `id` is a *unit* type — one that denotes a single value and can
+    /// therefore serve as a discriminant / narrowing target: a literal, or an
+    /// enum member. Enum members need their own arm because their base (the
+    /// whole enum) has to be interned and `literalBase` cannot allocate.
+    pub fn isLiteralLike(s: *const Store, id: TypeId) bool {
+        return s.literalBase(id) != no_type or s.isEnumMember(id);
     }
 
     /// Base primitive of a literal type, or `no_type` for non-literals.
@@ -1017,6 +1047,12 @@ pub const Store = struct {
 
     pub fn makeEnumType(s: *Store, symbol: u32) Error!TypeId {
         return s.internType(.enum_type, &.{ symbol, 0 }, 0);
+    }
+
+    /// The member type `E.<name>` of enum `symbol` (see `Kind.enum_type`).
+    pub fn makeEnumMember(s: *Store, symbol: u32, name: Atom, fresh: bool) Error!TypeId {
+        std.debug.assert(name != 0 and name & enum_member_fresh == 0);
+        return s.internType(.enum_type, &.{ symbol, if (fresh) name | enum_member_fresh else name }, 0);
     }
 
     pub fn makeUniqueSymbol(s: *Store, id: u32) Error!TypeId {
