@@ -17475,6 +17475,17 @@ const Checker = struct {
                 c.cur_scope = b.flowScope(flow);
                 return c.narrowBySwitchClause(before, clause, key);
             },
+            .switch_no_match => {
+                const sw = b.flowNode(flow);
+                const ante = b.flow_a[flow];
+                const saved = c.cur_scope;
+                defer c.cur_scope = saved;
+                c.cur_scope = b.flowScope(flow);
+                // An exhaustive `default`-less switch cannot fall out of its
+                // clause list, so this edge does not exist.
+                if (c.switchIsExhaustive(sw)) return types.never_type;
+                return c.flowType(ante, key, declared, depth + 1);
+            },
             .call_stmt => {
                 const call = b.flowNode(flow);
                 const ante = b.flow_a[flow];
@@ -18699,6 +18710,18 @@ const Checker = struct {
                 return c.definitelyAssigned(b.flow_a[flow], sym);
             },
             .cond_true, .cond_false, .switch_clause, .call_stmt => {
+                return c.definitelyAssigned(b.flow_a[flow], sym);
+            },
+            .switch_no_match => {
+                // The "no clause matched" edge out of a `default`-less switch.
+                // When the switch is exhaustive over a literal-union
+                // discriminant the edge is unreachable, so it constrains
+                // nothing — a `let x: number` assigned in every clause is
+                // definitely assigned afterwards, exactly as tsc sees it.
+                const saved = c.cur_scope;
+                defer c.cur_scope = saved;
+                c.cur_scope = b.flowScope(flow);
+                if (c.switchIsExhaustive(b.flowNode(flow))) return true;
                 return c.definitelyAssigned(b.flow_a[flow], sym);
             },
             .branch_label, .loop_label => {

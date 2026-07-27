@@ -313,6 +313,12 @@ pub const FlowTag = enum(u8) {
     /// Reached a switch clause. a = antecedent (pre-switch flow),
     /// b = case/default clause node.
     switch_clause,
+    /// Fell out of a `default`-less switch because no clause matched.
+    /// a = antecedent (pre-switch flow), b = the switch statement node.
+    /// Whether this edge exists at all is a *type* question — an exhaustive
+    /// switch over a literal-union discriminant never takes it — so the binder
+    /// always emits it and the checker decides.
+    switch_no_match,
     /// A call statement whose callee is a dotted name — a candidate
     /// assertion-function call. a = antecedent, b = the call node. The
     /// checker resolves the callee lazily; a non-assertion call is a
@@ -550,7 +556,7 @@ pub const Bind = struct {
     /// The AST node a flow node references (assign/condition/switch), or 0.
     pub fn flowNode(b: *const Bind, flow: FlowId) Node {
         return switch (b.flow_tags[flow]) {
-            .assign, .cond_true, .cond_false, .switch_clause, .start, .call_stmt => b.flow_b[flow],
+            .assign, .cond_true, .cond_false, .switch_clause, .switch_no_match, .start, .call_stmt => b.flow_b[flow],
             else => 0,
         };
     }
@@ -630,7 +636,7 @@ pub const Bind = struct {
             .cond_true, .cond_false => n_cond += 1,
             .branch_label => n_branch += 1,
             .loop_label => n_loop += 1,
-            .switch_clause => n_switch += 1,
+            .switch_clause, .switch_no_match => n_switch += 1,
             .call_stmt => n_call += 1,
             .none, .unreachable_ => {},
         };
@@ -1643,9 +1649,15 @@ const Binder = struct {
         }
         _ = b.ctxs.pop();
         try b.pendAdd(brk, prev);
-        if (!has_default) try b.pendAdd(brk, pre); // no clause matched
-        b.cur_flow = try b.finishPending(brk);
         b.popScope(saved_scope);
+        // No clause matched. Kept as its own flow node rather than the raw
+        // pre-switch edge so the checker can drop it when the switch is
+        // exhaustive over a literal-union discriminant — the binder cannot
+        // know that, it is a type question. Created after the case-block scope
+        // is popped: the discriminant the checker re-reads through it lives in
+        // the enclosing scope, not the case block.
+        if (!has_default) try b.pendAdd(brk, try b.addFlow(.switch_no_match, pre, node));
+        b.cur_flow = try b.finishPending(brk);
     }
 
     fn bindTry(b: *Binder, node: Node) Error!void {
@@ -3643,7 +3655,7 @@ fn checkBinderOnArbitraryBytes(alloc: Allocator, interner: *Interner, input: []c
                     try testing.expect(a < n_flows);
                 }
             },
-            .assign, .cond_true, .cond_false, .switch_clause, .call_stmt => {
+            .assign, .cond_true, .cond_false, .switch_clause, .switch_no_match, .call_stmt => {
                 try testing.expect(b.flow_a[f] < n_flows);
                 try testing.expect(b.flow_b[f] < tree.nodes.len);
             },
