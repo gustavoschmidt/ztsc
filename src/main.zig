@@ -1049,6 +1049,15 @@ pub fn main(init: std.process.Init) !void {
     for (paths.items, 0..) |p, i|
         dts_skipped[i] = skip_all_dts_check and !is_lib[i] and ztsc.paths.isDeclarationPath(p);
 
+    // `@ts-nocheck` / `@ts-ignore` / `@ts-expect-error` suppression, scanned
+    // from each file's comment trivia at parse time. Unlike `dts_skipped` this
+    // only covers *semantic* diagnostics (bind + link + check); syntax errors
+    // still report, as in tsc. Content-derived, so identical for any
+    // --workers/--checkers count.
+    const cdirs = try arena.alloc(ztsc.directives.File, paths.items.len);
+    for (trees.items, 0..) |maybe_tree, i|
+        cdirs[i] = if (maybe_tree) |tree| tree.comment_directives else .none;
+
     var parse_diags: usize = 0;
     for (trees.items, 0..) |maybe_tree, i| {
         const tree = maybe_tree orelse continue;
@@ -1078,12 +1087,18 @@ pub fn main(init: std.process.Init) !void {
         bind_scope_bytes += b.scopeBytes();
         bind_flow_bytes += b.flowBytes();
         bind_record_bytes += b.recordBytes();
-        if (!is_lib[i] and !dts_skipped[i]) bind_diags += b.diagnostics.len;
+        if (is_lib[i] or dts_skipped[i]) continue;
+        for (b.diagnostics) |d| {
+            if (!cdirs[i].suppresses(d.span.start)) bind_diags += 1;
+        }
     }
 
     var link_diags: usize = 0;
     for (links, 0..) |*l, i| {
-        if (!is_lib[i] and !dts_skipped[i]) link_diags += l.diags.len;
+        if (is_lib[i] or dts_skipped[i]) continue;
+        for (l.diags) |d| {
+            if (!cdirs[i].suppresses(d.span.start)) link_diags += 1;
+        }
     }
 
     var check_diags: usize = 0;
@@ -1104,7 +1119,9 @@ pub fn main(init: std.process.Init) !void {
     for (tasks) |*t| {
         const ck = t.result orelse continue;
         for (ck.diagnostics) |d| {
-            if (!is_lib[d.file] and !dts_skipped[d.file]) check_diags += 1;
+            if (is_lib[d.file] or dts_skipped[d.file]) continue;
+            if (cdirs[d.file].suppresses(d.span.start)) continue;
+            check_diags += 1;
         }
         check_types += ck.stats.types_created;
         check_type_bytes += ck.stats.type_bytes;
@@ -1200,8 +1217,15 @@ pub fn main(init: std.process.Init) !void {
                 try emitter.emit(path, &src, d.span, 0, d.message());
             }
         }
+        // Bind, link and check diagnostics are *semantic*, so a `@ts-nocheck`
+        // file pragma or a preceding `@ts-ignore`/`@ts-expect-error` drops
+        // them (tsc excludes exactly these three from a `@ts-nocheck` file and
+        // filters the same set through the comment-directive map). Parser
+        // diagnostics above are syntactic and always survive.
+        const cd = cdirs[i];
         if (binds.items[i]) |b| {
             for (b.diagnostics) |d| {
+                if (cd.suppresses(d.span.start)) continue;
                 const ts = d.code.tsCode();
                 if (ts != 0) {
                     try merged.append(gpa, .{ .code = ts, .start = d.span.start, .end = d.span.end, .msg = d.message() });
@@ -1211,6 +1235,7 @@ pub fn main(init: std.process.Init) !void {
             }
         }
         for (links[i].diags) |d| {
+            if (cd.suppresses(d.span.start)) continue;
             try merged.append(gpa, .{ .code = d.code, .start = d.span.start, .end = d.span.end, .msg = d.msg });
         }
         const owner = file_owner[i];
@@ -1218,6 +1243,7 @@ pub fn main(init: std.process.Init) !void {
             var cur = cursors[owner];
             while (cur < ck.diagnostics.len and ck.diagnostics[cur].file == i) : (cur += 1) {
                 const d = ck.diagnostics[cur];
+                if (cd.suppresses(d.span.start)) continue;
                 try merged.append(gpa, .{ .code = d.code, .start = d.span.start, .end = d.span.end, .msg = d.msg });
             }
             cursors[owner] = cur;

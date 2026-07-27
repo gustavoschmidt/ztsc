@@ -247,12 +247,18 @@ fn runCase(alloc: std.mem.Allocator, io: Io, gpa: std.mem.Allocator, interner: *
         if (ts == 0) continue;
         try out.append(alloc, .{ .code = ts, .file = "", .line = lineOf(line_starts, d.span.start) });
     }
+    // Bind + check diagnostics are semantic, so `@ts-nocheck` /
+    // `@ts-ignore` / `@ts-expect-error` drop them (main.zig emit loop does the
+    // same); the parser's own are syntactic and always survive.
+    const cd = tree.comment_directives;
     for (bound.diagnostics) |d| {
         const ts = d.code.tsCode();
         if (ts == 0) continue;
+        if (cd.suppresses(d.span.start)) continue;
         try out.append(alloc, .{ .code = ts, .file = "", .line = lineOf(line_starts, d.span.start) });
     }
     for (result.diagnostics) |d| {
+        if (cd.suppresses(d.span.start)) continue;
         try out.append(alloc, .{ .code = d.code, .file = "", .line = lineOf(line_starts, d.span.start) });
     }
     return out;
@@ -378,16 +384,22 @@ fn runDirCase(
             if (ts == 0) continue;
             try out.append(alloc, .{ .code = ts, .file = rel, .line = lineOf(line_starts, d.span.start) });
         }
+        // Semantic-only suppression from this file's comment directives, as in
+        // the CLI emit loop; `pf.tree.diagnostics` above are syntactic.
+        const cd = pf.tree.comment_directives;
         for (pf.bind.diagnostics) |d| {
             const ts = d.code.tsCode();
             if (ts == 0) continue;
+            if (cd.suppresses(d.span.start)) continue;
             try out.append(alloc, .{ .code = ts, .file = rel, .line = lineOf(line_starts, d.span.start) });
         }
         for (prog.links[i].diags) |d| {
+            if (cd.suppresses(d.span.start)) continue;
             try out.append(alloc, .{ .code = d.code, .file = rel, .line = lineOf(line_starts, d.span.start) });
         }
         for (result.diagnostics) |d| {
             if (d.file != i) continue;
+            if (cd.suppresses(d.span.start)) continue;
             try out.append(alloc, .{ .code = d.code, .file = rel, .line = lineOf(line_starts, d.span.start) });
         }
     }

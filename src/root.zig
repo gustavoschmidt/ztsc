@@ -7,6 +7,7 @@ pub const intern = @import("intern.zig");
 pub const zeropage = @import("zeropage.zig");
 pub const scanner = @import("scanner.zig");
 pub const diagnostics = @import("diagnostics.zig");
+pub const directives = @import("directives.zig");
 pub const ast = @import("ast.zig");
 pub const parser = @import("parser.zig");
 pub const binder = @import("binder.zig");
@@ -28,6 +29,7 @@ test {
     _ = zeropage;
     _ = scanner;
     _ = diagnostics;
+    _ = directives;
     _ = ast;
     _ = parser;
     _ = binder;

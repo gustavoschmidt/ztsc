@@ -31,6 +31,7 @@ const Allocator = std.mem.Allocator;
 const scanner = @import("scanner.zig");
 const diagnostics = @import("diagnostics.zig");
 const source = @import("source.zig");
+const directives = @import("directives.zig");
 
 pub const Span = source.Span;
 pub const Diagnostic = diagnostics.Diagnostic;
@@ -679,6 +680,11 @@ pub const Ast = struct {
     nodes: std.MultiArrayList(NodeItem).Slice,
     extra_data: []const u32,
     diagnostics: []const Diagnostic,
+    /// `@ts-nocheck` / `@ts-ignore` / `@ts-expect-error` suppression state,
+    /// scanned from the comment trivia. Consulted where *semantic*
+    /// diagnostics (bind + link + check) are surfaced, never for the parser's
+    /// own; `.none` for the files — nearly all of them — with no directive.
+    comment_directives: directives.File = .none,
 
     pub fn nodeTag(a: *const Ast, node: Node) Tag {
         return a.nodes.items(.tag)[node];

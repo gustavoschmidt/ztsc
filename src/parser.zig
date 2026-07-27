@@ -57,6 +57,7 @@ const scanner = @import("scanner.zig");
 const ast = @import("ast.zig");
 const types = @import("types.zig");
 const diagnostics = @import("diagnostics.zig");
+const directives = @import("directives.zig");
 
 const TokTag = scanner.Tag;
 const Token = scanner.Token;
@@ -165,6 +166,12 @@ const Parser = struct {
             .nodes = nodes.toOwnedSlice(),
             .extra_data = extra_data,
             .diagnostics = diags,
+            // Comment directives are scanned from the raw bytes rather than
+            // from trivia the scanner has already discarded. The scan is gated
+            // on the file containing `@ts-` at all, so this is one vectorised
+            // sweep for a file without directives, and it runs on the same
+            // (parallel) worker as the parse itself.
+            .comment_directives = try directives.scan(out, p.src),
         };
     }
 
