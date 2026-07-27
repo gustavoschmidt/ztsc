@@ -103,6 +103,11 @@ pub const ScopeKind = enum(u8) {
     type_alias,
     for_head,
     catch_clause,
+    /// Holds the expando properties (`fn.prop = …`) of one function value.
+    /// Never entered lexically — reached only through `expandoScopeOf` — but
+    /// parented at the function's own scope so a property's initializer
+    /// resolves names where it was written.
+    expando,
 };
 
 /// Packed symbol flag bitset (4 bytes/symbol).
@@ -135,7 +140,15 @@ pub const SymbolFlags = packed struct(u32) {
     enum_decl: bool = false,
     /// `namespace` / `module` declaration (both a value and a type container).
     namespace_decl: bool = false,
-    _pad: u8 = 0,
+    /// A function value carrying *expando* properties: same-scope
+    /// `fn.prop = value` statements declare members on it (TS 3.1
+    /// "properties declarations on functions"). Its members live in the
+    /// scope `expandoScopeOf` maps it to.
+    expando: bool = false,
+    /// One such property. Its declarations are the `assign` nodes; the
+    /// member type is the widened type of the assigned expressions.
+    expando_member: bool = false,
+    _pad: u6 = 0,
 
     pub fn bits(f: SymbolFlags) u32 {
         return @bitCast(f);
@@ -195,6 +208,8 @@ const DeclKind = enum {
     method,
     getter,
     setter,
+    /// `fn.prop = value` — an expando property declaration.
+    expando_member,
 
     fn flags(k: DeclKind) SymbolFlags {
         return switch (k) {
@@ -216,6 +231,7 @@ const DeclKind = enum {
             .method => .{ .method = true },
             .getter => .{ .getter = true },
             .setter => .{ .setter = true },
+            .expando_member => .{ .expando_member = true },
         };
     }
 
@@ -255,6 +271,9 @@ const DeclKind = enum {
             .method => mask_member & ~fbits(.{ .method = true }),
             .getter => mask_member & ~fbits(.{ .setter = true }),
             .setter => mask_member & ~fbits(.{ .getter = true }),
+            // Repeated `fn.prop = …` statements are all declarations of the
+            // same property; they merge (the member type unions them).
+            .expando_member => 0,
         };
     }
 
@@ -386,6 +405,11 @@ pub const Bind = struct {
     /// namespace keeps its own member scope distinct from the namespace body.
     ns_scope_syms: []const SymbolId,
     ns_scope_ids: []const ScopeId,
+    /// Expando-function symbol -> the scope holding its `fn.prop = …`
+    /// property symbols, sorted by symbol id. Empty for a file with no
+    /// expando functions (the common case).
+    expando_scope_syms: []const SymbolId = &.{},
+    expando_scope_ids: []const ScopeId = &.{},
 
     // --- flow graph (SoA; 0 = none, 1 = shared unreachable) ---------------
     flow_tags: []const FlowTag,
@@ -476,6 +500,11 @@ pub const Bind = struct {
     /// Body scope of a namespace symbol, if any.
     pub fn namespaceScopeOf(b: *const Bind, sym: SymbolId) ?ScopeId {
         return searchPair(b.ns_scope_syms, b.ns_scope_ids, sym);
+    }
+
+    /// Expando-property scope of a function symbol, if any.
+    pub fn expandoScopeOf(b: *const Bind, sym: SymbolId) ?ScopeId {
+        return searchPair(b.expando_scope_syms, b.expando_scope_ids, sym);
     }
 
     fn searchPair(keys: []const u32, vals: []const u32, key: u32) ?u32 {
@@ -735,6 +764,8 @@ pub const Bind = struct {
             .{ .bit = fbits(.{ .has_impl = true }), .name = "impl" },
             .{ .bit = fbits(.{ .optional_member = true }), .name = "optional" },
             .{ .bit = fbits(.{ .readonly_member = true }), .name = "readonly" },
+            .{ .bit = fbits(.{ .expando = true }), .name = "expando" },
+            .{ .bit = fbits(.{ .expando_member = true }), .name = "expando-prop" },
         };
         for (names) |n| {
             if (f.bits() & n.bit != 0) try w.print(" {s}", .{n.name});
@@ -849,6 +880,9 @@ const Binder = struct {
     member_scopes: std.AutoHashMapUnmanaged(SymbolId, ScopeId) = .empty,
     static_scopes: std.AutoHashMapUnmanaged(SymbolId, ScopeId) = .empty,
     namespace_scopes: std.AutoHashMapUnmanaged(SymbolId, ScopeId) = .empty,
+    /// Expando-function symbol -> the scope its `fn.prop = …` properties are
+    /// declared in (created on the first such assignment).
+    expando_scopes: std.AutoHashMapUnmanaged(SymbolId, ScopeId) = .empty,
 
     // flow under construction
     flow_tags: std.ArrayList(FlowTag) = .empty,
@@ -1311,6 +1345,7 @@ const Binder = struct {
             },
             .var_decl_one, .var_decl => try b.bindVarDecl(node),
             .expr_stmt => {
+                try b.bindExpandoAssignment(d.lhs);
                 try b.bindExpr(d.lhs);
                 // A call statement with a dotted-name callee may be an
                 // assertion function; record a flow node so the checker can
@@ -2373,6 +2408,74 @@ const Binder = struct {
     /// Bind an expression subtree: record identifier references (with flow
     /// attachment), assignments (flow), branches (flow), and nested
     /// function/class scopes. Total on any tree shape.
+    /// `fn.prop = value;` in statement position *declares* `prop` on the
+    /// function value `fn` — TS 3.1 "properties declarations on functions"
+    /// (`Stats.Row = Row`, `Stats.displayName = "Stats"`). tsc's shape, and
+    /// this function's, is narrow on purpose:
+    ///
+    ///   - a plain (non-compound) `=` in an expression statement,
+    ///   - the target is `<identifier>.<name>` — not computed, not nested,
+    ///   - the identifier resolves *in the current scope* (tsc's same-scope
+    ///     rule) to a symbol whose declaration is a `function` or a variable
+    ///     initialized with a function expression / arrow.
+    ///
+    /// Everything else is left to ordinary assignment checking, so `const obj
+    /// = {}; obj.x = 1` stays the TS2339 tsc reports. Repeated assignments to
+    /// one name merge into a single property whose declarations are all the
+    /// assignments.
+    fn bindExpandoAssignment(b: *Binder, node: Node) Error!void {
+        if (b.nodeTag(node) != .assign) return;
+        if (b.tree.tokens.tag(b.tree.nodeMainToken(node)) != .eq) return;
+        const d = b.tree.nodeData(node);
+        if (b.nodeTag(d.lhs) != .member_expr) return;
+        const td = b.tree.nodeData(d.lhs);
+        if (b.nodeTag(td.lhs) != .identifier) return;
+        const name_tok = td.rhs;
+        if (name_tok == 0) return;
+
+        const obj_atom = try b.atomOfToken(b.tree.nodeMainToken(td.lhs));
+        const sym = b.members.get(memberKey(b.cur_scope, obj_atom)) orelse return;
+        if (!b.isFunctionValueSymbol(sym)) return;
+
+        var xs = b.expando_scopes.get(sym) orelse 0;
+        if (xs == 0) {
+            xs = try b.newScope(.expando, node, b.cur_scope);
+            try b.expando_scopes.put(b.scratch, sym, xs);
+        }
+        const atom = try b.memberAtom(name_tok);
+        _ = try b.declare(xs, atom, .expando_member, node, name_tok, .{});
+        b.sym_flags.items[sym].expando = true;
+    }
+
+    /// Whether `sym` is expando-eligible: a function declaration, or a
+    /// `const` initialized with a function expression / arrow. `let`/`var`
+    /// are *not* eligible (oracle-checked: `let g = function () {}; g.h = 2`
+    /// is a TS2339), and neither is a class.
+    fn isFunctionValueSymbol(b: *Binder, sym: SymbolId) bool {
+        const f = b.sym_flags.items[sym];
+        if (f.class) return false;
+        if (f.function) return true;
+        if (!f.const_decl) return false;
+        var link = b.sym_decl_head.items[sym];
+        while (link != 0) : (link = b.decl_links.items[link].next) {
+            const decl = b.decl_links.items[link].value;
+            const init: Node = switch (b.nodeTag(decl)) {
+                .declarator_init => b.tree.nodeData(decl).rhs,
+                .declarator_full => b.tree.extraData(
+                    ast.DeclaratorFull,
+                    b.tree.nodeData(decl).rhs,
+                ).init,
+                else => continue,
+            };
+            if (init == null_node) continue;
+            switch (b.nodeTag(init)) {
+                .arrow_fn, .function_expr => return true,
+                else => {},
+            }
+        }
+        return false;
+    }
+
     fn bindExpr(b: *Binder, node: Node) Error!void {
         if (node == null_node) return;
         const d = b.tree.nodeData(node);
@@ -2830,6 +2933,7 @@ const Binder = struct {
         const msp = try sealPairMap(arena, b.scratch, &b.member_scopes);
         const ssp = try sealPairMap(arena, b.scratch, &b.static_scopes);
         const nsp = try sealPairMap(arena, b.scratch, &b.namespace_scopes);
+        const xsp = try sealPairMap(arena, b.scratch, &b.expando_scopes);
 
         // Flow: convert label pending ids into flow_extra ranges.
         const n_flows = b.flow_tags.items.len;
@@ -2889,6 +2993,8 @@ const Binder = struct {
             .static_scope_ids = ssp.vals,
             .ns_scope_syms = nsp.keys,
             .ns_scope_ids = nsp.vals,
+            .expando_scope_syms = xsp.keys,
+            .expando_scope_ids = xsp.vals,
             .flow_tags = flow_tags,
             .flow_a = flow_a,
             .flow_b = flow_b,

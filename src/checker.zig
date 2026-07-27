@@ -4371,7 +4371,8 @@ const Checker = struct {
         }
         if (f.enum_decl) return c.enumValueType(sym);
         if (f.class) return c.ts.makeClassValue(sym);
-        if (f.function) return c.functionSymbolType(sym);
+        if (f.function) return c.withExpandoProps(sym, try c.functionSymbolType(sym));
+        if (f.expando_member) return c.expandoMemberType(sym);
         if (f.property or f.method or f.getter or f.setter) return c.memberTypeOf(sym);
 
         // The remaining cases traverse decl nodes: switch to the symbol's
@@ -4405,8 +4406,58 @@ const Checker = struct {
             }
             return types.any_type;
         }
-        if (f.var_decl or f.let_decl or f.const_decl) return c.variableSymbolType(sym);
+        if (f.var_decl or f.let_decl or f.const_decl)
+            return c.withExpandoProps(sym, try c.variableSymbolType(sym));
         return types.any_type;
+    }
+
+    /// Fold a function value's *expando* properties into its type: the
+    /// callable base intersected with an object of the `fn.prop = value`
+    /// declarations the binder collected (TS 3.1 properties-on-functions).
+    /// A pass-through for the overwhelming majority of symbols, which have
+    /// none. tsc models this as one anonymous type carrying both the call
+    /// signatures and the members; the intersection is the same shape ztsc
+    /// already uses for a function merged with a namespace.
+    fn withExpandoProps(c: *Checker, sym: SymbolId, base: TypeId) Error!TypeId {
+        if (!c.symFlags(sym).expando) return base;
+        const saved = c.enterSymFile(sym);
+        defer c.restoreCtx(saved);
+        const xs = c.bind.expandoScopeOf(c.localOf(sym)) orelse return base;
+        var props: std.ArrayList(types.Prop) = .empty;
+        defer props.deinit(c.scratch());
+        const lo = c.bind.scope_members_start[xs];
+        const hi = c.bind.scope_members_start[xs + 1];
+        for (lo..hi) |i| {
+            const msym = c.toGlobal(c.bind.member_syms[i]);
+            try props.append(c.scratch(), .{
+                .name = c.bind.member_atoms[i],
+                .ty = try c.typeOfSymbol(msym),
+                .flags = 0,
+            });
+        }
+        if (props.items.len == 0) return base;
+        const obj = try c.ts.makeObject(props.items, 0, 0, 0);
+        return c.ts.makeIntersection(c.scratch(), &.{ base, obj });
+    }
+
+    /// Type of one expando property: the widened type of the assigned
+    /// expression, unioned over every `fn.prop = value` statement that
+    /// declares it (tsc widens each assignment and unions them).
+    fn expandoMemberType(c: *Checker, sym: SymbolId) Error!TypeId {
+        const saved = c.enterSymFile(sym);
+        defer c.restoreCtx(saved);
+        c.cur_scope = c.symScope(sym);
+        var parts: std.ArrayList(TypeId) = .empty;
+        defer parts.deinit(c.scratch());
+        for (c.declsOf(sym)) |decl| {
+            if (c.nodeTag(decl) != .assign) continue;
+            const rhs = c.tree.nodeData(decl).rhs;
+            if (rhs == ast.null_node) continue;
+            const t = try c.widenLiteral(try c.checkExprCached(rhs, types.no_type));
+            try parts.append(c.scratch(), t);
+        }
+        if (parts.items.len == 0) return types.any_type;
+        return c.ts.makeUnion(c.scratch(), parts.items);
     }
 
     /// Fold every callable constituent of a merged global function symbol into
