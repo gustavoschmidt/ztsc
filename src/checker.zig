@@ -10450,17 +10450,21 @@ const Checker = struct {
             for (try c.memberList(t)) |m| {
                 if (try c.isAssignable(s, m)) return true;
             }
-            // A type-parameter source whose constraint is itself a union
-            // relates to the union target as a WHOLE, not member-by-member:
-            // the loop above tries `T` against each member and misses that the
-            // constraint union satisfies the target union — the
+            // A type-parameter source relates to a union target through its
+            // constraint as a WHOLE, not member-by-member: the loop above tries
+            // `T` against each member (which already consults the constraint)
+            // and misses the case where the constraint spans the target union
+            // without fitting any single member — the
             // `<T extends AllGeoJSON>(f: T): T` residue where `T` flows into a
-            // generic call parameter typed by the same union constraint. Added
-            // strictly as a fallback (after single-member matching) so nothing
-            // previously accepted changes.
+            // generic call parameter typed by the same union constraint, and
+            // `<T, K extends keyof T>(k: K)` into a `PropertyKey` parameter,
+            // where the constraint is a deferred `keyof T` whose apparent type
+            // is the whole `string | number | symbol` union. Purely a fallback,
+            // after single-member matching, and exactly tsc's rule (relate the
+            // constraint), so it only ever accepts more.
             if (sk == .type_param) {
                 const constraint = try c.typeParamConstraint(c.ts.typeParamSymbol(s));
-                if (constraint != types.no_type and c.ts.kind(try c.resolveStructural(constraint)) == .union_type and
+                if (constraint != types.no_type and constraint != s and
                     try c.isAssignable(constraint, t)) return true;
             }
             // Discriminated-union normalization: a source object whose
