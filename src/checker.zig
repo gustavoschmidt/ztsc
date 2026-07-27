@@ -15330,12 +15330,33 @@ const Checker = struct {
         const obj = try c.objectFromProps(props.items, 0, 0);
         // The reverse-mapped object is the authoritative inference for a
         // homomorphic mapped target; it wins over an uninformative `any` that a
-        // sibling union member (`Reducer<S, A, P>`) may have bound first. Union
-        // only with another genuine candidate.
-        candidates[idx] = if (candidates[idx] == types.no_type or candidates[idx] == types.any_type)
-            obj
-        else
-            try c.makeUnion2(candidates[idx], obj);
+        // sibling union member (`Reducer<S, A, P>`) may have bound first.
+        if (candidates[idx] == types.no_type or candidates[idx] == types.any_type) {
+            candidates[idx] = obj;
+            return;
+        }
+        // Two genuine candidates for the same parameter. tsc resolves a
+        // covariant inference set with `getCommonSupertype`, never a union, and
+        // gives a reverse-mapped candidate a WORSE `InferencePriority` than a
+        // plain structural match — so a direct match's candidate is kept and the
+        // reverse-mapped one discarded. Approximate that by collapsing to
+        // whichever candidate subsumes the other (preferring the incumbent when
+        // they are mutually assignable, since it is the one a nominal alias came
+        // through), and union only genuinely unrelated candidates.
+        //
+        // Unioning here is not merely imprecise, it is lossy: `memo(Base,
+        // areEqual)` infers `P` twice — once from `FunctionComponent<P>`'s call
+        // signature (giving the props ALIAS) and once from the comparator's
+        // `Readonly<P>` (giving a structurally equal rebuild) — and the union of
+        // the two is a type whose properties nothing can look up, so every
+        // contextual type derived from the memoized component's props
+        // disappeared.
+        if (try c.isAssignable(obj, candidates[idx])) return;
+        if (try c.isAssignable(candidates[idx], obj)) {
+            candidates[idx] = obj;
+            return;
+        }
+        candidates[idx] = try c.makeUnion2(candidates[idx], obj);
     }
 
     /// Key-set inference into a NON-homomorphic mapped target whose constraint is
