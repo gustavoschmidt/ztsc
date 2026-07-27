@@ -13995,11 +13995,26 @@ const Checker = struct {
             const rctx = try c.resolveStructural(ctx);
             switch (c.ts.kind(rctx)) {
                 .function => ctx_sig = rctx,
+                // A callable-INTERFACE contextual type — a call signature plus
+                // ordinary properties (`FunctionComponent<P>` with its
+                // `displayName?`, `ForwardRefRenderFunction<T, P>`). tsc's
+                // `getContextualSignature` reads the type's call signatures and
+                // uses the SOLE one; only that case is unambiguous, so an
+                // overload set is left alone. Without this an arrow annotated
+                // with such an interface (`const Base: FC<Props> = (props) =>
+                // …`) got no contextual parameter types and reported TS7006.
+                .object => {
+                    if (c.ts.objectCallSigCount(rctx) == 1) ctx_sig = c.ts.objectCallSig(rctx, 0);
+                },
                 .union_type => {
                     for (try c.memberList(rctx)) |m| {
                         const rm = try c.resolveStructural(m);
                         if (c.ts.kind(rm) == .function) {
                             ctx_sig = rm;
+                            break;
+                        }
+                        if (c.ts.kind(rm) == .object and c.ts.objectCallSigCount(rm) == 1) {
+                            ctx_sig = c.ts.objectCallSig(rm, 0);
                             break;
                         }
                     }
