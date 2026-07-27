@@ -11241,21 +11241,20 @@ const Checker = struct {
             }
             return true;
         }
-        if (sk == .intersection) {
-            for (try c.memberList(s)) |m| {
-                if (try c.isAssignable(m, t)) return true;
-            }
-            // Fall through: merged-members structural check for object targets.
-            if (tk == .object or tk == .ref) {
-                return c.structuralAssignable(s, try c.resolveStructural(t));
-            }
-            return false;
-        }
-        // Deferred conditional *target*: the source must satisfy whichever
-        // branch the conditional resolves to, so require it against both.
-        if (tk == .conditional) {
-            return (try c.isAssignable(s, c.ts.condTrue(t))) and (try c.isAssignable(s, c.ts.condFalse(t)));
-        }
+        // The indexed-access-TARGET rule runs before the intersection-SOURCE arm
+        // below: that arm ends in `return false` for every non-object target, so
+        // with it first the rule was never reachable from an intersection
+        // source. Branded scalars (`number & { _brand: "rad" }`) are exactly
+        // that shape, and writing one through a `T["angle"]` annotation is the
+        // most common way to meet an indexed-access target — every such write
+        // was a phantom TS2322. The rule recurses on the reduced target, so an
+        // intersection source still reaches the member-wise arm one level down;
+        // when its guards do not hold it returns false, which is what the
+        // intersection arm did anyway. (The conditional-target arm stays BELOW
+        // the intersection source on purpose — tsc rejects a branded scalar
+        // against a deferred `T extends 0 ? Radians : Radians`, and hoisting
+        // that one too would accept it.)
+        //
         // Deferred indexed-access *target*: `S → T[K]` holds when `S` relates to
         // the BASE-CONSTRAINT instantiation of `T[K]` (tsc
         // `structuredTypeRelatedTo`, IndexedAccess-as-target). Inside
@@ -11283,6 +11282,21 @@ const Checker = struct {
                 if (bc != t and c.ts.kind(bc) != .unknown) return c.isAssignable(s, bc);
             }
             return false;
+        }
+        if (sk == .intersection) {
+            for (try c.memberList(s)) |m| {
+                if (try c.isAssignable(m, t)) return true;
+            }
+            // Fall through: merged-members structural check for object targets.
+            if (tk == .object or tk == .ref) {
+                return c.structuralAssignable(s, try c.resolveStructural(t));
+            }
+            return false;
+        }
+        // Deferred conditional *target*: the source must satisfy whichever
+        // branch the conditional resolves to, so require it against both.
+        if (tk == .conditional) {
+            return (try c.isAssignable(s, c.ts.condTrue(t))) and (try c.isAssignable(s, c.ts.condFalse(t)));
         }
         // Template-literal pattern *target*: a concrete string literal is
         // assignable iff its text matches the pattern; `string` and non-string
