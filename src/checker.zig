@@ -2655,22 +2655,29 @@ const Checker = struct {
     }
 
     /// Ambient-module registry index matching specifier `spec`: exact name,
-    /// else a wildcard pattern (`declare module "*.css"`). Mirrors the linker's
+    /// else the best-matching wildcard pattern (`declare module "*.css"`) —
+    /// longest prefix, first declaration on a tie. Mirrors the linker's
     /// `ambientKey` so import() types resolve against the same registry.
     fn ambientIndex(c: *Checker, spec: Atom) ?u32 {
         const specs = c.prog.ambient_specs;
         for (specs, 0..) |s, i| if (s == spec) return @intCast(i);
         const text = c.atomText(spec);
+        var best: ?u32 = null;
+        var best_prefix: usize = 0;
         for (specs, 0..) |s, i| {
             const pat = c.atomText(s);
             const star = std.mem.indexOfScalar(u8, pat, '*') orelse continue;
             const prefix = pat[0..star];
             const suffix = pat[star + 1 ..];
-            if (text.len >= prefix.len + suffix.len and
-                std.mem.startsWith(u8, text, prefix) and
-                std.mem.endsWith(u8, text, suffix)) return @intCast(i);
+            if (text.len < prefix.len + suffix.len) continue;
+            if (!std.mem.startsWith(u8, text, prefix)) continue;
+            if (!std.mem.endsWith(u8, text, suffix)) continue;
+            if (best == null or prefix.len > best_prefix) {
+                best = @intCast(i);
+                best_prefix = prefix.len;
+            }
         }
-        return null;
+        return best;
     }
 
     /// Look up export `name` in a resolved module, returning its link Target.

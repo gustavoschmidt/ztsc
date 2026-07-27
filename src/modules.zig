@@ -1281,21 +1281,34 @@ const Linker = struct {
     }
 
     /// The registry key matching specifier `spec`: an exact `declare module`
-    /// name, else a wildcard pattern (`declare module "*.css"`). Returns
-    /// null when no ambient module covers the specifier.
+    /// name, else the best-matching wildcard pattern (`declare module
+    /// "*.css"`). Returns null when no ambient module covers the specifier.
+    ///
+    /// "Best" is tsc's `findBestPatternMatch`: among the patterns that match,
+    /// the one with the LONGEST prefix, first declaration winning a tie. Taking
+    /// the first match instead gave `prefix-*` a specifier that
+    /// `prefix-deep-*` was written for; vite's `client.d.ts` alone declares
+    /// forty overlapping patterns (`*?worker` / `*?worker&inline`, `*.css` /
+    /// `*.module.css`), so the distinction is not hypothetical.
     fn ambientKey(l: *Linker, spec: Atom) ?Atom {
         if (l.ambient.contains(spec)) return spec;
         const text = l.atomText(spec);
+        var best: ?Atom = null;
+        var best_prefix: usize = 0;
         for (l.ambient.keys()) |pat_atom| {
             const pat = l.atomText(pat_atom);
             const star = std.mem.indexOfScalar(u8, pat, '*') orelse continue;
             const prefix = pat[0..star];
             const suffix = pat[star + 1 ..];
-            if (text.len >= prefix.len + suffix.len and
-                std.mem.startsWith(u8, text, prefix) and
-                std.mem.endsWith(u8, text, suffix)) return pat_atom;
+            if (text.len < prefix.len + suffix.len) continue;
+            if (!std.mem.startsWith(u8, text, prefix)) continue;
+            if (!std.mem.endsWith(u8, text, suffix)) continue;
+            if (best == null or prefix.len > best_prefix) {
+                best = pat_atom;
+                best_prefix = prefix.len;
+            }
         }
-        return null;
+        return best;
     }
 
     /// TS2307 for unresolved module specifiers, one per statement. A
