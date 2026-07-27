@@ -1503,6 +1503,26 @@ const Linker = struct {
                             // `export =`-shaped ambient module: the CommonJS
                             // export-assignment *is* the default under interop.
                             tgt = .{ .kind = .any };
+                        } else if (l.allow_synthetic_default and mfile_opt == null and
+                            l.ambientKey(rec.module) != null)
+                        {
+                            // Same synthesized default, for a specifier served
+                            // by an ambient `declare module "m"` block with real
+                            // named exports rather than by a resolved file. Such
+                            // a block only ever appears in a declaration file, so
+                            // it always satisfies tsc's `canHaveSyntheticDefault`
+                            // — the runtime shape is unknown and the default may
+                            // exist. `@types/node` declares `fs`, `util`,
+                            // `crypto`, … this way (unlike `path`, which is
+                            // `export =` and is handled by `exeq` above), so
+                            // without this a plain `import fs from "fs"` reported
+                            // TS1192 under `esModuleInterop`.
+                            const key = l.ambientKey(rec.module).?;
+                            tgt = .{
+                                .kind = .ambient_ns,
+                                .payload = @intCast(l.ambient.getIndex(key).?),
+                                .type_only = rec.type_only,
+                            };
                         } else if ((mfile_opt != null and (try l.lookupExport(mfile_opt.?, rec.local, 0)) != null) or
                             l.lookupAmbient(rec.module, rec.local) != null)
                         {
