@@ -5250,11 +5250,48 @@ const Checker = struct {
         };
         const name = c.symNameAtom(sym);
         var result: TypeId = types.any_type;
-        _ = try c.findBindingType(pattern, name, whole, &result);
+        _ = try c.findBindingType(pattern, name, whole, &result, try c.bindingFlowBase(sym, decl));
         return result;
     }
 
-    fn findBindingType(c: *Checker, pat: Node, name: Atom, whole: TypeId, out: *TypeId) Error!bool {
+    /// A destructured binding inherits the NARROWING of the property it comes
+    /// from: `const { multiElement } = this.state` inside `if
+    /// (this.state.multiElement)` binds the narrowed, non-null type. tsc builds
+    /// a synthetic `<initializer>["prop"]` element access carrying the
+    /// declaration's flow node and asks `getFlowTypeOfReference` about it
+    /// (`getFlowTypeOfDestructuring`); the equivalent here is to extend the
+    /// initializer's reference key by each pattern link and query the flow graph
+    /// at the declaration.
+    ///
+    /// Only when the initializer is itself a tracked reference and the
+    /// declaration lives in the file being checked — a cross-file symbol is
+    /// never flow-narrowed, and its flow ids belong to another graph.
+    const BindFlow = struct { node: Node, key: RefKey };
+
+    fn bindingFlowBase(c: *Checker, sym: SymbolId, decl: Node) Error!?BindFlow {
+        if (c.symFile(sym) != c.cur_file) return null;
+        const d = c.tree.nodeData(decl);
+        const init_node: Node = switch (c.nodeTag(decl)) {
+            .declarator_init => d.rhs,
+            .declarator_full => c.tree.extraData(ast.DeclaratorFull, d.rhs).init,
+            else => return null,
+        };
+        if (init_node == null_node) return null;
+        const key = (try c.buildRefKey(init_node)) orelse return null;
+        return .{ .node = init_node, .key = key };
+    }
+
+    /// The reference key one pattern link deeper, or null when the path would
+    /// exceed the tracked depth (sound under-narrowing).
+    fn extendRefKey(base: RefKey, elem: PathElem) ?RefKey {
+        if (base.len >= max_ref_depth) return null;
+        var k = base;
+        k.path[k.len] = elem;
+        k.len += 1;
+        return k;
+    }
+
+    fn findBindingType(c: *Checker, pat: Node, name: Atom, whole: TypeId, out: *TypeId, bf: ?BindFlow) Error!bool {
         if (pat == null_node) return false;
         const d = c.tree.nodeData(pat);
         switch (c.nodeTag(pat)) {
@@ -5276,9 +5313,20 @@ const Checker = struct {
                             if (try c.propOfType(try c.resolveStructural(whole), key)) |p| {
                                 pt = if (p.optional()) try c.makeUnion2(p.ty, types.undefined_type) else p.ty;
                             }
+                            // Inherit the narrowing of `<initializer>.key` at the
+                            // declaration (see `bindingFlowBase`).
+                            var sub_bf: ?BindFlow = null;
+                            if (bf) |b| {
+                                if (PathElem.memberFits(key)) {
+                                    if (extendRefKey(b.key, .member(key))) |k| {
+                                        pt = try c.flowTypeOfKey(b.node, k, pt);
+                                        sub_bf = .{ .node = b.node, .key = k };
+                                    }
+                                }
+                            }
                             if (ed.rhs != 0) pt = try c.removeUndefined(pt); // default strips undefined
                             if (ed.lhs != 0) {
-                                if (try c.findBindingType(ed.lhs, name, pt, out)) return true;
+                                if (try c.findBindingType(ed.lhs, name, pt, out, sub_bf)) return true;
                             } else if (key == name) {
                                 out.* = pt;
                                 return true;
@@ -5291,7 +5339,7 @@ const Checker = struct {
                             // object wrongly kept the destructured props, which
                             // then read as duplicated by a later spread (TS2783).
                             const rest_ty = try c.objectRestType(whole, pat);
-                            if (try c.findBindingType(ed.lhs, name, rest_ty, out)) return true;
+                            if (try c.findBindingType(ed.lhs, name, rest_ty, out, null)) return true;
                         },
                         else => {},
                     }
@@ -5316,18 +5364,18 @@ const Checker = struct {
                     if (c.nodeTag(el) == .rest_element) {
                         const ed = c.tree.nodeData(el);
                         const rest_t = try c.ts.makeArray(et);
-                        if (try c.findBindingType(ed.lhs, name, rest_t, out)) return true;
+                        if (try c.findBindingType(ed.lhs, name, rest_t, out, null)) return true;
                     } else if (c.nodeTag(el) == .binding_default) {
                         const ed = c.tree.nodeData(el);
-                        if (try c.findBindingType(ed.lhs, name, try c.removeUndefined(et), out)) return true;
+                        if (try c.findBindingType(ed.lhs, name, try c.removeUndefined(et), out, null)) return true;
                     } else {
-                        if (try c.findBindingType(el, name, et, out)) return true;
+                        if (try c.findBindingType(el, name, et, out, null)) return true;
                     }
                 }
                 return false;
             },
-            .binding_default => return c.findBindingType(d.lhs, name, whole, out),
-            .rest_element => return c.findBindingType(d.lhs, name, whole, out),
+            .binding_default => return c.findBindingType(d.lhs, name, whole, out, bf),
+            .rest_element => return c.findBindingType(d.lhs, name, whole, out, null),
             else => return false,
         }
     }
