@@ -420,8 +420,8 @@ const map_containers = [_][]const u8{
     "ctp_cache",              "cmp_cache",           "inst_cache",
     "inst_map_ids",           "tp_constraint_cache", "fresh_tp_ids",
     "fresh_tp_info",          "type_node_cache",     "atom_cache",
-    "unique_sym_ids",         "infer_ids",           "infer_scopes",
-    "mapped_key_ids",         "inst_diag_at",
+    "infer_ids",              "infer_scopes",        "mapped_key_ids",
+    "inst_diag_at",
 };
 
 const Checker = struct {
@@ -447,6 +447,12 @@ const Checker = struct {
     /// `flow_base[cur_file]`, refreshed by `setFile` — `flowType` runs on the
     /// current file's graph and is hot enough to want the index precomputed.
     cur_flow_base: u32 = 0,
+    /// Prefix sums of per-file AST node counts: `node_base[f] + node` is a
+    /// program-global node id (same idiom as `flow_base` / `Program.sym_base`).
+    /// Used where a *declaration site* must name itself with a number that is a
+    /// property of the program rather than of this checker's traversal order —
+    /// see `uniqueSymType`.
+    node_base: []const u32 = &.{},
 
     /// Checker arena: type store, caches. Freed at the end of check().
     /// Heap-allocated so `Allocator` handles stay valid when the Checker
@@ -661,12 +667,6 @@ const Checker = struct {
     type_node_cache: std.AutoHashMapUnmanaged(u64, TypeId) = .empty,
     /// Atom cache to avoid re-locking the shared interner.
     atom_cache: std.StringHashMapUnmanaged(Atom) = .empty,
-    /// `unique symbol` nominal identity: (file << 32 | annotation node) ->
-    /// a dense id. Keyed by declaration site so a value reference to a
-    /// `unique symbol` const yields the same nominal type as its computed-key
-    /// use (`{ [k]: … }`) and element access (`o[k]`).
-    unique_sym_ids: std.AutoHashMapUnmanaged(u64, u32) = .empty,
-    unique_sym_next: u32 = 1,
     /// Recursion bound for the type-materializing fallback of qualified
     /// computed-key resolution (`constSymbolKeyAtom`): an adversarial alias
     /// cycle (`[A.k]` where `A`'s type materialization re-resolves the same
@@ -928,6 +928,11 @@ const Checker = struct {
         for (prog.files, 0..) |*pf, i| fbase[i + 1] = fbase[i] + @as(u32, @intCast(pf.bind.flow_tags.len));
         c.flow_base = fbase;
         c.cur_flow_base = fbase[first];
+        // Global node-id bases (see `node_base`).
+        const nbase = try arena_alloc.alloc(u32, prog.files.len + 1);
+        nbase[0] = 0;
+        for (prog.files, 0..) |*pf, i| nbase[i + 1] = nbase[i] + @as(u32, @intCast(pf.tree.nodes.len));
+        c.node_base = nbase;
         // Owner node -> primary scope map is filled lazily per file by
         // `faultScopes`; only the per-file "already faulted" flags are set up
         // here (all false = nothing mapped yet).
@@ -1295,16 +1300,18 @@ const Checker = struct {
     }
 
     /// Nominal `unique symbol` type for the `unique symbol` annotation node
-    /// `ann`. Keyed by declaration site (file + node) so every resolution of
-    /// the same annotation — the declared type of the const, and thus every
-    /// value reference to it — yields the identical nominal type.
+    /// `ann`. Identified by declaration site (`node_base[file] + node`) so every
+    /// resolution of the same annotation — the declared type of the const, and
+    /// thus every value reference to it — yields the identical nominal type.
+    ///
+    /// The id is NOT a mint-order counter: it leaks into the member name
+    /// (`uniqueSymAtom` renders `__@u<id>`), which is printed in diagnostics, so
+    /// a counter made the same property read `__@u67` under one `--checkers`
+    /// value and `__@u65` under another — the counter advanced once per
+    /// *first-encountered* annotation, and encounter order is a property of the
+    /// partition. A global node id is a property of the program.
     fn uniqueSymType(c: *Checker, ann: Node) Error!TypeId {
-        const gop = try c.unique_sym_ids.getOrPut(c.cm(), (@as(u64, c.cur_file) << 32) | ann);
-        if (!gop.found_existing) {
-            gop.value_ptr.* = c.unique_sym_next;
-            c.unique_sym_next += 1;
-        }
-        return c.ts.makeUniqueSymbol(gop.value_ptr.*);
+        return c.ts.makeUniqueSymbol(c.node_base[c.cur_file] + ann);
     }
 
     /// Synthetic member atom for a value whose type is a `unique symbol`, so a
