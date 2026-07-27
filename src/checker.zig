@@ -11305,6 +11305,11 @@ const Checker = struct {
             .regex_literal => return types.any_type, // RegExp needs lib (documented)
             .this_expr => return if (c.this_type != 0) c.this_type else types.any_type,
             .super_expr => return types.any_type,
+            // `new.target`: tsc types it as the enclosing constructor's own
+            // type (the class's static side in a constructor, `typeof f` in a
+            // plain function). The checker has no enclosing-function *symbol*
+            // in hand here, so this is a documented under-report: `any`.
+            .new_target => return types.any_type,
             .import_expr => return types.any_type,
             .omitted, .error_node, .unsupported => return types.any_type,
             .paren_expr => return c.checkExprCached(d.lhs, ctx),

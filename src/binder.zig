@@ -2482,6 +2482,7 @@ const Binder = struct {
             .null_literal,
             .this_expr,
             .super_expr,
+            .new_target,
             .import_expr,
             .omitted,
             .error_node,

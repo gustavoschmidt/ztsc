@@ -2767,8 +2767,13 @@ const Parser = struct {
     fn parseNewExpr(p: *Parser, ctx: ExprCtx) PE!Node {
         const kw = try p.bump(); // `new`
         if (p.curTag() == .dot) {
-            // `new.target` — out of subset.
-            _ = try p.bump();
+            // The `new.target` meta-property. Anything else after the dot is
+            // not a meta-property at all, so it keeps the subset boundary.
+            _ = try p.bump(); // `.`
+            if (isIdentLike(p.curTag()) and std.mem.eql(u8, p.laText(0), "target")) {
+                _ = try p.bump(); // `target`
+                return p.addNode(.{ .tag = .new_target, .main_token = kw, .data = .{ .lhs = 0, .rhs = 0 } });
+            }
             _ = try p.eat(.identifier);
             return p.unsupportedFrom(kw);
         }
@@ -4892,7 +4897,15 @@ test "type predicates parse cleanly" {
 test "unsupported: class oddities" {
     try expectDiagCount("class A { static { init(); } }", 1);
     try expectDiagCount("class B { [computeKey()]() {} }", 1); // computed member name (non-symbol)
-    try expectDiagCount("x = new.target;", 1);
+}
+
+test "new.target is a meta-property expression" {
+    try expectSExpr("x = new.target;",
+        \\(expr_stmt (assign = (identifier x) (new_target)))
+    );
+    try expectDiagCount("class C { constructor() { if (new.target) {} } }", 0);
+    // `new.<anything else>` is not a meta-property; the boundary holds.
+    try expectDiagCount("x = new.other;", 1);
 }
 
 test "well-known symbol computed member is in subset" {

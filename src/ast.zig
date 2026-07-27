@@ -198,6 +198,8 @@ pub const Tag = enum(u8) {
     null_literal,
     this_expr,
     super_expr,
+    /// The `new.target` meta-property. Leaf; main_token = `new`.
+    new_target,
     /// `import` used as a call target (dynamic import `import(x)`).
     import_expr,
     /// Elided array element / pattern hole (`[a, , b]`).
@@ -877,6 +879,7 @@ pub const Ast = struct {
                 .const_type,
                 .this_expr,
                 .super_expr,
+                .new_target,
                 .import_expr,
                 .omitted,
                 .error_node,
