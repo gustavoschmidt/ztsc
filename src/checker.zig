@@ -421,7 +421,7 @@ const map_containers = [_][]const u8{
     "inst_map_ids",           "tp_constraint_cache", "fresh_tp_ids",
     "fresh_tp_info",          "type_node_cache",     "atom_cache",
     "infer_ids",              "infer_scopes",        "mapped_key_ids",
-    "inst_diag_at",
+    "inst_diag_at",           "infer_active",
 };
 
 const Checker = struct {
@@ -795,6 +795,15 @@ const Checker = struct {
     /// Set when generic inference fell back to a constraint (tsc then
     /// reports only the first failing argument).
     infer_fell_back: bool = false,
+    /// Type-parameter symbols of every `inferTypeArgs` call currently on the
+    /// stack (innermost last). A symbol in here but *not* in the current call's
+    /// `tp_syms` is an OUTER call's still-in-flight inference variable — tsc
+    /// maps those to `silentNeverType` before running the contextual-return
+    /// inference (`InferenceFlags.NoDefault`), so they must contribute no
+    /// candidate. A generic function's own type parameters, seen while checking
+    /// its body, are never on this stack, so inferring `U = T` from an enclosing
+    /// signature's fixed `T` still works.
+    infer_active: std.ArrayListUnmanaged(u32) = .empty,
     stats: Stats = .{},
 
     // Well-known atoms (interned once in init).
@@ -14609,8 +14618,53 @@ const Checker = struct {
                 tpIndex(tp_syms, c.ts.typeParamSymbol(con)) == null;
             const undefendable_default = con == types.no_type and c.typeParamHasDefault(tp_syms[i]);
             if (bare_outer_con or undefendable_default) continue;
+            // A candidate that IS an outer call's in-flight inference variable
+            // carries no information (see `isOuterInferVar`).
+            if (c.isOuterInferVar(rc[i], tp_syms)) continue;
             t.* = rc[i];
         }
+    }
+
+    /// Is `t` a bare type parameter that some ENCLOSING `inferTypeArgs` is
+    /// still inferring? tsc instantiates a nested call's contextual type with
+    /// `InferenceFlags.NoDefault`, mapping every unresolved outer inference
+    /// variable to `silentNeverType` — which infers nothing. Without the
+    /// equivalent guard, `pf(1, 2)` inside `pair(pf(1, 2), pf(3, 4))` adopts
+    /// `pair`'s own `Q` as its `P`, the outer call then infers `Q` from `Q`,
+    /// and the printed return type literally contains the type parameter
+    /// (`[Q, Q]`). A generic function's own type params, seen while checking
+    /// its body, are not on the stack, so `const b: Box<T> = makeBox()` still
+    /// infers `U = T` from the enclosing signature's fixed `T`.
+    fn isOuterInferVar(c: *Checker, t: TypeId, tp_syms: []const u32) bool {
+        if (c.ts.kind(t) != .type_param) return false;
+        const sym = c.ts.typeParamSymbol(t);
+        if (tpIndex(tp_syms, sym) != null) return false;
+        for (c.infer_active.items) |s| {
+            if (s == sym) return true;
+        }
+        return false;
+    }
+
+    /// Substitute the type params of this call that already have a value —
+    /// `candidates` (arguments seen so far) falling back to `seed` (the
+    /// contextual-return pass) — leaving the rest free. tsc's
+    /// `instantiateContextualType` / `nonFixingMapper`.
+    fn instantiateKnownParams(
+        c: *Checker,
+        t: TypeId,
+        tp_syms: []const u32,
+        candidates: []const TypeId,
+        seed: []const TypeId,
+    ) Error!TypeId {
+        var map_list: std.ArrayList(TpMap) = .empty;
+        defer map_list.deinit(c.scratch());
+        for (tp_syms, 0..) |sym, i| {
+            const v = if (candidates[i] != types.no_type) candidates[i] else seed[i];
+            if (v == types.no_type) continue;
+            try map_list.append(c.scratch(), .{ .sym = sym, .ty = v });
+        }
+        if (map_list.items.len == 0) return t;
+        return c.instantiate(t, map_list.items);
     }
 
     /// True when `tp_sym` is the *bare* return type of some function-typed
@@ -14645,6 +14699,13 @@ const Checker = struct {
         const candidates = try c.scratch().alloc(TypeId, tp_syms.len);
         for (candidates) |*x| x.* = types.no_type;
 
+        // This call's inference variables are in flight for the whole of it —
+        // see `infer_active`. A NESTED call's contextual-return inference must
+        // not adopt one of them as a candidate.
+        const active_base = c.infer_active.items.len;
+        try c.infer_active.appendSlice(c.cm(), tp_syms);
+        defer c.infer_active.shrinkRetainingCapacity(active_base);
+
         // Infer type parameters that appear in an explicit `this` parameter
         // (`flat<A, D extends number = 1>(this: A, depth?: D)`) from the call's
         // receiver — tsc treats the receiver as the `this` argument. Without it
@@ -14656,6 +14717,21 @@ const Checker = struct {
         const this_ty = c.ts.fnThisType(sig);
         if (this_ty != 0 and recv_ty != types.no_type) {
             try c.unify(this_ty, recv_ty, tp_syms, candidates, 0);
+        }
+
+        // Phase 0: contextual-return inference. tsc runs its
+        // `InferencePriority.ReturnType` pass BEFORE checking any argument, and
+        // the result (`context.returnMapper`) is what every argument's
+        // contextual type is instantiated with (`instantiateContextualType`).
+        // Kept out of `candidates` — argument evidence still owns the committed
+        // inference (Phase 3 fills only what no argument constrained); this
+        // exists so a nested generic call is contextually typed by the
+        // *resolved* parameter type instead of a bare, still-free inference
+        // variable of this very call.
+        const ret_seed = try c.scratch().alloc(TypeId, tp_syms.len);
+        for (ret_seed) |*x| x.* = types.no_type;
+        if (ret_ctx != types.no_type) {
+            try c.fillFromReturnContext(sig, tp_syms, ret_ctx, ret_seed, false);
         }
 
         // Phase 1: non-function arguments.
@@ -14717,6 +14793,16 @@ const Checker = struct {
             if (tag == .object_literal and c.ts.kind(try c.resolveStructural(pt)) == .type_param) {
                 const con = try c.typeParamConstraint(c.ts.typeParamSymbol(try c.resolveStructural(pt)));
                 if (con != types.no_type) arg_ctx = con;
+            }
+            // tsc's `instantiateContextualType`: substitute what this call
+            // already knows — the Phase-0 return-context inferences plus the
+            // arguments inferred to the left — into the contextual type. A param
+            // with no candidate yet stays FREE, so the shapes that deliberately
+            // rely on a free inference variable in the contextual type (a
+            // tuple-constrained `T`, a nested `Iterable<readonly [K, V]>`) are
+            // untouched; only the ones we can actually resolve are resolved.
+            if (arg_ctx != types.no_type) {
+                arg_ctx = try c.instantiateKnownParams(arg_ctx, tp_syms, candidates, ret_seed);
             }
             const at = try c.checkExprCached(an, arg_ctx);
             try c.unify(pt, at, tp_syms, candidates, 0);
