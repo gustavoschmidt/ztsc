@@ -1164,14 +1164,21 @@ const Parser = struct {
     // =====================================================================
 
     /// Parse from the `function` keyword. `flags` carries async/declare.
+    /// The name is required for a declaration, optional for a function
+    /// expression and for `export default function (…) {…}` — the one
+    /// declaration form the grammar lets go unnamed.
     fn parseFunctionDecl(p: *Parser, flags_in: u32, is_expr: bool) PE!Node {
+        return p.parseFunctionDeclNamed(flags_in, is_expr, is_expr);
+    }
+
+    fn parseFunctionDeclNamed(p: *Parser, flags_in: u32, is_expr: bool, anon_ok: bool) PE!Node {
         var flags = flags_in;
         const kw = try p.bump(); // `function`
         if (try p.eat(.asterisk) != null) flags |= ast.Flags.generator;
         var name_tok: u32 = 0;
         if (isIdentLike(p.curTag())) {
             name_tok = try p.bump();
-        } else if (!is_expr) {
+        } else if (!anon_ok) {
             try p.fail(.expected_identifier);
         }
         const proto = try p.parseFnProtoRest(flags, name_tok);
@@ -2015,11 +2022,12 @@ const Parser = struct {
             .keyword_default => {
                 _ = try p.bump();
                 const inner = switch (p.curTag()) {
-                    .keyword_function => try p.parseFunctionDecl(0, false),
+                    // `export default function (…) {…}` may be anonymous.
+                    .keyword_function => try p.parseFunctionDeclNamed(0, false, true),
                     .keyword_async => blk: {
                         if (p.peekTag(1) == .keyword_function and !p.peekNewline(1)) {
                             _ = try p.bump();
-                            break :blk try p.parseFunctionDecl(ast.Flags.async, false);
+                            break :blk try p.parseFunctionDeclNamed(ast.Flags.async, false, true);
                         }
                         const e = try p.parseAssignExpr(.{});
                         try p.expectSemicolon();
@@ -4609,6 +4617,12 @@ test "golden: export forms" {
     try expectSExpr("export default 42;",
         \\(export_default (number_literal 42))
     );
+    // `export default function` may be anonymous — the one declaration
+    // form the grammar lets go unnamed. A plain one still may not.
+    try expectSExpr("export default function (a: number) {}",
+        \\(export_default (function_decl (param (identifier a) (identifier number)) (block)))
+    );
+    try expectDiagCount("function (a: number) {}", 1);
     try expectSExpr("export { a, b as c };",
         \\(export_named (export_specifier a) (export_specifier b as=c))
     );
