@@ -9,9 +9,10 @@ TypeScript compiler, byte-identical at any parallelism.
 
 **Full documentation:** https://gustavoschmidt.github.io/ztsc/
 
-- **4.8–16× less peak memory** than tsgo (the native TypeScript 7 compiler)
-  on eight real benchmark packages.
-- **Faster on all eight** — wall clock, defaults vs. defaults — by up to 11×.
+- **3.3–16× less peak memory** than tsgo (the native TypeScript 7 compiler) —
+  4.8–16× on eight benchmark packages, 3.3× on a full production app.
+- **Faster on every benchmark** — up to 11× on the packages, 1.3× on the
+  app; wall clock, defaults vs. defaults.
 - **0 dependencies** — the Zig source uses nothing but the Zig standard
   library; the binary needs nothing but your OS.
 - **630/630 conformance** — differential cases (error code + line) against the
@@ -25,7 +26,7 @@ TypeScript compiler, byte-identical at any parallelism.
 
 ## Benchmarks
 
-**Faster and smaller than tsgo — on every input measured.** Eight real
+**Faster and smaller than tsgo — on every benchmark.** Eight real
 packages' published `.d.ts`, vendored at pinned versions, both tools checking
 identical inputs at their default 4 checker instances on an Apple M4: ztsc's
 peak memory is **6–21% of tsgo's** and its wall clock **9–58%** — 3.0–11×
@@ -35,12 +36,6 @@ faster on everything bigger than the process floor.
   <source media="(prefers-color-scheme: dark)" srcset="docs/benchmarks-dark.svg">
   <img alt="Peak memory and wall clock across eight packages: ztsc uses 8-24 MB where tsgo uses 43-276 MB, and takes 8-31 ms where tsgo takes 19-247 ms" src="docs/benchmarks-light.svg">
 </picture>
-
-| package | wall ztsc / tsgo | peak RSS ztsc / tsgo | rss vs tsgo |
-|---|---:|---:|---:|
-| @types/react 18.3.11 · 64.1k lines | 28 / 247 ms | 21.8 / 185.2 MB | 12% |
-| @types/node 22.7.4 · 49.6k lines | 15 / 47 ms | 16.9 / 101.7 MB | 17% |
-| drizzle-orm 0.33.0 · 12.6k lines | 22 / 238 ms | 17.3 / 275.7 MB | 6% |
 
 Declaration files exercise the type-level machinery; real application source
 exercises the rest. On a large production React/TypeScript app — full
