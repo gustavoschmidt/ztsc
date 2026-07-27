@@ -1293,6 +1293,16 @@ const Binder = struct {
         try b.flow_pairs.append(b.scratch, .{ .value = node, .next = b.cur_flow });
     }
 
+    /// A literal element index — the only element access the checker tracks as
+    /// a narrowing reference (`Checker.constIndexOf`). Deliberately coarser
+    /// than that predicate (no range/sign test): an index the checker rejects
+    /// simply leaves an unused flow entry.
+    fn isConstIndex(b: *const Binder, node: Node) bool {
+        var n = node;
+        while (b.nodeTag(n) == .paren_expr) n = b.tree.nodeData(n).lhs;
+        return b.nodeTag(n) == .number_literal;
+    }
+
     /// A bare identifier or a `a.b.c` chain of them — tsc's isDottedName,
     /// the gate for creating an assertion-candidate call flow node.
     fn isDottedName(b: *const Binder, node: Node) bool {
@@ -2504,6 +2514,17 @@ const Binder = struct {
                 try b.bindExpr(d.lhs);
                 // Narrowable reference (`x.y` discriminants): attach flow.
                 try b.attachFlow(node);
+            },
+            .index_expr, .optional_index_expr => {
+                try b.bindExpr(d.lhs);
+                try b.bindExpr(d.rhs);
+                // A CONSTANT element access (`arr[0]`) is a narrowable
+                // reference exactly like a dotted member — `if
+                // (isImageElement(elements[0]))` has to narrow the reads of the
+                // same access. A variable index (`arr[i]`) is not a stable
+                // reference (the checker's `buildRefKey` rejects it), so it gets
+                // no flow entry and costs nothing.
+                if (isConstIndex(b, d.rhs)) try b.attachFlow(node);
             },
             .assign => {
                 try b.bindExpr(d.lhs);

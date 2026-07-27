@@ -12721,7 +12721,7 @@ const Checker = struct {
             .array_literal => return c.checkArrayLiteral(node, ctx),
             .object_literal => return c.checkObjectLiteral(node, ctx),
             .member_expr, .optional_member_expr => return c.checkMemberExpr(node),
-            .index_expr, .optional_index_expr => return c.checkIndexExpr(node),
+            .index_expr, .optional_index_expr => return c.checkIndexExpr(node, true),
             .call_expr, .call_expr_targs, .optional_call => return c.checkCallExpr(node, false, ctx),
             .new_expr, .new_expr_targs, .new_expr_bare => return c.checkCallExpr(node, true, ctx),
             .instantiation_expr => {
@@ -14448,7 +14448,7 @@ const Checker = struct {
     fn chainObjType(c: *Checker, node: Node, chained: *bool) Error!TypeId {
         return switch (c.nodeTag(node)) {
             .member_expr, .optional_member_expr => c.memberChainInner(node, chained),
-            .index_expr, .optional_index_expr => c.indexChainInner(node, chained),
+            .index_expr, .optional_index_expr => c.indexChainInner(node, chained, true),
             .call_expr, .call_expr_targs, .optional_call => c.checkCallExprInner(node, false, chained, types.no_type),
             else => c.checkExprCached(node, types.no_type),
         };
@@ -14641,15 +14641,15 @@ const Checker = struct {
         }
     }
 
-    fn checkIndexExpr(c: *Checker, node: Node) Error!TypeId {
+    fn checkIndexExpr(c: *Checker, node: Node, narrow: bool) Error!TypeId {
         var chained = false;
-        const r = try c.indexChainInner(node, &chained);
+        const r = try c.indexChainInner(node, &chained, narrow);
         if (chained) return c.makeUnion2(r, types.undefined_type);
         return r;
     }
 
     /// Element access as an optional-chain link (see `memberChainInner`).
-    fn indexChainInner(c: *Checker, node: Node, chained: *bool) Error!TypeId {
+    fn indexChainInner(c: *Checker, node: Node, chained: *bool, narrow: bool) Error!TypeId {
         const d = c.tree.nodeData(node);
         const own_optional = c.nodeTag(node) == .optional_index_expr;
         var obj_t = if (c.isOptionalChain(d.lhs))
@@ -14764,6 +14764,19 @@ const Checker = struct {
                 }
             },
             else => result = types.any_type,
+        }
+        // Element-access narrowing, the counterpart of `memberChainInner`'s
+        // property-path step: `arr[0]` with a CONSTANT index is a tracked
+        // reference (`buildRefKey` rejects a variable index), so a guard written
+        // on it — `if (isImageElement(elements[0]))` — must narrow the reads of
+        // the same access. `narrow` is false for an assignment TARGET, whose
+        // type is the declared element type: narrowing it would reject
+        // `arr[0] = other` inside a guard on `arr[0]` (the dotted-member write
+        // path reads the declared property type for the same reason).
+        if (narrow) {
+            if (try c.buildRefKey(node)) |key| {
+                result = try c.flowTypeOfKey(node, key, result);
+            }
         }
         return result;
     }
@@ -15214,7 +15227,7 @@ const Checker = struct {
                         }
                     }
                 }
-                return c.checkIndexExpr(node);
+                return c.checkIndexExpr(node, false);
             },
             .array_literal, .object_literal, .array_pattern, .object_pattern => {
                 // Destructuring-assignment pattern in the expression cover
@@ -17980,14 +17993,16 @@ const Checker = struct {
                 }
                 return t;
             },
-            // An ELEMENT-access chain link (`a?.[k]`) is the same optional
-            // chain as `a?.p`, on a different node tag — so the containment
-            // rule of the member arm above applies unchanged: a truthy chain
-            // implies its receivers did not short-circuit. Without this arm
-            // `if (m?.[2]) { m[3] }` left `m` nullable while the property form
-            // `if (o?.p)` narrowed, because element access fell through to the
-            // no-op default.
+            // `if (arr[0])` — a constant element access is a tracked
+            // reference, so its own truthiness narrows it (`refMatches` walks
+            // element links). Failing that, an ELEMENT-access chain link
+            // (`a?.[k]`) is the same optional chain as `a?.p` on a different
+            // node tag: a truthy chain implies its receivers did not
+            // short-circuit, so the member arm's containment rule applies.
             .index_expr, .optional_index_expr => {
+                if (try c.refMatches(cond, key)) {
+                    return if (sense) c.getTruthyPart(t) else c.getFalsyPart(t, true);
+                }
                 if (sense and try c.optionalChainContainsRef(cond, key)) {
                     return c.nonNullable(t);
                 }
