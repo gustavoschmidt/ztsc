@@ -106,3 +106,16 @@ classes/062_inferred_return_this_cycle.ts  -TS7023 28
 classes/062_inferred_return_this_cycle.ts  -TS7022 35
 classes/062_inferred_return_this_cycle.ts  -TS2729 35
 classes/062_inferred_return_this_cycle.ts  -TS2729 41
+
+# A rest parameter typed by a UNION of array types is modelled per POSITION:
+# each argument position gets the union of the constituents' element types
+# (tsc's `getIndexedAccessType(restType, number)`), which is what makes a
+# callback argument contextually typed. tsc additionally requires the argument
+# list *as a whole* to satisfy one arm, so it rejects a list that mixes them
+# (a bare handler and an array of handlers in the same call); ztsc, having no
+# whole-list arm choice, accepts it. Deterministic under-report of one extra
+# check, and the narrower alternative — keeping the position untyped — costs a
+# false TS7006 on every correctly-typed callback at such a call site, which
+# policy forbids. The per-position check itself still discriminates: an
+# incompatible callback is rejected on line 31.
+calls/041_rest_param_union_of_arrays.ts  -TS2345 27

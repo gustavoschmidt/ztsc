@@ -3966,6 +3966,18 @@ const Checker = struct {
         return switch (c.ts.kind(r)) {
             .array => c.ts.arrayElem(r),
             .tuple => try c.numberIndexType(r),
+            .union_type => blk: {
+                var parts: std.ArrayList(TypeId) = .empty;
+                defer parts.deinit(c.scratch());
+                for (try c.memberList(r)) |m| {
+                    const e = try c.elemOfArrayish(m);
+                    // One non-arrayish constituent leaves the whole position
+                    // untyped, exactly as the single-type path does.
+                    if (c.ts.kind(e) == .any) break :blk types.any_type;
+                    try parts.append(c.scratch(), e);
+                }
+                break :blk try c.ts.makeUnion(c.scratch(), parts.items);
+            },
             else => types.any_type,
         };
     }
