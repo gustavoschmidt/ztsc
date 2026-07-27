@@ -785,10 +785,10 @@ const Checker = struct {
     /// subtree and re-scans every token it covers, so the hot boundaries
     /// record just the node and pay for the span only if a diagnostic
     /// actually fires. The file is captured too: materializing a type can
-    /// switch the current-file context (`enterSymFile`), and an anchor that
-    /// no longer belongs to the file being traversed is not a position at
-    /// all — `instSpanHere` discards it rather than reinterpreting the
-    /// offset against the wrong line table.
+    /// switch the current-file context (`enterSymFile`), so the anchor's
+    /// offset is only a position in the file it was recorded in —
+    /// `instLimitDiag` files the diagnostic under *that* file rather than
+    /// reinterpreting the offset against `cur_file`'s line table.
     inst_anchor: InstAnchor = .{ .span = .{ .file = 0, .span = .{ .start = 0, .end = 0 } } },
     /// Master switch for the instantiation caching layer (`--no-inst-cache` clears it):
     /// the instantiate memo, map interning, constraint memo, and type-node
@@ -1537,28 +1537,35 @@ const Checker = struct {
         span: struct { file: FileId, span: Span },
     };
 
-    /// The anchor as a position in the file currently being traversed, or
-    /// `null` when the anchor belongs to a different file.
+    /// The anchor resolved to the (file, span) pair it was recorded at.
     ///
     /// Materializing a type switches the current-file context
     /// (`enterSymFile`) without moving the anchor, so a limit tripped deep
-    /// inside a foreign declaration still carries the *demand* site's node.
-    /// Since the diagnostic is filed under `cur_file`, using that span would
-    /// stamp one file's byte offset onto another file's line table — a
-    /// position that means nothing, and one whose survival depends on
-    /// whether this checker happens to own both files. There is nothing to
-    /// report here: the demand site's own checker reports the same trip at
-    /// its real anchor.
-    fn instSpanHere(c: *const Checker) ?Span {
+    /// inside a foreign declaration still carries the *demand* site's node —
+    /// and the demand site is the position to report. `cur_file` at the
+    /// moment of the trip is not: whether the expansion happened to route
+    /// through a foreign declaration, rather than meeting this checker's
+    /// already-materialized copy of it, is a property of the partition.
+    /// The anchor's own file is the only frame its byte offset means
+    /// anything in, so the span is computed against that file's tree and
+    /// source rather than `c.tree`/`c.src`, which follow `cur_file`.
+    fn instSpanHere(c: *const Checker) struct { FileId, Span } {
         return switch (c.inst_anchor) {
-            .span => |s| if (s.file == c.cur_file) s.span else null,
-            .node => |n| if (n.file == c.cur_file) c.nodeSpan(n.node) else null,
+            .span => |s| .{ s.file, s.span },
+            .node => |n| .{ n.file, c.prog.files[n.file].tree.span(c.prog.files[n.file].src, n.node) },
         };
     }
 
     /// Report an instantiation-limit diagnostic (TS2589 / TS2590) at a
     /// canonical, partition-independent anchor: at most one per file and
-    /// code, at the lexically-first in-file anchor seen.
+    /// code, at the lexically-first anchor seen in that file.
+    ///
+    /// The record is filed under the *anchor's* file, never `cur_file`. The
+    /// anchor is only ever set while walking a file this checker owns
+    /// (`checkStatement`/`anchorInst` and the expression boundaries), so it
+    /// always survives `seal`'s owned-file filter — and a trip that unwound
+    /// through a foreign `.d.ts` is reported at the site that demanded it
+    /// instead of dropped.
     ///
     /// The limit is a resource cap, not a property of a single expression:
     /// `instantiateId`'s memo short-circuits before the depth guard, so
@@ -1568,15 +1575,15 @@ const Checker = struct {
     /// anchor makes the reported position a function of the program alone.
     /// Costs one hash lookup per trip (a handful per run).
     fn instLimitDiag(c: *Checker, code: u16, msg: []const u8) Error!void {
-        const span = c.instSpanHere() orelse return;
-        const gop = try c.inst_diag_at.getOrPut(c.cm(), (@as(u64, c.cur_file) << 32) | code);
+        const file, const span = c.instSpanHere();
+        const gop = try c.inst_diag_at.getOrPut(c.cm(), (@as(u64, file) << 32) | code);
         if (gop.found_existing) {
             const prev = &c.diags.items[gop.value_ptr.*];
             if (span.start < prev.span.start) prev.span = span;
             return;
         }
         gop.value_ptr.* = c.diags.items.len;
-        try c.diags.append(c.gpa, .{ .code = code, .file = c.cur_file, .span = span, .msg = try c.out.dupe(u8, msg) });
+        try c.diags.append(c.gpa, .{ .code = code, .file = file, .span = span, .msg = try c.out.dupe(u8, msg) });
     }
 
     fn anchorInst(c: *Checker, node: Node) void {
