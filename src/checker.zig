@@ -4773,6 +4773,47 @@ const Checker = struct {
 
     /// Type of one variable declarator for `sym` (no_type if this decl
     /// contributes none, e.g. bare `declarator` in a multi-decl symbol).
+    /// Is `sym` an *evolving* variable — tsc's "auto" type? A `let`/`var` with
+    /// no type annotation whose initializer is literally `null` or `undefined`
+    /// gets a declared type that does not constrain later writes: the write is
+    /// unchecked and a read's type is whatever the flow last assigned
+    /// (`getTypeAtFlowAssignment`'s `declaredType === autoType` branch, which
+    /// returns the assigned type instead of reducing it against the declared
+    /// one). Without this `let match = null; while ((match = exec(s)) !== null)`
+    /// pins `match` to `null` and reports the assignment plus every use.
+    ///
+    /// Purely syntactic — it never re-enters `checkExpr`, so it is safe to ask
+    /// from inside `typeOfSymbol`'s own callers. Restricted to the current file
+    /// (a cross-file reference is never flow-narrowed anyway) and to a single
+    /// declarator binding a plain identifier.
+    fn isEvolvingVar(c: *Checker, sym: SymbolId) bool {
+        if (sym == this_flow_root or sym == binder.no_symbol) return false;
+        const f = c.symFlags(sym);
+        if (!(f.let_decl or f.var_decl)) return false;
+        if (f.const_decl or f.param or f.catch_param) return false;
+        if (c.symFile(sym) != c.cur_file) return false;
+        const decls = c.declsOf(sym);
+        if (decls.len != 1) return false;
+        const decl = decls[0];
+        const d = c.tree.nodeData(decl);
+        const init_node: Node = switch (c.nodeTag(decl)) {
+            .declarator_init => d.rhs,
+            .declarator_full => blk: {
+                const e = c.tree.extraData(ast.DeclaratorFull, d.rhs);
+                if (e.type_ann != 0) return false;
+                break :blk e.init;
+            },
+            else => return false,
+        };
+        if (c.nodeTag(d.lhs) != .identifier) return false;
+        if (init_node == null_node) return false;
+        return switch (c.nodeTag(init_node)) {
+            .null_literal => true,
+            .identifier => c.tree.tokens.tag(c.tree.nodeMainToken(init_node)) == .keyword_undefined,
+            else => false,
+        };
+    }
+
     fn declaratorType(c: *Checker, sym: SymbolId, decl: Node, is_const: bool) Error!TypeId {
         const d = c.tree.nodeData(decl);
         switch (c.nodeTag(decl)) {
@@ -13895,12 +13936,18 @@ const Checker = struct {
         const d = c.tree.nodeData(node);
         const op = c.tree.tokens.tag(c.tree.nodeMainToken(node));
         const target_t = try c.checkAssignmentTarget(d.lhs);
+        // Writing an evolving (`auto`-typed) variable is unchecked: its
+        // `null`/`undefined` declared type is where the flow type starts, not
+        // a constraint on what may be stored (tsc's autoType). The type itself
+        // is still what `checkAssignmentTarget` returned, so `+=` classifies
+        // the operand the same way it would for any other declared type.
+        const unchecked = c.assignTargetIsEvolving(d.lhs);
         var rhs_ctx: TypeId = if (op == .eq) target_t else types.no_type;
-        if (target_t == types.error_type) rhs_ctx = types.no_type;
+        if (target_t == types.error_type or unchecked) rhs_ctx = types.no_type;
         const rt = try c.checkExprCached(d.rhs, rhs_ctx);
         switch (op) {
             .eq => {
-                if (target_t != types.error_type and target_t != types.any_type) {
+                if (!unchecked and target_t != types.error_type and target_t != types.any_type) {
                     _ = try c.checkAssignable(rt, target_t, d.rhs, c.nodeSpan(d.lhs));
                 }
                 return rt;
@@ -13910,13 +13957,25 @@ const Checker = struct {
                 return types.number_type;
             },
             .amp_amp_eq, .pipe_pipe_eq, .question_question_eq => {
-                if (target_t != types.error_type and target_t != types.any_type) {
+                if (!unchecked and target_t != types.error_type and target_t != types.any_type) {
                     _ = try c.checkAssignable(rt, target_t, d.rhs, c.nodeSpan(d.lhs));
                 }
                 return rt;
             },
             else => return types.number_type, // -=, *=, ... numeric compounds
         }
+    }
+
+    /// Does this assignment target name an evolving (`auto`-typed) variable?
+    fn assignTargetIsEvolving(c: *Checker, target0: Node) bool {
+        var n = target0;
+        while (n != null_node and c.nodeTag(n) == .paren_expr) n = c.tree.nodeData(n).lhs;
+        if (n == null_node or c.nodeTag(n) != .identifier) return false;
+        const a = c.atomOfToken(c.tree.nodeMainToken(n)) catch return false;
+        return switch (c.resolveSpace(a, c.cur_scope, true)) {
+            .sym => |sym| c.isEvolvingVar(sym),
+            else => false,
+        };
     }
 
     /// Type of an assignment target; reports TS2588 (const) and TS2540
@@ -16468,11 +16527,17 @@ const Checker = struct {
                     if (!try c.identIsSym(d.lhs, root_sym)) return null;
                     // key.len != 0 was caught above by refPrefixWritten.
                     const op = c.tree.tokens.tag(c.tree.nodeMainToken(target));
+                    // An evolving (`auto`-typed) variable takes the assigned
+                    // type outright — there is no declared type to reduce it
+                    // against (tsc `getTypeAtFlowAssignment`, autoType branch).
+                    const evolving = key.len == 0 and c.isEvolvingVar(root_sym);
                     if (op != .eq) {
                         const vt = c.nodeType(target) orelse declared;
+                        if (evolving) return try c.widenLiteral(vt);
                         return try c.assignmentReduced(declared, vt);
                     }
                     const vt = c.nodeType(d.rhs) orelse try c.checkExprCached(d.rhs, types.no_type);
+                    if (evolving) return try c.widenLiteral(vt);
                     return try c.assignmentReduced(declared, vt);
                 }
                 if (try c.patternBindsSym(d.lhs, root_sym)) return declared;
