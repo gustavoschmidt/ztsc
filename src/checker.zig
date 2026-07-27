@@ -11527,10 +11527,15 @@ const Checker = struct {
             .sym => |s| if (c.symFlags(s).namespace_decl) s else return null,
             else => return null,
         };
-        const nb = c.symBind(jsx_sym);
-        const ns = nb.namespaceScopeOf(c.localOf(jsx_sym)) orelse return null;
-        const local = nb.lookupInScope(ns, member) orelse return null;
-        const g = c.toGlobalIn(c.symFile(jsx_sym), local);
+        // Through `namespaceMemberSym`, so a `JSX` namespace declared in more
+        // than one file is looked up in its MERGED member index. Reaching into
+        // one declaration's body scope directly (`namespaceScopeOf` on the
+        // merged symbol's representative constituent) saw only that file's
+        // members: a project that adds its own custom elements with a script
+        // `declare namespace JSX { interface IntrinsicElements { "em-emoji":
+        // any } }` shadowed the whole React/preact `IntrinsicElements`, and
+        // every `<div>` in the project became TS2339.
+        const g = c.namespaceMemberSym(jsx_sym, member) orelse return null;
         const mf = c.symFlags(g);
         if (!(mf.exported and hasTypeMeaning(mf))) return null;
         return g;
