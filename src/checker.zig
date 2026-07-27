@@ -10231,15 +10231,22 @@ const Checker = struct {
     /// Union-distributing overlap test for TS2367/TS2678: some pair of
     /// constituents must be comparable.
     fn typesHaveOverlap(c: *Checker, a: TypeId, b: TypeId) Error!bool {
+        return c.typesHaveOverlapRec(a, b, 0);
+    }
+
+    fn typesHaveOverlapRec(c: *Checker, a: TypeId, b: TypeId, depth: u32) Error!bool {
+        // Under-report over false-reject (project policy): a composite this
+        // deep is not worth a phantom TS2367.
+        if (depth > 8) return true;
         if (c.ts.kind(a) == .union_type) {
             for (try c.memberList(a)) |m| {
-                if (try c.typesHaveOverlap(m, b)) return true;
+                if (try c.typesHaveOverlapRec(m, b, depth + 1)) return true;
             }
             return false;
         }
         if (c.ts.kind(b) == .union_type) {
             for (try c.memberList(b)) |m| {
-                if (try c.typesHaveOverlap(a, m)) return true;
+                if (try c.typesHaveOverlapRec(a, m, depth + 1)) return true;
             }
             return false;
         }
@@ -10266,7 +10273,33 @@ const Checker = struct {
         if (c.ts.kind(rb) == .enum_type and c.ts.kind(ra) == .string_literal) {
             if (try c.enumHasStringValue(c.ts.enumSymbol(rb), c.ts.literalAtom(ra))) return true;
         }
-        return c.isComparable(a, b);
+        if (try c.isComparable(a, b)) return true;
+        // tsc's *comparable* relation distributes EXISTENTIALLY over an
+        // intersection (`someTypeRelatedToType`): the relation holds as soon as
+        // ONE constituent relates. A branded primitive therefore overlaps a
+        // literal of its own domain through the primitive facet —
+        // `number & { _brand: "normalizedZoom" } === 1` and
+        // `string & { _brand: "SearchQuery" } === ""` are both clean in tsc,
+        // while ztsc's mutual-assignability `isComparable` saw no overlap and
+        // reported a phantom TS2367. Kept as a fallback (after the ordinary
+        // comparable probes) and existential rather than facet-based, so the
+        // real negatives survive: `number & {…} === "x"` and
+        // `("a" | "b") & {…} === "z"` still have no comparable constituent.
+        const ia = try c.resolveStructural(a);
+        if (c.ts.kind(ia) == .intersection) {
+            for (try c.memberList(ia)) |m| {
+                if (try c.typesHaveOverlapRec(m, b, depth + 1)) return true;
+            }
+            return false;
+        }
+        const ib = try c.resolveStructural(b);
+        if (c.ts.kind(ib) == .intersection) {
+            for (try c.memberList(ib)) |m| {
+                if (try c.typesHaveOverlapRec(a, m, depth + 1)) return true;
+            }
+            return false;
+        }
+        return false;
     }
 
     fn isAssignable(c: *Checker, s0: TypeId, t0: TypeId) Error!bool {
@@ -18122,7 +18155,13 @@ const Checker = struct {
             const cd = c.tree.nodeData(clause);
             if (c.nodeTag(clause) == .case_clause and cd.lhs != 0) {
                 const case_t = try c.checkExprCached(cd.lhs, types.no_type);
-                if (!try c.isComparable(case_t, disc_t)) {
+                // TS2678 is the same *comparable* relation as TS2367, so it
+                // goes through the same union/intersection-distributing test:
+                // a `case null:` on a non-nullable discriminant is clean in
+                // tsc, and `case 1:` on a branded `number & { _brand }` relates
+                // through the intersection's `number` constituent. Bare
+                // `isComparable` (mutual assignability) reported both.
+                if (!try c.typesHaveOverlap(case_t, disc_t)) {
                     try c.diagFmt(2678, c.nodeSpan(cd.lhs), "Type '{s}' is not comparable to type '{s}'.", .{
                         try c.typeToString(case_t), try c.typeToString(disc_t),
                     });
