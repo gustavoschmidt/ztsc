@@ -14976,7 +14976,15 @@ const Checker = struct {
                 if (c.ts.kind(rl) == .number_literal) {
                     return c.ts.makeNumberLiteral(-c.ts.numberValue(rl), c.ts.isFreshLiteral(ot));
                 }
-                if (try c.isBigintish(ot)) return types.bigint_type;
+                // `bigint` only when the operand actually CARRIES a bigint
+                // constituent: tsc's getUnaryResultType tests
+                // `maybeTypeOfKind(t, BigIntLike)`, not assignability, so the
+                // types that are vacuously assignable to bigint — `never`
+                // (no constituents) and `any` — coerce to `number` like every
+                // other non-bigint operand. `isBigintish` is the assignability
+                // test, so exclude the operands that are equally numberish;
+                // this mirrors the binary `-`/`*` arm below.
+                if (try c.isBigintish(ot) and !try c.isNumberish(ot)) return types.bigint_type;
                 return types.number_type;
             },
             .plus, .tilde => {
