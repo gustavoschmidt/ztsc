@@ -3030,6 +3030,21 @@ const Binder = struct {
                     symbol_flags[sym].exported = true;
                 }
             }
+            // `export default A;` where `A` is a bare identifier is an ALIAS to
+            // the local entity, carrying every meaning it has — tsc's
+            // `bindExportAssignment` declares an alias exactly when the
+            // expression is an entity name. Resolving the local here is what
+            // makes `import type A from "./m"` a type: without it the export is
+            // only a `default_expr` (the *value* of the expression), so the type
+            // meaning was silently dropped and the import became `any`.
+            // `export default class B {}` already carried its symbol from
+            // `bindExportDefault`, which is why the declaration form worked.
+            //
+            // The local is NOT marked `exported`: `export default A` publishes
+            // `A` under the name `default` only, never under `A`.
+            if (rec.kind == .default and rec.sym == no_symbol and rec.local != 0 and rec.module == 0) {
+                if (result.lookupInScope(file_scope, rec.local)) |sym| rec.sym = sym;
+            }
         }
         result.imports = try arena.dupe(ImportRec, b.import_recs.items);
         result.exports = try arena.dupe(ExportRec, b.export_recs.items);

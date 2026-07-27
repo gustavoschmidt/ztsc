@@ -1013,7 +1013,10 @@ const Linker = struct {
                 },
                 .default => {
                     if (rec.sym != binder.no_symbol) {
-                        try l.put(t, rec.exported, .{ .kind = .binding, .file = file, .payload = rec.sym });
+                        // Through `finalizeLocal` so `import X from "m"; export
+                        // default X;` follows the chain to m's export rather
+                        // than stopping at the local import binding.
+                        try l.put(t, rec.exported, try l.finalizeLocal(file, rec.sym, rec.local, rec.type_only, 0));
                     } else {
                         try l.put(t, rec.exported, .{ .kind = .default_expr, .file = file, .payload = rec.node });
                     }
