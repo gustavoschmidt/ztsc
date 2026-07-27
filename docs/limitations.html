@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Limitations — ztsc</title>
+<meta name="description" content="What ztsc doesn't check yet and what's planned: the under-report contract, the known false positives, platform support, and the roadmap to a drop-in tsc --noEmit replacement.">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='20' fill='%23eda100'/%3E%3Ctext x='50' y='74' font-size='68' font-family='monospace' font-weight='bold' text-anchor='middle' fill='%231c1b18'%3Ez%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+
+<nav class="sitenav"><div class="navin">
+  <a class="brand" href="./">ztsc</a>
+  <div class="navlinks">
+    <a href="./">overview</a>
+    <a href="usage.html">usage</a>
+    <a href="benchmarks.html">benchmarks</a>
+    <a href="internals.html">internals</a>
+    <a href="rationale.html">rationale</a>
+    <a href="limitations.html" aria-current="page">limitations</a>
+    <a href="https://github.com/gustavoschmidt/ztsc">github ↗</a>
+  </div>
+</div></nav>
+
+<div class="wrap">
+
+<header class="hero">
+  <p class="eyebrow">limitations · v0.0.1-dev · pre-release</p>
+  <h1>What it doesn't do yet</h1>
+  <p class="sub">ztsc is not ready for production use, and this page is the precise version of
+  that sentence: what's missing, how each gap behaves today, and what's planned. The rule that
+  governs every gap: <strong>fail in the safe direction</strong> — miss an error tsc would
+  report rather than invent one, and never crash.</p>
+</header>
+
+<!-- ============================================================ -->
+<section>
+  <p class="eyebrow"><span class="n">01</span> · the contract</p>
+  <h2>A measured subset, safely bounded</h2>
+  <p>ztsc checks a large, well-defined subset of strict-mode TypeScript: the full type-level
+  language (conditional types with <code>infer</code>, mapped types, template-literal types,
+  generics, narrowing, declaration merging), the real ES-core…esnext + DOM standard library
+  with the full iteration protocol, CommonJS interop, instantiation expressions, const-symbol
+  computed keys, and JSX against the real <code>@types/react</code>. What it checks, it checks
+  like the TypeScript compiler — enforced by a 630-case differential conformance suite
+  validated against the pinned native tsgo 7.0.2, down to error codes and lines.</p>
+  <p>Everything outside the subset is bounded by three guarantees:</p>
+  <ul>
+    <li><strong>Unsupported syntax never lies.</strong> Out-of-subset constructs parse into an
+    explicit <code>unsupported</code> node with a clear <em>"not yet supported"</em> diagnostic —
+    never a wrong answer, never a crash (every phase is fuzzed).</li>
+    <li><strong>Known gaps under-report.</strong> Where ztsc can't yet reproduce an error, it
+    stays silent rather than erroring on valid code. That bias holds but is not yet absolute —
+    see the false-positive ledger below.</li>
+    <li><strong>You can measure your own project.</strong> <code>ztsc --census</code> prints a
+    frequency table of exactly which unsupported constructs your codebase contains, so "is my
+    project in the subset?" is one command, not a guess.</li>
+  </ul>
+  <p>How close is it to a drop-in <code>tsc --noEmit</code>? On the standing dogfood target — a
+  large production React/TypeScript application — ztsc reproduces <strong>all 48 of tsc's errors
+  byte-identically</strong> and adds <strong>10 false positives</strong> of its own. Close, and
+  measured, but not there yet.</p>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <p class="eyebrow"><span class="n">02</span> · the big gaps</p>
+  <h2>Platform and modes — all planned</h2>
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th>gap</th><th>today</th><th>plan</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Windows</strong></td>
+          <td>does not build or run — a Windows target fails at compile time with a clear error</td>
+          <td>port planned. The checker's per-symbol state lives in demand-zeroed anonymous
+          memory via POSIX <code>mmap</code> (untouched pages never become resident — load-bearing
+          for the memory numbers); Windows has an exact equivalent
+          (<code>VirtualAlloc</code>) that isn't wired in yet. macOS and Linux work today.</td></tr>
+      <tr><td><strong>Watch mode</strong></td>
+          <td>batch only — check, print, exit</td>
+          <td>planned next. Every phase's output is an immutable sealed artifact per file,
+          which is exactly the granularity a watch mode invalidates.</td></tr>
+      <tr><td><strong>LSP</strong></td>
+          <td>none — the batch CLI is the interface</td>
+          <td>planned after watch mode, on the same sealed-phase substrate an editor
+          queries.</td></tr>
+      <tr><td><strong>npm distribution</strong></td>
+          <td>build from source (<a href="usage.html">usage</a>)</td>
+          <td>v0.0.1 ships as <code>bunx ztsc</code> / <code>npx ztsc</code> — a single static
+          binary per platform, no install step.</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <p class="eyebrow"><span class="n">03</span> · false positives</p>
+  <h2>The ten, on the record</h2>
+  <p>The number that matters most for trust is not estimated — it is measured continuously
+  against tsc 5.9.3 on a large production codebase. The current count is <strong>10 false
+  positives</strong>, each with a root-cause diagnosis; closing them is active work. They
+  cluster into three shapes:</p>
+  <ul>
+    <li><strong>Deep generic inference</strong> — immer's <code>Draft&lt;S&gt;</code> under a
+    reducer spread (three interacting mechanisms: method bivariance, spread dropping index
+    signatures, deferred conditional reduction) and Zod v4's <code>z.infer</code>.</li>
+    <li><strong>Control-flow narrowing depth</strong> — a few narrowing chains (aliased
+    conditions combined with deep optional chains) that tsc tracks further than ztsc does
+    yet.</li>
+    <li><strong>One lib-policy divergence</strong> — a case where ztsc's embedded-lib policy
+    differs from tsc's and the goldens pin the divergence deliberately.</li>
+  </ul>
+  <p>Everything else on this page is an <em>under</em>-report — a missed error, not a false
+  alarm. For an agent or CI gate, that asymmetry is deliberate: a bogus error sends a machine
+  off to "fix" correct code; a missed error is caught by the next tool in the chain. The
+  <a href="rationale.html">rationale</a> covers why that contract is the design center.</p>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <p class="eyebrow"><span class="n">04</span> · the smaller gaps</p>
+  <h2>Known leniencies, each in the safe direction</h2>
+  <ul>
+    <li><strong>tsconfig options beyond the subset</strong> — honored: <code>files</code> /
+    <code>include</code> / <code>exclude</code> / <code>extends</code>, and the
+    <code>compilerOptions</code> keys <code>lib</code>, <code>baseUrl</code>, <code>paths</code>,
+    <code>types</code>, <code>typeRoots</code>, <code>skipLibCheck</code> /
+    <code>skipDefaultLibCheck</code>, <code>allowJs</code>, <code>esModuleInterop</code>,
+    <code>allowSyntheticDefaultImports</code>, <code>noImplicitAny</code>,
+    <code>resolveJsonModule</code>. Strict mode only (<code>strict: false</code> is refused);
+    everything else is accepted and ignored, and <code>--verbose</code> lists which.</li>
+    <li><strong><code>lib</code> families other than <code>es*</code> and <code>dom*</code></strong>
+    (e.g. <code>webworker</code>) — ignored, with a note under <code>--verbose</code>.</li>
+    <li><strong>Generator corners</strong> — <code>yield*</code> delegation is unchecked, and
+    unannotated generator functions type as <code>any</code> (the full iteration protocol —
+    <code>for…of</code> over every DOM collection, <code>for await</code> with the sync-iterable
+    fallback — <em>is</em> checked).</li>
+    <li><strong>CommonJS corners</strong> — a namespace import of an <code>export =</code>
+    module keeps the export's call signature, so <code>ns()</code> is not flagged.</li>
+    <li><strong>Symbol-key corners</strong> — a plain non-<code>unique</code> <code>symbol</code>
+    key (rxjs's <code>[Symbol.observable]</code>) is keyed by name rather than as a symbol
+    index; a deeper-qualified <code>[a.b.c]</code> computed key stays out of subset.</li>
+    <li><strong>JSX corners</strong> — prop <em>type</em> mismatches arriving inside a spread
+    object, spreads of unions/generics/index-signature types, and children <em>value</em>
+    typing are unchecked; class-component prop mistakes report refined codes where tsgo
+    reports TS2769.</li>
+    <li><strong>Class-value instantiation expressions</strong> — <code>typeof C&lt;T&gt;</code>
+    applied to a class value under-reports.</li>
+    <li>A handful of other known edge cases miss an error the TypeScript compiler would
+    report; the conformance suite's <code>DEFERRED</code> ledger tracks 6 accepted divergences
+    explicitly rather than hiding them in the goldens.</li>
+  </ul>
+  <div class="note">
+    <p><strong>Check your own codebase in one command.</strong> <code>ztsc --census</code>
+    tallies every out-of-subset construct in your project by frequency — the same instrument
+    that decided what got built first (see the
+    <a href="rationale.html">measured-subset rationale</a>). If the census reads zero and the
+    tsconfig subset covers you, ztsc checks your project today.</p>
+  </div>
+</section>
+
+<footer class="sitefoot">
+  ztsc · MIT license ·
+  <a href="https://github.com/gustavoschmidt/ztsc">github.com/gustavoschmidt/ztsc</a>
+</footer>
+
+</div>
+</body>
+</html>

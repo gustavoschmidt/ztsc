@@ -15,8 +15,10 @@
   <div class="navlinks">
     <a href="./">overview</a>
     <a href="usage.html">usage</a>
+    <a href="benchmarks.html">benchmarks</a>
     <a href="internals.html">internals</a>
     <a href="rationale.html" aria-current="page">rationale</a>
+    <a href="limitations.html">limitations</a>
     <a href="https://github.com/gustavoschmidt/ztsc">github ↗</a>
   </div>
 </div></nav>
@@ -78,7 +80,7 @@
   memory model. Go's collector needs heap headroom — typically around 2× live data — and its
   AST and type objects are real heap objects: per-object headers, 64-bit pointers between them,
   allocation churn for the collector to chase. On the packages in the
-  <a href="./#benchmarks">benchmark</a>, tsgo peaks between 43 and 276&thinsp;MB; and its
+  <a href="benchmarks.html">benchmark</a>, tsgo peaks between 43 and 276&thinsp;MB; and its
   footprint <em>grows steeply</em> with its parallelism (drizzle-orm: 166&thinsp;→&thinsp;411&thinsp;MB
   from 1 to 8 checkers).</p>
   <p>ztsc's answer is that a checker's live data can be tiny if nothing about the design fights
@@ -117,7 +119,8 @@
       types are hash-consed into <code>TypeId</code>s once. Equality and cache keys are integer
       compares forever after.</li>
       <li><strong>Seal, then share.</strong> Each phase's output is frozen before the next phase
-      reads it — so all parallelism runs without a single lock.</li>
+      reads it — so the entire check phase runs without a single lock, and the front end's
+      only locks are a completion queue and the sharded string interner.</li>
     </ul>
   </div>
   <p>These reinforce each other: interning is only cheap because types are immutable;
@@ -161,7 +164,7 @@
   over that corpus reads <strong>zero</strong> in every bucket: the last residuals — drizzle's
   <code>this['_']</code> indexed access and a nested conditional in rxjs and hono — turned out to
   share one root, a speculation flag left set across a function type's return type, and went with
-  it. Correctness of what <em>is</em> checked is enforced differentially: a 622-case conformance
+  it. Correctness of what <em>is</em> checked is enforced differentially: a 630-case conformance
   suite validated against the pinned native TypeScript compiler (tsgo 7.0.2), down to error codes
   and positions.</p>
 </section>

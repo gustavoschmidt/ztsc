@@ -15,8 +15,10 @@
   <div class="navlinks">
     <a href="./">overview</a>
     <a href="usage.html" aria-current="page">usage</a>
+    <a href="benchmarks.html">benchmarks</a>
     <a href="internals.html">internals</a>
     <a href="rationale.html">rationale</a>
+    <a href="limitations.html">limitations</a>
     <a href="https://github.com/gustavoschmidt/ztsc">github ↗</a>
   </div>
 </div></nav>
@@ -44,7 +46,9 @@
 cd ztsc
 zig build -Doptimize=ReleaseFast   # -&gt; zig-out/bin/ztsc</code></pre>
   <p>A debug build is just <code>zig build</code>; <code>zig build test</code> runs the unit
-  tests and the 622-case differential conformance suite.</p>
+  tests and the 630-case differential conformance suite (validated against the pinned native
+  tsgo 7.0.2; the handful of deliberate divergences are tracked explicitly in a
+  <code>DEFERRED</code> ledger rather than baked into the goldens).</p>
 </section>
 
 <!-- ============================================================ -->
@@ -167,60 +171,17 @@ ztsc src/main.ts           # or explicit entry files</code></pre>
 <section id="limitations">
   <p class="eyebrow"><span class="n">05</span> · limitations</p>
   <h2>What it doesn't check yet</h2>
-  <p><strong>ztsc does not build or run on Windows yet.</strong> The checker's per-symbol state
-  lives in demand-zeroed anonymous memory obtained with POSIX <code>mmap</code> — untouched
-  pages never become resident, which is load-bearing for the memory numbers. Windows has an
-  exact equivalent (<code>VirtualAlloc</code> returns zero-initialized, demand-paged memory)
-  but it is not wired in yet, so a Windows target fails at compile time with a clear error.
-  macOS and Linux work today; a Windows port is planned.</p>
-  <p>ztsc checks a large, well-defined subset of strict-mode TypeScript: the full type-level
-  language (conditional types with <code>infer</code>, mapped types, template-literal types,
-  generics, narrowing, declaration merging), the real ES-core…esnext + DOM standard library
-  with the full iteration protocol (<code>for…of</code> over every DOM collection,
-  <code>for await</code> with the sync-iterable fallback), CommonJS interop, const-symbol
-  computed keys, and JSX against the real <code>@types/react</code>. What it checks, it checks
-  like the TypeScript compiler. Almost every gap below fails in the safe direction: ztsc misses
-  an error tsc would report rather than inventing one, and it never crashes. It is not yet a
-  drop-in replacement for <code>tsc --noEmit</code>: on a large production React/TypeScript
-  application it reproduces all 48 of tsc's errors byte-identically, and adds 10 false
-  positives of its own. On that same application it is also the faster tool —
-  0.40&thinsp;s and 219.6&thinsp;MB peak RSS against tsgo's 0.53&thinsp;s and 734&thinsp;MB,
-  both at their default four checkers.</p>
-  <p>What it does <strong>not</strong> check yet:</p>
-  <ul>
-    <li><strong>Watch mode and LSP</strong> — ztsc is batch-only; both are planned next, on an
-    architecture built for them.</li>
-    <li><strong>~10 known false positives on real code</strong> — deep generic inference (immer
-    <code>Draft&lt;S&gt;</code> under a reducer spread, Zod v4 <code>z.infer</code>), a few CFA
-    narrowing depths, and one lib-policy divergence. Each is diagnosed and tracked; the count is
-    measured against tsc on a large private codebase, not estimated.</li>
-    <li><strong>tsconfig options beyond the subset</strong> — honored: <code>files</code> /
-    <code>include</code> / <code>exclude</code> / <code>extends</code>, and the
-    <code>compilerOptions</code> keys <code>lib</code>, <code>baseUrl</code>, <code>paths</code>,
-    <code>types</code>, <code>typeRoots</code>, <code>skipLibCheck</code> /
-    <code>skipDefaultLibCheck</code>, <code>allowJs</code>, <code>esModuleInterop</code>,
-    <code>allowSyntheticDefaultImports</code>, <code>noImplicitAny</code>,
-    <code>resolveJsonModule</code>. Strict mode only (<code>strict: false</code> is refused);
-    everything else is accepted and ignored, and <code>--verbose</code> lists which.</li>
-    <li><strong><code>lib</code> families other than <code>es*</code> and <code>dom*</code></strong>
-    (e.g. <code>webworker</code>) — ignored, with a note under <code>--verbose</code>.</li>
-    <li><strong>Generator corners</strong>: <code>yield*</code> delegation is unchecked, and
-    unannotated generator functions type as <code>any</code>.</li>
-    <li><strong>CommonJS corners</strong>: a namespace import of an <code>export =</code>
-    module keeps the export's call signature, so <code>ns()</code> is not flagged.</li>
-    <li><strong>Symbol-key corners</strong>: a plain non-<code>unique</code> <code>symbol</code>
-    key (rxjs's <code>[Symbol.observable]</code>) is keyed by name rather than as a symbol
-    index.</li>
-    <li><strong>JSX corners</strong>: prop <em>type</em> mismatches arriving inside a spread
-    object, spreads of unions/generics/index-signature types, and children <em>value</em>
-    typing are unchecked; class-component prop mistakes report refined codes where tsgo
-    reports TS2769.</li>
-    <li>A handful of other known edge cases miss an error the TypeScript compiler would
-    report.</li>
-  </ul>
-  <p>Unsupported syntax produces a clear <em>"not yet supported"</em> diagnostic — never a
-  crash. Run <code>ztsc --census</code> on your project to get a frequency table of exactly
-  which unsupported constructs it contains.</p>
+  <p>ztsc is pre-release. The biggest gaps: <strong>no Windows</strong> (macOS and Linux work
+  today; a port is planned), <strong>no watch mode or LSP</strong> (batch only; both planned
+  next), a tsconfig subset (strict mode only — <code>strict: false</code> is refused), and
+  <strong>10 tracked false positives</strong> on the production dogfood application, against
+  all 48 of tsc's real errors reproduced byte-identically. Everything else fails in the safe
+  direction: ztsc misses an error tsc would report rather than inventing one, and unsupported
+  syntax produces a clear <em>"not yet supported"</em> diagnostic — never a crash.</p>
+  <p>Run <code>ztsc --census</code> on your project to get a frequency table of exactly which
+  unsupported constructs it contains.</p>
+  <p><a href="limitations.html">The full ledger: every gap, how it behaves today, and what's
+  planned →</a></p>
 </section>
 
 <footer class="sitefoot">

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Internals — how ztsc works</title>
-<meta name="description" content="A guided tour of ztsc's internals: the pipeline, the pointer-free data structures, the arena memory design, the lock-free parallelism, and the benchmarks.">
+<meta name="description" content="A guided tour of ztsc's internals: the architecture, the u32 decision, the pointer-free data structures, the arena memory design, and the parallelism — with the coordination story stated honestly.">
 <link rel="stylesheet" href="style.css">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='20' fill='%23eda100'/%3E%3Ctext x='50' y='74' font-size='68' font-family='monospace' font-weight='bold' text-anchor='middle' fill='%231c1b18'%3Ez%3C/text%3E%3C/svg%3E">
 </head>
@@ -15,8 +15,10 @@
   <div class="navlinks">
     <a href="./">overview</a>
     <a href="usage.html">usage</a>
+    <a href="benchmarks.html">benchmarks</a>
     <a href="internals.html" aria-current="page">internals</a>
     <a href="rationale.html">rationale</a>
+    <a href="limitations.html">limitations</a>
     <a href="https://github.com/gustavoschmidt/ztsc">github ↗</a>
   </div>
 </div></nav>
@@ -24,11 +26,13 @@
 <div class="wrap">
 
 <header class="hero">
-  <p class="eyebrow">ztsc 0.0.1-dev · 19 source files · 40,528 lines of zig 0.16 · real typescript 7.0.2 esnext + dom lib embedded</p>
+  <p class="eyebrow">ztsc 0.0.1-dev · 19 source files · 41,576 lines of zig 0.16 · real typescript 7.0.2 esnext + dom lib embedded</p>
   <h1>How ZTSC works</h1>
   <p class="sub">A guided tour of the <strong>Zig TypeScript Checker</strong> — a type checker (no JS emit)
   for a strict-mode TypeScript subset. The whole design serves one bet: <em>memory is where a
-  systems language beats a garbage-collected one</em>, and speed follows from the same choices.</p>
+  systems language beats a garbage-collected one</em>, and speed follows from the same choices.
+  This page explains <em>how</em>; the numbers themselves live on the
+  <a href="benchmarks.html">benchmarks page</a>.</p>
 
   <div class="stats">
     <div class="stat">
@@ -48,31 +52,26 @@
     </div>
     <div class="stat">
       <div class="k">conformance</div>
-      <div class="v">622/622</div>
+      <div class="v">630/630</div>
       <div class="c">differential cases (error code + line) vs the native TypeScript compiler, tsgo 7.0.2</div>
     </div>
   </div>
-  <figcaption>@types/node 22.7.4 — 59 files / 49.6k lines of published declarations, Apple M4,
-  both tools at their default 4 checkers. Real packages, identical inputs — see the honest
-  caveats in the scoreboard section before quoting.</figcaption>
 </header>
 
 <!-- ============================================================ -->
 <section>
-  <p class="eyebrow"><span class="n">01</span> · the pipeline</p>
+  <p class="eyebrow"><span class="n">01</span> · the architecture</p>
   <h2>One pass, three parallel regimes</h2>
-  <p>ZTSC is a batch pipeline. Files are discovered from the entry points by a
-  <strong>single-owner completion-queue scheduler</strong>: each file's front end (load, parse —
-  which tokenizes as it goes — and bind) runs as one task on the worker pool, and the
-  <code>import</code> specifiers and
-  triple-slash <code>/// &lt;reference&gt;</code> directives it surfaces queue new file tasks
-  immediately — no barrier between "waves", so one huge file can't stall the rest of the graph.
-  Module resolution is memoized per <code>(importer&nbsp;dir, specifier)</code> — including a
-  negative cache — so a bare specifier imported from a hundred files walks
-  <code>node_modules</code> once. Once discovery drains, a serial <em>link</em> step builds sealed
-  import/export tables, merges cross-file global declarations, and registers ambient modules;
-  then the program is partitioned by estimated cost (greedy by AST size) across
-  <strong>N independent checker instances</strong> that read everything lock-free.</p>
+  <p>ZTSC is a batch pipeline with three distinct concurrency regimes. First, a <strong>parallel
+  front end</strong>: files are discovered from the entry points, and each file's front end
+  (load, parse — which tokenizes as it goes — and bind) runs as one task on a worker pool. The
+  <code>import</code> specifiers and triple-slash <code>/// &lt;reference&gt;</code> directives a
+  file surfaces queue new file tasks immediately — no barrier between "waves", so one huge file
+  can't stall the rest of the graph. Second, once discovery drains, a <strong>serial resolve +
+  link</strong> step builds sealed import/export tables, merges cross-file global declarations,
+  and registers ambient modules. Third, the program is partitioned across <strong>N independent
+  checker instances</strong> that read everything without locks and never write anything another
+  checker reads.</p>
 
   <figure>
     <div class="figbox">
@@ -149,7 +148,7 @@
     </svg>
     </div>
     <figcaption>Phase timings from one <code>--timing</code> run on the multi corpus (93k lines,
-    re-measured 2026-07-26 with the real lib — now sharded into 12 blobs — loaded):
+    re-measured 2026-07-26 with the real lib — sharded into 12 blobs — loaded):
     <strong>31.1&thinsp;ms end to end</strong>.
     Per-phase ms are aggregate time-in-phase summed across the 10-worker pool, so the overlapping
     front-end phases sum to more than the wall; bind is the largest single phase. Diagnostics are
@@ -157,20 +156,39 @@
     N</strong>.</figcaption>
   </figure>
 
-  <p>The safety story is <strong>immutability boundaries, not locks</strong>: parse output is frozen
-  before bind reads it; bind output is frozen before check reads it. The only shared mutable
-  structure in the whole program is the string interner, and it is sharded.</p>
-</section>
+  <h3>How the front end coordinates — the honest lock inventory</h3>
+  <p>Discovery is driven by a <strong>single-owner completion-queue scheduler</strong>: the main
+  thread owns the module graph and the seen-set outright, workers own their file task, and the
+  two sides communicate over an unbounded FIFO channel — a plain mutex-and-condition queue in
+  <code>main.zig</code>. Workers push "file done, here are its import specifiers"; the main
+  thread pops, resolves each specifier (memoized per <code>(importer&nbsp;dir, specifier)</code>
+  with a negative cache, so a bare specifier imported from a hundred files walks
+  <code>node_modules</code> once), and enqueues newly discovered files. No graph state is ever
+  touched by two threads.</p>
+  <p>So the precise claim is not "no locks anywhere" — it is that locks are confined to two
+  small, cold structures, and the hot paths have none:</p>
+  <ul>
+    <li><strong>The completion queue</strong> — the mutex-and-condition channel above. Touched
+    once per file, not per node; its buffer lives in its own arena and is only handled under
+    the lock.</li>
+    <li><strong>The string interner</strong> — the one shared mutable structure in the program,
+    sharded 16 ways by string hash with a mutex per shard, so two threads contend only when
+    they hash into the same shard at the same moment.</li>
+    <li><strong>Everything else — including the entire check phase — takes no locks at
+    all.</strong> The mechanism is <em>immutability boundaries</em>: parse output is frozen
+    before bind reads it, bind output is frozen before check reads it, and the N checkers share
+    only sealed data. There is also no lock hiding in the allocator, because there is no malloc
+    path — allocation is a per-thread arena bump.</li>
+  </ul>
 
-<!-- ============================================================ -->
-<section>
-  <p class="eyebrow"><span class="n">02</span> · one struct per stage</p>
-  <h2>The pipeline, as data</h2>
-  <p>Every stage of the pipeline is a pure function from one sealed struct to the next. Each
-  struct is plain data — slices of integers, no pointers, no methods that mutate — produced by
-  exactly one phase, frozen at its seal boundary, and read immutably by everything downstream.
-  The handoff chain <em>is</em> the architecture: what a phase is allowed to know is exactly what
-  its input struct holds.</p>
+  <h3>The pipeline, as data</h3>
+  <p>Every stage is a pure function from one sealed struct to the next — plain data, slices of
+  integers, produced by exactly one phase, frozen at its seal boundary, read immutably by
+  everything downstream. The handoff chain <em>is</em> the architecture: what a phase is allowed
+  to know is exactly what its input struct holds
+  (<code>ARCHITECTURE.md</code> codifies this as a functional core of pure phase functions
+  around one imperative shell, <code>main.zig</code>, which owns every thread, timer, and
+  arena).</p>
 
   <div class="tablewrap">
   <table>
@@ -187,228 +205,66 @@
   </table>
   </div>
 
-  <p>To make the handoffs concrete, here is one file traced through every struct. The program is
-  a deliberate one-liner with a type error:</p>
-  <pre><code>// demo.ts
-const n: number = "hi";</code></pre>
-
-  <h3>load → Source (source.zig)</h3>
-  <pre><code>pub const Source = struct {
-    path: []const u8,         // "demo.ts"
-    bytes: []const u8,        // the 24 raw bytes, mmapped read-only — never copied
-    line_starts: []const u32, // [0] — one line; line/col computed lazily from this
-    backing: Backing,         // .mapped (mmap) | .owned (arena fallback) | .borrowed
-};</code></pre>
-  <p>The file's bytes stay OS-owned pages for the whole run. Everything downstream refers to them
-  by <code>u32</code> byte offset; <code>line_starts</code> turns an offset back into line:column
-  only when a diagnostic is actually printed.</p>
-
-  <h3>scan → Tokens (scanner.zig)</h3>
-  <pre><code>pub const Tokens = struct {
-    tags:   []const Tag, // 1 B/token
-    starts: []const u32, // 4 B/token · bit 31 = "newline before" (drives ASI)
-};</code></pre>
-  <p>There is no separate tokenize pass: the parser pulls tokens from
-  <code>scanner.Scanner</code> as it goes and materializes exactly this pair of arrays into
-  <code>Ast.tokens</code>, which is what the binder and everything downstream read.
-  For <code>demo.ts</code> the two arrays hold eight entries — 5 bytes per token, and no
-  <em>end</em> offsets stored (they're recomputed by rescanning the token when needed):</p>
-  <pre><code>index    0              1           2      3           4    5               6          7
-tags     keyword_const  identifier  colon  identifier  eq   string_literal  semicolon  eof
-starts   0              6           7      9           16   18              22         23</code></pre>
-
-  <h3>parse → Ast (ast.zig)</h3>
-  <pre><code>pub const NodeItem = struct {
-    tag: Tag,               // 1 B — 160+ node kinds
-    main_token: TokenIndex, // 4 B — index into Tokens (position comes from here)
-    data: Data,             // { lhs: u32, rhs: u32 } — meaning depends on tag
-};
-
-pub const Ast = struct {
-    tokens: scanner.Tokens,
-    nodes: std.MultiArrayList(NodeItem).Slice, // SoA: tag[], main_token[], data[]
-    extra_data: []const u32,                   // variable-length children, by range
-    diagnostics: []const Diagnostic,           // parse errors (code + span)
-};</code></pre>
-  <p>The demo file becomes five nodes (indices illustrative — exact order follows parse order;
-  node 0 is always <code>root</code>). Note how each tag's doc comment in <code>ast.zig</code>
-  states its <code>lhs</code>/<code>rhs</code> layout — <code>declarator_full</code> keeps the
-  name in <code>lhs</code> and points <code>rhs</code> into <code>extra_data</code> for its
-  <code>{type, init}</code> pair, because two fields can't hold three children:</p>
-  <pre><code>node  tag              main_token  data                     meaning
-0     root             0           extra range → [4]        one top-level statement
-1     identifier       3           —                        the type annotation `number`
-2     string_literal   5           —                        the initializer "hi"
-3     identifier       1           —                        the name `n`
-4     var_decl_one     0 (const)   lhs = 5                  one-declarator declaration
-5     declarator_full  1           lhs = 3, rhs = extra →   `n: number = "hi"`
-                                   DeclaratorFull{ type_node: 1, init: 2 }</code></pre>
-
-  <h3>bind → Bind (binder.zig)</h3>
-  <pre><code>pub const Bind = struct {
-    // symbols — SoA, index 0 reserved
-    symbol_names:  []const Atom,        // interned name per symbol
-    symbol_flags:  []const SymbolFlags, // packed u32 bitset (const_decl, class, …)
-    symbol_scopes: []const ScopeId,
-    symbol_decls_start: []const u32,    // symbol i's decl nodes =
-    symbol_decls:  []const Node,        //   decls[start[i]..start[i+1]]
-
-    // scopes — SoA, 0 = file scope; members sorted by atom per segment
-    scope_parents: []const ScopeId,
-    scope_kinds:   []const ScopeKind,
-    scope_members_start: []const u32,
-    member_atoms:  []const Atom,        // lookup = binary search, 8 B/member
-    member_syms:   []const SymbolId,
-
-    // flow graph — SoA, 0 = none, 1 = shared unreachable
-    flow_tags: []const FlowTag,         // start / assign / cond_true / branch_label…
-    flow_a: []const u32,                // antecedent (or extra range start)
-    flow_b: []const u32,                // AST node (or extra range end)
-    flow_map_nodes: []const Node,       // identifier read → flow id, sorted;
-    flow_map_ids:   []const FlowId,     //   8 B per *reference*, not per node
-
-    imports: []const ImportRec,         // for the linker
-    exports: []const ExportRec,
-    // this file's global contributions (empty for a typical app module —
-    // the linker then skips the file entirely)
-    global_atoms: []const Atom,
-    global_syms:  []const SymbolId,
-    ambient_modules: []const AmbientModule, // declare module "spec" { … } blocks
-};</code></pre>
-  <p>For the demo: one symbol (<code>names[1] = atom("n")</code>,
-  <code>flags[1] = .{ .const_decl = true }</code>, scope 0, decls → node 5), one member entry in
-  the file scope's segment, and a two-node flow graph — <code>start</code>, then
-  <code>assign</code> whose antecedent is <code>start</code> and whose <code>b</code> is the
-  declarator node. When the checker later asks "what is <code>n</code> here?", it walks this
-  flow chain backwards to the assignment.</p>
-
-  <h3>resolve + link → Program (resolve.zig, modules.zig)</h3>
-  <pre><code>pub const ProgFile = struct {      // one file's sealed front-end artifacts
-    path: []const u8,
-    src:  []const u8,
-    tree: *const Ast,
-    bind: *const Bind,
-    specs: SpecMap,                // import specifier atom → FileId
-};
-
-pub const Program = struct {
-    files: []const ProgFile,
-    sym_base: []const u32,         // prefix sums: global sym id = sym_base[file] + local id
-    links: []const FileLinks,      // per file: sorted import/export → Target tables
-    globals: Globals,              // lib + script global names, atom-sorted
-    merged: []const MergedSym,     // cross-file declaration merges
-    ambient_exports: []const AmbientExport, // declare module "spec" export tables
-};</code></pre>
-  <p>This is the one struct the check phase receives. For single-file <code>demo.ts</code> it is
-  nearly empty scaffolding (<code>files.len&nbsp;=&nbsp;2</code> counting the embedded lib,
-  <code>sym_base&nbsp;=&nbsp;[0,&nbsp;lib_syms,&nbsp;lib_syms+2]</code>); in a real project the
-  <code>links</code> tables answer "this import binding resolves to that file's export" in one
-  binary search, and <code>merged</code> holds names like <code>NodeJS</code> that two-plus files
-  reopened — a symbol-table overlay referencing the sealed per-file <code>Bind</code>s by
-  <code>(file,&nbsp;sym)</code>, never copying them.</p>
-
-  <h3>check → Store + Diag (types.zig, checker.zig)</h3>
-  <pre><code>pub const Store = struct {         // per checker instance — private, no locks
-    kinds:  std.ArrayList(Kind),   // u8: union_type / object / function / ref / …
-    data_a: std.ArrayList(u32),    // fixed payload, meaning depends on kind
-    data_b: std.ArrayList(u32),
-    extra:  std.ArrayList(u32),    // members / props / params, by range
-    map: std.HashMapUnmanaged(TypeId, void, MapCtx, 80), // hash-consing table
-};</code></pre>
-  <p>Checking the declarator asks two questions of the store. The annotation <code>number</code>
-  is a fixed intrinsic — <code>TypeId&nbsp;=&nbsp;8</code>, no work at all. The initializer
-  interns <code>string_literal</code> with <code>a&nbsp;=&nbsp;atom("hi")</code>,
-  <code>b&nbsp;=&nbsp;fresh</code> — the first non-fixed type this checker makes
-  (<code>first_free_index</code>). Then
-  <code>isAssignable(literal,&nbsp;number)</code> says no, memoized on the <code>(TypeId, TypeId)</code>
-  pair, and the checker emits its diagnostic struct — note it differs from the front end's
-  2-byte-coded <code>diagnostics.Diagnostic</code> by carrying a tsc code and a rendered
-  message:</p>
-  <pre><code>pub const Diag = struct {   // checker.zig
-    code: u16,              // 2322
-    file: FileId,           // demo.ts
-    span: Span,             // { start: 18, end: 22 } — the "hi" bytes
-    msg: []const u8,        // Type 'string' is not assignable to type 'number'.
-};</code></pre>
-
-  <h3>report → render.zig</h3>
-  <p><code>renderPretty</code> joins the two ends of the chain: the <code>Diag</code>'s span plus
-  the original <code>Source</code>'s <code>line_starts</code> produce the tsc-style excerpt —
-  file, line:col, code frame, caret under bytes 18–22. Nothing in between ever stored a line
-  number.</p>
-  <pre><code>demo.ts:1:19 - error TS2322: Type 'string' is not assignable to type 'number'.
-
-1 const n: number = "hi";
-                    ~~~~</code></pre>
-
-  <p>Two things to notice across all six structs. Every cross-stage reference is a
-  <code>u32</code> index into a sealed array — token index, node index, atom, symbol id, flow id,
-  file id, type id — so "follow an edge" is always an array subscript, never a pointer chase.
-  And each struct stores only what its stage learned: positions live in <code>Tokens</code>,
-  structure in <code>Ast</code>, names in <code>Bind</code>, wiring in <code>Program</code>,
-  meaning in <code>Store</code> — nothing is duplicated forward, which is why the whole 93k-line
-  corpus fits in 19.2&thinsp;MB of heap.</p>
+  <p>Two properties hold across every one of these structs. Every cross-stage reference is a
+  <code>u32</code> index into a sealed array — token index, node index, atom, symbol id, flow
+  id, file id, type id — so "follow an edge" is always an array subscript, never a pointer
+  chase. And each struct stores only what its stage learned: positions live in
+  <code>Tokens</code>, structure in <code>Ast</code>, names in <code>Bind</code>, wiring in
+  <code>Program</code>, meaning in <code>Store</code> — nothing is duplicated forward, which is
+  why a 93k-line corpus fits in 19.2&thinsp;MB of heap.</p>
 </section>
 
 <!-- ============================================================ -->
 <section>
-  <p class="eyebrow"><span class="n">03</span> · source map</p>
-  <h2>Where everything lives</h2>
-  <p>Nineteen files under <code>src/</code>, one responsibility each, ordered here as data flows
-  through them. The checker is the biggest file by far — types and their relations are where a
-  type checker earns its keep — and it has grown to 18k lines as the type-level language
-  (conditional, mapped, template-literal types) landed.</p>
-
-  <div class="tablewrap">
-  <table>
-    <thead><tr><th>file</th><th>role</th><th class="num">lines</th><th></th></tr></thead>
-    <tbody>
-      <tr><td><code>main.zig</code></td><td>CLI driver, thread pool, single-owner discovery scheduler, phase timers and counters</td><td class="num">1,670</td><td><span class="locbar" style="width:9px"></span></td></tr>
-      <tr><td><code>tsconfig.zig</code></td><td>tsconfig.json subset: <code>files</code>, <code>include</code>/<code>exclude</code> globs, <code>paths</code></td><td class="num">1,909</td><td><span class="locbar" style="width:10px"></span></td></tr>
-      <tr><td><code>source.zig</code></td><td>file loading via mmap, packed segments for small files, line tables, spans</td><td class="num">362</td><td><span class="locbar" style="width:2px"></span></td></tr>
-      <tr><td><code>intern.zig</code></td><td>global string interner: text → <code>Atom</code> (u32), sharded, thread-safe</td><td class="num">358</td><td><span class="locbar" style="width:2px"></span></td></tr>
-      <tr><td><code>scanner.zig</code></td><td>tokenizer — full TS token set incl. JSX, fuzzed, never crashes</td><td class="num">1,431</td><td><span class="locbar" style="width:8px"></span></td></tr>
-      <tr><td><code>ast.zig</code></td><td>struct-of-arrays node storage, <code>extra_data</code>, node tags</td><td class="num">1,334</td><td><span class="locbar" style="width:7px"></span></td></tr>
-      <tr><td><code>parser.zig</code></td><td>recursive descent → AST, error recovery, out-of-subset → <code>unsupported</code> nodes</td><td class="num">5,045</td><td><span class="locbar" style="width:27px"></span></td></tr>
-      <tr><td><code>binder.zig</code></td><td>symbols, scope tree, control-flow graph, global-contribution slices</td><td class="num">3,661</td><td><span class="locbar" style="width:20px"></span></td></tr>
-      <tr><td><code>paths.zig</code></td><td>lexical path predicates and algebra — pure string work, no filesystem access</td><td class="num">214</td><td><span class="locbar" style="width:1px"></span></td></tr>
-      <tr><td><code>resolve.zig</code></td><td>specifier → file path: bundler-style lookup, <code>exports</code> maps, <code>///</code> references, resolution + filesystem caches</td><td class="num">1,660</td><td><span class="locbar" style="width:9px"></span></td></tr>
-      <tr><td><code>modules.zig</code></td><td>the program contract — <code>FileId</code>, <code>Program</code>, <code>ProgFile</code> — plus the linker: export/import tables, cross-file merging, ambient modules</td><td class="num">1,563</td><td><span class="locbar" style="width:8px"></span></td></tr>
-      <tr><td><code>libs.zig</code></td><td>embedded lib shards: <code>lib</code>-list → blob set, synthetic paths, atom seeding</td><td class="num">247</td><td><span class="locbar" style="width:1px"></span></td></tr>
-      <tr><td><code>types.zig</code></td><td>type representation, <code>TypeId</code>, hash-consing, canonical unions, frozen-base/overlay split</td><td class="num">1,604</td><td><span class="locbar" style="width:9px"></span></td></tr>
-      <tr><td><code>zeropage.zig</code></td><td>demand-zeroed fixed arrays over <code>MAP_ANONYMOUS</code> — backs the checkers' per-symbol state</td><td class="num">106</td><td><span class="locbar" style="width:1px"></span></td></tr>
-      <tr class="hl"><td><code>checker.zig</code></td><td>assignability, inference, narrowing, generics, conditional/mapped/template types, JSX — the semantics</td><td class="num">18,446</td><td><span class="locbar" style="width:100px"></span></td></tr>
-      <tr><td><code>diagnostics.zig</code></td><td>front-end error codes (tsc-compatible where feasible)</td><td class="num">177</td><td><span class="locbar" style="width:1px"></span></td></tr>
-      <tr><td><code>report.zig</code></td><td>pure formatting for <code>--timing</code>/<code>--memory</code>/<code>--census</code> — measurement stays in main.zig</td><td class="num">426</td><td><span class="locbar" style="width:2px"></span></td></tr>
-      <tr><td><code>render.zig</code></td><td>pretty tsc-style output: excerpts, carets, colors</td><td class="num">272</td><td><span class="locbar" style="width:1px"></span></td></tr>
-      <tr><td><code>root.zig</code></td><td>library root — re-exports the modules above</td><td class="num">43</td><td><span class="locbar" style="width:1px"></span></td></tr>
-    </tbody>
-  </table>
-  </div>
-  <p>Non-Zig sources ship inside the binary: the <strong>real TypeScript 7.0.2 lib</strong>,
-  flattened by <code>src/lib/gen_lib.js</code> and <strong>sharded into twelve
-  <code>@embedFile</code> blobs</strong> so the worker pool can parse and bind them in parallel
-  rather than serializing on one giant file — the <code>lib.esnext</code> reference chain across
-  four shards (<code>lib.esnext.0&#8211;3.d.ts</code>, 87 <code>lib.*.d.ts</code> files; ES core
-  through esnext; DOM/webworker/scripthost excluded; <strong>14,096 lines / ~626&thinsp;KB</strong>)
-  and the DOM chain across eight shards (<code>lib.dom.0&#8211;7.d.ts</code> —
-  <code>dom</code> + <code>dom.iterable</code> + <code>dom.asynciterable</code>;
-  <strong>45,178 lines / ~2.35&thinsp;MB</strong>), plus a small ztsc-authored
-  <code>console</code> shim (<code>lib.console.d.ts</code>) for the DOM-less backend config. The
-  tsconfig <code>lib</code> option selects blobs (default = ES core + DOM, matching tsgo);
-  <code>--noLib</code> skips them. It replaced an earlier 220-line
-  hand-trimmed surface, and <code>--census</code> over it reports zero out-of-subset
-  constructs. <code>bench/</code> holds the corpus generator, the real-package fetcher
-  (<code>fetch_real.sh</code>) and the end-to-end harnesses; <code>test/</code> holds the
-  conformance runner with 622 differential cases against the pinned native tsgo 7.0.2. A good reading order for the
-  code is exactly the table above, top to bottom; <code>ARCHITECTURE.md</code> at the repo root
-  states the contract those files are held to — a functional core of pure phase functions around
-  an imperative shell (<code>main.zig</code>) that owns every thread, timer and arena.</p>
+  <p class="eyebrow"><span class="n">02</span> · the u32 decision</p>
+  <h2>Why everything is a u32</h2>
+  <p>Every identifier in the system — token index, AST node, interned string
+  (<code>Atom</code>), <code>SymbolId</code>, <code>ScopeId</code>, <code>FlowId</code>,
+  <code>FileId</code>, <code>TypeId</code> — is the same type: a <code>u32</code> index into a
+  flat array. That is a deliberate point in a three-way trade, and it's worth spelling out
+  because the whole memory story rests on it:</p>
+  <ul>
+    <li><strong>Why not <code>u64</code> (or pointers, which are u64 in disguise)?</strong>
+    Doubling the index width doubles every id-bearing array and halves how many ids fit in a
+    64-byte cache line — 16 as <code>u32</code>, 8 as <code>u64</code> — for address space no
+    real program needs. Four billion nodes-per-file, types-per-checker, or interned strings is
+    orders of magnitude beyond the largest inputs ztsc will ever see. A 64-bit pointer costs the
+    same 8 bytes and is <em>worse</em>: it pins objects to addresses (so structures can't be
+    relocated or mmap-backed freely) and every dereference is a potential cache miss into
+    scattered heap.</li>
+    <li><strong>Why not <code>u16</code>?</strong> It genuinely overflows: 65,535 is smaller
+    than the token count of a single big published file — csstype's one
+    <code>index.d.ts</code> is 21k <em>lines</em> of dense union types, several times that in
+    tokens. Per-file, per-program, and per-checker id spaces all blow through 16 bits on real
+    inputs.</li>
+    <li><strong>Alignment falls out for free.</strong> A <code>u32</code> array is naturally
+    aligned with zero padding, and because storage is struct-of-arrays, mixed-width fields never
+    pad each other either: a node's 1-byte tag lives in a <code>u8</code> array, its 4-byte
+    token and 8-byte payload in their own arrays — 13 bytes of true data per node instead of a
+    16-or-24-byte padded struct. When a bit is needed, it's taken from the index itself rather
+    than a new field: bit 31 of a token's start offset is the "newline before" flag that drives
+    ASI, and spare high bits carry similar flags elsewhere — the payload stays one word.</li>
+    <li><strong>Integer ids compose into cache keys.</strong> Two <code>u32</code>s pack into
+    one <code>u64</code>, so the assignability memo is keyed on a
+    <code>(TypeId,&nbsp;TypeId)</code> pair packed into a single word, and the binder's
+    duplicate detection keys on <code>(scope&nbsp;&lt;&lt;&nbsp;32)&nbsp;|&nbsp;atom</code> —
+    one hash-map probe, no tuple hashing, no allocation.</li>
+  </ul>
+  <p>The same move is applied to <em>values</em>, not just positions, via interning. A string is
+  looked up once in the global interner and is an <code>Atom</code> forever after — every later
+  name comparison in the binder, linker, and checker is an integer compare, never a byte
+  compare. Types go further: the type store <strong>hash-conses</strong> every type it builds,
+  so structurally identical types get the same <code>TypeId</code>, type equality <em>is</em>
+  <code>id1&nbsp;==&nbsp;id2</code>, and every downstream cache (assignability, instantiation,
+  expression types) gets small, uniform integer keys. Section 05 shows that machinery.</p>
+  <p>The one discipline this buys its costs with: <code>0</code> is the universal "none". Node 0
+  is always the root and the root is never anyone's child, so optional references need no
+  <code>maxInt</code> sentinels and no option types bloating the arrays.</p>
 </section>
 
 <!-- ============================================================ -->
 <section>
-  <p class="eyebrow"><span class="n">04</span> · the ast</p>
+  <p class="eyebrow"><span class="n">03</span> · the ast</p>
   <h2>No pointers, anywhere</h2>
   <p>The AST is modeled on the Zig compiler's own — a proven data-oriented design. A node is not an
   object; it is a <code>u32</code> <em>index</em>. Storage is <strong>struct-of-arrays</strong>
@@ -464,36 +320,32 @@ pub const Program = struct {
       <rect class="cell" x="614" y="226" width="24" height="24"/><rect class="cell" x="640" y="226" width="24" height="24"/><rect class="cell" x="666" y="226" width="24" height="24" stroke="var(--accent)" stroke-width="1.6"/><rect class="cell" x="692" y="226" width="24" height="24" stroke="var(--accent)" stroke-width="1.6"/><rect class="cell" x="718" y="226" width="24" height="24" stroke="var(--accent)" stroke-width="1.6"/><rect class="cell" x="744" y="226" width="24" height="24"/><rect class="cell" x="770" y="226" width="24" height="24"/><rect class="cell" x="796" y="226" width="24" height="24"/><rect class="cell" x="822" y="226" width="24" height="24"/><rect class="cell" x="848" y="226" width="24" height="24"/><rect class="cell" x="874" y="226" width="24" height="24"/>
       <text class="t11 mut" x="702" y="270" text-anchor="middle">children as a [start, end) range</text>
 
-      <text class="t11 dim" x="480" y="304">13 B fixed + amortized extra_data = <tspan class="acc" font-weight="700">16.06 B/node measured</tspan> <tspan class="mut">(--memory)</tspan></text>
+      <text class="t11 dim" x="480" y="304">13 B fixed + amortized extra_data = <tspan class="acc" font-weight="700">16.24 B/node measured</tspan> <tspan class="mut">(--memory)</tspan></text>
     </svg>
     </div>
     <figcaption>One node = one column across the parallel arrays. Walking siblings is a linear
     scan through memory the prefetcher loves, not a pointer chase. Tokens use the same trick:
     a <code>u8</code> tag array plus a <code>u32</code> start-offset array — <strong>5 bytes per
-    token</strong>; line/column is computed lazily from a per-file line-offset table, never stored.</figcaption>
+    token</strong>, with no <em>end</em> offsets stored (they're recomputed by rescanning the
+    token when needed); line/column is computed lazily from a per-file line-offset table, never
+    stored.</figcaption>
   </figure>
 
-  <p>Three details worth knowing before reading <code>ast.zig</code>:</p>
-  <ul>
-    <li><strong>The zero sentinel.</strong> Node 0 is always the root and the root is never anyone's
-    child, so <code>0</code> means "none" for optional nodes, extra-data indices and token
-    references alike. No <code>maxInt</code> sentinels, no option types bloating the arrays.</li>
-    <li><strong>Strings are interned once, globally.</strong> Identifier and string-literal text
-    becomes an <code>Atom</code> (<code>u32</code>); every later phase compares atoms, never bytes.</li>
-    <li><strong>Out-of-subset syntax parses into an <code>unsupported</code> node</strong> spanning
-    its token range, tagged with <em>which</em> construct it is (the census feeds on this), paired
-    with a clear diagnostic — never a wrong answer, never a crash (every phase is fuzzed).</li>
-  </ul>
+  <p>There is no separate tokenize pass — the parser pulls tokens from the scanner as it goes
+  and materializes the token arrays as a side effect. Out-of-subset syntax parses into an
+  <code>unsupported</code> node spanning its token range, tagged with <em>which</em> construct
+  it is (the <code>--census</code> flag feeds on this), paired with a clear diagnostic — never a
+  wrong answer, never a crash (every phase is fuzzed).</p>
 </section>
 
 <!-- ============================================================ -->
 <section>
-  <p class="eyebrow"><span class="n">05</span> · the binder</p>
+  <p class="eyebrow"><span class="n">04</span> · the binder</p>
   <h2>Symbols, scopes and flow — same discipline</h2>
   <p>The binder produces three things per file, all in the AST's flat-array style: a
   <strong>symbol table</strong>, a <strong>scope tree</strong>, and a <strong>control-flow
   graph</strong> that the checker later walks for narrowing. It costs
-  <strong>33.0 bytes per source line</strong>, and its output is sealed immutable the moment
+  <strong>32.2 bytes per source line</strong>, and its output is sealed immutable the moment
   binding finishes.</p>
   <ul>
     <li><strong>One hash map per file, not per scope.</strong> While binding, inserts and
@@ -509,20 +361,21 @@ pub const Program = struct {
     <code>cond_true</code>/<code>cond_false</code>, branch and loop labels. Single-antecedent joins
     collapse and never allocate. Flow ids attach to identifier reads through a compact sorted
     (node, flow) map — 8 bytes per <em>reference</em> rather than 4 bytes for every node.</li>
-    <li><strong>Global contributions are pay-per-use.</strong> Each <code>Bind</code> carries
-    a slice of the names this file contributes to the <em>global</em> scope — the whole top level
+    <li><strong>Global contributions are pay-per-use.</strong> Each file's bind output carries
+    a slice of the names it contributes to the <em>global</em> scope — the whole top level
     for a script or the lib, only <code>declare global</code> blocks for a module — plus its
     <code>declare module "spec"</code> ambient blocks. For a typical app module both slices are
     empty and the linker's cross-file merge skips the file entirely, so
     <code>@types/node</code>-style declaration merging costs nothing on code that doesn't use
     it. This layer passed its real-world acceptance test: checking against the actual
-    published <code>@types/node</code>, ztsc's cross-file merge diagnostics match the pinned tsgo 7.0.2 oracle.</li>
+    published <code>@types/node</code>, ztsc's cross-file merge diagnostics match the pinned
+    tsgo 7.0.2 oracle.</li>
   </ul>
 </section>
 
 <!-- ============================================================ -->
 <section>
-  <p class="eyebrow"><span class="n">06</span> · types</p>
+  <p class="eyebrow"><span class="n">05</span> · types</p>
   <h2>A type is a u32, too</h2>
   <p>Types live in a struct-of-arrays store shaped exactly like the AST: a <code>TypeId</code> is a
   <code>u32</code> index, fixed payloads sit in parallel arrays, variable payloads (union members,
@@ -556,7 +409,7 @@ pub const Program = struct {
       <text class="t12" x="666" y="84"><tspan class="acc" font-weight="700">TypeId 42</tspan> → union</text>
       <text class="t11 mut" x="666" y="103">members in extra: [object #17, null]</text>
       <text class="t11 mut" x="666" y="121">immutable · arena-allocated ·</text>
-      <text class="t11 mut" x="666" y="136">never freed · 28.3 B/type measured</text>
+      <text class="t11 mut" x="666" y="136">never freed · 28.1 B/type measured</text>
 
       <text class="t12 dim" x="470" y="192">t1 == t2  ⇔  id1 == id2 — type equality is an integer compare</text>
       <text class="t11 mut" x="470" y="216">assignability memoized on (TypeId, TypeId) · instantiations memoized · expression types cached per (node, context)</text>
@@ -564,7 +417,7 @@ pub const Program = struct {
     </div>
     <figcaption>The intern map hashes a type's <em>shape</em> — kind plus payload words with
     extra-ranges dereferenced — so identical contents at different offsets still unify. On the
-    multi corpus interning leaves just <strong>0.27 types per source line</strong>. The
+    multi corpus interning leaves just <strong>0.22 types per source line</strong>. The
     expression-type cache is keyed on <em>(node, contextual type)</em>, not the node alone —
     a hard-won correctness fix: a first-check-wins cache silently returned stale answers when
     overload resolution re-checked an argument under a different context.</figcaption>
@@ -582,24 +435,25 @@ pub const Program = struct {
   also why embedding the full 14k-line lib barely moved RSS: only the touched surface ever
   interns. Object-literal "freshness" for excess-property checks is one flag bit that participates
   in interning, so no side table is needed.</p>
-  <p>The checker itself (<code>checker.zig</code>, the largest file at 11k lines) implements
-  structural assignability, inference, declared-overload resolution, control-flow narrowing
-  (truthiness, <code>typeof</code>, equality, <code>in</code>, <code>instanceof</code>,
+  <p>The checker itself (<code>checker.zig</code>, by far the largest file at 19k lines)
+  implements structural assignability, inference, declared-overload resolution, control-flow
+  narrowing (truthiness, <code>typeof</code>, equality, <code>in</code>, <code>instanceof</code>,
   discriminants, assignments), user-defined type guards and assertion functions, enums,
   accessors, <code>as const</code>/<code>satisfies</code>, <code>this</code>-typing, TC39
   decorators with signature checks, <code>unique symbol</code>, <code>import()</code> types,
-  async/await/<code>Promise</code> typing, the <code>Symbol.iterator</code> protocol, JSX element
-  typing — and the type-level core: <strong>conditional types with
-  <code>infer</code> and distributivity, mapped types with <code>as</code> key remapping,
-  template-literal types and the string intrinsics, indexed access and <code>keyof</code> over
-  generics, recursive aliases</strong>, and call/construct signatures in interfaces and type
-  literals. Generic instantiation is memoized with depth limits so that machinery can't
-  blow up. All of it matches the TypeScript compiler's <em>observable</em> behavior, verified differentially.</p>
+  instantiation expressions, async/await/<code>Promise</code> typing, the
+  <code>Symbol.iterator</code> protocol, JSX element typing — and the type-level core:
+  <strong>conditional types with <code>infer</code> and distributivity, mapped types with
+  <code>as</code> key remapping, template-literal types and the string intrinsics, indexed
+  access and <code>keyof</code> over generics, recursive aliases</strong>, and call/construct
+  signatures in interfaces and type literals. Generic instantiation is memoized with depth
+  limits so that machinery can't blow up. All of it matches the TypeScript compiler's
+  <em>observable</em> behavior, verified differentially.</p>
 </section>
 
 <!-- ============================================================ -->
 <section>
-  <p class="eyebrow"><span class="n">07</span> · memory</p>
+  <p class="eyebrow"><span class="n">06</span> · memory</p>
   <h2>Allocation lifetime = phase lifetime</h2>
   <p>There is no general-purpose heap churn in ZTSC. The rule, followed
   everywhere: <strong>one arena per lifetime, and no per-object frees, ever</strong>. Every
@@ -690,11 +544,12 @@ pub const Program = struct {
 </section>
 
 <!-- ============================================================ -->
-<section>
-  <p class="eyebrow"><span class="n">08</span> · parallelism</p>
-  <h2>N checkers, zero locks, one answer</h2>
+<section id="parallelism">
+  <p class="eyebrow"><span class="n">07</span> · parallelism</p>
+  <h2>N checkers, no shared mutable state, one answer</h2>
   <p>The front end is embarrassingly parallel: one task per file on a
-  <code>std.Thread.Pool</code>, each task owning its own arenas. The interesting part is the check
+  <code>std.Thread.Pool</code>, each task owning its own arenas, coordinated only through the
+  completion queue described in section 01. The interesting part is the check
   phase, which borrows tsgo's key trick: <strong>partition the program's files across N
   independent checker instances</strong> (default <code>min(4,&nbsp;cores)</code>, matching tsgo) — by
   estimated cost (AST node count) <em>and</em> import locality, so one giant file doesn't leave
@@ -709,13 +564,15 @@ pub const Program = struct {
   pre-verified and its diagnostics are never surfaced, <code>--skip-default-lib-check</code>
   (tsc's <code>skipDefaultLibCheck</code>; also the tsconfig <code>skipLibCheck</code> /
   <code>skipDefaultLibCheck</code> keys) drops it back out of the partitions for pure time and
-  memory savings — on zod's DOM config that alone cuts the check phase 2.4×. Each checker owns a
-  private type
-  store and private caches, and reads the sealed AST/binder/link data freely. The cost is that
-  checkers re-derive some types their siblings also built; the payoff is parallelism with no
-  synchronization at all.</p>
-  <p>That duplication is the project's main <strong>speed/memory dial</strong>, and it is measured
-  rather than guessed:</p>
+  memory savings — on zod's DOM config that alone cuts the check phase 2.4×.</p>
+  <p>During the check phase itself, a checker takes <strong>no locks</strong>: each owns a
+  private type store and private caches, writes nothing any other checker reads, and reads only
+  the sealed AST/binder/link data. The cost of that independence is <em>duplicated
+  inference</em>: when two checkers' partitions both import the same file, each re-derives the
+  types of the exports it touches — the linker's sealed tables tell every checker <em>where</em>
+  an import points, but the <em>meaning</em> of that target is computed per checker, lazily, in
+  its own store. That duplication is the project's main <strong>speed/memory dial</strong>, and
+  it is measured rather than guessed:</p>
 
   <figure>
     <div class="figbox">
@@ -751,16 +608,22 @@ pub const Program = struct {
     and <code>--checkers=8</code> remains available for the extra speed.</figcaption>
   </figure>
 
+  <p>Sharing a type store between checkers would erase that duplication — and it was seriously
+  designed and then measured out: only about a quarter of types are shareable in principle, the
+  savings are noise at this scale, and the price would be synchronization on the hottest
+  structure in the program. The <a href="rationale.html">rationale's negative-results
+  section</a> keeps that record.</p>
   <p>Determinism is a hard guarantee, not a hope: every diagnostic is tagged with its file, each
   file is checked by exactly one checker, output is printed per file in discovery order,
   position-sorted, and even rendered type <em>display order</em> is structural rather than
   id-dependent. The conformance suite asserts <strong>byte-identical output for any
-  N</strong>.</p>
+  N</strong> — and a standing repeat-run gate asserts the checker's work counters don't depend
+  on traversal order either, which is what makes the parallelism dial honest.</p>
 </section>
 
 <!-- ============================================================ -->
 <section>
-  <p class="eyebrow"><span class="n">09</span> · synthesis</p>
+  <p class="eyebrow"><span class="n">08</span> · synthesis</p>
   <h2>Why it's fast (and small)</h2>
   <p>Nothing in ZTSC is exotic. The performance comes from five decisions applied with total
   consistency — the same discipline in the AST, the binder, the types and the module graph:</p>
@@ -779,271 +642,104 @@ pub const Program = struct {
       become <code>TypeId</code>s once. Equality checks and cache keys are integer compares for
       the rest of the run.</li>
       <li><strong>Seal, then share.</strong> Each phase's output is frozen before the next phase
-      reads it, so all parallelism — worker pool and N checkers — runs without a single lock.</li>
+      reads it — so the check phase runs without a single lock, and the front end's only locks
+      are the completion queue and the sharded interner.</li>
     </ul>
   </div>
   <p>Notice these reinforce each other: interning only works cheaply because types are immutable;
-  immutability is natural because arenas never free; lock-free parallelism is safe because
+  immutability is natural because arenas never free; lock-free checking is safe because
   everything is sealed; and small nodes are possible because indices replaced pointers. It's one
   idea — <em>data-oriented design</em> — expressed five ways. Laziness is the sixth, quieter
   decision: named types expand only when touched, per-symbol state pages in only when faulted —
-  which is how a 12k-line embedded lib costs almost nothing on a project that uses a fraction of
-  it.</p>
+  which is how embedding the real 14k-line lib costs almost nothing on a project that uses a
+  fraction of it.</p>
 </section>
 
 <!-- ============================================================ -->
 <section>
-  <p class="eyebrow"><span class="n">10</span> · scoreboard</p>
-  <h2>The numbers</h2>
-  <p>The benchmark moved from synthetic corpora to <strong>real, published packages</strong>:
-  <code>bench/fetch_real.sh</code> vendors each package's shipped <code>.d.ts</code> at a
-  pinned version, writes a strict <code>tsconfig.json</code> into it, and both tools check
-  identical inputs through <code>-p</code>. Measured 2026-07-26 on Apple M4 (10 cores,
-  32&thinsp;GB): ztsc 0.0.1-dev (ReleaseFast, native binary) vs <strong>tsgo 7.0.2</strong> (the
-  native arm64 TypeScript 7 compiler, invoked directly — no Node host in the measurement). Wall clock is the median of 11 runs timed with a monotonic nanosecond timer around the
-  whole process — so small-package ratios are real, not timer rounding; peak RSS is the median
-  of 5 runs under <code>/usr/bin/time&nbsp;-l</code>. One warm-up per configuration; both tools
-  at their default 4 checker instances.</p>
-
-  <figure>
-    <div class="figbox">
-    <svg viewBox="0 0 940 482" role="img" aria-label="Two-panel grouped bar chart across eight real packages at the default four checkers. Left panel, peak resident memory: ztsc uses 8 to 24 megabytes, tsgo 43 to 276 megabytes &#8212; ztsc is 6 to 21 percent of tsgo on every package. Right panel, wall clock: ztsc takes 8 to 31 milliseconds, tsgo 19 to 247 milliseconds &#8212; ztsc is 9 to 58 percent of tsgo's time.">
-      <rect x="20" y="12" width="12" height="12" rx="2" fill="var(--c-ztsc)"/>
-      <text class="t11 mut" x="38" y="22">ztsc</text>
-      <rect x="78" y="12" width="12" height="12" rx="2" fill="var(--c-tsgo)"/>
-      <text class="t11 mut" x="96" y="22">tsgo 7.0.2</text>
-      <text class="t12 dim" x="210" y="22">peak RSS · MB · lower is better</text>
-      <text class="t12 dim" x="620" y="22">wall clock · ms</text>
-      <line class="hairv" x1="590" y1="34" x2="590" y2="442"/>
-
-      <text class="t12 dim" x="195" y="64" text-anchor="end">@types/node</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 16.9 MB · 17% of tsgo" x="210" y="44" width="18" height="14" rx="2"/>
-      <text class="barlabel" x="236" y="55">17 <tspan class="acc">· 17%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 101.7 MB" x="210" y="61" width="107" height="14" rx="2"/>
-      <text class="barlabel" x="325" y="72">102</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 14.5 ms · 31% of tsgo" x="620" y="44" width="16" height="14" rx="2"/>
-      <text class="barlabel" x="644" y="55">15 <tspan class="acc">· 31%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 46.9 ms" x="620" y="61" width="51" height="14" rx="2"/>
-      <text class="barlabel" x="679" y="72">47</text>
-      <text class="t12 dim" x="195" y="116" text-anchor="end">@types/react</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 21.8 MB · 12% of tsgo" x="210" y="96" width="23" height="14" rx="2"/>
-      <text class="barlabel" x="241" y="107">22 <tspan class="acc">· 12%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 185.2 MB" x="210" y="113" width="195" height="14" rx="2"/>
-      <text class="barlabel" x="413" y="124">185</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 28.2 ms · 11% of tsgo" x="620" y="96" width="31" height="14" rx="2"/>
-      <text class="barlabel" x="659" y="107">28 <tspan class="acc">· 11%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 247.2 ms" x="620" y="113" width="270" height="14" rx="2"/>
-      <text class="barlabel" x="898" y="124">247</text>
-      <text class="t12 dim" x="195" y="168" text-anchor="end">drizzle-orm</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 17.3 MB · 6% of tsgo" x="210" y="148" width="18" height="14" rx="2"/>
-      <text class="barlabel" x="236" y="159">17 <tspan class="acc">· 6%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 275.7 MB" x="210" y="165" width="290" height="14" rx="2"/>
-      <text class="barlabel" x="508" y="176">276</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 21.5 ms · 9% of tsgo" x="620" y="148" width="23" height="14" rx="2"/>
-      <text class="barlabel" x="651" y="159">22 <tspan class="acc">· 9%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 238.1 ms" x="620" y="165" width="260" height="14" rx="2"/>
-      <text class="barlabel" x="888" y="176">238</text>
-      <text class="t12 dim" x="195" y="220" text-anchor="end">hono</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 23.5 MB · 15% of tsgo" x="210" y="200" width="25" height="14" rx="2"/>
-      <text class="barlabel" x="243" y="211">24 <tspan class="acc">· 15%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 155.2 MB" x="210" y="217" width="163" height="14" rx="2"/>
-      <text class="barlabel" x="381" y="228">155</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 31.3 ms · 18% of tsgo" x="620" y="200" width="34" height="14" rx="2"/>
-      <text class="barlabel" x="662" y="211">31 <tspan class="acc">· 18%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 172.1 ms" x="620" y="217" width="188" height="14" rx="2"/>
-      <text class="barlabel" x="816" y="228">172</text>
-      <text class="t12 dim" x="195" y="272" text-anchor="end">@sinclair/typebox</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 13.4 MB · 17% of tsgo" x="210" y="252" width="14" height="14" rx="2"/>
-      <text class="barlabel" x="232" y="263">13 <tspan class="acc">· 17%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 78.6 MB" x="210" y="269" width="83" height="14" rx="2"/>
-      <text class="barlabel" x="301" y="280">79</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 16.5 ms · 34% of tsgo" x="620" y="252" width="18" height="14" rx="2"/>
-      <text class="barlabel" x="646" y="263">17 <tspan class="acc">· 34%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 49.2 ms" x="620" y="269" width="54" height="14" rx="2"/>
-      <text class="barlabel" x="682" y="280">49</text>
-      <text class="t12 dim" x="195" y="324" text-anchor="end">ajv</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 10.3 MB · 21% of tsgo" x="210" y="304" width="11" height="14" rx="2"/>
-      <text class="barlabel" x="229" y="315">10 <tspan class="acc">· 21%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 49.5 MB" x="210" y="321" width="52" height="14" rx="2"/>
-      <text class="barlabel" x="270" y="332">50</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 13.9 ms · 58% of tsgo" x="620" y="304" width="15" height="14" rx="2"/>
-      <text class="barlabel" x="643" y="315">14 <tspan class="acc">· 58%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 23.9 ms" x="620" y="321" width="26" height="14" rx="2"/>
-      <text class="barlabel" x="654" y="332">24</text>
-      <text class="t12 dim" x="195" y="376" text-anchor="end">zod</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 20.7 MB · 15% of tsgo" x="210" y="356" width="22" height="14" rx="2"/>
-      <text class="barlabel" x="240" y="367">21 <tspan class="acc">· 15%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 136.1 MB" x="210" y="373" width="143" height="14" rx="2"/>
-      <text class="barlabel" x="361" y="384">136</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 26.0 ms · 17% of tsgo" x="620" y="356" width="28" height="14" rx="2"/>
-      <text class="barlabel" x="656" y="367">26 <tspan class="acc">· 17%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 154.6 ms" x="620" y="373" width="169" height="14" rx="2"/>
-      <text class="barlabel" x="797" y="384">155</text>
-      <text class="t12 dim" x="195" y="428" text-anchor="end">chalk</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 7.7 MB · 18% of tsgo" x="210" y="408" width="8" height="14" rx="2"/>
-      <text class="barlabel" x="226" y="419">8 <tspan class="acc">· 18%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 43.4 MB" x="210" y="425" width="46" height="14" rx="2"/>
-      <text class="barlabel" x="264" y="436">43</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 7.5 ms · 41% of tsgo" x="620" y="408" width="8" height="14" rx="2"/>
-      <text class="barlabel" x="636" y="419">8 <tspan class="acc">· 41%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 18.5 ms" x="620" y="425" width="20" height="14" rx="2"/>
-      <text class="barlabel" x="648" y="436">19</text>
-      <text class="t11 mut" x="20" y="468">median of 11 wall runs (monotonic ns timer) and 5 RSS runs · Apple M4 · defaults</text>
-    </svg>
-    </div>
-    <figcaption>Validators, web frameworks, an ORM, and the big <code>@types</code> packages, both
-    tools at the default 4 checkers and both type-checking their default lib: ztsc's peak memory is
-    <strong>6–21% of tsgo's</strong> and its wall clock <strong>9–58%</strong> — faster
-    <em>and</em> smaller on every package. The highest time ratios are the two <em>smallest</em>
-    packages (ajv, chalk) and <code>@sinclair/typebox</code>: at that size both tools sit near their
-    process floors — ztsc's ~7.5–14&thinsp;ms is dominated by startup plus its embedded lib front
-    end, which it now type-checks by default just like tsgo (parsed, bound, and checked;
-    <code>--skip-default-lib-check</code> skips the check for a slightly lower floor), tsgo's floor
-    is ~18&thinsp;ms. On everything bigger ztsc is <strong>3.0–11× faster</strong>. hono and zod
-    list <code>dom</code> in their tsconfig, so ztsc parses, binds, and checks the 2.35&thinsp;MB
-    DOM lib too — that front end is why their ratios sit near 17–18% rather than the low single
-    digits of drizzle or react. Sweeping <code>--checkers</code> 1→8 makes the memory gap starker:
-    tsgo's RSS climbs steeply with checker count (drizzle-orm 166&thinsp;→&thinsp;411&thinsp;MB)
-    while ztsc's barely moves (15&thinsp;→&thinsp;18&thinsp;MB) — ztsc's entire range stays below
-    tsgo's leanest single-checker run on every package.</figcaption>
-  </figure>
+  <p class="eyebrow"><span class="n">09</span> · source map</p>
+  <h2>Where everything lives</h2>
+  <p>Nineteen files under <code>src/</code>, one responsibility each, ordered here as data flows
+  through them. The checker is the biggest file by far — types and their relations are where a
+  type checker earns its keep — and it has grown to 19k lines as the type-level language
+  (conditional, mapped, template-literal types, instantiation expressions) landed.</p>
 
   <div class="tablewrap">
   <table>
-    <thead><tr><th>package</th><th class="num">files / lines</th><th class="num">wall ztsc / tsgo</th><th class="num">wall vs tsgo</th><th class="num">peak RSS ztsc / tsgo</th><th class="num">rss vs tsgo</th></tr></thead>
+    <thead><tr><th>file</th><th>role</th><th class="num">lines</th><th></th></tr></thead>
     <tbody>
-      <tr><td>@types/node 22.7.4</td><td class="num">59 / 49.6k</td><td class="num">15 / 47 ms</td><td class="num">31%</td><td class="num">16.9 / 101.7 MB</td><td class="num">17%</td></tr>
-      <tr><td>@types/react 18.3.11</td><td class="num">6 / 64.1k</td><td class="num">28 / 247 ms</td><td class="num">11%</td><td class="num">21.8 / 185.2 MB</td><td class="num">12%</td></tr>
-      <tr><td>drizzle-orm 0.33.0</td><td class="num">288 / 12.6k</td><td class="num">22 / 238 ms</td><td class="num">9%</td><td class="num">17.3 / 275.7 MB</td><td class="num">6%</td></tr>
-      <tr><td>hono 4.6.3</td><td class="num">165 / 6.3k</td><td class="num">31 / 172 ms</td><td class="num">18%</td><td class="num">23.5 / 155.2 MB</td><td class="num">15%</td></tr>
-      <tr><td>@sinclair/typebox 0.33.12</td><td class="num">241 / 3.1k</td><td class="num">17 / 49 ms</td><td class="num">34%</td><td class="num">13.4 / 78.6 MB</td><td class="num">17%</td></tr>
-      <tr><td>ajv 8.17.1</td><td class="num">107 / 1.8k</td><td class="num">14 / 24 ms</td><td class="num">58%</td><td class="num">10.3 / 49.5 MB</td><td class="num">21%</td></tr>
-      <tr><td>zod 3.23.8</td><td class="num">24 / 1.6k</td><td class="num">26 / 155 ms</td><td class="num">17%</td><td class="num">20.7 / 136.1 MB</td><td class="num">15%</td></tr>
-      <tr><td>chalk 5.3.0</td><td class="num">5 / 612</td><td class="num">8 / 19 ms</td><td class="num">41%</td><td class="num">7.7 / 43.4 MB</td><td class="num">18%</td></tr>
+      <tr><td><code>main.zig</code></td><td>CLI driver, thread pool, single-owner discovery scheduler, phase timers and counters</td><td class="num">1,713</td><td><span class="locbar" style="width:9px"></span></td></tr>
+      <tr><td><code>tsconfig.zig</code></td><td>tsconfig.json subset: <code>files</code>, <code>include</code>/<code>exclude</code> globs, <code>paths</code></td><td class="num">1,918</td><td><span class="locbar" style="width:10px"></span></td></tr>
+      <tr><td><code>source.zig</code></td><td>file loading via mmap, packed segments for small files, line tables, spans</td><td class="num">362</td><td><span class="locbar" style="width:2px"></span></td></tr>
+      <tr><td><code>intern.zig</code></td><td>global string interner: text → <code>Atom</code> (u32), sharded, thread-safe</td><td class="num">358</td><td><span class="locbar" style="width:2px"></span></td></tr>
+      <tr><td><code>scanner.zig</code></td><td>tokenizer — full TS token set incl. JSX, fuzzed, never crashes</td><td class="num">1,431</td><td><span class="locbar" style="width:8px"></span></td></tr>
+      <tr><td><code>ast.zig</code></td><td>struct-of-arrays node storage, <code>extra_data</code>, node tags</td><td class="num">1,366</td><td><span class="locbar" style="width:7px"></span></td></tr>
+      <tr><td><code>parser.zig</code></td><td>recursive descent → AST, error recovery, out-of-subset → <code>unsupported</code> nodes</td><td class="num">5,190</td><td><span class="locbar" style="width:27px"></span></td></tr>
+      <tr><td><code>binder.zig</code></td><td>symbols, scope tree, control-flow graph, global-contribution slices</td><td class="num">3,671</td><td><span class="locbar" style="width:19px"></span></td></tr>
+      <tr><td><code>paths.zig</code></td><td>lexical path predicates and algebra — pure string work, no filesystem access</td><td class="num">214</td><td><span class="locbar" style="width:1px"></span></td></tr>
+      <tr><td><code>resolve.zig</code></td><td>specifier → file path: bundler-style lookup, <code>exports</code> maps, <code>///</code> references, resolution + filesystem caches</td><td class="num">1,854</td><td><span class="locbar" style="width:10px"></span></td></tr>
+      <tr><td><code>modules.zig</code></td><td>the program contract — <code>FileId</code>, <code>Program</code>, <code>ProgFile</code> — plus the linker: export/import tables, cross-file merging, ambient modules</td><td class="num">1,574</td><td><span class="locbar" style="width:8px"></span></td></tr>
+      <tr><td><code>libs.zig</code></td><td>embedded lib shards: <code>lib</code>-list → blob set, synthetic paths, atom seeding</td><td class="num">247</td><td><span class="locbar" style="width:1px"></span></td></tr>
+      <tr><td><code>types.zig</code></td><td>type representation, <code>TypeId</code>, hash-consing, canonical unions, frozen-base/overlay split</td><td class="num">1,647</td><td><span class="locbar" style="width:9px"></span></td></tr>
+      <tr><td><code>zeropage.zig</code></td><td>demand-zeroed fixed arrays over <code>MAP_ANONYMOUS</code> — backs the checkers' per-symbol state</td><td class="num">106</td><td><span class="locbar" style="width:1px"></span></td></tr>
+      <tr class="hl"><td><code>checker.zig</code></td><td>assignability, inference, narrowing, generics, conditional/mapped/template types, JSX — the semantics</td><td class="num">18,975</td><td><span class="locbar" style="width:100px"></span></td></tr>
+      <tr><td><code>diagnostics.zig</code></td><td>front-end error codes (tsc-compatible where feasible)</td><td class="num">177</td><td><span class="locbar" style="width:1px"></span></td></tr>
+      <tr><td><code>report.zig</code></td><td>pure formatting for <code>--timing</code>/<code>--memory</code>/<code>--census</code> — measurement stays in main.zig</td><td class="num">458</td><td><span class="locbar" style="width:2px"></span></td></tr>
+      <tr><td><code>render.zig</code></td><td>pretty tsc-style output: excerpts, carets, colors</td><td class="num">272</td><td><span class="locbar" style="width:1px"></span></td></tr>
+      <tr><td><code>root.zig</code></td><td>library root — re-exports the modules above</td><td class="num">43</td><td><span class="locbar" style="width:1px"></span></td></tr>
     </tbody>
   </table>
   </div>
-
-  <h3>The synthetic corpora, for continuity</h3>
-  <p>The generated corpora that carried the project's earlier tuning still run — ztsc and tsgo
-  re-measured 2026-07-26 with the same monotonic-ns protocol as the package table above. tsc 5.5.4
-  was retired from the ongoing bench scripts, so its rows are the 2026-07-14 figures it retired on;
-  tsgo is the baseline that matters:</p>
-  <div class="tablewrap">
-  <table>
-    <thead><tr><th>corpus</th><th>tool</th><th class="num">wall</th><th class="num">peak RSS</th><th class="num">rss vs tsgo</th></tr></thead>
-    <tbody>
-      <tr class="hl"><td>medium · 50 files / 50k lines</td><td>ztsc</td><td class="num">20.8 ms</td><td class="num">23.7 MB</td><td class="num">22%</td></tr>
-      <tr><td></td><td>tsgo</td><td class="num">47.2 ms</td><td class="num">109.5 MB</td><td class="num">100%</td></tr>
-      <tr><td></td><td>tsc 5.5.4</td><td class="num">0.59 s</td><td class="num">224.4 MB</td><td class="num">205%</td></tr>
-      <tr class="hl"><td>multi · 201 files / 93k lines</td><td>ztsc</td><td class="num">33.6 ms</td><td class="num">40.7 MB</td><td class="num">21%</td></tr>
-      <tr><td></td><td>tsgo</td><td class="num">79.1 ms</td><td class="num">194.2 MB</td><td class="num">100%</td></tr>
-      <tr><td></td><td>tsc 5.5.4</td><td class="num">0.91 s</td><td class="num">316.3 MB</td><td class="num">163%</td></tr>
-    </tbody>
-  </table>
-  </div>
-
-  <h3>The per-byte accounting behind the RSS number</h3>
-  <p>From a <code>--memory</code> run on the multi corpus (N=4, real lib loaded, lib check off so the type figures are user-code only, 2026-07-26 — medians of 15 runs):</p>
-  <div class="tablewrap">
-  <table>
-    <thead><tr><th>metric</th><th class="num">value</th><th>note</th></tr></thead>
-    <tbody>
-      <tr><td>bytes / token</td><td class="num">5.00</td><td>u8 tag + u32 start, SoA</td></tr>
-      <tr><td>bytes / AST node</td><td class="num">16.24</td><td>target was ≤ 24</td></tr>
-      <tr><td>binder bytes / line</td><td class="num">32.19</td><td>symbols + scopes + flow graph + records</td></tr>
-      <tr><td>bytes / type</td><td class="num">28.08</td><td>hash-consed, arena-allocated</td></tr>
-      <tr><td>types / source line</td><td class="num">0.22</td><td>interning at work</td></tr>
-      <tr><td>relation cache hit rate</td><td class="num">52.7%</td><td>assignability memo on <code>(TypeId, TypeId)</code> pairs</td></tr>
-      <tr><td>instantiation cache hit rate</td><td class="num">30.0%</td><td>generic-instantiation memo</td></tr>
-      <tr><td>node_types cache hit rate</td><td class="num">7.2%</td><td>contextual-keyed expression-type cache</td></tr>
-      <tr><td>total heap (arenas + interner)</td><td class="num">19.2 MB</td><td>~187 bytes per source line, all-in — down from 45.5 MB / 508 before the arena-slack paydown</td></tr>
-    </tbody>
-  </table>
-  </div>
-
-  <div class="note">
-    <p><strong>Read before quoting.</strong> These are throughput and memory measurements on
-    identical inputs — not a diagnostic-parity claim:</p>
-    <p>ztsc checks a <em>subset</em> (against the real ES-core + DOM lib), so its diagnostic
-    output differs from tsgo's on real code; correctness is tracked separately by the 622-case
-    differential conformance suite validated against the TypeScript compiler. Packages are
-    vendored without their dependencies — nonzero exit is expected, and both tools fully parse,
-    bind, and check every file regardless. Wall clock is timed around the whole
-    process, so the ratios are real down to the smallest packages — but at the 7–24&thinsp;ms
-    scale both tools are effectively instant, and the ratio mostly reflects fixed startup
-    costs. Single machine, single OS — no Linux numbers yet.</p>
-  </div>
+  <p>Non-Zig sources ship inside the binary: the <strong>real TypeScript 7.0.2 lib</strong>,
+  flattened by <code>src/lib/gen_lib.js</code> and <strong>sharded into twelve
+  <code>@embedFile</code> blobs</strong> so the worker pool can parse and bind them in parallel
+  rather than serializing on one giant file — the <code>lib.esnext</code> reference chain across
+  four shards (<code>lib.esnext.0&#8211;3.d.ts</code>, 87 <code>lib.*.d.ts</code> files; ES core
+  through esnext; DOM/webworker/scripthost excluded; <strong>14,096 lines / ~626&thinsp;KB</strong>)
+  and the DOM chain across eight shards (<code>lib.dom.0&#8211;7.d.ts</code> —
+  <code>dom</code> + <code>dom.iterable</code> + <code>dom.asynciterable</code>;
+  <strong>45,178 lines / ~2.35&thinsp;MB</strong>), plus a small ztsc-authored
+  <code>console</code> shim (<code>lib.console.d.ts</code>) for the DOM-less backend config. The
+  tsconfig <code>lib</code> option selects blobs (default = ES core + DOM, matching tsgo);
+  <code>--noLib</code> skips them. It replaced an earlier 220-line
+  hand-trimmed surface, and <code>--census</code> over it reports zero out-of-subset
+  constructs. <code>bench/</code> holds the corpus generator, the real-package fetcher
+  (<code>fetch_real.sh</code>) and the end-to-end harnesses; <code>test/</code> holds the
+  conformance runner with 630 differential cases against the pinned native tsgo 7.0.2. A good reading order for the
+  code is exactly the table above, top to bottom; <code>ARCHITECTURE.md</code> at the repo root
+  states the contract those files are held to — a functional core of pure phase functions around
+  an imperative shell (<code>main.zig</code>) that owns every thread, timer and arena.</p>
 </section>
 
 <!-- ============================================================ -->
 <section>
-  <p class="eyebrow"><span class="n">11</span> · scope</p>
+  <p class="eyebrow"><span class="n">10</span> · scope</p>
   <h2>What it checks, and what's left</h2>
   <p>The subset has grown from "real-shaped code" to nearly the whole type-level language.
   Strict-mode semantics only (<code>strictNullChecks</code> always on):</p>
   <p>
-    <span class="chip">primitives + literal types</span><span class="chip">objects / interfaces / aliases</span><span class="chip">arrays + tuples</span><span class="chip">unions + intersections</span><span class="chip">discriminated unions</span><span class="chip">function inference + overload resolution</span><span class="chip">generics + inference</span><span class="chip">conditional types + infer</span><span class="chip">mapped types + as remapping</span><span class="chip">template-literal types + intrinsics</span><span class="chip">keyof / T[K] / typeof over generics</span><span class="chip">recursive aliases</span><span class="chip">classes + accessors + abstract</span><span class="chip">flow narrowing</span><span class="chip">enums + const enum</span><span class="chip">namespaces + merging</span><span class="chip">as const / satisfies</span><span class="chip">type guards + assertions</span><span class="chip">this-typing</span><span class="chip">decorators (TC39)</span><span class="chip">unique symbol</span><span class="chip">import() types</span><span class="chip">call + construct signatures</span><span class="chip">async/await + generators</span><span class="chip">iteration protocol (for…of / for await)</span><span class="chip">JSX (.tsx) from @types/react</span><span class="chip">JSX spread attributes</span><span class="chip">real typescript 7.0.2 esnext lib</span><span class="chip">commonjs interop (export = / require)</span><span class="chip">DOM lib (tsconfig lib)</span><span class="chip">ES modules + .d.ts</span><span class="chip">cross-file declaration merging</span><span class="chip">declare global / module augmentation</span><span class="chip">/// references + ambient modules</span><span class="chip">tsconfig subset (include/exclude, paths)</span>
+    <span class="chip">primitives + literal types</span><span class="chip">objects / interfaces / aliases</span><span class="chip">arrays + tuples</span><span class="chip">unions + intersections</span><span class="chip">discriminated unions</span><span class="chip">function inference + overload resolution</span><span class="chip">generics + inference</span><span class="chip">conditional types + infer</span><span class="chip">mapped types + as remapping</span><span class="chip">template-literal types + intrinsics</span><span class="chip">keyof / T[K] / typeof over generics</span><span class="chip">instantiation expressions</span><span class="chip">recursive aliases</span><span class="chip">classes + accessors + abstract</span><span class="chip">flow narrowing</span><span class="chip">enums + const enum</span><span class="chip">namespaces + merging</span><span class="chip">as const / satisfies</span><span class="chip">type guards + assertions</span><span class="chip">this-typing</span><span class="chip">decorators (TC39)</span><span class="chip">unique symbol</span><span class="chip">import() types</span><span class="chip">call + construct signatures</span><span class="chip">async/await + generators</span><span class="chip">iteration protocol (for…of / for await)</span><span class="chip">JSX (.tsx) from @types/react</span><span class="chip">JSX spread attributes</span><span class="chip">real typescript 7.0.2 esnext lib</span><span class="chip">commonjs interop (export = / require)</span><span class="chip">DOM lib (tsconfig lib)</span><span class="chip">ES modules + .d.ts</span><span class="chip">cross-file declaration merging</span><span class="chip">declare global / module augmentation</span><span class="chip">/// references + ambient modules</span><span class="chip">tsconfig subset (include/exclude, paths)</span>
   </p>
   <p>That growth is measured, not asserted. Every out-of-subset construct is tagged at parse time,
   so <code>--census</code> over a vendored real-world corpus (2,945 published <code>.d.ts</code>
   files, ~131k lines — @types/node, @types/react, @types/lodash, rxjs, drizzle-orm, zod, hono, …)
   is a frequency table of what's missing. The first census counted 2,287 unsupported constructs,
-  half of them conditional types and <code>infer</code>; today <strong>every type-level
-  bucket reads zero</strong>, and CommonJS interop (<code>export =</code>,
-  <code>import&nbsp;=&nbsp;require</code>) has landed as well, and computed property keys
-  now parse and check — bare const-symbol keys (drizzle's <code>[entityKind]</code>,
-  typebox's <code>[Kind]</code>) and member-expression keys (node's
-  <code>[EventEmitter.captureRejectionSymbol]</code>, <code>[promisify.custom]</code>) alike.
-  The census now reads <strong>zero across the board</strong>: the last residual — eight
-  parse-recovery artifacts blamed on two unsupported <em>type</em> forms (drizzle's
-  <code>this['_']</code> indexed access, a nested conditional in rxjs and hono) — was one
-  bug, a speculation flag left set across a function type's return type, not a subset gap
-  at all. The acceptance bar was the real, published
-  <code>@types/node</code>: ztsc's cross-file merge diagnostics match the TypeScript compiler on it (pinned tsgo 7.0.2 oracle).</p>
-  <p>What remains out for v0.0.1 is a short, deliberate list: a couple of lenient
-  CommonJS corners that degrade to <code>any</code> instead of erroring,
-  <strong>generator leniencies</strong> (the full iteration protocol is checked —
-  <code>for…of</code> over every DOM collection incl. <code>URLSearchParams</code>/<code>Headers</code>/<code>FormData</code>,
-  <code>for await</code> over <code>AsyncIterable</code>/<code>AsyncGenerator</code> with the
-  awaited sync fallback — but <code>yield*</code> delegation is unchecked and unannotated
-  generator functions type as <code>any</code>), <strong>symbol-key leniencies</strong> (computed keys —
-  bare <code>[entityKind]</code> and member-expression
-  <code>[EventEmitter.captureRejectionSymbol]</code> alike — are checked with full
-  cross-file nominal identity, but a plain non-<code>unique</code> <code>symbol</code> key
-  is matched by name and a deeper-qualified <code>[a.b.c]</code> key stays out of subset),
-  <strong>JSX leniencies</strong> (the <code>JSX</code> namespace resolves from the real
-  <code>@types/react</code> and spread attributes are checked, but prop-type mismatches
-  arriving <em>inside</em> a spread object, spreads of unions/generics, and children
-  <em>value</em> typing under-report rather than erroring), and <strong>watch mode / LSP</strong>
-  — both planned next, on the sealed-phase architecture that was designed not to preclude them.
-  Unsupported syntax still produces a clear <em>"not supported"</em> diagnostic — never a wrong
-  answer, never a crash — and in the handful of known miss cases ztsc under-reports rather than
-  inventing errors on valid code.</p>
-  <p>Everything before release is done: the semantic breadth, the instantiation discipline, the
-  type-level core, a correctness-debt paydown, the real lib and the real <code>@types/node</code>
-  acceptance, the substrate experiments, and pre-publish polish — MIT license, a NOTICE crediting
-  Microsoft's TypeScript (Apache-2.0) for the embedded lib and diagnostic strings, and the
-  README/benchmark rewrite. What's left is the ship itself: v0.0.1 as a working
-  <code>bunx ztsc</code>.</p>
-
-  <div class="note">
-    <p><strong>Negative results, preserved.</strong> Two optimizations were seriously pursued
-    and <em>measured out</em> — recorded in <code>EXPERIMENTS.md</code> so the economics are easy
-    to re-check later. The <strong>frozen-base lib payload</strong> (pre-expand the whole lib once
-    into the shared base store) was built, verified byte-identical against the old binary across
-    17 projects, and reverted: the entire lib is only ~90&thinsp;KB / ~2,500 types, while each
-    checker's overlay runs 0.7–1.4&thinsp;MB dominated by per-checker <em>instantiations</em> that
-    can't be pre-expanded — and lazy expansion already held RSS at ~26% of tsgo, so there was no
-    shortfall to claw back. The <strong>pre-parsed lib blob</strong> was never built: the entire
-    cold-start lib cost is ≈8.4&thinsp;ms, of which a blob eliminates 2–4&thinsp;ms — invisible
-    below the 10&thinsp;ms process-wall resolution. Method both times: gate speculative perf work
-    on a measurement first, and preserve built implementations via commit-then-revert.</p>
-  </div>
+  half of them conditional types and <code>infer</code>; those were built first, and today
+  <strong>every bucket in that census reads zero</strong>. The acceptance bar was the real,
+  published <code>@types/node</code>: ztsc's cross-file merge diagnostics match the TypeScript
+  compiler on it (pinned tsgo 7.0.2 oracle).</p>
+  <p>What remains out for v0.0.1 is a short, deliberate list — watch mode, an LSP, Windows, a
+  handful of leniencies that under-report rather than erroring, and the tracked false positives
+  on the dogfood application. The <a href="limitations.html">limitations page</a> holds the
+  full ledger: every gap, how it behaves today, and what's planned. Everything else before
+  release is done — the semantic breadth, the instantiation discipline, the real lib and the
+  real <code>@types/node</code> acceptance, the substrate experiments, and pre-publish polish
+  (MIT license, a NOTICE crediting Microsoft's TypeScript for the embedded lib and diagnostic
+  strings). What's left is the ship itself: v0.0.1 as a working <code>bunx ztsc</code>.</p>
 </section>
 
 <footer class="sitefoot">
-  ztsc 0.0.1-dev · sources: README.md, BENCHMARKS.md, EXPERIMENTS.md ARCHITECTURE.md and the src/ doc comments at commit f5adc66 (2026-07-26) · numbers are Apple M4, macOS
+  ztsc 0.0.1-dev · sources: README.md, BENCHMARKS.md, EXPERIMENTS.md, ARCHITECTURE.md and the src/ doc comments at commit 8404549 (2026-07-26) · numbers are Apple M4, macOS
 </footer>
 
 </div>
