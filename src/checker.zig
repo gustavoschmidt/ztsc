@@ -10424,6 +10424,30 @@ const Checker = struct {
             if (try c.enumValueUnion(c.ts.enumSymbol(s))) |vu| {
                 if (try c.isAssignable(vu, t)) return true;
             }
+            // tsc's rule is per-MEMBER: a string-enum member type `E.A` is a
+            // subtype of the string literal it is initialized with, so
+            // `const k: "keydown" = EVENT.KEYDOWN` is legal and
+            // `document.addEventListener(EVENT.KEYDOWN, h)` can pick the
+            // `K extends keyof DocumentEventMap` overload. ztsc has no member
+            // identity — `E.A` types as the whole `E` — so the closest
+            // available rule is EXISTENTIAL: relate `E` to a string literal
+            // that is *some* member's value. Deliberate under-approximation
+            // (`const k: "paste" = EVENT.KEYDOWN` is accepted too); the
+            // alternative is the false positive on every correct
+            // `addEventListener(EVENT.X, …)`, which policy forbids. A literal
+            // that is NOT a member value is still rejected, and the reverse
+            // direction is untouched: `string` and `"keydown"` remain
+            // unassignable INTO the nominal enum (`enumAssignable`).
+            if (tk == .string_literal) {
+                if (try c.enumHasStringValue(c.ts.enumSymbol(s), c.ts.literalAtom(t))) return true;
+            }
+            // Same rule for a numeric enum: tsc relates the member type `N.P`
+            // to the number literal `1`. A computed member makes the value set
+            // unknown, so the enum stays opaque there.
+            if (tk == .number_literal or tk == .number_literal_fresh) {
+                const info = try c.enumInfo(c.ts.enumSymbol(s));
+                if (info.all_numeric and !info.has_computed and info.hasValue(c.ts.numberValue(t))) return true;
+            }
         }
         // Source union distributes first.
         if (sk == .union_type) {

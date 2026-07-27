@@ -79,3 +79,17 @@ operators/004_branded_intersection_not_numeric.ts  -TS2322 31
 # positives in the same case prove the relation itself is in place.
 assignability/065_callback_parameter_variance.ts  -TS2322 25
 assignability/065_callback_parameter_variance.ts  -TS2322 74
+
+# ztsc has no enum MEMBER identity: `E.A` types as the whole nominal `E` (see
+# `enumValueType`). tsc's rule — an enum member is a subtype of the literal it
+# is initialized with — therefore has no exact analogue, and the relation uses
+# the EXISTENTIAL approximation: `E` relates to a literal that is *some*
+# member's value. That accepts three things tsc rejects: the wrong member's
+# literal (lines 28 and 48) and the enum-typed value as a whole (line 37).
+# The alternative is rejecting every correct `addEventListener(EVENT.KEYDOWN,
+# h)` — a false positive on correct code, which policy forbids. The relation
+# stays discriminating: a literal that is no member's value is still rejected
+# (lines 27 and 50), and nothing widens INTO the nominal enum (lines 31, 33).
+enums/member_to_single_literal.ts  -TS2322 28
+enums/member_to_single_literal.ts  -TS2322 37
+enums/member_to_single_literal.ts  -TS2322 48
