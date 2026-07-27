@@ -16207,18 +16207,39 @@ const Checker = struct {
         return key;
     }
 
+    /// tsc's `getReferenceCandidate`: the expression a narrowing condition is
+    /// really *about*. Parentheses are transparent; an assignment stands in for
+    /// its target, so `while ((m = next()) !== null)` narrows `m`; and a comma
+    /// expression stands in for its right operand. Without this the whole
+    /// assign-in-a-condition idiom narrowed nothing and every use inside the
+    /// body kept the nullable declared type.
+    fn referenceCandidate(c: *Checker, node0: Node) Node {
+        var n = node0;
+        while (n != null_node) {
+            switch (c.nodeTag(n)) {
+                .paren_expr => n = c.tree.nodeData(n).lhs,
+                .assign => switch (c.tree.tokens.tag(c.tree.nodeMainToken(n))) {
+                    .eq, .pipe_pipe_eq, .amp_amp_eq, .question_question_eq => n = c.tree.nodeData(n).lhs,
+                    else => return n,
+                },
+                .seq_expr => n = c.tree.nodeData(n).rhs,
+                else => return n,
+            }
+        }
+        return n;
+    }
+
     /// Does `node` denote exactly this reference? Peels the member/element
     /// spine right-to-left, matching each link against the key's path
     /// (outermost = `path[len-1]`), and bottoms out at the root identifier /
     /// `this`.
     fn refMatches(c: *Checker, node: Node, key: RefKey) Error!bool {
         if (node == null_node) return false;
-        var n = node;
-        while (c.nodeTag(n) == .paren_expr) n = c.tree.nodeData(n).lhs;
+        var n = c.referenceCandidate(node);
         if (key.len == 0) return c.identIsSym(n, key.sym);
         var i: usize = key.len;
         while (i > 0) : (i -= 1) {
-            while (c.nodeTag(n) == .paren_expr) n = c.tree.nodeData(n).lhs;
+            n = c.referenceCandidate(n);
             const tag = c.nodeTag(n);
             const d = c.tree.nodeData(n);
             const pe = key.path[i - 1];
@@ -16641,6 +16662,15 @@ const Checker = struct {
         switch (c.nodeTag(cond)) {
             .paren_expr => return c.narrowByCondition(t, d.lhs, sense, key),
             .non_null => return c.narrowByCondition(t, d.lhs, sense, key),
+            // `if ((m = next()))` — an assignment's value is the target's new
+            // value, so its truthiness narrows the target (tsc narrows by
+            // `getReferenceCandidate` of the condition); a comma expression
+            // condition is its right operand.
+            .assign, .seq_expr => {
+                const cand = c.referenceCandidate(cond);
+                if (cand != cond) return c.narrowByCondition(t, cand, sense, key);
+                return t;
+            },
             .identifier => {
                 if (try c.refMatches(cond, key)) {
                     return if (sense) c.getTruthyPart(t) else c.getFalsyPart(t, true);
