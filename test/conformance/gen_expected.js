@@ -96,6 +96,7 @@ function optionsForDir(dir) {
   let resolveJson = false;
   let allowJs = false;
   let noImplicitAny; // tri-state: undefined = inherit strict
+  let jsx, jsxImportSource;
   try {
     const co = JSON.parse(fs.readFileSync(cfgPath, "utf8")).compilerOptions;
     if (co && Array.isArray(co.lib)) lib = co.lib.join(",");
@@ -103,6 +104,8 @@ function optionsForDir(dir) {
     if (co && co.resolveJsonModule === true) resolveJson = true;
     if (co && co.allowJs === true) allowJs = true;
     if (co && typeof co.noImplicitAny === "boolean") noImplicitAny = co.noImplicitAny;
+    if (co && typeof co.jsx === "string") jsx = co.jsx;
+    if (co && typeof co.jsxImportSource === "string") jsxImportSource = co.jsxImportSource;
   } catch {
     return OPTIONS;
   }
@@ -126,6 +129,18 @@ function optionsForDir(dir) {
   // suppresses the implicit-any family (run_conformance.zig no_implicit_any).
   if (noImplicitAny === false) out.push("--noImplicitAny", "false");
   else if (noImplicitAny === true) out.push("--noImplicitAny", "true");
+  // `jsx`: the default OPTIONS pass `--jsx preserve` (cases declare their own
+  // global `JSX` namespace). A case that selects the *automatic* runtime
+  // (`react-jsx`) moves the `JSX` namespace into the
+  // `<jsxImportSource>/jsx-runtime` module's exports — replace the default so
+  // the oracle resolves it the same way ztsc does (run_conformance.zig
+  // dirCaseJsxRuntimeModule).
+  if (jsx) {
+    const at = out.indexOf("--jsx");
+    if (at >= 0) out[at + 1] = jsx;
+    else out.push("--jsx", jsx);
+  }
+  if (jsxImportSource) out.push("--jsxImportSource", jsxImportSource);
   // `allowSyntheticDefaultImports`/`esModuleInterop` are deliberately NOT
   // forwarded: this oracle version removed the `=false` form of both
   // (TS5108 "Option 'esModuleInterop=false' has been removed"), and the default

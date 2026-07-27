@@ -312,6 +312,31 @@ fn dirCaseOptBool(alloc: std.mem.Allocator, io: Io, conf_dir: Io.Dir, case_rel: 
     return v.boolean;
 }
 
+/// A string `compilerOptions.<key>`, or null when the config/option is absent
+/// or non-string.
+fn dirCaseOptString(alloc: std.mem.Allocator, io: Io, conf_dir: Io.Dir, case_rel: []const u8, key: []const u8) !?[]const u8 {
+    const cfg_path = try std.fmt.allocPrint(alloc, "{s}/tsconfig.json", .{case_rel});
+    const text = conf_dir.readFileAlloc(io, cfg_path, alloc, .limited(1 << 20)) catch return null;
+    const root = ztsc.tsconfig.parseJsonc(alloc, text) catch return null;
+    if (root != .object) return null;
+    const co = root.object.get("compilerOptions") orelse return null;
+    if (co != .object) return null;
+    const v = co.object.get(key) orelse return null;
+    if (v != .string) return null;
+    return v.string;
+}
+
+/// The `<jsxImportSource>/jsx-runtime` module for a case whose tsconfig selects
+/// the automatic JSX runtime (`jsx: "react-jsx"`/`"react-jsxdev"`), else null —
+/// mirrors `tsconfig.Config.jsx_runtime_module`. gen_expected.js forwards the
+/// same `--jsx` to the oracle.
+fn dirCaseJsxRuntimeModule(alloc: std.mem.Allocator, io: Io, conf_dir: Io.Dir, case_rel: []const u8) !?[]const u8 {
+    const j = (try dirCaseOptString(alloc, io, conf_dir, case_rel, "jsx")) orelse return null;
+    if (!std.mem.eql(u8, j, "react-jsx") and !std.mem.eql(u8, j, "react-jsxdev")) return null;
+    const src = (try dirCaseOptString(alloc, io, conf_dir, case_rel, "jsxImportSource")) orelse "react";
+    return try std.fmt.allocPrint(alloc, "{s}/jsx-runtime", .{src});
+}
+
 /// Run the full multi-file pipeline on a directory case: discover from
 /// entry.ts, link, check (single checker instance owns all files).
 /// Returned file names are relative to the case directory.
@@ -354,7 +379,8 @@ fn runDirCase(
     // `--allowSyntheticDefaultImports false`.
     const allow_synthetic_default = (try dirCaseOptBool(alloc, io, conf_dir, case_rel, "allowSyntheticDefaultImports")) orelse
         (try dirCaseOptBool(alloc, io, conf_dir, case_rel, "esModuleInterop")) orelse true;
-    var br = try modules.buildProgram(alloc, io, gpa, interner, conf_dir, &.{entry}, lib_set, .{ .resolve_json = resolve_json, .allow_js = allow_js }, allow_synthetic_default);
+    const jsx_runtime_module = try dirCaseJsxRuntimeModule(alloc, io, conf_dir, case_rel);
+    var br = try modules.buildProgram(alloc, io, gpa, interner, conf_dir, &.{entry}, lib_set, .{ .resolve_json = resolve_json, .allow_js = allow_js }, allow_synthetic_default, jsx_runtime_module);
     const prog = &br.program;
     prog.no_implicit_any = no_implicit_any;
 
@@ -685,7 +711,7 @@ test "determinism: diagnostics byte-identical for N = 1, 2, 4, 8 checkers" {
     defer interner.deinit(gpa);
     const alloc = arena.allocator();
 
-    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, &.{"entry.ts"}, .none, .{}, false);
+    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, &.{"entry.ts"}, .none, .{}, false, null);
     try std.testing.expectEqual(@as(usize, 10), br.program.files.len);
 
     const ref = try renderProgramDiags(alloc, io, gpa, &interner, &br.program, 1);
@@ -747,7 +773,7 @@ test "cycle stress: N-file import ring + diamonds terminate cleanly" {
     defer interner.deinit(gpa);
     const alloc = arena.allocator();
 
-    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, &.{"entry.ts"}, .none, .{}, false);
+    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, &.{"entry.ts"}, .none, .{}, false, null);
     try std.testing.expectEqual(@as(usize, n_ring + 3), br.program.files.len);
 
     // Clean at N=1, and byte-identical (still clean) at higher N — no
@@ -816,7 +842,7 @@ test "determinism: cross-file base cycles report identically for N = 1, 2, 4, 8"
     defer interner.deinit(gpa);
     const alloc = arena.allocator();
 
-    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, &.{"entry.d.ts"}, .none, .{}, false);
+    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, &.{"entry.d.ts"}, .none, .{}, false, null);
 
     const ref = try renderProgramDiags(alloc, io, gpa, &interner, &br.program, 1);
     // Every interface on every cycle is reported: 2 per cluster.

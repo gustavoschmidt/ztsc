@@ -12544,8 +12544,8 @@ const Checker = struct {
     /// (e.g. `IntrinsicClassAttributes<T>`) are never instantiated bare.
     fn jsxNamespaceMember(c: *Checker, member: Atom) ?SymbolId {
         const jsx_sym = switch (c.resolveSpace(c.atom_JSX, c.cur_scope, false)) {
-            .sym => |s| if (c.symFlags(s).namespace_decl) s else return null,
-            else => return null,
+            .sym => |s| if (c.symFlags(s).namespace_decl) s else return c.jsxRuntimeNamespaceMember(member),
+            else => return c.jsxRuntimeNamespaceMember(member),
         };
         // Through `namespaceMemberSym`, so a `JSX` namespace declared in more
         // than one file is looked up in its MERGED member index. Reaching into
@@ -12555,7 +12555,27 @@ const Checker = struct {
         // `declare namespace JSX { interface IntrinsicElements { "em-emoji":
         // any } }` shadowed the whole React/preact `IntrinsicElements`, and
         // every `<div>` in the project became TS2339.
-        const g = c.namespaceMemberSym(jsx_sym, member) orelse return null;
+        const g = c.namespaceMemberSym(jsx_sym, member) orelse return c.jsxRuntimeNamespaceMember(member);
+        const mf = c.symFlags(g);
+        if (!(mf.exported and hasTypeMeaning(mf))) return c.jsxRuntimeNamespaceMember(member);
+        return g;
+    }
+
+    /// The automatic-JSX-runtime fallback for `JSX.<member>`: under
+    /// `jsx: "react-jsx"` the namespace is an *export* of the
+    /// `<jsxImportSource>/jsx-runtime` module rather than a global — @types/react
+    /// 19 dropped `declare global { namespace JSX }` entirely, so the global
+    /// lookup above finds nothing and every intrinsic element would type its
+    /// props as "unknown target" (no contextual type for `onChange={(e) => …}`,
+    /// no TS2339 for a bogus tag). The driver puts that module in the program
+    /// and hands its FileId over as `Program.jsx_runtime_file`.
+    fn jsxRuntimeNamespaceMember(c: *Checker, member: Atom) ?SymbolId {
+        const f = c.prog.jsx_runtime_file;
+        if (f == modules.no_file or c.prog.links.len == 0) return null;
+        const ns_tgt = c.prog.links[f].exportTarget(c.atom_JSX) orelse return null;
+        const ns_sym = c.targetTypeSym(ns_tgt) orelse return null;
+        if (!c.symFlags(ns_sym).namespace_decl) return null;
+        const g = c.namespaceMemberSym(ns_sym, member) orelse return null;
         const mf = c.symFlags(g);
         if (!(mf.exported and hasTypeMeaning(mf))) return null;
         return g;

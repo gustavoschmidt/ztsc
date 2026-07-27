@@ -76,6 +76,10 @@ pub fn buildProgram(
     lib_set: LibSet,
     resolve_opts: ResolveOpts,
     allow_synthetic_default: bool,
+    /// `<jsxImportSource>/jsx-runtime` under the automatic JSX runtime, else
+    /// null. Pulled into the program on the first `.tsx` file, exactly as the
+    /// CLI driver does; its FileId becomes `Program.jsx_runtime_file`.
+    jsx_runtime_module: ?[]const u8,
 ) !BuildResult {
     var scratch_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch_arena.deinit();
@@ -103,6 +107,7 @@ pub fn buildProgram(
         }
     }
 
+    var jsx_runtime_fid: FileId = no_file;
     var next: usize = 0;
     while (next < pending.items.len) : (next += 1) {
         const path = pending.items[next];
@@ -125,6 +130,24 @@ pub fn buildProgram(
         tree.* = try parser.parseOpts(arena, bytes, parser.isJsxPath(path));
         const bound = try arena.create(Bind);
         bound.* = try binder.bind(arena, io, gpa, interner, tree, bytes, parser.isDeclarationPath(path));
+
+        // Automatic JSX runtime: `<jsxImportSource>/jsx-runtime` exports the
+        // `JSX` namespace (no global one exists under @types/react 19), so it is
+        // a program input for every JSX file. Injected once, like a
+        // triple-slash reference.
+        if (jsx_runtime_fid == no_file and jsx_runtime_module != null and
+            std.mem.endsWith(u8, path, ".tsx"))
+        {
+            if (try rcache.resolve(io, scratch, dir, path, jsx_runtime_module.?)) |jp| {
+                const stable = try arena.dupe(u8, jp);
+                const gop = try path_ids.getOrPut(scratch, stable);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = @intCast(pending.items.len);
+                    try pending.append(scratch, stable);
+                }
+                jsx_runtime_fid = gop.value_ptr.*;
+            }
+        }
 
         // Triple-slash `/// <reference>` directives pull extra files into the
         // program — not import bindings, just program inputs.
@@ -182,6 +205,7 @@ pub fn buildProgram(
             .constit_keys = lr.constit_keys,
             .constit_vals = lr.constit_vals,
             .export_equals_atom = lr.export_equals_atom,
+            .jsx_runtime_file = jsx_runtime_fid,
         },
         .load_failures = try arena.dupe(BuildDiag, failures.items),
     };
@@ -383,6 +407,11 @@ pub const Program = struct {
     /// affected values still type as `any`. Defaults on (strict semantics); the
     /// driver sets it from the tsconfig. See `tsconfig.Config.no_implicit_any`.
     no_implicit_any: bool = true,
+    /// The `<jsxImportSource>/jsx-runtime` module under the automatic JSX
+    /// runtime (`jsx: "react-jsx"`), or `no_file`. tsc reads the `JSX` namespace
+    /// off this module's exports there; the checker falls back to it when no
+    /// global `JSX` namespace exists. See `tsconfig.Config.jsx_runtime_module`.
+    jsx_runtime_file: FileId = no_file,
 
     /// Count of real per-file symbols (merged ids start here).
     pub fn totalSymbols(p: *const Program) u32 {

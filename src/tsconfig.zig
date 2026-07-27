@@ -126,6 +126,14 @@ pub fn loadInDir(io: Io, arena: Allocator, base: Io.Dir, config_path: []const u8
     if (acc.base_url) |bu| {
         cfg.base_url = try joinNormalize(arena, acc.base_url_dir, bu);
     }
+    // Automatic JSX runtime: the `JSX` namespace comes from the
+    // `<jsxImportSource>/jsx-runtime` module rather than global scope.
+    if (acc.jsx) |j| {
+        if (std.mem.eql(u8, j, "react-jsx") or std.mem.eql(u8, j, "react-jsxdev")) {
+            cfg.jsx_runtime_module = try std.fmt.allocPrint(arena, "{s}/jsx-runtime", .{acc.jsx_import_source orelse "react"});
+            try note(arena, &notes, "'jsx: {s}': the `JSX` namespace is read from '{s}' (automatic runtime), falling back to a global `JSX` namespace", .{ j, cfg.jsx_runtime_module.? });
+        }
+    }
     if (cfg.skip_all_lib_check) {
         try note(arena, &notes, "'skipLibCheck' honored: no diagnostics are surfaced from any .d.ts file (default lib and dependency/project .d.ts alike); their types still flow into .ts checking", .{});
     } else if (acc.skip_lib_check) |sv| {
@@ -309,6 +317,17 @@ pub const Config = struct {
     /// when unset). Consulted for bare `*.json` specifiers only (`public/api/
     /// x.json`); non-json baseUrl resolution is not modeled.
     base_url: ?[]const u8 = null,
+    /// Under the automatic JSX runtime (`jsx: "react-jsx"` / `"react-jsxdev"`)
+    /// the `JSX` namespace is NOT a global: tsc reads it off the exports of the
+    /// `<jsxImportSource>/jsx-runtime` module (`jsxImportSource` defaults to
+    /// `"react"`). This is that module specifier, or null under the classic
+    /// runtime / `preserve`, where the global `JSX` namespace is authoritative.
+    /// The driver pulls the named module into the program (like `@types/node`)
+    /// and the checker falls back to its `JSX` export when no global exists —
+    /// @types/react 19 ships no `declare global { namespace JSX }` at all, so
+    /// without this every intrinsic element (`<div>`, `<input>`) has an unknown
+    /// props type and its attribute values lose their contextual type.
+    jsx_runtime_module: ?[]const u8 = null,
     /// Non-fatal warnings (unknown options, bad shapes) for stderr.
     warnings: []const []const u8 = &.{},
     /// Accepted-and-ignored option notes, shown under --verbose only.
@@ -855,6 +874,8 @@ const Merged = struct {
     strict: ?bool = null,
     no_implicit_any: ?bool = null,
     allow_js: ?bool = null,
+    jsx: ?[]const u8 = null,
+    jsx_import_source: ?[]const u8 = null,
     lib: ?[]const []const u8 = null,
     skip_lib_check: ?bool = null,
     skip_all_lib_check: ?bool = null,
@@ -1010,9 +1031,16 @@ fn applyOwn(
                     std.mem.eql(u8, okey, "moduleResolution"))
                 {
                     try note(arena, notes, "{s}: '{s}' accepted and ignored (ztsc always checks its fixed esnext/bundler subset)", .{ config_path, okey });
-                } else if (std.mem.eql(u8, okey, "jsx") or
-                    std.mem.eql(u8, okey, "jsxImportSource") or
-                    std.mem.eql(u8, okey, "jsxFactory") or
+                } else if (std.mem.eql(u8, okey, "jsx")) {
+                    // Kept only to decide where the `JSX` namespace lives: under
+                    // the automatic runtime (`react-jsx`/`react-jsxdev`) tsc
+                    // reads it off the `<jsxImportSource>/jsx-runtime` module's
+                    // exports, not the global scope. Emit is never affected —
+                    // ztsc does not emit.
+                    if (oval == .string) acc.jsx = oval.string;
+                } else if (std.mem.eql(u8, okey, "jsxImportSource")) {
+                    if (oval == .string) acc.jsx_import_source = oval.string;
+                } else if (std.mem.eql(u8, okey, "jsxFactory") or
                     std.mem.eql(u8, okey, "jsxFragmentFactory"))
                 {
                     try note(arena, notes, "{s}: '{s}' accepted and ignored (ztsc type-checks JSX via the ambient/global `JSX` namespace; it never emits)", .{ config_path, okey });
@@ -1746,7 +1774,7 @@ test "config-driven program builds and checks (conformance-style)" {
 
     var interner = @import("intern.zig").Interner.init();
     defer interner.deinit(gpa);
-    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, cfg.root_files, .none, .{}, cfg.allow_synthetic_default_imports);
+    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, cfg.root_files, .none, .{}, cfg.allow_synthetic_default_imports, cfg.jsx_runtime_module);
     try testing.expectEqual(@as(usize, 2), br.program.files.len);
 
     const checker = @import("checker.zig");

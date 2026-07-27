@@ -484,6 +484,9 @@ pub fn main(init: std.process.Init) !void {
     // arguments) ztsc still resolves with the bundler algorithm, and tsc's rule
     // makes the flag default to true under bundler resolution.
     var config_allow_synthetic_default = true;
+    // `<jsxImportSource>/jsx-runtime` under the automatic JSX runtime; null
+    // under the classic runtime (global `JSX` namespace only).
+    var config_jsx_runtime_module: ?[]const u8 = null;
     if (cli.paths.len == 0) {
         const config_path: []const u8 = blk: {
             if (cli.project) |p| {
@@ -542,6 +545,7 @@ pub fn main(init: std.process.Init) !void {
         config_allow_js = cfg.allow_js;
         config_no_implicit_any = cfg.no_implicit_any;
         config_allow_synthetic_default = cfg.allow_synthetic_default_imports;
+        config_jsx_runtime_module = cfg.jsx_runtime_module;
     }
 
     // Effective decision: skip type-checking the embedded pre-verified lib?
@@ -679,6 +683,9 @@ pub fn main(init: std.process.Init) !void {
     // FileId of the auto-injected `@types/node` (null until the first Node
     // built-in import pulls it in); see the discovery loop below.
     var node_types_fid: ?u32 = null;
+    // FileId of the auto-injected `<jsxImportSource>/jsx-runtime` (null until
+    // the first `.tsx` file pulls it in); see the discovery loop below.
+    var jsx_runtime_fid: ?u32 = null;
     resolve.resetFsProbeCount();
 
     while (outstanding > 0) {
@@ -736,6 +743,30 @@ pub fn main(init: std.process.Init) !void {
                         try ref_files.append(arena, node_types_fid.?);
                     }
                     break;
+                }
+            }
+            // Under the automatic JSX runtime the `JSX` namespace is an export
+            // of `<jsxImportSource>/jsx-runtime`, not a global — @types/react 19
+            // ships no `declare global { namespace JSX }` at all. tsc puts that
+            // module in the program for every JSX file; do the same on the first
+            // `.tsx` we see, discovered like a triple-slash reference so the
+            // deterministic BFS reaches it. Its FileId is handed to the checker
+            // (`Program.jsx_runtime_file`) as the JSX-namespace fallback.
+            if (jsx_runtime_fid == null and config_jsx_runtime_module != null and
+                std.mem.endsWith(u8, paths.items[i], ".tsx"))
+            {
+                if (try rcache.resolve(io, scratch, Io.Dir.cwd(), paths.items[i], config_jsx_runtime_module.?)) |jp| {
+                    const pgop = try path_ids.getOrPut(arena, jp);
+                    if (pgop.found_existing) {
+                        jsx_runtime_fid = pgop.value_ptr.*;
+                    } else {
+                        const stable = try arena.dupe(u8, jp);
+                        pgop.key_ptr.* = stable;
+                        jsx_runtime_fid = @intCast(paths.items.len);
+                        pgop.value_ptr.* = jsx_runtime_fid.?;
+                        try paths.append(arena, stable);
+                    }
+                    try ref_files.append(arena, jsx_runtime_fid.?);
                 }
             }
             // Triple-slash `/// <reference>` directives pull extra files into
@@ -812,6 +843,7 @@ pub fn main(init: std.process.Init) !void {
         try permuteInPlace(?anyerror, arena, errs.items, order);
         try permuteInPlace([]ztsc.intern.Atom, arena, spec_atoms_all.items, order);
         try permuteInPlace([]modules.FileId, arena, spec_files_all.items, order);
+        if (jsx_runtime_fid) |f| jsx_runtime_fid = new_ids[f];
         // Remap the resolved FileIds inside the spec maps.
         for (spec_files_all.items) |spec_files| {
             for (spec_files) |*fid| {
@@ -864,6 +896,7 @@ pub fn main(init: std.process.Init) !void {
         .constit_vals = lr.constit_vals,
         .export_equals_atom = lr.export_equals_atom,
         .no_implicit_any = config_no_implicit_any,
+        .jsx_runtime_file = jsx_runtime_fid orelse modules.no_file,
     };
     const link_ns = link_timer.readNs();
 
