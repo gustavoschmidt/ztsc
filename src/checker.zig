@@ -4392,6 +4392,18 @@ const Checker = struct {
                         }
                     }
                 }
+            } else {
+                // A DESTRUCTURED parameter (`({ a, b }) => …`) names no symbol,
+                // so the pin above never ran and each binding fell back to
+                // `computeTypeOfSymbol`, which re-derives the parameter with no
+                // contextual signature — i.e. `any` for an unannotated one.
+                // Every read of such a binding was therefore unchecked, and the
+                // `any` spread outward: a generic call taking one of them
+                // inferred its type parameter as `any`, which absorbed the
+                // union parameter beside it, so an arrow argument written for
+                // that parameter lost its contextual signature and reported
+                // TS7006 on every parameter.
+                try c.pinPatternParamSyms(pn, c.tree.nodeData(pn).lhs, p.ty, ctx_sig != types.no_type);
             }
             pi += 1;
         }
@@ -5341,6 +5353,71 @@ const Checker = struct {
             },
             else => return types.any_type,
         }
+    }
+
+    /// Pin every symbol bound by a destructured parameter's pattern to the type
+    /// the parameter (contextual or annotated) gives it. The counterpart of the
+    /// named-parameter pin in `signatureOfProtoCtx`: without it those symbols
+    /// have no pinned type and `computeTypeOfSymbol` re-derives them from the
+    /// declaration alone, with no contextual signature to read.
+    ///
+    /// Each binding's type comes from `bindingElementType`, the same walk
+    /// `computeTypeOfSymbol` would use, so optional properties, defaults, and
+    /// object/array rests behave identically — only the starting `whole` is
+    /// better. `force` mirrors the named case: a contextual signature
+    /// overwrites, because the same arrow is materialized once per overload
+    /// candidate and the last materialization is the one the body is checked
+    /// under.
+    fn pinPatternParamSyms(c: *Checker, pn: Node, pat: Node, whole: TypeId, force: bool) Error!void {
+        if (pat == null_node) return;
+        const d = c.tree.nodeData(pat);
+        switch (c.nodeTag(pat)) {
+            .identifier => try c.pinBindingSym(pn, try c.atomOfToken(c.tree.nodeMainToken(pat)), whole, force),
+            .object_pattern => {
+                for (c.tree.nodeRange(pat)) |el| {
+                    if (el == null_node) continue;
+                    const ed = c.tree.nodeData(el);
+                    switch (c.nodeTag(el)) {
+                        .binding_property => {
+                            if (ed.lhs != 0) {
+                                try c.pinPatternParamSyms(pn, ed.lhs, whole, force);
+                            } else {
+                                try c.pinBindingSym(pn, try c.memberAtom(c.tree.nodeMainToken(el)), whole, force);
+                            }
+                        },
+                        .rest_element => try c.pinPatternParamSyms(pn, ed.lhs, whole, force),
+                        else => {},
+                    }
+                }
+            },
+            .array_pattern => {
+                for (c.tree.nodeRange(pat)) |el| {
+                    if (el == null_node or c.nodeTag(el) == .omitted) continue;
+                    try c.pinPatternParamSyms(pn, el, whole, force);
+                }
+            },
+            .binding_default, .rest_element => try c.pinPatternParamSyms(pn, d.lhs, whole, force),
+            else => {},
+        }
+    }
+
+    fn pinBindingSym(c: *Checker, pn: Node, name: Atom, whole: TypeId, force: bool) Error!void {
+        const psym = c.bind.lookupInScope(c.cur_scope, name) orelse return;
+        if (!c.bind.symbol_flags[psym].param) return;
+        const gsym = c.toGlobal(psym);
+        if (gsym == binder.no_symbol or gsym >= c.sym_types.items.len) return;
+        if (!force and c.sym_state.items[gsym] == .computed) return;
+        // Re-entrancy: `bindingElementType` checks the pattern's defaults, which
+        // can read this very symbol. Leave the slot alone while computing.
+        if (c.sym_state.items[gsym] == .in_progress) return;
+        const saved = c.sym_state.items[gsym];
+        c.sym_state.items[gsym] = .in_progress;
+        const t = c.bindingElementType(gsym, pn, whole) catch |err| {
+            c.sym_state.items[gsym] = saved;
+            return err;
+        };
+        c.sym_types.items[gsym] = t;
+        c.sym_state.items[gsym] = .computed;
     }
 
     /// Type of `sym` when bound by a destructuring pattern whose whole
