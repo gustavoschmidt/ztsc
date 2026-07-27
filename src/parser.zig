@@ -1874,9 +1874,30 @@ const Parser = struct {
     /// is the specifier string literal. The block's exports become an ambient
     /// module the linker resolves imports of `"spec"` against, and merges into
     /// a real module's exports when `"spec"` also resolves (augmentation).
+    ///
+    /// The *shorthand* form has no block at all — `declare module "*.scss";`
+    /// — and declares a module whose every export is `any`. That is exactly
+    /// what an empty body already means downstream (the linker's
+    /// `ambientOpaque`: an ambient module with no named exports degrades
+    /// imports to `any`), so the shorthand parses to the same node with an
+    /// empty body span. Demanding the `{` instead cost the whole rest of the
+    /// file: a project `global.d.ts` that opens with `declare module "*.scss";`
+    /// and then augments an interface lost the augmentation to error recovery,
+    /// and under `skipLibCheck` the parse error itself was invisible.
     fn parseAmbientModule(p: *Parser) PE!Node {
         const kw = try p.bump(); // `module`
         const spec_tok = try p.bump(); // string literal
+        if (p.curTag() != .l_brace) {
+            _ = try p.eat(.semicolon);
+            const empty = try p.scratchToSpan(p.scratchTop());
+            const extra_short = try p.addExtra(ast.NamespaceData{
+                .flags = ast.Flags.declare | ast.Flags.ambient_module,
+                .name_token = spec_tok,
+                .body_start = empty.start,
+                .body_end = empty.end,
+            });
+            return p.addNode(.{ .tag = .namespace_decl, .main_token = kw, .data = .{ .lhs = extra_short, .rhs = 0 } });
+        }
         _ = try p.expect(.l_brace, .expected_l_brace);
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
