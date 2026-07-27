@@ -1701,10 +1701,30 @@ const Checker = struct {
 
     /// Edit distance <= threshold spelling suggestion among scope-visible
     /// names (tsc's TS2552/TS2551 "Did you mean ...?").
+    ///
+    /// tsc iterates each scope's symbol table in DECLARATION order and only
+    /// replaces the incumbent on a strictly smaller distance, so among
+    /// equal-distance candidates the first-declared wins (verified against the
+    /// pinned oracle: swapping two tied declarations swaps the suggestion).
+    /// `member_atoms` is sorted by ATOM id for binary-search lookup, and atom
+    /// ids depend on interning order across workers — iterating it and taking
+    /// the first tie would make the message run-to-run nondeterministic, which
+    /// it was. `member_syms` carries the binder's SymbolId, handed out in a
+    /// single sequential walk of the file's AST, so it *is* declaration order:
+    /// break ties toward the smaller symbol id and the pick matches tsc and is
+    /// stable for any --workers/--checkers count.
+    ///
+    /// The tie-break is scope-local (`best_scope`). Scopes are visited
+    /// innermost-first, and an inner symbol can have a larger id than an outer
+    /// one declared earlier in the file, so comparing ids across scopes would
+    /// let an outer candidate beat an inner one; tsc's shrinking threshold
+    /// never does.
     fn suggestName(c: *Checker, a: Atom, from: ScopeId, want_value: bool) ?Atom {
         const text = c.atomText(a);
         if (text.len < 3) return null;
         var best: ?Atom = null;
+        var best_sym: binder.SymbolId = 0;
+        var best_scope: ScopeId = 0;
         var best_d: usize = @max(2, (text.len * 34 + 99) / 100) + 1;
         var s = from;
         while (true) {
@@ -1713,15 +1733,19 @@ const Checker = struct {
             for (lo..hi) |i| {
                 const cand = c.bind.member_atoms[i];
                 if (cand == a) continue;
-                const f = c.bind.symbol_flags[c.bind.member_syms[i]];
+                const sym = c.bind.member_syms[i];
+                const f = c.bind.symbol_flags[sym];
                 const ok = if (want_value) hasValueMeaning(f) else hasTypeMeaning(f);
                 if (!ok) continue;
                 const cand_text = c.atomText(cand);
                 const d = editDistance(text, cand_text, best_d);
-                if (d < best_d) {
-                    best_d = d;
-                    best = cand;
-                }
+                const better = d < best_d or
+                    (best != null and d == best_d and s == best_scope and sym < best_sym);
+                if (!better) continue;
+                best_d = d;
+                best_sym = sym;
+                best_scope = s;
+                best = cand;
             }
             if (s == binder.file_scope) break;
             s = c.bind.scope_parents[s];
@@ -19010,6 +19034,58 @@ test "cannot find name / wrong space / suggestions" {
     try expectCodes("const value = 1; const x: number = valeu;", &.{2552});
     try expectCodes("declare const o: { total: number }; o.totol;", &.{2551});
     try expectCodes("declare const o: { a: number }; o.b;", &.{2339});
+}
+
+/// Expect exactly one diagnostic, code `code`, whose message ends in
+/// `Did you mean '<want>'?`. The conformance snapshots record only (code,
+/// line), so the *text* of a suggestion has to be pinned here.
+fn expectSuggestion(src: []const u8, code: u16, want: []const u8) !void {
+    var t = try TestCheck.init(src);
+    defer t.deinit();
+    const tail = try std.fmt.allocPrint(testing.allocator, "Did you mean '{s}'?", .{want});
+    defer testing.allocator.free(tail);
+    if (t.result.diagnostics.len != 1 or t.result.diagnostics[0].code != code or
+        !std.mem.endsWith(u8, t.result.diagnostics[0].msg, tail))
+    {
+        std.debug.print("--- source: {s}\n--- want TS{d} ...{s}\n--- got {d} diagnostics:\n", .{ src, code, tail, t.result.diagnostics.len });
+        for (t.result.diagnostics) |dd| std.debug.print("  TS{d} {s}\n", .{ dd.code, dd.msg });
+        return error.TestExpectedEqual;
+    }
+}
+
+test "TS2552 suggestion: equal-distance ties break by declaration order" {
+    // `fooarbaz` and `foobarbz` are each one deletion from `foobarbaz`, so they
+    // tie. The pinned oracle keeps whichever is declared FIRST — swapping the
+    // two declarations swaps the suggestion — because it iterates the symbol
+    // table in declaration order and only replaces the incumbent on a strictly
+    // smaller distance. ztsc iterates `member_atoms`, which is sorted by atom
+    // id, and atom ids depend on interning order across workers: taking the
+    // first tie there made the message differ from run to run. The tie-break is
+    // on the binder's SymbolId, which is declaration order.
+    try expectSuggestion(
+        \\declare const fooarbaz: number;
+        \\declare const foobarbz: number;
+        \\foobarbaz;
+    , 2552, "fooarbaz");
+    try expectSuggestion(
+        \\declare const foobarbz: number;
+        \\declare const fooarbaz: number;
+        \\foobarbaz;
+    , 2552, "foobarbz");
+}
+
+test "TS2552 suggestion: an inner-scope candidate outranks an equally-close outer one" {
+    // The outer `fooarbaz` is declared first, so a file-wide symbol-id
+    // comparison would pick it; tsc's shrinking threshold cannot, because it
+    // visits the innermost scope first and never replaces on a tie. The
+    // tie-break is therefore scope-local.
+    try expectSuggestion(
+        \\declare const fooarbaz: number;
+        \\function f(): void {
+        \\  const foobarbz: number = 1;
+        \\  foobarbaz;
+        \\}
+    , 2552, "foobarbz");
 }
 
 test "implicit any params (7006)" {
