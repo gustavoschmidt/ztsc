@@ -5580,6 +5580,26 @@ const Checker = struct {
     /// left lazy (a non-decreasing hop stops the loop).
     fn reexpandShrinking(c: *Checker, orig_ref: TypeId, result0: TypeId) Error!TypeId {
         var result = result0;
+        // A DISTRIBUTED result is a union of one-step refs — the conditional's
+        // naked-check distribution ran per union member, and each member came
+        // back as `Alias<smaller-arg>`. Each of those would have been driven
+        // had it been the whole result, so drive them member-wise under the
+        // same strict-shrink rule. Without this, `Awaited<Promise<A> |
+        // Promise<B>>` stalled at `Awaited<A> | Awaited<B>` while the
+        // undistributed `Awaited<Promise<A>>` reduced to `A` — the property
+        // accesses on a `Promise.all` result (whose element type is exactly
+        // this shape) then all failed with TS2339.
+        if (c.ts.kind(result) == .union_type) {
+            var parts: std.ArrayList(TypeId) = .empty;
+            defer parts.deinit(c.scratch());
+            var changed = false;
+            for (try c.memberList(result)) |m| {
+                const r = if (c.ts.kind(m) == .ref) try c.reexpandShrinking(orig_ref, m) else m;
+                if (r != m) changed = true;
+                try parts.append(c.scratch(), r);
+            }
+            return if (changed) c.ts.makeUnion(c.scratch(), parts.items) else result;
+        }
         if (c.ts.kind(result) != .ref) return result;
         var prev_ref = orig_ref;
         var iter: u32 = 0;
