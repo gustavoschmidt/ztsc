@@ -12616,7 +12616,15 @@ const Checker = struct {
                 return types.number_type;
             },
             .non_null => {
-                const ot = try c.checkExprCached(d.lhs, types.no_type);
+                // A non-null assertion is transparent to contextual typing:
+                // tsc's `getContextualType` hands a `NonNullExpression` its
+                // parent's contextual type straight through. It is what lets a
+                // generic whose type parameter appears *only* in the return
+                // type infer from the target — `queryByTestId(el.querySelector(
+                // ".x")!)` needs the parameter's `HTMLElement` to reach
+                // `querySelector<E extends Element = Element>` and pick `E`,
+                // instead of falling back to the default `Element`.
+                const ot = try c.checkExprCached(d.lhs, ctx);
                 return c.nonNullable(ot);
             },
             .as_expr => {
