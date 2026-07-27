@@ -2945,14 +2945,36 @@ const Checker = struct {
         default: Node,
     };
 
-    /// Type parameters of a generic symbol (class/interface/alias), from
-    /// its first declaration. Symbol ids in the result are global.
+    /// Type parameters of a generic symbol (class/interface/alias). Symbol ids
+    /// in the result are global.
+    ///
+    /// A reopened or cross-file-merged interface may declare its type
+    /// parameters on any one of its blocks: tsc collects the parameter list
+    /// across *every* declaration, and a block that omits the list entirely is
+    /// legal whenever each parameter has a default (`areTypeParametersIdentical`
+    /// compares against the *minimum* argument count). `@types/node` relies on
+    /// exactly that — `interface Buffer<TArrayBuffer extends ArrayBufferLike =
+    /// ArrayBufferLike> extends Uint8Array<TArrayBuffer>` in one file, a bare
+    /// `interface Buffer { … }` reopen in another. So scan the constituents in
+    /// declaration order and take the first block that actually declares
+    /// parameters; a bare reopen must not erase them.
     fn typeParamsOf(c: *Checker, sym: SymbolId, buf: *std.ArrayList(TypeParamInfo)) Error!void {
-        const saved = c.enterSymFile(sym);
-        defer c.restoreCtx(saved);
-        const decls = c.declsOf(sym);
-        if (decls.len == 0) return;
-        const decl = decls[0];
+        var one = [_]SymbolId{sym};
+        const parts: []const SymbolId = if (c.prog.isMergedId(sym)) c.prog.mergedSym(sym).parts else one[0..];
+        for (parts) |csym| {
+            const saved = c.enterSymFile(csym);
+            defer c.restoreCtx(saved);
+            for (c.declsOf(csym)) |decl| {
+                try c.declTypeParams(decl, buf);
+                if (buf.items.len > 0) return;
+            }
+        }
+    }
+
+    /// Type parameters declared by ONE declaration node, appended to `buf`,
+    /// resolved in the current file context. Non-generic (or non-declaring)
+    /// nodes append nothing.
+    fn declTypeParams(c: *Checker, decl: Node, buf: *std.ArrayList(TypeParamInfo)) Error!void {
         const d = c.tree.nodeData(decl);
         var tp_start: u32 = 0;
         var tp_end: u32 = 0;
@@ -2974,6 +2996,9 @@ const Checker = struct {
             },
             else => return,
         }
+        // Non-generic declaration: bail before `scopeOf`, which is the
+        // expensive half and is pure overhead for the common case.
+        if (tp_start == tp_end) return;
         const decl_scope = (try c.scopeOf(decl)) orelse return;
         for (c.tree.extraRange(tp_start, tp_end)) |tp| {
             if (tp == null_node or c.nodeTag(tp) != .type_param) continue;
@@ -3083,9 +3108,13 @@ const Checker = struct {
                 // Defaults are nodes of the declaring file; evaluate there,
                 // then substitute the already-resolved params so `B = A` sees
                 // the supplied `A` (and `C = B` the defaulted `B`).
+                // The file is the *type parameter's* — a merged interface may
+                // declare its parameters on a block in a different file than
+                // the merged symbol's representative, and reading the node
+                // against the wrong tree is out of bounds.
                 var def: TypeId = undefined;
                 {
-                    const saved = c.enterSymFile(sym);
+                    const saved = c.enterSymFile(tp.sym);
                     defer c.restoreCtx(saved);
                     c.cur_scope = c.symScope(tp.sym);
                     def = try c.typeFromTypeNode(tp.default);
@@ -5277,6 +5306,14 @@ const Checker = struct {
         // blocks' direct members are gathered before any base is applied.
         var one = [_]SymbolId{sym};
         const parts: []const SymbolId = if (c.prog.isMergedId(sym)) c.prog.mergedSym(sym).parts else one[0..];
+        // The whole declaration set a member's `this` and type-parameter list
+        // belong to. `sym` may be ONE constituent of a cross-file merge — the
+        // declaration walk expands the file-local symbol so its members'
+        // diagnostics fire — and that partial expansion memoizes member
+        // signatures. Binding `this` to the constituent would bake a reference
+        // that expands to one file's members alone into those memos, which the
+        // merged expansion then inherits.
+        const owner = c.prog.mergedOf(sym) orelse sym;
 
         // Phase 1: direct members of every interface constituent, unioned with
         // earlier-file members winning on conflict (disjoint in the clean case;
@@ -5284,7 +5321,7 @@ const Checker = struct {
         var result: TypeId = types.no_type;
         for (parts) |csym| {
             if (!c.symFlags(csym).interface) continue;
-            const dm = try c.interfaceConstituentDirect(csym);
+            const dm = try c.interfaceConstituentDirect(csym, owner);
             result = if (result == types.no_type) dm else try c.mergeBaseObject(result, dm, true);
         }
         // An empty interface (no members, no bases) is still a nominal shape:
@@ -5294,7 +5331,7 @@ const Checker = struct {
         // members win, so an own member overrides an inherited one.
         for (parts) |csym| {
             if (!c.symFlags(csym).interface) continue;
-            result = try c.interfaceConstituentApplyBases(csym, result);
+            result = try c.interfaceConstituentApplyBases(csym, result, owner);
         }
         try c.iface_generic.put(c.cm(), sym, result);
         return result;
@@ -5302,6 +5339,14 @@ const Checker = struct {
 
     /// Set `this` to `sym`'s generic instance (polymorphic `this` return,
     /// `this` property/param types). Caller saves/restores `c.this_type`.
+    ///
+    /// `sym` must be the WHOLE declaration set — the merged id for a cross-file
+    /// merged interface, not one constituent. A `foo(): this` written in one
+    /// constituent denotes the merged interface, so binding `this` to the
+    /// constituent symbol would yield a reference that expands to that one
+    /// file's members alone (dropping the sibling constituent's members and its
+    /// `extends` bases), and a spurious mismatch against the base's own
+    /// `this`-returning member.
     fn setInterfaceThis(c: *Checker, sym: SymbolId) Error!void {
         var tps: std.ArrayList(TypeParamInfo) = .empty;
         defer tps.deinit(c.scratch());
@@ -5311,15 +5356,17 @@ const Checker = struct {
         c.this_type = try c.ts.makeRef(sym, args);
     }
 
-    /// Direct members (no `extends` bases) of one interface symbol: the union of
-    /// every reopened block's members, converted in the symbol's own file
-    /// context. See `interfaceGeneric` for why bases are applied separately.
-    fn interfaceConstituentDirect(c: *Checker, sym: SymbolId) Error!TypeId {
+    /// Direct members (no `extends` bases) of one interface constituent `sym`:
+    /// the union of every reopened block's members, converted in the symbol's
+    /// own file context. `owner` is the whole declaration set the constituent
+    /// belongs to (see `setInterfaceThis`). See `interfaceGeneric` for why
+    /// bases are applied separately.
+    fn interfaceConstituentDirect(c: *Checker, sym: SymbolId, owner: SymbolId) Error!TypeId {
         const saved_ctx = c.enterSymFile(sym);
         defer c.restoreCtx(saved_ctx);
         const saved_this = c.this_type;
         defer c.this_type = saved_this;
-        try c.setInterfaceThis(sym);
+        try c.setInterfaceThis(owner);
 
         var all_members: std.ArrayList(Node) = .empty;
         defer all_members.deinit(c.scratch());
@@ -5331,12 +5378,27 @@ const Checker = struct {
                 if (m != null_node) try all_members.append(c.scratch(), m);
             }
         }
-        // Convert members in the (first) interface scope.
+        // Convert members in one interface scope — the first block that
+        // declares the type parameters, else the first block. Reopened blocks
+        // bind a distinct type-param symbol per block and `buildInstMap` maps
+        // them all positionally, so any declaring block's scope resolves the
+        // parameter names; a block that omits the list entirely (legal when
+        // every parameter has a default) does not, so it must not be picked
+        // over one that has them. Mirrors `typeParamsOf`.
+        var scope_decl: Node = null_node;
         for (c.declsOf(sym)) |decl| {
-            if (c.nodeTag(decl) == .interface_decl) {
-                if (try c.scopeOf(decl)) |s| c.cur_scope = s;
+            if (c.nodeTag(decl) != .interface_decl) continue;
+            if (scope_decl == null_node) scope_decl = decl;
+            var tps: std.ArrayList(TypeParamInfo) = .empty;
+            defer tps.deinit(c.scratch());
+            try c.declTypeParams(decl, &tps);
+            if (tps.items.len > 0) {
+                scope_decl = decl;
                 break;
             }
+        }
+        if (scope_decl != null_node) {
+            if (try c.scopeOf(scope_decl)) |s| c.cur_scope = s;
         }
         return c.objectTypeFromMembers(all_members.items, types.obj_flag_not_inferable);
     }
@@ -5347,12 +5409,12 @@ const Checker = struct {
     /// recognized as a base cycle (TS2310); member/type-argument resolution
     /// stays out of the base phase, so a recursive reference through them is
     /// legal and reports nothing.
-    fn interfaceConstituentApplyBases(c: *Checker, sym: SymbolId, acc: TypeId) Error!TypeId {
+    fn interfaceConstituentApplyBases(c: *Checker, sym: SymbolId, acc: TypeId, owner: SymbolId) Error!TypeId {
         const saved_ctx = c.enterSymFile(sym);
         defer c.restoreCtx(saved_ctx);
         const saved_this = c.this_type;
         defer c.this_type = saved_this;
-        try c.setInterfaceThis(sym);
+        try c.setInterfaceThis(owner);
 
         var bases: std.ArrayList(TypeId) = .empty;
         defer bases.deinit(c.scratch());
@@ -5548,7 +5610,7 @@ const Checker = struct {
         if (c.prog.isMergedId(sym)) {
             for (c.prog.mergedSym(sym).parts) |p| {
                 if (!c.symFlags(p).interface) continue;
-                result = try c.mergeBaseObject(result, try c.interfaceConstituentDirect(p), true);
+                result = try c.mergeBaseObject(result, try c.interfaceConstituentDirect(p, sym), true);
             }
         }
         try c.class_inst_generic.put(c.cm(), sym, result);
@@ -6502,6 +6564,9 @@ const Checker = struct {
                 }
                 return false;
             },
+            // `this@I<T…>` is generic exactly when its home instance is (see
+            // the `.this_type` arm of `instantiateId`).
+            .this_type => return c.containsTypeParam(s.thisTypeInstance(t)),
             // A deferred conditional is "generic" (deferrable) iff any part
             // still mentions an *outer* type param. `infer_var` binders are not
             // type params, so they never make a conditional generic.
@@ -7024,6 +7089,17 @@ const Checker = struct {
                 for (try c.refArgsList(t)) |a| try args.append(c.scratch(), try c.instantiateId(a, map, map_id));
                 break :blk try s.makeRef(s.refSymbol(t), args.items);
             },
+            // A polymorphic `this` marker carries the home instance it was
+            // declared against (`I<T…>`); substituting the interface's type
+            // arguments must carry through it, so `this` inside `I<string>`
+            // denotes `this@I<string>` and not the still-generic `this@I<T>`.
+            // Without this, a `this`-returning member DECLARED on a derived
+            // interface never relates to the base's own `this`-returning
+            // member: the two markers reduce to `Derived<T_d>` and `Base<T_b>`,
+            // two unrelated free type params, instead of the concrete pair the
+            // caller is already relating (which the in-progress relation memo
+            // answers).
+            .this_type => try s.makeThisType(try c.instantiateId(s.thisTypeInstance(t), map, map_id)),
             .conditional => blk: {
                 const check0 = s.condCheck(t);
                 // Distribution: a naked type-param check distributes over a
@@ -18101,7 +18177,10 @@ const Checker = struct {
         defer tps.deinit(c.scratch());
         try c.typeParamsOf(sym, &tps);
         for (tps.items) |tp| {
-            const saved = c.enterSymFile(sym);
+            // The constraint/default nodes belong to the *type parameter's*
+            // declaring file, which for a merged interface need not be the
+            // merged symbol's representative file (see `fixTypeArgs`).
+            const saved = c.enterSymFile(tp.sym);
             defer c.restoreCtx(saved);
             c.cur_scope = c.symScope(tp.sym);
             if (tp.constraint != 0) _ = try c.typeFromTypeNode(tp.constraint);
