@@ -2853,8 +2853,16 @@ const Parser = struct {
     /// Tag name: `div`, `Foo`, or a member chain `A.B.C`, as a value
     /// expression the checker resolves (lowercase leaf = intrinsic).
     fn parseJsxTagName(p: *Parser) PE!Node {
-        const tok = try p.expectJsxName();
-        var node = try p.addNode(.{ .tag = .identifier, .main_token = tok, .data = .{ .lhs = 0, .rhs = 0 } });
+        // A tag name may be rooted at `this` (`<this.Component />`); only the
+        // root, never a member of the chain. The rescan runs first so a
+        // hyphenated custom element `<this-thing />` still lexes as one name.
+        p.rescanJsxName();
+        var node: Node = if (p.curTag() == .keyword_this)
+            try p.leaf(.this_expr)
+        else blk: {
+            const tok = try p.expectJsxName();
+            break :blk try p.addNode(.{ .tag = .identifier, .main_token = tok, .data = .{ .lhs = 0, .rhs = 0 } });
+        };
         while (p.curTag() == .dot) {
             const dot = try p.bump();
             const name = try p.expectMemberName();
@@ -4896,6 +4904,9 @@ test "jsx parses cleanly in tsx mode" {
         // custom-element tag lex as single names spanning `-`.
         "const h = <div data-foo=\"x\" aria-label=\"y\" />;",
         "const i = <my-widget data-n={1} />;",
+        // A tag name rooted at `this`, self-closing and with children.
+        "const j = <this.Component {...props} />;",
+        "const k = <this.a.B x={1}>child</this.a.B>;",
     };
     for (cases) |src| {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
