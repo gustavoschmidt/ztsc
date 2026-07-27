@@ -10643,6 +10643,19 @@ const Checker = struct {
             for (try c.memberList(t)) |m| try parts.append(c.scratch(), try c.awaitedType(m));
             return c.ts.makeUnion(c.scratch(), parts.items);
         }
+        // An INTERSECTION awaits through its thenable constituent. tsc reads
+        // the awaited type off the `then` member (`getPromisedTypeOfPromise`),
+        // and in `Promise<T> & { resolve; reject }` — the promise-with-
+        // resolvers shape — `then` comes from the promise half, so the result
+        // is `T`. Returning the whole intersection instead made every read off
+        // an awaited resolvable promise report TS2339.
+        if (c.ts.kind(t) == .intersection) {
+            for (try c.memberList(t)) |m| {
+                const a = try c.awaitedType(m);
+                if (a != m) return a;
+            }
+            return t;
+        }
         if (c.ts.kind(t) == .ref) {
             const sym = c.prog.globals.lookup(c.atom_Promise) orelse return t;
             if (c.ts.refSymbol(t) == sym) {
