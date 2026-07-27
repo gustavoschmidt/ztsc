@@ -3766,7 +3766,7 @@ const Checker = struct {
                         const i: u32 = @intFromFloat(v);
                         if (i < c.ts.tupleLen(rt)) {
                             const e = c.ts.tupleElem(rt, i);
-                            if (e.rest()) return c.elemOfArrayish(e.ty);
+                            if (e.rest()) return try c.elemOfArrayish(e.ty);
                             // An *optional* tuple element indexes to
                             // `T | undefined` (tsc's `getIndexedAccessType` over
                             // `[x?: T]` at `[0]`), the same undefined-widening the
@@ -3813,7 +3813,7 @@ const Checker = struct {
                 defer parts.deinit(c.scratch());
                 for (0..c.ts.tupleLen(r)) |i| {
                     const e = c.ts.tupleElem(r, @intCast(i));
-                    const et = if (e.rest()) c.elemOfArrayish(e.ty) else e.ty;
+                    const et = if (e.rest()) try c.elemOfArrayish(e.ty) else e.ty;
                     try parts.append(c.scratch(), et);
                 }
                 return c.ts.makeUnion(c.scratch(), parts.items);
@@ -3860,8 +3860,52 @@ const Checker = struct {
         return null;
     }
 
-    fn elemOfArrayish(c: *Checker, t: TypeId) TypeId {
-        return if (c.ts.kind(t) == .array) c.ts.arrayElem(t) else types.any_type;
+    /// The element type behind an "arrayish" position — a tuple's rest element
+    /// (`[...xs: T]`) or a rest parameter (`...args: T`).
+    ///
+    /// A *tuple* T answers with its numeric index type (the union of its
+    /// element types), not `any`: `(...args: [A, B])` used to erase both
+    /// positions to `any`, which silently accepted every argument and every
+    /// destructured element. Named tuple rest params are the standard way a
+    /// higher-order helper forwards a call (`<T extends any[]>(fn: (...a: T) =>
+    /// void)` instantiated at `[string, number]`), so the erasure removed
+    /// argument checking from every such call site.
+    fn elemOfArrayish(c: *Checker, t: TypeId) Error!TypeId {
+        const r = if (c.ts.kind(t) == .ref) try c.resolveStructural(t) else t;
+        return switch (c.ts.kind(r)) {
+            .array => c.ts.arrayElem(r),
+            .tuple => try c.numberIndexType(r),
+            else => types.any_type,
+        };
+    }
+
+    /// The fixed tuple a *trailing rest parameter* is typed by, if any.
+    /// `(...args: [a: A, b?: B])` has exactly the parameter list `(a: A, b?: B)`
+    /// — tsc expands such a signature before any arity or argument check
+    /// (`getExpandedParameters`). A generic (`...args: T`) or plain array
+    /// (`...args: A[]`) rest has no expansion and stays unbounded.
+    fn restTupleOf(c: *Checker, p: types.Param) Error!?TypeId {
+        if (!p.rest()) return null;
+        const r = try c.resolveStructural(p.ty);
+        if (c.ts.kind(r) != .tuple) return null;
+        // A *variadic* tuple whose spread is not last — rxjs's
+        // `[...ObservableInputTuple<T>, SchedulerLike]` — has no positional
+        // expansion: the elements after the spread sit at an arity nobody
+        // knows yet. Leave those signatures unexpanded (unbounded rest, the
+        // pre-existing behaviour) rather than mis-assigning position 1 to the
+        // trailing element.
+        const len = c.ts.tupleLen(r);
+        for (0..len) |i| {
+            if (c.ts.tupleElem(r, @intCast(i)).rest() and i != len - 1) return null;
+        }
+        return r;
+    }
+
+    /// The trailing rest parameter's expansion tuple for a whole signature.
+    fn sigRestTuple(c: *Checker, sig: TypeId) Error!?TypeId {
+        const count = c.ts.fnParamCount(sig);
+        if (count == 0) return null;
+        return c.restTupleOf(c.ts.fnParam(sig, count - 1));
     }
 
     /// Copy union members to scratch: slices into the type store dangle
@@ -4541,7 +4585,7 @@ const Checker = struct {
         } else if (init_node != 0) {
             ty = try c.widenLiteral(try c.checkExprCached(init_node, types.no_type));
         } else if (ctx_sig != types.no_type and c.ts.kind(ctx_sig) == .function) {
-            if (c.paramTypeAt(ctx_sig, index)) |ct| ty = ct;
+            if (try c.paramTypeAt(ctx_sig, index)) |ct| ty = ct;
         }
         if (ty == types.no_type) {
             // `noImplicitAny: false` suppresses TS7006 — the parameter still
@@ -11358,7 +11402,7 @@ const Checker = struct {
                     const elem = c.ts.arrayElem(t);
                     for (0..c.ts.tupleLen(s)) |i| {
                         const e = c.ts.tupleElem(s, @intCast(i));
-                        const et = if (e.rest()) c.elemOfArrayish(e.ty) else e.ty;
+                        const et = if (e.rest()) try c.elemOfArrayish(e.ty) else e.ty;
                         if (!try c.isAssignable(et, elem)) return false;
                     }
                     return true;
@@ -11466,22 +11510,22 @@ const Checker = struct {
         if (!t_has_rest and (s_len > t_len or s_has_rest)) return false;
         for (0..s_len) |i| {
             const se = c.ts.tupleElem(s, @intCast(i));
-            const st = if (se.rest()) c.elemOfArrayish(se.ty) else se.ty;
-            const tt = c.tupleElemTypeAt(t, @intCast(i)) orelse return false;
+            const st = if (se.rest()) try c.elemOfArrayish(se.ty) else se.ty;
+            const tt = try c.tupleElemTypeAt(t, @intCast(i)) orelse return false;
             if (!try c.isAssignable(st, tt)) return false;
         }
         return true;
     }
 
-    fn tupleElemTypeAt(c: *Checker, t: TypeId, i: u32) ?TypeId {
+    fn tupleElemTypeAt(c: *Checker, t: TypeId, i: u32) Error!?TypeId {
         const len = c.ts.tupleLen(t);
         if (i < len) {
             const e = c.ts.tupleElem(t, i);
-            return if (e.rest()) c.elemOfArrayish(e.ty) else e.ty;
+            return if (e.rest()) try c.elemOfArrayish(e.ty) else e.ty;
         }
         if (len > 0) {
             const last = c.ts.tupleElem(t, len - 1);
-            if (last.rest()) return c.elemOfArrayish(last.ty);
+            if (last.rest()) return try c.elemOfArrayish(last.ty);
         }
         return null;
     }
@@ -11858,14 +11902,14 @@ const Checker = struct {
         if (c.ts.fnTypeParams(s).len == 0 and c.ts.fnTypeParams(t).len > 0) {
             se = try c.eraseParamsOf(se, t);
         }
-        if (try c.requiredParams(se) > c.paramTotal(te)) return false;
-        const s_count = c.ts.fnParamCount(se);
-        const t_count = c.ts.fnParamCount(te);
-        const pairs = @min(c.paramTotal(se), @max(s_count, t_count));
+        if (try c.requiredParams(se) > try c.paramTotal(te)) return false;
+        const s_count = try c.effParamCount(se);
+        const t_count = try c.effParamCount(te);
+        const pairs = @min(try c.paramTotal(se), @max(s_count, t_count));
         var i: u32 = 0;
         while (i < pairs) : (i += 1) {
-            var sp = c.paramTypeAt(se, i) orelse break;
-            const tp = c.paramTypeAt(te, i) orelse break;
+            var sp = try c.paramTypeAt(se, i) orelse break;
+            const tp = try c.paramTypeAt(te, i) orelse break;
             // An optional *source* parameter admits `undefined` at the call
             // site, so its effective type for the contravariant relation is
             // `T | undefined` — exactly as an explicit `?` target param already
@@ -12135,30 +12179,66 @@ const Checker = struct {
     }
 
     /// i-th effective parameter type (expanding a trailing rest).
-    fn paramTypeAt(c: *Checker, sig: TypeId, i: u32) ?TypeId {
+    fn paramTypeAt(c: *Checker, sig: TypeId, i: u32) Error!?TypeId {
         const count = c.ts.fnParamCount(sig);
+        // A trailing rest typed by a fixed tuple *is* that parameter list.
+        if (count > 0) {
+            if (try c.sigRestTuple(sig)) |tup| {
+                if (i < count - 1) return c.ts.fnParam(sig, i).ty;
+                return c.tupleElemTypeAt(tup, i - (count - 1));
+            }
+        }
         if (i < count) {
             const p = c.ts.fnParam(sig, i);
-            return if (p.rest()) c.elemOfArrayish(p.ty) else p.ty;
+            return if (p.rest()) try c.elemOfArrayish(p.ty) else p.ty;
         }
         if (count > 0) {
             const last = c.ts.fnParam(sig, count - 1);
-            if (last.rest()) return c.elemOfArrayish(last.ty);
+            if (last.rest()) return try c.elemOfArrayish(last.ty);
         }
         return null;
     }
 
-    fn paramTotal(c: *Checker, sig: TypeId) u32 {
+    /// Highest accepted argument count (`maxInt` = unbounded).
+    fn paramTotal(c: *Checker, sig: TypeId) Error!u32 {
         const count = c.ts.fnParamCount(sig);
-        if (count > 0 and c.ts.fnParam(sig, count - 1).rest()) return std.math.maxInt(u32);
+        if (count == 0 or !c.ts.fnParam(sig, count - 1).rest()) return count;
+        if (try c.sigRestTuple(sig)) |tup| {
+            const len = c.ts.tupleLen(tup);
+            if (len > 0 and c.ts.tupleElem(tup, len - 1).rest()) return std.math.maxInt(u32);
+            return count - 1 + len;
+        }
+        return std.math.maxInt(u32);
+    }
+
+    /// Number of effective parameter *positions* — `paramTotal` without the
+    /// unbounded-rest saturation, so it can bound a pairwise loop.
+    fn effParamCount(c: *Checker, sig: TypeId) Error!u32 {
+        const total = try c.paramTotal(sig);
+        if (total != std.math.maxInt(u32)) return total;
+        const count = c.ts.fnParamCount(sig);
+        if (try c.sigRestTuple(sig)) |tup| return count - 1 + c.ts.tupleLen(tup);
         return count;
     }
 
     fn requiredParams(c: *Checker, sig: TypeId) Error!u32 {
         var n: u32 = 0;
-        for (0..c.ts.fnParamCount(sig)) |i| {
+        const count = c.ts.fnParamCount(sig);
+        for (0..count) |i| {
             const p = c.ts.fnParam(sig, @intCast(i));
-            if (p.optional() or p.rest()) break;
+            if (p.optional()) break;
+            if (p.rest()) {
+                // Expanded rest tuple: its leading non-optional, non-rest
+                // elements are required parameters too.
+                if (try c.restTupleOf(p)) |tup| {
+                    for (0..c.ts.tupleLen(tup)) |j| {
+                        const e = c.ts.tupleElem(tup, @intCast(j));
+                        if (e.optional() or e.rest()) break;
+                        n += 1;
+                    }
+                }
+                break;
+            }
             n += 1;
         }
         // tsc's `getMinArgumentCount` walks back from the last required
@@ -12167,7 +12247,8 @@ const Checker = struct {
         // `ActionCreatorWithoutPayload`, `(noArgument: void) => …`) is thus
         // callable with zero arguments and assignable to `() => T`.
         while (n > 0) {
-            if (!try c.paramAcceptsVoid(c.ts.fnParam(sig, n - 1).ty)) break;
+            const pt = (try c.paramTypeAt(sig, n - 1)) orelse break;
+            if (!try c.paramAcceptsVoid(pt)) break;
             n -= 1;
         }
         return n;
@@ -12252,7 +12333,7 @@ const Checker = struct {
                     if (el == null_node) continue;
                     defer i += 1;
                     if (c.nodeTag(el) == .omitted or c.nodeTag(el) == .spread_element) continue;
-                    const tt = if (rtk == .array) c.ts.arrayElem(rt) else (c.tupleElemTypeAt(rt, i) orelse continue);
+                    const tt = if (rtk == .array) c.ts.arrayElem(rt) else (try c.tupleElemTypeAt(rt, i) orelse continue);
                     const et = c.nodeType(el) orelse continue;
                     if (try c.isAssignable(et, tt)) continue;
                     if (!try c.elaborateLiteralError(el, et, tt)) {
@@ -12314,12 +12395,12 @@ const Checker = struct {
     }
 
     fn callbackParamsCompatible(c: *Checker, s: TypeId, t: TypeId) Error!bool {
-        if (try c.requiredParams(s) > c.paramTotal(t)) return false;
-        const pairs = @min(c.paramTotal(s), @max(c.ts.fnParamCount(s), c.ts.fnParamCount(t)));
+        if (try c.requiredParams(s) > try c.paramTotal(t)) return false;
+        const pairs = @min(try c.paramTotal(s), @max(try c.effParamCount(s), try c.effParamCount(t)));
         var i: u32 = 0;
         while (i < pairs) : (i += 1) {
-            const sp = c.paramTypeAt(s, i) orelse break;
-            const tp = c.paramTypeAt(t, i) orelse break;
+            const sp = try c.paramTypeAt(s, i) orelse break;
+            const tp = try c.paramTypeAt(t, i) orelse break;
             if (!try c.isAssignable(tp, sp) and !try c.isAssignable(sp, tp)) return false;
         }
         return true;
@@ -13735,7 +13816,7 @@ const Checker = struct {
             }
             var ectx: TypeId = ctx_elem;
             if (ctx_tuple) {
-                ectx = c.tupleElemTypeAt(ctx_tuple_ty, i) orelse types.no_type;
+                ectx = try c.tupleElemTypeAt(ctx_tuple_ty, i) orelse types.no_type;
             }
             var et = try c.checkExprCached(el, ectx);
             if (!try c.keepLiteral(et, ectx)) et = try c.widenLiteral(et);
@@ -14612,7 +14693,7 @@ const Checker = struct {
                     if (iv < c.ts.tupleLen(rt)) {
                         const e = c.ts.tupleElem(rt, iv);
                         result = if (e.optional()) try c.makeUnion2(e.ty, types.undefined_type) else e.ty;
-                    } else if (c.tupleElemTypeAt(rt, iv)) |et| {
+                    } else if (try c.tupleElemTypeAt(rt, iv)) |et| {
                         result = et;
                     } else {
                         try c.diagFmt(2493, c.nodeSpan(d.rhs), "Tuple type '{s}' of length '{d}' has no element at index '{d}'.", .{
@@ -15576,7 +15657,7 @@ const Checker = struct {
             // two type args, so the generic overload is chosen instead.
             if (explicit_targs.len > 0 and !c.sigTargArityOk(sig, explicit_targs.len)) continue;
             const inst = try c.instantiateSigForCall(sig, explicit_targs, arg_nodes, node, ret_ctx);
-            if (nargs < try c.requiredParams(inst) or nargs > c.paramTotal(inst)) continue;
+            if (nargs < try c.requiredParams(inst) or nargs > try c.paramTotal(inst)) continue;
             if (try c.argumentsMatch(inst, arg_nodes)) {
                 try c.checkCallArguments(node, inst, arg_nodes, true);
                 return if (instance_ret != types.no_type) instance_ret else c.ts.fnReturn(inst);
@@ -15906,7 +15987,7 @@ const Checker = struct {
             defer ai += 1;
             const tag = c.nodeTag(an);
             if (tag == .arrow_fn or tag == .function_expr) continue;
-            const pt = c.paramTypeAt(sig, ai) orelse continue;
+            const pt = try c.paramTypeAt(sig, ai) orelse continue;
             // Contextually type an array literal by the parameter so a
             // tuple-constrained target (`T extends readonly unknown[] | []`)
             // infers a tuple, not a widened array — the crux of picking the
@@ -16008,7 +16089,7 @@ const Checker = struct {
             defer ai += 1;
             const tag = c.nodeTag(an);
             if (tag != .arrow_fn and tag != .function_expr) continue;
-            const pt0 = c.paramTypeAt(sig, ai) orelse continue;
+            const pt0 = try c.paramTypeAt(sig, ai) orelse continue;
             const pt_partial = try c.instantiate(pt0, partial);
             const at = try c.checkExprCached(an, pt_partial);
             try c.unify(pt0, at, tp_syms, candidates, 0);
@@ -17003,7 +17084,7 @@ const Checker = struct {
             if (an == null_node) continue;
             defer ai += 1;
             if (c.nodeTag(an) == .spread_element) return true; // don't reject on spreads
-            const pt = c.paramTypeAt(sig, ai) orelse {
+            const pt = try c.paramTypeAt(sig, ai) orelse {
                 c.diags.items.len = saved_diags;
                 return false;
             };
@@ -17057,7 +17138,7 @@ const Checker = struct {
         if (!c.owned_mask[c.cur_file]) return;
         const nargs = countArgs(arg_nodes);
         const required = try c.requiredParams(sig);
-        const total = c.paramTotal(sig);
+        const total = try c.paramTotal(sig);
         var has_spread = false;
         for (arg_nodes) |an| {
             if (an != null_node and c.nodeTag(an) == .spread_element) has_spread = true;
@@ -17089,7 +17170,7 @@ const Checker = struct {
                 _ = try c.checkExprCached(an, types.no_type);
                 continue;
             }
-            const pt = c.paramTypeAt(sig, ai) orelse {
+            const pt = try c.paramTypeAt(sig, ai) orelse {
                 _ = try c.checkExprCached(an, types.no_type);
                 continue;
             };
@@ -20021,13 +20102,13 @@ const Checker = struct {
         // *requires* more can never resolve (tsc: "expects N").
         if (try c.requiredParams(sig) > 2) return false;
         // Value argument vs the first parameter.
-        if (c.paramTypeAt(sig, 0)) |p0| {
+        if (try c.paramTypeAt(sig, 0)) |p0| {
             if (!try c.decoAcceptsValue(pos, value, p0)) return false;
         }
         // Context argument vs the second parameter: fail only on an
         // unambiguous decorator-context kind mismatch.
         if (ctx_sym != null) {
-            if (c.paramTypeAt(sig, 1)) |p1| {
+            if (try c.paramTypeAt(sig, 1)) |p1| {
                 if (c.decoContextMismatch(p1, ctx_sym.?)) return false;
             }
         }
