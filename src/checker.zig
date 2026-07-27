@@ -15275,8 +15275,10 @@ const Checker = struct {
     /// param would otherwise stay unbound.
     fn inferReverseMapped(c: *Checker, m: TypeId, arg: TypeId, tp_syms: []const u32, candidates: []TypeId, depth: u32) Error!void {
         const s = &c.ts;
-        if (!s.mappedHomomorphic(m)) return; // only `[K in keyof S]`
         if (s.mappedAs(m) != 0) return; // no key remap
+        // `{ [P in K]: … }` with `K` itself an inference target (`Pick<S, K>`):
+        // the key set is what the argument tells us. Handled separately below.
+        if (!s.mappedHomomorphic(m)) return c.inferMappedKeySet(m, arg, tp_syms, candidates);
         const src = s.mappedSource(m);
         if (s.kind(src) != .type_param) return; // source must be a bare param
         const src_sym = s.typeParamSymbol(src);
@@ -15334,6 +15336,41 @@ const Checker = struct {
             obj
         else
             try c.makeUnion2(candidates[idx], obj);
+    }
+
+    /// Key-set inference into a NON-homomorphic mapped target whose constraint is
+    /// a bare type parameter we are inferring — tsc's `inferToMappedType`
+    /// TypeParameter branch: "We're inferring from some source type S to a mapped
+    /// type `{ [P in K]: X }`, where K is a type parameter. First infer from
+    /// `keyof S` to K." This is the `Pick<S, K>` shape, and the reason
+    /// `this.setState({ a: 1 })` type-checks: `setState<K extends keyof S>(state:
+    /// Pick<S, K> | S | null)` recovers `K = "a"` from the argument's own keys.
+    /// Without it `K` stayed unbound, fell back to its `keyof S` constraint, and
+    /// `Pick<S, keyof S>` — the FULL state — rejected every partial update
+    /// (TS2345).
+    ///
+    /// Deliberately narrow: the argument must be an object (so `keyof` is its
+    /// literal key union, never a primitive's approximated member set) and the
+    /// constraint must be a bare in-scope param. tsc's further fallbacks (recurse
+    /// into K's own constraint, then infer the source's property-type union into
+    /// the value template) are not implemented — they can only add inferences,
+    /// and the `Pick` shape needs neither.
+    fn inferMappedKeySet(c: *Checker, m: TypeId, arg: TypeId, tp_syms: []const u32, candidates: []TypeId) Error!void {
+        const s = &c.ts;
+        const con = s.mappedConstraint(m);
+        if (s.kind(con) != .type_param) return;
+        const ki = tpIndex(tp_syms, s.typeParamSymbol(con)) orelse return;
+        const ra = try c.resolveStructural(arg);
+        if (s.kind(ra) != .object) return;
+        if (s.objectPropCount(ra) == 0) return;
+        const keys = try c.keyofType(ra);
+        // A key set is authoritative for its own param: an uninformative `any`
+        // bound by a sibling union member (`Pick<S, K> | S | null`, where the
+        // whole-`S` member matched first) must not survive next to it.
+        candidates[ki] = if (candidates[ki] == types.no_type or candidates[ki] == types.any_type)
+            keys
+        else
+            try c.makeUnion2(candidates[ki], keys);
     }
 
     /// Drop bare `type_param` members from a reverse-mapped element inference.
