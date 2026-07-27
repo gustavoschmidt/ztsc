@@ -16547,7 +16547,11 @@ const Checker = struct {
         const ki = tpIndex(tp_syms, s.typeParamSymbol(con)) orelse return;
         const ra = try c.resolveStructural(arg);
         if (s.kind(ra) != .object) return;
-        if (s.objectPropCount(ra) == 0) return;
+        // An EMPTY object argument is informative, not a miss: `Pick<S, K>` with
+        // no keys means `K = never` (`Pick<S, never>` = `{}`), which is what tsc
+        // infers for `setState({})`. Bailing out left `K` to its `keyof S`
+        // constraint, so the target became the whole state and `{}` failed with
+        // every property reported missing.
         const keys = try c.keyofType(ra);
         // A key set is authoritative for its own param: an uninformative `any`
         // bound by a sibling union member (`Pick<S, K> | S | null`, where the
