@@ -5739,6 +5739,28 @@ const Checker = struct {
         }
         const fixed = try c.fixTypeArgs(sym, args, tok) orelse return types.error_type;
         const generic = try c.aliasGeneric(sym);
+        // ONE spelling for a recursive alias whose body is an INTERSECTION.
+        //
+        // The cycle-cut arm above leaves a lazy `.ref` for every reference taken
+        // while the body was still materializing; a reference taken afterwards
+        // gets a separately interned structural materialization. Both denote the
+        // same type, but they are distinct `TypeId`s, so `makeUnion` /
+        // `makeIntersection` cannot dedupe them and a union can carry the same
+        // type under both spellings — and WHICH references fall inside the cycle
+        // depends on the order files are visited, i.e. on the checker count.
+        //
+        // Answering with the ref in BOTH cases makes the spelling of a recursive
+        // alias one thing. Scoped to an intersection body, which is exactly the
+        // excalidraw element shape (`_ExcalidrawElementBase & { type: … }`) whose
+        // two spellings drive the partition-sensitive element-union family, and
+        // where the `origin` machinery already treats a ref and its
+        // materialization as interchangeable. An object/function body measured
+        // as a no-op; a union body must stay materialized (a `.ref` standing in
+        // for a union is not interchangeable — discriminant narrowing and the
+        // union-source arms switch on `.union_type` directly).
+        if (c.alias_recursive.contains(sym) and c.ts.kind(generic) == .intersection) {
+            return c.ts.makeRef(sym, fixed);
+        }
         var tps: std.ArrayList(TypeParamInfo) = .empty;
         defer tps.deinit(c.scratch());
         try c.typeParamsOf(sym, &tps);
