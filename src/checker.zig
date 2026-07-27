@@ -821,6 +821,10 @@ const Checker = struct {
     atom_Number: Atom = 0,
     atom_Boolean: Atom = 0,
     atom_Function: Atom = 0,
+    atom_Object: Atom = 0,
+    /// Guard against `objectInterfaceProp` recursing through the `Object`
+    /// interface's own member lookup.
+    in_object_iface: bool = false,
     // Names of the lib interfaces async/await + generators bridge to.
     atom_Promise: Atom = 0,
     atom_PromiseLike: Atom = 0,
@@ -960,6 +964,7 @@ const Checker = struct {
         c.atom_Number = try c.atom("Number");
         c.atom_Boolean = try c.atom("Boolean");
         c.atom_Function = try c.atom("Function");
+        c.atom_Object = try c.atom("Object");
         c.atom_Promise = try c.atom("Promise");
         c.atom_PromiseLike = try c.atom("PromiseLike");
         c.atom_Generator = try c.atom("Generator");
@@ -9769,8 +9774,17 @@ const Checker = struct {
                 // (`.bind`/`.call`/`.apply`/`.name`/`.length`/…). Plain
                 // (non-callable) objects do NOT — an absent member stays TS2339.
                 if (s.objectCallSigCount(t) > 0 or s.objectConstructSigCount(t) > 0) {
-                    return c.functionInterfaceProp(name);
+                    if (try c.functionInterfaceProp(name)) |p| return p;
                 }
+                // Every object type also has the apparent members of the global
+                // `Object` interface — `hasOwnProperty`, `toString`,
+                // `valueOf`, … — the tail of tsc's `getPropertyOfType`
+                // (`return getPropertyOfObjectType(globalObjectType, name)`).
+                // Member access only: the assignability relation asks a
+                // *target*'s own property list, and `isKnownProperty` (the
+                // excess-property check) deliberately does not consult the
+                // global object type.
+                if (allow_index) return c.objectInterfaceProp(name);
                 return null;
             },
             .union_type => {
@@ -9883,6 +9897,26 @@ const Checker = struct {
         const sym = c.prog.globals.lookup(c.atom_Function) orelse return null;
         if (!c.symFlags(sym).interface) return null;
         const ref = try c.ts.makeRef(sym, &.{});
+        return c.propOfType(try c.resolveStructural(ref), name);
+    }
+
+    /// Look `name` up on the global `Object` interface — the
+    /// `Object.prototype` members (`hasOwnProperty`/`isPrototypeOf`/
+    /// `propertyIsEnumerable`/`toString`/`toLocaleString`/`valueOf`/
+    /// `constructor`) that tsc gives every object type. Returns null when the
+    /// lib has no `Object` interface (`--noLib`) or the name genuinely isn't
+    /// one of its members, so a bogus member still degrades to TS2339.
+    ///
+    /// Re-entrancy: the `Object` interface's own member lookup lands back in
+    /// the `.object` arm that calls this, so a miss there would recurse
+    /// forever. The flag makes the inner lookup a plain one.
+    fn objectInterfaceProp(c: *Checker, name: Atom) Error!?types.Prop {
+        if (c.in_object_iface) return null;
+        const sym = c.prog.globals.lookup(c.atom_Object) orelse return null;
+        if (!c.symFlags(sym).interface) return null;
+        const ref = try c.ts.makeRef(sym, &.{});
+        c.in_object_iface = true;
+        defer c.in_object_iface = false;
         return c.propOfType(try c.resolveStructural(ref), name);
     }
 
