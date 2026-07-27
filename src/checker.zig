@@ -10484,6 +10484,30 @@ const Checker = struct {
                 if (constraint == types.no_type) return null;
                 return c.propOfTypeEx(try c.resolveStructural(constraint), name, allow_index);
             },
+            .mapped => {
+                // A DEFERRED homomorphic map has no members of its own, but its
+                // APPARENT members are the map applied to its source's base
+                // constraint — tsc resolves `x.a` inside `<T extends Base>(x:
+                // Mutable<T>)` through `getBaseConstraintOfType` on the
+                // modifiers type, yielding `T["a"]`. Member access only: the
+                // structural relation must not invent members a still-generic
+                // map does not have.
+                if (!allow_index) return null;
+                if (!s.mappedHomomorphic(t)) return null;
+                const src = s.mappedSource(t);
+                const bc = try c.transitiveBaseConstraint(src);
+                if (bc == src) return null;
+                const inst = try c.reduceMapped(
+                    s.mappedKeyParam(t),
+                    s.mappedConstraint(t),
+                    s.mappedValue(t),
+                    s.mappedAs(t),
+                    bc,
+                    s.mappedFlags(t),
+                );
+                if (s.kind(inst) == .mapped) return null; // key set still generic
+                return c.propOfTypeEx(inst, name, allow_index);
+            },
             .ref => return c.propOfTypeEx(try c.resolveStructural(t), name, allow_index),
             .class_value => return c.propOfTypeEx(try c.classStaticType(s.classSymbol(t)), name, allow_index),
             .enum_type => {
@@ -11396,6 +11420,11 @@ const Checker = struct {
             }
             return false;
         }
+        // Deferred (still generic) mapped types. Self-contained: every shape it
+        // does not recognize returns null and falls through unchanged.
+        if (sk == .mapped or tk == .mapped) {
+            if (try c.mappedAssignable(s, t, sk, tk)) |r| return r;
+        }
         if (sk == .intersection) {
             for (try c.memberList(s)) |m| {
                 if (try c.isAssignable(m, t)) return true;
@@ -11510,6 +11539,71 @@ const Checker = struct {
             .class_value => return false,
             else => return false,
         }
+    }
+
+    /// The key set a mapped type iterates: `keyof <source>` for a homomorphic
+    /// map (`[P in keyof T]`), the written constraint otherwise.
+    fn mappedKeySet(c: *Checker, m: TypeId) Error!TypeId {
+        if (c.ts.mappedHomomorphic(m)) return c.keyofType(c.ts.mappedSource(m));
+        return c.ts.mappedConstraint(m);
+    }
+
+    fn mappedAddsOptional(c: *Checker, m: TypeId) bool {
+        return c.ts.mappedFlags(m) & types.mapped_flag_optional_add != 0;
+    }
+
+    /// Assignability for a DEFERRED mapped type — one whose key set is still
+    /// generic, so it has no members to walk. Without these rules such a type
+    /// is opaque: `Mutable<T>` was not assignable to `Readonly<T>`, to another
+    /// alias with identical text, or to `T` itself, and every generic helper
+    /// written against one reported a phantom TS2322/TS2345.
+    ///
+    /// PURELY ADDITIVE: every path that does not establish the relation returns
+    /// null, so the caller falls through to exactly what it did before (a
+    /// deferred mapped type is still an `object`, still a `for…in` operand).
+    /// Readonly-ness is ignored throughout, exactly as it is for object
+    /// properties; optionality is not — a map that ADDS `?` (`Partial<T>`) is
+    /// not related to one that does not.
+    fn mappedAssignable(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: types.Kind) Error!?bool {
+        if (sk == .mapped and tk == .mapped) {
+            // tsc's `mappedTypeRelatedTo`: the modifiers must be compatible,
+            // the TARGET's key set must be related to the source's (contra-
+            // variant — the target iterates no more keys than the source), and
+            // the templates must relate with the two key parameters identified.
+            if (c.mappedAddsOptional(s) and !c.mappedAddsOptional(t)) return null;
+            if (c.ts.mappedAs(s) != 0 or c.ts.mappedAs(t) != 0) return null; // key remapping: not modelled
+            if (!try c.isAssignable(try c.mappedKeySet(t), try c.mappedKeySet(s))) return null;
+            const sv = try c.substMappedKey(
+                c.ts.mappedValue(s),
+                c.ts.mappedParamId(c.ts.mappedKeyParam(s)),
+                c.ts.mappedKeyParam(t),
+            );
+            return if (try c.isAssignable(sv, c.ts.mappedValue(t))) true else null;
+        }
+        if (tk == .mapped) {
+            // tsc `structuredTypeRelatedTo`: `S` is related to `{ [P in C]: X }`
+            // when `keyof S` is related to `C` and `S[P]` is related to `X`.
+            // Guarded, as tsc guards it, on the target not adding `?` — that
+            // direction (`S` → `Partial<S>`) is a different rule.
+            if (c.mappedAddsOptional(t) or c.ts.mappedAs(t) != 0) return null;
+            if (!try c.isAssignable(try c.keyofType(s), try c.mappedKeySet(t))) return null;
+            const access = try c.reduceIndexedAccess(s, c.ts.mappedKeyParam(t));
+            return if (try c.isAssignable(access, c.ts.mappedValue(t))) true else null;
+        }
+        // A homomorphic identity map with only modifier changes IS its source
+        // (`Readonly<P>` → `P`). A map that adds `?` is not, and one that
+        // rewrites the template is not.
+        if (c.ts.mappedHomomorphic(s) and !c.mappedAddsOptional(s) and c.ts.mappedAs(s) == 0) {
+            const src = c.ts.mappedSource(s);
+            const v = c.ts.mappedValue(s);
+            if (c.ts.kind(v) == .index_access and
+                c.ts.indexAccessObj(v) == src and
+                c.ts.indexAccessIndex(v) == c.ts.mappedKeyParam(s))
+            {
+                return if (try c.isAssignable(src, t)) true else null;
+            }
+        }
+        return null;
     }
 
     /// tsc's `getBaseConstraintOfType`: follow constraints all the way down.
