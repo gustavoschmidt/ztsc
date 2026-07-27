@@ -48,3 +48,11 @@ instantiation/018_growing_template_hole_no_loop.ts  +TS2589 18
 # TS2307 the oracle emits is deliberately traded for crash safety. See the
 # comment in the case entry.ts.
 modules/39_exports_subpath_block  -TS2307 entry.ts 12
+
+# A compound assignment (`x += 1`, `x -= 1`, ...) does not check that its
+# result is assignable back to the target, so the oracle's TS2322 on
+# `mv += 1` where `mv: number & { _brand }` is missed. Pre-existing and
+# independent of the operand classification the case is about: the plain
+# assignments on lines 11-12 of the same case prove `number` is still not
+# assignable to the brand. Deterministic under-report of a whole check.
+operators/004_branded_intersection_not_numeric.ts  -TS2322 31

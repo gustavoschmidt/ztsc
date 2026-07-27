@@ -13362,7 +13362,7 @@ const Checker = struct {
                 if (c.ts.kind(rl) == .number_literal) {
                     return c.ts.makeNumberLiteral(-c.ts.numberValue(rl), c.ts.isFreshLiteral(ot));
                 }
-                if (c.isBigintish(ot)) return types.bigint_type;
+                if (try c.isBigintish(ot)) return types.bigint_type;
                 return types.number_type;
             },
             .plus, .tilde => {
@@ -13381,8 +13381,8 @@ const Checker = struct {
         }
     }
 
-    fn isNumberish(c: *Checker, t: TypeId) bool {
-        return c.unionAnyMemberAll(t, struct {
+    fn isNumberish(c: *Checker, t: TypeId) Error!bool {
+        return c.hasPrimitiveFacet(t, struct {
             fn f(ch: *Checker, m: TypeId) bool {
                 return switch (ch.ts.kind(m)) {
                     .number, .number_literal, .number_literal_fresh, .any, .err, .never => true,
@@ -13390,22 +13390,22 @@ const Checker = struct {
                     else => false,
                 };
             }
-        }.f);
+        }.f, 0);
     }
 
-    fn isBigintish(c: *Checker, t: TypeId) bool {
-        return c.unionAnyMemberAll(t, struct {
+    fn isBigintish(c: *Checker, t: TypeId) Error!bool {
+        return c.hasPrimitiveFacet(t, struct {
             fn f(ch: *Checker, m: TypeId) bool {
                 return switch (ch.ts.kind(m)) {
                     .bigint, .bigint_literal, .any, .err, .never => true,
                     else => false,
                 };
             }
-        }.f);
+        }.f, 0);
     }
 
-    fn isStringish(c: *Checker, t: TypeId) bool {
-        return c.unionAnyMemberAll(t, struct {
+    fn isStringish(c: *Checker, t: TypeId) Error!bool {
+        return c.hasPrimitiveFacet(t, struct {
             fn f(ch: *Checker, m: TypeId) bool {
                 return switch (ch.ts.kind(m)) {
                     .string, .string_literal, .any, .err, .never => true,
@@ -13413,25 +13413,70 @@ const Checker = struct {
                     else => false,
                 };
             }
-        }.f);
+        }.f, 0);
     }
 
-    fn unionAnyMemberAll(c: *Checker, t: TypeId, comptime f: fn (*Checker, TypeId) bool) bool {
-        if (c.ts.kind(t) == .union_type) {
-            for (0..c.ts.memberCount(t)) |i| {
-                if (!f(c, c.ts.memberAt(t, i))) return false;
-            }
-            return true;
+    /// Does `t` carry the primitive facet tested by `f`? tsc classifies
+    /// operands of arithmetic / relational / `+` expressions by assignability
+    /// to the primitive (`isTypeAssignableToKind`), so the test looks through
+    /// exactly what assignability looks through: a union qualifies when EVERY
+    /// constituent does, an intersection when ANY constituent does — a branded
+    /// `number & { _brand: "radian" }` IS a number for arithmetic — an alias
+    /// `.ref` through its expansion, and a type parameter through its
+    /// constraint. Each composite is first scanned with the leaf test alone —
+    /// that settles the common shapes (`number | number`, `number & {brand}`)
+    /// without touching the allocator; only the recursive fallback copies the
+    /// members to scratch, because expanding a ref mid-iteration can intern a
+    /// type and invalidate the store slice.
+    fn hasPrimitiveFacet(c: *Checker, t: TypeId, comptime f: fn (*Checker, TypeId) bool, depth: u32) Error!bool {
+        if (f(c, t)) return true;
+        if (depth > 8) return false;
+        switch (c.ts.kind(t)) {
+            .union_type => {
+                const n = c.ts.memberCount(t);
+                if (n == 0) return false;
+                var all = true;
+                for (0..n) |i| {
+                    if (!f(c, c.ts.memberAt(t, i))) {
+                        all = false;
+                        break;
+                    }
+                }
+                if (all) return true;
+                for (try c.memberList(t)) |m| {
+                    if (!try c.hasPrimitiveFacet(m, f, depth + 1)) return false;
+                }
+                return true;
+            },
+            .intersection => {
+                for (0..c.ts.memberCount(t)) |i| {
+                    if (f(c, c.ts.memberAt(t, i))) return true;
+                }
+                for (try c.memberList(t)) |m| {
+                    if (try c.hasPrimitiveFacet(m, f, depth + 1)) return true;
+                }
+                return false;
+            },
+            .ref => {
+                const rs = try c.resolveStructural(t);
+                if (rs == t) return false;
+                return c.hasPrimitiveFacet(rs, f, depth + 1);
+            },
+            .type_param => {
+                const con = try c.typeParamConstraint(c.ts.typeParamSymbol(t));
+                if (con == types.no_type or con == t) return false;
+                return c.hasPrimitiveFacet(con, f, depth + 1);
+            },
+            else => return false,
         }
-        return f(c, t);
     }
 
-    fn isArithmeticOperand(c: *Checker, t: TypeId) bool {
-        return c.isNumberish(t) or c.isBigintish(t);
+    fn isArithmeticOperand(c: *Checker, t: TypeId) Error!bool {
+        return (try c.isNumberish(t)) or (try c.isBigintish(t));
     }
 
     fn checkArithmeticOperand(c: *Checker, t: TypeId, node: Node) Error!void {
-        if (c.isArithmeticOperand(t)) return;
+        if (try c.isArithmeticOperand(t)) return;
         try c.diagFmt(2356, c.nodeSpan(node), "An arithmetic operand must be of type 'any', 'number', 'bigint' or an enum type.", .{});
     }
 
@@ -13508,12 +13553,12 @@ const Checker = struct {
                 const lk = c.ts.kind(lt);
                 const rk = c.ts.kind(rt);
                 if (lk == .any or rk == .any or lk == .err or rk == .err) return types.any_type;
-                if (c.isStringish(lt) or c.isStringish(rt)) {
+                if (try c.isStringish(lt) or try c.isStringish(rt)) {
                     // string + anything stringifiable
                     return types.string_type;
                 }
-                if (c.isNumberish(lt) and c.isNumberish(rt)) return types.number_type;
-                if (c.isBigintish(lt) and c.isBigintish(rt)) return types.bigint_type;
+                if (try c.isNumberish(lt) and try c.isNumberish(rt)) return types.number_type;
+                if (try c.isBigintish(lt) and try c.isBigintish(rt)) return types.bigint_type;
                 try c.diagFmt(2365, c.nodeSpan(node), "Operator '+' cannot be applied to types '{s}' and '{s}'.", .{
                     try c.typeToString(lt), try c.typeToString(rt),
                 });
@@ -13522,14 +13567,14 @@ const Checker = struct {
             .minus, .asterisk, .slash, .percent, .asterisk_asterisk, .lt_lt, .gt_gt, .gt_gt_gt, .amp, .pipe, .caret => {
                 const lt = try c.checkExprCached(d.lhs, types.no_type);
                 const rt = try c.checkExprCached(d.rhs, types.no_type);
-                if (!c.isArithmeticOperand(lt)) {
+                if (!try c.isArithmeticOperand(lt)) {
                     try c.diagFmt(2362, c.nodeSpan(d.lhs), "The left-hand side of an arithmetic operation must be of type 'any', 'number', 'bigint' or an enum type.", .{});
                 }
-                if (!c.isArithmeticOperand(rt)) {
+                if (!try c.isArithmeticOperand(rt)) {
                     try c.diagFmt(2363, c.nodeSpan(d.rhs), "The right-hand side of an arithmetic operation must be of type 'any', 'number', 'bigint' or an enum type.", .{});
                 }
-                if (c.isBigintish(lt) and c.isBigintish(rt) and
-                    !c.isNumberish(lt) and !c.isNumberish(rt)) return types.bigint_type;
+                if (try c.isBigintish(lt) and try c.isBigintish(rt) and
+                    !try c.isNumberish(lt) and !try c.isNumberish(rt)) return types.bigint_type;
                 return types.number_type;
             },
             .lt, .gt, .lt_eq, .gt_eq => {
@@ -13549,8 +13594,8 @@ const Checker = struct {
                 const lk = c.ts.kind(ls);
                 const rk = c.ts.kind(rs);
                 const ok = lk == .any or rk == .any or lk == .err or rk == .err or blk: {
-                    const lnum = c.isNumberish(ls) or c.isBigintish(ls);
-                    const rnum = c.isNumberish(rs) or c.isBigintish(rs);
+                    const lnum = try c.isNumberish(ls) or try c.isBigintish(ls);
+                    const rnum = try c.isNumberish(rs) or try c.isBigintish(rs);
                     if (lnum and rnum) break :blk true;
                     if (!lnum and !rnum) break :blk (try c.isComparable(ls, rs));
                     break :blk false;
@@ -13584,7 +13629,7 @@ const Checker = struct {
             .keyword_in => {
                 const lt = try c.checkExprCached(d.lhs, types.no_type);
                 const rt = try c.checkExprCached(d.rhs, types.no_type);
-                if (!c.isStringish(lt) and !c.isNumberish(lt) and c.ts.kind(lt) != .symbol) {
+                if (!try c.isStringish(lt) and !try c.isNumberish(lt) and c.ts.kind(lt) != .symbol) {
                     try c.diagFmt(2360, c.nodeSpan(d.lhs), "The left-hand side of an 'in' expression must be of type 'any', 'string', 'number', or 'symbol'.", .{});
                 }
                 const rk = c.ts.kind(try c.resolveStructural(rt));
@@ -13616,7 +13661,7 @@ const Checker = struct {
                 return rt;
             },
             .plus_eq => {
-                if (c.isStringish(target_t)) return types.string_type;
+                if (try c.isStringish(target_t)) return types.string_type;
                 return types.number_type;
             },
             .amp_amp_eq, .pipe_pipe_eq, .question_question_eq => {
