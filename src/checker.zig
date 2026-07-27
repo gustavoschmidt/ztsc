@@ -15102,6 +15102,20 @@ const Checker = struct {
                     }
                     return;
                 }
+                // A plain FUNCTION argument against a callable-interface param —
+                // the mirror image of the `.function` arm's callable-object
+                // *argument* handling. `ForwardRefRenderFunction<T, P>` is an
+                // interface (a call signature plus a `displayName?` property), so
+                // every inference position for `forwardRef((props: Props, ref) =>
+                // …)` lives in that signature; the object-vs-function mismatch
+                // made the whole arm fall through and bind nothing, leaving
+                // `ForwardRefExoticComponent<{} & RefAttributes<unknown>>`. tsc's
+                // `inferFromSignatures` pairs signatures from the END, so a
+                // function source infers against the param's LAST call signature.
+                if (s.kind(ra) == .function and s.objectCallSigCount(param) > 0) {
+                    const psig = s.objectCallSig(param, s.objectCallSigCount(param) - 1);
+                    return c.unify(psig, ra, tp_syms, candidates, depth + 1);
+                }
                 // Array/tuple/string arg against an object-shaped param
                 // (`ArrayLike<T>`, `Iterable<T>`, `{ length: number }`):
                 // the param's number index matches the element type, and
