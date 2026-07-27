@@ -930,6 +930,8 @@ const Binder = struct {
     /// Includes `export {}` (a marker export with no bindings), which
     /// is exactly how a source file opts into module semantics.
     saw_module_syntax: bool = false,
+    /// Name from `export as namespace X;` (the UMD global declaration), or 0.
+    umd_name: Atom = 0,
     /// `declare module "spec" { … }` blocks collected during binding.
     ambient_mods: std.ArrayList(AmbientModule) = .empty,
 
@@ -1462,6 +1464,11 @@ const Binder = struct {
                 if (b.cur_scope == file_scope) b.saw_module_syntax = true;
                 try b.bindExportAssign(node);
             },
+            // `export as namespace X;` — record the UMD global name. It is NOT
+            // treated as module-marking syntax: whether the file is a module is
+            // already decided by its `export =` / import list, and flipping a
+            // file's classification here would move far more than this.
+            .export_as_ns => b.umd_name = try b.atomOfToken(d.lhs),
             .import_equals => try b.bindImportEquals(node),
 
             // Anything else in statement position (recovery leftovers) is
@@ -2913,10 +2920,58 @@ const Binder = struct {
         // (no top-level import/export), so their `global_scope` must merge in
         // too, not just `file_scope`. Contribute both segments.
         const is_module = b.saw_module_syntax;
+        // `export as namespace X;` publishes the module's `export =` entity
+        // under the global name X — the UMD global. That is what makes a
+        // `React.CSSProperties` annotation resolve in a file that never
+        // imports React; without it the qualified name found nothing and the
+        // whole annotation degraded to `any`. Only the `export = <ident>`
+        // shape is modeled (the ecosystem's `export = X; export as namespace
+        // X;` pair); a UMD name over a named-export module keeps the old
+        // discard. Resolved here rather than at bind time because the entity
+        // is routinely declared *after* the `export =` line.
+        var umd_atom: Atom = 0;
+        var umd_sym: SymbolId = no_symbol;
+        if (b.umd_name != 0) {
+            for (b.export_recs.items) |rec| {
+                if (rec.kind != .equals or rec.local == 0) continue;
+                const lo = members_start[file_scope];
+                const hi = members_start[file_scope + 1];
+                const seg = member_atoms[lo..hi];
+                if (std.sort.binarySearch(Atom, seg, rec.local, struct {
+                    fn cmp(key: Atom, mid: Atom) std.math.Order {
+                        return std.math.order(key, mid);
+                    }
+                }.cmp)) |i| {
+                    umd_atom = b.umd_name;
+                    umd_sym = member_syms[lo + i];
+                }
+                break;
+            }
+        }
         var global_atoms: []const Atom = &.{};
         var global_syms: []const SymbolId = &.{};
         var global_aug_start: u32 = 0;
-        {
+        if (umd_atom != 0) {
+            // The UMD entry belongs to the file's own (non-augmentation)
+            // contribution, so it sits before the `declare global` segment.
+            const flo = if (!is_module) members_start[file_scope] else 0;
+            const fhi = if (!is_module) members_start[file_scope + 1] else 0;
+            const glo = if (b.global_scope != 0) members_start[b.global_scope] else 0;
+            const ghi = if (b.global_scope != 0) members_start[b.global_scope + 1] else 0;
+            const fn_ = fhi - flo;
+            const gn_ = ghi - glo;
+            const ca = try arena.alloc(Atom, fn_ + 1 + gn_);
+            const cs = try arena.alloc(SymbolId, fn_ + 1 + gn_);
+            @memcpy(ca[0..fn_], member_atoms[flo..fhi]);
+            @memcpy(cs[0..fn_], member_syms[flo..fhi]);
+            ca[fn_] = umd_atom;
+            cs[fn_] = umd_sym;
+            @memcpy(ca[fn_ + 1 ..], member_atoms[glo..ghi]);
+            @memcpy(cs[fn_ + 1 ..], member_syms[glo..ghi]);
+            global_atoms = ca;
+            global_syms = cs;
+            global_aug_start = @intCast(fn_ + 1);
+        } else {
             const flo = if (!is_module) members_start[file_scope] else 0;
             const fhi = if (!is_module) members_start[file_scope + 1] else 0;
             const glo = if (b.global_scope != 0) members_start[b.global_scope] else 0;

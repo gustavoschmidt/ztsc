@@ -467,6 +467,9 @@ pub const Tag = enum(u8) {
     /// `export = <expr>;` (CommonJS export assignment). main_token = `export`;
     /// lhs = entity expression node, rhs unused.
     export_assign,
+    /// `export as namespace X;` — the UMD global declaration. main_token =
+    /// `export`; lhs = the name TOKEN index (not a node), rhs unused.
+    export_as_ns,
     /// `import x = require("m");` or `import A = B.C;` (and `export import`).
     /// main_token = `import`; lhs = extra→ImportEquals, rhs unused.
     import_equals,
@@ -1140,6 +1143,7 @@ pub const Ast = struct {
                 },
                 .export_all => {},
                 .export_assign => it.push(d.lhs),
+                .export_as_ns => {}, // lhs is a token index, not a node
                 .import_equals => {
                     const e = a.extraData(ImportEquals, d.lhs);
                     if (e.entity != 0) it.push(e.entity);
