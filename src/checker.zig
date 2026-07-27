@@ -11255,6 +11255,31 @@ const Checker = struct {
         return result;
     }
 
+    /// The true branch of a deferred conditional, read with the knowledge that
+    /// on that branch the check type is a subtype of the extends type.
+    ///
+    /// tsc wraps every occurrence of the check type inside a conditional's true
+    /// branch in a *substitution type* constrained by the extends type
+    /// (`getConditionalFlowTypeOfType`), so `K extends keyof O ? O[K] : D`
+    /// reads its true branch as `O[K & keyof O]` — which resolves even when
+    /// `K`'s own constraint is wider than `keyof O`. ztsc has no substitution
+    /// types, and without them the branch stays `O[K]`, whose constraint index
+    /// contains keys `O` does not have, so a generic
+    /// `set(shape: T["type"] extends keyof Shapes ? Shapes[T["type"]] : D)`
+    /// could not be passed on (TS2345/TS2322).
+    ///
+    /// Cover the shape that needs it — the branch IS the indexed access
+    /// `O[check]` — by indexing with the extends type instead. Sound for a
+    /// SOURCE position, which is the only caller: every instantiation has
+    /// `K <: extends`, and `O[A | B]` is `O[A] | O[B]`, so `O[K] <: O[extends]`.
+    fn condTrueUnderExtends(c: *Checker, cond: TypeId) Error!TypeId {
+        const s = &c.ts;
+        const tru = s.condTrue(cond);
+        if (s.kind(tru) != .index_access) return tru;
+        if (s.indexAccessIndex(tru) != s.condCheck(cond)) return tru;
+        return c.reduceIndexedAccess(s.indexAccessObj(tru), s.condExtends(cond));
+    }
+
     fn isCompound(k: types.Kind) bool {
         return switch (k) {
             .union_type, .intersection, .array, .tuple, .object, .function, .overloads, .ref, .class_value, .conditional, .mapped, .index_access, .template_literal_type, .keyof_op => true,
@@ -11272,7 +11297,8 @@ const Checker = struct {
                 return (try c.isAssignable(c.ts.condTrue(s), c.ts.condTrue(t))) and
                     (try c.isAssignable(c.ts.condFalse(s), c.ts.condFalse(t)));
             }
-            return (try c.isAssignable(c.ts.condTrue(s), t)) and (try c.isAssignable(c.ts.condFalse(s), t));
+            return (try c.isAssignable(try c.condTrueUnderExtends(s), t)) and
+                (try c.isAssignable(c.ts.condFalse(s), t));
         }
         // A deferred `keyof T` source relates through its apparent
         // constraint `string | number | symbol`; handled before union-target
