@@ -15292,6 +15292,22 @@ const Checker = struct {
         const fp_sym = try c.mintReverseElemVar(s.mappedParamName(key_param));
         const fp_ty = try s.makeTypeParam(fp_sym);
         const template = try c.substElemAccess(value, src_sym, key_id, fp_ty, 0);
+        // Modifier inversion (tsc's `resolveReverseMappedTypeMembers`): the
+        // reverse-mapped property keeps the ARGUMENT's `?`/`readonly` except
+        // where the mapping itself *added* that modifier — a modifier the map
+        // adds carries no information about the source, so it is masked off.
+        // `Readonly<P>` (adds `readonly`) therefore keeps the argument's
+        // optionality and drops its readonly-ness; `Partial<P>` (adds `?`)
+        // keeps readonly and drops optionality; a plain `{ [K in keyof S]: … }`
+        // keeps both. Dropping the optional flag unconditionally (the previous
+        // behavior) made every prop of the inferred `P` REQUIRED, so
+        // `memo(Base, areEqual)` — whose comparator parameter is `Readonly<P>`
+        // — turned an all-optional props type into an all-required one and
+        // every use of the memoized component reported TS2739/TS2741.
+        const mflags = s.mappedFlags(m);
+        var keep_mask: u32 = types.prop_flag_optional | types.prop_flag_readonly;
+        if (mflags & types.mapped_flag_optional_add != 0) keep_mask &= ~types.prop_flag_optional;
+        if (mflags & types.mapped_flag_readonly_add != 0) keep_mask &= ~types.prop_flag_readonly;
         var props: std.ArrayList(types.Prop) = .empty;
         defer props.deinit(c.scratch());
         const local_syms = [_]u32{fp_sym};
@@ -15306,7 +15322,7 @@ const Checker = struct {
             // into the reducer's `state:` parameter); strip it so the inferred
             // state is the reducer's own state, not a self-referential union.
             const et = try c.stripSourceParam(if (elem[0] != types.no_type) elem[0] else types.unknown_type, src_sym);
-            try props.append(c.scratch(), .{ .name = p.name, .ty = et, .flags = 0 });
+            try props.append(c.scratch(), .{ .name = p.name, .ty = et, .flags = p.flags & keep_mask });
         }
         if (props.items.len == 0) return;
         const obj = try c.objectFromProps(props.items, 0, 0);
