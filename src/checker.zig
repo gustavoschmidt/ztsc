@@ -1941,7 +1941,7 @@ const Checker = struct {
                 for (sorted) |x| {
                     if (!first) try w.writeAll(" | ");
                     first = false;
-                    try c.printTypeParen(w, x, depth + 1, true);
+                    try c.printTypeParen(w, x, depth + 1, .union_member);
                 }
                 for (all) |x| {
                     if (s.kind(x) != .null) continue;
@@ -1960,11 +1960,11 @@ const Checker = struct {
                 const sorted = try c.sortMembersStructural(s.members(t), depth + 1);
                 for (sorted, 0..) |x, i| {
                     if (i > 0) try w.writeAll(" & ");
-                    try c.printTypeParen(w, x, depth + 1, true);
+                    try c.printTypeParen(w, x, depth + 1, .isect_member);
                 }
             },
             .array => {
-                try c.printTypeParen(w, s.arrayElem(t), depth + 1, false);
+                try c.printTypeParen(w, s.arrayElem(t), depth + 1, .operand);
                 try w.writeAll("[]");
             },
             .tuple => {
@@ -2082,7 +2082,7 @@ const Checker = struct {
             .infer_var => try w.print("infer {s}", .{c.atomText(s.inferVarName(t))}),
             .mapped_param => try w.print("{s}", .{c.atomText(s.mappedParamName(t))}),
             .index_access => {
-                try c.printTypeParen(w, s.indexAccessObj(t), depth + 1, false);
+                try c.printTypeParen(w, s.indexAccessObj(t), depth + 1, .operand);
                 try w.writeAll("[");
                 try c.printType(w, s.indexAccessIndex(t), depth + 1);
                 try w.writeAll("]");
@@ -2102,9 +2102,9 @@ const Checker = struct {
                 try w.writeAll(" }");
             },
             .conditional => {
-                try c.printTypeParen(w, s.condCheck(t), depth + 1, false);
+                try c.printTypeParen(w, s.condCheck(t), depth + 1, .operand);
                 try w.writeAll(" extends ");
-                try c.printTypeParen(w, s.condExtends(t), depth + 1, false);
+                try c.printTypeParen(w, s.condExtends(t), depth + 1, .operand);
                 try w.writeAll(" ? ");
                 try c.printType(w, s.condTrue(t), depth + 1);
                 try w.writeAll(" : ");
@@ -2128,7 +2128,7 @@ const Checker = struct {
             },
             .keyof_op => {
                 try w.writeAll("keyof ");
-                try c.printTypeParen(w, s.keyofOperand(t), depth + 1, false);
+                try c.printTypeParen(w, s.keyofOperand(t), depth + 1, .operand);
             },
         }
     }
@@ -2172,11 +2172,17 @@ const Checker = struct {
         try w.writeAll(";");
     }
 
-    fn printTypeParen(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32, in_union: bool) PrintErr!void {
-        const k = c.ts.kind(t);
-        const needs = switch (k) {
+    /// Where a nested type is being printed, for precedence parenthesization.
+    /// `&` binds tighter than `|`, so an intersection needs no parens inside a
+    /// union but a union DOES need them inside an intersection (`(B | C) & A`,
+    /// not `B | C & A`, which reads as `B | (C & A)`).
+    const PrintPos = enum { union_member, isect_member, operand };
+
+    fn printTypeParen(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32, pos: PrintPos) PrintErr!void {
+        const needs = switch (c.ts.kind(t)) {
             .function => true,
-            .union_type, .intersection => !in_union,
+            .union_type => pos != .union_member,
+            .intersection => pos == .operand,
             else => false,
         };
         if (needs) try w.writeAll("(");
@@ -19048,6 +19054,26 @@ test "printer goldens via diagnostics" {
     defer t3.deinit();
     try testing.expectEqual(@as(usize, 1), t3.result.diagnostics.len);
     try testing.expectEqualStrings("Type 'true' is not assignable to type '[number, string] | null'.", t3.result.diagnostics[0].msg);
+
+    // `&` binds tighter than `|`, so a union *inside* an intersection needs
+    // parens — `(B | C) & A`, not `B | C & A`, which reads as `B | (C & A)`.
+    // `makeIntersection` distributes a union constituent, so the only way to
+    // hold one is to overflow the cross-product cap (6 unions of 8 members =
+    // 8^6 = 262144 > 100000), which keeps the intersection undistributed.
+    const wide =
+        "type U1 = { a1: 1 } | { a2: 1 } | { a3: 1 } | { a4: 1 } | { a5: 1 } | { a6: 1 } | { a7: 1 } | { a8: 1 };\n" ++
+        "type U2 = { b1: 1 } | { b2: 1 } | { b3: 1 } | { b4: 1 } | { b5: 1 } | { b6: 1 } | { b7: 1 } | { b8: 1 };\n" ++
+        "type U3 = { c1: 1 } | { c2: 1 } | { c3: 1 } | { c4: 1 } | { c5: 1 } | { c6: 1 } | { c7: 1 } | { c8: 1 };\n" ++
+        "type U4 = { d1: 1 } | { d2: 1 } | { d3: 1 } | { d4: 1 } | { d5: 1 } | { d6: 1 } | { d7: 1 } | { d8: 1 };\n" ++
+        "type U5 = { e1: 1 } | { e2: 1 } | { e3: 1 } | { e4: 1 } | { e5: 1 } | { e6: 1 } | { e7: 1 } | { e8: 1 };\n" ++
+        "type U6 = { f1: 1 } | { f2: 1 } | { f3: 1 } | { f4: 1 } | { f5: 1 } | { f6: 1 } | { f7: 1 } | { f8: 1 };\n" ++
+        "declare const x: U1 & U2 & U3 & U4 & U5 & U6;\n" ++
+        "const bad: string = x;\n";
+    var t4 = try TestCheck.init(wide);
+    defer t4.deinit();
+    try testing.expectEqual(@as(usize, 1), t4.result.diagnostics.len);
+    try testing.expect(std.mem.startsWith(u8, t4.result.diagnostics[0].msg, "Type '({ a1: 1; } | "));
+    try testing.expect(std.mem.indexOf(u8, t4.result.diagnostics[0].msg, "{ a8: 1; }) & ({ b1: 1; }") != null);
 }
 
 test "stress: checker total on random and token soup" {
