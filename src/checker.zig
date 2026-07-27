@@ -13991,12 +13991,70 @@ const Checker = struct {
                 return c.checkIndexExpr(node);
             },
             .array_literal, .object_literal, .array_pattern, .object_pattern => {
-                // Destructuring assignment targets: check element reads only.
-                var it = c.tree.childIterator(node);
-                while (it.next()) |child| _ = try c.checkExprCached(child, types.no_type);
+                // Destructuring-assignment pattern in the expression cover
+                // grammar (`[a, b] = …`, `({ p: a } = …)`). Every element is a
+                // WRITE, so it goes through `checkDestructuringElement`, not
+                // `checkExprCached`: an element identifier must resolve as an
+                // assignment target (no TDZ / definite-assignment read check)
+                // and a property KEY is a name, not a reference.
+                for (c.tree.nodeRange(node)) |el| try c.checkDestructuringElement(el);
                 return types.any_type;
             },
             else => return c.checkExprCached(node, types.no_type),
+        }
+    }
+
+    /// One element of a destructuring-assignment pattern, in the expression
+    /// cover grammar the parser keeps (`{ p: a }` is an `object_literal` of
+    /// `object_property`, not an `object_pattern`). Peels the element to its
+    /// assignment target and hands that to `checkAssignmentTarget`; default
+    /// initializers and computed keys are ordinary reads. Without the peel the
+    /// generic expression walker checked the property KEY as a reference
+    /// (TS2304 on `({ width: dx } = …)`) and the target identifier as a *read*,
+    /// so writing a not-yet-assigned `let` through a destructuring assignment
+    /// reported TS2454 at the write site itself.
+    fn checkDestructuringElement(c: *Checker, el0: Node) Error!void {
+        var el = el0;
+        while (el != null_node and c.nodeTag(el) == .paren_expr) el = c.tree.nodeData(el).lhs;
+        if (el == null_node) return;
+        const d = c.tree.nodeData(el);
+        switch (c.nodeTag(el)) {
+            // `{ key: target }` — `key` names a property, it is not a
+            // reference; only a computed key is evaluated.
+            .object_property => {
+                if (d.lhs != null_node and c.nodeTag(d.lhs) == .computed_name)
+                    _ = try c.checkExprCached(c.tree.nodeData(d.lhs).lhs, types.no_type);
+                try c.checkDestructuringElement(d.rhs);
+            },
+            // `{ a }` / `{ a = init }` — lhs is the target identifier, rhs the
+            // default.
+            .object_shorthand => {
+                if (d.rhs != null_node) _ = try c.checkExprCached(d.rhs, types.no_type);
+                try c.checkDestructuringElement(d.lhs);
+            },
+            // Declaration-shaped pattern nodes (a `for (…of…)` head can carry
+            // one): main_token is the key, lhs the target (0 when shorthand).
+            .binding_property => {
+                if (d.rhs != null_node) _ = try c.checkExprCached(d.rhs, types.no_type);
+                if (d.lhs != null_node) try c.checkDestructuringElement(d.lhs);
+            },
+            .binding_default => {
+                if (d.rhs != null_node) _ = try c.checkExprCached(d.rhs, types.no_type);
+                try c.checkDestructuringElement(d.lhs);
+            },
+            // `[a = init] = …`: the cover grammar parses the default as a plain
+            // assignment expression.
+            .assign => {
+                if (c.tree.tokens.tag(c.tree.nodeMainToken(el)) == .eq) {
+                    _ = try c.checkExprCached(d.rhs, types.no_type);
+                    try c.checkDestructuringElement(d.lhs);
+                } else {
+                    _ = try c.checkExprCached(el, types.no_type);
+                }
+            },
+            .spread_element, .rest_element => try c.checkDestructuringElement(d.lhs),
+            .omitted, .error_node, .unsupported => {},
+            else => _ = try c.checkAssignmentTarget(el),
         }
     }
 
@@ -16874,7 +16932,9 @@ const Checker = struct {
                     if (el != null_node) try c.markReassignTarget(el, scope);
                 }
             },
-            .binding_property, .object_shorthand, .object_property => {
+            // Cover grammar: `object_property`'s target is rhs (lhs is the key).
+            .object_property => try c.markReassignTarget(c.tree.nodeData(n).rhs, scope),
+            .binding_property, .object_shorthand => {
                 const d = c.tree.nodeData(n);
                 if (d.lhs != 0) {
                     try c.markReassignTarget(d.lhs, scope);
@@ -16953,7 +17013,12 @@ const Checker = struct {
                 }
                 return false;
             },
-            .binding_property, .object_shorthand, .object_property => {
+            // `object_property` is the *cover grammar* form (`({ p: a } = …)`):
+            // main_token/lhs are the property KEY and rhs is the target. The
+            // declaration form `binding_property` puts the target in lhs (0 when
+            // shorthand), and `object_shorthand`'s lhs is the target identifier.
+            .object_property => return c.patternBindsSym(c.tree.nodeData(pat).rhs, sym),
+            .binding_property, .object_shorthand => {
                 const d = c.tree.nodeData(pat);
                 if (d.lhs != 0) return c.patternBindsSym(d.lhs, sym);
                 return (try c.memberAtom(c.tree.nodeMainToken(pat))) == c.symNameAtom(sym);
