@@ -10596,6 +10596,18 @@ const Checker = struct {
         return c.castComparableRec(a, b, depth);
     }
 
+    /// If `t` is a type parameter, the operand the overlap test should use in
+    /// its place: its constraint, or `0` for "overlaps everything" (no
+    /// constraint, or one that is `unknown`/`any`/itself). Returns `t`
+    /// unchanged when it is not a type parameter.
+    fn typeParamOverlapOperand(c: *Checker, t: TypeId) Error!TypeId {
+        const r = try c.resolveStructural(t);
+        if (c.ts.kind(r) != .type_param) return t;
+        const con = try c.typeParamConstraint(c.ts.typeParamSymbol(r));
+        if (con == types.no_type or con == r or c.ts.kind(con) == .unknown or c.ts.kind(con) == .any) return 0;
+        return con;
+    }
+
     /// Union-distributing overlap test for TS2367/TS2678: some pair of
     /// constituents must be comparable.
     fn typesHaveOverlap(c: *Checker, a: TypeId, b: TypeId) Error!bool {
@@ -10618,6 +10630,22 @@ const Checker = struct {
             }
             return false;
         }
+        // A type parameter compares through its constraint, exactly as in the
+        // cast overlap test (`castComparableRec`) — tsc's comparable relation
+        // resolves the parameter to its constraint on either side, and an
+        // unconstrained parameter overlaps everything because it could be
+        // instantiated to the other operand's type. Without this,
+        // `t === "text"` inside `function f<T extends Kind>(t: T)` reported a
+        // phantom TS2367 (and every `case` of a switch on `t` a phantom
+        // TS2678): `isComparable` asks assignability both ways, and neither
+        // holds — a literal is not assignable *into* an unresolved `T`, and
+        // `T`'s union constraint is not assignable to one literal. The
+        // constraint keeps the real negatives (`T extends "a" | "b"` vs
+        // `"zzz"` still has no overlap).
+        const pa = try c.typeParamOverlapOperand(a);
+        if (pa != a) return if (pa == 0) true else c.typesHaveOverlapRec(pa, b, depth + 1);
+        const pb = try c.typeParamOverlapOperand(b);
+        if (pb != b) return if (pb == 0) true else c.typesHaveOverlapRec(a, pb, depth + 1);
         // tsc's comparable relation: `null` / `undefined` are comparable to
         // every type, so an equality test against (or of) a nullish operand is
         // never TS2367 — `x === null` is the idiomatic guard even when `x`'s
