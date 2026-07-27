@@ -284,6 +284,48 @@ const max_instantiation_depth = 100;
 /// the worst of those and two orders below the runaway, and it bounds a
 /// pathological statement to tens of megabytes instead of hundreds.
 const max_instantiation_count = 250_000;
+/// How many times one type may re-enter the *live* `instantiateId` chain
+/// before the expansion is treated as a non-terminating recursive-alias cycle
+/// and cut.
+///
+/// ztsc instantiates structurally and eagerly where tsc defers, so a generic
+/// alias that references itself through an indexed access re-expands forever
+/// with a growing argument. ajv's `UncheckedJSONSchemaType<T, IsPartial>` is
+/// the canonical shape — an eleven-frame cycle
+///
+///   {allOf?: UncheckedPartialSchema<T>[]; …}          (three object frames)
+///     → T extends any[] ? … : …                       (five conditionals)
+///       → {[P in keyof UncheckedJSONSchemaType<T[0], true>]: …[P]}
+///         → UncheckedJSONSchemaType<T[0], true>[P]
+///           → {allOf?: …}                             (lap 2)
+///
+/// whose type argument grows `T` → `T[0]` → `T[0][0]` …, so no `(map, type)`
+/// pair ever repeats and the instantiation memo cannot break it. Only the
+/// depth cap stopped it, at depth 101 — and *where* the chain happened to be
+/// when it got there is a function of what this checker instance had already
+/// materialized, i.e. of the partition. Repetition on the live chain is not:
+/// it is a property of the type.
+///
+/// The cut is silent (returns `error_type` without TS2589), matching the
+/// project's under-report policy for exactly this class — see
+/// test/conformance/instantiation/003, 010 and 018, where tsc reports TS2589
+/// on a growing recursive alias and ztsc deliberately stays quiet rather than
+/// false-positive a valid deep recursion. Genuinely deep *acyclic*
+/// instantiation still reports: `max_instantiation_depth` is untouched, and a
+/// 130-level nested tuple (conformance 002) repeats no type at all.
+///
+/// Four is chosen from the observed split. Peak chain repetition, whole
+/// program at `--checkers=1`: 2 for chalk, @types/node, @types/react, hono
+/// and zod; 3 for hoppscotch's js-sandbox and 4 for excalidraw (both already
+/// inside runaway expansions); against 51 for drizzle-orm, 98 for ajv and 101
+/// for typebox. It also has to leave room under `max_instantiation_depth`:
+/// four laps of ajv's eleven-frame cycle is depth 44, well clear of 100,
+/// where eight laps would not be.
+const max_chain_repeats = 4;
+/// Depth below which `chainRepeats` does not bother scanning. No cycle can
+/// have completed `max_chain_repeats` laps in fewer frames than this, and the
+/// scan sits on the hottest path in the checker.
+const chain_scan_floor = 8;
 /// Upper bound on scratch-arena physical capacity retained across the
 /// per-statement reset (`run`). The scratch arena is a transient workspace
 /// reset after every top-level statement; with plain `.retain_capacity` the
@@ -719,6 +761,11 @@ const Checker = struct {
     /// is scoped to a statement; this is the work counter the `--memory`
     /// report and `bench/repeat_sweep.sh` compare across runs.
     inst_total: u64 = 0,
+    /// The types on the live `instantiateId` stack, indexed by `inst_depth`.
+    /// Read only by `chainRepeats`; a frame's ancestors are the same set
+    /// whatever the memo did to its siblings, which is what makes a guard
+    /// built on them cache-independent.
+    inst_chain: [max_instantiation_depth + 2]TypeId = @splat(0),
     /// Set when the current top-level `instantiate` call tripped the depth or
     /// count limit; suppresses memoization of the (truncated) results for that
     /// call. Reset at each top-level entry (`inst_depth == 0`).
@@ -6897,6 +6944,20 @@ const Checker = struct {
 
     /// Memoized recursive substitution. `map_id` (when non-null) canonically
     /// identifies `map`; it keys the memo and is threaded unchanged down the
+    /// True when `t` already occupies `max_chain_repeats` of the
+    /// `instantiateId` frames currently on the stack — a cycle through `t`,
+    /// as opposed to a merely deep expansion.
+    fn chainRepeats(c: *const Checker, t: TypeId) bool {
+        if (c.inst_depth < chain_scan_floor) return false;
+        var reps: u32 = 0;
+        for (c.inst_chain[0..c.inst_depth]) |a| {
+            if (a != t) continue;
+            reps += 1;
+            if (reps >= max_chain_repeats) return true;
+        }
+        return false;
+    }
+
     /// recursion. A `null` id disables the memo (`--no-inst-cache`).
     fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) Error!TypeId {
         if (!try c.containsTypeParam(t)) return t;
@@ -6911,11 +6972,20 @@ const Checker = struct {
         // the memo on or off. Exceeding it is TS2589 (excessively deep /
         // possibly infinite): report once at the materialization site and
         // truncate this subtree to `error_type`.
+        // A non-terminating recursive-alias cycle: this exact type is already
+        // being instantiated `max_chain_repeats` levels up. Cut it, silently
+        // (see the constant, and the under-report policy the sibling cases in
+        // test/conformance/instantiation record).
+        if (c.chainRepeats(t)) {
+            c.inst_limit_tripped = true;
+            return types.error_type;
+        }
         if (c.inst_depth > max_instantiation_depth or c.inst_count > max_instantiation_count) {
             c.inst_limit_tripped = true;
             if (!c.suppress_inst_diag) try c.instLimitDiag(2589, "Type instantiation is excessively deep and possibly infinite.");
             return types.error_type;
         }
+        c.inst_chain[c.inst_depth] = t;
         c.inst_depth += 1;
         c.inst_count += 1;
         c.inst_total += 1;

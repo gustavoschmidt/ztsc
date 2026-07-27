@@ -34,13 +34,11 @@ classes/033_static_inherit.ts  -TS2417 14
 instantiation/003_recursive_alias_relation_cap.ts  -TS2589 19
 instantiation/010_growing_bareref_no_eager_expand.ts  -TS2589 12
 
-# Same diagnostic, different anchor: the oracle reports TS2589 at the deep
-# template node inside the alias declaration (line 16); ztsc reports it at the
-# annotation that triggered the instantiation (line 18). The error IS produced
-# and the TS2322 on line 18 matches — this is a report-SITE divergence on one
-# diagnostic, hand-verified, not an extra error.
+# A growing recursive alias, cut by the instantiation chain-repetition guard
+# (`max_chain_repeats`) rather than by the depth ceiling. Same handling as 003
+# and 010: the cut is silent, so the oracle's TS2589 is a deterministic
+# under-report. The TS2322 on line 18 still matches.
 instantiation/018_growing_template_hole_no_loop.ts  -TS2589 16
-instantiation/018_growing_template_hole_no_loop.ts  +TS2589 18
 
 # An `exports`-map subpath that the map does not name is routed to an opaque
 # `any` module rather than left dangling. Dangling the specifier was not
