@@ -2459,6 +2459,14 @@ const Parser = struct {
     }
 
     fn parseUnaryExpr(p: *Parser, ctx: ExprCtx) PE!Node {
+        // Legacy angle-bracket type assertion `<T>expr`. Only in files where
+        // JSX is off: in a `.tsx`/`.jsx` file a `<` in expression position
+        // opens an element and tsc rejects this assertion form outright.
+        // Reached only after the generic-arrow speculation in `parseAssignExpr`
+        // has already declined `<T>(x) => y`. Only a lone `<` opens one:
+        // tsc does not split a `<<` here either (`<<T>(x: T) => T>v` is a
+        // syntax error for it too).
+        if (!p.jsx and p.curTag() == .lt) return p.parseTypeAssertion(ctx);
         switch (p.curTag()) {
             .bang, .tilde, .plus, .minus, .plus_plus, .minus_minus, .keyword_typeof, .keyword_void, .keyword_delete => {
                 const op = try p.bump();
@@ -2477,6 +2485,23 @@ const Parser = struct {
             else => {},
         }
         return p.parsePostfixExpr(ctx);
+    }
+
+    /// `<T>expr` — the pre-`as` assertion syntax, still legal in non-JSX
+    /// files. It is the same operation as `expr as T`, so it reuses
+    /// `.as_expr`; `main_token` is the `<` (the node's span still covers
+    /// the whole assertion, which is what diagnostics report).
+    fn parseTypeAssertion(p: *Parser, ctx: ExprCtx) PE!Node {
+        const lt = try p.bump(); // `<`
+        // `<const>x` is a const assertion, the angle-bracket spelling of
+        // `x as const`.
+        const ty = if (p.curTag() == .keyword_const and p.peekTag(1) == .gt)
+            try p.leaf(.const_type)
+        else
+            try p.parseType();
+        _ = try p.expectGt();
+        const operand = try p.parseUnaryExpr(ctx);
+        return p.addNode(.{ .tag = .as_expr, .main_token = lt, .data = .{ .lhs = operand, .rhs = ty } });
     }
 
     fn parsePostfixExpr(p: *Parser, ctx: ExprCtx) PE!Node {
