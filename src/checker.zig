@@ -3586,13 +3586,20 @@ const Checker = struct {
             .number_literal, .number_literal_fresh => {
                 // A concrete numeric index into a tuple selects that element
                 // (matching tsc) — this is also what makes a homomorphic map
-                // over a tuple preserve per-element types.
-                if (c.ts.kind(r) == .tuple) {
+                // over a tuple preserve per-element types. A *branded* tuple
+                // (`[X, Y] & { _brand }`) indexes through its tuple
+                // constituent, the same way tsc finds the numeric key among the
+                // intersection's properties.
+                const rt = if (c.ts.kind(r) == .intersection)
+                    (try c.indexableConstituent(r)) orelse r
+                else
+                    r;
+                if (c.ts.kind(rt) == .tuple) {
                     const v = c.ts.numberValue(idx);
                     if (v == @floor(v) and v >= 0) {
                         const i: u32 = @intFromFloat(v);
-                        if (i < c.ts.tupleLen(r)) {
-                            const e = c.ts.tupleElem(r, i);
+                        if (i < c.ts.tupleLen(rt)) {
+                            const e = c.ts.tupleElem(rt, i);
                             if (e.rest()) return c.elemOfArrayish(e.ty);
                             // An *optional* tuple element indexes to
                             // `T | undefined` (tsc's `getIndexedAccessType` over
@@ -3643,9 +3650,41 @@ const Checker = struct {
                 if (c.ts.objectStringIndex(r) != 0) return c.ts.objectStringIndex(r);
                 return types.any_type;
             },
+            .intersection => {
+                if (try c.indexableConstituent(r)) |m| return c.numberIndexType(m);
+                return types.any_type;
+            },
             .string => return types.string_type,
             else => return types.any_type,
         }
+    }
+
+    /// The constituent of an intersection that carries element access — a
+    /// branded tuple/array (`[X, Y] & { _brand: "t" }`, the `Ordered`/`LocalPoint`
+    /// shape) or, failing that, the first constituent with an index signature.
+    ///
+    /// tsc gets this for free: `getIndexedAccessType` looks the numeric key up
+    /// as a *property* of the intersection, and an intersection's property set
+    /// is the union of its constituents'. ztsc's element-access paths switch on
+    /// the resolved kind, so an intersection fell to the `else` and produced
+    /// `any` — which then classified `-t[0]` as `bigint` and let genuinely
+    /// wrong element types through unchecked. Returns null (leaving `any`) when
+    /// no constituent is indexable, and takes the first when several are: a
+    /// brand object contributes no elements, so the tuple/array constituent is
+    /// the answer whenever there is one.
+    fn indexableConstituent(c: *Checker, r: TypeId) Error!?TypeId {
+        const members = try c.memberList(r);
+        for (members) |m| {
+            switch (c.ts.kind(m)) {
+                .array, .tuple => return m,
+                else => {},
+            }
+        }
+        for (members) |m| {
+            if (c.ts.kind(m) == .object and
+                (c.ts.objectNumberIndex(m) != 0 or c.ts.objectStringIndex(m) != 0)) return m;
+        }
+        return null;
     }
 
     fn elemOfArrayish(c: *Checker, t: TypeId) TypeId {
@@ -14143,17 +14182,23 @@ const Checker = struct {
             },
             .number_literal => {
                 const rl = try c.ts.regularLiteral(idx_t);
-                if (rk == .tuple) {
+                // A branded tuple (`[X, Y] & { _brand }`) indexes through its
+                // tuple constituent — see `indexableConstituent`.
+                const rt = if (rk == .intersection)
+                    (try c.indexableConstituent(r)) orelse r
+                else
+                    r;
+                if (c.ts.kind(rt) == .tuple) {
                     const v = c.ts.numberValue(rl);
                     const iv: u32 = if (v >= 0 and v == @floor(v) and v < 4096) @intFromFloat(v) else 4096;
-                    if (iv < c.ts.tupleLen(r)) {
-                        const e = c.ts.tupleElem(r, iv);
+                    if (iv < c.ts.tupleLen(rt)) {
+                        const e = c.ts.tupleElem(rt, iv);
                         result = if (e.optional()) try c.makeUnion2(e.ty, types.undefined_type) else e.ty;
-                    } else if (c.tupleElemTypeAt(r, iv)) |et| {
+                    } else if (c.tupleElemTypeAt(rt, iv)) |et| {
                         result = et;
                     } else {
                         try c.diagFmt(2493, c.nodeSpan(d.rhs), "Tuple type '{s}' of length '{d}' has no element at index '{d}'.", .{
-                            try c.typeToString(r), c.ts.tupleLen(r), iv,
+                            try c.typeToString(rt), c.ts.tupleLen(rt), iv,
                         });
                         result = types.error_type;
                     }
