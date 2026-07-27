@@ -3222,7 +3222,21 @@ const Checker = struct {
         const a = try c.atomOfToken(tok);
         switch (c.resolveSpace(a, c.cur_scope, true)) {
             .sym => |sym| return c.regularizeTypeQuery(try c.typeOfSymbol(sym)),
-            .wrong_space => return types.any_type,
+            .wrong_space => |sym| {
+                // A type-only import binding is excluded from value space by
+                // `hasValueMeaning` so that a *value* use reports TS1361 — but
+                // it still denotes the imported entity, and a type query is a
+                // TYPE position: `import type { App }` followed by
+                // `typeof App` / `InstanceType<typeof App>` is legal in tsc
+                // (verified against the oracle for named, default and
+                // namespace type-only imports). Without this the query
+                // degraded to `any` and erased everything built on it — every
+                // member of an `InstanceType<typeof App>["…"]` API surface.
+                const wf = c.symFlags(sym);
+                if (wf.import_binding and wf.type_only)
+                    return c.regularizeTypeQuery(try c.typeOfSymbol(sym));
+                return types.any_type;
+            },
             .none => {
                 // `typeof globalThis` — always in scope (see checkIdentifier).
                 if (std.mem.eql(u8, c.atomText(a), "globalThis")) return c.globalThisType();
