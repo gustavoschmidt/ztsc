@@ -15413,9 +15413,71 @@ const Checker = struct {
                 try c.unify(s.condTrue(param), arg, tp_syms, candidates, depth + 1);
                 try c.unify(s.condFalse(param), arg, tp_syms, candidates, depth + 1);
             },
+            .intersection => {
+                // A branded alias — `LineSegment<P> = [P, P] & { _brand: … }`,
+                // the shape excalidraw's geometry layer is built out of —
+                // materializes to an INTERSECTION, so it is the *parameter*
+                // (here: the signature's return type, matched against the call's
+                // contextual type) that is an intersection. There was no arm for
+                // that, so the inference was thrown away and `P` fell back to its
+                // whole `GlobalPoint | LocalPoint` constraint.
+                //
+                // tsc's `inferFromTypes` pairs the constituents that match and
+                // infers through each pair. Same-generic origins pair
+                // positionally first (the `.object` arm's rule, which the
+                // intersection origin tag exists for); otherwise a parameter
+                // constituent infers only from an argument constituent of the
+                // same structural kind — a brand object never pairs with the
+                // tuple that carries the type variable.
+                const ra = try c.resolveStructural(arg);
+                if (c.origin.get(param)) |po| {
+                    if (c.origin.get(ra)) |ao| {
+                        if (s.kind(po) == .ref and s.kind(ao) == .ref and
+                            s.refSymbol(po) == s.refSymbol(ao))
+                        {
+                            const pa = try c.scratch().dupe(TypeId, s.refArgs(po));
+                            const aa = try c.scratch().dupe(TypeId, s.refArgs(ao));
+                            const n = @min(pa.len, aa.len);
+                            for (0..n) |i| try c.unify(pa[i], aa[i], tp_syms, candidates, depth + 1);
+                            return;
+                        }
+                    }
+                }
+                const ams: []const TypeId = if (s.kind(ra) == .intersection)
+                    try c.memberList(ra)
+                else
+                    try c.scratch().dupe(TypeId, &.{ra});
+                for (try c.memberList(param)) |pm| {
+                    if (!try c.containsTypeParam(pm)) continue;
+                    for (ams) |am| {
+                        if (try c.intersectionMembersPair(pm, am)) {
+                            try c.unify(pm, am, tp_syms, candidates, depth + 1);
+                        }
+                    }
+                }
+            },
             .mapped => try c.inferReverseMapped(param, arg, tp_syms, candidates, depth),
             else => {},
         }
+    }
+
+    /// Do an intersection PARAMETER constituent and an argument constituent
+    /// describe the same part of the value? Only same-kind pairs qualify, so
+    /// `[P, P] & { _brand: "seg" }` matched against `[GP, GP] & { _brand:
+    /// "seg" }` infers `P` from the tuple and never from the brand. A naked
+    /// type-parameter constituent (`T & {}`) is deliberately not a pair: it
+    /// would swallow whichever constituent came first.
+    fn intersectionMembersPair(c: *Checker, pm: TypeId, am: TypeId) Error!bool {
+        const s = &c.ts;
+        const rp = try c.resolveStructural(pm);
+        const ra = try c.resolveStructural(am);
+        const pk = s.kind(rp);
+        if (pk != s.kind(ra)) return false;
+        return switch (pk) {
+            .object => try c.constituentRelatesTo(rp, ra),
+            .tuple, .array, .function, .mapped => true,
+            else => false,
+        };
     }
 
     /// Is intersection constituent `m` a plausible inference source for the
