@@ -1367,6 +1367,7 @@ pub const Store = struct {
         if (n == 0) return unknown_type;
         if (n == 1) return items[0];
         const list = items[0..n];
+        if (nullishIntersectionIsEmpty(s, list)) return never_type;
 
         // Distribute over the first union constituent, if any.
         var union_idx: usize = n;
@@ -1392,6 +1393,42 @@ pub const Store = struct {
             return s.makeUnion(scratch, out.items);
         }
         return s.internType(.intersection, list, 0);
+    }
+
+    /// tsc's empty-intersection rule for the nullish domain
+    /// (`getIntersectionType`): under `strictNullChecks`, an intersection that
+    /// mixes `null`/`undefined` with a member of ANY other domain has no
+    /// inhabitants and reduces to `never` — `null & {}`, `null & { a: 1 }`,
+    /// `undefined & string`, `null & (() => void)`, and (both being distinct
+    /// domains) `null & undefined` itself. Oracle-verified for objects,
+    /// arrays, functions, every primitive, and `void`; `void & {}` is NOT
+    /// empty and stays.
+    ///
+    /// Without it `NonNullable<T>` — spelled `T & {}` since TS 4.8 — leaves a
+    /// `null & {}` constituent in the distributed union, so `NonNullable<FileId
+    /// | null>` printed (and behaved as) `null & {} | FileId & {}` instead of
+    /// `FileId`.
+    ///
+    /// Deliberately syntactic: a `.ref` / `.type_param` / conditional member
+    /// could still resolve to an object, but this store has no checker to ask,
+    /// and leaving those unreduced is the pre-existing (sound) behaviour. A
+    /// `.union_type` member is likewise skipped — the cross-product below
+    /// re-enters this function per combination, where the check applies.
+    fn nullishIntersectionIsEmpty(s: *const Store, list: []const TypeId) bool {
+        var has_null = false;
+        var has_undefined = false;
+        var has_other_domain = false;
+        for (list) |t| {
+            switch (s.kind(t)) {
+                .null => has_null = true,
+                .undefined => has_undefined = true,
+                // Every domain that is provably disjoint from `null`/`undefined`.
+                .object, .array, .tuple, .function, .overloads, .class_value, .object_keyword, .void, .string, .number, .boolean, .bigint, .symbol, .bool_true, .bool_false, .string_literal, .number_literal, .number_literal_fresh, .bigint_literal, .enum_type, .unique_symbol, .template_literal_type, .string_mapping => has_other_domain = true,
+                else => {},
+            }
+        }
+        if (!has_null and !has_undefined) return false;
+        return has_other_domain or (has_null and has_undefined);
     }
 
     fn indexOf(list: []const TypeId, t: TypeId) ?usize {
