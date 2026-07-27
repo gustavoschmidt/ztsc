@@ -766,15 +766,6 @@ const Checker = struct {
     /// whatever the memo did to its siblings, which is what makes a guard
     /// built on them cache-independent.
     inst_chain: [max_instantiation_depth + 2]TypeId = @splat(0),
-    /// Monotonic count of instantiation-guard truncations — depth, count,
-    /// chain repetition, alias depth, `substThis` depth. A memo may only
-    /// publish a result computed without one: a truncated result is a
-    /// function of the live recursion chain, not of the memo's key, so
-    /// caching it hands one demand site's truncation to every later site,
-    /// and which site got there first is a property of the partition.
-    /// Every materialization memo brackets its computation with this counter
-    /// and declines to store when it moved.
-    inst_trips: u64 = 0,
     /// Set when the current top-level `instantiate` call tripped the depth or
     /// count limit; suppresses memoization of the (truncated) results for that
     /// call. Reset at each top-level entry (`inst_depth == 0`).
@@ -2328,9 +2319,8 @@ const Checker = struct {
         if (cacheable) {
             if (c.type_node_cache.get(key)) |t| return t;
         }
-        const trips = c.inst_trips;
         const result = try c.typeFromTypeNodeUncached(node);
-        if (cacheable and c.inst_trips == trips) try c.type_node_cache.put(c.cm(), key, result);
+        if (cacheable) try c.type_node_cache.put(c.cm(), key, result);
         return result;
     }
 
@@ -4290,18 +4280,10 @@ const Checker = struct {
         if (c.sym_state.items[sym] == .computed) return c.sym_types.items[sym];
         if (c.sym_state.items[sym] == .in_progress) return types.any_type; // circular
         c.sym_state.items[sym] = .in_progress;
-        const trips = c.inst_trips;
         const t = c.computeTypeOfSymbol(sym) catch |err| {
             c.sym_state.items[sym] = .not_computed;
             return err;
         };
-        // A truncated materialization is not a pure function of the symbol
-        // (see `inst_trips`) — recompute it at the next demand instead of
-        // publishing this one.
-        if (c.inst_trips != trips) {
-            c.sym_state.items[sym] = .not_computed;
-            return t;
-        }
         c.sym_types.items[sym] = t;
         c.sym_state.items[sym] = .computed;
         return t;
@@ -4970,10 +4952,7 @@ const Checker = struct {
         // Crash guard for pathological mutually-recursive generic alias chains
         // (see `max_alias_depth`). `alias_state` only breaks direct self-
         // recursion; a chain through distinct syms is bounded here.
-        if (c.alias_depth >= max_alias_depth) {
-            c.inst_trips += 1;
-            return types.error_type;
-        }
+        if (c.alias_depth >= max_alias_depth) return types.error_type;
         c.alias_depth += 1;
         defer c.alias_depth -= 1;
         const state = c.alias_state.get(sym) orelse 0;
@@ -5010,7 +4989,6 @@ const Checker = struct {
 
     fn aliasGeneric(c: *Checker, sym: SymbolId) Error!TypeId {
         if (c.alias_generic.get(sym)) |t| return t;
-        const trips = c.inst_trips;
         try c.alias_state.put(c.cm(), sym, 1);
         const saved_ctx = c.enterSymFile(sym);
         defer c.restoreCtx(saved_ctx);
@@ -5049,10 +5027,6 @@ const Checker = struct {
             }
             result = types.error_type;
         }
-        if (c.inst_trips != trips) { // truncated: see `inst_trips`
-            _ = c.alias_state.remove(sym);
-            return result;
-        }
         try c.alias_generic.put(c.cm(), sym, result);
         try c.alias_state.put(c.cm(), sym, 2);
         return result;
@@ -5077,7 +5051,6 @@ const Checker = struct {
             return t;
         }
         try c.expansions.put(c.cm(), ref, types.no_type); // in-progress
-        const trips = c.inst_trips;
         const sym = c.ts.refSymbol(ref);
         const args = try c.scratch().dupe(TypeId, c.ts.refArgs(ref));
         const f = c.symFlags(sym);
@@ -5117,10 +5090,6 @@ const Checker = struct {
         // objects are tagged — a ref that resolved to a union/primitive/etc.
         // is already compared by its own rules.
         if (originTaggable(c.ts.kind(result))) try c.origin.put(c.cm(), result, ref);
-        if (c.inst_trips != trips) { // truncated: see `inst_trips`
-            _ = c.expansions.remove(ref);
-            return result;
-        }
         try c.expansions.put(c.cm(), ref, result);
         return result;
     }
@@ -5398,7 +5367,6 @@ const Checker = struct {
             return t;
         }
         try c.iface_generic.put(c.cm(), sym, types.no_type);
-        const trips = c.inst_trips;
         try c.iface_stack.append(c.cm(), .{ .sym = sym });
         defer _ = c.iface_stack.pop();
 
@@ -5443,10 +5411,6 @@ const Checker = struct {
         for (parts) |csym| {
             if (!c.symFlags(csym).interface) continue;
             result = try c.interfaceConstituentApplyBases(csym, result, owner);
-        }
-        if (c.inst_trips != trips) { // truncated: see `inst_trips`
-            _ = c.iface_generic.remove(sym);
-            return result;
         }
         try c.iface_generic.put(c.cm(), sym, result);
         return result;
@@ -5661,7 +5625,6 @@ const Checker = struct {
             return t;
         }
         try c.class_inst_generic.put(c.cm(), sym, types.no_type);
-        const trips = c.inst_trips;
         const saved_ctx = c.enterSymFile(sym);
         defer c.restoreCtx(saved_ctx);
         // `this` inside member type nodes (a `foo(): this` return, a `x: this`
@@ -5728,10 +5691,6 @@ const Checker = struct {
                 if (!c.symFlags(p).interface) continue;
                 result = try c.mergeBaseObject(result, try c.interfaceConstituentDirect(p, sym), true);
             }
-        }
-        if (c.inst_trips != trips) { // truncated: see `inst_trips`
-            _ = c.class_inst_generic.remove(sym);
-            return result;
         }
         try c.class_inst_generic.put(c.cm(), sym, result);
         return result;
@@ -7026,12 +6985,10 @@ const Checker = struct {
         // test/conformance/instantiation record).
         if (c.chainRepeats(t)) {
             c.inst_limit_tripped = true;
-            c.inst_trips += 1;
             return types.error_type;
         }
         if (c.inst_depth > max_instantiation_depth or c.inst_count > max_instantiation_count) {
             c.inst_limit_tripped = true;
-            c.inst_trips += 1;
             if (!c.suppress_inst_diag) try c.instLimitDiag(2589, "Type instantiation is excessively deep and possibly infinite.");
             return types.error_type;
         }
@@ -7314,10 +7271,7 @@ const Checker = struct {
     fn substThis(c: *Checker, t: TypeId, repl: TypeId) Error!TypeId {
         if (!c.has_this_types) return t;
         if (!c.containsThisType(t)) return t;
-        if (c.inst_depth > max_instantiation_depth) {
-            c.inst_trips += 1;
-            return types.error_type;
-        }
+        if (c.inst_depth > max_instantiation_depth) return types.error_type;
         c.inst_depth += 1;
         defer c.inst_depth -= 1;
         const s = &c.ts;
@@ -7481,7 +7435,6 @@ const Checker = struct {
     fn reduceConditional(c: *Checker, chk: TypeId, extends_ty: TypeId, true_ty: TypeId, false_ty: TypeId, distributive: bool) Error!TypeId {
         if (c.inst_depth > max_instantiation_depth or c.inst_count > max_instantiation_count) {
             c.inst_limit_tripped = true;
-            c.inst_trips += 1;
             if (!c.suppress_inst_diag) try c.instLimitDiag(2589, "Type instantiation is excessively deep and possibly infinite.");
             return types.error_type;
         }
@@ -8359,7 +8312,6 @@ const Checker = struct {
     fn reduceMapped(c: *Checker, key_param: TypeId, constraint: TypeId, value: TypeId, as_clause: TypeId, src_type: TypeId, flags: u32) Error!TypeId {
         if (c.inst_depth > max_instantiation_depth or c.inst_count > max_instantiation_count) {
             c.inst_limit_tripped = true;
-            c.inst_trips += 1;
             if (!c.suppress_inst_diag) try c.instLimitDiag(2589, "Type instantiation is excessively deep and possibly infinite.");
             return types.error_type;
         }
@@ -9162,7 +9114,6 @@ const Checker = struct {
     fn reduceTemplateChunks(c: *Checker, head: Atom, holes: []const TypeId, chunks: []const Atom) Error!TypeId {
         if (c.inst_depth > max_instantiation_depth or c.inst_count > max_instantiation_count) {
             c.inst_limit_tripped = true;
-            c.inst_trips += 1;
             if (!c.suppress_inst_diag) try c.instLimitDiag(2589, "Type instantiation is excessively deep and possibly infinite.");
             return types.error_type;
         }
@@ -9230,7 +9181,6 @@ const Checker = struct {
             builders = next;
             if (builders.items.len >= cap) {
                 c.inst_limit_tripped = true;
-                c.inst_trips += 1;
                 try c.instLimitDiag(2590, "Expression produces a union type that is too complex to represent.");
                 return types.string_type;
             }
@@ -10234,15 +10184,8 @@ const Checker = struct {
             c.stats.relation_misses += 1;
             try c.relation.put(c.cm(), key, 2);
         }
-        const trips = c.inst_trips;
         const result = try c.isAssignableInner(s, t, sk, tk);
-        if (cacheable) {
-            if (c.inst_trips != trips) { // truncated: see `inst_trips`
-                _ = c.relation.remove(key);
-                return result;
-            }
-            try c.relation.put(c.cm(), key, @intFromBool(result));
-        }
+        if (cacheable) try c.relation.put(c.cm(), key, @intFromBool(result));
         return result;
     }
 
@@ -11445,9 +11388,7 @@ const Checker = struct {
             }
         }
         c.stats.node_type_misses += 1;
-        const trips = c.inst_trips;
         const t = try c.checkExpr(node, ctx);
-        if (c.inst_trips != trips) return t; // truncated: see `inst_trips`
         try c.node_types.put(c.cm(), key, .{ .ty = t, .ctx = ctx });
         return t;
     }
