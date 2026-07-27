@@ -408,20 +408,20 @@ const FreshTp = struct { name: Atom, constraint: TypeId, default: TypeId, has_de
 /// `deinit` cannot fall behind the field set: a container added to `Checker`
 /// and fed from `cm()` but forgotten here leaks its whole table.
 const map_containers = [_][]const u8{
-    "node_types",             "sig_cache",           "node_scopes",
-    "reassigned_syms",        "reassigned_in_loop",  "member_written_syms",
-    "member_written_in_loop", "ns_types",            "ambient_ns_types",
-    "relation",               "expansions",          "origin",
-    "iface_generic",          "iface_stack",         "pending_class_decos",
-    "class_inst_generic",     "class_static_cache",  "class_static_base_active",
-    "enum_value_cache",       "enum_info_cache",     "alias_generic",
-    "alias_state",            "alias_recursive",     "flow_same",
-    "flow_narrow",            "ref_keys",            "da_cache",
-    "ctp_cache",              "cmp_cache",           "inst_cache",
-    "inst_map_ids",           "tp_constraint_cache", "fresh_tp_ids",
-    "fresh_tp_info",          "type_node_cache",     "atom_cache",
-    "infer_ids",              "infer_scopes",        "mapped_key_ids",
-    "inst_diag_at",           "infer_active",
+    "node_types",             "sig_cache",          "node_scopes",
+    "reassigned_syms",        "reassigned_in_loop", "member_written_syms",
+    "member_written_in_loop", "ns_types",           "ambient_ns_types",
+    "relation",               "expansions",         "origin",
+    "iface_generic",          "iface_stack",        "pending_class_decos",
+    "class_inst_generic",     "class_static_cache", "class_static_base_active",
+    "class_ctor_cache",       "enum_value_cache",   "enum_info_cache",
+    "alias_generic",          "alias_state",        "alias_recursive",
+    "flow_same",              "flow_narrow",        "ref_keys",
+    "da_cache",               "ctp_cache",          "cmp_cache",
+    "inst_cache",             "inst_map_ids",       "tp_constraint_cache",
+    "fresh_tp_ids",           "fresh_tp_info",      "type_node_cache",
+    "atom_cache",             "infer_ids",          "infer_scopes",
+    "mapped_key_ids",         "inst_diag_at",       "infer_active",
 };
 
 const Checker = struct {
@@ -594,6 +594,9 @@ const Checker = struct {
     /// cache stays unpoisoned — static-field-initializer re-entry must still
     /// see the class's own members).
     class_static_base_active: std.AutoHashMapUnmanaged(SymbolId, void) = .empty,
+    /// Class symbol -> its *structural* constructor object (statics + construct
+    /// signatures returning the instance). See `classConstructType`.
+    class_ctor_cache: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
     /// Enum symbol -> value object type (the `typeof E` object with members).
     enum_value_cache: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
     /// Enum symbol -> computed EnumInfo (const-ness, member values).
@@ -6486,6 +6489,68 @@ const Checker = struct {
         return result;
     }
 
+    /// A class value (`typeof C`) rendered as an ordinary *structural*
+    /// constructor object: the class's static members plus one construct
+    /// signature per constructor overload, each returning the class instance.
+    ///
+    /// `.class_value` is a nominal shortcut — `new C()` and `C.staticMember`
+    /// read it directly (see `checkCallLike` / `propOfTypeEx`), so nothing ever
+    /// had to materialize its construct signatures. But a *pattern* match needs
+    /// them: `InstanceType<T> = T extends abstract new (…args: any) => infer R ?
+    /// R : never` matches an object carrying construct signatures, and a bare
+    /// `.class_value` source offers none, so `R` stayed uninferred and the whole
+    /// conditional collapsed to `unknown`. The instance type comes from the
+    /// class symbol (a constructor's own declared return is `void`), with the
+    /// class's type parameters filled with `any` — the same erasure
+    /// `instanceofInstanceType` uses for `x instanceof C`.
+    fn classConstructType(c: *Checker, cls: SymbolId) Error!TypeId {
+        if (c.class_ctor_cache.get(cls)) |t| return t;
+        var tps: std.ArrayList(TypeParamInfo) = .empty;
+        defer tps.deinit(c.scratch());
+        try c.typeParamsOf(cls, &tps);
+        const args = try c.scratch().alloc(TypeId, tps.items.len);
+        for (args) |*x| x.* = types.any_type;
+        const inst = try c.ts.makeRef(cls, args);
+        var ctor_sigs: std.ArrayList(TypeId) = .empty;
+        defer ctor_sigs.deinit(c.scratch());
+        try c.ctorSignatures(cls, &ctor_sigs);
+        const map = try c.scratch().alloc(TpMap, tps.items.len);
+        for (tps.items, 0..) |tp, i| map[i] = .{ .sym = tp.sym, .ty = args[i] };
+        var sigs: std.ArrayList(TypeId) = .empty;
+        defer sigs.deinit(c.scratch());
+        for (ctor_sigs.items) |sig0| {
+            const sig = if (map.len > 0) try c.instantiate(sig0, map) else sig0;
+            try sigs.append(c.scratch(), try c.sigWithReturn(sig, inst));
+        }
+        // No declared constructor: the implicit `new () => C`.
+        if (sigs.items.len == 0) {
+            try sigs.append(c.scratch(), try c.ts.makeFunction(&.{}, inst, &.{}, 0));
+        }
+        const statics = try c.classStaticType(cls);
+        var props: std.ArrayList(types.Prop) = .empty;
+        defer props.deinit(c.scratch());
+        if (c.ts.kind(statics) == .object) {
+            for (0..c.ts.objectPropCount(statics)) |i| {
+                try props.append(c.scratch(), c.ts.objectProp(statics, @intCast(i)));
+            }
+        }
+        const obj = try c.ts.makeObjectSigs(props.items, 0, 0, types.obj_flag_not_inferable, &.{}, sigs.items);
+        try c.class_ctor_cache.put(c.cm(), cls, obj);
+        return obj;
+    }
+
+    /// `sig` with its return type replaced (params, type params and arity kept).
+    fn sigWithReturn(c: *Checker, sig: TypeId, ret: TypeId) Error!TypeId {
+        const s = &c.ts;
+        var params: std.ArrayList(types.Param) = .empty;
+        defer params.deinit(c.scratch());
+        for (0..s.fnParamCount(sig)) |i| try params.append(c.scratch(), s.fnParam(sig, @intCast(i)));
+        var tps: std.ArrayList(u32) = .empty;
+        defer tps.deinit(c.scratch());
+        for (0..s.fnTypeParamCount(sig)) |i| try tps.append(c.scratch(), s.fnTypeParamAt(sig, i));
+        return s.makeFunction(params.items, ret, tps.items, 0);
+    }
+
     /// Constructor signatures of a class (own or inherited); empty list
     /// means the default ctor.
     fn ctorSignatures(c: *Checker, sym: SymbolId, out: *std.ArrayList(TypeId)) Error!void {
@@ -7887,7 +7952,19 @@ const Checker = struct {
                 if (rp != pattern) try c.inferFromExtends(src, rp, ids, vals, contra, depth + 1);
             },
             .object => {
-                const src = try c.resolveStructural(source0);
+                var src = try c.resolveStructural(source0);
+                // A construct-signature pattern (`abstract new (…args: any) =>
+                // infer R`, the shape of `InstanceType`/`ConstructorParameters`)
+                // against a class value: `.class_value` is nominal and carries
+                // no structural signatures, so bridge it to its constructor
+                // object first. Only for signature-bearing patterns — a plain
+                // property pattern reads a class value's statics through the
+                // ordinary `propOfTypeEx` route.
+                if (s.kind(src) == .class_value and
+                    (s.objectConstructSigCount(pattern) > 0 or s.objectCallSigCount(pattern) > 0))
+                {
+                    src = try c.classConstructType(s.classSymbol(src));
+                }
                 if (s.kind(src) != .object) return;
                 for (0..s.objectPropCount(pattern)) |i| {
                     const pp = s.objectProp(pattern, @intCast(i));
