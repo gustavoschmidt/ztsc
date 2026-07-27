@@ -14588,6 +14588,14 @@ const Checker = struct {
     /// }))`) or unions, which contextual typing would perturb without benefit.
     fn paramWantsLiteralCtx(c: *Checker, pt: TypeId) Error!bool {
         const r = try c.resolveStructural(pt);
+        // A still-generic MAPPED parameter (`c: { [K in keyof T]: T[K] }`) has
+        // no members for the property scan below to read, but it is exactly the
+        // shape whose per-property contextual type must be handed down: it is
+        // what tells a property value's fresh literal to stay a literal and a
+        // property value's callback what its parameters are (see `ctxPropType`'s
+        // `.mapped` arm). Without it every such argument is checked
+        // context-free.
+        if (c.ts.kind(r) == .mapped) return true;
         if (c.ts.kind(r) != .object) return false;
         for (0..c.ts.objectPropCount(r)) |i| {
             const p = c.ts.objectProp(r, @intCast(i));
@@ -14940,6 +14948,42 @@ const Checker = struct {
                 }
                 if (parts.items.len == 0) return types.no_type;
                 return c.ts.makeUnion(c.scratch(), parts.items);
+            },
+            // A still-generic mapped type (`c: { [K in keyof T]: T[K] }`) has
+            // no members to look up, so an object literal written for it got no
+            // contextual type at all: its property values widened (a fresh
+            // `true` to `boolean`, a fresh `'x'` to the whole union) and a
+            // callback value's parameters fell to implicit `any` (TS7006).
+            // tsc's `getTypeOfPropertyOfContextualType` answers with the value
+            // template, the key bound to this property's name
+            // (`substituteIndexedMappedType`), so property `a` of the map above
+            // is contextually `T['a']`.
+            // A deferred type variable offers the contextual members of its
+            // APPARENT type — tsc's `getApparentTypeOfContextualType` maps
+            // `getApparentType` over the contextual type. This is the other half
+            // of the mapped arm below: property `a` of `{ [K in keyof T]: T[K] }`
+            // is contextually `T['a']`, and only through the base constraint does
+            // that offer `{ b: boolean }` to the nested literal.
+            .index_access, .conditional => {
+                const ap = try c.transitiveBaseConstraint(rctx);
+                if (ap == rctx or ap == types.no_type) return types.no_type;
+                return c.ctxPropType(try c.resolveStructural(ap), ctx, key);
+            },
+            .mapped => {
+                // An `as` clause remaps the key, so the property name does not
+                // identify the template instance — not modelled (as elsewhere).
+                if (c.ts.mappedAs(rctx) != 0) return types.no_type;
+                const key_lit = try c.ts.makeStringLiteral(key, false);
+                // tsc's guard: the name must satisfy the map's key set, taken
+                // through its base constraint (`keyof T` for `T extends
+                // Record<string, …>` bottoms out at `string | number`).
+                const con = try c.transitiveBaseConstraint(c.ts.mappedConstraint(rctx));
+                if (con != types.no_type and !try c.isAssignable(key_lit, con)) return types.no_type;
+                return c.substMappedKey(
+                    c.ts.mappedValue(rctx),
+                    c.ts.mappedParamId(c.ts.mappedKeyParam(rctx)),
+                    key_lit,
+                );
             },
             // A contextual property inside an intersection (`Partial<C> & (A |
             // B | C)`) may live in a *union* member. `propOfType` has no union
@@ -15875,7 +15919,20 @@ const Checker = struct {
         const d = c.tree.nodeData(node);
         var ctx_sig: TypeId = types.no_type;
         if (ctx != types.no_type) {
-            const rctx = try c.resolveStructural(ctx);
+            var rctx = try c.resolveStructural(ctx);
+            // tsc's `getContextualSignature` reads the contextual type's
+            // APPARENT type, so a still-deferred type variable answers with its
+            // base constraint. That is what a mapped parameter hands down —
+            // property `a` of `{ [K in keyof T]: T[K] }` is contextually
+            // `T['a']` — and leaving it deferred lost the signature entirely,
+            // so the callback written there reported TS7006 on every parameter.
+            switch (c.ts.kind(rctx)) {
+                .type_param, .index_access, .conditional => {
+                    const ap = try c.transitiveBaseConstraint(rctx);
+                    if (ap != rctx and ap != types.no_type) rctx = try c.resolveStructural(ap);
+                },
+                else => {},
+            }
             switch (c.ts.kind(rctx)) {
                 .function => ctx_sig = rctx,
                 // A callable-INTERFACE contextual type — a call signature plus
