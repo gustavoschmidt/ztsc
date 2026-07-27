@@ -17084,6 +17084,21 @@ const Checker = struct {
             },
             .tuple => {
                 const ra = try c.resolveStructural(arg);
+                // A UNION argument against a tuple parameter — the shape a
+                // union parameter hands down, since the `.union_type` arm
+                // passes the whole argument to each of its type-parameter-
+                // bearing members. `void | readonly [number, T]` matched
+                // against `void | readonly [number, string[]]` therefore
+                // arrives here as (tuple, union) and inferred nothing, so `T`
+                // collapsed to its fallback. tsc's `inferFromTypes` pairs the
+                // constituents; distribute over them exactly as the `.array`
+                // arm already does (the non-tuple constituents no-op below).
+                if (s.kind(ra) == .union_type) {
+                    for (try c.memberList(ra)) |m| {
+                        try c.unify(param, m, tp_syms, candidates, depth + 1);
+                    }
+                    return;
+                }
                 if (s.kind(ra) == .tuple) {
                     const n = @min(s.tupleLen(param), s.tupleLen(ra));
                     for (0..n) |i| {
