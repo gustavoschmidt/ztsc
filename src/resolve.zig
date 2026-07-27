@@ -639,29 +639,75 @@ fn fileExistsFs(io: Io, dir: Io.Dir, path: []const u8, fs: ?*FsCache) Error!bool
     return fileExists(io, dir, path);
 }
 
-/// Minimal `package.json` scan for the first string value of any of `keys`
-/// (quoted key literals, e.g. `"types"`). First match wins; string escapes
-/// unsupported — documented cut.
+/// Minimal `package.json` scan for the string value of the first of `keys`
+/// (quoted key literals, e.g. `"types"`) that appears as a key of the ROOT
+/// object. Keys are tried in the given priority order, each over the whole
+/// file, so declaration order in the file does not decide between them.
+///
+/// Nesting matters: a flat substring search matched `"types"` at *any* depth,
+/// and `"scripts": { "types": "tsc src/index.tsx --declaration …" }` is a
+/// real, common shape. The build-script command line was then taken as the
+/// declaration path, the package looked like it had a `types` field, and the
+/// package's actual top-level `"typings"` was never reached — an unresolvable
+/// package (TS2307) whose declarations were sitting right there.
+///
+/// Depth is tracked by counting braces/brackets outside strings; string
+/// escapes are honored only well enough not to lose track of the quoting.
 fn packageStringField(text: []const u8, keys: []const []const u8) ?[]const u8 {
     for (keys) |key| {
-        var from: usize = 0;
-        while (std.mem.indexOfPos(u8, text, from, key)) |at| {
-            var i = at + key.len;
-            while (i < text.len and (text[i] == ' ' or text[i] == '\t' or
-                text[i] == '\r' or text[i] == '\n')) i += 1;
-            if (i >= text.len or text[i] != ':') {
-                from = at + key.len;
-                continue;
-            }
-            i += 1;
-            while (i < text.len and (text[i] == ' ' or text[i] == '\t' or
-                text[i] == '\r' or text[i] == '\n')) i += 1;
-            if (i >= text.len or text[i] != '"') return null;
-            i += 1;
-            const start = i;
-            while (i < text.len and text[i] != '"') i += 1;
-            if (i >= text.len) return null;
-            return text[start..i];
+        if (packageRootStringField(text, key)) |v| return v;
+    }
+    return null;
+}
+
+/// One key's root-object lookup for `packageStringField`.
+fn packageRootStringField(text: []const u8, key: []const u8) ?[]const u8 {
+    const isWs = struct {
+        fn f(c: u8) bool {
+            return c == ' ' or c == '\t' or c == '\r' or c == '\n';
+        }
+    }.f;
+    var i: usize = 0;
+    var depth: usize = 0;
+    while (i < text.len) {
+        switch (text[i]) {
+            '{', '[' => {
+                depth += 1;
+                i += 1;
+            },
+            '}', ']' => {
+                if (depth > 0) depth -= 1;
+                i += 1;
+            },
+            '"' => {
+                const start = i;
+                i += 1;
+                while (i < text.len and text[i] != '"') : (i += 1) {
+                    if (text[i] == '\\') i += 1;
+                }
+                if (i >= text.len) return null;
+                const tok = text[start .. i + 1];
+                i += 1;
+                if (depth != 1) continue; // not a key of the root object
+                var j = i;
+                while (j < text.len and isWs(text[j])) j += 1;
+                if (j >= text.len or text[j] != ':') continue; // a value, not a key
+                j += 1;
+                while (j < text.len and isWs(text[j])) j += 1;
+                if (!std.mem.eql(u8, tok, key)) {
+                    i = j; // resume at the value (an object/array re-enters depth)
+                    continue;
+                }
+                if (j >= text.len or text[j] != '"') return null; // present, not a string
+                j += 1;
+                const vstart = j;
+                while (j < text.len and text[j] != '"') : (j += 1) {
+                    if (text[j] == '\\') j += 1;
+                }
+                if (j >= text.len) return null;
+                return text[vstart..j];
+            },
+            else => i += 1,
         }
     }
     return null;
@@ -1250,6 +1296,31 @@ test "packageTypesField: minimal scan" {
     try testing.expectEqual(@as(?[]const u8, null), packageTypesField(
         \\{ "name": "p" }
     ));
+}
+
+test "packageTypesField: only root-object keys count" {
+    // A `types` *script* is not a declaration entry; the root `typings` is.
+    try testing.expectEqualStrings("./lib/index.d.ts", packageTypesField(
+        \\{ "name": "p", "typings": "./lib/index.d.ts",
+        \\  "scripts": { "types": "tsc src/index.tsx --declaration" } }
+    ).?);
+    // Nested-only: nothing at the root, so nothing resolves.
+    try testing.expectEqual(@as(?[]const u8, null), packageTypesField(
+        \\{ "name": "p", "scripts": { "types": "tsc --declaration" } }
+    ));
+    // The nesting may be an array of objects, and a *value* that looks like a
+    // key must not be mistaken for one.
+    try testing.expectEqualStrings("d/i.d.ts", packageTypesField(
+        \\{ "contributors": [ { "types": "nope" } ], "note": "\"types\":",
+        \\  "types": "d/i.d.ts" }
+    ).?);
+    // `types` outranks `typings` regardless of which comes first in the file.
+    try testing.expectEqualStrings("a.d.ts", packageTypesField(
+        \\{ "typings": "b.d.ts", "types": "a.d.ts" }
+    ).?);
+    try testing.expectEqualStrings("./lib/index.js", packageMainField(
+        \\{ "main": "./lib/index.js", "scripts": { "main": "node ." } }
+    ).?);
 }
 
 test "resolveSpecifier: relative, index, js rewrite, node_modules" {
