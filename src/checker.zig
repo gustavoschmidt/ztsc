@@ -6503,6 +6503,24 @@ const Checker = struct {
         return p;
     }
 
+    /// Expression-position companion to the `indexedAccessType` wiring above:
+    /// a property read whose receiver is a class ref (or a polymorphic `this`
+    /// standing for one) whose materialization is on this checker's stack.
+    /// Null whenever the ordinary path is the right one — the receiver is not
+    /// such a ref, or the name is genuinely not a member.
+    ///
+    /// Termination: every recursion goes through `lazyRefProp`, which marks the
+    /// member symbol it is resolving in `lazy_member_active` and answers null
+    /// for a member already on that stack. A self-referential inferred return
+    /// (`m() { return this.m(); }`) or field (`p = this.p`) therefore cuts to
+    /// the caller's not-found path instead of recurring, and a mutual cycle
+    /// cuts after at most one pass per member.
+    fn lazyThisProp(c: *Checker, recv: TypeId, name: Atom) Error!?types.Prop {
+        const t = if (c.ts.kind(recv) == .this_type) c.ts.thisTypeInstance(recv) else recv;
+        if (!c.refExpansionActive(t)) return null;
+        return c.lazyRefProp(t, name, 0);
+    }
+
     /// Is `name` an OWN instance member (field, param-property, accessor,
     /// method) of the class whose constructor is currently being checked? Used
     /// to permit a `readonly` assignment via `this.name` inside that
@@ -14704,6 +14722,21 @@ const Checker = struct {
                 return c.ts.makeUnion(c.scratch(), parts.items);
             },
             else => {
+                // `this.f` read from a member whose own type is being computed
+                // *as part of* the class's instance materialization: an
+                // unannotated method's return type is inferred by checking its
+                // body, and that body runs while `classInstanceGeneric` still
+                // holds the member table open. `resolveStructural` can only
+                // answer `error_type` there → `any`, which then memoizes into
+                // the method's signature, so every later caller of `c.m()` sees
+                // `any` too. The single member can be resolved on its own —
+                // see `lazyRefProp`, already used for the `C["f"]` type
+                // position.
+                if (try c.lazyThisProp(t, name)) |p| {
+                    var pt = try c.substThis(p.ty, t);
+                    if (p.optional()) pt = try c.makeUnion2(pt, types.undefined_type);
+                    return pt;
+                }
                 const r = try c.resolveStructural(t);
                 if (c.ts.kind(r) == .any or c.ts.kind(r) == .err) return types.any_type;
                 if (try c.propOfType(r, name)) |p| {
