@@ -25,9 +25,11 @@
 //!   union is `never`.
 //! - **Intersections are canonical** the same way: flattened, deduped,
 //!   sorted; `unknown` dropped (`T & unknown = T`), `never`/`any` absorbing,
-//!   empty intersection is `unknown`. Object-member *merging* is not done at
-//!   construction; the checker merges views lazily (property lookup walks
-//!   all constituents).
+//!   empty intersection is `unknown`. A *union* constituent is distributed
+//!   into a union of intersections (`(A | B) & C` -> `A & C | B & C`), as tsc
+//!   does, so no interned intersection ever contains a union member.
+//!   Object-member *merging* is not done at construction; the checker merges
+//!   views lazily (property lookup walks all constituents).
 //! - **Freshness** (for excess-property checking) is a flag bit on object
 //!   types that *participates* in interning: the fresh and regular variants
 //!   of an object literal type are two TypeIds, and `regular()` maps
@@ -1320,8 +1322,24 @@ pub const Store = struct {
         }
     }
 
+    /// Ceiling on the number of constituents a distributed intersection may
+    /// produce (tsc's `checkCrossProductUnion` limit). Past it we keep the
+    /// undistributed intersection rather than tsc's hard error — the
+    /// under-report policy — so a pathological shape degrades instead of
+    /// exploding the type store.
+    const max_cross_product: usize = 100_000;
+
     /// Canonical intersection (flatten, dedup, sort; unknown dropped;
     /// never/any absorbing; empty -> unknown; single -> unwrapped).
+    ///
+    /// A union constituent is *distributed*: `(A | B) & C` becomes
+    /// `(A & C) | (B & C)`, recursively for further unions (tsc's
+    /// `getIntersectionType` / `getCrossProductIntersections`). Keeping the
+    /// union outermost is what lets discriminant narrowing, assignability and
+    /// property lookup — all of which already handle unions — see through the
+    /// shape. The cross product is order-independent (both `makeUnion` and
+    /// this function sort by TypeId), so the result does not depend on which
+    /// union constituent is expanded first.
     pub fn makeIntersection(s: *Store, scratch: Allocator, parts: []const TypeId) Error!TypeId {
         var flat: std.ArrayList(TypeId) = .empty;
         defer flat.deinit(scratch);
@@ -1348,7 +1366,32 @@ pub const Store = struct {
         }
         if (n == 0) return unknown_type;
         if (n == 1) return items[0];
-        return s.internType(.intersection, items[0..n], 0);
+        const list = items[0..n];
+
+        // Distribute over the first union constituent, if any.
+        var union_idx: usize = n;
+        var size: usize = 1;
+        for (list, 0..) |t, i| {
+            if (s.kind(t) != .union_type) continue;
+            if (union_idx == n) union_idx = i;
+            size *|= s.members(t).len;
+        }
+        if (union_idx != n and size <= max_cross_product) {
+            // `members` dangles once the recursion interns anything.
+            const um = try scratch.dupe(TypeId, s.members(list[union_idx]));
+            defer scratch.free(um);
+            var out: std.ArrayList(TypeId) = .empty;
+            defer out.deinit(scratch);
+            try out.ensureTotalCapacityPrecise(scratch, um.len);
+            const combo = try scratch.dupe(TypeId, list);
+            defer scratch.free(combo);
+            for (um) |m| {
+                combo[union_idx] = m;
+                out.appendAssumeCapacity(try s.makeIntersection(scratch, combo));
+            }
+            return s.makeUnion(scratch, out.items);
+        }
+        return s.internType(.intersection, list, 0);
     }
 
     fn indexOf(list: []const TypeId, t: TypeId) ?usize {
@@ -1505,6 +1548,31 @@ test "intersection canonicalization" {
     try testing.expectEqual(Kind.intersection, s.kind(ix));
     // empty -> unknown
     try testing.expectEqual(unknown_type, try s.makeIntersection(sc, &.{}));
+
+    // A union constituent distributes: `(A | B) & C` = `A & C | B & C`, and
+    // no interned intersection holds a union member.
+    const o3 = try s.makeObject(&.{.{ .name = 3, .ty = boolean_type }}, 0, 0, 0);
+    const uni_ab = try s.makeUnion(sc, &.{ o1, o2 });
+    const dist = try s.makeIntersection(sc, &.{ uni_ab, o3 });
+    try testing.expectEqual(Kind.union_type, s.kind(dist));
+    try testing.expectEqual(try s.makeUnion(sc, &.{
+        try s.makeIntersection(sc, &.{ o1, o3 }),
+        try s.makeIntersection(sc, &.{ o2, o3 }),
+    }), dist);
+    for (s.members(dist)) |m| try testing.expectEqual(Kind.intersection, s.kind(m));
+
+    // Two unions cross-multiply, and the result is independent of which union
+    // is expanded first (both operands and results are sorted by TypeId).
+    const o4 = try s.makeObject(&.{.{ .name = 4, .ty = string_type }}, 0, 0, 0);
+    const uni_cd = try s.makeUnion(sc, &.{ o3, o4 });
+    const cross = try s.makeIntersection(sc, &.{ uni_ab, uni_cd });
+    try testing.expectEqual(@as(usize, 4), s.members(cross).len);
+    try testing.expectEqual(cross, try s.makeIntersection(sc, &.{ uni_cd, uni_ab }));
+
+    // `any` still absorbs through a union constituent, and a union member that
+    // repeats an intersected part collapses (`(A | B) & A` keeps `A` once).
+    try testing.expectEqual(any_type, try s.makeIntersection(sc, &.{ uni_ab, any_type }));
+    try testing.expectEqual(try s.makeUnion(sc, &.{ o1, ix }), try s.makeIntersection(sc, &.{ uni_ab, o1 }));
 }
 
 test "object interning: property order does not matter, freshness does" {
