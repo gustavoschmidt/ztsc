@@ -11033,9 +11033,18 @@ const Checker = struct {
         return cur;
     }
 
+    /// Is `k` one of the *non-primitive* type kinds — what the `object` keyword
+    /// admits, and what a `for…in` right-hand side must be?
+    ///
+    /// `.mapped` belongs here: a mapped type is an object type by construction,
+    /// whether or not its key set is still generic. A `Partial<T>` parameter
+    /// stays deferred as `{ [P in keyof T]: T[P] }` while `T` is a type param,
+    /// and without this arm every such value was rejected as a `object`
+    /// argument (TS2345) and as a `for…in` operand (TS2407) — a whole-family
+    /// false positive on any generic helper that takes a mapped type.
     fn isNonPrimitiveKind(k: types.Kind) bool {
         return switch (k) {
-            .object, .array, .tuple, .function, .overloads, .ref, .class_value, .intersection, .object_keyword => true,
+            .object, .array, .tuple, .function, .overloads, .ref, .class_value, .intersection, .object_keyword, .mapped => true,
             else => false,
         };
     }
