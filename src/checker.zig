@@ -10643,10 +10643,27 @@ const Checker = struct {
         return c.ts.kind(args[0]) == .type_param and c.ts.typeParamSymbol(args[0]) == tp_sym;
     }
 
-    /// Single-level `Awaited<T>`: unwrap a `Promise<T>` to `T`; any other type
-    /// passes through (await on a non-thenable yields the value itself).
-    /// Deeper `Awaited<T>` recursion (`Promise<Promise<T>>`) is a known gap.
+    /// `Awaited<T>`: unwrap a `Promise<T>` / `PromiseLike<T>` to `T`, to a
+    /// fixed point; any other type passes through (await on a non-thenable
+    /// yields the value itself).
+    ///
+    /// The lib types both of them (`Promise<T> extends PromiseLike<T>`, and
+    /// `then` returns `PromiseLike<TResult>`), so a bare `PromiseLike<T>`
+    /// receiver is ordinary — `await pool.all()` on a `PromiseLike<unknown[]>`
+    /// is `unknown[]`, not `PromiseLike<unknown[]>`. tsc's `Awaited<T>` is
+    /// structural over *any* thenable and recursive; ztsc recognizes the two
+    /// lib names and recurses, which covers every nesting of them
+    /// (`Promise<PromiseLike<T>>`, `PromiseLike<Promise<T>>`, …). A
+    /// hand-written thenable that is neither is still a gap (under-report:
+    /// the value keeps its object type).
     fn awaitedType(c: *Checker, t: TypeId) Error!TypeId {
+        return c.awaitedTypeRec(t, 0);
+    }
+
+    fn awaitedTypeRec(c: *Checker, t: TypeId, depth: u32) Error!TypeId {
+        // A self-referential alias (`type P = Promise<P>`) would spin; the cap
+        // is far above any real nesting and only ever leaves the type unwrapped.
+        if (depth >= 16) return t;
         // `Awaited<T>` distributes over unions: `await (Promise<X> | undefined)`
         // is `X | undefined` (tsc). Without this, a `Promise<X> | undefined`
         // receiver — common now that optional chains yield `... | undefined` —
@@ -10654,7 +10671,7 @@ const Checker = struct {
         if (c.ts.kind(t) == .union_type) {
             var parts: std.ArrayList(TypeId) = .empty;
             defer parts.deinit(c.scratch());
-            for (try c.memberList(t)) |m| try parts.append(c.scratch(), try c.awaitedType(m));
+            for (try c.memberList(t)) |m| try parts.append(c.scratch(), try c.awaitedTypeRec(m, depth + 1));
             return c.ts.makeUnion(c.scratch(), parts.items);
         }
         // An INTERSECTION awaits through its thenable constituent. tsc reads
@@ -10671,10 +10688,12 @@ const Checker = struct {
             return t;
         }
         if (c.ts.kind(t) == .ref) {
-            const sym = c.prog.globals.lookup(c.atom_Promise) orelse return t;
-            if (c.ts.refSymbol(t) == sym) {
+            const sym = c.ts.refSymbol(t);
+            const p = c.prog.globals.lookup(c.atom_Promise);
+            const pl = c.prog.globals.lookup(c.atom_PromiseLike);
+            if ((p != null and sym == p.?) or (pl != null and sym == pl.?)) {
                 const args = c.ts.refArgs(t);
-                if (args.len >= 1) return args[0];
+                if (args.len >= 1) return c.awaitedTypeRec(args[0], depth + 1);
             }
         }
         return t;
