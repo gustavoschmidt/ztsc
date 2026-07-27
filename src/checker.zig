@@ -13731,7 +13731,14 @@ const Checker = struct {
             // for a template-literal expression value; see jsxAttributeValueType).
             const vctx: TypeId = if (rt != types.no_type and c.tree.tokens.tag(name_tok) != .jsx_name) blk: {
                 const nm = try c.memberAtom(name_tok);
-                break :blk if (try c.propOfType(rt, nm)) |p| p.ty else types.no_type;
+                // `ctxPropType`, not a bare `propOfType`: a component's props
+                // are routinely `Base & (VariantA | VariantB)` (the
+                // discriminated-props idiom), and `propOfType` has no union
+                // arm, so a prop living in one variant was not found and the
+                // attribute value went unctx-typed — a callback attribute's
+                // parameters then fell to implicit `any` (TS7006). Object
+                // literals already read their contextual property this way.
+                break :blk try c.ctxPropType(rt, rt, nm);
             } else types.no_type;
             const vty = try c.jsxAttributeValueType(ad.lhs, vctx);
             // Hyphenated names (`data-*`, `aria-*`) are exempt from excess and
@@ -13777,6 +13784,14 @@ const Checker = struct {
                 else
                     p.ty;
                 _ = try c.checkAssignable(b.ty, target, b.value, vspan);
+            } else if (try c.unionNestedPropType(rt, b.name)) |nested| {
+                // A prop that lives in a UNION member of an intersection props
+                // type (`Base & (VariantA | VariantB)`) is not found by
+                // `propOfType`, so its value used to go unchecked — and, since
+                // the excess arm below only fires for an open target, silently.
+                // Check it against the union of the arms that declare it, the
+                // same type the attribute's contextual lookup above uses.
+                _ = try c.checkAssignable(b.ty, nested, b.value, c.tokSpan(b.name_tok));
             } else if (target_open and !containsAtom(ia_names.items, b.name)) {
                 if (!have_excess) {
                     first_excess = c.tokSpan(b.name_tok);
@@ -14812,6 +14827,21 @@ const Checker = struct {
             return c.ts.makeIntersection(c.scratch(), generic_spreads.items);
         }
         return obj;
+    }
+
+    /// The type of a property that `propOfType` cannot see because it lives in
+    /// only SOME constituents of a union (or of a union nested in an
+    /// intersection — `Base & (VariantA | VariantB)`, the discriminated-props
+    /// idiom): the union of the constituents that do declare it. Null for
+    /// every other shape, so a target `propOfType` already handles keeps the
+    /// exact behaviour it had.
+    fn unionNestedPropType(c: *Checker, rt: TypeId, key: Atom) Error!?TypeId {
+        switch (c.ts.kind(rt)) {
+            .intersection, .union_type => {},
+            else => return null,
+        }
+        const t = try c.ctxPropType(rt, rt, key);
+        return if (t == types.no_type) null else t;
     }
 
     /// Contextual type for property `key` of an object literal typed by
