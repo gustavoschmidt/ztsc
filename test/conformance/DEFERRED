@@ -93,3 +93,15 @@ assignability/065_callback_parameter_variance.ts  -TS2322 74
 enums/member_to_single_literal.ts  -TS2322 28
 enums/member_to_single_literal.ts  -TS2322 37
 enums/member_to_single_literal.ts  -TS2322 48
+
+# TS2502 ("referenced directly or indirectly in its own type annotation") is
+# not implemented. A member whose annotation indexes at itself is genuinely
+# circular; `lazyRefProp` detects the re-entry and cuts it, but the cut is
+# silent — it falls back to the ordinary property-not-found result rather than
+# reporting. Deterministic under-report of a whole check. The case exists to
+# pin the CUT: without it the lazy single-member lookup would recur forever,
+# and the non-circular self-index in the same file (line 23) proves the
+# lookup itself still resolves.
+indexed/021_self_referential_member_annotation.ts  -TS2502 7
+indexed/021_self_referential_member_annotation.ts  -TS2502 11
+indexed/021_self_referential_member_annotation.ts  -TS2502 12

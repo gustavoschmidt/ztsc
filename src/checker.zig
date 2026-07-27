@@ -455,6 +455,7 @@ const map_containers = [_][]const u8{
     "fresh_tp_ids",           "fresh_tp_info",      "type_node_cache",
     "atom_cache",             "infer_ids",          "infer_scopes",
     "mapped_key_ids",         "inst_diag_at",       "infer_active",
+    "lazy_member_active",
 };
 
 const Checker = struct {
@@ -627,6 +628,12 @@ const Checker = struct {
     /// cache stays unpoisoned — static-field-initializer re-entry must still
     /// see the class's own members).
     class_static_base_active: std.AutoHashMapUnmanaged(SymbolId, void) = .empty,
+    /// Member symbols whose type is being resolved by `lazyRefProp` (the
+    /// cycle-safe single-member lookup). A member whose own annotation indexes
+    /// back into the class at the very member being resolved (`class C { a:
+    /// C["a"] }`) is genuinely circular; re-entry returns null so the caller
+    /// falls back to the ordinary not-found result instead of recursing.
+    lazy_member_active: std.AutoHashMapUnmanaged(SymbolId, void) = .empty,
     /// Class symbol -> its *structural* constructor object (statics + construct
     /// signatures returning the instance). See `classConstructType`.
     class_ctor_cache: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
@@ -3689,6 +3696,15 @@ const Checker = struct {
 
     /// T[K] with literal / index-signature keys (non-generic subset).
     fn indexedAccessType(c: *Checker, obj: TypeId, idx: TypeId) Error!TypeId {
+        // `C["m"]` written while `C`'s own instance type is being materialized
+        // (a member signature mentions an alias that indexes back into the
+        // class). The whole-table expansion cannot answer, but the single
+        // member can — see `lazyRefProp`.
+        if (c.ts.kind(idx) == .string_literal and c.refExpansionActive(obj)) {
+            if (try c.lazyRefProp(obj, c.ts.literalAtom(idx), 0)) |p| {
+                return if (p.optional() and !c.homo_index_mode) c.makeUnion2(p.ty, types.undefined_type) else p.ty;
+            }
+        }
         const r = try c.resolveStructural(obj);
         // An indexed access over a *union object* distributes over its members:
         // `(A | B)[K]` = `A[K] | B[K]` (tsc's getIndexedAccessType). `propOfType`
@@ -6274,6 +6290,118 @@ const Checker = struct {
 
     fn isCtorName(c: *Checker, name: Atom) bool {
         return std.mem.eql(u8, c.atomText(name), "constructor");
+    }
+
+    /// Ceiling on the `extends` walk in `lazyRefProp`. A base chain is already
+    /// acyclic by construction (a cyclic `extends` is a bind error), but the
+    /// lazy path runs *inside* an in-progress materialization where the usual
+    /// caches are unavailable, so it carries its own belt.
+    const lazy_base_depth: u32 = 16;
+
+    /// Is `ref`'s materialization already on this checker's stack? Both layers
+    /// mark in-progress with `no_type`: `class_inst_generic` for the class's
+    /// own member table and `expansions` for this particular argument list.
+    /// The class layer is consulted FIRST — once its guard has fired,
+    /// `expandRef` memoizes the resulting `error_type` against the ref, so the
+    /// `expansions` entry no longer reads as in-progress even though the
+    /// member table still is.
+    fn refExpansionActive(c: *Checker, ref: TypeId) bool {
+        if (c.ts.kind(ref) != .ref) return false;
+        const sym = c.ts.refSymbol(ref);
+        if (c.symFlags(sym).class) {
+            if (c.class_inst_generic.get(sym)) |g| {
+                if (g == types.no_type) return true;
+            }
+        }
+        const e = c.expansions.get(ref) orelse return false;
+        return e == types.no_type;
+    }
+
+    /// ONE named member of a class `ref`, resolved without materializing the
+    /// whole member table. Null when the name is not a member of the class or
+    /// its bases — the caller then takes its ordinary not-found path.
+    ///
+    /// `expandRef` builds a class instance eagerly: every member's type is
+    /// computed to fill the object. That makes a perfectly ordinary TypeScript
+    /// cycle — a method parameter annotated with an alias that indexes back
+    /// into the class (`type P = { s: C["s"] }; class C { use(p: P) {} }`) —
+    /// re-enter the class's own in-progress expansion, where the only answer
+    /// available was `error_type` → `any`. The `any` is then *memoized* into
+    /// the alias body, so every later reader of `P.s` sees `any` for the rest
+    /// of the run, and which members lose depends on traversal order (so on
+    /// the checker count).
+    ///
+    /// tsc has no such state: `getPropertyOfType` resolves a single property
+    /// symbol on demand, and only the member that is *itself* circular is an
+    /// error. This is that lookup — the same lazy-member idea `globalThisType`
+    /// already relies on for the self-referential global table.
+    fn lazyRefProp(c: *Checker, ref: TypeId, name: Atom, depth: u32) Error!?types.Prop {
+        if (depth >= lazy_base_depth) return null;
+        const sym = c.ts.refSymbol(ref);
+        // Interfaces are not on this path: `interfaceGeneric` folds heritage
+        // and reopened declaration blocks, and a single-member shortcut past
+        // that fold would answer differently from the table it stands in for.
+        if (!c.symFlags(sym).class) return null;
+        const saved_ctx = c.enterSymFile(sym);
+        defer c.restoreCtx(saved_ctx);
+        // Same polymorphic-`this` binding `classInstanceGeneric` installs, so a
+        // member signature mentioning `this` resolves identically on both paths.
+        const saved_this = c.this_type;
+        defer c.this_type = saved_this;
+        var tps: std.ArrayList(TypeParamInfo) = .empty;
+        defer tps.deinit(c.scratch());
+        try c.typeParamsOf(sym, &tps);
+        {
+            const targs = try c.scratch().alloc(TypeId, tps.items.len);
+            for (tps.items, 0..) |tp, i| targs[i] = try c.ts.makeTypeParam(tp.sym);
+            c.this_type = try c.ts.makeRef(sym, targs);
+        }
+        var found: ?types.Prop = null;
+        if (c.bind.membersScopeOf(c.localOf(sym))) |ms| {
+            const kscope = c.symScope(sym);
+            const lo = c.bind.scope_members_start[ms];
+            const hi = c.bind.scope_members_start[ms + 1];
+            for (lo..hi) |i| {
+                const nm = try c.nominalizeComputedKey(c.bind.member_atoms[i], kscope);
+                if (nm != name) continue;
+                if (isCtorName(c, nm)) continue;
+                const msym = c.toGlobal(c.bind.member_syms[i]);
+                // `class C { a: C["a"] }` — the member's own type asks for
+                // itself. Genuinely circular; leave it to the caller's
+                // not-found path rather than recursing.
+                if (c.lazy_member_active.contains(msym)) return null;
+                try c.lazy_member_active.put(c.cm(), msym, {});
+                defer _ = c.lazy_member_active.remove(msym);
+                const mf = c.symFlags(msym);
+                var flags: u32 = 0;
+                if (mf.optional_member) flags |= types.prop_flag_optional;
+                if (mf.readonly_member) flags |= types.prop_flag_readonly;
+                if (mf.getter and !mf.setter) flags |= types.prop_flag_readonly;
+                found = .{ .name = nm, .ty = try c.memberTypeOf(msym), .flags = flags };
+                break;
+            }
+        }
+        if (found == null) {
+            // Inherited member: walk `extends`. A base whose own expansion is
+            // also on the stack stays on the lazy path.
+            if (try c.baseClassRef(sym)) |base_ref| {
+                if (c.refExpansionActive(base_ref)) {
+                    found = try c.lazyRefProp(base_ref, name, depth + 1);
+                } else {
+                    const b = try c.resolveStructural(base_ref);
+                    found = try c.propOfTypeEx(b, name, false);
+                }
+            }
+        }
+        var p = found orelse return null;
+        if (tps.items.len > 0) {
+            var map_list: std.ArrayList(TpMap) = .empty;
+            defer map_list.deinit(c.scratch());
+            const args = try c.scratch().dupe(TypeId, c.ts.refArgs(ref));
+            try c.buildInstMap(sym, args, &map_list);
+            p.ty = try c.instantiate(p.ty, map_list.items);
+        }
+        return p;
     }
 
     /// Is `name` an OWN instance member (field, param-property, accessor,
