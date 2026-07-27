@@ -3794,6 +3794,13 @@ const Checker = struct {
                 }
                 return types.any_type;
             },
+            // `T[never]` is `never` (tsc's getIndexedAccessType short-circuits an
+            // empty index set). Reaching the `any` fallback below instead poisons
+            // any union that contains such an access — `keyof {}` is `never`, and
+            // @types/react builds `ReactNode` as `… | Empty[keyof Empty]`, so the
+            // whole union collapsed to `any` and every ReactNode-contextual
+            // callback parameter became an implicit any.
+            .never => return types.never_type,
             else => return types.any_type,
         }
     }
