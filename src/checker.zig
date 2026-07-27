@@ -11010,10 +11010,33 @@ const Checker = struct {
         return c.signatureAssignable(inst, t);
     }
 
+    /// tsc's `SignatureCheckMode` (the subset ztsc models). A signature-valued
+    /// PARAMETER is related as a *callback*: because a callback parameter is an
+    /// output position, its own parameters relate in the same direction as the
+    /// outer relation (covariantly, not bivariantly), and — when the outer
+    /// relation was bivariant to begin with (a method) — its RETURN relates
+    /// bivariantly. Inside a callback comparison no further callback is
+    /// recognized, exactly as tsc suppresses `getSingleCallSignature` there.
+    const SigMode = enum {
+        /// Top-level signature relation.
+        none,
+        /// tsc `SignatureCheckMode.BivariantCallback` — the outer relation was
+        /// a method (bivariant), so the callback's return relates either way.
+        bivariant_callback,
+        /// tsc `SignatureCheckMode.StrictCallback` — the outer relation was a
+        /// plain function type under strictFunctionTypes; the callback's return
+        /// stays covariant.
+        strict_callback,
+    };
+
     /// strictFunctionTypes: contravariant params for function types,
     /// bivariant for methods; covariant returns; `void` target returns
     /// accept anything.
     fn signatureAssignable(c: *Checker, s: TypeId, t: TypeId) Error!bool {
+        return c.signatureAssignableMode(s, t, .none);
+    }
+
+    fn signatureAssignableMode(c: *Checker, s: TypeId, t: TypeId, mode: SigMode) Error!bool {
         // tsc's canonical type-IDENTITY probe `(<G>() => G extends X ? A : B)`
         // (react-hook-form's `IsEqual`, and other libraries) compares two types
         // for identity: `IsEqual<X,Y>` reduces to `(<G>()=>G extends X?1:2)
@@ -11070,13 +11093,53 @@ const Checker = struct {
             // param `b?: boolean` (`boolean | undefined`), a phantom TS2322 tsc
             // does not report. A *required* source param is untouched, so it
             // still (correctly) fails that target.
+            // Both parameters are themselves single-call-signature function
+            // types: they are CALLBACKS, and tsc relates them as one signature
+            // pair in the *contravariant* direction rather than relating the
+            // two parameter types independently (`compareSignaturesRelated`,
+            // `SignatureCheckMode.Callback`). Because a callback parameter is
+            // an output position, that makes the callback's own parameters
+            // relate covariantly with the outer relation — which is what keeps
+            // `Map<K, Big>` assignable to `Map<K, Small>` through `forEach`,
+            // where whole-signature bivariance is not enough (the callback's
+            // return would have to relate the wrong way). Detected on the RAW
+            // parameter types, before the optional widening below, and only at
+            // the top level: inside a callback comparison tsc suppresses
+            // `getSingleCallSignature`, so a callback nested one level deeper
+            // relates strictly.
+            //
+            // ADDITIVE: where tsc makes the callback relation the *only* test
+            // for such a pair, ztsc falls through to the pre-existing
+            // contravariant/bivariant check when it fails. tsc's exclusivity
+            // would also start REJECTING pairs whole-signature bivariance used
+            // to accept, and every such case measured in the corpus turned out
+            // to be an unrelated inference gap surfacing (`Observable<unknown>`
+            // where tsc infers `Observable<number>`) rather than a real error —
+            // so the strict form would trade this fix for a batch of new false
+            // positives. The consequence is a documented under-report: a
+            // callback-parameter mismatch in the *contravariant* direction, and
+            // one nested a level deeper, are accepted (conformance
+            // assignability/065 + DEFERRED).
+            if (mode == .none) {
+                if (try c.callbackSigOf(sp)) |s_cb| {
+                    if (try c.callbackSigOf(tp)) |t_cb| {
+                        // tsc also requires matching undefined/null facts.
+                        if ((try c.includesNullish(sp)) == (try c.includesNullish(tp))) {
+                            const inner: SigMode = if (bivariant) .bivariant_callback else .strict_callback;
+                            if (try c.signatureAssignableMode(t_cb, s_cb, inner)) continue;
+                        }
+                    }
+                }
+            }
             if (i < c.ts.fnParamCount(se)) {
                 const spar = c.ts.fnParam(se, i);
                 if (spar.optional() and !spar.rest()) sp = try c.makeUnion2(sp, types.undefined_type);
             }
             const contra = try c.isAssignable(tp, sp);
             if (!contra) {
-                if (!bivariant) return false;
+                // A callback comparison never falls back to bivariance — its
+                // own parameters are already related in the outer direction.
+                if (mode != .none or !bivariant) return false;
                 if (!try c.isAssignable(sp, tp)) return false;
             }
         }
@@ -11123,7 +11186,71 @@ const Checker = struct {
         // every case right (`void <: void|undefined` true, `void <: undefined`
         // false, `void <: number` false, `void <: any/unknown` trivially
         // true), so defer to it unconditionally.
-        return c.isAssignable(s_ret, t_ret);
+        if (try c.isAssignable(s_ret, t_ret)) return true;
+        // A BivariantCallback comparison relates the RETURN bivariantly too
+        // (tsc: `checkMode & BivariantCallback && compareTypes(targetReturn,
+        // sourceReturn) || compareTypes(sourceReturn, targetReturn)`). This is
+        // the half that whole-signature bivariance could not express, and it is
+        // what makes `L1<{a,b}>` — `interface L1<X> { r(cb: (v: X) => X): void }`
+        // — assignable to `L1<{a}>`.
+        if (mode == .bivariant_callback) return c.isAssignable(t_ret, s_ret);
+        return false;
+    }
+
+    /// tsc `getSingleCallSignature(getNonNullableType(t))`: the lone call
+    /// signature of a type that is nothing BUT that signature — no properties,
+    /// no index signatures, no construct signatures, no overloads. A type
+    /// predicate disqualifies it (tsc excludes predicate signatures from the
+    /// callback relation).
+    fn callbackSigOf(c: *Checker, t: TypeId) Error!?TypeId {
+        const r = try c.resolveStructural(try c.stripNullish(t));
+        switch (c.ts.kind(r)) {
+            .function => return if (c.ts.fnHasPredicate(r)) null else r,
+            .object => {
+                if (c.ts.objectPropCount(r) != 0) return null;
+                if (c.ts.objectStringIndex(r) != 0 or c.ts.objectNumberIndex(r) != 0) return null;
+                if (c.ts.objectConstructSigCount(r) != 0) return null;
+                if (c.ts.objectCallSigCount(r) != 1) return null;
+                const sig = c.ts.objectCallSig(r, 0);
+                return if (c.ts.fnHasPredicate(sig)) null else sig;
+            },
+            else => return null,
+        }
+    }
+
+    /// tsc `getNonNullableType`: drop `null`/`undefined` union constituents.
+    fn stripNullish(c: *Checker, t: TypeId) Error!TypeId {
+        if (c.ts.kind(t) != .union_type) return t;
+        var parts: std.ArrayList(TypeId) = .empty;
+        defer parts.deinit(c.scratch());
+        for (try c.memberList(t)) |m| {
+            switch (c.ts.kind(m)) {
+                .null, .undefined => {},
+                else => try parts.append(c.scratch(), m),
+            }
+        }
+        if (parts.items.len == 0) return t;
+        return c.ts.makeUnion(c.scratch(), parts.items);
+    }
+
+    /// Does `t` admit `null`/`undefined`? tsc gates the callback relation on
+    /// the two parameter types agreeing here (`getTypeFacts(…,
+    /// IsUndefinedOrNull)`), so an optional callback parameter is only related
+    /// as a callback against another optional one.
+    fn includesNullish(c: *Checker, t: TypeId) Error!bool {
+        switch (c.ts.kind(t)) {
+            .null, .undefined, .any, .unknown => return true,
+            .union_type => {
+                for (try c.memberList(t)) |m| {
+                    switch (c.ts.kind(m)) {
+                        .null, .undefined => return true,
+                        else => {},
+                    }
+                }
+                return false;
+            },
+            else => return false,
+        }
     }
 
     /// If `sig` is the type-identity probe `<G>() => (G extends X ? A : B)` — a

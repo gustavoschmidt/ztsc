@@ -63,3 +63,19 @@ directives/012_ts_expect_error_unused.ts  -TS2578 7
 # assignments on lines 11-12 of the same case prove `number` is still not
 # assignable to the brand. Deterministic under-report of a whole check.
 operators/004_branded_intersection_not_numeric.ts  -TS2322 31
+
+# The callback-parameter relation is ADDITIVE in ztsc, where tsc makes it the
+# only test for a pair of single-call-signature parameters. When the callback
+# comparison fails, ztsc falls back to the pre-existing
+# contravariant/bivariant parameter check instead of rejecting, so the two
+# directions tsc rejects *because* the callback relation is exclusive are
+# under-reported: a method callback related in the contravariant direction
+# (line 25), and a callback nested one level deeper, which tsc relates
+# strictly (line 74). Made exclusive, the rule also rejects pairs
+# whole-signature bivariance accepted, and every such case measured across the
+# 16-package corpus was an unrelated inference gap surfacing
+# (`Observable<unknown>` where tsc infers `Observable<number>`) — i.e. it would
+# trade this fix for a batch of false positives, which policy forbids. The 7
+# positives in the same case prove the relation itself is in place.
+assignability/065_callback_parameter_variance.ts  -TS2322 25
+assignability/065_callback_parameter_variance.ts  -TS2322 74
