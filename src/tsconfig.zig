@@ -791,11 +791,14 @@ fn collectAutoTypes(
                 if (!gop.found_existing) try out.append(arena, f);
             }
         }
-        std.mem.sort([]const u8, out.items, {}, struct {
-            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
-                return std.mem.order(u8, a, b) == .lt;
-            }
-        }.lessThan);
+        // NOT sorted: the enumeration branch sorts because directory iteration
+        // order is not stable, but an explicit `types` list is already a
+        // deterministic order — the one the user wrote — and it is the order
+        // tsc loads the directives in. That order is observable when two
+        // entries declare the same global (a project pulling in both
+        // `vitest/globals` and, transitively, `@types/jest`, each declaring
+        // `expect`): sorting would silently reshuffle which declaration the
+        // merge sees last.
         return out.toOwnedSlice(arena);
     }
 
@@ -1552,9 +1555,12 @@ test "auto @types: a 'types' entry that is not an @types package resolves as a p
     });
     const cfg = try loadInDir(io, alloc, d, "proj/tsconfig.json");
     try testing.expectEqual(@as(usize, 3), cfg.auto_type_files.len);
-    try testing.expectEqualStrings("proj/node_modules/@testing-library/jest-dom/types/index.d.ts", cfg.auto_type_files[0]);
-    try testing.expectEqualStrings("proj/node_modules/@types/node/index.d.ts", cfg.auto_type_files[1]);
-    try testing.expectEqualStrings("proj/node_modules/vitest/globals.d.ts", cfg.auto_type_files[2]);
+    // In `types` order (not sorted): that is the order tsc loads the
+    // directives in, and it decides which of two same-named globals is merged
+    // last.
+    try testing.expectEqualStrings("proj/node_modules/vitest/globals.d.ts", cfg.auto_type_files[0]);
+    try testing.expectEqualStrings("proj/node_modules/@testing-library/jest-dom/types/index.d.ts", cfg.auto_type_files[1]);
+    try testing.expectEqualStrings("proj/node_modules/@types/node/index.d.ts", cfg.auto_type_files[2]);
 }
 
 test "auto @types: 'typeRoots' overrides the default @types directories" {
