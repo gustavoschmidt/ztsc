@@ -151,6 +151,12 @@ pub fn tokenEnd(src: []const u8, tag: Tag, start: u32) u32 {
             const s = Scanner{ .src = src, .index = start };
             return s.scanJsxName(start);
         },
+        .jsx_string => {
+            const s = Scanner{ .src = src, .index = start };
+            // Only ever produced for a terminated string (see the parser's
+            // `rescanJsxAttributeString`); the fallback keeps this total.
+            return s.scanJsxString(start) orelse @as(u32, @intCast(src.len));
+        },
         else => {
             var s = Scanner{ .src = src, .index = start };
             return s.next().end;
@@ -236,6 +242,11 @@ pub const Tag = enum(u8) {
     /// identifier run spanning `-`. Produced only by the parser's
     /// `rescanJsxName` entry point in `.tsx` files, never by `next`.
     jsx_name,
+    /// A JSX attribute's quoted value (`title="a\nb"`). Unlike an ordinary
+    /// string it may contain raw line breaks and treats `\` as a literal
+    /// byte. Produced only by the parser's `rescanJsxAttributeString` entry
+    /// point in `.tsx` files, never by `next`.
+    jsx_string,
 
     // --- punctuation -------------------------------------------------------
     l_brace,
@@ -579,6 +590,24 @@ pub const Scanner = struct {
         var i = at_index;
         while (i < s.src.len and (isIdentCont(s.src[i]) or s.src[i] == '-')) : (i += 1) {}
         return i;
+    }
+
+    /// Scan a JSX attribute's quoted value starting at the quote at `at`,
+    /// returning the offset just past the closing quote (or end of file if
+    /// there is none). A JSX attribute string runs to the matching quote and
+    /// nothing else: raw line breaks are content, and `\` is a literal byte,
+    /// not an escape (tsc: `scanString(/*jsxAttributeString*/ true)`).
+    /// Null when there is no closing quote before end of file — the caller
+    /// leaves the token alone so the ordinary unterminated-string diagnostic
+    /// still fires. Used only by the parser's `rescanJsxAttributeString`.
+    pub fn scanJsxString(s: *const Scanner, at_index: u32) ?u32 {
+        if (at_index >= s.src.len) return null;
+        const quote = s.src[at_index];
+        var i = at_index + 1;
+        while (i < s.src.len) : (i += 1) {
+            if (s.src[i] == quote) return i + 1;
+        }
+        return null;
     }
 
     inline fn punctEnd(s: *Scanner, len: u32) u32 {

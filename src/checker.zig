@@ -1210,8 +1210,11 @@ const Checker = struct {
     /// Property-name atom: string keys lose quotes.
     fn memberAtom(c: *Checker, tok: TokenIndex) Error!Atom {
         const text = c.tokenText(tok);
-        if (c.tree.tokens.tag(tok) == .string_literal) return c.atom(stripQuotes(text));
-        return c.atom(text);
+        switch (c.tree.tokens.tag(tok)) {
+            // `.jsx_string` is a JSX attribute's quoted value.
+            .string_literal, .jsx_string => return c.atom(stripQuotes(text)),
+            else => return c.atom(text),
+        }
     }
 
     /// Member-name atom honoring a `[Symbol.iterator]` computed key (mirrors the

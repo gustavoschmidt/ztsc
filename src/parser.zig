@@ -340,6 +340,25 @@ const Parser = struct {
         p.la_len = 1;
     }
 
+    /// In JSX attribute-value position, re-lex a leading quote as a JSX
+    /// attribute string: it runs to the matching quote, so a raw line break
+    /// is content (`defaults="line one\nline two"`) and `\` is a literal
+    /// byte, not an escape. Normal scanning stops such a string at the
+    /// newline and reports it unterminated. Drops stale lookahead scanned
+    /// past the (now longer) string.
+    fn rescanJsxAttributeString(p: *Parser) void {
+        p.fill(0);
+        const t = p.la[0];
+        switch (t.tag) {
+            .string_literal, .unterminated_string_literal => {},
+            else => return,
+        }
+        const end = p.scn.scanJsxString(t.start) orelse return;
+        p.la[0] = .{ .tag = .jsx_string, .start = t.start, .end = end, .newline_before = t.newline_before };
+        p.scn.index = end;
+        p.la_len = 1;
+    }
+
     /// Consume a `>` out of a maximal-munched `>`-family token; the
     /// remainder becomes the current token.
     fn splitGt(p: *Parser) Error!u32 {
@@ -2894,8 +2913,9 @@ const Parser = struct {
     }
 
     fn parseJsxAttributeValue(p: *Parser) PE!Node {
+        p.rescanJsxAttributeString();
         switch (p.curTag()) {
-            .string_literal => return p.leaf(.string_literal),
+            .string_literal, .jsx_string => return p.leaf(.string_literal),
             .l_brace => {
                 const lb = try p.bump();
                 const expr = try p.parseAssignExpr(.{});
@@ -4907,6 +4927,11 @@ test "jsx parses cleanly in tsx mode" {
         // A tag name rooted at `this`, self-closing and with children.
         "const j = <this.Component {...props} />;",
         "const k = <this.a.B x={1}>child</this.a.B>;",
+        // An attribute string runs to the matching quote: raw line breaks
+        // are content, `\` is literal, and `<`/`>`/`/`/`{` are content too.
+        "const l = <div title=\"line one\nline two\" id=\"x\" />;",
+        "const m = <div title='one\ntwo' />;",
+        "const n = <div title=\"a\\b > c / d { e\" />;",
     };
     for (cases) |src| {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);

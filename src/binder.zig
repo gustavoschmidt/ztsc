@@ -910,8 +910,11 @@ const Binder = struct {
     /// the binder — the corpus subset does not rely on escaped member names.)
     fn memberAtom(b: *Binder, tok: TokenIndex) Error!Atom {
         const text = b.tokenText(tok);
-        if (b.tree.tokens.tag(tok) == .string_literal) return b.atomOf(stripQuotes(text));
-        return b.atomOf(text);
+        switch (b.tree.tokens.tag(tok)) {
+            // `.jsx_string` is a JSX attribute's quoted value.
+            .string_literal, .jsx_string => return b.atomOf(stripQuotes(text)),
+            else => return b.atomOf(text),
+        }
     }
 
     /// Member-name atom honoring a `[Symbol.iterator]` computed key: when the
