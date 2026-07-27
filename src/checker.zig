@@ -11604,6 +11604,23 @@ const Checker = struct {
                 }
             }
         }
+        // A lazy alias `.ref` and the materialization tagged with that very ref
+        // denote one type (see `origin`), so the relation between them is
+        // reflexive in both directions.
+        if (sk == .ref and originTaggable(tk)) {
+            if (c.origin.get(t)) |ot| {
+                if (ot == s) return true;
+                if (c.ts.kind(ot) == .ref and c.ts.refSymbol(ot) == c.ts.refSymbol(s) and
+                    try c.originArgEquiv(ot, s, 0)) return true;
+            }
+        }
+        if (tk == .ref and originTaggable(sk)) {
+            if (c.origin.get(s)) |os| {
+                if (os == t) return true;
+                if (c.ts.kind(os) == .ref and c.ts.refSymbol(os) == c.ts.refSymbol(t) and
+                    try c.originArgEquiv(os, t, 0)) return true;
+            }
+        }
         // Trivial targets/sources.
         switch (tk) {
             .any, .err, .unknown, .none => return true,
