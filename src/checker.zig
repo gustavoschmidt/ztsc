@@ -8767,6 +8767,21 @@ const Checker = struct {
                         for (0..s.tupleLen(src)) |i|
                             try c.inferFromExtends(s.tupleElem(src, @intCast(i)).ty, s.arrayElem(pattern), ids, vals, contra, depth + 1);
                     },
+                    // A *branded* array — `[Point, Point] & { _brand: "seg" }`,
+                    // the standard nominal-tuple idiom — is still an array, and
+                    // its element type lives in the array constituent. Without
+                    // this the pattern matched nothing and the infer var fell
+                    // back to `unknown`, so `segs.flat()` came back
+                    // `unknown[]`. Non-arrayish constituents (the brand object)
+                    // contribute nothing, exactly as they do here at top level.
+                    .intersection => {
+                        for (try c.memberList(src)) |m| {
+                            switch (s.kind(try c.resolveStructural(m))) {
+                                .array, .tuple => try c.inferFromExtends(m, pattern, ids, vals, contra, depth + 1),
+                                else => {},
+                            }
+                        }
+                    },
                     else => {},
                 }
             },
