@@ -47,6 +47,15 @@ instantiation/018_growing_template_hole_no_loop.ts  -TS2589 16
 # comment in the case entry.ts.
 modules/39_exports_subpath_block  -TS2307 entry.ts 12
 
+# TS2578 ("Unused '@ts-expect-error' directive") is not implemented. The
+# suppression half of `@ts-expect-error` is; the unused report is not, because
+# it is only sound on a checker that reports everything the oracle does. ztsc
+# deliberately under-reports in places, so a directive the oracle considers used
+# can look unused here, and TS2578 on that basis would be a false positive on
+# correct code — the one thing project policy forbids. Deterministic
+# under-report of a whole check.
+directives/012_ts_expect_error_unused.ts  -TS2578 7
+
 # A compound assignment (`x += 1`, `x -= 1`, ...) does not check that its
 # result is assignable back to the target, so the oracle's TS2322 on
 # `mv += 1` where `mv: number & { _brand }` is missed. Pre-existing and
