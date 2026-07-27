@@ -1015,6 +1015,71 @@ fn resolvePackage(io: Io, alloc: Allocator, dir: Io.Dir, importer_dir: []const u
     return null;
 }
 
+/// Resolve a directory that carries its own `package.json` entry map:
+/// `pkg_dir` is the enclosing package's directory (the escape boundary),
+/// `dir_path` the directory named by the subpath. `"types"`/`"typings"` first
+/// (declarations only), then `main` — as a declaration through the usual
+/// extension substitution, and only under `allow_js` as the raw JS file.
+///
+/// Targets are resolved relative to `dir_path` and may climb out of it
+/// (`"../lib/Either.d.ts"`), which is the whole point of the idiom; they may
+/// not climb out of `pkg_dir`.
+fn resolveDirPackageJson(
+    io: Io,
+    alloc: Allocator,
+    dir: Io.Dir,
+    pkg_dir: []const u8,
+    dir_path: []const u8,
+    allow_js: bool,
+    fs: ?*FsCache,
+) Error!?[]u8 {
+    const pj = try std.fmt.allocPrint(alloc, "{s}/package.json", .{dir_path});
+    defer alloc.free(pj);
+    var owned: ?[]u8 = null;
+    defer if (owned) |t| alloc.free(t);
+    var text: ?[]const u8 = null;
+    if (fs) |fc| {
+        text = try fc.packageJson(io, dir, pj);
+    } else {
+        bumpProbe();
+        if (dir.readFileAlloc(io, pj, alloc, .limited(1 << 20))) |t| {
+            owned = t;
+            text = t;
+        } else |_| {}
+    }
+    const t = text orelse return null;
+
+    if (packageTypesField(t)) |rel| {
+        if (try dirFieldTarget(io, alloc, dir, pkg_dir, dir_path, rel, false, fs)) |p| return p;
+    }
+    if (packageMainField(t)) |rel| {
+        if (try dirFieldTarget(io, alloc, dir, pkg_dir, dir_path, rel, allow_js, fs)) |p| return p;
+    }
+    return null;
+}
+
+/// One `resolveDirPackageJson` field target: join, keep it inside the package,
+/// then probe declarations (and, under `allow_js`, the raw JS twin).
+fn dirFieldTarget(
+    io: Io,
+    alloc: Allocator,
+    dir: Io.Dir,
+    pkg_dir: []const u8,
+    dir_path: []const u8,
+    rel: []const u8,
+    allow_js: bool,
+    fs: ?*FsCache,
+) Error!?[]u8 {
+    const stem = try joinNormalize(alloc, dir_path, rel);
+    defer alloc.free(stem);
+    // `../` may leave the subdirectory but never the package.
+    if (!std.mem.startsWith(u8, stem, pkg_dir)) return null;
+    if (stem.len <= pkg_dir.len or stem[pkg_dir.len] != '/') return null;
+    if (try resolveStemFs(io, alloc, dir, stem, fs)) |p| return p;
+    if (allow_js) return resolveJsStem(io, alloc, dir, stem, fs);
+    return null;
+}
+
 /// Resolve `<pkg>/<sub>` under one directory level's `node_modules`, honoring
 /// `package.json` `"types"`/`"typings"` (for a bare package) or a relative
 /// stem (for a subpath). Null when nothing resolves at this level.
@@ -1101,7 +1166,20 @@ fn resolvePackageAt(io: Io, alloc: Allocator, dir: Io.Dir, d: []const u8, pkg: [
     if (sub.len > 0) {
         const stem = try joinNormalize(alloc, nm, sub);
         defer alloc.free(stem);
-        return resolveStemOrJs(io, alloc, dir, stem, allow_js, fs);
+        if (try resolveStemOrJs(io, alloc, dir, stem, allow_js, fs)) |p| return p;
+        // The subpath may name a *directory* whose own package.json is the
+        // entry map — the pre-`exports` idiom for publishing deep imports
+        // (`fp-ts/Either/package.json` = `{"typings": "../lib/Either.d.ts"}`;
+        // io-ts and rxjs-compat ship the same shape). Its targets routinely
+        // escape the directory with `../`, which is fine as long as they stay
+        // inside the package.
+        //
+        // Ordering cut: tsc consults the directory package.json before the
+        // directory's `index.*`, this probes it after (`resolveStemOrJs`
+        // covers both the file candidates and `index`). They disagree only for
+        // a directory that has BOTH an `index.d.ts` and a package.json
+        // pointing somewhere else — a shape no real package ships.
+        return resolveDirPackageJson(io, alloc, dir, nm, stem, allow_js, fs);
     }
     // package.json "types"/"typings" (declaration entry — TS only), else the
     // JS "main" entry under allowJs (typed `any`), else index.d.ts/index.ts (or
