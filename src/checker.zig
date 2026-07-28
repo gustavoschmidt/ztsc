@@ -4052,6 +4052,18 @@ const Checker = struct {
     /// never absorbs another member — `T | {}` must not collapse to `{}` —
     /// while `{}` itself is still absorbed by a member it's assignable to
     /// (e.g. `{ [k: string]: any } | {}` -> the indexed type, matching tsc).
+    ///
+    /// A FRESH object literal never ABSORBS a sibling, and is only absorbed
+    /// itself when it survives an excess-property check against the absorber.
+    /// Both fall out of tsc reducing with `strictSubtypeRelation`, which
+    /// excess-checks a fresh source; the asymmetry is real and observable —
+    /// `cond ? declaredWide : { … }` keeps both members, `cond ? declaredWide :
+    /// declaredNarrow` collapses, and a literal that is a plain subtype of its
+    /// sibling (`f() || { width, height }` against `{ width, height, scale?:
+    /// number }`) still disappears into it. The literal has not been widened
+    /// yet, so letting it absorb would throw away a sibling's properties on the
+    /// strength of a shape that is still being formed.
+    ///
     /// Order-invariant: members are already TypeId-sorted by `makeUnion`, and
     /// the kept set is a deterministic function of that order.
     fn reduceSubtypes(c: *Checker, t: TypeId) Error!TypeId {
@@ -4064,12 +4076,19 @@ const Checker = struct {
         defer kept.deinit(c.scratch());
         outer: for (members, 0..) |m, i| {
             const m_empty = c.isEmptyAnonObject(m);
+            const m_fresh = c.ts.objectIsFresh(m);
             for (members, 0..) |o, j| {
                 if (i == j) continue;
+                if (c.ts.objectIsFresh(o)) continue; // a fresh literal never absorbs
                 if (c.isEmptyAnonObject(o)) continue; // `{}` never absorbs
+                if (m_fresh and try c.freshHasExcessProp(m, o)) continue;
                 if (!try c.isAssignable(m, o)) continue; // m not a subtype of o
                 if (!m_empty and try c.isAssignable(o, m)) {
-                    // Mutually assignable: keep m only if its twin isn't kept.
+                    // Mutually assignable: exactly one twin survives. A fresh
+                    // literal always yields — it can never absorb, so keeping
+                    // it here would keep both. Otherwise keep whichever of the
+                    // two was reached first.
+                    if (m_fresh) continue :outer;
                     for (kept.items) |k| if (k == o) continue :outer;
                 } else {
                     // Strict subtype (or the `{}` member itself): m is redundant.
@@ -4080,6 +4099,23 @@ const Checker = struct {
         }
         if (kept.items.len == members.len) return t;
         return c.ts.makeUnion(c.scratch(), kept.items);
+    }
+
+    /// tsc's `hasExcessProperties`, asked of two *types* rather than of a
+    /// literal's syntax: does the fresh object literal `m` declare a property
+    /// `o` does not know? A target with an index signature, or the empty object
+    /// type, knows every property and never reports one.
+    fn freshHasExcessProp(c: *Checker, m: TypeId, o0: TypeId) Error!bool {
+        const s = &c.ts;
+        if (s.kind(m) != .object) return false;
+        const o = try c.resolveStructural(o0);
+        if (s.kind(o) != .object) return false;
+        if (s.objectStringIndex(o) != 0 or s.objectNumberIndex(o) != 0) return false;
+        if (c.isEmptyObjectType(o)) return false;
+        for (0..s.objectPropCount(m)) |i| {
+            if (s.objectPropByName(o, s.objectProp(m, @intCast(i)).name) == null) return true;
+        }
+        return false;
     }
 
     /// tsc's `isEmptyAnonymousObjectType`: a structural object type with no
@@ -13399,7 +13435,9 @@ const Checker = struct {
                 _ = try c.checkExprCached(d.lhs, types.no_type);
                 const then_t = try c.checkExprCached(e.then_expr, ctx);
                 const else_t = try c.checkExprCached(e.else_expr, ctx);
-                return c.makeUnion2(then_t, else_t);
+                // The arms are subtype-reduced, exactly as `||`/`??` are
+                // (tsc: `getUnionType([type1, type2], UnionReduction.Subtype)`).
+                return c.logicalUnion(then_t, else_t);
             },
             .prefix_unary => return c.checkPrefixUnary(node),
             .postfix_unary => {
