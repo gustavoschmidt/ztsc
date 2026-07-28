@@ -11043,9 +11043,6 @@ const Checker = struct {
                 if (allow_index and s.objectFlags(t) & types.obj_flag_global_this != 0) {
                     return c.globalThisProp(name);
                 }
-                if (allow_index and s.objectStringIndex(t) != 0) {
-                    return .{ .name = name, .ty = s.objectStringIndex(t), .flags = 0 };
-                }
                 // A callable object/interface (one carrying call/construct
                 // signatures, e.g. react-i18next `TFunction`) inherits the
                 // apparent members of the global `Function` interface
@@ -11054,6 +11051,7 @@ const Checker = struct {
                 if (s.objectCallSigCount(t) > 0 or s.objectConstructSigCount(t) > 0) {
                     if (try c.functionInterfaceProp(name)) |p| return p;
                 }
+                if (!allow_index) return null;
                 // Every object type also has the apparent members of the global
                 // `Object` interface — `hasOwnProperty`, `toString`,
                 // `valueOf`, … — the tail of tsc's `getPropertyOfType`
@@ -11062,7 +11060,19 @@ const Checker = struct {
                 // *target*'s own property list, and `isKnownProperty` (the
                 // excess-property check) deliberately does not consult the
                 // global object type.
-                if (allow_index) return c.objectInterfaceProp(name);
+                if (try c.objectInterfaceProp(name)) |p| return p;
+                // The string index signature is the LAST resort, after the
+                // apparent members — tsc's `getPropertyOfType` never consults
+                // an index signature at all, and
+                // `checkPropertyAccessExpression` only falls back to
+                // `getApplicableIndexInfoForName` once the property lookup has
+                // come back empty. Consulting it first made
+                // `props.hasOwnProperty(k)` on a `{ [k: string]: ReactNode |
+                // ((el) => ReactNode) }` type as the index VALUE rather than
+                // as `Object.hasOwnProperty`, so calling it was TS2349.
+                if (s.objectStringIndex(t) != 0) {
+                    return .{ .name = name, .ty = s.objectStringIndex(t), .flags = 0 };
+                }
                 return null;
             },
             .union_type => {
