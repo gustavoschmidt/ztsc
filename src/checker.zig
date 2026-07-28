@@ -13377,17 +13377,21 @@ const Checker = struct {
         return n;
     }
 
-    /// A parameter type "accepts void" (tsc's `acceptsVoid` via `everyType`)
-    /// when it is `void`, or a union whose every member accepts void.
+    /// A parameter type "accepts void" when it is `void`, or a union with a
+    /// `void` member — tsc writes this as `filterType(type, acceptsVoid)` and
+    /// tests whether the *result* is `never`, so ANY void member is enough, not
+    /// every one. `Promise`'s executor takes
+    /// `(value: T | PromiseLike<T>) => void`, which at `T = void` is
+    /// `void | PromiseLike<void>`: requiring every member to be void made
+    /// `new Promise<void>((resolve) => … resolve())` report TS2554.
     fn paramAcceptsVoid(c: *Checker, ty: TypeId) Error!bool {
         if (ty == types.void_type) return true;
         const r = try c.resolveStructural(ty);
         if (r == types.void_type) return true;
         if (c.ts.kind(r) == .union_type) {
-            const ms = try c.memberList(r);
-            if (ms.len == 0) return false;
-            for (ms) |m| if (!try c.paramAcceptsVoid(m)) return false;
-            return true;
+            for (try c.memberList(r)) |m| {
+                if (try c.paramAcceptsVoid(m)) return true;
+            }
         }
         return false;
     }
