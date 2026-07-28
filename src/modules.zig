@@ -547,10 +547,21 @@ pub const Target = struct {
         /// The namespace object of an ambient module (`import * as ns from
         /// "fs"`): `payload` indexes `Program.ambient_exports`.
         ambient_ns,
+        /// A PROPERTY of the value a module exports with `export = <value>`:
+        /// `payload` is that value's local SymbolId in `file`, `name` the
+        /// property. tsc resolves `import { X } from "m"` against the type of
+        /// the export-assigned value when `X` is not an export of the entity
+        /// itself — the shape `@types/lodash.debounce` is built on (`import {
+        /// debounce } from "lodash"`, where lodash is `export = _` and
+        /// `debounce` is a member of `_`'s interface). Only the checker can
+        /// answer it: the link phase compares no types.
+        export_equals_prop,
     };
     kind: Kind = .any,
     file: FileId = 0,
     payload: u32 = 0,
+    /// Property name for `.export_equals_prop`; 0 otherwise.
+    name: Atom = 0,
     /// The chain passed through `export type` / `import type` somewhere:
     /// value use of the binding is an error (TS1362-adjacent).
     type_only: bool = false,
@@ -1186,7 +1197,9 @@ const Linker = struct {
                     // rather than accusing it of a missing member.
                     if (found == null) {
                         if (try l.lookupExport(mfile, l.atom_export_equals, 0)) |exeq| {
-                            found = (try l.exportEqualsMember(exeq, rec.local)) orelse .{ .kind = .any };
+                            found = (try l.exportEqualsMember(exeq, rec.local)) orelse
+                                exportEqualsProp(exeq, rec.local) orelse
+                                .{ .kind = .any };
                         }
                     }
                     if (found) |tgt| {
@@ -1345,6 +1358,19 @@ const Linker = struct {
         return (try l.exportEqualsMember(exeq, name)) != null;
     }
 
+    /// `import { X } from "m"` / `export { X } from "m"` where `m` is `export =
+    /// <value>` and `X` is not a member of the entity itself: tsc falls back to
+    /// the *type* of the export-assigned value and takes property `X` off it.
+    /// The link phase cannot evaluate a type, so it records the question —
+    /// `.export_equals_prop` — and the checker answers it. Null when the export
+    /// assignment is not a plain declaration binding (a whole namespace object,
+    /// an unresolved entity), where there is no value symbol to ask about.
+    fn exportEqualsProp(exeq: ?Target, name: Atom) ?Target {
+        const e = exeq orelse return null;
+        if (e.kind != .binding) return null;
+        return .{ .kind = .export_equals_prop, .file = e.file, .payload = e.payload, .name = name, .type_only = e.type_only };
+    }
+
     fn put(l: *Linker, t: *std.AutoArrayHashMapUnmanaged(Atom, Target), name: Atom, tgt: Target) Error!void {
         // Later explicit exports of the same name overwrite (duplicate
         // export names are a bind-phase diagnostic concern, not ours).
@@ -1379,6 +1405,23 @@ const Linker = struct {
                         var final = tgt;
                         final.type_only = final.type_only or t_only;
                         return final;
+                    }
+                    // The same `export = <entity>` fallbacks `linkImports` uses
+                    // for a named import, so a re-export *chain* through such a
+                    // module resolves too: `@types/lodash.debounce` is nothing
+                    // but `import { debounce } from "lodash"; export =
+                    // debounce;`, and without this the whole package was `any`.
+                    if (try l.lookupExport(mfile, l.atom_export_equals, depth + 1)) |exeq| {
+                        if (try l.exportEqualsMember(exeq, rec.imported)) |m| {
+                            var final = m;
+                            final.type_only = final.type_only or t_only;
+                            return final;
+                        }
+                        if (exportEqualsProp(exeq, rec.imported)) |p| {
+                            var final = p;
+                            final.type_only = final.type_only or t_only;
+                            return final;
+                        }
                     }
                     return .{ .kind = .any };
                 },
@@ -1717,6 +1760,9 @@ const Linker = struct {
                             // module — without member resolution the heritage
                             // base degrades to `any` and its matchers vanish.
                             if (exeq) |ee| found = try l.exportEqualsMember(ee, rec.imported);
+                        }
+                        if (found == null) {
+                            if (exportEqualsProp(exeq, rec.imported)) |p| found = p;
                         }
                         if (found) |ff| {
                             tgt = ff;

@@ -2935,8 +2935,9 @@ const Checker = struct {
                                 return types.any_type;
                             }
                         },
-                        // Namespace-as-type / unresolved: any (documented).
-                        .namespace, .default_expr, .ambient_ns, .any => return types.any_type,
+                        // Namespace-as-type / a property of an `export =` value
+                        // (value space only) / unresolved: any (documented).
+                        .namespace, .default_expr, .ambient_ns, .export_equals_prop, .any => return types.any_type,
                     }
                 }
                 return c.materializeTypeRef(sym, args, tok, a);
@@ -5588,6 +5589,15 @@ const Checker = struct {
             .binding => return c.typeOfSymbol(c.toGlobalIn(tgt.file, tgt.payload)),
             .namespace => return c.namespaceObjectType(tgt.file),
             .ambient_ns => return c.ambientNamespaceType(tgt.payload),
+            // `import { X } from "m"` where `m` is `export = <value>` and `X`
+            // is a property of that value's TYPE. A missing property stays
+            // `any` (the link phase could not have known, and the lenient
+            // fallback it replaces was `any` too).
+            .export_equals_prop => {
+                const base = try c.typeOfSymbol(c.toGlobalIn(tgt.file, tgt.payload));
+                const p = (try c.propOfType(base, tgt.name)) orelse return types.any_type;
+                return p.ty;
+            },
             .default_expr => {
                 const saved = c.saveCtx();
                 defer c.restoreCtx(saved);
@@ -5649,7 +5659,7 @@ const Checker = struct {
                     },
                     .namespace => ty = try c.namespaceObjectType(tgt.file),
                     .ambient_ns => ty = try c.ambientNamespaceType(tgt.payload),
-                    .default_expr => ty = try c.targetValueType(tgt),
+                    .default_expr, .export_equals_prop => ty = try c.targetValueType(tgt),
                     .any => {},
                 }
                 try props.append(c.scratch(), .{ .name = name, .ty = ty, .flags = types.prop_flag_readonly });
