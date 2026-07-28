@@ -18811,7 +18811,20 @@ const Checker = struct {
                         if (s.kind(ra) != .function) return;
                     }
                 }
-                const n = @min(s.fnParamCount(param), s.fnParamCount(ra));
+                // A trailing rest param in the *pattern* (`(...args: T)` with
+                // `T extends any[]` — the `debounce`/`withBatchedUpdates`
+                // wrapper shape) must bind `T` to the TUPLE of ALL residual
+                // source params, not 1:1 onto the single source param sitting
+                // in that slot. The positional loop below made `T` a candidate
+                // of the FIRST residual param's type, so every later argument
+                // was then checked against it. Same rule as the conditional
+                // `infer` path (`inferFromExtends`, the `pat_has_rest` block),
+                // mirroring tsc's `inferFromParameters` + `getRestTypeAtPosition`.
+                const pat_count = s.fnParamCount(param);
+                const src_count = s.fnParamCount(ra);
+                const pat_has_rest = pat_count != 0 and s.fnParam(param, pat_count - 1).rest();
+                const pat_fixed = if (pat_has_rest) pat_count - 1 else pat_count;
+                const n = @min(src_count, pat_fixed);
                 {
                     // Parameters are a contravariant position — unless the
                     // signature was written as a METHOD, whose parameters tsc
@@ -18823,6 +18836,28 @@ const Checker = struct {
                     };
                     for (0..n) |i| {
                         try c.unify(s.fnParam(param, @intCast(i)).ty, s.fnParam(ra, @intCast(i)).ty, tp_syms, candidates, depth + 1);
+                    }
+                    if (pat_has_rest and src_count >= pat_fixed) {
+                        const rest_pat = s.fnParam(param, pat_count - 1).ty;
+                        // tsc's `getRestTypeAtPosition` shortcut: when the
+                        // residual is exactly the source's own trailing rest
+                        // param, hand over its array type unchanged rather than
+                        // wrapping it in a one-element tuple.
+                        if (src_count == pat_fixed + 1 and s.fnParam(ra, src_count - 1).rest()) {
+                            try c.unify(rest_pat, s.fnParam(ra, src_count - 1).ty, tp_syms, candidates, depth + 1);
+                        } else {
+                            var elems: std.ArrayList(types.TupleElem) = .empty;
+                            defer elems.deinit(c.scratch());
+                            var i: u32 = pat_fixed;
+                            while (i < src_count) : (i += 1) {
+                                const sp = s.fnParam(ra, i);
+                                var eflags: u32 = 0;
+                                if (sp.rest()) eflags |= types.elem_flag_rest;
+                                if (sp.optional()) eflags |= types.elem_flag_optional;
+                                try elems.append(c.scratch(), .{ .ty = sp.ty, .flags = eflags });
+                            }
+                            try c.unify(rest_pat, try s.makeTuple(elems.items), tp_syms, candidates, depth + 1);
+                        }
                     }
                 }
                 try c.unify(s.fnReturn(param), s.fnReturn(ra), tp_syms, candidates, depth + 1);
