@@ -13519,7 +13519,12 @@ const Checker = struct {
         if (try c.isAssignable(src_t, target)) {
             // Excess property check for fresh object literals.
             if (expr_node != 0) {
+                // tsc's order: the whole-union excess check first (a reported
+                // TS2353 ends the relation), then the per-constituent one.
+                const before = c.diags.items.len;
                 try c.excessPropertyCheck(expr_node, src_t, target);
+                if (c.diags.items.len == before and
+                    try c.freshLiteralUnionMismatch(expr_node, src_t, target, 2322, span)) return false;
             }
             return true;
         }
@@ -13633,6 +13638,77 @@ const Checker = struct {
             },
             else => return false,
         }
+    }
+
+    /// A FRESH object literal against a UNION target that `isAssignable`
+    /// accepted, but tsc does not.
+    ///
+    /// tsc's excess-property check is not a separate pass: `hasExcessProperties`
+    /// runs at the top of every `isRelatedTo`, so when `typeRelatedToSomeType`
+    /// walks a union constituent-by-constituent it re-runs the check against
+    /// EACH constituent. A constituent that does not know one of the literal's
+    /// own properties therefore cannot satisfy the relation even though the
+    /// whole-union check (`excessPropertyCheck` here, which asks whether ANY
+    /// constituent knows the property) is happy. `crypto.subtle.decrypt`'s
+    /// `AlgorithmIdentifier | … | AesGcmParams` is the shape: `{ name, iv }`
+    /// relates structurally to the bare `Algorithm` arm, but `iv` is unknown
+    /// there, and the only arm that knows `iv` rejects its type — so tsc
+    /// reports and ztsc was silent.
+    ///
+    /// Reports (elaborated when possible) and returns true in exactly that
+    /// case. Purely additive: it never suppresses an accepted relation that
+    /// some constituent genuinely satisfies.
+    fn freshLiteralUnionMismatch(c: *Checker, expr_node: Node, src_t: TypeId, target: TypeId, code: u16, span: Span) Error!bool {
+        var node = expr_node;
+        while (true) {
+            switch (c.nodeTag(node)) {
+                .paren_expr, .jsx_expr_container => node = c.tree.nodeData(node).lhs,
+                else => break,
+            }
+            if (node == null_node) return false;
+        }
+        if (c.nodeTag(node) != .object_literal) return false;
+        if (!c.ts.objectIsFresh(src_t)) return false;
+        const rt = try c.resolveStructural(target);
+        if (c.ts.kind(rt) != .union_type) return false;
+        const ms = try c.memberList(rt);
+        for (ms) |m| {
+            const rm = try c.resolveStructural(m);
+            if (!try c.literalPropsKnownIn(node, rm)) continue;
+            if (try c.isAssignable(src_t, m)) return false;
+        }
+        if (try c.elaborateLiteralError(node, src_t, target)) return true;
+        try c.reportNotAssignable(code, src_t, target, span);
+        return true;
+    }
+
+    /// Every property WRITTEN in the object literal `node` is known in `rm`
+    /// (tsc's `isKnownProperty` over one union constituent, with the same
+    /// `isEmptyObjectType` / index-signature escapes `excessPropertyCheck`
+    /// applies to a non-union target).
+    fn literalPropsKnownIn(c: *Checker, node: Node, rm: TypeId) Error!bool {
+        switch (c.ts.kind(rm)) {
+            .object => {
+                if (c.ts.objectStringIndex(rm) != 0 or c.ts.objectNumberIndex(rm) != 0) return true;
+                if (c.isEmptyObjectType(rm)) return true;
+            },
+            .intersection => {},
+            // A non-object constituent is never excess-checked (a fresh object
+            // literal that reaches one is already assignable to it).
+            else => return true,
+        }
+        for (c.tree.nodeRange(node)) |prop| {
+            if (prop == null_node) continue;
+            const tag = c.nodeTag(prop);
+            if (tag != .object_property and tag != .object_shorthand and tag != .object_method) continue;
+            if (tag == .object_property) {
+                const pd = c.tree.nodeData(prop);
+                if (pd.lhs != 0 and c.nodeTag(pd.lhs) == .computed_name) continue;
+            }
+            const key = try c.memberAtom(c.tree.nodeMainToken(prop));
+            if (!try c.targetKnowsProp(rm, key)) return false;
+        }
+        return true;
     }
 
     /// The type an array literal's element `i` is checked against when the
@@ -19304,7 +19380,14 @@ const Checker = struct {
                 }
                 reported_arg = true;
             } else if (report) {
+                const before = c.diags.items.len;
                 try c.excessPropertyCheck(an, at, pt);
+                if (c.diags.items.len == before and
+                    !(first_error_only and reported_arg) and
+                    try c.freshLiteralUnionMismatch(an, at, pt, 2345, c.nodeSpan(an)))
+                {
+                    reported_arg = true;
+                }
             }
         }
     }
