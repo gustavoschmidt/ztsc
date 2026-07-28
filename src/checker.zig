@@ -21539,6 +21539,40 @@ const Checker = struct {
     }
 
     fn narrowByInProp(c: *Checker, t: TypeId, prop: Atom, sense: bool) Error!TypeId {
+        // tsc's `narrowByInKeyword`: the filtering branch only applies when the
+        // name is a *known* property — declared on some constituent, or covered
+        // by one's string index signature. For an unknown name the true branch
+        // is `type & Record<name, unknown>` instead, which is what makes
+        //     if ("pointerType" in e && e.pointerType === "touch")   // e: MouseEvent
+        // legal. The false branch of an unknown name says nothing.
+        {
+            const single = [_]TypeId{t};
+            const members: []const TypeId = if (c.ts.kind(t) == .union_type)
+                try c.memberList(t)
+            else
+                &single;
+            var known = false;
+            for (members) |m| {
+                const rm = try c.resolveStructural(m);
+                if ((try c.propOfType(rm, prop)) != null or
+                    c.ts.kind(rm) == .any or c.ts.kind(rm) == .unknown or
+                    (c.ts.kind(rm) == .object and c.ts.objectStringIndex(rm) != types.no_type))
+                {
+                    known = true;
+                    break;
+                }
+            }
+            if (!known) {
+                if (!sense) return t;
+                const rec = try c.ts.makeObject(
+                    &.{.{ .name = prop, .ty = types.unknown_type }},
+                    types.no_type,
+                    types.no_type,
+                    0,
+                );
+                return c.ts.makeIntersection(c.scratch(), &.{ t, rec });
+            }
+        }
         if (c.ts.kind(t) != .union_type) return t;
         var parts: std.ArrayList(TypeId) = .empty;
         defer parts.deinit(c.scratch());
