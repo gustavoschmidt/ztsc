@@ -11122,7 +11122,11 @@ const Checker = struct {
                 }
                 return found;
             },
-            .array, .tuple, .string, .string_literal => {
+            // A template-literal pattern and a string-transform intrinsic are
+            // subtypes of `string` (`Store.literalBase`), so their apparent
+            // members are `String`'s — `` `${number}`.split `` resolves exactly
+            // like `"1".split`.
+            .array, .tuple, .string, .string_literal, .template_literal_type, .string_mapping => {
                 if (name == c.atom_length) {
                     if (s.kind(t) == .tuple) {
                         var has_var = false;
@@ -11256,7 +11260,7 @@ const Checker = struct {
                 elem = try c.tupleElementUnion(t);
                 has_elem = true;
             },
-            .string, .string_literal => iface_atom = c.atom_String,
+            .string, .string_literal, .template_literal_type, .string_mapping => iface_atom = c.atom_String,
             .number, .number_literal, .number_literal_fresh => iface_atom = c.atom_Number,
             .boolean, .bool_true, .bool_false => iface_atom = c.atom_Boolean,
             else => return null,
