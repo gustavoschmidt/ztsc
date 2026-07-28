@@ -154,6 +154,7 @@ zig build test          # 622 conformance + unit, includes the determinism test
 bench/e2e.sh multi      # wall clock + peak RSS vs tsgo
 bench/crash_sweep.sh    # 8 packages × --checkers=1..16, crash + byte-identity
 bench/repeat_sweep.sh   # 8 packages × one config × N runs, byte-identity
+bench/convergence.sh    # one application × c1..c8, set-equality + tsgo scoreboard
 ```
 
 Plus the byte-identical check on a real project (see `CLAUDE.md`). If a lever
@@ -191,3 +192,25 @@ window it fell on, and `inst_count` moved between repeat runs on drizzle-orm.
 Diagnostics never followed it (the budget is dormant), but it gates TS2589 —
 an order-dependent decision variable is a defect whether or not it has
 surfaced yet.
+
+`bench/convergence.sh` runs both axes again on a whole *application* — an
+excalidraw checkout, passed in with `EXC=` because it is a gigabyte and not
+vendored, so the script SKIPs (exit 0) when it is absent. The two library
+gates above pass today; this one does not, and that is the point. A package
+from `bench/corpus/real` is small enough that the file partition barely
+splits it, and neither gate reproduces what an application does: excalidraw
+at `--checkers=3` deviates about one run in forty, and about 43 of its ~260
+diagnostic keys are reported at some checker counts and not others. The
+second number is a direct violation of the contract stated at the top of
+`checker.zig` — a foreign type is materialized on demand in each checker's
+local store, so a type's *spelling* (a lazy `ref` or a materialized
+structure) depends on what that checker happened to materialize first, and
+relations decided on the two spellings disagree. So the script compares
+`(file, line, column, code)` as a *set* across `c1..c8` rather than byte for
+byte, which lets it name the keys that move, and scores both directions
+against tsgo: a false positive counts if it appears at ANY checker count, an
+under-report only if it is missing at EVERY one. Those two totals are
+ratcheted (`CONVERGE_MAX_EXCESS` / `CONVERGE_MAX_UNDER`) so a change that
+adds a false positive fails while the absolute count is still large.
+`CONVERGE_SOFT=1` reports without the nonzero exit, which is how it runs
+until the fringe is closed.
