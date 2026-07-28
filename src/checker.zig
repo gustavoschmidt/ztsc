@@ -17687,33 +17687,53 @@ const Checker = struct {
                 rk = c.ts.kind(r);
             }
         }
-        // A merged value (e.g. `function F(){}` + `namespace F {}`) types as an
-        // intersection of a callable and the namespace object; pick the
-        // callable (or constructable, for `new`) member to resolve against.
+        // An INTERSECTION callee is one OVERLOAD SET. tsc's
+        // `resolveIntersectionTypeMembers` concatenates every constituent's
+        // call signatures, in member order, into a single list that the call
+        // then resolves against — first match wins. Taking one constituent's
+        // signatures and discarding the rest silently halved the overload set
+        // wherever two constituents are both callable: `window.clearTimeout`
+        // (`Window & typeof globalThis`, where the global half carries
+        // @types/node's `Timeout`-accepting overload and the `Window` half
+        // only lib.dom's `number` one), or a class intersected with an object
+        // literal that re-declares a method with a narrower signature.
+        //
+        // `new` keeps the pick-one rule: a `.class_value` constituent needs
+        // the class-value path below (class type-argument inference and the
+        // `instance_ret` override), which is not a signature list.
+        var isect_sigs: std.ArrayList(TypeId) = .empty;
+        defer isect_sigs.deinit(c.scratch());
+        var isect_any = false;
         if (rk == .intersection) {
             for (try c.memberList(r)) |m| {
                 const rm = try c.resolveStructural(m);
                 const mk = c.ts.kind(rm);
-                // A merged/curried callable can present its call signatures on
-                // an OBJECT member (an interface with call/construct sigs), not
-                // only as a `.function`/`.overloads` — e.g. RTK's
-                // `createAsyncThunk: CreateAsyncThunkFunction<C> & { withTypes }`
-                // whose callable arm is `CreateAsyncThunkFunction` (an object
-                // carrying call signatures). Accept it so the `.object` call/new
-                // arm resolves the signatures instead of falling through to
-                // TS2349/TS2351.
-                const usable = if (is_new)
-                    (mk == .class_value or (mk == .object and c.ts.objectConstructSigCount(rm) > 0))
-                else
-                    (mk == .function or mk == .overloads or (mk == .object and c.ts.objectCallSigCount(rm) > 0));
-                if (usable) {
-                    r = rm;
-                    rk = mk;
-                    break;
+                if (is_new) {
+                    // A merged/curried callable can present its construct
+                    // signatures on an OBJECT member (an interface with
+                    // call/construct sigs), not only as a `.class_value`.
+                    if (mk == .class_value or (mk == .object and c.ts.objectConstructSigCount(rm) > 0)) {
+                        r = rm;
+                        rk = mk;
+                        break;
+                    }
+                    continue;
+                }
+                switch (mk) {
+                    .any, .err => isect_any = true,
+                    .function => try isect_sigs.append(c.scratch(), rm),
+                    .overloads => for (try c.memberList(rm)) |mm| try isect_sigs.append(c.scratch(), mm),
+                    // An object member carrying call signatures — e.g. RTK's
+                    // `createAsyncThunk: CreateAsyncThunkFunction<C> & { withTypes }`,
+                    // whose callable arm is an interface with a call signature.
+                    .object => for (0..c.ts.objectCallSigCount(rm)) |i| {
+                        try isect_sigs.append(c.scratch(), c.ts.objectCallSig(rm, @intCast(i)));
+                    },
+                    else => {},
                 }
             }
         }
-        if (rk == .any or rk == .err) {
+        if (rk == .any or rk == .err or isect_any) {
             for (shape.arg_nodes) |an| {
                 if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
             }
@@ -17807,6 +17827,17 @@ const Checker = struct {
             }
         } else {
             switch (rk) {
+                // The concatenated overload set gathered above.
+                .intersection => {
+                    if (isect_sigs.items.len == 0) {
+                        try c.diagFmt(2349, c.nodeSpan(shape.callee), "This expression is not callable.", .{});
+                        for (shape.arg_nodes) |an| {
+                            if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
+                        }
+                        return types.error_type;
+                    }
+                    try sigs.appendSlice(c.scratch(), isect_sigs.items);
+                },
                 .function => try sigs.append(c.scratch(), r),
                 .overloads => {
                     for (try c.memberList(r)) |m| try sigs.append(c.scratch(), m);
@@ -17867,7 +17898,9 @@ const Checker = struct {
                             // Without this arm `(Document | (Window & typeof
                             // globalThis)).addEventListener` was judged
                             // non-callable and the whole optional call reported
-                            // TS2349.
+                            // TS2349. Its signatures are the CONCATENATION of
+                            // its constituents', same rule as the top-level
+                            // intersection above.
                             .intersection => {
                                 var member_callable = false;
                                 for (try c.memberList(rm)) |im| {
@@ -17890,7 +17923,6 @@ const Checker = struct {
                                         },
                                         else => {},
                                     }
-                                    if (member_callable) break;
                                 }
                                 if (!member_callable) all_callable = false;
                             },
