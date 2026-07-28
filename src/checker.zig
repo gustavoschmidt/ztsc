@@ -847,6 +847,13 @@ const Checker = struct {
     /// authoritative top-down check reports at the narrowed type, and a
     /// narrowing query must never be the thing that files an error.
     side_query_depth: u32 = 0,
+    /// Depth of an in-flight *trial* check: the expression is checked exactly
+    /// as the authoritative pass would — same relations, same inference, same
+    /// diagnostics — but its answer must not be written to the `node_types`
+    /// memo. Overload probing needs this and `side_query_depth` does not fit:
+    /// a side query also turns `any` into an inference wildcard and swallows
+    /// diagnostics, both of which change which overload is picked.
+    no_publish_depth: u32 = 0,
     /// Set while checking the operand of an `expr as const` const
     /// assertion: object/array literals produce readonly, non-widened,
     /// literal-typed members (recursively). Cleared at function bodies.
@@ -13484,7 +13491,7 @@ const Checker = struct {
         // A side query is speculative — it runs out of the checker's top-down
         // order — so it must not publish its answer for the authoritative
         // check to read back.
-        if (c.side_query_depth == 0) try c.node_types.put(c.cm(), key, .{ .ty = t, .ctx = ctx });
+        if (c.side_query_depth == 0 and c.no_publish_depth == 0) try c.node_types.put(c.cm(), key, .{ .ty = t, .ctx = ctx });
         return t;
     }
 
@@ -18331,10 +18338,30 @@ const Checker = struct {
                 .arrow_fn, .function_expr, .array_literal, .object_literal, .template_expr, .call_expr, .call_expr_targs, .optional_call, .new_expr, .new_expr_bare, .new_expr_targs => true,
                 else => false,
             };
-            const at = if (ctx_typed)
-                try c.checkExprCached(an, pt)
-            else
-                try c.checkExprCached(an, types.no_type);
+            // A function argument is probed on TRIAL. Its parameters take their
+            // types from this candidate's contextual signature, but the body's
+            // identifier reads are memoized under the (node, no-context) key —
+            // so publishing them pins every read of a parameter to the type a
+            // possibly-REJECTED candidate gave it, and the next candidate's
+            // re-check silently reads it back. `reduce`'s non-generic overload
+            // types `acc` as the element type; its leftovers turned the generic
+            // overload's `acc.concat(…)` into `String.prototype.concat`'s
+            // `string`, a candidate the argument never carried. The winning
+            // candidate's arguments are checked — published and diagnosed — by
+            // `checkCallArguments` right after this returns true, so the memo
+            // still ends up holding exactly the accepted candidate's answer.
+            const fn_arg = tag == .arrow_fn or tag == .function_expr;
+            if (fn_arg) c.no_publish_depth += 1;
+            const at = blk: {
+                errdefer if (fn_arg) {
+                    c.no_publish_depth -= 1;
+                };
+                break :blk if (ctx_typed)
+                    try c.checkExprCached(an, pt)
+                else
+                    try c.checkExprCached(an, types.no_type);
+            };
+            if (fn_arg) c.no_publish_depth -= 1;
             if (!try c.isAssignable(at, pt)) {
                 c.diags.items.len = saved_diags;
                 return false;
