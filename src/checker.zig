@@ -20679,7 +20679,21 @@ const Checker = struct {
                     if (evolving) return try c.widenLiteral(vt);
                     return try c.assignmentReduced(declared, vt);
                 }
-                if (try c.patternBindsSym(d.lhs, root_sym)) return declared;
+                if (try c.patternBindsSym(d.lhs, root_sym)) {
+                    // `[, width, height] = match` assigns a *position* of the
+                    // right-hand side, and tsc reduces the declared type by that
+                    // element's type just like a plain `width = …` (its
+                    // `getAssignedType` walks the destructuring target). Falling
+                    // back to `declared` here re-widened a `string | null` that
+                    // an earlier `width = width || "50"` had already narrowed.
+                    if (key.len == 0) {
+                        const rt = c.nodeType(d.rhs) orelse try c.checkExprCached(d.rhs, types.no_type);
+                        if (try c.destructuredAssignType(d.lhs, c.symNameAtom(root_sym), rt)) |vt| {
+                            return try c.assignmentReduced(declared, vt);
+                        }
+                    }
+                    return declared;
+                }
                 return null;
             },
             .prefix_unary, .postfix_unary => {
@@ -21256,6 +21270,97 @@ const Checker = struct {
             const p = b.scope_parents[s];
             if (p == s) break;
             s = p;
+        }
+    }
+
+    /// The type a destructuring *assignment* target gives to the element named
+    /// `name` (`[, width] = m`, `({ a: x } = o)`), or null when it cannot be
+    /// pinned down exactly. This is the cover-grammar mirror of
+    /// `findBindingType`, which only walks the declaration forms: an assignment
+    /// target is parsed as an array/object *literal*, with `object_property` /
+    /// `object_shorthand` / `spread_element` in place of the binding nodes.
+    /// Returning null keeps the caller's conservative "reset to declared".
+    fn destructuredAssignType(c: *Checker, pat: Node, name: Atom, whole: TypeId) Error!?TypeId {
+        if (pat == null_node) return null;
+        const d = c.tree.nodeData(pat);
+        switch (c.nodeTag(pat)) {
+            .paren_expr => return c.destructuredAssignType(d.lhs, name, whole),
+            .identifier => {
+                if ((try c.atomOfToken(c.tree.nodeMainToken(pat))) != name) return null;
+                return whole;
+            },
+            // `[a] = xs` inside a target is a default (`[a = 1] = xs`), which
+            // strips `undefined` exactly as a binding default does.
+            .assign, .binding_default => {
+                const inner = (try c.destructuredAssignType(d.lhs, name, whole)) orelse return null;
+                return try c.removeUndefined(inner);
+            },
+            .array_literal, .array_pattern => {
+                const r = try c.resolveStructural(whole);
+                // Every non-tuple position takes the iterated element type
+                // (tsc's `checkIteratedTypeOrElementType`), which is how a
+                // `RegExpMatchArray` — an interface over `Array<string>`, not an
+                // `.array` — yields `string` per position.
+                const iter: TypeId = if (c.ts.kind(r) == .tuple)
+                    types.no_type
+                else
+                    (try c.iterationElementType(r)) orelse types.no_type;
+                var i: u32 = 0;
+                for (c.tree.nodeRange(pat)) |el| {
+                    if (el == null_node) continue;
+                    defer i += 1;
+                    if (c.nodeTag(el) == .omitted) continue;
+                    var et: TypeId = iter;
+                    if (c.ts.kind(r) == .tuple and i < c.ts.tupleLen(r)) {
+                        const te = c.ts.tupleElem(r, i);
+                        et = if (te.optional() or te.rest())
+                            try c.makeUnion2(te.ty, types.undefined_type)
+                        else
+                            te.ty;
+                    }
+                    if (et == types.no_type) continue;
+                    const tag = c.nodeTag(el);
+                    if (tag == .rest_element or tag == .spread_element) {
+                        const rest = try c.ts.makeArray(et);
+                        if (try c.destructuredAssignType(c.tree.nodeData(el).lhs, name, rest)) |v| return v;
+                        continue;
+                    }
+                    if (try c.destructuredAssignType(el, name, et)) |v| return v;
+                }
+                return null;
+            },
+            .object_literal, .object_pattern => {
+                const r = try c.resolveStructural(whole);
+                for (c.tree.nodeRange(pat)) |el| {
+                    if (el == null_node) continue;
+                    const ed = c.tree.nodeData(el);
+                    switch (c.nodeTag(el)) {
+                        // `({ p: target } = o)` — key in main_token, target in rhs.
+                        .object_property, .binding_property => {
+                            const keyed = try c.memberAtom(c.tree.nodeMainToken(el));
+                            const p = (try c.propOfType(r, keyed)) orelse continue;
+                            const pt = if (p.optional())
+                                try c.makeUnion2(p.ty, types.undefined_type)
+                            else
+                                p.ty;
+                            const tgt = if (c.nodeTag(el) == .object_property) ed.rhs else ed.lhs;
+                            if (try c.destructuredAssignType(tgt, name, pt)) |v| return v;
+                        },
+                        .object_shorthand => {
+                            const keyed = try c.memberAtom(c.tree.nodeMainToken(el));
+                            if (keyed != name) continue;
+                            const p = (try c.propOfType(r, keyed)) orelse continue;
+                            return if (p.optional())
+                                try c.makeUnion2(p.ty, types.undefined_type)
+                            else
+                                p.ty;
+                        },
+                        else => {},
+                    }
+                }
+                return null;
+            },
+            else => return null,
         }
     }
 
