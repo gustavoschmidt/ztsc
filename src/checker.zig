@@ -16783,6 +16783,19 @@ const Checker = struct {
         }
         var r = try c.resolveStructural(callee_t);
         var rk = c.ts.kind(r);
+        // Calling a naked type parameter resolves against its APPARENT type.
+        // `resolveStructural` deliberately leaves a `.type_param` alone (that
+        // is `transitiveBaseConstraint`'s job), so every
+        // `<T extends (…) => R>(fn: T) => fn(…)` — the useStableCallback shape
+        // — fell to the switch's `else` and reported TS2349. tsc's
+        // `resolveCallExpression` calls `getApparentType` on the callee first.
+        if (rk == .type_param) {
+            const bc = try c.transitiveBaseConstraint(r);
+            if (bc != r) {
+                r = try c.resolveStructural(bc);
+                rk = c.ts.kind(r);
+            }
+        }
         // A merged value (e.g. `function F(){}` + `namespace F {}`) types as an
         // intersection of a callable and the namespace object; pick the
         // callable (or constructable, for `new`) member to resolve against.
