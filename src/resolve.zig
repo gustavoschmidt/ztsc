@@ -18,8 +18,11 @@
 //!   first matching condition whose target exists wins, failed targets
 //!   continue to the next). A `"types"`/`"import"` target that names a
 //!   `.js`/`.mjs`/`.cjs` runtime file probes its declaration sibling
-//!   (`.d.ts`/`.d.mts`/`.d.cts`). Unlike Node/tsc, when `exports` is present
-//!   but matches nothing we do NOT hard-fail — we fall back to legacy
+//!   (`.d.ts`/`.d.mts`/`.d.cts`); when no sibling exists the runtime file
+//!   itself is the answer, as an opaque `any` module with TS7016 at the
+//!   specifier, and the map's authority stops the legacy `"types"` key it
+//!   hides from winning. Unlike Node/tsc, when `exports` is present but
+//!   matches nothing *at all* we do NOT hard-fail — we fall back to legacy
 //!   `"types"`/`index` probing (a deliberate under-report: never a false
 //!   TS2307, may miss a real one). When `exports` is absent the legacy path is
 //!   byte-for-byte unchanged. `package.json` is parsed with the shared JSONC
@@ -592,9 +595,15 @@ pub const ResolveOpts = struct {
     /// a JavaScript file exists (a package whose entry is only `.js`, or a
     /// `./x.js` file with no `.ts`/`.d.ts` twin), resolve to that `.js`/`.jsx`/
     /// `.mjs`/`.cjs` file and type it opaquely as `any` (see `js_module_source`).
-    /// ztsc never parses/checks the JS source. tsc would report TS7016 under
-    /// `noImplicitAny`; ztsc under-reports (silent `any`) — a missed diagnostic,
-    /// never a false positive.
+    /// ztsc never parses/checks the JS source. When such a file came out of
+    /// `node_modules`, tsc types the module `any` too and reports TS7016 at the
+    /// specifier under `noImplicitAny`; the linker does the same
+    /// (`modules.untypedJsModule`). A project-local `./x.js` stays silent, as
+    /// in tsc, where that file IS added to the program.
+    ///
+    /// Note this flag does not gate the `exports`-map JavaScript target: a
+    /// package whose map names only JavaScript is untyped with `allowJs` on or
+    /// off, and tsc reports TS7016 either way (`resolvePackage` phase 2).
     allow_js: bool = false,
 };
 
@@ -746,9 +755,28 @@ fn exportsConditionActive(key: []const u8) bool {
         std.mem.eql(u8, key, "default");
 }
 
+/// Which file an `exports` target is allowed to land on.
+///
+/// tsc resolves an `exports` map twice, mirroring its extension masks: first
+/// for TypeScript/declaration files, and — when that finds nothing — again for
+/// the raw JavaScript the target actually names. The second pass is not a
+/// successful *type* resolution: the module has no declarations, so tsc types
+/// it `any` and reports TS7016 at the specifier ("Could not find a declaration
+/// file for module 'x'. '<the JS file>' implicitly has an 'any' type"). It
+/// happens with `allowJs` on or off — the JS entry sits in `node_modules`, so
+/// it is never added to the program either way.
+const ExportProbe = enum {
+    /// The declaration twin of the target (`./x.mjs` → `./x.d.mts`/`./x.d.ts`)
+    /// or the target itself when it already names a `.ts`/`.d.ts`.
+    declarations,
+    /// The target itself, when it names an existing `.js`/`.jsx`/`.mjs`/`.cjs`
+    /// file. Loaded as an opaque `any` module.
+    javascript,
+};
+
 /// Resolve `subpath` ("." for the package root, "./x" for a subpath) against a
-/// package.json `exports` value, returning an existing declaration file under
-/// `pkg_dir` (owned by `alloc`) or null. Pure function of the value + FS.
+/// package.json `exports` value, returning an existing file under `pkg_dir`
+/// (owned by `alloc`) or null. Pure function of the value + FS.
 fn resolveExportsField(
     io: Io,
     alloc: Allocator,
@@ -756,19 +784,20 @@ fn resolveExportsField(
     pkg_dir: []const u8,
     exports_val: tsconfig.Value,
     subpath: []const u8,
+    probe: ExportProbe,
     fs: ?*FsCache,
 ) Error!?[]u8 {
     switch (exports_val) {
         .string => |s| {
             // Sugar: a string `exports` defines only the package root ".".
-            if (std.mem.eql(u8, subpath, ".")) return statExportTarget(io, alloc, dir, pkg_dir, s, "", fs);
+            if (std.mem.eql(u8, subpath, ".")) return statExportTarget(io, alloc, dir, pkg_dir, s, "", probe, fs);
             return null;
         },
         .object => |obj| {
-            if (exportsIsSubpathMap(obj)) return resolveExportsSubpath(io, alloc, dir, pkg_dir, obj, subpath, fs);
+            if (exportsIsSubpathMap(obj)) return resolveExportsSubpath(io, alloc, dir, pkg_dir, obj, subpath, probe, fs);
             // A bare conditions object (no "./" keys) is sugar for the "." target.
             if (!std.mem.eql(u8, subpath, ".")) return null;
-            return resolveConditionalTarget(io, alloc, dir, pkg_dir, exports_val, "", fs);
+            return resolveConditionalTarget(io, alloc, dir, pkg_dir, exports_val, "", probe, fs);
         },
         else => return null,
     }
@@ -784,9 +813,10 @@ fn resolveExportsSubpath(
     pkg_dir: []const u8,
     obj: tsconfig.Value.Object,
     subpath: []const u8,
+    probe: ExportProbe,
     fs: ?*FsCache,
 ) Error!?[]u8 {
-    if (obj.get(subpath)) |v| return resolveConditionalTarget(io, alloc, dir, pkg_dir, v, "", fs);
+    if (obj.get(subpath)) |v| return resolveConditionalTarget(io, alloc, dir, pkg_dir, v, "", probe, fs);
     var best: ?usize = null;
     var best_prefix: usize = 0;
     for (obj.keys, 0..) |key, i| {
@@ -807,7 +837,7 @@ fn resolveExportsSubpath(
         const prefix = key[0..star];
         const suffix = key[star + 1 ..];
         const capture = subpath[prefix.len .. subpath.len - suffix.len];
-        return resolveConditionalTarget(io, alloc, dir, pkg_dir, obj.vals[bi], capture, fs);
+        return resolveConditionalTarget(io, alloc, dir, pkg_dir, obj.vals[bi], capture, probe, fs);
     }
     return null;
 }
@@ -824,21 +854,22 @@ fn resolveConditionalTarget(
     pkg_dir: []const u8,
     target: tsconfig.Value,
     star: []const u8,
+    probe: ExportProbe,
     fs: ?*FsCache,
 ) Error!?[]u8 {
     switch (target) {
         .null => return null, // explicitly blocked (`"./esm": null`)
-        .string => |s| return statExportTarget(io, alloc, dir, pkg_dir, s, star, fs),
+        .string => |s| return statExportTarget(io, alloc, dir, pkg_dir, s, star, probe, fs),
         .array => |arr| {
             for (arr) |elem| {
-                if (try resolveConditionalTarget(io, alloc, dir, pkg_dir, elem, star, fs)) |p| return p;
+                if (try resolveConditionalTarget(io, alloc, dir, pkg_dir, elem, star, probe, fs)) |p| return p;
             }
             return null;
         },
         .object => |obj| {
             for (obj.keys, obj.vals) |key, v| {
                 if (!exportsConditionActive(key)) continue;
-                if (try resolveConditionalTarget(io, alloc, dir, pkg_dir, v, star, fs)) |p| return p;
+                if (try resolveConditionalTarget(io, alloc, dir, pkg_dir, v, star, probe, fs)) |p| return p;
             }
             return null;
         },
@@ -846,12 +877,13 @@ fn resolveConditionalTarget(
     }
 }
 
-/// Stat an `exports` target string (with `*` replaced by `star`) as a
-/// declaration file under `pkg_dir`. The target names a runtime path; its
-/// types file is either the target itself (already a `.d.ts`/`.d.mts`/`.d.cts`)
-/// or the declaration sibling of a `.js`/`.mjs`/`.cjs` (`.mjs`→`.d.mts`,
-/// `.cjs`→`.d.cts`, `.js`→`.d.ts` — verified via `--traceResolution`). Returns
-/// the existing path (owned by `alloc`) or null.
+/// Stat an `exports` target string (with `*` replaced by `star`) under
+/// `pkg_dir`. The target names a runtime path; under `probe == .declarations`
+/// its types file is either the target itself (already a
+/// `.d.ts`/`.d.mts`/`.d.cts`) or the declaration sibling of a
+/// `.js`/`.mjs`/`.cjs` (`.mjs`→`.d.mts`, `.cjs`→`.d.cts`, `.js`→`.d.ts` —
+/// verified via `--traceResolution`). Under `probe == .javascript` it is the
+/// runtime file itself. Returns the existing path (owned by `alloc`) or null.
 fn statExportTarget(
     io: Io,
     alloc: Allocator,
@@ -859,6 +891,7 @@ fn statExportTarget(
     pkg_dir: []const u8,
     target: []const u8,
     star: []const u8,
+    probe: ExportProbe,
     fs: ?*FsCache,
 ) Error!?[]u8 {
     // Targets must be package-relative ("./..."). Reject anything else
@@ -890,6 +923,17 @@ fn statExportTarget(
     var cands: [3][]const u8 = undefined;
     var n: usize = 0;
     const p = joined;
+    if (probe == .javascript) {
+        // The runtime file itself, and only when the target explicitly names a
+        // JavaScript extension. An extensionless or non-JS target ("./index",
+        // "./style.css") stays unresolved: Node requires full paths in an
+        // `exports` map, and a `.css`/`.json`/asset target is not a module tsc
+        // would type at all. A target that already names TypeScript was either
+        // found by the `.declarations` pass or does not exist.
+        if (!endsWithAny(p, &.{ ".js", ".jsx", ".mjs", ".cjs" })) return null;
+        if (try fileExistsFs(io, dir, p, fs)) return try alloc.dupe(u8, p);
+        return null;
+    }
     if (endsWithAny(p, &.{ ".d.ts", ".d.mts", ".d.cts", ".ts", ".tsx" })) {
         cands[0] = p;
         n = 1;
@@ -991,13 +1035,20 @@ fn resolvePackage(io: Io, alloc: Allocator, dir: Io.Dir, importer_dir: []const u
         null;
     defer if (types_pkg) |tp| alloc.free(tp);
 
-    // Two-phase walk (HELD RESOLVER FIX): declarations beat JS-under-allowJs at
-    // ANY depth. Phase 1 probes the real pkg (decls only) then `@types/<pkg>`
-    // across ALL levels; only if nothing typed is found does Phase 2 fall back to
-    // the JS `main`/index under allowJs.
+    // Three-phase walk: declarations beat JavaScript at ANY depth. Phase 1
+    // probes the real pkg (decls only) then `@types/<pkg>` across ALL levels;
+    // only if nothing typed is found anywhere do the JavaScript phases run —
+    // phase 2 for the target a package's own `exports` map names, phase 3 for
+    // the legacy `main`/index under allowJs.
+    //
+    // Phase 1 covering every level before any JavaScript is the whole point:
+    // react's `exports` names `./index.js` and `./jsx-runtime.js`, both real
+    // files, while its declarations live in a *separate package*,
+    // `@types/react`. Landing on react's own JavaScript would type the entire
+    // React surface `any`.
     var d = importer_dir;
     while (true) {
-        if (try resolvePackageAt(io, alloc, dir, d, pkg, sub, false, fs)) |p| {
+        if (try resolvePackageAt(io, alloc, dir, d, pkg, sub, .declarations, false, fs)) |p| {
             // An `exports`-blocked subpath means "the real package publishes no
             // *declarations* here", not "resolution is over": tsc still consults
             // `@types/<pkg>` for the same subpath. `react/jsx-runtime` is the
@@ -1007,21 +1058,33 @@ fn resolvePackage(io: Io, alloc: Allocator, dir: Io.Dir, importer_dir: []const u
             // opaque any-module here typed the whole JSX namespace as `any`.
             if (paths.isBlockedSubpathPath(p)) {
                 if (types_pkg) |tp| {
-                    if (try resolvePackageAt(io, alloc, dir, d, tp, sub, false, fs)) |q| return q;
+                    if (try resolvePackageAt(io, alloc, dir, d, tp, sub, .declarations, false, fs)) |q| return q;
                 }
             }
             return p;
         }
         if (types_pkg) |tp| {
-            if (try resolvePackageAt(io, alloc, dir, d, tp, sub, false, fs)) |p| return p;
+            if (try resolvePackageAt(io, alloc, dir, d, tp, sub, .declarations, false, fs)) |p| return p;
         }
         if (d.len == 0 or std.mem.eql(u8, d, "/") or std.mem.eql(u8, d, ".")) break;
         d = dirnamePart(d);
     }
+    // Phase 2: nothing anywhere declares this specifier, so fall to the
+    // JavaScript a package's `exports` map names for it. Not gated on
+    // `allowJs`: the file sits in `node_modules`, so tsc never adds it to the
+    // program either way — it types the module `any` and reports TS7016 at the
+    // specifier, which is what an opaque any-module here reproduces.
+    d = importer_dir;
+    while (true) {
+        if (try resolvePackageAt(io, alloc, dir, d, pkg, sub, .javascript, false, fs)) |p| return p;
+        if (d.len == 0 or std.mem.eql(u8, d, "/") or std.mem.eql(u8, d, ".")) break;
+        d = dirnamePart(d);
+    }
+    // Phase 3: the legacy `main`/index JavaScript entry, under allowJs.
     if (allow_js) {
         d = importer_dir;
         while (true) {
-            if (try resolvePackageAt(io, alloc, dir, d, pkg, sub, true, fs)) |p| return p;
+            if (try resolvePackageAt(io, alloc, dir, d, pkg, sub, .declarations, true, fs)) |p| return p;
             if (d.len == 0 or std.mem.eql(u8, d, "/") or std.mem.eql(u8, d, ".")) break;
             d = dirnamePart(d);
         }
@@ -1094,10 +1157,22 @@ fn dirFieldTarget(
     return null;
 }
 
+/// Which of `resolvePackage`'s walks `resolvePackageAt` is serving.
+const PackagePhase = enum {
+    /// Declarations: the `exports` map's declaration targets, `"types"`, the
+    /// declaration twin of `"main"`, `index.d.ts` — plus, under `allow_js`,
+    /// the legacy JavaScript `main`/index (phase 3, which shares this arm
+    /// because it is the same probe sequence with one more candidate).
+    declarations,
+    /// The runtime JavaScript a package's own `exports` map names, and nothing
+    /// else. Runs only after the declaration walk has missed at every level.
+    javascript,
+};
+
 /// Resolve `<pkg>/<sub>` under one directory level's `node_modules`, honoring
 /// `package.json` `"types"`/`"typings"` (for a bare package) or a relative
 /// stem (for a subpath). Null when nothing resolves at this level.
-fn resolvePackageAt(io: Io, alloc: Allocator, dir: Io.Dir, d: []const u8, pkg: []const u8, sub: []const u8, allow_js: bool, fs: ?*FsCache) Error!?[]u8 {
+fn resolvePackageAt(io: Io, alloc: Allocator, dir: Io.Dir, d: []const u8, pkg: []const u8, sub: []const u8, phase: PackagePhase, allow_js: bool, fs: ?*FsCache) Error!?[]u8 {
     // Nothing under `<d>/node_modules` can resolve when that directory does not
     // exist, so one memoized stat per walk level replaces every probe below.
     // Pure short-circuit: the package.json read and all stem candidates would
@@ -1132,9 +1207,12 @@ fn resolvePackageAt(io: Io, alloc: Allocator, dir: Io.Dir, d: []const u8, pkg: [
         } else |_| {}
     }
 
-    // (1) `exports` map — authoritative for tsc when present. On a root (".")
-    //     miss we still fall through to legacy probing (deliberate under-report;
-    //     see file header). On a *subpath* miss, however, tsc's bundler/Node16
+    // (1) `exports` map — authoritative for tsc when present. A target the map
+    //     DOES name but that ships no declarations resolves to the JavaScript
+    //     itself (an opaque `any` module, plus TS7016 at the specifier); only
+    //     when the map names nothing our condition set can reach does a root
+    //     (".") miss still fall through to legacy probing. On a *subpath* miss,
+    //     however, tsc's bundler/Node16
     //     resolution hard-fails: a package that publishes `exports` is a closed
     //     set of entry points, so `pkg/deep/path` NOT named by the map is
     //     unresolvable — Node/tsc do NOT fall back to walking the filesystem.
@@ -1167,14 +1245,40 @@ fn resolvePackageAt(io: Io, alloc: Allocator, dir: Io.Dir, d: []const u8, pkg: [
             else
                 try std.fmt.allocPrint(alloc, "./{s}", .{sub});
             defer if (sub.len != 0) alloc.free(subpath);
-            if (try resolveExportsField(io, alloc, dir, nm, exports_val, subpath, fs)) |p| return p;
+            if (phase == .javascript) {
+                // Phase 2 in isolation: the runtime file the map names. See
+                // the `resolvePackage` walk for why this is a separate pass
+                // and not a fallback right here — `@types/<pkg>` has to be
+                // consulted first.
+                return resolveExportsField(io, alloc, dir, nm, exports_val, subpath, .javascript, fs);
+            }
+            if (try resolveExportsField(io, alloc, dir, nm, exports_val, subpath, .declarations, fs)) |p| return p;
+            // The map names a target for this specifier, but only ships
+            // JavaScript behind it. That is a resolution for tsc (an untyped
+            // `any` module plus TS7016 at the specifier), just not one this
+            // phase may return — so report "nothing declared here" and let the
+            // walk continue to `@types/<pkg>`, then to phase 2.
+            //
+            // Returning null rather than falling through to the legacy leg
+            // below is the point: a package that publishes `exports` without a
+            // `types` condition hides its own top-level `"types"` key, and tsc
+            // honours that (`browser-fs-access` ships exactly this shape —
+            // `exports` names only `./dist/index.mjs`, while the real
+            // `index.d.ts` is reachable solely through the legacy field).
+            if (try resolveExportsField(io, alloc, dir, nm, exports_val, subpath, .javascript, fs)) |p| {
+                alloc.free(p);
+                return null;
+            }
             // Subpath unmatched by a present `exports` map → opaque `any`
             // module (see above; NOT null — that dangles a symbol). The
             // root (".") still falls through to legacy probing, so a package
-            // whose `.` entry our condition set misses is not regressed.
+            // whose `.` entry our condition set misses entirely is not
+            // regressed.
             if (sub.len != 0) return try blockedSubpathPath(alloc, nm, sub);
         }
     }
+    // Phase 2 has nothing to say about a package with no `exports` map.
+    if (phase == .javascript) return null;
 
     // (2) Legacy resolution (exports absent or unmatched).
     if (sub.len > 0) {

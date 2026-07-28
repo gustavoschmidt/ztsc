@@ -116,6 +116,23 @@ pub fn isJsModulePath(path: []const u8) bool {
     return endsWithAny(path, &.{ ".js", ".jsx", ".mjs", ".cjs" });
 }
 
+/// True when `path` lies inside a `node_modules` directory — tsc's
+/// `isExternalLibraryImport`. A JavaScript file resolved from there is never
+/// added to the program (it is past `maxNodeModuleJsDepth`), so tsc types the
+/// module `any` and reports TS7016; a JavaScript file resolved from the
+/// project itself (a relative `./x.js`, or a `baseUrl`/`paths` mapping) IS
+/// added and stays silent. Forward slashes only, as everywhere in the loader.
+pub fn isInNodeModules(path: []const u8) bool {
+    var rest = path;
+    while (std.mem.indexOf(u8, rest, "node_modules")) |at| {
+        const before_ok = at == 0 or rest[at - 1] == '/';
+        const end = at + "node_modules".len;
+        if (before_ok and end < rest.len and rest[end] == '/') return true;
+        rest = rest[end..];
+    }
+    return false;
+}
+
 /// True for a synthetic exports-blocked-subpath any-module path (see
 /// `blocked_subpath_suffix`).
 pub fn isBlockedSubpathPath(path: []const u8) bool {
@@ -146,10 +163,13 @@ pub fn endsWithAny(s: []const u8, exts: []const []const u8) bool {
 pub const json_module_source = "declare const j: any;\nexport = j;\n";
 
 /// Synthetic source substituted for a resolved JavaScript module under
-/// `allowJs`. Identical shape to `json_module_source` (opaque `any` via
-/// `export =`): ztsc never parses/checks JS, so a JS-only dependency (`qs`,
-/// `leaflet.markercluster`) types as `any` instead of raising TS2307. Under
-/// `noImplicitAny` tsc emits TS7016 here; ztsc under-reports (silent `any`).
+/// `allowJs`, and for the JavaScript an `exports` map names when the package
+/// ships no declarations behind it. Identical shape to `json_module_source`
+/// (opaque `any` via `export =`): ztsc never parses/checks JS, so a JS-only
+/// dependency (`qs`, `leaflet.markercluster`) types as `any` instead of
+/// raising TS2307. Under `noImplicitAny` tsc reports TS7016 at the specifier
+/// for such a module when it came from `node_modules`; the linker does the
+/// same (`Linker.reportUnresolvedModules`).
 pub const js_module_source = json_module_source;
 
 /// Synthetic program-path suffix marking an `exports`-blocked subpath — a

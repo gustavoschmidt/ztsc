@@ -9,7 +9,9 @@
 //! Design decisions:
 //!
 //! - **Nonexistent module → TS2307** at the module-specifier string of the
-//!   import/export statement (one per statement).
+//!   import/export statement (one per statement). A module that resolved but
+//!   turned out to be undeclared JavaScript from `node_modules` gets TS7016
+//!   at the same anchor, under `noImplicitAny`.
 //! - **Linking is serial and pure**: after all files are bound (parallel
 //!   phases), `link` builds per-file sealed tables:
 //!   - a flattened **export table** (name → final `Target`), with
@@ -63,6 +65,21 @@ pub const no_file: FileId = std.math.maxInt(FileId);
 // program construction & linking
 // ===========================================================================
 
+/// The tsconfig options the *link* phase reads. Both are per-program constants
+/// the driver settles before any file is linked; grouping them keeps the two
+/// booleans from becoming an unlabelled pair at every call site.
+pub const LinkOpts = struct {
+    /// tsconfig `allowSyntheticDefaultImports`/`esModuleInterop`: a default
+    /// import of a module with no default export binds to the module namespace
+    /// object. See `linkImports`.
+    allow_synthetic_default: bool = false,
+    /// tsconfig `noImplicitAny`. Gates TS7016 ("Could not find a declaration
+    /// file for module …"), the link-phase member of the implicit-any family;
+    /// the checker gates TS7006/TS7053 on `Program.no_implicit_any`, which the
+    /// driver sets from the same option.
+    no_implicit_any: bool = true,
+};
+
 /// Serial wavefront: load, parse, bind and resolve transitively from
 /// `entries` (paths relative to `dir`), then link. Everything lives in
 /// `arena`.
@@ -75,7 +92,7 @@ pub fn buildProgram(
     entries: []const []const u8,
     lib_set: LibSet,
     resolve_opts: ResolveOpts,
-    allow_synthetic_default: bool,
+    link_opts: LinkOpts,
     /// `<jsxImportSource>/jsx-runtime` under the automatic JSX runtime, else
     /// null. Pulled into the program on the first `.tsx` file, exactly as the
     /// CLI driver does; its FileId becomes `Program.jsx_runtime_file`.
@@ -192,7 +209,7 @@ pub fn buildProgram(
     }
 
     const file_slice = try arena.dupe(ProgFile, files.items);
-    const lr = try link(arena, gpa, io, interner, file_slice, allow_synthetic_default);
+    const lr = try link(arena, gpa, io, interner, file_slice, link_opts);
     return .{
         .program = .{
             .files = file_slice,
@@ -219,7 +236,7 @@ pub fn link(
     io: Io,
     interner: *Interner,
     files: []const ProgFile,
-    allow_synthetic_default: bool,
+    link_opts: LinkOpts,
 ) Error!LinkResult {
     var scratch_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch_arena.deinit();
@@ -233,7 +250,8 @@ pub fn link(
         .interner = interner,
         .files = files,
         .atom_default = interner.intern(io, gpa, "default") catch return Error.OutOfMemory,
-        .allow_synthetic_default = allow_synthetic_default,
+        .allow_synthetic_default = link_opts.allow_synthetic_default,
+        .no_implicit_any = link_opts.no_implicit_any,
         .atom_export_equals = interner.intern(io, gpa, "export=") catch return Error.OutOfMemory,
         .state = try scratch.alloc(u8, files.len),
         .tables = try scratch.alloc(std.AutoArrayHashMapUnmanaged(Atom, Target), files.len),
@@ -945,6 +963,8 @@ const Linker = struct {
     /// import of a module with no default export binds to the module namespace
     /// object rather than raising TS1192.
     allow_synthetic_default: bool = false,
+    /// Effective `noImplicitAny`; gates TS7016 (see `LinkOpts`).
+    no_implicit_any: bool = true,
     /// Reserved key under which a module's `export = X` target is stored in its
     /// export/ambient table (`export=` can never be a real export name). Skipped
     /// by the namespace-object builders and `export *` merge.
@@ -1405,6 +1425,9 @@ const Linker = struct {
     /// side-effect-only import (`import "./x"`) of an unresolved module gets
     /// TS2882 instead — TS7 flags these (tsc 5.5 left them silent under
     /// bundler resolution).
+    ///
+    /// The same walk carries TS7016 for the module that resolved but has no
+    /// declarations behind it — see `untypedJsModule`.
     fn reportUnresolvedModules(l: *Linker, file: FileId) Error!void {
         const f = &l.files[file];
         const tree = f.tree;
@@ -1427,7 +1450,15 @@ const Linker = struct {
             const stripped = stripQuotes(text);
             if (stripped.len == 0) continue;
             const atom = l.interner.intern(l.io, l.gpa, stripped) catch return Error.OutOfMemory;
-            if (f.specs.get(atom) != null) continue;
+            if (l.effectiveModuleFile(f, atom)) |mfile| {
+                // Resolved. The one thing left to say about it: a dependency
+                // that turned out to be plain JavaScript has no types, and
+                // under `noImplicitAny` that is an error at the specifier.
+                if (l.no_implicit_any and !side_effect and untypedJsModule(l.files[mfile].path)) {
+                    try l.diag(file, 7016, l.tokSpan(file, mod_tok), "Could not find a declaration file for module '{s}'. '{s}' implicitly has an 'any' type.", .{ stripped, l.files[mfile].path });
+                }
+                continue;
+            }
             if (l.hasAmbient(atom)) continue; // resolved by a `declare module`
             if (side_effect) {
                 try l.diag(file, 2882, l.tokSpan(file, mod_tok), "Cannot find module or type declarations for side-effect import of '{s}'.", .{stripped});
@@ -1617,6 +1648,25 @@ const Linker = struct {
         }
     }
 };
+
+/// True for a program path that is a JavaScript file pulled out of
+/// `node_modules` — a dependency ztsc resolved but that ships no declarations,
+/// loaded as the opaque `any` body `paths.js_module_source`. Two ways in: a
+/// package whose `main` is only `.js` under `allowJs`, and (whatever `allowJs`
+/// says) the JavaScript an `exports` map names when nothing behind the map
+/// declares types.
+///
+/// This is the TS7016 predicate. The `node_modules` clause is tsc's
+/// `isExternalLibraryImport` — a JS file from a dependency is never added to
+/// the program, so its module has no symbol and tsc errors at the specifier,
+/// whereas a project-local `./x.js` IS added and stays silent. The other
+/// synthetic any-modules are deliberately excluded: a `*.json` resolved by
+/// `resolveJsonModule` is a legal resolution (tsc types it structurally, ztsc
+/// opaquely — an under-report, not an error), and an `exports`-blocked subpath
+/// is tsc's TS2307, a different diagnostic ztsc under-reports on purpose.
+fn untypedJsModule(path: []const u8) bool {
+    return paths.isJsModulePath(path) and paths.isInNodeModules(path);
+}
 
 fn stripQuotes(text: []const u8) []const u8 {
     if (text.len >= 2 and (text[0] == '"' or text[0] == '\'')) {

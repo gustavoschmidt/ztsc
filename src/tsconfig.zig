@@ -1774,7 +1774,10 @@ test "config-driven program builds and checks (conformance-style)" {
 
     var interner = @import("intern.zig").Interner.init();
     defer interner.deinit(gpa);
-    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, cfg.root_files, .none, .{}, cfg.allow_synthetic_default_imports, cfg.jsx_runtime_module);
+    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, cfg.root_files, .none, .{}, .{
+        .allow_synthetic_default = cfg.allow_synthetic_default_imports,
+        .no_implicit_any = cfg.no_implicit_any,
+    }, cfg.jsx_runtime_module);
     try testing.expectEqual(@as(usize, 2), br.program.files.len);
 
     const checker = @import("checker.zig");

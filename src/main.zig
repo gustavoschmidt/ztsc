@@ -881,7 +881,10 @@ pub fn main(init: std.process.Init) !void {
             .specs = .{ .atoms = spec_atoms_all.items[i], .files = spec_files_all.items[i] },
         };
     }
-    const lr = try modules.link(arena, gpa, io, &interner, prog_files, config_allow_synthetic_default);
+    const lr = try modules.link(arena, gpa, io, &interner, prog_files, .{
+        .allow_synthetic_default = config_allow_synthetic_default,
+        .no_implicit_any = config_no_implicit_any,
+    });
     const links = lr.links;
     const prog = try arena.create(modules.Program);
     prog.* = .{
