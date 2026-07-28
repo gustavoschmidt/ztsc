@@ -13294,6 +13294,78 @@ const Checker = struct {
     }
 
     fn signatureAssignableMode(c: *Checker, s: TypeId, t: TypeId, mode: SigMode) Error!bool {
+        if (try c.signatureAssignableModeInner(s, t, mode)) return true;
+        // tsc's `getErasedSignature` retry. The main path erases a signature's
+        // own type parameters to their CONSTRAINTS (`getBaseSignature`), which
+        // keeps a `Pick<S, K>` deferred; tsc's erasure maps them to `any`, and a
+        // mapped type over `any` demands nothing. That is what makes
+        // `Comp<Full>["setState"]` assignable to `Comp<Ui>["setState"]` — the
+        // `Pick<S, K>` member of the `state` union absorbs the callback member
+        // the constraint erasure could not place. Purely additive: it runs only
+        // after the precise relation has already failed, and only when a
+        // signature actually has type parameters to erase.
+        //
+        // Narrow on purpose. `any` is bivalent, so a blanket retry would accept
+        // every generic relation the constraint erasure soundly rejects (the
+        // negative controls in assignability/043 and inference/
+        // generic_source_to_concrete_cb, and the `IsEqual` identity probe in
+        // assignability/045, all regress under one). It therefore runs only when
+        // a MAPPED type is what the constraint erasure left deferred — the shape
+        // whose `any` instantiation is what tsc's acceptance actually rests on —
+        // and never when the identity probe has already decided the pair.
+        if (c.ts.fnTypeParams(s).len == 0 and c.ts.fnTypeParams(t).len == 0) return false;
+        if (try c.identityProbeRelated(s, t)) |_| return false;
+        if (!try c.typeHasMapped(s, 0) and !try c.typeHasMapped(t, 0)) return false;
+        const sa = try c.eraseParamsToAny(s);
+        const ta = try c.eraseParamsToAny(t);
+        if (sa == s and ta == t) return false;
+        return c.signatureAssignableModeInner(sa, ta, mode);
+    }
+
+    /// Does a deferred mapped type occur within `t0`, shallowly? Depth-bounded:
+    /// only used to gate the `any`-erasure retry above, where the mapped type
+    /// sits directly in a parameter's union.
+    fn typeHasMapped(c: *Checker, t0: TypeId, depth: u8) Error!bool {
+        if (depth > 4) return false;
+        const t = try c.resolveStructural(t0);
+        switch (c.ts.kind(t)) {
+            .mapped => return true,
+            .union_type, .intersection => {
+                const ms = try c.scratch().dupe(TypeId, try c.memberList(t));
+                defer c.scratch().free(ms);
+                for (ms) |m| {
+                    if (try c.typeHasMapped(m, depth + 1)) return true;
+                }
+                return false;
+            },
+            .function => {
+                const n = c.ts.fnParamCount(t);
+                var i: u32 = 0;
+                while (i < n) : (i += 1) {
+                    const pt = c.ts.fnParam(t, i).ty;
+                    if (try c.typeHasMapped(pt, depth + 1)) return true;
+                }
+                return c.typeHasMapped(c.ts.fnReturn(t), depth + 1);
+            },
+            .array => return c.typeHasMapped(c.ts.arrayElem(t), depth + 1),
+            else => return false,
+        }
+    }
+
+    /// Instantiate a signature's own type parameters with `any` (tsc's
+    /// `createTypeEraser`).
+    fn eraseParamsToAny(c: *Checker, sig: TypeId) Error!TypeId {
+        const sig_tps = c.ts.fnTypeParams(sig);
+        if (sig_tps.len == 0) return sig;
+        const tps = try c.scratch().dupe(u32, sig_tps);
+        defer c.scratch().free(tps);
+        const map = try c.scratch().alloc(TpMap, tps.len);
+        defer c.scratch().free(map);
+        for (tps, 0..) |tp, i| map[i] = .{ .sym = tp, .ty = types.any_type };
+        return c.instantiate(sig, map);
+    }
+
+    fn signatureAssignableModeInner(c: *Checker, s: TypeId, t: TypeId, mode: SigMode) Error!bool {
         // tsc's canonical type-IDENTITY probe `(<G>() => G extends X ? A : B)`
         // (react-hook-form's `IsEqual`, and other libraries) compares two types
         // for identity: `IsEqual<X,Y>` reduces to `(<G>()=>G extends X?1:2)
