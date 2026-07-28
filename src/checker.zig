@@ -17746,12 +17746,27 @@ const Checker = struct {
         return c.instantiate(t, map_list.items);
     }
 
-    /// True when `tp_sym` is the *bare* return type of some function-typed
-    /// parameter of `sig` — the `map<U>(cb: (…) => U)` shape, where seeding `U`
-    /// from the call's contextual return type cleanly makes the callback body
-    /// keep literal discriminants. A union/array-wrapped return (`flatMap`'s
-    /// `U | readonly U[]`) does not qualify.
+    /// May `tp_sym` be fixed from the call's contextual return type BEFORE the
+    /// arguments are contextually typed (tsc's `InferencePriority.ReturnType`
+    /// seed)? Two shapes qualify:
+    ///
+    ///   • the *bare* return type of some function-typed parameter — the
+    ///     `map<U>(cb: (…) => U)` shape, where seeding `U` cleanly makes the
+    ///     callback body keep literal discriminants. A union/array-wrapped
+    ///     return (`flatMap`'s `U | readonly U[]`) does not qualify;
+    ///   • the signature's own bare return type — the identity-wrapper shape
+    ///     (`wrap<F extends (…) => void>(f: F): F`, `withBatchedUpdates`). The
+    ///     contextual return type determines `F` outright, and seeding it is
+    ///     what gives the arrow ARGUMENT a contextual signature at all: without
+    ///     it `F` is `any` while the argument is checked, so every parameter of
+    ///     the arrow is an implicit `any`. `map`/`flatMap` return `U[]`, not a
+    ///     bare `U`, so this second rule does not reach them.
+    ///
+    /// The seed only builds contextual types; argument evidence still owns the
+    /// committed inference.
     fn paramIsBareCallbackReturn(c: *Checker, sig: TypeId, tp_sym: u32) bool {
+        const sr = c.ts.fnReturn(sig);
+        if (c.ts.kind(sr) == .type_param and c.ts.typeParamSymbol(sr) == tp_sym) return true;
         const n = c.ts.fnParamCount(sig);
         var i: u32 = 0;
         while (i < n) : (i += 1) {
