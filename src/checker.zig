@@ -18525,10 +18525,38 @@ const Checker = struct {
                 }
                 const tp_idx: ?usize = if (tp_member != types.no_type) tpIndex(tp_syms, s.typeParamSymbol(tp_member)) else null;
                 const before: TypeId = if (tp_idx) |ix| candidates[ix] else types.no_type;
+                // tsc's `inferFromTypes` union rule: "first infer between
+                // identically matching source and target constituents and
+                // remove the matched types". Only the RESIDUAL source is then
+                // offered to the inference-bearing members. Without it,
+                // `setState(s => cond ? {b:1} : null)` handed the whole
+                // `{b:number} | null` return to the `Pick<S, K>` member, which
+                // sees a union rather than an object, infers nothing, and lets
+                // `K` fall back to `keyof S` — i.e. the full state, which
+                // rejects every partial update. Identity is TypeId equality on
+                // interned types, so this only fires on an exact match.
+                const arg_residual: TypeId = blk: {
+                    if (s.kind(arg) != .union_type) break :blk arg;
+                    const ams = try c.memberList(arg);
+                    var rem: std.ArrayList(TypeId) = .empty;
+                    defer rem.deinit(c.scratch());
+                    for (ams) |am| {
+                        var paired = false;
+                        for (try c.memberList(param)) |pm| {
+                            if (pm == am) {
+                                paired = true;
+                                break;
+                            }
+                        }
+                        if (!paired) try rem.append(c.scratch(), am);
+                    }
+                    if (rem.items.len == 0 or rem.items.len == ams.len) break :blk arg;
+                    break :blk try s.makeUnion(c.scratch(), rem.items);
+                };
                 for (try c.memberList(param)) |m| {
                     if (m == tp_member) continue;
                     if (try c.containsTypeParam(m)) {
-                        try c.unify(m, arg, tp_syms, candidates, depth + 1);
+                        try c.unify(m, arg_residual, tp_syms, candidates, depth + 1);
                     }
                 }
                 // A wrapper member contributed a candidate for the naked var.
