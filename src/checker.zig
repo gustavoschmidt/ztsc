@@ -5452,10 +5452,52 @@ const Checker = struct {
         return if (is_const) c.ts.regular(norm) else c.widenLiteral(norm);
     }
 
+    /// The element type a `for..of` / `for..in` head gives the binding `sym`,
+    /// or null when `sym` is not such a binding.
+    ///
+    /// `checkForInOf` pins the same type as it walks the loop, but the binding
+    /// can be *demanded* long before that statement is reached: a flow query
+    /// crossing the loop's back edge re-checks an assignment in the body
+    /// (`assignNarrows`), and anything that assignment's right-hand side reads
+    /// resolves through `typeOfSymbol` right there. Return-type inference for
+    /// an enclosing arrow is enough to trigger it — the `return` after the loop
+    /// is checked first, its flow walk reaches the loop-carried assignment, and
+    /// the loop variable is asked for its type before the loop head has run.
+    ///
+    /// Without this the declarator falls through to `any`, and because
+    /// `typeOfSymbol` marks what it computes as final, that `any` *wins* over
+    /// the element type `checkForInOf` later tries to set — every use of the
+    /// loop variable in the body silently becomes `any`, taking with it the
+    /// narrowings and the contextual types that would have come from it.
+    fn forHeadBindingType(c: *Checker, sym: SymbolId) Error!?TypeId {
+        const scope = c.symScope(sym);
+        if (c.bind.scope_kinds[scope] != .for_head) return null;
+        const owner = c.bind.scope_owners[scope];
+        if (owner == null_node) return null;
+        const is_of = switch (c.nodeTag(owner)) {
+            .for_of_stmt => true,
+            .for_in_stmt => false,
+            else => return null, // plain `for (let i = 0; …)`
+        };
+        if (!is_of) return types.string_type; // for..in keys
+        const e = c.tree.extraData(ast.ForInOf, c.tree.nodeData(owner).lhs);
+        const rt = try c.checkExprCached(e.right, types.no_type);
+        // No `right_node`: a non-iterable right-hand side is diagnosed once, by
+        // `checkForInOf`, in source order — not from whatever demanded the
+        // binding first.
+        return try c.forOfElementType(rt, null_node, e.is_await != 0);
+    }
+
     fn declaratorType(c: *Checker, sym: SymbolId, decl: Node, is_const: bool) Error!TypeId {
         const d = c.tree.nodeData(decl);
         switch (c.nodeTag(decl)) {
-            .declarator => return types.any_type,
+            .declarator => {
+                // No initializer and no annotation: either a loop head binding
+                // (typed by what is iterated) or a bare `let x;`.
+                const et = (try c.forHeadBindingType(sym)) orelse return types.any_type;
+                if (c.nodeTag(d.lhs) == .identifier) return et;
+                return c.bindingElementType(sym, decl, et);
+            },
             .declarator_init => {
                 const init_t = try c.checkExprCached(d.rhs, types.no_type);
                 const vt = try c.widenInitializer(init_t, is_const);
