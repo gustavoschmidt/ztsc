@@ -17438,6 +17438,149 @@ const Checker = struct {
         return constraint;
     }
 
+    /// Is this candidate one of the *literal* shapes tsc's
+    /// `unionObjectAndArrayLiteralCandidates` pulls out of the covariant set —
+    /// an object literal or an array literal? Freshness answers it exactly for
+    /// objects (ztsc's fresh bit is tsc's `ObjectFlags.ObjectLiteral`). Arrays
+    /// and tuples carry no such bit: their types are interned structurally, so
+    /// a `string[]` written as a literal and a declared `string[]` are the same
+    /// id. They are therefore all treated as literal-shaped, which keeps the
+    /// union tsc forms between two array literals; the price is that a declared
+    /// array folded against an array literal also unions instead of taking the
+    /// supertype (which is what happened to every candidate pair before this
+    /// rule existed, so nothing regresses).
+    fn covLiteralShape(c: *Checker, t: TypeId) bool {
+        return switch (c.ts.kind(t)) {
+            .array, .tuple => true,
+            .object => c.ts.objectIsFresh(t),
+            else => false,
+        };
+    }
+
+    /// The common base of a literal type, or of a union whose members are all
+    /// literals sharing one base (tsc's `getBaseTypeOfLiteralType`, including
+    /// its union branch). `no_type` when the type is not literal-only — which
+    /// is also the answer for a base primitive itself, since tsc's
+    /// `literalTypesWithSameBaseType` rejects a candidate that *is* its own base.
+    fn covLiteralBase(c: *Checker, t: TypeId) Error!TypeId {
+        if (c.ts.kind(t) != .union_type) return c.literalBaseOf(t);
+        var base: TypeId = types.no_type;
+        for (try c.memberList(t)) |m| {
+            const b = try c.literalBaseOf(m);
+            if (b == types.no_type) return types.no_type;
+            if (base == types.no_type) base = b else if (base != b) return types.no_type;
+        }
+        return base;
+    }
+
+    /// 1 = has an `undefined` constituent, 2 = has a `null` one (tsc's
+    /// `TypeFlags.Nullable`; `void` is deliberately not one of them).
+    fn covNullableFlags(c: *Checker, t: TypeId) u2 {
+        var f: u2 = 0;
+        const members: []const TypeId = if (c.ts.kind(t) == .union_type) c.ts.members(t) else &.{t};
+        for (members) |m| switch (c.ts.kind(m)) {
+            .undefined => f |= 1,
+            .null => f |= 2,
+            else => {},
+        };
+        return f;
+    }
+
+    fn covStripNullable(c: *Checker, t: TypeId) Error!TypeId {
+        return c.filterUnion(t, struct {
+            fn keep(ch: *Checker, m: TypeId) bool {
+                const k = ch.ts.kind(m);
+                return k != .undefined and k != .null;
+            }
+        }.keep);
+    }
+
+    /// `isTypeSubtypeOf` as far as the supertype fold needs it: assignability
+    /// plus the one place the subtype relation is strictly stronger and the
+    /// difference is observable here — a source that omits an OPTIONAL property
+    /// of the target is assignable to it but is not a subtype of it, so
+    /// `{ a: number }` folded against `{ a: number; b?: string }` keeps the
+    /// former (tsc's answer) instead of climbing to the latter.
+    fn covSubtypeOf(c: *Checker, a: TypeId, b: TypeId) Error!bool {
+        if (!try c.isAssignable(a, b)) return false;
+        const rb = try c.resolveStructural(b);
+        if (c.ts.kind(rb) != .object) return true;
+        for (0..c.ts.objectPropCount(rb)) |i| {
+            const p = c.ts.objectProp(rb, @intCast(i));
+            if (p.flags & types.prop_flag_optional == 0) continue;
+            if (try c.propOfType(a, p.name) == null) return false;
+        }
+        return true;
+    }
+
+    /// Combine two covariant inference candidates for the same type parameter.
+    ///
+    /// tsc's `getCovariantInference` resolves a parameter's candidate set with
+    /// `getCommonSupertype`, never with a union: the candidates are folded left
+    /// to right by `reduceLeft((s, t) => isTypeSubtypeOf(s, t) ? t : s)`, so
+    /// unrelated candidates keep the LEFTMOST one and the call then reports the
+    /// argument that does not fit. A union is formed in exactly two places —
+    /// when the candidates are literals over one base (`f("a", "b")` gives
+    /// `"a" | "b"`), and among the object/array literal candidates, whose union
+    /// is folded in last. Nullable constituents are stripped from every
+    /// candidate before the fold and added back after it.
+    ///
+    /// ztsc has no candidate *list* — `unify` keeps one accumulator per
+    /// parameter — so the fold runs incrementally. That is exact for
+    /// `reduceLeft`; the one place it is not is a literal candidate arriving
+    /// after the fold has already taken a mismatched-base step (`f(1, "a", 2)`
+    /// yields `1 | 2` where tsc yields `1`), since the accumulator no longer
+    /// records that the run of same-base literals was already broken.
+    fn combineCovariant(c: *Checker, prev: TypeId, cand: TypeId) Error!TypeId {
+        if (prev == cand) return prev;
+        const s = &c.ts;
+        // `any` is a supertype of everything and a subtype of nothing in tsc's
+        // subtype relation, so it wins the fold from either side.
+        if (s.kind(prev) == .any or s.kind(cand) == .any) return types.any_type;
+        // A bare type variable as a candidate is the weakest evidence there is
+        // — it says the argument's shape MENTIONS the variable, not that the
+        // parameter is it. tsc files such an inference at a lower
+        // `InferencePriority` and never folds it against a structural
+        // candidate; ztsc has no priorities, so the pair keeps the union it
+        // formed before the supertype rule existed rather than letting an
+        // arbitrary arrival order decide (`argsOrArgArray<T>((T | T[])[])` fed
+        // `(ObservableInput<T> | ObservableInput<T>[])[]` collects both a bare
+        // `T`, via `ArrayLike<T>`'s iteration element, and the real union).
+        if (s.kind(prev) == .type_param or s.kind(cand) == .type_param) return c.makeUnion2(prev, cand);
+        if (c.covLiteralShape(prev) and c.covLiteralShape(cand)) return c.makeUnion2(prev, cand);
+        // The literal candidates' union is folded in LAST, so a literal never
+        // sits on the left of the pair. Only a FRESH OBJECT triggers the
+        // reorder: it is the one shape ztsc can positively identify as written
+        // at the call site, whereas an array's type is the same whether it was
+        // written as a literal or declared — reordering on that guess would
+        // turn `red<U>(cb, [] as string[])`'s `string[]` seed into the loser of
+        // a fold against a stray `string`.
+        const flip = s.kind(prev) == .object and s.objectIsFresh(prev);
+        var a = if (flip) cand else prev;
+        var b = if (flip) prev else cand;
+        const nulls = c.covNullableFlags(a) | c.covNullableFlags(b);
+        if (nulls != 0) {
+            a = try c.covStripNullable(a);
+            b = try c.covStripNullable(b);
+        }
+        var res: TypeId = undefined;
+        if (s.kind(a) == .never) {
+            res = b;
+        } else if (s.kind(b) == .never) {
+            res = a;
+        } else blk: {
+            const ab = try c.covLiteralBase(a);
+            if (ab != types.no_type and ab == try c.covLiteralBase(b)) {
+                res = try c.makeUnion2(a, b);
+                break :blk;
+            }
+            res = if (try c.covSubtypeOf(a, b)) b else a;
+        }
+        if (nulls & 1 != 0) res = try c.makeUnion2(res, types.undefined_type);
+        if (nulls & 2 != 0) res = try c.makeUnion2(res, types.null_type);
+        return res;
+    }
+
     fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, candidates: []TypeId, depth: u32) Error!void {
         if (depth > 16) return;
         const s = &c.ts;
@@ -17466,7 +17609,7 @@ const Checker = struct {
                     if (candidates[i] == types.no_type) {
                         candidates[i] = cand;
                     } else {
-                        candidates[i] = try c.makeUnion2(candidates[i], cand);
+                        candidates[i] = try c.combineCovariant(candidates[i], cand);
                     }
                 }
             },
