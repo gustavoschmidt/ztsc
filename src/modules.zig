@@ -1317,6 +1317,32 @@ const Linker = struct {
         return l.ambientKey(spec) != null;
     }
 
+    /// The file backing specifier `spec` in `f`, with tsc's ambient-module
+    /// precedence applied.
+    ///
+    /// tsc's `resolveExternalModuleNameWorker` looks a NON-RELATIVE specifier
+    /// up in the globals as an exactly-named ambient module (`declare module
+    /// "png-chunks-extract"`) BEFORE it consults the resolved file; only
+    /// *pattern* ambient modules (`declare module "*.css"`) are consulted
+    /// after resolution fails. ztsc resolves file-first, which is right for a
+    /// real declaration file (`declare module "x"` inside a module file is an
+    /// augmentation, and must merge into the resolved module rather than
+    /// replace it) but wrong for a SYNTHETIC opaque `any` module: under
+    /// `allowJs` a JS-only dependency loads as `declare const j: any; export =
+    /// j;` (`paths.js_module_source`), whose placeholder `export =` answered
+    /// first and shadowed the real ambient block declaring the package.
+    ///
+    /// So the precedence flip is scoped to exactly that case — an exact
+    /// (non-pattern) ambient declaration beats a synthetic any-module. A
+    /// synthetic body carries no information, so nothing can be augmenting it
+    /// and nothing is lost by preferring the declaration.
+    fn effectiveModuleFile(l: *Linker, f: *const ProgFile, spec: Atom) ?FileId {
+        const mfile = f.specs.get(spec) orelse return null;
+        if (paths.anyModuleSourceFor(l.files[mfile].path) == null) return mfile;
+        if (l.ambient.contains(spec)) return null;
+        return mfile;
+    }
+
     /// An ambient module whose block yielded no ES-style named exports — it
     /// uses `export =` / `import = require` or the ambient auto-export rule
     /// (top-level `let`/`function` with no `export`), all out of subset. Real
@@ -1427,7 +1453,9 @@ const Linker = struct {
     /// against the on-disk module (if the specifier resolved to a file), then
     /// against an ambient/augmentation module of the same specifier, so
     /// `declare module "spec"` supplies exports for an unresolved specifier and
-    /// augments a resolved one. Diagnostics fire only when the module is known
+    /// augments a resolved one — except when the resolved "file" is a synthetic
+    /// opaque `any` module, where an exactly-named ambient declaration wins
+    /// (see `effectiveModuleFile`). Diagnostics fire only when the module is known
     /// (a real file or an ambient declaration); a wholly unknown specifier is
     /// left to `reportUnresolvedModules` (TS2307).
     fn linkImports(l: *Linker, file: FileId, locals: *std.ArrayList(u32), targets: *std.ArrayList(Target)) Error!void {
@@ -1436,7 +1464,7 @@ const Linker = struct {
             if (rec.kind == .side_effect) continue;
             const local_sym = f.bind.lookupInScope(binder.file_scope, rec.local) orelse continue;
             var tgt: Target = .{ .kind = .any };
-            const mfile_opt = f.specs.get(rec.module);
+            const mfile_opt = l.effectiveModuleFile(f, rec.module);
             const known = mfile_opt != null or l.hasAmbient(rec.module);
             if (known) {
                 const exeq = try l.lookupExportEquals(mfile_opt, rec.module);
