@@ -1739,25 +1739,60 @@ const Checker = struct {
         try c.diags.append(c.gpa, .{ .code = code, .file = c.cur_file, .span = span, .msg = msg });
     }
 
-    /// Withdraw the diagnostics a speculative stretch of checking filed,
-    /// restoring the state a *silent* probe would have left.
+    /// The source region a speculative check is allowed to have spoken about:
+    /// everything a rejected overload candidate says *inside* it is an artifact
+    /// of that candidate and must be withdrawn; everything outside it is
+    /// collateral from work the probe merely happened to trigger and must
+    /// survive. `hi == 0` means "the whole file" (unused today, but it makes an
+    /// empty region unrepresentable).
+    const SpecRegion = struct { file: FileId, lo: u32, hi: u32 };
+
+    /// Withdraw the diagnostics a speculative stretch of checking filed inside
+    /// `spec`, restoring the state a *silent* probe would have left.
     ///
-    /// This is more than `diags.items.len = saved`, because `diagFmt` writes a
-    /// second, permanent record: the (file, code, span-start) key in
-    /// `diag_seen`. Truncating the list alone erases the diagnostic *and keeps
-    /// its suppression*, so the next check of the same expression is swallowed
-    /// forever. A rejected overload candidate contextually types an arrow
-    /// argument, walks its body, files the body's errors, and the truncation
-    /// then poisons every one of those spans against the WINNING candidate's
-    /// re-walk: the body is checked twice and reported zero times, which is
-    /// indistinguishable from never being checked at all.
+    /// Two things make this more than `diags.items.len = saved`.
+    ///
+    /// (1) `diagFmt` writes a second, permanent record: the (file, code,
+    ///     span-start) key in `diag_seen`. Truncating the list alone erases the
+    ///     diagnostic *and keeps its suppression*, so the next check of the same
+    ///     expression is swallowed forever. A rejected overload candidate
+    ///     contextually types an arrow argument, walks its body, files the body's
+    ///     errors, and the truncation then poisons every one of those spans
+    ///     against the WINNING candidate's re-walk: the body is checked twice
+    ///     and reported zero times, which is indistinguishable from never being
+    ///     checked at all.
+    ///
+    /// (2) The probe also drags in work that is not speculative at all. Checking
+    ///     an argument materializes whatever symbols it mentions, and
+    ///     materializing `const f = (…) => {…}` from another file walks that
+    ///     arrow's body — under `no_publish_depth == 0`, so its type IS memoized.
+    ///     Those diagnostics belong to the other file's own check, are produced
+    ///     exactly once, and the blanket truncation deleted them with no second
+    ///     chance: the memo makes sure the body is never walked again. That is
+    ///     how whole top-level bodies (data/encryption.ts's `decryptData`, via a
+    ///     `new Uint8Array(await decryptData(…))` overload probe in data/encode.ts)
+    ///     went unreported. Restricting the withdrawal to `spec` keeps them.
     ///
     /// `instLimitDiag` stores *indices* into `diags`; any pointing into the
     /// window are dropped rather than remapped (the map is empty on nearly every
     /// run — hence the count guard — and a dropped anchor at worst lets a later
     /// trip re-file the file's single TS2589, where the previous code left the
     /// index dangling onto an unrelated diagnostic).
-    fn rollbackDiags(c: *Checker, saved: usize) void {
+    ///
+    /// KNOWN RESIDUAL. A withdrawal is only recoverable if the winning candidate
+    /// re-walks the same expression. It does for the argument itself (the
+    /// contextual type differs per candidate, so `node_types` misses) and for an
+    /// argument that IS a function expression (`no_publish_depth`), but not for
+    /// a function expression nested inside an argument and typed context-free —
+    /// an IIFE, `promises.concat((async () => { … })())`. That body's answer is
+    /// published, so the re-check hits the memo and its diagnostics stay
+    /// withdrawn. One site in the excalidraw corpus (element/image.ts:54 of
+    /// 4166 instrumented arrow bodies). Withholding the whole probed argument
+    /// from `node_types` closes it and was measured: it also adds three excess
+    /// keys — a duplicate whole-argument TS2345 beside its own nested
+    /// elaboration, and two partition-dependent keys including a TS1308 — so it
+    /// is not worth taking on its own.
+    fn rollbackDiags(c: *Checker, saved: usize, spec: SpecRegion) void {
         if (c.diags.items.len == saved) return;
         // `remove` invalidates the iterator, so restart after each hit.
         while (c.inst_diag_at.count() > 0) {
@@ -1771,10 +1806,39 @@ const Checker = struct {
             }
             _ = c.inst_diag_at.remove(stale orelse break);
         }
+        var w = saved;
         for (c.diags.items[saved..]) |d| {
-            _ = c.diag_seen.remove((@as(u128, d.file) << 64) | (@as(u128, d.code) << 32) | d.span.start);
+            if (d.file == spec.file and d.span.start >= spec.lo and
+                (spec.hi == 0 or d.span.start < spec.hi))
+            {
+                _ = c.diag_seen.remove((@as(u128, d.file) << 64) | (@as(u128, d.code) << 32) | d.span.start);
+                continue;
+            }
+            c.diags.items[w] = d;
+            w += 1;
         }
-        c.diags.items.len = saved;
+        c.diags.items.len = w;
+    }
+
+    /// `rollbackDiags` for an overload probe: the speculative region is the
+    /// argument list's own byte range in `file`. Computed here rather than by
+    /// the caller because the span of the last argument is an O(subtree) walk
+    /// and the overwhelmingly common rejection files no diagnostic at all.
+    fn rollbackArgDiags(c: *Checker, saved: usize, file: FileId, arg_nodes: []const Node) void {
+        if (c.diags.items.len == saved) return;
+        // Arguments are in source order, so the region is [start of the first,
+        // end of the last] — one cheap start and one subtree walk, not one per
+        // argument.
+        var first: Node = null_node;
+        var last: Node = null_node;
+        for (arg_nodes) |an| {
+            if (an == null_node) continue;
+            if (first == null_node) first = an;
+            last = an;
+        }
+        // No arguments at all: nothing the candidate said can be about them.
+        if (first == null_node) return;
+        c.rollbackDiags(saved, .{ .file = file, .lo = c.nodeSpanStart(first), .hi = c.nodeSpan(last).end });
     }
 
     fn scopeOf(c: *Checker, node: Node) Error!?ScopeId {
@@ -19862,18 +19926,22 @@ const Checker = struct {
         // back on every rejecting return so only the ACCEPTED candidate's
         // argument diagnostics survive (emitted once here; `checkCallArguments`
         // then cache-hits the same (node, ctx) check without duplicating them).
-        // The rollback MUST go through `rollbackDiags`: dropping the list
-        // entries while leaving their `diag_seen` keys behind suppresses the
-        // winning candidate's re-check of the very same spans, which is what
-        // made whole function bodies read as never checked.
+        // The rollback goes through `rollbackDiags`, which is scoped to the
+        // argument list's own source range: the entries it drops also have to
+        // lose their `diag_seen` keys (or the winning candidate's re-check of
+        // the same spans is swallowed), and the entries it must NOT drop are
+        // the ones a probe merely triggered — a symbol materialization walking
+        // some other declaration's body. Both were "whole function bodies are
+        // never checked".
         const saved_diags = c.diags.items.len;
+        const spec_file = c.cur_file;
         var ai: u32 = 0;
         for (arg_nodes) |an| {
             if (an == null_node) continue;
             defer ai += 1;
             if (c.nodeTag(an) == .spread_element) return true; // don't reject on spreads
             const pt = try c.paramTypeAt(sig, ai) orelse {
-                c.rollbackDiags(saved_diags);
+                c.rollbackArgDiags(saved_diags, spec_file, arg_nodes);
                 return false;
             };
             const tag = c.nodeTag(an);
@@ -19926,7 +19994,7 @@ const Checker = struct {
             };
             if (fn_arg) c.no_publish_depth -= 1;
             if (!try c.isAssignable(at, pt)) {
-                c.rollbackDiags(saved_diags);
+                c.rollbackArgDiags(saved_diags, spec_file, arg_nodes);
                 return false;
             }
         }
