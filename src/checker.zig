@@ -11131,20 +11131,33 @@ const Checker = struct {
                 // structural relation must not invent members a still-generic
                 // map does not have.
                 if (!allow_index) return null;
-                if (!s.mappedHomomorphic(t)) return null;
-                const src = s.mappedSource(t);
-                const bc = try c.transitiveBaseConstraint(src);
-                if (bc == src) return null;
-                const inst = try c.reduceMapped(
-                    s.mappedKeyParam(t),
-                    s.mappedConstraint(t),
-                    s.mappedValue(t),
-                    s.mappedAs(t),
-                    bc,
-                    s.mappedFlags(t),
-                );
-                if (s.kind(inst) == .mapped) return null; // key set still generic
-                return c.propOfTypeEx(inst, name, allow_index);
+                if (s.mappedHomomorphic(t)) {
+                    const src = s.mappedSource(t);
+                    const bc = try c.transitiveBaseConstraint(src);
+                    if (bc == src) return null;
+                    const inst = try c.reduceMapped(
+                        s.mappedKeyParam(t),
+                        s.mappedConstraint(t),
+                        s.mappedValue(t),
+                        s.mappedAs(t),
+                        bc,
+                        s.mappedFlags(t),
+                    );
+                    if (s.kind(inst) == .mapped) return null; // key set still generic
+                    return c.propOfTypeEx(inst, name, allow_index);
+                }
+                // A NON-homomorphic map (`Pick`/`Omit`/`Record` applied to a
+                // generic) defers on its *constraint*, not a source, so the
+                // homomorphic route above cannot reach it and it exposed no
+                // members at all. Its apparent type is the base constraint of
+                // the whole map: `Omit<Partial<T>, "id">` with `T extends Base`
+                // has apparent type `Omit<Partial<Base>, "id">`, which is what
+                // tsc resolves a property access against.
+                const bc = try c.transitiveBaseConstraint(t);
+                if (bc == t) return null;
+                const rbc = try c.resolveStructural(bc);
+                if (s.kind(rbc) == .mapped) return null; // key set still generic
+                return c.propOfTypeEx(rbc, name, allow_index);
             },
             .ref => return c.propOfTypeEx(try c.resolveStructural(t), name, allow_index),
             .class_value => return c.propOfTypeEx(try c.classStaticType(s.classSymbol(t)), name, allow_index),
@@ -15049,6 +15062,17 @@ const Checker = struct {
             .index_access => {
                 try c.collectTypeParamSyms(s.indexAccessObj(t), out);
                 try c.collectTypeParamSyms(s.indexAccessIndex(t), out);
+            },
+            // A deferred mapped type mentions its outer params in any of its
+            // four parts. Without this arm the base constraint of a map was
+            // always the map itself, so a NON-homomorphic generic map
+            // (`Omit`/`Pick`/`Record` over a type param), whose key set is the
+            // constraint and not a source, had no apparent type at all.
+            .mapped => {
+                try c.collectTypeParamSyms(s.mappedConstraint(t), out);
+                try c.collectTypeParamSyms(s.mappedValue(t), out);
+                if (s.mappedAs(t) != 0) try c.collectTypeParamSyms(s.mappedAs(t), out);
+                if (s.mappedSource(t) != 0) try c.collectTypeParamSyms(s.mappedSource(t), out);
             },
             else => {},
         }
