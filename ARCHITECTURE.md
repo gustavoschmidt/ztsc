@@ -199,7 +199,7 @@ vendored, so the script SKIPs (exit 0) when it is absent. The two library
 gates above pass today; this one does not, and that is the point. A package
 from `bench/corpus/real` is small enough that the file partition barely
 splits it, and neither gate reproduces what an application does: excalidraw
-at `--checkers=3` deviates about one run in forty, and about 43 of its ~260
+at `--checkers=3` deviates about one run in forty, and about 43 of its
 diagnostic keys are reported at some checker counts and not others. The
 second number is a direct violation of the contract stated at the top of
 `checker.zig` — a foreign type is materialized on demand in each checker's

@@ -106,10 +106,12 @@ RUNS="${RUNS:-3}"
 MAX_CHECKERS="${MAX_CHECKERS:-8}"
 SOFT="${CONVERGE_SOFT:-0}"
 
-# The ratchet. These are the counts on main at the time this gate was written;
-# they are a ceiling, not a target — every convergence commit lowers them.
-CONVERGE_MAX_EXCESS="${CONVERGE_MAX_EXCESS:-257}"
-CONVERGE_MAX_UNDER="${CONVERGE_MAX_UNDER:-13}"
+# The ratchet, at the default c1..c8 sweep. A ceiling, not a target — every
+# convergence commit lowers it. (Widening MAX_CHECKERS can only raise the union
+# excess, since a false positive counts at any N; raise the ceiling with the
+# sweep or the gate will report a regression that is really a wider net.)
+CONVERGE_MAX_EXCESS="${CONVERGE_MAX_EXCESS:-226}"
+CONVERGE_MAX_UNDER="${CONVERGE_MAX_UNDER:-12}"
 
 echo "== building ztsc (ReleaseFast) =="
 zig build bench >/dev/null
