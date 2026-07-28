@@ -455,7 +455,7 @@ const map_containers = [_][]const u8{
     "fresh_tp_ids",           "fresh_tp_info",      "type_node_cache",
     "atom_cache",             "infer_ids",          "infer_scopes",
     "mapped_key_ids",         "inst_diag_at",       "infer_active",
-    "lazy_member_active",     "chain_guards",
+    "lazy_member_active",     "chain_guards",       "never_isect",
 };
 
 const Checker = struct {
@@ -887,6 +887,9 @@ const Checker = struct {
     /// is being checked (see `pushChainGuards`). Empty everywhere else, so the
     /// narrowing hook costs one length test per reference read.
     chain_guards: std.ArrayListUnmanaged(RefKey) = .empty,
+    /// Memo for `intersectionIsNever` (tsc's `getReducedType`), keyed by the
+    /// intersection type.
+    never_isect: std.AutoHashMapUnmanaged(TypeId, bool) = .empty,
     stats: Stats = .{},
 
     // Well-known atoms (interned once in init).
@@ -11924,6 +11927,9 @@ const Checker = struct {
             else => {},
         }
         if (tk == .never) return sk == .never; // even `any` is not assignable to never
+        // An uninhabited intersection source denotes `never`, which relates to
+        // everything (tsc's `getReducedType`). See `intersectionIsNever`.
+        if (sk == .intersection and try c.intersectionIsNever(s)) return true;
         switch (sk) {
             .any, .err, .never, .none => return true,
             else => {},
@@ -12540,6 +12546,87 @@ const Checker = struct {
         if (t_calls > 0 and !try c.sourceSatisfiesSigs(s, t, false)) return false;
         if (t_constructs > 0 and !try c.sourceSatisfiesSigs(s, t, true)) return false;
         return true;
+    }
+
+    /// tsc's `getReducedType` for an intersection (`isDiscriminantWithNeverType`):
+    /// an intersection is UNINHABITED when two of its constituents declare the
+    /// same required property with unit types that cannot both hold — the
+    /// intersected property type is `never`, so no value can have it.
+    ///
+    /// `distinctUnitIntersectionIsEmpty` (types.zig) is the same rule one level
+    /// down, for an intersection *of* unit types (`"line" & "arrow"`); this is
+    /// the rule for an intersection of OBJECTS that carry such a property.
+    /// `ExcalidrawArrowElement & ExcalidrawTextElement` — what narrowing a
+    /// generic `T extends A | B` by an `x is B` predicate produces — is
+    /// `{ type: "arrow" } & { type: "text" }` and denotes nothing; tsc drops it
+    /// from the union it appears in, so a call passing that union sees only the
+    /// inhabited member. ztsc kept the dead constituent and rejected the call.
+    ///
+    /// Only consulted as a SOURCE (`never` is assignable to everything), so it
+    /// can only remove false positives.
+    fn intersectionIsNever(c: *Checker, t: TypeId) Error!bool {
+        if (c.never_isect.get(t)) |v| return v;
+        // Mark in progress as "inhabited": a property type that recurses back
+        // into this very intersection is not what makes it empty.
+        try c.never_isect.put(c.cm(), t, false);
+        const result = try c.computeIntersectionIsNever(t);
+        try c.never_isect.put(c.cm(), t, result);
+        return result;
+    }
+
+    fn computeIntersectionIsNever(c: *Checker, t: TypeId) Error!bool {
+        var mem: std.ArrayList(TypeId) = .empty;
+        defer mem.deinit(c.scratch());
+        var n_obj: usize = 0;
+        for (try c.memberList(t)) |m| {
+            const rm = try c.resolveStructural(m);
+            switch (c.ts.kind(rm)) {
+                .object => {
+                    n_obj += 1;
+                    try mem.append(c.scratch(), rm);
+                },
+                // A type parameter's members come from its constraint, which is
+                // exactly what makes `T & B` (the branch type of an `x is B`
+                // predicate on a `T extends A`) empty.
+                .type_param, .union_type => try mem.append(c.scratch(), rm),
+                // Anything still unresolved could contribute anything; do not
+                // judge the intersection empty.
+                .mapped, .conditional, .index_access, .err, .any, .unknown => return false,
+                else => {},
+            }
+        }
+        if (mem.items.len < 2 or n_obj == 0) return false;
+        var seen: std.AutoHashMapUnmanaged(Atom, void) = .empty;
+        defer seen.deinit(c.scratch());
+        for (mem.items) |o| {
+            if (c.ts.kind(o) != .object) continue; // candidate names come from real objects
+            for (0..c.ts.objectPropCount(o)) |i| {
+                const p = c.ts.objectProp(o, @intCast(i));
+                // tsc requires the property to be a DISCRIMINANT: at least one
+                // constituent gives it a unit type.
+                if (!isUnitLikeKind(c.ts.kind(try c.ts.regularLiteral(p.ty)))) continue;
+                if ((try seen.getOrPut(c.scratch(), p.name)).found_existing) continue;
+                var parts: std.ArrayList(TypeId) = .empty;
+                defer parts.deinit(c.scratch());
+                var n_decl: usize = 0;
+                // tsc's `getUnionOrIntersectionProperty`: the synthesized
+                // property of an INTERSECTION is optional only when every
+                // declaring constituent declares it optional. `{ type?: "a" } &
+                // { type: "b" }` therefore has a REQUIRED `never` property and
+                // is empty just the same.
+                var all_optional = true;
+                for (mem.items) |o2| {
+                    const p2 = (try c.propOfTypeEx(o2, p.name, false)) orelse continue;
+                    if (p2.flags & types.prop_flag_optional == 0) all_optional = false;
+                    n_decl += 1;
+                    try parts.append(c.scratch(), try c.ts.regularLiteral(p2.ty));
+                }
+                if (all_optional or n_decl < 2) continue;
+                const merged = try c.ts.makeIntersection(c.scratch(), parts.items);
+                if (c.ts.kind(merged) == .never) return true;
+            }
+        }
+        return false;
     }
 
     /// A single literal / null / undefined / unique-symbol — a "unit" type that
