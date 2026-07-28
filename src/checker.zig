@@ -13977,7 +13977,17 @@ const Checker = struct {
             },
             .union_type => {
                 // Check against the union: a property is excess if no
-                // object constituent knows it.
+                // object constituent knows it — unless SOME constituent is
+                // itself an empty object type. tsc's `isEmptyObjectType` is
+                // `some(types, isEmptyObjectType)` over a union, and
+                // `hasExcessProperties` bails on it wholesale, so `T | {}`
+                // (and `T | object`, and `T | <empty interface>`) accepts any
+                // property exactly the way a bare `{}` target does. An empty
+                // *index-signature* constituent like `Record<string, never>`
+                // is not empty and does not bail — it elaborates instead.
+                for (try c.memberList(rt)) |m| {
+                    if (try c.targetIsEmptyish(m)) return;
+                }
             },
             else => return,
         }
@@ -14010,6 +14020,24 @@ const Checker = struct {
                 }
             }
         }
+    }
+
+    /// tsc's `isEmptyObjectType` as `hasExcessProperties` consults it: an
+    /// empty object literal type, the `object` keyword (`TypeFlags.NonPrimitive`
+    /// is unconditionally empty there), or a union with any such constituent.
+    fn targetIsEmptyish(c: *Checker, t: TypeId) Error!bool {
+        const r = try c.resolveStructural(t);
+        return switch (c.ts.kind(r)) {
+            .object => c.isEmptyObjectType(r),
+            .object_keyword => true,
+            .union_type => blk: {
+                for (try c.memberList(r)) |m| {
+                    if (try c.targetIsEmptyish(m)) break :blk true;
+                }
+                break :blk false;
+            },
+            else => false,
+        };
     }
 
     fn targetKnowsProp(c: *Checker, rt: TypeId, key: Atom) Error!bool {
