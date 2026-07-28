@@ -261,6 +261,9 @@ pub fn link(
     for (l.tables) |*t| t.* = .empty;
     for (l.diags) |*d| d.* = .empty;
 
+    // Group the `declare module "spec"` blocks by the file they augment; the
+    // export tables fold each block's new declarations in.
+    try l.indexAugmentations();
     // Build every export table (deterministic file order).
     for (0..files.len) |i| _ = try l.table(@intCast(i));
     // Then the ambient/augmentation module registry, which import
@@ -1022,6 +1025,15 @@ const Linker = struct {
     /// `declare module "spec" { … }` blocks; imports of `"spec"` resolve
     /// against it (after the on-disk module, so it augments a real module).
     ambient: std.AutoArrayHashMapUnmanaged(Atom, std.AutoArrayHashMapUnmanaged(Atom, Target)) = .empty,
+    /// Augmentation index, grouped by the file being augmented: the blocks
+    /// `declare module "spec" { … }` whose `spec` resolves to that file, as
+    /// (augmenting file, `bind.ambient_modules` index) pairs in FileId order.
+    /// `aug_start` has files.len+1 prefix sums. Built by `indexAugmentations`
+    /// before any export table, since `table` folds the blocks' new
+    /// declarations into the augmented module's exports.
+    aug_start: []u32 = &.{},
+    aug_files: []FileId = &.{},
+    aug_blocks: []u32 = &.{},
 
     const visit_limit = 256;
 
@@ -1084,6 +1096,48 @@ const Linker = struct {
         const tree = l.files[file].tree;
         const start = tree.tokens.start(tok);
         return .{ .start = start, .end = scanner.tokenEnd(l.files[file].src, tree.tokens.tag(tok), start) };
+    }
+
+    /// Group every `declare module "spec" { … }` block by the *file* its
+    /// specifier resolves to. Reads only sealed per-file bind data and the
+    /// already-built specifier maps, so it runs before any export table.
+    /// A block whose specifier resolves to no file (a standalone ambient
+    /// module, a wildcard pattern) is not an augmentation of a real module and
+    /// stays with the ambient registry.
+    fn indexAugmentations(l: *Linker) Error!void {
+        const n = l.files.len;
+        const counts = try l.scratch.alloc(u32, n + 1);
+        @memset(counts, 0);
+        for (l.files) |*f| {
+            if (!f.bind.is_module) continue;
+            for (f.bind.ambient_modules) |am| {
+                const mfile = f.specs.get(am.spec) orelse continue;
+                counts[mfile] += 1;
+            }
+        }
+        const start = try l.scratch.alloc(u32, n + 1);
+        var acc: u32 = 0;
+        for (0..n) |i| {
+            start[i] = acc;
+            acc += counts[i];
+        }
+        start[n] = acc;
+        const fill = try l.scratch.alloc(u32, n);
+        @memcpy(fill, start[0..n]);
+        const afiles = try l.scratch.alloc(FileId, acc);
+        const ablocks = try l.scratch.alloc(u32, acc);
+        for (l.files, 0..) |*f, fi| {
+            if (!f.bind.is_module) continue;
+            for (f.bind.ambient_modules, 0..) |am, ai| {
+                const mfile = f.specs.get(am.spec) orelse continue;
+                afiles[fill[mfile]] = @intCast(fi);
+                ablocks[fill[mfile]] = @intCast(ai);
+                fill[mfile] += 1;
+            }
+        }
+        l.aug_start = start;
+        l.aug_files = afiles;
+        l.aug_blocks = ablocks;
     }
 
     /// The flattened export table of `file` (built on demand, cycle-safe).
@@ -1184,6 +1238,41 @@ const Linker = struct {
             }
         }
 
+        // Pass 3: a `declare module "spec" { … }` augmentation's declarations
+        // are exports of the module `spec` resolves to. tsc merges the
+        // augmentation block into the module symbol, so a name the block
+        // *introduces* becomes importable from the module — `import type {
+        // DebounceSettings } from "lodash"` reaches an interface that only
+        // `@types/lodash/common/function.d.ts` declares, and an unqualified
+        // reference from a sibling augmentation block resolves through the
+        // same table.
+        //
+        // Strictly last, and only for names the module does not already
+        // resolve — its own exports, its `export *` re-exports, and the
+        // members of its `export = <namespace>`. A name the module DOES
+        // resolve is a *merge*, not a new export, and belongs to
+        // `mergeAugmentations`, which needs `exportTarget` to still answer
+        // with the real declaration to have something to merge into.
+        if (l.aug_start.len != 0) {
+            const alo = l.aug_start[file];
+            const ahi = l.aug_start[file + 1];
+            for (l.aug_files[alo..ahi], l.aug_blocks[alo..ahi]) |afile, ai| {
+                if (afile == file) continue;
+                const ab = l.files[afile].bind;
+                const am = ab.ambient_modules[ai];
+                const lo = ab.scope_members_start[am.scope];
+                const hi = ab.scope_members_start[am.scope + 1];
+                for (lo..hi) |i| {
+                    const local = ab.member_syms[i];
+                    if (ab.symbol_flags[local].export_default) continue;
+                    const name = ab.member_atoms[i];
+                    if (t.contains(name)) continue;
+                    if (try l.exportEqualsHasMember(t, name)) continue;
+                    try l.put(t, name, try l.finalizeLocal(afile, local, name, false, 0));
+                }
+            }
+        }
+
         l.state[file] = 2;
         return t;
     }
@@ -1246,6 +1335,14 @@ const Linker = struct {
             },
             else => return null,
         }
+    }
+
+    /// True when the module whose (partially built) export table is `t`
+    /// already reaches `name` through its `export = <entity>`. Keeps the
+    /// augmentation pass from shadowing a name the export assignment owns.
+    fn exportEqualsHasMember(l: *Linker, t: *std.AutoArrayHashMapUnmanaged(Atom, Target), name: Atom) Error!bool {
+        const exeq = t.get(l.atom_export_equals) orelse return false;
+        return (try l.exportEqualsMember(exeq, name)) != null;
     }
 
     fn put(l: *Linker, t: *std.AutoArrayHashMapUnmanaged(Atom, Target), name: Atom, tgt: Target) Error!void {
