@@ -1360,22 +1360,36 @@ const Linker = struct {
     /// up in the globals as an exactly-named ambient module (`declare module
     /// "png-chunks-extract"`) BEFORE it consults the resolved file; only
     /// *pattern* ambient modules (`declare module "*.css"`) are consulted
-    /// after resolution fails. ztsc resolves file-first, which is right for a
-    /// real declaration file (`declare module "x"` inside a module file is an
-    /// augmentation, and must merge into the resolved module rather than
-    /// replace it) but wrong for a SYNTHETIC opaque `any` module: under
-    /// `allowJs` a JS-only dependency loads as `declare const j: any; export =
-    /// j;` (`paths.js_module_source`), whose placeholder `export =` answered
-    /// first and shadowed the real ambient block declaring the package.
+    /// after resolution fails. ztsc resolves file-first, which is right when
+    /// the resolved file is itself a module — `declare module "x"` inside a
+    /// module file is an *augmentation*, and must merge into the module it
+    /// names rather than replace it. It is wrong in the two cases below, and
+    /// the precedence flip is scoped to exactly those, so no augmentation can
+    /// be turned into a replacement.
     ///
-    /// So the precedence flip is scoped to exactly that case — an exact
-    /// (non-pattern) ambient declaration beats a synthetic any-module. A
-    /// synthetic body carries no information, so nothing can be augmenting it
-    /// and nothing is lost by preferring the declaration.
-    fn effectiveModuleFile(l: *Linker, f: *const ProgFile, spec: Atom) ?FileId {
+    /// 1. A SYNTHETIC opaque `any` module. Under `allowJs` a JS-only
+    ///    dependency loads as `declare const j: any; export = j;`
+    ///    (`paths.js_module_source`), and that placeholder `export =` answered
+    ///    the import before the real ambient block declaring the package.
+    ///
+    /// 2. A resolved file that is a *script*, not a module (`bind.is_module`
+    ///    false: no top-level import/export). `open-color` is the shape — its
+    ///    `"types"` points at `open-color.d.ts`, whose entire content is a
+    ///    global `declare module 'open-color' { … }` block. Resolving it made
+    ///    the specifier "known" while the file itself declared no module, and
+    ///    the block's own `export default` record leaked into the file's export
+    ///    table as a target that types `any`. A script has no module exports to
+    ///    augment, so preferring the declaration loses nothing; it is also
+    ///    exactly what tsc does, since a script's symbol is not a module symbol
+    ///    for `resolveExternalModuleName` to return.
+    ///
+    /// Both are keyed on an EXACT ambient name; a pattern module
+    /// (`declare module "*.css"`) is left where tsc puts it, after resolution.
+    fn effectiveModuleFile(l: *Linker, f: *const ProgFile, spec: Atom) Error!?FileId {
         const mfile = f.specs.get(spec) orelse return null;
-        if (paths.anyModuleSourceFor(l.files[mfile].path) == null) return mfile;
-        if (l.ambient.contains(spec)) return null;
+        if (!l.ambient.contains(spec)) return mfile;
+        if (paths.anyModuleSourceFor(l.files[mfile].path) != null) return null;
+        if (!l.files[mfile].bind.is_module) return null;
         return mfile;
     }
 
@@ -1450,7 +1464,7 @@ const Linker = struct {
             const stripped = stripQuotes(text);
             if (stripped.len == 0) continue;
             const atom = l.interner.intern(l.io, l.gpa, stripped) catch return Error.OutOfMemory;
-            if (l.effectiveModuleFile(f, atom)) |mfile| {
+            if (try l.effectiveModuleFile(f, atom)) |mfile| {
                 // Resolved. The one thing left to say about it: a dependency
                 // that turned out to be plain JavaScript has no types, and
                 // under `noImplicitAny` that is an error at the specifier.
@@ -1511,7 +1525,7 @@ const Linker = struct {
             if (rec.kind == .side_effect) continue;
             const local_sym = f.bind.lookupInScope(binder.file_scope, rec.local) orelse continue;
             var tgt: Target = .{ .kind = .any };
-            const mfile_opt = l.effectiveModuleFile(f, rec.module);
+            const mfile_opt = try l.effectiveModuleFile(f, rec.module);
             const known = mfile_opt != null or l.hasAmbient(rec.module);
             if (known) {
                 const exeq = try l.lookupExportEquals(mfile_opt, rec.module);
