@@ -854,6 +854,18 @@ const Checker = struct {
     /// a side query also turns `any` into an inference wildcard and swallows
     /// diagnostics, both of which change which overload is picked.
     no_publish_depth: u32 = 0,
+    /// Contravariant inference candidates for the in-flight call, one per type
+    /// parameter — tsc's `InferenceInfo.contraCandidates`. `contra_owner` is
+    /// the identity of the covariant accumulator they belong to, so the many
+    /// other arrays `unify` is handed (a reverse-mapped element, a speculative
+    /// copy, a generic argument's own type params) simply do not participate.
+    /// Saved and restored around a nested call's inference.
+    contra_cands: []TypeId = &.{},
+    contra_owner: ?[*]TypeId = null,
+    /// Parameter-position nesting depth inside `unify`: odd means the current
+    /// inference position is contravariant. tsc flips the same bit in
+    /// `inferFromContravariantTypes` when it descends a signature's parameters.
+    contra_pos: u32 = 0,
     /// Set while checking the operand of an `expr as const` const
     /// assertion: object/array literals produce readonly, non-widened,
     /// literal-typed members (recursively). Cleared at function bodies.
@@ -17027,6 +17039,24 @@ const Checker = struct {
         const candidates = try c.scratch().alloc(TypeId, tp_syms.len);
         for (candidates) |*x| x.* = types.no_type;
 
+        // The contravariant half of the candidate set (tsc's
+        // `InferenceInfo.contraCandidates`), registered against `candidates` so
+        // `unify` can find it and every other accumulator it is handed cannot.
+        // A nested call's inference gets its own, and starts at variance zero.
+        const contra = try c.scratch().alloc(TypeId, tp_syms.len);
+        for (contra) |*x| x.* = types.no_type;
+        const saved_contra_cands = c.contra_cands;
+        const saved_contra_owner = c.contra_owner;
+        const saved_contra_pos = c.contra_pos;
+        c.contra_cands = contra;
+        c.contra_owner = candidates.ptr;
+        c.contra_pos = 0;
+        defer {
+            c.contra_cands = saved_contra_cands;
+            c.contra_owner = saved_contra_owner;
+            c.contra_pos = saved_contra_pos;
+        }
+
         // This call's inference variables are in flight for the whole of it —
         // see `infer_active`. A NESTED call's contextual-return inference must
         // not adopt one of them as a candidate.
@@ -17257,6 +17287,16 @@ const Checker = struct {
         for (echo_any) |*x| x.* = types.no_type;
         const placeheld = try c.scratch().alloc(bool, tp_syms.len);
         const before = try c.scratch().alloc(TypeId, tp_syms.len);
+        // The contravariant twin of the placeholder echo. The callback's
+        // parameters are typed from `partial`, so its parameter types come back
+        // as whatever we just put in — and a parameter position is exactly
+        // where a contravariant candidate is read. `reduce((acc, x) => acc + x,
+        // 0)` would hand `acc` the seed's `0`, read `0` straight back as a
+        // contravariant candidate, and then reject the covariant `number` for
+        // not being a subtype of it. A candidate identical to the type we fed
+        // the argument is our own guess coming home, not evidence.
+        const fed = try c.scratch().alloc(TypeId, tp_syms.len);
+        const before_contra = try c.scratch().alloc(TypeId, tp_syms.len);
         ai = 0;
         for (arg_nodes) |an| {
             if (an == null_node) continue;
@@ -17267,10 +17307,15 @@ const Checker = struct {
             for (partial, 0..) |p, i| {
                 placeheld[i] = !seeded[i] and p.ty == types.any_type;
                 before[i] = candidates[i];
+                fed[i] = p.ty;
+                before_contra[i] = contra[i];
             }
             const pt_partial = try c.partialParamCtx(pt0, partial);
             const at = try c.checkExprCached(an, pt_partial);
             try c.unify(pt0, at, tp_syms, candidates, 0);
+            for (contra, 0..) |*cc, i| {
+                if (cc.* != before_contra[i] and cc.* == fed[i]) cc.* = before_contra[i];
+            }
             // Placeholder echo. A parameter with no candidate yet stands in as
             // `any` in this argument's contextual type, so a callback that
             // merely passes that value through infers `any` straight back —
@@ -17316,6 +17361,22 @@ const Checker = struct {
         // from the expected `FeatureCollection<Polygon | MultiPolygon>` instead
         // of falling back to `G`'s constraint (the whole `Geometry` union).
         try c.fillFromReturnContext(sig, tp_syms, ret_ctx, candidates, false);
+        // Contravariant candidates outrank covariant ones (tsc's
+        // `getInferredType`): the covariant inference survives only when it is
+        // not `never` AND is a subtype of the contravariant one — that is, when
+        // every parameter position the type variable appears in would still
+        // accept it. Otherwise the parameter takes the contravariant candidates'
+        // common subtype, which is the narrowest type all of those positions
+        // can be fed. Without the split, a callback's parameter type was
+        // unioned into the same accumulator as the value the call actually
+        // produces, and the union then satisfied neither.
+        for (candidates, 0..) |*cd, i| {
+            const ct = contra[i];
+            if (ct == types.no_type) continue;
+            if (cd.* != types.no_type and c.ts.kind(cd.*) != .never and
+                try c.covSubtypeOf(cd.*, ct)) continue;
+            cd.* = ct;
+        }
         // A provisional map over the raw candidates, so an inter-dependent
         // constraint (`K extends keyof T`) is checked with the *other*
         // params already substituted — `keyof T` becomes `keyof {…}` before the
@@ -17581,6 +17642,25 @@ const Checker = struct {
         return res;
     }
 
+    /// Combine two contravariant inference candidates: tsc's
+    /// `getCommonSubtype`, `reduceLeft((s, t) => isTypeSubtypeOf(t, s) ? t : s)`
+    /// — the mirror of the covariant fold, keeping the leftmost candidate that
+    /// nothing to its right is a subtype of.
+    fn combineContravariant(c: *Checker, prev: TypeId, cand: TypeId) Error!TypeId {
+        if (prev == cand) return prev;
+        return if (try c.covSubtypeOf(cand, prev)) cand else prev;
+    }
+
+    /// The contravariant candidate slot for type parameter `i`, when the
+    /// current inference position is a parameter position AND `candidates` is
+    /// the accumulator the in-flight call registered.
+    fn contraSlot(c: *Checker, candidates: []TypeId, i: usize) ?*TypeId {
+        if (c.contra_pos % 2 == 0) return null;
+        if (c.contra_owner != candidates.ptr) return null;
+        if (c.contra_cands.len != candidates.len) return null;
+        return &c.contra_cands[i];
+    }
+
     fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, candidates: []TypeId, depth: u32) Error!void {
         if (depth > 16) return;
         const s = &c.ts;
@@ -17606,6 +17686,13 @@ const Checker = struct {
             .type_param => {
                 if (tpIndex(tp_syms, s.typeParamSymbol(param))) |i| {
                     const cand = arg;
+                    // A candidate found in a PARAMETER position is
+                    // contravariant evidence and is kept apart from the
+                    // covariant set (tsc's `inferFromContravariantTypes`).
+                    if (c.contraSlot(candidates, i)) |slot| {
+                        slot.* = if (slot.* == types.no_type) cand else try c.combineContravariant(slot.*, cand);
+                        return;
+                    }
                     if (candidates[i] == types.no_type) {
                         candidates[i] = cand;
                     } else {
@@ -17986,8 +18073,18 @@ const Checker = struct {
                     }
                 }
                 const n = @min(s.fnParamCount(param), s.fnParamCount(ra));
-                for (0..n) |i| {
-                    try c.unify(s.fnParam(param, @intCast(i)).ty, s.fnParam(ra, @intCast(i)).ty, tp_syms, candidates, depth + 1);
+                {
+                    // Parameters are a contravariant position — unless the
+                    // signature was written as a METHOD, whose parameters tsc
+                    // relates bivariantly and infers from covariantly.
+                    const bivariant = s.fnFlags(param) & types.fn_flag_method != 0;
+                    if (!bivariant) c.contra_pos += 1;
+                    defer if (!bivariant) {
+                        c.contra_pos -= 1;
+                    };
+                    for (0..n) |i| {
+                        try c.unify(s.fnParam(param, @intCast(i)).ty, s.fnParam(ra, @intCast(i)).ty, tp_syms, candidates, depth + 1);
+                    }
                 }
                 try c.unify(s.fnReturn(param), s.fnReturn(ra), tp_syms, candidates, depth + 1);
                 // Infer type params from the *predicate guard* too:
