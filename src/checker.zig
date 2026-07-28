@@ -20191,10 +20191,16 @@ const Checker = struct {
         return false;
     }
 
-    /// Is narrowing worth running for this declared type?
+    /// Is narrowing worth running for this declared type? `any` *is* narrowable
+    /// — tsc's `narrowTypeByTypeof` opens with `isTypeAny(type)` and its
+    /// `Array.isArray`/type-predicate guards apply to it too, so
+    /// `if (typeof d !== "string") return undefined; return d;` on `d: any`
+    /// returns `string | undefined`, not `any`. Only the types no guard can
+    /// refine stay out (`assignmentReduced` already leaves an `any` declared
+    /// type alone, so an assignment still cannot narrow it).
     fn isNarrowable(c: *Checker, declared: TypeId) bool {
         return switch (c.ts.kind(declared)) {
-            .any, .err, .never, .void, .none => false,
+            .err, .never, .void, .none => false,
             else => true,
         };
     }
@@ -21758,10 +21764,16 @@ const Checker = struct {
             return result;
         }
         if (sense) {
-            if (try c.isAssignable(t, instance)) return t;
-            if (try c.isAssignable(instance, t)) return instance;
+            // tsc's `getNarrowedTypeWorker` opens with
+            // `if (type.flags & AnyOrUnknown) return candidate` — an `any`
+            // subject takes the guard's type outright. This has to come before
+            // the assignability tests: `any` is assignable to everything, so
+            // the first of them would otherwise keep `any` and drop the guard
+            // (`Array.isArray(x)` on `any` never yielding `any[]`).
             const k = c.ts.kind(t);
             if (k == .any or k == .unknown or k == .err) return instance;
+            if (try c.isAssignable(t, instance)) return t;
+            if (try c.isAssignable(instance, t)) return instance;
             // Unrelated `t` and guard `C`: tsc narrows to the intersection
             // `t & C` (e.g. `Array.isArray(s)` with `s: string` → `string &
             // any[]`, which carries the array members; disjoint primitives
