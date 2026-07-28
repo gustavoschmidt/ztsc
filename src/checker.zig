@@ -20869,7 +20869,18 @@ const Checker = struct {
                         return c.narrowByInProp(t, c.ts.literalAtom(rl), sense);
                     },
                     .keyword_instanceof => {
-                        if (!try c.refMatches(d.lhs, key)) return t;
+                        if (!try c.refMatches(d.lhs, key)) {
+                            // `a?.b instanceof C` being true implies the chain
+                            // did not short-circuit, so its receivers are not
+                            // nullish — the same optional-chain containment rule
+                            // the truthiness arms above apply, and the reason
+                            // `if (cached?.image instanceof Promise) await
+                            // cached.image;` is legal. False says nothing.
+                            if (sense and try c.optionalChainContainsRef(d.lhs, key)) {
+                                return c.nonNullable(t);
+                            }
+                            return t;
+                        }
                         const rt = try c.checkExprCached(d.rhs, types.no_type);
                         if (try c.instanceofInstanceType(rt)) |inst|
                             return c.narrowByInstance(t, inst, sense);
