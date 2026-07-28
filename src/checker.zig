@@ -16969,6 +16969,40 @@ const Checker = struct {
                                     for (0..n) |i| try sigs.append(c.scratch(), c.ts.objectCallSig(rm, @intCast(i)));
                                 }
                             },
+                            // A union member that is itself an INTERSECTION —
+                            // `Window & typeof globalThis` is the canonical one
+                            // — is callable when one of ITS members is, exactly
+                            // as the top-level intersection walk above decides.
+                            // Without this arm `(Document | (Window & typeof
+                            // globalThis)).addEventListener` was judged
+                            // non-callable and the whole optional call reported
+                            // TS2349.
+                            .intersection => {
+                                var member_callable = false;
+                                for (try c.memberList(rm)) |im| {
+                                    const ri = try c.resolveStructural(im);
+                                    switch (c.ts.kind(ri)) {
+                                        .function => {
+                                            try sigs.append(c.scratch(), ri);
+                                            member_callable = true;
+                                        },
+                                        .overloads => {
+                                            for (try c.memberList(ri)) |mm| try sigs.append(c.scratch(), mm);
+                                            member_callable = true;
+                                        },
+                                        .object => {
+                                            const n = c.ts.objectCallSigCount(ri);
+                                            if (n != 0) {
+                                                for (0..n) |i| try sigs.append(c.scratch(), c.ts.objectCallSig(ri, @intCast(i)));
+                                                member_callable = true;
+                                            }
+                                        },
+                                        else => {},
+                                    }
+                                    if (member_callable) break;
+                                }
+                                if (!member_callable) all_callable = false;
+                            },
                             else => all_callable = false,
                         }
                     }
