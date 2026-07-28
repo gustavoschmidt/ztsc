@@ -11818,6 +11818,14 @@ const Checker = struct {
         return switch (s.kind(t)) {
             .null, .undefined, .void, .bool_false => types.never_type,
             .boolean => types.true_type,
+            // A truthy naked type parameter is `T & {}` — tsc's
+            // `getAdjustedTypeWithFacts` maps the `Truthy` facts over the type
+            // and replaces any constituent that can be nullish with
+            // `NonNullable<…>`. Without it `<T extends P | null>(p: T)` guarded
+            // by `if (p)` still sees the nullish constraint and reports every
+            // member access on it. `nonNullable` builds the same marker the
+            // intersection arm of `propOfTypeEx` already consumes.
+            .type_param => try c.nonNullable(t),
             .string_literal => if (c.atomText(s.literalAtom(t)).len == 0) types.never_type else t,
             .number_literal, .number_literal_fresh => if (s.numberValue(t) == 0) types.never_type else t,
             .bigint_literal => blk: {
