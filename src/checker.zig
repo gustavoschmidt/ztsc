@@ -16097,9 +16097,21 @@ const Checker = struct {
                     const raw = try c.checkExprCached(pd.lhs, types.no_type);
                     const st = try c.resolveStructural(if (prop == dist_node) dist_ty else raw);
                     if (c.ts.kind(st) == .any or c.ts.kind(st) == .err) spread_any = true;
-                    if (c.ts.kind(st) == .type_param) {
-                        try generic_spreads.append(c.scratch(), st);
-                        continue;
+                    // tsc's `getSpreadType`: when either side `isGenericObject
+                    // Type` the spread is an INTERSECTION, not a flattened
+                    // object — the generic half has no members to copy yet, and
+                    // keeping its identity is what makes `{ ...updates, x }`
+                    // assignable back to `updates`'s own (still deferred) type.
+                    // A bare type parameter was already handled this way; a
+                    // deferred mapped type / indexed access / conditional
+                    // contributed NOTHING at all, so the literal lost every
+                    // property the spread carried.
+                    switch (c.ts.kind(st)) {
+                        .type_param, .mapped, .index_access, .conditional => {
+                            try generic_spreads.append(c.scratch(), st);
+                            continue;
+                        },
+                        else => {},
                     }
                     try c.gatherSpreadProps(st, &props, &prop_index, &str_index_vals, &num_index_vals);
                 },
