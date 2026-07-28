@@ -3053,7 +3053,12 @@ const Checker = struct {
         const nb = c.symBind(ns_sym);
         const ns = nb.namespaceScopeOf(c.localOf(ns_sym)) orelse return null;
         const local = nb.lookupInScope(ns, name) orelse return null;
-        return c.toGlobalIn(c.symFile(ns_sym), local);
+        // Route through the cross-file merge index, like `targetTypeSym`: a
+        // member of an `export = <namespace>` module reached as `ns.I` may be
+        // the real half of a `declare module` augmentation merge, and the
+        // file-local declaration alone carries none of the augmented members.
+        const g = c.toGlobalIn(c.symFile(ns_sym), local);
+        return c.prog.mergedOf(g) orelse g;
     }
 
     /// If namespace scope `s` belongs to a symbol that is a cross-file merge

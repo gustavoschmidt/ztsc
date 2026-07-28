@@ -300,7 +300,7 @@ pub fn link(
     // every file's harvest slice and every `declare module` augmentation of a
     // resolved real module. Needs the sealed export tables (`out`).
     const sym_base = try computeSymBase(arena, files);
-    const gm = try mergeGlobals(arena, scratch, files, sym_base, out);
+    const gm = try mergeGlobals(arena, scratch, files, sym_base, out, l.atom_export_equals);
 
     // Seal the ambient module export tables in registry order, so
     // `Target.ambient_ns` payloads (assigned from `getIndex`) address them.
@@ -365,7 +365,7 @@ pub fn singleWithLibProgram(
     // Unlinked single-file path: a script user file may still augment lib
     // globals; merge diagnostics (none for the clean case) have no link table
     // to land in here and are dropped.
-    const gm = try mergeGlobals(arena, arena, files, sym_base, &.{});
+    const gm = try mergeGlobals(arena, arena, files, sym_base, &.{}, 0);
     return .{ .files = files, .sym_base = sym_base, .globals = gm.globals, .merged = gm.merged, .constit_keys = gm.constit_keys, .constit_vals = gm.constit_vals };
 }
 
@@ -700,6 +700,7 @@ fn mergeGlobals(
     files: []const ProgFile,
     sym_base: []const u32,
     links: []const FileLinks,
+    export_equals_atom: Atom,
 ) Error!GlobalMerge {
     // Accumulate name -> constituent global ids in TWO passes over the files,
     // each pass in FileId order: first every *script*'s own top level, then
@@ -755,7 +756,7 @@ fn mergeGlobals(
     // Cross-file module augmentation merge: fold a `declare module
     // "spec" { interface I { … } }` block (in a MODULE-context file) into the
     // interface `I` already exported by the real module `spec` resolves to.
-    try mergeAugmentations(&m, files, sym_base, links);
+    try mergeAugmentations(&m, files, sym_base, links, export_equals_atom);
 
     if (m.merged.items.len == 0) return .{ .globals = globals };
 
@@ -800,6 +801,7 @@ fn mergeAugmentations(
     files: []const ProgFile,
     sym_base: []const u32,
     links: []const FileLinks,
+    export_equals_atom: Atom,
 ) Error!void {
     if (links.len != files.len) return; // unlinked path: no export tables
 
@@ -827,7 +829,9 @@ fn mergeAugmentations(
                 const lf_flags = b.symbol_flags[local];
                 if (!lf_flags.interface and !lf_flags.namespace_decl) continue;
                 const name = b.member_atoms[i];
-                const tgt = links[mfile].exportTarget(name) orelse continue;
+                const tgt = links[mfile].exportTarget(name) orelse
+                    exportEqualsMemberTarget(files, links, mfile, export_equals_atom, name) orelse
+                    continue;
                 if (tgt.kind != .binding) continue;
                 const real = sym_base[tgt.file] + tgt.payload;
                 // The real export may be an interface (interface↔interface
@@ -862,6 +866,46 @@ fn mergeAugmentations(
         parts[0] = real;
         @memcpy(parts[1..], augs);
         _ = try m.mergeSet(parts);
+    }
+}
+
+/// Member `name` of the entity a module exports with `export = <entity>`, read
+/// off the *sealed* link tables (`mergeAugmentations` runs after the linker has
+/// finished, so `Linker.exportEqualsMember` is out of reach). Two container
+/// shapes, exactly as the linker's version: a namespace `.binding` (look the
+/// name up in that symbol's body scope) and a whole module-namespace object
+/// (look it up in that module's export table).
+///
+/// This is what makes an augmentation of a DefinitelyTyped-shaped package
+/// (`export = _; declare const _: _.LoDashStatic; declare namespace _ {
+/// interface LoDashStatic {} }`) merge at all: `LoDashStatic` is not an export
+/// of the module — it is a member of the export-assigned namespace — so a
+/// direct `exportTarget` lookup misses and every `declare module "../index" {
+/// interface LoDashStatic { … } }` block was silently dropped.
+fn exportEqualsMemberTarget(
+    files: []const ProgFile,
+    links: []const FileLinks,
+    mfile: FileId,
+    export_equals_atom: Atom,
+    name: Atom,
+) ?Target {
+    if (export_equals_atom == 0) return null;
+    const exeq = links[mfile].exportTarget(export_equals_atom) orelse return null;
+    switch (exeq.kind) {
+        .binding => {
+            const b = files[exeq.file].bind;
+            const ns = b.namespaceScopeOf(exeq.payload) orelse return null;
+            const local = b.lookupInScope(ns, name) orelse return null;
+            // An imported member re-exported out of the namespace body: follow
+            // the import binding to its defining declaration.
+            if (b.symbol_flags[local].import_binding) {
+                const t = links[exeq.file].importTarget(local) orelse return null;
+                return t;
+            }
+            return .{ .kind = .binding, .file = exeq.file, .payload = local, .type_only = exeq.type_only };
+        },
+        .namespace => return links[exeq.file].exportTarget(name),
+        else => return null,
     }
 }
 
