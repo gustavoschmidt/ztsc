@@ -15809,15 +15809,27 @@ const Checker = struct {
                 const falsy = try c.getFalsyPart(lt, false);
                 return c.logicalUnion(falsy, rt);
             },
+            // `||` and `??` hand their RIGHT operand the LEFT operand's type as
+            // its contextual type when the expression has none of its own
+            // (tsc's `getContextualTypeForBinaryOperand`). A fallback is written
+            // to stand in for the thing on the left, so the thing on the left is
+            // what shapes it: `last || { type: "selection" }` keeps the literal
+            // `"selection"` because `last`'s `type` admits it. Without the
+            // context the property widens to `string`, the fallback becomes a
+            // SUPERTYPE of the left operand, and the union reduction that
+            // follows collapses the whole expression into it — losing every
+            // property the left operand had. `&&` is asymmetric here (tsc
+            // forwards only an outer contextual type to its right operand)
+            // because its right operand is not a stand-in for its left.
             .pipe_pipe => {
                 const lt = try c.checkExprCached(d.lhs, types.no_type);
-                const rt = try c.checkExprCached(d.rhs, ctx);
+                const rt = try c.checkExprCached(d.rhs, if (ctx == types.no_type) lt else ctx);
                 const truthy = try c.getTruthyPart(lt);
                 return c.logicalUnion(truthy, rt);
             },
             .question_question => {
                 const lt = try c.checkExprCached(d.lhs, types.no_type);
-                const rt = try c.checkExprCached(d.rhs, ctx);
+                const rt = try c.checkExprCached(d.rhs, if (ctx == types.no_type) lt else ctx);
                 return c.logicalUnion(try c.nonNullable(lt), rt);
             },
             .plus => {
