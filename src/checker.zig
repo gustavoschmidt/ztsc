@@ -11267,13 +11267,30 @@ const Checker = struct {
             .array, .tuple, .string, .string_literal, .template_literal_type, .string_mapping => {
                 if (name == c.atom_length) {
                     if (s.kind(t) == .tuple) {
-                        var has_var = false;
-                        for (0..s.tupleLen(t)) |i| {
+                        // tsc: a tuple with no rest element has a LITERAL length
+                        // — the union of every arity it admits, so `[a: number,
+                        // b?: string]["length"]` is `1 | 2` and `[a?: number]`
+                        // is `0 | 1`. Only a rest element makes it `number`.
+                        // Collapsing an optional tuple to `number` broke every
+                        // `Parameters<F>["length"] extends 0 | 1 ? … : never`
+                        // arity guard: the conditional took the false branch and
+                        // the parameter became `never`.
+                        var has_rest = false;
+                        var required: usize = 0;
+                        const total = s.tupleLen(t);
+                        for (0..total) |i| {
                             const e = s.tupleElem(t, @intCast(i));
-                            if (e.optional() or e.rest()) has_var = true;
+                            if (e.rest()) has_rest = true;
+                            if (!e.optional() and !e.rest()) required = i + 1;
                         }
-                        if (!has_var) {
-                            return .{ .name = name, .ty = try s.makeNumberLiteral(@floatFromInt(s.tupleLen(t)), false), .flags = types.prop_flag_readonly };
+                        if (!has_rest) {
+                            var lens: std.ArrayList(TypeId) = .empty;
+                            defer lens.deinit(c.scratch());
+                            var n = required;
+                            while (n <= total) : (n += 1) {
+                                try lens.append(c.scratch(), try s.makeNumberLiteral(@floatFromInt(n), false));
+                            }
+                            return .{ .name = name, .ty = try s.makeUnion(c.scratch(), lens.items), .flags = types.prop_flag_readonly };
                         }
                     }
                     // `Array<T>.length` is *writable* in tsc (`arr.length = 0`
