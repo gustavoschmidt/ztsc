@@ -11428,6 +11428,66 @@ const Checker = struct {
         };
     }
 
+    /// Can a value of `t` be falsy? tsc asks this (`getTypeFacts(left,
+    /// TypeFacts.Falsy)`) before building the `||` result: when the answer is
+    /// no the right operand is unreachable and the result is just the left
+    /// operand's type, with no union and no reduction. Undecidable shapes —
+    /// `any`, a bare type parameter, an unresolved conditional — answer "yes",
+    /// which keeps the union ztsc built before.
+    fn canBeFalsy(c: *Checker, t: TypeId, depth: u32) Error!bool {
+        if (depth > 8) return true;
+        const s = &c.ts;
+        switch (s.kind(t)) {
+            .union_type => {
+                for (try c.memberList(t)) |m| {
+                    if (try c.canBeFalsy(m, depth + 1)) return true;
+                }
+                return false;
+            },
+            // One always-truthy constituent makes the whole intersection so.
+            .intersection => {
+                for (try c.memberList(t)) |m| {
+                    if (!try c.canBeFalsy(m, depth + 1)) return false;
+                }
+                return true;
+            },
+            .object, .array, .tuple, .function, .overloads, .class_value, .bool_true, .symbol, .unique_symbol, .object_keyword => return false,
+            .string_literal => return c.atomText(s.literalAtom(t)).len == 0,
+            .number_literal, .number_literal_fresh => return s.numberValue(t) == 0,
+            .bigint_literal => return isZeroBigInt(c.atomText(s.literalAtom(t))),
+            .ref, .this_type => {
+                const r = try c.resolveStructural(t);
+                if (r == t) return true;
+                return c.canBeFalsy(r, depth + 1);
+            },
+            else => return true,
+        }
+    }
+
+    /// Can a value of `t` be `null` or `undefined`? The `??` counterpart of
+    /// `canBeFalsy` (tsc's `getTypeFacts(left, TypeFacts.EQUndefinedOrNull)`):
+    /// `a ?? b` is just `a`'s type when the answer is no. `void` counts — it
+    /// admits `undefined` — and undecidable shapes again answer "yes".
+    fn canBeNullish(c: *Checker, t: TypeId, depth: u32) Error!bool {
+        if (depth > 8) return true;
+        switch (c.ts.kind(t)) {
+            .null, .undefined, .void, .any, .unknown, .err, .type_param => return true,
+            .union_type, .intersection => {
+                for (try c.memberList(t)) |m| {
+                    if (try c.canBeNullish(m, depth + 1)) return true;
+                }
+                return false;
+            },
+            .ref, .this_type => {
+                const r = try c.resolveStructural(t);
+                if (r == t) return true;
+                return c.canBeNullish(r, depth + 1);
+            },
+            .conditional, .infer_var, .mapped_param => return true,
+            else => return false,
+        }
+    }
+
     fn isZeroBigInt(text: []const u8) bool {
         for (text) |ch| {
             if (ch >= '1' and ch <= '9') return false;
@@ -15853,10 +15913,17 @@ const Checker = struct {
         const d = c.tree.nodeData(node);
         const op = c.tree.tokens.tag(c.tree.nodeMainToken(node));
         switch (op) {
+            // A guard that cannot fail contributes no union: tsc consults
+            // `getTypeFacts` on the left operand first and returns its type
+            // outright when the right operand is unreachable. `x || {}` where
+            // `x` is an object type is `x` — not `x | {}`, which is how a
+            // fallback written for a nullable case that no longer exists ends
+            // up in the type of every use of the result.
             .amp_amp => {
                 const lt = try c.checkExprCached(d.lhs, types.no_type);
                 const rt = try c.checkExprCached(d.rhs, ctx);
                 const falsy = try c.getFalsyPart(lt, false);
+                if (try c.getTruthyPart(lt) == types.never_type) return lt;
                 return c.logicalUnion(falsy, rt);
             },
             // `||` and `??` hand their RIGHT operand the LEFT operand's type as
@@ -15875,11 +15942,13 @@ const Checker = struct {
                 const lt = try c.checkExprCached(d.lhs, types.no_type);
                 const rt = try c.checkExprCached(d.rhs, if (ctx == types.no_type) lt else ctx);
                 const truthy = try c.getTruthyPart(lt);
+                if (!try c.canBeFalsy(lt, 0)) return lt;
                 return c.logicalUnion(truthy, rt);
             },
             .question_question => {
                 const lt = try c.checkExprCached(d.lhs, types.no_type);
                 const rt = try c.checkExprCached(d.rhs, if (ctx == types.no_type) lt else ctx);
+                if (!try c.canBeNullish(lt, 0)) return lt;
                 return c.logicalUnion(try c.nonNullable(lt), rt);
             },
             .plus => {
