@@ -12380,6 +12380,22 @@ const Checker = struct {
             return false;
         }
         if (tk == .intersection) {
+            // An intersection SOURCE that still carries a `null`/`undefined`
+            // constituent — i.e. one the nullish rule could not reduce to
+            // `never`, because its other constituent is instantiable
+            // (`null & T`) — does not satisfy an intersection TARGET. tsc
+            // relates a source to each constituent of an intersection target
+            // with `IntersectionState.Target`, which stops the source
+            // intersection from being accepted through a single constituent;
+            // the nullish half contributes no members, so the target's members
+            // go unmatched (TS2740). A plain object target is NOT affected —
+            // tsc accepts `null & T` there, reaching `T`'s constraint — and
+            // neither is a source whose nullish half made it `never`, which the
+            // fast path above already accepted.
+            if (sk == .intersection) {
+                if (try c.hasNullishMember(s)) return false;
+                if (try c.intersectionPairAssignable(s, t)) |r| return r;
+            }
             for (try c.memberList(t)) |m| {
                 if (!try c.isAssignable(s, m)) return false;
             }
@@ -12835,7 +12851,96 @@ const Checker = struct {
         return result;
     }
 
+    /// An intersection SOURCE against an intersection TARGET: tsc compares the
+    /// two MERGED (apparent) property sets, so a name declared by more than one
+    /// target constituent is demanded at the INTERSECTION of its declarations —
+    /// `Event & { target: HTMLElement }` demands `target: (EventTarget | null) &
+    /// HTMLElement`, not merely `HTMLElement`. Decomposing the target
+    /// constituent by constituent loses exactly that: the source's `{ target: T }`
+    /// half satisfies the `{ target: HTMLElement }` half on its own, and the
+    /// nullish part of `Event.target` is never confronted.
+    ///
+    /// Applies only when every target constituent is a plain property bag whose
+    /// names overlap; anything with index/call/construct signatures, or a target
+    /// whose constituents share no name at all (where merging changes nothing),
+    /// returns null and keeps the per-constituent route.
+    fn intersectionPairAssignable(c: *Checker, s: TypeId, t: TypeId) Error!?bool {
+        var objs: std.ArrayList(TypeId) = .empty;
+        defer objs.deinit(c.scratch());
+        {
+            const members = try c.scratch().dupe(TypeId, try c.memberList(t));
+            defer c.scratch().free(members);
+            for (members) |m| {
+                const rm = try c.resolveStructural(m);
+                if (c.ts.kind(rm) != .object) return null;
+                if (c.ts.objectStringIndex(rm) != 0 or c.ts.objectNumberIndex(rm) != 0) return null;
+                if (c.ts.objectCallSigCount(rm) != 0 or c.ts.objectConstructSigCount(rm) != 0) return null;
+                try objs.append(c.scratch(), rm);
+            }
+        }
+        var names: std.ArrayList(Atom) = .empty;
+        defer names.deinit(c.scratch());
+        var seen: std.AutoHashMapUnmanaged(Atom, void) = .empty;
+        defer seen.deinit(c.scratch());
+        var shared = false;
+        for (objs.items) |o| {
+            for (0..c.ts.objectPropCount(o)) |i| {
+                const p = c.ts.objectProp(o, @intCast(i));
+                if ((try seen.getOrPut(c.scratch(), p.name)).found_existing) {
+                    shared = true;
+                } else try names.append(c.scratch(), p.name);
+            }
+        }
+        if (!shared) return null;
+        for (names.items) |nm| {
+            const tp = (try c.propOfTypeEx(t, nm, false)) orelse continue;
+            const sp = (try c.propOfTypeEx(s, nm, false)) orelse {
+                if (tp.optional()) continue;
+                return false;
+            };
+            if (sp.optional() and !tp.optional()) return false;
+            var st = sp.ty;
+            if (sp.optional()) st = try c.makeUnion2(st, types.undefined_type);
+            var tt = tp.ty;
+            if (tp.optional()) tt = try c.makeUnion2(tt, types.undefined_type);
+            if (!try c.isAssignable(st, tt)) return false;
+        }
+        return true;
+    }
+
+    /// Does this intersection still carry a `null`/`undefined` constituent?
+    fn hasNullishMember(c: *Checker, t: TypeId) Error!bool {
+        for (try c.memberList(t)) |m| {
+            switch (c.ts.kind(try c.resolveStructural(m))) {
+                .null, .undefined => return true,
+                else => {},
+            }
+        }
+        return false;
+    }
+
     fn computeIntersectionIsNever(c: *Checker, t: TypeId) Error!bool {
+        // The store's nullish rule (`nullishIntersectionIsEmpty`) is deliberately
+        // syntactic: it cannot resolve a `.ref`, so `null & HTMLElement` survives
+        // interning even though tsc reduces it to `never`. Re-run the rule here,
+        // where the members CAN be resolved — an intersection of `null`/
+        // `undefined` with anything from a provably disjoint domain has no
+        // inhabitants. A member that is still instantiable (a type parameter, a
+        // deferred conditional/mapped/indexed access) is left alone, exactly as
+        // the store leaves it: `null & T` stays a real, non-empty type.
+        {
+            var nullish = false;
+            var other_domain = false;
+            for (try c.memberList(t)) |m| {
+                const rm = try c.resolveStructural(m);
+                switch (c.ts.kind(rm)) {
+                    .null, .undefined => nullish = true,
+                    .object, .array, .tuple, .function, .overloads, .class_value, .object_keyword, .void, .string, .number, .boolean, .bigint, .symbol, .bool_true, .bool_false, .string_literal, .number_literal, .number_literal_fresh, .bigint_literal, .enum_type, .unique_symbol, .template_literal_type, .string_mapping => other_domain = true,
+                    else => {},
+                }
+            }
+            if (nullish and other_domain) return true;
+        }
         var mem: std.ArrayList(TypeId) = .empty;
         defer mem.deinit(c.scratch());
         var n_obj: usize = 0;
