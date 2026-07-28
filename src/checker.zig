@@ -18500,6 +18500,31 @@ const Checker = struct {
                 }
             },
             .union_type => {
+                // Same-origin fast path for a generic UNION alias — the
+                // discriminated-union shape (`GeometricShape<P>`), whose
+                // constituents are anonymous object literals and so carry no
+                // origin of their own. Member-by-member pairing can only match
+                // them structurally, which the branded tuple members defeat, so
+                // nothing was inferred and the callee's parameter fell back to
+                // its constraint. The union itself does carry the origin: pair
+                // the two materializations' type arguments positionally, the
+                // same identity rule the `.object`, `.intersection` and `.ref`
+                // arms already apply.
+                if (c.origin.get(param)) |po| {
+                    if (s.kind(po) == .ref) {
+                        const ra0 = try c.resolveStructural(arg);
+                        const ao_opt = c.origin.get(arg) orelse c.origin.get(ra0);
+                        if (ao_opt) |ao| {
+                            if (s.kind(ao) == .ref and s.refSymbol(ao) == s.refSymbol(po)) {
+                                const pa = try c.scratch().dupe(TypeId, s.refArgs(po));
+                                const aa = try c.scratch().dupe(TypeId, s.refArgs(ao));
+                                const n0 = @min(pa.len, aa.len);
+                                for (0..n0) |i| try c.unify(pa[i], aa[i], tp_syms, candidates, depth + 1);
+                                return;
+                            }
+                        }
+                    }
+                }
                 // Unify against the single type-param member if the rest
                 // doesn't already accept the arg (common: T | undefined).
                 var tp_member: TypeId = types.no_type;
@@ -18726,6 +18751,58 @@ const Checker = struct {
                         if (try c.constituentRelatesTo(param, m)) {
                             try c.unify(param, m, tp_syms, candidates, depth + 1);
                         }
+                    }
+                    return;
+                }
+                // A UNION argument: pair by generic ORIGIN, the same identity
+                // rule the `.ref` arm already applies to a union. A contextual
+                // return type that is a union (`A<P> | B<P>`, `A<P> | null`)
+                // reaches here whenever its constituents are type ALIASES,
+                // which materialize as objects carrying an origin tag rather
+                // than staying refs. Walking the whole union structurally binds
+                // nothing, so the callee's own parameter fell back to its
+                // constraint and the return was rejected against the very type
+                // that provided the context. Interfaces never took this path —
+                // they stay refs — which is why the same code with `interface`
+                // instead of `type` already worked.
+                if (s.kind(ra) == .union_type) {
+                    // Constituents that share the param's generic origin are
+                    // the authoritative pairing (the `.ref` arm's identity
+                    // rule); when some match, only they infer.
+                    if (c.origin.get(param)) |po| {
+                        if (s.kind(po) == .ref) {
+                            var matched = false;
+                            for (try c.memberList(ra)) |m| {
+                                const mo = if (s.kind(m) == .ref)
+                                    m
+                                else blk: {
+                                    const rm = try c.resolveStructural(m);
+                                    break :blk c.origin.get(rm) orelse continue;
+                                };
+                                if (s.kind(mo) == .ref and s.refSymbol(mo) == s.refSymbol(po)) {
+                                    try c.unify(param, m, tp_syms, candidates, depth + 1);
+                                    matched = true;
+                                }
+                            }
+                            if (matched) return;
+                        }
+                    }
+                    // Otherwise pick the constituent the param's own
+                    // DISCRIMINANT selects (tsc's
+                    // `getMatchingUnionConstituentForType`). A discriminated
+                    // union built out of anonymous object literals
+                    // (`GeometricShape<P>`) carries no origin on its members,
+                    // so the discriminant is the only identity there is — and
+                    // without it the callee's own parameter fell back to its
+                    // constraint and the return was rejected against the very
+                    // type that provided the context. Inferring from EVERY
+                    // constituent instead (tsc's untargeted union-source rule)
+                    // is not safe here: a union of sibling object literals with
+                    // no discriminant then contributes each of its literal
+                    // property types as a candidate, which collapses to the
+                    // widened primitive.
+                    if (try c.discriminatedConstituent(param, ra)) |m| {
+                        try c.unify(param, m, tp_syms, candidates, depth + 1);
                     }
                     return;
                 }
@@ -18990,6 +19067,51 @@ const Checker = struct {
             .mapped => try c.inferReverseMapped(param, arg, tp_syms, candidates, depth),
             else => {},
         }
+    }
+
+    /// The one constituent of the union `uni` that the object parameter's own
+    /// DISCRIMINANT selects — tsc's `getMatchingUnionConstituentForType`.
+    ///
+    /// A discriminant is a property of `param` whose type is a single unit
+    /// literal (`type: "polycurve"`). A constituent qualifies when it agrees on
+    /// EVERY such property; the answer is that constituent only when exactly
+    /// one does. Returns null whenever the param has no discriminant or the
+    /// match is ambiguous, which is what keeps this from degenerating into
+    /// "infer from every constituent" — a union of sibling object literals
+    /// with no discriminant would otherwise contribute each of its literal
+    /// property types as a candidate, and the merged candidate widens to the
+    /// primitive.
+    fn discriminatedConstituent(c: *Checker, param: TypeId, uni: TypeId) Error!?TypeId {
+        const s = &c.ts;
+        var have_disc = false;
+        var found: TypeId = types.no_type;
+        var n_found: usize = 0;
+        for (try c.memberList(uni)) |m| {
+            const rm = try c.resolveStructural(m);
+            if (s.kind(rm) != .object) continue;
+            var agrees = true;
+            var saw_disc = false;
+            for (0..s.objectPropCount(param)) |i| {
+                const pp = s.objectProp(param, @intCast(i));
+                if (!isUnitLikeKind(s.kind(pp.ty))) continue;
+                saw_disc = true;
+                const ap = s.objectPropByName(rm, pp.name) orelse {
+                    agrees = false;
+                    break;
+                };
+                if (!try c.isAssignable(pp.ty, ap.ty)) {
+                    agrees = false;
+                    break;
+                }
+            }
+            if (saw_disc) have_disc = true;
+            if (saw_disc and agrees) {
+                found = m;
+                n_found += 1;
+            }
+        }
+        if (!have_disc or n_found != 1) return null;
+        return found;
     }
 
     /// Do an intersection PARAMETER constituent and an argument constituent
