@@ -11372,6 +11372,19 @@ const Checker = struct {
                 if (s.kind(rbc) == .mapped) return null; // key set still generic
                 return c.propOfTypeEx(rbc, name, allow_index);
             },
+            // A still-deferred conditional has the apparent members of its
+            // DEFAULT CONSTRAINT — tsc's `getDefaultConstraintOfConditionalType`,
+            // the union of the true branch (instantiated under its own extends
+            // clause) and the false branch. A property both branches declare is
+            // therefore readable: `{ encryptionKey } & ([T] extends [never] ?
+            // { metadata?: T } : { metadata: T })` has `metadata`. Without this
+            // arm a conditional exposed nothing at all, in an intersection or
+            // on its own.
+            .conditional => {
+                const u = try c.makeUnion2(try c.condTrueUnderExtends(t), s.condFalse(t));
+                if (u == t) return null;
+                return c.propOfTypeEx(u, name, allow_index);
+            },
             .ref => return c.propOfTypeEx(try c.resolveStructural(t), name, allow_index),
             .class_value => return c.propOfTypeEx(try c.classStaticType(s.classSymbol(t)), name, allow_index),
             .enum_type => {
