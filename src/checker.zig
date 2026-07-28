@@ -963,6 +963,9 @@ const Checker = struct {
     atom_AsyncIterableIterator: Atom = 0,
     atom_AsyncIteratorObject: Atom = 0,
     atom_JSX: Atom = 0,
+    /// `default`, for the synthetic default an interop `import("m")` gets over
+    /// an `export =` module (`importCallType`).
+    atom_default: Atom = 0,
     atom_IntrinsicElements: Atom = 0,
     atom_Element: Atom = 0,
     atom_ElementAttributesProperty: Atom = 0,
@@ -1099,6 +1102,7 @@ const Checker = struct {
         c.atom_AsyncIterableIterator = try c.atom("AsyncIterableIterator");
         c.atom_AsyncIteratorObject = try c.atom("AsyncIteratorObject");
         c.atom_JSX = try c.atom("JSX");
+        c.atom_default = try c.atom("default");
         c.atom_IntrinsicElements = try c.atom("IntrinsicElements");
         c.atom_Element = try c.atom("Element");
         c.atom_ElementAttributesProperty = try c.atom("ElementAttributesProperty");
@@ -17570,6 +17574,65 @@ const Checker = struct {
         }
     }
 
+    /// `import("m")` in *expression* position: `Promise<<namespace object of
+    /// m>>`, tsc's `getTypeOfImportCall`. The specifier resolves through the
+    /// same two registries the type-position `import("m")` uses — the current
+    /// file's specifier map, then the ambient `declare module` registry — and
+    /// the namespace object is the same one `import * as ns from "m"` gets, so
+    /// an `export =` module reaches its export-assigned entity.
+    ///
+    /// Everything else stays `any`: a non-literal specifier (tsc cannot
+    /// resolve it either), an unresolved module (already TS2307 at the
+    /// statement level, or deliberately opaque), and a program with no lib
+    /// (no global `Promise` to wrap with). No diagnostic is reported here —
+    /// resolution failures belong to the resolver.
+    fn importCallType(c: *Checker, arg_nodes: []const Node) Error!TypeId {
+        if (arg_nodes.len == 0) return types.any_type;
+        const spec_node = arg_nodes[0];
+        if (c.nodeTag(spec_node) != .string_literal) return types.any_type;
+        const spec = try c.memberAtom(c.tree.nodeMainToken(spec_node));
+        var m: ModuleRef = blk: {
+            if (c.prog.files.len != 0) {
+                if (c.prog.files[c.cur_file].specs.get(spec)) |mfile| break :blk .{ .file = mfile };
+            }
+            break :blk .{ .ambient = c.ambientIndex(spec) orelse return types.any_type };
+        };
+        // A JS-only dependency resolves to a file ztsc loads as a synthetic
+        // opaque `any` module. An ambient `declare module "m"` that describes it
+        // wins — the same precedence `linkImports` gives a named import, which
+        // falls through to the ambient registry when the resolved file has
+        // nothing to offer. `image-blob-reduce` ships no types and is declared
+        // in the app's `global.d.ts`.
+        if (m == .file and (try c.namespaceObjectType(m.file)) == types.any_type) {
+            if (c.ambientIndex(spec)) |idx| m = .{ .ambient = idx };
+        }
+        var inner: TypeId = switch (m) {
+            .file => |f| try c.namespaceObjectType(f),
+            .ambient => |idx| try c.ambientNamespaceType(idx),
+        };
+        // A CommonJS module (`export = x`) has no `default` of its own, and the
+        // namespace object ztsc builds for one *is* the export-assigned entity.
+        // Under module interop tsc still hands `import("m")` a `default` — that
+        // is how `import("pica").then((res) => res.default)` reaches pica. tsc
+        // spreads `{ default: T }` over the module type; the intersection has
+        // the same members.
+        if (c.prog.export_equals_atom != 0) {
+            if (c.moduleExportTarget(m, c.prog.export_equals_atom)) |eq| {
+                if (!eq.type_only) {
+                    // An ambient `export =` never reached `ambientNamespaceType`
+                    // (it skips the reserved key), so take the entity here.
+                    const entity = switch (m) {
+                        .file => inner,
+                        .ambient => try c.targetValueType(eq),
+                    };
+                    const wrapper = try c.ts.makeObject(&.{.{ .name = c.atom_default, .ty = entity, .flags = types.prop_flag_readonly }}, 0, 0, 0);
+                    inner = try c.ts.makeIntersection(c.scratch(), &.{ entity, wrapper });
+                }
+            }
+        }
+        return c.makePromise(inner);
+    }
+
     fn checkCallExpr(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Error!TypeId {
         var chained = false;
         const result = try c.checkCallExprInner(node, is_new, &chained, ctx);
@@ -17583,6 +17646,10 @@ const Checker = struct {
     /// short-circuits on a nullish callee.
     fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, chained: *bool, ctx: TypeId) Error!TypeId {
         const shape = c.callShape(node);
+        // `import("m")` is not an ordinary call — `import` has no type of its
+        // own. tsc's `getTypeOfImportCall`: the module's namespace object,
+        // wrapped in `Promise`.
+        if (!is_new and c.nodeTag(shape.callee) == .import_expr) return c.importCallType(shape.arg_nodes);
         var callee_t = if (c.isOptionalChain(shape.callee))
             try c.chainObjType(shape.callee, chained)
         else

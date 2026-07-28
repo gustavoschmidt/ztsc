@@ -2651,6 +2651,14 @@ const Binder = struct {
                 for (b.tree.extraRange(e.children_start, e.children_end)) |ch| try b.bindExpr(ch);
             },
 
+            .call_expr => {
+                // `import("m")` in *expression* position is a module
+                // dependency exactly like the type-position `import("m")`.
+                if (b.nodeTag(d.lhs) == .import_expr) try b.bindDynamicImport(node);
+                var it = b.tree.childIterator(node);
+                while (it.next()) |child| try b.bindExpr(child);
+            },
+
             // Everything else: recurse over expression children generically.
             else => {
                 var it = b.tree.childIterator(node);
@@ -2812,6 +2820,28 @@ const Binder = struct {
     /// dependency so discovery pulls `m` into the program. Emitted as a
     /// side-effect import record (no local binding); `linkImports` skips it and
     /// the checker resolves the module's exports lazily via `ProgFile.specs`.
+    /// An expression `import("m")` with a literal specifier: register `m` as a
+    /// module dependency so discovery pulls it into the program and the checker
+    /// can give the call `Promise<<namespace object of m>>` (`importCallType`).
+    /// A side-effect record, like `bindImportType` — no local binding, and
+    /// `linkImports` skips it. Not `type_only`: this is a runtime import.
+    /// A computed specifier registers nothing (tsc cannot resolve it either).
+    fn bindDynamicImport(b: *Binder, node: Node) Error!void {
+        const r = b.tree.extraData(ast.SubRange, b.tree.nodeData(node).rhs);
+        const args = b.tree.extraRange(r.start, r.end);
+        if (args.len == 0 or b.nodeTag(args[0]) != .string_literal) return;
+        const module = try b.moduleAtom(b.tree.nodeMainToken(args[0]));
+        if (module == 0) return;
+        try b.import_recs.append(b.scratch, .{
+            .local = 0,
+            .imported = 0,
+            .module = module,
+            .node = node,
+            .kind = .side_effect,
+            .type_only = false,
+        });
+    }
+
     fn bindImportType(b: *Binder, node: Node) Error!void {
         const spec_tok = b.tree.nodeData(node).lhs;
         if (spec_tok == 0) return; // parse error: no specifier
