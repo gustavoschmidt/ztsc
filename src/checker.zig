@@ -9895,7 +9895,18 @@ const Checker = struct {
                         var parts: std.ArrayList(TypeId) = .empty;
                         defer parts.deinit(c.scratch());
                         for (umembers) |m| {
-                            try parts.append(c.scratch(), try c.materializeMapped(key_param, constraint, value, as_clause, m, flags));
+                            // Re-bind the source inside the value template per
+                            // constituent. tsc distributes by instantiating the
+                            // whole mapped type with `T := A`, so `T[P]` becomes
+                            // `A[P]`; ztsc has already substituted `T`, so the
+                            // union is baked into the value and passing it
+                            // through unchanged resolves every property against
+                            // the WHOLE union — `(A|B)["ax"]` is `unknown` and
+                            // the discriminant widens to `"a" | "b"` on both
+                            // constituents, so no discriminant / `in` narrowing
+                            // can ever select a member.
+                            const v = try c.substHomoSource(value, src_type, src, m);
+                            try parts.append(c.scratch(), try c.materializeMapped(key_param, constraint, v, as_clause, m, flags));
                         }
                         return c.ts.makeUnion(c.scratch(), parts.items);
                     }
@@ -10023,6 +10034,73 @@ const Checker = struct {
         }
         if (props.items.len == 0 and sindex == 0 and nindex == 0) return types.empty_object_type;
         return s.makeObject(props.items, sindex, nindex, 0);
+    }
+
+    /// Re-bind a homomorphic mapped type's SOURCE inside its value template
+    /// when the map distributes over a union source: replace `from` (the source
+    /// as written, e.g. a `ref` to the alias) and `from_res` (its structural
+    /// resolution, the union itself) with the single constituent `to`.
+    ///
+    /// Deliberately narrow — only the type forms a mapped value template
+    /// actually takes are rewritten (`T[P]`, and that wrapped in
+    /// array/union/intersection/ref-arg/conditional/`keyof`). Anything else is
+    /// returned untouched, which is exactly the behaviour before this existed.
+    fn substHomoSource(c: *Checker, t: TypeId, from: TypeId, from_res: TypeId, to: TypeId) Error!TypeId {
+        if (t == from or t == from_res) return to;
+        const s = &c.ts;
+        switch (s.kind(t)) {
+            .index_access => {
+                const obj = try c.substHomoSource(s.indexAccessObj(t), from, from_res, to);
+                const idx = try c.substHomoSource(s.indexAccessIndex(t), from, from_res, to);
+                if (obj == s.indexAccessObj(t) and idx == s.indexAccessIndex(t)) return t;
+                return c.reduceIndexedAccess(obj, idx);
+            },
+            .array => {
+                const e = try c.substHomoSource(s.arrayElem(t), from, from_res, to);
+                return if (e == s.arrayElem(t)) t else s.makeArray(e);
+            },
+            .union_type, .intersection => {
+                var parts: std.ArrayList(TypeId) = .empty;
+                defer parts.deinit(c.scratch());
+                var changed = false;
+                for (try c.memberList(t)) |m| {
+                    const nm = try c.substHomoSource(m, from, from_res, to);
+                    if (nm != m) changed = true;
+                    try parts.append(c.scratch(), nm);
+                }
+                if (!changed) return t;
+                return if (s.kind(t) == .union_type)
+                    s.makeUnion(c.scratch(), parts.items)
+                else
+                    s.makeIntersection(c.scratch(), parts.items);
+            },
+            .ref => {
+                var args: std.ArrayList(TypeId) = .empty;
+                defer args.deinit(c.scratch());
+                var changed = false;
+                for (try c.refArgsList(t)) |a| {
+                    const na = try c.substHomoSource(a, from, from_res, to);
+                    if (na != a) changed = true;
+                    try args.append(c.scratch(), na);
+                }
+                if (!changed) return t;
+                return s.makeRef(s.refSymbol(t), args.items);
+            },
+            .conditional => {
+                const chk = try c.substHomoSource(s.condCheck(t), from, from_res, to);
+                const ext = try c.substHomoSource(s.condExtends(t), from, from_res, to);
+                const tru = try c.substHomoSource(s.condTrue(t), from, from_res, to);
+                const fls = try c.substHomoSource(s.condFalse(t), from, from_res, to);
+                if (chk == s.condCheck(t) and ext == s.condExtends(t) and
+                    tru == s.condTrue(t) and fls == s.condFalse(t)) return t;
+                return c.reduceConditional(chk, ext, tru, fls, s.condDistributive(t));
+            },
+            .keyof_op => {
+                const o = try c.substHomoSource(s.keyofOperand(t), from, from_res, to);
+                return if (o == s.keyofOperand(t)) t else c.keyofType(o);
+            },
+            else => return t,
+        }
     }
 
     /// Collect the distinct own props of an objectish source (object, or an
