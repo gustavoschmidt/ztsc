@@ -3924,8 +3924,34 @@ const Checker = struct {
             // whole union collapsed to `any` and every ReactNode-contextual
             // callback parameter became an implicit any.
             .never => return types.never_type,
-            else => return types.any_type,
+            // A BRANDED key (`FontString = string & { _brand }`, the whole
+            // `Ordered`/`FontString` family) is an intersection, not one of the
+            // kinds above, and fell through to `any` — so every read through
+            // `{ [key: FontString]: T }` lost its type. tsc classifies the index
+            // by `TypeFlags.StringLike` / `NumberLike`, so reduce a string-like
+            // (number-like) index to its base primitive and re-enter.
+            else => {
+                const ri = try c.resolveStructural(idx);
+                if (try c.typeIsStringLike(ri)) return c.indexedAccessType(obj, types.string_type);
+                if (try c.typeIsNumberLike(ri)) return c.numberIndexType(r);
+                return types.any_type;
+            },
         }
+    }
+
+    /// tsc's `TypeFlags.NumberLike` over a resolved type (union/intersection
+    /// scan, as in `maybeTypeOfKind`).
+    fn typeIsNumberLike(c: *Checker, t: TypeId) Error!bool {
+        return switch (c.ts.kind(t)) {
+            .number, .number_literal, .number_literal_fresh => true,
+            .union_type, .intersection => blk: {
+                for (try c.memberList(t)) |m| {
+                    if (try c.typeIsNumberLike(try c.resolveStructural(m))) break :blk true;
+                }
+                break :blk false;
+            },
+            else => false,
+        };
     }
 
     fn numberIndexType(c: *Checker, r: TypeId) Error!TypeId {
@@ -16596,7 +16622,24 @@ const Checker = struct {
                     result = types.any_type;
                 }
             },
-            else => result = types.any_type,
+            // A BRANDED key (`FontString = string & { _brand }`) is an
+            // intersection, none of the kinds above, and fell straight through
+            // to `any` — so every read through `{ [key: FontString]: T }` lost
+            // its type. tsc classifies the index by `TypeFlags.StringLike` /
+            // `NumberLike`, so reduce it to its base primitive.
+            else => {
+                const ri = try c.resolveStructural(try c.ts.regularLiteral(idx_t));
+                if (try c.typeIsStringLike(ri)) {
+                    result = if (rk == .object and c.ts.objectStringIndex(r) != 0)
+                        c.ts.objectStringIndex(r)
+                    else
+                        types.any_type;
+                } else if (try c.typeIsNumberLike(ri)) {
+                    result = try c.numberIndexType(r);
+                } else {
+                    result = types.any_type;
+                }
+            },
         }
         // Element-access narrowing, the counterpart of `memberChainInner`'s
         // property-path step: `arr[0]` with a CONSTANT index is a tracked
