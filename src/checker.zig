@@ -14424,7 +14424,14 @@ const Checker = struct {
             const name_tok = c.tree.nodeMainToken(attr);
             // Contextual type for the value = the target prop's type (used only
             // for a template-literal expression value; see jsxAttributeValueType).
-            const vctx: TypeId = if (rt != types.no_type and c.tree.tokens.tag(name_tok) != .jsx_name) blk: {
+            // A HYPHENATED name (`data-*`, `aria-*`, `connect-link`) is exempt
+            // from the excess-property and assignability checks further down,
+            // but not from contextual typing: tsc looks it up in the attributes
+            // type like any other name, which for a props type carrying a string
+            // index signature yields the index VALUE. Skipping the lookup here
+            // left a callback written as a hyphenated attribute with no
+            // contextual signature, so its parameters went implicit-any.
+            const vctx: TypeId = if (rt != types.no_type) blk: {
                 const nm = try c.memberAtom(name_tok);
                 // `ctxPropType`, not a bare `propOfType`: a component's props
                 // are routinely `Base & (VariantA | VariantB)` (the
