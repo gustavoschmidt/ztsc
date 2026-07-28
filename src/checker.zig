@@ -4541,6 +4541,27 @@ const Checker = struct {
                 sig_p.ty = try c.makeUnion2(p.ty, types.undefined_type);
             }
             try params.append(c.scratch(), sig_p);
+            // tsc's `removeOptionalityFromDeclaredType`, the mirror image of the
+            // widening just above: inside the BODY a parameter with an
+            // initializer never observes `undefined`, because passing
+            // `undefined` is exactly what runs the default. So strip it from the
+            // declared type here even when the ANNOTATION itself spells it —
+            // which an alias routinely does (`ImportedDataState["libraryItems"]`
+            // is `readonly LibraryItem[] | undefined`, and `(xs = [])` then still
+            // read as possibly-undefined in the body). tsc's one carve-out is an
+            // initializer that can itself be `undefined`, which leaves the
+            // parameter genuinely undefined-able.
+            var body_ty = p.ty;
+            if (p.flags & types.param_flag_initializer != 0 and
+                p.flags & types.param_flag_optional == 0)
+            {
+                const stripped = try c.removeUndefined(p.ty);
+                if (stripped != p.ty and stripped != types.never_type and
+                    !try c.paramInitCanBeUndefined(pn))
+                {
+                    body_ty = stripped;
+                }
+            }
             // Pin the parameter symbol's type so body checking sees the
             // contextual/inferred type (not a re-derivation without ctx). When a
             // contextual signature is supplied (`ctx_sig`), FORCE-overwrite any
@@ -4556,10 +4577,10 @@ const Checker = struct {
                     if (c.bind.symbol_flags[psym].param) {
                         const gsym = c.toGlobal(psym);
                         if (ctx_sig != types.no_type and gsym != binder.no_symbol and gsym < c.sym_types.items.len) {
-                            c.sym_types.items[gsym] = p.ty;
+                            c.sym_types.items[gsym] = body_ty;
                             c.sym_state.items[gsym] = .computed;
                         } else {
-                            c.setTypeOfSymbol(gsym, p.ty);
+                            c.setTypeOfSymbol(gsym, body_ty);
                         }
                     }
                 }
@@ -4574,7 +4595,7 @@ const Checker = struct {
                 // union parameter beside it, so an arrow argument written for
                 // that parameter lost its contextual signature and reported
                 // TS7006 on every parameter.
-                try c.pinPatternParamSyms(pn, c.tree.nodeData(pn).lhs, p.ty, ctx_sig != types.no_type);
+                try c.pinPatternParamSyms(pn, c.tree.nodeData(pn).lhs, body_ty, ctx_sig != types.no_type);
             }
             pi += 1;
         }
@@ -4831,6 +4852,25 @@ const Checker = struct {
             }
         }
         return .{ .param = param, .ty = target, .asserts = asserts };
+    }
+
+    /// tsc's `parameterInitializerContainsUndefined`: can the parameter's
+    /// default expression itself produce `undefined`? If it can, the parameter
+    /// really is undefined-able inside the body and
+    /// `removeOptionalityFromDeclaredType` leaves the declared type alone.
+    ///
+    /// Run as a side query: it publishes no `node_types` entry and reports no
+    /// diagnostic, so the authoritative check of the same initializer — which
+    /// happens later, under the annotation as its contextual type — is
+    /// unaffected.
+    fn paramInitCanBeUndefined(c: *Checker, pn: Node) Error!bool {
+        if (c.nodeTag(pn) != .param_full) return false;
+        const e = c.tree.extraData(ast.ParamFull, c.tree.nodeData(pn).rhs);
+        if (e.init == 0) return false;
+        c.side_query_depth += 1;
+        defer c.side_query_depth -= 1;
+        const it = try c.checkExprCached(e.init, types.no_type);
+        return (try c.removeUndefined(it)) != it;
     }
 
     fn paramInfo(c: *Checker, pn: Node, index: u32, ctx_sig: TypeId, report_implicit: bool) Error!types.Param {
