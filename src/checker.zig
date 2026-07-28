@@ -4286,6 +4286,13 @@ const Checker = struct {
         try props.append(alloc, p);
     }
 
+    fn propByName(props: []const types.Prop, name: Atom) ?types.Prop {
+        for (props) |p| {
+            if (p.name == name) return p;
+        }
+        return null;
+    }
+
     /// Fold the properties of a spread source (`{ ...src }`) into an object
     /// literal's property set. An intersection source contributes the props of
     /// every constituent (a later constituent wins on a name clash, mirroring
@@ -4338,11 +4345,17 @@ const Checker = struct {
                 // `{ ...(tool || { type: "selection" }), extra }` lost `type`
                 // entirely and failed every target that requires it.
                 //
-                // Only an all-object union folds; `null`/`undefined`/`void`
-                // members spread nothing (tsc), and anything else leaves the
-                // whole spread unmodelled exactly as before.
+                // A member is folded through the SAME gather this function
+                // performs for a non-union source, so an INTERSECTION member
+                // contributes the merged properties of its constituents. That
+                // matters for every discriminated union whose members are
+                // `Base & { … }`: taking only `.object` members made
+                // `{ ...element, … }` over such a union contribute nothing at
+                // all, because each member resolves to an intersection.
+                // `null`/`undefined`/`void` members spread nothing (tsc), and
+                // anything else leaves the whole spread unmodelled as before.
                 const members = try c.memberList(st);
-                var objs: std.ArrayList(TypeId) = .empty;
+                var objs: std.ArrayList([]const types.Prop) = .empty;
                 defer objs.deinit(c.scratch());
                 // A `null`/`undefined`/`void` member spreads the EMPTY object
                 // (tsc), i.e. one alternative supplies no property at all — so
@@ -4351,7 +4364,21 @@ const Checker = struct {
                 for (members) |m| {
                     const rm = try c.resolveStructural(m);
                     switch (c.ts.kind(rm)) {
-                        .object => try objs.append(c.scratch(), rm),
+                        .object, .intersection => {
+                            var mprops: std.ArrayList(types.Prop) = .empty;
+                            var mindex: std.AutoHashMapUnmanaged(Atom, u32) = .empty;
+                            defer mindex.deinit(c.scratch());
+                            // A union member's index signatures are not carried
+                            // into the fold (they were not before this arm
+                            // recursed either); a throwaway sink keeps the
+                            // recursive gather's contract.
+                            var sink_s: std.ArrayList(TypeId) = .empty;
+                            defer sink_s.deinit(c.scratch());
+                            var sink_n: std.ArrayList(TypeId) = .empty;
+                            defer sink_n.deinit(c.scratch());
+                            try c.gatherSpreadProps(rm, &mprops, &mindex, &sink_s, &sink_n);
+                            try objs.append(c.scratch(), mprops.items);
+                        },
                         .null, .undefined, .void => has_empty = true,
                         else => return,
                     }
@@ -4362,8 +4389,7 @@ const Checker = struct {
                 var seen: std.AutoHashMapUnmanaged(Atom, void) = .empty;
                 defer seen.deinit(c.scratch());
                 for (objs.items) |o| {
-                    for (0..c.ts.objectPropCount(o)) |i| {
-                        const p = c.ts.objectProp(o, @intCast(i));
+                    for (o) |p| {
                         const g = try seen.getOrPut(c.scratch(), p.name);
                         if (!g.found_existing) try names.append(c.scratch(), p.name);
                     }
@@ -4374,7 +4400,7 @@ const Checker = struct {
                     var optional = has_empty;
                     var readonly = false;
                     for (objs.items) |o| {
-                        if (c.ts.objectPropByName(o, nm)) |p| {
+                        if (propByName(o, nm)) |p| {
                             try parts.append(c.scratch(), try c.removeUndefined(p.ty));
                             if (p.flags & types.prop_flag_optional != 0) optional = true;
                             if (p.flags & types.prop_flag_readonly != 0) readonly = true;
@@ -15085,7 +15111,80 @@ const Checker = struct {
         return c.ts.makeUnion(c.scratch(), surviving);
     }
 
+    /// Upper bound on the constituents of a distributed union spread (see
+    /// `checkObjectLiteral`). The work is linear in this number, and the unions
+    /// that need it are hand-written discriminated unions an order of magnitude
+    /// below the bound; anything wider folds instead.
+    const max_spread_distribution = 16;
+
+    const DistSpread = struct { node: Node, members: []const TypeId };
+
+    /// The single spread element of `node` whose source is a union worth
+    /// distributing over, plus that union's constituents. `.node == 0` when
+    /// there is none — or when there is more than one, since distributing
+    /// several at once is a cartesian product.
+    fn distributableSpread(c: *Checker, node: Node) Error!DistSpread {
+        const none: DistSpread = .{ .node = 0, .members = &.{} };
+        var found: Node = 0;
+        var members: []const TypeId = &.{};
+        for (c.tree.nodeRange(node)) |prop| {
+            if (prop == null_node or c.nodeTag(prop) != .spread_element) continue;
+            const st = try c.resolveStructural(try c.checkExprCached(c.tree.nodeData(prop).lhs, types.no_type));
+            if (c.ts.kind(st) != .union_type) continue;
+            const ms = try c.memberList(st);
+            if (ms.len < 2 or ms.len > max_spread_distribution) continue;
+            var ok = true;
+            var carriers: usize = 0;
+            for (ms) |m| {
+                const rm = try c.resolveStructural(m);
+                switch (c.ts.kind(rm)) {
+                    .object => if (c.ts.objectPropCount(rm) > 0) {
+                        carriers += 1;
+                    },
+                    .intersection => carriers += 1,
+                    .null, .undefined, .void => {},
+                    else => ok = false,
+                }
+            }
+            // At least two constituents must actually carry properties. A
+            // `T | undefined` (or `T | {}`) spread has one, and distributing it
+            // says nothing the fold does not already say — `undefined` and `{}`
+            // both spread the empty object, so every property is optional
+            // either way — while turning the literal into a union that
+            // perturbs inference at the use site.
+            if (!ok or carriers < 2) continue;
+            if (found != 0) return none; // more than one: fold both, as before
+            found = prop;
+            members = ms;
+        }
+        return .{ .node = found, .members = members };
+    }
+
     fn checkObjectLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
+        // tsc's `getSpreadType` DISTRIBUTES over a union spread source:
+        // `{ ...(A | B), x }` is `{ ...A, x } | { ...B, x }`, and each
+        // constituent keeps the correlation between the properties that came
+        // from one union member. Folding the union into a single object (what
+        // `gatherSpreadProps` does when the distribution does not apply) loses
+        // that correlation — every property only some member declares becomes
+        // optional — so the literal then matches no arm of a discriminated
+        // target. Distribute here, where the literal's type can be a union.
+        const dist = try c.distributableSpread(node);
+        if (dist.node != 0) {
+            var outs: std.ArrayList(TypeId) = .empty;
+            defer outs.deinit(c.scratch());
+            for (dist.members) |m| {
+                try outs.append(c.scratch(), try c.objectLiteralType(node, ctx, dist.node, m));
+            }
+            return c.ts.makeUnion(c.scratch(), outs.items);
+        }
+        return c.objectLiteralType(node, ctx, 0, types.no_type);
+    }
+
+    /// One constituent of an object literal's type. `dist_node`, when non-zero,
+    /// names a spread element whose source type is replaced by `dist_ty` (see
+    /// `checkObjectLiteral`).
+    fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist_node: Node, dist_ty: TypeId) Error!TypeId {
         var rctx = if (ctx != types.no_type) try c.resolveStructural(ctx) else types.no_type;
         if (rctx != types.no_type and c.ts.kind(rctx) == .union_type) {
             rctx = try c.discriminateCtxUnion(node, rctx);
@@ -15244,7 +15343,8 @@ const Checker = struct {
                     try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = mt });
                 },
                 .spread_element => {
-                    const st = try c.resolveStructural(try c.checkExprCached(pd.lhs, types.no_type));
+                    const raw = try c.checkExprCached(pd.lhs, types.no_type);
+                    const st = try c.resolveStructural(if (prop == dist_node) dist_ty else raw);
                     if (c.ts.kind(st) == .any or c.ts.kind(st) == .err) spread_any = true;
                     if (c.ts.kind(st) == .type_param) {
                         try generic_spreads.append(c.scratch(), st);

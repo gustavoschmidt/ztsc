@@ -4,9 +4,10 @@
 // none for a union, so `{ ...(tool || { type: "selection" }), extra }`
 // contributed NOTHING — the spread's properties vanished and the literal failed
 // every target that requires them. tsc's `getSpreadType` distributes and yields
-// a union of spread results; a single object literal cannot, so the
-// constituents are folded: a property every member declares keeps the union of
-// its types, one some member lacks becomes optional.
+// a union of spread results; when that distribution does not apply (see
+// literals/033) the constituents are FOLDED into one object instead: a property
+// every member declares keeps the union of its types, one some member lacks
+// becomes optional.
 
 type Tool = "selection" | "rectangle" | "eraser";
 type Full = { type: Tool; locked: boolean };
