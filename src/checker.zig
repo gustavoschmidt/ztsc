@@ -1248,22 +1248,39 @@ const Checker = struct {
         c.cur_flow_base = c.flow_base[f];
     }
 
-    const SavedCtx = struct { file: FileId, scope: ScopeId };
+    /// The ambient `this` travels with the file/scope context: a lazy demand
+    /// that crosses into another file must not carry the demanding frame's
+    /// `this` with it (see `enterSymFile`).
+    const SavedCtx = struct { file: FileId, scope: ScopeId, this_type: TypeId };
 
     fn saveCtx(c: *const Checker) SavedCtx {
-        return .{ .file = c.cur_file, .scope = c.cur_scope };
+        return .{ .file = c.cur_file, .scope = c.cur_scope, .this_type = c.this_type };
     }
 
     fn restoreCtx(c: *Checker, s: SavedCtx) void {
         if (s.file != c.cur_file) c.setFile(s.file);
         c.cur_scope = s.scope;
+        c.this_type = s.this_type;
     }
 
     /// Switch to `sym`'s file (scope untouched; callers set it).
+    ///
+    /// Crossing a file boundary drops `this`. Symbol types are materialized on
+    /// demand, so the frame that triggers the demand is arbitrary — it may be
+    /// the middle of some class body — and `this_type` is a single mutable
+    /// field, not part of the walk state. Without the reset a class body that
+    /// demands a symbol from another file leaks its own `this` into whatever
+    /// expression that file's materialization walks, which makes the answer a
+    /// function of the file partition (`--checkers=N`) rather than of the
+    /// program. Class-member resolvers set `this_type` *after* this call, so
+    /// they are unaffected; `restoreCtx` puts the caller's `this` back.
     fn enterSymFile(c: *Checker, sym: SymbolId) SavedCtx {
         const saved = c.saveCtx();
         const f = c.symFile(sym);
-        if (f != c.cur_file) c.setFile(f);
+        if (f != c.cur_file) {
+            c.setFile(f);
+            c.this_type = 0;
+        }
         return saved;
     }
 
@@ -16386,6 +16403,20 @@ const Checker = struct {
                     try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = vt });
                 },
                 .object_method => {
+                    // `this` inside an object-literal method is the literal's
+                    // own `this`, never the enclosing frame's. tsc
+                    // (`getContextualThisParameterType`): with a contextual
+                    // type for the literal, `this` is that contextual type —
+                    // which is what makes `{ perform() { this.checked!(…) } }`
+                    // passed to `register(action: Action)` legal, `checked`
+                    // being a member of `Action`. With no contextual type it is
+                    // the literal's own type, which is only known after this
+                    // walk; that case falls back to `any` (an under-report:
+                    // `{ m() { return this.nope; } }` goes unreported) rather
+                    // than to the ambient `this`, which would be wrong.
+                    const saved_this = c.this_type;
+                    defer c.this_type = saved_this;
+                    c.this_type = if (rctx != types.no_type) rctx else 0;
                     if (pd.lhs != 0 and c.nodeTag(pd.lhs) == .computed_name) {
                         _ = try c.checkExprCached(pd.rhs, types.no_type);
                         continue;
