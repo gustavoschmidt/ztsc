@@ -21519,7 +21519,14 @@ const Checker = struct {
             if (ctx.ret_ann != types.no_type and ctx.ret_ann != types.error_type and
                 ctx.ret_ann != types.any_type and c.ts.kind(ctx.ret_ann) != .none)
             {
-                _ = try c.checkAssignable(eff_rt, ctx.ret_ann, d.lhs, c.nodeSpan(d.lhs));
+                // Anchored at the RETURN STATEMENT, not the expression: tsc's
+                // `checkReturnStatement` passes the statement as the error
+                // node, so the column is `return`'s, seven characters to the
+                // left of the expression's. (The expression node still goes in
+                // as `expr_node`, so the literal elaboration below still
+                // descends into it.) The bare-`return` arm below already
+                // anchored this way.
+                _ = try c.checkAssignable(eff_rt, ctx.ret_ann, d.lhs, c.nodeSpan(node));
             }
         } else if (ctx.ret_ann != types.no_type) {
             const k = c.ts.kind(ctx.ret_ann);
