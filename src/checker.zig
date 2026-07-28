@@ -13560,17 +13560,36 @@ const Checker = struct {
         var expr_node = expr_node0;
         while (c.nodeTag(expr_node) == .paren_expr) expr_node = c.tree.nodeData(expr_node).lhs;
         const rt = try c.resolveStructural(target);
+        // tsc's `getBestMatchIndexedAccessTypeOrUndefined`: an element/property
+        // of a UNION target is first looked up on the union ITSELF, and only
+        // when the union has no such member is the lookup redirected to the
+        // single best-matching constituent (`getBestMatchingType`). That
+        // two-step is what lets `BlobPart[] | undefined` elaborate as
+        // `BlobPart[]` and `RequestInit | undefined` as `RequestInit`, while
+        // `{ type: 'a'; … } | { type: 'b'; … }` — where the union does answer
+        // `.type` — keeps elaborating against `'a' | 'b'` and so stays silent.
+        // Without it a union target bailed out entirely and the whole literal
+        // was reported at the argument/assignment span.
+        const is_union = c.ts.kind(rt) == .union_type;
+        // The best-matching constituent, resolved once; `no_type` when the
+        // union has none (then only whole-union lookups can contribute).
+        const alt: TypeId = if (!is_union) types.no_type else blk: {
+            const b = (try c.bestMatchingUnionMember(src_t, rt)) orelse break :blk types.no_type;
+            break :blk try c.resolveStructural(b);
+        };
         switch (c.nodeTag(expr_node)) {
             .array_literal => {
                 const rtk = c.ts.kind(rt);
-                if (rtk != .array and rtk != .tuple) return false;
+                if (rtk != .array and rtk != .tuple and !is_union) return false;
                 var reported = false;
                 var i: u32 = 0;
                 for (c.tree.nodeRange(expr_node)) |el| {
                     if (el == null_node) continue;
                     defer i += 1;
                     if (c.nodeTag(el) == .omitted or c.nodeTag(el) == .spread_element) continue;
-                    const tt = if (rtk == .array) c.ts.arrayElem(rt) else (try c.tupleElemTypeAt(rt, i) orelse continue);
+                    const tt = if (is_union)
+                        ((try c.unionElemTypeAt(rt, i)) orelse (try c.elemTypeAt(alt, i)) orelse continue)
+                    else if (rtk == .array) c.ts.arrayElem(rt) else (try c.tupleElemTypeAt(rt, i) orelse continue);
                     const et = c.nodeType(el) orelse continue;
                     if (try c.isAssignable(et, tt)) continue;
                     if (!try c.elaborateLiteralError(el, et, tt)) {
@@ -13581,7 +13600,7 @@ const Checker = struct {
                 return reported;
             },
             .object_literal => {
-                if (c.ts.kind(rt) != .object) return false;
+                if (c.ts.kind(rt) != .object and !is_union) return false;
                 var reported = false;
                 for (c.tree.nodeRange(expr_node)) |prop| {
                     if (prop == null_node) continue;
@@ -13590,23 +13609,126 @@ const Checker = struct {
                     if (tag != .object_property and tag != .object_shorthand) continue;
                     if (tag == .object_property and pd.lhs != 0 and c.nodeTag(pd.lhs) == .computed_name) continue;
                     const key = try c.memberAtom(c.tree.nodeMainToken(prop));
-                    const tp = c.ts.objectPropByName(rt, key) orelse continue;
+                    const tp_ty = if (is_union)
+                        (if (try c.propOfType(rt, key)) |p|
+                            p.ty
+                        else if (alt != types.no_type and c.ts.kind(alt) == .object)
+                            ((c.ts.objectPropByName(alt, key) orelse continue).ty)
+                        else
+                            continue)
+                    else
+                        (c.ts.objectPropByName(rt, key) orelse continue).ty;
                     const value_node = if (tag == .object_property) pd.rhs else pd.lhs;
                     const vt = c.nodeType(value_node) orelse continue;
-                    if (try c.isAssignable(vt, tp.ty)) continue;
-                    if (!try c.elaborateLiteralError(value_node, vt, tp.ty)) {
+                    if (try c.isAssignable(vt, tp_ty)) continue;
+                    if (!try c.elaborateLiteralError(value_node, vt, tp_ty)) {
                         // tsc anchors an object-literal member mismatch at the
                         // property NAME (for shorthand the name IS the value), not
                         // the value expression.
-                        try c.reportNotAssignable(2322, vt, tp.ty, c.tokSpan(c.tree.nodeMainToken(prop)));
+                        try c.reportNotAssignable(2322, vt, tp_ty, c.tokSpan(c.tree.nodeMainToken(prop)));
                     }
                     reported = true;
                 }
-                _ = src_t;
                 return reported;
             },
             else => return false,
         }
+    }
+
+    /// The type an array literal's element `i` is checked against when the
+    /// target is `t` — tsc's `getIndexedAccessTypeOrUndefined(t, i)` restricted
+    /// to a numeric index. Null when `t` has no numeric element at all (the
+    /// caller then redirects to the best-matching union constituent).
+    fn elemTypeAt(c: *Checker, t: TypeId, i: u32) Error!?TypeId {
+        if (t == types.no_type) return null;
+        const r = try c.resolveStructural(t);
+        return switch (c.ts.kind(r)) {
+            .array => c.ts.arrayElem(r),
+            .tuple => try c.tupleElemTypeAt(r, i),
+            // A string is indexable by number through `String`'s numeric index
+            // signature (`("a" | "b" | ("a" | "b")[])[0]` is `string`, which is
+            // exactly why tsc does NOT elaborate that union element-wise).
+            .string, .string_literal, .template_literal_type => types.string_type,
+            .any, .err, .unknown => r,
+            else => null,
+        };
+    }
+
+    /// `elemTypeAt` over a union: the union of every constituent's element
+    /// type, and null as soon as ONE constituent has none — matching tsc,
+    /// where `getIndexedAccessTypeOrUndefined` on a union needs the index to
+    /// resolve in every constituent.
+    fn unionElemTypeAt(c: *Checker, ut: TypeId, i: u32) Error!?TypeId {
+        const ms = try c.memberList(ut);
+        if (ms.len == 0) return null;
+        const buf = try c.scratch().alloc(TypeId, ms.len);
+        for (ms, 0..) |m, k| buf[k] = (try c.elemTypeAt(m, i)) orelse return null;
+        return try c.ts.makeUnion(c.scratch(), buf);
+    }
+
+    /// tsc's `getBestMatchingType`: which constituent of a UNION target an
+    /// elaboration (and a fresh-literal member relation) is judged against.
+    /// tsc runs five probes in order; the three that carry the shapes a
+    /// literal elaboration reaches are mirrored here:
+    ///
+    ///  1. `findMatchingTypeReferenceOrTypeAliasReference` — same generic
+    ///     reference on both sides. The only form that matters for a literal
+    ///     source is `Array`/tuple, so an array/tuple source picks the
+    ///     array/tuple constituent (`Uint8Array[]` vs `BlobPart[] | undefined`).
+    ///  2. `findBestTypeForObjectLiteral` — an object literal against a union
+    ///     that contains an array-like constituent picks a NON-array-like one.
+    ///  3. `findMostOverlappyType` — otherwise the constituent sharing the most
+    ///     property names with the source (`keyof S & keyof T`), ties going to
+    ///     the LAST such constituent (tsc compares with `>=`). A constituent
+    ///     sharing no name at all is never chosen, so `undefined` / `string`
+    ///     arms drop out and `RequestInit` wins.
+    ///
+    /// Returns null when no constituent matches, which leaves the caller with
+    /// its whole-union report.
+    fn bestMatchingUnionMember(c: *Checker, src_t: TypeId, ut: TypeId) Error!?TypeId {
+        const ms = try c.memberList(ut);
+        if (ms.len == 0) return null;
+        const rs = try c.resolveStructural(src_t);
+        const sk = c.ts.kind(rs);
+        // (1) array/tuple source -> the array/tuple constituent.
+        if (sk == .array or sk == .tuple) {
+            for (ms) |m| {
+                const mk = c.ts.kind(try c.resolveStructural(m));
+                if (mk == .array or mk == .tuple) return m;
+            }
+        }
+        if (sk != .object) return null;
+        // (2) object source, some array-like constituent -> the first that is not.
+        var has_array_like = false;
+        for (ms) |m| {
+            const mk = c.ts.kind(try c.resolveStructural(m));
+            if (mk == .array or mk == .tuple) has_array_like = true;
+        }
+        if (has_array_like) {
+            for (ms) |m| {
+                const mk = c.ts.kind(try c.resolveStructural(m));
+                if (mk != .array and mk != .tuple) return m;
+            }
+        }
+        // (3) most shared property names.
+        var best: ?TypeId = null;
+        var best_n: u32 = 0;
+        const nprops = c.ts.objectPropCount(rs);
+        for (ms) |m| {
+            const rm = try c.resolveStructural(m);
+            if (c.ts.kind(rm) != .object and c.ts.kind(rm) != .intersection) continue;
+            var n: u32 = 0;
+            var i: u32 = 0;
+            while (i < nprops) : (i += 1) {
+                const name = c.ts.objectProp(rs, i).name;
+                if ((try c.propOfType(rm, name)) != null) n += 1;
+            }
+            if (n > 0 and n >= best_n) {
+                best_n = n;
+                best = m;
+            }
+        }
+        return best;
     }
 
     /// tsc reports contextually-typed callback return mismatches as TS2322
