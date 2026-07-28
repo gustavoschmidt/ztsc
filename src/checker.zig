@@ -20867,6 +20867,24 @@ const Checker = struct {
                             return c.narrowByInstance(t, inst, sense);
                         return t;
                     },
+                    // `a && b` true implies both operands are truthy; `a || b`
+                    // false implies both are falsy (tsc
+                    // `narrowTypeByBinaryExpression`). A condition written
+                    // directly in an `if` never reaches here — the binder
+                    // decomposes it into separate flow nodes — but an *aliased*
+                    // condition does, because `constAliasInit` hands the alias's
+                    // initializer straight to this narrower, bypassing the
+                    // binder. `const g = isImg(e) && files[e.fileId]; if (g) …`
+                    // is the shape that needs it. The other polarity of each
+                    // operator says nothing about either operand.
+                    .amp_amp => {
+                        if (!sense) return t;
+                        return c.narrowByCondition(try c.narrowByCondition(t, d.lhs, true, key), d.rhs, true, key);
+                    },
+                    .pipe_pipe => {
+                        if (sense) return t;
+                        return c.narrowByCondition(try c.narrowByCondition(t, d.lhs, false, key), d.rhs, false, key);
+                    },
                     else => return t,
                 }
             },
