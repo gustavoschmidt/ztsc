@@ -1055,7 +1055,23 @@ const Linker = struct {
                         try l.put(t, rec.exported, .{ .kind = .any });
                         continue; // 2307 reported statement-level
                     };
-                    if (try l.lookupExport(mfile, rec.local, 0)) |tgt| {
+                    var found = try l.lookupExport(mfile, rec.local, 0);
+                    // `export { X } from "m"` where `m` is `export = ns` reads
+                    // the namespace member `ns.X`, exactly as `import { X }
+                    // from "m"` does in `linkImports`. Without this arm the
+                    // re-export form reported TS2305 where the import form
+                    // resolved — and it fired on every re-export from a module
+                    // ztsc loads as a synthetic opaque `any` (an allowJs `.js`
+                    // entry, a `*.json`, an `exports`-blocked subpath), whose
+                    // whole body is `declare const j: any; export = j;`. A
+                    // module with an `export =` therefore degrades to `any`
+                    // rather than accusing it of a missing member.
+                    if (found == null) {
+                        if (try l.lookupExport(mfile, l.atom_export_equals, 0)) |exeq| {
+                            found = (try l.exportEqualsMember(exeq, rec.local)) orelse .{ .kind = .any };
+                        }
+                    }
+                    if (found) |tgt| {
                         var final = tgt;
                         final.type_only = final.type_only or rec.type_only;
                         try l.put(t, rec.exported, final);
