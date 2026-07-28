@@ -789,6 +789,13 @@ const Checker = struct {
     /// materialization; drained once the enclosing class's instance type is
     /// complete. See `DeferredBody` / `drainDeferredBodies`.
     deferred_bodies: std.ArrayList(DeferredBody) = .empty,
+    /// Depth of "checking a NON-STATIC class field's initializer" frames. Such
+    /// an initializer runs at construction time, not at class-definition time,
+    /// so a forward reference in it is not in the temporal dead zone — tsc's
+    /// `isUsedInFunctionOrInstanceProperty` treats it exactly like a nested
+    /// function body. A *static* field initializer does run at definition time
+    /// and is deliberately not counted here. Read by `checkTdz`.
+    instance_field_init_depth: u32 = 0,
     inst_depth: u32 = 0,
     /// Live recursion depth of alias-instance expansion (`aliasInstance`).
     /// `alias_state` already breaks *direct* self-recursion with a lazy ref, but
@@ -5949,6 +5956,11 @@ const Checker = struct {
                         // walked until that type exists (see `DeferredBody`).
                         c.defer_bodies += 1;
                         defer c.defer_bodies -= 1;
+                        const instance = e.flags & ast.Flags.static == 0;
+                        if (instance) c.instance_field_init_depth += 1;
+                        defer if (instance) {
+                            c.instance_field_init_depth -= 1;
+                        };
                         return c.widenLiteral(try c.checkExprCached(e.init, types.no_type));
                     }
                     return types.any_type;
@@ -14879,7 +14891,13 @@ const Checker = struct {
         const decl_start = c.nodeSpanStart(decls[0]);
         const use_start = c.tree.tokens.start(tok);
         if (use_start >= decl_start) return;
-        // Uses inside a *nested function* run later — no TDZ error.
+        // Uses inside a *nested function* run later — no TDZ error. So does a
+        // use inside a NON-STATIC class field initializer, which runs at
+        // construction time rather than at class-definition time; tsc's
+        // `isUsedInFunctionOrInstanceProperty` puts the two in the same clause.
+        // `containerOf` maps a field initializer back to the module scope, so
+        // the container test alone cannot see it.
+        if (c.instance_field_init_depth > 0) return;
         const use_container = c.containerOf(c.cur_scope);
         const decl_container = c.containerOf(c.symScope(sym));
         if (use_container != decl_container) return;
@@ -21968,6 +21986,13 @@ const Checker = struct {
                         continue;
                     }
                     if (e.init != 0) {
+                        // See `instance_field_init_depth`: an instance field's
+                        // initializer runs at construction time, so a forward
+                        // reference in it is not a TDZ use.
+                        if (!is_static) c.instance_field_init_depth += 1;
+                        defer if (!is_static) {
+                            c.instance_field_init_depth -= 1;
+                        };
                         const it = try c.checkExprCached(e.init, ann);
                         if (ann != types.no_type and ann != types.error_type) {
                             _ = try c.checkAssignable(it, ann, e.init, c.tokSpan(c.tree.nodeMainToken(member)));
