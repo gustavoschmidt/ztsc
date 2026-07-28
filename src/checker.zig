@@ -19159,13 +19159,23 @@ const Checker = struct {
         if (s.kind(con) != .type_param) return;
         const ki = tpIndex(tp_syms, s.typeParamSymbol(con)) orelse return;
         const ra = try c.resolveStructural(arg);
-        if (s.kind(ra) != .object) return;
         // An EMPTY object argument is informative, not a miss: `Pick<S, K>` with
         // no keys means `K = never` (`Pick<S, never>` = `{}`), which is what tsc
         // infers for `setState({})`. Bailing out left `K` to its `keyof S`
         // constraint, so the target became the whole state and `{}` failed with
         // every property reported missing.
-        const keys = try c.keyofType(ra);
+        //
+        // A DEFERRED MAPPED argument has no members to take `keyof` of, but it
+        // does carry its own key set: forwarding an already-`Pick<S, K2>`-typed
+        // value into `setState` must infer `K = K2` rather than leave `K` at its
+        // constraint. tsc reaches the same place through `inferFromTypes`'
+        // mapped-to-mapped rule (infer the source's constraint into the
+        // target's).
+        const keys = switch (s.kind(ra)) {
+            .object => try c.keyofType(ra),
+            .mapped => if (s.mappedAs(ra) == 0) try c.mappedKeySet(ra) else return,
+            else => return,
+        };
         // A key set is authoritative for its own param: an uninformative `any`
         // bound by a sibling union member (`Pick<S, K> | S | null`, where the
         // whole-`S` member matched first) must not survive next to it.
