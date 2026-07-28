@@ -20039,7 +20039,25 @@ const Checker = struct {
                 if (key.len != 0) return declared;
                 if (e.init == 0) return declared;
                 if (c.nodeTag(d.lhs) != .identifier) return declared;
-                const vt = c.nodeType(e.init) orelse try c.checkExprCached(e.init, types.no_type);
+                // Reading this variable can reach its declaration's flow node
+                // BEFORE the declaration statement itself is checked — a JSX
+                // attribute referring to a `const cb: CB = (props) => …`
+                // declared earlier in the file, or a cross-file demand. The
+                // initializer then has to be checked here, and checking it with
+                // NO contextual type is what the declaration statement would
+                // never do: an arrow's parameters get no contextual signature,
+                // materialize as `any`, and that answer is what the (cached)
+                // authoritative check reads back — TS7006 on every callback in
+                // the body. Supply the annotation, exactly as `checkDeclarator`
+                // does, so both orders produce the same signature.
+                // (`unique symbol` is left alone — it contextually types
+                // nothing, and resolving it here would raise TS1335 a second
+                // time, out of the declaration's own position.)
+                const ctx: TypeId = if (e.type_ann != 0 and c.nodeTag(e.type_ann) != .unique_symbol_type)
+                    try c.typeFromTypeNode(e.type_ann)
+                else
+                    types.no_type;
+                const vt = c.nodeType(e.init) orelse try c.checkExprCached(e.init, ctx);
                 return try c.assignmentReduced(declared, vt);
             },
             .assign => {
