@@ -4861,6 +4861,53 @@ const Checker = struct {
         return .{ .param = param, .ty = target, .asserts = asserts };
     }
 
+    /// Mark optional every property of `t` that the object binding pattern
+    /// `pat` destructures WITH A DEFAULT.
+    ///
+    /// tsc arrives here from the other side: the initializer of a
+    /// binding-pattern declaration is contextually typed by the pattern's
+    /// implied type — in which a destructured-with-default name is optional —
+    /// and `checkObjectLiteral`'s `contextualTypeHasPattern` branch copies that
+    /// `Optional` flag onto each matching literal property. The part of that
+    /// which the parameter's *type* depends on is exactly this flag transfer,
+    /// so it is done directly. (The other half of tsc's branch, TS2353 for an
+    /// initializer property the pattern does not name, is a separate
+    /// diagnostic and is not synthesized here.)
+    ///
+    /// Only a plain object type is rewritten: an initializer that is not an
+    /// object literal (a union, a callable) keeps whatever it has.
+    fn optionalizePatternDefaults(c: *Checker, t: TypeId, pat: Node) Error!TypeId {
+        if (pat == null_node or c.nodeTag(pat) != .object_pattern) return t;
+        if (c.ts.kind(t) != .object) return t;
+        if (c.ts.objectCallSigCount(t) != 0 or c.ts.objectConstructSigCount(t) != 0) return t;
+        const n = c.ts.objectPropCount(t);
+        if (n == 0) return t;
+        var props: std.ArrayList(types.Prop) = .empty;
+        defer props.deinit(c.scratch());
+        var changed = false;
+        for (0..n) |i| {
+            var p = c.ts.objectProp(t, @intCast(i));
+            if (p.flags & types.prop_flag_optional == 0 and try c.patternDefaultsProp(pat, p.name)) {
+                p.flags |= types.prop_flag_optional;
+                changed = true;
+            }
+            try props.append(c.scratch(), p);
+        }
+        if (!changed) return t;
+        return c.ts.makeObject(props.items, c.ts.objectStringIndex(t), c.ts.objectNumberIndex(t), c.ts.objectFlags(t));
+    }
+
+    /// Does the object binding pattern `pat` destructure `name` with a default?
+    fn patternDefaultsProp(c: *Checker, pat: Node, name: Atom) Error!bool {
+        for (c.tree.nodeRange(pat)) |el| {
+            if (el == null_node or c.nodeTag(el) != .binding_property) continue;
+            const ed = c.tree.nodeData(el);
+            if (ed.rhs == 0) continue; // no default
+            if ((try c.memberAtom(c.tree.nodeMainToken(el))) == name) return true;
+        }
+        return false;
+    }
+
     /// tsc's `parameterInitializerContainsUndefined`: can the parameter's
     /// default expression itself produce `undefined`? If it can, the parameter
     /// really is undefined-able inside the body and
@@ -4917,6 +4964,17 @@ const Checker = struct {
             ty = try c.typeFromTypeNode(type_ann);
         } else if (init_node != 0) {
             ty = try c.widenLiteral(try c.checkExprCached(init_node, types.no_type));
+            // A parameter whose NAME is an object binding pattern takes its
+            // type from the initializer, but each property the pattern
+            // destructures WITH A DEFAULT is optional there — the default
+            // supplies it, so a caller need not. tsc reaches the same place
+            // from the other side: it contextually types the initializer with
+            // the pattern's implied type and copies that type's `Optional` flag
+            // onto each matching literal property
+            // (`checkObjectLiteral`/`contextualTypeHasPattern`). Without it
+            // every property of `({ w = 1, h = 2 } = { w: 0, h: 0 })` came out
+            // REQUIRED and `f({ w: 5 })` reported TS2345.
+            ty = try c.optionalizePatternDefaults(ty, name_node);
         } else if (ctx_sig != types.no_type and c.ts.kind(ctx_sig) == .function) {
             if (try c.paramTypeAt(ctx_sig, index)) |ct| ty = ct;
         }
