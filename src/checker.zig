@@ -11443,6 +11443,18 @@ const Checker = struct {
         return (try c.isAssignable(a, b)) or (try c.isAssignable(b, a));
     }
 
+    /// tsc's `typeMaybeAssignableTo`: like `isAssignable`, except a UNION
+    /// source only has to have SOME constituent assignable to the target. Used
+    /// where the question is "could this value have come from that slot" rather
+    /// than "does this value fit that slot".
+    fn maybeAssignable(c: *Checker, a: TypeId, b: TypeId) Error!bool {
+        if (c.ts.kind(a) != .union_type) return c.isAssignable(a, b);
+        for (try c.memberList(a)) |m| {
+            if (try c.isAssignable(m, b)) return true;
+        }
+        return false;
+    }
+
     /// The `as`-cast overlap test (TS2352). tsc uses its *comparable* relation
     /// here, which is strictly more lenient than mutual assignability: an
     /// optional source property may satisfy a required target property
@@ -19462,6 +19474,21 @@ const Checker = struct {
 
     /// tsc's getAssignmentReducedType: keep declared-union constituents
     /// the assigned type is assignable to.
+    ///
+    /// "Assignable to" is tsc's `typeMaybeAssignableTo`, which for a UNION
+    /// source asks whether SOME constituent is assignable — not whether all of
+    /// them are. The difference decides whether a union survives its own
+    /// assignment: under the strict reading, writing `A | B` into a variable
+    /// declared `A | B` keeps only the constituents the WHOLE union fits, so a
+    /// variable initialized with `x || fallback` or `cond ? a : b` collapsed to
+    /// whichever arm happened to be a supertype of the other and lost the rest
+    /// — at the point of use, not at the expression.
+    ///
+    /// The reduced union is only taken when the assigned type actually fits it
+    /// (tsc's closing `isTypeAssignableTo` guard) — under the loosened filter a
+    /// kept set can otherwise fail to admit the very value being written. The
+    /// guard is inert for a non-union assigned type, where "some" and "all"
+    /// agree and the kept set trivially admits it.
     fn assignmentReduced(c: *Checker, declared: TypeId, assigned0: TypeId) Error!TypeId {
         const dk = c.ts.kind(declared);
         if (dk == .any or dk == .err or dk == .unknown) {
@@ -19470,15 +19497,19 @@ const Checker = struct {
         }
         const assigned = try c.ts.regular(try c.ts.regularLiteral(assigned0));
         if (dk != .union_type) return declared;
+        if (assigned == declared) return declared;
         var parts: std.ArrayList(TypeId) = .empty;
         defer parts.deinit(c.scratch());
         for (try c.memberList(declared)) |m| {
-            if (try c.isAssignable(assigned, m)) try parts.append(c.scratch(), m);
+            if (try c.maybeAssignable(assigned, m)) try parts.append(c.scratch(), m);
         }
-        if (parts.items.len == 0) {
-            for (try c.memberList(declared)) |m| {
-                if (try c.isComparable(assigned, m)) try parts.append(c.scratch(), m);
-            }
+        if (parts.items.len != 0) {
+            const reduced = try c.ts.makeUnion(c.scratch(), parts.items);
+            if (try c.isAssignable(assigned, reduced)) return reduced;
+            return declared;
+        }
+        for (try c.memberList(declared)) |m| {
+            if (try c.isComparable(assigned, m)) try parts.append(c.scratch(), m);
         }
         if (parts.items.len == 0) return declared;
         return c.ts.makeUnion(c.scratch(), parts.items);
