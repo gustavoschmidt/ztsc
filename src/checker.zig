@@ -19947,19 +19947,19 @@ const Checker = struct {
     /// symbol (`x.k`) *or* a depth-1 member path (`f.geometry.k`) — by reusing
     /// `refMatches` on the access base.
     ///
-    /// A *plain* `.k` access is a discriminant read. An *optional* `?.k` access
-    /// short-circuits to `undefined` when the base is nullish, so comparing it
-    /// is the optional-chain-containment pattern (handled downstream), not a
-    /// discriminant — accepted here only for a root-symbol ref, where tsc's
-    /// `getDiscriminantPropertyAccess` still treats `x?.k === lit` as a
-    /// discriminant (and where this preserves the pre-existing behavior). For a
-    /// member-path ref, only the plain access counts, so an optional discriminant
-    /// read on the tracked member (`m?.k`) stays with the containment machinery.
+    /// Both a plain `.k` and an optional `?.k` access count. tsc's
+    /// `getDiscriminantPropertyAccess` accepts either — an optional read
+    /// short-circuits to `undefined` when the base is nullish, which is exactly
+    /// what the discriminant filter then removes on the asserting branch (the
+    /// caller finishes the job with `narrowByOptChainContainment`, since a
+    /// member with no `k` at all is kept by the filter). The reference's depth
+    /// is likewise irrelevant: the union being filtered is the reference's own
+    /// type whether it is a root symbol (`x?.k`) or a member path
+    /// (`s.openDialog?.k`).
     fn discriminantOfRef(c: *Checker, node: Node, key: RefKey) Error!?TokenIndex {
         if (node == null_node) return null;
         switch (c.nodeTag(node)) {
-            .member_expr => {},
-            .optional_member_expr => if (key.len != 0) return null,
+            .member_expr, .optional_member_expr => {},
             else => return null,
         }
         const d = c.tree.nodeData(node);
