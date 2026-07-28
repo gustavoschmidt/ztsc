@@ -450,6 +450,7 @@ const map_containers = [_][]const u8{
     "class_ctor_cache",       "enum_value_cache",   "enum_info_cache",
     "alias_generic",          "alias_state",        "alias_recursive",
     "flow_same",              "flow_narrow",        "ref_keys",
+    "flow_loop_stack",        "flow_stack",         "flow_tmp",
     "da_cache",               "ctp_cache",          "cmp_cache",
     "inst_cache",             "inst_map_ids",       "tp_constraint_cache",
     "fresh_tp_ids",           "fresh_tp_info",      "type_node_cache",
@@ -663,6 +664,28 @@ const Checker = struct {
     /// The other ~1.5%: queries that actually narrowed. Disjoint from
     /// `flow_same` (a key is moved here when its result comes back != declared).
     flow_narrow: std.AutoHashMapUnmanaged(FlowQ, TypeId) = .empty,
+    /// The queries currently on the `flowType` walk stack, innermost last.
+    /// Only consulted on a `flow_same` hit under a back-edge walk (see
+    /// `flowInFlight`), so a push/pop list beats a hash set by a wide margin.
+    flow_stack: std.ArrayList(FlowQ) = .empty,
+    /// Nesting bound for the re-walk `flowInFlight` unlocks.
+    flow_busy_depth: u32 = 0,
+    /// Transient memo for re-entrant answers taken while a loop fixpoint is in
+    /// flight. They are derived from a *partial* fixpoint, so they must never
+    /// reach `flow_same`/`flow_narrow`; without the memo the re-walk that
+    /// produces them is exponential, because every node on the re-walked chain
+    /// re-checks the expression that caused the re-entry. Valid only while some
+    /// back-edge walk is in flight, so it is dropped when the outermost one
+    /// finishes.
+    flow_tmp: std.AutoHashMapUnmanaged(FlowQ, TypeId) = .empty,
+    /// tsc's in-process loop-label stack. A query that re-enters a loop label
+    /// still being computed is answered with the partial union gathered so far
+    /// (see `LoopFrame`), never with the declared type.
+    flow_loop_stack: std.ArrayList(LoopFrame) = .empty,
+    /// Nesting depth of loop-label BACK-edge walks. Non-zero means every flow
+    /// answer being computed right now is taken against a partial fixpoint, so
+    /// it belongs in `flow_tmp` rather than the persistent cache.
+    flow_back_edge: u32 = 0,
     /// Interned narrowing reference keys (RefQ -> dense index).
     ref_keys: std.AutoHashMapUnmanaged(RefQ, u32) = .empty,
     /// (flow << 32 | symbol) -> definitely-assigned (2 computing, 0/1 result).
@@ -20030,6 +20053,12 @@ const Checker = struct {
     const RefQ = struct { key: RefKey, declared: TypeId };
     const SymLoop = struct { sym: SymbolId, scope: ScopeId };
 
+    /// One in-progress loop-label query (tsc's `flowLoopNodes` /
+    /// `flowLoopKeys` / `flowLoopTypes` stack). `parts` points at the live
+    /// antecedent-type list of the `flowTypeInner` frame that owns the label,
+    /// so a re-entrant query reads the union computed *so far*.
+    const LoopFrame = struct { q: FlowQ, parts: *std.ArrayList(TypeId) };
+
     fn refKeyIndex(c: *Checker, key: RefKey, declared: TypeId) Error!u32 {
         const gop = try c.ref_keys.getOrPut(c.cm(), .{ .key = key, .declared = declared });
         if (!gop.found_existing) gop.value_ptr.* = @intCast(c.ref_keys.count());
@@ -20228,20 +20257,91 @@ const Checker = struct {
         return t;
     }
 
+    /// Is this query already on the walk stack (still being computed)? Only
+    /// asked on a `flow_same` hit under a back-edge walk, which is why a linear
+    /// scan of a push/pop stack is the right shape: a second hash map on the
+    /// `flowType` hot path measured +330 ms of check time on the dogfood app,
+    /// three times the whole flow phase.
+    fn flowInFlight(c: *const Checker, q: FlowQ) bool {
+        var i: usize = c.flow_stack.items.len;
+        while (i > 0) : (i -= 1) {
+            if (c.flow_stack.items[i - 1] == q) return true;
+        }
+        return false;
+    }
+
     fn flowType(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth: u32) Error!TypeId {
         if (flow == binder.no_flow) return declared;
         if (flow == binder.unreachable_flow) return types.never_type;
         if (depth > 4000) return declared; // pathological chains: stay sound
         const q: FlowQ = (@as(u64, c.cur_flow_base + flow) << 32) | try c.refKeyIndex(key, declared);
-        // `flow_same` covers both cached states that answer `declared`: an
-        // in-progress query (loop re-entry) and a finished query that narrowed
+        // tsc's `getTypeAtFlowLoopLabel` in-process check. Re-entering a loop
+        // label that is still computing (the walk came back round the loop, or
+        // an assignment's right-hand side reads the very reference the label is
+        // resolving) answers with the union of the antecedent types gathered so
+        // far — tsc's *incomplete* FlowType — not with the declared type. That
+        // partial value is what makes the fixpoint converge for a self-reading
+        // loop assignment (`x = x.replace(…)` under an `x !== undefined`
+        // guard): the read sees the narrowed entry type instead of re-widening.
+        if (c.flow_loop_stack.items.len != 0 and c.bind.flow_tags[flow] == .loop_label) {
+            var i: usize = c.flow_loop_stack.items.len;
+            while (i > 0) : (i -= 1) {
+                const fr = &c.flow_loop_stack.items[i - 1];
+                if (fr.q != q or fr.parts.items.len == 0) continue;
+                return c.ts.makeUnion(c.scratch(), fr.parts.items);
+            }
+        }
+        // `flow_same` covers both states that answer `declared`: a query still
+        // in progress (the walk stack below) and a finished one that narrowed
         // nothing. `flow_narrow` holds the rest, and the two are disjoint.
-        if (c.flow_same.contains(q)) return declared;
+        if (c.flow_same.contains(q)) {
+            // Under a back-edge walk the two states are *not* interchangeable.
+            // Every node between the re-entering reference and its loop label
+            // is in flight (a `for..of`/`for..in` binding is itself an
+            // assignment node, so there is always at least one), and answering
+            // `declared` there swallows the partial the label is publishing —
+            // the very widening this mechanism removes. Re-walk instead,
+            // bounded, and memoize in `flow_tmp`. Everywhere else the old,
+            // cheap answer stands: outside a back-edge walk there is no partial
+            // for an in-flight node to swallow.
+            if (c.flow_back_edge != 0 and c.flow_busy_depth < 4 and c.flowInFlight(q)) {
+                if (c.flow_tmp.get(q)) |t| return t;
+                c.flow_busy_depth += 1;
+                defer c.flow_busy_depth -= 1;
+                const r = try c.flowTypeInner(flow, key, declared, depth);
+                try c.flow_tmp.put(c.cm(), q, r);
+                return r;
+            }
+            return declared;
+        }
         if (c.flow_narrow.get(q)) |t| return t;
+        // Everything computed while a loop label's BACK edges are walked is
+        // computed against the partial fixpoint that label publishes, so it is
+        // only valid inside that walk: it goes to `flow_tmp` (dropped when the
+        // outermost label finishes) and never to the persistent cache, which
+        // therefore only ever holds answers taken against *finished* labels.
+        //
+        // Marking that positionally rather than tainting the values is what
+        // makes it affordable: the label's own result is decided *outside* its
+        // back-edge walk, so it is always cached. Propagating an incompleteness
+        // bit up the walk instead — tsc's literal `isIncomplete` — keeps whole
+        // nests of labels out of the cache, and each uncached label re-walks
+        // back edges that re-check expressions that start fresh walks over the
+        // same uncached labels: measured at three orders of magnitude.
+        if (c.flow_back_edge != 0) {
+            if (c.flow_tmp.get(q)) |t| return t;
+        }
         // Mark in progress. If the result turns out to be `declared` this
         // entry *is* the final answer, so the common case never writes twice.
         try c.flow_same.put(c.cm(), q, {});
+        try c.flow_stack.append(c.cm(), q);
         const result = try c.flowTypeInner(flow, key, declared, depth);
+        _ = c.flow_stack.pop();
+        if (c.flow_back_edge != 0) {
+            _ = c.flow_same.remove(q);
+            try c.flow_tmp.put(c.cm(), q, result);
+            return result;
+        }
         // `no_type` is not storable as a result (it was the old in-progress
         // sentinel and still reads back as "declared"); leaving such a result
         // in `flow_same` reproduces the previous behaviour exactly.
@@ -20441,11 +20541,51 @@ const Checker = struct {
                 }
                 var parts: std.ArrayList(TypeId) = .empty;
                 defer parts.deinit(c.scratch());
-                for (antes) |a| {
+                // The binder lays a loop label out as antecedent[0] = the
+                // non-looping entry edge and [1..] = the back edges. tsc walks
+                // the entry edge first, then publishes the partial union on the
+                // in-process stack while it walks the back edges, so any query
+                // that comes back round to this label reads that partial
+                // instead of the declared type (see `flowType`).
+                const looping = b.flow_tags[flow] == .loop_label and antes.len > 1;
+                var frame: usize = 0;
+                var published = false;
+                for (antes, 0..) |a, i| {
+                    // Publish only when the entry edge actually carries a
+                    // narrowing. With `parts[0] == declared` the partial union
+                    // *is* the declared type, so every answer it could give is
+                    // the answer the old in-progress sentinel already gave —
+                    // and skipping the publication keeps the re-walk (and the
+                    // suppressed expression memo below) off the overwhelming
+                    // majority of loops, which is what keeps the check phase
+                    // where it was.
+                    if (looping and i == 1 and parts.items.len != 0 and parts.items[0] != declared) {
+                        published = true;
+                        frame = c.flow_loop_stack.items.len;
+                        const q: FlowQ = (@as(u64, c.cur_flow_base + flow) << 32) |
+                            try c.refKeyIndex(key, declared);
+                        try c.flow_loop_stack.append(c.cm(), .{ .q = q, .parts = &parts });
+                        c.flow_back_edge += 1;
+                        // Everything a back edge re-checks (an assignment's
+                        // right-hand side, a guard call) is evaluated against
+                        // the *partial* fixpoint, so its type must not be
+                        // published as the node's answer — the authoritative
+                        // check re-runs it against the finished label. tsc drops
+                        // `flowTypeCache` around exactly this walk.
+                        c.no_publish_depth += 1;
+                    }
                     const t = try c.flowType(a, key, declared, depth + 1);
-                    // In-progress loop back-edges return `declared`
-                    // (tsc: start from declared type at back edges).
                     if (t != types.never_type) try parts.append(c.scratch(), t);
+                }
+                if (published) {
+                    c.flow_loop_stack.shrinkRetainingCapacity(frame);
+                    c.flow_back_edge -= 1;
+                    c.no_publish_depth -= 1;
+                    // The partial answers only mean anything while some loop
+                    // fixpoint is in flight; once the outermost one finishes,
+                    // every query re-runs against the finished labels and lands
+                    // in the persistent cache.
+                    if (c.flow_back_edge == 0) c.flow_tmp.clearRetainingCapacity();
                 }
                 if (parts.items.len == 0) return types.never_type;
                 return c.ts.makeUnion(c.scratch(), parts.items);
