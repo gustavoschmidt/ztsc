@@ -9920,6 +9920,31 @@ const Checker = struct {
                     // this the intersection fell through to `{}` and dropped
                     // them all (e.g. `WithBaseUIEvent<ComponentPropsWithRef<'img'>>`,
                     // whose argument is `ClassAttributes & ImgHTMLAttributes`).
+                    // An intersection constituent may be an ARRAY or a TUPLE
+                    // (`readonly [number, number] & { _brand }` — a branded
+                    // point). `collectHomoProps` only collects named props, so
+                    // the array half was dropped outright and `Mutable<Point>`
+                    // came out as just `{ _brand }`: no `length`, no element
+                    // access, not assignable to the tuple. Map each array-ish
+                    // constituent by its own rule and intersect the results
+                    // with the mapped named props. tsc instead materializes the
+                    // full apparent member set of the intersection (a numeric
+                    // index signature plus every `Array.prototype` member);
+                    // keeping the tuple/array shape is the same relation with a
+                    // far smaller type, and it prints as the source does.
+                    // The member slice is duplicated first: the per-constituent
+                    // recursion materializes new types and may reallocate the
+                    // store's member backing.
+                    var arrayish: std.ArrayList(TypeId) = .empty;
+                    defer arrayish.deinit(c.scratch());
+                    if (s.kind(src) == .intersection) {
+                        const imembers = try c.scratch().dupe(TypeId, try c.memberList(src));
+                        for (imembers) |m| {
+                            const rm = try c.resolveStructural(m);
+                            if (s.kind(rm) != .array and s.kind(rm) != .tuple) continue;
+                            try arrayish.append(c.scratch(), try c.materializeMapped(key_param, constraint, value, as_clause, rm, flags));
+                        }
+                    }
                     var srcprops: std.ArrayList(types.Prop) = .empty;
                     defer srcprops.deinit(c.scratch());
                     try c.collectHomoProps(src, &srcprops);
@@ -9957,7 +9982,10 @@ const Checker = struct {
                             nindex = v;
                         }
                     }
-                    return c.objectFromProps(props.items, sindex, nindex);
+                    const empty = props.items.len == 0 and sindex == 0 and nindex == 0;
+                    if (arrayish.items.len == 0) return c.objectFromProps(props.items, sindex, nindex);
+                    if (!empty) try arrayish.append(c.scratch(), try c.objectFromProps(props.items, sindex, nindex));
+                    return s.makeIntersection(c.scratch(), arrayish.items);
                 },
                 else => return types.empty_object_type,
             }
