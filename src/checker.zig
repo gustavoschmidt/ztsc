@@ -515,7 +515,9 @@ const Checker = struct {
     diag_seen: std.AutoHashMapUnmanaged(u128, void) = .empty,
     /// `(file << 32) | code` -> index into `diags` of this file's single
     /// instantiation-limit diagnostic (see `instLimitDiag`). Indices stay
-    /// valid: `diags` only grows until `seal`.
+    /// valid: `diags` only grows until `seal`, except for the speculative
+    /// rollback in `argumentsMatch`, which goes through `rollbackDiags` and
+    /// drops any entry it would strand.
     inst_diag_at: std.AutoHashMapUnmanaged(u64, usize) = .empty,
 
     // --- caches (checker arena) -------------------------------------------
@@ -1735,6 +1737,44 @@ const Checker = struct {
         if (gop.found_existing) return;
         const msg = try std.fmt.allocPrint(c.out, fmt, args);
         try c.diags.append(c.gpa, .{ .code = code, .file = c.cur_file, .span = span, .msg = msg });
+    }
+
+    /// Withdraw the diagnostics a speculative stretch of checking filed,
+    /// restoring the state a *silent* probe would have left.
+    ///
+    /// This is more than `diags.items.len = saved`, because `diagFmt` writes a
+    /// second, permanent record: the (file, code, span-start) key in
+    /// `diag_seen`. Truncating the list alone erases the diagnostic *and keeps
+    /// its suppression*, so the next check of the same expression is swallowed
+    /// forever. A rejected overload candidate contextually types an arrow
+    /// argument, walks its body, files the body's errors, and the truncation
+    /// then poisons every one of those spans against the WINNING candidate's
+    /// re-walk: the body is checked twice and reported zero times, which is
+    /// indistinguishable from never being checked at all.
+    ///
+    /// `instLimitDiag` stores *indices* into `diags`; any pointing into the
+    /// window are dropped rather than remapped (the map is empty on nearly every
+    /// run — hence the count guard — and a dropped anchor at worst lets a later
+    /// trip re-file the file's single TS2589, where the previous code left the
+    /// index dangling onto an unrelated diagnostic).
+    fn rollbackDiags(c: *Checker, saved: usize) void {
+        if (c.diags.items.len == saved) return;
+        // `remove` invalidates the iterator, so restart after each hit.
+        while (c.inst_diag_at.count() > 0) {
+            var stale: ?u64 = null;
+            var it = c.inst_diag_at.iterator();
+            while (it.next()) |e| {
+                if (e.value_ptr.* >= saved) {
+                    stale = e.key_ptr.*;
+                    break;
+                }
+            }
+            _ = c.inst_diag_at.remove(stale orelse break);
+        }
+        for (c.diags.items[saved..]) |d| {
+            _ = c.diag_seen.remove((@as(u128, d.file) << 64) | (@as(u128, d.code) << 32) | d.span.start);
+        }
+        c.diags.items.len = saved;
     }
 
     fn scopeOf(c: *Checker, node: Node) Error!?ScopeId {
@@ -19822,6 +19862,10 @@ const Checker = struct {
         // back on every rejecting return so only the ACCEPTED candidate's
         // argument diagnostics survive (emitted once here; `checkCallArguments`
         // then cache-hits the same (node, ctx) check without duplicating them).
+        // The rollback MUST go through `rollbackDiags`: dropping the list
+        // entries while leaving their `diag_seen` keys behind suppresses the
+        // winning candidate's re-check of the very same spans, which is what
+        // made whole function bodies read as never checked.
         const saved_diags = c.diags.items.len;
         var ai: u32 = 0;
         for (arg_nodes) |an| {
@@ -19829,7 +19873,7 @@ const Checker = struct {
             defer ai += 1;
             if (c.nodeTag(an) == .spread_element) return true; // don't reject on spreads
             const pt = try c.paramTypeAt(sig, ai) orelse {
-                c.diags.items.len = saved_diags;
+                c.rollbackDiags(saved_diags);
                 return false;
             };
             const tag = c.nodeTag(an);
@@ -19882,7 +19926,7 @@ const Checker = struct {
             };
             if (fn_arg) c.no_publish_depth -= 1;
             if (!try c.isAssignable(at, pt)) {
-                c.diags.items.len = saved_diags;
+                c.rollbackDiags(saved_diags);
                 return false;
             }
         }
