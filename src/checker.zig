@@ -4340,8 +4340,26 @@ const Checker = struct {
                 }
             },
             .intersection => {
+                // tsc spreads the *apparent* members of the intersection, and a
+                // name declared by more than one constituent has the
+                // INTERSECTION of its declared types (`getPropertyOfUnionOr
+                // IntersectionType` synthesizes one symbol per name). Recursing
+                // per constituent and letting the last one win instead threw the
+                // narrower declaration away: `{ height?: number } & { height?:
+                // string | number }` spread to `height?: string | number`, which
+                // then failed assignment back to the very type it came from.
+                // The constituents are still walked first — for their index
+                // signatures, and to collect the name set in declaration order.
+                var names: std.ArrayList(types.Prop) = .empty;
+                defer names.deinit(c.scratch());
+                var nindex: std.AutoHashMapUnmanaged(Atom, u32) = .empty;
+                defer nindex.deinit(c.scratch());
                 for (try c.memberList(st)) |m| {
-                    try c.gatherSpreadProps(try c.resolveStructural(m), props, prop_index, str_index_vals, num_index_vals);
+                    try c.gatherSpreadProps(try c.resolveStructural(m), &names, &nindex, str_index_vals, num_index_vals);
+                }
+                for (names.items) |p| {
+                    const merged = (try c.propOfTypeEx(st, p.name, false)) orelse p;
+                    try c.addSpreadProp(merged, props, prop_index);
                 }
             },
             .union_type => {
