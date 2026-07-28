@@ -13954,16 +13954,24 @@ const Checker = struct {
                 // `expr as const`: a const assertion. Check the operand in
                 // const context (readonly/non-widened literals) and return
                 // that type; there is no target to compare against.
+                // The assertion does not stop contextual typing — `.satisfies_expr`
+                // below is the model. For `as const` the operand's context is the
+                // OUTER one (a const assertion names no target of its own); for
+                // `as T` it is `T`. Dropping it left the operand of
+                // `((event) => { … }) as TFunction` with no contextual signature,
+                // so its parameters reported TS7006 while the parenthesized
+                // assertion-free sibling was fine.
                 if (c.nodeTag(d.rhs) == .const_type) {
                     const prev = c.const_ctx;
                     c.const_ctx = true;
                     defer c.const_ctx = prev;
-                    const et = try c.checkExprCached(d.lhs, types.no_type);
+                    const et = try c.checkExprCached(d.lhs, ctx);
                     // De-fresh a bare primitive literal so it does not widen.
                     return c.ts.regularLiteral(et);
                 }
-                const et = try c.checkExprCached(d.lhs, types.no_type);
+                // The target type first: it is the operand's contextual type.
                 const tt = try c.typeFromTypeNode(d.rhs);
+                const et = try c.checkExprCached(d.lhs, tt);
                 if (tt == types.error_type) return et;
                 if (!try c.castComparable(try c.widenLiteral(et), tt)) {
                     try c.diagFmt(2352, c.nodeSpan(node), "Conversion of type '{s}' to type '{s}' may be a mistake because neither type sufficiently overlaps with the other. If this was intentional, convert the expression to 'unknown' first.", .{
