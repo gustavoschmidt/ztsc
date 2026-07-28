@@ -12300,6 +12300,25 @@ const Checker = struct {
         // distribution because `keyof T` is assignable to the whole key union,
         // not to any single member. Identity (`keyof T <: keyof T`) is caught
         // by the `s == t` fast path.
+        // Deferred `keyof T` TARGET (tsc `structuredTypeRelatedTo`, Index as
+        // target). Two rules, both purely additive:
+        //   - `keyof S` is assignable to `keyof T` exactly when T is assignable
+        //     to S (fewer members ⇒ more keys), and
+        //   - any S is assignable to `keyof T` when it is assignable to
+        //     `keyof C`, C being T's constraint. That is what makes
+        //     `pick(o, "id")` legal for `pick<T, K extends keyof T>` called with
+        //     an `o: Partial<U>` where `U extends { id: … }`: without it the
+        //     literal met the still-deferred `keyof T` and was rejected, and the
+        //     inferred `K` collapsed to `never`.
+        if (tk == .keyof_op) {
+            const t_op = c.ts.keyofOperand(t);
+            if (sk == .keyof_op and try c.isAssignable(t_op, c.ts.keyofOperand(s))) return true;
+            const bc = try c.transitiveBaseConstraint(t_op);
+            if (bc != t_op) {
+                const keys = try c.keyofType(bc);
+                if (keys != t and try c.isAssignable(s, keys)) return true;
+            }
+        }
         if (sk == .keyof_op) return c.isAssignable(try c.propertyKeyType(), t);
         // Enum *source* against a non-enum target. Handled before union-target
         // distribution, because what an enum relates to is a whole union, not
