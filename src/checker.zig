@@ -22273,11 +22273,83 @@ const Checker = struct {
                 const obj = try c.declaredPathTypeInner(d.lhs);
                 if (obj == types.no_type) return types.no_type;
                 const name = try c.memberAtom(d.rhs);
-                const p = (try c.propOfType(try c.nonNullable(obj), name)) orelse return types.no_type;
+                const recv = try c.nonNullable(obj);
+                // The identifier arm's rule, one level down: a property lookup
+                // on a class whose own member table is mid-materialization
+                // would *build* that table, so answer "no information" instead.
+                if (try c.classSideOnCycle(recv, 0)) return types.no_type;
+                const p = (try c.propOfType(recv, name)) orelse return types.no_type;
                 return p.ty;
             },
             else => return types.no_type,
         }
+    }
+
+    /// Is `recv` a CLASS receiver — `typeof C` (the static side) or a `C`
+    /// instance — whose member table is *currently being materialized*?
+    ///
+    /// `propOfType` on such a receiver runs `classStaticType` / `expandRef`,
+    /// computing every member's type. That is exactly what a narrowing query
+    /// must never do while the class is on the cycle: a sibling whose own
+    /// materialization is already on the stack answers `any` (`typeOfSymbol`'s
+    /// cycle break), and that `any` is then memoized as the *asking* member's
+    /// type for the rest of the run.
+    ///
+    /// That is the circular-accessor defect. A static getter whose body narrows
+    /// a field it initializes (`if (!C._r) C._r = C.init(); return C._r;`) was
+    /// demanded from inside `init`'s own return-type inference, because the
+    /// effects-signature probe on an ordinary call statement in that body
+    /// (`C.reg.call(o);` → `guardCallOf` → `declaredPathType` → here) built
+    /// `typeof C`. With `init` in progress the assignment's right-hand side
+    /// reads as `any`, `assignmentReduced` keeps the DECLARED `… | undefined`,
+    /// and the getter caches that — a `possibly undefined` on every later read.
+    ///
+    /// tsc never gets there: its equivalent probe (`getEffectsSignature` →
+    /// `getTypeOfDottedName`) resolves one property symbol, and the predicate
+    /// test it feeds (`hasTypePredicateOrNeverReturnType`) consults only an
+    /// *annotated* return type, so no inferred return is ever forced.
+    ///
+    /// The answer here is the same shape as `refExpansionActive` /
+    /// `lazyRefProp`: off the cycle nothing changes (the caller's ordinary
+    /// `propOfType` runs, byte for byte as before); on it the query answers
+    /// `no_type`, "no information" — the sound under-narrowing it already
+    /// promises for everything it cannot resolve exactly.
+    fn classSideOnCycle(c: *Checker, recv: TypeId, depth: u32) Error!bool {
+        if (depth >= lazy_base_depth) return false;
+        const statics = switch (c.ts.kind(recv)) {
+            .class_value => true,
+            .ref => false,
+            else => return false,
+        };
+        const cls = if (statics) c.ts.classSymbol(recv) else c.ts.refSymbol(recv);
+        if (!c.symFlags(cls).class) return false;
+        // The instance side marks its own in-progress table (`expandRef` and
+        // `classInstanceGeneric` both park `no_type` there).
+        if (!statics and c.refExpansionActive(recv)) return true;
+        // Either side is also on the cycle when one of its member symbols is
+        // mid-`typeOfSymbol` — which is how `classStaticType`'s loop, and every
+        // demand that reaches a member directly, marks its progress.
+        const saved_ctx = c.enterSymFile(cls);
+        defer c.restoreCtx(saved_ctx);
+        if (if (statics) c.bind.staticsScopeOf(c.localOf(cls)) else c.bind.membersScopeOf(c.localOf(cls))) |ms| {
+            const lo = c.bind.scope_members_start[ms];
+            const hi = c.bind.scope_members_start[ms + 1];
+            for (lo..hi) |i| {
+                const msym = c.toGlobal(c.bind.member_syms[i]);
+                if (msym == binder.no_symbol or msym >= c.sym_types.items.len) continue;
+                if (c.sym_state.items[msym] == .in_progress) return true;
+            }
+        }
+        // Inherited members come from the base's table, so a base on the cycle
+        // is this receiver on the cycle too.
+        if (try c.baseClassSym(cls)) |base| {
+            const base_recv = if (statics)
+                try c.ts.makeClassValue(base)
+            else
+                try c.ts.makeRef(base, &.{});
+            return c.classSideOnCycle(base_recv, depth + 1);
+        }
+        return false;
     }
 
     /// A resolved predicate call: the callee's predicate and the argument
@@ -22307,10 +22379,26 @@ const Checker = struct {
         // structurally instead (`declaredPathType`): a type predicate is a
         // property of the declaration, so the declared type answers the
         // question, and the lookup neither narrows, checks nor memoizes.
+        //
+        // A plain NAME follows tsc's `getExplicitTypeOfSymbol`: a function,
+        // class or namespace is resolved outright, but a *variable without a
+        // type annotation* is not — computing it here would run its
+        // initializer's inference from inside the flow walk. tsc gives up
+        // entirely there; ztsc uses the answer when the symbol happens to be
+        // resolved already (`declaredPathType`) and otherwise treats the call
+        // as carrying no information. An unannotated `const f = (…) => {…}`
+        // holding an *assertion* is not expressible anyway — `asserts x is T`
+        // is a return-type annotation — so nothing is lost, while the arrow
+        // body (which may reach back into a class whose members are mid-
+        // materialization) is never checked at this point.
         const callee = shape.callee;
         const callee_t = switch (c.nodeTag(callee)) {
             .member_expr, .optional_member_expr, .index_expr, .optional_index_expr => c.nodeType(callee) orelse
                 try c.declaredPathType(callee),
+            .identifier => if (c.calleeNeedsExplicitDecl(callee))
+                c.nodeType(callee) orelse try c.declaredPathType(callee)
+            else
+                try c.checkExprCached(callee, types.no_type),
             else => try c.checkExprCached(callee, types.no_type),
         };
         if (callee_t == types.no_type) return null;
@@ -22321,6 +22409,62 @@ const Checker = struct {
         const arg = shape.arg_nodes[pred.param];
         if (arg == null_node) return null;
         return .{ .pred = pred, .arg = arg };
+    }
+
+    /// tsc's `isDeclarationWithExplicitTypeAnnotation`, asked the other way
+    /// round: does this plain-name callee resolve to a VARIABLE whose type
+    /// would have to be *inferred from an initializer*? That is the one case
+    /// `getExplicitTypeOfSymbol` refuses to resolve, because inferring it is
+    /// arbitrary work — including a function-body walk — pulled into the
+    /// middle of a flow walk.
+    ///
+    /// ztsc keeps one case tsc gives up on, because it costs nothing and the
+    /// app relies on it: an unannotated `const isX = (n): n is T => …`. The
+    /// predicate a guard probe is looking for *is* a return-type annotation,
+    /// so a declaration that carries one can be resolved without inferring
+    /// anything, and a declaration that carries none has no predicate to
+    /// find — resolving it could only cost a body walk.
+    fn calleeNeedsExplicitDecl(c: *Checker, callee: Node) bool {
+        const tok = c.tree.nodeMainToken(callee);
+        const a = c.atomOfToken(tok) catch return false;
+        const sym = switch (c.resolveSpace(a, c.cur_scope, true)) {
+            .sym => |s| s,
+            else => return false,
+        };
+        if (sym == binder.no_symbol) return false;
+        const f = c.symFlags(sym);
+        if (!(f.var_decl or f.let_decl or f.const_decl)) return false;
+        const saved = c.enterSymFile(sym);
+        defer c.restoreCtx(saved);
+        for (c.declsOf(sym)) |decl| {
+            const d = c.tree.nodeData(decl);
+            switch (c.nodeTag(decl)) {
+                .declarator_init => {
+                    // `const x = <init>` — no annotation by construction.
+                    if (d.rhs != 0 and c.initReturnsPredicate(d.rhs)) return false;
+                },
+                .declarator_full => {
+                    const e = c.tree.extraData(ast.DeclaratorFull, d.rhs);
+                    if (e.type_ann != 0) return false; // annotated: resolve it
+                    if (e.init != 0 and c.initReturnsPredicate(e.init)) return false;
+                },
+                else => {},
+            }
+        }
+        return true;
+    }
+
+    /// Is `init` a function/arrow literal whose RETURN TYPE ANNOTATION is a
+    /// type predicate (`x is T` / `asserts x is T`)? The only initializer
+    /// shape a guard probe can learn anything from without inferring.
+    fn initReturnsPredicate(c: *Checker, init_node: Node) bool {
+        switch (c.nodeTag(init_node)) {
+            .arrow_fn, .function_expr => {},
+            else => return false,
+        }
+        const proto = c.tree.extraData(ast.FnProto, c.tree.nodeData(init_node).lhs);
+        if (proto.return_type == 0) return false;
+        return c.nodeTag(proto.return_type) == .type_predicate;
     }
 
     /// If `call`'s callee is a predicate signature whose guarded parameter
