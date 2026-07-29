@@ -125,3 +125,16 @@ calls/041_rest_param_union_of_arrays.ts  -TS2345 27
 # unusable access is still rejected (the TS2322 on the same line), so nothing
 # passes silently; only the second, more specific diagnostic is missing.
 indexed/028_index_target_constraint_negatives.ts  -TS2536 31
+
+# Element access with a UNION key is distributed only when every constituent
+# resolves (indexed/029); when one does not, the access keeps the `any` it
+# always had. tsc reports TS7053 there — an implicit-'any' element access — and
+# ztsc's element-access path emits TS7053 only for a SINGLE unresolved key, not
+# for a key set. Line 19 is the same shape one level down: the union reaches the
+# tuple's numeric index signature, so the assignment is still rejected (the
+# TS2322 on that line), but the out-of-range constituent is not named.
+# Deterministic under-reports; the case exists to pin that the distribution
+# stays out of these three.
+indexed/030_element_access_union_key_negatives.ts  -TS7053 9
+indexed/030_element_access_union_key_negatives.ts  -TS7053 14
+indexed/030_element_access_union_key_negatives.ts  -TS2493 19

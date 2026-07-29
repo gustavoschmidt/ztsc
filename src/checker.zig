@@ -4173,6 +4173,56 @@ const Checker = struct {
         }
     }
 
+    /// Upper bound on the constituents of a distributed element access. The work
+    /// is linear in this number and the key sets that need it are hand-written
+    /// unions; a wider key set keeps the caller's `any`.
+    const max_union_index_keys = 64;
+
+    /// `o[k]` where the KEY is a union of literals: tsc's `getIndexedAccessType`
+    /// distributes, so the access is `o[k1] | o[k2] | …`. Returns null — leaving
+    /// the caller's own single-key handling in charge — unless every constituent
+    /// resolves, so a key set that is partly unknown still reaches the caller's
+    /// implicit-any reporting instead of being silently narrowed here.
+    fn unionIndexElemType(c: *Checker, r: TypeId, idx_t: TypeId) Error!?TypeId {
+        if (c.ts.kind(idx_t) != .union_type) return null;
+        const rk = c.ts.kind(r);
+        // A branded tuple indexes through its tuple constituent, as in the
+        // single-number-literal arm.
+        const rt = if (rk == .intersection)
+            (try c.indexableConstituent(r)) orelse r
+        else
+            r;
+        const keys = try c.memberList(idx_t);
+        if (keys.len == 0 or keys.len > max_union_index_keys) return null;
+        const parts = try c.scratch().alloc(TypeId, keys.len);
+        for (keys, 0..) |k, i| {
+            const rl = try c.ts.regularLiteral(k);
+            switch (c.ts.kind(rl)) {
+                .string_literal => {
+                    const name = c.ts.literalAtom(rl);
+                    if (try c.propOfType(r, name)) |p| {
+                        parts[i] = if (p.optional()) try c.makeUnion2(p.ty, types.undefined_type) else p.ty;
+                    } else if (rk == .object and c.ts.objectStringIndex(r) != 0) {
+                        parts[i] = c.ts.objectStringIndex(r);
+                    } else return null;
+                },
+                .number_literal => {
+                    if (c.ts.kind(rt) != .tuple) return null;
+                    const v = c.ts.numberValue(rl);
+                    const iv: u32 = if (v >= 0 and v == @floor(v) and v < 4096) @intFromFloat(v) else 4096;
+                    if (iv < c.ts.tupleLen(rt)) {
+                        const e = c.ts.tupleElem(rt, iv);
+                        parts[i] = if (e.optional()) try c.makeUnion2(e.ty, types.undefined_type) else e.ty;
+                    } else if (try c.tupleElemTypeAt(rt, iv)) |et| {
+                        parts[i] = et;
+                    } else return null;
+                },
+                else => return null,
+            }
+        }
+        return try c.ts.makeUnion(c.scratch(), parts);
+    }
+
     /// The constituent of an intersection that carries element access — a
     /// branded tuple/array (`[X, Y] & { _brand: "t" }`, the `Ordered`/`LocalPoint`
     /// shape) or, failing that, the first constituent with an index signature.
@@ -17257,7 +17307,16 @@ const Checker = struct {
             return result;
         }
         const ik = c.ts.kind(try c.ts.regularLiteral(idx_t));
-        switch (ik) {
+        // tsc's `getIndexedAccessType` distributes over a UNION index type:
+        // `o[k]` with `k: "a" | "b"` is `o["a"] | o["b"]`. Without this arm a
+        // union key matched none of the kinds below and fell through to the
+        // string-like `else`, where an object with no string index signature
+        // yields `any` — so every read through a `Record<SomeUnion, T>` lost
+        // its type, and with it the contextual signature of any callback the
+        // read fed (`map[dir].map((c) => c)`).
+        if (try c.unionIndexElemType(r, idx_t)) |ut| {
+            result = ut;
+        } else switch (ik) {
             .string_literal => {
                 const key = c.ts.literalAtom(try c.ts.regularLiteral(idx_t));
                 if (try c.propOfType(r, key)) |p| {
