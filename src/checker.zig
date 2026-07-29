@@ -8244,6 +8244,48 @@ const Checker = struct {
         }
     }
 
+    /// One own static member of `cls`, resolved WITHOUT materializing its
+    /// siblings — tsc's `getPropertyOfType` on the static side, which reaches
+    /// the member symbol and then `getTypeOfSymbol` on it alone.
+    ///
+    /// Going through `classStaticType` instead is what made a static whose
+    /// initializer reads another static of the same class resolve to `any`:
+    /// building the static object types EVERY member, so while member A is
+    /// still in progress the loop reaches member B, checks B's body against
+    /// the transient `any` A's in-progress guard hands out, and memoizes that
+    /// answer for B forever. `ShapeCache` is the shape — `static get = <T>(e) =>
+    /// ShapeCache.cache.get(e) as …` demands the static object from inside
+    /// `get`, so `generateElementShape` was typed against `get: any`. Resolving
+    /// only the member actually asked for breaks the chain: `cache` is
+    /// reachable from inside `get` without B ever being visited.
+    ///
+    /// Own members only. An inherited or namespace-merged static returns null
+    /// here and the caller falls back to the whole static object, which is
+    /// where merging lives.
+    fn ownStaticMemberProp(c: *Checker, cls: SymbolId, name: Atom) Error!?types.Prop {
+        const saved_ctx = c.enterSymFile(cls);
+        defer c.restoreCtx(saved_ctx);
+        const ss = c.bind.staticsScopeOf(c.localOf(cls)) orelse return null;
+        const kscope = c.symScope(cls);
+        const lo = c.bind.scope_members_start[ss];
+        const hi = c.bind.scope_members_start[ss + 1];
+        for (lo..hi) |i| {
+            if (try c.nominalizeComputedKey(c.bind.member_atoms[i], kscope) != name) continue;
+            const msym = c.toGlobal(c.bind.member_syms[i]);
+            const mf = c.symFlags(msym);
+            var flags: u32 = 0;
+            if (mf.readonly_member) flags |= types.prop_flag_readonly;
+            if (mf.getter and !mf.setter) flags |= types.prop_flag_readonly;
+            // `this` inside a static member is the class's constructor type,
+            // exactly as `classStaticType` sets it before resolving one.
+            const saved_this = c.this_type;
+            defer c.this_type = saved_this;
+            c.this_type = try c.ts.makeClassValue(cls);
+            return .{ .name = name, .ty = try c.typeOfSymbol(msym), .flags = flags };
+        }
+        return null;
+    }
+
     fn classStaticType(c: *Checker, sym: SymbolId) Error!TypeId {
         if (c.class_static_cache.get(sym)) |t| return t;
         const saved_ctx = c.enterSymFile(sym);
@@ -11919,7 +11961,11 @@ const Checker = struct {
                 return c.propOfTypeEx(u, name, allow_index);
             },
             .ref => return c.propOfTypeEx(try c.resolveStructural(t), name, allow_index),
-            .class_value => return c.propOfTypeEx(try c.classStaticType(s.classSymbol(t)), name, allow_index),
+            .class_value => {
+                const cls = s.classSymbol(t);
+                if (try c.ownStaticMemberProp(cls, name)) |p| return p;
+                return c.propOfTypeEx(try c.classStaticType(cls), name, allow_index);
+            },
             .enum_type => {
                 // A value of enum type borrows its base primitive's members.
                 const info = try c.enumInfo(s.enumSymbol(t));
