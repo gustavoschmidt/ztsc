@@ -150,3 +150,12 @@ indexed/030_element_access_union_key_negatives.ts  -TS2493 19
 # standing policy direction. Line 14, whose operands are not deferred, still
 # reports.
 indexed/032_cast_to_deferred_indexed_access_negatives.ts  -TS2352 8
+
+# An explicit `this` parameter is not part of ztsc's signature relation, so a
+# function expression whose own `this` contradicts its contextual type is
+# accepted where tsc reports TS2322 on the declaration. The body is still
+# checked against the declared `this` — line 52, which proves the own parameter
+# wins over the contextual one — so only the outer compatibility report is
+# missing. Deterministic under-report of one check; pre-dates the contextual
+# `this` work and is independent of it.
+inference/094_contextual_this_parameter.ts  -TS2322 51

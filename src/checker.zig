@@ -18095,7 +18095,37 @@ const Checker = struct {
                 else => {},
             }
         }
+        // tsc's `getContextualThisParameterType`: a contextually typed function
+        // EXPRESSION whose own proto declares no `this` parameter takes `this`
+        // from the contextual signature's. An arrow is excluded there and here —
+        // it keeps the enclosing `this`. Only the body sees it; the type this
+        // expression *has* is still built from its own proto, which is what tsc
+        // reports for it too.
+        //
+        // This has to be in place before the signature is built, not just before
+        // the body walk: an inner callback is contextually typed while its
+        // enclosing call's type arguments are inferred, and that inference runs
+        // from `signatureOfProtoCtx`. Setting it later left `this.xs.map((x) =>
+        // …)` reporting `x` implicitly `any` even though `this` read correctly
+        // on the line above.
+        //
+        // Without it `reduce._create_blob = function (env) { return
+        // this.pica.toBlob(…).then((blob) => …) }` — whose contextual type
+        // declares `(this: Reduce, env: Env)` — read `this` as the ambient one,
+        // so `this.pica` was `any` and `blob` was reported implicitly `any`. The
+        // contextual PARAMETERS were being adopted all along; only `this` was
+        // dropped.
+        const saved_this = c.this_type;
+        defer c.this_type = saved_this;
+        if (c.nodeTag(node) == .function_expr and
+            ctx_sig != types.no_type and c.ts.kind(ctx_sig) == .function)
+        {
+            const ctx_this = c.ts.fnThisType(ctx_sig);
+            if (ctx_this != 0) c.this_type = ctx_this;
+        }
         const sig = try c.signatureOfProtoCtx(node, d.lhs, false, ctx_sig == types.no_type, ctx_sig);
+        // An own `this` parameter wins; `checkFunctionBody` installs it.
+        if (c.ts.kind(sig) == .function and c.ts.fnThisType(sig) != 0) c.this_type = saved_this;
         // Check the body. The contextual signature's return type is the
         // contextual type of the body's return expressions, exactly as its
         // parameters are the contextual types of this function's parameters —
