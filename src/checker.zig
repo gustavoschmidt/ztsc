@@ -20217,10 +20217,26 @@ const Checker = struct {
         // constraint. tsc reaches the same place through `inferFromTypes`'
         // mapped-to-mapped rule (infer the source's constraint into the
         // target's).
-        const keys = switch (s.kind(ra)) {
-            .object => try c.keyofType(ra),
-            .mapped => if (s.mappedAs(ra) == 0) try c.mappedKeySet(ra) else return,
+        // tsc's `inferToMappedType` runs `getIndexType(source)` for ANY source,
+        // not just an object. A FUNCTION source (an updater arrow with no
+        // return statement) and a UNION source (a forwarded `state` parameter,
+        // whose key set is the intersection of its members') both come out
+        // `never`, so `Pick<S, never>` is `{}` and the argument is trivially
+        // assignable. Returning silently instead left `K` to its `keyof S`
+        // constraint, making the target the FULL state and rejecting every
+        // forwarded or void-returning update.
+        //
+        // A PRIMITIVE source is excluded: its key set is its apparent type's
+        // members, which are not modelled here, so `keyofType` would answer a
+        // spurious `never` — and unlike the real answer, `never` satisfies
+        // `K extends keyof S`, silently accepting `setState(123)`.
+        switch (s.kind(ra)) {
+            .object, .mapped, .union_type, .intersection, .function, .overloads, .class_value, .type_param, .index_access, .conditional, .keyof_op, .infer_var, .this_type => {},
             else => return,
+        }
+        const keys = switch (s.kind(ra)) {
+            .mapped => if (s.mappedAs(ra) == 0) try c.mappedKeySet(ra) else return,
+            else => try c.keyofType(ra),
         };
         // A key set is authoritative for its own param: an uninformative `any`
         // bound by a sibling union member (`Pick<S, K> | S | null`, where the
