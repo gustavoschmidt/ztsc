@@ -14110,6 +14110,30 @@ const Checker = struct {
         return null;
     }
 
+    /// `paramTypeAt`, retried through what the call has already inferred when
+    /// the trailing rest parameter is typed by a bare type PARAMETER
+    /// (`...args: Args`). Such a signature has no positional expansion on its
+    /// own, so the plain lookup answers the rest's array element type — nothing
+    /// at all for a bare `Args` — and a function argument written for it got no
+    /// contextual type, leaving its parameters implicit `any`. tsc expands the
+    /// parameters of the INSTANTIATED signature, by which point `Args` is the
+    /// tuple an earlier argument supplied (`store.set(atom, (s) => …)` with
+    /// `atom: WritableAtom<V, [SetStateAction<V>], R>`).
+    fn paramTypeAtInferred(c: *Checker, sig: TypeId, i: u32, map: []const TpMap) Error!?TypeId {
+        const count = c.ts.fnParamCount(sig);
+        expand: {
+            if (count == 0 or i < count - 1) break :expand;
+            const last = c.ts.fnParam(sig, count - 1);
+            if (!last.rest() or c.ts.kind(last.ty) != .type_param) break :expand;
+            const inst = try c.instantiate(last.ty, map);
+            if (inst == last.ty) break :expand;
+            const r = try c.resolveStructural(inst);
+            if (c.ts.kind(r) != .tuple) break :expand;
+            if (try c.tupleElemTypeAt(r, i - (count - 1))) |t| return t;
+        }
+        return c.paramTypeAt(sig, i);
+    }
+
     /// Highest accepted argument count (`maxInt` = unbounded).
     fn paramTotal(c: *Checker, sig: TypeId) Error!u32 {
         const count = c.ts.fnParamCount(sig);
@@ -18927,7 +18951,7 @@ const Checker = struct {
             defer ai += 1;
             const tag = c.nodeTag(an);
             if (tag != .arrow_fn and tag != .function_expr) continue;
-            const pt0 = try c.paramTypeAt(sig, ai) orelse continue;
+            const pt0 = try c.paramTypeAtInferred(sig, ai, partial) orelse continue;
             for (partial, 0..) |p, i| {
                 placeheld[i] = !seeded[i] and p.ty == types.any_type;
                 before[i] = candidates[i];
