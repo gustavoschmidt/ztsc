@@ -1393,9 +1393,12 @@ const Linker = struct {
         if (!flags.import_binding) {
             return .{ .kind = .binding, .file = file, .payload = local_sym, .type_only = type_only };
         }
-        // Find the import record that created this binding.
+        // Find the import record that created this binding. Matched on scope
+        // as well as name: a `declare module` block's imports are records too,
+        // and one of them may shadow a file-scope name.
         for (f.bind.imports) |rec| {
             if (rec.local != local_atom) continue;
+            if (rec.scope != f.bind.symbol_scopes[local_sym]) continue;
             const t_only = type_only or rec.type_only;
             const mfile = f.specs.get(rec.module) orelse return .{ .kind = .any };
             switch (rec.kind) {
@@ -1707,7 +1710,12 @@ const Linker = struct {
         const f = &l.files[file];
         for (f.bind.imports) |rec| {
             if (rec.kind == .side_effect) continue;
-            const local_sym = f.bind.lookupInScope(binder.file_scope, rec.local) orelse continue;
+            // In the record's OWN scope: a `declare module "spec" { import
+            // type { T } from "other"; … }` block declares its imports in the
+            // block, not at file scope, and looking only at file scope dropped
+            // the record — the local bound to nothing, so an interface
+            // `extends` on it inherited no members at all.
+            const local_sym = f.bind.lookupInScope(rec.scope, rec.local) orelse continue;
             var tgt: Target = .{ .kind = .any };
             const mfile_opt = try l.effectiveModuleFile(f, rec.module);
             const known = mfile_opt != null or l.hasAmbient(rec.module);

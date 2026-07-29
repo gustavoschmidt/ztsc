@@ -341,6 +341,10 @@ pub const ImportRec = struct {
     node: Node,
     kind: ImportKind,
     type_only: bool,
+    /// Scope the local binding was declared in. Almost always the file scope;
+    /// a `declare module "spec" { import … }` block declares its imports in the
+    /// block's own scope, and the linker has to look them up there.
+    scope: ScopeId = file_scope,
 };
 
 /// One exported binding; feeds the module graph.
@@ -2253,6 +2257,7 @@ const Binder = struct {
                 .node = node,
                 .kind = .default,
                 .type_only = decl_type_only,
+                .scope = b.cur_scope,
             });
         }
         if (data.ns_name_token != 0) {
@@ -2267,6 +2272,7 @@ const Binder = struct {
                 .node = node,
                 .kind = .namespace,
                 .type_only = decl_type_only,
+                .scope = b.cur_scope,
             });
         }
         for (b.tree.extraRange(data.spec_start, data.spec_end)) |spec| {
@@ -2287,6 +2293,7 @@ const Binder = struct {
                 .node = spec,
                 .kind = .named,
                 .type_only = type_only,
+                .scope = b.cur_scope,
             });
         }
         if (!any_binding and module != 0) {
@@ -2387,6 +2394,7 @@ const Binder = struct {
                     .node = node,
                     .kind = .equals,
                     .type_only = false,
+                    .scope = b.cur_scope,
                 });
             }
         }
