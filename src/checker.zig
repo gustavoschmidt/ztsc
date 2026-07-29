@@ -17349,9 +17349,16 @@ const Checker = struct {
             .keyword_in => {
                 const lt = try c.checkExprCached(d.lhs, types.no_type);
                 const rt = try c.checkExprCached(d.rhs, types.no_type);
-                if (!try c.isStringish(lt) and !try c.isNumberish(lt) and c.ts.kind(lt) != .symbol) {
-                    try c.diagFmt(2360, c.nodeSpan(d.lhs), "The left-hand side of an 'in' expression must be of type 'any', 'string', 'number', or 'symbol'.", .{});
-                }
+                // tsc's `checkInExpression` relates the left operand to
+                // `string | number | symbol` as a WHOLE, rather than asking
+                // whether it carries one primitive facet. The difference is a
+                // key type that is only collectively key-like: a deferred
+                // `keyof R`, or a `K[number]` over `K extends readonly
+                // (keyof R)[]`, is assignable to that union while matching no
+                // single facet. The relation also carries the diagnostic —
+                // TS2322 naming both types, not the old flat TS2360.
+                const key_union = try c.ts.makeUnion(c.scratch(), &.{ types.string_type, types.number_type, types.symbol_type });
+                _ = try c.checkAssignable(lt, key_union, d.lhs, c.nodeSpan(d.lhs));
                 const rk = c.ts.kind(try c.resolveStructural(rt));
                 if (!isNonPrimitiveKind(rk) and rk != .any and rk != .err and rk != .type_param and rk != .union_type and rk != .unknown) {
                     try c.diagFmt(2361, c.nodeSpan(d.rhs), "The right-hand side of an 'in' expression must not be a primitive.", .{});
