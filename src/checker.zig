@@ -5989,13 +5989,21 @@ const Checker = struct {
     /// Type of one variable declarator for `sym` (no_type if this decl
     /// contributes none, e.g. bare `declarator` in a multi-decl symbol).
     /// Is `sym` an *evolving* variable — tsc's "auto" type? A `let`/`var` with
-    /// no type annotation whose initializer is literally `null` or `undefined`
-    /// gets a declared type that does not constrain later writes: the write is
-    /// unchecked and a read's type is whatever the flow last assigned
-    /// (`getTypeAtFlowAssignment`'s `declaredType === autoType` branch, which
-    /// returns the assigned type instead of reducing it against the declared
-    /// one). Without this `let match = null; while ((match = exec(s)) !== null)`
-    /// pins `match` to `null` and reports the assignment plus every use.
+    /// no type annotation and either no initializer at all or one that is
+    /// literally `null` or `undefined` gets a declared type that does not
+    /// constrain later writes: the write is unchecked and a read's type is
+    /// whatever the flow last assigned (`getTypeAtFlowAssignment`'s
+    /// `declaredType === autoType` branch, which returns the assigned type
+    /// instead of reducing it against the declared one). Without this
+    /// `let match = null; while ((match = exec(s)) !== null)` pins `match` to
+    /// `null` and reports the assignment plus every use.
+    ///
+    /// The initializer-less form is tsc's primary one — `let x;` IS the auto
+    /// type, and `= null` / `= undefined` merely join it. Excluding it left a
+    /// bare `let x;` reading as a plain `any` for the whole function, so every
+    /// callback it fed lost its contextual signature:
+    /// `let target; … target = xs.filter(…); return target.map((item) => …)`
+    /// reported `item` as an implicit `any`.
     ///
     /// Purely syntactic — it never re-enters `checkExpr`, so it is safe to ask
     /// from inside `typeOfSymbol`'s own callers. Restricted to the current file
@@ -6012,6 +6020,8 @@ const Checker = struct {
         const decl = decls[0];
         const d = c.tree.nodeData(decl);
         const init_node: Node = switch (c.nodeTag(decl)) {
+            // `let x;` — no annotation, no initializer.
+            .declarator => null_node,
             .declarator_init => d.rhs,
             .declarator_full => blk: {
                 const e = c.tree.extraData(ast.DeclaratorFull, d.rhs);
@@ -6021,7 +6031,7 @@ const Checker = struct {
             else => return false,
         };
         if (c.nodeTag(d.lhs) != .identifier) return false;
-        if (init_node == null_node) return false;
+        if (init_node == null_node) return c.nodeTag(decl) == .declarator;
         return switch (c.nodeTag(init_node)) {
             .null_literal => true,
             .identifier => c.tree.tokens.tag(c.tree.nodeMainToken(init_node)) == .keyword_undefined,
