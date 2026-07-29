@@ -11939,6 +11939,22 @@ const Checker = struct {
         }.keep);
     }
 
+    /// `??`'s left operand. tsc's `getNonNullableType` is
+    /// `getTypeWithFacts(t, NEUndefinedOrNull)`, and `VoidFacts` does not carry
+    /// `NEUndefinedOrNull` — so `void` is filtered out alongside `undefined`
+    /// and `null`, and `(boolean | void) ?? false` is `boolean`. Scoped to
+    /// `??`: the same strip inside the general `nonNullable` (which also serves
+    /// `!` and comparison narrowing) regressed a `void` receiver.
+    fn nonNullableNullish(c: *Checker, t: TypeId) Error!TypeId {
+        if (c.ts.kind(t) == .type_param) return c.nonNullable(t);
+        return c.filterUnion(t, struct {
+            fn keep(ch: *Checker, m: TypeId) bool {
+                const k = ch.ts.kind(m);
+                return k != .undefined and k != .null and k != .void;
+            }
+        }.keep);
+    }
+
     /// Receiver narrowing for an optional-chain link (`a?.b`, `a?.[i]`, `a?.()`).
     /// Beyond null/undefined it also drops `void`: a `.catch(() => {})` /
     /// `.then(…)` tail types a promise `T | void`, and tsc lets `x?.prop` reach
@@ -17249,7 +17265,7 @@ const Checker = struct {
                 const lt = try c.checkExprCached(d.lhs, types.no_type);
                 const rt = try c.checkExprCached(d.rhs, if (ctx == types.no_type) lt else ctx);
                 if (!try c.canBeNullish(lt, 0)) return lt;
-                return c.logicalUnion(try c.nonNullable(lt), rt);
+                return c.logicalUnion(try c.nonNullableNullish(lt), rt);
             },
             .plus => {
                 const lt = try c.checkExprCached(d.lhs, types.no_type);
