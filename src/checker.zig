@@ -841,6 +841,9 @@ const Checker = struct {
     /// "in progress". Bounded here against `max_alias_depth` so such a chain
     /// terminates (as `error_type`) instead of overflowing the worker stack.
     alias_depth: u32 = 0,
+    /// Live nesting of `driveShrinkingAlias`, bounded by
+    /// `max_eager_alias_depth` (see that constant).
+    eager_alias_depth: u32 = 0,
     /// Live recursion depth of the structural assignability relation
     /// (`isAssignable`), checked against `max_relation_depth` to break the
     /// otherwise-unbounded walk over an undecidable recursive alias's
@@ -6602,6 +6605,106 @@ const Checker = struct {
         return k == .object or k == .function or k == .intersection;
     }
 
+    /// Bound on nested eager expansion of a recursive alias reached through a
+    /// conditional's true branch (`driveShrinkingAlias`). The chains this
+    /// drives shrink and bottom out in a handful of hops; the bound is what
+    /// keeps a GROWING recursion from being driven forever, since the
+    /// enclosing-ref comparison `reexpandShrinking` uses is not available at
+    /// that call site.
+    const max_eager_alias_depth: u32 = 8;
+
+    /// A recursive alias reached through a resolved conditional's TRUE BRANCH
+    /// has no enclosing `.ref` for `expandRef` to re-expand from, so the
+    /// recursion stalls one hop in.
+    ///
+    /// The lib's `FlatArray<Arr, Depth>` is the case: `arr.flat()`'s return
+    /// type is the alias body already materialized against the method's own
+    /// type parameters, i.e. a deferred indexed access — no `FlatArray<…>` ref
+    /// survives for `aliasInstance`/`expandRef` to drive. Substituting the call's
+    /// arguments resolves `Arr extends ReadonlyArray<infer I>` and hands back
+    /// the bare ref `FlatArray<Elem, 0>`, which then simply sits there. A
+    /// stalled ref is not a union, so `typeof x === "string"` narrowing and the
+    /// union relation arms never see the constituents.
+    ///
+    /// Drive it the same way `aliasInstance` drives a source-written
+    /// `Alias<args>`, and only where `aliasInstance` itself would: a recursive
+    /// alias whose body is `originTaggable` (object/function/intersection)
+    /// deliberately keeps ONE ref spelling. Answers null — keep the lazy ref —
+    /// for everything else, including a chain that does not bottom out.
+    fn driveShrinkingAlias(c: *Checker, ref: TypeId) Error!?TypeId {
+        if (c.ts.kind(ref) != .ref) return null;
+        if (c.eager_alias_depth >= max_eager_alias_depth) return null;
+        const sym = c.ts.refSymbol(ref);
+        if (!c.symFlags(sym).type_alias) return null;
+        if (!c.alias_recursive.contains(sym)) return null;
+        if ((c.alias_state.get(sym) orelse 0) == 1) return null; // body still materializing
+        // Not while an argument still carries an unbound `infer` binder (or a
+        // deferred conditional / indexed access): expanding then resolves the
+        // recursive step against the placeholder instead of against the value
+        // the enclosing conditional is about to bind, which loses the
+        // distribution and stalls the chain one hop EARLIER than leaving it
+        // lazy would. A free outer type parameter is fine — the reduction is
+        // the same for every substitution, which is exactly why the enclosing
+        // conditional resolved at all (`arrayDecidablyExtends`).
+        if (!try c.refArgsSettled(ref, 0)) return null;
+        if (originTaggable(c.ts.kind(try c.aliasGeneric(sym)))) return null;
+        c.eager_alias_depth += 1;
+        defer c.eager_alias_depth -= 1;
+        const expanded = try c.expandRef(ref);
+        if (expanded == types.error_type) return null;
+        const reduced = try c.reexpandShrinking(ref, expanded);
+        // Still a ref: the recursion did not bottom out (a non-shrinking hop, or
+        // the ceiling). Keep the lazy spelling rather than a half-driven one.
+        if (c.ts.kind(reduced) == .ref) return null;
+        return reduced;
+    }
+
+    /// Nothing in `t` is a placeholder an enclosing conditional is still about
+    /// to fill: no `infer` binder, no deferred conditional / indexed access /
+    /// mapped type. A free type parameter IS settled — substituting it later
+    /// cannot change the reduction.
+    ///
+    /// Only the type-forming shapes an `infer` binder can be handed back
+    /// through are walked; a materialized object/function is settled by
+    /// definition, and walking one would visit an app's whole element type on
+    /// every hop.
+    fn refArgsSettled(c: *Checker, t: TypeId, depth: u32) Error!bool {
+        if (depth > 8) return false;
+        const s = &c.ts;
+        return switch (s.kind(t)) {
+            .infer_var,
+            .mapped_param,
+            .mapped,
+            .index_access,
+            .conditional,
+            .keyof_op,
+            .string_mapping,
+            .template_literal_type,
+            => false,
+            // Indexed walks: the recursion can intern and move `extra`.
+            .union_type, .intersection, .overloads => blk: {
+                for (0..s.memberCount(t)) |i| {
+                    if (!try c.refArgsSettled(s.memberAt(t, i), depth + 1)) break :blk false;
+                }
+                break :blk true;
+            },
+            .array => c.refArgsSettled(s.arrayElem(t), depth + 1),
+            .tuple => blk: {
+                for (0..s.tupleLen(t)) |i| {
+                    if (!try c.refArgsSettled(s.tupleElem(t, @intCast(i)).ty, depth + 1)) break :blk false;
+                }
+                break :blk true;
+            },
+            .ref => blk: {
+                for (0..s.refArgCount(t)) |i| {
+                    if (!try c.refArgsSettled(s.refArgAt(t, i), depth + 1)) break :blk false;
+                }
+                break :blk true;
+            },
+            else => true,
+        };
+    }
+
     /// Depth ceiling on the recursive origin-arg equivalence walk (see
     /// `originArgEquiv`) — a belt on top of the structure-only reduction, which
     /// already terminates (each hop peels a ref/intersection/tuple layer).
@@ -9430,7 +9533,9 @@ const Checker = struct {
         }
         const resolved_extends = try c.substInfer(extends_ty, ids.items, vals);
         if (try c.isAssignable(chk, resolved_extends)) {
-            return c.substInfer(true_ty, ids.items, vals);
+            const tb = try c.substInfer(true_ty, ids.items, vals);
+            if (try c.driveShrinkingAlias(tb)) |reduced| return reduced;
+            return tb;
         }
         return false_ty; // infer binders are out of scope in the false branch
     }
@@ -9446,13 +9551,29 @@ const Checker = struct {
     /// a check whose top-level shape is itself a variable.
     fn arrayDecidablyExtends(c: *Checker, chk: TypeId, extends_ty: TypeId) Error!bool {
         const s = &c.ts;
-        switch (s.kind(try c.resolveStructural(chk))) {
-            .array, .tuple, .function => {},
-            else => return false,
-        }
+        if (!try c.isArrayShaped(chk)) return false;
         const ext = try c.resolveStructural(extends_ty);
         if (s.kind(ext) != .array) return false;
         return s.kind(s.arrayElem(ext)) == .infer_var;
+    }
+
+    /// `t` is an array/tuple whatever its free type parameters turn out to be.
+    /// A BRANDED tuple (`[P, P] & { _brand: "…" }`, the shape every geometry
+    /// type in a branded-primitive codebase has) is array-shaped through the
+    /// intersection: one constituent is the tuple, and an intersection's values
+    /// satisfy every constituent.
+    fn isArrayShaped(c: *Checker, t: TypeId) Error!bool {
+        const r = try c.resolveStructural(t);
+        switch (c.ts.kind(r)) {
+            .array, .tuple, .function => return true,
+            .intersection => {
+                for (0..c.ts.memberCount(r)) |i| {
+                    if (try c.isArrayShaped(c.ts.memberAt(r, i))) return true;
+                }
+                return false;
+            },
+            else => return false,
+        }
     }
 
     /// Narrow decidability rule for a deferred conditional whose *check* is a
