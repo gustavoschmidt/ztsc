@@ -22925,12 +22925,44 @@ const Checker = struct {
         }
     }
 
+    fn isNullishKind(k: types.Kind) bool {
+        return k == .null or k == .undefined or k == .void;
+    }
+
+    /// `instance` genuinely contains the nullish kind `k` — as itself, as a
+    /// union constituent, or because it is `any`/`unknown`. Deliberately NOT
+    /// an assignability question: an all-optional object is assignable FROM
+    /// `undefined` in ztsc's relation, and that is what this guards against.
+    fn admitsNullish(c: *Checker, instance: TypeId, k: types.Kind) Error!bool {
+        const r = try c.resolveStructural(instance);
+        const rk = c.ts.kind(r);
+        if (rk == .any or rk == .unknown or rk == .err) return true;
+        if (rk == k) return true;
+        if (rk == .undefined and k == .void) return true;
+        if (rk == .void and k == .undefined) return true;
+        if (rk == .union_type) {
+            for (0..c.ts.memberCount(r)) |i| {
+                if (try c.admitsNullish(c.ts.memberAt(r, i), k)) return true;
+            }
+        }
+        return false;
+    }
+
     fn narrowByInstance(c: *Checker, t: TypeId, instance: TypeId, sense: bool) Error!TypeId {
         if (c.ts.kind(t) == .union_type) {
             var parts: std.ArrayList(TypeId) = .empty;
             defer parts.deinit(c.scratch());
             for (try c.memberList(t)) |m| {
-                const matches = try c.isAssignable(m, instance);
+                var matches = try c.isAssignable(m, instance);
+                // tsc's `getNarrowedTypeWorker` filters with the SUBTYPE
+                // relation, and `undefined`/`null` are subtypes of nothing but
+                // themselves. Under plain assignability a "weak" guard type —
+                // an object whose properties are ALL optional, the shape of
+                // every `json is Lib` validator — accepts them, so
+                // `if (!isValidLibrary(data)) throw` left `undefined` in the
+                // guarded branch and every later use reported TS18048.
+                if (matches and isNullishKind(c.ts.kind(m)) and !try c.admitsNullish(instance, c.ts.kind(m)))
+                    matches = false;
                 const kept = if (sense) matches else !matches;
                 if (kept) try parts.append(c.scratch(), m);
             }
@@ -22949,6 +22981,10 @@ const Checker = struct {
             // (`Array.isArray(x)` on `any` never yielding `any[]`).
             const k = c.ts.kind(t);
             if (k == .any or k == .unknown or k == .err) return instance;
+            // Same subtype rule as the union arm above: a guard whose type does
+            // not itself admit `undefined`/`null` leaves nothing behind (tsc
+            // ends at `undefined & Lib`, which is `never`).
+            if (isNullishKind(k) and !try c.admitsNullish(instance, k)) return types.never_type;
             if (try c.isAssignable(t, instance)) return t;
             if (try c.isAssignable(instance, t)) return instance;
             // Unrelated `t` and guard `C`: tsc narrows to the intersection
