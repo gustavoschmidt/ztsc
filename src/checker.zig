@@ -1784,6 +1784,18 @@ const Checker = struct {
         try c.diags.append(c.gpa, .{ .code = code, .file = c.cur_file, .span = span, .msg = msg });
     }
 
+    /// Has a diagnostic with this code already been filed at this span?
+    /// (`diagFmt`'s dedupe key, asked without filing anything.)
+    ///
+    /// An elaboration that ran once has to keep answering "yes, I elaborated"
+    /// on every re-check of the same expression, even when its own diagnostic
+    /// would now be swallowed as a duplicate — otherwise the caller concludes
+    /// nothing was reported and falls back to the whole-expression error,
+    /// which lands *beside* the earlier nested one.
+    fn diagAlreadyFiled(c: *Checker, code: u16, span: Span) bool {
+        return c.diag_seen.contains((@as(u128, c.cur_file) << 64) | (@as(u128, code) << 32) | span.start);
+    }
+
     /// The source region a speculative check is allowed to have spoken about:
     /// everything a rejected overload candidate says *inside* it is an artifact
     /// of that candidate and must be withdrawn; everything outside it is
@@ -1833,10 +1845,16 @@ const Checker = struct {
     /// published, so the re-check hits the memo and its diagnostics stay
     /// withdrawn. One site in the excalidraw corpus (element/image.ts:54 of
     /// 4166 instrumented arrow bodies). Withholding the whole probed argument
-    /// from `node_types` closes it and was measured: it also adds three excess
-    /// keys — a duplicate whole-argument TS2345 beside its own nested
-    /// elaboration, and two partition-dependent keys including a TS1308 — so it
-    /// is not worth taking on its own.
+    /// from `node_types` closes it and was measured TWICE:
+    ///   - first pass: +3 excess keys — a duplicate whole-argument TS2345
+    ///     beside its own nested elaboration, plus two partition-dependent keys
+    ///     including a TS1308;
+    ///   - re-measured after `diagAlreadyFiled` fixed the duplicate: +2 excess
+    ///     keys, exactly `data/encryption.ts:86:5 TS2345` and
+    ///     `packages/utils/export.ts:126:18 TS1308`, for zero matched keys and
+    ///     zero under-reports closed on the oracle's key set.
+    /// Still not worth taking: the one site it fixes is an under-report the
+    /// oracle does not name, and it costs two false positives.
     fn rollbackDiags(c: *Checker, saved: usize, spec: SpecRegion) void {
         if (c.diags.items.len == saved) return;
         // `remove` invalidates the iterator, so restart after each hit.
@@ -14555,6 +14573,12 @@ const Checker = struct {
                     if (el == null_node) continue;
                     defer i += 1;
                     if (c.nodeTag(el) == .omitted or c.nodeTag(el) == .spread_element) continue;
+                    // A re-check of this same literal must still answer
+                    // "elaborated" (see `diagAlreadyFiled`).
+                    if (c.diagAlreadyFiled(2322, c.nodeSpan(el))) {
+                        reported = true;
+                        continue;
+                    }
                     const tt = if (is_union)
                         ((try c.unionElemTypeAt(rt, i)) orelse (try c.elemTypeAt(alt, i)) orelse continue)
                     else if (rtk == .array) c.ts.arrayElem(rt) else (try c.tupleElemTypeAt(rt, i) orelse continue);
@@ -14576,6 +14600,13 @@ const Checker = struct {
                     const tag = c.nodeTag(prop);
                     if (tag != .object_property and tag != .object_shorthand) continue;
                     if (tag == .object_property and pd.lhs != 0 and c.nodeTag(pd.lhs) == .computed_name) continue;
+                    // A re-check of this same literal must still answer
+                    // "elaborated" (see `diagAlreadyFiled`). The anchor is the
+                    // property NAME, which is where this arm reports.
+                    if (c.diagAlreadyFiled(2322, c.tokSpan(c.tree.nodeMainToken(prop)))) {
+                        reported = true;
+                        continue;
+                    }
                     const key = try c.memberAtom(c.tree.nodeMainToken(prop));
                     const tp_ty = if (is_union)
                         (if (try c.propOfType(rt, key)) |p|
