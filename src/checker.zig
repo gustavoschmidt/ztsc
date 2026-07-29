@@ -16476,6 +16476,33 @@ const Checker = struct {
     /// like `FieldPath<TFieldValues>` collapse to its concrete `${string}`
     /// template union once the abstract inner params are replaced by their
     /// constraints, so constraint-sensitive tests can see through it.
+    /// tsc's `TypeFlags.Instantiable`: a type whose identity still depends on a
+    /// type argument, so its final shape is not decided yet.
+    fn isInstantiableKind(k: types.Kind) bool {
+        return switch (k) {
+            .type_param, .keyof_op, .index_access, .conditional, .template_literal_type, .string_mapping, .infer_var => true,
+            else => false,
+        };
+    }
+
+    /// tsc's `getDefaultConstraintOfConditionalType`: the union of a deferred
+    /// conditional's two branches (recursively through a nested conditional),
+    /// each reduced to its own base constraint.
+    ///
+    /// Deliberately NOT `baseConstraintOf`, which instantiates the whole type
+    /// with every type parameter's constraint and therefore *evaluates* the
+    /// conditional — picking exactly one branch. What the callers here need is
+    /// the set of types the conditional can still produce, which is both.
+    /// `keyof T extends K[number] ? (K extends readonly (keyof T)[] ? K : E) : E`
+    /// evaluates to `E` under its constraints, but can still produce a `K`.
+    fn deferredDefaultConstraint(c: *Checker, t: TypeId, depth: u32) Error!TypeId {
+        if (depth > 4) return t;
+        if (c.ts.kind(t) != .conditional) return c.baseConstraintOf(t);
+        const tr = try c.deferredDefaultConstraint(c.ts.condTrue(t), depth + 1);
+        const fa = try c.deferredDefaultConstraint(c.ts.condFalse(t), depth + 1);
+        return c.makeUnion2(tr, fa);
+    }
+
     fn baseConstraintOf(c: *Checker, t: TypeId) Error!TypeId {
         var syms: std.ArrayList(u32) = .empty;
         defer syms.deinit(c.scratch());
@@ -23200,6 +23227,31 @@ const Checker = struct {
             const result = try c.ts.makeUnion(c.scratch(), parts.items);
             if (sense and result == types.never_type) {
                 if (try c.isAssignable(instance, t)) return instance;
+                // tsc's `getNarrowedTypeWorker` does not stop when no
+                // constituent is directly related to the candidate: it then
+                // keeps every constituent that is still INSTANTIABLE (a
+                // deferred conditional, `keyof`, indexed access, or a bare type
+                // parameter) and whose *constraint* the candidate is comparable
+                // to — such a constituent can still be instantiated to
+                // something the guard accepts, so narrowing it away is wrong.
+                // `isShallowEqual`'s `comparators` is
+                // `{ [k in keyof T]?: … } | (keyof T extends K[number] ? … )`,
+                // and `Array.isArray(comparators)` filtered BOTH constituents
+                // out, leaving `never` — so iterating the guarded value was
+                // TS2488.
+                for (try c.memberList(t)) |m| {
+                    if (!isInstantiableKind(c.ts.kind(m))) continue;
+                    const bc = try c.deferredDefaultConstraint(m, 0);
+                    if (bc == m) continue;
+                    if (try c.isAssignable(instance, bc)) return instance;
+                }
+                // tsc's tail past this point is `getIntersectionType([type,
+                // candidate])`, which the non-union arm below already does.
+                // MEASURED OUT for the union arm: `(A | B) & C` distributes
+                // into a union of intersections that ztsc's relation cannot
+                // put back together, and eight false TS2345s appear across
+                // rxjs (`innerFrom`, `scheduled`, `Observable.subscribe`).
+                // Stopping at `never` is the pre-existing, sound behaviour.
             }
             return result;
         }
