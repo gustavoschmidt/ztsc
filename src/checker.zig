@@ -19270,6 +19270,26 @@ const Checker = struct {
             try c.bindAnyToTypeParams(param, tp_syms, candidates, depth);
             return;
         }
+        // tsc's `inferFromTypes` apparent-source rule: when the target is NOT
+        // itself an inference position, a source that is a type VARIABLE
+        // contributes through its constraint, not as an opaque `T`. Only the
+        // naked inference variable gets the original source — which is why the
+        // union/intersection arms are excluded here: they hand the ORIGINAL arg
+        // to their naked member and re-enter `unify` for the wrapper members,
+        // where this rule then applies (tsc's `inferToMultipleTypes` does the
+        // same split). Without it, `castArray(el)` with `el: T extends El |
+        // El[]` against `(value: U | U[]) => U[]` inferred `U = T` instead of
+        // `U = El`, so every downstream element stayed the opaque `T` and
+        // `El`-typed uses of it were rejected.
+        if (s.kind(arg) == .type_param) switch (s.kind(param)) {
+            .type_param, .union_type, .intersection => {},
+            else => {
+                const con = try c.typeParamConstraint(s.typeParamSymbol(arg));
+                if (con != types.no_type and con != arg) {
+                    return c.unify(param, con, tp_syms, candidates, depth + 1);
+                }
+            },
+        };
         switch (s.kind(param)) {
             .type_param => {
                 if (tpIndex(tp_syms, s.typeParamSymbol(param))) |i| {
@@ -19318,6 +19338,16 @@ const Checker = struct {
                         // parameter through `.map`'s `U[]` return into the
                         // callback body, so the returned array literal is formed
                         // as a tuple instead of widening.
+                        //
+                        // A `string` source is iterable but is NOT array-like
+                        // for inference: tsc only walks members when the source
+                        // is an object/intersection, so `castArray(s)` with
+                        // `s: string` must infer nothing here and leave the
+                        // naked union member to answer.
+                        switch (s.kind(ra)) {
+                            .string, .string_literal, .template_literal_type, .string_mapping => return,
+                            else => {},
+                        }
                         if (try c.iterationElementType(ra)) |elem| {
                             try c.unify(s.arrayElem(param), elem, tp_syms, candidates, depth + 1);
                         }
