@@ -23,9 +23,13 @@
 //!   canonicalize toward it — same observable behavior for the subset).
 //!   `T | never = T`, a single member is returned unwrapped, and the empty
 //!   union is `never`.
-//! - **Intersections are canonical** the same way: flattened, deduped,
-//!   sorted; `unknown` dropped (`T & unknown = T`), `never`/`any` absorbing,
-//!   empty intersection is `unknown`. A *union* constituent is distributed
+//! - **Intersections are canonical** in the same way *except for order*:
+//!   flattened, deduped (first occurrence wins), `unknown` dropped
+//!   (`T & unknown = T`), `never`/`any` absorbing, empty intersection is
+//!   `unknown` — but members keep the order they were written in, as they do
+//!   in tsc, because that order is observable (an intersection's call
+//!   signatures are its constituents' concatenated in member order). So
+//!   `A & B` and `B & A` are two TypeIds. A *union* constituent is distributed
 //!   into a union of intersections (`(A | B) & C` -> `A & C | B & C`), as tsc
 //!   does, so no interned intersection ever contains a union member.
 //!   Object-member *merging* is not done at construction; the checker merges
@@ -1374,17 +1378,32 @@ pub const Store = struct {
     /// exploding the type store.
     const max_cross_product: usize = 100_000;
 
-    /// Canonical intersection (flatten, dedup, sort; unknown dropped;
-    /// never/any absorbing; empty -> unknown; single -> unwrapped).
+    /// Canonical intersection (flatten, dedup; unknown dropped; never/any
+    /// absorbing; empty -> unknown; single -> unwrapped).
+    ///
+    /// Member order is the order the members were WRITTEN — the first
+    /// occurrence of each, after flattening nested intersections in place.
+    /// tsc's `getIntersectionType` does the same (`addTypeToIntersection`
+    /// appends into an insertion-ordered map; only `getUnionType` sorts), and
+    /// the order is observable: `getSignaturesOfType` on an intersection
+    /// concatenates its constituents' call signatures in member order, so the
+    /// order decides which overload a call matches first. Sorting by TypeId
+    /// made that order a function of this checker's *interning* sequence,
+    /// which is a function of which files it owns — so `window.setTimeout`
+    /// answered lib.dom's `number` or @types/node's `Timeout` depending on
+    /// the `--checkers` partition. Written order is program-canonical, so the
+    /// answer is not.
+    ///
+    /// The cost is that `A & B` and `B & A` are now distinct TypeIds, exactly
+    /// as they are in tsc (mutually assignable, structurally compared).
     ///
     /// A union constituent is *distributed*: `(A | B) & C` becomes
     /// `(A & C) | (B & C)`, recursively for further unions (tsc's
     /// `getIntersectionType` / `getCrossProductIntersections`). Keeping the
     /// union outermost is what lets discriminant narrowing, assignability and
     /// property lookup — all of which already handle unions — see through the
-    /// shape. The cross product is order-independent (both `makeUnion` and
-    /// this function sort by TypeId), so the result does not depend on which
-    /// union constituent is expanded first.
+    /// shape. The resulting *union* is canonical (`makeUnion` sorts), but the
+    /// cross-product members keep the operand order they were built from.
     pub fn makeIntersection(s: *Store, scratch: Allocator, parts: []const TypeId) Error!TypeId {
         var flat: std.ArrayList(TypeId) = .empty;
         defer flat.deinit(scratch);
@@ -1401,11 +1420,15 @@ pub const Store = struct {
                 else => try flat.append(scratch, p),
             }
         }
+        // Dedup keeping the FIRST occurrence, so the surviving order is the
+        // written one. Quadratic, over a list that is two or three long in
+        // every real program.
         const items = flat.items;
-        std.mem.sort(TypeId, items, {}, std.sort.asc(TypeId));
         var n: usize = 0;
-        for (items) |t| {
-            if (n > 0 and items[n - 1] == t) continue;
+        outer: for (items) |t| {
+            for (items[0..n]) |seen| {
+                if (seen == t) continue :outer;
+            }
             items[n] = t;
             n += 1;
         }
@@ -1660,13 +1683,20 @@ test "intersection canonicalization" {
     try testing.expectEqual(string_type, try s.makeIntersection(sc, &.{ string_type, unknown_type }));
     // never absorbs
     try testing.expectEqual(never_type, try s.makeIntersection(sc, &.{ string_type, never_type }));
-    // order-insensitive
+    // Member order is the WRITTEN order and is part of the identity, as in
+    // tsc: `A & B` and `B & A` are two types over the same member set.
     const o1 = try s.makeObject(&.{.{ .name = 1, .ty = string_type }}, 0, 0, 0);
     const o2 = try s.makeObject(&.{.{ .name = 2, .ty = number_type }}, 0, 0, 0);
     const ix = try s.makeIntersection(sc, &.{ o1, o2 });
     const iy = try s.makeIntersection(sc, &.{ o2, o1 });
-    try testing.expectEqual(ix, iy);
+    try testing.expect(ix != iy);
     try testing.expectEqual(Kind.intersection, s.kind(ix));
+    try testing.expectEqualSlices(TypeId, &.{ o1, o2 }, s.members(ix));
+    try testing.expectEqualSlices(TypeId, &.{ o2, o1 }, s.members(iy));
+    // Re-intersecting an intersection flattens in place and dedups on the
+    // first occurrence, so the order survives.
+    try testing.expectEqual(ix, try s.makeIntersection(sc, &.{ ix, o1 }));
+    try testing.expectEqual(ix, try s.makeIntersection(sc, &.{ o1, ix }));
     // empty -> unknown
     try testing.expectEqual(unknown_type, try s.makeIntersection(sc, &.{}));
 
@@ -1682,18 +1712,26 @@ test "intersection canonicalization" {
     }), dist);
     for (s.members(dist)) |m| try testing.expectEqual(Kind.intersection, s.kind(m));
 
-    // Two unions cross-multiply, and the result is independent of which union
-    // is expanded first (both operands and results are sorted by TypeId).
+    // Two unions cross-multiply into four intersections. The *union* is
+    // canonical, but each cross-product member keeps the operand order it was
+    // built from, so swapping the operands yields a different (mutually
+    // assignable) union — the same thing tsc's `getCrossProductIntersections`
+    // does.
     const o4 = try s.makeObject(&.{.{ .name = 4, .ty = string_type }}, 0, 0, 0);
     const uni_cd = try s.makeUnion(sc, &.{ o3, o4 });
     const cross = try s.makeIntersection(sc, &.{ uni_ab, uni_cd });
     try testing.expectEqual(@as(usize, 4), s.members(cross).len);
-    try testing.expectEqual(cross, try s.makeIntersection(sc, &.{ uni_cd, uni_ab }));
+    for (s.members(cross)) |m| {
+        try testing.expectEqual(Kind.intersection, s.kind(m));
+        try testing.expectEqual(@as(usize, 2), s.members(m).len);
+    }
 
     // `any` still absorbs through a union constituent, and a union member that
     // repeats an intersected part collapses (`(A | B) & A` keeps `A` once).
     try testing.expectEqual(any_type, try s.makeIntersection(sc, &.{ uni_ab, any_type }));
-    try testing.expectEqual(try s.makeUnion(sc, &.{ o1, ix }), try s.makeIntersection(sc, &.{ uni_ab, o1 }));
+    // `(o1 | o2) & o1` distributes to `o1 | (o2 & o1)` — the distributed
+    // member keeps the union constituent first, so it is `iy`, not `ix`.
+    try testing.expectEqual(try s.makeUnion(sc, &.{ o1, iy }), try s.makeIntersection(sc, &.{ uni_ab, o1 }));
 }
 
 test "object interning: property order does not matter, freshness does" {
