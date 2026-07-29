@@ -12238,6 +12238,28 @@ const Checker = struct {
             }
             return t;
         }
+        // A DEFERRED conditional or indexed access is not a union, so filtering
+        // leaves it whole and the nullish constituent hiding in its constraint
+        // survives the guard. tsc's `getAdjustedTypeWithFacts` handles exactly
+        // this: for `NEUndefined` it maps each constituent that *could* be
+        // undefined onto its BASE CONSTRAINT and re-applies the fact there. So
+        // `K extends keyof M ? M[K] | undefined : never` guarded by
+        // `!== undefined` becomes `M[K]`'s constraint without `undefined`,
+        // instead of staying the whole conditional — which is what made
+        // `ShapeCache.generateElementShape`'s inferred return keep an
+        // `undefined` arm past its own `if (cachedShape !== undefined) return`,
+        // and every `.forEach` on the result report an implicit `any`.
+        // The `& {}` marker used for a bare type parameter is deliberately not
+        // used here: there is no `T` slot to stay assignable to.
+        switch (c.ts.kind(t)) {
+            .conditional, .index_access => {
+                const base = try c.transitiveBaseConstraint(t);
+                if (base != t and base != types.no_type and c.containsNullish(base)) {
+                    return c.ts.makeIntersection(c.scratch(), &.{ t, types.empty_object_type });
+                }
+            },
+            else => {},
+        }
         return c.filterUnion(t, struct {
             fn keep(ch: *Checker, m: TypeId) bool {
                 const k = ch.ts.kind(m);
@@ -22700,6 +22722,16 @@ const Checker = struct {
     }
 
     /// Remove the single value type `v` from `t` (!== true branch).
+    /// Is `t`, or any constituent of it if it is a union, of kind `k`?
+    fn unionHasKind(c: *Checker, t: TypeId, k: types.Kind) bool {
+        if (c.ts.kind(t) == k) return true;
+        if (c.ts.kind(t) != .union_type) return false;
+        for (c.ts.members(t)) |m| {
+            if (c.ts.kind(m) == k) return true;
+        }
+        return false;
+    }
+
     fn narrowExcludeValue(c: *Checker, t: TypeId, v: TypeId) Error!TypeId {
         if (c.ts.kind(t) == .union_type) {
             var parts: std.ArrayList(TypeId) = .empty;
@@ -22712,6 +22744,40 @@ const Checker = struct {
         }
         const mt = try c.ts.regularLiteral(t);
         if (mt == v) return types.never_type;
+        // A DEFERRED conditional or indexed access is not a union, so none of
+        // the arms here can subtract the nullish constituent hiding inside it,
+        // and `x !== undefined` left the type exactly as it found it. tsc's
+        // `getAdjustedTypeWithFacts` covers this: for `NEUndefined` it maps a
+        // constituent that *could* be undefined onto its BASE CONSTRAINT and
+        // re-applies the fact there. So
+        // `K extends keyof M ? M[K] | undefined : never` guarded by
+        // `!== undefined` becomes the constraint without `undefined`.
+        //
+        // `ShapeCache.generateElementShape` is the shape that needs it: its
+        // inferred return type unions the guarded `cachedShape` with the
+        // freshly-generated one, so an `undefined` that the `if (cachedShape
+        // !== undefined) return cachedShape` had already excluded survived into
+        // the result, and every `.forEach` on it reported an implicit `any`.
+        // Only when the constraint really carries the value being excluded: an
+        // access that CANNOT be undefined (`M[K]` inside `M[K] | undefined`)
+        // must keep its deferred spelling, or the union arm above would trade
+        // every such member for its constraint.
+        if ((c.ts.kind(v) == .undefined or c.ts.kind(v) == .null) and
+            (c.ts.kind(mt) == .conditional or c.ts.kind(mt) == .index_access))
+        {
+            const base = try c.transitiveBaseConstraint(mt);
+            if (base != mt and base != types.no_type and c.unionHasKind(base, c.ts.kind(v))) {
+                // `& {}`, exactly as a bare type parameter is handled: the
+                // deferred spelling survives, so instantiating it later still
+                // produces the caller's own type argument, while the apparent
+                // members seen through it are the constraint's non-nullish
+                // ones. Replacing it with the constraint outright would bake the
+                // constraint into any inferred return type built from this
+                // branch, and `f("a")` would come back `string | number[]`
+                // instead of `number[]`.
+                return c.ts.makeIntersection(c.scratch(), &.{ mt, types.empty_object_type });
+            }
+        }
         // `x !== E.A` on a WHOLE-enum reference: the enum is the union of its
         // members (tsc), so the branch keeps every other member —
         // `WS.INVALID | WS.UPDATE`, not `WS`. Without this the negative branch

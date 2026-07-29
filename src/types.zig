@@ -1338,9 +1338,52 @@ pub const Store = struct {
             list = list[0..w];
         }
 
+        // `X & {}` next to `X` is absorbed by it. Every value of `X & {}` is a
+        // value of `X`, so the union is just `X` — tsc reaches the same answer
+        // through subtype reduction, which drops any constituent that is a
+        // subtype of another. This is the one shape that reduction MUST cover
+        // here: `& {}` is the marker narrowing puts on a type it has taken the
+        // nullish arm off without being able to rewrite it (a bare type
+        // parameter, a deferred conditional or indexed access), so a function
+        // that returns the guarded value on one path and the unguarded one on
+        // another infers `X & {} | X`. Left in place that union has no apparent
+        // members in common with `X` for property lookup to find.
+        var has_marked = false;
+        for (list) |t| {
+            if (s.kind(t) == .intersection and indexOf(s.members(t), empty_object_type) != null) {
+                has_marked = true;
+                break;
+            }
+        }
+        if (has_marked) {
+            var w: usize = 0;
+            for (list) |t| {
+                if (s.strippedEmptyObject(t)) |base| {
+                    if (indexOf(list, base) != null) continue;
+                }
+                list[w] = t;
+                w += 1;
+            }
+            list = list[0..w];
+        }
+
         if (list.len == 0) return never_type;
         if (list.len == 1) return list[0];
         return s.internType(.union_type, list, 0);
+    }
+
+    /// `X & {}` -> `X`, for a two-member intersection with the empty object
+    /// type as one member. Null for anything else, including a longer
+    /// intersection: `X & Y & {}` is not `X & Y`'s duplicate in a union unless
+    /// that whole intersection is itself a constituent, which the caller
+    /// cannot check without interning a new type.
+    fn strippedEmptyObject(s: *Store, t: TypeId) ?TypeId {
+        if (s.kind(t) != .intersection) return null;
+        const ms = s.members(t);
+        if (ms.len != 2) return null;
+        if (ms[0] == empty_object_type) return ms[1];
+        if (ms[1] == empty_object_type) return ms[0];
+        return null;
     }
 
     fn unionFlatten(
