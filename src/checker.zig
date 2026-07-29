@@ -19782,7 +19782,22 @@ const Checker = struct {
                     var map_list: std.ArrayList(TpMap) = .empty;
                     defer map_list.deinit(c.scratch());
                     var all_unbound = true;
-                    for (own_syms, own_cands) |sym, cand| {
+                    var erased_self = false;
+                    for (own_syms, own_cands) |sym, cand0| {
+                        // A candidate that IS one of the parameters this call is
+                        // still solving carries no information: it would leave
+                        // the argument's signature mentioning the very variable
+                        // being inferred, and since parameters are contravariant
+                        // that self-candidate then outranks the real covariant
+                        // evidence and the signature stays uninstantiated. tsc
+                        // erases a generic argument signature's own parameters
+                        // to their base constraints (`getBaseSignature`) before
+                        // inferring from it, which is what the fallback does.
+                        const self_ref = cand0 != types.no_type and
+                            s.kind(cand0) == .type_param and
+                            tpIndex(tp_syms, s.typeParamSymbol(cand0)) != null;
+                        if (self_ref) erased_self = true;
+                        const cand = if (self_ref) types.no_type else cand0;
                         if (cand != types.no_type) all_unbound = false;
                         const v = if (cand != types.no_type) cand else try c.typeParamFallback(sym);
                         try map_list.append(c.scratch(), .{ .sym = sym, .ty = v });
@@ -19790,7 +19805,9 @@ const Checker = struct {
                     // Only substitute when something was actually inferred —
                     // an unbound-everything map would erase params to their
                     // fallbacks and *lose* inference the caller could still do.
-                    if (!all_unbound) {
+                    // An erased self-reference counts: leaving the argument's
+                    // own parameter free is exactly the case that misinfers.
+                    if (!all_unbound or erased_self) {
                         ra = try c.instantiate(ra, map_list.items);
                         if (s.kind(ra) != .function) return;
                     }
@@ -20062,6 +20079,16 @@ const Checker = struct {
         const src_sym = s.typeParamSymbol(src);
         const idx = tpIndex(tp_syms, src_sym) orelse return; // …that we're inferring
         const ra = try c.resolveStructural(arg);
+        // Mapped against mapped (tsc's `inferFromObjectTypes` rule for two
+        // generic mapped types: infer constraint from constraint). A DEFERRED
+        // `Partial<T>` argument has no members to reverse-map, but it does name
+        // its own source: `Delta.create(deleted, inserted)` with both arguments
+        // typed `Partial<T>` must infer `create`'s own `T2 = T`, not leave it
+        // unbound and fall to `unknown`. Homomorphic on both sides only — the
+        // `Pick<S, K>`-shaped argument goes through `inferMappedKeySet`.
+        if (s.kind(ra) == .mapped and s.mappedAs(ra) == 0 and s.mappedHomomorphic(ra)) {
+            return c.unify(src, s.mappedSource(ra), tp_syms, candidates, depth + 1);
+        }
         if (s.kind(ra) != .object) return;
         const key_param = s.mappedKeyParam(m);
         const key_id = s.mappedParamId(key_param);
@@ -20106,6 +20133,17 @@ const Checker = struct {
         }
         if (props.items.len == 0) return;
         const obj = try c.objectFromProps(props.items, 0, 0);
+        // A reverse-mapped object found in a PARAMETER position is
+        // contravariant evidence, exactly like the `.type_param` arm's
+        // candidate. Writing it into the covariant accumulator let a callback
+        // parameter's rebuilt shape displace the type the call actually
+        // produces — `calculate(prev, next, postProcess)` took the erased
+        // `{ tag: string }` from `postProcess`'s `Partial<T>` over the `S` its
+        // first two arguments supply.
+        if (c.contraSlot(candidates, idx)) |slot| {
+            slot.* = if (slot.* == types.no_type) obj else try c.combineContravariant(slot.*, obj);
+            return;
+        }
         // The reverse-mapped object is the authoritative inference for a
         // homomorphic mapped target; it wins over an uninformative `any` that a
         // sibling union member (`Reducer<S, A, P>`) may have bound first.
@@ -20130,6 +20168,13 @@ const Checker = struct {
         // contextual type derived from the memoized component's props
         // disappeared.
         if (try c.isAssignable(obj, candidates[idx])) return;
+        // A TYPE-VARIABLE incumbent is always a direct match — an argument was
+        // literally of that type — and every rebuild of a constraint-shaped
+        // object strictly subsumes it, so the subsumption approximation gets
+        // this one case backwards. `calculate(prev, next, postProcess)` would
+        // answer `postProcess`'s erased `{ tag: string }` instead of the `S`
+        // that `prev` supplies. Priority, not subsumption, decides here.
+        if (s.kind(candidates[idx]) == .type_param) return;
         if (try c.isAssignable(candidates[idx], obj)) {
             candidates[idx] = obj;
             return;
