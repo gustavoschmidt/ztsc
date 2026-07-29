@@ -18082,7 +18082,26 @@ const Checker = struct {
                 return if (instance_ret != types.no_type) instance_ret else c.ts.fnReturn(inst);
             }
         }
-        try c.diagFmt(2769, c.nodeSpan(c.callShape(node).callee), "No overload matches this call.", .{});
+        // No candidate matched. tsc does not report at the callee: it re-checks
+        // the LAST candidate with error reporting on and files the TS2769 where
+        // that check would have reported — the offending argument, or, when the
+        // argument is an object literal, the offending PROPERTY of it
+        // (`fetch(url, { body: aSharedArrayBuffer })` is TS2769 on `body`).
+        // So run that check, take the span of the first diagnostic it filed
+        // inside this call, withdraw them all, and anchor the TS2769 there.
+        const call_span = c.nodeSpan(node);
+        const saved = c.diags.items.len;
+        const inst_last = try c.instantiateSigForCall(sigs[sigs.len - 1], explicit_targs, arg_nodes, node, ret_ctx);
+        try c.checkCallArguments(node, inst_last, arg_nodes, true);
+        var anchor = c.nodeSpan(c.callShape(node).callee);
+        for (c.diags.items[saved..]) |d| {
+            if (d.file != c.cur_file) continue;
+            if (d.span.start < call_span.start or d.span.start >= call_span.end) continue;
+            anchor = d.span;
+            break;
+        }
+        c.rollbackDiags(saved, .{ .file = c.cur_file, .lo = call_span.start, .hi = call_span.end });
+        try c.diagFmt(2769, anchor, "No overload matches this call.", .{});
         // Continue with the first signature for downstream typing.
         const inst = try c.instantiateSigForCall(sigs[0], explicit_targs, arg_nodes, node, ret_ctx);
         for (arg_nodes) |an| {
