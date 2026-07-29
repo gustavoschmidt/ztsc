@@ -15313,7 +15313,7 @@ const Checker = struct {
                 // (tsc: `getUnionType([type1, type2], UnionReduction.Subtype)`).
                 return c.logicalUnion(then_t, else_t);
             },
-            .prefix_unary => return c.checkPrefixUnary(node),
+            .prefix_unary => return c.checkPrefixUnary(node, ctx),
             .postfix_unary => {
                 const ot = try c.checkExprCached(d.lhs, types.no_type);
                 try c.checkArithmeticOperand(ot, d.lhs);
@@ -17741,7 +17741,7 @@ const Checker = struct {
         return result;
     }
 
-    fn checkPrefixUnary(c: *Checker, node: Node) Error!TypeId {
+    fn checkPrefixUnary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         const d = c.tree.nodeData(node);
         const op = c.tree.tokens.tag(c.tree.nodeMainToken(node));
         switch (op) {
@@ -17774,7 +17774,20 @@ const Checker = struct {
                 }
                 // `await e`: unwrap `Promise<T>` to `T`; a non-thenable passes
                 // through. Single-level only (deeper `Awaited<T>` is a gap).
-                const ot = try c.checkExprCached(d.lhs, types.no_type);
+                //
+                // The operand is contextually typed by `T | Promise<T>` — tsc's
+                // contextual type for an await operand, the same convention the
+                // async-return arm already uses. Checking it context-free left
+                // a GENERIC operand's type parameter with no candidate at all,
+                // so `const orig: Object = await importOriginal()` (vitest's
+                // `<T extends M = M>() => Promise<T>`) took `T`'s DEFAULT
+                // rather than `Object`.
+                const await_ctx = if (ctx != types.no_type and ctx != types.error_type and
+                    c.ts.kind(ctx) != .none)
+                    try c.makeUnion2(ctx, try c.makePromise(ctx))
+                else
+                    types.no_type;
+                const ot = try c.checkExprCached(d.lhs, await_ctx);
                 return try c.awaitedType(ot);
             },
             .minus => {
@@ -19144,7 +19157,22 @@ const Checker = struct {
             // contextual type, its `true` widened to `boolean`, and the result
             // no longer satisfied `{ [k: string]: true }` — while the same
             // declaration written without the `= any` default worked.
-            const undefendable_default = !seed_only and
+            //
+            // Restricted to a param that IS the whole return type. There the
+            // "inference" is content-free — `unify(AD, ctx)` just echoes the
+            // expected type back, which is exactly the override the guard is
+            // about. A param BURIED in the return (`(): Promise<T>` against a
+            // contextual `Promise<Object>` — vitest's `importOriginal:
+            // <T extends M = M>() => Promise<T>`, whose minted param has the
+            // same unretrievable-constraint-plus-default shape) matched
+            // structurally, so it is real evidence and outranks the default,
+            // as it does in tsc (a default is used only when NO candidate was
+            // found).
+            const ret_is_bare_param = blk: {
+                const r = try c.resolveStructural(c.ts.fnReturn(sig));
+                break :blk c.ts.kind(r) == .type_param and c.ts.typeParamSymbol(r) == tp_syms[i];
+            };
+            const undefendable_default = !seed_only and ret_is_bare_param and
                 con == types.no_type and c.typeParamHasDefault(tp_syms[i]);
             if (bare_outer_con or undefendable_default) continue;
             // A candidate that IS an outer call's in-flight inference variable
