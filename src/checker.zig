@@ -20838,6 +20838,31 @@ const Checker = struct {
         }
         const keys = switch (s.kind(ra)) {
             .mapped => if (s.mappedAs(ra) == 0) try c.mappedKeySet(ra) else return,
+            // A source union that CONTAINS a mapped type of the same shape pairs
+            // with the mapped target constituent-wise, and that constituent's
+            // key set is the inference — tsc's `inferFromTypes` matches union
+            // constituents to each other before inferring, so `Pick<S, K2>`
+            // inside the source lands on `Pick<S, K>` in the target and gives
+            // `K = K2`. Taking `keyof` of the WHOLE union instead intersects
+            // every member's key set, and a member with no enumerable keys (the
+            // updater callback of a forwarded `setState`) turns that into a
+            // symbolic `K2 & keyof (…)`, which does not satisfy `K extends
+            // keyof S` — so `K` fell back to its constraint, the target became
+            // the FULL state, and every forwarded update was rejected.
+            //
+            // Only when such a constituent is there: a union with no mapped
+            // member keeps the whole-union key set, which is what makes a
+            // void-returning or `null`-returning updater infer `never`.
+            .union_type => blk: {
+                var acc: TypeId = types.no_type;
+                for (try c.memberList(ra)) |um| {
+                    const rm = try c.resolveStructural(um);
+                    if (s.kind(rm) != .mapped or s.mappedAs(rm) != 0) continue;
+                    const ks = try c.mappedKeySet(rm);
+                    acc = if (acc == types.no_type) ks else try c.makeUnion2(acc, ks);
+                }
+                break :blk if (acc != types.no_type) acc else try c.keyofType(ra);
+            },
             else => try c.keyofType(ra),
         };
         // A key set is authoritative for its own param: an uninformative `any`
