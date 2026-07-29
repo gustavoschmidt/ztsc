@@ -13625,8 +13625,10 @@ const Checker = struct {
         const sp_count = c.ts.objectPropCount(sr);
         for (0..sp_count) |pi| {
             const dprop = c.ts.objectProp(sr, @intCast(pi));
-            // Candidate discriminant: present as a unit-typed property on every
-            // member, with at least two distinct member values.
+            // Candidate discriminant: present on every member as a unit — or a
+            // union of units, which is how a target constituent that already
+            // covers several tags spells it — with at least two distinct
+            // member values.
             var first_val: TypeId = 0;
             var differs = false;
             var ok = true;
@@ -13636,7 +13638,7 @@ const Checker = struct {
                     break;
                 };
                 const mr = try c.resolveStructural(mp.ty);
-                if (!isUnitLikeKind(c.ts.kind(mr))) {
+                if (!try c.isUnitOrUnitUnion(mr)) {
                     ok = false;
                     break;
                 }
@@ -13673,12 +13675,32 @@ const Checker = struct {
         return false;
     }
 
+    /// A unit type, or a union of nothing but unit types.
+    fn isUnitOrUnitUnion(c: *Checker, t: TypeId) Error!bool {
+        if (c.ts.kind(t) != .union_type) return isUnitLikeKind(c.ts.kind(t));
+        for (0..c.ts.memberCount(t)) |i| {
+            const m = try c.resolveStructural(c.ts.memberAt(t, i));
+            if (!isUnitLikeKind(c.ts.kind(m))) return false;
+        }
+        return true;
+    }
+
     /// Every named property of object `member` other than the discriminant
     /// `excl` must be present on `s` and assignable. Members carrying index or
     /// call/construct signatures are declined (return false) — the focused
     /// check covers only named properties, so bailing keeps the relation sound.
     fn nonDiscPropsAssignable(c: *Checker, s: TypeId, member: TypeId, excl: Atom) Error!bool {
         const m = try c.resolveStructural(member);
+        // An intersection requires every constituent, so relate to each. This
+        // is the shape a branded/composed element union has — `{ isDeleted:
+        // false } & { type: "diamond" } & Base` — where the discriminant lives
+        // in one constituent and the payload in another.
+        if (c.ts.kind(m) == .intersection) {
+            for (try c.memberList(m)) |part| {
+                if (!try c.nonDiscPropsAssignable(s, part, excl)) return false;
+            }
+            return true;
+        }
         if (c.ts.kind(m) != .object) return false;
         if (c.ts.objectStringIndex(m) != 0 or c.ts.objectNumberIndex(m) != 0 or
             c.ts.objectCallSigCount(m) != 0 or c.ts.objectConstructSigCount(m) != 0) return false;
@@ -14500,6 +14522,11 @@ const Checker = struct {
             if (!try c.literalPropsKnownIn(node, rm)) continue;
             if (try c.isAssignable(src_t, m)) return false;
         }
+        // A source whose DISCRIMINANT is a union legitimately matches no single
+        // constituent — it spans several (tsc `typeRelatedToDiscriminatedType`),
+        // and tsc's excess-property check is about property NAMES being known,
+        // not about fitting one constituent whole.
+        if (try c.discriminatedUnionAssignable(src_t, rt)) return false;
         if (try c.elaborateLiteralError(node, src_t, target)) return true;
         try c.reportNotAssignable(code, src_t, target, span);
         return true;
