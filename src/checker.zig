@@ -12501,6 +12501,20 @@ const Checker = struct {
         // whole key union is not assignable to `string`.
         if (c.ts.kind(a) == .keyof_op) return c.castComparableRec(try c.propertyKeyType(), b0, depth + 1);
         if (c.ts.kind(b) == .keyof_op) return c.castComparableRec(a0, try c.propertyKeyType(), depth + 1);
+        // A DEFERRED indexed access (`T[K]`) overlaps everything, like an
+        // unconstrained type parameter. tsc only rejects a cast through one when
+        // `getBaseConstraintOfType` fully reduces it — which needs the object
+        // constraint to answer for EVERY key the index constraint admits, i.e.
+        // an index signature or a mapped template (`T extends Record<keyof T,
+        // number>`). Substituting the constraints structurally instead reduces
+        // shapes tsc leaves deferred (`T extends { a: number; b: number }`,
+        // where tsc accepts `s as T[K]` for any `s`), which would be a false
+        // rejection — the one thing policy forbids. So the whole family is
+        // conceded: comparing the two operands' *members* here reported
+        // `result as T[K]` on a numeric record, which tsc accepts, and four
+        // more shapes besides. The residual under-report is registered against
+        // the negatives case.
+        if (c.ts.kind(a) == .index_access or c.ts.kind(b) == .index_access) return true;
         // A DEFERRED conditional (`T extends E[] ? E[] : E | null`, the return
         // type of a generic overload written as one function) has no resolved
         // form here. tsc compares against its *default constraint* — the union

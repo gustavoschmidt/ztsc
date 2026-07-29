@@ -138,3 +138,15 @@ indexed/028_index_target_constraint_negatives.ts  -TS2536 31
 indexed/030_element_access_union_key_negatives.ts  -TS7053 9
 indexed/030_element_access_union_key_negatives.ts  -TS7053 14
 indexed/030_element_access_union_key_negatives.ts  -TS2493 19
+
+# A cast whose source or target is a DEFERRED indexed access (`T[K]`) is
+# conceded outright (indexed/031): tsc rejects one only when
+# `getBaseConstraintOfType` fully reduces the access, which needs the object
+# constraint to answer for every key the index constraint admits. Reducing it
+# structurally instead — substituting each parameter's constraint — also
+# collapses the shapes tsc leaves deferred, and then rejects casts tsc accepts
+# (`s as T[K]` under `T extends { a: number; b: number }`, plus four more in
+# 031). Trading one deterministic under-report for five false rejections is the
+# standing policy direction. Line 14, whose operands are not deferred, still
+# reports.
+indexed/032_cast_to_deferred_indexed_access_negatives.ts  -TS2352 8
