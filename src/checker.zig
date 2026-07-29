@@ -14853,6 +14853,17 @@ const Checker = struct {
     /// tsc's excess property check: only *fresh* object literals, checked
     /// against object-ish targets; recurses into nested literal properties.
     fn excessPropertyCheck(c: *Checker, expr_node: Node, src_t: TypeId, target: TypeId) Error!void {
+        _ = try c.excessPropertyScan(expr_node, src_t, target, true);
+    }
+
+    /// The excess-property check, with the diagnostic made optional: returns
+    /// whether the fresh literal `expr_node` carries a property `target` does
+    /// not know. `report = false` is the silent form overload probing needs
+    /// (`freshLiteralRejects`) — tsc folds this test into the assignability
+    /// relation itself (`hasExcessProperties` inside `isRelatedTo`), so a
+    /// candidate signature that only "fits" by ignoring an excess property is
+    /// not applicable there either.
+    fn excessPropertyScan(c: *Checker, expr_node: Node, src_t: TypeId, target: TypeId, report: bool) Error!bool {
         var node = expr_node;
         // Unwrap parens and a JSX expression container (`prop={{ … }}`): the
         // object literal inside a JSX attribute value is fresh and excess-checked
@@ -14862,18 +14873,18 @@ const Checker = struct {
                 .paren_expr, .jsx_expr_container => node = c.tree.nodeData(node).lhs,
                 else => break,
             }
-            if (node == null_node) return;
+            if (node == null_node) return false;
         }
-        if (c.nodeTag(node) != .object_literal) return;
-        if (!c.ts.objectIsFresh(src_t)) return;
+        if (c.nodeTag(node) != .object_literal) return false;
+        if (!c.ts.objectIsFresh(src_t)) return false;
         const rt = try c.resolveStructural(target);
         switch (c.ts.kind(rt)) {
             .object => {
-                if (c.ts.objectStringIndex(rt) != 0 or c.ts.objectNumberIndex(rt) != 0) return;
+                if (c.ts.objectStringIndex(rt) != 0 or c.ts.objectNumberIndex(rt) != 0) return false;
                 // The empty object type `{}` accepts any properties: tsc's
                 // `hasExcessProperties` bails on `isEmptyObjectType(target)`
                 // (e.g. react-i18next's `values?: {}`). No prop is ever excess.
-                if (c.isEmptyObjectType(rt)) return;
+                if (c.isEmptyObjectType(rt)) return false;
             },
             .union_type => {
                 // Check against the union: a property is excess if no
@@ -14886,10 +14897,10 @@ const Checker = struct {
                 // *index-signature* constituent like `Record<string, never>`
                 // is not empty and does not bail — it elaborates instead.
                 for (try c.memberList(rt)) |m| {
-                    if (try c.targetIsEmptyish(m)) return;
+                    if (try c.targetIsEmptyish(m)) return false;
                 }
             },
-            else => return,
+            else => return false,
         }
         for (c.tree.nodeRange(node)) |prop| {
             if (prop == null_node) continue;
@@ -14903,10 +14914,12 @@ const Checker = struct {
             const key = try c.memberAtom(key_tok);
             const known = try c.targetKnowsProp(rt, key);
             if (!known) {
-                try c.diagFmt(2353, c.tokSpan(key_tok), "Object literal may only specify known properties, and '{s}' does not exist in type '{s}'.", .{
-                    c.atomText(key), try c.typeToString(target),
-                });
-                return; // one excess error per literal, like tsc's early bail
+                if (report) {
+                    try c.diagFmt(2353, c.tokSpan(key_tok), "Object literal may only specify known properties, and '{s}' does not exist in type '{s}'.", .{
+                        c.atomText(key), try c.typeToString(target),
+                    });
+                }
+                return true; // one excess error per literal, like tsc's early bail
             }
             // Recurse into nested fresh literals.
             if (tag == .object_property) {
@@ -14914,12 +14927,50 @@ const Checker = struct {
                 if (c.nodeTag(pd.rhs) == .object_literal) {
                     if (c.nodeType(pd.rhs)) |nested_t| {
                         if (try c.targetPropType(rt, key)) |tp| {
-                            try c.excessPropertyCheck(pd.rhs, nested_t, tp);
+                            if (try c.excessPropertyScan(pd.rhs, nested_t, tp, report)) return true;
                         }
                     }
                 }
             }
         }
+        return false;
+    }
+
+    /// Would a fresh object-literal argument make this candidate signature
+    /// inapplicable? tsc runs the excess-property check *inside* the
+    /// assignability relation, and for a UNION target it runs it once per
+    /// constituent (`typeRelatedToSomeType` recurses with the source still
+    /// fresh) — so `throttle(fn, ms, { leading: false })` is not applicable to
+    /// the `ThrottleSettings & { leading: true } | Omit<ThrottleSettings,
+    /// "leading">` overload: the intersection arm rejects `false` and the
+    /// `Omit` arm does not know `leading`. ztsc keeps freshness out of
+    /// `isAssignable` (the relation is memoized on type pairs, and freshness
+    /// is a property of the *expression*), so overload probing consults this
+    /// predicate separately. It mirrors exactly what the reporting paths
+    /// (`excessPropertyCheck` / `freshLiteralUnionMismatch`) would file for
+    /// the same triple — the candidate is rejected iff the winning candidate
+    /// would have been diagnosed on this argument.
+    fn freshLiteralRejects(c: *Checker, expr_node: Node, src_t: TypeId, target: TypeId) Error!bool {
+        var node = expr_node;
+        while (true) {
+            switch (c.nodeTag(node)) {
+                .paren_expr, .jsx_expr_container => node = c.tree.nodeData(node).lhs,
+                else => break,
+            }
+            if (node == null_node) return false;
+        }
+        if (c.nodeTag(node) != .object_literal) return false;
+        if (!c.ts.objectIsFresh(src_t)) return false;
+        const rt = try c.resolveStructural(target);
+        if (c.ts.kind(rt) == .union_type) {
+            for (try c.memberList(rt)) |m| {
+                const rm = try c.resolveStructural(m);
+                if (!try c.literalPropsKnownIn(node, rm)) continue;
+                if (try c.isAssignable(src_t, m)) return false;
+            }
+            return !try c.discriminatedUnionAssignable(src_t, rt);
+        }
+        return try c.excessPropertyScan(node, src_t, target, false);
     }
 
     /// tsc's `isEmptyObjectType` as `hasExcessProperties` consults it: an
@@ -20798,6 +20849,16 @@ const Checker = struct {
             };
             if (fn_arg) c.no_publish_depth -= 1;
             if (!try c.isAssignable(at, pt)) {
+                c.rollbackArgDiags(saved_diags, spec_file, arg_nodes);
+                return false;
+            }
+            // Freshness is not part of `isAssignable` here (see
+            // `freshLiteralRejects`), so an excess property on a fresh object
+            // literal has to reject the candidate explicitly — otherwise the
+            // first overload "matches", wins, and is then diagnosed by
+            // `checkCallArguments`, which is exactly the error tsc avoids by
+            // moving on to the next overload.
+            if (try c.freshLiteralRejects(an, at, pt)) {
                 c.rollbackArgDiags(saved_diags, spec_file, arg_nodes);
                 return false;
             }
