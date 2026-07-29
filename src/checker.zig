@@ -19335,10 +19335,22 @@ const Checker = struct {
         // El[]` against `(value: U | U[]) => U[]` inferred `U = T` instead of
         // `U = El`, so every downstream element stayed the opaque `T` and
         // `El`-typed uses of it were rejected.
-        if (s.kind(arg) == .type_param) switch (s.kind(param)) {
+        // `getApparentType` covers every INSTANTIABLE source, not just a bare
+        // type variable: a deferred `T["boundElements"]` contributes through
+        // `readonly Bound[] | null` too, which is what lets the array literal
+        // written for it be formed as an array of `{ type: "arrow" }` instead
+        // of widening its discriminant to `string`.
+        const arg_instantiable = switch (s.kind(arg)) {
+            .type_param, .index_access, .conditional => true,
+            else => false,
+        };
+        if (arg_instantiable) switch (s.kind(param)) {
             .type_param, .union_type, .intersection => {},
             else => {
-                const con = try c.typeParamConstraint(s.typeParamSymbol(arg));
+                const con = if (s.kind(arg) == .type_param)
+                    try c.typeParamConstraint(s.typeParamSymbol(arg))
+                else
+                    try c.transitiveBaseConstraint(arg);
                 if (con != types.no_type and con != arg) {
                     return c.unify(param, con, tp_syms, candidates, depth + 1);
                 }
