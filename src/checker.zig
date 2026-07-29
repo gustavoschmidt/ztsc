@@ -16298,7 +16298,15 @@ const Checker = struct {
             // (`const a: WS.A[] = [WS.A]`); the whole enum does not — that is
             // the widening context (`const o = { k: WS.A }` is `{ k: WS }`).
             .enum_type => return c.ts.isEnumMember(r) and c.ts.isEnumMember(lit),
-            .union_type => {
+            // tsc's `isLiteralOfContextualType` treats a union and an
+            // INTERSECTION alike (`contextualType.flags & UnionOrIntersection`
+            // → `some(types, …)`). An intersection contextual type is exactly
+            // what a property of `Settings & { leading: true }` gets — the
+            // members are `boolean | undefined` and `true`, and only the second
+            // admits the literal. Without the arm the fresh `true` widened to
+            // `boolean`, which no longer matched the `{ leading: true }` arm of
+            // the parameter union, so the whole overload was rejected.
+            .union_type, .intersection => {
                 for (try c.memberList(r)) |m| {
                     if (try c.contextAdmitsLiteral(m, lit)) return true;
                 }
