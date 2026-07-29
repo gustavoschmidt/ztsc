@@ -18306,6 +18306,82 @@ const Checker = struct {
         }
     }
 
+    /// tsc's `getContextualCallSignature` for an INTERSECTION contextual type:
+    /// the constituents' call signatures concatenate, and either the sole one
+    /// answers or they are COMBINED (`getIntersectedSignatures` ->
+    /// `combineSignaturesOfIntersectionMembers`), which unions the parameter
+    /// types position-wise and intersects the return types. `no_type` when the
+    /// intersection carries no usable call signature.
+    ///
+    /// Deliberately conservative: a constituent with its own type parameters,
+    /// a rest parameter, or a `this` type makes the combination ambiguous, so
+    /// the whole intersection answers `no_type` and the arrow keeps its
+    /// context-free check (the prior behaviour for every intersection).
+    fn intersectedCallSignature(c: *Checker, rctx: TypeId) Error!TypeId {
+        const s = &c.ts;
+        var sigs: std.ArrayList(TypeId) = .empty;
+        defer sigs.deinit(c.scratch());
+        for (try c.memberList(rctx)) |m| {
+            const rm = try c.resolveStructural(m);
+            switch (s.kind(rm)) {
+                .function => try sigs.append(c.scratch(), rm),
+                .overloads => for (try c.memberList(rm)) |ov| {
+                    try sigs.append(c.scratch(), ov);
+                },
+                // Every call signature of the constituent, including an
+                // overload set's: `getSignaturesOfType` concatenates them all
+                // and the combination below is what tsc applies to the result.
+                .object => {
+                    for (0..s.objectCallSigCount(rm)) |i| {
+                        try sigs.append(c.scratch(), s.objectCallSig(rm, @intCast(i)));
+                    }
+                },
+                else => {},
+            }
+        }
+        if (sigs.items.len == 0) return types.no_type;
+        if (sigs.items.len == 1) return sigs.items[0];
+        var max_params: usize = 0;
+        for (sigs.items) |sig| {
+            if (s.fnTypeParams(sig).len != 0 or s.fnThisType(sig) != 0) return types.no_type;
+            for (0..s.fnParamCount(sig)) |i| {
+                if (s.fnParam(sig, @intCast(i)).rest()) return types.no_type;
+            }
+            max_params = @max(max_params, s.fnParamCount(sig));
+        }
+        var params: std.ArrayList(types.Param) = .empty;
+        defer params.deinit(c.scratch());
+        var parts: std.ArrayList(TypeId) = .empty;
+        defer parts.deinit(c.scratch());
+        for (0..max_params) |i| {
+            parts.clearRetainingCapacity();
+            var name: Atom = 0;
+            var opt = false;
+            for (sigs.items) |sig| {
+                if (i >= s.fnParamCount(sig)) {
+                    // A signature that does not declare this position leaves it
+                    // optional, matching tsc's `combineSignatures` arity rule.
+                    opt = true;
+                    continue;
+                }
+                const p = s.fnParam(sig, @intCast(i));
+                if (name == 0) name = p.name;
+                if (p.optional()) opt = true;
+                try parts.append(c.scratch(), p.ty);
+            }
+            if (parts.items.len == 0) return types.no_type;
+            try params.append(c.scratch(), .{
+                .name = name,
+                .ty = try s.makeUnion(c.scratch(), parts.items),
+                .flags = if (opt) types.param_flag_optional else 0,
+            });
+        }
+        parts.clearRetainingCapacity();
+        for (sigs.items) |sig| try parts.append(c.scratch(), s.fnReturn(sig));
+        const ret = try s.makeIntersection(c.scratch(), parts.items);
+        return s.makeFunction(params.items, ret, &.{}, 0);
+    }
+
     fn checkFunctionLikeExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         // A const assertion does not propagate into function bodies.
         const prev_cc = c.const_ctx;
@@ -18352,8 +18428,29 @@ const Checker = struct {
                             ctx_sig = c.ts.objectCallSig(rm, 0);
                             break;
                         }
+                        // An optional property whose declared type is an
+                        // intersection of callables arrives as
+                        // `(A & B) | undefined`.
+                        if (c.ts.kind(rm) == .intersection) {
+                            const isig = try c.intersectedCallSignature(rm);
+                            if (isig != types.no_type) {
+                                ctx_sig = isig;
+                                break;
+                            }
+                        }
                     }
                 },
+                // An INTERSECTION of callables. `getSignaturesOfType` on an
+                // intersection is the concatenation of its constituents', and
+                // `getContextualCallSignature` then either takes the sole one
+                // or COMBINES them (tsc's `getIntersectedSignatures`). A JSX
+                // attribute of a component whose props are
+                // `Omit<TriggerProps, "name"> & React.HTMLAttributes<…>` is
+                // exactly this: both constituents declare `onToggle`, so the
+                // attribute value's contextual type is
+                // `((open: boolean) => void) & ReactEventHandler<…>` and the
+                // arrow written for it reported TS7006 on every parameter.
+                .intersection => ctx_sig = try c.intersectedCallSignature(rctx),
                 else => {},
             }
         }
