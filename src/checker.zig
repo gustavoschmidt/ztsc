@@ -918,6 +918,14 @@ const Checker = struct {
     /// still-top-level parameter widens a fresh-literal candidate
     /// (`getCovariantInference`). Shares `contra_owner`'s identity check.
     top_flags: []bool = &.{},
+    /// tsc's `InferencePriority.HomomorphicMappedType`, one flag per type
+    /// parameter of the in-flight call: true while the only evidence recorded
+    /// for it came from REVERSE-MAPPED inference (`Partial<T>`, `Readonly<T>`,
+    /// a homomorphic mapped parameter). tsc keeps only the candidates at the
+    /// best priority it saw, so a direct structural candidate replaces a
+    /// reverse-mapped one outright and a reverse-mapped one arriving second is
+    /// discarded. Shares `contra_owner`'s identity check.
+    rev_flags: []bool = &.{},
     /// Nesting depth inside `unify` below a non-top-level constructor. Unions
     /// and intersections preserve top-level-ness (tsc's
     /// `isTypeParameterAtTopLevel` descends them); everything else does not.
@@ -19282,21 +19290,27 @@ const Checker = struct {
         // tsc's `InferenceInfo.topLevel`, registered the same way.
         const top_flags = try c.scratch().alloc(bool, tp_syms.len);
         for (top_flags) |*x| x.* = true;
+        // tsc's `InferencePriority.HomomorphicMappedType`, registered the same way.
+        const rev_flags = try c.scratch().alloc(bool, tp_syms.len);
+        for (rev_flags) |*x| x.* = false;
         const saved_contra_cands = c.contra_cands;
         const saved_contra_owner = c.contra_owner;
         const saved_contra_pos = c.contra_pos;
         const saved_top_flags = c.top_flags;
+        const saved_rev_flags = c.rev_flags;
         const saved_nontop_depth = c.nontop_depth;
         c.contra_cands = contra;
         c.contra_owner = candidates.ptr;
         c.contra_pos = 0;
         c.top_flags = top_flags;
+        c.rev_flags = rev_flags;
         c.nontop_depth = 0;
         defer {
             c.contra_cands = saved_contra_cands;
             c.contra_owner = saved_contra_owner;
             c.contra_pos = saved_contra_pos;
             c.top_flags = saved_top_flags;
+            c.rev_flags = saved_rev_flags;
             c.nontop_depth = saved_nontop_depth;
         }
 
@@ -19923,6 +19937,14 @@ const Checker = struct {
         return &c.top_flags[i];
     }
 
+    /// The reverse-mapped-priority flag for type parameter `i` (same identity
+    /// rule as `contraSlot`).
+    fn revSlot(c: *Checker, candidates: []TypeId, i: usize) ?*bool {
+        if (c.contra_owner != candidates.ptr) return null;
+        if (c.rev_flags.len != candidates.len) return null;
+        return &c.rev_flags[i];
+    }
+
     fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, candidates: []TypeId, depth: u32) Error!void {
         if (depth > 16) return;
         const s = &c.ts;
@@ -20002,6 +20024,16 @@ const Checker = struct {
                     if (c.contraSlot(candidates, i)) |slot| {
                         slot.* = if (slot.* == types.no_type) cand else try c.combineContravariant(slot.*, cand);
                         return;
+                    }
+                    // A DIRECT structural match outranks a reverse-mapped one
+                    // (tsc keeps only the best-priority candidates), so an
+                    // incumbent that came solely from a `Partial<T>`-shaped
+                    // parameter is dropped rather than combined.
+                    if (c.revSlot(candidates, i)) |rf| {
+                        if (rf.*) {
+                            rf.* = false;
+                            candidates[i] = types.no_type;
+                        }
                     }
                     if (candidates[i] == types.no_type) {
                         candidates[i] = cand;
@@ -20878,7 +20910,18 @@ const Checker = struct {
         // sibling union member (`Reducer<S, A, P>`) may have bound first.
         if (candidates[idx] == types.no_type or candidates[idx] == types.any_type) {
             candidates[idx] = obj;
+            if (c.revSlot(candidates, idx)) |rf| rf.* = true;
             return;
+        }
+        // A DIRECT structural candidate already answered for this parameter.
+        // tsc gives a reverse-mapped inference `InferencePriority.
+        // HomomorphicMappedType` and keeps only the best-priority candidates,
+        // so this one is discarded outright — `updateObject<T extends
+        // Record<string, any>>(obj: T, updates: Partial<T>)` must answer the
+        // `T` its FIRST argument supplies, not a union of that with the
+        // rebuilt `{ docked: boolean | undefined; … }` of its second.
+        if (c.revSlot(candidates, idx)) |rf| {
+            if (!rf.*) return;
         }
         // Two genuine candidates for the same parameter. tsc resolves a
         // covariant inference set with `getCommonSupertype`, never a union, and
