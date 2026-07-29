@@ -5277,7 +5277,16 @@ const Checker = struct {
         for (c.tree.nodeRange(body)) |stmt| {
             if (stmt != null_node) try c.collectReturns(stmt, &rets, &ret_scopes, &bare_return, base_scope);
         }
-        if (rets.items.len == 0) return types.void_type;
+        if (rets.items.len == 0) {
+            // A block body with no `return` at all whose endpoint is
+            // UNREACHABLE never produces a value: tsc infers `never`, not
+            // `void` (`getReturnTypeFromBody` → `functionHasImplicitReturn`).
+            // `() => { throw new Error(…); }` is therefore usable wherever a
+            // `() => [number, string]` is wanted; typed `void` it was a
+            // phantom TS2322/TS2345 at every such callback.
+            if (c.stmtListTerminal(c.tree.nodeRange(body))) return types.never_type;
+            return types.void_type;
+        }
         var parts: std.ArrayList(TypeId) = .empty;
         defer parts.deinit(c.scratch());
         // Each return expression is resolved in the scope where its `return`
