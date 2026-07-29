@@ -13210,6 +13210,14 @@ const Checker = struct {
             return if (try c.isAssignable(sv, c.ts.mappedValue(t))) true else null;
         }
         if (tk == .mapped) {
+            // tsc `structuredTypeRelatedTo`, verbatim: "An empty object type is
+            // related to any mapped type that includes a '?' modifier." Every
+            // key such a map produces is optional, so a source with no members
+            // satisfies all of them — whatever key set the map is still
+            // deferred on. This is what makes `Delta.empty()`, which returns
+            // `Delta<unknown>` (`deleted: Partial<unknown>` = `{}`), a legal
+            // `Delta<T>` inside `Delta.calculate<T>`.
+            if (c.mappedAddsOptional(t) and c.isEmptyObjectType(try c.resolveStructural(s))) return true;
             // tsc `structuredTypeRelatedTo`: `S` is related to `{ [P in C]: X }`
             // when `keyof S` is related to `C` and `S[P]` is related to `X`.
             // Guarded, as tsc guards it, on the target not adding `?` — that
