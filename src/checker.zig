@@ -17212,6 +17212,37 @@ const Checker = struct {
                             try generic_spreads.append(c.scratch(), st);
                             continue;
                         },
+                        // An INTERSECTION that mixes concrete constituents with
+                        // generic ones (`{ [ORIG]?: string } & { selected?: true }
+                        // & Partial<Record<T, any>>`) is tsc's intersection
+                        // branch of `getSpreadType`: the concrete half is
+                        // flattened into the literal and the generic half is
+                        // kept by identity. Flattening the whole thing dropped
+                        // the deferred constituent, so `{ ...el, id }` was no
+                        // longer assignable to `typeof el & { id: string }`.
+                        .intersection => {
+                            var any_generic = false;
+                            for (try c.memberList(st)) |m| {
+                                const rm = try c.resolveStructural(m);
+                                switch (c.ts.kind(rm)) {
+                                    .type_param, .mapped, .index_access, .conditional => {
+                                        try generic_spreads.append(c.scratch(), rm);
+                                        any_generic = true;
+                                    },
+                                    else => {},
+                                }
+                            }
+                            if (any_generic) {
+                                for (try c.memberList(st)) |m| {
+                                    const rm = try c.resolveStructural(m);
+                                    switch (c.ts.kind(rm)) {
+                                        .type_param, .mapped, .index_access, .conditional => {},
+                                        else => try c.gatherSpreadProps(rm, &props, &prop_index, &str_index_vals, &num_index_vals),
+                                    }
+                                }
+                                continue;
+                            }
+                        },
                         else => {},
                     }
                     try c.gatherSpreadProps(st, &props, &prop_index, &str_index_vals, &num_index_vals);
@@ -23283,6 +23314,32 @@ const Checker = struct {
         return c.ts.makeUnion(c.scratch(), parts.items);
     }
 
+    /// Is `prop` DECLARED on `rm`, for the purposes of `in`-narrowing? tsc's
+    /// `isTypePresencePossible` asks `getPropertyOfType`, and a still-GENERIC
+    /// mapped type (`Partial<Record<T, any>>` with `T` abstract) has no members
+    /// at all there — its key set is unknown, so it can neither confirm nor
+    /// supply the name. ztsc's `propOfType` synthesizes a member for any name
+    /// on such a type, which made every constituent of
+    /// `({ [ORIG_ID]?: string } | { id: string }) & Partial<Record<T, any>>`
+    /// look like it has `id`, so `"id" in el` filtered nothing.
+    fn propDeclaredForIn(c: *Checker, rm: TypeId, prop: Atom) Error!?types.Prop {
+        switch (c.ts.kind(rm)) {
+            .mapped => {
+                const con = c.ts.mappedConstraint(rm);
+                if (con == types.no_type or try c.containsTypeParam(con)) return null;
+            },
+            .intersection => {
+                for (try c.memberList(rm)) |m| {
+                    const r = try c.resolveStructural(m);
+                    if (try c.propDeclaredForIn(r, prop)) |p| return p;
+                }
+                return null;
+            },
+            else => {},
+        }
+        return c.propOfType(rm, prop);
+    }
+
     fn narrowByInProp(c: *Checker, t: TypeId, prop: Atom, sense: bool) Error!TypeId {
         // tsc's `narrowByInKeyword`: the filtering branch only applies when the
         // name is a *known* property — declared on some constituent, or covered
@@ -23323,8 +23380,9 @@ const Checker = struct {
         defer parts.deinit(c.scratch());
         for (try c.memberList(t)) |m| {
             const rm = try c.resolveStructural(m);
-            const has = (try c.propOfType(rm, prop)) != null;
-            const optional = if (try c.propOfType(rm, prop)) |p| p.optional() else false;
+            const found = try c.propDeclaredForIn(rm, prop);
+            const has = found != null;
+            const optional = if (found) |p| p.optional() else false;
             const kept = if (sense) has else (!has or optional);
             if (kept) try parts.append(c.scratch(), m);
         }
