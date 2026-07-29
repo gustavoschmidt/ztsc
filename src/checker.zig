@@ -21459,7 +21459,15 @@ const Checker = struct {
                     if (c.flow_back_edge == 0) c.flow_tmp.clearRetainingCapacity();
                 }
                 if (parts.items.len == 0) return types.never_type;
-                return c.ts.makeUnion(c.scratch(), parts.items);
+                const joined = try c.ts.makeUnion(c.scratch(), parts.items);
+                // tsc joins the antecedents of an EVOLVING (`auto`-typed)
+                // variable with `UnionReduction.Subtype`, so a branch that
+                // assigns `{ appState: … }` and one that assigns the
+                // all-optional `Init` collapse to `Init` instead of a union
+                // whose first constituent lacks the other's properties. Without
+                // it every later `v?.someProp` reported TS2339.
+                if (key.len == 0 and c.isEvolvingVar(key.sym)) return c.reduceEvolvingJoin(joined);
+                return joined;
             },
         }
     }
@@ -22285,6 +22293,30 @@ const Checker = struct {
     /// kept set can otherwise fail to admit the very value being written. The
     /// guard is inert for a non-union assigned type, where "some" and "all"
     /// agree and the kept set trivially admits it.
+    /// Subtype reduction for an evolving variable's flow join, with the
+    /// nullish constituents held out of it. `null`/`undefined` must survive:
+    /// ztsc's relation lets them satisfy an object whose properties are all
+    /// optional, so a plain `reduceSubtypes` would absorb the `null` that a
+    /// branch which assigns nothing still contributes.
+    fn reduceEvolvingJoin(c: *Checker, joined: TypeId) Error!TypeId {
+        if (c.ts.kind(joined) != .union_type) return joined;
+        var nullish: std.ArrayList(TypeId) = .empty;
+        defer nullish.deinit(c.scratch());
+        var rest: std.ArrayList(TypeId) = .empty;
+        defer rest.deinit(c.scratch());
+        for (try c.memberList(joined)) |m| {
+            if (isNullishKind(c.ts.kind(m)))
+                try nullish.append(c.scratch(), m)
+            else
+                try rest.append(c.scratch(), m);
+        }
+        if (nullish.items.len == 0) return c.reduceSubtypes(joined);
+        if (rest.items.len == 0) return joined;
+        const reduced = try c.reduceSubtypes(try c.ts.makeUnion(c.scratch(), rest.items));
+        try nullish.append(c.scratch(), reduced);
+        return c.ts.makeUnion(c.scratch(), nullish.items);
+    }
+
     fn assignmentReduced(c: *Checker, declared: TypeId, assigned0: TypeId) Error!TypeId {
         const dk = c.ts.kind(declared);
         if (dk == .any or dk == .err or dk == .unknown) {
