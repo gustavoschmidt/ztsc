@@ -13180,7 +13180,19 @@ const Checker = struct {
             if (tk == .object or tk == .ref) {
                 return c.structuralAssignable(s, try c.resolveStructural(t));
             }
-            return false;
+            // A deferred CONDITIONAL target is answered by the arm just below,
+            // not here. tsc's `someTypeRelatedToType` failing on an intersection
+            // source does not end the relation — it falls through to
+            // `structuredTypeRelatedTo`, which applies the both-branches rule.
+            // Answering `false` here made an intersection unable to meet
+            // `T extends X ? S : S` even when both branches ARE the source: no
+            // single constituent (`number`, `{ _brand }`) relates to the whole
+            // conditional, so the loop above always fails. That is why a UNION
+            // OF INTERSECTIONS did not relate to a conditional whose branches
+            // were spelled with that very union — the source union distributes
+            // to its intersection members first, and each one died here — while
+            // a union of plain objects was fine.
+            if (tk != .conditional) return false;
         }
         // Deferred conditional *target*: the source must satisfy whichever
         // branch the conditional resolves to, so require it against both.

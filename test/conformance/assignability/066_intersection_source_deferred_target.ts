@@ -18,9 +18,11 @@ export const write = <T extends Base>(e: T) => {
 };
 
 // Deferred conditional target (`T` is free, so it does not resolve), same
-// intersection source: it must satisfy whichever branch is taken, so a
-// `Radians`/`Radians` conditional accepts it and a `string`/`string` one does
-// not.
+// intersection source: it must satisfy whichever branch is taken, so ztsc
+// accepts a `Radians`/`Radians` conditional and rejects a `string`/`string`
+// one. tsc rejects BOTH in this (declaration) position — it applies the
+// both-branches rule only to a return expression — so line 25 is a registered
+// divergence; conditional/035 pins its full extent.
 export const cond = <T extends Base>(e: T) => {
   const okCond: T extends 0 ? Radians : Radians = e.angle;
   const badCond: T extends 0 ? string : string = e.angle;
