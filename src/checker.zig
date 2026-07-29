@@ -16849,10 +16849,42 @@ const Checker = struct {
                 // a concrete constraint already had its full say above.
                 if (try c.containsTypeParam(constraint)) {
                     const base = try c.baseConstraintOf(constraint);
-                    if (base != constraint) return c.contextAdmitsLiteral(base, lit);
+                    if (base != constraint) {
+                        if (try c.contextAdmitsLiteral(base, lit)) return true;
+                        return c.constraintKeepsLiteralKind(base, lk);
+                    }
+                }
+                // tsc's `isLiteralOfContextualType` type-VARIABLE rule: a
+                // constraint that merely *contains* the literal's primitive
+                // (`T extends string`) is a literal context, even though the
+                // primitive itself is a widening context in every other
+                // position. That is what makes `isMemberOf<T extends string>(
+                // coll: readonly T[], v)` called with `["a", "b"]` infer
+                // `T = "a" | "b"` instead of `string`.
+                return c.constraintKeepsLiteralKind(constraint, lk);
+            },
+            else => return false,
+        }
+    }
+
+    /// tsc's `maybeTypeOfKind(constraint, <primitive of the literal>)` half of
+    /// `isLiteralOfContextualType`'s type-variable rule: does `constraint`
+    /// contain the primitive that `lk` is a literal of? Unions and
+    /// intersections are searched; a bare `string`/`number`/`bigint`/`boolean`
+    /// answers for its own literal kind.
+    fn constraintKeepsLiteralKind(c: *Checker, constraint: TypeId, lk: types.Kind) Error!bool {
+        const r = try c.resolveStructural(constraint);
+        switch (c.ts.kind(r)) {
+            .union_type, .intersection => {
+                for (try c.memberList(r)) |m| {
+                    if (try c.constraintKeepsLiteralKind(m, lk)) return true;
                 }
                 return false;
             },
+            .string, .template_literal_type, .string_mapping => return lk == .string_literal,
+            .number => return lk == .number_literal or lk == .number_literal_fresh,
+            .bigint => return lk == .bigint_literal,
+            .boolean => return lk == .bool_true or lk == .bool_false,
             else => return false,
         }
     }
@@ -19984,7 +20016,15 @@ const Checker = struct {
                     .array => try c.unify(s.arrayElem(param), s.arrayElem(ra), tp_syms, candidates, depth + 1),
                     .tuple => {
                         for (0..s.tupleLen(ra)) |i| {
-                            try c.unify(s.arrayElem(param), s.tupleElem(ra, @intCast(i)).ty, tp_syms, candidates, depth + 1);
+                            // A REST element carries the whole ARRAY type (see
+                            // `checkConstArrayLiteral`), so `[a, b, ...vals]`
+                            // must contribute `vals`' element type here, not
+                            // `vals` itself — otherwise `T` gets an array
+                            // candidate beside its literal ones and the two
+                            // cannot combine.
+                            const e = s.tupleElem(ra, @intCast(i));
+                            const et = if (e.rest()) try c.elemOfArrayish(e.ty) else e.ty;
+                            try c.unify(s.arrayElem(param), et, tp_syms, candidates, depth + 1);
                         }
                     },
                     .union_type => {
@@ -20378,7 +20418,11 @@ const Checker = struct {
                 // `Array.from(xs)` inferring `unknown[]` from an array.
                 const elem: TypeId = switch (s.kind(ra)) {
                     .array => s.arrayElem(ra),
-                    .tuple => try c.tupleElementUnion(ra),
+                    // `numberIndexType`, not `tupleElementUnion`: the latter
+                    // takes a REST element's `.ty` verbatim, which is the whole
+                    // ARRAY type, so `[a, b, ...vals] as const` contributed an
+                    // array beside its literals and the combination collapsed.
+                    .tuple => try c.numberIndexType(ra),
                     .string, .string_literal => types.string_type,
                     else => return,
                 };
@@ -20390,10 +20434,25 @@ const Checker = struct {
                     // polluting the inference with a spurious `| undefined`
                     // (and, for `flatMap`'s `U | ReadonlyArray<U>`, corrupting U).
                     try c.unify(s.objectNumberIndex(param), elem, tp_syms, candidates, depth + 1);
+                } else if (try c.iterationElementType(param)) |pelem| {
+                    // No number index but the param IS iterable (`Iterable<T>`,
+                    // `Set<T>`, `Map<K,V>`): the element type is fully
+                    // determined by the `[Symbol.iterator]` protocol, so infer
+                    // through it alone.
+                    //
+                    // Scraping every same-named property instead pairs members
+                    // that have nothing to do with the element: an array's
+                    // `keys(): ArrayIterator<number>` against `Set<T>`'s
+                    // `keys(): SetIterator<T>` infers `T = number`, which then
+                    // wins over the `readonly T[]` member of the same union
+                    // parameter (`Set<T> | readonly T[] | Record<T, any> |
+                    // Map<T, any>` — the `isMemberOf` guard shape) and, under a
+                    // `T extends string` constraint, clamps the whole inference
+                    // back to `string`.
+                    try c.unify(pelem, elem, tp_syms, candidates, depth + 1);
                 } else {
-                    // No number index (`Iterable<T>`): the element flows only
-                    // through members like `[Symbol.iterator](): Iterator<T>`,
-                    // so resolve `T` by matching those props on the arg.
+                    // Not iterable either (`{ length: number }` and friends):
+                    // fall back to matching the param's props on the arg.
                     for (0..s.objectPropCount(param)) |i| {
                         const pp = s.objectProp(param, @intCast(i));
                         if (try c.propOfType(ra, pp.name)) |ap| {
@@ -23285,7 +23344,27 @@ const Checker = struct {
         };
         if (callee_t == types.no_type) return null;
         if (!c.ts.fnHasPredicate(callee_t)) return null;
-        const pred = c.ts.fnPredicate(callee_t);
+        // A GENERIC guard names its own type parameter in the predicate
+        // (`isMemberOf = <T extends string>(coll: readonly T[], v: string):
+        // v is T`). The DECLARED signature therefore narrows the argument to
+        // the naked `T`; tsc reads the predicate off the call's RESOLVED
+        // signature, whose `T` is the inferred type argument. There is no
+        // resolved-signature memo here, so re-run the same inference the call
+        // itself ran — silently, since anything it files inside the argument
+        // list is an artifact of this side query and the real check of the
+        // call reports it (or not) on its own.
+        const sig_t = if (c.ts.fnTypeParams(callee_t).len == 0) callee_t else blk: {
+            const saved = c.diags.items.len;
+            var targs: std.ArrayList(TypeId) = .empty;
+            defer targs.deinit(c.scratch());
+            for (shape.targ_nodes) |tn| {
+                if (tn != null_node) try targs.append(c.scratch(), try c.typeFromTypeNode(tn));
+            }
+            const inst = try c.instantiateSigForCall(callee_t, targs.items, shape.arg_nodes, call, types.no_type);
+            c.rollbackArgDiags(saved, c.cur_file, shape.arg_nodes);
+            break :blk if (c.ts.fnHasPredicate(inst)) inst else callee_t;
+        };
+        const pred = c.ts.fnPredicate(sig_t);
         if (pred.param == types.Predicate.this_param) return null; // `this is T`: gap
         if (pred.param >= shape.arg_nodes.len) return null;
         const arg = shape.arg_nodes[pred.param];
