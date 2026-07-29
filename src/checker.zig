@@ -13018,8 +13018,11 @@ const Checker = struct {
             // Discriminated-union normalization: a source object whose
             // discriminant property is a union may still be assignable to a
             // union target that splits that discriminant across members, even
-            // though it matched no single member above.
-            if (sk == .object or sk == .ref) {
+            // though it matched no single member above. An INTERSECTION source
+            // qualifies too: `Merge<U, { type: K }>` is
+            // `Omit<U, "type"> & { type: K }`, the shape of every helper that
+            // re-tags a discriminated union.
+            if (sk == .object or sk == .ref or sk == .intersection) {
                 if (try c.discriminatedUnionAssignable(s, t)) return true;
             }
             return false;
@@ -13701,12 +13704,22 @@ const Checker = struct {
     /// single-member path (a sound under-accept, never a false accept).
     fn discriminatedUnionAssignable(c: *Checker, s: TypeId, t: TypeId) Error!bool {
         const sr = try c.resolveStructural(s);
-        if (c.ts.kind(sr) != .object) return false;
+        // The source may be a plain object or an INTERSECTION of objects.
+        // `Merge<U, { type: K }>` is `Omit<U, "type"> & { type: K }`, which is
+        // exactly the shape a helper that re-tags a discriminated union
+        // returns — and the discriminant then lives in a different constituent
+        // from the payload, so the whole intersection has to be consulted.
+        switch (c.ts.kind(sr)) {
+            .object, .intersection => {},
+            else => return false,
+        }
         const members = try c.memberList(t);
         if (members.len < 2) return false;
-        const sp_count = c.ts.objectPropCount(sr);
-        for (0..sp_count) |pi| {
-            const dprop = c.ts.objectProp(sr, @intCast(pi));
+        var dnames: std.ArrayList(Atom) = .empty;
+        defer dnames.deinit(c.scratch());
+        try c.collectPropNames(sr, &dnames, 0);
+        for (dnames.items) |dname| {
+            const dprop = (try c.propOfTypeEx(sr, dname, false)) orelse continue;
             // Candidate discriminant: present on every member as a unit — or a
             // union of units, which is how a target constituent that already
             // covers several tags spells it — with at least two distinct
@@ -13755,6 +13768,29 @@ const Checker = struct {
             if (all_ok) return true;
         }
         return false;
+    }
+
+    /// Every named property an object — or an intersection of objects — has,
+    /// with duplicates dropped. Only the shapes `discriminatedUnionAssignable`
+    /// accepts as a source are walked; anything else contributes nothing.
+    fn collectPropNames(c: *Checker, t: TypeId, out: *std.ArrayList(Atom), depth: u32) Error!void {
+        if (depth > 4) return;
+        const r = try c.resolveStructural(t);
+        switch (c.ts.kind(r)) {
+            .object => {
+                outer: for (0..c.ts.objectPropCount(r)) |i| {
+                    const name = c.ts.objectProp(r, @intCast(i)).name;
+                    for (out.items) |seen| {
+                        if (seen == name) continue :outer;
+                    }
+                    try out.append(c.scratch(), name);
+                }
+            },
+            .intersection => {
+                for (try c.memberList(r)) |m| try c.collectPropNames(m, out, depth + 1);
+            },
+            else => {},
+        }
     }
 
     /// A unit type, or a union of nothing but unit types.
