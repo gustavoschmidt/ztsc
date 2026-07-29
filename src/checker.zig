@@ -16749,7 +16749,25 @@ const Checker = struct {
     }
 
     fn paramWantsLiteralCtx(c: *Checker, pt: TypeId) Error!bool {
+        return c.paramWantsLiteralCtxAt(pt, 0);
+    }
+
+    fn paramWantsLiteralCtxAt(c: *Checker, pt: TypeId, depth: u8) Error!bool {
         const r = try c.resolveStructural(pt);
+        // An INTERSECTION parameter (`o: { elbowed?: T; … } & Opts`) wants the
+        // same per-property contextual type as its object constituents do:
+        // `ctxPropType` already has an `.intersection` arm that finds `T`, but
+        // it is only reached when the argument is checked WITH the parameter as
+        // its contextual type. Answering `false` here checks the object literal
+        // context-free, so `elbowed: true` widens to `boolean` and the callee's
+        // `T extends true ? … : …` return takes the wrong branch.
+        if (c.ts.kind(r) == .intersection and depth < 2) {
+            for (try c.memberList(r)) |m| {
+                if (m == r) continue;
+                if (try c.paramWantsLiteralCtxAt(m, depth + 1)) return true;
+            }
+            return false;
+        }
         // A still-generic MAPPED parameter (`c: { [K in keyof T]: T[K] }`) has
         // no members for the property scan below to read, but it is exactly the
         // shape whose per-property contextual type must be handed down: it is
