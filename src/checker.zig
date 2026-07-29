@@ -13475,6 +13475,30 @@ const Checker = struct {
         return true;
     }
 
+    /// Is the parameter at position `i` optional? A trailing rest typed by a
+    /// fixed TUPLE *is* the parameter list, so the optional marker can live on
+    /// the tuple element rather than on a `Param` — `(...args: [key: string,
+    /// options?: Opts])` has an optional second parameter exactly as
+    /// `(key: string, options?: Opts)` does. Reading only the `Param` flags
+    /// missed that, so the position's type stayed the bare `Opts` where tsc's
+    /// `getTypeAtPosition` gives `Opts | undefined`.
+    fn paramOptionalAt(c: *Checker, sig: TypeId, i: u32) Error!bool {
+        const count = c.ts.fnParamCount(sig);
+        if (count > 0) {
+            if (try c.sigRestTuple(sig)) |tup| {
+                if (i >= count - 1) {
+                    const k = i - (count - 1);
+                    if (k >= c.ts.tupleLen(tup)) return false;
+                    const e = c.ts.tupleElem(tup, k);
+                    return e.optional() and !e.rest();
+                }
+            }
+        }
+        if (i >= count) return false;
+        const p = c.ts.fnParam(sig, i);
+        return p.optional() and !p.rest();
+    }
+
     fn tupleElemTypeAt(c: *Checker, t: TypeId, i: u32) Error!?TypeId {
         const len = c.ts.tupleLen(t);
         if (i < len) {
@@ -13492,6 +13516,17 @@ const Checker = struct {
     /// (object, array/tuple/string via length lookup, function, ...).
     fn structuralAssignable(c: *Checker, s: TypeId, t: TypeId) Error!bool {
         if (c.ts.kind(t) != .object) return false;
+        // `undefined` / `null` / `void` are not object values. The empty-object
+        // fast path below said so, but a target with members reached the
+        // property loop instead, where every property of a nullish source is
+        // simply absent — so an ALL-OPTIONAL target (`{ a?: string }`,
+        // `Partial<T>`) fell through the loop and returned true. Under
+        // strictNullChecks tsc rejects all of these (TS2322), whatever the
+        // target's optionality.
+        switch (c.ts.kind(s)) {
+            .null, .undefined, .void => return false,
+            else => {},
+        }
         const n = c.ts.objectPropCount(t);
         const sidx = c.ts.objectStringIndex(t);
         const nidx = c.ts.objectNumberIndex(t);
@@ -14212,10 +14247,7 @@ const Checker = struct {
                     }
                 }
             }
-            if (i < c.ts.fnParamCount(se)) {
-                const spar = c.ts.fnParam(se, i);
-                if (spar.optional() and !spar.rest()) sp = try c.makeUnion2(sp, types.undefined_type);
-            }
+            if (try c.paramOptionalAt(se, i)) sp = try c.makeUnion2(sp, types.undefined_type);
             const contra = try c.isAssignable(tp, sp);
             if (!contra) {
                 // A callback comparison never falls back to bivariance — its
@@ -18565,7 +18597,25 @@ const Checker = struct {
                     // Infer class type args from ctor arguments.
                     const ctor = if (ctor_sigs.items.len > 0) ctor_sigs.items[0] else types.no_type;
                     if (ctor != types.no_type) {
-                        try c.inferTypeArgs(ctor, tp_syms, shape.arg_nodes, inst_args, types.no_type, types.no_type);
+                        // …and from the CONTEXTUAL TYPE, which for a class value
+                        // has to be matched against the instance type: a
+                        // constructor's own declared return is not it. tsc adds
+                        // exactly this inference (`InferencePriority.ReturnType`,
+                        // from the contextual type to the signature's return),
+                        // so `const s: SubjectLike<T> = new ReplaySubject(1)` is
+                        // a `ReplaySubject<T>` and not a `ReplaySubject<unknown>`
+                        // that then fails to be assignable. Handing
+                        // `inferTypeArgs` the ctor signature with the instance
+                        // type as its return puts the inference in both the
+                        // places that need it: the pre-argument seed (so an
+                        // argument's own contextual type is instantiated with
+                        // it) and the post-argument fill, which only reaches a
+                        // param no ARGUMENT constrained — argument evidence
+                        // still wins, as it does in tsc.
+                        const self_args = try c.scratch().alloc(TypeId, tps.items.len);
+                        for (tps.items, 0..) |tp, i| self_args[i] = try c.ts.makeTypeParam(tp.sym);
+                        const self_sig = try c.sigWithReturn(ctor, try c.ts.makeRef(cls, self_args));
+                        try c.inferTypeArgs(self_sig, tp_syms, shape.arg_nodes, inst_args, ctx, types.no_type);
                     } else {
                         for (inst_args) |*x| x.* = types.any_type;
                     }
