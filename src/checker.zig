@@ -16077,7 +16077,13 @@ const Checker = struct {
                                 try elems.append(c.scratch(), .{ .ty = e.ty, .flags = e.flags | types.elem_flag_readonly });
                             }
                         },
-                        .array => try elems.append(c.scratch(), .{ .ty = c.ts.arrayElem(st), .flags = types.elem_flag_rest | types.elem_flag_readonly }),
+                        // A REST element carries the whole array type, not its
+                        // element type — that is what `tupleElemTypeAt` /
+                        // `elemOfArrayish` and the non-`const` array-literal
+                        // path both assume. Storing the element here made
+                        // `typeof [a, b, ...vals] as const` index to nothing,
+                        // so a mapped type keyed on it collapsed to `{}`.
+                        .array => try elems.append(c.scratch(), .{ .ty = st, .flags = types.elem_flag_rest | types.elem_flag_readonly }),
                         else => try elems.append(c.scratch(), .{ .ty = types.any_type, .flags = types.elem_flag_readonly }),
                     }
                 },
