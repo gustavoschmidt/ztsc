@@ -926,9 +926,6 @@ const Checker = struct {
     /// assertion: object/array literals produce readonly, non-widened,
     /// literal-typed members (recursively). Cleared at function bodies.
     const_ctx: bool = false,
-    /// Set when generic inference fell back to a constraint (tsc then
-    /// reports only the first failing argument).
-    infer_fell_back: bool = false,
     /// Type-parameter symbols of every `inferTypeArgs` call currently on the
     /// stack (innermost last). A symbol in here but *not* in the current call's
     /// `tp_syms` is an OUTER call's still-in-flight inference variable — tsc
@@ -18778,7 +18775,6 @@ const Checker = struct {
     /// type args win; otherwise unify parameters against arguments
     /// (two-phase: plain args first, then context-sensitive function args).
     fn instantiateSigForCall(c: *Checker, sig: TypeId, explicit_targs: []const TypeId, arg_nodes: []const Node, node: Node, ret_ctx: TypeId) Error!TypeId {
-        c.infer_fell_back = false;
         const tps = try c.scratch().dupe(u32, c.ts.fnTypeParams(sig));
         if (tps.len == 0) return sig;
         var args_buf = try c.scratch().alloc(TypeId, tps.len);
@@ -19539,7 +19535,8 @@ const Checker = struct {
                 if (constraint != types.no_type and !bare_outer and
                     !try c.isAssignable(candidates[i], constraint))
                 {
-                    out[i] = try c.clampToConstraint(out[i], constraint, &c.infer_fell_back);
+                    var fell_back = false;
+                    out[i] = try c.clampToConstraint(out[i], constraint, &fell_back);
                 }
             } else if (c.typeParamHasDefault(tp)) {
                 // Uninferable param with a default takes it, instantiated under
@@ -21074,7 +21071,13 @@ const Checker = struct {
                 }
             }
         }
-        const first_error_only = c.infer_fell_back;
+        // tsc reports at most ONE argument error per call. `checkApplicableSignature`
+        // walks the arguments in order and returns as soon as one fails, so the
+        // arguments after it are never related to their parameters at all — and
+        // with a generic signature they could not be judged fairly anyway, since
+        // the failing argument is often what mis-inferred the type argument the
+        // rest are checked against. `two("x", 1)` against `two(a: number, b:
+        // string)` is one TS2345, not two.
         var reported_arg = false;
         var ai: u32 = 0;
         for (arg_nodes) |an| {
@@ -21090,20 +21093,24 @@ const Checker = struct {
             };
             const at = try c.checkExprCached(an, pt);
             if (report and !try c.isAssignable(at, pt)) {
-                if (first_error_only and reported_arg) continue;
+                if (reported_arg) continue;
                 if (!try c.elaborateCallbackError(an, at, pt) and
                     !try c.elaborateLiteralError(an, at, pt))
                 {
                     try c.reportNotAssignable(2345, at, pt, c.nodeSpan(an));
                 }
                 reported_arg = true;
-            } else if (report) {
+            } else if (report and !reported_arg) {
+                // The excess-property check is part of the same walk tsc stops
+                // at the first failure, so a later argument's excess property
+                // is not reported either.
                 const before = c.diags.items.len;
                 try c.excessPropertyCheck(an, at, pt);
                 if (c.diags.items.len == before and
-                    !(first_error_only and reported_arg) and
                     try c.freshLiteralUnionMismatch(an, at, pt, 2345, c.nodeSpan(an)))
                 {
+                    reported_arg = true;
+                } else if (c.diags.items.len != before) {
                     reported_arg = true;
                 }
             }
