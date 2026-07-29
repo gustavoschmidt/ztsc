@@ -18901,10 +18901,13 @@ const Checker = struct {
     /// arguments are contextually typed (tsc's `InferencePriority.ReturnType`
     /// seed)? Two shapes qualify:
     ///
-    ///   • the *bare* return type of some function-typed parameter — the
-    ///     `map<U>(cb: (…) => U)` shape, where seeding `U` cleanly makes the
-    ///     callback body keep literal discriminants. A union/array-wrapped
-    ///     return (`flatMap`'s `U | readonly U[]`) does not qualify;
+    ///   • the return type of some function-typed parameter, either bare or as
+    ///     one constituent of a union — the `map<U>(cb: (…) => U)` shape and
+    ///     the `promiseTry<T>(fn: (…) => PromiseLike<T> | T)` shape, where
+    ///     seeding cleanly makes the callback body keep literal discriminants
+    ///     and tuple/array contexts. A param that only appears WRAPPED
+    ///     (`flatMap`'s `readonly U[]` constituent, `Promise<U>`) does not
+    ///     qualify on that constituent's account;
     ///   • the signature's own bare return type — the identity-wrapper shape
     ///     (`wrap<F extends (…) => void>(f: F): F`, `withBatchedUpdates`). The
     ///     contextual return type determines `F` outright, and seeding it is
@@ -18924,7 +18927,21 @@ const Checker = struct {
             const pt = c.ts.fnParam(sig, i).ty;
             if (c.ts.kind(pt) != .function) continue;
             const r = c.ts.fnReturn(pt);
-            if (c.ts.kind(r) == .type_param and c.ts.typeParamSymbol(r) == tp_sym) return true;
+            if (c.isBareOrUnionMember(r, tp_sym)) return true;
+        }
+        return false;
+    }
+
+    /// Is `t` the type param `tp_sym` itself, or a UNION with it as one of its
+    /// constituents? A param that only appears wrapped inside a constituent
+    /// (`readonly U[]`, `Promise<U>`) is not matched: the seed exists to hand a
+    /// callback body a contextual type, and only a bare occurrence gives the
+    /// body's `return` one directly.
+    fn isBareOrUnionMember(c: *Checker, t: TypeId, tp_sym: u32) bool {
+        if (c.ts.kind(t) == .type_param) return c.ts.typeParamSymbol(t) == tp_sym;
+        if (c.ts.kind(t) != .union_type) return false;
+        for (c.ts.members(t)) |m| {
+            if (c.ts.kind(m) == .type_param and c.ts.typeParamSymbol(m) == tp_sym) return true;
         }
         return false;
     }
