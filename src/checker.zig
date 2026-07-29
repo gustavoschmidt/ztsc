@@ -20824,7 +20824,7 @@ const Checker = struct {
     /// Maximum tracked reference-path depth. tsc caps reference narrowing;
     /// ztsc's live need tops out at depth-2 (`a.b.c`). Paths deeper than this
     /// are not tracked (sound under-narrowing = pre-depth-N behavior).
-    const max_ref_depth = 5;
+    const max_ref_depth = 3;
 
     /// One link in a reference path: either a dotted member (`.p`) or a
     /// constant element access (`[i]`). Only *constant* integer indices are
