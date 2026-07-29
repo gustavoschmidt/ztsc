@@ -441,22 +441,23 @@ const FreshTp = struct { name: Atom, constraint: TypeId, default: TypeId, has_de
 /// `deinit` cannot fall behind the field set: a container added to `Checker`
 /// and fed from `cm()` but forgotten here leaks its whole table.
 const map_containers = [_][]const u8{
-    "node_types",             "sig_cache",          "node_scopes",
-    "reassigned_syms",        "reassigned_in_loop", "member_written_syms",
-    "member_written_in_loop", "ns_types",           "ambient_ns_types",
-    "relation",               "expansions",         "origin",
-    "iface_generic",          "iface_stack",        "pending_class_decos",
-    "class_inst_generic",     "class_static_cache", "class_static_base_active",
-    "class_ctor_cache",       "enum_value_cache",   "enum_info_cache",
-    "alias_generic",          "alias_state",        "alias_recursive",
-    "flow_same",              "flow_narrow",        "ref_keys",
-    "flow_loop_stack",        "flow_stack",         "flow_tmp",
-    "da_cache",               "ctp_cache",          "cmp_cache",
-    "inst_cache",             "inst_map_ids",       "tp_constraint_cache",
-    "fresh_tp_ids",           "fresh_tp_info",      "type_node_cache",
-    "atom_cache",             "infer_ids",          "infer_scopes",
-    "mapped_key_ids",         "inst_diag_at",       "infer_active",
-    "lazy_member_active",     "chain_guards",       "never_isect",
+    "node_types",               "sig_cache",          "node_scopes",
+    "reassigned_syms",          "reassigned_in_loop", "member_written_syms",
+    "member_written_in_loop",   "ns_types",           "ambient_ns_types",
+    "relation",                 "expansions",         "overload_rotate",
+    "origin",                   "iface_generic",      "iface_stack",
+    "pending_class_decos",      "class_inst_generic", "class_static_cache",
+    "class_static_base_active", "class_ctor_cache",   "enum_value_cache",
+    "enum_info_cache",          "alias_generic",      "alias_state",
+    "alias_recursive",          "flow_same",          "flow_narrow",
+    "ref_keys",                 "flow_loop_stack",    "flow_stack",
+    "flow_tmp",                 "da_cache",           "ctp_cache",
+    "cmp_cache",                "inst_cache",         "inst_map_ids",
+    "tp_constraint_cache",      "fresh_tp_ids",       "fresh_tp_info",
+    "type_node_cache",          "atom_cache",         "infer_ids",
+    "infer_scopes",             "mapped_key_ids",     "inst_diag_at",
+    "infer_active",             "lazy_member_active", "chain_guards",
+    "never_isect",
 };
 
 const Checker = struct {
@@ -595,6 +596,16 @@ const Checker = struct {
     relation: std.AutoHashMapUnmanaged(u64, u8) = .empty,
     /// ref TypeId -> expanded structural type.
     expansions: std.AutoHashMapUnmanaged(TypeId, TypeId) = .empty,
+    /// `.overloads` TypeId -> the index at which its LAST declaration group
+    /// starts. An entry exists only for a merged global function whose
+    /// signatures come from two groups of declarations (the default library,
+    /// and a module's `declare global { … }` augmentation of the same name).
+    /// The interned member list is in declaration order — what
+    /// `getSignaturesOfType` reports, and so what `ReturnType`/`Parameters`
+    /// and the printer see — while overload RESOLUTION tries the last group
+    /// first (tsc's `reorderCandidates`). `overloadCandidates` applies it;
+    /// everything else reads the members as stored. See `mergedFunctionValue`.
+    overload_rotate: std.AutoHashMapUnmanaged(TypeId, u32) = .empty,
     /// Instantiated interface/alias OBJECT TypeId -> its canonical origin
     /// `makeRef(sym, canonical-args)`. Two objects that carry the SAME origin
     /// ref denote the same nominal instantiation `G<A…>` (identical symbol AND
@@ -5477,14 +5488,38 @@ const Checker = struct {
     }
 
     /// Fold every callable constituent of a merged global function symbol into
-    /// one overload set, non-lib declarations before lib ones. tsc binds a
-    /// program's root files and their type-reference dependencies (@types)
-    /// before the default library, so the @types/node `global{}` timer
-    /// signatures (`setInterval(...): NodeJS.Timeout`) precede lib.dom's
-    /// `number` ones and win first-match overload resolution — the same order
-    /// tsc produces. Returns null when fewer than two constituents are callable
-    /// (the overwhelmingly common single-contributor global keeps its type via
-    /// the caller's existing first-value-constituent path).
+    /// one overload set — in DECLARATION order, with the split point recorded
+    /// in `overload_rotate` for the call path. Returns null when fewer than two
+    /// constituents are callable (the overwhelmingly common single-contributor
+    /// global keeps its type via the caller's existing first-value-constituent
+    /// path).
+    ///
+    /// The two orders are tsc's, and they differ. A merged symbol's signatures
+    /// are `getSignaturesOfSymbol`'s — the symbol's declarations in the order
+    /// they were merged. The default library is bound first and a module's
+    /// `declare global { … }` block is a global-scope *augmentation*, merged
+    /// after every plain global file, so lib.dom's
+    /// `setTimeout(handler: TimerHandler, …): number` comes first and
+    /// @types/node's `setTimeout(…): NodeJS.Timeout` last. That is the order
+    /// `getSignaturesOfType` reports, hence the order the printer shows and the
+    /// order `ReturnType`/`Parameters` see (they align from the END, so they
+    /// answer with the node signature).
+    ///
+    /// Overload RESOLUTION does not use that order. `resolveCall` runs the list
+    /// through `reorderCandidates` first, which groups the signatures by
+    /// declaring parent and moves each later group ahead of the earlier ones,
+    /// keeping the order within a group. With two groups that is a swap: node's
+    /// signatures are tried first and lib.dom's last, which is why
+    /// `setTimeout(() => {}, 1)` is a `NodeJS.Timeout` while
+    /// `setTimeout(someString, 1)` — which only lib.dom accepts — is a `number`,
+    /// and why a call that matches NEITHER (`fetch(url, { body: aSharedBuffer })`)
+    /// is TS2769 rather than a bare argument error.
+    ///
+    /// Keeping only the non-lib group, as this did before, got the call site
+    /// right and everything else wrong: one signature can never be an overload
+    /// set, so a call matching no signature reported the failing argument
+    /// instead of TS2769, and a call only the library signature accepts failed
+    /// outright.
     fn mergedFunctionValue(c: *Checker, parts: []const u32) Error!?TypeId {
         var nonlib: std.ArrayList(TypeId) = .empty;
         defer nonlib.deinit(c.scratch());
@@ -5514,27 +5549,41 @@ const Checker = struct {
                 try nonlib.append(c.scratch(), t);
         }
         if (nonlib.items.len + lib.items.len < 2) return null;
-        // When a non-lib file (@types/node's `global{}`) redeclares a lib
-        // global function, tsc's effective type is the node one at BOTH the
-        // call site (`setTimeout(): NodeJS.Timeout`) and through `ReturnType`
-        // — node dominates end-to-end. Use the non-lib signatures alone when
-        // present (dropping the shadowed lib.dom `number` overloads); fall back
-        // to folding all when every constituent is a lib.
-        const groups: []const *std.ArrayList(TypeId) = if (nonlib.items.len != 0)
-            &.{&nonlib}
-        else
-            &.{&lib};
+        // Declaration order: the library group, then the augmenting group.
         var sigs: std.ArrayList(TypeId) = .empty;
         defer sigs.deinit(c.scratch());
-        for (groups) |grp| {
-            for (grp.items) |o| {
-                if (c.ts.kind(o) == .overloads) {
-                    for (c.ts.members(o)) |mm| try sigs.append(c.scratch(), mm);
-                } else try sigs.append(c.scratch(), o);
-            }
+        for (lib.items) |o| {
+            if (c.ts.kind(o) == .overloads) {
+                for (c.ts.members(o)) |mm| try sigs.append(c.scratch(), mm);
+            } else try sigs.append(c.scratch(), o);
+        }
+        const split: u32 = @intCast(sigs.items.len);
+        for (nonlib.items) |o| {
+            if (c.ts.kind(o) == .overloads) {
+                for (c.ts.members(o)) |mm| try sigs.append(c.scratch(), mm);
+            } else try sigs.append(c.scratch(), o);
         }
         if (sigs.items.len == 1) return sigs.items[0];
-        return try c.ts.makeOverloads(sigs.items);
+        const t = try c.ts.makeOverloads(sigs.items);
+        if (split != 0 and split != sigs.items.len) {
+            try c.overload_rotate.put(c.cm(), t, split);
+        }
+        return t;
+    }
+
+    /// Append `ov`'s call signatures in overload-RESOLUTION order — tsc's
+    /// `reorderCandidates`. Identical to the stored member order except for a
+    /// merged global function, where the last declaration group is tried
+    /// first (see `mergedFunctionValue`).
+    fn appendOverloadCandidates(c: *Checker, out: *std.ArrayList(TypeId), ov: TypeId) Error!void {
+        const ms = try c.memberList(ov);
+        const rot = c.overload_rotate.get(ov) orelse 0;
+        if (rot == 0 or rot >= ms.len) {
+            try out.appendSlice(c.scratch(), ms);
+            return;
+        }
+        try out.appendSlice(c.scratch(), ms[rot..]);
+        try out.appendSlice(c.scratch(), ms[0..rot]);
     }
 
     /// The last call signature (a `.function` TypeId) reachable from any
@@ -17722,7 +17771,7 @@ const Checker = struct {
                 switch (mk) {
                     .any, .err => isect_any = true,
                     .function => try isect_sigs.append(c.scratch(), rm),
-                    .overloads => for (try c.memberList(rm)) |mm| try isect_sigs.append(c.scratch(), mm),
+                    .overloads => try c.appendOverloadCandidates(&isect_sigs, rm),
                     // An object member carrying call signatures — e.g. RTK's
                     // `createAsyncThunk: CreateAsyncThunkFunction<C> & { withTypes }`,
                     // whose callable arm is an interface with a call signature.
@@ -17839,9 +17888,7 @@ const Checker = struct {
                     try sigs.appendSlice(c.scratch(), isect_sigs.items);
                 },
                 .function => try sigs.append(c.scratch(), r),
-                .overloads => {
-                    for (try c.memberList(r)) |m| try sigs.append(c.scratch(), m);
-                },
+                .overloads => try c.appendOverloadCandidates(&sigs, r),
                 // Calling `never` is silently `never` (tsc; typically the
                 // non-nullable remainder of a null-narrowed reference).
                 .never => {
@@ -17880,9 +17927,7 @@ const Checker = struct {
                             .any, .err => saw_any = true,
                             .never => {},
                             .function => try sigs.append(c.scratch(), rm),
-                            .overloads => {
-                                for (try c.memberList(rm)) |mm| try sigs.append(c.scratch(), mm);
-                            },
+                            .overloads => try c.appendOverloadCandidates(&sigs, rm),
                             .object => {
                                 const n = c.ts.objectCallSigCount(rm);
                                 if (n == 0) {
@@ -17911,7 +17956,7 @@ const Checker = struct {
                                             member_callable = true;
                                         },
                                         .overloads => {
-                                            for (try c.memberList(ri)) |mm| try sigs.append(c.scratch(), mm);
+                                            try c.appendOverloadCandidates(&sigs, ri);
                                             member_callable = true;
                                         },
                                         .object => {
