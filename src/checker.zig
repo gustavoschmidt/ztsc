@@ -22842,6 +22842,16 @@ const Checker = struct {
         if (!direct and prop == 0) return t;
 
         if (is_default) {
+            // tsc's `narrowTypeBySwitchOnDiscriminant` narrows the DISCRIMINANT
+            // type first and only then filters the constituents: when no
+            // discriminant value survives the `case` labels the clause is
+            // unreachable and the narrowed type is `never`. The per-member
+            // subtraction below can only drop a member whose discriminant is a
+            // single literal, so it leaves a member with a WIDE discriminant
+            // (`type: "line" | "arrow"`) — and a naked type parameter
+            // (`switch (t)` on `T extends "a" | "b"`) — alive in `default:`,
+            // which is the false positive on every `assertNever(x)` idiom.
+            if (try c.switchDefaultCovered(sw, t, prop)) return types.never_type;
             // Exclude every case value.
             var cur = t;
             const r = c.tree.extraData(ast.SubRange, c.tree.nodeData(sw).rhs);
@@ -22867,6 +22877,83 @@ const Checker = struct {
             try c.narrowToValue(t, vt)
         else
             try c.narrowByDiscriminant(t, prop, vt, true);
+    }
+
+    /// Every value the discriminant can take is covered by a `case` label, so
+    /// the `default:` clause is unreachable (tsc's `narrowTypeBySwitchOnDiscriminant`
+    /// reduces the discriminant to `never` there). `prop == 0` means the switch
+    /// is on the reference itself, otherwise on `ref.prop`.
+    ///
+    /// Answers `false` for anything it cannot decide exactly — a case label
+    /// that is not a unit value, a member without the discriminant property, a
+    /// non-literal discriminant — so the caller falls back to the per-member
+    /// subtraction, which is sound but coarser.
+    fn switchDefaultCovered(c: *Checker, sw: Node, t: TypeId, prop: Atom) Error!bool {
+        var vals: std.ArrayList(TypeId) = .empty;
+        defer vals.deinit(c.scratch());
+        const r = c.tree.extraData(ast.SubRange, c.tree.nodeData(sw).rhs);
+        for (c.tree.extraRange(r.start, r.end)) |cl| {
+            if (cl == null_node or c.nodeTag(cl) != .case_clause) continue;
+            const test_node = c.tree.nodeData(cl).lhs;
+            if (test_node == 0) continue;
+            const vt = try c.ts.regularLiteral(try c.checkExprCached(test_node, types.no_type));
+            if (!c.ts.isLiteralLike(vt) and c.ts.kind(vt) != .null and c.ts.kind(vt) != .undefined)
+                return false;
+            try vals.append(c.scratch(), vt);
+        }
+        if (vals.items.len == 0) return false;
+        const single = [_]TypeId{t};
+        const members: []const TypeId = if (c.ts.kind(t) == .union_type)
+            try c.memberList(t)
+        else
+            &single;
+        if (members.len == 0) return false;
+        for (members) |m| {
+            var d = m;
+            if (prop != 0) {
+                const rm = try c.resolveStructural(m);
+                const p = (try c.propOfType(rm, prop)) orelse return false;
+                if (p.optional()) return false;
+                d = p.ty;
+            }
+            if (!try c.discriminantCovered(d, vals.items, 0)) return false;
+        }
+        return true;
+    }
+
+    /// Every value of the discriminant type `d0` is one of `vals`.
+    fn discriminantCovered(c: *Checker, d0: TypeId, vals: []const TypeId, depth: u32) Error!bool {
+        if (depth > 4) return false;
+        var d = try c.resolveStructural(d0);
+        // A naked type parameter stands for its constraint: tsc substitutes
+        // constraints for a narrowable reference before the flow walk, which is
+        // what makes `switch (t)` over `T extends "a" | "b"` exhaustive.
+        if (c.ts.kind(d) == .type_param) d = try c.resolveStructural(try c.baseConstraintOf(d));
+        switch (c.ts.kind(d)) {
+            // Every constituent must be covered.
+            .union_type => {
+                for (try c.memberList(d)) |dm| {
+                    if (!try c.discriminantCovered(dm, vals, depth + 1)) return false;
+                }
+                return true;
+            },
+            // An intersection's value satisfies every constituent, so one
+            // covered constituent covers the whole.
+            .intersection => {
+                for (try c.memberList(d)) |dm| {
+                    if (try c.discriminantCovered(dm, vals, depth + 1)) return true;
+                }
+                return false;
+            },
+            else => {},
+        }
+        const dv = try c.ts.regularLiteral(d);
+        if (!c.ts.isLiteralLike(dv) and c.ts.kind(dv) != .null and c.ts.kind(dv) != .undefined)
+            return false;
+        for (vals) |v| {
+            if (dv == v) return true;
+        }
+        return false;
     }
 
     /// The switch statement owning a case/default clause (linear scan of
