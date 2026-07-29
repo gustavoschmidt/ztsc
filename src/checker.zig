@@ -909,6 +909,16 @@ const Checker = struct {
     /// inference position is contravariant. tsc flips the same bit in
     /// `inferFromContravariantTypes` when it descends a signature's parameters.
     contra_pos: u32 = 0,
+    /// tsc's `InferenceInfo.topLevel`, one flag per type parameter of the
+    /// in-flight call: false once a candidate has been recorded from a position
+    /// that is not at the top level of the parameter type it came from. Only a
+    /// still-top-level parameter widens a fresh-literal candidate
+    /// (`getCovariantInference`). Shares `contra_owner`'s identity check.
+    top_flags: []bool = &.{},
+    /// Nesting depth inside `unify` below a non-top-level constructor. Unions
+    /// and intersections preserve top-level-ness (tsc's
+    /// `isTypeParameterAtTopLevel` descends them); everything else does not.
+    nontop_depth: u32 = 0,
     /// Set while checking the operand of an `expr as const` const
     /// assertion: object/array literals produce readonly, non-widened,
     /// literal-typed members (recursively). Cleared at function bodies.
@@ -18469,7 +18479,7 @@ const Checker = struct {
     /// currently `no_type`. Used both to *seed* callback contextual typing
     /// (before argument inference) and to *fill* leftover params (after it).
     /// No-op when nothing is unbound or the context is `any`/`unknown`/error.
-    fn fillFromReturnContext(c: *Checker, sig: TypeId, tp_syms: []const u32, ret_ctx: TypeId, target: []TypeId, bare_callback_only: bool) Error!void {
+    fn fillFromReturnContext(c: *Checker, sig: TypeId, tp_syms: []const u32, ret_ctx: TypeId, target: []TypeId, bare_callback_only: bool, seed_only: bool) Error!void {
         if (ret_ctx == types.no_type or c.ts.kind(sig) != .function) return;
         var any_empty = false;
         for (target) |t| {
@@ -18508,7 +18518,16 @@ const Checker = struct {
             const bare_outer_con = con != types.no_type and
                 c.ts.kind(con) == .type_param and
                 tpIndex(tp_syms, c.ts.typeParamSymbol(con)) == null;
-            const undefendable_default = con == types.no_type and c.typeParamHasDefault(tp_syms[i]);
+            // …but only when this fill IS the answer. A SEED never is: it is
+            // superseded by argument evidence and exists only to give the
+            // arguments a contextual type. Blocking it there cost the shape
+            // `Object.fromEntries<T = any>(e: Iterable<readonly [PropertyKey,
+            // T]>)`: with no seed the callback's array literal had no
+            // contextual type, its `true` widened to `boolean`, and the result
+            // no longer satisfied `{ [k: string]: true }` — while the same
+            // declaration written without the `= any` default worked.
+            const undefendable_default = !seed_only and
+                con == types.no_type and c.typeParamHasDefault(tp_syms[i]);
             if (bare_outer_con or undefendable_default) continue;
             // A candidate that IS an outer call's in-flight inference variable
             // carries no information (see `isOuterInferVar`).
@@ -18633,16 +18652,25 @@ const Checker = struct {
         // A nested call's inference gets its own, and starts at variance zero.
         const contra = try c.scratch().alloc(TypeId, tp_syms.len);
         for (contra) |*x| x.* = types.no_type;
+        // tsc's `InferenceInfo.topLevel`, registered the same way.
+        const top_flags = try c.scratch().alloc(bool, tp_syms.len);
+        for (top_flags) |*x| x.* = true;
         const saved_contra_cands = c.contra_cands;
         const saved_contra_owner = c.contra_owner;
         const saved_contra_pos = c.contra_pos;
+        const saved_top_flags = c.top_flags;
+        const saved_nontop_depth = c.nontop_depth;
         c.contra_cands = contra;
         c.contra_owner = candidates.ptr;
         c.contra_pos = 0;
+        c.top_flags = top_flags;
+        c.nontop_depth = 0;
         defer {
             c.contra_cands = saved_contra_cands;
             c.contra_owner = saved_contra_owner;
             c.contra_pos = saved_contra_pos;
+            c.top_flags = saved_top_flags;
+            c.nontop_depth = saved_nontop_depth;
         }
 
         // This call's inference variables are in flight for the whole of it —
@@ -18677,7 +18705,7 @@ const Checker = struct {
         const ret_seed = try c.scratch().alloc(TypeId, tp_syms.len);
         for (ret_seed) |*x| x.* = types.no_type;
         if (ret_ctx != types.no_type) {
-            try c.fillFromReturnContext(sig, tp_syms, ret_ctx, ret_seed, false);
+            try c.fillFromReturnContext(sig, tp_syms, ret_ctx, ret_seed, false, true);
         }
 
         // Empty-array-literal candidates, demoted to a fallback (see below).
@@ -18856,7 +18884,7 @@ const Checker = struct {
         const seed: []const TypeId = if (ret_ctx != types.no_type) blk: {
             const s = try c.scratch().alloc(TypeId, tp_syms.len);
             for (s, 0..) |*x, i| x.* = candidates[i];
-            try c.fillFromReturnContext(sig, tp_syms, ret_ctx, s, true);
+            try c.fillFromReturnContext(sig, tp_syms, ret_ctx, s, true, true);
             break :blk s;
         } else candidates;
         // Phase 2: function arguments, contextually typed by the partial
@@ -18948,7 +18976,7 @@ const Checker = struct {
         // `union(featureCollection(xs))` recovers `featureCollection`'s `G`
         // from the expected `FeatureCollection<Polygon | MultiPolygon>` instead
         // of falling back to `G`'s constraint (the whole `Geometry` union).
-        try c.fillFromReturnContext(sig, tp_syms, ret_ctx, candidates, false);
+        try c.fillFromReturnContext(sig, tp_syms, ret_ctx, candidates, false, false);
         // Contravariant candidates outrank covariant ones (tsc's
         // `getInferredType`): the covariant inference survives only when it is
         // not `never` AND is a subtype of the contravariant one — that is, when
@@ -19010,7 +19038,16 @@ const Checker = struct {
                 // constraint). Only fresh literals widen, so `x as const` and a
                 // `null` candidate stay narrow. An explicit type argument never
                 // reaches here (it fills `out` directly upstream).
+                //
+                // The third condition is tsc's `InferenceInfo.topLevel`: the
+                // candidate must have come from a top-level occurrence of the
+                // param in the PARAMETER type too. `Object.fromEntries<T>(e:
+                // Iterable<readonly [PropertyKey, T]>)` buries `T` two levels
+                // down, so `fromEntries(xs.map(x => [x.id, true]))` keeps `true`
+                // and the result still satisfies `{ [k: string]: true }`;
+                // widening it gave `boolean`.
                 if (sig_ret != types.no_type and
+                    top_flags[i] and
                     !try c.constraintIsPrimitive(constraint) and
                     !try c.typeParamAtTopLevel(sig_ret, tp))
                 {
@@ -19249,6 +19286,15 @@ const Checker = struct {
         return &c.contra_cands[i];
     }
 
+    /// The `topLevel` flag for type parameter `i`, when `candidates` is the
+    /// accumulator the in-flight call registered (same identity rule as
+    /// `contraSlot`).
+    fn topSlot(c: *Checker, candidates: []TypeId, i: usize) ?*bool {
+        if (c.contra_owner != candidates.ptr) return null;
+        if (c.top_flags.len != candidates.len) return null;
+        return &c.top_flags[i];
+    }
+
     fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, candidates: []TypeId, depth: u32) Error!void {
         if (depth > 16) return;
         const s = &c.ts;
@@ -19290,10 +19336,26 @@ const Checker = struct {
                 }
             },
         };
+        // tsc's `isTypeParameterAtTopLevel`: a union or an intersection keeps
+        // its members at the top level of the pattern; every other constructor
+        // buries what it contains. Track the descent so the `.type_param` arm
+        // below can tell whether the candidate it records came from a top-level
+        // occurrence — only a still-top-level parameter widens a fresh literal.
+        const buries = switch (s.kind(param)) {
+            .type_param, .union_type, .intersection => false,
+            else => true,
+        };
+        if (buries) c.nontop_depth += 1;
+        defer if (buries) {
+            c.nontop_depth -= 1;
+        };
         switch (s.kind(param)) {
             .type_param => {
                 if (tpIndex(tp_syms, s.typeParamSymbol(param))) |i| {
                     const cand = arg;
+                    if (c.nontop_depth > 0) {
+                        if (c.topSlot(candidates, i)) |f| f.* = false;
+                    }
                     // A candidate found in a PARAMETER position is
                     // contravariant evidence and is kept apart from the
                     // covariant set (tsc's `inferFromContravariantTypes`).
