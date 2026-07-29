@@ -4874,9 +4874,19 @@ const Checker = struct {
                 ret = try c.makePromise(types.void_type);
             }
         } else if (is_generator) {
-            // Generator return-type inference (yield union → `Generator<T>`) is
-            // a gap: unannotated generators type as `any` (no false positives).
-            ret = types.any_type;
+            if (!is_async and node != 0 and c.tree.nodeData(node).rhs != 0 and
+                (c.nodeTag(node) == .function_expr or c.nodeTag(node) == .function_decl or
+                    c.nodeTag(node) == .class_method))
+            {
+                // Reserve the cache slot to break recursion, as the ordinary
+                // inferred-return path does.
+                try c.sig_cache.put(c.cm(), c.nodeKey(node), .{ .ty = try c.ts.makeFunction(params.items, types.any_type, tps.items, if (is_method) types.fn_flag_method else 0), .ctx = ctx_sig });
+                ret = try c.inferGeneratorReturn(node, c.tree.nodeData(node).rhs);
+            } else {
+                // `async function*` and generator shapes with no body keep the
+                // old `any`.
+                ret = types.any_type;
+            }
         } else if (node != 0 and c.tree.nodeData(node).rhs != 0 and
             (c.nodeTag(node) == .arrow_fn or c.nodeTag(node) == .function_expr or
                 c.nodeTag(node) == .function_decl or c.nodeTag(node) == .class_method))
@@ -5297,6 +5307,88 @@ const Checker = struct {
         // contextual return keeps the widenToContext behaviour.
         if (ret_ctx == types.no_type) return c.finalizeInferredReturn(try c.widenReturnMember(raw));
         return c.widenToContext(raw, ret_ctx);
+    }
+
+    /// Inferred return type of an unannotated `function*`: tsc's
+    /// `Generator<Y, R, N>`, where `Y` unions every yielded value (widened —
+    /// `yield "a"` gives `string`, a bare `yield` gives `undefined`, no yields
+    /// at all give `never`), `R` is the ordinary inferred return type of the
+    /// body, and `N` is `unknown` — the value a caller hands to `.next()`,
+    /// which nothing in the body can pin down.
+    ///
+    /// A `yield*` delegation is deliberately NOT inferred: its yield type is
+    /// the delegated iterable's element type, which needs the iterator
+    /// protocol, and guessing it would be inventing. Such a body keeps the old
+    /// `any`, so this narrows the gap rather than trading it for a wrong
+    /// answer. Same for `async function*` (`AsyncGenerator`'s own shape) and
+    /// for a generator without a body.
+    fn inferGeneratorReturn(c: *Checker, fn_node: Node, body: Node) Error!TypeId {
+        const gen_sym = c.prog.globals.lookup(c.atom_Generator) orelse return types.any_type;
+        if (!c.symFlags(gen_sym).interface) return types.any_type;
+        if (c.nodeTag(body) != .block) return types.any_type;
+
+        var yields: std.ArrayList(Node) = .empty;
+        defer yields.deinit(c.scratch());
+        var yield_scopes: std.ArrayList(ScopeId) = .empty;
+        defer yield_scopes.deinit(c.scratch());
+        var bare_yield = false;
+        var delegated = false;
+        const base_scope = (try c.scopeOf(fn_node)) orelse c.cur_scope;
+        for (c.tree.nodeRange(body)) |stmt| {
+            if (stmt != null_node) try c.collectYields(stmt, &yields, &yield_scopes, &bare_yield, &delegated, base_scope);
+        }
+        if (delegated) return types.any_type;
+
+        var yield_ty: TypeId = types.never_type;
+        {
+            // Same body context `inferReturnType` establishes: a `yield`
+            // operand must be judged inside *this* generator.
+            const proto = c.tree.extraData(ast.FnProto, c.tree.nodeData(fn_node).lhs);
+            const saved_fn_ctx = c.fn_ctx;
+            defer c.fn_ctx = saved_fn_ctx;
+            c.fn_ctx = .{
+                .ret_ann = types.no_type,
+                .is_async = proto.flags & ast.Flags.async != 0,
+                .is_generator = true,
+                .yield_type = 0,
+            };
+            const saved_scope = c.cur_scope;
+            defer c.cur_scope = saved_scope;
+            var parts: std.ArrayList(TypeId) = .empty;
+            defer parts.deinit(c.scratch());
+            for (yields.items, yield_scopes.items) |y, sc| {
+                c.cur_scope = sc;
+                try parts.append(c.scratch(), try c.widenLiteral(try c.checkExprCached(y, types.no_type)));
+            }
+            if (bare_yield) try parts.append(c.scratch(), types.undefined_type);
+            yield_ty = try c.ts.makeUnion(c.scratch(), parts.items);
+        }
+        const ret_ty = try c.inferReturnType(fn_node, body, types.no_type);
+        return c.ts.makeRef(gen_sym, &.{ yield_ty, ret_ty, types.unknown_type });
+    }
+
+    fn collectYields(c: *Checker, node: Node, out: *std.ArrayList(Node), out_scopes: *std.ArrayList(ScopeId), bare: *bool, delegated: *bool, scope: ScopeId) Error!void {
+        if (node == null_node) return;
+        switch (c.nodeTag(node)) {
+            .yield_expr => {
+                const d = c.tree.nodeData(node);
+                if (d.rhs != 0) {
+                    delegated.* = true;
+                    return;
+                }
+                if (d.lhs != 0) {
+                    try out.append(c.scratch(), d.lhs);
+                    try out_scopes.append(c.scratch(), scope);
+                } else bare.* = true;
+            },
+            // Don't descend into nested functions/classes: their yields belong
+            // to them (and only a generator may contain one at all).
+            .arrow_fn, .function_expr, .function_decl, .class_decl, .class_method => return,
+            else => {},
+        }
+        const inner = (try c.scopeOf(node)) orelse scope;
+        var it = c.tree.childIterator(node);
+        while (it.next()) |child| try c.collectYields(child, out, out_scopes, bare, delegated, inner);
     }
 
     fn collectReturns(c: *Checker, node: Node, out: *std.ArrayList(Node), out_scopes: ?*std.ArrayList(ScopeId), bare: *bool, scope: ScopeId) Error!void {
