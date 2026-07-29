@@ -119,3 +119,9 @@ classes/062_inferred_return_this_cycle.ts  -TS2729 41
 # policy forbids. The per-position check itself still discriminates: an
 # incompatible callback is rejected on line 31.
 calls/041_rest_param_union_of_arrays.ts  -TS2345 27
+
+# ztsc emits no TS2536 at all — the "key K cannot be used to index T" check on
+# a deferred indexed access is unimplemented. The assignment through the
+# unusable access is still rejected (the TS2322 on the same line), so nothing
+# passes silently; only the second, more specific diagnostic is missing.
+indexed/028_index_target_constraint_negatives.ts  -TS2536 31

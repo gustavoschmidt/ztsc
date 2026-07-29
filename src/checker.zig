@@ -12608,7 +12608,21 @@ const Checker = struct {
                 if (keys != t and try c.isAssignable(s, keys)) return true;
             }
         }
-        if (sk == .keyof_op) return c.isAssignable(try c.propertyKeyType(), t);
+        if (sk == .keyof_op) {
+            // A deferred indexed-access TARGET is reduced FIRST. Widening the
+            // source to `string | number | symbol` and handing that to the
+            // target rule loses the relation: the widened union distributes,
+            // and `string` alone does not meet a `K[number]` whose constraint
+            // reduces to `keyof R`. tsc reduces an IndexedAccess target before
+            // it reaches the source's apparent type, so `keyof R` meets
+            // `K[number]` (`K extends readonly (keyof R)[]`) by identity.
+            if (tk == .index_access) {
+                if (try c.indexAccessTargetConstraint(t)) |bc| {
+                    if (try c.isAssignable(s, bc)) return true;
+                }
+            }
+            return c.isAssignable(try c.propertyKeyType(), t);
+        }
         // Enum *source* against a non-enum target. Handled before union-target
         // distribution, because what an enum relates to is a whole union, not
         // any single member of it.
@@ -12665,7 +12679,7 @@ const Checker = struct {
         // a source whose constraint resolves to nothing better than itself, or
         // does not relate, falls through unchanged.
         if (sk == .index_access) {
-            const obj_bc = try c.transitiveBaseConstraint(c.ts.indexAccessObj(s));
+            const obj_bc = try c.indexObjBaseConstraint(c.ts.indexAccessObj(s));
             // Same two guards as the target rule: neither side may still be
             // generic after taking base constraints.
             const idx_bc = try c.baseConstraintOf(c.ts.indexAccessIndex(s));
@@ -12750,22 +12764,7 @@ const Checker = struct {
         // substitution the constraint reduces back to the same deferred access
         // (`bc == t`) and the relation stays rejected, as before.
         if (tk == .index_access) {
-            const obj_bc = try c.transitiveBaseConstraint(c.ts.indexAccessObj(t));
-            // The INDEX takes a single constraint step, not a fixpoint: for
-            // `K extends keyof T` that step lands on the deferred `keyof T`,
-            // which is still generic and (correctly) blocks the rule. Iterating
-            // would collapse it through `keyof unknown` to `never` and make the
-            // access look resolvable — silently accepting anything as `T[K]`.
-            const idx_bc = try c.baseConstraintOf(c.ts.indexAccessIndex(t));
-            // tsc's two guards: neither side may still be generic after taking
-            // base constraints, or the access has no meaningful constraint.
-            if (!try c.isGenericObjectForIndex(obj_bc) and !try c.containsFreeTypeParam(idx_bc, &.{})) {
-                const bc = try c.reduceIndexedAccess(obj_bc, idx_bc);
-                // `unknown` is what `indexedAccessType` yields for a property
-                // that is genuinely absent — tsc's `getIndexedAccessTypeOrUndefined`
-                // returns nothing there and the rule does not apply.
-                if (bc != t and c.ts.kind(bc) != .unknown) return c.isAssignable(s, bc);
-            }
+            if (try c.indexAccessTargetConstraint(t)) |bc| return c.isAssignable(s, bc);
             return false;
         }
         // Deferred (still generic) mapped types. Self-contained: every shape it
@@ -12952,6 +12951,54 @@ const Checker = struct {
             }
         }
         return null;
+    }
+
+    /// The base-constraint reduction of a deferred indexed-access TARGET `T[K]`
+    /// (tsc `structuredTypeRelatedTo`, IndexedAccess-as-target): a source is
+    /// related to `T[K]` when it is related to this. Null when the access has
+    /// no meaningful constraint — either side still generic after taking base
+    /// constraints, or a reduction that lands back on the same deferred access
+    /// or on `unknown` (what `indexedAccessType` yields for a property that is
+    /// genuinely absent, where tsc's `getIndexedAccessTypeOrUndefined` returns
+    /// nothing and the rule does not apply).
+    fn indexAccessTargetConstraint(c: *Checker, t: TypeId) Error!?TypeId {
+        const obj_bc = try c.indexObjBaseConstraint(c.ts.indexAccessObj(t));
+        // The INDEX takes a single constraint step, not a fixpoint: for
+        // `K extends keyof T` that step lands on the deferred `keyof T`, which
+        // is still generic and (correctly) blocks the rule. Iterating would
+        // collapse it through `keyof unknown` to `never` and make the access
+        // look resolvable — silently accepting anything as `T[K]`.
+        const idx_bc = try c.baseConstraintOf(c.ts.indexAccessIndex(t));
+        if (try c.isGenericObjectForIndex(obj_bc) or try c.containsFreeTypeParam(idx_bc, &.{})) return null;
+        const bc = try c.reduceIndexedAccess(obj_bc, idx_bc);
+        if (bc == t or c.ts.kind(bc) == .unknown) return null;
+        return bc;
+    }
+
+    /// The OBJECT side of a deferred indexed access, reduced the way tsc's
+    /// `computeBaseConstraint` reduces it: follow a type parameter's constraint
+    /// chain, and STOP at the first type that is not itself a type parameter.
+    ///
+    /// `transitiveBaseConstraint` cannot be used here. It re-runs
+    /// `baseConstraintOf` on whatever the chain lands on, and that substitutes
+    /// every free param *nested inside* it — so `K extends readonly (keyof R)[]`
+    /// does not stop at `readonly (keyof R)[]` but goes on to
+    /// `readonly (keyof Record<string, any>)[]`, i.e. `readonly (string |
+    /// number)[]`. `K[number]` then reduced to `string | number` instead of
+    /// `keyof R`: writing a `keyof R` through a `K[number]` slot was a phantom
+    /// TS2322, and writing a bare `number` was wrongly accepted. tsc's
+    /// `computeBaseConstraint` returns an object/array type unchanged; it never
+    /// descends into its type arguments.
+    fn indexObjBaseConstraint(c: *Checker, t: TypeId) Error!TypeId {
+        if (c.ts.kind(t) != .type_param) return c.transitiveBaseConstraint(t);
+        var cur = t;
+        var i: u32 = 0;
+        while (i < 8 and c.ts.kind(cur) == .type_param) : (i += 1) {
+            const next = try c.baseConstraintOf(cur);
+            if (next == cur) break;
+            cur = next;
+        }
+        return cur;
     }
 
     /// tsc's `getBaseConstraintOfType`: follow constraints all the way down.
