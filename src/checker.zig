@@ -3757,6 +3757,20 @@ const Checker = struct {
                 return c.ts.makeUnion(c.scratch(), parts.items);
             },
             .array, .tuple => return types.number_type, // approximation (no lib members)
+            // `keyof typeof N` for a namespace or class value. `.class_value`
+            // is a nominal shortcut carrying no properties of its own, so it
+            // fell to the `else` arm and collapsed to `never` — and a namespace
+            // is exactly how ztsc models the value side of an `export =
+            // <namespace>` module, which is what `@types/react` and every
+            // `declare namespace X; export = X` package is. An empty key set
+            // silently empties every constraint built on it (vitest's `spyOn`
+            // rejects `"useRef"`). Members come from the same place property
+            // access reads them, `classStaticType`.
+            .class_value => {
+                const statics = try c.classStaticType(c.ts.classSymbol(r));
+                if (statics == r) return types.never_type; // self-referential: no members
+                return c.keyofType(statics);
+            },
             // `keyof` of a mapped type reflects its key set (closing the
             // loop with mapped types): `keyof { [K in "a"|"b"]: X }` === `"a" | "b"`.
             // The key set is the constraint (homomorphic → `keyof source`),
