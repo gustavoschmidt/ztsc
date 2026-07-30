@@ -9815,8 +9815,19 @@ const Checker = struct {
             // from that shape alone, the false branch holds for every
             // substitution, so resolve rather than defer into a conditional
             // that can never relate (e.g. Awaited<{ data: P }> → { data: P }).
-            if (!ext_generic and s.kind(chk) == .object and try c.objectDecidablyNotExtends(chk, extends_ty)) {
-                return false_ty;
+            // An interface / class-instance REFERENCE (`GenericState<T, E>`)
+            // has the same fixed member NAMES as an inline object literal —
+            // the type arguments only reach property values — so expand the
+            // reference before asking the shape question. Without this, immer's
+            // `Draft<GenericState<T, E>>` stalled on its `extends
+            // ReadonlyMap<…>` / `ReadonlySet<…>` / `WeakReferences` arms and
+            // stayed an unreduced conditional whose default constraint (a union
+            // including `Map<…>`) exposes none of the state's own members.
+            if (!ext_generic) {
+                const chk_shape = if (s.kind(chk) == .ref) try c.resolveStructural(chk) else chk;
+                if (s.kind(chk_shape) == .object and try c.objectDecidablyNotExtends(chk_shape, extends_ty)) {
+                    return false_ty;
+                }
             }
             // A concrete *function* check (`(value: number) => Promise<R> | R`
             // with a free `R` only in the return) is likewise non-instantiable:
@@ -9976,6 +9987,16 @@ const Checker = struct {
                     }
                 }
                 return false;
+            },
+            .array, .tuple => {
+                // An object type carrying neither a `length` member nor a
+                // numeric index signature is not an array/tuple for ANY
+                // substitution of its free params — array-ness is settled by
+                // the check's own shape. (immer 11's `WritableDraft` opens with
+                // `T extends any[] ? …`; without this the whole `Draft<…>`
+                // chain stayed deferred.)
+                if (s.objectNumberIndex(chk_obj) != 0) return false;
+                return s.objectPropByName(chk_obj, c.atom_length) == null;
             },
             else => return false,
         }
