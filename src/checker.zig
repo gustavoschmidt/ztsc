@@ -16250,6 +16250,14 @@ const Checker = struct {
                 if (cd.lhs == null_node) break :blk types.no_type;
                 break :blk switch (c.nodeTag(cd.lhs)) {
                     .template_expr => pt.ty,
+                    // An object/array-literal attribute whose target prop carries
+                    // a literal-constrained inference target keeps its literals —
+                    // the same gate `inferTypeArgs`' Phase 1 applies to an
+                    // object-literal ARGUMENT (`paramWantsLiteralCtx`). Without it
+                    // `options={[{ value: Breed.Nellore }, …]}` is checked
+                    // context-free, the enum members widen to the whole enum and
+                    // `T extends string` is inferred as `Breed`.
+                    .object_literal, .array_literal => if (try c.paramWantsLiteralCtx(pt.ty)) pt.ty else types.no_type,
                     else => types.no_type,
                 };
             };
@@ -17412,6 +17420,12 @@ const Checker = struct {
         // `.mapped` arm). Without it every such argument is checked
         // context-free.
         if (c.ts.kind(r) == .mapped) return true;
+        // An ARRAY parameter (`options: { value: T; label: string }[]`) wants the
+        // same per-element contextual type its element type does: the elements
+        // are object literals whose `value` property is the literal-constrained
+        // inference target. Checked context-free, `{ value: Breed.Nellore }`
+        // widens the enum member to the whole enum and `T` is inferred as `Breed`.
+        if (c.ts.kind(r) == .array and depth < 2) return c.paramWantsLiteralCtxAt(c.ts.arrayElem(r), depth + 1);
         if (c.ts.kind(r) != .object) return false;
         for (0..c.ts.objectPropCount(r)) |i| {
             const p = c.ts.objectProp(r, @intCast(i));
@@ -17483,11 +17497,15 @@ const Checker = struct {
                 // collapses to its concrete `${string}` template union and can
                 // admit the field-name literal. Only the generic case retries —
                 // a concrete constraint already had its full say above.
+                // An enum MEMBER is a string/number literal too (tsc gives it
+                // `TypeFlags.StringLiteral | EnumLiteral`), so the type-variable
+                // rule below must judge it by the kind of its declared value.
+                const elk = try c.enumMemberLiteralKind(lit, lk);
                 if (try c.containsTypeParam(constraint)) {
                     const base = try c.baseConstraintOf(constraint);
                     if (base != constraint) {
                         if (try c.contextAdmitsLiteral(base, lit)) return true;
-                        return c.constraintKeepsLiteralKind(base, lk);
+                        return c.constraintKeepsLiteralKind(base, elk);
                     }
                 }
                 // tsc's `isLiteralOfContextualType` type-VARIABLE rule: a
@@ -17497,10 +17515,21 @@ const Checker = struct {
                 // position. That is what makes `isMemberOf<T extends string>(
                 // coll: readonly T[], v)` called with `["a", "b"]` infer
                 // `T = "a" | "b"` instead of `string`.
-                return c.constraintKeepsLiteralKind(constraint, lk);
+                return c.constraintKeepsLiteralKind(constraint, elk);
             },
             else => return false,
         }
+    }
+
+    /// The literal KIND an enum member stands for — the kind of its declared
+    /// value (`.string_literal` for a string enum, `.number_literal` for a
+    /// numeric one). Non-members answer with `fallback` (their own kind). tsc
+    /// carries both flags on one type; ztsc models an enum member as its own
+    /// `.enum_type` kind, so the mapping is explicit.
+    fn enumMemberLiteralKind(c: *Checker, lit: TypeId, fallback: types.Kind) Error!types.Kind {
+        if (!c.ts.isEnumMember(lit)) return fallback;
+        const v = try c.enumMemberValue(c.ts.enumSymbol(lit), c.ts.enumMemberAtom(lit)) orelse return fallback;
+        return c.ts.kind(v);
     }
 
     /// tsc's `maybeTypeOfKind(constraint, <primitive of the literal>)` half of
