@@ -147,10 +147,12 @@
   <code>unsupported</code> node with a clear diagnostic — <strong>never a wrong answer, never a
   crash</strong> (every phase is fuzzed) — and in the known edge cases where ztsc can't yet
   reproduce an error, it <em>under-reports</em> rather than inventing errors on valid code. That
-  bias holds, but it is not yet absolute: on a large production React/TypeScript application
-  ztsc reproduces all 48 of tsc's errors byte-identically and still adds 10 false positives of
-  its own, each diagnosed and tracked — a run it finishes in 0.40&thinsp;s and 219.6&thinsp;MB
-  against tsgo's 0.53&thinsp;s and 734&thinsp;MB. Closing the ten is the current work.</p>
+  bias holds, and on excalidraw — 333k lines of real application source — it is now exact:
+  ztsc reports the same findings as tsgo, with zero excess, at every checker count. On a large
+  private production React/TypeScript application ztsc reproduces all 48 of tsc's errors
+  byte-identically and still adds 10 false positives of its own, each diagnosed and tracked —
+  a run it finishes in 0.40&thinsp;s and 219.6&thinsp;MB against tsgo's 0.53&thinsp;s and
+  734&thinsp;MB. Closing those is the current work.</p>
   <p>What went <em>into</em> the subset was decided by measurement, not by spec order. Every
   <code>unsupported</code> node records which construct it covers, so <code>--census</code> over
   a vendored corpus of real published <code>.d.ts</code> (2,945 files, ~131k lines — @types/node,

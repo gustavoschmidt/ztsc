@@ -11,8 +11,11 @@ TypeScript compiler, byte-identical at any parallelism.
 
 - **3.3–16× less peak memory** than tsgo (the native TypeScript 7 compiler) —
   4.8–16× on eight benchmark packages, 3.3× on a full production app.
-- **Faster on every benchmark** — up to 11× on the packages, 1.3× on the
-  app; wall clock, defaults vs. defaults.
+- **Faster on every benchmark** — up to 11× on the packages, 1.3–1.4× on the
+  applications; wall clock, defaults vs. defaults.
+- **Same findings as tsgo on a real app** — on excalidraw, exactly the same
+  17 diagnostics (file, line, column, code) at every checker count, 1.4×
+  faster in 20% of the memory.
 - **0 dependencies** — the Zig source uses nothing but the Zig standard
   library; the binary needs nothing but your OS.
 - **909/909 conformance** — differential cases (error code + line) against the
