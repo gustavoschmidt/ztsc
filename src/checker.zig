@@ -16967,16 +16967,25 @@ const Checker = struct {
     /// below the bound; anything wider folds instead.
     const max_spread_distribution = 16;
 
+    /// One distributable spread element: the element node and the constituents
+    /// of its union source.
     const DistSpread = struct { node: Node, members: []const TypeId };
 
-    /// The single spread element of `node` whose source is a union worth
-    /// distributing over, plus that union's constituents. `.node == 0` when
-    /// there is none — or when there is more than one, since distributing
-    /// several at once is a cartesian product.
-    fn distributableSpread(c: *Checker, node: Node) Error!DistSpread {
-        const none: DistSpread = .{ .node = 0, .members = &.{} };
-        var found: Node = 0;
-        var members: []const TypeId = &.{};
+    /// The spread elements of `node` whose sources are unions worth
+    /// distributing over. Empty when there are none, or when the cartesian
+    /// product of their constituents would exceed `max_spread_distribution` —
+    /// the work is linear in that product, so the bound is on the product, not
+    /// on any one union.
+    ///
+    /// More than one is the common shape for a literal that re-tags a
+    /// discriminated union through a helper: `{ ...prevState.activeTool,
+    /// ...updateActiveTool(…), locked }` spreads two two-member unions, and
+    /// folding EITHER of them loses the property correlation that the target's
+    /// arms discriminate on. Distributing only one of the two left the other
+    /// folded, which is the same lost-correlation failure the single-spread
+    /// distribution was introduced to fix.
+    fn distributableSpreads(c: *Checker, node: Node, out: *std.ArrayList(DistSpread)) Error!void {
+        var product: usize = 1;
         for (c.tree.nodeRange(node)) |prop| {
             if (prop == null_node or c.nodeTag(prop) != .spread_element) continue;
             const st = try c.resolveStructural(try c.checkExprCached(c.tree.nodeData(prop).lhs, types.no_type));
@@ -17003,11 +17012,13 @@ const Checker = struct {
             // either way — while turning the literal into a union that
             // perturbs inference at the use site.
             if (!ok or carriers < 2) continue;
-            if (found != 0) return none; // more than one: fold both, as before
-            found = prop;
-            members = ms;
+            product *|= ms.len;
+            if (product > max_spread_distribution) {
+                out.clearRetainingCapacity();
+                return;
+            }
+            try out.append(c.scratch(), .{ .node = prop, .members = try c.scratch().dupe(TypeId, ms) });
         }
-        return .{ .node = found, .members = members };
     }
 
     fn checkObjectLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
@@ -17019,22 +17030,46 @@ const Checker = struct {
         // that correlation — every property only some member declares becomes
         // optional — so the literal then matches no arm of a discriminated
         // target. Distribute here, where the literal's type can be a union.
-        const dist = try c.distributableSpread(node);
-        if (dist.node != 0) {
+        var dist: std.ArrayList(DistSpread) = .empty;
+        defer dist.deinit(c.scratch());
+        try c.distributableSpreads(node, &dist);
+        if (dist.items.len > 0) {
+            // Cartesian product over the distributable spreads, `max_spread_
+            // distribution` constituents at most. `pick[i]` selects the member
+            // of `dist.items[i]` this constituent uses.
+            var pick: [max_spread_distribution]usize = @splat(0);
             var outs: std.ArrayList(TypeId) = .empty;
             defer outs.deinit(c.scratch());
-            for (dist.members) |m| {
-                try outs.append(c.scratch(), try c.objectLiteralType(node, ctx, dist.node, m));
+            var subst: std.ArrayList(Subst) = .empty;
+            defer subst.deinit(c.scratch());
+            while (true) {
+                subst.clearRetainingCapacity();
+                for (dist.items, 0..) |d, i| {
+                    try subst.append(c.scratch(), .{ .node = d.node, .ty = d.members[pick[i]] });
+                }
+                try outs.append(c.scratch(), try c.objectLiteralType(node, ctx, subst.items));
+                // Odometer step, least-significant spread first.
+                var i = dist.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    pick[i] += 1;
+                    if (pick[i] < dist.items[i].members.len) break;
+                    pick[i] = 0;
+                    if (i == 0) return c.ts.makeUnion(c.scratch(), outs.items);
+                }
             }
-            return c.ts.makeUnion(c.scratch(), outs.items);
         }
-        return c.objectLiteralType(node, ctx, 0, types.no_type);
+        return c.objectLiteralType(node, ctx, &.{});
     }
 
-    /// One constituent of an object literal's type. `dist_node`, when non-zero,
-    /// names a spread element whose source type is replaced by `dist_ty` (see
-    /// `checkObjectLiteral`).
-    fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist_node: Node, dist_ty: TypeId) Error!TypeId {
+    /// A spread element whose source type is replaced by `ty` for one
+    /// constituent of a distributed object literal (see `checkObjectLiteral`).
+    const Subst = struct { node: Node, ty: TypeId };
+
+    /// One constituent of an object literal's type. `dist` names the spread
+    /// elements whose source types are replaced for this constituent (see
+    /// `checkObjectLiteral`); it is empty for an undistributed literal.
+    fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) Error!TypeId {
         var rctx = if (ctx != types.no_type) try c.resolveStructural(ctx) else types.no_type;
         if (rctx != types.no_type and c.ts.kind(rctx) == .union_type) {
             rctx = try c.discriminateCtxUnion(node, rctx);
@@ -17208,7 +17243,14 @@ const Checker = struct {
                 },
                 .spread_element => {
                     const raw = try c.checkExprCached(pd.lhs, types.no_type);
-                    const st = try c.resolveStructural(if (prop == dist_node) dist_ty else raw);
+                    var src = raw;
+                    for (dist) |d| {
+                        if (d.node == prop) {
+                            src = d.ty;
+                            break;
+                        }
+                    }
+                    const st = try c.resolveStructural(src);
                     if (c.ts.kind(st) == .any or c.ts.kind(st) == .err) spread_any = true;
                     // tsc's `getSpreadType`: when either side `isGenericObject
                     // Type` the spread is an INTERSECTION, not a flattened
