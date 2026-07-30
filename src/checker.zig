@@ -17245,8 +17245,8 @@ const Checker = struct {
                         const key_kind = c.ts.kind(rk);
                         const pctx: TypeId = if (rctx == types.no_type) types.no_type else switch (key_kind) {
                             .string_literal => try c.ctxPropType(rctx, ctx, c.ts.dataA(rk)),
-                            .string, .template_literal_type, .string_mapping => if (c.ts.kind(rctx) == .object and c.ts.objectStringIndex(rctx) != 0) c.ts.objectStringIndex(rctx) else types.no_type,
-                            .number, .number_literal, .number_literal_fresh => if (c.ts.kind(rctx) == .object and c.ts.objectNumberIndex(rctx) != 0) c.ts.objectNumberIndex(rctx) else types.no_type,
+                            .string, .template_literal_type, .string_mapping => try c.ctxIndexType(rctx, false),
+                            .number, .number_literal, .number_literal_fresh => try c.ctxIndexType(rctx, true),
                             else => types.no_type,
                         };
                         var vt = try c.checkExprCached(pd.rhs, pctx);
@@ -17430,6 +17430,51 @@ const Checker = struct {
         }
         const t = try c.ctxPropType(rt, rt, key);
         return if (t == types.no_type) null else t;
+    }
+
+    /// Contextual INDEX-SIGNATURE type for a computed-key member — tsc's
+    /// `getIndexTypeOfContextualType`, which maps over the contextual type
+    /// rather than requiring one object.
+    ///
+    /// Only a bare `.object` used to be consulted, and an *optional*
+    /// contextual property offers `{ [id: string]: true } | undefined`, so
+    /// `{ [k]: true }` written under one got no contextual type at all and its
+    /// value widened to `boolean`. That is a confluence hazard, not just a
+    /// precision loss: the same literal is typed once with the declared
+    /// contextual type and again with the inferred one (the argument re-check
+    /// of a generic call), and only the second pass saw the union — so the two
+    /// passes disagreed and the later one clobbered the first's cached node
+    /// type, surfacing as a whole-function TS2322 whose two printed types were
+    /// identical but for this one index signature.
+    fn ctxIndexType(c: *Checker, rctx: TypeId, want_number: bool) Error!TypeId {
+        switch (c.ts.kind(rctx)) {
+            .object => {
+                const idx = if (want_number) c.ts.objectNumberIndex(rctx) else c.ts.objectStringIndex(rctx);
+                return if (idx != 0) idx else types.no_type;
+            },
+            // A constituent with no index signature contributes nothing (tsc's
+            // `mapType` drops it), so `T | undefined` answers `T`'s index.
+            .union_type => {
+                var parts: std.ArrayList(TypeId) = .empty;
+                defer parts.deinit(c.scratch());
+                for (try c.memberList(rctx)) |m| {
+                    const it = try c.ctxIndexType(try c.resolveStructural(m), want_number);
+                    if (it != types.no_type) try parts.append(c.scratch(), it);
+                }
+                if (parts.items.len == 0) return types.no_type;
+                return c.ts.makeUnion(c.scratch(), parts.items);
+            },
+            // First constituent that carries one, matching how the relation
+            // reads an intersection's index signatures.
+            .intersection => {
+                for (try c.memberList(rctx)) |m| {
+                    const it = try c.ctxIndexType(try c.resolveStructural(m), want_number);
+                    if (it != types.no_type) return it;
+                }
+                return types.no_type;
+            },
+            else => return types.no_type,
+        }
     }
 
     /// Contextual type for property `key` of an object literal typed by
