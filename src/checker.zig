@@ -13007,6 +13007,22 @@ const Checker = struct {
         // more shapes besides. The residual under-report is registered against
         // the negatives case.
         if (c.ts.kind(a) == .index_access or c.ts.kind(b) == .index_access) return true;
+        // A DEFERRED mapped type (`{ [K in keyof R]: … }` with `R` still free)
+        // is in the same family: a mapped type only survives to here when its
+        // key constraint is generic, so its member set is unknown and no
+        // member-based verdict is available. tsc's comparable relation asks
+        // whether the target's key domain relates to the source's, which a
+        // generic domain answers affirmatively for the one key the other side
+        // happens to name. Concede the family rather than false-reject — this
+        // is redux-toolkit's `slice as Omit<typeof slice, 'actions'> & {
+        // actions: { success: ActionCreatorWithPayload<T, string> } }`, where
+        // the slice's own `actions` is `CaseReducerActions<Reducers, …>`.
+        // Scoped to an object-shaped counterpart: a mapped type IS an object
+        // type whatever its keys turn out to be, so `T[K] as string` under
+        // `T extends Record<keyof T, number>` is still decided (and rejected)
+        // on the shapes alone.
+        if ((c.ts.kind(a) == .mapped and mappedCastPeer(c.ts.kind(b))) or
+            (c.ts.kind(b) == .mapped and mappedCastPeer(c.ts.kind(a)))) return true;
         // A DEFERRED conditional (`T extends E[] ? E[] : E | null`, the return
         // type of a generic overload written as one function) has no resolved
         // form here. tsc compares against its *default constraint* — the union
@@ -13037,6 +13053,12 @@ const Checker = struct {
         }
         if (try c.isComparable(a0, b0)) return true;
         return (try c.lenientOverlap(a0, b0, depth)) or (try c.lenientOverlap(b0, a0, depth));
+    }
+
+    /// The shapes a still-generic mapped type may overlap in the cast test: an
+    /// object type is the only thing a mapped type can ever instantiate to.
+    fn mappedCastPeer(k: types.Kind) bool {
+        return k == .object or k == .intersection or k == .mapped;
     }
 
     /// One direction of the lenient comparable relation: does source `s0`
