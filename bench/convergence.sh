@@ -227,6 +227,9 @@ echo "-- (c) tsgo scoreboard"
 ORACLE="${TSGO_OUT:-}"
 if [ -z "$ORACLE" ]; then
     TSGO="${TSGO:-bench/baselines/tsgo/node_modules/@typescript/typescript-$(uname | tr '[:upper:]' '[:lower:]')-$(uname -m | sed 's/^x86_64$/x64/;s/^aarch64$/arm64/')/lib/tsc}"
+    # Absolute, because the oracle runs from inside $CHECKOUT — a repo-relative
+    # default silently resolved to nothing there and scored as "oracle: 0".
+    case "$TSGO" in /*) ;; *) TSGO="$PWD/$TSGO" ;; esac
     if [ -x "$TSGO" ]; then
         ORACLE="$TMP/oracle.txt"
         echo "  running the oracle ($TSGO) …"
