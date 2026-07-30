@@ -11721,7 +11721,14 @@ const Checker = struct {
             .type_param => {
                 const con = try c.typeParamConstraint(c.ts.typeParamSymbol(r));
                 if (con == types.no_type) return false;
-                return c.typeIsStringLike(try c.resolveStructural(con));
+                // tsc reads the BASE constraint here (`getBaseConstraintOfType`),
+                // which is what makes a constraint that is itself parameterised
+                // string-like: `TName extends FieldPath<TFieldValues>` is a
+                // deferred alias reference while `TFieldValues` is free, so the
+                // resolved-structural test alone answered "not string-like" and
+                // the template expression widened to `string`.
+                const base = if (try c.containsTypeParam(con)) try c.baseConstraintOf(con) else con;
+                return c.typeIsStringLike(try c.resolveStructural(base));
             },
             else => return false,
         }
@@ -16227,7 +16234,26 @@ const Checker = struct {
                 if (cd.lhs != null_node and (c.nodeTag(cd.lhs) == .arrow_fn or c.nodeTag(cd.lhs) == .function_expr)) continue;
             }
             const pt = (try c.propOfType(rp0, try c.memberAtom(name_tok))) orelse continue;
-            const vty = try c.jsxAttributeValueType(ad.lhs, types.no_type);
+            // A TEMPLATE-LITERAL attribute value is contextually typed by the
+            // target prop, exactly as `inferTypeArgs`' Phase 1 does for a
+            // template-expression argument: `ctxWantsTemplate` needs to see the
+            // string-like-constrained type param to keep `` `owners.${number}.status` ``
+            // a template-literal type. Checked context-free it widens to `string`,
+            // which fails `TName extends FieldPath<TFieldValues>`, so `TName` fell
+            // back to its default — the whole path union — and react-hook-form's
+            // `<Controller name={`a.${i}.b`} …/>` typed `field.value` as the union
+            // of EVERY field's value. Every other attribute shape keeps its
+            // context-free inference (its contextual pass is `checkJsxAttributes`').
+            const vctx: TypeId = blk: {
+                if (ad.lhs == null_node or c.nodeTag(ad.lhs) != .jsx_expr_container) break :blk types.no_type;
+                const cd = c.tree.nodeData(ad.lhs);
+                if (cd.lhs == null_node) break :blk types.no_type;
+                break :blk switch (c.nodeTag(cd.lhs)) {
+                    .template_expr => pt.ty,
+                    else => types.no_type,
+                };
+            };
+            const vty = try c.jsxAttributeValueType(ad.lhs, vctx);
             try c.unify(pt.ty, vty, tps, candidates, 0);
         }
         // Resolve each param: inferred candidate (clamped to its constraint when
