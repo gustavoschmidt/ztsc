@@ -3020,7 +3020,12 @@ const Checker = struct {
                 i -= 1;
                 if (mk_here and i < c.cur_mapped_key_scope_depth) return c.cur_mapped_key_ty;
                 if (c.infer_ids.get(.{ .cond = c.infer_scopes.items[i], .name = a })) |id| {
-                    return c.ts.makeInferVar(id, a);
+                    // A bare mention of an already-declared binder, not the
+                    // `infer V` declaration (that path is `inferVarFromNode`).
+                    // Flagged so a NESTED conditional that mentions it in its
+                    // own extends clause (`string extends R`, React's
+                    // `PropsWithRef`) does not treat it as its own binder.
+                    return c.ts.makeInferVar(id, a, true);
                 }
             }
             // A mapped type's key parameter `K` is in scope in its `as`/value
@@ -9585,7 +9590,7 @@ const Checker = struct {
         // An `infer V` binder belongs to the immediately-enclosing conditional
         // (top of the scope stack) — its extends clause is where it is declared.
         const id = try c.inferVarId(c.infer_scopes.items[c.infer_scopes.items.len - 1], name);
-        return c.ts.makeInferVar(id, name);
+        return c.ts.makeInferVar(id, name, false);
     }
 
     fn conditionalTypeFromNode(c: *Checker, node: Node) Error!TypeId {
@@ -9693,7 +9698,7 @@ const Checker = struct {
             // this is what lets Awaited unwrap a real Promise's `then` callback
             // without erasing the method's own `TResult` params.
             if (!ext_generic and s.kind(chk) == .function and s.kind(try c.resolveStructural(extends_ty)) == .function) {
-                return c.resolveConcreteConditional(chk, extends_ty, true_ty, false_ty);
+                return c.resolveConcreteConditional(chk, extends_ty, true_ty, false_ty, distributive);
             }
             // An array/tuple check against an array pattern whose element is a
             // bare `infer` — the lib's `FlatArray`, `Arr extends
@@ -9704,17 +9709,41 @@ const Checker = struct {
             // deferring. Deferring left `arr.flat()` as an unreduced
             // conditional that related to nothing.
             if (!ext_generic and try c.arrayDecidablyExtends(chk, extends_ty)) {
-                return c.resolveConcreteConditional(chk, extends_ty, true_ty, false_ty);
+                return c.resolveConcreteConditional(chk, extends_ty, true_ty, false_ty, distributive);
             }
             return s.makeConditional(chk, extends_ty, true_ty, false_ty, distributive);
         }
-        return c.resolveConcreteConditional(chk, extends_ty, true_ty, false_ty);
+        return c.resolveConcreteConditional(chk, extends_ty, true_ty, false_ty, distributive);
     }
 
-    fn resolveConcreteConditional(c: *Checker, chk: TypeId, extends_ty: TypeId, true_ty: TypeId, false_ty: TypeId) Error!TypeId {
+    fn resolveConcreteConditional(c: *Checker, chk: TypeId, extends_ty: TypeId, true_ty: TypeId, false_ty: TypeId, distributive: bool) Error!TypeId {
         var ids: std.ArrayList(u32) = .empty;
         defer ids.deinit(c.scratch());
-        try c.collectInferVars(extends_ty, &ids);
+        var refs: std.ArrayList(u32) = .empty;
+        defer refs.deinit(c.scratch());
+        try c.collectInferVars(extends_ty, &ids, &refs);
+        // A conditional binds exactly the `infer V` DECLARATIONS in its own
+        // extends clause. A bare mention of a binder owned by an ENCLOSING
+        // conditional is a free type variable — not this conditional's to bind
+        // — so the conditional stays symbolic until the enclosing `substInfer`
+        // supplies a value and re-enters here.
+        //
+        // React's `PropsWithRef` is exactly that shape:
+        //     P extends { ref?: infer R | undefined }
+        //       ? string extends R
+        //           ? PropsWithoutRef<P> & { ref?: Exclude<R, string> | undefined }
+        //           : P
+        //       : P
+        // The inner `string extends R` has a concrete check and an extends made
+        // entirely of the OUTER R, so it used to resolve at build time, collect
+        // R as its own binder and bind `R := string`. `Exclude<string, string>`
+        // is `never`, so every intrinsic element's `ref` prop collapsed to
+        // `undefined`; intersecting that dead prop with a live `Ref<T>` is what
+        // produced the malformed `undefined & RefObject<unknown>`.
+        for (refs.items) |r| {
+            if (indexOfId(ids.items, r) == null)
+                return c.ts.makeConditional(chk, extends_ty, true_ty, false_ty, distributive);
+        }
         // `any` as the check type takes *both* branches (tsc): infer vars bind
         // `any`, and the result is trueBranch | falseBranch. This is what makes
         // `Awaited<any>` collapse to `any` instead of surviving as a deferred
@@ -9838,41 +9867,47 @@ const Checker = struct {
         return null;
     }
 
-    fn collectInferVars(c: *Checker, t: TypeId, out: *std.ArrayList(u32)) Error!void {
+    /// Gather the `infer` binders a conditional's extends clause mentions.
+    /// DECLARATIONS (`infer V`) land in `out` — those are the binders the
+    /// conditional owns; bare REFERENCES to a binder declared by an enclosing
+    /// conditional land in `refs` (see `types.infer_var_reference`). One walk
+    /// serves both so the hot conditional path pays for a single traversal.
+    fn collectInferVars(c: *Checker, t: TypeId, out: *std.ArrayList(u32), refs: ?*std.ArrayList(u32)) Error!void {
         const s = &c.ts;
         switch (s.kind(t)) {
             .infer_var => {
                 const id = s.inferVarId(t);
-                if (indexOfId(out.items, id) == null) try out.append(c.scratch(), id);
+                const bucket = if (s.inferVarIsRef(t)) (refs orelse return) else out;
+                if (indexOfId(bucket.items, id) == null) try bucket.append(c.scratch(), id);
             },
-            .array => try c.collectInferVars(s.arrayElem(t), out),
+            .array => try c.collectInferVars(s.arrayElem(t), out, refs),
             .union_type, .intersection, .overloads => {
-                for (0..s.memberCount(t)) |i| try c.collectInferVars(s.memberAt(t, i), out);
+                for (0..s.memberCount(t)) |i| try c.collectInferVars(s.memberAt(t, i), out, refs);
             },
             .tuple => {
-                for (0..s.tupleLen(t)) |i| try c.collectInferVars(s.tupleElem(t, @intCast(i)).ty, out);
+                for (0..s.tupleLen(t)) |i| try c.collectInferVars(s.tupleElem(t, @intCast(i)).ty, out, refs);
             },
             .object => {
-                for (0..s.objectPropCount(t)) |i| try c.collectInferVars(s.objectProp(t, @intCast(i)).ty, out);
-                if (s.objectStringIndex(t) != 0) try c.collectInferVars(s.objectStringIndex(t), out);
-                if (s.objectNumberIndex(t) != 0) try c.collectInferVars(s.objectNumberIndex(t), out);
+                for (0..s.objectPropCount(t)) |i| try c.collectInferVars(s.objectProp(t, @intCast(i)).ty, out, refs);
+                if (s.objectStringIndex(t) != 0) try c.collectInferVars(s.objectStringIndex(t), out, refs);
+                if (s.objectNumberIndex(t) != 0) try c.collectInferVars(s.objectNumberIndex(t), out, refs);
                 // Call/construct signatures carry infer vars too (`new (x: infer
                 // P) => …`, a `JSXElementConstructor` construct constituent).
-                for (0..s.objectCallSigCount(t)) |i| try c.collectInferVars(s.objectCallSig(t, @intCast(i)), out);
-                for (0..s.objectConstructSigCount(t)) |i| try c.collectInferVars(s.objectConstructSig(t, @intCast(i)), out);
+                for (0..s.objectCallSigCount(t)) |i| try c.collectInferVars(s.objectCallSig(t, @intCast(i)), out, refs);
+                for (0..s.objectConstructSigCount(t)) |i| try c.collectInferVars(s.objectConstructSig(t, @intCast(i)), out, refs);
             },
             .function => {
-                for (0..s.fnParamCount(t)) |i| try c.collectInferVars(s.fnParam(t, @intCast(i)).ty, out);
-                try c.collectInferVars(s.fnReturn(t), out);
+                for (0..s.fnParamCount(t)) |i| try c.collectInferVars(s.fnParam(t, @intCast(i)).ty, out, refs);
+                try c.collectInferVars(s.fnReturn(t), out, refs);
             },
             .ref => {
-                for (0..s.refArgCount(t)) |i| try c.collectInferVars(s.refArgAt(t, i), out);
+                for (0..s.refArgCount(t)) |i| try c.collectInferVars(s.refArgAt(t, i), out, refs);
             },
             .template_literal_type => {
-                for (0..s.templateHoleCount(t)) |i| try c.collectInferVars(s.templateHole(t, @intCast(i)), out);
+                for (0..s.templateHoleCount(t)) |i| try c.collectInferVars(s.templateHole(t, @intCast(i)), out, refs);
             },
-            .string_mapping => try c.collectInferVars(s.stringMappingArg(t), out),
-            .keyof_op => try c.collectInferVars(s.keyofOperand(t), out),
+            .string_mapping => try c.collectInferVars(s.stringMappingArg(t), out, refs),
+            .keyof_op => try c.collectInferVars(s.keyofOperand(t), out, refs),
             else => {},
         }
     }

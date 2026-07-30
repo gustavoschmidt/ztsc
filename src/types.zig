@@ -216,6 +216,14 @@ pub const cond_flag_distributive: u32 = 1;
 /// Freshness bit in an `enum_type` member payload (`data_b`). See `enum_type`.
 pub const enum_member_fresh: u32 = 0x8000_0000;
 
+/// Marks an `infer_var` occurrence that is a *reference* to a binder declared
+/// by an enclosing conditional (a bare `R` in `string extends R ? … : …`),
+/// as opposed to the `infer R` DECLARATION itself. Stored in the high bit of
+/// the payload id so both occurrences keep the same logical `inferVarId`;
+/// only `inferVarIsRef` can tell them apart. A conditional binds exactly the
+/// declarations in its own extends clause — see `reduceConditional`.
+pub const infer_var_reference: u32 = 0x8000_0000;
+
 // String-transform intrinsic indices, stored in a `string_mapping`
 // type's `data_a`.
 pub const string_mapping_uppercase: u32 = 0;
@@ -711,7 +719,12 @@ pub const Store = struct {
     }
 
     pub fn inferVarId(s: *const Store, id: TypeId) u32 {
-        return s.dataA(id);
+        return s.dataA(id) & ~infer_var_reference;
+    }
+    /// True for a bare mention of a binder declared by an *enclosing*
+    /// conditional (`infer_var_reference`).
+    pub fn inferVarIsRef(s: *const Store, id: TypeId) bool {
+        return s.dataA(id) & infer_var_reference != 0;
     }
     pub fn inferVarName(s: *const Store, id: TypeId) Atom {
         return s.dataB(id);
@@ -1227,8 +1240,11 @@ pub const Store = struct {
         return s.internType(.this_type, &.{ instance_ref, 0 }, 0);
     }
 
-    pub fn makeInferVar(s: *Store, id: u32, name: Atom) Error!TypeId {
-        return s.internType(.infer_var, &.{ id, name }, 0);
+    /// `is_ref` distinguishes a bare mention of an already-declared binder
+    /// from the `infer V` declaration — see `infer_var_reference`.
+    pub fn makeInferVar(s: *Store, id: u32, name: Atom, is_ref: bool) Error!TypeId {
+        const payload = if (is_ref) id | infer_var_reference else id;
+        return s.internType(.infer_var, &.{ payload, name }, 0);
     }
 
     /// Intern a deferred conditional type. `distributive` records that the
