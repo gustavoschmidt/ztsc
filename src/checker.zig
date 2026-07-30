@@ -2905,6 +2905,29 @@ const Checker = struct {
                 for (c.tree.nodeRange(node)) |m| {
                     if (m != null_node) try parts.append(c.scratch(), try c.typeFromTypeNode(m));
                 }
+                // tsc's `getTypeFromIntersectionTypeNode`: *"We perform no
+                // supertype reduction for X & {} or {} & X, where X is a
+                // primitive type"* — the two-member, source-WRITTEN form is the
+                // `'a' | 'b' | (string & {})` idiom (a literal union that still
+                // accepts any string), so the `{}` must survive there even
+                // though the same intersection reduces to `X` when it arrives
+                // by instantiation (`NonNullable<string>` is `string`). tsc's
+                // opt-out covers exactly the non-unit string/number/bigint
+                // primitives: a written `boolean & {}`, `symbol & {}`,
+                // `'x' & {}` or `I & {}` all still reduce.
+                if (parts.items.len == 2) {
+                    const ei: ?usize = if (parts.items[0] == types.empty_object_type)
+                        0
+                    else if (parts.items[1] == types.empty_object_type) 1 else null;
+                    if (ei) |i| {
+                        switch (c.ts.kind(parts.items[1 - i])) {
+                            .string, .number, .bigint, .template_literal_type => {
+                                return c.ts.makeIntersectionNoReduce(c.scratch(), parts.items);
+                            },
+                            else => {},
+                        }
+                    }
+                }
                 return c.ts.makeIntersection(c.scratch(), parts.items);
             },
             .object_type => return c.objectTypeFromMembers(c.tree.nodeRange(node), 0),
@@ -10773,7 +10796,19 @@ const Checker = struct {
         // F<Head>)` carries `keyof Head`, so `containsInfer` keeps it deferred and
         // `substInfer` (its `.mapped` arm) re-enters here once `Head` binds.
         const key_src = if (homomorphic) try c.keyofType(src_type) else constraint;
-        const key_generic = try c.containsFreeTypeParam(key_src, &.{}) or try c.containsInfer(key_src);
+        // …and while it still mentions an ENCLOSING mapped type's key parameter.
+        // `K` is not a free type param (it is locally bound, like an `infer`
+        // var), so a nested map whose source is the outer map's `T[K]`
+        // (`{ [K in keyof T]: { [J in keyof T[K]]: … } }` — react-hook-form's
+        // `DeepRequired<T>` recursing through `DeepRequired<T[K]>`) looked
+        // concrete: `keyof T[K]` is a deferred `keyof` over a deferred indexed
+        // access with no free param in it, so the map materialized against an
+        // unresolvable source and collapsed to `{}` before `K` was ever bound.
+        // Deferring here parks it until `substMappedKey`'s `.mapped` arm binds
+        // `K` and re-enters with a concrete source.
+        const key_generic = try c.containsFreeTypeParam(key_src, &.{}) or
+            try c.containsInfer(key_src) or
+            try c.containsMappedParam(key_src);
         if (key_generic) {
             return c.ts.makeMapped(key_param, constraint, value, as_clause, src_type, flags);
         }
@@ -10798,6 +10833,41 @@ const Checker = struct {
         return f;
     }
 
+    /// Kinds a homomorphic mapped type maps to THEMSELVES (tsc: everything
+    /// outside `AnyOrUnknown | InstantiableNonPrimitive | Object |
+    /// Intersection` is returned unchanged by `instantiateMappedType`).
+    /// The `object` keyword (`NonPrimitive`) and the string-flavoured
+    /// instantiables `string_mapping` / `template_literal_type`
+    /// (`InstantiablePrimitive`, not `…NonPrimitive`) are on this side of
+    /// tsc's test too, so they pass through as well. Modifiers (`?`, `-?`,
+    /// `readonly`) are irrelevant: there are no properties to modify.
+    fn isPrimitiveForHomomorphicMap(k: types.Kind) bool {
+        return switch (k) {
+            .never,
+            .void,
+            .undefined,
+            .null,
+            .string,
+            .number,
+            .boolean,
+            .bigint,
+            .symbol,
+            .object_keyword,
+            .bool_true,
+            .bool_false,
+            .string_literal,
+            .number_literal,
+            .number_literal_fresh,
+            .bigint_literal,
+            .enum_type,
+            .unique_symbol,
+            .template_literal_type,
+            .string_mapping,
+            => true,
+            else => false,
+        };
+    }
+
     /// Materialize a concrete mapped type (its key set is known). Homomorphic
     /// maps iterate the src_type's own members (preserving modifiers and
     /// array/tuple-ness); others iterate the constraint's literal members.
@@ -10811,6 +10881,21 @@ const Checker = struct {
             c.homo_index_mode = true;
             defer c.homo_index_mode = saved_hi;
             const src = try c.resolveStructural(src_type);
+            // tsc's `instantiateMappedType`: a homomorphic map over a
+            // *primitive* performs NO mapping — the result is simply the
+            // source. Its rule is a positive test on the instantiated type
+            // variable (`AnyOrUnknown | InstantiableNonPrimitive | Object |
+            // Intersection` materializes, everything else is returned
+            // unchanged), so `Partial<string>`/`Required<string>` are `string`,
+            // not `{}`. ztsc used to fall through to `{}` here, which flipped
+            // `T[K] extends object` from false to TRUE one level up:
+            // react-hook-form's `DeepRequired<T>` (`T extends BrowserNativeObject
+            // ? T : { [K in keyof T]-?: NonNullable<DeepRequired<T[K]>> }`) turned
+            // every `string`/`number` form field into `{}`, so `FieldErrorsImpl`
+            // picked its `Merge<FieldError, FieldErrorsImpl<{}>>` arm instead of
+            // plain `FieldError` and every `FieldErrors<Form>` value printed as
+            // `{ message?: unknown; ref?: unknown; … }`.
+            if (isPrimitiveForHomomorphicMap(s.kind(src))) return src;
             switch (s.kind(src)) {
                 .any, .err => return types.any_type,
                 .array => {
@@ -11404,6 +11489,20 @@ const Checker = struct {
             },
             .string_mapping => c.containsMappedParam(s.stringMappingArg(t)),
             .keyof_op => c.containsMappedParam(s.keyofOperand(t)),
+            // A DEFERRED mapped type parked by `reduceMapped` because its KEY
+            // SET mentions an enclosing map's key parameter. Only the key set
+            // (constraint / homomorphic source) is inspected: both are
+            // evaluated with this map's own `K` still unbound, so a hit there
+            // is necessarily a FOREIGN key parameter. The value and the `as`
+            // clause are where this map's own `K` lives — reading them would
+            // answer `true` for every deferred map and drag `substMappedKey`
+            // through maps that have nothing to substitute (measured: +181
+            // diagnostics on the dogfood app, from re-reducing maps whose key
+            // set was already concrete).
+            .mapped => blk: {
+                if (s.mappedConstraint(t) != 0 and try c.containsMappedParam(s.mappedConstraint(t))) break :blk true;
+                break :blk s.mappedSource(t) != 0 and try c.containsMappedParam(s.mappedSource(t));
+            },
             else => false,
         };
     }
@@ -11482,6 +11581,19 @@ const Checker = struct {
             },
             .string_mapping => return c.applyStringMapping(s.stringMappingKind(t), try c.substMappedKey(s.stringMappingArg(t), key_id, key_ty)),
             .keyof_op => return c.keyofType(try c.substMappedKey(s.keyofOperand(t), key_id, key_ty)),
+            // Re-enter `reduceMapped` with the enclosing map's key bound — the
+            // mirror of `substInfer`'s `.mapped` arm, for a map deferred by the
+            // `containsMappedParam` test in `reduceMapped`. The inner map's own
+            // key param keeps its identity (a different id), so only the outer
+            // `key_id` is rewritten.
+            .mapped => {
+                const kp = s.mappedKeyParam(t);
+                const con = if (s.mappedConstraint(t) != 0) try c.substMappedKey(s.mappedConstraint(t), key_id, key_ty) else 0;
+                const val = try c.substMappedKey(s.mappedValue(t), key_id, key_ty);
+                const as_c = if (s.mappedAs(t) != 0) try c.substMappedKey(s.mappedAs(t), key_id, key_ty) else 0;
+                const src = if (s.mappedSource(t) != 0) try c.substMappedKey(s.mappedSource(t), key_id, key_ty) else 0;
+                return c.reduceMapped(kp, con, val, as_c, src, s.mappedFlags(t));
+            },
             else => return t,
         }
     }

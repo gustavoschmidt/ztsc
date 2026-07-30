@@ -1486,6 +1486,17 @@ pub const Store = struct {
     /// shape. The resulting *union* is canonical (`makeUnion` sorts), but the
     /// cross-product members keep the operand order they were built from.
     pub fn makeIntersection(s: *Store, scratch: Allocator, parts: []const TypeId) Error!TypeId {
+        return s.makeIntersectionFlags(scratch, parts, true);
+    }
+
+    /// `makeIntersection` with tsc's `IntersectionFlags.NoSupertypeReduction`:
+    /// the `{}` constituent is KEPT. Used only by the intersection *type node*
+    /// path for the `X & {}` / `{} & X` idiom (see `emptyObjectSupertypeOf`).
+    pub fn makeIntersectionNoReduce(s: *Store, scratch: Allocator, parts: []const TypeId) Error!TypeId {
+        return s.makeIntersectionFlags(scratch, parts, false);
+    }
+
+    fn makeIntersectionFlags(s: *Store, scratch: Allocator, parts: []const TypeId, reduce_empty_object: bool) Error!TypeId {
         var flat: std.ArrayList(TypeId) = .empty;
         defer flat.deinit(scratch);
         for (parts) |p| {
@@ -1515,19 +1526,52 @@ pub const Store = struct {
         }
         if (n == 0) return unknown_type;
         if (n == 1) return items[0];
-        const list = items[0..n];
+        var list = items[0..n];
         if (nullishIntersectionIsEmpty(s, list)) return never_type;
         if (distinctUnitIntersectionIsEmpty(s, list)) return never_type;
 
+        // Supertype reduction against `{}` (tsc's `getIntersectionType`): `{}`
+        // is a supertype of every non-nullish type, so `X & {}` IS `X` and the
+        // `{}` constituent is dropped. `NonNullable<T>` is spelled `T & {}`, so
+        // without this every `NonNullable<X>` for a concrete `X` stayed a
+        // two-member intersection — which reads as an OBJECT type, flipping
+        // `X extends object` from false to true (react-hook-form's
+        // `DeepRequired<T>` = `{ [K in keyof T]-?: NonNullable<DeepRequired<T[K]>> }`
+        // made every `string` field an object, so `FieldErrorsImpl` took its
+        // `Merge<FieldError, …>` arm and every `FieldErrors<Form>` value read
+        // as `unknown`).
+        if (reduce_empty_object) {
+            if (indexOf(list, empty_object_type)) |ei| {
+                var reduce = false;
+                for (list, 0..) |t, i| {
+                    if (i == ei) continue;
+                    if (emptyObjectSupertypeOf(s.kind(t))) {
+                        reduce = true;
+                        break;
+                    }
+                }
+                if (reduce) {
+                    var w: usize = 0;
+                    for (list, 0..) |t, i| {
+                        if (i == ei) continue;
+                        list[w] = t;
+                        w += 1;
+                    }
+                    list = list[0..w];
+                    if (list.len == 1) return list[0];
+                }
+            }
+        }
+
         // Distribute over the first union constituent, if any.
-        var union_idx: usize = n;
+        var union_idx: usize = list.len;
         var size: usize = 1;
         for (list, 0..) |t, i| {
             if (s.kind(t) != .union_type) continue;
-            if (union_idx == n) union_idx = i;
+            if (union_idx == list.len) union_idx = i;
             size *|= s.members(t).len;
         }
-        if (union_idx != n and size <= max_cross_product) {
+        if (union_idx != list.len and size <= max_cross_product) {
             // `members` dangles once the recursion interns anything.
             const um = try scratch.dupe(TypeId, s.members(list[union_idx]));
             defer scratch.free(um);
@@ -1543,6 +1587,53 @@ pub const Store = struct {
             return s.makeUnion(scratch, out.items);
         }
         return s.internType(.intersection, list, 0);
+    }
+
+    /// Kinds that are provably SUBTYPES of `{}` — every value of one is a
+    /// value of the empty object type — so an intersection containing one of
+    /// them absorbs an `{}` constituent (tsc's supertype reduction in
+    /// `getIntersectionType`). Every object-ish kind and every primitive
+    /// except the nullish domain qualifies; `void` does NOT (`void & {}` has
+    /// no reduction in tsc either).
+    ///
+    /// `.ref` (interface / class instance / lazy generic-alias instance) is on
+    /// the list: an interface or class instance is never nullish, and a lazy
+    /// alias ref is the spelling `NonNullable<Recursive<X>>` leaves behind —
+    /// the one this reduction has to see through. `null`/`undefined` are
+    /// absent because `nullishIntersectionIsEmpty` already answers `never` for
+    /// them. Deliberately syntactic, like every other rule in this store: the
+    /// still-generic kinds (`.type_param`, `.conditional`, `.index_access`,
+    /// `.keyof_op`, `.mapped`, `.infer_var`, `.this_type`) are NOT reduced —
+    /// `T & {}` for an unconstrained `T` is a real type in tsc *and* the
+    /// marker ztsc's narrowing puts on a type it took the nullish arm off.
+    fn emptyObjectSupertypeOf(k: Kind) bool {
+        return switch (k) {
+            .object,
+            .array,
+            .tuple,
+            .function,
+            .overloads,
+            .class_value,
+            .object_keyword,
+            .ref,
+            .string,
+            .number,
+            .boolean,
+            .bigint,
+            .symbol,
+            .bool_true,
+            .bool_false,
+            .string_literal,
+            .number_literal,
+            .number_literal_fresh,
+            .bigint_literal,
+            .enum_type,
+            .unique_symbol,
+            .template_literal_type,
+            .string_mapping,
+            => true,
+            else => false,
+        };
     }
 
     /// tsc's empty-intersection rule for the nullish domain
