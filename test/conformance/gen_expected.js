@@ -56,6 +56,12 @@ const OPTIONS = [
   "--lib", "esnext,dom", "--types", "",
   "--module", "esnext", "--moduleResolution", "bundler",
   "--allowImportingTsExtensions", "--jsx", "preserve",
+  // `noUncheckedSideEffectImports` is off in tsc (5.6+ introduced it, default
+  // false) but ON by default in this tsgo build — an unresolved side-effect
+  // `import "m"` gets TS2882 there and nothing in tsc. ztsc follows tsc's
+  // default, so the oracle is pinned to the same value; a case that wants the
+  // diagnostic turns it on in its own tsconfig (forwarded below).
+  "--noUncheckedSideEffectImports", "false",
   "--pretty", "false",
 ];
 
@@ -96,6 +102,7 @@ function optionsForDir(dir) {
   let resolveJson = false;
   let allowJs = false;
   let noImplicitAny; // tri-state: undefined = inherit strict
+  let noUncheckedSideEffectImports = false;
   let jsx, jsxImportSource;
   try {
     const co = JSON.parse(fs.readFileSync(cfgPath, "utf8")).compilerOptions;
@@ -104,6 +111,7 @@ function optionsForDir(dir) {
     if (co && co.resolveJsonModule === true) resolveJson = true;
     if (co && co.allowJs === true) allowJs = true;
     if (co && typeof co.noImplicitAny === "boolean") noImplicitAny = co.noImplicitAny;
+    if (co && co.noUncheckedSideEffectImports === true) noUncheckedSideEffectImports = true;
     if (co && typeof co.jsx === "string") jsx = co.jsx;
     if (co && typeof co.jsxImportSource === "string") jsxImportSource = co.jsxImportSource;
   } catch {
@@ -129,6 +137,14 @@ function optionsForDir(dir) {
   // suppresses the implicit-any family (run_conformance.zig no_implicit_any).
   if (noImplicitAny === false) out.push("--noImplicitAny", "false");
   else if (noImplicitAny === true) out.push("--noImplicitAny", "true");
+  // `noUncheckedSideEffectImports`: the default OPTIONS pin it off (tsc's
+  // default); a case opts back in and ztsc reads the same key
+  // (run_conformance.zig dirCaseBoolOption).
+  if (noUncheckedSideEffectImports) {
+    const at = out.indexOf("--noUncheckedSideEffectImports");
+    if (at >= 0) out[at + 1] = "true";
+    else out.push("--noUncheckedSideEffectImports", "true");
+  }
   // `jsx`: the default OPTIONS pass `--jsx preserve` (cases declare their own
   // global `JSX` namespace). A case that selects the *automatic* runtime
   // (`react-jsx`) moves the `JSX` namespace into the

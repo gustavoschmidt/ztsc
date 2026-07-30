@@ -78,6 +78,10 @@ pub const LinkOpts = struct {
     /// the checker gates TS7006/TS7053 on `Program.no_implicit_any`, which the
     /// driver sets from the same option.
     no_implicit_any: bool = true,
+    /// tsconfig `noUncheckedSideEffectImports` (default OFF, like tsc). Gates the
+    /// unresolved-specifier diagnostic for a side-effect-only import. See
+    /// `reportUnresolvedModules`.
+    no_unchecked_side_effect_imports: bool = false,
 };
 
 /// Serial wavefront: load, parse, bind and resolve transitively from
@@ -252,6 +256,7 @@ pub fn link(
         .atom_default = interner.intern(io, gpa, "default") catch return Error.OutOfMemory,
         .allow_synthetic_default = link_opts.allow_synthetic_default,
         .no_implicit_any = link_opts.no_implicit_any,
+        .no_unchecked_side_effect_imports = link_opts.no_unchecked_side_effect_imports,
         .atom_export_equals = interner.intern(io, gpa, "export=") catch return Error.OutOfMemory,
         .state = try scratch.alloc(u8, files.len),
         .tables = try scratch.alloc(std.AutoArrayHashMapUnmanaged(Atom, Target), files.len),
@@ -1023,6 +1028,8 @@ const Linker = struct {
     allow_synthetic_default: bool = false,
     /// Effective `noImplicitAny`; gates TS7016 (see `LinkOpts`).
     no_implicit_any: bool = true,
+    /// Effective `noUncheckedSideEffectImports`; gates TS2882 (see `LinkOpts`).
+    no_unchecked_side_effect_imports: bool = false,
     /// Reserved key under which a module's `export = X` target is stored in its
     /// export/ambient table (`export=` can never be a real export name). Skipped
     /// by the namespace-object builders and `export *` merge.
@@ -1623,9 +1630,16 @@ const Linker = struct {
     }
 
     /// TS2307 for unresolved module specifiers, one per statement. A
-    /// side-effect-only import (`import "./x"`) of an unresolved module gets
-    /// TS2882 instead — TS7 flags these (tsc 5.5 left them silent under
-    /// bundler resolution).
+    /// side-effect-only import (`import "./x"`) is governed by
+    /// `noUncheckedSideEffectImports` (TS 5.6+) instead: tsc's
+    /// `checkImportDeclaration` only resolves the specifier of a *bare*
+    /// `import "m"` when that option is on, so with the option off (tsc's
+    /// default, and the dogfood project's) an unresolved side-effect specifier
+    /// is silently accepted — bundler plugins own specifiers like
+    /// `import "@fontsource-variable/inter"`, which is a CSS-only package.
+    /// When the option is on, ztsc reports TS2882, matching the pinned tsgo
+    /// oracle (tsc words the same condition as TS2307); tsgo 7.0.2 differs from
+    /// tsc only in defaulting the option ON.
     ///
     /// The same walk carries TS7016 for the module that resolved but has no
     /// declarations behind it — see `untypedJsModule`.
@@ -1662,6 +1676,7 @@ const Linker = struct {
             }
             if (l.hasAmbient(atom)) continue; // resolved by a `declare module`
             if (side_effect) {
+                if (!l.no_unchecked_side_effect_imports) continue;
                 try l.diag(file, 2882, l.tokSpan(file, mod_tok), "Cannot find module or type declarations for side-effect import of '{s}'.", .{stripped});
             } else {
                 try l.diag(file, 2307, l.tokSpan(file, mod_tok), "Cannot find module '{s}' or its corresponding type declarations.", .{stripped});

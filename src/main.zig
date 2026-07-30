@@ -480,6 +480,8 @@ pub fn main(init: std.process.Init) !void {
     // tsconfig allowJs (resolve JS-only deps as `any`) + effective noImplicitAny.
     var config_allow_js = false;
     var config_no_implicit_any = true;
+    // tsconfig noUncheckedSideEffectImports (tsc's default is off).
+    var config_no_unchecked_side_effect_imports = false;
     // Effective allowSyntheticDefaultImports. With no tsconfig (bare file
     // arguments) ztsc still resolves with the bundler algorithm, and tsc's rule
     // makes the flag default to true under bundler resolution.
@@ -544,6 +546,7 @@ pub fn main(init: std.process.Init) !void {
         config_base_url = cfg.base_url;
         config_allow_js = cfg.allow_js;
         config_no_implicit_any = cfg.no_implicit_any;
+        config_no_unchecked_side_effect_imports = cfg.no_unchecked_side_effect_imports;
         config_allow_synthetic_default = cfg.allow_synthetic_default_imports;
         config_jsx_runtime_module = cfg.jsx_runtime_module;
     }
@@ -884,6 +887,7 @@ pub fn main(init: std.process.Init) !void {
     const lr = try modules.link(arena, gpa, io, &interner, prog_files, .{
         .allow_synthetic_default = config_allow_synthetic_default,
         .no_implicit_any = config_no_implicit_any,
+        .no_unchecked_side_effect_imports = config_no_unchecked_side_effect_imports,
     });
     const links = lr.links;
     const prog = try arena.create(modules.Program);

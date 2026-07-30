@@ -379,10 +379,15 @@ fn runDirCase(
     // `--allowSyntheticDefaultImports false`.
     const allow_synthetic_default = (try dirCaseOptBool(alloc, io, conf_dir, case_rel, "allowSyntheticDefaultImports")) orelse
         (try dirCaseOptBool(alloc, io, conf_dir, case_rel, "esModuleInterop")) orelse true;
+    // `noUncheckedSideEffectImports` defaults OFF, like tsc. The pinned tsgo
+    // oracle defaults it ON, so a case that wants the diagnostic sets it
+    // explicitly and gen_expected.js forwards the same flag.
+    const no_unchecked_side_effect_imports = try dirCaseBoolOption(alloc, io, conf_dir, case_rel, "noUncheckedSideEffectImports");
     const jsx_runtime_module = try dirCaseJsxRuntimeModule(alloc, io, conf_dir, case_rel);
     var br = try modules.buildProgram(alloc, io, gpa, interner, conf_dir, &.{entry}, lib_set, .{ .resolve_json = resolve_json, .allow_js = allow_js }, .{
         .allow_synthetic_default = allow_synthetic_default,
         .no_implicit_any = no_implicit_any,
+        .no_unchecked_side_effect_imports = no_unchecked_side_effect_imports,
     }, jsx_runtime_module);
     const prog = &br.program;
     prog.no_implicit_any = no_implicit_any;
