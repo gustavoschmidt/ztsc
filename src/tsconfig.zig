@@ -110,6 +110,7 @@ pub fn loadInDir(io: Io, arena: Allocator, base: Io.Dir, config_path: []const u8
     cfg.skip_lib_check = acc.skip_lib_check orelse false;
     cfg.skip_all_lib_check = acc.skip_all_lib_check orelse false;
     cfg.resolve_json_module = acc.resolve_json_module orelse false;
+    cfg.no_unchecked_side_effect_imports = acc.no_unchecked_side_effect_imports orelse false;
     // Effective allowSyntheticDefaultImports = explicit value ?? esModuleInterop
     // ?? (module is system || moduleResolution is bundler). ztsc always resolves
     // with the bundler algorithm (`moduleResolution` is accepted and ignored
@@ -305,6 +306,13 @@ pub const Config = struct {
     /// `compilerOptions.resolveJsonModule`: a `*.json` import that names an
     /// existing file resolves (typed opaquely as `any`) rather than TS2307.
     resolve_json_module: bool = false,
+    /// `compilerOptions.noUncheckedSideEffectImports` (TS 5.6+). tsc's default is
+    /// OFF: a side-effect-only `import "m"` whose specifier resolves to nothing
+    /// is silently accepted, because bundler plugins routinely own such
+    /// specifiers (`import "@fontsource-variable/inter"` is CSS). Only when the
+    /// option is on does the unresolved specifier become an error. Note the
+    /// pinned tsgo oracle defaults this ON — see `Linker.reportUnresolvedModules`.
+    no_unchecked_side_effect_imports: bool = false,
     /// Effective `compilerOptions.allowSyntheticDefaultImports`, i.e.
     /// `allowSyntheticDefaultImports ?? esModuleInterop ?? (module is system ||
     /// moduleResolution is bundler)` (tsc's rule). ztsc always resolves with the
@@ -880,6 +888,7 @@ const Merged = struct {
     skip_lib_check: ?bool = null,
     skip_all_lib_check: ?bool = null,
     resolve_json_module: ?bool = null,
+    no_unchecked_side_effect_imports: ?bool = null,
     es_module_interop: ?bool = null,
     allow_synthetic_default_imports: ?bool = null,
     base_url: ?[]const u8 = null,
@@ -1060,6 +1069,12 @@ fn applyOwn(
                         acc.resolve_json_module = oval.boolean;
                     } else {
                         try warn(arena, warnings, "{s}: 'resolveJsonModule' must be a boolean (ignored)", .{config_path});
+                    }
+                } else if (std.mem.eql(u8, okey, "noUncheckedSideEffectImports")) {
+                    if (oval == .boolean) {
+                        acc.no_unchecked_side_effect_imports = oval.boolean;
+                    } else {
+                        try warn(arena, warnings, "{s}: 'noUncheckedSideEffectImports' must be a boolean (ignored)", .{config_path});
                     }
                 } else if (std.mem.eql(u8, okey, "esModuleInterop")) {
                     if (oval == .boolean) {
