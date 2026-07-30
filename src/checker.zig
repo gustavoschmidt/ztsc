@@ -22416,40 +22416,49 @@ const Checker = struct {
     /// (`this.state.a.b.c.d`) without widening the hot key.
     const max_deep_ref_depth = 5;
 
-    /// One link in a reference path: either a dotted member (`.p`) or a
-    /// constant element access (`[i]`). Only *constant* integer indices are
-    /// trackable — a variable index (`arr[i]`) is not a stable reference, so
-    /// `buildRefKey` rejects it.
+    /// One link in a reference path: a dotted member (`.p`), a constant element
+    /// access (`[0]`), or an element access through a *stable identifier* index
+    /// (`[tag]`, where `tag` is a `const` or a never-reassigned local/parameter
+    /// — tsc's `isMatchingReference` element-access arm). Any other index
+    /// expression is not a stable reference, so `buildRefKey` rejects it.
     ///
-    /// The two payloads are mutually exclusive by tag, so they share one u32
-    /// and the tag rides in that u32's high bit (`atom()` / `index()` assert
-    /// the tag): the original two-field form carried a permanently-zero
-    /// companion field and cost 12 bytes, which `RefKey`'s `[3]PathElem`
-    /// multiplied into a 48-byte `ref_keys` key; a shared payload behind a
-    /// separate `bool` tag still cost 8 (`RefQ` 36) to the bool's own field
-    /// slot. Folding the tag into bit 31 gets `PathElem` to 4 (`RefQ` 24).
+    /// The three payloads are mutually exclusive by tag, so they share one u32
+    /// and the tag rides in that u32's two high bits (`atom()` / `index()` /
+    /// `indexSym()` assert the tag): the original two-field form carried a
+    /// permanently-zero companion field and cost 12 bytes, which `RefKey`'s
+    /// `[3]PathElem` multiplied into a 48-byte `ref_keys` key; a shared payload
+    /// behind a separate `bool` tag still cost 8 (`RefQ` 36) to the bool's own
+    /// field slot. Folding the tag into the high bits gets `PathElem` to 4
+    /// (`RefQ` 24).
     ///
-    /// The fold is lossless because both payloads fit in 31 bits: element
-    /// indices are bounded by 4096 (`constIndexOf`), and a member atom is a
-    /// shard-interleaved interner handle (`Interner.atomFrom`), so bit 31 is
-    /// clear until a single shard holds 2^(31 - 4) = 134 M strings — hundreds
-    /// of millions of distinct identifiers. That is a size bound, not a
-    /// structural one, so `memberFits` checks it at the one construction site
-    /// instead of assuming it: an atom that does not fit makes `buildRefKey`
-    /// return null, i.e. the reference is simply not tracked (sound
-    /// under-narrowing, the same degradation as an over-deep path) — never a
-    /// silent alias with an element link.
+    /// The fold is lossless because every payload fits in 30 bits: element
+    /// indices are bounded by 4096 (`constIndexOf`), a symbol id is bounded by
+    /// the program's symbol count, and a member atom is a shard-interleaved
+    /// interner handle (`Interner.atomFrom`), so the tag bits are clear until a
+    /// single shard holds 2^(30 - 4) = 67 M strings — tens of millions of
+    /// distinct identifiers. That is a size bound, not a structural one, so
+    /// `memberFits`/`symFits` check it at the one construction site instead of
+    /// assuming it: a payload that does not fit makes `buildRefKey` return null,
+    /// i.e. the reference is simply not tracked (sound under-narrowing, the same
+    /// degradation as an over-deep path) — never a silent alias.
     const PathElem = struct {
-        /// Bit 31 = tag (set: element index), bits 0..30 = payload.
+        /// Bit 31 = element access, bit 30 = (with bit 31) identifier index,
+        /// bits 0..29 = payload. A dotted member is tag `00`, so `member(0)`
+        /// is the all-zero default and unused slots hash canonically.
         bits: u32 = 0,
 
         const index_tag: u32 = 1 << 31;
-        const payload_max: u32 = index_tag - 1;
+        const sym_tag: u32 = 1 << 30;
+        const payload_max: u32 = sym_tag - 1;
 
         /// Can this property atom be folded? (See the type doc: false only
-        /// past atom 2^31-1, where the caller stops tracking the reference.)
+        /// past atom 2^30-1, where the caller stops tracking the reference.)
         fn memberFits(a: Atom) bool {
             return a <= payload_max;
+        }
+        /// Can this index symbol be folded? (Same bound, same fallback.)
+        fn symFits(s: SymbolId) bool {
+            return s <= payload_max;
         }
         fn member(a: Atom) PathElem {
             std.debug.assert(memberFits(a));
@@ -22459,15 +22468,26 @@ const Checker = struct {
             std.debug.assert(i <= payload_max);
             return .{ .bits = index_tag | i };
         }
+        fn elementSym(s: SymbolId) PathElem {
+            std.debug.assert(symFits(s));
+            return .{ .bits = index_tag | sym_tag | s };
+        }
         fn isIndex(pe: PathElem) bool {
             return pe.bits & index_tag != 0;
+        }
+        fn isIndexSym(pe: PathElem) bool {
+            return pe.bits & (index_tag | sym_tag) == (index_tag | sym_tag);
         }
         fn atom(pe: PathElem) Atom {
             std.debug.assert(!pe.isIndex());
             return pe.bits;
         }
         fn index(pe: PathElem) u32 {
-            std.debug.assert(pe.isIndex());
+            std.debug.assert(pe.isIndex() and !pe.isIndexSym());
+            return pe.bits & payload_max;
+        }
+        fn indexSym(pe: PathElem) SymbolId {
+            std.debug.assert(pe.isIndexSym());
             return pe.bits & payload_max;
         }
     };
@@ -22590,6 +22610,44 @@ const Checker = struct {
         return @intFromFloat(v);
     }
 
+    /// The value symbol of a *stable* identifier element-access index
+    /// (`ICON_BY_TAG[tag]`), else null. This is tsc's `isMatchingReference`
+    /// element-access arm: two element accesses spelled with the same
+    /// identifier denote the same reference when that identifier's symbol is
+    /// `isConstantVariable` — a `const` — or `isParameterOrMutableLocalVariable
+    /// && !isSymbolAssigned` — a parameter or a `let`/`var`/catch local that is
+    /// never assigned. Anything else (a reassigned local, a property, a call
+    /// result, a computed expression) leaves the reference untracked, which is
+    /// sound under-narrowing.
+    ///
+    /// Order-independent: `const`ness is a declaration flag, and the
+    /// never-assigned test reads `reassigned_syms`, a pure function of one
+    /// file's AST (`ensureReassignScan`). Because that table is only populated
+    /// for files already scanned, the non-`const` case is restricted to symbols
+    /// declared in the file being checked — otherwise the answer would depend
+    /// on which files had been visited, which is exactly the order-dependence
+    /// the determinism contract forbids. The same restriction guards the
+    /// closure-crossing arm of `flowType`.
+    fn stableIndexSymbol(c: *Checker, rhs: Node) Error!?SymbolId {
+        var n = rhs;
+        while (c.nodeTag(n) == .paren_expr) n = c.tree.nodeData(n).lhs;
+        if (c.nodeTag(n) != .identifier) return null;
+        const a = try c.atomOfToken(c.tree.nodeMainToken(n));
+        const sym = switch (c.resolveSpace(a, c.cur_scope, true)) {
+            .sym => |s| s,
+            else => return null,
+        };
+        if (sym == binder.no_symbol) return null;
+        if (!PathElem.symFits(sym)) return null;
+        const sf = c.symFlags(sym);
+        if (sf.const_decl) return sym;
+        if (!(sf.let_decl or sf.var_decl or sf.param or sf.catch_param)) return null;
+        if (c.symFile(sym) != c.cur_file) return null;
+        try c.ensureReassignScan();
+        if (c.reassigned_syms.contains(sym)) return null;
+        return sym;
+    }
+
     /// Build the tracked reference key for a member/element-access node by
     /// peeling its spine right-to-left, collecting dotted-member atoms and
     /// constant element indices, until it bottoms out at a bare identifier
@@ -22610,9 +22668,12 @@ const Checker = struct {
                 if (!PathElem.memberFits(ma)) return null; // unfoldable atom: not tracked
                 elems[count] = .member(ma);
             } else if (tag == .index_expr or tag == .optional_index_expr) {
-                const iv = c.constIndexOf(d.rhs) orelse return null; // variable index: untracked
                 if (count >= max_deep_ref_depth) return null;
-                elems[count] = .element(iv);
+                if (c.constIndexOf(d.rhs)) |iv| {
+                    elems[count] = .element(iv);
+                } else if (try c.stableIndexSymbol(d.rhs)) |is| {
+                    elems[count] = .elementSym(is);
+                } else return null; // unstable index: untracked
             } else break;
             count += 1;
             n = d.lhs;
@@ -22681,7 +22742,11 @@ const Checker = struct {
             const tag = c.nodeTag(n);
             const d = c.tree.nodeData(n);
             const pe = path[i - 1];
-            if (pe.isIndex()) {
+            if (pe.isIndexSym()) {
+                if (tag != .index_expr and tag != .optional_index_expr) return false;
+                const is = (try c.stableIndexSymbol(d.rhs)) orelse return false;
+                if (is != pe.indexSym()) return false;
+            } else if (pe.isIndex()) {
                 if (tag != .index_expr and tag != .optional_index_expr) return false;
                 const iv = c.constIndexOf(d.rhs) orelse return false;
                 if (iv != pe.index()) return false;
@@ -26817,19 +26882,28 @@ test "narrowing: PathElem tag fold is lossless and keeps RefQ at 24 bytes" {
     // The point of the fold: one word per link, 24 bytes per interned key.
     try testing.expectEqual(@as(usize, 4), @sizeOf(PE));
     try testing.expectEqual(@as(usize, 24), @sizeOf(Checker.RefQ));
-    // Round-trips, and the two tags never alias on a shared payload.
+    // Round-trips, and the three tags never alias on a shared payload.
     try testing.expectEqual(@as(Atom, 7), PE.member(7).atom());
     try testing.expectEqual(@as(u32, 7), PE.element(7).index());
+    try testing.expectEqual(@as(u32, 7), PE.elementSym(7).indexSym());
     try testing.expect(!PE.member(7).isIndex());
+    try testing.expect(!PE.member(7).isIndexSym());
     try testing.expect(PE.element(7).isIndex());
+    try testing.expect(!PE.element(7).isIndexSym());
+    try testing.expect(PE.elementSym(7).isIndex());
+    try testing.expect(PE.elementSym(7).isIndexSym());
     try testing.expect(PE.member(7).bits != PE.element(7).bits);
+    try testing.expect(PE.element(7).bits != PE.elementSym(7).bits);
+    try testing.expect(PE.member(7).bits != PE.elementSym(7).bits);
     // A trailing slot past `len` is canonically a zero-atom member link, so
     // `RefKey`'s default and `member(0)` stay the same key (as before the fold).
     try testing.expectEqual(PE.member(0).bits, (PE{}).bits);
-    // The 31-bit bound is checked, not assumed.
+    // The 30-bit bound is checked, not assumed.
     try testing.expect(PE.memberFits(PE.payload_max));
     try testing.expect(!PE.memberFits(PE.payload_max + 1));
     try testing.expect(!PE.memberFits(std.math.maxInt(Atom)));
+    try testing.expect(PE.symFits(PE.payload_max));
+    try testing.expect(!PE.symFits(PE.payload_max + 1));
 }
 
 test "narrowing: assignment narrowing and loop widening" {
