@@ -457,7 +457,7 @@ const map_containers = [_][]const u8{
     "type_node_cache",          "atom_cache",         "infer_ids",
     "infer_scopes",             "mapped_key_ids",     "inst_diag_at",
     "infer_active",             "lazy_member_active", "chain_guards",
-    "never_isect",
+    "never_isect",              "deep_path_list",     "deep_path_ids",
 };
 
 const Checker = struct {
@@ -701,6 +701,13 @@ const Checker = struct {
     flow_back_edge: u32 = 0,
     /// Interned narrowing reference keys (RefQ -> dense index).
     ref_keys: std.AutoHashMapUnmanaged(RefQ, u32) = .empty,
+    /// Over-deep reference paths, indexed by `RefKey.deep - 1`. Appended to
+    /// only by `makeRefKey`, and only for the rare path that does not fit
+    /// inline, so this stays a few dozen entries on a real project.
+    deep_path_list: std.ArrayListUnmanaged(DeepPath) = .empty,
+    /// The interning side of `deep_path_list` (path -> 1-based id, 0 = the
+    /// table was full when this path was first seen, i.e. untracked).
+    deep_path_ids: std.AutoHashMapUnmanaged(DeepPath, u16) = .empty,
     /// (flow << 32 | symbol) -> definitely-assigned (2 computing, 0/1 result).
     da_cache: std.AutoHashMapUnmanaged(u64, u8) = .empty,
     /// containsTypeParam memo: 0 unknown, 1 no, 2 yes.
@@ -6248,12 +6255,14 @@ const Checker = struct {
 
     /// The reference key one pattern link deeper, or null when the path would
     /// exceed the tracked depth (sound under-narrowing).
-    fn extendRefKey(base: RefKey, elem: PathElem) ?RefKey {
-        if (base.len >= max_ref_depth) return null;
-        var k = base;
-        k.path[k.len] = elem;
-        k.len += 1;
-        return k;
+    fn extendRefKey(c: *Checker, base: RefKey, elem: PathElem) Error!?RefKey {
+        if (base.len >= max_deep_ref_depth) return null;
+        var elems: [max_deep_ref_depth]PathElem = undefined;
+        var buf: [max_deep_ref_depth]PathElem = undefined;
+        const path = c.refPath(&base, &buf);
+        @memcpy(elems[0..path.len], path);
+        elems[path.len] = elem;
+        return c.makeRefKey(base.sym, elems[0 .. path.len + 1]);
     }
 
     fn findBindingType(c: *Checker, pat: Node, name: Atom, whole: TypeId, out: *TypeId, bf: ?BindFlow) Error!bool {
@@ -6283,7 +6292,7 @@ const Checker = struct {
                             var sub_bf: ?BindFlow = null;
                             if (bf) |b| {
                                 if (PathElem.memberFits(key)) {
-                                    if (extendRefKey(b.key, .member(key))) |k| {
+                                    if (try c.extendRefKey(b.key, .member(key))) |k| {
                                         pt = try c.flowTypeOfKey(b.node, k, pt);
                                         sub_bf = .{ .node = b.node, .key = k };
                                     }
@@ -17619,7 +17628,7 @@ const Checker = struct {
         }
         var pt = try c.propertyTypeOf(obj_t, name, name_tok);
         // Property-path narrowing: peel the whole access spine into a member
-        // path (`x.p`, `this.p`, `x.a.b`, …) capped at `max_ref_depth`.
+        // path (`x.p`, `this.p`, `x.a.b`, …) capped at `max_deep_ref_depth`.
         if (try c.buildRefKey(node)) |key| {
             pt = try c.flowTypeOfKey(node, key, pt);
         }
@@ -21729,10 +21738,21 @@ const Checker = struct {
     // control-flow narrowing
     // =====================================================================
 
-    /// Maximum tracked reference-path depth. tsc caps reference narrowing;
-    /// ztsc's live need tops out at depth-2 (`a.b.c`). Paths deeper than this
-    /// are not tracked (sound under-narrowing = pre-depth-N behavior).
+    /// How many path links a `RefKey` stores *inline*. Chosen for layout, not
+    /// for semantics: `[3]PathElem` is what keeps `RefQ` at 24 bytes (see
+    /// `PathElem`), and a live reference is at this depth or shallower in the
+    /// overwhelming majority of cases.
     const max_ref_depth = 3;
+
+    /// Maximum *tracked* reference-path depth. Links past `max_ref_depth` do
+    /// not fit inline, so a deeper path is interned in `deep_path_list` and
+    /// the key carries only its id (see `makeRefKey`) — the inline layout, and
+    /// therefore `RefQ`'s size, is unchanged. Paths deeper than this are still
+    /// not tracked (sound under-narrowing = the reference keeps its declared
+    /// type). tsc keys flow references by AST node identity and has no such
+    /// cap at all; five links covers the guard shapes real code writes
+    /// (`this.state.a.b.c.d`) without widening the hot key.
+    const max_deep_ref_depth = 5;
 
     /// One link in a reference path: either a dotted member (`.p`) or a
     /// constant element access (`[i]`). Only *constant* integer indices are
@@ -21791,17 +21811,35 @@ const Checker = struct {
     };
 
     /// A narrowable reference: a bare identifier (`len == 0`) or a member
-    /// path `sym.path[0].path[1]…` capped at `max_ref_depth`. `path[0]` is the
-    /// innermost link (closest to the root), `path[len-1]` the outermost. Each
-    /// link is a dotted member (`.p`) or a constant element access (`[i]`), so
-    /// `data.Legend[0].rules` is a depth-3 reference (`Legend`, `[0]`, `rules`).
-    /// A `this`-rooted path uses the sentinel root `this_flow_root` (flow
-    /// graphs are per-function, so the sentinel never crosses a `this`-rebind
-    /// boundary). Trailing `path` slots past `len` are always default so the
-    /// struct hashes/compares canonically as an `AutoHashMap` key.
+    /// path `sym.path[0].path[1]…` capped at `max_deep_ref_depth`. `path[0]` is
+    /// the innermost link (closest to the root), `path[len-1]` the outermost.
+    /// Each link is a dotted member (`.p`) or a constant element access (`[i]`),
+    /// so `data.Legend[0].rules` is a depth-3 reference (`Legend`, `[0]`,
+    /// `rules`). A `this`-rooted path uses the sentinel root `this_flow_root`
+    /// (flow graphs are per-function, so the sentinel never crosses a
+    /// `this`-rebind boundary).
+    ///
+    /// Up to `max_ref_depth` links live in `path`, with trailing slots past
+    /// `len` left default so the struct hashes/compares canonically as an
+    /// `AutoHashMap` key. A deeper path does not fit — widening `path` would
+    /// push `RefQ` past its 24-byte commitment — so it is interned instead:
+    /// `deep` holds its 1-based `deep_path_list` id and `path` stays all
+    /// default. Interning is structural (equal link sequences share one id),
+    /// so key equality stays exact either way, and `deep` is free: `sym` +
+    /// `path` + `len` is 17 bytes of a 4-aligned 20-byte struct, so it fits in
+    /// padding the key already carried. `refPath` reads either form.
     const RefKey = struct {
         sym: SymbolId,
         path: [max_ref_depth]PathElem = [_]PathElem{.{}} ** max_ref_depth,
+        /// 1-based `deep_path_list` id, or 0 when the path is inline.
+        deep: u16 = 0,
+        len: u8 = 0,
+    };
+
+    /// One interned over-deep link sequence (see `RefKey.deep`). Slots past
+    /// `len` stay default so the struct is a canonical `AutoHashMap` key.
+    const DeepPath = struct {
+        elems: [max_deep_ref_depth]PathElem = [_]PathElem{.{}} ** max_deep_ref_depth,
         len: u8 = 0,
     };
 
@@ -21832,6 +21870,45 @@ const Checker = struct {
     /// so a re-entrant query reads the union computed *so far*.
     const LoopFrame = struct { q: FlowQ, parts: *std.ArrayList(TypeId) };
 
+    /// Assemble the key for `root.elems[0].elems[1]…` (innermost first),
+    /// interning the link sequence when it is too deep to store inline. Null
+    /// when the overflow table is full — the reference is then simply not
+    /// tracked, the same sound under-narrowing as an over-deep path. The
+    /// refusal is memoized under the path itself, so which paths are tracked
+    /// never depends on how often one is rebuilt.
+    fn makeRefKey(c: *Checker, sym: SymbolId, elems: []const PathElem) Error!?RefKey {
+        std.debug.assert(elems.len <= max_deep_ref_depth);
+        var key: RefKey = .{ .sym = sym, .len = @intCast(elems.len) };
+        if (elems.len <= max_ref_depth) {
+            @memcpy(key.path[0..elems.len], elems);
+            return key;
+        }
+        var dp: DeepPath = .{ .len = @intCast(elems.len) };
+        @memcpy(dp.elems[0..elems.len], elems);
+        const gop = try c.deep_path_ids.getOrPut(c.cm(), dp);
+        if (!gop.found_existing) {
+            if (c.deep_path_list.items.len >= std.math.maxInt(u16)) {
+                gop.value_ptr.* = 0;
+            } else {
+                try c.deep_path_list.append(c.cm(), dp);
+                gop.value_ptr.* = @intCast(c.deep_path_list.items.len);
+            }
+        }
+        if (gop.value_ptr.* == 0) return null;
+        key.deep = gop.value_ptr.*;
+        return key;
+    }
+
+    /// The reference's links, innermost first. An inline path is returned in
+    /// place (hence the `*const` key: the slice points into the caller's own
+    /// storage); a deep one is copied into `buf` rather than handed out as a
+    /// view of `deep_path_list`, which a later `makeRefKey` may reallocate.
+    fn refPath(c: *const Checker, key: *const RefKey, buf: *[max_deep_ref_depth]PathElem) []const PathElem {
+        if (key.deep == 0) return key.path[0..key.len];
+        @memcpy(buf[0..key.len], c.deep_path_list.items[key.deep - 1].elems[0..key.len]);
+        return buf[0..key.len];
+    }
+
     fn refKeyIndex(c: *Checker, key: RefKey, declared: TypeId) Error!u32 {
         const gop = try c.ref_keys.getOrPut(c.cm(), .{ .key = key, .declared = declared });
         if (!gop.found_existing) gop.value_ptr.* = @intCast(c.ref_keys.count());
@@ -21856,9 +21933,9 @@ const Checker = struct {
     /// constant element indices, until it bottoms out at a bare identifier
     /// (resolved to a value symbol) or `this`. Returns null when the root is
     /// neither (call result, non-constant index, etc.) or the path is deeper
-    /// than `max_ref_depth` (untracked = sound under-narrowing).
+    /// than `max_deep_ref_depth` (untracked = sound under-narrowing).
     fn buildRefKey(c: *Checker, node: Node) Error!?RefKey {
-        var elems: [max_ref_depth]PathElem = [_]PathElem{.{}} ** max_ref_depth;
+        var elems: [max_deep_ref_depth]PathElem = [_]PathElem{.{}} ** max_deep_ref_depth;
         var count: usize = 0;
         var n = node;
         while (true) {
@@ -21866,13 +21943,13 @@ const Checker = struct {
             const tag = c.nodeTag(n);
             const d = c.tree.nodeData(n);
             if (tag == .member_expr or tag == .optional_member_expr) {
-                if (count >= max_ref_depth) return null; // too deep: not tracked
+                if (count >= max_deep_ref_depth) return null; // too deep: not tracked
                 const ma = try c.memberAtom(d.rhs);
                 if (!PathElem.memberFits(ma)) return null; // unfoldable atom: not tracked
                 elems[count] = .member(ma);
             } else if (tag == .index_expr or tag == .optional_index_expr) {
                 const iv = c.constIndexOf(d.rhs) orelse return null; // variable index: untracked
-                if (count >= max_ref_depth) return null;
+                if (count >= max_deep_ref_depth) return null;
                 elems[count] = .element(iv);
             } else break;
             count += 1;
@@ -21881,23 +21958,22 @@ const Checker = struct {
         // `n` is the root. A bare identifier must resolve to a value symbol
         // (skip the `undefined` keyword, which is not a reference); `this`
         // uses the sentinel root.
-        var key: RefKey = .{ .sym = 0, .len = @intCast(count) };
+        var root: SymbolId = 0;
         if (c.nodeTag(n) == .identifier) {
             const base_tok = c.tree.nodeMainToken(n);
             if (c.tree.tokens.tag(base_tok) == .keyword_undefined) return null;
             const a = try c.atomOfToken(base_tok);
             switch (c.resolveSpace(a, c.cur_scope, true)) {
-                .sym => |sym| key.sym = sym,
+                .sym => |sym| root = sym,
                 else => return null,
             }
         } else if (c.nodeTag(n) == .this_expr) {
-            key.sym = this_flow_root;
+            root = this_flow_root;
         } else return null;
         // Links were collected outermost-first; reverse so `path[0]` is the
         // innermost link (closest to the root).
-        var i: usize = 0;
-        while (i < count) : (i += 1) key.path[i] = elems[count - 1 - i];
-        return key;
+        std.mem.reverse(PathElem, elems[0..count]);
+        return c.makeRefKey(root, elems[0..count]);
     }
 
     /// tsc's `getReferenceCandidate`: the expression a narrowing condition is
@@ -21927,15 +22003,22 @@ const Checker = struct {
     /// (outermost = `path[len-1]`), and bottoms out at the root identifier /
     /// `this`.
     fn refMatches(c: *Checker, node: Node, key: RefKey) Error!bool {
+        var buf: [max_deep_ref_depth]PathElem = undefined;
+        return c.refMatchesPath(node, key.sym, c.refPath(&key, &buf));
+    }
+
+    /// `refMatches` against an explicit link sequence, so a caller holding a
+    /// path (`refPrefixWritten`) can test a prefix without interning it.
+    fn refMatchesPath(c: *Checker, node: Node, sym: SymbolId, path: []const PathElem) Error!bool {
         if (node == null_node) return false;
         var n = c.referenceCandidate(node);
-        if (key.len == 0) return c.identIsSym(n, key.sym);
-        var i: usize = key.len;
+        if (path.len == 0) return c.identIsSym(n, sym);
+        var i: usize = path.len;
         while (i > 0) : (i -= 1) {
             n = c.referenceCandidate(n);
             const tag = c.nodeTag(n);
             const d = c.tree.nodeData(n);
-            const pe = key.path[i - 1];
+            const pe = path[i - 1];
             if (pe.isIndex()) {
                 if (tag != .index_expr and tag != .optional_index_expr) return false;
                 const iv = c.constIndexOf(d.rhs) orelse return false;
@@ -21946,7 +22029,7 @@ const Checker = struct {
             }
             n = d.lhs;
         }
-        return c.identIsSym(n, key.sym);
+        return c.identIsSym(n, sym);
     }
 
     /// Is `target` a proper prefix of the tracked reference `key`? Writing any
@@ -21954,12 +22037,11 @@ const Checker = struct {
     /// whole subtree's narrowing.
     fn refPrefixWritten(c: *Checker, target: Node, key: RefKey) Error!bool {
         if (key.len == 0) return false;
-        var k: u8 = 0;
-        while (k < key.len) : (k += 1) {
-            var pk: RefKey = .{ .sym = key.sym, .len = k };
-            var j: usize = 0;
-            while (j < k) : (j += 1) pk.path[j] = key.path[j];
-            if (try c.refMatches(target, pk)) return true;
+        var buf: [max_deep_ref_depth]PathElem = undefined;
+        const path = c.refPath(&key, &buf);
+        var k: usize = 0;
+        while (k < path.len) : (k += 1) {
+            if (try c.refMatchesPath(target, key.sym, path[0..k])) return true;
         }
         return false;
     }
