@@ -3883,7 +3883,21 @@ const Checker = struct {
     fn keyofType(c: *Checker, t: TypeId) Error!TypeId {
         const r = try c.resolveStructural(t);
         switch (c.ts.kind(r)) {
-            .any, .err => return c.makeUnion2(types.string_type, c.makeUnion2(types.number_type, types.symbol_type) catch unreachable),
+            .err => {
+                // A `.ref` that does not resolve to a structure is NOT the same
+                // thing as `any`: it is a reference we cannot read the key set of
+                // yet (a self-recursive alias whose body is still materializing
+                // resolves to `error` through `expandRef`'s cycle cut). Answering
+                // the full `string | number | symbol` domain bakes that answer
+                // into whatever composite is being built — react-hook-form's
+                // `Merge<A, B>` interned `keyof A & keyof B` as
+                // `("message"|…) & (string|number|symbol)`, so every key took the
+                // "in both" branch and `FieldErrors<T>[k]` came out with `unknown`
+                // members. Deferring keeps `keyof <ref>` reducible.
+                if (c.ts.kind(t) == .ref) return c.ts.makeKeyof(t);
+                return c.makeUnion2(types.string_type, c.makeUnion2(types.number_type, types.symbol_type) catch unreachable);
+            },
+            .any => return c.makeUnion2(types.string_type, c.makeUnion2(types.number_type, types.symbol_type) catch unreachable),
             .object => {
                 var parts: std.ArrayList(TypeId) = .empty;
                 defer parts.deinit(c.scratch());
