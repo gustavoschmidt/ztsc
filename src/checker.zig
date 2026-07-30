@@ -16102,7 +16102,23 @@ const Checker = struct {
             sig = try c.inferJsxTargs(sig, tps, e);
         }
         if (c.ts.fnParamCount(sig) == 0) return types.empty_object_type;
-        return c.ts.fnParam(sig, 0).ty;
+        // A props parameter that is OPTIONAL at the call site (`p?: Props`, or
+        // `{ a }: Props = {}` — the "usable with no props at all" component
+        // shape) carries `| undefined` in the signature, exactly as tsc's
+        // `getTypeOfParameter` adds it. tsc then folds that union through
+        // `intersectTypes(IntrinsicAttributes, props)`, whose `extractIrreducible`
+        // pulls the `undefined` back OUT of the intersection: the props target
+        // is `(IntrinsicAttributes & Props) | undefined`, and since a JSX
+        // attributes object is never `undefined`, every check lands on the
+        // object constituent. ztsc has no intersection step here, so strip the
+        // nullish constituents directly. Leaving them in made the target a
+        // UNION, which `checkJsxAttributes` treats as a lenient shape: the
+        // missing/excess checks were skipped outright, and `propOfType` on the
+        // union lost each prop's OPTIONAL flag, so passing a possibly-undefined
+        // value to an optional prop was rejected (TS2322).
+        const p0 = c.ts.fnParam(sig, 0).ty;
+        const stripped = try c.nonNullableNullish(p0);
+        return if (stripped == types.never_type) p0 else stripped;
     }
 
     /// Infer a generic component's type arguments from its JSX attributes,
