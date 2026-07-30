@@ -21729,6 +21729,16 @@ const Checker = struct {
                     try c.memberList(ra)
                 else
                     try c.scratch().dupe(TypeId, &.{ra});
+                // Scanned before any re-entry: `memberList` hands out a
+                // borrowed slice, and the pairing pass below can invalidate it.
+                var naked: TypeId = types.no_type;
+                var naked_n: usize = 0;
+                for (try c.memberList(param)) |pm| {
+                    if (s.kind(pm) != .type_param) continue;
+                    if (tpIndex(tp_syms, s.typeParamSymbol(pm)) == null) continue;
+                    naked = pm;
+                    naked_n += 1;
+                }
                 for (try c.memberList(param)) |pm| {
                     if (!try c.containsTypeParam(pm)) continue;
                     for (ams) |am| {
@@ -21736,6 +21746,29 @@ const Checker = struct {
                             try c.unify(pm, am, tp_syms, candidates, depth + 1);
                         }
                     }
+                }
+                // tsc's `inferToMultipleTypes` naked-type-variable rule: when
+                // the intersection parameter has EXACTLY ONE constituent that
+                // is a bare inference variable, the WHOLE source infers to it
+                // once the non-variable constituents have been inferred
+                // through. This is *not* the constituent pairing the helper
+                // above deliberately refuses — nothing gets swallowed, the
+                // variable simply receives the argument as written, which is
+                // the only reading available when the rest of the intersection
+                // is a decoration over that same variable.
+                //
+                // redux-toolkit's `createSlice({ reducers })` types its
+                // parameter as `ValidateSliceCaseReducers<S, ACR> = ACR &
+                // { [T in keyof ACR]: … }`. Neither constituent paired (a naked
+                // variable is no pair, and a mapped parameter never pairs with
+                // an object argument), so `CaseReducers` took no candidate at
+                // all and fell back to its `SliceCaseReducers<State>`
+                // constraint — whose `keyof` is `string`.
+                //
+                // tsc skips this path entirely when the source is a union
+                // (`inferFromTypes`' `!(source.flags & TypeFlags.Union)`).
+                if (naked_n == 1 and s.kind(arg) != .union_type) {
+                    try c.unify(naked, arg, tp_syms, candidates, depth + 1);
                 }
             },
             .mapped => try c.inferReverseMapped(param, arg, tp_syms, candidates, depth),
