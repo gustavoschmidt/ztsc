@@ -34,7 +34,7 @@
   It checks a large, well-defined subset of strict-mode TypeScript with diagnostics that match
   the TypeScript compiler, byte-identical at any parallelism. On
   <a href="benchmarks.html">excalidraw</a> — 333k lines of real application source — it reports
-  exactly the same findings as tsgo, 1.4× faster in 20% of the memory.</p>
+  exactly the same findings as tsgo.</p>
 
   <div class="ctas">
     <a class="btn primary" href="usage.html">Get started</a>
@@ -44,14 +44,14 @@
 
   <div class="stats">
     <div class="stat">
-      <div class="k">wall clock · @types/node</div>
-      <div class="v">15&thinsp;<small>ms</small></div>
-      <div class="c">tsgo 7.0.2 takes 47&thinsp;ms on the same 49.6k lines of declarations — and ztsc is faster on all eight benchmark packages, by up to 11×</div>
+      <div class="k">wall clock · excalidraw</div>
+      <div class="v">0.35&thinsp;<small>s</small></div>
+      <div class="c">tsgo 7.0.2 takes 0.50&thinsp;s on the same 333k lines of application source — and ztsc is faster on every benchmark, by up to 11× on the packages</div>
     </div>
     <div class="stat">
-      <div class="k">peak RSS · @types/node</div>
-      <div class="v">17&thinsp;<small>MB</small></div>
-      <div class="c">17% of tsgo (102&thinsp;MB); across eight real packages ztsc uses 4.8–16× less peak memory</div>
+      <div class="k">peak RSS · excalidraw</div>
+      <div class="v">130&thinsp;<small>MB</small></div>
+      <div class="c">20% of tsgo (649.5&thinsp;MB); across eight benchmark packages ztsc uses 4.8–16× less peak memory</div>
     </div>
     <div class="stat">
       <div class="k">dependencies</div>
@@ -70,14 +70,21 @@
 <section>
   <p class="eyebrow">benchmarks</p>
   <h2>Faster and smaller than tsgo — on every benchmark</h2>
-  <p>Eight real packages' published <code>.d.ts</code>, vendored at pinned versions, both tools
-  checking identical inputs at their default 4 checker instances on an Apple M4: ztsc's peak
-  memory is <strong>6–21% of tsgo's</strong> and its wall clock <strong>9–58%</strong> —
-  3.0–11× faster on everything bigger than the process floor.</p>
+  <p>The headline number is a whole application: on
+  <a href="https://github.com/excalidraw/excalidraw">excalidraw</a> — public, pinned, checked
+  with its <code>node_modules</code> — ztsc finishes in <strong>0.35&thinsp;s and
+  129.8&thinsp;MB</strong> against tsgo's 0.50&thinsp;s and 649.5&thinsp;MB, and reports
+  <strong>exactly the same 17 diagnostics as tsgo</strong>: same file, line, column and code,
+  at every checker count from 1 to 8. Behind it, eight real packages' published
+  <code>.d.ts</code>, vendored at pinned versions, exercise the type-level machinery: ztsc's
+  peak memory is <strong>6–21% of tsgo's</strong> and its wall clock <strong>9–58%</strong> —
+  3.0–11× faster on everything bigger than the process floor. All inputs identical, both tools
+  at their default 4 checker instances on an Apple M4.</p>
   <div class="tablewrap">
   <table>
-    <thead><tr><th>package</th><th class="num">wall ztsc / tsgo</th><th class="num">peak RSS ztsc / tsgo</th><th class="num">rss vs tsgo</th></tr></thead>
+    <thead><tr><th>input</th><th class="num">wall ztsc / tsgo</th><th class="num">peak RSS ztsc / tsgo</th><th class="num">rss vs tsgo</th></tr></thead>
     <tbody>
+      <tr><td>excalidraw 0.18.1 · 333k lines of application source + deps</td><td class="num">0.35 / 0.50 s</td><td class="num">129.8 / 649.5 MB</td><td class="num">20%</td></tr>
       <tr><td>@types/react 18.3.11 · 64.1k lines</td><td class="num">28 / 247 ms</td><td class="num">21.8 / 185.2 MB</td><td class="num">12%</td></tr>
       <tr><td>@types/node 22.7.4 · 49.6k lines</td><td class="num">15 / 47 ms</td><td class="num">16.9 / 101.7 MB</td><td class="num">17%</td></tr>
       <tr><td>drizzle-orm 0.33.0 · 12.6k lines</td><td class="num">22 / 238 ms</td><td class="num">17.3 / 275.7 MB</td><td class="num">6%</td></tr>
@@ -85,15 +92,10 @@
   </table>
   </div>
   <p>Declaration files exercise the type-level machinery; real application source exercises the
-  rest, and two whole applications are measured. On
-  <a href="https://github.com/excalidraw/excalidraw">excalidraw</a> — public and pinned, checked
-  with its <code>node_modules</code> — ztsc finishes in <strong>0.35&thinsp;s and
-  129.8&thinsp;MB</strong> against tsgo's 0.50&thinsp;s and 649.5&thinsp;MB, and reports
-  <strong>exactly the same 17 diagnostics as tsgo</strong>: same file, line, column and code, at
-  every checker count from 1 to 8. On a large private production React/TypeScript app — full
-  <code>.ts</code>/<code>.tsx</code>, frontend and backend — it finishes in
-  <strong>0.40&thinsp;s and 219.6&thinsp;MB</strong> against tsgo's 0.53&thinsp;s and
-  734&thinsp;MB, while reproducing all 48 of tsc's errors byte-identically.</p>
+  rest, and a second whole application is measured privately: a large production
+  React/TypeScript app — full <code>.ts</code>/<code>.tsx</code>, frontend and backend — where
+  ztsc finishes in <strong>0.40&thinsp;s and 219.6&thinsp;MB</strong> against tsgo's
+  0.53&thinsp;s and 734&thinsp;MB, while reproducing all 48 of tsc's errors byte-identically.</p>
   <p><a href="benchmarks.html">All eight packages, both application runs, methodology, and how to
   reproduce every number →</a></p>
 </section>
