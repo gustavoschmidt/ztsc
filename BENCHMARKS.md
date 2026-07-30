@@ -11,7 +11,7 @@ selects — es-core..esnext for most, plus the real DOM lib for the three packag
 that list `dom` (hono, zod, and `@types/react`), matching tsgo's target-esnext
 default. On the package corpus its diagnostic output still differs from tsgo's,
 so those rows are throughput and memory measurements on identical inputs, not a
-diagnostic-parity claim. (Correctness is tracked separately by a 909-case
+diagnostic-parity claim. (Correctness is tracked separately by a 917-case
 differential conformance suite validated against the TypeScript compiler — and
 on the excalidraw application row below, ztsc *does* reproduce tsgo's
 diagnostics exactly.) hono and zod check against the

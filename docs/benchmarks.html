@@ -51,7 +51,7 @@
     </div>
     <div class="stat">
       <div class="k">conformance</div>
-      <div class="v">909/909</div>
+      <div class="v">917/917</div>
       <div class="c">differential cases (error code + line) vs the native TypeScript compiler, tsgo 7.0.2</div>
     </div>
   </div>
@@ -85,7 +85,7 @@
   </ul>
   <p>The package matrix is not a diagnostic-parity claim: ztsc checks a
   <a href="limitations.html">measured subset</a> of TypeScript, so those are throughput and
-  memory comparisons on identical inputs. Correctness is tracked separately, by the 909-case
+  memory comparisons on identical inputs. Correctness is tracked separately, by the 917-case
   differential conformance suite, the excalidraw diagnostic convergence, and the dogfood
   error-for-error reproduction.</p>
 </section>
@@ -434,7 +434,7 @@ zig-out/bench/ztsc --pretty=false --checkers=4 -p "$C"   # wall: median of 11
     identical inputs — not a diagnostic-parity claim:</p>
     <p>ztsc checks a <em>subset</em> of TypeScript (against the real ES-core + DOM lib), so on
     the packages its diagnostic output differs from tsgo's; correctness is tracked separately by
-    the 909-case differential conformance suite, the excalidraw convergence gate (the same 17
+    the 917-case differential conformance suite, the excalidraw convergence gate (the same 17
     diagnostics as tsgo at every checker count — same file, line, column and code, though not
     the same message text), and the dogfood application's error-for-error reproduction.
     Packages are vendored without their dependencies — nonzero exit is expected,

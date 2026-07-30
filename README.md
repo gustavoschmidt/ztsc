@@ -18,7 +18,7 @@ TypeScript compiler, byte-identical at any parallelism.
   faster in 20% of the memory.
 - **0 dependencies** — the Zig source uses nothing but the Zig standard
   library; the binary needs nothing but your OS.
-- **909/909 conformance** — differential cases (error code + line) against the
+- **917/917 conformance** — differential cases (error code + line) against the
   native TypeScript compiler, tsgo 7.0.2.
 
 > [!WARNING]

@@ -43,7 +43,7 @@
   generics, narrowing, declaration merging), the real ES-core…esnext + DOM standard library
   with the full iteration protocol, CommonJS interop, instantiation expressions, const-symbol
   computed keys, and JSX against the real <code>@types/react</code>. What it checks, it checks
-  like the TypeScript compiler — enforced by a 909-case differential conformance suite
+  like the TypeScript compiler — enforced by a 917-case differential conformance suite
   validated against the pinned native tsgo 7.0.2, down to error codes and lines.</p>
   <p>Everything outside the subset is bounded by three guarantees:</p>
   <ul>
@@ -164,7 +164,7 @@
     <li><strong>Class-value instantiation expressions</strong> — <code>typeof C&lt;T&gt;</code>
     applied to a class value under-reports.</li>
     <li>Other known edge cases miss an error the TypeScript compiler would report; the
-    conformance suite's <code>DEFERRED</code> ledger tracks <strong>33 accepted
+    conformance suite's <code>DEFERRED</code> ledger tracks <strong>34 accepted
     divergences</strong> explicitly — with a written justification each — rather than hiding
     them in the goldens, and the runner fails a case whose entry stops describing reality, so
     the ledger cannot be used to mask a regression. Every one is an <em>under</em>-report.
