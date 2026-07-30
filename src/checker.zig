@@ -22412,9 +22412,16 @@ const Checker = struct {
     /// therefore `RefQ`'s size, is unchanged. Paths deeper than this are still
     /// not tracked (sound under-narrowing = the reference keeps its declared
     /// type). tsc keys flow references by AST node identity and has no such
-    /// cap at all; five links covers the guard shapes real code writes
-    /// (`this.state.a.b.c.d`) without widening the hot key.
-    const max_deep_ref_depth = 5;
+    /// cap at all, and real code does reach past five links once element
+    /// accesses count as links: a GeoServer legend guard walks
+    /// `data?.Legend?.[0].rules?.[0]?.symbolizers?.[0]?.Raster?.colormap?.entries`
+    /// — nine links — and every reference on that spine has to narrow. The cap
+    /// only sizes `DeepPath`, the side-table entry an over-deep path interns
+    /// into; the inline `RefKey`/`RefQ` layout is fixed by `max_ref_depth` and
+    /// does not move, so raising it costs 16 bytes per distinct over-deep path
+    /// and nothing per flow-cache slot. Measured on the dogfood app, 5 vs 9 is
+    /// indistinguishable in wall clock and peak RSS.
+    const max_deep_ref_depth = 9;
 
     /// One link in a reference path: a dotted member (`.p`), a constant element
     /// access (`[0]`), or an element access through a *stable identifier* index
