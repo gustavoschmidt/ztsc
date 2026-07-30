@@ -940,6 +940,13 @@ const Checker = struct {
     /// reverse-mapped one outright and a reverse-mapped one arriving second is
     /// discarded. Shares `contra_owner`'s identity check.
     rev_flags: []bool = &.{},
+    /// Non-zero while `unify` is running *inside* a homomorphic-mapped-parameter
+    /// inference (the alias-identity pairing in `inferReverseMapped`), so the
+    /// candidates it records carry the same `InferencePriority.
+    /// HomomorphicMappedType` the reverse-mapped rebuild they replace does: they
+    /// stand down for a direct structural match and are discarded when one
+    /// already answered.
+    rev_prio: u32 = 0,
     /// Nesting depth inside `unify` below a non-top-level constructor. Unions
     /// and intersections preserve top-level-ness (tsc's
     /// `isTypeParameterAtTopLevel` descends them); everything else does not.
@@ -6895,7 +6902,12 @@ const Checker = struct {
     /// route-divergent instantiations must relate by origin). Unions/primitives
     /// are compared by their own rules and are never tagged.
     fn originTaggable(k: types.Kind) bool {
-        return k == .object or k == .function or k == .intersection;
+        // `.mapped` is tagged too: a still-generic alias instantiation
+        // (`WeakValidationMap<P>` with `P` free) never materializes into an
+        // object, and inference needs its alias identity to pair with a
+        // concrete `WeakValidationMap<X>` argument — tsc's same-alias rule (see
+        // `inferReverseMapped`).
+        return k == .object or k == .function or k == .intersection or k == .mapped;
     }
 
     /// Bound on nested eager expansion of a recursive alias reached through a
@@ -9559,7 +9571,16 @@ const Checker = struct {
                 const val = try c.instantiateId(s.mappedValue(t), map, map_id);
                 const as_c = if (s.mappedAs(t) != 0) try c.instantiateId(s.mappedAs(t), map, map_id) else 0;
                 const src = if (s.mappedSource(t) != 0) try c.instantiateId(s.mappedSource(t), map, map_id) else 0;
-                break :blk try c.reduceMapped(kp, con, val, as_c, src, s.mappedFlags(t));
+                const red = try c.reduceMapped(kp, con, val, as_c, src, s.mappedFlags(t));
+                // Same origin propagation as the `.object` arm: a mapped alias
+                // instantiation reached through a generic interface's member
+                // (`interface C<P> { propTypes?: WeakValidationMap<P> }`) is
+                // re-instantiated at every use, and inference pairs the two
+                // sides by alias identity (see `inferReverseMapped`).
+                if (c.origin.get(t)) |orig_ref| {
+                    if (red != t and originTaggable(c.ts.kind(red))) try c.tagInstantiatedOrigin(red, orig_ref, map, map_id);
+                }
+                break :blk red;
             },
             .template_literal_type => blk: {
                 var holes: std.ArrayList(TypeId) = .empty;
@@ -20298,12 +20319,14 @@ const Checker = struct {
         const saved_contra_pos = c.contra_pos;
         const saved_top_flags = c.top_flags;
         const saved_rev_flags = c.rev_flags;
+        const saved_rev_prio = c.rev_prio;
         const saved_nontop_depth = c.nontop_depth;
         c.contra_cands = contra;
         c.contra_owner = candidates.ptr;
         c.contra_pos = 0;
         c.top_flags = top_flags;
         c.rev_flags = rev_flags;
+        c.rev_prio = 0;
         c.nontop_depth = 0;
         defer {
             c.contra_cands = saved_contra_cands;
@@ -20311,6 +20334,7 @@ const Checker = struct {
             c.contra_pos = saved_contra_pos;
             c.top_flags = saved_top_flags;
             c.rev_flags = saved_rev_flags;
+            c.rev_prio = saved_rev_prio;
             c.nontop_depth = saved_nontop_depth;
         }
 
@@ -21028,9 +21052,15 @@ const Checker = struct {
                     // A DIRECT structural match outranks a reverse-mapped one
                     // (tsc keeps only the best-priority candidates), so an
                     // incumbent that came solely from a `Partial<T>`-shaped
-                    // parameter is dropped rather than combined.
+                    // parameter is dropped rather than combined — and,
+                    // symmetrically, evidence recorded from INSIDE a
+                    // homomorphic-mapped parameter stands down for a direct
+                    // incumbent.
                     if (c.revSlot(candidates, i)) |rf| {
-                        if (rf.*) {
+                        if (c.rev_prio > 0) {
+                            if (candidates[i] != types.no_type and !rf.*) return;
+                            rf.* = true;
+                        } else if (rf.*) {
                             rf.* = false;
                             candidates[i] = types.no_type;
                         }
@@ -21869,6 +21899,43 @@ const Checker = struct {
     /// param would otherwise stay unbound.
     fn inferReverseMapped(c: *Checker, m: TypeId, arg: TypeId, tp_syms: []const u32, candidates: []TypeId, depth: u32) Error!void {
         const s = &c.ts;
+        // Same generic ALIAS on both sides (tsc's `inferFromTypes`: "source and
+        // target are types originating in the same generic type alias
+        // declaration — simply infer from source type arguments to target type
+        // arguments"). It sits ABOVE the reverse-mapping rule in tsc for a
+        // reason: rebuilding `P` out of `WeakValidationMap<P>`'s members is a
+        // strictly worse answer than reading it off the alias, and the rebuild
+        // loses whatever the template could not invert. `FunctionComponent<P>`'s
+        // `propTypes?: WeakValidationMap<P>` against a `ProviderExoticComponent`
+        // argument's `propTypes?: WeakValidationMap<ProviderProps<T>>` inferred
+        // a rebuilt `{ children: …; value: … }` with every property REQUIRED
+        // (the map adds `?`, so the inversion drops it), and that covariant
+        // candidate then beat the call signature's contravariant `ProviderProps<T>`
+        // — `React.createElement(Ctx.Provider, { value })` became TS2769.
+        if (c.origin.get(m)) |po| {
+            if (s.kind(po) == .ref) {
+                const ao_opt = c.origin.get(arg) orelse c.origin.get(try c.resolveStructural(arg));
+                if (ao_opt) |ao| {
+                    if (s.kind(ao) == .ref and s.refSymbol(ao) == s.refSymbol(po)) {
+                        const pa = try c.scratch().dupe(TypeId, s.refArgs(po));
+                        defer c.scratch().free(pa);
+                        const aa = try c.scratch().dupe(TypeId, s.refArgs(ao));
+                        defer c.scratch().free(aa);
+                        const n = @min(pa.len, aa.len);
+                        // Same priority as the rebuild this replaces: a DIRECT
+                        // structural match elsewhere in the call still wins
+                        // (`inference/084`, where `calculate(prev, next,
+                        // postProcess)` must answer the `S` its first two
+                        // arguments supply, not the `Observed` that
+                        // `postProcess`'s erased `Partial<Observed>` names).
+                        c.rev_prio += 1;
+                        defer c.rev_prio -= 1;
+                        for (0..n) |i| try c.unify(pa[i], aa[i], tp_syms, candidates, depth + 1);
+                        return;
+                    }
+                }
+            }
+        }
         if (s.mappedAs(m) != 0) return; // no key remap
         // `{ [P in K]: … }` with `K` itself an inference target (`Pick<S, K>`):
         // the key set is what the argument tells us. Handled separately below.
