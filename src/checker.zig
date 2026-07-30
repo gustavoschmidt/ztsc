@@ -283,6 +283,13 @@ const max_instantiation_depth = 100;
 /// 4,161, typebox 15,400, ajv 21,201. 250,000 is an order of magnitude above
 /// the worst of those and two orders below the runaway, and it bounds a
 /// pathological statement to tens of megabytes instead of hundreds.
+///
+/// The element the budget is scoped to is the statement *or* the cross-file
+/// declaration materialization a statement demands, whichever frame the work
+/// is really being done for: `enterSymFile` opens a fresh budget and
+/// `restoreCtx` closes it. Without that split the budget is spent on work
+/// whose assignment to a statement is a function of `--checkers=N`, and the
+/// cap becomes a partition-dependent decision variable — see `enterSymFile`.
 const max_instantiation_count = 250_000;
 /// How many times one type may re-enter the *live* `instantiateId` chain
 /// before the expansion is treated as a non-terminating recursive-alias cycle
@@ -1273,19 +1280,21 @@ const Checker = struct {
         c.cur_flow_base = c.flow_base[f];
     }
 
-    /// The ambient `this` travels with the file/scope context: a lazy demand
-    /// that crosses into another file must not carry the demanding frame's
-    /// `this` with it (see `enterSymFile`).
-    const SavedCtx = struct { file: FileId, scope: ScopeId, this_type: TypeId };
+    /// The ambient `this` *and* the instantiation budget travel with the
+    /// file/scope context: a lazy demand that crosses into another file must
+    /// not carry the demanding frame's `this` — nor spend the demanding
+    /// frame's budget — with it (see `enterSymFile`).
+    const SavedCtx = struct { file: FileId, scope: ScopeId, this_type: TypeId, inst_count: u64 };
 
     fn saveCtx(c: *const Checker) SavedCtx {
-        return .{ .file = c.cur_file, .scope = c.cur_scope, .this_type = c.this_type };
+        return .{ .file = c.cur_file, .scope = c.cur_scope, .this_type = c.this_type, .inst_count = c.inst_count };
     }
 
     fn restoreCtx(c: *Checker, s: SavedCtx) void {
         if (s.file != c.cur_file) c.setFile(s.file);
         c.cur_scope = s.scope;
         c.this_type = s.this_type;
+        c.inst_count = s.inst_count;
     }
 
     /// Switch to `sym`'s file (scope untouched; callers set it).
@@ -1299,12 +1308,34 @@ const Checker = struct {
     /// function of the file partition (`--checkers=N`) rather than of the
     /// program. Class-member resolvers set `this_type` *after* this call, so
     /// they are unaffected; `restoreCtx` puts the caller's `this` back.
+    ///
+    /// Crossing a file boundary opens a fresh instantiation budget
+    /// (`max_instantiation_count`) for the same reason and with the same
+    /// force. The budget is scoped to a source element — but materializing
+    /// *another file's* declaration is not work the demanding element asked
+    /// for, it is work the declaration costs, and which element pays it is
+    /// whichever one reaches the declaration first with a cold cache. That
+    /// order is a function of the partition: at `--checkers=8` the files that
+    /// import a heavy library are spread over eight instances, and each
+    /// instance re-materializes the library starting from whichever of its own
+    /// files gets there first. On one app a single statement was charged
+    /// 469,012 node visits for a component library's declarations, tripped the
+    /// budget, and truncated that library's types to `error_type` — and a
+    /// different file was the one to pay at every checker count, so the TS2589
+    /// sites and the ~70-diagnostic cascade under them moved with `N`.
+    /// Charging the declaration's own frame instead makes the answer a
+    /// function of the program. The budget still bounds every single
+    /// materialization — a runaway alias trips inside its own frame and is cut
+    /// there, which is also where the truncation belongs — but no source
+    /// element can be poisoned by the cost of a declaration it merely
+    /// referenced.
     fn enterSymFile(c: *Checker, sym: SymbolId) SavedCtx {
         const saved = c.saveCtx();
         const f = c.symFile(sym);
         if (f != c.cur_file) {
             c.setFile(f);
             c.this_type = 0;
+            c.inst_count = 0;
         }
         return saved;
     }
