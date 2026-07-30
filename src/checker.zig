@@ -21300,21 +21300,36 @@ const Checker = struct {
                     }
                     const pidx = s.objectStringIndex(param);
                     if (pidx != 0) {
+                        // Reverse index-signature inference (tsc's
+                        // `inferFromIndexTypes`): a target string index
+                        // `{ [s: string]: T }` — the `Object.values`/`entries`
+                        // parameter — infers `T` from a named-property source
+                        // (`{ x: {...} }`), since the source has no index
+                        // signature to pair with. Without it
+                        // `Object.values({x:{s:1}})` leaves `T` unbound and the
+                        // result collapses to `unknown[]`.
+                        //
+                        // tsc collects EVERY applicable source member — each
+                        // string-keyed property plus the source's own string
+                        // index — and infers their UNION as ONE candidate.
+                        // Feeding them one at a time instead made each its own
+                        // candidate, and the covariant fold
+                        // (`getCommonSupertype`) then keeps only the leftmost of
+                        // any two with unrelated bases: `Object.entries({a:
+                        // string, b: number})` inferred `string`, the argument
+                        // stopped fitting, and the call fell to the
+                        // `entries(o: {}): [string, any][]` overload.
+                        var parts: std.ArrayList(TypeId) = .empty;
+                        defer parts.deinit(c.scratch());
+                        for (0..s.objectPropCount(ra)) |i| {
+                            try parts.append(c.scratch(), s.objectProp(ra, @intCast(i)).ty);
+                        }
                         if (s.objectStringIndex(ra) != 0) {
-                            try c.unify(pidx, s.objectStringIndex(ra), tp_syms, candidates, depth + 1);
-                        } else {
-                            // Reverse index-signature inference (tsc's
-                            // `inferFromIndexTypes`): a target string index
-                            // `{ [s: string]: T }` — the `Object.values`/`entries`
-                            // parameter — infers `T` from a named-property source
-                            // (`{ x: {...} }`) by matching each own property's type,
-                            // since the source has no index signature to pair with.
-                            // Without it `Object.values({x:{s:1}})` leaves `T`
-                            // unbound and the result collapses to `unknown[]`.
-                            for (0..s.objectPropCount(ra)) |i| {
-                                const ap = s.objectProp(ra, @intCast(i));
-                                try c.unify(pidx, ap.ty, tp_syms, candidates, depth + 1);
-                            }
+                            try parts.append(c.scratch(), s.objectStringIndex(ra));
+                        }
+                        if (parts.items.len != 0) {
+                            const one = try s.makeUnion(c.scratch(), parts.items);
+                            try c.unify(pidx, one, tp_syms, candidates, depth + 1);
                         }
                     }
                     if (s.objectNumberIndex(param) != 0 and s.objectNumberIndex(ra) != 0) {
@@ -21424,6 +21439,29 @@ const Checker = struct {
                     // widened primitive.
                     if (try c.discriminatedConstituent(param, ra)) |m| {
                         try c.unify(param, m, tp_syms, candidates, depth + 1);
+                        return;
+                    }
+                    // An INDEX-SHAPED param (`{ [s: string]: T }` and nothing
+                    // else — the `Object.entries`/`Object.values`/`Object.keys`
+                    // parameter) has no property to pair by name, no origin and
+                    // no discriminant, so the constituents are the only
+                    // inference sites there are. Here tsc's plain union-source
+                    // rule applies: `inferFromTypes` recurses constituent by
+                    // constituent, each contributing ONE candidate (its own
+                    // members' union, above), and `getCommonSupertype` folds
+                    // them — keeping the LEFTMOST of two with unrelated bases,
+                    // which is what makes the call fall to the
+                    // `entries(o: {}): [string, any][]` overload for a union
+                    // whose constituents disagree. Leaving `T` unbound instead
+                    // silently selected the generic overload with `T = unknown`,
+                    // and a callback annotated with the real element type was
+                    // then rejected against `[string, unknown]`.
+                    if (s.objectPropCount(param) == 0 and s.objectCallSigCount(param) == 0 and
+                        s.objectConstructSigCount(param) == 0 and s.objectStringIndex(param) != 0)
+                    {
+                        const ms = try c.scratch().dupe(TypeId, try c.memberList(ra));
+                        defer c.scratch().free(ms);
+                        for (ms) |m| try c.unify(param, m, tp_syms, candidates, depth + 1);
                     }
                     return;
                 }
