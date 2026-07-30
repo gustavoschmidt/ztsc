@@ -10750,7 +10750,19 @@ const Checker = struct {
         // read as required (spurious TS2739/TS2741).
         var mod_src: TypeId = 0;
         if (s.kind(value) == .index_access and s.kind(s.indexAccessIndex(value)) == .mapped_param) {
-            const o = try c.resolveStructural(s.indexAccessObj(value));
+            var o = try c.resolveStructural(s.indexAccessObj(value));
+            // tsc reads the modifiers type through `getApparentType`, so a still
+            // GENERIC `T` answers from its constraint. That is the `Pick<T,
+            // keyof Base>` written inside `<T extends Required<Omit<Base, "k">> &
+            // { k?: … }>`: the key set is concrete (`keyof Base`) so the map
+            // materializes, but the modifiers type is the bare type parameter and
+            // failed the composite gate below — every picked prop read as
+            // required, including the one the constraint declares optional
+            // (spurious TS2741).
+            if (s.kind(o) == .type_param) {
+                const bc = try c.transitiveBaseConstraint(o);
+                if (bc != o) o = try c.resolveStructural(bc);
+            }
             // The modifiers type may be an object, an intersection of objects,
             // or a union of those (`Omit<Partial<Base> & (A|B|C), K>` —
             // react-hook-form `RegisterOptions` — whose intersection distributes
