@@ -43,7 +43,7 @@
   generics, narrowing, declaration merging), the real ES-core…esnext + DOM standard library
   with the full iteration protocol, CommonJS interop, instantiation expressions, const-symbol
   computed keys, and JSX against the real <code>@types/react</code>. What it checks, it checks
-  like the TypeScript compiler — enforced by a 630-case differential conformance suite
+  like the TypeScript compiler — enforced by a 909-case differential conformance suite
   validated against the pinned native tsgo 7.0.2, down to error codes and lines.</p>
   <p>Everything outside the subset is bounded by three guarantees:</p>
   <ul>
@@ -57,8 +57,12 @@
     frequency table of exactly which unsupported constructs your codebase contains, so "is my
     project in the subset?" is one command, not a guess.</li>
   </ul>
-  <p>How close is it to a drop-in <code>tsc --noEmit</code>? On the standing dogfood target — a
-  large production React/TypeScript application — ztsc reproduces <strong>all 48 of tsc's errors
+  <p>How close is it to a drop-in <code>tsc --noEmit</code>? Measured on two whole applications.
+  On <strong><a href="https://github.com/excalidraw/excalidraw">excalidraw</a></strong> — public,
+  pinned, checked with its <code>node_modules</code> — ztsc reports <strong>exactly the same 17
+  diagnostics as tsgo 7.0.2</strong>, same file, line, column and code, at every checker count
+  from 1 to 8: nothing extra, nothing missing. On the standing private dogfood target, a large
+  production React/TypeScript application, it reproduces <strong>all 48 of tsc's errors
   byte-identically</strong> and adds <strong>10 false positives</strong> of its own. Close, and
   measured, but not there yet.</p>
 </section>
@@ -97,11 +101,22 @@
 <!-- ============================================================ -->
 <section>
   <p class="eyebrow"><span class="n">03</span> · false positives</p>
-  <h2>The ten, on the record</h2>
-  <p>The number that matters most for trust is not estimated — it is measured continuously
-  against tsc 5.9.3 on a large production codebase. The current count is <strong>10 false
-  positives</strong>, each with a root-cause diagnosis; closing them is active work. They
-  cluster into three shapes:</p>
+  <h2>Zero on the public app, ten on the private one</h2>
+  <p>The number that matters most for trust is not estimated — it is measured continuously on
+  real applications, against two independent truth sets.</p>
+  <p>On <strong><a href="https://github.com/excalidraw/excalidraw">excalidraw</a></strong> — the
+  public, pinned application benchmark, checked whole with its <code>node_modules</code> — the
+  count is <strong>zero</strong>. ztsc reports exactly the same 17 diagnostics as tsgo 7.0.2:
+  the same file, line, column and code for every one, no diagnostic tsgo does not also report,
+  and none of tsgo's missing — at every checker count from 1 to 8. That is a standing gate
+  (<code>bench/convergence.sh</code>), with the false-positive and under-report ceilings both
+  pinned at zero, so a regression fails the build rather than being noticed later. The message
+  <em>text</em> still differs from tsgo's in places, so this is a same-findings result, not a
+  byte-identical-output one.</p>
+  <p>On the private dogfood target — a large production React/TypeScript codebase, scored
+  against tsc 5.9.3 — the current count is <strong>10 false positives</strong>, each with a
+  root-cause diagnosis; closing them is active work. None of the ten reproduce on excalidraw.
+  They cluster into three shapes:</p>
   <ul>
     <li><strong>Deep generic inference</strong> — immer's <code>Draft&lt;S&gt;</code> under a
     reducer spread (three interacting mechanisms: method bivariance, spread dropping index
@@ -148,9 +163,20 @@
     reports TS2769.</li>
     <li><strong>Class-value instantiation expressions</strong> — <code>typeof C&lt;T&gt;</code>
     applied to a class value under-reports.</li>
-    <li>A handful of other known edge cases miss an error the TypeScript compiler would
-    report; the conformance suite's <code>DEFERRED</code> ledger tracks 6 accepted divergences
-    explicitly rather than hiding them in the goldens.</li>
+    <li>Other known edge cases miss an error the TypeScript compiler would report; the
+    conformance suite's <code>DEFERRED</code> ledger tracks <strong>33 accepted
+    divergences</strong> explicitly — with a written justification each — rather than hiding
+    them in the goldens, and the runner fails a case whose entry stops describing reality, so
+    the ledger cannot be used to mask a regression. Every one is an <em>under</em>-report.
+    Whole checks that are simply not implemented: <strong>TS2417</strong> (class static side
+    incorrectly extends base static side), <strong>TS2578</strong> (unused
+    <code>@ts-expect-error</code> — only sound on a checker that reports everything the oracle
+    does), <strong>TS2536</strong> (key cannot be used to index), and the circularity family
+    <strong>TS2502 / TS7022 / TS7023 / TS2729</strong>, where the re-entry is detected and cut
+    but the cut is silent. The rest are deliberate trades where the stricter rule was measured
+    to cost false positives on correct code — most numerously
+    <strong>TS2589</strong> at the recursion cap and <strong>TS2322</strong> on the
+    conditional-target and callback-variance rules.</li>
   </ul>
   <div class="note">
     <p><strong>Check your own codebase in one command.</strong> <code>ztsc --census</code>

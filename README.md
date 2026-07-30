@@ -15,7 +15,7 @@ TypeScript compiler, byte-identical at any parallelism.
   app; wall clock, defaults vs. defaults.
 - **0 dependencies** — the Zig source uses nothing but the Zig standard
   library; the binary needs nothing but your OS.
-- **630/630 conformance** — differential cases (error code + line) against the
+- **909/909 conformance** — differential cases (error code + line) against the
   native TypeScript compiler, tsgo 7.0.2.
 
 > [!WARNING]
@@ -38,14 +38,19 @@ faster on everything bigger than the process floor.
 </picture>
 
 Declaration files exercise the type-level machinery; real application source
-exercises the rest. On a large production React/TypeScript app — full
-`.ts`/`.tsx`, frontend and backend — ztsc finishes in **0.40 s and 219.6 MB**
+exercises the rest, and two whole applications are measured. On
+[excalidraw](https://github.com/excalidraw/excalidraw) — public and pinned,
+checked with its `node_modules` — ztsc finishes in **0.35 s and 129.8 MB**
+against tsgo's 0.50 s and 649.5 MB, and reports **exactly the same 17
+diagnostics as tsgo**: same file, line, column and code, at every checker count
+from 1 to 8. On a large private production React/TypeScript app — full
+`.ts`/`.tsx`, frontend and backend — it finishes in **0.40 s and 219.6 MB**
 against tsgo's 0.53 s and 734 MB, while reproducing all 48 of tsc's errors
 byte-identically.
 
-All eight packages, the application run, methodology, and how to reproduce
-every number: [BENCHMARKS.md](BENCHMARKS.md) · [benchmarks
-page](https://gustavoschmidt.github.io/ztsc/benchmarks.html).
+All eight packages, both application runs, methodology, and how to reproduce
+every number — including the exact excalidraw recipe: [BENCHMARKS.md](BENCHMARKS.md)
+· [benchmarks page](https://gustavoschmidt.github.io/ztsc/benchmarks.html).
 
 ## Getting started
 
@@ -117,10 +122,11 @@ parallelism: [internals page](https://gustavoschmidt.github.io/ztsc/internals.ht
 well-defined subset of strict-mode TypeScript — watch mode, an LSP, and
 Windows are the biggest gaps, all planned. Unsupported syntax produces a clear
 "not supported" diagnostic, never a crash, and known gaps *under-report*
-rather than inventing errors on valid code: on the production dogfood app it
-reproduces all 48 of tsc's errors byte-identically and adds 10 tracked false
-positives. `ztsc --census` tells you in one command exactly which unsupported
-constructs your own project contains.
+rather than inventing errors on valid code: on excalidraw it reports exactly
+the same 17 diagnostics as tsgo with no false positives at all, and on the
+private production dogfood app it reproduces all 48 of tsc's errors
+byte-identically and adds 10 tracked false positives. `ztsc --census` tells you
+in one command exactly which unsupported constructs your own project contains.
 
 On Windows specifically, ztsc does not build or run yet: the checker's
 per-symbol state lives in demand-zeroed anonymous memory obtained with POSIX

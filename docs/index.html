@@ -58,7 +58,7 @@
     </div>
     <div class="stat">
       <div class="k">conformance</div>
-      <div class="v">630/630</div>
+      <div class="v">909/909</div>
       <div class="c">differential cases (error code + line) vs the native TypeScript compiler, tsgo 7.0.2</div>
     </div>
   </div>
@@ -83,11 +83,16 @@
   </table>
   </div>
   <p>Declaration files exercise the type-level machinery; real application source exercises the
-  rest. On a large production React/TypeScript app — full <code>.ts</code>/<code>.tsx</code>,
-  frontend and backend — ztsc finishes in <strong>0.40&thinsp;s and 219.6&thinsp;MB</strong>
-  against tsgo's 0.53&thinsp;s and 734&thinsp;MB, while reproducing all 48 of tsc's errors
-  byte-identically.</p>
-  <p><a href="benchmarks.html">All eight packages, the application run, methodology, and how to
+  rest, and two whole applications are measured. On
+  <a href="https://github.com/excalidraw/excalidraw">excalidraw</a> — public and pinned, checked
+  with its <code>node_modules</code> — ztsc finishes in <strong>0.35&thinsp;s and
+  129.8&thinsp;MB</strong> against tsgo's 0.50&thinsp;s and 649.5&thinsp;MB, and reports
+  <strong>exactly the same 17 diagnostics as tsgo</strong>: same file, line, column and code, at
+  every checker count from 1 to 8. On a large private production React/TypeScript app — full
+  <code>.ts</code>/<code>.tsx</code>, frontend and backend — it finishes in
+  <strong>0.40&thinsp;s and 219.6&thinsp;MB</strong> against tsgo's 0.53&thinsp;s and
+  734&thinsp;MB, while reproducing all 48 of tsc's errors byte-identically.</p>
+  <p><a href="benchmarks.html">All eight packages, both application runs, methodology, and how to
   reproduce every number →</a></p>
 </section>
 
@@ -156,9 +161,10 @@ ztsc src/main.ts           # or explicit entry files</code></pre>
   well-defined subset of strict-mode TypeScript — watch mode, an LSP, and Windows are the
   biggest gaps, all planned. Unsupported syntax produces a clear "not supported" diagnostic,
   never a crash, and known gaps <em>under-report</em> rather than inventing errors on valid
-  code: on the production dogfood app it reproduces all 48 of tsc's errors byte-identically
-  and adds 10 tracked false positives. <code>ztsc --census</code> tells you in one command
-  exactly which unsupported constructs your own project contains.</p>
+  code: on excalidraw it reports exactly the same 17 diagnostics as tsgo with no false positives
+  at all, and on the private production dogfood app it reproduces all 48 of tsc's errors
+  byte-identically and adds 10 tracked false positives. <code>ztsc --census</code> tells you in
+  one command exactly which unsupported constructs your own project contains.</p>
   <p><a href="limitations.html">The full list: every gap, how it behaves today, and what's
   planned →</a></p>
 </section>
