@@ -1,16 +1,19 @@
 # ZTSC — Benchmarks
 
 Wall clock and peak memory for **ztsc vs tsgo** (the native TypeScript 7
-compiler), checking real, published packages on identical inputs. Measured
-2026-07-26 on an Apple M4, ztsc at commit 374d2c2.
+compiler), checking real, published packages and real applications on identical
+inputs. Package matrix measured 2026-07-26 on an Apple M4 with ztsc at commit
+374d2c2; the excalidraw application row 2026-07-30, same machine.
 
 ztsc checks a subset of TypeScript, against the lib each package's tsconfig
 selects — es-core..esnext for most, plus the real DOM lib for the three packages
 that list `dom` (hono, zod, and `@types/react`), matching tsgo's target-esnext
-default. Its diagnostic output still differs from tsgo's on real code — these are
-throughput and memory measurements on identical inputs, not a diagnostic-parity
-claim (correctness is tracked separately by a differential conformance suite
-validated against the TypeScript compiler). hono and zod check against the
+default. On the package corpus its diagnostic output still differs from tsgo's,
+so those rows are throughput and memory measurements on identical inputs, not a
+diagnostic-parity claim. (Correctness is tracked separately by a 909-case
+differential conformance suite validated against the TypeScript compiler — and
+on the excalidraw application row below, ztsc *does* reproduce tsgo's
+diagnostics exactly.) hono and zod check against the
 2.35 MB DOM lib, so their memory and wall clock sit higher than their line counts
 alone suggest — that added front end is why their rows land where they do.
 Packages are vendored without their dependencies; both tools fully parse, bind,
@@ -90,16 +93,53 @@ its 76 diagnostics. The bug is fixed (commit 374d2c2) and the numbers above are
 the first honest measurement of that package at the default — understated before,
 because a crashed run stops paying for work it never did.
 
-### Beyond the packages
+### Beyond the packages: whole applications
 
-The same defaults on a large production React/TypeScript application — a whole
-app graph rather than a single package's `.d.ts` — put ztsc at **0.40 s and
-219.6 MB against tsgo's 0.53 s and 734 MB**, both at their default 4 checkers:
-faster than tsgo on the largest corpus measured, at 30% of its peak memory. That
-codebase is private, so the run is not reproducible from this repository; it is
-reported because it is the only measurement here taken on a full application,
-where ztsc's diagnostics are also compared against `tsc` (see the README's
-limitations).
+Two applications are measured — a whole app graph rather than a single package's
+`.d.ts`. Both tools at their default 4 checkers:
+
+| application | wall ztsc / tsgo | peak RSS ztsc / tsgo | rss vs tsgo | diagnostics |
+|---|---:|---:|---:|---|
+| **excalidraw** 0.18.1 (`a2ec2889`) — public | 0.355 / 0.502 s | 129.8 / 649.5 MB | 20% | the same 17 as tsgo, at every checker count |
+| production React/TS app — private | 0.40 / 0.53 s | 219.6 / 734 MB | 30% | all 48 of tsc's errors byte-identical, + 10 tracked false positives |
+
+**excalidraw** is the public, reproducible row, measured 2026-07-30. ztsc loads
+1,110 files / 332,794 lines (537 of them the project's own source; the rest are
+the dependency `.d.ts` closure and the standard library) and checks them
+**1.4× faster at 20% of tsgo's peak memory**.
+
+Unlike the package matrix, this row *is* a diagnostic claim. ztsc reports
+exactly the same 17 diagnostics as tsgo — the same (file, line, column, code)
+for every one, zero excess and zero under-reports — and the same set at every
+checker count from 1 to 8. It is *not* byte-identical output: the message text
+differs in places (tsgo prints `Uint8Array<ArrayBufferLike>` where ztsc expands
+the union, and `BlobPart` where ztsc names its constituents). The property is
+held by `bench/convergence.sh`, a standing gate whose false-positive and
+under-report ceilings both sit at zero.
+
+For context on what the 17 are: excalidraw's own pinned `tsc` 4.9.4 reports
+**zero errors** on this tree. All 17 come from TypeScript 7's newer lib
+definitions — nine from the `Uint8Array`/`ArrayBuffer` generic parameters added
+since 4.9, six implicit-`any` reports in one file behind a dependency whose types
+no longer resolve under its package `exports` map, and two ordinary findings.
+They are real findings under tsgo's libs, and ztsc agrees with tsgo on all of
+them.
+
+**The config caveat.** TypeScript 7 removed `moduleResolution: "node10"` and
+`baseUrl`, so tsgo cannot read excalidraw's real `tsconfig.json` at all — it
+stops at two config errors (TS5108, TS5102) having checked nothing. The row
+therefore uses `tsconfig.tsgo.json`, a minimal adjustment of the real config
+that both tools accept: `"moduleResolution": "bundler"` instead of `"node"`,
+and `baseUrl` dropped (the `paths` entries are already explicit relative paths,
+so nothing else changes). ztsc reads *both* files, and its diagnostic set is
+identical under either — the same 17 keys, and the same 1,110 files / 332,794
+lines loaded — so the adjustment changes what tsgo can run, not what is being
+measured.
+
+The **private** row is the standing dogfood target, measured 2026-07-26 and
+scored against `tsc` 5.9.3. That codebase is private, so the run is not
+reproducible from this repository; excalidraw above is its public counterpart.
+None of its 10 false positives reproduce on excalidraw.
 
 ### Scaling with `--checkers`
 
@@ -160,7 +200,14 @@ TypeScript compiler, invoked directly (no Node host in the measurement).
 via `npm pack` at the pinned versions above, and writes a benchmark
 `tsconfig.json` (`noEmit`, `strict`, `target: esnext`) into each so both tools
 check identical inputs through `-p <dir>`. The corpus is gitignored; regenerate
-with the script.
+with the script. The excalidraw corpus is a `yarn`-installed checkout at commit
+`a2ec2889` (~1 GB with `node_modules`), so it is not vendored either — it is
+passed in by path, and both tools check it through the shared
+`tsconfig.tsgo.json` described above.
+
+**Cold runs.** Neither config sets `incremental`, and no `*.tsbuildinfo` or
+other cache artifact is written by either tool on any of these corpora — checked
+before, between, and after every timed run. Every run is cold.
 
 **Checkers.** `--checkers=N` runs N parallel checker instances that trade some
 duplicated type construction for lock-free parallelism. Both tools default to 4.
@@ -199,3 +246,81 @@ resident set size" line of `/usr/bin/time -l`, in bytes) as the median of 5.
 Note tsgo's space form for `--checkers`, not `=4`. Nonzero exit is expected —
 the packages are vendored without their dependencies — and both tools fully
 check every file regardless.
+
+### Reproducing the excalidraw row
+
+The checkout is ~1 GB, so it is not vendored:
+
+```sh
+git clone https://github.com/excalidraw/excalidraw && cd excalidraw
+git checkout a2ec2889
+yarn                                   # node_modules is part of the corpus
+```
+
+Then write `tsconfig.tsgo.json` next to `tsconfig.json` — the project's own
+config with the two options TypeScript 7 removed adjusted, and nothing else
+changed:
+
+```json
+{
+  "compilerOptions": {
+    "rootDir": "./",
+    "target": "ESNext",
+    "lib": ["dom", "dom.iterable", "esnext"],
+    "types": ["vitest/globals", "@testing-library/jest-dom"],
+    "allowJs": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "strict": true,
+    "forceConsistentCasingInFileNames": true,
+    "noFallthroughCasesInSwitch": true,
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "paths": {
+      "@excalidraw/excalidraw": ["./packages/excalidraw/index.tsx"],
+      "@excalidraw/utils": ["./packages/utils/index.ts"],
+      "@excalidraw/math": ["./packages/math/index.ts"],
+      "@excalidraw/excalidraw/*": ["./packages/excalidraw/*"],
+      "@excalidraw/utils/*": ["./packages/utils/*"],
+      "@excalidraw/math/*": ["./packages/math/*"]
+    }
+  },
+  "include": ["packages", "excalidraw-app"],
+  "exclude": ["examples", "dist", "types", "tests"]
+}
+```
+
+Run both tools from inside the checkout, same protocol as above:
+
+```sh
+ztsc --pretty=false --checkers=4 -p tsconfig.tsgo.json
+tsgo --noEmit --pretty false --checkers 4 -p tsconfig.tsgo.json
+```
+
+To compare the diagnostic sets, strip each tool's message text down to the
+(file, line, column, code) key — tsgo prints `file(line,col):` and ztsc prints
+`file:line:col:`:
+
+```sh
+# ztsc
+sed -nE 's|^(.+):([0-9]+):([0-9]+): error (TS[0-9]+):.*$|\1:\2:\3:\4|p' | sort -u
+# tsgo
+sed -nE 's|^(.+)\(([0-9]+),([0-9]+)\): error (TS[0-9]+):.*$|\1:\2:\3:\4|p' | sort -u
+```
+
+Both yield the same 17 keys. The whole property — every checker count from 1 to
+8, repeated, scored against the pinned oracle — is one command from a ztsc
+checkout:
+
+```sh
+EXC=/path/to/excalidraw bench/convergence.sh
+```
+
+It sweeps `--checkers` 1..8, asserts run-to-run stability at each count, asserts
+cross-N set equality of the diagnostic keys, and scores every count against tsgo
+for matched / under / excess. Both ceilings are zero.

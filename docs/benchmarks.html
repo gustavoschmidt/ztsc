@@ -26,11 +26,12 @@
 <div class="wrap">
 
 <header class="hero">
-  <p class="eyebrow">benchmarks · measured 2026-07-26 · apple m4 · vs tsgo 7.0.2</p>
+  <p class="eyebrow">benchmarks · measured 2026-07-26, excalidraw 2026-07-30 · apple m4 · vs tsgo 7.0.2</p>
   <h1>The numbers</h1>
-  <p class="sub">Everything on this page is measured, pinned, and reproducible: real published
-  packages and a real application, identical inputs into both tools, medians over repeated runs
-  with a monotonic nanosecond timer. The caveats are stated before the conclusions.</p>
+  <p class="sub">Everything on this page is measured and pinned: real published packages and two
+  real applications, identical inputs into both tools, medians over repeated runs with a
+  monotonic nanosecond timer. All of it is reproducible except the private dogfood app, which is
+  labeled as such. The caveats are stated before the conclusions.</p>
 
   <div class="stats">
     <div class="stat">
@@ -45,12 +46,12 @@
     </div>
     <div class="stat">
       <div class="k">real app source</div>
-      <div class="v">0.40&thinsp;<small>s</small></div>
-      <div class="c">a large production React/TypeScript app, full source: ztsc 0.40&thinsp;s / 219.6&thinsp;MB vs tsgo 0.53&thinsp;s / 734&thinsp;MB</div>
+      <div class="v">0.35&thinsp;<small>s</small></div>
+      <div class="c">excalidraw, full source + node_modules: ztsc 0.35&thinsp;s / 129.8&thinsp;MB vs tsgo 0.50&thinsp;s / 649.5&thinsp;MB — and the same 17 diagnostics as tsgo</div>
     </div>
     <div class="stat">
       <div class="k">conformance</div>
-      <div class="v">630/630</div>
+      <div class="v">909/909</div>
       <div class="c">differential cases (error code + line) vs the native TypeScript compiler, tsgo 7.0.2</div>
     </div>
   </div>
@@ -71,18 +72,22 @@
     standard library that both tools also check. It is the right corpus for "how fast is the
     type-level machinery" and it is fully reproducible from pinned versions.</li>
     <li><strong>Application source.</strong> The real test of a checker is <code>.ts</code>/<code>.tsx</code>
-    with bodies: inference, narrowing, JSX, the whole expression grammar. ztsc's standing
-    dogfood target is a large production React/TypeScript application (private codebase):
-    ztsc reproduces <strong>all 48 of tsc's errors byte-identically</strong> (plus 10 tracked
-    false positives) and finishes in <strong>0.40&thinsp;s / 219.6&thinsp;MB</strong> against
-    tsgo's <strong>0.53&thinsp;s / 734&thinsp;MB</strong>, both at their default four checkers.
-    A public open-source application benchmark is planned so this row becomes reproducible
-    too.</li>
+    with bodies: inference, narrowing, JSX, the whole expression grammar. Two applications are
+    measured. <strong><a href="https://github.com/excalidraw/excalidraw">excalidraw</a></strong>
+    is the public, reproducible one — anyone can clone it and re-run both tools — and on it ztsc
+    reports <strong>exactly the same 17 diagnostics as tsgo</strong>, same file, line, column and
+    code, at every checker count from 1 to 8, in <strong>0.35&thinsp;s / 129.8&thinsp;MB</strong>
+    against tsgo's <strong>0.50&thinsp;s / 649.5&thinsp;MB</strong>. ztsc's standing dogfood
+    target is additionally a large production React/TypeScript application (private codebase),
+    where it reproduces <strong>all 48 of tsc's errors byte-identically</strong> (plus 10 tracked
+    false positives) in <strong>0.40&thinsp;s / 219.6&thinsp;MB</strong> against tsgo's
+    <strong>0.53&thinsp;s / 734&thinsp;MB</strong>, both at their default four checkers.</li>
   </ul>
-  <p>Neither workload is a diagnostic-parity claim: ztsc checks a
-  <a href="limitations.html">measured subset</a> of TypeScript, so these are throughput and
-  memory comparisons on identical inputs. Correctness is tracked separately, by the 630-case
-  differential conformance suite and the dogfood error-for-error reproduction.</p>
+  <p>The package matrix is not a diagnostic-parity claim: ztsc checks a
+  <a href="limitations.html">measured subset</a> of TypeScript, so those are throughput and
+  memory comparisons on identical inputs. Correctness is tracked separately, by the 909-case
+  differential conformance suite, the excalidraw diagnostic convergence, and the dogfood
+  error-for-error reproduction.</p>
 </section>
 
 <!-- ============================================================ -->
@@ -213,11 +218,108 @@
 <!-- ============================================================ -->
 <section>
   <p class="eyebrow"><span class="n">03</span> · real application source</p>
-  <h2>The dogfood run: full .ts/.tsx with bodies</h2>
-  <p>Declaration files never exercise inference on function bodies, narrowing, or JSX — so the
-  standing acceptance target is a large production React/TypeScript application (frontend
-  and backend, private codebase), checked continuously against tsc 5.9.3's output as the truth
-  set:</p>
+  <h2>Two applications: full .ts/.tsx with bodies</h2>
+  <p>Declaration files never exercise inference on function bodies, narrowing, or JSX. Two whole
+  applications do — one public and reproducible, one private and long-standing.</p>
+
+  <h3>excalidraw — public, pinned, reproducible</h3>
+  <p><a href="https://github.com/excalidraw/excalidraw">excalidraw</a> v0.18.1 at commit
+  <code>a2ec2889</code>: a real React/TypeScript app with its <code>node_modules</code>, checked
+  whole. ztsc loads <strong>1,110 files / 332,794 lines</strong> (537 of them the project's own
+  source; the rest are the dependency <code>.d.ts</code> closure and the standard library).
+  Both tools at their default 4 checkers:</p>
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th>tool</th><th class="num">wall</th><th class="num">peak RSS</th><th>diagnostics</th></tr></thead>
+    <tbody>
+      <tr class="hl"><td>ztsc</td><td class="num">0.35 s</td><td class="num">129.8 MB</td><td>the same 17 — same file, line, column, code — at every checker count 1–8</td></tr>
+      <tr><td>tsgo 7.0.2</td><td class="num">0.50 s</td><td class="num">649.5 MB</td><td>baseline: 17 diagnostics</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p><strong>1.4× faster at 20% of the peak memory</strong> — and, unlike the package matrix,
+  this row <em>is</em> a diagnostic claim. ztsc reports exactly the same 17 diagnostics as tsgo:
+  the same (file, line, column, code) for every one, zero excess and zero under-reports, and the
+  same set at every checker count from 1 to 8. The <em>message text</em> is not identical —
+  tsgo says <code>Uint8Array&lt;ArrayBufferLike&gt;</code> where ztsc expands the union, and
+  <code>BlobPart</code> where ztsc names its constituents — so this is a same-findings claim, not
+  a byte-identical-output one. It is enforced as a standing gate by
+  <code>bench/convergence.sh</code>, whose false-positive and under-report ceilings both sit at
+  zero.</p>
+  <p>What the 17 are: excalidraw's own pinned <code>tsc</code> 4.9.4 reports <strong>zero
+  errors</strong> on this tree. The 17 findings come from TypeScript 7's newer lib definitions:
+  <strong>nine</strong> are the <code>Uint8Array</code>/<code>ArrayBuffer</code> generic
+  parameters added since 4.9 (<code>ArrayBufferLike</code> no longer collapsing into
+  <code>ArrayBuffer</code>), <strong>six</strong> are implicit-<code>any</code> reports in one
+  file behind a dependency whose types no longer resolve under its package
+  <code>exports</code> map, and <strong>two</strong> are ordinary findings (a comparison with no
+  overlap, an event-target mismatch). They are real findings under tsgo's libs, and ztsc agrees
+  with tsgo on all of them.</p>
+
+  <div class="note">
+    <p><strong>The config caveat.</strong> TypeScript 7 removed
+    <code>moduleResolution: "node10"</code> and <code>baseUrl</code>, so tsgo cannot read
+    excalidraw's real <code>tsconfig.json</code> at all — it stops at two config errors
+    (TS5108, TS5102) having checked nothing. The row therefore uses
+    <code>tsconfig.tsgo.json</code>, a minimal adjustment of the real config that both tools
+    accept: <code>"moduleResolution": "bundler"</code> instead of <code>"node"</code>, and
+    <code>baseUrl</code> dropped (the <code>paths</code> entries are already explicit relative
+    paths, so nothing else changes). Everything else is byte-for-byte the project's own config.
+    ztsc reads <em>both</em> files, and its diagnostic set is identical under either — the same
+    17 keys, and the same 1,110 files / 332,794 lines loaded — so the adjustment changes what
+    tsgo can run, not what is being measured.</p>
+  </div>
+
+  <p><strong>Reproducing it.</strong> The checkout is ~1&thinsp;GB, so it is not vendored:</p>
+  <pre><code>git clone https://github.com/excalidraw/excalidraw &amp;&amp; cd excalidraw
+git checkout a2ec2889
+yarn                                   # node_modules is part of the corpus</code></pre>
+  <p>Then write <code>tsconfig.tsgo.json</code> next to <code>tsconfig.json</code> — the real
+  config with the two removed options adjusted:</p>
+  <pre><code>{
+  "compilerOptions": {
+    "rootDir": "./",
+    "target": "ESNext",
+    "lib": ["dom", "dom.iterable", "esnext"],
+    "types": ["vitest/globals", "@testing-library/jest-dom"],
+    "allowJs": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "strict": true,
+    "forceConsistentCasingInFileNames": true,
+    "noFallthroughCasesInSwitch": true,
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "paths": {
+      "@excalidraw/excalidraw": ["./packages/excalidraw/index.tsx"],
+      "@excalidraw/utils": ["./packages/utils/index.ts"],
+      "@excalidraw/math": ["./packages/math/index.ts"],
+      "@excalidraw/excalidraw/*": ["./packages/excalidraw/*"],
+      "@excalidraw/utils/*": ["./packages/utils/*"],
+      "@excalidraw/math/*": ["./packages/math/*"]
+    }
+  },
+  "include": ["packages", "excalidraw-app"],
+  "exclude": ["examples", "dist", "types", "tests"]
+}</code></pre>
+  <p>And run both tools from inside the checkout — same protocol as everything else on this page,
+  median of 11 monotonic-ns runs for wall and 5 <code>/usr/bin/time -l</code> runs for RSS:</p>
+  <pre><code>ztsc --pretty=false --checkers=4 -p tsconfig.tsgo.json
+tsgo --noEmit --pretty false --checkers 4 -p tsconfig.tsgo.json
+
+# the convergence gate, from a ztsc checkout — sweeps checkers 1..8 and
+# scores every count against the pinned tsgo
+EXC=/path/to/excalidraw bench/convergence.sh</code></pre>
+
+  <h3>The dogfood app — private, continuous</h3>
+  <p>The standing acceptance target is additionally a large production React/TypeScript
+  application (frontend and backend, private codebase), checked continuously against tsc 5.9.3's
+  output as the truth set:</p>
   <div class="tablewrap">
   <table>
     <thead><tr><th>tool</th><th class="num">wall</th><th class="num">peak RSS</th><th>diagnostics</th></tr></thead>
@@ -227,11 +329,11 @@
     </tbody>
   </table>
   </div>
-  <p>This is the workload the package matrix can't show: real expression checking at scale, and
-  the memory ratio (30%) is measured there too, not only on declarations. The codebase is
-  private, so this row isn't reproducible by readers yet — a pinned benchmark against a public
-  open-source application is planned to close that gap. The 10 false positives are each
-  diagnosed and tracked on the <a href="limitations.html">limitations page</a>.</p>
+  <p>This is the largest corpus measured and the memory ratio (30%) is measured there too, not
+  only on declarations. The codebase is private, so this row is not reproducible by readers —
+  excalidraw above is the public counterpart. The 10 false positives are each diagnosed and
+  tracked on the <a href="limitations.html">limitations page</a>; none of them reproduce on
+  excalidraw.</p>
 </section>
 
 <!-- ============================================================ -->
@@ -328,12 +430,14 @@ zig-out/bench/ztsc --pretty=false --checkers=4 -p "$C"   # wall: median of 11
   <a href="https://github.com/gustavoschmidt/ztsc/blob/main/BENCHMARKS.md">BENCHMARKS.md</a>.</p>
 
   <div class="note">
-    <p><strong>Read before quoting.</strong> These are throughput and memory measurements on
+    <p><strong>Read before quoting.</strong> The package matrix is throughput and memory on
     identical inputs — not a diagnostic-parity claim:</p>
-    <p>ztsc checks a <em>subset</em> of TypeScript (against the real ES-core + DOM lib), so its
-    diagnostic output differs from tsgo's on real code; correctness is tracked separately by the
-    630-case differential conformance suite and the dogfood application's error-for-error
-    reproduction. Packages are vendored without their dependencies — nonzero exit is expected,
+    <p>ztsc checks a <em>subset</em> of TypeScript (against the real ES-core + DOM lib), so on
+    the packages its diagnostic output differs from tsgo's; correctness is tracked separately by
+    the 909-case differential conformance suite, the excalidraw convergence gate (the same 17
+    diagnostics as tsgo at every checker count — same file, line, column and code, though not
+    the same message text), and the dogfood application's error-for-error reproduction.
+    Packages are vendored without their dependencies — nonzero exit is expected,
     and both tools fully parse, bind, and check every file regardless. At the 7–24&thinsp;ms
     scale both tools are effectively instant, and the ratio mostly reflects fixed startup costs.
     Single machine, single OS — no Linux numbers yet.</p>
