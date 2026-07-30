@@ -3845,15 +3845,32 @@ const Checker = struct {
                 // cannot re-materialize deferred `.d.ts` machinery (the OOM guard
                 // and the redux `ExtractStoreExtensions` unmask both require an
                 // *abstract* arg), so those concerns below don't apply here.
-                const ground_earlier = bare_earlier != null and
-                    !(try c.containsTypeParam(out[bare_earlier.?]));
+                //
+                // A referenced argument that is itself a *naked type parameter*
+                // is the same single symbol swap: it renames one bound name to
+                // another and expands nothing, so it can no more re-materialize
+                // deferred `.d.ts` machinery than a ground argument can. Leaving
+                // it unsubstituted is in fact unsound rather than lenient — the
+                // alias body keeps a *free* occurrence of the alias's own `S`
+                // that the caller's later instantiation can never close. RTK's
+                // `interface Slice<State, …> { reducer: Reducer<State> }` over
+                // redux's `Reducer<S, A, PreloadedState = S>` materialized as
+                // `(state: State | S | undefined, …) => State`; substituting
+                // `Slice<X>` then left the dangling `S` behind, and a merely
+                // *generic* type poisons every conditional that tests it —
+                // `combineReducers`' `M[keyof M] extends Reducer<…> | undefined`
+                // never decided, so its result stayed an unreduced conditional
+                // and `configureStore({ reducer: rootReducer })` was rejected.
+                const swappable_earlier = bare_earlier != null and
+                    (!(try c.containsTypeParam(out[bare_earlier.?])) or
+                        c.ts.kind(out[bare_earlier.?]) == .type_param);
                 // Ensure the generic body is built so self-recursion is detected
                 // (the flag is set when materialization re-enters this alias).
-                const recursive = if (bare_earlier != null and !ground_earlier and c.symInDeclFile(sym)) rec: {
+                const recursive = if (bare_earlier != null and !swappable_earlier and c.symInDeclFile(sym)) rec: {
                     if ((c.alias_state.get(sym) orelse 0) != 1) _ = try c.aliasGeneric(sym);
                     break :rec (c.alias_state.get(sym) orelse 0) == 1 or c.alias_recursive.contains(sym);
                 } else true;
-                if (bare_earlier != null and (ground_earlier or recursive or !c.symInDeclFile(sym))) {
+                if (bare_earlier != null and (swappable_earlier or recursive or !c.symInDeclFile(sym))) {
                     out[i] = out[bare_earlier.?];
                 } else if (c.symInDeclFile(sym)) {
                     // A *complex* or non-recursive library default (e.g. RTK's
