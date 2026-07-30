@@ -1301,10 +1301,20 @@ const Binder = struct {
     /// a narrowing reference (`Checker.constIndexOf`). Deliberately coarser
     /// than that predicate (no range/sign test): an index the checker rejects
     /// simply leaves an unused flow entry.
-    fn isConstIndex(b: *const Binder, node: Node) bool {
+    /// The syntactic half of tsc's `isNarrowableReference` element-access arm:
+    /// an index that *could* denote a stable reference — a numeric literal
+    /// (`arr[0]`) or a bare identifier (`map[key]`). The semantic half — is the
+    /// identifier a `const` or a never-assigned local? — needs symbol
+    /// resolution, which is not available here; the checker applies it in
+    /// `stableIndexSymbol` and simply does not build a key when it fails, so an
+    /// index that turns out to be unstable costs one unused flow entry.
+    fn isNarrowableIndex(b: *const Binder, node: Node) bool {
         var n = node;
         while (b.nodeTag(n) == .paren_expr) n = b.tree.nodeData(n).lhs;
-        return b.nodeTag(n) == .number_literal;
+        return switch (b.nodeTag(n)) {
+            .number_literal, .identifier => true,
+            else => false,
+        };
     }
 
     /// A bare identifier or a `a.b.c` chain of them — tsc's isDottedName,
@@ -2526,13 +2536,15 @@ const Binder = struct {
             .index_expr, .optional_index_expr => {
                 try b.bindExpr(d.lhs);
                 try b.bindExpr(d.rhs);
-                // A CONSTANT element access (`arr[0]`) is a narrowable
+                // An element access whose index is a literal (`arr[0]`) or a
+                // bare identifier (`ICON_BY_TAG[tag]`) is a narrowable
                 // reference exactly like a dotted member — `if
-                // (isImageElement(elements[0]))` has to narrow the reads of the
-                // same access. A variable index (`arr[i]`) is not a stable
-                // reference (the checker's `buildRefKey` rejects it), so it gets
-                // no flow entry and costs nothing.
-                if (isConstIndex(b, d.rhs)) try b.attachFlow(node);
+                // (isImageElement(elements[0]))` and `if (map[k]) map[k].use()`
+                // both have to narrow the reads of the same access. A computed
+                // index (`arr[i + 1]`, `f()[k]`) is not a stable reference
+                // (the checker's `buildRefKey` rejects it), so it gets no flow
+                // entry and costs nothing.
+                if (isNarrowableIndex(b, d.rhs)) try b.attachFlow(node);
             },
             .assign => {
                 try b.bindExpr(d.lhs);
