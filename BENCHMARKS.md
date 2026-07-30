@@ -3,7 +3,8 @@
 Wall clock and peak memory for **ztsc vs tsgo** (the native TypeScript 7
 compiler), checking real, published packages and real applications on identical
 inputs. Package matrix measured 2026-07-26 on an Apple M4 with ztsc at commit
-374d2c2; the excalidraw application row 2026-07-30, same machine.
+374d2c2; the excalidraw application row 2026-07-30 at commit 218978d, same
+machine.
 
 ztsc checks a subset of TypeScript, against the lib each package's tsconfig
 selects — es-core..esnext for most, plus the real DOM lib for the three packages
@@ -103,8 +104,8 @@ Two applications are measured — a whole app graph rather than a single package
 | **excalidraw** 0.18.1 (`a2ec2889`) — public | 0.355 / 0.502 s | 129.8 / 649.5 MB | 20% | the same 17 as tsgo, at every checker count |
 | production React/TS app — private | 0.40 / 0.53 s | 219.6 / 734 MB | 30% | all 48 of tsc's errors byte-identical, + 10 tracked false positives |
 
-**excalidraw** is the public, reproducible row, measured 2026-07-30. ztsc loads
-1,110 files / 332,794 lines (537 of them the project's own source; the rest are
+**excalidraw** is the public, reproducible row, measured 2026-07-30 with ztsc
+at commit 218978d. It loads 1,110 files / 332,794 lines (537 of them the project's own source; the rest are
 the dependency `.d.ts` closure and the standard library) and checks them
 **1.4× faster at 20% of tsgo's peak memory**.
 
