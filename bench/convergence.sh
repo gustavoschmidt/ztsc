@@ -39,12 +39,10 @@
 #       byte-identical for any partition count" — measured as a set rather
 #       than a byte diff, so the failure report can name the keys that move.
 #       crash_sweep.sh already compares c1..c16 byte for byte on the library
-#       corpus; on an application the comparison currently FAILS, and it fails
-#       for a reason worth naming rather than hiding: a foreign type is
-#       materialized on demand in each checker's local store, so which
-#       spelling (a lazy `ref` or a materialized structure) a type has depends
-#       on what that checker already materialized. Roughly 44 keys of ~260
-#       move with the partition.
+#       corpus; this is the same property on an application, where foreign
+#       types materialized on demand in each checker's local store once made
+#       ~44 keys of ~260 move with the partition. That fringe is closed — the
+#       set is identical at every N, and this check keeps it that way.
 #
 #   (c) THE tsgo SCOREBOARD, when the pinned oracle is available: how many of
 #       tsgo's diagnostics ztsc reproduces at the same (file, line, column,
@@ -52,16 +50,15 @@
 #       reports that tsgo does not — `excess`. Scored per N and then over the
 #       whole sweep: UNION excess (a false positive that appears at ANY
 #       checker count) and UNION under-reports (a tsgo diagnostic missing from
-#       EVERY checker count) are the two numbers convergence has to drive to
-#       zero. They are ratcheted against CONVERGE_MAX_EXCESS /
-#       CONVERGE_MAX_UNDER so a change that adds a false positive fails here
-#       even while the absolute count is still large.
+#       EVERY checker count) are the two numbers convergence drove to zero.
+#       Both ceilings (CONVERGE_MAX_EXCESS / CONVERGE_MAX_UNDER) now sit AT
+#       zero: ztsc reproduces tsgo's 17 diagnostics exactly, at every checker
+#       count, and any new false positive or under-report on this app fails
+#       the sweep outright.
 #
-# (b) FAILS TODAY, by construction: this script is the standing gate for work
-# that has not finished yet, not a description of a passing state. Run it with
-# CONVERGE_SOFT=1 to get the report without the nonzero exit; that is how it
-# runs until the partition-dependent fringe is closed, at which point the
-# hatch goes away.
+# The sweep PASSES as of the convergence campaign's close; CONVERGE_SOFT=1
+# remains as a triage hatch for reading the report from a mid-investigation
+# tree without the nonzero exit.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -106,12 +103,10 @@ RUNS="${RUNS:-3}"
 MAX_CHECKERS="${MAX_CHECKERS:-8}"
 SOFT="${CONVERGE_SOFT:-0}"
 
-# The ratchet, at the default c1..c8 sweep. A ceiling, not a target — every
-# convergence commit lowers it. (Widening MAX_CHECKERS can only raise the union
-# excess, since a false positive counts at any N; raise the ceiling with the
-# sweep or the gate will report a regression that is really a wider net.)
-CONVERGE_MAX_EXCESS="${CONVERGE_MAX_EXCESS:-226}"
-CONVERGE_MAX_UNDER="${CONVERGE_MAX_UNDER:-12}"
+# The ratchet, fully ratcheted: converged means zero excess and zero
+# under-reports, at any checker count, and the default ceilings hold it there.
+CONVERGE_MAX_EXCESS="${CONVERGE_MAX_EXCESS:-0}"
+CONVERGE_MAX_UNDER="${CONVERGE_MAX_UNDER:-0}"
 
 echo "== building ztsc (ReleaseFast) =="
 zig build bench >/dev/null
