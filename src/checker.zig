@@ -13726,6 +13726,32 @@ const Checker = struct {
     ///
     /// Only consulted as a SOURCE (`never` is assignable to everything), so it
     /// can only remove false positives.
+    /// tsc's `getReducedType` for a UNION (`getReducedUnionType`): a union
+    /// constituent that is an uninhabited intersection denotes nothing, so tsc
+    /// removes it outright rather than carrying it along. ztsc only consulted
+    /// `intersectionIsNever` from the relation, where a dead constituent is
+    /// harmless; every other consumer (object spread, `.map` return inference,
+    /// property lookup) saw the dead constituents and produced garbage.
+    fn reduceNeverIntersections(c: *Checker, t: TypeId) Error!TypeId {
+        if (c.ts.kind(t) == .intersection)
+            return if (try c.intersectionIsNever(t)) types.never_type else t;
+        if (c.ts.kind(t) != .union_type) return t;
+        const members = try c.scratch().dupe(TypeId, try c.memberList(t));
+        defer c.scratch().free(members);
+        var kept: std.ArrayList(TypeId) = .empty;
+        defer kept.deinit(c.scratch());
+        var dropped = false;
+        for (members) |m| {
+            if (c.ts.kind(m) == .intersection and try c.intersectionIsNever(m)) {
+                dropped = true;
+                continue;
+            }
+            try kept.append(c.scratch(), m);
+        }
+        if (!dropped) return t;
+        return try c.ts.makeUnion(c.scratch(), kept.items);
+    }
+
     fn intersectionIsNever(c: *Checker, t: TypeId) Error!bool {
         if (c.never_isect.get(t)) |v| return v;
         // Mark in progress as "inhabited": a property type that recurses back
@@ -24359,13 +24385,17 @@ const Checker = struct {
                     if (bc == m) continue;
                     if (try c.isAssignable(instance, bc)) return instance;
                 }
-                // tsc's tail past this point is `getIntersectionType([type,
-                // candidate])`, which the non-union arm below already does.
-                // MEASURED OUT for the union arm: `(A | B) & C` distributes
-                // into a union of intersections that ztsc's relation cannot
-                // put back together, and eight false TS2345s appear across
-                // rxjs (`innerFrom`, `scheduled`, `Observable.subscribe`).
-                // Stopping at `never` is the pre-existing, sound behaviour.
+                // tsc's tail is `getIntersectionType([type, candidate])`, and
+                // for a union `type` that distributes into a union of
+                // intersections — one per constituent. Most of them are
+                // uninhabited (`{ type: "text" } & { type: "arrow" }`), and
+                // tsc drops those in `getReducedType` before anything reads
+                // the narrowed type. Doing the intersection WITHOUT that
+                // reduction is what made this arm stop at `never` before: the
+                // dead constituents leaked into spreads and inferred returns
+                // and produced eight false TS2345s across rxjs.
+                const isect = try c.ts.makeIntersection(c.scratch(), &.{ t, instance });
+                return try c.reduceNeverIntersections(isect);
             }
             return result;
         }
