@@ -24666,23 +24666,33 @@ const Checker = struct {
         return c.nodeTag(proto.return_type) == .type_predicate;
     }
 
-    /// If `call`'s callee is a predicate signature whose guarded parameter
-    /// receives `key` as its argument, return that predicate; else null.
-    /// Shared by user-defined type guards and assertion functions.
-    fn guardTargetFor(c: *Checker, call: Node, key: RefKey) Error!?types.Predicate {
-        const g = (try c.guardCallOf(call)) orelse return null;
-        if (!try c.refMatches(g.arg, key)) return null;
-        return g.pred;
-    }
-
     /// `if (isT(x))` — a user-defined type guard used in a condition.
     /// True branch narrows the argument to the predicate type; the false
     /// branch takes the complement (union filtering handles both).
     fn narrowByGuardCall(c: *Checker, t: TypeId, call: Node, sense: bool, key: RefKey) Error!TypeId {
-        const pred = (try c.guardTargetFor(call, key)) orelse return t;
+        const g = (try c.guardCallOf(call)) orelse return t;
+        if (!try c.refMatches(g.arg, key)) return c.narrowByGuardArgChain(t, g, sense, key);
+        const pred = g.pred;
         if (pred.asserts) return t; // assertion fns narrow after the call, not here
         if (pred.ty == types.no_type) return t;
         return c.narrowByInstance(t, pred.ty, sense);
+    }
+
+    /// tsc's `narrowTypeByTypePredicate` optional-chain arm: the guarded
+    /// ARGUMENT is an optional chain whose receiver is the tracked reference
+    /// (`Array.isArray(data?.detail)`). A nullish receiver short-circuits the
+    /// chain to `undefined`, so when the predicate's asserted type cannot BE
+    /// `undefined`, the asserting branch proves the receiver did not
+    /// short-circuit — narrow it to non-null. Only the true branch says
+    /// anything (a failed predicate is equally consistent with a nullish
+    /// receiver), which is why tsc gates this on `assumeTrue`.
+    fn narrowByGuardArgChain(c: *Checker, t: TypeId, g: GuardCall, sense: bool, key: RefKey) Error!TypeId {
+        if (!sense) return t;
+        if (g.pred.asserts) return t; // narrows after the call, not in the condition
+        if (g.pred.ty == types.no_type) return t;
+        if (try c.admitsNullish(g.pred.ty, .undefined)) return t;
+        if (!try c.optionalChainContainsRef(g.arg, key)) return t;
+        return c.nonNullable(t);
     }
 
     /// `assertIsT(x);` — an assertion-function call statement narrows the
@@ -25699,7 +25709,7 @@ const Checker = struct {
         //   * `node_types` is a memo, and every reader outside diagnostics
         //     re-derives on miss (`checkExprCached`). The three readers that
         //     branch on presence — `elaborateLiteralError`, `assignNarrows`'
-        //     compound-assign arm, `guardTargetFor`'s member callee — are
+        //     compound-assign arm, `guardCallOf`'s member callee — are
         //     either diagnostics-only (dropped here) or reached from
         //     `inferReturnType`, and `checkFunctionLikeExpr`/`checkFunctionDecl`
         //     run that probe BEFORE this body walk, so the probe already sees
