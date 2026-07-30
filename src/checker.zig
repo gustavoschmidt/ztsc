@@ -16461,6 +16461,12 @@ const Checker = struct {
 
         var elem_types: std.ArrayList(TypeId) = .empty;
         defer elem_types.deinit(c.scratch());
+        // The same element types BEFORE literal widening, positionally aligned
+        // with `elem_types`. Subtype reduction has to read object-literal
+        // FRESHNESS, and `widenLiteral` regularizes it away (see the reduction
+        // below).
+        var raw_types: std.ArrayList(TypeId) = .empty;
+        defer raw_types.deinit(c.scratch());
         var tuple_elems: std.ArrayList(types.TupleElem) = .empty;
         defer tuple_elems.deinit(c.scratch());
         var i: u32 = 0;
@@ -16468,6 +16474,7 @@ const Checker = struct {
             if (el == null_node) continue;
             if (c.nodeTag(el) == .omitted) {
                 try elem_types.append(c.scratch(), types.undefined_type);
+                try raw_types.append(c.scratch(), types.undefined_type);
                 try tuple_elems.append(c.scratch(), .{ .ty = types.undefined_type });
                 i += 1;
                 continue;
@@ -16477,12 +16484,14 @@ const Checker = struct {
                 switch (c.ts.kind(st)) {
                     .array => {
                         try elem_types.append(c.scratch(), c.ts.arrayElem(st));
+                        try raw_types.append(c.scratch(), c.ts.arrayElem(st));
                         try tuple_elems.append(c.scratch(), .{ .ty = st, .flags = types.elem_flag_rest });
                     },
                     .tuple => {
                         for (0..c.ts.tupleLen(st)) |j| {
                             const e = c.ts.tupleElem(st, @intCast(j));
                             try elem_types.append(c.scratch(), e.ty);
+                            try raw_types.append(c.scratch(), e.ty);
                             try tuple_elems.append(c.scratch(), e);
                         }
                     },
@@ -16491,6 +16500,7 @@ const Checker = struct {
                         // its element type via the `[Symbol.iterator]` protocol.
                         const elem = (try c.iterationElementType(st)) orelse types.any_type;
                         try elem_types.append(c.scratch(), elem);
+                        try raw_types.append(c.scratch(), elem);
                         try tuple_elems.append(c.scratch(), .{ .ty = try c.ts.makeArray(elem), .flags = types.elem_flag_rest });
                     },
                 }
@@ -16501,9 +16511,11 @@ const Checker = struct {
             if (ctx_tuple) {
                 ectx = try c.tupleElemTypeAt(ctx_tuple_ty, i) orelse types.no_type;
             }
-            var et = try c.checkExprCached(el, ectx);
+            const raw = try c.checkExprCached(el, ectx);
+            var et = raw;
             if (!try c.keepLiteral(et, ectx)) et = try c.widenLiteral(et);
             try elem_types.append(c.scratch(), et);
+            try raw_types.append(c.scratch(), raw);
             try tuple_elems.append(c.scratch(), .{ .ty = et });
             i += 1;
         }
@@ -16526,7 +16538,61 @@ const Checker = struct {
             }
             return c.ts.makeArray(types.any_type); // evolving arrays out of scope
         }
-        return c.ts.makeArray(try c.ts.makeUnion(c.scratch(), elem_types.items));
+        return c.ts.makeArray(try c.arrayLiteralElemType(raw_types.items, elem_types.items));
+    }
+
+    /// tsc's `createArrayLiteralType`: an array literal's element type is
+    /// `getUnionType(elementTypes, UnionReduction.Subtype)` — the best common
+    /// supertype, not the plain union. Without the reduction an array holding two
+    /// instantiations of the same generic, one narrower than the other, keeps
+    /// both spellings, and a later generic call over the array can satisfy
+    /// neither: `[seg(r[0], ptFrom(…)), seg(ptFrom(…), r[1])]` infers
+    /// `Seg<Point>` for one element and `Seg<G | L>` for the other (tsc does
+    /// too — `ptFrom`'s return-only type parameter genuinely falls back to its
+    /// constraint), and tsc reduces the pair to `Seg<G | L>[]`.
+    ///
+    /// `reduceSubtypes` carries the `strictSubtypeRelation` guards this needs —
+    /// a FRESH object literal never absorbs a sibling and is only absorbed when
+    /// it survives an excess-property check — but it can only apply them while
+    /// the literals are still fresh, and `widenLiteral` regularizes freshness
+    /// away per element. So reduce the RAW (pre-widening) types and use the
+    /// result only as a removal set: an element's widened type is dropped
+    /// exactly when the reduction removed its raw type. Reading it as a removal
+    /// set rather than as the answer also keeps a union-typed element safe — it
+    /// is flattened by `makeUnion` and so is never itself a member, hence never
+    /// "removed".
+    ///
+    /// This is what keeps `[{ a: 1 }, { a: 1, b: 2 }]` a two-member union (both
+    /// fresh, neither absorbs) while `[a, ab]` of two DECLARED types reduces to
+    /// `A`, matching tsc on both.
+    fn arrayLiteralElemType(c: *Checker, raw: []const TypeId, widened: []const TypeId) Error!TypeId {
+        std.debug.assert(raw.len == widened.len);
+        const plain = try c.ts.makeUnion(c.scratch(), widened);
+        if (raw.len < 2) return plain;
+        const raw_union = try c.ts.makeUnion(c.scratch(), raw);
+        if (c.ts.kind(raw_union) != .union_type) return plain;
+        const reduced = try c.reduceSubtypes(raw_union);
+        if (reduced == raw_union) return plain;
+        // Members of `raw_union` the reduction dropped.
+        const survivors: []const TypeId = if (c.ts.kind(reduced) == .union_type)
+            try c.memberList(reduced)
+        else
+            &.{reduced};
+        var kept: std.ArrayList(TypeId) = .empty;
+        defer kept.deinit(c.scratch());
+        outer: for (raw, widened) |r, w| {
+            for (try c.memberList(raw_union)) |m| {
+                if (m != r) continue;
+                // `r` IS a member of the raw union: keep it only if it survived.
+                for (survivors) |sv| {
+                    if (sv == r) break;
+                } else continue :outer;
+                break;
+            }
+            try kept.append(c.scratch(), w);
+        }
+        if (kept.items.len == 0) return plain;
+        return c.ts.makeUnion(c.scratch(), kept.items);
     }
 
     /// The element type an array literal's elements should be contextually
