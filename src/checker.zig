@@ -10013,6 +10013,35 @@ const Checker = struct {
                 {
                     src = try c.classConstructType(s.classSymbol(src));
                 }
+                // An INTERSECTION source still has the pattern's properties —
+                // tsc's `inferFromProperties` reads each target property off
+                // the source with `getTypeOfPropertyOfType`, and
+                // `getUnionOrIntersectionProperty` synthesises an
+                // intersection's property from the constituents that declare
+                // it. Bailing out here (the pre-fix `!= .object` return) left
+                // every infer var of a property pattern unbound, so it
+                // resolved to `unknown`: React's
+                // `PropsWithRef<P> = "ref" extends keyof P ? P extends { ref?:
+                // infer R | undefined } ? …` inferred `R = unknown` for every
+                // intrinsic element, because `ComponentProps<'div'>` is
+                // `ClassAttributes<HTMLDivElement> & HTMLAttributes<…>` — an
+                // intersection.
+                //
+                // Signature inference below still needs a single object, so
+                // the intersection only feeds the property loop.
+                if (s.kind(src) == .intersection) {
+                    for (0..s.objectPropCount(pattern)) |i| {
+                        const pp = s.objectProp(pattern, @intCast(i));
+                        // `allow_index = false`: an index signature or an
+                        // apparent `Object`/`Function` member is not a
+                        // declared property and must not seed a candidate,
+                        // matching the plain-object branch below.
+                        if (try c.propOfTypeEx(src, pp.name, false)) |sp| {
+                            try c.inferFromExtends(sp.ty, pp.ty, ids, vals, contra, depth + 1);
+                        }
+                    }
+                    return;
+                }
                 if (s.kind(src) != .object) return;
                 for (0..s.objectPropCount(pattern)) |i| {
                     const pp = s.objectProp(pattern, @intCast(i));
