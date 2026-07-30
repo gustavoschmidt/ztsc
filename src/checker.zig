@@ -22884,6 +22884,22 @@ const Checker = struct {
                 // unreachable definition point.
                 if (ante == binder.unreachable_flow) return declared;
                 if (key.len != 0 or key.sym == this_flow_root) return declared;
+                // Only a reference *captured* by this closure may continue into
+                // the definition-point flow. A reference to something the
+                // closure declares itself (its parameters, its own locals) is
+                // not captured — tsc's `checkIdentifier` only walks out to an
+                // enclosing container when the declaration container differs
+                // from the reference's. Crossing anyway put the closure's own
+                // symbol into the enclosing function's flow, where
+                // `assignNarrows` matches a declarator by NAME
+                // (`patternBindsSym`): a same-named outer `const d: string`
+                // then narrowed an `unknown`-typed parameter `d` to `string`.
+                // (Only visible for a declared type `assignmentRefines` accepts,
+                // which is why `unknown` parameters were the reported shape.)
+                if (c.symFile(key.sym) == c.cur_file) {
+                    const own = c.containerOf(c.bind.symbol_scopes[c.localOf(key.sym)]);
+                    if (c.bind.scope_owners[own] == b.flowNode(flow)) return declared;
+                }
                 const sf = c.symFlags(key.sym);
                 if (!sf.const_decl) {
                     // Effectively-const let/var/param: tsc narrows a captured
