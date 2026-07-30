@@ -4395,6 +4395,111 @@ const Checker = struct {
         return c.restTupleOf(c.ts.fnParam(sig, count - 1));
     }
 
+    /// The trailing rest parameter's type when it is a UNION OF TUPLES —
+    /// i18next's `TFunction`, whose one call signature is
+    /// `(...args: [key: K, options?: O] | [key: K, defaultValue: D,
+    /// options?: O])`.
+    ///
+    /// Such a signature has no single expanded parameter list (`sigRestTuple`
+    /// answers null) and no per-position type either: position 1 above would
+    /// have to be `O | undefined | D`, which relates to neither a `(k, o?)`
+    /// nor a `(k, d, o?)` target. tsc treats the union as the parameter list
+    /// chosen as a WHOLE (`getNonArrayRestType`): the other side's parameters
+    /// — or, at a call, the argument list — are packed into one tuple and have
+    /// to satisfy exactly one ARM.
+    ///
+    /// The SIGNATURE-RELATION half of that is what this drives
+    /// (`restTupleAtPosition`, `signatureAssignableModeInner`). Its call half
+    /// stays a per-position check, an under-report recorded in
+    /// test/conformance/DEFERRED next to calls/053.
+    fn sigRestUnion(c: *Checker, sig: TypeId) Error!?TypeId {
+        const count = c.ts.fnParamCount(sig);
+        if (count == 0) return null;
+        const p = c.ts.fnParam(sig, count - 1);
+        if (!p.rest()) return null;
+        switch (c.ts.kind(p.ty)) {
+            .union_type, .ref => {},
+            else => return null,
+        }
+        const r = try c.resolveStructural(p.ty);
+        if (c.ts.kind(r) != .union_type) return null;
+        // Cheap first pass over the borrowed member slice: bail on the first
+        // non-tuple, and only pay the scratch dupe when a member is a `ref`
+        // that has to be resolved (resolving interns, which dangles the slice).
+        var needs_resolve = false;
+        for (c.ts.members(r)) |m| {
+            switch (c.ts.kind(m)) {
+                .tuple => {},
+                .ref => needs_resolve = true,
+                else => return null,
+            }
+        }
+        if (!needs_resolve) return r;
+        for (try c.memberList(r)) |m| {
+            if (c.ts.kind(try c.resolveStructural(m)) != .tuple) return null;
+        }
+        return r;
+    }
+
+    /// Is `index` an OPTIONAL position of a rest parameter typed by a union of
+    /// tuples? It is as soon as ONE arm says so — either its element there is
+    /// marked `?` or the arm is too short to reach the index at all — because
+    /// a call may pick that arm and omit the argument. tsc reads the position
+    /// as `getIndexedAccessType(restType, index)`, which distributes over the
+    /// union and so carries each arm's own `| undefined` along; ztsc's
+    /// positional answer is the rest's whole element type (`elemOfArrayish`),
+    /// which loses it. Without the `undefined` a perfectly ordinary
+    /// `t(key, maybeOptions)` — the options bag typed `Opts | undefined` at
+    /// the call site — had nothing in the parameter to be assignable to.
+    fn restUnionOptionalAt(c: *Checker, u: TypeId, index: u32) Error!bool {
+        for (try c.memberList(u)) |m| {
+            const arm = try c.resolveStructural(m);
+            const len = c.ts.tupleLen(arm);
+            if (index < len) {
+                if (c.ts.tupleElem(arm, index).optional()) return true;
+            } else if (len == 0 or !c.ts.tupleElem(arm, len - 1).rest()) return true;
+        }
+        return false;
+    }
+
+    /// tsc's `getRestTypeAtPosition`: `sig`'s parameters from `pos` onward
+    /// packed into one tuple, so a whole parameter list can be related to a
+    /// rest parameter's type in one step. A signature whose own rest is a
+    /// union of tuples answers with that union at its rest position — tsc
+    /// builds `[...(A | B)]` there and `createNormalizedTupleType` distributes
+    /// the variadic union straight back to `A | B`.
+    fn restTupleAtPosition(c: *Checker, sig: TypeId, pos: u32) Error!TypeId {
+        const pc = try c.effParamCount(sig);
+        if (pos + 1 == pc) {
+            if (try c.sigRestUnion(sig)) |u| return u;
+        }
+        const count = c.ts.fnParamCount(sig);
+        // An UNBOUNDED rest (`...xs: T[]`, `...xs: T`) has no positional
+        // expansion; it rides as the tuple's variadic element, exactly as tsc
+        // pushes `restType` with `ElementFlags.Variadic`.
+        const unbounded = count > 0 and c.ts.fnParam(sig, count - 1).rest() and
+            (try c.sigRestTuple(sig)) == null and (try c.sigRestUnion(sig)) == null;
+        const req = try c.requiredParams(sig);
+        var elems: std.ArrayList(types.TupleElem) = .empty;
+        defer elems.deinit(c.scratch());
+        var i = pos;
+        while (i < pc) : (i += 1) {
+            if (unbounded and i + 1 == count) {
+                try elems.append(c.scratch(), .{
+                    .ty = c.ts.fnParam(sig, count - 1).ty,
+                    .flags = types.elem_flag_rest,
+                });
+                break;
+            }
+            const t = try c.paramTypeAt(sig, i) orelse break;
+            try elems.append(c.scratch(), .{
+                .ty = t,
+                .flags = if (i < req) 0 else types.elem_flag_optional,
+            });
+        }
+        return c.ts.makeTuple(elems.items);
+    }
+
     /// Copy union members to scratch: slices into the type store dangle
     /// as soon as a new type is interned (extra array may grow).
     fn memberList(c: *Checker, t: TypeId) Error![]const TypeId {
@@ -13654,7 +13759,15 @@ const Checker = struct {
         for (0..s_len) |i| {
             const se = c.ts.tupleElem(s, @intCast(i));
             const st = if (se.rest()) try c.elemOfArrayish(se.ty) else se.ty;
-            const tt = try c.tupleElemTypeAt(t, @intCast(i)) orelse return false;
+            var tt = try c.tupleElemTypeAt(t, @intCast(i)) orelse return false;
+            // An OPTIONAL target element admits `undefined` — tsc bakes it into
+            // the element's own type (`[a?: T]`'s type argument is
+            // `T | undefined`), where ztsc keeps the bare `T` beside the flag.
+            // Reading only the bare type rejected `[string, O | undefined]`
+            // against `[string, O?]`, which tsc accepts.
+            if (i < t_len and c.ts.tupleElem(t, @intCast(i)).optional()) {
+                tt = try c.makeUnion2(tt, types.undefined_type);
+            }
             if (!try c.isAssignable(st, tt)) return false;
         }
         return true;
@@ -14406,9 +14519,34 @@ const Checker = struct {
         if (try c.requiredParams(se) > try c.paramTotal(te)) return false;
         const s_count = try c.effParamCount(se);
         const t_count = try c.effParamCount(te);
-        const pairs = @min(try c.paramTotal(se), @max(s_count, t_count));
+        // tsc's `compareSignaturesRelated` stops the pairwise walk where either
+        // side's rest parameter is typed by something that is not one tuple
+        // (`getNonArrayRestType`) and compares the two sides' REMAINING
+        // parameter lists, each packed into a tuple, at that one position. For
+        // a rest typed by a union of tuples that is the whole point: the
+        // target's parameter list has to satisfy one ARM, which is what makes
+        // i18next's `TFunction` — `(...args: [k, o?] | [k, d, o?])` —
+        // assignable to a plain `(key: string, options?: O) => string`, where
+        // the per-position union `o | d` in the options slot rejects it.
+        const rest_pair: ?u32 = blk: {
+            const both = @min(s_count, t_count);
+            if (both == 0) break :blk null;
+            if ((try c.sigRestUnion(se)) == null and (try c.sigRestUnion(te)) == null) break :blk null;
+            break :blk both - 1;
+        };
+        const pairs = if (rest_pair) |r| r + 1 else @min(try c.paramTotal(se), @max(s_count, t_count));
         var i: u32 = 0;
         while (i < pairs) : (i += 1) {
+            if (rest_pair) |r| {
+                if (i == r) {
+                    const st = try c.restTupleAtPosition(se, i);
+                    const tt = try c.restTupleAtPosition(te, i);
+                    if (try c.isAssignable(tt, st)) continue;
+                    if (mode != .none or !bivariant) return false;
+                    if (!try c.isAssignable(st, tt)) return false;
+                    continue;
+                }
+            }
             var sp = try c.paramTypeAt(se, i) orelse break;
             const tp = try c.paramTypeAt(te, i) orelse break;
             // An optional *source* parameter admits `undefined` at the call
@@ -14684,6 +14822,21 @@ const Checker = struct {
             if (try c.sigRestTuple(sig)) |tup| {
                 if (i < count - 1) return c.ts.fnParam(sig, i).ty;
                 return c.tupleElemTypeAt(tup, i - (count - 1));
+            }
+            // A rest typed by a union of tuples has no single expanded list,
+            // but its positions still carry OPTIONALITY: an arm that marks the
+            // position `?`, or that is too short to reach it, means a call may
+            // omit the argument, so the position admits `undefined`
+            // (`restUnionOptionalAt`). The element type itself stays the rest's
+            // whole element type — see that helper for what tsc computes.
+            if (i + 1 >= count) {
+                if (try c.sigRestUnion(sig)) |u| {
+                    const t = try c.elemOfArrayish(u);
+                    if (try c.restUnionOptionalAt(u, i - (count - 1))) {
+                        return try c.makeUnion2(t, types.undefined_type);
+                    }
+                    return t;
+                }
             }
         }
         if (i < count) {

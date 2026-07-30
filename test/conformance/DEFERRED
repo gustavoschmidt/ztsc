@@ -107,18 +107,31 @@ classes/062_inferred_return_this_cycle.ts  -TS7022 35
 classes/062_inferred_return_this_cycle.ts  -TS2729 35
 classes/062_inferred_return_this_cycle.ts  -TS2729 41
 
-# A rest parameter typed by a UNION of array types is modelled per POSITION:
-# each argument position gets the union of the constituents' element types
-# (tsc's `getIndexedAccessType(restType, number)`), which is what makes a
-# callback argument contextually typed. tsc additionally requires the argument
-# list *as a whole* to satisfy one arm, so it rejects a list that mixes them
-# (a bare handler and an array of handlers in the same call); ztsc, having no
-# whole-list arm choice, accepts it. Deterministic under-report of one extra
-# check, and the narrower alternative — keeping the position untyped — costs a
-# false TS7006 on every correctly-typed callback at such a call site, which
-# policy forbids. The per-position check itself still discriminates: an
-# incompatible callback is rejected on line 31.
+# A rest parameter typed by a UNION is modelled per POSITION at a CALL: each
+# argument position gets the union of the constituents' element types (tsc's
+# `getIndexedAccessType(restType, number)`), widened by `undefined` where some
+# constituent makes the position optional. That is what contextually types a
+# callback argument and what accepts an optional options bag. tsc additionally
+# relates the argument list *as a whole* to the rest type
+# (`getSignatureApplicabilityError` does zero positional checks once
+# `getNonArrayRestType` answers), so it rejects a list that mixes constituents:
+# a bare handler and an array of handlers in one call (041), an options bag in
+# the defaultValue slot (053). ztsc accepts those — a deterministic under-report
+# of one extra check.
+#
+# Its SIGNATURE-RELATION half is implemented (`sigRestUnion` /
+# `restTupleAtPosition`, conformance calls/053), where whole-list arm choice is
+# what an assignment actually turns on. The call half additionally needs `const`
+# type parameters (tsc's `isConstTypeVariable` puts a template-literal argument
+# written for a `const Key extends …` rest arm in a const context, so it keeps
+# its literal type); without them the whole-list check rejects `t(`P.${x}`)` at
+# every i18next call site, i.e. it would trade this under-report for a batch of
+# false positives, which policy forbids.
+#
+# 041: the per-position check still discriminates — an incompatible callback is
+# rejected on line 31.
 calls/041_rest_param_union_of_arrays.ts  -TS2345 27
+calls/053_rest_param_union_of_tuples.ts  -TS2345 58
 
 # ztsc emits no TS2536 at all — the "key K cannot be used to index T" check on
 # a deferred indexed access is unimplemented. The assignment through the
