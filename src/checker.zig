@@ -13190,7 +13190,19 @@ const Checker = struct {
             }
             // Fall through: merged-members structural check for object targets.
             if (tk == .object or tk == .ref) {
-                return c.structuralAssignable(s, try c.resolveStructural(t));
+                const rt = try c.resolveStructural(t);
+                // A RECURSIVE alias whose body is an intersection is spelled as a
+                // lazy `.ref` in every position (see `aliasInstance`), so an
+                // intersection TARGET can arrive here disguised as `.ref` and
+                // never reach the `tk == .intersection` arm above. Handing its
+                // expansion to `structuralAssignable` is an outright rejection —
+                // that helper's first line requires an `.object` target — which
+                // made `{…} & T` unassignable to `Node<T> = T & {prev: Node<T> |
+                // null}` even though the same relation succeeds when the target
+                // is spelled out. Re-dispatch so the intersection-target rule
+                // (each constituent must be met) runs.
+                if (rt != t and c.ts.kind(rt) == .intersection) return c.isAssignable(s, rt);
+                return c.structuralAssignable(s, rt);
             }
             // A deferred CONDITIONAL target is answered by the arm just below,
             // not here. tsc's `someTypeRelatedToType` failing on an intersection
