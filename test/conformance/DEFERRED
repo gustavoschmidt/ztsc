@@ -200,6 +200,6 @@ conditional/035_deferred_conditional_target_leniency.ts  -TS2322 34
 # conditional-target rule, and `Radians` satisfies both branches of
 # `T extends 0 ? Radians : Radians`. tsc rejects it here (declaration position)
 # and accepts it in a return position; this case only exercises the declaration
-# half. The `T extends 0 ? string : string` row on line 26 — the case's actual
+# half. The `T extends 0 ? string : string` row on line 28 — the case's actual
 # negative — still reports.
-assignability/066_intersection_source_deferred_target.ts  -TS2322 25
+assignability/066_intersection_source_deferred_target.ts  -TS2322 27
