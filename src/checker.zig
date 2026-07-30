@@ -18440,12 +18440,16 @@ const Checker = struct {
                         try c.diagFmt(2540, c.tokSpan(d.rhs), "Cannot assign to '{s}' because it is a read-only property.", .{c.atomText(name)});
                         return types.error_type; // suppress cascading 2322
                     }
+                    // TS 4.3 split accessors (`get x(): A; set x(v: B)`): the
+                    // WRITE type is the setter's parameter, not the property's
+                    // (getter's) type. See `setterWriteType`.
+                    const wt = (try c.setterWriteType(obj_t, name, 0)) orelse p.ty;
                     // An optional property accepts `undefined` as a write target
                     // (exactOptionalPropertyTypes is off): `x.opt = undefined` is
                     // legal. Fold `| undefined` in exactly as the read path does,
                     // so the write-target type is not narrower than the read type.
-                    if (p.optional()) return c.makeUnion2(p.ty, types.undefined_type);
-                    return p.ty;
+                    if (p.optional()) return c.makeUnion2(wt, types.undefined_type);
+                    return wt;
                 }
                 return c.propertyTypeOf(obj_t, name, d.rhs);
             },
@@ -18453,7 +18457,16 @@ const Checker = struct {
                 // Writing to a readonly tuple element (from `as const`) is
                 // TS2540, like a readonly property.
                 const d = c.tree.nodeData(node);
-                const r = try c.resolveStructural(try c.checkExprCached(d.lhs, types.no_type));
+                const obj_t = try c.checkExprCached(d.lhs, types.no_type);
+                // `o["p"] = v` writes at the setter's parameter type when `p` is
+                // a TS 4.3 split accessor, exactly as `o.p = v` does. Keyed off
+                // the *syntactic* string literal so no extra expression is
+                // checked on the ordinary element-write path.
+                if (c.nodeTag(d.rhs) == .string_literal) {
+                    const key = try c.memberAtom(c.tree.nodeMainToken(d.rhs));
+                    if (try c.setterWriteType(obj_t, key, 0)) |wt| return wt;
+                }
+                const r = try c.resolveStructural(obj_t);
                 if (c.ts.kind(r) == .tuple) {
                     const idx_t = try c.ts.regularLiteral(try c.checkExprCached(d.rhs, types.no_type));
                     if (c.ts.kind(idx_t) == .number_literal) {
@@ -18479,6 +18492,173 @@ const Checker = struct {
             },
             else => return c.checkExprCached(node, types.no_type),
         }
+    }
+
+    /// Since TS 4.3 a get/set pair may declare DIFFERENT types
+    /// (`get x(): A; set x(v: B)`), and the DOM lib uses it — `Window.location`
+    /// reads as `Location` and writes as `string`. `types.Prop` carries a single
+    /// `ty`, which is the getter's (the read type, per the "a getter, if present,
+    /// wins the property type" rule the member builders state), so a write site
+    /// would check the right-hand side against the READ type and reject
+    /// `w.location = url`.
+    ///
+    /// The full design is tsc's `getWriteTypeOfSymbol`: a second, *write* type
+    /// carried per property — a field on `types.Prop`, threaded through
+    /// interning, every member-list builder, instantiation, mapped types and
+    /// both directions of the assignability relation. This is the bounded form:
+    /// it answers only at a WRITE site, and only from the DECLARATION, so no
+    /// type-store layout changes and nothing on the read path moves.
+    ///
+    /// Reaches a declaration through interface and class references — the
+    /// shapes that stay a `.ref` — and through unions/intersections of them.
+    /// Answers null (keep the getter type, i.e. the pre-existing behaviour) for
+    /// everything that has already materialized to a bare `.object`: a type
+    /// literal annotation, a non-generic alias naming one, a mapped or spread
+    /// shape. An interned object carries no back-link to the member nodes it
+    /// was built from, and a side table filled *while building* one would be
+    /// order-dependent — two structurally identical literals intern to a single
+    /// `TypeId`, and a type may be built by one checker and read by another.
+    /// The answer has to stay a pure function of the program; closing that gap
+    /// is the full design's job, not a memo's.
+    fn setterWriteType(c: *Checker, t0: TypeId, name: Atom, depth: u32) Error!?TypeId {
+        if (depth > 8) return null;
+        const t = if (c.ts.kind(t0) == .this_type) c.ts.thisTypeInstance(t0) else t0;
+        switch (c.ts.kind(t)) {
+            .union_type, .intersection => {
+                for (c.ts.members(t)) |m| {
+                    if (try c.setterWriteType(m, name, depth + 1)) |wt| return wt;
+                }
+                return null;
+            },
+            .ref => {
+                const sym = c.ts.refSymbol(t);
+                const f = c.symFlags(sym);
+                const raw: ?TypeId = if (f.interface)
+                    try c.interfaceSetterParam(sym, name, depth)
+                else if (f.class)
+                    try c.classSetterParam(sym, name, depth)
+                else
+                    null;
+                const wt = raw orelse return null;
+                // The declaration's parameter type is written in the declaring
+                // symbol's own type-parameter space; substitute the reference's
+                // arguments exactly as `expandRef` does for the member list.
+                const args = c.ts.refArgs(t);
+                if (args.len == 0) return wt;
+                var tps: std.ArrayList(TypeParamInfo) = .empty;
+                defer tps.deinit(c.scratch());
+                try c.typeParamsOf(sym, &tps);
+                if (tps.items.len == 0) return wt;
+                var map_list: std.ArrayList(TpMap) = .empty;
+                defer map_list.deinit(c.scratch());
+                try c.buildInstMap(sym, try c.scratch().dupe(TypeId, args), &map_list);
+                return try c.instantiate(wt, map_list.items);
+            },
+            else => return null,
+        }
+    }
+
+    /// The parameter type of `set <name>(v)` declared on interface `sym` (any
+    /// reopened block), else on one of its `extends` bases. Converted in the
+    /// interface's own file context with its `this` bound, exactly as
+    /// `interfaceConstituentDirect` converts the member the getter came from.
+    fn interfaceSetterParam(c: *Checker, sym: SymbolId, name: Atom, depth: u32) Error!?TypeId {
+        const saved_ctx = c.enterSymFile(sym);
+        defer c.restoreCtx(saved_ctx);
+        const saved_this = c.this_type;
+        defer c.this_type = saved_this;
+        try c.setInterfaceThis(sym);
+        for (c.declsOf(sym)) |decl| {
+            if (c.nodeTag(decl) != .interface_decl) continue;
+            if (try c.scopeOf(decl)) |s| c.cur_scope = s;
+            const data = c.tree.extraData(ast.InterfaceData, c.tree.nodeData(decl).lhs);
+            const members = c.tree.extraRange(data.members_start, data.members_end);
+            if (try c.setterParamInMembers(members, name)) |wt| return wt;
+        }
+        // Inherited: walk `extends`. The bases are already materialized (the
+        // property was found on the resolved shape), so this is a cache hit.
+        for (c.declsOf(sym)) |decl| {
+            if (c.nodeTag(decl) != .interface_decl) continue;
+            if (try c.scopeOf(decl)) |s| c.cur_scope = s;
+            const data = c.tree.extraData(ast.InterfaceData, c.tree.nodeData(decl).lhs);
+            for (c.tree.extraRange(data.extends_start, data.extends_end)) |h| {
+                if (h == null_node or c.nodeTag(h) != .heritage) continue;
+                const hd = c.tree.nodeData(h);
+                var targs: std.ArrayList(TypeId) = .empty;
+                defer targs.deinit(c.scratch());
+                if (hd.rhs != 0) {
+                    const r = c.tree.extraData(ast.SubRange, hd.rhs);
+                    for (c.tree.extraRange(r.start, r.end)) |an| {
+                        if (an != null_node) try targs.append(c.scratch(), try c.typeFromTypeNode(an));
+                    }
+                }
+                const base = try c.typeFromTypeName(hd.lhs, targs.items);
+                if (try c.setterWriteType(base, name, depth + 1)) |wt| return wt;
+            }
+        }
+        return null;
+    }
+
+    /// Scan a member-node list for `set <name>(v)` and answer its parameter
+    /// type.
+    fn setterParamInMembers(c: *Checker, members: []const Node, name: Atom) Error!?TypeId {
+        for (members) |m| {
+            if (m == null_node or c.nodeTag(m) != .method_signature) continue;
+            const md = c.tree.nodeData(m);
+            if (md.rhs & ast.Flags.set == 0) continue;
+            if (try c.memberKey(c.tree.nodeMainToken(m), md.rhs) != name) continue;
+            return try c.setterParamOfProto(m, md.lhs);
+        }
+        return null;
+    }
+
+    /// The parameter type of `set <name>(v)` declared on class `sym`, else on
+    /// its base class. `this` is the class instance, as `classInstanceGeneric`
+    /// binds it while converting the members.
+    fn classSetterParam(c: *Checker, sym: SymbolId, name: Atom, depth: u32) Error!?TypeId {
+        const saved_ctx = c.enterSymFile(sym);
+        defer c.restoreCtx(saved_ctx);
+        const saved_this = c.this_type;
+        defer c.this_type = saved_this;
+        {
+            var tps: std.ArrayList(TypeParamInfo) = .empty;
+            defer tps.deinit(c.scratch());
+            try c.typeParamsOf(sym, &tps);
+            const args = try c.scratch().alloc(TypeId, tps.items.len);
+            for (tps.items, 0..) |tp, i| args[i] = try c.ts.makeTypeParam(tp.sym);
+            c.this_type = try c.ts.makeRef(sym, args);
+        }
+        if (c.bind.membersScopeOf(c.localOf(sym))) |ms| {
+            const kscope = c.symScope(sym);
+            const lo = c.bind.scope_members_start[ms];
+            const hi = c.bind.scope_members_start[ms + 1];
+            for (lo..hi) |i| {
+                if (try c.nominalizeComputedKey(c.bind.member_atoms[i], kscope) != name) continue;
+                const msym = c.toGlobal(c.bind.member_syms[i]);
+                const mf = c.symFlags(msym);
+                if (!mf.setter) return null;
+                for (c.declsOf(msym)) |decl| {
+                    if (c.nodeTag(decl) != .class_method) continue;
+                    const d = c.tree.nodeData(decl);
+                    const proto = c.tree.extraData(ast.FnProto, d.lhs);
+                    if (proto.flags & ast.Flags.set == 0) continue;
+                    return try c.setterParamOfProto(decl, d.lhs);
+                }
+                return null;
+            }
+        }
+        if (try c.baseClassRef(sym)) |base_ref| {
+            return c.setterWriteType(base_ref, name, depth + 1);
+        }
+        return null;
+    }
+
+    /// The declared type of a set accessor's single parameter. A setter with no
+    /// parameter (an error elsewhere) has no write type.
+    fn setterParamOfProto(c: *Checker, decl: Node, proto_idx: u32) Error!?TypeId {
+        const sig = try c.signatureOfProto(decl, proto_idx, true, false);
+        if (c.ts.kind(sig) != .function or c.ts.fnParamCount(sig) == 0) return null;
+        return c.ts.fnParam(sig, 0).ty;
     }
 
     /// One element of a destructuring-assignment pattern, in the expression
