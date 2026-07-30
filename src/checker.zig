@@ -23968,6 +23968,33 @@ const Checker = struct {
         return c.declaredPathTypeInner(node);
     }
 
+    /// tsc's `isDeclarationWithExplicitTypeAnnotation`, asked of every
+    /// declaration of a variable symbol: only such a symbol may be
+    /// materialized from inside a flow walk (see `declaredPathTypeInner`).
+    fn symExplicitlyTyped(c: *Checker, sym: SymbolId) bool {
+        const f = c.symFlags(sym);
+        if (!(f.var_decl or f.let_decl or f.const_decl)) return false;
+        const saved = c.enterSymFile(sym);
+        defer c.restoreCtx(saved);
+        var annotated = false;
+        for (c.declsOf(sym)) |decl| {
+            switch (c.nodeTag(decl)) {
+                // `const x = <init>`: no annotation by construction.
+                .declarator_init => return false,
+                .declarator_full => {
+                    const e = c.tree.extraData(ast.DeclaratorFull, c.tree.nodeData(decl).rhs);
+                    if (e.type_ann == 0) return false;
+                    annotated = true;
+                },
+                // The type-space half of a merge (`interface Array<T>` beside
+                // `declare var Array: ArrayConstructor`) says nothing about
+                // how the VALUE is typed.
+                else => {},
+            }
+        }
+        return annotated;
+    }
+
     fn declaredPathTypeInner(c: *Checker, node: Node) Error!TypeId {
         switch (c.nodeTag(node)) {
             .paren_expr => return c.declaredPathTypeInner(c.tree.nodeData(node).lhs),
@@ -23985,8 +24012,22 @@ const Checker = struct {
                         // that answer is then cached as the symbol's type for
                         // the rest of the run.
                         if (sym == binder.no_symbol or sym >= c.sym_types.items.len) break :blk types.no_type;
-                        if (c.sym_state.items[sym] != .computed) break :blk types.no_type;
-                        break :blk c.sym_types.items[sym];
+                        if (c.sym_state.items[sym] == .computed) break :blk c.sym_types.items[sym];
+                        if (c.sym_state.items[sym] == .in_progress) break :blk types.no_type;
+                        // tsc's `getExplicitTypeOfSymbol` DOES resolve a
+                        // variable whose declaration carries an explicit type
+                        // ANNOTATION: reading an annotation costs no inference
+                        // and cannot pull a function body into the flow walk.
+                        // Refusing it made the answer depend on whether this
+                        // checker happened to have materialized the symbol
+                        // yet, which varies with how the files were
+                        // partitioned — `Array.isArray(x)` narrowed at
+                        // `--checkers=1` and silently did not at
+                        // `--checkers=4`, because the lib's `declare var
+                        // Array: ArrayConstructor` was still cold in the
+                        // checker that owned the file.
+                        if (!c.symExplicitlyTyped(sym)) break :blk types.no_type;
+                        break :blk try c.typeOfSymbol(sym);
                     },
                     else => types.no_type,
                 };
