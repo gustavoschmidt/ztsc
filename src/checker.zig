@@ -3883,7 +3883,21 @@ const Checker = struct {
     fn keyofType(c: *Checker, t: TypeId) Error!TypeId {
         const r = try c.resolveStructural(t);
         switch (c.ts.kind(r)) {
-            .any, .err => return c.makeUnion2(types.string_type, c.makeUnion2(types.number_type, types.symbol_type) catch unreachable),
+            .err => {
+                // A `.ref` that does not resolve to a structure is NOT the same
+                // thing as `any`: it is a reference we cannot read the key set of
+                // yet (a self-recursive alias whose body is still materializing
+                // resolves to `error` through `expandRef`'s cycle cut). Answering
+                // the full `string | number | symbol` domain bakes that answer
+                // into whatever composite is being built — react-hook-form's
+                // `Merge<A, B>` interned `keyof A & keyof B` as
+                // `("message"|…) & (string|number|symbol)`, so every key took the
+                // "in both" branch and `FieldErrors<T>[k]` came out with `unknown`
+                // members. Deferring keeps `keyof <ref>` reducible.
+                if (c.ts.kind(t) == .ref) return c.ts.makeKeyof(t);
+                return c.makeUnion2(types.string_type, c.makeUnion2(types.number_type, types.symbol_type) catch unreachable);
+            },
+            .any => return c.makeUnion2(types.string_type, c.makeUnion2(types.number_type, types.symbol_type) catch unreachable),
             .object => {
                 var parts: std.ArrayList(TypeId) = .empty;
                 defer parts.deinit(c.scratch());
@@ -11393,6 +11407,17 @@ const Checker = struct {
         if (try c.containsMappedParam(idx) or try c.containsMappedParam(obj)) {
             return c.ts.makeIndexAccess(obj, idx);
         }
+        // An as-yet-unbound `infer` var in the index is the same situation: in
+        // tsc an `infer` binder IS a TypeParameter, so `isGenericIndexType` is
+        // true and `T[K]` stays deferred until `getInferredType` substitutes the
+        // binder. ztsc models `infer` as its own kind, which `containsFreeTypeParam`
+        // deliberately does not report — so `Form[infer K]` resolved eagerly to
+        // `any` and baked that in before `substInfer` could bind `K`. That is the
+        // react-hook-form `PathValueImpl` shape (`P extends \`${infer K}.${infer R}\`
+        // ? K extends keyof T ? T[K] : …`): every field path collapsed to `any`.
+        if (try c.containsInfer(idx)) {
+            return c.ts.makeIndexAccess(obj, idx);
+        }
         // Distribute over a union index: `Obj[A | B]` === `Obj[A] |
         // Obj[B]`. Holds whether or not `Obj` is generic, and is how a
         // `keyof`-derived index expands once the key union is known.
@@ -11696,7 +11721,14 @@ const Checker = struct {
             .type_param => {
                 const con = try c.typeParamConstraint(c.ts.typeParamSymbol(r));
                 if (con == types.no_type) return false;
-                return c.typeIsStringLike(try c.resolveStructural(con));
+                // tsc reads the BASE constraint here (`getBaseConstraintOfType`),
+                // which is what makes a constraint that is itself parameterised
+                // string-like: `TName extends FieldPath<TFieldValues>` is a
+                // deferred alias reference while `TFieldValues` is free, so the
+                // resolved-structural test alone answered "not string-like" and
+                // the template expression widened to `string`.
+                const base = if (try c.containsTypeParam(con)) try c.baseConstraintOf(con) else con;
+                return c.typeIsStringLike(try c.resolveStructural(base));
             },
             else => return false,
         }
@@ -16202,7 +16234,34 @@ const Checker = struct {
                 if (cd.lhs != null_node and (c.nodeTag(cd.lhs) == .arrow_fn or c.nodeTag(cd.lhs) == .function_expr)) continue;
             }
             const pt = (try c.propOfType(rp0, try c.memberAtom(name_tok))) orelse continue;
-            const vty = try c.jsxAttributeValueType(ad.lhs, types.no_type);
+            // A TEMPLATE-LITERAL attribute value is contextually typed by the
+            // target prop, exactly as `inferTypeArgs`' Phase 1 does for a
+            // template-expression argument: `ctxWantsTemplate` needs to see the
+            // string-like-constrained type param to keep `` `owners.${number}.status` ``
+            // a template-literal type. Checked context-free it widens to `string`,
+            // which fails `TName extends FieldPath<TFieldValues>`, so `TName` fell
+            // back to its default — the whole path union — and react-hook-form's
+            // `<Controller name={`a.${i}.b`} …/>` typed `field.value` as the union
+            // of EVERY field's value. Every other attribute shape keeps its
+            // context-free inference (its contextual pass is `checkJsxAttributes`').
+            const vctx: TypeId = blk: {
+                if (ad.lhs == null_node or c.nodeTag(ad.lhs) != .jsx_expr_container) break :blk types.no_type;
+                const cd = c.tree.nodeData(ad.lhs);
+                if (cd.lhs == null_node) break :blk types.no_type;
+                break :blk switch (c.nodeTag(cd.lhs)) {
+                    .template_expr => pt.ty,
+                    // An object/array-literal attribute whose target prop carries
+                    // a literal-constrained inference target keeps its literals —
+                    // the same gate `inferTypeArgs`' Phase 1 applies to an
+                    // object-literal ARGUMENT (`paramWantsLiteralCtx`). Without it
+                    // `options={[{ value: Breed.Nellore }, …]}` is checked
+                    // context-free, the enum members widen to the whole enum and
+                    // `T extends string` is inferred as `Breed`.
+                    .object_literal, .array_literal => if (try c.paramWantsLiteralCtx(pt.ty)) pt.ty else types.no_type,
+                    else => types.no_type,
+                };
+            };
+            const vty = try c.jsxAttributeValueType(ad.lhs, vctx);
             try c.unify(pt.ty, vty, tps, candidates, 0);
         }
         // Resolve each param: inferred candidate (clamped to its constraint when
@@ -17361,6 +17420,12 @@ const Checker = struct {
         // `.mapped` arm). Without it every such argument is checked
         // context-free.
         if (c.ts.kind(r) == .mapped) return true;
+        // An ARRAY parameter (`options: { value: T; label: string }[]`) wants the
+        // same per-element contextual type its element type does: the elements
+        // are object literals whose `value` property is the literal-constrained
+        // inference target. Checked context-free, `{ value: Breed.Nellore }`
+        // widens the enum member to the whole enum and `T` is inferred as `Breed`.
+        if (c.ts.kind(r) == .array and depth < 2) return c.paramWantsLiteralCtxAt(c.ts.arrayElem(r), depth + 1);
         if (c.ts.kind(r) != .object) return false;
         for (0..c.ts.objectPropCount(r)) |i| {
             const p = c.ts.objectProp(r, @intCast(i));
@@ -17432,11 +17497,15 @@ const Checker = struct {
                 // collapses to its concrete `${string}` template union and can
                 // admit the field-name literal. Only the generic case retries —
                 // a concrete constraint already had its full say above.
+                // An enum MEMBER is a string/number literal too (tsc gives it
+                // `TypeFlags.StringLiteral | EnumLiteral`), so the type-variable
+                // rule below must judge it by the kind of its declared value.
+                const elk = try c.enumMemberLiteralKind(lit, lk);
                 if (try c.containsTypeParam(constraint)) {
                     const base = try c.baseConstraintOf(constraint);
                     if (base != constraint) {
                         if (try c.contextAdmitsLiteral(base, lit)) return true;
-                        return c.constraintKeepsLiteralKind(base, lk);
+                        return c.constraintKeepsLiteralKind(base, elk);
                     }
                 }
                 // tsc's `isLiteralOfContextualType` type-VARIABLE rule: a
@@ -17446,10 +17515,21 @@ const Checker = struct {
                 // position. That is what makes `isMemberOf<T extends string>(
                 // coll: readonly T[], v)` called with `["a", "b"]` infer
                 // `T = "a" | "b"` instead of `string`.
-                return c.constraintKeepsLiteralKind(constraint, lk);
+                return c.constraintKeepsLiteralKind(constraint, elk);
             },
             else => return false,
         }
+    }
+
+    /// The literal KIND an enum member stands for — the kind of its declared
+    /// value (`.string_literal` for a string enum, `.number_literal` for a
+    /// numeric one). Non-members answer with `fallback` (their own kind). tsc
+    /// carries both flags on one type; ztsc models an enum member as its own
+    /// `.enum_type` kind, so the mapping is explicit.
+    fn enumMemberLiteralKind(c: *Checker, lit: TypeId, fallback: types.Kind) Error!types.Kind {
+        if (!c.ts.isEnumMember(lit)) return fallback;
+        const v = try c.enumMemberValue(c.ts.enumSymbol(lit), c.ts.enumMemberAtom(lit)) orelse return fallback;
+        return c.ts.kind(v);
     }
 
     /// tsc's `maybeTypeOfKind(constraint, <primitive of the literal>)` half of
