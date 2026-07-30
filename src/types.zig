@@ -1041,6 +1041,28 @@ pub const Store = struct {
         return s.internType(.array, &.{ elem, 0 }, 0);
     }
 
+    /// `readonly T[]` / `ReadonlyArray<T>`. Interned apart from `T[]` and
+    /// carrying the SAME members (the global `Array` interface) — the flag is
+    /// data, deliberately invisible to the assignability relation, exactly as
+    /// `elem_flag_readonly` is for tuples. Its one consumer is the type
+    /// predicate narrowing in `narrowByInstance`, which mirrors tsc's SUBTYPE
+    /// filter: a `readonly T[]` is not a subtype of a mutable `U[]` (it has no
+    /// `push`), so `Array.isArray(x)` on a readonly array narrows to the
+    /// guard's `any[]` rather than to `x`'s own type.
+    pub fn makeArrayReadonly(s: *Store, elem: TypeId) Error!TypeId {
+        return s.internType(.array, &.{ elem, 1 }, 0);
+    }
+
+    pub fn arrayIsReadonly(s: *const Store, id: TypeId) bool {
+        return s.dataB(id) != 0;
+    }
+
+    /// Rebuild an array with `src`'s readonly-ness — used by every
+    /// substitution path so the flag survives instantiation.
+    pub fn makeArrayLike(s: *Store, src: TypeId, elem: TypeId) Error!TypeId {
+        return s.internType(.array, &.{ elem, s.dataB(src) }, 0);
+    }
+
     pub fn makeTypeParam(s: *Store, symbol: u32) Error!TypeId {
         return s.internType(.type_param, &.{ symbol, 0 }, 0);
     }

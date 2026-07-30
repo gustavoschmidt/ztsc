@@ -2893,7 +2893,16 @@ const Checker = struct {
                 const r = c.tree.extraData(ast.SubRange, d.rhs);
                 return c.instantiationExprType(base, c.tree.extraRange(r.start, r.end), node);
             },
-            .readonly_type => return c.typeFromTypeNode(d.lhs), // readonly T[] ~ T[]
+            .readonly_type => {
+                // `readonly T[]` carries Array's members and relates exactly as
+                // `T[]` does; the flag is only there for tsc's subtype-based
+                // type-predicate narrowing (see `makeArrayReadonly`). Anything
+                // else (`readonly [a, b]`) is unchanged.
+                const inner = try c.typeFromTypeNode(d.lhs);
+                if (c.ts.kind(inner) == .array and !c.ts.arrayIsReadonly(inner))
+                    return c.ts.makeArrayReadonly(c.ts.arrayElem(inner));
+                return inner;
+            },
             .unique_symbol_type => {
                 // A `unique symbol` reached through the generic type path is in
                 // a disallowed position (param, return, alias, array, union,
@@ -3077,12 +3086,15 @@ const Checker = struct {
             const fixed = try c.fixTypeArgs(sym, args, tok) orelse return types.error_type;
             // The global `Array<T>` / `ReadonlyArray<T>` lower to `T[]`: tsc
             // treats `Array<T>` and `T[]` as the *same* type, and
-            // `ReadonlyArray<T>` as `readonly T[]` (which ztsc already folds to
-            // `T[]`; array readonly-ness is not modeled). Keeping them as
+            // `ReadonlyArray<T>` as `readonly T[]` — which lowers to the same
+            // members, only flagged (see `makeArrayReadonly`). Keeping them as
             // structural refs instead makes `T[]` fail to relate to them
             // through the interface body (ref→array has no structural bridge).
-            if (fixed.len == 1 and (c.globalSymNamed(sym, "Array") or c.globalSymNamed(sym, "ReadonlyArray"))) {
+            if (fixed.len == 1 and c.globalSymNamed(sym, "Array")) {
                 return c.ts.makeArray(fixed[0]);
+            }
+            if (fixed.len == 1 and c.globalSymNamed(sym, "ReadonlyArray")) {
+                return c.ts.makeArrayReadonly(fixed[0]);
             }
             return c.ts.makeRef(sym, fixed);
         }
@@ -9175,7 +9187,7 @@ const Checker = struct {
                 for (0..s.memberCount(t)) |i| try parts.append(c.scratch(), try c.instantiateId(s.memberAt(t, i), map, map_id));
                 break :blk try s.makeOverloads(parts.items);
             },
-            .array => try s.makeArray(try c.instantiateId(s.arrayElem(t), map, map_id)),
+            .array => try s.makeArrayLike(t, try c.instantiateId(s.arrayElem(t), map, map_id)),
             .tuple => blk: {
                 var elems: std.ArrayList(types.TupleElem) = .empty;
                 defer elems.deinit(c.scratch());
@@ -9439,7 +9451,7 @@ const Checker = struct {
                 for (try c.memberList(t)) |m| try parts.append(c.scratch(), try c.substThis(m, repl));
                 return s.makeOverloads(parts.items);
             },
-            .array => return s.makeArray(try c.substThis(s.arrayElem(t), repl)),
+            .array => return s.makeArrayLike(t, try c.substThis(s.arrayElem(t), repl)),
             .tuple => {
                 var elems: std.ArrayList(types.TupleElem) = .empty;
                 defer elems.deinit(c.scratch());
@@ -10341,7 +10353,7 @@ const Checker = struct {
                 const idx = indexOfId(ids, s.inferVarId(t)) orelse return t;
                 return vals[idx];
             },
-            .array => return s.makeArray(try c.substInfer(s.arrayElem(t), ids, vals)),
+            .array => return s.makeArrayLike(t, try c.substInfer(s.arrayElem(t), ids, vals)),
             .union_type => {
                 var parts: std.ArrayList(TypeId) = .empty;
                 defer parts.deinit(c.scratch());
@@ -10868,7 +10880,7 @@ const Checker = struct {
             },
             .array => {
                 const e = try c.substHomoSource(s.arrayElem(t), from, from_res, to);
-                return if (e == s.arrayElem(t)) t else s.makeArray(e);
+                return if (e == s.arrayElem(t)) t else s.makeArrayLike(t, e);
             },
             .union_type, .intersection => {
                 var parts: std.ArrayList(TypeId) = .empty;
@@ -11208,7 +11220,7 @@ const Checker = struct {
                 const idx = try c.substMappedKey(s.indexAccessIndex(t), key_id, key_ty);
                 return c.reduceIndexedAccess(obj, idx);
             },
-            .array => return s.makeArray(try c.substMappedKey(s.arrayElem(t), key_id, key_ty)),
+            .array => return s.makeArrayLike(t, try c.substMappedKey(s.arrayElem(t), key_id, key_ty)),
             .union_type => {
                 var parts: std.ArrayList(TypeId) = .empty;
                 defer parts.deinit(c.scratch());
@@ -21680,7 +21692,7 @@ const Checker = struct {
                 }
                 return s.makeIndexAccess(try c.substElemAccess(obj, src_sym, key_id, fp, depth + 1), try c.substElemAccess(ix, src_sym, key_id, fp, depth + 1));
             },
-            .array => return s.makeArray(try c.substElemAccess(s.arrayElem(t), src_sym, key_id, fp, depth + 1)),
+            .array => return s.makeArrayLike(t, try c.substElemAccess(s.arrayElem(t), src_sym, key_id, fp, depth + 1)),
             .union_type => {
                 var parts: std.ArrayList(TypeId) = .empty;
                 defer parts.deinit(c.scratch());
@@ -24453,6 +24465,16 @@ const Checker = struct {
             // not itself admit `undefined`/`null` leaves nothing behind (tsc
             // ends at `undefined & Lib`, which is `never`).
             if (isNullishKind(k) and !try c.admitsNullish(instance, k)) return types.never_type;
+            // tsc filters with the SUBTYPE relation, and a `readonly T[]` is
+            // not a subtype of a mutable `U[]` — it has no `push`. The reverse
+            // does hold, so `getNarrowedTypeWorker`'s second clause fires and
+            // the narrowed type is the GUARD's: `Array.isArray(x)` on a
+            // `readonly T[]` yields `any[]`, not `readonly T[]`. ztsc's
+            // relation is deliberately readonly-blind, so both directions are
+            // "assignable" here and the subject would win instead.
+            if (k == .array and c.ts.arrayIsReadonly(t) and
+                c.ts.kind(instance) == .array and !c.ts.arrayIsReadonly(instance))
+                return instance;
             if (try c.isAssignable(t, instance)) return t;
             if (try c.isAssignable(instance, t)) return instance;
             // Unrelated `t` and guard `C`: tsc narrows to the intersection
