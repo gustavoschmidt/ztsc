@@ -6116,6 +6116,31 @@ const Checker = struct {
     }
 
     fn declaratorType(c: *Checker, sym: SymbolId, decl: Node, is_const: bool) Error!TypeId {
+        // The initializer is being typed to *build* this variable's type, so
+        // any function body inside it must not be walked yet — the same rule
+        // the class-field arm of `computeTypeOfSymbol` already applies (see
+        // `DeferredBody`), and tsc's own: `checkFunctionExpressionOrObject-
+        // LiteralMethod` resolves the signature and then `checkNodeDeferred`s
+        // the body, which runs at the end of the enclosing file's check.
+        //
+        // `declaratorType` is only ever reached from `typeOfSymbol`, i.e. from
+        // a *demand* — the file's own walk checks a declarator's initializer
+        // directly (`checkDeclarator`), where `defer_bodies` is 0 and nothing
+        // changes. What changes is the demand path: `const f = (…) => {…}` is
+        // no longer body-walked from the middle of whatever asked for `f`'s
+        // type. That walk is arbitrary work with arbitrary type demands of its
+        // own, and when the demand came from another module in an import cycle
+        // it reached back into a symbol still marked in-progress, which answers
+        // `any` (`typeOfSymbol`'s cycle break). Two unannotated functions in a
+        // module cycle then resolved differently depending on which side was
+        // entered first — and which side that is depends on the `--checkers=N`
+        // partition, so the resulting report came and went with it.
+        //
+        // Nothing is lost: `drainDeferredBodies` walks the queued body at the
+        // next top-level statement boundary, by which time the symbol whose
+        // demand queued it is sealed.
+        c.defer_bodies += 1;
+        defer c.defer_bodies -= 1;
         const d = c.tree.nodeData(decl);
         switch (c.nodeTag(decl)) {
             .declarator => {
@@ -22642,6 +22667,38 @@ const Checker = struct {
         }
     }
 
+    /// Can the assigned value change the answer at all — i.e. can
+    /// `assignmentReduced(declared, …)` return anything but `declared`?
+    ///
+    /// tsc's `getTypeAtFlowAssignment` states the rule outright: *"Assignments
+    /// only narrow the computed type if the declared type is a union type."*
+    /// Its assignment arm is `declaredType.flags & Union ?
+    /// getAssignmentReducedType(declaredType, getAssignedType(node)) :
+    /// declaredType` — for every other declared type the right-hand side is
+    /// never even *evaluated*. (ztsc keeps one more refining case, a declared
+    /// `unknown`, which `assignmentReduced` widens the assigned value into.)
+    ///
+    /// The distinction is not an optimization: TYPING the right-hand side is
+    /// arbitrary work pulled into the middle of a flow walk, and a flow walk is
+    /// routinely run from inside a *return-type inference*. Two unannotated
+    /// functions in a module cycle then reach each other through a right-hand
+    /// side whose value is discarded a line later, and whichever demand entered
+    /// the cycle first hits `typeOfSymbol`'s in-progress break and answers
+    /// `any`. That is how `getElementsWithinSelection`'s inferred return
+    /// (`return elementsInSelection`, a plain `El[]`) came to depend on
+    /// `elementOverlapsWithFrame` — through `elementsInSelection =
+    /// elementsInSelection.filter((e) => elementOverlapsWithFrame(…))`, an
+    /// assignment that cannot possibly refine `El[]` — and, because the cycle
+    /// was then entered from whichever side the partition happened to schedule
+    /// first, `.some((e) => …)` on the `any` result lost its contextual
+    /// signature in some `--checkers=N` and not others.
+    fn assignmentRefines(c: *Checker, declared: TypeId) bool {
+        return switch (c.ts.kind(declared)) {
+            .union_type, .unknown => true,
+            else => false,
+        };
+    }
+
     /// If the assign-flow node writes the reference (or invalidates a
     /// property path by writing its root), the type after the assignment;
     /// null when it is unrelated.
@@ -22654,6 +22711,7 @@ const Checker = struct {
                 if (!try c.patternBindsSym(d.lhs, root_sym)) return null;
                 if (key.len != 0) return declared; // root re-init: reset path
                 if (c.nodeTag(d.lhs) != .identifier) return declared;
+                if (!c.assignmentRefines(declared)) return declared;
                 const vt = c.nodeType(d.rhs) orelse try c.checkExprCached(d.rhs, types.no_type);
                 return try c.assignmentReduced(declared, vt);
             },
@@ -22664,6 +22722,7 @@ const Checker = struct {
                 if (key.len != 0) return declared;
                 if (e.init == 0) return declared;
                 if (c.nodeTag(d.lhs) != .identifier) return declared;
+                if (!c.assignmentRefines(declared)) return declared;
                 // Reading this variable can reach its declaration's flow node
                 // BEFORE the declaration statement itself is checked — a JSX
                 // attribute referring to a `const cb: CB = (props) => …`
@@ -22691,6 +22750,7 @@ const Checker = struct {
                 if (key.len != 0 and try c.refMatches(d.lhs, key)) {
                     const op = c.tree.tokens.tag(c.tree.nodeMainToken(target));
                     if (op != .eq) return declared;
+                    if (!c.assignmentRefines(declared)) return declared;
                     const vt = c.nodeType(d.rhs) orelse try c.checkExprCached(d.rhs, types.no_type);
                     return try c.assignmentReduced(declared, vt);
                 }
@@ -22710,6 +22770,7 @@ const Checker = struct {
                         if (evolving) return try c.widenLiteral(vt);
                         return try c.assignmentReduced(declared, vt);
                     }
+                    if (!evolving and !c.assignmentRefines(declared)) return declared;
                     const vt = c.nodeType(d.rhs) orelse try c.checkExprCached(d.rhs, types.no_type);
                     if (evolving) return try c.widenLiteral(vt);
                     return try c.assignmentReduced(declared, vt);
@@ -22721,7 +22782,7 @@ const Checker = struct {
                     // `getAssignedType` walks the destructuring target). Falling
                     // back to `declared` here re-widened a `string | null` that
                     // an earlier `width = width || "50"` had already narrowed.
-                    if (key.len == 0) {
+                    if (key.len == 0 and c.assignmentRefines(declared)) {
                         const rt = c.nodeType(d.rhs) orelse try c.checkExprCached(d.rhs, types.no_type);
                         if (try c.destructuredAssignType(d.lhs, c.symNameAtom(root_sym), rt)) |vt| {
                             return try c.assignmentReduced(declared, vt);
