@@ -11393,6 +11393,17 @@ const Checker = struct {
         if (try c.containsMappedParam(idx) or try c.containsMappedParam(obj)) {
             return c.ts.makeIndexAccess(obj, idx);
         }
+        // An as-yet-unbound `infer` var in the index is the same situation: in
+        // tsc an `infer` binder IS a TypeParameter, so `isGenericIndexType` is
+        // true and `T[K]` stays deferred until `getInferredType` substitutes the
+        // binder. ztsc models `infer` as its own kind, which `containsFreeTypeParam`
+        // deliberately does not report — so `Form[infer K]` resolved eagerly to
+        // `any` and baked that in before `substInfer` could bind `K`. That is the
+        // react-hook-form `PathValueImpl` shape (`P extends \`${infer K}.${infer R}\`
+        // ? K extends keyof T ? T[K] : …`): every field path collapsed to `any`.
+        if (try c.containsInfer(idx)) {
+            return c.ts.makeIndexAccess(obj, idx);
+        }
         // Distribute over a union index: `Obj[A | B]` === `Obj[A] |
         // Obj[B]`. Holds whether or not `Obj` is generic, and is how a
         // `keyof`-derived index expands once the key union is known.
