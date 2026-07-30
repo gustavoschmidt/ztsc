@@ -203,3 +203,13 @@ conditional/035_deferred_conditional_target_leniency.ts  -TS2322 34
 # half. The `T extends 0 ? string : string` row on line 28 — the case's actual
 # negative — still reports.
 assignability/066_intersection_source_deferred_target.ts  -TS2322 27
+
+# A property read on `never` is not reported. ztsc's member-access path treats
+# `never` as permissive (it is assignable to everything, so a read off it can
+# never widen a later error), and reporting it would need a dedicated arm.
+# Pre-existing and unrelated to what case 085 pins: the base binary is
+# identically silent on a bare `(x: never) => x.length`. Line 41 is the branch
+# `typeof x === "string"` leaves empty when `T`'s constraint has no string
+# constituent — the collapse itself is what the case asserts, and every other
+# row in the file reports.
+narrowing/085_typeof_keeps_type_param_negatives.ts  -TS2339 41

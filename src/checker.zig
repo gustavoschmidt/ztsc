@@ -23342,12 +23342,30 @@ const Checker = struct {
             if (a == str) which = i;
         }
         if (which == typeof_names.len) return t0;
-        // A bare type parameter (an unconstrained `T`, or `T = any`) is not
-        // disprovably a non-object: `typeofMatches` only inspects concrete
-        // kinds, so narrowing the type param directly would collapse
-        // `typeof x === 'object'` to `never`. Narrow its *constraint* instead
-        // (sound, and matches tsc's constraint-based reference narrowing).
-        const t = if (c.ts.kind(t0) == .type_param) try c.baseConstraintOf(t0) else t0;
+        // A type parameter narrows through its CONSTRAINT (`typeofMatches` only
+        // inspects concrete kinds, so filtering `T` itself would collapse
+        // `typeof x === 'object'` to `never`) — but the answer must stay a
+        // subtype of `T`, so the filtered constraint is intersected back with
+        // the type param. tsc does exactly this (`getNarrowedType` ends in
+        // `getIntersectionType([t, candidate])` for an instantiable `t`), and it
+        // is what keeps a narrowed reference passable where `T` is wanted: in
+        // `<T extends { id: string } | string>`, the value argument of
+        // `m.set(typeof e === "string" ? e : e.id, e)` is read at the merge of
+        // the two branches, and a bare filtered constraint made it
+        // `string | { id: string }` — not assignable to `T` (TS2345).
+        if (c.ts.kind(t0) == .type_param) {
+            const con = try c.baseConstraintOf(t0);
+            if (con != t0) {
+                const narrowed = try c.narrowByTypeofResolved(con, which, sense);
+                if (narrowed == con) return t0; // nothing filtered
+                if (c.ts.kind(narrowed) == .never) return types.never_type;
+                return c.ts.makeIntersection(c.scratch(), &.{ t0, narrowed });
+            }
+        }
+        return c.narrowByTypeofResolved(t0, which, sense);
+    }
+
+    fn narrowByTypeofResolved(c: *Checker, t: TypeId, which: usize, sense: bool) Error!TypeId {
         if (c.ts.kind(t) == .union_type) {
             var parts: std.ArrayList(TypeId) = .empty;
             defer parts.deinit(c.scratch());
