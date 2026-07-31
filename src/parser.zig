@@ -1260,12 +1260,40 @@ const Parser = struct {
         return p.parseType();
     }
 
+    /// Can `tag` begin a type parameter's name (or another variance modifier)?
+    /// Decides whether a preceding contextual `out` is a MODIFIER rather than
+    /// the parameter's own name. A fully reserved word (`extends`) is not
+    /// ident-like, so `<out extends X>` keeps parsing as a parameter named
+    /// `out` — tsc reports TS1359 there instead, a deliberate under-report on
+    /// a shape no real code writes.
+    fn typeParamNameFollows(tag: TokTag) bool {
+        return isIdentLike(tag) or tag == .keyword_in or tag == .keyword_out or tag == .keyword_const;
+    }
+
     fn parseTypeParams(p: *Parser) PE!ast.SubRange {
         _ = try p.expectLt();
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
         while (p.curTag() != .gt and p.curTag() != .eof) {
             const before = p.curIdx();
+            // `out` is a CONTEXTUAL keyword, so unlike `const` and `in` it is
+            // ident-like and never reached the modifier switch below — it was
+            // taken as the parameter's NAME, and the real name that followed
+            // it was a syntax error. Every `<out T>` declaration in the file
+            // was lost: zod v4's `$ZodTypeInternals<out O = unknown, out I =
+            // unknown>` came out with one parameter and no defaults, so
+            // `$ZodType`'s `Internals = $ZodTypeInternals<O, I>` default was
+            // an arity error, `_zod` resolved to `unknown`, and every
+            // `z.infer<…>` in a zod-typed API degraded to `unknown`.
+            //
+            // It is the TS 4.7 variance modifier exactly when a name can
+            // follow it (tsc's `parseAnyContextualModifier` ->
+            // `canFollowModifier`); `<out>`, `<out, T>` and `<out = X>` still
+            // declare a parameter *named* `out`, as tsc parses them.
+            if (p.curTag() == .keyword_out and typeParamNameFollows(p.peekTag(1))) {
+                _ = try p.bump();
+                continue;
+            }
             if (!isIdentLike(p.curTag())) {
                 // `const T` / `in`/`out` variance — consume modifiers.
                 switch (p.curTag()) {
