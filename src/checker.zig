@@ -625,6 +625,12 @@ const Checker = struct {
     /// non-confluently into distinct interned objects. It is an identity-only
     /// shortcut (no variance): it fires solely when both origins are equal.
     origin: std.AutoHashMapUnmanaged(TypeId, TypeId) = .empty,
+    /// Declared (`in`/`out`) variance of a generic symbol's type parameters,
+    /// packed 2 bits each (see `Variance`), lowest bits first. A cached 0 —
+    /// the overwhelmingly common case — means "no parameter is annotated", so
+    /// the relation's variance probe costs one hash lookup on hot paths.
+    /// Parameters past the 16th are read as unannotated.
+    variance_cache: std.AutoHashMapUnmanaged(SymbolId, u32) = .empty,
     /// Generic (uninstantiated) bodies per symbol: interface/class-instance/
     /// class-static/alias.
     iface_generic: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
@@ -13300,6 +13306,110 @@ const Checker = struct {
         return c.enumHasStringValue(c.ts.enumSymbol(e), c.ts.literalAtom(lit));
     }
 
+    /// Declaration-site variance (TS 4.7 `in`/`out`) of one type parameter.
+    const Variance = enum(u2) {
+        none = 0,
+        /// `in T` — contravariant: `G<Super>` is assignable to `G<Sub>`.
+        contravariant = 1,
+        /// `out T` — covariant: `G<Sub>` is assignable to `G<Super>`.
+        covariant = 2,
+        /// `in out T` — invariant: the arguments must be mutually assignable.
+        invariant = 3,
+    };
+
+    /// The `in`/`out` annotation on a type parameter, read back off the tokens
+    /// that precede its name. The parser consumes the modifiers without
+    /// storing them and the token stream already holds the answer, so an
+    /// annotation costs no node, symbol, or type-store memory. Only `in`,
+    /// `out` and the name itself can occupy those slots (a `const` or the
+    /// opening `<`/`,` ends the walk), so the scan cannot run past its
+    /// parameter.
+    fn declaredVarianceOfTypeParam(c: *Checker, tp_sym: SymbolId) Variance {
+        const saved = c.enterSymFile(tp_sym);
+        defer c.restoreCtx(saved);
+        for (c.declsOf(tp_sym)) |decl| {
+            if (c.nodeTag(decl) != .type_param) continue;
+            var tok = c.tree.nodeMainToken(decl);
+            var bits: u2 = 0;
+            while (tok > 0) {
+                tok -= 1;
+                switch (c.tree.tokens.tag(tok)) {
+                    .keyword_in => bits |= 1,
+                    .keyword_out => bits |= 2,
+                    else => break,
+                }
+            }
+            return @enumFromInt(bits);
+        }
+        return .none;
+    }
+
+    /// Declared variances of `owner`'s type parameters, packed 2 bits each
+    /// (see `variance_cache`). 0 means no parameter is annotated.
+    fn declaredVariances(c: *Checker, owner: SymbolId) Error!u32 {
+        if (c.variance_cache.get(owner)) |v| return v;
+        var bits: u32 = 0;
+        var tps: std.ArrayList(TypeParamInfo) = .empty;
+        defer tps.deinit(c.scratch());
+        try c.typeParamsOf(owner, &tps);
+        for (tps.items, 0..) |tp, i| {
+            if (i >= 16) break;
+            bits |= @as(u32, @intFromEnum(c.declaredVarianceOfTypeParam(tp.sym))) << @intCast(2 * i);
+        }
+        try c.variance_cache.put(c.cm(), owner, bits);
+        return bits;
+    }
+
+    /// tsc's variance-directed comparison (`relateVariances`) of two
+    /// references to the SAME generic symbol, restricted to type parameters
+    /// that carry an explicit `in`/`out` annotation.
+    ///
+    /// An annotation is a DECLARATION, not a hint: where it holds the two
+    /// instantiations relate however their members compare — for
+    /// `interface Getter<in T> { get(): T }`, `Getter<unknown>` IS assignable
+    /// to `Getter<string>`, which the structural walk rejects on the return
+    /// type — and where it fails they do not relate even when the members
+    /// would have matched bivariantly.
+    ///
+    /// Returns null whenever the annotations say nothing decisive — none
+    /// present, mismatched arity, or an UNANNOTATED parameter whose two
+    /// arguments are not already equal — leaving every relation ztsc decided
+    /// before this existed to the structural walk, unchanged.
+    fn varianceVerdict(c: *Checker, s_ref: TypeId, t_ref: TypeId) Error!?bool {
+        const st = &c.ts;
+        const n = st.refArgCount(s_ref);
+        if (n == 0 or n != st.refArgCount(t_ref)) return null;
+        const bits = try c.declaredVariances(st.refSymbol(s_ref));
+        if (bits == 0) return null;
+        var decisive = true;
+        for (0..n) |i| {
+            const sa = st.refArgAt(s_ref, i);
+            const ta = st.refArgAt(t_ref, i);
+            const v: Variance = if (i >= 16) .none else @enumFromInt(@as(u2, @truncate(bits >> @intCast(2 * i))));
+            switch (v) {
+                // Unannotated: equal arguments hold under ANY variance, so
+                // they stay decidable here; anything else defers the whole
+                // pair to the structural walk.
+                .none => if (!try c.originArgEquiv(sa, ta, 0)) {
+                    decisive = false;
+                },
+                .covariant => if (!try c.isAssignable(sa, ta)) return false,
+                .contravariant => if (!try c.isAssignable(ta, sa)) return false,
+                .invariant => if (!(try c.isAssignable(sa, ta)) or !(try c.isAssignable(ta, sa))) return false,
+            }
+        }
+        return if (decisive) true else null;
+    }
+
+    /// The generic reference a type denotes: itself when it IS one, otherwise
+    /// the canonical origin ref of a materialized instantiation (see `origin`).
+    fn refFacetOf(c: *Checker, ty: TypeId, k: types.Kind) ?TypeId {
+        if (k == .ref) return ty;
+        if (!originTaggable(k)) return null;
+        const o = c.origin.get(ty) orelse return null;
+        return if (c.ts.kind(o) == .ref) o else null;
+    }
+
     fn isAssignable(c: *Checker, s0: TypeId, t0: TypeId) Error!bool {
         // Structural-relation recursion guard (see `max_relation_depth`). Past
         // the cap, assume the pair related — this only drops diagnostics, never
@@ -13366,6 +13476,18 @@ const Checker = struct {
                 if (os == t) return true;
                 if (c.ts.kind(os) == .ref and c.ts.refSymbol(os) == c.ts.refSymbol(t) and
                     try c.originArgEquiv(os, t, 0)) return true;
+            }
+        }
+        // Declared variance (`interface Box<in T>`/`<out T>`): two references
+        // to the same generic symbol relate by their type ARGUMENTS, not by
+        // their members (see `varianceVerdict`). Runs after the identity
+        // fast-paths above — an equal pair never reaches here — and yields to
+        // the structural walk whenever the annotations are not decisive.
+        if (c.refFacetOf(s, sk)) |sr| {
+            if (c.refFacetOf(t, tk)) |tr| {
+                if (sr != tr and c.ts.refSymbol(sr) == c.ts.refSymbol(tr)) {
+                    if (try c.varianceVerdict(sr, tr)) |verdict| return verdict;
+                }
             }
         }
         // Trivial targets/sources.

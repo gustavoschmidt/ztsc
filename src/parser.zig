@@ -1225,7 +1225,7 @@ const Parser = struct {
     /// Type params + params + return type → extra index of FnProto.
     fn parseFnProtoRest(p: *Parser, flags: u32, name_tok: u32) PE!u32 {
         var tp: ast.SubRange = .{ .start = 0, .end = 0 };
-        if (p.atLt()) tp = try p.parseTypeParams();
+        if (p.atLt()) tp = try p.parseTypeParams(false);
         const params = try p.parseParams();
         var ret: Node = null_node;
         if (try p.eat(.colon) != null) ret = try p.parseReturnType();
@@ -1270,39 +1270,50 @@ const Parser = struct {
         return isIdentLike(tag) or tag == .keyword_in or tag == .keyword_out or tag == .keyword_const;
     }
 
-    fn parseTypeParams(p: *Parser) PE!ast.SubRange {
+    /// `allow_variance` is true only for the three declaration forms that HAVE
+    /// declaration-site variance (class, interface, type alias); a function,
+    /// method, arrow, or function/constructor type gets TS1274 per modifier.
+    fn parseTypeParams(p: *Parser, allow_variance: bool) PE!ast.SubRange {
         _ = try p.expectLt();
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
         while (p.curTag() != .gt and p.curTag() != .eof) {
             const before = p.curIdx();
-            // `out` is a CONTEXTUAL keyword, so unlike `const` and `in` it is
-            // ident-like and never reached the modifier switch below — it was
-            // taken as the parameter's NAME, and the real name that followed
-            // it was a syntax error. Every `<out T>` declaration in the file
-            // was lost: zod v4's `$ZodTypeInternals<out O = unknown, out I =
-            // unknown>` came out with one parameter and no defaults, so
-            // `$ZodType`'s `Internals = $ZodTypeInternals<O, I>` default was
-            // an arity error, `_zod` resolved to `unknown`, and every
-            // `z.infer<…>` in a zod-typed API degraded to `unknown`.
+            // Leading modifiers: `const` (TS 5.0) and the `in`/`out` variance
+            // annotations (TS 4.7). Consumed and dropped — the CHECKER reads
+            // the annotation back off the token before the name (see
+            // `declaredVarianceOfTypeParam`), so nothing is stored per node.
             //
-            // It is the TS 4.7 variance modifier exactly when a name can
-            // follow it (tsc's `parseAnyContextualModifier` ->
-            // `canFollowModifier`); `<out>`, `<out, T>` and `<out = X>` still
-            // declare a parameter *named* `out`, as tsc parses them.
-            if (p.curTag() == .keyword_out and typeParamNameFollows(p.peekTag(1))) {
-                _ = try p.bump();
-                continue;
+            // `out` is a CONTEXTUAL keyword, so unlike `const` and `in` it is
+            // ident-like: it is the modifier exactly when a name can follow it
+            // (tsc's `parseAnyContextualModifier` -> `canFollowModifier`), and
+            // `<out>`, `<out, T>` and `<out = X>` still declare a parameter
+            // *named* `out`, as tsc parses them.
+            var out_tok: ?u32 = null;
+            while (true) {
+                const tag = p.curTag();
+                const is_modifier = switch (tag) {
+                    .keyword_const, .keyword_in => true,
+                    .keyword_out => typeParamNameFollows(p.peekTag(1)),
+                    else => false,
+                };
+                if (!is_modifier) break;
+                const tok = try p.bump();
+                if (tag == .keyword_const) continue;
+                // Diagnostics only — `errAtToken` does not backtrack, and a
+                // speculative parse that loses discards them with `restore`,
+                // so reporting here cannot cost us an arrow function.
+                if (!allow_variance) {
+                    try p.errAtToken(if (tag == .keyword_in)
+                        .in_modifier_not_valid_here
+                    else
+                        .out_modifier_not_valid_here, tok);
+                } else if (tag == .keyword_in) {
+                    if (out_tok != null) try p.errAtToken(.in_must_precede_out, tok);
+                }
+                if (tag == .keyword_out) out_tok = tok;
             }
             if (!isIdentLike(p.curTag())) {
-                // `const T` / `in`/`out` variance — consume modifiers.
-                switch (p.curTag()) {
-                    .keyword_const, .keyword_in, .keyword_out => {
-                        _ = try p.bump();
-                        continue;
-                    },
-                    else => {},
-                }
                 try p.fail(.expected_identifier);
                 if (p.curIdx() == before) break;
                 continue;
@@ -1503,7 +1514,7 @@ const Parser = struct {
             name_tok = try p.bump();
         }
         var tp: ast.SubRange = .{ .start = 0, .end = 0 };
-        if (p.atLt()) tp = try p.parseTypeParams();
+        if (p.atLt()) tp = try p.parseTypeParams(true);
 
         var extends: Node = null_node;
         if (try p.eat(.keyword_extends) != null) {
@@ -1752,7 +1763,7 @@ const Parser = struct {
         const kw = try p.bump(); // `interface`
         const name_tok = try p.expectIdentLike();
         var tp: ast.SubRange = .{ .start = 0, .end = 0 };
-        if (p.atLt()) tp = try p.parseTypeParams();
+        if (p.atLt()) tp = try p.parseTypeParams(true);
         var ext: ast.SubRange = .{ .start = 0, .end = 0 };
         if (try p.eat(.keyword_extends) != null) {
             const top = p.scratchTop();
@@ -1797,7 +1808,7 @@ const Parser = struct {
         const kw = try p.bump(); // `type`
         const name_tok = try p.expectIdentLike();
         var tp: ast.SubRange = .{ .start = 0, .end = 0 };
-        if (p.atLt()) tp = try p.parseTypeParams();
+        if (p.atLt()) tp = try p.parseTypeParams(true);
         _ = try p.expect(.eq, .expected_eq);
         const value = try p.parseType();
         try p.expectSemicolon();
@@ -2441,7 +2452,7 @@ const Parser = struct {
             }
         }
         var tp: ast.SubRange = .{ .start = 0, .end = 0 };
-        if (p.atLt()) tp = try p.parseTypeParams();
+        if (p.atLt()) tp = try p.parseTypeParams(false);
         if (p.curTag() != .l_paren) return error.Backtrack;
         const params = try p.parseParams();
         var ret: Node = null_node;
@@ -3340,7 +3351,7 @@ const Parser = struct {
         if (is_abstract) _ = try p.bump(); // `abstract`
         _ = try p.bump(); // `new`
         var tp: ast.SubRange = .{ .start = 0, .end = 0 };
-        if (p.atLt()) tp = try p.parseTypeParams();
+        if (p.atLt()) tp = try p.parseTypeParams(false);
         const params = try p.parseParams();
         _ = try p.expect(.arrow, .expected_arrow);
         const ret = try p.parseReturnType();
@@ -3373,7 +3384,7 @@ const Parser = struct {
     fn parseFunctionType(p: *Parser) PE!Node {
         const start_tok = p.curIdx();
         var tp: ast.SubRange = .{ .start = 0, .end = 0 };
-        if (p.atLt()) tp = try p.parseTypeParams();
+        if (p.atLt()) tp = try p.parseTypeParams(false);
         const params = try p.parseParams();
         _ = try p.expect(.arrow, .expected_arrow);
         // Past the `=>` the function type is committed — a parenthesized type

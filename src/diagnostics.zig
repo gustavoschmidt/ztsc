@@ -65,6 +65,15 @@ pub const Code = enum(u16) {
     /// TS1206: a decorator in a position the grammar forbids (parameter
     /// decorator under TC39 standard decorators).
     decorator_not_valid_here,
+    /// TS1274: an `in` variance annotation outside a class/interface/type
+    /// alias type parameter (a function, method, or function/constructor type
+    /// has no declaration-site variance).
+    in_modifier_not_valid_here,
+    /// TS1274: an `out` variance annotation in the same forbidden positions.
+    out_modifier_not_valid_here,
+    /// TS1029: `<out in T>` — the two variance annotations are in the wrong
+    /// order.
+    in_must_precede_out,
 
     // --- bind errors, tsc-compatible codes via tsCode() ---------------
     /// TS2300: two declarations of the same name that cannot merge
@@ -127,6 +136,9 @@ pub const Code = enum(u16) {
             .line_break_not_allowed => "line break not permitted here",
             .argument_expected => "argument expression expected",
             .decorator_not_valid_here => "Decorators are not valid here.",
+            .in_modifier_not_valid_here => "'in' modifier can only appear on a type parameter of a class, interface or type alias",
+            .out_modifier_not_valid_here => "'out' modifier can only appear on a type parameter of a class, interface or type alias",
+            .in_must_precede_out => "'in' modifier must precede 'out' modifier.",
             .duplicate_identifier => "duplicate identifier",
             .block_scoped_redeclare => "cannot redeclare block-scoped variable",
             .duplicate_function_implementation => "duplicate function implementation",
@@ -147,6 +159,8 @@ pub const Code = enum(u16) {
             .import_conflict => 2440,
             .catch_redeclare => 2492,
             .decorator_not_valid_here => 1206,
+            .in_modifier_not_valid_here, .out_modifier_not_valid_here => 1274,
+            .in_must_precede_out => 1029,
             else => 0,
         };
     }
