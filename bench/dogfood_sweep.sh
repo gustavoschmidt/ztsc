@@ -50,7 +50,7 @@ MAX_CHECKERS="${MAX_CHECKERS:-8}"
 SOFT="${DOGFOOD_SOFT:-0}"
 
 # The ratchet. Lower it with every landed fix; the gate fails on any rise.
-DOGFOOD_MAX_EXCESS="${DOGFOOD_MAX_EXCESS:-27}"
+DOGFOOD_MAX_EXCESS="${DOGFOOD_MAX_EXCESS:-2}"
 DOGFOOD_MAX_UNDER="${DOGFOOD_MAX_UNDER:-0}"
 
 echo "== building ztsc (ReleaseFast) =="
