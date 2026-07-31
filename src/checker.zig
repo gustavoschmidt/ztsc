@@ -3852,15 +3852,32 @@ const Checker = struct {
                 // cannot re-materialize deferred `.d.ts` machinery (the OOM guard
                 // and the redux `ExtractStoreExtensions` unmask both require an
                 // *abstract* arg), so those concerns below don't apply here.
-                const ground_earlier = bare_earlier != null and
-                    !(try c.containsTypeParam(out[bare_earlier.?]));
+                //
+                // A referenced argument that is itself a *naked type parameter*
+                // is the same single symbol swap: it renames one bound name to
+                // another and expands nothing, so it can no more re-materialize
+                // deferred `.d.ts` machinery than a ground argument can. Leaving
+                // it unsubstituted is in fact unsound rather than lenient — the
+                // alias body keeps a *free* occurrence of the alias's own `S`
+                // that the caller's later instantiation can never close. RTK's
+                // `interface Slice<State, …> { reducer: Reducer<State> }` over
+                // redux's `Reducer<S, A, PreloadedState = S>` materialized as
+                // `(state: State | S | undefined, …) => State`; substituting
+                // `Slice<X>` then left the dangling `S` behind, and a merely
+                // *generic* type poisons every conditional that tests it —
+                // `combineReducers`' `M[keyof M] extends Reducer<…> | undefined`
+                // never decided, so its result stayed an unreduced conditional
+                // and `configureStore({ reducer: rootReducer })` was rejected.
+                const swappable_earlier = bare_earlier != null and
+                    (!(try c.containsTypeParam(out[bare_earlier.?])) or
+                        c.ts.kind(out[bare_earlier.?]) == .type_param);
                 // Ensure the generic body is built so self-recursion is detected
                 // (the flag is set when materialization re-enters this alias).
-                const recursive = if (bare_earlier != null and !ground_earlier and c.symInDeclFile(sym)) rec: {
+                const recursive = if (bare_earlier != null and !swappable_earlier and c.symInDeclFile(sym)) rec: {
                     if ((c.alias_state.get(sym) orelse 0) != 1) _ = try c.aliasGeneric(sym);
                     break :rec (c.alias_state.get(sym) orelse 0) == 1 or c.alias_recursive.contains(sym);
                 } else true;
-                if (bare_earlier != null and (ground_earlier or recursive or !c.symInDeclFile(sym))) {
+                if (bare_earlier != null and (swappable_earlier or recursive or !c.symInDeclFile(sym))) {
                     out[i] = out[bare_earlier.?];
                 } else if (c.symInDeclFile(sym)) {
                     // A *complex* or non-recursive library default (e.g. RTK's
@@ -17403,6 +17420,21 @@ const Checker = struct {
     /// every callback parameter inside it fell to implicit `any` — TS7006 at
     /// call sites that are correct TypeScript.
     fn objLitIsContextSensitive(c: *Checker, node: Node) bool {
+        return c.objLitIsContextSensitiveAt(node, 0, false);
+    }
+
+    /// The same question restricted to the literal's OWN properties — no
+    /// recursion into a nested object literal. A shallow-sensitive literal is
+    /// one the single contextual read already handles: every un-annotated
+    /// callback parameter it carries is named directly by a property of the
+    /// parameter type, so reading the literal against that parameter types
+    /// them. Only a literal whose sensitivity is NESTED is read against a
+    /// property type that may itself still be a bare inference variable.
+    fn objLitIsShallowContextSensitive(c: *Checker, node: Node) bool {
+        return c.objLitIsContextSensitiveAt(node, 0, true);
+    }
+
+    fn objLitIsContextSensitiveAt(c: *Checker, node: Node, depth: u8, shallow: bool) bool {
         for (c.tree.nodeRange(node)) |m| {
             if (m == null_node) continue;
             const val = switch (c.nodeTag(m)) {
@@ -17412,6 +17444,17 @@ const Checker = struct {
             if (val == null_node) continue;
             switch (c.nodeTag(val)) {
                 .arrow_fn, .function_expr => {},
+                // tsc's `isContextSensitive` RECURSES through a property
+                // assignment into a nested object literal, so a bag of
+                // un-annotated callbacks one level down makes the whole
+                // argument context sensitive. redux-toolkit's
+                // `createSlice({ name, initialState, reducers })` is that
+                // shape — the sensitivity lives entirely inside `reducers`.
+                .object_literal => {
+                    if (shallow) continue;
+                    if (depth < 4 and c.objLitIsContextSensitiveAt(val, depth + 1, false)) return true;
+                    continue;
+                },
                 else => continue,
             }
             const proto = c.tree.extraData(ast.FnProto, c.tree.nodeData(val).lhs);
@@ -20561,15 +20604,38 @@ const Checker = struct {
             // parameter this argument is meant to determine. They live in a
             // scratch copy that only builds pass two's contextual type; pass
             // two re-derives every candidate this argument really carries.
-            if (tag == .object_literal and arg_ctx == types.no_type and
-                c.objLitIsContextSensitive(an))
+            //
+            // A literal-keeping contextual type normally REPLACES the two
+            // passes, and rightly so: every un-annotated callback such a
+            // literal carries at its OWN top level is named directly by a
+            // property of the parameter type, so the single contextual read
+            // types them and is the better reading.
+            //
+            // That reasoning does not reach a callback one level DOWN, inside a
+            // nested object literal. The nested bag is read against the
+            // parameter's property type, which is routinely a bare inference
+            // variable of this very call — the variable the bag is meant to
+            // determine — so what comes back still names this call's own
+            // parameters. RTK's `createSlice({ name, initialState, reducers })`
+            // is that shape: `name: Name` (`Name extends string`) asks for the
+            // literal-keeping read, while `reducers` is a bag of un-annotated
+            // case reducers read against `ValidateSliceCaseReducers<State, CR>`
+            // with `State` still free. `CaseReducers` came out as
+            // `{ … (state: State) => void … }`, failed its own
+            // `CR extends SliceCaseReducers<State>` check, and was clamped to
+            // that constraint — whose `keyof` is `string`, which collapsed
+            // `slice.actions`' `{ [Type in keyof CaseReducers]: … }` to `{}`.
+            // The two passes fix `State` between them, which is exactly the
+            // missing step, so they run for a NESTED-only sensitivity.
+            if (tag == .object_literal and c.objLitIsContextSensitive(an) and
+                (arg_ctx == types.no_type or !c.objLitIsShallowContextSensitive(an)))
             {
                 const probe_cands = try c.scratch().alloc(TypeId, tp_syms.len);
                 for (candidates, 0..) |cd, i| probe_cands[i] = cd;
                 c.side_query_depth += 1;
                 const ctx2 = blk: {
                     errdefer c.side_query_depth -= 1;
-                    const probe = try c.checkExprCached(an, types.no_type);
+                    const probe = try c.checkExprCached(an, arg_ctx);
                     try c.unify(pt, probe, tp_syms, probe_cands, 0);
                     // Every type parameter is FIXED for pass two: one the probe
                     // could not infer takes its default/constraint (tsc fixes a
@@ -20594,8 +20660,21 @@ const Checker = struct {
                             v = try c.typeParamDefault(sym);
                             if (v == types.no_type) v = try c.typeParamConstraint(sym);
                             if (v == types.no_type) v = types.any_type;
-                            if (map2.items.len > 0) v = try c.instantiate(v, map2.items);
                         }
+                        // Declaration order applies to a probe CANDIDATE too,
+                        // not only to a fallback: the probe read the argument
+                        // while the earlier parameters were still free, so its
+                        // candidate can carry them (`reducers`' inferred
+                        // `{ a: (state: State) => void }` still naming the
+                        // `State` that `initialState` has since pinned).
+                        // Handing that to pass two left the free variable in
+                        // the contextual type, so pass two re-derived the same
+                        // half-open candidate and the constraint check
+                        // (`CR extends SliceCaseReducers<State>`) rejected it —
+                        // clamping the parameter to its constraint, whose
+                        // `keyof` is `string`, which is how RTK's
+                        // `slice.actions` became `{}`.
+                        if (map2.items.len > 0) v = try c.instantiate(v, map2.items);
                         try map2.append(c.scratch(), .{ .sym = sym, .ty = v });
                     }
                     break :blk try c.instantiate(pt, map2.items);
@@ -21876,6 +21955,16 @@ const Checker = struct {
                     try c.memberList(ra)
                 else
                     try c.scratch().dupe(TypeId, &.{ra});
+                // Scanned before any re-entry: `memberList` hands out a
+                // borrowed slice, and the pairing pass below can invalidate it.
+                var naked: TypeId = types.no_type;
+                var naked_n: usize = 0;
+                for (try c.memberList(param)) |pm| {
+                    if (s.kind(pm) != .type_param) continue;
+                    if (tpIndex(tp_syms, s.typeParamSymbol(pm)) == null) continue;
+                    naked = pm;
+                    naked_n += 1;
+                }
                 for (try c.memberList(param)) |pm| {
                     if (!try c.containsTypeParam(pm)) continue;
                     for (ams) |am| {
@@ -21883,6 +21972,31 @@ const Checker = struct {
                             try c.unify(pm, am, tp_syms, candidates, depth + 1);
                         }
                     }
+                }
+                // tsc's `inferToMultipleTypes` naked-type-variable rule: when
+                // the intersection parameter has EXACTLY ONE constituent that
+                // is a bare inference variable, the WHOLE source infers to it
+                // once the non-variable constituents have been inferred
+                // through. This is *not* the constituent pairing the helper
+                // above deliberately refuses — nothing gets swallowed, the
+                // variable simply receives the argument as written, which is
+                // the only reading available when the rest of the intersection
+                // is a decoration over that same variable.
+                //
+                // RTK's `createSlice({ reducers })` types its parameter as
+                // `ValidateSliceCaseReducers<S, ACR> = ACR & { [T in keyof
+                // ACR]: … }`. Neither constituent paired (a naked variable is
+                // no pair, and a mapped parameter never pairs with an object
+                // argument), so `ACR` took no candidate at all and fell back to
+                // its `SliceCaseReducers<State>` constraint — whose `keyof` is
+                // `string`, collapsing `Slice.actions`'
+                // `{ [Type in keyof CaseReducers]: … }` to `{}` and rejecting
+                // every annotated `slice.actions` binding.
+                //
+                // tsc skips this path entirely when the source is a union
+                // (`inferFromTypes`' `!(source.flags & TypeFlags.Union)`).
+                if (naked_n == 1 and s.kind(arg) != .union_type) {
+                    try c.unify(naked, arg, tp_syms, candidates, depth + 1);
                 }
             },
             .mapped => try c.inferReverseMapped(param, arg, tp_syms, candidates, depth),
