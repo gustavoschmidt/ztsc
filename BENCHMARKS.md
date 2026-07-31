@@ -102,7 +102,7 @@ Two applications are measured — a whole app graph rather than a single package
 | application | wall ztsc / tsgo | peak RSS ztsc / tsgo | rss vs tsgo | diagnostics |
 |---|---:|---:|---:|---|
 | **excalidraw** 0.18.1 (`a2ec2889`) — public | 0.355 / 0.502 s | 129.8 / 649.5 MB | 20% | the same 17 as tsgo, at every checker count |
-| production React/TS app — private | 0.40 / 0.53 s | 219.6 / 734 MB | 30% | all 48 of tsc's errors byte-identical, + 10 tracked false positives |
+| production React/TS app — private | 0.40 / 0.53 s | 219.6 / 734 MB | 30% | all 48 of tsc's errors byte-identical, + 2 tracked false positives |
 
 **excalidraw** is the public, reproducible row, measured 2026-07-30 with ztsc
 at commit 218978d. It loads 1,110 files / 332,794 lines (537 of them the project's own source; the rest are
@@ -140,7 +140,7 @@ measured.
 The **private** row is the standing dogfood target, measured 2026-07-26 and
 scored against `tsc` 5.9.3. That codebase is private, so the run is not
 reproducible from this repository; excalidraw above is its public counterpart.
-None of its 10 false positives reproduce on excalidraw.
+None of its 2 false positives reproduce on excalidraw.
 
 ### Scaling with `--checkers`
 

@@ -128,7 +128,7 @@ Windows are the biggest gaps, all planned. Unsupported syntax produces a clear
 rather than inventing errors on valid code: on excalidraw it reports exactly
 the same 17 diagnostics as tsgo with no false positives at all, and on the
 private production dogfood app it reproduces all 48 of tsc's errors
-byte-identically and adds 10 tracked false positives. `ztsc --census` tells you
+byte-identically and adds 2 tracked false positives. `ztsc --census` tells you
 in one command exactly which unsupported constructs your own project contains.
 
 On Windows specifically, ztsc does not build or run yet: the checker's

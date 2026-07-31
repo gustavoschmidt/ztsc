@@ -79,7 +79,7 @@
     code, at every checker count from 1 to 8, in <strong>0.35&thinsp;s / 129.8&thinsp;MB</strong>
     against tsgo's <strong>0.50&thinsp;s / 649.5&thinsp;MB</strong>. ztsc's standing dogfood
     target is additionally a large production React/TypeScript application (private codebase),
-    where it reproduces <strong>all 48 of tsc's errors byte-identically</strong> (plus 10 tracked
+    where it reproduces <strong>all 48 of tsc's errors byte-identically</strong> (plus 2 tracked
     false positives) in <strong>0.40&thinsp;s / 219.6&thinsp;MB</strong> against tsgo's
     <strong>0.53&thinsp;s / 734&thinsp;MB</strong>, both at their default four checkers.</li>
   </ul>
@@ -324,14 +324,14 @@ EXC=/path/to/excalidraw bench/convergence.sh</code></pre>
   <table>
     <thead><tr><th>tool</th><th class="num">wall</th><th class="num">peak RSS</th><th>diagnostics</th></tr></thead>
     <tbody>
-      <tr class="hl"><td>ztsc</td><td class="num">0.40 s</td><td class="num">219.6 MB</td><td>all 48 of tsc's errors, byte-identical + 10 tracked false positives</td></tr>
+      <tr class="hl"><td>ztsc</td><td class="num">0.40 s</td><td class="num">219.6 MB</td><td>all 48 of tsc's errors, byte-identical + 2 tracked false positives</td></tr>
       <tr><td>tsgo 7.0.2</td><td class="num">0.53 s</td><td class="num">734 MB</td><td>baseline (both tools at their default 4 checkers)</td></tr>
     </tbody>
   </table>
   </div>
   <p>This is the largest corpus measured and the memory ratio (30%) is measured there too, not
   only on declarations. The codebase is private, so this row is not reproducible by readers —
-  excalidraw above is the public counterpart. The 10 false positives are each diagnosed and
+  excalidraw above is the public counterpart. The 2 false positives are each diagnosed and
   tracked on the <a href="limitations.html">limitations page</a>; none of them reproduce on
   excalidraw.</p>
 </section>

@@ -174,7 +174,7 @@ ztsc src/main.ts           # or explicit entry files</code></pre>
   <p>ztsc is pre-release. The biggest gaps: <strong>no Windows</strong> (macOS and Linux work
   today; a port is planned), <strong>no watch mode or LSP</strong> (batch only; both planned
   next), a tsconfig subset (strict mode only — <code>strict: false</code> is refused), and
-  <strong>10 tracked false positives</strong> on the production dogfood application, against
+  <strong>2 tracked false positives</strong> on the production dogfood application, against
   all 48 of tsc's real errors reproduced byte-identically — while on
   <a href="benchmarks.html">excalidraw</a> ztsc reports exactly the same findings as tsgo,
   with zero excess, at every checker count. Everything else fails in the safe

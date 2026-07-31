@@ -63,7 +63,7 @@
   diagnostics as tsgo 7.0.2</strong>, same file, line, column and code, at every checker count
   from 1 to 8: nothing extra, nothing missing. On the standing private dogfood target, a large
   production React/TypeScript application, it reproduces <strong>all 48 of tsc's errors
-  byte-identically</strong> and adds <strong>10 false positives</strong> of its own. Close, and
+  byte-identically</strong> and adds <strong>2 false positives</strong> of its own. Close, and
   measured, but not there yet.</p>
 </section>
 
@@ -101,7 +101,7 @@
 <!-- ============================================================ -->
 <section>
   <p class="eyebrow"><span class="n">03</span> · false positives</p>
-  <h2>Zero on the public app, ten on the private one</h2>
+  <h2>Zero on the public app, two on the private one</h2>
   <p>The number that matters most for trust is not estimated — it is measured continuously on
   real applications, against two independent truth sets.</p>
   <p>On <strong><a href="https://github.com/excalidraw/excalidraw">excalidraw</a></strong> — the
@@ -114,18 +114,24 @@
   <em>text</em> still differs from tsgo's in places, so this is a same-findings result, not a
   byte-identical-output one.</p>
   <p>On the private dogfood target — a large production React/TypeScript codebase, scored
-  against tsc 5.9.3 — the current count is <strong>10 false positives</strong>, each with a
-  root-cause diagnosis; closing them is active work. None of the ten reproduce on excalidraw.
-  They cluster into three shapes:</p>
+  against tsc 5.9.3 — ztsc reproduces all <strong>48</strong> of tsc's errors at the same
+  file, line, column and code, and adds <strong>2 false positives</strong>. That is a standing
+  gate too (<code>bench/dogfood_sweep.sh</code>), ratcheted at 2: run-to-run byte-identical at
+  each checker count, the same diagnostic set at every count from 1 to 8, and zero
+  under-reports. Both survivors have a root-cause diagnosis, and both are deliberate stops
+  rather than open mysteries:</p>
   <ul>
-    <li><strong>Deep generic inference</strong> — immer's <code>Draft&lt;S&gt;</code> under a
-    reducer spread (three interacting mechanisms: method bivariance, spread dropping index
-    signatures, deferred conditional reduction) and Zod v4's <code>z.infer</code>.</li>
-    <li><strong>Control-flow narrowing depth</strong> — a few narrowing chains (aliased
-    conditions combined with deep optional chains) that tsc tracks further than ztsc does
-    yet.</li>
-    <li><strong>One lib-policy divergence</strong> — a case where ztsc's embedded-lib policy
-    differs from tsc's and the goldens pin the divergence deliberately.</li>
+    <li><strong>A store-extension chain left unmaterialized</strong> — redux-toolkit's
+    <code>configureStore</code> reaches its dispatch type through four links of complex
+    library defaults over abstract arguments, which ztsc declines to substitute; a thunk's
+    <code>.unwrap</code> is missing as a result. Materializing them needs inference-variable
+    constraint tracking that is a design item, not a patch.</li>
+    <li><strong>An instantiation-depth ceiling</strong> — a zod v4 schema type now resolves
+    (a variance-annotation parser gap used to collapse it to <code>unknown</code>, hiding the
+    question), and materializing it reaches depth 101 against a ceiling of 100. The ceiling is
+    calibrated against tsc, which reports the same error from depth 110 where ztsc does;
+    raising it alone would trade this false positive for under-reports. The fix is to separate
+    structural-recursion depth from nesting depth.</li>
   </ul>
   <p>Everything else on this page is an <em>under</em>-report — a missed error, not a false
   alarm. For an agent or CI gate, that asymmetry is deliberate: a bogus error sends a machine
