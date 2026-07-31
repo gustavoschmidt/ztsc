@@ -940,6 +940,13 @@ const Checker = struct {
     /// reverse-mapped one outright and a reverse-mapped one arriving second is
     /// discarded. Shares `contra_owner`'s identity check.
     rev_flags: []bool = &.{},
+    /// Non-zero while `unify` is running *inside* a homomorphic-mapped-parameter
+    /// inference (the alias-identity pairing in `inferReverseMapped`), so the
+    /// candidates it records carry the same `InferencePriority.
+    /// HomomorphicMappedType` the reverse-mapped rebuild they replace does: they
+    /// stand down for a direct structural match and are discarded when one
+    /// already answered.
+    rev_prio: u32 = 0,
     /// Nesting depth inside `unify` below a non-top-level constructor. Unions
     /// and intersections preserve top-level-ness (tsc's
     /// `isTypeParameterAtTopLevel` descends them); everything else does not.
@@ -3845,15 +3852,32 @@ const Checker = struct {
                 // cannot re-materialize deferred `.d.ts` machinery (the OOM guard
                 // and the redux `ExtractStoreExtensions` unmask both require an
                 // *abstract* arg), so those concerns below don't apply here.
-                const ground_earlier = bare_earlier != null and
-                    !(try c.containsTypeParam(out[bare_earlier.?]));
+                //
+                // A referenced argument that is itself a *naked type parameter*
+                // is the same single symbol swap: it renames one bound name to
+                // another and expands nothing, so it can no more re-materialize
+                // deferred `.d.ts` machinery than a ground argument can. Leaving
+                // it unsubstituted is in fact unsound rather than lenient — the
+                // alias body keeps a *free* occurrence of the alias's own `S`
+                // that the caller's later instantiation can never close. RTK's
+                // `interface Slice<State, …> { reducer: Reducer<State> }` over
+                // redux's `Reducer<S, A, PreloadedState = S>` materialized as
+                // `(state: State | S | undefined, …) => State`; substituting
+                // `Slice<X>` then left the dangling `S` behind, and a merely
+                // *generic* type poisons every conditional that tests it —
+                // `combineReducers`' `M[keyof M] extends Reducer<…> | undefined`
+                // never decided, so its result stayed an unreduced conditional
+                // and `configureStore({ reducer: rootReducer })` was rejected.
+                const swappable_earlier = bare_earlier != null and
+                    (!(try c.containsTypeParam(out[bare_earlier.?])) or
+                        c.ts.kind(out[bare_earlier.?]) == .type_param);
                 // Ensure the generic body is built so self-recursion is detected
                 // (the flag is set when materialization re-enters this alias).
-                const recursive = if (bare_earlier != null and !ground_earlier and c.symInDeclFile(sym)) rec: {
+                const recursive = if (bare_earlier != null and !swappable_earlier and c.symInDeclFile(sym)) rec: {
                     if ((c.alias_state.get(sym) orelse 0) != 1) _ = try c.aliasGeneric(sym);
                     break :rec (c.alias_state.get(sym) orelse 0) == 1 or c.alias_recursive.contains(sym);
                 } else true;
-                if (bare_earlier != null and (ground_earlier or recursive or !c.symInDeclFile(sym))) {
+                if (bare_earlier != null and (swappable_earlier or recursive or !c.symInDeclFile(sym))) {
                     out[i] = out[bare_earlier.?];
                 } else if (c.symInDeclFile(sym)) {
                     // A *complex* or non-recursive library default (e.g. RTK's
@@ -3883,7 +3907,21 @@ const Checker = struct {
     fn keyofType(c: *Checker, t: TypeId) Error!TypeId {
         const r = try c.resolveStructural(t);
         switch (c.ts.kind(r)) {
-            .any, .err => return c.makeUnion2(types.string_type, c.makeUnion2(types.number_type, types.symbol_type) catch unreachable),
+            .err => {
+                // A `.ref` that does not resolve to a structure is NOT the same
+                // thing as `any`: it is a reference we cannot read the key set of
+                // yet (a self-recursive alias whose body is still materializing
+                // resolves to `error` through `expandRef`'s cycle cut). Answering
+                // the full `string | number | symbol` domain bakes that answer
+                // into whatever composite is being built — react-hook-form's
+                // `Merge<A, B>` interned `keyof A & keyof B` as
+                // `("message"|…) & (string|number|symbol)`, so every key took the
+                // "in both" branch and `FieldErrors<T>[k]` came out with `unknown`
+                // members. Deferring keeps `keyof <ref>` reducible.
+                if (c.ts.kind(t) == .ref) return c.ts.makeKeyof(t);
+                return c.makeUnion2(types.string_type, c.makeUnion2(types.number_type, types.symbol_type) catch unreachable);
+            },
+            .any => return c.makeUnion2(types.string_type, c.makeUnion2(types.number_type, types.symbol_type) catch unreachable),
             .object => {
                 var parts: std.ArrayList(TypeId) = .empty;
                 defer parts.deinit(c.scratch());
@@ -6895,7 +6933,12 @@ const Checker = struct {
     /// route-divergent instantiations must relate by origin). Unions/primitives
     /// are compared by their own rules and are never tagged.
     fn originTaggable(k: types.Kind) bool {
-        return k == .object or k == .function or k == .intersection;
+        // `.mapped` is tagged too: a still-generic alias instantiation
+        // (`WeakValidationMap<P>` with `P` free) never materializes into an
+        // object, and inference needs its alias identity to pair with a
+        // concrete `WeakValidationMap<X>` argument — tsc's same-alias rule (see
+        // `inferReverseMapped`).
+        return k == .object or k == .function or k == .intersection or k == .mapped;
     }
 
     /// Bound on nested eager expansion of a recursive alias reached through a
@@ -9559,7 +9602,16 @@ const Checker = struct {
                 const val = try c.instantiateId(s.mappedValue(t), map, map_id);
                 const as_c = if (s.mappedAs(t) != 0) try c.instantiateId(s.mappedAs(t), map, map_id) else 0;
                 const src = if (s.mappedSource(t) != 0) try c.instantiateId(s.mappedSource(t), map, map_id) else 0;
-                break :blk try c.reduceMapped(kp, con, val, as_c, src, s.mappedFlags(t));
+                const red = try c.reduceMapped(kp, con, val, as_c, src, s.mappedFlags(t));
+                // Same origin propagation as the `.object` arm: a mapped alias
+                // instantiation reached through a generic interface's member
+                // (`interface C<P> { propTypes?: WeakValidationMap<P> }`) is
+                // re-instantiated at every use, and inference pairs the two
+                // sides by alias identity (see `inferReverseMapped`).
+                if (c.origin.get(t)) |orig_ref| {
+                    if (red != t and originTaggable(c.ts.kind(red))) try c.tagInstantiatedOrigin(red, orig_ref, map, map_id);
+                }
+                break :blk red;
             },
             .template_literal_type => blk: {
                 var holes: std.ArrayList(TypeId) = .empty;
@@ -11393,6 +11445,17 @@ const Checker = struct {
         if (try c.containsMappedParam(idx) or try c.containsMappedParam(obj)) {
             return c.ts.makeIndexAccess(obj, idx);
         }
+        // An as-yet-unbound `infer` var in the index is the same situation: in
+        // tsc an `infer` binder IS a TypeParameter, so `isGenericIndexType` is
+        // true and `T[K]` stays deferred until `getInferredType` substitutes the
+        // binder. ztsc models `infer` as its own kind, which `containsFreeTypeParam`
+        // deliberately does not report — so `Form[infer K]` resolved eagerly to
+        // `any` and baked that in before `substInfer` could bind `K`. That is the
+        // react-hook-form `PathValueImpl` shape (`P extends \`${infer K}.${infer R}\`
+        // ? K extends keyof T ? T[K] : …`): every field path collapsed to `any`.
+        if (try c.containsInfer(idx)) {
+            return c.ts.makeIndexAccess(obj, idx);
+        }
         // Distribute over a union index: `Obj[A | B]` === `Obj[A] |
         // Obj[B]`. Holds whether or not `Obj` is generic, and is how a
         // `keyof`-derived index expands once the key union is known.
@@ -11696,7 +11759,14 @@ const Checker = struct {
             .type_param => {
                 const con = try c.typeParamConstraint(c.ts.typeParamSymbol(r));
                 if (con == types.no_type) return false;
-                return c.typeIsStringLike(try c.resolveStructural(con));
+                // tsc reads the BASE constraint here (`getBaseConstraintOfType`),
+                // which is what makes a constraint that is itself parameterised
+                // string-like: `TName extends FieldPath<TFieldValues>` is a
+                // deferred alias reference while `TFieldValues` is free, so the
+                // resolved-structural test alone answered "not string-like" and
+                // the template expression widened to `string`.
+                const base = if (try c.containsTypeParam(con)) try c.baseConstraintOf(con) else con;
+                return c.typeIsStringLike(try c.resolveStructural(base));
             },
             else => return false,
         }
@@ -16102,7 +16172,23 @@ const Checker = struct {
             sig = try c.inferJsxTargs(sig, tps, e);
         }
         if (c.ts.fnParamCount(sig) == 0) return types.empty_object_type;
-        return c.ts.fnParam(sig, 0).ty;
+        // A props parameter that is OPTIONAL at the call site (`p?: Props`, or
+        // `{ a }: Props = {}` — the "usable with no props at all" component
+        // shape) carries `| undefined` in the signature, exactly as tsc's
+        // `getTypeOfParameter` adds it. tsc then folds that union through
+        // `intersectTypes(IntrinsicAttributes, props)`, whose `extractIrreducible`
+        // pulls the `undefined` back OUT of the intersection: the props target
+        // is `(IntrinsicAttributes & Props) | undefined`, and since a JSX
+        // attributes object is never `undefined`, every check lands on the
+        // object constituent. ztsc has no intersection step here, so strip the
+        // nullish constituents directly. Leaving them in made the target a
+        // UNION, which `checkJsxAttributes` treats as a lenient shape: the
+        // missing/excess checks were skipped outright, and `propOfType` on the
+        // union lost each prop's OPTIONAL flag, so passing a possibly-undefined
+        // value to an optional prop was rejected (TS2322).
+        const p0 = c.ts.fnParam(sig, 0).ty;
+        const stripped = try c.nonNullableNullish(p0);
+        return if (stripped == types.never_type) p0 else stripped;
     }
 
     /// Infer a generic component's type arguments from its JSX attributes,
@@ -16202,7 +16288,34 @@ const Checker = struct {
                 if (cd.lhs != null_node and (c.nodeTag(cd.lhs) == .arrow_fn or c.nodeTag(cd.lhs) == .function_expr)) continue;
             }
             const pt = (try c.propOfType(rp0, try c.memberAtom(name_tok))) orelse continue;
-            const vty = try c.jsxAttributeValueType(ad.lhs, types.no_type);
+            // A TEMPLATE-LITERAL attribute value is contextually typed by the
+            // target prop, exactly as `inferTypeArgs`' Phase 1 does for a
+            // template-expression argument: `ctxWantsTemplate` needs to see the
+            // string-like-constrained type param to keep `` `owners.${number}.status` ``
+            // a template-literal type. Checked context-free it widens to `string`,
+            // which fails `TName extends FieldPath<TFieldValues>`, so `TName` fell
+            // back to its default — the whole path union — and react-hook-form's
+            // `<Controller name={`a.${i}.b`} …/>` typed `field.value` as the union
+            // of EVERY field's value. Every other attribute shape keeps its
+            // context-free inference (its contextual pass is `checkJsxAttributes`').
+            const vctx: TypeId = blk: {
+                if (ad.lhs == null_node or c.nodeTag(ad.lhs) != .jsx_expr_container) break :blk types.no_type;
+                const cd = c.tree.nodeData(ad.lhs);
+                if (cd.lhs == null_node) break :blk types.no_type;
+                break :blk switch (c.nodeTag(cd.lhs)) {
+                    .template_expr => pt.ty,
+                    // An object/array-literal attribute whose target prop carries
+                    // a literal-constrained inference target keeps its literals —
+                    // the same gate `inferTypeArgs`' Phase 1 applies to an
+                    // object-literal ARGUMENT (`paramWantsLiteralCtx`). Without it
+                    // `options={[{ value: Breed.Nellore }, …]}` is checked
+                    // context-free, the enum members widen to the whole enum and
+                    // `T extends string` is inferred as `Breed`.
+                    .object_literal, .array_literal => if (try c.paramWantsLiteralCtx(pt.ty)) pt.ty else types.no_type,
+                    else => types.no_type,
+                };
+            };
+            const vty = try c.jsxAttributeValueType(ad.lhs, vctx);
             try c.unify(pt.ty, vty, tps, candidates, 0);
         }
         // Resolve each param: inferred candidate (clamped to its constraint when
@@ -17307,6 +17420,21 @@ const Checker = struct {
     /// every callback parameter inside it fell to implicit `any` — TS7006 at
     /// call sites that are correct TypeScript.
     fn objLitIsContextSensitive(c: *Checker, node: Node) bool {
+        return c.objLitIsContextSensitiveAt(node, 0, false);
+    }
+
+    /// The same question restricted to the literal's OWN properties — no
+    /// recursion into a nested object literal. A shallow-sensitive literal is
+    /// one the single contextual read already handles: every un-annotated
+    /// callback parameter it carries is named directly by a property of the
+    /// parameter type, so reading the literal against that parameter types
+    /// them. Only a literal whose sensitivity is NESTED is read against a
+    /// property type that may itself still be a bare inference variable.
+    fn objLitIsShallowContextSensitive(c: *Checker, node: Node) bool {
+        return c.objLitIsContextSensitiveAt(node, 0, true);
+    }
+
+    fn objLitIsContextSensitiveAt(c: *Checker, node: Node, depth: u8, shallow: bool) bool {
         for (c.tree.nodeRange(node)) |m| {
             if (m == null_node) continue;
             const val = switch (c.nodeTag(m)) {
@@ -17316,6 +17444,17 @@ const Checker = struct {
             if (val == null_node) continue;
             switch (c.nodeTag(val)) {
                 .arrow_fn, .function_expr => {},
+                // tsc's `isContextSensitive` RECURSES through a property
+                // assignment into a nested object literal, so a bag of
+                // un-annotated callbacks one level down makes the whole
+                // argument context sensitive. redux-toolkit's
+                // `createSlice({ name, initialState, reducers })` is that
+                // shape — the sensitivity lives entirely inside `reducers`.
+                .object_literal => {
+                    if (shallow) continue;
+                    if (depth < 4 and c.objLitIsContextSensitiveAt(val, depth + 1, false)) return true;
+                    continue;
+                },
                 else => continue,
             }
             const proto = c.tree.extraData(ast.FnProto, c.tree.nodeData(val).lhs);
@@ -17361,6 +17500,12 @@ const Checker = struct {
         // `.mapped` arm). Without it every such argument is checked
         // context-free.
         if (c.ts.kind(r) == .mapped) return true;
+        // An ARRAY parameter (`options: { value: T; label: string }[]`) wants the
+        // same per-element contextual type its element type does: the elements
+        // are object literals whose `value` property is the literal-constrained
+        // inference target. Checked context-free, `{ value: Breed.Nellore }`
+        // widens the enum member to the whole enum and `T` is inferred as `Breed`.
+        if (c.ts.kind(r) == .array and depth < 2) return c.paramWantsLiteralCtxAt(c.ts.arrayElem(r), depth + 1);
         if (c.ts.kind(r) != .object) return false;
         for (0..c.ts.objectPropCount(r)) |i| {
             const p = c.ts.objectProp(r, @intCast(i));
@@ -17432,11 +17577,15 @@ const Checker = struct {
                 // collapses to its concrete `${string}` template union and can
                 // admit the field-name literal. Only the generic case retries —
                 // a concrete constraint already had its full say above.
+                // An enum MEMBER is a string/number literal too (tsc gives it
+                // `TypeFlags.StringLiteral | EnumLiteral`), so the type-variable
+                // rule below must judge it by the kind of its declared value.
+                const elk = try c.enumMemberLiteralKind(lit, lk);
                 if (try c.containsTypeParam(constraint)) {
                     const base = try c.baseConstraintOf(constraint);
                     if (base != constraint) {
                         if (try c.contextAdmitsLiteral(base, lit)) return true;
-                        return c.constraintKeepsLiteralKind(base, lk);
+                        return c.constraintKeepsLiteralKind(base, elk);
                     }
                 }
                 // tsc's `isLiteralOfContextualType` type-VARIABLE rule: a
@@ -17446,10 +17595,21 @@ const Checker = struct {
                 // position. That is what makes `isMemberOf<T extends string>(
                 // coll: readonly T[], v)` called with `["a", "b"]` infer
                 // `T = "a" | "b"` instead of `string`.
-                return c.constraintKeepsLiteralKind(constraint, lk);
+                return c.constraintKeepsLiteralKind(constraint, elk);
             },
             else => return false,
         }
+    }
+
+    /// The literal KIND an enum member stands for — the kind of its declared
+    /// value (`.string_literal` for a string enum, `.number_literal` for a
+    /// numeric one). Non-members answer with `fallback` (their own kind). tsc
+    /// carries both flags on one type; ztsc models an enum member as its own
+    /// `.enum_type` kind, so the mapping is explicit.
+    fn enumMemberLiteralKind(c: *Checker, lit: TypeId, fallback: types.Kind) Error!types.Kind {
+        if (!c.ts.isEnumMember(lit)) return fallback;
+        const v = try c.enumMemberValue(c.ts.enumSymbol(lit), c.ts.enumMemberAtom(lit)) orelse return fallback;
+        return c.ts.kind(v);
     }
 
     /// tsc's `maybeTypeOfKind(constraint, <primitive of the literal>)` half of
@@ -20298,12 +20458,14 @@ const Checker = struct {
         const saved_contra_pos = c.contra_pos;
         const saved_top_flags = c.top_flags;
         const saved_rev_flags = c.rev_flags;
+        const saved_rev_prio = c.rev_prio;
         const saved_nontop_depth = c.nontop_depth;
         c.contra_cands = contra;
         c.contra_owner = candidates.ptr;
         c.contra_pos = 0;
         c.top_flags = top_flags;
         c.rev_flags = rev_flags;
+        c.rev_prio = 0;
         c.nontop_depth = 0;
         defer {
             c.contra_cands = saved_contra_cands;
@@ -20311,6 +20473,7 @@ const Checker = struct {
             c.contra_pos = saved_contra_pos;
             c.top_flags = saved_top_flags;
             c.rev_flags = saved_rev_flags;
+            c.rev_prio = saved_rev_prio;
             c.nontop_depth = saved_nontop_depth;
         }
 
@@ -20441,15 +20604,38 @@ const Checker = struct {
             // parameter this argument is meant to determine. They live in a
             // scratch copy that only builds pass two's contextual type; pass
             // two re-derives every candidate this argument really carries.
-            if (tag == .object_literal and arg_ctx == types.no_type and
-                c.objLitIsContextSensitive(an))
+            //
+            // A literal-keeping contextual type normally REPLACES the two
+            // passes, and rightly so: every un-annotated callback such a
+            // literal carries at its OWN top level is named directly by a
+            // property of the parameter type, so the single contextual read
+            // types them and is the better reading.
+            //
+            // That reasoning does not reach a callback one level DOWN, inside a
+            // nested object literal. The nested bag is read against the
+            // parameter's property type, which is routinely a bare inference
+            // variable of this very call — the variable the bag is meant to
+            // determine — so what comes back still names this call's own
+            // parameters. RTK's `createSlice({ name, initialState, reducers })`
+            // is that shape: `name: Name` (`Name extends string`) asks for the
+            // literal-keeping read, while `reducers` is a bag of un-annotated
+            // case reducers read against `ValidateSliceCaseReducers<State, CR>`
+            // with `State` still free. `CaseReducers` came out as
+            // `{ … (state: State) => void … }`, failed its own
+            // `CR extends SliceCaseReducers<State>` check, and was clamped to
+            // that constraint — whose `keyof` is `string`, which collapsed
+            // `slice.actions`' `{ [Type in keyof CaseReducers]: … }` to `{}`.
+            // The two passes fix `State` between them, which is exactly the
+            // missing step, so they run for a NESTED-only sensitivity.
+            if (tag == .object_literal and c.objLitIsContextSensitive(an) and
+                (arg_ctx == types.no_type or !c.objLitIsShallowContextSensitive(an)))
             {
                 const probe_cands = try c.scratch().alloc(TypeId, tp_syms.len);
                 for (candidates, 0..) |cd, i| probe_cands[i] = cd;
                 c.side_query_depth += 1;
                 const ctx2 = blk: {
                     errdefer c.side_query_depth -= 1;
-                    const probe = try c.checkExprCached(an, types.no_type);
+                    const probe = try c.checkExprCached(an, arg_ctx);
                     try c.unify(pt, probe, tp_syms, probe_cands, 0);
                     // Every type parameter is FIXED for pass two: one the probe
                     // could not infer takes its default/constraint (tsc fixes a
@@ -20474,8 +20660,21 @@ const Checker = struct {
                             v = try c.typeParamDefault(sym);
                             if (v == types.no_type) v = try c.typeParamConstraint(sym);
                             if (v == types.no_type) v = types.any_type;
-                            if (map2.items.len > 0) v = try c.instantiate(v, map2.items);
                         }
+                        // Declaration order applies to a probe CANDIDATE too,
+                        // not only to a fallback: the probe read the argument
+                        // while the earlier parameters were still free, so its
+                        // candidate can carry them (`reducers`' inferred
+                        // `{ a: (state: State) => void }` still naming the
+                        // `State` that `initialState` has since pinned).
+                        // Handing that to pass two left the free variable in
+                        // the contextual type, so pass two re-derived the same
+                        // half-open candidate and the constraint check
+                        // (`CR extends SliceCaseReducers<State>`) rejected it —
+                        // clamping the parameter to its constraint, whose
+                        // `keyof` is `string`, which is how RTK's
+                        // `slice.actions` became `{}`.
+                        if (map2.items.len > 0) v = try c.instantiate(v, map2.items);
                         try map2.append(c.scratch(), .{ .sym = sym, .ty = v });
                     }
                     break :blk try c.instantiate(pt, map2.items);
@@ -21028,9 +21227,15 @@ const Checker = struct {
                     // A DIRECT structural match outranks a reverse-mapped one
                     // (tsc keeps only the best-priority candidates), so an
                     // incumbent that came solely from a `Partial<T>`-shaped
-                    // parameter is dropped rather than combined.
+                    // parameter is dropped rather than combined — and,
+                    // symmetrically, evidence recorded from INSIDE a
+                    // homomorphic-mapped parameter stands down for a direct
+                    // incumbent.
                     if (c.revSlot(candidates, i)) |rf| {
-                        if (rf.*) {
+                        if (c.rev_prio > 0) {
+                            if (candidates[i] != types.no_type and !rf.*) return;
+                            rf.* = true;
+                        } else if (rf.*) {
                             rf.* = false;
                             candidates[i] = types.no_type;
                         }
@@ -21300,21 +21505,36 @@ const Checker = struct {
                     }
                     const pidx = s.objectStringIndex(param);
                     if (pidx != 0) {
+                        // Reverse index-signature inference (tsc's
+                        // `inferFromIndexTypes`): a target string index
+                        // `{ [s: string]: T }` — the `Object.values`/`entries`
+                        // parameter — infers `T` from a named-property source
+                        // (`{ x: {...} }`), since the source has no index
+                        // signature to pair with. Without it
+                        // `Object.values({x:{s:1}})` leaves `T` unbound and the
+                        // result collapses to `unknown[]`.
+                        //
+                        // tsc collects EVERY applicable source member — each
+                        // string-keyed property plus the source's own string
+                        // index — and infers their UNION as ONE candidate.
+                        // Feeding them one at a time instead made each its own
+                        // candidate, and the covariant fold
+                        // (`getCommonSupertype`) then keeps only the leftmost of
+                        // any two with unrelated bases: `Object.entries({a:
+                        // string, b: number})` inferred `string`, the argument
+                        // stopped fitting, and the call fell to the
+                        // `entries(o: {}): [string, any][]` overload.
+                        var parts: std.ArrayList(TypeId) = .empty;
+                        defer parts.deinit(c.scratch());
+                        for (0..s.objectPropCount(ra)) |i| {
+                            try parts.append(c.scratch(), s.objectProp(ra, @intCast(i)).ty);
+                        }
                         if (s.objectStringIndex(ra) != 0) {
-                            try c.unify(pidx, s.objectStringIndex(ra), tp_syms, candidates, depth + 1);
-                        } else {
-                            // Reverse index-signature inference (tsc's
-                            // `inferFromIndexTypes`): a target string index
-                            // `{ [s: string]: T }` — the `Object.values`/`entries`
-                            // parameter — infers `T` from a named-property source
-                            // (`{ x: {...} }`) by matching each own property's type,
-                            // since the source has no index signature to pair with.
-                            // Without it `Object.values({x:{s:1}})` leaves `T`
-                            // unbound and the result collapses to `unknown[]`.
-                            for (0..s.objectPropCount(ra)) |i| {
-                                const ap = s.objectProp(ra, @intCast(i));
-                                try c.unify(pidx, ap.ty, tp_syms, candidates, depth + 1);
-                            }
+                            try parts.append(c.scratch(), s.objectStringIndex(ra));
+                        }
+                        if (parts.items.len != 0) {
+                            const one = try s.makeUnion(c.scratch(), parts.items);
+                            try c.unify(pidx, one, tp_syms, candidates, depth + 1);
                         }
                     }
                     if (s.objectNumberIndex(param) != 0 and s.objectNumberIndex(ra) != 0) {
@@ -21424,6 +21644,29 @@ const Checker = struct {
                     // widened primitive.
                     if (try c.discriminatedConstituent(param, ra)) |m| {
                         try c.unify(param, m, tp_syms, candidates, depth + 1);
+                        return;
+                    }
+                    // An INDEX-SHAPED param (`{ [s: string]: T }` and nothing
+                    // else — the `Object.entries`/`Object.values`/`Object.keys`
+                    // parameter) has no property to pair by name, no origin and
+                    // no discriminant, so the constituents are the only
+                    // inference sites there are. Here tsc's plain union-source
+                    // rule applies: `inferFromTypes` recurses constituent by
+                    // constituent, each contributing ONE candidate (its own
+                    // members' union, above), and `getCommonSupertype` folds
+                    // them — keeping the LEFTMOST of two with unrelated bases,
+                    // which is what makes the call fall to the
+                    // `entries(o: {}): [string, any][]` overload for a union
+                    // whose constituents disagree. Leaving `T` unbound instead
+                    // silently selected the generic overload with `T = unknown`,
+                    // and a callback annotated with the real element type was
+                    // then rejected against `[string, unknown]`.
+                    if (s.objectPropCount(param) == 0 and s.objectCallSigCount(param) == 0 and
+                        s.objectConstructSigCount(param) == 0 and s.objectStringIndex(param) != 0)
+                    {
+                        const ms = try c.scratch().dupe(TypeId, try c.memberList(ra));
+                        defer c.scratch().free(ms);
+                        for (ms) |m| try c.unify(param, m, tp_syms, candidates, depth + 1);
                     }
                     return;
                 }
@@ -21712,6 +21955,16 @@ const Checker = struct {
                     try c.memberList(ra)
                 else
                     try c.scratch().dupe(TypeId, &.{ra});
+                // Scanned before any re-entry: `memberList` hands out a
+                // borrowed slice, and the pairing pass below can invalidate it.
+                var naked: TypeId = types.no_type;
+                var naked_n: usize = 0;
+                for (try c.memberList(param)) |pm| {
+                    if (s.kind(pm) != .type_param) continue;
+                    if (tpIndex(tp_syms, s.typeParamSymbol(pm)) == null) continue;
+                    naked = pm;
+                    naked_n += 1;
+                }
                 for (try c.memberList(param)) |pm| {
                     if (!try c.containsTypeParam(pm)) continue;
                     for (ams) |am| {
@@ -21719,6 +21972,31 @@ const Checker = struct {
                             try c.unify(pm, am, tp_syms, candidates, depth + 1);
                         }
                     }
+                }
+                // tsc's `inferToMultipleTypes` naked-type-variable rule: when
+                // the intersection parameter has EXACTLY ONE constituent that
+                // is a bare inference variable, the WHOLE source infers to it
+                // once the non-variable constituents have been inferred
+                // through. This is *not* the constituent pairing the helper
+                // above deliberately refuses — nothing gets swallowed, the
+                // variable simply receives the argument as written, which is
+                // the only reading available when the rest of the intersection
+                // is a decoration over that same variable.
+                //
+                // RTK's `createSlice({ reducers })` types its parameter as
+                // `ValidateSliceCaseReducers<S, ACR> = ACR & { [T in keyof
+                // ACR]: … }`. Neither constituent paired (a naked variable is
+                // no pair, and a mapped parameter never pairs with an object
+                // argument), so `ACR` took no candidate at all and fell back to
+                // its `SliceCaseReducers<State>` constraint — whose `keyof` is
+                // `string`, collapsing `Slice.actions`'
+                // `{ [Type in keyof CaseReducers]: … }` to `{}` and rejecting
+                // every annotated `slice.actions` binding.
+                //
+                // tsc skips this path entirely when the source is a union
+                // (`inferFromTypes`' `!(source.flags & TypeFlags.Union)`).
+                if (naked_n == 1 and s.kind(arg) != .union_type) {
+                    try c.unify(naked, arg, tp_syms, candidates, depth + 1);
                 }
             },
             .mapped => try c.inferReverseMapped(param, arg, tp_syms, candidates, depth),
@@ -21831,6 +22109,43 @@ const Checker = struct {
     /// param would otherwise stay unbound.
     fn inferReverseMapped(c: *Checker, m: TypeId, arg: TypeId, tp_syms: []const u32, candidates: []TypeId, depth: u32) Error!void {
         const s = &c.ts;
+        // Same generic ALIAS on both sides (tsc's `inferFromTypes`: "source and
+        // target are types originating in the same generic type alias
+        // declaration — simply infer from source type arguments to target type
+        // arguments"). It sits ABOVE the reverse-mapping rule in tsc for a
+        // reason: rebuilding `P` out of `WeakValidationMap<P>`'s members is a
+        // strictly worse answer than reading it off the alias, and the rebuild
+        // loses whatever the template could not invert. `FunctionComponent<P>`'s
+        // `propTypes?: WeakValidationMap<P>` against a `ProviderExoticComponent`
+        // argument's `propTypes?: WeakValidationMap<ProviderProps<T>>` inferred
+        // a rebuilt `{ children: …; value: … }` with every property REQUIRED
+        // (the map adds `?`, so the inversion drops it), and that covariant
+        // candidate then beat the call signature's contravariant `ProviderProps<T>`
+        // — `React.createElement(Ctx.Provider, { value })` became TS2769.
+        if (c.origin.get(m)) |po| {
+            if (s.kind(po) == .ref) {
+                const ao_opt = c.origin.get(arg) orelse c.origin.get(try c.resolveStructural(arg));
+                if (ao_opt) |ao| {
+                    if (s.kind(ao) == .ref and s.refSymbol(ao) == s.refSymbol(po)) {
+                        const pa = try c.scratch().dupe(TypeId, s.refArgs(po));
+                        defer c.scratch().free(pa);
+                        const aa = try c.scratch().dupe(TypeId, s.refArgs(ao));
+                        defer c.scratch().free(aa);
+                        const n = @min(pa.len, aa.len);
+                        // Same priority as the rebuild this replaces: a DIRECT
+                        // structural match elsewhere in the call still wins
+                        // (`inference/084`, where `calculate(prev, next,
+                        // postProcess)` must answer the `S` its first two
+                        // arguments supply, not the `Observed` that
+                        // `postProcess`'s erased `Partial<Observed>` names).
+                        c.rev_prio += 1;
+                        defer c.rev_prio -= 1;
+                        for (0..n) |i| try c.unify(pa[i], aa[i], tp_syms, candidates, depth + 1);
+                        return;
+                    }
+                }
+            }
+        }
         if (s.mappedAs(m) != 0) return; // no key remap
         // `{ [P in K]: … }` with `K` itself an inference target (`Pick<S, K>`):
         // the key set is what the argument tells us. Handled separately below.
@@ -22396,44 +22711,60 @@ const Checker = struct {
     /// therefore `RefQ`'s size, is unchanged. Paths deeper than this are still
     /// not tracked (sound under-narrowing = the reference keeps its declared
     /// type). tsc keys flow references by AST node identity and has no such
-    /// cap at all; five links covers the guard shapes real code writes
-    /// (`this.state.a.b.c.d`) without widening the hot key.
-    const max_deep_ref_depth = 5;
+    /// cap at all, and real code does reach past five links once element
+    /// accesses count as links: a GeoServer legend guard walks
+    /// `data?.Legend?.[0].rules?.[0]?.symbolizers?.[0]?.Raster?.colormap?.entries`
+    /// — nine links — and every reference on that spine has to narrow. The cap
+    /// only sizes `DeepPath`, the side-table entry an over-deep path interns
+    /// into; the inline `RefKey`/`RefQ` layout is fixed by `max_ref_depth` and
+    /// does not move, so raising it costs 16 bytes per distinct over-deep path
+    /// and nothing per flow-cache slot. Measured on the dogfood app, 5 vs 9 is
+    /// indistinguishable in wall clock and peak RSS.
+    const max_deep_ref_depth = 9;
 
-    /// One link in a reference path: either a dotted member (`.p`) or a
-    /// constant element access (`[i]`). Only *constant* integer indices are
-    /// trackable — a variable index (`arr[i]`) is not a stable reference, so
-    /// `buildRefKey` rejects it.
+    /// One link in a reference path: a dotted member (`.p`), a constant element
+    /// access (`[0]`), or an element access through a *stable identifier* index
+    /// (`[tag]`, where `tag` is a `const` or a never-reassigned local/parameter
+    /// — tsc's `isMatchingReference` element-access arm). Any other index
+    /// expression is not a stable reference, so `buildRefKey` rejects it.
     ///
-    /// The two payloads are mutually exclusive by tag, so they share one u32
-    /// and the tag rides in that u32's high bit (`atom()` / `index()` assert
-    /// the tag): the original two-field form carried a permanently-zero
-    /// companion field and cost 12 bytes, which `RefKey`'s `[3]PathElem`
-    /// multiplied into a 48-byte `ref_keys` key; a shared payload behind a
-    /// separate `bool` tag still cost 8 (`RefQ` 36) to the bool's own field
-    /// slot. Folding the tag into bit 31 gets `PathElem` to 4 (`RefQ` 24).
+    /// The three payloads are mutually exclusive by tag, so they share one u32
+    /// and the tag rides in that u32's two high bits (`atom()` / `index()` /
+    /// `indexSym()` assert the tag): the original two-field form carried a
+    /// permanently-zero companion field and cost 12 bytes, which `RefKey`'s
+    /// `[3]PathElem` multiplied into a 48-byte `ref_keys` key; a shared payload
+    /// behind a separate `bool` tag still cost 8 (`RefQ` 36) to the bool's own
+    /// field slot. Folding the tag into the high bits gets `PathElem` to 4
+    /// (`RefQ` 24).
     ///
-    /// The fold is lossless because both payloads fit in 31 bits: element
-    /// indices are bounded by 4096 (`constIndexOf`), and a member atom is a
-    /// shard-interleaved interner handle (`Interner.atomFrom`), so bit 31 is
-    /// clear until a single shard holds 2^(31 - 4) = 134 M strings — hundreds
-    /// of millions of distinct identifiers. That is a size bound, not a
-    /// structural one, so `memberFits` checks it at the one construction site
-    /// instead of assuming it: an atom that does not fit makes `buildRefKey`
-    /// return null, i.e. the reference is simply not tracked (sound
-    /// under-narrowing, the same degradation as an over-deep path) — never a
-    /// silent alias with an element link.
+    /// The fold is lossless because every payload fits in 30 bits: element
+    /// indices are bounded by 4096 (`constIndexOf`), a symbol id is bounded by
+    /// the program's symbol count, and a member atom is a shard-interleaved
+    /// interner handle (`Interner.atomFrom`), so the tag bits are clear until a
+    /// single shard holds 2^(30 - 4) = 67 M strings — tens of millions of
+    /// distinct identifiers. That is a size bound, not a structural one, so
+    /// `memberFits`/`symFits` check it at the one construction site instead of
+    /// assuming it: a payload that does not fit makes `buildRefKey` return null,
+    /// i.e. the reference is simply not tracked (sound under-narrowing, the same
+    /// degradation as an over-deep path) — never a silent alias.
     const PathElem = struct {
-        /// Bit 31 = tag (set: element index), bits 0..30 = payload.
+        /// Bit 31 = element access, bit 30 = (with bit 31) identifier index,
+        /// bits 0..29 = payload. A dotted member is tag `00`, so `member(0)`
+        /// is the all-zero default and unused slots hash canonically.
         bits: u32 = 0,
 
         const index_tag: u32 = 1 << 31;
-        const payload_max: u32 = index_tag - 1;
+        const sym_tag: u32 = 1 << 30;
+        const payload_max: u32 = sym_tag - 1;
 
         /// Can this property atom be folded? (See the type doc: false only
-        /// past atom 2^31-1, where the caller stops tracking the reference.)
+        /// past atom 2^30-1, where the caller stops tracking the reference.)
         fn memberFits(a: Atom) bool {
             return a <= payload_max;
+        }
+        /// Can this index symbol be folded? (Same bound, same fallback.)
+        fn symFits(s: SymbolId) bool {
+            return s <= payload_max;
         }
         fn member(a: Atom) PathElem {
             std.debug.assert(memberFits(a));
@@ -22443,15 +22774,26 @@ const Checker = struct {
             std.debug.assert(i <= payload_max);
             return .{ .bits = index_tag | i };
         }
+        fn elementSym(s: SymbolId) PathElem {
+            std.debug.assert(symFits(s));
+            return .{ .bits = index_tag | sym_tag | s };
+        }
         fn isIndex(pe: PathElem) bool {
             return pe.bits & index_tag != 0;
+        }
+        fn isIndexSym(pe: PathElem) bool {
+            return pe.bits & (index_tag | sym_tag) == (index_tag | sym_tag);
         }
         fn atom(pe: PathElem) Atom {
             std.debug.assert(!pe.isIndex());
             return pe.bits;
         }
         fn index(pe: PathElem) u32 {
-            std.debug.assert(pe.isIndex());
+            std.debug.assert(pe.isIndex() and !pe.isIndexSym());
+            return pe.bits & payload_max;
+        }
+        fn indexSym(pe: PathElem) SymbolId {
+            std.debug.assert(pe.isIndexSym());
             return pe.bits & payload_max;
         }
     };
@@ -22574,6 +22916,44 @@ const Checker = struct {
         return @intFromFloat(v);
     }
 
+    /// The value symbol of a *stable* identifier element-access index
+    /// (`ICON_BY_TAG[tag]`), else null. This is tsc's `isMatchingReference`
+    /// element-access arm: two element accesses spelled with the same
+    /// identifier denote the same reference when that identifier's symbol is
+    /// `isConstantVariable` — a `const` — or `isParameterOrMutableLocalVariable
+    /// && !isSymbolAssigned` — a parameter or a `let`/`var`/catch local that is
+    /// never assigned. Anything else (a reassigned local, a property, a call
+    /// result, a computed expression) leaves the reference untracked, which is
+    /// sound under-narrowing.
+    ///
+    /// Order-independent: `const`ness is a declaration flag, and the
+    /// never-assigned test reads `reassigned_syms`, a pure function of one
+    /// file's AST (`ensureReassignScan`). Because that table is only populated
+    /// for files already scanned, the non-`const` case is restricted to symbols
+    /// declared in the file being checked — otherwise the answer would depend
+    /// on which files had been visited, which is exactly the order-dependence
+    /// the determinism contract forbids. The same restriction guards the
+    /// closure-crossing arm of `flowType`.
+    fn stableIndexSymbol(c: *Checker, rhs: Node) Error!?SymbolId {
+        var n = rhs;
+        while (c.nodeTag(n) == .paren_expr) n = c.tree.nodeData(n).lhs;
+        if (c.nodeTag(n) != .identifier) return null;
+        const a = try c.atomOfToken(c.tree.nodeMainToken(n));
+        const sym = switch (c.resolveSpace(a, c.cur_scope, true)) {
+            .sym => |s| s,
+            else => return null,
+        };
+        if (sym == binder.no_symbol) return null;
+        if (!PathElem.symFits(sym)) return null;
+        const sf = c.symFlags(sym);
+        if (sf.const_decl) return sym;
+        if (!(sf.let_decl or sf.var_decl or sf.param or sf.catch_param)) return null;
+        if (c.symFile(sym) != c.cur_file) return null;
+        try c.ensureReassignScan();
+        if (c.reassigned_syms.contains(sym)) return null;
+        return sym;
+    }
+
     /// Build the tracked reference key for a member/element-access node by
     /// peeling its spine right-to-left, collecting dotted-member atoms and
     /// constant element indices, until it bottoms out at a bare identifier
@@ -22594,9 +22974,12 @@ const Checker = struct {
                 if (!PathElem.memberFits(ma)) return null; // unfoldable atom: not tracked
                 elems[count] = .member(ma);
             } else if (tag == .index_expr or tag == .optional_index_expr) {
-                const iv = c.constIndexOf(d.rhs) orelse return null; // variable index: untracked
                 if (count >= max_deep_ref_depth) return null;
-                elems[count] = .element(iv);
+                if (c.constIndexOf(d.rhs)) |iv| {
+                    elems[count] = .element(iv);
+                } else if (try c.stableIndexSymbol(d.rhs)) |is| {
+                    elems[count] = .elementSym(is);
+                } else return null; // unstable index: untracked
             } else break;
             count += 1;
             n = d.lhs;
@@ -22665,7 +23048,11 @@ const Checker = struct {
             const tag = c.nodeTag(n);
             const d = c.tree.nodeData(n);
             const pe = path[i - 1];
-            if (pe.isIndex()) {
+            if (pe.isIndexSym()) {
+                if (tag != .index_expr and tag != .optional_index_expr) return false;
+                const is = (try c.stableIndexSymbol(d.rhs)) orelse return false;
+                if (is != pe.indexSym()) return false;
+            } else if (pe.isIndex()) {
                 if (tag != .index_expr and tag != .optional_index_expr) return false;
                 const iv = c.constIndexOf(d.rhs) orelse return false;
                 if (iv != pe.index()) return false;
@@ -22884,6 +23271,22 @@ const Checker = struct {
                 // unreachable definition point.
                 if (ante == binder.unreachable_flow) return declared;
                 if (key.len != 0 or key.sym == this_flow_root) return declared;
+                // Only a reference *captured* by this closure may continue into
+                // the definition-point flow. A reference to something the
+                // closure declares itself (its parameters, its own locals) is
+                // not captured — tsc's `checkIdentifier` only walks out to an
+                // enclosing container when the declaration container differs
+                // from the reference's. Crossing anyway put the closure's own
+                // symbol into the enclosing function's flow, where
+                // `assignNarrows` matches a declarator by NAME
+                // (`patternBindsSym`): a same-named outer `const d: string`
+                // then narrowed an `unknown`-typed parameter `d` to `string`.
+                // (Only visible for a declared type `assignmentRefines` accepts,
+                // which is why `unknown` parameters were the reported shape.)
+                if (c.symFile(key.sym) == c.cur_file) {
+                    const own = c.containerOf(c.bind.symbol_scopes[c.localOf(key.sym)]);
+                    if (c.bind.scope_owners[own] == b.flowNode(flow)) return declared;
+                }
                 const sf = c.symFlags(key.sym);
                 if (!sf.const_decl) {
                     // Effectively-const let/var/param: tsc narrows a captured
@@ -24666,23 +25069,33 @@ const Checker = struct {
         return c.nodeTag(proto.return_type) == .type_predicate;
     }
 
-    /// If `call`'s callee is a predicate signature whose guarded parameter
-    /// receives `key` as its argument, return that predicate; else null.
-    /// Shared by user-defined type guards and assertion functions.
-    fn guardTargetFor(c: *Checker, call: Node, key: RefKey) Error!?types.Predicate {
-        const g = (try c.guardCallOf(call)) orelse return null;
-        if (!try c.refMatches(g.arg, key)) return null;
-        return g.pred;
-    }
-
     /// `if (isT(x))` — a user-defined type guard used in a condition.
     /// True branch narrows the argument to the predicate type; the false
     /// branch takes the complement (union filtering handles both).
     fn narrowByGuardCall(c: *Checker, t: TypeId, call: Node, sense: bool, key: RefKey) Error!TypeId {
-        const pred = (try c.guardTargetFor(call, key)) orelse return t;
+        const g = (try c.guardCallOf(call)) orelse return t;
+        if (!try c.refMatches(g.arg, key)) return c.narrowByGuardArgChain(t, g, sense, key);
+        const pred = g.pred;
         if (pred.asserts) return t; // assertion fns narrow after the call, not here
         if (pred.ty == types.no_type) return t;
         return c.narrowByInstance(t, pred.ty, sense);
+    }
+
+    /// tsc's `narrowTypeByTypePredicate` optional-chain arm: the guarded
+    /// ARGUMENT is an optional chain whose receiver is the tracked reference
+    /// (`Array.isArray(data?.detail)`). A nullish receiver short-circuits the
+    /// chain to `undefined`, so when the predicate's asserted type cannot BE
+    /// `undefined`, the asserting branch proves the receiver did not
+    /// short-circuit — narrow it to non-null. Only the true branch says
+    /// anything (a failed predicate is equally consistent with a nullish
+    /// receiver), which is why tsc gates this on `assumeTrue`.
+    fn narrowByGuardArgChain(c: *Checker, t: TypeId, g: GuardCall, sense: bool, key: RefKey) Error!TypeId {
+        if (!sense) return t;
+        if (g.pred.asserts) return t; // narrows after the call, not in the condition
+        if (g.pred.ty == types.no_type) return t;
+        if (try c.admitsNullish(g.pred.ty, .undefined)) return t;
+        if (!try c.optionalChainContainsRef(g.arg, key)) return t;
+        return c.nonNullable(t);
     }
 
     /// `assertIsT(x);` — an assertion-function call statement narrows the
@@ -25699,7 +26112,7 @@ const Checker = struct {
         //   * `node_types` is a memo, and every reader outside diagnostics
         //     re-derives on miss (`checkExprCached`). The three readers that
         //     branch on presence — `elaborateLiteralError`, `assignNarrows`'
-        //     compound-assign arm, `guardTargetFor`'s member callee — are
+        //     compound-assign arm, `guardCallOf`'s member callee — are
         //     either diagnostics-only (dropped here) or reached from
         //     `inferReturnType`, and `checkFunctionLikeExpr`/`checkFunctionDecl`
         //     run that probe BEFORE this body walk, so the probe already sees
@@ -26791,19 +27204,28 @@ test "narrowing: PathElem tag fold is lossless and keeps RefQ at 24 bytes" {
     // The point of the fold: one word per link, 24 bytes per interned key.
     try testing.expectEqual(@as(usize, 4), @sizeOf(PE));
     try testing.expectEqual(@as(usize, 24), @sizeOf(Checker.RefQ));
-    // Round-trips, and the two tags never alias on a shared payload.
+    // Round-trips, and the three tags never alias on a shared payload.
     try testing.expectEqual(@as(Atom, 7), PE.member(7).atom());
     try testing.expectEqual(@as(u32, 7), PE.element(7).index());
+    try testing.expectEqual(@as(u32, 7), PE.elementSym(7).indexSym());
     try testing.expect(!PE.member(7).isIndex());
+    try testing.expect(!PE.member(7).isIndexSym());
     try testing.expect(PE.element(7).isIndex());
+    try testing.expect(!PE.element(7).isIndexSym());
+    try testing.expect(PE.elementSym(7).isIndex());
+    try testing.expect(PE.elementSym(7).isIndexSym());
     try testing.expect(PE.member(7).bits != PE.element(7).bits);
+    try testing.expect(PE.element(7).bits != PE.elementSym(7).bits);
+    try testing.expect(PE.member(7).bits != PE.elementSym(7).bits);
     // A trailing slot past `len` is canonically a zero-atom member link, so
     // `RefKey`'s default and `member(0)` stay the same key (as before the fold).
     try testing.expectEqual(PE.member(0).bits, (PE{}).bits);
-    // The 31-bit bound is checked, not assumed.
+    // The 30-bit bound is checked, not assumed.
     try testing.expect(PE.memberFits(PE.payload_max));
     try testing.expect(!PE.memberFits(PE.payload_max + 1));
     try testing.expect(!PE.memberFits(std.math.maxInt(Atom)));
+    try testing.expect(PE.symFits(PE.payload_max));
+    try testing.expect(!PE.symFits(PE.payload_max + 1));
 }
 
 test "narrowing: assignment narrowing and loop widening" {
