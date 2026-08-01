@@ -465,7 +465,10 @@ pub fn varianceMarkers(c: *Checker, param_name: []const u8) Error![2]TypeId {
     const super_sym = c.fresh_tp_next;
     c.fresh_tp_next += 1;
     try c.fresh_tp_info.append(c.cm(), .{
-        .name = try c.atom(try std.fmt.allocPrint(c.scratch(), "super-{s}", .{param_name})),
+        // `internText`, not `atom`: the printed name lives in scratch, and
+        // `atom` would store the transient slice as an `atom_cache` key —
+        // a dangling key that segfaults the next cache rehash.
+        .name = try c.internText(try std.fmt.allocPrint(c.scratch(), "super-{s}", .{param_name})),
         .constraint = types.no_type,
         .default = types.no_type,
         .has_default = false,
@@ -474,7 +477,7 @@ pub fn varianceMarkers(c: *Checker, param_name: []const u8) Error![2]TypeId {
     const sub_sym = c.fresh_tp_next;
     c.fresh_tp_next += 1;
     try c.fresh_tp_info.append(c.cm(), .{
-        .name = try c.atom(try std.fmt.allocPrint(c.scratch(), "sub-{s}", .{param_name})),
+        .name = try c.internText(try std.fmt.allocPrint(c.scratch(), "sub-{s}", .{param_name})),
         .constraint = super_ty,
         .default = types.no_type,
         .has_default = false,
