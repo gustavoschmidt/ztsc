@@ -97,16 +97,6 @@ calls/053_rest_param_union_of_tuples.ts  -TS2345 58
 # reports.
 indexed/032_cast_to_deferred_indexed_access_negatives.ts  -TS2352 8
 
-# Reading a property off an intersection whose members include a still-GENERIC
-# mapped type answers from that mapped type instead of reporting TS2339: ztsc's
-# `propOfType` synthesizes a member for any name on `Partial<Record<T, any>>`,
-# where tsc's `getPropertyOfType` has no members at all until `T` is known. The
-# `in`-narrowing side of the same question IS handled (`propDeclaredForIn`, the
-# subject of case 060); the READ side is a wider change to property lookup.
-# Pre-existing and deterministic: the base binary is identically silent here,
-# and line 13 — the same read on the other branch — still reports.
-narrowing/061_in_narrow_generic_mapped_constituent_negatives.ts  -TS2339 21
-
 # Inference from a TEMPLATE-LITERAL TYPE source into a template-literal pattern
 # (`` `owners.${number}.status` extends `${infer K}.${infer R}` ``) is not
 # implemented: ztsc's template matcher only walks a CONCRETE string against the
