@@ -794,12 +794,18 @@ pub fn inferFromExtends(c: *Checker, source0: TypeId, pattern: TypeId, ids: []co
                 if (try c.containsInfer(m)) try c.inferFromExtends(residual_src, m, ids, vals, contra, depth + 1);
             }
         },
-        // `S extends `${infer H}-${infer R}`` — pattern-match the concrete
-        // source string against the template, binding each hole's infer var.
+        // `S extends `${infer H}-${infer R}`` — pattern-match the source
+        // against the template, binding each hole's infer var. A concrete
+        // string source walks the text; a template-literal *type* source
+        // (`` `owners.${number}.status` ``) matches its fixed text parts and
+        // placeholder types against the target's spans (tsc's
+        // `inferFromLiteralPartsToTemplateLiteral`).
         .template_literal_type => {
             const src = try c.resolveStructural(source0);
             if (try c.stringLiteralOf(src)) |atom_| {
                 try c.inferFromTemplate(c.atomText(atom_), pattern, ids, vals);
+            } else if (s.kind(src) == .template_literal_type) {
+                try c.inferFromTemplateSource(src, pattern, ids, vals, contra, depth);
             }
         },
         else => {},
@@ -874,6 +880,177 @@ pub fn bindTemplateInfer(c: *Checker, hole: TypeId, captured: []const u8, ids: [
         vals[idx] = try c.makeUnion2(vals[idx], lit);
     }
 }
+
+/// Infer from a template-literal *type* source into a template-literal
+/// pattern — tsc's `inferTypesFromTemplateLiteralType` +
+/// `inferFromLiteralPartsToTemplateLiteral`. The source contributes its fixed
+/// text parts (`texts[0]` = head, `texts[i+1]` = the chunk after hole `i`)
+/// and its placeholder types; `matchTemplateParts` produces one match type
+/// per TARGET hole, and each is then inferred into that hole exactly as tsc
+/// pairs `matches[i]` with `target.types[i]`. So
+/// `` `owners.${number}.status` extends `${infer K}.${infer R}` `` binds
+/// `K = "owners"` and `` R = `${number}.status` ``, and the recursive path
+/// walk keeps going instead of collapsing to `never`.
+pub fn inferFromTemplateSource(c: *Checker, src: TypeId, tpl: TypeId, ids: []const u32, vals: []TypeId, contra: bool, depth: u32) Error!void {
+    const s = &c.ts;
+    const gpa = c.scratch();
+    const n = s.templateHoleCount(src);
+    // Interned atom bytes are stable for the interner's lifetime, so the
+    // text slices survive the atom-table growth `addMatch` triggers.
+    var texts: std.ArrayList([]const u8) = .empty;
+    defer texts.deinit(gpa);
+    var holes: std.ArrayList(TypeId) = .empty;
+    defer holes.deinit(gpa);
+    try texts.append(gpa, c.atomText(s.templateHead(src)));
+    for (0..n) |i| {
+        try holes.append(gpa, s.templateHole(src, @intCast(i)));
+        try texts.append(gpa, c.atomText(s.templateChunk(src, @intCast(i))));
+    }
+    var matches: std.ArrayList(TypeId) = .empty;
+    defer matches.deinit(gpa);
+    if (!try c.matchTemplateParts(texts.items, holes.items, tpl, &matches)) return;
+    for (matches.items, 0..) |m, i| {
+        try c.inferFromExtends(m, s.templateHole(tpl, @intCast(i)), ids, vals, contra, depth + 1);
+    }
+}
+
+/// The scan half of tsc's `inferFromLiteralPartsToTemplateLiteral`. Anchors
+/// the target's leading/trailing fixed text, then walks the target's interior
+/// delimiters left-to-right over the source's parts. A delimiter is only ever
+/// found in source TEXT — a source placeholder (`${number}`) is opaque and
+/// cannot be split by it, so a hole that spans one absorbs it whole and the
+/// match is rebuilt as a template-literal type. Appends one match type per
+/// target hole to `out`; returns false (inferring nothing) when the source
+/// cannot match, matching tsc's `undefined`.
+pub fn matchTemplateParts(c: *Checker, source_texts: []const []const u8, source_types: []const TypeId, tpl: TypeId, out: *std.ArrayList(TypeId)) Error!bool {
+    const s = &c.ts;
+    std.debug.assert(source_texts.len == source_types.len + 1);
+    const m = s.templateHoleCount(tpl);
+    if (m == 0) return false;
+    const last_source = source_texts.len - 1;
+    const target_start = c.atomText(s.templateHead(tpl));
+    const target_end = c.atomText(s.templateChunk(tpl, m - 1));
+    const source_start = source_texts[0];
+    const source_end = source_texts[last_source];
+    if (last_source == 0 and source_start.len < target_start.len + target_end.len) return false;
+    if (!std.mem.startsWith(u8, source_start, target_start)) return false;
+    if (!std.mem.endsWith(u8, source_end, target_end)) return false;
+
+    var w: PartWalk = .{
+        .c = c,
+        .texts = source_texts,
+        .types = source_types,
+        .last = last_source,
+        .remaining_end = source_end[0 .. source_end.len - target_end.len],
+        .pos = target_start.len,
+        .out = out,
+    };
+    var j: u32 = 0;
+    while (j + 1 < m) : (j += 1) {
+        const delim = c.atomText(s.templateChunk(tpl, j));
+        if (delim.len > 0) {
+            var si = w.seg;
+            var p = w.pos;
+            while (true) {
+                const txt = w.sourceText(si);
+                if (p <= txt.len) {
+                    if (std.mem.indexOf(u8, txt[p..], delim)) |rel| {
+                        p += rel;
+                        break;
+                    }
+                }
+                si += 1;
+                if (si == source_texts.len) return false;
+                p = 0;
+            }
+            try w.addMatch(si, p);
+            w.pos += delim.len;
+        } else if (w.pos < w.sourceText(w.seg).len) {
+            // Adjacent target holes, source text left to split: one char.
+            try w.addMatch(w.seg, w.pos + 1);
+        } else if (w.seg < last_source) {
+            // …otherwise the next hole absorbs the source's placeholder.
+            try w.addMatch(w.seg + 1, 0);
+        } else return false;
+    }
+    try w.addMatch(last_source, w.sourceText(last_source).len);
+    return true;
+}
+
+/// tsc's tail of `getTemplateLiteralType`: a template whose text parts are
+/// ALL empty is not a pattern at all, it is its hole. `` `${string}` `` (any
+/// number of `string` holes) is exactly `string`, and a lone hole that is
+/// itself a pattern (`` `${`a${number}`}` ``, `` `${Uppercase<T>}` ``) is
+/// that pattern. Applied only to the types `matchTemplateParts` recombines,
+/// so the shared `reduceTemplateChunks` evaluation point is untouched —
+/// without it an `infer` hole would bind `` `${string}` `` where tsc binds
+/// `string`, and the extra pattern wrapper would reject a plain `string`
+/// downstream (a false positive).
+pub fn normalizeTextlessTemplate(c: *Checker, t: TypeId) Error!TypeId {
+    const s = &c.ts;
+    if (s.kind(t) != .template_literal_type) return t;
+    const n = s.templateHoleCount(t);
+    if (c.atomText(s.templateHead(t)).len != 0) return t;
+    for (0..n) |i| {
+        if (c.atomText(s.templateChunk(t, @intCast(i))).len != 0) return t;
+    }
+    var all_string = true;
+    for (0..n) |i| {
+        if (s.kind(try c.resolveStructural(s.templateHole(t, @intCast(i)))) != .string) all_string = false;
+    }
+    if (all_string) return types.string_type;
+    if (n == 1) {
+        const hole = s.templateHole(t, 0);
+        switch (s.kind(hole)) {
+            .template_literal_type, .string_mapping => return hole,
+            else => {},
+        }
+    }
+    return t;
+}
+
+/// Cursor over a source template's (texts, types) parts: `seg` is the text
+/// part the cursor sits in and `pos` the offset within it.
+const PartWalk = struct {
+    c: *Checker,
+    texts: []const []const u8,
+    types: []const TypeId,
+    last: usize,
+    /// The last text part with the target's trailing literal stripped; it is
+    /// what `sourceText` reports for the final segment.
+    remaining_end: []const u8,
+    seg: usize = 0,
+    pos: usize,
+    out: *std.ArrayList(TypeId),
+
+    fn sourceText(w: *const PartWalk, i: usize) []const u8 {
+        return if (i < w.last) w.texts[i] else w.remaining_end;
+    }
+
+    /// Commit the span from (`seg`, `pos`) up to (`si`, `p`) as one target
+    /// hole's match: a string literal when it stays inside one text part,
+    /// otherwise a template-literal type recombining the crossed text and
+    /// placeholder parts.
+    fn addMatch(w: *PartWalk, si: usize, p: usize) Error!void {
+        const c = w.c;
+        const gpa = c.scratch();
+        var match: TypeId = undefined;
+        if (si == w.seg) {
+            match = try c.ts.makeStringLiteral(try c.internText(w.sourceText(si)[w.pos..p]), false);
+        } else {
+            var chunks: std.ArrayList(Atom) = .empty;
+            defer chunks.deinit(gpa);
+            var k = w.seg + 1;
+            while (k < si) : (k += 1) try chunks.append(gpa, try c.internText(w.texts[k]));
+            try chunks.append(gpa, try c.internText(w.sourceText(si)[0..p]));
+            const head = try c.internText(w.texts[w.seg][w.pos..]);
+            match = try c.normalizeTextlessTemplate(try c.reduceTemplateChunks(head, w.types[w.seg..si], chunks.items));
+        }
+        try w.out.append(gpa, match);
+        w.seg = si;
+        w.pos = p;
+    }
+};
 
 pub fn containsInfer(c: *Checker, t: TypeId) Error!bool {
     const s = &c.ts;
