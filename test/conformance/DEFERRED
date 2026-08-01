@@ -31,12 +31,6 @@
 # assignability/075 is the positive/negative pair it under-reports against.
 assignability/077_variance_annotation_mismatch.ts  -TS2636 7
 
-# TS2417 (class static side incorrectly extends base static side) is not
-# implemented: ztsc does not relate `typeof Derived` to `typeof Base` when a
-# derived static shadows a base static incompatibly. Under-report of a whole
-# check, not a span/precision difference.
-classes/033_static_inherit.ts  -TS2417 14
-
 # TS2589 at the structural-relation recursion cap. ztsc's cap assumes the
 # relation and stays silent rather than reporting at the cap, because reporting
 # there would false-positive genuinely-valid deep recursive types the oracle
