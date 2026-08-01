@@ -2667,6 +2667,7 @@ pub const Checker = struct {
     pub const containsBreak = stmts_zig.containsBreak;
     pub const checkNamespace = stmts_zig.checkNamespace;
     pub const checkClass = stmts_zig.checkClass;
+    pub const checkStaticSideExtends = stmts_zig.checkStaticSideExtends;
     pub const checkDecorator = stmts_zig.checkDecorator;
     pub const decoCode = stmts_zig.decoCode;
     pub const decoContextName = stmts_zig.decoContextName;

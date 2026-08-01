@@ -967,6 +967,36 @@ pub fn checkNamespace(c: *Checker, node: Node) Error!void {
     }
 }
 
+/// TS2417: the static side of a derived class must extend the static side
+/// of its base — `typeof D` assignable to `typeof B`, which is what makes a
+/// derived static that shadows a base static with an incompatible type an
+/// error rather than a silent narrowing of the constructor object.
+///
+/// tsc relates `getTypeOfSymbol(class)` against
+/// `getTypeWithoutSignatures(staticBaseType)`: construct signatures are
+/// dropped (a derived ctor never has to match the base's), and `prototype`
+/// is skipped by the `SymbolFlags.Prototype` filter in `propertiesRelatedTo`
+/// (it is the instance side's job, TS2415). ztsc's `classStaticType` carries
+/// neither signatures nor `prototype`, so relating the two objects directly
+/// *is* the filtered relation.
+///
+/// The source object is the merged one — `classStaticType` already folds the
+/// base's statics in with own members winning — so every base member the
+/// derived does not shadow is present verbatim and relates trivially. Only a
+/// genuine incompatible shadow can fail, which keeps this off valid code.
+/// Reported on the class name, tsc's `node.name || node`.
+pub fn checkStaticSideExtends(c: *Checker, class_sym: SymbolId, name_token: ast.TokenIndex) Error!void {
+    if (name_token == 0) return;
+    const base = try c.baseClassSym(class_sym) orelse return;
+    const derived_static = try c.classStaticType(class_sym);
+    const base_static = try c.classStaticType(base);
+    if (derived_static == base_static) return;
+    if (try c.isAssignable(derived_static, base_static)) return;
+    try c.diagFmt(2417, c.tokSpan(name_token), "Class static side 'typeof {s}' incorrectly extends base class static side 'typeof {s}'.", .{
+        c.symbolName(class_sym), c.symbolName(base),
+    });
+}
+
 pub fn checkClass(c: *Checker, node: Node) Error!void {
     const d = c.tree.nodeData(node);
     const data = c.tree.extraData(ast.ClassData, d.lhs);
@@ -1029,6 +1059,7 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
         _ = try c.baseClassRef(class_sym);
         const hd = c.tree.nodeData(data.extends);
         _ = try c.checkExprCached(hd.lhs, types.no_type);
+        try c.checkStaticSideExtends(class_sym, data.name_token);
     }
 
     // implements clauses: instance assignable to each interface.
