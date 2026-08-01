@@ -1230,8 +1230,11 @@ fn resolvePackageAt(io: Io, alloc: Allocator, dir: Io.Dir, d: []const u8, pkg: [
     //     subpath to a stable opaque `any` module (the JSON/allowJs any-module
     //     machinery): the import binds concretely to `any` — matching tsc's
     //     observable `any` at an un-exported subpath — and no symbol dangles.
-    //     Under-reports the TS2307 tsc emits for an app-level such import
-    //     (allowed: a missed error is fine, a false positive is not).
+    //     The stand-in is not silent: liveness and reporting are separate, so
+    //     the linker still emits tsc's TS2307 at the specifier for a path
+    //     carrying `paths.blocked_subpath_suffix` (`Linker.blockedSubpathReport`
+    //     in modules.zig). Returning null here would report the same thing and
+    //     crash; returning the stand-in reports it and does not.
     //
     //     The parse itself is memoized per `package.json` path (`pkg_exports`):
     //     the body was already read once for the run, but the walk re-parsed it

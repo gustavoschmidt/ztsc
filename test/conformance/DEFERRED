@@ -46,13 +46,6 @@ instantiation/010_growing_bareref_no_eager_expand.ts  -TS2589 12
 # under-report. The TS2322 on line 18 still matches.
 instantiation/018_growing_template_hole_no_loop.ts  -TS2589 16
 
-# An `exports`-map subpath that the map does not name is routed to an opaque
-# `any` module rather than left dangling. Dangling the specifier was not
-# crash-safe under parallel resolution (it dangled a symbol -> SIGABRT), so the
-# TS2307 the oracle emits is deliberately traded for crash safety. See the
-# comment in the case entry.ts.
-modules/39_exports_subpath_block  -TS2307 entry.ts 12
-
 # TS2578 ("Unused '@ts-expect-error' directive") is not implemented. The
 # suppression half of `@ts-expect-error` is; the unused report is not, because
 # it is only sound on a checker that reports everything the oracle does. ztsc

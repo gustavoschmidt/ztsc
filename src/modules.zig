@@ -1587,6 +1587,24 @@ const Linker = struct {
         return mfile;
     }
 
+    /// True when `mfile` is the synthetic stand-in the resolver returns for an
+    /// `exports`-map subpath the map does not name — i.e. the specifier did
+    /// NOT really resolve, and tsc reports TS2307 at it.
+    ///
+    /// Splitting the report from the resolution is the whole point. The
+    /// resolver may not answer `null` for a blocked subpath: an unresolved
+    /// specifier dangles the import's symbol, which is order-dependent under
+    /// parallel resolution and aborted intermittently in the flow-narrowing
+    /// `mergedSym` path. So resolution keeps handing back a stable opaque `any`
+    /// module (every downstream symbol stays bound and typed `any`, which is
+    /// also tsc's observable type at such an import), and only the *diagnostic*
+    /// treats the specifier as unresolved. Nothing here mutates shared state —
+    /// the linker walks files sequentially into per-file `diags` sinks — so the
+    /// recording inherits the link phase's thread-safety, not the resolver's.
+    fn blockedSubpathReport(l: *Linker, mfile: FileId) bool {
+        return paths.isBlockedSubpathPath(l.files[mfile].path);
+    }
+
     /// An ambient module whose block yielded no ES-style named exports — it
     /// uses `export =` / `import = require` or the ambient auto-export rule
     /// (top-level `let`/`function` with no `export`), all out of subset. Real
@@ -1666,13 +1684,25 @@ const Linker = struct {
             if (stripped.len == 0) continue;
             const atom = l.interner.intern(l.io, l.gpa, stripped) catch return Error.OutOfMemory;
             if (try l.effectiveModuleFile(f, atom)) |mfile| {
-                // Resolved. The one thing left to say about it: a dependency
-                // that turned out to be plain JavaScript has no types, and
-                // under `noImplicitAny` that is an error at the specifier.
-                if (l.no_implicit_any and !side_effect and untypedJsModule(l.files[mfile].path)) {
-                    try l.diag(file, 7016, l.tokSpan(file, mod_tok), "Could not find a declaration file for module '{s}'. '{s}' implicitly has an 'any' type.", .{ stripped, l.files[mfile].path });
+                // An `exports`-blocked subpath is a RESOLUTION FAILURE wearing
+                // a resolution's clothes: the resolver hands back a synthetic
+                // opaque `any` module (`paths.blocked_subpath_suffix`) purely so
+                // every downstream symbol stays bound — dangling the specifier
+                // instead is not crash-safe under parallel resolution. The
+                // diagnostic is decoupled from that liveness decision here:
+                // liveness stays with the resolver's stand-in module, and the
+                // report falls through to the same unresolved-specifier arms
+                // below (ambient suppression included), so tsc's TS2307 lands
+                // at the specifier token. See `blockedSubpathReport`.
+                if (!l.blockedSubpathReport(mfile)) {
+                    // Resolved. The one thing left to say about it: a dependency
+                    // that turned out to be plain JavaScript has no types, and
+                    // under `noImplicitAny` that is an error at the specifier.
+                    if (l.no_implicit_any and !side_effect and untypedJsModule(l.files[mfile].path)) {
+                        try l.diag(file, 7016, l.tokSpan(file, mod_tok), "Could not find a declaration file for module '{s}'. '{s}' implicitly has an 'any' type.", .{ stripped, l.files[mfile].path });
+                    }
+                    continue;
                 }
-                continue;
             }
             if (l.hasAmbient(atom)) continue; // resolved by a `declare module`
             if (side_effect) {
@@ -1887,7 +1917,8 @@ const Linker = struct {
 /// synthetic any-modules are deliberately excluded: a `*.json` resolved by
 /// `resolveJsonModule` is a legal resolution (tsc types it structurally, ztsc
 /// opaquely — an under-report, not an error), and an `exports`-blocked subpath
-/// is tsc's TS2307, a different diagnostic ztsc under-reports on purpose.
+/// gets TS2307 instead — a different diagnostic, emitted on the unresolved arm
+/// of the same walk via `blockedSubpathReport`.
 fn untypedJsModule(path: []const u8) bool {
     return paths.isJsModulePath(path) and paths.isInNodeModules(path);
 }
