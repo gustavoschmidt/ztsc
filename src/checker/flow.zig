@@ -457,9 +457,97 @@ pub fn flowTypeOfKey(c: *Checker, node: Node, key: RefKey, declared: TypeId) Err
         if (c.bind.flowAt(node)) |flow| {
             c.stats.flow_queries += 1;
             t = try c.flowType(flow, key, declared, 0);
+            // The tail of tsc's `getFlowTypeOfReference`. tsc has *two*
+            // `never`s: the ordinary one a guard narrows a reference down to,
+            // and `unreachableNeverType`, which is what the walk answers when
+            // it bottoms out in code no control path reaches. Only the first
+            // is a type anyone may observe — for the second the DECLARED type
+            // is handed back, which is why `function f(x: string) { return 1;
+            //   x.length; }` is silent while an exhausted union's dead branch
+            // reports TS2339. ztsc computes both with the one `never_type`,
+            // so the distinction is drawn here, by asking the graph whether
+            // the reference's own flow node is reachable at all.
+            if (c.ts.kind(t) == .never and !try c.flowReachable(flow)) t = declared;
         }
     }
     return c.applyChainGuards(key, t);
+}
+
+/// tsc's `isReachableFlowNode`. Only asked on a `never` answer (a fraction of
+/// a percent of queries), so the memo is there to bound a pathological graph
+/// rather than to carry a hot path.
+pub fn flowReachable(c: *Checker, flow: FlowId) Error!bool {
+    if (flow == binder.no_flow) return true;
+    if (flow == binder.unreachable_flow) return false;
+    const cache_key = c.cur_flow_base + flow;
+    // 0 = in flight. A cycle can only close through a loop label, whose
+    // *entry* edge is the one edge walked, so this is defensive only;
+    // answering "reachable" keeps it on the non-suppressing side.
+    if (c.flow_reach.get(cache_key)) |v| return v != 1;
+    try c.flow_reach.put(c.cm(), cache_key, 0);
+    const r = try flowReachableInner(c, flow);
+    try c.flow_reach.put(c.cm(), cache_key, if (r) 2 else 1);
+    return r;
+}
+
+fn flowReachableInner(c: *Checker, flow: FlowId) Error!bool {
+    const b = c.bind;
+    switch (b.flow_tags[flow]) {
+        .none, .start => return true,
+        .unreachable_ => return false,
+        .branch_label => {
+            for (b.flowAntecedents(flow)) |a| {
+                if (try c.flowReachable(a)) return true;
+            }
+            return false;
+        },
+        // Only the entry edge: a loop's back edges are reachable exactly
+        // when the head is, so following them would answer with itself.
+        .loop_label => {
+            const antes = b.flowAntecedents(flow);
+            if (antes.len == 0) return false;
+            return c.flowReachable(antes[0]);
+        },
+        // tsc's Call arm: a call statement whose signature returns `never`
+        // (`invariant(false)`, `fail(msg): never`) ends the flow — the
+        // statements after it are dead, and a reference read there is back
+        // at its declared type.
+        .call_stmt => {
+            if (try callStmtReturnsNever(c, flow)) return false;
+            return c.flowReachable(b.flow_a[flow]);
+        },
+        // A `switch_no_match` edge is deliberately NOT tested for
+        // exhaustiveness here: the fall-out of an exhaustive `switch` is
+        // where tsc reports `never` on the discriminant, so it must stay
+        // "reachable" and let the narrowed `never` through.
+        else => return c.flowReachable(b.flow_a[flow]),
+    }
+}
+
+/// Does the call statement behind `flow` return `never`? Resolved from the
+/// callee's DECLARED (or already-memoized) type only — `never` is not a
+/// return type inference produces for a declaration, and re-checking a
+/// callee from inside a flow query is the re-entrancy `guardCallOf`'s header
+/// note documents.
+fn callStmtReturnsNever(c: *Checker, flow: FlowId) Error!bool {
+    const call = c.bind.flowNode(flow);
+    if (call == null_node) return false;
+    const saved = c.cur_scope;
+    defer c.cur_scope = saved;
+    c.cur_scope = c.bind.flowScope(flow);
+    const callee = c.callShape(call).callee;
+    const callee_t = switch (c.nodeTag(callee)) {
+        .member_expr, .optional_member_expr, .index_expr, .optional_index_expr => c.nodeType(callee) orelse
+            try c.declaredPathType(callee),
+        .identifier => if (c.calleeNeedsExplicitDecl(callee))
+            c.nodeType(callee) orelse try c.declaredPathType(callee)
+        else
+            try c.checkExprCached(callee, types.no_type),
+        else => return false,
+    };
+    if (callee_t == types.no_type) return false;
+    const sig = (try c.lastCallSig(callee_t)) orelse return false;
+    return c.ts.kind(c.ts.fnReturn(sig)) == .never;
 }
 
 /// The binder binds optional chains linearly (see its header note), so the
@@ -1936,7 +2024,7 @@ pub fn narrowByTypeofResolved(c: *Checker, t: TypeId, which: usize, sense: bool)
         var parts: std.ArrayList(TypeId) = .empty;
         defer parts.deinit(c.scratch());
         for (try c.memberList(t)) |m| {
-            const keep = c.typeofMatches(m, which);
+            const keep = try c.typeofMatchesFn(m, which);
             const kept = if (sense) keep else !keep;
             if (kept) try parts.append(c.scratch(), m);
         }
@@ -1957,9 +2045,47 @@ pub fn narrowByTypeofResolved(c: *Checker, t: TypeId, which: usize, sense: bool)
             else => t,
         };
     }
-    const matches = c.typeofMatches(t, which);
+    const matches = try c.typeofMatchesFn(t, which);
     if (sense) return if (matches) t else types.never_type;
     return if (matches) types.never_type else t;
+}
+
+/// `typeofMatches` plus tsc's `isFunctionObjectType`: for `typeof x ===
+/// "function"` an OBJECT type survives when it carries call or construct
+/// signatures. `interface SymbolConstructor { (d?: string): symbol; … }` is
+/// a `.ref`, so the syntactic-kind test alone answered "not a function" and
+/// narrowed every callable interface — `Symbol`, `Array`, a mixin
+/// constructor, an unannotated `const f = Object.assign(fn, {…})` — to
+/// `never` inside its own `typeof === "function"` guard. Silent while a read
+/// off `never` was permissive; a TS2339 the moment it stopped being.
+///
+/// Only the *keep* side is widened here: the `"object"` case still keeps a
+/// callable (tsc's `FunctionFacts` would drop it), which under-narrows and
+/// can only lose a diagnostic, never invent one.
+pub fn typeofMatchesFn(c: *Checker, t: TypeId, which: usize) Error!bool {
+    if (c.typeofMatches(t, which)) return true;
+    if (which != 7) return false;
+    return switch (c.ts.kind(t)) {
+        .ref, .object, .intersection => c.hasCallableShape(t),
+        else => false,
+    };
+}
+
+/// Does `t` carry a call or construct signature? (`lastCallSig` already
+/// walks overload sets and intersections for the call half.)
+pub fn hasCallableShape(c: *Checker, t: TypeId) Error!bool {
+    if ((try c.lastCallSig(t)) != null) return true;
+    const r = try c.resolveStructural(t);
+    switch (c.ts.kind(r)) {
+        .object => return c.ts.objectConstructSigCount(r) > 0,
+        .intersection => {
+            for (try c.memberList(r)) |m| {
+                if (try c.hasCallableShape(m)) return true;
+            }
+            return false;
+        },
+        else => return false,
+    }
 }
 
 pub fn typeofMatches(c: *Checker, t: TypeId, which: usize) bool {
