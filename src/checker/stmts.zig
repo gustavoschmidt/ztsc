@@ -199,7 +199,16 @@ pub fn checkDeclarator(c: *Checker, decl: Node, is_const: bool) Error!void {
             if (e.init != 0) {
                 const it = try c.checkExprCached(e.init, ann);
                 if (ann != types.no_type and ann != types.error_type) {
-                    _ = try c.checkAssignable(it, ann, e.init, name_span);
+                    // An INLINE deferred conditional annotation does not get
+                    // the both-branches leniency here (see
+                    // `inlineCondAnnRejects`): tsc treats a distributive
+                    // conditional written inside the generic function's body
+                    // as distribution dependent and rejects the write.
+                    if (try c.checkAssignable(it, ann, e.init, name_span) and
+                        try c.inlineCondAnnRejects(e.type_ann, it, ann))
+                    {
+                        try c.reportNotAssignable(2322, it, ann, name_span);
+                    }
                 }
             }
             try c.materializePatternTypes(d.lhs);
