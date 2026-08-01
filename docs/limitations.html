@@ -170,19 +170,17 @@
     <li><strong>Class-value instantiation expressions</strong> — <code>typeof C&lt;T&gt;</code>
     applied to a class value under-reports.</li>
     <li>Other known edge cases miss an error the TypeScript compiler would report; the
-    conformance suite's <code>DEFERRED</code> ledger tracks <strong>32 accepted
+    conformance suite's <code>DEFERRED</code> ledger tracks <strong>9 accepted
     divergences</strong> explicitly — with a written justification each — rather than hiding
     them in the goldens, and the runner fails a case whose entry stops describing reality, so
     the ledger cannot be used to mask a regression. Every one is an <em>under</em>-report.
-    Whole checks that are simply not implemented: <strong>TS2417</strong> (class static side
-    incorrectly extends base static side), <strong>TS2578</strong> (unused
+    The only whole check simply not implemented is <strong>TS2578</strong> (unused
     <code>@ts-expect-error</code> — only sound on a checker that reports everything the oracle
-    does), and the circularity family
-    <strong>TS2502 / TS7022 / TS7023 / TS2729</strong>, where the re-entry is detected and cut
-    but the cut is silent. The rest are deliberate trades where the stricter rule was measured
-    to cost false positives on correct code — most numerously
-    <strong>TS2589</strong> at the recursion cap and <strong>TS2322</strong> on the
-    conditional-target and callback-variance rules.</li>
+    does). The rest are deliberate trades where the stricter rule was measured to cost false
+    positives on correct code — <strong>TS2589</strong> at the recursion cap,
+    <strong>TS2345</strong> on whole-list rest-union calls (needs <code>const</code> type
+    parameters first), <strong>TS2352</strong> on deferred-indexed-access casts, and
+    <strong>TS2322</strong> on the exclusive callback-variance rule.</li>
   </ul>
   <div class="note">
     <p><strong>Check your own codebase in one command.</strong> <code>ztsc --census</code>
