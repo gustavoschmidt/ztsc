@@ -2565,7 +2565,15 @@ pub fn checkNullishAccess(c: *Checker, t: TypeId, obj_node: Node, access_node: N
             try c.diagFmt(2532, span, "Object is possibly 'undefined'.", .{});
         }
     }
-    return c.nonNullable(t);
+    // tsc's `checkNonNullTypeWithReporter`: once the nullish access has been
+    // reported, a remainder that is `never` (the object was *only* nullish —
+    // `null`, `undefined`, or a reference the flow narrowed to nothing else)
+    // degrades to the error type, not to `never`. That keeps the single
+    // "possibly null/undefined" diagnostic from being doubled by a TS2339 on
+    // `never` from the member lookup that follows.
+    const nn = try c.nonNullable(t);
+    if (c.ts.kind(nn) == .never) return types.error_type;
+    return nn;
 }
 
 /// Render an entity-name-ish expression (a, a.b, a.b.c) or null.
@@ -2597,9 +2605,18 @@ pub fn propertyTypeOf(c: *Checker, t: TypeId, name: Atom, name_tok: TokenIndex) 
     const k = c.ts.kind(t);
     switch (k) {
         .any, .err, .none => return types.any_type,
-        // Property access on `never` is silently `never` (tsc; typically
-        // the non-nullable remainder of a null-narrowed reference).
-        .never => return types.never_type,
+        // `never` has no members, so tsc's `getPropertyOfType` finds nothing
+        // and `checkPropertyAccessExpression` reports. The two `never`s that
+        // must NOT arrive here are handled where tsc handles them: a read in
+        // unreachable code answers with the DECLARED type (`flowTypeOfKey`),
+        // and the empty remainder of a nullish access degrades to the error
+        // type after its own diagnostic (`checkNullishAccess`).
+        .never => {
+            try c.diagFmt(2339, c.tokSpan(name_tok), "Property '{s}' does not exist on type 'never'.", .{
+                c.atomText(name),
+            });
+            return types.error_type;
+        },
         .union_type => {
             var parts: std.ArrayList(TypeId) = .empty;
             defer parts.deinit(c.scratch());

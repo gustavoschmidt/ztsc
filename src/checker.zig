@@ -465,6 +465,7 @@ pub const map_containers = [_][]const u8{
     "infer_scopes",             "mapped_key_ids",     "inst_diag_at",
     "infer_active",             "lazy_member_active", "chain_guards",
     "never_isect",              "deep_path_list",     "deep_path_ids",
+    "flow_reach",
 };
 
 pub const Checker = struct {
@@ -723,6 +724,11 @@ pub const Checker = struct {
     deep_path_ids: std.AutoHashMapUnmanaged(DeepPath, u16) = .empty,
     /// (flow << 32 | symbol) -> definitely-assigned (2 computing, 0/1 result).
     da_cache: std.AutoHashMapUnmanaged(u64, u8) = .empty,
+    /// Program-global flow id -> can control reach it (0 computing, 1 no,
+    /// 2 yes). Consulted only when a flow query answered `never`, to tell a
+    /// reference narrowed to nothing apart from one read in dead code — see
+    /// `flowReachable`.
+    flow_reach: std.AutoHashMapUnmanaged(u32, u8) = .empty,
     /// containsTypeParam memo: 0 unknown, 1 no, 2 yes.
     ctp_cache: std.AutoHashMapUnmanaged(TypeId, u8) = .empty,
     /// containsMappedParam memo: 0 unknown, 1 no, 2 yes.
@@ -2566,6 +2572,7 @@ pub const Checker = struct {
     pub const isNarrowable = flow_zig.isNarrowable;
     pub const flowTypeOfReference = flow_zig.flowTypeOfReference;
     pub const flowTypeOfKey = flow_zig.flowTypeOfKey;
+    pub const flowReachable = flow_zig.flowReachable;
     pub const pushChainGuards = flow_zig.pushChainGuards;
     pub const applyChainGuards = flow_zig.applyChainGuards;
     pub const flowInFlight = flow_zig.flowInFlight;
@@ -2604,6 +2611,8 @@ pub const Checker = struct {
     pub const narrowByTypeof = flow_zig.narrowByTypeof;
     pub const narrowByTypeofResolved = flow_zig.narrowByTypeofResolved;
     pub const typeofMatches = flow_zig.typeofMatches;
+    pub const typeofMatchesFn = flow_zig.typeofMatchesFn;
+    pub const hasCallableShape = flow_zig.hasCallableShape;
     pub const narrowByDiscriminant = flow_zig.narrowByDiscriminant;
     pub const narrowByPropTruthiness = flow_zig.narrowByPropTruthiness;
     pub const propDeclaredForIn = flow_zig.propDeclaredForIn;
