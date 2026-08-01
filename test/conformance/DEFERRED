@@ -68,14 +68,6 @@ modules/39_exports_subpath_block  -TS2307 entry.ts 12
 # under-report of a whole check.
 directives/012_ts_expect_error_unused.ts  -TS2578 7
 
-# A compound assignment (`x += 1`, `x -= 1`, ...) does not check that its
-# result is assignable back to the target, so the oracle's TS2322 on
-# `mv += 1` where `mv: number & { _brand }` is missed. Pre-existing and
-# independent of the operand classification the case is about: the plain
-# assignments on lines 11-12 of the same case prove `number` is still not
-# assignable to the brand. Deterministic under-report of a whole check.
-operators/004_branded_intersection_not_numeric.ts  -TS2322 31
-
 # The callback-parameter relation is ADDITIVE in ztsc, where tsc makes it the
 # only test for a pair of single-call-signature parameters. When the callback
 # comparison fails, ztsc falls back to the pre-existing
