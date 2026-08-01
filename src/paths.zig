@@ -182,7 +182,9 @@ pub const js_module_source = json_module_source;
 /// symbol in the parallel resolution phase — an intermittent, load-dependent
 /// crash). The suffix is deliberately not a real file extension: it never
 /// collides with an on-disk file, and `anyModuleSourceFor` recognizes it so the
-/// loader substitutes the synthetic `any` body and never touches disk.
+/// loader substitutes the synthetic `any` body and never touches disk. It is
+/// also what the linker keys tsc's TS2307 off (`blockedSubpathReport`): the
+/// stand-in keeps the symbols alive, the suffix keeps the diagnostic.
 pub const blocked_subpath_suffix = ".ztsc-exports-blocked";
 
 // -------------------------------------------------------------------------
