@@ -170,14 +170,14 @@
     <li><strong>Class-value instantiation expressions</strong> — <code>typeof C&lt;T&gt;</code>
     applied to a class value under-reports.</li>
     <li>Other known edge cases miss an error the TypeScript compiler would report; the
-    conformance suite's <code>DEFERRED</code> ledger tracks <strong>34 accepted
+    conformance suite's <code>DEFERRED</code> ledger tracks <strong>32 accepted
     divergences</strong> explicitly — with a written justification each — rather than hiding
     them in the goldens, and the runner fails a case whose entry stops describing reality, so
     the ledger cannot be used to mask a regression. Every one is an <em>under</em>-report.
     Whole checks that are simply not implemented: <strong>TS2417</strong> (class static side
     incorrectly extends base static side), <strong>TS2578</strong> (unused
     <code>@ts-expect-error</code> — only sound on a checker that reports everything the oracle
-    does), <strong>TS2536</strong> (key cannot be used to index), and the circularity family
+    does), and the circularity family
     <strong>TS2502 / TS7022 / TS7023 / TS2729</strong>, where the re-entry is detected and cut
     but the cut is silent. The rest are deliberate trades where the stricter rule was measured
     to cost false positives on correct code — most numerously

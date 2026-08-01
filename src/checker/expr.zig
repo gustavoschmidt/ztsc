@@ -31,6 +31,7 @@ const check = checker_zig.check;
 
 const TpMap = @import("enums.zig").TpMap;
 const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
+const UnionIndexMiss = @import("typenode.zig").UnionIndexMiss;
 const buildRefKey = @import("flow.zig").buildRefKey;
 const checkFunctionBody = @import("stmts.zig").checkFunctionBody;
 const classInstanceGeneric = @import("instantiate.zig").classInstanceGeneric;
@@ -2767,7 +2768,27 @@ pub fn indexChainInner(c: *Checker, node: Node, chained: *bool, narrow: bool) Er
     // yields `any` — so every read through a `Record<SomeUnion, T>` lost
     // its type, and with it the contextual signature of any callback the
     // read fed (`map[dir].map((c) => c)`).
-    if (try c.unionIndexElemType(r, idx_t)) |ut| {
+    var miss: UnionIndexMiss = .none;
+    const distributed = try c.unionIndexElemType(r, idx_t, &miss);
+    // A key set that did NOT distribute is still reported on: tsc's
+    // `getIndexedAccessType` errors on the offending constituent and the
+    // access falls back to `any` (TS7053) or to the receiver's numeric index
+    // signature (TS2493, out-of-range tuple constituent). Only the two
+    // certain shapes reach here (see `UnionIndexMiss`); the fallback type
+    // below is unchanged either way, so whatever the access already reported
+    // downstream still reports.
+    switch (miss) {
+        .none => {},
+        .absent_key => if (c.prog.no_implicit_any) {
+            try c.diagFmt(7053, c.nodeSpan(node), "Element implicitly has an 'any' type because expression of type '{s}' can't be used to index type '{s}'.", .{
+                try c.typeToString(idx_t), try c.typeToString(obj_t),
+            });
+        },
+        .tuple_range => |tr| try c.diagFmt(2493, c.nodeSpan(d.rhs), "Tuple type '{s}' of length '{d}' has no element at index '{d}'.", .{
+            try c.typeToString(tr.tuple), c.ts.tupleLen(tr.tuple), tr.index,
+        }),
+    }
+    if (distributed) |ut| {
         result = ut;
     } else switch (ik) {
         .string_literal => {
@@ -2824,6 +2845,22 @@ pub fn indexChainInner(c: *Checker, node: Node, chained: *bool, narrow: bool) Er
             } else if (rk == .array or rk == .tuple or rk == .string) {
                 result = types.any_type;
             } else {
+                // A plain `string` key into an object with no string index
+                // signature is, for tsc, an implicit-'any' element access
+                // (TS7053) — the whole-domain counterpart of the
+                // string-literal arm above. `globalThis` has its own code
+                // (TS7017, on the property path); an array/tuple/string
+                // receiver has TS7015 ("index expression is not of type
+                // 'number'"), which ztsc does not implement, so those stay
+                // silent above. Suppressed under `noImplicitAny: false`; the
+                // result is `any` either way.
+                if (rk == .object and c.prog.no_implicit_any and
+                    c.ts.objectFlags(r) & types.obj_flag_global_this == 0)
+                {
+                    try c.diagFmt(7053, c.nodeSpan(node), "Element implicitly has an 'any' type because expression of type '{s}' can't be used to index type '{s}'.", .{
+                        try c.typeToString(idx_t), try c.typeToString(obj_t),
+                    });
+                }
                 result = types.any_type;
             }
         },

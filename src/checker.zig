@@ -913,6 +913,15 @@ pub const Checker = struct {
     /// authoritative top-down check reports at the narrowed type, and a
     /// narrowing query must never be the thing that files an error.
     side_query_depth: u32 = 0,
+    /// Nesting depth of a conditional type's TRUE branch, while its type
+    /// nodes are being synthesized. tsc wraps every occurrence of the check
+    /// type inside that branch in a *substitution type* constrained by the
+    /// `extends` type (see `condTrueUnderExtends`); ztsc has none, so a
+    /// `T["k"]` there still reads `T`'s declared constraint and would look
+    /// unindexable even when the branch guarantees the key. The only reader
+    /// is `checkIndexedAccessIndexType`, which stays silent while this is
+    /// non-zero.
+    cond_true_depth: u32 = 0,
     /// Depth of an in-flight *trial* check: the expression is checked exactly
     /// as the authoritative pass would — same relations, same inference, same
     /// diagnostics — but its answer must not be written to the `node_types`
@@ -2068,6 +2077,7 @@ pub const Checker = struct {
     pub const isKeyAtom = typenode_zig.isKeyAtom;
     pub const keyofMapped = typenode_zig.keyofMapped;
     pub const indexedAccessType = typenode_zig.indexedAccessType;
+    pub const checkIndexedAccessIndexType = typenode_zig.checkIndexedAccessIndexType;
     pub const typeIsNumberLike = typenode_zig.typeIsNumberLike;
     pub const numberIndexType = typenode_zig.numberIndexType;
     pub const unionIndexElemType = typenode_zig.unionIndexElemType;

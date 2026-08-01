@@ -92,7 +92,13 @@ pub fn conditionalTypeFromNode(c: *Checker, node: Node) Error!TypeId {
     // enclosing scopes only.
     try c.infer_scopes.append(c.cm(), c.nodeKey(node));
     const extends_ty = try c.typeFromTypeNode(e.extends_type);
+    // The true branch is read under tsc's substitution-type narrowing (the
+    // check type is a subtype of `extends` there); ztsc models none, so the
+    // "can this key index that object" check stays quiet inside it — see
+    // `Checker.cond_true_depth`.
+    c.cond_true_depth += 1;
     const true_ty = try c.typeFromTypeNode(e.true_type);
+    c.cond_true_depth -= 1;
     _ = c.infer_scopes.pop();
     const false_ty = try c.typeFromTypeNode(e.false_type);
     // Distributivity is a property of a *naked type-parameter* check. A
