@@ -632,6 +632,12 @@ pub const Checker = struct {
     /// the relation's variance probe costs one hash lookup on hot paths.
     /// Parameters past the 16th are read as unannotated.
     variance_cache: std.AutoHashMapUnmanaged(SymbolId, u32) = .empty,
+    /// The two `G<…marker…>` references a variance MEASUREMENT is currently
+    /// relating (`{0,0}` outside one). The relation must compare these
+    /// structurally: answering them from `G`'s *declared* variance is what
+    /// the measurement is trying to verify, so it would make every annotation
+    /// vacuously true. tsc keeps the same exemption as its `markerTypes` set.
+    variance_marker_refs: [2]TypeId = .{ 0, 0 },
     /// Generic (uninstantiated) bodies per symbol: interface/class-instance/
     /// class-static/alias.
     iface_generic: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
@@ -2374,6 +2380,13 @@ pub const Checker = struct {
     pub const declaredVarianceOfTypeParam = assign_zig.declaredVarianceOfTypeParam;
     pub const declaredVariances = assign_zig.declaredVariances;
     pub const varianceVerdict = assign_zig.varianceVerdict;
+    pub const varianceMarkers = assign_zig.varianceMarkers;
+    pub const isVarianceMarkerRef = assign_zig.isVarianceMarkerRef;
+    pub const varianceMeasurable = assign_zig.varianceMeasurable;
+    pub const VarianceScan = assign_zig.VarianceScan;
+    pub const varianceAnnotationSpan = assign_zig.varianceAnnotationSpan;
+    pub const reportVarianceMismatch = assign_zig.reportVarianceMismatch;
+    pub const checkVarianceAnnotations = assign_zig.checkVarianceAnnotations;
     pub const refFacetOf = assign_zig.refFacetOf;
     pub const isAssignable = assign_zig.isAssignable;
     pub const condTrueUnderExtends = assign_zig.condTrueUnderExtends;
