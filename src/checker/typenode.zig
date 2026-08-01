@@ -235,7 +235,9 @@ pub fn typeFromTypeNodeUncached(c: *Checker, node: Node) Error!TypeId {
         .indexed_access_type => {
             const obj = try c.typeFromTypeNode(d.lhs);
             const idx = try c.typeFromTypeNode(d.rhs);
-            return c.reduceIndexedAccess(obj, idx);
+            const acc = try c.reduceIndexedAccess(obj, idx);
+            try c.checkIndexedAccessIndexType(acc, node);
+            return acc;
         },
         .conditional_type => return c.conditionalTypeFromNode(node),
         .infer_type => return c.inferVarFromNode(node),
@@ -1529,6 +1531,78 @@ pub fn indexedAccessType(c: *Checker, obj: TypeId, idx: TypeId) Error!TypeId {
     }
 }
 
+/// TS2536 — "Type 'K' cannot be used to index type 'T'" (tsc's
+/// `checkIndexedAccessIndexType`, run on the type NODE that produced the
+/// access).
+///
+/// Only a DEFERRED access is checked, exactly as tsc gates on
+/// `TypeFlags.IndexedAccess`: a concrete `T[K]` has already been resolved by
+/// `indexedAccessType`, which answers `unknown` for an absent key and never
+/// leaves anything for this check to say.
+///
+/// tsc runs it on every deferred access and leans on its substitution types
+/// plus a constraint-chasing relation to clear the generic keys; ztsc has
+/// neither, so the literal transcription — "is the index assignable to
+/// `keyof obj`" — rejects the whole mapped/conditional family
+/// (`{ [P in K]: T[P] }`, `K extends keyof O ? O[K] : D`, `Form[infer K]`),
+/// none of which tsc reports. The check is therefore restricted to the
+/// DECIDABLE shape:
+///
+///   * the object is a bare TYPE PARAMETER with a written constraint (read
+///     straight off the declaration — no `baseConstraintOf` instantiation
+///     pass, which would spend the statement's TS2589 budget on a check);
+///   * the index is a single string-literal key, not a type variable,
+///     `infer` binder, mapped key or key union (a NUMERIC key is left alone:
+///     its answer comes from index signatures and lib members ztsc
+///     approximates — `T["length"]` under `T extends readonly any[]`, the
+///     `IsTuple`/`Parameters<F>["length"]` arity guard);
+///   * the constraint is a plain OBJECT type with no index signature, and
+///     the key is absent from it. Absence is asked with `propOfType` — the
+///     same lookup the concrete access path uses, so inheritance and
+///     declaration merging answer here exactly as they do there, which an
+///     enumerated `keyofType` key set does not (drizzle's
+///     `MySqlDeleteBase`'s `_` comes from the merged interface half);
+///   * the access is not inside a conditional type's TRUE branch, where tsc's
+///     substitution types narrow the check type to its `extends` type and
+///     admit keys the declared constraint does not have (`T extends
+///     ZodObject<…> ? … T["shape"] …`, zod's `DeepPartial`; the same gap
+///     `condTrueUnderExtends` names on the relation side).
+///
+/// Everything else stays silent — a deterministic under-report, never a
+/// false positive.
+///
+/// The access type is returned UNCHANGED (tsc substitutes `errorType`):
+/// downstream assignability still reports the TS2322 through the unusable
+/// access, which is the diagnostic that keeps the bad value from passing.
+pub fn checkIndexedAccessIndexType(c: *Checker, acc: TypeId, node: Node) Error!void {
+    if (c.ts.kind(acc) != .index_access) return;
+    if (c.cond_true_depth > 0) return;
+    const obj = c.ts.indexAccessObj(acc);
+    if (c.ts.kind(obj) != .type_param) return;
+    const idx = try c.ts.regularLiteral(c.ts.indexAccessIndex(acc));
+    if (c.ts.kind(idx) != .string_literal) return;
+    const con = try c.typeParamConstraint(c.ts.typeParamSymbol(obj));
+    if (con == types.no_type) return;
+    const bc = try c.resolveStructural(con);
+    // A shape whose members are knowable. `any`/`err`/`unknown`, a
+    // still-deferred mapped/conditional form, an array/tuple (approximate
+    // key set) and the primitives are all "cannot tell".
+    if (c.ts.kind(bc) != .object) return;
+    if (c.ts.objectStringIndex(bc) != 0 or c.ts.objectNumberIndex(bc) != 0) return;
+    // A CLASS instance constraint is not authoritative: a same-named
+    // interface merges extra members into it (drizzle's `MySqlDeleteBase`
+    // declares its `_` on the interface half), and ztsc does not model that
+    // merge — reporting here would turn one modelling gap into a second,
+    // louder one.
+    if (c.refFacetOf(bc, c.ts.kind(bc))) |r| {
+        if (c.symFlags(c.ts.refSymbol(r)).class) return;
+    }
+    if (try c.propOfType(bc, c.ts.literalAtom(idx)) != null) return;
+    try c.diagFmt(2536, c.nodeSpan(node), "Type '{s}' cannot be used to index type '{s}'.", .{
+        try c.typeToString(idx), try c.typeToString(obj),
+    });
+}
+
 /// tsc's `TypeFlags.NumberLike` over a resolved type (union/intersection
 /// scan, as in `maybeTypeOfKind`).
 pub fn typeIsNumberLike(c: *Checker, t: TypeId) Error!bool {
@@ -1576,12 +1650,36 @@ pub fn numberIndexType(c: *Checker, r: TypeId) Error!TypeId {
 /// unions; a wider key set keeps the caller's `any`.
 pub const max_union_index_keys = 64;
 
+/// Why a distributed element access did not resolve — the constituent that
+/// stopped it, so the caller can REPORT the key set instead of silently
+/// keeping the `any` the access falls back to.
+pub const UnionIndexMiss = union(enum) {
+    /// Not attempted, or not decidable here (a non-literal constituent, a
+    /// key set too wide to walk, an approximate receiver): stay silent.
+    none,
+    /// A key literal the receiver has neither a member nor an index
+    /// signature for → the access is an implicit 'any' (TS7053).
+    absent_key,
+    /// A numeric key past the end of a tuple (TS2493). The tuple is the one
+    /// actually indexed (a branded tuple indexes through its constituent).
+    tuple_range: struct { tuple: TypeId, index: u32 },
+};
+
 /// `o[k]` where the KEY is a union of literals: tsc's `getIndexedAccessType`
 /// distributes, so the access is `o[k1] | o[k2] | …`. Returns null — leaving
 /// the caller's own single-key handling in charge — unless every constituent
 /// resolves, so a key set that is partly unknown still reaches the caller's
 /// implicit-any reporting instead of being silently narrowed here.
-pub fn unionIndexElemType(c: *Checker, r: TypeId, idx_t: TypeId) Error!?TypeId {
+///
+/// `miss` names the constituent that stopped a distribution, but only where
+/// the answer is certain: a receiver whose member set ztsc models exactly
+/// (an object, or a union/intersection of them) for an absent key, a tuple
+/// for an out-of-range numeric key. Array/tuple *string* keys and every
+/// non-literal constituent leave `.none` — their key sets involve lib
+/// members ztsc approximates, and a wrong "cannot index" there would be a
+/// false positive.
+pub fn unionIndexElemType(c: *Checker, r: TypeId, idx_t: TypeId, miss: *UnionIndexMiss) Error!?TypeId {
+    miss.* = .none;
     if (c.ts.kind(idx_t) != .union_type) return null;
     const rk = c.ts.kind(r);
     // A branded tuple indexes through its tuple constituent, as in the
@@ -1602,7 +1700,10 @@ pub fn unionIndexElemType(c: *Checker, r: TypeId, idx_t: TypeId) Error!?TypeId {
                     parts[i] = if (p.optional()) try c.makeUnion2(p.ty, types.undefined_type) else p.ty;
                 } else if (rk == .object and c.ts.objectStringIndex(r) != 0) {
                     parts[i] = c.ts.objectStringIndex(r);
-                } else return null;
+                } else {
+                    if (rk == .object or rk == .union_type or rk == .intersection) miss.* = .absent_key;
+                    return null;
+                }
             },
             .number_literal => {
                 if (c.ts.kind(rt) != .tuple) return null;
@@ -1613,7 +1714,10 @@ pub fn unionIndexElemType(c: *Checker, r: TypeId, idx_t: TypeId) Error!?TypeId {
                     parts[i] = if (e.optional()) try c.makeUnion2(e.ty, types.undefined_type) else e.ty;
                 } else if (try c.tupleElemTypeAt(rt, iv)) |et| {
                     parts[i] = et;
-                } else return null;
+                } else {
+                    miss.* = .{ .tuple_range = .{ .tuple = rt, .index = iv } };
+                    return null;
+                }
             },
             else => return null,
         }
