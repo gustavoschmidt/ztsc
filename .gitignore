@@ -3,6 +3,12 @@ zig-out/
 bench/corpus/
 node_modules/
 
+# Claude Code local state — agent worktrees are full checkouts plus build cache
+.claude/
+
+# local repros, diff dumps and throwaway probes
+scratchpad/
+
 # but keep the node_modules fixtures used by conformance tests
 !test/conformance/**/node_modules/
 !test/conformance/**/node_modules/**
