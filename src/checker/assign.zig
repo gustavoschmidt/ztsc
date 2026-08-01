@@ -443,6 +443,288 @@ pub fn varianceVerdict(c: *Checker, s_ref: TypeId, t_ref: TypeId) Error!?bool {
     return if (decisive) true else null;
 }
 
+// =====================================================================
+// declaration-site variance (TS2636)
+// =====================================================================
+
+/// The opaque MARKER pair a declaration-site variance measurement runs
+/// against: two type parameters, `sub` constrained by `super`, so `sub` is
+/// assignable to `super` and nothing else relates them in either direction
+/// (`isAssignable` follows a source parameter's constraint and rejects every
+/// non-identical target parameter). Substituting them for the measured
+/// parameter turns "how is `T` used?" into one ordinary relation question —
+/// exactly how tsc measures variance (`markerSubTypeForCheck` /
+/// `markerSuperTypeForCheck`).
+///
+/// Minted per measured parameter and named after it (`sub-T` / `super-T`,
+/// tsc's own display names, so the reported message names the same two types
+/// the oracle's does), above the real + merged symbol space like every other
+/// fresh type-param symbol (see `fresh_tp_base`). Only a program that
+/// actually declares a variance annotation mints any.
+pub fn varianceMarkers(c: *Checker, param_name: []const u8) Error![2]TypeId {
+    const super_sym = c.fresh_tp_next;
+    c.fresh_tp_next += 1;
+    try c.fresh_tp_info.append(c.cm(), .{
+        .name = try c.atom(try std.fmt.allocPrint(c.scratch(), "super-{s}", .{param_name})),
+        .constraint = types.no_type,
+        .default = types.no_type,
+        .has_default = false,
+    });
+    const super_ty = try c.ts.makeTypeParam(super_sym);
+    const sub_sym = c.fresh_tp_next;
+    c.fresh_tp_next += 1;
+    try c.fresh_tp_info.append(c.cm(), .{
+        .name = try c.atom(try std.fmt.allocPrint(c.scratch(), "sub-{s}", .{param_name})),
+        .constraint = super_ty,
+        .default = types.no_type,
+        .has_default = false,
+    });
+    return .{ try c.ts.makeTypeParam(sub_sym), super_ty };
+}
+
+/// Is `r` one of the two marker references the measurement in flight is
+/// relating? Those two must be compared structurally — see
+/// `variance_marker_refs`.
+pub fn isVarianceMarkerRef(c: *const Checker, r: TypeId) bool {
+    return r == c.variance_marker_refs[0] or r == c.variance_marker_refs[1];
+}
+
+/// Types a single measurability scan may visit before giving up. Each visit
+/// is a distinct type (the `seen` set), so this bounds the walk's recursion
+/// depth as well as its width.
+pub const variance_scan_budget: u32 = 4096;
+
+/// The walk `varianceMeasurable` performs over one generic's parametric
+/// spine, and the two facts it collects on the way.
+pub const VarianceScan = struct {
+    /// The generic being measured.
+    owner: SymbolId,
+    seen: std.AutoHashMapUnmanaged(TypeId, void) = .empty,
+    budget: u32 = variance_scan_budget,
+    /// The spine loops back to `owner`.
+    cyclic: bool = false,
+    /// The spine passes through a DIFFERENT generic that carries its own
+    /// `in`/`out` annotations.
+    via_annotated: bool = false,
+
+    pub fn deinit(sc: *VarianceScan, gpa: std.mem.Allocator) void {
+        sc.seen.deinit(gpa);
+    }
+
+    /// Both together mean the measurement is order-dependent in tsc — see
+    /// `varianceMeasurable`.
+    pub fn entangled(sc: *const VarianceScan) bool {
+        return sc.cyclic and sc.via_annotated;
+    }
+};
+
+/// Is the parametric spine of `t` simple enough that relating two marker
+/// instantiations of it MEASURES the parameter's variance, rather than
+/// probing a corner of the relation where ztsc and tsc need not agree?
+///
+/// tsc has no such gate — `checkTypeParameterDeferred` reports whatever its
+/// relation says — so this is a deliberate under-report, and the reason is
+/// the no-false-positive rule: a marker substituted into a `keyof` /
+/// conditional / mapped / indexed-access / template position asks the
+/// relation about a deferred type with a free parameter in it, which is
+/// precisely where ztsc's answers are approximations. A wrong "not
+/// assignable" there would invent a TS2636 the oracle never reports, on a
+/// declaration that is perfectly fine.
+///
+/// The scan is cheap because it prunes on `containsTypeParam`: a subtree
+/// with no type parameter in it is IDENTICAL in both instantiations, so the
+/// relation short-circuits on it (`s == t`) and it cannot influence the
+/// measurement. What is left to walk is the spine the parameter flows down.
+pub fn varianceMeasurable(c: *Checker, t: TypeId, sc: *VarianceScan) Error!bool {
+    if (!try c.containsTypeParam(t)) return true;
+    if (sc.budget == 0) return false;
+    sc.budget -= 1;
+    if ((try sc.seen.getOrPut(c.scratch(), t)).found_existing) return true;
+    const s = &c.ts;
+    switch (s.kind(t)) {
+        .type_param => return true,
+        .union_type, .intersection, .overloads => {
+            for (0..s.memberCount(t)) |i| {
+                if (!try c.varianceMeasurable(s.memberAt(t, i), sc)) return false;
+            }
+            return true;
+        },
+        .array => return c.varianceMeasurable(s.arrayElem(t), sc),
+        .tuple => {
+            for (0..s.tupleLen(t)) |i| {
+                if (!try c.varianceMeasurable(s.tupleElem(t, @intCast(i)).ty, sc)) return false;
+            }
+            return true;
+        },
+        .object => {
+            for (0..s.objectPropCount(t)) |i| {
+                if (!try c.varianceMeasurable(s.objectProp(t, @intCast(i)).ty, sc)) return false;
+            }
+            const si = s.objectStringIndex(t);
+            if (si != 0 and !try c.varianceMeasurable(si, sc)) return false;
+            const ni = s.objectNumberIndex(t);
+            if (ni != 0 and !try c.varianceMeasurable(ni, sc)) return false;
+            for (0..s.objectCallSigCount(t)) |i| {
+                if (!try c.varianceMeasurable(s.objectCallSig(t, @intCast(i)), sc)) return false;
+            }
+            for (0..s.objectConstructSigCount(t)) |i| {
+                if (!try c.varianceMeasurable(s.objectConstructSig(t, @intCast(i)), sc)) return false;
+            }
+            return true;
+        },
+        .function => {
+            // A type predicate or a `this` parameter carrying the measured
+            // parameter is out of scope for the measurement.
+            if (s.fnHasPredicate(t)) return false;
+            if (s.fnThisType(t) != 0 and try c.containsTypeParam(s.fnThisType(t))) return false;
+            if (!try c.varianceMeasurable(s.fnReturn(t), sc)) return false;
+            for (0..s.fnParamCount(t)) |i| {
+                if (!try c.varianceMeasurable(s.fnParam(t, @intCast(i)).ty, sc)) return false;
+            }
+            return true;
+        },
+        .ref => {
+            for (0..s.refArgCount(t)) |i| {
+                if (!try c.varianceMeasurable(s.refArgAt(t, i), sc)) return false;
+            }
+            const sym = s.refSymbol(t);
+            if (sym == sc.owner) {
+                sc.cyclic = true;
+            } else if (try c.declaredVariances(sym) != 0) {
+                sc.via_annotated = true;
+            }
+            // The parameter flows INTO another generic: the relation will
+            // walk that generic's body with the marker inside it, so the
+            // body has to be measurable too. Expansion is memoized and
+            // `seen` cuts a self-referential ref.
+            const body = try c.expandRef(t);
+            if (body == types.error_type or body == t) return false;
+            return c.varianceMeasurable(body, sc);
+        },
+        else => return false,
+    }
+}
+
+/// The span tsc reports TS2636 at: the `in`/`out` modifier itself (the first
+/// of the two for an `in out`), falling back to the parameter's name. Read
+/// off the token stream the way `declaredVarianceOfTypeParam` reads the
+/// annotation; the caller must already be in the parameter's file.
+pub fn varianceAnnotationSpan(c: *Checker, tp_sym: SymbolId) ?Span {
+    for (c.declsOf(tp_sym)) |decl| {
+        if (c.nodeTag(decl) != .type_param) continue;
+        var tok = c.tree.nodeMainToken(decl);
+        var first = tok;
+        while (tok > 0) {
+            tok -= 1;
+            switch (c.tree.tokens.tag(tok)) {
+                .keyword_in, .keyword_out => first = tok,
+                else => break,
+            }
+        }
+        return c.tokSpan(first);
+    }
+    return null;
+}
+
+/// TS2636 at one parameter's annotation, in the parameter's own file (a
+/// merged declaration can declare its parameters in a different file from
+/// the one being walked — the same rule `evalTypeParamDecls` follows).
+pub fn reportVarianceMismatch(c: *Checker, tp_sym: SymbolId, src: TypeId, tgt: TypeId) Error!void {
+    const saved = c.enterSymFile(tp_sym);
+    defer c.restoreCtx(saved);
+    const span = c.varianceAnnotationSpan(tp_sym) orelse return;
+    try c.diagFmt(2636, span, "Type '{s}' is not assignable to type '{s}' as implied by variance annotation.", .{
+        try c.typeToString(src),
+        try c.typeToString(tgt),
+    });
+}
+
+/// TS2636 — the DECLARATION-site half of TS 4.7 variance: does an `in`/`out`
+/// annotation match how the parameter is actually USED?
+///
+/// tsc's `checkTypeParameterDeferred`: build the two instantiations of the
+/// annotated generic that differ only in the measured parameter — one
+/// carrying the `sub` marker, one the `super` marker — and ask the ordinary
+/// relation whether the direction the annotation promises holds. `out T`
+/// promises `G<sub>` is assignable to `G<super>`; `in T` promises the
+/// reverse. A parameter used the other way round (`interface Getter<in T> {
+/// get(): T }`) fails that one relation, and the failure IS the diagnostic.
+///
+/// Only pure `in` and pure `out` are measured, exactly as tsc does: `in out`
+/// declares invariance, which no use can contradict.
+pub fn checkVarianceAnnotations(c: *Checker, owner: SymbolId) Error!void {
+    const bits = try c.declaredVariances(owner);
+    if (bits == 0) return;
+    const f = c.symFlags(owner);
+    const generic = if (f.class)
+        try c.classInstanceGeneric(owner)
+    else if (f.interface)
+        try c.interfaceGeneric(owner)
+    else if (f.type_alias)
+        try c.aliasGeneric(owner)
+    else
+        return;
+    switch (c.ts.kind(generic)) {
+        // An annotated ALIAS must resolve to an object/function shape: tsc
+        // rejects every other alias body outright, with a different
+        // diagnostic (TS2637) that ztsc does not implement. An interface or
+        // class-instance body is always one of these anyway; anything else
+        // here (a `ref`, an error) is a body that did not resolve.
+        .object, .function => {},
+        else => return,
+    }
+    var tps: std.ArrayList(TypeParamInfo) = .empty;
+    defer tps.deinit(c.scratch());
+    try c.typeParamsOf(owner, &tps);
+    if (tps.items.len == 0) return;
+
+    // Instantiation and expansion are bookkeeping here: a depth/count trip
+    // measuring a type the user never wrote must not spend the program's
+    // TS2589 budget on it.
+    const saved_suppress = c.suppress_inst_diag;
+    c.suppress_inst_diag = true;
+    defer c.suppress_inst_diag = saved_suppress;
+
+    var sc: VarianceScan = .{ .owner = owner };
+    defer sc.deinit(c.scratch());
+    if (!try c.varianceMeasurable(generic, &sc)) return;
+    // A cycle back to `owner` that runs THROUGH another annotated generic
+    // makes tsc's own answer a function of declaration order, so there is no
+    // stable oracle to match: relating the cycle's other member seeds tsc's
+    // relation cache with the pair `owner`'s own check then asks about, and
+    // the cached answer came from that member's *declared* variance rather
+    // than from the structure. Two mutually recursive `in` interfaces are
+    // reported only if the offending one is declared FIRST. Measuring here
+    // would report both, so measure neither — an under-report, and the only
+    // order-independent choice.
+    if (sc.entangled()) return;
+
+    const args = try c.scratch().alloc(TypeId, tps.items.len);
+    for (tps.items, 0..) |tp, j| args[j] = try c.ts.makeTypeParam(tp.sym);
+    for (tps.items, 0..) |tp, i| {
+        if (i >= 16) break;
+        const v: Variance = @enumFromInt(@as(u2, @truncate(bits >> @intCast(2 * i))));
+        if (v != .covariant and v != .contravariant) continue;
+        const markers = try c.varianceMarkers(c.symbolName(tp.sym));
+        const saved_arg = args[i];
+        args[i] = markers[0];
+        const sub_ref = try c.ts.makeRef(owner, args);
+        args[i] = markers[1];
+        const super_ref = try c.ts.makeRef(owner, args);
+        args[i] = saved_arg;
+        if (sub_ref == super_ref) continue;
+        // `out T` promises sub -> super; `in T` promises the reverse.
+        const src = if (v == .covariant) sub_ref else super_ref;
+        const tgt = if (v == .covariant) super_ref else sub_ref;
+        const saved_refs = c.variance_marker_refs;
+        c.variance_marker_refs = .{ sub_ref, super_ref };
+        const ok = c.isAssignable(src, tgt);
+        c.variance_marker_refs = saved_refs;
+        if (try ok) continue;
+        try c.reportVarianceMismatch(tp.sym, src, tgt);
+    }
+}
+
 /// The generic reference a type denotes: itself when it IS one, otherwise
 /// the canonical origin ref of a materialized instantiation (see `origin`).
 pub fn refFacetOf(c: *Checker, ty: TypeId, k: types.Kind) ?TypeId {
@@ -525,10 +807,26 @@ pub fn isAssignable(c: *Checker, s0: TypeId, t0: TypeId) Error!bool {
     // their members (see `varianceVerdict`). Runs after the identity
     // fast-paths above — an equal pair never reaches here — and yields to
     // the structural walk whenever the annotations are not decisive.
+    //
+    // The one exemption is the marker pair a declaration-site MEASUREMENT is
+    // relating (`isVarianceMarkerRef`): answering those from the declared
+    // variance is what the measurement exists to verify, so it would make
+    // every annotation vacuously true. tsc exempts its `markerTypes` here
+    // for the same reason.
+    //
+    // Inside a measurement a NEGATIVE verdict on some *other* generic in the
+    // spine is not decisive either, and falls through to the structural walk:
+    // tsc's variance comparison keeps a structural fallback, so an inner
+    // generic whose own annotation contradicts its members (already reported
+    // on its own line) must not make its every USER a second report.
     if (c.refFacetOf(s, sk)) |sr| {
         if (c.refFacetOf(t, tk)) |tr| {
-            if (sr != tr and c.ts.refSymbol(sr) == c.ts.refSymbol(tr)) {
-                if (try c.varianceVerdict(sr, tr)) |verdict| return verdict;
+            if (sr != tr and c.ts.refSymbol(sr) == c.ts.refSymbol(tr) and
+                !c.isVarianceMarkerRef(sr) and !c.isVarianceMarkerRef(tr))
+            {
+                if (try c.varianceVerdict(sr, tr)) |verdict| {
+                    if (verdict or c.variance_marker_refs[0] == 0) return verdict;
+                }
             }
         }
     }

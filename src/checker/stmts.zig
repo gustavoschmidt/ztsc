@@ -1384,7 +1384,10 @@ pub fn checkTypeAliasDecl(c: *Checker, node: Node) Error!void {
 /// Eagerly evaluate type-parameter constraint/default annotations of a
 /// generic declaration so their diagnostics fire during the owner's
 /// file walk (partition-independent output; lazy paths only reach them
-/// on instantiation).
+/// on instantiation). The declaration-site variance check (TS2636) rides
+/// along here: its callers — class, interface and type alias — are exactly
+/// the three declaration forms that HAVE declaration-site variance, and it
+/// is the same "check what the type parameter list declares" pass.
 pub fn evalTypeParamDecls(c: *Checker, sym: SymbolId) Error!void {
     var tps: std.ArrayList(TypeParamInfo) = .empty;
     defer tps.deinit(c.scratch());
@@ -1399,4 +1402,5 @@ pub fn evalTypeParamDecls(c: *Checker, sym: SymbolId) Error!void {
         if (tp.constraint != 0) _ = try c.typeFromTypeNode(tp.constraint);
         if (tp.default != 0) _ = try c.typeFromTypeNode(tp.default);
     }
+    try c.checkVarianceAnnotations(sym);
 }

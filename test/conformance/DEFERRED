@@ -19,18 +19,6 @@
 # a `+` line, the oracle dropped a `-` line, or the case is gone). It cannot be
 # used to hide a regression.
 
-# TS2636 — the DECLARATION-site half of TS 4.7 variance: that an `in`/`out`
-# annotation matches how the parameter is actually used. tsc measures a
-# parameter's structural variance by instantiating the generic against opaque
-# sub/super marker types and relating the two instantiations; ztsc has no
-# marker type parameters, so the measurement (not just the report) is missing.
-# The USE-site half — relating two instantiations by their annotated arguments
-# — is implemented, and this case pins exactly that: the annotation on line 7
-# is the one tsc flags, and the assignment on line 13 goes by the annotation
-# rather than by the member. A deterministic under-report of a whole check;
-# assignability/075 is the positive/negative pair it under-reports against.
-assignability/077_variance_annotation_mismatch.ts  -TS2636 7
-
 # TS2417 (class static side incorrectly extends base static side) is not
 # implemented: ztsc does not relate `typeof Derived` to `typeof Base` when a
 # derived static shadows a base static incompatibly. Under-report of a whole
