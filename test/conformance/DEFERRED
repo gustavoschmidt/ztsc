@@ -238,13 +238,3 @@ assignability/066_intersection_source_deferred_target.ts  -TS2322 27
 # constituent — the collapse itself is what the case asserts, and every other
 # row in the file reports.
 narrowing/085_typeof_keeps_type_param_negatives.ts  -TS2339 41
-
-# Inference from a TEMPLATE-LITERAL TYPE source into a template-literal pattern
-# (`` `owners.${number}.status` extends `${infer K}.${infer R}` ``) is not
-# implemented: ztsc's template matcher only walks a CONCRETE string against the
-# pattern, so the binders come back `unknown` and the recursive path walk
-# collapses to `never`. The static-path rows of this case (lines 47-56) resolve
-# precisely and the case's positive assertions all hold; only the negative on
-# the template path is silent. Deterministic under-report of a whole inference
-# route, not a span/precision difference.
-jsx/031_template_attr_type_arg_inference.tsx  -TS2322 74
