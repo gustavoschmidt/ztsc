@@ -19,7 +19,7 @@ export const c: { kind: "elbow" } = mk({ type: "arrow" });
 declare const flag: boolean;
 export const d: { kind: "elbow" } = mk({ type: "arrow", elbowed: flag });
 
-// Excess-property checking through the intersection parameter: the oracle
-// reports TS2353 for `bogus`; ztsc's excess-property pass does not descend an
-// intersection contextual type (pre-existing, registered in DEFERRED).
+// Excess-property checking through the intersection parameter: `bogus` is
+// declared by no constituent of `{ type; elbowed? } & Opts`, so it is TS2353
+// (tsc's `isKnownProperty` recursing through a UnionOrIntersection target).
 export const e = mk({ type: "arrow", elbowed: true, bogus: 1 });
