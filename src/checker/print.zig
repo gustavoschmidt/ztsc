@@ -194,6 +194,15 @@ pub fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr
                 try w.writeAll(">");
             }
             try w.writeAll("(");
+            // An explicit `this` parameter is part of the displayed shape
+            // (tsc prints it): without it, a signature that differs ONLY in
+            // its receiver renders identically on both sides of a TS2322.
+            const this_ty = s.fnThisType(t);
+            if (this_ty != 0) {
+                try w.writeAll("this: ");
+                try c.printType(w, this_ty, depth + 1);
+                if (s.fnParamCount(t) > 0) try w.writeAll(", ");
+            }
             for (0..s.fnParamCount(t)) |i| {
                 if (i > 0) try w.writeAll(", ");
                 const p = s.fnParam(t, @intCast(i));

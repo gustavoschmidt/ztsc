@@ -1905,6 +1905,24 @@ pub fn signatureAssignableModeInner(c: *Checker, s: TypeId, t: TypeId, mode: Sig
     if (c.ts.fnTypeParams(s).len == 0 and c.ts.fnTypeParams(t).len > 0) {
         se = try c.eraseParamsOf(se, t);
     }
+    // tsc's `compareSignaturesRelated`: an explicit `this` parameter is part
+    // of the relation and behaves like an ordinary parameter —
+    // contravariant in a strict function position, bivariant for methods
+    // (and inside a callback comparison, where tsc clears `strictVariance`).
+    // Both guards are tsc's: a source that declares no `this` — or declares
+    // `this: void`, the "never uses it" marker — imposes nothing, and a
+    // target that declares no `this` demands nothing, so an annotated source
+    // stays compatible with every unannotated target.
+    const s_this = c.ts.fnThisType(se);
+    if (s_this != 0 and s_this != types.void_type) {
+        const t_this = c.ts.fnThisType(te);
+        if (t_this != 0) {
+            const this_bivariant = bivariant or mode != .none;
+            var this_ok = try c.isAssignable(t_this, s_this);
+            if (!this_ok and this_bivariant) this_ok = try c.isAssignable(s_this, t_this);
+            if (!this_ok) return false;
+        }
+    }
     if (try c.requiredParams(se) > try c.paramTotal(te)) return false;
     const s_count = try c.effParamCount(se);
     const t_count = try c.effParamCount(te);
