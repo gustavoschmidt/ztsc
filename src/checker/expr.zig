@@ -3262,18 +3262,86 @@ pub fn checkAssignExpr(c: *Checker, node: Node) Error!TypeId {
             }
             return rt;
         },
-        .plus_eq => {
-            if (try c.isStringish(target_t)) return types.string_type;
-            return types.number_type;
-        },
         .amp_amp_eq, .pipe_pipe_eq, .question_question_eq => {
             if (!unchecked and target_t != types.error_type and target_t != types.any_type) {
                 _ = try c.checkAssignable(rt, target_t, d.rhs, c.nodeSpan(d.lhs));
             }
             return rt;
         },
-        else => return types.number_type, // -=, *=, ... numeric compounds
+        // `+=`, `-=`, `*=`, … : the operation's RESULT is what gets stored,
+        // so tsc runs the same assignability check `=` runs, with the
+        // operator's result type as the source (`checkAssignmentOperator`
+        // with the value type computed by `checkBinaryLikeExpressionWorker`).
+        // `x += 1` on a branded `number & { _brand }` therefore fails the
+        // same way `x = x + 1` does: the operation widens to `number`.
+        else => {
+            const lt = try c.compoundTargetBase(target_t);
+            const res = try c.compoundResultType(op, lt, rt);
+            if (res == types.no_type) {
+                // Operands too coarse to classify (`any`/error, or not
+                // arithmetic at all — where tsc reports TS2362/TS2363/TS2365
+                // and skips the assignment check). Keep the old, unchecked
+                // approximation of the expression's type.
+                if (op == .plus_eq and try c.isStringish(lt)) return types.string_type;
+                return types.number_type;
+            }
+            if (!unchecked and lt != types.error_type and lt != types.any_type) {
+                // No expression node: the source type is synthesized by the
+                // operator, so there is no literal to elaborate or excess-check.
+                _ = try c.checkAssignable(res, lt, null_node, c.nodeSpan(d.lhs));
+            }
+            return res;
+        },
     }
+}
+
+/// The type a compound assignment's TARGET reads (and is written back) as:
+/// tsc's `checkIdentifier` returns `getBaseTypeOfLiteralType(flowType)` for
+/// a reference in assignment-target position, so a literal type widens to
+/// its base before either the operand classification or the write-back
+/// check sees it. That is what makes `let d: -1 | 1 = 1; d *= -1` and
+/// `let s: "a" | "b"; s += "x"` legal — the target reads as `number` /
+/// `string` there. Only literal, enum-member and boolean-literal types
+/// widen; a branded `number & { _brand }` is not a literal type and stays
+/// exactly as declared, which is why `mv += 1` on it still fails.
+pub fn compoundTargetBase(c: *Checker, t: TypeId) Error!TypeId {
+    if (c.ts.kind(t) == .union_type) {
+        var list: std.ArrayList(TypeId) = .empty;
+        defer list.deinit(c.scratch());
+        var changed = false;
+        for (try c.memberList(t)) |m| {
+            const b = try c.compoundTargetBase(m);
+            if (b != m) changed = true;
+            try list.append(c.scratch(), b);
+        }
+        if (!changed) return t;
+        return c.ts.makeUnion(c.scratch(), list.items);
+    }
+    const base = try c.literalBaseOf(t);
+    return if (base != types.no_type) base else t;
+}
+
+/// Result type of a compound assignment's operation (`+=`, `-=`, `*=`, …),
+/// mirroring what `checkBinaryExpr` computes for the plain operator — or
+/// `no_type` when the operands are not classified sharply enough for the
+/// back-assignability check to be sound. That "give up" case covers `any`
+/// and error operands (tsc's result is `any`, which never fails the check)
+/// and operands that are not arithmetic at all, where tsc reports the
+/// operand diagnostic and skips the assignment check entirely.
+pub fn compoundResultType(c: *Checker, op: scanner.Tag, lt: TypeId, rt: TypeId) Error!TypeId {
+    const lk = c.ts.kind(lt);
+    const rk = c.ts.kind(rt);
+    if (lk == .any or rk == .any or lk == .err or rk == .err) return types.no_type;
+    if (op == .plus_eq) {
+        if (try c.isStringish(lt) or try c.isStringish(rt)) return types.string_type;
+        if (try c.isNumberish(lt) and try c.isNumberish(rt)) return types.number_type;
+        if (try c.isBigintish(lt) and try c.isBigintish(rt)) return types.bigint_type;
+        return types.no_type;
+    }
+    if (!try c.isArithmeticOperand(lt) or !try c.isArithmeticOperand(rt)) return types.no_type;
+    if (try c.isBigintish(lt) and try c.isBigintish(rt) and
+        !try c.isNumberish(lt) and !try c.isNumberish(rt)) return types.bigint_type;
+    return types.number_type;
 }
 
 /// Does this assignment target name an evolving (`auto`-typed) variable?
