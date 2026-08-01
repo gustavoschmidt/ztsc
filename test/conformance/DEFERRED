@@ -176,15 +176,6 @@ indexed/030_element_access_union_key_negatives.ts  -TS2493 19
 # reports.
 indexed/032_cast_to_deferred_indexed_access_negatives.ts  -TS2352 8
 
-# Excess-property checking does not descend an INTERSECTION contextual type:
-# `excessPropertyCheck` walks the target's own property list, and an
-# intersection has none of its own, so an unknown property in an object literal
-# passed to `f(o: {…} & Opts)` is not reported. Pre-existing and independent of
-# the contextual-type fix the case covers (base binary is identically silent);
-# a deterministic under-report of one check. The wrong-branch TS2322 rows on
-# lines 12/14/16/20 — what the case is actually about — all match.
-inference/100_literal_ctx_through_intersection_param_negatives.ts  -TS2353 25
-
 # Reading a property off an intersection whose members include a still-GENERIC
 # mapped type answers from that mapped type instead of reporting TS2339: ztsc's
 # `propOfType` synthesizes a member for any name on `Partial<Record<T, any>>`,

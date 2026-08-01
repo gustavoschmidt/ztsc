@@ -2867,6 +2867,12 @@ pub fn excessPropertyScan(c: *Checker, expr_node: Node, src_t: TypeId, target: T
                 if (try c.targetIsEmptyish(m)) return false;
             }
         },
+        // An intersection has no properties of its own, so the walk below
+        // relies entirely on `targetKnowsProp`'s intersection arm (ANY
+        // constituent knowing the name is enough — tsc's `isKnownProperty`
+        // recursing through a `UnionOrIntersection`). Whether the target
+        // participates at all is `intersectionExcessCheckable`.
+        .intersection => if (!try c.intersectionExcessCheckable(rt)) return false,
         else => return false,
     }
     for (c.tree.nodeRange(node)) |prop| {
@@ -2938,6 +2944,49 @@ pub fn freshLiteralRejects(c: *Checker, expr_node: Node, src_t: TypeId, target: 
         return !try c.discriminatedUnionAssignable(src_t, rt);
     }
     return try c.excessPropertyScan(node, src_t, target, false);
+}
+
+/// Does an INTERSECTION target take part in excess-property checking?
+///
+/// tsc gates the check on `isExcessPropertyCheckTarget`, whose intersection
+/// arm requires EVERY constituent to be one, and then bails on
+/// `isEmptyObjectType(target)`, whose intersection arm holds when EVERY
+/// constituent is empty. Both are mirrored here, conservatively: a
+/// constituent whose member set ztsc cannot enumerate up front — a type
+/// parameter, a conditional/mapped/keyof node, a callable, a nested union —
+/// disqualifies the whole intersection rather than risk a false TS2353.
+/// That is what keeps the ubiquitous generic helpers quiet: `T & {}`
+/// (non-nullish marker), `Props & Partial<T>`, `Base & TVariant`.
+///
+/// An index signature anywhere in the intersection also disqualifies it:
+/// the intersection's index infos are the union of its constituents', so
+/// one string/number index makes every name applicable (tsc's
+/// `getApplicableIndexInfoForName` over the intersection).
+pub fn intersectionExcessCheckable(c: *Checker, rt: TypeId) Error!bool {
+    const ms = try c.memberList(rt);
+    if (ms.len == 0) return false;
+    var all_empty = true;
+    for (ms) |m| {
+        const rm = try c.resolveStructural(m);
+        switch (c.ts.kind(rm)) {
+            .object => {
+                if (c.ts.objectStringIndex(rm) != 0 or c.ts.objectNumberIndex(rm) != 0) return false;
+                // A callable constituent carries members `targetKnowsProp`
+                // does not consult (the apparent `Function` shape, plus
+                // whatever the signature's own object side declares).
+                if (c.ts.objectCallSigCount(rm) != 0 or c.ts.objectConstructSigCount(rm) != 0) return false;
+                if (!c.isEmptyObjectType(rm)) all_empty = false;
+            },
+            // Canonical intersections are flattened, but an intersection
+            // reached through a `ref` need not be.
+            .intersection => {
+                if (!try c.intersectionExcessCheckable(rm)) return false;
+                all_empty = false;
+            },
+            else => return false,
+        }
+    }
+    return !all_empty;
 }
 
 /// tsc's `isEmptyObjectType` as `hasExcessProperties` consults it: an
