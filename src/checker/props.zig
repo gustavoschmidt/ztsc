@@ -1,0 +1,828 @@
+//! Properties and type parts.
+//! Split mechanically from checker.zig; functions take the
+//! `Checker` context as their first parameter.
+
+const std = @import("std");
+const ast = @import("../ast.zig");
+const scanner = @import("../scanner.zig");
+const intern = @import("../intern.zig");
+const binder = @import("../binder.zig");
+const types = @import("../types.zig");
+const source = @import("../source.zig");
+const libs = @import("../libs.zig");
+const modules = @import("../modules.zig");
+const ZeroPagedArray = @import("../zeropage.zig").ZeroPagedArray;
+
+const Atom = intern.Atom;
+const SymbolId = binder.SymbolId;
+const TypeId = types.TypeId;
+const Store = types.Store;
+
+const checker_zig = @import("../checker.zig");
+const Checker = checker_zig.Checker;
+const Error = checker_zig.Error;
+const check = checker_zig.check;
+
+const atom = Checker.atom;
+const globalThisType = @import("instantiate.zig").globalThisType;
+const instantiate = @import("enums.zig").instantiate;
+const resolveStructural = @import("instantiate.zig").resolveStructural;
+const run = Checker.run;
+
+// =====================================================================
+// properties & type parts
+// =====================================================================
+
+/// Property of a *structural* type (call resolveStructural first).
+/// Handles objects, unions, intersections, arrays/tuples/strings
+/// (`length`), and type params (via constraint).
+pub fn propOfType(c: *Checker, t: TypeId, name: Atom) Error!?types.Prop {
+    return c.propOfTypeEx(t, name, true);
+}
+
+/// Named-property lookup. `allow_index=true` (the member-access default)
+/// lets a string index signature stand in for any name — `obj.foo` on a
+/// `{ [k: string]: V }` yields `V`. `allow_index=false` is the *assignability*
+/// rule: a source's index signature does NOT satisfy a required *named*
+/// target property (tsc reports TS2741/TS2740), so `{ [k: string]: any }` is
+/// not assignable to `Date`/`{ x: number }`. Only the relation callers pass
+/// false; the index signature is related separately (indexSignaturesRelatedTo).
+pub fn propOfTypeEx(c: *Checker, t: TypeId, name: Atom, allow_index: bool) Error!?types.Prop {
+    const s = &c.ts;
+    switch (s.kind(t)) {
+        .object => {
+            if (s.objectPropByName(t, name)) |p| return p;
+            // The global-scope object stores no properties: its members are
+            // the program's merged global value declarations, resolved on
+            // demand (see `globalThisType`).
+            //
+            // Only for MEMBER ACCESS (`allow_index`), never for the
+            // structural relation. Resolving a global's type is a lazy,
+            // re-entrant operation and the global table is self-referential
+            // — `@types/node` declares `var AbortController: typeof
+            // globalThis extends { onmessage: any; AbortController: infer T
+            // } ? T : …`, whose own resolution asks the global object for
+            // `AbortController`. The relation walks a target's properties
+            // in stored (atom) order, and atom ids come from the parallel
+            // interner, so *which* arm of that cycle is entered first moves
+            // run to run: the diagnostics held but the work counters did
+            // not (`_types_node` repeat sweep, 19/40 runs). Keeping the
+            // relation out means `typeof globalThis` relates as the empty
+            // object it stores, which is order-free by construction.
+            if (allow_index and s.objectFlags(t) & types.obj_flag_global_this != 0) {
+                return c.globalThisProp(name);
+            }
+            // A callable object/interface (one carrying call/construct
+            // signatures, e.g. react-i18next `TFunction`) inherits the
+            // apparent members of the global `Function` interface
+            // (`.bind`/`.call`/`.apply`/`.name`/`.length`/…). Plain
+            // (non-callable) objects do NOT — an absent member stays TS2339.
+            if (s.objectCallSigCount(t) > 0 or s.objectConstructSigCount(t) > 0) {
+                if (try c.functionInterfaceProp(name)) |p| return p;
+            }
+            if (!allow_index) return null;
+            // Every object type also has the apparent members of the global
+            // `Object` interface — `hasOwnProperty`, `toString`,
+            // `valueOf`, … — the tail of tsc's `getPropertyOfType`
+            // (`return getPropertyOfObjectType(globalObjectType, name)`).
+            // Member access only: the assignability relation asks a
+            // *target*'s own property list, and `isKnownProperty` (the
+            // excess-property check) deliberately does not consult the
+            // global object type.
+            if (try c.objectInterfaceProp(name)) |p| return p;
+            // The string index signature is the LAST resort, after the
+            // apparent members — tsc's `getPropertyOfType` never consults
+            // an index signature at all, and
+            // `checkPropertyAccessExpression` only falls back to
+            // `getApplicableIndexInfoForName` once the property lookup has
+            // come back empty. Consulting it first made
+            // `props.hasOwnProperty(k)` on a `{ [k: string]: ReactNode |
+            // ((el) => ReactNode) }` type as the index VALUE rather than
+            // as `Object.hasOwnProperty`, so calling it was TS2349.
+            if (s.objectStringIndex(t) != 0) {
+                return .{ .name = name, .ty = s.objectStringIndex(t), .flags = 0 };
+            }
+            return null;
+        },
+        .union_type => {
+            // tsc's `getUnionOrIntersectionProperty`: a union has a
+            // property only when *every* constituent has it, and its type
+            // is the union of the per-constituent types. Reached whenever a
+            // union is not the top-level type of a member access — through
+            // a type parameter's union constraint (`<T extends A | B>`),
+            // an intersection constituent, or an apparent-member lookup.
+            // Flags accumulate: optional/readonly on any constituent makes
+            // the merged property optional/readonly.
+            const members = try c.memberList(t);
+            var parts: std.ArrayList(TypeId) = .empty;
+            defer parts.deinit(c.scratch());
+            var flags: u32 = 0;
+            for (members) |m| {
+                const r = try c.resolveStructural(m);
+                const p = (try c.propOfTypeEx(r, name, allow_index)) orelse return null;
+                try parts.append(c.scratch(), p.ty);
+                flags |= p.flags;
+            }
+            return .{ .name = name, .ty = try s.makeUnion(c.scratch(), parts.items), .flags = flags };
+        },
+        .intersection => {
+            const members = try c.memberList(t);
+            // `T & {}` (NonNullable of a type parameter): the empty-object
+            // marker signals the value is non-nullish, so a type-param
+            // constituent's members come from its constraint with
+            // null/undefined stripped — `(T extends string | undefined) & {}`
+            // exposes `string`'s members. Without the marker a bare `T`
+            // resolves through its raw constraint (nullish kept).
+            var has_marker = false;
+            for (members) |m| {
+                if (c.isEmptyObjectType(try c.resolveStructural(m))) {
+                    has_marker = true;
+                    break;
+                }
+            }
+            var found: ?types.Prop = null;
+            for (members) |m| {
+                const r = try c.resolveStructural(m);
+                var lookup = r;
+                if (has_marker and c.ts.kind(r) == .type_param) {
+                    const con = try c.typeParamConstraint(c.ts.typeParamSymbol(r));
+                    if (con != types.no_type) {
+                        lookup = try c.resolveStructural(try c.nonNullable(con));
+                    }
+                }
+                if (try c.propOfTypeEx(lookup, name, allow_index)) |p| {
+                    if (found == null) {
+                        found = p;
+                    } else {
+                        const merged = try c.ts.makeIntersection(c.scratch(), &.{ found.?.ty, p.ty });
+                        found = .{ .name = name, .ty = merged, .flags = found.?.flags & p.flags };
+                    }
+                }
+            }
+            return found;
+        },
+        // A template-literal pattern and a string-transform intrinsic are
+        // subtypes of `string` (`Store.literalBase`), so their apparent
+        // members are `String`'s — `` `${number}`.split `` resolves exactly
+        // like `"1".split`.
+        .array, .tuple, .string, .string_literal, .template_literal_type, .string_mapping => {
+            if (name == c.atom_length) {
+                if (s.kind(t) == .tuple) {
+                    // tsc: a tuple with no rest element has a LITERAL length
+                    // — the union of every arity it admits, so `[a: number,
+                    // b?: string]["length"]` is `1 | 2` and `[a?: number]`
+                    // is `0 | 1`. Only a rest element makes it `number`.
+                    // Collapsing an optional tuple to `number` broke every
+                    // `Parameters<F>["length"] extends 0 | 1 ? … : never`
+                    // arity guard: the conditional took the false branch and
+                    // the parameter became `never`.
+                    var has_rest = false;
+                    var required: usize = 0;
+                    const total = s.tupleLen(t);
+                    for (0..total) |i| {
+                        const e = s.tupleElem(t, @intCast(i));
+                        if (e.rest()) has_rest = true;
+                        if (!e.optional() and !e.rest()) required = i + 1;
+                    }
+                    if (!has_rest) {
+                        var lens: std.ArrayList(TypeId) = .empty;
+                        defer lens.deinit(c.scratch());
+                        var n = required;
+                        while (n <= total) : (n += 1) {
+                            try lens.append(c.scratch(), try s.makeNumberLiteral(@floatFromInt(n), false));
+                        }
+                        return .{ .name = name, .ty = try s.makeUnion(c.scratch(), lens.items), .flags = types.prop_flag_readonly };
+                    }
+                }
+                // `Array<T>.length` is *writable* in tsc (`arr.length = 0`
+                // is idiomatic truncation); `string.length` and a fixed
+                // tuple's length (above) are readonly.
+                const flags: u32 = if (s.kind(t) == .array) 0 else types.prop_flag_readonly;
+                return .{ .name = name, .ty = types.number_type, .flags = flags };
+            }
+            return c.primitiveInterfaceProp(t, name);
+        },
+        .number, .number_literal, .number_literal_fresh, .boolean, .bool_true, .bool_false => {
+            return c.primitiveInterfaceProp(t, name);
+        },
+        .type_param => {
+            const constraint = try c.typeParamConstraint(s.typeParamSymbol(t));
+            if (constraint == types.no_type) return null;
+            return c.propOfTypeEx(try c.resolveStructural(constraint), name, allow_index);
+        },
+        .mapped => {
+            // A DEFERRED homomorphic map has no members of its own, but its
+            // APPARENT members are the map applied to its source's base
+            // constraint — tsc resolves `x.a` inside `<T extends Base>(x:
+            // Mutable<T>)` through `getBaseConstraintOfType` on the
+            // modifiers type, yielding `T["a"]`. Member access only: the
+            // structural relation must not invent members a still-generic
+            // map does not have.
+            if (!allow_index) return null;
+            if (s.mappedHomomorphic(t)) {
+                const src = s.mappedSource(t);
+                const bc = try c.transitiveBaseConstraint(src);
+                if (bc == src) return null;
+                const inst = try c.reduceMapped(
+                    s.mappedKeyParam(t),
+                    s.mappedConstraint(t),
+                    s.mappedValue(t),
+                    s.mappedAs(t),
+                    bc,
+                    s.mappedFlags(t),
+                );
+                if (s.kind(inst) == .mapped) return null; // key set still generic
+                return c.propOfTypeEx(inst, name, allow_index);
+            }
+            // A NON-homomorphic map (`Pick`/`Omit`/`Record` applied to a
+            // generic) defers on its *constraint*, not a source, so the
+            // homomorphic route above cannot reach it and it exposed no
+            // members at all. Its apparent type is the base constraint of
+            // the whole map: `Omit<Partial<T>, "id">` with `T extends Base`
+            // has apparent type `Omit<Partial<Base>, "id">`, which is what
+            // tsc resolves a property access against.
+            const bc = try c.transitiveBaseConstraint(t);
+            if (bc == t) return null;
+            const rbc = try c.resolveStructural(bc);
+            if (s.kind(rbc) == .mapped) return null; // key set still generic
+            return c.propOfTypeEx(rbc, name, allow_index);
+        },
+        // A still-deferred conditional has the apparent members of its
+        // DEFAULT CONSTRAINT — tsc's `getDefaultConstraintOfConditionalType`,
+        // the union of the true branch (instantiated under its own extends
+        // clause) and the false branch. A property both branches declare is
+        // therefore readable: `{ encryptionKey } & ([T] extends [never] ?
+        // { metadata?: T } : { metadata: T })` has `metadata`. Without this
+        // arm a conditional exposed nothing at all, in an intersection or
+        // on its own.
+        .conditional => {
+            const u = try c.makeUnion2(try c.condTrueUnderExtends(t), s.condFalse(t));
+            if (u == t) return null;
+            return c.propOfTypeEx(u, name, allow_index);
+        },
+        .ref => return c.propOfTypeEx(try c.resolveStructural(t), name, allow_index),
+        .class_value => {
+            const cls = s.classSymbol(t);
+            if (try c.ownStaticMemberProp(cls, name)) |p| return p;
+            return c.propOfTypeEx(try c.classStaticType(cls), name, allow_index);
+        },
+        .enum_type => {
+            // A value of enum type borrows its base primitive's members.
+            const info = try c.enumInfo(s.enumSymbol(t));
+            const base: TypeId = if (info.all_string) types.string_type else types.number_type;
+            return c.propOfTypeEx(base, name, allow_index);
+        },
+        // A bare function type or overload set (arrow/normal function,
+        // `(x) => y`, an overloaded signature) has the apparent members of
+        // the global `Function` interface.
+        .function, .overloads => return c.functionInterfaceProp(name),
+        else => return null,
+    }
+}
+
+/// Look `name` up on the global `Function` interface — the apparent members
+/// (`bind`/`call`/`apply`/`name`/`length`/`toString`/…) that tsc gives every
+/// function-shaped type. Returns null when the lib has no `Function`
+/// interface (`--noLib`) or the property genuinely isn't a `Function`
+/// member, so a bogus member on a callable still degrades to TS2339.
+pub fn functionInterfaceProp(c: *Checker, name: Atom) Error!?types.Prop {
+    const sym = c.prog.globals.lookup(c.atom_Function) orelse return null;
+    if (!c.symFlags(sym).interface) return null;
+    const ref = try c.ts.makeRef(sym, &.{});
+    return c.propOfType(try c.resolveStructural(ref), name);
+}
+
+/// Look `name` up on the global `Object` interface — the
+/// `Object.prototype` members (`hasOwnProperty`/`isPrototypeOf`/
+/// `propertyIsEnumerable`/`toString`/`toLocaleString`/`valueOf`/
+/// `constructor`) that tsc gives every object type. Returns null when the
+/// lib has no `Object` interface (`--noLib`) or the name genuinely isn't
+/// one of its members, so a bogus member still degrades to TS2339.
+///
+/// Re-entrancy: the `Object` interface's own member lookup lands back in
+/// the `.object` arm that calls this, so a miss there would recurse
+/// forever. The flag makes the inner lookup a plain one.
+pub fn objectInterfaceProp(c: *Checker, name: Atom) Error!?types.Prop {
+    if (c.in_object_iface) return null;
+    const sym = c.prog.globals.lookup(c.atom_Object) orelse return null;
+    if (!c.symFlags(sym).interface) return null;
+    const ref = try c.ts.makeRef(sym, &.{});
+    c.in_object_iface = true;
+    defer c.in_object_iface = false;
+    return c.propOfType(try c.resolveStructural(ref), name);
+}
+
+/// Bridge a primitive/array/tuple to its lib interface and look
+/// the property up there: `arr.map` -> `Array<T>.map`, `"x".toUpperCase`
+/// -> `String.toUpperCase`, etc. Returns null when no lib is loaded or
+/// the interface is missing, so member access degrades to TS2339 exactly
+/// as it did lib-free.
+pub fn primitiveInterfaceProp(c: *Checker, t: TypeId, name: Atom) Error!?types.Prop {
+    const s = &c.ts;
+    var iface_atom: Atom = 0;
+    var elem: TypeId = types.no_type;
+    var has_elem = false;
+    switch (s.kind(t)) {
+        .array => {
+            iface_atom = c.atom_Array;
+            elem = s.arrayElem(t);
+            has_elem = true;
+        },
+        .tuple => {
+            iface_atom = c.atom_Array;
+            elem = try c.tupleElementUnion(t);
+            has_elem = true;
+        },
+        .string, .string_literal, .template_literal_type, .string_mapping => iface_atom = c.atom_String,
+        .number, .number_literal, .number_literal_fresh => iface_atom = c.atom_Number,
+        .boolean, .bool_true, .bool_false => iface_atom = c.atom_Boolean,
+        else => return null,
+    }
+    const sym = c.prog.globals.lookup(iface_atom) orelse return null;
+    if (!c.symFlags(sym).interface) return null;
+    const args: []const TypeId = if (has_elem) &.{elem} else &.{};
+    const ref = try s.makeRef(sym, args);
+    return c.propOfType(try c.resolveStructural(ref), name);
+}
+
+/// Wrap `payload` in the global `Promise<T>`. Falls back to `any`
+/// when the lib has no `Promise` interface (e.g. `--noLib`).
+pub fn makePromise(c: *Checker, payload: TypeId) Error!TypeId {
+    const sym = c.prog.globals.lookup(c.atom_Promise) orelse return types.any_type;
+    if (!c.symFlags(sym).interface) return types.any_type;
+    return c.ts.makeRef(sym, &.{payload});
+}
+
+/// Whether `t` is a `.ref` to `Promise`/`PromiseLike` whose first type
+/// argument is exactly the type parameter `tp_sym` (the `PromiseLike<T>`
+/// member of a `.then` onfulfilled return `T | PromiseLike<T>`).
+pub fn isPromiseLikeOf(c: *Checker, t: TypeId, tp_sym: u32) bool {
+    if (c.ts.kind(t) != .ref) return false;
+    const sym = c.ts.refSymbol(t);
+    const p = c.prog.globals.lookup(c.atom_Promise);
+    const pl = c.prog.globals.lookup(c.atom_PromiseLike);
+    if ((p == null or sym != p.?) and (pl == null or sym != pl.?)) return false;
+    const args = c.ts.refArgs(t);
+    if (args.len == 0) return false;
+    return c.ts.kind(args[0]) == .type_param and c.ts.typeParamSymbol(args[0]) == tp_sym;
+}
+
+/// `Awaited<T>`: unwrap a `Promise<T>` / `PromiseLike<T>` to `T`, to a
+/// fixed point; any other type passes through (await on a non-thenable
+/// yields the value itself).
+///
+/// The lib types both of them (`Promise<T> extends PromiseLike<T>`, and
+/// `then` returns `PromiseLike<TResult>`), so a bare `PromiseLike<T>`
+/// receiver is ordinary — `await pool.all()` on a `PromiseLike<unknown[]>`
+/// is `unknown[]`, not `PromiseLike<unknown[]>`. tsc's `Awaited<T>` is
+/// structural over *any* thenable and recursive; ztsc recognizes the two
+/// lib names and recurses, which covers every nesting of them
+/// (`Promise<PromiseLike<T>>`, `PromiseLike<Promise<T>>`, …). A
+/// hand-written thenable that is neither is still a gap (under-report:
+/// the value keeps its object type).
+pub fn awaitedType(c: *Checker, t: TypeId) Error!TypeId {
+    return c.awaitedTypeRec(t, 0);
+}
+
+pub fn awaitedTypeRec(c: *Checker, t: TypeId, depth: u32) Error!TypeId {
+    // A self-referential alias (`type P = Promise<P>`) would spin; the cap
+    // is far above any real nesting and only ever leaves the type unwrapped.
+    if (depth >= 16) return t;
+    // `Awaited<T>` distributes over unions: `await (Promise<X> | undefined)`
+    // is `X | undefined` (tsc). Without this, a `Promise<X> | undefined`
+    // receiver — common now that optional chains yield `... | undefined` —
+    // fails to unwrap and surfaces spurious property/callable errors.
+    if (c.ts.kind(t) == .union_type) {
+        var parts: std.ArrayList(TypeId) = .empty;
+        defer parts.deinit(c.scratch());
+        for (try c.memberList(t)) |m| try parts.append(c.scratch(), try c.awaitedTypeRec(m, depth + 1));
+        return c.ts.makeUnion(c.scratch(), parts.items);
+    }
+    // An INTERSECTION awaits through its thenable constituent. tsc reads
+    // the awaited type off the `then` member (`getPromisedTypeOfPromise`),
+    // and in `Promise<T> & { resolve; reject }` — the promise-with-
+    // resolvers shape — `then` comes from the promise half, so the result
+    // is `T`. Returning the whole intersection instead made every read off
+    // an awaited resolvable promise report TS2339.
+    if (c.ts.kind(t) == .intersection) {
+        for (try c.memberList(t)) |m| {
+            const a = try c.awaitedType(m);
+            if (a != m) return a;
+        }
+        return t;
+    }
+    if (c.ts.kind(t) == .ref) {
+        const sym = c.ts.refSymbol(t);
+        const p = c.prog.globals.lookup(c.atom_Promise);
+        const pl = c.prog.globals.lookup(c.atom_PromiseLike);
+        if ((p != null and sym == p.?) or (pl != null and sym == pl.?)) {
+            const args = c.ts.refArgs(t);
+            if (args.len >= 1) return c.awaitedTypeRec(args[0], depth + 1);
+        }
+    }
+    return t;
+}
+
+/// If `t` is a ref to one of the lib's iterator interfaces whose first
+/// type arg is the yield element (`Generator<T>`/`Iterator<T>`/
+/// `IterableIterator<T>`, plus the TS ≥5.6 `IteratorObject<T>` and the
+/// named built-in iterators like `MapIterator<T>`), return that `T`;
+/// otherwise 0.
+pub fn generatorYieldType(c: *Checker, t: TypeId) TypeId {
+    if (c.ts.kind(t) != .ref) return 0;
+    const sym = c.ts.refSymbol(t);
+    const names = [_]Atom{
+        c.atom_Generator,      c.atom_Iterator,       c.atom_IterableIterator,
+        c.atom_IteratorObject, c.atom_ArrayIterator,  c.atom_MapIterator,
+        c.atom_SetIterator,    c.atom_StringIterator, c.atom_RegExpStringIterator,
+    };
+    for (names) |name| {
+        const g = c.prog.globals.lookup(name) orelse continue;
+        if (sym == g) {
+            const args = c.ts.refArgs(t);
+            if (args.len >= 1) return args[0];
+            return 0;
+        }
+    }
+    return 0;
+}
+
+/// Async analogue of `generatorYieldType`: the first type arg of a lib
+/// async-iterator ref (`AsyncGenerator<T>`/`AsyncIterator<T>`/
+/// `AsyncIterableIterator<T>`/`AsyncIteratorObject<T>`), else 0.
+pub fn asyncGeneratorYieldType(c: *Checker, t: TypeId) TypeId {
+    if (c.ts.kind(t) != .ref) return 0;
+    const sym = c.ts.refSymbol(t);
+    const names = [_]Atom{
+        c.atom_AsyncGenerator,        c.atom_AsyncIterator,
+        c.atom_AsyncIterableIterator, c.atom_AsyncIteratorObject,
+    };
+    for (names) |name| {
+        const g = c.prog.globals.lookup(name) orelse continue;
+        if (sym == g) {
+            const args = c.ts.refArgs(t);
+            if (args.len >= 1) return args[0];
+            return 0;
+        }
+    }
+    return 0;
+}
+
+/// Union of a tuple's element types (the element type used when a tuple
+/// borrows `Array<T>` members).
+pub fn tupleElementUnion(c: *Checker, t: TypeId) Error!TypeId {
+    const s = &c.ts;
+    const n = s.tupleLen(t);
+    var parts: std.ArrayList(TypeId) = .empty;
+    defer parts.deinit(c.scratch());
+    for (0..n) |i| try parts.append(c.scratch(), s.tupleElem(t, @intCast(i)).ty);
+    return s.makeUnion(c.scratch(), parts.items);
+}
+
+/// Uninferred own-type-param value for contextual signature instantiation:
+/// declared default, else constraint, else `unknown` (tsc's order).
+pub fn typeParamFallback(c: *Checker, sym: SymbolId) Error!TypeId {
+    const d = try c.typeParamDefault(sym);
+    if (d != types.no_type) return d;
+    const con = try c.typeParamConstraint(sym);
+    if (con != types.no_type) return con;
+    return types.unknown_type;
+}
+
+pub fn typeParamConstraint(c: *Checker, sym: SymbolId) Error!TypeId {
+    if (c.isFreshTp(sym)) return c.freshTp(sym).constraint;
+    if (c.inst_cache_on) {
+        if (c.tp_constraint_cache.get(sym)) |t| return t;
+    }
+    const result = try c.typeParamConstraintUncached(sym);
+    if (c.inst_cache_on) try c.tp_constraint_cache.put(c.cm(), sym, result);
+    return result;
+}
+
+pub fn typeParamConstraintUncached(c: *Checker, sym: SymbolId) Error!TypeId {
+    const saved = c.enterSymFile(sym);
+    defer c.restoreCtx(saved);
+    const decls = c.declsOf(sym);
+    for (decls) |decl| {
+        if (c.nodeTag(decl) != .type_param) continue;
+        const d = c.tree.nodeData(decl);
+        if (d.lhs == 0) return types.no_type;
+        c.cur_scope = c.symScope(sym);
+        return c.typeFromTypeNode(d.lhs);
+    }
+    return types.no_type;
+}
+
+/// The default type of a type parameter (`<T = D>`), evaluated in its
+/// declaring file + declaration scope, or `no_type` if it has none. The
+/// result references earlier type-params as their type-param types; a
+/// caller wanting `B = A` to see the supplied `A` must instantiate the
+/// result under the mapping resolved so far.
+pub fn typeParamDefault(c: *Checker, sym: SymbolId) Error!TypeId {
+    if (c.isFreshTp(sym)) return c.freshTp(sym).default;
+    const saved = c.enterSymFile(sym);
+    defer c.restoreCtx(saved);
+    for (c.declsOf(sym)) |decl| {
+        if (c.nodeTag(decl) != .type_param) continue;
+        const d = c.tree.nodeData(decl);
+        if (d.rhs == 0) return types.no_type;
+        c.cur_scope = c.symScope(sym);
+        return c.typeFromTypeNode(d.rhs);
+    }
+    return types.no_type;
+}
+
+/// Whether a type parameter declares a default (`<T = D>`).
+pub fn typeParamHasDefault(c: *Checker, sym: SymbolId) bool {
+    if (c.isFreshTp(sym)) return c.freshTp(sym).has_default;
+    const saved = c.enterSymFile(sym);
+    defer c.restoreCtx(saved);
+    for (c.declsOf(sym)) |decl| {
+        if (c.nodeTag(decl) != .type_param) continue;
+        return c.tree.nodeData(decl).rhs != 0;
+    }
+    return false;
+}
+
+/// Minimum required type-argument count for a signature: type params up to
+/// the first defaulted one (defaults are trailing-only, so this is the
+/// count of params without a default).
+pub fn sigMinTargs(c: *Checker, tps: []const u32) usize {
+    var min: usize = 0;
+    for (tps) |tp| {
+        if (!c.typeParamHasDefault(tp)) min += 1;
+    }
+    return min;
+}
+
+/// Whether `n` explicit type arguments satisfy a signature's arity given
+/// defaults: `min <= n <= tps.len`.
+pub fn sigTargArityOk(c: *Checker, sig: TypeId, n: usize) bool {
+    const tps = c.ts.fnTypeParams(sig);
+    if (n > tps.len) return false;
+    return n >= c.sigMinTargs(tps);
+}
+
+pub fn removeUndefined(c: *Checker, t: TypeId) Error!TypeId {
+    return c.filterUnion(t, struct {
+        fn keep(ch: *Checker, m: TypeId) bool {
+            return ch.ts.kind(m) != .undefined;
+        }
+    }.keep);
+}
+
+pub fn nonNullable(c: *Checker, t: TypeId) Error!TypeId {
+    // A bare type parameter whose constraint may be nullish becomes `T & {}`
+    // (tsc's `getNonNullableType` / `NonNullable<T>`). The `& {}` marker
+    // keeps the value assignable back to a `T` slot while exposing the
+    // constraint's non-nullish apparent members (see the intersection arm of
+    // `propOfTypeEx`). A type param already known non-nullish is unchanged.
+    if (c.ts.kind(t) == .type_param) {
+        const con = try c.typeParamConstraint(c.ts.typeParamSymbol(t));
+        if (con == types.no_type or c.containsNullish(con)) {
+            return c.ts.makeIntersection(c.scratch(), &.{ t, types.empty_object_type });
+        }
+        return t;
+    }
+    // A DEFERRED conditional or indexed access is not a union, so filtering
+    // leaves it whole and the nullish constituent hiding in its constraint
+    // survives the guard. tsc's `getAdjustedTypeWithFacts` handles exactly
+    // this: for `NEUndefined` it maps each constituent that *could* be
+    // undefined onto its BASE CONSTRAINT and re-applies the fact there. So
+    // `K extends keyof M ? M[K] | undefined : never` guarded by
+    // `!== undefined` becomes `M[K]`'s constraint without `undefined`,
+    // instead of staying the whole conditional — which is what made
+    // `ShapeCache.generateElementShape`'s inferred return keep an
+    // `undefined` arm past its own `if (cachedShape !== undefined) return`,
+    // and every `.forEach` on the result report an implicit `any`.
+    // The `& {}` marker used for a bare type parameter is deliberately not
+    // used here: there is no `T` slot to stay assignable to.
+    switch (c.ts.kind(t)) {
+        .conditional, .index_access => {
+            const base = try c.transitiveBaseConstraint(t);
+            if (base != t and base != types.no_type and c.containsNullish(base)) {
+                return c.ts.makeIntersection(c.scratch(), &.{ t, types.empty_object_type });
+            }
+        },
+        else => {},
+    }
+    return c.filterUnion(t, struct {
+        fn keep(ch: *Checker, m: TypeId) bool {
+            const k = ch.ts.kind(m);
+            return k != .undefined and k != .null;
+        }
+    }.keep);
+}
+
+/// `??`'s left operand. tsc's `getNonNullableType` is
+/// `getTypeWithFacts(t, NEUndefinedOrNull)`, and `VoidFacts` does not carry
+/// `NEUndefinedOrNull` — so `void` is filtered out alongside `undefined`
+/// and `null`, and `(boolean | void) ?? false` is `boolean`. Scoped to
+/// `??`: the same strip inside the general `nonNullable` (which also serves
+/// `!` and comparison narrowing) regressed a `void` receiver.
+pub fn nonNullableNullish(c: *Checker, t: TypeId) Error!TypeId {
+    if (c.ts.kind(t) == .type_param) return c.nonNullable(t);
+    return c.filterUnion(t, struct {
+        fn keep(ch: *Checker, m: TypeId) bool {
+            const k = ch.ts.kind(m);
+            return k != .undefined and k != .null and k != .void;
+        }
+    }.keep);
+}
+
+/// Receiver narrowing for an optional-chain link (`a?.b`, `a?.[i]`, `a?.()`).
+/// Beyond null/undefined it also drops `void`: a `.catch(() => {})` /
+/// `.then(…)` tail types a promise `T | void`, and tsc lets `x?.prop` reach
+/// through the `void` constituent to `T`'s members (the whole chain already
+/// yields `… | undefined`). Scoped to the chain sites so the general
+/// `nonNullable` used by `??`, `!`, and comparison narrowing is unaffected.
+/// A receiver that is *only* nullish/void keeps the plain `nonNullable`
+/// result so a bare-`void` access still behaves as before.
+pub fn nonNullableChain(c: *Checker, t: TypeId) Error!TypeId {
+    const nn = try c.nonNullable(t);
+    const dropped = try c.filterUnion(nn, struct {
+        fn keep(ch: *Checker, m: TypeId) bool {
+            return ch.ts.kind(m) != .void;
+        }
+    }.keep);
+    return if (c.ts.kind(dropped) == .never) nn else dropped;
+}
+
+pub fn filterUnion(c: *Checker, t: TypeId, comptime keep: fn (*Checker, TypeId) bool) Error!TypeId {
+    if (c.ts.kind(t) == .union_type) {
+        var parts: std.ArrayList(TypeId) = .empty;
+        defer parts.deinit(c.scratch());
+        for (try c.memberList(t)) |m| {
+            if (keep(c, m)) try parts.append(c.scratch(), m);
+        }
+        return c.ts.makeUnion(c.scratch(), parts.items);
+    }
+    return if (keep(c, t)) t else types.never_type;
+}
+
+pub fn containsNullish(c: *Checker, t: TypeId) bool {
+    return c.unionAnyMember(t, struct {
+        fn f(ch: *Checker, m: TypeId) bool {
+            const k = ch.ts.kind(m);
+            return k == .null or k == .undefined or k == .void or k == .unknown;
+        }
+    }.f);
+}
+
+pub fn containsNull(c: *Checker, t: TypeId) bool {
+    return c.unionAnyMember(t, struct {
+        fn f(ch: *Checker, m: TypeId) bool {
+            return ch.ts.kind(m) == .null;
+        }
+    }.f);
+}
+
+pub fn containsUndefinedish(c: *Checker, t: TypeId) bool {
+    return c.unionAnyMember(t, struct {
+        fn f(ch: *Checker, m: TypeId) bool {
+            const k = ch.ts.kind(m);
+            return k == .undefined or k == .void;
+        }
+    }.f);
+}
+
+pub fn unionAnyMember(c: *Checker, t: TypeId, comptime f: fn (*Checker, TypeId) bool) bool {
+    if (c.ts.kind(t) == .union_type) {
+        for (0..c.ts.memberCount(t)) |i| {
+            if (f(c, c.ts.memberAt(t, i))) return true;
+        }
+        return false;
+    }
+    return f(c, t);
+}
+
+/// The definitely-truthy part of `t` (removes null/undefined/false/
+/// falsy literals; boolean -> true; object types kept).
+pub fn getTruthyPart(c: *Checker, t: TypeId) Error!TypeId {
+    if (c.ts.kind(t) == .union_type) {
+        var parts: std.ArrayList(TypeId) = .empty;
+        defer parts.deinit(c.scratch());
+        for (try c.memberList(t)) |m| {
+            const p = try c.getTruthyPart(m);
+            if (p != types.never_type) try parts.append(c.scratch(), p);
+        }
+        return c.ts.makeUnion(c.scratch(), parts.items);
+    }
+    const s = &c.ts;
+    return switch (s.kind(t)) {
+        .null, .undefined, .void, .bool_false => types.never_type,
+        .boolean => types.true_type,
+        // A truthy naked type parameter is `T & {}` — tsc's
+        // `getAdjustedTypeWithFacts` maps the `Truthy` facts over the type
+        // and replaces any constituent that can be nullish with
+        // `NonNullable<…>`. Without it `<T extends P | null>(p: T)` guarded
+        // by `if (p)` still sees the nullish constraint and reports every
+        // member access on it. `nonNullable` builds the same marker the
+        // intersection arm of `propOfTypeEx` already consumes.
+        .type_param => try c.nonNullable(t),
+        .string_literal => if (c.atomText(s.literalAtom(t)).len == 0) types.never_type else t,
+        .number_literal, .number_literal_fresh => if (s.numberValue(t) == 0) types.never_type else t,
+        .bigint_literal => blk: {
+            const text = c.atomText(s.literalAtom(t));
+            break :blk if (isZeroBigInt(text)) types.never_type else t;
+        },
+        else => t,
+    };
+}
+
+/// The definitely-falsy part of `t` (tsc's `A && B` left contribution
+/// and falsy-branch narrowing): string -> "", number -> 0, boolean ->
+/// false, bigint -> 0n; object types contribute nothing.
+pub fn getFalsyPart(c: *Checker, t: TypeId, for_narrowing: bool) Error!TypeId {
+    if (c.ts.kind(t) == .union_type) {
+        var parts: std.ArrayList(TypeId) = .empty;
+        defer parts.deinit(c.scratch());
+        for (try c.memberList(t)) |m| {
+            const p = try c.getFalsyPart(m, for_narrowing);
+            if (p != types.never_type) try parts.append(c.scratch(), p);
+        }
+        return c.ts.makeUnion(c.scratch(), parts.items);
+    }
+    const s = &c.ts;
+    return switch (s.kind(t)) {
+        .null, .undefined, .void, .bool_false => t,
+        .boolean => types.false_type,
+        .bool_true => types.never_type,
+        .any, .err => types.any_type,
+        .unknown => types.unknown_type,
+        .string => if (for_narrowing) types.string_type else try s.makeStringLiteral(try c.atom(""), false),
+        .number => if (for_narrowing) types.number_type else try s.makeNumberLiteral(0, false),
+        .bigint => if (for_narrowing) types.bigint_type else try s.makeBigIntLiteral(try c.atom("0n"), false),
+        .string_literal => if (c.atomText(s.literalAtom(t)).len == 0) t else types.never_type,
+        .number_literal, .number_literal_fresh => if (s.numberValue(t) == 0) t else types.never_type,
+        .bigint_literal => if (isZeroBigInt(c.atomText(s.literalAtom(t)))) t else types.never_type,
+        else => types.never_type, // objects, functions, tuples, refs...
+    };
+}
+
+/// Can a value of `t` be falsy? tsc asks this (`getTypeFacts(left,
+/// TypeFacts.Falsy)`) before building the `||` result: when the answer is
+/// no the right operand is unreachable and the result is just the left
+/// operand's type, with no union and no reduction. Undecidable shapes —
+/// `any`, a bare type parameter, an unresolved conditional — answer "yes",
+/// which keeps the union ztsc built before.
+pub fn canBeFalsy(c: *Checker, t: TypeId, depth: u32) Error!bool {
+    if (depth > 8) return true;
+    const s = &c.ts;
+    switch (s.kind(t)) {
+        .union_type => {
+            for (try c.memberList(t)) |m| {
+                if (try c.canBeFalsy(m, depth + 1)) return true;
+            }
+            return false;
+        },
+        // One always-truthy constituent makes the whole intersection so.
+        .intersection => {
+            for (try c.memberList(t)) |m| {
+                if (!try c.canBeFalsy(m, depth + 1)) return false;
+            }
+            return true;
+        },
+        .object, .array, .tuple, .function, .overloads, .class_value, .bool_true, .symbol, .unique_symbol, .object_keyword => return false,
+        .string_literal => return c.atomText(s.literalAtom(t)).len == 0,
+        .number_literal, .number_literal_fresh => return s.numberValue(t) == 0,
+        .bigint_literal => return isZeroBigInt(c.atomText(s.literalAtom(t))),
+        .ref, .this_type => {
+            const r = try c.resolveStructural(t);
+            if (r == t) return true;
+            return c.canBeFalsy(r, depth + 1);
+        },
+        else => return true,
+    }
+}
+
+/// Can a value of `t` be `null` or `undefined`? The `??` counterpart of
+/// `canBeFalsy` (tsc's `getTypeFacts(left, TypeFacts.EQUndefinedOrNull)`):
+/// `a ?? b` is just `a`'s type when the answer is no. `void` counts — it
+/// admits `undefined` — and undecidable shapes again answer "yes".
+pub fn canBeNullish(c: *Checker, t: TypeId, depth: u32) Error!bool {
+    if (depth > 8) return true;
+    switch (c.ts.kind(t)) {
+        .null, .undefined, .void, .any, .unknown, .err, .type_param => return true,
+        .union_type, .intersection => {
+            for (try c.memberList(t)) |m| {
+                if (try c.canBeNullish(m, depth + 1)) return true;
+            }
+            return false;
+        },
+        .ref, .this_type => {
+            const r = try c.resolveStructural(t);
+            if (r == t) return true;
+            return c.canBeNullish(r, depth + 1);
+        },
+        .conditional, .infer_var, .mapped_param => return true,
+        else => return false,
+    }
+}
+
+pub fn isZeroBigInt(text: []const u8) bool {
+    for (text) |ch| {
+        if (ch >= '1' and ch <= '9') return false;
+    }
+    return true;
+}

@@ -119,14 +119,24 @@ the sum of live sealed data — not of every allocator that ever ran.
 
 Every module in `src/` reads top-down in one order: the `//!` file doc
 comment, then the public entry functions, then the public types they traffic
-in, then the private implementation, then the tests. `src/parser.zig` and
-`src/checker.zig` are the reference. Types-only contract modules
-(`src/types.zig`, `src/ast.zig`) are exempt by nature — they are all surface.
+in, then the private implementation, then the tests. `src/parser.zig` is
+the reference. Types-only contract modules (`src/types.zig`, `src/ast.zig`)
+are exempt by nature — they are all surface.
 
-`pub` means "has a consumer in another file", not "looks reusable". Eight
-functions in `modules.zig` were public with no caller anywhere in `src/` or
-`test/`; withdrawing them changed nothing but the apparent size of the module's
-API. Check that with the compiler, not with intent.
+The checker is one logical module split across files for navigability:
+`src/checker.zig` holds the public API, the `Checker` state struct, and its
+core context/cache helpers; `src/checker/*.zig` hold the implementation as
+free functions taking `c: *Checker`, grouped by domain (assignability,
+expressions, calls, narrowing, …) and re-exported as decls on `Checker` so
+call sites use method syntax. Only `src/checker.zig` is imported from
+outside; the sub-files are internal even though their functions are `pub`
+(method dispatch across files requires it).
+
+Elsewhere, `pub` means "has a consumer in another file", not "looks
+reusable". Eight functions in `modules.zig` were public with no caller
+anywhere in `src/` or `test/`; withdrawing them changed nothing but the
+apparent size of the module's API. Check that with the compiler, not with
+intent.
 
 A module is one concern. What was `modules.zig` is four files, each with its
 own head and its own tests:

@@ -1,0 +1,1402 @@
+//! Statements & declarations: classes, interfaces, aliases, reachability.
+//! Split mechanically from checker.zig; functions take the
+//! `Checker` context as their first parameter.
+
+const std = @import("std");
+const ast = @import("../ast.zig");
+const scanner = @import("../scanner.zig");
+const intern = @import("../intern.zig");
+const binder = @import("../binder.zig");
+const types = @import("../types.zig");
+const source = @import("../source.zig");
+const libs = @import("../libs.zig");
+const modules = @import("../modules.zig");
+const ZeroPagedArray = @import("../zeropage.zig").ZeroPagedArray;
+
+const Node = ast.Node;
+const null_node = ast.null_node;
+const Bind = binder.Bind;
+const SymbolId = binder.SymbolId;
+const TypeId = types.TypeId;
+
+const checker_zig = @import("../checker.zig");
+const Checker = checker_zig.Checker;
+const Error = checker_zig.Error;
+const Check = checker_zig.Check;
+const check = checker_zig.check;
+const max_instantiation_count = checker_zig.max_instantiation_count;
+const DeferredBody = checker_zig.DeferredBody;
+
+const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
+const assignNarrows = @import("flow.zig").assignNarrows;
+const baseClassRef = @import("instantiate.zig").baseClassRef;
+const checkExprCached = @import("expr.zig").checkExprCached;
+const checkFunctionLikeExpr = @import("expr.zig").checkFunctionLikeExpr;
+const checkJsxElement = @import("expr.zig").checkJsxElement;
+const classStaticType = @import("enums.zig").classStaticType;
+const diagFmt = Checker.diagFmt;
+const elaborateLiteralError = @import("assign.zig").elaborateLiteralError;
+const fixTypeArgs = @import("typenode.zig").fixTypeArgs;
+const guardCallOf = @import("flow.zig").guardCallOf;
+const inferReturnType = @import("signatures.zig").inferReturnType;
+const isComparable = @import("assign.zig").isComparable;
+const isNonPrimitiveKind = @import("assign.zig").isNonPrimitiveKind;
+const run = Checker.run;
+const seal = Checker.seal;
+const typeFromQualifiedName = @import("typenode.zig").typeFromQualifiedName;
+const typeOfSymbol = @import("signatures.zig").typeOfSymbol;
+const typeof_names = Checker.typeof_names;
+
+// =====================================================================
+// statements & declarations
+// =====================================================================
+
+pub fn checkStatement(c: *Checker, node: Node) Error!void {
+    if (node == null_node) return;
+    // Baseline anchor for any TS2589 raised while materializing types in
+    // this statement (refined to finer spans at expression / assignment
+    // boundaries), and the source element the instantiation budget is
+    // scoped to (`max_instantiation_count` — tsc's `checkSourceElement`
+    // resets `instantiationCount` at exactly this point).
+    c.anchorInst(node);
+    c.inst_count = 0;
+    const d = c.tree.nodeData(node);
+    const stmt_tag = c.nodeTag(node);
+    // A class-position decorator applies to the class that immediately
+    // follows it in the statement list (possibly through an `export`
+    // wrapper). Any other statement means a preceding decorator had no
+    // class target — drop the pending set so it can't attach to a later
+    // class. (`export_default` can also wrap the decorated class.)
+    switch (stmt_tag) {
+        .decorator, .class_decl, .export_decl, .export_default => {},
+        else => c.pending_class_decos.clearRetainingCapacity(),
+    }
+    switch (stmt_tag) {
+        .block => {
+            const saved = c.cur_scope;
+            defer c.cur_scope = saved;
+            if (try c.scopeOf(node)) |s| c.cur_scope = s;
+            for (c.tree.nodeRange(node)) |stmt| try c.checkStatement(stmt);
+        },
+        .var_decl_one, .var_decl => try c.checkVarDeclStatement(node),
+        .expr_stmt => _ = try c.checkExprCached(d.lhs, types.no_type),
+        .empty_stmt, .debugger_stmt, .error_node, .unsupported, .omitted => {},
+        .if_stmt => {
+            _ = try c.checkExprCached(d.lhs, types.no_type);
+            try c.checkStatement(d.rhs);
+        },
+        .if_else_stmt => {
+            const e = c.tree.extraData(ast.IfElse, d.rhs);
+            _ = try c.checkExprCached(d.lhs, types.no_type);
+            try c.checkStatement(e.then_stmt);
+            try c.checkStatement(e.else_stmt);
+        },
+        .while_stmt => {
+            _ = try c.checkExprCached(d.lhs, types.no_type);
+            try c.checkStatement(d.rhs);
+        },
+        .do_stmt => {
+            try c.checkStatement(d.lhs);
+            _ = try c.checkExprCached(d.rhs, types.no_type);
+        },
+        .for_stmt => {
+            const e = c.tree.extraData(ast.For, d.lhs);
+            const saved = c.cur_scope;
+            defer c.cur_scope = saved;
+            if (try c.scopeOf(node)) |s| c.cur_scope = s;
+            if (e.init != 0) {
+                switch (c.nodeTag(e.init)) {
+                    .var_decl_one, .var_decl => try c.checkVarDeclStatement(e.init),
+                    else => _ = try c.checkExprCached(e.init, types.no_type),
+                }
+            }
+            if (e.cond != 0) _ = try c.checkExprCached(e.cond, types.no_type);
+            if (e.update != 0) _ = try c.checkExprCached(e.update, types.no_type);
+            try c.checkStatement(d.rhs);
+        },
+        .for_in_stmt, .for_of_stmt => try c.checkForInOf(node),
+        .switch_stmt => try c.checkSwitch(node),
+        .case_clause, .default_clause => {}, // handled by checkSwitch
+        .try_stmt => {
+            const e = c.tree.extraData(ast.Try, d.rhs);
+            try c.checkStatement(d.lhs);
+            if (e.catch_clause != 0) {
+                const cd = c.tree.nodeData(e.catch_clause);
+                const saved = c.cur_scope;
+                defer c.cur_scope = saved;
+                if (try c.scopeOf(e.catch_clause)) |s| c.cur_scope = s;
+                if (cd.rhs != 0) {
+                    if (c.nodeTag(cd.rhs) == .block) {
+                        for (c.tree.nodeRange(cd.rhs)) |stmt| try c.checkStatement(stmt);
+                    } else {
+                        try c.checkStatement(cd.rhs);
+                    }
+                }
+            }
+            if (e.finally_block != 0) try c.checkStatement(e.finally_block);
+        },
+        .throw_stmt => _ = try c.checkExprCached(d.lhs, types.no_type),
+        .return_stmt => try c.checkReturn(node),
+        .break_stmt, .continue_stmt => {},
+        .labeled_stmt => try c.checkStatement(d.lhs),
+        .function_decl => try c.checkFunctionDecl(node),
+        .decorator => try c.pending_class_decos.append(c.cm(), node),
+        .class_decl => try c.checkClass(node),
+        .interface_decl => try c.checkInterfaceDecl(node),
+        .type_alias => try c.checkTypeAliasDecl(node),
+        .enum_decl => try c.checkEnum(node),
+        .namespace_decl => try c.checkNamespace(node),
+        .import_decl => {}, // module graph
+        .export_named, .export_all => {},
+        .export_decl => try c.checkStatement(d.lhs),
+        .export_default => {
+            switch (c.nodeTag(d.lhs)) {
+                .function_decl, .class_decl => try c.checkStatement(d.lhs),
+                else => _ = try c.checkExprCached(d.lhs, types.no_type),
+            }
+        },
+        else => _ = try c.checkExprCached(node, types.no_type),
+    }
+}
+
+pub fn checkVarDeclStatement(c: *Checker, node: Node) Error!void {
+    const d = c.tree.nodeData(node);
+    const is_const = c.tree.tokens.tag(c.tree.nodeMainToken(node)) == .keyword_const;
+    if (c.nodeTag(node) == .var_decl_one) {
+        try c.checkDeclarator(d.lhs, is_const);
+    } else {
+        for (c.tree.nodeRange(node)) |decl| {
+            if (decl != null_node) try c.checkDeclarator(decl, is_const);
+        }
+    }
+}
+
+pub fn checkDeclarator(c: *Checker, decl: Node, is_const: bool) Error!void {
+    const d = c.tree.nodeData(decl);
+    switch (c.nodeTag(decl)) {
+        .declarator => {},
+        .declarator_init => {
+            _ = try c.checkExprCached(d.rhs, types.no_type);
+            // Materialize the symbol's type (infers + caches).
+            try c.materializePatternTypes(d.lhs);
+        },
+        .declarator_full => {
+            const e = c.tree.extraData(ast.DeclaratorFull, d.rhs);
+            const name_span = if (c.nodeTag(d.lhs) == .identifier)
+                c.tokSpan(c.tree.nodeMainToken(d.lhs))
+            else
+                c.nodeSpan(d.lhs);
+            const ann: TypeId = if (e.type_ann != 0) try c.annTypeMaybeUnique(e.type_ann, is_const, 1332, name_span) else types.no_type;
+            // A `unique symbol` const accepts only a fresh `Symbol()` /
+            // `Symbol.for()` initializer; the assignability check (a plain
+            // `symbol` is not assignable to `unique symbol`) is skipped for
+            // that one form, matching tsc.
+            if (e.init != 0 and e.type_ann != 0 and c.nodeTag(e.type_ann) == .unique_symbol_type and c.isFreshSymbolCall(e.init)) {
+                _ = try c.checkExprCached(e.init, ann);
+                try c.materializePatternTypes(d.lhs);
+                return;
+            }
+            if (e.init != 0) {
+                const it = try c.checkExprCached(e.init, ann);
+                if (ann != types.no_type and ann != types.error_type) {
+                    _ = try c.checkAssignable(it, ann, e.init, name_span);
+                }
+            }
+            try c.materializePatternTypes(d.lhs);
+        },
+        else => {},
+    }
+}
+
+/// Force typeOfSymbol for every name bound by a pattern so inference
+/// diagnostics fire deterministically at the declaration site.
+pub fn materializePatternTypes(c: *Checker, pat: Node) Error!void {
+    if (pat == null_node) return;
+    switch (c.nodeTag(pat)) {
+        .identifier => {
+            const a = try c.atomOfToken(c.tree.nodeMainToken(pat));
+            switch (c.resolveSpace(a, c.cur_scope, true)) {
+                .sym => |sym| _ = try c.typeOfSymbol(sym),
+                else => {},
+            }
+        },
+        .array_pattern, .object_pattern => {
+            for (c.tree.nodeRange(pat)) |el| {
+                if (el != null_node) try c.materializePatternTypes(el);
+            }
+        },
+        .binding_property => {
+            const d = c.tree.nodeData(pat);
+            if (d.lhs != 0) {
+                try c.materializePatternTypes(d.lhs);
+            } else {
+                const a = try c.memberAtom(c.tree.nodeMainToken(pat));
+                switch (c.resolveSpace(a, c.cur_scope, true)) {
+                    .sym => |sym| _ = try c.typeOfSymbol(sym),
+                    else => {},
+                }
+            }
+            if (d.rhs != 0) _ = try c.checkExprCached(d.rhs, types.no_type);
+        },
+        .binding_default => {
+            const d = c.tree.nodeData(pat);
+            try c.materializePatternTypes(d.lhs);
+            _ = try c.checkExprCached(d.rhs, types.no_type);
+        },
+        .rest_element => try c.materializePatternTypes(c.tree.nodeData(pat).lhs),
+        else => {},
+    }
+}
+
+pub fn checkForInOf(c: *Checker, node: Node) Error!void {
+    const d = c.tree.nodeData(node);
+    const e = c.tree.extraData(ast.ForInOf, d.lhs);
+    const is_of = c.nodeTag(node) == .for_of_stmt;
+    const saved = c.cur_scope;
+    defer c.cur_scope = saved;
+    if (try c.scopeOf(node)) |s| c.cur_scope = s;
+
+    const rt = try c.checkExprCached(e.right, types.no_type);
+    var elem_t: TypeId = types.any_type;
+    if (is_of) {
+        elem_t = try c.forOfElementType(rt, e.right, e.is_await != 0);
+    } else {
+        elem_t = types.string_type; // for..in keys
+        const rk = c.ts.kind(try c.resolveStructural(rt));
+        if (!isNonPrimitiveKind(rk) and rk != .any and rk != .err and rk != .unknown and rk != .type_param) {
+            try c.diagFmt(2407, c.nodeSpan(e.right), "The right-hand side of a 'for...in' statement must be of type 'any', an object type or a type parameter, but here has type '{s}'.", .{try c.typeToString(rt)});
+        }
+    }
+    // Bind the left side.
+    switch (c.nodeTag(e.left)) {
+        .var_decl_one, .var_decl => {
+            const ld = c.tree.nodeData(e.left);
+            const decl = if (c.nodeTag(e.left) == .var_decl_one) ld.lhs else blk: {
+                const range = c.tree.nodeRange(e.left);
+                break :blk if (range.len > 0) range[0] else null_node;
+            };
+            if (decl != null_node) {
+                const dd = c.tree.nodeData(decl);
+                switch (c.nodeTag(decl)) {
+                    .declarator => {
+                        if (c.nodeTag(dd.lhs) == .identifier) {
+                            const a = try c.atomOfToken(c.tree.nodeMainToken(dd.lhs));
+                            if (c.bind.lookupInScope(c.cur_scope, a)) |sym| {
+                                c.setTypeOfSymbol(c.toGlobal(sym), elem_t);
+                            }
+                        } else {
+                            try c.assignPatternFromType(dd.lhs, elem_t);
+                        }
+                    },
+                    .declarator_full => {
+                        const ee = c.tree.extraData(ast.DeclaratorFull, dd.rhs);
+                        if (ee.type_ann != 0) {
+                            const ann = try c.typeFromTypeNode(ee.type_ann);
+                            _ = try c.checkAssignable(elem_t, ann, 0, c.nodeSpan(dd.lhs));
+                        }
+                        try c.materializePatternTypes(dd.lhs);
+                    },
+                    else => {},
+                }
+            }
+        },
+        else => _ = try c.checkExprCached(e.left, types.no_type),
+    }
+    try c.checkStatement(d.rhs);
+}
+
+/// Pre-set the types of identifiers bound in a destructuring pattern
+/// from the element type (for-of patterns).
+pub fn assignPatternFromType(c: *Checker, pat: Node, whole: TypeId) Error!void {
+    if (pat == null_node) return;
+    switch (c.nodeTag(pat)) {
+        .identifier => {
+            const a = try c.atomOfToken(c.tree.nodeMainToken(pat));
+            if (c.bind.lookupInScope(c.cur_scope, a)) |sym| c.setTypeOfSymbol(c.toGlobal(sym), whole);
+        },
+        .object_pattern => {
+            for (c.tree.nodeRange(pat)) |el| {
+                if (el == null_node) continue;
+                const ed = c.tree.nodeData(el);
+                if (c.nodeTag(el) == .binding_property) {
+                    const key = try c.memberAtom(c.tree.nodeMainToken(el));
+                    var pt: TypeId = types.any_type;
+                    if (try c.propOfType(try c.resolveStructural(whole), key)) |p| pt = p.ty;
+                    if (ed.lhs != 0) {
+                        try c.assignPatternFromType(ed.lhs, pt);
+                    } else {
+                        const a = try c.memberAtom(c.tree.nodeMainToken(el));
+                        if (c.bind.lookupInScope(c.cur_scope, a)) |sym| c.setTypeOfSymbol(c.toGlobal(sym), pt);
+                    }
+                }
+            }
+        },
+        .array_pattern => {
+            const r = try c.resolveStructural(whole);
+            var i: u32 = 0;
+            for (c.tree.nodeRange(pat)) |el| {
+                if (el == null_node) continue;
+                defer i += 1;
+                var et: TypeId = types.any_type;
+                switch (c.ts.kind(r)) {
+                    .array => et = c.ts.arrayElem(r),
+                    .tuple => {
+                        if (i < c.ts.tupleLen(r)) et = c.ts.tupleElem(r, i).ty;
+                    },
+                    else => {},
+                }
+                try c.assignPatternFromType(el, et);
+            }
+        },
+        .binding_default => try c.assignPatternFromType(c.tree.nodeData(pat).lhs, whole),
+        .rest_element => try c.assignPatternFromType(c.tree.nodeData(pat).lhs, try c.ts.makeArray(whole)),
+        else => {},
+    }
+}
+
+/// Element type of `for (x of expr)`, diagnosing TS2488 when `expr` is not
+/// iterable. Arrays/tuples/strings resolve directly; everything else goes
+/// through the `[Symbol.iterator]()` protocol (`iterationElementType`).
+pub fn forOfElementType(c: *Checker, rt: TypeId, right_node: Node, is_await: bool) Error!TypeId {
+    if (is_await) {
+        if (try c.asyncIterationElementType(rt)) |e| return e;
+        if (right_node != 0) {
+            try c.diagFmt(2504, c.nodeSpan(right_node), "Type '{s}' must have a '[Symbol.asyncIterator]()' method that returns an async iterator.", .{try c.typeToString(rt)});
+        }
+        return types.any_type;
+    }
+    if (try c.iterationElementType(rt)) |e| return e;
+    if (right_node != 0) {
+        try c.diagFmt(2488, c.nodeSpan(right_node), "Type '{s}' must have a '[Symbol.iterator]()' method that returns an iterator.", .{try c.typeToString(rt)});
+    }
+    return types.any_type;
+}
+
+/// The type produced by iterating `rt` (the `x` in `for (x of rt)` and the
+/// element of `[...rt]`), or null when `rt` is not iterable. Handles
+/// arrays/tuples/strings directly, `Generator`/`Iterator`/`IterableIterator`
+/// refs, and the general `[Symbol.iterator]() -> { next(): { value } }`
+/// protocol (so `Map`/`Set` and user-defined iterables work).
+pub fn iterationElementType(c: *Checker, rt: TypeId) Error!?TypeId {
+    const r = try c.resolveStructural(rt);
+    switch (c.ts.kind(r)) {
+        .array => return c.ts.arrayElem(r),
+        .tuple => return try c.numberIndexType(r),
+        .string, .string_literal => return types.string_type,
+        .any, .err => return types.any_type,
+        .union_type => {
+            var parts: std.ArrayList(TypeId) = .empty;
+            defer parts.deinit(c.scratch());
+            for (try c.memberList(r)) |m| {
+                const e = (try c.iterationElementType(m)) orelse return null;
+                try parts.append(c.scratch(), e);
+            }
+            return try c.ts.makeUnion(c.scratch(), parts.items);
+        },
+        else => {},
+    }
+    // `[Symbol.iterator](): Iterator<E>` protocol.
+    if (try c.propOfType(r, c.atom_sym_iterator)) |p| {
+        const ret = try c.callableReturn(p.ty);
+        if (ret != 0) {
+            // Lib iterables return `IterableIterator<E>`/`Iterator<E>`.
+            const y2 = c.generatorYieldType(ret);
+            if (y2 != 0) return y2;
+            // General protocol: the iterator's `next()` result `value`.
+            if (try c.iteratorNextValue(ret, false)) |v| return v;
+        }
+    }
+    return null;
+}
+
+/// The type produced by `for await (x of rt)`: the
+/// `[Symbol.asyncIterator]()` protocol, falling back to the sync protocol
+/// with `Awaited<…>` applied to the element (tsc allows `for await` over
+/// a plain iterable). Null when `rt` is neither.
+pub fn asyncIterationElementType(c: *Checker, rt: TypeId) Error!?TypeId {
+    const r = try c.resolveStructural(rt);
+    switch (c.ts.kind(r)) {
+        .any, .err => return types.any_type,
+        .union_type => {
+            var parts: std.ArrayList(TypeId) = .empty;
+            defer parts.deinit(c.scratch());
+            for (try c.memberList(r)) |m| {
+                const e = (try c.asyncIterationElementType(m)) orelse return null;
+                try parts.append(c.scratch(), e);
+            }
+            return try c.ts.makeUnion(c.scratch(), parts.items);
+        },
+        else => {},
+    }
+    if (try c.propOfType(r, c.atom_sym_asyncIterator)) |p| {
+        const ret = try c.callableReturn(p.ty);
+        if (ret != 0) {
+            const y = c.asyncGeneratorYieldType(ret);
+            if (y != 0) return y;
+            if (try c.iteratorNextValue(ret, true)) |v| return v;
+        }
+        return null;
+    }
+    if (try c.iterationElementType(rt)) |e| return try c.awaitedType(e);
+    return null;
+}
+
+/// Return type of a callable prop (`.function` or the first `.overloads`
+/// signature); 0 if `ty` is not callable.
+pub fn callableReturn(c: *Checker, ty: TypeId) Error!TypeId {
+    switch (c.ts.kind(ty)) {
+        .function => return c.ts.fnReturn(ty),
+        .overloads => {
+            const sigs = try c.memberList(ty);
+            return if (sigs.len > 0) c.ts.fnReturn(sigs[0]) else 0;
+        },
+        else => return 0,
+    }
+}
+
+/// The `value` type of an iterator's `next()` result, i.e. the yield type
+/// of an arbitrary (non-lib-named) iterator object. Null if `iter` has no
+/// `next(): { value }` shape. With `is_async`, `next()`'s `Promise<…>`
+/// return is unwrapped first (the `AsyncIterator` protocol).
+pub fn iteratorNextValue(c: *Checker, iter: TypeId, is_async: bool) Error!?TypeId {
+    const r = try c.resolveStructural(iter);
+    const nextp = (try c.propOfType(r, c.atom_next)) orelse return null;
+    var ret = try c.callableReturn(nextp.ty);
+    if (ret == 0) return null;
+    if (is_async) ret = try c.awaitedType(ret);
+    const rr = try c.resolveStructural(ret);
+    if (c.ts.kind(rr) == .union_type) {
+        // The lib's `next(): IteratorResult<T, TReturn>` is the union
+        // `IteratorYieldResult<T> | IteratorReturnResult<TReturn>`,
+        // discriminated on `done`: the iteration type is the `value` of
+        // the constituents whose `done` is not literally `true`.
+        var parts: std.ArrayList(TypeId) = .empty;
+        defer parts.deinit(c.scratch());
+        for (try c.memberList(rr)) |m| {
+            const rm = try c.resolveStructural(m);
+            if (try c.propOfType(rm, c.atom_done)) |dp| {
+                if (c.ts.kind(try c.resolveStructural(dp.ty)) == .bool_true) continue;
+            }
+            const vp = (try c.propOfType(rm, c.atom_value)) orelse continue;
+            try parts.append(c.scratch(), vp.ty);
+        }
+        if (parts.items.len == 0) return null;
+        return try c.ts.makeUnion(c.scratch(), parts.items);
+    }
+    const valp = (try c.propOfType(rr, c.atom_value)) orelse return null;
+    return valp.ty;
+}
+
+pub fn checkSwitch(c: *Checker, node: Node) Error!void {
+    const d = c.tree.nodeData(node);
+    const disc_t = try c.checkExprCached(d.lhs, types.no_type);
+    const saved = c.cur_scope;
+    defer c.cur_scope = saved;
+    if (try c.scopeOf(node)) |s| c.cur_scope = s;
+    const r = c.tree.extraData(ast.SubRange, d.rhs);
+    for (c.tree.extraRange(r.start, r.end)) |clause| {
+        if (clause == null_node) continue;
+        const cd = c.tree.nodeData(clause);
+        if (c.nodeTag(clause) == .case_clause and cd.lhs != 0) {
+            const case_t = try c.checkExprCached(cd.lhs, types.no_type);
+            // TS2678 is the same *comparable* relation as TS2367, so it
+            // goes through the same union/intersection-distributing test:
+            // a `case null:` on a non-nullable discriminant is clean in
+            // tsc, and `case 1:` on a branded `number & { _brand }` relates
+            // through the intersection's `number` constituent. Bare
+            // `isComparable` (mutual assignability) reported both.
+            if (!try c.typesHaveOverlap(case_t, disc_t)) {
+                try c.diagFmt(2678, c.nodeSpan(cd.lhs), "Type '{s}' is not comparable to type '{s}'.", .{
+                    try c.typeToString(case_t), try c.typeToString(disc_t),
+                });
+            }
+        }
+        const cr = c.tree.extraData(ast.SubRange, cd.rhs);
+        for (c.tree.extraRange(cr.start, cr.end)) |stmt| try c.checkStatement(stmt);
+    }
+}
+
+pub fn checkReturn(c: *Checker, node: Node) Error!void {
+    const d = c.tree.nodeData(node);
+    const ctx = c.fn_ctx orelse {
+        if (d.lhs != 0) _ = try c.checkExprCached(d.lhs, types.no_type);
+        return;
+    };
+    if (d.lhs != 0) {
+        // Contextual type of the return expression. For async, tsc's
+        // `getContextualTypeForReturnExpression` yields `T | Promise<T>`
+        // (awaited payload OR a promise of it), so a returned generic
+        // call/`new` whose own return is `Promise<R>` infers `R` from the
+        // promise arm (`return new Promise(()=>{})` → `Promise<T>`;
+        // `return axios.delete(...)` → `Promise<R=T>`). The assignability
+        // check below still relates the *awaited* value to `ctx.ret_ann`.
+        // With no annotation, the contextual signature's return type takes
+        // that role (`c.ret_ctx`) — it is what tsc's
+        // `getContextualTypeForReturnExpression` yields for a contextually
+        // typed function, and without it a `return { handler: (e) => … }`
+        // inside such a function lost every nested contextual type.
+        const base_ctx = if (ctx.ret_ann != types.no_type) ctx.ret_ann else ctx.ret_ctx;
+        const expr_ctx = if (ctx.is_async and base_ctx != types.no_type and
+            base_ctx != types.error_type and c.ts.kind(base_ctx) != .none)
+            try c.makeUnion2(base_ctx, try c.makePromise(base_ctx))
+        else
+            base_ctx;
+        const rt = try c.checkExprCached(d.lhs, expr_ctx);
+        // async: `return v` in a `Promise<T>` relates the awaited `v` to the
+        // payload `T` (so `return somePromise` is not double-wrapped).
+        const eff_rt = if (ctx.is_async) try c.awaitedType(rt) else rt;
+        if (ctx.ret_ann != types.no_type and ctx.ret_ann != types.error_type and
+            ctx.ret_ann != types.any_type and c.ts.kind(ctx.ret_ann) != .none)
+        {
+            // Anchored at the RETURN STATEMENT, not the expression: tsc's
+            // `checkReturnStatement` passes the statement as the error
+            // node, so the column is `return`'s, seven characters to the
+            // left of the expression's. (The expression node still goes in
+            // as `expr_node`, so the literal elaboration below still
+            // descends into it.) The bare-`return` arm below already
+            // anchored this way.
+            _ = try c.checkAssignable(eff_rt, ctx.ret_ann, d.lhs, c.nodeSpan(node));
+        }
+    } else if (ctx.ret_ann != types.no_type) {
+        const k = c.ts.kind(ctx.ret_ann);
+        const allows_bare = k == .void or k == .any or k == .unknown or k == .err or k == .none or
+            c.containsUndefinedish(ctx.ret_ann);
+        if (!allows_bare) {
+            try c.diagFmt(2322, c.nodeSpan(node), "Type 'undefined' is not assignable to type '{s}'.", .{try c.typeToString(ctx.ret_ann)});
+        }
+    }
+}
+
+pub fn checkFunctionDecl(c: *Checker, node: Node) Error!void {
+    const d = c.tree.nodeData(node);
+    // Builds the signature (reports 7006 etc. once).
+    _ = try c.signatureOfProto(node, d.lhs, false, true);
+    if (d.rhs != 0) {
+        const sig = try c.signatureOfProto(node, d.lhs, false, true);
+        try c.checkFunctionBody(node, d.lhs, d.rhs, sig, types.no_type);
+    }
+}
+
+/// Walk every function body postponed by `defer_bodies`, in queue order.
+/// Each entry restores the file and `this` it was queued under; draining a
+/// body may queue more (a nested class, another field), so the loop reads
+/// the list by index until it stops growing.
+pub fn drainDeferredBodies(c: *Checker) Error!void {
+    if (c.deferred_bodies.items.len == 0) return;
+    std.debug.assert(c.defer_bodies == 0);
+    const saved_ctx = c.saveCtx();
+    const saved_this = c.this_type;
+    defer {
+        c.restoreCtx(saved_ctx);
+        c.this_type = saved_this;
+    }
+    var i: usize = 0;
+    while (i < c.deferred_bodies.items.len) : (i += 1) {
+        const d = c.deferred_bodies.items[i];
+        if (d.file != c.cur_file) c.setFile(d.file);
+        c.this_type = d.this_type;
+        try c.checkFunctionBody(d.node, d.proto_idx, d.body, d.sig, d.ret_ctx);
+    }
+    c.deferred_bodies.clearRetainingCapacity();
+}
+
+/// `ret_ctx` is the contextual signature's return type when this function
+/// has no return annotation (0 otherwise / when there is no context). It
+/// only supplies a contextual type to the return expressions — the
+/// assignability checks stay on the written annotation.
+pub fn checkFunctionBody(c: *Checker, node: Node, proto_idx: u32, body: Node, sig: TypeId, ret_ctx: TypeId) Error!void {
+    if (body == 0) return;
+    // Owned-file guard (see `checkJsxElement`). This function returns
+    // `void` — its *result* is input-independent by construction, so the
+    // invariant the JSX guard needs holds trivially here. Everything it
+    // does is diagnostics (TS2355/2366, parameter-initializer and return
+    // assignability, and whatever the statement walk reports), and
+    // `diagFmt` files each one under `cur_file`, which `seal` drops unless
+    // this checker owns it.
+    //
+    // The obligation that is *not* trivial is side effects. The body walk
+    // populates `node_types` and materializes symbol types, and a foreign
+    // file is only ever entered by materializing a dependency's type — so
+    // the question is whether any later answer depends on the cache state
+    // this walk would have left behind:
+    //
+    //   * `node_types` is a memo, and every reader outside diagnostics
+    //     re-derives on miss (`checkExprCached`). The three readers that
+    //     branch on presence — `elaborateLiteralError`, `assignNarrows`'
+    //     compound-assign arm, `guardCallOf`'s member callee — are
+    //     either diagnostics-only (dropped here) or reached from
+    //     `inferReturnType`, and `checkFunctionLikeExpr`/`checkFunctionDecl`
+    //     run that probe BEFORE this body walk, so the probe already sees
+    //     a cold cache today. Skipping the walk cannot change what it saw.
+    //   * Symbol types are materialized lazily and re-entrantly by
+    //     `typeOfSymbol`, never by the body walk being reached first: the
+    //     inferred type of anything this file exports is reachable from the
+    //     probe/`typeOfSymbol` path alone.
+    //   * `reassign_scanned`/`scopes_faulted` are per-file syntactic scans
+    //     driven by their own lazy faults, not by this walk.
+    //
+    // Byte-identity across `--checkers=N` is therefore preserved: the walk
+    // interns fewer types in a foreign file, and type identity is already
+    // required to be order-independent (that is the determinism contract
+    // every `--checkers=N` split exercises).
+    if (!c.owned_mask[c.cur_file]) return;
+    // Reached while materializing a class field's type: postpone the walk
+    // until the enclosing class's instance type exists (see `DeferredBody`).
+    if (c.defer_bodies > 0) {
+        try c.deferred_bodies.append(c.cm(), .{
+            .file = c.cur_file,
+            .node = node,
+            .proto_idx = proto_idx,
+            .body = body,
+            .sig = sig,
+            .ret_ctx = ret_ctx,
+            .this_type = c.this_type,
+        });
+        return;
+    }
+    const proto = c.tree.extraData(ast.FnProto, proto_idx);
+    const saved_scope = c.cur_scope;
+    const saved_ctx = c.fn_ctx;
+    const saved_this = c.this_type;
+    defer {
+        c.cur_scope = saved_scope;
+        c.fn_ctx = saved_ctx;
+        c.this_type = saved_this;
+    }
+    if (try c.scopeOf(node)) |s| c.cur_scope = s;
+    // An explicit `this` parameter types `this` inside the body.
+    if (c.ts.kind(sig) == .function) {
+        const tt = c.ts.fnThisType(sig);
+        if (tt != 0) c.this_type = tt;
+    }
+    const is_async = proto.flags & ast.Flags.async != 0;
+    const is_generator = proto.flags & ast.Flags.generator != 0;
+    const ann: TypeId = if (proto.return_type != 0) try c.typeFromTypeNode(proto.return_type) else types.no_type;
+    // Effective return-check target. For async this is the awaited payload
+    // `T` of the declared `Promise<T>`; a non-Promise annotation is TS1064.
+    var eff_ann = ann;
+    var yield_type: TypeId = 0;
+    if (is_async and is_generator) {
+        // `async function*`: annotated with an AsyncGenerator-family type,
+        // not Promise — TS1064 does not apply. Relate `yield x` to its
+        // first type arg (yielded promises are awaited at the yield site).
+        yield_type = c.asyncGeneratorYieldType(ann);
+        eff_ann = types.no_type;
+    } else if (is_async and ann != types.no_type) {
+        const k = c.ts.kind(ann);
+        const is_promise = c.ts.kind(ann) == .ref and c.prog.globals.lookup(c.atom_Promise) != null and
+            c.ts.refSymbol(ann) == c.prog.globals.lookup(c.atom_Promise).?;
+        if (is_promise) {
+            eff_ann = try c.awaitedType(ann);
+        } else if (k != .err and k != .none) {
+            try c.diagFmt(1064, c.nodeSpan(proto.return_type), "The return type of an async function or method must be the global Promise<T> type. Did you mean to write 'Promise<{s}>'?", .{try c.typeToString(ann)});
+            eff_ann = types.no_type; // suppress payload assignability noise
+        }
+    } else if (is_generator) {
+        // Generators: relate `yield x` to `T` from `Generator<T>`; return
+        // values (→ TReturn) are unchecked (gap).
+        yield_type = c.generatorYieldType(ann);
+        eff_ann = types.no_type;
+    }
+    // Contextual return type: only meaningful when nothing was written and
+    // the function is not a generator. Async unwraps to the payload, as
+    // `eff_ann` does for a written `Promise<T>`.
+    var eff_ret_ctx: TypeId = if (proto.return_type == 0 and !is_generator) ret_ctx else types.no_type;
+    if (eff_ret_ctx != types.no_type and is_async) eff_ret_ctx = try c.awaitedType(eff_ret_ctx);
+    c.fn_ctx = .{ .ret_ann = eff_ann, .ret_ctx = eff_ret_ctx, .is_async = is_async, .is_generator = is_generator, .yield_type = yield_type };
+
+    // Check parameter initializers against annotations.
+    for (c.tree.extraRange(proto.params_start, proto.params_end)) |pn| {
+        if (pn == null_node or c.nodeTag(pn) != .param_full) continue;
+        const pd = c.tree.nodeData(pn);
+        const e = c.tree.extraData(ast.ParamFull, pd.rhs);
+        if (e.init != 0 and e.type_ann != 0) {
+            const ann_t = try c.typeFromTypeNode(e.type_ann);
+            const it = try c.checkExprCached(e.init, ann_t);
+            _ = try c.checkAssignable(it, ann_t, e.init, c.nodeSpan(e.init));
+        } else if (e.init != 0) {
+            _ = try c.checkExprCached(e.init, types.no_type);
+        }
+    }
+
+    if (c.nodeTag(body) == .block) {
+        for (c.tree.nodeRange(body)) |stmt| try c.checkStatement(stmt);
+        // Ending-return analysis (TS2355/2366). For async the target is the
+        // Promise payload; generators do not require an ending return.
+        if (!is_generator and eff_ann != types.no_type and eff_ann != types.error_type) {
+            const k = c.ts.kind(eff_ann);
+            const exempt = k == .void or k == .any or k == .err or k == .unknown or k == .none or
+                c.containsUndefinedish(eff_ann);
+            if (!exempt) {
+                var rets: std.ArrayList(Node) = .empty;
+                defer rets.deinit(c.scratch());
+                var bare = false;
+                for (c.tree.nodeRange(body)) |stmt| {
+                    if (stmt != null_node) try c.collectReturns(stmt, &rets, null, &bare, binder.file_scope);
+                }
+                const span = if (proto.name_token != 0) c.tokSpan(proto.name_token) else c.tokSpan(c.tree.nodeMainToken(node));
+                if (!c.stmtListTerminal(c.tree.nodeRange(body))) {
+                    if (rets.items.len == 0 and !bare) {
+                        try c.diagFmt(2355, span, "A function whose declared type is neither 'undefined', 'void', nor 'any' must return a value.", .{});
+                    } else {
+                        try c.diagFmt(2366, span, "Function lacks ending return statement and return type does not include 'undefined'.", .{});
+                    }
+                }
+            }
+        }
+    } else {
+        // Arrow expression body. For async, relate the awaited body type to
+        // the Promise payload (`async () => p` returns `Promise<T>`).
+        const rt = try c.checkExprCached(body, if (eff_ann != types.no_type) eff_ann else eff_ret_ctx);
+        if (eff_ann != types.no_type and eff_ann != types.error_type) {
+            const eff_rt = if (is_async) try c.awaitedType(rt) else rt;
+            _ = try c.checkAssignable(eff_rt, eff_ann, body, c.nodeSpan(body));
+        }
+    }
+}
+
+// --- syntactic reachability (2366/return-undefined inference) ---------
+
+pub fn stmtListTerminal(c: *Checker, stmts: []const Node) bool {
+    // Does control flow fall off the end of this list? Walk forward tracking
+    // reachability: the first terminal statement (return/throw/terminal
+    // loop…) kills it, and straight-line code never revives it. A terminal
+    // statement in the *middle* therefore makes the whole list terminal —
+    // trailing dead code or a hoisted `function`/type declaration after a
+    // `return` does not resurrect the endpoint (the previous "inspect the
+    // last statement only" rule wrongly did, adding a phantom `| undefined`
+    // to the inferred return type of the common
+    // `return { … }; function helper() {…}` hook pattern).
+    var reachable = true;
+    for (stmts) |s| {
+        if (s == null_node or !reachable) continue;
+        if (c.stmtTerminal(s)) reachable = false;
+    }
+    return !reachable;
+}
+
+pub fn stmtTerminal(c: *Checker, node: Node) bool {
+    const d = c.tree.nodeData(node);
+    switch (c.nodeTag(node)) {
+        .return_stmt, .throw_stmt => return true,
+        .block => return c.stmtListTerminal(c.tree.nodeRange(node)),
+        .if_else_stmt => {
+            const e = c.tree.extraData(ast.IfElse, d.rhs);
+            return c.stmtTerminal(e.then_stmt) and c.stmtTerminal(e.else_stmt);
+        },
+        .labeled_stmt => return c.stmtTerminal(d.lhs),
+        .try_stmt => {
+            const e = c.tree.extraData(ast.Try, d.rhs);
+            // A `finally` that itself ends abruptly (return/throw) makes the
+            // whole statement terminal regardless of the try/catch bodies.
+            if (e.finally_block != null_node and c.stmtTerminal(e.finally_block)) return true;
+            // Otherwise the statement can complete normally if the try block
+            // can, or — when a catch exists — if the catch block can. It is
+            // terminal only when neither falls through.
+            const try_terminal = c.stmtTerminal(d.lhs);
+            if (e.catch_clause != null_node) {
+                const catch_block = c.tree.nodeData(e.catch_clause).rhs;
+                return try_terminal and c.stmtTerminal(catch_block);
+            }
+            return try_terminal;
+        },
+        .switch_stmt => return c.switchTerminal(node),
+        .while_stmt => {
+            // while (true) without break is terminal-ish.
+            if (c.nodeTag(d.lhs) == .true_literal and !c.containsBreak(d.rhs)) return true;
+            return false;
+        },
+        .for_stmt => {
+            const e = c.tree.extraData(ast.For, d.lhs);
+            if (e.cond == 0 and !c.containsBreak(d.rhs)) return true;
+            return false;
+        },
+        else => return false,
+    }
+}
+
+/// A switch is terminal if it has a default (or is exhaustive over a
+/// literal-union discriminant), every clause ends terminally, and no
+/// clause breaks out.
+pub fn switchTerminal(c: *Checker, node: Node) bool {
+    const d = c.tree.nodeData(node);
+    const r = c.tree.extraData(ast.SubRange, d.rhs);
+    var has_default = false;
+    var n_cases: usize = 0;
+    for (c.tree.extraRange(r.start, r.end)) |clause| {
+        if (clause == null_node) continue;
+        const cd = c.tree.nodeData(clause);
+        if (c.nodeTag(clause) == .default_clause) has_default = true else n_cases += 1;
+        const cr = c.tree.extraData(ast.SubRange, cd.rhs);
+        const stmts = c.tree.extraRange(cr.start, cr.end);
+        for (stmts) |s| {
+            if (s != null_node and c.containsBreak(s)) return false;
+        }
+        // A clause with statements must end terminally (empty clauses
+        // fall through to the next).
+        var has_stmt = false;
+        for (stmts) |s| {
+            if (s != null_node) has_stmt = true;
+        }
+        if (has_stmt and !c.stmtListTerminal(stmts)) return false;
+    }
+    if (has_default) return true;
+    // Exhaustiveness: discriminant type's union members all covered.
+    return c.switchIsExhaustive(node);
+}
+
+pub fn switchIsExhaustive(c: *Checker, node: Node) bool {
+    const d = c.tree.nodeData(node);
+    // switch (typeof x): exhaustive when every typeof outcome of x's
+    // type is covered by a case string.
+    if (c.nodeTag(d.lhs) == .prefix_unary and
+        c.tree.tokens.tag(c.tree.nodeMainToken(d.lhs)) == .keyword_typeof)
+    {
+        return c.typeofSwitchIsExhaustive(node, c.tree.nodeData(d.lhs).lhs);
+    }
+    // The discriminant type may not be cached yet: `switchIsExhaustive` is
+    // reached from `inferReturnType`, a type probe that checks only the
+    // `return` expressions, never the switch discriminant. Synthesize it on
+    // demand (memoized by `checkExprCached`) so an exhaustive switch over a
+    // literal-union parameter — `switch (fmt) { case 'a': … }` covering
+    // every `FormatKey` member — is recognized as terminal, and the
+    // function's inferred return type gains no phantom `| undefined`.
+    const disc_t0 = c.nodeType(d.lhs) orelse (c.checkExprCached(d.lhs, types.no_type) catch return false);
+    const disc_t1 = c.resolveStructural(disc_t0) catch return false;
+    // A whole-enum discriminant is the union of its member types (tsc), so
+    // `switch (e) { case E.A: … case E.B: … }` over every member IS
+    // exhaustive. Expanding here keeps the one covering loop below.
+    const disc_t = if (c.ts.kind(disc_t1) == .enum_type and !c.ts.isEnumMember(disc_t1))
+        ((c.enumMemberTypeUnion(c.ts.enumSymbol(disc_t1), 0) catch return false) orelse return false)
+    else
+        disc_t1;
+    if (c.ts.kind(disc_t) != .union_type) return false;
+    const r = c.tree.extraData(ast.SubRange, d.rhs);
+    for (0..c.ts.memberCount(disc_t)) |mi| {
+        const rm = c.ts.regularLiteral(c.ts.memberAt(disc_t, mi)) catch return false;
+        if (!c.ts.isLiteralLike(rm) and
+            c.ts.kind(rm) != .null and c.ts.kind(rm) != .undefined) return false;
+        var covered = false;
+        for (c.tree.extraRange(r.start, r.end)) |clause| {
+            if (clause == null_node or c.nodeTag(clause) != .case_clause) continue;
+            const test_node = c.tree.nodeData(clause).lhs;
+            if (test_node == 0) continue;
+            // Case-label literals may be unchecked in the return-type probe
+            // (it types only `return` expressions) — synthesize on demand
+            // (memoized) so switch coverage is seen.
+            const tt0 = c.nodeType(test_node) orelse (c.checkExprCached(test_node, types.no_type) catch continue);
+            const tt = c.ts.regularLiteral(tt0) catch continue;
+            if (tt == rm) covered = true;
+        }
+        if (!covered) return false;
+    }
+    return true;
+}
+
+pub fn typeofSwitchIsExhaustive(c: *Checker, sw: Node, operand: Node) bool {
+    const t = c.nodeType(operand) orelse (c.checkExprCached(operand, types.no_type) catch return false);
+    const r = c.tree.extraData(ast.SubRange, c.tree.nodeData(sw).rhs);
+    // For each possible typeof outcome of t, require a covering case.
+    for (0..typeof_names.len) |which| {
+        var possible = false;
+        if (c.ts.kind(t) == .union_type) {
+            for (c.ts.members(t)) |m| {
+                if (c.typeofMatches(m, which)) possible = true;
+            }
+        } else {
+            possible = c.typeofMatches(t, which);
+        }
+        if (!possible) continue;
+        var covered = false;
+        for (c.tree.extraRange(r.start, r.end)) |clause| {
+            if (clause == null_node or c.nodeTag(clause) != .case_clause) continue;
+            const test_node = c.tree.nodeData(clause).lhs;
+            if (test_node == 0) continue;
+            // Case-label literals may be unchecked in the return-type probe
+            // (it types only `return` expressions) — synthesize on demand
+            // (memoized) so switch coverage is seen.
+            const tt0 = c.nodeType(test_node) orelse (c.checkExprCached(test_node, types.no_type) catch continue);
+            const tt = c.ts.regularLiteral(tt0) catch continue;
+            if (c.ts.kind(tt) != .string_literal) continue;
+            if (c.ts.literalAtom(tt) == c.typeof_atoms[which]) covered = true;
+        }
+        if (!covered) return false;
+    }
+    return true;
+}
+
+pub fn containsBreak(c: *Checker, node: Node) bool {
+    if (node == null_node) return false;
+    switch (c.nodeTag(node)) {
+        .break_stmt => return true,
+        // Breaks inside nested loops/switches target those.
+        .while_stmt, .do_stmt, .for_stmt, .for_in_stmt, .for_of_stmt, .switch_stmt => return false,
+        .arrow_fn, .function_expr, .function_decl, .class_decl => return false,
+        else => {},
+    }
+    var it = c.tree.childIterator(node);
+    while (it.next()) |child| {
+        if (c.containsBreak(child)) return true;
+    }
+    return false;
+}
+
+// --- classes / interfaces / aliases ------------------------------------
+
+/// Check a namespace body: enter the (merged) namespace scope and check
+/// each body statement there. Member visibility/typing is materialized by
+/// classStaticType (value) and typeFromQualifiedName (type).
+pub fn checkNamespace(c: *Checker, node: Node) Error!void {
+    const d = c.tree.nodeData(node);
+    const data = c.tree.extraData(ast.NamespaceData, d.lhs);
+    const saved = c.cur_scope;
+    defer c.cur_scope = saved;
+    // The body scope is the one owned by this node, or — for a merged
+    // block whose scope is owned by an earlier block — the namespace
+    // symbol's members scope.
+    if (try c.scopeOf(node)) |s| {
+        c.cur_scope = s;
+    } else if (data.name_token != 0) {
+        const a = try c.atomOfToken(data.name_token);
+        if (c.bind.lookupInScope(saved, a)) |sym| {
+            if (c.bind.namespaceScopeOf(sym)) |ns| c.cur_scope = ns;
+        }
+    }
+    for (c.tree.extraRange(data.body_start, data.body_end)) |stmt| {
+        if (stmt != null_node) try c.checkStatement(stmt);
+    }
+}
+
+pub fn checkClass(c: *Checker, node: Node) Error!void {
+    const d = c.tree.nodeData(node);
+    const data = c.tree.extraData(ast.ClassData, d.lhs);
+    const saved_scope = c.cur_scope;
+    const saved_this = c.this_type;
+    defer {
+        c.cur_scope = saved_scope;
+        c.this_type = saved_this;
+    }
+    if (try c.scopeOf(node)) |s| c.cur_scope = s;
+
+    var class_sym: SymbolId = binder.no_symbol;
+    if (data.name_token != 0) {
+        const a = try c.atomOfToken(data.name_token);
+        if (c.bind.lookupInScope(saved_scope, a)) |sym| {
+            if (c.bind.symbol_flags[sym].class) class_sym = c.toGlobal(sym);
+        }
+    }
+
+    // Instance type for `this` (generic: tp refs as args).
+    var this_t: TypeId = types.any_type;
+    if (class_sym != binder.no_symbol) {
+        var tps: std.ArrayList(TypeParamInfo) = .empty;
+        defer tps.deinit(c.scratch());
+        try c.typeParamsOf(class_sym, &tps);
+        var args = try c.scratch().alloc(TypeId, tps.items.len);
+        for (tps.items, 0..) |tp, i| args[i] = try c.ts.makeTypeParam(tp.sym);
+        this_t = try c.ts.makeRef(class_sym, args);
+        // Eagerly expand so member diagnostics (7006, bad annotations)
+        // fire even for unused classes.
+        _ = try c.resolveStructural(this_t);
+        _ = try c.classStaticType(class_sym);
+        try c.evalTypeParamDecls(class_sym);
+    }
+
+    // Class-position decorators (`@deco class C {}`): evaluated in the
+    // scope surrounding the class, with the enclosing `this`. Snapshot and
+    // clear the pending set first so a nested decorated class inside a
+    // member body cannot re-consume them.
+    if (c.pending_class_decos.items.len > 0) {
+        const decos = try c.scratch().dupe(Node, c.pending_class_decos.items);
+        c.pending_class_decos.clearRetainingCapacity();
+        const saved_ds = c.cur_scope;
+        c.cur_scope = saved_scope;
+        c.this_type = saved_this;
+        const class_val: TypeId = if (class_sym != binder.no_symbol)
+            try c.ts.makeClassValue(class_sym)
+        else
+            types.any_type;
+        for (decos) |deco| {
+            const dt = try c.checkDecorator(deco);
+            try c.checkDecoratorSig(deco, dt, .class, class_val);
+        }
+        c.cur_scope = saved_ds;
+    }
+
+    // extends: base must be a class (checked in baseClassRef); type
+    // args arity checked there too.
+    if (class_sym != binder.no_symbol and data.extends != 0) {
+        _ = try c.baseClassRef(class_sym);
+        const hd = c.tree.nodeData(data.extends);
+        _ = try c.checkExprCached(hd.lhs, types.no_type);
+    }
+
+    // implements clauses: instance assignable to each interface.
+    if (class_sym != binder.no_symbol) {
+        for (c.tree.extraRange(data.impl_start, data.impl_end)) |h| {
+            if (h == null_node or c.nodeTag(h) != .heritage) continue;
+            const hd = c.tree.nodeData(h);
+            var targs: std.ArrayList(TypeId) = .empty;
+            defer targs.deinit(c.scratch());
+            if (hd.rhs != 0) {
+                const rr = c.tree.extraData(ast.SubRange, hd.rhs);
+                for (c.tree.extraRange(rr.start, rr.end)) |an| {
+                    if (an != null_node) try targs.append(c.scratch(), try c.typeFromTypeNode(an));
+                }
+            }
+            const iface = try c.typeFromTypeName(hd.lhs, targs.items);
+            if (iface != types.error_type and iface != types.any_type) {
+                if (!try c.isAssignable(this_t, iface)) {
+                    try c.diagFmt(2420, c.nodeSpan(hd.lhs), "Class '{s}' incorrectly implements interface '{s}'.", .{
+                        c.symbolName(class_sym), try c.typeToString(iface),
+                    });
+                }
+            }
+        }
+    }
+
+    // A concrete class must implement inherited abstract members.
+    if (class_sym != binder.no_symbol) try c.checkAbstractImplementation(class_sym, node);
+
+    const class_is_abstract = data.flags & ast.Flags.abstract != 0;
+
+    // Members.
+    const members = c.tree.extraRange(data.members_start, data.members_end);
+    for (members, 0..) |member, mi| {
+        if (member == null_node) continue;
+        const md = c.tree.nodeData(member);
+        switch (c.nodeTag(member)) {
+            .class_field => {
+                const e = c.tree.extraData(ast.Field, md.lhs);
+                const is_static = e.flags & ast.Flags.static != 0;
+                if (e.flags & ast.Flags.abstract != 0 and !class_is_abstract) {
+                    try c.diagFmt(1244, c.tokSpan(c.tree.nodeMainToken(member)), "Abstract properties can only appear within an abstract class.", .{});
+                }
+                c.this_type = if (is_static and class_sym != binder.no_symbol)
+                    try c.ts.makeClassValue(class_sym)
+                else
+                    this_t;
+                var ann: TypeId = types.no_type;
+                if (e.type_ann != 0) {
+                    const ok = is_static and e.flags & ast.Flags.readonly != 0;
+                    ann = try c.annTypeMaybeUnique(e.type_ann, ok, 1331, c.tokSpan(c.tree.nodeMainToken(member)));
+                }
+                // A `unique symbol` static-readonly field, like a const,
+                // takes only a fresh `Symbol()` initializer without TS2322.
+                if (e.type_ann != 0 and c.nodeTag(e.type_ann) == .unique_symbol_type and e.init != 0 and c.isFreshSymbolCall(e.init)) {
+                    _ = try c.checkExprCached(e.init, ann);
+                    continue;
+                }
+                if (e.init != 0) {
+                    // See `instance_field_init_depth`: an instance field's
+                    // initializer runs at construction time, so a forward
+                    // reference in it is not a TDZ use.
+                    if (!is_static) c.instance_field_init_depth += 1;
+                    defer if (!is_static) {
+                        c.instance_field_init_depth -= 1;
+                    };
+                    const it = try c.checkExprCached(e.init, ann);
+                    if (ann != types.no_type and ann != types.error_type) {
+                        _ = try c.checkAssignable(it, ann, e.init, c.tokSpan(c.tree.nodeMainToken(member)));
+                    }
+                }
+            },
+            .class_method => {
+                const proto = c.tree.extraData(ast.FnProto, md.lhs);
+                const is_static = proto.flags & ast.Flags.static != 0;
+                const is_abstract = proto.flags & ast.Flags.abstract != 0;
+                if (is_abstract and !class_is_abstract) {
+                    try c.diagFmt(1244, c.tokSpan(c.tree.nodeMainToken(member)), "Abstract methods can only appear within an abstract class.", .{});
+                }
+                if (is_abstract and md.rhs != 0) {
+                    try c.diagFmt(1245, c.tokSpan(c.tree.nodeMainToken(member)), "Method '{s}' cannot have an implementation because it is marked abstract.", .{c.tokenText(c.tree.nodeMainToken(member))});
+                }
+                c.this_type = if (is_static and class_sym != binder.no_symbol)
+                    try c.ts.makeClassValue(class_sym)
+                else
+                    this_t;
+                const sig = try c.signatureOfProto(member, md.lhs, true, true);
+                if (md.rhs != 0) {
+                    const is_ctor = !is_static and c.isCtorName(try c.memberAtom(c.tree.nodeMainToken(member)));
+                    const saved_ctor = c.ctor_class_sym;
+                    if (is_ctor) c.ctor_class_sym = class_sym;
+                    defer c.ctor_class_sym = saved_ctor;
+                    try c.checkFunctionBody(member, md.lhs, md.rhs, sig, types.no_type);
+                }
+            },
+            .decorator => {
+                // A member decorator expression is evaluated in the scope
+                // surrounding the class (at class-definition time), so its
+                // `this` is the enclosing `this`, not the instance.
+                c.this_type = saved_this;
+                const dt = try c.checkDecorator(member);
+                // The decorated member is the next non-decorator member.
+                var target: Node = null_node;
+                var k = mi + 1;
+                while (k < members.len) : (k += 1) {
+                    if (members[k] != null_node and c.nodeTag(members[k]) != .decorator) {
+                        target = members[k];
+                        break;
+                    }
+                }
+                if (target != null_node) try c.checkMemberDecoratorSig(member, dt, target, this_t, class_sym);
+            },
+            else => {},
+        }
+    }
+}
+
+/// Type-check a decorator expression (`@expr`) and return its type.
+/// Standard decorators name-resolve and type-check the expression: an
+/// undefined name ⇒ TS2304, and the callee/args of a factory `@f(args)`
+/// are checked. The returned type is the decorator function itself (for a
+/// factory, the call's return type) — the value `checkDecoratorSig` relates
+/// against the expected context-typed decorator signature.
+pub fn checkDecorator(c: *Checker, node: Node) Error!TypeId {
+    const expr = c.tree.nodeData(node).lhs;
+    if (expr == null_node) return types.any_type;
+    return c.checkExprCached(expr, types.no_type);
+}
+
+/// The position a decorator is applied to. Drives which TS12xx code and
+/// which `Class*DecoratorContext` shape apply (tsc §checkDecorators).
+pub const DecoPos = enum { class, method, getter, setter, field, accessor };
+
+pub fn decoCode(pos: DecoPos) u16 {
+    return switch (pos) {
+        .class => 1238, // class decorator
+        .field, .accessor => 1240, // property decorator
+        .method, .getter, .setter => 1241, // method decorator
+    };
+}
+
+pub fn decoContextName(pos: DecoPos) []const u8 {
+    return switch (pos) {
+        .class => "ClassDecoratorContext",
+        .method => "ClassMethodDecoratorContext",
+        .getter => "ClassGetterDecoratorContext",
+        .setter => "ClassSetterDecoratorContext",
+        .field => "ClassFieldDecoratorContext",
+        .accessor => "ClassAccessorDecoratorContext",
+    };
+}
+
+/// Signature check for a class-member decorator: classify the member's
+/// position, build the `value` argument type tsc synthesizes for it, and
+/// relate the decorator against the expected context-typed signature.
+pub fn checkMemberDecoratorSig(c: *Checker, deco: Node, dt: TypeId, target: Node, this_t: TypeId, class_sym: SymbolId) Error!void {
+    const md = c.tree.nodeData(target);
+    var pos: DecoPos = .method;
+    var value: TypeId = types.any_type;
+    switch (c.nodeTag(target)) {
+        .class_field => {
+            const e = c.tree.extraData(ast.Field, md.lhs);
+            if (e.flags & ast.Flags.accessor != 0) {
+                pos = .accessor;
+                // `accessor x` decorators receive a
+                // `ClassAccessorDecoratorTarget<This, Value>`.
+                value = c.decoContextRef("ClassAccessorDecoratorTarget");
+            } else {
+                pos = .field;
+                // Field decorators receive `undefined` as the value.
+                value = types.undefined_type;
+            }
+        },
+        .class_method => {
+            const proto = c.tree.extraData(ast.FnProto, md.lhs);
+            if (proto.flags & ast.Flags.get != 0) {
+                pos = .getter;
+            } else if (proto.flags & ast.Flags.set != 0) {
+                pos = .setter;
+            } else {
+                pos = .method;
+            }
+            const is_static = proto.flags & ast.Flags.static != 0;
+            const saved = c.this_type;
+            c.this_type = if (is_static and class_sym != binder.no_symbol)
+                try c.ts.makeClassValue(class_sym)
+            else
+                this_t;
+            // The value is the member's own function type. Suppress TS7006
+            // here — the member's own pass reports implicit-any.
+            value = c.signatureOfProto(target, md.lhs, true, false) catch types.any_type;
+            c.this_type = saved;
+        },
+        else => return,
+    }
+    try c.checkDecoratorSig(deco, dt, pos, value);
+}
+
+/// Build a `.ref` to a decorator-family lib interface by name (default
+/// type args), or `any` when absent (e.g. `--noLib`).
+pub fn decoContextRef(c: *Checker, name: []const u8) TypeId {
+    const a = c.atom(name) catch return types.any_type;
+    const sym = c.prog.globals.lookup(a) orelse return types.any_type;
+    if (!c.symFlags(sym).interface) return types.any_type;
+    return c.ts.makeRef(sym, &.{}) catch types.any_type;
+}
+
+/// Relate a decorator against the expected `(value, context) => …` shape
+/// for its position and emit TS1238/1240/1241 when no call signature fits
+/// (tsc: "Unable to resolve signature of … decorator when called as an
+/// expression."). Policy: under-report freely, never a false positive —
+/// generic decorators and any/unknown parameter types are always accepted,
+/// and the `value`/`context` relations run only where a mismatch is
+/// unambiguous.
+pub fn checkDecoratorSig(c: *Checker, deco: Node, dt: TypeId, pos: DecoPos, value: TypeId) Error!void {
+    const r = try c.resolveStructural(dt);
+    var sigs: std.ArrayList(TypeId) = .empty;
+    defer sigs.deinit(c.scratch());
+    switch (c.ts.kind(r)) {
+        .any, .unknown, .err => return, // permissive: no reliable shape
+        .function => try sigs.append(c.scratch(), r),
+        .overloads => {
+            for (try c.memberList(r)) |m| try sigs.append(c.scratch(), m);
+        },
+        .object => {
+            if (c.ts.objectCallSigCount(r) == 0) return; // non-callable: under-report
+            for (0..c.ts.objectCallSigCount(r)) |i| {
+                try sigs.append(c.scratch(), c.ts.objectCallSig(r, @intCast(i)));
+            }
+        },
+        else => return, // not callable in a shape we model: under-report
+    }
+    if (sigs.items.len == 0) return;
+
+    // Expected context interface for this position (null under --noLib →
+    // context relation is skipped, value/arity relation still applies).
+    const ctx_atom = c.atom(decoContextName(pos)) catch 0;
+    const ctx_sym: ?SymbolId = if (ctx_atom != 0) c.prog.globals.lookup(ctx_atom) else null;
+
+    for (sigs.items) |sig| {
+        if (try c.decoSigMatches(sig, pos, value, ctx_sym)) return; // some overload fits
+    }
+    const expr = c.tree.nodeData(deco).lhs;
+    const span = if (expr != null_node) c.nodeSpan(expr) else c.nodeSpan(deco);
+    try c.diagFmt(decoCode(pos), span, "Unable to resolve signature of {s} decorator when called as an expression.", .{switch (pos) {
+        .class => "class",
+        .field, .accessor => "property",
+        .method, .getter, .setter => "method",
+    }});
+}
+
+/// Does one decorator call signature accept the runtime `(value, context)`
+/// call? Conservative: a generic signature or any indeterminate parameter
+/// is treated as a match (under-report, never a false positive).
+pub fn decoSigMatches(c: *Checker, sig: TypeId, pos: DecoPos, value: TypeId, ctx_sym: ?SymbolId) Error!bool {
+    // Generic decorators need inference we don't model here — accept.
+    if (c.ts.fnTypeParams(sig).len > 0) return true;
+    // The runtime invokes a decorator with 2 arguments; a signature that
+    // *requires* more can never resolve (tsc: "expects N").
+    if (try c.requiredParams(sig) > 2) return false;
+    // Value argument vs the first parameter.
+    if (try c.paramTypeAt(sig, 0)) |p0| {
+        if (!try c.decoAcceptsValue(pos, value, p0)) return false;
+    }
+    // Context argument vs the second parameter: fail only on an
+    // unambiguous decorator-context kind mismatch.
+    if (ctx_sym != null) {
+        if (try c.paramTypeAt(sig, 1)) |p1| {
+            if (c.decoContextMismatch(p1, ctx_sym.?)) return false;
+        }
+    }
+    return true;
+}
+
+/// True if `value` is acceptable as the first decorator argument for `p0`.
+/// Permissive supertypes (`any`/`unknown`/`object`/`Function`, a matching
+/// context/target ref, or a constructor-typed parameter for a class
+/// decorator) are accepted without an assignability probe so an incomplete
+/// relation cannot produce a false positive.
+pub fn decoAcceptsValue(c: *Checker, pos: DecoPos, value: TypeId, p0: TypeId) Error!bool {
+    switch (c.ts.kind(p0)) {
+        .any, .unknown, .err, .object_keyword => return true,
+        .ref => {
+            const psym = c.ts.refSymbol(p0);
+            if (c.globalSymNamed(psym, "Function")) return true;
+            if (pos == .accessor and c.globalSymNamed(psym, "ClassAccessorDecoratorTarget")) return true;
+        },
+        .object => {
+            // A constructor-typed parameter accepts a class value.
+            if (pos == .class and c.ts.objectConstructSigCount(p0) > 0) return true;
+        },
+        else => {},
+    }
+    if (value == 0 or value == types.error_type or value == types.any_type) return true;
+    return c.isAssignable(value, p0);
+}
+
+/// True when `p1` is a ref to a *different* decorator-context interface
+/// than expected (e.g. `ClassMethodDecoratorContext` where a class
+/// decorator wants `ClassDecoratorContext`). Anything else (a union like
+/// `DecoratorContext`, `any`, an unrelated type) is accepted.
+pub fn decoContextMismatch(c: *Checker, p1: TypeId, ctx_sym: SymbolId) bool {
+    if (c.ts.kind(p1) != .ref) return false;
+    const psym = c.ts.refSymbol(p1);
+    const family = [_][]const u8{
+        "ClassDecoratorContext",       "ClassMethodDecoratorContext",
+        "ClassGetterDecoratorContext", "ClassSetterDecoratorContext",
+        "ClassFieldDecoratorContext",  "ClassAccessorDecoratorContext",
+    };
+    for (family) |name| {
+        if (c.globalSymNamed(psym, name)) return psym != ctx_sym;
+    }
+    return false;
+}
+
+/// Is `sym` the global interface/type named `name`?
+pub fn globalSymNamed(c: *Checker, sym: SymbolId, name: []const u8) bool {
+    const a = c.atom(name) catch return false;
+    const g = c.prog.globals.lookup(a) orelse return false;
+    return g == sym;
+}
+
+pub fn checkInterfaceDecl(c: *Checker, node: Node) Error!void {
+    // Eagerly expand so member-type diagnostics (2304 in bodies, 7006 in
+    // method signatures) fire even for unused interfaces.
+    const d = c.tree.nodeData(node);
+    const data = c.tree.extraData(ast.InterfaceData, d.lhs);
+    if (data.name_token == 0) return;
+    const a = try c.atomOfToken(data.name_token);
+    const saved = c.cur_scope;
+    defer c.cur_scope = saved;
+    if (c.bind.lookupInScope(c.cur_scope, a)) |sym| {
+        if (c.bind.symbol_flags[sym].interface) {
+            _ = try c.interfaceGeneric(c.toGlobal(sym));
+            try c.evalTypeParamDecls(c.toGlobal(sym));
+        }
+    }
+}
+
+pub fn checkTypeAliasDecl(c: *Checker, node: Node) Error!void {
+    const d = c.tree.nodeData(node);
+    const data = c.tree.extraData(ast.TypeAlias, d.lhs);
+    if (data.name_token == 0) return;
+    const a = try c.atomOfToken(data.name_token);
+    if (c.bind.lookupInScope(c.cur_scope, a)) |sym| {
+        if (c.bind.symbol_flags[sym].type_alias) {
+            _ = try c.aliasGeneric(c.toGlobal(sym));
+            try c.evalTypeParamDecls(c.toGlobal(sym));
+        }
+    }
+}
+
+/// Eagerly evaluate type-parameter constraint/default annotations of a
+/// generic declaration so their diagnostics fire during the owner's
+/// file walk (partition-independent output; lazy paths only reach them
+/// on instantiation).
+pub fn evalTypeParamDecls(c: *Checker, sym: SymbolId) Error!void {
+    var tps: std.ArrayList(TypeParamInfo) = .empty;
+    defer tps.deinit(c.scratch());
+    try c.typeParamsOf(sym, &tps);
+    for (tps.items) |tp| {
+        // The constraint/default nodes belong to the *type parameter's*
+        // declaring file, which for a merged interface need not be the
+        // merged symbol's representative file (see `fixTypeArgs`).
+        const saved = c.enterSymFile(tp.sym);
+        defer c.restoreCtx(saved);
+        c.cur_scope = c.symScope(tp.sym);
+        if (tp.constraint != 0) _ = try c.typeFromTypeNode(tp.constraint);
+        if (tp.default != 0) _ = try c.typeFromTypeNode(tp.default);
+    }
+}
