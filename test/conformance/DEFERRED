@@ -194,16 +194,6 @@ inference/094_contextual_this_parameter.ts  -TS2322 51
 # lines 12/14/16/20 — what the case is actually about — all match.
 inference/100_literal_ctx_through_intersection_param_negatives.ts  -TS2353 25
 
-# Reading a property off an intersection whose members include a still-GENERIC
-# mapped type answers from that mapped type instead of reporting TS2339: ztsc's
-# `propOfType` synthesizes a member for any name on `Partial<Record<T, any>>`,
-# where tsc's `getPropertyOfType` has no members at all until `T` is known. The
-# `in`-narrowing side of the same question IS handled (`propDeclaredForIn`, the
-# subject of case 060); the READ side is a wider change to property lookup.
-# Pre-existing and deterministic: the base binary is identically silent here,
-# and line 13 — the same read on the other branch — still reports.
-narrowing/061_in_narrow_generic_mapped_constituent_negatives.ts  -TS2339 21
-
 # ztsc's conditional-TARGET rule ("the source must satisfy whichever branch the
 # conditional resolves to, so require it against both") is a general
 # assignability rule. tsc applies the same rule only in a RETURN position — the

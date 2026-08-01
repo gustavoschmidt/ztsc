@@ -219,6 +219,11 @@ pub fn propOfTypeEx(c: *Checker, t: TypeId, name: Atom, allow_index: bool) Error
             // structural relation must not invent members a still-generic
             // map does not have.
             if (!allow_index) return null;
+            // …and neither may member access, when the map's KEY DOMAIN is
+            // itself still generic (`mappedKeysStillGeneric`): tsc's
+            // `getPropertyOfType` then has no members at all, so every name
+            // is TS2339.
+            if (try mappedKeysStillGeneric(c, t)) return null;
             if (s.mappedHomomorphic(t)) {
                 const src = s.mappedSource(t);
                 const bc = try c.transitiveBaseConstraint(src);
@@ -277,6 +282,88 @@ pub fn propOfTypeEx(c: *Checker, t: TypeId, name: Atom, allow_index: bool) Error
         // the global `Function` interface.
         .function, .overloads => return c.functionInterfaceProp(name),
         else => return null,
+    }
+}
+
+/// Does this deferred mapped type's KEY DOMAIN stay generic — i.e. would
+/// tsc's `resolveMappedTypeMembers` produce no members at all for it?
+///
+/// tsc iterates `getLowerBoundOfKeyType(constraintType)` and only makes a
+/// member for a key that is usable as a property name. A key type that is
+/// still a naked type parameter is neither a literal nor a valid index key,
+/// so the map contributes NOTHING to a named lookup — `Record<T, any>`,
+/// `Pick<Base, K>` and `{ [P in K]: … }` all report TS2339 for every name
+/// until `K`/`T` is known. Only `keyof X` gets the apparent-type treatment
+/// (`getIndexType(getApparentType(X))`), which is what makes the members of
+/// a homomorphic `Partial<T>` visible through `T`'s constraint.
+///
+/// Answers "generic" only when tsc would too: anything unrecognized is
+/// reported concrete, so the existing base-constraint route below still runs
+/// and no name that resolves today starts failing.
+fn mappedKeysStillGeneric(c: *Checker, t: TypeId) Error!bool {
+    // A homomorphic map stores `X` (of `keyof X`) as its source, not the
+    // `keyof` node; its key domain is exactly `keyof src`.
+    if (c.ts.mappedHomomorphic(t)) return keyofStillGeneric(c, c.ts.mappedSource(t), 0);
+    return keyDomainStillGeneric(c, c.ts.mappedConstraint(t), 0);
+}
+
+/// `getLowerBoundOfKeyType` on a mapped type's constraint, asked only for
+/// "does this land on a concrete set of names?".
+fn keyDomainStillGeneric(c: *Checker, con: TypeId, depth: u32) Error!bool {
+    if (depth > 8 or con == types.no_type) return false;
+    const s = &c.ts;
+    const r = try c.resolveStructural(con);
+    switch (s.kind(r)) {
+        .keyof_op => return keyofStillGeneric(c, s.keyofOperand(r), depth + 1),
+        // A naked type parameter is returned unchanged by
+        // `getLowerBoundOfKeyType` — its CONSTRAINT is never consulted, so
+        // `Record<T, any>` has no members even for `T extends "a" | "b"`.
+        .type_param => return true,
+        // A constituent with a concrete key set still contributes its names
+        // (`Partial<Record<T, number> & Base>` resolves `x` through `Base`),
+        // so only an all-generic union/intersection is empty.
+        .union_type, .intersection => {
+            for (0..s.memberCount(r)) |i| {
+                if (!try keyDomainStillGeneric(c, s.memberAt(r, i), depth + 1)) return false;
+            }
+            return true;
+        },
+        // A distributive conditional is re-instantiated with the lower bound
+        // of its CHECK type, so `Omit<T, "y">` — `Exclude<keyof T, "y">` —
+        // resolves exactly when `keyof T` does.
+        .conditional => return keyDomainStillGeneric(c, s.condCheck(r), depth + 1),
+        else => return false,
+    }
+}
+
+/// `getIndexType(getApparentType(t))`, asked the same way: are the keys of
+/// `t` a concrete set of names?
+fn keyofStillGeneric(c: *Checker, t: TypeId, depth: u32) Error!bool {
+    if (depth > 8) return false;
+    const s = &c.ts;
+    const r = try c.resolveStructural(t);
+    switch (s.kind(r)) {
+        // The apparent type of a type variable is its constraint; an
+        // unconstrained `T` has no keys to speak of.
+        .type_param => {
+            const con = try c.typeParamConstraint(s.typeParamSymbol(r));
+            if (con == types.no_type) return true;
+            return keyofStillGeneric(c, con, depth + 1);
+        },
+        // `keyof` a mapped type IS that map's key domain — tsc's
+        // `getIndexTypeForMappedType` returns its constraint. This is what
+        // separates `Partial<Partial<T>>` (composes down to `keyof T`, so
+        // `T`'s constraint supplies the names) from
+        // `Partial<Record<T, any>>` (whose inner key domain is the naked
+        // `T`, so the whole thing has no members).
+        .mapped => return mappedKeysStillGeneric(c, r),
+        .union_type, .intersection => {
+            for (0..s.memberCount(r)) |i| {
+                if (!try keyofStillGeneric(c, s.memberAt(r, i), depth + 1)) return false;
+            }
+            return true;
+        },
+        else => return false,
     }
 }
 
