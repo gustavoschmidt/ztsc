@@ -78,33 +78,6 @@ directives/012_ts_expect_error_unused.ts  -TS2578 7
 assignability/065_callback_parameter_variance.ts  -TS2322 25
 assignability/065_callback_parameter_variance.ts  -TS2322 74
 
-# TS2502 ("referenced directly or indirectly in its own type annotation") is
-# not implemented. A member whose annotation indexes at itself is genuinely
-# circular; `lazyRefProp` detects the re-entry and cuts it, but the cut is
-# silent — it falls back to the ordinary property-not-found result rather than
-# reporting. Deterministic under-report of a whole check. The case exists to
-# pin the CUT: without it the lazy single-member lookup would recur forever,
-# and the non-circular self-index in the same file (line 23) proves the
-# lookup itself still resolves.
-indexed/021_self_referential_member_annotation.ts  -TS2502 7
-indexed/021_self_referential_member_annotation.ts  -TS2502 11
-indexed/021_self_referential_member_annotation.ts  -TS2502 12
-
-# The three circularity reports for a class member reached from its own body
-# — TS7023 (inferred return type), TS7022 (inferred field type), TS2729 (field
-# read before its initialization) — are not implemented. The same silent cut as
-# TS2502 above: `lazyRefProp` detects the re-entry and falls back to the
-# ordinary not-found path rather than naming the cycle. Deterministic
-# under-reports of whole checks; the case exists to pin the cut (without it the
-# lookup recurs forever), and the non-circular member on line 57 proves the
-# lookup still resolves.
-classes/062_inferred_return_this_cycle.ts  -TS7023 18
-classes/062_inferred_return_this_cycle.ts  -TS7023 25
-classes/062_inferred_return_this_cycle.ts  -TS7023 28
-classes/062_inferred_return_this_cycle.ts  -TS7022 35
-classes/062_inferred_return_this_cycle.ts  -TS2729 35
-classes/062_inferred_return_this_cycle.ts  -TS2729 41
-
 # A rest parameter typed by a UNION is modelled per POSITION at a CALL: each
 # argument position gets the union of the constituents' element types (tsc's
 # `getIndexedAccessType(restType, number)`), widened by `undefined` where some

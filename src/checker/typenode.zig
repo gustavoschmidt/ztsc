@@ -1416,6 +1416,20 @@ pub fn indexedAccessType(c: *Checker, obj: TypeId, idx: TypeId) Error!TypeId {
     // class). The whole-table expansion cannot answer, but the single
     // member can — see `lazyRefProp`.
     if (c.ts.kind(idx) == .string_literal and c.refExpansionActive(obj)) {
+        // An access on a GENERIC object is one tsc never performs here: it
+        // answers with a deferred `IndexedAccessType` and resolves the
+        // property only once the object is instantiated with real arguments,
+        // by which time the member's own type exists. ztsc resolves it
+        // eagerly, so a member reached this way can re-enter its own
+        // resolution where tsc never would (`readonly _: { …; inferSelect:
+        // Infer<Table<T>> }`, where `Infer` indexes `Table<T>['_']`). The
+        // lookup is unchanged — the cut answers as it always did — but a
+        // circle closed under one of these must not be *named*. Only the
+        // object is recorded here; whether it is generic is asked on the
+        // cycle path alone (`lazy_index_objs`), which costs the hot path a
+        // push and a pop.
+        try c.lazy_index_objs.append(c.cm(), obj);
+        defer _ = c.lazy_index_objs.pop();
         if (try c.lazyRefProp(obj, c.ts.literalAtom(idx), 0)) |p| {
             return if (p.optional() and !c.homo_index_mode) c.makeUnion2(p.ty, types.undefined_type) else p.ty;
         }

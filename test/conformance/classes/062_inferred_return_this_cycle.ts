@@ -5,12 +5,12 @@
 // member" for one already on that stack, so each shape below falls back to the
 // ordinary not-found path after at most one pass per member.
 //
-// The cut is silent. tsc names the circularity (TS7023 for a return type,
-// TS7022 for an initializer, TS2729 for a field read before its
-// initialization); ztsc implements none of the three, so those are recorded in
-// DEFERRED as deterministic under-reports. The case exists to pin the CUT —
-// without it these hang — and the non-circular members in the same file prove
-// the lookup itself still resolves.
+// The cut is named, not silent: `memberTypeOf` sees a member re-enter its own
+// resolution and reports the circle tsc reports — TS7023 for an inferred
+// return type, TS7022 for an inferred field type — beside TS2729 for a field
+// read before its initialization. The case still pins the CUT — without it
+// these hang — and the non-circular members in the same file prove the
+// lookup itself still resolves.
 declare function use(x: unknown): void;
 
 // Direct self-reference through a call.

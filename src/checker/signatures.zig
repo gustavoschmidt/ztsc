@@ -1745,8 +1745,84 @@ pub fn functionSymbolType(c: *Checker, sym: SymbolId) Error!TypeId {
     return c.ts.makeOverloads(sigs.items);
 }
 
+/// The three circularity reports for a member whose own type turned out to
+/// need itself. `cycle` is the slice of the member-resolution stack from the
+/// re-entered member to the top — every member on the circle, so the report
+/// set is a function of the circle and not of whichever member the traversal
+/// happened to demand first (tsc reports on all of them likewise).
+///
+/// Which of the three a member takes is decided by its *own* declaration,
+/// because that is what the circle runs through:
+///
+///   - a member with a type ANNOTATION can only be circular through that
+///     annotation (`a: A["a"]`) → TS2502;
+///   - an unannotated method/accessor is circular through its inferred
+///     RETURN type (`m() { return this.m(); }`) → TS7023;
+///   - an unannotated field is circular through its INITIALIZER
+///     (`p = this.p`) → TS7022.
+///
+/// The last two are implicit-`any` reports, so they follow `noImplicitAny`
+/// like their siblings. Anything else (a parameter property, a member with
+/// no declaration node of a shape handled here) reports nothing: the cut
+/// itself is unchanged, so silence is the pre-existing behaviour.
+fn reportMemberCycle(c: *Checker, cycle: []const SymbolId) Error!void {
+    // A circle that only closed because an indexed access tsc defers was
+    // taken eagerly is not tsc's circle — see `lazy_index_objs`.
+    for (c.lazy_index_objs.items) |obj| {
+        if (try c.containsTypeParam(obj)) return;
+    }
+    for (cycle) |msym| {
+        const saved = c.enterSymFile(msym);
+        defer c.restoreCtx(saved);
+        const decls = c.declsOf(msym);
+        if (decls.len == 0) continue;
+        const decl = decls[0];
+        const d = c.tree.nodeData(decl);
+        const name_span = c.tokSpan(c.tree.nodeMainToken(decl));
+        const name = c.tokenText(c.tree.nodeMainToken(decl));
+        switch (c.nodeTag(decl)) {
+            .class_field => {
+                const e = c.tree.extraData(ast.Field, d.lhs);
+                if (e.type_ann != 0) {
+                    try c.diagFmt(2502, name_span, "'{s}' is referenced directly or indirectly in its own type annotation.", .{name});
+                } else if (c.prog.no_implicit_any) {
+                    try c.diagFmt(7022, name_span, "'{s}' implicitly has type 'any' because it does not have a type annotation and is referenced directly or indirectly in its own initializer.", .{name});
+                }
+            },
+            .property_signature => {
+                if (d.lhs != 0) {
+                    try c.diagFmt(2502, name_span, "'{s}' is referenced directly or indirectly in its own type annotation.", .{name});
+                }
+            },
+            .class_method, .method_signature => {
+                const proto = c.tree.extraData(ast.FnProto, d.lhs);
+                if (proto.return_type != 0) {
+                    try c.diagFmt(2502, name_span, "'{s}' is referenced directly or indirectly in its own type annotation.", .{name});
+                } else if (c.prog.no_implicit_any) {
+                    try c.diagFmt(7023, name_span, "'{s}' implicitly has return type 'any' because it does not have a return type annotation and is referenced directly or indirectly in one of its return expressions.", .{name});
+                }
+            },
+            else => {},
+        }
+    }
+}
+
 /// Type of a class/interface member symbol (unsubstituted).
 pub fn memberTypeOf(c: *Checker, sym: SymbolId) Error!TypeId {
+    // A member whose type demands itself: `a: A["a"]` through the lazy
+    // single-member lookup, `m() { return this.m(); }` through the
+    // reserved-signature slot, `p = this.p` through both. Every one of
+    // those cuts the recursion *below* this frame (the caller's not-found
+    // path / the placeholder signature) and stays silent; naming the circle
+    // is this report. Detection only — the cut, and therefore termination,
+    // is exactly as before.
+    for (c.member_type_stack.items, 0..) |m, i| {
+        if (m != sym) continue;
+        try reportMemberCycle(c, c.member_type_stack.items[i..]);
+        break;
+    }
+    try c.member_type_stack.append(c.cm(), sym);
+    defer _ = c.member_type_stack.pop();
     const saved = c.enterSymFile(sym);
     defer c.restoreCtx(saved);
     c.cur_scope = c.symScope(sym);
