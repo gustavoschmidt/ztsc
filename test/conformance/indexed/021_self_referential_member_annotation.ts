@@ -1,8 +1,8 @@
 // The negative direction of 019/020: a member whose own annotation indexes at
 // itself is genuinely circular, and the lazy single-member lookup must not
-// chase it. tsc reports TS2502; ztsc cuts the recursion and stays silent (a
-// registered under-report — see DEFERRED). What this case pins is that the cut
-// still happens: the file has to terminate rather than recur forever.
+// chase it. The cut names the circle as tsc's TS2502 (`reportMemberCycle`),
+// and what this case also pins is that the cut still HAPPENS: the file has
+// to terminate rather than recur forever.
 class A {
   a: A["a"] = null as any;
 }

@@ -465,6 +465,7 @@ pub const map_containers = [_][]const u8{
     "infer_scopes",             "mapped_key_ids",     "inst_diag_at",
     "infer_active",             "lazy_member_active", "chain_guards",
     "never_isect",              "deep_path_list",     "deep_path_ids",
+    "member_type_stack",        "lazy_index_objs",
 };
 
 pub const Checker = struct {
@@ -661,6 +662,22 @@ pub const Checker = struct {
     /// C["a"] }`) is genuinely circular; re-entry returns null so the caller
     /// falls back to the ordinary not-found result instead of recursing.
     lazy_member_active: std.AutoHashMapUnmanaged(SymbolId, void) = .empty,
+    /// Member symbols whose type `memberTypeOf` is computing, innermost last
+    /// (both the eager whole-table walk and the lazy single-member lookup push
+    /// here). A member that re-appears is one whose type demanded itself; the
+    /// slice from its first occurrence to the top is exactly the circle, which
+    /// `reportMemberCycle` names (TS2502 / TS7022 / TS7023). Reporting only —
+    /// the recursion is cut where it always was.
+    member_type_stack: std.ArrayListUnmanaged(SymbolId) = .empty,
+    /// Object types of the single-member indexed accesses currently in flight
+    /// (`C["m"]` taken while `C`'s own table is materializing). A GENERIC one
+    /// is an access tsc defers — it answers with an unresolved
+    /// `IndexedAccessType` and looks no member up — so a resolution circle
+    /// that only closes through it is not a circle tsc ever sees, and
+    /// `reportMemberCycle` stays silent. Kept as the raw object types so the
+    /// genericity question is asked only when a circle is actually found; the
+    /// lookup and its cut are unaffected either way.
+    lazy_index_objs: std.ArrayListUnmanaged(TypeId) = .empty,
     /// Class symbol -> its *structural* constructor object (statics + construct
     /// signatures returning the instance). See `classConstructType`.
     class_ctor_cache: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
