@@ -204,31 +204,6 @@ inference/100_literal_ctx_through_intersection_param_negatives.ts  -TS2353 25
 # and line 13 — the same read on the other branch — still reports.
 narrowing/061_in_narrow_generic_mapped_constituent_negatives.ts  -TS2339 21
 
-# ztsc's conditional-TARGET rule ("the source must satisfy whichever branch the
-# conditional resolves to, so require it against both") is a general
-# assignability rule. tsc applies the same rule only in a RETURN position — the
-# 5.8 "checked returns for conditional types" feature — and rejects an identical
-# assignment in a variable declaration. Case 035 pins the exact extent of the
-# leniency: the four `decl*` rows below are accepted by ztsc and rejected by
-# tsc, while every RETURN row and the miss-a-branch row (41) agree.
-# Pre-existing for object, union and primitive sources (the base binary is
-# identically silent on 22/26/34); line 30 joined them when the intersection
-# source stopped being answered `false` before it could reach the rule, which is
-# what made a UNION OF INTERSECTIONS unable to meet a conditional spelled with
-# that very union. A deterministic under-report on all four.
-conditional/035_deferred_conditional_target_leniency.ts  -TS2322 22
-conditional/035_deferred_conditional_target_leniency.ts  -TS2322 26
-conditional/035_deferred_conditional_target_leniency.ts  -TS2322 30
-conditional/035_deferred_conditional_target_leniency.ts  -TS2322 34
-
-# Same root as the 035 block: an intersection source now reaches the general
-# conditional-target rule, and `Radians` satisfies both branches of
-# `T extends 0 ? Radians : Radians`. tsc rejects it here (declaration position)
-# and accepts it in a return position; this case only exercises the declaration
-# half. The `T extends 0 ? string : string` row on line 28 — the case's actual
-# negative — still reports.
-assignability/066_intersection_source_deferred_target.ts  -TS2322 27
-
 # A property read on `never` is not reported. ztsc's member-access path treats
 # `never` as permissive (it is assignable to everything, so a read off it can
 # never widen a later error), and reporting it would need a dedicated arm.

@@ -2367,6 +2367,107 @@ pub fn checkAssignable(c: *Checker, src_t: TypeId, target: TypeId, expr_node: No
     return false;
 }
 
+/// The conditional-TARGET leniency ("the source must satisfy whichever
+/// branch the conditional resolves to, so require it against both") is not
+/// universal in tsc. `structuredTypeRelatedTo` applies it only when the
+/// conditional is not *distribution dependent*, and that predicate
+/// (`isTypeParameterPossiblyReferenced`) is deliberately conservative about
+/// SYNTAX: for a DISTRIBUTIVE conditional — a naked type-parameter check —
+/// tsc answers "possibly referenced", hence "distribution dependent", for
+/// any occurrence separated from the check parameter's own declaration by a
+/// statement BLOCK. An inline `T extends … ? A : B` written as the
+/// annotation of a `const` inside the generic function's body is exactly
+/// that shape, so tsc rejects it; the same conditional spelled as the
+/// function's RETURN annotation (or a parameter's, or a class property's, or
+/// through a type ALIAS whose root lives in the alias declaration) is not
+/// separated by a block, keeps the leniency, and is accepted.
+///
+/// Mirror the syntactic half of the rule where it is decidable: an inline
+/// conditional TYPE NODE used as a declaration's annotation. `ann_node` is
+/// that annotation node, so alias references (`Exclude<T, null>`, a custom
+/// `PathValue<T, K>`) are untouched and keep today's leniency, as do
+/// non-distributive checks (`[T] extends [true] ? A : B`), which tsc is
+/// lenient about in every position.
+///
+/// Returns true when the assignment must be rejected despite `isAssignable`
+/// having accepted it through the both-branches rule.
+pub fn inlineCondAnnRejects(c: *Checker, ann_node: Node, src_t: TypeId, target: TypeId) Error!bool {
+    if (ann_node == 0) return false;
+    var n = ann_node;
+    while (c.nodeTag(n) == .paren_type) n = c.tree.nodeData(n).lhs;
+    if (c.nodeTag(n) != .conditional_type) return false;
+    const t = try c.ts.regular(target);
+    // Still a conditional ⇒ still deferred: a conditional whose check type
+    // is known has already resolved to one of its branches, and normal
+    // assignability decided the question.
+    if (c.ts.kind(t) != .conditional) return false;
+    // Only a DISTRIBUTIVE conditional — one whose check is a naked type
+    // parameter — is treated as distribution dependent by tsc's syntactic
+    // rule. An `infer`-var check is a different (enclosing-conditional)
+    // shape; leave it lenient.
+    if (!c.ts.condDistributive(t)) return false;
+    if (c.ts.kind(c.ts.condCheck(t)) != .type_param) return false;
+    return c.condStrictSourceRejects(src_t, 0);
+}
+
+/// Would `src` relate to a deferred conditional target only through the
+/// both-branches leniency? True for a CONCRETE source (an object, a
+/// primitive, an intersection of them …), false for every source that has
+/// its own rule against a conditional target — the identical conditional, a
+/// type parameter reaching it through its constraint, another still-deferred
+/// form, and the universally-related `any`/`never`/error types. Deliberately
+/// a conservative allow-list of the concrete kinds: anything unrecognized
+/// answers "no rejection", which leaves the existing (lenient) verdict.
+pub fn condStrictSourceRejects(c: *Checker, src_t: TypeId, depth: u32) Error!bool {
+    if (depth > 4) return false;
+    const s = try c.ts.regular(try c.ts.regularLiteral(src_t));
+    switch (c.ts.kind(s)) {
+        .string,
+        .number,
+        .boolean,
+        .bigint,
+        .symbol,
+        .object_keyword,
+        .undefined,
+        .null,
+        .void,
+        .bool_true,
+        .bool_false,
+        .string_literal,
+        .number_literal,
+        .number_literal_fresh,
+        .bigint_literal,
+        .array,
+        .tuple,
+        .object,
+        .function,
+        .overloads,
+        .class_value,
+        .enum_type,
+        .unique_symbol,
+        .template_literal_type,
+        .string_mapping,
+        => return true,
+        // Every constituent must be concrete: one that relates for its own
+        // reasons (a type parameter, the conditional itself) keeps the
+        // whole union lenient.
+        .union_type, .intersection => {
+            for (try c.memberList(s)) |m| {
+                if (!try c.condStrictSourceRejects(m, depth + 1)) return false;
+            }
+            return c.ts.memberCount(s) > 0;
+        },
+        // A named reference is whatever it expands to (an alias for a
+        // conditional must stay lenient).
+        .ref => {
+            const r = try c.resolveStructural(s);
+            if (r == s) return false;
+            return c.condStrictSourceRejects(r, depth + 1);
+        },
+        else => return false,
+    }
+}
+
 /// `expr satisfies T`: same relation as `checkAssignable`, but a
 /// top-level failure is reported as TS1360 ("does not satisfy the
 /// expected type") rather than TS2322/2741. Nested member mismatches
