@@ -18,13 +18,30 @@
 # stops describing reality (ztsc started emitting a `-` line, stopped emitting
 # a `+` line, the oracle dropped a `-` line, or the case is gone). It cannot be
 # used to hide a regression.
+#
+# What the registry cannot check is whether an entry's REASON is still true, so
+# every block below carries the date its rationale was last measured against
+# the oracle. Full triage: 2026-08-02 (B4). Every remaining entry is a
+# deliberate under-report whose alternative was measured to cost more than it
+# buys — a false positive on correct code in every case where the alternative
+# was reachable enough to measure.
 
-# TS2589 at the structural-relation recursion cap. ztsc's cap assumes the
-# relation and stays silent rather than reporting at the cap, because reporting
-# there would false-positive genuinely-valid deep recursive types the oracle
-# accepts (real form-library `PathValue` shapes). Deliberate, deterministic
-# under-report; the cases exist to prove these inputs keep checking without
-# stack-overflowing. See the comment in each case file.
+# TS2589 at a recursion cap. ztsc's caps assume the relation and stay silent
+# rather than reporting where they cut. They are RESOURCE bounds, not semantic
+# ones — `max_relation_depth`, `max_chain_repeats` and (since B1)
+# `max_relation_identity_repeats`, all in `src/checker.zig` — and their shape
+# is not tsc's `instantiationDepth`/`instantiationCount` budget, so a report at
+# ztsc's cut fires on inputs tsc accepts. Assuming the relation is the only
+# direction at a resource bound that cannot manufacture a false positive; the
+# cases exist to prove these inputs keep checking, deterministically, without
+# stack-overflowing.
+#
+# How reachable the caps are, measured 2026-08-02 by flipping the
+# `max_relation_depth` cut's answer from "related" to "unrelated" and diffing:
+# exactly ONE conformance case changes (003, the case built to trip it), and
+# nothing changes on the 16-package corpus or on excalidraw.
+# So the caps are nowhere near live code today — which is the argument for
+# leaving them silent, not against it. See the comment in each case file.
 instantiation/003_recursive_alias_relation_cap.ts  -TS2589 19
 instantiation/010_growing_bareref_no_eager_expand.ts  -TS2589 12
 
@@ -36,11 +53,27 @@ instantiation/018_growing_template_hole_no_loop.ts  -TS2589 16
 
 # TS2578 ("Unused '@ts-expect-error' directive") is not implemented. The
 # suppression half of `@ts-expect-error` is; the unused report is not, because
-# it is only sound on a checker that reports everything the oracle does. ztsc
-# deliberately under-reports in places, so a directive the oracle considers used
-# can look unused here, and TS2578 on that basis would be a false positive on
-# correct code — the one thing project policy forbids. Deterministic
-# under-report of a whole check.
+# it is only sound on a checker that reports everything the oracle does: it
+# fires precisely when a directive suppressed nothing, so it is built on
+# ztsc's own report set rather than on the oracle's.
+#
+# Re-examined 2026-08-02, after under-reports reached zero on all eight parity
+# packages and on excalidraw. Zero *there* is not zero: every remaining entry
+# in this file is a line where the oracle considers a directive used and ztsc
+# would consider it unused — a numeric-literal key (`constassert/006`), a cast
+# through a deferred `T[K]` (`indexed/032`), a callback-parameter direction
+# (`assignability/065`), TS2589 at a recursion cap (`instantiation/003`, `010`,
+# `018`), a still-deferred type argument (`instantiation/052`). TS2578 on that
+# basis is a false positive on correct code — the one thing project policy
+# forbids — so the prerequisite is unchanged: this file empty of `-` entries,
+# not a clean scoreboard on one corpus.
+#
+# `directives/013_ts_expect_error_over_under_report.ts` makes that concrete
+# and executable: two directives over diagnostics ztsc deliberately does not
+# make, where the oracle reports nothing and so must ztsc. Implement TS2578
+# before closing those under-reports and that case fails with a `+TS2578`.
+#
+# Deterministic under-report of a whole check.
 directives/012_ts_expect_error_unused.ts  -TS2578 7
 
 # The callback-parameter relation is ADDITIVE in ztsc, where tsc makes it the
@@ -50,12 +83,26 @@ directives/012_ts_expect_error_unused.ts  -TS2578 7
 # directions tsc rejects *because* the callback relation is exclusive are
 # under-reported: a method callback related in the contravariant direction
 # (line 25), and a callback nested one level deeper, which tsc relates
-# strictly (line 74). Made exclusive, the rule also rejects pairs
-# whole-signature bivariance accepted, and every such case measured across the
-# 16-package corpus was an unrelated inference gap surfacing
-# (`Observable<unknown>` where tsc infers `Observable<number>`) — i.e. it would
-# trade this fix for a batch of false positives, which policy forbids. The 7
-# positives in the same case prove the relation itself is in place.
+# strictly (line 74).
+#
+# Re-measured 2026-08-02, after the B1 relation work (memo-key
+# canonicalization, the growing-instantiation guard, measured variance) — the
+# fixes that were the standing reason to re-evaluate. Making the rule
+# exclusive (the fall-through below `signatureAssignableMode`'s callback arm
+# replaced by `return false`) does fix exactly these two lines and regresses
+# no other conformance case, but it still costs more than it buys: on the
+# 16-package corpus it is byte-identical on fifteen packages and adds TEN new
+# false positives on rxjs 7.8.1 —
+#
+#   Notification.ts:180, concatWith.ts:47, delayWhen.ts:98, elementAt.ts:62,
+#   first.ts:86, ignoreElements.ts:42, last.ts:84, mergeWith.ts:48,
+#   onErrorResumeNextWith.ts:93 (TS2322) and catchError.ts:117 (TS2345)
+#
+# — every one of them the same unrelated inference gap the exclusivity merely
+# surfaces: ztsc infers `Observable<unknown>` / `OperatorFunction<…, unknown>`
+# where tsc infers the element type. The prerequisite is that inference gap,
+# not the relation. The 7 positives in the same case prove the callback
+# relation itself is in place.
 assignability/065_callback_parameter_variance.ts  -TS2322 25
 assignability/065_callback_parameter_variance.ts  -TS2322 74
 
@@ -65,22 +112,41 @@ assignability/065_callback_parameter_variance.ts  -TS2322 74
 # constraint to answer for every key the index constraint admits. Reducing it
 # structurally instead — substituting each parameter's constraint — also
 # collapses the shapes tsc leaves deferred, and then rejects casts tsc accepts
-# (`s as T[K]` under `T extends { a: number; b: number }`, plus four more in
-# 031). Trading one deterministic under-report for five false rejections is the
-# standing policy direction. Line 14, whose operands are not deferred, still
-# reports.
+# (`s as T[K]` under `T extends { a: number; b: number }`, among others).
+# Re-measured 2026-08-02 by removing the concession from `castComparableRec`:
+# ztsc then reports SIX TS2352 on `indexed/031`, whose oracle snapshot is
+# empty — six false rejections to gain the one true report below. Trading a
+# deterministic under-report for that is the standing policy direction.
+# (`castComparableRec`'s own doc comment still says "four more shapes
+# besides", the count measured when the concession landed; the case grew a
+# sixth cast since.) Line 14, whose operands are not deferred, still reports.
 indexed/032_cast_to_deferred_indexed_access_negatives.ts  -TS2352 8
 
 # A NUMBER-literal key that names no member is not reported. The string-literal
 # arm of element access reports the implicit-'any' miss (TS7053); the numeric
 # arm falls back to the receiver's numeric index signature, which for an object
 # without one is `any`, silently. Reporting there needs the numeric key space to
-# be modelled as exactly as the named one is — arrays, tuples, enum-keyed maps
-# and lib types all index numerically through paths ztsc approximates — so a
+# be modelled as exactly as the named one is — arrays, tuples, enum objects and
+# lib types all index numerically through paths ztsc approximates — so a
 # "cannot index" verdict on this arm would be a false positive on correct code,
-# which policy forbids. Deterministic under-report of one report; the ELEMENT
-# TYPE the same access produces is exact (that is what lines 7, 11 and 19 pin,
-# and what `constassert/006` as a whole is about).
+# which policy forbids.
+#
+# Measured 2026-08-02, with the report added under the same guard the
+# string-literal arm uses (object receiver, no numeric or string index
+# signature, not `globalThis`). Conformance stays clean, and so do the
+# 16-package corpus and excalidraw — but a targeted probe against the oracle
+# finds two shapes immediately:
+#
+#   enum E { A, B }        E[0]        oracle: `string` (REVERSE MAPPING),
+#                                      ztsc: false TS7053
+#   Map<number, string>    m[0]        oracle: TS7052 ("no index signature"),
+#                                      ztsc: TS7053 — the wrong code, i.e. one
+#                                      excess key and one under
+#
+# The enum-object arm alone is a false positive on correct code, so the arm
+# stays silent. Deterministic under-report of one report; the ELEMENT TYPE the
+# same access produces is exact (that is what lines 7, 11 and 19 pin, and what
+# `constassert/006` as a whole is about).
 constassert/006_template_expr_const_context_negatives.ts  -TS7053 16
 
 # TS2344 decides a written type argument against its parameter's constraint
@@ -99,7 +165,8 @@ constassert/006_template_expr_const_context_negatives.ts  -TS7053 16
 # DEFERRED node — an `infer` binder, an unreduced conditional / indexed
 # access / `keyof`. Those are not sets ztsc can enumerate, and every one of
 # the 130+ false TS2344s the unguarded check invented across the corpus was
-# one of them. Line 26 is that shape: the argument is `T["k"]`, an indexed
-# access into a still-free `T`, which tsc decides through its constraint
-# machinery and ztsc does not.
+# one of them. Line 26 is that shape — a DEFERRED ARGUMENT, not a structural
+# constraint: the argument is `T["k"]`, an indexed access into a still-free
+# `T`, which tsc decides through its constraint machinery and ztsc does not.
+# Nothing about the structural arm (open since B1) bears on it.
 instantiation/052_type_arg_constraint_structural.ts  -TS2344 26
