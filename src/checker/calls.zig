@@ -1973,6 +1973,34 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
         },
         .object => {
             const ra = try c.resolveStructural(arg);
+            // A CLASS VALUE (`typeof C`) against a parameter carrying CONSTRUCT
+            // signatures — `ClassConstructor<T>`, Nest's `Type<T>`, or a bare
+            // `new (...args: any[]) => T`. A class value is not an `.object`
+            // (its statics and its constructor are derived from the symbol, not
+            // stored as members), so the structural walk below skipped it
+            // entirely and `T` was left to its constraint or to `unknown`.
+            // Every `get(UserRepository)` / `BaseService.create(AlbumService,
+            // …)` / `getMock<T, R = Mocked<T>>(key: ClassConstructor<T>)` in a
+            // DI-shaped program then returned `unknown` or the bare base, and
+            // each use of the result was a TS2339 — the single largest family
+            // on immich's server package.
+            //
+            // Infer through the construct signature's RETURN type only, paired
+            // against the class's instance type at `any` (tsc's
+            // `getInstanceType`, and the same instantiation `instanceof`
+            // narrowing uses). The signature's PARAMETERS are deliberately not
+            // paired: a class's constructor arity is unrelated to the pattern's
+            // (`...args: any[]` is what these interfaces universally write), so
+            // pairing them could only manufacture candidates.
+            if (s.kind(ra) == .class_value and s.objectConstructSigCount(param) > 0) {
+                if (try c.instanceofInstanceType(ra)) |inst| {
+                    for (0..s.objectConstructSigCount(param)) |i| {
+                        const psig = s.objectConstructSig(param, @intCast(i));
+                        try c.unify(s.fnReturn(psig), inst, tp_syms, candidates, depth + 1);
+                    }
+                }
+                return;
+            }
             if (s.kind(ra) == .object) {
                 // Same-origin fast path (tsc's `inferFromTypes` same-reference
                 // rule). A generic interface/alias parameter whose type args
