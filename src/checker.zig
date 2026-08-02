@@ -1878,6 +1878,51 @@ pub const Checker = struct {
     /// Prefix of a computed-key placeholder atom (see `computedSymPlaceholder`).
     pub const computed_sym_prefix = "__@k$";
 
+    /// The member name a computed key `[expr]` denotes when `expr`'s type is a
+    /// LITERAL — tsc's late-bound name rule (`isLateBindableName`: a computed
+    /// name is bindable when its type is a string literal, a numeric literal,
+    /// or a unique symbol). A string enum member counts: `[E.A]` with
+    /// `A = "a"` declares the property `"a"`, and `keyof` over such a map is
+    /// the union of the VALUES, not of anything derived from how the keys were
+    /// spelled.
+    ///
+    /// Sibling of `uniqueSymAtom`, which covers the third case. Without this
+    /// one, every `{ [E.A]: T }` map kept the syntactic placeholder as its
+    /// member name, so `m.a` was TS2339, `keyof M` printed the placeholders
+    /// back at the user, and no `E`-typed key was assignable to it.
+    pub fn literalKeyAtom(c: *Checker, ty: TypeId) Error!?Atom {
+        const r = try c.ts.regular(ty);
+        switch (c.ts.kind(r)) {
+            .string_literal => return c.ts.literalAtom(r),
+            .number_literal, .number_literal_fresh => {
+                var buf: [32]u8 = undefined;
+                var w = std.Io.Writer.fixed(&buf);
+                print_zig.printNumber(&w, c.ts.numberValue(r)) catch return null;
+                // Stack buffer: `internText` copies. `atom` would keep the
+                // transient slice as an `atom_cache` key and dangle.
+                return try c.internText(w.buffered());
+            },
+            // An enum MEMBER stands for its own constant value; a whole enum
+            // type (or a computed member with no constant) does not.
+            .enum_type => {
+                if (!c.ts.isEnumMember(r)) return null;
+                const v = (try c.enumMemberValue(c.ts.enumSymbol(r), c.ts.enumMemberAtom(r))) orelse return null;
+                if (v == r) return null; // no self-recursion on an opaque member
+                return c.literalKeyAtom(v);
+            },
+            else => return null,
+        }
+    }
+
+    /// The nominal member atom a computed-key expression of type `ty` denotes:
+    /// the `__@u<id>` of a `unique symbol`, else the literal name it spells
+    /// out. Null when `ty` is neither, and the caller falls back to the
+    /// syntactic placeholder.
+    pub fn computedKeyAtomOfType(c: *Checker, ty: TypeId) Error!?Atom {
+        if (try c.uniqueSymAtom(ty)) |a| return a;
+        return c.literalKeyAtom(ty);
+    }
+
     /// Placeholder member atom for a computed const-`unique symbol` key, keyed
     /// by the identifier text (matches the binder's `computedSymPlaceholder`).
     /// Used as a lenient fallback when the key identifier can't be resolved to
@@ -1890,9 +1935,10 @@ pub const Checker = struct {
     }
 
     /// Resolve a computed-key identifier `name` (a `[k]` key) in `scope` to the
-    /// nominal `__@u<id>` atom of the const `unique symbol` it denotes. Returns
-    /// null when it does not resolve to a `unique symbol` — the caller then
-    /// falls back to the name placeholder. Resolution goes through the value
+    /// member atom it denotes: the nominal `__@u<id>` of a const `unique
+    /// symbol`, or the literal name a string/number-literal constant spells out
+    /// (`computedKeyAtomOfType`). Returns null when it is neither — the caller
+    /// then falls back to the name placeholder. Resolution goes through the value
     /// space and `typeOfSymbol`, so an imported key resolves to the *declaring*
     /// site's nominal id, giving cross-file key identity for free.
     pub fn constSymbolKeyAtom(c: *Checker, name: []const u8, scope: ScopeId) Error!?Atom {
@@ -1912,7 +1958,7 @@ pub const Checker = struct {
             };
             const member = try c.internText(name[dot + 1 ..]);
             if (c.qualifiedKeyMemberSym(obj, member)) |msym| {
-                return c.uniqueSymAtom(try c.typeOfSymbol(msym));
+                return c.computedKeyAtomOfType(try c.typeOfSymbol(msym));
             }
             // Fallback for a base that is not itself a class/namespace (an
             // import binding, or a var whose *type* carries the member —
@@ -1923,14 +1969,14 @@ pub const Checker = struct {
             c.computed_key_depth += 1;
             defer c.computed_key_depth -= 1;
             const p = (try c.propOfType(try c.typeOfSymbol(obj), member)) orelse return null;
-            return c.uniqueSymAtom(p.ty);
+            return c.computedKeyAtomOfType(p.ty);
         }
         const a = try c.atom(name);
         const sym = switch (c.resolveSpace(a, scope, true)) {
             .sym => |s| s,
             else => return null,
         };
-        return c.uniqueSymAtom(try c.typeOfSymbol(sym));
+        return c.computedKeyAtomOfType(try c.typeOfSymbol(sym));
     }
 
     /// Member symbol `name` of `obj` for qualified computed-key resolution:
