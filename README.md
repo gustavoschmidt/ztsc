@@ -12,10 +12,6 @@ TypeScript compiler, byte-identical at any parallelism.
 - **At least 2× faster and at least 5× less peak memory than tsgo** (the
   native TypeScript 7 compiler) — on *every* benchmark: eight real packages
   and a whole application, wall clock and peak RSS, defaults vs. defaults.
-- **2.7–12.4× faster on the packages** — 6.3–23.8 ms where tsgo takes
-  19.2–245.8 ms — and 2.5× faster on the application.
-- **5.4–15.3× less peak memory on the packages** — 7.5–24.1 MB where tsgo
-  needs 43.8–276.5 MB — and 5.3× less on the application.
 - **Same findings as tsgo on a real app** — on excalidraw, exactly the same
   17 diagnostics (file, line, column, code) at every checker count, 2.5×
   faster in 19% of the memory.
