@@ -159,7 +159,15 @@ pub const SymbolFlags = packed struct(u32) {
     /// half a dozen places (`namespace webcrypto {…}` next to `const
     /// webcrypto`, `namespace console {…}` next to `var console`).
     ns_uninstantiated: bool = false,
-    _pad: u5 = 0,
+    /// A `const` TYPE PARAMETER (TS 5.0 `f<const T>(…)`). Inference into it
+    /// runs in a const context — a literal argument keeps its literal type and
+    /// an object/array literal argument infers readonly members, as if the
+    /// argument had been written `as const` — and the fresh-literal widening
+    /// `getCovariantInference` normally applies is suppressed. Read off the
+    /// tokens before the parameter's name at bind time (`bindTypeParams`), so
+    /// the checker's per-argument test is one flag load.
+    const_type_param: bool = false,
+    _pad: u4 = 0,
 
     pub fn bits(f: SymbolFlags) u32 {
         return @bitCast(f);
@@ -1932,11 +1940,32 @@ const Binder = struct {
         b.restoreState(saved);
     }
 
+    /// Does a `const` modifier precede the type parameter named by `name_tok`?
+    /// The parser consumes `const`/`in`/`out` without storing them, so the
+    /// answer lives in the token stream — and only those three tags can occupy
+    /// the slots between the opening `<`/`,` and the name, so the walk cannot
+    /// run past its own parameter. Same readback `declaredVarianceOfTypeParam`
+    /// does for the variance annotations.
+    fn constTypeParam(b: *Binder, name_tok: TokenIndex) bool {
+        var tok = name_tok;
+        while (tok > 0) {
+            tok -= 1;
+            switch (b.tree.tokens.tag(tok)) {
+                .keyword_const => return true,
+                .keyword_in, .keyword_out => {},
+                else => return false,
+            }
+        }
+        return false;
+    }
+
     fn bindTypeParams(b: *Binder, start: u32, end: u32) Error!void {
         for (b.tree.extraRange(start, end)) |tp| {
             if (tp == null_node or b.nodeTag(tp) != .type_param) continue;
             const tok = b.tree.nodeMainToken(tp);
-            _ = try b.declare(b.cur_scope, try b.atomOfToken(tok), .type_param, tp, tok, .{});
+            _ = try b.declare(b.cur_scope, try b.atomOfToken(tok), .type_param, tp, tok, .{
+                .const_type_param = constTypeParam(b, tok),
+            });
             const d = b.tree.nodeData(tp);
             try b.bindType(d.lhs); // constraint
             try b.bindType(d.rhs); // default

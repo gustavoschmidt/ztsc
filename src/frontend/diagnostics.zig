@@ -74,6 +74,10 @@ pub const Code = enum(u16) {
     /// TS1029: `<out in T>` — the two variance annotations are in the wrong
     /// order.
     in_must_precede_out,
+    /// TS1277: a `const` type-parameter modifier (TS 5.0) on an interface or
+    /// type-alias type parameter — the two declaration forms that have no
+    /// call site to infer from, so `const` inference has nothing to mean.
+    const_modifier_not_valid_here,
 
     // --- bind errors, tsc-compatible codes via tsCode() ---------------
     /// TS2300: two declarations of the same name that cannot merge
@@ -139,6 +143,7 @@ pub const Code = enum(u16) {
             .in_modifier_not_valid_here => "'in' modifier can only appear on a type parameter of a class, interface or type alias",
             .out_modifier_not_valid_here => "'out' modifier can only appear on a type parameter of a class, interface or type alias",
             .in_must_precede_out => "'in' modifier must precede 'out' modifier.",
+            .const_modifier_not_valid_here => "'const' modifier can only appear on a type parameter of a function, method or class",
             .duplicate_identifier => "duplicate identifier",
             .block_scoped_redeclare => "cannot redeclare block-scoped variable",
             .duplicate_function_implementation => "duplicate function implementation",
@@ -161,6 +166,7 @@ pub const Code = enum(u16) {
             .decorator_not_valid_here => 1206,
             .in_modifier_not_valid_here, .out_modifier_not_valid_here => 1274,
             .in_must_precede_out => 1029,
+            .const_modifier_not_valid_here => 1277,
             else => 0,
         };
     }

@@ -1102,6 +1102,15 @@ pub fn freshTp(c: *const Checker, sym: SymbolId) *const FreshTp {
     return &c.fresh_tp_info.items[sym - c.fresh_tp_base];
 }
 
+/// Does type-parameter symbol `sym` carry the TS 5.0 `const` modifier? The
+/// bounds guard is load-bearing: a type-param symbol id can be a FRESH
+/// higher-order one (minted above the whole real + merged symbol space), which
+/// indexes no per-symbol flag array.
+pub inline fn isConstTypeParamSym(c: *const Checker, sym: SymbolId) bool {
+    if (c.isFreshTp(sym)) return c.freshTp(sym).const_tp;
+    return c.symFlags(sym).const_type_param;
+}
+
 /// Mint (or reuse) a fresh symbol for own type-param `orig` when a
 /// signature is instantiated under `map` (canonical id `map_id`, computed
 /// on demand when memoization is off). The fresh symbol carries the
@@ -1120,6 +1129,7 @@ pub fn mintFreshTp(c: *Checker, orig: SymbolId, map: []const TpMap, map_id: ?u32
             .constraint = constraint,
             .default = default,
             .has_default = has_default,
+            .const_tp = c.isConstTypeParamSym(orig),
         });
     }
     return gop.value_ptr.*;
