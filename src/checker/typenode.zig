@@ -996,12 +996,53 @@ pub const TypeParamInfo = struct {
 pub fn typeParamsOf(c: *Checker, sym: SymbolId, buf: *std.ArrayList(TypeParamInfo)) Error!void {
     var one = [_]SymbolId{sym};
     const parts: []const SymbolId = if (c.prog.isMergedId(sym)) c.prog.mergedSym(sym).parts else one[0..];
-    for (parts) |csym| {
+    outer: for (parts) |csym| {
         const saved = c.enterSymFile(csym);
         defer c.restoreCtx(saved);
         for (c.declsOf(csym)) |decl| {
             try c.declTypeParams(decl, buf);
-            if (buf.items.len > 0) return;
+            if (buf.items.len > 0) break :outer;
+        }
+    }
+    if (buf.items.len > 0 and c.symFlags(sym).class) try c.canonicalizeClassTypeParams(sym, buf);
+}
+
+/// A class merged with a same-named `interface` has TWO declaring blocks,
+/// each binding its own type-parameter symbols; tsc unifies them by POSITION
+/// (`interface P<A> { x: A }` beside `class P<A> { y: A }` — `P<number>`
+/// types both members `number`). `buildInstMap` already substitutes every
+/// block's i-th parameter, so an instantiation with real arguments is fine
+/// either way; what is not fine is the SELF reference — the class's own
+/// `this` instance `P<A>`, whose arguments are these symbols. The
+/// `implements`/`extends` clauses written on the class body resolve their
+/// `A` in the CLASS's scope, so unless the self reference uses the class
+/// block's symbols too, `class P<A> implements R<A>` compares `R<class A>`
+/// against an instance whose every member reads `R<interface A>` and fails
+/// (drizzle's `PgRaw`, `SQLiteRaw` and `Column`, whose interface halves are
+/// written first).
+///
+/// Only the SYMBOLS are canonicalized. Arity, constraints and defaults stay
+/// with the first declaring block, which is what tsc's declared type keeps:
+/// `@types/react` writes `interface Component<P = {}, S = {}, SS = any>`
+/// beside `class Component<P, S>`, and `Component<any>` is legal there only
+/// because the three defaulted parameters win.
+pub fn canonicalizeClassTypeParams(c: *Checker, sym: SymbolId, buf: *std.ArrayList(TypeParamInfo)) Error!void {
+    var one = [_]SymbolId{sym};
+    const parts: []const SymbolId = if (c.prog.isMergedId(sym)) c.prog.mergedSym(sym).parts else one[0..];
+    for (parts) |csym| {
+        const saved = c.enterSymFile(csym);
+        defer c.restoreCtx(saved);
+        for (c.declsOf(csym)) |decl| {
+            if (c.nodeTag(decl) != .class_decl) continue;
+            var syms: std.ArrayList(SymbolId) = .empty;
+            defer syms.deinit(c.scratch());
+            try c.typeParamSymsOfDecl(decl, &syms);
+            if (syms.items.len == 0) return;
+            for (syms.items, 0..) |s, i| {
+                if (i >= buf.items.len) break;
+                buf.items[i].sym = s;
+            }
+            return;
         }
     }
 }

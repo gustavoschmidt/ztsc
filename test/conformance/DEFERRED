@@ -118,3 +118,17 @@ module_aug/16_ambient_export_named_scope  -TS2322 entry.ts 14
 # TYPE the same access produces is exact (that is what lines 7, 11 and 19 pin,
 # and what `constassert/006` as a whole is about).
 constassert/006_template_expr_const_context_negatives.ts  -TS7053 16
+
+# TS2344 ("Type X does not satisfy the constraint Y") is not implemented.
+# Deciding it means enumerating the constraint's key set, and ztsc only folds
+# a complete member table when nothing on the way is still materializing: a
+# class whose own members are typed through itself (drizzle's select builders
+# write `execute: ReturnType<this["prepare"]>["execute"]`) cuts its base-class
+# fold at the in-progress guard and loses every inherited member, and the same
+# happens to `keyof ReadableOptions` in `@types/node`'s `Pick<ReadableOptions,
+# …, "signal">`. A check built on those sets invents TS2344s on valid code —
+# measured, both shapes, on the 8-package corpus — which policy forbids. A
+# whole check deliberately under-reported until the member tables are
+# trustworthy. The TS2345 on line 25 shows the use site still reports.
+instantiation/051_type_arg_constraint.ts  -TS2344 14
+instantiation/051_type_arg_constraint.ts  -TS2344 19

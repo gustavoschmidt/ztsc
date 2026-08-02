@@ -159,16 +159,80 @@ pub fn checkStatement(c: *Checker, node: Node) Error!void {
     }
 }
 
+/// tsc's `checkGrammarTopLevelElementsForRequiredDeclareModifier`: inside a
+/// `.d.ts`, every top-level DECLARATION (and every variable statement) must
+/// start with `declare`, `export` or `default`. Interfaces, type aliases,
+/// imports and exports are exempt, and anything that is not a declaration is
+/// not this check's business. tsc stops at the FIRST offender, so a file
+/// gets at most one TS1046.
+pub fn checkDeclFileTopLevel(c: *Checker) Error!void {
+    for (c.tree.nodeRange(0)) |stmt| {
+        if (stmt == null_node) continue;
+        const needs = switch (c.nodeTag(stmt)) {
+            // A variable statement never carries the modifier on its own
+            // node — the parser consumes `declare` and starts the statement
+            // at `var`/`let`/`const` — so read it off the token stream.
+            .var_decl_one, .var_decl => !precededByDeclare(c, stmt),
+            .class_decl => !declFlagSet(c, ast.ClassData, stmt),
+            .function_decl => !declFlagSet(c, ast.FnProto, stmt),
+            .enum_decl => !declFlagSet(c, ast.EnumData, stmt),
+            .namespace_decl => !declFlagSet(c, ast.NamespaceData, stmt),
+            else => false,
+        };
+        if (!needs) continue;
+        try c.diagFmt(1046, c.tokSpan(c.tree.nodeMainToken(stmt)), "Top-level declarations in .d.ts files must start with either a 'declare' or 'export' modifier.", .{});
+        return;
+    }
+}
+
+fn declFlagSet(c: *Checker, comptime T: type, node: Node) bool {
+    const data = c.tree.extraData(T, c.tree.nodeData(node).lhs);
+    return data.flags & ast.Flags.declare != 0;
+}
+
+/// Is the token immediately before `node`'s main token a `declare` keyword?
+/// The parser folds `declare` into a flag for every declaration form except
+/// variable statements, where it simply bumps past it.
+fn precededByDeclare(c: *Checker, node: Node) bool {
+    const mt = c.tree.nodeMainToken(node);
+    return mt > 0 and c.tree.tokens.tag(mt - 1) == .keyword_declare;
+}
+
 pub fn checkVarDeclStatement(c: *Checker, node: Node) Error!void {
     const d = c.tree.nodeData(node);
     const is_const = c.tree.tokens.tag(c.tree.nodeMainToken(node)) == .keyword_const;
+    const ambient = c.ambient_ctx or precededByDeclare(c, node);
     if (c.nodeTag(node) == .var_decl_one) {
+        if (ambient) try checkAmbientInitializer(c, d.lhs, is_const);
         try c.checkDeclarator(d.lhs, is_const);
     } else {
         for (c.tree.nodeRange(node)) |decl| {
-            if (decl != null_node) try c.checkDeclarator(decl, is_const);
+            if (decl == null_node) continue;
+            if (ambient) try checkAmbientInitializer(c, decl, is_const);
+            try c.checkDeclarator(decl, is_const);
         }
     }
+}
+
+/// tsc's `checkAmbientInitializer` for a variable declarator: an initializer
+/// is not allowed in an ambient context (TS1039) unless the declaration is a
+/// `const` WITHOUT a type annotation — the one form that carries a literal
+/// value into the declaration file. (tsc additionally requires that
+/// exempted initializer to be a literal, TS1254; ztsc stays silent there, a
+/// deliberate under-report rather than a guess at "literal enum reference".)
+fn checkAmbientInitializer(c: *Checker, decl: Node, is_const: bool) Error!void {
+    const d = c.tree.nodeData(decl);
+    const init: Node, const has_ann: bool = switch (c.nodeTag(decl)) {
+        .declarator_init => .{ d.rhs, false },
+        .declarator_full => blk: {
+            const e = c.tree.extraData(ast.DeclaratorFull, d.rhs);
+            break :blk .{ e.init, e.type_ann != 0 };
+        },
+        else => return,
+    };
+    if (init == null_node) return;
+    if (is_const and !has_ann) return;
+    try c.diagFmt(1039, c.nodeSpan(init), "Initializers are not allowed in ambient contexts.", .{});
 }
 
 pub fn checkDeclarator(c: *Checker, decl: Node, is_const: bool) Error!void {
@@ -960,6 +1024,12 @@ pub fn checkNamespace(c: *Checker, node: Node) Error!void {
     const data = c.tree.extraData(ast.NamespaceData, d.lhs);
     const saved = c.cur_scope;
     defer c.cur_scope = saved;
+    // `declare namespace N`, `declare module "spec"` and `declare global`
+    // all open an ambient context for their body (tsc's `NodeFlags.Ambient`),
+    // and it stays open once opened.
+    const saved_ambient = c.ambient_ctx;
+    defer c.ambient_ctx = saved_ambient;
+    if (data.flags & ast.Flags.declare != 0) c.ambient_ctx = true;
     // The body scope is the one owned by this node, or — for a merged
     // block whose scope is owned by an earlier block — the namespace
     // symbol's members scope.
@@ -1130,7 +1200,12 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
             const iface = try c.typeFromTypeName(hd.lhs, targs.items);
             if (iface != types.error_type and iface != types.any_type) {
                 if (!try c.isAssignable(this_t, iface)) {
-                    try c.diagFmt(2420, c.nodeSpan(hd.lhs), "Class '{s}' incorrectly implements interface '{s}'.", .{
+                    // tsc anchors the broad TS2420 at the class NAME
+                    // (`issueMemberSpecificError`'s `node.name || node`),
+                    // not at the heritage reference that failed — two
+                    // failing `implements` clauses report twice on the
+                    // same name.
+                    try c.diagFmt(2420, c.tokSpan(data.name_token), "Class '{s}' incorrectly implements interface '{s}'.", .{
                         c.symbolName(class_sym), try c.typeToString(iface),
                     });
                 }

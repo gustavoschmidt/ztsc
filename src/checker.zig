@@ -68,6 +68,7 @@ const types = @import("types.zig");
 const source = @import("source.zig");
 const libs = @import("libs.zig");
 const modules = @import("modules.zig");
+const parser = @import("parser.zig");
 const ZeroPagedArray = @import("zeropage.zig").ZeroPagedArray;
 
 const Ast = ast.Ast;
@@ -673,6 +674,11 @@ pub const Checker = struct {
     /// A decorator statement precedes its class in the same statement list;
     /// checkStatement pushes here and checkClass consumes them.
     pending_class_decos: std.ArrayListUnmanaged(Node) = .empty,
+    /// Are we inside an ambient context (tsc's `NodeFlags.Ambient`)? Seeded
+    /// per file from the `.d.ts` extension and pushed by every `declare`
+    /// namespace / ambient module / `declare global` body. Drives the ambient
+    /// grammar checks (TS1039).
+    ambient_ctx: bool = false,
     class_inst_generic: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
     class_static_cache: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
     /// Classes whose base-static fold is on the stack, so a malformed `extends`
@@ -1254,6 +1260,10 @@ pub const Checker = struct {
             c.cur_scope = binder.file_scope;
             c.fn_ctx = null;
             c.this_type = 0;
+            // A declaration file is one big ambient context, and its top-level
+            // declarations need `declare`/`export` (TS1046).
+            c.ambient_ctx = parser.isDeclarationPath(c.prog.files[f].path);
+            if (c.ambient_ctx) try stmts_zig.checkDeclFileTopLevel(c);
             for (c.tree.nodeRange(0)) |stmt| {
                 if (stmt != null_node) try c.checkStatement(stmt);
                 // Every class touched by this statement now has a complete
@@ -2118,6 +2128,7 @@ pub const Checker = struct {
     pub const regularizeTypeQuery = typenode_zig.regularizeTypeQuery;
     pub const typeofEntity = typenode_zig.typeofEntity;
     pub const typeParamsOf = typenode_zig.typeParamsOf;
+    pub const canonicalizeClassTypeParams = typenode_zig.canonicalizeClassTypeParams;
     pub const declTypeParams = typenode_zig.declTypeParams;
     pub const typeParamSymsOfDecl = typenode_zig.typeParamSymsOfDecl;
     pub const buildInstMap = typenode_zig.buildInstMap;
@@ -2228,6 +2239,8 @@ pub const Checker = struct {
     pub const setInterfaceThis = instantiate_zig.setInterfaceThis;
     pub const interfaceConstituentDirect = instantiate_zig.interfaceConstituentDirect;
     pub const interfaceConstituentApplyBases = instantiate_zig.interfaceConstituentApplyBases;
+    pub const interfaceHeritageTypes = instantiate_zig.interfaceHeritageTypes;
+    pub const classInterfaceHalfBases = instantiate_zig.classInterfaceHalfBases;
     pub const mergeBaseResolved = instantiate_zig.mergeBaseResolved;
     pub const arrayInterfaceObject = instantiate_zig.arrayInterfaceObject;
     pub const unionCallableSigs = instantiate_zig.unionCallableSigs;
@@ -2246,6 +2259,8 @@ pub const Checker = struct {
     pub const importedContainerSym = instantiate_zig.importedContainerSym;
     pub const classIsAbstract = instantiate_zig.classIsAbstract;
     pub const memberIsAbstract = instantiate_zig.memberIsAbstract;
+    pub const abstractSatisfiedElsewhere = instantiate_zig.abstractSatisfiedElsewhere;
+    pub const classChainMemberIsAbstract = instantiate_zig.classChainMemberIsAbstract;
     pub const checkAbstractImplementation = instantiate_zig.checkAbstractImplementation;
     pub const collectClassMemberAtoms = instantiate_zig.collectClassMemberAtoms;
     pub const max_eager_alias_depth = instantiate_zig.max_eager_alias_depth;
@@ -2429,6 +2444,7 @@ pub const Checker = struct {
     pub const mappedAddsOptional = assign_zig.mappedAddsOptional;
     pub const mappedAssignable = assign_zig.mappedAssignable;
     pub const indexAccessTargetConstraint = assign_zig.indexAccessTargetConstraint;
+    pub const indexKeyDeclared = assign_zig.indexKeyDeclared;
     pub const indexObjBaseConstraint = assign_zig.indexObjBaseConstraint;
     pub const transitiveBaseConstraint = assign_zig.transitiveBaseConstraint;
     pub const isNonPrimitiveKind = assign_zig.isNonPrimitiveKind;

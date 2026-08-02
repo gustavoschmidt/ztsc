@@ -1338,9 +1338,13 @@ pub fn mappedAssignable(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: t
 /// related to `T[K]` when it is related to this. Null when the access has
 /// no meaningful constraint — either side still generic after taking base
 /// constraints, or a reduction that lands back on the same deferred access
-/// or on `unknown` (what `indexedAccessType` yields for a property that is
-/// genuinely absent, where tsc's `getIndexedAccessTypeOrUndefined` returns
-/// nothing and the rule does not apply).
+/// or on an `unknown` that stands for a property the constraint does not
+/// have (`indexedAccessType`'s absent-property answer, where tsc's
+/// `getIndexedAccessTypeOrUndefined` returns nothing and the rule does not
+/// apply). A key the constraint DOES declare as `unknown` is a real
+/// reduction and does apply — drizzle's `Column` writes `(value: unknown)
+/// => unknown` through `DriverValueMapper<T["data"], T["driverParam"]>`
+/// where the constraint's `data`/`driverParam` are declared `unknown`.
 pub fn indexAccessTargetConstraint(c: *Checker, t: TypeId) Error!?TypeId {
     const obj_bc = try c.indexObjBaseConstraint(c.ts.indexAccessObj(t));
     // The INDEX takes a single constraint step, not a fixpoint: for
@@ -1351,8 +1355,18 @@ pub fn indexAccessTargetConstraint(c: *Checker, t: TypeId) Error!?TypeId {
     const idx_bc = try c.baseConstraintOf(c.ts.indexAccessIndex(t));
     if (try c.isGenericObjectForIndex(obj_bc) or try c.containsFreeTypeParam(idx_bc, &.{})) return null;
     const bc = try c.reduceIndexedAccess(obj_bc, idx_bc);
-    if (bc == t or c.ts.kind(bc) == .unknown) return null;
+    if (bc == t) return null;
+    if (c.ts.kind(bc) == .unknown and !try c.indexKeyDeclared(obj_bc, idx_bc)) return null;
     return bc;
+}
+
+/// Does `obj` actually declare the single literal key `idx`? Used to tell
+/// `indexedAccessType`'s two `unknown` answers apart — a declared
+/// `unknown`-typed property from an absent one.
+pub fn indexKeyDeclared(c: *Checker, obj: TypeId, idx: TypeId) Error!bool {
+    if (c.ts.kind(idx) != .string_literal) return false;
+    const r = try c.resolveStructural(obj);
+    return (try c.propOfType(r, c.ts.literalAtom(idx))) != null;
 }
 
 /// The OBJECT side of a deferred indexed access, reduced the way tsc's
