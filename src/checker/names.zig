@@ -249,6 +249,33 @@ pub fn toLower(ch: u8) u8 {
 // literal freshness / widening helpers
 // =====================================================================
 
+/// tsc's `isConstTypeVariable`: is `t` a `const` TYPE PARAMETER (TS 5.0
+/// `f<const T>(…)`), or a union with one as a member? An expression whose
+/// CONTEXTUAL type is one is checked in a const context — literal types kept,
+/// object/array literals readonly — which is the whole of what `const` on a
+/// type parameter means at an argument position (tsc's `isConstContext`:
+/// `isValidConstAssertionArgument(node) && isConstTypeVariable(contextualType)`).
+///
+/// The union arm is the only nesting ztsc's contextual types actually produce
+/// here (`T | undefined` at an optional parameter); tsc also descends indexed
+/// accesses, conditionals, mapped types and variadic tuples, which ztsc leaves
+/// as a deliberate under-application — the literal is then checked as if the
+/// parameter had no `const`, i.e. exactly today's behavior.
+pub fn isConstTypeVar(c: *Checker, t: TypeId) bool {
+    switch (c.ts.kind(t)) {
+        .type_param => return c.isConstTypeParamSym(c.ts.typeParamSymbol(t)),
+        .union_type => {
+            for (0..c.ts.memberCount(t)) |i| {
+                const m = c.ts.memberAt(t, @intCast(i));
+                if (c.ts.kind(m) == .type_param and
+                    c.isConstTypeParamSym(c.ts.typeParamSymbol(m))) return true;
+            }
+            return false;
+        },
+        else => return false,
+    }
+}
+
 /// `Store.literalBase`, extended with the enum-member case: the base of an
 /// enum member type `E.A` is the whole enum `E` (tsc's
 /// `getBaseTypeOfEnumLikeType`), so a member widens to `E`, is assignable

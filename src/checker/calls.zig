@@ -1062,7 +1062,17 @@ pub fn inferTypeArgs(
         // falling back to the instantiated constraint. A non-fresh variable
         // argument is not an object-literal node, so it never reaches here —
         // its already-widened type still fails the constraint (unchanged).
-        if (tag == .object_literal and c.ts.kind(try c.resolveStructural(pt)) == .type_param) {
+        //
+        // NOT for a `const` type parameter: substituting the constraint is
+        // exactly what would hide the const-ness from the literal, and the
+        // reason for the substitution — keeping a literal that would
+        // otherwise widen — is what `const` already guarantees. tsc's own
+        // contextual type for an argument is the parameter, never its
+        // constraint (`instantiateContextualType` does no such widening), so
+        // `q<const T extends { a: number }>({ a: 1 })` must see `T`.
+        if (tag == .object_literal and c.ts.kind(try c.resolveStructural(pt)) == .type_param and
+            !c.isConstTypeVar(try c.resolveStructural(pt)))
+        {
             const con = try c.typeParamConstraint(c.ts.typeParamSymbol(try c.resolveStructural(pt)));
             if (con != types.no_type) arg_ctx = con;
         }
@@ -1376,8 +1386,15 @@ pub fn inferTypeArgs(
             // down, so `fromEntries(xs.map(x => [x.id, true]))` keeps `true`
             // and the result still satisfies `{ [k: string]: true }`;
             // widening it gave `boolean`.
+            //
+            // A `const` type parameter never widens: tsc's
+            // `getCovariantInference` folds `isConstTypeVariable` into the
+            // same `primitiveConstraint` test this mirrors, so `f<const T>`
+            // keeps `"a"` for `f("a")` exactly as an `extends string`
+            // constraint would.
             if (sig_ret != types.no_type and
                 top_flags[i] and
+                !c.isConstTypeParamSym(tp) and
                 !try c.constraintIsPrimitive(constraint) and
                 !try c.typeParamAtTopLevel(sig_ret, tp))
             {
@@ -3146,6 +3163,29 @@ pub fn checkCallArguments(c: *Checker, node: Node, sig: TypeId, arg_nodes: []con
     // the failing argument is often what mis-inferred the type argument the
     // rest are checked against. `two("x", 1)` against `two(a: number, b:
     // string)` is one TS2345, not two.
+    //
+    // tsc's `getSignatureApplicabilityError`: a signature with a NON-ARRAY
+    // rest type stops the positional walk at the rest position and relates
+    // the arguments from there on, packed into ONE tuple, to the rest type —
+    // so exactly one arm of a union rest has to accept the whole list. Below
+    // `whole_from` the walk is positional, exactly as before.
+    //
+    // Per-position typing still runs for those arguments (that is what
+    // contextually types a callback argument and what gives an optional
+    // position its `| undefined`); only the REPORT moves to the packed
+    // relation, which subsumes it — a per-position failure fails the packed
+    // one too, so the two never both fire.
+    //
+    // Skipped when the call has a spread argument: the packed tuple would be
+    // a guess, and guessing here can only invent a rejection.
+    const rest_union: ?TypeId = if (has_spread) null else try c.sigNonArrayRest(sig);
+    const whole_from: u32 = if (rest_union == null)
+        std.math.maxInt(u32)
+    else
+        c.ts.fnParamCount(sig) - 1;
+    var packed_elems: std.ArrayList(types.TupleElem) = .empty;
+    defer packed_elems.deinit(c.scratch());
+    var packed_first: Node = null_node;
     var reported_arg = false;
     var ai: u32 = 0;
     for (arg_nodes) |an| {
@@ -3160,6 +3200,11 @@ pub fn checkCallArguments(c: *Checker, node: Node, sig: TypeId, arg_nodes: []con
             continue;
         };
         const at = try c.checkExprCached(an, pt);
+        if (ai >= whole_from) {
+            if (packed_first == null_node) packed_first = an;
+            try packed_elems.append(c.scratch(), .{ .ty = at });
+            continue;
+        }
         if (report and !try c.isAssignable(at, pt)) {
             if (reported_arg) continue;
             if (!try c.elaborateCallbackError(an, at, pt) and
@@ -3181,6 +3226,16 @@ pub fn checkCallArguments(c: *Checker, node: Node, sig: TypeId, arg_nodes: []con
             } else if (c.diags.items.len != before) {
                 reported_arg = true;
             }
+        }
+    }
+    if (report and !reported_arg and rest_union != null) {
+        const rest_ty = rest_union.?;
+        const packed_ty = try c.ts.makeTuple(packed_elems.items);
+        if (!try c.isAssignable(packed_ty, rest_ty)) {
+            // tsc's error node: the single rest argument, or the range from
+            // the first to the last of them; with none at all, the call.
+            const span = if (packed_first != null_node) c.nodeSpan(packed_first) else c.nodeSpan(node);
+            try c.reportNotAssignable(2345, packed_ty, rest_ty, span);
         }
     }
 }

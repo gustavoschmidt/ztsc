@@ -375,6 +375,38 @@ pub const scratch_retain_limit = 256 * 1024;
 /// far below the worker-thread stack-overflow depth, leaving a wide safety
 /// margin on the smallest (main-thread) stack.
 pub const max_relation_depth = 900;
+/// How many times ONE generic may reappear on the relation's live source or
+/// target stack, each time as a strictly LATER instantiation of itself, before
+/// the pair is assumed related — tsc's `isDeeplyNestedType` maxDepth.
+///
+/// `max_relation_depth` alone cannot close a walk like zod's: `ZodType`'s
+/// members return `ZodOptional<this>`, `ZodArray<this>`, `ZodIntersection<this,
+/// T>` … so the pair at each level is a strictly LARGER instantiation of the
+/// same handful of generics, a dozen ways per level. Nothing repeats, so both
+/// memos miss, and the walk ran until the per-statement instantiation budget
+/// tripped — whereupon the truncation to `error_type` came back as a FALSE
+/// relation and was cached, which is where `ZodString` stopped satisfying
+/// `ZodType<string | number | symbol, any, any>`. Recognising the *generic*
+/// rather than the instantiation closes it in two levels.
+///
+/// The GROWTH half of the test (`relIdDeeplyNested`) is what makes so small a
+/// limit safe: an ordinary recursive type meeting itself through its own
+/// members — `Uint8Array<ArrayBufferLike>`, whose `subarray`/`slice` hand back
+/// the same instantiation — re-enters with the same ref and is not counted at
+/// all. Only a chain that keeps building a bigger argument is.
+///
+/// Assume-related is the same direction the depth cap already takes: it can
+/// only drop diagnostics, never invent one. It is nevertheless recorded
+/// (`rel_guard_tripped`), because a NEGATIVE verdict built on an assumed YES
+/// is not evidence — see that field.
+pub const max_relation_identity_repeats = 2;
+/// Buckets in the relation-stack occupancy filter (`rel_src_buckets`).
+pub const rel_id_buckets = 64;
+
+/// One live relation frame's recursion identity for one side: the generic
+/// (`sym`) and the exact instantiation of it (`ref`, the interned origin ref).
+/// `relIdDeeplyNested` counts occurrences of `sym` whose `ref` keeps growing.
+pub const RelId = struct { sym: SymbolId, ref: TypeId };
 /// Recursion-depth cap for alias-instance expansion (`aliasInstance`; see the
 /// `alias_depth` field). Fires only on pathological mutually-recursive generic
 /// alias chains (e.g. `@scalar/typebox`'s conditional type modules, whose
@@ -484,7 +516,16 @@ pub const IfaceFrame = struct { sym: SymbolId, resolving_base: bool = false };
 
 /// Bounds of a fresh higher-order type-param symbol (see `fresh_tp_ids`). The
 /// constraint/default are already `M`-instantiated TypeIds (`no_type` = none).
-pub const FreshTp = struct { name: Atom, constraint: TypeId, default: TypeId, has_default: bool };
+pub const FreshTp = struct {
+    name: Atom,
+    constraint: TypeId,
+    default: TypeId,
+    has_default: bool,
+    /// The `const` modifier of the ORIGINAL type parameter this fresh id
+    /// stands in for, carried across so a `const` parameter of a generic
+    /// method survives the receiver's instantiation.
+    const_tp: bool = false,
+};
 
 /// One entry of `Checker.mapped_key_scopes`: a mapped type's key parameter
 /// `K`, in scope for that map's `as`/value branches (and for anything nested
@@ -528,7 +569,13 @@ pub const map_containers = [_][]const u8{
     "deep_path_list",           "deep_path_ids",          "flow_reach",
     "member_type_stack",        "lazy_index_objs",        "pending_type_args",
     "pending_type_args_pool",   "pending_type_args_seen", "tp_constrained_cache",
+    "nominal_bases",            "nominal_base_pool",
 };
+
+/// Where one symbol's declared heritage lives in `Checker.nominal_base_pool`.
+/// Eight bytes per symbol ever asked, and the pool holds four bytes per
+/// declared `extends` clause — see `declaredBaseRefs`.
+pub const BaseSpan = struct { start: u32, len: u32 };
 
 pub const Checker = struct {
     out: Allocator,
@@ -740,6 +787,15 @@ pub const Checker = struct {
     /// namespace / ambient module / `declare global` body. Drives the ambient
     /// grammar checks (TS1039).
     ambient_ctx: bool = false,
+    /// Declared `extends` heritage per symbol, as a span of
+    /// `nominal_base_pool` — the nominal-heritage relation fast path's index
+    /// (`declaredBaseRefs`). Filled lazily, only for symbols the relation
+    /// actually asks about, and empty-but-present for the ones with no
+    /// heritage at all.
+    nominal_bases: std.AutoHashMapUnmanaged(SymbolId, BaseSpan) = .empty,
+    /// Backing store for `nominal_bases`: each symbol's declared base
+    /// references, laid out contiguously in the order they were written.
+    nominal_base_pool: std.ArrayListUnmanaged(TypeId) = .empty,
     class_inst_generic: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
     class_static_cache: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
     /// Classes whose base-static fold is on the stack, so a malformed `extends`
@@ -1001,6 +1057,37 @@ pub const Checker = struct {
     /// otherwise-unbounded walk over an undecidable recursive alias's
     /// expansions (see the constant's doc comment).
     rel_depth: u32 = 0,
+    /// The generic INSTANTIATION each live relation frame is comparing, one
+    /// entry per side — the frame's origin ref (`refFacetOf`) and its symbol,
+    /// pushed only for frames whose two sides are both generic instantiations.
+    /// This is tsc's `sourceStack`/`targetStack`, and `relIdDeeplyNested` is
+    /// its `isDeeplyNestedType`: a family of mutually recursive generics whose
+    /// members return `Wrapper<this>` grows a new, strictly larger pair of
+    /// instantiations at every level, so nothing ever repeats and neither the
+    /// relation memo nor the expansion memo can close the walk. Seeing the
+    /// same GENERIC re-entered as a strictly later instantiation is what
+    /// closes it (see `max_relation_identity_repeats`).
+    rel_src_ids: [max_relation_depth]RelId = @splat(.{ .sym = 0, .ref = 0 }),
+    rel_tgt_ids: [max_relation_depth]RelId = @splat(.{ .sym = 0, .ref = 0 }),
+    /// Live depth of `rel_src_ids`/`rel_tgt_ids`.
+    rel_id_depth: u32 = 0,
+    /// Set whenever the growing-instantiation guard answered a pair from
+    /// assumption rather than from its members. A relation run that consulted
+    /// the guard is not evidence for a NEGATIVE verdict, so the two callers
+    /// that build one out of a relation — variance MEASUREMENT
+    /// (`measureOneVariance`) and the declared-variance check
+    /// (`checkVarianceAnnotations`, TS2636) — clear it, run, and decline to
+    /// conclude anything if it came back set. tsc's `VarianceFlags.Unmeasurable`
+    /// / `Unreliable`, same purpose: a measurement whose relation was truncated
+    /// must fall back to the structural walk, not silently answer "bivariant".
+    rel_guard_tripped: bool = false,
+    /// Occupancy of the two stacks above, bucketed by the low bits of the
+    /// symbol (`rel_id_bucket`). A bucket below `max_relation_identity_repeats`
+    /// cannot hold that many occurrences of ANY symbol, so the scan the guard
+    /// would otherwise run on every frame is skipped outright — which is the
+    /// overwhelmingly common case (a generic pair met once).
+    rel_src_buckets: [rel_id_buckets]u16 = @splat(0),
+    rel_tgt_buckets: [rel_id_buckets]u16 = @splat(0),
     /// `instantiate` node-visits spent on the source element being checked
     /// (against `max_instantiation_count`); reset by `checkStatement`. Within
     /// a statement it is monotonic, with no exempt window — an exempt window
@@ -2157,6 +2244,7 @@ pub const Checker = struct {
     pub const toLower = names_zig.toLower;
     pub const literalBaseOf = names_zig.literalBaseOf;
     pub const widenLiteral = names_zig.widenLiteral;
+    pub const isConstTypeVar = names_zig.isConstTypeVar;
     pub const normalizeFreshObjectSiblings = names_zig.normalizeFreshObjectSiblings;
     pub const widenReturnMember = names_zig.widenReturnMember;
     pub const finalizeInferredReturn = names_zig.finalizeInferredReturn;
@@ -2239,6 +2327,7 @@ pub const Checker = struct {
     pub const restTupleOf = typenode_zig.restTupleOf;
     pub const sigRestTuple = typenode_zig.sigRestTuple;
     pub const sigRestUnion = typenode_zig.sigRestUnion;
+    pub const sigNonArrayRest = typenode_zig.sigNonArrayRest;
     pub const restUnionOptionalAt = typenode_zig.restUnionOptionalAt;
     pub const restTupleAtPosition = typenode_zig.restTupleAtPosition;
     pub const memberList = typenode_zig.memberList;
@@ -2385,6 +2474,7 @@ pub const Checker = struct {
     pub const tpLookup = enums_zig.tpLookup;
     pub const canonMapId = enums_zig.canonMapId;
     pub const isFreshTp = enums_zig.isFreshTp;
+    pub const isConstTypeParamSym = enums_zig.isConstTypeParamSym;
     pub const freshTp = enums_zig.freshTp;
     pub const mintFreshTp = enums_zig.mintFreshTp;
     pub const instantiate = enums_zig.instantiate;
@@ -2528,7 +2618,10 @@ pub const Checker = struct {
     pub const reportVarianceMismatch = assign_zig.reportVarianceMismatch;
     pub const checkVarianceAnnotations = assign_zig.checkVarianceAnnotations;
     pub const refFacetOf = assign_zig.refFacetOf;
+    pub const relIdDeeplyNested = assign_zig.relIdDeeplyNested;
     pub const isAssignable = assign_zig.isAssignable;
+    pub const nominalHeritageRelated = assign_zig.nominalHeritageRelated;
+    pub const declaredBaseRefs = assign_zig.declaredBaseRefs;
     pub const condTrueUnderExtends = assign_zig.condTrueUnderExtends;
     pub const isCompound = assign_zig.isCompound;
     pub const isAssignableInner = assign_zig.isAssignableInner;
@@ -2638,6 +2731,8 @@ pub const Checker = struct {
     pub const contextualArrayElemType = expr_zig.contextualArrayElemType;
     pub const multiArrayLikeBranches = expr_zig.multiArrayLikeBranches;
     pub const checkConstArrayLiteral = expr_zig.checkConstArrayLiteral;
+    pub const ctxIsMutableArrayLike = expr_zig.ctxIsMutableArrayLike;
+    pub const ctxIsMutableArrayLikeAt = expr_zig.ctxIsMutableArrayLikeAt;
     pub const collectTypeParamSyms = expr_zig.collectTypeParamSyms;
     pub const isInstantiableKind = expr_zig.isInstantiableKind;
     pub const deferredDefaultConstraint = expr_zig.deferredDefaultConstraint;
