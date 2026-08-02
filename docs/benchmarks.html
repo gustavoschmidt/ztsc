@@ -51,7 +51,7 @@
     </div>
     <div class="stat">
       <div class="k">conformance</div>
-      <div class="v">977/977</div>
+      <div class="v">990/990</div>
       <div class="c">differential cases (error code + line) vs the native TypeScript compiler, tsgo 7.0.2</div>
     </div>
   </div>
@@ -83,7 +83,7 @@
   <p>The package matrix is also a diagnostic-parity claim: on all eight packages ztsc reports
   exactly the same diagnostics as tsgo — the same (file, line, column, code) set, zero excess
   and zero under-reports — held by a standing ratcheted gate
-  (<code>bench/parity_sweep.sh</code>), alongside the 977-case differential conformance suite
+  (<code>bench/parity_sweep.sh</code>), alongside the 990-case differential conformance suite
   and the excalidraw diagnostic convergence.</p>
 </section>
 
@@ -418,7 +418,7 @@ zig-out/bench/ztsc --pretty=false --checkers=4 -p "$C"   # wall: median of 11
     <p>ztsc checks a <em>subset</em> of TypeScript (against the real ES-core + DOM lib), but on
     all eight packages it reports exactly the same diagnostics as tsgo — the same (file, line,
     column, code) set, zero excess and zero under-reports, held by the ratcheted
-    <code>bench/parity_sweep.sh</code> gate — alongside the 977-case differential conformance
+    <code>bench/parity_sweep.sh</code> gate — alongside the 990-case differential conformance
     suite and the excalidraw convergence gate (the same 17 diagnostics as tsgo at every checker
     count, though not the same message text).
     Packages are vendored without their dependencies — nonzero exit is expected,
