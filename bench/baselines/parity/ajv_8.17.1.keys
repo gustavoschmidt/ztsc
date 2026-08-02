@@ -1,0 +1,5 @@
+dist/compile/resolve.d.ts:3:35:TS2307
+dist/runtime/equal.d.ts:1:24:TS2307
+dist/runtime/re2.d.ts:1:22:TS2307
+dist/runtime/uri.d.ts:1:22:TS2307
+dist/types/index.d.ts:1:30:TS2307

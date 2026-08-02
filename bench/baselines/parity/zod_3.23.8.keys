@@ -1,0 +1,8 @@
+lib/benchmarks/datetime.d.ts:1:23:TS2307
+lib/benchmarks/discriminatedUnion.d.ts:1:23:TS2307
+lib/benchmarks/ipv4.d.ts:1:23:TS2307
+lib/benchmarks/object.d.ts:1:23:TS2307
+lib/benchmarks/primitives.d.ts:1:23:TS2307
+lib/benchmarks/realworld.d.ts:1:23:TS2307
+lib/benchmarks/string.d.ts:1:23:TS2307
+lib/benchmarks/union.d.ts:1:23:TS2307
