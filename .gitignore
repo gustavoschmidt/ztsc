@@ -3,6 +3,10 @@ zig-out/
 bench/corpus/
 node_modules/
 
+# real-application benchmark checkouts (multi-GB, cloned + installed locally;
+# see BENCHMARKS.md) — like bench/corpus, regenerated rather than vendored
+bench/apps/
+
 # Claude Code local state — agent worktrees are full checkouts plus build cache
 .claude/
 
