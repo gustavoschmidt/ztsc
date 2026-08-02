@@ -19,7 +19,15 @@
 //!   wherever a wildcard could have reached them — so an explicit `exclude`
 //!   neither enables nor disables it. A pattern's wildcard-free literal prefix
 //!   is the one way in (`include: ["node_modules/typed"]`), and it opts in only
-//!   what that prefix names; see `implicitlyPruned`.
+//!   what that prefix names; see `implicitlyPruned`. An entry may be rooted
+//!   (`/home/me/proj/out`); the walk lifts candidate paths into that space to
+//!   match it, so rooted and relative spellings of the same directory do the
+//!   same thing, and one that names somewhere else matches nothing — see
+//!   `Matcher`. Every pattern comparison — `exclude`, `include`, and the
+//!   package-folder prune — ignores case exactly when the filesystem does, the
+//!   condition tsc puts the `i` flag on its regexes under; see
+//!   `caseSensitiveFs`. The `.ts`/`.tsx` extension gate does not: it is a plain
+//!   suffix test in tsc too, so `a.TS` is never an input even on macOS.
 //! - **compilerOptions**:
 //!   - `strict` must be `true` or absent — ztsc only implements strict
 //!     semantics, so `strict: false` is a polite hard error (exit 2).
@@ -229,12 +237,16 @@ pub fn loadInDir(io: Io, arena: Allocator, base: Io.Dir, config_path: []const u8
         var exc_abs: std.ArrayList([]const u8) = .empty;
         if (acc.exclude) |list| {
             for (list) |e| {
-                try exc_abs.append(arena, try joinNormalize(arena, acc.exclude_dir, e));
+                try appendExclude(arena, &exc_abs, try joinNormalize(arena, acc.exclude_dir, e));
             }
         } else {
             try defaultExcludes(arena, &exc_abs, &acc);
         }
-        const matched = try expandInclude(io, arena, base, include_dir, inc_abs.items, exc_abs.items, &warnings, cfg.path);
+        var matcher: Matcher = .{
+            .case_sensitive = caseSensitiveFs(io, arena, base, config_path),
+            .base_abs = baseAbsPath(io, arena, base),
+        };
+        const matched = try expandInclude(io, arena, base, &matcher, include_dir, inc_abs.items, exc_abs.items, &warnings, cfg.path);
         for (matched) |m| {
             const gop = try seen.getOrPut(arena, m);
             if (!gop.found_existing) try root_files.append(arena, m);
@@ -499,12 +511,19 @@ pub const JsonError = error{ SyntaxError, OutOfMemory };
 // glob matcher
 // ===========================================================================
 
-/// Match a glob `pattern` against a `/`-separated relative `path` (both
-/// lexically normalized, no leading `./`). `**` matches zero or more whole
-/// segments, `*` any run of non-`/` characters, `?` exactly one non-`/`
-/// character. Wildcards never match a leading `.` of a segment.
-pub fn globMatch(pattern: []const u8, path: []const u8) bool {
-    return matchParts(pattern, path);
+/// Match a glob `pattern` against a `/`-separated `path` (both lexically
+/// normalized, no leading `./`, either both relative or both rooted). `**`
+/// matches zero or more whole segments, `*` any run of non-`/` characters, `?`
+/// exactly one non-`/` character. Wildcards never match a leading `.` of a
+/// segment.
+///
+/// `case_sensitive` is the filesystem's, not a style choice: tsc and tsgo
+/// compile these patterns to a regex and add the `i` flag whenever the host
+/// reports case-insensitive file names, so on macOS/Windows `exclude: ["OUT"]`
+/// really does exclude `out/`. Segment structure (`/`, the dot-segment rule)
+/// is case-independent either way.
+pub fn globMatch(case_sensitive: bool, pattern: []const u8, path: []const u8) bool {
+    return matchParts(case_sensitive, pattern, path);
 }
 
 // ===========================================================================
@@ -703,26 +722,36 @@ fn splitSeg(s: []const u8) Split {
     return .{ .head = s, .tail = null };
 }
 
-fn matchParts(pat: ?[]const u8, path: ?[]const u8) bool {
+fn matchParts(cs: bool, pat: ?[]const u8, path: ?[]const u8) bool {
     const p = pat orelse return path == null;
     const sp = splitSeg(p);
     if (std.mem.eql(u8, sp.head, "**")) {
         // Zero segments...
-        if (matchParts(sp.tail, path)) return true;
+        if (matchParts(cs, sp.tail, path)) return true;
         // ...or eat one path segment and retry (never a dot-segment).
         const t = path orelse return false;
         const st = splitSeg(t);
         if (st.head.len > 0 and st.head[0] == '.') return false;
-        return matchParts(p, st.tail);
+        return matchParts(cs, p, st.tail);
     }
     const t = path orelse return false;
     const st = splitSeg(t);
-    if (!segMatch(sp.head, st.head)) return false;
-    return matchParts(sp.tail, st.tail);
+    if (!segMatch(cs, sp.head, st.head)) return false;
+    return matchParts(cs, sp.tail, st.tail);
+}
+
+/// Case-fold one byte the way tsc's `i` regex flag does: ASCII only. tsc
+/// canonicalizes with `String.prototype.toLowerCase` restricted to ASCII
+/// (`toFileNameLowerCase`), precisely so a locale never moves a file in or out
+/// of a program.
+fn foldEq(cs: bool, a: u8, b: u8) bool {
+    if (a == b) return true;
+    if (cs) return false;
+    return std.ascii.toLower(a) == std.ascii.toLower(b);
 }
 
 /// Match one path segment (no `/`) against a pattern segment with `*`/`?`.
-fn segMatch(pat: []const u8, name: []const u8) bool {
+fn segMatch(cs: bool, pat: []const u8, name: []const u8) bool {
     // A leading '.' must be matched literally (tsc: wildcards skip
     // dotfiles).
     if (name.len > 0 and name[0] == '.' and pat.len > 0 and
@@ -733,7 +762,7 @@ fn segMatch(pat: []const u8, name: []const u8) bool {
     var star_pi: ?usize = null;
     var star_ni: usize = 0;
     while (ni < name.len) {
-        if (pi < pat.len and (pat[pi] == '?' or pat[pi] == name[ni])) {
+        if (pi < pat.len and (pat[pi] == '?' or foldEq(cs, pat[pi], name[ni]))) {
             pi += 1;
             ni += 1;
         } else if (pi < pat.len and pat[pi] == '*') {
@@ -1261,6 +1290,45 @@ fn isFile(io: Io, base: Io.Dir, path: []const u8) bool {
     return st.kind == .file;
 }
 
+/// Does this filesystem distinguish `out` from `OUT`? Every include/exclude
+/// comparison the walk makes hangs off the answer, because tsc and tsgo build
+/// their matcher from the host's `useCaseSensitiveFileNames` — so on a Mac
+/// `outDir: "OUT"` really does exclude `out/`, and on Linux it excludes nothing.
+///
+/// Answered the way tsc answers it — ask the filesystem, do not guess from the
+/// OS name (a case-sensitive volume mounts fine on macOS, and a case-insensitive
+/// one on Linux): stat a path known to exist under its case-swapped spelling.
+/// The probe is `probe`, the config file itself, so the answer describes the
+/// volume the project actually lives on. A probe with no ASCII letters (or one
+/// that has vanished) answers "sensitive", the conservative reading — it keeps
+/// every comparison exact.
+fn caseSensitiveFs(io: Io, arena: Allocator, base: Io.Dir, probe: []const u8) bool {
+    const swapped = arena.dupe(u8, probe) catch return true;
+    var any = false;
+    for (swapped) |*c| {
+        if (std.ascii.isLower(c.*)) {
+            c.* = std.ascii.toUpper(c.*);
+            any = true;
+        } else if (std.ascii.isUpper(c.*)) {
+            c.* = std.ascii.toLower(c.*);
+            any = true;
+        }
+    }
+    if (!any) return true;
+    return !isFile(io, base, swapped);
+}
+
+/// Canonical absolute path of the walk's base directory, or "" when the OS will
+/// not say. Only rooted patterns need it (see `Matcher`); "" leaves those inert,
+/// which is strictly better than matching the wrong tree.
+fn baseAbsPath(io: Io, arena: Allocator, base: Io.Dir) []const u8 {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = base.realPathFile(io, ".", &buf) catch return "";
+    var p = buf[0..n];
+    while (p.len > 1 and p[p.len - 1] == '/') p = p[0 .. p.len - 1];
+    return arena.dupe(u8, p) catch "";
+}
+
 const default_include = [_][]const u8{"**/*"};
 
 /// The package folders tsc keeps the include walk out of (`implicitlyPruned`).
@@ -1272,7 +1340,9 @@ const common_package_dirs = [_][]const u8{ "node_modules", "bower_components", "
 
 /// tsc's default `exclude`, used only when the merged config has no `exclude`
 /// key at all: the `outDir` and `declarationDir` that are set, each resolved
-/// against the config that declared it. Appends base-relative patterns to `out`.
+/// against the config that declared it. Appends the patterns to `out` via
+/// `appendExclude`, in the walk's coordinate system (base-relative, or rooted
+/// when the value was).
 ///
 /// The rule is a plain substitution, not a union — it is `exclude` that decides,
 /// and any `exclude` (even `[]`, even one inherited through `extends`) replaces
@@ -1283,14 +1353,11 @@ const common_package_dirs = [_][]const u8{ "node_modules", "bower_components", "
 /// program), nor an `include` that names it — exclude always wins. Verified
 /// against tsc 7.0.2.
 ///
-/// Two patterns per directory: the literal path, so the walk prunes the
-/// directory on sight, and `<dir>/**/*`, which is what tsc's trailing `($|/)`
-/// buys and is the only form that still bites when the excluded directory is
-/// the walk root itself and so is never tested as a child.
-///
-/// An absolute value is inert, exactly as an absolute entry in an explicit
-/// `exclude` is: the walk names files relative to the process base, and nothing
-/// here rebases an already-rooted path onto it.
+/// A rooted (absolute) value works like any other: `appendExclude` keeps it
+/// rooted and the walk lifts candidate paths into that space to match (see
+/// `Matcher`), so `outDir: "/home/me/proj/out"` excludes exactly what the
+/// relative spelling would. One outside the project matches nothing, which is
+/// also what tsc does with it.
 fn defaultExcludes(arena: Allocator, out: *std.ArrayList([]const u8), acc: *const Merged) Error!void {
     const dirs = [_]struct { ?[]const u8, []const u8 }{
         .{ acc.out_dir, acc.out_dir_dir },
@@ -1298,13 +1365,24 @@ fn defaultExcludes(arena: Allocator, out: *std.ArrayList([]const u8), acc: *cons
     };
     for (dirs) |d| {
         const spec = d[0] orelse continue;
-        const abs = try joinNormalize(arena, d[1], spec);
-        try out.append(arena, abs);
-        try out.append(arena, if (std.mem.eql(u8, abs, "."))
-            "**/*"
-        else
-            try std.fmt.allocPrint(arena, "{s}/**/*", .{abs}));
+        try appendExclude(arena, out, try joinNormalize(arena, d[1], spec));
     }
+}
+
+/// Append the two patterns one `exclude` entry expands to: the entry itself, so
+/// the walk prunes a named directory on sight, and `<entry>/**/*`, which is what
+/// tsc's trailing `($|/)` buys — the only form that still bites when the
+/// excluded directory is the walk root itself (or an ancestor of it) and so is
+/// never tested as a child. `.` is the walk root spelled as a path, and its
+/// subtree form has no prefix at all.
+fn appendExclude(arena: Allocator, out: *std.ArrayList([]const u8), pat: []const u8) Error!void {
+    try out.append(arena, pat);
+    try out.append(arena, if (std.mem.eql(u8, pat, "."))
+        "**/*"
+    else if (std.mem.eql(u8, pat, "/"))
+        "/**/*"
+    else
+        try std.fmt.allocPrint(arena, "{s}/**/*", .{pat}));
 }
 
 fn warn(arena: Allocator, list: *std.ArrayList([]const u8), comptime fmt: []const u8, args: anytype) Error!void {
@@ -1364,18 +1442,79 @@ fn hasTsExt(name: []const u8) bool {
     return std.mem.endsWith(u8, name, ".ts") or std.mem.endsWith(u8, name, ".tsx");
 }
 
+/// True for a pattern (or path) rooted at the filesystem root rather than at
+/// the walk's base directory. tsc keeps both patterns and walked paths
+/// absolute, so the two spaces mix freely there; ztsc walks base-relative for
+/// the memory, and this is the flag that says which space a string is in.
+fn isRooted(s: []const u8) bool {
+    return s.len > 0 and s[0] == '/';
+}
+
+/// The rules a walked path is matched under: the filesystem's case sensitivity
+/// and the base directory's own absolute path.
+///
+/// `base_abs` exists so a *rooted* pattern is not dead on arrival. The walk
+/// names files relative to the base directory, so an `exclude` (or an `outDir`)
+/// spelled `/home/me/proj/out` shares no prefix with `proj/out` and could never
+/// match; tsc has no such gap because it walks absolute. Rather than rebasing
+/// the pattern — which cannot be done lexically once a wildcard sits above the
+/// project (`/home/*/proj/out`) — the walked path is lifted into the pattern's
+/// space, and only for the patterns that ask for it. Everything stays
+/// base-relative on the common path, where no pattern is rooted at all.
+const Matcher = struct {
+    /// The walk's filesystem, as probed by `caseSensitiveFs`.
+    case_sensitive: bool,
+    /// Canonical absolute path of the base directory, no trailing `/`
+    /// ("" = unknown, which leaves rooted patterns inert as they were).
+    base_abs: []const u8,
+    /// Scratch for the lifted path; rewritten on every `rooted*` call and only
+    /// ever read before the next one.
+    buf: [std.fs.max_path_bytes]u8 = undefined,
+
+    /// `<base_abs>/<cur>/<name>` (any empty part elided), or null when it does
+    /// not fit / the base is unknown. Already-rooted input passes through: a
+    /// config named by an absolute `--project` path makes the whole walk
+    /// absolute, and lifting it twice would be nonsense.
+    fn rooted(m: *Matcher, cur: []const u8, name: []const u8) ?[]const u8 {
+        if (isRooted(cur) or (cur.len == 0 and isRooted(name))) {
+            if (cur.len == 0) return name;
+            if (name.len == 0) return cur;
+            return m.write(&.{ cur, name });
+        }
+        if (m.base_abs.len == 0) return null;
+        return m.write(&.{ m.base_abs, cur, name });
+    }
+
+    fn write(m: *Matcher, parts: []const []const u8) ?[]const u8 {
+        var n: usize = 0;
+        for (parts) |p| {
+            if (p.len == 0) continue;
+            if (n != 0 and m.buf[n - 1] != '/') {
+                if (n + 1 > m.buf.len) return null;
+                m.buf[n] = '/';
+                n += 1;
+            }
+            if (n + p.len > m.buf.len) return null;
+            @memcpy(m.buf[n..][0..p.len], p);
+            n += p.len;
+        }
+        return m.buf[0..n];
+    }
+};
+
 /// Walk from `walk_root` (base-relative dir) collecting `.ts`/`.d.ts` files
 /// matching any `include` pattern and excluded by none. `include`/`exclude`
-/// patterns are already base-relative (same coordinate system as the walked
-/// paths), so patterns declared in different configs compose correctly.
-/// Directories are additionally pruned by `implicitlyPruned`, which `exclude`
-/// can neither turn on nor off — without it this walk descends the entire
-/// dependency tree looking for sources that are never there.
+/// patterns are base-relative like the walked paths — except the rooted ones,
+/// which `Matcher` handles — so patterns declared in different configs compose
+/// correctly. Directories are additionally pruned by `implicitlyPruned`, which
+/// `exclude` can neither turn on nor off — without it this walk descends the
+/// entire dependency tree looking for sources that are never there.
 /// Returned paths are base-relative and sorted.
 fn expandInclude(
     io: Io,
     arena: Allocator,
     base: Io.Dir,
+    m: *Matcher,
     walk_root: []const u8,
     include: []const []const u8,
     exclude: []const []const u8,
@@ -1405,15 +1544,15 @@ fn expandInclude(
             // string that lives until the config arena dies.
             switch (entry.kind) {
                 .directory => {
-                    if (implicitlyPruned(include, cur, entry.name)) continue;
+                    if (implicitlyPruned(m, include, cur, entry.name)) continue;
                     const child = try joinChild(arena, cur, entry.name);
-                    if (!matchesAny(exclude, child)) try stack.append(arena, child);
+                    if (!matchesAny(m, exclude, cur, entry.name, child)) try stack.append(arena, child);
                 },
                 .file => {
                     if (!hasTsExt(entry.name)) continue;
                     const child = try joinChild(arena, cur, entry.name);
-                    if (matchesAny(exclude, child)) continue;
-                    if (!matchesAny(include, child)) continue;
+                    if (matchesAny(m, exclude, cur, entry.name, child)) continue;
+                    if (!matchesAny(m, include, cur, entry.name, child)) continue;
                     try out.append(arena, child);
                 },
                 else => {},
@@ -1429,9 +1568,15 @@ fn expandInclude(
     return out.toOwnedSlice(arena);
 }
 
-fn matchesAny(patterns: []const []const u8, path: []const u8) bool {
+/// Does any of `patterns` match `<cur>/<name>`? `path` is that same join, which
+/// the caller has already had to materialize; `cur`/`name` come along so a
+/// rooted pattern can be answered without a second arena string.
+fn matchesAny(m: *Matcher, patterns: []const []const u8, cur: []const u8, name: []const u8, path: []const u8) bool {
     for (patterns) |p| {
-        if (globMatch(p, path)) return true;
+        if (isRooted(p)) {
+            const abs = m.rooted(cur, name) orelse continue;
+            if (globMatch(m.case_sensitive, p, abs)) return true;
+        } else if (globMatch(m.case_sensitive, p, path)) return true;
     }
     return false;
 }
@@ -1458,16 +1603,34 @@ fn matchesAny(patterns: []const []const u8, path: []const u8) bool {
 /// dirs deeper in the project are still in wildcard territory and prune.
 ///
 /// Takes `cur` and `name` unjoined so a pruned directory never allocates its
-/// path. Purely lexical, so the walk stays deterministic.
-fn implicitlyPruned(include: []const []const u8, cur: []const u8, name: []const u8) bool {
+/// path. Purely lexical, so the walk stays deterministic. Both halves — the
+/// folder name and the escape hatch — follow the filesystem's case rule, since
+/// tsc splices the package names into the same regex that carries the `i` flag:
+/// on macOS a `NODE_MODULES` prunes, and a lowercase `include` still names it.
+fn implicitlyPruned(m: *Matcher, include: []const []const u8, cur: []const u8, name: []const u8) bool {
     for (common_package_dirs) |pkg_dir| {
-        if (!std.mem.eql(u8, name, pkg_dir)) continue;
+        if (!eqlPath(m.case_sensitive, name, pkg_dir)) continue;
         for (include) |pat| {
-            if (dirCoversPath(cur, name, literalPrefix(pat))) return false;
+            const prefix = literalPrefix(pat);
+            if (isRooted(pat)) {
+                // Only here — a package folder, under a rooted pattern — is
+                // lifting the path out of the base-relative space worth it.
+                const abs = m.rooted(cur, name) orelse continue;
+                if (dirCoversPath(m.case_sensitive, abs, "", prefix)) return false;
+            } else if (dirCoversPath(m.case_sensitive, cur, name, prefix)) return false;
         }
         return true;
     }
     return false;
+}
+
+fn eqlPath(cs: bool, a: []const u8, b: []const u8) bool {
+    if (cs) return std.mem.eql(u8, a, b);
+    return std.ascii.eqlIgnoreCase(a, b);
+}
+
+fn startsWithPath(cs: bool, haystack: []const u8, needle: []const u8) bool {
+    return haystack.len >= needle.len and eqlPath(cs, haystack[0..needle.len], needle);
 }
 
 /// The leading whole segments of an include pattern that contain no `*`/`?` —
@@ -1488,15 +1651,20 @@ fn literalPrefix(pat: []const u8) []const u8 {
 
 /// Is the directory `<cur>/<name>` an ancestor of `path`, or `path` itself?
 /// Whole-segment (`src` does not cover `srcx`), and spelled on the unjoined
-/// parts so the caller need not build the child path to ask.
-fn dirCoversPath(cur: []const u8, name: []const u8, path: []const u8) bool {
+/// parts so the caller need not build the child path to ask. Either part may be
+/// empty (the caller that has already joined passes the whole directory as
+/// `cur`). Case follows the filesystem, like every other comparison the walk
+/// makes.
+fn dirCoversPath(cs: bool, cur: []const u8, name: []const u8, path: []const u8) bool {
     var rest = path;
     if (cur.len != 0) {
-        if (!std.mem.startsWith(u8, rest, cur)) return false;
-        if (rest.len == cur.len or rest[cur.len] != '/') return false;
+        if (!startsWithPath(cs, rest, cur)) return false;
+        if (rest.len == cur.len) return name.len == 0;
+        if (rest[cur.len] != '/') return false;
         rest = rest[cur.len + 1 ..];
     }
-    if (!std.mem.startsWith(u8, rest, name)) return false;
+    if (name.len == 0) return true;
+    if (!startsWithPath(cs, rest, name)) return false;
     return rest.len == name.len or rest[name.len] == '/';
 }
 
@@ -1550,7 +1718,7 @@ test "jsonc: syntax errors" {
 }
 
 test "globMatch: subset semantics" {
-    const T = struct { pat: []const u8, path: []const u8, want: bool };
+    const T = struct { pat: []const u8, path: []const u8, want: bool, cs: bool = true };
     const cases = [_]T{
         .{ .pat = "**/*", .path = "a.ts", .want = true },
         .{ .pat = "**/*", .path = "x/y/a.ts", .want = true },
@@ -1582,10 +1750,25 @@ test "globMatch: subset semantics" {
         .{ .pat = "node_modules", .path = "node_modules", .want = true },
         .{ .pat = "node_modules", .path = "src/node_modules", .want = false },
         .{ .pat = "**/node_modules", .path = "src/node_modules", .want = true },
+        // Rooted patterns are matched exactly like relative ones — the caller
+        // is what lifts a walked path into their space.
+        .{ .pat = "/a/b/out/**/*", .path = "/a/b/out/x.ts", .want = true },
+        .{ .pat = "/a/b/out", .path = "/a/b/output/x.ts", .want = false },
+        .{ .pat = "/a/*/out/**/*", .path = "/a/b/out/x.ts", .want = true },
+        // Case: exact under `cs`, folded (ASCII only) without it.
+        .{ .pat = "OUT/**/*", .path = "out/x.ts", .want = false },
+        .{ .pat = "OUT/**/*", .path = "out/x.ts", .want = true, .cs = false },
+        .{ .pat = "**/*.D.TS", .path = "a/b.d.ts", .want = true, .cs = false },
+        .{ .pat = "/A/B/out", .path = "/a/b/out", .want = true, .cs = false },
+        .{ .pat = "src", .path = "srC", .want = true, .cs = false },
+        .{ .pat = "src", .path = "srcx", .want = false, .cs = false },
+        // Folding is ASCII-only, like tsc's `toFileNameLowerCase`: a non-ASCII
+        // byte pair that some locale would equate stays distinct.
+        .{ .pat = "É.ts", .path = "é.ts", .want = false, .cs = false },
     };
     for (cases) |c| {
-        if (globMatch(c.pat, c.path) != c.want) {
-            std.debug.print("globMatch({s}, {s}) != {}\n", .{ c.pat, c.path, c.want });
+        if (globMatch(c.cs, c.pat, c.path) != c.want) {
+            std.debug.print("globMatch({}, {s}, {s}) != {}\n", .{ c.cs, c.pat, c.path, c.want });
             return error.TestUnexpectedResult;
         }
     }
@@ -1871,6 +2054,366 @@ test "config: extends — an inherited 'exclude' still replaces the outDir defau
     try testing.expectEqualStrings("proj/root.ts", cfg.root_files[5]);
 }
 
+// ---------------------------------------------------------------------------
+// rooted (absolute) and case-mismatched patterns
+//
+// Every `want` below is what tsgo 7.0.2 actually produced for that config on
+// the `writeOutDirTree` tree — a file-set oracle, not a reading of the rules:
+// this is the one part of the loader where being subtly wrong shows up as a
+// program that silently checks the wrong files.
+// ---------------------------------------------------------------------------
+
+/// The root-file sets the fixtures below select from, base-relative and sorted
+/// exactly as `expandInclude` returns them.
+const out_tree = struct {
+    const all = [_][]const u8{
+        "proj/decls/e.d.ts", "proj/out.ts",  "proj/out/b.ts", "proj/out/c.d.ts",
+        "proj/output/o.ts",  "proj/root.ts", "proj/src/a.ts",
+    };
+    /// `out/` gone; `out.ts` and `output/` stay (whole-segment matching).
+    const no_out = [_][]const u8{
+        "proj/decls/e.d.ts", "proj/out.ts", "proj/output/o.ts", "proj/root.ts", "proj/src/a.ts",
+    };
+    const no_decls = [_][]const u8{
+        "proj/out.ts", "proj/out/b.ts", "proj/out/c.d.ts", "proj/output/o.ts", "proj/root.ts", "proj/src/a.ts",
+    };
+    const no_out_decls = [_][]const u8{
+        "proj/out.ts", "proj/output/o.ts", "proj/root.ts", "proj/src/a.ts",
+    };
+    const no_root = [_][]const u8{
+        "proj/decls/e.d.ts", "proj/out.ts", "proj/out/b.ts", "proj/out/c.d.ts", "proj/output/o.ts", "proj/src/a.ts",
+    };
+    const no_dts = [_][]const u8{
+        "proj/out.ts", "proj/out/b.ts", "proj/output/o.ts", "proj/root.ts", "proj/src/a.ts",
+    };
+    const only_src = [_][]const u8{"proj/src/a.ts"};
+    const none = [_][]const u8{};
+};
+
+/// Substitute `needle` in `text`.
+fn substAll(alloc: Allocator, text: []const u8, needle: []const u8, with: []const u8) ![]u8 {
+    const buf = try alloc.alloc(u8, std.mem.replacementSize(u8, text, needle, with));
+    _ = std.mem.replace(u8, text, needle, with, buf);
+    return buf;
+}
+
+/// Expand `config` (a `writeOutDirTree` tsconfig, with `@ROOT@` standing for the
+/// temporary directory's absolute path and `@ROOTUP@` for that path upper-cased)
+/// and assert the root files come out as `want`.
+fn expectOutTree(io: Io, alloc: Allocator, config: []const u8, want: []const []const u8) !void {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const d = tmp.dir;
+    const root = baseAbsPath(io, alloc, d);
+    try testing.expect(root.len > 0); // no absolute path, no rooted fixture
+    const upper = try alloc.dupe(u8, root);
+    for (upper) |*c| c.* = std.ascii.toUpper(c.*);
+    try writeOutDirTree(io, d, try substAll(alloc, try substAll(alloc, config, "@ROOTUP@", upper), "@ROOT@", root));
+
+    const cfg = try loadInDir(io, alloc, d, "proj/tsconfig.json");
+    var ok = cfg.root_files.len == want.len;
+    if (ok) {
+        for (cfg.root_files, want) |got, w| ok = ok and std.mem.eql(u8, got, w);
+    }
+    if (!ok) {
+        std.debug.print("config: {s}\n  got: ", .{config});
+        for (cfg.root_files) |f| std.debug.print(" {s}", .{f});
+        std.debug.print("\n  want:", .{});
+        for (want) |f| std.debug.print(" {s}", .{f});
+        std.debug.print("\n", .{});
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "config: rooted include/exclude/outDir match instead of being ignored" {
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const T = struct { cfg: []const u8, want: []const []const u8 };
+    for ([_]T{
+        // The default `exclude`, spelled rooted: same effect as `"out"`.
+        .{ .cfg =
+        \\{ "compilerOptions": { "strict": true, "outDir": "@ROOT@/proj/out" } }
+        , .want = &out_tree.no_out },
+        .{ .cfg =
+        \\{ "compilerOptions": { "strict": true, "outDir": "@ROOT@/proj/out/" } }
+        , .want = &out_tree.no_out },
+        .{ .cfg =
+        \\{ "compilerOptions": { "strict": true, "declarationDir": "@ROOT@/proj/decls" } }
+        , .want = &out_tree.no_decls },
+        // An explicit rooted `exclude`, of a directory and of a single file.
+        .{ .cfg =
+        \\{ "compilerOptions": { "strict": true },
+        \\  "exclude": ["@ROOT@/proj/out", "@ROOT@/proj/decls"] }
+        , .want = &out_tree.no_out_decls },
+        .{ .cfg =
+        \\{ "compilerOptions": { "strict": true }, "exclude": ["@ROOT@/proj/root.ts"] }
+        , .want = &out_tree.no_root },
+        // Rooted globs, including one whose wildcard sits *above* the project —
+        // the case no lexical rebase of the pattern could have handled.
+        .{ .cfg =
+        \\{ "compilerOptions": { "strict": true }, "exclude": ["@ROOT@/proj/**/*.d.ts"] }
+        , .want = &out_tree.no_dts },
+        .{ .cfg =
+        \\{ "compilerOptions": { "strict": true }, "exclude": ["@ROOT@/*/out"] }
+        , .want = &out_tree.no_out },
+        .{ .cfg =
+        \\{ "compilerOptions": { "strict": true }, "include": ["@ROOT@/*/src/**/*"] }
+        , .want = &out_tree.only_src },
+        // `.` and `..` are normalized away before matching.
+        .{ .cfg =
+        \\{ "compilerOptions": { "strict": true }, "exclude": ["@ROOT@/proj/src/../out"] }
+        , .want = &out_tree.no_out },
+        // Rooted `include`: a directory (which becomes `<dir>/**/*`) and a glob.
+        .{ .cfg =
+        \\{ "compilerOptions": { "strict": true }, "include": ["@ROOT@/proj/src"] }
+        , .want = &out_tree.only_src },
+        .{ .cfg =
+        \\{ "compilerOptions": { "strict": true }, "include": ["@ROOT@/proj/**/*"] }
+        , .want = &out_tree.all },
+        // Rooted and relative patterns compose: exclude still beats include.
+        .{ .cfg =
+        \\{ "compilerOptions": { "strict": true },
+        \\  "include": ["src", "out"], "exclude": ["@ROOT@/proj/out"] }
+        , .want = &out_tree.only_src },
+        // The walk root itself, and an ancestor of it: only the `<pat>/**/*`
+        // companion form can bite here, and it must (tsc TS18003).
+        .{ .cfg =
+        \\{ "compilerOptions": { "strict": true, "outDir": "@ROOT@/proj" } }
+        , .want = &out_tree.none },
+        .{ .cfg =
+        \\{ "compilerOptions": { "strict": true }, "exclude": ["@ROOT@"] }
+        , .want = &out_tree.none },
+        // Rooted somewhere else entirely: matches nothing, excludes nothing.
+        .{ .cfg =
+        \\{ "compilerOptions": { "strict": true, "outDir": "/tmp/ztsc-nowhere-xyz" } }
+        , .want = &out_tree.all },
+        .{ .cfg =
+        \\{ "compilerOptions": { "strict": true }, "include": ["/tmp/ztsc-nowhere-xyz/**/*"] }
+        , .want = &out_tree.none },
+    }) |c| try expectOutTree(io, alloc, c.cfg, c.want);
+}
+
+test "config: an exclude entry covers the directory it names, root or not" {
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // tsc terminates every exclude pattern with `($|/)`, so an entry naming the
+    // walk root empties the program — the literal pattern alone cannot say so,
+    // since the walk root is never tested as a child of anything.
+    for ([_][]const u8{ ".", "", "src/..", "./" }) |spec| {
+        const cfg = try std.fmt.allocPrint(
+            alloc,
+            "{{ \"compilerOptions\": {{ \"strict\": true }}, \"exclude\": [\"{s}\"] }}",
+            .{spec},
+        );
+        try expectOutTree(io, alloc, cfg, &out_tree.none);
+    }
+}
+
+/// Ground truth for the case fixtures, established without `caseSensitiveFs`:
+/// write a file, then ask for it back under a different spelling.
+fn tmpDirCaseSensitive(io: Io, d: Io.Dir) bool {
+    d.writeFile(io, .{ .sub_path = "CaseProbe.tmp", .data = "" }) catch return true;
+    return !isFile(io, d, "caseprobe.tmp");
+}
+
+test "caseSensitiveFs: agrees with the filesystem it is asked about" {
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "tsconfig.json", .data = "{}" });
+    try testing.expectEqual(
+        tmpDirCaseSensitive(io, tmp.dir),
+        caseSensitiveFs(io, arena.allocator(), tmp.dir, "tsconfig.json"),
+    );
+    // A probe that cannot answer (no letters to swap, or simply not there)
+    // reports "sensitive", which leaves every comparison exact.
+    try testing.expect(caseSensitiveFs(io, arena.allocator(), tmp.dir, "123/456"));
+    try testing.expect(caseSensitiveFs(io, arena.allocator(), tmp.dir, "no-such-config.json"));
+}
+
+test "config: include/exclude casing follows the filesystem, like tsc's regex flag" {
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var probe = std.testing.tmpDir(.{});
+    defer probe.cleanup();
+    // On a case-insensitive volume the expectations are tsgo 7.0.2's, measured
+    // on this machine; on a case-sensitive one they are tsgo's too — the only
+    // thing that changes over there is the `i` flag on its pattern regexes, so
+    // every mismatched spelling simply stops matching.
+    const cs = tmpDirCaseSensitive(io, probe.dir);
+
+    const T = struct { cfg: []const u8, ci_want: []const []const u8, cs_want: []const []const u8 };
+    for ([_]T{
+        .{ .cfg =
+        \\{ "compilerOptions": { "strict": true, "outDir": "OUT" } }
+        , .ci_want = &out_tree.no_out, .cs_want = &out_tree.all },
+        .{ .cfg =
+        \\{ "compilerOptions": { "strict": true }, "exclude": ["OUT", "DECLS"] }
+        , .ci_want = &out_tree.no_out_decls, .cs_want = &out_tree.all },
+        .{ .cfg =
+        \\{ "compilerOptions": { "strict": true }, "exclude": ["**/*.D.TS"] }
+        , .ci_want = &out_tree.no_dts, .cs_want = &out_tree.all },
+        .{ .cfg =
+        \\{ "compilerOptions": { "strict": true }, "include": ["SRC"] }
+        , .ci_want = &out_tree.only_src, .cs_want = &out_tree.none },
+        .{ .cfg =
+        \\{ "compilerOptions": { "strict": true }, "include": ["SRC/**/*"] }
+        , .ci_want = &out_tree.only_src, .cs_want = &out_tree.none },
+        .{ .cfg =
+        \\{ "compilerOptions": { "strict": true }, "include": ["**/*.TS"] }
+        , .ci_want = &out_tree.all, .cs_want = &out_tree.none },
+        // Rooted *and* mis-cased: the walk lifts the path with the base's real
+        // spelling, so the fold has to reach the rooted prefix too.
+        .{ .cfg =
+        \\{ "compilerOptions": { "strict": true }, "exclude": ["@ROOTUP@/PROJ/OUT"] }
+        , .ci_want = &out_tree.no_out, .cs_want = &out_tree.all },
+    }) |c| try expectOutTree(io, alloc, c.cfg, if (cs) c.cs_want else c.ci_want);
+}
+
+test "expandInclude: one tree, both case rules — the sensitive half runs everywhere" {
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // The fixtures above can only assert the rule this machine's filesystem
+    // happens to have. Driving the walk directly pins down *both* halves on any
+    // machine, which is the half that matters for not regressing Linux: with
+    // `case_sensitive`, a mis-spelled pattern must go on matching nothing.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const d = tmp.dir;
+    try writeOutDirTree(io, d,
+        \\{ "compilerOptions": { "strict": true } }
+    );
+    const root = baseAbsPath(io, alloc, d);
+    try testing.expect(root.len > 0);
+    const rooted_out = try std.fmt.allocPrint(alloc, "{s}/proj/OUT", .{root});
+
+    const T = struct {
+        include: []const []const u8,
+        exclude: []const []const u8,
+        cs_want: []const []const u8,
+        ci_want: []const []const u8,
+    };
+    for ([_]T{
+        .{
+            .include = &.{"proj/**/*"},
+            .exclude = &.{ "proj/OUT", "proj/OUT/**/*" },
+            .cs_want = &out_tree.all,
+            .ci_want = &out_tree.no_out,
+        },
+        .{
+            .include = &.{"proj/SRC/**/*"},
+            .exclude = &.{},
+            .cs_want = &out_tree.none,
+            .ci_want = &out_tree.only_src,
+        },
+        .{
+            .include = &.{"proj/**/*"},
+            .exclude = &.{"**/*.D.TS"},
+            .cs_want = &out_tree.all,
+            .ci_want = &out_tree.no_dts,
+        },
+        .{
+            .include = &.{"proj/**/*"},
+            .exclude = &.{ rooted_out, try std.fmt.allocPrint(alloc, "{s}/**/*", .{rooted_out}) },
+            .cs_want = &out_tree.all,
+            .ci_want = &out_tree.no_out,
+        },
+    }) |c| {
+        for ([_]bool{ true, false }) |cs| {
+            var warnings: std.ArrayList([]const u8) = .empty;
+            var m: Matcher = .{ .case_sensitive = cs, .base_abs = root };
+            const got = try expandInclude(io, alloc, d, &m, "proj", c.include, c.exclude, &warnings, "proj/tsconfig.json");
+            const want = if (cs) c.cs_want else c.ci_want;
+            try testing.expectEqual(want.len, got.len);
+            for (got, want) |g, w| try testing.expectEqualStrings(w, g);
+        }
+    }
+}
+
+test "config: the .ts extension gate stays case-sensitive whatever the filesystem" {
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // tsgo 7.0.2 on this (case-insensitive) machine does not pick these up:
+    // the extension filter is a plain suffix test, applied outside the pattern
+    // regex that carries the `i` flag. So `include: ["**/*.TS"]` matching
+    // `a.ts` (above) and `a.TS` never being an input are both true at once.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const d = tmp.dir;
+    try d.createDirPath(io, "proj");
+    try d.writeFile(io, .{ .sub_path = "proj/keep.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/upper.TS", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/upper.D.TS", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/upper.Tsx", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/tsconfig.json", .data =
+        \\{ "compilerOptions": { "strict": true } }
+    });
+
+    const cfg = try loadInDir(io, alloc, d, "proj/tsconfig.json");
+    try testing.expectEqual(@as(usize, 1), cfg.root_files.len);
+    try testing.expectEqualStrings("proj/keep.ts", cfg.root_files[0]);
+}
+
+test "config: the node_modules prune follows the filesystem's casing" {
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var probe = std.testing.tmpDir(.{});
+    defer probe.cleanup();
+    const cs = tmpDirCaseSensitive(io, probe.dir);
+
+    // tsc splices the package-folder names into the same regex the `i` flag is
+    // put on, so on a case-insensitive volume `NODE_MODULES` prunes exactly
+    // like `node_modules` — and a lowercase `include` still names it.
+    const T = struct { include: []const u8, ci: usize, cs_: usize };
+    for ([_]T{
+        // Default include: pruned where the filesystem folds case, walked
+        // (and its `.d.ts` rooted) where it does not.
+        .{ .include = "", .ci = 1, .cs_ = 2 },
+        // The escape hatch, spelled either way.
+        .{ .include = ", \"include\": [\"src\", \"NODE_MODULES/pkg\"]", .ci = 2, .cs_ = 2 },
+        .{ .include = ", \"include\": [\"src\", \"node_modules/pkg\"]", .ci = 2, .cs_ = 1 },
+    }) |c| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const d = tmp.dir;
+        try d.createDirPath(io, "proj/src");
+        try d.createDirPath(io, "proj/NODE_MODULES/pkg");
+        try d.writeFile(io, .{ .sub_path = "proj/src/a.ts", .data = "" });
+        try d.writeFile(io, .{ .sub_path = "proj/NODE_MODULES/pkg/index.d.ts", .data = "" });
+        const config = try std.fmt.allocPrint(
+            alloc,
+            "{{ \"compilerOptions\": {{ \"strict\": true }}{s} }}",
+            .{c.include},
+        );
+        try d.writeFile(io, .{ .sub_path = "proj/tsconfig.json", .data = config });
+
+        const cfg = try loadInDir(io, alloc, d, "proj/tsconfig.json");
+        try testing.expectEqual(if (cs) c.cs_ else c.ci, cfg.root_files.len);
+        try testing.expectEqualStrings("proj/src/a.ts", cfg.root_files[cfg.root_files.len - 1]);
+    }
+}
+
 test "literalPrefix: leading wildcard-free segments" {
     try testing.expectEqualStrings("", literalPrefix("**/*"));
     try testing.expectEqualStrings("", literalPrefix("*/index.ts"));
@@ -1883,45 +2426,46 @@ test "literalPrefix: leading wildcard-free segments" {
 }
 
 test "dirCoversPath: whole-segment ancestor-or-self, unjoined" {
-    try testing.expect(dirCoversPath("", "node_modules", "node_modules"));
-    try testing.expect(dirCoversPath("", "node_modules", "node_modules/typed"));
-    try testing.expect(dirCoversPath("node_modules", "typed", "node_modules/typed"));
-    try testing.expect(!dirCoversPath("node_modules", "typed", "node_modules"));
-    try testing.expect(!dirCoversPath("src/deep", "node_modules", "src"));
+    try testing.expect(dirCoversPath(true, "", "node_modules", "node_modules"));
+    try testing.expect(dirCoversPath(true, "", "node_modules", "node_modules/typed"));
+    try testing.expect(dirCoversPath(true, "node_modules", "typed", "node_modules/typed"));
+    try testing.expect(!dirCoversPath(true, "node_modules", "typed", "node_modules"));
+    try testing.expect(!dirCoversPath(true, "src/deep", "node_modules", "src"));
     // Whole segments only.
-    try testing.expect(!dirCoversPath("", "src", "srcx/a"));
-    try testing.expect(!dirCoversPath("", "node_modules", "my_node_modules"));
+    try testing.expect(!dirCoversPath(true, "", "src", "srcx/a"));
+    try testing.expect(!dirCoversPath(true, "", "node_modules", "my_node_modules"));
 }
 
 test "implicitlyPruned: the escape hatch is positional, not global" {
+    var m: Matcher = .{ .case_sensitive = true, .base_abs = "" };
     // Nothing names them: all three prune wherever they appear.
-    try testing.expect(implicitlyPruned(&.{"**/*"}, "", "node_modules"));
-    try testing.expect(implicitlyPruned(&.{"**/*"}, "", "bower_components"));
-    try testing.expect(implicitlyPruned(&.{"**/*"}, "", "jspm_packages"));
-    try testing.expect(implicitlyPruned(&.{"**/*"}, "src/deep", "node_modules"));
+    try testing.expect(implicitlyPruned(&m, &.{"**/*"}, "", "node_modules"));
+    try testing.expect(implicitlyPruned(&m, &.{"**/*"}, "", "bower_components"));
+    try testing.expect(implicitlyPruned(&m, &.{"**/*"}, "", "jspm_packages"));
+    try testing.expect(implicitlyPruned(&m, &.{"**/*"}, "src/deep", "node_modules"));
     // Non-package directories are never the prune's business.
-    try testing.expect(!implicitlyPruned(&.{"**/*"}, "", "src"));
-    try testing.expect(!implicitlyPruned(&.{"**/*"}, "", "node_modules_x"));
+    try testing.expect(!implicitlyPruned(&m, &.{"**/*"}, "", "src"));
+    try testing.expect(!implicitlyPruned(&m, &.{"**/*"}, "", "node_modules_x"));
 
     // `include: ["src", "node_modules/typed"]` opts in exactly the one folder
     // the literal prefix names — the defect a whole-pattern scan would create
     // is that the other two would open too.
     const inc = [_][]const u8{ "src/**/*", "node_modules/typed/**/*" };
-    try testing.expect(!implicitlyPruned(&inc, "", "node_modules"));
-    try testing.expect(implicitlyPruned(&inc, "src/deep", "node_modules"));
-    try testing.expect(implicitlyPruned(&inc, "node_modules/typed", "node_modules"));
-    try testing.expect(implicitlyPruned(&inc, "", "jspm_packages"));
+    try testing.expect(!implicitlyPruned(&m, &inc, "", "node_modules"));
+    try testing.expect(implicitlyPruned(&m, &inc, "src/deep", "node_modules"));
+    try testing.expect(implicitlyPruned(&m, &inc, "node_modules/typed", "node_modules"));
+    try testing.expect(implicitlyPruned(&m, &inc, "", "jspm_packages"));
 
     // Wildcard territory always prunes, even one segment in: `src/*/index.ts`
     // could match `src/node_modules/index.ts` textually, and tsc still refuses.
-    try testing.expect(implicitlyPruned(&.{"src/*/index.ts"}, "src", "node_modules"));
+    try testing.expect(implicitlyPruned(&m, &.{"src/*/index.ts"}, "src", "node_modules"));
 
     // A project *under* a package folder: the walk root's own segments sit
     // inside the pattern's literal prefix, so they open.
     const under = [_][]const u8{"node_modules/mypkg/src/**/*"};
-    try testing.expect(!implicitlyPruned(&under, "", "node_modules"));
-    try testing.expect(implicitlyPruned(&under, "node_modules/mypkg", "node_modules"));
-    try testing.expect(implicitlyPruned(&under, "node_modules/mypkg/src/deep", "node_modules"));
+    try testing.expect(!implicitlyPruned(&m, &under, "", "node_modules"));
+    try testing.expect(implicitlyPruned(&m, &under, "node_modules/mypkg", "node_modules"));
+    try testing.expect(implicitlyPruned(&m, &under, "node_modules/mypkg/src/deep", "node_modules"));
 }
 
 test "config: explicit exclude does not re-enable walking node_modules" {
