@@ -11,8 +11,9 @@
 //!   wildcard and no extension is treated as a directory (`p` -> `p/**/*`),
 //!   like tsc. Only `.ts`/`.d.ts` files are collected. Default include (when
 //!   neither `files` nor `include` is present) is `**/*`. The default `exclude`
-//!   is empty: tsc's is `[outDir, declarationDir]`, and ztsc ignores both (it
-//!   never emits). What keeps the walk out of `node_modules`,
+//!   — used only when no `exclude` key survives the `extends` merge — is
+//!   `[outDir, declarationDir]`; see `defaultExcludes`. What keeps the walk out
+//!   of `node_modules`,
 //!   `bower_components` and `jspm_packages` is not `exclude` at all but tsc's
 //!   `implicitExcludePathRegexPattern`, which prunes those folder names
 //!   wherever a wildcard could have reached them — so an explicit `exclude`
@@ -23,6 +24,8 @@
 //!   - `strict` must be `true` or absent — ztsc only implements strict
 //!     semantics, so `strict: false` is a polite hard error (exit 2).
 //!   - `noEmit` is ignored (ztsc never emits).
+//!   - `outDir` / `declarationDir` are accepted and never used as output
+//!     locations; they matter only as the default `exclude` above.
 //!   - `target` / `module` / `moduleResolution` are accepted and ignored
 //!     (surfaced as notes under `--verbose`): ztsc always checks its fixed
 //!     esnext/bundler-resolution subset.
@@ -215,13 +218,6 @@ pub fn loadInDir(io: Io, arena: Allocator, base: Io.Dir, config_path: []const u8
     } else if (acc.files == null) {
         include_pats = &default_include;
     }
-    var exclude_pats: []const []const u8 = &default_excludes;
-    var exclude_dir: []const u8 = include_dir;
-    if (acc.exclude) |list| {
-        exclude_pats = list;
-        exclude_dir = acc.exclude_dir;
-    }
-
     if (include_pats.len > 0) {
         // Re-express include/exclude patterns in the base-relative space the
         // filesystem walk produces, so patterns from different configs (and the
@@ -231,8 +227,12 @@ pub fn loadInDir(io: Io, arena: Allocator, base: Io.Dir, config_path: []const u8
             try inc_abs.append(arena, try joinNormalize(arena, include_dir, try preprocessInclude(arena, p)));
         }
         var exc_abs: std.ArrayList([]const u8) = .empty;
-        for (exclude_pats) |e| {
-            try exc_abs.append(arena, try joinNormalize(arena, exclude_dir, e));
+        if (acc.exclude) |list| {
+            for (list) |e| {
+                try exc_abs.append(arena, try joinNormalize(arena, acc.exclude_dir, e));
+            }
+        } else {
+            try defaultExcludes(arena, &exc_abs, &acc);
         }
         const matched = try expandInclude(io, arena, base, include_dir, inc_abs.items, exc_abs.items, &warnings, cfg.path);
         for (matched) |m| {
@@ -924,6 +924,13 @@ const Merged = struct {
     include_dir: []const u8 = "",
     exclude: ?[]const []const u8 = null,
     exclude_dir: []const u8 = "",
+    // `compilerOptions.outDir` / `declarationDir`: emit-only for tsc and
+    // meaningless to ztsc except as the *default* `exclude` (see
+    // `defaultExcludes`). Anchored to the config that declared them.
+    out_dir: ?[]const u8 = null,
+    out_dir_dir: []const u8 = "",
+    declaration_dir: ?[]const u8 = null,
+    declaration_dir_dir: []const u8 = "",
     // `compilerOptions.types`: restrict auto-`@types` inclusion to the named
     // packages (null = unset → include everything; `[]` = include nothing).
     types: ?[]const []const u8 = null,
@@ -1147,6 +1154,24 @@ fn applyOwn(
                     } else {
                         try warn(arena, warnings, "{s}: '{s}' must be a boolean (ignored)", .{ config_path, okey });
                     }
+                } else if (std.mem.eql(u8, okey, "outDir") or std.mem.eql(u8, okey, "declarationDir")) {
+                    // Never used as an output location (ztsc does not emit),
+                    // only as tsc's default `exclude`; see `defaultExcludes`.
+                    if (oval == .string) {
+                        if (std.mem.eql(u8, okey, "outDir")) {
+                            acc.out_dir = oval.string;
+                            acc.out_dir_dir = dir;
+                        } else {
+                            acc.declaration_dir = oval.string;
+                            acc.declaration_dir_dir = dir;
+                        }
+                        // Worded for the general case: this fires while merging
+                        // one config, before it is known whether some config in
+                        // the chain has an `exclude` that drops the default.
+                        try note(arena, notes, "{s}: '{s}' accepted; ztsc never emits, so it affects only the default 'exclude', which any explicit 'exclude' replaces", .{ config_path, okey });
+                    } else {
+                        try warn(arena, warnings, "{s}: '{s}' must be a string (ignored)", .{ config_path, okey });
+                    }
                 } else if (std.mem.eql(u8, okey, "baseUrl")) {
                     if (oval == .string) {
                         acc.base_url = oval.string;
@@ -1239,13 +1264,48 @@ fn isFile(io: Io, base: Io.Dir, path: []const u8) bool {
 const default_include = [_][]const u8{"**/*"};
 
 /// The package folders tsc keeps the include walk out of (`implicitlyPruned`).
-/// They are *not* a default `exclude`: tsc's default `exclude` is
-/// `[outDir, declarationDir]`, both of which ztsc ignores (it never emits), so
-/// the fallback below is empty. Modeling them as an exclude instead would make
-/// them unconditional and defeat the escape hatch — `include:
-/// ["node_modules/typed"]` with no `exclude` field must still find its files.
+/// They are *not* a default `exclude` — that is `[outDir, declarationDir]`, see
+/// `defaultExcludes`. Modeling them as an exclude instead would make them
+/// unconditional and defeat the escape hatch: `include: ["node_modules/typed"]`
+/// with no `exclude` field must still find its files.
 const common_package_dirs = [_][]const u8{ "node_modules", "bower_components", "jspm_packages" };
-const default_excludes = [_][]const u8{};
+
+/// tsc's default `exclude`, used only when the merged config has no `exclude`
+/// key at all: the `outDir` and `declarationDir` that are set, each resolved
+/// against the config that declared it. Appends base-relative patterns to `out`.
+///
+/// The rule is a plain substitution, not a union — it is `exclude` that decides,
+/// and any `exclude` (even `[]`, even one inherited through `extends`) replaces
+/// this list wholesale, so a project that sets `outDir` and any `exclude` roots
+/// its own output. Nothing else is consulted: neither `declaration` (an
+/// unusable `declarationDir` still excludes) nor whether the directory holds
+/// real sources or is the project root (`outDir: "."` legitimately empties the
+/// program), nor an `include` that names it — exclude always wins. Verified
+/// against tsc 7.0.2.
+///
+/// Two patterns per directory: the literal path, so the walk prunes the
+/// directory on sight, and `<dir>/**/*`, which is what tsc's trailing `($|/)`
+/// buys and is the only form that still bites when the excluded directory is
+/// the walk root itself and so is never tested as a child.
+///
+/// An absolute value is inert, exactly as an absolute entry in an explicit
+/// `exclude` is: the walk names files relative to the process base, and nothing
+/// here rebases an already-rooted path onto it.
+fn defaultExcludes(arena: Allocator, out: *std.ArrayList([]const u8), acc: *const Merged) Error!void {
+    const dirs = [_]struct { ?[]const u8, []const u8 }{
+        .{ acc.out_dir, acc.out_dir_dir },
+        .{ acc.declaration_dir, acc.declaration_dir_dir },
+    };
+    for (dirs) |d| {
+        const spec = d[0] orelse continue;
+        const abs = try joinNormalize(arena, d[1], spec);
+        try out.append(arena, abs);
+        try out.append(arena, if (std.mem.eql(u8, abs, "."))
+            "**/*"
+        else
+            try std.fmt.allocPrint(arena, "{s}/**/*", .{abs}));
+    }
+}
 
 fn warn(arena: Allocator, list: *std.ArrayList([]const u8), comptime fmt: []const u8, args: anytype) Error!void {
     try list.append(arena, try std.fmt.allocPrint(arena, fmt, args));
@@ -1569,6 +1629,246 @@ test "config: files + include/exclude expansion" {
     try testing.expectEqualStrings("proj/src/b.d.ts", cfg.root_files[2]);
     try testing.expectEqual(@as(usize, 0), cfg.warnings.len);
     try testing.expect(cfg.notes.len > 0); // noEmit note
+}
+
+/// Tree shared by the `outDir`/`declarationDir` default-exclude tests: sources
+/// at the root and under `src`, generated output under `out` and `decls`.
+/// `output/` and `out.ts` are the whole-segment decoys — `outDir: "out"` must
+/// leave both alone, which a plain string-prefix exclude test would not.
+fn writeOutDirTree(io: Io, d: Io.Dir, config: []const u8) !void {
+    try d.createDirPath(io, "proj/src");
+    try d.createDirPath(io, "proj/out");
+    try d.createDirPath(io, "proj/decls");
+    try d.createDirPath(io, "proj/output");
+    try d.writeFile(io, .{ .sub_path = "proj/root.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/out.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/src/a.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/out/b.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/out/c.d.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/decls/e.d.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/output/o.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/tsconfig.json", .data = config });
+}
+
+test "config: outDir/declarationDir are the default exclude" {
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const d = tmp.dir;
+    try writeOutDirTree(io, d,
+        \\{ "compilerOptions": { "strict": true, "declaration": true,
+        \\                       "outDir": "out", "declarationDir": "./decls/" } }
+    );
+
+    const cfg = try loadInDir(io, alloc, d, "proj/tsconfig.json");
+    try testing.expectEqual(@as(usize, 4), cfg.root_files.len);
+    // `out.ts` and `output/` are not `out`: the exclude matches whole segments.
+    try testing.expectEqualStrings("proj/out.ts", cfg.root_files[0]);
+    try testing.expectEqualStrings("proj/output/o.ts", cfg.root_files[1]);
+    try testing.expectEqualStrings("proj/root.ts", cfg.root_files[2]);
+    try testing.expectEqualStrings("proj/src/a.ts", cfg.root_files[3]);
+    // Accepted, not "unknown compiler option" (`declaration` still is one).
+    try testing.expectEqual(@as(usize, 1), cfg.warnings.len);
+    try testing.expectEqual(@as(usize, 3), cfg.notes.len); // both, plus skipLibCheck
+}
+
+test "config: any 'exclude' replaces the outDir default wholesale" {
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // An `exclude` that never mentions `out`/`decls` still un-excludes them:
+    // the default is substituted, never unioned.
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try writeOutDirTree(io, tmp.dir,
+            \\{ "compilerOptions": { "strict": true, "outDir": "out", "declarationDir": "decls" },
+            \\  "exclude": ["src"] }
+        );
+        const cfg = try loadInDir(io, alloc, tmp.dir, "proj/tsconfig.json");
+        try testing.expectEqual(@as(usize, 6), cfg.root_files.len);
+        try testing.expectEqualStrings("proj/decls/e.d.ts", cfg.root_files[0]);
+        try testing.expectEqualStrings("proj/out.ts", cfg.root_files[1]);
+        try testing.expectEqualStrings("proj/out/b.ts", cfg.root_files[2]);
+        try testing.expectEqualStrings("proj/out/c.d.ts", cfg.root_files[3]);
+        try testing.expectEqualStrings("proj/output/o.ts", cfg.root_files[4]);
+        try testing.expectEqualStrings("proj/root.ts", cfg.root_files[5]);
+    }
+    // Even an empty one.
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try writeOutDirTree(io, tmp.dir,
+            \\{ "compilerOptions": { "strict": true, "outDir": "out" }, "exclude": [] }
+        );
+        const cfg = try loadInDir(io, alloc, tmp.dir, "proj/tsconfig.json");
+        try testing.expectEqual(@as(usize, 7), cfg.root_files.len);
+    }
+}
+
+test "config: the outDir default exclude beats an include that names it" {
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try writeOutDirTree(io, tmp.dir,
+            \\{ "compilerOptions": { "strict": true, "outDir": "out" }, "include": ["out/**/*"] }
+        );
+        const cfg = try loadInDir(io, alloc, tmp.dir, "proj/tsconfig.json");
+        try testing.expectEqual(@as(usize, 0), cfg.root_files.len);
+    }
+    // `outDir` at the project root excludes the project (tsc: TS18003).
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try writeOutDirTree(io, tmp.dir,
+            \\{ "compilerOptions": { "strict": true, "outDir": "." } }
+        );
+        const cfg = try loadInDir(io, alloc, tmp.dir, "proj/tsconfig.json");
+        try testing.expectEqual(@as(usize, 0), cfg.root_files.len);
+    }
+    // `""` is not "unset": it normalizes to the declaring config's directory,
+    // so it empties the program exactly as `"."` does.
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try writeOutDirTree(io, tmp.dir,
+            \\{ "compilerOptions": { "strict": true, "outDir": "" } }
+        );
+        const cfg = try loadInDir(io, alloc, tmp.dir, "proj/tsconfig.json");
+        try testing.expectEqual(@as(usize, 0), cfg.root_files.len);
+    }
+}
+
+test "config: a project at the walk root excludes itself via the bare '**/*' form" {
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Config directory `""` is the one case where the excluded path normalizes
+    // to `.`; the literal pattern cannot match (the walk root is never tested
+    // as a child), so only the `**/*` descendant form empties the program.
+    for ([_][]const u8{ ".", "" }) |out_dir| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const d = tmp.dir;
+        try d.createDirPath(io, "src");
+        try d.writeFile(io, .{ .sub_path = "root.ts", .data = "" });
+        try d.writeFile(io, .{ .sub_path = "src/a.ts", .data = "" });
+        const config = try std.fmt.allocPrint(
+            alloc,
+            "{{ \"compilerOptions\": {{ \"strict\": true, \"outDir\": \"{s}\" }} }}",
+            .{out_dir},
+        );
+        try d.writeFile(io, .{ .sub_path = "tsconfig.json", .data = config });
+
+        const cfg = try loadInDir(io, alloc, d, "tsconfig.json");
+        try testing.expectEqualStrings("", cfg.dir);
+        try testing.expectEqual(@as(usize, 0), cfg.root_files.len);
+    }
+}
+
+test "config: extends — outDir anchors to the config that declared it" {
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const d = tmp.dir;
+    try d.createDirPath(io, "proj/src");
+    try d.createDirPath(io, "proj/out");
+    try d.createDirPath(io, "proj/base/out");
+    try d.writeFile(io, .{ .sub_path = "proj/src/a.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/out/b.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/base/out/q.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/base/tsconfig.base.json", .data =
+        \\{ "compilerOptions": { "strict": true, "outDir": "out" } }
+    });
+    try d.writeFile(io, .{ .sub_path = "proj/tsconfig.json", .data =
+        \\{ "extends": "./base/tsconfig.base.json" }
+    });
+
+    // `out` means `proj/base/out`, so the project's own `proj/out` survives.
+    const cfg = try loadInDir(io, alloc, d, "proj/tsconfig.json");
+    try testing.expectEqual(@as(usize, 2), cfg.root_files.len);
+    try testing.expectEqualStrings("proj/out/b.ts", cfg.root_files[0]);
+    try testing.expectEqualStrings("proj/src/a.ts", cfg.root_files[1]);
+}
+
+test "config: extends — a child's outDir replaces the base's, its declarationDir survives" {
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const d = tmp.dir;
+    try d.createDirPath(io, "proj/src");
+    try d.createDirPath(io, "proj/out");
+    try d.createDirPath(io, "proj/other");
+    try d.createDirPath(io, "proj/base/out");
+    try d.createDirPath(io, "proj/base/decls");
+    try d.writeFile(io, .{ .sub_path = "proj/src/a.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/out/b.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/other/o.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/base/out/q.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/base/decls/w.d.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/base/tsconfig.base.json", .data =
+        \\{ "compilerOptions": { "strict": true, "outDir": "out", "declarationDir": "decls" } }
+    });
+    try d.writeFile(io, .{ .sub_path = "proj/tsconfig.json", .data =
+        \\{ "extends": "./base/tsconfig.base.json", "compilerOptions": { "outDir": "other" } }
+    });
+
+    // The two options are independent: `outDir` is now `proj/other` (so the
+    // base's `proj/base/out` is back in), while `declarationDir` still carries
+    // the base's anchor and keeps `proj/base/decls` out.
+    const cfg = try loadInDir(io, alloc, d, "proj/tsconfig.json");
+    try testing.expectEqual(@as(usize, 3), cfg.root_files.len);
+    try testing.expectEqualStrings("proj/base/out/q.ts", cfg.root_files[0]);
+    try testing.expectEqualStrings("proj/out/b.ts", cfg.root_files[1]);
+    try testing.expectEqualStrings("proj/src/a.ts", cfg.root_files[2]);
+}
+
+test "config: extends — an inherited 'exclude' still replaces the outDir default" {
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const d = tmp.dir;
+    try writeOutDirTree(io, d,
+        \\{ "extends": "./tsconfig.base.json",
+        \\  "compilerOptions": { "outDir": "out", "declarationDir": "decls" } }
+    );
+    try d.writeFile(io, .{ .sub_path = "proj/tsconfig.base.json", .data =
+        \\{ "compilerOptions": { "strict": true }, "exclude": ["src"] }
+    });
+
+    const cfg = try loadInDir(io, alloc, d, "proj/tsconfig.json");
+    try testing.expectEqual(@as(usize, 6), cfg.root_files.len);
+    try testing.expectEqualStrings("proj/decls/e.d.ts", cfg.root_files[0]);
+    try testing.expectEqualStrings("proj/out.ts", cfg.root_files[1]);
+    try testing.expectEqualStrings("proj/out/b.ts", cfg.root_files[2]);
+    try testing.expectEqualStrings("proj/out/c.d.ts", cfg.root_files[3]);
+    try testing.expectEqualStrings("proj/output/o.ts", cfg.root_files[4]);
+    try testing.expectEqualStrings("proj/root.ts", cfg.root_files[5]);
 }
 
 test "literalPrefix: leading wildcard-free segments" {
