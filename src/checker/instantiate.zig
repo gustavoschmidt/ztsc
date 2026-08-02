@@ -176,8 +176,14 @@ pub fn expandRef(c: *Checker, ref: TypeId) Error!TypeId {
     const args = try c.scratch().dupe(TypeId, c.ts.refArgs(ref));
     const f = c.symFlags(sym);
     var generic: TypeId = types.any_type;
+    // A class's generic table is PROVISIONAL when some class on the way was
+    // still materializing (`classTableProvisional`); such a table is never
+    // memoized, and neither is any expansion built on it — see the invariant
+    // on `classTableProvisional`.
+    var provisional = false;
     if (f.class) {
         generic = try c.classInstanceGeneric(sym);
+        provisional = c.classTableProvisional(sym);
     } else if (f.interface) {
         generic = try c.interfaceGeneric(sym);
     } else if (f.type_alias) {
@@ -203,6 +209,15 @@ pub fn expandRef(c: *Checker, ref: TypeId) Error!TypeId {
         // decreases so it fully reduces to `"c"`. A growing recursion
         // (`Grow<{deeper:T}>`) never re-expands — its metric increases.
         if (f.type_alias) result = try c.reexpandShrinking(ref, result);
+    }
+    // Withdraw the in-progress mark rather than memoizing an expansion of a
+    // provisional table: the answer is only true for the duration of the
+    // cycle that produced it, and the first reader outside that cycle must
+    // recompute it. Nor is it origin-tagged — an incomplete object must not
+    // become the identity other materializations of `ref` relate to.
+    if (provisional) {
+        _ = c.expansions.remove(ref);
+        return result;
     }
     // Origin tag: this object is the materialization of `ref =
     // makeRef(sym, canonical-args)` (interface refs carry default-filled
@@ -974,6 +989,9 @@ pub fn classInstanceGeneric(c: *Checker, sym: SymbolId) Error!TypeId {
     }
     var props: std.ArrayList(types.Prop) = .empty;
     defer props.deinit(c.scratch());
+    // Set when a base could not be folded completely; see the base merge
+    // below and the invariant on `classTableProvisional`.
+    var provisional = false;
     // A class instance is a nominal shape without the implied string index
     // that an object/type literal carries (an empty `class C {}` must still
     // fail assignment to `{[k:string]:T}`).
@@ -1015,9 +1033,15 @@ pub fn classInstanceGeneric(c: *Checker, sym: SymbolId) Error!TypeId {
     if (iface_half) {
         result = try c.mergeBaseObject(result, try c.interfaceConstituentDirect(sym, sym), true);
     }
-    // Merge base class instance.
+    // Merge base class instance. A base whose own table is still
+    // materializing further down this stack resolves to `err`, which
+    // `mergeBaseObject`'s object-only guard drops — the derived instance
+    // then silently loses EVERY inherited member. The fold still cuts (there
+    // is nothing else it could do mid-cycle), but the incomplete table it
+    // produced is marked provisional so it is never memoized.
     if (try c.baseClassRef(sym)) |base_ref| {
         result = try c.mergeBaseObject(result, try c.resolveStructural(base_ref), false);
+        if (c.baseRefProvisional(base_ref)) provisional = true;
     } else if (try c.baseExprConstructType(sym)) |base_ctor| {
         // `extends <value with construct signatures>`: the base instance is
         // the construct signature's return type.
@@ -1037,22 +1061,60 @@ pub fn classInstanceGeneric(c: *Checker, sym: SymbolId) Error!TypeId {
             result = try c.mergeBaseObject(result, try c.interfaceConstituentDirect(p, sym), true);
         }
     }
-    if (iface_half) result = try c.classInterfaceHalfBases(sym, result);
-    try c.class_inst_generic.put(c.cm(), sym, result);
+    if (iface_half) result = try c.classInterfaceHalfBases(sym, result, &provisional);
+    // Only a table folded over COMPLETE bases earns a place in the memo —
+    // see `classTableProvisional`. Withdraw the in-progress mark otherwise,
+    // so the next reader recomputes instead of inheriting the cut.
+    if (provisional) {
+        _ = c.class_inst_generic.remove(sym);
+    } else {
+        try c.class_inst_generic.put(c.cm(), sym, result);
+    }
     return result;
+}
+
+/// Was `sym`'s class member table left PROVISIONAL — folded over a base this
+/// checker could not see completely, because that base's own table was still
+/// materializing further down the stack?
+///
+/// The invariant this reads: **`class_inst_generic` holds complete tables
+/// only.** A table folded across a cycle cut is returned to its caller (there
+/// is no better answer mid-cycle) but never memoized, so the entry is either
+/// absent (provisional, withdrawn) or `no_type` (still materializing) exactly
+/// when the answer is incomplete. Transitivity is free: a derived class that
+/// folded a provisional base sees no memo entry for it and marks itself
+/// provisional in turn.
+pub fn classTableProvisional(c: *Checker, sym: SymbolId) bool {
+    const g = c.class_inst_generic.get(sym) orelse return true;
+    return g == types.no_type;
+}
+
+/// `classTableProvisional` for a resolved base written as a type reference.
+/// Only class refs answer true — an interface / alias base is folded by
+/// different machinery with its own guard.
+pub fn baseRefProvisional(c: *Checker, base_ref: TypeId) bool {
+    if (c.ts.kind(base_ref) != .ref) return false;
+    const sym = c.ts.refSymbol(base_ref);
+    if (!c.symFlags(sym).class) return false;
+    return c.classTableProvisional(sym);
 }
 
 /// Fold the `extends` bases written on a class's same-file `interface` half
 /// into its instance type; members already in `acc` (the class's own and the
 /// interface half's declared members, plus the class's `extends` base) win.
-pub fn classInterfaceHalfBases(c: *Checker, sym: SymbolId, acc: TypeId) Error!TypeId {
+/// A class base among them that could not be folded completely sets
+/// `provisional`, exactly as the class's own `extends` base does.
+pub fn classInterfaceHalfBases(c: *Checker, sym: SymbolId, acc: TypeId, provisional: *bool) Error!TypeId {
     const saved_ctx = c.enterSymFile(sym);
     defer c.restoreCtx(saved_ctx);
     var bases: std.ArrayList(TypeId) = .empty;
     defer bases.deinit(c.scratch());
     try c.interfaceHeritageTypes(sym, &bases);
     var own = acc;
-    for (bases.items) |b| own = try c.mergeBaseResolved(own, try c.resolveStructural(b));
+    for (bases.items) |b| {
+        own = try c.mergeBaseResolved(own, try c.resolveStructural(b));
+        if (c.baseRefProvisional(b)) provisional.* = true;
+    }
     return own;
 }
 
@@ -1066,21 +1128,31 @@ pub fn isCtorName(c: *Checker, name: Atom) bool {
 /// caches are unavailable, so it carries its own belt.
 pub const lazy_base_depth: u32 = 16;
 
+/// Is `sym`'s class member table being materialized further down this
+/// checker's stack? `classInstanceGeneric` marks in-progress with `no_type`,
+/// and answers `error_type` — a cut, not a result — for the whole window.
+pub fn classGenericInProgress(c: *Checker, sym: SymbolId) bool {
+    const g = c.class_inst_generic.get(sym) orelse return false;
+    return g == types.no_type;
+}
+
 /// Is `ref`'s materialization already on this checker's stack? Both layers
 /// mark in-progress with `no_type`: `class_inst_generic` for the class's
-/// own member table and `expansions` for this particular argument list.
-/// The class layer is consulted FIRST — once its guard has fired,
-/// `expandRef` memoizes the resulting `error_type` against the ref, so the
-/// `expansions` entry no longer reads as in-progress even though the
-/// member table still is.
+/// own member table and `expansions` for this particular argument list. The
+/// class layer is consulted FIRST and is the authoritative one — a SECOND
+/// argument list for the same class (`Sel<any>` reached while `Sel<T>` is
+/// materializing) has no `expansions` mark of its own, and `expandRef`
+/// withdraws the mark it did make rather than memoizing the cut, so only the
+/// class layer can see the whole window.
+///
+/// Distinct from `classTableProvisional`, which also answers true for a
+/// class whose table was withdrawn and is not being materialized right now.
+/// This one is the narrower "on the stack" question the lazy single-member
+/// lookups route on.
 pub fn refExpansionActive(c: *Checker, ref: TypeId) bool {
     if (c.ts.kind(ref) != .ref) return false;
     const sym = c.ts.refSymbol(ref);
-    if (c.symFlags(sym).class) {
-        if (c.class_inst_generic.get(sym)) |g| {
-            if (g == types.no_type) return true;
-        }
-    }
+    if (c.symFlags(sym).class and c.classGenericInProgress(sym)) return true;
     const e = c.expansions.get(ref) orelse return false;
     return e == types.no_type;
 }
