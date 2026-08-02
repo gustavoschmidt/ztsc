@@ -443,29 +443,47 @@ pub const IfaceFrame = struct { sym: SymbolId, resolving_base: bool = false };
 /// constraint/default are already `M`-instantiated TypeIds (`no_type` = none).
 pub const FreshTp = struct { name: Atom, constraint: TypeId, default: TypeId, has_default: bool };
 
+/// One entry of `Checker.mapped_key_scopes`: a mapped type's key parameter
+/// `K`, in scope for that map's `as`/value branches (and for anything nested
+/// in them).
+pub const MappedKeyScope = struct {
+    name: Atom,
+    /// The `mapped_param` type `name` resolves to, or 0 for a SHADOW entry:
+    /// a nearer non-mapped binder of the same name (a signature's own type
+    /// parameter) that hides every enclosing mapped key called `name`.
+    ty: TypeId,
+    /// `infer_scopes` stack height when this key was entered. A same-named
+    /// outer `infer X` (scope index < this) is OUTER to the mapped key `[X in
+    /// K]` and is shadowed by it (lexical innermost-wins); an `infer X` pushed
+    /// by a conditional NESTED in the mapped value (index >= this) stays inner
+    /// and still wins.
+    infer_depth: usize,
+};
+
 /// Every long-lived `Checker` container whose storage comes from `cm()` (the
 /// freeing container allocator) rather than the checker arena. Listed once so
 /// `deinit` cannot fall behind the field set: a container added to `Checker`
 /// and fed from `cm()` but forgotten here leaks its whole table.
 pub const map_containers = [_][]const u8{
-    "node_types",               "sig_cache",          "node_scopes",
-    "reassigned_syms",          "reassigned_in_loop", "member_written_syms",
-    "member_written_in_loop",   "ns_types",           "ambient_ns_types",
-    "relation",                 "expansions",         "overload_rotate",
-    "origin",                   "iface_generic",      "iface_stack",
-    "pending_class_decos",      "class_inst_generic", "class_static_cache",
-    "class_static_base_active", "class_ctor_cache",   "enum_value_cache",
-    "enum_info_cache",          "alias_generic",      "alias_state",
-    "alias_recursive",          "flow_same",          "flow_narrow",
-    "ref_keys",                 "flow_loop_stack",    "flow_stack",
-    "flow_tmp",                 "da_cache",           "ctp_cache",
-    "cmp_cache",                "inst_cache",         "inst_map_ids",
-    "tp_constraint_cache",      "fresh_tp_ids",       "fresh_tp_info",
-    "type_node_cache",          "atom_cache",         "infer_ids",
-    "infer_scopes",             "mapped_key_ids",     "inst_diag_at",
-    "infer_active",             "lazy_member_active", "chain_guards",
-    "never_isect",              "deep_path_list",     "deep_path_ids",
-    "flow_reach",               "member_type_stack",  "lazy_index_objs",
+    "node_types",               "sig_cache",           "node_scopes",
+    "reassigned_syms",          "reassigned_in_loop",  "member_written_syms",
+    "member_written_in_loop",   "ns_types",            "ambient_ns_types",
+    "relation",                 "expansions",          "overload_rotate",
+    "origin",                   "iface_generic",       "iface_stack",
+    "pending_class_decos",      "class_inst_generic",  "class_static_cache",
+    "class_static_base_active", "class_ctor_cache",    "enum_value_cache",
+    "enum_info_cache",          "alias_generic",       "alias_state",
+    "alias_recursive",          "flow_same",           "flow_narrow",
+    "ref_keys",                 "flow_loop_stack",     "flow_stack",
+    "flow_tmp",                 "da_cache",            "ctp_cache",
+    "cmp_cache",                "mmp_cache",           "inst_cache",
+    "inst_map_ids",             "tp_constraint_cache", "fresh_tp_ids",
+    "fresh_tp_info",            "type_node_cache",     "atom_cache",
+    "infer_ids",                "infer_scopes",        "mapped_key_ids",
+    "mapped_key_scopes",        "inst_diag_at",        "infer_active",
+    "lazy_member_active",       "chain_guards",        "never_isect",
+    "deep_path_list",           "deep_path_ids",       "flow_reach",
+    "member_type_stack",        "lazy_index_objs",
 };
 
 pub const Checker = struct {
@@ -755,6 +773,10 @@ pub const Checker = struct {
     ctp_cache: std.AutoHashMapUnmanaged(TypeId, u8) = .empty,
     /// containsMappedParam memo: 0 unknown, 1 no, 2 yes.
     cmp_cache: std.AutoHashMapUnmanaged(TypeId, u8) = .empty,
+    /// mentionsMappedParam memo, keyed `(t << 32 | key_id)`: 0 unknown/in
+    /// progress, 1 no, 2 yes. Separate from `cmp_cache` because the answer
+    /// depends on WHICH key parameter is asked about.
+    mmp_cache: std.AutoHashMapUnmanaged(u64, u8) = .empty,
     /// Instantiation memo: `(canonical_map_id << 32 | t) -> result`. A
     /// substitution is a pure function of `(t, map-contents)`; `map_id`
     /// canonically identifies the map's `(type-param, arg)` set (order- and
@@ -821,18 +843,19 @@ pub const Checker = struct {
     /// id for its `K` (stable across the memo-off re-evaluations of the node).
     mapped_key_ids: std.AutoHashMapUnmanaged(u64, u32) = .empty,
     mapped_key_next: u32 = 1,
-    /// The mapped key parameter currently in scope (0 = none). While building a
-    /// mapped type's `as`/value branches, a bare reference to `K` resolves to
-    /// this `mapped_param` type; the constraint is evaluated with it cleared.
-    cur_mapped_key_name: Atom = 0,
-    cur_mapped_key_ty: TypeId = 0,
-    /// Infer-scope stack height captured when `cur_mapped_key_*` was entered.
-    /// A same-named outer `infer X` (scope index < this) is OUTER to the mapped
-    /// key `[X in K]` and is shadowed by it (lexical innermost-wins); an `infer
-    /// X` pushed by a conditional NESTED in the mapped value (index >= this)
-    /// stays inner and still wins. See the resolution site in
+    /// Stack of the mapped key parameters currently in scope, outermost
+    /// first. While building a mapped type's `as`/value branches, a bare
+    /// reference to `K` resolves to that entry's `mapped_param` type; the
+    /// constraint is evaluated with the entry not yet pushed. It is a STACK,
+    /// not a single slot, because a mapped type nested in another mapped
+    /// type's value must still see the ENCLOSING key: `{ [P in keyof S]: {
+    /// [M in keyof S[P]]: S[P][M] } }` mentions `P` inside the inner map's
+    /// value, and hono's `MergeSchemaPath` / ajv's `JTDSchemaType` do exactly
+    /// that (a single slot reported TS2304 "Cannot find name 'P'" there).
+    /// Lookup is innermost-out by name, so an inner key shadows a same-named
+    /// outer one. See `lookupMappedKey` / the resolution site in
     /// `typeFromTypeNodeUncached`.
-    cur_mapped_key_scope_depth: usize = 0,
+    mapped_key_scopes: std.ArrayListUnmanaged(MappedKeyScope) = .empty,
     /// Type-param names of the alias declaration whose (memoized) generic body
     /// is currently being materialized. Such a param is lexically the innermost
     /// binding of its name inside the body, so it shadows a same-named `infer`
@@ -2070,6 +2093,7 @@ pub const Checker = struct {
     pub const typeNodeCacheable = typenode_zig.typeNodeCacheable;
     pub const typeFromTypeNodeUncached = typenode_zig.typeFromTypeNodeUncached;
     pub const typeFromTypeName = typenode_zig.typeFromTypeName;
+    pub const lookupMappedKey = typenode_zig.lookupMappedKey;
     pub const materializeTypeRef = typenode_zig.materializeTypeRef;
     pub const augmentModuleTypeSym = typenode_zig.augmentModuleTypeSym;
     pub const namespaceMemberSym = typenode_zig.namespaceMemberSym;
@@ -2307,6 +2331,8 @@ pub const Checker = struct {
     pub const isGenericObjectForIndex = generics_zig.isGenericObjectForIndex;
     pub const containsMappedParam = generics_zig.containsMappedParam;
     pub const containsMappedParamInner = generics_zig.containsMappedParamInner;
+    pub const mentionsMappedParam = generics_zig.mentionsMappedParam;
+    pub const mentionsMappedParamInner = generics_zig.mentionsMappedParamInner;
     pub const substMappedKey = generics_zig.substMappedKey;
     pub const intrinsicStringMapping = generics_zig.intrinsicStringMapping;
     pub const aliasBodyIsIntrinsic = generics_zig.aliasBodyIsIntrinsic;

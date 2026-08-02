@@ -97,19 +97,17 @@ pub fn signatureOfProtoCtx(
     // `mapped_param`, which `containsTypeParam` misses — so `eraseTypeParams`
     // silently no-ops and the sig never relates (order-dependent, since it
     // only triggers when the mapped key happens to be in scope at
-    // materialization time). Cleared for the whole body via defer.
-    const saved_mkey_name = c.cur_mapped_key_name;
-    const saved_mkey_ty = c.cur_mapped_key_ty;
-    defer {
-        c.cur_mapped_key_name = saved_mkey_name;
-        c.cur_mapped_key_ty = saved_mkey_ty;
-    }
+    // materialization time). Hidden for the whole body via defer, by pushing
+    // a SHADOW entry (`ty == 0`) per colliding name onto the mapped-key
+    // stack — only that name is hidden, so an enclosing map's differently
+    // named key stays visible to the sig.
+    const saved_keys = c.mapped_key_scopes.items.len;
+    defer c.mapped_key_scopes.shrinkRetainingCapacity(saved_keys);
     for (c.tree.extraRange(proto.tp_start, proto.tp_end)) |tp| {
         if (tp == null_node or c.nodeTag(tp) != .type_param) continue;
         const a = try c.atomOfToken(c.tree.nodeMainToken(tp));
-        if (c.cur_mapped_key_name != 0 and c.cur_mapped_key_name == a) {
-            c.cur_mapped_key_name = 0;
-            c.cur_mapped_key_ty = 0;
+        if (c.lookupMappedKey(a) != null) {
+            try c.mapped_key_scopes.append(c.cm(), .{ .name = a, .ty = 0, .infer_depth = c.infer_scopes.items.len });
         }
         if (c.bind.lookupInScope(c.cur_scope, a)) |tp_sym| {
             try tps.append(c.scratch(), c.toGlobal(tp_sym));
