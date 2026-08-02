@@ -537,7 +537,26 @@ pub fn measuredVariances(c: *Checker, owner: SymbolId) Error!?u32 {
     const saved_suppress = c.suppress_inst_diag;
     const saved_count = c.inst_count;
     c.suppress_inst_diag = true;
+    // The relation stack is bookkeeping here too, and for a stronger reason
+    // than the counters above: a measurement is a question about the GENERIC,
+    // and its answer is cached under the generic alone. Left on top of
+    // whatever chain of frames happened to demand it, the growing-instantiation
+    // guard would read those frames as part of the measurement's own spine and
+    // cut it early — turning a real verdict into `unmeasured`, which then
+    // stands for every later user of the generic. That makes the measured
+    // variance depend on which reference asked first, i.e. on file order and
+    // on how work was split across checkers.
+    //
+    // Hide them behind a FLOOR rather than clearing the stack: the frames
+    // below are still live and will pop themselves (their bucket counts have
+    // to survive), so only the growth test's window moves. The guard therefore
+    // still bounds the measurement, it just bounds it by the measurement's own
+    // spine, which is what makes the answer a pure function of the generic —
+    // tsc measures in its own `getVariances` context for the same reason.
+    const saved_rel_id_floor = c.rel_id_floor;
+    c.rel_id_floor = c.rel_id_depth;
     defer {
+        c.rel_id_floor = saved_rel_id_floor;
         c.suppress_inst_diag = saved_suppress;
         c.inst_count = saved_count;
         c.variance_measure_depth -= 1;
@@ -1049,48 +1068,6 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!bool {
                 try c.originArgEquiv(os, t, 0)) return true;
         }
     }
-    // Declared variance (`interface Box<in T>`/`<out T>`): two references
-    // to the same generic symbol relate by their type ARGUMENTS, not by
-    // their members (see `varianceVerdict`). Runs after the identity
-    // fast-paths above — an equal pair never reaches here — and yields to
-    // the structural walk whenever the annotations are not decisive.
-    //
-    // The one exemption is the marker pair a declaration-site MEASUREMENT is
-    // relating (`isVarianceMarkerRef`): answering those from the declared
-    // variance is what the measurement exists to verify, so it would make
-    // every annotation vacuously true. tsc exempts its `markerTypes` here
-    // for the same reason.
-    //
-    // Inside a measurement a NEGATIVE verdict on some *other* generic in the
-    // spine is not decisive either, and falls through to the structural walk:
-    // tsc's variance comparison keeps a structural fallback, so an inner
-    // generic whose own annotation contradicts its members (already reported
-    // on its own line) must not make its every USER a second report.
-    if (sr) |sref| {
-        if (tr) |tref| {
-            if (sref != tref and c.ts.refSymbol(sref) == c.ts.refSymbol(tref) and
-                !c.isVarianceMarkerRef(sref) and !c.isVarianceMarkerRef(tref))
-            {
-                if (try c.varianceVerdict(sref, tref)) |verdict| {
-                    if (verdict or c.variance_marker_refs[0] == 0) return verdict;
-                }
-                // Nothing declared, or nothing decisive: MEASURE how the
-                // generic uses its parameters and relate the arguments by
-                // that (see `measuredVarianceVerdict`). Positive only — a
-                // failure still falls through to the structural walk below.
-                //
-                // `marker_refs` is tsc's `markerTypes`: a pair some
-                // measurement minted is the question, not something to answer
-                // from a verdict. (The DECLARED verdict above needs no such
-                // guard for a measured pair: a mixed `<in A, B>` measuring `B`
-                // leaves `A` identical on both sides and `B` unannotated, so
-                // `varianceVerdict` is never decisive on it.)
-                if (!c.marker_refs.contains(sref) and !c.marker_refs.contains(tref)) {
-                    if (try c.measuredVarianceVerdict(sref, tref)) return true;
-                }
-            }
-        }
-    }
     // Trivial targets/sources.
     switch (tk) {
         .any, .err, .unknown, .none => return true,
@@ -1167,6 +1144,83 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!bool {
     if (cacheable) {
         c.stats.relation_misses += 1;
         try c.relation.put(c.cm(), key, 2);
+    }
+    // Declared variance (`interface Box<in T>`/`<out T>`): two references
+    // to the same generic symbol relate by their type ARGUMENTS, not by
+    // their members (see `varianceVerdict`). Runs after the identity
+    // fast-paths above — an equal pair never reaches here — and yields to
+    // the structural walk whenever the annotations are not decisive.
+    //
+    // Both probes sit HERE, below the memo lookup, the growing-instantiation
+    // guard and the in-progress mark, which is where tsc runs its own
+    // variance comparison (`relateVariances`, reached from
+    // `structuredTypeRelatedTo` — i.e. past `recursiveTypeRelatedTo`'s
+    // `maybeKeys` push and its `isDeeplyNestedType` test). The placement is
+    // load-bearing, not cosmetic: what a variance verdict relates is the two
+    // sides' ARGUMENTS, and those are very often references to the same
+    // generic one level down. A probe running ABOVE the three guards
+    // therefore recurses through itself with no memo to answer a pair already
+    // decided, no in-progress mark to cut a cycle, and — because the guard
+    // frame is pushed further down and so never reached — no growth test to
+    // cut a runaway spine like `G<A>` → `G<G<A>>` → … Nothing bounded it but
+    // `max_relation_depth`, and with a branch per type argument that bound is
+    // exponential: immich's server package hung for tens of minutes inside
+    // `relate` → `measuredVarianceVerdict` → `relate`. Down here the probe
+    // inherits all three protections, and a verdict is CACHED rather than
+    // re-derived at every reference.
+    //
+    // The one exemption is the marker pair a declaration-site MEASUREMENT is
+    // relating (`isVarianceMarkerRef`): answering those from the declared
+    // variance is what the measurement exists to verify, so it would make
+    // every annotation vacuously true. tsc exempts its `markerTypes` here
+    // for the same reason.
+    //
+    // Inside a measurement a NEGATIVE verdict on some *other* generic in the
+    // spine is not decisive either, and falls through to the structural walk:
+    // tsc's variance comparison keeps a structural fallback, so an inner
+    // generic whose own annotation contradicts its members (already reported
+    // on its own line) must not make its every USER a second report.
+    if (sr) |sref| {
+        if (tr) |tref| {
+            if (sref != tref and c.ts.refSymbol(sref) == c.ts.refSymbol(tref) and
+                !c.isVarianceMarkerRef(sref) and !c.isVarianceMarkerRef(tref))
+            {
+                if (try c.varianceVerdict(sref, tref)) |verdict| {
+                    if (verdict) {
+                        if (cacheable) try c.relation.put(c.cm(), key, 1);
+                        return true;
+                    }
+                    if (c.variance_marker_refs[0] == 0) {
+                        // A negative declared verdict is decisive only while
+                        // no measurement is in flight, so it must NOT be
+                        // memoized: the very same pair may be asked again
+                        // from inside a measurement, where the rule above
+                        // says to fall through to the structural walk. Drop
+                        // the in-progress mark instead of overwriting it, so
+                        // the pair leaves no trace either way.
+                        if (cacheable) _ = c.relation.remove(key);
+                        return false;
+                    }
+                }
+                // Nothing declared, or nothing decisive: MEASURE how the
+                // generic uses its parameters and relate the arguments by
+                // that (see `measuredVarianceVerdict`). Positive only — a
+                // failure still falls through to the structural walk below.
+                //
+                // `marker_refs` is tsc's `markerTypes`: a pair some
+                // measurement minted is the question, not something to answer
+                // from a verdict. (The DECLARED verdict above needs no such
+                // guard for a measured pair: a mixed `<in A, B>` measuring `B`
+                // leaves `A` identical on both sides and `B` unannotated, so
+                // `varianceVerdict` is never decisive on it.)
+                if (!c.marker_refs.contains(sref) and !c.marker_refs.contains(tref)) {
+                    if (try c.measuredVarianceVerdict(sref, tref)) {
+                        if (cacheable) try c.relation.put(c.cm(), key, 1);
+                        return true;
+                    }
+                }
+            }
+        }
     }
     // Nominal heritage fast path (see `nominalHeritageRelated`): a class or
     // interface reaches a DECLARED base of itself without walking members.
@@ -1395,10 +1449,14 @@ pub fn relIdDeeplyNested(c: *const Checker, src: bool) bool {
     const ids = if (src) &c.rel_src_ids else &c.rel_tgt_ids;
     const top = ids[c.rel_id_depth - 1];
     const buckets = if (src) &c.rel_src_buckets else &c.rel_tgt_buckets;
+    // The bucket filter counts the WHOLE live stack, floor included, so it
+    // stays a conservative pre-filter when a floor is set: it can only let
+    // through a scan that then finds nothing, never skip one that would have
+    // found something.
     if (buckets[relIdBucket(top.sym)] < checker_zig.max_relation_identity_repeats) return false;
     var seen: u32 = 0;
     var last: TypeId = 0;
-    for (ids[0..c.rel_id_depth]) |id| {
+    for (ids[c.rel_id_floor..c.rel_id_depth]) |id| {
         if (id.sym != top.sym) continue;
         if (id.ref > last) {
             seen += 1;

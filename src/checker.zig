@@ -1097,6 +1097,13 @@ pub const Checker = struct {
     rel_tgt_ids: [max_relation_depth]RelId = @splat(.{ .sym = 0, .ref = 0 }),
     /// Live depth of `rel_src_ids`/`rel_tgt_ids`.
     rel_id_depth: u32 = 0,
+    /// Index below which relation frames belong to an OUTER question and are
+    /// invisible to the growing-instantiation test. Raised for the duration of
+    /// a variance measurement, whose answer is cached per generic and so must
+    /// not depend on the chain of frames that happened to demand it — see
+    /// `measuredVariances`. The frames below the floor are still live and still
+    /// pop themselves; only `relIdDeeplyNested`'s window moves.
+    rel_id_floor: u32 = 0,
     /// Set whenever the growing-instantiation guard answered a pair from
     /// assumption rather than from its members. A relation run that consulted
     /// the guard is not evidence for a NEGATIVE verdict, so the two callers
