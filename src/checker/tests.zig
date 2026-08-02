@@ -1256,6 +1256,36 @@ test "elaboration: TS2345 argument mismatches chain the same way" {
     );
 }
 
+test "elaboration: TS2344 constraint violations chain under their own head" {
+    try expectMsg(
+        \\interface Exact { s: string }
+        \\interface ExactHolder<T extends Exact> { v: T }
+        \\declare const h: ExactHolder<{ s: number }>;
+    ,
+        \\Type '{ s: number; }' does not satisfy the constraint 'Exact'.
+        \\  Types of property 's' are incompatible.
+        \\    Type 'number' is not assignable to type 'string'.
+    );
+    try expectMsg(
+        \\interface Deep { a: { b: string } }
+        \\interface DeepHolder<T extends Deep> { v: T }
+        \\declare const h: DeepHolder<{ a: { b: number } }>;
+    ,
+        \\Type '{ a: { b: number; }; }' does not satisfy the constraint 'Deep'.
+        \\  The types of 'a.b' are incompatible between these types.
+        \\    Type 'number' is not assignable to type 'string'.
+    );
+    // The missing-property head still wins over the constraint head, and it
+    // abbreviates past five names exactly as the assignment head does.
+    try expectMsg(
+        \\interface Wide { p: number; q1: 1; q2: 1; q3: 1; q4: 1; q5: 1; q6: 1 }
+        \\interface WideHolder<T extends Wide> { v: T }
+        \\declare const h: WideHolder<{ p: number }>;
+    ,
+        \\Type '{ p: number; }' is missing the following properties from type 'Wide': q1, q2, q3, q4, and 2 more.
+    );
+}
+
 test "elaboration: nothing to derive leaves the headline alone" {
     // Primitive leaves, a top-level missing property (already TS2741), a
     // did-you-mean morph, and a source the walk cannot descend into.

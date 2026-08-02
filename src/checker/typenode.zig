@@ -34,6 +34,7 @@ const annTypeMaybeUnique = Checker.annTypeMaybeUnique;
 const atom = Checker.atom;
 const checkIdentifier = @import("expr.zig").checkIdentifier;
 const classStaticType = @import("enums.zig").classStaticType;
+const elaborate = @import("elaborate.zig");
 const expandRef = @import("instantiate.zig").expandRef;
 const hasTypeMeaning = @import("names.zig").hasTypeMeaning;
 const hasValueMeaning = @import("names.zig").hasValueMeaning;
@@ -1354,8 +1355,13 @@ pub fn checkTypeArgConstraints(c: *Checker, sym: SymbolId, args: []const TypeId,
         // path): `Holder<{ s: string }>` against `T extends Shape` is
         // TS2741, not TS2344.
         if (try c.tryReportMissingProps(arg, con, c.nodeSpan(an))) continue;
-        try c.diagFmt(2344, c.nodeSpan(an), "Type '{s}' does not satisfy the constraint '{s}'.", .{
-            try c.typeToString(arg), try c.typeToString(con),
+        // A constraint violation elaborates like any other failed relation
+        // (`elaborate.zig`): the argument and the constraint are the pair, and
+        // tsc chains the same derivation under this head as under TS2322.
+        try c.diagFmt(2344, c.nodeSpan(an), "Type '{s}' does not satisfy the constraint '{s}'.{s}", .{
+            try c.typeToString(arg),
+            try c.typeToString(con),
+            try elaborate.chainText(c, arg, con),
         });
     }
 }
