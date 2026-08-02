@@ -220,7 +220,7 @@ fn runCase(alloc: std.mem.Allocator, io: Io, gpa: std.mem.Allocator, interner: *
 
     const line_starts = try ztsc.source.computeLineStarts(alloc, src);
     const tree = try alloc.create(ztsc.ast.Ast);
-    tree.* = try parser.parseOpts(alloc, src, jsx);
+    tree.* = try parser.parseOpts(alloc, src, .{ .jsx = jsx });
     const bound = try alloc.create(binder.Bind);
     bound.* = try binder.bind(alloc, io, gpa, interner, tree, src, false);
     // Single-file cases run against the injected ES-core lib (file 0), just
@@ -383,11 +383,17 @@ fn runDirCase(
     // oracle defaults it ON, so a case that wants the diagnostic sets it
     // explicitly and gen_expected.js forwards the same flag.
     const no_unchecked_side_effect_imports = try dirCaseBoolOption(alloc, io, conf_dir, case_rel, "noUncheckedSideEffectImports");
+    // `experimentalDecorators`: the legacy decorator dialect. It changes the
+    // GRAMMAR (parameter decorators are legal), so it has to reach the parser
+    // `buildProgram` runs, not just the checker; gen_expected.js forwards the
+    // same flag to the oracle.
+    const experimental_decorators = try dirCaseBoolOption(alloc, io, conf_dir, case_rel, "experimentalDecorators");
     const jsx_runtime_module = try dirCaseJsxRuntimeModule(alloc, io, conf_dir, case_rel);
     var br = try modules.buildProgram(alloc, io, gpa, interner, conf_dir, &.{entry}, lib_set, .{ .resolve_json = resolve_json, .allow_js = allow_js }, .{
         .allow_synthetic_default = allow_synthetic_default,
         .no_implicit_any = no_implicit_any,
         .no_unchecked_side_effect_imports = no_unchecked_side_effect_imports,
+        .experimental_decorators = experimental_decorators,
     }, jsx_runtime_module);
     const prog = &br.program;
     prog.no_implicit_any = no_implicit_any;

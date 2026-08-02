@@ -88,11 +88,24 @@ pub fn isDeclarationPath(path: []const u8) bool {
         std.mem.endsWith(u8, path, ".d.cts");
 }
 
+/// Everything the tsconfig can change about the GRAMMAR itself. Kept to the
+/// options that decide whether a byte sequence parses at all, so a file's
+/// tokens/nodes stay a pure function of its text plus this struct.
+pub const Opts = struct {
+    /// JSX enabled (`.tsx`/`.jsx`): `<` in expression position starts an
+    /// element rather than a type assertion.
+    jsx: bool = false,
+    /// `compilerOptions.experimentalDecorators`: the legacy decorator dialect,
+    /// whose grammar allows decorators on PARAMETERS. Off (the standard TC39
+    /// dialect) a parameter decorator is TS1206. See `tsconfig.Config`.
+    experimental_decorators: bool = false,
+};
+
 pub fn parse(gpa: Allocator, src: []const u8) error{ OutOfMemory, SourceTooLarge }!ast.Ast {
-    return parseOpts(gpa, src, false);
+    return parseOpts(gpa, src, .{});
 }
 
-pub fn parseOpts(gpa: Allocator, src: []const u8, jsx: bool) error{ OutOfMemory, SourceTooLarge }!ast.Ast {
+pub fn parseOpts(gpa: Allocator, src: []const u8, opts: Opts) error{ OutOfMemory, SourceTooLarge }!ast.Ast {
     if (src.len > scanner.max_source_len) return error.SourceTooLarge;
     // Build the AST in a transient scratch arena so the growable lists'
     // doubling reallocs and their final tail slack are freed here, then
@@ -105,7 +118,8 @@ pub fn parseOpts(gpa: Allocator, src: []const u8, jsx: bool) error{ OutOfMemory,
         .out = gpa,
         .src = src,
         .scn = scanner.Scanner.init(src),
-        .jsx = jsx,
+        .jsx = opts.jsx,
+        .experimental_decorators = opts.experimental_decorators,
     };
     p.parseRoot() catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -126,6 +140,9 @@ const Parser = struct {
     /// JSX enabled (`.tsx`/`.jsx`): `<` in expression position starts an
     /// element. Off in `.ts`, where `<T>x` is a type assertion.
     jsx: bool = false,
+    /// Legacy (`experimentalDecorators`) grammar: parameter decorators are
+    /// legal. See `Opts.experimental_decorators`.
+    experimental_decorators: bool = false,
 
     /// Lookahead queue of scanned-but-not-consumed tokens; la[0] is current.
     la: [max_la]Token = undefined,
@@ -1381,11 +1398,20 @@ const Parser = struct {
         // Parameter decorators (`@dec x: T`) are a grammar error under TC39
         // standard decorators: consume them (so the parameter itself still
         // parses cleanly, no cascade) and report TS1206 per decorator.
+        //
+        // Under `experimentalDecorators` they are legal, so the diagnostic is
+        // dropped. The expression is still consumed and then DISCARDED rather
+        // than hung off the parameter: a legacy parameter decorator is only
+        // ever a value read from the enclosing scope, so the sole check it
+        // could contribute is on names ztsc would have to bind through a new
+        // AST edge. Skipping it under-reports (an undefined name inside
+        // `@Inject(Nope)` goes unnamed) and can never invent a diagnostic —
+        // the trade the flag is documented to make.
         while (p.curTag() == .at) {
             if (p.spec > 0) return error.Backtrack;
             const at = try p.bump(); // `@`
             if (canStartExpression(p.curTag())) _ = try p.parseLhsExpression(.{});
-            try p.errAtToken(.decorator_not_valid_here, at);
+            if (!p.experimental_decorators) try p.errAtToken(.decorator_not_valid_here, at);
         }
         const start_tok = p.curIdx();
         var flags: u32 = 0;
@@ -5047,7 +5073,7 @@ test "jsx parses cleanly in tsx mode" {
     for (cases) |src| {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena.deinit();
-        const tree = try parseOpts(arena.allocator(), src, true);
+        const tree = try parseOpts(arena.allocator(), src, .{ .jsx = true });
         if (tree.diagnostics.len != 0) {
             std.debug.print("--- unexpected JSX parse diag for: {s}\n", .{src});
             for (tree.diagnostics) |d| std.debug.print("  {s}\n", .{d.message()});
@@ -5058,7 +5084,7 @@ test "jsx parses cleanly in tsx mode" {
     {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena.deinit();
-        const tree = try parseOpts(arena.allocator(), "const a = x < y;", false);
+        const tree = try parseOpts(arena.allocator(), "const a = x < y;", .{});
         try testing.expectEqual(@as(usize, 0), tree.diagnostics.len);
     }
 }
@@ -5070,7 +5096,7 @@ test "jsx name rescan does not disturb subtraction lexing" {
     inline for (.{ "const j = a-b;", "const k = x - 1;", "const l = a-b-c;" }) |src| {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena.deinit();
-        const tree = try parseOpts(arena.allocator(), src, true); // jsx on
+        const tree = try parseOpts(arena.allocator(), src, .{ .jsx = true });
         try testing.expectEqual(@as(usize, 0), tree.diagnostics.len);
         const got = try dumpSource(arena.allocator(), src);
         // A binary `-` node, not a single merged identifier token.

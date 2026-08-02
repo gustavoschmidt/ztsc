@@ -1403,6 +1403,16 @@ pub fn decoContextRef(c: *Checker, name: []const u8) TypeId {
 /// and the `value`/`context` relations run only where a mismatch is
 /// unambiguous.
 pub fn checkDecoratorSig(c: *Checker, deco: Node, dt: TypeId, pos: DecoPos, value: TypeId) Error!void {
+    // `experimentalDecorators` selects the LEGACY dialect, where the runtime
+    // hands a decorator `(target, propertyKey, descriptorOrParameterIndex)` —
+    // a different call shape from the standard `(value, context)` this
+    // function models, and one whose own diagnostics are a different family
+    // (TS1270/TS1271, not TS1238/1240/1241). Checking a legacy decorator
+    // against the standard shape reports every one of them: Nest's
+    // `@Column()`, `@WebSocketServer()`, `@ApiProperty()` and friends all
+    // fail. Accept them all instead — an under-report, per the no-false-
+    // positive rule. See `tsconfig.Config.experimental_decorators`.
+    if (c.prog.experimental_decorators) return;
     const r = try c.resolveStructural(dt);
     var sigs: std.ArrayList(TypeId) = .empty;
     defer sigs.deinit(c.scratch());

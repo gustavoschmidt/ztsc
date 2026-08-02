@@ -305,6 +305,10 @@ const Worker = struct {
     pack: ztsc.source.Pack = .{},
     thread: std.Thread = undefined,
     files_loaded: usize = 0,
+    /// The grammar options every file this worker parses is parsed under
+    /// (`jsx` is per-file and filled in at the call site). Settled from the
+    /// tsconfig before any worker is spawned, so it needs no synchronization.
+    parse_opts: parser.Opts = .{},
 
     fn discoverRun(
         w: *Worker,
@@ -373,7 +377,9 @@ const Worker = struct {
         timer = Timer.start(io);
         var r: usize = 1;
         while (r < repeat) : (r += 1) {
-            var tree = parser.parseOpts(w.scratch.allocator(), src.bytes, parser.isJsxPath(path)) catch break;
+            var opts = w.parse_opts;
+            opts.jsx = parser.isJsxPath(path);
+            var tree = parser.parseOpts(w.scratch.allocator(), src.bytes, opts) catch break;
             std.mem.doNotOptimizeAway(&tree);
             _ = w.scratch.reset(.retain_capacity);
         }
@@ -381,7 +387,9 @@ const Worker = struct {
             c.err = err;
             return;
         };
-        tree.* = parser.parseOpts(alloc, src.bytes, parser.isJsxPath(path)) catch |err| {
+        var file_opts = w.parse_opts;
+        file_opts.jsx = parser.isJsxPath(path);
+        tree.* = parser.parseOpts(alloc, src.bytes, file_opts) catch |err| {
             c.err = err;
             return;
         };
@@ -540,6 +548,9 @@ pub fn main(init: std.process.Init) !void {
     // tsconfig allowJs (resolve JS-only deps as `any`) + effective noImplicitAny.
     var config_allow_js = false;
     var config_no_implicit_any = true;
+    // tsconfig experimentalDecorators (legacy decorator dialect; grammar + the
+    // decorator signature check both change). See `tsconfig.Config`.
+    var config_experimental_decorators = false;
     // tsconfig noUncheckedSideEffectImports (tsc's default is off).
     var config_no_unchecked_side_effect_imports = false;
     // tsconfig `types: [… "*" …]` — TS2580 instead of TS2591 (see LinkOpts).
@@ -609,6 +620,7 @@ pub fn main(init: std.process.Init) !void {
         config_base_url = cfg.base_url;
         config_allow_js = cfg.allow_js;
         config_no_implicit_any = cfg.no_implicit_any;
+        config_experimental_decorators = cfg.experimental_decorators;
         config_no_unchecked_side_effect_imports = cfg.no_unchecked_side_effect_imports;
         config_types_wildcard = cfg.types_wildcard;
         config_allow_synthetic_default = cfg.allow_synthetic_default_imports;
@@ -652,6 +664,7 @@ pub fn main(init: std.process.Init) !void {
     for (workers) |*w| w.* = .{
         .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
         .scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+        .parse_opts = .{ .experimental_decorators = config_experimental_decorators },
     };
 
     // Transient allocator for module resolution: candidate path strings and
@@ -1009,6 +1022,7 @@ pub fn main(init: std.process.Init) !void {
         .export_equals_atom = lr.export_equals_atom,
         .no_implicit_any = config_no_implicit_any,
         .types_wildcard = config_types_wildcard,
+        .experimental_decorators = config_experimental_decorators,
         .jsx_runtime_file = jsx_runtime_fid orelse modules.no_file,
     };
     const link_ns = link_timer.readNs();

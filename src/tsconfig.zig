@@ -121,6 +121,10 @@ pub fn loadInDir(io: Io, arena: Allocator, base: Io.Dir, config_path: []const u8
     if (!cfg.no_implicit_any) {
         try note(arena, &notes, "'noImplicitAny' is off: implicit-'any' diagnostics (TS7006/TS7053) are suppressed; unannotated values still type as 'any'", .{});
     }
+    cfg.experimental_decorators = acc.experimental_decorators orelse false;
+    if (cfg.experimental_decorators) {
+        try note(arena, &notes, "'experimentalDecorators' honored: parameter decorators are accepted and decorator signatures are not checked against the standard 'Class*DecoratorContext' shapes (the legacy dialect calls them differently)", .{});
+    }
     cfg.allow_js = acc.allow_js orelse false;
     if (cfg.allow_js) {
         try note(arena, &notes, "'allowJs' honored: a specifier resolving only to a .js file is typed opaquely as 'any' (ztsc never parses JS; 'checkJs' is unsupported)", .{});
@@ -333,6 +337,22 @@ pub const Config = struct {
     /// twin) is typed opaquely as `any` rather than raising TS2307. ztsc never
     /// parses/checks the JS. `checkJs` stays unsupported.
     allow_js: bool = false,
+    /// `compilerOptions.experimentalDecorators`: the pre-TC39 ("legacy")
+    /// decorator dialect Angular/NestJS/TypeORM are written against. It is a
+    /// different LANGUAGE from the standard decorators ztsc otherwise
+    /// implements, not a flag on top of them:
+    ///
+    ///   * parameter decorators (`constructor(@Inject(X) private x: T)`) are
+    ///     grammatical, where the standard dialect makes them TS1206;
+    ///   * a decorator is invoked as `(target, key, descriptorOrIndex)`, not
+    ///     as `(value, context)`, so the standard `Class*DecoratorContext`
+    ///     signature check (TS1238/1240/1241) does not describe it at all.
+    ///
+    /// When on, ztsc accepts both — the parameter-decorator grammar and every
+    /// decorator signature. That is a deliberate under-report (a genuinely
+    /// ill-typed legacy decorator goes unreported) chosen over the alternative,
+    /// which is thousands of false positives on any Nest/Angular program.
+    experimental_decorators: bool = false,
     /// `compilerOptions.resolveJsonModule`: a `*.json` import that names an
     /// existing file resolves (typed opaquely as `any`) rather than TS2307.
     resolve_json_module: bool = false,
@@ -933,6 +953,7 @@ const Merged = struct {
     strict: ?bool = null,
     no_implicit_any: ?bool = null,
     allow_js: ?bool = null,
+    experimental_decorators: ?bool = null,
     jsx: ?[]const u8 = null,
     jsx_import_source: ?[]const u8 = null,
     lib: ?[]const []const u8 = null,
@@ -1152,6 +1173,17 @@ fn applyOwn(
                     } else {
                         try warn(arena, warnings, "{s}: 'noImplicitAny' must be a boolean (ignored)", .{config_path});
                     }
+                } else if (std.mem.eql(u8, okey, "experimentalDecorators")) {
+                    if (oval == .boolean) {
+                        acc.experimental_decorators = oval.boolean;
+                    } else {
+                        try warn(arena, warnings, "{s}: 'experimentalDecorators' must be a boolean (ignored)", .{config_path});
+                    }
+                } else if (std.mem.eql(u8, okey, "emitDecoratorMetadata")) {
+                    // Emit-only (it makes tsc write `design:type` metadata
+                    // calls); it has no effect on type checking, and ztsc
+                    // never emits.
+                    try note(arena, notes, "{s}: 'emitDecoratorMetadata' accepted and ignored (emit-only; ztsc never emits)", .{config_path});
                 } else if (std.mem.eql(u8, okey, "allowJs")) {
                     if (oval == .boolean) {
                         acc.allow_js = oval.boolean;

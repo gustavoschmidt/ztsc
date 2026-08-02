@@ -92,6 +92,12 @@ pub const LinkOpts = struct {
     /// their "and then add 'node' to the types field" tail and become TS2580
     /// instead of TS2591 — with a wildcard list there is no list to add to.
     types_wildcard: bool = false,
+    /// tsconfig `experimentalDecorators`. Read only by `buildProgram`'s own
+    /// parse (the serial wavefront parses the files it discovers, so it must
+    /// know the decorator grammar); the parallel CLI driver parses before it
+    /// links and passes the same value to `parseOpts` itself. See
+    /// `parser.Opts.experimental_decorators`.
+    experimental_decorators: bool = false,
 };
 
 /// Serial wavefront: load, parse, bind and resolve transitively from
@@ -158,7 +164,10 @@ pub fn buildProgram(
                 continue;
             };
         const tree = try arena.create(Ast);
-        tree.* = try parser.parseOpts(arena, bytes, parser.isJsxPath(path));
+        tree.* = try parser.parseOpts(arena, bytes, .{
+            .jsx = parser.isJsxPath(path),
+            .experimental_decorators = link_opts.experimental_decorators,
+        });
         const bound = try arena.create(Bind);
         bound.* = try binder.bind(arena, io, gpa, interner, tree, bytes, parser.isDeclarationPath(path));
 
@@ -241,6 +250,7 @@ pub fn buildProgram(
             .constit_vals = lr.constit_vals,
             .export_equals_atom = lr.export_equals_atom,
             .types_wildcard = link_opts.types_wildcard,
+            .experimental_decorators = link_opts.experimental_decorators,
             .jsx_runtime_file = jsx_runtime_fid,
         },
         .load_failures = try arena.dupe(BuildDiag, failures.items),
@@ -455,6 +465,11 @@ pub const Program = struct {
     /// reads it in `reportNameNotFound`/`reportModuleNotFound`. See
     /// `tsconfig.Config.types_wildcard`.
     types_wildcard: bool = false,
+    /// Effective `experimentalDecorators`. The legacy decorator dialect calls a
+    /// decorator as `(target, key, descriptorOrIndex)`, so the checker skips the
+    /// standard `(value, context)` signature check (TS1238/1240/1241) when it is
+    /// on. See `tsconfig.Config.experimental_decorators`.
+    experimental_decorators: bool = false,
     /// The `<jsxImportSource>/jsx-runtime` module under the automatic JSX
     /// runtime (`jsx: "react-jsx"`), or `no_file`. tsc reads the `JSX` namespace
     /// off this module's exports there; the checker falls back to it when no

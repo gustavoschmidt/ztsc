@@ -103,6 +103,7 @@ function optionsForDir(dir) {
   let allowJs = false;
   let noImplicitAny; // tri-state: undefined = inherit strict
   let noUncheckedSideEffectImports = false;
+  let experimentalDecorators = false;
   let jsx, jsxImportSource;
   try {
     const co = JSON.parse(fs.readFileSync(cfgPath, "utf8")).compilerOptions;
@@ -112,6 +113,7 @@ function optionsForDir(dir) {
     if (co && co.allowJs === true) allowJs = true;
     if (co && typeof co.noImplicitAny === "boolean") noImplicitAny = co.noImplicitAny;
     if (co && co.noUncheckedSideEffectImports === true) noUncheckedSideEffectImports = true;
+    if (co && co.experimentalDecorators === true) experimentalDecorators = true;
     if (co && typeof co.jsx === "string") jsx = co.jsx;
     if (co && typeof co.jsxImportSource === "string") jsxImportSource = co.jsxImportSource;
   } catch {
@@ -145,6 +147,11 @@ function optionsForDir(dir) {
     if (at >= 0) out[at + 1] = "true";
     else out.push("--noUncheckedSideEffectImports", "true");
   }
+  // `experimentalDecorators`: selects the legacy decorator dialect, in which
+  // parameter decorators are grammatical and decorators are not checked
+  // against the standard `Class*DecoratorContext` signatures
+  // (run_conformance.zig dirCaseBoolOption).
+  if (experimentalDecorators) out.push("--experimentalDecorators");
   // `jsx`: the default OPTIONS pass `--jsx preserve` (cases declare their own
   // global `JSX` namespace). A case that selects the *automatic* runtime
   // (`react-jsx`) moves the `JSX` namespace into the
