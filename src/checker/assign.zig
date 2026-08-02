@@ -29,6 +29,7 @@ const check = checker_zig.check;
 const max_relation_depth = checker_zig.max_relation_depth;
 
 const TpMap = @import("enums.zig").TpMap;
+const this_apparent = @import("enums.zig").this_apparent;
 const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
 const aliasInstance = @import("instantiate.zig").aliasInstance;
 const atom = Checker.atom;
@@ -1016,6 +1017,23 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!bool {
     s = try c.ts.regular(s);
     t = try c.ts.regular(t);
     if (s == t) return true;
+    // The same simplification, one level down: a `this` NESTED inside a
+    // deferred operator (`this extends {_zod:…} ? this["_zod"]["output"] :
+    // unknown`, zod's `output<this>`) relates through its apparent instance
+    // too. tsc never sees this pair — it resolves an interface reference's
+    // members with the reference itself as `thisArgument`, so both sides are
+    // already concrete by the time they are compared — whereas ztsc keeps
+    // the marker until the access site. Two such operands that differ only
+    // in WHICH instance they were declared against are not identical ids and
+    // have no structural rule that could relate them, so without this every
+    // schema-vs-schema comparison in zod failed on a pair that prints the
+    // same on both sides. Costs one memoized `containsThisType` lookup on a
+    // pair that already failed the identity test.
+    if (c.has_this_types and ((try c.containsThisType(s)) or (try c.containsThisType(t)))) {
+        const sa = try c.substThis(s, this_apparent);
+        const ta = try c.substThis(t, this_apparent);
+        if (sa != s or ta != t) return c.isAssignable(sa, ta);
+    }
     const sk = c.ts.kind(s);
     const tk = c.ts.kind(t);
     // The generic reference each side denotes (`refFacetOf`), read ONCE: the
