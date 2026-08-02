@@ -448,20 +448,31 @@ pub const DeferredBody = struct {
 /// is that ordering — the reference is queued during conversion and drained
 /// once every statement of every owned file has been checked, when every
 /// class table is complete.
+///
+/// Six `u32`s and no per-entry allocation. The written argument *nodes* are
+/// not kept: they are a `SubRange` of the (immutable) tree, so the drain reads
+/// them back out of `node`. Their *types* are kept — re-converting them at the
+/// drain is not sound, because an argument may be written under a binder that
+/// only exists mid-walk (`infer X`, a mapped type's key parameter), and those
+/// live on checker stacks that are unwound long before the drain runs; a
+/// re-conversion answers `TS2304 Cannot find name 'X'` instead. They go into
+/// the shared `pending_type_args_pool` rather than a slice of their own.
 pub const PendingTypeArgs = struct {
     /// File the reference was written in — where its diagnostics belong, and
-    /// whose tree `arg_nodes` index.
+    /// whose tree `node` indexes.
     file: FileId,
+    /// The `type_ref` node. The drain re-reads its written argument nodes
+    /// (`writtenTypeArgNodes`) instead of the queue storing a copy.
+    node: Node,
     /// The generic the name resolved to.
     sym: SymbolId,
-    /// Resolved arguments and the nodes they were written as, positionally
-    /// paired. Both live in the checker arena (the scratch arena is reset
-    /// between statements).
-    args: []const TypeId,
-    arg_nodes: []const Node,
     /// `this` in force at the reference, so a constraint mentioning `this`
     /// resolves at drain time exactly as it would have in place.
     this_type: TypeId,
+    /// This entry's run of resolved arguments in `pending_type_args_pool`,
+    /// positionally paired with the non-hole entries of the node list.
+    args_start: u32,
+    args_len: u32,
 };
 
 /// A memoized expression type together with the contextual type it was
@@ -497,26 +508,26 @@ pub const MappedKeyScope = struct {
 /// `deinit` cannot fall behind the field set: a container added to `Checker`
 /// and fed from `cm()` but forgotten here leaks its whole table.
 pub const map_containers = [_][]const u8{
-    "node_types",               "sig_cache",            "node_scopes",
-    "reassigned_syms",          "reassigned_in_loop",   "member_written_syms",
-    "member_written_in_loop",   "ns_types",             "ambient_ns_types",
-    "relation",                 "expansions",           "overload_rotate",
-    "origin",                   "iface_generic",        "iface_stack",
-    "pending_class_decos",      "class_inst_generic",   "class_static_cache",
-    "class_static_base_active", "class_ctor_cache",     "enum_value_cache",
-    "enum_info_cache",          "alias_generic",        "alias_state",
-    "alias_recursive",          "flow_same",            "flow_narrow",
-    "ref_keys",                 "flow_loop_stack",      "flow_stack",
-    "flow_tmp",                 "da_cache",             "ctp_cache",
-    "cmp_cache",                "mmp_cache",            "inst_cache",
-    "inst_map_ids",             "tp_constraint_cache",  "fresh_tp_ids",
-    "fresh_tp_info",            "type_node_cache",      "atom_cache",
-    "infer_ids",                "infer_scopes",         "mapped_key_ids",
-    "mapped_key_scopes",        "inst_diag_at",         "infer_active",
-    "lazy_member_active",       "chain_guards",         "never_isect",
-    "deep_path_list",           "deep_path_ids",        "flow_reach",
-    "member_type_stack",        "lazy_index_objs",      "pending_type_args",
-    "pending_type_args_seen",   "tp_constrained_cache",
+    "node_types",               "sig_cache",              "node_scopes",
+    "reassigned_syms",          "reassigned_in_loop",     "member_written_syms",
+    "member_written_in_loop",   "ns_types",               "ambient_ns_types",
+    "relation",                 "expansions",             "overload_rotate",
+    "origin",                   "iface_generic",          "iface_stack",
+    "pending_class_decos",      "class_inst_generic",     "class_static_cache",
+    "class_static_base_active", "class_ctor_cache",       "enum_value_cache",
+    "enum_info_cache",          "alias_generic",          "alias_state",
+    "alias_recursive",          "flow_same",              "flow_narrow",
+    "ref_keys",                 "flow_loop_stack",        "flow_stack",
+    "flow_tmp",                 "da_cache",               "ctp_cache",
+    "cmp_cache",                "mmp_cache",              "inst_cache",
+    "inst_map_ids",             "tp_constraint_cache",    "fresh_tp_ids",
+    "fresh_tp_info",            "type_node_cache",        "atom_cache",
+    "infer_ids",                "infer_scopes",           "mapped_key_ids",
+    "mapped_key_scopes",        "inst_diag_at",           "infer_active",
+    "lazy_member_active",       "chain_guards",           "never_isect",
+    "deep_path_list",           "deep_path_ids",          "flow_reach",
+    "member_type_stack",        "lazy_index_objs",        "pending_type_args",
+    "pending_type_args_pool",   "pending_type_args_seen", "tp_constrained_cache",
 };
 
 pub const Checker = struct {
@@ -937,6 +948,11 @@ pub const Checker = struct {
     /// Written type-argument lists awaiting their TS2344 constraint check,
     /// drained after every owned file is checked. See `PendingTypeArgs`.
     pending_type_args: std.ArrayList(PendingTypeArgs) = .empty,
+    /// One flat run of resolved arguments per `pending_type_args` entry, in
+    /// queue order — the entries index it rather than each owning a slice, so
+    /// the queue is one growable buffer instead of one allocation per
+    /// reference. Cleared with the queue at the drain.
+    pending_type_args_pool: std.ArrayList(TypeId) = .empty,
     /// `nodeKey`s already queued in `pending_type_args`, so a type node
     /// converted once per contextual variation queues its check once.
     pending_type_args_seen: std.AutoHashMapUnmanaged(u64, void) = .empty,

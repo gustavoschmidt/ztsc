@@ -113,7 +113,7 @@ pub fn typeFromTypeNodeUncached(c: *Checker, node: Node) Error!TypeId {
             var target: SymbolId = binder.no_symbol;
             const result = try c.typeFromTypeNameEx(d.lhs, args.items, &target);
             if (target != binder.no_symbol) {
-                try c.queueTypeArgConstraints(node, target, args.items, arg_nodes);
+                try c.queueTypeArgConstraints(node, target, args.items);
             }
             return result;
         },
@@ -1181,8 +1181,14 @@ pub fn symHasConstrainedTypeParam(c: *Checker, sym: SymbolId) Error!bool {
 /// Only references in a file this checker OWNS are queued: a diagnostic for
 /// any other file is discarded at `seal`, and the checker that owns it queues
 /// the same reference itself. Each (file, node) is queued once.
-pub fn queueTypeArgConstraints(c: *Checker, node: Node, sym: SymbolId, args: []const TypeId, arg_nodes: []const Node) Error!void {
-    if (args.len == 0 or arg_nodes.len == 0) return;
+///
+/// `args` is the caller's resolved argument list, holes skipped — the same
+/// pairing the drain rebuilds against `writtenTypeArgNodes(node)`, which is
+/// read here rather than passed in so queue and drain cannot drift apart.
+pub fn queueTypeArgConstraints(c: *Checker, node: Node, sym: SymbolId, args: []const TypeId) Error!void {
+    // `args` holds one entry per non-hole argument node, so an empty `args`
+    // is exactly the old "no arguments, or none written" test.
+    if (args.len == 0) return;
     if (c.cur_file >= c.owned_mask.len or !c.owned_mask[c.cur_file]) return;
     const f = c.symFlags(sym);
     if (!f.interface and !f.class and !f.type_alias) return;
@@ -1190,8 +1196,8 @@ pub fn queueTypeArgConstraints(c: *Checker, node: Node, sym: SymbolId, args: []c
     if (gop.found_existing) return;
     // Nothing to decide, nothing to keep: most generics constrain no
     // parameter at all (`Array<T>`, `Promise<T>`, every one-off `Wrap<T>`),
-    // and queueing those would hold two slices per reference in the checker
-    // arena for a drain that would immediately skip them.
+    // and queueing those would hold an entry and its arguments for the rest
+    // of the run for a drain that would immediately skip them.
     if (!try c.symHasConstrainedTypeParam(sym)) return;
     // Nor is anything to decide when no WRITTEN argument is a decided set:
     // `undecidableType` is a pure function of the argument's `TypeId`, so its
@@ -1199,6 +1205,7 @@ pub fn queueTypeArgConstraints(c: *Checker, node: Node, sym: SymbolId, args: []c
     // arguments are still type variables or deferred nodes (zod's
     // `DeepPartial<T["shape"][k]>`, every `Foo<infer X>`) would only be
     // skipped later — after being kept alive for the whole run.
+    const arg_nodes = writtenTypeArgNodes(c, node);
     {
         var any_decidable = false;
         for (args[0..@min(args.len, arg_nodes.len)], 0..) |a, i| {
@@ -1210,13 +1217,24 @@ pub fn queueTypeArgConstraints(c: *Checker, node: Node, sym: SymbolId, args: []c
         }
         if (!any_decidable) return;
     }
+    const args_start: u32 = @intCast(c.pending_type_args_pool.items.len);
+    try c.pending_type_args_pool.appendSlice(c.cm(), args);
     try c.pending_type_args.append(c.cm(), .{
         .file = c.cur_file,
+        .node = node,
         .sym = sym,
-        .args = try c.cm().dupe(TypeId, args),
-        .arg_nodes = try c.cm().dupe(Node, arg_nodes),
         .this_type = c.this_type,
+        .args_start = args_start,
+        .args_len = @intCast(args.len),
     });
+}
+
+/// The WRITTEN type-argument nodes of a `type_ref`, straight out of the tree.
+/// Immutable program data for the life of the program, so the TS2344 queue
+/// keeps the reference node instead of a copy of this list.
+fn writtenTypeArgNodes(c: *const Checker, node: Node) []const Node {
+    const r = c.tree.extraData(ast.SubRange, c.tree.nodeData(node).rhs);
+    return c.tree.extraRange(r.start, r.end);
 }
 
 /// Run every queued TS2344 constraint check. Called once, after every
@@ -1231,30 +1249,39 @@ pub fn drainTypeArgConstraints(c: *Checker) Error!void {
         c.cur_scope = saved_scope;
         c.this_type = saved_this;
     }
-    // Index-walked: a check may queue nothing (the queue is closed by then),
-    // but the list is read across `scratch` resets, so no slice is held.
+    // Index-walked, and the entry's arguments are copied out before the check
+    // runs: a check can convert a type node that queues a further reference,
+    // which both appends to `pending_type_args` (walked by index for exactly
+    // that reason) and can grow — and so move — the argument pool. One reused
+    // scratch buffer, never longer than the widest written argument list.
+    var args: std.ArrayList(TypeId) = .empty;
+    defer args.deinit(c.scratch());
     var i: usize = 0;
     while (i < c.pending_type_args.items.len) : (i += 1) {
         const p = c.pending_type_args.items[i];
         c.setFile(p.file);
         c.cur_scope = binder.file_scope;
         c.this_type = p.this_type;
+        const arg_nodes = writtenTypeArgNodes(c, p.node);
+        args.clearRetainingCapacity();
+        try args.appendSlice(c.scratch(), c.pending_type_args_pool.items[p.args_start..][0..p.args_len]);
         // Each queued reference is its own source element, exactly as it was
         // when the enclosing statement was walked: the instantiation budget
         // is scoped to one (tsc resets `instantiationCount` per
         // `checkSourceElement`), and the TS2589 anchor is this reference.
         // Without the reset the whole drain is one statement and the budget
         // trips on the accumulated total of every reference in the program.
-        for (p.arg_nodes) |an| {
+        for (arg_nodes) |an| {
             if (an != null_node) {
                 c.anchorInst(an);
                 break;
             }
         }
         c.inst_count = 0;
-        try c.checkTypeArgConstraints(p.sym, p.args, p.arg_nodes);
+        try c.checkTypeArgConstraints(p.sym, args.items, arg_nodes);
     }
     c.pending_type_args.clearRetainingCapacity();
+    c.pending_type_args_pool.clearRetainingCapacity();
 }
 
 /// TS2344 — every WRITTEN type argument of a type reference must satisfy its
