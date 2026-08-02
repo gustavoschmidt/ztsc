@@ -832,6 +832,17 @@ pub fn partialParamCtx(c: *Checker, pt0: TypeId, partial: []const TpMap) Error!T
     const full = try c.instantiate(pt0, partial);
     if (c.ts.kind(full) != .any) return full;
     const r = try c.resolveStructural(pt0);
+    // NOTE (diagnosed, deliberately NOT done here): tsc's
+    // `getApparentTypeOfContextualType` would answer a parameter that IS a
+    // still-un-inferred type variable (`e: E`) with the variable's
+    // CONSTRAINT rather than the `any` placeholder standing in for it, which
+    // is what would give the callback form of every builder API — kysely's
+    // `where<E extends ExpressionOrFactory<DB, TB, SqlBool>>(e: E)` — a
+    // contextual signature instead of TS7006 on each parameter. Supplying it
+    // makes ztsc check arrow bodies it previously typed as `any`, and on a
+    // long builder chain each level re-checks its whole receiver prefix, so
+    // the cost compounds: immich went from 5.8 s / 4.3 GB to OOM. The
+    // correctness fix has to wait on that re-check cascade.
     if (c.ts.kind(r) != .union_type) return full;
     const members = try c.memberList(r);
     var kept: std.ArrayList(TypeId) = .empty;
@@ -1392,10 +1403,19 @@ pub fn inferTypeArgs(
             // same `primitiveConstraint` test this mirrors, so `f<const T>`
             // keeps `"a"` for `f("a")` exactly as an `extends string`
             // constraint would.
+            // A fresh higher-order param whose bound was a bare OUTER param
+            // carries that bound only for this test (`FreshTp.widen_bound`):
+            // it is not enforced, but `<T extends TB>` under `TB := "asset"`
+            // is a primitive constraint as far as tsc's widening rule is
+            // concerned, and treating it as unconstrained widened kysely's
+            // `selectAll("asset")` key to `string` — which then indexed the
+            // schema to nothing and made the whole row type `{}`.
+            const widen_bound: TypeId = if (c.isFreshTp(tp)) c.freshTp(tp).widen_bound else types.no_type;
             if (sig_ret != types.no_type and
                 top_flags[i] and
                 !c.isConstTypeParamSym(tp) and
                 !try c.constraintIsPrimitive(constraint) and
+                !try c.constraintIsPrimitive(widen_bound) and
                 !try c.typeParamAtTopLevel(sig_ret, tp))
             {
                 out[i] = try c.widenLiteral(out[i]);

@@ -525,6 +525,18 @@ pub const FreshTp = struct {
     /// stands in for, carried across so a `const` parameter of a generic
     /// method survives the receiver's instantiation.
     const_tp: bool = false,
+    /// A BARE outer bound (`<T extends TB>` where `TB` is the enclosing
+    /// interface's parameter) after substitution — `no_type` when the bound
+    /// was absent or already structured (then `constraint` holds it).
+    ///
+    /// Such a bound is deliberately NOT enforced (see `mintFreshTp`'s caller:
+    /// enforcing a substituted bare bound erases legitimate inferences), but
+    /// it still has to be VISIBLE to the literal-widening rule: tsc keeps an
+    /// inferred literal whenever the parameter has a primitive constraint,
+    /// and `<T extends TB>` under `TB := "asset"` is one. Without it, kysely's
+    /// `selectAll<T extends TB>(table: T)` widened `"asset"` to `string` and
+    /// the row type `Selectable<DB[T]>` collapsed to `{}`.
+    widen_bound: TypeId = types.no_type,
 };
 
 /// One entry of `Checker.mapped_key_scopes`: a mapped type's key parameter

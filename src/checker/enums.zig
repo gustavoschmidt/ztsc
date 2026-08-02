@@ -1116,7 +1116,7 @@ pub inline fn isConstTypeParamSym(c: *const Checker, sym: SymbolId) bool {
 /// already-`map`-substituted `constraint`/`default`. Deterministic and
 /// memoized per `(orig, canonical map)`, so a repeat instantiation reuses
 /// the same id (interning coherence).
-pub fn mintFreshTp(c: *Checker, orig: SymbolId, map: []const TpMap, map_id: ?u32, constraint: TypeId, default: TypeId, has_default: bool) Error!u32 {
+pub fn mintFreshTp(c: *Checker, orig: SymbolId, map: []const TpMap, map_id: ?u32, constraint: TypeId, default: TypeId, has_default: bool, widen_bound: TypeId) Error!u32 {
     const mid: u32 = map_id orelse try c.canonMapId(map);
     const key = (@as(u64, orig) << 32) | mid;
     const gop = try c.fresh_tp_ids.getOrPut(c.cm(), key);
@@ -1129,6 +1129,7 @@ pub fn mintFreshTp(c: *Checker, orig: SymbolId, map: []const TpMap, map_id: ?u32
             .default = default,
             .has_default = has_default,
             .const_tp = c.isConstTypeParamSym(orig),
+            .widen_bound = widen_bound,
         });
     }
     return gop.value_ptr.*;
@@ -1426,8 +1427,12 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
                     // and enforcing its substituted form would erase a
                     // legitimate inference. Mint only when a bound moved.
                     const fc = if (oc != types.no_type and c.ts.kind(oc) != .type_param) nc else types.no_type;
+                    // A bare bound stays unenforced, but its substituted form
+                    // rides along for the literal-widening rule — see
+                    // `FreshTp.widen_bound`.
+                    const wb = if (fc == types.no_type and oc != types.no_type and nc != oc) nc else types.no_type;
                     if (nc != oc or nd != od) {
-                        fresh = try c.mintFreshTp(tp, cur_map.items, cur_id, fc, nd, od != types.no_type);
+                        fresh = try c.mintFreshTp(tp, cur_map.items, cur_id, fc, nd, od != types.no_type, wb);
                     }
                 }
                 if (fresh) |fid| {
