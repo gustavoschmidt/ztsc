@@ -127,6 +127,25 @@ pub fn tokenize(alloc: Allocator, src: []const u8) error{ OutOfMemory, SourceToo
 pub fn tokenEnd(src: []const u8, tag: Tag, start: u32) u32 {
     switch (tag) {
         .eof => return start,
+        // Identifiers are the overwhelming majority of the rescans the checker
+        // asks for (`atomOfToken` reaches every name through `tokenSlice`), and
+        // the general `next()` path pays two things they cannot need: the
+        // leading-trivia loop — a token start is never trivia — and the
+        // `keyword_map` probe, whose answer is already known to be "no keyword"
+        // because the token was tagged `.identifier` at scan time. Consuming
+        // identifier-continue bytes directly is the whole job.
+        .identifier => {
+            var s = Scanner{ .src = src, .index = start };
+            if (start < src.len and src[start] == '\\') {
+                // A `\uXXXX`-introduced identifier: consume the escape exactly
+                // as `next()` does, then fall into the same rest loop.
+                if (!s.consumeIdentifierEscape()) return s.next().end;
+            } else {
+                s.index +|= 1;
+            }
+            _ = s.identifierRest();
+            return s.index;
+        },
         // These consume to end of file by construction.
         .unterminated_template, .unterminated_comment => {
             // A middle/tail rescan can also produce unterminated_template
