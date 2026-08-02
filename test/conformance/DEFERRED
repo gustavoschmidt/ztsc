@@ -97,3 +97,17 @@ calls/053_rest_param_union_of_tuples.ts  -TS2345 58
 # reports.
 indexed/032_cast_to_deferred_indexed_access_negatives.ts  -TS2352 8
 
+
+# TS2344 ("Type X does not satisfy the constraint Y") is not implemented.
+# Deciding it means enumerating the constraint's key set, and ztsc only folds
+# a complete member table when nothing on the way is still materializing: a
+# class whose own members are typed through itself (drizzle's select builders
+# write `execute: ReturnType<this["prepare"]>["execute"]`) cuts its base-class
+# fold at the in-progress guard and loses every inherited member, and the same
+# happens to `keyof ReadableOptions` in `@types/node`'s `Pick<ReadableOptions,
+# …, "signal">`. A check built on those sets invents TS2344s on valid code —
+# measured, both shapes, on the 8-package corpus — which policy forbids. A
+# whole check deliberately under-reported until the member tables are
+# trustworthy. The TS2345 on line 25 shows the use site still reports.
+instantiation/051_type_arg_constraint.ts  -TS2344 14
+instantiation/051_type_arg_constraint.ts  -TS2344 19
