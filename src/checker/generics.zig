@@ -285,6 +285,13 @@ pub fn resolveConcreteConditional(c: *Checker, chk: TypeId, extends_ty: TypeId, 
     const vals = try c.scratch().alloc(TypeId, ids.items.len);
     for (vals) |*v| v.* = types.no_type;
     if (ids.items.len > 0) {
+        // A fresh key space for this match's `infer_visited` entries, restored
+        // on exit so an inference re-entered from inside this one (through an
+        // `instantiate` in the walk) cannot invalidate the outer one's.
+        const saved_gen = c.infer_gen;
+        c.infer_gen = c.infer_gen_next;
+        c.infer_gen_next +%= 1;
+        defer c.infer_gen = saved_gen;
         try c.inferFromExtends(chk, extends_ty, ids.items, vals, false, 0);
         for (vals) |*v| {
             if (v.* == types.no_type) v.* = types.unknown_type; // unmatched → unknown
@@ -455,7 +462,68 @@ pub fn collectInferVars(c: *Checker, t: TypeId, out: *std.ArrayList(u32), refs: 
 /// same-name combine rule (union in covariant positions, intersection in
 /// contravariant/function-parameter positions).
 pub fn inferFromExtends(c: *Checker, source0: TypeId, pattern: TypeId, ids: []const u32, vals: []TypeId, contra: bool, depth: u32) Error!void {
-    if (depth > 24) return;
+    if (depth > max_infer_depth) {
+        c.infer_trunc = true;
+        return;
+    }
+    // tsc's `inferFromTypes` opens with `if (!couldContainTypeVariables(target))
+    // return;` — a walk into a target that holds no inference variable can only
+    // recurse and find nothing, since the ONLY arm that writes a candidate is
+    // `.infer_var`. So this is a pure prune, and the one that makes the
+    // function affordable: without it the recursion descends the whole
+    // structural closure of the pattern, branching once per property and once
+    // per signature return, and bottoms out only on the depth cap. On kysely's
+    // builder types — an `ExpressionBuilder` whose ~100 members are functions
+    // returning objects with ~100 members — that closure is exponential in
+    // `depth`, and it was the single hot spot (78% of samples, 77 GB of
+    // instantiation scratch in ONE top-level `instantiate`) whenever an
+    // `ExpressionOrFactory` pattern was matched.
+    if (!try c.containsInfer(pattern)) return;
+    const s = &c.ts;
+    // tsc's `visited` guard (`inferFromObjectTypes`): a `(source, pattern)`
+    // pair already walked in this inference writes nothing new — every combine
+    // (`vals[idx] = union/intersection(vals[idx], source0)`) is idempotent in
+    // its own argument — so the repeat is pure cost. `contra` rides in the
+    // value because it changes how a candidate combines. The prune above is
+    // powerless against a SELF-REFERENTIAL pattern like kysely's
+    // `SelectQueryBuilderExpression<infer O>`, an interface whose members are
+    // functions returning it: `infer O` is reachable everywhere, so the walk
+    // branches once per member at every one of the 24 allowed levels.
+    // Cheap leaves are excluded: they cost less than the map probe.
+    const memoize = switch (s.kind(pattern)) {
+        .object, .function, .ref, .intersection, .union_type, .overloads, .conditional, .mapped => true,
+        else => false,
+    };
+    if (!memoize) return inferFromExtendsInner(c, source0, pattern, ids, vals, contra, depth);
+    // Skipping on pair identity ALONE is not result-preserving, because the
+    // walk is cut at `max_infer_depth`: a pair first met deep may have been
+    // TRUNCATED where the same pair met shallower would still reach the binder
+    // below it. So the record carries both the depth it started at and whether
+    // anything under it was cut, and a repeat is skipped only when the earlier
+    // visit started no deeper AND ran to completion. (Identity alone moved
+    // three keys on immich; this moves none.)
+    const key = (@as(u64, source0) << 32) | pattern;
+    const tag: u64 = (c.infer_gen << 1) | @intFromBool(contra);
+    if (c.infer_visited.get(key)) |v| {
+        if (v >> 33 == tag and v & (1 << 32) == 0 and @as(u32, @truncate(v)) <= depth) return;
+    }
+    // Published BEFORE recursing — blocking the repeats *inside* this walk is
+    // the whole win — with the truncated bit clear, so a nested repeat deeper
+    // than this one is skipped and a shallower one cannot occur (depth only
+    // grows). The real bit is written back below.
+    try c.infer_visited.put(c.cm(), key, (tag << 33) | depth);
+    const outer_trunc = c.infer_trunc;
+    c.infer_trunc = false;
+    defer c.infer_trunc = outer_trunc or c.infer_trunc;
+    try inferFromExtendsInner(c, source0, pattern, ids, vals, contra, depth);
+    try c.infer_visited.put(c.cm(), key, (tag << 33) | (@as(u64, @intFromBool(c.infer_trunc)) << 32) | depth);
+}
+
+/// Ceiling on `inferFromExtends`'s structural descent. A cut here is what makes
+/// the visited guard depth-sensitive — see there.
+pub const max_infer_depth: u32 = 24;
+
+fn inferFromExtendsInner(c: *Checker, source0: TypeId, pattern: TypeId, ids: []const u32, vals: []TypeId, contra: bool, depth: u32) Error!void {
     const s = &c.ts;
     switch (s.kind(pattern)) {
         .infer_var => {
@@ -1104,7 +1172,19 @@ const PartWalk = struct {
     }
 };
 
+/// Does `t` hold an unbound `infer` binder — tsc's `couldContainTypeVariables`
+/// for the inference target. Memoized in the dense `ci_cache`: types are
+/// immutable and the walk is a pure structural descent, and `inferFromExtends`
+/// asks it once per step.
 pub fn containsInfer(c: *Checker, t: TypeId) Error!bool {
+    const v = c.triGet(&c.ci_cache, t);
+    if (v != 0) return v == 2;
+    const r = try containsInferInner(c, t);
+    try c.triSet(&c.ci_cache, t, if (r) 2 else 1);
+    return r;
+}
+
+fn containsInferInner(c: *Checker, t: TypeId) Error!bool {
     const s = &c.ts;
     return switch (s.kind(t)) {
         .infer_var => true,

@@ -561,28 +561,28 @@ pub const MappedKeyScope = struct {
 /// `deinit` cannot fall behind the field set: a container added to `Checker`
 /// and fed from `cm()` but forgotten here leaks its whole table.
 pub const map_containers = [_][]const u8{
-    "node_types",               "sig_cache",            "node_scopes",
-    "reassigned_syms",          "reassigned_in_loop",   "member_written_syms",
-    "member_written_in_loop",   "ns_types",             "ambient_ns_types",
-    "relation",                 "expansions",           "overload_rotate",
-    "origin",                   "iface_generic",        "iface_stack",
-    "pending_class_decos",      "class_inst_generic",   "class_static_cache",
-    "class_static_base_active", "class_ctor_cache",     "enum_value_cache",
-    "enum_info_cache",          "alias_generic",        "alias_state",
-    "alias_recursive",          "flow_same",            "flow_narrow",
-    "ref_keys",                 "flow_loop_stack",      "flow_stack",
-    "flow_tmp",                 "da_cache",             "ctp_cache",
-    "cmp_cache",                "ctt_cache",            "mmp_cache",
-    "inst_cache",               "arrayish_elem_cache",  "inst_map_ids",
-    "tp_constraint_cache",      "fresh_tp_ids",         "fresh_tp_info",
-    "type_node_cache",          "atom_cache",           "infer_ids",
-    "infer_scopes",             "mapped_key_ids",       "mapped_key_scopes",
-    "inst_diag_at",             "infer_active",         "lazy_member_active",
-    "chain_guards",             "never_isect",          "deep_path_list",
-    "deep_path_ids",            "flow_reach",           "member_type_stack",
-    "lazy_index_objs",          "pending_type_args",    "pending_type_args_pool",
-    "pending_type_args_seen",   "tp_constrained_cache", "nominal_bases",
-    "nominal_base_pool",
+    "node_types",               "sig_cache",              "node_scopes",
+    "reassigned_syms",          "reassigned_in_loop",     "member_written_syms",
+    "member_written_in_loop",   "ns_types",               "ambient_ns_types",
+    "relation",                 "expansions",             "overload_rotate",
+    "origin",                   "iface_generic",          "iface_stack",
+    "pending_class_decos",      "class_inst_generic",     "class_static_cache",
+    "class_static_base_active", "class_ctor_cache",       "enum_value_cache",
+    "enum_info_cache",          "alias_generic",          "alias_state",
+    "alias_recursive",          "flow_same",              "flow_narrow",
+    "ref_keys",                 "flow_loop_stack",        "flow_stack",
+    "flow_tmp",                 "da_cache",               "ctp_cache",
+    "cmp_cache",                "ctt_cache",              "ci_cache",
+    "infer_visited",            "mmp_cache",              "inst_cache",
+    "arrayish_elem_cache",      "inst_map_ids",           "tp_constraint_cache",
+    "fresh_tp_ids",             "fresh_tp_info",          "type_node_cache",
+    "atom_cache",               "infer_ids",              "infer_scopes",
+    "mapped_key_ids",           "mapped_key_scopes",      "inst_diag_at",
+    "infer_active",             "lazy_member_active",     "chain_guards",
+    "never_isect",              "deep_path_list",         "deep_path_ids",
+    "flow_reach",               "member_type_stack",      "lazy_index_objs",
+    "pending_type_args",        "pending_type_args_pool", "pending_type_args_seen",
+    "tp_constrained_cache",     "nominal_bases",          "nominal_base_pool",
 };
 
 /// Where one symbol's declared heritage lives in `Checker.nominal_base_pool`.
@@ -923,6 +923,29 @@ pub const Checker = struct {
     ctp_cache: std.ArrayList(u8) = .empty,
     /// containsMappedParam memo, dense like `ctp_cache`.
     cmp_cache: std.ArrayList(u8) = .empty,
+    /// `(source << 32 | pattern) -> (generation << 1 | contra)`: the
+    /// source/pattern pairs one `infer` match has already walked — tsc's
+    /// `visited` map in `inferFromObjectTypes`. A repeat pair can only write
+    /// the candidates it already wrote (every combine is idempotent in its own
+    /// argument), so re-walking it is pure cost — and on a self-referential
+    /// pattern (kysely's `SelectQueryBuilderExpression<infer O>`, an interface
+    /// whose members are functions returning itself) that cost is exponential
+    /// in the depth cap.
+    infer_visited: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+    /// Generation of the in-flight `inferFromExtends` root, so a nested root
+    /// (reached through an `instantiate` inside the walk) gets a fresh key
+    /// space and the outer one's entries survive its return. Monotonic and
+    /// 64-bit wide, so a stale entry can never be mistaken for a live one.
+    infer_gen: u64 = 0,
+    infer_gen_next: u64 = 1,
+    /// Did anything under the `inferFromExtends` frame being recorded hit the
+    /// depth cut? A truncated walk is not a complete answer, so its
+    /// `infer_visited` entry must never let a shallower repeat be skipped.
+    infer_trunc: bool = false,
+    /// containsInfer memo, dense like `ctp_cache`. `inferFromExtends` now asks
+    /// it at every step (the `couldContainTypeVariables` prune), and the walk
+    /// itself is a full structural descent, so it has to be O(1) on a repeat.
+    ci_cache: std.ArrayList(u8) = .empty,
     /// containsThisType memo, dense like `ctp_cache`. The walk descends into
     /// object members and deferred type operators, so it is not the cheap
     /// shallow test it once was; every `substThis` (i.e. every property
