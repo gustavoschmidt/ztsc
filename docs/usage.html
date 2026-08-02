@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Usage — ztsc</title>
-<meta name="description" content="Building and using ztsc: CLI options, the tsconfig subset, diagnostics and exit codes, and current limitations.">
+<meta name="description" content="Using ztsc: install, CLI options, the tsconfig subset, diagnostics and exit codes.">
 <link rel="stylesheet" href="style.css">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='20' fill='%23eda100'/%3E%3Ctext x='50' y='74' font-size='68' font-family='monospace' font-weight='bold' text-anchor='middle' fill='%231c1b18'%3Ez%3C/text%3E%3C/svg%3E">
 </head>
@@ -15,10 +15,10 @@
   <div class="navlinks">
     <a href="./">overview</a>
     <a href="usage.html" aria-current="page">usage</a>
-    <a href="benchmarks.html">benchmarks</a>
-    <a href="internals.html">internals</a>
-    <a href="rationale.html">rationale</a>
     <a href="limitations.html">limitations</a>
+    <a href="benchmarks.html">benchmarks</a>
+    <a href="rationale.html">rationale</a>
+    <a href="internals.html">internals</a>
     <a href="https://github.com/gustavoschmidt/ztsc">github ↗</a>
   </div>
 </div></nav>
@@ -36,19 +36,13 @@
 <!-- ============================================================ -->
 <section>
   <p class="eyebrow"><span class="n">01</span> · install</p>
-  <h2>Build from source</h2>
-  <p>v0.0.1 is not on npm yet. Once it is, <code>bunx ztsc</code> / <code>npx ztsc</code> will
-  work with no install step. Until then, build from source — the only requirement is
-  <a href="https://ziglang.org">Zig</a> 0.16.0. There are no dependencies to fetch:
-  <code>build.zig.zon</code> lists none, and the source uses nothing but the Zig standard
-  library.</p>
-  <pre><code>git clone https://github.com/gustavoschmidt/ztsc
-cd ztsc
-zig build -Doptimize=ReleaseFast   # -&gt; zig-out/bin/ztsc</code></pre>
-  <p>A debug build is just <code>zig build</code>; <code>zig build test</code> runs the unit
-  tests and the 917-case differential conformance suite (validated against the pinned native
-  tsgo 7.0.2; the handful of deliberate divergences are tracked explicitly in a
-  <code>DEFERRED</code> ledger rather than baked into the goldens).</p>
+  <h2>One command, no install step</h2>
+  <p>v0.0.1 ships on npm soon. Once it lands, running ztsc is a single command:</p>
+  <pre><code>npx ztsc          # or: bunx ztsc</code></pre>
+  <p>Until then, build from source: with <a href="https://ziglang.org">Zig</a> 0.16.0
+  installed, <code>zig build -Doptimize=ReleaseFast</code> in a clone of the
+  <a href="https://github.com/gustavoschmidt/ztsc">repo</a> produces
+  <code>zig-out/bin/ztsc</code>. There are no dependencies to fetch.</p>
 </section>
 
 <!-- ============================================================ -->
@@ -165,23 +159,6 @@ ztsc src/main.ts           # or explicit entry files</code></pre>
     </tbody>
   </table>
   </div>
-</section>
-
-<!-- ============================================================ -->
-<section id="limitations">
-  <p class="eyebrow"><span class="n">05</span> · limitations</p>
-  <h2>What it doesn't check yet</h2>
-  <p>ztsc is pre-release. The biggest gaps: <strong>no Windows</strong> (macOS and Linux work
-  today; a port is planned), <strong>no watch mode or LSP</strong> (batch only; both planned
-  next), and a tsconfig subset (strict mode only — <code>strict: false</code> is refused) —
-  while on <a href="benchmarks.html">excalidraw</a> ztsc reports exactly the same findings as
-  tsgo, with zero excess, at every checker count. Everything else fails in the safe
-  direction: ztsc misses an error tsc would report rather than inventing one, and unsupported
-  syntax produces a clear <em>"not yet supported"</em> diagnostic — never a crash.</p>
-  <p>Run <code>ztsc --census</code> on your project to get a frequency table of exactly which
-  unsupported constructs it contains.</p>
-  <p><a href="limitations.html">The full ledger: every gap, how it behaves today, and what's
-  planned →</a></p>
 </section>
 
 <footer class="sitefoot">

@@ -15,10 +15,10 @@
   <div class="navlinks">
     <a href="./">overview</a>
     <a href="usage.html">usage</a>
-    <a href="benchmarks.html">benchmarks</a>
-    <a href="internals.html" aria-current="page">internals</a>
-    <a href="rationale.html">rationale</a>
     <a href="limitations.html">limitations</a>
+    <a href="benchmarks.html">benchmarks</a>
+    <a href="rationale.html">rationale</a>
+    <a href="internals.html" aria-current="page">internals</a>
     <a href="https://github.com/gustavoschmidt/ztsc">github ↗</a>
   </div>
 </div></nav>
@@ -653,91 +653,10 @@
   decision: named types expand only when touched, per-symbol state pages in only when faulted —
   which is how embedding the real 14k-line lib costs almost nothing on a project that uses a
   fraction of it.</p>
-</section>
-
-<!-- ============================================================ -->
-<section>
-  <p class="eyebrow"><span class="n">09</span> · source map</p>
-  <h2>Where everything lives</h2>
-  <p>Nineteen files under <code>src/</code>, one responsibility each, ordered here as data flows
-  through them. The checker is the biggest file by far — types and their relations are where a
-  type checker earns its keep — and it has grown to 19k lines as the type-level language
-  (conditional, mapped, template-literal types, instantiation expressions) landed.</p>
-
-  <div class="tablewrap">
-  <table>
-    <thead><tr><th>file</th><th>role</th><th class="num">lines</th><th></th></tr></thead>
-    <tbody>
-      <tr><td><code>main.zig</code></td><td>CLI driver, thread pool, single-owner discovery scheduler, phase timers and counters</td><td class="num">1,713</td><td><span class="locbar" style="width:9px"></span></td></tr>
-      <tr><td><code>tsconfig.zig</code></td><td>tsconfig.json subset: <code>files</code>, <code>include</code>/<code>exclude</code> globs, <code>paths</code></td><td class="num">1,918</td><td><span class="locbar" style="width:10px"></span></td></tr>
-      <tr><td><code>source.zig</code></td><td>file loading via mmap, packed segments for small files, line tables, spans</td><td class="num">362</td><td><span class="locbar" style="width:2px"></span></td></tr>
-      <tr><td><code>intern.zig</code></td><td>global string interner: text → <code>Atom</code> (u32), sharded, thread-safe</td><td class="num">358</td><td><span class="locbar" style="width:2px"></span></td></tr>
-      <tr><td><code>scanner.zig</code></td><td>tokenizer — full TS token set incl. JSX, fuzzed, never crashes</td><td class="num">1,431</td><td><span class="locbar" style="width:8px"></span></td></tr>
-      <tr><td><code>ast.zig</code></td><td>struct-of-arrays node storage, <code>extra_data</code>, node tags</td><td class="num">1,366</td><td><span class="locbar" style="width:7px"></span></td></tr>
-      <tr><td><code>parser.zig</code></td><td>recursive descent → AST, error recovery, out-of-subset → <code>unsupported</code> nodes</td><td class="num">5,190</td><td><span class="locbar" style="width:27px"></span></td></tr>
-      <tr><td><code>binder.zig</code></td><td>symbols, scope tree, control-flow graph, global-contribution slices</td><td class="num">3,671</td><td><span class="locbar" style="width:19px"></span></td></tr>
-      <tr><td><code>paths.zig</code></td><td>lexical path predicates and algebra — pure string work, no filesystem access</td><td class="num">214</td><td><span class="locbar" style="width:1px"></span></td></tr>
-      <tr><td><code>resolve.zig</code></td><td>specifier → file path: bundler-style lookup, <code>exports</code> maps, <code>///</code> references, resolution + filesystem caches</td><td class="num">1,854</td><td><span class="locbar" style="width:10px"></span></td></tr>
-      <tr><td><code>modules.zig</code></td><td>the program contract — <code>FileId</code>, <code>Program</code>, <code>ProgFile</code> — plus the linker: export/import tables, cross-file merging, ambient modules</td><td class="num">1,574</td><td><span class="locbar" style="width:8px"></span></td></tr>
-      <tr><td><code>libs.zig</code></td><td>embedded lib shards: <code>lib</code>-list → blob set, synthetic paths, atom seeding</td><td class="num">247</td><td><span class="locbar" style="width:1px"></span></td></tr>
-      <tr><td><code>types.zig</code></td><td>type representation, <code>TypeId</code>, hash-consing, canonical unions, frozen-base/overlay split</td><td class="num">1,647</td><td><span class="locbar" style="width:9px"></span></td></tr>
-      <tr><td><code>zeropage.zig</code></td><td>demand-zeroed fixed arrays over <code>MAP_ANONYMOUS</code> — backs the checkers' per-symbol state</td><td class="num">106</td><td><span class="locbar" style="width:1px"></span></td></tr>
-      <tr class="hl"><td><code>checker.zig</code></td><td>assignability, inference, narrowing, generics, conditional/mapped/template types, JSX — the semantics</td><td class="num">18,975</td><td><span class="locbar" style="width:100px"></span></td></tr>
-      <tr><td><code>diagnostics.zig</code></td><td>front-end error codes (tsc-compatible where feasible)</td><td class="num">177</td><td><span class="locbar" style="width:1px"></span></td></tr>
-      <tr><td><code>report.zig</code></td><td>pure formatting for <code>--timing</code>/<code>--memory</code>/<code>--census</code> — measurement stays in main.zig</td><td class="num">458</td><td><span class="locbar" style="width:2px"></span></td></tr>
-      <tr><td><code>render.zig</code></td><td>pretty tsc-style output: excerpts, carets, colors</td><td class="num">272</td><td><span class="locbar" style="width:1px"></span></td></tr>
-      <tr><td><code>root.zig</code></td><td>library root — re-exports the modules above</td><td class="num">43</td><td><span class="locbar" style="width:1px"></span></td></tr>
-    </tbody>
-  </table>
-  </div>
-  <p>Non-Zig sources ship inside the binary: the <strong>real TypeScript 7.0.2 lib</strong>,
-  flattened by <code>src/lib/gen_lib.js</code> and <strong>sharded into twelve
-  <code>@embedFile</code> blobs</strong> so the worker pool can parse and bind them in parallel
-  rather than serializing on one giant file — the <code>lib.esnext</code> reference chain across
-  four shards (<code>lib.esnext.0&#8211;3.d.ts</code>, 87 <code>lib.*.d.ts</code> files; ES core
-  through esnext; DOM/webworker/scripthost excluded; <strong>14,096 lines / ~626&thinsp;KB</strong>)
-  and the DOM chain across eight shards (<code>lib.dom.0&#8211;7.d.ts</code> —
-  <code>dom</code> + <code>dom.iterable</code> + <code>dom.asynciterable</code>;
-  <strong>45,178 lines / ~2.35&thinsp;MB</strong>), plus a small ztsc-authored
-  <code>console</code> shim (<code>lib.console.d.ts</code>) for the DOM-less backend config. The
-  tsconfig <code>lib</code> option selects blobs (default = ES core + DOM, matching tsgo);
-  <code>--noLib</code> skips them. It replaced an earlier 220-line
-  hand-trimmed surface, and <code>--census</code> over it reports zero out-of-subset
-  constructs. <code>bench/</code> holds the corpus generator, the real-package fetcher
-  (<code>fetch_real.sh</code>) and the end-to-end harnesses; <code>test/</code> holds the
-  conformance runner with 917 differential cases against the pinned native tsgo 7.0.2. A good reading order for the
-  code is exactly the table above, top to bottom; <code>ARCHITECTURE.md</code> at the repo root
-  states the contract those files are held to — a functional core of pure phase functions around
-  an imperative shell (<code>main.zig</code>) that owns every thread, timer and arena.</p>
-</section>
-
-<!-- ============================================================ -->
-<section>
-  <p class="eyebrow"><span class="n">10</span> · scope</p>
-  <h2>What it checks, and what's left</h2>
-  <p>The subset has grown from "real-shaped code" to nearly the whole type-level language.
-  Strict-mode semantics only (<code>strictNullChecks</code> always on):</p>
-  <p>
-    <span class="chip">primitives + literal types</span><span class="chip">objects / interfaces / aliases</span><span class="chip">arrays + tuples</span><span class="chip">unions + intersections</span><span class="chip">discriminated unions</span><span class="chip">function inference + overload resolution</span><span class="chip">generics + inference</span><span class="chip">conditional types + infer</span><span class="chip">mapped types + as remapping</span><span class="chip">template-literal types + intrinsics</span><span class="chip">keyof / T[K] / typeof over generics</span><span class="chip">instantiation expressions</span><span class="chip">recursive aliases</span><span class="chip">classes + accessors + abstract</span><span class="chip">flow narrowing</span><span class="chip">enums + const enum</span><span class="chip">namespaces + merging</span><span class="chip">as const / satisfies</span><span class="chip">type guards + assertions</span><span class="chip">this-typing</span><span class="chip">decorators (TC39)</span><span class="chip">unique symbol</span><span class="chip">import() types</span><span class="chip">call + construct signatures</span><span class="chip">async/await + generators</span><span class="chip">iteration protocol (for…of / for await)</span><span class="chip">JSX (.tsx) from @types/react</span><span class="chip">JSX spread attributes</span><span class="chip">real typescript 7.0.2 esnext lib</span><span class="chip">commonjs interop (export = / require)</span><span class="chip">DOM lib (tsconfig lib)</span><span class="chip">ES modules + .d.ts</span><span class="chip">cross-file declaration merging</span><span class="chip">declare global / module augmentation</span><span class="chip">/// references + ambient modules</span><span class="chip">tsconfig subset (include/exclude, paths)</span>
-  </p>
-  <p>That growth is measured, not asserted. Every out-of-subset construct is tagged at parse time,
-  so <code>--census</code> over a vendored real-world corpus (2,945 published <code>.d.ts</code>
-  files, ~131k lines — @types/node, @types/react, @types/lodash, rxjs, drizzle-orm, zod, hono, …)
-  is a frequency table of what's missing. The first census counted 2,287 unsupported constructs,
-  half of them conditional types and <code>infer</code>; those were built first, and today
-  <strong>every bucket in that census reads zero</strong>. The acceptance bar was the real,
-  published <code>@types/node</code>: ztsc's cross-file merge diagnostics match the TypeScript
-  compiler on it (pinned tsgo 7.0.2 oracle).</p>
-  <p>What remains out for v0.0.1 is a short, deliberate list — watch mode, an LSP, Windows, and a
-  handful of leniencies that under-report rather than erroring (on excalidraw the
-  false-positive count is zero — ztsc reports exactly tsgo's findings at every checker
-  count). The
-  <a href="limitations.html">limitations page</a> holds the
-  full ledger: every gap, how it behaves today, and what's planned. Everything else before
-  release is done — the semantic breadth, the instantiation discipline, the real lib and the
-  real <code>@types/node</code> acceptance, the substrate experiments, and pre-publish polish
-  (MIT license, a NOTICE crediting Microsoft's TypeScript for the embedded lib and diagnostic
-  strings). What's left is the ship itself: v0.0.1 as a working <code>bunx ztsc</code>.</p>
+  <p>The source layout and a good reading order are in
+  <a href="https://github.com/gustavoschmidt/ztsc/blob/main/ARCHITECTURE.md">ARCHITECTURE.md</a>;
+  the <a href="limitations.html">limitations page</a> is the ledger of what's checked and
+  what's left.</p>
 </section>
 
 <footer class="sitefoot">

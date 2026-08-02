@@ -15,10 +15,10 @@
   <div class="navlinks">
     <a href="./" aria-current="page">overview</a>
     <a href="usage.html">usage</a>
-    <a href="benchmarks.html">benchmarks</a>
-    <a href="internals.html">internals</a>
-    <a href="rationale.html">rationale</a>
     <a href="limitations.html">limitations</a>
+    <a href="benchmarks.html">benchmarks</a>
+    <a href="rationale.html">rationale</a>
+    <a href="internals.html">internals</a>
     <a href="https://github.com/gustavoschmidt/ztsc">github ↗</a>
   </div>
 </div></nav>
@@ -68,6 +68,42 @@
 
 <!-- ============================================================ -->
 <section>
+  <p class="eyebrow">getting started</p>
+  <h2>One command, no install step</h2>
+  <p>v0.0.1 ships on npm soon — then running ztsc is a single command, nothing to install:</p>
+  <pre><code>npx ztsc          # or: bunx ztsc</code></pre>
+  <p>(Until the npm package lands, ztsc can be
+  <a href="https://github.com/gustavoschmidt/ztsc#readme">built from source</a> —
+  Zig 0.16.0, zero dependencies.)</p>
+  <p>Point it at a project and it does the rest:</p>
+  <pre><code>ztsc                       # finds tsconfig.json in cwd or a parent
+ztsc -p path/to/project    # explicit tsconfig
+ztsc src/main.ts           # or explicit entry files</code></pre>
+  <p>Diagnostics are tsc-style, with source excerpts and matching error codes:</p>
+  <pre><code>demo.ts:1:19 - error TS2322: Type 'string' is not assignable to type 'number'.
+
+1 const n: number = "hi";
+                    ~~~~</code></pre>
+  <p><a href="usage.html">Full usage: CLI options, the tsconfig subset, exit codes →</a></p>
+</section>
+
+<!-- ============================================================ -->
+<section>
+  <p class="eyebrow">limits</p>
+  <h2>What it can't do yet</h2>
+  <p><strong>ztsc is pre-release and not ready for production use.</strong> It checks a large,
+  well-defined subset of strict-mode TypeScript — watch mode, an LSP, and Windows are the
+  biggest gaps, all planned. Unsupported syntax produces a clear "not supported" diagnostic,
+  never a crash, and known gaps <em>under-report</em> rather than inventing errors on valid
+  code: on excalidraw it reports exactly the same 17 diagnostics as tsgo with no false positives
+  at all. <code>ztsc --census</code> tells you in
+  one command exactly which unsupported constructs your own project contains.</p>
+  <p><a href="limitations.html">The full list: every gap, how it behaves today, and what's
+  planned →</a></p>
+</section>
+
+<!-- ============================================================ -->
+<section>
   <p class="eyebrow">benchmarks</p>
   <h2>Faster and smaller than tsgo — on every benchmark</h2>
   <p>The headline number is a whole application: on
@@ -97,26 +133,18 @@
 
 <!-- ============================================================ -->
 <section>
-  <p class="eyebrow">getting started</p>
-  <h2>Build it, point it at a project</h2>
-  <p>v0.0.1 is not on npm yet — once it ships, <code>bunx ztsc</code> / <code>npx ztsc</code>
-  will run it with no install step. Until then, build from source — all you need is
-  <a href="https://ziglang.org">Zig</a> 0.16.0; there are no dependencies to fetch:</p>
-  <pre><code>git clone https://github.com/gustavoschmidt/ztsc
-cd ztsc
-zig build -Doptimize=ReleaseFast   # -&gt; zig-out/bin/ztsc</code></pre>
-  <p>Point it at a project and it does the rest:</p>
-  <pre><code>ztsc                       # finds tsconfig.json in cwd or a parent
-ztsc -p path/to/project    # explicit tsconfig
-ztsc src/main.ts           # or explicit entry files</code></pre>
-  <p>Diagnostics are tsc-style, with source excerpts and matching error codes:</p>
-  <pre><code>demo.ts:1:19 - error TS2322: Type 'string' is not assignable to type 'number'.
-
-1 const n: number = "hi";
-                    ~~~~</code></pre>
-  <p>(The comparison baseline is just as easy to get: tsgo is
-  <code>npm i @typescript/native-preview</code>.)</p>
-  <p><a href="usage.html">Full usage: CLI options, the tsconfig subset, exit codes →</a></p>
+  <p class="eyebrow">rationale</p>
+  <h2>Why this exists</h2>
+  <p>AI writes code fast, so the tooling that checks that code has to be fast and cheap to run.
+  A type checker used to be a tool a person ran occasionally; now it is <strong>infrastructure
+  that machines call at high frequency and high concurrency</strong> — dozens of invocations
+  per agent session, fleets of memory-capped sandboxes running instances simultaneously. That
+  shift makes memory per instance a density limit, the startup floor a multiplied cost, and
+  deterministic output a cache key. tsgo settled the speed question; ztsc's bet is that
+  <em>memory is where a systems language beats a garbage-collected one</em> — and that if you
+  design for memory with total consistency, speed comes along for free.</p>
+  <p><a href="rationale.html">The full argument: what machine-called checkers need, and the
+  memory bet →</a></p>
 </section>
 
 <!-- ============================================================ -->
@@ -154,59 +182,28 @@ ztsc src/main.ts           # or explicit entry files</code></pre>
 
 <!-- ============================================================ -->
 <section>
-  <p class="eyebrow">limits</p>
-  <h2>What it can't do yet</h2>
-  <p><strong>ztsc is pre-release and not ready for production use.</strong> It checks a large,
-  well-defined subset of strict-mode TypeScript — watch mode, an LSP, and Windows are the
-  biggest gaps, all planned. Unsupported syntax produces a clear "not supported" diagnostic,
-  never a crash, and known gaps <em>under-report</em> rather than inventing errors on valid
-  code: on excalidraw it reports exactly the same 17 diagnostics as tsgo with no false positives
-  at all. <code>ztsc --census</code> tells you in
-  one command exactly which unsupported constructs your own project contains.</p>
-  <p><a href="limitations.html">The full list: every gap, how it behaves today, and what's
-  planned →</a></p>
-</section>
-
-<!-- ============================================================ -->
-<section>
-  <p class="eyebrow">rationale</p>
-  <h2>Why this exists</h2>
-  <p>AI writes code fast, so the tooling that checks that code has to be fast and cheap to run.
-  A type checker used to be a tool a person ran occasionally; now it is <strong>infrastructure
-  that machines call at high frequency and high concurrency</strong> — dozens of invocations
-  per agent session, fleets of memory-capped sandboxes running instances simultaneously. That
-  shift makes memory per instance a density limit, the startup floor a multiplied cost, and
-  deterministic output a cache key. tsgo settled the speed question; ztsc's bet is that
-  <em>memory is where a systems language beats a garbage-collected one</em> — and that if you
-  design for memory with total consistency, speed comes along for free.</p>
-  <p><a href="rationale.html">The full argument: the memory bet, the measured subset, hard
-  determinism, and the experiments that didn't land →</a></p>
-</section>
-
-<!-- ============================================================ -->
-<section>
   <p class="eyebrow">documentation</p>
   <h2>Read more</h2>
   <div class="cardgrid">
     <a class="card" href="usage.html">
       <h3>Usage</h3>
-      <p>Building, CLI options, the tsconfig subset, exit codes.</p>
+      <p>Install, CLI options, the tsconfig subset, exit codes.</p>
+    </a>
+    <a class="card" href="limitations.html">
+      <h3>Limitations</h3>
+      <p>What's not checked yet, the false-positive ledger, and what's planned: watch mode, LSP, Windows, npm.</p>
     </a>
     <a class="card" href="benchmarks.html">
       <h3>Benchmarks</h3>
       <p>Full results on packages and application source, the parallelism sweep, methodology, and how to reproduce.</p>
     </a>
+    <a class="card" href="rationale.html">
+      <h3>Rationale</h3>
+      <p>Why this exists: machines call the checker now, and memory is the bet.</p>
+    </a>
     <a class="card" href="internals.html">
       <h3>Internals</h3>
       <p>A guided tour of how the checker works — the pipeline, the pointer-free data structures, the memory design, the parallelism.</p>
-    </a>
-    <a class="card" href="rationale.html">
-      <h3>Rationale</h3>
-      <p>Why this exists: the memory bet, why a measured subset, why determinism is a hard guarantee, and the experiments that didn't land.</p>
-    </a>
-    <a class="card" href="limitations.html">
-      <h3>Limitations</h3>
-      <p>What's not checked yet, the false-positive ledger, and what's planned: watch mode, LSP, Windows, npm.</p>
     </a>
   </div>
 </section>

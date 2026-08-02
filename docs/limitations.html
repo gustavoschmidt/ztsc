@@ -15,10 +15,10 @@
   <div class="navlinks">
     <a href="./">overview</a>
     <a href="usage.html">usage</a>
-    <a href="benchmarks.html">benchmarks</a>
-    <a href="internals.html">internals</a>
-    <a href="rationale.html">rationale</a>
     <a href="limitations.html" aria-current="page">limitations</a>
+    <a href="benchmarks.html">benchmarks</a>
+    <a href="rationale.html">rationale</a>
+    <a href="internals.html">internals</a>
     <a href="https://github.com/gustavoschmidt/ztsc">github ↗</a>
   </div>
 </div></nav>
@@ -45,6 +45,10 @@
   computed keys, and JSX against the real <code>@types/react</code>. What it checks, it checks
   like the TypeScript compiler — enforced by a 917-case differential conformance suite
   validated against the pinned native tsgo 7.0.2, down to error codes and lines.</p>
+  <p>The subset, positively stated:</p>
+  <p>
+    <span class="chip">primitives + literal types</span><span class="chip">objects / interfaces / aliases</span><span class="chip">arrays + tuples</span><span class="chip">unions + intersections</span><span class="chip">discriminated unions</span><span class="chip">function inference + overload resolution</span><span class="chip">generics + inference</span><span class="chip">conditional types + infer</span><span class="chip">mapped types + as remapping</span><span class="chip">template-literal types + intrinsics</span><span class="chip">keyof / T[K] / typeof over generics</span><span class="chip">instantiation expressions</span><span class="chip">recursive aliases</span><span class="chip">classes + accessors + abstract</span><span class="chip">flow narrowing</span><span class="chip">enums + const enum</span><span class="chip">namespaces + merging</span><span class="chip">as const / satisfies</span><span class="chip">type guards + assertions</span><span class="chip">this-typing</span><span class="chip">decorators (TC39)</span><span class="chip">unique symbol</span><span class="chip">import() types</span><span class="chip">call + construct signatures</span><span class="chip">async/await + generators</span><span class="chip">iteration protocol (for…of / for await)</span><span class="chip">JSX (.tsx) from @types/react</span><span class="chip">JSX spread attributes</span><span class="chip">real typescript 7.0.2 esnext lib</span><span class="chip">commonjs interop (export = / require)</span><span class="chip">DOM lib (tsconfig lib)</span><span class="chip">ES modules + .d.ts</span><span class="chip">cross-file declaration merging</span><span class="chip">declare global / module augmentation</span><span class="chip">/// references + ambient modules</span><span class="chip">tsconfig subset (include/exclude, paths)</span>
+  </p>
   <p>Everything outside the subset is bounded by three guarantees:</p>
   <ul>
     <li><strong>Unsupported syntax never lies.</strong> Out-of-subset constructs parse into an
@@ -163,8 +167,7 @@
   <div class="note">
     <p><strong>Check your own codebase in one command.</strong> <code>ztsc --census</code>
     tallies every out-of-subset construct in your project by frequency — the same instrument
-    that decided what got built first (see the
-    <a href="rationale.html">measured-subset rationale</a>). If the census reads zero and the
+    that decided what got built first. If the census reads zero and the
     tsconfig subset covers you, ztsc checks your project today.</p>
   </div>
 </section>
