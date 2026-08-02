@@ -396,6 +396,44 @@ const Worker = struct {
     }
 };
 
+/// Check-work (AST nodes to walk) below which a run drops to two checkers.
+///
+/// A checker instance is not free. Each carries its own type-store overlay,
+/// per-symbol state arrays, scratch/instantiation arenas, relation and
+/// instantiation caches, thread, and its thread's share of the general
+/// allocator's size-class slabs — measured at ~0.35 MB of fixed state per
+/// instance on ajv, against ~90 KB of types the instance actually interns.
+/// Adding instances also re-materializes lib types once per instance that
+/// reaches them.
+///
+/// That fixed cost is worth paying when there is enough work to spread, and
+/// the corpus shows the trade inverting sharply around this size. Going from
+/// four checkers to two (median of 11 runs / 5 runs):
+///
+///   chalk       21.1k nodes   RSS -7.8%   wall +8.1%
+///   @types/prop-types 21.0k   RSS -7.4%   wall +6.9%
+///   ajv         28.0k nodes   RSS -11.4%  wall +1.7%
+///   ---- threshold ----
+///   date-fns    36.8k nodes   RSS -2.2%   wall +7.6%
+///   typebox     37.0k nodes   RSS -0.3%   wall +14.8%
+///   @types/react 101.6k       RSS -7.7%   wall +14.9%
+///   zod         98.2k nodes   RSS -6.8%   wall +21.9%
+///
+/// Below the line the memory saved is large and the wall cost small; above
+/// it the wall cost multiplies while the memory saving collapses. An
+/// explicit `--checkers=N` always wins over this.
+///
+/// Diagnostics are unaffected: output is byte-identical for any checker
+/// count (see the determinism tests), so this only moves the resource
+/// trade-off, never the result.
+const small_program_nodes: u64 = 32_000;
+
+fn defaultCheckers(explicit: ?usize, cpu_count: usize, check_nodes: u64) usize {
+    if (explicit) |n| return n;
+    const wide = @min(4, cpu_count);
+    return if (check_nodes < small_program_nodes) @min(wide, 2) else wide;
+}
+
 /// One checker instance: checks its partition on its own thread.
 const CheckerTask = struct {
     arena: std.heap.ArenaAllocator,
@@ -965,38 +1003,42 @@ pub fn main(init: std.process.Init) !void {
 
     // --- Check (N independent checker instances) --------------------------------
     const check_timer = Timer.start(io);
-    const n_checkers: usize = @max(1, @min(cli.checkers orelse @min(4, cpu_count), n_files));
-    const tasks = try arena.alloc(CheckerTask, n_checkers);
     // File id -> owning checker, so per-file diagnostics can be reassembled
     // from the right checker below (replaces the old `i % n_checkers`).
     const file_owner = try arena.alloc(u32, n_files);
+
+    // Cost-based partition, weighted by per-file AST node count
+    // (≈ check cost, known post-parse) — see the run split below for how
+    // the weights are spent. Built before the checker count is chosen,
+    // because the total is what chooses it.
+    const Item = struct { file: u32, cost: u64 };
+    var items: std.ArrayList(Item) = .empty;
+    try items.ensureTotalCapacity(arena, n_files);
+    @memset(file_owner, 0);
+    var check_nodes: u64 = 0;
+    for (0..n_files) |i| {
+        // Embedded lib files are parsed/bound/linked (globals, lazy type
+        // expansion) and, by default, also enqueued to a checker so the
+        // pre-verified lib is walked just like tsc/tsgo at their defaults.
+        // `--skip-default-lib-check` (or tsconfig skipLibCheck/
+        // skipDefaultLibCheck) drops them — pure time savings, since lib
+        // diagnostics are never surfaced (tsc's skipDefaultLibCheck).
+        if (skip_default_lib_check and libs.isLibPath(paths.items[i])) continue;
+        // skipLibCheck: a non-lib `.d.ts` produces no surfaced check
+        // diagnostics, and its types are resolved lazily on demand from
+        // `.ts` files (not by walking it), so its check pass is dead work —
+        // don't enqueue it. Pure time savings, deterministic (path-based).
+        if (skip_all_dts_check and ztsc.paths.isDeclarationPath(paths.items[i])) continue;
+        const cost: u64 = if (trees.items[i]) |tree| tree.nodes.len else 0;
+        check_nodes += cost;
+        items.appendAssumeCapacity(.{ .file = @intCast(i), .cost = cost });
+    }
+
+    const n_checkers: usize = @max(1, @min(defaultCheckers(cli.checkers, cpu_count, check_nodes), n_files));
+    const tasks = try arena.alloc(CheckerTask, n_checkers);
     {
-        // Cost-based partition, weighted by per-file AST node count
-        // (≈ check cost, known post-parse) — see the run split below for how
-        // the weights are spent.
         const owned_lists = try arena.alloc(std.ArrayList(modules.FileId), n_checkers);
         for (owned_lists) |*l| l.* = .empty;
-
-        const Item = struct { file: u32, cost: u64 };
-        var items: std.ArrayList(Item) = .empty;
-        try items.ensureTotalCapacity(arena, n_files);
-        @memset(file_owner, 0);
-        for (0..n_files) |i| {
-            // Embedded lib files are parsed/bound/linked (globals, lazy type
-            // expansion) and, by default, also enqueued to a checker so the
-            // pre-verified lib is walked just like tsc/tsgo at their defaults.
-            // `--skip-default-lib-check` (or tsconfig skipLibCheck/
-            // skipDefaultLibCheck) drops them — pure time savings, since lib
-            // diagnostics are never surfaced (tsc's skipDefaultLibCheck).
-            if (skip_default_lib_check and libs.isLibPath(paths.items[i])) continue;
-            // skipLibCheck: a non-lib `.d.ts` produces no surfaced check
-            // diagnostics, and its types are resolved lazily on demand from
-            // `.ts` files (not by walking it), so its check pass is dead work —
-            // don't enqueue it. Pure time savings, deterministic (path-based).
-            if (skip_all_dts_check and ztsc.paths.isDeclarationPath(paths.items[i])) continue;
-            const cost: u64 = if (trees.items[i]) |tree| tree.nodes.len else 0;
-            items.appendAssumeCapacity(.{ .file = @intCast(i), .cost = cost });
-        }
         // Locality-aware, balanced partition. File ids are BFS positions in
         // the import graph (see the renumbering above), so a contiguous id
         // range is import-adjacent and its dependency closures largely
