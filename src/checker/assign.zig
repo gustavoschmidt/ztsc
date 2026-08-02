@@ -444,6 +444,208 @@ pub fn varianceVerdict(c: *Checker, s_ref: TypeId, t_ref: TypeId) Error!?bool {
 }
 
 // =====================================================================
+// measured (structural) variance — tsc's `getVariances`
+// =====================================================================
+
+/// How a generic actually USES one of its type parameters, measured from its
+/// body rather than read off an `in`/`out` annotation — tsc's
+/// `VarianceFlags`. Packed 3 bits per parameter in `measured_variance`, so
+/// `unmeasured` must stay 0: an all-zero cache entry is "this generic told us
+/// nothing", the answer for every non-generic and every shape below.
+pub const Measured = enum(u3) {
+    /// No verdict. The parameter list is too long to pack, the body is not a
+    /// materializable generic, or the measurement was declined. The relation
+    /// falls back to the structural walk, exactly as before this existed.
+    unmeasured = 0,
+    /// `G<sub>` relates to `G<super>` but not the reverse: the parameter is
+    /// read (returns, property types), never written.
+    covariant = 1,
+    /// The reverse: the parameter is only written (function-property
+    /// parameters under `strictFunctionTypes`).
+    contravariant = 2,
+    /// Both directions relate and the parameter IS witnessed — a method
+    /// parameter, which TypeScript compares bivariantly. Either argument
+    /// direction satisfies the pair.
+    bivariant = 3,
+    /// Neither direction relates: the parameter is read AND written, so two
+    /// instantiations relate only when the arguments relate both ways.
+    invariant = 4,
+    /// Both directions relate and so does a marker unrelated to either: the
+    /// parameter is not witnessed anywhere in the body, so its arguments do
+    /// not participate in the relation at all.
+    independent = 5,
+};
+
+/// Type parameters one generic may have and still be measured. Three bits
+/// each have to fit in the `measured_variance` word; a longer list is read as
+/// unmeasured and keeps the structural walk.
+pub const max_measured_params = 10;
+
+/// Measurements that may be on the stack at once. A measurement walks the
+/// generic's body, and every OTHER generic it meets there wants measuring
+/// too, so the nest is bounded by the size of the mutually-referencing family
+/// — zod's `ZodType` and its ~20 wrappers are the shape that sets the bar. It
+/// cannot loop (a generic already on the stack short-circuits, see
+/// `measuring_variance`), and the relation's own `max_relation_depth` is not
+/// reset per measurement, so the native stack stays bounded by that.
+///
+/// The cap has to clear the family, not merely bound it: past it the generic
+/// is left unmeasured and the structural walk answers — which for exactly
+/// these recursive `this`-typed families is the exponential walk measurement
+/// exists to avoid. A cap of 4 left zod's `ZodNumber` check running for
+/// minutes; 32 clears it with room to spare.
+pub const max_variance_measure_depth = 32;
+
+pub fn measuredAt(bits: u32, i: usize) Measured {
+    if (i >= max_measured_params) return .unmeasured;
+    return @enumFromInt(@as(u3, @truncate(bits >> @intCast(3 * i))));
+}
+
+/// Structurally measured variance of every type parameter of `owner`, packed
+/// (see `measured_variance`). Null means "declined" — `owner` is not a
+/// generic the checker can materialize, or the nest cap
+/// (`max_variance_measure_depth`) is reached — and nothing is cached, so a
+/// later shallower demand still measures.
+///
+/// tsc's `getVariancesWorker`: substitute an opaque `sub`/`super` marker pair
+/// for the parameter, and ask the ordinary relation which way the two
+/// instantiations go. A parameter carrying an explicit `in`/`out` annotation
+/// is not measured — the annotation IS the declared answer, and whether the
+/// body agrees is TS2636's business (`checkVarianceAnnotations`), not the
+/// relation's.
+pub fn measuredVariances(c: *Checker, owner: SymbolId) Error!?u32 {
+    if (c.measured_variance.get(owner)) |v| return v;
+    if (c.variance_measure_depth >= max_variance_measure_depth) return null;
+    const f = c.symFlags(owner);
+    if (!f.interface and !f.class and !f.type_alias) return null;
+
+    var tps: std.ArrayList(TypeParamInfo) = .empty;
+    defer tps.deinit(c.scratch());
+    try c.typeParamsOf(owner, &tps);
+    if (tps.items.len == 0 or tps.items.len > max_measured_params) {
+        try c.measured_variance.put(c.cm(), owner, 0);
+        return 0;
+    }
+
+    try c.measuring_variance.put(c.cm(), owner, {});
+    c.variance_measure_depth += 1;
+    // Instantiation and expansion are bookkeeping here, exactly as in
+    // `checkVarianceAnnotations`: a depth/count trip measuring a type the
+    // user never wrote must neither be reported nor charged to the statement
+    // whose relation happened to demand the measurement.
+    const saved_suppress = c.suppress_inst_diag;
+    const saved_count = c.inst_count;
+    c.suppress_inst_diag = true;
+    defer {
+        c.suppress_inst_diag = saved_suppress;
+        c.inst_count = saved_count;
+        c.variance_measure_depth -= 1;
+        _ = c.measuring_variance.remove(owner);
+    }
+
+    const declared = try c.declaredVariances(owner);
+    var bits: u32 = 0;
+    for (tps.items, 0..) |_, i| {
+        const dv: Variance = if (i >= 16) .none else @enumFromInt(@as(u2, @truncate(declared >> @intCast(2 * i))));
+        const m: Measured = switch (dv) {
+            .covariant => .covariant,
+            .contravariant => .contravariant,
+            .invariant => .invariant,
+            .none => try measureOneVariance(c, owner, tps.items, i),
+        };
+        bits |= @as(u32, @intFromEnum(m)) << @intCast(3 * i);
+    }
+    // Cached unconditionally, even when the relation gave up on depth
+    // somewhere inside (`max_relation_depth`, "assume related"): a
+    // measurement is answered ONCE per generic per checker, and re-running an
+    // expensive one on every reference — which is what declining to cache
+    // amounts to — costs more than the precision it buys. A verdict skewed by
+    // the depth guard is skewed towards "related", and only POSITIVE verdicts
+    // are believed (see `measuredVarianceVerdict`), so the cost is an
+    // under-report, never a false positive.
+    try c.measured_variance.put(c.cm(), owner, bits);
+    return bits;
+}
+
+/// One parameter's measurement: build the two instantiations that differ only
+/// at position `i` — one carrying the `sub` marker, one the `super` — and ask
+/// the relation which way they go.
+fn measureOneVariance(c: *Checker, owner: SymbolId, tps: []const TypeParamInfo, i: usize) Error!Measured {
+    const args = try c.scratch().alloc(TypeId, tps.len);
+    defer c.scratch().free(args);
+    for (tps, 0..) |tp, j| args[j] = try c.ts.makeTypeParam(tp.sym);
+    const markers = try c.varianceMarkers(c.symbolName(tps[i].sym));
+    args[i] = markers[0];
+    const sub_ref = try c.ts.makeRef(owner, args);
+    args[i] = markers[1];
+    const super_ref = try c.ts.makeRef(owner, args);
+    // The parameter is not part of the reference's identity at all (a
+    // defaulted tail that `makeRef` dropped): nothing to measure.
+    if (sub_ref == super_ref) return .independent;
+    try c.marker_refs.put(c.cm(), sub_ref, {});
+    try c.marker_refs.put(c.cm(), super_ref, {});
+    const co = try c.isAssignable(sub_ref, super_ref);
+    const contra = try c.isAssignable(super_ref, sub_ref);
+    if (co and contra) {
+        // Bivariant may just mean the parameter is never witnessed. tsc
+        // settles it with a THIRD marker related to neither of the first two
+        // (`markerOtherType`): if that one relates as well, no member reads
+        // the parameter. A second `varianceMarkers` mint supplies it — its
+        // UNCONSTRAINED half is by construction related to nothing but
+        // itself, which is exactly the marker wanted.
+        const other = (try c.varianceMarkers(c.symbolName(tps[i].sym)))[1];
+        args[i] = other;
+        const other_ref = try c.ts.makeRef(owner, args);
+        try c.marker_refs.put(c.cm(), other_ref, {});
+        if (other_ref != super_ref and try c.isAssignable(other_ref, super_ref)) return .independent;
+        return .bivariant;
+    }
+    if (co) return .covariant;
+    if (contra) return .contravariant;
+    return .invariant;
+}
+
+/// tsc's `relateVariances` over MEASURED variance: two references to the same
+/// generic relate by their type ARGUMENTS, which is what keeps the relation
+/// off a body that instantiates the generic again one level deeper.
+///
+/// Purely additive — the verdict is only ever believed when it is POSITIVE.
+/// A failed variance check falls through to the structural walk, where tsc
+/// would have returned "not related" outright; that is an under-report by
+/// construction and never a false positive, and it is what keeps every
+/// relation ztsc decided before this existed unchanged.
+///
+/// The exception is a generic measuring ITSELF (`measuring_variance`): the
+/// pair is assumed related, tsc's `Ternary.Unknown` for a recursive
+/// `getVariances`. Variance is therefore measured only from occurrences that
+/// are not nested inside a recursive instantiation of the same generic — and
+/// that assumption is what terminates `ZodOptional<this>` inside `ZodType`.
+pub fn measuredVarianceVerdict(c: *Checker, s_ref: TypeId, t_ref: TypeId) Error!bool {
+    const st = &c.ts;
+    const n = st.refArgCount(s_ref);
+    if (n == 0 or n != st.refArgCount(t_ref)) return false;
+    const owner = st.refSymbol(s_ref);
+    if (c.measuring_variance.contains(owner)) return true;
+    if (n > max_measured_params) return false;
+    const bits = (try c.measuredVariances(owner)) orelse return false;
+    if (bits == 0) return false;
+    for (0..n) |i| {
+        const sa = st.refArgAt(s_ref, i);
+        const ta = st.refArgAt(t_ref, i);
+        if (sa == ta) continue;
+        switch (measuredAt(bits, i)) {
+            .unmeasured => return false,
+            .independent => {},
+            .covariant => if (!try c.isAssignable(sa, ta)) return false,
+            .contravariant => if (!try c.isAssignable(ta, sa)) return false,
+            .bivariant => if (!(try c.isAssignable(sa, ta)) and !(try c.isAssignable(ta, sa))) return false,
+            .invariant => if (!(try c.isAssignable(sa, ta)) or !(try c.isAssignable(ta, sa))) return false,
+        }
+    }
+    return true;
+}
+
+// =====================================================================
 // declaration-site variance (TS2636)
 // =====================================================================
 
@@ -716,6 +918,11 @@ pub fn checkVarianceAnnotations(c: *Checker, owner: SymbolId) Error!void {
         const super_ref = try c.ts.makeRef(owner, args);
         args[i] = saved_arg;
         if (sub_ref == super_ref) continue;
+        // Same exemption the MEASURED verdict needs (tsc's `markerTypes`):
+        // a variance verdict on the very pair a measurement is relating
+        // would make every measurement vacuously true.
+        try c.marker_refs.put(c.cm(), sub_ref, {});
+        try c.marker_refs.put(c.cm(), super_ref, {});
         // `out T` promises sub -> super; `in T` promises the reverse.
         const src = if (v == .covariant) sub_ref else super_ref;
         const tgt = if (v == .covariant) super_ref else sub_ref;
@@ -829,6 +1036,20 @@ pub fn isAssignable(c: *Checker, s0: TypeId, t0: TypeId) Error!bool {
             {
                 if (try c.varianceVerdict(sr, tr)) |verdict| {
                     if (verdict or c.variance_marker_refs[0] == 0) return verdict;
+                }
+                // Nothing declared, or nothing decisive: MEASURE how the
+                // generic uses its parameters and relate the arguments by
+                // that (see `measuredVarianceVerdict`). Positive only — a
+                // failure still falls through to the structural walk below.
+                //
+                // `marker_refs` is tsc's `markerTypes`: a pair some
+                // measurement minted is the question, not something to answer
+                // from a verdict. (The DECLARED verdict above needs no such
+                // guard for a measured pair: a mixed `<in A, B>` measuring `B`
+                // leaves `A` identical on both sides and `B` unannotated, so
+                // `varianceVerdict` is never decisive on it.)
+                if (!c.marker_refs.contains(sr) and !c.marker_refs.contains(tr)) {
+                    if (try c.measuredVarianceVerdict(sr, tr)) return true;
                 }
             }
         }
@@ -1112,6 +1333,18 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
     // substitution the constraint reduces back to the same deferred access
     // (`bc == t`) and the relation stays rejected, as before.
     if (tk == .index_access) {
+        // `S[K]` relates to `T[J]` when S relates to T and K relates to J
+        // (tsc `structuredTypeRelatedTo`, IndexedAccess on BOTH sides). The
+        // constraint route below cannot answer this pair: neither side
+        // reduces while its object is still a type parameter, so
+        // `T["_output"]` under two different arguments compared as nothing
+        // at all — which is what made a generic whose members read their
+        // parameter through an indexed access (`ZodOptional<T> extends
+        // ZodType<T["_output"] | undefined, …>`) measure INVARIANT instead
+        // of covariant.
+        if (sk == .index_access and
+            try c.isAssignable(c.ts.indexAccessObj(s), c.ts.indexAccessObj(t)) and
+            try c.isAssignable(c.ts.indexAccessIndex(s), c.ts.indexAccessIndex(t))) return true;
         if (try c.indexAccessTargetConstraint(t)) |bc| return c.isAssignable(s, bc);
         return false;
     }
