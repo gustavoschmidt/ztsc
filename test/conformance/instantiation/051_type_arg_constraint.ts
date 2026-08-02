@@ -1,11 +1,15 @@
 // TS2344 — a written type argument must satisfy its type parameter's
-// constraint — is not implemented. See the DEFERRED entry: enumerating a
-// constraint's key set is only sound on a member table ztsc folds
-// completely, and it does not always fold one.
+// constraint. The constraint is instantiated under the reference's OWN
+// argument list, so `K`'s `keyof T & string` is decided against the supplied
+// `C`, not against a free `T`.
 //
-// The consequences of a bad argument are still reported wherever the
-// argument is USED, which is what keeps a wrong instantiation from passing
-// silently: `pick` below is the same mistake, and it fails at the write.
+// The check runs after every statement of every owned file (see
+// `PendingTypeArgs`): enumerating a constraint's key set is only sound on a
+// completely folded member table, and mid-materialization there is no such
+// thing.
+//
+// The consequences of a bad argument are ALSO reported wherever the argument
+// is USED — `pick` below is the same mistake, and it fails at the write.
 type Without<T, K extends keyof T & string> = [T, K];
 interface C {
   a: number;

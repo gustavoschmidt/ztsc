@@ -110,7 +110,12 @@ pub fn typeFromTypeNodeUncached(c: *Checker, node: Node) Error!TypeId {
             for (arg_nodes) |an| {
                 if (an != null_node) try args.append(c.scratch(), try c.typeFromTypeNode(an));
             }
-            return c.typeFromTypeName(d.lhs, args.items);
+            var target: SymbolId = binder.no_symbol;
+            const result = try c.typeFromTypeNameEx(d.lhs, args.items, &target);
+            if (target != binder.no_symbol) {
+                try c.queueTypeArgConstraints(node, target, args.items, arg_nodes);
+            }
+            return result;
         },
         .qualified_name => return c.typeFromQualifiedName(node, &.{}),
         .import_type => {
@@ -274,6 +279,14 @@ pub fn lookupMappedKey(c: *Checker, a: Atom) ?checker_zig.MappedKeyScope {
 
 /// A named type reference (identifier, possibly with type arguments).
 pub fn typeFromTypeName(c: *Checker, name_node: Node, args: []const TypeId) Error!TypeId {
+    return typeFromTypeNameEx(c, name_node, args, null);
+}
+
+/// `typeFromTypeName`, additionally reporting WHICH generic symbol the name
+/// resolved to. Only the syntactic type-reference arm needs it — to check the
+/// written type arguments against that symbol's constraints (TS2344) — and
+/// only it pays for the out-parameter.
+pub fn typeFromTypeNameEx(c: *Checker, name_node: Node, args: []const TypeId, out_sym: ?*SymbolId) Error!TypeId {
     if (name_node == null_node) return types.any_type;
     // `member_expr` appears when the name came from expression position
     // (class/interface `extends` clauses); it shares qualified_name's
@@ -372,6 +385,7 @@ pub fn typeFromTypeName(c: *Checker, name_node: Node, args: []const TypeId) Erro
                     .namespace, .default_expr, .ambient_ns, .export_equals_prop, .any => return types.any_type,
                 }
             }
+            if (out_sym) |o| o.* = sym;
             return c.materializeTypeRef(sym, args, tok, a);
         },
         .wrong_space => {
@@ -388,6 +402,7 @@ pub fn typeFromTypeName(c: *Checker, name_node: Node, args: []const TypeId) Erro
             // loses every inherited member (→ spurious TS2352 downstream on
             // a `DrawStop`-typed value cast to a `LeafletEvent` handler).
             if (try c.augmentModuleTypeSym(c.cur_scope, a)) |gsym| {
+                if (out_sym) |o| o.* = gsym;
                 return c.materializeTypeRef(gsym, args, tok, a);
             }
             // The four intrinsic string transforms are magic global
@@ -1142,6 +1157,299 @@ pub fn buildInstMap(c: *Checker, sym: SymbolId, args: []const TypeId, out: *std.
             }
         }
     }
+}
+
+/// Does `sym` declare any type parameter with an `extends` clause? Memoized:
+/// the answer is a property of the declaration, asked once per written type
+/// reference, and `typeParamsOf` walks every declaration block to answer it.
+pub fn symHasConstrainedTypeParam(c: *Checker, sym: SymbolId) Error!bool {
+    if (c.tp_constrained_cache.get(sym)) |v| return v;
+    var tps: std.ArrayList(TypeParamInfo) = .empty;
+    defer tps.deinit(c.scratch());
+    try c.typeParamsOf(sym, &tps);
+    var any = false;
+    for (tps.items) |tp| {
+        if (tp.constraint != 0) any = true;
+    }
+    try c.tp_constrained_cache.put(c.cm(), sym, any);
+    return any;
+}
+
+/// Queue a written type-argument list for its TS2344 constraint check (see
+/// `PendingTypeArgs` for why the check may not run here).
+///
+/// Only references in a file this checker OWNS are queued: a diagnostic for
+/// any other file is discarded at `seal`, and the checker that owns it queues
+/// the same reference itself. Each (file, node) is queued once.
+pub fn queueTypeArgConstraints(c: *Checker, node: Node, sym: SymbolId, args: []const TypeId, arg_nodes: []const Node) Error!void {
+    if (args.len == 0 or arg_nodes.len == 0) return;
+    if (c.cur_file >= c.owned_mask.len or !c.owned_mask[c.cur_file]) return;
+    const f = c.symFlags(sym);
+    if (!f.interface and !f.class and !f.type_alias) return;
+    const gop = try c.pending_type_args_seen.getOrPut(c.cm(), c.nodeKey(node));
+    if (gop.found_existing) return;
+    // Nothing to decide, nothing to keep: most generics constrain no
+    // parameter at all (`Array<T>`, `Promise<T>`, every one-off `Wrap<T>`),
+    // and queueing those would hold two slices per reference in the checker
+    // arena for a drain that would immediately skip them.
+    if (!try c.symHasConstrainedTypeParam(sym)) return;
+    // Nor is anything to decide when no WRITTEN argument is a decided set:
+    // `undecidableType` is a pure function of the argument's `TypeId`, so its
+    // answer at the drain is the answer here, and a reference all of whose
+    // arguments are still type variables or deferred nodes (zod's
+    // `DeepPartial<T["shape"][k]>`, every `Foo<infer X>`) would only be
+    // skipped later — after being kept alive for the whole run.
+    {
+        var any_decidable = false;
+        for (args[0..@min(args.len, arg_nodes.len)], 0..) |a, i| {
+            if (arg_nodes[i] == null_node) continue;
+            if (a == types.any_type or a == types.unknown_type) continue;
+            if (try c.undecidableType(a)) continue;
+            any_decidable = true;
+            break;
+        }
+        if (!any_decidable) return;
+    }
+    try c.pending_type_args.append(c.cm(), .{
+        .file = c.cur_file,
+        .sym = sym,
+        .args = try c.cm().dupe(TypeId, args),
+        .arg_nodes = try c.cm().dupe(Node, arg_nodes),
+        .this_type = c.this_type,
+    });
+}
+
+/// Run every queued TS2344 constraint check. Called once, after every
+/// statement of every owned file has been checked, so no class member table
+/// is still materializing.
+pub fn drainTypeArgConstraints(c: *Checker) Error!void {
+    const saved_file = c.cur_file;
+    const saved_scope = c.cur_scope;
+    const saved_this = c.this_type;
+    defer {
+        c.setFile(saved_file);
+        c.cur_scope = saved_scope;
+        c.this_type = saved_this;
+    }
+    // Index-walked: a check may queue nothing (the queue is closed by then),
+    // but the list is read across `scratch` resets, so no slice is held.
+    var i: usize = 0;
+    while (i < c.pending_type_args.items.len) : (i += 1) {
+        const p = c.pending_type_args.items[i];
+        c.setFile(p.file);
+        c.cur_scope = binder.file_scope;
+        c.this_type = p.this_type;
+        // Each queued reference is its own source element, exactly as it was
+        // when the enclosing statement was walked: the instantiation budget
+        // is scoped to one (tsc resets `instantiationCount` per
+        // `checkSourceElement`), and the TS2589 anchor is this reference.
+        // Without the reset the whole drain is one statement and the budget
+        // trips on the accumulated total of every reference in the program.
+        for (p.arg_nodes) |an| {
+            if (an != null_node) {
+                c.anchorInst(an);
+                break;
+            }
+        }
+        c.inst_count = 0;
+        try c.checkTypeArgConstraints(p.sym, p.args, p.arg_nodes);
+    }
+    c.pending_type_args.clearRetainingCapacity();
+}
+
+/// TS2344 — every WRITTEN type argument of a type reference must satisfy its
+/// type parameter's constraint (tsc's `checkTypeArgumentConstraints`).
+///
+/// The constraint is instantiated under the reference's OWN argument list, so
+/// a constraint that mentions an earlier parameter is checked in the supplied
+/// world: drizzle writes `MySqlSelectWithout<T, TDynamic, K extends keyof T &
+/// string>`, and `K`'s constraint only means anything once `T` is the class's
+/// polymorphic `this`.
+///
+/// Deliberately silent — this is a *negative* check whose whole cost is false
+/// positives — whenever the verdict would be about ztsc's own resolution
+/// rather than the code:
+///
+///   * a parameter with no WRITTEN argument — a defaulted tail, or a list
+///     whose arity is already another check's diagnostic (TS2314/TS2707) and
+///     whose positions therefore pair with the wrong parameters,
+///   * `any` / `unknown` on either side, which admit everything,
+///   * an argument that is not a decided set (`undecidableType`), or
+///   * a constraint that is not a decided set (`decidableConstraintSet`).
+///
+/// The check runs once per written reference per checker (the queue dedupes
+/// on `nodeKey`), so a generic used a thousand times is judged at each of its
+/// use sites exactly once, and never at its declaration.
+pub fn checkTypeArgConstraints(c: *Checker, sym: SymbolId, args: []const TypeId, arg_nodes: []const Node) Error!void {
+    if (args.len == 0) return;
+    const f = c.symFlags(sym);
+    if (!f.interface and !f.class and !f.type_alias) return;
+    var tps: std.ArrayList(TypeParamInfo) = .empty;
+    defer tps.deinit(c.scratch());
+    try c.typeParamsOf(sym, &tps);
+    if (tps.items.len == 0) return;
+    // Arity is another check's business (TS2314/TS2707); a mismatched list
+    // pairs arguments with the wrong parameters, so say nothing.
+    if (args.len > tps.items.len) return;
+    var min: usize = 0;
+    for (tps.items) |tp| {
+        if (tp.default == 0) min += 1;
+    }
+    if (args.len < min) return;
+    // The mapper tsc builds: every parameter to its supplied argument, with
+    // defaulted tail parameters left as themselves (their own instantiation
+    // is `fixTypeArgs`'s job, and a constraint that leans on one is not
+    // decidable here).
+    var map_list: std.ArrayList(TpMap) = .empty;
+    defer map_list.deinit(c.scratch());
+    try c.buildInstMap(sym, args, &map_list);
+    for (tps.items, 0..) |tp, i| {
+        if (i >= args.len or i >= arg_nodes.len) break;
+        if (tp.constraint == 0) continue;
+        const an = arg_nodes[i];
+        if (an == null_node) continue;
+        const arg = args[i];
+        if (arg == types.any_type or arg == types.unknown_type) continue;
+        if (try c.undecidableType(arg)) continue;
+        var con: TypeId = undefined;
+        {
+            const saved = c.enterSymFile(tp.sym);
+            defer c.restoreCtx(saved);
+            c.cur_scope = c.symScope(tp.sym);
+            con = try c.typeFromTypeNode(tp.constraint);
+        }
+        con = try c.instantiate(con, map_list.items);
+        if (!try c.decidableConstraintSet(con)) continue;
+        if (try c.isAssignable(arg, con)) continue;
+        try c.diagFmt(2344, c.nodeSpan(an), "Type '{s}' does not satisfy the constraint '{s}'.", .{
+            try c.typeToString(arg), try c.typeToString(con),
+        });
+    }
+}
+
+/// Budget for the TS2344 gates' structural scans. Running out answers
+/// "undecidable", which for a negative check is always the safe direction.
+pub const constraint_scan_budget: u32 = 512;
+
+/// May a "does not satisfy" verdict be built against `con` as a TARGET?
+///
+/// Only when `con` is a PRIMITIVE OR LITERAL SET — a primitive, a literal, an
+/// enum member, `never`, or a union/intersection of those. That is the shape
+/// TS2344 is overwhelmingly about (`K extends keyof T & string`, `K extends
+/// "a" | "b"`, `N extends number`), and it is the shape ztsc decides
+/// *exactly*: membership in a key set is a set question, not a structural one.
+///
+/// A STRUCTURAL constraint (`T extends ZodType<any, any, any>`) is not
+/// decided here even though `isAssignable` will happily answer it. The answer
+/// is only as good as the relation, and the relation is not yet exact enough
+/// to be the sole evidence for a negative verdict: it currently rejects zod's
+/// `ZodNumber` against `ZodType<any, any, any>` (a variance/polymorphic-`this`
+/// gap that surfaces nowhere else), which would be a false TS2344 on valid
+/// code. Nothing is lost that another check catches — a bad argument is still
+/// reported wherever it is USED — and this gate is what keeps the check at
+/// zero false positives across the eight-package corpus.
+pub fn decidableConstraintSet(c: *Checker, con: TypeId) Error!bool {
+    const s = &c.ts;
+    var budget: u32 = constraint_scan_budget;
+    var stack: std.ArrayList(TypeId) = .empty;
+    defer stack.deinit(c.scratch());
+    try stack.append(c.scratch(), con);
+    while (stack.pop()) |cur| {
+        if (budget == 0) return false;
+        budget -= 1;
+        switch (s.kind(cur)) {
+            .string,
+            .number,
+            .boolean,
+            .bigint,
+            .symbol,
+            .object_keyword,
+            .never,
+            .null,
+            .undefined,
+            .void,
+            .bool_true,
+            .bool_false,
+            .string_literal,
+            .number_literal,
+            .number_literal_fresh,
+            .bigint_literal,
+            .enum_type,
+            .unique_symbol,
+            => {},
+            .union_type, .intersection => {
+                for (0..s.memberCount(cur)) |i| try stack.append(c.scratch(), s.memberAt(cur, i));
+            },
+            else => return false,
+        }
+    }
+    return true;
+}
+
+/// May a "does not satisfy" verdict be built on `t`?
+///
+/// No, whenever `t` still contains a type variable or a DEFERRED node — a
+/// free type parameter, an `infer` binder, a mapped key, an unreduced
+/// conditional / indexed access / `keyof` / template pattern / string
+/// intrinsic. Such a type is not a set ztsc can enumerate: tsc decides those
+/// through the constraint machinery of a full deferred relation, ztsc does
+/// not, and every one of the 130+ false TS2344s the naive check invented on
+/// the corpus was one of these (`infer Type`, `T["shape"][k]`,
+/// `DeepPartial<…>` against `ZodType<any, any, any>`).
+///
+/// An object's own property types count: drizzle writes a type argument
+/// `{ tableName: infer TTableName }` inside a conditional's `extends` clause,
+/// and the members of a set whose contents are still being inferred are not a
+/// decided set either. A `.ref` is followed through its ARGUMENTS only —
+/// expanding it to look inside a class instance would report on the type
+/// parameters every generic class mentions in its own members.
+pub fn undecidableType(c: *Checker, t: TypeId) Error!bool {
+    const s = &c.ts;
+    var budget: u32 = constraint_scan_budget;
+    var seen: std.AutoHashMapUnmanaged(TypeId, void) = .empty;
+    defer seen.deinit(c.scratch());
+    var stack: std.ArrayList(TypeId) = .empty;
+    defer stack.deinit(c.scratch());
+    try stack.append(c.scratch(), t);
+    while (stack.pop()) |cur| {
+        if (budget == 0) return true;
+        budget -= 1;
+        if ((try seen.getOrPut(c.scratch(), cur)).found_existing) continue;
+        switch (s.kind(cur)) {
+            .err,
+            .type_param,
+            .infer_var,
+            .mapped_param,
+            .conditional,
+            .index_access,
+            .keyof_op,
+            .mapped,
+            .template_literal_type,
+            .string_mapping,
+            => return true,
+            // Indexed walks, not `memberList` dupes: interning during the
+            // scan may move `extra` (see `Store.memberAt`).
+            .union_type, .intersection, .overloads => {
+                for (0..s.memberCount(cur)) |i| try stack.append(c.scratch(), s.memberAt(cur, i));
+            },
+            .array => try stack.append(c.scratch(), s.arrayElem(cur)),
+            .tuple => for (0..s.tupleLen(cur)) |i| {
+                try stack.append(c.scratch(), s.tupleElem(cur, @intCast(i)).ty);
+            },
+            .ref => for (0..s.refArgCount(cur)) |i| {
+                try stack.append(c.scratch(), s.refArgAt(cur, i));
+            },
+            .object => {
+                for (0..s.objectPropCount(cur)) |i| {
+                    try stack.append(c.scratch(), s.objectProp(cur, @intCast(i)).ty);
+                }
+                if (s.objectStringIndex(cur) != 0) try stack.append(c.scratch(), s.objectStringIndex(cur));
+                if (s.objectNumberIndex(cur) != 0) try stack.append(c.scratch(), s.objectNumberIndex(cur));
+            },
+            else => {},
+        }
+    }
+    return false;
 }
 
 /// Check type-argument arity against a generic symbol and fill defaults.

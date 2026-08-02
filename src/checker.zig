@@ -433,6 +433,37 @@ pub const DeferredBody = struct {
     this_type: TypeId,
 };
 
+/// One written type-argument list awaiting its TS2344 constraint check.
+///
+/// The check cannot run where the reference is CONVERTED. Conversion happens
+/// wherever a type is first needed — which is routinely in the middle of some
+/// class's instance materialization, where a `keyof` over that class answers
+/// with whatever half of the member table exists so far. Deciding "does not
+/// satisfy" against a half-built key set is exactly how a negative check
+/// invents diagnostics (drizzle's `keyof PgSelectBase<…> & string` answered
+/// with 7 of its 28 keys, and any argument fails a set that small).
+///
+/// tsc has no such exposure: `checkTypeArgumentConstraints` runs from
+/// `checkSourceElement`, a walk that happens after declarations resolve. This
+/// is that ordering — the reference is queued during conversion and drained
+/// once every statement of every owned file has been checked, when every
+/// class table is complete.
+pub const PendingTypeArgs = struct {
+    /// File the reference was written in — where its diagnostics belong, and
+    /// whose tree `arg_nodes` index.
+    file: FileId,
+    /// The generic the name resolved to.
+    sym: SymbolId,
+    /// Resolved arguments and the nodes they were written as, positionally
+    /// paired. Both live in the checker arena (the scratch arena is reset
+    /// between statements).
+    args: []const TypeId,
+    arg_nodes: []const Node,
+    /// `this` in force at the reference, so a constraint mentioning `this`
+    /// resolves at drain time exactly as it would have in place.
+    this_type: TypeId,
+};
+
 /// A memoized expression type together with the contextual type it was
 /// synthesized under (contextual re-check cache).
 pub const NodeType = struct { ty: TypeId, ctx: TypeId };
@@ -466,25 +497,26 @@ pub const MappedKeyScope = struct {
 /// `deinit` cannot fall behind the field set: a container added to `Checker`
 /// and fed from `cm()` but forgotten here leaks its whole table.
 pub const map_containers = [_][]const u8{
-    "node_types",               "sig_cache",           "node_scopes",
-    "reassigned_syms",          "reassigned_in_loop",  "member_written_syms",
-    "member_written_in_loop",   "ns_types",            "ambient_ns_types",
-    "relation",                 "expansions",          "overload_rotate",
-    "origin",                   "iface_generic",       "iface_stack",
-    "pending_class_decos",      "class_inst_generic",  "class_static_cache",
-    "class_static_base_active", "class_ctor_cache",    "enum_value_cache",
-    "enum_info_cache",          "alias_generic",       "alias_state",
-    "alias_recursive",          "flow_same",           "flow_narrow",
-    "ref_keys",                 "flow_loop_stack",     "flow_stack",
-    "flow_tmp",                 "da_cache",            "ctp_cache",
-    "cmp_cache",                "mmp_cache",           "inst_cache",
-    "inst_map_ids",             "tp_constraint_cache", "fresh_tp_ids",
-    "fresh_tp_info",            "type_node_cache",     "atom_cache",
-    "infer_ids",                "infer_scopes",        "mapped_key_ids",
-    "mapped_key_scopes",        "inst_diag_at",        "infer_active",
-    "lazy_member_active",       "chain_guards",        "never_isect",
-    "deep_path_list",           "deep_path_ids",       "flow_reach",
-    "member_type_stack",        "lazy_index_objs",
+    "node_types",               "sig_cache",            "node_scopes",
+    "reassigned_syms",          "reassigned_in_loop",   "member_written_syms",
+    "member_written_in_loop",   "ns_types",             "ambient_ns_types",
+    "relation",                 "expansions",           "overload_rotate",
+    "origin",                   "iface_generic",        "iface_stack",
+    "pending_class_decos",      "class_inst_generic",   "class_static_cache",
+    "class_static_base_active", "class_ctor_cache",     "enum_value_cache",
+    "enum_info_cache",          "alias_generic",        "alias_state",
+    "alias_recursive",          "flow_same",            "flow_narrow",
+    "ref_keys",                 "flow_loop_stack",      "flow_stack",
+    "flow_tmp",                 "da_cache",             "ctp_cache",
+    "cmp_cache",                "mmp_cache",            "inst_cache",
+    "inst_map_ids",             "tp_constraint_cache",  "fresh_tp_ids",
+    "fresh_tp_info",            "type_node_cache",      "atom_cache",
+    "infer_ids",                "infer_scopes",         "mapped_key_ids",
+    "mapped_key_scopes",        "inst_diag_at",         "infer_active",
+    "lazy_member_active",       "chain_guards",         "never_isect",
+    "deep_path_list",           "deep_path_ids",        "flow_reach",
+    "member_type_stack",        "lazy_index_objs",      "pending_type_args",
+    "pending_type_args_seen",   "tp_constrained_cache",
 };
 
 pub const Checker = struct {
@@ -902,6 +934,15 @@ pub const Checker = struct {
     /// materialization; drained once the enclosing class's instance type is
     /// complete. See `DeferredBody` / `drainDeferredBodies`.
     deferred_bodies: std.ArrayList(DeferredBody) = .empty,
+    /// Written type-argument lists awaiting their TS2344 constraint check,
+    /// drained after every owned file is checked. See `PendingTypeArgs`.
+    pending_type_args: std.ArrayList(PendingTypeArgs) = .empty,
+    /// `nodeKey`s already queued in `pending_type_args`, so a type node
+    /// converted once per contextual variation queues its check once.
+    pending_type_args_seen: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    /// Per-generic-symbol memo of "declares a constrained type parameter"
+    /// (see `symHasConstrainedTypeParam`) — the queue's admission test.
+    tp_constrained_cache: std.AutoHashMapUnmanaged(SymbolId, bool) = .empty,
     /// Depth of "checking a NON-STATIC class field's initializer" frames. Such
     /// an initializer runs at construction time, not at class-definition time,
     /// so a forward reference in it is not in the temporal dead zone — tsc's
@@ -1274,6 +1315,11 @@ pub const Checker = struct {
                 _ = c.scratch_arena.reset(.{ .retain_with_limit = scratch_retain_limit });
             }
         }
+        // Every class instance type is now complete, so the written type
+        // arguments collected along the way can be judged against their
+        // constraints (TS2344 — see `PendingTypeArgs`).
+        try typenode_zig.drainTypeArgConstraints(c);
+        _ = c.scratch_arena.reset(.{ .retain_with_limit = scratch_retain_limit });
         // TDZ / use-before-assign / 2304 come from the walk itself.
         // Debug-only soundness net over every composite interned this run: a
         // member id past the id space is the fingerprint of a use-after-realloc
@@ -2105,6 +2151,7 @@ pub const Checker = struct {
     pub const typeNodeCacheable = typenode_zig.typeNodeCacheable;
     pub const typeFromTypeNodeUncached = typenode_zig.typeFromTypeNodeUncached;
     pub const typeFromTypeName = typenode_zig.typeFromTypeName;
+    pub const typeFromTypeNameEx = typenode_zig.typeFromTypeNameEx;
     pub const lookupMappedKey = typenode_zig.lookupMappedKey;
     pub const materializeTypeRef = typenode_zig.materializeTypeRef;
     pub const augmentModuleTypeSym = typenode_zig.augmentModuleTypeSym;
@@ -2133,6 +2180,12 @@ pub const Checker = struct {
     pub const typeParamSymsOfDecl = typenode_zig.typeParamSymsOfDecl;
     pub const buildInstMap = typenode_zig.buildInstMap;
     pub const fixTypeArgs = typenode_zig.fixTypeArgs;
+    pub const symHasConstrainedTypeParam = typenode_zig.symHasConstrainedTypeParam;
+    pub const queueTypeArgConstraints = typenode_zig.queueTypeArgConstraints;
+    pub const drainTypeArgConstraints = typenode_zig.drainTypeArgConstraints;
+    pub const checkTypeArgConstraints = typenode_zig.checkTypeArgConstraints;
+    pub const undecidableType = typenode_zig.undecidableType;
+    pub const decidableConstraintSet = typenode_zig.decidableConstraintSet;
     pub const keyofType = typenode_zig.keyofType;
     pub const intersectKeySets = typenode_zig.intersectKeySets;
     pub const keySetMembers = typenode_zig.keySetMembers;
