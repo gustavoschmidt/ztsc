@@ -892,10 +892,10 @@ pub const Checker = struct {
     /// reference narrowed to nothing apart from one read in dead code — see
     /// `flowReachable`.
     flow_reach: std.AutoHashMapUnmanaged(u32, u8) = .empty,
-    /// containsTypeParam memo: 0 unknown, 1 no, 2 yes.
-    ctp_cache: std.AutoHashMapUnmanaged(TypeId, u8) = .empty,
-    /// containsMappedParam memo: 0 unknown, 1 no, 2 yes.
-    cmp_cache: std.AutoHashMapUnmanaged(TypeId, u8) = .empty,
+    /// containsTypeParam memo, a dense `TriMemo` (see it for why not a map).
+    ctp_cache: std.ArrayList(u8) = .empty,
+    /// containsMappedParam memo, dense like `ctp_cache`.
+    cmp_cache: std.ArrayList(u8) = .empty,
     /// Numeric element type of a TUPLE or of a UNION of arrayish types —
     /// `numberIndexType`'s tuple arm and `elemOfArrayish`'s union arm, which
     /// are the same function of the same (immutable, interned) shape.
@@ -1493,6 +1493,25 @@ pub const Checker = struct {
 
     pub fn scratch(c: *Checker) Allocator {
         return c.scratch_arena.allocator();
+    }
+
+    /// Read a dense tri-state memo (`ctp_cache` / `cmp_cache`): 0 unknown or
+    /// in progress, 1 no, 2 yes. Out of range reads as 0, so an entry that
+    /// was never written is indistinguishable from "unknown" — the same
+    /// contract the hash-map form had for an absent key.
+    ///
+    /// These are keyed by `TypeId`, and a `TypeId` is a dense counter: the
+    /// frozen base holds only the 17 intrinsics, so every type a checker
+    /// materializes is `base_len + local_index`. A byte per type is both
+    /// smaller and faster than a hash entry — the maps were ~7% of the check
+    /// phase on @sinclair/typebox, nearly all of it hashing and probing.
+    pub fn triGet(_: *const Checker, v: *const std.ArrayList(u8), t: TypeId) u8 {
+        return if (t < v.items.len) v.items[t] else 0;
+    }
+
+    pub fn triSet(c: *Checker, v: *std.ArrayList(u8), t: TypeId, val: u8) Error!void {
+        if (t >= v.items.len) try v.appendNTimes(c.cm(), 0, t + 1 - v.items.len);
+        v.items[t] = val;
     }
     /// Allocator for stable, one-shot checker payload (never individually
     /// freed): interned enum value arrays, canonical substitution-map key

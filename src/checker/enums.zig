@@ -841,12 +841,11 @@ pub fn sigReferencesOuterParam(c: *Checker, sig: TypeId, bound: []const u32) Err
 }
 
 pub fn containsTypeParam(c: *Checker, t: TypeId) Error!bool {
-    if (c.ctp_cache.get(t)) |v| {
-        if (v != 0) return v == 2;
-    }
-    try c.ctp_cache.put(c.cm(), t, 1); // assume no while computing (cycles)
+    const v = c.triGet(&c.ctp_cache, t);
+    if (v != 0) return v == 2;
+    try c.triSet(&c.ctp_cache, t, 1); // assume no while computing (cycles)
     const result = try c.containsTypeParamInner(t);
-    try c.ctp_cache.put(c.cm(), t, if (result) 2 else 1);
+    try c.triSet(&c.ctp_cache, t, if (result) 2 else 1);
     return result;
 }
 

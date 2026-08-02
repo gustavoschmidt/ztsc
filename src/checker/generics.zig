@@ -2048,12 +2048,11 @@ pub fn isGenericObjectForIndex(c: *Checker, t0: TypeId) Error!bool {
 }
 
 pub fn containsMappedParam(c: *Checker, t: TypeId) Error!bool {
-    if (c.cmp_cache.get(t)) |v| {
-        if (v != 0) return v == 2;
-    }
-    try c.cmp_cache.put(c.cm(), t, 1);
+    const v = c.triGet(&c.cmp_cache, t);
+    if (v != 0) return v == 2;
+    try c.triSet(&c.cmp_cache, t, 1);
     const r = try c.containsMappedParamInner(t);
-    try c.cmp_cache.put(c.cm(), t, if (r) 2 else 1);
+    try c.triSet(&c.cmp_cache, t, if (r) 2 else 1);
     return r;
 }
 
