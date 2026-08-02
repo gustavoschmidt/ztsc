@@ -375,6 +375,38 @@ pub const scratch_retain_limit = 256 * 1024;
 /// far below the worker-thread stack-overflow depth, leaving a wide safety
 /// margin on the smallest (main-thread) stack.
 pub const max_relation_depth = 900;
+/// How many times ONE generic may reappear on the relation's live source or
+/// target stack, each time as a strictly LATER instantiation of itself, before
+/// the pair is assumed related — tsc's `isDeeplyNestedType` maxDepth.
+///
+/// `max_relation_depth` alone cannot close a walk like zod's: `ZodType`'s
+/// members return `ZodOptional<this>`, `ZodArray<this>`, `ZodIntersection<this,
+/// T>` … so the pair at each level is a strictly LARGER instantiation of the
+/// same handful of generics, a dozen ways per level. Nothing repeats, so both
+/// memos miss, and the walk ran until the per-statement instantiation budget
+/// tripped — whereupon the truncation to `error_type` came back as a FALSE
+/// relation and was cached, which is where `ZodString` stopped satisfying
+/// `ZodType<string | number | symbol, any, any>`. Recognising the *generic*
+/// rather than the instantiation closes it in two levels.
+///
+/// The GROWTH half of the test (`relIdDeeplyNested`) is what makes so small a
+/// limit safe: an ordinary recursive type meeting itself through its own
+/// members — `Uint8Array<ArrayBufferLike>`, whose `subarray`/`slice` hand back
+/// the same instantiation — re-enters with the same ref and is not counted at
+/// all. Only a chain that keeps building a bigger argument is.
+///
+/// Assume-related is the same direction the depth cap already takes: it can
+/// only drop diagnostics, never invent one. It is nevertheless recorded
+/// (`rel_guard_tripped`), because a NEGATIVE verdict built on an assumed YES
+/// is not evidence — see that field.
+pub const max_relation_identity_repeats = 2;
+/// Buckets in the relation-stack occupancy filter (`rel_src_buckets`).
+pub const rel_id_buckets = 64;
+
+/// One live relation frame's recursion identity for one side: the generic
+/// (`sym`) and the exact instantiation of it (`ref`, the interned origin ref).
+/// `relIdDeeplyNested` counts occurrences of `sym` whose `ref` keeps growing.
+pub const RelId = struct { sym: SymbolId, ref: TypeId };
 /// Recursion-depth cap for alias-instance expansion (`aliasInstance`; see the
 /// `alias_depth` field). Fires only on pathological mutually-recursive generic
 /// alias chains (e.g. `@scalar/typebox`'s conditional type modules, whose
@@ -1001,6 +1033,37 @@ pub const Checker = struct {
     /// otherwise-unbounded walk over an undecidable recursive alias's
     /// expansions (see the constant's doc comment).
     rel_depth: u32 = 0,
+    /// The generic INSTANTIATION each live relation frame is comparing, one
+    /// entry per side — the frame's origin ref (`refFacetOf`) and its symbol,
+    /// pushed only for frames whose two sides are both generic instantiations.
+    /// This is tsc's `sourceStack`/`targetStack`, and `relIdDeeplyNested` is
+    /// its `isDeeplyNestedType`: a family of mutually recursive generics whose
+    /// members return `Wrapper<this>` grows a new, strictly larger pair of
+    /// instantiations at every level, so nothing ever repeats and neither the
+    /// relation memo nor the expansion memo can close the walk. Seeing the
+    /// same GENERIC re-entered as a strictly later instantiation is what
+    /// closes it (see `max_relation_identity_repeats`).
+    rel_src_ids: [max_relation_depth]RelId = @splat(.{ .sym = 0, .ref = 0 }),
+    rel_tgt_ids: [max_relation_depth]RelId = @splat(.{ .sym = 0, .ref = 0 }),
+    /// Live depth of `rel_src_ids`/`rel_tgt_ids`.
+    rel_id_depth: u32 = 0,
+    /// Set whenever the growing-instantiation guard answered a pair from
+    /// assumption rather than from its members. A relation run that consulted
+    /// the guard is not evidence for a NEGATIVE verdict, so the two callers
+    /// that build one out of a relation — variance MEASUREMENT
+    /// (`measureOneVariance`) and the declared-variance check
+    /// (`checkVarianceAnnotations`, TS2636) — clear it, run, and decline to
+    /// conclude anything if it came back set. tsc's `VarianceFlags.Unmeasurable`
+    /// / `Unreliable`, same purpose: a measurement whose relation was truncated
+    /// must fall back to the structural walk, not silently answer "bivariant".
+    rel_guard_tripped: bool = false,
+    /// Occupancy of the two stacks above, bucketed by the low bits of the
+    /// symbol (`rel_id_bucket`). A bucket below `max_relation_identity_repeats`
+    /// cannot hold that many occurrences of ANY symbol, so the scan the guard
+    /// would otherwise run on every frame is skipped outright — which is the
+    /// overwhelmingly common case (a generic pair met once).
+    rel_src_buckets: [rel_id_buckets]u16 = @splat(0),
+    rel_tgt_buckets: [rel_id_buckets]u16 = @splat(0),
     /// `instantiate` node-visits spent on the source element being checked
     /// (against `max_instantiation_count`); reset by `checkStatement`. Within
     /// a statement it is monotonic, with no exempt window — an exempt window
@@ -2528,6 +2591,7 @@ pub const Checker = struct {
     pub const reportVarianceMismatch = assign_zig.reportVarianceMismatch;
     pub const checkVarianceAnnotations = assign_zig.checkVarianceAnnotations;
     pub const refFacetOf = assign_zig.refFacetOf;
+    pub const relIdDeeplyNested = assign_zig.relIdDeeplyNested;
     pub const isAssignable = assign_zig.isAssignable;
     pub const condTrueUnderExtends = assign_zig.condTrueUnderExtends;
     pub const isCompound = assign_zig.isCompound;

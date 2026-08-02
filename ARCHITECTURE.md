@@ -107,7 +107,7 @@ renders a multi-file program's full diagnostics once per partition size
 byte; the cycle-stress test (`:735`) and the cross-file-cycle determinism test
 (`:797`) do the same over import cycles.
 A change that quietly introduces shared mutable state fails here rather than
-in production. (The 983 conformance cases themselves are single-program runs —
+in production. (The 985 conformance cases themselves are single-program runs —
 they pin *what* is reported; these tests pin that the partition cannot change
 it.)
 
@@ -175,7 +175,7 @@ scratch freed, no new shared state — then run the gate:
 
 ```sh
 zig fmt build.zig src test
-zig build test          # 983 conformance + unit, includes the determinism test
+zig build test          # 985 conformance + unit, includes the determinism test
 bench/e2e.sh multi      # wall clock + peak RSS vs tsgo
 bench/crash_sweep.sh    # 8 packages × --checkers=1..16, crash + byte-identity
 bench/repeat_sweep.sh   # 8 packages × one config × N runs, byte-identity
