@@ -700,6 +700,24 @@ pub const Checker = struct {
     /// the measurement is trying to verify, so it would make every annotation
     /// vacuously true. tsc keeps the same exemption as its `markerTypes` set.
     variance_marker_refs: [2]TypeId = .{ 0, 0 },
+    /// Structurally MEASURED variance of a generic symbol's type parameters
+    /// (`Measured`, tsc's `getVariances`), packed 3 bits each, lowest bits
+    /// first. A cached 0 means "no parameter yielded a verdict", so the
+    /// relation's probe costs one hash lookup on hot paths. Parameters past
+    /// the 10th are read as unmeasured.
+    measured_variance: std.AutoHashMapUnmanaged(SymbolId, u32) = .empty,
+    /// Generic symbols whose measurement is on the stack right now. tsc's
+    /// `emptyArray` sentinel: a pair of references to a generic that is
+    /// measuring ITSELF is assumed related, which is what stops the
+    /// measurement from chasing a generic that instantiates itself.
+    measuring_variance: std.AutoHashMapUnmanaged(SymbolId, void) = .empty,
+    /// How many measurements are on the stack (`max_variance_measure_depth`).
+    variance_measure_depth: u32 = 0,
+    /// Every `G<…marker…>` reference ever minted for a variance measurement
+    /// (tsc's `markerTypes`). Those pairs are what a measurement asks the
+    /// relation about, so answering them FROM a variance verdict would make
+    /// every measurement vacuously covariant.
+    marker_refs: std.AutoHashMapUnmanaged(TypeId, void) = .empty,
     /// Generic (uninstantiated) bodies per symbol: interface/class-instance/
     /// class-static/alias.
     iface_generic: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
@@ -2500,6 +2518,8 @@ pub const Checker = struct {
     pub const declaredVarianceOfTypeParam = assign_zig.declaredVarianceOfTypeParam;
     pub const declaredVariances = assign_zig.declaredVariances;
     pub const varianceVerdict = assign_zig.varianceVerdict;
+    pub const measuredVariances = assign_zig.measuredVariances;
+    pub const measuredVarianceVerdict = assign_zig.measuredVarianceVerdict;
     pub const varianceMarkers = assign_zig.varianceMarkers;
     pub const isVarianceMarkerRef = assign_zig.isVarianceMarkerRef;
     pub const varianceMeasurable = assign_zig.varianceMeasurable;
@@ -2580,6 +2600,7 @@ pub const Checker = struct {
     pub const targetKnowsProp = assign_zig.targetKnowsProp;
     pub const targetPropType = assign_zig.targetPropType;
     pub const Variance = assign_zig.Variance;
+    pub const Measured = assign_zig.Measured;
     pub const SigMode = assign_zig.SigMode;
 
     const expr_zig = @import("checker/expr.zig");

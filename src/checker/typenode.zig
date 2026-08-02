@@ -1368,13 +1368,20 @@ pub const constraint_scan_budget: u32 = 512;
 ///
 /// A STRUCTURAL constraint (`T extends ZodType<any, any, any>`) is not
 /// decided here even though `isAssignable` will happily answer it. The answer
-/// is only as good as the relation, and the relation is not yet exact enough
-/// to be the sole evidence for a negative verdict: it currently rejects zod's
-/// `ZodNumber` against `ZodType<any, any, any>` (a variance/polymorphic-`this`
-/// gap that surfaces nowhere else), which would be a false TS2344 on valid
-/// code. Nothing is lost that another check catches — a bad argument is still
-/// reported wherever it is USED — and this gate is what keeps the check at
-/// zero false positives across the eight-package corpus.
+/// is only as good as the relation, and the relation is not exact enough to
+/// be the sole evidence for a NEGATIVE verdict — it under-reports by design in
+/// several documented places, and each of those would read here as a false
+/// TS2344 on valid code.
+///
+/// The specific gap this comment used to name — zod's `ZodNumber` rejected
+/// against `ZodType<any, any, any>`, variance through a generic reference
+/// carrying a polymorphic `this` — is FIXED (measured variance, see
+/// `measuredVarianceVerdict`), and `test/conformance/assignability/078` pins
+/// it. The gate stays because the general argument does: nothing is lost that
+/// another check catches — a bad argument is still reported wherever it is
+/// USED — and this gate is what keeps the check at zero false positives
+/// across the eight-package corpus. Narrowing it is its own piece of work,
+/// with its own evidence.
 pub fn decidableConstraintSet(c: *Checker, con: TypeId) Error!bool {
     const s = &c.ts;
     var budget: u32 = constraint_scan_budget;
