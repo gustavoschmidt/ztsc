@@ -88,6 +88,59 @@ pub fn isNodeBuiltin(spec: []const u8) bool {
     return false;
 }
 
+/// tsc's *exact* Node core-module list (`core.NodeCoreModules` in tsgo,
+/// `nodeCoreModules` in TypeScript): every name `require('module').builtinModules`
+/// reports, each accepted bare and `node:`-prefixed, plus the handful that exist
+/// only under the prefix.
+///
+/// Distinct from `isNodeBuiltin`, and deliberately so. `isNodeBuiltin` answers
+/// "should the driver pull `@types/node` in for this specifier?", where being
+/// generous costs nothing (`node:anything` counts). This one decides a
+/// *diagnostic code*: an unresolved specifier in this set is TS2591 ("…install
+/// type definitions for node…"), one outside it is the generic TS2307. The
+/// oracle draws that line precisely — `node:sqlite` is TS2591 while
+/// `node:nosuch` and bare `test` are TS2307 — so an approximation here would
+/// invent a wrong code on real input.
+pub fn isNodeCoreModule(spec: []const u8) bool {
+    // `require('module').builtinModules.filter(x => !x.match(/^(?:_|node:)/))`
+    const unprefixed = [_][]const u8{
+        "assert",           "assert/strict",      "async_hooks",         "buffer",
+        "child_process",    "cluster",            "console",             "constants",
+        "crypto",           "dgram",              "diagnostics_channel", "dns",
+        "dns/promises",     "domain",             "events",              "fs",
+        "fs/promises",      "http",               "http2",               "https",
+        "inspector",        "inspector/promises", "module",              "net",
+        "os",               "path",               "path/posix",          "path/win32",
+        "perf_hooks",       "process",            "punycode",            "querystring",
+        "readline",         "readline/promises",  "repl",                "stream",
+        "stream/consumers", "stream/promises",    "stream/web",          "string_decoder",
+        "sys",              "timers",             "timers/promises",     "tls",
+        "trace_events",     "tty",                "url",                 "util",
+        "util/types",       "v8",                 "vm",                  "wasi",
+        "worker_threads",   "zlib",
+    };
+    // `require('module').builtinModules.filter(x => x.startsWith('node:'))`
+    const prefixed_only = [_][]const u8{
+        "node:quic", "node:sea", "node:sqlite", "node:test", "node:test/reporters",
+    };
+    const bare = if (std.mem.startsWith(u8, spec, "node:")) spec["node:".len..] else spec;
+    for (unprefixed) |b| if (std.mem.eql(u8, bare, b)) return true;
+    for (prefixed_only) |b| if (std.mem.eql(u8, spec, b)) return true;
+    return false;
+}
+
+/// The global names tsc attributes to `@types/node` when they resolve to
+/// nothing: an unresolved use is TS2591 ("…install type definitions for
+/// node…") rather than the generic TS2304. tsgo's
+/// `getCannotFindNameDiagnosticForName` keys off exactly these five, and only
+/// for a bare identifier — a qualified `NodeJS.Timeout` fails as a *namespace*
+/// (TS2503) and never reaches here.
+pub fn isNodeGlobalName(name: []const u8) bool {
+    const names = [_][]const u8{ "process", "require", "Buffer", "module", "NodeJS" };
+    for (names) |n| if (std.mem.eql(u8, name, n)) return true;
+    return false;
+}
+
 /// Embedded synthetic source for a resolved JSON or JS any-module (or an
 /// `exports`-blocked subpath), or null for a real file that must be read and
 /// parsed. Centralizes the loader's any-module routing (JSON via
@@ -233,4 +286,37 @@ test "isNodeBuiltin: node: prefix and bare builtin names" {
     try testing.expect(!isNodeBuiltin("react"));
     try testing.expect(!isNodeBuiltin("@reduxjs/toolkit"));
     try testing.expect(!isNodeBuiltin("./local"));
+}
+
+// (b2) The exact core-module list that picks TS2591 over TS2307. Every case
+// below is pinned against tsgo 7.0.2 on a project with no `@types/node`.
+test "isNodeCoreModule: exactly tsc's list, bare and node:-prefixed" {
+    try testing.expect(isNodeCoreModule("node:tty"));
+    try testing.expect(isNodeCoreModule("tty"));
+    try testing.expect(isNodeCoreModule("fs/promises"));
+    try testing.expect(isNodeCoreModule("node:fs/promises"));
+    try testing.expect(isNodeCoreModule("stream/consumers"));
+    // Prefix-only members: `node:sqlite` counts, bare `sqlite` does not, and
+    // bare `test` is an ordinary package name (oracle: TS2307).
+    try testing.expect(isNodeCoreModule("node:sqlite"));
+    try testing.expect(!isNodeCoreModule("sqlite"));
+    try testing.expect(isNodeCoreModule("node:test/reporters"));
+    try testing.expect(!isNodeCoreModule("test"));
+    // Unlike `isNodeBuiltin`, an unknown name under the prefix is NOT a core
+    // module — tsgo reports TS2307 for it.
+    try testing.expect(!isNodeCoreModule("node:nosuch"));
+    try testing.expect(!isNodeCoreModule("bun:sqlite"));
+    try testing.expect(!isNodeCoreModule("react"));
+    try testing.expect(!isNodeCoreModule("./local"));
+}
+
+// (b3) The five globals that carry the "install @types/node" wording.
+test "isNodeGlobalName: tsc's five node globals" {
+    for ([_][]const u8{ "process", "require", "Buffer", "module", "NodeJS" }) |n| {
+        try testing.expect(isNodeGlobalName(n));
+    }
+    try testing.expect(!isNodeGlobalName("buffer")); // case-sensitive
+    try testing.expect(!isNodeGlobalName("Bufferr"));
+    try testing.expect(!isNodeGlobalName("global"));
+    try testing.expect(!isNodeGlobalName("__dirname"));
 }

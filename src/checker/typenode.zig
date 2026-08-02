@@ -381,7 +381,7 @@ pub fn typeFromTypeName(c: *Checker, name_node: Node, args: []const TypeId) Erro
             if (c.suggestName(a, c.cur_scope, false)) |sugg| {
                 try c.diagFmt(2552, c.tokSpan(tok), "Cannot find name '{s}'. Did you mean '{s}'?", .{ c.tokenText(tok), c.atomText(sugg) });
             } else {
-                try c.diagFmt(2304, c.tokSpan(tok), "Cannot find name '{s}'.", .{c.tokenText(tok)});
+                try c.reportNameNotFound(tok);
             }
             return types.error_type;
         },
@@ -508,7 +508,8 @@ pub const ModuleRef = union(enum) { file: FileId, ambient: u32 };
 pub const NsContainer = union(enum) { ns: SymbolId, module: ModuleRef };
 
 /// Resolve an `.import_type` node's specifier to its module. Reports TS2307
-/// (deduped per span) when the specifier resolves to neither an on-disk
+/// (deduped per span; TS2591 for a Node core module — see
+/// `reportModuleNotFound`) when the specifier resolves to neither an on-disk
 /// module nor an ambient `declare module`.
 pub fn resolveImportTypeModule(c: *Checker, import_node: Node, report: bool) Error!?ModuleRef {
     const spec_tok = c.tree.nodeData(import_node).lhs;
@@ -519,7 +520,7 @@ pub fn resolveImportTypeModule(c: *Checker, import_node: Node, report: bool) Err
     }
     if (c.ambientIndex(spec)) |idx| return .{ .ambient = idx };
     if (report) {
-        try c.diagFmt(2307, c.tokSpan(spec_tok), "Cannot find module '{s}' or its corresponding type declarations.", .{stripQuotes(c.tokenText(spec_tok))});
+        try c.reportModuleNotFound(spec_tok);
     }
     return null;
 }
@@ -896,7 +897,7 @@ pub fn typeofEntity(c: *Checker, node: Node) Error!TypeId {
         .none => {
             // `typeof globalThis` — always in scope (see checkIdentifier).
             if (std.mem.eql(u8, c.atomText(a), "globalThis")) return c.globalThisType();
-            try c.diagFmt(2304, c.tokSpan(tok), "Cannot find name '{s}'.", .{c.tokenText(tok)});
+            try c.reportNameNotFound(tok);
             return types.error_type;
         },
     }

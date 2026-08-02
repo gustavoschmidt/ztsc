@@ -243,6 +243,11 @@ pub fn loadInDir(io: Io, arena: Allocator, base: Io.Dir, config_path: []const u8
         for (trs) |r| try abs.append(arena, try joinNormalize(arena, acc.type_roots_dir, r));
         break :blk try abs.toOwnedSlice(arena);
     } else null;
+    if (acc.types) |ts| {
+        for (ts) |t| {
+            if (std.mem.eql(u8, t, "*")) cfg.types_wildcard = true;
+        }
+    }
     cfg.auto_type_files = try collectAutoTypes(io, arena, base, cfg.dir, type_roots_abs, acc.types);
     if (cfg.auto_type_files.len > 0) {
         try note(arena, &notes, "auto-included {d} '@types' package(s) as ambient roots (tsc's default typeRoots); override with 'typeRoots'/'types'", .{cfg.auto_type_files.len});
@@ -298,6 +303,12 @@ pub const Config = struct {
     /// suppressed — the value still becomes `any`, only the diagnostic is gone.
     /// `strictNullChecks` etc. remain governed by `strict`, never coupled here.
     no_implicit_any: bool = true,
+    /// `compilerOptions.types` contains the `"*"` wildcard (tsc's
+    /// `usesWildcardTypes`). Its only effect on diagnostics: the node-flavoured
+    /// not-found messages ("Do you need to install type definitions for node?")
+    /// drop the "and then add 'node' to the types field" tail, which is a
+    /// different diagnostic code — TS2580 rather than TS2591.
+    types_wildcard: bool = false,
     /// `compilerOptions.allowJs`: a bare/relative specifier that resolves only to
     /// a JavaScript file (a JS-only package, or a `./x.js` with no `.ts`/`.d.ts`
     /// twin) is typed opaquely as `any` rather than raising TS2307. ztsc never
@@ -757,7 +768,11 @@ fn segMatch(pat: []const u8, name: []const u8) bool {
 /// is what makes a non-`@types` entry work: `types: ["vitest/globals"]`
 /// resolves to `node_modules/vitest/globals.d.ts` through the package's
 /// `exports` map. An empty `types` yields nothing; an entry that resolves
-/// nowhere is skipped (tsc's TS2688 is not reported — an under-report).
+/// nowhere is skipped: tsc's TS2688 for it is a *file-less* global diagnostic
+/// (the directive lives in the config, not in a source file), and ztsc prints
+/// only file-anchored ones — an under-report. The same directive written as a
+/// `/// <reference types="…" />` inside a source file does get TS2688, from
+/// `Linker.reportUnresolvedTypeRefs`.
 fn collectAutoTypes(
     io: Io,
     arena: Allocator,

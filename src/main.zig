@@ -482,6 +482,8 @@ pub fn main(init: std.process.Init) !void {
     var config_no_implicit_any = true;
     // tsconfig noUncheckedSideEffectImports (tsc's default is off).
     var config_no_unchecked_side_effect_imports = false;
+    // tsconfig `types: [… "*" …]` — TS2580 instead of TS2591 (see LinkOpts).
+    var config_types_wildcard = false;
     // Effective allowSyntheticDefaultImports. With no tsconfig (bare file
     // arguments) ztsc still resolves with the bundler algorithm, and tsc's rule
     // makes the flag default to true under bundler resolution.
@@ -547,6 +549,7 @@ pub fn main(init: std.process.Init) !void {
         config_allow_js = cfg.allow_js;
         config_no_implicit_any = cfg.no_implicit_any;
         config_no_unchecked_side_effect_imports = cfg.no_unchecked_side_effect_imports;
+        config_types_wildcard = cfg.types_wildcard;
         config_allow_synthetic_default = cfg.allow_synthetic_default_imports;
         config_jsx_runtime_module = cfg.jsx_runtime_module;
     }
@@ -653,6 +656,9 @@ pub fn main(init: std.process.Init) !void {
     // Per-file resolved FileIds in first-occurrence specifier order
     // (unresolved skipped) — the edges of the deterministic BFS below.
     var edge_lists: std.ArrayList([]const modules.FileId) = .empty;
+    // Per-file `/// <reference types="X" />` directives that resolved to
+    // nothing; the linker replays them as TS2688.
+    var type_ref_misses_all: std.ArrayList([]const modules.TypeRefMiss) = .empty;
 
     var load_ns: u64 = 0;
     var parse_ns: u64 = 0;
@@ -677,7 +683,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var outstanding: usize = 0;
-    try growPerFile(arena, paths.items.len, &results, &trees, &binds, &errs, &spec_atoms_all, &spec_files_all, &edge_lists);
+    try growPerFile(arena, paths.items.len, &results, &trees, &binds, &errs, &spec_atoms_all, &spec_files_all, &edge_lists, &type_ref_misses_all);
     for (paths.items, 0..) |p, i| {
         try work.push(.{ .file = @intCast(i), .path = p });
         outstanding += 1;
@@ -777,10 +783,18 @@ pub fn main(init: std.process.Init) !void {
             // resolved ids join the discovery edge list so the deterministic
             // BFS renumbering below reaches them.
             if (results.items[i]) |src| {
+                var misses: std.ArrayList(modules.TypeRefMiss) = .empty;
                 for (try resolve.scanReferences(scratch, src.bytes)) |ref| {
                     const rfid = try discoverReferenceInto(arena, scratch, io, &rcache, paths.items[i], ref, &path_ids, &paths);
                     try ref_files.append(arena, rfid);
+                    // An unresolvable `types=` directive is tsc's TS2688; the
+                    // linker reports it, since only this loop knows resolution
+                    // failed. `path=` misses are TS6053, not implemented.
+                    if (rfid == modules.no_file and ref.kind == .types) {
+                        try misses.append(arena, modules.typeRefMiss(ref));
+                    }
                 }
+                type_ref_misses_all.items[i] = misses.items;
             }
             _ = resolve_scratch.reset(.retain_capacity);
         }
@@ -797,7 +811,7 @@ pub fn main(init: std.process.Init) !void {
         spec_files_all.items[i] = files.items;
 
         // Enqueue newly discovered files right away.
-        try growPerFile(arena, paths.items.len, &results, &trees, &binds, &errs, &spec_atoms_all, &spec_files_all, &edge_lists);
+        try growPerFile(arena, paths.items.len, &results, &trees, &binds, &errs, &spec_atoms_all, &spec_files_all, &edge_lists, &type_ref_misses_all);
         for (known_before..paths.items.len) |nf| {
             try work.push(.{ .file = @intCast(nf), .path = paths.items[nf] });
             outstanding += 1;
@@ -846,6 +860,7 @@ pub fn main(init: std.process.Init) !void {
         try permuteInPlace(?anyerror, arena, errs.items, order);
         try permuteInPlace([]ztsc.intern.Atom, arena, spec_atoms_all.items, order);
         try permuteInPlace([]modules.FileId, arena, spec_files_all.items, order);
+        try permuteInPlace([]const modules.TypeRefMiss, arena, type_ref_misses_all.items, order);
         if (jsx_runtime_fid) |f| jsx_runtime_fid = new_ids[f];
         // Remap the resolved FileIds inside the spec maps.
         for (spec_files_all.items) |spec_files| {
@@ -882,12 +897,14 @@ pub fn main(init: std.process.Init) !void {
             .tree = tree.?,
             .bind = bnd.?,
             .specs = .{ .atoms = spec_atoms_all.items[i], .files = spec_files_all.items[i] },
+            .type_ref_misses = type_ref_misses_all.items[i],
         };
     }
     const lr = try modules.link(arena, gpa, io, &interner, prog_files, .{
         .allow_synthetic_default = config_allow_synthetic_default,
         .no_implicit_any = config_no_implicit_any,
         .no_unchecked_side_effect_imports = config_no_unchecked_side_effect_imports,
+        .types_wildcard = config_types_wildcard,
     });
     const links = lr.links;
     const prog = try arena.create(modules.Program);
@@ -903,6 +920,7 @@ pub fn main(init: std.process.Init) !void {
         .constit_vals = lr.constit_vals,
         .export_equals_atom = lr.export_equals_atom,
         .no_implicit_any = config_no_implicit_any,
+        .types_wildcard = config_types_wildcard,
         .jsx_runtime_file = jsx_runtime_fid orelse modules.no_file,
     };
     const link_ns = link_timer.readNs();
@@ -1471,6 +1489,7 @@ fn growPerFile(
     spec_atoms_all: *std.ArrayList([]ztsc.intern.Atom),
     spec_files_all: *std.ArrayList([]modules.FileId),
     edge_lists: *std.ArrayList([]const modules.FileId),
+    type_ref_misses_all: *std.ArrayList([]const modules.TypeRefMiss),
 ) !void {
     while (results.items.len < n) {
         try results.append(arena, null);
@@ -1480,6 +1499,7 @@ fn growPerFile(
         try spec_atoms_all.append(arena, &.{});
         try spec_files_all.append(arena, &.{});
         try edge_lists.append(arena, &.{});
+        try type_ref_misses_all.append(arena, &.{});
     }
 }
 
