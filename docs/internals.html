@@ -37,13 +37,13 @@
   <div class="stats">
     <div class="stat">
       <div class="k">wall clock · @types/node</div>
-      <div class="v">13&thinsp;<small>ms</small></div>
-      <div class="c">tsgo 7.0.2 takes 45&thinsp;ms on the same 49.6k lines of declarations — and ztsc is faster on all eight benchmark packages</div>
+      <div class="v">11&thinsp;<small>ms</small></div>
+      <div class="c">tsgo 7.0.2 takes 47&thinsp;ms on the same 49.6k lines of declarations — and ztsc is at least 2× faster on every benchmark</div>
     </div>
     <div class="stat">
       <div class="k">peak RSS · @types/node</div>
-      <div class="v">18&thinsp;<small>MB</small></div>
-      <div class="c">17% of tsgo (107&thinsp;MB); across eight real packages ztsc runs at 7–20% of tsgo's peak, against a ≤&thinsp;50% headline goal</div>
+      <div class="v">17&thinsp;<small>MB</small></div>
+      <div class="c">17% of tsgo (101&thinsp;MB); across eight real packages ztsc runs at 7–19% of tsgo's peak, against a ≤&thinsp;20% headline goal</div>
     </div>
     <div class="stat">
       <div class="k">memory per ast node</div>
@@ -52,7 +52,7 @@
     </div>
     <div class="stat">
       <div class="k">conformance</div>
-      <div class="v">917/917</div>
+      <div class="v">991/991</div>
       <div class="c">differential cases (error code + line) vs the native TypeScript compiler, tsgo 7.0.2</div>
     </div>
   </div>
@@ -552,7 +552,9 @@
   <code>std.Thread.Pool</code>, each task owning its own arenas, coordinated only through the
   completion queue described in section 01. The interesting part is the check
   phase, which borrows tsgo's key trick: <strong>partition the program's files across N
-  independent checker instances</strong> (default <code>min(4,&nbsp;cores)</code>, matching tsgo) — by
+  independent checker instances</strong> (default <code>min(4,&nbsp;cores)</code>, matching tsgo,
+  dropped to 2 when there is less than 32k nodes of check work to spread — each instance carries
+  fixed state that a small program never repays) — by
   estimated cost (AST node count) <em>and</em> import locality, so one giant file doesn't leave
   three checkers idle (on the skewed stress corpus the cost-based partition cut check time 26%; on
   bigfan, 2.4×) and import-adjacent files tend to land on the same checker, which materializes a
@@ -661,7 +663,7 @@
 </section>
 
 <footer class="sitefoot">
-  ztsc 0.0.1-dev · sources: README.md, BENCHMARKS.md, EXPERIMENTS.md, ARCHITECTURE.md and the src/ doc comments at commit d308f63 (2026-08-02) · numbers are Apple M4, macOS
+  ztsc 0.0.1-dev · sources: README.md, BENCHMARKS.md, EXPERIMENTS.md, ARCHITECTURE.md and the src/ doc comments at commit 732ab8b (2026-08-02) · numbers are Apple M4, macOS
 </footer>
 
 </div>

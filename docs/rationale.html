@@ -49,13 +49,13 @@
   <em>infrastructure that machines call at high frequency and high concurrency</em>. That shift
   changes which properties matter:</p>
   <ul>
-    <li><strong>Memory per instance is a density limit.</strong> One 276&thinsp;MB checker is
-    nothing on a laptop. Fifty concurrent memory-capped sandboxes is where 276&thinsp;MB vs
-    17&thinsp;MB decides how many agents fit on a host — and what the GB-hours cost.</li>
+    <li><strong>Memory per instance is a density limit.</strong> One 277&thinsp;MB checker is
+    nothing on a laptop. Fifty concurrent memory-capped sandboxes is where 277&thinsp;MB vs
+    18&thinsp;MB decides how many agents fit on a host — and what the GB-hours cost.</li>
     <li><strong>The per-invocation floor gets multiplied by thousands.</strong> A checker run
     once a day can shrug off startup cost; a checker run on every agent edit pays it every
     time. ztsc's entire process floor — start, load the embedded lib, check — is
-    ~7–14&thinsp;ms.</li>
+    ~6–9&thinsp;ms.</li>
     <li><strong>Determinism is a cache key.</strong> Byte-identical output at any parallelism
     means a harness can cache, diff, and dedupe checker results reliably. The batch CLI
     <em>is</em> the agent interface — which is why batch shipped before the LSP.</li>
@@ -80,15 +80,17 @@
   memory model. Go's collector needs heap headroom — typically around 2× live data — and its
   AST and type objects are real heap objects: per-object headers, 64-bit pointers between them,
   allocation churn for the collector to chase. On the packages in the
-  <a href="benchmarks.html">benchmark</a>, tsgo peaks between 43 and 276&thinsp;MB; and its
+  <a href="benchmarks.html">benchmark</a>, tsgo peaks between 44 and 277&thinsp;MB; and its
   footprint <em>grows steeply</em> with its parallelism (drizzle-orm: 174&thinsp;→&thinsp;419&thinsp;MB
   from 1 to 8 checkers).</p>
   <p>ztsc's answer is that a checker's live data can be tiny if nothing about the design fights
   it: 16 bytes per AST node, 5 per token, 28 per type, ~187 bytes of heap per source line
-  all-in. There is no collector, so footprint <em>equals</em> live data — 7–20% of tsgo's peak
-  on real packages, nearly flat as parallelism grows. Memory is the headline goal (the standing
-  gate is ≤&thinsp;50% of tsgo; measured reality is far under it) with speed parity the
-  constraint — and in practice ztsc is faster too, because the same choices that shrink memory
+  all-in. There is no collector, so footprint <em>equals</em> live data — 7–19% of tsgo's peak
+  on real packages, nearly flat as parallelism grows. Memory is the headline goal, and the
+  standing bar is now stated as a guarantee: <strong>at least 2× faster and at least 5× less
+  peak memory than tsgo on every benchmark</strong> — wall ≤&thinsp;50%, peak RSS
+  ≤&thinsp;20%, with measured reality well under both. Speed came along for free, because the
+  same choices that shrink memory
   (flat arrays, no pointer-chasing, no allocator locks) are the ones that make a CPU cache
   happy.</p>
   <p>Why does the footprint matter at all, when a laptop has 32&thinsp;GB? Because a type checker

@@ -11,7 +11,7 @@ hand-maintained prose/tables.)
 
 Only data-driven attributes/text change; the visual design is untouched. Edit
 DATA below (medians: wall = median of 11 monotonic-ns runs, RSS = median of 5
-under /usr/bin/time -l, both tools at their default 4 checkers) and re-run:
+under /usr/bin/time -l, both tools at their defaults) and re-run:
 
     /usr/bin/python3 docs/gen_charts.py
 
@@ -24,27 +24,26 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
 # name, wall_ztsc, wall_tsgo (ms), rss_ztsc, rss_tsgo (MB)
-# Both tools at their default 4 checkers.
-# Re-measured 2026-08-02 at commit d308f63, after the corpus-wide diagnostic
-# parity ratchet (8/8 packages at zero excess / zero under), the ambient-context
-# grammar checks in declaration files, and the tsc-fidelity implicit
-# node_modules prune in tsconfig include expansion (the prune does not touch
-# these vendored packages — they carry no node_modules — but halves the
-# excalidraw application row). @sinclair/typebox roughly doubled
-# (16.5 -> 30.5 ms) between 374d2c2 and f183773: the checker now does the work
-# whose absence produced its two false positives (0 excess now, was 2) —
-# the wall bought correctness, verified by rebuilding both commits. The other
-# seven rows moved only within noise. Both tools check their default lib at
-# their defaults — apples to apples, no parity flag needed.
+# Both tools at their defaults (tsgo 4 checkers; ztsc min(4, cores), 2 below
+# 32k nodes of check work).
+# Re-measured 2026-08-02 at commit 732ab8b, after the perf series: the built-in
+# lib is front-ended once instead of twice, programs under 32k check-nodes
+# default to two checkers instead of four, tuple element-type walks are
+# memoized, and the scanner got an identifier fast path. @sinclair/typebox's
+# earlier parity-work slowdown (it had roughly doubled when the checker gained
+# the ambient-context grammar checks that removed its two false positives) is
+# recovered — 30.5 -> 15.2 ms with the diagnostics unchanged. Both tools check
+# their default lib at their defaults — apples to apples, no parity flag needed.
+# Runs are interleaved ztsc/tsgo against tsgo 7.0.2.
 DATA = [
-    ("@types/node",        13.1,  45.3, 17.7, 106.6),
-    ("@types/react",       27.3, 244.2, 23.3, 200.0),
-    ("drizzle-orm",        23.2, 231.7, 18.7, 285.7),
-    ("hono",               31.0, 173.0, 24.8, 161.2),
-    ("@sinclair/typebox",  30.5,  47.8, 14.0,  81.7),
-    ("ajv",                 9.9,  22.8, 10.6,  52.2),
-    ("zod",                25.4, 155.2, 22.5, 142.5),
-    ("chalk",               7.6,  18.5,  8.4,  45.7),
+    ("@types/node",        11.3,  46.7, 17.4, 101.2),
+    ("@types/react",       22.1, 245.8, 22.9, 183.2),
+    ("drizzle-orm",        19.5, 241.4, 18.1, 276.5),
+    ("hono",               23.8, 172.4, 24.1, 153.4),
+    ("@sinclair/typebox",  15.2,  48.9, 13.8,  78.1),
+    ("ajv",                 9.2,  24.5,  9.3,  49.8),
+    ("zod",                21.6, 156.3, 21.3, 136.1),
+    ("chalk",               6.3,  19.2,  7.5,  43.8),
 ]
 
 RSS_MAX_PX = 290
@@ -111,8 +110,8 @@ def aria():
     rz = [rup(r[3]) for r in DATA]; rt = [rup(r[4]) for r in DATA]
     wz = [rup(r[1]) for r in DATA]; wt = [rup(r[2]) for r in DATA]
     rp = [pct(r[3], r[4]) for r in DATA]; wp = [pct(r[1], r[2]) for r in DATA]
-    return ("Two-panel grouped bar chart across eight real packages at the default "
-            "four checkers. Left panel, peak resident memory: ztsc uses %d to %d "
+    return ("Two-panel grouped bar chart across eight real packages, both tools at "
+            "their defaults. Left panel, peak resident memory: ztsc uses %d to %d "
             "megabytes, tsgo %d to %d megabytes &#8212; ztsc is %d to %d percent of "
             "tsgo on every package. Right panel, wall clock: ztsc takes %d to %d "
             "milliseconds, tsgo %d to %d milliseconds &#8212; ztsc is %d to %d "
