@@ -1329,6 +1329,25 @@ pub const Checker = struct {
         // grow on `cm()` and are `deinit`ed; the frozen *base* store keeps its
         // caller-supplied arena (built once, shared read-only, never freed).
         c.ts = if (base) |b| try Store.initOverlay(c.cm(), b) else try Store.init(arena_alloc);
+        // Pre-size the hash-consing map. Growing it is not the usual amortized
+        // O(1): every rehash re-derives each stored key's *shape* — the whole
+        // `extra` payload of the type — and Wyhashes it, so the doubling
+        // sequence costs ~2x one full pass over every type's payload. It
+        // measured ~11% of the check phase on @sinclair/typebox.
+        //
+        // Half the owned AST node count is the estimate: types run ~0.25-0.5
+        // per node across the benchmark packages, so this lands one doubling
+        // short of the final size — the map ends at exactly the capacity it
+        // would have reached anyway (peak RSS unchanged, measured on all five
+        // packages), while the whole geometric tail of small rehashes is
+        // skipped. Reserving the full node count removes the last rehash too
+        // but overshoots the final capacity, and cost 1-2 MB of peak RSS on
+        // zod/drizzle/hono for ~1% more wall — not the trade this project makes.
+        {
+            var owned_nodes: usize = 0;
+            for (owned) |f| owned_nodes += prog.files[f].tree.nodes.len;
+            try c.ts.reserveTypes(owned_nodes / 2);
+        }
         // Sized to include the merged-symbol range (ids ≥ totalSymbols()),
         // so merged ids are valid sym_types/sym_state indices. These
         // are indexed by *global* SymbolId — a checker reads them for foreign
