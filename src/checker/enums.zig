@@ -1382,10 +1382,28 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
             defer kept.deinit(c.scratch());
             var fresh_map: std.ArrayList(TpMap) = .empty;
             defer fresh_map.deinit(c.scratch());
+            // The map a bound is substituted under: the incoming one plus
+            // every fresh rewrite minted SO FAR in this loop. A bound may
+            // name a SIBLING own param — kysely's
+            // `where<RE extends ReferenceExpression<DB, TB>,
+            //        VE extends OperandValueExpressionOrList<DB, TB, RE>>`
+            // is the canonical shape — and substituting it under the bare
+            // incoming map left `VE`'s fresh bound pointing at the ORIGINAL
+            // `RE`, a symbol nothing ever binds. `RE`'s inferred literal
+            // therefore never reached `ExtractTypeFromReferenceExpression`,
+            // which stalled as a deferred conditional and rejected every
+            // right-hand operand: TS2769 on every `.where(...)` overload set.
+            // tsc does the same thing by construction — `instantiateSignature`
+            // combines the fresh-parameter mapper INTO the outer one and
+            // hands the combination to each cloned parameter.
+            var cur_map: std.ArrayList(TpMap) = .empty;
+            defer cur_map.deinit(c.scratch());
+            var cur_id = map_id;
             // Mint fresh params only for an eligible sig (all own bounds
             // bare/absent); otherwise keep the original params + AST bounds
             // (the pre-rewrite behavior for standalone generic functions).
             const eligible = n_tps != 0 and map.len > 0 and try c.higherOrderSigEligible(t);
+            if (eligible) try cur_map.appendSlice(c.scratch(), map);
             // Index: the loop body resolves bounds and instantiates, both of
             // which intern and can move `extra` (see `memberAt`).
             for (0..n_tps) |tp_i| {
@@ -1395,8 +1413,8 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
                 if (eligible) {
                     const od = try c.typeParamDefault(tp);
                     const oc = try c.typeParamConstraint(tp);
-                    const nd = if (od != types.no_type) try c.instantiate(od, map) else od;
-                    const nc = if (oc != types.no_type) try c.instantiate(oc, map) else oc;
+                    const nd = if (od != types.no_type) try c.instantiateId(od, cur_map.items, cur_id) else od;
+                    const nc = if (oc != types.no_type) try c.instantiateId(oc, cur_map.items, cur_id) else oc;
                     // Fresh param carries the substituted *default* (so a
                     // no-arg `<AD = DispatchType>()` resolves to the supplied
                     // dispatch). Its *constraint* is enforced only when it
@@ -1409,12 +1427,15 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
                     // legitimate inference. Mint only when a bound moved.
                     const fc = if (oc != types.no_type and c.ts.kind(oc) != .type_param) nc else types.no_type;
                     if (nc != oc or nd != od) {
-                        fresh = try c.mintFreshTp(tp, map, map_id, fc, nd, od != types.no_type);
+                        fresh = try c.mintFreshTp(tp, cur_map.items, cur_id, fc, nd, od != types.no_type);
                     }
                 }
                 if (fresh) |fid| {
                     try kept.append(c.scratch(), fid);
-                    try fresh_map.append(c.scratch(), .{ .sym = tp, .ty = try s.makeTypeParam(fid) });
+                    const rewrite: TpMap = .{ .sym = tp, .ty = try s.makeTypeParam(fid) };
+                    try fresh_map.append(c.scratch(), rewrite);
+                    try cur_map.append(c.scratch(), rewrite);
+                    cur_id = if (c.inst_cache_on) try c.canonMapId(cur_map.items) else null;
                 } else {
                     try kept.append(c.scratch(), tp);
                 }
