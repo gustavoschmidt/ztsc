@@ -1204,6 +1204,40 @@ pub fn baseClassRef(c: *Checker, sym: SymbolId) Error!?TypeId {
     return null;
 }
 
+/// True when somewhere up `sym`'s `extends` chain there is a base ztsc could
+/// not resolve to a class declaration — an `import S = internal.Stream;`
+/// entity alias (deliberately lenient, resolves to `any`), a mixin
+/// expression, a base behind an unmodeled construct. Such a class's member
+/// set is INCOMPLETE by construction, so any "does not implement" verdict
+/// against it is an artifact of the missing base, not a fact about the code:
+/// `@types/node`'s `class ReadableBase extends Stream implements
+/// NodeJS.ReadableStream` is exactly this shape. Callers use it to stay
+/// silent rather than emit a false positive.
+pub fn hasUnresolvedBase(c: *Checker, sym: SymbolId) Error!bool {
+    var cur = sym;
+    var depth: u32 = 0;
+    while (depth < 64) : (depth += 1) {
+        var has_extends = false;
+        {
+            const saved_ctx = c.enterSymFile(cur);
+            defer c.restoreCtx(saved_ctx);
+            for (c.declsOf(cur)) |decl| {
+                if (c.nodeTag(decl) != .class_decl) continue;
+                const data = c.tree.extraData(ast.ClassData, c.tree.nodeData(decl).lhs);
+                if (data.extends != 0) {
+                    has_extends = true;
+                    break;
+                }
+            }
+        }
+        if (!has_extends) return false;
+        const base = (try c.baseClassSym(cur)) orelse return true;
+        if (base == cur) return false; // self-extends: not an unknown base
+        cur = base;
+    }
+    return false;
+}
+
 /// The base *class symbol* of `sym` (`class D extends B`), when the base
 /// resolves to a class declaration. Mirrors `baseClassRef`'s resolution but
 /// yields the symbol — used to inherit static members (`typeof D` includes

@@ -1281,7 +1281,7 @@ const Linker = struct {
                     }
                     try l.put(t, l.atom_export_equals, tgt);
                     // TS2309: `export =` cannot coexist with a value export.
-                    try l.reportExportAssignMixing(file, rec.node);
+                    try l.reportExportAssignMixing(file, rec.node, rec.scope);
                 },
             }
         }
@@ -1344,9 +1344,16 @@ const Linker = struct {
     /// module (type-only exports — interfaces, `export type` — are allowed).
     /// Emitted at the `export =` statement. Under-reports exotic mixings
     /// (re-exports) to stay clear of false positives.
-    fn reportExportAssignMixing(l: *Linker, file: FileId, node: ast.Node) Error!void {
+    ///
+    /// "The same module" is the container the `export =` lives in, not the
+    /// file: one `.d.ts` routinely holds several `declare module "…"` blocks,
+    /// and `@types/node`'s `events.d.ts` — `export = EventEmitter` in one
+    /// block, a plain `export { … }` in another — was reported twice by a
+    /// file-wide scan.
+    fn reportExportAssignMixing(l: *Linker, file: FileId, node: ast.Node, scope: u32) Error!void {
         const b = l.files[file].bind;
         for (b.exports) |other| {
+            if (other.scope != scope) continue;
             const is_value = switch (other.kind) {
                 .default => true,
                 .named => other.module == 0 and other.sym != binder.no_symbol and
@@ -1450,6 +1457,20 @@ const Linker = struct {
             if (rec.local != local_atom) continue;
             if (rec.scope != f.bind.symbol_scopes[local_sym]) continue;
             const t_only = type_only or rec.type_only;
+            // `import x = require("m"); export = x;` where "m" is an AMBIENT
+            // module (no file behind it) is how every `node:<mod>` alias in
+            // `@types/node` is written. Resolving it needs the ambient
+            // registry, not the file graph; without it the alias — and so
+            // every member reached through it — degraded to `any`.
+            if (rec.kind == .equals and f.specs.get(rec.module) == null) {
+                const key = l.ambientKey(rec.module) orelse return .{ .kind = .any };
+                var tgt: Target = .{ .kind = .ambient_ns, .payload = @intCast(l.ambient.getIndex(key).?), .type_only = t_only };
+                if (l.ambient.getPtr(key).?.get(l.atom_export_equals)) |exeq| {
+                    if (exeq.kind != .any) tgt = exeq;
+                }
+                tgt.type_only = tgt.type_only or t_only;
+                return tgt;
+            }
             const mfile = f.specs.get(rec.module) orelse return .{ .kind = .any };
             switch (rec.kind) {
                 .namespace => return .{ .kind = .namespace, .file = mfile, .type_only = t_only },
@@ -1500,6 +1521,17 @@ const Linker = struct {
     /// of a name wins (deterministic FileId order). Must run after all export
     /// tables are built (member `finalizeLocal` may follow re-exports).
     fn buildAmbient(l: *Linker) Error!void {
+        // Seed every specifier key first, so the registry's index space is
+        // complete before any table is filled. `finalizeLocal` hands out
+        // `.ambient_ns` payloads (registry indices) while filling, and a
+        // `declare module "node:x" { import x = require("x"); export = x; }`
+        // block may be reached before the `"x"` block it names.
+        for (l.files) |*f| {
+            for (f.bind.ambient_modules) |am| {
+                const gop = try l.ambient.getOrPut(l.scratch, am.spec);
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+            }
+        }
         for (l.files, 0..) |*f, fi| {
             const fid: FileId = @intCast(fi);
             const b = f.bind;
@@ -1558,7 +1590,16 @@ const Linker = struct {
                         },
                         .named => {
                             if (tbl.contains(rec.exported)) continue;
-                            const ls = b.lookupInScope(am.scope, rec.local) orelse continue;
+                            // `rec.sym` is the binder's own resolution, which
+                            // walks outward from the `export { … }` statement
+                            // and consults the file's `global { … }` blocks;
+                            // the block-scope lookup only sees the block's own
+                            // members. `declare module "buffer" { global { var
+                            // Buffer … } export { Buffer }; }` needs the former.
+                            const ls = if (rec.sym != binder.no_symbol)
+                                rec.sym
+                            else
+                                b.lookupInScope(am.scope, rec.local) orelse continue;
                             try tbl.put(l.scratch, rec.exported, try l.finalizeLocal(fid, ls, rec.local, rec.type_only, 0));
                         },
                         .equals => {
