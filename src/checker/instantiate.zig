@@ -796,6 +796,23 @@ pub fn interfaceConstituentApplyBases(c: *Checker, sym: SymbolId, acc: TypeId, o
 
     var bases: std.ArrayList(TypeId) = .empty;
     defer bases.deinit(c.scratch());
+    try c.interfaceHeritageTypes(sym, &bases);
+    const frame_idx: ?usize = if (c.iface_stack.items.len > 0) c.iface_stack.items.len - 1 else null;
+    if (frame_idx) |fi| c.iface_stack.items[fi].resolving_base = true;
+    defer if (frame_idx) |fi| {
+        c.iface_stack.items[fi].resolving_base = false;
+    };
+    var own = acc;
+    for (bases.items) |base| {
+        own = try c.mergeBaseResolved(own, try c.resolveStructural(base));
+    }
+    return own;
+}
+
+/// The `extends` heritage types written on every `interface` declaration of
+/// `sym`, in declaration order, converted in the symbol's own file context.
+/// Caller sets `this` and the file context (see `interfaceConstituentApplyBases`).
+pub fn interfaceHeritageTypes(c: *Checker, sym: SymbolId, out: *std.ArrayList(TypeId)) Error!void {
     for (c.declsOf(sym)) |decl| {
         if (c.nodeTag(decl) != .interface_decl) continue;
         const d = c.tree.nodeData(decl);
@@ -812,20 +829,9 @@ pub fn interfaceConstituentApplyBases(c: *Checker, sym: SymbolId, acc: TypeId, o
                     if (an != null_node) try targs.append(c.scratch(), try c.typeFromTypeNode(an));
                 }
             }
-            const base = try c.typeFromTypeName(hd.lhs, targs.items);
-            try bases.append(c.scratch(), base);
+            try out.append(c.scratch(), try c.typeFromTypeName(hd.lhs, targs.items));
         }
     }
-    const frame_idx: ?usize = if (c.iface_stack.items.len > 0) c.iface_stack.items.len - 1 else null;
-    if (frame_idx) |fi| c.iface_stack.items[fi].resolving_base = true;
-    defer if (frame_idx) |fi| {
-        c.iface_stack.items[fi].resolving_base = false;
-    };
-    var own = acc;
-    for (bases.items) |base| {
-        own = try c.mergeBaseResolved(own, try c.resolveStructural(base));
-    }
-    return own;
 }
 
 /// Merge one resolved base into `derived`. A base that reduces to an
@@ -994,6 +1000,21 @@ pub fn classInstanceGeneric(c: *Checker, sym: SymbolId) Error!TypeId {
         }
         result = try c.ts.makeObject(props.items, 0, 0, types.obj_flag_not_inferable);
     }
+    // Same-file class+interface declaration merge. tsc binds the pair to ONE
+    // symbol whose declarations share a single member table, and whose base
+    // list is the class's `extends` FOLLOWED BY every interface block's
+    // `extends` (`getBaseTypes` runs `resolveBaseTypesOfClass` and then
+    // `resolveBaseTypesOfInterface`). So the interface half's DECLARED
+    // members join the class's own here — before any base, so a declared
+    // member still overrides an inherited one — and its `extends` bases are
+    // folded after the class's base below. drizzle leans on this hard:
+    // `interface Table extends SQLWrapper {}` beside `declare class Table
+    // implements SQLWrapper {}` is what makes the class satisfy the
+    // interface at all.
+    const iface_half = !c.prog.isMergedId(sym) and c.symFlags(sym).interface;
+    if (iface_half) {
+        result = try c.mergeBaseObject(result, try c.interfaceConstituentDirect(sym, sym), true);
+    }
     // Merge base class instance.
     if (try c.baseClassRef(sym)) |base_ref| {
         result = try c.mergeBaseObject(result, try c.resolveStructural(base_ref), false);
@@ -1016,8 +1037,23 @@ pub fn classInstanceGeneric(c: *Checker, sym: SymbolId) Error!TypeId {
             result = try c.mergeBaseObject(result, try c.interfaceConstituentDirect(p, sym), true);
         }
     }
+    if (iface_half) result = try c.classInterfaceHalfBases(sym, result);
     try c.class_inst_generic.put(c.cm(), sym, result);
     return result;
+}
+
+/// Fold the `extends` bases written on a class's same-file `interface` half
+/// into its instance type; members already in `acc` (the class's own and the
+/// interface half's declared members, plus the class's `extends` base) win.
+pub fn classInterfaceHalfBases(c: *Checker, sym: SymbolId, acc: TypeId) Error!TypeId {
+    const saved_ctx = c.enterSymFile(sym);
+    defer c.restoreCtx(saved_ctx);
+    var bases: std.ArrayList(TypeId) = .empty;
+    defer bases.deinit(c.scratch());
+    try c.interfaceHeritageTypes(sym, &bases);
+    var own = acc;
+    for (bases.items) |b| own = try c.mergeBaseResolved(own, try c.resolveStructural(b));
+    return own;
 }
 
 pub fn isCtorName(c: *Checker, name: Atom) bool {
@@ -1323,6 +1359,46 @@ pub fn classIsAbstract(c: *Checker, sym: SymbolId) Error!bool {
     return false;
 }
 
+/// Does one of `bases` — the extra base types a class picks up from its
+/// same-file `interface` half — supply a declaration of `name` that
+/// satisfies an inherited abstract member? tsc compares declaration symbols
+/// (`derivedElsewhere !== base`); ztsc's resolved objects carry no symbol
+/// identity, so the equivalent question is "present in that base, and not
+/// itself a still-abstract class member" — only a class can declare one, so
+/// an interface base that has the name always satisfies.
+pub fn abstractSatisfiedElsewhere(c: *Checker, bases: []const TypeId, name: Atom) Error!bool {
+    for (bases) |b| {
+        const r = try c.resolveStructural(b);
+        if ((try c.propOfType(r, name)) == null) continue;
+        if (try c.classChainMemberIsAbstract(b, name, 0)) continue;
+        return true;
+    }
+    return false;
+}
+
+/// Walking a class ref's own members and then its `extends` chain: is
+/// `name` declared there and still `abstract`? A non-class base answers
+/// false.
+pub fn classChainMemberIsAbstract(c: *Checker, t: TypeId, name: Atom, depth: u32) Error!bool {
+    if (depth >= 64 or c.ts.kind(t) != .ref) return false;
+    const sym = c.ts.refSymbol(t);
+    if (!c.symFlags(sym).class) return false;
+    {
+        const saved = c.enterSymFile(sym);
+        defer c.restoreCtx(saved);
+        if (c.bind.membersScopeOf(c.localOf(sym))) |ms| {
+            const lo = c.bind.scope_members_start[ms];
+            const hi = c.bind.scope_members_start[ms + 1];
+            for (lo..hi) |i| {
+                if (c.bind.member_atoms[i] != name) continue;
+                return c.memberIsAbstract(c.toGlobal(c.bind.member_syms[i]));
+            }
+        }
+    }
+    const nb = try c.baseClassRef(sym) orelse return false;
+    return c.classChainMemberIsAbstract(nb, name, depth + 1);
+}
+
 /// Whether a class member symbol's declaration is `abstract`.
 pub fn memberIsAbstract(c: *Checker, msym: SymbolId) bool {
     for (c.declsOf(msym)) |decl| {
@@ -1358,6 +1434,31 @@ pub fn checkAbstractImplementation(c: *Checker, class_sym: SymbolId, class_node:
     defer seen.deinit(c.scratch());
     try c.collectClassMemberAtoms(class_sym, &seen);
 
+    // Same-file class+interface declaration merge. The interface half's
+    // DECLARED members are part of the one merged member table, so they
+    // implement the abstract member outright; its `extends` clauses are
+    // extra base types of the merged declared type, which tsc searches for
+    // a satisfying declaration ("The class may have more than one base type
+    // via declaration merging with an interface with the same name" —
+    // `checkKindsOfPropertyMemberOverrides`). drizzle's `PgSelectBase` is
+    // exactly this: `interface PgSelectBase extends …, SQLWrapper` supplies
+    // the `getSQL` its abstract `TypedQueryBuilder` base leaves open, while
+    // the MySQL/SQLite twins — whose interface halves do NOT extend
+    // `SQLWrapper` — still report.
+    var iface_bases: std.ArrayList(TypeId) = .empty;
+    defer iface_bases.deinit(c.scratch());
+    if (!c.prog.isMergedId(class_sym) and c.symFlags(class_sym).interface) {
+        const saved = c.enterSymFile(class_sym);
+        defer c.restoreCtx(saved);
+        const direct = try c.interfaceConstituentDirect(class_sym, class_sym);
+        if (c.ts.kind(direct) == .object) {
+            for (0..c.ts.objectPropCount(direct)) |i| {
+                try seen.put(c.scratch(), c.ts.objectProp(direct, @intCast(i)).name, {});
+            }
+        }
+        try c.interfaceHeritageTypes(class_sym, &iface_bases);
+    }
+
     var unimpl: std.ArrayList(Atom) = .empty;
     defer unimpl.deinit(c.scratch());
 
@@ -1384,6 +1485,7 @@ pub fn checkAbstractImplementation(c: *Checker, class_sym: SymbolId, class_node:
                     const local_sym = c.bind.member_syms[i];
                     const msym = c.toGlobal(local_sym);
                     if (c.memberIsAbstract(msym)) {
+                        if (try c.abstractSatisfiedElsewhere(iface_bases.items, name_atom)) continue;
                         const decls = c.bind.declsOf(local_sym);
                         const start = if (decls.len > 0) c.nodeSpan(decls[0]).start else 0;
                         try batch.append(c.scratch(), .{ .atom = name_atom, .start = start });

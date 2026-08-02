@@ -1127,7 +1127,12 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
             const iface = try c.typeFromTypeName(hd.lhs, targs.items);
             if (iface != types.error_type and iface != types.any_type) {
                 if (!try c.isAssignable(this_t, iface)) {
-                    try c.diagFmt(2420, c.nodeSpan(hd.lhs), "Class '{s}' incorrectly implements interface '{s}'.", .{
+                    // tsc anchors the broad TS2420 at the class NAME
+                    // (`issueMemberSpecificError`'s `node.name || node`),
+                    // not at the heritage reference that failed — two
+                    // failing `implements` clauses report twice on the
+                    // same name.
+                    try c.diagFmt(2420, c.tokSpan(data.name_token), "Class '{s}' incorrectly implements interface '{s}'.", .{
                         c.symbolName(class_sym), try c.typeToString(iface),
                     });
                 }

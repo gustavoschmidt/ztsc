@@ -50,8 +50,10 @@
 //!   self-references show up as unresolved refs, which the binder treats as
 //!   non-errors), computed member names as symbols (the key expression is
 //!   still bound), and declaration merging beyond interface-interface
-//!   (class+interface pairs merge silently without member merging — the
-//!   subset boundary check lands with the checker).
+//!   (class+interface pairs merge into one SYMBOL here, but the two halves'
+//!   members and bases are folded by the checker — `classInstanceGeneric` —
+//!   not by sharing a members scope, so the fold does not depend on which
+//!   block the file happens to write first).
 //!
 //! Unresolved identifiers are NOT errors at bind time (globals and cross-file
 //! imports resolve at link time); they are exposed via `Bind.unresolved`.
