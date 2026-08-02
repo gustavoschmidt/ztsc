@@ -484,7 +484,16 @@ pub const IfaceFrame = struct { sym: SymbolId, resolving_base: bool = false };
 
 /// Bounds of a fresh higher-order type-param symbol (see `fresh_tp_ids`). The
 /// constraint/default are already `M`-instantiated TypeIds (`no_type` = none).
-pub const FreshTp = struct { name: Atom, constraint: TypeId, default: TypeId, has_default: bool };
+pub const FreshTp = struct {
+    name: Atom,
+    constraint: TypeId,
+    default: TypeId,
+    has_default: bool,
+    /// The `const` modifier of the ORIGINAL type parameter this fresh id
+    /// stands in for, carried across so a `const` parameter of a generic
+    /// method survives the receiver's instantiation.
+    const_tp: bool = false,
+};
 
 /// One entry of `Checker.mapped_key_scopes`: a mapped type's key parameter
 /// `K`, in scope for that map's `as`/value branches (and for anything nested
@@ -2157,6 +2166,7 @@ pub const Checker = struct {
     pub const toLower = names_zig.toLower;
     pub const literalBaseOf = names_zig.literalBaseOf;
     pub const widenLiteral = names_zig.widenLiteral;
+    pub const isConstTypeVar = names_zig.isConstTypeVar;
     pub const normalizeFreshObjectSiblings = names_zig.normalizeFreshObjectSiblings;
     pub const widenReturnMember = names_zig.widenReturnMember;
     pub const finalizeInferredReturn = names_zig.finalizeInferredReturn;
@@ -2239,6 +2249,7 @@ pub const Checker = struct {
     pub const restTupleOf = typenode_zig.restTupleOf;
     pub const sigRestTuple = typenode_zig.sigRestTuple;
     pub const sigRestUnion = typenode_zig.sigRestUnion;
+    pub const sigNonArrayRest = typenode_zig.sigNonArrayRest;
     pub const restUnionOptionalAt = typenode_zig.restUnionOptionalAt;
     pub const restTupleAtPosition = typenode_zig.restTupleAtPosition;
     pub const memberList = typenode_zig.memberList;
@@ -2385,6 +2396,7 @@ pub const Checker = struct {
     pub const tpLookup = enums_zig.tpLookup;
     pub const canonMapId = enums_zig.canonMapId;
     pub const isFreshTp = enums_zig.isFreshTp;
+    pub const isConstTypeParamSym = enums_zig.isConstTypeParamSym;
     pub const freshTp = enums_zig.freshTp;
     pub const mintFreshTp = enums_zig.mintFreshTp;
     pub const instantiate = enums_zig.instantiate;
@@ -2638,6 +2650,8 @@ pub const Checker = struct {
     pub const contextualArrayElemType = expr_zig.contextualArrayElemType;
     pub const multiArrayLikeBranches = expr_zig.multiArrayLikeBranches;
     pub const checkConstArrayLiteral = expr_zig.checkConstArrayLiteral;
+    pub const ctxIsMutableArrayLike = expr_zig.ctxIsMutableArrayLike;
+    pub const ctxIsMutableArrayLikeAt = expr_zig.ctxIsMutableArrayLikeAt;
     pub const collectTypeParamSyms = expr_zig.collectTypeParamSyms;
     pub const isInstantiableKind = expr_zig.isInstantiableKind;
     pub const deferredDefaultConstraint = expr_zig.deferredDefaultConstraint;

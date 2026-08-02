@@ -2314,9 +2314,8 @@ pub fn sigRestTuple(c: *Checker, sig: TypeId) Error!?TypeId {
 /// to satisfy exactly one ARM.
 ///
 /// The SIGNATURE-RELATION half of that is what this drives
-/// (`restTupleAtPosition`, `signatureAssignableModeInner`). Its call half
-/// stays a per-position check, an under-report recorded in
-/// test/conformance/DEFERRED next to calls/053.
+/// (`restTupleAtPosition`, `signatureAssignableModeInner`); its CALL half is
+/// `sigNonArrayRest` below, which is the same rule one step more general.
 pub fn sigRestUnion(c: *Checker, sig: TypeId) Error!?TypeId {
     const count = c.ts.fnParamCount(sig);
     if (count == 0) return null;
@@ -2344,6 +2343,34 @@ pub fn sigRestUnion(c: *Checker, sig: TypeId) Error!?TypeId {
         if (c.ts.kind(try c.resolveStructural(m)) != .tuple) return null;
     }
     return r;
+}
+
+/// tsc's `getNonArrayRestType`: the trailing rest parameter's type when the
+/// argument list has to satisfy it as a WHOLE rather than position by
+/// position. tsc's test is "there is an effective rest type and it is not an
+/// array type" — a union of tuples (i18next's `TFunction`), a union of arrays
+/// (an emitter's `...handlers: Sub[] | Sub[][]`), a bare type parameter. A
+/// FULLY FIXED tuple rest has no effective rest type at all (it expands
+/// positionally), and a plain `T[]` rest is an array, so both keep the
+/// per-position walk.
+///
+/// ztsc narrows that to a UNION, which is where the whole-list rule earns its
+/// keep and where per-position typing provably cannot answer: position 1 of
+/// `[k, o?] | [k, d, o?]` would have to union the options bag with the default
+/// string, which relates to neither arm. Every other non-array rest stays on
+/// the per-position path — a deterministic under-report of the same shape the
+/// per-position check already handles.
+pub fn sigNonArrayRest(c: *Checker, sig: TypeId) Error!?TypeId {
+    const count = c.ts.fnParamCount(sig);
+    if (count == 0) return null;
+    const p = c.ts.fnParam(sig, count - 1);
+    if (!p.rest()) return null;
+    switch (c.ts.kind(p.ty)) {
+        .union_type, .ref => {},
+        else => return null,
+    }
+    const r = try c.resolveStructural(p.ty);
+    return if (c.ts.kind(r) == .union_type) r else null;
 }
 
 /// Is `index` an OPTIONAL position of a rest parameter typed by a union of

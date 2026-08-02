@@ -1225,7 +1225,7 @@ const Parser = struct {
     /// Type params + params + return type → extra index of FnProto.
     fn parseFnProtoRest(p: *Parser, flags: u32, name_tok: u32) PE!u32 {
         var tp: ast.SubRange = .{ .start = 0, .end = 0 };
-        if (p.atLt()) tp = try p.parseTypeParams(false);
+        if (p.atLt()) tp = try p.parseTypeParams(.callable);
         const params = try p.parseParams();
         var ret: Node = null_node;
         if (try p.eat(.colon) != null) ret = try p.parseReturnType();
@@ -1270,10 +1270,30 @@ const Parser = struct {
         return isIdentLike(tag) or tag == .keyword_in or tag == .keyword_out or tag == .keyword_const;
     }
 
-    /// `allow_variance` is true only for the three declaration forms that HAVE
-    /// declaration-site variance (class, interface, type alias); a function,
-    /// method, arrow, or function/constructor type gets TS1274 per modifier.
-    fn parseTypeParams(p: *Parser, allow_variance: bool) PE!ast.SubRange {
+    /// Which modifiers a type-parameter list's OWNER admits. Declaration-site
+    /// variance (`in`/`out`, TS 4.7) belongs to the three forms that declare a
+    /// named generic type — class, interface, type alias; `const` (TS 5.0)
+    /// belongs to the forms that have a CALL SITE to infer from — function,
+    /// method, class (its constructor). Only a class admits both; the two
+    /// remaining forms admit exactly one each, which is why this is one enum
+    /// rather than two flags.
+    const TypeParamOwner = enum {
+        /// Function, method, arrow, function/constructor type: `const` only.
+        callable,
+        /// Class: both.
+        class,
+        /// Interface, type alias: `in`/`out` only.
+        type_decl,
+
+        fn allowsVariance(o: TypeParamOwner) bool {
+            return o != .callable;
+        }
+        fn allowsConst(o: TypeParamOwner) bool {
+            return o != .type_decl;
+        }
+    };
+
+    fn parseTypeParams(p: *Parser, owner: TypeParamOwner) PE!ast.SubRange {
         _ = try p.expectLt();
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
@@ -1281,8 +1301,10 @@ const Parser = struct {
             const before = p.curIdx();
             // Leading modifiers: `const` (TS 5.0) and the `in`/`out` variance
             // annotations (TS 4.7). Consumed and dropped — the CHECKER reads
-            // the annotation back off the token before the name (see
-            // `declaredVarianceOfTypeParam`), so nothing is stored per node.
+            // them back off the tokens before the name (see
+            // `declaredVarianceOfTypeParam`; the binder does the same for
+            // `const`, into `SymbolFlags.const_type_param`), so a modifier
+            // costs no node, symbol, or type-store memory.
             //
             // `out` is a CONTEXTUAL keyword, so unlike `const` and `in` it is
             // ident-like: it is the modifier exactly when a name can follow it
@@ -1290,6 +1312,10 @@ const Parser = struct {
             // `<out>`, `<out, T>` and `<out = X>` still declare a parameter
             // *named* `out`, as tsc parses them.
             var out_tok: ?u32 = null;
+            // tsc's `checkGrammarModifiers` reports the FIRST offending
+            // modifier of a type parameter and stops, so `<const in out T>` on
+            // a function is one TS1274 (at `in`), not two.
+            var reported = false;
             while (true) {
                 const tag = p.curTag();
                 const is_modifier = switch (tag) {
@@ -1299,17 +1325,20 @@ const Parser = struct {
                 };
                 if (!is_modifier) break;
                 const tok = try p.bump();
-                if (tag == .keyword_const) continue;
                 // Diagnostics only — `errAtToken` does not backtrack, and a
                 // speculative parse that loses discards them with `restore`,
                 // so reporting here cannot cost us an arrow function.
-                if (!allow_variance) {
-                    try p.errAtToken(if (tag == .keyword_in)
-                        .in_modifier_not_valid_here
-                    else
-                        .out_modifier_not_valid_here, tok);
-                } else if (tag == .keyword_in) {
-                    if (out_tok != null) try p.errAtToken(.in_must_precede_out, tok);
+                const bad: ?diagnostics.Code = if (tag == .keyword_const)
+                    (if (owner.allowsConst()) null else .const_modifier_not_valid_here)
+                else if (!owner.allowsVariance())
+                    (if (tag == .keyword_in) .in_modifier_not_valid_here else .out_modifier_not_valid_here)
+                else if (tag == .keyword_in and out_tok != null)
+                    .in_must_precede_out
+                else
+                    null;
+                if (bad) |code| {
+                    if (!reported) try p.errAtToken(code, tok);
+                    reported = true;
                 }
                 if (tag == .keyword_out) out_tok = tok;
             }
@@ -1514,7 +1543,7 @@ const Parser = struct {
             name_tok = try p.bump();
         }
         var tp: ast.SubRange = .{ .start = 0, .end = 0 };
-        if (p.atLt()) tp = try p.parseTypeParams(true);
+        if (p.atLt()) tp = try p.parseTypeParams(.class);
 
         var extends: Node = null_node;
         if (try p.eat(.keyword_extends) != null) {
@@ -1763,7 +1792,7 @@ const Parser = struct {
         const kw = try p.bump(); // `interface`
         const name_tok = try p.expectIdentLike();
         var tp: ast.SubRange = .{ .start = 0, .end = 0 };
-        if (p.atLt()) tp = try p.parseTypeParams(true);
+        if (p.atLt()) tp = try p.parseTypeParams(.type_decl);
         var ext: ast.SubRange = .{ .start = 0, .end = 0 };
         if (try p.eat(.keyword_extends) != null) {
             const top = p.scratchTop();
@@ -1808,7 +1837,7 @@ const Parser = struct {
         const kw = try p.bump(); // `type`
         const name_tok = try p.expectIdentLike();
         var tp: ast.SubRange = .{ .start = 0, .end = 0 };
-        if (p.atLt()) tp = try p.parseTypeParams(true);
+        if (p.atLt()) tp = try p.parseTypeParams(.type_decl);
         _ = try p.expect(.eq, .expected_eq);
         const value = try p.parseType();
         try p.expectSemicolon();
@@ -2452,7 +2481,7 @@ const Parser = struct {
             }
         }
         var tp: ast.SubRange = .{ .start = 0, .end = 0 };
-        if (p.atLt()) tp = try p.parseTypeParams(false);
+        if (p.atLt()) tp = try p.parseTypeParams(.callable);
         if (p.curTag() != .l_paren) return error.Backtrack;
         const params = try p.parseParams();
         var ret: Node = null_node;
@@ -3351,7 +3380,7 @@ const Parser = struct {
         if (is_abstract) _ = try p.bump(); // `abstract`
         _ = try p.bump(); // `new`
         var tp: ast.SubRange = .{ .start = 0, .end = 0 };
-        if (p.atLt()) tp = try p.parseTypeParams(false);
+        if (p.atLt()) tp = try p.parseTypeParams(.callable);
         const params = try p.parseParams();
         _ = try p.expect(.arrow, .expected_arrow);
         const ret = try p.parseReturnType();
@@ -3384,7 +3413,7 @@ const Parser = struct {
     fn parseFunctionType(p: *Parser) PE!Node {
         const start_tok = p.curIdx();
         var tp: ast.SubRange = .{ .start = 0, .end = 0 };
-        if (p.atLt()) tp = try p.parseTypeParams(false);
+        if (p.atLt()) tp = try p.parseTypeParams(.callable);
         const params = try p.parseParams();
         _ = try p.expect(.arrow, .expected_arrow);
         // Past the `=>` the function type is committed — a parenthesized type

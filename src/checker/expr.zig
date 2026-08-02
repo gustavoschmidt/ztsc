@@ -134,7 +134,7 @@ pub fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             // `` `setUint${BITS[bytes]}` as const `` widened to `string`,
             // which cannot index a `DataView` — a TS7053 false positive on
             // the standard "compute the accessor name" idiom.
-            if (c.const_ctx or try c.ctxWantsTemplate(ctx)) return c.templateExprType(node);
+            if (c.const_ctx or c.isConstTypeVar(ctx) or try c.ctxWantsTemplate(ctx)) return c.templateExprType(node);
             for (c.tree.nodeRange(node)) |sub| {
                 if (sub != null_node) _ = try c.checkExprCached(sub, types.no_type);
             }
@@ -145,8 +145,25 @@ pub fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             _ = try c.checkExprCached(d.rhs, types.no_type);
             return types.any_type;
         },
-        .array_literal => return c.checkArrayLiteral(node, ctx),
-        .object_literal => return c.checkObjectLiteral(node, ctx),
+        // An array/object literal whose CONTEXTUAL type is a `const` type
+        // parameter is checked in a const context — tsc's `isConstContext`
+        // arm `isValidConstAssertionArgument(node) &&
+        // isConstTypeVariable(getContextualType(node))`. The flag then
+        // propagates to nested literals on its own (the `as const` path is
+        // the same machinery), which is how tsc's upward `isConstContext`
+        // walk through property assignments and array elements is matched.
+        .array_literal, .object_literal => {
+            const enter = !c.const_ctx and c.isConstTypeVar(ctx);
+            const prev = c.const_ctx;
+            if (enter) c.const_ctx = true;
+            defer if (enter) {
+                c.const_ctx = prev;
+            };
+            return if (c.nodeTag(node) == .array_literal)
+                c.checkArrayLiteral(node, ctx)
+            else
+                c.checkObjectLiteral(node, ctx);
+        },
         .member_expr, .optional_member_expr => return c.checkMemberExpr(node),
         .index_expr, .optional_index_expr => return c.checkIndexExpr(node, true),
         .call_expr, .call_expr_targs, .optional_call => return c.checkCallExpr(node, false, ctx),
@@ -1289,7 +1306,16 @@ pub fn checkUseBeforeAssigned(c: *Checker, sym: SymbolId, node: Node, tok: Token
 pub fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     // `[...] as const`: a readonly tuple of the (non-widened) element
     // types. Nested literals recurse because const_ctx stays set.
-    if (c.const_ctx) return c.checkConstArrayLiteral(node);
+    //
+    // tsc's `checkArrayLiteral` builds the tuple `readonly` only when the
+    // contextual type is not mutable-array-like, so a const context under a
+    // MUTABLE array target keeps a mutable tuple: `f<const T extends
+    // unknown[]>([1, 2])` is `[1, 2]`, while an unconstrained `const T` and a
+    // `readonly unknown[]` constraint both give `readonly [1, 2]`. ztsc's
+    // readonly flag is invisible to the relation, so the difference is only
+    // observable on an element WRITE — which is exactly where getting it
+    // wrong would be a false TS2540.
+    if (c.const_ctx) return c.checkConstArrayLiteral(node, !try c.ctxIsMutableArrayLike(ctx));
     const rctx = if (ctx != types.no_type) try c.resolveStructural(ctx) else types.no_type;
     // Tuple context: a direct tuple contextual type, or an inference target
     // `T` whose constraint is tuple-like. `Promise.all([a, b])` infers into
@@ -1511,20 +1537,24 @@ pub fn multiArrayLikeBranches(c: *Checker, rctx: TypeId) Error!bool {
 /// `[...] as const` -> a readonly tuple. Elements keep their literal
 /// types (de-freshened so they never widen); nested array/object
 /// literals recurse via the still-set `const_ctx`.
-pub fn checkConstArrayLiteral(c: *Checker, node: Node) Error!TypeId {
+///
+/// `ro` is false only for the mutable-array-like contextual type described in
+/// `checkArrayLiteral` — the elements are still non-widened, just writable.
+pub fn checkConstArrayLiteral(c: *Checker, node: Node, ro: bool) Error!TypeId {
+    const rof: u32 = if (ro) types.elem_flag_readonly else 0;
     var elems: std.ArrayList(types.TupleElem) = .empty;
     defer elems.deinit(c.scratch());
     for (c.tree.nodeRange(node)) |el| {
         if (el == null_node) continue;
         switch (c.nodeTag(el)) {
-            .omitted => try elems.append(c.scratch(), .{ .ty = types.undefined_type, .flags = types.elem_flag_readonly }),
+            .omitted => try elems.append(c.scratch(), .{ .ty = types.undefined_type, .flags = rof }),
             .spread_element => {
                 const st = try c.resolveStructural(try c.checkExprCached(c.tree.nodeData(el).lhs, types.no_type));
                 switch (c.ts.kind(st)) {
                     .tuple => {
                         for (0..c.ts.tupleLen(st)) |j| {
                             const e = c.ts.tupleElem(st, @intCast(j));
-                            try elems.append(c.scratch(), .{ .ty = e.ty, .flags = e.flags | types.elem_flag_readonly });
+                            try elems.append(c.scratch(), .{ .ty = e.ty, .flags = e.flags | rof });
                         }
                     },
                     // A REST element carries the whole array type, not its
@@ -1533,17 +1563,50 @@ pub fn checkConstArrayLiteral(c: *Checker, node: Node) Error!TypeId {
                     // path both assume. Storing the element here made
                     // `typeof [a, b, ...vals] as const` index to nothing,
                     // so a mapped type keyed on it collapsed to `{}`.
-                    .array => try elems.append(c.scratch(), .{ .ty = st, .flags = types.elem_flag_rest | types.elem_flag_readonly }),
-                    else => try elems.append(c.scratch(), .{ .ty = types.any_type, .flags = types.elem_flag_readonly }),
+                    .array => try elems.append(c.scratch(), .{ .ty = st, .flags = types.elem_flag_rest | rof }),
+                    else => try elems.append(c.scratch(), .{ .ty = types.any_type, .flags = rof }),
                 }
             },
             else => {
                 const et = try c.ts.regularLiteral(try c.checkExprCached(el, types.no_type));
-                try elems.append(c.scratch(), .{ .ty = et, .flags = types.elem_flag_readonly });
+                try elems.append(c.scratch(), .{ .ty = et, .flags = rof });
             },
         }
     }
     return c.ts.makeTuple(elems.items);
+}
+
+/// tsc's `isMutableArrayLikeType` over every constituent of `ctx` (its
+/// `someType(contextualType, …)`): a mutable `T[]`, a tuple whose elements
+/// are writable, or a type parameter whose constraint is one. Only consulted
+/// inside a const context, so it costs nothing on the ordinary path.
+pub fn ctxIsMutableArrayLike(c: *Checker, ctx: TypeId) Error!bool {
+    return c.ctxIsMutableArrayLikeAt(ctx, 0);
+}
+
+pub fn ctxIsMutableArrayLikeAt(c: *Checker, ctx: TypeId, depth: u32) Error!bool {
+    if (ctx == types.no_type or depth > 3) return false;
+    const t = try c.resolveStructural(ctx);
+    switch (c.ts.kind(t)) {
+        .array => return !c.ts.arrayIsReadonly(t),
+        .tuple => {
+            for (0..c.ts.tupleLen(t)) |i| {
+                if (c.ts.tupleElem(t, @intCast(i)).readonly()) return false;
+            }
+            return true;
+        },
+        .union_type => {
+            for (try c.memberList(t)) |m| {
+                if (try c.ctxIsMutableArrayLikeAt(m, depth + 1)) return true;
+            }
+            return false;
+        },
+        .type_param => {
+            const con = try c.typeParamConstraint(c.ts.typeParamSymbol(t));
+            return c.ctxIsMutableArrayLikeAt(con, depth + 1);
+        },
+        else => return false,
+    }
 }
 
 /// Collect the free type-param symbols reachable in `t` (structural walk,
@@ -1751,6 +1814,12 @@ pub fn paramWantsLiteralCtx(c: *Checker, pt: TypeId) Error!bool {
 
 pub fn paramWantsLiteralCtxAt(c: *Checker, pt: TypeId, depth: u8) Error!bool {
     const r = try c.resolveStructural(pt);
+    // A `const` type parameter always wants the contextual read: that IS the
+    // feature. Handing the parameter down is what puts the argument in a
+    // const context (`checkExpr`'s array/object-literal arm), and an
+    // unconstrained `const T` has no constraint for the literal-ish test
+    // below to look at.
+    if (c.isConstTypeVar(r)) return true;
     // An INTERSECTION parameter (`o: { elbowed?: T; … } & Opts`) wants the
     // same per-property contextual type as its object constituents do:
     // `ctxPropType` already has an `.intersection` arm that finds `T`, but
@@ -1783,6 +1852,10 @@ pub fn paramWantsLiteralCtxAt(c: *Checker, pt: TypeId, depth: u8) Error!bool {
     for (0..c.ts.objectPropCount(r)) |i| {
         const p = c.ts.objectProp(r, @intCast(i));
         const pr = try c.resolveStructural(p.ty);
+        // A `const` type parameter under a property (`x: { v: T }`) is the
+        // nested half of the same rule: the property's contextual type is
+        // what puts `{ v: [1, 2] }`'s element list in a const context.
+        if (c.isConstTypeVar(pr)) return true;
         if (c.ts.kind(pr) != .type_param) continue;
         const con = try c.typeParamConstraint(c.ts.typeParamSymbol(pr));
         if (con == types.no_type) continue;
