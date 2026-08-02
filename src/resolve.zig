@@ -170,7 +170,14 @@ pub fn scanReferences(alloc: Allocator, src: []const u8) Error![]RefDirective {
             const line = src[start..i];
             // Triple-slash only.
             if (line.len >= 3 and line[2] == '/') {
-                if (parseReference(line[3..])) |d| try out.append(alloc, d);
+                if (parseReference(line[3..])) |d| {
+                    // `spec` is always a subslice of `src` (the scanner never
+                    // copies), so its byte offset is a pointer difference —
+                    // the anchor a directive diagnostic (TS2688) reports at.
+                    var with_pos = d;
+                    with_pos.pos = @intCast(@intFromPtr(d.spec.ptr) - @intFromPtr(src.ptr));
+                    try out.append(alloc, with_pos);
+                }
             }
             continue;
         }
@@ -611,7 +618,15 @@ pub const RefKind = enum { path, types };
 
 /// A `/// <reference path=… />` / `<reference types=… />` directive; `spec`
 /// slices into the source. `lib=` references are ignored (built-in libs).
-pub const RefDirective = struct { kind: RefKind, spec: []const u8 };
+pub const RefDirective = struct {
+    kind: RefKind,
+    spec: []const u8,
+    /// Byte offset of `spec[0]` in the scanned source — the first character
+    /// *inside* the opening quote, which is where tsc anchors the directive's
+    /// own diagnostic (TS2688). Filled by `scanReferences`; 0 when a caller
+    /// builds a directive by hand (resolution never reads it).
+    pos: u32 = 0,
+};
 
 // =========================================================================
 // private implementation
@@ -2010,6 +2025,38 @@ test "ResolveCache: reference directives and roots canonicalize to one path" {
     try testing.expectEqualStrings(canonical, try off.canonicalPath(io, alloc, d, "node_modules/@types/pkg/index.d.ts"));
     const off_ref = try off.resolveRef(io, alloc, d, "node_modules/.pnpm/other@1/node_modules/other/index.d.ts", .{ .kind = .types, .spec = "pkg" });
     try testing.expectEqualStrings(canonical, off_ref.?);
+}
+
+// (b2) `scanReferences` reports each directive's name span, which is where the
+// unresolved-directive diagnostic (TS2688) lands — one character past the
+// opening quote, name length wide, whatever precedes it on the line.
+test "scanReferences: kind, spec and name offset" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\/// <reference types="nope" />
+        \\/// <reference types='@scope/nope' />
+        \\   /// <reference path="./other.d.ts" />
+        \\/// <reference lib="es2015" />
+        \\export const x = 1;
+        \\/// <reference types="after-first-token" />
+        \\
+    ;
+    const refs = try scanReferences(arena.allocator(), src);
+    try testing.expectEqual(@as(usize, 3), refs.len);
+    try testing.expectEqual(RefKind.types, refs[0].kind);
+    try testing.expectEqualStrings("nope", refs[0].spec);
+    // `/// <reference types="` is 22 characters, so the name starts at byte 22
+    // (column 23, the oracle's anchor).
+    try testing.expectEqual(@as(u32, 22), refs[0].pos);
+    try testing.expectEqualStrings("nope", src[refs[0].pos..][0..refs[0].spec.len]);
+    try testing.expectEqualStrings("@scope/nope", refs[1].spec);
+    try testing.expectEqualStrings("@scope/nope", src[refs[1].pos..][0..refs[1].spec.len]);
+    // Indentation shifts the offset; a `path=` directive keeps its own kind.
+    try testing.expectEqual(RefKind.path, refs[2].kind);
+    try testing.expectEqualStrings("./other.d.ts", src[refs[2].pos..][0..refs[2].spec.len]);
+    // `lib=` is not a program input here, and nothing past the first real token
+    // is a directive at all.
 }
 
 // (c) resolveJsonModule: a `*.json` specifier resolves to the JSON file only

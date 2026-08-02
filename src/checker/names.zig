@@ -11,6 +11,7 @@ const types = @import("../types.zig");
 const source = @import("../source.zig");
 const libs = @import("../libs.zig");
 const modules = @import("../modules.zig");
+const paths = @import("../paths.zig");
 const ZeroPagedArray = @import("../zeropage.zig").ZeroPagedArray;
 
 const Atom = intern.Atom;
@@ -153,6 +154,43 @@ pub fn suggestName(c: *Checker, a: Atom, from: ScopeId, want_value: bool) ?Atom 
         s = c.bind.scope_parents[s];
     }
     return best;
+}
+
+/// Report a name that resolved to nothing at `tok`, choosing tsc's code the
+/// way `getCannotFindNameDiagnosticForName` does: the five globals `@types/node`
+/// would have declared get the node-flavoured TS2591 (TS2580 when
+/// `compilerOptions.types` holds the `"*"` wildcard, tsc's "no explicit types
+/// list to add 'node' to" phrasing), everything else the generic TS2304.
+///
+/// Callers keep ownership of the spelling-suggestion arm (TS2552), which wins
+/// over both — tsc tries `getSuggestedSymbolForNonexistentSymbol` before it
+/// falls back to the not-found message, so `require` with `Required` in scope
+/// is TS2552, not TS2591.
+pub fn reportNameNotFound(c: *Checker, tok: ast.TokenIndex) Error!void {
+    const text = c.tokenText(tok);
+    if (!paths.isNodeGlobalName(text)) {
+        try c.diagFmt(2304, c.tokSpan(tok), "Cannot find name '{s}'.", .{text});
+    } else if (c.prog.types_wildcard) {
+        try c.diagFmt(2580, c.tokSpan(tok), "Cannot find name '{s}'. Do you need to install type definitions for node? Try `npm i --save-dev @types/node`.", .{text});
+    } else {
+        try c.diagFmt(2591, c.tokSpan(tok), "Cannot find name '{s}'. Do you need to install type definitions for node? Try `npm i --save-dev @types/node` and then add 'node' to the types field in your tsconfig.", .{text});
+    }
+}
+
+/// Report an unresolved module specifier at `spec_tok` with tsc's code for it
+/// (`getCannotResolveModuleNameErrorForSpecificModule`): a specifier naming a
+/// Node core module is the *name*-flavoured TS2591/TS2580 — tsc really does
+/// print "Cannot find name 'node:tty'" for a missing `@types/node` — and
+/// anything else is the generic TS2307.
+pub fn reportModuleNotFound(c: *Checker, spec_tok: ast.TokenIndex) Error!void {
+    const spec = Checker.stripQuotes(c.tokenText(spec_tok));
+    if (!paths.isNodeCoreModule(spec)) {
+        try c.diagFmt(2307, c.tokSpan(spec_tok), "Cannot find module '{s}' or its corresponding type declarations.", .{spec});
+    } else if (c.prog.types_wildcard) {
+        try c.diagFmt(2580, c.tokSpan(spec_tok), "Cannot find name '{s}'. Do you need to install type definitions for node? Try `npm i --save-dev @types/node`.", .{spec});
+    } else {
+        try c.diagFmt(2591, c.tokSpan(spec_tok), "Cannot find name '{s}'. Do you need to install type definitions for node? Try `npm i --save-dev @types/node` and then add 'node' to the types field in your tsconfig.", .{spec});
+    }
 }
 
 pub fn suggestProp(c: *Checker, a: Atom, obj: TypeId) ?Atom {

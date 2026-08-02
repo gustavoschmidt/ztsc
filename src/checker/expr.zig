@@ -1214,7 +1214,7 @@ pub fn checkIdentifier(c: *Checker, node: Node) Error!TypeId {
             if (c.suggestName(a, c.cur_scope, true)) |sugg| {
                 try c.diagFmt(2552, c.tokSpan(tok), "Cannot find name '{s}'. Did you mean '{s}'?", .{ c.tokenText(tok), c.atomText(sugg) });
             } else {
-                try c.diagFmt(2304, c.tokSpan(tok), "Cannot find name '{s}'.", .{c.tokenText(tok)});
+                try c.reportNameNotFound(tok);
             }
             return types.error_type;
         },
@@ -3432,7 +3432,7 @@ pub fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
                 },
                 .wrong_space => return types.error_type,
                 .none => {
-                    try c.diagFmt(2304, c.tokSpan(tok), "Cannot find name '{s}'.", .{c.tokenText(tok)});
+                    try c.reportNameNotFound(tok);
                     return types.error_type;
                 },
             }

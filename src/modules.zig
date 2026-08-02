@@ -9,9 +9,14 @@
 //! Design decisions:
 //!
 //! - **Nonexistent module → TS2307** at the module-specifier string of the
-//!   import/export statement (one per statement). A module that resolved but
-//!   turned out to be undeclared JavaScript from `node_modules` gets TS7016
-//!   at the same anchor, under `noImplicitAny`.
+//!   import/export statement (one per statement) — except a Node core module,
+//!   whose absence tsc blames on a missing `@types/node` (TS2591, worded as a
+//!   *name*). A module that resolved but turned out to be undeclared
+//!   JavaScript from `node_modules` gets TS7016 at the same anchor, under
+//!   `noImplicitAny`.
+//! - **Unresolvable `/// <reference types="X" />` → TS2688** at the directive's
+//!   name. Resolution happens during discovery, so the misses arrive on
+//!   `ProgFile.type_ref_misses` and the linker only replays them.
 //! - **Linking is serial and pure**: after all files are bound (parallel
 //!   phases), `link` builds per-file sealed tables:
 //!   - a flattened **export table** (name → final `Target`), with
@@ -82,6 +87,11 @@ pub const LinkOpts = struct {
     /// unresolved-specifier diagnostic for a side-effect-only import. See
     /// `reportUnresolvedModules`.
     no_unchecked_side_effect_imports: bool = false,
+    /// tsconfig `types` contains the `"*"` wildcard (tsc's `usesWildcardTypes`).
+    /// Only reachable effect: the node-flavoured not-found diagnostics drop
+    /// their "and then add 'node' to the types field" tail and become TS2580
+    /// instead of TS2591 — with a wildcard list there is no list to add to.
+    types_wildcard: bool = false,
 };
 
 /// Serial wavefront: load, parse, bind and resolve transitively from
@@ -172,6 +182,7 @@ pub fn buildProgram(
 
         // Triple-slash `/// <reference>` directives pull extra files into the
         // program — not import bindings, just program inputs.
+        var type_ref_misses: std.ArrayList(TypeRefMiss) = .empty;
         for (try resolve.scanReferences(scratch, bytes)) |ref| {
             if (try rcache.resolveRef(io, scratch, dir, path, ref)) |resolved| {
                 const stable = try arena.dupe(u8, resolved);
@@ -180,6 +191,8 @@ pub fn buildProgram(
                     gop.value_ptr.* = @intCast(pending.items.len);
                     try pending.append(scratch, stable);
                 }
+            } else if (ref.kind == .types) {
+                try type_ref_misses.append(arena, typeRefMiss(ref));
             }
         }
 
@@ -206,6 +219,7 @@ pub fn buildProgram(
                 .atoms = try arena.dupe(Atom, spec_atoms.items),
                 .files = try arena.dupe(FileId, spec_files.items),
             },
+            .type_ref_misses = try type_ref_misses.toOwnedSlice(arena),
         });
         spec_atoms.deinit(scratch);
         spec_files.deinit(scratch);
@@ -226,6 +240,7 @@ pub fn buildProgram(
             .constit_keys = lr.constit_keys,
             .constit_vals = lr.constit_vals,
             .export_equals_atom = lr.export_equals_atom,
+            .types_wildcard = link_opts.types_wildcard,
             .jsx_runtime_file = jsx_runtime_fid,
         },
         .load_failures = try arena.dupe(BuildDiag, failures.items),
@@ -257,6 +272,7 @@ pub fn link(
         .allow_synthetic_default = link_opts.allow_synthetic_default,
         .no_implicit_any = link_opts.no_implicit_any,
         .no_unchecked_side_effect_imports = link_opts.no_unchecked_side_effect_imports,
+        .types_wildcard = link_opts.types_wildcard,
         .atom_export_equals = interner.intern(io, gpa, "export=") catch return Error.OutOfMemory,
         .state = try scratch.alloc(u8, files.len),
         .tables = try scratch.alloc(std.AutoArrayHashMapUnmanaged(Atom, Target), files.len),
@@ -278,6 +294,7 @@ pub fn link(
     const out = try arena.alloc(FileLinks, files.len);
     for (0..files.len) |i| {
         const fid: FileId = @intCast(i);
+        try l.reportUnresolvedTypeRefs(fid);
         try l.reportUnresolvedModules(fid);
         try l.reportModuleGrammar(fid);
 
@@ -433,6 +450,11 @@ pub const Program = struct {
     /// affected values still type as `any`. Defaults on (strict semantics); the
     /// driver sets it from the tsconfig. See `tsconfig.Config.no_implicit_any`.
     no_implicit_any: bool = true,
+    /// Effective `types: [… "*" …]` (tsc's `usesWildcardTypes`). Picks TS2580
+    /// over TS2591 for the node-flavoured not-found diagnostics; the checker
+    /// reads it in `reportNameNotFound`/`reportModuleNotFound`. See
+    /// `tsconfig.Config.types_wildcard`.
+    types_wildcard: bool = false,
     /// The `<jsxImportSource>/jsx-runtime` module under the automatic JSX
     /// runtime (`jsx: "react-jsx"`), or `no_file`. tsc reads the `JSX` namespace
     /// off this module's exports there; the checker falls back to it when no
@@ -487,12 +509,31 @@ pub const Program = struct {
 };
 
 /// One program file: sealed parse/bind outputs plus its specifier map.
+/// A `/// <reference types="X" />` in a program file whose type-reference
+/// directive resolved to nothing. `span` is the directive's name, quotes
+/// excluded — where tsc anchors TS2688.
+pub const TypeRefMiss = struct { name: []const u8, span: Span };
+
+/// Turn an unresolved `types=` directive into its TS2688 record. `spec` and
+/// `pos` both come from `resolve.scanReferences`, which slices the live source
+/// buffer, so the name needs no copy: the buffer outlives the program.
+pub fn typeRefMiss(ref: resolve.RefDirective) TypeRefMiss {
+    return .{
+        .name = ref.spec,
+        .span = .{ .start = ref.pos, .end = ref.pos + @as(u32, @intCast(ref.spec.len)) },
+    };
+}
+
 pub const ProgFile = struct {
     path: []const u8,
     src: []const u8,
     tree: *const Ast,
     bind: *const Bind,
     specs: SpecMap = .{},
+    /// Unresolved `types=` reference directives, in source order. Recorded by
+    /// the driver that discovered the file (only it runs resolution); replayed
+    /// as TS2688 by `Linker.reportUnresolvedTypeRefs`.
+    type_ref_misses: []const TypeRefMiss = &.{},
 };
 
 /// Sealed link tables for one file (read-only during check).
@@ -1030,6 +1071,8 @@ const Linker = struct {
     no_implicit_any: bool = true,
     /// Effective `noUncheckedSideEffectImports`; gates TS2882 (see `LinkOpts`).
     no_unchecked_side_effect_imports: bool = false,
+    /// Effective `types: ["*"]`; picks TS2580 over TS2591 (see `LinkOpts`).
+    types_wildcard: bool = false,
     /// Reserved key under which a module's `export = X` target is stored in its
     /// export/ambient table (`export=` can never be a real export name). Skipped
     /// by the namespace-object builders and `export *` merge.
@@ -1708,9 +1751,36 @@ const Linker = struct {
             if (side_effect) {
                 if (!l.no_unchecked_side_effect_imports) continue;
                 try l.diag(file, 2882, l.tokSpan(file, mod_tok), "Cannot find module or type declarations for side-effect import of '{s}'.", .{stripped});
-            } else {
+            } else if (!paths.isNodeCoreModule(stripped)) {
                 try l.diag(file, 2307, l.tokSpan(file, mod_tok), "Cannot find module '{s}' or its corresponding type declarations.", .{stripped});
+            } else if (l.types_wildcard) {
+                try l.diag(file, 2580, l.tokSpan(file, mod_tok), "Cannot find name '{s}'. Do you need to install type definitions for node? Try `npm i --save-dev @types/node`.", .{stripped});
+            } else {
+                // A Node core module that resolved to nothing is a missing
+                // `@types/node`, and tsc says so — with the *name* wording, at
+                // the specifier. Only for the exact core-module list
+                // (`paths.isNodeCoreModule`); `bun:sqlite` and `node:nosuch`
+                // stay TS2307. A side-effect import keeps TS2882: tsgo passes
+                // its own message down and never consults the node list.
+                try l.diag(file, 2591, l.tokSpan(file, mod_tok), "Cannot find name '{s}'. Do you need to install type definitions for node? Try `npm i --save-dev @types/node` and then add 'node' to the types field in your tsconfig.", .{stripped});
             }
+        }
+    }
+
+    /// TS2688 for a `/// <reference types="X" />` whose target resolved to
+    /// nothing, at the directive's own name span (tsc anchors it just inside
+    /// the opening quote). The misses were recorded by whichever driver
+    /// discovered the file — resolution is a filesystem walk and does not
+    /// belong in the linker — so this is a pure replay in source order.
+    ///
+    /// Unlike the tsconfig `types` list, whose unresolved entries tsc reports
+    /// as a file-less global diagnostic (still an under-report here), these are
+    /// anchored in a real file, which also means `skipLibCheck` suppresses the
+    /// ones in a `.d.ts` — exactly what the oracle does, and what the driver's
+    /// whole-file `.d.ts` suppression already delivers.
+    fn reportUnresolvedTypeRefs(l: *Linker, file: FileId) Error!void {
+        for (l.files[file].type_ref_misses) |miss| {
+            try l.diag(file, 2688, miss.span, "Cannot find type definition file for '{s}'.", .{miss.name});
         }
     }
 
