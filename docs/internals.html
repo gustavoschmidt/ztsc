@@ -95,17 +95,17 @@
 
       <rect class="box" x="205" y="98" width="180" height="42"/>
       <text class="t12" x="217" y="116">load <tspan class="mut">(mmap)</tspan></text>
-      <text class="t11 mut" x="217" y="131">7.5 ms · 377 MB/s</text>
+      <text class="t11 mut" x="217" y="131">6.9 ms · 410 MB/s</text>
       <line class="flow" x1="295" y1="140" x2="295" y2="166" marker-end="url(#arr)"/>
 
       <rect class="box" x="205" y="168" width="180" height="42"/>
       <text class="t12" x="217" y="186">parse <tspan class="mut">→ tokens + SoA AST</tspan></text>
-      <text class="t11 mut" x="217" y="201">24.9 ms · then sealed</text>
+      <text class="t11 mut" x="217" y="201">26.5 ms · then sealed</text>
       <line class="flow" x1="295" y1="210" x2="295" y2="236" marker-end="url(#arr)"/>
 
       <rect class="box" x="205" y="238" width="180" height="42"/>
       <text class="t12" x="217" y="256">bind <tspan class="mut">→ symbols, flow</tspan></text>
-      <text class="t11 mut" x="217" y="271">36.0 ms · then sealed</text>
+      <text class="t11 mut" x="217" y="271">32.5 ms · then sealed</text>
 
       <!-- discovery loop -->
       <path class="flow" d="M 205,259 C 186,259 186,119 202,119" marker-end="url(#arr)"/>
@@ -116,7 +116,7 @@
       <line class="flow" x1="414" y1="184" x2="452" y2="184" marker-end="url(#arr)"/>
       <rect class="box" x="456" y="156" width="94" height="56"/>
       <text class="t12" x="503" y="180" text-anchor="middle">resolve</text>
-      <text class="t11 mut" x="503" y="196" text-anchor="middle">1.7 ms</text>
+      <text class="t11 mut" x="503" y="196" text-anchor="middle">1.8 ms</text>
       <line class="flow" x1="550" y1="184" x2="574" y2="184" marker-end="url(#arr)"/>
       <rect class="box" x="578" y="156" width="94" height="56"/>
       <text class="t12" x="625" y="180" text-anchor="middle">link</text>
@@ -143,13 +143,13 @@
       <text class="t12" x="742" y="310">checker 3</text>
       <text class="t11 mut" x="742" y="326">own type store + caches</text>
 
-      <text class="t11 mut" x="822" y="366" text-anchor="middle">check · 18.8 ms aggregate · --checkers=N, default 4</text>
+      <text class="t11 mut" x="822" y="366" text-anchor="middle">check · 17.3 ms aggregate · --checkers=N, default 4</text>
       <text class="t11 mut" x="822" y="22" text-anchor="middle">files partitioned by cost, read sealed data lock-free</text>
     </svg>
     </div>
     <figcaption>Phase timings from one <code>--timing</code> run on the multi corpus (93k lines,
     re-measured 2026-08-02 with the real lib — sharded into 12 blobs — loaded):
-    <strong>30.2&thinsp;ms end to end</strong>, tsconfig loading (the <code>config</code> phase,
+    <strong>27.4&thinsp;ms end to end</strong>, tsconfig loading (the <code>config</code> phase,
     now timed too) 0.04&thinsp;ms of it.
     Per-phase ms are aggregate time-in-phase summed across the 10-worker pool, so the overlapping
     front-end phases sum to more than the wall; bind is the largest single phase. Diagnostics are
