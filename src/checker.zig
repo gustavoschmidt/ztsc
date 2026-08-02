@@ -710,6 +710,20 @@ pub const Checker = struct {
     /// Ambient-module namespace-object cache, keyed by ambient_exports index.
     ambient_ns_types: std.AutoHashMapUnmanaged(u32, TypeId) = .empty,
     /// (source << 32 | target) -> Relation.
+    ///
+    /// Its SIZE is traversal-order dependent, and deliberately so: the `2`
+    /// mark `relate` writes means "in progress, assume related", and a
+    /// re-entry answered from it never recurses. Settle a pair before meeting
+    /// it again and its subtree is walked and memoized; meet it while its own
+    /// frame is live and the subtree is never visited. The verdicts are the
+    /// same either way — this is tsc's `Ternary.Maybe` and the only thing that
+    /// terminates a recursive type — but the SET of pairs reached is not, so
+    /// `relation cache entries` (and `inst cache hits`, which counts the
+    /// substitutions those extra subtrees re-request) move run to run wherever
+    /// the traversal order does. Under the parallel front end it does: atom
+    /// ids are the sort key every declaration and property table is reached
+    /// through. See bench/repeat_sweep.sh, which pins both counters under a
+    /// serial front end and documents why it cannot under a parallel one.
     relation: std.AutoHashMapUnmanaged(u64, u8) = .empty,
     /// ref TypeId -> expanded structural type.
     expansions: std.AutoHashMapUnmanaged(TypeId, TypeId) = .empty,
