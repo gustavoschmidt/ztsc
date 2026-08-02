@@ -34,6 +34,7 @@ const aliasInstance = @import("instantiate.zig").aliasInstance;
 const atom = Checker.atom;
 const baseConstraintOf = @import("expr.zig").baseConstraintOf;
 const diagAlreadyFiled = Checker.diagAlreadyFiled;
+const elaborate = @import("elaborate.zig");
 const enumAssignable = @import("enums.zig").enumAssignable;
 const indexedAccessType = @import("typenode.zig").indexedAccessType;
 const instantiate = @import("enums.zig").instantiate;
@@ -3397,15 +3398,19 @@ pub fn tryReportMissingProps(c: *Checker, src_t: TypeId, target: TypeId, span: S
         return true;
     }
     if (missing.items.len > 1) {
-        var names: std.Io.Writer.Allocating = .init(c.scratch());
-        defer names.deinit();
-        for (missing.items, 0..) |m, i| {
-            if (i > 0) names.writer.writeAll(", ") catch return error.OutOfMemory;
-            names.writer.print("{s}", .{c.atomText(m)}) catch return error.OutOfMemory;
-        }
-        try c.diagFmt(2739, span, "Type '{s}' is missing the following properties from type '{s}': {s}", .{
-            try c.typeToString(src_t), try c.typeToString(target), names.written(),
-        });
+        // Past five names tsc abbreviates the list and reports TS2740 rather
+        // than TS2739; the elaboration chain renders the same list, so both
+        // share one formatter (`elaborate.missingList`).
+        try c.diagFmt(
+            elaborate.missingPropsCode(missing.items.len),
+            span,
+            "Type '{s}' is missing the following properties from type '{s}': {s}",
+            .{
+                try c.typeToString(src_t),
+                try c.typeToString(target),
+                try elaborate.missingList(c, missing.items),
+            },
+        );
         return true;
     }
     return false;
@@ -3425,13 +3430,20 @@ pub fn reportNotAssignable(c: *Checker, code: u16, src_t: TypeId, target: TypeId
             return;
         }
     }
-    const msg_fmt = "Type '{s}' is not assignable to type '{s}'.";
+    // The derivation chain tsc prints under the headline. Reconstructed by
+    // re-walking the (already failed) relation — nothing runs on the success
+    // path, so the relation stays allocation-free. Empty when the failure has
+    // no structural story (`elaborate.zig`). Computed BEFORE `diagFmt` so the
+    // whole message is one interpolation.
+    const chain = if (c.diagAlreadyFiled(code, span)) "" else try elaborate.chainText(c, src_t, target);
     if (code == 2345) {
-        try c.diagFmt(2345, span, "Argument of type '{s}' is not assignable to parameter of type '{s}'.", .{
-            try c.typeToString(src_t), try c.typeToString(target),
+        try c.diagFmt(2345, span, "Argument of type '{s}' is not assignable to parameter of type '{s}'.{s}", .{
+            try c.typeToString(src_t), try c.typeToString(target), chain,
         });
     } else {
-        try c.diagFmt(code, span, msg_fmt, .{ try c.typeToString(src_t), try c.typeToString(target) });
+        try c.diagFmt(code, span, "Type '{s}' is not assignable to type '{s}'.{s}", .{
+            try c.typeToString(src_t), try c.typeToString(target), chain,
+        });
     }
 }
 

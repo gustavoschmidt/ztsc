@@ -889,3 +889,404 @@ test "assignability matrix: intrinsics x intrinsics (table test)" {
     }
     try testing.expectEqual(expected_errors, got_2322);
 }
+
+// ---------------------------------------------------------------------------
+// error elaboration chains (checker/elaborate.zig)
+//
+// The conformance snapshots pin (code, line) only, so the chain TEXT needs its
+// own oracle. Every string below was copied verbatim from tsgo 7.0.2 run on the
+// same source (`--strict --noEmit --pretty false`); nothing here was invented.
+// Where ztsc's TYPE PRINTER still differs from tsgo (unquoted non-identifier
+// property names, `[x: string]` for a declared `[k: string]`, an optional
+// property printed without `| undefined`, the `new () => T` and method
+// shorthands) only the chain is asserted, via `expectChain` — those are
+// separate, pre-existing divergences on the headline that this feature does
+// not touch.
+// ---------------------------------------------------------------------------
+
+/// The whole message of the single diagnostic `src` must produce.
+fn expectMsg(src: []const u8, expected: []const u8) !void {
+    var t = try TestCheck.init(src);
+    defer t.deinit();
+    if (t.result.diagnostics.len != 1) {
+        std.debug.print("--- source: {s}\n--- got {d} diagnostics:\n", .{ src, t.result.diagnostics.len });
+        for (t.result.diagnostics) |dd| std.debug.print("  TS{d} {s}\n", .{ dd.code, dd.msg });
+        return error.TestExpectedEqual;
+    }
+    try testing.expectEqualStrings(expected, t.result.diagnostics[0].msg);
+}
+
+/// Everything below the headline: the elaboration chain alone.
+fn expectChain(src: []const u8, expected: []const u8) !void {
+    var t = try TestCheck.init(src);
+    defer t.deinit();
+    if (t.result.diagnostics.len != 1) {
+        std.debug.print("--- source: {s}\n--- got {d} diagnostics:\n", .{ src, t.result.diagnostics.len });
+        for (t.result.diagnostics) |dd| std.debug.print("  TS{d} {s}\n", .{ dd.code, dd.msg });
+        return error.TestExpectedEqual;
+    }
+    const msg = t.result.diagnostics[0].msg;
+    const nl = std.mem.indexOfScalar(u8, msg, '\n') orelse {
+        std.debug.print("--- source: {s}\n--- no chain in: {s}\n", .{ src, msg });
+        return error.TestExpectedEqual;
+    };
+    try testing.expectEqualStrings(expected, msg[nl + 1 ..]);
+}
+
+/// The diagnostic must carry NO chain (a bare one-line message).
+fn expectNoChain(src: []const u8) !void {
+    var t = try TestCheck.init(src);
+    defer t.deinit();
+    for (t.result.diagnostics) |d| {
+        if (std.mem.indexOfScalar(u8, d.msg, '\n') != null) {
+            std.debug.print("--- source: {s}\n--- unexpected chain: {s}\n", .{ src, d.msg });
+            return error.TestExpectedEqual;
+        }
+    }
+}
+
+test "elaboration: one property level keeps tsc's singular phrasing" {
+    try expectMsg(
+        \\declare const s: { a: number };
+        \\const t: { a: string } = s;
+    ,
+        \\Type '{ a: number; }' is not assignable to type '{ a: string; }'.
+        \\  Types of property 'a' are incompatible.
+        \\    Type 'number' is not assignable to type 'string'.
+    );
+}
+
+test "elaboration: nested properties collapse into a dotted path" {
+    try expectMsg(
+        \\declare const s: { a: { b: number } };
+        \\const t: { a: { b: string } } = s;
+    ,
+        \\Type '{ a: { b: number; }; }' is not assignable to type '{ a: { b: string; }; }'.
+        \\  The types of 'a.b' are incompatible between these types.
+        \\    Type 'number' is not assignable to type 'string'.
+    );
+    try expectMsg(
+        \\declare const s: { a: { b: { c: number } } };
+        \\const t: { a: { b: { c: string } } } = s;
+    ,
+        \\Type '{ a: { b: { c: number; }; }; }' is not assignable to type '{ a: { b: { c: string; }; }; }'.
+        \\  The types of 'a.b.c' are incompatible between these types.
+        \\    Type 'number' is not assignable to type 'string'.
+    );
+}
+
+test "elaboration: a non-identifier path segment is bracketed and quoted" {
+    try expectChain(
+        \\declare const s: { a: { "c-d": number } };
+        \\const t: { a: { "c-d": string } } = s;
+    ,
+        \\  The types of 'a["c-d"]' are incompatible between these types.
+        \\    Type 'number' is not assignable to type 'string'.
+    );
+    // A numeric name stays bare (tsgo brackets only what its symbol printer
+    // quotes, and it does not quote numbers).
+    try expectMsg(
+        \\declare const s: { a: { 0: number } };
+        \\const t: { a: { 0: string } } = s;
+    ,
+        \\Type '{ a: { 0: number; }; }' is not assignable to type '{ a: { 0: string; }; }'.
+        \\  The types of 'a.0' are incompatible between these types.
+        \\    Type 'number' is not assignable to type 'string'.
+    );
+}
+
+test "elaboration: parameters report contravariantly with both names" {
+    try expectMsg(
+        \\declare const f: (foo: number) => void;
+        \\const g: (bar: string) => void = f;
+    ,
+        \\Type '(foo: number) => void' is not assignable to type '(bar: string) => void'.
+        \\  Types of parameters 'foo' and 'bar' are incompatible.
+        \\    Type 'string' is not assignable to type 'number'.
+    );
+    try expectMsg(
+        \\declare const f: { go: (x: number) => void };
+        \\const g: { go: (x: string) => void } = f;
+    ,
+        \\Type '{ go: (x: number) => void; }' is not assignable to type '{ go: (x: string) => void; }'.
+        \\  Types of property 'go' are incompatible.
+        \\    Type '(x: number) => void' is not assignable to type '(x: string) => void'.
+        \\      Types of parameters 'x' and 'x' are incompatible.
+        \\        Type 'string' is not assignable to type 'number'.
+    );
+}
+
+test "elaboration: return types render as a call in the path" {
+    try expectMsg(
+        \\declare const f: { go: () => number };
+        \\const g: { go: () => string } = f;
+    ,
+        \\Type '{ go: () => number; }' is not assignable to type '{ go: () => string; }'.
+        \\  The types returned by 'go()' are incompatible between these types.
+        \\    Type 'number' is not assignable to type 'string'.
+    );
+    // With parameters the call prints as `(...)`.
+    try expectMsg(
+        \\declare const f: { go: (a: number, b: number) => number };
+        \\const g: { go: (a: number, b: number) => string } = f;
+    ,
+        \\Type '{ go: (a: number, b: number) => number; }' is not assignable to type '{ go: (a: number, b: number) => string; }'.
+        \\  The types returned by 'go(...)' are incompatible between these types.
+        \\    Type 'number' is not assignable to type 'string'.
+    );
+    // A call that is not the FIRST segment keeps the "The types of" headline.
+    try expectMsg(
+        \\declare const f: { a: { b: () => number } };
+        \\const g: { a: { b: () => string } } = f;
+    ,
+        \\Type '{ a: { b: () => number; }; }' is not assignable to type '{ a: { b: () => string; }; }'.
+        \\  The types of 'a.b()' are incompatible between these types.
+        \\    Type 'number' is not assignable to type 'string'.
+    );
+    // ... and properties continue past the call.
+    try expectMsg(
+        \\declare const f: { go: () => { b: { c: number } } };
+        \\const g: { go: () => { b: { c: string } } } = f;
+    ,
+        \\Type '{ go: () => { b: { c: number; }; }; }' is not assignable to type '{ go: () => { b: { c: string; }; }; }'.
+        \\  The types returned by 'go().b.c' are incompatible between these types.
+        \\    Type 'number' is not assignable to type 'string'.
+    );
+}
+
+test "elaboration: a lone return message is elided, as tsc marks it" {
+    try expectMsg(
+        \\declare const f: () => number;
+        \\const g: () => string = f;
+    ,
+        \\Type '() => number' is not assignable to type '() => string'.
+        \\  Type 'number' is not assignable to type 'string'.
+    );
+    // A run may not open with a return, so the outer return closes at once
+    // and the properties below it form their own path.
+    try expectMsg(
+        \\declare const f: () => { b: { c: number } };
+        \\const g: () => { b: { c: string } } = f;
+    ,
+        \\Type '() => { b: { c: number; }; }' is not assignable to type '() => { b: { c: string; }; }'.
+        \\  Type '{ b: { c: number; }; }' is not assignable to type '{ b: { c: string; }; }'.
+        \\    The types of 'b.c' are incompatible between these types.
+        \\      Type 'number' is not assignable to type 'string'.
+    );
+    // Nor may a return follow a return.
+    try expectMsg(
+        \\declare const f: { go: () => () => number };
+        \\const g: { go: () => () => string } = f;
+    ,
+        \\Type '{ go: () => () => number; }' is not assignable to type '{ go: () => () => string; }'.
+        \\  The types returned by 'go()' are incompatible between these types.
+        \\    Type '() => number' is not assignable to type '() => string'.
+        \\      Type 'number' is not assignable to type 'string'.
+    );
+}
+
+test "elaboration: construct signatures wrap the path in a `new` call" {
+    try expectChain(
+        \\declare const c: { mk: { new (): { b: number } } };
+        \\const d: { mk: { new (): { b: string } } } = c;
+    ,
+        \\  The types returned by '(new mk()).b' are incompatible between these types.
+        \\    Type 'number' is not assignable to type 'string'.
+    );
+    try expectChain(
+        \\declare const c: { mk: { new (q: number): { b: number } } };
+        \\const d: { mk: { new (q: number): { b: string } } } = c;
+    ,
+        \\  The types returned by '(new mk(...)).b' are incompatible between these types.
+        \\    Type 'number' is not assignable to type 'string'.
+    );
+}
+
+test "elaboration: element, union, intersection and type-argument boundaries" {
+    // Array element: a full relation line, no path.
+    try expectMsg(
+        \\declare const s: { b: number }[];
+        \\const t: { b: string }[] = s;
+    ,
+        \\Type '{ b: number; }[]' is not assignable to type '{ b: string; }[]'.
+        \\  Type '{ b: number; }' is not assignable to type '{ b: string; }'.
+        \\    Types of property 'b' are incompatible.
+        \\      Type 'number' is not assignable to type 'string'.
+    );
+    // Union source: the failing constituent against the whole target.
+    try expectMsg(
+        \\declare const s: { a: number | boolean };
+        \\const t: { a: string | number } = s;
+    ,
+        \\Type '{ a: number | boolean; }' is not assignable to type '{ a: string | number; }'.
+        \\  Types of property 'a' are incompatible.
+        \\    Type 'number | boolean' is not assignable to type 'string | number'.
+        \\      Type 'boolean' is not assignable to type 'string | number'.
+    );
+    // Union target: the best-matching constituent, by shared property names.
+    try expectMsg(
+        \\declare const s: { a: number };
+        \\const t: { a: string } | { c: number } = s;
+    ,
+        \\Type '{ a: number; }' is not assignable to type '{ a: string; } | { c: number; }'.
+        \\  Type '{ a: number; }' is not assignable to type '{ a: string; }'.
+        \\    Types of property 'a' are incompatible.
+        \\      Type 'number' is not assignable to type 'string'.
+    );
+    // Intersection target: the failing member.
+    try expectMsg(
+        \\declare const s: { a: number };
+        \\const t: { a: string } & { c: number } = s;
+    ,
+        \\Type '{ a: number; }' is not assignable to type '{ a: string; } & { c: number; }'.
+        \\  Type '{ a: number; }' is not assignable to type '{ a: string; }'.
+        \\    Types of property 'a' are incompatible.
+        \\      Type 'number' is not assignable to type 'string'.
+    );
+    // Two references to one generic relate by their ARGUMENTS.
+    try expectMsg(
+        \\interface Box<T> { v: T }
+        \\declare const s: Box<number>;
+        \\const t: Box<string> = s;
+    ,
+        \\Type 'Box<number>' is not assignable to type 'Box<string>'.
+        \\  Type 'number' is not assignable to type 'string'.
+    );
+}
+
+test "elaboration: tuple positions, tuple arity and index signatures" {
+    try expectMsg(
+        \\declare const s: [number, string];
+        \\const t: [string, string] = s;
+    ,
+        \\Type '[number, string]' is not assignable to type '[string, string]'.
+        \\  Type at position 0 in source is not compatible with type at position 0 in target.
+        \\    Type 'number' is not assignable to type 'string'.
+    );
+    // Arity prints BELOW the level's own relation line (tsc does not suppress
+    // that one, unlike the missing-property message).
+    try expectMsg(
+        \\declare const s: { a: [number] };
+        \\const t: { a: [number, string] } = s;
+    ,
+        \\Type '{ a: [number]; }' is not assignable to type '{ a: [number, string]; }'.
+        \\  Types of property 'a' are incompatible.
+        \\    Type '[number]' is not assignable to type '[number, string]'.
+        \\      Source has 1 element(s) but target requires 2.
+    );
+    try expectChain(
+        \\declare const s: { [k: string]: number };
+        \\const t: { [k: string]: string } = s;
+    ,
+        \\  'string' index signatures are incompatible.
+        \\    Type 'number' is not assignable to type 'string'.
+    );
+    try expectChain(
+        \\declare const s: { [k: number]: number };
+        \\const t: { [k: number]: string } = s;
+    ,
+        \\  'number' index signatures are incompatible.
+        \\    Type 'number' is not assignable to type 'string'.
+    );
+}
+
+test "elaboration: a missing property REPLACES the level's relation line" {
+    try expectMsg(
+        \\declare const s: { a: { x: number } };
+        \\const t: { a: { x: number; y: string } } = s;
+    ,
+        \\Type '{ a: { x: number; }; }' is not assignable to type '{ a: { x: number; y: string; }; }'.
+        \\  Types of property 'a' are incompatible.
+        \\    Property 'y' is missing in type '{ x: number; }' but required in type '{ x: number; y: string; }'.
+    );
+    try expectMsg(
+        \\declare const s: { a: { x: number } };
+        \\const t: { a: { x: number; y: string; z: boolean } } = s;
+    ,
+        \\Type '{ a: { x: number; }; }' is not assignable to type '{ a: { x: number; y: string; z: boolean; }; }'.
+        \\  Types of property 'a' are incompatible.
+        \\    Type '{ x: number; }' is missing the following properties from type '{ x: number; y: string; z: boolean; }': y, z
+    );
+    try expectMsg(
+        \\declare const s: { a: { b: { x: number } } };
+        \\const t: { a: { b: { x: number; y: string } } } = s;
+    ,
+        \\Type '{ a: { b: { x: number; }; }; }' is not assignable to type '{ a: { b: { x: number; y: string; }; }; }'.
+        \\  The types of 'a.b' are incompatible between these types.
+        \\    Property 'y' is missing in type '{ x: number; }' but required in type '{ x: number; y: string; }'.
+    );
+}
+
+test "elaboration: past five names the missing list abbreviates (TS2740)" {
+    // Both the headline and the chain render the list through one formatter,
+    // so they abbreviate together — and tsc's code changes with it.
+    try expectMsg(
+        \\declare const s: { p: number };
+        \\const t: { p: number; q1: 1; q2: 1; q3: 1; q4: 1; q5: 1; q6: 1 } = s;
+    ,
+        \\Type '{ p: number; }' is missing the following properties from type '{ p: number; q1: 1; q2: 1; q3: 1; q4: 1; q5: 1; q6: 1; }': q1, q2, q3, q4, and 2 more.
+    );
+    try expectCodes(
+        \\declare const s: { p: number };
+        \\const t: { p: number; q1: 1; q2: 1; q3: 1; q4: 1; q5: 1; q6: 1 } = s;
+    , &.{2740});
+    // Exactly five still lists them all, under TS2739.
+    try expectCodes(
+        \\declare const s: { p: number };
+        \\const t: { p: number; q1: 1; q2: 1; q3: 1; q4: 1; q5: 1 } = s;
+    , &.{2739});
+    try expectChain(
+        \\declare const s: { a: { p: number } };
+        \\const t: { a: { p: number; q1: 1; q2: 1; q3: 1; q4: 1; q5: 1; q6: 1 } } = s;
+    ,
+        \\  Types of property 'a' are incompatible.
+        \\    Type '{ p: number; }' is missing the following properties from type '{ p: number; q1: 1; q2: 1; q3: 1; q4: 1; q5: 1; q6: 1; }': q1, q2, q3, q4, and 2 more.
+    );
+}
+
+test "elaboration: TS2345 argument mismatches chain the same way" {
+    try expectMsg(
+        \\declare function take(p: { a: { b: string } }): void;
+        \\declare const arg: { a: { b: number } };
+        \\take(arg);
+    ,
+        \\Argument of type '{ a: { b: number; }; }' is not assignable to parameter of type '{ a: { b: string; }; }'.
+        \\  The types of 'a.b' are incompatible between these types.
+        \\    Type 'number' is not assignable to type 'string'.
+    );
+}
+
+test "elaboration: nothing to derive leaves the headline alone" {
+    // Primitive leaves, a top-level missing property (already TS2741), a
+    // did-you-mean morph, and a source the walk cannot descend into.
+    try expectNoChain("const a: string = 1;");
+    try expectNoChain(
+        \\interface P { x: number; y: number }
+        \\declare const p: { x: number };
+        \\const q: P = p;
+    );
+    try expectNoChain(
+        \\declare const s: "aa";
+        \\const t: "ab" | "ac" = s;
+    );
+    try expectNoChain("declare const s: { a: number }; const t: number = s;");
+    // A union SOURCE does chain, down to the constituent that fails.
+    try expectMsg(
+        \\declare const u: string | number;
+        \\const s: string = u;
+    ,
+        \\Type 'string | number' is not assignable to type 'string'.
+        \\  Type 'number' is not assignable to type 'string'.
+    );
+}
+
+test "elaboration: a recursive pair terminates" {
+    // The walk would descend onto the same pair forever without the cycle
+    // guard; the point is that this returns at all.
+    try expectCodes(
+        \\interface A { n: A; v: number }
+        \\interface B { n: B; v: string }
+        \\declare const a: A;
+        \\const b: B = a;
+    , &.{2322});
+}
