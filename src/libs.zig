@@ -89,6 +89,7 @@ pub fn isLibPath(path: []const u8) bool {
 pub const LibUnit = struct {
     src: Source,
     tree: *Ast,
+    /// Filled by the serial bind pass; `undefined` between parse and bind.
     bind: *Bind,
     parse_ns: u64 = 0,
     bind_ns: u64 = 0,
@@ -110,42 +111,124 @@ pub const LibUnit = struct {
 /// pool, so each shard is parsed and bound once per run rather than once here
 /// and again on a worker — the lib is the bulk of the front-end work on a
 /// small project (627 KB of the 704 KB ztsc reads for ajv), so the duplicate
-/// pass was a large share of its wall clock. `alloc` must outlive the run: the
-/// AST, binder output and line table are program data now, not scratch.
+/// pass was a large share of its wall clock.
+///
+/// Only *binding* has to be serial. The parser never touches the interner, so
+/// the shards are scanned and parsed on `n_threads` threads first and only the
+/// bind loop runs single-threaded, in fixed shard order. That halves the pass:
+/// on ajv's five shards it is ~1.5 ms of parse against ~1.6 ms of bind, and on
+/// a DOM config (twelve shards) ~5.2 ms against ~6.7 ms.
+///
+/// Each shard owns an arena that outlives the run: the AST, binder output and
+/// line table are program data now, not scratch. `LibFrontEnd.deinit` releases
+/// them.
 pub fn frontEndLibs(
     alloc: Allocator,
     io: Io,
     gpa: Allocator,
     interner: *Interner,
     set: LibSet,
-) ![]LibUnit {
+    n_threads: usize,
+) !LibFrontEnd {
     var buf: [max_lib_files]LibFile = undefined;
     const files = libFiles(set, &buf);
     const units = try alloc.alloc(LibUnit, files.len);
-    for (files, units) |lf, *u| {
-        // `fromBytes` over the embedded blob is the same path the worker front
-        // end takes for a synthetic lib path (`libSourceFor`).
-        const src = try Source.fromBytes(alloc, lf.path, lf.source);
+    const arenas = try alloc.alloc(std.heap.ArenaAllocator, files.len);
+    for (arenas) |*a| a.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    errdefer for (arenas) |*a| a.deinit();
+
+    // --- Parse (parallel; interns nothing) --------------------------------
+    const parse_errs = try alloc.alloc(?anyerror, files.len);
+    @memset(parse_errs, null);
+    var job: ParseJob = .{
+        .files = files,
+        .units = units,
+        .arenas = arenas,
+        .io = io,
+        .errs = parse_errs,
+    };
+    const n = @max(1, @min(n_threads, files.len));
+    if (n == 1) {
+        job.run();
+    } else {
+        var threads: [max_lib_files]std.Thread = undefined;
+        var started: usize = 0;
+        for (threads[0..n]) |*t| {
+            t.* = std.Thread.spawn(.{}, ParseJob.run, .{&job}) catch break;
+            started += 1;
+        }
+        // A spawn failure is not fatal: the remaining shards are simply
+        // claimed by this thread instead.
+        job.run();
+        for (threads[0..started]) |t| t.join();
+    }
+    for (parse_errs) |e| if (e) |err| return err;
+
+    // --- Bind (serial, fixed shard order: this is what pins the atoms) ----
+    for (files, units, arenas) |lf, *u, *a| {
         // Each lib file's own path atom, as the worker front end interns it.
         _ = try interner.intern(io, gpa, lf.path);
         const t0 = Io.Clock.Timestamp.now(io, .awake);
-        const tree = try alloc.create(Ast);
-        tree.* = try parser.parse(alloc, lf.source);
-        const t1 = Io.Clock.Timestamp.now(io, .awake);
-        const b = try alloc.create(Bind);
+        const b = try a.allocator().create(Bind);
         // Lib paths end in `.d.ts`, so this matches `isDeclarationPath`.
-        b.* = try binder.bind(alloc, io, gpa, interner, tree, lf.source, true);
-        const t2 = Io.Clock.Timestamp.now(io, .awake);
-        u.* = .{
-            .src = src,
-            .tree = tree,
-            .bind = b,
-            .parse_ns = elapsedNs(t0, t1),
-            .bind_ns = elapsedNs(t1, t2),
-        };
+        b.* = try binder.bind(a.allocator(), io, gpa, interner, u.tree, lf.source, true);
+        u.bind = b;
+        u.bind_ns = elapsedNs(t0, Io.Clock.Timestamp.now(io, .awake));
     }
-    return units;
+    return .{ .units = units, .arenas = arenas };
 }
+
+/// The lib front end's output plus the arenas backing it.
+pub const LibFrontEnd = struct {
+    units: []LibUnit,
+    arenas: []std.heap.ArenaAllocator,
+
+    pub fn deinit(f: *LibFrontEnd) void {
+        for (f.arenas) |*a| a.deinit();
+    }
+};
+
+/// Work-stealing parse of the shards: every shard is an independent pure
+/// function of its embedded bytes, so any claim order gives identical output.
+const ParseJob = struct {
+    files: []const LibFile,
+    units: []LibUnit,
+    arenas: []std.heap.ArenaAllocator,
+    io: Io,
+    /// One slot per shard, written only by the thread that claimed it.
+    errs: []?anyerror,
+    next: std.atomic.Value(usize) = .init(0),
+
+    fn run(j: *ParseJob) void {
+        while (true) {
+            const i = j.next.fetchAdd(1, .monotonic);
+            if (i >= j.files.len) return;
+            const lf = j.files[i];
+            const a = j.arenas[i].allocator();
+            const t0 = Io.Clock.Timestamp.now(j.io, .awake);
+            // `fromBytes` over the embedded blob is the same path the worker
+            // front end takes for a synthetic lib path (`libSourceFor`).
+            const src = Source.fromBytes(a, lf.path, lf.source) catch |e| {
+                j.errs[i] = e;
+                continue;
+            };
+            const tree = a.create(Ast) catch |e| {
+                j.errs[i] = e;
+                continue;
+            };
+            tree.* = parser.parse(a, lf.source) catch |e| {
+                j.errs[i] = e;
+                continue;
+            };
+            j.units[i] = .{
+                .src = src,
+                .tree = tree,
+                .bind = undefined,
+                .parse_ns = elapsedNs(t0, Io.Clock.Timestamp.now(j.io, .awake)),
+            };
+        }
+    }
+};
 
 fn elapsedNs(from: Io.Clock.Timestamp, to: Io.Clock.Timestamp) u64 {
     const ns = from.durationTo(to).raw.nanoseconds;
@@ -158,7 +241,8 @@ fn elapsedNs(from: Io.Clock.Timestamp, to: Io.Clock.Timestamp) u64 {
 pub fn seedLibAtoms(io: Io, gpa: Allocator, interner: *Interner, set: LibSet) !void {
     var seed_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer seed_arena.deinit();
-    _ = try frontEndLibs(seed_arena.allocator(), io, gpa, interner, set);
+    var fe = try frontEndLibs(seed_arena.allocator(), io, gpa, interner, set, 1);
+    fe.deinit();
 }
 
 /// Which built-in lib blobs to inject. Derived from tsconfig `lib` (or the

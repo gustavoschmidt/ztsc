@@ -726,14 +726,14 @@ pub fn main(init: std.process.Init) !void {
     // itself: the shards never enter the work queue, so the lib is parsed and
     // bound once per run instead of once here and again on a worker.
     //
-    // Its own arena, not the process arena: `init.arena` is thread-safe, so
+    // Per-shard arenas, not the process arena: `init.arena` is thread-safe, so
     // every allocation there takes a lock, and this is one of the
-    // allocation-heaviest stretches of the run. It lives as long as the
-    // program — the AST and binder output are program data — so it is only
-    // released at the end.
-    var lib_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer lib_arena.deinit();
-    const lib_units = try libs.frontEndLibs(lib_arena.allocator(), io, gpa, &interner, lib_set);
+    // allocation-heaviest stretches of the run (and its parse pass is
+    // concurrent). They live as long as the program — the AST and binder
+    // output are program data — so they are only released at the end.
+    var lib_fe = try libs.frontEndLibs(arena, io, gpa, &interner, lib_set, n_workers);
+    defer lib_fe.deinit();
+    const lib_units = lib_fe.units;
 
     const discover_timer = Timer.start(io);
     for (workers) |*w| {
