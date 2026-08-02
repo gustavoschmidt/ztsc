@@ -1708,6 +1708,12 @@ pub fn deferredDefaultConstraint(c: *Checker, t: TypeId, depth: u32) Error!TypeI
 }
 
 pub fn baseConstraintOf(c: *Checker, t: TypeId) Error!TypeId {
+    // A polymorphic `this` is a type variable constrained by its home
+    // instance (tsc's `thisType` is a TypeParameter whose constraint is the
+    // class/interface type). Every constraint consumer — the deferred
+    // indexed-access relation rules above all — needs that step, or a
+    // `this["k"]` annotation inside the class body relates to nothing.
+    if (c.ts.kind(t) == .this_type) return c.ts.thisTypeInstance(t);
     var syms: std.ArrayList(u32) = .empty;
     defer syms.deinit(c.scratch());
     try c.collectTypeParamSyms(t, &syms);
@@ -3008,6 +3014,11 @@ pub fn indexChainInner(c: *Checker, node: Node, chained: *bool, narrow: bool) Er
             }
         },
     }
+    // A member reached by ELEMENT access (`o["~standard"]`) resolves its
+    // polymorphic `this` against the receiver exactly as the dotted form
+    // does — the two spellings name the same member, so they must answer
+    // the same type. A no-op (one `has_this_types` test) otherwise.
+    result = try c.substThis(result, obj_t);
     // Element-access narrowing, the counterpart of `memberChainInner`'s
     // property-path step: `arr[0]` with a CONSTANT index is a tracked
     // reference (`buildRefKey` rejects a variable index), so a guard written

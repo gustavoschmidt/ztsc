@@ -256,7 +256,23 @@ pub fn typeFromTypeNodeUncached(c: *Checker, node: Node) Error!TypeId {
         // predicate; this keeps every other consumer (TS2355, etc.)
         // consistent.
         .type_predicate => return if (d.rhs != 0) types.void_type else types.boolean_type,
-        .this_expr => return if (c.this_type != 0) c.this_type else types.any_type,
+        // `this` in a TYPE position is tsc's `thisType`: a type *variable*
+        // whose constraint is the home instance, not the instance itself.
+        // The distinction only shows up when the `this` is an operand of a
+        // deferred type operator — `this["k"]`, `F<this>` with a conditional
+        // body — where resolving it eagerly would demand the home
+        // interface's member table *while that table is being built*
+        // (`expandRef` reports a cycle → `any`). Kept symbolic, the operator
+        // stays deferred until `substThis` supplies a concrete receiver at
+        // the access site, exactly as tsc resolves it. zod's
+        // `parse(): output<this>` (→ `this["_zod"]["output"]`) is the shape
+        // that needs it.
+        .this_expr => {
+            if (c.this_type == 0) return types.any_type;
+            if (c.ts.kind(c.this_type) != .ref) return c.this_type;
+            c.has_this_types = true;
+            return c.ts.makeThisType(c.this_type);
+        },
         .error_node, .unsupported => return types.any_type,
         else => return types.any_type,
     }
@@ -1925,7 +1941,19 @@ pub fn keyofMapped(c: *Checker, m: TypeId) Error!TypeId {
 }
 
 /// T[K] with literal / index-signature keys (non-generic subset).
+///
+/// The looked-up member may itself mention the home instance's polymorphic
+/// `this` (zod's `parse(): output<this>`); `Obj["parse"]` must read that as
+/// `Obj`, the receiver the access names. tsc gets this for free — it resolves
+/// a type reference's members with the reference as `thisArgument` — so the
+/// substitution rides on the answer here instead. A no-op (one `has_this_types`
+/// test) for the overwhelming majority of programs, which declare no `this`
+/// type at all.
 pub fn indexedAccessType(c: *Checker, obj: TypeId, idx: TypeId) Error!TypeId {
+    return c.substThis(try indexedAccessTypeInner(c, obj, idx), obj);
+}
+
+fn indexedAccessTypeInner(c: *Checker, obj: TypeId, idx: TypeId) Error!TypeId {
     // `C["m"]` written while `C`'s own instance type is being materialized
     // (a member signature mentions an alias that indexes back into the
     // class). The whole-table expansion cannot answer, but the single

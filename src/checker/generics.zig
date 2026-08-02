@@ -171,8 +171,14 @@ pub fn reduceConditional(c: *Checker, chk: TypeId, extends_ty: TypeId, true_ty: 
     // A check/extends type whose only type variables are bound within a
     // member signature (`{ f: <T>() => T } extends ...`) is concrete for
     // resolution purposes, so the *free* type-param test gates deferral.
-    const ext_generic = try c.containsFreeTypeParam(extends_ty, &.{}) or try c.containsMappedParam(extends_ty);
-    const chk_generic = try c.containsFreeTypeParam(chk, &.{}) or try c.containsMappedParam(chk);
+    // A polymorphic `this` in the check is a type variable too (tsc's
+    // thisType is a TypeParameter), so `F<this>` stays deferred until the
+    // access site substitutes a receiver — see the `.this_expr` arm of
+    // `typeFromTypeNode`. Resolving it early against the home instance both
+    // re-enters that instance's still-open member table and loses the
+    // subclass receiver a later `substThis` would supply.
+    const ext_generic = try c.containsFreeTypeParam(extends_ty, &.{}) or try c.containsMappedParam(extends_ty) or try c.containsThisType(extends_ty);
+    const chk_generic = try c.containsFreeTypeParam(chk, &.{}) or try c.containsMappedParam(chk) or try c.containsThisType(chk);
     if (chk_generic or ext_generic) {
         // Narrow decidability carve-out (see objectDecidablyNotExtends): a
         // concrete-shaped object check whose free params live only in
@@ -2033,6 +2039,11 @@ pub fn reduceIndexedAccess(c: *Checker, obj: TypeId, idx: TypeId) Error!TypeId {
 /// concrete key resolves the same before and after instantiation.
 pub fn isGenericObjectForIndex(c: *Checker, t0: TypeId) Error!bool {
     const s = &c.ts;
+    // A polymorphic `this` is a type VARIABLE (tsc's thisType), so `this[K]`
+    // defers until a receiver substitutes it. Asked before `resolveStructural`,
+    // which would otherwise unwrap the marker to its home instance and resolve
+    // the access against a member table that may still be materializing.
+    if (s.kind(t0) == .this_type) return true;
     const t = try c.resolveStructural(t0);
     return switch (s.kind(t)) {
         .type_param, .infer_var, .mapped_param, .mapped, .index_access, .conditional, .keyof_op, .string_mapping, .template_literal_type => true,

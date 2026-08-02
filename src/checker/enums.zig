@@ -1116,7 +1116,7 @@ pub inline fn isConstTypeParamSym(c: *const Checker, sym: SymbolId) bool {
 /// already-`map`-substituted `constraint`/`default`. Deterministic and
 /// memoized per `(orig, canonical map)`, so a repeat instantiation reuses
 /// the same id (interning coherence).
-pub fn mintFreshTp(c: *Checker, orig: SymbolId, map: []const TpMap, map_id: ?u32, constraint: TypeId, default: TypeId, has_default: bool) Error!u32 {
+pub fn mintFreshTp(c: *Checker, orig: SymbolId, map: []const TpMap, map_id: ?u32, constraint: TypeId, default: TypeId, has_default: bool, widen_bound: TypeId) Error!u32 {
     const mid: u32 = map_id orelse try c.canonMapId(map);
     const key = (@as(u64, orig) << 32) | mid;
     const gop = try c.fresh_tp_ids.getOrPut(c.cm(), key);
@@ -1129,6 +1129,7 @@ pub fn mintFreshTp(c: *Checker, orig: SymbolId, map: []const TpMap, map_id: ?u32
             .default = default,
             .has_default = has_default,
             .const_tp = c.isConstTypeParamSym(orig),
+            .widen_bound = widen_bound,
         });
     }
     return gop.value_ptr.*;
@@ -1382,10 +1383,28 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
             defer kept.deinit(c.scratch());
             var fresh_map: std.ArrayList(TpMap) = .empty;
             defer fresh_map.deinit(c.scratch());
+            // The map a bound is substituted under: the incoming one plus
+            // every fresh rewrite minted SO FAR in this loop. A bound may
+            // name a SIBLING own param — kysely's
+            // `where<RE extends ReferenceExpression<DB, TB>,
+            //        VE extends OperandValueExpressionOrList<DB, TB, RE>>`
+            // is the canonical shape — and substituting it under the bare
+            // incoming map left `VE`'s fresh bound pointing at the ORIGINAL
+            // `RE`, a symbol nothing ever binds. `RE`'s inferred literal
+            // therefore never reached `ExtractTypeFromReferenceExpression`,
+            // which stalled as a deferred conditional and rejected every
+            // right-hand operand: TS2769 on every `.where(...)` overload set.
+            // tsc does the same thing by construction — `instantiateSignature`
+            // combines the fresh-parameter mapper INTO the outer one and
+            // hands the combination to each cloned parameter.
+            var cur_map: std.ArrayList(TpMap) = .empty;
+            defer cur_map.deinit(c.scratch());
+            var cur_id = map_id;
             // Mint fresh params only for an eligible sig (all own bounds
             // bare/absent); otherwise keep the original params + AST bounds
             // (the pre-rewrite behavior for standalone generic functions).
             const eligible = n_tps != 0 and map.len > 0 and try c.higherOrderSigEligible(t);
+            if (eligible) try cur_map.appendSlice(c.scratch(), map);
             // Index: the loop body resolves bounds and instantiates, both of
             // which intern and can move `extra` (see `memberAt`).
             for (0..n_tps) |tp_i| {
@@ -1395,8 +1414,8 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
                 if (eligible) {
                     const od = try c.typeParamDefault(tp);
                     const oc = try c.typeParamConstraint(tp);
-                    const nd = if (od != types.no_type) try c.instantiate(od, map) else od;
-                    const nc = if (oc != types.no_type) try c.instantiate(oc, map) else oc;
+                    const nd = if (od != types.no_type) try c.instantiateId(od, cur_map.items, cur_id) else od;
+                    const nc = if (oc != types.no_type) try c.instantiateId(oc, cur_map.items, cur_id) else oc;
                     // Fresh param carries the substituted *default* (so a
                     // no-arg `<AD = DispatchType>()` resolves to the supplied
                     // dispatch). Its *constraint* is enforced only when it
@@ -1408,13 +1427,20 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
                     // and enforcing its substituted form would erase a
                     // legitimate inference. Mint only when a bound moved.
                     const fc = if (oc != types.no_type and c.ts.kind(oc) != .type_param) nc else types.no_type;
+                    // A bare bound stays unenforced, but its substituted form
+                    // rides along for the literal-widening rule — see
+                    // `FreshTp.widen_bound`.
+                    const wb = if (fc == types.no_type and oc != types.no_type and nc != oc) nc else types.no_type;
                     if (nc != oc or nd != od) {
-                        fresh = try c.mintFreshTp(tp, map, map_id, fc, nd, od != types.no_type);
+                        fresh = try c.mintFreshTp(tp, cur_map.items, cur_id, fc, nd, od != types.no_type, wb);
                     }
                 }
                 if (fresh) |fid| {
                     try kept.append(c.scratch(), fid);
-                    try fresh_map.append(c.scratch(), .{ .sym = tp, .ty = try s.makeTypeParam(fid) });
+                    const rewrite: TpMap = .{ .sym = tp, .ty = try s.makeTypeParam(fid) };
+                    try fresh_map.append(c.scratch(), rewrite);
+                    try cur_map.append(c.scratch(), rewrite);
+                    cur_id = if (c.inst_cache_on) try c.canonMapId(cur_map.items) else null;
                 } else {
                     try kept.append(c.scratch(), tp);
                 }
@@ -1554,15 +1580,21 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
 /// Replace every polymorphic `this` marker in `t` with `repl` (the concrete
 /// receiver at a property access). Gated by `has_this_types`, so it is a
 /// no-op cost for programs that never declare a `this`-return.
+/// `repl` sentinel for `substThis`: replace every marker with its OWN home
+/// instance — the apparent type of a polymorphic `this` — rather than with
+/// one common receiver. Used by the relation, where the two sides carry
+/// markers declared against different instances.
+pub const this_apparent: TypeId = 0;
+
 pub fn substThis(c: *Checker, t: TypeId, repl: TypeId) Error!TypeId {
     if (!c.has_this_types) return t;
-    if (!c.containsThisType(t)) return t;
+    if (!try c.containsThisType(t)) return t;
     if (c.inst_depth > max_instantiation_depth) return types.error_type;
     c.inst_depth += 1;
     defer c.inst_depth -= 1;
     const s = &c.ts;
     switch (s.kind(t)) {
-        .this_type => return repl,
+        .this_type => return if (repl == this_apparent) s.thisTypeInstance(t) else repl,
         .union_type => {
             var parts: std.ArrayList(TypeId) = .empty;
             defer parts.deinit(c.scratch());
@@ -1609,40 +1641,163 @@ pub fn substThis(c: *Checker, t: TypeId, repl: TypeId) Error!TypeId {
             for (try c.refArgsList(t)) |a| try args.append(c.scratch(), try c.substThis(a, repl));
             return s.makeRef(s.refSymbol(t), args.items);
         },
+        // Anonymous object shape — see the `.object` arm of
+        // `containsThisType` for the alias-expansion case that needs it.
+        .object => {
+            var props: std.ArrayList(types.Prop) = .empty;
+            defer props.deinit(c.scratch());
+            for (0..s.objectPropCount(t)) |i| {
+                const p = s.objectProp(t, @intCast(i));
+                try props.append(c.scratch(), .{ .name = p.name, .ty = try c.substThis(p.ty, repl), .flags = p.flags });
+            }
+            const sidx = if (s.objectStringIndex(t) != 0) try c.substThis(s.objectStringIndex(t), repl) else 0;
+            const nidx = if (s.objectNumberIndex(t) != 0) try c.substThis(s.objectNumberIndex(t), repl) else 0;
+            var call_sigs: std.ArrayList(TypeId) = .empty;
+            defer call_sigs.deinit(c.scratch());
+            var construct_sigs: std.ArrayList(TypeId) = .empty;
+            defer construct_sigs.deinit(c.scratch());
+            for (0..s.objectCallSigCount(t)) |i| {
+                try call_sigs.append(c.scratch(), try c.substThis(s.objectCallSig(t, @intCast(i)), repl));
+            }
+            for (0..s.objectConstructSigCount(t)) |i| {
+                try construct_sigs.append(c.scratch(), try c.substThis(s.objectConstructSig(t, @intCast(i)), repl));
+            }
+            return s.makeObjectSigs(props.items, sidx, nidx, s.objectFlags(t), call_sigs.items, construct_sigs.items);
+        },
+        // The deferred type operators. A `this` operand keeps these symbolic
+        // (see `isGenericObjectForIndex` / `reduceConditional`), so this is
+        // where they finally resolve: substitute the receiver, then run the
+        // same reducers `instantiateId` runs, which is what turns zod's
+        // `this["_zod"]["output"]` into the schema's output type.
+        .index_access => return c.reduceIndexedAccess(
+            try c.substThis(s.indexAccessObj(t), repl),
+            try c.substThis(s.indexAccessIndex(t), repl),
+        ),
+        .conditional => {
+            const chk = try c.substThis(s.condCheck(t), repl);
+            const ext = try c.substThis(s.condExtends(t), repl);
+            const tru = try c.substThis(s.condTrue(t), repl);
+            const fls = try c.substThis(s.condFalse(t), repl);
+            return c.reduceConditional(chk, ext, tru, fls, s.condDistributive(t));
+        },
+        .keyof_op => return c.keyofType(try c.substThis(s.keyofOperand(t), repl)),
+        .mapped => return c.reduceMapped(
+            s.mappedKeyParam(t),
+            try c.substThis(s.mappedConstraint(t), repl),
+            try c.substThis(s.mappedValue(t), repl),
+            if (s.mappedAs(t) != 0) try c.substThis(s.mappedAs(t), repl) else 0,
+            if (s.mappedSource(t) != 0) try c.substThis(s.mappedSource(t), repl) else 0,
+            s.mappedFlags(t),
+        ),
+        .template_literal_type => {
+            var holes: std.ArrayList(TypeId) = .empty;
+            defer holes.deinit(c.scratch());
+            for (0..s.templateHoleCount(t)) |i| {
+                try holes.append(c.scratch(), try c.substThis(s.templateHole(t, @intCast(i)), repl));
+            }
+            return c.reduceTemplate(s.templateHead(t), holes.items, t);
+        },
+        .string_mapping => return c.applyStringMapping(
+            s.stringMappingKind(t),
+            try c.substThis(s.stringMappingArg(t), repl),
+        ),
         else => return t,
     }
 }
 
-pub fn containsThisType(c: *Checker, t: TypeId) bool {
+/// Does `t` mention a polymorphic `this` anywhere `substThis` can reach?
+/// The two must agree exactly: a shape this test misses is a shape
+/// `substThis` is never asked to rewrite, so the marker survives into the
+/// answer and resolves to nothing.
+///
+/// Memoized in the dense `ctt_cache` — types are immutable and the walk is
+/// structural, so the answer is a pure function of the id, and every
+/// property access pays for it once the program declares any `this` type.
+pub fn containsThisType(c: *Checker, t: TypeId) Error!bool {
+    const v = c.triGet(&c.ctt_cache, t);
+    if (v != 0) return v == 2;
+    const r = try containsThisTypeInner(c, t);
+    try c.triSet(&c.ctt_cache, t, if (r) 2 else 1);
+    return r;
+}
+
+fn containsThisTypeInner(c: *Checker, t: TypeId) Error!bool {
     const s = &c.ts;
-    return switch (s.kind(t)) {
-        .this_type => true,
-        .array => c.containsThisType(s.arrayElem(t)),
-        .union_type, .intersection, .overloads => blk: {
-            for (s.members(t)) |m| {
-                if (c.containsThisType(m)) break :blk true;
+    switch (s.kind(t)) {
+        .this_type => return true,
+        .array => return c.containsThisType(s.arrayElem(t)),
+        .union_type, .intersection, .overloads => {
+            // Indexed: `containsThisType` interns nothing, but `members`
+            // aliases store memory, so re-read per step for symmetry with
+            // the rest of the file's walks.
+            for (0..s.memberCount(t)) |i| {
+                if (try c.containsThisType(s.memberAt(t, i))) return true;
             }
-            break :blk false;
+            return false;
         },
-        .tuple => blk: {
+        .tuple => {
             for (0..s.tupleLen(t)) |i| {
-                if (c.containsThisType(s.tupleElem(t, @intCast(i)).ty)) break :blk true;
+                if (try c.containsThisType(s.tupleElem(t, @intCast(i)).ty)) return true;
             }
-            break :blk false;
+            return false;
         },
-        .function => blk: {
-            if (c.containsThisType(s.fnReturn(t))) break :blk true;
+        .function => {
+            if (try c.containsThisType(s.fnReturn(t))) return true;
             for (0..s.fnParamCount(t)) |i| {
-                if (c.containsThisType(s.fnParam(t, @intCast(i)).ty)) break :blk true;
+                if (try c.containsThisType(s.fnParam(t, @intCast(i)).ty)) return true;
             }
-            break :blk false;
+            return false;
         },
-        .ref => blk: {
-            for (s.refArgs(t)) |a| {
-                if (c.containsThisType(a)) break :blk true;
+        .ref => {
+            for (0..s.refArgCount(t)) |i| {
+                if (try c.containsThisType(s.refArgAt(t, i))) return true;
             }
-            break :blk false;
+            return false;
         },
-        else => false,
-    };
+        // An anonymous object shape carries `this` as readily as anything
+        // else: zod's `safeParse(): ZodSafeParseResult<output<this>>` is an
+        // alias that expands to a UNION OF OBJECT LITERALS whose `data`
+        // property is the deferred `output<this>`. Without this arm the
+        // union's members read as `this`-free and the marker never resolved
+        // — every `safeParse().data` was `unknown`.
+        .object => {
+            for (0..s.objectPropCount(t)) |i| {
+                if (try c.containsThisType(s.objectProp(t, @intCast(i)).ty)) return true;
+            }
+            if (s.objectStringIndex(t) != 0 and try c.containsThisType(s.objectStringIndex(t))) return true;
+            if (s.objectNumberIndex(t) != 0 and try c.containsThisType(s.objectNumberIndex(t))) return true;
+            for (0..s.objectCallSigCount(t)) |i| {
+                if (try c.containsThisType(s.objectCallSig(t, @intCast(i)))) return true;
+            }
+            for (0..s.objectConstructSigCount(t)) |i| {
+                if (try c.containsThisType(s.objectConstructSig(t, @intCast(i)))) return true;
+            }
+            return false;
+        },
+        // Deferred operators — the forms a `this` operand keeps symbolic.
+        // Without these arms `substThis` declared them `this`-free and left
+        // them unsubstituted forever, so `this["k"]` never resolved.
+        .index_access => return (try c.containsThisType(s.indexAccessObj(t))) or
+            (try c.containsThisType(s.indexAccessIndex(t))),
+        .conditional => return (try c.containsThisType(s.condCheck(t))) or
+            (try c.containsThisType(s.condExtends(t))) or
+            (try c.containsThisType(s.condTrue(t))) or
+            (try c.containsThisType(s.condFalse(t))),
+        .keyof_op => return c.containsThisType(s.keyofOperand(t)),
+        .mapped => {
+            if (try c.containsThisType(s.mappedConstraint(t))) return true;
+            if (try c.containsThisType(s.mappedValue(t))) return true;
+            if (s.mappedAs(t) != 0 and try c.containsThisType(s.mappedAs(t))) return true;
+            if (s.mappedSource(t) != 0 and try c.containsThisType(s.mappedSource(t))) return true;
+            return false;
+        },
+        .template_literal_type => {
+            for (0..s.templateHoleCount(t)) |i| {
+                if (try c.containsThisType(s.templateHole(t, @intCast(i)))) return true;
+            }
+            return false;
+        },
+        .string_mapping => return c.containsThisType(s.stringMappingArg(t)),
+        else => return false,
+    }
 }

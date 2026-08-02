@@ -525,6 +525,18 @@ pub const FreshTp = struct {
     /// stands in for, carried across so a `const` parameter of a generic
     /// method survives the receiver's instantiation.
     const_tp: bool = false,
+    /// A BARE outer bound (`<T extends TB>` where `TB` is the enclosing
+    /// interface's parameter) after substitution — `no_type` when the bound
+    /// was absent or already structured (then `constraint` holds it).
+    ///
+    /// Such a bound is deliberately NOT enforced (see `mintFreshTp`'s caller:
+    /// enforcing a substituted bare bound erases legitimate inferences), but
+    /// it still has to be VISIBLE to the literal-widening rule: tsc keeps an
+    /// inferred literal whenever the parameter has a primitive constraint,
+    /// and `<T extends TB>` under `TB := "asset"` is one. Without it, kysely's
+    /// `selectAll<T extends TB>(table: T)` widened `"asset"` to `string` and
+    /// the row type `Selectable<DB[T]>` collapsed to `{}`.
+    widen_bound: TypeId = types.no_type,
 };
 
 /// One entry of `Checker.mapped_key_scopes`: a mapped type's key parameter
@@ -549,27 +561,28 @@ pub const MappedKeyScope = struct {
 /// `deinit` cannot fall behind the field set: a container added to `Checker`
 /// and fed from `cm()` but forgotten here leaks its whole table.
 pub const map_containers = [_][]const u8{
-    "node_types",               "sig_cache",              "node_scopes",
-    "reassigned_syms",          "reassigned_in_loop",     "member_written_syms",
-    "member_written_in_loop",   "ns_types",               "ambient_ns_types",
-    "relation",                 "expansions",             "overload_rotate",
-    "origin",                   "iface_generic",          "iface_stack",
-    "pending_class_decos",      "class_inst_generic",     "class_static_cache",
-    "class_static_base_active", "class_ctor_cache",       "enum_value_cache",
-    "enum_info_cache",          "alias_generic",          "alias_state",
-    "alias_recursive",          "flow_same",              "flow_narrow",
-    "ref_keys",                 "flow_loop_stack",        "flow_stack",
-    "flow_tmp",                 "da_cache",               "ctp_cache",
-    "cmp_cache",                "mmp_cache",              "inst_cache",
-    "arrayish_elem_cache",      "inst_map_ids",           "tp_constraint_cache",
-    "fresh_tp_ids",             "fresh_tp_info",          "type_node_cache",
-    "atom_cache",               "infer_ids",              "infer_scopes",
-    "mapped_key_ids",           "mapped_key_scopes",      "inst_diag_at",
-    "infer_active",             "lazy_member_active",     "chain_guards",
-    "never_isect",              "deep_path_list",         "deep_path_ids",
-    "flow_reach",               "member_type_stack",      "lazy_index_objs",
-    "pending_type_args",        "pending_type_args_pool", "pending_type_args_seen",
-    "tp_constrained_cache",     "nominal_bases",          "nominal_base_pool",
+    "node_types",               "sig_cache",            "node_scopes",
+    "reassigned_syms",          "reassigned_in_loop",   "member_written_syms",
+    "member_written_in_loop",   "ns_types",             "ambient_ns_types",
+    "relation",                 "expansions",           "overload_rotate",
+    "origin",                   "iface_generic",        "iface_stack",
+    "pending_class_decos",      "class_inst_generic",   "class_static_cache",
+    "class_static_base_active", "class_ctor_cache",     "enum_value_cache",
+    "enum_info_cache",          "alias_generic",        "alias_state",
+    "alias_recursive",          "flow_same",            "flow_narrow",
+    "ref_keys",                 "flow_loop_stack",      "flow_stack",
+    "flow_tmp",                 "da_cache",             "ctp_cache",
+    "cmp_cache",                "ctt_cache",            "mmp_cache",
+    "inst_cache",               "arrayish_elem_cache",  "inst_map_ids",
+    "tp_constraint_cache",      "fresh_tp_ids",         "fresh_tp_info",
+    "type_node_cache",          "atom_cache",           "infer_ids",
+    "infer_scopes",             "mapped_key_ids",       "mapped_key_scopes",
+    "inst_diag_at",             "infer_active",         "lazy_member_active",
+    "chain_guards",             "never_isect",          "deep_path_list",
+    "deep_path_ids",            "flow_reach",           "member_type_stack",
+    "lazy_index_objs",          "pending_type_args",    "pending_type_args_pool",
+    "pending_type_args_seen",   "tp_constrained_cache", "nominal_bases",
+    "nominal_base_pool",
 };
 
 /// Where one symbol's declared heritage lives in `Checker.nominal_base_pool`.
@@ -910,6 +923,11 @@ pub const Checker = struct {
     ctp_cache: std.ArrayList(u8) = .empty,
     /// containsMappedParam memo, dense like `ctp_cache`.
     cmp_cache: std.ArrayList(u8) = .empty,
+    /// containsThisType memo, dense like `ctp_cache`. The walk descends into
+    /// object members and deferred type operators, so it is not the cheap
+    /// shallow test it once was; every `substThis` (i.e. every property
+    /// access, once a program declares one `this` type) opens with it.
+    ctt_cache: std.ArrayList(u8) = .empty,
     /// Numeric element type of a TUPLE or of a UNION of arrayish types —
     /// `numberIndexType`'s tuple arm and `elemOfArrayish`'s union arm, which
     /// are the same function of the same (immutable, interned) shape.
