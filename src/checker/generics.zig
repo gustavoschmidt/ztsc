@@ -248,6 +248,24 @@ pub fn resolveConcreteConditional(c: *Checker, chk: TypeId, extends_ty: TypeId, 
         if (indexOfId(ids.items, r) == null)
             return c.ts.makeConditional(chk, extends_ty, true_ty, false_ty, distributive);
     }
+    // The same rule applies to a binder mentioned inside the CHECK type. A
+    // naked `M` check is caught earlier (`reduceConditional`'s `.infer_var`
+    // fast path), but a WRAPPED one is not: `[M] extends [string]` — the
+    // idiom for turning distributivity off — hands us a concrete-looking
+    // tuple whose element is still an unbound binder owned by an enclosing
+    // conditional. `containsFreeTypeParam` doesn't count infer vars, so the
+    // whole conditional looked decidable and resolved at BUILD time: the
+    // unbound `M` relates to nothing, so `[M] extends [string]` baked the
+    // FALSE branch into the enclosing true branch, and no later
+    // instantiation could undo it. Defer instead, so the enclosing
+    // `substInfer` supplies `M` and re-enters here with a real tuple.
+    var chk_vars: std.ArrayList(u32) = .empty;
+    defer chk_vars.deinit(c.scratch());
+    try c.collectInferVars(chk, &chk_vars, &chk_vars);
+    for (chk_vars.items) |v| {
+        if (indexOfId(ids.items, v) == null)
+            return c.ts.makeConditional(chk, extends_ty, true_ty, false_ty, distributive);
+    }
     // `any` as the check type takes *both* branches (tsc): infer vars bind
     // `any`, and the result is trueBranch | falseBranch. This is what makes
     // `Awaited<any>` collapse to `any` instead of surviving as a deferred
