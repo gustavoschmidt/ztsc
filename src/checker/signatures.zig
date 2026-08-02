@@ -1149,6 +1149,24 @@ pub fn importedSymbolType(c: *Checker, sym: SymbolId) Error!TypeId {
     return c.targetValueType(tgt);
 }
 
+/// The VALUE half of a `.dual` binding: property `name` of the export-assigned
+/// value's type, or null when that value's type has no such property (the
+/// binding then has only the meanings its `type_tgt` carries).
+pub fn dualValueType(c: *Checker, d: modules.DualTarget) Error!?TypeId {
+    const v = d.value_tgt;
+    const base = try c.typeOfSymbol(c.toGlobalIn(v.file, v.payload));
+    const p = (try c.propOfType(base, v.name)) orelse return null;
+    return p.ty;
+}
+
+/// True when a `.dual` binding really does have a value meaning through its
+/// export-assigned value's type. Lets a value-position reference decide
+/// between "both meanings" and "type meaning only" (TS2693).
+pub fn dualHasValue(c: *Checker, tgt: modules.Target) Error!bool {
+    if (tgt.kind != .dual) return false;
+    return (try c.dualValueType(c.prog.dual_targets[tgt.payload])) != null;
+}
+
 pub fn targetValueType(c: *Checker, tgt: modules.Target) Error!TypeId {
     switch (tgt.kind) {
         .any => return types.any_type,
@@ -1163,6 +1181,16 @@ pub fn targetValueType(c: *Checker, tgt: modules.Target) Error!TypeId {
             const base = try c.typeOfSymbol(c.toGlobalIn(tgt.file, tgt.payload));
             const p = (try c.propOfType(base, tgt.name)) orelse return types.any_type;
             return p.ty;
+        },
+        // Both meanings available (tsc's `combineValueAndTypeSymbols`): the
+        // VALUE meaning is the property of the export-assigned value's type.
+        // The link phase could not check that the property exists, so a miss
+        // falls back to the member's own value meaning — which is what the
+        // binding resolved to before the dual existed.
+        .dual => {
+            const d = c.prog.dual_targets[tgt.payload];
+            if (try c.dualValueType(d)) |t| return t;
+            return c.targetValueType(d.type_tgt);
         },
         .default_expr => {
             const saved = c.saveCtx();
@@ -1226,6 +1254,21 @@ pub fn namespaceObjectType(c: *Checker, file: FileId) Error!TypeId {
                 .namespace => ty = try c.namespaceObjectType(tgt.file),
                 .ambient_ns => ty = try c.ambientNamespaceType(tgt.payload),
                 .default_expr, .export_equals_prop => ty = try c.targetValueType(tgt),
+                // A re-exported dual contributes to the namespace object
+                // through its value half. Without one it falls back to the
+                // member, which — being a type-only interface in the shape
+                // that motivates duals — is then omitted like any other.
+                .dual => {
+                    const d = c.prog.dual_targets[tgt.payload];
+                    if (try c.dualValueType(d)) |vt| {
+                        ty = vt;
+                    } else if (c.targetTypeSym(d.type_tgt)) |g| {
+                        if (!hasValueMeaning(c.symFlags(g))) continue;
+                        ty = try c.typeOfSymbol(g);
+                    } else {
+                        ty = try c.targetValueType(d.type_tgt);
+                    }
+                },
                 .any => {},
             }
             try props.append(c.scratch(), .{ .name = name, .ty = ty, .flags = types.prop_flag_readonly });

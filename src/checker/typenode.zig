@@ -363,7 +363,10 @@ pub fn typeFromTypeNameEx(c: *Checker, name_node: Node, args: []const TypeId, ou
             var sym = sym0;
             var f = c.symFlags(sym);
             if (f.import_binding) {
-                const tgt = c.importTarget(sym) orelse return types.any_type; // unlinked
+                const tgt0 = c.importTarget(sym) orelse return types.any_type; // unlinked
+                // A dual binding's TYPE half is the member of the exported
+                // entity; its value half is a property and has none.
+                const tgt = c.typeMeaningTarget(tgt0);
                 switch (tgt.kind) {
                     .binding => {
                         const g = c.toGlobalIn(tgt.file, tgt.payload);
@@ -383,7 +386,7 @@ pub fn typeFromTypeNameEx(c: *Checker, name_node: Node, args: []const TypeId, ou
                     },
                     // Namespace-as-type / a property of an `export =` value
                     // (value space only) / unresolved: any (documented).
-                    .namespace, .default_expr, .ambient_ns, .export_equals_prop, .any => return types.any_type,
+                    .namespace, .default_expr, .ambient_ns, .export_equals_prop, .dual, .any => return types.any_type,
                 }
             }
             if (out_sym) |o| o.* = sym;
@@ -653,9 +656,28 @@ fn exportEqualsMemberSymAt(c: *Checker, m: ModuleRef, name: Atom, depth: u32) ?S
     }
 }
 
+/// The TYPE half of a link Target: a `.dual` binding (tsc's combined
+/// value-and-type symbol) carries its type meaning in `type_tgt` — the member
+/// of the export-assigned entity — while its `value_tgt` is a property of that
+/// entity's type and has no type meaning at all. Every other kind is its own
+/// type half. Unwraps nested duals (a dual re-exported through another
+/// `export =` module), bounded.
+pub fn typeMeaningTarget(c: *Checker, tgt: modules.Target) modules.Target {
+    var t = tgt;
+    var depth: u32 = 0;
+    while (t.kind == .dual and depth < 8) : (depth += 1) {
+        const d = c.prog.dual_targets[t.payload];
+        const outer_type_only = t.type_only;
+        t = d.type_tgt;
+        t.type_only = t.type_only or outer_type_only;
+    }
+    return t;
+}
+
 /// The global symbol an export Target denotes (for type materialization),
 /// or null for non-binding targets (namespace objects, default expressions).
-pub fn targetTypeSym(c: *Checker, tgt: modules.Target) ?SymbolId {
+pub fn targetTypeSym(c: *Checker, tgt0: modules.Target) ?SymbolId {
+    const tgt = c.typeMeaningTarget(tgt0);
     return switch (tgt.kind) {
         // Route through the cross-file merge index so a `ns.I` / qualified /
         // `import("m").I` reference to an interface augmented by a
@@ -818,7 +840,9 @@ pub fn resolveNsContainer(c: *Checker, node: Node) Error!?NsContainer {
 /// denotes: a namespace declaration symbol (the `export =` entity of an
 /// `export =`-module, or a re-export), or the whole-module namespace object
 /// of a plain named-export module (`import * as`). Null otherwise.
-pub fn containerFromImportTarget(c: *Checker, tgt: modules.Target) ?NsContainer {
+pub fn containerFromImportTarget(c: *Checker, tgt0: modules.Target) ?NsContainer {
+    // A namespace container is a type-space entity: take the dual's type half.
+    const tgt = c.typeMeaningTarget(tgt0);
     switch (tgt.kind) {
         .binding => {
             const g = c.toGlobalIn(tgt.file, tgt.payload);

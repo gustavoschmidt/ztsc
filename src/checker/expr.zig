@@ -1184,7 +1184,13 @@ pub fn checkIdentifier(c: *Checker, node: Node) Error!TypeId {
         .sym => |sym| {
             const f = c.symFlags(sym);
             if (f.import_binding) {
-                if (c.importTarget(sym)) |tgt| {
+                if (c.importTarget(sym)) |tgt0| {
+                    // A dual binding (tsc's combined value-and-type symbol)
+                    // has a value meaning as long as the export-assigned
+                    // value's type really does carry the property; when it
+                    // does not, only the member's meanings are left and the
+                    // type-only verdict below applies to it.
+                    const tgt = if (try c.dualHasValue(tgt0)) tgt0 else c.typeMeaningTarget(tgt0);
                     if (tgt.kind == .binding) {
                         const tf = c.symFlags(c.toGlobalIn(tgt.file, tgt.payload));
                         // A pure type target is 2693 (matches tsc even

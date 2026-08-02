@@ -1382,6 +1382,17 @@ pub fn classBaseEntitySym(c: *Checker, node: Node) Error!?SymbolId {
                 .sym => |sym| {
                     if (!c.symFlags(sym).import_binding) return sym;
                     const tgt = c.importTarget(sym) orelse return null;
+                    // A dual binding is a heritage base through its VALUE
+                    // meaning — tsc's combined symbol takes `valueDeclaration`
+                    // from the property (`Request: typeof SARequest`), so the
+                    // base is that constructor's class, not the same-named
+                    // interface in the type half. `@types/supertest`'s
+                    // `declare class Test extends Request` is exactly this.
+                    if (tgt.kind == .dual) {
+                        if (try c.dualValueType(c.prog.dual_targets[tgt.payload])) |vt| {
+                            if (c.ts.kind(vt) == .class_value) return c.ts.classSymbol(vt);
+                        }
+                    }
                     return c.importedContainerSym(tgt);
                 },
                 else => return null,
@@ -1437,7 +1448,10 @@ pub fn baseExprConstructType(c: *Checker, sym: SymbolId) Error!?TypeId {
 /// for a whole-module (`import * as X`) target — the module's `export =`
 /// entity when it is a symbol (namespace/class), which is how `X.Member`
 /// reaches into `export = X`-style packages. Null otherwise.
-pub fn importedContainerSym(c: *Checker, tgt: modules.Target) ?SymbolId {
+pub fn importedContainerSym(c: *Checker, tgt0: modules.Target) ?SymbolId {
+    // The declaration behind a dual binding is its type half (the member of
+    // the export-assigned entity); the value half is a property, not a symbol.
+    const tgt = c.typeMeaningTarget(tgt0);
     switch (tgt.kind) {
         .binding => return c.toGlobalIn(tgt.file, tgt.payload),
         .namespace => {
