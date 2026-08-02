@@ -24,7 +24,7 @@ and fails the build on any unformatted file.
 
 Run the benchmark (`bench/e2e.sh multi`) and compare against the last
 recorded numbers. **If wall clock or peak RSS regressed, alert me before
-committing** — memory ≤50% of tsgo and speed parity are the headline goals,
-so a regression is a blocker, not a footnote.
-</content>
-</invoke>
+committing** — the headline goal is **at least 2× faster and at least 5× less
+peak memory than tsgo on every benchmark** (wall ≤50% and peak RSS ≤20% of
+tsgo's, packages and whole applications alike), so anything that breaks either
+bar is a blocker, not a footnote.

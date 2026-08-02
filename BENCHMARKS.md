@@ -3,7 +3,13 @@
 Wall clock and peak memory for **ztsc vs tsgo** (the native TypeScript 7
 compiler), checking real, published packages and a real application on identical
 inputs. Package matrix and excalidraw application row both measured 2026-08-02
-on an Apple M4 with ztsc at commit d308f63.
+on an Apple M4 with ztsc at commit 732ab8b, ztsc and tsgo runs interleaved.
+
+The headline, held on every benchmark on this page: **ztsc is at least 2×
+faster and uses at least 5× less peak memory than tsgo** — wall clock ≤ 50%
+and peak RSS ≤ 20% of tsgo's, packages and whole application alike. The
+measured floors are 2.5× (wall) and 5.3× (RSS), both on excalidraw; the widest
+margins are 12.4× and 15.3×, both on drizzle-orm.
 
 ztsc checks a subset of TypeScript, against the lib each package's tsconfig
 selects — es-core..esnext for most, plus the real DOM lib for the three packages
@@ -29,66 +35,68 @@ never surfaced — for a few milliseconds and a few MB saved.
 
 ## Results
 
-Both tools default to 4 checker instances. Peak memory at that default, across
-all eight packages:
+Both tools run at their defaults — tsgo at 4 checker instances, ztsc at
+`min(4, cores)` dropping to 2 when there is less than 32k nodes of check work
+to spread (which covers the two smallest packages). Peak memory at those
+defaults, across all eight packages:
 
 ```
-peak RSS at the default 4 checkers — MB, lower is better
+peak RSS at the defaults — MB, lower is better
 
-@types/node        ztsc ███ 18
-                   tsgo ████████████████████ 107
+@types/node        ztsc ███ 17
+                   tsgo ████████████████████ 101
 @types/react       ztsc ████ 23
-                   tsgo ██████████████████████████████████████ 200
-drizzle-orm        ztsc ████ 19
-                   tsgo ██████████████████████████████████████████████████████ 286
-hono               ztsc █████ 25
-                   tsgo ██████████████████████████████ 161
+                   tsgo ████████████████████████████████████ 183
+drizzle-orm        ztsc ████ 18
+                   tsgo ██████████████████████████████████████████████████████ 276
+hono               ztsc █████ 24
+                   tsgo ██████████████████████████████ 153
 @sinclair/typebox  ztsc ███ 14
-                   tsgo ███████████████ 82
-ajv                ztsc ██ 11
-                   tsgo ██████████ 52
-zod                ztsc ████ 22
-                   tsgo ███████████████████████████ 142
-chalk              ztsc ██ 8
-                   tsgo █████████ 46
+                   tsgo ███████████████ 78
+ajv                ztsc ██ 9
+                   tsgo ██████████ 50
+zod                ztsc ████ 21
+                   tsgo ███████████████████████████ 136
+chalk              ztsc █ 8
+                   tsgo █████████ 44
 ```
 
-At the default, ztsc's peak memory is **7–20% of tsgo's** and its wall clock
-**10–64%** — smaller *and* faster on every package:
+ztsc's peak memory is **7–19% of tsgo's** and its wall clock **8–38%** —
+smaller *and* faster on every package, and past both bars of the 2×/5×
+guarantee on every one:
 
 | package (files / lines) | wall ztsc / tsgo | wall vs tsgo | peak RSS ztsc / tsgo | rss vs tsgo |
 |---|---:|---:|---:|---:|
-| @types/node 22.7.4 (59 / 49.6k) | 13.1 / 45.3 ms | 29% | 17.7 / 106.6 MB | 17% |
-| @types/react 18.3.11 (6 / 64.1k) | 27.3 / 244.2 ms | 11% | 23.3 / 200.0 MB | 12% |
-| drizzle-orm 0.33.0 (288 / 12.6k) | 23.2 / 231.7 ms | 10% | 18.7 / 285.7 MB | 7% |
-| hono 4.6.3 (165 / 6.3k) | 31.0 / 173.0 ms | 18% | 24.8 / 161.2 MB | 15% |
-| @sinclair/typebox 0.33.12 (241 / 3.1k) | 30.5 / 47.8 ms | 64% | 14.0 / 81.7 MB | 17% |
-| ajv 8.17.1 (107 / 1.8k) | 9.9 / 22.8 ms | 43% | 10.6 / 52.2 MB | 20% |
-| zod 3.23.8 (24 / 1.6k) | 25.4 / 155.2 ms | 16% | 22.5 / 142.5 MB | 16% |
-| chalk 5.3.0 (5 / 612) | 7.6 / 18.5 ms | 41% | 8.4 / 45.7 MB | 18% |
+| @types/node 22.7.4 (59 / 49.6k) | 11.3 / 46.7 ms | 24% | 17.4 / 101.2 MB | 17% |
+| @types/react 18.3.11 (6 / 64.1k) | 22.1 / 245.8 ms | 9% | 22.9 / 183.2 MB | 13% |
+| drizzle-orm 0.33.0 (288 / 12.6k) | 19.5 / 241.4 ms | 8% | 18.1 / 276.5 MB | 7% |
+| hono 4.6.3 (165 / 6.3k) | 23.8 / 172.4 ms | 14% | 24.1 / 153.4 MB | 16% |
+| @sinclair/typebox 0.33.12 (241 / 3.1k) | 15.2 / 48.9 ms | 31% | 13.8 / 78.1 MB | 18% |
+| ajv 8.17.1 (107 / 1.8k) | 9.2 / 24.5 ms | 38% | 9.3 / 49.8 MB | 19% |
+| zod 3.23.8 (24 / 1.6k) | 21.6 / 156.3 ms | 14% | 21.3 / 136.1 MB | 16% |
+| chalk 5.3.0 (5 / 612) | 6.3 / 19.2 ms | 33% | 7.5 / 43.8 MB | 17% |
 
-That is **4.9–15× less peak memory**, and faster on all eight packages by up to
-10×. The two *smallest* packages (ajv 43%, chalk 41%) sit near both tools'
-process floors — ztsc's ~8–10 ms is startup plus its embedded lib front end,
-which it type-checks by default just like tsgo, and tsgo's floor is ~18 ms — so
+That is **5.4–15.3× less peak memory** and **2.7–12.4× faster**, on all eight
+packages. The two *smallest* packages (ajv 38%, chalk 33%) sit near both tools'
+process floors — ztsc's ~6–9 ms is startup plus its embedded lib front end,
+which it type-checks by default just like tsgo, and tsgo's floor is ~19 ms — so
 their ratios reflect fixed startup cost, not checking throughput.
-`@sinclair/typebox` (64%) is the corpus's highest ratio for a different reason:
-its wall roughly doubled (16.5 → 30.5 ms) when the checker gained the
+`@sinclair/typebox` (31%) is the corpus's highest wall ratio after them: its
+wall had roughly doubled (16.5 → 30.5 ms) when the checker gained the
 ambient-context grammar checks and the diagnostic-parity work that removed its
-two remaining false positives — the added time is the checking work whose
-absence produced them, and the row now matches tsgo's diagnostics exactly at
-1.6× its speed. Excluding the near-floor pair and typebox, ztsc is
-**3.5–10× faster**. hono and zod land higher than their size alone suggests
-(18% / 16% wall) because their tsconfig lists `dom`: ztsc parses, binds, and
-checks the 2.35 MB DOM lib for them too, a sizable front end on top.
-`@types/node`, the densest declaration corpus, sits at 29% wall — its
-declaration merging and interface heritage is the work ztsc closes least of
-the gap on. `@types/react` is the corpus's heaviest row for tsgo — its deep
-conditional types and the DOM-derived `DetailedHTMLProps` intrinsic-element
-unions cost tsgo 244 ms, more wall time than any other package, and 200 MB —
-yet ztsc checks the same surface in 27 ms and 23 MB (11% wall, 12% RSS), an
-8.9× speedup at one-ninth the memory. drizzle-orm is the widest gap in the
-corpus: 23 ms against 232 ms, 18.7 MB against 285.7 MB.
+two remaining false positives, and memoizing the tuple element-type walks since
+gave that back (30.5 → 15.2 ms) with the diagnostics unchanged. hono and zod
+land higher than their size alone suggests (14% wall each) because their
+tsconfig lists `dom`: ztsc parses, binds, and checks the 2.35 MB DOM lib for
+them too, a sizable front end on top. `@types/node`, the densest declaration
+corpus, sits at 24% wall — its declaration merging and interface heritage is
+the work ztsc closes least of the gap on. `@types/react` is the corpus's
+heaviest row for tsgo — its deep conditional types and the DOM-derived
+`DetailedHTMLProps` intrinsic-element unions cost tsgo 246 ms, more wall time
+than any other package, and 183 MB — yet ztsc checks the same surface in 22 ms
+and 23 MB (9% wall, 13% RSS), an 11× speedup at an eighth of the memory.
+drizzle-orm is the widest gap in the corpus: 19.5 ms against 241.4 ms, 18.1 MB
+against 276.5 MB.
 
 Its row also supersedes an invalid one. The previously published drizzle-orm
 figures (15.0 ms / 14.6 MB) timed a process that crashed partway through the
@@ -101,22 +109,25 @@ because a crashed run stops paying for work it never did.
 ### Beyond the packages: a whole application
 
 One application is measured — a whole app graph rather than a single package's
-`.d.ts`. Both tools at their default 4 checkers:
+`.d.ts`. Both tools at their defaults:
 
 | application | wall ztsc / tsgo | peak RSS ztsc / tsgo | rss vs tsgo | diagnostics |
 |---|---:|---:|---:|---|
-| **excalidraw** 0.18.1 (`a2ec2889`) — public | 0.218 / 0.494 s | 129.2 / 669.1 MB | 19% | the same 17 as tsgo, at every checker count |
+| **excalidraw** 0.18.1 (`a2ec2889`) — public | 0.195 / 0.493 s | 121.6 / 640.7 MB | 19% | the same 17 as tsgo, at every checker count |
 
 **excalidraw** is public and reproducible, measured 2026-08-02 with ztsc
-at commit d308f63. It loads 1,091 files / 330,555 lines (513 of them the project's own source; the rest are
+at commit 732ab8b. It loads 1,091 files / 330,555 lines (513 of them the project's own source; the rest are
 the dependency `.d.ts` closure and the standard library) and checks them
-**2.3× faster at 19% of tsgo's peak memory**. This row improved from the
-previously published 0.355 s for two compounding reasons: include expansion
-now stays out of package folders the way tsc's does, which both removed a
-~330 ms hidden directory walk over the checkout's `node_modules` (now visible
-as the `config` phase in `--timing`, ~5 ms) and stopped rooting 24 nested
-`node_modules` sources that tsgo also refuses to root (1,110 → 1,091 files
-loaded — the tsgo-verified fidelity fix behind the smaller file count).
+**2.5× faster at 19% of tsgo's peak memory** — the tightest margin on either
+axis anywhere in this document, and still clear of the 2×/5× guarantee. Two
+earlier steps account for most of the wall: include expansion now stays out of
+package folders the way tsc's does, which both removed a ~330 ms hidden
+directory walk over the checkout's `node_modules` (now visible as the `config`
+phase in `--timing`, ~5 ms) and stopped rooting 24 nested `node_modules`
+sources that tsgo also refuses to root (1,110 → 1,091 files loaded — the
+tsgo-verified fidelity fix behind the smaller file count); the current perf
+series (lib front-ended once instead of twice, memoized tuple element-type
+walks, a scanner identifier fast path) took it the rest of the way.
 
 Unlike the package matrix, this row *is* a diagnostic claim. ztsc reports
 exactly the same 17 diagnostics as tsgo — the same (file, line, column, code)
@@ -174,15 +185,25 @@ at the defaults:
 | **4** (default) | **18.0 ms** | **+10.9%** | **42.7 MB** |
 | 8 | 13.5 ms | +20.6% | 41.5 MB |
 
-Four is the default because the returns flatten after it while the duplication
-keeps climbing; `--checkers=8` remains available for the extra speed.
+Four is the ceiling of the default because the returns flatten after it while
+the duplication keeps climbing; `--checkers=8` remains available for the extra
+speed. Below 32k nodes of check work the default drops to two instead: a
+checker instance carries fixed state (its own type-store overlay, per-symbol
+arrays, arenas, caches, thread) that a small program never repays, so on the
+corpus's smallest packages two instances are both leaner and no slower. An
+explicit `--checkers=N` always wins over the default, and the diagnostics are
+byte-identical for any N.
 
 ### The synthetic corpora, for continuity
 
-The generated corpora that carried the project's earlier tuning still run,
-re-measured 2026-08-02 with the same protocol as the package table above. tsc
-5.5.4 was retired from the ongoing bench scripts, so its rows are the
-2026-07-14 figures it retired on; tsgo is the baseline that matters:
+The generated corpora that carried the project's earlier tuning still run.
+The rows below were taken 2026-08-02 at commit d308f63, before the perf series
+that produced the package table above — ztsc has only moved down since: the
+standing `bench/e2e.sh multi` gate currently records ztsc at **0.02–0.03 s and
+~40 MB** (42 MB worst of three runs) against tsgo's **0.08 s and ~200 MB** at
+four checkers. tsc 5.5.4 was retired from the ongoing bench scripts, so its
+rows are the 2026-07-14 figures it retired on; tsgo is the baseline that
+matters:
 
 | corpus | tool | wall | peak RSS | rss vs tsgo |
 |---|---|---:|---:|---:|
@@ -197,7 +218,7 @@ re-measured 2026-08-02 with the same protocol as the package table above. tsc
 
 **Hardware.** Apple M4 (10 cores), 32 GB RAM, macOS 26.5.1.
 
-**Versions.** ztsc 0.0.1-dev at commit d308f63, built with `zig build bench`
+**Versions.** ztsc 0.0.1-dev at commit 732ab8b, built with `zig build bench`
 (ReleaseFast, Zig 0.16.0), run as a native binary. tsgo 7.0.2, the native arm64
 TypeScript compiler, invoked directly (no Node host in the measurement).
 
@@ -215,8 +236,10 @@ other cache artifact is written by either tool on any of these corpora — check
 before, between, and after every timed run. Every run is cold.
 
 **Checkers.** `--checkers=N` runs N parallel checker instances that trade some
-duplicated type construction for lock-free parallelism. Both tools default to 4.
-tsgo takes the space form (`--checkers 4`); ztsc takes `--checkers=4`.
+duplicated type construction for lock-free parallelism. tsgo defaults to 4;
+ztsc defaults to `min(4, cores)`, dropping to 2 on programs with less than 32k
+nodes of check work. Every row above is defaults vs. defaults. tsgo takes the
+space form (`--checkers 4`); ztsc takes `--checkers=4`.
 
 **Defaults.** Both tools are measured at their defaults. ztsc type-checks its
 embedded default lib (like tsc/tsgo), so this is a like-for-like comparison;
@@ -241,13 +264,15 @@ ZTSC=zig-out/bench/ztsc
 TSGO=bench/baselines/tsgo/node_modules/@typescript/typescript-darwin-arm64/lib/tsc
 C=bench/corpus/real/_types_node_22.7.4
 
-"$ZTSC" --pretty=false --checkers=4 -p "$C"              # wall: median of 11
+"$ZTSC" --pretty=false -p "$C"                           # wall: median of 11
 /usr/bin/time -l "$TSGO" --noEmit --checkers 4 -p "$C"   # RSS: median of 5
 ```
 
-Time the wall clock around the whole process with a monotonic nanosecond timer
-and take the median of 11 runs after one warm-up; take peak RSS (the "maximum
-resident set size" line of `/usr/bin/time -l`, in bytes) as the median of 5.
+ztsc is run without `--checkers` so it picks its own default, the way tsgo
+picks 4; pass `--checkers=N` to pin either tool. Time the wall clock around the
+whole process with a monotonic nanosecond timer and take the median of 11 runs
+after one warm-up; take peak RSS (the "maximum resident set size" line of
+`/usr/bin/time -l`, in bytes) as the median of 5.
 Note tsgo's space form for `--checkers`, not `=4`. Nonzero exit is expected —
 the packages are vendored without their dependencies — and both tools fully
 check every file regardless.
