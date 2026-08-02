@@ -1,5 +1,11 @@
 //! ZTSC CLI driver: argument parsing, thread pool, phase orchestration.
 //!
+//! The built-in lib runs its own front end first (`libs.frontEndLibs`):
+//! the shards are parsed on a small thread budget and then bound
+//! single-threaded in fixed order, which is what pins the interner's atoms
+//! before any concurrent user-file work. Its output enters discovery as
+//! ready-made completions, so the lib is never queued to the pool.
+//!
 //! Module discovery is single-owner with a completion queue: the main
 //! thread is the sole owner of
 //! the module graph and seen-set (no locks on graph state); workers run
@@ -14,7 +20,8 @@
 //! the old wavefront discovery produced). A serial `link` phase then
 //! builds sealed per-file import/export tables; the check phase
 //! partitions the program's files across N independent checker instances
-//! (`--checkers=N`, default min(4, cores)), each with its own type
+//! (`--checkers=N`; the default is min(4, cores), dropped to 2 when there
+//! is less than `small_program_nodes` of check work to spread), each with its own type
 //! store/caches, reading the shared immutable AST/binder/link data without
 //! locks.
 //!
@@ -76,8 +83,13 @@ const usage =
     \\                         skipLibCheck is the superset — it suppresses all
     \\                         diagnostics in every .d.ts (their types still flow)
     \\  --workers=N            number of worker threads (default: CPU count)
-    \\  --checkers=N           number of checker instances (default: min(4, CPUs))
-    \\  --repeat=N             parse/bind each file N times (benchmark aid)
+    \\  --checkers=N           number of checker instances (default:
+    \\                         min(4, CPUs), or 2 on a small program —
+    \\                         each instance costs fixed state that little
+    \\                         checking does not repay)
+    \\  --repeat=N             parse/bind each file N times (benchmark aid;
+    \\                         does not cover the built-in lib, which is
+    \\                         front-ended once before the pool starts)
     \\  --no-resolve-cache     disable the module-resolution memos — the
     \\                         specifier memo and the filesystem-fact caches
     \\                         under it (benchmark aid / correctness oracle)
