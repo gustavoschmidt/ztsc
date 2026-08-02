@@ -21,8 +21,11 @@ fn nsToMs(ns: u64) f64 {
 /// Per-phase nanosecond totals. load/parse/bind are summed per-file worker
 /// times (files stream through the pipeline, so the phases overlap);
 /// `discover` is the front-end wall clock (spawn -> last completion
-/// resolved -> join).
+/// resolved -> join). `config` is tsconfig discovery/loading — including the
+/// `include` filesystem walk — and is 0 when the run comes from CLI file
+/// arguments; it precedes every other phase and is part of `total`.
 pub const Phases = struct {
+    config_ns: u64 = 0,
     load_ns: u64,
     parse_ns: u64,
     bind_ns: u64,
@@ -83,6 +86,7 @@ pub fn printTiming(
     const repeat_bytes = @as(f64, @floatFromInt(vol.bytes * vol.repeat));
     try out.print("\n--timing\n", .{});
     try out.print("  {s:<10} {s:>10} {s:>14} {s:>10}\n", .{ "phase", "ms", "lines/s", "MB/s" });
+    try printPhase(out, "config", phases.config_ns, 0, 0);
     try printPhase(out, "load", phases.load_ns, lines_f, bytes_f);
     try printPhase(out, "parse", phases.parse_ns, repeat_lines, repeat_bytes);
     try printPhase(out, "bind", phases.bind_ns, repeat_lines, repeat_bytes);
@@ -368,6 +372,7 @@ test "printTiming renders one row per phase and per checker" {
     try printTiming(
         &out.writer,
         .{
+            .config_ns = 2_000_000,
             .load_ns = 1_000_000,
             .parse_ns = 3_000_000,
             .bind_ns = 4_000_000,
@@ -398,6 +403,7 @@ test "printTiming renders one row per phase and per checker" {
     );
     const s = out.written();
     try std.testing.expect(std.mem.startsWith(u8, s, "\n--timing\n"));
+    try std.testing.expect(std.mem.indexOf(u8, s, "  config          2.000") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "  load            1.000") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "  total           9.000\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "    checker[1]      2.000 ms  4 file(s)\n") != null);

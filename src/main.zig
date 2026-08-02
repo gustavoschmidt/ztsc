@@ -23,9 +23,10 @@
 //! check diagnostics come from exactly the checker that owns it, and the
 //! final print is per file (in graph order), position-sorted —
 //! byte-identical for any --workers/--checkers combination. `--timing`
-//! reports the per-phase split (load/parse/bind are summed per-file
-//! worker times, since files stream through the pipeline; `discover` is
-//! the front-end wall clock) plus a per-checker breakdown; `--memory`
+//! reports the per-phase split (`config` is tsconfig loading and its
+//! `include` walk; load/parse/bind are summed per-file worker times,
+//! since files stream through the pipeline; `discover` is the front-end
+//! wall clock) plus a per-checker breakdown; `--memory`
 //! reports arena/token/AST/binder statistics plus per-checker type-store
 //! bytes and module-graph bytes.
 
@@ -464,8 +465,17 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     }
 
+    // Everything from here on is real work, so `total` starts here rather than
+    // after config loading: reading and expanding a tsconfig walks the project
+    // tree, which on a large repo costs more than any single later phase and
+    // must not hide outside the measured window.
+    const total_timer = Timer.start(io);
+
     // With no file arguments, drive the run from a tsconfig.json.
     var entry_paths = cli.paths;
+    // The `config` phase: discovery, `extends` chasing, the `include` walk and
+    // `collectAutoTypes`. Stays 0 when the run is driven by CLI file arguments.
+    var config_ns: u64 = 0;
     var paths_map: ?ztsc.tsconfig.Paths = null;
     // The tsconfig `lib` field (null when no config / no field), consulted below
     // to pick the built-in lib blobs.
@@ -492,6 +502,7 @@ pub fn main(init: std.process.Init) !void {
     // under the classic runtime (global `JSX` namespace only).
     var config_jsx_runtime_module: ?[]const u8 = null;
     if (cli.paths.len == 0) {
+        const config_timer = Timer.start(io);
         const config_path: []const u8 = blk: {
             if (cli.project) |p| {
                 // Accept either the config file or its directory.
@@ -552,6 +563,7 @@ pub fn main(init: std.process.Init) !void {
         config_types_wildcard = cfg.types_wildcard;
         config_allow_synthetic_default = cfg.allow_synthetic_default_imports;
         config_jsx_runtime_module = cfg.jsx_runtime_module;
+        config_ns = config_timer.readNs();
     }
 
     // Effective decision: skip type-checking the embedded pre-verified lib?
@@ -579,8 +591,6 @@ pub fn main(init: std.process.Init) !void {
     // Pretty diagnostics: tsc-style excerpts + colors; default follows the
     // terminal, --pretty / --pretty=false forces.
     const pretty = cli.pretty orelse (Io.File.stderr().isTty(io) catch false);
-
-    const total_timer = Timer.start(io);
 
     var interner = Interner.init();
     defer interner.deinit(gpa);
@@ -1373,6 +1383,7 @@ pub fn main(init: std.process.Init) !void {
         for (tasks, checker_times) |*t, *ct| ct.* = .{ .ns = t.ns, .files = t.owned.len };
         const fs_counts = rcache.fs.entryCounts();
         try ztsc.report.printTiming(out, .{
+            .config_ns = config_ns,
             .load_ns = load_ns,
             .parse_ns = parse_ns,
             .bind_ns = bind_ns,
