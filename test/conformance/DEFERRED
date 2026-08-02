@@ -94,20 +94,22 @@ module_aug/16_ambient_export_named_scope  -TS2322 entry.ts 14
 constassert/006_template_expr_const_context_negatives.ts  -TS7053 16
 
 # TS2344 decides a written type argument against its parameter's constraint
-# only when that constraint is a PRIMITIVE OR LITERAL SET — a primitive, a
-# literal, an enum member, `never`, or a union/intersection of those (see
-# `decidableConstraintSet`). A STRUCTURAL constraint (`T extends
-# ZodType<any, any, any>`) is left undecided: `isAssignable` answers it, but
-# only as well as the relation does, and the relation currently rejects zod's
-# `ZodNumber` against `ZodType<any, any, any>` — which as the sole evidence
-# for a negative verdict is a false TS2344 on valid code. Same for an argument
-# or constraint that is still a type variable or a deferred node (an `infer`
-# binder, an unreduced conditional / indexed access / `keyof`): those are not
-# sets ztsc can enumerate, and every one of the 130+ false TS2344s the
-# unguarded check invented across the corpus was one of them.
+# when that constraint is a PRIMITIVE OR LITERAL SET (a primitive, a literal,
+# an enum member, `never`, or a union/intersection of those) or a STRUCTURAL
+# type — an object type, or a reference to an interface/class/alias (see
+# `decidableConstraintSet`). The structural arm was closed until the relation
+# could carry a negative verdict on the recursive `this`-typed generic
+# families it is mostly used with; it opened once both halves of the zod
+# counter-example were fixed and pinned (`assignability/078` for measured
+# variance, `assignability/080` for the growing-instantiation guard), with
+# `bench/parity_sweep.sh` at 0 under / 0 excess on all eight packages as the
+# evidence.
 #
-# (tsc reports the structural miss on line 21 as TS2741 — the "property is
-# missing" elaboration replaces the TS2344 head when the target is an object
-# with a required member absent from the source.)
-instantiation/052_type_arg_constraint_structural.ts  -TS2741 21
+# What stays undecided is an argument that is still a type VARIABLE or a
+# DEFERRED node — an `infer` binder, an unreduced conditional / indexed
+# access / `keyof`. Those are not sets ztsc can enumerate, and every one of
+# the 130+ false TS2344s the unguarded check invented across the corpus was
+# one of them. Line 26 is that shape: the argument is `T["k"]`, an indexed
+# access into a still-free `T`, which tsc decides through its constraint
+# machinery and ztsc does not.
 instantiation/052_type_arg_constraint_structural.ts  -TS2344 26

@@ -1348,6 +1348,12 @@ pub fn checkTypeArgConstraints(c: *Checker, sym: SymbolId, args: []const TypeId,
         con = try c.instantiate(con, map_list.items);
         if (!try c.decidableConstraintSet(con)) continue;
         if (try c.isAssignable(arg, con)) continue;
+        // tsc replaces the "does not satisfy" head with the specific
+        // missing-property error whenever that is what went wrong
+        // (`reportRelationError` → `getExactOptionalUnassignableProperties`
+        // path): `Holder<{ s: string }>` against `T extends Shape` is
+        // TS2741, not TS2344.
+        if (try c.tryReportMissingProps(arg, con, c.nodeSpan(an))) continue;
         try c.diagFmt(2344, c.nodeSpan(an), "Type '{s}' does not satisfy the constraint '{s}'.", .{
             try c.typeToString(arg), try c.typeToString(con),
         });
@@ -1360,28 +1366,42 @@ pub const constraint_scan_budget: u32 = 512;
 
 /// May a "does not satisfy" verdict be built against `con` as a TARGET?
 ///
-/// Only when `con` is a PRIMITIVE OR LITERAL SET — a primitive, a literal, an
-/// enum member, `never`, or a union/intersection of those. That is the shape
-/// TS2344 is overwhelmingly about (`K extends keyof T & string`, `K extends
-/// "a" | "b"`, `N extends number`), and it is the shape ztsc decides
-/// *exactly*: membership in a key set is a set question, not a structural one.
+/// Two shapes qualify.
 ///
-/// A STRUCTURAL constraint (`T extends ZodType<any, any, any>`) is not
-/// decided here even though `isAssignable` will happily answer it. The answer
-/// is only as good as the relation, and the relation is not exact enough to
-/// be the sole evidence for a NEGATIVE verdict — it under-reports by design in
-/// several documented places, and each of those would read here as a false
-/// TS2344 on valid code.
+/// A PRIMITIVE OR LITERAL SET — a primitive, a literal, an enum member,
+/// `never`, or a union/intersection of those. That is what TS2344 is
+/// overwhelmingly about (`K extends keyof T & string`, `K extends "a" | "b"`,
+/// `N extends number`), and it is the shape ztsc decides *exactly*: membership
+/// in a key set is a set question, not a structural one.
 ///
-/// The specific gap this comment used to name — zod's `ZodNumber` rejected
-/// against `ZodType<any, any, any>`, variance through a generic reference
-/// carrying a polymorphic `this` — is FIXED (measured variance, see
-/// `measuredVarianceVerdict`), and `test/conformance/assignability/078` pins
-/// it. The gate stays because the general argument does: nothing is lost that
-/// another check catches — a bad argument is still reported wherever it is
-/// USED — and this gate is what keeps the check at zero false positives
-/// across the eight-package corpus. Narrowing it is its own piece of work,
-/// with its own evidence.
+/// A STRUCTURAL constraint — an object type, or a reference to an
+/// interface/class/alias (`T extends Shape`, `T extends ZodType<any, any,
+/// any>`) — which is decided by the relation. That used to be excluded on the
+/// argument that "the answer is only as good as the relation", with zod's
+/// `ZodNumber` against `ZodType<any, any, any>` as the standing counter-
+/// example. Both halves of that example are now fixed and pinned: the variance
+/// half by `measuredVarianceVerdict` (`assignability/078`), and the
+/// growing-instantiation half — `ZodString` against `ZodType<string | number |
+/// symbol, any, any>`, where the walk burnt the whole per-statement
+/// instantiation budget and the truncation came back as a cached FALSE — by
+/// the relation's deeply-nested guard (`max_relation_identity_repeats`,
+/// `assignability/080`). With those closed, `bench/parity_sweep.sh` holds
+/// 0 under / 0 excess on all eight packages with the structural arm ENABLED,
+/// which is the evidence this gate was waiting for.
+///
+/// What stays out is anything still DEFERRED — a free type parameter, a
+/// conditional, a `keyof`, an indexed access, a mapped type, a template
+/// pattern. Those are not sets ztsc can enumerate on either side of the
+/// relation, and they are what the caller's `undecidableType` guard is about.
+///
+/// The structural arm is not free: it is one full relation per written
+/// reference, and on declaration corpora that write many nominal constraints
+/// against large lib interfaces (`T extends HTMLElement`, `T extends
+/// ArrayBufferLike`) it is the dominant new cost — @types/react's check phase
+/// 9.6 → 21 ms, zod's 7.2 → 10.9 ms, measured 2026-08-02. Everything else is
+/// flat: e2e `multi` 0.03 s / 41 MB and excalidraw 0.21 s / 128 MB are
+/// unchanged, because an application writes far fewer such references than a
+/// `.d.ts` package does.
 pub fn decidableConstraintSet(c: *Checker, con: TypeId) Error!bool {
     const s = &c.ts;
     var budget: u32 = constraint_scan_budget;
@@ -1392,6 +1412,9 @@ pub fn decidableConstraintSet(c: *Checker, con: TypeId) Error!bool {
         if (budget == 0) return false;
         budget -= 1;
         switch (s.kind(cur)) {
+            // Structural: decided by the relation. `undecidableType` has
+            // already refused anything still deferred inside it.
+            .object, .ref => if (try c.undecidableType(cur)) return false,
             .string,
             .number,
             .boolean,

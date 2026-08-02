@@ -584,8 +584,23 @@ fn measureOneVariance(c: *Checker, owner: SymbolId, tps: []const TypeParamInfo, 
     if (sub_ref == super_ref) return .independent;
     try c.marker_refs.put(c.cm(), sub_ref, {});
     try c.marker_refs.put(c.cm(), super_ref, {});
+    // A measurement is only as good as the relation that answered it, and the
+    // growing-instantiation guard answers "related" from assumption
+    // (`rel_guard_tripped`). That can only turn a NO into a YES, so the one
+    // verdict it can manufacture is the vacuous both-ways one: a parameter
+    // that is really read-and-written reads as bivariant, and every user of
+    // the generic then relates by nothing at all. Distrust exactly that case
+    // and report the parameter UNMEASURED, so the structural walk decides
+    // (tsc's `VarianceFlags.Unmeasurable`). A one-directional verdict stands:
+    // its NO half was reached without assuming anything, and its YES half
+    // erring towards related is the same under-report the depth cap already
+    // accepts (see `measuredVariances`).
+    const saved_trip = c.rel_guard_tripped;
+    c.rel_guard_tripped = false;
+    defer c.rel_guard_tripped = saved_trip;
     const co = try c.isAssignable(sub_ref, super_ref);
     const contra = try c.isAssignable(super_ref, sub_ref);
+    if (c.rel_guard_tripped and co and contra) return .unmeasured;
     if (co and contra) {
         // Bivariant may just mean the parameter is never witnessed. tsc
         // settles it with a THIRD marker related to neither of the first two
@@ -927,10 +942,17 @@ pub fn checkVarianceAnnotations(c: *Checker, owner: SymbolId) Error!void {
         const src = if (v == .covariant) sub_ref else super_ref;
         const tgt = if (v == .covariant) super_ref else sub_ref;
         const saved_refs = c.variance_marker_refs;
+        const saved_trip = c.rel_guard_tripped;
         c.variance_marker_refs = .{ sub_ref, super_ref };
+        c.rel_guard_tripped = false;
         const ok = c.isAssignable(src, tgt);
         c.variance_marker_refs = saved_refs;
+        const tripped = c.rel_guard_tripped;
+        c.rel_guard_tripped = saved_trip;
         if (try ok) continue;
+        // A relation the growing-instantiation guard had to truncate is not
+        // evidence that the annotation is wrong (see `rel_guard_tripped`).
+        if (tripped) continue;
         try c.reportVarianceMismatch(tp.sym, src, tgt);
     }
 }
@@ -945,6 +967,17 @@ pub fn refFacetOf(c: *Checker, ty: TypeId, k: types.Kind) ?TypeId {
 }
 
 pub fn isAssignable(c: *Checker, s0: TypeId, t0: TypeId) Error!bool {
+    return relate(c, s0, t0, true);
+}
+
+/// One relation frame. `memoize` is false for the single caller that
+/// DELEGATES its own frame's question unchanged — the `.ref` arm of
+/// `isAssignableInner`, which resolves a lazy reference to the very
+/// materialization the memo key already canonicalizes it to (see the key
+/// below). Both frames then carry the same key, so letting the inner one
+/// consult the memo would read the outer one's own in-progress mark and
+/// answer "related" without doing any work at all.
+fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!bool {
     // Structural-relation recursion guard (see `max_relation_depth`). Past
     // the cap, assume the pair related — this only drops diagnostics, never
     // adds a false positive. Returns before the `(s,t)` relation memo below,
@@ -965,6 +998,11 @@ pub fn isAssignable(c: *Checker, s0: TypeId, t0: TypeId) Error!bool {
     if (s == t) return true;
     const sk = c.ts.kind(s);
     const tk = c.ts.kind(t);
+    // The generic reference each side denotes (`refFacetOf`), read ONCE: the
+    // origin fast-paths, the variance probe and the relation memo key all
+    // want it, and each used to pay its own `origin` lookup.
+    const sr = c.refFacetOf(s, sk);
+    const tr = c.refFacetOf(t, tk);
     // Reflexive origin fast-path (see `origin`): two distinct materialized
     // types (object or function member) that both denote the same generic
     // instantiation `G<A…>` — identical symbol AND element-wise-equal args,
@@ -974,8 +1012,8 @@ pub fn isAssignable(c: *Checker, s0: TypeId, t0: TypeId) Error!bool {
     // type. Identity-only: no variance, it fires solely when the origin refs
     // are equal.
     if (originTaggable(sk) and sk == tk) {
-        if (c.origin.get(s)) |os| {
-            if (c.origin.get(t)) |ot| {
+        if (sr) |os| {
+            if (tr) |ot| {
                 // Reflexive identity: same interned origin ref (see `origin`).
                 if (os == ot) return true;
                 // Variance-free EQUIVALENCE: both denote `G<…>` for the same
@@ -987,9 +1025,7 @@ pub fn isAssignable(c: *Checker, s0: TypeId, t0: TypeId) Error!bool {
                 // reflexive. This closes the RTK non-confluence where one
                 // instantiation carries an unreduced config `C1 = P & Omit<…>`
                 // and the other the concrete reduction `C2 = P`.
-                if (c.ts.kind(os) == .ref and c.ts.kind(ot) == .ref and
-                    c.ts.refSymbol(os) == c.ts.refSymbol(ot))
-                {
+                if (c.ts.refSymbol(os) == c.ts.refSymbol(ot)) {
                     if (try c.originArgEquiv(os, ot, 0)) return true;
                 }
             }
@@ -999,16 +1035,16 @@ pub fn isAssignable(c: *Checker, s0: TypeId, t0: TypeId) Error!bool {
     // denote one type (see `origin`), so the relation between them is
     // reflexive in both directions.
     if (sk == .ref and originTaggable(tk)) {
-        if (c.origin.get(t)) |ot| {
+        if (tr) |ot| {
             if (ot == s) return true;
-            if (c.ts.kind(ot) == .ref and c.ts.refSymbol(ot) == c.ts.refSymbol(s) and
+            if (c.ts.refSymbol(ot) == c.ts.refSymbol(s) and
                 try c.originArgEquiv(ot, s, 0)) return true;
         }
     }
     if (tk == .ref and originTaggable(sk)) {
-        if (c.origin.get(s)) |os| {
+        if (sr) |os| {
             if (os == t) return true;
-            if (c.ts.kind(os) == .ref and c.ts.refSymbol(os) == c.ts.refSymbol(t) and
+            if (c.ts.refSymbol(os) == c.ts.refSymbol(t) and
                 try c.originArgEquiv(os, t, 0)) return true;
         }
     }
@@ -1029,12 +1065,12 @@ pub fn isAssignable(c: *Checker, s0: TypeId, t0: TypeId) Error!bool {
     // tsc's variance comparison keeps a structural fallback, so an inner
     // generic whose own annotation contradicts its members (already reported
     // on its own line) must not make its every USER a second report.
-    if (c.refFacetOf(s, sk)) |sr| {
-        if (c.refFacetOf(t, tk)) |tr| {
-            if (sr != tr and c.ts.refSymbol(sr) == c.ts.refSymbol(tr) and
-                !c.isVarianceMarkerRef(sr) and !c.isVarianceMarkerRef(tr))
+    if (sr) |sref| {
+        if (tr) |tref| {
+            if (sref != tref and c.ts.refSymbol(sref) == c.ts.refSymbol(tref) and
+                !c.isVarianceMarkerRef(sref) and !c.isVarianceMarkerRef(tref))
             {
-                if (try c.varianceVerdict(sr, tr)) |verdict| {
+                if (try c.varianceVerdict(sref, tref)) |verdict| {
                     if (verdict or c.variance_marker_refs[0] == 0) return verdict;
                 }
                 // Nothing declared, or nothing decisive: MEASURE how the
@@ -1048,8 +1084,8 @@ pub fn isAssignable(c: *Checker, s0: TypeId, t0: TypeId) Error!bool {
                 // guard for a measured pair: a mixed `<in A, B>` measuring `B`
                 // leaves `A` identical on both sides and `B` unannotated, so
                 // `varianceVerdict` is never decisive on it.)
-                if (!c.marker_refs.contains(sr) and !c.marker_refs.contains(tr)) {
-                    if (try c.measuredVarianceVerdict(sr, tr)) return true;
+                if (!c.marker_refs.contains(sref) and !c.marker_refs.contains(tref)) {
+                    if (try c.measuredVarianceVerdict(sref, tref)) return true;
                 }
             }
         }
@@ -1073,21 +1109,127 @@ pub fn isAssignable(c: *Checker, s0: TypeId, t0: TypeId) Error!bool {
     const base = try c.literalBaseOf(s);
     if (base != types.no_type and base == t) return true;
 
-    // Cache compound comparisons (recursion termination for refs).
-    const cacheable = isCompound(sk) or isCompound(tk);
-    const key = (@as(u64, s) << 32) | t;
+    // Cache compound comparisons (recursion termination for refs), keyed on
+    // what each side DENOTES rather than on the TypeId it happens to be: a
+    // materialized instantiation is keyed by its origin ref (`relKeyOf`).
+    //
+    // Two objects carrying the same origin ref denote the same nominal
+    // instantiation `G<A…>` — identical symbol AND element-wise-equal args,
+    // since `makeRef` interns — so they pose the SAME relation question, and
+    // the re-materialization a `this`-substituting member hands back (a fresh
+    // TypeId, since it does not intern back to the object the walk started
+    // from) now hits the in-progress mark instead of restarting the walk.
+    // Sound for exactly the reason the reflexive fast-path above is.
+    const cacheable = memoize and (isCompound(sk) or isCompound(tk));
+    const key = (@as(u64, relKeyOf(s, sk, sr)) << 32) | relKeyOf(t, tk, tr);
     if (cacheable) {
         if (c.relation.get(key)) |v| {
             c.stats.relation_hits += 1;
             if (v == 2) return true; // in progress: assume (recursive types)
             return v == 1;
         }
+    }
+    // Growing-instantiation guard (tsc's `isDeeplyNestedType`, see
+    // `max_relation_identity_repeats`). Runs BEFORE the in-progress mark is
+    // written: an assumed answer must leave no trace in the memo, or the
+    // `2` would answer every later reader of the pair.
+    //
+    // Pushed FIRST, then tested with this frame included — the growth test
+    // reads the chain, and this frame is its last link. Either side growing is
+    // enough: one runaway spine is all it takes for the walk not to terminate,
+    // and the growth test is precise enough that it does not fire on the
+    // ordinary recursive types tsc's both-sides rule exists to protect.
+    var pushed = false;
+    if (sr) |sref| {
+        if (tr) |tref| {
+            if (c.rel_id_depth >= max_relation_depth) {
+                c.rel_guard_tripped = true;
+                return true;
+            }
+            c.rel_src_ids[c.rel_id_depth] = .{ .sym = c.ts.refSymbol(sref), .ref = sref };
+            c.rel_tgt_ids[c.rel_id_depth] = .{ .sym = c.ts.refSymbol(tref), .ref = tref };
+            c.rel_src_buckets[relIdBucket(c.rel_src_ids[c.rel_id_depth].sym)] += 1;
+            c.rel_tgt_buckets[relIdBucket(c.rel_tgt_ids[c.rel_id_depth].sym)] += 1;
+            c.rel_id_depth += 1;
+            pushed = true;
+        }
+    }
+    defer if (pushed) {
+        c.rel_id_depth -= 1;
+        c.rel_src_buckets[relIdBucket(c.rel_src_ids[c.rel_id_depth].sym)] -= 1;
+        c.rel_tgt_buckets[relIdBucket(c.rel_tgt_ids[c.rel_id_depth].sym)] -= 1;
+    };
+    if (pushed and (c.relIdDeeplyNested(true) or c.relIdDeeplyNested(false))) {
+        c.rel_guard_tripped = true;
+        return true;
+    }
+    if (cacheable) {
         c.stats.relation_misses += 1;
         try c.relation.put(c.cm(), key, 2);
     }
     const result = try c.isAssignableInner(s, t, sk, tk);
     if (cacheable) try c.relation.put(c.cm(), key, @intFromBool(result));
     return result;
+}
+
+/// One side's relation-memo key: the generic reference an OBJECT
+/// materialization denotes (`refFacetOf`), the TypeId itself otherwise.
+///
+/// Restricted to `.object` on purpose. An interface/class instantiation is
+/// fully determined by its origin ref, so two route-divergent materializations
+/// of `G<A…>` pose one question and share one memo entry. The other
+/// origin-tagged kinds are not: a recursive alias whose body is an
+/// INTERSECTION is tagged with a ref that also stands for the lazy, unexpanded
+/// spelling of itself, so keying the intersection by that ref makes the
+/// expansion's own question indistinguishable from the ref's and answers it
+/// from the in-progress mark (assignability/074 pins the resulting
+/// under-report).
+fn relKeyOf(ty: TypeId, k: types.Kind, facet: ?TypeId) TypeId {
+    if (k != .object) return ty;
+    return facet orelse ty;
+}
+
+fn relIdBucket(sym: SymbolId) usize {
+    return @as(usize, sym) & (checker_zig.rel_id_buckets - 1);
+}
+
+/// Is the generic on the top of the live source (`src`) or target relation
+/// stack GROWING — has it re-entered `max_relation_identity_repeats` times,
+/// each time as a strictly LATER instantiation than the one before?
+///
+/// The "strictly later" half is what tells a runaway apart from an ordinary
+/// recursive type, and it is tsc's own test (`isDeeplyNestedType`: "we only
+/// count occurrences with a higher type id than the previous occurrence,
+/// since otherwise we could infinitely recurse on types that are structurally
+/// identical"). Types are interned in creation order, so a chain that keeps
+/// building a bigger argument — zod's `Base<string, …>` → `Isec<Base<string,
+/// …>, Any>` → `Base<any, IsecDef<…>, any>` → … — has a strictly increasing
+/// ref id, while `Uint8Array<ArrayBufferLike>` meeting itself through its own
+/// members does not, and neither does the second frame a lazy `.ref` and its
+/// materialization occupy (they carry the SAME ref). Only the first is
+/// unbounded; assuming the other two related loses real diagnostics
+/// (excalidraw's `new Blob([…, new Uint8Array(…)])` TS2322 is the one that
+/// caught it).
+///
+/// The bucket counter is an exact upper bound on the occurrences of any one
+/// symbol in its bucket, so the scan runs only for a symbol that could
+/// possibly qualify.
+pub fn relIdDeeplyNested(c: *const Checker, src: bool) bool {
+    const ids = if (src) &c.rel_src_ids else &c.rel_tgt_ids;
+    const top = ids[c.rel_id_depth - 1];
+    const buckets = if (src) &c.rel_src_buckets else &c.rel_tgt_buckets;
+    if (buckets[relIdBucket(top.sym)] < checker_zig.max_relation_identity_repeats) return false;
+    var seen: u32 = 0;
+    var last: TypeId = 0;
+    for (ids[0..c.rel_id_depth]) |id| {
+        if (id.sym != top.sym) continue;
+        if (id.ref > last) {
+            seen += 1;
+            if (seen >= checker_zig.max_relation_identity_repeats) return true;
+        }
+        last = id.ref;
+    }
+    return false;
 }
 
 /// The true branch of a deferred conditional, read with the knowledge that
@@ -1423,11 +1565,17 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
     // objects are intentionally excluded.
     if (tk == .ref and c.globalSymNamed(c.ts.refSymbol(t), "Function") and try c.isCallableForFunctionIface(s, sk)) return true;
     // Refs: expand and recurse (cache on the ref pair terminates cycles).
+    //
+    // The recursion does NOT memoize: the expansion of a ref canonicalizes to
+    // that very ref (`refFacetOf`), so the inner frame's key is this frame's
+    // key, and consulting the memo would read our own in-progress mark and
+    // answer "related" without expanding anything. See `relate`.
     if (sk == .ref or tk == .ref) {
         const rs = try c.resolveStructural(s);
         const rt = try c.resolveStructural(t);
         if (rs == s and rt == t) return false;
-        return c.isAssignable(rs, rt);
+        if (rs == rt) return true;
+        return relate(c, rs, rt, false);
     }
     // Enum types are nominal (identical enums caught by s == t earlier).
     if (sk == .enum_type or tk == .enum_type) return c.enumAssignable(s, t, sk, tk);
@@ -1797,7 +1945,21 @@ pub fn structuralAssignable(c: *Checker, s: TypeId, t: TypeId) Error!bool {
     // whose every known property conforms. A source with neither — a bare
     // primitive, function, class instance, or interface without an index —
     // fails vacuously no longer: it fails, period.
-    if (sidx != 0) {
+    // A target string index whose type is exactly `any` short-circuits the
+    // whole index-signature relation for any NON-PRIMITIVE source (tsc
+    // `indexSignaturesRelatedTo`: `targetHasStringIndex && targetInfo.type
+    // & TypeFlags.Any` → `Ternary.True`, guarded by `!sourceIsPrimitive`).
+    // This is what makes `Record<string, any>` the "any object" escape hatch
+    // it is in practice: an interface or class instance, which has no index
+    // signature of its own and no implied one, still satisfies it — and it
+    // is why `T extends Record<string, any>` (react-hook-form's
+    // `FieldValues`, the shape `instantiation/025` and `jsx/017` are built
+    // on) accepts a plain `interface Form`. `unknown` does NOT get the
+    // exemption — it is not `any` (verified against the oracle:
+    // conformance `assignability/058`).
+    const sidx_any = sidx != 0 and isNonPrimitiveKind(c.ts.kind(s)) and
+        c.ts.kind(try c.resolveStructural(sidx)) == .any;
+    if (sidx != 0 and !sidx_any) {
         switch (c.ts.kind(s)) {
             .object => {
                 if (c.ts.objectStringIndex(s) != 0) {
@@ -1808,19 +1970,6 @@ pub fn structuralAssignable(c: *Checker, s: TypeId, t: TypeId) Error!bool {
                         if (!try c.isAssignable(sp.ty, sidx)) return false;
                     }
                 } else return false; // interface / class instance, no index sig
-            },
-            // An array/tuple has no *string* index signature of its own, so
-            // tsc rejects it against a target string index ("Index signature
-            // for type 'string' is missing in type 'T[]'") — with one
-            // exception: a target string index whose type is exactly `any`
-            // short-circuits the whole index-signature relation. `unknown`
-            // does NOT get that exemption — it is not `any` (verified
-            // against the oracle: conformance assignability/058). Decisive
-            // for
-            // `[…] → { [k: string]: any; …optional }`, the shape of a real
-            // project's `{ …optional; [key: string]: any }` catch-all.
-            .array, .tuple => {
-                if (c.ts.kind(try c.resolveStructural(sidx)) != .any) return false;
             },
             else => return false,
         }
