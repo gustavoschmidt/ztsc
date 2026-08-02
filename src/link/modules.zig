@@ -1457,12 +1457,22 @@ const Linker = struct {
             if (rec.local != local_atom) continue;
             if (rec.scope != f.bind.symbol_scopes[local_sym]) continue;
             const t_only = type_only or rec.type_only;
-            // `import x = require("m"); export = x;` where "m" is an AMBIENT
-            // module (no file behind it) is how every `node:<mod>` alias in
-            // `@types/node` is written. Resolving it needs the ambient
-            // registry, not the file graph; without it the alias — and so
-            // every member reached through it — degraded to `any`.
-            if (rec.kind == .equals and f.specs.get(rec.module) == null) {
+            // `import x = require("m"); export = x;` — and its ES twin
+            // `import * as x from "m"; export { x };` — where "m" is an
+            // AMBIENT module (no file behind it). The first is how every
+            // `node:<mod>` alias in `@types/node` is written; the second is
+            // how `fs.d.ts` re-exports `promises`. Both name the module
+            // NAMESPACE OBJECT, so both resolve through the ambient registry
+            // rather than the file graph; without this the alias — and every
+            // member reached through it — degraded to `any`.
+            //
+            // The registry's key space is seeded before any table is filled
+            // (`buildAmbient`), so the `.ambient_ns` payload is always
+            // available here. The `export =` preference below is not: a block
+            // processed after this one has not stored its `export =` entity
+            // yet, and the namespace object is what we fall back to — the
+            // same ordering caveat the `equals` form has always had.
+            if ((rec.kind == .equals or rec.kind == .namespace) and f.specs.get(rec.module) == null) {
                 const key = l.ambientKey(rec.module) orelse return .{ .kind = .any };
                 var tgt: Target = .{ .kind = .ambient_ns, .payload = @intCast(l.ambient.getIndex(key).?), .type_only = t_only };
                 if (l.ambient.getPtr(key).?.get(l.atom_export_equals)) |exeq| {
