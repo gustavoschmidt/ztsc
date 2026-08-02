@@ -405,6 +405,11 @@ pub const Store = struct {
         };
     }
 
+    /// Pre-size the hash-consing map for `n` expected types.
+    pub fn reserveTypes(s: *Store, n: usize) Error!void {
+        try s.map.ensureTotalCapacityContext(s.alloc, @intCast(n), .{ .store = s });
+    }
+
     /// Seal a base store: no further interning, safe to share read-only as the
     /// frozen base of any number of overlays.
     pub fn freeze(s: *Store) void {

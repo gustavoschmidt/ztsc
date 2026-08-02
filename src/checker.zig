@@ -561,15 +561,15 @@ pub const map_containers = [_][]const u8{
     "ref_keys",                 "flow_loop_stack",        "flow_stack",
     "flow_tmp",                 "da_cache",               "ctp_cache",
     "cmp_cache",                "mmp_cache",              "inst_cache",
-    "inst_map_ids",             "tp_constraint_cache",    "fresh_tp_ids",
-    "fresh_tp_info",            "type_node_cache",        "atom_cache",
-    "infer_ids",                "infer_scopes",           "mapped_key_ids",
-    "mapped_key_scopes",        "inst_diag_at",           "infer_active",
-    "lazy_member_active",       "chain_guards",           "never_isect",
-    "deep_path_list",           "deep_path_ids",          "flow_reach",
-    "member_type_stack",        "lazy_index_objs",        "pending_type_args",
-    "pending_type_args_pool",   "pending_type_args_seen", "tp_constrained_cache",
-    "nominal_bases",            "nominal_base_pool",
+    "arrayish_elem_cache",      "inst_map_ids",           "tp_constraint_cache",
+    "fresh_tp_ids",             "fresh_tp_info",          "type_node_cache",
+    "atom_cache",               "infer_ids",              "infer_scopes",
+    "mapped_key_ids",           "mapped_key_scopes",      "inst_diag_at",
+    "infer_active",             "lazy_member_active",     "chain_guards",
+    "never_isect",              "deep_path_list",         "deep_path_ids",
+    "flow_reach",               "member_type_stack",      "lazy_index_objs",
+    "pending_type_args",        "pending_type_args_pool", "pending_type_args_seen",
+    "tp_constrained_cache",     "nominal_bases",          "nominal_base_pool",
 };
 
 /// Where one symbol's declared heritage lives in `Checker.nominal_base_pool`.
@@ -892,10 +892,22 @@ pub const Checker = struct {
     /// reference narrowed to nothing apart from one read in dead code — see
     /// `flowReachable`.
     flow_reach: std.AutoHashMapUnmanaged(u32, u8) = .empty,
-    /// containsTypeParam memo: 0 unknown, 1 no, 2 yes.
-    ctp_cache: std.AutoHashMapUnmanaged(TypeId, u8) = .empty,
-    /// containsMappedParam memo: 0 unknown, 1 no, 2 yes.
-    cmp_cache: std.AutoHashMapUnmanaged(TypeId, u8) = .empty,
+    /// containsTypeParam memo, a dense `TriMemo` (see it for why not a map).
+    ctp_cache: std.ArrayList(u8) = .empty,
+    /// containsMappedParam memo, dense like `ctp_cache`.
+    cmp_cache: std.ArrayList(u8) = .empty,
+    /// Numeric element type of a TUPLE or of a UNION of arrayish types —
+    /// `numberIndexType`'s tuple arm and `elemOfArrayish`'s union arm, which
+    /// are the same function of the same (immutable, interned) shape.
+    ///
+    /// The two are mutually recursive through a rest element (`[...T]` whose
+    /// `T` is itself a tuple with a rest), so a nested variadic tuple —
+    /// typebox's `TSchema` parameter packs are built from them — re-walks
+    /// the whole nest once per element, and `tupleElemTypeAt` asks again per
+    /// argument position on top of that. Both loops are self-time in the
+    /// profile; the memo turns the repeated subtrees into one walk.
+    /// Gated by `inst_cache_on` (`--no-inst-cache` is the oracle leg).
+    arrayish_elem_cache: std.AutoHashMapUnmanaged(TypeId, TypeId) = .empty,
     /// mentionsMappedParam memo, keyed `(t << 32 | key_id)`: 0 unknown/in
     /// progress, 1 no, 2 yes. Separate from `cmp_cache` because the answer
     /// depends on WHICH key parameter is asked about.
@@ -1317,6 +1329,25 @@ pub const Checker = struct {
         // grow on `cm()` and are `deinit`ed; the frozen *base* store keeps its
         // caller-supplied arena (built once, shared read-only, never freed).
         c.ts = if (base) |b| try Store.initOverlay(c.cm(), b) else try Store.init(arena_alloc);
+        // Pre-size the hash-consing map. Growing it is not the usual amortized
+        // O(1): every rehash re-derives each stored key's *shape* — the whole
+        // `extra` payload of the type — and Wyhashes it, so the doubling
+        // sequence costs ~2x one full pass over every type's payload. It
+        // measured ~11% of the check phase on @sinclair/typebox.
+        //
+        // Half the owned AST node count is the estimate: types run ~0.25-0.5
+        // per node across the benchmark packages, so this lands one doubling
+        // short of the final size — the map ends at exactly the capacity it
+        // would have reached anyway (peak RSS unchanged, measured on all five
+        // packages), while the whole geometric tail of small rehashes is
+        // skipped. Reserving the full node count removes the last rehash too
+        // but overshoots the final capacity, and cost 1-2 MB of peak RSS on
+        // zod/drizzle/hono for ~1% more wall — not the trade this project makes.
+        {
+            var owned_nodes: usize = 0;
+            for (owned) |f| owned_nodes += prog.files[f].tree.nodes.len;
+            try c.ts.reserveTypes(owned_nodes / 2);
+        }
         // Sized to include the merged-symbol range (ids ≥ totalSymbols()),
         // so merged ids are valid sym_types/sym_state indices. These
         // are indexed by *global* SymbolId — a checker reads them for foreign
@@ -1481,6 +1512,25 @@ pub const Checker = struct {
 
     pub fn scratch(c: *Checker) Allocator {
         return c.scratch_arena.allocator();
+    }
+
+    /// Read a dense tri-state memo (`ctp_cache` / `cmp_cache`): 0 unknown or
+    /// in progress, 1 no, 2 yes. Out of range reads as 0, so an entry that
+    /// was never written is indistinguishable from "unknown" — the same
+    /// contract the hash-map form had for an absent key.
+    ///
+    /// These are keyed by `TypeId`, and a `TypeId` is a dense counter: the
+    /// frozen base holds only the 17 intrinsics, so every type a checker
+    /// materializes is `base_len + local_index`. A byte per type is both
+    /// smaller and faster than a hash entry — the maps were ~7% of the check
+    /// phase on @sinclair/typebox, nearly all of it hashing and probing.
+    pub fn triGet(_: *const Checker, v: *const std.ArrayList(u8), t: TypeId) u8 {
+        return if (t < v.items.len) v.items[t] else 0;
+    }
+
+    pub fn triSet(c: *Checker, v: *std.ArrayList(u8), t: TypeId, val: u8) Error!void {
+        if (t >= v.items.len) try v.appendNTimes(c.cm(), 0, t + 1 - v.items.len);
+        v.items[t] = val;
     }
     /// Allocator for stable, one-shot checker payload (never individually
     /// freed): interned enum value arrays, canonical substitution-map key
