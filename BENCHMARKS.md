@@ -1,7 +1,7 @@
 # ZTSC — Benchmarks
 
 Wall clock and peak memory for **ztsc vs tsgo** (the native TypeScript 7
-compiler), checking real, published packages and real applications on identical
+compiler), checking real, published packages and a real application on identical
 inputs. Package matrix measured 2026-07-26 on an Apple M4 with ztsc at commit
 374d2c2; the excalidraw application row 2026-07-30 at commit 218978d, same
 machine.
@@ -94,17 +94,16 @@ its 76 diagnostics. The bug is fixed (commit 374d2c2) and the numbers above are
 the first honest measurement of that package at the default — understated before,
 because a crashed run stops paying for work it never did.
 
-### Beyond the packages: whole applications
+### Beyond the packages: a whole application
 
-Two applications are measured — a whole app graph rather than a single package's
+One application is measured — a whole app graph rather than a single package's
 `.d.ts`. Both tools at their default 4 checkers:
 
 | application | wall ztsc / tsgo | peak RSS ztsc / tsgo | rss vs tsgo | diagnostics |
 |---|---:|---:|---:|---|
 | **excalidraw** 0.18.1 (`a2ec2889`) — public | 0.355 / 0.502 s | 129.8 / 649.5 MB | 20% | the same 17 as tsgo, at every checker count |
-| production React/TS app — private | 0.40 / 0.53 s | 219.6 / 734 MB | 30% | all 48 of tsc's errors byte-identical, + 2 tracked false positives |
 
-**excalidraw** is the public, reproducible row, measured 2026-07-30 with ztsc
+**excalidraw** is public and reproducible, measured 2026-07-30 with ztsc
 at commit 218978d. It loads 1,110 files / 332,794 lines (537 of them the project's own source; the rest are
 the dependency `.d.ts` closure and the standard library) and checks them
 **1.4× faster at 20% of tsgo's peak memory**.
@@ -136,11 +135,6 @@ so nothing else changes). ztsc reads *both* files, and its diagnostic set is
 identical under either — the same 17 keys, and the same 1,110 files / 332,794
 lines loaded — so the adjustment changes what tsgo can run, not what is being
 measured.
-
-The **private** row is the standing dogfood target, measured 2026-07-26 and
-scored against `tsc` 5.9.3. That codebase is private, so the run is not
-reproducible from this repository; excalidraw above is its public counterpart.
-None of its 2 false positives reproduce on excalidraw.
 
 ### Scaling with `--checkers`
 

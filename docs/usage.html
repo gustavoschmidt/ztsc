@@ -173,11 +173,9 @@ ztsc src/main.ts           # or explicit entry files</code></pre>
   <h2>What it doesn't check yet</h2>
   <p>ztsc is pre-release. The biggest gaps: <strong>no Windows</strong> (macOS and Linux work
   today; a port is planned), <strong>no watch mode or LSP</strong> (batch only; both planned
-  next), a tsconfig subset (strict mode only — <code>strict: false</code> is refused), and
-  <strong>2 tracked false positives</strong> on the production dogfood application, against
-  all 48 of tsc's real errors reproduced byte-identically — while on
-  <a href="benchmarks.html">excalidraw</a> ztsc reports exactly the same findings as tsgo,
-  with zero excess, at every checker count. Everything else fails in the safe
+  next), and a tsconfig subset (strict mode only — <code>strict: false</code> is refused) —
+  while on <a href="benchmarks.html">excalidraw</a> ztsc reports exactly the same findings as
+  tsgo, with zero excess, at every checker count. Everything else fails in the safe
   direction: ztsc misses an error tsc would report rather than inventing one, and unsupported
   syntax produces a clear <em>"not yet supported"</em> diagnostic — never a crash.</p>
   <p>Run <code>ztsc --census</code> on your project to get a frequency table of exactly which

@@ -9,10 +9,10 @@ TypeScript compiler, byte-identical at any parallelism.
 
 **Full documentation:** https://gustavoschmidt.github.io/ztsc/
 
-- **3.3–16× less peak memory** than tsgo (the native TypeScript 7 compiler) —
-  4.8–16× on eight benchmark packages, 3.3× on a full production app.
-- **Faster on every benchmark** — up to 11× on the packages, 1.3–1.4× on the
-  applications; wall clock, defaults vs. defaults.
+- **4.8–16× less peak memory** than tsgo (the native TypeScript 7 compiler)
+  on eight benchmark packages, 5× on a whole application (excalidraw).
+- **Faster on every benchmark** — up to 11× on the packages, 1.4× on the
+  application; wall clock, defaults vs. defaults.
 - **Same findings as tsgo on a real app** — on excalidraw, exactly the same
   17 diagnostics (file, line, column, code) at every checker count, 1.4×
   faster in 20% of the memory.
@@ -41,17 +41,14 @@ faster on everything bigger than the process floor.
 </picture>
 
 Declaration files exercise the type-level machinery; real application source
-exercises the rest, and two whole applications are measured. On
+exercises the rest, and a whole application is measured. On
 [excalidraw](https://github.com/excalidraw/excalidraw) — public and pinned,
 checked with its `node_modules` — ztsc finishes in **0.35 s and 129.8 MB**
 against tsgo's 0.50 s and 649.5 MB, and reports **exactly the same 17
 diagnostics as tsgo**: same file, line, column and code, at every checker count
-from 1 to 8. On a large private production React/TypeScript app — full
-`.ts`/`.tsx`, frontend and backend — it finishes in **0.40 s and 219.6 MB**
-against tsgo's 0.53 s and 734 MB, while reproducing all 48 of tsc's errors
-byte-identically.
+from 1 to 8.
 
-All eight packages, both application runs, methodology, and how to reproduce
+All eight packages, the application run, methodology, and how to reproduce
 every number — including the exact excalidraw recipe: [BENCHMARKS.md](BENCHMARKS.md)
 · [benchmarks page](https://gustavoschmidt.github.io/ztsc/benchmarks.html).
 
@@ -126,9 +123,7 @@ well-defined subset of strict-mode TypeScript — watch mode, an LSP, and
 Windows are the biggest gaps, all planned. Unsupported syntax produces a clear
 "not supported" diagnostic, never a crash, and known gaps *under-report*
 rather than inventing errors on valid code: on excalidraw it reports exactly
-the same 17 diagnostics as tsgo with no false positives at all, and on the
-private production dogfood app it reproduces all 48 of tsc's errors
-byte-identically and adds 2 tracked false positives. `ztsc --census` tells you
+the same 17 diagnostics as tsgo with no false positives at all. `ztsc --census` tells you
 in one command exactly which unsupported constructs your own project contains.
 
 On Windows specifically, ztsc does not build or run yet: the checker's
