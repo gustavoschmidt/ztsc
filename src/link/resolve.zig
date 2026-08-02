@@ -41,7 +41,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
-const tsconfig = @import("tsconfig.zig");
+const tsconfig = @import("../tsconfig.zig");
 const paths = @import("paths.zig");
 
 const Error = @import("modules.zig").Error;

@@ -63,7 +63,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const ast = @import("ast.zig");
 const scanner = @import("scanner.zig");
-const intern = @import("intern.zig");
+const intern = @import("../intern.zig");
 const diagnostics = @import("diagnostics.zig");
 const source = @import("source.zig");
 

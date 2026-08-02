@@ -9,7 +9,7 @@
 const std = @import("std");
 const Io = std.Io;
 
-const ast = @import("ast.zig");
+const ast = @import("../frontend/ast.zig");
 const Ast = ast.Ast;
 
 fn nsToMs(ns: u64) f64 {

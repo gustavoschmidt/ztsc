@@ -194,13 +194,13 @@
   <table>
     <thead><tr><th>stage</th><th>output struct</th><th>defined in</th><th>what it holds</th><th>read by</th></tr></thead>
     <tbody>
-      <tr><td>load</td><td><code>Source</code></td><td><code>source.zig</code></td><td>mmapped bytes + line-start table</td><td>parse, render</td></tr>
-      <tr><td>scan (inside parse)</td><td><code>Tokens</code></td><td><code>scanner.zig</code></td><td>SoA token stream: tags + start offsets</td><td>parse, everyone via <code>Ast</code></td></tr>
-      <tr><td>parse</td><td><code>Ast</code></td><td><code>ast.zig</code></td><td>SoA nodes + <code>extra_data</code> + parse diagnostics</td><td>bind, check</td></tr>
-      <tr><td>bind</td><td><code>Bind</code></td><td><code>binder.zig</code></td><td>symbols, scopes, flow graph, import/export records</td><td>link, check</td></tr>
-      <tr><td>resolve + link</td><td><code>Program</code></td><td><code>resolve.zig</code> / <code>modules.zig</code></td><td>all files + link tables + merged globals + ambient modules</td><td>check (×N, lock-free)</td></tr>
+      <tr><td>load</td><td><code>Source</code></td><td><code>frontend/source.zig</code></td><td>mmapped bytes + line-start table</td><td>parse, render</td></tr>
+      <tr><td>scan (inside parse)</td><td><code>Tokens</code></td><td><code>frontend/scanner.zig</code></td><td>SoA token stream: tags + start offsets</td><td>parse, everyone via <code>Ast</code></td></tr>
+      <tr><td>parse</td><td><code>Ast</code></td><td><code>frontend/ast.zig</code></td><td>SoA nodes + <code>extra_data</code> + parse diagnostics</td><td>bind, check</td></tr>
+      <tr><td>bind</td><td><code>Bind</code></td><td><code>frontend/binder.zig</code></td><td>symbols, scopes, flow graph, import/export records</td><td>link, check</td></tr>
+      <tr><td>resolve + link</td><td><code>Program</code></td><td><code>link/resolve.zig</code> / <code>link/modules.zig</code></td><td>all files + link tables + merged globals + ambient modules</td><td>check (×N, lock-free)</td></tr>
       <tr><td>check</td><td><code>Store</code> + <code>Diag</code>s</td><td><code>types.zig</code> / <code>checker.zig</code></td><td>hash-consed types (per checker) + coded diagnostics</td><td>report</td></tr>
-      <tr><td>report</td><td>terminal output</td><td><code>render.zig</code></td><td>tsc-style excerpts rendered from <code>Diag</code> + <code>Source</code></td><td>you</td></tr>
+      <tr><td>report</td><td>terminal output</td><td><code>report/render.zig</code></td><td>tsc-style excerpts rendered from <code>Diag</code> + <code>Source</code></td><td>you</td></tr>
     </tbody>
   </table>
   </div>
@@ -297,7 +297,7 @@
       <line class="hairv" x1="440" y1="30" x2="440" y2="300"/>
 
       <!-- right: SoA -->
-      <text class="t13" x="480" y="30">ztsc struct-of-arrays <tspan class="mut" font-weight="400">(ast.zig)</tspan></text>
+      <text class="t13" x="480" y="30">ztsc struct-of-arrays <tspan class="mut" font-weight="400">(frontend/ast.zig)</tspan></text>
 
       <text class="t11 dim" x="480" y="76">tag: u8</text>
       <text class="t11 mut" x="480" y="90">1 B/node</text>

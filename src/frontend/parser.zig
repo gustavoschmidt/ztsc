@@ -55,7 +55,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const scanner = @import("scanner.zig");
 const ast = @import("ast.zig");
-const types = @import("types.zig");
+const types = @import("../types.zig");
 const diagnostics = @import("diagnostics.zig");
 const directives = @import("directives.zig");
 

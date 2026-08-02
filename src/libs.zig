@@ -10,9 +10,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
-const ast = @import("ast.zig");
-const parser = @import("parser.zig");
-const binder = @import("binder.zig");
+const ast = @import("frontend/ast.zig");
+const parser = @import("frontend/parser.zig");
+const binder = @import("frontend/binder.zig");
 const intern = @import("intern.zig");
 
 const Ast = ast.Ast;
