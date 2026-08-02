@@ -1396,12 +1396,19 @@ pub const constraint_scan_budget: u32 = 512;
 ///
 /// The structural arm is not free: it is one full relation per written
 /// reference, and on declaration corpora that write many nominal constraints
-/// against large lib interfaces (`T extends HTMLElement`, `T extends
-/// ArrayBufferLike`) it is the dominant new cost — @types/react's check phase
-/// 9.6 → 21 ms, zod's 7.2 → 10.9 ms, measured 2026-08-02. Everything else is
-/// flat: e2e `multi` 0.03 s / 41 MB and excalidraw 0.21 s / 128 MB are
-/// unchanged, because an application writes far fewer such references than a
-/// `.d.ts` package does.
+/// against large lib interfaces (`T extends HTMLElement` appears 119 times in
+/// @types/react) it was the dominant new cost — that package's check phase
+/// 10.3 → 21.0 ms when the arm landed. Most of it is back: the relation now
+/// answers a derived type against a DECLARED base of itself without walking
+/// members at all (`nominalHeritageRelated`), which took @types/react to
+/// 11.1 ms and its peak RSS 24.3 → 22.1 MB. What is left is the constraints
+/// the fast path cannot settle nominally — zod's `ZodString` against
+/// `ZodType<string | number | symbol, any, any>`, a base instantiation whose
+/// arguments neither match nor are `any`, which is a real structural
+/// question and stays one (10.8 → 10.5 ms). Everything else was flat
+/// throughout: e2e `multi` 0.03 s / 41 MB and excalidraw 0.20 s / 122 MB,
+/// because an application writes far fewer such references than a `.d.ts`
+/// package does.
 pub fn decidableConstraintSet(c: *Checker, con: TypeId) Error!bool {
     const s = &c.ts;
     var budget: u32 = constraint_scan_budget;
