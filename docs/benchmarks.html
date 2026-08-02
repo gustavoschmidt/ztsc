@@ -51,7 +51,7 @@
     </div>
     <div class="stat">
       <div class="k">conformance</div>
-      <div class="v">917/917</div>
+      <div class="v">977/977</div>
       <div class="c">differential cases (error code + line) vs the native TypeScript compiler, tsgo 7.0.2</div>
     </div>
   </div>
@@ -80,10 +80,11 @@
     against tsgo's <strong>0.50&thinsp;s / 649.5&thinsp;MB</strong>, both at their default four
     checkers.</li>
   </ul>
-  <p>The package matrix is not a diagnostic-parity claim: ztsc checks a
-  <a href="limitations.html">measured subset</a> of TypeScript, so those are throughput and
-  memory comparisons on identical inputs. Correctness is tracked separately, by the 917-case
-  differential conformance suite and the excalidraw diagnostic convergence.</p>
+  <p>The package matrix is also a diagnostic-parity claim: on all eight packages ztsc reports
+  exactly the same diagnostics as tsgo — the same (file, line, column, code) set, zero excess
+  and zero under-reports — held by a standing ratcheted gate
+  (<code>bench/parity_sweep.sh</code>), alongside the 977-case differential conformance suite
+  and the excalidraw diagnostic convergence.</p>
 </section>
 
 <!-- ============================================================ -->
@@ -409,12 +410,13 @@ zig-out/bench/ztsc --pretty=false --checkers=4 -p "$C"   # wall: median of 11
 
   <div class="note">
     <p><strong>Read before quoting.</strong> The package matrix is throughput and memory on
-    identical inputs — not a diagnostic-parity claim:</p>
-    <p>ztsc checks a <em>subset</em> of TypeScript (against the real ES-core + DOM lib), so on
-    the packages its diagnostic output differs from tsgo's; correctness is tracked separately by
-    the 917-case differential conformance suite and the excalidraw convergence gate (the same 17
-    diagnostics as tsgo at every checker count — same file, line, column and code, though not
-    the same message text).
+    identical inputs, and also a diagnostic-parity result:</p>
+    <p>ztsc checks a <em>subset</em> of TypeScript (against the real ES-core + DOM lib), but on
+    all eight packages it reports exactly the same diagnostics as tsgo — the same (file, line,
+    column, code) set, zero excess and zero under-reports, held by the ratcheted
+    <code>bench/parity_sweep.sh</code> gate — alongside the 977-case differential conformance
+    suite and the excalidraw convergence gate (the same 17 diagnostics as tsgo at every checker
+    count, though not the same message text).
     Packages are vendored without their dependencies — nonzero exit is expected,
     and both tools fully parse, bind, and check every file regardless. At the 7–24&thinsp;ms
     scale both tools are effectively instant, and the ratio mostly reflects fixed startup costs.

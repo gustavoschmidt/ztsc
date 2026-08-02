@@ -9,12 +9,12 @@ machine.
 ztsc checks a subset of TypeScript, against the lib each package's tsconfig
 selects — es-core..esnext for most, plus the real DOM lib for the three packages
 that list `dom` (hono, zod, and `@types/react`), matching tsgo's target-esnext
-default. On the package corpus its diagnostic output still differs from tsgo's,
-so those rows are throughput and memory measurements on identical inputs, not a
-diagnostic-parity claim. (Correctness is tracked separately by a 917-case
-differential conformance suite validated against the TypeScript compiler — and
-on the excalidraw application row below, ztsc *does* reproduce tsgo's
-diagnostics exactly.) hono and zod check against the
+default. Every row is also a diagnostic-parity claim: on all eight packages
+ztsc reports **exactly the same diagnostics as tsgo** — the same (file, line,
+column, code) set, zero excess and zero under-reports — held by a standing
+ratcheted gate (`bench/parity_sweep.sh`, scored against checked-in tsgo 7.0.2
+oracle snapshots), alongside a 977-case differential conformance suite and the
+excalidraw application row below. hono and zod check against the
 2.35 MB DOM lib, so their memory and wall clock sit higher than their line counts
 alone suggest — that added front end is why their rows land where they do.
 Packages are vendored without their dependencies; both tools fully parse, bind,
