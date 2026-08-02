@@ -2121,6 +2121,9 @@ pub fn numberIndexType(c: *Checker, r: TypeId) Error!TypeId {
     switch (c.ts.kind(r)) {
         .array => return c.ts.arrayElem(r),
         .tuple => {
+            if (c.inst_cache_on) {
+                if (c.arrayish_elem_cache.get(r)) |hit| return hit;
+            }
             var parts: std.ArrayList(TypeId) = .empty;
             defer parts.deinit(c.scratch());
             for (0..c.ts.tupleLen(r)) |i| {
@@ -2128,7 +2131,9 @@ pub fn numberIndexType(c: *Checker, r: TypeId) Error!TypeId {
                 const et = if (e.rest()) try c.elemOfArrayish(e.ty) else e.ty;
                 try parts.append(c.scratch(), et);
             }
-            return c.ts.makeUnion(c.scratch(), parts.items);
+            const u = try c.ts.makeUnion(c.scratch(), parts.items);
+            if (c.inst_cache_on) try c.arrayish_elem_cache.put(c.cm(), r, u);
+            return u;
         },
         .object => {
             if (c.ts.objectNumberIndex(r) != 0) return c.ts.objectNumberIndex(r);
@@ -2286,16 +2291,23 @@ pub fn elemOfArrayish(c: *Checker, t: TypeId) Error!TypeId {
         .array => c.ts.arrayElem(r),
         .tuple => try c.numberIndexType(r),
         .union_type => blk: {
+            if (c.inst_cache_on) {
+                if (c.arrayish_elem_cache.get(r)) |hit| break :blk hit;
+            }
             var parts: std.ArrayList(TypeId) = .empty;
             defer parts.deinit(c.scratch());
-            for (try c.memberList(r)) |m| {
-                const e = try c.elemOfArrayish(m);
-                // One non-arrayish constituent leaves the whole position
-                // untyped, exactly as the single-type path does.
-                if (c.ts.kind(e) == .any) break :blk types.any_type;
-                try parts.append(c.scratch(), e);
-            }
-            break :blk try c.ts.makeUnion(c.scratch(), parts.items);
+            const u = u: {
+                for (try c.memberList(r)) |m| {
+                    const e = try c.elemOfArrayish(m);
+                    // One non-arrayish constituent leaves the whole position
+                    // untyped, exactly as the single-type path does.
+                    if (c.ts.kind(e) == .any) break :u types.any_type;
+                    try parts.append(c.scratch(), e);
+                }
+                break :u try c.ts.makeUnion(c.scratch(), parts.items);
+            };
+            if (c.inst_cache_on) try c.arrayish_elem_cache.put(c.cm(), r, u);
+            break :blk u;
         },
         else => types.any_type,
     };
