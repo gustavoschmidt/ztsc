@@ -71,16 +71,6 @@ assignability/065_callback_parameter_variance.ts  -TS2322 74
 # reports.
 indexed/032_cast_to_deferred_indexed_access_negatives.ts  -TS2352 8
 
-
-# `export { promises }` where `promises` is a NAMESPACE IMPORT of another module
-# (`@types/node`'s `fs.d.ts` shape). The re-export itself resolves — the point
-# of the case, and what used to be TS2304 — but the re-exported namespace's
-# members type as `any`, so an assignment from one is not rejected. A namespace
-# import's target is a whole-module object, and ztsc does not synthesize its
-# member types through a re-export hop. Deterministic under-report; the
-# well-typed half (line 13, a member of a plain `export { X }` re-export) still
-# reports.
-module_aug/16_ambient_export_named_scope  -TS2322 entry.ts 14
 # A NUMBER-literal key that names no member is not reported. The string-literal
 # arm of element access reports the implicit-'any' miss (TS7053); the numeric
 # arm falls back to the receiver's numeric index signature, which for an object
