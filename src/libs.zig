@@ -4,7 +4,7 @@
 //! The ES-core and DOM libs ship inside the binary as sharded blobs; a
 //! tsconfig `lib` list selects which shards a run injects (`resolveLibSet`),
 //! the loaders substitute their embedded text for the synthetic paths
-//! (`libSourceFor`), and `seedLibAtoms` pins their interner atoms before the
+//! (`libSourceFor`), and `frontEndLibs` parses and binds them before the
 //! worker pool starts so runs stay deterministic.
 
 const std = @import("std");
@@ -14,10 +14,12 @@ const ast = @import("frontend/ast.zig");
 const parser = @import("frontend/parser.zig");
 const binder = @import("frontend/binder.zig");
 const intern = @import("intern.zig");
+const source = @import("frontend/source.zig");
 
 const Ast = ast.Ast;
 const Bind = binder.Bind;
 const Interner = intern.Interner;
+const Source = source.Source;
 
 /// Resolve a tsconfig `lib` list (or null = not specified) to the blob set.
 /// tsc semantics: a `lib` list REPLACES the default set. We map any `es*`
@@ -41,7 +43,7 @@ pub fn resolveLibSet(lib: ?[]const []const u8) LibSet {
 }
 
 /// Fill `buf` with the ordered synthetic lib files for `set`. Order is fixed
-/// (esnext, dom, console shim) so that seeded atoms (`seedLibAtoms`) and the
+/// (esnext, dom, console shim) so that seeded atoms (`frontEndLibs`) and the
 /// injected file ids agree run-to-run — the determinism the seeded interner
 /// relies on. Returns the populated prefix of `buf`.
 pub fn libFiles(set: LibSet, buf: *[max_lib_files]LibFile) []const LibFile {
@@ -82,35 +84,85 @@ pub fn isLibPath(path: []const u8) bool {
     return libSourceFor(path) != null;
 }
 
-/// Deterministic lib atoms. Intern every string the lib front end
-/// produces, single-threaded, *before* the worker pool starts. An `Atom`
-/// encodes shard-local insertion order (intern.zig), so run-to-run stability
-/// requires the lib's strings to be interned in a fixed order ahead of the
-/// concurrent user-file work; the worker that later binds the lib re-interns
-/// the same text and receives these stable atoms. This is the seeded-interner
-/// approach (option a): it pins the lib's atoms (the ones a serialized
-/// lib blob would reference) without touching user-file atoms.
+/// The front-end product of one built-in lib shard: exactly what a worker
+/// would have produced for it, kept instead of thrown away.
+pub const LibUnit = struct {
+    src: Source,
+    tree: *Ast,
+    bind: *Bind,
+    parse_ns: u64 = 0,
+    bind_ns: u64 = 0,
+};
+
+/// Run the whole front end (source → parse → bind) over the selected lib
+/// shards, single-threaded, *before* the worker pool starts, and keep the
+/// results.
 ///
-/// Seeding runs the real binder — not a token scan — so it interns exactly
+/// Single-threaded is what pins the atoms. An `Atom` encodes shard-local
+/// insertion order (intern.zig), so run-to-run stability requires the lib's
+/// strings to be interned in a fixed order ahead of the concurrent user-file
+/// work. This runs the real binder — not a token scan — so it interns exactly
 /// what binding interns, including the text transforms binding applies
 /// (`stripQuotes`, well-known-symbol keys, the "default"/"*" constants).
-/// The parse/bind products are thrown away; only their interner side effects
-/// (which are idempotent) survive. Cheap: the lib is ~9 KB.
-pub fn seedLibAtoms(io: Io, gpa: Allocator, interner: *Interner, set: LibSet) !void {
+///
+/// It *is* the lib's front end, not a rehearsal for it. The caller feeds these
+/// units into the program instead of queueing the lib paths to the worker
+/// pool, so each shard is parsed and bound once per run rather than once here
+/// and again on a worker — the lib is the bulk of the front-end work on a
+/// small project (627 KB of the 704 KB ztsc reads for ajv), so the duplicate
+/// pass was a large share of its wall clock. `alloc` must outlive the run: the
+/// AST, binder output and line table are program data now, not scratch.
+pub fn frontEndLibs(
+    alloc: Allocator,
+    io: Io,
+    gpa: Allocator,
+    interner: *Interner,
+    set: LibSet,
+) ![]LibUnit {
     var buf: [max_lib_files]LibFile = undefined;
-    for (libFiles(set, &buf)) |lf| {
-        var seed_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        defer seed_arena.deinit();
-        const sa = seed_arena.allocator();
-        const lib_tree = try parser.parse(sa, lf.source);
-        _ = try binder.bind(sa, io, gpa, interner, &lib_tree, lf.source, true);
-        // Each lib file's own path atom is interned by the worker front end too.
+    const files = libFiles(set, &buf);
+    const units = try alloc.alloc(LibUnit, files.len);
+    for (files, units) |lf, *u| {
+        // `fromBytes` over the embedded blob is the same path the worker front
+        // end takes for a synthetic lib path (`libSourceFor`).
+        const src = try Source.fromBytes(alloc, lf.path, lf.source);
+        // Each lib file's own path atom, as the worker front end interns it.
         _ = try interner.intern(io, gpa, lf.path);
+        const t0 = Io.Clock.Timestamp.now(io, .awake);
+        const tree = try alloc.create(Ast);
+        tree.* = try parser.parse(alloc, lf.source);
+        const t1 = Io.Clock.Timestamp.now(io, .awake);
+        const b = try alloc.create(Bind);
+        // Lib paths end in `.d.ts`, so this matches `isDeclarationPath`.
+        b.* = try binder.bind(alloc, io, gpa, interner, tree, lf.source, true);
+        const t2 = Io.Clock.Timestamp.now(io, .awake);
+        u.* = .{
+            .src = src,
+            .tree = tree,
+            .bind = b,
+            .parse_ns = elapsedNs(t0, t1),
+            .bind_ns = elapsedNs(t1, t2),
+        };
     }
+    return units;
+}
+
+fn elapsedNs(from: Io.Clock.Timestamp, to: Io.Clock.Timestamp) u64 {
+    const ns = from.durationTo(to).raw.nanoseconds;
+    return if (ns > 0) @intCast(ns) else 0;
+}
+
+/// Intern every atom the lib front end produces, discarding the parse/bind
+/// products. Identical interner side effects to `frontEndLibs` (what the CLI
+/// runs); for callers that only need the atoms.
+pub fn seedLibAtoms(io: Io, gpa: Allocator, interner: *Interner, set: LibSet) !void {
+    var seed_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer seed_arena.deinit();
+    _ = try frontEndLibs(seed_arena.allocator(), io, gpa, interner, set);
 }
 
 /// Which built-in lib blobs to inject. Derived from tsconfig `lib` (or the
-/// default) by `resolveLibSet`; consumed by `libFiles`, `seedLibAtoms`,
+/// default) by `resolveLibSet`; consumed by `libFiles`, `frontEndLibs`,
 /// `buildProgram`, and the CLI injection site. `dom` always implies `es`
 /// (lib.dom references es2015 / es2018.asynciterable, both in the esnext blob),
 /// and `shim` (the console shim) is present exactly when `es and !dom`.

@@ -680,10 +680,22 @@ pub fn main(init: std.process.Init) !void {
     var done = Channel(Completion).init(io);
     defer done.deinit();
 
-    // Deterministic lib atoms. Intern the lib's strings single-
-    // threaded before any worker runs so the concurrent worker that binds
-    // file 0 re-interns them into these stable, run-to-run-identical atoms.
-    try libs.seedLibAtoms(io, gpa, &interner, lib_set);
+    // The lib's front end: parse and bind the injected shards single-threaded,
+    // before any worker runs, and *keep* the results. Single-threaded is what
+    // pins the atoms (an `Atom` encodes shard-local insertion order, so the
+    // lib's strings must be interned in a fixed order ahead of the concurrent
+    // user-file work). Keeping the products is what makes the pass pay for
+    // itself: the shards never enter the work queue, so the lib is parsed and
+    // bound once per run instead of once here and again on a worker.
+    //
+    // Its own arena, not the process arena: `init.arena` is thread-safe, so
+    // every allocation there takes a lock, and this is one of the
+    // allocation-heaviest stretches of the run. It lives as long as the
+    // program — the AST and binder output are program data — so it is only
+    // released at the end.
+    var lib_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer lib_arena.deinit();
+    const lib_units = try libs.frontEndLibs(lib_arena.allocator(), io, gpa, &interner, lib_set);
 
     const discover_timer = Timer.start(io);
     for (workers) |*w| {
@@ -694,7 +706,23 @@ pub fn main(init: std.process.Init) !void {
 
     var outstanding: usize = 0;
     try growPerFile(arena, paths.items.len, &results, &trees, &binds, &errs, &spec_atoms_all, &spec_files_all, &edge_lists, &type_ref_misses_all);
-    for (paths.items, 0..) |p, i| {
+    // The lib shards hold file ids 0..lib_units.len and are already
+    // front-ended, so they enter the discovery loop as ready-made completions
+    // instead of as work. Everything downstream — specifier resolution,
+    // `/// <reference>` scanning, the BFS renumbering — sees an ordinary
+    // completion and cannot tell the difference.
+    for (lib_units, 0..) |*u, i| {
+        try done.push(.{
+            .file = @intCast(i),
+            .src = u.src,
+            .tree = u.tree,
+            .bind = u.bind,
+            .parse_ns = u.parse_ns,
+            .bind_ns = u.bind_ns,
+        });
+        outstanding += 1;
+    }
+    for (paths.items[lib_units.len..], lib_units.len..) |p, i| {
         try work.push(.{ .file = @intCast(i), .path = p });
         outstanding += 1;
     }
