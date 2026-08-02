@@ -1111,8 +1111,11 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
         try c.checkStaticSideExtends(class_sym, data.name_token);
     }
 
-    // implements clauses: instance assignable to each interface.
-    if (class_sym != binder.no_symbol) {
+    // implements clauses: instance assignable to each interface. Skipped
+    // entirely when the class inherits from a base ztsc could not resolve —
+    // the instance type is then missing whatever that base contributed, and
+    // the verdict would be about ztsc's gap, not the code.
+    if (class_sym != binder.no_symbol and !try c.hasUnresolvedBase(class_sym)) {
         for (c.tree.extraRange(data.impl_start, data.impl_end)) |h| {
             if (h == null_node or c.nodeTag(h) != .heritage) continue;
             const hd = c.tree.nodeData(h);

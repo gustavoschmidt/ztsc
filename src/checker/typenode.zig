@@ -571,6 +571,50 @@ pub fn moduleExportTarget(c: *Checker, m: ModuleRef, name: Atom) ?modules.Target
     }
 }
 
+/// Member `name` of a module that exports a namespace by assignment
+/// (`export = ns`), as a GLOBAL symbol id. The module's own export table only
+/// holds the assignment, under the reserved `export=` key, so a plain
+/// `moduleExportTarget` miss is not the end of the lookup: tsc resolves
+/// `import("m").name` — like `import { name } from "m"` — against the members
+/// of the export-assigned entity. `@types/node`'s `declare module "assert" {
+/// namespace assert { function ok(…): …; … } export = assert; }` is the shape;
+/// without this every `typeof import("node:assert").ok` in `test.d.ts` was a
+/// spurious TS2694. Null when the module has no export assignment, when the
+/// assignment is not a namespace, or when the member is not exported.
+pub fn exportEqualsMemberSym(c: *Checker, m: ModuleRef, name: Atom) ?SymbolId {
+    return exportEqualsMemberSymAt(c, m, name, 0);
+}
+
+fn exportEqualsMemberSymAt(c: *Checker, m: ModuleRef, name: Atom, depth: u32) ?SymbolId {
+    if (depth > 8) return null; // `export =` chains are shallow; cycles are not
+    if (c.prog.export_equals_atom == 0) return null;
+    const eq = c.moduleExportTarget(m, c.prog.export_equals_atom) orelse return null;
+    switch (eq.kind) {
+        .binding => {
+            const ns = targetTypeSym(c, eq) orelse return null;
+            const mem = c.namespaceMemberSym(ns, name) orelse return null;
+            return if (c.symFlags(mem).exported) mem else null;
+        },
+        // `export = ` a whole module-namespace object: its members are that
+        // module's exports.
+        .namespace => {
+            const tgt = c.moduleExportTarget(.{ .file = eq.file }, name) orelse return null;
+            return targetTypeSym(c, tgt);
+        },
+        // `declare module "node:assert" { import a = require("assert");
+        // export = a; }` — the assignment is another ambient module's
+        // namespace; ask it the same question.
+        .ambient_ns => {
+            const sub: ModuleRef = .{ .ambient = eq.payload };
+            if (c.moduleExportTarget(sub, name)) |tgt| {
+                if (targetTypeSym(c, tgt)) |g| return g;
+            }
+            return exportEqualsMemberSymAt(c, sub, name, depth + 1);
+        },
+        else => return null,
+    }
+}
+
 /// The global symbol an export Target denotes (for type materialization),
 /// or null for non-binding targets (namespace objects, default expressions).
 pub fn targetTypeSym(c: *Checker, tgt: modules.Target) ?SymbolId {
@@ -596,6 +640,9 @@ pub fn importTypeMember(c: *Checker, import_node: Node, name_tok: TokenIndex, ar
         if (c.targetTypeSym(tgt)) |sym| {
             if (hasTypeMeaning(c.symFlags(sym))) return c.namedTypeFromSymbol(sym, args, name_tok);
         }
+    }
+    if (c.exportEqualsMemberSym(m, name)) |sym| {
+        if (hasTypeMeaning(c.symFlags(sym))) return c.namedTypeFromSymbol(sym, args, name_tok);
     }
     const spec_tok = c.tree.nodeData(import_node).lhs;
     try c.diagFmt(2694, c.tokSpan(name_tok), "Namespace '{s}' has no exported member '{s}'.", .{ stripQuotes(c.tokenText(spec_tok)), c.atomText(name) });
@@ -850,6 +897,9 @@ pub fn typeofEntity(c: *Checker, node: Node) Error!TypeId {
             const m = (try c.resolveImportTypeModule(d.lhs, true)) orelse return types.error_type;
             const name = try c.memberAtom(d.rhs);
             if (c.moduleExportTarget(m, name)) |tgt| return c.targetValueType(tgt);
+            if (c.exportEqualsMemberSym(m, name)) |sym| {
+                return c.regularizeTypeQuery(try c.typeOfSymbol(sym));
+            }
             const spec_tok = c.tree.nodeData(d.lhs).lhs;
             try c.diagFmt(2694, c.tokSpan(d.rhs), "Namespace '{s}' has no exported member '{s}'.", .{ stripQuotes(c.tokenText(spec_tok)), c.atomText(name) });
             return types.error_type;

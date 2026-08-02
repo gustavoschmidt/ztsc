@@ -148,7 +148,16 @@ pub const SymbolFlags = packed struct(u32) {
     /// One such property. Its declarations are the `assign` nodes; the
     /// member type is the widened type of the assigned expressions.
     expando_member: bool = false,
-    _pad: u6 = 0,
+    /// Every `namespace`/`module` block of this symbol is NON-INSTANTIATED —
+    /// its body declares only types (interfaces, type aliases, non-exported
+    /// imports, const enums, other non-instantiated namespaces), so it emits
+    /// no runtime object. tsc gives such a symbol `NamespaceModule`, whose
+    /// excludes mask is *empty*: it neither displaces nor is displaced by a
+    /// `var`/`let`/`const` of the same name. `@types/node` leans on that in
+    /// half a dozen places (`namespace webcrypto {…}` next to `const
+    /// webcrypto`, `namespace console {…}` next to `var console`).
+    ns_uninstantiated: bool = false,
+    _pad: u5 = 0,
 
     pub fn bits(f: SymbolFlags) u32 {
         return @bitCast(f);
@@ -199,6 +208,10 @@ const DeclKind = enum {
     type_alias,
     enum_decl,
     namespace,
+    /// A `namespace`/`module` whose body is type-only (see
+    /// `SymbolFlags.ns_uninstantiated`). Same symbol shape as `.namespace`,
+    /// but it excludes nothing and nothing excludes it.
+    namespace_type,
     type_param,
     param,
     catch_param,
@@ -222,6 +235,7 @@ const DeclKind = enum {
             .type_alias => .{ .type_alias = true },
             .enum_decl => .{ .enum_decl = true },
             .namespace => .{ .namespace_decl = true },
+            .namespace_type => .{ .namespace_decl = true, .ns_uninstantiated = true },
             .type_param => .{ .type_param = true },
             .param => .{ .param = true },
             .catch_param => .{ .catch_param = true },
@@ -262,6 +276,8 @@ const DeclKind = enum {
                 fbits(.{ .function = true }) | fbits(.{ .class = true }) | fbits(.{ .enum_decl = true }))) |
                 (mask_type & ~(fbits(.{ .namespace_decl = true }) | fbits(.{ .interface = true }) |
                     fbits(.{ .class = true }) | fbits(.{ .enum_decl = true }) | fbits(.{ .type_alias = true }))),
+            // tsc's `NamespaceModuleExcludes = 0`.
+            .namespace_type => 0,
             .type_param => mask_type & ~fbits(.{ .class = true }),
             .param => mask_value & ~fbits(.{ .var_decl = true }),
             .catch_param => mask_value,
@@ -361,6 +377,12 @@ pub const ExportRec = struct {
     node: Node,
     kind: ExportKind,
     type_only: bool,
+    /// Scope the `export { … }` statement textually lives in. Almost always
+    /// the file scope; a `declare module "spec" { … export { X }; }` block or a
+    /// `namespace N { export { X }; }` body resolves `X` from *there*, walking
+    /// outward, exactly as tsc's `resolveName` walks the node parent chain.
+    /// Looking only at file scope reported TS2304 for every such re-export.
+    scope: ScopeId = file_scope,
 };
 
 /// An identifier reference that did not resolve in-file (usually a global
@@ -495,6 +517,19 @@ pub const Bind = struct {
             if (s == file_scope) return null;
             s = b.scope_parents[s];
         }
+    }
+
+    /// `resolve`, then the file's own `global { … }` block scopes as a last
+    /// resort — the file-local half of tsc's "lexical chain, then globals"
+    /// fallback. Used while sealing, where the program global table does not
+    /// exist yet; the scopes are the binder's, not `Bind`'s, so they are
+    /// passed in.
+    pub fn resolveWithGlobals(b: *const Bind, atom: Atom, scope: ScopeId, global_scopes: []const ScopeId) ?SymbolId {
+        if (b.resolve(atom, scope)) |sym| return sym;
+        for (global_scopes) |gs| {
+            if (b.lookupInScope(gs, atom)) |sym| return sym;
+        }
+        return null;
     }
 
     /// Members scope of a class/interface symbol (instance side), if any.
@@ -925,11 +960,17 @@ const Binder = struct {
     /// members are implicitly exported (visible as `N.member` without an
     /// explicit `export`), matching tsc's ambient-context rule.
     ambient: bool = false,
-    /// Shared scope for all `declare global { … }` blocks in this file (0 =
-    /// none yet). One scope per file so blocks merge within the file exactly
-    /// as reopened namespaces do; its members are the file's global
-    /// contributions.
-    global_scope: ScopeId = 0,
+    /// Scopes holding this file's `declare global { … }` / bare `global { … }`
+    /// block members — the file's global contributions, in creation order.
+    /// One scope per distinct *enclosing container*, not one per block: blocks
+    /// sharing a container merge within the file exactly as reopened
+    /// namespaces do, while a `global { … }` nested in `declare module "m"`
+    /// gets its own scope parented to `m`'s body, so names inside it resolve
+    /// outward into the module (tsc's `resolveName` walks the node parent
+    /// chain; real `@types/node` leans on it heavily — `events.d.ts` declares
+    /// `type Key<…>` in the module body and uses it from `global { namespace
+    /// NodeJS { … } }`).
+    global_scopes: std.ArrayList(ScopeId) = .empty,
     /// Set once any top-level `import`/`export` is bound: the file is a module
     /// Includes `export {}` (a marker export with no bindings), which
     /// is exactly how a source file opts into module semantics.
@@ -938,6 +979,11 @@ const Binder = struct {
     umd_name: Atom = 0,
     /// `declare module "spec" { … }` blocks collected during binding.
     ambient_mods: std.ArrayList(AmbientModule) = .empty,
+    /// Body scope of the `declare module "spec" { … }` block currently being
+    /// bound (0 = none). That body is a MODULE body, so its `export { … }`
+    /// statements are module exports, while a plain `namespace N { … }` nested
+    /// anywhere inside it exports namespace members instead.
+    ambient_mod_scope: ScopeId = 0,
 
     // --- small helpers ------------------------------------------------------
 
@@ -1115,6 +1161,12 @@ const Binder = struct {
             bits &= ~fbits(.{ .import_binding = true });
             bits |= fbits(.{ .type_alias = true });
         }
+        // A non-instantiated namespace occupies no exclusion space at all
+        // (tsc's `NamespaceModule`), so it merges with anything — including a
+        // `var`/`let`/`const` of the same name. The bit stays on the symbol:
+        // only the excludes check ignores it, so name resolution and the
+        // `N.member` container meaning are untouched.
+        if (f.ns_uninstantiated) bits &= ~fbits(.{ .namespace_decl = true });
         return bits;
     }
 
@@ -2030,6 +2082,42 @@ const Binder = struct {
         }
     }
 
+    /// tsc's `getModuleInstanceState`, reduced to the yes/no the excludes
+    /// check needs: does this `namespace`/`module` block emit a runtime
+    /// object? A body of interfaces, type aliases, `const enum`s, side-effect-
+    /// free imports and other non-instantiated namespaces does not; anything
+    /// else (a `var`, `function`, `class`, non-const `enum`, statement) does.
+    /// Read straight off the AST — no scopes, no symbols — so the answer is
+    /// the same whichever of `const X` / `namespace X` the binder reaches
+    /// first. `preserveConstEnums`/`isolatedModules` are off, matching the
+    /// oracle's defaults, so a const-enum-only body counts as type-only.
+    fn instantiated(b: *Binder, node: Node) bool {
+        const data = b.tree.extraData(ast.NamespaceData, b.tree.nodeData(node).lhs);
+        for (b.tree.extraRange(data.body_start, data.body_end)) |raw| {
+            if (raw == null_node) continue;
+            var stmt = raw;
+            // `export interface I {}` is still just an interface.
+            while (b.nodeTag(stmt) == .export_decl) {
+                stmt = b.tree.nodeData(stmt).lhs;
+                if (stmt == null_node) return true;
+            }
+            switch (b.nodeTag(stmt)) {
+                .interface_decl, .type_alias => {},
+                // An import binds a name but emits nothing on its own; tsc
+                // only calls it instantiating when it is re-`export`ed (the
+                // `export_decl` unwrapping above already made that visible).
+                .import_decl, .import_equals => {},
+                .enum_decl => {
+                    const e = b.tree.extraData(ast.EnumData, b.tree.nodeData(stmt).lhs);
+                    if (e.flags & ast.Flags.const_enum == 0) return true;
+                },
+                .namespace_decl => if (b.instantiated(stmt)) return true,
+                else => return true,
+            }
+        }
+        return false;
+    }
+
     /// A namespace declares one symbol (both a value and a type container).
     /// Its body is a scope; `export`ed members are visible as `N.member`.
     /// Multiple `namespace N {}` blocks in one file (and namespace + function
@@ -2043,7 +2131,21 @@ const Binder = struct {
             const atom = try b.atomOfToken(data.name_token);
             // Declared (and possibly marked exported by an outer `export`)
             // in the enclosing scope before the body clears exporting_node.
-            sym = try b.declare(b.cur_scope, atom, .namespace, node, data.name_token, .{});
+            // The instantiated/type-only distinction is read off the AST, as
+            // tsc's `getModuleInstanceState` does, so it is available for the
+            // excludes check no matter which of `const X` / `namespace X`
+            // comes first in the file.
+            // The flag is an AND over the merged blocks, so it survives only
+            // while *every* block of the name is type-only; `declare` merges
+            // flags by OR, which is the wrong fold for it.
+            const prev_inst_ns = if (b.members.get(memberKey(b.cur_scope, atom))) |p|
+                b.sym_flags.items[p].namespace_decl and !b.sym_flags.items[p].ns_uninstantiated
+            else
+                false;
+            const inst = b.instantiated(node);
+            const kind: DeclKind = if (inst) .namespace else .namespace_type;
+            sym = try b.declare(b.cur_scope, atom, kind, node, data.name_token, .{});
+            b.sym_flags.items[sym].ns_uninstantiated = !inst and !prev_inst_ns;
         }
 
         const saved = b.saveState();
@@ -2085,19 +2187,30 @@ const Binder = struct {
         b.restoreState(saved);
     }
 
-    /// `declare global { … }`. Binds the block's declarations into a
-    /// single shared per-file scope (so blocks merge within the file, and the
-    /// linker harvests one segment). No `global` symbol is declared: the
-    /// members are contributions to the *program* global table, resolved
-    /// cross-file at link time. The body is an ambient context.
+    /// `declare global { … }`. Binds the block's declarations into a scope
+    /// shared by every global block with the same enclosing container (so
+    /// blocks merge, and the linker harvests one segment per container). The
+    /// scope's PARENT is that container, so a reference inside the block sees
+    /// the enclosing `declare module` body's locals — tsc resolves names by
+    /// walking the node parent chain, and a `global { … }` node's parent is
+    /// the module declaration, not the source file. No `global` symbol is
+    /// declared: the members are contributions to the *program* global table,
+    /// resolved cross-file at link time. The body is an ambient context.
     fn bindGlobalAugmentation(b: *Binder, node: Node) Error!void {
         const d = b.tree.nodeData(node);
         const data = b.tree.extraData(ast.NamespaceData, d.lhs);
 
-        if (b.global_scope == 0) {
-            b.global_scope = try b.newScope(.namespace, node, file_scope);
+        var gs: ScopeId = 0;
+        for (b.global_scopes.items) |cand| {
+            if (b.scope_parents.items[cand] == b.cur_scope) {
+                gs = cand;
+                break;
+            }
         }
-        const gs = b.global_scope;
+        if (gs == 0) {
+            gs = try b.newScope(.namespace, node, b.cur_scope);
+            try b.global_scopes.append(b.scratch, gs);
+        }
 
         const saved = b.saveState();
         // Ambient body (declarations may omit initializers/bodies), but members
@@ -2141,6 +2254,9 @@ const Binder = struct {
         const clear_export = b.exporting_node;
         b.exporting_node = 0;
         defer b.exporting_node = clear_export;
+        const saved_mod_scope = b.ambient_mod_scope;
+        b.ambient_mod_scope = ms;
+        defer b.ambient_mod_scope = saved_mod_scope;
 
         try b.scope_stack.append(b.scratch, ms);
         b.cur_scope = ms;
@@ -2355,6 +2471,7 @@ const Binder = struct {
             .node = node,
             .kind = .default,
             .type_only = false,
+            .scope = b.cur_scope,
         });
     }
 
@@ -2379,6 +2496,7 @@ const Binder = struct {
             .node = node,
             .kind = .equals,
             .type_only = false,
+            .scope = b.cur_scope,
         });
     }
 
@@ -2415,6 +2533,19 @@ const Binder = struct {
         const data = b.tree.extraData(ast.ExportNamed, d.lhs);
         const module = try b.moduleAtom(d.rhs);
         const decl_type_only = data.flags & ast.Flags.type_only != 0;
+        // `namespace N { export { x }; }` re-exports `x` as the NAMESPACE
+        // member `N.x` — it is not a module export, so it emits no ExportRec
+        // (`noteExport` draws the same line for `export <decl>` forms). Both
+        // `@types/node`'s `namespace test { export { after, … }; }` and its
+        // `global { namespace NodeJS { export { BufferEncoding }; } }` are this
+        // shape; treating them as module exports put names the module never
+        // exported into its table and, in `events.d.ts`, made a value export
+        // collide with the module's `export = EventEmitter` (TS2309). The
+        // member alias itself is not modeled — an under-report, never a false
+        // positive. A `declare module "spec" { … }` body IS a module body, so
+        // its own `export { … }` records normally.
+        const in_ns = b.cur_scope != file_scope and b.cur_scope != b.ambient_mod_scope;
+        if (in_ns and module == 0) return;
         for (b.tree.extraRange(data.spec_start, data.spec_end)) |spec| {
             if (spec == null_node or b.nodeTag(spec) != .export_specifier) continue;
             const sd = b.tree.nodeData(spec);
@@ -2430,6 +2561,7 @@ const Binder = struct {
                 .node = spec,
                 .kind = if (module != 0) .reexport_named else .named,
                 .type_only = type_only,
+                .scope = b.cur_scope,
             });
         }
     }
@@ -3022,47 +3154,56 @@ const Binder = struct {
         var global_atoms: []const Atom = &.{};
         var global_syms: []const SymbolId = &.{};
         var global_aug_start: u32 = 0;
-        if (umd_atom != 0) {
-            // The UMD entry belongs to the file's own (non-augmentation)
-            // contribution, so it sits before the `declare global` segment.
+        {
+            // Own (non-augmentation) segment: a script/lib's whole file scope,
+            // plus the UMD entry if any. Then the augmentation segment: every
+            // `global { … }` block scope, in creation order. `global_aug_start`
+            // splits them for `mergeGlobals`, which merges the two classes in
+            // separate passes (tsc's precedence).
             const flo = if (!is_module) members_start[file_scope] else 0;
             const fhi = if (!is_module) members_start[file_scope + 1] else 0;
-            const glo = if (b.global_scope != 0) members_start[b.global_scope] else 0;
-            const ghi = if (b.global_scope != 0) members_start[b.global_scope + 1] else 0;
-            const fn_ = fhi - flo;
-            const gn_ = ghi - glo;
-            const ca = try arena.alloc(Atom, fn_ + 1 + gn_);
-            const cs = try arena.alloc(SymbolId, fn_ + 1 + gn_);
-            @memcpy(ca[0..fn_], member_atoms[flo..fhi]);
-            @memcpy(cs[0..fn_], member_syms[flo..fhi]);
-            ca[fn_] = umd_atom;
-            cs[fn_] = umd_sym;
-            @memcpy(ca[fn_ + 1 ..], member_atoms[glo..ghi]);
-            @memcpy(cs[fn_ + 1 ..], member_syms[glo..ghi]);
-            global_atoms = ca;
-            global_syms = cs;
-            global_aug_start = @intCast(fn_ + 1);
-        } else {
-            const flo = if (!is_module) members_start[file_scope] else 0;
-            const fhi = if (!is_module) members_start[file_scope + 1] else 0;
-            const glo = if (b.global_scope != 0) members_start[b.global_scope] else 0;
-            const ghi = if (b.global_scope != 0) members_start[b.global_scope + 1] else 0;
-            const fn_ = fhi - flo;
-            const gn_ = ghi - glo;
-            global_aug_start = @intCast(fn_);
+            const fn_ = (fhi - flo) + @as(u32, if (umd_atom != 0) 1 else 0);
+            var gn_: u32 = 0;
+            for (b.global_scopes.items) |gs| gn_ += members_start[gs + 1] - members_start[gs];
+            global_aug_start = fn_;
             if (gn_ == 0) {
-                global_atoms = member_atoms[flo..fhi];
-                global_syms = member_syms[flo..fhi];
-            } else if (fn_ == 0) {
-                global_atoms = member_atoms[glo..ghi];
-                global_syms = member_syms[glo..ghi];
+                // No global blocks: the file scope segment is already
+                // contiguous unless the UMD entry has to be appended.
+                if (umd_atom == 0) {
+                    global_atoms = member_atoms[flo..fhi];
+                    global_syms = member_syms[flo..fhi];
+                } else {
+                    const ca = try arena.alloc(Atom, fn_);
+                    const cs = try arena.alloc(SymbolId, fn_);
+                    @memcpy(ca[0 .. fn_ - 1], member_atoms[flo..fhi]);
+                    @memcpy(cs[0 .. fn_ - 1], member_syms[flo..fhi]);
+                    ca[fn_ - 1] = umd_atom;
+                    cs[fn_ - 1] = umd_sym;
+                    global_atoms = ca;
+                    global_syms = cs;
+                }
+            } else if (fn_ == 0 and b.global_scopes.items.len == 1) {
+                const gs = b.global_scopes.items[0];
+                global_atoms = member_atoms[members_start[gs]..members_start[gs + 1]];
+                global_syms = member_syms[members_start[gs]..members_start[gs + 1]];
             } else {
                 const ca = try arena.alloc(Atom, fn_ + gn_);
                 const cs = try arena.alloc(SymbolId, fn_ + gn_);
-                @memcpy(ca[0..fn_], member_atoms[flo..fhi]);
-                @memcpy(ca[fn_..], member_atoms[glo..ghi]);
-                @memcpy(cs[0..fn_], member_syms[flo..fhi]);
-                @memcpy(cs[fn_..], member_syms[glo..ghi]);
+                var at: u32 = fhi - flo;
+                @memcpy(ca[0..at], member_atoms[flo..fhi]);
+                @memcpy(cs[0..at], member_syms[flo..fhi]);
+                if (umd_atom != 0) {
+                    ca[at] = umd_atom;
+                    cs[at] = umd_sym;
+                    at += 1;
+                }
+                for (b.global_scopes.items) |gs| {
+                    const glo = members_start[gs];
+                    const ghi = members_start[gs + 1];
+                    @memcpy(ca[at .. at + (ghi - glo)], member_atoms[glo..ghi]);
+                    @memcpy(cs[at .. at + (ghi - glo)], member_syms[glo..ghi]);
+                    at += ghi - glo;
+                }
                 global_atoms = ca;
                 global_syms = cs;
             }
@@ -3161,9 +3302,17 @@ const Binder = struct {
         result.unresolved = try arena.dupe(Ref, unresolved.items);
 
         // Resolve local `export { a }` records + mark the symbols exported.
+        // The lookup starts in the record's OWN scope and walks outward: a
+        // `declare module "spec" { class S {} export { S }; }` block and a
+        // `namespace N { export { x }; }` body both name entities that are not
+        // in the file scope, and tsc resolves them by walking the enclosing
+        // containers. The `global { … }` blocks are consulted last, as the
+        // program globals tsc would have found after the lexical chain ran out
+        // — that is what makes `declare module "buffer" { global { var Buffer …
+        // } export { Buffer }; }` (real `@types/node`) resolve.
         for (b.export_recs.items) |*rec| {
             if (rec.kind == .named and rec.sym == no_symbol and rec.local != 0 and rec.module == 0) {
-                if (result.lookupInScope(file_scope, rec.local)) |sym| {
+                if (result.resolveWithGlobals(rec.local, rec.scope, b.global_scopes.items)) |sym| {
                     rec.sym = sym;
                     symbol_flags[sym].exported = true;
                 }
@@ -3181,7 +3330,7 @@ const Binder = struct {
             // The local is NOT marked `exported`: `export default A` publishes
             // `A` under the name `default` only, never under `A`.
             if (rec.kind == .default and rec.sym == no_symbol and rec.local != 0 and rec.module == 0) {
-                if (result.lookupInScope(file_scope, rec.local)) |sym| rec.sym = sym;
+                if (result.resolveWithGlobals(rec.local, rec.scope, b.global_scopes.items)) |sym| rec.sym = sym;
             }
         }
         result.imports = try arena.dupe(ImportRec, b.import_recs.items);
@@ -3533,6 +3682,26 @@ test "dup: var/function is TS2300, var/var and var/param merge" {
     try expectBindCodes("function f() {} var f;", &.{.duplicate_identifier});
     try expectBindCodes("var x; var x;", &.{});
     try expectBindCodes("function f(x: number) { var x; }", &.{});
+}
+
+test "dup: a type-only namespace merges with a variable, an instantiated one does not" {
+    // tsc's `NamespaceModuleExcludes = 0`: a namespace whose body declares only
+    // types emits no runtime object, so it neither displaces nor is displaced
+    // by a variable of the same name, in either declaration order.
+    try expectBindCodes("namespace N { type A = number; } const N = 1;", &.{});
+    try expectBindCodes("const M = 1; namespace M { interface I { a: number } }", &.{});
+    try expectBindCodes("namespace E {} var E: number;", &.{});
+    try expectBindCodes("namespace O { namespace Inner { type A = number; } } let O: number;", &.{});
+    try expectBindCodes("namespace C { const enum K { A } } let C: number;", &.{});
+    // A value in the body makes it instantiated, and the clash is real again.
+    try expectBindCodes("namespace P { export const v = 1; } const P = 2;", &.{.block_scoped_redeclare});
+    try expectBindCodes("namespace Q { function f() {} } const Q = 2;", &.{.block_scoped_redeclare});
+    try expectBindCodes("namespace R { enum K { A } } const R = 2;", &.{.block_scoped_redeclare});
+    try expectBindCodes("namespace S { namespace In { export class C {} } } const S = 2;", &.{.block_scoped_redeclare});
+    // The flag is an AND over merged blocks, not an OR: one instantiated block
+    // makes the whole symbol a value module whichever order it is bound in.
+    try expectBindCodes("namespace T { type A = number; } namespace T { export const v = 1; } const T = 2;", &.{.block_scoped_redeclare});
+    try expectBindCodes("namespace U { export const v = 1; } namespace U { type A = number; } const U = 2;", &.{.block_scoped_redeclare});
 }
 
 test "dup: two function implementations is TS2393, overloads are fine" {
