@@ -91,6 +91,9 @@ pub const LibUnit = struct {
     tree: *Ast,
     /// Filled by the serial bind pass; `undefined` between parse and bind.
     bind: *Bind,
+    /// Index of the arena this shard's parse output lives in — the slot of
+    /// the thread that claimed it. The bind pass allocates from the same one.
+    arena: usize = 0,
     parse_ns: u64 = 0,
     bind_ns: u64 = 0,
 };
@@ -119,9 +122,12 @@ pub const LibUnit = struct {
 /// on ajv's five shards it is ~1.5 ms of parse against ~1.6 ms of bind, and on
 /// a DOM config (twelve shards) ~5.2 ms against ~6.7 ms.
 ///
-/// Each shard owns an arena that outlives the run: the AST, binder output and
-/// line table are program data now, not scratch. `LibFrontEnd.deinit` releases
-/// them.
+/// The arenas outlive the run — the AST, binder output and line table are
+/// program data now, not scratch — and there is one *per parse thread*, not
+/// per shard. An arena is not thread-safe, so the parse pass needs one each;
+/// making it one each rather than one per shard keeps the count (and their
+/// growth slack) flat as the lib set widens from 5 shards to 13.
+/// `LibFrontEnd.deinit` releases them.
 pub fn frontEndLibs(
     alloc: Allocator,
     io: Io,
@@ -132,8 +138,10 @@ pub fn frontEndLibs(
 ) !LibFrontEnd {
     var buf: [max_lib_files]LibFile = undefined;
     const files = libFiles(set, &buf);
+    const n = @max(1, @min(@min(n_threads, max_parse_threads), files.len));
+
     const units = try alloc.alloc(LibUnit, files.len);
-    const arenas = try alloc.alloc(std.heap.ArenaAllocator, files.len);
+    const arenas = try alloc.alloc(std.heap.ArenaAllocator, n);
     for (arenas) |*a| a.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     errdefer for (arenas) |*a| a.deinit();
 
@@ -147,36 +155,43 @@ pub fn frontEndLibs(
         .io = io,
         .errs = parse_errs,
     };
-    const n = @max(1, @min(n_threads, files.len));
     if (n == 1) {
-        job.run();
+        job.run(0);
     } else {
-        var threads: [max_lib_files]std.Thread = undefined;
+        var threads: [max_parse_threads]std.Thread = undefined;
         var started: usize = 0;
-        for (threads[0..n]) |*t| {
-            t.* = std.Thread.spawn(.{}, ParseJob.run, .{&job}) catch break;
+        // Slot 0 is this thread; spawn one runner for each of the rest. A
+        // spawn failure is not fatal — its slot simply goes unused and the
+        // shards it would have claimed are picked up by the runners that did
+        // start (each shard records the slot that parsed it).
+        for (threads[0 .. n - 1], 1..) |*t, slot| {
+            t.* = std.Thread.spawn(.{}, ParseJob.run, .{ &job, slot }) catch break;
             started += 1;
         }
-        // A spawn failure is not fatal: the remaining shards are simply
-        // claimed by this thread instead.
-        job.run();
+        job.run(0);
         for (threads[0..started]) |t| t.join();
     }
     for (parse_errs) |e| if (e) |err| return err;
 
     // --- Bind (serial, fixed shard order: this is what pins the atoms) ----
-    for (files, units, arenas) |lf, *u, *a| {
+    for (files, units) |lf, *u| {
         // Each lib file's own path atom, as the worker front end interns it.
         _ = try interner.intern(io, gpa, lf.path);
+        const a = arenas[u.arena].allocator();
         const t0 = Io.Clock.Timestamp.now(io, .awake);
-        const b = try a.allocator().create(Bind);
+        const b = try a.create(Bind);
         // Lib paths end in `.d.ts`, so this matches `isDeclarationPath`.
-        b.* = try binder.bind(a.allocator(), io, gpa, interner, u.tree, lf.source, true);
+        b.* = try binder.bind(a, io, gpa, interner, u.tree, lf.source, true);
         u.bind = b;
         u.bind_ns = elapsedNs(t0, Io.Clock.Timestamp.now(io, .awake));
     }
     return .{ .units = units, .arenas = arenas };
 }
+
+/// Parse threads for the lib pass. Four saturates the win (the shards are
+/// 150-250 KB each, so the pass is a handful of chunks either way) without
+/// widening the concurrent parse scratch further.
+const max_parse_threads: usize = 4;
 
 /// The lib front end's output plus the arenas backing it.
 pub const LibFrontEnd = struct {
@@ -199,12 +214,12 @@ const ParseJob = struct {
     errs: []?anyerror,
     next: std.atomic.Value(usize) = .init(0),
 
-    fn run(j: *ParseJob) void {
+    fn run(j: *ParseJob, slot: usize) void {
         while (true) {
             const i = j.next.fetchAdd(1, .monotonic);
             if (i >= j.files.len) return;
             const lf = j.files[i];
-            const a = j.arenas[i].allocator();
+            const a = j.arenas[slot].allocator();
             const t0 = Io.Clock.Timestamp.now(j.io, .awake);
             // `fromBytes` over the embedded blob is the same path the worker
             // front end takes for a synthetic lib path (`libSourceFor`).
@@ -224,6 +239,7 @@ const ParseJob = struct {
                 .src = src,
                 .tree = tree,
                 .bind = undefined,
+                .arena = slot,
                 .parse_ns = elapsedNs(t0, Io.Clock.Timestamp.now(j.io, .awake)),
             };
         }
