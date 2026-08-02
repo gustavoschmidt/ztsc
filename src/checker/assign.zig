@@ -121,8 +121,8 @@ pub fn castComparableRec(c: *Checker, a0: TypeId, b0: TypeId, depth: u32) Error!
     // where tsc accepts `s as T[K]` for any `s`), which would be a false
     // rejection — the one thing policy forbids. So the whole family is
     // conceded: comparing the two operands' *members* here reported
-    // `result as T[K]` on a numeric record, which tsc accepts, and four
-    // more shapes besides. The residual under-report is registered against
+    // `result as T[K]` on a numeric record, which tsc accepts, and six
+    // more shapes besides (measured 2026-08-02 on indexed/031). The residual under-report is registered against
     // the negatives case.
     if (c.ts.kind(a) == .index_access or c.ts.kind(b) == .index_access) return true;
     // A DEFERRED mapped type (`{ [K in keyof R]: … }` with `R` still free)
@@ -1167,9 +1167,185 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!bool {
         c.stats.relation_misses += 1;
         try c.relation.put(c.cm(), key, 2);
     }
+    // Nominal heritage fast path (see `nominalHeritageRelated`): a class or
+    // interface reaches a DECLARED base of itself without walking members.
+    // Positive-only; anything it cannot settle falls through to the
+    // structural walk below, so it never invents a "not related".
+    if (sr) |sref| {
+        if (tr) |tref| {
+            if (try c.nominalHeritageRelated(sref, tref)) {
+                if (cacheable) try c.relation.put(c.cm(), key, 1);
+                return true;
+            }
+        }
+    }
     const result = try c.isAssignableInner(s, t, sk, tk);
     if (cacheable) try c.relation.put(c.cm(), key, @intFromBool(result));
     return result;
+}
+
+/// How many references the nominal heritage walk holds before giving up (and
+/// the size of its stack-allocated queue). A declared `extends` graph is a
+/// handful of links wide in practice; past the cap the structural walk
+/// answers, as it did before the fast path.
+pub const max_heritage_walk: usize = 64;
+
+/// Is the source RELATED TO the target because the target IS one of the
+/// source's declared bases?
+///
+/// `class HTMLDivElement extends HTMLElement` (and `interface
+/// DataHTMLAttributes<T> extends HTMLAttributes<T>`) makes the derived type a
+/// subtype of the base BY DECLARATION: TypeScript checks that at the
+/// declaration (TS2415 / TS2430), so every later use may take it as given —
+/// which is exactly what the structural walk was re-deriving, once per pair,
+/// over the several hundred members of a lib interface. B1's TS2344 gate made
+/// that walk the dominant cost of the check phase on `.d.ts` corpora that
+/// write nominal constraints (`T extends HTMLElement` appears 119 times in
+/// @types/react), which is what this path is for.
+///
+/// Both sides must denote a generic reference (`refFacetOf`) and the target's
+/// symbol must be a class or an interface — a nominal declaration is the only
+/// thing an `extends` clause can name and the only thing this may conclude
+/// about. The walk follows `declaredBaseRefs` transitively, instantiating each
+/// base through the reference's own arguments, and answers only when it lands
+/// on a base instantiation of the TARGET's symbol whose arguments make the two
+/// the same type:
+///
+///   * argument-wise IDENTICAL (`Base<T>` reached from `Derived<T>` against
+///     the written `Base<T>`) — the same type, so related under any variance;
+///   * or the target's argument is `any` (`ZodString`'s base `ZodType<string,
+///     ZodStringDef, string>` against the written `ZodType<any, any, any>`) —
+///     `any` relates to everything in both directions, so it is related under
+///     any variance too.
+///
+/// `unknown` is deliberately NOT in that list: it swallows a covariant
+/// argument but not a contravariant one, so it needs the variance machinery
+/// the structural path already has. Everything else — a base instantiation
+/// whose arguments merely *relate* — falls through untouched. `implements` is
+/// not heritage for this purpose either: it is a constraint the class is
+/// separately checked against (TS2420), not a declaration that the relation
+/// holds.
+pub fn nominalHeritageRelated(c: *Checker, src_ref: TypeId, tgt_ref: TypeId) Error!bool {
+    const s = &c.ts;
+    const tsym = s.refSymbol(tgt_ref);
+    // The same symbol on both sides is the variance question, already asked
+    // above; a non-nominal target has no `extends` clause naming it.
+    if (s.refSymbol(src_ref) == tsym) return false;
+    const tf = c.symFlags(tsym);
+    if (!tf.interface and !tf.class) return false;
+    // The overwhelmingly common case — a source that declares no heritage at
+    // all — costs one hash probe and no allocation. The queue is a fixed
+    // stack buffer for the same reason: this runs on every ref-against-ref
+    // relation frame in the program, most of which end right here.
+    if ((try c.declaredBaseRefs(s.refSymbol(src_ref))).len == 0) return false;
+    var queue: [max_heritage_walk]TypeId = undefined;
+    queue[0] = src_ref;
+    var qlen: usize = 1;
+    var head: usize = 0;
+    while (head < qlen) : (head += 1) {
+        const cur = queue[head];
+        const csym = s.refSymbol(cur);
+        // Copied out: `declaredBaseRefs` may grow the pool the slice points
+        // into while this loop instantiates.
+        var buf: [8]TypeId = undefined;
+        const bases = try c.declaredBaseRefs(csym);
+        if (bases.len == 0) continue;
+        const n = @min(bases.len, buf.len);
+        @memcpy(buf[0..n], bases[0..n]);
+        var map_list: std.ArrayList(TpMap) = .empty;
+        defer map_list.deinit(c.scratch());
+        if (s.refArgs(cur).len > 0) try c.buildInstMap(csym, s.refArgs(cur), &map_list);
+        for (buf[0..n]) |b0| {
+            const b = if (map_list.items.len > 0) try c.instantiate(b0, map_list.items) else b0;
+            if (s.kind(b) != .ref) continue;
+            if (s.refSymbol(b) == tsym and heritageArgsIdentical(c, b, tgt_ref)) return true;
+            if (qlen == queue.len) return false;
+            var dup = false;
+            for (queue[0..qlen]) |q| {
+                if (q == b) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) {
+                queue[qlen] = b;
+                qlen += 1;
+            }
+        }
+    }
+    return false;
+}
+
+/// Do two references to the SAME generic carry arguments that make them the
+/// same type — variance not consulted, and none needed? See
+/// `nominalHeritageRelated` for why `any` counts and `unknown` does not.
+fn heritageArgsIdentical(c: *const Checker, a: TypeId, b: TypeId) bool {
+    if (a == b) return true;
+    const s = &c.ts;
+    const aa = s.refArgs(a);
+    const ba = s.refArgs(b);
+    if (aa.len != ba.len) return false;
+    for (aa, ba) |x, y| {
+        if (x == y) continue;
+        switch (s.kind(y)) {
+            .any, .err => {},
+            else => return false,
+        }
+    }
+    return true;
+}
+
+/// The `extends` heritage `sym` DECLARES, as references written in terms of
+/// `sym`'s own type parameters, memoized per symbol.
+///
+/// A class contributes its single `extends` base; an interface contributes
+/// every `extends` clause of every reopened block; a merged class+interface
+/// symbol contributes both, which is how drizzle's `declare class Table` /
+/// `interface Table extends SQLWrapper {}` pair reaches `SQLWrapper`. Anything
+/// that is not a plain reference (a mixin expression, an `extends Array<T>`
+/// that models as `.array`) is dropped — the fast path has nothing to say
+/// about it and the structural walk still does.
+///
+/// Storage is per SYMBOL, not per type: a `BaseSpan` (8 bytes) in
+/// `nominal_bases` plus four bytes per declared clause in
+/// `nominal_base_pool`. Symbols with no heritage still take the map entry, so
+/// the negative answer is a hash probe rather than a re-walk of the
+/// declaration list.
+pub fn declaredBaseRefs(c: *Checker, sym: SymbolId) Error![]const TypeId {
+    if (c.nominal_bases.get(sym)) |e| return c.nominal_base_pool.items[e.start..][0..e.len];
+    // Mark empty first: a heritage clause that resolves back through this
+    // symbol reads "no bases" instead of recursing.
+    try c.nominal_bases.put(c.cm(), sym, .{ .start = 0, .len = 0 });
+    var out: std.ArrayList(TypeId) = .empty;
+    defer out.deinit(c.scratch());
+    var one = [_]SymbolId{sym};
+    const parts: []const SymbolId = if (c.prog.isMergedId(sym)) c.prog.mergedSym(sym).parts else one[0..];
+    for (parts) |p| {
+        const f = c.symFlags(p);
+        if (f.class) {
+            if (try c.baseClassRef(p)) |b| {
+                if (c.ts.kind(b) == .ref) try out.append(c.scratch(), b);
+            }
+        }
+        if (f.interface) {
+            const saved_ctx = c.enterSymFile(p);
+            defer c.restoreCtx(saved_ctx);
+            const saved_this = c.this_type;
+            defer c.this_type = saved_this;
+            try c.setInterfaceThis(sym);
+            var bases: std.ArrayList(TypeId) = .empty;
+            defer bases.deinit(c.scratch());
+            try c.interfaceHeritageTypes(p, &bases);
+            for (bases.items) |b| {
+                if (c.ts.kind(b) == .ref) try out.append(c.scratch(), b);
+            }
+        }
+    }
+    const start: u32 = @intCast(c.nominal_base_pool.items.len);
+    try c.nominal_base_pool.appendSlice(c.cm(), out.items);
+    const span: checker_zig.BaseSpan = .{ .start = start, .len = @intCast(out.items.len) };
+    try c.nominal_bases.put(c.cm(), sym, span);
+    return c.nominal_base_pool.items[span.start..][0..span.len];
 }
 
 /// One side's relation-memo key: the generic reference an OBJECT

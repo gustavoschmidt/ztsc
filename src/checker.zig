@@ -569,7 +569,13 @@ pub const map_containers = [_][]const u8{
     "deep_path_list",           "deep_path_ids",          "flow_reach",
     "member_type_stack",        "lazy_index_objs",        "pending_type_args",
     "pending_type_args_pool",   "pending_type_args_seen", "tp_constrained_cache",
+    "nominal_bases",            "nominal_base_pool",
 };
+
+/// Where one symbol's declared heritage lives in `Checker.nominal_base_pool`.
+/// Eight bytes per symbol ever asked, and the pool holds four bytes per
+/// declared `extends` clause — see `declaredBaseRefs`.
+pub const BaseSpan = struct { start: u32, len: u32 };
 
 pub const Checker = struct {
     out: Allocator,
@@ -781,6 +787,15 @@ pub const Checker = struct {
     /// namespace / ambient module / `declare global` body. Drives the ambient
     /// grammar checks (TS1039).
     ambient_ctx: bool = false,
+    /// Declared `extends` heritage per symbol, as a span of
+    /// `nominal_base_pool` — the nominal-heritage relation fast path's index
+    /// (`declaredBaseRefs`). Filled lazily, only for symbols the relation
+    /// actually asks about, and empty-but-present for the ones with no
+    /// heritage at all.
+    nominal_bases: std.AutoHashMapUnmanaged(SymbolId, BaseSpan) = .empty,
+    /// Backing store for `nominal_bases`: each symbol's declared base
+    /// references, laid out contiguously in the order they were written.
+    nominal_base_pool: std.ArrayListUnmanaged(TypeId) = .empty,
     class_inst_generic: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
     class_static_cache: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
     /// Classes whose base-static fold is on the stack, so a malformed `extends`
@@ -2605,6 +2620,8 @@ pub const Checker = struct {
     pub const refFacetOf = assign_zig.refFacetOf;
     pub const relIdDeeplyNested = assign_zig.relIdDeeplyNested;
     pub const isAssignable = assign_zig.isAssignable;
+    pub const nominalHeritageRelated = assign_zig.nominalHeritageRelated;
+    pub const declaredBaseRefs = assign_zig.declaredBaseRefs;
     pub const condTrueUnderExtends = assign_zig.condTrueUnderExtends;
     pub const isCompound = assign_zig.isCompound;
     pub const isAssignableInner = assign_zig.isAssignableInner;

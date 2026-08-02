@@ -12,7 +12,7 @@ default. Every row is also a diagnostic-parity claim: on all eight packages
 ztsc reports **exactly the same diagnostics as tsgo** — the same (file, line,
 column, code) set, zero excess and zero under-reports — held by a standing
 ratcheted gate (`bench/parity_sweep.sh`, scored against checked-in tsgo 7.0.2
-oracle snapshots), alongside a 990-case differential conformance suite and the
+oracle snapshots), alongside a 991-case differential conformance suite and the
 excalidraw application row below. hono and zod check against the
 2.35 MB DOM lib, so their memory and wall clock sit higher than their line counts
 alone suggest — that added front end is why their rows land where they do.

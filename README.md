@@ -21,7 +21,7 @@ TypeScript compiler, byte-identical at any parallelism.
 - **Same diagnostics as tsgo on every benchmark** — all eight packages and
   excalidraw report exactly tsgo's (file, line, column, code) set: zero
   false positives, zero missed reports, held by standing ratcheted gates.
-- **990/990 conformance** — differential cases (error code + line) against the
+- **991/991 conformance** — differential cases (error code + line) against the
   native TypeScript compiler, tsgo 7.0.2.
 
 > [!WARNING]
