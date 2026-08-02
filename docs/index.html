@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ztsc — a fast, memory-lean TypeScript type checker in Zig</title>
-<meta name="description" content="ztsc type-checks TypeScript in milliseconds and megabytes: 4.8–16× less peak memory than tsgo and faster on every benchmark — with exactly the same findings as tsgo on every benchmark package and on excalidraw. A single static binary, zero dependencies, written in Zig.">
+<meta name="description" content="ztsc type-checks TypeScript in milliseconds and megabytes: 4.9–15× less peak memory than tsgo and faster on every benchmark — with exactly the same findings as tsgo on every benchmark package and on excalidraw. A single static binary, zero dependencies, written in Zig.">
 <link rel="stylesheet" href="style.css">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='20' fill='%23eda100'/%3E%3Ctext x='50' y='74' font-size='68' font-family='monospace' font-weight='bold' text-anchor='middle' fill='%231c1b18'%3Ez%3C/text%3E%3C/svg%3E">
 </head>
@@ -33,7 +33,7 @@
   <strong>zero dependencies</strong>, nothing but the Zig standard library.
   It checks a large, well-defined subset of strict-mode TypeScript with diagnostics that match
   the TypeScript compiler, byte-identical at any parallelism. On
-  <a href="benchmarks.html">excalidraw</a> — 333k lines of real application source — it reports
+  <a href="benchmarks.html">excalidraw</a> — 331k lines of real application source — it reports
   exactly the same findings as tsgo.</p>
 
   <div class="ctas">
@@ -45,13 +45,13 @@
   <div class="stats">
     <div class="stat">
       <div class="k">wall clock · excalidraw</div>
-      <div class="v">0.35&thinsp;<small>s</small></div>
-      <div class="c">tsgo 7.0.2 takes 0.50&thinsp;s on the same 333k lines of application source — and ztsc is faster on every benchmark, by up to 11× on the packages</div>
+      <div class="v">0.22&thinsp;<small>s</small></div>
+      <div class="c">tsgo 7.0.2 takes 0.49&thinsp;s on the same 331k lines of application source — and ztsc is faster on every benchmark, by up to 10× on the packages</div>
     </div>
     <div class="stat">
       <div class="k">peak RSS · excalidraw</div>
-      <div class="v">130&thinsp;<small>MB</small></div>
-      <div class="c">20% of tsgo (649.5&thinsp;MB); across eight benchmark packages ztsc uses 4.8–16× less peak memory</div>
+      <div class="v">129&thinsp;<small>MB</small></div>
+      <div class="c">19% of tsgo (669.1&thinsp;MB); across eight benchmark packages ztsc uses 4.9–15× less peak memory</div>
     </div>
     <div class="stat">
       <div class="k">dependencies</div>
@@ -108,22 +108,22 @@ ztsc src/main.ts           # or explicit entry files</code></pre>
   <h2>Faster and smaller than tsgo — on every benchmark</h2>
   <p>The headline number is a whole application: on
   <a href="https://github.com/excalidraw/excalidraw">excalidraw</a> — public, pinned, checked
-  with its <code>node_modules</code> — ztsc finishes in <strong>0.35&thinsp;s and
-  129.8&thinsp;MB</strong> against tsgo's 0.50&thinsp;s and 649.5&thinsp;MB, and reports
+  with its <code>node_modules</code> — ztsc finishes in <strong>0.22&thinsp;s and
+  129.2&thinsp;MB</strong> against tsgo's 0.49&thinsp;s and 669.1&thinsp;MB, and reports
   <strong>exactly the same 17 diagnostics as tsgo</strong>: same file, line, column and code,
   at every checker count from 1 to 8. Behind it, eight real packages' published
   <code>.d.ts</code>, vendored at pinned versions, exercise the type-level machinery: ztsc's
-  peak memory is <strong>6–21% of tsgo's</strong> and its wall clock <strong>9–58%</strong> —
-  3.0–11× faster on everything bigger than the process floor. All inputs identical, both tools
+  peak memory is <strong>7–20% of tsgo's</strong> and its wall clock <strong>10–64%</strong> —
+  3.5–10× faster on everything bigger than the process floor. All inputs identical, both tools
   at their default 4 checker instances on an Apple M4.</p>
   <div class="tablewrap">
   <table>
     <thead><tr><th>input</th><th class="num">wall ztsc / tsgo</th><th class="num">peak RSS ztsc / tsgo</th><th class="num">rss vs tsgo</th></tr></thead>
     <tbody>
-      <tr><td>excalidraw 0.18.1 · 333k lines of application source + deps</td><td class="num">0.35 / 0.50 s</td><td class="num">129.8 / 649.5 MB</td><td class="num">20%</td></tr>
-      <tr><td>@types/react 18.3.11 · 64.1k lines</td><td class="num">28 / 247 ms</td><td class="num">21.8 / 185.2 MB</td><td class="num">12%</td></tr>
-      <tr><td>@types/node 22.7.4 · 49.6k lines</td><td class="num">15 / 47 ms</td><td class="num">16.9 / 101.7 MB</td><td class="num">17%</td></tr>
-      <tr><td>drizzle-orm 0.33.0 · 12.6k lines</td><td class="num">22 / 238 ms</td><td class="num">17.3 / 275.7 MB</td><td class="num">6%</td></tr>
+      <tr><td>excalidraw 0.18.1 · 331k lines of application source + deps</td><td class="num">0.22 / 0.49 s</td><td class="num">129.2 / 669.1 MB</td><td class="num">19%</td></tr>
+      <tr><td>@types/react 18.3.11 · 64.1k lines</td><td class="num">27 / 244 ms</td><td class="num">23.3 / 200.0 MB</td><td class="num">12%</td></tr>
+      <tr><td>@types/node 22.7.4 · 49.6k lines</td><td class="num">13 / 45 ms</td><td class="num">17.7 / 106.6 MB</td><td class="num">17%</td></tr>
+      <tr><td>drizzle-orm 0.33.0 · 12.6k lines</td><td class="num">23 / 232 ms</td><td class="num">18.7 / 285.7 MB</td><td class="num">7%</td></tr>
     </tbody>
   </table>
   </div>

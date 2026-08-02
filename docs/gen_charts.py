@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Regenerate the two-panel RSS+wall benchmark charts from a single data table.
 
-Four copies are kept byte-in-sync by this script:
+Three copies are kept byte-in-sync by this script:
   - docs/benchmarks-light.svg   (standalone, light palette via CSS classes)
   - docs/benchmarks-dark.svg    (standalone, dark palette via CSS classes)
-  - docs/index.html             (inline SVG, palette via CSS vars, has data-tip)
-  - docs/internals.html         (inline SVG, palette via CSS vars, has data-tip)
+  - docs/benchmarks.html        (inline SVG, palette via CSS vars, has data-tip)
+
+(index.html and internals.html no longer embed this chart; their numbers are
+hand-maintained prose/tables.)
 
 Only data-driven attributes/text change; the visual design is untouched. Edit
 DATA below (medians: wall = median of 11 monotonic-ns runs, RSS = median of 5
@@ -23,25 +25,26 @@ ROOT = os.path.dirname(HERE)
 
 # name, wall_ztsc, wall_tsgo (ms), rss_ztsc, rss_tsgo (MB)
 # Both tools at their default 4 checkers.
-# Re-measured 2026-07-26 at commit 374d2c2, after the owned-file guards, the
-# flow-cache split, the resolver stat/exports memos, the PathElem shrink, the
-# lazy TS2589 anchor span, the locality-aware checker partition, the smaller
-# scratch retain floor and the `fnTypeParams` held-slice fix. RSS fell again on
-# six of eight packages and the check phase got ~25% cheaper. drizzle-orm's row
-# rose (15.0 -> 21.5 ms, 14.6 -> 17.3 MB), but the old figures were invalid:
-# before 1f18192 the checker segfaulted mid-check on that package at the default
-# 4 checkers, so the timed process was doing only part of the work. This row is
-# the first honest one. Both tools check their default lib at their defaults —
-# apples to apples, no parity flag needed.
+# Re-measured 2026-08-02 at commit d308f63, after the corpus-wide diagnostic
+# parity ratchet (8/8 packages at zero excess / zero under), the ambient-context
+# grammar checks in declaration files, and the tsc-fidelity implicit
+# node_modules prune in tsconfig include expansion (the prune does not touch
+# these vendored packages — they carry no node_modules — but halves the
+# excalidraw application row). @sinclair/typebox roughly doubled
+# (16.5 -> 30.5 ms) between 374d2c2 and f183773: the checker now does the work
+# whose absence produced its two false positives (0 excess now, was 2) —
+# the wall bought correctness, verified by rebuilding both commits. The other
+# seven rows moved only within noise. Both tools check their default lib at
+# their defaults — apples to apples, no parity flag needed.
 DATA = [
-    ("@types/node",        14.5,  46.9, 16.9, 101.7),
-    ("@types/react",       28.2, 247.2, 21.8, 185.2),
-    ("drizzle-orm",        21.5, 238.1, 17.3, 275.7),
-    ("hono",               31.3, 172.1, 23.5, 155.2),
-    ("@sinclair/typebox",  16.5,  49.2, 13.4,  78.6),
-    ("ajv",                13.9,  23.9, 10.3,  49.5),
-    ("zod",                26.0, 154.6, 20.7, 136.1),
-    ("chalk",               7.5,  18.5,  7.7,  43.4),
+    ("@types/node",        13.1,  45.3, 17.7, 106.6),
+    ("@types/react",       27.3, 244.2, 23.3, 200.0),
+    ("drizzle-orm",        23.2, 231.7, 18.7, 285.7),
+    ("hono",               31.0, 173.0, 24.8, 161.2),
+    ("@sinclair/typebox",  30.5,  47.8, 14.0,  81.7),
+    ("ajv",                 9.9,  22.8, 10.6,  52.2),
+    ("zod",                25.4, 155.2, 22.5, 142.5),
+    ("chalk",               7.6,  18.5,  8.4,  45.7),
 ]
 
 RSS_MAX_PX = 290
@@ -138,8 +141,7 @@ def patch(path, fmt):
 if __name__ == "__main__":
     patch(os.path.join(HERE, "benchmarks-light.svg"), "svg")
     patch(os.path.join(HERE, "benchmarks-dark.svg"), "svg")
-    patch(os.path.join(HERE, "index.html"), "html")
-    patch(os.path.join(HERE, "internals.html"), "html")
+    patch(os.path.join(HERE, "benchmarks.html"), "html")
 
     print("\n--- derived numbers ---")
     print("aria:", aria())

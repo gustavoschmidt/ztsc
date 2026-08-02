@@ -37,13 +37,13 @@
   <div class="stats">
     <div class="stat">
       <div class="k">wall clock · @types/node</div>
-      <div class="v">15&thinsp;<small>ms</small></div>
-      <div class="c">tsgo 7.0.2 takes 47&thinsp;ms on the same 49.6k lines of declarations — and ztsc is faster on all eight benchmark packages</div>
+      <div class="v">13&thinsp;<small>ms</small></div>
+      <div class="c">tsgo 7.0.2 takes 45&thinsp;ms on the same 49.6k lines of declarations — and ztsc is faster on all eight benchmark packages</div>
     </div>
     <div class="stat">
       <div class="k">peak RSS · @types/node</div>
-      <div class="v">17&thinsp;<small>MB</small></div>
-      <div class="c">17% of tsgo (102&thinsp;MB); across eight real packages ztsc runs at 6–21% of tsgo's peak, against a ≤&thinsp;50% headline goal</div>
+      <div class="v">18&thinsp;<small>MB</small></div>
+      <div class="c">17% of tsgo (107&thinsp;MB); across eight real packages ztsc runs at 7–20% of tsgo's peak, against a ≤&thinsp;50% headline goal</div>
     </div>
     <div class="stat">
       <div class="k">memory per ast node</div>
@@ -95,17 +95,17 @@
 
       <rect class="box" x="205" y="98" width="180" height="42"/>
       <text class="t12" x="217" y="116">load <tspan class="mut">(mmap)</tspan></text>
-      <text class="t11 mut" x="217" y="131">7.3 ms · 387 MB/s</text>
+      <text class="t11 mut" x="217" y="131">7.5 ms · 377 MB/s</text>
       <line class="flow" x1="295" y1="140" x2="295" y2="166" marker-end="url(#arr)"/>
 
       <rect class="box" x="205" y="168" width="180" height="42"/>
       <text class="t12" x="217" y="186">parse <tspan class="mut">→ tokens + SoA AST</tspan></text>
-      <text class="t11 mut" x="217" y="201">26.0 ms · then sealed</text>
+      <text class="t11 mut" x="217" y="201">24.9 ms · then sealed</text>
       <line class="flow" x1="295" y1="210" x2="295" y2="236" marker-end="url(#arr)"/>
 
       <rect class="box" x="205" y="238" width="180" height="42"/>
       <text class="t12" x="217" y="256">bind <tspan class="mut">→ symbols, flow</tspan></text>
-      <text class="t11 mut" x="217" y="271">34.9 ms · then sealed</text>
+      <text class="t11 mut" x="217" y="271">36.0 ms · then sealed</text>
 
       <!-- discovery loop -->
       <path class="flow" d="M 205,259 C 186,259 186,119 202,119" marker-end="url(#arr)"/>
@@ -116,7 +116,7 @@
       <line class="flow" x1="414" y1="184" x2="452" y2="184" marker-end="url(#arr)"/>
       <rect class="box" x="456" y="156" width="94" height="56"/>
       <text class="t12" x="503" y="180" text-anchor="middle">resolve</text>
-      <text class="t11 mut" x="503" y="196" text-anchor="middle">2.1 ms</text>
+      <text class="t11 mut" x="503" y="196" text-anchor="middle">1.7 ms</text>
       <line class="flow" x1="550" y1="184" x2="574" y2="184" marker-end="url(#arr)"/>
       <rect class="box" x="578" y="156" width="94" height="56"/>
       <text class="t12" x="625" y="180" text-anchor="middle">link</text>
@@ -148,8 +148,9 @@
     </svg>
     </div>
     <figcaption>Phase timings from one <code>--timing</code> run on the multi corpus (93k lines,
-    re-measured 2026-07-26 with the real lib — sharded into 12 blobs — loaded):
-    <strong>31.1&thinsp;ms end to end</strong>.
+    re-measured 2026-08-02 with the real lib — sharded into 12 blobs — loaded):
+    <strong>30.2&thinsp;ms end to end</strong>, tsconfig loading (the <code>config</code> phase,
+    now timed too) 0.04&thinsp;ms of it.
     Per-phase ms are aggregate time-in-phase summed across the 10-worker pool, so the overlapping
     front-end phases sum to more than the wall; bind is the largest single phase. Diagnostics are
     printed per file in discovery order, position-sorted — <strong>byte-identical output for any
@@ -576,34 +577,34 @@
 
   <figure>
     <div class="figbox">
-    <svg viewBox="0 0 940 250" role="img" aria-label="Bar chart of check-phase time versus number of checker instances on the multi corpus: 62.7 milliseconds at N equals 1, 33.2 at 2, 17.8 at 4, 13.9 at 8. Duplicated-type overhead grows from 6 to 20 percent.">
+    <svg viewBox="0 0 940 250" role="img" aria-label="Bar chart of check-phase time versus number of checker instances on the multi corpus: 64.5 milliseconds at N equals 1, 33.8 at 2, 18.0 at 4, 13.5 at 8. Duplicated-type overhead grows from 6 to 21 percent.">
       <text class="t12 dim" x="20" y="26">check-phase time vs --checkers=N · multi corpus, 93k lines, real lib loaded</text>
       <line x1="130" y1="190" x2="790" y2="190" stroke="var(--base)"/>
-      <path fill="var(--c-ztsc)" data-tip="N=1 · 62.7 ms · 21,335 types" d="M150,45 L226,45 Q230,45 230,49 L230,190 L150,190 L150,49 Q150,45 154,45 Z"/>
-      <path fill="var(--c-ztsc)" data-tip="N=2 · 33.2 ms · +5.6% types vs N=1" d="M310,113 L386,113 Q390,113 390,117 L390,190 L310,190 L310,117 Q310,113 314,113 Z"/>
-      <path fill="var(--c-ztsc)" data-tip="N=4 · 17.8 ms · +10.8% types vs N=1" d="M470,149 L546,149 Q550,149 550,153 L550,190 L470,190 L470,153 Q470,149 474,149 Z"/>
-      <path fill="var(--c-ztsc)" data-tip="N=8 · 13.9 ms · +20.4% types vs N=1" d="M630,158 L706,158 Q710,158 710,162 L710,190 L630,190 L630,162 Q630,158 634,158 Z"/>
-      <text class="barlabel" x="190" y="37" text-anchor="middle">62.7 ms</text>
-      <text class="barlabel" x="350" y="105" text-anchor="middle">33.2 ms</text>
-      <text class="barlabel" x="510" y="141" text-anchor="middle">17.8 ms</text>
-      <text class="barlabel" x="670" y="150" text-anchor="middle">13.9 ms</text>
+      <path fill="var(--c-ztsc)" data-tip="N=1 · 64.5 ms · 21,343 types" d="M150,45 L226,45 Q230,45 230,49 L230,190 L150,190 L150,49 Q150,45 154,45 Z"/>
+      <path fill="var(--c-ztsc)" data-tip="N=2 · 33.8 ms · +5.6% types vs N=1" d="M310,114 L386,114 Q390,114 390,118 L390,190 L310,190 L310,118 Q310,114 314,114 Z"/>
+      <path fill="var(--c-ztsc)" data-tip="N=4 · 18.0 ms · +10.9% types vs N=1" d="M470,150 L546,150 Q550,150 550,154 L550,190 L470,190 L470,154 Q470,150 474,150 Z"/>
+      <path fill="var(--c-ztsc)" data-tip="N=8 · 13.5 ms · +20.6% types vs N=1" d="M630,160 L706,160 Q710,160 710,164 L710,190 L630,190 L630,164 Q630,160 634,160 Z"/>
+      <text class="barlabel" x="190" y="37" text-anchor="middle">64.5 ms</text>
+      <text class="barlabel" x="350" y="106" text-anchor="middle">33.8 ms</text>
+      <text class="barlabel" x="510" y="142" text-anchor="middle">18.0 ms</text>
+      <text class="barlabel" x="670" y="152" text-anchor="middle">13.5 ms</text>
       <text class="t11 dim" x="190" y="210" text-anchor="middle">N=1</text>
       <text class="t11 dim" x="350" y="210" text-anchor="middle">N=2</text>
       <text class="t11 dim" x="510" y="210" text-anchor="middle">N=4 (default)</text>
       <text class="t11 dim" x="670" y="210" text-anchor="middle">N=8</text>
       <text class="t11 mut" x="190" y="228" text-anchor="middle">— dup types</text>
       <text class="t11 mut" x="350" y="228" text-anchor="middle">+5.6% dup types</text>
-      <text class="t11 mut" x="510" y="228" text-anchor="middle">+10.8% dup types</text>
-      <text class="t11 mut" x="670" y="228" text-anchor="middle">+20.4% dup types</text>
+      <text class="t11 mut" x="510" y="228" text-anchor="middle">+10.9% dup types</text>
+      <text class="t11 mut" x="670" y="228" text-anchor="middle">+20.6% dup types</text>
     </svg>
     </div>
-    <figcaption>Near-linear speedup to N=4 (3.5×), tapering at N=8 (4.5×) — measured with
+    <figcaption>Near-linear speedup to N=4 (3.6×), tapering at N=8 (4.8×) — measured with
     <code>--skip-default-lib-check</code> so the numbers isolate user-code check time (the
     embedded lib, which the default now type-checks, is excluded here so the scaling shape
     isn't masked by fixed lib cost). The duplicated types stay under a quarter of the
-    type arena even at N=8 — and the whole type arena is under 1&thinsp;MB, noise against ~41&thinsp;MB
+    type arena even at N=8 — and the whole type arena is under 1&thinsp;MB, noise against ~42&thinsp;MB
     of process RSS. Since the demand-paged right-sizing, RSS doesn't even grow monotonically with N: the
-    high-water mark is N=4 (~41&thinsp;MB), and N=8 (~38&thinsp;MB) sits below it.
+    high-water mark is N=4 (~43&thinsp;MB), and N=8 (~41.5&thinsp;MB) sits below it.
     N=4 stays the default — it matches tsgo's, so defaults-vs-defaults is apples to apples —
     and <code>--checkers=8</code> remains available for the extra speed.</figcaption>
   </figure>
@@ -660,7 +661,7 @@
 </section>
 
 <footer class="sitefoot">
-  ztsc 0.0.1-dev · sources: README.md, BENCHMARKS.md, EXPERIMENTS.md, ARCHITECTURE.md and the src/ doc comments at commit 218978d (2026-07-30) · numbers are Apple M4, macOS
+  ztsc 0.0.1-dev · sources: README.md, BENCHMARKS.md, EXPERIMENTS.md, ARCHITECTURE.md and the src/ doc comments at commit d308f63 (2026-08-02) · numbers are Apple M4, macOS
 </footer>
 
 </div>

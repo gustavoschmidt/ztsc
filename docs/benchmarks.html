@@ -26,7 +26,7 @@
 <div class="wrap">
 
 <header class="hero">
-  <p class="eyebrow">benchmarks · measured 2026-07-26, excalidraw 2026-07-30 · apple m4 · vs tsgo 7.0.2</p>
+  <p class="eyebrow">benchmarks · measured 2026-08-02 · apple m4 · vs tsgo 7.0.2</p>
   <h1>The numbers</h1>
   <p class="sub">Everything on this page is measured and pinned: real published packages and a
   real application, identical inputs into both tools, medians over repeated runs with a
@@ -36,18 +36,18 @@
   <div class="stats">
     <div class="stat">
       <div class="k">wall clock</div>
-      <div class="v">up to 11<small>× faster</small></div>
-      <div class="c">ztsc's wall clock is 9–58% of tsgo's on all eight declaration packages; 3.0–11× faster on everything bigger than the process floor</div>
+      <div class="v">up to 10<small>× faster</small></div>
+      <div class="c">ztsc's wall clock is 10–64% of tsgo's on all eight declaration packages; 3.5–10× faster on everything bigger than the process floor</div>
     </div>
     <div class="stat">
       <div class="k">peak RSS</div>
-      <div class="v">6–21<small>%</small></div>
-      <div class="c">of tsgo's peak memory on every package — 4.8–16× less, against a headline goal of ≤&thinsp;50%</div>
+      <div class="v">7–20<small>%</small></div>
+      <div class="c">of tsgo's peak memory on every package — 4.9–15× less, against a headline goal of ≤&thinsp;50%</div>
     </div>
     <div class="stat">
       <div class="k">real app source</div>
-      <div class="v">0.35&thinsp;<small>s</small></div>
-      <div class="c">excalidraw, full source + node_modules: ztsc 0.35&thinsp;s / 129.8&thinsp;MB vs tsgo 0.50&thinsp;s / 649.5&thinsp;MB — and the same 17 diagnostics as tsgo</div>
+      <div class="v">0.22&thinsp;<small>s</small></div>
+      <div class="c">excalidraw, full source + node_modules: ztsc 0.22&thinsp;s / 129.2&thinsp;MB vs tsgo 0.49&thinsp;s / 669.1&thinsp;MB — and the same 17 diagnostics as tsgo</div>
     </div>
     <div class="stat">
       <div class="k">conformance</div>
@@ -76,8 +76,8 @@
     measured: <strong><a href="https://github.com/excalidraw/excalidraw">excalidraw</a></strong>,
     public and reproducible — anyone can clone it and re-run both tools — and on it ztsc
     reports <strong>exactly the same 17 diagnostics as tsgo</strong>, same file, line, column and
-    code, at every checker count from 1 to 8, in <strong>0.35&thinsp;s / 129.8&thinsp;MB</strong>
-    against tsgo's <strong>0.50&thinsp;s / 649.5&thinsp;MB</strong>, both at their default four
+    code, at every checker count from 1 to 8, in <strong>0.22&thinsp;s / 129.2&thinsp;MB</strong>
+    against tsgo's <strong>0.49&thinsp;s / 669.1&thinsp;MB</strong>, both at their default four
     checkers.</li>
   </ul>
   <p>The package matrix is also a diagnostic-parity claim: on all eight packages ztsc reports
@@ -99,7 +99,7 @@
 
   <figure>
     <div class="figbox">
-    <svg viewBox="0 0 940 482" role="img" aria-label="Two-panel grouped bar chart across eight real packages at the default four checkers. Left panel, peak resident memory: ztsc uses 8 to 24 megabytes, tsgo 43 to 276 megabytes &#8212; ztsc is 6 to 21 percent of tsgo on every package. Right panel, wall clock: ztsc takes 8 to 31 milliseconds, tsgo 19 to 247 milliseconds &#8212; ztsc is 9 to 58 percent of tsgo's time.">
+    <svg viewBox="0 0 940 482" role="img" aria-label="Two-panel grouped bar chart across eight real packages at the default four checkers. Left panel, peak resident memory: ztsc uses 8 to 25 megabytes, tsgo 46 to 286 megabytes &#8212; ztsc is 7 to 20 percent of tsgo on every package. Right panel, wall clock: ztsc takes 8 to 31 milliseconds, tsgo 19 to 244 milliseconds &#8212; ztsc is 10 to 64 percent of tsgo's time.">
       <rect x="20" y="12" width="12" height="12" rx="2" fill="var(--c-ztsc)"/>
       <text class="t11 mut" x="38" y="22">ztsc</text>
       <rect x="78" y="12" width="12" height="12" rx="2" fill="var(--c-tsgo)"/>
@@ -109,74 +109,74 @@
       <line class="hairv" x1="590" y1="34" x2="590" y2="442"/>
 
       <text class="t12 dim" x="195" y="64" text-anchor="end">@types/node</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 16.9 MB · 17% of tsgo" x="210" y="44" width="18" height="14" rx="2"/>
-      <text class="barlabel" x="236" y="55">17 <tspan class="acc">· 17%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 101.7 MB" x="210" y="61" width="107" height="14" rx="2"/>
-      <text class="barlabel" x="325" y="72">102</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 14.5 ms · 31% of tsgo" x="620" y="44" width="16" height="14" rx="2"/>
-      <text class="barlabel" x="644" y="55">15 <tspan class="acc">· 31%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 46.9 ms" x="620" y="61" width="51" height="14" rx="2"/>
-      <text class="barlabel" x="679" y="72">47</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 17.7 MB · 17% of tsgo" x="210" y="44" width="18" height="14" rx="2"/>
+      <text class="barlabel" x="236" y="55">18 <tspan class="acc">· 17%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 106.6 MB" x="210" y="61" width="108" height="14" rx="2"/>
+      <text class="barlabel" x="326" y="72">107</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 13.1 ms · 29% of tsgo" x="620" y="44" width="14" height="14" rx="2"/>
+      <text class="barlabel" x="642" y="55">13 <tspan class="acc">· 29%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 45.3 ms" x="620" y="61" width="50" height="14" rx="2"/>
+      <text class="barlabel" x="678" y="72">45</text>
       <text class="t12 dim" x="195" y="116" text-anchor="end">@types/react</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 21.8 MB · 12% of tsgo" x="210" y="96" width="23" height="14" rx="2"/>
-      <text class="barlabel" x="241" y="107">22 <tspan class="acc">· 12%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 185.2 MB" x="210" y="113" width="195" height="14" rx="2"/>
-      <text class="barlabel" x="413" y="124">185</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 28.2 ms · 11% of tsgo" x="620" y="96" width="31" height="14" rx="2"/>
-      <text class="barlabel" x="659" y="107">28 <tspan class="acc">· 11%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 247.2 ms" x="620" y="113" width="270" height="14" rx="2"/>
-      <text class="barlabel" x="898" y="124">247</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 23.3 MB · 12% of tsgo" x="210" y="96" width="24" height="14" rx="2"/>
+      <text class="barlabel" x="242" y="107">23 <tspan class="acc">· 12%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 200.0 MB" x="210" y="113" width="203" height="14" rx="2"/>
+      <text class="barlabel" x="421" y="124">200</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 27.3 ms · 11% of tsgo" x="620" y="96" width="30" height="14" rx="2"/>
+      <text class="barlabel" x="658" y="107">27 <tspan class="acc">· 11%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 244.2 ms" x="620" y="113" width="270" height="14" rx="2"/>
+      <text class="barlabel" x="898" y="124">244</text>
       <text class="t12 dim" x="195" y="168" text-anchor="end">drizzle-orm</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 17.3 MB · 6% of tsgo" x="210" y="148" width="18" height="14" rx="2"/>
-      <text class="barlabel" x="236" y="159">17 <tspan class="acc">· 6%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 275.7 MB" x="210" y="165" width="290" height="14" rx="2"/>
-      <text class="barlabel" x="508" y="176">276</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 21.5 ms · 9% of tsgo" x="620" y="148" width="23" height="14" rx="2"/>
-      <text class="barlabel" x="651" y="159">22 <tspan class="acc">· 9%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 238.1 ms" x="620" y="165" width="260" height="14" rx="2"/>
-      <text class="barlabel" x="888" y="176">238</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 18.7 MB · 7% of tsgo" x="210" y="148" width="19" height="14" rx="2"/>
+      <text class="barlabel" x="237" y="159">19 <tspan class="acc">· 7%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 285.7 MB" x="210" y="165" width="290" height="14" rx="2"/>
+      <text class="barlabel" x="508" y="176">286</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 23.2 ms · 10% of tsgo" x="620" y="148" width="26" height="14" rx="2"/>
+      <text class="barlabel" x="654" y="159">23 <tspan class="acc">· 10%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 231.7 ms" x="620" y="165" width="256" height="14" rx="2"/>
+      <text class="barlabel" x="884" y="176">232</text>
       <text class="t12 dim" x="195" y="220" text-anchor="end">hono</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 23.5 MB · 15% of tsgo" x="210" y="200" width="25" height="14" rx="2"/>
-      <text class="barlabel" x="243" y="211">24 <tspan class="acc">· 15%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 155.2 MB" x="210" y="217" width="163" height="14" rx="2"/>
-      <text class="barlabel" x="381" y="228">155</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 31.3 ms · 18% of tsgo" x="620" y="200" width="34" height="14" rx="2"/>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 24.8 MB · 15% of tsgo" x="210" y="200" width="25" height="14" rx="2"/>
+      <text class="barlabel" x="243" y="211">25 <tspan class="acc">· 15%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 161.2 MB" x="210" y="217" width="164" height="14" rx="2"/>
+      <text class="barlabel" x="382" y="228">161</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 31.0 ms · 18% of tsgo" x="620" y="200" width="34" height="14" rx="2"/>
       <text class="barlabel" x="662" y="211">31 <tspan class="acc">· 18%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 172.1 ms" x="620" y="217" width="188" height="14" rx="2"/>
-      <text class="barlabel" x="816" y="228">172</text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 173.0 ms" x="620" y="217" width="191" height="14" rx="2"/>
+      <text class="barlabel" x="819" y="228">173</text>
       <text class="t12 dim" x="195" y="272" text-anchor="end">@sinclair/typebox</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 13.4 MB · 17% of tsgo" x="210" y="252" width="14" height="14" rx="2"/>
-      <text class="barlabel" x="232" y="263">13 <tspan class="acc">· 17%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 78.6 MB" x="210" y="269" width="83" height="14" rx="2"/>
-      <text class="barlabel" x="301" y="280">79</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 16.5 ms · 34% of tsgo" x="620" y="252" width="18" height="14" rx="2"/>
-      <text class="barlabel" x="646" y="263">17 <tspan class="acc">· 34%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 49.2 ms" x="620" y="269" width="54" height="14" rx="2"/>
-      <text class="barlabel" x="682" y="280">49</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 14.0 MB · 17% of tsgo" x="210" y="252" width="14" height="14" rx="2"/>
+      <text class="barlabel" x="232" y="263">14 <tspan class="acc">· 17%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 81.7 MB" x="210" y="269" width="83" height="14" rx="2"/>
+      <text class="barlabel" x="301" y="280">82</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 30.5 ms · 64% of tsgo" x="620" y="252" width="34" height="14" rx="2"/>
+      <text class="barlabel" x="662" y="263">31 <tspan class="acc">· 64%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 47.8 ms" x="620" y="269" width="53" height="14" rx="2"/>
+      <text class="barlabel" x="681" y="280">48</text>
       <text class="t12 dim" x="195" y="324" text-anchor="end">ajv</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 10.3 MB · 21% of tsgo" x="210" y="304" width="11" height="14" rx="2"/>
-      <text class="barlabel" x="229" y="315">10 <tspan class="acc">· 21%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 49.5 MB" x="210" y="321" width="52" height="14" rx="2"/>
-      <text class="barlabel" x="270" y="332">50</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 13.9 ms · 58% of tsgo" x="620" y="304" width="15" height="14" rx="2"/>
-      <text class="barlabel" x="643" y="315">14 <tspan class="acc">· 58%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 23.9 ms" x="620" y="321" width="26" height="14" rx="2"/>
-      <text class="barlabel" x="654" y="332">24</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 10.6 MB · 20% of tsgo" x="210" y="304" width="11" height="14" rx="2"/>
+      <text class="barlabel" x="229" y="315">11 <tspan class="acc">· 20%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 52.2 MB" x="210" y="321" width="53" height="14" rx="2"/>
+      <text class="barlabel" x="271" y="332">52</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 9.9 ms · 43% of tsgo" x="620" y="304" width="11" height="14" rx="2"/>
+      <text class="barlabel" x="639" y="315">10 <tspan class="acc">· 43%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 22.8 ms" x="620" y="321" width="25" height="14" rx="2"/>
+      <text class="barlabel" x="653" y="332">23</text>
       <text class="t12 dim" x="195" y="376" text-anchor="end">zod</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 20.7 MB · 15% of tsgo" x="210" y="356" width="22" height="14" rx="2"/>
-      <text class="barlabel" x="240" y="367">21 <tspan class="acc">· 15%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 136.1 MB" x="210" y="373" width="143" height="14" rx="2"/>
-      <text class="barlabel" x="361" y="384">136</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 26.0 ms · 17% of tsgo" x="620" y="356" width="28" height="14" rx="2"/>
-      <text class="barlabel" x="656" y="367">26 <tspan class="acc">· 17%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 154.6 ms" x="620" y="373" width="169" height="14" rx="2"/>
-      <text class="barlabel" x="797" y="384">155</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 22.5 MB · 16% of tsgo" x="210" y="356" width="23" height="14" rx="2"/>
+      <text class="barlabel" x="241" y="367">23 <tspan class="acc">· 16%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 142.5 MB" x="210" y="373" width="145" height="14" rx="2"/>
+      <text class="barlabel" x="363" y="384">143</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 25.4 ms · 16% of tsgo" x="620" y="356" width="28" height="14" rx="2"/>
+      <text class="barlabel" x="656" y="367">25 <tspan class="acc">· 16%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 155.2 ms" x="620" y="373" width="172" height="14" rx="2"/>
+      <text class="barlabel" x="800" y="384">155</text>
       <text class="t12 dim" x="195" y="428" text-anchor="end">chalk</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 7.7 MB · 18% of tsgo" x="210" y="408" width="8" height="14" rx="2"/>
-      <text class="barlabel" x="226" y="419">8 <tspan class="acc">· 18%</tspan></text>
-      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 43.4 MB" x="210" y="425" width="46" height="14" rx="2"/>
-      <text class="barlabel" x="264" y="436">43</text>
-      <rect fill="var(--c-ztsc)" data-tip="ztsc · 7.5 ms · 41% of tsgo" x="620" y="408" width="8" height="14" rx="2"/>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 8.4 MB · 18% of tsgo" x="210" y="408" width="9" height="14" rx="2"/>
+      <text class="barlabel" x="227" y="419">8 <tspan class="acc">· 18%</tspan></text>
+      <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 45.7 MB" x="210" y="425" width="46" height="14" rx="2"/>
+      <text class="barlabel" x="264" y="436">46</text>
+      <rect fill="var(--c-ztsc)" data-tip="ztsc · 7.6 ms · 41% of tsgo" x="620" y="408" width="8" height="14" rx="2"/>
       <text class="barlabel" x="636" y="419">8 <tspan class="acc">· 41%</tspan></text>
       <rect fill="var(--c-tsgo)" data-tip="tsgo 7.0.2 · 18.5 ms" x="620" y="425" width="20" height="14" rx="2"/>
       <text class="barlabel" x="648" y="436">19</text>
@@ -185,28 +185,30 @@
     </div>
     <figcaption>Validators, web frameworks, an ORM, and the big <code>@types</code> packages, both
     tools at the default 4 checkers and both type-checking their default lib: ztsc's peak memory is
-    <strong>6–21% of tsgo's</strong> and its wall clock <strong>9–58%</strong> — faster
-    <em>and</em> smaller on every package. The highest time ratios are the two <em>smallest</em>
-    packages (ajv, chalk) and <code>@sinclair/typebox</code>: at that size both tools sit near their
-    process floors — ztsc's ~7.5–14&thinsp;ms is dominated by startup plus its embedded 14k-line
-    lib, which it type-checks by default like tsgo; tsgo's floor is ~18&thinsp;ms. On everything
-    bigger ztsc is <strong>3.0–11× faster</strong>. hono and zod list <code>dom</code> in their
-    tsconfig, so ztsc parses, binds, and checks the 2.35&thinsp;MB DOM lib too — that front end is
-    why their ratios sit near 17–18% rather than the low single digits of drizzle or react.</figcaption>
+    <strong>7–20% of tsgo's</strong> and its wall clock <strong>10–64%</strong> — faster
+    <em>and</em> smaller on every package. The two <em>smallest</em> packages (ajv, chalk) sit near
+    both tools' process floors — ztsc's ~8–10&thinsp;ms is dominated by startup plus its embedded
+    14k-line lib, which it type-checks by default like tsgo; tsgo's floor is ~18&thinsp;ms.
+    <code>@sinclair/typebox</code>'s 64% is different: its wall roughly doubled when the checker
+    gained the ambient-context grammar checks and the parity work that removed its two remaining
+    false positives — the added time is the checking work whose absence produced them. On
+    everything bigger ztsc is <strong>3.5–10× faster</strong>. hono and zod list <code>dom</code> in
+    their tsconfig, so ztsc parses, binds, and checks the 2.35&thinsp;MB DOM lib too — that front
+    end is why their ratios sit near 16–18% rather than the low single digits of drizzle or react.</figcaption>
   </figure>
 
   <div class="tablewrap">
   <table>
     <thead><tr><th>package</th><th class="num">files / lines</th><th class="num">wall ztsc / tsgo</th><th class="num">wall vs tsgo</th><th class="num">peak RSS ztsc / tsgo</th><th class="num">rss vs tsgo</th></tr></thead>
     <tbody>
-      <tr><td>@types/node 22.7.4</td><td class="num">59 / 49.6k</td><td class="num">15 / 47 ms</td><td class="num">31%</td><td class="num">16.9 / 101.7 MB</td><td class="num">17%</td></tr>
-      <tr><td>@types/react 18.3.11</td><td class="num">6 / 64.1k</td><td class="num">28 / 247 ms</td><td class="num">11%</td><td class="num">21.8 / 185.2 MB</td><td class="num">12%</td></tr>
-      <tr><td>drizzle-orm 0.33.0</td><td class="num">288 / 12.6k</td><td class="num">22 / 238 ms</td><td class="num">9%</td><td class="num">17.3 / 275.7 MB</td><td class="num">6%</td></tr>
-      <tr><td>hono 4.6.3</td><td class="num">165 / 6.3k</td><td class="num">31 / 172 ms</td><td class="num">18%</td><td class="num">23.5 / 155.2 MB</td><td class="num">15%</td></tr>
-      <tr><td>@sinclair/typebox 0.33.12</td><td class="num">241 / 3.1k</td><td class="num">17 / 49 ms</td><td class="num">34%</td><td class="num">13.4 / 78.6 MB</td><td class="num">17%</td></tr>
-      <tr><td>ajv 8.17.1</td><td class="num">107 / 1.8k</td><td class="num">14 / 24 ms</td><td class="num">58%</td><td class="num">10.3 / 49.5 MB</td><td class="num">21%</td></tr>
-      <tr><td>zod 3.23.8</td><td class="num">24 / 1.6k</td><td class="num">26 / 155 ms</td><td class="num">17%</td><td class="num">20.7 / 136.1 MB</td><td class="num">15%</td></tr>
-      <tr><td>chalk 5.3.0</td><td class="num">5 / 612</td><td class="num">8 / 19 ms</td><td class="num">41%</td><td class="num">7.7 / 43.4 MB</td><td class="num">18%</td></tr>
+      <tr><td>@types/node 22.7.4</td><td class="num">59 / 49.6k</td><td class="num">13 / 45 ms</td><td class="num">29%</td><td class="num">17.7 / 106.6 MB</td><td class="num">17%</td></tr>
+      <tr><td>@types/react 18.3.11</td><td class="num">6 / 64.1k</td><td class="num">27 / 244 ms</td><td class="num">11%</td><td class="num">23.3 / 200.0 MB</td><td class="num">12%</td></tr>
+      <tr><td>drizzle-orm 0.33.0</td><td class="num">288 / 12.6k</td><td class="num">23 / 232 ms</td><td class="num">10%</td><td class="num">18.7 / 285.7 MB</td><td class="num">7%</td></tr>
+      <tr><td>hono 4.6.3</td><td class="num">165 / 6.3k</td><td class="num">31 / 173 ms</td><td class="num">18%</td><td class="num">24.8 / 161.2 MB</td><td class="num">15%</td></tr>
+      <tr><td>@sinclair/typebox 0.33.12</td><td class="num">241 / 3.1k</td><td class="num">31 / 48 ms</td><td class="num">64%</td><td class="num">14.0 / 81.7 MB</td><td class="num">17%</td></tr>
+      <tr><td>ajv 8.17.1</td><td class="num">107 / 1.8k</td><td class="num">10 / 23 ms</td><td class="num">43%</td><td class="num">10.6 / 52.2 MB</td><td class="num">20%</td></tr>
+      <tr><td>zod 3.23.8</td><td class="num">24 / 1.6k</td><td class="num">25 / 155 ms</td><td class="num">16%</td><td class="num">22.5 / 142.5 MB</td><td class="num">16%</td></tr>
+      <tr><td>chalk 5.3.0</td><td class="num">5 / 612</td><td class="num">8 / 19 ms</td><td class="num">41%</td><td class="num">8.4 / 45.7 MB</td><td class="num">18%</td></tr>
     </tbody>
   </table>
   </div>
@@ -222,19 +224,21 @@
   <h3>excalidraw — public, pinned, reproducible</h3>
   <p><a href="https://github.com/excalidraw/excalidraw">excalidraw</a> v0.18.1 at commit
   <code>a2ec2889</code>: a real React/TypeScript app with its <code>node_modules</code>, checked
-  whole. ztsc loads <strong>1,110 files / 332,794 lines</strong> (537 of them the project's own
-  source; the rest are the dependency <code>.d.ts</code> closure and the standard library).
-  Both tools at their default 4 checkers:</p>
+  whole. ztsc loads <strong>1,091 files / 330,555 lines</strong> (513 of them the project's own
+  source; the rest are the dependency <code>.d.ts</code> closure and the standard library —
+  the count fell from the previously published 1,110 when include expansion learned to stay out
+  of nested package folders the way tsc's does, dropping 24 <code>node_modules</code> sources
+  that tsgo also refuses to root). Both tools at their default 4 checkers:</p>
   <div class="tablewrap">
   <table>
     <thead><tr><th>tool</th><th class="num">wall</th><th class="num">peak RSS</th><th>diagnostics</th></tr></thead>
     <tbody>
-      <tr class="hl"><td>ztsc</td><td class="num">0.35 s</td><td class="num">129.8 MB</td><td>the same 17 — same file, line, column, code — at every checker count 1–8</td></tr>
-      <tr><td>tsgo 7.0.2</td><td class="num">0.50 s</td><td class="num">649.5 MB</td><td>baseline: 17 diagnostics</td></tr>
+      <tr class="hl"><td>ztsc</td><td class="num">0.22 s</td><td class="num">129.2 MB</td><td>the same 17 — same file, line, column, code — at every checker count 1–8</td></tr>
+      <tr><td>tsgo 7.0.2</td><td class="num">0.49 s</td><td class="num">669.1 MB</td><td>baseline: 17 diagnostics</td></tr>
     </tbody>
   </table>
   </div>
-  <p><strong>1.4× faster at 20% of the peak memory</strong> — and, unlike the package matrix,
+  <p><strong>2.3× faster at 19% of the peak memory</strong> — and, unlike the package matrix,
   this row <em>is</em> a diagnostic claim. ztsc reports exactly the same 17 diagnostics as tsgo:
   the same (file, line, column, code) for every one, zero excess and zero under-reports, and the
   same set at every checker count from 1 to 8. The <em>message text</em> is not identical —
@@ -263,7 +267,7 @@
     <code>baseUrl</code> dropped (the <code>paths</code> entries are already explicit relative
     paths, so nothing else changes). Everything else is byte-for-byte the project's own config.
     ztsc reads <em>both</em> files, and its diagnostic set is identical under either — the same
-    17 keys, and the same 1,110 files / 332,794 lines loaded — so the adjustment changes what
+    17 keys, and the same 1,091 files / 330,555 lines loaded — so the adjustment changes what
     tsgo can run, not what is being measured.</p>
   </div>
 
@@ -322,13 +326,13 @@ EXC=/path/to/excalidraw bench/convergence.sh</code></pre>
   <p>Both tools default to 4 checker instances, so the headline numbers are defaults-vs-defaults —
   but sweeping <code>--checkers</code> 1→8 makes the memory story starker.
   <strong>tsgo's RSS climbs steeply with checker count</strong> (drizzle-orm:
-  166&thinsp;→&thinsp;411&thinsp;MB from 1 to 8 checkers) while
-  <strong>ztsc's barely moves</strong> (15&thinsp;→&thinsp;18&thinsp;MB on the same package) —
+  174&thinsp;→&thinsp;419&thinsp;MB from 1 to 8 checkers) while
+  <strong>ztsc's barely moves</strong> (18&thinsp;→&thinsp;20&thinsp;MB on the same package) —
   ztsc's entire 1–8 range stays below tsgo's leanest single-checker run on every package.
   Since the demand-paged right-sizing of per-checker state, ztsc's RSS doesn't even grow
-  monotonically with N: on the multi corpus the high-water mark is N=4 (~41&thinsp;MB) and N=8
-  sits below it (~38&thinsp;MB).</p>
-  <p>Speed scales near-linearly to N=4 (3.5×) and tapers at N=8 (4.5×), at the cost of some
+  monotonically with N: on the multi corpus the high-water mark is N=4 (~43&thinsp;MB) and N=8
+  sits below it (~41.5&thinsp;MB).</p>
+  <p>Speed scales near-linearly to N=4 (3.6×) and tapers at N=8 (4.8×), at the cost of some
   duplicated type derivation between the independent checker instances — that trade and its
   measurements are covered in the <a href="internals.html#parallelism">internals tour</a>.
   Methodology and reproduction recipes are in
@@ -340,19 +344,19 @@ EXC=/path/to/excalidraw bench/convergence.sh</code></pre>
   <p class="eyebrow"><span class="n">05</span> · synthetic corpora</p>
   <h2>The generated corpora, for continuity</h2>
   <p>The generated corpora that carried the project's earlier tuning still run — ztsc and tsgo
-  re-measured 2026-07-26 with the same monotonic-ns protocol as the package matrix. tsc 5.5.4
+  re-measured 2026-08-02 with the same monotonic-ns protocol as the package matrix. tsc 5.5.4
   was retired from the ongoing bench scripts, so its rows are the 2026-07-14 figures it retired
   on; tsgo is the baseline that matters:</p>
   <div class="tablewrap">
   <table>
     <thead><tr><th>corpus</th><th>tool</th><th class="num">wall</th><th class="num">peak RSS</th><th class="num">rss vs tsgo</th></tr></thead>
     <tbody>
-      <tr class="hl"><td>medium · 50 files / 50k lines</td><td>ztsc</td><td class="num">20.8 ms</td><td class="num">23.7 MB</td><td class="num">22%</td></tr>
-      <tr><td></td><td>tsgo</td><td class="num">47.2 ms</td><td class="num">109.5 MB</td><td class="num">100%</td></tr>
-      <tr><td></td><td>tsc 5.5.4</td><td class="num">0.59 s</td><td class="num">224.4 MB</td><td class="num">205%</td></tr>
-      <tr class="hl"><td>multi · 201 files / 93k lines</td><td>ztsc</td><td class="num">33.6 ms</td><td class="num">40.7 MB</td><td class="num">21%</td></tr>
-      <tr><td></td><td>tsgo</td><td class="num">79.1 ms</td><td class="num">194.2 MB</td><td class="num">100%</td></tr>
-      <tr><td></td><td>tsc 5.5.4</td><td class="num">0.91 s</td><td class="num">316.3 MB</td><td class="num">163%</td></tr>
+      <tr class="hl"><td>medium · 50 files / 50k lines</td><td>ztsc</td><td class="num">20.0 ms</td><td class="num">25.1 MB</td><td class="num">22%</td></tr>
+      <tr><td></td><td>tsgo</td><td class="num">43.9 ms</td><td class="num">113.3 MB</td><td class="num">100%</td></tr>
+      <tr><td></td><td>tsc 5.5.4</td><td class="num">0.59 s</td><td class="num">224.4 MB</td><td class="num">198%</td></tr>
+      <tr class="hl"><td>multi · 201 files / 93k lines</td><td>ztsc</td><td class="num">33.2 ms</td><td class="num">42.9 MB</td><td class="num">21%</td></tr>
+      <tr><td></td><td>tsgo</td><td class="num">81.0 ms</td><td class="num">206.1 MB</td><td class="num">100%</td></tr>
+      <tr><td></td><td>tsc 5.5.4</td><td class="num">0.91 s</td><td class="num">316.3 MB</td><td class="num">153%</td></tr>
     </tbody>
   </table>
   </div>

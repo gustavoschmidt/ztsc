@@ -9,13 +9,13 @@ TypeScript compiler, byte-identical at any parallelism.
 
 **Full documentation:** https://gustavoschmidt.github.io/ztsc/
 
-- **4.8–16× less peak memory** than tsgo (the native TypeScript 7 compiler)
-  on eight benchmark packages, 5× on a whole application (excalidraw).
-- **Faster on every benchmark** — up to 11× on the packages, 1.4× on the
+- **4.9–15× less peak memory** than tsgo (the native TypeScript 7 compiler)
+  on eight benchmark packages, 5.2× on a whole application (excalidraw).
+- **Faster on every benchmark** — up to 10× on the packages, 2.3× on the
   application; wall clock, defaults vs. defaults.
 - **Same findings as tsgo on a real app** — on excalidraw, exactly the same
-  17 diagnostics (file, line, column, code) at every checker count, 1.4×
-  faster in 20% of the memory.
+  17 diagnostics (file, line, column, code) at every checker count, 2.3×
+  faster in 19% of the memory.
 - **0 dependencies** — the Zig source uses nothing but the Zig standard
   library; the binary needs nothing but your OS.
 - **Same diagnostics as tsgo on every benchmark** — all eight packages and
@@ -35,19 +35,19 @@ TypeScript compiler, byte-identical at any parallelism.
 **Faster and smaller than tsgo — on every benchmark.** Eight real
 packages' published `.d.ts`, vendored at pinned versions, both tools checking
 identical inputs at their default 4 checker instances on an Apple M4: ztsc's
-peak memory is **6–21% of tsgo's** and its wall clock **9–58%** — 3.0–11×
+peak memory is **7–20% of tsgo's** and its wall clock **10–64%** — 3.5–10×
 faster on everything bigger than the process floor.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/benchmarks-dark.svg">
-  <img alt="Peak memory and wall clock across eight packages: ztsc uses 8-24 MB where tsgo uses 43-276 MB, and takes 8-31 ms where tsgo takes 19-247 ms" src="docs/benchmarks-light.svg">
+  <img alt="Peak memory and wall clock across eight packages: ztsc uses 8-25 MB where tsgo uses 46-286 MB, and takes 8-31 ms where tsgo takes 19-244 ms" src="docs/benchmarks-light.svg">
 </picture>
 
 Declaration files exercise the type-level machinery; real application source
 exercises the rest, and a whole application is measured. On
 [excalidraw](https://github.com/excalidraw/excalidraw) — public and pinned,
-checked with its `node_modules` — ztsc finishes in **0.35 s and 129.8 MB**
-against tsgo's 0.50 s and 649.5 MB, and reports **exactly the same 17
+checked with its `node_modules` — ztsc finishes in **0.22 s and 129.2 MB**
+against tsgo's 0.49 s and 669.1 MB, and reports **exactly the same 17
 diagnostics as tsgo**: same file, line, column and code, at every checker count
 from 1 to 8.
 
