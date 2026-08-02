@@ -17,10 +17,12 @@
 # They observably are. Atom ids come from the interner's per-shard insertion
 # order (`Interner.intern`), which parallel workers vary run to run — the
 # atom *set* is identical every time, the id assignment never is. Atoms are
-# then sort keys: for a scope's member table (`Binder.seal`) and for a merged
-# namespace's member index (`Merger.buildNsMembers`). So the order the checker
-# reaches types in is not run-to-run stable, by design — the contract is that
-# nothing observable may depend on it. That is exactly what this script pins.
+# then sort keys: for a scope's member table (`Binder.seal`), for a merged
+# namespace's member index (`Merger.buildNsMembers`), and for an object type's
+# property records (`types.Store.sortTriples`, the interning canonical form).
+# So the order the checker reaches types in is not run-to-run stable, by
+# design — the contract is that nothing observable may depend on it. That is
+# exactly what this script pins.
 #
 # Why it exists: the checker's instantiation budget used to be measured with
 # an exempt window (origin tagging did not charge `inst_count`). Substitution
@@ -42,8 +44,10 @@
 #   2. every run prints its trailing `ztsc: loaded …` summary — a crash
 #      mid-check exits after printing a prefix of the diagnostics,
 #   3. all N runs share one exit code,
-#   4. all N runs are byte-identical, and
-#   5. all N runs agree on the work counters below.
+#   4. all N runs are byte-identical,
+#   5. all N runs agree on the order-invariant work counters below, and
+#   6. with the front end held SERIAL (`--workers=1`), all N runs agree on
+#      those *plus* the three traversal-order counters (5) has to let go of.
 #
 # Normalization for (4) is crash_sweep.sh's, verbatim: only the summary line's
 # `(N worker(s), N checker(s))` tail — the configuration itself — is folded
@@ -57,23 +61,61 @@
 # (5) is a second, cheap pass with `--memory`, and it is the part with teeth
 # for the bug above: that bug never moved a diagnostic, so (4) alone would
 # have watched it happen. It compares a whitelist of `--memory` rows — the
-# front end's work totals and every checker work counter, `instantiations`
-# included — chosen because each was measured invariant across repeat runs of
-# all eight packages at both configurations. A whitelist, not a blacklist, so
-# a new telemetry row cannot silently join the compared set unaudited.
+# front end's work totals and every checker counter of work PERFORMED,
+# `instantiations` included — chosen because each was measured invariant across
+# repeat runs of all eight packages at both configurations, under the shipped
+# parallel front end. A whitelist, not a blacklist, so a new telemetry row
+# cannot silently join the compared set unaudited.
 #
 # Deliberately *not* whitelisted, because they are known to vary run to run:
 # the per-worker arena high-waters and everything derived from them (`heap
 # total`, `bytes/line (heap)`, `pack segments`, `interner (total)`), which
 # follow from which files a worker happened to take; `check scratch
-# high-water`, the peak of a reused scratch arena; and `relation cache
-# entries` / `relation hit rate`, which still move on `@types/node` and
-# drizzle-orm (~1% of entries). That last one is the same order-dependence
-# class as the bug above, in the assignability memo rather than the
-# instantiation budget, and it is an open item — memoized results are a subset
-# question, so a differing entry count means a differing set of pairs reached.
-# It is telemetry today (no diagnostic has been observed to follow it); when
-# it is fixed, move those two rows into the whitelist.
+# high-water`, the peak of a reused scratch arena; and the three TRAVERSAL
+# counters `relation cache entries`, `relation hit rate` and `inst cache
+# hits`, which move on drizzle-orm at both configurations (`@types/node` used
+# to as well). Those three are one item, not three, and the mechanism is
+# understood:
+#
+#   The assignability memo marks a pair IN PROGRESS (`relate`'s `2`) while its
+#   own walk is live, and a re-entry on a live pair is answered from that mark
+#   without recursing — tsc's `Ternary.Maybe`, and the only thing that
+#   terminates a recursive type. So the pairs a walk *reaches* are a function
+#   of the order it reaches them in: settle a pair early and its subtree is
+#   walked and memoized; meet it while it is live and the subtree is never
+#   visited at all. `relation cache entries` counts exactly that reached set,
+#   and `inst cache hits` counts the memoized substitutions those extra
+#   subtrees re-request — which is why the two move in lockstep, and why
+#   `inst cache misses` / `instantiations` (the substitutions actually
+#   PERFORMED, one per distinct `(map, type)` pair) do not move at all.
+#
+#   The order itself is the atom order this header opens with: the checker
+#   reaches declarations, and an object type's properties, through tables
+#   sorted by name atom (`Binder.seal`, `Merger.buildNsMembers`,
+#   `types.Store.sortTriples`), and atom ids come from the interner's
+#   per-shard insertion order. Hold the front end serial and every one of the
+#   three is invariant — which is what (6) below pins, and what proves the
+#   parallel interner is the whole of it. drizzle-orm at `--checkers=1` charges
+#   42,215 / 42,223 / 42,231 / 42,247 / 42,255 `inst cache hits` across repeats
+#   of one binary, and 42,215 every time under `--workers=1`.
+#
+# Making them invariant under the parallel front end means a content-derived
+# atom order — the same fix `print.propDisplayOrder` already applies at the
+# output boundary, pushed down to the interner so traversal order gets it too.
+# Measured at ~3 ms per run on drizzle-orm's 61k atoms (a 5% wall regression on
+# a 59 ms check) before any of the store/binder churn, so it is not free and it
+# stays an open item. Nothing observable rides on it: diagnostics are compared
+# byte for byte by (4) and have never moved.
+#
+# (6) is what keeps the three from simply falling off the gate in the meantime.
+# It is a third `--memory` pass at the same checker count with `--workers=1`,
+# compared against a STRICT whitelist — (5)'s rows plus those three. The serial
+# front end removes the atom-id variance and nothing else: the partition, the
+# N-way checker scheduling and every per-checker memo are exercised exactly as
+# (5) exercises them, so a checker-side regression in any of the three still
+# fails here. What (6) deliberately cannot see is a counter that moves ONLY
+# under a parallel front end — which is why it is an addition to (5) and never
+# a substitute for it. Both passes must hold.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -135,7 +177,8 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 echo "repeat sweep: ${#PKGS[@]} package(s) × ${#CHECKERS[@]} config(s) × $REPEATS run(s)"
-echo "  (each run twice: once plain for byte-identity, once --memory for the counters)"
+echo "  (each run three times: plain for byte-identity, --memory for the counters,"
+echo "   --memory --workers=1 for the traversal counters a parallel interner moves)"
 echo
 
 # normalize <stdout-file>: crash_sweep.sh's compared form — the summary line's
@@ -144,14 +187,25 @@ normalize() {
     sed -E 's/\([0-9]+ worker\(s\), [0-9]+ checker\(s\)\)$/(W worker(s), C checker(s))/' "$1"
 }
 
-# The `--memory` rows compared across repeats: front-end work totals, then
-# every checker work counter. Each was measured invariant across repeat runs;
-# see the header for what is left out and why.
-COUNTERS='^  (tokens|ast nodes|bind symbols|bind scopes|bind flow nodes|check types \(total\)|inst cache hits|inst cache misses|inst canonical maps|instantiations|node_types hits|node_types misses|check flow queries) '
+# The `--memory` rows compared across repeats of the shipped (parallel) front
+# end: front-end work totals, then every checker work counter that measures
+# work PERFORMED rather than work re-requested. Each was measured invariant
+# across repeat runs; see the header for what is left out and why.
+COUNTERS='^  (tokens|ast nodes|bind symbols|bind scopes|bind flow nodes|check types \(total\)|inst cache misses|inst canonical maps|instantiations|node_types hits|node_types misses|check flow queries) '
+
+# The rows compared across repeats of the SERIAL front end (`--workers=1`):
+# the above plus the three traversal counters, which are invariant once atom
+# ids stop moving. Strictly a superset — (6) never compares less than (5).
+STRICT_COUNTERS='^  (tokens|ast nodes|bind symbols|bind scopes|bind flow nodes|check types \(total\)|inst cache hits|inst cache misses|inst canonical maps|instantiations|node_types hits|node_types misses|check flow queries|relation cache entries|relation hit rate) '
 
 # counters <stdout-file>: the whitelisted `--memory` rows, in print order.
 counters() {
     grep -E "$COUNTERS" "$1" || true
+}
+
+# strict_counters <stdout-file>: the serial-front-end whitelist, in print order.
+strict_counters() {
+    grep -E "$STRICT_COUNTERS" "$1" || true
 }
 
 # signal_note <status>: " (SIGSEGV)"-style suffix for a signalled exit.
@@ -215,6 +269,19 @@ for pkg in "${PKGS[@]}"; do
                 >"$TMP/mem" 2>/dev/null || true
             counters "$TMP/mem" >"$TMP/$pkg.c$n.r$r.counters"
 
+            # Third pass, same checker count but a SERIAL front end, for the
+            # three traversal counters. Atom ids are what the parallel
+            # interner varies, and they are the sort key every declaration and
+            # property table is reached through — so `--workers=1` removes the
+            # whole of the run-to-run order variance while leaving the checker
+            # side (partition, N-way scheduling, per-checker memos) exactly as
+            # the pass above exercises it. See the header for why the two
+            # passes cannot be merged: this one must not be allowed to excuse
+            # a shipped-configuration counter.
+            "$BIN" --pretty=false --memory --workers=1 --checkers="$n" -p "$CORPUS/$pkg" \
+                >"$TMP/mem1" 2>/dev/null || true
+            strict_counters "$TMP/mem1" >"$TMP/$pkg.c$n.r$r.strict"
+
             run_ok=1
             if [ "$status" -ne 0 ] && [ "$status" -ne 1 ]; then
                 notes+=("c$n run $r: exit $status$(signal_note "$status") — expected 0 or 1")
@@ -231,8 +298,9 @@ for pkg in "${PKGS[@]}"; do
                 ref_status="$status"
                 cp "$TMP/$pkg.c$n.r$r" "$TMP/$pkg.c$n.ref"
                 cp "$TMP/$pkg.c$n.r$r.counters" "$TMP/$pkg.c$n.ref.counters"
+                cp "$TMP/$pkg.c$n.r$r.strict" "$TMP/$pkg.c$n.ref.strict"
                 ndiags=$(grep -c 'error TS' "$TMP/$pkg.c$n.ref" || true)
-                if [ ! -s "$TMP/$pkg.c$n.ref.counters" ]; then
+                if [ ! -s "$TMP/$pkg.c$n.ref.counters" ] || [ ! -s "$TMP/$pkg.c$n.ref.strict" ]; then
                     notes+=("c$n run $r: no whitelisted --memory counter rows — did a row get renamed?")
                     run_ok=0
                 fi
@@ -251,6 +319,12 @@ for pkg in "${PKGS[@]}"; do
                     notes+=("c$n run $r: work counters differ from run 1 of the same config:")
                     while IFS= read -r line; do notes+=("    $line"); done \
                         < <(diff "$TMP/$pkg.c$n.ref.counters" "$TMP/$pkg.c$n.r$r.counters" | head -8)
+                    run_ok=0
+                fi
+                if ! cmp -s "$TMP/$pkg.c$n.r$r.strict" "$TMP/$pkg.c$n.ref.strict"; then
+                    notes+=("c$n run $r: --workers=1 work counters differ from run 1 of the same config:")
+                    while IFS= read -r line; do notes+=("    $line"); done \
+                        < <(diff "$TMP/$pkg.c$n.ref.strict" "$TMP/$pkg.c$n.r$r.strict" | head -8)
                     run_ok=0
                 fi
             fi
