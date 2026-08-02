@@ -66,9 +66,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
-const modules = @import("modules.zig");
-const paths = @import("paths.zig");
-const resolve = @import("resolve.zig");
+const modules = @import("link/modules.zig");
+const paths = @import("link/paths.zig");
+const resolve = @import("link/resolve.zig");
 
 pub const Error = error{OutOfMemory};
 

@@ -1,14 +1,14 @@
 //! Checker tests (moved verbatim from checker.zig).
 
 const std = @import("std");
-const ast = @import("../ast.zig");
-const scanner = @import("../scanner.zig");
+const ast = @import("../frontend/ast.zig");
+const scanner = @import("../frontend/scanner.zig");
 const intern = @import("../intern.zig");
-const binder = @import("../binder.zig");
+const binder = @import("../frontend/binder.zig");
 const types = @import("../types.zig");
-const source = @import("../source.zig");
+const source = @import("../frontend/source.zig");
 const libs = @import("../libs.zig");
-const modules = @import("../modules.zig");
+const modules = @import("../link/modules.zig");
 const ZeroPagedArray = @import("../zeropage.zig").ZeroPagedArray;
 
 const Io = std.Io;
@@ -29,7 +29,7 @@ const checkFiles = checker_zig.checkFiles;
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
-const parser = @import("../parser.zig");
+const parser = @import("../frontend/parser.zig");
 
 const TestCheck = struct {
     arena: std.heap.ArenaAllocator,

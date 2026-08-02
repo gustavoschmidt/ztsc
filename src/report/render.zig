@@ -10,7 +10,7 @@
 
 const std = @import("std");
 const Io = std.Io;
-const source = @import("source.zig");
+const source = @import("../frontend/source.zig");
 
 pub const Span = source.Span;
 
