@@ -1252,6 +1252,9 @@ pub const Checker = struct {
     atom_Boolean: Atom = 0,
     atom_Function: Atom = 0,
     atom_Object: Atom = 0,
+    /// The one member a class's constructor side gets that the global
+    /// `Function` interface does not supply usefully — see `classValueProp`.
+    atom_prototype: Atom = 0,
     /// Guard against `objectInterfaceProp` recursing through the `Object`
     /// interface's own member lookup.
     in_object_iface: bool = false,
@@ -1417,6 +1420,7 @@ pub const Checker = struct {
         c.atom_Boolean = try c.atom("Boolean");
         c.atom_Function = try c.atom("Function");
         c.atom_Object = try c.atom("Object");
+        c.atom_prototype = try c.atom("prototype");
         c.atom_Promise = try c.atom("Promise");
         c.atom_PromiseLike = try c.atom("PromiseLike");
         c.atom_Generator = try c.atom("Generator");

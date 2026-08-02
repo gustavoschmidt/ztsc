@@ -273,11 +273,7 @@ pub fn propOfTypeEx(c: *Checker, t: TypeId, name: Atom, allow_index: bool) Error
             return c.propOfTypeEx(u, name, allow_index);
         },
         .ref => return c.propOfTypeEx(try c.resolveStructural(t), name, allow_index),
-        .class_value => {
-            const cls = s.classSymbol(t);
-            if (try c.ownStaticMemberProp(cls, name)) |p| return p;
-            return c.propOfTypeEx(try c.classStaticType(cls), name, allow_index);
-        },
+        .class_value => return classValueProp(c, s.classSymbol(t), name, allow_index),
         .enum_type => {
             // A value of enum type borrows its base primitive's members.
             const info = try c.enumInfo(s.enumSymbol(t));
@@ -384,6 +380,45 @@ pub fn functionInterfaceProp(c: *Checker, name: Atom) Error!?types.Prop {
     if (!c.symFlags(sym).interface) return null;
     const ref = try c.ts.makeRef(sym, &.{});
     return c.propOfType(try c.resolveStructural(ref), name);
+}
+
+/// A property read off a class's CONSTRUCTOR side (`typeof C` — the value the
+/// class name denotes). Three sources, in tsc's own order:
+///
+///   1. the class's own `static` members, then the static side it inherits
+///      through `extends` (`classStaticType`);
+///   2. `prototype`, which every class declaration carries implicitly. tsc
+///      synthesizes it (`getTypeOfPrototypeProperty`) as the class's INSTANCE
+///      type, with `any` for each type parameter — "an instantiation of the
+///      class type with type Any supplied as a type argument for each type
+///      parameter", per the 1.0 spec §8.4 the compiler still cites — and marks
+///      it readonly. The global `Function` interface also declares
+///      `prototype`, but only as `any`, so this must come first;
+///   3. the global `Function` interface, which is the apparent type of every
+///      callable value and so supplies `name`, `length`, `call`, `apply`,
+///      `bind`, `toString` and `Symbol.hasInstance` to a class value exactly
+///      as it does to a function expression.
+///
+/// Source 3 is what a bare `.class_value` arm was missing: `Class.name` — the
+/// idiom every DI container, test factory and log line in a Nest/Angular
+/// codebase is built on — was TS2339 on every class in the program.
+fn classValueProp(c: *Checker, cls: SymbolId, name: Atom, allow_index: bool) Error!?types.Prop {
+    if (try c.ownStaticMemberProp(cls, name)) |p| return p;
+    if (try c.propOfTypeEx(try c.classStaticType(cls), name, allow_index)) |p| return p;
+    if (name == c.atom_prototype and name != 0) {
+        var tps: std.ArrayList(checker_zig.Checker.TypeParamInfo) = .empty;
+        defer tps.deinit(c.scratch());
+        try c.typeParamsOf(cls, &tps);
+        const args = try c.scratch().alloc(TypeId, tps.items.len);
+        defer c.scratch().free(args);
+        @memset(args, types.any_type);
+        return .{
+            .name = name,
+            .ty = try c.ts.makeRef(cls, args),
+            .flags = types.prop_flag_readonly,
+        };
+    }
+    return c.functionInterfaceProp(name);
 }
 
 /// Look `name` up on the global `Object` interface — the
