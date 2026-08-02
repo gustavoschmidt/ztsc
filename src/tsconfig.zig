@@ -10,8 +10,15 @@
 //!   a leading `.` in a segment. An include pattern whose last segment has no
 //!   wildcard and no extension is treated as a directory (`p` -> `p/**/*`),
 //!   like tsc. Only `.ts`/`.d.ts` files are collected. Default include (when
-//!   neither `files` nor `include` is present) is `**/*`; default excludes
-//!   are `node_modules`, `bower_components`, `jspm_packages`.
+//!   neither `files` nor `include` is present) is `**/*`. The default `exclude`
+//!   is empty: tsc's is `[outDir, declarationDir]`, and ztsc ignores both (it
+//!   never emits). What keeps the walk out of `node_modules`,
+//!   `bower_components` and `jspm_packages` is not `exclude` at all but tsc's
+//!   `implicitExcludePathRegexPattern`, which prunes those folder names
+//!   wherever a wildcard could have reached them — so an explicit `exclude`
+//!   neither enables nor disables it. A pattern's wildcard-free literal prefix
+//!   is the one way in (`include: ["node_modules/typed"]`), and it opts in only
+//!   what that prefix names; see `implicitlyPruned`.
 //! - **compilerOptions**:
 //!   - `strict` must be `true` or absent — ztsc only implements strict
 //!     semantics, so `strict: false` is a polite hard error (exit 2).
@@ -1230,7 +1237,15 @@ fn isFile(io: Io, base: Io.Dir, path: []const u8) bool {
 }
 
 const default_include = [_][]const u8{"**/*"};
-const default_excludes = [_][]const u8{ "node_modules", "bower_components", "jspm_packages" };
+
+/// The package folders tsc keeps the include walk out of (`implicitlyPruned`).
+/// They are *not* a default `exclude`: tsc's default `exclude` is
+/// `[outDir, declarationDir]`, both of which ztsc ignores (it never emits), so
+/// the fallback below is empty. Modeling them as an exclude instead would make
+/// them unconditional and defeat the escape hatch — `include:
+/// ["node_modules/typed"]` with no `exclude` field must still find its files.
+const common_package_dirs = [_][]const u8{ "node_modules", "bower_components", "jspm_packages" };
+const default_excludes = [_][]const u8{};
 
 fn warn(arena: Allocator, list: *std.ArrayList([]const u8), comptime fmt: []const u8, args: anytype) Error!void {
     try list.append(arena, try std.fmt.allocPrint(arena, fmt, args));
@@ -1293,6 +1308,9 @@ fn hasTsExt(name: []const u8) bool {
 /// matching any `include` pattern and excluded by none. `include`/`exclude`
 /// patterns are already base-relative (same coordinate system as the walked
 /// paths), so patterns declared in different configs compose correctly.
+/// Directories are additionally pruned by `implicitlyPruned`, which `exclude`
+/// can neither turn on nor off — without it this walk descends the entire
+/// dependency tree looking for sources that are never there.
 /// Returned paths are base-relative and sorted.
 fn expandInclude(
     io: Io,
@@ -1320,16 +1338,20 @@ fn expandInclude(
         var it = d.iterate();
         while (it.next(io) catch null) |entry| {
             if (entry.name.len == 0 or entry.name[0] == '.') continue;
-            const child = if (cur.len == 0)
-                try arena.dupe(u8, entry.name)
-            else
-                try std.fmt.allocPrint(arena, "{s}/{s}", .{ cur, entry.name });
+            // Both arms decide on the unjoined `cur`/`entry.name` first and
+            // materialize the child path only for entries that survive. On a
+            // tree with a populated `node_modules` the rejected entries are the
+            // overwhelming majority, and none of them should cost an arena
+            // string that lives until the config arena dies.
             switch (entry.kind) {
                 .directory => {
+                    if (implicitlyPruned(include, cur, entry.name)) continue;
+                    const child = try joinChild(arena, cur, entry.name);
                     if (!matchesAny(exclude, child)) try stack.append(arena, child);
                 },
                 .file => {
-                    if (!hasTsExt(child)) continue;
+                    if (!hasTsExt(entry.name)) continue;
+                    const child = try joinChild(arena, cur, entry.name);
                     if (matchesAny(exclude, child)) continue;
                     if (!matchesAny(include, child)) continue;
                     try out.append(arena, child);
@@ -1352,6 +1374,75 @@ fn matchesAny(patterns: []const []const u8, path: []const u8) bool {
         if (globMatch(p, path)) return true;
     }
     return false;
+}
+
+/// tsc's implicit exclude (`implicitExcludePathRegexPattern`): include expansion
+/// never descends into a directory named `node_modules`, `bower_components` or
+/// `jspm_packages`. tsc splices that negative lookahead into the *wildcard*
+/// fragment of each include pattern, never into the literal head, which makes
+/// the rule positional: a package folder is reachable only while the walk is
+/// still inside some pattern's wildcard-free prefix, and is unreachable
+/// everywhere a wildcard could have put it.
+///
+/// So `include: ["src", "node_modules/typed"]` opts in exactly
+/// `node_modules/typed` — not `src/deep/node_modules` (wildcard territory under
+/// `src/**/*`), and not `node_modules/typed/node_modules` (past the end of the
+/// literal prefix). A whole-pattern "does this name appear anywhere" test would
+/// wrongly open all three, so the test is `<cur>/<name>` being an
+/// ancestor-or-self of a literal prefix.
+///
+/// The same rule is what keeps a project that itself lives under a package
+/// folder working (`-p root/node_modules/mypkg`, or an `extends` base inside
+/// `node_modules` that declares `include`): the walk root's own segments are
+/// inside every derived pattern's literal prefix, so they open, while package
+/// dirs deeper in the project are still in wildcard territory and prune.
+///
+/// Takes `cur` and `name` unjoined so a pruned directory never allocates its
+/// path. Purely lexical, so the walk stays deterministic.
+fn implicitlyPruned(include: []const []const u8, cur: []const u8, name: []const u8) bool {
+    for (common_package_dirs) |pkg_dir| {
+        if (!std.mem.eql(u8, name, pkg_dir)) continue;
+        for (include) |pat| {
+            if (dirCoversPath(cur, name, literalPrefix(pat))) return false;
+        }
+        return true;
+    }
+    return false;
+}
+
+/// The leading whole segments of an include pattern that contain no `*`/`?` —
+/// the part tsc matches literally rather than by wildcard. `"src/**/*"` -> `src`,
+/// `"node_modules/typed/**/*"` -> `node_modules/typed`, `"src/*/index.ts"` ->
+/// `src`, `"**/*"` -> `""` (the walk root itself, and nothing under it).
+fn literalPrefix(pat: []const u8) []const u8 {
+    var end: usize = 0;
+    var i: usize = 0;
+    while (i < pat.len) {
+        const seg_end = std.mem.indexOfScalarPos(u8, pat, i, '/') orelse pat.len;
+        if (std.mem.indexOfAny(u8, pat[i..seg_end], "*?") != null) break;
+        end = seg_end;
+        i = seg_end + 1;
+    }
+    return pat[0..end];
+}
+
+/// Is the directory `<cur>/<name>` an ancestor of `path`, or `path` itself?
+/// Whole-segment (`src` does not cover `srcx`), and spelled on the unjoined
+/// parts so the caller need not build the child path to ask.
+fn dirCoversPath(cur: []const u8, name: []const u8, path: []const u8) bool {
+    var rest = path;
+    if (cur.len != 0) {
+        if (!std.mem.startsWith(u8, rest, cur)) return false;
+        if (rest.len == cur.len or rest[cur.len] != '/') return false;
+        rest = rest[cur.len + 1 ..];
+    }
+    if (!std.mem.startsWith(u8, rest, name)) return false;
+    return rest.len == name.len or rest[name.len] == '/';
+}
+
+fn joinChild(arena: Allocator, cur: []const u8, name: []const u8) Error![]const u8 {
+    if (cur.len == 0) return arena.dupe(u8, name);
+    return std.fmt.allocPrint(arena, "{s}/{s}", .{ cur, name });
 }
 
 // ===========================================================================
@@ -1478,6 +1569,188 @@ test "config: files + include/exclude expansion" {
     try testing.expectEqualStrings("proj/src/b.d.ts", cfg.root_files[2]);
     try testing.expectEqual(@as(usize, 0), cfg.warnings.len);
     try testing.expect(cfg.notes.len > 0); // noEmit note
+}
+
+test "literalPrefix: leading wildcard-free segments" {
+    try testing.expectEqualStrings("", literalPrefix("**/*"));
+    try testing.expectEqualStrings("", literalPrefix("*/index.ts"));
+    try testing.expectEqualStrings("src", literalPrefix("src/**/*"));
+    try testing.expectEqualStrings("src", literalPrefix("src/*/index.ts"));
+    try testing.expectEqualStrings("src", literalPrefix("src/a?.ts"));
+    try testing.expectEqualStrings("node_modules/typed", literalPrefix("node_modules/typed/**/*"));
+    // No wildcard anywhere: the whole pattern is literal.
+    try testing.expectEqualStrings("src/a.ts", literalPrefix("src/a.ts"));
+}
+
+test "dirCoversPath: whole-segment ancestor-or-self, unjoined" {
+    try testing.expect(dirCoversPath("", "node_modules", "node_modules"));
+    try testing.expect(dirCoversPath("", "node_modules", "node_modules/typed"));
+    try testing.expect(dirCoversPath("node_modules", "typed", "node_modules/typed"));
+    try testing.expect(!dirCoversPath("node_modules", "typed", "node_modules"));
+    try testing.expect(!dirCoversPath("src/deep", "node_modules", "src"));
+    // Whole segments only.
+    try testing.expect(!dirCoversPath("", "src", "srcx/a"));
+    try testing.expect(!dirCoversPath("", "node_modules", "my_node_modules"));
+}
+
+test "implicitlyPruned: the escape hatch is positional, not global" {
+    // Nothing names them: all three prune wherever they appear.
+    try testing.expect(implicitlyPruned(&.{"**/*"}, "", "node_modules"));
+    try testing.expect(implicitlyPruned(&.{"**/*"}, "", "bower_components"));
+    try testing.expect(implicitlyPruned(&.{"**/*"}, "", "jspm_packages"));
+    try testing.expect(implicitlyPruned(&.{"**/*"}, "src/deep", "node_modules"));
+    // Non-package directories are never the prune's business.
+    try testing.expect(!implicitlyPruned(&.{"**/*"}, "", "src"));
+    try testing.expect(!implicitlyPruned(&.{"**/*"}, "", "node_modules_x"));
+
+    // `include: ["src", "node_modules/typed"]` opts in exactly the one folder
+    // the literal prefix names — the defect a whole-pattern scan would create
+    // is that the other two would open too.
+    const inc = [_][]const u8{ "src/**/*", "node_modules/typed/**/*" };
+    try testing.expect(!implicitlyPruned(&inc, "", "node_modules"));
+    try testing.expect(implicitlyPruned(&inc, "src/deep", "node_modules"));
+    try testing.expect(implicitlyPruned(&inc, "node_modules/typed", "node_modules"));
+    try testing.expect(implicitlyPruned(&inc, "", "jspm_packages"));
+
+    // Wildcard territory always prunes, even one segment in: `src/*/index.ts`
+    // could match `src/node_modules/index.ts` textually, and tsc still refuses.
+    try testing.expect(implicitlyPruned(&.{"src/*/index.ts"}, "src", "node_modules"));
+
+    // A project *under* a package folder: the walk root's own segments sit
+    // inside the pattern's literal prefix, so they open.
+    const under = [_][]const u8{"node_modules/mypkg/src/**/*"};
+    try testing.expect(!implicitlyPruned(&under, "", "node_modules"));
+    try testing.expect(implicitlyPruned(&under, "node_modules/mypkg", "node_modules"));
+    try testing.expect(implicitlyPruned(&under, "node_modules/mypkg/src/deep", "node_modules"));
+}
+
+test "config: explicit exclude does not re-enable walking node_modules" {
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const d = tmp.dir;
+    // An `exclude` that names neither node_modules nor the nested copy: tsc
+    // still refuses to descend either, and so must ztsc.
+    try d.createDirPath(io, "proj/src");
+    try d.createDirPath(io, "proj/node_modules/pkg");
+    try d.createDirPath(io, "proj/src/node_modules/dep");
+    try d.createDirPath(io, "proj/bower_components/widget");
+    try d.createDirPath(io, "proj/tests");
+    try d.writeFile(io, .{ .sub_path = "proj/src/a.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/node_modules/pkg/index.d.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/src/node_modules/dep/index.d.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/bower_components/widget/w.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/tests/t.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/tsconfig.json", .data =
+        \\{ "compilerOptions": { "strict": true }, "exclude": ["tests"] }
+    });
+
+    const cfg = try loadInDir(io, alloc, d, "proj/tsconfig.json");
+    try testing.expectEqual(@as(usize, 1), cfg.root_files.len);
+    try testing.expectEqualStrings("proj/src/a.ts", cfg.root_files[0]);
+}
+
+test "config: an include naming node_modules walks only what it names" {
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const d = tmp.dir;
+    try d.createDirPath(io, "proj/src/deep/node_modules/dep");
+    try d.createDirPath(io, "proj/node_modules/typed/node_modules/inner");
+    try d.createDirPath(io, "proj/jspm_packages/other");
+    try d.writeFile(io, .{ .sub_path = "proj/src/x.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/src/deep/node_modules/dep/index.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/node_modules/typed/index.d.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/node_modules/typed/node_modules/inner/index.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/jspm_packages/other/o.ts", .data = "" });
+    // No `exclude` field at all: the escape hatch must work without one, which
+    // it cannot if the package folders are also modeled as a default exclude.
+    try d.writeFile(io, .{ .sub_path = "proj/tsconfig.json", .data =
+        \\{
+        \\  "compilerOptions": { "strict": true },
+        \\  "include": ["src", "node_modules/typed"],
+        \\}
+    });
+
+    // Verified against tsc 7.0.2 `--showConfig` on the same tree: exactly these
+    // two. `src/deep/node_modules` is wildcard territory under `src/**/*`;
+    // `node_modules/typed/node_modules` is past the literal prefix.
+    const cfg = try loadInDir(io, alloc, d, "proj/tsconfig.json");
+    try testing.expectEqual(@as(usize, 2), cfg.root_files.len);
+    try testing.expectEqualStrings("proj/node_modules/typed/index.d.ts", cfg.root_files[0]);
+    try testing.expectEqualStrings("proj/src/x.ts", cfg.root_files[1]);
+}
+
+test "config: a project under node_modules sees the same roots as anywhere else" {
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const d = tmp.dir;
+    // The identical tree at two placements. The prune must key on position
+    // relative to the include patterns, not on whether `node_modules` happens
+    // to appear in the project's own path.
+    for ([_][]const u8{ "proj", "node_modules/mypkg" }) |root| {
+        const dir = try std.fmt.allocPrint(alloc, "{s}/src/deep/node_modules/dep", .{root});
+        try d.createDirPath(io, dir);
+        try d.createDirPath(io, try std.fmt.allocPrint(alloc, "{s}/node_modules/other", .{root}));
+        try d.writeFile(io, .{
+            .sub_path = try std.fmt.allocPrint(alloc, "{s}/src/x.ts", .{root}),
+            .data = "",
+        });
+        try d.writeFile(io, .{
+            .sub_path = try std.fmt.allocPrint(alloc, "{s}/src/deep/node_modules/dep/index.ts", .{root}),
+            .data = "",
+        });
+        try d.writeFile(io, .{
+            .sub_path = try std.fmt.allocPrint(alloc, "{s}/node_modules/other/index.ts", .{root}),
+            .data = "",
+        });
+        try d.writeFile(io, .{
+            .sub_path = try std.fmt.allocPrint(alloc, "{s}/tsconfig.json", .{root}),
+            .data =
+            \\{ "compilerOptions": { "strict": true }, "include": ["src"], "exclude": ["dist"] }
+            ,
+        });
+
+        const cfg = try loadInDir(io, alloc, d, try std.fmt.allocPrint(alloc, "{s}/tsconfig.json", .{root}));
+        try testing.expectEqual(@as(usize, 1), cfg.root_files.len);
+        try testing.expectEqualStrings(try std.fmt.allocPrint(alloc, "{s}/src/x.ts", .{root}), cfg.root_files[0]);
+    }
+}
+
+test "config: a 'files' entry under node_modules loads (the walk never sees it)" {
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const d = tmp.dir;
+    try d.createDirPath(io, "proj/node_modules/pkg");
+    try d.writeFile(io, .{ .sub_path = "proj/node_modules/pkg/index.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "proj/tsconfig.json", .data =
+        \\{ "compilerOptions": { "strict": true }, "files": ["node_modules/pkg/index.ts"] }
+    });
+
+    // `files` is a literal list, not a pattern — the prune is a property of
+    // include expansion only, and `include` defaults to nothing when `files`
+    // is present.
+    const cfg = try loadInDir(io, alloc, d, "proj/tsconfig.json");
+    try testing.expectEqual(@as(usize, 1), cfg.root_files.len);
+    try testing.expectEqualStrings("proj/node_modules/pkg/index.ts", cfg.root_files[0]);
 }
 
 test "auto @types: default walk-up includes every visible package, sorted" {
