@@ -1692,11 +1692,98 @@ const Linker = struct {
                             }
                             try tbl.put(l.scratch, l.atom_export_equals, tgt);
                         },
-                        else => {}, // re-exports from another module: unsupported
+                        else => {}, // `export *`: second pass, below
                     }
                 }
             }
         }
+
+        try l.starMergeAmbient();
+    }
+
+    /// `export * from "other"` inside a `declare module "spec" { … }` block.
+    ///
+    /// The star's source is usually ANOTHER ambient module declared in the same
+    /// `.d.ts`: `transformation-matrix`'s typings are one script holding a
+    /// `declare module` per entry point plus a final `declare module
+    /// 'transformation-matrix'` block that stars them all back into the package
+    /// root — so `import { compose, identity } from 'transformation-matrix'`
+    /// reaches names no block of that specifier declares itself. Without this
+    /// every such name was TS2305.
+    ///
+    /// Runs after `buildAmbient` has placed every block's own members, so a
+    /// star never races the block it names, and iterates so a chain of stars
+    /// settles. Same rules as the file-level star merge: `default` and the
+    /// reserved `export=` key are not re-exported, and the first contributor of
+    /// a name wins (which keeps a block's own declaration ahead of a star's).
+    /// Order-invariant: the fixed point does not depend on visit order, since
+    /// every round only *adds* names no round could have taken differently.
+    fn starMergeAmbient(l: *Linker) Error!void {
+        const star_rounds = 8;
+        // A specifier whose blocks declare NOTHING of their own stays `opaque`
+        // (see `ambientOpaque`): named imports from it degrade to `any`, the
+        // documented under-report for the ambient shapes outside ztsc's
+        // subset. A star must not rescue such a module — @types/node's
+        // `declare module "node:fs" { export * from "fs"; }` alias blocks are
+        // all of this shape, and switching them on wholesale trades their
+        // (deliberate) `any` for a wave of false positives from checker gaps
+        // the `any` had been hiding (generic overload inference on
+        // `stream.pipeline`, well-known-symbol members on `readline.Interface`
+        // — none of them about module linking). So such a table is filled
+        // during the fixed point, which lets it relay a star CHAIN, and
+        // emptied again at the end. Snapshotted before any round, so both the
+        // fixed point and the reset stay independent of visit order.
+        const seeded = try l.scratch.alloc(bool, l.ambient.count());
+        for (l.ambient.values(), 0..) |*tbl, i| seeded[i] = tbl.count() != 0;
+        var round: u32 = 0;
+        while (round < star_rounds) : (round += 1) {
+            var changed = false;
+            for (l.files) |*f| {
+                for (f.bind.ambient_modules) |am| {
+                    const dst_idx = l.ambient.getIndex(am.spec) orelse continue;
+                    for (f.bind.exports[am.export_start..am.export_end]) |rec| {
+                        if (rec.kind != .reexport_all) continue;
+                        // tsc's precedence: for a non-relative specifier an
+                        // exactly-named ambient module outranks the resolved
+                        // file, which `effectiveModuleFile` already encodes.
+                        if (try l.effectiveModuleFile(f, rec.module)) |mfile| {
+                            const mt = try l.table(mfile);
+                            for (mt.keys(), mt.values()) |name, tgt| {
+                                if (try l.starPut(dst_idx, name, tgt, rec.type_only)) changed = true;
+                            }
+                            continue;
+                        }
+                        const src_key = l.ambientKey(rec.module) orelse continue;
+                        const src_idx = l.ambient.getIndex(src_key).?;
+                        if (src_idx == dst_idx) continue; // self-star
+                        // Snapshot: the put below may grow the destination
+                        // table, and only the source's entries are read.
+                        const src = l.ambient.values()[src_idx];
+                        for (src.keys(), src.values()) |name, tgt| {
+                            if (try l.starPut(dst_idx, name, tgt, rec.type_only)) changed = true;
+                        }
+                    }
+                }
+            }
+            if (!changed) break;
+        }
+        // Back to opaque: a block-less specifier relayed the chain, it does not
+        // export through it.
+        for (l.ambient.values(), 0..) |*tbl, i| {
+            if (!seeded[i]) tbl.clearRetainingCapacity();
+        }
+    }
+
+    /// One `export *`-merged name into ambient table `dst_idx`. True when it
+    /// was actually new (the fixed-point driver's change signal).
+    fn starPut(l: *Linker, dst_idx: usize, name: Atom, tgt: Target, type_only: bool) Error!bool {
+        if (name == l.atom_default or name == l.atom_export_equals) return false;
+        const dst = &l.ambient.values()[dst_idx];
+        if (dst.contains(name)) return false;
+        var final = tgt;
+        final.type_only = final.type_only or type_only;
+        try dst.put(l.scratch, name, final);
+        return true;
     }
 
     fn lookupAmbient(l: *Linker, spec: Atom, name: Atom) ?Target {
