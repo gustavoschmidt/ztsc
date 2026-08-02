@@ -256,6 +256,22 @@ pub fn typeFromTypeNodeUncached(c: *Checker, node: Node) Error!TypeId {
     }
 }
 
+/// The mapped-type key parameter named `a` that is lexically in scope, or
+/// null when there is none. Walks `mapped_key_scopes` innermost-out so an
+/// inner map's `[K in …]` shadows a same-named enclosing one, and a SHADOW
+/// entry (`ty == 0`, pushed for a signature's own type parameter) hides every
+/// enclosing mapped key of that name.
+pub fn lookupMappedKey(c: *Checker, a: Atom) ?checker_zig.MappedKeyScope {
+    if (a == 0) return null;
+    var i = c.mapped_key_scopes.items.len;
+    while (i > 0) {
+        i -= 1;
+        const e = c.mapped_key_scopes.items[i];
+        if (e.name == a) return if (e.ty == 0) null else e;
+    }
+    return null;
+}
+
 /// A named type reference (identifier, possibly with type arguments).
 pub fn typeFromTypeName(c: *Checker, name_node: Node, args: []const TypeId) Error!TypeId {
     if (name_node == null_node) return types.any_type;
@@ -305,11 +321,16 @@ pub fn typeFromTypeName(c: *Checker, name_node: Node, args: []const TypeId) Erro
         // unbound infer var collapses the indexed access to `any` at
         // reduction → every prop dropped to required (the
         // `--checkers`-partition-dependent TS2739/TS2322 non-confluence).
-        const mk_here = c.cur_mapped_key_name != 0 and c.cur_mapped_key_name == a;
+        //
+        // The lookup walks the mapped-key STACK innermost-out, so a mapped
+        // type nested in another map's value still resolves the ENCLOSING
+        // key (`{ [P in keyof S]: { [M in keyof S[P]]: S[P][M] } }` — `P` in
+        // the inner value); an inner key of the same name shadows the outer.
+        const mk = c.lookupMappedKey(a);
         var i = c.infer_scopes.items.len;
         while (i > 0) {
             i -= 1;
-            if (mk_here and i < c.cur_mapped_key_scope_depth) return c.cur_mapped_key_ty;
+            if (mk) |e| if (i < e.infer_depth) return e.ty;
             if (c.infer_ids.get(.{ .cond = c.infer_scopes.items[i], .name = a })) |id| {
                 // A bare mention of an already-declared binder, not the
                 // `infer V` declaration (that path is `inferVarFromNode`).
@@ -321,7 +342,7 @@ pub fn typeFromTypeName(c: *Checker, name_node: Node, args: []const TypeId) Erro
         }
         // A mapped type's key parameter `K` is in scope in its `as`/value
         // branches; a bare `K` there resolves to the mapped_param.
-        if (mk_here) return c.cur_mapped_key_ty;
+        if (mk) |e| return e.ty;
     }
     switch (c.resolveSpace(a, c.cur_scope, false)) {
         .sym => |sym0| {

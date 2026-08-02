@@ -1308,18 +1308,18 @@ pub fn mappedTypeFromNode(c: *Checker, node: Node) Error!TypeId {
     }
 
     // The key parameter is in scope in the `as` and value branches only
-    // (never in the constraint), so evaluate those with it bound.
-    const saved_name = c.cur_mapped_key_name;
-    const saved_ty = c.cur_mapped_key_ty;
-    const saved_depth = c.cur_mapped_key_scope_depth;
-    c.cur_mapped_key_name = key_name;
-    c.cur_mapped_key_ty = key_param;
-    c.cur_mapped_key_scope_depth = c.infer_scopes.items.len;
+    // (never in the constraint), so evaluate those with it PUSHED. Pushing
+    // rather than overwriting is what lets a mapped type nested in this
+    // one's value still see `key_name` (see `Checker.mapped_key_scopes`).
+    const saved_keys = c.mapped_key_scopes.items.len;
+    try c.mapped_key_scopes.append(c.cm(), .{
+        .name = key_name,
+        .ty = key_param,
+        .infer_depth = c.infer_scopes.items.len,
+    });
     const as_clause = if (m.as_type != null_node) try c.typeFromTypeNode(m.as_type) else 0;
     const value = if (m.value != null_node) try c.typeFromTypeNode(m.value) else types.any_type;
-    c.cur_mapped_key_name = saved_name;
-    c.cur_mapped_key_ty = saved_ty;
-    c.cur_mapped_key_scope_depth = saved_depth;
+    c.mapped_key_scopes.shrinkRetainingCapacity(saved_keys);
 
     return c.reduceMapped(key_param, constraint, value, as_clause, src_type, flags);
 }
@@ -2081,10 +2081,111 @@ pub fn containsMappedParamInner(c: *Checker, t: TypeId) Error!bool {
     };
 }
 
+/// Does `t` mention the mapped key parameter `key_id`? The EXACT-id
+/// counterpart of `containsMappedParam` (which answers "any mapped key"),
+/// and what gates `substMappedKey`.
+///
+/// The distinction matters for a DEFERRED nested map. `containsMappedParam`
+/// deliberately reads only a `.mapped`'s key set, because its value/`as`
+/// always mention its OWN key and reading them would answer `true` for every
+/// deferred map. But then `{ [P in "a"|"b"]: { [M in keyof T]: [P, M] } }`
+/// — inner map deferred on the free `T`, outer key `P` only in its VALUE —
+/// answered `false`, so `substMappedKey` returned it untouched and `P` was
+/// never bound (the tuple stayed `[P, "q"]`). Testing one specific id lets
+/// the value/`as` be walked without that false positive.
+pub fn mentionsMappedParam(c: *Checker, t: TypeId, key_id: u32) Error!bool {
+    const k = (@as(u64, t) << 32) | key_id;
+    if (c.mmp_cache.get(k)) |v| {
+        if (v != 0) return v == 2;
+    }
+    try c.mmp_cache.put(c.cm(), k, 1);
+    const r = try c.mentionsMappedParamInner(t, key_id);
+    try c.mmp_cache.put(c.cm(), k, if (r) 2 else 1);
+    return r;
+}
+
+pub fn mentionsMappedParamInner(c: *Checker, t: TypeId, key_id: u32) Error!bool {
+    const s = &c.ts;
+    return switch (s.kind(t)) {
+        .mapped_param => s.mappedParamId(t) == key_id,
+        .array => c.mentionsMappedParam(s.arrayElem(t), key_id),
+        .index_access => (try c.mentionsMappedParam(s.indexAccessObj(t), key_id)) or
+            (try c.mentionsMappedParam(s.indexAccessIndex(t), key_id)),
+        .union_type, .intersection, .overloads => blk: {
+            for (0..s.memberCount(t)) |i| {
+                if (try c.mentionsMappedParam(s.memberAt(t, i), key_id)) break :blk true;
+            }
+            break :blk false;
+        },
+        .tuple => blk: {
+            for (0..s.tupleLen(t)) |i| {
+                if (try c.mentionsMappedParam(s.tupleElem(t, @intCast(i)).ty, key_id)) break :blk true;
+            }
+            break :blk false;
+        },
+        .object => blk: {
+            for (0..s.objectPropCount(t)) |i| {
+                if (try c.mentionsMappedParam(s.objectProp(t, @intCast(i)).ty, key_id)) break :blk true;
+            }
+            break :blk false;
+        },
+        .function => blk: {
+            if (try c.mentionsMappedParam(s.fnReturn(t), key_id)) break :blk true;
+            for (0..s.fnParamCount(t)) |i| {
+                if (try c.mentionsMappedParam(s.fnParam(t, @intCast(i)).ty, key_id)) break :blk true;
+            }
+            break :blk false;
+        },
+        .ref => blk: {
+            for (0..s.refArgCount(t)) |i| {
+                if (try c.mentionsMappedParam(s.refArgAt(t, i), key_id)) break :blk true;
+            }
+            break :blk false;
+        },
+        .conditional => blk: {
+            if (try c.mentionsMappedParam(s.condCheck(t), key_id)) break :blk true;
+            if (try c.mentionsMappedParam(s.condExtends(t), key_id)) break :blk true;
+            if (try c.mentionsMappedParam(s.condTrue(t), key_id)) break :blk true;
+            if (try c.mentionsMappedParam(s.condFalse(t), key_id)) break :blk true;
+            break :blk false;
+        },
+        .template_literal_type => blk: {
+            for (0..s.templateHoleCount(t)) |i| {
+                if (try c.mentionsMappedParam(s.templateHole(t, @intCast(i)), key_id)) break :blk true;
+            }
+            break :blk false;
+        },
+        .string_mapping => c.mentionsMappedParam(s.stringMappingArg(t), key_id),
+        .keyof_op => c.mentionsMappedParam(s.keyofOperand(t), key_id),
+        .mapped => blk: {
+            // Key set first: it is evaluated OUTSIDE this map's own binder,
+            // so `key_id` there is always the enclosing one.
+            if (s.mappedConstraint(t) != 0 and try c.mentionsMappedParam(s.mappedConstraint(t), key_id)) break :blk true;
+            if (s.mappedSource(t) != 0 and try c.mentionsMappedParam(s.mappedSource(t), key_id)) break :blk true;
+            // The value/`as` branches are inside this map's binder. A
+            // recursive alias (`type R<T> = { [K in keyof T]: R<T[K]> }`)
+            // re-enters the SAME mapped node, so the inner instance can
+            // carry the same key id — there its own binder shadows the
+            // enclosing one and nothing inside is substitutable.
+            if (mappedBindsKey(s, t, key_id)) break :blk false;
+            if (try c.mentionsMappedParam(s.mappedValue(t), key_id)) break :blk true;
+            break :blk s.mappedAs(t) != 0 and try c.mentionsMappedParam(s.mappedAs(t), key_id);
+        },
+        else => false,
+    };
+}
+
+/// Does mapped type `t` bind `key_id` as its OWN key parameter (so a
+/// reference to it inside `t`'s value/`as` is `t`'s, not an enclosing map's)?
+fn mappedBindsKey(s: *const types.Store, t: TypeId, key_id: u32) bool {
+    const kp = s.mappedKeyParam(t);
+    return kp != 0 and s.kind(kp) == .mapped_param and s.mappedParamId(kp) == key_id;
+}
+
 /// Replace the mapped key parameter (`key_id`) with a concrete key type
 /// throughout `t`, reducing any `Obj[Idx]` that becomes concrete.
 pub fn substMappedKey(c: *Checker, t: TypeId, key_id: u32, key_ty: TypeId) Error!TypeId {
-    if (!try c.containsMappedParam(t)) return t;
+    if (!try c.mentionsMappedParam(t, key_id)) return t;
     const s = &c.ts;
     switch (s.kind(t)) {
         .mapped_param => return if (s.mappedParamId(t) == key_id) key_ty else t,
@@ -2158,14 +2259,17 @@ pub fn substMappedKey(c: *Checker, t: TypeId, key_id: u32, key_ty: TypeId) Error
         // Re-enter `reduceMapped` with the enclosing map's key bound — the
         // mirror of `substInfer`'s `.mapped` arm, for a map deferred by the
         // `containsMappedParam` test in `reduceMapped`. The inner map's own
-        // key param keeps its identity (a different id), so only the outer
-        // `key_id` is rewritten.
+        // key param keeps its identity (normally a different id), so only
+        // the outer `key_id` is rewritten. When the ids DO coincide (a
+        // recursive alias re-entering the same mapped node) this map's own
+        // binder shadows the enclosing one, so its value/`as` are left alone.
         .mapped => {
             const kp = s.mappedKeyParam(t);
+            const shadowed = mappedBindsKey(s, t, key_id);
             const con = if (s.mappedConstraint(t) != 0) try c.substMappedKey(s.mappedConstraint(t), key_id, key_ty) else 0;
-            const val = try c.substMappedKey(s.mappedValue(t), key_id, key_ty);
-            const as_c = if (s.mappedAs(t) != 0) try c.substMappedKey(s.mappedAs(t), key_id, key_ty) else 0;
             const src = if (s.mappedSource(t) != 0) try c.substMappedKey(s.mappedSource(t), key_id, key_ty) else 0;
+            const val = if (shadowed) s.mappedValue(t) else try c.substMappedKey(s.mappedValue(t), key_id, key_ty);
+            const as_c = if (s.mappedAs(t) == 0 or shadowed) s.mappedAs(t) else try c.substMappedKey(s.mappedAs(t), key_id, key_ty);
             return c.reduceMapped(kp, con, val, as_c, src, s.mappedFlags(t));
         },
         else => return t,
