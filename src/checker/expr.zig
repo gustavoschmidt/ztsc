@@ -124,11 +124,17 @@ pub fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             return c.checkExprCached(d.rhs, ctx);
         },
         .template_expr => {
-            // When the contextual type wants a template-literal type, keep
-            // the expression's template structure (checkExprCached on each
-            // substitution happens inside templateExprType); otherwise a
-            // template expression is just `string`.
-            if (try c.ctxWantsTemplate(ctx)) return c.templateExprType(node);
+            // When the contextual type wants a template-literal type — or
+            // the expression sits in a CONST context (`` `a${b}` as const ``,
+            // tsc's `checkTemplateExpression`: `isConstContext(node) ||
+            // isTemplateLiteralContextualType(...)`) — keep the expression's
+            // template structure (checkExprCached on each substitution
+            // happens inside templateExprType); otherwise a template
+            // expression is just `string`. Without the const-context arm
+            // `` `setUint${BITS[bytes]}` as const `` widened to `string`,
+            // which cannot index a `DataView` — a TS7053 false positive on
+            // the standard "compute the accessor name" idiom.
+            if (c.const_ctx or try c.ctxWantsTemplate(ctx)) return c.templateExprType(node);
             for (c.tree.nodeRange(node)) |sub| {
                 if (sub != null_node) _ = try c.checkExprCached(sub, types.no_type);
             }
@@ -2707,6 +2713,20 @@ pub fn propertyTypeOf(c: *Checker, t: TypeId, name: Atom, name_tok: TokenIndex) 
     }
 }
 
+/// The member a NUMBER-LITERAL key names, if `r` declares one. tsc's
+/// `getPropertyNameFromIndex` renders the literal the way JavaScript does
+/// (`String(2)` is `"2"`) and looks that name up before any index signature.
+/// Only integral values in the range where that rendering is exact are
+/// handled; anything else (fractional, exponential, huge) falls through to
+/// the index signature, which is the pre-existing behaviour.
+pub fn numericKeyProp(c: *Checker, r: TypeId, lit: TypeId) Error!?types.Prop {
+    const v = c.ts.numberValue(lit);
+    if (v != @floor(v) or @abs(v) >= 9007199254740992.0) return null;
+    var buf: [24]u8 = undefined;
+    const txt = std.fmt.bufPrint(&buf, "{d}", .{@as(i64, @intFromFloat(v))}) catch return null;
+    return c.propOfType(r, try c.internText(txt));
+}
+
 pub fn checkIndexExpr(c: *Checker, node: Node, narrow: bool) Error!TypeId {
     var chained = false;
     const r = try c.indexChainInner(node, &chained, narrow);
@@ -2851,6 +2871,15 @@ pub fn indexChainInner(c: *Checker, node: Node, chained: *bool, narrow: bool) Er
                     });
                     result = types.error_type;
                 }
+            } else if (try c.numericKeyProp(r, rl)) |p| {
+                // tsc's `getPropertyNameFromIndex`: a NUMERIC-literal key
+                // names a property exactly as a string-literal one does —
+                // `{ 1: 8, 2: 16, 4: 32 } as const` declares members `"1"`,
+                // `"2"`, `"4"`, and `BITS[2]` reads that member. Going
+                // straight to `numberIndexType` instead meant an object
+                // without a numeric index signature answered `any`, so every
+                // number-keyed lookup table lost its element type.
+                result = if (p.optional()) try c.makeUnion2(p.ty, types.undefined_type) else p.ty;
             } else {
                 result = try c.numberIndexType(r);
             }

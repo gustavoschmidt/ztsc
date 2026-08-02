@@ -375,9 +375,9 @@ pub fn inferredPredicate(c: *Checker, params: []const types.Param, ret: TypeId, 
             else => continue,
         };
         const key = RefKey{ .sym = psym };
-        const true_ty = try c.narrowByGuardExpr(declared, guard, sense, key, 0);
+        const true_ty = try c.narrowByGuardExpr(declared, guard, sense, key, 0, declared);
         if (true_ty == declared or c.ts.kind(true_ty) == .never) continue;
-        const false_ty = try c.narrowByGuardExpr(declared, guard, !sense, key, 0);
+        const false_ty = try c.narrowByGuardExpr(declared, guard, !sense, key, 0, declared);
         // Soundness: the false branch must fully exclude the narrowed type.
         if (try c.typesOverlap(true_ty, false_ty)) continue;
         if (found != null) return null; // ambiguous: two params narrowed
@@ -396,34 +396,34 @@ pub fn inferredPredicate(c: *Checker, params: []const types.Param, ret: TypeId, 
 /// (and the De Morgan dual for `||`). Leaves delegate to
 /// `narrowByCondition`; unhandled shapes return `t`, which the caller's
 /// `true_ty == declared` gate then rejects (no predicate — old behavior).
-pub fn narrowByGuardExpr(c: *Checker, t: TypeId, cond: Node, sense: bool, key: RefKey, depth: u32) Error!TypeId {
+pub fn narrowByGuardExpr(c: *Checker, t: TypeId, cond: Node, sense: bool, key: RefKey, depth: u32, decl: TypeId) Error!TypeId {
     if (cond == null_node or depth > 8) return t;
     const d = c.tree.nodeData(cond);
     switch (c.nodeTag(cond)) {
-        .paren_expr => return c.narrowByGuardExpr(t, d.lhs, sense, key, depth + 1),
+        .paren_expr => return c.narrowByGuardExpr(t, d.lhs, sense, key, depth + 1, decl),
         .prefix_unary => {
             if (c.tree.tokens.tag(c.tree.nodeMainToken(cond)) != .bang)
                 return t;
-            return c.narrowByGuardExpr(t, d.lhs, !sense, key, depth + 1);
+            return c.narrowByGuardExpr(t, d.lhs, !sense, key, depth + 1, decl);
         },
         .binary => switch (c.tree.tokens.tag(c.tree.nodeMainToken(cond))) {
             .amp_amp => {
-                const a_true = try c.narrowByGuardExpr(t, d.lhs, true, key, depth + 1);
-                if (sense) return c.narrowByGuardExpr(a_true, d.rhs, true, key, depth + 1);
-                const a_false = try c.narrowByGuardExpr(t, d.lhs, false, key, depth + 1);
-                const b_false = try c.narrowByGuardExpr(a_true, d.rhs, false, key, depth + 1);
+                const a_true = try c.narrowByGuardExpr(t, d.lhs, true, key, depth + 1, decl);
+                if (sense) return c.narrowByGuardExpr(a_true, d.rhs, true, key, depth + 1, decl);
+                const a_false = try c.narrowByGuardExpr(t, d.lhs, false, key, depth + 1, decl);
+                const b_false = try c.narrowByGuardExpr(a_true, d.rhs, false, key, depth + 1, decl);
                 return c.makeUnion2(a_false, b_false);
             },
             .pipe_pipe => {
-                const a_false = try c.narrowByGuardExpr(t, d.lhs, false, key, depth + 1);
-                if (!sense) return c.narrowByGuardExpr(a_false, d.rhs, false, key, depth + 1);
-                const a_true = try c.narrowByGuardExpr(t, d.lhs, true, key, depth + 1);
-                const b_true = try c.narrowByGuardExpr(a_false, d.rhs, true, key, depth + 1);
+                const a_false = try c.narrowByGuardExpr(t, d.lhs, false, key, depth + 1, decl);
+                if (!sense) return c.narrowByGuardExpr(a_false, d.rhs, false, key, depth + 1, decl);
+                const a_true = try c.narrowByGuardExpr(t, d.lhs, true, key, depth + 1, decl);
+                const b_true = try c.narrowByGuardExpr(a_false, d.rhs, true, key, depth + 1, decl);
                 return c.makeUnion2(a_true, b_true);
             },
-            else => return c.narrowByCondition(t, cond, sense, key),
+            else => return c.narrowByCondition(t, cond, sense, key, decl),
         },
-        else => return c.narrowByCondition(t, cond, sense, key),
+        else => return c.narrowByCondition(t, cond, sense, key, decl),
     }
 }
 

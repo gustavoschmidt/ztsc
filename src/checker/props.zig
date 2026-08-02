@@ -221,13 +221,18 @@ pub fn propOfTypeEx(c: *Checker, t: TypeId, name: Atom, allow_index: bool) Error
             if (!allow_index) return null;
             // …and neither may member access, when the map's KEY DOMAIN is
             // itself still generic (`mappedKeysStillGeneric`): tsc's
-            // `getPropertyOfType` then has no members at all, so every name
-            // is TS2339.
-            if (try mappedKeysStillGeneric(c, t)) return null;
+            // `getPropertyOfType` then has no *named* members at all — but a
+            // mapped type is still an object type there, so the tail of
+            // `getPropertyOfType` (`getPropertyOfObjectType(globalObjectType,
+            // name)`) still supplies the apparent `Object` members. That is
+            // why `collection.hasOwnProperty(v)` on the `Record<T, any>`
+            // constituent of `Set<T> | readonly T[] | Record<T, any> |
+            // Map<T, any>` is legal; without it every name was TS2339.
+            if (try mappedKeysStillGeneric(c, t)) return c.objectInterfaceProp(name);
             if (s.mappedHomomorphic(t)) {
                 const src = s.mappedSource(t);
                 const bc = try c.transitiveBaseConstraint(src);
-                if (bc == src) return null;
+                if (bc == src) return c.objectInterfaceProp(name);
                 const inst = try c.reduceMapped(
                     s.mappedKeyParam(t),
                     s.mappedConstraint(t),
@@ -236,7 +241,8 @@ pub fn propOfTypeEx(c: *Checker, t: TypeId, name: Atom, allow_index: bool) Error
                     bc,
                     s.mappedFlags(t),
                 );
-                if (s.kind(inst) == .mapped) return null; // key set still generic
+                // key set still generic
+                if (s.kind(inst) == .mapped) return c.objectInterfaceProp(name);
                 return c.propOfTypeEx(inst, name, allow_index);
             }
             // A NON-homomorphic map (`Pick`/`Omit`/`Record` applied to a
@@ -247,9 +253,10 @@ pub fn propOfTypeEx(c: *Checker, t: TypeId, name: Atom, allow_index: bool) Error
             // has apparent type `Omit<Partial<Base>, "id">`, which is what
             // tsc resolves a property access against.
             const bc = try c.transitiveBaseConstraint(t);
-            if (bc == t) return null;
+            if (bc == t) return c.objectInterfaceProp(name);
             const rbc = try c.resolveStructural(bc);
-            if (s.kind(rbc) == .mapped) return null; // key set still generic
+            // key set still generic
+            if (s.kind(rbc) == .mapped) return c.objectInterfaceProp(name);
             return c.propOfTypeEx(rbc, name, allow_index);
         },
         // A still-deferred conditional has the apparent members of its

@@ -97,3 +97,15 @@ calls/053_rest_param_union_of_tuples.ts  -TS2345 58
 # reports.
 indexed/032_cast_to_deferred_indexed_access_negatives.ts  -TS2352 8
 
+
+# A NUMBER-literal key that names no member is not reported. The string-literal
+# arm of element access reports the implicit-'any' miss (TS7053); the numeric
+# arm falls back to the receiver's numeric index signature, which for an object
+# without one is `any`, silently. Reporting there needs the numeric key space to
+# be modelled as exactly as the named one is — arrays, tuples, enum-keyed maps
+# and lib types all index numerically through paths ztsc approximates — so a
+# "cannot index" verdict on this arm would be a false positive on correct code,
+# which policy forbids. Deterministic under-report of one report; the ELEMENT
+# TYPE the same access produces is exact (that is what lines 7, 11 and 19 pin,
+# and what `constassert/006` as a whole is about).
+constassert/006_template_expr_const_context_negatives.ts  -TS7053 16

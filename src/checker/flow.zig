@@ -788,7 +788,7 @@ pub fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, d
             const saved = c.cur_scope;
             defer c.cur_scope = saved;
             c.cur_scope = b.flowScope(flow);
-            return c.narrowByCondition(before, cond, sense, key);
+            return c.narrowByCondition(before, cond, sense, key, declared);
         },
         .switch_clause => {
             const clause = b.flowNode(flow);
@@ -798,7 +798,7 @@ pub fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, d
             const saved = c.cur_scope;
             defer c.cur_scope = saved;
             c.cur_scope = b.flowScope(flow);
-            return c.narrowBySwitchClause(before, clause, key);
+            return c.narrowBySwitchClause(before, clause, key, declared);
         },
         .switch_no_match => {
             const sw = b.flowNode(flow);
@@ -822,7 +822,7 @@ pub fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, d
             const saved = c.cur_scope;
             defer c.cur_scope = saved;
             c.cur_scope = b.flowScope(flow);
-            return c.narrowByAssertCall(before, call, key);
+            return c.narrowByAssertCall(before, call, key, declared);
         },
         .branch_label, .loop_label => {
             const antes = b.flowAntecedents(flow);
@@ -1170,19 +1170,19 @@ pub fn constAliasInit(c: *Checker, cond: Node, key: RefKey) Error!?Node {
     }
 }
 
-pub fn narrowByCondition(c: *Checker, t: TypeId, cond: Node, sense: bool, key: RefKey) Error!TypeId {
+pub fn narrowByCondition(c: *Checker, t: TypeId, cond: Node, sense: bool, key: RefKey, decl: TypeId) Error!TypeId {
     if (cond == null_node) return t;
     const d = c.tree.nodeData(cond);
     switch (c.nodeTag(cond)) {
-        .paren_expr => return c.narrowByCondition(t, d.lhs, sense, key),
-        .non_null => return c.narrowByCondition(t, d.lhs, sense, key),
+        .paren_expr => return c.narrowByCondition(t, d.lhs, sense, key, decl),
+        .non_null => return c.narrowByCondition(t, d.lhs, sense, key, decl),
         // `if ((m = next()))` — an assignment's value is the target's new
         // value, so its truthiness narrows the target (tsc narrows by
         // `getReferenceCandidate` of the condition); a comma expression
         // condition is its right operand.
         .assign, .seq_expr => {
             const cand = c.referenceCandidate(cond);
-            if (cand != cond) return c.narrowByCondition(t, cand, sense, key);
+            if (cand != cond) return c.narrowByCondition(t, cand, sense, key, decl);
             return t;
         },
         .identifier => {
@@ -1201,7 +1201,7 @@ pub fn narrowByCondition(c: *Checker, t: TypeId, cond: Node, sense: bool, key: R
                 if (try c.constAliasInit(cond, key)) |init_expr| {
                     c.alias_inline_level += 1;
                     defer c.alias_inline_level -= 1;
-                    return c.narrowByCondition(t, init_expr, sense, key);
+                    return c.narrowByCondition(t, init_expr, sense, key, decl);
                 }
             }
             return t;
@@ -1219,7 +1219,7 @@ pub fn narrowByCondition(c: *Checker, t: TypeId, cond: Node, sense: bool, key: R
                     base = try c.nonNullable(base);
                 }
                 const prop = try c.memberAtom(d.rhs);
-                return c.narrowByPropTruthiness(base, prop, sense);
+                return c.narrowByPropTruthiness(base, prop, sense, decl);
             }
             // A truthy optional chain (`if (a?.b.c)`, `if (!a?.b.c)` else)
             // implies its receivers did not short-circuit: narrow a contained
@@ -1254,7 +1254,7 @@ pub fn narrowByCondition(c: *Checker, t: TypeId, cond: Node, sense: bool, key: R
                     const strict = op == .eq_eq_eq or op == .bang_eq_eq;
                     var eff_sense = sense;
                     if (op == .bang_eq_eq or op == .bang_eq) eff_sense = !sense;
-                    return c.narrowByEqualityCond(t, d.lhs, d.rhs, strict, eff_sense, key);
+                    return c.narrowByEqualityCond(t, d.lhs, d.rhs, strict, eff_sense, key, decl);
                 },
                 .keyword_in => {
                     // `"p" in x`
@@ -1294,11 +1294,11 @@ pub fn narrowByCondition(c: *Checker, t: TypeId, cond: Node, sense: bool, key: R
                 // operator says nothing about either operand.
                 .amp_amp => {
                     if (!sense) return t;
-                    return c.narrowByCondition(try c.narrowByCondition(t, d.lhs, true, key), d.rhs, true, key);
+                    return c.narrowByCondition(try c.narrowByCondition(t, d.lhs, true, key, decl), d.rhs, true, key, decl);
                 },
                 .pipe_pipe => {
                     if (sense) return t;
-                    return c.narrowByCondition(try c.narrowByCondition(t, d.lhs, false, key), d.rhs, false, key);
+                    return c.narrowByCondition(try c.narrowByCondition(t, d.lhs, false, key, decl), d.rhs, false, key, decl);
                 },
                 else => return t,
             }
@@ -1321,7 +1321,7 @@ pub fn narrowByCondition(c: *Checker, t: TypeId, cond: Node, sense: bool, key: R
     }
 }
 
-pub fn narrowByEqualityCond(c: *Checker, t: TypeId, lhs: Node, rhs: Node, strict: bool, sense: bool, key: RefKey) Error!TypeId {
+pub fn narrowByEqualityCond(c: *Checker, t: TypeId, lhs: Node, rhs: Node, strict: bool, sense: bool, key: RefKey, decl: TypeId) Error!TypeId {
     // typeof <ref> === "..."
     if (try c.typeofTargetOf(lhs, key)) {
         const rt = try c.ts.regularLiteral(try c.checkExprCached(rhs, types.no_type));
@@ -1363,7 +1363,7 @@ pub fn narrowByEqualityCond(c: *Checker, t: TypeId, lhs: Node, rhs: Node, strict
     // discriminant filter applies regardless of the reference's depth.
     if (try c.discriminantOfRef(lhs, key)) |prop_tok| {
         const other = try c.ts.regularLiteral(try c.checkExprCached(rhs, types.no_type));
-        const narrowed = try c.narrowByDiscriminant(t, try c.memberAtom(prop_tok), other, sense);
+        const narrowed = try c.narrowByDiscriminant(t, try c.memberAtom(prop_tok), other, sense, decl);
         // An OPTIONAL discriminant read (`x?.k === lit`) short-circuits to
         // `undefined` when the receiver is nullish, so the equality also
         // forces the receiver non-nullish on the asserting branch (tsc's
@@ -1376,7 +1376,7 @@ pub fn narrowByEqualityCond(c: *Checker, t: TypeId, lhs: Node, rhs: Node, strict
     }
     if (try c.discriminantOfRef(rhs, key)) |prop_tok| {
         const other = try c.ts.regularLiteral(try c.checkExprCached(lhs, types.no_type));
-        const narrowed = try c.narrowByDiscriminant(t, try c.memberAtom(prop_tok), other, sense);
+        const narrowed = try c.narrowByDiscriminant(t, try c.memberAtom(prop_tok), other, sense, decl);
         if (c.nodeTag(rhs) == .optional_member_expr) {
             return c.narrowByOptChainContainment(narrowed, lhs, strict, sense);
         }
@@ -2104,7 +2104,7 @@ pub fn typeofMatches(c: *Checker, t: TypeId, which: usize) bool {
     };
 }
 
-pub fn narrowByDiscriminant(c: *Checker, t: TypeId, prop: Atom, value: TypeId, sense: bool) Error!TypeId {
+pub fn narrowByDiscriminant(c: *Checker, t: TypeId, prop: Atom, value: TypeId, sense: bool, decl: TypeId) Error!TypeId {
     var parts: std.ArrayList(TypeId) = .empty;
     defer parts.deinit(c.scratch());
     // Also filter a single (non-union) member: once a discriminated union
@@ -2113,6 +2113,30 @@ pub fn narrowByDiscriminant(c: *Checker, t: TypeId, prop: Atom, value: TypeId, s
     // on `{ type: 'C' }` is `never` (tsc). A member lacking the discriminant
     // prop (`any`/`unknown`/primitives, wide `type: string`) stays in both
     // branches via the conservative arms below, so nothing over-narrows.
+    //
+    // …but only when `prop` really is a DISCRIMINANT. tsc reaches every
+    // discriminant narrowing (equality, truthiness, `switch`) through
+    // `getDiscriminantPropertyAccess`, which selects
+    // `declaredType.flags & Union ? declaredType : computedType` and then
+    // demands `isDiscriminantProperty`. Both halves of that matter here:
+    //
+    //   * a NON-UNION reference is never discriminated at all, so
+    //     `switch (data.encoding) { case "bstring": …; default: throw
+    //     Error(data.encoding) }` on a plain `{ encoding: "bstring"; … }`
+    //     keeps its type in the `default:` clause instead of collapsing to
+    //     `never` — the exhaustiveness idiom, and a false positive before;
+    //   * a property whose per-constituent types are uniform or carry no
+    //     unit type is not a discriminant either, so
+    //     `sel[0].id === app.selectedLinearElement?.elementId` must leave
+    //     `sel[0]` (a `line | arrow` union with `id: string` on both) alone
+    //     rather than filtering it to `never`.
+    //
+    // `decl` is the reference's declared type, threaded down from
+    // `flowTypeInner` — for a reference already narrowed to one constituent
+    // it is still the union, which is exactly the shape the single-member
+    // fallback above exists for.
+    const disc_over = if (c.ts.kind(decl) == .union_type) decl else t;
+    if (!try c.isDiscriminantProp(disc_over, prop)) return t;
     const single = [_]TypeId{t};
     const members: []const TypeId = if (c.ts.kind(t) == .union_type) try c.memberList(t) else &single;
     for (members) |m| {
@@ -2146,8 +2170,17 @@ pub fn narrowByDiscriminant(c: *Checker, t: TypeId, prop: Atom, value: TypeId, s
     return c.ts.makeUnion(c.scratch(), parts.items);
 }
 
-pub fn narrowByPropTruthiness(c: *Checker, t: TypeId, prop: Atom, sense: bool) Error!TypeId {
+pub fn narrowByPropTruthiness(c: *Checker, t: TypeId, prop: Atom, sense: bool, decl: TypeId) Error!TypeId {
     if (c.ts.kind(t) != .union_type) return t;
+    // tsc's `narrowTypeByTruthiness` reaches the per-member filter only
+    // through `getDiscriminantPropertyAccess`, which requires `prop` to be a
+    // DISCRIMINANT of the union (`isDiscriminantProperty`). Without that gate
+    // `element.lineHeight || …` — a `number & { _brand }` property that is
+    // uniformly non-optional and never a unit type — dropped every member on
+    // the falsy branch and left `never`, so the `||`'s right operand reported
+    // TS2339 on the same reference. tsc leaves the union untouched there.
+    if (!try c.isDiscriminantProp(if (c.ts.kind(decl) == .union_type) decl else t, prop))
+        return t;
     var parts: std.ArrayList(TypeId) = .empty;
     defer parts.deinit(c.scratch());
     for (try c.memberList(t)) |m| {
@@ -2166,6 +2199,73 @@ pub fn narrowByPropTruthiness(c: *Checker, t: TypeId, prop: Atom, sense: bool) E
         if (keep) try parts.append(c.scratch(), m);
     }
     return c.ts.makeUnion(c.scratch(), parts.items);
+}
+
+/// Is `t` a *unit* type in tsc's sense (`TypeFlags.Unit`: a literal, an enum
+/// member, `unique symbol`, `null`, `undefined`)? Deliberately narrower than
+/// `Store.isLiteralLike`, which also admits template-literal patterns and
+/// `Uppercase<…>` string mappings — neither is a unit type.
+fn isUnitLike(c: *Checker, t: TypeId) bool {
+    return switch (c.ts.kind(t)) {
+        .string_literal,
+        .number_literal,
+        .number_literal_fresh,
+        .bigint_literal,
+        .bool_true,
+        .bool_false,
+        .unique_symbol,
+        .undefined,
+        .null,
+        => true,
+        else => c.ts.isEnumMember(t),
+    };
+}
+
+/// tsc's `isLiteralType`: `boolean` counts (it is the union of its two
+/// literals), a union counts when every constituent is a unit type, and
+/// anything else must be a unit type itself.
+fn isLiteralTypeLike(c: *Checker, t0: TypeId) Error!bool {
+    const t = try c.resolveStructural(t0);
+    if (c.ts.kind(t) == .boolean) return true;
+    if (c.ts.kind(t) == .union_type) {
+        for (try c.memberList(t)) |m| {
+            if (!isUnitLike(c, try c.resolveStructural(m))) return false;
+        }
+        return true;
+    }
+    return isUnitLike(c, t);
+}
+
+/// tsc's `isDiscriminantProperty`: a union's synthetic property qualifies as
+/// a discriminant when its per-constituent types are NON-UNIFORM and at least
+/// one of them is a literal/unit type (`CheckFlags.Discriminant =
+/// HasNonUniformType | HasLiteralType`), and the resulting type is not
+/// generic. Only such a property may narrow the *parent* reference; every
+/// other property says nothing about which constituent is live, which is why
+/// `if (x.someNumber)` must leave `x` alone.
+///
+/// A constituent that lacks the property contributes nothing (tsc records it
+/// as `CheckFlags.Partial` and moves on). A property type that still mentions
+/// a type parameter disqualifies the whole thing — matching tsc's
+/// `!isGenericType(...)` and erring toward *less* narrowing, which can only
+/// drop a diagnostic, never invent one.
+pub fn isDiscriminantProp(c: *Checker, t: TypeId, prop: Atom) Error!bool {
+    if (c.ts.kind(t) != .union_type) return false;
+    var first: TypeId = types.no_type;
+    var non_uniform = false;
+    var has_literal = false;
+    for (try c.memberList(t)) |m| {
+        const rm = try c.resolveStructural(m);
+        const p = (try c.propOfType(rm, prop)) orelse continue;
+        if (try c.containsTypeParam(p.ty)) return false;
+        if (first == types.no_type) {
+            first = p.ty;
+        } else if (p.ty != first) {
+            non_uniform = true;
+        }
+        if (try isLiteralTypeLike(c, p.ty)) has_literal = true;
+    }
+    return non_uniform and has_literal;
 }
 
 /// Is `prop` DECLARED on `rm`, for the purposes of `in`-narrowing? tsc's
@@ -2581,7 +2681,7 @@ pub fn narrowByGuardArgChain(c: *Checker, t: TypeId, g: GuardCall, sense: bool, 
 /// `assertIsT(x);` — an assertion-function call statement narrows the
 /// argument to the asserted type for the rest of the flow; a bare
 /// `asserts cond` narrows by truthiness.
-pub fn narrowByAssertCall(c: *Checker, t: TypeId, call: Node, key: RefKey) Error!TypeId {
+pub fn narrowByAssertCall(c: *Checker, t: TypeId, call: Node, key: RefKey, decl: TypeId) Error!TypeId {
     const g = (try c.guardCallOf(call)) orelse return t;
     if (!g.pred.asserts) return t; // plain guards don't narrow as statements
     if (g.pred.ty == types.no_type) {
@@ -2592,7 +2692,7 @@ pub fn narrowByAssertCall(c: *Checker, t: TypeId, call: Node, key: RefKey) Error
         // reference to *be* the argument only ever caught the degenerate
         // `assert(x)` — which the same call still handles, via the
         // identifier arm's truthiness narrowing.
-        return c.narrowByCondition(t, g.arg, true, key);
+        return c.narrowByCondition(t, g.arg, true, key, decl);
     }
     // `asserts x is T` names its subject positionally: it must be the arg.
     if (!try c.refMatches(g.arg, key)) return t;
@@ -2783,7 +2883,7 @@ pub fn narrowByInstance(c: *Checker, t: TypeId, instance: TypeId, sense: bool) E
     return t;
 }
 
-pub fn narrowBySwitchClause(c: *Checker, t: TypeId, clause: Node, key: RefKey) Error!TypeId {
+pub fn narrowBySwitchClause(c: *Checker, t: TypeId, clause: Node, key: RefKey, decl: TypeId) Error!TypeId {
     if (clause == null_node) return t;
     // Find the owning switch statement's discriminant: clause nodes
     // don't back-reference it, so scan: the discriminant condition
@@ -2821,7 +2921,7 @@ pub fn narrowBySwitchClause(c: *Checker, t: TypeId, clause: Node, key: RefKey) E
         // (`type: "line" | "arrow"`) — and a naked type parameter
         // (`switch (t)` on `T extends "a" | "b"`) — alive in `default:`,
         // which is the false positive on every `assertNever(x)` idiom.
-        if (try c.switchDefaultCovered(sw, t, prop)) return types.never_type;
+        if (try c.switchDefaultCovered(sw, t, prop, decl)) return types.never_type;
         // Exclude every case value.
         var cur = t;
         const r = c.tree.extraData(ast.SubRange, c.tree.nodeData(sw).rhs);
@@ -2834,7 +2934,7 @@ pub fn narrowBySwitchClause(c: *Checker, t: TypeId, clause: Node, key: RefKey) E
             cur = if (prop == 0)
                 try c.narrowExcludeValue(cur, vt)
             else
-                try c.narrowByDiscriminant(cur, prop, vt, false);
+                try c.narrowByDiscriminant(cur, prop, vt, false, decl);
         }
         return cur;
     }
@@ -2846,7 +2946,7 @@ pub fn narrowBySwitchClause(c: *Checker, t: TypeId, clause: Node, key: RefKey) E
     return if (prop == 0)
         try c.narrowToValue(t, vt)
     else
-        try c.narrowByDiscriminant(t, prop, vt, true);
+        try c.narrowByDiscriminant(t, prop, vt, true, decl);
 }
 
 /// Every value the discriminant can take is covered by a `case` label, so
@@ -2858,7 +2958,16 @@ pub fn narrowBySwitchClause(c: *Checker, t: TypeId, clause: Node, key: RefKey) E
 /// that is not a unit value, a member without the discriminant property, a
 /// non-literal discriminant — so the caller falls back to the per-member
 /// subtraction, which is sound but coarser.
-pub fn switchDefaultCovered(c: *Checker, sw: Node, t: TypeId, prop: Atom) Error!bool {
+pub fn switchDefaultCovered(c: *Checker, sw: Node, t: TypeId, prop: Atom, decl: TypeId) Error!bool {
+    // Discriminant-based exhaustiveness needs an actual discriminated union,
+    // for the same reason `narrowByDiscriminant` does — tsc reaches
+    // `narrowTypeBySwitchOnDiscriminantProperty` only through
+    // `getDiscriminantPropertyAccess`. Switching on the reference ITSELF
+    // (`prop == 0`) is plain equality narrowing and applies to any type.
+    if (prop != 0) {
+        const over = if (c.ts.kind(decl) == .union_type) decl else t;
+        if (!try c.isDiscriminantProp(over, prop)) return false;
+    }
     var vals: std.ArrayList(TypeId) = .empty;
     defer vals.deinit(c.scratch());
     const r = c.tree.extraData(ast.SubRange, c.tree.nodeData(sw).rhs);
