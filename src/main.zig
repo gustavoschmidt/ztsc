@@ -1,5 +1,11 @@
 //! ZTSC CLI driver: argument parsing, thread pool, phase orchestration.
 //!
+//! The built-in lib runs its own front end first (`libs.frontEndLibs`):
+//! the shards are parsed on a small thread budget and then bound
+//! single-threaded in fixed order, which is what pins the interner's atoms
+//! before any concurrent user-file work. Its output enters discovery as
+//! ready-made completions, so the lib is never queued to the pool.
+//!
 //! Module discovery is single-owner with a completion queue: the main
 //! thread is the sole owner of
 //! the module graph and seen-set (no locks on graph state); workers run
@@ -14,7 +20,8 @@
 //! the old wavefront discovery produced). A serial `link` phase then
 //! builds sealed per-file import/export tables; the check phase
 //! partitions the program's files across N independent checker instances
-//! (`--checkers=N`, default min(4, cores)), each with its own type
+//! (`--checkers=N`; the default is min(4, cores), dropped to 2 when there
+//! is less than `small_program_nodes` of check work to spread), each with its own type
 //! store/caches, reading the shared immutable AST/binder/link data without
 //! locks.
 //!
@@ -76,8 +83,13 @@ const usage =
     \\                         skipLibCheck is the superset — it suppresses all
     \\                         diagnostics in every .d.ts (their types still flow)
     \\  --workers=N            number of worker threads (default: CPU count)
-    \\  --checkers=N           number of checker instances (default: min(4, CPUs))
-    \\  --repeat=N             parse/bind each file N times (benchmark aid)
+    \\  --checkers=N           number of checker instances (default:
+    \\                         min(4, CPUs), or 2 on a small program —
+    \\                         each instance costs fixed state that little
+    \\                         checking does not repay)
+    \\  --repeat=N             parse/bind each file N times (benchmark aid;
+    \\                         does not cover the built-in lib, which is
+    \\                         front-ended once before the pool starts)
     \\  --no-resolve-cache     disable the module-resolution memos — the
     \\                         specifier memo and the filesystem-fact caches
     \\                         under it (benchmark aid / correctness oracle)
@@ -396,6 +408,44 @@ const Worker = struct {
     }
 };
 
+/// Check-work (AST nodes to walk) below which a run drops to two checkers.
+///
+/// A checker instance is not free. Each carries its own type-store overlay,
+/// per-symbol state arrays, scratch/instantiation arenas, relation and
+/// instantiation caches, thread, and its thread's share of the general
+/// allocator's size-class slabs — measured at ~0.35 MB of fixed state per
+/// instance on ajv, against ~90 KB of types the instance actually interns.
+/// Adding instances also re-materializes lib types once per instance that
+/// reaches them.
+///
+/// That fixed cost is worth paying when there is enough work to spread, and
+/// the corpus shows the trade inverting sharply around this size. Going from
+/// four checkers to two (median of 11 runs / 5 runs):
+///
+///   chalk       21.1k nodes   RSS -7.8%   wall +8.1%
+///   @types/prop-types 21.0k   RSS -7.4%   wall +6.9%
+///   ajv         28.0k nodes   RSS -11.4%  wall +1.7%
+///   ---- threshold ----
+///   date-fns    36.8k nodes   RSS -2.2%   wall +7.6%
+///   typebox     37.0k nodes   RSS -0.3%   wall +14.8%
+///   @types/react 101.6k       RSS -7.7%   wall +14.9%
+///   zod         98.2k nodes   RSS -6.8%   wall +21.9%
+///
+/// Below the line the memory saved is large and the wall cost small; above
+/// it the wall cost multiplies while the memory saving collapses. An
+/// explicit `--checkers=N` always wins over this.
+///
+/// Diagnostics are unaffected: output is byte-identical for any checker
+/// count (see the determinism tests), so this only moves the resource
+/// trade-off, never the result.
+const small_program_nodes: u64 = 32_000;
+
+fn defaultCheckers(explicit: ?usize, cpu_count: usize, check_nodes: u64) usize {
+    if (explicit) |n| return n;
+    const wide = @min(4, cpu_count);
+    return if (check_nodes < small_program_nodes) @min(wide, 2) else wide;
+}
+
 /// One checker instance: checks its partition on its own thread.
 const CheckerTask = struct {
     arena: std.heap.ArenaAllocator,
@@ -680,10 +730,22 @@ pub fn main(init: std.process.Init) !void {
     var done = Channel(Completion).init(io);
     defer done.deinit();
 
-    // Deterministic lib atoms. Intern the lib's strings single-
-    // threaded before any worker runs so the concurrent worker that binds
-    // file 0 re-interns them into these stable, run-to-run-identical atoms.
-    try libs.seedLibAtoms(io, gpa, &interner, lib_set);
+    // The lib's front end: parse and bind the injected shards single-threaded,
+    // before any worker runs, and *keep* the results. Single-threaded is what
+    // pins the atoms (an `Atom` encodes shard-local insertion order, so the
+    // lib's strings must be interned in a fixed order ahead of the concurrent
+    // user-file work). Keeping the products is what makes the pass pay for
+    // itself: the shards never enter the work queue, so the lib is parsed and
+    // bound once per run instead of once here and again on a worker.
+    //
+    // Per-shard arenas, not the process arena: `init.arena` is thread-safe, so
+    // every allocation there takes a lock, and this is one of the
+    // allocation-heaviest stretches of the run (and its parse pass is
+    // concurrent). They live as long as the program — the AST and binder
+    // output are program data — so they are only released at the end.
+    var lib_fe = try libs.frontEndLibs(arena, io, gpa, &interner, lib_set, n_workers);
+    defer lib_fe.deinit();
+    const lib_units = lib_fe.units;
 
     const discover_timer = Timer.start(io);
     for (workers) |*w| {
@@ -694,7 +756,23 @@ pub fn main(init: std.process.Init) !void {
 
     var outstanding: usize = 0;
     try growPerFile(arena, paths.items.len, &results, &trees, &binds, &errs, &spec_atoms_all, &spec_files_all, &edge_lists, &type_ref_misses_all);
-    for (paths.items, 0..) |p, i| {
+    // The lib shards hold file ids 0..lib_units.len and are already
+    // front-ended, so they enter the discovery loop as ready-made completions
+    // instead of as work. Everything downstream — specifier resolution,
+    // `/// <reference>` scanning, the BFS renumbering — sees an ordinary
+    // completion and cannot tell the difference.
+    for (lib_units, 0..) |*u, i| {
+        try done.push(.{
+            .file = @intCast(i),
+            .src = u.src,
+            .tree = u.tree,
+            .bind = u.bind,
+            .parse_ns = u.parse_ns,
+            .bind_ns = u.bind_ns,
+        });
+        outstanding += 1;
+    }
+    for (paths.items[lib_units.len..], lib_units.len..) |p, i| {
         try work.push(.{ .file = @intCast(i), .path = p });
         outstanding += 1;
     }
@@ -937,38 +1015,42 @@ pub fn main(init: std.process.Init) !void {
 
     // --- Check (N independent checker instances) --------------------------------
     const check_timer = Timer.start(io);
-    const n_checkers: usize = @max(1, @min(cli.checkers orelse @min(4, cpu_count), n_files));
-    const tasks = try arena.alloc(CheckerTask, n_checkers);
     // File id -> owning checker, so per-file diagnostics can be reassembled
     // from the right checker below (replaces the old `i % n_checkers`).
     const file_owner = try arena.alloc(u32, n_files);
+
+    // Cost-based partition, weighted by per-file AST node count
+    // (≈ check cost, known post-parse) — see the run split below for how
+    // the weights are spent. Built before the checker count is chosen,
+    // because the total is what chooses it.
+    const Item = struct { file: u32, cost: u64 };
+    var items: std.ArrayList(Item) = .empty;
+    try items.ensureTotalCapacity(arena, n_files);
+    @memset(file_owner, 0);
+    var check_nodes: u64 = 0;
+    for (0..n_files) |i| {
+        // Embedded lib files are parsed/bound/linked (globals, lazy type
+        // expansion) and, by default, also enqueued to a checker so the
+        // pre-verified lib is walked just like tsc/tsgo at their defaults.
+        // `--skip-default-lib-check` (or tsconfig skipLibCheck/
+        // skipDefaultLibCheck) drops them — pure time savings, since lib
+        // diagnostics are never surfaced (tsc's skipDefaultLibCheck).
+        if (skip_default_lib_check and libs.isLibPath(paths.items[i])) continue;
+        // skipLibCheck: a non-lib `.d.ts` produces no surfaced check
+        // diagnostics, and its types are resolved lazily on demand from
+        // `.ts` files (not by walking it), so its check pass is dead work —
+        // don't enqueue it. Pure time savings, deterministic (path-based).
+        if (skip_all_dts_check and ztsc.paths.isDeclarationPath(paths.items[i])) continue;
+        const cost: u64 = if (trees.items[i]) |tree| tree.nodes.len else 0;
+        check_nodes += cost;
+        items.appendAssumeCapacity(.{ .file = @intCast(i), .cost = cost });
+    }
+
+    const n_checkers: usize = @max(1, @min(defaultCheckers(cli.checkers, cpu_count, check_nodes), n_files));
+    const tasks = try arena.alloc(CheckerTask, n_checkers);
     {
-        // Cost-based partition, weighted by per-file AST node count
-        // (≈ check cost, known post-parse) — see the run split below for how
-        // the weights are spent.
         const owned_lists = try arena.alloc(std.ArrayList(modules.FileId), n_checkers);
         for (owned_lists) |*l| l.* = .empty;
-
-        const Item = struct { file: u32, cost: u64 };
-        var items: std.ArrayList(Item) = .empty;
-        try items.ensureTotalCapacity(arena, n_files);
-        @memset(file_owner, 0);
-        for (0..n_files) |i| {
-            // Embedded lib files are parsed/bound/linked (globals, lazy type
-            // expansion) and, by default, also enqueued to a checker so the
-            // pre-verified lib is walked just like tsc/tsgo at their defaults.
-            // `--skip-default-lib-check` (or tsconfig skipLibCheck/
-            // skipDefaultLibCheck) drops them — pure time savings, since lib
-            // diagnostics are never surfaced (tsc's skipDefaultLibCheck).
-            if (skip_default_lib_check and libs.isLibPath(paths.items[i])) continue;
-            // skipLibCheck: a non-lib `.d.ts` produces no surfaced check
-            // diagnostics, and its types are resolved lazily on demand from
-            // `.ts` files (not by walking it), so its check pass is dead work —
-            // don't enqueue it. Pure time savings, deterministic (path-based).
-            if (skip_all_dts_check and ztsc.paths.isDeclarationPath(paths.items[i])) continue;
-            const cost: u64 = if (trees.items[i]) |tree| tree.nodes.len else 0;
-            items.appendAssumeCapacity(.{ .file = @intCast(i), .cost = cost });
-        }
         // Locality-aware, balanced partition. File ids are BFS positions in
         // the import graph (see the renumbering above), so a contiguous id
         // range is import-adjacent and its dependency closures largely

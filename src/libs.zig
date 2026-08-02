@@ -4,7 +4,7 @@
 //! The ES-core and DOM libs ship inside the binary as sharded blobs; a
 //! tsconfig `lib` list selects which shards a run injects (`resolveLibSet`),
 //! the loaders substitute their embedded text for the synthetic paths
-//! (`libSourceFor`), and `seedLibAtoms` pins their interner atoms before the
+//! (`libSourceFor`), and `frontEndLibs` parses and binds them before the
 //! worker pool starts so runs stay deterministic.
 
 const std = @import("std");
@@ -14,10 +14,12 @@ const ast = @import("frontend/ast.zig");
 const parser = @import("frontend/parser.zig");
 const binder = @import("frontend/binder.zig");
 const intern = @import("intern.zig");
+const source = @import("frontend/source.zig");
 
 const Ast = ast.Ast;
 const Bind = binder.Bind;
 const Interner = intern.Interner;
+const Source = source.Source;
 
 /// Resolve a tsconfig `lib` list (or null = not specified) to the blob set.
 /// tsc semantics: a `lib` list REPLACES the default set. We map any `es*`
@@ -41,7 +43,7 @@ pub fn resolveLibSet(lib: ?[]const []const u8) LibSet {
 }
 
 /// Fill `buf` with the ordered synthetic lib files for `set`. Order is fixed
-/// (esnext, dom, console shim) so that seeded atoms (`seedLibAtoms`) and the
+/// (esnext, dom, console shim) so that seeded atoms (`frontEndLibs`) and the
 /// injected file ids agree run-to-run — the determinism the seeded interner
 /// relies on. Returns the populated prefix of `buf`.
 pub fn libFiles(set: LibSet, buf: *[max_lib_files]LibFile) []const LibFile {
@@ -82,35 +84,185 @@ pub fn isLibPath(path: []const u8) bool {
     return libSourceFor(path) != null;
 }
 
-/// Deterministic lib atoms. Intern every string the lib front end
-/// produces, single-threaded, *before* the worker pool starts. An `Atom`
-/// encodes shard-local insertion order (intern.zig), so run-to-run stability
-/// requires the lib's strings to be interned in a fixed order ahead of the
-/// concurrent user-file work; the worker that later binds the lib re-interns
-/// the same text and receives these stable atoms. This is the seeded-interner
-/// approach (option a): it pins the lib's atoms (the ones a serialized
-/// lib blob would reference) without touching user-file atoms.
+/// The front-end product of one built-in lib shard: exactly what a worker
+/// would have produced for it, kept instead of thrown away.
+pub const LibUnit = struct {
+    src: Source,
+    tree: *Ast,
+    /// Filled by the serial bind pass; `undefined` between parse and bind.
+    bind: *Bind,
+    /// Index of the arena this shard's parse output lives in — the slot of
+    /// the thread that claimed it. The bind pass allocates from the same one.
+    arena: usize = 0,
+    parse_ns: u64 = 0,
+    bind_ns: u64 = 0,
+};
+
+/// Run the whole front end (source → parse → bind) over the selected lib
+/// shards, single-threaded, *before* the worker pool starts, and keep the
+/// results.
 ///
-/// Seeding runs the real binder — not a token scan — so it interns exactly
+/// Single-threaded is what pins the atoms. An `Atom` encodes shard-local
+/// insertion order (intern.zig), so run-to-run stability requires the lib's
+/// strings to be interned in a fixed order ahead of the concurrent user-file
+/// work. This runs the real binder — not a token scan — so it interns exactly
 /// what binding interns, including the text transforms binding applies
 /// (`stripQuotes`, well-known-symbol keys, the "default"/"*" constants).
-/// The parse/bind products are thrown away; only their interner side effects
-/// (which are idempotent) survive. Cheap: the lib is ~9 KB.
-pub fn seedLibAtoms(io: Io, gpa: Allocator, interner: *Interner, set: LibSet) !void {
+///
+/// It *is* the lib's front end, not a rehearsal for it. The caller feeds these
+/// units into the program instead of queueing the lib paths to the worker
+/// pool, so each shard is parsed and bound once per run rather than once here
+/// and again on a worker — the lib is the bulk of the front-end work on a
+/// small project (627 KB of the 704 KB ztsc reads for ajv), so the duplicate
+/// pass was a large share of its wall clock.
+///
+/// Only *binding* has to be serial. The parser never touches the interner, so
+/// the shards are scanned and parsed on `n_threads` threads first and only the
+/// bind loop runs single-threaded, in fixed shard order. That halves the pass:
+/// on ajv's five shards it is ~1.5 ms of parse against ~1.6 ms of bind, and on
+/// a DOM config (twelve shards) ~5.2 ms against ~6.7 ms.
+///
+/// The arenas outlive the run — the AST, binder output and line table are
+/// program data now, not scratch — and there is one *per parse thread*, not
+/// per shard. An arena is not thread-safe, so the parse pass needs one each;
+/// making it one each rather than one per shard keeps the count (and their
+/// growth slack) flat as the lib set widens from 5 shards to 13.
+/// `LibFrontEnd.deinit` releases them.
+pub fn frontEndLibs(
+    alloc: Allocator,
+    io: Io,
+    gpa: Allocator,
+    interner: *Interner,
+    set: LibSet,
+    n_threads: usize,
+) !LibFrontEnd {
     var buf: [max_lib_files]LibFile = undefined;
-    for (libFiles(set, &buf)) |lf| {
-        var seed_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        defer seed_arena.deinit();
-        const sa = seed_arena.allocator();
-        const lib_tree = try parser.parse(sa, lf.source);
-        _ = try binder.bind(sa, io, gpa, interner, &lib_tree, lf.source, true);
-        // Each lib file's own path atom is interned by the worker front end too.
-        _ = try interner.intern(io, gpa, lf.path);
+    const files = libFiles(set, &buf);
+    const n = @max(1, @min(@min(n_threads, max_parse_threads), files.len));
+
+    const units = try alloc.alloc(LibUnit, files.len);
+    const arenas = try alloc.alloc(std.heap.ArenaAllocator, n);
+    for (arenas) |*a| a.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    errdefer for (arenas) |*a| a.deinit();
+
+    // --- Parse (parallel; interns nothing) --------------------------------
+    const parse_errs = try alloc.alloc(?anyerror, files.len);
+    @memset(parse_errs, null);
+    var job: ParseJob = .{
+        .files = files,
+        .units = units,
+        .arenas = arenas,
+        .io = io,
+        .errs = parse_errs,
+    };
+    if (n == 1) {
+        job.run(0);
+    } else {
+        var threads: [max_parse_threads]std.Thread = undefined;
+        var started: usize = 0;
+        // Slot 0 is this thread; spawn one runner for each of the rest. A
+        // spawn failure is not fatal — its slot simply goes unused and the
+        // shards it would have claimed are picked up by the runners that did
+        // start (each shard records the slot that parsed it).
+        for (threads[0 .. n - 1], 1..) |*t, slot| {
+            t.* = std.Thread.spawn(.{}, ParseJob.run, .{ &job, slot }) catch break;
+            started += 1;
+        }
+        job.run(0);
+        for (threads[0..started]) |t| t.join();
     }
+    for (parse_errs) |e| if (e) |err| return err;
+
+    // --- Bind (serial, fixed shard order: this is what pins the atoms) ----
+    for (files, units) |lf, *u| {
+        // Each lib file's own path atom, as the worker front end interns it.
+        _ = try interner.intern(io, gpa, lf.path);
+        const a = arenas[u.arena].allocator();
+        const t0 = Io.Clock.Timestamp.now(io, .awake);
+        const b = try a.create(Bind);
+        // Lib paths end in `.d.ts`, so this matches `isDeclarationPath`.
+        b.* = try binder.bind(a, io, gpa, interner, u.tree, lf.source, true);
+        u.bind = b;
+        u.bind_ns = elapsedNs(t0, Io.Clock.Timestamp.now(io, .awake));
+    }
+    return .{ .units = units, .arenas = arenas };
+}
+
+/// Parse threads for the lib pass. Four saturates the win (the shards are
+/// 150-250 KB each, so the pass is a handful of chunks either way) without
+/// widening the concurrent parse scratch further.
+const max_parse_threads: usize = 4;
+
+/// The lib front end's output plus the arenas backing it.
+pub const LibFrontEnd = struct {
+    units: []LibUnit,
+    arenas: []std.heap.ArenaAllocator,
+
+    pub fn deinit(f: *LibFrontEnd) void {
+        for (f.arenas) |*a| a.deinit();
+    }
+};
+
+/// Work-stealing parse of the shards: every shard is an independent pure
+/// function of its embedded bytes, so any claim order gives identical output.
+const ParseJob = struct {
+    files: []const LibFile,
+    units: []LibUnit,
+    arenas: []std.heap.ArenaAllocator,
+    io: Io,
+    /// One slot per shard, written only by the thread that claimed it.
+    errs: []?anyerror,
+    next: std.atomic.Value(usize) = .init(0),
+
+    fn run(j: *ParseJob, slot: usize) void {
+        while (true) {
+            const i = j.next.fetchAdd(1, .monotonic);
+            if (i >= j.files.len) return;
+            const lf = j.files[i];
+            const a = j.arenas[slot].allocator();
+            const t0 = Io.Clock.Timestamp.now(j.io, .awake);
+            // `fromBytes` over the embedded blob is the same path the worker
+            // front end takes for a synthetic lib path (`libSourceFor`).
+            const src = Source.fromBytes(a, lf.path, lf.source) catch |e| {
+                j.errs[i] = e;
+                continue;
+            };
+            const tree = a.create(Ast) catch |e| {
+                j.errs[i] = e;
+                continue;
+            };
+            tree.* = parser.parse(a, lf.source) catch |e| {
+                j.errs[i] = e;
+                continue;
+            };
+            j.units[i] = .{
+                .src = src,
+                .tree = tree,
+                .bind = undefined,
+                .arena = slot,
+                .parse_ns = elapsedNs(t0, Io.Clock.Timestamp.now(j.io, .awake)),
+            };
+        }
+    }
+};
+
+fn elapsedNs(from: Io.Clock.Timestamp, to: Io.Clock.Timestamp) u64 {
+    const ns = from.durationTo(to).raw.nanoseconds;
+    return if (ns > 0) @intCast(ns) else 0;
+}
+
+/// Intern every atom the lib front end produces, discarding the parse/bind
+/// products. Identical interner side effects to `frontEndLibs` (what the CLI
+/// runs); for callers that only need the atoms.
+pub fn seedLibAtoms(io: Io, gpa: Allocator, interner: *Interner, set: LibSet) !void {
+    var seed_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer seed_arena.deinit();
+    var fe = try frontEndLibs(seed_arena.allocator(), io, gpa, interner, set, 1);
+    fe.deinit();
 }
 
 /// Which built-in lib blobs to inject. Derived from tsconfig `lib` (or the
-/// default) by `resolveLibSet`; consumed by `libFiles`, `seedLibAtoms`,
+/// default) by `resolveLibSet`; consumed by `libFiles`, `frontEndLibs`,
 /// `buildProgram`, and the CLI injection site. `dom` always implies `es`
 /// (lib.dom references es2015 / es2018.asynciterable, both in the esnext blob),
 /// and `shim` (the console shim) is present exactly when `es and !dom`.
