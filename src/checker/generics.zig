@@ -700,13 +700,41 @@ pub fn inferFromExtends(c: *Checker, source0: TypeId, pattern: TypeId, ids: []co
             // residual source params into a tuple (optional source params →
             // optional elements, a trailing source rest param → a rest
             // element) and infers that against the pattern's rest type.
-            const src_count = s.fnParamCount(src);
+            //
+            // The SOURCE's parameter list is the *expanded* one: tsc's
+            // `getExpandedParameters` turns a trailing rest typed by a fixed
+            // tuple (`(...args: Parameters<F>)` — what every
+            // `BoundFunction`-style helper produces) into that positional
+            // list before any parameter is paired up. Unexpanded, the whole
+            // tuple was matched against the pattern's FIRST parameter and
+            // `(container: Elem, ...args: infer P)` bound `P` to the empty
+            // tuple; the conditional's own check then failed and the type
+            // fell to the `never` branch — a TS2339 on every use.
+            var exp: std.ArrayList(types.Param) = .empty;
+            defer exp.deinit(c.scratch());
+            {
+                const raw = s.fnParamCount(src);
+                const tup = if (raw > 0) try c.sigRestTuple(src) else null;
+                if (tup) |tt| {
+                    for (0..raw - 1) |i| try exp.append(c.scratch(), s.fnParam(src, @intCast(i)));
+                    for (0..s.tupleLen(tt)) |i| {
+                        const e = s.tupleElem(tt, @intCast(i));
+                        var pf: u32 = 0;
+                        if (e.optional()) pf |= types.param_flag_optional;
+                        if (e.rest()) pf |= types.param_flag_rest;
+                        try exp.append(c.scratch(), .{ .name = 0, .ty = e.ty, .flags = pf });
+                    }
+                } else {
+                    for (0..raw) |i| try exp.append(c.scratch(), s.fnParam(src, @intCast(i)));
+                }
+            }
+            const src_count: u32 = @intCast(exp.items.len);
             const pat_count = s.fnParamCount(pattern);
             const pat_has_rest = pat_count != 0 and s.fnParam(pattern, pat_count - 1).rest();
             const pat_fixed = if (pat_has_rest) pat_count - 1 else pat_count;
             const n = @min(src_count, pat_fixed);
             for (0..n) |i| {
-                var sp = s.fnParam(src, @intCast(i)).ty;
+                var sp = exp.items[i].ty;
                 if (base_map.items.len != 0) sp = try c.instantiate(sp, base_map.items);
                 try c.inferFromExtends(sp, s.fnParam(pattern, @intCast(i)).ty, ids, vals, !contra, depth + 1);
             }
@@ -715,7 +743,7 @@ pub fn inferFromExtends(c: *Checker, source0: TypeId, pattern: TypeId, ids: []co
                 defer elems.deinit(c.scratch());
                 var i: u32 = pat_fixed;
                 while (i < src_count) : (i += 1) {
-                    const sp = s.fnParam(src, i);
+                    const sp = exp.items[i];
                     var pty = sp.ty;
                     if (base_map.items.len != 0) pty = try c.instantiate(pty, base_map.items);
                     var eflags: u32 = 0;

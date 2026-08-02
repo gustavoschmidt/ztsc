@@ -170,7 +170,7 @@
     <li><strong>Class-value instantiation expressions</strong> — <code>typeof C&lt;T&gt;</code>
     applied to a class value under-reports.</li>
     <li>Other known edge cases miss an error the TypeScript compiler would report; the
-    conformance suite's <code>DEFERRED</code> ledger tracks <strong>9 accepted
+    conformance suite's <code>DEFERRED</code> ledger tracks <strong>10 accepted
     divergences</strong> explicitly — with a written justification each — rather than hiding
     them in the goldens, and the runner fails a case whose entry stops describing reality, so
     the ledger cannot be used to mask a regression. Every one is an <em>under</em>-report.
@@ -179,8 +179,9 @@
     does). The rest are deliberate trades where the stricter rule was measured to cost false
     positives on correct code — <strong>TS2589</strong> at the recursion cap,
     <strong>TS2345</strong> on whole-list rest-union calls (needs <code>const</code> type
-    parameters first), <strong>TS2352</strong> on deferred-indexed-access casts, and
-    <strong>TS2322</strong> on the exclusive callback-variance rule.</li>
+    parameters first), <strong>TS2352</strong> on deferred-indexed-access casts,
+    <strong>TS2322</strong> on the exclusive callback-variance rule, and
+    <strong>TS7053</strong> for a number-literal key that names no member.</li>
   </ul>
   <div class="note">
     <p><strong>Check your own codebase in one command.</strong> <code>ztsc --census</code>

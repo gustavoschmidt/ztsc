@@ -1792,7 +1792,19 @@ pub fn unionIndexElemType(c: *Checker, r: TypeId, idx_t: TypeId, miss: *UnionInd
                 }
             },
             .number_literal => {
-                if (c.ts.kind(rt) != .tuple) return null;
+                if (c.ts.kind(rt) != .tuple) {
+                    // A number-literal key names a property (`"2"`) just as a
+                    // string-literal one does — tsc's
+                    // `getPropertyNameFromIndex` — so a number-keyed lookup
+                    // table distributes like any other. `BITS[bytes]` with
+                    // `BITS = { 1: 8, 2: 16, 4: 32 } as const` and
+                    // `bytes: 1 | 2 | 4` is `8 | 16 | 32`, not `any`.
+                    if (try c.numericKeyProp(r, rl)) |p| {
+                        parts[i] = if (p.optional()) try c.makeUnion2(p.ty, types.undefined_type) else p.ty;
+                        continue;
+                    }
+                    return null;
+                }
                 const v = c.ts.numberValue(rl);
                 const iv: u32 = if (v >= 0 and v == @floor(v) and v < 4096) @intFromFloat(v) else 4096;
                 if (iv < c.ts.tupleLen(rt)) {
