@@ -53,7 +53,13 @@ pub fn aliasInstance(c: *Checker, sym: SymbolId, args: []const TypeId, tok: Toke
     // Crash guard for pathological mutually-recursive generic alias chains
     // (see `max_alias_depth`). `alias_state` only breaks direct self-
     // recursion; a chain through distinct syms is bounded here.
-    if (c.alias_depth >= max_alias_depth) return types.error_type;
+    if (c.alias_depth >= max_alias_depth) {
+        // Depth-dependent, so it must suppress memoization of every enclosing
+        // substitution the same way the instantiation depth cap does — see
+        // `substThis`.
+        c.inst_limit_tripped = true;
+        return types.error_type;
+    }
     c.alias_depth += 1;
     defer c.alias_depth -= 1;
     const state = c.alias_state.get(sym) orelse 0;

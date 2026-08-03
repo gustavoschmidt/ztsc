@@ -1658,7 +1658,17 @@ pub const this_apparent: TypeId = 0;
 pub fn substThis(c: *Checker, t: TypeId, repl: TypeId) Error!TypeId {
     if (!c.has_this_types) return t;
     if (!try c.containsThisType(t)) return t;
-    if (c.inst_depth > max_instantiation_depth) return types.error_type;
+    if (c.inst_depth > max_instantiation_depth) {
+        // Depth-dependent truncation, so it has to be announced: an enclosing
+        // `instantiateId`/`substThis` frame is about to decide whether to
+        // memoize a result that has this `error_type` inside it, and that
+        // decision is `inst_limit_tripped`. Returning silently let a
+        // truncated answer be cached as if it were a function of the pair —
+        // and whether a given walk arrives here deep or shallow is traversal
+        // order, which is not run-to-run stable.
+        c.inst_limit_tripped = true;
+        return types.error_type;
+    }
     const memo_key = (@as(u64, t) << 32) | repl;
     if (c.subst_this_cache.get(memo_key)) |m| return m;
     // Subtree-scoped, for `instantiateId`'s reason — the flag has to answer
@@ -1726,7 +1736,10 @@ pub fn substThis(c: *Checker, t: TypeId, repl: TypeId) Error!TypeId {
 }
 
 fn substThisInner(c: *Checker, t: TypeId, repl: TypeId) Error!TypeId {
-    if (c.inst_depth > max_instantiation_depth) return types.error_type;
+    if (c.inst_depth > max_instantiation_depth) {
+        c.inst_limit_tripped = true; // see `substThis`
+        return types.error_type;
+    }
     c.inst_depth += 1;
     defer c.inst_depth -= 1;
     const s = &c.ts;
