@@ -85,8 +85,56 @@
 //!   a builder interface's whole table and every later statement reads it
 //!   free; per-member, each statement pays for its own members, and any
 //!   member whose substitution is truncated is never memoized at all, so it
-//!   is re-paid and re-truncated forever. Revisit only after per-statement
-//!   demand fits the budget.
+//!   is re-paid and re-truncated forever.
+//! * **The same laziness PAIRED with a per-`(ref, member)` memo** that
+//!   restores the amortization at member granularity — one substitution per
+//!   `(ref, member)` for the whole run, never published when the
+//!   substitution truncated (the `inst_limit_tripped` subtree rule
+//!   `eraseParamsOf` follows). It does cut work — immich wall 3.82 -> 3.58 s,
+//!   peak RSS 1.59 -> 1.26 GB, the kysely repro 4.92 M -> 4.53 M node visits,
+//!   `SelectQueryBuilder` expansions 694 -> 609 — and immich still went
+//!   497 -> 566, the same magnitude and the same family (96 new TS7006) as
+//!   the un-memoized attempt. **The memo was not the missing piece, and
+//!   amortization was not the mechanism.**
+//!
+//!   The mechanism is BUDGET TIMING. An eager expansion at the member-access
+//!   site runs EARLY in a source element, while `inst_count` is still low, so
+//!   the table completes and is memoized complete for the rest of the run —
+//!   the eager expansion is a cheap prepayment. Read one member instead and
+//!   the element runs much deeper before anything forces the table; the first
+//!   consumer that does force it is `isAssignableInner` / `unify` /
+//!   `inferFromExtendsInner`, deep inside a walk with the budget nearly
+//!   spent, so the table comes back TRUNCATED — and `expandRef` publishes
+//!   that truncation as the answer for every later reader. Corroborating:
+//!   per-symbol expansion cost RISES under laziness even as the count falls
+//!   (`ZodObject` 230 calls / 241 k visits -> 221 / 332 k, max 8,379 ->
+//!   32,296), because the eager table also warmed `inst_cache` for what the
+//!   later consumers ask.
+//!
+//!   The 2x2 is measured, and today's cell is the best one on excess
+//!   (immich excess / wall):
+//!
+//!   | | eager | lazy + memo |
+//!   |---|---|---|
+//!   | publish truncated (today) | **497 / 3.8 s** | 566 / 3.6 s |
+//!   | withdraw truncated | 522 / 4.2 s | 530 / 4.3 s |
+//!   | own budget epoch | 503 / 8.0 s | 501 / 7.2 s |
+//!
+//!   Routing the memo only from `propOfTypeEx` — the half of the earlier
+//!   route bisect that read neutral — is a literal no-op: byte-identical
+//!   visits (4,923,741) and an identical key set, because `isAssignableInner`
+//!   resolves BOTH sides with `resolveStructural` before the property loop
+//!   ever sees a `.ref`. Nothing is winnable on that route without changing
+//!   the relation itself.
+//!
+//!   What would have to change first: the relation and inference sites must
+//!   stop forcing whole tables, which is tsc's actual split (symbols eagerly,
+//!   types lazily) and not reachable from member access. Member-access
+//!   laziness alone reaches only `propertyTypeOf`'s share of the forcing
+//!   sites — 1.14 M visits of 6.0 M charged, 12% of expansions — while
+//!   `checkClass` (1.90 M / 118), `inferFromExtendsInner` (476 k + 160 k),
+//!   `callbackSigOf` (454 k), `isAssignableInner` (383 k + 192 k + 135 k) and
+//!   `unify` (350 k + 125 k) still expand.
 //! * **A free-parameter Bloom summary + map-aware early-out, and narrowing
 //!   the memo key to the relevant sub-map.** See the revert commit: 1.5% of
 //!   visits and 498 -> 500 for the first; a 4x *increase* in distinct maps
@@ -105,8 +153,19 @@
 //!   is the right answer in principle. 503 excess but wall 3.4 -> 8.0 s and
 //!   peak RSS 1.58 -> 2.66 GB; charging the cost back to the outer element
 //!   on exit lands at 512 excess, 5.9 s, 1.96 GB. The extra time is real
-//!   work: tables that used to come back truncated now complete. Revisit
-//!   once a per-ref member memo has made one expansion cheap.
+//!   work: tables that used to come back truncated now complete.
+//!
+//!   Re-measured on top of the per-member memo above, which was supposed to
+//!   be its precondition: 501 excess, 7.23 s, 2.51 GB. Laziness buys the
+//!   epoch 10% of its wall and two keys — it is not the lever. Neither is
+//!   BOUNDING the epoch: capping one table at 24,000 visits instead of the
+//!   full 250,000 lands on the same 501 at 7.13 s / 1.90 GB, because the cost
+//!   is not a few enormous tables but the many ordinary ones (1.5 k - 15 k
+//!   visits each) that used to come back truncated. On the kysely repro the
+//!   epoch simply doubles the work: 4.92 M -> 9.47 M node visits, budget
+//!   trips 1,750 -> 18,104. Read the other way, ztsc's immich wall is today
+//!   partly BOUGHT by truncation, and the epoch costs exactly what the
+//!   truncation was saving.
 //! * **The one `instantiateId` arm that turns the memo off for a whole
 //!   subtree** (`cond_check_subst`, the second distribution rule, which
 //!   re-walks the branches once per union constituent with `map_id = null`).
