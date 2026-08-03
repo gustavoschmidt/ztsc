@@ -441,6 +441,10 @@ pub fn arrayDecidablyExtends(c: *Checker, chk: TypeId, extends_ty: TypeId) Error
 /// intersection: one constituent is the tuple, and an intersection's values
 /// satisfy every constituent.
 pub fn isArrayShaped(c: *Checker, t: TypeId) Error!bool {
+    // An interface/class instance is an object for every argument list, and
+    // an object is not array-shaped — so the whole member table need not be
+    // materialized to say no. See `refExpandsToObject`.
+    if (c.refExpandsToObject(t)) return false;
     const r = try c.resolveStructural(t);
     switch (c.ts.kind(r)) {
         .array, .tuple, .function => return true,
@@ -2310,6 +2314,11 @@ pub fn isGenericObjectForIndex(c: *Checker, t0: TypeId) Error!bool {
     // which would otherwise unwrap the marker to its home instance and resolve
     // the access against a member table that may still be materializing.
     if (s.kind(t0) == .this_type) return true;
+    // An interface/class instance is an object for every argument list, and
+    // an object is not an instantiable type here (the doc comment above) —
+    // so the member table need not be materialized to say no. See
+    // `refExpandsToObject`.
+    if (c.refExpandsToObject(t0)) return false;
     const t = try c.resolveStructural(t0);
     return switch (s.kind(t)) {
         .type_param, .infer_var, .mapped_param, .mapped, .index_access, .conditional, .keyof_op, .string_mapping, .template_literal_type => true,

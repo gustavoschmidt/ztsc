@@ -88,6 +88,14 @@ const FileId = u32;
 /// the pool spawns, so no synchronization is needed.
 pub var profile_on: bool = false;
 
+/// `--inst-focus=<type-id>`: the ONE root type whose substitution the
+/// per-type histogram should be restricted to. The unrestricted histogram
+/// answers "which subterm does this run re-walk most", which a run-wide sum
+/// answers badly when one top-level entry is itself the outlier — read a
+/// root's id out of the `by root type` section and feed it back here to get
+/// that entry's own breakdown. Write-once alongside `profile_on`.
+pub var focus_root: TypeId = 0;
+
 /// Whether the profiler is enabled for this process.
 pub fn enabled() bool {
     return profile_on;
@@ -133,6 +141,21 @@ pub const InstProf = struct {
     stmts: std.ArrayListUnmanaged(Stmt) = .empty,
     /// Statements whose budget actually tripped.
     tripped: u64 = 0,
+    /// Non-zero while a top-level `instantiate` of `focus_root` is live —
+    /// see `focus_root`. Nested so a re-entrant focused root still counts.
+    focus_depth: u32 = 0,
+    /// `per_type`, restricted to visits charged under `focus_root`. The
+    /// unrestricted histogram sums a whole run and cannot say which subterm
+    /// ONE enormous substitution walked; this one can.
+    focus_types: std.AutoHashMapUnmanaged(TypeId, Tally) = .empty,
+    /// `kinds`, restricted the same way.
+    focus_kinds: [256]u64 = @splat(0),
+    /// Node visits made while a `cond_check_subst` rebinding is live — i.e.
+    /// under the one arm of `instantiateId` that turns the memo off for a
+    /// whole subtree, and re-walks it once per union constituent.
+    cond_subst_visits: u64 = 0,
+    /// Union constituents distributed through that arm.
+    cond_subst_laps: u64 = 0,
 
     pub fn deinit(p: *InstProf, gpa: std.mem.Allocator) void {
         p.sites.deinit(gpa);
@@ -140,6 +163,7 @@ pub const InstProf = struct {
         p.expands.deinit(gpa);
         p.expand_sites.deinit(gpa);
         p.per_type.deinit(gpa);
+        p.focus_types.deinit(gpa);
         p.stmts.deinit(gpa);
     }
 };
@@ -160,10 +184,30 @@ pub fn noteTopLevel(c: *Checker, ret_addr: usize, t: TypeId, visits: u64) void {
 
 /// Charge one `instantiateId` node visit to the type visited.
 pub fn noteVisit(c: *Checker, t: TypeId) void {
+    if (c.cond_check_subst != null) c.prof.cond_subst_visits += 1;
     if (c.prof.per_type.getOrPut(c.gpa, t)) |gop| {
         if (!gop.found_existing) gop.value_ptr.* = .{};
         gop.value_ptr.add(1);
     } else |_| {}
+    if (c.prof.focus_depth > 0) {
+        c.prof.focus_kinds[@intFromEnum(c.ts.kind(t))] += 1;
+        if (c.prof.focus_types.getOrPut(c.gpa, t)) |gop| {
+            if (!gop.found_existing) gop.value_ptr.* = .{};
+            gop.value_ptr.add(1);
+        } else |_| {}
+    }
+}
+
+/// Open/close a focus window around a top-level `instantiate` (see
+/// `focus_root`). Returns whether this entry opened one.
+pub fn focusEnter(c: *Checker, t: TypeId) bool {
+    if (focus_root == 0 or t != focus_root) return false;
+    c.prof.focus_depth += 1;
+    return true;
+}
+
+pub fn focusExit(c: *Checker) void {
+    c.prof.focus_depth -= 1;
 }
 
 /// Charge one `resolveStructural` that forced an expansion to its call site.
@@ -266,6 +310,9 @@ pub fn report(c: *Checker) void {
     w.print("total node visits: {d}  memo hits: {d}  misses: {d}  budget trips: {d}\n", .{
         c.inst_total, c.stats.inst_hits, c.stats.inst_misses, c.prof.tripped,
     }) catch {};
+    w.print("uncached cond-check rebinding: {d} visits over {d} constituents\n", .{
+        c.prof.cond_subst_visits, c.prof.cond_subst_laps,
+    }) catch {};
 
     w.writeAll("\n-- visits by type kind --\n") catch {};
     {
@@ -299,6 +346,19 @@ pub fn report(c: *Checker) void {
     dumpTally(TypeId, w, gpa, &c.prof.roots, 25, labelRoot, c) catch {};
     w.writeAll("\n-- most re-instantiated individual types --\n") catch {};
     dumpTally(TypeId, w, gpa, &c.prof.per_type, 30, labelRoot, c) catch {};
+    if (focus_root != 0) {
+        w.print("\n-- visits under root #{d} only, by type --\n", .{focus_root}) catch {};
+        dumpTally(TypeId, w, gpa, &c.prof.focus_types, 40, labelRoot, c) catch {};
+        w.writeAll("\n-- visits under that root, by kind --\n") catch {};
+        for (c.prof.focus_kinds, 0..) |v, i| {
+            if (v == 0) continue;
+            const name = if (i < @typeInfo(types.Kind).@"enum".fields.len)
+                @tagName(@as(types.Kind, @enumFromInt(@as(u8, @intCast(i)))))
+            else
+                "?";
+            w.print("  {d:>12} visits  {s}\n", .{ v, name }) catch {};
+        }
+    }
     w.writeAll("\n-- expandRef() by symbol --\n") catch {};
     dumpTally(SymbolId, w, gpa, &c.prof.expands, 25, labelSym, c) catch {};
     w.writeAll("\n-- resolveStructural() sites that forced an expansion --\n") catch {};

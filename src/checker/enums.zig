@@ -1213,7 +1213,9 @@ pub fn instantiate(c: *Checker, t: TypeId, map: []const TpMap) Error!TypeId {
         const map_id: ?u32 = if (c.inst_cache_on) try c.canonMapId(map) else null;
         if (c.prof.on) {
             const before = c.inst_total;
+            const focused = prof_zig.focusEnter(c, t);
             const r = c.instantiateId(t, map, map_id);
+            if (focused) prof_zig.focusExit(c);
             prof_zig.noteTopLevel(c, @returnAddress(), t, c.inst_total - before);
             return r;
         }
@@ -1664,6 +1666,7 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
                     var parts: std.ArrayList(TypeId) = .empty;
                     defer parts.deinit(c.scratch());
                     for (try c.memberList(new_check)) |m| {
+                        if (c.prof.on) c.prof.cond_subst_laps += 1;
                         c.cond_check_subst = .{ .from = check0, .to = m };
                         const ext_m = try c.instantiateId(s.condExtends(t), map, null);
                         const tru_m = try c.instantiateId(s.condTrue(t), map, null);

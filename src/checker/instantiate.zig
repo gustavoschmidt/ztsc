@@ -177,6 +177,28 @@ pub fn resolveStructural(c: *Checker, t0: TypeId) Error!TypeId {
     return t;
 }
 
+/// Is `t` a reference whose expansion is an OBJECT whatever its type
+/// arguments are — answerable without expanding it?
+///
+/// An interface's and a class's member table is `.object` before and after
+/// substitution: `interfaceGeneric`/`classInstanceGeneric` build an object
+/// (or `error_type` on a base cycle), `instantiateId`'s `.object` arm
+/// rebuilds an object, and the two interfaces that would break the rule —
+/// `Array`/`ReadonlyArray` — never become refs at all, because
+/// `typeFromTypeRef` lowers them to `.array` at construction.
+///
+/// So a predicate that only reads the KIND of the expansion is a function
+/// of the ref's SYMBOL, and can skip materializing a member table that a
+/// generic builder interface makes enormous. Type ALIASES are excluded on
+/// purpose: an alias body REDUCES when instantiated — a conditional picks a
+/// branch, an indexed access resolves, a mapped type materializes — so its
+/// kind genuinely depends on the arguments and only the expansion can say.
+pub fn refExpandsToObject(c: *Checker, t: TypeId) bool {
+    if (c.ts.kind(t) != .ref) return false;
+    const f = c.symFlags(c.ts.refSymbol(t));
+    return f.interface or f.class;
+}
+
 pub fn expandRef(c: *Checker, ref: TypeId) Error!TypeId {
     if (c.expansions.get(ref)) |t| {
         if (t == types.no_type) return types.error_type; // cycle

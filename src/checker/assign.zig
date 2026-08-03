@@ -2790,6 +2790,11 @@ pub fn signatureAssignableMode(c: *Checker, s: TypeId, t: TypeId, mode: SigMode)
 /// sits directly in a parameter's union.
 pub fn typeHasMapped(c: *Checker, t0: TypeId, depth: u8) Error!bool {
     if (depth > 4) return false;
+    // An interface/class instance is an object for every argument list, and
+    // this walk stops at an object (it looks for a mapped type sitting
+    // directly in a parameter's union) — so the member table need not be
+    // materialized to say no. See `refExpandsToObject`.
+    if (c.refExpandsToObject(t0)) return false;
     const t = try c.resolveStructural(t0);
     switch (c.ts.kind(t)) {
         .mapped => return true,
@@ -3323,6 +3328,10 @@ pub fn requiredParams(c: *Checker, sig: TypeId) Error!u32 {
 /// `new Promise<void>((resolve) => … resolve())` report TS2554.
 pub fn paramAcceptsVoid(c: *Checker, ty: TypeId) Error!bool {
     if (ty == types.void_type) return true;
+    // An interface/class instance is an object for every argument list, and
+    // an object is neither `void` nor a union containing it — so the member
+    // table need not be materialized to say no. See `refExpandsToObject`.
+    if (c.refExpandsToObject(ty)) return false;
     const r = try c.resolveStructural(ty);
     if (r == types.void_type) return true;
     if (c.ts.kind(r) == .union_type) {

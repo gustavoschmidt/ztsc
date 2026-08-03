@@ -2714,6 +2714,7 @@ pub const Checker = struct {
     pub const aliasGeneric = instantiate_zig.aliasGeneric;
     pub const resolveStructural = instantiate_zig.resolveStructural;
     pub const expandRef = instantiate_zig.expandRef;
+    pub const refExpandsToObject = instantiate_zig.refExpandsToObject;
     pub const originTaggable = instantiate_zig.originTaggable;
     pub const driveShrinkingAlias = instantiate_zig.driveShrinkingAlias;
     pub const refArgsSettled = instantiate_zig.refArgsSettled;
