@@ -1,8 +1,8 @@
-//! Instantiation-demand profiler — a diagnostic instrument, OFF unless the
-//! environment variable `ZTSC_INST_PROFILE` is set.
+//! Instantiation-demand profiler — a diagnostic instrument, off unless
+//! `--inst-profile` is passed.
 //!
 //! It answers the question "where does a statement's instantiation budget
-//! (`max_instantiation_count`) go?" along four independent axes:
+//! (`max_instantiation_count`) go?" along several independent axes:
 //!
 //!   * **call site** — the return address of each *top-level* `instantiate`
 //!     entry, with the node-visits that entry charged. Symbolized at report
@@ -23,6 +23,54 @@
 //! flag off the only cost is a predictable-false branch at the instrumentation
 //! points. Output goes to stderr at `seal`, so run with `--checkers=1` to read
 //! one profile rather than an interleave.
+//!
+//! ## What it has already established (immich / kysely, 2026-08-03)
+//!
+//! Repro: one kysely builder chain against immich's `DB`, 110 files pulled in
+//! by its imports; `--checkers=1 --inst-profile`. 5.07 M node visits, 2.62 M
+//! of them memo misses, 1,674 budget trips.
+//!
+//! * **Demand is spread, not concentrated.** `expandRef`'s
+//!   `instantiate(interfaceGeneric, args)` is 52% (2.58 M over 4,004 calls),
+//!   `instantiateSigForCall` 19%, `eraseParamsOf` 22%, `baseConstraintOf` 5%.
+//!   No single call site is a keystone; a fix has to be structural.
+//! * **The memo already catches the repeats — what is left is unique work.**
+//!   59.5 k distinct types are instantiated under 120 k distinct substitution
+//!   maps, 44 misses per distinct type. Better *caching* has nothing left to
+//!   win; only doing less work does.
+//! * **The expansions are forced by the relation and inference machinery,**
+//!   not by member access: `isAssignableInner` (1.06 M), `paramAcceptsVoid`
+//!   (485 k), `unify` (442 k), `inferFromExtendsInner` (413 k),
+//!   `isArrayShaped` (361 k), `isGenericObjectForIndex` (324 k),
+//!   `typeHasMapped` (310 k) — several of which expand a whole member table
+//!   only to answer a yes/no structural predicate.
+//! * **A single signature instantiation can exceed the whole budget.**
+//!   kysely's `QueryCreator.with<N, E>` costs 316,401 node visits for ONE
+//!   `instantiateSigForCall`, against a 250,000 statement budget.
+//!
+//! ## Ruled out, with numbers (do not re-run these)
+//!
+//! * **Raising the budget.** At tsc's own constant (5 M instead of 250 k):
+//!   41 s wall (from 3.5 s) and immich excess got WORSE, 498 -> 556, with
+//!   TS7006 nearly doubling (108 -> 187). Excess is not monotone in the
+//!   budget — the intermediate regime just moves which materializations come
+//!   back truncated, and a lost contextual parameter type costs more
+//!   diagnostics than a lost deep instantiation.
+//! * **Lazy per-member instantiation of an interface reference** (tsc's
+//!   `createInstantiatedSymbolTable`; read one member out of the memoized
+//!   generic table and substitute only it, instead of expanding all ~50).
+//!   Structurally correct and it does cut work (5.28 M -> 4.89 M visits, 315
+//!   fewer expansions), but immich went 498 -> 567: it removes the
+//!   *amortization* that `expansions` provides. Today one statement pays for
+//!   a builder interface's whole table and every later statement reads it
+//!   free; per-member, each statement pays for its own members, and any
+//!   member whose substitution is truncated is never memoized at all, so it
+//!   is re-paid and re-truncated forever. Revisit only after per-statement
+//!   demand fits the budget.
+//! * **A free-parameter Bloom summary + map-aware early-out, and narrowing
+//!   the memo key to the relevant sub-map.** See the revert commit: 1.5% of
+//!   visits and 498 -> 500 for the first; a 4x *increase* in distinct maps
+//!   and 13% more misses for the second.
 
 const std = @import("std");
 const types = @import("../types.zig");
