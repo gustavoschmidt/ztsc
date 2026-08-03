@@ -183,6 +183,14 @@ pub fn expandRef(c: *Checker, ref: TypeId) Error!TypeId {
         return t;
     }
     try c.expansions.put(c.cm(), ref, types.no_type); // in-progress
+    // Truncation is a property of THIS expansion, so the flag the
+    // memoization test below reads is scoped to it — the same subtree
+    // scoping `instantiateId` applies one layer down, and for the same
+    // reason: the question is "was MY result truncated", not "did anything
+    // earlier in this statement truncate".
+    const outer_trip = c.inst_limit_tripped;
+    c.inst_limit_tripped = false;
+    defer c.inst_limit_tripped = c.inst_limit_tripped or outer_trip;
     const sym = c.ts.refSymbol(ref);
     const prof_before = c.inst_total;
     defer if (c.prof.on) prof_zig.noteExpand(c, sym, c.inst_total - prof_before);
@@ -232,6 +240,20 @@ pub fn expandRef(c: *Checker, ref: TypeId) Error!TypeId {
         _ = c.expansions.remove(ref);
         return result;
     }
+    // A TRUNCATED expansion is published for ONE budget epoch, and no
+    // longer: `resetInstBudget` withdraws it at the next source element.
+    // This is the rule `inst_cache` already follows, relaxed by exactly the
+    // scope the budget itself has — a member list the instantiation budget
+    // cut short is not a function of the ref, it is a function of how much
+    // of THIS source element's budget was left when the first reader asked.
+    // Memoized for the whole run, that accident was published to every later
+    // reader on this checker, so WHICH ref came back with `error` members
+    // was a function of statement order, which the file partition decides;
+    // immich's `--checkers=1` vs `8` key sets diverged measurably on it, and
+    // the receivers it silently truncated were hiding real diagnostics
+    // behind them. Kept for the epoch, the element that paid for the
+    // truncation still amortizes it over its own re-reads.
+    if (c.inst_limit_tripped) try c.truncated_expansions.append(c.cm(), ref);
     // Origin tag: this object is the materialization of `ref =
     // makeRef(sym, canonical-args)` (interface refs carry default-filled
     // args from `fixTypeArgs`). Record it so a structurally-divergent

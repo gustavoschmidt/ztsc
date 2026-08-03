@@ -66,7 +66,7 @@ pub fn checkStatement(c: *Checker, node: Node) Error!void {
         prof_zig.noteStatement(c, f, sp.start, c.inst_count);
     }
     c.anchorInst(node);
-    c.inst_count = 0;
+    c.resetInstBudget();
     const d = c.tree.nodeData(node);
     const stmt_tag = c.nodeTag(node);
     // A class-position decorator applies to the class that immediately
