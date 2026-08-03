@@ -15,6 +15,12 @@
 //!     which separates signature/constraint work from object-member work.
 //!   * **expansion** — `expandRef` calls and their cost, per named symbol,
 //!     which is where an interface's whole member table is materialized.
+//!   * **one root, in isolation** — `--inst-focus=<type-id>` restricts the
+//!     per-type histogram and the kind buckets to substitutions rooted at
+//!     one type. A run-wide histogram answers "which subterm does this run
+//!     re-walk most", which is the wrong question once a SINGLE top-level
+//!     entry is itself the outlier; read the `#id` out of the `by root type`
+//!     section and feed it back to break that entry down on its own.
 //!
 //! Plus a per-statement ledger of the statements that spent the most budget,
 //! so a profile can be read against the statements that actually trip.
@@ -43,10 +49,24 @@
 //!   (485 k), `unify` (442 k), `inferFromExtendsInner` (413 k),
 //!   `isArrayShaped` (361 k), `isGenericObjectForIndex` (324 k),
 //!   `typeHasMapped` (310 k) — several of which expand a whole member table
-//!   only to answer a yes/no structural predicate.
+//!   only to answer a yes/no structural predicate. Four of them no longer
+//!   do (`refExpandsToObject`); what is left — `isAssignableInner`, `unify`,
+//!   `inferFromExtendsInner`, `propertyTypeOf` — genuinely reads members.
 //! * **A single signature instantiation can exceed the whole budget.**
 //!   kysely's `QueryCreator.with<N, E>` costs 316,401 node visits for ONE
 //!   `instantiateSigForCall`, against a 250,000 statement budget.
+//!   `--inst-focus` on that entry showed it is NOT a runaway substitution of
+//!   the signature: its own params and return type are references and cost
+//!   nothing. It is the reductions the substitution triggers —
+//!   `ExtractRowFromCommonTableExpression<E>` matching the callback's return
+//!   against `Expression<infer QO>` and three builder interfaces — each of
+//!   which calls `resolveStructural` and expands a whole kysely builder
+//!   table, charged to the enclosing top-level entry because `expandRef`
+//!   runs at `inst_depth > 0`. So the outlier is the SAME problem as the
+//!   predicates, not a separate bug: ~1,400 expansions of two builder
+//!   interfaces at ~1,500 visits each, under distinct argument lists.
+//!   Its own histogram is a long flat tail (top subterm 1,583 visits of
+//!   219 k), every visit a memo MISS under a distinct substitution map.
 //!
 //! ## Ruled out, with numbers (do not re-run these)
 //!
@@ -71,6 +91,27 @@
 //!   the memo key to the relevant sub-map.** See the revert commit: 1.5% of
 //!   visits and 498 -> 500 for the first; a 4x *increase* in distinct maps
 //!   and 13% more misses for the second.
+//! * **Refusing to memoize a TRUNCATED expansion** (`expandRef`), scoped to
+//!   the budget epoch that truncated it so the element that paid still
+//!   amortizes its own re-reads. Aimed at the cross-partition divergence,
+//!   which it does dent (c1^c8 108 -> 83, c4^c8 34 -> 31, c1^c4 unchanged),
+//!   but the causation runs the wrong way: the next reader re-expands, the
+//!   re-expansion is charged to ITS budget, and more statements trip.
+//!   immich 496 -> 522, wall 3.4 -> 4.2 s, and the 26 new keys are a
+//!   truncation signature (TS2589 plus its TS7006/TS2769 cascade), not
+//!   hidden diagnostics. See the revert commit.
+//! * **Giving each `expandRef` its own budget epoch** — which DOES make the
+//!   table a function of the ref (`enterSymFile`'s rule, one layer down) and
+//!   is the right answer in principle. 503 excess but wall 3.4 -> 8.0 s and
+//!   peak RSS 1.58 -> 2.66 GB; charging the cost back to the outer element
+//!   on exit lands at 512 excess, 5.9 s, 1.96 GB. The extra time is real
+//!   work: tables that used to come back truncated now complete. Revisit
+//!   once a per-ref member memo has made one expansion cheap.
+//! * **The one `instantiateId` arm that turns the memo off for a whole
+//!   subtree** (`cond_check_subst`, the second distribution rule, which
+//!   re-walks the branches once per union constituent with `map_id = null`).
+//!   A plausible-looking suspect for the `with<N, E>` outlier, and the
+//!   counter in the report header ruled it out: 32 k of 5.23 M visits.
 
 const std = @import("std");
 const types = @import("../types.zig");
