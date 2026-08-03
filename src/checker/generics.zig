@@ -2342,6 +2342,13 @@ fn mappedBindsKey(s: *const types.Store, t: TypeId, key_id: u32) bool {
 /// Replace the mapped key parameter (`key_id`) with a concrete key type
 /// throughout `t`, reducing any `Obj[Idx]` that becomes concrete.
 pub fn substMappedKey(c: *Checker, t: TypeId, key_id: u32, key_ty: TypeId) Error!TypeId {
+    // Per-constituent rebinding of a distributive conditional (see the
+    // `.conditional` arm below and `instantiateId`'s). Asked first: the check
+    // being rebound need not mention the key at all once it has been
+    // substituted.
+    if (c.cond_check_subst) |cs| {
+        if (t == cs.from) return cs.to;
+    }
     if (!try c.mentionsMappedParam(t, key_id)) return t;
     const s = &c.ts;
     switch (s.kind(t)) {
@@ -2399,7 +2406,29 @@ pub fn substMappedKey(c: *Checker, t: TypeId, key_id: u32, key_ty: TypeId) Error
             return s.makeRef(s.refSymbol(t), args.items);
         },
         .conditional => {
-            const chk = try c.substMappedKey(s.condCheck(t), key_id, key_ty);
+            const check0 = s.condCheck(t);
+            const chk = try c.substMappedKey(check0, key_id, key_ty);
+            // Distribution, rebinding the branches per constituent. Binding
+            // the key turns the check (`O[K]`) into the column's union, and
+            // instantiating the branches against that union rather than
+            // against each constituent lets a conditional nested in a branch
+            // answer for the whole union — see `instantiateId`'s copy of this
+            // rule for the kysely shape it was written for.
+            if (s.condDistributive(t) and chk != check0 and s.kind(chk) == .union_type) {
+                const saved_subst = c.cond_check_subst;
+                defer c.cond_check_subst = saved_subst;
+                var parts: std.ArrayList(TypeId) = .empty;
+                defer parts.deinit(c.scratch());
+                for (try c.memberList(chk)) |m| {
+                    c.cond_check_subst = .{ .from = check0, .to = m };
+                    const ext_m = try c.substMappedKey(s.condExtends(t), key_id, key_ty);
+                    const tru_m = try c.substMappedKey(s.condTrue(t), key_id, key_ty);
+                    const fls_m = try c.substMappedKey(s.condFalse(t), key_id, key_ty);
+                    c.cond_check_subst = saved_subst;
+                    try parts.append(c.scratch(), try c.reduceConditional(m, ext_m, tru_m, fls_m, false));
+                }
+                return s.makeUnion(c.scratch(), parts.items);
+            }
             const ext = try c.substMappedKey(s.condExtends(t), key_id, key_ty);
             const tru = try c.substMappedKey(s.condTrue(t), key_id, key_ty);
             const fls = try c.substMappedKey(s.condFalse(t), key_id, key_ty);
