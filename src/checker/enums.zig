@@ -1136,6 +1136,29 @@ pub fn mintFreshTp(c: *Checker, orig: SymbolId, map: []const TpMap, map_id: ?u32
     return gop.value_ptr.*;
 }
 
+/// Mint (or reuse) a fresh symbol for own type-param `orig` when a signature
+/// is `this`-substituted against receiver `repl` (`substThis`). Same record
+/// pool as `mintFreshTp`, but a SEPARATE key table: that one keys on a
+/// canonical map id and this one on a `TypeId`, both `u32`, so sharing one
+/// table would alias unrelated pairs onto the same fresh symbol.
+pub fn mintThisTp(c: *Checker, orig: SymbolId, repl: TypeId, constraint: TypeId, default: TypeId, has_default: bool) Error!u32 {
+    const key = (@as(u64, orig) << 32) | repl;
+    const gop = try c.this_tp_ids.getOrPut(c.cm(), key);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = c.fresh_tp_next;
+        c.fresh_tp_next += 1;
+        try c.fresh_tp_info.append(c.cm(), .{
+            .name = c.symNameAtom(orig),
+            .constraint = constraint,
+            .default = default,
+            .has_default = has_default,
+            .const_tp = c.isConstTypeParamSym(orig),
+            .widen_bound = types.no_type,
+        });
+    }
+    return gop.value_ptr.*;
+}
+
 /// Substitute the type parameters in `map` throughout `t`. Public entry:
 /// canonicalizes the map (when caching is on) and dispatches to the
 /// memoized recursive walk.
@@ -1784,16 +1807,59 @@ fn substThisInner(c: *Checker, t: TypeId, repl: TypeId) Error!TypeId {
             return s.makeTuple(elems.items);
         },
         .function => {
+            // A `this` marker also hides in the signature's OWN type-param
+            // BOUNDS, and those are held by symbol, not by type — so leaving
+            // `fnTypeParams` alone left the marker unresolvable. zod's
+            // `refine<Ch extends (arg: output<this>) => unknown>(check: Ch)`
+            // is the shape: the argument's contextual type comes from `Ch`'s
+            // constraint, so an unsubstituted bound handed the callback a
+            // deferred `this extends {_zod:{output:any}} ? … : unknown` and
+            // every parameter of the arrow fell to implicit `any` (TS7006)
+            // with TS2339 on each use. tsc has no such gap by construction:
+            // it appends `thisType` to the interface's type parameters and
+            // the receiver to its arguments, so ORDINARY instantiation —
+            // which does clone own params with substituted bounds — covers
+            // `this` too. Mirror `instantiateId`'s higher-order rewrite here:
+            // mint a fresh symbol per own param whose bound actually moved,
+            // and rewrite its references in the body to the fresh one.
+            var kept: std.ArrayList(u32) = .empty;
+            defer kept.deinit(c.scratch());
+            var fresh_map: std.ArrayList(TpMap) = .empty;
+            defer fresh_map.deinit(c.scratch());
+            for (0..s.fnTypeParamCount(t)) |tp_i| {
+                const tp = s.fnTypeParamAt(t, tp_i);
+                const oc = try c.typeParamConstraint(tp);
+                const od = try c.typeParamDefault(tp);
+                // A bound may name a SIBLING own param, so the rewrites
+                // minted so far in this loop apply to it as well (the reason
+                // `instantiateId` threads `cur_map`).
+                var nc = if (oc != types.no_type) try c.substThis(oc, repl) else oc;
+                var nd = if (od != types.no_type) try c.substThis(od, repl) else od;
+                if (fresh_map.items.len > 0) {
+                    if (nc != types.no_type) nc = try c.instantiate(nc, fresh_map.items);
+                    if (nd != types.no_type) nd = try c.instantiate(nd, fresh_map.items);
+                }
+                if (nc != oc or nd != od) {
+                    const fid = try c.mintThisTp(tp, repl, nc, nd, od != types.no_type);
+                    try kept.append(c.scratch(), fid);
+                    try fresh_map.append(c.scratch(), .{ .sym = tp, .ty = try s.makeTypeParam(fid) });
+                } else {
+                    try kept.append(c.scratch(), tp);
+                }
+            }
             var params: std.ArrayList(types.Param) = .empty;
             defer params.deinit(c.scratch());
             for (0..s.fnParamCount(t)) |i| {
                 const p = s.fnParam(t, @intCast(i));
-                try params.append(c.scratch(), .{ .name = p.name, .ty = try c.substThis(p.ty, repl), .flags = p.flags });
+                var pt = try c.substThis(p.ty, repl);
+                if (fresh_map.items.len > 0) pt = try c.instantiate(pt, fresh_map.items);
+                try params.append(c.scratch(), .{ .name = p.name, .ty = pt, .flags = p.flags });
             }
-            const ret = try c.substThis(s.fnReturn(t), repl);
+            var ret = try c.substThis(s.fnReturn(t), repl);
+            if (fresh_map.items.len > 0) ret = try c.instantiate(ret, fresh_map.items);
             const this_ty = s.fnThisType(t);
             const pred: ?types.Predicate = if (s.fnHasPredicate(t)) s.fnPredicate(t) else null;
-            return s.makeFunctionThis(params.items, ret, s.fnTypeParams(t), s.fnFlags(t), pred, this_ty);
+            return s.makeFunctionThis(params.items, ret, kept.items, s.fnFlags(t), pred, this_ty);
         },
         .ref => {
             var args: std.ArrayList(TypeId) = .empty;

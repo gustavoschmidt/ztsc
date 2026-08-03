@@ -566,29 +566,29 @@ pub const MappedKeyScope = struct {
 /// `deinit` cannot fall behind the field set: a container added to `Checker`
 /// and fed from `cm()` but forgotten here leaks its whole table.
 pub const map_containers = [_][]const u8{
-    "node_types",               "sig_cache",            "node_scopes",
-    "reassigned_syms",          "reassigned_in_loop",   "member_written_syms",
-    "member_written_in_loop",   "ns_types",             "ambient_ns_types",
-    "relation",                 "expansions",           "overload_rotate",
-    "origin",                   "iface_generic",        "iface_stack",
-    "pending_class_decos",      "class_inst_generic",   "class_static_cache",
-    "class_static_base_active", "class_ctor_cache",     "enum_value_cache",
-    "enum_info_cache",          "alias_generic",        "alias_state",
-    "alias_recursive",          "flow_same",            "flow_narrow",
-    "ref_keys",                 "flow_loop_stack",      "flow_stack",
-    "flow_tmp",                 "da_cache",             "ctp_cache",
-    "cmp_cache",                "ctt_cache",            "ci_cache",
-    "infer_visited",            "subst_this_cache",     "mmp_cache",
-    "inst_cache",               "arrayish_elem_cache",  "tp_constraint_cache",
-    "inst_map_ids",             "fresh_tp_ids",         "fresh_tp_info",
-    "type_node_cache",          "atom_cache",           "infer_ids",
-    "infer_scopes",             "mapped_key_ids",       "mapped_key_scopes",
-    "inst_diag_at",             "infer_active",         "lazy_member_active",
-    "chain_guards",             "never_isect",          "deep_path_list",
-    "deep_path_ids",            "flow_reach",           "member_type_stack",
-    "lazy_index_objs",          "pending_type_args",    "pending_type_args_pool",
-    "pending_type_args_seen",   "tp_constrained_cache", "nominal_bases",
-    "nominal_base_pool",
+    "node_types",               "sig_cache",              "node_scopes",
+    "reassigned_syms",          "reassigned_in_loop",     "member_written_syms",
+    "member_written_in_loop",   "ns_types",               "ambient_ns_types",
+    "relation",                 "expansions",             "overload_rotate",
+    "origin",                   "iface_generic",          "iface_stack",
+    "pending_class_decos",      "class_inst_generic",     "class_static_cache",
+    "class_static_base_active", "class_ctor_cache",       "enum_value_cache",
+    "enum_info_cache",          "alias_generic",          "alias_state",
+    "alias_recursive",          "flow_same",              "flow_narrow",
+    "ref_keys",                 "flow_loop_stack",        "flow_stack",
+    "flow_tmp",                 "da_cache",               "ctp_cache",
+    "cmp_cache",                "ctt_cache",              "ci_cache",
+    "infer_visited",            "subst_this_cache",       "mmp_cache",
+    "inst_cache",               "arrayish_elem_cache",    "tp_constraint_cache",
+    "inst_map_ids",             "fresh_tp_ids",           "this_tp_ids",
+    "fresh_tp_info",            "type_node_cache",        "atom_cache",
+    "infer_ids",                "infer_scopes",           "mapped_key_ids",
+    "mapped_key_scopes",        "inst_diag_at",           "infer_active",
+    "lazy_member_active",       "chain_guards",           "never_isect",
+    "deep_path_list",           "deep_path_ids",          "flow_reach",
+    "member_type_stack",        "lazy_index_objs",        "pending_type_args",
+    "pending_type_args_pool",   "pending_type_args_seen", "tp_constrained_cache",
+    "nominal_bases",            "nominal_base_pool",
 };
 
 /// Where one symbol's declared heritage lives in `Checker.nominal_base_pool`.
@@ -1013,6 +1013,11 @@ pub const Checker = struct {
     /// `(orig_param_sym, canonical_map_id)`, so the same instantiation reuses the
     /// same fresh symbol (inst-cache coherent; `--no-inst-cache` agrees).
     fresh_tp_ids: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    /// The same rewrite for the OTHER substitution that reaches a signature's
+    /// own bounds — `substThis`, keyed by `(orig_param_sym, receiver TypeId)`.
+    /// Separate table because a canonical map id and a `TypeId` are both `u32`
+    /// and would collide in `fresh_tp_ids`; the records share `fresh_tp_info`.
+    this_tp_ids: std.AutoHashMapUnmanaged(u64, u32) = .empty,
     fresh_tp_info: std.ArrayListUnmanaged(FreshTp) = .empty,
     fresh_tp_base: u32 = 0,
     fresh_tp_next: u32 = 0,
@@ -2682,6 +2687,7 @@ pub const Checker = struct {
     pub const isConstTypeParamSym = enums_zig.isConstTypeParamSym;
     pub const freshTp = enums_zig.freshTp;
     pub const mintFreshTp = enums_zig.mintFreshTp;
+    pub const mintThisTp = enums_zig.mintThisTp;
     pub const instantiate = enums_zig.instantiate;
     pub const tagInstantiatedOrigin = enums_zig.tagInstantiatedOrigin;
     pub const chainRepeats = enums_zig.chainRepeats;
