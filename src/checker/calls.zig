@@ -547,12 +547,33 @@ pub fn resolveSignatureCall(
         // non-generic `new (): Map<any, any>` when `new Map<K, V>()` names
         // two type args, so the generic overload is chosen instead.
         if (explicit_targs.len > 0 and !c.sigTargArityOk(sig, explicit_targs.len)) continue;
+        // A candidate's TYPE-ARGUMENT INFERENCE is as speculative as the
+        // argument check that follows it. Inference contextually types every
+        // function argument by this candidate's parameter (`partialParamCtx`
+        // → `checkExprCached`), so a candidate whose parameter is not callable
+        // — `select(selections: ReadonlyArray<SE>)`, tried before the callback
+        // overload beside it — walks the arrow with no contextual signature
+        // and reports TS7006 on each of its parameters. `argumentsMatch`
+        // already withdraws what a rejected candidate says about the
+        // arguments; it just started counting too late, at its own entry,
+        // leaving everything inference had already said standing. tsc runs the
+        // whole of `chooseOverload` — inference included — with diagnostics
+        // off and reports only for the signature it settles on.
+        //
+        // The accepted candidate keeps its inference diagnostics, exactly as
+        // before: only the `continue` paths withdraw.
+        const saved_infer = c.diags.items.len;
+        const infer_file = c.cur_file;
         const inst = try c.instantiateSigForCall(sig, explicit_targs, arg_nodes, node, ret_ctx);
-        if (nargs < try c.requiredParams(inst) or nargs > try c.paramTotal(inst)) continue;
+        if (nargs < try c.requiredParams(inst) or nargs > try c.paramTotal(inst)) {
+            c.rollbackArgDiags(saved_infer, infer_file, arg_nodes);
+            continue;
+        }
         if (try c.argumentsMatch(inst, arg_nodes)) {
             try c.checkCallArguments(node, inst, arg_nodes, true);
             return if (instance_ret != types.no_type) instance_ret else c.ts.fnReturn(inst);
         }
+        c.rollbackArgDiags(saved_infer, infer_file, arg_nodes);
     }
     // No candidate matched. tsc does not report at the callee: it re-checks
     // the LAST candidate with error reporting on and files the TS2769 where
