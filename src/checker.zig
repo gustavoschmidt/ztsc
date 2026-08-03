@@ -124,12 +124,6 @@ pub const Stats = struct {
     inst_hits: usize = 0,
     inst_misses: usize = 0,
     inst_maps: usize = 0,
-    /// Substitutions answered `t` outright because the map's parameters and
-    /// the type's free-parameter summary are disjoint (`Checker.tp_mask`).
-    inst_mask_skips: usize = 0,
-    /// Substitutions whose memo key was narrowed to the part of the map the
-    /// type can mention (`restrictMap`).
-    inst_map_narrowings: usize = 0,
     /// `Checker.inst_count` at seal: the instantiation work this instance
     /// charged against `max_instantiation_count`, and the comparator for
     /// tsgo's `--extendedDiagnostics` Instantiations. Reported so the quantity
@@ -585,21 +579,19 @@ pub const map_containers = [_][]const u8{
     "alias_recursive",          "flow_same",              "flow_narrow",
     "ref_keys",                 "flow_loop_stack",        "flow_stack",
     "flow_tmp",                 "da_cache",               "ctp_cache",
-    "tp_mask",                  "tp_mask_state",          "map_mask",
     "cmp_cache",                "ctt_cache",              "ci_cache",
     "infer_visited",            "subst_this_cache",       "mmp_cache",
     "inst_cache",               "arrayish_elem_cache",    "tp_constraint_cache",
-    "erase_cache",              "inst_map_ids",           "inst_map_slices",
-    "restrict_ids",             "fresh_tp_ids",           "this_tp_ids",
-    "fresh_tp_info",            "type_node_cache",        "atom_cache",
-    "infer_ids",                "infer_scopes",           "mapped_key_ids",
-    "mapped_key_scopes",        "inst_diag_at",           "infer_active",
-    "lazy_member_active",       "chain_guards",           "never_isect",
-    "deep_path_list",           "deep_path_ids",          "flow_reach",
-    "member_type_stack",        "lazy_index_objs",        "pending_type_args",
-    "pending_type_args_pool",   "pending_type_args_seen", "tp_constrained_cache",
-    "nominal_bases",            "nominal_base_pool",      "keyof_mapped_active",
-    "ctp_syms_seen",
+    "erase_cache",              "inst_map_ids",           "fresh_tp_ids",
+    "this_tp_ids",              "fresh_tp_info",          "type_node_cache",
+    "atom_cache",               "infer_ids",              "infer_scopes",
+    "mapped_key_ids",           "mapped_key_scopes",      "inst_diag_at",
+    "infer_active",             "lazy_member_active",     "chain_guards",
+    "never_isect",              "deep_path_list",         "deep_path_ids",
+    "flow_reach",               "member_type_stack",      "lazy_index_objs",
+    "pending_type_args",        "pending_type_args_pool", "pending_type_args_seen",
+    "tp_constrained_cache",     "nominal_bases",          "nominal_base_pool",
+    "keyof_mapped_active",      "ctp_syms_seen",
 };
 
 /// Where one symbol's declared heritage lives in `Checker.nominal_base_pool`.
@@ -956,33 +948,6 @@ pub const Checker = struct {
     flow_reach: std.AutoHashMapUnmanaged(u32, u8) = .empty,
     /// containsTypeParam memo, a dense `TriMemo` (see it for why not a map).
     ctp_cache: std.ArrayList(u8) = .empty,
-    /// Free-type-parameter SUMMARY, dense like `ctp_cache` and computed by
-    /// the same walk: a 64-bit Bloom filter over the type-parameter symbols
-    /// that occur free in a type (`freeParamMask`). Valid exactly where
-    /// `ctp_cache` says 2; zero everywhere else, which is also the honest
-    /// answer for a type that mentions no parameter.
-    ///
-    /// It exists so `instantiateId` can ask the *map-aware* question tsc's
-    /// boolean `couldContainTypeVariables` cannot: not "does this type
-    /// mention some parameter" but "does it mention one THIS substitution
-    /// binds". A kysely builder chain instantiates one signature's own
-    /// parameter (`SE`) through a return type whose bulk is the DB-wide
-    /// `SelectQueryBuilder<DB, TB, O>` machinery — every node of which the
-    /// boolean test says to walk, and the mask test skips in O(1).
-    ///
-    /// A Bloom filter, not a set: false positives only cost a walk that
-    /// would have happened anyway, and the fixed 64-bit width keeps the
-    /// summary one word per type. `~0` is the deliberate "unknown, assume
-    /// everything" value for the one construct whose parameters cannot be
-    /// enumerated (a higher-order call signature reached through
-    /// `sigReferencesOuterParam`).
-    tp_mask: std.ArrayList(u64) = .empty,
-    /// Tri-state validity for `tp_mask`, dense like `ctp_cache`: 0 unknown or
-    /// in progress, 1 no free parameters, 2 mask stored.
-    tp_mask_state: std.ArrayList(u8) = .empty,
-    /// `mapParamMask` memo, indexed by canonical substitution-map id. Zero
-    /// means "not computed" — a non-empty map's summary is never zero.
-    map_mask: std.ArrayList(u64) = .empty,
     /// containsMappedParam memo, dense like `ctp_cache`.
     cmp_cache: std.ArrayList(u8) = .empty,
     /// `(source << 32 | pattern) -> (generation << 1 | contra)`: the
@@ -1054,12 +1019,6 @@ pub const Checker = struct {
     /// arena (scratch is reset per statement).
     inst_map_ids: std.StringHashMapUnmanaged(u32) = .empty,
     inst_map_next: u32 = 1,
-    /// Canonical pair list per map id (`id - 1` indexes it), so a narrowed
-    /// map can be handed back down by id — see `restrictMap`.
-    inst_map_slices: std.ArrayListUnmanaged([]const TpMap) = .empty,
-    /// `restrictMap` memo: `(free-parameter summary << 32 | map id)` -> the
-    /// id of that map narrowed to the summary.
-    restrict_ids: std.AutoHashMapUnmanaged(u128, u32) = .empty,
     /// `SymbolId -> declared constraint TypeId` (`no_type` = unconstrained).
     /// Avoids re-resolving the constraint AST on every assignability check.
     tp_constraint_cache: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
@@ -2792,10 +2751,6 @@ pub const Checker = struct {
     pub const boundHasReducerShape = enums_zig.boundHasReducerShape;
     pub const boundReducible = enums_zig.boundReducible;
     pub const sigReferencesOuterParam = enums_zig.sigReferencesOuterParam;
-    pub const freeParamMask = enums_zig.freeParamMask;
-    pub const mapParamMask = enums_zig.mapParamMask;
-    pub const restrictMap = enums_zig.restrictMap;
-    pub const mapOfId = enums_zig.mapOfId;
     pub const containsTypeParam = enums_zig.containsTypeParam;
     pub const containsTypeParamInner = enums_zig.containsTypeParamInner;
     pub const containsFreeTypeParam = enums_zig.containsFreeTypeParam;
