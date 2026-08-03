@@ -194,9 +194,31 @@ pub fn reduceConditional(c: *Checker, chk: TypeId, extends_ty: TypeId, true_ty: 
         // ReadonlyMap<…>` / `ReadonlySet<…>` / `WeakReferences` arms and
         // stayed an unreduced conditional whose default constraint (a union
         // including `Map<…>`) exposes none of the state's own members.
+        // `[X] extends [Y]` — the idiom that switches distributivity off —
+        // wraps both sides in a one-element tuple. Tuples relate
+        // element-wise, so the decidability question is EXACTLY the
+        // element's; unwrap both before asking it, or every wrapped test
+        // (kysely's whole `SelectFrom` chain opens with `[TE] extends
+        // [keyof DB]`) is undecidable by construction and defers.
+        var chk_d = chk;
+        var ext_d = extends_ty;
         if (!ext_generic) {
-            const chk_shape = if (s.kind(chk) == .ref) try c.resolveStructural(chk) else chk;
-            if (s.kind(chk_shape) == .object and try c.objectDecidablyNotExtends(chk_shape, extends_ty)) {
+            const ce = try c.resolveStructural(chk);
+            const ee = try c.resolveStructural(extends_ty);
+            if (s.kind(ce) == .tuple and s.kind(ee) == .tuple and
+                s.tupleLen(ce) == 1 and s.tupleLen(ee) == 1)
+            {
+                const a = s.tupleElem(ce, 0);
+                const b = s.tupleElem(ee, 0);
+                if (a.flags == 0 and b.flags == 0) {
+                    chk_d = a.ty;
+                    ext_d = b.ty;
+                }
+            }
+        }
+        if (!ext_generic) {
+            const chk_shape = if (s.kind(chk_d) == .ref) try c.resolveStructural(chk_d) else chk_d;
+            if (s.kind(chk_shape) == .object and try c.objectDecidablyNotExtends(chk_shape, ext_d)) {
                 return false_ty;
             }
         }
@@ -364,11 +386,37 @@ pub fn objectDecidablyNotExtends(c: *Checker, chk_obj: TypeId, extends_ty: TypeI
     const ext = try c.resolveStructural(extends_ty);
     switch (s.kind(ext)) {
         .null, .undefined => return true,
+        // No object type is assignable to a PRIMITIVE, whatever its free
+        // params turn out to be — a value with members is not a string, a
+        // number, a literal, a template pattern or an enum member. (`any`,
+        // `unknown`, `object` and `{}` are deliberately absent: an object
+        // does satisfy those.) This is what decides kysely's `[TE] extends
+        // [keyof DB]` and `[TE] extends [`${infer T} as ${infer A}`]` for a
+        // class-instance table expression, so the chain reaches its real
+        // last arm instead of stalling and later having a branch picked for
+        // it by an apparent-type lookup.
+        .string,
+        .number,
+        .boolean,
+        .bigint,
+        .symbol,
+        .string_literal,
+        .number_literal,
+        .number_literal_fresh,
+        .bigint_literal,
+        .bool_true,
+        .bool_false,
+        .unique_symbol,
+        .template_literal_type,
+        .string_mapping,
+        .enum_type,
+        .never,
+        .void,
+        => return true,
         .union_type => {
-            // Decidable only if the whole target is null/undefined-shaped.
+            // A union is out of reach exactly when every constituent is.
             for (try c.memberList(ext)) |m| {
-                const mk = s.kind(try c.resolveStructural(m));
-                if (mk != .null and mk != .undefined) return false;
+                if (!try c.objectDecidablyNotExtends(chk_obj, m)) return false;
             }
             return true;
         },
