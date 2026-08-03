@@ -1007,6 +1007,19 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!bool {
     if (c.rel_depth > max_relation_depth) return true;
     c.rel_depth += 1;
     defer c.rel_depth -= 1;
+    // Release this frame's scratch on the way out, the same way an
+    // `instantiateId` frame does (see `BumpArena`). The relation is the other
+    // deep recursive walk, and the other big scratch consumer: it dupes a
+    // member list and builds property worklists per frame, millions of times
+    // within a single statement, and none of it outlives the `bool` the frame
+    // answers with — the memo lives on the checker arena and elaboration is a
+    // separate re-walk of the failing path (`elaborate.zig`), not a record
+    // kept from this one. The arena is captured rather than re-read because a
+    // nested top-level `instantiate` swaps a different one in for its own
+    // duration.
+    const rel_arena = c.scratch_arena;
+    const rel_mark = rel_arena.mark();
+    defer rel_arena.restore(rel_mark);
     // A polymorphic `this` relates through its apparent instance type. This
     // is a subset simplification (true `this` is nominally narrower than
     // the base), but sound for the fluent/builder patterns we support.
