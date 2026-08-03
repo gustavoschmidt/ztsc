@@ -70,6 +70,7 @@ const libs = @import("libs.zig");
 const modules = @import("link/modules.zig");
 const parser = @import("frontend/parser.zig");
 const ZeroPagedArray = @import("zeropage.zig").ZeroPagedArray;
+pub const BumpArena = @import("checker/bump.zig").BumpArena;
 
 const Ast = ast.Ast;
 const Node = ast.Node;
@@ -637,14 +638,20 @@ pub const Checker = struct {
     /// a region that is released the moment the top-level substitution
     /// finishes — bounding the per-statement scratch high-water to the largest
     /// single instantiation instead of the sum of all of a statement's.
-    scratch_arena: *std.heap.ArenaAllocator,
+    scratch_arena: *BumpArena,
     /// Dedicated arena swapped in for `scratch_arena` while the outermost
     /// `instantiate()` runs; reset (shrunk to `scratch_retain_limit`) at that
     /// call's exit. Never holds anything referenced past the top-level
     /// substitution: results are interned into `ts`, persistent keys into
     /// `carena` (the `canonMapId`/`mintFreshTp` discipline), so the reset frees
     /// only genuinely dead intermediates.
-    inst_arena: *std.heap.ArenaAllocator,
+    ///
+    /// Rewound at a finer grain than that, too: `instantiateId` takes a
+    /// `BumpArena` mark on entry and restores it on exit, so the region holds
+    /// one root-to-leaf path's buffers rather than every buffer the whole
+    /// substitution ever made. See `BumpArena` for why the standard arena
+    /// could not do this and what the discipline costs.
+    inst_arena: *BumpArena,
 
     ts: Store = undefined,
 
@@ -1423,13 +1430,13 @@ pub const Checker = struct {
         errdefer gpa.destroy(c.carena);
         c.carena.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         errdefer c.carena.deinit();
-        c.scratch_arena = try gpa.create(std.heap.ArenaAllocator);
+        c.scratch_arena = try gpa.create(BumpArena);
         errdefer gpa.destroy(c.scratch_arena);
-        c.scratch_arena.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        c.scratch_arena.* = BumpArena.init(std.heap.page_allocator);
         errdefer c.scratch_arena.deinit();
-        c.inst_arena = try gpa.create(std.heap.ArenaAllocator);
+        c.inst_arena = try gpa.create(BumpArena);
         errdefer gpa.destroy(c.inst_arena);
-        c.inst_arena.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        c.inst_arena.* = BumpArena.init(std.heap.page_allocator);
         errdefer c.inst_arena.deinit();
         const arena_alloc = c.carena.allocator();
         // The store's SoA arrays are the checker's other big *growable*
@@ -3220,4 +3227,5 @@ pub const Checker = struct {
 
 test {
     _ = @import("checker/tests.zig");
+    _ = @import("checker/bump.zig");
 }

@@ -1323,6 +1323,21 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
     c.inst_count += 1;
     c.inst_total += 1;
     defer c.inst_depth -= 1;
+    // Release this frame's scratch on the way out. Everything the arms below
+    // allocate — the exact-size worklists, the `memberList` dupes, the
+    // reduction helpers' temporaries — is dead once the frame's answer has
+    // been interned into the type store, but an arena that can only rewind to
+    // empty had to hold all of it until the whole top-level substitution
+    // finished. One kysely builder chain peaked that region above a gigabyte,
+    // nearly all of it already dead. `BumpArena` marks are strictly nested
+    // with the recursion, so restoring here frees this subtree's bytes and
+    // nothing an enclosing frame still holds (its buffers were bumped before
+    // this mark was taken). Only while the dedicated instantiation arena is
+    // swapped in: the shared scratch arena is reset per statement by callers
+    // who do hold buffers across an `instantiate`.
+    const bump_owned = c.scratch_arena == c.inst_arena;
+    const bump_mark = c.inst_arena.mark();
+    defer if (bump_owned) c.inst_arena.restore(bump_mark);
     // Truncation is a property of THIS subtree, so the flag the memoization
     // test below reads has to be scoped to it. It used to be scoped to the
     // whole top-level `instantiate` call and never cleared, which made it
