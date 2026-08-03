@@ -832,21 +832,9 @@ pub fn partialParamCtx(c: *Checker, pt0: TypeId, partial: []const TpMap) Error!T
     const full = try c.instantiate(pt0, partial);
     if (c.ts.kind(full) != .any) return full;
     const r = try c.resolveStructural(pt0);
-    // A parameter that IS a still-un-inferred type variable (`e: E`)
-    // contextually types its argument by the variable's CONSTRAINT, not by the
-    // `any` placeholder standing in for it — tsc's
-    // `getApparentTypeOfContextualType`, which takes the base constraint of a
-    // type variable before looking for a call signature. Without it the
-    // callback form of every builder API — kysely's
-    // `where<E extends ExpressionOrFactory<DB, TB, SqlBool>>(e: E)` — gave its
-    // arrow no contextual signature and reported TS7006 on every parameter.
-    // The placeholder still wins when the constraint says no more than it does.
-    if (c.ts.kind(r) == .type_param) {
-        const con = try c.typeParamConstraint(c.ts.typeParamSymbol(r));
-        if (con == types.no_type) return full;
-        const ci = try c.instantiate(con, partial);
-        return if (c.ts.kind(ci) == .any) full else ci;
-    }
+    // NOTE (diagnosed, landed separately): tsc's
+    // `getApparentTypeOfContextualType` answers a parameter that IS a
+    // still-un-inferred type variable with the variable's CONSTRAINT.
     if (c.ts.kind(r) != .union_type) return full;
     const members = try c.memberList(r);
     var kept: std.ArrayList(TypeId) = .empty;
