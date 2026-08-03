@@ -499,11 +499,108 @@ pub const Bind = struct {
     /// top level first, then every global *augmentation* — so the linker needs
     /// the boundary to reproduce that precedence (modules.zig `mergeGlobals`).
     global_aug_start: u32 = 0,
+    /// Start offset of each atom-sorted run inside `global_atoms`. The slice is
+    /// a *concatenation* of sorted segments (the file scope, the UMD entry,
+    /// then one per `global { … }` block), not one sorted array, and
+    /// `remapAtoms` has to restore exactly that shape after atom ids move.
+    /// Empty means the whole slice is a single run.
+    global_runs: []const u32 = &.{},
+    /// Every atom this file interned or looked up, in first-touch order — the
+    /// file's slice of the program-wide interning order. The driver replays
+    /// these in file order to reassign atom ids deterministically
+    /// (`Interner.renumber`); nothing else reads it, and `remapAtoms`
+    /// deliberately leaves it alone (it is the map's *input*).
+    first_touch: []const Atom = &.{},
     /// `declare module "spec" { … }` blocks in this file. The linker
     /// harvests each block scope's exported members into a program ambient
     /// module keyed by `spec`, which imports of `"spec"` resolve against (and
     /// which augments a real module's exports when `"spec"` also resolves).
     ambient_modules: []const AmbientModule = &.{},
+
+    // --- atom renumbering ----------------------------------------------------
+
+    /// Number of `Bind` fields `remapAtoms` was written against. Bumping this
+    /// is the reminder the test below enforces: a new field that holds an
+    /// `Atom` (directly or inside a record) has to be rewritten here too, or
+    /// the parallel front end ships a file whose names point at the wrong
+    /// strings.
+    const remap_field_count = 37;
+
+    /// Rewrite every atom this file stored through `map` (old atom -> new
+    /// atom), restoring the atom-sorted order of the tables that have one.
+    /// Called once, on the main thread, after `Interner.renumber` and before
+    /// anything reads the file — see main.zig's renumbering block.
+    ///
+    /// `scratch` is used for the re-sorts and can be released on return.
+    pub fn remapAtoms(b: *Bind, scratch: Allocator, map: []const Atom) Error!void {
+        comptime std.debug.assert(@typeInfo(Bind).@"struct".fields.len == remap_field_count);
+
+        for (@constCast(b.symbol_names)) |*a| a.* = map[a.*];
+        for (@constCast(b.imports)) |*rec| {
+            rec.local = map[rec.local];
+            rec.imported = map[rec.imported];
+            rec.module = map[rec.module];
+        }
+        for (@constCast(b.exports)) |*rec| {
+            rec.exported = map[rec.exported];
+            rec.local = map[rec.local];
+            rec.module = map[rec.module];
+        }
+        for (@constCast(b.unresolved)) |*ref| ref.atom = map[ref.atom];
+        for (@constCast(b.ambient_modules)) |*am| am.spec = map[am.spec];
+
+        // The member table is sorted by atom within each scope's segment, and
+        // `lookupInScope` binary-searches it: remap, then restore the order.
+        const members = @constCast(b.member_atoms);
+        const syms = @constCast(b.member_syms);
+        for (members) |*a| a.* = map[a.*];
+        for (0..b.scope_members_start.len - 1) |s| {
+            const lo = b.scope_members_start[s];
+            const hi = b.scope_members_start[s + 1];
+            try sortRun(scratch, members[lo..hi], syms[lo..hi]);
+        }
+
+        // `global_atoms` is either a view of one of those segments (already
+        // done above) or a private concatenation of sorted runs.
+        if (b.global_atoms.len != 0 and !overlaps(b.global_atoms, b.member_atoms)) {
+            const gatoms = @constCast(b.global_atoms);
+            const gsyms = @constCast(b.global_syms);
+            for (gatoms) |*a| a.* = map[a.*];
+            if (b.global_runs.len == 0) {
+                try sortRun(scratch, gatoms, gsyms);
+            } else {
+                for (b.global_runs, 0..) |start, i| {
+                    const end = if (i + 1 < b.global_runs.len) b.global_runs[i + 1] else @as(u32, @intCast(gatoms.len));
+                    try sortRun(scratch, gatoms[start..end], gsyms[start..end]);
+                }
+            }
+        }
+    }
+
+    /// Re-sort one (atom, symbol) run by atom. Names are unique within a run,
+    /// so the order is total and an unstable sort is deterministic.
+    fn sortRun(scratch: Allocator, atoms: []Atom, syms: []SymbolId) Error!void {
+        if (atoms.len < 2) return;
+        const Pair = struct { a: Atom, s: SymbolId };
+        const pairs = try scratch.alloc(Pair, atoms.len);
+        defer scratch.free(pairs);
+        for (pairs, atoms, syms) |*p, a, s| p.* = .{ .a = a, .s = s };
+        std.mem.sort(Pair, pairs, {}, struct {
+            fn lessThan(_: void, x: Pair, y: Pair) bool {
+                return x.a < y.a;
+            }
+        }.lessThan);
+        for (pairs, atoms, syms) |p, *a, *s| {
+            a.* = p.a;
+            s.* = p.s;
+        }
+    }
+
+    fn overlaps(inner: []const Atom, outer: []const Atom) bool {
+        if (outer.len == 0) return false;
+        const p = @intFromPtr(inner.ptr);
+        return p >= @intFromPtr(outer.ptr) and p < @intFromPtr(outer.ptr + outer.len);
+    }
 
     // --- name resolution ---------------------------------------------------
 
@@ -959,6 +1056,8 @@ const Binder = struct {
     /// Per-file atom cache so repeated identifiers don't hit the shared
     /// (mutex-guarded) interner more than once each.
     atom_cache: std.StringHashMapUnmanaged(Atom) = .empty,
+    /// Every atom this file touched, in first-touch order (`Bind.first_touch`).
+    first_touch: std.ArrayList(Atom) = .empty,
 
     cur_scope: ScopeId = file_scope,
     var_scope: ScopeId = file_scope,
@@ -1004,7 +1103,15 @@ const Binder = struct {
     fn atomOf(b: *Binder, text: []const u8) Error!Atom {
         const gop = try b.atom_cache.getOrPut(b.scratch, text);
         if (!gop.found_existing) {
-            gop.value_ptr.* = try b.interner.intern(b.io, b.gpa, text);
+            const a = try b.interner.intern(b.io, b.gpa, text);
+            gop.value_ptr.* = a;
+            // Cache miss == this file's first touch of the string. The list is
+            // the file's contribution to the program-wide interning order the
+            // driver replays to make atom ids independent of worker scheduling
+            // (`Interner.renumber`). Atoms from the frozen prefix — the lib's,
+            // interned before any worker started — never move, so recording
+            // them would only make the replay longer.
+            if (!b.interner.isFrozen(a)) try b.first_touch.append(b.scratch, a);
         }
         return gop.value_ptr.*;
     }
@@ -3194,6 +3301,10 @@ const Binder = struct {
         var global_atoms: []const Atom = &.{};
         var global_syms: []const SymbolId = &.{};
         var global_aug_start: u32 = 0;
+        // Start offset of each atom-sorted run inside `global_atoms` (see
+        // `Bind.global_runs`); left empty when the whole slice is one run.
+        var global_runs: std.ArrayList(u32) = .empty;
+        defer global_runs.deinit(b.scratch);
         {
             // Own (non-augmentation) segment: a script/lib's whole file scope,
             // plus the UMD entry if any. Then the augmentation segment: every
@@ -3221,6 +3332,7 @@ const Binder = struct {
                     cs[fn_ - 1] = umd_sym;
                     global_atoms = ca;
                     global_syms = cs;
+                    try global_runs.appendSlice(b.scratch, &.{ 0, fn_ - 1 });
                 }
             } else if (fn_ == 0 and b.global_scopes.items.len == 1) {
                 const gs = b.global_scopes.items[0];
@@ -3232,7 +3344,9 @@ const Binder = struct {
                 var at: u32 = fhi - flo;
                 @memcpy(ca[0..at], member_atoms[flo..fhi]);
                 @memcpy(cs[0..at], member_syms[flo..fhi]);
+                try global_runs.append(b.scratch, 0);
                 if (umd_atom != 0) {
+                    try global_runs.append(b.scratch, at);
                     ca[at] = umd_atom;
                     cs[at] = umd_sym;
                     at += 1;
@@ -3240,6 +3354,7 @@ const Binder = struct {
                 for (b.global_scopes.items) |gs| {
                     const glo = members_start[gs];
                     const ghi = members_start[gs + 1];
+                    try global_runs.append(b.scratch, at);
                     @memcpy(ca[at .. at + (ghi - glo)], member_atoms[glo..ghi]);
                     @memcpy(cs[at .. at + (ghi - glo)], member_syms[glo..ghi]);
                     at += ghi - glo;
@@ -3329,6 +3444,8 @@ const Binder = struct {
             .global_atoms = global_atoms,
             .global_syms = global_syms,
             .global_aug_start = global_aug_start,
+            .global_runs = try arena.dupe(u32, global_runs.items),
+            .first_touch = try arena.dupe(Atom, b.first_touch.items),
         };
 
         // Resolve recorded references; keep the unresolved ones.
@@ -3413,6 +3530,63 @@ const Binder = struct {
 
 const testing = std.testing;
 const parser = @import("parser.zig");
+
+test "remapAtoms: every Bind field is accounted for" {
+    // A new field holding an `Atom` (directly, or inside a record) must be
+    // rewritten by `remapAtoms`; bump the count once it is.
+    try testing.expectEqual(Bind.remap_field_count, @typeInfo(Bind).@"struct".fields.len);
+}
+
+test "remapAtoms: a renumbered file resolves exactly as it did" {
+    const src =
+        \\declare const zulu: number;
+        \\declare const alpha: string;
+        \\export function mike(kilo: number) { const oscar = kilo; return oscar; }
+        \\export { zulu, alpha };
+        \\declare module "sierra" { export const x: number; }
+    ;
+    var t = try TestBind.init(src);
+    defer t.deinit();
+
+    const before = try t.dumpAlloc(testing.allocator);
+    defer testing.allocator.free(before);
+
+    // Renumber against the reverse of the file's own first-touch order: the
+    // ids move as far as they can, so anything `remapAtoms` forgets shows up.
+    var order: std.ArrayList(Atom) = .empty;
+    defer order.deinit(testing.allocator);
+    var i = t.b.first_touch.len;
+    while (i > 0) : (i -= 1) try order.append(testing.allocator, t.b.first_touch[i - 1]);
+    const rn = try t.interner.renumber(testing.allocator, testing.allocator, order.items);
+    defer testing.allocator.free(rn.map);
+    try testing.expect(!rn.identity);
+    try testing.expectEqual(@as(u32, 0), rn.uncovered);
+    try t.b.remapAtoms(testing.allocator, rn.map);
+
+    // The dump prints names, not ids: same file, same names, same structure.
+    const after = try t.dumpAlloc(testing.allocator);
+    defer testing.allocator.free(after);
+    try testing.expectEqualStrings(before, after);
+
+    // Name resolution goes through the atom-sorted member segments, so it only
+    // works if `remapAtoms` restored their order.
+    for ([_][]const u8{ "zulu", "alpha", "mike" }) |name| {
+        const a = try t.interner.intern(testing.io, testing.allocator, name);
+        try testing.expect(t.b.resolve(a, file_scope) != null);
+    }
+    for (0..t.b.scope_members_start.len - 1) |s| {
+        const lo = t.b.scope_members_start[s];
+        const hi = t.b.scope_members_start[s + 1];
+        for (lo + 1..hi) |k| try testing.expect(t.b.member_atoms[k - 1] < t.b.member_atoms[k]);
+    }
+    // Records carry atoms too.
+    try testing.expect(t.b.ambient_modules.len == 1);
+    try testing.expectEqualStrings("sierra", t.interner.lookup(testing.io, t.b.ambient_modules[0].spec));
+    for (t.b.exports) |rec| {
+        if (rec.exported == 0) continue;
+        try testing.expect(t.interner.lookup(testing.io, rec.exported).len > 0);
+    }
+}
 
 /// Everything needed to bind a source string in a test.
 const TestBind = struct {

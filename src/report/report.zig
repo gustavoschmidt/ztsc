@@ -31,6 +31,8 @@ pub const Phases = struct {
     bind_ns: u64,
     resolve_ns: u64,
     discover_ns: u64,
+    /// Deterministic atom renumbering (main.zig), between discovery and link.
+    renumber_ns: u64 = 0,
     link_ns: u64,
     check_ns: u64,
     total_ns: u64,
@@ -92,6 +94,7 @@ pub fn printTiming(
     try printPhase(out, "bind", phases.bind_ns, repeat_lines, repeat_bytes);
     try printPhase(out, "resolve", phases.resolve_ns, 0, 0);
     try printPhase(out, "discover", phases.discover_ns, lines_f, bytes_f);
+    try printPhase(out, "renumber", phases.renumber_ns, 0, 0);
     try printPhase(out, "link", phases.link_ns, 0, 0);
     try printPhase(out, "check", phases.check_ns, lines_f, bytes_f);
     try out.print("  {s:<10} {d:>10.3}\n", .{ "total", total_ms });

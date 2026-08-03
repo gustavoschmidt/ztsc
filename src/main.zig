@@ -230,6 +230,11 @@ const Completion = struct {
     tree: ?*Ast = null,
     bind: ?*Bind = null,
     err: ?anyerror = null,
+    /// The file's own path, interned before it is parsed — the first string
+    /// this file contributes to the program-wide interning order (see the
+    /// renumbering block below). 0 for the lib shards, whose atoms are already
+    /// pinned, and for a file that never loaded.
+    path_atom: ztsc.intern.Atom = 0,
     load_ns: u64 = 0,
     parse_ns: u64 = 0,
     bind_ns: u64 = 0,
@@ -364,7 +369,7 @@ const Worker = struct {
         c.src = src;
         w.files_loaded += 1;
         // Exercise the shared interner from every worker thread.
-        _ = interner.intern(io, gpa, path) catch |err| {
+        c.path_atom = interner.intern(io, gpa, path) catch |err| {
             c.err = err;
             return;
         };
@@ -724,6 +729,9 @@ pub fn main(init: std.process.Init) !void {
     var trees: std.ArrayList(?*Ast) = .empty;
     var binds: std.ArrayList(?*Bind) = .empty;
     var errs: std.ArrayList(?anyerror) = .empty;
+    // Per-file path atom, in the order the front end interned it (first for
+    // the file); feeds the deterministic renumbering after discovery.
+    var path_atoms: std.ArrayList(ztsc.intern.Atom) = .empty;
     var spec_atoms_all: std.ArrayList([]ztsc.intern.Atom) = .empty;
     var spec_files_all: std.ArrayList([]modules.FileId) = .empty;
     // Per-file resolved FileIds in first-occurrence specifier order
@@ -737,6 +745,7 @@ pub fn main(init: std.process.Init) !void {
     var parse_ns: u64 = 0;
     var bind_ns: u64 = 0;
     var resolve_ns: u64 = 0;
+    var renumber_ns: u64 = 0;
 
     var work = Channel(WorkItem).init(io);
     defer work.deinit();
@@ -760,6 +769,13 @@ pub fn main(init: std.process.Init) !void {
     defer lib_fe.deinit();
     const lib_units = lib_fe.units;
 
+    // Everything interned up to here came from a single-threaded phase, so its
+    // ids are already the same on every run and the lib's sealed binder output
+    // (which is kept, never re-bound) can keep pointing at them. Ids handed out
+    // past this point are scheduling-dependent and get reassigned once
+    // discovery is done — see the renumbering block below.
+    interner.freezePrefix();
+
     const discover_timer = Timer.start(io);
     for (workers) |*w| {
         w.thread = try std.Thread.spawn(.{}, Worker.discoverRun, .{
@@ -768,7 +784,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var outstanding: usize = 0;
-    try growPerFile(arena, paths.items.len, &results, &trees, &binds, &errs, &spec_atoms_all, &spec_files_all, &edge_lists, &type_ref_misses_all);
+    try growPerFile(arena, paths.items.len, &results, &trees, &binds, &errs, &path_atoms, &spec_atoms_all, &spec_files_all, &edge_lists, &type_ref_misses_all);
     // The lib shards hold file ids 0..lib_units.len and are already
     // front-ended, so they enter the discovery loop as ready-made completions
     // instead of as work. Everything downstream — specifier resolution,
@@ -807,6 +823,7 @@ pub fn main(init: std.process.Init) !void {
         trees.items[i] = c.tree;
         binds.items[i] = c.bind;
         errs.items[i] = c.err;
+        path_atoms.items[i] = c.path_atom;
         load_ns += c.load_ns;
         parse_ns += c.parse_ns;
         bind_ns += c.bind_ns;
@@ -912,7 +929,7 @@ pub fn main(init: std.process.Init) !void {
         spec_files_all.items[i] = files.items;
 
         // Enqueue newly discovered files right away.
-        try growPerFile(arena, paths.items.len, &results, &trees, &binds, &errs, &spec_atoms_all, &spec_files_all, &edge_lists, &type_ref_misses_all);
+        try growPerFile(arena, paths.items.len, &results, &trees, &binds, &errs, &path_atoms, &spec_atoms_all, &spec_files_all, &edge_lists, &type_ref_misses_all);
         for (known_before..paths.items.len) |nf| {
             try work.push(.{ .file = @intCast(nf), .path = paths.items[nf] });
             outstanding += 1;
@@ -959,6 +976,7 @@ pub fn main(init: std.process.Init) !void {
         try permuteInPlace(?*Ast, arena, trees.items, order);
         try permuteInPlace(?*Bind, arena, binds.items, order);
         try permuteInPlace(?anyerror, arena, errs.items, order);
+        try permuteInPlace(ztsc.intern.Atom, arena, path_atoms.items, order);
         try permuteInPlace([]ztsc.intern.Atom, arena, spec_atoms_all.items, order);
         try permuteInPlace([]modules.FileId, arena, spec_files_all.items, order);
         try permuteInPlace([]const modules.TypeRefMiss, arena, type_ref_misses_all.items, order);
@@ -969,6 +987,57 @@ pub fn main(init: std.process.Init) !void {
                 if (fid.* != modules.no_file) fid.* = new_ids[fid.*];
             }
         }
+    }
+
+    // --- Deterministic atom ids (file order, not scheduling order) --------
+    // An `Atom` encodes its shard-local insertion index, and the front end
+    // interns from every worker at once, so the ids a run hands out depend on
+    // which worker got there first. Atoms are sort keys downstream — a scope's
+    // member table, a merged namespace's member index, an object type's
+    // property records — so that scheduling noise reached the checker as a
+    // different *traversal order*, and (through the assignability memo's
+    // in-progress marks) a different set of walked subtrees. Diagnostics never
+    // moved, but the work counters did, and a program sitting on the
+    // instantiation budget could have tipped either way.
+    //
+    // The fix is to assign the ids a single-threaded front end would have.
+    // Each file recorded the atoms it touched in first-touch order
+    // (`Bind.first_touch`, preceded by its own path); replaying those lists in
+    // the program's graph-derived file order is exactly the sequence a serial
+    // run interns in, so `Interner.renumber` can hand out the serial ids and
+    // every table sorted by atom lands where the serial run put it. Serial
+    // runs get an identity permutation and skip the rewrite entirely.
+    {
+        const renumber_timer = Timer.start(io);
+        var order: std.ArrayList(ztsc.intern.Atom) = .empty;
+        defer order.deinit(gpa);
+        // The lib shards are bound before the pool starts; their atoms are in
+        // the frozen prefix and never move.
+        for (lib_units.len..n_files) |i| {
+            if (path_atoms.items[i] != 0) try order.append(gpa, path_atoms.items[i]);
+            if (binds.items[i]) |b| try order.appendSlice(gpa, b.first_touch);
+        }
+        const rn = try interner.renumber(gpa, gpa, order.items);
+        defer gpa.free(rn.map);
+        if (rn.uncovered != 0) {
+            // An interning site the replay does not know about: the id space is
+            // scheduling-dependent again. Loud, because nothing downstream can
+            // detect it.
+            std.debug.print(
+                "ztsc: internal: {d} atom(s) outside the recorded interning order\n",
+                .{rn.uncovered},
+            );
+        }
+        if (!rn.identity) {
+            for (binds.items[lib_units.len..]) |maybe_bind| {
+                if (maybe_bind) |b| try b.remapAtoms(gpa, rn.map);
+            }
+            for (spec_atoms_all.items, spec_files_all.items) |spec_atoms, spec_files| {
+                for (spec_atoms) |*a| a.* = rn.map[a.*];
+                sortSpecPairs(spec_atoms, spec_files);
+            }
+        }
+        renumber_ns = renumber_timer.readNs();
     }
 
     // --- Link (serial): program assembly + import/export tables ----------
@@ -1486,6 +1555,7 @@ pub fn main(init: std.process.Init) !void {
             .bind_ns = bind_ns,
             .resolve_ns = resolve_ns,
             .discover_ns = discover_ns,
+            .renumber_ns = renumber_ns,
             .link_ns = link_ns,
             .check_ns = check_ns,
             .total_ns = total_ns,
@@ -1594,6 +1664,7 @@ fn growPerFile(
     trees: *std.ArrayList(?*Ast),
     binds: *std.ArrayList(?*Bind),
     errs: *std.ArrayList(?anyerror),
+    path_atoms: *std.ArrayList(ztsc.intern.Atom),
     spec_atoms_all: *std.ArrayList([]ztsc.intern.Atom),
     spec_files_all: *std.ArrayList([]modules.FileId),
     edge_lists: *std.ArrayList([]const modules.FileId),
@@ -1604,6 +1675,7 @@ fn growPerFile(
         try trees.append(arena, null);
         try binds.append(arena, null);
         try errs.append(arena, null);
+        try path_atoms.append(arena, 0);
         try spec_atoms_all.append(arena, &.{});
         try spec_files_all.append(arena, &.{});
         try edge_lists.append(arena, &.{});
