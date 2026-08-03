@@ -2648,6 +2648,7 @@ pub const Checker = struct {
     pub const setTypeOfSymbol = signatures_zig.setTypeOfSymbol;
     pub const computeTypeOfSymbol = signatures_zig.computeTypeOfSymbol;
     pub const withExpandoProps = signatures_zig.withExpandoProps;
+    pub const callableClassValue = signatures_zig.callableClassValue;
     pub const expandoMemberType = signatures_zig.expandoMemberType;
     pub const mergedFunctionValue = signatures_zig.mergedFunctionValue;
     pub const appendOverloadCandidates = signatures_zig.appendOverloadCandidates;

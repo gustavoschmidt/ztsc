@@ -87,6 +87,12 @@ pub const Code = enum(u16) {
     block_scoped_redeclare,
     /// TS2393: two function (or method) declarations with bodies.
     duplicate_function_implementation,
+    /// TS2813: a class declaration merged with function declarations of the
+    /// same name, and the class is not ambient. Reported on the class.
+    class_cannot_implement_overloads,
+    /// TS2814: the function half of that same merge. Reported on each
+    /// function declaration.
+    function_merge_needs_ambient_class,
     /// TS2440: import binding clashes with a local declaration.
     import_conflict,
     /// TS2492: redeclaring a catch-clause parameter in the catch block.
@@ -147,6 +153,8 @@ pub const Code = enum(u16) {
             .duplicate_identifier => "duplicate identifier",
             .block_scoped_redeclare => "cannot redeclare block-scoped variable",
             .duplicate_function_implementation => "duplicate function implementation",
+            .class_cannot_implement_overloads => "Class declaration cannot implement overload list.",
+            .function_merge_needs_ambient_class => "Function with bodies can only merge with classes that are ambient.",
             .import_conflict => "import declaration conflicts with local declaration",
             .catch_redeclare => "cannot redeclare identifier in catch clause",
             .unsupported_syntax => "syntax not yet supported by ztsc",
@@ -161,6 +169,8 @@ pub const Code = enum(u16) {
             .duplicate_identifier => 2300,
             .block_scoped_redeclare => 2451,
             .duplicate_function_implementation => 2393,
+            .class_cannot_implement_overloads => 2813,
+            .function_merge_needs_ambient_class => 2814,
             .import_conflict => 2440,
             .catch_redeclare => 2492,
             .decorator_not_valid_here => 1206,

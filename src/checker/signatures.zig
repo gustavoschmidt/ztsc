@@ -871,6 +871,20 @@ pub fn computeTypeOfSymbol(c: *Checker, sym: SymbolId) Error!TypeId {
         // `setInterval(): NodeJS.Timeout`) merges into one overload set,
         // node's signatures first — see `mergedFunctionValue`.
         if (try c.mergedFunctionValue(m.parts)) |ft| return ft;
+        // A callable class split across files (`class C` here, `function C`
+        // overloads there): keep both signature sets, call side first, the
+        // same shape the same-file merge takes in `callableClassValue`.
+        if (m.flags.class and m.flags.function) {
+            var cls: TypeId = types.no_type;
+            var fnv: TypeId = types.no_type;
+            for (m.parts) |p| {
+                const pf = c.symFlags(p);
+                if (pf.class and cls == types.no_type) cls = try c.ts.makeClassValue(p);
+                if (pf.function and fnv == types.no_type) fnv = try c.functionSymbolType(p);
+            }
+            if (cls != types.no_type and fnv != types.no_type)
+                return c.ts.makeIntersection(c.scratch(), &.{ fnv, cls });
+        }
         for (m.parts) |p| {
             if (hasValueMeaning(c.symFlags(p))) return c.typeOfSymbol(p);
         }
@@ -886,7 +900,12 @@ pub fn computeTypeOfSymbol(c: *Checker, sym: SymbolId) Error!TypeId {
     // the namespace object.
     if (f.namespace_decl) {
         const ns_val = try c.ts.makeClassValue(sym);
-        if (f.class) return ns_val;
+        if (f.class) {
+            // `class_value` already carries the namespace's static members;
+            // a callable class still needs its call signatures folded in.
+            if (!f.function) return ns_val;
+            return c.ts.makeIntersection(c.scratch(), &.{ try c.functionSymbolType(sym), ns_val });
+        }
         if (f.function) return c.ts.makeIntersection(c.scratch(), &.{ try c.functionSymbolType(sym), ns_val });
         if (f.enum_decl) return c.ts.makeIntersection(c.scratch(), &.{ try c.enumValueType(sym), ns_val });
         // Same-file `var X: T` + `namespace X {…}` (a namespace merged onto a
@@ -896,7 +915,7 @@ pub fn computeTypeOfSymbol(c: *Checker, sym: SymbolId) Error!TypeId {
         return ns_val;
     }
     if (f.enum_decl) return c.enumValueType(sym);
-    if (f.class) return c.ts.makeClassValue(sym);
+    if (f.class) return c.callableClassValue(sym, f);
     if (f.function) return c.withExpandoProps(sym, try c.functionSymbolType(sym));
     if (f.expando_member) return c.expandoMemberType(sym);
     if (f.property or f.method or f.getter or f.setter) return c.memberTypeOf(sym);
@@ -935,6 +954,26 @@ pub fn computeTypeOfSymbol(c: *Checker, sym: SymbolId) Error!TypeId {
     if (f.var_decl or f.let_decl or f.const_decl)
         return c.withExpandoProps(sym, try c.variableSymbolType(sym));
     return types.any_type;
+}
+
+/// The value (`typeof C`) side of a class symbol. Normally just the
+/// `class_value` — construct signatures, statics, and the namespace members
+/// of anything merged onto it.
+///
+/// A class that ALSO carries `function` declarations is tsc's *callable
+/// class*: `ClassExcludes` omits `Function` (and `FunctionExcludes` omits
+/// `Class`), so a `.d.ts` may declare call signatures next to the class to
+/// describe a constructor that also works without `new` — ua-parser-js's
+/// `function UAParser(…): IResult` overloads next to `class UAParser`, then
+/// `export = UAParser`. tsc's `resolveAnonymousTypeMembers` gives the merged
+/// symbol both signature sets; here the callable half is intersected in, the
+/// same shape a function merged with a namespace already uses. Call
+/// signatures come first so overload resolution sees them in declaration
+/// order.
+pub fn callableClassValue(c: *Checker, sym: SymbolId, f: binder.SymbolFlags) Error!TypeId {
+    const cls = try c.ts.makeClassValue(sym);
+    if (!f.function) return cls;
+    return c.ts.makeIntersection(c.scratch(), &.{ try c.functionSymbolType(sym), cls });
 }
 
 /// Fold a function value's *expando* properties into its type: the

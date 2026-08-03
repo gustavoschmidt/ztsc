@@ -167,7 +167,14 @@ pub const SymbolFlags = packed struct(u32) {
     /// tokens before the parameter's name at bind time (`bindTypeParams`), so
     /// the checker's per-argument test is one flag load.
     const_type_param: bool = false,
-    _pad: u4 = 0,
+    /// At least one of this symbol's `class` declarations is NOT in an
+    /// ambient context. Only consulted by the function/class merge check
+    /// (TS2813/TS2814): tsc lets a class merge with function declarations
+    /// so a `.d.ts` can model a callable class (`ClassExcludes` omits
+    /// `Function` and vice-versa), but the pair is an error unless every
+    /// class declaration is ambient.
+    nonambient_class: bool = false,
+    _pad: u3 = 0,
 
     pub fn bits(f: SymbolFlags) u32 {
         return @bitCast(f);
@@ -269,8 +276,16 @@ const DeclKind = enum {
             // kinds whitelist the namespace bit here (and vice-versa below).
             .var_decl => mask_value & ~(fbits(.{ .var_decl = true }) | fbits(.{ .param = true })),
             .let_decl, .const_decl => mask_value,
-            .function => mask_value & ~(fbits(.{ .function = true }) | fbits(.{ .namespace_decl = true })),
-            .class => (mask_value & ~(fbits(.{ .class = true }) | fbits(.{ .namespace_decl = true }))) |
+            // A function also merges with a *class* — tsc's `FunctionExcludes`
+            // omits `Class` and `ClassExcludes` omits `Function`, so a `.d.ts`
+            // can model a callable class (`function UAParser(…): IResult` next
+            // to `class UAParser`). The pair is only legal when every class
+            // declaration is ambient; `checkFunctionClassMerge` reports
+            // TS2813/TS2814 otherwise.
+            .function => mask_value & ~(fbits(.{ .function = true }) |
+                fbits(.{ .namespace_decl = true }) | fbits(.{ .class = true })),
+            .class => (mask_value & ~(fbits(.{ .class = true }) |
+                fbits(.{ .namespace_decl = true }) | fbits(.{ .function = true }))) |
                 (mask_type & ~(fbits(.{ .interface = true }) | fbits(.{ .namespace_decl = true }))),
             .interface => mask_type & ~(fbits(.{ .interface = true }) | fbits(.{ .class = true }) |
                 fbits(.{ .namespace_decl = true })),
@@ -1362,6 +1377,9 @@ const Binder = struct {
                 if (flags.has_impl and existing.has_impl) {
                     try b.diag(.duplicate_function_implementation, name_tok);
                 }
+                try b.checkFunctionClassMerge(sym, existing, flags, name_tok);
+            } else if (kind == .class) {
+                try b.checkFunctionClassMerge(sym, existing, flags, name_tok);
             }
             b.sym_flags.items[sym] = existing.merge(flags);
             try b.appendDecl(sym, decl_node);
@@ -1380,6 +1398,63 @@ const Binder = struct {
         try b.appendDecl(sym, decl_node);
         try b.noteExport(sym, atom, scope);
         return sym;
+    }
+
+    /// The function/class merge check, tsc's `checkFunctionOrConstructorSymbol`
+    /// arm for `hasNonAmbientClass`. The binder lets the two kinds merge (a
+    /// `.d.ts` models a callable class that way — ua-parser-js declares
+    /// `function UAParser(…): IResult` overloads next to `class UAParser`), but
+    /// the pair is only legal when the class is ambient. Otherwise the class
+    /// gets TS2813 and *every* function declaration gets TS2814, whether or not
+    /// it has a body — verified against tsgo 7.0.2 in both declaration orders.
+    ///
+    /// `existing` is the symbol's flags *before* this declaration merges in and
+    /// `incoming` the new declaration's, so "the class half was already
+    /// reported" is exactly `existing.function` — the class arm runs once, when
+    /// the two kinds first meet.
+    fn checkFunctionClassMerge(
+        b: *Binder,
+        sym: SymbolId,
+        existing: SymbolFlags,
+        incoming: SymbolFlags,
+        name_tok: TokenIndex,
+    ) Error!void {
+        if (incoming.class) {
+            // A class landing on an existing function set.
+            if (!existing.function or !incoming.nonambient_class) return;
+            try b.diag(.class_cannot_implement_overloads, name_tok);
+            try b.diagMergedDecls(sym, .function_decl, .function_merge_needs_ambient_class);
+            return;
+        }
+        // A function/method landing on an existing class.
+        if (!existing.nonambient_class) return;
+        try b.diag(.function_merge_needs_ambient_class, name_tok);
+        // Only the first function of the merge reports the class half; a
+        // second overload would otherwise repeat TS2813 on the same class.
+        // (A symbol never has two class declarations — `ClassExcludes`
+        // includes `Class` — so the single non-ambient one is the target.)
+        if (!existing.function)
+            try b.diagMergedDecls(sym, .class_decl, .class_cannot_implement_overloads);
+    }
+
+    /// Report `code` at the name of every declaration of `sym` whose node tag
+    /// is `tag`. Used by the function/class merge check, which reports on
+    /// declarations bound *before* the one that closed the merge.
+    fn diagMergedDecls(b: *Binder, sym: SymbolId, tag: ast.Tag, code: Code) Error!void {
+        var link = b.sym_decl_head.items[sym];
+        while (link != 0) {
+            const l = b.decl_links.items[link];
+            link = l.next;
+            const node = l.value;
+            if (b.tree.nodeTag(node) != tag) continue;
+            const d = b.tree.nodeData(node);
+            const tok: TokenIndex = switch (tag) {
+                .function_decl => b.tree.extraData(ast.FnProto, d.lhs).name_token,
+                .class_decl => b.tree.extraData(ast.ClassData, d.lhs).name_token,
+                else => 0,
+            };
+            if (tok != 0) try b.diag(code, tok);
+        }
     }
 
     /// While binding the names of `export <decl>`, emit an export record
@@ -2131,7 +2206,13 @@ const Binder = struct {
         var class_sym: SymbolId = no_symbol;
         if (declare_name and data.name_token != 0) {
             const atom = try b.atomOfToken(data.name_token);
-            class_sym = try b.declare(b.cur_scope, atom, .class, node, data.name_token, .{});
+            // Ambient-ness decides whether a merge with function declarations
+            // of the same name is legal (see `checkFunctionClassMerge`): a
+            // `.d.ts`, a `declare namespace` body, or an explicit `declare`.
+            const is_ambient = b.ambient or (data.flags & ast.Flags.declare) != 0;
+            class_sym = try b.declare(b.cur_scope, atom, .class, node, data.name_token, .{
+                .nonambient_class = !is_ambient,
+            });
         }
         const saved = b.saveState();
         const clear_export = b.exporting_node;
