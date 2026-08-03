@@ -1415,14 +1415,30 @@ pub fn inferTypeArgs(
             // `selectAll("asset")` key to `string` — which then indexed the
             // schema to nothing and made the whole row type `{}`.
             const widen_bound: TypeId = if (c.isFreshTp(tp)) c.freshTp(tp).widen_bound else types.no_type;
+            const primitive_constraint = c.isConstTypeParamSym(tp) or
+                try c.constraintIsPrimitive(constraint) or
+                try c.constraintIsPrimitive(widen_bound);
             if (sig_ret != types.no_type and
                 top_flags[i] and
-                !c.isConstTypeParamSym(tp) and
-                !try c.constraintIsPrimitive(constraint) and
-                !try c.constraintIsPrimitive(widen_bound) and
+                !primitive_constraint and
                 !try c.typeParamAtTopLevel(sig_ret, tp))
             {
                 out[i] = try c.widenLiteral(out[i]);
+            } else if (primitive_constraint) {
+                // tsc's `getCovariantInference` is a three-way choice, and the
+                // arm above is only its middle one:
+                //     primitiveConstraint ? sameMap(candidates, getRegularTypeOfLiteralType)
+                //   : widenLiteralTypes  ? sameMap(candidates, getWidenedLiteralType)
+                //   : candidates
+                // A param whose constraint KEEPS the literal still loses its
+                // FRESHNESS. Both variants intern separately here, so a fresh
+                // `"album"` inferred for `<T extends keyof DB>` is a different
+                // TypeId from the `"album"` inside `keyof DB` — and a union of
+                // the two (kysely's `From<DB, TE>` maps over `keyof DB |
+                // ExtractAlias<DB, TE>`) failed to dedupe, materializing the
+                // same key twice. Only the un-widened arm needs this: widening
+                // already yields the regular base primitive.
+                out[i] = try c.ts.regularLiteral(out[i]);
             }
             // Candidate violating the constraint falls back to the
             // constraint (tsc then re-checks args against it). But skip
