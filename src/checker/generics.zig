@@ -1996,7 +1996,29 @@ pub fn materializeMapped(c: *Checker, key_param: TypeId, constraint: TypeId, val
                 }
                 try props.append(c.scratch(), .{ .name = nm, .ty = pt, .flags = applyPropModifiers(base, flags) });
             },
-            else => {}, // non-key member (e.g. symbol) — skip
+            // A key that is not usable as a property name on its own. With
+            // an `as` clause it still names a property: tsc's
+            // `addMemberForKeyType` computes the name by instantiating the
+            // name type with the key and only then asks whether the RESULT
+            // is usable, so the key itself may be any type at all.
+            //
+            // kysely's `Selection<DB, TB, SE> = { [E in SE as
+            // ExtractAliasFromSelectExpression<E>]: … }` iterates SELECT
+            // EXPRESSIONS — column strings, aliased-expression objects, and
+            // `(eb) => …` callbacks — and reads each one's column alias out
+            // of it with a conditional. Skipping every non-literal key
+            // dropped the object and callback forms outright, so
+            // `.select((eb) => ….as('stack'))` contributed nothing to the
+            // row type and every later read of that column was a TS2339.
+            // Without an `as` clause there is nothing to derive a name
+            // from, and a non-key member (a symbol, an object) is skipped
+            // as before.
+            else => {
+                if (as_clause == 0) continue;
+                const name = (try c.remapKey(as_clause, key_id, key_lit)) orelse continue;
+                const pt = try c.substMappedKey(value, key_id, key_lit);
+                try props.append(c.scratch(), .{ .name = name, .ty = pt, .flags = applyPropModifiers(0, flags) });
+            },
         }
     }
     if (props.items.len == 0 and sindex == 0 and nindex == 0) return types.empty_object_type;
