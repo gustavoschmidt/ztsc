@@ -1386,6 +1386,15 @@ pub fn checkTypeArgConstraints(c: *Checker, sym: SymbolId, args: []const TypeId,
             c.cur_scope = c.symScope(tp.sym);
             con = try c.typeFromTypeNode(tp.constraint);
         }
+        // A constraint WRITTEN in terms of `this` is undecidable here for the
+        // same reason a `this` argument is (see `undecidableType`): its meaning
+        // depends on the instantiating class, and a `this` operand keeps every
+        // conditional over it deferred, so instantiating it under this
+        // reference's arguments re-expands without ever reducing. Asked before
+        // the instantiation, which is the part that ran away — the two residual
+        // TS2589s on drizzle's `PgSelectQueryBuilderBase` / `SQLiteSelectBase`
+        // heritage clauses were exactly this.
+        if (try c.containsThisType(con)) continue;
         con = try c.instantiate(con, map_list.items);
         if (!try c.decidableConstraintSet(con)) continue;
         if (try c.isAssignable(arg, con)) continue;
@@ -1528,6 +1537,17 @@ pub fn undecidableType(c: *Checker, t: TypeId) Error!bool {
         switch (s.kind(cur)) {
             .err,
             .type_param,
+            // A polymorphic `this` is a type VARIABLE — that is what
+            // `typeFromTypeNode`'s `.this_expr` arm establishes — and belongs
+            // beside `.type_param` for exactly the reason the doc comment
+            // gives: whether `this` satisfies a bound is a question about the
+            // class's own resolution, decided over a self-reference whose
+            // parameters are still their own bounds, not about the code.
+            // drizzle writes `NotNull<this>` / `$Type<this, T>` on nearly every
+            // column-builder method, and judging those produced 45 false
+            // TS2344s ("Type 'this' does not satisfy the constraint …") plus
+            // two TS2589s from the scans they provoked.
+            .this_type,
             .infer_var,
             .mapped_param,
             .conditional,

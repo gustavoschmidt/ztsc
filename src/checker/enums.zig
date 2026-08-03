@@ -1590,6 +1590,17 @@ pub fn substThis(c: *Checker, t: TypeId, repl: TypeId) Error!TypeId {
     if (!c.has_this_types) return t;
     if (!try c.containsThisType(t)) return t;
     if (c.inst_depth > max_instantiation_depth) return types.error_type;
+    const memo_key = (@as(u64, t) << 32) | repl;
+    if (c.subst_this_cache.get(memo_key)) |m| return m;
+    const r = try substThisInner(c, t, repl);
+    // A truncated answer is depth-dependent, not a function of the pair — the
+    // rule `inst_cache` follows.
+    if (!c.inst_limit_tripped) try c.subst_this_cache.put(c.cm(), memo_key, r);
+    return r;
+}
+
+fn substThisInner(c: *Checker, t: TypeId, repl: TypeId) Error!TypeId {
+    if (c.inst_depth > max_instantiation_depth) return types.error_type;
     c.inst_depth += 1;
     defer c.inst_depth -= 1;
     const s = &c.ts;

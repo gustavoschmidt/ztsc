@@ -561,28 +561,29 @@ pub const MappedKeyScope = struct {
 /// `deinit` cannot fall behind the field set: a container added to `Checker`
 /// and fed from `cm()` but forgotten here leaks its whole table.
 pub const map_containers = [_][]const u8{
-    "node_types",               "sig_cache",              "node_scopes",
-    "reassigned_syms",          "reassigned_in_loop",     "member_written_syms",
-    "member_written_in_loop",   "ns_types",               "ambient_ns_types",
-    "relation",                 "expansions",             "overload_rotate",
-    "origin",                   "iface_generic",          "iface_stack",
-    "pending_class_decos",      "class_inst_generic",     "class_static_cache",
-    "class_static_base_active", "class_ctor_cache",       "enum_value_cache",
-    "enum_info_cache",          "alias_generic",          "alias_state",
-    "alias_recursive",          "flow_same",              "flow_narrow",
-    "ref_keys",                 "flow_loop_stack",        "flow_stack",
-    "flow_tmp",                 "da_cache",               "ctp_cache",
-    "cmp_cache",                "ctt_cache",              "ci_cache",
-    "infer_visited",            "mmp_cache",              "inst_cache",
-    "arrayish_elem_cache",      "inst_map_ids",           "tp_constraint_cache",
-    "fresh_tp_ids",             "fresh_tp_info",          "type_node_cache",
-    "atom_cache",               "infer_ids",              "infer_scopes",
-    "mapped_key_ids",           "mapped_key_scopes",      "inst_diag_at",
-    "infer_active",             "lazy_member_active",     "chain_guards",
-    "never_isect",              "deep_path_list",         "deep_path_ids",
-    "flow_reach",               "member_type_stack",      "lazy_index_objs",
-    "pending_type_args",        "pending_type_args_pool", "pending_type_args_seen",
-    "tp_constrained_cache",     "nominal_bases",          "nominal_base_pool",
+    "node_types",               "sig_cache",            "node_scopes",
+    "reassigned_syms",          "reassigned_in_loop",   "member_written_syms",
+    "member_written_in_loop",   "ns_types",             "ambient_ns_types",
+    "relation",                 "expansions",           "overload_rotate",
+    "origin",                   "iface_generic",        "iface_stack",
+    "pending_class_decos",      "class_inst_generic",   "class_static_cache",
+    "class_static_base_active", "class_ctor_cache",     "enum_value_cache",
+    "enum_info_cache",          "alias_generic",        "alias_state",
+    "alias_recursive",          "flow_same",            "flow_narrow",
+    "ref_keys",                 "flow_loop_stack",      "flow_stack",
+    "flow_tmp",                 "da_cache",             "ctp_cache",
+    "cmp_cache",                "ctt_cache",            "ci_cache",
+    "infer_visited",            "subst_this_cache",     "mmp_cache",
+    "inst_cache",               "arrayish_elem_cache",  "tp_constraint_cache",
+    "inst_map_ids",             "fresh_tp_ids",         "fresh_tp_info",
+    "type_node_cache",          "atom_cache",           "infer_ids",
+    "infer_scopes",             "mapped_key_ids",       "mapped_key_scopes",
+    "inst_diag_at",             "infer_active",         "lazy_member_active",
+    "chain_guards",             "never_isect",          "deep_path_list",
+    "deep_path_ids",            "flow_reach",           "member_type_stack",
+    "lazy_index_objs",          "pending_type_args",    "pending_type_args_pool",
+    "pending_type_args_seen",   "tp_constrained_cache", "nominal_bases",
+    "nominal_base_pool",
 };
 
 /// Where one symbol's declared heritage lives in `Checker.nominal_base_pool`.
@@ -942,6 +943,17 @@ pub const Checker = struct {
     /// depth cut? A truncated walk is not a complete answer, so its
     /// `infer_visited` entry must never let a shallower repeat be skipped.
     infer_trunc: bool = false,
+    /// Recursive `inferFromExtends` calls made by the in-flight inference root.
+    /// Its guards arm only past `max_infer_steps` — see the escape hatch there.
+    infer_steps: u64 = 0,
+    /// `substThis` memo, keyed `(t << 32 | repl)`. Substituting a receiver into
+    /// a member type is a pure function of the two interned ids, and the walk
+    /// REBUILDS whole object shapes — drizzle's query builders declare `this`
+    /// on nearly every member, so the same interface was rebuilt once per
+    /// property access. Never populated for a result computed under a tripped
+    /// instantiation limit (that answer is depth-dependent, not a function of
+    /// the pair) — the same rule `inst_cache` follows.
+    subst_this_cache: std.AutoHashMapUnmanaged(u64, TypeId) = .empty,
     /// containsInfer memo, dense like `ctp_cache`. `inferFromExtends` now asks
     /// it at every step (the `couldContainTypeVariables` prune), and the walk
     /// itself is a full structural descent, so it has to be O(1) on a repeat.

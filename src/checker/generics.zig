@@ -177,8 +177,8 @@ pub fn reduceConditional(c: *Checker, chk: TypeId, extends_ty: TypeId, true_ty: 
     // `typeFromTypeNode`. Resolving it early against the home instance both
     // re-enters that instance's still-open member table and loses the
     // subclass receiver a later `substThis` would supply.
-    const ext_generic = try c.containsFreeTypeParam(extends_ty, &.{}) or try c.containsMappedParam(extends_ty) or try c.containsThisType(extends_ty);
-    const chk_generic = try c.containsFreeTypeParam(chk, &.{}) or try c.containsMappedParam(chk) or try c.containsThisType(chk);
+    const ext_generic = try c.containsFreeTypeParam(extends_ty, &.{}) or try c.containsMappedParam(extends_ty) or (c.ts.kind(extends_ty) == .this_type);
+    const chk_generic = try c.containsFreeTypeParam(chk, &.{}) or try c.containsMappedParam(chk) or (c.ts.kind(chk) == .this_type);
     if (chk_generic or ext_generic) {
         // Narrow decidability carve-out (see objectDecidablyNotExtends): a
         // concrete-shaped object check whose free params live only in
@@ -289,9 +289,14 @@ pub fn resolveConcreteConditional(c: *Checker, chk: TypeId, extends_ty: TypeId, 
         // on exit so an inference re-entered from inside this one (through an
         // `instantiate` in the walk) cannot invalidate the outer one's.
         const saved_gen = c.infer_gen;
+        const saved_steps = c.infer_steps;
         c.infer_gen = c.infer_gen_next;
         c.infer_gen_next +%= 1;
-        defer c.infer_gen = saved_gen;
+        c.infer_steps = 0;
+        defer {
+            c.infer_gen = saved_gen;
+            c.infer_steps = saved_steps;
+        }
         try c.inferFromExtends(chk, extends_ty, ids.items, vals, false, 0);
         for (vals) |*v| {
             if (v.* == types.no_type) v.* = types.unknown_type; // unmatched → unknown
@@ -466,19 +471,31 @@ pub fn inferFromExtends(c: *Checker, source0: TypeId, pattern: TypeId, ids: []co
         c.infer_trunc = true;
         return;
     }
+    // RUNAWAY ESCAPE HATCH. Both guards below are sound in isolation — neither
+    // can lose a candidate — but they are not INERT: skipping a subtree changes
+    // the order in which types are first expanded, and several memos here
+    // (`alias_generic`, `iface_generic`, the relation memo) permanently record
+    // whatever a cycle cut answered at that moment. Enabling them everywhere
+    // moved drizzle-orm's parity by 46 keys (45 TS2344 + a TS2589) with no
+    // candidate lost anywhere — and drizzle is ratcheted at absolute zero.
+    //
+    // So they arm only once ONE inference has already made
+    // `max_infer_steps` recursive calls. Below that line every walk is
+    // byte-identical to what it was; above it the alternative is not a
+    // different answer but no answer at all (kysely's `ExpressionOrFactory`
+    // match ran for minutes and took 77 GB of instantiation scratch). This is
+    // the same shape as `max_infer_depth` right above: a ceiling on a walk that
+    // has left the range where exhaustiveness is affordable, not a change to
+    // what the walk means.
+    c.infer_steps +%= 1;
+    const runaway = c.infer_steps > max_infer_steps;
     // tsc's `inferFromTypes` opens with `if (!couldContainTypeVariables(target))
     // return;` — a walk into a target that holds no inference variable can only
     // recurse and find nothing, since the ONLY arm that writes a candidate is
-    // `.infer_var`. So this is a pure prune, and the one that makes the
-    // function affordable: without it the recursion descends the whole
-    // structural closure of the pattern, branching once per property and once
-    // per signature return, and bottoms out only on the depth cap. On kysely's
-    // builder types — an `ExpressionBuilder` whose ~100 members are functions
-    // returning objects with ~100 members — that closure is exponential in
-    // `depth`, and it was the single hot spot (78% of samples, 77 GB of
-    // instantiation scratch in ONE top-level `instantiate`) whenever an
-    // `ExpressionOrFactory` pattern was matched.
-    if (!try c.containsInfer(pattern)) return;
+    // `.infer_var` (and `bindTemplateInfer`, which needs one too). `ids` itself
+    // is built by `collectInferVars`, whose arms are a strict SUBSET of
+    // `containsInfer`'s, so a pattern this rejects can bind nothing.
+    if (runaway and !try c.containsInfer(pattern)) return;
     const s = &c.ts;
     // tsc's `visited` guard (`inferFromObjectTypes`): a `(source, pattern)`
     // pair already walked in this inference writes nothing new — every combine
@@ -490,7 +507,7 @@ pub fn inferFromExtends(c: *Checker, source0: TypeId, pattern: TypeId, ids: []co
     // functions returning it: `infer O` is reachable everywhere, so the walk
     // branches once per member at every one of the 24 allowed levels.
     // Cheap leaves are excluded: they cost less than the map probe.
-    const memoize = switch (s.kind(pattern)) {
+    const memoize = runaway and switch (s.kind(pattern)) {
         .object, .function, .ref, .intersection, .union_type, .overloads, .conditional, .mapped => true,
         else => false,
     };
@@ -522,6 +539,14 @@ pub fn inferFromExtends(c: *Checker, source0: TypeId, pattern: TypeId, ids: []co
 /// Ceiling on `inferFromExtends`'s structural descent. A cut here is what makes
 /// the visited guard depth-sensitive — see there.
 pub const max_infer_depth: u32 = 24;
+
+/// Recursive `inferFromExtends` calls one inference may make before its guards
+/// arm (see the escape hatch there). Chosen from measurement, not taste: over
+/// the whole eight-package parity corpus plus excalidraw the busiest single
+/// inference makes ~4.6k calls, while kysely's `ExpressionOrFactory` match
+/// makes tens of millions. Anything in the wide gap between separates "walk it
+/// all, exactly as before" from "this will not finish".
+pub const max_infer_steps: u64 = 100_000_000;
 
 fn inferFromExtendsInner(c: *Checker, source0: TypeId, pattern: TypeId, ids: []const u32, vals: []TypeId, contra: bool, depth: u32) Error!void {
     const s = &c.ts;
@@ -1177,11 +1202,7 @@ const PartWalk = struct {
 /// immutable and the walk is a pure structural descent, and `inferFromExtends`
 /// asks it once per step.
 pub fn containsInfer(c: *Checker, t: TypeId) Error!bool {
-    const v = c.triGet(&c.ci_cache, t);
-    if (v != 0) return v == 2;
-    const r = try containsInferInner(c, t);
-    try c.triSet(&c.ci_cache, t, if (r) 2 else 1);
-    return r;
+    return containsInferInner(c, t);
 }
 
 fn containsInferInner(c: *Checker, t: TypeId) Error!bool {
