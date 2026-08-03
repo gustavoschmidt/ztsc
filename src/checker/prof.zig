@@ -218,6 +218,13 @@ pub fn report(c: *Checker) void {
     w.print("total node visits: {d}  memo hits: {d}  misses: {d}  budget trips: {d}\n", .{
         c.inst_total, c.stats.inst_hits, c.stats.inst_misses, c.prof.tripped,
     }) catch {};
+    w.print("distinct types instantiated: {d}  distinct substitution maps: {d}  " ++
+        "misses per distinct type: {d:.1}\n", .{
+        c.prof.per_type.count(),
+        c.inst_map_next -| 1,
+        @as(f64, @floatFromInt(c.stats.inst_misses)) /
+            @as(f64, @floatFromInt(@max(1, c.prof.per_type.count()))),
+    }) catch {};
 
     w.writeAll("\n-- visits by type kind --\n") catch {};
     {

@@ -859,6 +859,190 @@ pub fn sigReferencesOuterParam(c: *Checker, sig: TypeId, bound: []const u32) Err
     return false;
 }
 
+/// The Bloom bit a type-parameter symbol contributes to a `tp_mask`
+/// summary. A multiplicative hash of the symbol id, so the 64 buckets are
+/// spread across the dense id space rather than aliasing every 64th symbol.
+pub fn tpBit(sym: u32) u64 {
+    return @as(u64, 1) << @intCast((@as(u64, sym) *% 0x9E37_79B9_7F4A_7C15) >> 58);
+}
+
+/// The Bloom summary of the type parameters a substitution map binds.
+/// Memoized per canonical map id (maps are interned and immutable, and the
+/// summary of a non-empty map is never zero, so zero doubles as "not yet
+/// computed").
+pub fn mapParamMask(c: *Checker, map: []const TpMap, map_id: ?u32) Error!u64 {
+    if (map_id) |mid| {
+        if (mid < c.map_mask.items.len and c.map_mask.items[mid] != 0) return c.map_mask.items[mid];
+    }
+    var m: u64 = 0;
+    for (map) |e| m |= tpBit(e.sym);
+    if (map_id) |mid| {
+        if (mid >= c.map_mask.items.len) try c.map_mask.appendNTimes(c.cm(), 0, mid + 1 - c.map_mask.items.len);
+        c.map_mask.items[mid] = m;
+    }
+    return m;
+}
+
+/// Whether a node of this kind is substituted *purely structurally* — the
+/// arm rebuilds the same shape out of its instantiated children and nothing
+/// else, so feeding it unchanged children re-interns the identical type.
+///
+/// Only for those kinds is "the map binds nothing this type mentions" a
+/// licence to answer `t` outright. The reducing kinds — conditional,
+/// indexed access, mapped, `keyof`, template literal, string mapping — are
+/// deliberately absent: their instantiation arm runs a REDUCTION
+/// (`planConditional`, `reduceIndexedAccess`, `reduceMapped`, `keyofType`,
+/// `reduceTemplate`) whose result need not be `t` even when every child came
+/// back unchanged, so skipping them would not be behaviour-preserving.
+pub fn maskSkippableKind(k: types.Kind) bool {
+    return switch (k) {
+        .type_param,
+        .union_type,
+        .intersection,
+        .overloads,
+        .array,
+        .tuple,
+        .object,
+        .function,
+        .ref,
+        .this_type,
+        => true,
+        else => false,
+    };
+}
+
+/// Bloom summary of the type-parameter symbols occurring free in `t` — see
+/// `Checker.tp_mask`. Its own dense memo with its own in-progress cut
+/// (assume no parameters, exactly as `containsTypeParam` does for cycles).
+///
+/// Deliberately NOT derived from `ctp_cache`: the two walks answer subtly
+/// different questions at an object's call signatures (see
+/// `freeParamMaskInner`), and `containsTypeParam`'s answer is load-bearing
+/// for the pre-existing early-out. This summary only ever *adds* skips on
+/// top of it.
+pub fn freeParamMask(c: *Checker, t: TypeId) Error!u64 {
+    const v = c.triGet(&c.tp_mask_state, t);
+    if (v != 0) return if (v == 2) maskGet(c, t) else 0;
+    try c.triSet(&c.tp_mask_state, t, 1); // assume none while computing (cycles)
+    const m = try freeParamMaskInner(c, t);
+    try c.triSet(&c.tp_mask_state, t, if (m != 0) 2 else 1);
+    if (m != 0) try maskSet(c, t, m);
+    return m;
+}
+
+fn maskGet(c: *const Checker, t: TypeId) u64 {
+    return if (t < c.tp_mask.items.len) c.tp_mask.items[t] else ~@as(u64, 0);
+}
+
+fn maskSet(c: *Checker, t: TypeId, m: u64) Error!void {
+    if (t >= c.tp_mask.items.len) try c.tp_mask.appendNTimes(c.cm(), 0, t + 1 - c.tp_mask.items.len);
+    c.tp_mask.items[t] = m;
+}
+
+/// `freeParamMask`'s walk. Mirrors `containsTypeParamInner` arm for arm —
+/// every place that answers `true` there contributes bits here — except that
+/// it cannot short-circuit, and that two constructs whose parameters it
+/// cannot enumerate answer `~0` ("assume everything", i.e. never skip):
+///
+///   * an object carrying a GENERIC call/construct signature. Instantiating
+///     such an object can *drop* a signature (`higherOrderSigEligible`), so
+///     answering `t` unchanged would keep a signature the eager path removes.
+///   * an object whose signatures reach an outer parameter through their own
+///     bounds (`sigReferencesOuterParam` reports the reference without
+///     naming it).
+fn freeParamMaskInner(c: *Checker, t: TypeId) Error!u64 {
+    const s = &c.ts;
+    const all = ~@as(u64, 0);
+    switch (s.kind(t)) {
+        .type_param => return tpBit(s.typeParamSymbol(t)),
+        // Indexed walk, not a `memberList` dupe: the recursion can reach
+        // `sigReferencesOuterParam` -> `typeFromTypeNode`, which interns
+        // and may move `extra`. See `Store.memberAt`.
+        .union_type, .intersection, .overloads => {
+            var m: u64 = 0;
+            for (0..s.memberCount(t)) |i| m |= try c.freeParamMask(s.memberAt(t, i));
+            return m;
+        },
+        .array => return c.freeParamMask(s.arrayElem(t)),
+        .tuple => {
+            var m: u64 = 0;
+            for (0..s.tupleLen(t)) |i| m |= try c.freeParamMask(s.tupleElem(t, @intCast(i)).ty);
+            return m;
+        },
+        .object => {
+            var m: u64 = 0;
+            for (0..s.objectPropCount(t)) |i| m |= try c.freeParamMask(s.objectProp(t, @intCast(i)).ty);
+            if (s.objectStringIndex(t) != 0) m |= try c.freeParamMask(s.objectStringIndex(t));
+            if (s.objectNumberIndex(t) != 0) m |= try c.freeParamMask(s.objectNumberIndex(t));
+            for (0..s.objectCallSigCount(t)) |i| {
+                const sig = s.objectCallSig(t, @intCast(i));
+                if (s.fnTypeParams(sig).len != 0) return all;
+                if (try c.sigReferencesOuterParam(sig, &.{})) return all;
+                m |= try c.freeParamMask(sig);
+            }
+            for (0..s.objectConstructSigCount(t)) |i| {
+                const sig = s.objectConstructSig(t, @intCast(i));
+                if (s.fnTypeParams(sig).len != 0) return all;
+                if (try c.sigReferencesOuterParam(sig, &.{})) return all;
+                m |= try c.freeParamMask(sig);
+            }
+            return m;
+        },
+        .function => {
+            var m = try c.freeParamMask(s.fnReturn(t));
+            for (0..s.fnParamCount(t)) |i| m |= try c.freeParamMask(s.fnParam(t, @intCast(i)).ty);
+            if (s.fnHasPredicate(t)) {
+                const pr = s.fnPredicate(t);
+                if (pr.ty != types.no_type) m |= try c.freeParamMask(pr.ty);
+            }
+            // The signature's OWN parameters' bounds are substituted too (the
+            // higher-order rewrite in the `.function` instantiation arm mints
+            // a fresh parameter exactly when a bound moves), so a map that
+            // touches only a bound must still reach this signature.
+            for (s.fnTypeParams(t)) |tp| {
+                const con = try c.typeParamConstraint(tp);
+                if (con != types.no_type) m |= try c.freeParamMask(con);
+                const def = try c.typeParamDefault(tp);
+                if (def != types.no_type) m |= try c.freeParamMask(def);
+            }
+            return m;
+        },
+        .ref => {
+            var m: u64 = 0;
+            for (0..s.refArgCount(t)) |i| m |= try c.freeParamMask(s.refArgAt(t, i));
+            return m;
+        },
+        .this_type => return c.freeParamMask(s.thisTypeInstance(t)),
+        .conditional => {
+            var m = try c.freeParamMask(s.condCheck(t));
+            m |= try c.freeParamMask(s.condExtends(t));
+            m |= try c.freeParamMask(s.condTrue(t));
+            m |= try c.freeParamMask(s.condFalse(t));
+            return m;
+        },
+        .index_access => {
+            var m = try c.freeParamMask(s.indexAccessObj(t));
+            m |= try c.freeParamMask(s.indexAccessIndex(t));
+            return m;
+        },
+        .mapped => {
+            var m = try c.freeParamMask(s.mappedConstraint(t));
+            m |= try c.freeParamMask(s.mappedValue(t));
+            if (s.mappedAs(t) != 0) m |= try c.freeParamMask(s.mappedAs(t));
+            if (s.mappedSource(t) != 0) m |= try c.freeParamMask(s.mappedSource(t));
+            return m;
+        },
+        .template_literal_type => {
+            var m: u64 = 0;
+            for (0..s.templateHoleCount(t)) |i| m |= try c.freeParamMask(s.templateHole(t, @intCast(i)));
+            return m;
+        },
+        .string_mapping => return c.freeParamMask(s.stringMappingArg(t)),
+        .keyof_op => return c.freeParamMask(s.keyofOperand(t)),
+        else => return 0,
+    }
+}
+
 pub fn containsTypeParam(c: *Checker, t: TypeId) Error!bool {
     const v = c.triGet(&c.ctp_cache, t);
     if (v != 0) return v == 2;
@@ -1106,8 +1290,52 @@ pub fn canonMapId(c: *Checker, map: []const TpMap) Error!u32 {
         gop.value_ptr.* = c.inst_map_next;
         c.inst_map_next += 1;
         c.stats.inst_maps += 1;
+        // Keep the canonical pair list addressable by id, so `restrictMap`
+        // can hand a narrowed map back down without the caller owning it.
+        std.debug.assert(c.inst_map_slices.items.len == gop.value_ptr.* - 1);
+        try c.inst_map_slices.append(c.cm(), try c.ca().dupe(TpMap, sorted));
     }
     return gop.value_ptr.*;
+}
+
+/// The canonical pair list behind a map id (see `canonMapId`).
+pub fn mapOfId(c: *const Checker, id: u32) []const TpMap {
+    return c.inst_map_slices.items[id - 1];
+}
+
+/// `map` narrowed to the entries `t` could possibly mention, identified by
+/// `t`'s free-parameter summary `tm` (see `Checker.tp_mask`).
+///
+/// This is the answer to substitution-map MULTIPLICITY, which the
+/// `--inst-profile` measurement put at the centre of the immich cost: a
+/// kysely builder chain mints a fresh output row type at every link, so
+/// `SelectQueryBuilder<DB, TB, O₁>`, `<DB, TB, O₂>`, … each canonicalize to a
+/// DIFFERENT map id — 120 k distinct maps over only 59 k distinct types, 44
+/// memo misses per type. The DB-wide machinery under those maps (`keyof DB`,
+/// `DB[T]`, the table-expression conditionals) does not mention `O` at all,
+/// yet `(map_id, type)` keying made every one of them a fresh miss per link.
+///
+/// Narrowing the key to the sub-map `t` can actually see makes all of those
+/// links share one memo entry. It is sound because substitution only ever
+/// consults the map through `tpLookup` on a parameter that occurs in `t`
+/// (and, for a signature, in its own parameters' bounds — which the summary
+/// covers): dropping an entry no occurrence can match cannot change the
+/// result. A Bloom false positive keeps an entry that was not needed, which
+/// only costs a memo entry that could have been shared.
+///
+/// Memoized on `(map_id, tm)`, so the sort-and-intern in `canonMapId` runs
+/// once per distinct narrowing rather than once per node visit.
+pub fn restrictMap(c: *Checker, map: []const TpMap, map_id: u32, tm: u64) Error!struct { []const TpMap, u32 } {
+    const key = (@as(u128, tm) << 32) | map_id;
+    if (c.restrict_ids.get(key)) |rid| return .{ mapOfId(c, rid), rid };
+    var kept: std.ArrayList(TpMap) = .empty;
+    defer kept.deinit(c.scratch());
+    for (map) |e| {
+        if (tpBit(e.sym) & tm != 0) try kept.append(c.scratch(), e);
+    }
+    const rid = try c.canonMapId(kept.items);
+    try c.restrict_ids.put(c.cm(), key, rid);
+    return .{ mapOfId(c, rid), rid };
 }
 
 /// True for a fresh higher-order type-param symbol (`fresh_tp_ids`).
@@ -1293,11 +1521,47 @@ pub fn chainRepeats(c: *const Checker, t: TypeId) bool {
 }
 
 /// recursion. A `null` id disables the memo (`--no-inst-cache`).
+///
+/// The free-parameter summary (`Checker.tp_mask`) is applied here, ahead of
+/// the memoized walk, in two ways — see `maskSkippableKind` and
+/// `restrictMap`. Both are suspended while `cond_check_subst` is live: that
+/// rebinding is keyed by a check EXPRESSION rather than by a parameter
+/// symbol, so no symbol summary can account for it.
 pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) Error!TypeId {
     // Per-constituent rebinding of a distributive conditional whose check is
     // no longer a bare type parameter — see the `.conditional` arm. Asked
     // before the type-parameter early-out, because the check being rebound
     // (`O[K]`) need not contain one.
+    if (c.cond_check_subst) |cs| {
+        if (t == cs.from) return cs.to;
+        return instantiateIdInner(c, t, map, map_id);
+    }
+    if (!try c.containsTypeParam(t)) return t;
+    const mid0 = map_id orelse return instantiateIdInner(c, t, map, map_id);
+    const tm = try c.freeParamMask(t);
+    const mm = try c.mapParamMask(map, mid0);
+    if (tm & mm == 0 and maskSkippableKind(c.ts.kind(t))) {
+        // This substitution binds nothing `t` can mention, and `t`'s kind
+        // rebuilds itself structurally out of its instantiated children — so
+        // the answer is `t`, without walking a node of it. tsc's
+        // `couldContainTypeVariables` gate, sharpened from "mentions some
+        // type variable" to "mentions one THIS map binds".
+        c.stats.inst_mask_skips += 1;
+        return t;
+    }
+    if (mm & ~tm != 0) {
+        // Some of the map is irrelevant to `t`: key the memo by the part
+        // that is not. See `restrictMap` — this is what stops a builder
+        // chain's per-link output type from invalidating the memo for every
+        // DB-wide type under it.
+        const rmap, const rid = try c.restrictMap(map, mid0, tm);
+        c.stats.inst_map_narrowings += 1;
+        return instantiateIdInner(c, t, rmap, rid);
+    }
+    return instantiateIdInner(c, t, map, map_id);
+}
+
+fn instantiateIdInner(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) Error!TypeId {
     if (c.cond_check_subst) |cs| {
         if (t == cs.from) return cs.to;
     }
