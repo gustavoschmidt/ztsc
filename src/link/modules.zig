@@ -1311,6 +1311,9 @@ const Linker = struct {
                         try l.put(t, rec.exported, .{ .kind = .any });
                     }
                 },
+                // A namespace's own `export { … }` is a member of that
+                // namespace, never an export of the module around it.
+                .ns_named => {},
                 .reexport_all => {},
                 .equals => {
                     // `export = <entity>`: resolve the named local and store it
@@ -1433,10 +1436,38 @@ const Linker = struct {
             .binding => {
                 const b = l.files[exeq.file].bind;
                 const ns_scope = b.namespaceScopeOf(exeq.payload) orelse return null;
-                const member_local = b.lookupInScope(ns_scope, name) orelse return null;
-                var t = try l.finalizeLocal(exeq.file, member_local, name, exeq.type_only, 0);
-                t.type_only = t.type_only or exeq.type_only;
-                return t;
+                // A member DECLARED in the namespace body, under its own name.
+                if (b.lookupInScope(ns_scope, name)) |member_local| {
+                    var t = try l.finalizeLocal(exeq.file, member_local, name, exeq.type_only, 0);
+                    t.type_only = t.type_only or exeq.type_only;
+                    return t;
+                }
+                // …or a member the body RE-EXPORTS under a different local name:
+                // `namespace EE { export { internal as EventEmitter } }`. The
+                // scope holds `internal`, not `EventEmitter`, so the name-keyed
+                // lookup above misses it and the whole entity degraded to `any`
+                // — which is how `import { EventEmitter } from "node:events"`
+                // lost every method @types/node declares on it, and with it the
+                // contextual signature of every listener callback written for
+                // one (TS7006 on `chunk`, `err`, `code`, …). tsc reads a
+                // namespace's `export { … }` statements as exports of the
+                // namespace, exactly as it does for a `declare module` block —
+                // which `buildAmbient` already handles for the block case.
+                for (b.exports) |rec| {
+                    if (rec.kind != .ns_named or rec.scope != ns_scope) continue;
+                    if (rec.exported != name) continue;
+                    // Resolve the LOCAL name (`internal`), not the exported one:
+                    // `finalizeLocal` matches the import record that created the
+                    // binding by its local atom.
+                    const ls = if (rec.sym != binder.no_symbol)
+                        rec.sym
+                    else
+                        b.lookupInScope(ns_scope, rec.local) orelse continue;
+                    var t = try l.finalizeLocal(exeq.file, ls, rec.local, rec.type_only or exeq.type_only, 0);
+                    t.type_only = t.type_only or exeq.type_only;
+                    return t;
+                }
+                return null;
             },
             .namespace => {
                 if (try l.lookupExport(exeq.file, name, 0)) |t| {

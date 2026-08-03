@@ -353,7 +353,11 @@ pub const FlowTag = enum(u8) {
 };
 
 pub const ImportKind = enum(u8) { default, namespace, named, side_effect, equals };
-pub const ExportKind = enum(u8) { named, default, reexport_named, reexport_all, reexport_ns, equals };
+/// `ns_named` is `namespace N { export { x as y }; }` — an export of the
+/// NAMESPACE, not of the module the namespace lives in. It is recorded so the
+/// linker can read a namespace's aliases (see `exportEqualsMember`) and is
+/// skipped everywhere a module's own export table is built.
+pub const ExportKind = enum(u8) { named, default, reexport_named, reexport_all, reexport_ns, equals, ns_named };
 
 /// One imported binding; feeds the module graph.
 pub const ImportRec = struct {
@@ -2565,18 +2569,23 @@ const Binder = struct {
         const module = try b.moduleAtom(d.rhs);
         const decl_type_only = data.flags & ast.Flags.type_only != 0;
         // `namespace N { export { x }; }` re-exports `x` as the NAMESPACE
-        // member `N.x` — it is not a module export, so it emits no ExportRec
-        // (`noteExport` draws the same line for `export <decl>` forms). Both
-        // `@types/node`'s `namespace test { export { after, … }; }` and its
-        // `global { namespace NodeJS { export { BufferEncoding }; } }` are this
-        // shape; treating them as module exports put names the module never
-        // exported into its table and, in `events.d.ts`, made a value export
-        // collide with the module's `export = EventEmitter` (TS2309). The
-        // member alias itself is not modeled — an under-report, never a false
-        // positive. A `declare module "spec" { … }` body IS a module body, so
-        // its own `export { … }` records normally.
+        // member `N.x` — it is not a module export (`noteExport` draws the same
+        // line for `export <decl>` forms). Both `@types/node`'s `namespace test
+        // { export { after, … }; }` and its `global { namespace NodeJS {
+        // export { BufferEncoding }; } }` are this shape; treating them as
+        // module exports put names the module never exported into its table
+        // and, in `events.d.ts`, made a value export collide with the module's
+        // `export = EventEmitter` (TS2309). So it is recorded under its own
+        // kind, `.ns_named`, which every module-export table skips.
+        //
+        // Recorded rather than dropped because a namespace's aliases ARE
+        // reachable — `import { EventEmitter } from "node:events"` resolves
+        // through `export = EventEmitter` to the namespace member of that name,
+        // which `events.d.ts` writes as `export { internal as EventEmitter }`.
+        // Dropping the record made that import (and every @types/node type
+        // reached the same way) `any`. A `declare module "spec" { … }` body IS
+        // a module body, so its own `export { … }` records normally.
         const in_ns = b.cur_scope != file_scope and b.cur_scope != b.ambient_mod_scope;
-        if (in_ns and module == 0) return;
         for (b.tree.extraRange(data.spec_start, data.spec_end)) |spec| {
             if (spec == null_node or b.nodeTag(spec) != .export_specifier) continue;
             const sd = b.tree.nodeData(spec);
@@ -2590,7 +2599,7 @@ const Binder = struct {
                 .module = module,
                 .sym = no_symbol, // local exports resolved at seal
                 .node = spec,
-                .kind = if (module != 0) .reexport_named else .named,
+                .kind = if (module != 0) .reexport_named else if (in_ns) .ns_named else .named,
                 .type_only = type_only,
                 .scope = b.cur_scope,
             });
@@ -3342,7 +3351,7 @@ const Binder = struct {
         // — that is what makes `declare module "buffer" { global { var Buffer …
         // } export { Buffer }; }` (real `@types/node`) resolve.
         for (b.export_recs.items) |*rec| {
-            if (rec.kind == .named and rec.sym == no_symbol and rec.local != 0 and rec.module == 0) {
+            if ((rec.kind == .named or rec.kind == .ns_named) and rec.sym == no_symbol and rec.local != 0 and rec.module == 0) {
                 if (result.resolveWithGlobals(rec.local, rec.scope, b.global_scopes.items)) |sym| {
                     rec.sym = sym;
                     symbol_flags[sym].exported = true;
