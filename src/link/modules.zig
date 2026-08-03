@@ -1751,21 +1751,19 @@ const Linker = struct {
     /// every round only *adds* names no round could have taken differently.
     fn starMergeAmbient(l: *Linker) Error!void {
         const star_rounds = 8;
-        // A specifier whose blocks declare NOTHING of their own stays `opaque`
-        // (see `ambientOpaque`): named imports from it degrade to `any`, the
-        // documented under-report for the ambient shapes outside ztsc's
-        // subset. A star must not rescue such a module — @types/node's
-        // `declare module "node:fs" { export * from "fs"; }` alias blocks are
-        // all of this shape, and switching them on wholesale trades their
-        // (deliberate) `any` for a wave of false positives from checker gaps
-        // the `any` had been hiding (generic overload inference on
-        // `stream.pipeline`, well-known-symbol members on `readline.Interface`
-        // — none of them about module linking). So such a table is filled
-        // during the fixed point, which lets it relay a star CHAIN, and
-        // emptied again at the end. Snapshotted before any round, so both the
-        // fixed point and the reset stay independent of visit order.
-        const seeded = try l.scratch.alloc(bool, l.ambient.count());
-        for (l.ambient.values(), 0..) |*tbl, i| seeded[i] = tbl.count() != 0;
+        // A specifier whose blocks declare NOTHING of their own — `declare
+        // module "node:fs" { export * from "fs"; }`, which is how every
+        // `node:` alias in `@types/node` that is not an `import … = require`
+        // is written — used to be emptied again at the end of the fixed point,
+        // so it could relay a star CHAIN but exported nothing itself and every
+        // named import from it degraded to `any`. That was a deliberate
+        // under-report held in place by checker gaps the `any` was hiding
+        // (generic overload inference, well-known-symbol members) — gaps since
+        // closed. The `any` cost real diagnostics: `import { ChildProcess }
+        // from "node:child_process"` typed as `any`, so every `.on(event, cb)`
+        // written for one reported TS7006 on the callback's parameters.
+        //
+        // A star re-export IS an export, so the merged table now stands.
         var round: u32 = 0;
         while (round < star_rounds) : (round += 1) {
             var changed = false;
@@ -1797,11 +1795,6 @@ const Linker = struct {
                 }
             }
             if (!changed) break;
-        }
-        // Back to opaque: a block-less specifier relayed the chain, it does not
-        // export through it.
-        for (l.ambient.values(), 0..) |*tbl, i| {
-            if (!seeded[i]) tbl.clearRetainingCapacity();
         }
     }
 
