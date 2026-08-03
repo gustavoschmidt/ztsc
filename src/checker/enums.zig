@@ -1275,6 +1275,23 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
     c.inst_count += 1;
     c.inst_total += 1;
     defer c.inst_depth -= 1;
+    // Truncation is a property of THIS subtree, so the flag the memoization
+    // test below reads has to be scoped to it. It used to be scoped to the
+    // whole top-level `instantiate` call and never cleared, which made it
+    // "somebody, somewhere earlier in this call, truncated" — so one
+    // `chainRepeats` cut near the start of a big expansion suppressed
+    // memoization of every unrelated sibling reached after it. Which
+    // siblings those are is the order the walk reaches them in, and that
+    // order is not run-to-run stable (see `bench/repeat_sweep.sh`: object
+    // property records are sorted by name atom and atom ids come from the
+    // parallel interner's per-shard insertion order). drizzle-orm charged
+    // 499,656 / 499,854 / 499,944 `inst cache misses` across repeats of one
+    // binary for exactly that reason. Scoped to the subtree the test asks
+    // the question it means — "was MY result truncated" — and the memo
+    // becomes a function of `(map, t)` alone.
+    const outer_trip = c.inst_limit_tripped;
+    c.inst_limit_tripped = false;
+    defer c.inst_limit_tripped = c.inst_limit_tripped or outer_trip;
     const s = &c.ts;
     const result: TypeId = switch (s.kind(t)) {
         .type_param => tpLookup(map, s.typeParamSymbol(t)) orelse t,
@@ -1592,6 +1609,10 @@ pub fn substThis(c: *Checker, t: TypeId, repl: TypeId) Error!TypeId {
     if (c.inst_depth > max_instantiation_depth) return types.error_type;
     const memo_key = (@as(u64, t) << 32) | repl;
     if (c.subst_this_cache.get(memo_key)) |m| return m;
+    // Subtree-scoped, for `instantiateId`'s reason.
+    const outer_trip = c.inst_limit_tripped;
+    c.inst_limit_tripped = false;
+    defer c.inst_limit_tripped = c.inst_limit_tripped or outer_trip;
     const r = try substThisInner(c, t, repl);
     // A truncated answer is depth-dependent, not a function of the pair — the
     // rule `inst_cache` follows.
