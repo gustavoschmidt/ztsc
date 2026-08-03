@@ -2659,6 +2659,7 @@ pub const Checker = struct {
 
     const enums_zig = @import("checker/enums.zig");
     pub const classifyEnumInit = enums_zig.classifyEnumInit;
+    pub const enumInitAtom = enums_zig.enumInitAtom;
     pub const enumInfo = enums_zig.enumInfo;
     pub const eachEnumMember = enums_zig.eachEnumMember;
     pub const enumHasMemberNamed = enums_zig.enumHasMemberNamed;

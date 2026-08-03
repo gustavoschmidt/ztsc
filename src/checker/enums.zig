@@ -95,9 +95,25 @@ pub fn classifyEnumInit(c: *Checker, node: Node) struct { kind: EnumInitKind, va
             }
             return .{ .kind = .computed, .value = 0 };
         },
-        .string_literal => return .{ .kind = .string, .value = 0 },
+        // A NO-SUBSTITUTION template literal is a string constant, the same
+        // as a quoted one: tsc's `computeConstantValue` folds
+        // `NoSubstitutionTemplateLiteral` to its cooked text. Treating it as
+        // computed instead made the member opaque, which cost the whole enum
+        // its `all_string` classification and turned every `case E.M:` on it
+        // into TS2678 (immich writes nine `ManualJobName` members in
+        // backticks).
+        .string_literal, .template_literal => return .{ .kind = .string, .value = 0 },
         else => return .{ .kind = .computed, .value = 0 },
     }
+}
+
+/// The cooked text of a constant string enum initializer — quoted or in
+/// backticks (see `classifyEnumInit`). The token spellings differ, so the
+/// atom has to be read through the matching accessor.
+pub fn enumInitAtom(c: *Checker, init_node: Node) Error!Atom {
+    const tok = c.tree.nodeMainToken(init_node);
+    if (c.nodeTag(init_node) == .template_literal) return c.templateAtom(tok);
+    return c.memberAtom(tok);
 }
 
 /// Const-ness, string/numeric nature, and numeric member values of an
@@ -190,7 +206,7 @@ pub fn eachEnumMember(
             const ci = c.classifyEnumInit(init_node);
             switch (ci.kind) {
                 .string => {
-                    const av = try c.memberAtom(c.tree.nodeMainToken(init_node));
+                    const av = try c.enumInitAtom(init_node);
                     auto_ok = false;
                     try f(ctx, name, try c.ts.makeStringLiteral(av, false));
                 },
@@ -378,8 +394,9 @@ pub fn enumHasStringValue(c: *Checker, sym: SymbolId, val: Atom) Error!bool {
         for (c.tree.extraRange(data.members_start, data.members_end)) |m| {
             if (m == null_node or c.nodeTag(m) != .enum_member) continue;
             const init_node = c.tree.nodeData(m).lhs;
-            if (init_node == null_node or c.nodeTag(init_node) != .string_literal) continue;
-            if ((try c.memberAtom(c.tree.nodeMainToken(init_node))) == val) return true;
+            if (init_node == null_node) continue;
+            if (c.classifyEnumInit(init_node).kind != .string) continue;
+            if ((try c.enumInitAtom(init_node)) == val) return true;
         }
     }
     return false;
