@@ -1944,9 +1944,33 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                     if (m == tp_member) continue;
                     if (c.isPromiseLikeOf(m, s.typeParamSymbol(tp_member))) promise_of_tp = true;
                 }
+                // "Some other member of the union already accounts for the
+                // argument, so the variable stands down."
+                //
+                // Only a member that can INFER may say that. tsc's
+                // `inferToMultipleTypes` marks a source constituent matched
+                // when inferring it to a non-variable target actually produced
+                // an inference, and a target constituent with no inference
+                // sites in it never does — `T | { a: number }` still infers
+                // `T` from a `{ a: number; b: string }` argument even though
+                // that argument satisfies the second member outright.
+                //
+                // Asking assignability instead let any concrete member veto
+                // the whole inference, and the variable then fell back to its
+                // own constraint. zod's
+                // `pipe<T extends $ZodType<any, output<this>>>(target: T |
+                // $ZodType<any, output<this>>)` is that shape exactly: every
+                // schema argument satisfies the second member, so `T` was
+                // never inferred and every `.pipe(…)` produced
+                // `ZodPipe<this, $ZodType<any, output<this>>>` — a type whose
+                // unsubstituted `this` makes every later conditional over the
+                // schema (`z.output<S>`, `ReturnType<S['parse']>`) defer
+                // forever, which is how a `createZodDto` class ended up with
+                // no properties at all.
                 var rest_ok = false;
                 for (try c.memberList(param)) |m| {
                     if (m == tp_member) continue;
+                    if (!try c.containsTypeParam(m)) continue;
                     if (try c.isAssignable(arg, m)) rest_ok = true;
                 }
                 if (promise_of_tp) {
