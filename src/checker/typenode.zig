@@ -1034,6 +1034,12 @@ pub const TypeParamInfo = struct {
     sym: SymbolId,
     constraint: Node,
     default: Node,
+    /// The type-parameter symbol whose declaration owns `default`. Normally
+    /// `sym`, but a merged declaration may supply the default from a block
+    /// OTHER than the one the parameter list was taken from (see
+    /// `typeParamsOf`), and the default is a NODE — it has to be read
+    /// against the tree and scope of the block that wrote it.
+    default_sym: SymbolId = 0,
 };
 
 /// Type parameters of a generic symbol (class/interface/alias). Symbol ids
@@ -1049,6 +1055,17 @@ pub const TypeParamInfo = struct {
 /// `interface Buffer { … }` reopen in another. So scan the constituents in
 /// declaration order and take the first block that actually declares
 /// parameters; a bare reopen must not erase them.
+///
+/// DEFAULTS, though, are pooled across every block. tsc reads a parameter's
+/// default off its own symbol, whose declarations merge with the interface's,
+/// so a parameter is optional as soon as ANY block gives it one — order does
+/// not matter. `@types/node` depends on it: `compatibility/iterators.d.ts`
+/// reopens `NodeJS.AsyncIterator<T, TReturn, TNext>` with no defaults while
+/// `globals.d.ts` writes `<T, TReturn = undefined, TNext = any>`. Taking the
+/// bare block's list alone made `NodeJS.AsyncIterator<any>` a TS2314 arity
+/// error, which degrades to `any` — so `Readable`'s
+/// `[Symbol.asyncIterator](): NodeJS.AsyncIterator<any>` returned `any`, and
+/// `for await (… of readable)` reported TS2504 for want of an async iterator.
 pub fn typeParamsOf(c: *Checker, sym: SymbolId, buf: *std.ArrayList(TypeParamInfo)) Error!void {
     var one = [_]SymbolId{sym};
     const parts: []const SymbolId = if (c.prog.isMergedId(sym)) c.prog.mergedSym(sym).parts else one[0..];
@@ -1060,7 +1077,48 @@ pub fn typeParamsOf(c: *Checker, sym: SymbolId, buf: *std.ArrayList(TypeParamInf
             if (buf.items.len > 0) break :outer;
         }
     }
-    if (buf.items.len > 0 and c.symFlags(sym).class) try c.canonicalizeClassTypeParams(sym, buf);
+    if (buf.items.len == 0) return;
+    for (buf.items) |*tp| tp.default_sym = tp.sym;
+    try fillMergedTypeParamDefaults(c, sym, buf);
+    if (c.symFlags(sym).class) try c.canonicalizeClassTypeParams(sym, buf);
+}
+
+/// Fill a parameter's missing default from a LATER declaring block of the
+/// same merged symbol, positionally (see `typeParamsOf`). Arity, constraints
+/// and parameter symbols stay with the block the list came from; only a
+/// default the list is missing is adopted, and it carries the donating
+/// block's symbol so the node is read against the right file and scope.
+/// Nothing to do once every parameter already has one.
+fn fillMergedTypeParamDefaults(c: *Checker, sym: SymbolId, buf: *std.ArrayList(TypeParamInfo)) Error!void {
+    var missing = false;
+    for (buf.items) |tp| {
+        if (tp.default == 0) missing = true;
+    }
+    if (!missing) return;
+    var other: std.ArrayList(TypeParamInfo) = .empty;
+    defer other.deinit(c.scratch());
+    var one = [_]SymbolId{sym};
+    const parts: []const SymbolId = if (c.prog.isMergedId(sym)) c.prog.mergedSym(sym).parts else one[0..];
+    for (parts) |csym| {
+        const saved = c.enterSymFile(csym);
+        defer c.restoreCtx(saved);
+        for (c.declsOf(csym)) |decl| {
+            other.clearRetainingCapacity();
+            try c.declTypeParams(decl, &other);
+            if (other.items.len != buf.items.len) continue;
+            var still_missing = false;
+            for (buf.items, other.items) |*tp, od| {
+                if (tp.default != 0) continue;
+                if (od.default == 0) {
+                    still_missing = true;
+                    continue;
+                }
+                tp.default = od.default;
+                tp.default_sym = od.sym;
+            }
+            if (!still_missing) return;
+        }
+    }
 }
 
 /// A class merged with a same-named `interface` has TWO declaring blocks,
@@ -1626,11 +1684,14 @@ pub fn fixTypeArgs(c: *Checker, sym: SymbolId, args: []const TypeId, tok: TokenI
             // declare its parameters on a block in a different file than
             // the merged symbol's representative, and reading the node
             // against the wrong tree is out of bounds.
+            // `default_sym`, not `sym`: a merged symbol may take the default
+            // from a different block than the parameter list (`typeParamsOf`).
             var def: TypeId = undefined;
             {
-                const saved = c.enterSymFile(tp.sym);
+                const dsym = if (tp.default_sym != 0) tp.default_sym else tp.sym;
+                const saved = c.enterSymFile(dsym);
                 defer c.restoreCtx(saved);
-                c.cur_scope = c.symScope(tp.sym);
+                c.cur_scope = c.symScope(dsym);
                 def = try c.typeFromTypeNode(tp.default);
             }
             // A *bare* default reference to an earlier own param (`Tr = T`)
