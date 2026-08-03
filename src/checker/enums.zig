@@ -27,6 +27,7 @@ const check = checker_zig.check;
 const max_instantiation_depth = checker_zig.max_instantiation_depth;
 const max_instantiation_count = checker_zig.max_instantiation_count;
 const max_chain_repeats = checker_zig.max_chain_repeats;
+const max_this_subst_repeats = checker_zig.max_this_subst_repeats;
 const chain_scan_floor = checker_zig.chain_scan_floor;
 const scratch_retain_limit = checker_zig.scratch_retain_limit;
 const FreshTp = checker_zig.FreshTp;
@@ -1590,6 +1591,48 @@ pub fn substThis(c: *Checker, t: TypeId, repl: TypeId) Error!TypeId {
     if (!c.has_this_types) return t;
     if (!try c.containsThisType(t)) return t;
     if (c.inst_depth > max_instantiation_depth) return types.error_type;
+    // Cycle cut. The deferred-operator arms below do not merely rewrite, they
+    // *reduce*: `this["_zod"]` is looked up on the receiver, and the member it
+    // finds mentions `this` again, so the reduction re-enters here with the
+    // very same `(t, repl)` pair. zod's `$ZodType` closes such a circle in
+    // four frames — `this["_zod"]["output"]` → `$ZodTypeInternals` →
+    // `"~standard"` → `core.output<this>` → `this["_zod"]["output"]` — and
+    // nothing about the pair changes on each lap, so no memo can see progress
+    // and the walk only stopped when `max_instantiation_depth` truncated it to
+    // `error_type`. That truncation is what made `.pipe(…).optional()` report
+    // TS2589 and lose every property of the schema it typed.
+    //
+    // Leaving the operator symbolic on re-entry is the answer tsc arrives at
+    // by never resolving it in the first place: it defers an indexed access
+    // whose object is a type variable and only resolves it once a real
+    // receiver exists, which is exactly the outermost frame here. That frame
+    // still substitutes and still reduces; only the inner lap, which has no
+    // new information, stops.
+    const key = (@as(u64, t) << 32) | repl;
+    for (c.this_subst_keys[0..c.this_subst_depth]) |k| {
+        if (k == key) return t;
+    }
+    // Growth cut, the same rule the relation applies as `relIdDeeplyNested`:
+    // a chain that keeps rewriting the SAME generic as a strictly larger
+    // instantiation of itself is not converging on an answer. The pair test
+    // above cannot see it, because nothing repeats — zod's `core.output<this>`
+    // wraps another `$ZodType<any, …>` around its own argument every lap
+    // (`$ZodType<any, $ZodType<any, $ZodType<any, …>>>`), so every frame is a
+    // type this checker has never interned before. Leaving the subject
+    // symbolic once the generic has been re-entered `max_this_subst_repeats`
+    // times keeps the outer, informative rewrites and drops only the tail.
+    const t_sym: SymbolId = if (c.ts.kind(t) == .ref) c.ts.refSymbol(t) else binder.no_symbol;
+    if (t_sym != binder.no_symbol) {
+        var seen: u32 = 0;
+        for (c.this_subst_syms[0..c.this_subst_depth]) |sym| {
+            if (sym == t_sym) seen += 1;
+        }
+        if (seen >= max_this_subst_repeats) return t;
+    }
+    c.this_subst_keys[c.this_subst_depth] = key;
+    c.this_subst_syms[c.this_subst_depth] = t_sym;
+    c.this_subst_depth += 1;
+    defer c.this_subst_depth -= 1;
     c.inst_depth += 1;
     defer c.inst_depth -= 1;
     const s = &c.ts;

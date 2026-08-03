@@ -400,6 +400,11 @@ pub const max_relation_depth = 900;
 /// (`rel_guard_tripped`), because a NEGATIVE verdict built on an assumed YES
 /// is not evidence — see that field.
 pub const max_relation_identity_repeats = 2;
+/// How many times one generic may be re-entered by the polymorphic-`this`
+/// rewrite (`substThis`) before its subject is left symbolic. The instantiation
+/// analogue of `max_relation_identity_repeats`, and chosen the same way — see
+/// the growth cut in `substThis` for the shape it closes.
+pub const max_this_subst_repeats = 2;
 /// Buckets in the relation-stack occupancy filter (`rel_src_buckets`).
 pub const rel_id_buckets = 64;
 
@@ -1101,6 +1106,18 @@ pub const Checker = struct {
     /// otherwise-unbounded walk over an undecidable recursive alias's
     /// expansions (see the constant's doc comment).
     rel_depth: u32 = 0,
+    /// The `(type, receiver)` pairs `substThis` currently has open, innermost
+    /// last. A pair that reappears on this stack is a cycle, not progress —
+    /// see the guard in `substThis`. Sized by the nesting `substThis` can
+    /// reach: it spends one `inst_depth` per frame and bails past
+    /// `max_instantiation_depth`.
+    this_subst_keys: [max_instantiation_depth + 2]u64 = @splat(0),
+    /// The generic each open `substThis` frame is rewriting, when its subject
+    /// is a reference — the growth test in `substThis` counts repeats of it.
+    /// `no_symbol` for a frame whose subject is not a reference.
+    this_subst_syms: [max_instantiation_depth + 2]SymbolId = @splat(binder.no_symbol),
+    /// Live depth of `this_subst_keys`/`this_subst_syms`.
+    this_subst_depth: u32 = 0,
     /// The generic INSTANTIATION each live relation frame is comparing, one
     /// entry per side — the frame's origin ref (`refFacetOf`) and its symbol,
     /// pushed only for frames whose two sides are both generic instantiations.
