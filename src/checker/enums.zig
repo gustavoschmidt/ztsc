@@ -1246,6 +1246,13 @@ pub fn chainRepeats(c: *const Checker, t: TypeId) bool {
 
 /// recursion. A `null` id disables the memo (`--no-inst-cache`).
 pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) Error!TypeId {
+    // Per-constituent rebinding of a distributive conditional whose check is
+    // no longer a bare type parameter — see the `.conditional` arm. Asked
+    // before the type-parameter early-out, because the check being rebound
+    // (`O[K]`) need not contain one.
+    if (c.cond_check_subst) |cs| {
+        if (t == cs.from) return cs.to;
+    }
     if (!try c.containsTypeParam(t)) return t;
     if (map_id) |mid| {
         if (c.inst_cache.get((@as(u64, mid) << 32) | t)) |r| {
@@ -1522,6 +1529,50 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
                     for (try c.memberList(new_check)) |m| {
                         const m2 = try c.mapWith(map, csym, m);
                         try parts.append(c.scratch(), try c.instantiate(t, m2));
+                    }
+                    break :blk try s.makeUnion(c.scratch(), parts.items);
+                }
+            }
+            // The same distribution, one instantiation later. A distributive
+            // conditional written inside a mapped type is instantiated TWICE:
+            // first with the alias argument (`SDV<O[K]>`, which leaves the
+            // check the still-generic `O[K]` and defers), then per key. By the
+            // second pass the check is an `.index_access`, not a bare type
+            // parameter, so the rule above no longer fires — and the branches
+            // below get instantiated with the WHOLE union substituted for the
+            // check. A conditional nested in a branch then resolves against
+            // the union instead of the constituent, and its answer is unioned
+            // in beside the correct one.
+            //
+            // kysely's `ShallowDehydrateObject<O> = { [K in keyof O]:
+            // ShallowDehydrateValue<O[K]> }` is that shape: for a
+            // `string | null` column the outer arm correctly yields `null`,
+            // while the nested `T extends (infer U)[] | null | undefined` arm
+            // — reduced against `string | null`, which the `| null` half
+            // matches with `U` unbound — contributed a spurious
+            // `ShallowDehydrateValue<unknown>[]`, and every read of the column
+            // was a TS2322.
+            //
+            // Rebinding is by the check EXPRESSION rather than by a symbol:
+            // that is what the branches were instantiated against, and it is
+            // the only handle left once the parameter is gone. The memo is
+            // switched off (`map_id = null`) for the duration — the answer is
+            // a function of the constituent too, which the `(map, type)` key
+            // cannot express.
+            if (s.condDistributive(t) and s.kind(check0) != .type_param) {
+                const new_check = try c.instantiateId(check0, map, map_id);
+                if (new_check != check0 and s.kind(new_check) == .union_type) {
+                    const saved_subst = c.cond_check_subst;
+                    defer c.cond_check_subst = saved_subst;
+                    var parts: std.ArrayList(TypeId) = .empty;
+                    defer parts.deinit(c.scratch());
+                    for (try c.memberList(new_check)) |m| {
+                        c.cond_check_subst = .{ .from = check0, .to = m };
+                        const ext_m = try c.instantiateId(s.condExtends(t), map, null);
+                        const tru_m = try c.instantiateId(s.condTrue(t), map, null);
+                        const fls_m = try c.instantiateId(s.condFalse(t), map, null);
+                        c.cond_check_subst = saved_subst;
+                        try parts.append(c.scratch(), try c.reduceConditional(m, ext_m, tru_m, fls_m, false));
                     }
                     break :blk try s.makeUnion(c.scratch(), parts.items);
                 }

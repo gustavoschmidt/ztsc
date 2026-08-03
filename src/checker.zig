@@ -1111,6 +1111,11 @@ pub const Checker = struct {
     /// see the guard in `substThis`. Sized by the nesting `substThis` can
     /// reach: it spends one `inst_depth` per frame and bails past
     /// `max_instantiation_depth`.
+    /// While a distributive conditional is being rebound per union
+    /// constituent and its check is no longer a bare type parameter, the
+    /// check EXPRESSION and the constituent standing in for it. `instantiateId`
+    /// honours it at the top; see the `.conditional` arm.
+    cond_check_subst: ?struct { from: TypeId, to: TypeId } = null,
     this_subst_keys: [max_instantiation_depth + 2]u64 = @splat(0),
     /// The generic each open `substThis` frame is rewriting, when its subject
     /// is a reference — the growth test in `substThis` counts repeats of it.
