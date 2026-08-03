@@ -1376,7 +1376,7 @@ pub fn drainTypeArgConstraints(c: *Checker) Error!void {
                 break;
             }
         }
-        c.resetInstBudget();
+        c.inst_count = 0;
         try c.checkTypeArgConstraints(p.sym, args.items, arg_nodes);
     }
     c.pending_type_args.clearRetainingCapacity();

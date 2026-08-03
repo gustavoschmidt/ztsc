@@ -755,23 +755,6 @@ pub const Checker = struct {
     relation: std.AutoHashMapUnmanaged(u64, u8) = .empty,
     /// ref TypeId -> expanded structural type.
     expansions: std.AutoHashMapUnmanaged(TypeId, TypeId) = .empty,
-    /// The refs in `expansions` whose member table was materialized under a
-    /// TRIPPED instantiation budget, i.e. with some subtree truncated to
-    /// `error_type`. Such a table is not a function of the ref: it is a
-    /// function of how much of the current source element's budget happened
-    /// to be left when the first reader asked for it. Published, it makes
-    /// every LATER source element read that accident — so WHICH refs come
-    /// back with `error` members becomes a function of statement order,
-    /// which the file partition decides, and immich's `--checkers=1` vs `4`
-    /// key sets diverged measurably on exactly that.
-    ///
-    /// So the entry lives for one budget epoch and no longer:
-    /// `resetInstBudget` drops it wherever `inst_count` is reset. Within the
-    /// epoch the table is still shared — a single source element that
-    /// re-reaches the same builder interface fifty times still pays once,
-    /// which is the amortization the expansion memo exists for, and dropping
-    /// that outright costs drizzle-orm two TS2589s.
-    truncated_expansions: std.ArrayList(TypeId) = .empty,
     /// `.overloads` TypeId -> the index at which its LAST declaration group
     /// starts. An entry exists only for a merged global function whose
     /// signatures come from two groups of declarations (the default library,
@@ -1806,7 +1789,7 @@ pub const Checker = struct {
         if (f != c.cur_file) {
             c.setFile(f);
             c.this_type = 0;
-            c.resetInstBudget();
+            c.inst_count = 0;
         }
         return saved;
     }
@@ -2327,23 +2310,6 @@ pub const Checker = struct {
 
     pub fn anchorInst(c: *Checker, node: Node) void {
         c.inst_anchor = .{ .node = .{ .file = c.cur_file, .node = node } };
-    }
-
-    /// Open a new instantiation-budget epoch: `max_instantiation_count` is
-    /// scoped to one source element (tsc resets `instantiationCount` in
-    /// `checkSourceElement`), so every site that resets the counter goes
-    /// through here.
-    ///
-    /// Withdrawing the epoch's TRUNCATED expansions is the other half of the
-    /// reset: a member table cut short by *this* element's exhausted budget
-    /// is an artifact of this element, and letting it outlive the counter
-    /// that produced it is how one expensive statement silently turned a
-    /// receiver into `error_type` for every statement after it. See
-    /// `truncated_expansions`.
-    pub fn resetInstBudget(c: *Checker) void {
-        c.inst_count = 0;
-        for (c.truncated_expansions.items) |ref| _ = c.expansions.remove(ref);
-        c.truncated_expansions.clearRetainingCapacity();
     }
 
     pub fn nodeTag(c: *const Checker, node: Node) ast.Tag {
