@@ -591,7 +591,7 @@ pub const map_containers = [_][]const u8{
     "flow_reach",               "member_type_stack",      "lazy_index_objs",
     "pending_type_args",        "pending_type_args_pool", "pending_type_args_seen",
     "tp_constrained_cache",     "nominal_bases",          "nominal_base_pool",
-    "keyof_mapped_active",      "ctp_syms_seen",
+    "keyof_mapped_active",      "ctp_syms_seen",          "weak_types",
 };
 
 /// Where one symbol's declared heritage lives in `Checker.nominal_base_pool`.
@@ -1236,6 +1236,60 @@ pub const Checker = struct {
     /// / `Unreliable`, same purpose: a measurement whose relation was truncated
     /// must fall back to the structural walk, not silently answer "bivariant".
     rel_guard_tripped: bool = false,
+    /// Nesting depth of an INTERSECTION-target decomposition. tsc relates a
+    /// source to each constituent of an intersection target with
+    /// `IntersectionState.Target`, which — among other things — turns the
+    /// weak-type check off for those inner frames: only the intersection as a
+    /// whole is judged weak (`isWeakType` requires *every* constituent to be),
+    /// never one constituent on its own. Without that, `{a: 1}` against
+    /// `{a: number} & {b?: string}` would be rejected for having nothing in
+    /// common with `{b?: string}`. See `weakTypeMismatch`.
+    rel_intersection_target: u16 = 0,
+    /// Nesting depth of a SUBTYPE-REDUCTION probe (`reduceSubtypes`), where
+    /// the weak-type check is not consulted. tsc reduces with
+    /// `strictSubtypeRelation`, which does run the check — but what keeps
+    /// tsc's answer clean for the shape this matters on is a different rule
+    /// entirely: a union constituent that is an OBJECT LITERAL type and lacks
+    /// the accessed property contributes `undefined` rather than making the
+    /// property unreadable (`createUnionOrIntersectionProperty`'s
+    /// WritePartial arm), so `let v = null; … v = { z: 1 }` reads `v?.y` as
+    /// `number | undefined` even though `{ z: number }` survives the union.
+    /// ztsc has no object-literal facet to carry that distinction (freshness
+    /// is stripped by widening), and reaches the same answer by ABSORBING the
+    /// constituent instead. Letting the weak rule block that absorption would
+    /// turn a matched line into a phantom TS2339 (conformance flow/062);
+    /// suppressing it here only ever makes a union smaller, so it can add no
+    /// diagnostic. The residual divergence — an ANNOTATED sibling that tsc
+    /// keeps and reports on — is pre-existing and unchanged.
+    weak_rule_off: u16 = 0,
+    /// Nesting depth of a UNION-target decomposition whose members include a
+    /// CALLABLE one. Inside it a callable source is not weak-rejected: the
+    /// callable constituent is the one that decides, and if it accepts (which
+    /// is what tsc concludes for every such shape ztsc currently gets right)
+    /// the weak constituent's verdict never mattered.
+    ///
+    /// The narrowing exists because the two verdicts are not independent in
+    /// ztsc: a callable constituent ztsc wrongly rejects used to be rescued by
+    /// the weak constituent accepting VACUOUSLY, and turning that vacuous
+    /// acceptance into a rejection converts a silent miss into a phantom
+    /// TS2769 plus uncontextualized-parameter TS7006s. kysely's
+    /// `set(update: UpdateObject<…> | UpdateObjectFactory<…>)` is that shape:
+    /// `UpdateObject` is an all-optional mapped type, and the factory's return
+    /// type only checks once `fn<O>(…): ExpressionWrapper<DB, TB, O>` recovers
+    /// `O` from a UNION contextual type — inference ztsc does not yet do (the
+    /// gap is the builder-chain family, tracked with the rest of it). Skipping
+    /// the rejection restores exactly the pre-rule behaviour on those shapes,
+    /// so it can only ever LOSE a diagnostic tsc reports, never add one.
+    ///
+    /// `fs.watch(path, listener)` — the shape the weak rule exists for — is
+    /// unaffected: its first overload's parameter is
+    /// `WatchOptionsWithStringEncoding | BufferEncoding | null`, three
+    /// constituents and not one of them callable.
+    union_callable_sibling: u16 = 0,
+    /// Memo for `isWeakType`: TypeId -> 1 weak / 0 not. The weak-type check
+    /// runs on every relation frame with an object-ish target, and answering
+    /// it means resolving the target's members, so the answer is kept.
+    weak_types: std.AutoHashMapUnmanaged(TypeId, u8) = .empty,
     /// Occupancy of the two stacks above, bucketed by the low bits of the
     /// symbol (`rel_id_bucket`). A bucket below `max_relation_identity_repeats`
     /// cannot hold that many occurrences of ANY symbol, so the scan the guard
@@ -2910,6 +2964,11 @@ pub const Checker = struct {
     pub const refFacetOf = assign_zig.refFacetOf;
     pub const relIdDeeplyNested = assign_zig.relIdDeeplyNested;
     pub const isAssignable = assign_zig.isAssignable;
+    pub const isWeakType = assign_zig.isWeakType;
+    pub const weakTypeMismatch = assign_zig.weakTypeMismatch;
+    pub const weakTargetKnows = assign_zig.weakTargetKnows;
+    pub const unionHasCallableMember = assign_zig.unionHasCallableMember;
+    pub const isCallableSource = assign_zig.isCallableSource;
     pub const nominalHeritageRelated = assign_zig.nominalHeritageRelated;
     pub const declaredBaseRefs = assign_zig.declaredBaseRefs;
     pub const condTrueUnderExtends = assign_zig.condTrueUnderExtends;

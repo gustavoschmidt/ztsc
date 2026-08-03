@@ -2673,6 +2673,10 @@ pub fn reduceSubtypes(c: *Checker, t: TypeId) Error!TypeId {
     // Guard cost: `||`/`??` unions are tiny; skip pathological ones
     // (leaving the union untouched is always sound — never a new FP).
     if (members.len < 2 or members.len > 32) return t;
+    // The weak-type rule is not consulted while reducing — see
+    // `Checker.weak_rule_off`.
+    c.weak_rule_off += 1;
+    defer c.weak_rule_off -= 1;
     var kept: std.ArrayList(TypeId) = .empty;
     defer kept.deinit(c.scratch());
     outer: for (members, 0..) |m, i| {

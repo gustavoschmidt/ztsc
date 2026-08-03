@@ -991,6 +991,169 @@ pub fn isAssignable(c: *Checker, s0: TypeId, t0: TypeId) Error!bool {
     return relate(c, s0, t0, true);
 }
 
+/// tsc's `isWeakType`: an object type with at least one property, EVERY
+/// property optional, and no call signatures, no construct signatures and no
+/// index signatures. An intersection is weak when every constituent is.
+///
+/// A weak type is one nothing structurally fails to satisfy — `{ a?: X }`
+/// accepts `{}`, and so accepts any object at all — which is why TypeScript
+/// added a separate rule for it (TS2559 / "has no properties in common with").
+/// The rule is what picks the right `fs.watch` overload: the first takes
+/// `options?: WatchOptionsWithStringEncoding | …`, whose object constituent is
+/// weak, and a `(event, filename) => …` listener passed as the second argument
+/// would otherwise land there and leave the callback's parameters
+/// uncontextualized (two phantom TS7006 in immich's transcoding service).
+pub fn isWeakType(c: *Checker, t0: TypeId) Error!bool {
+    if (c.weak_types.get(t0)) |v| return v == 1;
+    const answer = try computeIsWeakType(c, t0);
+    try c.weak_types.put(c.cm(), t0, @intFromBool(answer));
+    return answer;
+}
+
+fn computeIsWeakType(c: *Checker, t0: TypeId) Error!bool {
+    const k0 = c.ts.kind(t0);
+    if (k0 == .intersection) {
+        const ms = try c.memberList(t0);
+        if (ms.len == 0) return false;
+        for (ms) |m| {
+            if (!try c.isWeakType(m)) return false;
+        }
+        return true;
+    }
+    // Only a materialized object shape can be weak; everything else
+    // (primitives, unions, type parameters, deferred operators) is not.
+    if (k0 != .object and k0 != .ref) return false;
+    const t = try c.resolveStructural(t0);
+    if (c.ts.kind(t) == .intersection) return c.isWeakType(t);
+    if (c.ts.kind(t) != .object) return false;
+    const n = c.ts.objectPropCount(t);
+    if (n == 0) return false;
+    if (c.ts.objectStringIndex(t) != 0 or c.ts.objectNumberIndex(t) != 0) return false;
+    if (c.ts.objectCallSigCount(t) != 0 or c.ts.objectConstructSigCount(t) != 0) return false;
+    for (0..n) |i| {
+        if (!c.ts.objectProp(t, @intCast(i)).optional()) return false;
+    }
+    return true;
+}
+
+/// tsc's `isKnownProperty` for a weak-type target: does `t` declare `name`,
+/// or an index signature that would cover it?
+pub fn weakTargetKnows(c: *Checker, t: TypeId, name: Atom) Error!bool {
+    if (c.ts.kind(t) == .intersection or c.ts.kind(t) == .union_type) {
+        for (try c.memberList(t)) |m| {
+            if (try c.weakTargetKnows(m, name)) return true;
+        }
+        return false;
+    }
+    return (try c.propOfTypeEx(t, name, true)) != null;
+}
+
+/// tsc's common-property check for a weak target: the source and the target
+/// must share at least one property name, otherwise the two are unrelated
+/// however vacuously the structural walk would succeed.
+///
+/// Returns true when the pair must be REJECTED. Gated exactly as tsc gates it
+/// (`isPerformingCommonPropertyChecks`): the source is a primitive, an object
+/// or an intersection — never a union or a type variable — and carries at
+/// least one property or a call/construct signature; the target is an object
+/// or intersection and is weak; and the frame is not one of the constituent
+/// frames an intersection TARGET decomposes into.
+/// Is `s` a callable source, and does the union `t` offer a callable
+/// constituent to judge it? See `Checker.union_callable_sibling`.
+pub fn unionHasCallableMember(c: *Checker, s: TypeId, sk: types.Kind, t: TypeId) Error!bool {
+    if (!try c.isCallableSource(s, sk)) return false;
+    for (try c.memberList(t)) |m| {
+        const rm = try c.resolveStructural(m);
+        switch (c.ts.kind(rm)) {
+            .function, .overloads => return true,
+            .object => if (c.ts.objectCallSigCount(rm) != 0) return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
+/// A source that carries call signatures and no properties of its own — a
+/// function value, in other words, however it happens to be materialized.
+pub fn isCallableSource(c: *Checker, s: TypeId, sk: types.Kind) Error!bool {
+    if (sk == .function or sk == .overloads) return true;
+    if (sk != .object and sk != .ref) return false;
+    const rs = try c.resolveStructural(s);
+    if (c.ts.kind(rs) != .object) return false;
+    return c.ts.objectCallSigCount(rs) != 0 and c.ts.objectPropCount(rs) == 0;
+}
+
+pub fn weakTypeMismatch(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: types.Kind, src_fresh: bool) Error!bool {
+    if (c.rel_intersection_target != 0 or c.weak_rule_off != 0) return false;
+    if (c.union_callable_sibling != 0 and try c.isCallableSource(s, sk)) return false;
+    switch (tk) {
+        .object, .ref, .intersection => {},
+        else => return false,
+    }
+    switch (sk) {
+        // tsc's `Primitive | Object | Intersection`. `.ref` and `.class_value`
+        // are object types; `.function`/`.overloads` are the callable object
+        // types the rule most often fires on. Unions and type variables are
+        // deliberately absent — a union source distributes, and a type
+        // variable is judged through its constraint elsewhere.
+        .object, .ref, .intersection, .function, .overloads, .class_value, .array, .tuple => {},
+        .string, .number, .boolean, .bigint, .symbol, .string_literal, .number_literal, .number_literal_fresh, .bigint_literal, .bool_true, .bool_false, .enum_type, .unique_symbol => {},
+        else => return false,
+    }
+    // A FRESH object literal is the excess-property check's business, not this
+    // one. tsc runs `isPerformingExcessPropertyChecks` first and it answers
+    // for every fresh source — a literal with a property the weak target does
+    // not know is excess (TS2353), and one whose properties are all known has
+    // a property in common by construction — so the weak rule can never be
+    // what a fresh literal is rejected by. ztsc runs the excess check at the
+    // syntactic site rather than inside the relation, so rejecting here would
+    // pre-empt it: the site would never see the literal reach its target. It
+    // would also make an evolving `let v = null; … v = { z: 1 }` keep a
+    // constituent tsc's subtype reduction drops (conformance flow/062).
+    if (src_fresh) return false;
+    if (!try c.isWeakType(t)) return false;
+    // Source side: properties, or (for the callable case) a signature.
+    const rs = try c.resolveStructural(s);
+    var has_sig = false;
+    var props: []const Atom = &.{};
+    var buf: std.ArrayList(Atom) = .empty;
+    defer buf.deinit(c.scratch());
+    switch (c.ts.kind(rs)) {
+        .object => {
+            if (c.ts.objectCallSigCount(rs) != 0 or c.ts.objectConstructSigCount(rs) != 0) has_sig = true;
+            for (0..c.ts.objectPropCount(rs)) |i|
+                try buf.append(c.scratch(), c.ts.objectProp(rs, @intCast(i)).name);
+            props = buf.items;
+        },
+        .function, .overloads => has_sig = true,
+        .intersection => {
+            for (try c.memberList(rs)) |m| {
+                const rm = try c.resolveStructural(m);
+                switch (c.ts.kind(rm)) {
+                    .function, .overloads => has_sig = true,
+                    .object => {
+                        if (c.ts.objectCallSigCount(rm) != 0 or c.ts.objectConstructSigCount(rm) != 0) has_sig = true;
+                        for (0..c.ts.objectPropCount(rm)) |i|
+                            try buf.append(c.scratch(), c.ts.objectProp(rm, @intCast(i)).name);
+                    },
+                    else => {},
+                }
+            }
+            props = buf.items;
+        },
+        // A primitive source has the apparent members of its wrapper
+        // interface, which never overlap a user weak type; tsc still runs the
+        // check on it (`string` is not assignable to `{ a?: X }`), and the
+        // structural walk already rejects those, so nothing is added here.
+        else => return false,
+    }
+    if (props.len == 0 and !has_sig) return false;
+    for (props) |p| {
+        if (try c.weakTargetKnows(t, p)) return false;
+    }
+    return true;
+}
+
 /// One relation frame. `memoize` is false for the single caller that
 /// DELEGATES its own frame's question unchanged — the `.ref` arm of
 /// `isAssignableInner`, which resolves a lazy reference to the very
@@ -1117,6 +1280,28 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!bool {
     // Literal -> base primitive.
     const base = try c.literalBaseOf(s);
     if (base != types.no_type and base == t) return true;
+
+    // The weak-type rule (tsc's `isPerformingCommonPropertyChecks`), ahead of
+    // the memo and the structural walk: a WEAK target — all-optional, no
+    // signatures, no index — is satisfied vacuously by anything, so tsc adds
+    // the requirement that the two share a property name. Placed here rather
+    // than inside the structural walk because a union target reaches its
+    // constituents through `isAssignableInner`, and tsc runs the check on each
+    // of those frames (which is what makes an overload whose parameter is
+    // `WeakOptions | BufferEncoding | null` reject a callback argument).
+    // A FRESH object literal source turns the rule off for this frame AND
+    // everything under it. tsc answers for a fresh literal with the
+    // excess-property check, which runs ahead of the weak check inside its
+    // relation; ztsc runs that check at the syntactic site instead, so the
+    // relation has to let the literal through for the site to see it — and
+    // "the literal" includes the re-materialized, regular-ized copies the
+    // frames below this one work with, which no longer carry the flag.
+    const src_fresh = c.ts.objectIsFresh(s1);
+    if (src_fresh) c.weak_rule_off += 1;
+    defer if (src_fresh) {
+        c.weak_rule_off -= 1;
+    };
+    if (try c.weakTypeMismatch(s, t, sk, tk, src_fresh)) return false;
 
     // Cache compound comparisons (recursion termination for refs), keyed on
     // what each side DENOTES rather than on the TypeId it happens to be: a
@@ -1663,6 +1848,15 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
         }
     }
     if (tk == .union_type) {
+        // A callable constituent decides for a callable source — see
+        // `Checker.union_callable_sibling`. Only consulted while the weak-type
+        // rule could fire (a callable source), so the scan costs nothing on
+        // the overwhelming majority of union targets.
+        const callable_sibling = try c.unionHasCallableMember(s, sk, t);
+        if (callable_sibling) c.union_callable_sibling += 1;
+        defer if (callable_sibling) {
+            c.union_callable_sibling -= 1;
+        };
         for (try c.memberList(t)) |m| {
             if (try c.isAssignable(s, m)) return true;
         }
@@ -1712,6 +1906,11 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
             if (try c.hasNullishMember(s)) return false;
             if (try c.intersectionPairAssignable(s, t)) |r| return r;
         }
+        // tsc's `IntersectionState.Target` for the weak-type check: the
+        // intersection is judged weak as a WHOLE (above, in `relate`), never
+        // one constituent at a time — `{a: 1}` meets `{a: number} & {b?: X}`.
+        c.rel_intersection_target += 1;
+        defer c.rel_intersection_target -= 1;
         for (try c.memberList(t)) |m| {
             if (!try c.isAssignable(s, m)) return false;
         }
@@ -3855,6 +4054,19 @@ pub fn tryReportMissingProps(c: *Checker, src_t: TypeId, target: TypeId, span: S
 }
 
 pub fn reportNotAssignable(c: *Checker, code: u16, src_t: TypeId, target: TypeId, span: Span) Error!void {
+    // Weak-type headline (tsc TS2559). The check that rejected the pair runs
+    // at the top of the relation, ahead of the structural walk, so its message
+    // REPLACES the assignability headline rather than elaborating under it —
+    // including in argument position, where tsc's head message is skipped and
+    // the diagnostic comes out as 2559 rather than 2345.
+    if (code == 2322 or code == 2345) {
+        if (try c.weakTypeMismatch(src_t, target, c.ts.kind(src_t), c.ts.kind(target), c.ts.objectIsFresh(src_t))) {
+            try c.diagFmt(2559, span, "Type '{s}' has no properties in common with type '{s}'.", .{
+                try c.typeToString(src_t), try c.typeToString(target),
+            });
+            return;
+        }
+    }
     // Missing-property refinement (tsc: 2739 / 2741 instead of 2322).
     if (code == 2322) {
         if (try c.tryReportMissingProps(src_t, target, span)) return;
