@@ -111,17 +111,116 @@ pub fn conditionalTypeFromNode(c: *Checker, node: Node) Error!TypeId {
     return c.reduceConditional(chk, extends_ty, true_ty, false_ty, distributive);
 }
 
+/// What a conditional's check/extends pair decides — computed WITHOUT
+/// either branch.
+///
+/// A conditional's branches are two whole type subtrees, and a resolution
+/// keeps exactly one of them. Substituting both and then throwing one away
+/// is not merely wasted work: the discarded walk still charges the
+/// per-statement instantiation budget and still raises TS2589 when it runs
+/// past the depth cap, so a branch nobody asked for can be the reason a
+/// statement truncates — and a truncated type is what turns into a cascade
+/// of TS7006 / TS2554 / TS2769 at the call sites downstream.
+/// `conditional/042` is that shape reduced to eight lines.
+///
+/// tsc never pays it: `getConditionalType` resolves the check first and
+/// instantiates only the branch it selects. `planConditional` is that
+/// split — the caller substitutes the branch the plan asks for, and
+/// nothing else. Measured on immich's kysely query builders (the corpus
+/// that motivated it): total node visits 12.36 M → 12.00 M at
+/// `--checkers=1`, wall 3.83 s → 3.52 s, and five false positives gone,
+/// including a whole repository helper that had collapsed to `any`.
+pub const CondPlan = union(enum) {
+    /// Fully determined; neither branch is needed.
+    value: TypeId,
+    /// The true branch, with these `infer` bindings substituted into it.
+    take_true: Bindings,
+    /// The false branch, verbatim (an `infer` binder is out of scope there).
+    take_false,
+    /// An `any` check takes BOTH branches (see `planConcreteConditional`).
+    both_any: Bindings,
+    /// Undecided: the caller materializes both branches and calls
+    /// `finishCondPlan`.
+    need_both: Rest,
+
+    /// Slices into the caller's scratch, valid until the enclosing
+    /// substitution frame unwinds — which is exactly as long as the branch
+    /// the caller is about to substitute them into lives.
+    pub const Bindings = struct { ids: []const u32, vals: []const TypeId };
+    pub const Rest = enum { defer_symbolic, distribute };
+};
+
 /// The single evaluation point for a conditional, used at build time and
 /// on each instantiation: defer while a check/extends is still generic,
 /// otherwise resolve concretely. Distribution over a naked-param union is
 /// handled by `instantiateId` (it holds the substitution map needed to
 /// re-bind the param per member). Counts against the TS2589 depth/count
 /// budget so a self-referential conditional terminates.
+///
+/// The eager form: both branches are already materialized. A caller that
+/// can defer materializing them — every substitution walk — should run
+/// `planConditional` and materialize only what the plan names.
 pub fn reduceConditional(c: *Checker, chk: TypeId, extends_ty: TypeId, true_ty: TypeId, false_ty: TypeId, distributive: bool) Error!TypeId {
+    const plan = try c.planConditional(chk, extends_ty, distributive);
+    return c.finishCondPlan(plan, chk, extends_ty, true_ty, false_ty, distributive);
+}
+
+/// Apply a plan once both branches exist. `take_true`/`take_false` readers
+/// that materialize lazily inline the two cheap arms themselves and only
+/// come here for `need_both`.
+pub fn finishCondPlan(c: *Checker, plan: CondPlan, chk: TypeId, extends_ty: TypeId, true_ty: TypeId, false_ty: TypeId, distributive: bool) Error!TypeId {
+    const s = &c.ts;
+    switch (plan) {
+        .value => |v| return v,
+        .take_false => return false_ty,
+        .take_true => |b| return c.condTrueBranch(b, true_ty),
+        .both_any => |b| {
+            const t = try c.substInfer(true_ty, b.ids, b.vals);
+            return c.makeUnion2(t, false_ty);
+        },
+        .need_both => |rest| switch (rest) {
+            .defer_symbolic => return s.makeConditional(chk, extends_ty, true_ty, false_ty, distributive),
+            .distribute => {
+                var parts: std.ArrayList(TypeId) = .empty;
+                defer parts.deinit(c.scratch());
+                for (try c.memberList(chk)) |m| {
+                    // A distributive conditional's true/false branch may BE
+                    // the check type (`T extends U ? never : T` = Exclude,
+                    // `? T : never` = Extract). When the naked-type-param
+                    // distribution in `instantiateId` was bypassed — because
+                    // the instantiated check is not a naked param but a
+                    // `keyof X` / indexed access that resolved to this union
+                    // (the `Omit`/`Exclude<keyof T, K>` composition) — the
+                    // branch was baked to the WHOLE union instead of the
+                    // per-member value. Rebind a branch that IS the check to
+                    // the current member so `Omit<T, K>` actually strips the
+                    // excluded keys. A branch that doesn't reference the
+                    // check (e.g. `never`) is untouched, so ordinary
+                    // distributions (Awaited) are unchanged.
+                    const tru_m = if (true_ty == chk) m else true_ty;
+                    const fls_m = if (false_ty == chk) m else false_ty;
+                    try parts.append(c.scratch(), try c.reduceConditional(m, extends_ty, tru_m, fls_m, false));
+                }
+                return s.makeUnion(c.scratch(), parts.items);
+            },
+        },
+    }
+}
+
+/// The true branch of a resolved conditional: bind this conditional's own
+/// `infer` variables into it, then drive a recursive alias the branch
+/// handed back (see `driveShrinkingAlias`).
+pub fn condTrueBranch(c: *Checker, b: CondPlan.Bindings, true_ty: TypeId) Error!TypeId {
+    const tb = try c.substInfer(true_ty, b.ids, b.vals);
+    if (try c.driveShrinkingAlias(tb)) |reduced| return reduced;
+    return tb;
+}
+
+pub fn planConditional(c: *Checker, chk: TypeId, extends_ty: TypeId, distributive: bool) Error!CondPlan {
     if (c.inst_depth > max_instantiation_depth or c.inst_count > max_instantiation_count) {
         c.inst_limit_tripped = true;
         if (!c.suppress_inst_diag) try c.instLimitDiag(2589, "Type instantiation is excessively deep and possibly infinite.");
-        return types.error_type;
+        return .{ .value = types.error_type };
     }
     c.inst_depth += 1;
     c.inst_count += 1;
@@ -135,34 +234,16 @@ pub fn reduceConditional(c: *Checker, chk: TypeId, extends_ty: TypeId, true_ty: 
     // symbolic so substInfer re-enters here once F resolves. Without this,
     // it would relate against an unbound infer var and collapse to `never`.
     if (s.kind(chk) == .infer_var) {
-        return s.makeConditional(chk, extends_ty, true_ty, false_ty, distributive);
+        return .{ .need_both = .defer_symbolic };
     }
     // Distribute a distributive conditional over a concrete union check
     // member-wise (the naked check resolved, via substInfer, to a union
     // like `fn | undefined | null`). Each member is inferred independently
     // and the results unioned — this is what lets Awaited pick the callable
-    // `then` argument out of its `| undefined | null`.
+    // `then` argument out of its `| undefined | null`. Each member may pick
+    // a different branch, so both are wanted.
     if (distributive and s.kind(chk) == .union_type) {
-        var parts: std.ArrayList(TypeId) = .empty;
-        defer parts.deinit(c.scratch());
-        for (try c.memberList(chk)) |m| {
-            // A distributive conditional's true/false branch may BE the
-            // check type (`T extends U ? never : T` = Exclude, `? T :
-            // never` = Extract). When the naked-type-param distribution in
-            // `instantiateId` was bypassed — because the instantiated check
-            // is not a naked param but a `keyof X` / indexed access that
-            // resolved to this union (the `Omit`/`Exclude<keyof T, K>`
-            // composition) — the branch was baked to the WHOLE union
-            // instead of the per-member value. Rebind a branch that IS the
-            // check to the current member so `Omit<T, K>` actually strips
-            // the excluded keys. A branch that doesn't reference the check
-            // (e.g. `never`) is untouched, so ordinary distributions
-            // (Awaited) are unchanged.
-            const tru_m = if (true_ty == chk) m else true_ty;
-            const fls_m = if (false_ty == chk) m else false_ty;
-            try parts.append(c.scratch(), try c.reduceConditional(m, extends_ty, tru_m, fls_m, false));
-        }
-        return s.makeUnion(c.scratch(), parts.items);
+        return .{ .need_both = .distribute };
     }
     // Defer while a mapped key parameter is still unbound: a
     // conditional in a mapped type's `as`/value branch (`P extends K ?
@@ -218,7 +299,7 @@ pub fn reduceConditional(c: *Checker, chk: TypeId, extends_ty: TypeId, true_ty: 
         if (!ext_generic) {
             const chk_shape = if (s.kind(chk_d) == .ref) try c.resolveStructural(chk_d) else chk_d;
             if (s.kind(chk_shape) == .object and try c.objectDecidablyNotExtends(chk_shape, ext_d)) {
-                return false_ty;
+                return .take_false;
             }
         }
         // A concrete *function* check (`(value: number) => Promise<R> | R`
@@ -229,7 +310,7 @@ pub fn reduceConditional(c: *Checker, chk: TypeId, extends_ty: TypeId, true_ty: 
         // this is what lets Awaited unwrap a real Promise's `then` callback
         // without erasing the method's own `TResult` params.
         if (!ext_generic and s.kind(chk) == .function and s.kind(try c.resolveStructural(extends_ty)) == .function) {
-            return c.resolveConcreteConditional(chk, extends_ty, true_ty, false_ty, distributive);
+            return c.planConcreteConditional(chk, extends_ty);
         }
         // An array/tuple check against an array pattern whose element is a
         // bare `infer` — the lib's `FlatArray`, `Arr extends
@@ -240,16 +321,24 @@ pub fn reduceConditional(c: *Checker, chk: TypeId, extends_ty: TypeId, true_ty: 
         // deferring. Deferring left `arr.flat()` as an unreduced
         // conditional that related to nothing.
         if (!ext_generic and try c.arrayDecidablyExtends(chk, extends_ty)) {
-            return c.resolveConcreteConditional(chk, extends_ty, true_ty, false_ty, distributive);
+            return c.planConcreteConditional(chk, extends_ty);
         }
-        return s.makeConditional(chk, extends_ty, true_ty, false_ty, distributive);
+        return .{ .need_both = .defer_symbolic };
     }
-    return c.resolveConcreteConditional(chk, extends_ty, true_ty, false_ty, distributive);
+    return c.planConcreteConditional(chk, extends_ty);
 }
 
 pub fn resolveConcreteConditional(c: *Checker, chk: TypeId, extends_ty: TypeId, true_ty: TypeId, false_ty: TypeId, distributive: bool) Error!TypeId {
+    const plan = try c.planConcreteConditional(chk, extends_ty);
+    return c.finishCondPlan(plan, chk, extends_ty, true_ty, false_ty, distributive);
+}
+
+pub fn planConcreteConditional(c: *Checker, chk: TypeId, extends_ty: TypeId) Error!CondPlan {
+    // Kept in scratch, never freed here: `ids`/`vals` are handed back to
+    // the caller, which substitutes them into a branch it has yet to
+    // materialize. The enclosing substitution frame's arena mark releases
+    // them (see `instantiateId`'s per-frame rewind).
     var ids: std.ArrayList(u32) = .empty;
-    defer ids.deinit(c.scratch());
     var refs: std.ArrayList(u32) = .empty;
     defer refs.deinit(c.scratch());
     try c.collectInferVars(extends_ty, &ids, &refs);
@@ -273,7 +362,7 @@ pub fn resolveConcreteConditional(c: *Checker, chk: TypeId, extends_ty: TypeId, 
     // produced the malformed `undefined & RefObject<unknown>`.
     for (refs.items) |r| {
         if (indexOfId(ids.items, r) == null)
-            return c.ts.makeConditional(chk, extends_ty, true_ty, false_ty, distributive);
+            return .{ .need_both = .defer_symbolic };
     }
     // The same rule applies to a binder mentioned inside the CHECK type. A
     // naked `M` check is caught earlier (`reduceConditional`'s `.infer_var`
@@ -291,7 +380,7 @@ pub fn resolveConcreteConditional(c: *Checker, chk: TypeId, extends_ty: TypeId, 
     try c.collectInferVars(chk, &chk_vars, &chk_vars);
     for (chk_vars.items) |v| {
         if (indexOfId(ids.items, v) == null)
-            return c.ts.makeConditional(chk, extends_ty, true_ty, false_ty, distributive);
+            return .{ .need_both = .defer_symbolic };
     }
     // `any` as the check type takes *both* branches (tsc): infer vars bind
     // `any`, and the result is trueBranch | falseBranch. This is what makes
@@ -300,8 +389,7 @@ pub fn resolveConcreteConditional(c: *Checker, chk: TypeId, extends_ty: TypeId, 
     if (c.ts.kind(chk) == .any) {
         const any_vals = try c.scratch().alloc(TypeId, ids.items.len);
         for (any_vals) |*v| v.* = types.any_type;
-        const t = try c.substInfer(true_ty, ids.items, any_vals);
-        return c.makeUnion2(t, false_ty);
+        return .{ .both_any = .{ .ids = ids.items, .vals = any_vals } };
     }
     const vals = try c.scratch().alloc(TypeId, ids.items.len);
     for (vals) |*v| v.* = types.no_type;
@@ -325,11 +413,9 @@ pub fn resolveConcreteConditional(c: *Checker, chk: TypeId, extends_ty: TypeId, 
     }
     const resolved_extends = try c.substInfer(extends_ty, ids.items, vals);
     if (try c.isAssignable(chk, resolved_extends)) {
-        const tb = try c.substInfer(true_ty, ids.items, vals);
-        if (try c.driveShrinkingAlias(tb)) |reduced| return reduced;
-        return tb;
+        return .{ .take_true = .{ .ids = ids.items, .vals = vals } };
     }
-    return false_ty; // infer binders are out of scope in the false branch
+    return .take_false; // infer binders are out of scope in the false branch
 }
 
 /// Decidability rule for a check against an array pattern whose element is

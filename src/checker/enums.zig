@@ -1661,9 +1661,21 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
             }
             const chk = try c.instantiateId(check0, map, map_id);
             const ext = try c.instantiateId(s.condExtends(t), map, map_id);
-            const tru = try c.instantiateId(s.condTrue(t), map, map_id);
-            const fls = try c.instantiateId(s.condFalse(t), map, map_id);
-            break :blk try c.reduceConditional(chk, ext, tru, fls, s.condDistributive(t));
+            // Decide FIRST, substitute the winning branch only — see
+            // `CondPlan`. A fall-through chain of conditionals (kysely's
+            // reference-expression machinery is eight deep) costs its own
+            // length here instead of two to the power of it.
+            const plan = try c.planConditional(chk, ext, s.condDistributive(t));
+            switch (plan) {
+                .value => |v| break :blk v,
+                .take_false => break :blk try c.instantiateId(s.condFalse(t), map, map_id),
+                .take_true => |b| break :blk try c.condTrueBranch(b, try c.instantiateId(s.condTrue(t), map, map_id)),
+                .both_any, .need_both => {
+                    const tru = try c.instantiateId(s.condTrue(t), map, map_id);
+                    const fls = try c.instantiateId(s.condFalse(t), map, map_id);
+                    break :blk try c.finishCondPlan(plan, chk, ext, tru, fls, s.condDistributive(t));
+                },
+            }
         },
         .index_access => blk: {
             const obj = try c.instantiateId(s.indexAccessObj(t), map, map_id);
