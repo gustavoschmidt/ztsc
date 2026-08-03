@@ -110,9 +110,10 @@ pub fn resolveSpace(c: *Checker, a: Atom, from: ScopeId, want_value: bool) Resol
 /// equal-distance candidates the first-declared wins (verified against the
 /// pinned oracle: swapping two tied declarations swaps the suggestion).
 /// `member_atoms` is sorted by ATOM id for binary-search lookup, and atom
-/// ids depend on interning order across workers — iterating it and taking
-/// the first tie would make the message run-to-run nondeterministic, which
-/// it was. `member_syms` carries the binder's SymbolId, handed out in a
+/// ids are interning order, not declaration order — iterating it and taking
+/// the first tie would pick by an unrelated ordering (and, before the ids
+/// were made scheduling-independent, a run-to-run unstable one, which is how
+/// this surfaced). `member_syms` carries the binder's SymbolId, handed out in a
 /// single sequential walk of the file's AST, so it *is* declaration order:
 /// break ties toward the smaller symbol id and the pick matches tsc and is
 /// stable for any --workers/--checkers count.

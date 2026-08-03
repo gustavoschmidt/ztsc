@@ -176,6 +176,12 @@ pub const Interner = struct {
     /// `lookup` keeps working unchanged. The caller must rewrite every atom it
     /// stored during the front end through `map` — see `binder.Bind.remapAtoms`.
     ///
+    /// Ids handed out *after* this point continue past the renumbered ones.
+    /// The link phase is serial, so its atoms are deterministic; names the
+    /// checkers intern (mapped-type key remaps, template-literal results) are
+    /// numbered as the parallel instances reach them, which is why the output
+    /// boundary orders properties by text (`print.propDisplayOrder`).
+    ///
     /// Single-threaded: call with the worker pool joined.
     pub fn renumber(
         self: *Interner,

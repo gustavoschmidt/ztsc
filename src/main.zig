@@ -6,6 +6,14 @@
 //! before any concurrent user-file work. Its output enters discovery as
 //! ready-made completions, so the lib is never queued to the pool.
 //!
+//! Atoms the *concurrent* front end hands out are pinned differently: they
+//! are reassigned once discovery is done, replaying each file's first-touch
+//! list in graph order so the ids are the ones a single-threaded front end
+//! would have produced (`Interner.renumber`, the renumbering block below).
+//! Atoms are sort keys — scope member tables, merged namespace members,
+//! object property records — so without it the checker's traversal order,
+//! and the work it did, moved with worker scheduling.
+//!
 //! Module discovery is single-owner with a completion queue: the main
 //! thread is the sole owner of
 //! the module graph and seen-set (no locks on graph state); workers run

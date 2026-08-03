@@ -377,10 +377,12 @@ fn propertyStep(c: *Checker, s0: TypeId, s: TypeId, t: TypeId, depth: usize) Err
     }
 
     // The first incompatible property, in name-TEXT order. The stored order is
-    // by name ATOM, i.e. by interning order, which depends on how the program
-    // was partitioned across checker instances — text order keeps the rendered
-    // message a function of the program alone (the determinism contract
-    // `tryReportMissingProps` observes for the same reason).
+    // by name ATOM, i.e. by interning order, which is not the program's own
+    // order and — for names the checkers themselves intern — still depends on
+    // how the program was partitioned across checker instances. Text order
+    // keeps the rendered message a function of the program alone (the
+    // determinism contract `tryReportMissingProps` observes for the same
+    // reason).
     var best_name: Atom = 0;
     var best_s: TypeId = 0;
     var best_t: TypeId = 0;

@@ -626,9 +626,9 @@ test "TS2552 suggestion: equal-distance ties break by declaration order" {
     // two declarations swaps the suggestion — because it iterates the symbol
     // table in declaration order and only replaces the incumbent on a strictly
     // smaller distance. ztsc iterates `member_atoms`, which is sorted by atom
-    // id, and atom ids depend on interning order across workers: taking the
-    // first tie there made the message differ from run to run. The tie-break is
-    // on the binder's SymbolId, which is declaration order.
+    // id — interning order, and back then a scheduling-dependent one: taking
+    // the first tie there made the message differ from run to run. The
+    // tie-break is on the binder's SymbolId, which is declaration order.
     try expectSuggestion(
         \\declare const fooarbaz: number;
         \\declare const foobarbz: number;

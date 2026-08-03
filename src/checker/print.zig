@@ -421,10 +421,12 @@ pub fn sortMembersStructural(c: *Checker, members: []const TypeId, depth: u32) P
 
 /// Display order for an object type's `n` properties: their stored slots
 /// reordered by property-name *text*. Object props are stored sorted by
-/// name *atom* (see `types.makeObject`), but atom ids are assigned in
-/// parallel-intern order and so vary run-to-run and across --workers;
-/// text order is content-derived and therefore byte-identical for any
-/// worker/checker count. Names are unique within an object, so the order
+/// name *atom* (see `types.makeObject`), which is interning order: the front
+/// end's ids are scheduling-independent now (`Interner.renumber`), but names
+/// the *checker* interns — mapped-type key remaps, template-literal results —
+/// are still numbered as the parallel checkers reach them. Text order is
+/// content-derived and therefore byte-identical for any worker/checker count
+/// either way. Names are unique within an object, so the order
 /// is total (an unstable sort stays deterministic). Scratch-owned slice.
 pub fn propDisplayOrder(c: *Checker, t: TypeId, n: usize) Error![]u32 {
     const order = try c.scratch().alloc(u32, n);

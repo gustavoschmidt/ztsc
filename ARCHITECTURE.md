@@ -74,9 +74,16 @@ meaningful within the interner that produced it, so every phase on every
 thread has to agree on one. It is safe to share because it is **append-only**
 (atoms are never reassigned or removed) and **sharded** by string hash into 16
 independently locked shards, so concurrent interning contends only on a hash
-collision. Determinism does not depend on interning order — the lib's strings
-are seeded single-threaded first (`seedLibAtoms`, `src/main.zig:686`) so the
-atoms that matter are run-to-run stable.
+collision. Interning order used to be the one thing about it that was not
+run-to-run stable — an `Atom` encodes its shard-local insertion index, so the
+ids depended on which worker got to a string first, and atoms are sort keys
+downstream. The front end now hands out the ids a *serial* front end would
+have: every file records the atoms it touched in first-touch order, and after
+discovery the driver replays those lists in the program's graph-derived file
+order and reassigns every id (`Interner.renumber`, `src/main.zig`). A run with
+one worker gets an identity permutation; a run with sixteen gets the same ids
+it does. Strings interned before the pool starts (the lib front end) are frozen
+in place and never move.
 
 **The `fs_probes` counter** (`src/link/resolve.zig:646`) — a
 `std.atomic.Value(u64)` counting filesystem syscalls for the `--timing`
@@ -205,18 +212,22 @@ were not.
 configuration, run N times. Agreement across configurations does not imply
 agreement with yourself — a single checker is still fed by a multi-threaded
 front end, so two runs of `--checkers=1` are two different interleavings.
-Concretely, the atom *set* is identical every run but the id assignment never
-is (`Interner.intern` numbers by per-shard insertion order), and atoms are
+Concretely, the atom *set* was identical every run but the id assignment was
+not (`Interner.intern` numbers by per-shard insertion order), and atoms are
 sort keys for a scope's member table (`Binder.seal`) and for a merged
 namespace's member index (`Merger.buildNsMembers`) — so the order the checker
-reaches types in varies by design, and the contract is that nothing observable
-may depend on it. The bug that motivated the script was an internal quantity
-that did: the instantiation budget exempted origin-tagging work, so a
+reached types in moved with scheduling, and the contract is that nothing
+observable may depend on it. The bug that motivated the script was an internal
+quantity that did: the instantiation budget exempted origin-tagging work, so a
 memoized first visit was charged or not depending on which side of the exempt
 window it fell on, and `inst_count` moved between repeat runs on drizzle-orm.
 Diagnostics never followed it (the budget is dormant), but it gates TS2589 —
 an order-dependent decision variable is a defect whether or not it has
-surfaced yet.
+surfaced yet. The atom order itself is deterministic now (see the interner
+above), which is why the script compares the traversal counters strictly, and
+compares a `--workers=1` run against the parallel one rather than only against
+itself: the front end is a pure function of the file set, so the same program
+must do the same work at any worker count.
 
 `bench/convergence.sh` runs both axes again on a whole *application* — an
 excalidraw checkout, passed in with `EXC=` because it is a gigabyte and not

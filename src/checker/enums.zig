@@ -1229,11 +1229,12 @@ pub fn instantiate(c: *Checker, t: TypeId, map: []const TpMap) Error!TypeId {
 /// program. Substitution results are memoized (`inst_cache`), so only the
 /// *first* visit of a given `(map_id, type)` pair is counted; whether that
 /// first visit lands inside one of these windows or outside it depends on
-/// the order the checker reaches types in. That order is not run-to-run
-/// stable: atom ids come from the interner's per-shard insertion order,
-/// which the parallel front end varies between runs, and atoms are sort
-/// keys for a scope's member table (`binder.Binder.seal`) and for a merged
-/// namespace's member index (`modules.Merger.buildNsMembers`). Restoring
+/// the order the checker reaches types in — an implementation detail either
+/// way, and one that was not even run-to-run stable when this was written:
+/// atom ids came from the interner's per-shard insertion order, which the
+/// parallel front end varied between runs, and atoms are sort keys for a
+/// scope's member table (`binder.Binder.seal`) and for a merged namespace's
+/// member index (`modules.Merger.buildNsMembers`). Restoring
 /// the count therefore subtracted a run-varying amount from it: on
 /// drizzle-orm at `--checkers=1`, repeat runs of the same binary on the
 /// same input charged 56,988 / 57,018 / 57,093 of an invariant 57,359
@@ -1345,9 +1346,10 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
     // `chainRepeats` cut near the start of a big expansion suppressed
     // memoization of every unrelated sibling reached after it. Which
     // siblings those are is the order the walk reaches them in, and that
-    // order is not run-to-run stable (see `bench/repeat_sweep.sh`: object
-    // property records are sorted by name atom and atom ids come from the
-    // parallel interner's per-shard insertion order). drizzle-orm charged
+    // order was not run-to-run stable when this was found (see
+    // `bench/repeat_sweep.sh`: object property records are sorted by name atom
+    // and atom ids came from the parallel interner's per-shard insertion
+    // order, before the renumbering pinned them). drizzle-orm charged
     // 499,656 / 499,854 / 499,944 `inst cache misses` across repeats of one
     // binary for exactly that reason. Scoped to the subtree the test asks
     // the question it means — "was MY result truncated" — and the memo
