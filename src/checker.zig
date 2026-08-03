@@ -2425,6 +2425,35 @@ pub const Checker = struct {
         c.scopes_faulted[f] = true;
     }
 
+    /// Is the function lexically enclosing the node now being checked
+    /// `async`? Null at the top level of the file (no enclosing function).
+    ///
+    /// The SYNTACTIC answer — tsc's parser-assigned `NodeFlags.AwaitContext`
+    /// — which is what `await`/`yield` legality is a property of. The dynamic
+    /// `fn_ctx` cannot answer it: an expression is re-checked from wherever a
+    /// later contextual type demands it, and the frame in flight then belongs
+    /// to some unrelated function. Walks the scope chain, so a class-member
+    /// or block scope in between is transparent.
+    pub fn enclosingFnIsAsync(c: *const Checker) ?bool {
+        var cur = c.cur_scope;
+        while (cur != binder.file_scope) {
+            if (c.bind.scope_kinds[cur] == .function) {
+                const owner = c.bind.scope_owners[cur];
+                if (owner == ast.null_node) return null;
+                // Every `.function` scope is created by `bindFunctionLike`
+                // (or `bindFunctionType`), whose owner node keeps its
+                // modifiers in an `FnProto` at `lhs`.
+                const flags = switch (c.tree.nodeTag(owner)) {
+                    .arrow_fn, .function_expr, .function_decl, .class_method, .function_type => c.tree.extraData(ast.FnProto, c.tree.nodeData(owner).lhs).flags,
+                    else => return null,
+                };
+                return flags & ast.Flags.async != 0;
+            }
+            cur = c.bind.scope_parents[cur];
+        }
+        return null;
+    }
+
     /// Nearest enclosing function/file scope (for TDZ containment).
     pub fn containerOf(c: *const Checker, s: ScopeId) ScopeId {
         var cur = s;

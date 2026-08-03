@@ -3059,8 +3059,19 @@ pub fn checkPrefixUnary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             // `await` legality: inside a non-async function → TS1308; at the
             // top level of a non-module file → TS1375 (top-level await is
             // otherwise allowed under module: esnext).
-            if (c.fn_ctx) |fc| {
-                if (!fc.is_async) {
+            //
+            // Judged SYNTACTICALLY, off the enclosing function scope, not off
+            // the dynamic `fn_ctx`. tsc reads a parser-assigned
+            // `NodeFlags.AwaitContext`, and it has to be a property of where
+            // the node is WRITTEN, because an expression can be re-checked
+            // from anywhere: resolving `counts` inside `[…].map(t =>
+            // counts.length)` re-enters the initializer of
+            // `const counts = await db` (a different contextual type, so a
+            // different `checkExprCached` key) while `fn_ctx` still describes
+            // the ARROW — which is not async, so a correct `await` in the
+            // enclosing async method reported TS1308.
+            if (c.enclosingFnIsAsync()) |is_async| {
+                if (!is_async) {
                     try c.diagFmt(1308, c.nodeSpan(node), "'await' expressions are only allowed within async functions and at the top levels of modules.", .{});
                 }
             } else if (c.bind.imports.len == 0 and c.bind.exports.len == 0) {
