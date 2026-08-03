@@ -1220,7 +1220,27 @@ pub fn inferTypeArgs(
             try c.unify(pt, at2, tp_syms, candidates, 0);
             continue;
         }
-        const at = try c.checkExprCached(an, arg_ctx);
+        var at = try c.checkExprCached(an, arg_ctx);
+        // tsc's `checkExpressionWithContextualType` strips a contextually
+        // typed literal's FRESHNESS before handing it to `inferTypes` —
+        // "such that contextually typed literals always preserve their
+        // literal types (otherwise they might widen during type inference)".
+        // The parameter is the contextual type here, so the test is whether
+        // it names a literal domain this argument belongs to.
+        //
+        // It is the whole difference between two shapes that look alike:
+        // `on(eventName: K | keyof T, …)` infers `K = "add"` because the
+        // union has a string-literal constituent for `"add"` to match — and
+        // it must, or the dependent `Listener<K, T>` conditional reduces to
+        // `never` and the listener's parameters are implicit `any`. Whereas
+        // `useState(initial: S | (() => S))` still widens `false` to
+        // `boolean`, because nothing in that union is a literal.
+        //
+        // The node's own cached type is untouched: only the evidence this
+        // call infers from is regularized, which is where tsc applies it too.
+        if (c.ts.isFreshLiteral(at) and try c.literalOfContextualType(at, pt)) {
+            at = try c.ts.regularLiteral(at);
+        }
         // An EMPTY array literal is the accumulator seed of a fold
         // (`arr.reduce((acc: T[], el) => …, [])`). It carries no element
         // evidence, and its type here is `any[]`, so unioning it into the

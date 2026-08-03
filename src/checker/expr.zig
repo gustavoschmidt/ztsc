@@ -1820,6 +1820,93 @@ pub fn objLitIsContextSensitiveAt(c: *Checker, node: Node, depth: u8, shallow: b
     return false;
 }
 
+/// tsc's `isLiteralOfContextualType`: does `ctx` name a literal domain that
+/// the literal `cand` belongs to?
+///
+/// `checkExpressionWithContextualType` strips a contextually typed literal's
+/// FRESHNESS on exactly this test, with the comment "such that contextually
+/// typed literals always preserve their literal types (otherwise they might
+/// widen during type inference)". That is the whole mechanism by which
+/// `on(eventName: K | keyof T, …)` infers `K = "add"` while
+/// `useState(initial: S | (() => S))` still widens `false` to `boolean`: the
+/// first union has a string-literal constituent for `"add"` to match, the
+/// second has nothing for `false` to match.
+pub fn literalOfContextualType(c: *Checker, cand: TypeId, ctx: TypeId) Error!bool {
+    return literalOfContextualTypeAt(c, cand, ctx, 0);
+}
+
+fn literalOfContextualTypeAt(c: *Checker, cand: TypeId, ctx: TypeId, depth: u8) Error!bool {
+    if (depth > 4 or ctx == types.no_type) return false;
+    const s = &c.ts;
+    switch (s.kind(ctx)) {
+        .union_type, .intersection => {
+            for (try c.memberList(ctx)) |m| {
+                if (try literalOfContextualTypeAt(c, cand, m, depth + 1)) return true;
+            }
+            return false;
+        },
+        // tsc's `InstantiableNonPrimitive`: a type variable constrained to a
+        // primitive keeps the literal, and so does one whose constraint names
+        // the literal domain outright.
+        .type_param, .index_access, .conditional => {
+            const con = if (s.kind(ctx) == .type_param)
+                try c.typeParamConstraint(s.typeParamSymbol(ctx))
+            else
+                try c.transitiveBaseConstraint(ctx);
+            if (con == types.no_type or con == ctx) return false;
+            if (try maybeLiteralKind(c, cand, .string_literal) and try maybeKind(c, con, .string)) return true;
+            if (try maybeLiteralKind(c, cand, .number_literal) and try maybeKind(c, con, .number)) return true;
+            if (try maybeLiteralKind(c, cand, .bigint_literal) and try maybeKind(c, con, .bigint)) return true;
+            return literalOfContextualTypeAt(c, cand, con, depth + 1);
+        },
+        // `Index` / `TemplateLiteral` / `StringMapping` name the string-literal
+        // domain the same way a string literal does.
+        .string_literal, .keyof_op, .template_literal_type, .string_mapping => return maybeLiteralKind(c, cand, .string_literal),
+        .number_literal, .number_literal_fresh => return maybeLiteralKind(c, cand, .number_literal),
+        .bigint_literal => return maybeLiteralKind(c, cand, .bigint_literal),
+        .bool_true, .bool_false => return maybeLiteralKind(c, cand, .bool_true),
+        .unique_symbol => return maybeLiteralKind(c, cand, .unique_symbol),
+        .enum_type => return s.isEnumMember(ctx) and (try maybeLiteralKind(c, cand, .enum_type)),
+        else => return false,
+    }
+}
+
+/// tsc's `maybeTypeOfKind` for the literal kinds: any constituent of `t`
+/// (which may be a union) is of the given literal kind. `.number_literal`
+/// covers its fresh twin, and `.bool_true` stands for either boolean literal.
+fn maybeLiteralKind(c: *Checker, t: TypeId, want: types.Kind) Error!bool {
+    const s = &c.ts;
+    if (s.kind(t) == .union_type) {
+        for (try c.memberList(t)) |m| {
+            if (try maybeLiteralKind(c, m, want)) return true;
+        }
+        return false;
+    }
+    const k = s.kind(t);
+    return switch (want) {
+        .string_literal => k == .string_literal,
+        .number_literal => k == .number_literal or k == .number_literal_fresh,
+        .bigint_literal => k == .bigint_literal,
+        .bool_true => k == .bool_true or k == .bool_false,
+        .unique_symbol => k == .unique_symbol,
+        .enum_type => k == .enum_type,
+        else => false,
+    };
+}
+
+/// The primitive-domain half of the same test: does `t` (possibly a union)
+/// have a constituent of primitive kind `want`?
+fn maybeKind(c: *Checker, t: TypeId, want: types.Kind) Error!bool {
+    const s = &c.ts;
+    if (s.kind(t) == .union_type) {
+        for (try c.memberList(t)) |m| {
+            if (try maybeKind(c, m, want)) return true;
+        }
+        return false;
+    }
+    return s.kind(t) == want;
+}
+
 pub fn paramWantsLiteralCtx(c: *Checker, pt: TypeId) Error!bool {
     return c.paramWantsLiteralCtxAt(pt, 0);
 }

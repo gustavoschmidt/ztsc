@@ -2982,6 +2982,7 @@ pub const Checker = struct {
     pub const objLitIsContextSensitive = expr_zig.objLitIsContextSensitive;
     pub const objLitIsShallowContextSensitive = expr_zig.objLitIsShallowContextSensitive;
     pub const objLitIsContextSensitiveAt = expr_zig.objLitIsContextSensitiveAt;
+    pub const literalOfContextualType = expr_zig.literalOfContextualType;
     pub const paramWantsLiteralCtx = expr_zig.paramWantsLiteralCtx;
     pub const paramWantsLiteralCtxAt = expr_zig.paramWantsLiteralCtxAt;
     pub const keepLiteral = expr_zig.keepLiteral;
