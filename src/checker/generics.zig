@@ -177,8 +177,8 @@ pub fn reduceConditional(c: *Checker, chk: TypeId, extends_ty: TypeId, true_ty: 
     // `typeFromTypeNode`. Resolving it early against the home instance both
     // re-enters that instance's still-open member table and loses the
     // subclass receiver a later `substThis` would supply.
-    const ext_generic = try c.containsFreeTypeParam(extends_ty, &.{}) or try c.containsMappedParam(extends_ty) or (c.ts.kind(extends_ty) == .this_type);
-    const chk_generic = try c.containsFreeTypeParam(chk, &.{}) or try c.containsMappedParam(chk) or (c.ts.kind(chk) == .this_type);
+    const ext_generic = try c.containsFreeTypeParam(extends_ty, &.{}) or try c.containsMappedParam(extends_ty) or try c.containsThisType(extends_ty);
+    const chk_generic = try c.containsFreeTypeParam(chk, &.{}) or try c.containsMappedParam(chk) or try c.containsThisType(chk);
     if (chk_generic or ext_generic) {
         // Narrow decidability carve-out (see objectDecidablyNotExtends): a
         // concrete-shaped object check whose free params live only in
@@ -546,7 +546,7 @@ pub const max_infer_depth: u32 = 24;
 /// inference makes ~4.6k calls, while kysely's `ExpressionOrFactory` match
 /// makes tens of millions. Anything in the wide gap between separates "walk it
 /// all, exactly as before" from "this will not finish".
-pub const max_infer_steps: u64 = 100_000_000;
+pub const max_infer_steps: u64 = 100_000;
 
 fn inferFromExtendsInner(c: *Checker, source0: TypeId, pattern: TypeId, ids: []const u32, vals: []TypeId, contra: bool, depth: u32) Error!void {
     const s = &c.ts;
