@@ -27,6 +27,7 @@ const check = checker_zig.check;
 const max_instantiation_depth = checker_zig.max_instantiation_depth;
 const max_instantiation_count = checker_zig.max_instantiation_count;
 const max_chain_repeats = checker_zig.max_chain_repeats;
+const max_this_subst_repeats = checker_zig.max_this_subst_repeats;
 const chain_scan_floor = checker_zig.chain_scan_floor;
 const scratch_retain_limit = checker_zig.scratch_retain_limit;
 const FreshTp = checker_zig.FreshTp;
@@ -1245,6 +1246,13 @@ pub fn chainRepeats(c: *const Checker, t: TypeId) bool {
 
 /// recursion. A `null` id disables the memo (`--no-inst-cache`).
 pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) Error!TypeId {
+    // Per-constituent rebinding of a distributive conditional whose check is
+    // no longer a bare type parameter — see the `.conditional` arm. Asked
+    // before the type-parameter early-out, because the check being rebound
+    // (`O[K]`) need not contain one.
+    if (c.cond_check_subst) |cs| {
+        if (t == cs.from) return cs.to;
+    }
     if (!try c.containsTypeParam(t)) return t;
     if (map_id) |mid| {
         if (c.inst_cache.get((@as(u64, mid) << 32) | t)) |r| {
@@ -1525,6 +1533,50 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
                     break :blk try s.makeUnion(c.scratch(), parts.items);
                 }
             }
+            // The same distribution, one instantiation later. A distributive
+            // conditional written inside a mapped type is instantiated TWICE:
+            // first with the alias argument (`SDV<O[K]>`, which leaves the
+            // check the still-generic `O[K]` and defers), then per key. By the
+            // second pass the check is an `.index_access`, not a bare type
+            // parameter, so the rule above no longer fires — and the branches
+            // below get instantiated with the WHOLE union substituted for the
+            // check. A conditional nested in a branch then resolves against
+            // the union instead of the constituent, and its answer is unioned
+            // in beside the correct one.
+            //
+            // kysely's `ShallowDehydrateObject<O> = { [K in keyof O]:
+            // ShallowDehydrateValue<O[K]> }` is that shape: for a
+            // `string | null` column the outer arm correctly yields `null`,
+            // while the nested `T extends (infer U)[] | null | undefined` arm
+            // — reduced against `string | null`, which the `| null` half
+            // matches with `U` unbound — contributed a spurious
+            // `ShallowDehydrateValue<unknown>[]`, and every read of the column
+            // was a TS2322.
+            //
+            // Rebinding is by the check EXPRESSION rather than by a symbol:
+            // that is what the branches were instantiated against, and it is
+            // the only handle left once the parameter is gone. The memo is
+            // switched off (`map_id = null`) for the duration — the answer is
+            // a function of the constituent too, which the `(map, type)` key
+            // cannot express.
+            if (s.condDistributive(t) and s.kind(check0) != .type_param) {
+                const new_check = try c.instantiateId(check0, map, map_id);
+                if (new_check != check0 and s.kind(new_check) == .union_type) {
+                    const saved_subst = c.cond_check_subst;
+                    defer c.cond_check_subst = saved_subst;
+                    var parts: std.ArrayList(TypeId) = .empty;
+                    defer parts.deinit(c.scratch());
+                    for (try c.memberList(new_check)) |m| {
+                        c.cond_check_subst = .{ .from = check0, .to = m };
+                        const ext_m = try c.instantiateId(s.condExtends(t), map, null);
+                        const tru_m = try c.instantiateId(s.condTrue(t), map, null);
+                        const fls_m = try c.instantiateId(s.condFalse(t), map, null);
+                        c.cond_check_subst = saved_subst;
+                        try parts.append(c.scratch(), try c.reduceConditional(m, ext_m, tru_m, fls_m, false));
+                    }
+                    break :blk try s.makeUnion(c.scratch(), parts.items);
+                }
+            }
             const chk = try c.instantiateId(check0, map, map_id);
             const ext = try c.instantiateId(s.condExtends(t), map, map_id);
             const tru = try c.instantiateId(s.condTrue(t), map, map_id);
@@ -1592,10 +1644,61 @@ pub fn substThis(c: *Checker, t: TypeId, repl: TypeId) Error!TypeId {
     if (c.inst_depth > max_instantiation_depth) return types.error_type;
     const memo_key = (@as(u64, t) << 32) | repl;
     if (c.subst_this_cache.get(memo_key)) |m| return m;
+    // Cycle cut. The deferred-operator arms below do not merely rewrite, they
+    // *reduce*: `this["_zod"]` is looked up on the receiver, and the member it
+    // finds mentions `this` again, so the reduction re-enters here with the
+    // very same `(t, repl)` pair. zod's `$ZodType` closes such a circle in
+    // four frames — `this["_zod"]["output"]` → `$ZodTypeInternals` →
+    // `"~standard"` → `core.output<this>` → `this["_zod"]["output"]` — and
+    // nothing about the pair changes on each lap, so no memo can see progress
+    // and the walk only stopped when `max_instantiation_depth` truncated it to
+    // `error_type`. That truncation is what made `.pipe(…).optional()` report
+    // TS2589 and lose every property of the schema it typed.
+    //
+    // Leaving the operator symbolic on re-entry is the answer tsc arrives at
+    // by never resolving it in the first place: it defers an indexed access
+    // whose object is a type variable and only resolves it once a real
+    // receiver exists, which is exactly the outermost frame here. That frame
+    // still substitutes and still reduces; only the inner lap, which has no
+    // new information, stops.
+    for (c.this_subst_keys[0..c.this_subst_depth]) |k| {
+        if (k == memo_key) {
+            c.this_subst_cuts +%= 1;
+            return t;
+        }
+    }
+    // Growth cut, the same rule the relation applies as `relIdDeeplyNested`:
+    // a chain that keeps rewriting the SAME generic as a strictly larger
+    // instantiation of itself is not converging on an answer. The pair test
+    // above cannot see it, because nothing repeats — zod's `core.output<this>`
+    // wraps another `$ZodType<any, …>` around its own argument every lap
+    // (`$ZodType<any, $ZodType<any, $ZodType<any, …>>>`), so every frame is a
+    // type this checker has never interned before. Leaving the subject
+    // symbolic once the generic has been re-entered `max_this_subst_repeats`
+    // times keeps the outer, informative rewrites and drops only the tail.
+    const t_sym: SymbolId = if (c.ts.kind(t) == .ref) c.ts.refSymbol(t) else binder.no_symbol;
+    if (t_sym != binder.no_symbol) {
+        var seen: u32 = 0;
+        for (c.this_subst_syms[0..c.this_subst_depth]) |sym| {
+            if (sym == t_sym) seen += 1;
+        }
+        if (seen >= max_this_subst_repeats) {
+            c.this_subst_cuts +%= 1;
+            return t;
+        }
+    }
+    c.this_subst_keys[c.this_subst_depth] = memo_key;
+    c.this_subst_syms[c.this_subst_depth] = t_sym;
+    c.this_subst_depth += 1;
+    defer c.this_subst_depth -= 1;
+    const cuts_before = c.this_subst_cuts;
     const r = try substThisInner(c, t, repl);
-    // A truncated answer is depth-dependent, not a function of the pair — the
-    // rule `inst_cache` follows.
-    if (!c.inst_limit_tripped) try c.subst_this_cache.put(c.cm(), memo_key, r);
+    // A truncated answer is depth-dependent, and one computed while a guard
+    // above cut a lap underneath depends on the live stack — neither is a
+    // function of the pair, so neither is memoized (the rule `inst_cache`
+    // follows).
+    if (!c.inst_limit_tripped and c.this_subst_cuts == cuts_before)
+        try c.subst_this_cache.put(c.cm(), memo_key, r);
     return r;
 }
 
