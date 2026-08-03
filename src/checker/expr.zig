@@ -1618,46 +1618,66 @@ pub fn ctxIsMutableArrayLikeAt(c: *Checker, ctx: TypeId, depth: u32) Error!bool 
 /// Collect the free type-param symbols reachable in `t` (structural walk,
 /// no expansion — a `ref` contributes its args, not its resolved body).
 pub fn collectTypeParamSyms(c: *Checker, t: TypeId, out: *std.ArrayList(u32)) Error!void {
+    c.ctp_syms_seen.clearRetainingCapacity();
+    return collectTypeParamSymsInner(c, t, out);
+}
+
+fn collectTypeParamSymsInner(c: *Checker, t: TypeId, out: *std.ArrayList(u32)) Error!void {
     const s = &c.ts;
-    switch (s.kind(t)) {
+    const k = s.kind(t);
+    // Memoize the composite nodes. The walk builds a SET, so a node reached a
+    // second time can contribute nothing the first visit did not — and the
+    // store interns aggressively, so a big generic type is a DAG, not a tree.
+    // Walking it as a tree was exponential in the sharing (a conditional
+    // forks four ways per level), and outright non-terminating on a type
+    // whose structure closes a cycle. Both are reachable from sequelize's
+    // model types: outline spent minutes here, 1.9 GB deep, on a single call
+    // whose base constraint this is. Leaves are left unmemoized — inserting
+    // them would cost more than the visit it saves.
+    const composite = switch (k) {
+        .array, .union_type, .intersection, .overloads, .tuple, .object, .function, .ref, .template_literal_type, .string_mapping, .keyof_op, .conditional, .index_access, .mapped => true,
+        else => false,
+    };
+    if (composite and (try c.ctp_syms_seen.getOrPut(c.cm(), t)).found_existing) return;
+    switch (k) {
         .type_param => {
             const sym = s.typeParamSymbol(t);
             for (out.items) |x| if (x == sym) return;
             try out.append(c.scratch(), sym);
         },
-        .array => try c.collectTypeParamSyms(s.arrayElem(t), out),
+        .array => try collectTypeParamSymsInner(c, s.arrayElem(t), out),
         .union_type, .intersection, .overloads => {
-            for (0..s.memberCount(t)) |i| try c.collectTypeParamSyms(s.memberAt(t, i), out);
+            for (0..s.memberCount(t)) |i| try collectTypeParamSymsInner(c, s.memberAt(t, i), out);
         },
         .tuple => {
-            for (0..s.tupleLen(t)) |i| try c.collectTypeParamSyms(s.tupleElem(t, @intCast(i)).ty, out);
+            for (0..s.tupleLen(t)) |i| try collectTypeParamSymsInner(c, s.tupleElem(t, @intCast(i)).ty, out);
         },
         .object => {
-            for (0..s.objectPropCount(t)) |i| try c.collectTypeParamSyms(s.objectProp(t, @intCast(i)).ty, out);
-            if (s.objectStringIndex(t) != 0) try c.collectTypeParamSyms(s.objectStringIndex(t), out);
-            if (s.objectNumberIndex(t) != 0) try c.collectTypeParamSyms(s.objectNumberIndex(t), out);
+            for (0..s.objectPropCount(t)) |i| try collectTypeParamSymsInner(c, s.objectProp(t, @intCast(i)).ty, out);
+            if (s.objectStringIndex(t) != 0) try collectTypeParamSymsInner(c, s.objectStringIndex(t), out);
+            if (s.objectNumberIndex(t) != 0) try collectTypeParamSymsInner(c, s.objectNumberIndex(t), out);
         },
         .function => {
-            for (0..s.fnParamCount(t)) |i| try c.collectTypeParamSyms(s.fnParam(t, @intCast(i)).ty, out);
-            try c.collectTypeParamSyms(s.fnReturn(t), out);
+            for (0..s.fnParamCount(t)) |i| try collectTypeParamSymsInner(c, s.fnParam(t, @intCast(i)).ty, out);
+            try collectTypeParamSymsInner(c, s.fnReturn(t), out);
         },
         .ref => {
-            for (0..s.refArgCount(t)) |i| try c.collectTypeParamSyms(s.refArgAt(t, i), out);
+            for (0..s.refArgCount(t)) |i| try collectTypeParamSymsInner(c, s.refArgAt(t, i), out);
         },
         .template_literal_type => {
-            for (0..s.templateHoleCount(t)) |i| try c.collectTypeParamSyms(s.templateHole(t, @intCast(i)), out);
+            for (0..s.templateHoleCount(t)) |i| try collectTypeParamSymsInner(c, s.templateHole(t, @intCast(i)), out);
         },
-        .string_mapping => try c.collectTypeParamSyms(s.stringMappingArg(t), out),
-        .keyof_op => try c.collectTypeParamSyms(s.keyofOperand(t), out),
+        .string_mapping => try collectTypeParamSymsInner(c, s.stringMappingArg(t), out),
+        .keyof_op => try collectTypeParamSymsInner(c, s.keyofOperand(t), out),
         .conditional => {
-            try c.collectTypeParamSyms(s.condCheck(t), out);
-            try c.collectTypeParamSyms(s.condExtends(t), out);
-            try c.collectTypeParamSyms(s.condTrue(t), out);
-            try c.collectTypeParamSyms(s.condFalse(t), out);
+            try collectTypeParamSymsInner(c, s.condCheck(t), out);
+            try collectTypeParamSymsInner(c, s.condExtends(t), out);
+            try collectTypeParamSymsInner(c, s.condTrue(t), out);
+            try collectTypeParamSymsInner(c, s.condFalse(t), out);
         },
         .index_access => {
-            try c.collectTypeParamSyms(s.indexAccessObj(t), out);
-            try c.collectTypeParamSyms(s.indexAccessIndex(t), out);
+            try collectTypeParamSymsInner(c, s.indexAccessObj(t), out);
+            try collectTypeParamSymsInner(c, s.indexAccessIndex(t), out);
         },
         // A deferred mapped type mentions its outer params in any of its
         // four parts. Without this arm the base constraint of a map was
@@ -1665,10 +1685,10 @@ pub fn collectTypeParamSyms(c: *Checker, t: TypeId, out: *std.ArrayList(u32)) Er
         // (`Omit`/`Pick`/`Record` over a type param), whose key set is the
         // constraint and not a source, had no apparent type at all.
         .mapped => {
-            try c.collectTypeParamSyms(s.mappedConstraint(t), out);
-            try c.collectTypeParamSyms(s.mappedValue(t), out);
-            if (s.mappedAs(t) != 0) try c.collectTypeParamSyms(s.mappedAs(t), out);
-            if (s.mappedSource(t) != 0) try c.collectTypeParamSyms(s.mappedSource(t), out);
+            try collectTypeParamSymsInner(c, s.mappedConstraint(t), out);
+            try collectTypeParamSymsInner(c, s.mappedValue(t), out);
+            if (s.mappedAs(t) != 0) try collectTypeParamSymsInner(c, s.mappedAs(t), out);
+            if (s.mappedSource(t) != 0) try collectTypeParamSymsInner(c, s.mappedSource(t), out);
         },
         else => {},
     }

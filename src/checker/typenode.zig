@@ -1991,6 +1991,14 @@ pub fn isKeyAtom(k: types.Kind) bool {
 /// renames are reflected.
 pub fn keyofMapped(c: *Checker, m: TypeId) Error!TypeId {
     const s = &c.ts;
+    // Enumerating the remapped key set asks the `as` clause about one key at a
+    // time, and an `as` clause may name `keyof` of the map it is renaming for
+    // (see `keyof_mapped_active`). Answering "the key set is whatever the key
+    // set is" is not possible; defer, exactly as a non-enumerable constraint
+    // does below.
+    if (c.keyof_mapped_active.contains(m)) return s.makeKeyof(m);
+    try c.keyof_mapped_active.put(c.cm(), m, {});
+    defer _ = c.keyof_mapped_active.remove(m);
     const homomorphic = s.mappedHomomorphic(m);
     const constraint: TypeId = if (homomorphic)
         try c.keyofType(s.mappedSource(m))

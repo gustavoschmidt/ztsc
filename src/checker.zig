@@ -590,15 +590,16 @@ pub const map_containers = [_][]const u8{
     "infer_visited",            "subst_this_cache",       "mmp_cache",
     "inst_cache",               "arrayish_elem_cache",    "tp_constraint_cache",
     "erase_cache",              "inst_map_ids",           "inst_map_slices",
-    "restrict_ids",             "fresh_tp_ids",
-    "this_tp_ids",              "fresh_tp_info",          "type_node_cache",
-    "atom_cache",               "infer_ids",              "infer_scopes",
-    "mapped_key_ids",           "mapped_key_scopes",      "inst_diag_at",
-    "infer_active",             "lazy_member_active",     "chain_guards",
-    "never_isect",              "deep_path_list",         "deep_path_ids",
-    "flow_reach",               "member_type_stack",      "lazy_index_objs",
-    "pending_type_args",        "pending_type_args_pool", "pending_type_args_seen",
-    "tp_constrained_cache",     "nominal_bases",          "nominal_base_pool",
+    "restrict_ids",             "fresh_tp_ids",           "this_tp_ids",
+    "fresh_tp_info",            "type_node_cache",        "atom_cache",
+    "infer_ids",                "infer_scopes",           "mapped_key_ids",
+    "mapped_key_scopes",        "inst_diag_at",           "infer_active",
+    "lazy_member_active",       "chain_guards",           "never_isect",
+    "deep_path_list",           "deep_path_ids",          "flow_reach",
+    "member_type_stack",        "lazy_index_objs",        "pending_type_args",
+    "pending_type_args_pool",   "pending_type_args_seen", "tp_constrained_cache",
+    "nominal_bases",            "nominal_base_pool",      "keyof_mapped_active",
+    "ctp_syms_seen",
 };
 
 /// Where one symbol's declared heritage lives in `Checker.nominal_base_pool`.
@@ -852,6 +853,18 @@ pub const Checker = struct {
     /// cache stays unpoisoned — static-field-initializer re-entry must still
     /// see the class's own members).
     class_static_base_active: std.AutoHashMapUnmanaged(SymbolId, void) = .empty,
+    /// Mapped types whose key set `keyofMapped` is enumerating. An `as` clause
+    /// is allowed to mention `keyof` of the very map it renames the keys of
+    /// (sequelize's `InferAttributes<M>` filters `Key extends keyof Model`,
+    /// and `M` is a model class whose own attribute type IS that map), so
+    /// remapping one key can ask for the key set again. That question has no
+    /// answer yet; re-entry defers with `keyof <map>` — the same result the
+    /// non-enumerable path already returns — instead of recursing until the
+    /// thread stack dies.
+    keyof_mapped_active: std.AutoHashMapUnmanaged(TypeId, void) = .empty,
+    /// Composite types `collectTypeParamSyms` has already walked, for the
+    /// duration of one top-level collect. See there.
+    ctp_syms_seen: std.AutoHashMapUnmanaged(TypeId, void) = .empty,
     /// Member symbols whose type is being resolved by `lazyRefProp` (the
     /// cycle-safe single-member lookup). A member whose own annotation indexes
     /// back into the class at the very member being resolved (`class C { a:

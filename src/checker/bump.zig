@@ -184,12 +184,29 @@ pub const BumpArena = struct {
         const self: *BumpArena = @ptrCast(@alignCast(ctx));
         if (self.chunks.items.len == 0) return false;
         const ch = self.chunks.items[self.cur];
-        const end = @intFromPtr(memory.ptr) + memory.len;
-        if (end != @intFromPtr(ch.ptr) + self.off) return new_len <= memory.len;
-        const start = @intFromPtr(memory.ptr) - @intFromPtr(ch.ptr);
+        const start = self.offsetOfTop(ch, memory) orelse return new_len <= memory.len;
         if (start + new_len > ch.len) return false;
         self.off = start + new_len;
         return true;
+    }
+
+    /// `memory`'s offset in `ch`, but only if it really is that chunk's most
+    /// recent allocation — i.e. it starts inside the chunk AND ends at the bump
+    /// pointer. Both halves matter: chunks come from a page-granular backing
+    /// allocator and are routinely handed out back to back, so a block filling
+    /// the tail of chunk N-1 ends at exactly `chunks[N].ptr`, which the
+    /// end-address test alone accepts whenever the current chunk's bump offset
+    /// happens to be 0 (a fresh chunk, a restore, or the free of a block that
+    /// started at the chunk base). Rewinding on that match subtracted a higher
+    /// address from a lower one: `off` wrapped to ~2^64 and the next allocation
+    /// handed back a pointer outside every chunk. Seen as a SIGBUS partway
+    /// through checking outline; a debug build caught it as the subtraction.
+    fn offsetOfTop(self: *const BumpArena, ch: []u8, memory: []u8) ?usize {
+        const base = @intFromPtr(ch.ptr);
+        const p = @intFromPtr(memory.ptr);
+        if (p < base or p - base > self.off) return null;
+        const start = p - base;
+        return if (start + memory.len == self.off) start else null;
     }
 
     fn remap(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ra: usize) ?[*]u8 {
@@ -203,9 +220,7 @@ pub const BumpArena = struct {
         const self: *BumpArena = @ptrCast(@alignCast(ctx));
         if (self.chunks.items.len == 0) return;
         const ch = self.chunks.items[self.cur];
-        if (@intFromPtr(memory.ptr) + memory.len == @intFromPtr(ch.ptr) + self.off) {
-            self.off = @intFromPtr(memory.ptr) - @intFromPtr(ch.ptr);
-        }
+        self.off = self.offsetOfTop(ch, memory) orelse return;
     }
 };
 
@@ -239,6 +254,84 @@ test "bump arena honours large and over-aligned requests" {
     try std.testing.expectEqual(@as(usize, 0), @intFromPtr(over.ptr) % 64);
     _ = a.reset(.free_all);
     try std.testing.expectEqual(@as(usize, 0), a.queryCapacity());
+}
+
+/// Backing allocator for the adjacency test: page-aligned requests (the arena's
+/// chunks) are carved back to back out of one region, the way an mmap-based
+/// page allocator routinely hands out consecutive mappings. Everything else
+/// (the chunk list itself) goes elsewhere so it cannot separate two chunks.
+const PackedPages = struct {
+    region: []u8,
+    used: usize = 0,
+    other: Allocator,
+
+    fn allocator(self: *PackedPages) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = pAlloc, .resize = pResize, .remap = pRemap, .free = pFree } };
+    }
+    fn owns(self: *PackedPages, p: [*]u8) bool {
+        return @intFromPtr(p) >= @intFromPtr(self.region.ptr) and
+            @intFromPtr(p) < @intFromPtr(self.region.ptr) + self.region.len;
+    }
+    fn pAlloc(ctx: *anyopaque, len: usize, alignment: Alignment, ra: usize) ?[*]u8 {
+        const self: *PackedPages = @ptrCast(@alignCast(ctx));
+        if (alignment.toByteUnits() < std.heap.page_size_min) return self.other.rawAlloc(len, alignment, ra);
+        const start = std.mem.alignForward(usize, self.used, alignment.toByteUnits());
+        if (start + len > self.region.len) return null;
+        self.used = start + len;
+        return self.region.ptr + start;
+    }
+    fn pResize(ctx: *anyopaque, m: []u8, alignment: Alignment, new_len: usize, ra: usize) bool {
+        const self: *PackedPages = @ptrCast(@alignCast(ctx));
+        if (self.owns(m.ptr)) return new_len <= m.len;
+        return self.other.rawResize(m, alignment, new_len, ra);
+    }
+    fn pRemap(ctx: *anyopaque, m: []u8, alignment: Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *PackedPages = @ptrCast(@alignCast(ctx));
+        if (self.owns(m.ptr)) return if (new_len <= m.len) m.ptr else null;
+        return self.other.rawRemap(m, alignment, new_len, ra);
+    }
+    fn pFree(ctx: *anyopaque, m: []u8, alignment: Alignment, ra: usize) void {
+        const self: *PackedPages = @ptrCast(@alignCast(ctx));
+        if (self.owns(m.ptr)) return; // leaked into the region; freed wholesale
+        self.other.rawFree(m, alignment, ra);
+    }
+};
+
+test "bump arena ignores a free from an adjacent chunk" {
+    // Chunks handed out back to back: a block filling the tail of chunk 0 ends
+    // at exactly chunk 1's base, so the "ends at the bump pointer" test matches
+    // it while chunk 1 sits at offset 0. Rewinding on that match used to
+    // underflow `off`.
+    const page = std.heap.page_size_min;
+    const region = try std.heap.page_allocator.alignedAlloc(u8, .fromByteUnits(page), 4 * BumpArena.min_chunk);
+    defer std.heap.page_allocator.free(region);
+    var pages = PackedPages{ .region = region, .other = std.testing.allocator };
+
+    var a = BumpArena.init(pages.allocator());
+    defer a.deinit();
+    const al = a.allocator();
+
+    const half = BumpArena.min_chunk / 2;
+    const lo = try al.alloc(u8, half);
+    const tail = try al.alloc(u8, half); // ends exactly at chunk 0's end
+    try std.testing.expectEqual(@as(usize, 1), a.chunks.items.len);
+    const top = try al.alloc(u8, 8); // forces chunk 1, at its base
+    try std.testing.expectEqual(@as(usize, 2), a.chunks.items.len);
+    try std.testing.expectEqual(@intFromPtr(tail.ptr) + tail.len, @intFromPtr(top.ptr));
+
+    al.free(top); // legitimate rewind: off back to 0 in chunk 1
+    try std.testing.expectEqual(@as(usize, 0), a.off);
+    al.free(tail); // must be ignored — `tail` belongs to chunk 0
+    try std.testing.expectEqual(@as(usize, 0), a.off);
+    try std.testing.expectEqual(@as(usize, 1), a.cur);
+
+    // and the arena still hands out sane, in-chunk memory afterwards
+    const after = try al.alloc(u8, 32);
+    @memset(after, 0xAB);
+    const ch1 = a.chunks.items[1];
+    try std.testing.expect(@intFromPtr(after.ptr) >= @intFromPtr(ch1.ptr));
+    try std.testing.expect(@intFromPtr(after.ptr) + after.len <= @intFromPtr(ch1.ptr) + ch1.len);
+    for (lo) |*b| b.* = 1;
 }
 
 test "bump arena reset retains within the limit" {
