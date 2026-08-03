@@ -200,20 +200,19 @@ pub fn reduceConditional(c: *Checker, chk: TypeId, extends_ty: TypeId, true_ty: 
         // element's; unwrap both before asking it, or every wrapped test
         // (kysely's whole `SelectFrom` chain opens with `[TE] extends
         // [keyof DB]`) is undecidable by construction and defers.
+        // Asked on the WRITTEN kinds — the idiom writes both sides as literal
+        // tuple type nodes, so no structural resolution is spent here; this
+        // runs on the deferral path of every generic conditional.
         var chk_d = chk;
         var ext_d = extends_ty;
-        if (!ext_generic) {
-            const ce = try c.resolveStructural(chk);
-            const ee = try c.resolveStructural(extends_ty);
-            if (s.kind(ce) == .tuple and s.kind(ee) == .tuple and
-                s.tupleLen(ce) == 1 and s.tupleLen(ee) == 1)
-            {
-                const a = s.tupleElem(ce, 0);
-                const b = s.tupleElem(ee, 0);
-                if (a.flags == 0 and b.flags == 0) {
-                    chk_d = a.ty;
-                    ext_d = b.ty;
-                }
+        if (s.kind(chk) == .tuple and s.kind(extends_ty) == .tuple and
+            s.tupleLen(chk) == 1 and s.tupleLen(extends_ty) == 1)
+        {
+            const a = s.tupleElem(chk, 0);
+            const b = s.tupleElem(extends_ty, 0);
+            if (a.flags == 0 and b.flags == 0) {
+                chk_d = a.ty;
+                ext_d = b.ty;
             }
         }
         if (!ext_generic) {
@@ -471,6 +470,12 @@ pub fn indexOfAtom(atoms: []const Atom, needle: Atom) ?usize {
 /// conditional land in `refs` (see `types.infer_var_reference`). One walk
 /// serves both so the hot conditional path pays for a single traversal.
 pub fn collectInferVars(c: *Checker, t: TypeId, out: *std.ArrayList(u32), refs: ?*std.ArrayList(u32)) Error!void {
+    // The only arm that writes is `.infer_var`, and this walk's arms are a
+    // strict SUBSET of `containsInfer`'s — so a subtree that holds no binder
+    // can be skipped whole. `containsInfer` is memoized per interned type, so
+    // this turns the repeat descent of a conditional's extends clause (asked
+    // once per instantiation) into one map probe.
+    if (!try c.containsInfer(t)) return;
     const s = &c.ts;
     switch (s.kind(t)) {
         .infer_var => {
@@ -1250,7 +1255,11 @@ const PartWalk = struct {
 /// immutable and the walk is a pure structural descent, and `inferFromExtends`
 /// asks it once per step.
 pub fn containsInfer(c: *Checker, t: TypeId) Error!bool {
-    return containsInferInner(c, t);
+    const v = c.triGet(&c.ci_cache, t);
+    if (v != 0) return v == 2;
+    const r = try containsInferInner(c, t);
+    try c.triSet(&c.ci_cache, t, if (r) 2 else 1);
+    return r;
 }
 
 fn containsInferInner(c: *Checker, t: TypeId) Error!bool {
