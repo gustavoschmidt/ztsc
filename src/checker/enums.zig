@@ -1304,16 +1304,22 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
     const result: TypeId = switch (s.kind(t)) {
         .type_param => tpLookup(map, s.typeParamSymbol(t)) orelse t,
         .union_type => blk: {
-            var parts: std.ArrayList(TypeId) = .empty;
-            defer parts.deinit(c.scratch());
-            for (0..s.memberCount(t)) |i| try parts.append(c.scratch(), try c.instantiateId(s.memberAt(t, i), map, map_id));
-            break :blk try s.makeUnion(c.scratch(), parts.items);
+            // Exact allocation, not a doubling `ArrayList`: the arity is known
+            // and an arena cannot reuse a realloc predecessor, so every growth
+            // step of every list this walk builds stays resident until the
+            // top-level `instantiate` releases `inst_arena`. See the note on
+            // `scratch_high_water` there — one kysely builder chain peaked the
+            // arena above a gigabyte, most of it abandoned growth steps.
+            const parts = try c.scratch().alloc(TypeId, s.memberCount(t));
+            defer c.scratch().free(parts);
+            for (parts, 0..) |*p, i| p.* = try c.instantiateId(s.memberAt(t, i), map, map_id);
+            break :blk try s.makeUnion(c.scratch(), parts);
         },
         .intersection => blk: {
-            var parts: std.ArrayList(TypeId) = .empty;
-            defer parts.deinit(c.scratch());
-            for (0..s.memberCount(t)) |i| try parts.append(c.scratch(), try c.instantiateId(s.memberAt(t, i), map, map_id));
-            const inter = try s.makeIntersection(c.scratch(), parts.items);
+            const parts = try c.scratch().alloc(TypeId, s.memberCount(t));
+            defer c.scratch().free(parts);
+            for (parts, 0..) |*p, i| p.* = try c.instantiateId(s.memberAt(t, i), map, map_id);
+            const inter = try s.makeIntersection(c.scratch(), parts);
             // Propagate the origin tag through instantiation of a callable-
             // object alias that materializes to a kept intersection (RTK's
             // `AsyncThunk<…>` = `AsyncThunkActionCreator<…> & {…}`): the
@@ -1329,27 +1335,27 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
             break :blk inter;
         },
         .overloads => blk: {
-            var parts: std.ArrayList(TypeId) = .empty;
-            defer parts.deinit(c.scratch());
-            for (0..s.memberCount(t)) |i| try parts.append(c.scratch(), try c.instantiateId(s.memberAt(t, i), map, map_id));
-            break :blk try s.makeOverloads(parts.items);
+            const parts = try c.scratch().alloc(TypeId, s.memberCount(t));
+            defer c.scratch().free(parts);
+            for (parts, 0..) |*p, i| p.* = try c.instantiateId(s.memberAt(t, i), map, map_id);
+            break :blk try s.makeOverloads(parts);
         },
         .array => try s.makeArrayLike(t, try c.instantiateId(s.arrayElem(t), map, map_id)),
         .tuple => blk: {
-            var elems: std.ArrayList(types.TupleElem) = .empty;
-            defer elems.deinit(c.scratch());
-            for (0..s.tupleLen(t)) |i| {
+            const elems = try c.scratch().alloc(types.TupleElem, s.tupleLen(t));
+            defer c.scratch().free(elems);
+            for (elems, 0..) |*el, i| {
                 const e = s.tupleElem(t, @intCast(i));
-                try elems.append(c.scratch(), .{ .ty = try c.instantiateId(e.ty, map, map_id), .flags = e.flags });
+                el.* = .{ .ty = try c.instantiateId(e.ty, map, map_id), .flags = e.flags };
             }
-            break :blk try s.makeTuple(elems.items);
+            break :blk try s.makeTuple(elems);
         },
         .object => blk: {
-            var props: std.ArrayList(types.Prop) = .empty;
-            defer props.deinit(c.scratch());
-            for (0..s.objectPropCount(t)) |i| {
+            const props = try c.scratch().alloc(types.Prop, s.objectPropCount(t));
+            defer c.scratch().free(props);
+            for (props, 0..) |*out, i| {
                 const p = s.objectProp(t, @intCast(i));
-                try props.append(c.scratch(), .{ .name = p.name, .ty = try c.instantiateId(p.ty, map, map_id), .flags = p.flags });
+                out.* = .{ .name = p.name, .ty = try c.instantiateId(p.ty, map, map_id), .flags = p.flags };
             }
             const sidx = if (s.objectStringIndex(t) != 0) try c.instantiateId(s.objectStringIndex(t), map, map_id) else 0;
             const nidx = if (s.objectNumberIndex(t) != 0) try c.instantiateId(s.objectNumberIndex(t), map, map_id) else 0;
@@ -1368,24 +1374,28 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
             // symbols for the own params, carrying the substituted
             // constraints/defaults, so the call site resolves them
             // correctly instead of stranding the interface param.
-            var call_sigs: std.ArrayList(TypeId) = .empty;
-            defer call_sigs.deinit(c.scratch());
-            var construct_sigs: std.ArrayList(TypeId) = .empty;
-            defer construct_sigs.deinit(c.scratch());
+            const call_buf = try c.scratch().alloc(TypeId, s.objectCallSigCount(t));
+            defer c.scratch().free(call_buf);
+            var n_call: usize = 0;
+            const ctor_buf = try c.scratch().alloc(TypeId, s.objectConstructSigCount(t));
+            defer c.scratch().free(ctor_buf);
+            var n_ctor: usize = 0;
             for (0..s.objectCallSigCount(t)) |i| {
                 const sig = s.objectCallSig(t, @intCast(i));
                 // A non-eligible higher-order sig (RHF-style deep bound) is
                 // dropped — the pristine behavior — so its call sites are
                 // unchanged; eligible ones and param-free ones instantiate.
                 if (s.fnTypeParams(sig).len != 0 and !try c.higherOrderSigEligible(sig)) continue;
-                try call_sigs.append(c.scratch(), try c.instantiateId(sig, map, map_id));
+                call_buf[n_call] = try c.instantiateId(sig, map, map_id);
+                n_call += 1;
             }
             for (0..s.objectConstructSigCount(t)) |i| {
                 const sig = s.objectConstructSig(t, @intCast(i));
                 if (s.fnTypeParams(sig).len != 0 and !try c.higherOrderSigEligible(sig)) continue;
-                try construct_sigs.append(c.scratch(), try c.instantiateId(sig, map, map_id));
+                ctor_buf[n_ctor] = try c.instantiateId(sig, map, map_id);
+                n_ctor += 1;
             }
-            const obj = try s.makeObjectSigs(props.items, sidx, nidx, s.objectFlags(t), call_sigs.items, construct_sigs.items);
+            const obj = try s.makeObjectSigs(props, sidx, nidx, s.objectFlags(t), call_buf[0..n_call], ctor_buf[0..n_ctor]);
             // Propagate the origin tag through instantiation (see `origin`):
             // if `t` is the pre-expanded materialization of `G<A…>`, the
             // instantiated result denotes `G<A'…>` with each arg substituted
@@ -1483,11 +1493,11 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
                 sub_map = try c.scratch().dupe(TpMap, em.items);
                 sub_id = if (c.inst_cache_on) try c.canonMapId(sub_map) else null;
             }
-            var params: std.ArrayList(types.Param) = .empty;
-            defer params.deinit(c.scratch());
-            for (0..s.fnParamCount(t)) |i| {
+            const params = try c.scratch().alloc(types.Param, s.fnParamCount(t));
+            defer c.scratch().free(params);
+            for (params, 0..) |*out, i| {
                 const p = s.fnParam(t, @intCast(i));
-                try params.append(c.scratch(), .{ .name = p.name, .ty = try c.instantiateId(p.ty, sub_map, sub_id), .flags = p.flags });
+                out.* = .{ .name = p.name, .ty = try c.instantiateId(p.ty, sub_map, sub_id), .flags = p.flags };
             }
             const ret = try c.instantiateId(s.fnReturn(t), sub_map, sub_id);
             // Preserve the type predicate (`x is S`) through instantiation,
@@ -1505,7 +1515,7 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
                 };
             } else null;
             const this_ty = s.fnThisType(t);
-            const fnres = try s.makeFunctionThis(params.items, ret, kept.items, s.fnFlags(t), pred, if (this_ty != 0) try c.instantiateId(this_ty, sub_map, sub_id) else 0);
+            const fnres = try s.makeFunctionThis(params, ret, kept.items, s.fnFlags(t), pred, if (this_ty != 0) try c.instantiateId(this_ty, sub_map, sub_id) else 0);
             // Propagate the origin tag through function instantiation (see
             // the `.object` arm) — an aliased function member such as RHF's
             // `UseFormClearErrors<T>` relates by identity across builds.
@@ -1515,10 +1525,10 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
             break :blk fnres;
         },
         .ref => blk: {
-            var args: std.ArrayList(TypeId) = .empty;
-            defer args.deinit(c.scratch());
-            for (try c.refArgsList(t)) |a| try args.append(c.scratch(), try c.instantiateId(a, map, map_id));
-            break :blk try s.makeRef(s.refSymbol(t), args.items);
+            const args = try c.scratch().alloc(TypeId, s.refArgCount(t));
+            defer c.scratch().free(args);
+            for (args, 0..) |*a, i| a.* = try c.instantiateId(s.refArgAt(t, i), map, map_id);
+            break :blk try s.makeRef(s.refSymbol(t), args);
         },
         // A polymorphic `this` marker carries the home instance it was
         // declared against (`I<T…>`); substituting the interface's type
@@ -1623,10 +1633,10 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
             break :blk red;
         },
         .template_literal_type => blk: {
-            var holes: std.ArrayList(TypeId) = .empty;
-            defer holes.deinit(c.scratch());
-            for (0..s.templateHoleCount(t)) |i| try holes.append(c.scratch(), try c.instantiateId(s.templateHole(t, @intCast(i)), map, map_id));
-            break :blk try c.reduceTemplate(s.templateHead(t), holes.items, t);
+            const holes = try c.scratch().alloc(TypeId, s.templateHoleCount(t));
+            defer c.scratch().free(holes);
+            for (holes, 0..) |*h, i| h.* = try c.instantiateId(s.templateHole(t, @intCast(i)), map, map_id);
+            break :blk try c.reduceTemplate(s.templateHead(t), holes, t);
         },
         .string_mapping => blk: {
             const arg = try c.instantiateId(s.stringMappingArg(t), map, map_id);
