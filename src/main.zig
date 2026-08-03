@@ -106,6 +106,9 @@ const usage =
     \\  --no-inst-cache        disable the instantiation caching layer; re-run
     \\                         every substitution (benchmark aid / oracle)
     \\  --census               tally out-of-subset constructs by frequency
+    \\  --inst-profile         dump the instantiation-demand profile (where a
+    \\                         statement's instantiation budget goes) to stderr;
+    \\                         pair with --checkers=1
     \\  -h, --help             print this help and exit
     \\  --version              print version and exit
     \\
@@ -170,6 +173,11 @@ const Cli = struct {
     /// Print a by-construct histogram of out-of-subset syntax (census) —
     /// the frequency table that prioritizes upcoming feature work.
     census: bool = false,
+    /// Dump the instantiation-demand profile (`src/checker/prof.zig`) to
+    /// stderr at the end of each checker: where a statement's instantiation
+    /// budget goes, by call site / root type / type kind / expanded symbol.
+    /// A diagnostic instrument; pair with `--checkers=1`.
+    inst_profile: bool = false,
     /// null = auto (pretty iff stderr is a TTY).
     pretty: ?bool = null,
     project: ?[]const u8 = null,
@@ -520,6 +528,9 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("try 'ztsc --help'\n", .{});
         std.process.exit(2);
     };
+
+    // Write-once, before any checker thread exists (see `prof.profile_on`).
+    checker.prof_zig.profile_on = cli.inst_profile;
 
     if (cli.help) {
         try out.print("{s}", .{usage});
@@ -1851,6 +1862,8 @@ fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8, bad_arg: *[]c
             cli.no_inst_cache = true;
         } else if (std.mem.eql(u8, arg, "--census")) {
             cli.census = true;
+        } else if (std.mem.eql(u8, arg, "--inst-profile")) {
+            cli.inst_profile = true;
         } else if (std.mem.eql(u8, arg, "--pretty")) {
             cli.pretty = true;
         } else if (std.mem.startsWith(u8, arg, "--pretty=")) {

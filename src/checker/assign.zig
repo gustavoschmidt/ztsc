@@ -3150,6 +3150,13 @@ pub fn eraseParamsOf(c: *Checker, sig: TypeId, owner: TypeId) Error!TypeId {
     // Non-generic early-out before the dupe (the common case).
     const sig_tps = c.ts.fnTypeParams(owner);
     if (sig_tps.len == 0) return sig;
+    // Memo (see `erase_cache`): the erasure is a pure function of
+    // `(sig, owner)`, and the signature relation asks for it on both sides of
+    // every generic comparison.
+    const memo_key = (@as(u64, owner) << 32) | sig;
+    if (c.inst_cache_on) {
+        if (c.erase_cache.get(memo_key)) |r| return r;
+    }
     const tps = try c.scratch().dupe(u32, sig_tps);
     // Fixed base-constraint mapper: each type param → its declared
     // constraint (or `any`). Kept immutable so it can be re-applied.
@@ -3170,6 +3177,12 @@ pub fn eraseParamsOf(c: *Checker, sig: TypeId, owner: TypeId) Error!TypeId {
     // `(key: string) => string`.
     const resolved = try c.scratch().alloc(TpMap, tps.len);
     @memcpy(resolved, base_map);
+    // Scope the truncation flag to this derivation, exactly as `instantiateId`
+    // scopes it to its own subtree: the memo below must ask "was MY result
+    // truncated", not "did anything earlier in this call truncate".
+    const outer_trip = c.inst_limit_tripped;
+    c.inst_limit_tripped = false;
+    defer c.inst_limit_tripped = c.inst_limit_tripped or outer_trip;
     const rounds: usize = if (tps.len > 1) tps.len - 1 else 0;
     var iter: usize = 0;
     while (iter < rounds) : (iter += 1) {
@@ -3181,7 +3194,9 @@ pub fn eraseParamsOf(c: *Checker, sig: TypeId, owner: TypeId) Error!TypeId {
         }
         if (!changed) break;
     }
-    return c.instantiate(sig, resolved);
+    const result = try c.instantiate(sig, resolved);
+    if (c.inst_cache_on and !c.inst_limit_tripped) try c.erase_cache.put(c.cm(), memo_key, result);
+    return result;
 }
 
 /// i-th effective parameter type (expanding a trailing rest).

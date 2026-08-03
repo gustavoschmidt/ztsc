@@ -30,6 +30,7 @@ const max_chain_repeats = checker_zig.max_chain_repeats;
 const max_this_subst_repeats = checker_zig.max_this_subst_repeats;
 const chain_scan_floor = checker_zig.chain_scan_floor;
 const scratch_retain_limit = checker_zig.scratch_retain_limit;
+const prof_zig = checker_zig.prof_zig;
 const FreshTp = checker_zig.FreshTp;
 
 const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
@@ -1210,6 +1211,12 @@ pub fn instantiate(c: *Checker, t: TypeId, map: []const TpMap) Error!TypeId {
             c.scratch_arena = saved;
         }
         const map_id: ?u32 = if (c.inst_cache_on) try c.canonMapId(map) else null;
+        if (c.prof.on) {
+            const before = c.inst_total;
+            const r = c.instantiateId(t, map, map_id);
+            prof_zig.noteTopLevel(c, @returnAddress(), t, c.inst_total - before);
+            return r;
+        }
         return c.instantiateId(t, map, map_id);
     }
     const map_id: ?u32 = if (c.inst_cache_on) try c.canonMapId(map) else null;
@@ -1298,10 +1305,15 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
     if (map_id) |mid| {
         if (c.inst_cache.get((@as(u64, mid) << 32) | t)) |r| {
             c.stats.inst_hits += 1;
+            if (c.prof.on) c.prof.kind_hits[@intFromEnum(c.ts.kind(t))] += 1;
             return r;
         }
     }
     c.stats.inst_misses += 1;
+    if (c.prof.on) {
+        c.prof.kinds[@intFromEnum(c.ts.kind(t))] += 1;
+        prof_zig.noteVisit(c, t);
+    }
     // Depth/count guard — cache-independent, so it fires identically with
     // the memo on or off. Exceeding it is TS2589 (excessively deep /
     // possibly infinite): report once at the materialization site and
@@ -1316,6 +1328,7 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
     }
     if (c.inst_depth > max_instantiation_depth or c.inst_count > max_instantiation_count) {
         c.inst_limit_tripped = true;
+        if (c.prof.on) c.prof.tripped += 1;
         if (!c.suppress_inst_diag) try c.instLimitDiag(2589, "Type instantiation is excessively deep and possibly infinite.");
         return types.error_type;
     }

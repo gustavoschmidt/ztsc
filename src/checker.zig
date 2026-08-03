@@ -71,6 +71,7 @@ const modules = @import("link/modules.zig");
 const parser = @import("frontend/parser.zig");
 const ZeroPagedArray = @import("zeropage.zig").ZeroPagedArray;
 pub const BumpArena = @import("checker/bump.zig").BumpArena;
+pub const prof_zig = @import("checker/prof.zig");
 
 const Ast = ast.Ast;
 const Node = ast.Node;
@@ -581,15 +582,15 @@ pub const map_containers = [_][]const u8{
     "cmp_cache",                "ctt_cache",              "ci_cache",
     "infer_visited",            "subst_this_cache",       "mmp_cache",
     "inst_cache",               "arrayish_elem_cache",    "tp_constraint_cache",
-    "inst_map_ids",             "fresh_tp_ids",           "this_tp_ids",
-    "fresh_tp_info",            "type_node_cache",        "atom_cache",
-    "infer_ids",                "infer_scopes",           "mapped_key_ids",
-    "mapped_key_scopes",        "inst_diag_at",           "infer_active",
-    "lazy_member_active",       "chain_guards",           "never_isect",
-    "deep_path_list",           "deep_path_ids",          "flow_reach",
-    "member_type_stack",        "lazy_index_objs",        "pending_type_args",
-    "pending_type_args_pool",   "pending_type_args_seen", "tp_constrained_cache",
-    "nominal_bases",            "nominal_base_pool",
+    "erase_cache",              "inst_map_ids",           "fresh_tp_ids",
+    "this_tp_ids",              "fresh_tp_info",          "type_node_cache",
+    "atom_cache",               "infer_ids",              "infer_scopes",
+    "mapped_key_ids",           "mapped_key_scopes",      "inst_diag_at",
+    "infer_active",             "lazy_member_active",     "chain_guards",
+    "never_isect",              "deep_path_list",         "deep_path_ids",
+    "flow_reach",               "member_type_stack",      "lazy_index_objs",
+    "pending_type_args",        "pending_type_args_pool", "pending_type_args_seen",
+    "tp_constrained_cache",     "nominal_bases",          "nominal_base_pool",
 };
 
 /// Where one symbol's declared heritage lives in `Checker.nominal_base_pool`.
@@ -1008,6 +1009,21 @@ pub const Checker = struct {
     /// `SymbolId -> declared constraint TypeId` (`no_type` = unconstrained).
     /// Avoids re-resolving the constraint AST on every assignability check.
     tp_constraint_cache: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
+    /// `eraseParamsOf` memo, keyed `(owner << 32 | sig)`. Erasing a
+    /// signature's type parameters to their constraints (tsc's
+    /// `getBaseSignature`, cached there on the signature's links) is a pure
+    /// function of the `(sig, owner)` pair, and the signature relation asks
+    /// for it on BOTH sides of every generic comparison — so a kysely builder
+    /// chain re-derived the same erasure thousands of times, including the
+    /// `tps.len - 1` constraint fixed-point rounds. It was the second-largest
+    /// consumer of the per-statement instantiation budget in the
+    /// `--inst-profile` measurement (1.2 M of 5.3 M node visits on the immich
+    /// repro, over 11 k calls).
+    ///
+    /// Gated by `inst_cache_on` and, like `inst_cache`, never populated for a
+    /// result whose computation tripped the depth/count limit — a truncated
+    /// erasure is a function of the live depth, not of `(sig, owner)`.
+    erase_cache: std.AutoHashMapUnmanaged(u64, TypeId) = .empty,
     /// Higher-order type-param rewrite. When an object's generic call/
     /// construct signature (`interface H<T>{ <U extends C<T> = D<T>>(…):… }`) is
     /// instantiated under a map `M`, an own param `U` whose constraint/default
@@ -1252,6 +1268,10 @@ pub const Checker = struct {
     /// While set, `instantiateId`'s depth/count guard truncates silently
     /// (no TS2589) — used for origin-tag bookkeeping (`tagInstantiatedOrigin`).
     suppress_inst_diag: bool = false,
+    /// Instantiation-demand profiler (`ZTSC_INST_PROFILE=1`; see
+    /// `checker/prof.zig`). `prof.on` is false in every normal run and the
+    /// instrumentation points are single predictable branches.
+    prof: prof_zig.InstProf = .{},
     /// Depth of an in-flight *side query*: a type looked up from inside the
     /// flow-narrowing walk, out of the checker's top-down order (see
     /// `declaredPathType`). While non-zero `diagFmt` drops diagnostics — the
@@ -1425,6 +1445,7 @@ pub const Checker = struct {
             .scratch_arena = undefined,
             .inst_arena = undefined,
             .inst_cache_on = inst_cache_on,
+            .prof = .{ .on = prof_zig.enabled() },
         };
         c.carena = try gpa.create(std.heap.ArenaAllocator);
         errdefer gpa.destroy(c.carena);
@@ -1555,6 +1576,7 @@ pub const Checker = struct {
         c.sym_state.free();
         c.diag_seen.deinit(c.gpa);
         c.diags.deinit(c.gpa);
+        c.prof.deinit(c.gpa);
         inline for (map_containers) |n| @field(c, n).deinit(c.cm());
         if (c.ts.base != null) c.ts.deinit(); // overlay only; a base store is arena-owned
         c.carena.deinit();
@@ -1620,6 +1642,7 @@ pub const Checker = struct {
         c.stats.relation_entries = c.relation.count();
         c.stats.relation_bytes = c.relation.capacity() * (8 + 1);
         c.stats.instantiations = c.inst_total;
+        if (c.prof.on) prof_zig.report(c);
         return .{ .diagnostics = list, .stats = c.stats };
     }
 

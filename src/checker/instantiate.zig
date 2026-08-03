@@ -33,6 +33,7 @@ const arrayDecidablyExtends = @import("generics.zig").arrayDecidablyExtends;
 const atom = Checker.atom;
 const buildInstMap = @import("typenode.zig").buildInstMap;
 const checkClass = @import("stmts.zig").checkClass;
+const prof_zig = checker_zig.prof_zig;
 const diagFmt = Checker.diagFmt;
 const fixTypeArgs = @import("typenode.zig").fixTypeArgs;
 const hasValueMeaning = @import("names.zig").hasValueMeaning;
@@ -165,9 +166,13 @@ pub fn resolveStructural(c: *Checker, t0: TypeId) Error!TypeId {
     // class instance.
     var t = if (c.ts.kind(t0) == .this_type) c.ts.thisTypeInstance(t0) else t0;
     var i: u32 = 0;
+    const prof_before = c.inst_total;
     while (c.ts.kind(t) == .ref) : (i += 1) {
         if (i > 16) return types.error_type;
         t = try c.expandRef(t);
+    }
+    if (c.prof.on and c.inst_total != prof_before) {
+        prof_zig.noteExpandSite(c, @returnAddress(), c.inst_total - prof_before);
     }
     return t;
 }
@@ -179,6 +184,8 @@ pub fn expandRef(c: *Checker, ref: TypeId) Error!TypeId {
     }
     try c.expansions.put(c.cm(), ref, types.no_type); // in-progress
     const sym = c.ts.refSymbol(ref);
+    const prof_before = c.inst_total;
+    defer if (c.prof.on) prof_zig.noteExpand(c, sym, c.inst_total - prof_before);
     const args = try c.scratch().dupe(TypeId, c.ts.refArgs(ref));
     const f = c.symFlags(sym);
     var generic: TypeId = types.any_type;

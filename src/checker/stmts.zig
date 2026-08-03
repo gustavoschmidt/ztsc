@@ -21,6 +21,7 @@ const TypeId = types.TypeId;
 
 const checker_zig = @import("../checker.zig");
 const Checker = checker_zig.Checker;
+const prof_zig = checker_zig.prof_zig;
 const Error = checker_zig.Error;
 const Check = checker_zig.Check;
 const check = checker_zig.check;
@@ -58,6 +59,12 @@ pub fn checkStatement(c: *Checker, node: Node) Error!void {
     // boundaries), and the source element the instantiation budget is
     // scoped to (`max_instantiation_count` — tsc's `checkSourceElement`
     // resets `instantiationCount` at exactly this point).
+    // Profiler: the budget the *previous* source element spent is final at
+    // exactly this point, where the next one resets it.
+    if (c.prof.on and c.inst_count > 0) {
+        const f, const sp = c.instSpanHere();
+        prof_zig.noteStatement(c, f, sp.start, c.inst_count);
+    }
     c.anchorInst(node);
     c.inst_count = 0;
     const d = c.tree.nodeData(node);
