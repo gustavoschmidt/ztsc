@@ -3866,52 +3866,99 @@ pub fn checkDestructuringElement(c: *Checker, el0: Node) Error!void {
 /// types position-wise and intersects the return types. `no_type` when the
 /// intersection carries no usable call signature.
 ///
-/// Deliberately conservative: a constituent with its own type parameters,
-/// a rest parameter, or a `this` type makes the combination ambiguous, so
-/// the whole intersection answers `no_type` and the arrow keeps its
-/// context-free check (the prior behaviour for every intersection).
+/// The same combination answers an OVERLOAD SET, which is the other way a
+/// contextual type ends up with several call signatures — `getSignaturesOfType`
+/// makes no distinction between the two. `Console.trace` is declared once in
+/// `lib.dom` and once by `@types/node`, and `globalThis.fetch` likewise; an
+/// object literal written `as Console`, or an arrow assigned to
+/// `globalThis.fetch`, therefore had NO contextual signature at all and every
+/// parameter it declared was reported implicitly `any`.
+///
+/// Deliberately conservative: a constituent with its own type parameters or a
+/// `this` type makes the combination ambiguous, so the whole set answers
+/// `no_type` and the arrow keeps its context-free check (the prior behaviour
+/// for every intersection).
 pub fn intersectedCallSignature(c: *Checker, rctx: TypeId) Error!TypeId {
     const s = &c.ts;
     var sigs: std.ArrayList(TypeId) = .empty;
     defer sigs.deinit(c.scratch());
-    for (try c.memberList(rctx)) |m| {
-        const rm = try c.resolveStructural(m);
-        switch (s.kind(rm)) {
-            .function => try sigs.append(c.scratch(), rm),
-            .overloads => for (try c.memberList(rm)) |ov| {
-                try sigs.append(c.scratch(), ov);
-            },
-            // Every call signature of the constituent, including an
-            // overload set's: `getSignaturesOfType` concatenates them all
-            // and the combination below is what tsc applies to the result.
-            .object => {
-                for (0..s.objectCallSigCount(rm)) |i| {
-                    try sigs.append(c.scratch(), s.objectCallSig(rm, @intCast(i)));
-                }
-            },
-            else => {},
-        }
+    switch (s.kind(rctx)) {
+        .function => try sigs.append(c.scratch(), rctx),
+        .overloads => for (try c.memberList(rctx)) |ov| {
+            try sigs.append(c.scratch(), ov);
+        },
+        .object => {
+            for (0..s.objectCallSigCount(rctx)) |i| {
+                try sigs.append(c.scratch(), s.objectCallSig(rctx, @intCast(i)));
+            }
+        },
+        else => for (try c.memberList(rctx)) |m| {
+            const rm = try c.resolveStructural(m);
+            switch (s.kind(rm)) {
+                .function => try sigs.append(c.scratch(), rm),
+                .overloads => for (try c.memberList(rm)) |ov| {
+                    try sigs.append(c.scratch(), ov);
+                },
+                // Every call signature of the constituent, including an
+                // overload set's: `getSignaturesOfType` concatenates them all
+                // and the combination below is what tsc applies to the result.
+                .object => {
+                    for (0..s.objectCallSigCount(rm)) |i| {
+                        try sigs.append(c.scratch(), s.objectCallSig(rm, @intCast(i)));
+                    }
+                },
+                else => {},
+            }
+        },
     }
     if (sigs.items.len == 0) return types.no_type;
     if (sigs.items.len == 1) return sigs.items[0];
-    var max_params: usize = 0;
-    for (sigs.items) |sig| {
+    // Per signature: how many LEADING fixed parameters it declares, and the
+    // element type of its trailing rest parameter (`no_type` when it has
+    // none). tsc's `combineIntersectionParameters` reads a position through
+    // `tryGetTypeAtPosition`, which answers a rest parameter's element type
+    // for every position it covers — the reason `(...data: any[]) => void`
+    // combines with `(message?: any, …rest) => void` instead of aborting.
+    const fixed = try c.scratch().alloc(usize, sigs.items.len);
+    defer c.scratch().free(fixed);
+    const rest_elem = try c.scratch().alloc(TypeId, sigs.items.len);
+    defer c.scratch().free(rest_elem);
+    var max_fixed: usize = 0;
+    var any_rest = false;
+    for (sigs.items, 0..) |sig, si| {
         if (s.fnTypeParams(sig).len != 0 or s.fnThisType(sig) != 0) return types.no_type;
+        fixed[si] = s.fnParamCount(sig);
+        rest_elem[si] = types.no_type;
         for (0..s.fnParamCount(sig)) |i| {
-            if (s.fnParam(sig, @intCast(i)).rest()) return types.no_type;
+            const p = s.fnParam(sig, @intCast(i));
+            if (!p.rest()) continue;
+            // Only a trailing rest with an array-shaped type is understood;
+            // a tuple rest would need positional expansion.
+            const rt = try c.resolveStructural(p.ty);
+            if (i + 1 != s.fnParamCount(sig) or s.kind(rt) != .array) return types.no_type;
+            fixed[si] = i;
+            rest_elem[si] = s.arrayElem(rt);
+            any_rest = true;
         }
-        max_params = @max(max_params, s.fnParamCount(sig));
+        max_fixed = @max(max_fixed, fixed[si]);
     }
     var params: std.ArrayList(types.Param) = .empty;
     defer params.deinit(c.scratch());
     var parts: std.ArrayList(TypeId) = .empty;
     defer parts.deinit(c.scratch());
-    for (0..max_params) |i| {
+    for (0..max_fixed) |i| {
         parts.clearRetainingCapacity();
         var name: Atom = 0;
         var opt = false;
-        for (sigs.items) |sig| {
-            if (i >= s.fnParamCount(sig)) {
+        for (sigs.items, 0..) |sig, si| {
+            if (i >= fixed[si]) {
+                if (rest_elem[si] != types.no_type) {
+                    // Covered by the rest parameter, and a rest position is
+                    // always optional.
+                    opt = true;
+                    try parts.append(c.scratch(), rest_elem[si]);
+                    continue;
+                }
                 // A signature that does not declare this position leaves it
                 // optional, matching tsc's `combineSignatures` arity rule.
                 opt = true;
@@ -3927,6 +3974,18 @@ pub fn intersectedCallSignature(c: *Checker, rctx: TypeId) Error!TypeId {
             .name = name,
             .ty = try s.makeUnion(c.scratch(), parts.items),
             .flags = if (opt) types.param_flag_optional else 0,
+        });
+    }
+    if (any_rest) {
+        parts.clearRetainingCapacity();
+        for (sigs.items, 0..) |sig, si| {
+            _ = sig;
+            if (rest_elem[si] != types.no_type) try parts.append(c.scratch(), rest_elem[si]);
+        }
+        try params.append(c.scratch(), .{
+            .name = 0,
+            .ty = try s.makeArray(try s.makeUnion(c.scratch(), parts.items)),
+            .flags = types.param_flag_rest,
         });
     }
     parts.clearRetainingCapacity();
@@ -3963,13 +4022,25 @@ pub fn checkFunctionLikeExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId 
             // ordinary properties (`FunctionComponent<P>` with its
             // `displayName?`, `ForwardRefRenderFunction<T, P>`). tsc's
             // `getContextualSignature` reads the type's call signatures and
-            // uses the SOLE one; only that case is unambiguous, so an
-            // overload set is left alone. Without this an arrow annotated
-            // with such an interface (`const Base: FC<Props> = (props) =>
-            // …`) got no contextual parameter types and reported TS7006.
+            // uses the SOLE one; SEVERAL are combined the same way an
+            // intersection's are (`getIntersectedSignatures`). Without this an
+            // arrow annotated with such an interface (`const Base: FC<Props> =
+            // (props) => …`) got no contextual parameter types and reported
+            // TS7006.
             .object => {
-                if (c.ts.objectCallSigCount(rctx) == 1) ctx_sig = c.ts.objectCallSig(rctx, 0);
+                if (c.ts.objectCallSigCount(rctx) == 1) {
+                    ctx_sig = c.ts.objectCallSig(rctx, 0);
+                } else if (c.ts.objectCallSigCount(rctx) > 1) {
+                    ctx_sig = try c.intersectedCallSignature(rctx);
+                }
             },
+            // An OVERLOAD SET. `getSignaturesOfType` treats it exactly as it
+            // treats an intersection of callables — several signatures — and
+            // `getContextualCallSignature` combines them. A name declared by
+            // both `lib.dom` and `@types/node` (`fetch`, `Console.trace`)
+            // arrives here, and leaving it alone reported TS7006 on every
+            // parameter of the arrow written for it.
+            .overloads => ctx_sig = try c.intersectedCallSignature(rctx),
             .union_type => {
                 for (try c.memberList(rctx)) |m| {
                     const rm = try c.resolveStructural(m);
