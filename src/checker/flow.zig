@@ -2054,7 +2054,16 @@ pub fn assignmentReduced(c: *Checker, declared: TypeId, assigned0: TypeId) Error
 
 pub fn narrowByLiteralEquality(c: *Checker, t: TypeId, other: Node, strict: bool, sense: bool) Error!TypeId {
     const ot0 = try c.checkExprCached(other, types.no_type);
-    const ot = try c.ts.regularLiteral(ot0);
+    const ot1 = try c.ts.regularLiteral(ot0);
+    // `x === 'a'` / `x !== 1` where `x` is an ENUM: tsc's whole enum is the
+    // union `E.A | E.B`, so `filterType(E, t => areTypesComparable(t, "a"))`
+    // keeps `E.A` on the true branch and drops it on the false one. ztsc
+    // keeps the enum as one type and the arms below match member types by
+    // identity, so the raw value is translated into the member type it names
+    // first — after which the existing enum arms do exactly tsc's thing.
+    // Without it `e !== 'a'` never shrank `E` and `e === 'a'` collapsed the
+    // reference to `never`.
+    const ot = try enumMemberForLiteral(c, t, ot1);
     const ok = c.ts.kind(ot);
     const is_nullish = ok == .null or ok == .undefined;
     if (!strict and is_nullish) {
@@ -2075,6 +2084,36 @@ pub fn narrowByLiteralEquality(c: *Checker, t: TypeId, other: Node, strict: bool
         return c.narrowToValue(t, ot);
     }
     return c.narrowExcludeValue(t, ot);
+}
+
+/// Translate a plain literal comparand into the ENUM MEMBER type it names,
+/// when the narrowed type is an enum (optionally nullable). Returns the
+/// comparand unchanged in every other case, including a mixed union such as
+/// `E | string`, where the plain literal is still the right comparand for the
+/// non-enum constituents.
+fn enumMemberForLiteral(c: *Checker, t: TypeId, v: TypeId) Error!TypeId {
+    switch (c.ts.kind(v)) {
+        .string_literal, .number_literal, .number_literal_fresh => {},
+        else => return v,
+    }
+    var sym: ?u32 = null;
+    if (c.ts.kind(t) == .enum_type) {
+        sym = c.ts.enumSymbol(t);
+    } else if (c.ts.kind(t) == .union_type) {
+        for (c.ts.members(t)) |m| {
+            switch (c.ts.kind(m)) {
+                .enum_type => {
+                    const s = c.ts.enumSymbol(m);
+                    if (sym != null and sym.? != s) return v; // two enums: leave it
+                    sym = s;
+                },
+                .null, .undefined => {},
+                else => return v, // a non-enum constituent still wants the literal
+            }
+        }
+    }
+    const es = sym orelse return v;
+    return (try c.enumMemberForValue(es, v)) orelse v;
 }
 
 /// Narrow `t` to the single value type `v` (=== true branch).
@@ -2353,7 +2392,15 @@ pub fn narrowByDiscriminant(c: *Checker, t: TypeId, prop: Atom, value: TypeId, s
                 const pv = try c.ts.regularLiteral(pp.ty);
                 const is_unit = c.ts.isLiteralLike(pv) or
                     c.ts.kind(pv) == .null or c.ts.kind(pv) == .undefined;
-                break :blk !(is_unit and pv == value);
+                // COMPARABLE, not identical — tsc's rule is
+                // `!(isUnitLikeType(t) && areTypesComparable(t, valueType))`,
+                // and `matches` above is that same comparability test. The
+                // difference shows on a string/numeric ENUM discriminant
+                // guarded by its raw value (`edit.action !== 'crop'` on
+                // `action: AssetEditAction.Crop`): identity kept every member
+                // on the false branch, so the branches overlapped and the
+                // TS 5.5 inferred predicate on `find`/`filter` was refused.
+                break :blk !(is_unit and matches);
             }
             break :blk true;
         };

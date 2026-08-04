@@ -255,6 +255,31 @@ pub fn enumMemberValue(c: *Checker, sym: SymbolId, name: Atom) Error!?TypeId {
     return look.value;
 }
 
+/// The member type of enum `sym` whose constant VALUE is the literal
+/// `value` — `'a'` -> `E.A` for `enum E { A = 'a' }`. tsc needs no such
+/// lookup: a whole enum IS the union of its member types there, so
+/// `filterType(E, t => areTypesComparable(t, "a"))` matches `E.A` directly.
+/// ztsc keeps the enum as ONE type, so a guard written against the raw value
+/// has to be translated into the member type before the value narrowers can
+/// keep or subtract it (see `narrowByLiteralEquality`).
+pub const EnumMemberByValue = struct {
+    c: *Checker,
+    sym: SymbolId,
+    want: TypeId,
+    found: TypeId = types.no_type,
+    pub fn visit(self: *EnumMemberByValue, name: Atom, value: TypeId) Error!void {
+        if (self.found != types.no_type or value == types.no_type) return;
+        if ((try self.c.ts.regularLiteral(value)) != self.want) return;
+        self.found = try self.c.ts.makeEnumMember(self.sym, name, false);
+    }
+};
+
+pub fn enumMemberForValue(c: *Checker, sym: SymbolId, value: TypeId) Error!?TypeId {
+    var look: EnumMemberByValue = .{ .c = c, .sym = sym, .want = try c.ts.regularLiteral(value) };
+    try c.eachEnumMember(sym, &look, EnumMemberByValue.visit);
+    return if (look.found == types.no_type) null else look.found;
+}
+
 pub const EnumMemberCollect = struct {
     c: *Checker,
     list: *std.ArrayList(TypeId),
