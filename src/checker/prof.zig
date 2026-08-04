@@ -396,6 +396,60 @@
 //! ceiling, take the keys that only exist there, and compare those members'
 //! completed types against tsgo's. All of the above is reverted; only the
 //! trip-by-frame profiler axis was kept.
+//!
+//! ## The POLARITY axis, and the cascade claim it disproves (2026-08-04)
+//!
+//! A different axis from the two above: not who is charged and not how high
+//! the ceiling is, but WHERE a trip is allowed to be a user-facing error.
+//! tsc's separation is by position — `instantiateType`'s guard reports
+//! TS2589 at the checking level, while `recursiveTypeRelatedTo` answers
+//! `Ternary.Maybe` for the same recursion detected inside the relation, with
+//! no diagnostic. ztsc reported at both. `Checker.instDiagAllowed` now
+//! withdraws the report while `rel_depth > 0`; the truncation itself is
+//! unchanged (see that function for why it is harmless there).
+//!
+//! **The change is right and it is small.** immich 222 -> 221 excess, wall
+//! 3.69 -> 3.67 s, peak RSS 1.885 -> 1.941 GB, every gate unchanged. The
+//! isolated pair it was found on — immich's
+//! `ExpressionBuilder<DB & {sharedBy: UserTable}, 'partner'|'sharedBy'>`
+//! against `ExpressionBuilder<DB, 'partner'>`, tsgo clean — goes clean.
+//!
+//! **The cascade claim attached to it is false, and this is the number to
+//! remember.** The hypothesis was that ~70% of immich's 222 (TS7006 87,
+//! TS2769 43, TS2554 19, TS2589 10) descends from relation-internal trips,
+//! so a policy that stopped them from poisoning a statement would take the
+//! excess with it. Measured on the whole package, at the 222 baseline:
+//!
+//!   * `max_instantiation_count` 250 k -> 3 M: 221 -> **216**, wall 4.0 ->
+//!     21.0 s, RSS 2.05 -> 2.90 GB. TS7006 87 -> 75 but TS2769 43 -> **53**:
+//!     the same one-cascade-for-another trade the 5 M row above records.
+//!   * `max_instantiation_depth` 100 -> 400 (count held at 250 k):
+//!     **byte-identical 221**. Depth is not binding on this corpus at all.
+//!
+//! So the guards together account for **6 of 222 keys (2.7%)**, not ~155.
+//! Direct evidence for where the rest is: `--inst-profile` says only SEVEN
+//! statements in the package reach the 250 k cap, and `getById` in
+//! `asset.repository.ts` — which alone carries 42 of the 87 TS7006 — is not
+//! one of them, spending under 13 k visits. Its cluster is rooted in a
+//! genuine overload divergence upstream (`src/utils/database.ts:119`,
+//! `withExif`'s `.select(selectExifInfo)`, TS2769 where tsgo is clean),
+//! which is what strips the contextual type off every `$if`/`$call` callback
+//! downstream of it. **immich's TS7006/TS2769 population is a call-resolution
+//! problem, not an instantiation-budget one**; the budget family of
+//! hypotheses is now closed from three independent directions.
+//!
+//! No synthetic conformance fixture reproduces the relation-internal trip.
+//! Seven were tried — branching builders, recursive mapped aliases, wide
+//! union fan-outs, a hand-written kysely-shaped builder pair with 30 tables,
+//! and the same pair under distinct symbols to defeat the variance
+//! short-circuit — and every one closes in a few thousand node visits with
+//! zero trips, because `relIdDeeplyNested` and the relation memo do cut
+//! ordinary recursive shapes. What makes the kysely pair escape is that the
+//! refs on its spine DECREASE (the deeper frames meet declarations interned
+//! earlier), and the growth test counts only strictly later instantiations.
+//! That is an interning-order property, not a shape property, so the
+//! checking-level half of the boundary is pinned by conformance
+//! instantiation/002 and the relation half by the immich app gate.
 
 const std = @import("std");
 const types = @import("../types.zig");
