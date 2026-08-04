@@ -377,14 +377,25 @@
 //!   new). Excess is FLAT across a 20x ceiling while wall grows 8.6x and RSS
 //!   2.6x.
 //!
-//! The last row is the one that matters beyond this experiment: letting every
-//! truncated repository member complete does not remove the diagnostics —
-//! it exchanges one set of ~44 keys for another. **The ~390 "budget-truncation
-//! cascades" in immich's 453 are not curable by budget**, whoever is charged
-//! and however high the ceiling. Whatever produces them survives the work
-//! completing, so the next hypothesis has to come from comparing a completed
-//! member's TYPE against tsgo's, not from the budget at all. All of it is
-//! reverted; only the trip-by-frame profiler axis was kept.
+//! The last row is the one that matters beyond this experiment, and its key
+//! diff says exactly what a bigger budget buys and what it costs. At 5 M the
+//! keys that DISAPPEAR are a clean truncation-cascade signature — 26 TS7006,
+//! 7 TS2589, 7 TS2554, 3 TS2769, 1 TS2345 — so truncation really is producing
+//! some of immich's excess. But 43 others APPEAR in their place: 13 TS2769,
+//! 7 TS2589, 7 TS2339, 6 TS7006, 5 TS2554, 5 TS2345. Letting the work complete
+//! trades one cascade for an equal amount of divergence that truncation was
+//! hiding, and the seven fresh TS2589 say the deeper walk simply trips
+//! somewhere else.
+//!
+//! So **the budget cannot be the lever on immich's 453** — not through who is
+//! charged, not through how high the ceiling is. The truncation-attributable
+//! share is real but ~40 keys, not ~390, and it is only reachable by making
+//! those repository members CHEAPER (each costs > 250,000 node visits alone),
+//! not by letting them cost more. The 43 keys that surface underneath are the
+//! population the next hypothesis should come from: run at the 5 M table
+//! ceiling, take the keys that only exist there, and compare those members'
+//! completed types against tsgo's. All of the above is reverted; only the
+//! trip-by-frame profiler axis was kept.
 
 const std = @import("std");
 const types = @import("../types.zig");
