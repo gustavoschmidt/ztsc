@@ -724,6 +724,134 @@
 //! same trade the budget-ceiling experiments recorded: five TS2322 on
 //! `asset.repository.ts:917-923`, four TS2345 in `media.service.ts`, one
 //! TS2589 in `person.repository.ts`. They are the successor item.
+//!
+//! ## The budget is TWO budgets, and the ceiling family REOPENS (2026-08-04)
+//!
+//! The five TS2322 above were read as a `Selection<…>` evaluation bug. They
+//! are not one, and the bisect that settled it is worth keeping because every
+//! intermediate step looked like a different bug:
+//!
+//!   * `.with('cte', …)`'s row type is MISSING five columns, and the five are
+//!     exactly the ``sql`…` `` templates with no `${}` substitution — a
+//!     perfect correlation that is a COINCIDENCE (adding a substitution to one
+//!     of them does not bring it back);
+//!   * the cte row is CORRECT when read directly (`.selectFrom('cte')
+//!     .select('cte.isImage')`), and wrong only through the second
+//!     `.with('agg', …)`, which made it look like `ExtractRowFromCommon
+//!     TableExpression`;
+//!   * `Selection<DB, TB, SE>` applied to the union SE by hand is byte-correct
+//!     against tsgo, so the mapped type and its `as` clause are fine;
+//!   * what is wrong is the union SE the ARRAY LITERAL infers. It comes back
+//!     with one `AliasedRawBuilder<…>` constituent instead of six. Distinct
+//!     `O` arguments (`sql<number>`, `sql<string>`, …) do not save them, so it
+//!     is not a dedup by shape;
+//!   * and the whole thing depends on whether immich's `asset.repository.ts`
+//!     is in the program at all. Four lines:
+//!
+//!         declare const x2: AliasedRawBuilder<string, 'a2'>;
+//!         export const y1: AliasedRawBuilder<number, 'a1'> = x2;
+//!
+//!     tsgo reports TS2322; ztsc reported it alone and ACCEPTED it with one
+//!     extra import. Union subtype reduction then collapsed the six.
+//!
+//! The cause is `measuredVariances` running on the demanding statement's spent
+//! budget: every `instantiate` returns `error_type`, the member table is
+//! empty, no member witnesses the parameter, and the third-marker test reports
+//! `independent` — cached under the symbol for the whole run. Fixed by giving
+//! the measurement its own window, which is the argument `rel_id_floor`'s
+//! comment already makes for the relation stack.
+//!
+//! **That fix alone is a net LOSS on immich — 123 -> 125 at c4, 152 -> 153 at
+//! c1** — and the seven keys it uncovers (four TS2551 + a TS7006 in
+//! `person.service.ts`, a TS2345 in `metadata.service.ts`, a TS7006 in
+//! `asset.repository.ts`) are all `asset.faces` and friends going missing off
+//! a repository method's inferred return type. Which is a truncation. Which is
+//! the family this header had closed.
+//!
+//! ### Why it was closed wrongly: one cap was doing two jobs
+//!
+//! `max_instantiation_count` is a FAIRNESS device for a source element — the
+//! answer it truncates is that statement's, and the next statement starts
+//! over. `enterSymFile`'s window inherited the same number, and there the
+//! reasoning does not hold at all: a declaration's materialization is memoized
+//! under the SYMBOL and read by every later statement, so a truncation is
+//! published once and never revisited. Which statement demanded it first
+//! decides what the whole run sees. The "own budget epoch" experiments above
+//! all moved the CHARGE and correctly measured that as a no-op; none of them
+//! raised the CAP for the frame that needed it.
+//!
+//! Split into `max_instantiation_count` (250 k, a statement) and
+//! `max_decl_instantiation_count` (5 M, tsc's own constant, a declaration
+//! window), and with the window opened for EVERY declaration frame rather than
+//! only a cross-file one:
+//!
+//!     | | c4 | c1 | c1^c4 | wall (c4) | RSS (c4) |
+//!     |---|---:|---:|---:|---:|---:|
+//!     | 431d668 | 123 | 152 | 41 | 2.76 s | 2.38 GB |
+//!     | + variance window | 125 | 153 | — | 3.10 s | 2.37 GB |
+//!     | + declaration cap (cross-file) | 108 | 91 | — | 4.00 s | 2.65 GB |
+//!     | + every declaration frame | **88** | **91** | **9** | 3.98 s | 2.56 GB |
+//!
+//! Library corpus byte-identical or better: zod 0.15 s / 53 MB unchanged,
+//! typebox **0.40 s -> 0.01 s** (its declaration now completes once instead of
+//! being re-truncated by every reader — the memory note about typebox's wall
+//! doubling is closed), e2e multi unchanged, excalidraw 17/0/0 CONVERGED.
+//!
+//! ### Raising `max_instantiation_count` itself is still ruled out — new reason
+//!
+//! The old entry ("Raising the budget", above) said 5 M cost 41 s and made
+//! immich WORSE. Re-measured at this branch point, demand having fallen ~10x
+//! since, BOTH halves of that are now false and it is still a blocker:
+//!
+//!     | statement cap | immich c4 | immich c1 | zod wall / RSS |
+//!     |---|---:|---:|---|
+//!     | 250 k | 123 | 152 | 0.15 s / 53 MB |
+//!     | 1 M | 123 | 133 | — |
+//!     | 2 M | 96 | 127 | — |
+//!     | 3 M | 95 | 94 | — |
+//!     | 5 M | 95 | 94 | **1.37 s / 301 MB** |
+//!
+//! immich plateaus at 3 M (10 M is byte-identical to 5 M), and 95/94 with a
+//! cross-partition divergence of ONE key is the best excess this corpus has
+//! ever shown — but zod goes to nine times tsgo's wall and twice its RSS on a
+//! GATED package, because zod's cost is in ordinary source elements that used
+//! to trip and now run to completion. The split cap buys immich's half of that
+//! (88/91) without touching what a statement may spend.
+//!
+//! ### What the split leaves, measured
+//!
+//! `-- budget trips by the declaration frame that was live --` at head:
+//!
+//!     950 trips, ALL of them <source element>
+//!
+//! against 3,916 of 5,290 inside a table construction before. **No declaration
+//! materialization in the whole package truncates any more**, and exactly one
+//! statement (`ocr.repository.ts:31:49`) reaches the 250 k cap. So the
+//! remaining 88 keys are NOT truncation, and the ceiling family is closed for
+//! a third time — this time with the trip counter, not by inference.
+//!
+//! 88 keys at c4: TS2345 23, TS2769 19, TS7006 17, TS2339 13, TS2322 10,
+//! TS2589 2, one each TS2678/TS2367/TS2366/TS2365. The largest single cluster
+//! is `sync.repository.ts` (12, every one a TS7006 on a `.select((eb) => …)`
+//! or `.where(…, (eb) => …)` callback whose contextual type is lost), then
+//! `search.service.ts` and `user.repository.ts` at 5. None of the three
+//! reproduces in isolation — each needs the rest of the package in the program
+//! — which is the same signature the TS2769 that opened this campaign had, and
+//! that one turned out to be a call-resolution divergence
+//! (`rollbackArgDiags`' budget refund), not a truncation. That is where the
+//! next bisect should start.
+//!
+//! No synthetic conformance fixture exists for the VARIANCE half, and the
+//! reason is structural rather than a failure of imagination: the bug needs a
+//! variance question asked from a statement that has already spent 250,000
+//! node visits, and a statement that has spent them reports TS2589 where tsc
+//! (with 20x the budget) is clean — so any snapshot carries a `+` entry with
+//! no matching oracle diagnostic, which DEFERRED's policy does not admit. It
+//! is pinned by the four-line kysely repro above and by the immich gate. The
+//! DECLARATION half is pinned, by
+//! `instantiation/053_cross_file_declaration_budget`, which fails (and is the
+//! only case that fails) when `max_decl_instantiation_count` is put back to
+//! `max_instantiation_count`.
 
 const std = @import("std");
 const types = @import("../types.zig");
