@@ -431,12 +431,26 @@
 //! statements in the package reach the 250 k cap, and `getById` in
 //! `asset.repository.ts` — which alone carries 42 of the 87 TS7006 — is not
 //! one of them, spending under 13 k visits. Its cluster is rooted in a
-//! genuine overload divergence upstream (`src/utils/database.ts:119`,
-//! `withExif`'s `.select(selectExifInfo)`, TS2769 where tsgo is clean),
-//! which is what strips the contextual type off every `$if`/`$call` callback
-//! downstream of it. **immich's TS7006/TS2769 population is a call-resolution
-//! problem, not an instantiation-budget one**; the budget family of
-//! hypotheses is now closed from three independent directions.
+//! genuine overload divergence upstream — `src/utils/database.ts:119`,
+//! `withExif`'s `.select(selectExifInfo)` — which strips the contextual type
+//! off every `$if`/`$call` callback downstream of it. It isolates to fifteen
+//! self-contained lines (immich's `node_modules` + `src/schema`, nothing
+//! else): declare
+//!
+//!     type AssetExpressionBuilder = ExpressionBuilder<DB, 'asset' | 'asset_exif'>;
+//!     const selectExifInfo = (eb: AssetExpressionBuilder) =>
+//!       eb.fn.toJson(eb.table('asset_exif'))
+//!         .$castTo<ShallowDehydrateObject<Selectable<AssetExifTable>> | null>()
+//!         .as('exifInfo');
+//!     export function withExif<O>(qb: SelectQueryBuilder<DB, 'asset', O>) {
+//!       return qb.leftJoin('asset_exif', 'asset.id', 'asset_exif.assetId')
+//!         .select(selectExifInfo);
+//!     }
+//!
+//! and ztsc raises TS2769 on the `.select(…)` where tsgo is clean, with no
+//! budget trip anywhere near it. **immich's TS7006/TS2769 population is a
+//! call-resolution problem, not an instantiation-budget one**; the budget
+//! family of hypotheses is now closed from three independent directions.
 //!
 //! No synthetic conformance fixture reproduces the relation-internal trip.
 //! Seven were tried — branching builders, recursive mapped aliases, wide
