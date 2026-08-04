@@ -2033,9 +2033,9 @@ pub const Checker = struct {
         if (f != c.cur_file) {
             c.setFile(f);
             c.this_type = 0;
-            c.inst_count = 0;
-            c.inst_budget = max_decl_instantiation_count;
         }
+        c.inst_count = 0;
+        c.inst_budget = max_decl_instantiation_count;
         return saved;
     }
 
