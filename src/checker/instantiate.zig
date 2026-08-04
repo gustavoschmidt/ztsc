@@ -445,12 +445,33 @@ fn lazySlotNumberIndex(c: *Checker, generic: TypeId) u32 {
 /// amortization the whole-table expansion provided survives at member
 /// granularity — EXCEPT when the substitution truncated, which is never
 /// published (see `lazy_member`).
+///
+/// A truncated member falls back to the WHOLE-table expansion and reads the
+/// member out of that. Without the fallback a truncation is unrecoverable:
+/// nothing is memoized, so the next reader re-substitutes under a budget that
+/// is no less spent and truncates again, forever — the failure mode
+/// `expandRef`'s truncated-withdrawal experiment ran into from the other
+/// direction (see prof.zig). `expandRef` memoizes whatever it gets, truncated
+/// or not, so one fallback moves this reference to the eager regime for the
+/// rest of the run and every later reader sees the same answer the checker
+/// would have given with no lazy layer at all. The lazy route can therefore
+/// only win: it either substitutes one member instead of two hundred, or it
+/// pays exactly what the eager path paid.
 pub fn lazyMemberAt(c: *Checker, ref: TypeId, generic_ty: TypeId, slot: u32) Error!TypeId {
     const key = (@as(u64, ref) << 32) | slot;
     if (c.lazy_member.get(key)) |t| return t;
     const map = (try c.lazyRefMap(ref)) orelse return generic_ty;
     const result = try c.instantiate(generic_ty, map);
-    if (!c.inst_limit_tripped) try c.lazy_member.put(c.cm(), key, result);
+    if (!c.inst_limit_tripped) {
+        try c.lazy_member.put(c.cm(), key, result);
+        return result;
+    }
+    const whole = try c.expandRef(ref);
+    if (c.ts.kind(whole) != .object) return result;
+    const n = c.ts.objectPropCount(whole);
+    if (slot < n) return c.ts.objectProp(whole, slot).ty;
+    if (slot == n) return c.ts.objectStringIndex(whole);
+    if (slot == n + 1) return c.ts.objectNumberIndex(whole);
     return result;
 }
 
