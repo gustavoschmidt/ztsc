@@ -577,7 +577,33 @@ pub fn measuredVariances(c: *Checker, owner: SymbolId) Error!?u32 {
     // whose relation happened to demand the measurement.
     const saved_suppress = c.suppress_inst_diag;
     const saved_count = c.inst_count;
+    const saved_tripped = c.inst_limit_tripped;
     c.suppress_inst_diag = true;
+    // …and the budget is a WINDOW here, not just an unbilled charge. The
+    // restore below already keeps the measurement off the demanding
+    // statement's ledger, but leaving `inst_count` where the demander left it
+    // means a measurement asked for late in a spent statement runs with no
+    // budget at all: every `instantiate` under it returns `error_type`, so
+    // the generic's member table comes back empty, NO member witnesses the
+    // parameter, and `measureOneVariance`'s third-marker test reports
+    // `independent` — "these arguments do not participate in the relation".
+    // That verdict is then cached under the symbol for the whole run, and
+    // every later pair of instantiations relates by nothing.
+    //
+    // kysely's `AliasedRawBuilder<O, A>` is the shape that showed it:
+    // `AliasedRawBuilder<string, 'a2'>` was assignable to
+    // `AliasedRawBuilder<number, 'a1'>` iff immich's `asset.repository.ts`
+    // was also in the program, which collapsed every `sql`…`.as(name)` in a
+    // `.select([…])` array to ONE union constituent (subtype reduction) and
+    // dropped the rest of the columns from the row type.
+    //
+    // This is the same argument the `rel_id_floor` comment above makes, on
+    // the one axis it did not cover: the answer is cached under the generic
+    // alone, so it must be computed as a function of the generic alone.
+    // Bounded work — one window per generic per checker, and the window is
+    // still capped by `max_instantiation_count` from zero.
+    c.inst_count = 0;
+    c.inst_limit_tripped = false;
     // The relation stack is bookkeeping here too, and for a stronger reason
     // than the counters above: a measurement is a question about the GENERIC,
     // and its answer is cached under the generic alone. Left on top of
@@ -600,6 +626,7 @@ pub fn measuredVariances(c: *Checker, owner: SymbolId) Error!?u32 {
         c.rel_id_floor = saved_rel_id_floor;
         c.suppress_inst_diag = saved_suppress;
         c.inst_count = saved_count;
+        c.inst_limit_tripped = saved_tripped;
         c.variance_measure_depth -= 1;
         _ = c.measuring_variance.remove(owner);
     }
@@ -659,9 +686,21 @@ fn measureOneVariance(c: *Checker, owner: SymbolId, tps: []const TypeParamInfo, 
     const saved_trip = c.rel_guard_tripped;
     c.rel_guard_tripped = false;
     defer c.rel_guard_tripped = saved_trip;
+    // The instantiation budget manufactures the same vacuous verdict, one
+    // layer down: a truncated substitution is `error_type`, a member table
+    // built out of `error_type` witnesses nothing, and a parameter no member
+    // witnesses reads `independent` — "these arguments do not participate in
+    // the relation at all", which is the strongest claim this function can
+    // make and the one it is least entitled to from a walk that never
+    // finished. `measuredVariances` gives the measurement its own budget
+    // window so this is rare; when the window itself runs out, distrust the
+    // both-ways verdict exactly as above and let the structural walk decide.
+    const saved_inst_trip = c.inst_limit_tripped;
+    c.inst_limit_tripped = false;
+    defer c.inst_limit_tripped = c.inst_limit_tripped or saved_inst_trip;
     const co = try c.isAssignable(sub_ref, super_ref);
     const contra = try c.isAssignable(super_ref, sub_ref);
-    if (c.rel_guard_tripped and co and contra) return .unmeasured;
+    if ((c.rel_guard_tripped or c.inst_limit_tripped) and co and contra) return .unmeasured;
     if (co and contra) {
         // Bivariant may just mean the parameter is never witnessed. tsc
         // settles it with a THIRD marker related to neither of the first two
