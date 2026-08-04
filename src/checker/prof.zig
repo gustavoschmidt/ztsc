@@ -630,6 +630,95 @@
 //! Both are needed for the immich site and each was measured alone to confirm
 //! it: (1) alone leaves every `keyof` case failing, (2) alone leaves every
 //! constraint case failing. immich 174 -> 173, no other key moved.
+//!
+//! ## The synthetic, profiled: THE RELATION ERASED TO CONSTRAINTS (2026-08-04)
+//!
+//! The 13-line synthetic above (67 tables x 17 columns, `kysely` only, one
+//! file in the program) reproduces verbatim: 429,210 node visits, 203 budget
+//! trips, TS7006 + TS2589 where tsgo is clean in 0.08 s. Its profile names one
+//! dominant term, and it is not `expandRef`:
+//!
+//!     162,760 visits / 1,329 calls   eraseParamsOf   (assign.zig:3733)
+//!      96,051 visits /   673 calls   eraseParamsOf   (the fixed-point rounds)
+//!      62,445 visits /   199 calls   isAssignableInner's resolveStructural
+//!
+//! **60% of a whole one-statement program's instantiation demand is the
+//! signature relation erasing type parameters to their CONSTRAINTS**, and on
+//! this corpus a constraint is `ReferenceExpression<DB, TB>` — a union over
+//! every column of every table, which is exactly the measured "demand scales
+//! with tables x columns". The multiplicity is not the call count (the
+//! `erase_cache` already serves repeats); it is the COST of one erasure.
+//!
+//! tsc never does this. `getBaseSignature` — erase to constraints, with the
+//! same `tps.len - 1` fixed-point rounds ztsc copied — has exactly ONE caller
+//! in checker.ts, `inferFromSignature`, and it is cached on the signature.
+//! The RELATION uses `getErasedSignature`: `createTypeEraser`, every own type
+//! parameter to `any`, cached as `erasedSignatureCache`. `signaturesRelatedTo`
+//! then has three arms, and only the middle one compares un-erased:
+//!
+//!   1. both sides `Instantiated` with `source.symbol === target.symbol` (or
+//!      two references to one generic target) — pairwise, `erase = true`;
+//!   2. ONE signature on each side — `erase = relation === comparableRelation`,
+//!      i.e. normally NOT erased: `compareSignaturesRelated` instead
+//!      instantiates the source in the target's context;
+//!   3. anything else (an overload SET on either side) — cross-matched,
+//!      `erase = true`.
+//!
+//! ztsc now follows that split (`Erase`, `signatureAssignableErased`,
+//! `sameSigTypeParams`). Arm 1 is detected through the type parameters
+//! themselves: ztsc keys a type parameter by its declaration symbol and
+//! `FreshTp.orig` carries that origin across every re-freshening, so "the two
+//! signatures' parameters have the same origins" IS "two instantiations of one
+//! declaration". Arm 2 keeps the constraint erasure, which is what the
+//! `genericSourceRelatesByInference` path already backstops.
+//!
+//! Measured, one lever at a time (synthetic visits / immich excess at
+//! `--checkers=4`, baseline 429,210 with 203 trips / 173):
+//!
+//! | | synthetic | trips | immich |
+//! |---|---:|---:|---:|
+//! | baseline | 429,210 | 203 | 173 |
+//! | arm 3 only (overload sets) | 357,206 | 0 | 162 |
+//! | arms 1 + 3 (landed) | **189,643** | **0** | **123** |
+//! | `any` everywhere (unfaithful) | 189,643 | 0 | 121 |
+//!
+//! The landed pair is within two keys of erasing everything to `any`, and the
+//! synthetic goes byte-clean against tsgo. immich: 60 keys gone, 10 new, wall
+//! 4.63 -> 3.06 s, peak RSS 2.10 -> 2.36 GB. Both halves are oracle-pinned by
+//! `assignability/084_same_declaration_sigs_erase_to_any` and
+//! `085_overload_set_erases_to_any`, each of which reported the giveaway
+//! "Type '<S>(x: S) => S' is not assignable to type '<S>(x: S) => S'" before.
+//!
+//! ### The three ways of doing arm 2 "properly", all measured negative
+//!
+//! tsc's arm 2 is `instantiateSignatureInContextOf` + a comparison against the
+//! target's own (free) type parameters. `instantiateSigInContextOf` is that
+//! function, split out of `genericSourceRelatesByInference`; the comparison
+//! was tried three ways and every one is worse than leaving arm 2 alone:
+//!
+//! * **Additive** (try the context comparison, fall through to the constraint
+//!   erasure when it fails): 429,210 -> **440,534 visits, 309 trips**. The
+//!   attempt costs and wins nothing — the pairs it is asked about fail it.
+//! * **Replacing the erasure whenever the target is generic** (tsc-exact):
+//!   140,227 visits and 0 trips, but the synthetic then reports a TS2345 tsgo
+//!   does not — ztsc's inference is not tsc's, and with no fallback a pair it
+//!   cannot infer is rejected.
+//! * **Replacing it only when BOTH sides are generic**: 189,643 visits and
+//!   clean on the synthetic, but it LOSES a diagnostic ztsc gets right today
+//!   (`<T extends string>(x: T) => T` accepting `(x: '000') => x`).
+//!
+//! Erasing arm 2 to `any` as well is likewise ruled out and by the same probe:
+//! it silently accepts BOTH `const f: <T>(x: T) => T = (x: string) => x` and
+//! its constrained twin, where tsgo reports two TS2322 (ztsc reports the
+//! second one today and still does).
+//!
+//! ### What is left on immich, and where it came from
+//!
+//! 123 keys: TS7006 43, TS2345 25, TS2769 20, TS2322 15, TS2339 13, TS2589 3.
+//! The 10 keys that APPEARED are the population truncation was hiding, the
+//! same trade the budget-ceiling experiments recorded: five TS2322 on
+//! `asset.repository.ts:917-923`, four TS2345 in `media.service.ts`, one
+//! TS2589 in `person.repository.ts`. They are the successor item.
 
 const std = @import("std");
 const types = @import("../types.zig");

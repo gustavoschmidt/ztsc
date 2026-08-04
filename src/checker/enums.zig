@@ -1189,6 +1189,13 @@ pub fn freshTp(c: *const Checker, sym: SymbolId) *const FreshTp {
     return &c.fresh_tp_info.items[sym - c.fresh_tp_base];
 }
 
+/// The declaration symbol a (possibly FRESH) type-parameter symbol stands
+/// for — itself for an ordinary one. See `FreshTp.orig`.
+pub inline fn tpOrigin(c: *const Checker, sym: SymbolId) SymbolId {
+    if (c.isFreshTp(sym)) return c.freshTp(sym).orig;
+    return sym;
+}
+
 /// Does type-parameter symbol `sym` carry the TS 5.0 `const` modifier? The
 /// bounds guard is load-bearing: a type-param symbol id can be a FRESH
 /// higher-order one (minted above the whole real + merged symbol space), which
@@ -1217,6 +1224,7 @@ pub fn mintFreshTp(c: *Checker, orig: SymbolId, map: []const TpMap, map_id: ?u32
             .default = default,
             .has_default = has_default,
             .const_tp = c.isConstTypeParamSym(orig),
+            .orig = c.tpOrigin(orig),
             .widen_bound = widen_bound,
         });
     }
@@ -1240,6 +1248,7 @@ pub fn mintThisTp(c: *Checker, orig: SymbolId, repl: TypeId, constraint: TypeId,
             .default = default,
             .has_default = has_default,
             .const_tp = c.isConstTypeParamSym(orig),
+            .orig = c.tpOrigin(orig),
             .widen_bound = types.no_type,
         });
     }

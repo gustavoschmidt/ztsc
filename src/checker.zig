@@ -545,6 +545,13 @@ pub const FreshTp = struct {
     /// `selectAll<T extends TB>(table: T)` widened `"asset"` to `string` and
     /// the row type `Selectable<DB[T]>` collapsed to `{}`.
     widen_bound: TypeId = types.no_type,
+    /// The DECLARATION symbol this fresh id stands in for (transitively — a
+    /// fresh parameter that is itself re-freshened records the original).
+    /// Two signatures whose parameters share their origins are two
+    /// instantiations of one generic declaration, which is what tsc's
+    /// signature relation tests as `source.symbol === target.symbol` before
+    /// erasing the pair to `any` (`signatureAssignableModeInnerErase`).
+    orig: SymbolId = 0,
 };
 
 /// One entry of `Checker.mapped_key_scopes`: a mapped type's key parameter
@@ -614,32 +621,33 @@ pub const LazyStat = enum(u8) {
 };
 
 pub const map_containers = [_][]const u8{
-    "node_types",               "sig_cache",              "node_scopes",
-    "reassigned_syms",          "reassigned_in_loop",     "member_written_syms",
-    "member_written_in_loop",   "ns_types",               "ambient_ns_types",
-    "relation",                 "expansions",             "overload_rotate",
-    "origin",                   "iface_generic",          "iface_stack",
-    "pending_class_decos",      "class_inst_generic",     "class_static_cache",
-    "class_static_base_active", "class_ctor_cache",       "enum_value_cache",
-    "enum_info_cache",          "alias_generic",          "alias_state",
-    "alias_recursive",          "flow_same",              "flow_narrow",
-    "ref_keys",                 "flow_loop_stack",        "flow_stack",
-    "flow_tmp",                 "da_cache",               "ctp_cache",
-    "cmp_cache",                "ctt_cache",              "ci_cache",
-    "infer_visited",            "subst_this_cache",       "mmp_cache",
-    "inst_cache",               "arrayish_elem_cache",    "tp_constraint_cache",
-    "erase_cache",              "inst_map_ids",           "fresh_tp_ids",
-    "this_tp_ids",              "fresh_tp_info",          "type_node_cache",
-    "atom_cache",               "infer_ids",              "infer_scopes",
-    "mapped_key_ids",           "mapped_key_scopes",      "inst_diag_at",
-    "infer_active",             "lazy_member_active",     "chain_guards",
-    "never_isect",              "deep_path_list",         "deep_path_ids",
-    "flow_reach",               "member_type_stack",      "lazy_index_objs",
-    "pending_type_args",        "pending_type_args_pool", "pending_type_args_seen",
-    "tp_constrained_cache",     "nominal_bases",          "nominal_base_pool",
-    "keyof_mapped_active",      "ctp_syms_seen",          "weak_types",
-    "lazy_member",              "lazy_map",               "pattern_root_decls",
-    "pattern_root_ids",         "pattern_narrow_busy",    "key_name_types",
+    "node_types",               "sig_cache",            "node_scopes",
+    "reassigned_syms",          "reassigned_in_loop",   "member_written_syms",
+    "member_written_in_loop",   "ns_types",             "ambient_ns_types",
+    "relation",                 "expansions",           "overload_rotate",
+    "origin",                   "iface_generic",        "iface_stack",
+    "pending_class_decos",      "class_inst_generic",   "class_static_cache",
+    "class_static_base_active", "class_ctor_cache",     "enum_value_cache",
+    "enum_info_cache",          "alias_generic",        "alias_state",
+    "alias_recursive",          "flow_same",            "flow_narrow",
+    "ref_keys",                 "flow_loop_stack",      "flow_stack",
+    "flow_tmp",                 "da_cache",             "ctp_cache",
+    "cmp_cache",                "ctt_cache",            "ci_cache",
+    "infer_visited",            "subst_this_cache",     "mmp_cache",
+    "inst_cache",               "arrayish_elem_cache",  "tp_constraint_cache",
+    "erase_cache",              "erase_any_cache",      "inst_map_ids",
+    "fresh_tp_ids",             "this_tp_ids",          "fresh_tp_info",
+    "type_node_cache",          "atom_cache",           "infer_ids",
+    "infer_scopes",             "mapped_key_ids",       "mapped_key_scopes",
+    "inst_diag_at",             "infer_active",         "lazy_member_active",
+    "chain_guards",             "never_isect",          "deep_path_list",
+    "deep_path_ids",            "flow_reach",           "member_type_stack",
+    "lazy_index_objs",          "pending_type_args",    "pending_type_args_pool",
+    "pending_type_args_seen",   "tp_constrained_cache", "nominal_bases",
+    "nominal_base_pool",        "keyof_mapped_active",  "ctp_syms_seen",
+    "weak_types",               "lazy_member",          "lazy_map",
+    "pattern_root_decls",       "pattern_root_ids",     "pattern_narrow_busy",
+    "key_name_types",
 };
 
 /// Where one symbol's declared heritage lives in `Checker.nominal_base_pool`.
@@ -1096,6 +1104,9 @@ pub const Checker = struct {
     /// result whose computation tripped the depth/count limit — a truncated
     /// erasure is a function of the live depth, not of `(sig, owner)`.
     erase_cache: std.AutoHashMapUnmanaged(u64, TypeId) = .empty,
+    /// The same memo for the ERASE-TO-`any` half (tsc's `getErasedSignature`,
+    /// cached on the signature as `erasedSignatureCache`), keyed the same way.
+    erase_any_cache: std.AutoHashMapUnmanaged(u64, TypeId) = .empty,
     /// tsc's `symbol.links.nameType`, for the one case ztsc cannot recover
     /// from a member table: a member declared with a computed ENUM-MEMBER key
     /// (`{ [E.A]: T }`). The table keys by the atom the key evaluates to
@@ -3051,6 +3062,7 @@ pub const Checker = struct {
     pub const isFreshTp = enums_zig.isFreshTp;
     pub const isConstTypeParamSym = enums_zig.isConstTypeParamSym;
     pub const freshTp = enums_zig.freshTp;
+    pub const tpOrigin = enums_zig.tpOrigin;
     pub const mintFreshTp = enums_zig.mintFreshTp;
     pub const mintThisTp = enums_zig.mintThisTp;
     pub const instantiate = enums_zig.instantiate;
@@ -3237,11 +3249,16 @@ pub const Checker = struct {
     pub const sourceSatisfiesSigs = assign_zig.sourceSatisfiesSigs;
     pub const isNumericPropName = assign_zig.isNumericPropName;
     pub const genericSourceRelatesByInference = assign_zig.genericSourceRelatesByInference;
+    pub const instantiateSigInContextOf = assign_zig.instantiateSigInContextOf;
     pub const signatureAssignable = assign_zig.signatureAssignable;
     pub const signatureAssignableMode = assign_zig.signatureAssignableMode;
     pub const typeHasMapped = assign_zig.typeHasMapped;
     pub const eraseParamsToAny = assign_zig.eraseParamsToAny;
+    pub const eraseParamsToAnyOf = assign_zig.eraseParamsToAnyOf;
+    pub const signatureAssignableErased = assign_zig.signatureAssignableErased;
+    pub const signatureAssignableModeErase = assign_zig.signatureAssignableModeErase;
     pub const signatureAssignableModeInner = assign_zig.signatureAssignableModeInner;
+    pub const signatureAssignableModeInnerErase = assign_zig.signatureAssignableModeInnerErase;
     pub const callbackSigOf = assign_zig.callbackSigOf;
     pub const stripNullish = assign_zig.stripNullish;
     pub const includesNullish = assign_zig.includesNullish;

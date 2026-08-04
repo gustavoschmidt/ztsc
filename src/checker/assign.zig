@@ -2170,16 +2170,24 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
         .function => {
             if (sk == .function) return c.signatureAssignable(s, t);
             if (sk == .overloads) {
+                // An overload SET on the source side is tsc's cross-matching
+                // `else` arm, which erases both sides to `any`.
                 for (try c.memberList(s)) |m| {
-                    if (try c.signatureAssignable(m, t)) return true;
+                    if (try c.signatureAssignableErased(m, t)) return true;
                 }
                 return false;
             }
             // Callable object → function type: some call signature
             // of the object must be assignable to the target function.
             if (sk == .object) {
-                for (0..c.ts.objectCallSigCount(s)) |i| {
-                    if (try c.signatureAssignable(c.ts.objectCallSig(s, @intCast(i)), t)) return true;
+                const n = c.ts.objectCallSigCount(s);
+                for (0..n) |i| {
+                    const ss = c.ts.objectCallSig(s, @intCast(i));
+                    const ok = if (n == 1)
+                        try c.signatureAssignable(ss, t)
+                    else
+                        try c.signatureAssignableErased(ss, t);
+                    if (ok) return true;
                 }
                 return false;
             }
@@ -3163,11 +3171,20 @@ pub fn sourceSatisfiesSigs(c: *Checker, s: TypeId, t: TypeId, is_construct: bool
         else => {},
     }
     const t_cnt = if (is_construct) c.ts.objectConstructSigCount(t) else c.ts.objectCallSigCount(t);
+    // tsc's `signaturesRelatedTo` splits here: ONE signature on each side is
+    // compared un-erased (the source's type params are instantiated in the
+    // target's context — `genericSourceRelatesByInference` here); anything
+    // else is the cross-matching `else` arm, which erases both sides to `any`
+    // (`getErasedSignature`). Erasing an overload set to its CONSTRAINTS
+    // instead is where a kysely builder's demand comes from: the constraints
+    // are `ReferenceExpression<DB, TB>`-shaped unions over every column of
+    // every table, so one comparison substitutes the whole schema.
+    const erase: Erase = if (src.items.len == 1 and t_cnt == 1) .constraints else .any;
     for (0..t_cnt) |i| {
         const tsig = if (is_construct) c.ts.objectConstructSig(t, @intCast(i)) else c.ts.objectCallSig(t, @intCast(i));
         var matched = false;
         for (src.items) |ssig| {
-            if (try c.signatureAssignable(ssig, tsig)) {
+            if (try c.signatureAssignableModeErase(ssig, tsig, .none, erase)) {
                 matched = true;
                 break;
             }
@@ -3198,10 +3215,22 @@ pub fn isNumericPropName(text: []const u8) bool {
 /// erases a generic source. Only fires for a generic function source against
 /// a concrete (non-generic) function target.
 pub fn genericSourceRelatesByInference(c: *Checker, s: TypeId, t: TypeId) Error!bool {
-    if (c.ts.kind(s) != .function or c.ts.kind(t) != .function) return false;
-    const tps = c.ts.fnTypeParams(s);
-    if (tps.len == 0) return false; // source not generic
     if (c.ts.fnTypeParams(t).len != 0) return false; // target still generic
+    const inst = (try c.instantiateSigInContextOf(s, t)) orelse return false;
+    return c.signatureAssignable(inst, t);
+}
+
+/// tsc's `instantiateSignatureInContextOf`: infer `s`'s OWN type parameters
+/// from `t`'s parameters and return type and hand back the instantiation, or
+/// `null` when `s` is not a generic signature or an inferred argument would
+/// violate its constraint (tsc rejects such a pair). `t`'s own type
+/// parameters, if any, stay free and are legitimate inference results — that
+/// is how `<TE>(from: TE) => X<TE>` relates to `<TE2>(from: TE2) => X<TE2>`
+/// without either side being collapsed.
+pub fn instantiateSigInContextOf(c: *Checker, s: TypeId, t: TypeId) Error!?TypeId {
+    if (c.ts.kind(s) != .function or c.ts.kind(t) != .function) return null;
+    const tps = c.ts.fnTypeParams(s);
+    if (tps.len == 0) return null; // source not generic
     const tp_syms = try c.scratch().dupe(u32, tps);
     const cand = try c.scratch().alloc(TypeId, tp_syms.len);
     for (cand) |*x| x.* = types.no_type;
@@ -3224,15 +3253,15 @@ pub fn genericSourceRelatesByInference(c: *Checker, s: TypeId, t: TypeId) Error!
         if (val == types.no_type) {
             val = if (con != types.no_type) con else types.unknown_type;
         } else if (con != types.no_type and !try c.isAssignable(val, con)) {
-            return false;
+            return null;
         }
         map[k] = .{ .sym = tp, .ty = val };
     }
     const inst = try c.instantiate(s, map);
     // A full map over the source's own params yields a non-generic sig; if
     // anything remains generic, bail rather than risk recursion.
-    if (c.ts.kind(inst) != .function or c.ts.fnTypeParams(inst).len != 0) return false;
-    return c.signatureAssignable(inst, t);
+    if (c.ts.kind(inst) != .function or c.ts.fnTypeParams(inst).len != 0) return null;
+    return inst;
 }
 
 /// tsc's `SignatureCheckMode` (the subset ztsc models). A signature-valued
@@ -3261,8 +3290,26 @@ pub fn signatureAssignable(c: *Checker, s: TypeId, t: TypeId) Error!bool {
     return c.signatureAssignableMode(s, t, .none);
 }
 
+/// tsc's `signatureRelatedTo(…, erase = true)` — the two positions where the
+/// relation erases a generic signature's type parameters to `any` instead of
+/// comparing them: an overload SET on either side (`signaturesRelatedTo`'s
+/// `else` arm, which cross-matches), and two instantiations of the SAME
+/// generic type compared pairwise. The 1-vs-1 case is the one tsc leaves
+/// un-erased, and it is the one `genericSourceRelatesByInference` covers.
+pub fn signatureAssignableErased(c: *Checker, s: TypeId, t: TypeId) Error!bool {
+    return c.signatureAssignableModeErase(s, t, .none, .any);
+}
+
 pub fn signatureAssignableMode(c: *Checker, s: TypeId, t: TypeId, mode: SigMode) Error!bool {
-    if (try c.signatureAssignableModeInner(s, t, mode)) return true;
+    return c.signatureAssignableModeErase(s, t, mode, .constraints);
+}
+
+/// How a generic signature's own type parameters are collapsed before the
+/// pair is compared — see `signatureAssignableErased`.
+pub const Erase = enum { constraints, any };
+
+pub fn signatureAssignableModeErase(c: *Checker, s: TypeId, t: TypeId, mode: SigMode, erase: Erase) Error!bool {
+    if (try c.signatureAssignableModeInnerErase(s, t, mode, erase)) return true;
     // tsc's `getErasedSignature` retry. The main path erases a signature's
     // own type parameters to their CONSTRAINTS (`getBaseSignature`), which
     // keeps a `Pick<S, K>` deferred; tsc's erasure maps them to `any`, and a
@@ -3281,6 +3328,7 @@ pub fn signatureAssignableMode(c: *Checker, s: TypeId, t: TypeId, mode: SigMode)
     // a MAPPED type is what the constraint erasure left deferred — the shape
     // whose `any` instantiation is what tsc's acceptance actually rests on —
     // and never when the identity probe has already decided the pair.
+    if (erase == .any) return false; // the main path already erased to `any`
     if (c.ts.fnTypeParams(s).len == 0 and c.ts.fnTypeParams(t).len == 0) return false;
     if (try c.identityProbeRelated(s, t)) |_| return false;
     if (!try c.typeHasMapped(s, 0) and !try c.typeHasMapped(t, 0)) return false;
@@ -3328,17 +3376,60 @@ pub fn typeHasMapped(c: *Checker, t0: TypeId, depth: u8) Error!bool {
 /// Instantiate a signature's own type parameters with `any` (tsc's
 /// `createTypeEraser`).
 pub fn eraseParamsToAny(c: *Checker, sig: TypeId) Error!TypeId {
-    const sig_tps = c.ts.fnTypeParams(sig);
+    return c.eraseParamsToAnyOf(sig, sig);
+}
+
+/// tsc's `getErasedSignature`: every type parameter OWNED BY `owner` mapped
+/// to `any`. The `owner`-relative form exists for the same reason
+/// `eraseParamsOf` has one — an arrow contextually typed by a generic target
+/// carries the TARGET's type-param symbols free, and both sides must collapse
+/// them the same way.
+///
+/// Memoized (`erase_any_cache`), which is what tsc's per-signature
+/// `erasedSignatureCache` does; the signature relation asks for it on both
+/// sides of every generic comparison.
+pub fn eraseParamsToAnyOf(c: *Checker, sig: TypeId, owner: TypeId) Error!TypeId {
+    const sig_tps = c.ts.fnTypeParams(owner);
     if (sig_tps.len == 0) return sig;
+    const memo_key = (@as(u64, owner) << 32) | sig;
+    if (c.inst_cache_on) {
+        if (c.erase_any_cache.get(memo_key)) |r| return r;
+    }
     const tps = try c.scratch().dupe(u32, sig_tps);
     defer c.scratch().free(tps);
     const map = try c.scratch().alloc(TpMap, tps.len);
     defer c.scratch().free(map);
     for (tps, 0..) |tp, i| map[i] = .{ .sym = tp, .ty = types.any_type };
-    return c.instantiate(sig, map);
+    // Scope the truncation flag exactly as `eraseParamsOf` does: the memo
+    // must ask "was MY result truncated", not "did anything earlier trip".
+    const outer_trip = c.inst_limit_tripped;
+    c.inst_limit_tripped = false;
+    defer c.inst_limit_tripped = c.inst_limit_tripped or outer_trip;
+    const result = try c.instantiate(sig, map);
+    if (c.inst_cache_on and !c.inst_limit_tripped) try c.erase_any_cache.put(c.cm(), memo_key, result);
+    return result;
+}
+
+/// Whether two signatures carry the SAME type parameters — which, because
+/// ztsc keys a type parameter by its declaration symbol, means they are two
+/// instantiations of one generic declaration (tsc's `source.symbol ===
+/// target.symbol` on an `Instantiated` pair).
+fn sameSigTypeParams(c: *Checker, s: TypeId, t: TypeId) bool {
+    const n = c.ts.fnTypeParamCount(s);
+    if (n == 0 or n != c.ts.fnTypeParamCount(t)) return false;
+    for (0..n) |i| {
+        const x = c.ts.fnTypeParamAt(s, i);
+        const y = c.ts.fnTypeParamAt(t, i);
+        if (x != y and c.tpOrigin(x) != c.tpOrigin(y)) return false;
+    }
+    return true;
 }
 
 pub fn signatureAssignableModeInner(c: *Checker, s: TypeId, t: TypeId, mode: SigMode) Error!bool {
+    return c.signatureAssignableModeInnerErase(s, t, mode, .constraints);
+}
+
+pub fn signatureAssignableModeInnerErase(c: *Checker, s: TypeId, t: TypeId, mode: SigMode, erase_in: Erase) Error!bool {
     // tsc's canonical type-IDENTITY probe `(<G>() => G extends X ? A : B)`
     // (react-hook-form's `IsEqual`, and other libraries) compares two types
     // for identity: `IsEqual<X,Y>` reduces to `(<G>()=>G extends X?1:2)
@@ -3366,9 +3457,23 @@ pub fn signatureAssignableModeInner(c: *Checker, s: TypeId, t: TypeId, mode: Sig
     if (try c.genericSourceRelatesByInference(s, t)) return true;
     const bivariant = (c.ts.fnFlags(s) & types.fn_flag_method != 0) or
         (c.ts.fnFlags(t) & types.fn_flag_method != 0);
-    // Erase generics to their constraints (documented simplification).
-    var se = try c.eraseTypeParams(s);
-    const te = try c.eraseTypeParams(t);
+    // Erase generics: to `any` in tsc's `erase = true` positions, to their
+    // constraints otherwise (the documented simplification of the 1-vs-1 case
+    // tsc handles by instantiating the source in the target's context).
+    var erase: Erase = erase_in;
+    // tsc's OTHER `erase = true` position: two instantiations of the SAME
+    // generic declaration, compared signature-by-signature
+    // (`sourceObjectFlags & Instantiated && targetObjectFlags & Instantiated
+    // && source.symbol === target.symbol`). ztsc keeps a signature's type
+    // parameters as their DECLARATION symbols, so "same declaration" is just
+    // "same type-param list" — and a pair that shares its type parameters is
+    // also the pair tsc declines to instantiate in context, for the same
+    // reason. This is the kysely builder case: `SelectQueryBuilder<A>.where`
+    // against `SelectQueryBuilder<B>.where`, whose constraints are unions
+    // over every column of every table in the schema.
+    if (erase == .constraints and sameSigTypeParams(c, s, t)) erase = .any;
+    var se = if (erase == .any) try c.eraseParamsToAny(s) else try c.eraseTypeParams(s);
+    const te = if (erase == .any) try c.eraseParamsToAny(t) else try c.eraseTypeParams(t);
     // The source may be an arrow contextually typed by the generic target:
     // its param/return types then reference the TARGET's type-param symbols
     // as free params (the arrow itself carries no type params, so
@@ -3376,7 +3481,7 @@ pub fn signatureAssignableModeInner(c: *Checker, s: TypeId, t: TypeId, mode: Sig
     // target's constraints too, so both sides collapse the shared params
     // consistently — the `renderHook`/`typeof base` higher-order wrapper.
     if (c.ts.fnTypeParams(s).len == 0 and c.ts.fnTypeParams(t).len > 0) {
-        se = try c.eraseParamsOf(se, t);
+        se = if (erase == .any) try c.eraseParamsToAnyOf(se, t) else try c.eraseParamsOf(se, t);
     }
     // The erasure runs `instantiate`, so it is subject to the instantiation
     // budget, and a trip hands back `error_type` in place of the signature —
