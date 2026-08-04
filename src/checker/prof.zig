@@ -830,6 +830,12 @@
 //! remaining 88 keys are NOT truncation, and the ceiling family is closed for
 //! a third time — this time with the trip counter, not by inference.
 //!
+//! Confirmed from the other side: raising the STATEMENT cap to 3 M *on top of
+//! the split* gives **88 -> 95** (13 keys appear, 6 go), and the largest
+//! remaining cluster gets worse rather than better —
+//! `sync.repository.ts` 12 -> 21. More budget buys these nothing, which is
+//! what a genuine divergence looks like.
+//!
 //! 88 keys at c4: TS2345 23, TS2769 19, TS7006 17, TS2339 13, TS2322 10,
 //! TS2589 2, one each TS2678/TS2367/TS2366/TS2365. The largest single cluster
 //! is `sync.repository.ts` (12, every one a TS7006 on a `.select((eb) => …)`
