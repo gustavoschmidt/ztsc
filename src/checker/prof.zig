@@ -919,6 +919,46 @@
 //! isolated one are the same masking: in the app most of this family is still
 //! hidden behind the `DynamicModule<DB>` truncation. Pinned lib-free by
 //! `assignability/086_overload_target_erases_to_any`.
+//!
+//! ### And then the mask itself: a truncation is not an answer either
+//!
+//! `expandRef` memoized `error_type` under the ref and served it for the rest
+//! of the run. Withdrawing that one publication — the generic table exists,
+//! the substitution over it collapsed, so it is a truncation and not a fact —
+//! takes immich **86 -> 74 at c4 and 89 -> 72 at c1**: all twelve
+//! `sync.repository.ts` TS7006 and a thirteenth in `person.repository.ts`, for
+//! one new key. wall 3.59 -> 3.63 s, peak RSS 2.40 GB, zod and typebox
+//! byte-identical in time and space.
+//!
+//! Two neighbouring shapes of the same idea are NOT this, and both are worse:
+//!
+//! * **Withdrawing on `inst_limit_tripped`** — the flag, scoped to the
+//!   expansion's own extent — is a literal no-op on immich at head (86/89,
+//!   byte-identical key sets). The statement that publishes the truncation has
+//!   ALREADY tripped by the time it gets there, so the flag is set on entry
+//!   and the guard never fires. The definite marker (`error_type` out of a
+//!   non-`error_type` generic) is the one that names the case.
+//! * **Refunding the expansion's cost to the demanding statement**
+//!   (`saveCtx`/`restoreCtx` around `expandRef`, on the argument that an
+//!   expansion is a declaration-scope fact and `restoreCtx` already rolls
+//!   declaration windows off the requester) reaches the SAME immich numbers —
+//!   72 at c4, 71 at c1, and a c1^c4 divergence of ONE key — but it is a
+//!   BLOCKER on a gated package: a statement whose cost is all expansions then
+//!   has no bound at all, and **zod goes 0.15 s / 53 MB -> 0.90 s / 166 MB**
+//!   (user CPU 0.21 -> 0.90 s), six times tsgo's wall. Not taken. The cheap
+//!   half of what it buys is the withdrawal above.
+//!
+//! No conformance fixture pins the withdrawal, and it is the same structural
+//! reason the variance window has none, now sharper: after the split cap,
+//! reaching a truncated expansion at all requires a SOURCE ELEMENT to spend
+//! 250,000 node visits, and a source element that spends them reports TS2589
+//! where tsc — with 20x the budget — is clean, so the snapshot carries a `+`
+//! with no oracle diagnostic. Two more shapes were tried on top of the ones
+//! this header already lists: a mapped-type burn read through a relation
+//! (`twoArg(p, h)` with `Heavy<Big1>` against `Heavy<Big2>`), which is
+//! reportable-free but charges 4.0 M visits to DECLARATION windows and trips
+//! zero times, and the same burn at checking level, which trips and reports
+//! the TS2589. It is pinned by the immich gate.
 
 const std = @import("std");
 const types = @import("../types.zig");

@@ -254,6 +254,29 @@ pub fn expandRef(c: *Checker, ref: TypeId) Error!TypeId {
         _ = c.expansions.remove(ref);
         return result;
     }
+    // A TRUNCATION IS NOT AN ANSWER. When the generic table exists and the
+    // substitution over it still came back `error_type`, the substitution ran
+    // out of budget (or depth) — `instantiateId`'s guard collapses the whole
+    // term — and nothing about `ref` says so. Publishing it makes the WHOLE
+    // RUN's view of that reference a function of which source element reached
+    // it first with a cold cache: immich's `DynamicModule<DB>` was expanded
+    // once, from the single statement in the package that reaches the 250 k
+    // statement cap (`ocr.repository.ts`), and every later reader got `any` —
+    // `const { table, ref } = this.db.dynamic` bound both names to `any`, and
+    // twelve kysely callbacks in `sync.repository.ts` lost their contextual
+    // type behind it.
+    //
+    // So withdraw the mark and let the next reader recompute, exactly as the
+    // provisional case above does. This is narrower than the
+    // `inst_limit_tripped`-scoped withdrawal measured (and reverted) before
+    // the budget split: that one re-expanded on any trip anywhere in the
+    // subtree and cost 26 keys and 0.8 s; this one fires only on the definite
+    // marker, which after the split is rare — no declaration materialization
+    // in immich truncates at all, and only one statement reaches its cap.
+    if (c.ts.kind(result) == .err and c.ts.kind(generic) != .err) {
+        _ = c.expansions.remove(ref);
+        return result;
+    }
     // Origin tag: this object is the materialization of `ref =
     // makeRef(sym, canonical-args)` (interface refs carry default-filled
     // args from `fixTypeArgs`). Record it so a structurally-divergent
