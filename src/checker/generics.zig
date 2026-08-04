@@ -1022,8 +1022,45 @@ fn inferFromExtendsInner(c: *Checker, source0: TypeId, pattern: TypeId, ids: []c
             try c.inferFromExtends(sr, s.fnReturn(pattern), ids, vals, contra, depth + 1);
         },
         .union_type => {
-            for (try c.memberList(pattern)) |m| {
-                if (try c.containsInfer(m)) try c.inferFromExtends(source0, m, ids, vals, contra, depth + 1);
+            // tsc's `inferFromTypes` union rule, the same one `unify`'s
+            // `.union_type` arm already applies to a call's arguments: "first
+            // infer between identically matching source and target
+            // constituents and remove the matched types from
+            // consideration"; only the RESIDUAL source is then offered to
+            // the infer-bearing members. Identity is TypeId equality on
+            // interned types, so this only fires on an exact match.
+            //
+            // kysely's `AliasedExpression<T, A>` declares `alias: A |
+            // Expression<unknown>`, so `X extends AliasedExpression<any,
+            // infer EA>` infers `EA` from `"foo" | Expression<unknown>`
+            // against `EA | Expression<unknown>`. Without the subtraction
+            // `EA` came out as the whole union, which is not a property name
+            // — so `Selection`'s key remap dropped the column and every
+            // later read of it was a TS2339.
+            const pms = try c.scratch().dupe(TypeId, try c.memberList(pattern));
+            const rsrc = try c.resolveStructural(source0);
+            const residual: TypeId = blk: {
+                if (s.kind(rsrc) != .union_type) break :blk source0;
+                const sms = try c.scratch().dupe(TypeId, try c.memberList(rsrc));
+                var rem: std.ArrayList(TypeId) = .empty;
+                defer rem.deinit(c.scratch());
+                for (sms) |sm| {
+                    var paired = false;
+                    for (pms) |pm| {
+                        if (pm == sm) {
+                            paired = true;
+                            break;
+                        }
+                    }
+                    if (!paired) try rem.append(c.scratch(), sm);
+                }
+                // Nothing subtracted, or everything did (tsc still offers the
+                // whole source when the residual is empty): leave it alone.
+                if (rem.items.len == 0 or rem.items.len == sms.len) break :blk source0;
+                break :blk try s.makeUnion(c.scratch(), rem.items);
+            };
+            for (pms) |m| {
+                if (try c.containsInfer(m)) try c.inferFromExtends(residual, m, ids, vals, contra, depth + 1);
             }
         },
         // Intersection pattern (`object & { then(onfulfilled: infer F, …) }`
