@@ -268,12 +268,71 @@
 //! as `checkClass` walks, so no single trip bounds it) and memoized per symbol
 //! for the rest of the run. Nothing in this layer touches them.
 //!
-//! Still eager, in demand order at 453: `keyofType` (6.74 M / 155 — all
-//! ALIAS references now, which genuinely reduce and are not member tables),
+//! Still eager, in demand order at 453: `keyofType` (6.74 M / 155),
 //! `propertyTypeOf` (3.44 M, see above), `expandRef` itself (1.92 M),
 //! `eraseParamsOf` (674 k + 194 k), `isAssignableInner`'s ref arm (587 k +
 //! 180 k), `inferFromExtendsInner` (504 k + 191 k), `unify` (464 k + 401 k),
 //! `isArrayShaped` (322 k).
+//!
+//! ### The layer is saturated — measured, not assumed
+//!
+//! `--lazy-stats` tallies why the relation's lazy route declines a pair. Over
+//! immich's 53,000 entries into `isAssignableInner`'s `.ref` arm:
+//!
+//!     hit                      63
+//!     tbl_not_nominal      27,540   target is an ALIAS reference
+//!     tbl_already_expanded 14,271   the expansion is already memoized
+//!     tgt_not_ref          10,889
+//!     same_symbol             419   the variance question
+//!     src_kind                137
+//!     this_types                5
+//!
+//! Nothing here is widenable. An alias body REDUCES when instantiated, so it
+//! has no fixed member table; an already-memoized expansion costs a hash
+//! lookup. The `this`-type guard — the obvious suspect, since kysely's
+//! builders are written with `this` — declines **five** pairs in the whole
+//! package, so making the lazy view `this`-aware would buy nothing.
+//!
+//! kysely's `SelectQueryBuilder` (2.51 M visits over 1,471 expansions) is not
+//! reached through the relation at all. The builder chain's first touch of
+//! each fresh reference is a property ACCESS, so those expansions belong to
+//! `propertyTypeOf` — the one route this layer measured as a loss, twice.
+//!
+//! Three further closures, all re-measured on top of the 453 baseline:
+//!
+//! * **`propertyTypeOf` with a truncation FALLBACK.** The theory was that a
+//!   member substituted under a spent budget is never memoized, so it
+//!   re-truncates forever; falling back to `expandRef` (which memoizes
+//!   whatever it gets) makes the route's cost monotone. It does — and immich
+//!   still went 453 -> **523**, the same 95-new-TS7006 signature. The fallback
+//!   is kept, because it is the right invariant, but it is not the mechanism.
+//! * **An oracle leg comparing every lazily-substituted member against the one
+//!   the expansion holds** settled what the mechanism is NOT: over the whole
+//!   package there are 126 differences, 125 of them `Assertion.resolves` where
+//!   the EAGER expansion truncated to `any` and the lazy member is the more
+//!   precise type, and exactly one on a builder (`SelectQueryBuilder.where`).
+//!   On the kysely path the two routes compute **the same TypeId** for the
+//!   same member — the map is the same, `canonMapId` gives the same `map_id`,
+//!   and both hit the same `inst_cache` entry. So the 95 lost contextual
+//!   parameter types are caused by the ABSENCE of the whole-table expansion,
+//!   not by any member's value: the expansion was warming `inst_cache` and
+//!   `expansions` for the call machinery that contextually types the callback
+//!   two frames later.
+//! * **The `expandRef`-own-budget-epoch closer, re-measured** now that demand
+//!   has dropped (visits 11.99 M -> 10.01 M, budget trips 12,501 -> 5,113):
+//!   453 -> **467 excess, wall 3.2 -> 5.8 s, peak RSS 1.53 -> 2.74 GB**. The
+//!   40% fall in trips did not make it affordable, and it is now measured from
+//!   three different baselines with the same verdict.
+//!
+//! What is left is a different problem from this layer's. `keyofType`'s
+//! remaining 6.74 M over 155 calls is `keyof <immich repository class>` —
+//! `WorkflowRepository`, `SearchRepository`, `AssetRepository`, one call each
+//! — and those classes declare no type parameters, so `expandRef` substitutes
+//! nothing: the entire cost is `classInstanceGeneric` resolving a hundred
+//! kysely-typed method signatures. Nothing is saved by deferring it (the class
+//! is checked anyway, so the table is built either way); only WHERE the cost
+//! is charged moves, which is the same budget-timing coin every negative above
+//! landed on.
 
 const std = @import("std");
 const types = @import("../types.zig");
