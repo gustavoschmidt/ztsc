@@ -876,6 +876,23 @@ pub fn partialParamCtx(c: *Checker, pt0: TypeId, partial: []const TpMap) Error!T
     for (members) |m| {
         const mi = try c.instantiate(m, partial);
         if (c.ts.kind(m) == .type_param and c.ts.kind(mi) == .any) {
+            // Same rule as the bare-type-variable case above, one level down:
+            // an OPTIONAL parameter `impl?: T` is `T | undefined` here, so the
+            // variable arrives as a union member. Dropping it outright left
+            // `undefined` as the whole contextual type — no call signature, so
+            // a callback argument's parameters got none either and every one
+            // was a TS7006 (vitest's `fn<T extends Procedure = Procedure>(
+            // implementation?: T)`, which immich's test doubles are built on).
+            // Substitute the constraint when it says more than the placeholder.
+            const con = try c.typeParamConstraint(c.ts.typeParamSymbol(m));
+            if (con != types.no_type) {
+                const ci = try c.instantiate(con, partial);
+                if (c.ts.kind(ci) != .any) {
+                    try kept.append(c.scratch(), ci);
+                    dropped = true;
+                    continue;
+                }
+            }
             dropped = true;
             continue;
         }
