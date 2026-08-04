@@ -1340,6 +1340,25 @@ pub fn inferTypeArgs(
             before_contra[i] = contra[i];
         }
         const pt_partial = try c.partialParamCtx(pt0, partial);
+        // A CONTEXT-SENSITIVE function argument this candidate hands NO
+        // contextual signature is not an inference source, and walking it is
+        // worse than useless. Its un-annotated parameters become implicit
+        // `any`, so what it yields is tsc's `anyFunctionType` — which
+        // `inferFromTypes` refuses outright — and the walk PUBLISHES its body:
+        // the arrow's own node key carries the contextual type, so a later
+        // walk misses that memo and re-derives, but every identifier read
+        // INSIDE is memoized under (node, no-context). A walk that saw
+        // `eb: any` publishes `eb.ref('x'): any`, and the overload candidate
+        // that finally gives `eb` its real type reads that `any` straight
+        // back. tsc reaches the same place from the other side:
+        // `chooseOverload` runs its first inference pass with
+        // `SkipContextSensitive`, which types such an argument as
+        // `anyFunctionType` and infers nothing from it.
+        //
+        // An ANNOTATED function argument is not context sensitive — its type
+        // is the same whatever it is handed — so it stays an inference source.
+        if (try c.contextualCallSig(pt_partial) == types.no_type and
+            c.fnExprIsContextSensitive(an)) continue;
         const at = try c.checkExprCached(an, pt_partial);
         try c.unify(pt0, at, tp_syms, candidates, 0);
         for (contra, 0..) |*cc, i| {

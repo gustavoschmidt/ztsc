@@ -4123,12 +4123,14 @@ pub fn intersectedCallSignature(c: *Checker, rctx: TypeId) Error!TypeId {
     return s.makeFunction(params.items, ret, &.{}, 0);
 }
 
-pub fn checkFunctionLikeExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
-    // A const assertion does not propagate into function bodies.
-    const prev_cc = c.const_ctx;
-    c.const_ctx = false;
-    defer c.const_ctx = prev_cc;
-    const d = c.tree.nodeData(node);
+/// tsc's `getContextualSignature`: the single call signature a contextual type
+/// hands to a function expression written against it, or `no_type` when it
+/// hands none — in which case the function's un-annotated parameters are
+/// implicit `any`. Split out so a caller can ask the question WITHOUT walking
+/// the function: `instantiateSigForCall` needs to know whether an overload
+/// candidate is about to type a callback's parameters as `any` before it lets
+/// that walk happen at all.
+pub fn contextualCallSig(c: *Checker, ctx: TypeId) Error!TypeId {
     var ctx_sig: TypeId = types.no_type;
     if (ctx != types.no_type) {
         var rctx = try c.resolveStructural(ctx);
@@ -4207,6 +4209,36 @@ pub fn checkFunctionLikeExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId 
             else => {},
         }
     }
+    return ctx_sig;
+}
+
+/// tsc's `isContextSensitive` for a function expression / arrow: does its TYPE
+/// depend on the contextual type it is checked against? It does exactly when
+/// some parameter carries no annotation — such a parameter takes its type from
+/// the contextual signature, and with no contextual signature it is implicit
+/// `any`, which makes the whole function tsc's `anyFunctionType`.
+pub fn fnExprIsContextSensitive(c: *Checker, node: Node) bool {
+    const proto = c.tree.extraData(ast.FnProto, c.tree.nodeData(node).lhs);
+    for (c.tree.extraRange(proto.params_start, proto.params_end)) |p| {
+        if (p == null_node) continue;
+        const pd = c.tree.nodeData(p);
+        const ann: Node = switch (c.nodeTag(p)) {
+            .param => pd.rhs,
+            .param_full => c.tree.extraData(ast.ParamFull, pd.rhs).type_ann,
+            else => 0,
+        };
+        if (ann == 0) return true;
+    }
+    return false;
+}
+
+pub fn checkFunctionLikeExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
+    // A const assertion does not propagate into function bodies.
+    const prev_cc = c.const_ctx;
+    c.const_ctx = false;
+    defer c.const_ctx = prev_cc;
+    const d = c.tree.nodeData(node);
+    const ctx_sig = try c.contextualCallSig(ctx);
     // tsc's `getContextualThisParameterType`: a contextually typed function
     // EXPRESSION whose own proto declares no `this` parameter takes `this`
     // from the contextual signature's. An arrow is excluded there and here —
