@@ -447,10 +447,63 @@
 //!         .select(selectExifInfo);
 //!     }
 //!
-//! and ztsc raises TS2769 on the `.select(…)` where tsgo is clean, with no
-//! budget trip anywhere near it. **immich's TS7006/TS2769 population is a
-//! call-resolution problem, not an instantiation-budget one**; the budget
-//! family of hypotheses is now closed from three independent directions.
+//! and ztsc raises TS2769 on the `.select(…)` where tsgo is clean.
+//!
+//! ## That TS2769, traced and FIXED (2026-08-04)
+//!
+//! It is a call-resolution divergence, and the budget is in it after all —
+//! not as a ceiling but as a RESOURCE ONE CANDIDATE TAKES FROM THE NEXT.
+//! `--checkers=1` resolves the call and `--checkers=4` does not, which is the
+//! tell: the answer depended on how much of the statement's 250,000-node
+//! budget was already spent when the call was reached.
+//!
+//! kysely's `select` has three overloads. The FIRST —
+//! `select(selections: ReadonlyArray<SE extends SelectExpression<DB, TB>>)`,
+//! whose constraint is a union over every column of every table — spends
+//! 240,000 nodes probing the callback argument it then DECLINES (11,162 ->
+//! 250,001 on `inst_count`). `select(callback: CB)`, the overload tsc picks,
+//! then instantiated to `error_type`, read back through the `fn*` accessors
+//! as arity 0, and was rejected without ever being compared. So did the
+//! third, and the call fell out TS2769.
+//!
+//! `resolveSignatureCall` already treats a rejected candidate's inference as
+//! speculative (`rollbackArgDiags`); its BUDGET was not. It now refunds
+//! `inst_count` and `inst_limit_tripped` on both `continue` paths — the
+//! accepted candidate keeps its charge. immich **221 -> 190** (46 keys gone:
+//! 20 TS2769, 13 TS7006, 4 TS2551, 3 TS2554, 3 TS2345, 2 TS2339, 1 TS2589;
+//! `album.repository.ts` alone 14 -> 5), 15 new, 0 under, wall 3.65 ->
+//! 4.22 s, peak RSS 1.90 -> 1.95 GB. Pinned by conformance
+//! `calls/058_rejected_overload_refunds_budget`, which reproduces the whole
+//! shape in 30 lib-free lines with no kysely: a wide template-literal
+//! constraint whose mapped return costs more than the budget, an overload
+//! set, and a callback argument.
+//!
+//! The 15 new keys are ONE downstream family (TS2339 on `album.albumUsers`
+//! and friends): those calls now resolve, and resolve to an overload whose
+//! `Selection<…>` drops the aliased property, so the property is missing
+//! rather than `any`. That is the successor item — a `Selection<…>` /
+//! `ExtractAliasFromSelectExpression` evaluation question, not this one.
+//!
+//! A second site of the same polarity error, found on the way and fixed with
+//! it: `signatureAssignableModeInner` erases both signatures' type parameters
+//! to their constraints, which runs `instantiate` and can also come back
+//! `error_type`; every step below then read a non-function and the pair fell
+//! out "not related". A truncation inside the relation is `Ternary.Maybe`
+//! (`instDiagAllowed`'s rule), so it now assumes related. **No synthetic
+//! fixture reproduces this half** — the erasure is memoized at the
+//! declaration, so a hand-written case never meets it with a spent budget;
+//! four were tried (a `Box<T>` pair with ten heavy generic methods, the same
+//! under distinct symbols to defeat the variance short-circuit, a heavy
+//! accepted call in the same statement, and a knife-edge burn tuned to stop
+//! just under the cap). It is pinned by the fifteen-line immich repro above,
+//! which needs it: with the refund alone that file still reports the TS2769
+//! plus a TS2322 on
+//! `ExpressionBuilder<LeftJoin<DB,'asset_exif'>, TB> -> ExpressionBuilder<DB, TB>`,
+//! and with both it is byte-clean against tsgo.
+//!
+//! **immich's TS7006/TS2769 population is a call-resolution problem, not an
+//! instantiation-budget ceiling one**; the ceiling family of hypotheses is
+//! closed from three independent directions.
 //!
 //! No synthetic conformance fixture reproduces the relation-internal trip.
 //! Seven were tried — branching builders, recursive mapped aliases, wide
