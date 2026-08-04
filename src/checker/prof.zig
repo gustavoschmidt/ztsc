@@ -216,12 +216,64 @@
 //! effect, and it is the case that pays: a generic interface is materialized
 //! once and read thousands of times.
 //!
-//! Still eager, in demand order, and the next places to look:
-//! `propertyTypeOf` (3.45 M — the member-access route, whose laziness is the
-//! measured negative above), `expandRef` itself (2.17 M), `isAssignableInner`
-//! (931 k + 441 k + 168 k), `eraseParamsOf` (604 k), `inferFromExtendsInner`
-//! (490 k + 252 k + 164 k), `typeParamAtTopLevel` (483 k), `unify` (456 k +
-//! 397 k), `isArrayShaped` (333 k).
+//! Two more sites then fell to `refExpandsToObject` — `isAssignableInner`'s
+//! ref-source/union-target arm and `typeParamAtTopLevel`, both of which
+//! resolved a reference only to ask its KIND — taking immich to 453 excess
+//! and peak RSS to 1.53 GB, with budget trips 11,095 -> 5,113.
+//!
+//! ### The negative that RE-CONFIRMED under the new rule
+//!
+//! `propertyTypeOf` routed through `lazyTableOf`/`lazyPropNamed` (one member
+//! substituted per access, miss falls through to the eager path) is still a
+//! large regression: **immich 453 -> 522**, even though it is the cheapest
+//! configuration ever measured on this corpus (wall 3.57 s, peak RSS 1.34 GB,
+//! user CPU 9.3 s). The mechanism is the one this header already describes and
+//! it is now sharply delimited:
+//!
+//!   * laziness that needs NO member type at all — `keyof`, `isWeakType`,
+//!     `isCallableSource` — is free, because the whole-table substitution it
+//!     skips was never going to be read through that route;
+//!   * laziness that substitutes ONE member instead of the table is a LOSS,
+//!     because the table it skipped was prepaying for every later reader of
+//!     that reference while the budget was still low, and the single member it
+//!     does substitute is computed deep in a spent budget and comes back
+//!     truncated.
+//!
+//! So the rule for this layer is: **read the table's symbols freely; think
+//! twice before substituting one member in place of the table.** The relation
+//! walk (`lazyRefRelate`) is the case where the second half is still right,
+//! because its short circuits substitute NEITHER side.
+//!
+//! ### Where immich's remaining demand is
+//!
+//! `expandRef` by symbol, at 453 excess, is two distinct populations:
+//!
+//!     2,512,058 visits  1,471 calls    8,410 max  SelectQueryBuilder
+//!     1,155,418 visits      1 calls  1,155,418 max  SearchRepository
+//!       888,397 visits      1 calls    888,397 max  AssetRepository
+//!       797,005 visits      1 calls    797,005 max  AssetJobRepository
+//!       725,896 visits    151 calls     15,647 max  InsertQueryBuilder
+//!       589,935 visits      1 calls    589,935 max  SharedLinkRepository
+//!
+//! The kysely builders are many substitutions of one memoized generic table —
+//! `lazyTableOf`'s target, reached only through the relation and inference
+//! walks, and today `lazyRefRelate` declines most of them because a kysely
+//! builder's members mention `this` (the guard that keeps `relate`'s
+//! `substThis` step faithful). Making the lazy route `this`-aware is the next
+//! step for that half.
+//!
+//! immich's OWN repository classes are the other half and a different problem:
+//! ONE `classInstanceGeneric` each, at half a million to a million visits,
+//! spread across many statements' budgets (the table is built member by member
+//! as `checkClass` walks, so no single trip bounds it) and memoized per symbol
+//! for the rest of the run. Nothing in this layer touches them.
+//!
+//! Still eager, in demand order at 453: `keyofType` (6.74 M / 155 — all
+//! ALIAS references now, which genuinely reduce and are not member tables),
+//! `propertyTypeOf` (3.44 M, see above), `expandRef` itself (1.92 M),
+//! `eraseParamsOf` (674 k + 194 k), `isAssignableInner`'s ref arm (587 k +
+//! 180 k), `inferFromExtendsInner` (504 k + 191 k), `unify` (464 k + 401 k),
+//! `isArrayShaped` (322 k).
 
 const std = @import("std");
 const types = @import("../types.zig");
