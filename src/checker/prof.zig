@@ -517,6 +517,119 @@
 //! That is an interning-order property, not a shape property, so the
 //! checking-level half of the boundary is pinned by conformance
 //! instantiation/002 and the relation half by the immich app gate.
+//!
+//! ## The successor family, traced: a truncation is not an arity (2026-08-04)
+//!
+//! The 15 keys the budget refund left behind were read as a `Selection<…>` /
+//! `ExtractAliasFromSelectExpression` evaluation bug — the chosen overload's
+//! output dropping an aliased property. **It is not an evaluation bug at all.**
+//! Bisecting immich's `album.repository.ts` chain link by link (a scratch
+//! project whose `paths` maps `src/*` at the app, plus a `node_modules`
+//! symlink so kysely resolves) isolates it to `withAssets`, and from there to
+//! ten lines with no immich types in them:
+//!
+//!     function withDefaultVisibility<O>(qb: SelectQueryBuilder<DB,'asset',O>) {
+//!       return qb.where('asset.deletedAt', 'is', null);
+//!     }
+//!     const m = (eb: ExpressionBuilder<DB, 'album'>) =>
+//!       eb.selectFrom((eb) =>
+//!         eb.selectFrom('asset').selectAll('asset')
+//!           .$call(withDefaultVisibility).as('asset'));
+//!
+//! ztsc reported TS2554 **"Expected 0 arguments, but got 1"** on a call to
+//! `ExpressionBuilder.selectFrom`, which has ONE signature taking ONE
+//! parameter. `instantiateId`'s depth/count guard fires *before* its
+//! `.function` arm runs and returns `error_type` for the whole signature, and
+//! every `fn*` accessor reads that as a signature of arity ZERO. tsc cannot
+//! reach that state: `instantiateSignature` clones the signature and
+//! instantiates each parameter and the return type independently, so a limit
+//! hit degrades a COMPONENT while the shape always survives.
+//!
+//! `checkCallArguments` now withdraws the arity claim when the signature it
+//! was handed is not a function. **immich 190 -> 174, all 16 TS2554 gone, 0
+//! new keys**, wall 4.52 -> 4.22 s, peak RSS flat.
+//!
+//! The obvious stronger fix is a REGRESSION, and the number is worth keeping:
+//! rebuilding the shape instead — arity preserved, every component
+//! `error_type` — gives **190 -> 194 with TS7006 74 -> 107**, because an
+//! `error_type` parameter then overwrites each callback argument's contextual
+//! type with one that types its parameters `any`. Leaving the type
+//! `error_type` is also what keeps a truncated statement cheap: `error_type`
+//! is a suppressing type and short-circuits the rest of the walk. And
+//! re-substituting the components rather than setting them to `error_type` is
+//! worse still — each re-entry into `instantiate` restarts at `inst_depth` 0
+//! with an empty `inst_chain`, so a DEPTH-guard truncation re-walks the whole
+//! subterm once per parameter: 10x wall and 2.2x peak RSS on immich.
+//!
+//! No oracle-faithful synthetic fixture exists for this one. The bug needs a
+//! real truncation, and ztsc reports TS2589 where tsc — with 20x the budget —
+//! is clean, so any snapshot would carry a `+` entry with no matching
+//! diagnostic, which DEFERRED's policy does not admit. Four shapes were tried
+//! (a 1,000-member and a 10,000-member template-literal constraint whose
+//! mapped return exceeds the budget, with the burn in a nested call and in a
+//! relation; tsc completes all four). It is pinned by the immich app gate.
+//! The 13-line synthetic that DOES reproduce it against a stock ztsc, for
+//! bisecting a regression by hand:
+//!
+//!     type D = '0'|'1'|'2'|'3'|'4'|'5'|'6'|'7'|'8'|'9';
+//!     type W = `${D}${D}${D}`;
+//!     type Cross<K,U> = U extends string
+//!       ? `${K & string}.${U}` | `${U}.${K & string}` : never;
+//!     interface Builder<O> {
+//!       pick<S extends W>(cb: (b: Builder<O>) => unknown):
+//!         Builder<O & { [K in S]: Cross<K, W> }>;
+//!       burn<S extends W>(): Builder<O & { [K in S]: Cross<K, W> }>;
+//!     }
+//!     declare const qb: Builder<{}>;
+//!     export const out = qb.pick((b: Builder<{}>) => b.burn());
+//!
+//! ### What the same bisect settled about the rest of the album family
+//!
+//! * The `Selection<…>` machinery is **correct in isolation**, and so is the
+//!   curried `withAlbumUsers(authUserId)` factory: `ExtractAliasFromSelect
+//!   Expression` extracts `'albumUsers'` from both the factory and its return,
+//!   and the mapped-type form computes `{ albumUsers: 1 }`, byte-identical to
+//!   tsgo. So does the whole `.with(cte)/.selectFrom/.selectAll/.where/
+//!   .select(withAlbumUsers(…))/.select(withSharedLink)/.$if(…)` chain when it
+//!   is the only thing in the file.
+//! * What is lost in the full app is lost to BUDGET ORDER, not to the alias
+//!   remap: the same chain drops `albumUsers` or keeps it depending on what
+//!   was checked before it in the same file. `--checkers=1` and `--checkers=4`
+//!   still disagree on 60 of immich's keys, which is the same coin.
+//! * The one deterministic member of the family, reproducible in a 4-file
+//!   program, is `assets` — and it descends from `withAssets`, i.e. from the
+//!   TS2554 above.
+//!
+//! ### A self-contained repro of the underlying truncation, with no immich
+//!
+//! The same ten-line `selectFrom((eb) => … .$call(…))` shape against a
+//! SYNTHETIC `DB` trips the budget at 67 tables x 17 columns and is clean at
+//! 12 x 8 — kysely alone, no immich types, ~430 k node visits of which the one
+//! statement spends the full 250,001. That is the cheapest handle anyone has
+//! on the remaining TS7006 population, because it profiles with a single file
+//! in the program instead of 627.
+//!
+//! ## Two enum divergences, unrelated to the budget (2026-08-04)
+//!
+//! Found and fixed while bisecting immich's `src/utils/sync.ts:34`, both
+//! independent of everything above and both oracle-pinned in
+//! `test/conformance/enums`:
+//!
+//! * **A type parameter constrained to an enum was not assignable to that
+//!   enum.** `isAssignableInner`'s arms are written on type KINDS and the
+//!   nominal enum arm came before the type-parameter arm, so `<T extends E>`
+//!   — a `.type_param` — was handed to `enumAssignable`, which saw a non-enum
+//!   source and rejected it. `<T extends E>(t: T): E => t` was TS2322.
+//! * **A member declared with a computed enum-member key lost the enum.** A
+//!   member table keys by atom and an enum member's atom is its VALUE, so
+//!   `keyof { [E.A]: T }` came back `'AV1'` and not `E.A`. tsc keeps the enum
+//!   literal as `symbol.links.nameType`; `Checker.key_name_types` keeps it in
+//!   a side table against the interned object, leaving the member layout
+//!   alone.
+//!
+//! Both are needed for the immich site and each was measured alone to confirm
+//! it: (1) alone leaves every `keyof` case failing, (2) alone leaves every
+//! constraint case failing. immich 174 -> 173, no other key moved.
 
 const std = @import("std");
 const types = @import("../types.zig");
