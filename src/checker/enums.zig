@@ -403,6 +403,31 @@ pub fn enumHasStringValue(c: *Checker, sym: SymbolId, val: Atom) Error!bool {
     return false;
 }
 
+/// Is every initialized member of enum `sym` string-valued? A STRING enum is
+/// the nominal shape the assertion check has a special rule for (see
+/// `stringEnumCastOverlap`); a numeric or mixed enum keeps the ordinary
+/// numeric-literal comparability and must not take it.
+pub fn enumIsStringValued(c: *Checker, sym: SymbolId) Error!bool {
+    const saved = c.enterSymFile(sym);
+    defer c.restoreCtx(saved);
+    var any = false;
+    for (c.declsOf(sym)) |decl| {
+        if (c.nodeTag(decl) != .enum_decl) continue;
+        const d = c.tree.nodeData(decl);
+        const data = c.tree.extraData(ast.EnumData, d.lhs);
+        for (c.tree.extraRange(data.members_start, data.members_end)) |m| {
+            if (m == null_node or c.nodeTag(m) != .enum_member) continue;
+            const init_node = c.tree.nodeData(m).lhs;
+            // An uninitialized member is auto-numbered: the enum is not
+            // string-valued.
+            if (init_node == null_node) return false;
+            if (c.classifyEnumInit(init_node).kind != .string) return false;
+            any = true;
+        }
+    }
+    return any;
+}
+
 /// Type-check an enum declaration: validate member initializers (TS1061)
 /// and check any initializer expressions.
 pub fn checkEnum(c: *Checker, node: Node) Error!void {

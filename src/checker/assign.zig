@@ -172,7 +172,46 @@ pub fn castComparableRec(c: *Checker, a0: TypeId, b0: TypeId, depth: u32) Error!
         return false;
     }
     if (try c.isComparable(a0, b0)) return true;
+    if (try c.stringEnumCastOverlap(a, b)) return true;
     return (try c.lenientOverlap(a0, b0, depth)) or (try c.lenientOverlap(b0, a0, depth));
+}
+
+/// The two string-enum shapes tsc's assertion check accepts and mutual
+/// assignability does not. A string enum is NOMINAL — a plain string literal
+/// is not assignable into it and it is not assignable to a plain literal — but
+/// `checkAssertionWorker` compares the target against the WIDENED source, and
+/// widening turns a string literal into `string`, which every string enum is
+/// assignable to. Verified against tsgo 7.0.2 in both directions:
+///
+///   * `str as E` / `"nope" as E` / `"nope" as E.Major` — accepted, whatever
+///     the literal is, because the widened source is `string`;
+///   * `E.Major as "minor"` — accepted: a single member widens to itself and
+///     the plain literal target is comparable to it;
+///   * `E as "nope"` — REJECTED: the whole enum is a union of members and no
+///     member is that literal (`enumOverlapsStringLiteral` already answers the
+///     member-value case, which is what `===` overlap uses);
+///   * everything numeric, and enum-to-different-enum, unchanged.
+///
+/// `a` is the cast's SOURCE and `b` its target — the direction matters here,
+/// which is why this sits next to the symmetric `lenientOverlap` rather than
+/// inside it.
+pub fn stringEnumCastOverlap(c: *Checker, a: TypeId, b: TypeId) Error!bool {
+    const s = &c.ts;
+    // Source is string-like (but NOT an enum of its own), target is a string
+    // enum or one of its members.
+    if (s.kind(b) == .enum_type and try c.enumIsStringValued(s.enumSymbol(b))) {
+        switch (s.kind(a)) {
+            .string, .string_literal, .template_literal_type, .string_mapping => return true,
+            else => {},
+        }
+    }
+    // Source is a single string-enum MEMBER, target is a plain string literal.
+    if (s.kind(a) == .enum_type and s.isEnumMember(a) and s.kind(b) == .string_literal and
+        try c.enumIsStringValued(s.enumSymbol(a))) return true;
+    // Source is a WHOLE string enum and the target literal is one of its
+    // member values — the same overlap `===` narrowing already uses.
+    if (try c.enumOverlapsStringLiteral(a, b)) return true;
+    return false;
 }
 
 /// The shapes a still-generic mapped type may overlap in the cast test: an
