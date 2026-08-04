@@ -42,6 +42,7 @@ const instantiate = @import("enums.zig").instantiate;
 const isEmptyObjectType = @import("instantiate.zig").isEmptyObjectType;
 const originTaggable = @import("instantiate.zig").originTaggable;
 const propOfType = @import("props.zig").propOfType;
+const lazy_zig = @import("instantiate.zig");
 const resolveStructural = @import("instantiate.zig").resolveStructural;
 const restUnionOptionalAt = @import("typenode.zig").restUnionOptionalAt;
 const run = Checker.run;
@@ -2254,6 +2255,13 @@ pub const ObjSide = struct {
     }
 };
 
+/// Tally one declined pair and answer "not this route's question" (see
+/// `LazyStat`). Costs a predictable-false branch when `--lazy-stats` is off.
+fn note(c: *Checker, why: checker_zig.LazyStat) ?bool {
+    if (lazy_zig.stats_on) c.lazy_stats[@intFromEnum(why)] += 1;
+    return null;
+}
+
 /// The structural relation between two object sides, at most one member of
 /// each substituted per property compared — tsc's `propertiesRelatedTo`
 /// calling `getTypeOfSymbol` on the instantiated member symbols rather than
@@ -2271,8 +2279,11 @@ pub const ObjSide = struct {
 /// depended on. A relation that fails on a builder's first property now
 /// substitutes nothing at all.
 fn lazyRefRelate(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: types.Kind) Error!?bool {
-    if (tk != .ref) return null;
-    const t_table = (try c.lazyTableOf(t)) orelse return null;
+    if (tk != .ref) return note(c, .tgt_not_ref);
+    const t_table = switch (try lazy_zig.lazyTableOutcome(c, t)) {
+        .table => |g| g,
+        .no => |why| return note(c, why),
+    };
     const tsym = c.ts.refSymbol(t);
     var sv: ObjSide = undefined;
     switch (sk) {
@@ -2280,8 +2291,11 @@ fn lazyRefRelate(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: types.Ki
             // The SAME generic on both sides is the variance question and the
             // origin-equivalence fast path; both live on the eager frame the
             // `.ref` arm delegates to, and neither is a structural walk.
-            if (c.ts.refSymbol(s) == tsym) return null;
-            const s_table = (try c.lazyTableOf(s)) orelse return null;
+            if (c.ts.refSymbol(s) == tsym) return note(c, .same_symbol);
+            const s_table = switch (try lazy_zig.lazyTableOutcome(c, s)) {
+                .table => |g| g,
+                .no => |why| return note(c, why),
+            };
             sv = .{ .table = s_table, .ref = s };
         },
         .object => {
@@ -2290,14 +2304,14 @@ fn lazyRefRelate(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: types.Ki
             // `Function` members through `propOfTypeEx`, which this loop does
             // not model, and a fresh literal is the excess-property check's
             // business — both stay eager.
-            if (c.ts.objectCallSigCount(s) != 0 or c.ts.objectConstructSigCount(s) != 0) return null;
-            if (c.ts.objectIsFresh(s)) return null;
+            if (c.ts.objectCallSigCount(s) != 0 or c.ts.objectConstructSigCount(s) != 0) return note(c, .src_object_shape);
+            if (c.ts.objectIsFresh(s)) return note(c, .src_object_shape);
             if (c.refFacetOf(s, sk)) |os| {
-                if (c.ts.refSymbol(os) == tsym) return null;
+                if (c.ts.refSymbol(os) == tsym) return note(c, .same_symbol);
             }
             sv = .{ .table = s };
         },
-        else => return null,
+        else => return note(c, .src_kind),
     }
     const tv: ObjSide = .{ .table = t_table, .ref = t };
     // A `this` type on either side is re-related through its apparent instance
@@ -2305,8 +2319,9 @@ fn lazyRefRelate(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: types.Ki
     // rewrites member types wholesale. Leave those pairs eager.
     if (c.has_this_types) {
         if ((try c.containsThisType(s)) or (try c.containsThisType(t)) or
-            (try c.containsThisType(sv.table)) or (try c.containsThisType(tv.table))) return null;
+            (try c.containsThisType(sv.table)) or (try c.containsThisType(tv.table))) return note(c, .this_types);
     }
+    if (lazy_zig.stats_on) c.lazy_stats[@intFromEnum(checker_zig.LazyStat.hit)] += 1;
     // The frame this replaces pushed the same two references onto the
     // growing-instantiation stack a second time (its own `refFacetOf` of each
     // materialization is the very reference this frame holds). Push them here

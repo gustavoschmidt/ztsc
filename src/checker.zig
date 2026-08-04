@@ -568,6 +568,51 @@ pub const MappedKeyScope = struct {
 /// freeing container allocator) rather than the checker arena. Listed once so
 /// `deinit` cannot fall behind the field set: a container added to `Checker`
 /// and fed from `cm()` but forgotten here leaks its whole table.
+/// Outcomes of the relation's lazy member route (`lazyRefRelate`), counted
+/// under `--lazy-stats`. A conversion that is not firing looks exactly like a
+/// conversion that is firing and losing, so the bail reasons are the only way
+/// to aim the next one.
+pub const LazyStat = enum(u8) {
+    /// Decided by the lazy route.
+    hit,
+    /// Target is not a `.ref`.
+    tgt_not_ref,
+    /// Source is neither a `.ref` nor a materialized `.object`.
+    src_kind,
+    /// Both sides denote the same generic — the variance question.
+    same_symbol,
+    /// Source is a callable or fresh object literal.
+    src_object_shape,
+    /// A `this` marker on one of the four operands.
+    this_types,
+
+    // Why a side had no readable member table (`lazyTableOutcome`).
+    /// `--eager-members`.
+    tbl_disabled,
+    /// Not an interface or class reference — an alias body REDUCES when
+    /// instantiated, so its members are not a substitution of the generic's.
+    tbl_not_nominal,
+    /// The generic table is on the stack; `expandRef` cuts the cycle.
+    tbl_in_progress,
+    /// A class table built inside a materialization cycle, which `expandRef`
+    /// refuses to publish.
+    tbl_provisional,
+    /// No `expandRef` has built this symbol's generic table yet, and this
+    /// route may read one but never build one.
+    tbl_unbuilt,
+    /// The generic resolved to something other than an object (a base cycle).
+    tbl_not_object,
+    /// This exact reference's expansion is already memoized — the eager path
+    /// is free and owns the `origin` tag.
+    tbl_already_expanded,
+    /// The table carries call/construct signatures, whose count does not
+    /// survive instantiation (`higherOrderSigEligible`).
+    tbl_has_sigs,
+    /// The symbol declares no type parameters, so the expansion IS the
+    /// generic and there is nothing to defer.
+    tbl_no_type_params,
+};
+
 pub const map_containers = [_][]const u8{
     "node_types",               "sig_cache",              "node_scopes",
     "reassigned_syms",          "reassigned_in_loop",     "member_written_syms",
@@ -1314,6 +1359,10 @@ pub const Checker = struct {
     /// type-parameter list, which at 200 members would cost more than the
     /// substitutions it feeds.
     lazy_map: std.AutoHashMapUnmanaged(TypeId, []@import("checker/enums.zig").TpMap) = .empty,
+    /// Why the relation's lazy member route declined a pair, tallied per
+    /// checker so the counters need no synchronization. Dumped at `seal` under
+    /// `--lazy-stats`; pair with `--checkers=1`. See `LazyStat`.
+    lazy_stats: [@typeInfo(LazyStat).@"enum".fields.len]u64 = @splat(0),
     /// Occupancy of the two stacks above, bucketed by the low bits of the
     /// symbol (`rel_id_bucket`). A bucket below `max_relation_identity_repeats`
     /// cannot hold that many occurrences of ANY symbol, so the scan the guard
@@ -1734,6 +1783,15 @@ pub const Checker = struct {
         c.stats.relation_bytes = c.relation.capacity() * (8 + 1);
         c.stats.instantiations = c.inst_total;
         if (c.prof.on) prof_zig.report(c);
+        if (lazy_zig.stats_on) {
+            var buf: [512]u8 = undefined;
+            var used: usize = 0;
+            inline for (@typeInfo(LazyStat).@"enum".fields) |f| {
+                const line = std.fmt.bufPrint(buf[used..], "{s}={d} ", .{ f.name, c.lazy_stats[f.value] }) catch buf[used..used];
+                used += line.len;
+            }
+            std.debug.print("lazy relation route: {s}\n", .{buf[0..used]});
+        }
         return .{ .diagnostics = list, .stats = c.stats };
     }
 

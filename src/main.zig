@@ -193,6 +193,9 @@ const Cli = struct {
     /// movement the route causes is visible as a key-set diff against this
     /// flag in the same binary.
     eager_members: bool = false,
+    /// `--lazy-stats`: dump the lazy relation route.s hit/bail tally to stderr
+    /// at seal. A diagnostic instrument; pair with `--checkers=1`.
+    lazy_stats: bool = false,
     /// null = auto (pretty iff stderr is a TTY).
     pretty: ?bool = null,
     project: ?[]const u8 = null,
@@ -548,6 +551,7 @@ pub fn main(init: std.process.Init) !void {
     checker.prof_zig.profile_on = cli.inst_profile;
     checker.prof_zig.focus_root = cli.inst_focus;
     checker.lazy_zig.lazy_members_on = !cli.eager_members;
+    checker.lazy_zig.stats_on = cli.lazy_stats;
 
     if (cli.help) {
         try out.print("{s}", .{usage});
@@ -1883,6 +1887,8 @@ fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8, bad_arg: *[]c
             cli.inst_profile = true;
         } else if (std.mem.eql(u8, arg, "--eager-members")) {
             cli.eager_members = true;
+        } else if (std.mem.eql(u8, arg, "--lazy-stats")) {
+            cli.lazy_stats = true;
         } else if (std.mem.startsWith(u8, arg, "--inst-focus=")) {
             cli.inst_focus = std.fmt.parseInt(u32, arg["--inst-focus=".len..], 10) catch
                 return error.BadFlagValue;

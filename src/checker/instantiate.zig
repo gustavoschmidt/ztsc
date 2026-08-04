@@ -275,6 +275,10 @@ pub fn expandRef(c: *Checker, ref: TypeId) Error!TypeId {
 /// bisected against the eager path in the same binary.
 pub var lazy_members_on: bool = true;
 
+/// `--lazy-stats`: dump the relation route's hit / bail tally at `seal` (see
+/// `LazyStat`). Write-once before the pool spawns, like `lazy_members_on`.
+pub var stats_on: bool = false;
+
 /// The GENERIC member table `ref`'s expansion substitutes, when that table
 /// can be read member-by-member instead of materialized whole — else null,
 /// and the caller expands eagerly exactly as before.
@@ -314,16 +318,36 @@ pub var lazy_members_on: bool = true;
 ///   * a reference with no type parameters expands to the generic itself, so
 ///     there is nothing to defer.
 pub fn lazyTableOf(c: *Checker, ref: TypeId) Error!?TypeId {
-    const generic = (try lazyShapeOf(c, ref)) orelse return null;
+    return switch (try lazyTableOutcome(c, ref)) {
+        .table => |g| g,
+        .no => null,
+    };
+}
+
+/// `lazyTableOf`'s answer WITH the reason it declined, so `--lazy-stats` can
+/// aim the next conversion without a second copy of the eligibility rules
+/// drifting out of step with these.
+pub const TableOutcome = union(enum) {
+    table: TypeId,
+    no: checker_zig.LazyStat,
+};
+
+pub fn lazyTableOutcome(c: *Checker, ref: TypeId) Error!TableOutcome {
+    const generic = switch (try lazyShapeOutcome(c, ref)) {
+        .table => |g| g,
+        .no => |why| return .{ .no = why },
+    };
     // Already materialized: the eager path is free, and it is the one that
     // owns the object's `origin` tag.
-    if (c.expansions.get(ref) != null) return null;
+    if (c.expansions.get(ref) != null) return .{ .no = .tbl_already_expanded };
     // `instantiateId` DROPS a higher-order signature it cannot instantiate
     // (`higherOrderSigEligible`), so a signature count is not carried through
     // and a member table that has any may not be read off the generic.
-    if (c.ts.objectCallSigCount(generic) != 0 or c.ts.objectConstructSigCount(generic) != 0) return null;
-    if (try c.lazyRefMap(ref)) |_| return generic;
-    return null;
+    if (c.ts.objectCallSigCount(generic) != 0 or c.ts.objectConstructSigCount(generic) != 0) {
+        return .{ .no = .tbl_has_sigs };
+    }
+    if (try c.lazyRefMap(ref)) |_| return .{ .table = generic };
+    return .{ .no = .tbl_no_type_params };
 }
 
 /// The member table whose NAMES, FLAGS and COUNTS `ref`'s expansion carries
@@ -355,22 +379,29 @@ pub fn lazyTableOf(c: *Checker, ref: TypeId) Error!?TypeId {
 /// matters: a generic interface is materialized once and read thousands of
 /// times, so the second and every later reader takes this route.
 pub fn lazyShapeOf(c: *Checker, ref: TypeId) Error!?TypeId {
-    if (!lazy_members_on) return null;
-    if (c.ts.kind(ref) != .ref) return null;
+    return switch (try lazyShapeOutcome(c, ref)) {
+        .table => |g| g,
+        .no => null,
+    };
+}
+
+pub fn lazyShapeOutcome(c: *Checker, ref: TypeId) Error!TableOutcome {
+    if (!lazy_members_on) return .{ .no = .tbl_disabled };
+    if (c.ts.kind(ref) != .ref) return .{ .no = .tgt_not_ref };
     const sym = c.ts.refSymbol(ref);
     const f = c.symFlags(sym);
-    if (!f.interface and !f.class) return null;
+    if (!f.interface and !f.class) return .{ .no = .tbl_not_nominal };
     if (c.expansions.get(ref)) |e| {
-        if (e == types.no_type) return null; // in progress: `expandRef` cuts
+        if (e == types.no_type) return .{ .no = .tbl_in_progress }; // `expandRef` cuts
     }
     const generic = if (f.class) blk: {
-        if (c.classGenericInProgress(sym)) return null;
-        if (c.classTableProvisional(sym)) return null;
-        break :blk c.class_inst_generic.get(sym) orelse return null;
-    } else c.iface_generic.get(sym) orelse return null;
-    if (generic == types.no_type) return null; // still materializing
-    if (c.ts.kind(generic) != .object) return null;
-    return generic;
+        if (c.classGenericInProgress(sym)) return .{ .no = .tbl_in_progress };
+        if (c.classTableProvisional(sym)) return .{ .no = .tbl_provisional };
+        break :blk c.class_inst_generic.get(sym) orelse return .{ .no = .tbl_unbuilt };
+    } else c.iface_generic.get(sym) orelse return .{ .no = .tbl_unbuilt };
+    if (generic == types.no_type) return .{ .no = .tbl_in_progress }; // still materializing
+    if (c.ts.kind(generic) != .object) return .{ .no = .tbl_not_object };
+    return .{ .table = generic };
 }
 
 /// The substitution `ref`'s member table is read under, built once per
