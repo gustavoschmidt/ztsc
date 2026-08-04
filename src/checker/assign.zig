@@ -3763,15 +3763,27 @@ pub fn elaborateLiteralError(c: *Checker, expr_node0: Node, src_t: TypeId, targe
                     continue;
                 }
                 const key = try c.memberAtom(c.tree.nodeMainToken(prop));
-                const tp_ty = if (is_union)
+                const tp: types.Prop = if (is_union)
                     (if (try c.propOfType(rt, key)) |p|
-                        p.ty
+                        p
                     else if (alt != types.no_type and c.ts.kind(alt) == .object)
-                        ((c.ts.objectPropByName(alt, key) orelse continue).ty)
+                        (c.ts.objectPropByName(alt, key) orelse continue)
                     else
                         continue)
                 else
-                    (c.ts.objectPropByName(rt, key) orelse continue).ty;
+                    (c.ts.objectPropByName(rt, key) orelse continue);
+                // An OPTIONAL target property accepts `undefined` — the same
+                // `| undefined` `structuralAssignable` folds in before it
+                // compares. Without it this elaboration re-judged every
+                // optional property on its own, stricter terms than the
+                // relation that sent it here, and blamed each one fed a
+                // `T | undefined` value for a failure somewhere else in the
+                // literal (immich's `EnvData` return: three phantom TS2322 on
+                // `host?`, `configFile?` and `logLevel?`).
+                const tp_ty = if (tp.optional())
+                    try c.makeUnion2(tp.ty, types.undefined_type)
+                else
+                    tp.ty;
                 const value_node = if (tag == .object_property) pd.rhs else pd.lhs;
                 const vt = c.nodeType(value_node) orelse continue;
                 if (try c.isAssignable(vt, tp_ty)) continue;
