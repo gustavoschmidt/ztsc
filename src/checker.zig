@@ -3209,6 +3209,7 @@ pub const Checker = struct {
     pub const checkTdz = expr_zig.checkTdz;
     pub const checkUseBeforeAssigned = expr_zig.checkUseBeforeAssigned;
     pub const checkArrayLiteral = expr_zig.checkArrayLiteral;
+    pub const checkTaggedTemplate = expr_zig.checkTaggedTemplate;
     pub const arrayLiteralElemType = expr_zig.arrayLiteralElemType;
     pub const contextualArrayElemType = expr_zig.contextualArrayElemType;
     pub const multiArrayLikeBranches = expr_zig.multiArrayLikeBranches;

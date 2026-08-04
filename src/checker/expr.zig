@@ -140,11 +140,7 @@ pub fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             }
             return types.string_type;
         },
-        .tagged_template => {
-            _ = try c.checkExprCached(d.lhs, types.no_type);
-            _ = try c.checkExprCached(d.rhs, types.no_type);
-            return types.any_type;
-        },
+        .tagged_template => return c.checkTaggedTemplate(node, ctx),
         // An array/object literal whose CONTEXTUAL type is a `const` type
         // parameter is checked in a const context — tsc's `isConstContext`
         // arm `isValidConstAssertionArgument(node) &&
@@ -1319,6 +1315,67 @@ pub fn checkUseBeforeAssigned(c: *Checker, sym: SymbolId, node: Node, tok: Token
     if (!try c.definitelyAssigned(flow, sym)) {
         try c.diagFmt(2454, c.tokSpan(tok), "Variable '{s}' is used before being assigned.", .{c.tokenText(tok)});
     }
+}
+
+/// ``tag`a${x}b` `` — a CALL of `tag` with the template's cooked-strings
+/// array followed by each substitution (tsc's
+/// `resolveTaggedTemplateExpression`). Before this the whole expression was
+/// simply `any`, which erased every library that returns a typed builder from
+/// a tag: kysely's ``sql<Row>`…` `` came back `any`, so the `rows` of its
+/// result were `any[]` and every callback over them reported TS7006.
+///
+/// Deliberately TYPE-ONLY, not a full call check: the return type is
+/// computed (with type-argument inference from the substitutions, and with
+/// explicit type arguments already applied by the `instantiation_expr` the
+/// parser builds for ``tag<T>`…` ``), but no argument diagnostic is reported
+/// and a tag with no call signature stays `any`. Reporting would need the
+/// synthesized `TemplateStringsArray` argument to relate exactly as tsc
+/// builds it, and getting that subtly wrong is a false positive on every
+/// tagged template in a program; answering with the return type is pure gain.
+pub fn checkTaggedTemplate(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
+    const d = c.tree.nodeData(node);
+    const tag_ty = try c.checkExprCached(d.lhs, types.no_type);
+    // The substitutions are checked by the template node itself; do it first
+    // so their diagnostics land whatever the tag turns out to be.
+    _ = try c.checkExprCached(d.rhs, types.no_type);
+    const r = try c.resolveStructural(tag_ty);
+    var sigs: std.ArrayList(TypeId) = .empty;
+    defer sigs.deinit(c.scratch());
+    switch (c.ts.kind(r)) {
+        .function => try sigs.append(c.scratch(), r),
+        .overloads => for (try c.memberList(r)) |m| try sigs.append(c.scratch(), m),
+        .object => for (0..c.ts.objectCallSigCount(r)) |i| {
+            try sigs.append(c.scratch(), c.ts.objectCallSig(r, @intCast(i)));
+        },
+        else => {},
+    }
+    if (sigs.items.len == 0) return types.any_type;
+    // Argument nodes: the template stands in for the strings array (its own
+    // parameter is `TemplateStringsArray`, which carries no type parameter in
+    // any real tag, so what it contributes to inference is nothing), then one
+    // per substitution.
+    var args: std.ArrayList(Node) = .empty;
+    defer args.deinit(c.scratch());
+    try args.append(c.scratch(), d.rhs);
+    if (c.nodeTag(d.rhs) == .template_expr) {
+        for (c.tree.nodeRange(d.rhs)) |sub| {
+            if (sub != null_node) try args.append(c.scratch(), sub);
+        }
+    }
+    // Overloads: the first signature whose arity fits, mirroring
+    // `resolveSignatureCall`'s order without its argument check.
+    var chosen = sigs.items[0];
+    if (sigs.items.len > 1) {
+        for (sigs.items) |sig| {
+            const n = args.items.len;
+            if (n >= try c.requiredParams(sig) and n <= try c.paramTotal(sig)) {
+                chosen = sig;
+                break;
+            }
+        }
+    }
+    const inst = try c.instantiateSigForCall(chosen, &.{}, args.items, node, ctx);
+    return c.ts.fnReturn(inst);
 }
 
 pub fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
