@@ -3293,6 +3293,7 @@ pub const Checker = struct {
     pub const typeArgsSpan = calls_zig.typeArgsSpan;
     pub const fillFromReturnContext = calls_zig.fillFromReturnContext;
     pub const isOuterInferVar = calls_zig.isOuterInferVar;
+    pub const mentionsActiveInferVar = calls_zig.mentionsActiveInferVar;
     pub const partialParamCtx = calls_zig.partialParamCtx;
     pub const instantiateKnownParams = calls_zig.instantiateKnownParams;
     pub const paramIsBareCallbackReturn = calls_zig.paramIsBareCallbackReturn;

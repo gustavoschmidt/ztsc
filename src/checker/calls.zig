@@ -845,6 +845,42 @@ pub fn isOuterInferVar(c: *Checker, t: TypeId, tp_syms: []const u32) bool {
     return false;
 }
 
+/// Does `t` mention a type parameter that some call currently resolving its
+/// type arguments is still inferring? Any type built out of one is evidence
+/// about itself, which is never evidence at all (see the empty-array-literal
+/// arm of `checkArrayLiteral`). A bare parameter and the parameter under one
+/// array/reference layer are what the callers see, so the walk is shallow —
+/// deeper occurrences simply read as "no free variable", i.e. the old
+/// behavior.
+pub fn mentionsActiveInferVar(c: *Checker, t0: TypeId) Error!bool {
+    if (c.infer_active.items.len == 0) return false;
+    return mentionsActiveInferVarAt(c, t0, 0);
+}
+
+fn mentionsActiveInferVarAt(c: *Checker, t0: TypeId, depth: u32) Error!bool {
+    if (depth > 4) return false;
+    // Deliberately NOT `resolveStructural`: this runs in the middle of a
+    // call's argument check, and forcing a reference's expansion here is
+    // arbitrary work — and, on a self-referential alias, unbounded.
+    switch (c.ts.kind(t0)) {
+        .type_param => {
+            const sym = c.ts.typeParamSymbol(t0);
+            for (c.infer_active.items) |s| {
+                if (s == sym) return true;
+            }
+            return false;
+        },
+        .array => return mentionsActiveInferVarAt(c, c.ts.arrayElem(t0), depth + 1),
+        .union_type, .intersection => {
+            for (try c.memberList(t0)) |m| {
+                if (try mentionsActiveInferVarAt(c, m, depth + 1)) return true;
+            }
+            return false;
+        },
+        else => return false,
+    }
+}
+
 /// Substitute the type params of this call that already have a value —
 /// `candidates` (arguments seen so far) falling back to `seed` (the
 /// contextual-return pass) — leaving the rest free. tsc's

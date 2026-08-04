@@ -1451,6 +1451,17 @@ pub fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             if (rctx != types.no_type and c.ts.kind(rctx) == .union_type and
                 try c.multiArrayLikeBranches(rctx))
                 return c.ts.makeArray(types.never_type);
+            // The contextual element is a FREE inference variable of a call
+            // in flight (`mk<T>(xs: T[])` called as `mk([])`): echoing it
+            // back makes the argument its own evidence, so `T` infers `T` and
+            // leaks a naked type parameter into the result (immich's
+            // `asSet(v, [])` produced `Set<T>`, then `T | ImmichWorker`).
+            // tsc never reads the contextual element type for an EMPTY
+            // literal at all — `checkArrayLiteral` hands back
+            // `implicitNeverType` regardless — and `never` is the right
+            // evidence: it is what an array holding nothing contributes, and
+            // it is assignable to every array target.
+            if (try c.mentionsActiveInferVar(ctx_elem)) return c.ts.makeArray(types.never_type);
             return c.ts.makeArray(ctx_elem);
         }
         return c.ts.makeArray(types.any_type); // evolving arrays out of scope
