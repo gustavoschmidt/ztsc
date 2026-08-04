@@ -959,6 +959,47 @@
 //! reportable-free but charges 4.0 M visits to DECLARATION windows and trips
 //! zero times, and the same burn at checking level, which trips and reports
 //! the TS2589. It is pinned by the immich gate.
+//!
+//! ## Family 2, re-bucketed at 74 — and it isolates now (2026-08-04)
+//!
+//! With the scratch-project method fixed, the clusters that "needed the whole
+//! package" do not. `user.repository.ts` and `search.service.ts` copied into a
+//! project holding nothing but themselves reproduce NINE of the remaining keys
+//! verbatim, at 3 s a run. Anything left on the list can be bisected the same
+//! way.
+//!
+//! ### `search.service.ts`'s three TS2339: an undecidable `as` remap DELETES
+//!
+//! `LargeAssetSearchDto` has no `visibility` — and its sibling
+//! `RandomSearchDto`, built from the same base schema, does. The split is zod's
+//! `util.Extend`:
+//!
+//!     type Extend<A, B> = Flatten<keyof A & keyof B extends never ? A & B
+//!       : { [K in keyof A as K extends keyof B ? never : K]: A[K] }
+//!         & { [K in keyof B]: B[K] }>;
+//!
+//! `RandomSearchSchema.extend({…})` adds only NEW keys and takes the `A & B`
+//! branch; `LargeAssetSearchSchema.extend({…})` redeclares `size` and takes the
+//! REMAP branch — where every key `A` had and `B` did not vanished.
+//!
+//! `reduceMapped` decided deferral from the KEY SET alone, on the stated
+//! reasoning that "the value/`as` branches may still be generic (they
+//! materialize into generic-typed props)". True of the value branch, false of
+//! the remap: `remapKey` evaluates the remap once per key and DROPS any key
+//! whose remap does not reduce to a literal or `never`, so an `as` clause that
+//! still mentions an unbound type parameter deletes the whole table — and the
+//! key set is perfectly concrete there, so nothing else catches it. Reached
+//! through `ZodObject.extend<U>(shape: U): ZodObject<Extend<Shape, U>>`,
+//! `Shape` is bound at the receiver and `U` only at the call.
+//!
+//! Deferring on a free type param in the `as` clause: immich **74 -> 69 at c4,
+//! 72 -> 67 at c1**, five keys (three in `search.service.ts`, two in
+//! `activity.service.ts`), zero new, wall 3.63 -> 3.62 s, RSS flat, zod
+//! byte-identical. Only FREE TYPE PARAMS may count: the map's own key is a
+//! `.mapped_param`, and an `infer` binder written inside the remap binds per
+//! key — conformance `mapped/061` and `conditional/043` fail on either. Pinned
+//! lib-free by `mapped/062_as_remap_defers_on_free_param`, whose negative
+//! control keeps the filtering a DECIDABLE remap still does.
 
 const std = @import("std");
 const types = @import("../types.zig");

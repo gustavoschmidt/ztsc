@@ -1712,7 +1712,28 @@ pub fn reduceMapped(c: *Checker, key_param: TypeId, constraint: TypeId, value: T
     const key_generic = try c.containsFreeTypeParam(key_src, &.{}) or
         try c.containsInfer(key_src) or
         try c.containsMappedParam(key_src);
-    if (key_generic) {
+    // …and while the `as` REMAP cannot be decided. The key set is only half of
+    // what materialization needs: `remapKey` evaluates the remap once per key
+    // and DROPS any key whose remap does not reduce to a literal or `never`,
+    // so an `as` clause that still mentions a free type param — `{ [K in keyof
+    // A as K extends keyof B ? never : K]: A[K] }` with `B` not yet bound, the
+    // `Omit`-by-another-shape idiom — deletes EVERY key instead of deferring.
+    // The key set is concrete there (`A` is bound), so nothing above catches
+    // it. zod's `util.Extend` is written exactly that way and is applied inside
+    // `ZodObject.extend<U>(shape: U): ZodObject<Extend<Shape, U>>`, where
+    // `Shape` is bound at the receiver and `U` only at the call: every property
+    // an overriding `.extend({…})` did NOT redeclare vanished from the schema
+    // (immich's `LargeAssetSearchDto` lost `visibility` and `withDeleted`,
+    // while its sibling `RandomSearchDto` — whose extension adds only NEW keys,
+    // taking `Extend`'s `A & B` branch — kept them).
+    //
+    // Only FREE TYPE PARAMS count. The map's own key parameter is a
+    // `.mapped_param` and is bound here; an `infer` binder written INSIDE the
+    // remap (`{ [E in SE as E extends A<infer X> ? X : never]: … }`,
+    // conformance mapped/061) binds per key when the remap is evaluated, so
+    // neither is a reason to defer — only a parameter nothing here can supply.
+    const as_generic = as_clause != 0 and try c.containsFreeTypeParam(as_clause, &.{});
+    if (key_generic or as_generic) {
         return c.ts.makeMapped(key_param, constraint, value, as_clause, src_type, flags);
     }
     return c.materializeMapped(key_param, constraint, value, as_clause, src_type, flags);
