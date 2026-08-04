@@ -2233,8 +2233,38 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
             return false;
         },
         .overloads => {
+            // tsc's `signaturesRelatedTo` arm 3: an overload SET on EITHER side
+            // is cross-matched with both sides erased to `any`
+            // (`getErasedSignature`), and only the one-signature-per-side case
+            // is compared with the type parameters left standing. Recursing
+            // into `isAssignable` per target signature answered the second
+            // question for a pair that is in the first: each target signature
+            // met a single source signature and was compared through
+            // `signatureAssignable`, i.e. erased to its CONSTRAINTS.
+            //
+            // A source whose one generic signature covers the whole overload
+            // set is then rejected on the overloads it covers only via `any` —
+            // kysely's `SelectQueryBuilder.as<A extends string>(alias: A)`
+            // against `AliasableExpression.as`, whose second overload takes an
+            // `Expression<any>`: constraint-erased, the source parameter is
+            // `string` and does not accept it, so a builder stopped being an
+            // `AliasableExpression` at all. That is the whole `.where(ref, 'in',
+            // (eb) => …)` family — the callback's return no longer matched the
+            // `ExpressionFactory` constituent, the argument was rejected, and
+            // the call fell out TS2769 with the callback's parameters
+            // implicitly `any`.
             for (try c.memberList(t)) |m| {
-                if (!try c.isAssignable(s, m)) return false;
+                const matched = switch (sk) {
+                    .function => try c.signatureAssignableErased(s, m),
+                    .overloads => blk: {
+                        for (try c.memberList(s)) |sm| {
+                            if (try c.signatureAssignableErased(sm, m)) break :blk true;
+                        }
+                        break :blk false;
+                    },
+                    else => try c.isAssignable(s, m),
+                };
+                if (!matched) return false;
             }
             return true;
         },

@@ -858,6 +858,67 @@
 //! `instantiation/053_cross_file_declaration_budget`, which fails (and is the
 //! only case that fails) when `max_decl_instantiation_count` is put back to
 //! `max_instantiation_count`.
+//!
+//! ## "It does not reproduce in isolation" was FALSE (2026-08-04)
+//!
+//! The note above — that `sync.repository.ts`'s twelve keys need the rest of
+//! the package — was an artifact of the scratch project, not of the bug. A
+//! `tsconfig.json` whose `include` matches nothing loads no inputs and prints
+//! "no inputs were found", which greps for `error TS` read as CLEAN. The file
+//! copied into a project that really does load it — its own imports resolved
+//! through `paths` at the app, `node_modules` symlinked, 3 s per run, nothing
+//! else in the program — reports TWENTY-ONE diagnostics where tsgo is clean.
+//! Any bisect that ends in "it needs the whole package" should re-check that
+//! the scratch program has files in it first.
+//!
+//! What the package was doing to those twelve is MASKING, and it is worth
+//! recording because it inverts the usual reading of an `any` cascade. In the
+//! app the callbacks are TS7006 because their chain is `any`: `const { table,
+//! ref } = this.db.dynamic` binds both names to `any` because
+//! `resolveStructural(DynamicModule<DB>)` answers `error_type`. That expansion
+//! was built ONCE — from `ocr.repository.ts`, the single statement in the
+//! package that reaches the 250 k statement cap — and `expandRef` memoized the
+//! truncation under the ref for the rest of the run. An `any` receiver reports
+//! one implicit-`any` parameter and nothing else, so the twelve TS7006 were
+//! the *quiet* form of twelve TS2769 plus three TS2345.
+//!
+//! ### The bug under them: the overload-set erasure was one-sided
+//!
+//! Nine lines with no immich code in them:
+//!
+//!     declare const db: Kysely<DB>;
+//!     export const q = db.selectFrom('asset_exif')
+//!       .where('assetId', 'in', (eb) =>
+//!         eb.selectFrom('asset').select('id').where('ownerId', '=', 'x'))
+//!       .compile();
+//!
+//! Everything up to the relation is right: `partialParamCtx` takes `VE`'s
+//! CONSTRAINT (`OperandValueExpressionOrList<DB, TB, RE>`) for the contextual
+//! type, the arrow types as `(eb: ExpressionBuilder<DB, 'asset_exif'>) =>
+//! SelectQueryBuilder<DB, 'asset' | 'asset_exif', { id: string }>`, and the
+//! argument then fails on the RETURN — that builder is not a
+//! `SelectQueryBuilderExpression<{ [x: string]: string | null }>`. Which is
+//! not about the payload: `Expression<…>` and `AliasableExpression<…>` split
+//! the pair, and the member that fails is `as`.
+//!
+//! `AliasableExpression.as` is an overload SET of two (`alias: A extends
+//! string`, `alias: Expression<any>`); `SelectQueryBuilder` overrides it with
+//! ONE signature. tsc's `signaturesRelatedTo` reads the erasure off the SHAPE
+//! OF THE PAIR — arm 3, "an overload set on EITHER side", erases both sides to
+//! `any` — while ztsc's `.overloads` TARGET arm recursed into `isAssignable`
+//! once per target signature, so every pair then looked like arm 2 and was
+//! erased to its CONSTRAINTS. The source's `A` becomes `string`, `string` does
+//! not accept `Expression<any>`, and a kysely builder stopped being an
+//! `AliasableExpression` at all. 085 pinned the source half of arm 3 a day
+//! earlier; the target half was never written.
+//!
+//! immich **88 -> 86 at c4 and 91 -> 89 at c1** on its own (two TS2345 in
+//! `move.repository.ts` and `person.repository.ts`, zero new keys), wall
+//! 3.58 -> 3.59 s, peak RSS 2.59 -> 2.40 GB, every gate unchanged — and the
+//! scratch project's 21 go to zero. The small package number and the large
+//! isolated one are the same masking: in the app most of this family is still
+//! hidden behind the `DynamicModule<DB>` truncation. Pinned lib-free by
+//! `assignability/086_overload_target_erases_to_any`.
 
 const std = @import("std");
 const types = @import("../types.zig");
