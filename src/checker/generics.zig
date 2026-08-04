@@ -783,7 +783,9 @@ fn inferFromExtendsInner(c: *Checker, source0: TypeId, pattern: TypeId, ids: []c
             }
         },
         .ref => {
-            const src = try c.resolveStructural(source0);
+            // Identity pairing infers from the two references' type ARGUMENTS
+            // and reads no member, so it runs before the source is resolved
+            // (the same ordering `unify`'s `.ref` arm takes).
             if (s.kind(source0) == .ref and s.refSymbol(source0) == s.refSymbol(pattern)) {
                 const pa = try c.scratch().dupe(TypeId, s.refArgs(pattern));
                 const aa = try c.scratch().dupe(TypeId, s.refArgs(source0));
@@ -791,6 +793,7 @@ fn inferFromExtendsInner(c: *Checker, source0: TypeId, pattern: TypeId, ids: []c
                 for (0..n) |i| try c.inferFromExtends(aa[i], pa[i], ids, vals, contra, depth + 1);
                 return;
             }
+            const src = try c.resolveStructural(source0);
             // `Array<infer U>` (and other single-arg generics) vs an
             // array/tuple source: bind the arg from the element type.
             const pa = try c.scratch().dupe(TypeId, s.refArgs(pattern));

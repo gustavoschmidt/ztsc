@@ -1894,7 +1894,10 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
     // SINGLE target-union member — a spurious TS2345/TS2322. Resolving here
     // lets the source-union distribution above run on re-entry. Scoped to
     // ref-source + union-target + resolves-to-a-union so nothing else moves.
-    if (sk == .ref and tk == .union_type) {
+    // An interface/class instance is an object for every argument list, so it
+    // is never the union this rule is looking for and its member table need
+    // not be materialized to say so (see `refExpandsToObject`).
+    if (sk == .ref and tk == .union_type and !c.refExpandsToObject(s)) {
         const rs = try c.resolveStructural(s);
         if (rs != s and c.ts.kind(rs) == .union_type) return c.isAssignable(rs, t);
     }

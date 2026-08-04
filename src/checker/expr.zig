@@ -505,6 +505,11 @@ pub fn jsxComponentProps(c: *Checker, tag_ty: TypeId, explicit_targs: []const Ty
 /// `boolean`). A top-level named alias (`type Foo<S> = S | undefined`) is
 /// resolved once so `S` is still found.
 pub fn typeParamAtTopLevel(c: *Checker, ret: TypeId, sym: u32) Error!bool {
+    // An interface/class instance is an object for every argument list, and an
+    // object is neither a type parameter nor a union/intersection of them — so
+    // the member table need not be materialized to say no. See
+    // `refExpandsToObject`.
+    if (c.refExpandsToObject(ret)) return false;
     const t = if (c.ts.kind(ret) == .ref) try c.resolveStructural(ret) else ret;
     switch (c.ts.kind(t)) {
         .type_param => return c.ts.typeParamSymbol(t) == sym,
