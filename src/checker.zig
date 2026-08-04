@@ -1381,6 +1381,19 @@ pub const Checker = struct {
     /// is scoped to a statement; this is the work counter the `--memory`
     /// report and `bench/repeat_sweep.sh` compare across runs.
     inst_total: u64 = 0,
+    /// PROFILER ONLY (`--inst-profile`): the symbol whose declaration
+    /// materialization opened the live budget window — the innermost
+    /// `enterSymFile` — or 0 while the window is a source element's own.
+    ///
+    /// `restoreCtx` puts `inst_count` back, so EVERY declaration frame, not
+    /// just a cross-file one, is a window whose cost the requesting element is
+    /// not charged for. This names the frame a budget trip actually belongs
+    /// to, which is never the statement `instSpanHere` anchors its TS2589 at —
+    /// the distinction that ruled out the whole "charge table construction
+    /// elsewhere" family (see `src/checker/prof.zig`). Written only when the
+    /// profiler is on, so it costs a predictable-false branch and one word in
+    /// `SavedCtx` otherwise.
+    epoch_sym: SymbolId = 0,
     /// The types on the live `instantiateId` stack, indexed by `inst_depth`.
     /// Read only by `chainRepeats`; a frame's ancestors are the same set
     /// whatever the memo did to its siblings, which is what makes a guard
@@ -1874,10 +1887,22 @@ pub const Checker = struct {
     /// file/scope context: a lazy demand that crosses into another file must
     /// not carry the demanding frame's `this` — nor spend the demanding
     /// frame's budget — with it (see `enterSymFile`).
-    pub const SavedCtx = struct { file: FileId, scope: ScopeId, this_type: TypeId, inst_count: u64 };
+    pub const SavedCtx = struct {
+        file: FileId,
+        scope: ScopeId,
+        this_type: TypeId,
+        inst_count: u64,
+        epoch_sym: SymbolId,
+    };
 
     pub fn saveCtx(c: *const Checker) SavedCtx {
-        return .{ .file = c.cur_file, .scope = c.cur_scope, .this_type = c.this_type, .inst_count = c.inst_count };
+        return .{
+            .file = c.cur_file,
+            .scope = c.cur_scope,
+            .this_type = c.this_type,
+            .inst_count = c.inst_count,
+            .epoch_sym = c.epoch_sym,
+        };
     }
 
     pub fn restoreCtx(c: *Checker, s: SavedCtx) void {
@@ -1885,6 +1910,7 @@ pub const Checker = struct {
         c.cur_scope = s.scope;
         c.this_type = s.this_type;
         c.inst_count = s.inst_count;
+        c.epoch_sym = s.epoch_sym;
     }
 
     /// Switch to `sym`'s file (scope untouched; callers set it).
@@ -1922,6 +1948,7 @@ pub const Checker = struct {
     pub fn enterSymFile(c: *Checker, sym: SymbolId) SavedCtx {
         const saved = c.saveCtx();
         const f = c.symFile(sym);
+        if (prof_zig.enabled()) c.epoch_sym = sym;
         if (f != c.cur_file) {
             c.setFile(f);
             c.this_type = 0;

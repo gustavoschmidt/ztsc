@@ -333,6 +333,58 @@
 //! is checked anyway, so the table is built either way); only WHERE the cost
 //! is charged moves, which is the same budget-timing coin every negative above
 //! landed on.
+//!
+//! ## The budget-timing coin, closed (2026-08-04)
+//!
+//! The whole family above rests on one premise — that a statement is charged
+//! for the declaration materializations it happens to be the first to demand,
+//! so moving the charge moves the truncations. **The premise is false, and
+//! `-- budget trips by the declaration frame that was live --` is the axis
+//! that settled it.** `restoreCtx` puts `inst_count` back unconditionally, so
+//! EVERY `enterSymFile` window — same-file as much as cross-file — already
+//! rolls its cost off the requester's budget. `enterSymFile`'s reset only
+//! decides where the window STARTS, not who pays for it.
+//!
+//! Measured on immich (`--checkers=1`; baseline 453 excess, 3.3 s, 1.57 GB,
+//! 10,007,576 visits, 5,290 trips; c1/c4/c8 = 540/453/487, divergence
+//! 121/107/52):
+//!
+//! * **Own budget epoch for the run-once per-symbol table construction**
+//!   (`interfaceGeneric` + `classInstanceGeneric` reset `inst_count` instead
+//!   of inheriting it — the assigned design): a **literal no-op**. Identical
+//!   key set at c1/c4/c8, identical 10,007,576 visits, identical 5,290 trips.
+//!   A tally of each construction's own-window charge says why: over the whole
+//!   package the constructions charge **4,537 node visits in total**, and
+//!   immich's repository classes charge **zero** — `SearchRepository`'s
+//!   1,154,502 visits all happen inside nested declaration windows that reset
+//!   and restore around them. Nobody was ever being charged for them.
+//! * **Where the trips actually are.** 3,916 of 5,290 fire inside a table
+//!   construction, but attributed to the innermost declaration frame they are
+//!   individual MEMBERS: `query` 576, `streamForSearchDuplicates` 396,
+//!   `searchAssetBuilder` 354, `get` 282, `getForVideoConversion` 264,
+//!   `getSharedLinks` 229 — each one a single immich repository method whose
+//!   own materialization exceeds 250,000 node visits starting from ZERO. The
+//!   remaining 2,335 are a source element's own budget. It is a CEILING
+//!   problem per declaration, not a charging problem.
+//! * **A fresh window for every declaration frame** (`enterSymFile` resets
+//!   unconditionally, not only across files): 453 -> **452**, wall 3.3 ->
+//!   3.9 s, RSS 1.57 -> 1.59 GB, and 23 keys lost for 22 new. Noise.
+//! * **A raised ceiling scoped to the construction's whole dynamic extent**
+//!   (a dynamic `inst_budget` the guard reads, set on entry to a per-symbol
+//!   table build, restored with the context — the "generous ceiling" the
+//!   design asked for): 250 k -> 1 M gives **454 excess, 6.8 s, 2.09 GB**;
+//!   250 k -> 5 M gives **452 excess, 28.7 s, 4.14 GB** (44 keys lost, 43
+//!   new). Excess is FLAT across a 20x ceiling while wall grows 8.6x and RSS
+//!   2.6x.
+//!
+//! The last row is the one that matters beyond this experiment: letting every
+//! truncated repository member complete does not remove the diagnostics —
+//! it exchanges one set of ~44 keys for another. **The ~390 "budget-truncation
+//! cascades" in immich's 453 are not curable by budget**, whoever is charged
+//! and however high the ceiling. Whatever produces them survives the work
+//! completing, so the next hypothesis has to come from comparing a completed
+//! member's TYPE against tsgo's, not from the budget at all. All of it is
+//! reverted; only the trip-by-frame profiler axis was kept.
 
 const std = @import("std");
 const types = @import("../types.zig");
@@ -403,6 +455,11 @@ pub const InstProf = struct {
     stmts: std.ArrayListUnmanaged(Stmt) = .empty,
     /// Statements whose budget actually tripped.
     tripped: u64 = 0,
+    /// Budget trips by the symbol whose declaration materialization owned the
+    /// live budget window (`Checker.epoch_sym`; 0 = a source element's own).
+    /// The trip's TS2589 is anchored at the demanding statement, which is a
+    /// different thing entirely — this is the frame that spent the budget.
+    trip_epochs: std.AutoHashMapUnmanaged(SymbolId, Tally) = .empty,
     /// Non-zero while a top-level `instantiate` of `focus_root` is live —
     /// see `focus_root`. Nested so a re-entrant focused root still counts.
     focus_depth: u32 = 0,
@@ -424,6 +481,7 @@ pub const InstProf = struct {
         p.roots.deinit(gpa);
         p.expands.deinit(gpa);
         p.expand_sites.deinit(gpa);
+        p.trip_epochs.deinit(gpa);
         p.per_type.deinit(gpa);
         p.focus_types.deinit(gpa);
         p.stmts.deinit(gpa);
@@ -477,6 +535,15 @@ pub fn noteExpandSite(c: *Checker, ret_addr: usize, visits: u64) void {
     if (c.prof.expand_sites.getOrPut(c.gpa, ret_addr)) |gop| {
         if (!gop.found_existing) gop.value_ptr.* = .{};
         gop.value_ptr.add(visits);
+    } else |_| {}
+}
+
+/// Charge one budget trip to the declaration frame that was live when it
+/// fired (`Checker.epoch_sym`).
+pub fn noteTrip(c: *Checker) void {
+    if (c.prof.trip_epochs.getOrPut(c.gpa, c.epoch_sym)) |gop| {
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        gop.value_ptr.add(1);
     } else |_| {}
 }
 
@@ -562,6 +629,14 @@ fn labelSym(c: *Checker, sym: SymbolId, w: *std.Io.Writer) void {
     w.print("{s}", .{c.symbolName(sym)}) catch {};
 }
 
+fn labelEpoch(c: *Checker, sym: SymbolId, w: *std.Io.Writer) void {
+    if (sym == 0) {
+        w.writeAll("<source element>") catch {};
+        return;
+    }
+    labelSym(c, sym, w);
+}
+
 /// Render the whole profile to stderr. Called from `seal`.
 pub fn report(c: *Checker) void {
     const gpa = c.gpa;
@@ -623,6 +698,8 @@ pub fn report(c: *Checker) void {
     }
     w.writeAll("\n-- expandRef() by symbol --\n") catch {};
     dumpTally(SymbolId, w, gpa, &c.prof.expands, 25, labelSym, c) catch {};
+    w.writeAll("\n-- budget trips by the declaration frame that was live --\n") catch {};
+    dumpTally(SymbolId, w, gpa, &c.prof.trip_epochs, 25, labelEpoch, c) catch {};
     w.writeAll("\n-- resolveStructural() sites that forced an expansion --\n") catch {};
     dumpTally(usize, w, gpa, &c.prof.expand_sites, 25, labelSite, c) catch {};
 

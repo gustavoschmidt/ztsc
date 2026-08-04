@@ -1357,7 +1357,10 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
     }
     if (c.inst_depth > max_instantiation_depth or c.inst_count > max_instantiation_count) {
         c.inst_limit_tripped = true;
-        if (c.prof.on) c.prof.tripped += 1;
+        if (c.prof.on) {
+            c.prof.tripped += 1;
+            prof_zig.noteTrip(c);
+        }
         if (!c.suppress_inst_diag) try c.instLimitDiag(2589, "Type instantiation is excessively deep and possibly infinite.");
         return types.error_type;
     }
