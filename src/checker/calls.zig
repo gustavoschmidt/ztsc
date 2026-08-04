@@ -3400,7 +3400,27 @@ pub fn checkCallArguments(c: *Checker, node: Node, sig: TypeId, arg_nodes: []con
     for (arg_nodes) |an| {
         if (an != null_node and c.nodeTag(an) == .spread_element) has_spread = true;
     }
-    if (report and !has_spread) {
+    // A TRUNCATION IS NOT AN ARITY. `instantiateId`'s depth/count guard fires
+    // *before* the `.function` arm runs and collapses the whole signature to
+    // `error_type`, and every `fn*` accessor then reads that as a signature
+    // with ZERO parameters — so a call whose substitution merely ran out of
+    // budget was reported "Expected 0 arguments, but got 1". tsc cannot reach
+    // that state: `instantiateSignature` clones the signature and
+    // instantiates each parameter lazily and independently, so a limit hit
+    // degrades a component to `errorType` while the shape — arity,
+    // optionality, `this` — always survives.
+    //
+    // The types are deliberately left alone (`error_type` is a suppressing
+    // type and short-circuits the rest of the walk, which is what keeps the
+    // truncated statement cheap); only the ARITY CLAIM is withdrawn, because
+    // it is the one thing a truncation cannot have an opinion about.
+    // Rebuilding the shape instead — arity kept, every component
+    // `error_type` — was measured on immich and is worse: 190 -> 194, with
+    // TS7006 74 -> 107, because an `error_type` parameter then overwrites
+    // each callback argument's contextual type with one that types its
+    // parameters `any`.
+    const arity_known = c.ts.kind(sig) == .function;
+    if (report and !has_spread and arity_known) {
         if (nargs < required) {
             if (total == std.math.maxInt(u32)) {
                 try c.diagFmt(2555, c.nodeSpan(node), "Expected at least {d} arguments, but got {d}.", .{ required, nargs });
