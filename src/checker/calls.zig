@@ -987,6 +987,34 @@ pub fn paramIsBareCallbackReturn(c: *Checker, sig: TypeId, tp_sym: u32) bool {
         if (c.ts.kind(pt) != .function) continue;
         const r = c.ts.fnReturn(pt);
         if (c.isBareOrUnionMember(r, tp_sym)) return true;
+        // …or a bare PARAMETER of the callback, or of a callback the
+        // callback itself takes: `new Promise<T>(executor: (resolve:
+        // (value: T | PromiseLike<T>) => void, …) => void)`. Without the
+        // seed `resolve` is handed the `any` placeholder, so `resolve()` on
+        // a `Promise<void>` reports TS2554 (a `void` parameter may be
+        // omitted, but only once the parameter IS `void`) and every
+        // `resolve(x)` goes unchecked.
+        //
+        // This is a CONTRAVARIANT occurrence, which is why it is safe where
+        // the covariant `flatMap<U>(cb: (…) => U | readonly U[])` shape is
+        // not: the seed becomes the callback parameter's declared type
+        // rather than the type its body's `return` is checked against, so it
+        // cannot make the callback's own inference disagree with itself.
+        if (callbackParamMentions(c, pt, tp_sym, 0)) return true;
+    }
+    return false;
+}
+
+/// Does a callback parameter's own PARAMETER list mention `tp_sym`, bare or
+/// as a union constituent, at this level or one callback deeper?
+fn callbackParamMentions(c: *Checker, cb: TypeId, tp_sym: u32, depth: u32) bool {
+    if (depth > 2 or c.ts.kind(cb) != .function) return false;
+    const n = c.ts.fnParamCount(cb);
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const pt = c.ts.fnParam(cb, i).ty;
+        if (c.isBareOrUnionMember(pt, tp_sym)) return true;
+        if (callbackParamMentions(c, pt, tp_sym, depth + 1)) return true;
     }
     return false;
 }
