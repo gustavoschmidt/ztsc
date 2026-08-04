@@ -372,7 +372,24 @@ pub fn enumValueType(c: *Checker, sym: SymbolId) Error!TypeId {
 /// not `string`, not the matching string literal — widens *into* it; and
 /// `E → E.A`, `E.A → E.B` and `E1.A → E2.A` are all rejected.
 pub fn enumAssignable(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: types.Kind) Error!bool {
-    if (sk == .enum_type and tk == .enum_type) return false;
+    if (sk == .enum_type and tk == .enum_type) {
+        // A WHOLE enum against one of its own members. tsc's declared type
+        // of an enum is the union of its member types, so an enum with a
+        // single member and that member are the same type there and relate
+        // in both directions; ztsc keeps the two spellings distinct, so the
+        // identity has to be stated. immich's `WorkflowType` (one member,
+        // the rest commented out) is exactly this shape, and every DTO that
+        // annotates `WorkflowType[]` while the value is `WorkflowType.AssetV1[]`
+        // reported TS2322.
+        if (!c.ts.isEnumMember(s) and c.ts.isEnumMember(t) and
+            c.ts.enumSymbol(s) == c.ts.enumSymbol(t))
+        {
+            if (try c.enumMemberTypeUnion(c.ts.enumSymbol(s), 0)) |mu| {
+                return mu == try c.ts.regularLiteral(t);
+            }
+        }
+        return false;
+    }
     if (sk == .enum_type) {
         if (c.ts.isEnumMember(s)) {
             // A member widens to the primitive domain of its OWN value, so
