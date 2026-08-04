@@ -1639,7 +1639,7 @@ const Parser = struct {
     fn parseDecorator(p: *Parser) PE!Node {
         const at = try p.bump(); // `@`
         var expr: Node = null_node;
-        if (canStartExpression(p.curTag())) expr = try p.parseLhsExpression(.{});
+        if (canStartExpression(p.curTag())) expr = try p.parseLhsExpression(.{ .in_decorator = true });
         return p.addNode(.{ .tag = .decorator, .main_token = at, .data = .{ .lhs = expr, .rhs = 0 } });
     }
 
@@ -2374,6 +2374,17 @@ const Parser = struct {
     const ExprCtx = struct {
         no_in: bool = false,
         no_calls: bool = false,
+        /// Inside a decorator's `@ LeftHandSideExpression` (tsc's
+        /// `NodeFlags.Decorator` parsing context). A `[` after the decorator
+        /// expression is NOT an element access — it opens the decorated
+        /// member's COMPUTED PROPERTY NAME, which is on the next line as
+        /// often as not (`@ApiProperty(...) \n [Field.NAME]!: T`). tsc
+        /// suppresses the element-access production in exactly this context
+        /// (`parseMemberExpressionRest`'s `!inDecoratorContext()`); without
+        /// it the decorator swallows the member name and the class body
+        /// derails. Cleared inside argument lists and parentheses, which
+        /// parse with a fresh context here as they do there.
+        in_decorator: bool = false,
     };
 
     /// Expression including the comma operator.
@@ -2718,6 +2729,9 @@ const Parser = struct {
                     }
                 },
                 .l_bracket => {
+                    // In a decorator this `[` starts the decorated member's
+                    // computed name, not an element access. See `in_decorator`.
+                    if (ctx.in_decorator) return lhs;
                     const lb = try p.bump();
                     const index = try p.parseExpression(.{});
                     _ = try p.expect(.r_bracket, .expected_r_bracket);
