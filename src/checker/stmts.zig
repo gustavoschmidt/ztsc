@@ -67,6 +67,7 @@ pub fn checkStatement(c: *Checker, node: Node) Error!void {
     }
     c.anchorInst(node);
     c.inst_count = 0;
+    c.inst_budget = max_instantiation_count;
     c.epoch_sym = 0; // this element's own budget (see `Checker.epoch_sym`)
     const d = c.tree.nodeData(node);
     const stmt_tag = c.nodeTag(node);

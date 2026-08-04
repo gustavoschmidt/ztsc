@@ -295,6 +295,33 @@ pub const max_instantiation_depth = 100;
 /// whose assignment to a statement is a function of `--checkers=N`, and the
 /// cap becomes a partition-dependent decision variable — see `enterSymFile`.
 pub const max_instantiation_count = 250_000;
+/// The same cap for a CROSS-FILE DECLARATION materialization — the window
+/// `enterSymFile` opens — where it has to be much larger.
+///
+/// A statement's budget is a fairness device: the answer it truncates is that
+/// statement's, and the next statement starts over. A declaration's is not.
+/// Its result is memoized under the SYMBOL (`inst_cache`, `expansions`, the
+/// per-symbol member table) and read by every later statement in the program,
+/// so a truncation there is published once and never revisited — and which
+/// statement happened to demand it first decides what the whole run sees.
+///
+/// The number is set by what those materializations actually cost. immich's
+/// repository classes are ~100 kysely-typed methods each, and the profiler's
+/// `-- budget trips by the declaration frame that was live --` axis shows
+/// INDIVIDUAL members (`query`, `streamForSearchDuplicates`, `getById`)
+/// exceeding 250,000 node visits starting from zero; on the whole package
+/// 3,916 of 5,290 trips fire inside a table construction. Every one of those
+/// is a member type published truncated.
+///
+/// Why not raise `max_instantiation_count` itself: measured, and it is a
+/// blocker on the library corpus. At tsc's own 5 M, immich excess does fall
+/// (c4 123 -> 95, c1 152 -> 94, cross-partition divergence 29 -> 1 keys) and
+/// the plateau starts at 3 M — but zod goes 0.15 s / 53 MB to 1.37 s /
+/// 301 MB, nine times tsgo's wall on a gated package, because zod's cost is
+/// in ordinary source elements that used to trip and now run to completion.
+/// Splitting the two caps buys immich's declaration truncations without
+/// touching what a statement may spend.
+pub const max_decl_instantiation_count = 5_000_000;
 /// How many times one type may re-enter the *live* `instantiateId` chain
 /// before the expansion is treated as a non-terminating recursive-alias cycle
 /// and cut.
@@ -1421,6 +1448,13 @@ pub const Checker = struct {
     /// happened to fall on, i.e. on traversal order (see
     /// `tagInstantiatedOrigin`).
     inst_count: u64 = 0,
+    /// The cap `inst_count` is measured against for the window in flight:
+    /// `max_instantiation_count` for a source element,
+    /// `max_decl_instantiation_count` for the cross-file declaration
+    /// materialization window `enterSymFile` opens. Saved and restored with
+    /// the rest of the context, so a statement that demands a declaration
+    /// gets its own cap back on the way out.
+    inst_budget: u64 = max_instantiation_count,
     /// Every node-visit this checker performed, never reset. The budget above
     /// is scoped to a statement; this is the work counter the `--memory`
     /// report and `bench/repeat_sweep.sh` compare across runs.
@@ -1936,6 +1970,7 @@ pub const Checker = struct {
         scope: ScopeId,
         this_type: TypeId,
         inst_count: u64,
+        inst_budget: u64,
         epoch_sym: SymbolId,
     };
 
@@ -1945,6 +1980,7 @@ pub const Checker = struct {
             .scope = c.cur_scope,
             .this_type = c.this_type,
             .inst_count = c.inst_count,
+            .inst_budget = c.inst_budget,
             .epoch_sym = c.epoch_sym,
         };
     }
@@ -1954,6 +1990,7 @@ pub const Checker = struct {
         c.cur_scope = s.scope;
         c.this_type = s.this_type;
         c.inst_count = s.inst_count;
+        c.inst_budget = s.inst_budget;
         c.epoch_sym = s.epoch_sym;
     }
 
@@ -1997,6 +2034,7 @@ pub const Checker = struct {
             c.setFile(f);
             c.this_type = 0;
             c.inst_count = 0;
+            c.inst_budget = max_decl_instantiation_count;
         }
         return saved;
     }
