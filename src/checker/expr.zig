@@ -2003,15 +2003,32 @@ pub fn contextAdmitsLiteral(c: *Checker, ctx: TypeId, lit: TypeId) Error!bool {
     const r = try c.resolveStructural(ctx);
     const lk = c.ts.kind(lit);
     const lit_is_bool = lk == .bool_true or lk == .bool_false;
+    // tsc carries BOTH flags on an enum member's type (`EnumLiteral |
+    // StringLiteral`), so `maybeTypeOfKind(candidate, StringLiteral)` — the
+    // candidate half of every arm below — is true for a string enum member as
+    // much as for `"a"`. ztsc gives an enum member its own `.enum_type` kind,
+    // so the candidate has to be mapped to the literal kind it stands for
+    // before the arms compare. Without it a string-literal context (`keyof`
+    // of an object with enum-computed keys) rejected an enum member and the
+    // property value widened to the whole enum.
+    const clk = try c.enumMemberLiteralKind(lit, lk);
     switch (c.ts.kind(r)) {
-        .string_literal => return lk == .string_literal,
-        .number_literal, .number_literal_fresh => return lk == .number_literal or lk == .number_literal_fresh,
-        .bigint_literal => return lk == .bigint_literal,
+        .string_literal => return clk == .string_literal,
+        .number_literal, .number_literal_fresh => return clk == .number_literal or clk == .number_literal_fresh,
+        .bigint_literal => return clk == .bigint_literal,
         .bool_true, .bool_false, .boolean => return lit_is_bool,
         // An enum MEMBER context keeps a fresh member of the same enum
-        // (`const a: WS.A[] = [WS.A]`); the whole enum does not — that is
-        // the widening context (`const o = { k: WS.A }` is `{ k: WS }`).
-        .enum_type => return c.ts.isEnumMember(r) and c.ts.isEnumMember(lit),
+        // (`const a: WS.A[] = [WS.A]`). So does the WHOLE enum: tsc models
+        // an enum type as the UNION of its members, and
+        // `isLiteralOfContextualType` recurses through a union, so
+        // `<T extends WS>(o: { k: T })` called with `{ k: WS.A }` infers
+        // `T = WS.A`. A bare `const o = { k: WS.A }` still widens — it has no
+        // contextual type at all, so it never reaches here.
+        .enum_type => {
+            if (!c.ts.isEnumMember(lit)) return false;
+            if (c.ts.isEnumMember(r)) return true;
+            return c.ts.enumSymbol(r) == c.ts.enumSymbol(lit);
+        },
         // tsc's `isLiteralOfContextualType` treats a union and an
         // INTERSECTION alike (`contextualType.flags & UnionOrIntersection`
         // → `some(types, …)`). An intersection contextual type is exactly
