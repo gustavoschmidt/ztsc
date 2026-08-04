@@ -265,6 +265,201 @@ pub fn expandRef(c: *Checker, ref: TypeId) Error!TypeId {
     return result;
 }
 
+// =====================================================================
+// lazy member tables — "symbols eagerly, types lazily"
+// =====================================================================
+
+/// Process-global switch for the lazy member route (`--eager-members` turns
+/// it off). Written once by `main` before the checker pool spawns, so it
+/// needs no synchronization; it exists so any diagnostic movement can be
+/// bisected against the eager path in the same binary.
+pub var lazy_members_on: bool = true;
+
+/// The GENERIC member table `ref`'s expansion substitutes, when that table
+/// can be read member-by-member instead of materialized whole — else null,
+/// and the caller expands eagerly exactly as before.
+///
+/// tsc resolves an interface/class reference to a member table that holds
+/// member SYMBOLS (names, flags, declarations) and computes each member's
+/// TYPE on first access. ztsc's `expandRef` instead substitutes the whole
+/// table up front, so a relation that fails on a builder's first property
+/// still pays for the other two hundred — the ~100x demand gap kysely's
+/// chains open up. The table this returns is the same one `expandRef` would
+/// substitute, and `instantiateId`'s `.object` arm carries `Prop.name` and
+/// `Prop.flags` through untouched, so every question that reads only a
+/// member's NAME or FLAGS — "is this target weak?", "does the source have a
+/// property called `x`?", "is `x` optional?" — is answerable off the generic
+/// with no substitution at all.
+///
+/// Eligibility is deliberately narrow; everything it excludes keeps today's
+/// eager path, so a member read through this route is byte-identical to the
+/// one the expansion would have held:
+///
+///   * interfaces and classes only — an ALIAS body reduces when instantiated
+///     (a conditional picks a branch, a mapped type materializes), so its
+///     members are not a substitution of the generic's members;
+///   * the generic must already be an `.object`: a base cycle answers
+///     `error_type`, and `Array`/`ReadonlyArray` are lowered elsewhere;
+///   * no call or construct signatures — `instantiateId` DROPS a
+///     higher-order signature it cannot instantiate (`higherOrderSigEligible`),
+///     so a signature count is not carried through and may not be read off
+///     the generic;
+///   * an expansion already memoized (or in progress) stays on the eager
+///     path: the finished table is free, and an in-progress one must take
+///     `expandRef`'s cycle cut;
+///   * a PROVISIONAL class table (`classTableProvisional`) is true only for
+///     the duration of the cycle that produced it, and `expandRef` refuses to
+///     memoize an expansion built on one — so nothing built on it may be
+///     memoized here either;
+///   * a reference with no type parameters expands to the generic itself, so
+///     there is nothing to defer.
+pub fn lazyTableOf(c: *Checker, ref: TypeId) Error!?TypeId {
+    const generic = (try lazyShapeOf(c, ref)) orelse return null;
+    // Already materialized: the eager path is free, and it is the one that
+    // owns the object's `origin` tag.
+    if (c.expansions.get(ref) != null) return null;
+    // `instantiateId` DROPS a higher-order signature it cannot instantiate
+    // (`higherOrderSigEligible`), so a signature count is not carried through
+    // and a member table that has any may not be read off the generic.
+    if (c.ts.objectCallSigCount(generic) != 0 or c.ts.objectConstructSigCount(generic) != 0) return null;
+    if (try c.lazyRefMap(ref)) |_| return generic;
+    return null;
+}
+
+/// The member table whose NAMES, FLAGS and COUNTS `ref`'s expansion carries
+/// unchanged — or null when `ref` is not a reference whose expansion is a
+/// substitution of a fixed table.
+///
+/// This is the weaker half of `lazyTableOf`, for consumers that read no member
+/// TYPE at all: `keyof` enumerates names, `isCallableSource` asks whether the
+/// shape has properties, `isWeakType` asks whether every property is optional.
+/// None of them needs the substitution map, and none of them cares that the
+/// table may already have been materialized elsewhere — so none of the
+/// restrictions `lazyTableOf` adds for materialization apply.
+///
+/// Aliases are excluded for the reason `refExpandsToObject` excludes them: an
+/// alias BODY reduces when instantiated, so its members are not a
+/// substitution of the generic's members. An in-progress or provisional class
+/// table is excluded because `expandRef` refuses to publish either, so what
+/// the eager path answers for one is not this table at all.
+///
+/// **It never BUILDS a table, only reads one already memoized.** Materializing
+/// a generic member table is not a pure function of the symbol — it runs the
+/// declaration walk under `enterSymFile`, folds `extends` bases, resolves
+/// every member's annotation and can re-enter this very reference — so WHEN it
+/// first runs is observable. `expandRef` marks `expansions[ref]` in progress
+/// before it builds, and building from anywhere else steps outside that mark;
+/// measured on excalidraw, hoisting the construction into `keyofType` alone
+/// took the sweep from 17 diagnostics to 279. Reading a table some earlier
+/// `expandRef` already built has no such effect, and it is the case that
+/// matters: a generic interface is materialized once and read thousands of
+/// times, so the second and every later reader takes this route.
+pub fn lazyShapeOf(c: *Checker, ref: TypeId) Error!?TypeId {
+    if (!lazy_members_on) return null;
+    if (c.ts.kind(ref) != .ref) return null;
+    const sym = c.ts.refSymbol(ref);
+    const f = c.symFlags(sym);
+    if (!f.interface and !f.class) return null;
+    if (c.expansions.get(ref)) |e| {
+        if (e == types.no_type) return null; // in progress: `expandRef` cuts
+    }
+    const generic = if (f.class) blk: {
+        if (c.classGenericInProgress(sym)) return null;
+        if (c.classTableProvisional(sym)) return null;
+        break :blk c.class_inst_generic.get(sym) orelse return null;
+    } else c.iface_generic.get(sym) orelse return null;
+    if (generic == types.no_type) return null; // still materializing
+    if (c.ts.kind(generic) != .object) return null;
+    return generic;
+}
+
+/// The substitution `ref`'s member table is read under, built once per
+/// reference and kept on the checker arena. Null when the reference's symbol
+/// declares no type parameters — `expandRef` hands back the generic itself in
+/// that case, so there is nothing to substitute and nothing to defer.
+pub fn lazyRefMap(c: *Checker, ref: TypeId) Error!?[]const TpMap {
+    if (c.lazy_map.get(ref)) |m| return if (m.len == 0) null else m;
+    const sym = c.ts.refSymbol(ref);
+    var tps: std.ArrayList(TypeParamInfo) = .empty;
+    defer tps.deinit(c.scratch());
+    try c.typeParamsOf(sym, &tps);
+    if (tps.items.len == 0) {
+        try c.lazy_map.put(c.cm(), ref, &.{});
+        return null;
+    }
+    var map_list: std.ArrayList(TpMap) = .empty;
+    defer map_list.deinit(c.scratch());
+    const args = try c.scratch().dupe(TypeId, c.ts.refArgs(ref));
+    try c.buildInstMap(sym, args, &map_list);
+    const owned = try c.cm().dupe(TpMap, map_list.items);
+    try c.lazy_map.put(c.cm(), ref, owned);
+    return if (owned.len == 0) null else owned;
+}
+
+/// Slot numbering for `lazy_member`: property `i` is slot `i`, and the two
+/// index signatures follow the properties.
+fn lazySlotStringIndex(c: *Checker, generic: TypeId) u32 {
+    return c.ts.objectPropCount(generic);
+}
+
+fn lazySlotNumberIndex(c: *Checker, generic: TypeId) u32 {
+    return c.ts.objectPropCount(generic) + 1;
+}
+
+/// Substitute ONE member of `ref`'s table — tsc's `getTypeOfSymbol` on an
+/// instantiated symbol. `generic_ty` is that member's type as written on the
+/// generic table; `slot` identifies it for the memo.
+///
+/// The result is cached per `(ref, slot)` for the whole run, so the
+/// amortization the whole-table expansion provided survives at member
+/// granularity — EXCEPT when the substitution truncated, which is never
+/// published (see `lazy_member`).
+pub fn lazyMemberAt(c: *Checker, ref: TypeId, generic_ty: TypeId, slot: u32) Error!TypeId {
+    const key = (@as(u64, ref) << 32) | slot;
+    if (c.lazy_member.get(key)) |t| return t;
+    const map = (try c.lazyRefMap(ref)) orelse return generic_ty;
+    const result = try c.instantiate(generic_ty, map);
+    if (!c.inst_limit_tripped) try c.lazy_member.put(c.cm(), key, result);
+    return result;
+}
+
+/// Property `i` of `ref`'s table, its type substituted on demand.
+pub fn lazyPropAt(c: *Checker, ref: TypeId, generic: TypeId, i: u32) Error!types.Prop {
+    const p = c.ts.objectProp(generic, i);
+    return .{ .name = p.name, .flags = p.flags, .ty = try lazyMemberAt(c, ref, p.ty, i) };
+}
+
+/// The named property of `ref`'s table, or null when the table has no member
+/// of that name. Costs one binary search and — only on a hit — one member
+/// substitution.
+pub fn lazyPropNamed(c: *Checker, ref: TypeId, generic: TypeId, name: Atom) Error!?types.Prop {
+    const n = c.ts.objectPropCount(generic);
+    var lo: u32 = 0;
+    var hi: u32 = n;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const p = c.ts.objectProp(generic, mid);
+        if (p.name == name) return try lazyPropAt(c, ref, generic, mid);
+        if (p.name < name) lo = mid + 1 else hi = mid;
+    }
+    return null;
+}
+
+/// `ref`'s string index signature type (0 when it has none), substituted on
+/// demand. `instantiateId` maps a non-zero index type to a non-zero one, so
+/// the PRESENCE of an index signature is readable off the generic.
+pub fn lazyStringIndex(c: *Checker, ref: TypeId, generic: TypeId) Error!TypeId {
+    const g = c.ts.objectStringIndex(generic);
+    if (g == 0) return 0;
+    return lazyMemberAt(c, ref, g, lazySlotStringIndex(c, generic));
+}
+
+pub fn lazyNumberIndex(c: *Checker, ref: TypeId, generic: TypeId) Error!TypeId {
+    const g = c.ts.objectNumberIndex(generic);
+    if (g == 0) return 0;
+    return lazyMemberAt(c, ref, g, lazySlotNumberIndex(c, generic));
+}
+
 /// A materialized generic instantiation carries an origin tag (see `origin`)
 /// only when it lands on a structural shape whose identity the reflexive /
 /// equivalence fast-path can exploit: an object, a function, or an

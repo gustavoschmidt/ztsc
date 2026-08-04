@@ -1775,9 +1775,46 @@ pub fn fixTypeArgs(c: *Checker, sym: SymbolId, args: []const TypeId, tok: TokenI
     return out;
 }
 
+/// The key set of one object member table — the names it stores, plus the
+/// domains its index signatures open up. Reads nothing but names, flags and
+/// index-signature presence, all three of which `instantiateId` carries
+/// through a substitution unchanged; that is what lets `keyofType` answer for
+/// a generic reference off the table the substitution would have been applied
+/// to.
+fn keyofObjectTable(c: *Checker, r: TypeId) Error!TypeId {
+    var parts: std.ArrayList(TypeId) = .empty;
+    defer parts.deinit(c.scratch());
+    for (0..c.ts.objectPropCount(r)) |i| {
+        const p = c.ts.objectProp(r, @intCast(i));
+        // A `private`/`protected` class member is not a key. tsc's
+        // `getLiteralTypeFromProperty` answers `never` for one, which is what
+        // keeps `Pick<C, keyof C>` — and every mapped type over a class — to
+        // the public surface. immich's test mocks are built that way
+        // (`RepositoryInterface<T> = Pick<T, keyof T>` over repositories whose
+        // `constructor(private db: …)` parameter property would otherwise be a
+        // required key of every mock).
+        if (p.nonPublic()) continue;
+        try parts.append(c.scratch(), try c.ts.makeStringLiteral(p.name, false));
+    }
+    if (c.ts.objectStringIndex(r) != 0) {
+        try parts.append(c.scratch(), types.string_type);
+        try parts.append(c.scratch(), types.number_type);
+    }
+    if (c.ts.objectNumberIndex(r) != 0) try parts.append(c.scratch(), types.number_type);
+    return c.ts.makeUnion(c.scratch(), parts.items);
+}
+
 /// keyof T for the resolved structural type (object-ish only; the v0.0.1
 /// subset has non-generic keys).
 pub fn keyofType(c: *Checker, t: TypeId) Error!TypeId {
+    // `keyof` reads member NAMES and the `private`/`protected` flag, and both
+    // survive instantiation untouched — so an interface/class reference
+    // answers off its generic table without substituting a single member (see
+    // `lazyShapeOf`). This was by a wide margin the checker's largest
+    // materialization site: a mapped type over a generic repository interface
+    // expanded that interface's whole table per argument list only to read the
+    // names back out of it.
+    if (try c.lazyShapeOf(t)) |generic| return keyofObjectTable(c, generic);
     const r = try c.resolveStructural(t);
     switch (c.ts.kind(r)) {
         .err => {
@@ -1795,29 +1832,7 @@ pub fn keyofType(c: *Checker, t: TypeId) Error!TypeId {
             return c.makeUnion2(types.string_type, c.makeUnion2(types.number_type, types.symbol_type) catch unreachable);
         },
         .any => return c.makeUnion2(types.string_type, c.makeUnion2(types.number_type, types.symbol_type) catch unreachable),
-        .object => {
-            var parts: std.ArrayList(TypeId) = .empty;
-            defer parts.deinit(c.scratch());
-            for (0..c.ts.objectPropCount(r)) |i| {
-                const p = c.ts.objectProp(r, @intCast(i));
-                // A `private`/`protected` class member is not a key. tsc's
-                // `getLiteralTypeFromProperty` answers `never` for one, which
-                // is what keeps `Pick<C, keyof C>` — and every mapped type
-                // over a class — to the public surface. immich's test mocks
-                // are built that way (`RepositoryInterface<T> = Pick<T, keyof
-                // T>` over repositories whose `constructor(private db: …)`
-                // parameter property would otherwise be a required key of
-                // every mock).
-                if (p.nonPublic()) continue;
-                try parts.append(c.scratch(), try c.ts.makeStringLiteral(p.name, false));
-            }
-            if (c.ts.objectStringIndex(r) != 0) {
-                try parts.append(c.scratch(), types.string_type);
-                try parts.append(c.scratch(), types.number_type);
-            }
-            if (c.ts.objectNumberIndex(r) != 0) try parts.append(c.scratch(), types.number_type);
-            return c.ts.makeUnion(c.scratch(), parts.items);
-        },
+        .object => return keyofObjectTable(c, r),
         .array, .tuple => return types.number_type, // approximation (no lib members)
         // `keyof typeof N` for a namespace or class value. `.class_value`
         // is a nominal shortcut carrying no properties of its own, so it

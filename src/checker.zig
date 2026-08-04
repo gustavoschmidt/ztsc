@@ -72,6 +72,7 @@ const parser = @import("frontend/parser.zig");
 const ZeroPagedArray = @import("zeropage.zig").ZeroPagedArray;
 pub const BumpArena = @import("checker/bump.zig").BumpArena;
 pub const prof_zig = @import("checker/prof.zig");
+pub const lazy_zig = @import("checker/instantiate.zig");
 
 const Ast = ast.Ast;
 const Node = ast.Node;
@@ -592,6 +593,7 @@ pub const map_containers = [_][]const u8{
     "pending_type_args",        "pending_type_args_pool", "pending_type_args_seen",
     "tp_constrained_cache",     "nominal_bases",          "nominal_base_pool",
     "keyof_mapped_active",      "ctp_syms_seen",          "weak_types",
+    "lazy_member",              "lazy_map",
 };
 
 /// Where one symbol's declared heritage lives in `Checker.nominal_base_pool`.
@@ -1290,6 +1292,28 @@ pub const Checker = struct {
     /// runs on every relation frame with an object-ish target, and answering
     /// it means resolving the target's members, so the answer is kept.
     weak_types: std.AutoHashMapUnmanaged(TypeId, u8) = .empty,
+    /// **Symbols eagerly, types lazily** (tsc's `createInstantiatedSymbolTable`
+    /// / `getTypeOfSymbol` split) — see `lazyTableOf`.
+    ///
+    /// `(ref << 32) | slot` -> the substituted type of one member of `ref`'s
+    /// member table, where `slot` indexes the GENERIC table's properties (and
+    /// the two slots past its end are the string / number index signatures).
+    /// A member is materialized the first time some consumer asks for that
+    /// member's TYPE — reading its NAME, optionality or readonly-ness costs
+    /// nothing, because `instantiateId`'s `.object` arm carries all three
+    /// through unchanged and substitutes only `Prop.ty`.
+    ///
+    /// Never holds a type computed while `inst_limit_tripped`: a truncated
+    /// substitution is an artifact of the budget epoch that produced it, and
+    /// publishing one would answer every later reader with it (the rule
+    /// `eraseParamsOf` and `inst_cache` already follow).
+    lazy_member: std.AutoHashMapUnmanaged(u64, TypeId) = .empty,
+    /// `ref` -> the type-parameter substitution its member table is read
+    /// under, interned on the checker arena. Built once per reference rather
+    /// than once per member: `buildInstMap` re-walks every declaration block's
+    /// type-parameter list, which at 200 members would cost more than the
+    /// substitutions it feeds.
+    lazy_map: std.AutoHashMapUnmanaged(TypeId, []@import("checker/enums.zig").TpMap) = .empty,
     /// Occupancy of the two stacks above, bucketed by the low bits of the
     /// symbol (`rel_id_bucket`). A bucket below `max_relation_identity_repeats`
     /// cannot hold that many occurrences of ANY symbol, so the scan the guard
@@ -2736,6 +2760,14 @@ pub const Checker = struct {
     pub const resolveStructural = instantiate_zig.resolveStructural;
     pub const expandRef = instantiate_zig.expandRef;
     pub const refExpandsToObject = instantiate_zig.refExpandsToObject;
+    pub const lazyTableOf = instantiate_zig.lazyTableOf;
+    pub const lazyShapeOf = instantiate_zig.lazyShapeOf;
+    pub const lazyRefMap = instantiate_zig.lazyRefMap;
+    pub const lazyMemberAt = instantiate_zig.lazyMemberAt;
+    pub const lazyPropAt = instantiate_zig.lazyPropAt;
+    pub const lazyPropNamed = instantiate_zig.lazyPropNamed;
+    pub const lazyStringIndex = instantiate_zig.lazyStringIndex;
+    pub const lazyNumberIndex = instantiate_zig.lazyNumberIndex;
     pub const originTaggable = instantiate_zig.originTaggable;
     pub const driveShrinkingAlias = instantiate_zig.driveShrinkingAlias;
     pub const refArgsSettled = instantiate_zig.refArgsSettled;

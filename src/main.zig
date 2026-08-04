@@ -111,6 +111,9 @@ const usage =
     \\                         pair with --checkers=1
     \\  --inst-focus=ID        restrict that profile's per-type histogram to
     \\                         one substitution root (a #id from its report)
+    \\  --eager-members        materialize every interface/class member table
+    \\                         whole, instead of member-by-member on demand
+    \\                         (bisect leg / oracle)
     \\  -h, --help             print this help and exit
     \\  --version              print version and exit
     \\
@@ -184,6 +187,12 @@ const Cli = struct {
     /// one top-level substitution root (see `prof.focus_root`). Implies
     /// `--inst-profile`.
     inst_focus: u32 = 0,
+    /// `--eager-members`: materialize an interface/class reference's whole
+    /// member table at every consumer, the way the checker did before the lazy
+    /// member route landed (see `lazyTableOf`). A bisect leg — any diagnostic
+    /// movement the route causes is visible as a key-set diff against this
+    /// flag in the same binary.
+    eager_members: bool = false,
     /// null = auto (pretty iff stderr is a TTY).
     pretty: ?bool = null,
     project: ?[]const u8 = null,
@@ -538,6 +547,7 @@ pub fn main(init: std.process.Init) !void {
     // Write-once, before any checker thread exists (see `prof.profile_on`).
     checker.prof_zig.profile_on = cli.inst_profile;
     checker.prof_zig.focus_root = cli.inst_focus;
+    checker.lazy_zig.lazy_members_on = !cli.eager_members;
 
     if (cli.help) {
         try out.print("{s}", .{usage});
@@ -1871,6 +1881,8 @@ fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8, bad_arg: *[]c
             cli.census = true;
         } else if (std.mem.eql(u8, arg, "--inst-profile")) {
             cli.inst_profile = true;
+        } else if (std.mem.eql(u8, arg, "--eager-members")) {
+            cli.eager_members = true;
         } else if (std.mem.startsWith(u8, arg, "--inst-focus=")) {
             cli.inst_focus = std.fmt.parseInt(u32, arg["--inst-focus=".len..], 10) catch
                 return error.BadFlagValue;

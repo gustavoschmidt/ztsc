@@ -1062,6 +1062,28 @@ fn computeIsWeakType(c: *Checker, t0: TypeId) Error!bool {
     // Only a materialized object shape can be weak; everything else
     // (primitives, unions, type parameters, deferred operators) is not.
     if (k0 != .object and k0 != .ref) return false;
+    // Weakness is a question about member NAMES, FLAGS and COUNTS, and
+    // `instantiateId`'s `.object` arm carries all three through unchanged —
+    // so an interface/class reference answers it off its generic table
+    // without substituting a single member (see `lazyTableOf`). This is the
+    // hottest forcing site in the checker: `weakTypeMismatch` runs on every
+    // relation frame with an object-ish target, ahead of the memo and the
+    // structural walk, and it used to materialize that target's whole table
+    // before the walk had asked for anything.
+    if (try c.lazyShapeOf(t0)) |generic| {
+        // A generic that carries signatures stays eager: `instantiateId` may
+        // drop a higher-order one, so a non-zero signature count is not
+        // evidence the instantiation has any.
+        if (c.ts.objectCallSigCount(generic) == 0 and c.ts.objectConstructSigCount(generic) == 0) {
+            const gn = c.ts.objectPropCount(generic);
+            if (gn == 0) return false;
+            if (c.ts.objectStringIndex(generic) != 0 or c.ts.objectNumberIndex(generic) != 0) return false;
+            for (0..gn) |i| {
+                if (!c.ts.objectProp(generic, @intCast(i)).optional()) return false;
+            }
+            return true;
+        }
+    }
     const t = try c.resolveStructural(t0);
     if (c.ts.kind(t) == .intersection) return c.isWeakType(t);
     if (c.ts.kind(t) != .object) return false;
@@ -1117,6 +1139,17 @@ pub fn unionHasCallableMember(c: *Checker, s: TypeId, sk: types.Kind, t: TypeId)
 pub fn isCallableSource(c: *Checker, s: TypeId, sk: types.Kind) Error!bool {
     if (sk == .function or sk == .overloads) return true;
     if (sk != .object and sk != .ref) return false;
+    // A reference whose generic table has properties of its own, or no call
+    // signature at all, cannot be a bare callable however it is instantiated:
+    // property counts carry through a substitution unchanged, and a table with
+    // no signature to instantiate gains none. Both are outright NOs read off
+    // the generic (see `lazyShapeOf`) — the one shape that has to materialize
+    // is a property-free table that does carry signatures, since
+    // `instantiateId` may drop a higher-order one.
+    if (try c.lazyShapeOf(s)) |generic| {
+        if (c.ts.objectPropCount(generic) != 0) return false;
+        if (c.ts.objectCallSigCount(generic) == 0) return false;
+    }
     const rs = try c.resolveStructural(s);
     if (c.ts.kind(rs) != .object) return false;
     return c.ts.objectCallSigCount(rs) != 0 and c.ts.objectPropCount(rs) == 0;
@@ -2075,6 +2108,11 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
     // key, and consulting the memo would read our own in-progress mark and
     // answer "related" without expanding anything. See `relate`.
     if (sk == .ref or tk == .ref) {
+        // Lazy member route (see `lazyRefRelate`): decide the pair by reading
+        // member names and flags off the generic tables, substituting only the
+        // members the comparison actually reaches. Answers null for every
+        // shape it does not model, which then takes the eager path below.
+        if (try lazyRefRelate(c, s, t, sk, tk)) |r| return r;
         const rs = try c.resolveStructural(s);
         const rt = try c.resolveStructural(t);
         if (rs == s and rt == t) return false;
@@ -2147,6 +2185,207 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
 
 /// The key set a mapped type iterates: `keyof <source>` for a homomorphic
 /// map (`[P in keyof T]`), the written constraint otherwise.
+/// One side of the structural walk, read WITHOUT materializing it when it can
+/// be: `table` is the member table to read names, flags and counts out of, and
+/// `ref` is the reference whose substitution a member's TYPE is computed under
+/// (0 when `table` is already the materialized object). See `lazyTableOf`.
+pub const ObjSide = struct {
+    table: TypeId,
+    ref: TypeId = 0,
+
+    fn propCount(v: ObjSide, c: *const Checker) u32 {
+        return c.ts.objectPropCount(v.table);
+    }
+
+    /// The slot of `name` in this side's table, or null — a binary search over
+    /// stored (atom-sorted) names, substituting nothing.
+    fn slotOf(v: ObjSide, c: *const Checker, name: Atom) ?u32 {
+        var lo: u32 = 0;
+        var hi: u32 = c.ts.objectPropCount(v.table);
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const p = c.ts.objectProp(v.table, mid);
+            if (p.name == name) return mid;
+            if (p.name < name) lo = mid + 1 else hi = mid;
+        }
+        return null;
+    }
+
+    fn flagsAt(v: ObjSide, c: *const Checker, i: u32) u32 {
+        return c.ts.objectProp(v.table, i).flags;
+    }
+
+    fn nameAt(v: ObjSide, c: *const Checker, i: u32) Atom {
+        return c.ts.objectProp(v.table, i).name;
+    }
+
+    /// The member's TYPE — the one operation that can cost a substitution.
+    fn typeAt(v: ObjSide, c: *Checker, i: u32) Error!TypeId {
+        const g = c.ts.objectProp(v.table, i).ty;
+        if (v.ref == 0) return g;
+        return c.lazyMemberAt(v.ref, g, i);
+    }
+
+    fn stringIndex(v: ObjSide, c: *Checker) Error!TypeId {
+        if (v.ref == 0) return c.ts.objectStringIndex(v.table);
+        return c.lazyStringIndex(v.ref, v.table);
+    }
+
+    fn numberIndex(v: ObjSide, c: *Checker) Error!TypeId {
+        if (v.ref == 0) return c.ts.objectNumberIndex(v.table);
+        return c.lazyNumberIndex(v.ref, v.table);
+    }
+
+    /// Presence of an index signature, readable off the generic:
+    /// `instantiateId` maps a non-zero index type to a non-zero one.
+    fn hasStringIndex(v: ObjSide, c: *const Checker) bool {
+        return c.ts.objectStringIndex(v.table) != 0;
+    }
+
+    fn hasNumberIndex(v: ObjSide, c: *const Checker) bool {
+        return c.ts.objectNumberIndex(v.table) != 0;
+    }
+
+    fn hasImpliedIndex(v: ObjSide, c: *const Checker) bool {
+        return c.ts.objectHasImpliedIndex(v.table);
+    }
+};
+
+/// The structural relation between two object sides, at most one member of
+/// each substituted per property compared — tsc's `propertiesRelatedTo`
+/// calling `getTypeOfSymbol` on the instantiated member symbols rather than
+/// resolving the whole instantiated table first.
+///
+/// Answers null when the pair is not one this route may decide, in which case
+/// the caller expands both sides and takes the eager path exactly as before.
+///
+/// What makes it faithful is that everything read before a member type is
+/// materialized — the target's property NAMES and OPTIONALITY, the source's
+/// property names, the presence of index signatures, the object flags — is
+/// carried through `instantiateId`'s `.object` arm unchanged. The short
+/// circuits are therefore the same short circuits the eager walk takes; they
+/// just take them before paying for the two hundred members the answer never
+/// depended on. A relation that fails on a builder's first property now
+/// substitutes nothing at all.
+fn lazyRefRelate(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: types.Kind) Error!?bool {
+    if (tk != .ref) return null;
+    const t_table = (try c.lazyTableOf(t)) orelse return null;
+    const tsym = c.ts.refSymbol(t);
+    var sv: ObjSide = undefined;
+    switch (sk) {
+        .ref => {
+            // The SAME generic on both sides is the variance question and the
+            // origin-equivalence fast path; both live on the eager frame the
+            // `.ref` arm delegates to, and neither is a structural walk.
+            if (c.ts.refSymbol(s) == tsym) return null;
+            const s_table = (try c.lazyTableOf(s)) orelse return null;
+            sv = .{ .table = s_table, .ref = s };
+        },
+        .object => {
+            // An already-materialized source saves nothing on its own side but
+            // keeps the target lazy. A callable one inherits the global
+            // `Function` members through `propOfTypeEx`, which this loop does
+            // not model, and a fresh literal is the excess-property check's
+            // business — both stay eager.
+            if (c.ts.objectCallSigCount(s) != 0 or c.ts.objectConstructSigCount(s) != 0) return null;
+            if (c.ts.objectIsFresh(s)) return null;
+            if (c.refFacetOf(s, sk)) |os| {
+                if (c.ts.refSymbol(os) == tsym) return null;
+            }
+            sv = .{ .table = s };
+        },
+        else => return null,
+    }
+    const tv: ObjSide = .{ .table = t_table, .ref = t };
+    // A `this` type on either side is re-related through its apparent instance
+    // by the frame this route replaces (`relate`'s `substThis` step), which
+    // rewrites member types wholesale. Leave those pairs eager.
+    if (c.has_this_types) {
+        if ((try c.containsThisType(s)) or (try c.containsThisType(t)) or
+            (try c.containsThisType(sv.table)) or (try c.containsThisType(tv.table))) return null;
+    }
+    // The frame this replaces pushed the same two references onto the
+    // growing-instantiation stack a second time (its own `refFacetOf` of each
+    // materialization is the very reference this frame holds). Push them here
+    // too, so the guard trips at the same depth it does today.
+    if (c.rel_id_depth >= max_relation_depth) {
+        c.rel_guard_tripped = true;
+        return true;
+    }
+    const ssrc = if (sv.ref != 0) sv.ref else (c.refFacetOf(s, sk) orelse 0);
+    if (ssrc != 0) {
+        c.rel_src_ids[c.rel_id_depth] = .{ .sym = c.ts.refSymbol(ssrc), .ref = ssrc };
+        c.rel_tgt_ids[c.rel_id_depth] = .{ .sym = tsym, .ref = t };
+        c.rel_src_buckets[relIdBucket(c.rel_src_ids[c.rel_id_depth].sym)] += 1;
+        c.rel_tgt_buckets[relIdBucket(tsym)] += 1;
+        c.rel_id_depth += 1;
+    }
+    defer if (ssrc != 0) {
+        c.rel_id_depth -= 1;
+        c.rel_src_buckets[relIdBucket(c.rel_src_ids[c.rel_id_depth].sym)] -= 1;
+        c.rel_tgt_buckets[relIdBucket(c.rel_tgt_ids[c.rel_id_depth].sym)] -= 1;
+    };
+    if (ssrc != 0 and (c.relIdDeeplyNested(true) or c.relIdDeeplyNested(false))) {
+        c.rel_guard_tripped = true;
+        return true;
+    }
+    return try lazyStructural(c, sv, tv);
+}
+
+fn lazyStructural(c: *Checker, sv: ObjSide, tv: ObjSide) Error!bool {
+    const n = tv.propCount(c);
+    // `{}` accepts anything non-nullish, and both sides here are object
+    // shapes. A target with no members and no index signature is that case
+    // (neither side can carry signatures — `lazyTableOf` excludes them).
+    if (n == 0 and !tv.hasStringIndex(c) and !tv.hasNumberIndex(c)) return true;
+    for (0..n) |i| {
+        const ti: u32 = @intCast(i);
+        const t_opt = tv.flagsAt(c, ti) & types.prop_flag_optional != 0;
+        const si = sv.slotOf(c, tv.nameAt(c, ti)) orelse {
+            // The source has no member of that name — the eager walk's
+            // `propOfTypeEx` miss, reached without substituting anything on
+            // either side. This is the short circuit the whole conversion is
+            // for: the answer never depended on the other members' types.
+            if (t_opt) continue;
+            return false;
+        };
+        const s_opt = sv.flagsAt(c, si) & types.prop_flag_optional != 0;
+        if (s_opt and !t_opt) return false;
+        var st = try sv.typeAt(c, si);
+        if (s_opt) st = try c.makeUnion2(st, types.undefined_type);
+        var tt = try tv.typeAt(c, ti);
+        if (t_opt) tt = try c.makeUnion2(tt, types.undefined_type);
+        if (!try c.isAssignable(st, tt)) return false;
+    }
+    if (tv.hasStringIndex(c)) {
+        const sidx = try tv.stringIndex(c);
+        const sidx_any = c.ts.kind(try c.resolveStructural(sidx)) == .any;
+        if (!sidx_any) {
+            if (sv.hasStringIndex(c)) {
+                if (!try c.isAssignable(try sv.stringIndex(c), sidx)) return false;
+            } else if (sv.hasImpliedIndex(c)) {
+                for (0..sv.propCount(c)) |i| {
+                    if (!try c.isAssignable(try sv.typeAt(c, @intCast(i)), sidx)) return false;
+                }
+            } else return false; // interface / class instance, no index sig
+        }
+    }
+    if (tv.hasNumberIndex(c)) {
+        const nidx = try tv.numberIndex(c);
+        if (sv.hasNumberIndex(c)) {
+            if (!try c.isAssignable(try sv.numberIndex(c), nidx)) return false;
+        } else if (sv.hasStringIndex(c)) {
+            if (!try c.isAssignable(try sv.stringIndex(c), nidx)) return false;
+        } else if (sv.hasImpliedIndex(c)) {
+            for (0..sv.propCount(c)) |i| {
+                if (!isNumericPropName(c.atomText(sv.nameAt(c, @intCast(i))))) continue;
+                if (!try c.isAssignable(try sv.typeAt(c, @intCast(i)), nidx)) return false;
+            }
+        } else return false;
+    }
+    return true;
+}
+
 pub fn mappedKeySet(c: *Checker, m: TypeId) Error!TypeId {
     if (c.ts.mappedHomomorphic(m)) return c.keyofType(c.ts.mappedSource(m));
     return c.ts.mappedConstraint(m);
@@ -3278,7 +3517,18 @@ pub fn signatureAssignableModeInner(c: *Checker, s: TypeId, t: TypeId, mode: Sig
 /// predicate disqualifies it (tsc excludes predicate signatures from the
 /// callback relation).
 pub fn callbackSigOf(c: *Checker, t: TypeId) Error!?TypeId {
-    const r = try c.resolveStructural(try c.stripNullish(t));
+    const stripped = try c.stripNullish(t);
+    // Three of the four disqualifications are readable off the generic table
+    // (see `lazyShapeOf`): a table with properties, with an index signature,
+    // or with no call signature at all keeps every one of those through a
+    // substitution. Only the "exactly one call signature" test has to
+    // materialize, because `instantiateId` may drop a higher-order signature.
+    if (try c.lazyShapeOf(stripped)) |generic| {
+        if (c.ts.objectPropCount(generic) != 0) return null;
+        if (c.ts.objectStringIndex(generic) != 0 or c.ts.objectNumberIndex(generic) != 0) return null;
+        if (c.ts.objectCallSigCount(generic) == 0) return null;
+    }
+    const r = try c.resolveStructural(stripped);
     switch (c.ts.kind(r)) {
         .function => return if (c.ts.fnHasPredicate(r)) null else r,
         .object => {

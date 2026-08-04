@@ -171,6 +171,57 @@
 //!   re-walks the branches once per union constituent with `map_id = null`).
 //!   A plausible-looking suspect for the `with<N, E>` outlier, and the
 //!   counter in the report header ruled it out: 32 k of 5.23 M visits.
+//!
+//! ## What LANDED: the lazy member layer (`lazyShapeOf` / `lazyTableOf`)
+//!
+//! The negatives above were all measured on the kysely mini-repro, where
+//! `expandRef` is 52% of the demand and the forcing sites are the relation and
+//! inference walks. Profiled on the WHOLE immich server package the ranking is
+//! different, and the answer was in the part of the split the earlier attempts
+//! never reached — the consumers that materialize a member table and then read
+//! nothing off it but NAMES:
+//!
+//!     keyofType           8.08 M visits / 184 calls
+//!     propertyTypeOf      3.36 M / 1,962
+//!     expandRef itself    2.47 M / 8,324
+//!     isCallableSource    1.57 M / 1,324
+//!     callbackSigOf       1.12 M / 238
+//!
+//! `instantiateId`'s `.object` arm substitutes `Prop.ty` and copies
+//! `Prop.name` and `Prop.flags` through untouched, so a member table's names,
+//! optionality, readonly-ness, `private`/`protected`-ness, property COUNT and
+//! index-signature PRESENCE are all functions of the generic table alone.
+//! Every question above is answerable off it: `keyof` enumerates names,
+//! `isWeakType` asks whether every property is optional, `isCallableSource`
+//! and `callbackSigOf` ask whether the shape has properties. Converting those
+//! five took immich 461 -> 458 excess with total node visits 11.99 M ->
+//! 10.55 M (-12%), budget trips 12,501 -> 11,095, user CPU 12.4 s -> 11.0 s
+//! and peak RSS 1.83 -> 1.81 GB, with excalidraw still CONVERGED at 17/0/0 and
+//! parity 8/8 at 0/0.
+//!
+//! Signature counts are the one thing that does NOT carry through
+//! (`higherOrderSigEligible` drops a higher-order signature the substitution
+//! cannot rewrite), so a table that has any stays on the eager path.
+//!
+//! **The load-bearing rule, and it is not obvious: the lazy route may READ a
+//! generic member table but must never BUILD one.** Materializing a table is
+//! not a pure function of the symbol — it runs the declaration walk under
+//! `enterSymFile`, folds `extends` bases, resolves every member's annotation
+//! and can re-enter the very reference being asked about — and `expandRef`
+//! marks `expansions[ref]` in progress before it starts, so a table built from
+//! anywhere else is built outside that mark. Hoisting the construction into
+//! `keyofType` alone (nothing else changed, the key set it computed was
+//! byte-identical every time) took the excalidraw sweep from 17 diagnostics to
+//! 279. Reading a table an earlier `expandRef` already built has no such
+//! effect, and it is the case that pays: a generic interface is materialized
+//! once and read thousands of times.
+//!
+//! Still eager, in demand order, and the next places to look:
+//! `propertyTypeOf` (3.45 M — the member-access route, whose laziness is the
+//! measured negative above), `expandRef` itself (2.17 M), `isAssignableInner`
+//! (931 k + 441 k + 168 k), `eraseParamsOf` (604 k), `inferFromExtendsInner`
+//! (490 k + 252 k + 164 k), `typeParamAtTopLevel` (483 k), `unify` (456 k +
+//! 397 k), `isArrayShaped` (333 k).
 
 const std = @import("std");
 const types = @import("../types.zig");
