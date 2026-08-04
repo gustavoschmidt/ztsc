@@ -1228,7 +1228,14 @@ pub fn checkIdentifier(c: *Checker, node: Node) Error!TypeId {
                     try c.checkUseBeforeAssigned(sym, node, tok, declared);
                 }
             }
-            // Flow narrowing.
+            // Flow narrowing. A binding destructured out of a discriminated
+            // union has no flow of its own that a guard on a SIBLING binding
+            // touches, so its parent union is narrowed as a pseudo-reference
+            // first (tsc's `getNarrowedTypeOfSymbol`); the ordinary walk still
+            // runs on top of whatever that yields.
+            if (try c.narrowedPatternBinding(node, sym)) |t| {
+                return c.flowTypeOfReference(node, sym, t);
+            }
             return c.flowTypeOfReference(node, sym, declared);
         },
         .wrong_space => |sym| {

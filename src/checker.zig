@@ -638,7 +638,8 @@ pub const map_containers = [_][]const u8{
     "pending_type_args",        "pending_type_args_pool", "pending_type_args_seen",
     "tp_constrained_cache",     "nominal_bases",          "nominal_base_pool",
     "keyof_mapped_active",      "ctp_syms_seen",          "weak_types",
-    "lazy_member",              "lazy_map",
+    "lazy_member",              "lazy_map",               "pattern_root_decls",
+    "pattern_root_ids",         "pattern_narrow_busy",
 };
 
 /// Where one symbol's declared heritage lives in `Checker.nominal_base_pool`.
@@ -986,6 +987,17 @@ pub const Checker = struct {
     /// The interning side of `deep_path_list` (path -> 1-based id, 0 = the
     /// table was full when this path was first seen, i.e. untracked).
     deep_path_ids: std.AutoHashMapUnmanaged(DeepPath, u16) = .empty,
+    /// Declaration nodes (`file << 32 | node`) behind the object-binding-
+    /// pattern pseudo-references of `narrowedPatternBinding`, indexed by
+    /// `sym - pattern_root_base`. See `flow.zig`'s `pattern_root_base`.
+    pattern_root_decls: std.ArrayListUnmanaged(u64) = .empty,
+    /// The interning side of `pattern_root_decls` (decl -> index).
+    pattern_root_ids: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    /// Re-entrancy guard for `narrowedPatternBinding` (tsc's
+    /// `NodeCheckFlags.InCheckIdentifier`): the declarations whose pattern is
+    /// having its narrowed parent type computed right now. Narrowing reads the
+    /// guard expressions, which can name the pattern's own bindings.
+    pattern_narrow_busy: std.AutoHashMapUnmanaged(u64, void) = .empty,
     /// (flow << 32 | symbol) -> definitely-assigned (2 computing, 0/1 result).
     da_cache: std.AutoHashMapUnmanaged(u64, u8) = .empty,
     /// Program-global flow id -> can control reach it (0 computing, 1 no,
@@ -2047,7 +2059,8 @@ pub const Checker = struct {
     /// a `for (const x of xs)` binding is not in the reassignment scan yet is
     /// effectively assigned by every iteration.
     pub fn symDeclaredInForHead(c: *const Checker, sym: SymbolId) bool {
-        if (sym == this_flow_root) return false; // `this` is never a loop binding
+        // Neither `this` nor a binding-pattern pseudo-root is a loop binding.
+        if (flow_zig.isPseudoRoot(sym)) return false;
         const s = c.reprSym(sym);
         const f = c.symFile(s);
         const b = c.prog.files[f].bind;
@@ -3325,6 +3338,7 @@ pub const Checker = struct {
     pub const isNarrowable = flow_zig.isNarrowable;
     pub const flowTypeOfReference = flow_zig.flowTypeOfReference;
     pub const flowTypeOfKey = flow_zig.flowTypeOfKey;
+    pub const narrowedPatternBinding = flow_zig.narrowedPatternBinding;
     pub const flowReachable = flow_zig.flowReachable;
     pub const pushChainGuards = flow_zig.pushChainGuards;
     pub const applyChainGuards = flow_zig.applyChainGuards;

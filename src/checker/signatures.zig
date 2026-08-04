@@ -1410,7 +1410,7 @@ pub fn ambientNamespaceType(c: *Checker, idx: u32) Error!TypeId {
 /// (a cross-file reference is never flow-narrowed anyway) and to a single
 /// declarator binding a plain identifier.
 pub fn isEvolvingVar(c: *Checker, sym: SymbolId) bool {
-    if (sym == this_flow_root or sym == binder.no_symbol) return false;
+    if (@import("flow.zig").isPseudoRoot(sym) or sym == binder.no_symbol) return false;
     const f = c.symFlags(sym);
     if (!(f.let_decl or f.var_decl)) return false;
     if (f.const_decl or f.param or f.catch_param) return false;

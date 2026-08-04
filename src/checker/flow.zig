@@ -188,6 +188,55 @@ pub const DeepPath = struct {
 /// Sentinel `RefKey.sym` for `this`-rooted property paths.
 pub const this_flow_root: SymbolId = std.math.maxInt(SymbolId);
 
+/// Base of the sentinel `RefKey.sym` range for OBJECT-BINDING-PATTERN
+/// pseudo-references — tsc's `getNarrowedTypeOfSymbol`, which narrows the
+/// destructured *parent* (`function f({ kind, data }: A | B)`) by a guard on
+/// one binding and then re-projects the requested binding out of the narrowed
+/// union. tsc uses the pattern node itself as the reference; ztsc's `RefKey`
+/// is rooted at a `SymbolId`, so the declaration is interned into
+/// `pattern_root_decls` and its index rides in this reserved range.
+///
+/// The range sits a megabyte below `this_flow_root`, i.e. above every real,
+/// merged and fresh-type-param id (`fresh_tp_base` is the total symbol count
+/// and grows upward from it); `patternRoot` refuses to mint when the two
+/// spaces would meet, so the encoding can never alias a real symbol. Every
+/// `key.sym` consumer that would dereference a real symbol tests
+/// `isPatternRoot` first, exactly as it already tests `this_flow_root`.
+pub const pattern_root_base: SymbolId = std.math.maxInt(SymbolId) - (1 << 20);
+
+pub inline fn isPatternRoot(sym: SymbolId) bool {
+    return sym >= pattern_root_base and sym != this_flow_root;
+}
+
+/// Is this a sentinel root (`this`, or a binding pattern) rather than a real
+/// symbol? Guards every `symFlags`/`symFile`/`declsOf` read in a flow walk.
+pub inline fn isPseudoRoot(sym: SymbolId) bool {
+    return sym >= pattern_root_base;
+}
+
+/// Intern `decl` (a parameter or declarator whose name is an object binding
+/// pattern) as a pseudo-reference root. Null when the sentinel range is
+/// exhausted or would collide with the fresh-type-param space — the reference
+/// is then simply not tracked (sound under-narrowing).
+pub fn patternRoot(c: *Checker, decl: Node) Error!?SymbolId {
+    if (c.fresh_tp_base != 0 and c.fresh_tp_base >= pattern_root_base) return null;
+    const gop = try c.pattern_root_ids.getOrPut(c.cm(), c.nodeKey(decl));
+    if (!gop.found_existing) {
+        if (c.pattern_root_decls.items.len >= this_flow_root - pattern_root_base) {
+            _ = c.pattern_root_ids.remove(c.nodeKey(decl));
+            return null;
+        }
+        try c.pattern_root_decls.append(c.cm(), c.nodeKey(decl));
+        gop.value_ptr.* = @intCast(c.pattern_root_decls.items.len - 1);
+    }
+    return pattern_root_base + gop.value_ptr.*;
+}
+
+/// The `(file, node)` declaration a pattern pseudo-root stands for.
+pub fn patternRootDecl(c: *const Checker, sym: SymbolId) u64 {
+    return c.pattern_root_decls.items[sym - pattern_root_base];
+}
+
 /// A flow-cache query key, packed into one u64:
 ///   high 32 = the program-global flow id (`flow_base[file] + flow`),
 ///   low  32 = the dense `ref_keys` index of `(reference, declared)`.
@@ -451,6 +500,137 @@ pub fn flowTypeOfReference(c: *Checker, node: Node, sym: SymbolId, declared: Typ
     return c.flowTypeOfKey(node, .{ .sym = sym }, declared);
 }
 
+/// The object binding pattern a declaration binds through, or null.
+fn objectPatternOf(c: *Checker, decl: Node) ?Node {
+    const pat: Node = switch (c.nodeTag(decl)) {
+        .param, .param_full, .declarator, .declarator_init, .declarator_full => c.tree.nodeData(decl).lhs,
+        else => return null,
+    };
+    if (pat == null_node or c.nodeTag(pat) != .object_pattern) return null;
+    return pat;
+}
+
+/// The ANNOTATED type of a destructuring declaration's whole value —
+/// tsc's `getTypeForBindingElementParent`, restricted to the annotated forms.
+/// An unannotated parameter's type is contextual and an unannotated
+/// declarator's comes from an initializer checked in another scope; leaving
+/// both out keeps this a pure function of the declaration (so `--checkers=N`
+/// partitions cannot disagree about it) at the cost of narrowing fewer
+/// destructurings than tsc — sound under-narrowing either way.
+fn patternParentType(c: *Checker, decl: Node) Error!TypeId {
+    const d = c.tree.nodeData(decl);
+    const ann: Node = switch (c.nodeTag(decl)) {
+        // `.param` carries its (optional) annotation directly in `rhs`;
+        // `.param_full` moves it into the side table with flags/initializer.
+        .param => d.rhs,
+        .param_full => c.tree.extraData(ast.ParamFull, d.rhs).type_ann,
+        .declarator_full => c.tree.extraData(ast.DeclaratorFull, d.rhs).type_ann,
+        else => null_node,
+    };
+    if (ann == null_node) return types.no_type;
+    return c.typeFromTypeNode(ann);
+}
+
+/// The direct `binding_property` of `pat` that binds `name`, if it is one
+/// tsc would let participate: no default (`{ a = 1 }` has an initializer),
+/// no rest element, and a plain identifier target (a nested pattern's own
+/// bindings are reached through their own declaration).
+fn bindingPropertyFor(c: *Checker, pat: Node, name: Atom) Error!?Node {
+    for (c.tree.nodeRange(pat)) |el| {
+        if (el == null_node or c.nodeTag(el) != .binding_property) continue;
+        const ed = c.tree.nodeData(el);
+        if (ed.rhs != 0) continue; // has a default
+        if (ed.lhs == 0) {
+            if ((try c.memberAtom(c.tree.nodeMainToken(el))) == name) return el;
+        } else if (c.nodeTag(ed.lhs) == .identifier) {
+            if ((try c.atomOfToken(c.tree.nodeMainToken(ed.lhs))) == name) return el;
+        }
+    }
+    return null;
+}
+
+/// tsc's `getNarrowedTypeOfSymbol`, binding-element arm.
+///
+/// `function f({ kind, data }: { kind: 'a', data: A } | { kind: 'b', data: B })`
+/// destructures a discriminated union, and TS 4.6 lets a guard on one binding
+/// narrow the others: `switch (kind) { case 'a': data /* A */ }`. Nothing in
+/// the flow graph connects the two — they are separate symbols — so the union
+/// itself is narrowed as a pseudo-reference rooted at the declaration
+/// (`pattern_root_base`), with `discriminantOfRef` teaching the narrowers that
+/// a bare identifier bound by that pattern reads the corresponding property;
+/// the requested binding is then re-projected out of the narrowed parent by
+/// the same `findBindingType` that produced its declared type.
+///
+/// Null when the shape does not qualify or the walk found nothing to narrow,
+/// leaving the caller's declared type untouched.
+pub fn narrowedPatternBinding(c: *Checker, node: Node, sym: SymbolId) Error!?TypeId {
+    if (isPseudoRoot(sym) or c.isFreshTp(sym) or sym == binder.no_symbol) return null;
+    const f = c.symFlags(sym);
+    // tsc: a `const`-like binding only — a parameter with no assignment to it,
+    // or a `const` declarator.
+    if (!(f.param or f.const_decl)) return null;
+    if (c.symFile(sym) != c.cur_file) return null;
+    const decls = c.declsOf(sym);
+    if (decls.len != 1) return null;
+    const decl = decls[0];
+    const pat = objectPatternOf(c, decl) orelse return null;
+    // tsc requires at least two elements: with one there is no sibling
+    // discriminant to narrow by.
+    if (c.tree.nodeRange(pat).len < 2) return null;
+    const name = c.symNameAtom(sym);
+    if ((try bindingPropertyFor(c, pat, name)) == null) return null;
+    try c.ensureReassignScan();
+    if (c.reassigned_syms.contains(sym)) return null;
+
+    const whole = try patternParentType(c, decl);
+    if (whole == types.no_type) return null;
+    const parent = try c.resolveStructural(whole);
+    if (c.ts.kind(parent) != .union_type) return null;
+
+    const busy_key = c.nodeKey(decl);
+    if (c.pattern_narrow_busy.contains(busy_key)) return null;
+    try c.pattern_narrow_busy.put(c.cm(), busy_key, {});
+    defer _ = c.pattern_narrow_busy.remove(busy_key);
+
+    const root = (try patternRoot(c, decl)) orelse return null;
+    const narrowed = try c.flowTypeOfKey(node, .{ .sym = root }, parent);
+    if (narrowed == parent) return null;
+    if (c.ts.kind(narrowed) == .never) return types.never_type;
+    var out: TypeId = types.no_type;
+    if (!try c.findBindingType(pat, name, narrowed, &out, null)) return null;
+    if (out == types.no_type) return null;
+    return out;
+}
+
+/// Is `node` a bare identifier bound by the object pattern behind the
+/// pseudo-root `key`, and if so which property does it read? (tsc's
+/// `getCandidateDiscriminantPropertyAccess`, binding-pattern arm.)
+fn patternDiscriminantTok(c: *Checker, node: Node, key: RefKey) Error!?TokenIndex {
+    if (key.len != 0) return null;
+    if (c.nodeTag(node) != .identifier) return null;
+    const dk = patternRootDecl(c, key.sym);
+    if (dk >> 32 != c.cur_file) return null;
+    const decl: Node = @truncate(dk);
+    const pat = objectPatternOf(c, decl) orelse return null;
+    const a = try c.atomOfToken(c.tree.nodeMainToken(node));
+    const sym = switch (c.resolveSpace(a, c.cur_scope, true)) {
+        .sym => |s| s,
+        else => return null,
+    };
+    // The identifier must resolve to a binding of THIS pattern, and must not
+    // be reassigned (tsc's `isParameterOrMutableLocalVariable && !isSymbolAssigned`).
+    if (isPseudoRoot(sym) or c.isFreshTp(sym)) return null;
+    if (c.symFile(sym) != c.cur_file) return null;
+    const decls = c.declsOf(sym);
+    if (decls.len != 1 or decls[0] != decl) return null;
+    try c.ensureReassignScan();
+    if (c.reassigned_syms.contains(sym)) return null;
+    const el = (try bindingPropertyFor(c, pat, a)) orelse return null;
+    // `binding_property`'s main token is the PROPERTY name in both the
+    // shorthand (`{ kind }`) and the renamed (`{ kind: k }`) form.
+    return c.tree.nodeMainToken(el);
+}
+
 pub fn flowTypeOfKey(c: *Checker, node: Node, key: RefKey, declared: TypeId) Error!TypeId {
     var t = declared;
     if (c.isNarrowable(declared)) {
@@ -712,7 +892,9 @@ pub fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, d
             // Use the declared type instead: there is no valid narrowing at an
             // unreachable definition point.
             if (ante == binder.unreachable_flow) return declared;
-            if (key.len != 0 or key.sym == this_flow_root) return declared;
+            // Property paths, `this` and binding-pattern pseudo-roots never
+            // continue into an enclosing function's flow.
+            if (key.len != 0 or isPseudoRoot(key.sym)) return declared;
             // Only a reference *captured* by this closure may continue into
             // the definition-point flow. A reference to something the
             // closure declares itself (its parameters, its own locals) is
@@ -858,7 +1040,7 @@ pub fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, d
             // reference that was never narrowed before the loop (which would
             // otherwise unmask unrelated latent FPs downstream).
             if (b.flow_tags[flow] == .loop_label and antes.len >= 1 and
-                !c.symDeclaredInForHead(key.sym))
+                !isPatternRoot(key.sym) and !c.symDeclaredInForHead(key.sym))
             {
                 try c.ensureReassignScan();
                 // "Assigned inside *this* loop" is the exact tsc predicate. A
@@ -947,7 +1129,9 @@ pub fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, d
             // all-optional `Init` collapse to `Init` instead of a union
             // whose first constituent lacks the other's properties. Without
             // it every later `v?.someProp` reported TS2339.
-            if (key.len == 0 and c.isEvolvingVar(key.sym)) return c.reduceEvolvingJoin(joined);
+            if (key.len == 0 and !isPseudoRoot(key.sym) and c.isEvolvingVar(key.sym)) {
+                return c.reduceEvolvingJoin(joined);
+            }
             return joined;
         },
     }
@@ -1117,7 +1301,7 @@ pub fn assignNarrows(c: *Checker, target: Node, key: RefKey, declared: TypeId) E
 /// stale (mirrors tsc's `isConstantReference`).
 pub fn isConstantRefSym(c: *Checker, key: RefKey) Error!bool {
     if (key.len != 0) return false;
-    if (key.sym == this_flow_root) return false;
+    if (isPseudoRoot(key.sym)) return false;
     const sf = c.symFlags(key.sym);
     if (sf.const_decl) return true;
     if (!(sf.let_decl or sf.var_decl or sf.param or sf.catch_param)) return false;
@@ -1493,6 +1677,9 @@ pub fn narrowByTypeofChainContainment(c: *Checker, t: TypeId, value: Node, sense
 /// (`s.openDialog?.k`).
 pub fn discriminantOfRef(c: *Checker, node: Node, key: RefKey) Error!?TokenIndex {
     if (node == null_node) return null;
+    // A binding-pattern pseudo-reference reads its discriminant through a
+    // sibling BINDING, not a member access (see `narrowedPatternBinding`).
+    if (isPatternRoot(key.sym)) return patternDiscriminantTok(c, node, key);
     switch (c.nodeTag(node)) {
         .member_expr, .optional_member_expr => {},
         else => return null,
@@ -1505,6 +1692,10 @@ pub fn discriminantOfRef(c: *Checker, node: Node, key: RefKey) Error!?TokenIndex
 pub fn identIsSym(c: *Checker, node: Node, sym: SymbolId) Error!bool {
     if (node == null_node) return false;
     if (sym == this_flow_root) return c.nodeTag(node) == .this_expr;
+    // A binding pattern is never itself written as an expression, so no
+    // identifier ever *is* a pattern pseudo-root (its bindings are matched by
+    // `discriminantOfRef` instead).
+    if (isPatternRoot(sym)) return false;
     if (c.nodeTag(node) != .identifier) return false;
     const a = try c.atomOfToken(c.tree.nodeMainToken(node));
     if (a != c.symNameAtom(sym)) return false;
@@ -1748,7 +1939,8 @@ pub fn destructuredAssignType(c: *Checker, pat: Node, name: Atom, whole: TypeId)
 
 pub fn patternBindsSym(c: *Checker, pat: Node, sym: SymbolId) Error!bool {
     if (pat == null_node) return false;
-    if (sym == this_flow_root) return false; // a pattern never binds `this`
+    // A pattern never binds `this`, nor another pattern's pseudo-root.
+    if (isPseudoRoot(sym)) return false;
     switch (c.nodeTag(pat)) {
         .identifier => return (try c.atomOfToken(c.tree.nodeMainToken(pat))) == c.symNameAtom(sym),
         .array_pattern, .object_pattern, .array_literal, .object_literal => {
