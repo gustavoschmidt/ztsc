@@ -1882,6 +1882,12 @@ pub fn materializeMapped(c: *Checker, key_param: TypeId, constraint: TypeId, val
                 var props: std.ArrayList(types.Prop) = .empty;
                 defer props.deinit(c.scratch());
                 for (srcprops.items) |p| {
+                    // A homomorphic map's key set IS `keyof src`, which
+                    // excludes `private`/`protected` members — so a mapped
+                    // type over a class has only its public surface, and
+                    // nothing about the source's non-public members carries
+                    // into it (see `prop_flag_non_public`).
+                    if (p.nonPublic()) continue;
                     const key_lit = try s.makeStringLiteral(p.name, false);
                     const name = (try c.remapKey(as_clause, key_id, key_lit)) orelse continue;
                     const pt = try c.substMappedKey(value, key_id, key_lit);

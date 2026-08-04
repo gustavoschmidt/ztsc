@@ -1800,6 +1800,15 @@ pub fn keyofType(c: *Checker, t: TypeId) Error!TypeId {
             defer parts.deinit(c.scratch());
             for (0..c.ts.objectPropCount(r)) |i| {
                 const p = c.ts.objectProp(r, @intCast(i));
+                // A `private`/`protected` class member is not a key. tsc's
+                // `getLiteralTypeFromProperty` answers `never` for one, which
+                // is what keeps `Pick<C, keyof C>` — and every mapped type
+                // over a class — to the public surface. immich's test mocks
+                // are built that way (`RepositoryInterface<T> = Pick<T, keyof
+                // T>` over repositories whose `constructor(private db: …)`
+                // parameter property would otherwise be a required key of
+                // every mock).
+                if (p.nonPublic()) continue;
                 try parts.append(c.scratch(), try c.ts.makeStringLiteral(p.name, false));
             }
             if (c.ts.objectStringIndex(r) != 0) {

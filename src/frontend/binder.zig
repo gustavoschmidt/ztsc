@@ -174,7 +174,15 @@ pub const SymbolFlags = packed struct(u32) {
     /// `Function` and vice-versa), but the pair is an error unless every
     /// class declaration is ambient.
     nonambient_class: bool = false,
-    _pad: u3 = 0,
+    /// A class member declared `private` or `protected` (including a
+    /// `constructor(private db: …)` parameter property). tsc's
+    /// `ModifierFlags.NonPublic`. The checker does not enforce visibility at
+    /// access sites yet; what it needs the bit for is `keyof`, which excludes
+    /// non-public members outright (`getLiteralTypeFromProperty` answers
+    /// `never` for them) — and with `keyof` every mapped type over it,
+    /// `Pick<T, keyof T>` most of all.
+    non_public: bool = false,
+    _pad: u2 = 0,
 
     pub fn bits(f: SymbolFlags) u32 {
         return @bitCast(f);
@@ -212,6 +220,10 @@ const mask_type = fbits(.{ .class = true }) | fbits(.{ .interface = true }) |
     fbits(.{ .enum_decl = true }) | fbits(.{ .namespace_decl = true });
 const mask_member = fbits(.{ .property = true }) | fbits(.{ .method = true }) |
     fbits(.{ .getter = true }) | fbits(.{ .setter = true });
+
+/// The modifiers that make a class member non-public (tsc's
+/// `ModifierFlags.NonPublic`). `public` is the default and never restricts.
+const nonpublic_mask: u32 = ast.Flags.private | ast.Flags.protected;
 
 /// What kind of declaration is being bound; determines the flags a new
 /// symbol gets and which existing flags it refuses to merge with.
@@ -2182,6 +2194,7 @@ const Binder = struct {
                         const tok = b.tree.nodeMainToken(d.lhs);
                         _ = try b.declare(ms, try b.atomOfToken(tok), .property, node, tok, .{
                             .readonly_member = e.flags & ast.Flags.readonly != 0,
+                            .non_public = e.flags & nonpublic_mask != 0,
                         });
                     }
                 }
@@ -2246,6 +2259,7 @@ const Binder = struct {
                         .static_member = is_static,
                         .optional_member = f.flags & ast.Flags.optional != 0,
                         .readonly_member = f.flags & ast.Flags.readonly != 0,
+                        .non_public = f.flags & nonpublic_mask != 0,
                     });
                     try b.bindType(f.type_ann);
                     try b.bindExpr(f.init);
@@ -2261,6 +2275,7 @@ const Binder = struct {
                     _ = try b.declare(if (is_static) ss else ms, atom, kind, member, tok, .{
                         .static_member = is_static,
                         .has_impl = md.rhs != 0 and !is_get and !is_set,
+                        .non_public = proto.flags & nonpublic_mask != 0,
                     });
                     const is_ctor = b.tree.tokens.tag(tok) == .keyword_constructor and !is_static;
                     try b.bindFunctionLike(member, md.lhs, md.rhs, is_ctor);

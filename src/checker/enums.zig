@@ -461,6 +461,7 @@ pub fn ownStaticMemberProp(c: *Checker, cls: SymbolId, name: Atom) Error!?types.
         var flags: u32 = 0;
         if (mf.readonly_member) flags |= types.prop_flag_readonly;
         if (mf.getter and !mf.setter) flags |= types.prop_flag_readonly;
+        if (mf.non_public) flags |= types.prop_flag_non_public;
         // `this` inside a static member is the class's constructor type,
         // exactly as `classStaticType` sets it before resolving one.
         const saved_this = c.this_type;
@@ -498,6 +499,7 @@ pub fn classStaticType(c: *Checker, sym: SymbolId) Error!TypeId {
             var flags: u32 = 0;
             if (mf.readonly_member) flags |= types.prop_flag_readonly;
             if (mf.getter and !mf.setter) flags |= types.prop_flag_readonly;
+            if (mf.non_public) flags |= types.prop_flag_non_public;
             try props.append(c.scratch(), .{
                 .name = try c.nominalizeComputedKey(c.bind.member_atoms[i], kscope),
                 // Route through typeOfSymbol (not memberTypeOf directly) so a

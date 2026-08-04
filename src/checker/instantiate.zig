@@ -1045,6 +1045,7 @@ pub fn classInstanceGeneric(c: *Checker, sym: SymbolId) Error!TypeId {
             if (mf.readonly_member) flags |= types.prop_flag_readonly;
             // A get-only accessor is a read-only property (TS2540 on write).
             if (mf.getter and !mf.setter) flags |= types.prop_flag_readonly;
+            if (mf.non_public) flags |= types.prop_flag_non_public;
             try props.append(c.scratch(), .{
                 .name = name,
                 .ty = try c.memberTypeOf(msym),
@@ -1252,6 +1253,7 @@ pub fn lazyRefProp(c: *Checker, ref: TypeId, name: Atom, depth: u32) Error!?type
             if (mf.optional_member) flags |= types.prop_flag_optional;
             if (mf.readonly_member) flags |= types.prop_flag_readonly;
             if (mf.getter and !mf.setter) flags |= types.prop_flag_readonly;
+            if (mf.non_public) flags |= types.prop_flag_non_public;
             found = .{ .name = nm, .ty = try c.memberTypeOf(msym), .flags = flags };
             break;
         }

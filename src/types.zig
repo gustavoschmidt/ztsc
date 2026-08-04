@@ -262,6 +262,12 @@ pub const obj_flag_has_sigs: u32 = 4;
 pub const obj_flag_global_this: u32 = 8;
 pub const prop_flag_optional: u32 = 1;
 pub const prop_flag_readonly: u32 = 2;
+/// A `private`/`protected` class member (tsc's `ModifierFlags.NonPublic`).
+/// Carried so `keyof` can leave it out — tsc's `getLiteralTypeFromProperty`
+/// answers `never` for a non-public property, which is what keeps
+/// `Pick<C, keyof C>` (and every `{ [K in keyof C]: … }` over a class) to the
+/// public surface. The structural relation still sees the member.
+pub const prop_flag_non_public: u32 = 4;
 pub const elem_flag_optional: u32 = 1;
 pub const elem_flag_rest: u32 = 2;
 /// A `readonly` tuple element (produced by `as const`). Ignored by the
@@ -293,6 +299,9 @@ pub const Prop = struct {
     }
     pub fn readonly(p: Prop) bool {
         return p.flags & prop_flag_readonly != 0;
+    }
+    pub fn nonPublic(p: Prop) bool {
+        return p.flags & prop_flag_non_public != 0;
     }
 };
 
