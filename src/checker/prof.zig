@@ -712,6 +712,11 @@
 //! its constrained twin, where tsgo reports two TS2322 (ztsc reports the
 //! second one today and still does).
 //!
+//! The peak RSS the change costs (2.10 -> 2.36 GB at `--checkers=4`) is not
+//! the new `erase_any_cache`: dropping its writes leaves immich at the same
+//! 123 keys, 3.15 s and 2.46 GB. It is completed work — the same coin the
+//! budget-ceiling experiments above priced, read from the other side.
+//!
 //! ### What is left on immich, and where it came from
 //!
 //! 123 keys: TS7006 43, TS2345 25, TS2769 20, TS2322 15, TS2339 13, TS2589 3.
