@@ -2454,6 +2454,54 @@ pub const Checker = struct {
         };
     }
 
+    /// Whether an instantiation-budget trip happening *right now* is a
+    /// user-facing TS2589, or a silent "no evidence" cut. Every guard site
+    /// that would `instLimitDiag(2589, …)` asks this first.
+    ///
+    /// The two are different questions and tsc keeps them apart by WHERE the
+    /// recursion is detected. At the CHECKING level — materializing an
+    /// annotation, a cast, a call's return — tsc's `instantiateType` guard
+    /// (`instantiationDepth`/`instantiationCount`) reports
+    /// `Type_instantiation_is_excessively_deep_and_possibly_infinite` and
+    /// hands back `errorType`. Inside the assignability RELATION it does not:
+    /// `recursiveTypeRelatedTo` detects a same-symbol recursion with
+    /// `isDeeplyNestedType` and answers `Ternary.Maybe` — the pair is assumed
+    /// related, silently, with no diagnostic and nothing cached. A relation is
+    /// a *question*, and running out of budget while answering it is an
+    /// absence of evidence, not a property of the program.
+    ///
+    /// ztsc needs the separation more than tsc does, because its relation asks
+    /// for orders of magnitude more instantiation than tsc's: ztsc substitutes
+    /// eagerly and structurally where tsc defers. Relating one pair of kysely
+    /// builder references — `ExpressionBuilder<DB & {sharedBy: UserTable},
+    /// 'partner'|'sharedBy'>` against `ExpressionBuilder<DB, 'partner'>`,
+    /// immich's shape, on which tsc is clean — walks a spine of
+    /// `SelectQueryBuilder`/`ExpressionBuilder` frames that mints a fresh
+    /// interned pair at every level. Nothing repeats, so neither the relation
+    /// memo nor `relIdDeeplyNested`'s growth test closes it (the refs SHRINK
+    /// down that spine, and the growth test counts only strictly later
+    /// instantiations), and the walk was measured still running past
+    /// 40,000,000 node visits at `max_instantiation_depth` 400. Whatever
+    /// budget it is given it will exhaust, so the trip carries exactly one
+    /// bit of information — "ztsc gave up" — which is what tsc answers
+    /// `Maybe` to.
+    ///
+    /// Reporting it anyway is a false positive, and unlike the report the
+    /// truncation itself is harmless here: `error_type` relates to everything,
+    /// so the relation's answer with the cut is the assumed-YES it would have
+    /// given at `max_relation_depth` one layer up. `inst_limit_tripped` still
+    /// fires, so the truncated result is still kept out of every memo.
+    ///
+    /// The direction of the unsoundness is the one `max_relation_depth` and
+    /// `max_relation_identity_repeats` already take, and the one tsc takes:
+    /// assume-related can only DROP a diagnostic, never invent one. What it
+    /// deliberately does NOT do is suppress TS2589 generally — a trip while
+    /// materializing an annotation still reports (conformance
+    /// instantiation/002), because that one is a property of the type.
+    pub fn instDiagAllowed(c: *const Checker) bool {
+        return !c.suppress_inst_diag and c.rel_depth == 0;
+    }
+
     /// Report an instantiation-limit diagnostic (TS2589 / TS2590) at a
     /// canonical, partition-independent anchor: at most one per file and
     /// code, at the lexically-first anchor seen in that file.

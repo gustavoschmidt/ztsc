@@ -219,7 +219,7 @@ pub fn condTrueBranch(c: *Checker, b: CondPlan.Bindings, true_ty: TypeId) Error!
 pub fn planConditional(c: *Checker, chk: TypeId, extends_ty: TypeId, distributive: bool) Error!CondPlan {
     if (c.inst_depth > max_instantiation_depth or c.inst_count > max_instantiation_count) {
         c.inst_limit_tripped = true;
-        if (!c.suppress_inst_diag) try c.instLimitDiag(2589, "Type instantiation is excessively deep and possibly infinite.");
+        if (c.instDiagAllowed()) try c.instLimitDiag(2589, "Type instantiation is excessively deep and possibly infinite.");
         return .{ .value = types.error_type };
     }
     c.inst_depth += 1;
@@ -1670,7 +1670,7 @@ pub fn mappedTypeFromNode(c: *Checker, node: Node) Error!TypeId {
 pub fn reduceMapped(c: *Checker, key_param: TypeId, constraint: TypeId, value: TypeId, as_clause: TypeId, src_type: TypeId, flags: u32) Error!TypeId {
     if (c.inst_depth > max_instantiation_depth or c.inst_count > max_instantiation_count) {
         c.inst_limit_tripped = true;
-        if (!c.suppress_inst_diag) try c.instLimitDiag(2589, "Type instantiation is excessively deep and possibly infinite.");
+        if (c.instDiagAllowed()) try c.instLimitDiag(2589, "Type instantiation is excessively deep and possibly infinite.");
         return types.error_type;
     }
     c.inst_depth += 1;
@@ -2871,7 +2871,7 @@ pub const TplBuilder = struct {
 pub fn reduceTemplateChunks(c: *Checker, head: Atom, holes: []const TypeId, chunks: []const Atom) Error!TypeId {
     if (c.inst_depth > max_instantiation_depth or c.inst_count > max_instantiation_count) {
         c.inst_limit_tripped = true;
-        if (!c.suppress_inst_diag) try c.instLimitDiag(2589, "Type instantiation is excessively deep and possibly infinite.");
+        if (c.instDiagAllowed()) try c.instLimitDiag(2589, "Type instantiation is excessively deep and possibly infinite.");
         return types.error_type;
     }
     c.inst_depth += 1;
