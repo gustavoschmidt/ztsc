@@ -639,7 +639,7 @@ pub const map_containers = [_][]const u8{
     "tp_constrained_cache",     "nominal_bases",          "nominal_base_pool",
     "keyof_mapped_active",      "ctp_syms_seen",          "weak_types",
     "lazy_member",              "lazy_map",               "pattern_root_decls",
-    "pattern_root_ids",         "pattern_narrow_busy",
+    "pattern_root_ids",         "pattern_narrow_busy",    "key_name_types",
 };
 
 /// Where one symbol's declared heritage lives in `Checker.nominal_base_pool`.
@@ -1096,6 +1096,27 @@ pub const Checker = struct {
     /// result whose computation tripped the depth/count limit — a truncated
     /// erasure is a function of the live depth, not of `(sig, owner)`.
     erase_cache: std.AutoHashMapUnmanaged(u64, TypeId) = .empty,
+    /// tsc's `symbol.links.nameType`, for the one case ztsc cannot recover
+    /// from a member table: a member declared with a computed ENUM-MEMBER key
+    /// (`{ [E.A]: T }`). The table keys by the atom the key evaluates to
+    /// (`"AV1"`), so `keyof` read back `"AV1" | …` and the enum's identity was
+    /// gone — `T extends keyof M` no longer satisfied `T extends E`, which is
+    /// immich's `src/utils/sync.ts:34` (`SyncItem` is keyed by
+    /// `SyncEntityType`).
+    ///
+    /// Keyed by `(object type << 32) | atom`, recorded by
+    /// `objectTypeFromMembers` once the object has been interned and read by
+    /// `keyofObjectTable`. Attaching it to the TYPE rather than to `Prop`
+    /// keeps the store's member layout — the hottest and most
+    /// memory-sensitive structure in the checker — untouched, and the map
+    /// stays empty on every program with no enum-keyed type.
+    ///
+    /// Object types are interned structurally, so a hand-written
+    /// `{ 'AV1': T; … }` with the identical member shape shares the id and
+    /// would read the same name types. That is the one imprecision, and it is
+    /// the safe direction: the two spell the same key set, and the enum form
+    /// is the more specific answer.
+    key_name_types: std.AutoHashMapUnmanaged(u64, TypeId) = .empty,
     /// Higher-order type-param rewrite. When an object's generic call/
     /// construct signature (`interface H<T>{ <U extends C<T> = D<T>>(…):… }`) is
     /// instantiated under a map `M`, an own param `U` whose constraint/default
@@ -2247,6 +2268,16 @@ pub const Checker = struct {
     /// space and `typeOfSymbol`, so an imported key resolves to the *declaring*
     /// site's nominal id, giving cross-file key identity for free.
     pub fn constSymbolKeyAtom(c: *Checker, name: []const u8, scope: ScopeId) Error!?Atom {
+        const ty = (try c.constSymbolKeyType(name, scope)) orelse return null;
+        return c.computedKeyAtomOfType(ty);
+    }
+
+    /// The TYPE a computed-key identifier denotes — the resolution half of
+    /// `constSymbolKeyAtom`, split out because the key's type is also its
+    /// tsc `nameType` (see `memberNameType`): `[E.A]` is keyed by the atom
+    /// `"AV1"` but NAMED by the enum-member literal `E.A`, and `keyof` has to
+    /// report the latter.
+    pub fn constSymbolKeyType(c: *Checker, name: []const u8, scope: ScopeId) Error!?TypeId {
         if (std.mem.indexOfScalar(u8, name, '.')) |dot| {
             // Qualified `[a.b]` key: resolve `a` in the value space, then find
             // the member *symbol* `b` directly on it (class statics, namespace
@@ -2263,7 +2294,7 @@ pub const Checker = struct {
             };
             const member = try c.internText(name[dot + 1 ..]);
             if (c.qualifiedKeyMemberSym(obj, member)) |msym| {
-                return c.computedKeyAtomOfType(try c.typeOfSymbol(msym));
+                return try c.typeOfSymbol(msym);
             }
             // Fallback for a base that is not itself a class/namespace (an
             // import binding, or a var whose *type* carries the member —
@@ -2274,14 +2305,39 @@ pub const Checker = struct {
             c.computed_key_depth += 1;
             defer c.computed_key_depth -= 1;
             const p = (try c.propOfType(try c.typeOfSymbol(obj), member)) orelse return null;
-            return c.computedKeyAtomOfType(p.ty);
+            return p.ty;
         }
         const a = try c.atom(name);
         const sym = switch (c.resolveSpace(a, scope, true)) {
             .sym => |s| s,
             else => return null,
         };
-        return c.computedKeyAtomOfType(try c.typeOfSymbol(sym));
+        return try c.typeOfSymbol(sym);
+    }
+
+    /// tsc's `symbol.links.nameType` for a member declared with a computed
+    /// key: the ENUM-MEMBER literal type `[E.A]` denotes. A member table keys
+    /// by atom, and an enum member's atom is its VALUE (`"AV1"`), so `keyof`
+    /// read back a plain string-literal union and lost the enum's identity —
+    /// `T extends keyof M` then did not satisfy `T extends E`. Returns
+    /// `no_type` for every other key, which is every key that has no name
+    /// type: an ordinary identifier or string key names itself.
+    ///
+    /// Only enum members are recorded. A `unique symbol` key is already
+    /// nominal through its `__@u<id>` atom, and a string/number-literal const
+    /// key names exactly the atom it produces, so neither needs the side
+    /// table — and keeping it to the one case that needs it keeps the map
+    /// empty on every program that has no enum-keyed type.
+    pub fn memberNameType(c: *Checker, tok: TokenIndex, flags: u32) Error!TypeId {
+        if (flags & ast.Flags.computed_sym == 0) return types.no_type;
+        const name = if (flags & ast.Flags.computed_sym_qual != 0)
+            try std.fmt.allocPrint(c.scratch(), "{s}.{s}", .{ c.tokenText(tok - 2), c.tokenText(tok) })
+        else
+            c.tokenText(tok);
+        const ty = (try c.constSymbolKeyType(name, c.cur_scope)) orelse return types.no_type;
+        const r = try c.ts.regular(ty);
+        if (c.ts.kind(r) != .enum_type or !c.ts.isEnumMember(r)) return types.no_type;
+        return r;
     }
 
     /// Member symbol `name` of `obj` for qualified computed-key resolution:

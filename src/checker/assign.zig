@@ -2124,7 +2124,17 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
         return relate(c, rs, rt, false);
     }
     // Enum types are nominal (identical enums caught by s == t earlier).
-    if (sk == .enum_type or tk == .enum_type) return c.enumAssignable(s, t, sk, tk);
+    //
+    // A generic SOURCE is not one of them. `<T extends E>` is a `.type_param`,
+    // so `enumAssignable` saw a non-enum source and rejected `T` against the
+    // very enum it is constrained to — `<T extends E>(t: T): E => t` was
+    // TS2322, and so was every `T extends keyof M` over an enum-keyed table
+    // (immich `src/utils/sync.ts:34`). The nominal question is about the
+    // CONSTRAINT, which is what the type-parameter arm below asks; this arm
+    // only ever ran first because it is written on kinds, not on roles.
+    if ((sk == .enum_type or tk == .enum_type) and sk != .type_param) {
+        return c.enumAssignable(s, t, sk, tk);
+    }
     // Type parameters.
     if (sk == .type_param) {
         const constraint = try c.typeParamConstraint(c.ts.typeParamSymbol(s));

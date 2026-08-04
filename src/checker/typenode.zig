@@ -1794,6 +1794,15 @@ fn keyofObjectTable(c: *Checker, r: TypeId) Error!TypeId {
         // `constructor(private db: …)` parameter property would otherwise be a
         // required key of every mock).
         if (p.nonPublic()) continue;
+        // A member declared with a computed ENUM-MEMBER key is NAMED by that
+        // enum member even though the table keys it by the string value —
+        // tsc's `symbol.links.nameType`. Without it `keyof M` came back as a
+        // plain string-literal union and `T extends keyof M` no longer
+        // satisfied `T extends E` (immich `src/utils/sync.ts:34`).
+        if (c.key_name_types.get((@as(u64, r) << 32) | p.name)) |nt| {
+            try parts.append(c.scratch(), nt);
+            continue;
+        }
         try parts.append(c.scratch(), try c.ts.makeStringLiteral(p.name, false));
     }
     if (c.ts.objectStringIndex(r) != 0) {
@@ -2782,6 +2791,12 @@ pub fn objectTypeFromMembers(c: *Checker, member_nodes: []const Node, obj_flags:
     }
     var order: std.ArrayList(Atom) = .empty;
     defer order.deinit(c.scratch());
+    // Members declared with a computed ENUM-MEMBER key, as (atom, name type)
+    // — tsc's `symbol.links.nameType`. Recorded against the interned object
+    // below so `keyof` can report `E.A` where the table is keyed `"AV1"`.
+    // See `Checker.key_name_types`; empty for every type with no such key.
+    var name_types: std.ArrayList(struct { name: Atom, ty: TypeId }) = .empty;
+    defer name_types.deinit(c.scratch());
     // Method names declared optional (`m?(): T`) — tsc marks the resulting
     // property optional (e.g. `PropertyDescriptor.get?`/`set?`).
     var optional_methods: std.AutoHashMapUnmanaged(Atom, void) = .empty;
@@ -2804,6 +2819,8 @@ pub fn objectTypeFromMembers(c: *Checker, member_nodes: []const Node, obj_flags:
         switch (c.nodeTag(m)) {
             .property_signature => {
                 const name = try c.memberKey(c.tree.nodeMainToken(m), md.rhs);
+                const nt = try c.memberNameType(c.tree.nodeMainToken(m), md.rhs);
+                if (nt != types.no_type) try name_types.append(c.scratch(), .{ .name = name, .ty = nt });
                 var flags: u32 = 0;
                 if (md.rhs & ast.Flags.optional != 0) flags |= types.prop_flag_optional;
                 if (md.rhs & ast.Flags.readonly != 0) flags |= types.prop_flag_readonly;
@@ -2875,7 +2892,11 @@ pub fn objectTypeFromMembers(c: *Checker, member_nodes: []const Node, obj_flags:
         if (setter_keys.contains(k.*)) continue;
         if (prop_index.get(k.*)) |idx| props.items[idx].flags |= types.prop_flag_readonly;
     }
-    return c.ts.makeObjectSigs(props.items, sindex, nindex, obj_flags, call_sigs.items, construct_sigs.items);
+    const obj = try c.ts.makeObjectSigs(props.items, sindex, nindex, obj_flags, call_sigs.items, construct_sigs.items);
+    for (name_types.items) |nt| {
+        try c.key_name_types.put(c.cm(), (@as(u64, obj) << 32) | nt.name, nt.ty);
+    }
+    return obj;
 }
 
 /// Append `p`, replacing any existing prop with the same name. `index`
