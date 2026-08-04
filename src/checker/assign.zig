@@ -3368,6 +3368,21 @@ pub fn signatureAssignableModeInner(c: *Checker, s: TypeId, t: TypeId, mode: Sig
     if (c.ts.fnTypeParams(s).len == 0 and c.ts.fnTypeParams(t).len > 0) {
         se = try c.eraseParamsOf(se, t);
     }
+    // The erasure runs `instantiate`, so it is subject to the instantiation
+    // budget, and a trip hands back `error_type` in place of the signature —
+    // not a wider signature, no signature at all. Every step below then reads
+    // a non-function through the `fn*` accessors (zero parameters, a garbage
+    // return) and the pair falls out "not related", which is the WRONG
+    // polarity: a truncation inside the relation is `Ternary.Maybe`, the same
+    // rule `instDiagAllowed` applies to the diagnostic (see `Checker`). It is
+    // also silent — the budget is spent, so no TS2589 marks the spot, and the
+    // only trace is a TS2322/TS2769 on a pair tsc accepts.
+    //
+    // Assume related, as the relation already does for a truncated type that
+    // reaches it as a VALUE (`.err` relates to everything at the top of
+    // `relate`). This is an under-report by construction, never a false
+    // positive: the pair could not be decided, so nothing is reported.
+    if (c.ts.kind(se) != .function or c.ts.kind(te) != .function) return true;
     // tsc's `compareSignaturesRelated`: an explicit `this` parameter is part
     // of the relation and behaves like an ordinary parameter —
     // contravariant in a strict function position, bivariant for methods

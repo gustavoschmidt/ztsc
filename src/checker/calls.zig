@@ -562,11 +562,37 @@ pub fn resolveSignatureCall(
         //
         // The accepted candidate keeps its inference diagnostics, exactly as
         // before: only the `continue` paths withdraw.
+        //
+        // The candidate's INSTANTIATION BUDGET is speculative for the same
+        // reason, and this is the half that decides which overload wins. A
+        // rejected candidate's substitutions are thrown away with its
+        // diagnostics — but their cost stayed on `inst_count`, so a candidate
+        // tried EARLIER could spend the statement's whole budget probing an
+        // argument it then declines, and every candidate after it
+        // instantiated to `error_type` (the truncation marker), read as
+        // arity 0, and was rejected without ever being compared. That is how
+        // kysely's `select(selections: ReadonlyArray<SE>)` — a wide union
+        // constraint, tried first — bankrupts the `select(callback: CB)`
+        // overload beside it and turns a call tsc resolves into TS2769: the
+        // budget made overload resolution depend on candidate ORDER, and on
+        // how much of the budget the enclosing statement had already spent,
+        // which is why the same call diverged between checker partitions.
+        //
+        // So roll the counter back with the diagnostics. The accepted
+        // candidate keeps its charge (its substitutions are the ones the
+        // statement actually uses); only the `continue` paths refund.
+        // `inst_limit_tripped` travels with it — it is the "do not memoize,
+        // this subtree truncated" mark for the frames the refund unwinds, and
+        // those frames are gone by the time it is restored.
         const saved_infer = c.diags.items.len;
         const infer_file = c.cur_file;
+        const saved_inst_count = c.inst_count;
+        const saved_inst_trip = c.inst_limit_tripped;
         const inst = try c.instantiateSigForCall(sig, explicit_targs, arg_nodes, node, ret_ctx);
         if (nargs < try c.requiredParams(inst) or nargs > try c.paramTotal(inst)) {
             c.rollbackArgDiags(saved_infer, infer_file, arg_nodes);
+            c.inst_count = saved_inst_count;
+            c.inst_limit_tripped = saved_inst_trip;
             continue;
         }
         if (try c.argumentsMatch(inst, arg_nodes)) {
@@ -574,6 +600,8 @@ pub fn resolveSignatureCall(
             return if (instance_ret != types.no_type) instance_ret else c.ts.fnReturn(inst);
         }
         c.rollbackArgDiags(saved_infer, infer_file, arg_nodes);
+        c.inst_count = saved_inst_count;
+        c.inst_limit_tripped = saved_inst_trip;
     }
     // No candidate matched. tsc does not report at the callee: it re-checks
     // the LAST candidate with error reporting on and files the TS2769 where
