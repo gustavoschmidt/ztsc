@@ -4414,6 +4414,8 @@ pub fn elaborateLiteralError(c: *Checker, expr_node0: Node, src_t: TypeId, targe
 /// case. Purely additive: it never suppresses an accepted relation that
 /// some constituent genuinely satisfies.
 pub fn freshLiteralUnionMismatch(c: *Checker, expr_node: Node, src_t: TypeId, target: TypeId, code: u16, span: Span) Error!bool {
+    _ = code;
+    _ = span;
     var node = expr_node;
     while (true) {
         switch (c.nodeTag(node)) {
@@ -4427,19 +4429,85 @@ pub fn freshLiteralUnionMismatch(c: *Checker, expr_node: Node, src_t: TypeId, ta
     const rt = try c.resolveStructural(target);
     if (c.ts.kind(rt) != .union_type) return false;
     const ms = try c.memberList(rt);
-    for (ms) |m| {
-        const rm = try c.resolveStructural(m);
-        if (!try c.literalPropsKnownIn(node, rm)) continue;
-        if (try c.isAssignable(src_t, m)) return false;
-    }
     // A source whose DISCRIMINANT is a union legitimately matches no single
     // constituent — it spans several (tsc `typeRelatedToDiscriminatedType`),
     // and tsc's excess-property check is about property NAMES being known,
     // not about fitting one constituent whole.
     if (try c.discriminatedUnionAssignable(src_t, rt)) return false;
-    if (try c.elaborateLiteralError(node, src_t, target)) return true;
-    try c.reportNotAssignable(code, src_t, target, span);
-    return true;
+    // tsc's `hasExcessProperties` has a SECOND half, and it is the whole rule
+    // for a union target. Having found the written property's name known
+    // somewhere in the union, it compares the property's VALUE against
+    // `getTypeOfPropertyInTypes(checkTypes, name)` — the union of that
+    // property's type over EVERY constituent, with `undefined` standing in
+    // for a constituent that does not have it — and fails the relation when
+    // the value does not fit. Nothing else about the union is per-constituent:
+    // `unionOrIntersectionRelatedTo` then relates the REGULARIZED (no longer
+    // fresh) literal to some constituent, which never excess-checks again.
+    //
+    // Asking instead for one constituent that both knows every written
+    // property AND takes the literal whole is stricter than tsc in exactly
+    // the case where the properties are spread across arms: `@nestjs/swagger`'s
+    // `ApiQuery({ name, type })` against `Common | ({ name: string } & Common
+    // & Omit<SchemaObject, 'required'>)` — `name` is known only in the second
+    // arm, which rejects on `type`, while the first arm takes the regularized
+    // literal. It is not more lenient on the case this function exists for:
+    // `crypto.subtle.decrypt({ name: 'AES-GCM', iv })`'s `iv` is `number` in
+    // the one arm that has it and `undefined` in the rest, so a wrong `iv`
+    // still fails here (conformance `assignability/070`).
+    // tsc's `hasExcessProperties` bails wholesale on a target that is (or,
+    // over a union, CONTAINS — `isEmptyObjectType` is `some` there) an empty
+    // object type or `object`, so `T | {}` accepts anything (conformance
+    // `assignability/071`). A constituent whose members ztsc cannot read here
+    // is the same case: it can neither know nor refuse a property.
+    for (ms) |m| {
+        const rm = try c.resolveStructural(m);
+        switch (c.ts.kind(rm)) {
+            .object => if (c.isEmptyObjectType(rm)) return false,
+            .array, .tuple, .function, .overloads, .class_value, .intersection, .string_literal, .number_literal, .number_literal_fresh, .boolean, .bool_true, .bool_false, .string, .number, .bigint, .symbol, .enum_type, .null, .undefined, .void, .never, .template_literal_type => {},
+            // `object`, `any`, `unknown`, a type variable, a deferred access:
+            // not a shape this check can read.
+            else => return false,
+        }
+    }
+    for (c.tree.nodeRange(node)) |prop| {
+        if (prop == null_node) continue;
+        const tag = c.nodeTag(prop);
+        if (tag != .object_property and tag != .object_shorthand and tag != .object_method) continue;
+        if (tag == .object_property) {
+            const pd = c.tree.nodeData(prop);
+            if (pd.lhs != 0 and c.nodeTag(pd.lhs) == .computed_name) continue;
+        }
+        const key = try c.memberAtom(c.tree.nodeMainToken(prop));
+        const sp = c.ts.objectPropByName(src_t, key) orelse continue; // (union half)
+        var known = false;
+        var parts: std.ArrayList(TypeId) = .empty;
+        defer parts.deinit(c.scratch());
+        for (ms) |m| {
+            const rm = try c.resolveStructural(m);
+            if (try c.targetKnowsProp(rm, key)) known = true;
+            const pt = (try c.targetPropType(rm, key)) orelse blk: {
+                if (c.ts.kind(rm) == .object and c.ts.objectStringIndex(rm) != 0) {
+                    break :blk c.ts.objectStringIndex(rm);
+                }
+                break :blk types.undefined_type;
+            };
+            try parts.append(c.scratch(), pt);
+        }
+        // Unknown everywhere is the plain excess-property error, which the
+        // relation's own check already reports (TS2353).
+        if (!known) return false;
+        const want = try c.ts.makeUnion(c.scratch(), parts.items);
+        if (try c.isAssignable(sp.ty, want)) continue;
+        // tsc's report here is always `Types_of_property_0_are_incompatible`
+        // — it names the property. When ztsc's elaboration cannot name one,
+        // this finding disagrees with the relation walk that just ACCEPTED
+        // the literal, and the walk is the one to believe: a whole-type
+        // report there is a false positive on any pair whose property types
+        // ztsc evaluates differently from tsc.
+        if (try c.elaborateLiteralError(node, src_t, target)) return true;
+        return false;
+    }
+    return false;
 }
 
 /// Every property WRITTEN in the object literal `node` is known in `rm`
