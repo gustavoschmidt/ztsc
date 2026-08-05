@@ -2003,6 +2003,22 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
             if (bc != s and c.ts.kind(bc) != .unknown and try c.isAssignable(bc, t)) return true;
         }
     }
+    // A generic TEMPLATE-LITERAL source, the same rule one kind over: a
+    // template whose hole is a type variable relates through its base
+    // constraint (tsc's `structuredTypeRelatedTo` reaches
+    // `getBaseConstraintOfType` for every `TypeFlags.Instantiable` source).
+    // `` `excluded.${T}` `` with `T extends keyof AssetExifTable` instantiates
+    // to `` `excluded.${'assetId' | 'description' | …}` ``, which expands to
+    // exactly the union of column references kysely's `eb.ref` wants.
+    //
+    // Ahead of the union-target arm for the reason the indexed-access rule is
+    // (it would answer for the whole target first), and purely additive: a
+    // template whose base constraint is itself, or does not relate, falls
+    // through unchanged.
+    if (sk == .template_literal_type) {
+        const bc = try c.baseConstraintOf(s);
+        if (bc != s and try c.isAssignable(bc, t)) return true;
+    }
     if (tk == .union_type) {
         // A callable constituent decides for a callable source — see
         // `Checker.union_callable_sibling`. Only consulted while the weak-type
