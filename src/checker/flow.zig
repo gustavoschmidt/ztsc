@@ -1234,7 +1234,17 @@ pub fn assignNarrows(c: *Checker, target: Node, key: RefKey, declared: TypeId) E
             // Full path write: <ref> = v narrows the tracked reference.
             if (key.len != 0 and try c.refMatches(d.lhs, key)) {
                 const op = c.tree.tokens.tag(c.tree.nodeMainToken(target));
-                if (op != .eq) return declared;
+                // A compound assignment writes a PATH exactly as it writes a
+                // variable, and tsc narrows both (a property access is a
+                // reference in the flow graph). `session.startSegment ??= i`
+                // leaves a `number`, and giving up here left it `number |
+                // null` for the rest of the function — immich's
+                // `TranscodingService.onSegmentRequest`.
+                if (op != .eq) {
+                    const vt = c.nodeType(target) orelse
+                        try c.checkExprCached(target, types.no_type);
+                    return try c.assignmentReduced(declared, vt);
+                }
                 if (!c.assignmentRefines(declared)) return declared;
                 const vt = c.nodeType(d.rhs) orelse try c.checkExprCached(d.rhs, types.no_type);
                 return try c.assignmentReduced(declared, vt);
@@ -1251,7 +1261,21 @@ pub fn assignNarrows(c: *Checker, target: Node, key: RefKey, declared: TypeId) E
                 // against (tsc `getTypeAtFlowAssignment`, autoType branch).
                 const evolving = key.len == 0 and c.isEvolvingVar(root_sym);
                 if (op != .eq) {
-                    const vt = c.nodeType(target) orelse declared;
+                    // A compound assignment's post-value is the whole
+                    // expression's type (`x ??= s` leaves `NonNullable<x> |
+                    // typeof s`), so it has to be CHECKED, not read
+                    // opportunistically out of the node cache. A reference can
+                    // reach this flow node before the assignment statement is
+                    // itself checked — a later reference in the same function
+                    // whose type is demanded first (an inferred return type
+                    // mentioning it is enough) — and falling back to `declared`
+                    // there is not merely imprecise: `flowType` memoizes a
+                    // result equal to `declared` as "this reference narrows
+                    // nothing", so the non-answer is published for every later
+                    // query at this node. The `.eq` arm below already checks
+                    // its right-hand side for exactly this reason.
+                    const vt = c.nodeType(target) orelse
+                        try c.checkExprCached(target, types.no_type);
                     if (evolving) return try c.widenLiteral(vt);
                     return try c.assignmentReduced(declared, vt);
                 }
