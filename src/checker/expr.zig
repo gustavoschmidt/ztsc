@@ -3244,7 +3244,23 @@ pub fn indexChainInner(c: *Checker, node: Node, chained: *bool, narrow: bool) Er
         // `NumberLike`, so reduce it to its base primitive.
         else => {
             const ri = try c.resolveStructural(try c.ts.regularLiteral(idx_t));
-            if (try c.typeIsStringLike(ri)) {
+            // A whole ENUM as the key (`handlers[name as JobName]`). ztsc
+            // models an enum as ONE nominal type while tsc models it as the
+            // UNION of its member types, so neither the string-like nor the
+            // number-like arm can answer for it: a string enum fell through
+            // to `any`, and a numeric one asked for a number index signature
+            // the table does not have. tsc computes
+            // `getIndexedAccessType(objectType, indexType)`, which
+            // distributes over that union and answers the union of the named
+            // members' types — `{ [K in JobName]?: Item }` indexed by
+            // `JobName` is `Item | undefined`, not `any`. Before this, every
+            // read off the result and the inferred return type of the
+            // function holding it were `any`.
+            const enum_key = c.ts.kind(ri) == .enum_type and !c.ts.isEnumMember(ri);
+            const ia: TypeId = if (enum_key) try c.indexedAccessType(r, ri) else types.no_type;
+            if (ia != types.no_type and ia != types.error_type) {
+                result = ia;
+            } else if (try c.typeIsStringLike(ri)) {
                 result = if (rk == .object and c.ts.objectStringIndex(r) != 0)
                     c.ts.objectStringIndex(r)
                 else

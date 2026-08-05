@@ -2209,6 +2209,19 @@ fn indexedAccessTypeInner(c: *Checker, obj: TypeId, idx: TypeId) Error!TypeId {
                     }
                 }
             }
+            // A NUMERICALLY NAMED property answers a numeric key, exactly as
+            // the string-literal arm answers a named one — tsc's
+            // `getPropertyOfType(objectType, "0")` runs before it ever looks
+            // for an index signature. Without it `{ 0: string; 1: string }[0]`
+            // (and every mapped type over a NUMERIC enum, whose keys are the
+            // members' values) answered `any` off `numberIndexType`, which has
+            // no signature to read.
+            if (try c.numericKeyProp(r, idx)) |p| {
+                return if (p.optional() and !c.homo_index_mode)
+                    c.makeUnion2(p.ty, types.undefined_type)
+                else
+                    p.ty;
+            }
             return c.numberIndexType(r);
         },
         .number => return c.numberIndexType(r),
