@@ -1619,9 +1619,39 @@ pub fn substInfer(c: *Checker, t: TypeId, ids: []const u32, vals: []const TypeId
             }
             const chk = try c.substInfer(check0, ids, vals);
             const ext = try c.substInfer(s.condExtends(t), ids, vals);
-            const tru = try c.substInfer(s.condTrue(t), ids, vals);
-            const fls = try c.substInfer(s.condFalse(t), ids, vals);
-            return c.reduceConditional(chk, ext, tru, fls, s.condDistributive(t));
+            // Decide FIRST, substitute the winning branch only — the same
+            // split `instantiateId`'s `.conditional` arm makes, and for the
+            // same reason. This arm is reached with a whole FALL-THROUGH
+            // CHAIN under it: an enclosing conditional bound an `infer` var
+            // (`CTE extends (creator: …) => infer Q ? <chain> : never`), and
+            // the chain's branches were built while `Q` was still unbound, so
+            // every level deferred symbolically and the chain is one
+            // conditional nested in the next one's FALSE branch. Substituting
+            // both branches before reducing evaluates that chain
+            // bottom-up — the LAST alternative's relation runs first and every
+            // alternative runs, even though the answer is the first one that
+            // matches.
+            //
+            // kysely's `ExtractRowFromCommonTableExpression<CTE>` is four
+            // alternatives deep (`Expression`, then the Insert/Update/Delete
+            // builders), and an INSERT-shaped CTE — which matches the second —
+            // still paid for the third and the fourth: 204 expansions of
+            // `DeleteQueryBuilder` over a 60-table schema in a program with no
+            // `deleteFrom` in it, 195,201 node visits of a single
+            // `instantiateSigForCall` of `QueryCreator.with<N, E>` that
+            // charged 272,523 against a 250,000 budget. A SELECT-shaped CTE
+            // matches the FIRST alternative and never showed it.
+            const plan = try c.planConditional(chk, ext, s.condDistributive(t));
+            switch (plan) {
+                .value => |v| return v,
+                .take_false => return c.substInfer(s.condFalse(t), ids, vals),
+                .take_true => |b| return c.condTrueBranch(b, try c.substInfer(s.condTrue(t), ids, vals)),
+                .both_any, .need_both => {
+                    const tru = try c.substInfer(s.condTrue(t), ids, vals);
+                    const fls = try c.substInfer(s.condFalse(t), ids, vals);
+                    return c.finishCondPlan(plan, chk, ext, tru, fls, s.condDistributive(t));
+                },
+            }
         },
         .index_access => {
             const obj = try c.substInfer(s.indexAccessObj(t), ids, vals);
