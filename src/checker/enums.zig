@@ -371,8 +371,95 @@ pub fn enumValueType(c: *Checker, sym: SymbolId) Error!TypeId {
 /// its own value; a string enum is a subtype of `string` but nothing —
 /// not `string`, not the matching string literal — widens *into* it; and
 /// `E → E.A`, `E.A → E.B` and `E1.A → E2.A` are all rejected.
+/// Collects `(name, value)` for every member of an enum, for the structural
+/// enum comparison below.
+const EnumPair = struct { name: Atom, value: TypeId };
+
+const EnumMemberPairs = struct {
+    c: *Checker,
+    list: *std.ArrayList(EnumPair),
+    pub fn visit(self: *EnumMemberPairs, name: Atom, value: TypeId) Error!void {
+        for (self.list.items) |e| {
+            if (e.name == name) return; // a re-declared member is one member
+        }
+        try self.list.append(self.c.scratch(), .{ .name = name, .value = value });
+    }
+};
+
+/// tsc's `isEnumTypeRelatedTo`: two DIFFERENT enum declarations relate when
+/// they share a name and every member of the source has a same-named member
+/// of the same value in the target.
+///
+/// This is the one structural rule in an otherwise nominal type, and real
+/// programs depend on it: a package that publishes an enum and an application
+/// that redeclares it (immich's `src/dtos/env.dto.ts` re-writes
+/// `@immich/sql-tools`' `DatabaseSslMode` with a `// TODO import from
+/// sql-tools` note above it) must interoperate, and zod's
+/// `$InferEnumOutput<T> = T[keyof T]` hands the redeclared members straight
+/// into a parameter typed by the published one.
+///
+/// A `const enum` is excluded, matching tsc's `SymbolFlags.RegularEnum` test,
+/// and so is an enum with a computed member, whose value is not comparable.
+/// Cached per ordered pair, as tsc caches `enumRelation`.
+pub fn enumsStructurallyRelated(c: *Checker, src: SymbolId, tgt: SymbolId) Error!bool {
+    if (src == tgt) return true;
+    const key = (@as(u64, src) << 32) | tgt;
+    if (c.enum_relation_cache.get(key)) |v| return v;
+    const answer = try enumsStructurallyRelatedUncached(c, src, tgt);
+    try c.enum_relation_cache.put(c.cm(), key, answer);
+    return answer;
+}
+
+fn enumsStructurallyRelatedUncached(c: *Checker, src: SymbolId, tgt: SymbolId) Error!bool {
+    if (c.symNameAtom(src) != c.symNameAtom(tgt)) return false;
+    const si = try c.enumInfo(src);
+    const ti = try c.enumInfo(tgt);
+    if (si.is_const or ti.is_const or si.has_computed or ti.has_computed) return false;
+
+    var sm: std.ArrayList(EnumPair) = .empty;
+    defer sm.deinit(c.scratch());
+    var tm: std.ArrayList(EnumPair) = .empty;
+    defer tm.deinit(c.scratch());
+    var sv: EnumMemberPairs = .{ .c = c, .list = &sm };
+    var tv: EnumMemberPairs = .{ .c = c, .list = &tm };
+    try c.eachEnumMember(src, &sv, EnumMemberPairs.visit);
+    try c.eachEnumMember(tgt, &tv, EnumMemberPairs.visit);
+    if (sm.items.len == 0) return false;
+
+    // Every SOURCE member must be present in the target with the same value;
+    // the target may declare more (tsc scans the source's members only).
+    for (sm.items) |a| {
+        if (a.value == types.no_type) return false;
+        var found = false;
+        for (tm.items) |b| {
+            if (b.name != a.name) continue;
+            if (b.value == types.no_type) return false;
+            if ((try c.ts.regularLiteral(a.value)) != (try c.ts.regularLiteral(b.value))) return false;
+            found = true;
+            break;
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+/// The two enum types `s` and `t` under `enumsStructurallyRelated` — the
+/// cross-declaration half of `enumAssignable`'s first arm. A whole enum is
+/// tsc's union of its members, so a MEMBER reaches the other declaration's
+/// whole enum and two members must name the same value; the whole enum does
+/// not reach one member.
+fn crossEnumAssignable(c: *Checker, s: TypeId, t: TypeId) Error!bool {
+    if (!try enumsStructurallyRelated(c, c.ts.enumSymbol(s), c.ts.enumSymbol(t))) return false;
+    if (!c.ts.isEnumMember(t)) return true;
+    if (!c.ts.isEnumMember(s)) return false;
+    const sv = (try c.enumMemberValue(c.ts.enumSymbol(s), c.ts.enumMemberAtom(s))) orelse return false;
+    const tv = (try c.enumMemberValue(c.ts.enumSymbol(t), c.ts.enumMemberAtom(t))) orelse return false;
+    return (try c.ts.regularLiteral(sv)) == (try c.ts.regularLiteral(tv));
+}
+
 pub fn enumAssignable(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: types.Kind) Error!bool {
     if (sk == .enum_type and tk == .enum_type) {
+        if (c.ts.enumSymbol(s) != c.ts.enumSymbol(t)) return crossEnumAssignable(c, s, t);
         // A WHOLE enum against one of its own members. tsc's declared type
         // of an enum is the union of its member types, so an enum with a
         // single member and that member are the same type there and relate
