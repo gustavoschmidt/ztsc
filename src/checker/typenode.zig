@@ -1750,9 +1750,30 @@ pub fn fixTypeArgs(c: *Checker, sym: SymbolId, args: []const TypeId, tok: TokenI
                 if ((c.alias_state.get(sym) orelse 0) != 1) _ = try c.aliasGeneric(sym);
                 break :rec (c.alias_state.get(sym) orelse 0) == 1 or c.alias_recursive.contains(sym);
             } else true;
+            // Every earlier position already resolved to a GROUND type. The
+            // comment above says why that is the deciding property: the OOM
+            // guard and the redux `ExtractStoreExtensions` unmask both require
+            // an ABSTRACT argument to be threaded in, and there is none here —
+            // the substitution can only replace type parameters by types that
+            // mention no type parameter, which is a finite rewrite of a
+            // finite term.
+            //
+            // Leaving it unsubstituted is what is actually unsound: bullmq's
+            // `Queue<DataTypeOrJob = any, …, NameType extends string =
+            // DataTypeOrJob extends Job<any, any, infer N> ? N : DefaultNameType>`
+            // written as a bare `Queue` kept `NameType` as a conditional over
+            // `Queue`'s OWN parameters, which nothing downstream can ever
+            // close, so `queue.add(name, data)` was TS2345 against a type
+            // spelled with the class's own type parameters in it.
+            const ground_earlier = blk: {
+                for (out[0..i]) |a| {
+                    if (try c.containsTypeParam(a)) break :blk false;
+                }
+                break :blk true;
+            };
             if (bare_earlier != null and (swappable_earlier or recursive or !c.symInDeclFile(sym))) {
                 out[i] = out[bare_earlier.?];
-            } else if (c.symInDeclFile(sym)) {
+            } else if (c.symInDeclFile(sym) and !ground_earlier) {
                 // A *complex* or non-recursive library default (e.g. RTK's
                 // `ExtractStoreExtensionsFromEnhancerTuple` tuple default, or
                 // `Reducer`'s `PreloadedState = S`) stays unsubstituted:
