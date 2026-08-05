@@ -1915,7 +1915,17 @@ pub fn materializeMapped(c: *Checker, key_param: TypeId, constraint: TypeId, val
                     // carry named props and NO index signature; a pure
                     // index-signature object (`Record<string,V>`) is the redux
                     // `SliceCaseReducers` fallback and must not distribute.
+                    // A PRIMITIVE constituent is mapped to itself (tsc's rule,
+                    // `isPrimitiveForHomomorphicMap`), so it neither needs nor
+                    // prevents distribution — the recursion below returns it
+                    // unchanged. Without this arm a single `null` in the union
+                    // sank the whole map to `{}`: kysely's
+                    // `Simplify<ShallowDehydrateObject<O>>` over an
+                    // `O = AudioStreamInfo | null` (immich's
+                    // `withAudioStream`, whose `$castTo` nullable row every
+                    // `jsonObjectFrom` produces) came back `{} | null`.
                     const ok = s.kind(rm) == .intersection or
+                        isPrimitiveForHomomorphicMap(s.kind(rm)) or
                         (s.kind(rm) == .object and
                             s.objectPropCount(rm) > 0 and
                             s.objectStringIndex(rm) == 0 and
