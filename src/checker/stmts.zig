@@ -861,6 +861,17 @@ pub fn stmtTerminal(c: *Checker, node: Node) bool {
     const d = c.tree.nodeData(node);
     switch (c.nodeTag(node)) {
         .return_stmt, .throw_stmt => return true,
+        // tsc's endpoint analysis is CFA, not syntax: `functionHasImplicit
+        // Return` reads `isReachableFlowNode(func.endFlowNode)`, whose Call
+        // arm ends the flow at a call whose signature returns `never`. So
+        // `this.handleError(e): never` as the last statement of a `catch`
+        // makes the endpoint unreachable — no TS2366, and no phantom
+        // `| undefined` on an inferred return type. `flowReachable` already
+        // reads this for narrowing; both endpoint consumers need it too.
+        .expr_stmt => return switch (c.nodeTag(d.lhs)) {
+            .call_expr, .call_expr_targs, .optional_call => c.callReturnsNever(d.lhs) catch false,
+            else => false,
+        },
         .block => return c.stmtListTerminal(c.tree.nodeRange(node)),
         .if_else_stmt => {
             const e = c.tree.extraData(ast.IfElse, d.rhs);

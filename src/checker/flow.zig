@@ -710,12 +710,27 @@ fn flowReachableInner(c: *Checker, flow: FlowId) Error!bool {
 /// callee from inside a flow query is the re-entrancy `guardCallOf`'s header
 /// note documents.
 fn callStmtReturnsNever(c: *Checker, flow: FlowId) Error!bool {
-    const call = c.bind.flowNode(flow);
+    return callReturnsNever(c, c.bind.flowNode(flow));
+}
+
+/// The same question asked of a call NODE, so consumers with no flow node to
+/// hand can ask it too (`stmtTerminal`'s endpoint analysis).
+///
+/// Resolving the callee needs the scope it was WRITTEN in, and neither caller
+/// has it: a flow walk runs at the querying reference's scope, and
+/// `stmtTerminal` recurses into nested blocks from the body's. The binder
+/// attaches a flow entry to every identifier and member read
+/// (`bindIdentifierRef` / `bindExpr`), and `flowScope` on that entry is
+/// exactly the scope wanted — reading it here is what keeps a callee declared
+/// in an inner block (`const render = () => …; … render();`) from resolving
+/// against the function scope, where the name does not exist and
+/// `checkExprCached` would report a phantom TS2304.
+pub fn callReturnsNever(c: *Checker, call: Node) Error!bool {
     if (call == null_node) return false;
+    const callee = c.callShape(call).callee;
     const saved = c.cur_scope;
     defer c.cur_scope = saved;
-    c.cur_scope = c.bind.flowScope(flow);
-    const callee = c.callShape(call).callee;
+    if (c.bind.flowAt(callee)) |f| c.cur_scope = c.bind.flowScope(f);
     const callee_t = switch (c.nodeTag(callee)) {
         .member_expr, .optional_member_expr, .index_expr, .optional_index_expr => c.nodeType(callee) orelse
             try c.declaredPathType(callee),

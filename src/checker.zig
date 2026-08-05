@@ -3521,6 +3521,7 @@ pub const Checker = struct {
     pub const flowTypeOfKey = flow_zig.flowTypeOfKey;
     pub const narrowedPatternBinding = flow_zig.narrowedPatternBinding;
     pub const flowReachable = flow_zig.flowReachable;
+    pub const callReturnsNever = flow_zig.callReturnsNever;
     pub const pushChainGuards = flow_zig.pushChainGuards;
     pub const applyChainGuards = flow_zig.applyChainGuards;
     pub const flowInFlight = flow_zig.flowInFlight;
