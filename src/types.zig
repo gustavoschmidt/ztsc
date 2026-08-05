@@ -1552,7 +1552,51 @@ pub const Store = struct {
         var list = items[0..n];
         if (nullishIntersectionIsEmpty(s, list)) return never_type;
         if (distinctUnitIntersectionIsEmpty(s, list)) return never_type;
+        if (disjointDomainIntersectionIsEmpty(s, list)) return never_type;
         if (discriminantIntersectionIsEmpty(s, list)) return never_type;
+
+        // tsc's `removeRedundantPrimitiveTypes`: a base primitive is dropped
+        // when a LITERAL of the same primitive is in the intersection, so
+        // `"a" & string` IS `"a"`. Without it the pair stayed live and the
+        // `keyof M & (string | symbol)` key-filter idiom produced
+        // `("a" & string) | ("b" & string)`, which then indexed nothing —
+        // socket.io's `EventNames` is written exactly that way and every
+        // `Map[EventNames<Map>]` downstream of it collapsed.
+        //
+        // An ENUM member is left out: its primitive domain follows its VALUE,
+        // which the store cannot read.
+        {
+            var lit: u32 = 0;
+            for (list) |t| lit |= switch (s.kind(t)) {
+                .string_literal, .template_literal_type, .string_mapping => @as(u32, 1),
+                .number_literal, .number_literal_fresh => 2,
+                .bigint_literal => 4,
+                .unique_symbol => 8,
+                .undefined => 16,
+                .bool_true, .bool_false => 32,
+                else => 0,
+            };
+            if (lit != 0) {
+                var w: usize = 0;
+                for (list) |t| {
+                    const drop = switch (s.kind(t)) {
+                        .string => lit & 1 != 0,
+                        .number => lit & 2 != 0,
+                        .bigint => lit & 4 != 0,
+                        .symbol => lit & 8 != 0,
+                        .void => lit & 16 != 0,
+                        .boolean => lit & 32 != 0,
+                        else => false,
+                    };
+                    if (drop) continue;
+                    list[w] = t;
+                    w += 1;
+                }
+                list = list[0..w];
+                if (list.len == 0) return unknown_type;
+                if (list.len == 1) return list[0];
+            }
+        }
 
         // Supertype reduction against `{}` (tsc's `getIntersectionType`): `{}`
         // is a supertype of every non-nullish type, so `X & {}` IS `X` and the
@@ -1746,6 +1790,47 @@ pub const Store = struct {
             if (seen) |prev| {
                 if (!std.mem.eql(u32, &prev, &key)) return true;
             } else seen = key;
+        }
+        return false;
+    }
+
+    /// tsc's `TypeFlags.DisjointDomains`: the primitive domains no value can
+    /// belong to two of. `boolean` is deliberately absent — tsc leaves it out
+    /// too — and so is `TypeFlags.Object`, which is why a branded
+    /// `string & { __brand }` and `NonNullable<T>`'s `T & {}` survive.
+    ///
+    /// An enum has no bit: a member's domain follows its VALUE, which the
+    /// store cannot read, so an enum-bearing intersection is left alone.
+    fn disjointDomain(s: *const Store, t: TypeId) u32 {
+        return switch (s.kind(t)) {
+            .object_keyword => 1, // NonPrimitive
+            .string, .string_literal, .template_literal_type, .string_mapping => 2,
+            .number, .number_literal, .number_literal_fresh => 4,
+            .bigint, .bigint_literal => 8,
+            .symbol, .unique_symbol => 16,
+            .void, .undefined => 32,
+            .null => 64,
+            else => 0,
+        };
+    }
+
+    /// tsc's `getIntersectionType` emptiness rule for the primitive domains:
+    /// *"a string-like type and a type known to be non-string-like, a
+    /// number-like type and a type known to be non-number-like, …"* — i.e.
+    /// two DIFFERENT disjoint domains make the intersection `never`.
+    ///
+    /// Without it `1 & string` stayed a live intersection, and the whole
+    /// `IsAny<T> = 0 extends 1 & T ? …` family, plus every
+    /// `keyof M & (string | symbol)` key filter, carried junk constituents
+    /// (`"AppRestartV1" & symbol`) that poisoned every later indexed access.
+    /// socket.io's `EventNames` / `EventNamesWithoutAck` are written that way.
+    fn disjointDomainIntersectionIsEmpty(s: *const Store, list: []const TypeId) bool {
+        var mask: u32 = 0;
+        for (list) |t| {
+            const d = disjointDomain(s, t);
+            if (d == 0) continue;
+            if (mask != 0 and mask != d) return true;
+            mask |= d;
         }
         return false;
     }
