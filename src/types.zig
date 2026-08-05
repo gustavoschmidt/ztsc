@@ -260,6 +260,15 @@ pub const obj_flag_has_sigs: u32 = 4;
 /// (`Checker.propOfTypeEx`), so the type stays a single interned word and its
 /// members cost exactly what is asked for.
 pub const obj_flag_global_this: u32 = 8;
+/// The object's ONLY index signature is keyed by `symbol` (`[k: symbol]: V`).
+/// The value type is kept in the string-index slot, so every consumer of an
+/// index signature keeps behaving as it did; the flag exists so `keyof` can
+/// report `symbol` instead of `string | number`, which is what lets a
+/// `unique symbol` key satisfy a `keyof S` parameter (nestjs-cls' `ClsStore`
+/// is `{ [key: symbol]: any }` and `cls.get(CLS_ID)` passes exactly that).
+/// Left clear when a string/number index is present too, so the shared slot
+/// is never mis-reported.
+pub const obj_flag_symbol_index: u32 = 16;
 pub const prop_flag_optional: u32 = 1;
 pub const prop_flag_readonly: u32 = 2;
 /// A `private`/`protected` class member (tsc's `ModifierFlags.NonPublic`).

@@ -1806,8 +1806,17 @@ fn keyofObjectTable(c: *Checker, r: TypeId) Error!TypeId {
         try parts.append(c.scratch(), try c.ts.makeStringLiteral(p.name, false));
     }
     if (c.ts.objectStringIndex(r) != 0) {
-        try parts.append(c.scratch(), types.string_type);
-        try parts.append(c.scratch(), types.number_type);
+        // A `symbol`-keyed signature shares the string slot but its key
+        // domain is `symbol`, not `string | number` — see
+        // `obj_flag_symbol_index`. Without this a `unique symbol` argument
+        // was rejected by every `keyof S` parameter over such a shape
+        // (nestjs-cls' `ClsStore`, immich `config.repository.ts:302-304`).
+        if (c.ts.objectFlags(r) & types.obj_flag_symbol_index != 0) {
+            try parts.append(c.scratch(), types.symbol_type);
+        } else {
+            try parts.append(c.scratch(), types.string_type);
+            try parts.append(c.scratch(), types.number_type);
+        }
     }
     if (c.ts.objectNumberIndex(r) != 0) try parts.append(c.scratch(), types.number_type);
     return c.ts.makeUnion(c.scratch(), parts.items);
@@ -2782,6 +2791,8 @@ pub fn objectTypeFromMembers(c: *Checker, member_nodes: []const Node, obj_flags:
     defer prop_index.deinit(c.scratch());
     var sindex: TypeId = 0;
     var nindex: TypeId = 0;
+    var sym_index = false;
+    var str_index = false;
     // Method overload grouping: name -> sig list.
     var methods: std.AutoHashMapUnmanaged(Atom, std.ArrayList(TypeId)) = .empty;
     defer {
@@ -2867,7 +2878,17 @@ pub fn objectTypeFromMembers(c: *Checker, member_nodes: []const Node, obj_flags:
                 const e = c.tree.extraData(ast.IndexSig, md.lhs);
                 const key = try c.typeFromTypeNode(e.key_type);
                 const val = try c.typeFromTypeNode(e.value_type);
-                if (key == types.number_type) nindex = val else sindex = val;
+                if (key == types.number_type) {
+                    nindex = val;
+                } else {
+                    // A `symbol`-keyed signature shares the string slot, so
+                    // everything that reads an index signature is unchanged;
+                    // the flag is only there for `keyof`. A string signature
+                    // written alongside one takes the slot back and clears it
+                    // — see `obj_flag_symbol_index`.
+                    if (key == types.symbol_type) sym_index = true else str_index = true;
+                    sindex = val;
+                }
             },
             // Call / construct signatures. Compared like function
             // types (not methods), so params are contravariant.
@@ -2892,7 +2913,11 @@ pub fn objectTypeFromMembers(c: *Checker, member_nodes: []const Node, obj_flags:
         if (setter_keys.contains(k.*)) continue;
         if (prop_index.get(k.*)) |idx| props.items[idx].flags |= types.prop_flag_readonly;
     }
-    const obj = try c.ts.makeObjectSigs(props.items, sindex, nindex, obj_flags, call_sigs.items, construct_sigs.items);
+    const flags = if (sym_index and !str_index and nindex == 0)
+        obj_flags | types.obj_flag_symbol_index
+    else
+        obj_flags;
+    const obj = try c.ts.makeObjectSigs(props.items, sindex, nindex, flags, call_sigs.items, construct_sigs.items);
     for (name_types.items) |nt| {
         try c.key_name_types.put(c.cm(), (@as(u64, obj) << 32) | nt.name, nt.ty);
     }
