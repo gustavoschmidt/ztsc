@@ -2134,10 +2134,38 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                 if (rem.items.len == 0 or rem.items.len == ams.len) break :blk arg;
                 break :blk try s.makeUnion(c.scratch(), rem.items);
             };
+            // tsc's `inferToMultipleTypes` runs each non-variable target
+            // constituent against each SOURCE constituent on its own, and
+            // records which sources produced an inference (`matched[i]`). The
+            // naked variable then receives the union of the UNMATCHED sources
+            // — handing the whole union to the wrapper and then standing the
+            // variable down because the wrapper inferred loses every source
+            // constituent the wrapper did not account for. `T | T[]` against
+            // `string | string[] | undefined` must infer `string | undefined`;
+            // matching the wrapper alone gives `string`.
+            //
+            // Scoped to the shape the bookkeeping is FOR: exactly one naked
+            // type-param member, which is also the only case tsc's `matched`
+            // array is consulted in (`typeVariableCount === 1`). With no naked
+            // member the wrapper keeps the whole union, because splitting it
+            // there changes what a wrapper INFERS rather than what is left
+            // over — `Pick<T, K> | T | null` against a forwarded `state`
+            // union then takes its key set from a single constituent instead
+            // of the whole source (conformance `inference/085`).
+            const per_constituent = n_tp == 1 and s.kind(arg_residual) == .union_type;
+            const src_members: []const TypeId = if (per_constituent)
+                try c.memberList(arg_residual)
+            else
+                &.{arg_residual};
+            const matched = try c.scratch().alloc(bool, src_members.len);
+            @memset(matched, false);
             for (try c.memberList(param)) |m| {
                 if (m == tp_member) continue;
-                if (try c.containsTypeParam(m)) {
-                    try c.unify(m, arg_residual, tp_syms, candidates, depth + 1);
+                if (!try c.containsTypeParam(m)) continue;
+                for (src_members, 0..) |sm, i| {
+                    const snap = try c.scratch().dupe(TypeId, candidates);
+                    try c.unify(m, sm, tp_syms, candidates, depth + 1);
+                    if (!std.mem.eql(TypeId, snap, candidates)) matched[i] = true;
                 }
             }
             // A wrapper member contributed a candidate for the naked var.
@@ -2183,7 +2211,7 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                     } else if (!rest_ok) {
                         try c.unify(tp_member, arg, tp_syms, candidates, depth + 1);
                     }
-                } else if (!wrapper_inferred) {
+                } else {
                     // Naked fallback: infer `T` from the arg. When the param's
                     // OTHER members are concrete (`T | undefined`) and the arg
                     // is a union sharing some of them, infer `T` from the
@@ -2195,24 +2223,34 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                     // whole arg when nothing subtracts (and infers nothing
                     // when the whole arg is already covered — `rest_ok`), so
                     // the `T | ReadonlyArray<T>` (flatMap) path is unchanged.
+                    //
+                    // A constituent an inference-BEARING member already
+                    // matched (`matched[i]`, tsc's `inferToMultipleTypes`
+                    // bookkeeping) subtracts the same way: what is left of the
+                    // source after both filters is what the naked variable
+                    // gets. Only when NOTHING is left does the wrapper's
+                    // inference stand the variable down entirely — tsc infers
+                    // the whole source there at `NakedTypeVariable` priority,
+                    // which any candidate the wrapper already recorded beats.
                     var rem: std.ArrayList(TypeId) = .empty;
                     defer rem.deinit(c.scratch());
                     const arg_members: []const TypeId = if (s.kind(arg) == .union_type) try c.memberList(arg) else &.{arg};
-                    for (arg_members) |am| {
-                        var matched = false;
+                    for (src_members, 0..) |am, i| {
+                        if (matched[i]) continue;
+                        var covered = false;
                         for (try c.memberList(param)) |m| {
                             if (m == tp_member) continue;
                             if (try c.containsTypeParam(m)) continue;
                             if (try c.isAssignable(am, m)) {
-                                matched = true;
+                                covered = true;
                                 break;
                             }
                         }
-                        if (!matched) try rem.append(c.scratch(), am);
+                        if (!covered) try rem.append(c.scratch(), am);
                     }
                     if (rem.items.len > 0 and rem.items.len < arg_members.len) {
                         try c.unify(tp_member, try s.makeUnion(c.scratch(), rem.items), tp_syms, candidates, depth + 1);
-                    } else if (!rest_ok) {
+                    } else if (!rest_ok and !(rem.items.len == 0 and wrapper_inferred)) {
                         try c.unify(tp_member, arg, tp_syms, candidates, depth + 1);
                     }
                 }
