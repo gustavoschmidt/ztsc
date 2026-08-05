@@ -2642,9 +2642,25 @@ pub fn mentionsMappedParamInner(c: *Checker, t: TypeId, key_id: u32) Error!bool 
             }
             break :blk false;
         },
+        // Every slot `substMappedKey`'s `.object` arm rewrites has to be
+        // asked about here, or the early-out returns the object untouched
+        // and the key is never bound in it. The INDEX SIGNATURE is the one
+        // that mattered: `Record<string, V>` materializes to `{ [x: string]:
+        // V }`, so a mapped type whose value is `Record<string, F<M[C]>>`
+        // (kysely's `SelectQueryBuilderExpression<Record<string,
+        // UpdateType<DB[T][C]>>>` inside `UpdateObject`) kept `C` free
+        // forever and related to nothing.
         .object => blk: {
             for (0..s.objectPropCount(t)) |i| {
                 if (try c.mentionsMappedParam(s.objectProp(t, @intCast(i)).ty, key_id)) break :blk true;
+            }
+            if (s.objectStringIndex(t) != 0 and try c.mentionsMappedParam(s.objectStringIndex(t), key_id)) break :blk true;
+            if (s.objectNumberIndex(t) != 0 and try c.mentionsMappedParam(s.objectNumberIndex(t), key_id)) break :blk true;
+            for (0..s.objectCallSigCount(t)) |i| {
+                if (try c.mentionsMappedParam(s.objectCallSig(t, @intCast(i)), key_id)) break :blk true;
+            }
+            for (0..s.objectConstructSigCount(t)) |i| {
+                if (try c.mentionsMappedParam(s.objectConstructSig(t, @intCast(i)), key_id)) break :blk true;
             }
             break :blk false;
         },
@@ -2742,6 +2758,13 @@ pub fn substMappedKey(c: *Checker, t: TypeId, key_id: u32, key_ty: TypeId) Error
             }
             return s.makeTuple(elems.items);
         },
+        // The whole shape has to survive, not just the properties: this arm
+        // used to rebuild the object from its property list alone, dropping
+        // both index signatures, the object flags and every call/construct
+        // signature. It was invisible while `mentionsMappedParam` did not
+        // look at those slots either (the early-out returned `t` untouched),
+        // and the moment it does, dropping them would be a much worse bug
+        // than the one it fixes. Mirrors `instantiateId`'s `.object` arm.
         .object => {
             var props: std.ArrayList(types.Prop) = .empty;
             defer props.deinit(c.scratch());
@@ -2749,7 +2772,19 @@ pub fn substMappedKey(c: *Checker, t: TypeId, key_id: u32, key_ty: TypeId) Error
                 const p = s.objectProp(t, @intCast(i));
                 try props.append(c.scratch(), .{ .name = p.name, .ty = try c.substMappedKey(p.ty, key_id, key_ty), .flags = p.flags });
             }
-            return s.makeObject(props.items, 0, 0, 0);
+            const sidx = if (s.objectStringIndex(t) != 0) try c.substMappedKey(s.objectStringIndex(t), key_id, key_ty) else 0;
+            const nidx = if (s.objectNumberIndex(t) != 0) try c.substMappedKey(s.objectNumberIndex(t), key_id, key_ty) else 0;
+            var call_sigs: std.ArrayList(TypeId) = .empty;
+            defer call_sigs.deinit(c.scratch());
+            for (0..s.objectCallSigCount(t)) |i| {
+                try call_sigs.append(c.scratch(), try c.substMappedKey(s.objectCallSig(t, @intCast(i)), key_id, key_ty));
+            }
+            var ctor_sigs: std.ArrayList(TypeId) = .empty;
+            defer ctor_sigs.deinit(c.scratch());
+            for (0..s.objectConstructSigCount(t)) |i| {
+                try ctor_sigs.append(c.scratch(), try c.substMappedKey(s.objectConstructSig(t, @intCast(i)), key_id, key_ty));
+            }
+            return s.makeObjectSigs(props.items, sidx, nidx, s.objectFlags(t), call_sigs.items, ctor_sigs.items);
         },
         .function => {
             var params: std.ArrayList(types.Param) = .empty;
