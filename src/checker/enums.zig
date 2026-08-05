@@ -723,6 +723,38 @@ pub fn classStaticType(c: *Checker, sym: SymbolId) Error!TypeId {
             const base_static = try c.classStaticType(base);
             _ = c.class_static_base_active.remove(sym);
             result = try c.mergeBaseObject(result, base_static, false);
+        } else if (blk: {
+            try c.class_static_base_active.put(c.cm(), sym, {});
+            defer _ = c.class_static_base_active.remove(sym);
+            break :blk try c.baseExprConstructType(sym);
+        }) |base_ctor| {
+            // `class D extends <expression>`: the STATIC side inherits the
+            // base expression's own members, exactly as it inherits a base
+            // class's statics — tsc gives the class's static type the base
+            // CONSTRUCTOR type as its base type, so anything declared beside
+            // the construct signature is reachable through `D.`. The
+            // signatures are deliberately dropped: `classConstructType`
+            // builds this class's own from its constructors, and the base
+            // instance already comes from `classInstanceGeneric`'s matching
+            // `baseExprConstructType` arm.
+            //
+            // nestjs-zod is written this way — `class Dto extends
+            // createZodDto(Schema) {}`, where `ZodDto` declares
+            // `create(input: unknown)`, `schema` and `isZodDto` next to its
+            // `new ()`. immich calls `HlsPlaylistHeaderDto.create(headers)`
+            // and reads `PluginManifestDto.schema`.
+            var bprops: std.ArrayList(types.Prop) = .empty;
+            defer bprops.deinit(c.scratch());
+            for (0..c.ts.objectPropCount(base_ctor)) |i| {
+                try bprops.append(c.scratch(), c.ts.objectProp(base_ctor, @intCast(i)));
+            }
+            const base_static = try c.ts.makeObject(
+                bprops.items,
+                c.ts.objectStringIndex(base_ctor),
+                c.ts.objectNumberIndex(base_ctor),
+                0,
+            );
+            result = try c.mergeBaseObject(result, base_static, false);
         }
     }
     try c.class_static_cache.put(c.cm(), sym, result);
