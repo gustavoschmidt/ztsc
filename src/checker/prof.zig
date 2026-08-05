@@ -1220,6 +1220,148 @@
 //!
 //! The rest: bullmq `Job<…, infer N>` (job.repository ×2), main.ts ×2 (the
 //! socket.io family's residue, a different call), and fifteen one-offs.
+//!
+//! ## 10 -> 5: the last ten, six of them closed (2026-08-05)
+//!
+//! Same method again, and the same lesson: every one is an ordinary
+//! type-system rule ztsc had not transcribed, each isolates in a handful of
+//! lines, none needed a profile. immich **10 -> 5 at c4 and 9 -> 4 at c1, zero
+//! new keys** (one appeared mid-way and was closed by the scoping below).
+//!
+//! * **A union parameter's naked variable takes the UNMATCHED constituents.**
+//!   tsc's `inferToMultipleTypes` runs each non-variable target constituent
+//!   against each SOURCE constituent on its own and records which sources
+//!   produced an inference; the naked variable gets the union of the rest.
+//!   ztsc handed the whole union to the wrapper and stood the variable down
+//!   whenever the wrapper inferred anything, losing every constituent the
+//!   wrapper did not account for — `T | T[]` against
+//!   `string | string[] | undefined` gave `string`, not `string | undefined`.
+//!   Scoped to exactly one naked member, which is also tsc's
+//!   `typeVariableCount === 1`: with no naked member, splitting the union
+//!   changes what a wrapper INFERS rather than what is left over, and
+//!   `Pick<T, K> | T | null` against a forwarded `state` then takes its key
+//!   set from one constituent (conformance `inference/085`).
+//! * **An element access keyed by a whole ENUM**, plus a NUMERIC property key.
+//!   `checkIndexExpr`'s catch-all classifies the key as string- or
+//!   number-like and a whole enum is neither (ztsc models an enum as ONE
+//!   nominal type, tsc as the union of its members); and
+//!   `indexedAccessType`'s numeric arm went straight to `numberIndexType`, so
+//!   `{ 0: string }[0]` was `any` too. Together these made
+//!   `handlers[name as JobName]` on `Partial<Record<JobName, JobMapItem>>`
+//!   answer `any` — poisoning the inferred return type of the method holding
+//!   it (`job.service.ts:91`).
+//! * **An enum member initialized with ANOTHER enum's member is a CONSTANT**
+//!   (tsc's `computeConstantValue` over an entity name). Classified
+//!   `computed`, it cost the whole enum its `all_string` classification, so
+//!   the member no longer widened to `string` and `typeof E` no longer
+//!   satisfied `Readonly<Record<string, string | number>>` — zod's
+//!   `z.enum(E)` parameter (`enum.ts:103`). The bare-name form (`B = A`) is
+//!   deliberately NOT folded: ztsc's binder declares no scope for an enum
+//!   body, so such a reference is already TS2304 and folding it would not
+//!   make the declaration check. Watch the file-scope trap this exposed —
+//!   both walks run under `enterSymFile`, which switches the FILE and leaves
+//!   `cur_scope` pointing into the REQUESTER's, an out-of-bounds scope id.
+//! * **A NON-ARRAY rest parameter takes its arguments as a TUPLE** (tsc's
+//!   `getNonArrayRestType` / `getSpreadArgumentType`). ztsc read the rest's
+//!   array ELEMENT, which mentions no inference variable, so
+//!   `K extends PropertyName[]` fell back to its constraint and lodash's
+//!   `omit`'s `Pick<T, Exclude<keyof T, K[number]>>` reduced to `{}` for every
+//!   call (`shared-link.repository.ts:179`). Two scopings are load-bearing: an
+//!   element keeps its LITERAL when the rest's element type is primitive
+//!   (tsc's `hasPrimitiveContextualType`), and a CONTEXT-SENSITIVE function
+//!   argument stops the pass (tsc gets `anyFunctionType` under
+//!   `SkipContextSensitive` and the tuple propagates `NonInferrableType`).
+//!
+//! ### The `freshLiteralUnionMismatch` question above is SETTLED
+//!
+//! The note this header left — that the swagger case and the
+//! `crypto.subtle.decrypt` case "differ somewhere in `findMatchingDiscriminant
+//! Type` / `filterPrimitivesIfContainsNonPrimitive`" — was looking in the
+//! wrong place, and the answer was derived from the ORACLE rather than from
+//! reading: twelve probes separate the candidate models and exactly one rule
+//! fits all twelve.
+//!
+//! `hasExcessProperties` has a SECOND half, and over a union it is the whole
+//! rule. Having found a written property's NAME known somewhere in the union,
+//! tsc compares the property's VALUE against
+//! `getTypeOfPropertyInTypes(checkTypes, name)` — the union of that property's
+//! type over EVERY constituent, `undefined` standing in for a constituent that
+//! does not have it — and fails the relation when the value does not fit.
+//! Nothing else is per-constituent: `unionOrIntersectionRelatedTo` then
+//! relates the REGULARIZED literal to some constituent and never
+//! excess-checks again.
+//!
+//! That single rule gives both recorded shapes. The crypto case fails because
+//! `iv` is `number` in the one arm that has it and `undefined` in the rest;
+//! the swagger case passes because `name` (`string` in the second arm) and
+//! `type` (a `Ctor` union in the first) each fit, after which the regularized
+//! literal relates to `Common`. The old per-constituent model is stricter
+//! exactly when the properties are SPREAD ACROSS ARMS, which is what
+//! `ApiQuery({ name, type })` is. Two scopings matter: the wholesale bail on a
+//! union CONTAINING an empty object type or `object` (`isEmptyObjectType` is
+//! `some` over a union), and reporting only when the elaboration can NAME the
+//! property — tsc's own message does
+//! (`Types_of_property_0_are_incompatible`), and when ztsc's cannot, this
+//! check is disagreeing with the relation walk that just accepted the literal,
+//! which is a false positive on any pair whose property types ztsc evaluates
+//! differently (it cost one fresh key, `album.service.ts:163`, a kysely
+//! `ShallowDehydrateValue`, until it was scoped).
+//!
+//! ### What is left at 5, and what each one is
+//!
+//! 5 at c4 / 4 at c1 (`asset.repository.ts:192`'s TS2589 is still the one
+//! c4-only key, as it has been for three sessions).
+//!
+//! * **`user.repository.ts:311` TS2769** — kysely `.set()` with a
+//!   subquery-valued update column, and it is now bisected to NINE lines and
+//!   is ORDER-INDEPENDENT (it reproduces alone in a file). The failing shape
+//!   is precisely: the OBJECT form of `set` whose property is a factory arrow
+//!   whose body contains a NESTED callback call —
+//!
+//!       db.updateTable('user').set({
+//!         quotaUsageInBytes: (eb) =>
+//!           eb.selectFrom('asset').select((eb2) => eb2.lit(0).as('usage')),
+//!       })
+//!
+//!   Both neighbours are CLEAN, which is the whole handle: the two-argument
+//!   `set('quotaUsageInBytes', <same factory>)` overload is clean, and the
+//!   object form with a factory that has NO nested callback is clean. The
+//!   inner builder's row type is also right on its own (`{ usage: number }`,
+//!   byte-identical to the oracle). So it is not the subquery and not the
+//!   `set` value slot alone — it is contextually typing a context-sensitive
+//!   arrow that is an OBJECT-LITERAL PROPERTY, whose contextual type comes
+//!   from a mapped-type property (`UpdateObject`'s
+//!   `ValueExpression<DB, TB, V>`), when that arrow is itself the receiver of
+//!   a second context-sensitive call. That is where the next bisect starts.
+//! * **`search.service.ts:33` and `asset.service.ts:127` TS2345** — traced,
+//!   and they are the truncation MASK, not a separate evaluation bug. Two
+//!   independent probes settle it: `person.getByName` copied into a project
+//!   holding nothing else reports the TS2589 at its `.selectFrom([…])`, and
+//!   once a cheap warm-up statement PREPAYS that materialization the same
+//!   chain's element type is correct and the consumer that fails in the app
+//!   (`wantPerson(person)`) is clean. `asset.service.ts:127`'s one bad
+//!   property (`deletedAt: unknown` for a `Timestamp | null` column) is the
+//!   same: `Selectable<{ deletedAt: Timestamp | null }>` computed at the type
+//!   level is byte-correct against the oracle. Both keys move when the
+//!   TS2589 below moves, and not before.
+//! * **`asset.repository.ts:192` and `ocr.repository.ts:33` TS2589** — the
+//!   budget-order pair, untouched (the ceiling family is closed from five
+//!   directions in this header). One new datum for whoever reopens it: the
+//!   asymmetry is sharp and cheap to reproduce. `db.selectFrom(['person'])`
+//!   — an ARRAY of ONE plain table — trips the 250 k statement cap where
+//!   `db.selectFrom('person')` does not, in a 110-file program with immich's
+//!   `DB` and nothing else, and its profile is ONE top-level `instantiate`
+//!   charging 1,600,183 node visits of the statement's 6.17 M. Whichever
+//!   `selectFrom([…])` is checked FIRST in a file pays and trips; every later
+//!   one is clean. That is a single overload's cost, not a spread demand, and
+//!   it is the first handle on this family that names one entry.
+//!
+//! ### Not an immich key, found on the way and left alone
+//!
+//! A bare enum-member reference inside an enum body (`enum E { A = 1, B = A }`)
+//! is TS2304 in ztsc and clean in tsc: the binder declares no scope for an
+//! enum body, so the member names are not resolvable as values there. It needs
+//! a binder change, not a checker one.
 
 const std = @import("std");
 const types = @import("../types.zig");
