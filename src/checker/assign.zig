@@ -3171,12 +3171,23 @@ pub fn collectPropNames(c: *Checker, t: TypeId, out: *std.ArrayList(Atom), depth
 
 /// A unit type, or a union of nothing but unit types.
 pub fn isUnitOrUnitUnion(c: *Checker, t: TypeId) Error!bool {
-    if (c.ts.kind(t) != .union_type) return isUnitLikeKind(c.ts.kind(t));
+    if (c.ts.kind(t) != .union_type) return isUnitType(c, t);
     for (0..c.ts.memberCount(t)) |i| {
         const m = try c.resolveStructural(c.ts.memberAt(t, i));
-        if (!isUnitLikeKind(c.ts.kind(m))) return false;
+        if (!isUnitType(c, m)) return false;
     }
     return true;
+}
+
+/// tsc's `isUnitType` — a type denoting a single value. An enum MEMBER is one
+/// (tsc's "enum literal"); a whole enum is not, so the test needs the type and
+/// not just its kind. Enum-tagged discriminated unions are ordinary in
+/// application code — excalidraw's `SocketUpdateDataSource` is keyed by
+/// `WS_SUBTYPES` members — and without the member arm
+/// `discriminatedUnionAssignable` declined every one of them.
+pub fn isUnitType(c: *Checker, t: TypeId) bool {
+    if (c.ts.kind(t) == .enum_type) return c.ts.isEnumMember(t);
+    return isUnitLikeKind(c.ts.kind(t));
 }
 
 /// Every named property of object `member` other than the discriminant
