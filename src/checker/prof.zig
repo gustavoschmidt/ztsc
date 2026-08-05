@@ -1475,6 +1475,108 @@
 //!   it too — the immich case separates only because the relation short
 //!   circuits on a derived-to-base pair while `unify` walks it structurally.
 //!   Pinned by the app gate.
+//!
+//! ## CLOSED: immich is 0/0 (2026-08-05, 6585bbd + aa108cc)
+//!
+//! **immich reports ZERO diagnostics at `--checkers=1`, `4` and `8`, three
+//! runs each, byte-stable, against a tsgo that is also clean — 0 excess and
+//! 0 under.** The campaign that this header records from 498 keys down is
+//! finished. Both remaining keys fell to ordinary type-system rules; neither
+//! needed a budget experiment, and the ceiling family stayed closed.
+//!
+//! * **`asset.service.ts:127` TS2345 — an intersection did not factor out an
+//!   irreducible nullish** (6585bbd, conformance
+//!   `assignability/092_intersection_extracts_irreducible_nullish`). tsc's
+//!   `extractIrreducible` runs in `getIntersectionType` BEFORE the cross
+//!   product: when every member is a union containing `undefined` (then,
+//!   separately, `null`), the nullish half survives no product, so
+//!   `(A | null) & (B | null)` is `(A & B) | null` and not the four-way
+//!   product. ztsc distributed instead, and the `null & <member>` products it
+//!   left standing are only killed by `nullishIntersectionIsEmpty`, which is
+//!   deliberately syntactic and cannot see through a `.ref`. So `null & Date`
+//!   survived — and a distributive conditional MATCHES it (an intersection
+//!   relates when one member does) while inferring nothing, so `infer S` fell
+//!   back to `unknown` and poisoned the union.
+//!
+//!   `AssetRepository.update`'s second branch is a CTE named `asset` that
+//!   SHADOWS the table it selects from, so `DB['asset']` is
+//!   `AssetTable & <cte row>` and `deletedAt` — the only nullable
+//!   `ColumnType` in the table — became
+//!   `(Timestamp | null) & (Date | null)`. kysely's
+//!   `SelectType<T> = T extends ColumnType<infer S, any, any> ? S : T` then
+//!   answered `unknown` for that one column; every other property already
+//!   matched, which is exactly what the previous session's probes had
+//!   reported. It reproduces in twenty lines with `ColumnType` and `Date` and
+//!   no query builder at all — the earlier warm-order caveat was about the
+//!   BUILDER CHAIN, and the bug is one level below it.
+//!
+//! * **`asset.repository.ts:192` TS2589 — `substInfer` reduced a conditional
+//!   chain bottom-up** (aa108cc, conformance
+//!   `conditional/044_infer_subst_takes_one_branch`). `planConditional` /
+//!   `CondPlan` (69a019d) taught `instantiateId` to DECIDE FIRST and
+//!   substitute only the winning branch. `substInfer` — the pass that binds a
+//!   conditional's own `infer` variables into the branch it selected — was
+//!   never converted: it substituted the check, the extends clause and BOTH
+//!   BRANCHES, then called `reduceConditional` on the four finished types.
+//!
+//!   That matters because the types this arm is handed are whole FALL-THROUGH
+//!   CHAINS. An enclosing conditional binds an `infer` variable
+//!   (`CTE extends (creator: QueryCreator<any>) => infer Q ? <chain> : never`),
+//!   the chain under it was built while `Q` was still unbound so every level
+//!   deferred symbolically, and each alternative therefore sits in the
+//!   previous one's FALSE branch. Substituting both branches before reducing
+//!   evaluates that chain BOTTOM-UP: the last alternative's relation runs
+//!   first and EVERY alternative runs, however early the answer was found.
+//!
+//!   kysely's `ExtractRowFromCommonTableExpression<CTE>` is four alternatives
+//!   deep (`Expression`, then the Insert/Update/Delete builders). An
+//!   INSERT-shaped CTE matches the SECOND and still paid for the third and the
+//!   fourth — which is why the previous session measured a SELECT-shaped CTE
+//!   at 26,584 and this one at the whole budget: SELECT matches the FIRST
+//!   alternative, so it never had a wrong branch to walk. The self-contained
+//!   repro is one file, kysely only, no immich: a synthetic 60-table x
+//!   17-column `DB` and `db.with('cte', (qb) => qb.insertInto('t0').values(v))`.
+//!
+//!       | | before | after |
+//!       |---|---:|---:|
+//!       | node visits (whole program) | 398,222 | **184,618** |
+//!       | budget trips | 158 | **0** |
+//!       | the one `instantiateSigForCall` of `with<N, E>` | 272,523 | **58,919** |
+//!       | `expandRef(DeleteQueryBuilder)` | 195,201 / 204 calls | **20,740 / 8** |
+//!
+//!   204 expansions of `DeleteQueryBuilder` over a 60-table schema, in a
+//!   program with no `deleteFrom` anywhere in it, is the whole bug in one
+//!   number. tsgo checks the same file clean in 0.05 s.
+//!
+//!   The lib-free fixture needed one non-obvious thing: the alternatives have
+//!   to be individually expensive enough that FOUR exceed a statement's
+//!   250,000 nodes while ONE does not, which four generic builder-shaped
+//!   interfaces over a 1,000-member template literal supply (~120 k each).
+//!   Pre-fix it reports TS2589 and no answer; post-fix it is byte-identical to
+//!   the oracle. Its negative controls re-run the same four-alternative
+//!   selection over CHEAP marker interfaces so every alternative, the
+//!   fall-off, the still-generic `need_both` defer, the `any` check's
+//!   `both_any`, and the distributive-union case are all exercised.
+//!
+//! ### The end state, measured
+//!
+//! `--inst-profile` on the whole package at `--checkers=1`: **0 budget trips**
+//! and a costliest statement of **40,066** of 250,000 (was 147,303 at the
+//! previous entry, 250,001 three entries before that). Nothing in immich
+//! truncates and nothing comes close.
+//!
+//! Both fixes are also net WORK, not just net keys — the whole package at
+//! `--checkers=4` goes **4.76 s / 3.02 GB -> 3.96 s / 2.54 GB** (tsgo 7.0.2:
+//! 3.00 s / 2.28 GB, clean). Every gate is unchanged: parity 8/8 at 0/0,
+//! repeat 80/80, crash 128/128, excalidraw 17/0/0 CONVERGED, conformance
+//! 1082 -> 1084, e2e multi flat.
+//!
+//! The instrument in this file has now done its job three times over and the
+//! lesson each time was the same: **every remaining key was ordinary type-
+//! system surface, and the profile was useful for LOCATING the frame, never
+//! for diagnosing it.** The budget-ceiling family is closed from six
+//! independent directions and should not be reopened without a trip counter
+//! that is non-zero.
 
 const std = @import("std");
 const types = @import("../types.zig");
