@@ -3561,6 +3561,7 @@ pub const Checker = struct {
     pub const narrowByTypeofResolved = flow_zig.narrowByTypeofResolved;
     pub const typeofMatches = flow_zig.typeofMatches;
     pub const typeofMatchesFn = flow_zig.typeofMatchesFn;
+    pub const enumTypeofDomain = flow_zig.enumTypeofDomain;
     pub const hasCallableShape = flow_zig.hasCallableShape;
     pub const narrowByDiscriminant = flow_zig.narrowByDiscriminant;
     pub const narrowByPropTruthiness = flow_zig.narrowByPropTruthiness;

@@ -2310,11 +2310,35 @@ pub fn narrowByTypeofResolved(c: *Checker, t: TypeId, which: usize, sense: bool)
 /// can only lose a diagnostic, never invent one.
 pub fn typeofMatchesFn(c: *Checker, t: TypeId, which: usize) Error!bool {
     if (c.typeofMatches(t, which)) return true;
+    if (c.ts.kind(t) == .enum_type) return c.enumTypeofDomain(t, which);
     if (which != 7) return false;
     return switch (c.ts.kind(t)) {
         .ref, .object, .intersection => c.hasCallableShape(t),
         else => false,
     };
+}
+
+/// Which `typeof` bucket an enum type falls in. tsc models an enum as the
+/// UNION of its member types, and each member type is a string- or
+/// number-LITERAL type carrying the enum flag — so `typeof` classifies an
+/// enum by its VALUE domain, and `typeof p === 'string'` keeps a string enum
+/// whole rather than collapsing it to `never`. ztsc keeps an enum as ONE
+/// nominal type, so the domain has to be read off the declaration: a member
+/// by its own constant value, a whole enum by whether any member is
+/// string-valued (the split `isStringish` / `isNumberish` already follow).
+///
+/// Nothing else changes: an enum is not an object and not a function, so
+/// every other bucket stays false and those branches narrow as before.
+pub fn enumTypeofDomain(c: *Checker, t: TypeId, which: usize) Error!bool {
+    if (which != 0 and which != 1) return false; // only "string" / "number"
+    const sym = c.ts.enumSymbol(t);
+    var stringish = c.enumHasStringMember(sym);
+    if (c.ts.isEnumMember(t)) {
+        if (try c.enumMemberValue(sym, c.ts.enumMemberAtom(t))) |v| {
+            stringish = c.ts.kind(try c.ts.regularLiteral(v)) == .string_literal;
+        }
+    }
+    return if (which == 0) stringish else !stringish;
 }
 
 /// Does `t` carry a call or construct signature? (`lastCallSig` already
