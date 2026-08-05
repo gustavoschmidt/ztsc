@@ -1613,6 +1613,32 @@ pub fn contextualArrayElemType(c: *Checker, rctx: TypeId) Error!TypeId {
             if (elems.items.len == 0) return types.no_type;
             return c.ts.makeUnion(c.scratch(), elems.items);
         },
+        // tsc's `getApparentTypeOfContextualType`: a contextual type that is
+        // still a type VARIABLE — the inference target of a call in flight —
+        // contributes through its base CONSTRAINT, which is where the element
+        // shape lives. The TUPLE branch of `checkArrayLiteral` already looks
+        // through the constraint; the plain-array branch did not, so an array
+        // literal passed to `f<T extends readonly Name[]>(xs: T)` was checked
+        // with NO contextual element type at all and every element widened.
+        //
+        // kysely's `selectFrom<TE extends TableExpressionOrList<DB, TB>>(from:
+        // TE)` is that shape: `db.selectFrom(['person'])` widened `'person'`
+        // to `string`, so `TE` inferred `string[]`, `From<DB, string>`
+        // collapsed the whole schema to `{ [x: string]: <one table> }` and the
+        // builder came back as a 60-constituent union — immich's
+        // `person.getByName` row type was `{}`. Writing `['person'] as const`
+        // or the type argument by hand was already correct, which is the tell.
+        //
+        // One level only: the constraint's own type variables are not
+        // re-followed, mirroring `getBaseConstraintOfType`'s fixed point being
+        // reached at the first non-instantiable form here.
+        .type_param => {
+            const con = try c.typeParamConstraint(c.ts.typeParamSymbol(rctx));
+            if (con == types.no_type) return types.no_type;
+            const rcon = try c.resolveStructural(con);
+            if (c.ts.kind(rcon) == .type_param) return types.no_type;
+            return c.contextualArrayElemType(rcon);
+        },
         else => return types.no_type,
     }
 }
