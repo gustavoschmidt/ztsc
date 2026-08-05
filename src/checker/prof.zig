@@ -1362,6 +1362,119 @@
 //! is TS2304 in ztsc and clean in tsc: the binder declares no scope for an
 //! enum body, so the member names are not resolvable as values there. It needs
 //! a binder change, not a checker one.
+//!
+//! ## 5 -> 2: and the ceiling family closes for real (2026-08-05, 821d4d4)
+//!
+//! immich **5 -> 2 keys at c4 and c8, 4 -> 1 at c1, zero new keys at any
+//! step**, byte-stable over three runs at each of c1/c4/c8. Three fixes, none
+//! of them a budget experiment:
+//!
+//! * **A map's key binds through an INDEX SIGNATURE** (1232e47, conformance
+//!   `mapped/064`). `substMappedKey` is gated on `mentionsMappedParam`, whose
+//!   object arm walked the property list ALONE — no index signature, no
+//!   call/construct signatures — so a template of the form `Record<string,
+//!   F<M[K]>>` answered "does not mention K" and was returned untouched, the
+//!   key staying FREE in the reduced type for the rest of the run. The
+//!   substitution's own object arm had the mirror-image hole, masked by the
+//!   predicate: it rebuilt the object from its properties, dropping both index
+//!   signatures, the flags and every signature. Either fix alone is a
+//!   regression. Closed `user.repository.ts:311` — kysely's `UpdateObject`
+//!   slot reduced its `Expression<V>` half and left `DB[T][C]` standing in the
+//!   `SelectQueryBuilderExpression<Record<string, V>>` half.
+//! * **tsc's `couldContainTypeVariables` gate on `unify`** (e9cc773).
+//!   `inferFromTypes` opens with it and ztsc had no equivalent; nothing in
+//!   `unify` can record a candidate unless the PATTERN reaches a type
+//!   parameter, and the walk it skips `resolveStructural`s BOTH sides.
+//!   `TransactionBuilder.execute<T>(cb: (trx: Transaction<DB>) => Promise<T>)`
+//!   is the shape: `T` lives only in the return, but the parameter position is
+//!   walked too, and `Transaction<DB>` against the written `Kysely<DB>`
+//!   expanded both classes over the 60-table schema. `ocr.repository.ts`'s
+//!   `deleteAll` spent its whole 250,000-node budget there; it now costs under
+//!   a thousand. Note the shape of the evidence: the DIRECT relation between
+//!   the same two function types was always cheap, and writing
+//!   `(trx: Transaction<DB>)` was always cheap — only inference paid.
+//! * **An array literal's element context comes through the type variable's
+//!   CONSTRAINT** (821d4d4, conformance `inference/086`). tsc's
+//!   `getApparentTypeOfContextualType`; `checkArrayLiteral` already looked
+//!   through the constraint for TUPLE context and not for the plain-array
+//!   branch, so `db.selectFrom(['person'])` widened `'person'` to `string`,
+//!   `TE` inferred `string[]`, and `From<DB, string>` degenerated its key set
+//!   `keyof DB | ExtractAlias<DB, string>` to `string` — collapsing the schema
+//!   to `{ [x: string]: <one table> }` ONCE PER TABLE, so the builder came
+//!   back a sixty-constituent union and `person.getByName`'s row type was
+//!   `{}`. `['person'] as const` and the hand-written type argument were both
+//!   already byte-correct, which is the tell.
+//!
+//! ### The `selectFrom([…])` asymmetry was NOT a budget problem
+//!
+//! The entry above left `db.selectFrom(['person'])` tripping the cap where
+//! `db.selectFrom('person')` does not, and read it as the last handle on the
+//! budget family. It is the widening bug: the array form inferred `string[]`
+//! and then evaluated `From<DB, string>` sixty times over. The cost was a
+//! SYMPTOM of the wrong type argument, not the cause of the wrong answer — and
+//! the two keys the header called "the truncation MASK"
+//! (`search.service.ts:33`, `asset.service.ts:127`) were never masks either:
+//! `search.service.ts` closed with the widening fix, and `asset.service.ts`
+//! survives in a package where nothing truncates at all.
+//!
+//! **The ceiling family is closed with a counter, not an argument.** On the
+//! whole package at `--checkers=1`, `--inst-profile` now reports **0 budget
+//! trips** and a costliest statement of 147,303 of 250,000. No statement and
+//! no declaration window in immich truncates. Any remaining excess is ordinary
+//! type-system surface.
+//!
+//! ### The 2 that are left, and exactly what each is
+//!
+//! * **`asset.service.ts:127` TS2345** (c1, c4 and c8 — the only key at c1).
+//!   `AssetRepository.update` returns a union of two branches and the SECOND
+//!   one — the `with('asset', (qb) => qb.updateTable('asset')…returningAll())
+//!   .selectFrom('asset').selectAll('asset').$call(withExif)…` chain — types
+//!   `deletedAt` as `unknown`; every other property matches. Ruled out, each
+//!   probed against the oracle in a scratch project: the `getById` branch
+//!   (`Date | null`, correct), the `returningAll()` row read directly
+//!   (correct), `Selectable<AssetTable>['deletedAt']` (correct), and
+//!   `SelectType` applied once, twice, or to `Date | null` (all correct).
+//!   `deletedAt` is the only NULLABLE `ColumnType` (`Timestamp | null`) in the
+//!   table, so the trigger is a nullable column carried through a CTE that
+//!   SHADOWS the table it selects from. The bisect needs care: the chain
+//!   copied into a scratch project still trips the 250 k cap there (the
+//!   package's other 600 files warm what it needs), so it has to be read off
+//!   the app's own declaration — `NonNullable<Awaited<ReturnType<
+//!   AssetRepository['update']>>>['deletedAt']` in a file that imports
+//!   nothing else reproduces the `unknown` with the package's budget profile.
+//! * **`asset.repository.ts:192` TS2589** (c4 and c8, not c1 — the same
+//!   budget-order coin, now the ONLY one left). `upsertExif`'s
+//!   `this.db.with('audio', (qb) => qb.insertInto('asset_audio')…)`. Profiled
+//!   to a single frame: `instantiateSigForCall` of `QueryCreator.with<N, E>`
+//!   charges **1,270,290 node visits in one entry**, and a depth-tagged charge
+//!   dump puts ALL of it inside ONE type — the four-branch
+//!   `ExtractRowFromCommonTableExpression<E>` conditional in the return type
+//!   `QueryCreator<DB & { [K in ExtractTable…<N>]: … }>` — spread over
+//!   thousands of sub-frames of which NONE exceeds 30,000. It is not the
+//!   contextual typing (a pre-typed callback costs the same), not the
+//!   inference (explicit type arguments cost the same), and not the reduction
+//!   itself (the same conditional written out by hand against a concrete CTE
+//!   type is cheap). It is the SUBSTITUTION of that conditional under the
+//!   call's map. A SELECT-shaped CTE costs 26,584; the INSERT-shaped one costs
+//!   the whole budget, which points at the branches that must fail
+//!   (`Q extends Expression<infer QO>`) before the matching one is reached.
+//!
+//! ### Re-measured negatives from this session
+//!
+//! * **Arming `inferFromExtends`' `containsInfer` gate unconditionally**
+//!   (today it arms only after `max_infer_steps`). Parity is now 8/8 at 0/0
+//!   with it on — the 46-key drizzle regression its comment records no longer
+//!   happens — and it takes the kysely repro 6.12 M -> 5.94 M node visits.
+//!   But it moves ZERO immich keys and immich's wall went 4.2 -> 5.2 s in the
+//!   same measurement. Not taken; the comment's reasoning about expansion
+//!   ORDER still stands and there is nothing to buy.
+//! * **A lib-free fixture for the `unify` gate.** Four shapes tried. The
+//!   blocker is structural: ztsc expands a reference ONE level, so a deep
+//!   synthetic interface tree costs nothing to `resolveStructural`, and any
+//!   shape big enough to exceed the statement budget makes the RELATION pay
+//!   it too — the immich case separates only because the relation short
+//!   circuits on a derived-to-base pair while `unify` walks it structurally.
+//!   Pinned by the app gate.
 
 const std = @import("std");
 const types = @import("../types.zig");
