@@ -102,6 +102,14 @@ pub fn aliasedEnumInitValue(c: *Checker, own: SymbolId, init_node: Node) Error!?
         // is read off it exactly as the type-position form does.
         .member_expr => {
             const d = c.tree.nodeData(init_node);
+            // Both walks that call this run under `enterSymFile`, which
+            // switches the FILE but leaves `cur_scope` pointing into the
+            // requester's — an out-of-bounds scope id in the enum's own file.
+            // The qualifier is a top-level name in that file, so resolve it
+            // from the file scope.
+            const saved_scope = c.cur_scope;
+            c.cur_scope = binder.file_scope;
+            defer c.cur_scope = saved_scope;
             const esym = (try c.enumSymOfQualifier(d.lhs)) orelse return null;
             const name = try c.memberAtom(d.rhs);
             if (esym == own) return null; // a member of THIS enum, mid-walk
