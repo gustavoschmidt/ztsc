@@ -1930,6 +1930,29 @@ pub fn revSlot(c: *Checker, candidates: []TypeId, i: usize) ?*bool {
 
 pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, candidates: []TypeId, depth: u32) Error!void {
     if (depth > 16) return;
+    // tsc's `inferFromTypes` opens with `if (!couldContainTypeVariables(target))
+    // return;` and ztsc had no equivalent. Nothing below can record a candidate
+    // unless the PATTERN reaches a type parameter — every writer of
+    // `candidates` is under the `.type_param` arm or one of the reverse-mapped
+    // helpers, all of which require one — so a pattern with none in it is a
+    // pure structural walk with no result. And the walk is not cheap: its arms
+    // `resolveStructural` BOTH sides, so pairing two unrelated generic
+    // interfaces materializes both member tables and every substituted method
+    // signature under them.
+    //
+    // kysely's `TransactionBuilder.execute<T>(cb: (trx: Transaction<DB>) =>
+    // Promise<T>)` is the shape immich trips on. `T` lives only in the return,
+    // but inferring it walks the parameter position too, and there the pattern
+    // `Transaction<DB>` — no `T` anywhere in it — was unified against the
+    // written `Kysely<DB>`, expanding both classes over immich's 60-table `DB`.
+    // One such statement, `ocr.repository.ts`'s `deleteAll`, spent the entire
+    // 250,000-node statement budget and reported TS2589 where tsc is clean;
+    // with the gate it costs under a thousand.
+    //
+    // `containsTypeParam` is the conservative form (ANY type parameter, not
+    // just one of `tp_syms`) and is memoized per type, so the gate is a hash
+    // lookup on the hot path.
+    if (!try c.containsTypeParam(param)) return;
     const s = &c.ts;
     // An `any` source infers `any` for every inference position in the
     // pattern (tsc's inferFromTypes). Without this, `any` slips past the
