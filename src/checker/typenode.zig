@@ -2212,6 +2212,25 @@ fn indexedAccessTypeInner(c: *Checker, obj: TypeId, idx: TypeId) Error!TypeId {
         // (number-like) index to its base primitive and re-enter.
         else => {
             const ri = try c.resolveStructural(idx);
+            // An ENUM MEMBER index names the property its VALUE spells: a
+            // member table keys a computed enum key by the value
+            // (`literalKeyAtom`), and so does a mapped type over an enum
+            // domain. Falling through to the string-like arm below indexed by
+            // `string` instead, which answers `any` for a table with no string
+            // index signature — immich's
+            // `Jobs = { [K in JobItem['name']]: (JobItem & { name: K })['data'] }`
+            // read through `JobOf<JobName.LibrarySyncFiles>` handed back `any`
+            // and every callback under it lost its parameter types.
+            if (c.ts.kind(ri) == .enum_type) {
+                if (c.ts.isEnumMember(ri)) {
+                    if (try c.enumMemberValue(c.ts.enumSymbol(ri), c.ts.enumMemberAtom(ri))) |v| {
+                        return c.indexedAccessType(obj, try c.ts.regularLiteral(v));
+                    }
+                } else if (try c.enumMemberTypeUnion(c.ts.enumSymbol(ri), 0)) |mu| {
+                    // A WHOLE enum index is tsc's union of its members.
+                    if (mu != ri) return c.indexedAccessType(obj, mu);
+                }
+            }
             if (try c.typeIsStringLike(ri)) return c.indexedAccessType(obj, types.string_type);
             if (try c.typeIsNumberLike(ri)) return c.numberIndexType(r);
             return types.any_type;
