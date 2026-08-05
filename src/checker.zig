@@ -971,6 +971,13 @@ pub const Checker = struct {
     enum_value_cache: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
     /// Enum symbol -> computed EnumInfo (const-ness, member values).
     enum_info_cache: std.AutoHashMapUnmanaged(SymbolId, EnumInfo) = .empty,
+    /// Nesting of `aliasedEnumInitValue` — an enum member initialized with
+    /// ANOTHER enum's member folds that member's constant value, and a cycle
+    /// (`enum A { X = B.X }` / `enum B { X = A.X }`) would otherwise recur
+    /// forever. tsc guards the same walk with `EvaluatorResult.isSyntacticallyString`
+    /// bookkeeping plus a resolution cycle check; a depth cap is enough here
+    /// because the fold is only ever a chain of constant references.
+    enum_alias_depth: u32 = 0,
     /// `(source enum symbol, target enum symbol)` -> whether the two relate
     /// structurally (tsc's `enumRelation`). See `enumsStructurallyRelated`.
     enum_relation_cache: std.AutoHashMapUnmanaged(u64, bool) = .empty,
@@ -3086,6 +3093,7 @@ pub const Checker = struct {
     const enums_zig = @import("checker/enums.zig");
     pub const classifyEnumInit = enums_zig.classifyEnumInit;
     pub const enumInitAtom = enums_zig.enumInitAtom;
+    pub const aliasedEnumInitValue = enums_zig.aliasedEnumInitValue;
     pub const enumInfo = enums_zig.enumInfo;
     pub const eachEnumMember = enums_zig.eachEnumMember;
     pub const enumHasMemberNamed = enums_zig.enumHasMemberNamed;

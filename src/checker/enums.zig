@@ -81,6 +81,41 @@ pub const EnumInfo = struct {
 
 pub const EnumInitKind = enum { numeric, string, computed };
 
+/// The constant value of an enum member initializer that REFERENCES another
+/// constant enum member — `Asc = AssetOrder.Asc`, or `B = A` naming a member
+/// of the same enum. tsc's `computeConstantValue` evaluates an entity-name
+/// expression against the enum member it resolves to, so such a member is a
+/// string (or numeric) constant like any other; ztsc classified it as
+/// `computed`, which cost the whole enum its `all_string` classification —
+/// `Aliased.Asc` was then not assignable to `string`, and immich's
+/// `z.enum(AssetOrderWithRandom)` (whose parameter is
+/// `Readonly<Record<string, string | number>>`) had no matching overload.
+///
+/// `own` is the enum being walked, so a self-reference resolves against its
+/// own members without going back through the scope chain.
+pub fn aliasedEnumInitValue(c: *Checker, own: SymbolId, init_node: Node) Error!?TypeId {
+    if (c.enum_alias_depth >= 8) return null;
+    c.enum_alias_depth += 1;
+    defer c.enum_alias_depth -= 1;
+    switch (c.nodeTag(init_node)) {
+        // `E.M` (or `NS.E.M`) — the qualifier names an enum, the member name
+        // is read off it exactly as the type-position form does.
+        .member_expr => {
+            const d = c.tree.nodeData(init_node);
+            const esym = (try c.enumSymOfQualifier(d.lhs)) orelse return null;
+            const name = try c.memberAtom(d.rhs);
+            if (esym == own) return null; // a member of THIS enum, mid-walk
+            return c.enumMemberValue(esym, name);
+        },
+        // The bare-name form (`B = A`, a member of the same enum) is left
+        // alone: ztsc's binder declares no scope for an enum body — member
+        // names live in the value object the checker materializes — so such
+        // a reference is already TS2304 and folding its value would not make
+        // the declaration check.
+        else => return null,
+    }
+}
+
 /// Classify an enum member initializer for constant folding. Only literal
 /// numbers (incl. unary `-`/`+`) and string literals fold to constants;
 /// anything else is "computed".
@@ -159,6 +194,22 @@ pub fn enumInfo(c: *Checker, sym: SymbolId) Error!EnumInfo {
                     auto_ok = false;
                 },
                 .computed => {
+                    // A reference to another constant enum member is a
+                    // CONSTANT (see `aliasedEnumInitValue`): folding it is
+                    // what keeps a string enum's `all_string` classification
+                    // when one of its members aliases another enum's.
+                    if (try c.aliasedEnumInitValue(sym, init_node)) |v| {
+                        if (c.ts.kind(v) == .string_literal) {
+                            has_string = true;
+                            auto_ok = false;
+                        } else {
+                            const n = c.ts.numberValue(v);
+                            try values.append(c.scratch(), n);
+                            auto = n + 1;
+                            auto_ok = true;
+                        }
+                        continue;
+                    }
                     has_computed = true;
                     auto_ok = false;
                 },
@@ -217,6 +268,18 @@ pub fn eachEnumMember(
                     try f(ctx, name, try c.ts.makeNumberLiteral(ci.value, false));
                 },
                 .computed => {
+                    // A reference to another constant enum member folds to
+                    // that member's value (see `aliasedEnumInitValue`).
+                    if (try c.aliasedEnumInitValue(sym, init_node)) |v| {
+                        if (c.ts.kind(v) == .number_literal or c.ts.kind(v) == .number_literal_fresh) {
+                            auto = c.ts.numberValue(v) + 1;
+                            auto_ok = true;
+                        } else {
+                            auto_ok = false;
+                        }
+                        try f(ctx, name, v);
+                        continue;
+                    }
                     auto_ok = false;
                     try f(ctx, name, types.no_type);
                 },
