@@ -1387,6 +1387,60 @@ pub fn inferTypeArgs(
         }
         try c.unify(pt, at, tp_syms, candidates, 0);
     }
+    // Phase 1.75: a NON-ARRAY rest parameter takes the trailing arguments as
+    // a TUPLE. tsc's `getNonArrayRestType` / `getSpreadArgumentType`: when
+    // the rest's declared type is not a plain array — a bare type parameter,
+    // `...paths: K` with `K extends PropertyName[]` — the arguments from the
+    // rest position on are packed into a tuple and the WHOLE tuple is
+    // inferred against it. `paramTypeAt` answers the rest's array ELEMENT
+    // instead, which mentions no inference variable, so `K` got no candidate
+    // at all and fell back to its constraint: lodash's
+    // `omit<T, K extends PropertyName[]>(o, ...paths: K):
+    //  Pick<T, Exclude<keyof T, K[number]>>` then reduced to `Pick<T, never>`
+    // — `{}` — for every call.
+    //
+    // Each element keeps its literal when the rest's element type is
+    // PRIMITIVE (tsc's `hasPrimitiveContextualType` branch of the same
+    // function, which is what makes `omit(o, 'a')` infer `['a']` and not
+    // `[string]`); otherwise it widens, exactly as an unannotated position
+    // does.
+    if (c.ts.fnParamCount(sig) > 0) restTuple: {
+        const pcount = c.ts.fnParamCount(sig);
+        const last = c.ts.fnParam(sig, pcount - 1);
+        if (!last.rest()) break :restTuple;
+        if (c.ts.kind(last.ty) != .type_param) break :restTuple;
+        if (tpIndex(tp_syms, c.ts.typeParamSymbol(last.ty)) == null) break :restTuple;
+        const fixed = pcount - 1;
+        if (arg_nodes.len < fixed) break :restTuple;
+        const con = try c.typeParamConstraint(c.ts.typeParamSymbol(last.ty));
+        const elem = if (con == types.no_type) types.no_type else try c.elemOfArrayish(con);
+        const keep_literal = elem != types.no_type and try c.isPrimitiveLiteralish(elem);
+        var elems: std.ArrayList(types.TupleElem) = .empty;
+        defer elems.deinit(c.scratch());
+        for (arg_nodes[fixed..]) |an| {
+            if (an == null_node) break :restTuple; // an elided argument: no tuple
+            switch (c.nodeTag(an)) {
+                // A spread has no positional expansion here, and a
+                // CONTEXT-SENSITIVE function argument must not contribute:
+                // tsc checks it under `SkipContextSensitive` in this pass,
+                // gets `anyFunctionType`, and the tuple built around it
+                // propagates `ObjectFlags.NonInferrableType`, so the whole
+                // inference is skipped. Without the skip, `store.set(atom,
+                // (s) => …)` infers `Args` from the un-contextualized arrow
+                // instead of from the `WritableAtom` argument that carries
+                // it, and the callback's parameters go implicit `any`
+                // (conformance `inference/092`).
+                .spread_element, .arrow_fn, .function_expr => break :restTuple,
+                else => {},
+            }
+            const at = try c.checkExprCached(an, types.no_type);
+            try elems.append(c.scratch(), .{ .ty = if (keep_literal)
+                try c.ts.regularLiteral(at)
+            else
+                try c.widenLiteral(at) });
+        }
+        try c.unify(last.ty, try c.ts.makeTuple(elems.items), tp_syms, candidates, 0);
+    }
     // Phase 1.5: contextual return-type *seed* (tsc's ReturnType-priority
     // inference happens *before* callback arguments are contextually
     // typed). A type param appearing only in a callback's return position
