@@ -371,7 +371,48 @@ pub fn typesHaveOverlapRec(c: *Checker, a: TypeId, b: TypeId, depth: u32) Error!
         }
         return false;
     }
+    // Two instantiations of ONE generic — tsc's `relateVariances`, which
+    // pairs the type arguments instead of walking the members. Here it is the
+    // step that lets the type-parameter leniency above reach an argument
+    // POSITION: `switch (key)` on a `ClassConstructor<T>` with a
+    // `case LoggingRepository as ClassConstructor<LoggingRepository>` asks
+    // whether `ClassConstructor<LoggingRepository>` overlaps
+    // `ClassConstructor<T>`, and neither direction is assignable because `T`
+    // is a bare unconstrained parameter buried one layer down. The
+    // constituents `T` could be instantiated to include the other argument,
+    // so the pair overlaps — the same reasoning `typeParamOverlapOperand`
+    // already applies at the top level (immich `test/medium.factory.ts:493`).
+    //
+    // Argument-wise rather than blanket: `Box<T>` against a `number` still
+    // has no overlap, and `Box<"a" | "b">` against `Box<"z">` still has none,
+    // because each pair is asked recursively.
+    if (try sameGenericArgs(c, a, b)) |pairs| {
+        defer c.scratch().free(pairs);
+        for (pairs) |p| {
+            if (!try c.typesHaveOverlapRec(p[0], p[1], depth + 1)) return false;
+        }
+        return pairs.len > 0;
+    }
     return false;
+}
+
+/// The positionally paired type arguments of two references to the SAME
+/// generic symbol, or null when the pair is not that shape. Reads the origin
+/// tag as well as a live `.ref`, so an alias that materialized into an object
+/// still pairs (the rule `unify`'s `.object` arm already relies on).
+fn sameGenericArgs(c: *Checker, a: TypeId, b: TypeId) Error!?[][2]TypeId {
+    const s = &c.ts;
+    const ra = if (s.kind(a) == .ref) a else (c.origin.get(a) orelse c.origin.get(try c.resolveStructural(a)) orelse return null);
+    const rb = if (s.kind(b) == .ref) b else (c.origin.get(b) orelse c.origin.get(try c.resolveStructural(b)) orelse return null);
+    if (s.kind(ra) != .ref or s.kind(rb) != .ref) return null;
+    if (s.refSymbol(ra) != s.refSymbol(rb)) return null;
+    const aa = s.refArgs(ra);
+    const ba = s.refArgs(rb);
+    const n = @min(aa.len, ba.len);
+    if (n == 0) return null;
+    const out = try c.scratch().alloc([2]TypeId, n);
+    for (0..n) |i| out[i] = .{ aa[i], ba[i] };
+    return out;
 }
 
 /// tsc's *comparable* relation for the enum/string-literal pair: a string
@@ -2269,7 +2310,27 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
             return true;
         },
         .object => return c.structuralAssignable(s, t),
-        .class_value => return false,
+        // A class's STATIC side is an ordinary object type in tsc — the
+        // statics, plus one construct signature per constructor overload — so
+        // any object carrying a matching construct signature is assignable to
+        // `typeof C`. ztsc's `.class_value` is a nominal shortcut (`new C()`
+        // and `C.staticMember` read the symbol directly), and this arm simply
+        // said no, so `ClassConstructor<T> = { new (…args: any[]): T }` was
+        // not a `typeof SomeRepository` — immich's whole DI factory
+        // (`deps.includes(dep)`, `BASE_SERVICE_DEPENDENCIES.indexOf(key)`)
+        // was rejected against the union of its repository class values.
+        //
+        // `classConstructType` is exactly that materialization and already
+        // exists for `InstanceType<T>`-style pattern matching. A
+        // `.class_value` SOURCE is deliberately left on the nominal path:
+        // making two class values structurally interchangeable is a much
+        // larger change than this divergence asks for, and every case that
+        // reaches here with one is already answered by the identity fast path
+        // or by the heritage walk above.
+        .class_value => {
+            if (sk == .class_value) return false;
+            return c.structuralAssignable(s, try c.classConstructType(c.ts.classSymbol(t)));
+        },
         else => return false,
     }
 }
@@ -4533,7 +4594,13 @@ pub fn callbackParamsCompatible(c: *Checker, s: TypeId, t: TypeId) Error!bool {
 /// emitted the wrapper code.
 pub fn tryReportMissingProps(c: *Checker, src_t: TypeId, target: TypeId, span: Span) Error!bool {
     const rs = try c.resolveStructural(src_t);
-    const rt = try c.resolveStructural(target);
+    // A class value's static side is the same object the relation compares
+    // against (see the `.class_value` arm of `isAssignableInner`), so a
+    // missing STATIC reports the same specific code a missing property does.
+    const rt = if (c.ts.kind(target) == .class_value and c.ts.kind(rs) != .class_value)
+        try c.classConstructType(c.ts.classSymbol(target))
+    else
+        try c.resolveStructural(target);
     if (!isSourceObjecty(c.ts.kind(rs)) or c.ts.kind(rt) != .object) return false;
     var missing: std.ArrayList(Atom) = .empty;
     defer missing.deinit(c.scratch());
