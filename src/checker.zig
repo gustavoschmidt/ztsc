@@ -3388,6 +3388,7 @@ pub const Checker = struct {
     pub const checkTaggedTemplate = expr_zig.checkTaggedTemplate;
     pub const arrayLiteralElemType = expr_zig.arrayLiteralElemType;
     pub const contextualArrayElemType = expr_zig.contextualArrayElemType;
+    pub const contextualElemTypeAt = expr_zig.contextualElemTypeAt;
     pub const multiArrayLikeBranches = expr_zig.multiArrayLikeBranches;
     pub const checkConstArrayLiteral = expr_zig.checkConstArrayLiteral;
     pub const ctxIsMutableArrayLike = expr_zig.ctxIsMutableArrayLike;

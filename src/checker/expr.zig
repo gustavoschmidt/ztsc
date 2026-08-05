@@ -1483,7 +1483,20 @@ pub fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         }
         var ectx: TypeId = ctx_elem;
         if (ctx_tuple) {
-            ectx = try c.tupleElemTypeAt(ctx_tuple_ty, i) orelse types.no_type;
+            // A UNION contextual type contributes what EVERY constituent
+            // holds at this index, not just the one tuple that put the
+            // literal in tuple context — tsc's
+            // `getContextualTypeForElementExpression` is
+            // `getTypeOfPropertyOfContextualType(t, "" + index)`, and that
+            // maps over the union. sharp's `affine([[a, b], [c, d]])` against
+            // `[number, number, number, number] | [[number, number],
+            // [number, number]]` is the case: reading only the first tuple
+            // gives the inner literal a contextual `number`, so it widens to
+            // `number[]` and matches neither branch.
+            ectx = if (c.ts.kind(rctx) == .union_type)
+                try c.contextualElemTypeAt(rctx, i)
+            else
+                try c.tupleElemTypeAt(ctx_tuple_ty, i) orelse types.no_type;
         }
         const raw = try c.checkExprCached(el, ectx);
         var et = raw;
@@ -1595,6 +1608,31 @@ pub fn contextualArrayElemType(c: *Checker, rctx: TypeId) Error!TypeId {
             defer elems.deinit(c.scratch());
             for (try c.memberList(rctx)) |m| {
                 const e = try c.contextualArrayElemType(try c.resolveStructural(m));
+                if (e != types.no_type) try elems.append(c.scratch(), e);
+            }
+            if (elems.items.len == 0) return types.no_type;
+            return c.ts.makeUnion(c.scratch(), elems.items);
+        },
+        else => return types.no_type,
+    }
+}
+
+/// The contextual type for the element at index `i` of an array literal in
+/// TUPLE context, given a (structurally resolved) contextual type — tsc's
+/// `getTypeOfPropertyOfContextualType(ctx, "" + i)`, which `mapType`s over a
+/// union. A tuple constituent contributes the type at that position (its
+/// rest element past the fixed part), an array constituent its element type,
+/// and anything else nothing. Returns `no_type` when no constituent holds an
+/// element there.
+pub fn contextualElemTypeAt(c: *Checker, rctx: TypeId, i: u32) Error!TypeId {
+    switch (c.ts.kind(rctx)) {
+        .tuple => return try c.tupleElemTypeAt(rctx, i) orelse types.no_type,
+        .array => return c.ts.arrayElem(rctx),
+        .union_type => {
+            var elems: std.ArrayList(TypeId) = .empty;
+            defer elems.deinit(c.scratch());
+            for (try c.memberList(rctx)) |m| {
+                const e = try c.contextualElemTypeAt(try c.resolveStructural(m), i);
                 if (e != types.no_type) try elems.append(c.scratch(), e);
             }
             if (elems.items.len == 0) return types.no_type;
