@@ -52,6 +52,20 @@ export function voidDropsBesideAParam<T>(x: T | void): (T & {}) | number {
   return x ?? pick();
 }
 
+// Negative control, and the reason the union walk carries ONLY the bare
+// type-parameter arm: a deferred conditional constituent keeps its spelling.
+// The `& {}` marker is for a type whose nullish arm hides inside its
+// constraint, and a union has already separated its nullish arms out —
+// marking it here would stop the conditional reducing for every later reader
+// (excalidraw's `rest.startBinding`).
+type Binding = { elementId: string };
+declare function binding<T extends string>(v: T): (T extends "arrow" ? Binding : never) | undefined;
+
+export function conditionalKeepsItsSpelling<T extends string>(v: T) {
+  const b = binding(v);
+  return b ?? null;
+}
+
 // Negative control: `??` must not hide a genuine mismatch.
 export function stillReportsAMismatch(x: string | null) {
   const y: number = x ?? "a";

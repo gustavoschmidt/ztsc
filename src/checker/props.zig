@@ -706,20 +706,31 @@ pub fn nonNullable(c: *Checker, t: TypeId) Error!TypeId {
 
 /// tsc's `getAdjustedTypeWithFacts(t, NEUndefinedOrNull)` is a `mapType`: the
 /// `NonNullable<…>` instantiation is applied CONSTITUENT BY CONSTITUENT, not
-/// only to a union as a whole. The arms below (a bare type parameter, a
-/// deferred conditional or indexed access) therefore have to be reachable from
-/// inside a union too — a `T` narrowed by `typeof value === 'number'` is
-/// `number & T | T`, and stripping nullish from that has to leave the `T` arm
-/// as `T & {}`. Filtering the union by KIND alone left it as `T`, so
-/// immich's `validate<T>(value: T): NonNullable<T> | null` reported TS2322 on
-/// its own `return value ?? null` — but only once a guard had turned the bare
+/// only to a union as a whole. A bare TYPE PARAMETER therefore has to be
+/// reachable from inside a union too — a `T` narrowed by
+/// `typeof value === 'number'` is `number & T | T`, and stripping nullish from
+/// that has to leave the `T` arm as `T & {}`. Filtering the union by KIND
+/// alone left it as `T`, so immich's
+/// `validate<T>(value: T): NonNullable<T> | null` reported TS2322 on its own
+/// `return value ?? null` — but only once a guard had turned the bare
 /// parameter into a union.
+///
+/// The DEFERRED conditional / indexed-access arm deliberately does NOT come
+/// along. It marks a whole type whose nullish arm is hidden inside its
+/// constraint, and a union has already separated its nullish arms out:
+/// marking a constituent there stops the conditional from reducing for every
+/// later reader. excalidraw's
+/// `rest.startBinding: (T extends "arrow" ? Binding : never) | undefined`
+/// read through `?? null` is the shape — five fresh TS2322/TS2345 spelled
+/// `{} & T extends "arrow" ? …`.
 fn nonNullableInner(c: *Checker, t: TypeId, drop_void: bool) Error!TypeId {
     if (c.ts.kind(t) == .union_type) {
         var parts: std.ArrayList(TypeId) = .empty;
         defer parts.deinit(c.scratch());
         for (try c.memberList(t)) |m| {
-            const nm = try nonNullableInner(c, m, drop_void);
+            const k = c.ts.kind(m);
+            if (k == .undefined or k == .null or (drop_void and k == .void)) continue;
+            const nm = if (k == .type_param) try nonNullableScalar(c, m) else m;
             if (nm != types.never_type) try parts.append(c.scratch(), nm);
         }
         return c.ts.makeUnion(c.scratch(), parts.items);
