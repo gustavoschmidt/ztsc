@@ -1645,6 +1645,38 @@ pub const Store = struct {
             }
         }
 
+        // tsc's `extractIrreducible`, which runs BEFORE the cross product and
+        // factors a nullish constituent out of the whole intersection instead
+        // of multiplying it through: when EVERY member is a union that
+        // contains `undefined` (then, separately, `null`), the nullish half is
+        // irreducible — it survives no product with any other member — so
+        // `(A | null) & (B | null)` is `(A & B) | null` and not the
+        // four-way product `A & B | A & null | null & B | null`.
+        //
+        // This is not only a spelling: `nullishIntersectionIsEmpty` is
+        // deliberately syntactic and cannot reduce `null & <ref>`, so the
+        // products it leaves standing are live garbage constituents. kysely's
+        // `deletedAt` is exactly that shape — a CTE that shadows its own table
+        // intersects `Timestamp | null` with `Date | null`, and the surviving
+        // `null & Date` made `SelectType<…>` distribute onto a constituent
+        // that matched `ColumnType<infer S, …>` while inferring nothing, so
+        // the column came out `unknown`.
+        for ([_]Kind{ .undefined, .null }) |nullish| {
+            var all = true;
+            for (list) |t| {
+                if (s.kind(t) != .union_type or indexOfKind(s, s.members(t), nullish) == null) {
+                    all = false;
+                    break;
+                }
+            }
+            if (!all) continue;
+            const rest = try scratch.alloc(TypeId, list.len);
+            defer scratch.free(rest);
+            for (list, 0..) |t, i| rest[i] = try s.filterOutKind(scratch, t, nullish);
+            const core = try s.makeIntersectionFlags(scratch, rest, reduce_empty_object);
+            return s.makeUnion(scratch, &.{ core, if (nullish == .null) null_type else undefined_type });
+        }
+
         // Distribute over the first union constituent, if any.
         var union_idx: usize = list.len;
         var size: usize = 1;
@@ -1910,6 +1942,28 @@ pub const Store = struct {
             if (x == t) return i;
         }
         return null;
+    }
+
+    fn indexOfKind(s: *const Store, list: []const TypeId, k: Kind) ?usize {
+        for (list, 0..) |x, i| {
+            if (s.kind(x) == k) return i;
+        }
+        return null;
+    }
+
+    /// tsc's `filterType` for one kind: the union `t` without its members of
+    /// kind `k`. `t` is known to BE a union that has one (see
+    /// `makeIntersectionFlags`), so the result is never the input.
+    fn filterOutKind(s: *Store, scratch: Allocator, t: TypeId, k: Kind) Error!TypeId {
+        const src = try scratch.dupe(TypeId, s.members(t));
+        defer scratch.free(src);
+        var w: usize = 0;
+        for (src) |m| {
+            if (s.kind(m) == k) continue;
+            src[w] = m;
+            w += 1;
+        }
+        return s.makeUnion(scratch, src[0..w]);
     }
 
     /// Insertion-sort 3-word (name, type, flags) records by name.
