@@ -477,7 +477,19 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, chained: *bool,
     // the return via `instance_ret`, so contextual return inference there is
     // both moot and a needless perturbation.
     const call_ctx = if (is_new and instance_ret != types.no_type) types.no_type else ctx;
-    const result = try c.resolveSignatureCall(node, sigs.items, targs.items, shape.arg_nodes, instance_ret, call_ctx);
+    // `new C<A>(…)`'s type arguments belong to the CLASS, and the class-value
+    // path above has already spent them: `fixTypeArgs` checked their arity,
+    // `inst_args` built the instance type, and every constructor signature was
+    // instantiated with them. Handing them on as the SIGNATURE's own explicit
+    // type arguments then measures them against the constructor's own type
+    // parameters — normally none — and every candidate is rejected on arity.
+    // tsc has no such double-spend because the construct signatures of
+    // `typeof C` carry the class's parameters as their own; ztsc substitutes
+    // instead, so the list has to stop here. Visible only with an OVERLOADED
+    // constructor (a lone candidate is not dropped for it): every
+    // `new Kysely<DB>(config)` in immich was TS2769.
+    const sig_targs: []const TypeId = if (is_new and instance_ret != types.no_type) &.{} else targs.items;
+    const result = try c.resolveSignatureCall(node, sigs.items, sig_targs, shape.arg_nodes, instance_ret, call_ctx);
     return result;
 }
 
