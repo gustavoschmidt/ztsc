@@ -1000,6 +1000,116 @@
 //! key — conformance `mapped/061` and `conditional/043` fail on either. Pinned
 //! lib-free by `mapped/062_as_remap_defers_on_free_param`, whose negative
 //! control keeps the filtering a DECIDABLE remap still does.
+//!
+//! ## 69 -> 42: the budget was never the story (2026-08-04)
+//!
+//! Everything above is about instantiation budget. The eight fixes below are
+//! not — every one is a missing REDUCTION RULE, each isolates in a lib-free
+//! file, each was found by copying one immich file into a scratch project and
+//! deleting until the diagnostic stood alone. immich **69 -> 42 at c4 and
+//! 67 -> 40 at c1, zero new keys at any step**, wall 3.62 -> 3.53 s, peak RSS
+//! 2.44 -> 2.55 GB (tsgo: 2.28 s / 2.28 GB, 0 diagnostics). The lesson for the
+//! next session is the method, not any one fix: **the remaining excess is
+//! ordinary type-system surface, and it comes out three or four keys at a
+//! time.** Nothing here needed a profile.
+//!
+//! The ENUM is where most of it lived, because ztsc models an enum as ONE
+//! nominal type while tsc models it as the UNION of its member types. Five of
+//! the eight are that single modelling difference surfacing in a different
+//! operator:
+//!
+//! * **`Record<E, V>` had an index signature, not members.** `collect
+//!   MappedKeys` materialized an enum key domain as one string/number index
+//!   on the reasoning that a computed enum key `[E.A]` is keyed by a
+//!   text-derived placeholder. It is not — `constSymbolKeyAtom` resolves it to
+//!   the member's VALUE. The index signature cost `keyof` the enum, so
+//!   `keyof M` for `interface M extends Record<E, …>` was `string | number`
+//!   and `<T extends keyof M>` no longer satisfied `T extends E`. The domain
+//!   now enumerates member types and names one property per member, recording
+//!   the member type in `key_name_types`. -7 keys.
+//! * **`Exclude<E, E.A>` did not subtract.** A distributive conditional whose
+//!   check is a whole enum did not distribute, so `E extends E.A` was simply
+//!   false. Invisible while `Record<E, V>` was an index signature; four
+//!   missing properties the moment it was not (`ConcurrentQueueName`).
+//!   `condDistributionDomain` distributes over the members when the extends
+//!   clause names members of the same enum — gated so nothing else changes
+//!   spelling.
+//! * **`T[E.A]` indexed by `string`.** No arm for an enum index, so it fell to
+//!   the string-like arm and answered `any` for a table with no string index.
+//!   `Jobs = { [K in JobItem['name']]: … }` read through `JobOf<JobName.X>`
+//!   was `any` and every callback under it lost its parameter types. -3.
+//! * **Two same-named enum DECLARATIONS did not relate.** tsc's
+//!   `isEnumTypeRelatedTo` is the one structural rule in a nominal type: same
+//!   name, every source member present in the target with the same value.
+//!   immich redeclares `@immich/sql-tools`' `DatabaseSslMode` in
+//!   `env.dto.ts`, and zod's `$InferEnumOutput<T> = T[keyof T]` hands the
+//!   redeclared members into the published one's parameter.
+//! * **An enum member was not a UNIT type**, so `discriminatedUnionAssignable`
+//!   declined every enum-tagged discriminated union. This one is only
+//!   reachable once `T[E.A]` resolves — it was hidden behind the `any` — and
+//!   it is what the excalidraw gate caught. Worth remembering as a shape:
+//!   fixing a reduction can expose a relation rule one layer down, and the app
+//!   gate is where that shows up.
+//!
+//! The other three are ordinary tsc rules ztsc had never transcribed:
+//!
+//! * **An intersection with a `never` DISCRIMINANT is empty**
+//!   (`getReducedType` / `isDiscriminantWithNeverType`). ztsc reduced only a
+//!   top-level pair of distinct units (`'a' & 'b'`), never two objects that
+//!   disagree on a property — so `(A | B) & { tag: true }` kept its
+//!   contradictory product as a union constituent carrying none of `A`'s
+//!   members, and every read off it was TS2339 (`MaintenanceModeState`). -4.
+//! * **Disjoint primitive DOMAINS, and redundant base primitives.**
+//!   `TypeFlags.DisjointDomains` (`1 & string` is `never`) and
+//!   `removeRedundantPrimitiveTypes` (`"a" & string` IS `"a"`). Together they
+//!   are what makes the `keyof M & (string | symbol)` key-filter idiom work.
+//!   Byte-identical on immich, but the whole `IsAny<T> = 0 extends 1 & T`
+//!   family needs the first, and the socket.io alias chain now matches the
+//!   oracle step for step.
+//! * **A homomorphic map over a union maps PRIMITIVE constituents to
+//!   themselves.** ztsc distributed only when every constituent was a plain
+//!   object, so one `null` sank the map to `{}`: kysely's
+//!   `Simplify<ShallowDehydrateObject<O>>` over a nullable row typed
+//!   `withAudioStream` as `{} | null`. -5.
+//! * **The static side did not inherit a base EXPRESSION's members.**
+//!   `class D extends <expr>` — the instance side already had the arm
+//!   (`baseExprConstructType`), the static side had only the class-SYMBOL one.
+//!   nestjs-zod's `createZodDto` is written that way. -4.
+//! * **`keyof { [k: symbol]: V }` was `string | number`.** A symbol-keyed
+//!   index signature shares ztsc's string slot; `obj_flag_symbol_index`
+//!   records the distinction for `keyof` alone, so every consumer that READS
+//!   an index signature is untouched. nestjs-cls' `ClsStore`. -3.
+//!
+//! ### What is left, and what it is
+//!
+//! 42 keys at c4 / 40 at c1, c1^c4 = 2 (`asset.repository.ts:192` TS2589 and
+//! `user.repository.ts:301` TS2769, both c4-only — the same budget-order coin
+//! this header has priced three times). By family:
+//!
+//! * **kysely `sql`-template contextual typing** — `person.repository.ts:328`
+//!   `.where(() => sql\`…\`)` isolates in ELEVEN lines against immich's
+//!   `node_modules` and nothing else. `where<E extends ExpressionOrFactory<DB,
+//!   TB, SqlBool>>` should contextually type the arrow's return as
+//!   `OperandExpression<SqlBool>`, so the `sql` tag's `T` infers `SqlBool`;
+//!   ztsc leaves `T` at its `unknown` default and `Expression<unknown>` does
+//!   not accept. Return-context-driven inference into a TAGGED TEMPLATE call
+//!   is the thing to look at. `search.service.ts`'s two keys are its cascade.
+//! * **socket.io `EventNamesWithoutAck`** (app.repository ×3,
+//!   websocket.repository, maintenance-websocket.repository, main.ts ×2).
+//!   Every alias on the chain — `EventNames`, `Map[K]`, `Parameters`, `Last`,
+//!   `IsAny` — now computes the oracle's answer when written out by hand in a
+//!   scratch file; only the real `Server<…>` call still fails, so the residue
+//!   is in the generic plumbing between the interface's type params and the
+//!   default type argument, not in the aliases.
+//! * **`ClassConstructor` DI comparability** (medium.factory ×3) — never
+//!   traced.
+//! * **kysely `excluded.${col}` template references** (asset.repository ×3) —
+//!   `eb.ref(\`excluded.${col}\`)` with `col: T extends keyof AssetExifTable`.
+//! * Singles: bullmq `Job<…, infer N>` conditionals (job.repository ×2),
+//!   `@nestjs/swagger` `SchemaObject` (auth.guard ×2), and ten one-offs.
+//!
+//! The two TS2589 (`asset.repository.ts:192`, `ocr.repository.ts:33`) are the
+//! only keys in the package that are still about the budget at all.
 
 const std = @import("std");
 const types = @import("../types.zig");
