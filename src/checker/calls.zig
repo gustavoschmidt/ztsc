@@ -794,6 +794,8 @@ pub fn fillFromReturnContext(c: *Checker, sig: TypeId, tp_syms: []const u32, ret
     const ret = c.ts.fnReturn(sig);
     const rc = try c.scratch().alloc(TypeId, tp_syms.len);
     for (rc) |*x| x.* = types.no_type;
+    c.ret_ctx_prio += 1;
+    defer c.ret_ctx_prio -= 1;
     try c.unify(ret, rctx, tp_syms, rc, 0);
     for (target, 0..) |*t, i| {
         if (t.* != types.no_type or rc[i] == types.no_type) continue;
@@ -2435,6 +2437,50 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                     const ms = try c.scratch().dupe(TypeId, try c.memberList(ra));
                     defer c.scratch().free(ms);
                     for (ms) |m| try c.unify(param, m, tp_syms, candidates, depth + 1);
+                    return;
+                }
+                // Otherwise tsc's plain union-source rule, which is the last
+                // arm of `inferFromTypes`: when the TARGET is not itself a
+                // union/type variable, a union SOURCE infers constituent by
+                // constituent (`for (const sourceType of sourceTypes)
+                // inferFromTypes(sourceType, target)`). ztsc reached it only
+                // through the three identity rules above, so a contextual
+                // type that is a union of UNRELATED named types — kysely's
+                // `OperandExpression<V> = Expression<V> |
+                // SelectQueryBuilderExpression<Record<string, V>>`, the
+                // return context `where(expr)` gives its factory argument —
+                // inferred nothing, and `sql`'s `<T = unknown>` fell back to
+                // its default: `Expression<unknown>` is not an
+                // `Expression<SqlBool>` and the call was TS2769.
+                //
+                // Scoped to the contextual-RETURN pass (`ret_ctx_prio`, tsc's
+                // `InferencePriority.ReturnType`) because that is the priority
+                // whose several candidates tsc COMBINES — see `ret_ctx_prio`.
+                //
+                // Gated by `constituentCarriesInference`, which is stricter
+                // than the INTERSECTION arm's `constituentRelatesTo`: a
+                // constituent qualifies only when it has a property NAMED by
+                // one of the param's inference positions. Two reasons.
+                // Correctness: a constituent with nothing to say can only
+                // manufacture a candidate the covariant fold then has to
+                // combine with the right one — which is the sibling-object-
+                // literal collapse this arm's comment above warns about.
+                // Cost: the untargeted rule takes immich from 3.9 s to
+                // 16.2 s, because kysely's contextual types are unions of
+                // builder interfaces that all pair with each other on
+                // callability alone, and the extra walks spend enough budget
+                // to trip it (a fresh TS2589/TS7006 cascade in
+                // `duplicate.repository.ts` and `asset.repository.ts`). The
+                // narrow filter keeps the wall flat and still finds the one
+                // pairing that carries information.
+                if (c.ret_ctx_prio > 0) {
+                    const ms = try c.scratch().dupe(TypeId, try c.memberList(ra));
+                    defer c.scratch().free(ms);
+                    for (ms) |m| {
+                        if (try c.constituentCarriesInference(param, m, tp_syms)) {
+                            try c.unify(param, m, tp_syms, candidates, depth + 1);
+                        }
+                    }
                 }
                 return;
             }
@@ -2844,6 +2890,61 @@ pub fn intersectionMembersPair(c: *Checker, pm: TypeId, am: TypeId) Error!bool {
 /// bolted onto the argument (`WithInitialValue<V>`'s `{ init: V }`, a brand
 /// object) — knows nothing about `param`'s type variables, and letting it
 /// infer would union a wrong candidate into the right one.
+/// Can the union constituent `m` supply an inference for one of `tp_syms`
+/// against the object parameter `param`? True only when `m` is an object with
+/// a property NAMED by one of the param's own properties whose type mentions a
+/// type parameter being inferred — the single pairing that carries
+/// information. Deliberately narrower than `constituentRelatesTo`: shared
+/// callability or a shared index signature makes any two builder interfaces
+/// look related without either one saying anything about a type parameter,
+/// and on a kysely-shaped corpus that is most of the union.
+pub fn constituentCarriesInference(c: *Checker, param: TypeId, m: TypeId, tp_syms: []const u32) Error!bool {
+    const s = &c.ts;
+    if (s.objectPropCount(param) == 0) return false;
+    const rm = try c.resolveStructural(m);
+    if (s.kind(rm) != .object or s.objectPropCount(rm) == 0) return false;
+    for (0..s.objectPropCount(param)) |i| {
+        const pp = s.objectProp(param, @intCast(i));
+        if (s.objectPropByName(rm, pp.name) == null) continue;
+        if (try mentionsAnyTypeParam(c, pp.ty, tp_syms)) return true;
+    }
+    return false;
+}
+
+/// Does `t` mention any of `tp_syms` within a shallow walk? A conservative
+/// screen for `constituentCarriesInference` — the deeper the occurrence, the
+/// less a structural pairing can invert it, and a false negative only leaves
+/// the prior behaviour.
+fn mentionsAnyTypeParam(c: *Checker, t: TypeId, tp_syms: []const u32) Error!bool {
+    return mentionsAnyTypeParamAt(c, t, tp_syms, 0);
+}
+
+fn mentionsAnyTypeParamAt(c: *Checker, t: TypeId, tp_syms: []const u32, depth: u32) Error!bool {
+    if (depth > 3) return false;
+    const s = &c.ts;
+    switch (s.kind(t)) {
+        .type_param => return tpIndex(tp_syms, s.typeParamSymbol(t)) != null,
+        .array => return mentionsAnyTypeParamAt(c, s.arrayElem(t), tp_syms, depth + 1),
+        .union_type, .intersection => {
+            const ms = try c.scratch().dupe(TypeId, try c.memberList(t));
+            defer c.scratch().free(ms);
+            for (ms) |m| {
+                if (try mentionsAnyTypeParamAt(c, m, tp_syms, depth + 1)) return true;
+            }
+            return false;
+        },
+        .ref => {
+            const args = try c.scratch().dupe(TypeId, s.refArgs(t));
+            defer c.scratch().free(args);
+            for (args) |a| {
+                if (try mentionsAnyTypeParamAt(c, a, tp_syms, depth + 1)) return true;
+            }
+            return false;
+        },
+        else => return false,
+    }
+}
+
 pub fn constituentRelatesTo(c: *Checker, param: TypeId, m: TypeId) Error!bool {
     const s = &c.ts;
     const rm = try c.resolveStructural(m);

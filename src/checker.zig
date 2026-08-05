@@ -1565,6 +1565,17 @@ pub const Checker = struct {
     /// and intersections preserve top-level-ness (tsc's
     /// `isTypeParameterAtTopLevel` descends them); everything else does not.
     nontop_depth: u32 = 0,
+    /// Non-zero while `unify` is running the contextual-RETURN pass
+    /// (`fillFromReturnContext`), i.e. at tsc's `InferencePriority.ReturnType`.
+    /// The distinction matters for the untargeted union-SOURCE rule, which
+    /// lets several constituents each contribute a candidate: `ReturnType` is
+    /// in tsc's `PriorityImpliesCombination`, so `getCovariantInference`
+    /// UNIONS those candidates, while at ordinary priority it common-
+    /// supertypes them — and a common supertype of two literal-ish candidates
+    /// widens (excalidraw's `DropdownMenuItemContentRadio<T>` inferred `T =
+    /// string` instead of `Theme | "system"`). ztsc has no priority ladder, so
+    /// the rule is scoped to the pass where tsc's fold is the combining one.
+    ret_ctx_prio: u32 = 0,
     /// Set while checking the operand of an `expr as const` const
     /// assertion: object/array literals produce readonly, non-widened,
     /// literal-typed members (recursively). Cleared at function bodies.
@@ -3482,6 +3493,7 @@ pub const Checker = struct {
     pub const discriminatedConstituent = calls_zig.discriminatedConstituent;
     pub const intersectionMembersPair = calls_zig.intersectionMembersPair;
     pub const constituentRelatesTo = calls_zig.constituentRelatesTo;
+    pub const constituentCarriesInference = calls_zig.constituentCarriesInference;
     pub const inferReverseMapped = calls_zig.inferReverseMapped;
     pub const inferMappedKeySet = calls_zig.inferMappedKeySet;
     pub const stripSourceParam = calls_zig.stripSourceParam;
