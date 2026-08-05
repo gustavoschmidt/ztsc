@@ -1543,6 +1543,7 @@ pub const Store = struct {
         var list = items[0..n];
         if (nullishIntersectionIsEmpty(s, list)) return never_type;
         if (distinctUnitIntersectionIsEmpty(s, list)) return never_type;
+        if (discriminantIntersectionIsEmpty(s, list)) return never_type;
 
         // Supertype reduction against `{}` (tsc's `getIntersectionType`): `{}`
         // is a supertype of every non-nullish type, so `X & {}` IS `X` and the
@@ -1705,21 +1706,93 @@ pub const Store = struct {
     /// is the safe direction for a rule whose output is `never`. Non-unit
     /// members (including `.union_type`, re-entered per combination by the
     /// cross-product below) are ignored.
+    /// Identity of a UNIT type — one that denotes a single value — modulo
+    /// literal freshness. Null for everything else. Two different keys are two
+    /// different values, which is tsc's *"an intersection containing more than
+    /// one unit type is empty"* rule.
+    fn unitKey(s: *const Store, t: TypeId) ?[3]u32 {
+        return switch (s.kind(t)) {
+            .string_literal => .{ 1, s.dataA(t), 0 },
+            .number_literal, .number_literal_fresh => .{ 2, s.dataA(t), s.dataB(t) },
+            .bigint_literal => .{ 3, s.dataA(t), 0 },
+            .bool_true => .{ 4, 0, 0 },
+            .bool_false => .{ 5, 0, 0 },
+            .unique_symbol => .{ 6, s.dataA(t), 0 },
+            // An enum MEMBER is a unit type (tsc's "enum literal"); a whole
+            // enum is not. A member is nominally distinct from the literal it
+            // is initialized to — `E.X & "XV"` is empty in tsc — so the enum
+            // symbol is part of the key.
+            .enum_type => if (s.isEnumMember(t))
+                .{ 7, s.dataA(t), s.dataB(t) & ~enum_member_fresh }
+            else
+                null,
+            else => null,
+        };
+    }
+
     fn distinctUnitIntersectionIsEmpty(s: *const Store, list: []const TypeId) bool {
         var seen: ?[3]u32 = null;
         for (list) |t| {
-            const key: [3]u32 = switch (s.kind(t)) {
-                .string_literal => .{ 1, s.dataA(t), 0 },
-                .number_literal, .number_literal_fresh => .{ 2, s.dataA(t), s.dataB(t) },
-                .bigint_literal => .{ 3, s.dataA(t), 0 },
-                .bool_true => .{ 4, 0, 0 },
-                .bool_false => .{ 5, 0, 0 },
-                .unique_symbol => .{ 6, s.dataA(t), 0 },
-                else => continue,
-            };
+            const key = unitKey(s, t) orelse continue;
             if (seen) |prev| {
                 if (!std.mem.eql(u32, &prev, &key)) return true;
             } else seen = key;
+        }
+        return false;
+    }
+
+    /// Whether two types denote provably DIFFERENT single values.
+    fn unitTypesDisjoint(s: *const Store, a: TypeId, b: TypeId) bool {
+        if (a == b) return false;
+        const ka = unitKey(s, a) orelse return false;
+        const kb = unitKey(s, b) orelse return false;
+        return !std.mem.eql(u32, &ka, &kb);
+    }
+
+    /// tsc's `getReducedType` / `isDiscriminantWithNeverType`: an intersection
+    /// is EMPTY when some property it merges comes out `never` — which for a
+    /// discriminant means two constituents give the same property disjoint
+    /// unit types.
+    ///
+    /// This is what makes `(A | B) & { tag: true }` usable after the
+    /// distribution above: the `B & { tag: true }` product, whose `tag` would
+    /// be `false & true`, drops out of the union instead of staying as a
+    /// constituent with none of `A`'s members. immich's
+    /// `MaintenanceModeState & { isMaintenanceMode: true }` read every
+    /// property off it as missing (TS2339 on `.secret` / `.action`).
+    ///
+    /// An intersection's synthesized property is optional only when it is
+    /// optional in EVERY constituent (tsc's `getUnionOrIntersectionProperty`),
+    /// and only an optional one is exempt — so a required side against an
+    /// optional one still reduces.
+    fn discriminantIntersectionIsEmpty(s: *const Store, list: []const TypeId) bool {
+        for (list, 0..) |a, i| {
+            if (s.kind(a) != .object) continue;
+            const na = s.objectPropCount(a);
+            if (na == 0) continue;
+            for (list[i + 1 ..]) |b| {
+                if (s.kind(b) != .object) continue;
+                const nb = s.objectPropCount(b);
+                if (nb == 0) continue;
+                // Property records are interned sorted by name atom, so one
+                // merge pass finds every shared name.
+                var ia: u32 = 0;
+                var ib: u32 = 0;
+                while (ia < na and ib < nb) {
+                    const pa = s.objectProp(a, ia);
+                    const pb = s.objectProp(b, ib);
+                    if (pa.name < pb.name) {
+                        ia += 1;
+                    } else if (pb.name < pa.name) {
+                        ib += 1;
+                    } else {
+                        if ((!pa.optional() or !pb.optional()) and
+                            unitTypesDisjoint(s, pa.ty, pb.ty)) return true;
+                        ia += 1;
+                        ib += 1;
+                    }
+                }
+            }
         }
         return false;
     }
