@@ -1110,6 +1110,116 @@
 //!
 //! The two TS2589 (`asset.repository.ts:192`, `ocr.repository.ts:33`) are the
 //! only keys in the package that are still about the budget at all.
+//!
+//! ## 42 -> 26: four of those five families, closed (2026-08-04)
+//!
+//! Same method, same result: every one is an ordinary type-system rule ztsc had
+//! not transcribed, each isolates lib-free, none needed a profile. immich
+//! **42 -> 26 at c4 and 40 -> 25 at c1, zero new keys at any step**, wall
+//! 3.53 -> 3.48 s, peak RSS 2.55 -> 2.33 GB (tsgo: 2.28 s / 2.28 GB, clean).
+//! The c1^c4 divergence went 2 -> 1: `user.repository.ts:301` closed with the
+//! rest, `asset.repository.ts:192`'s TS2589 is still c4-only.
+//!
+//! * **A union contextual RETURN type infers constituent by constituent.**
+//!   tsc's `inferFromTypes` ends in an untargeted union-SOURCE rule; ztsc's
+//!   `.object` arm of `unify` reached that pairing only through three identity
+//!   rules (same generic origin, a discriminant, an index-shaped target), so
+//!   kysely's `OperandExpression<V> = Expression<V> | SelectQueryBuilder
+//!   Expression<Record<string, V>>` inferred NOTHING and `sql`'s `<T = unknown>`
+//!   fell back to its default. **The tagged template was a red herring** — a
+//!   plain generic call in the same position failed identically, and the whole
+//!   thing reduces to four lines with no `sql` tag in them. -5 keys.
+//!
+//!   Two scopings are load-bearing and both are measured. The untargeted form
+//!   costs **3.9 s -> 16.2 s and 42 -> 46 keys**, because kysely's contextual
+//!   types are unions of builder interfaces that all pair on callability alone;
+//!   `constituentCarriesInference` (the constituent must have a property NAMED
+//!   by one of the target's inference positions) is what keeps the wall flat.
+//!   And applying it outside the contextual-RETURN pass costs excalidraw a key
+//!   (`DropdownMenuItemContentRadio<T>` infers `T = string` instead of
+//!   `Theme | "system"`), because `ReturnType` is in tsc's
+//!   `PriorityImpliesCombination` — several constituents' candidates are
+//!   UNIONED there and common-supertyped everywhere else.
+//! * **A construct-signature object is assignable to a class VALUE.** ztsc's
+//!   `.class_value` target arm answered `false`, so `ClassConstructor<T> =
+//!   { new (...args: any[]): T }` was not a `typeof SomeRepository`.
+//!   `classConstructType` already materialized the static side for
+//!   `InstanceType<T>` pattern matching; the relation and
+//!   `tryReportMissingProps` now read it. A `.class_value` SOURCE stays
+//!   nominal. -2.
+//! * **Two instantiations of one generic pair their type ARGUMENTS in the
+//!   overlap test** (tsc's `relateVariances`). `typesHaveOverlap` already
+//!   treated an unconstrained type parameter as overlapping everything, but
+//!   only at the top level of an operand, so `switch (key)` on a
+//!   `ClassConstructor<T>` rejected a `case` of type
+//!   `ClassConstructor<LoggingRepository>`. -1.
+//! * **`[...X[]]` is `X[]`** (tsc's `getTupleTargetType`). ztsc reified a
+//!   parameter list as a tuple unconditionally, so
+//!   `Parameters<(...args: any[]) => void>` was `[...any[]]` and
+//!   `ReadonlyArray<infer E>` inferred `E = any[]`. Byte-identical on immich by
+//!   itself — it is the prerequisite for the next one.
+//! * **`higherOrderSigEligible` decides ENFORCEMENT, not substitution.** A
+//!   generic interface's method may bound its own type parameter with a type
+//!   built out of the INTERFACE's parameter; ztsc gated the whole rewrite on
+//!   eligibility and `sigReferencesOuterParam` then called such a signature
+//!   self-contained, so the bound was left standing over a parameter that had
+//!   just been substituted away — unsatisfiable, and the inference clamped to
+//!   it. socket.io's `emit<Ev extends EventNames<RemoveAcknowledgements<E>>>`
+//!   is exactly that (its `Last`/`Parameters` chain has an `infer` in an
+//!   `extends` clause, so `boundReducible` declines it). -5.
+//!
+//!   The narrow alternative — widening the constraint-FALLBACK skip at the call
+//!   site to any constraint mentioning an unresolvable outer parameter —
+//!   reaches the same immich number and LOSES a diagnostic
+//!   (`indexed/025`'s `pick(o, "nope")`, where `keyof T` legitimately
+//!   substitutes to `keyof Partial<U>` over the enclosing function's own `U`).
+//!   Fix the instantiation, not the clamp.
+//! * **A generic TEMPLATE-LITERAL source relates through its base constraint.**
+//!   ztsc had tsc's `getBaseConstraintOfType` source rule for a deferred
+//!   indexed access but not for a template literal, so
+//!   `` `excluded.${T}` `` related to nothing. -3.
+//!
+//!   The neighbouring change is a NEGATIVE: `ctxWantsTemplate` is ztsc's
+//!   `isTemplateLiteralContextualType`, tsc's admits `StringLiteral |
+//!   TemplateLiteral`, and adding the literal half looks right because ztsc
+//!   EXPANDS a finite template-literal type into its union. But ztsc's version
+//!   also DISTRIBUTES over a union, which tsc's does not, and the two together
+//!   made excalidraw's `style={{ transform: … }}` keep
+//!   `` `translate(${number}px, …)` `` against a `CSSProperties['transform']`
+//!   that merely CONTAINS string literals — two fresh TS2322. Not taken.
+//!
+//! ### What is left at 26, and the one thing that is diagnosed but not fixed
+//!
+//! 26 at c4 / 25 at c1: TS2769 8, TS2345 8, TS2322 5, TS2589 2, one each
+//! TS2366/TS2365/TS2339. No family is larger than two keys any more.
+//!
+//! `@nestjs/swagger`'s `ApiQuery` (auth.guard ×2) is traced and isolates in 27
+//! lib-free lines, and the fix is NOT obvious — it is a question about tsc, not
+//! about ztsc:
+//!
+//!     interface Common { type?: Ctor<unknown> | 'string' | (string & {}); }
+//!     type Meta = Common | ({ name: string } & Common & Omit<Schema,'required'>);
+//!     declare function api(o: Meta): void;
+//!     api({ name: 'plain', type: S });   // tsgo clean, ztsc TS2345
+//!
+//! The literal fits the FIRST constituent (whose properties are all optional)
+//! with `name` as an extra property, and `name` is known in the union, so tsc's
+//! whole-union `hasExcessProperties` passes and
+//! `typeRelatedToSomeType(getRegularTypeOfObjectLiteral(source), …)` then
+//! relates the REGULARIZED literal to `Common` and accepts. ztsc's
+//! `freshLiteralUnionMismatch` instead SKIPS any constituent that does not know
+//! every written property, which is the per-constituent excess model. Note the
+//! same function's own motivating case (`crypto.subtle.decrypt`'s `{name, iv}`
+//! against `AlgorithmIdentifier | … | AesGcmParams`) needs the skip: tsc
+//! reports there. The two differ somewhere in `hasExcessProperties`'
+//! `findMatchingDiscriminantType` / `filterPrimitivesIfContainsNonPrimitive`
+//! reduction of the target union, and settling WHICH is the next step — the
+//! same source is assignable, and the only difference is which constituent is
+//! allowed to answer. Both shapes are in this header; do not change
+//! `freshLiteralUnionMismatch` without re-running the crypto case.
+//!
+//! The rest: bullmq `Job<…, infer N>` (job.repository ×2), main.ts ×2 (the
+//! socket.io family's residue, a different call), and fifteen one-offs.
 
 const std = @import("std");
 const types = @import("../types.zig");
