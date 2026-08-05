@@ -701,6 +701,35 @@ pub fn removeUndefined(c: *Checker, t: TypeId) Error!TypeId {
 }
 
 pub fn nonNullable(c: *Checker, t: TypeId) Error!TypeId {
+    return nonNullableInner(c, t, false);
+}
+
+/// tsc's `getAdjustedTypeWithFacts(t, NEUndefinedOrNull)` is a `mapType`: the
+/// `NonNullable<…>` instantiation is applied CONSTITUENT BY CONSTITUENT, not
+/// only to a union as a whole. The arms below (a bare type parameter, a
+/// deferred conditional or indexed access) therefore have to be reachable from
+/// inside a union too — a `T` narrowed by `typeof value === 'number'` is
+/// `number & T | T`, and stripping nullish from that has to leave the `T` arm
+/// as `T & {}`. Filtering the union by KIND alone left it as `T`, so
+/// immich's `validate<T>(value: T): NonNullable<T> | null` reported TS2322 on
+/// its own `return value ?? null` — but only once a guard had turned the bare
+/// parameter into a union.
+fn nonNullableInner(c: *Checker, t: TypeId, drop_void: bool) Error!TypeId {
+    if (c.ts.kind(t) == .union_type) {
+        var parts: std.ArrayList(TypeId) = .empty;
+        defer parts.deinit(c.scratch());
+        for (try c.memberList(t)) |m| {
+            const nm = try nonNullableInner(c, m, drop_void);
+            if (nm != types.never_type) try parts.append(c.scratch(), nm);
+        }
+        return c.ts.makeUnion(c.scratch(), parts.items);
+    }
+    const scalar = try nonNullableScalar(c, t);
+    if (drop_void and c.ts.kind(scalar) == .void) return types.never_type;
+    return scalar;
+}
+
+fn nonNullableScalar(c: *Checker, t: TypeId) Error!TypeId {
     // A bare type parameter whose constraint may be nullish becomes `T & {}`
     // (tsc's `getNonNullableType` / `NonNullable<T>`). The `& {}` marker
     // keeps the value assignable back to a `T` slot while exposing the
@@ -750,13 +779,7 @@ pub fn nonNullable(c: *Checker, t: TypeId) Error!TypeId {
 /// `??`: the same strip inside the general `nonNullable` (which also serves
 /// `!` and comparison narrowing) regressed a `void` receiver.
 pub fn nonNullableNullish(c: *Checker, t: TypeId) Error!TypeId {
-    if (c.ts.kind(t) == .type_param) return c.nonNullable(t);
-    return c.filterUnion(t, struct {
-        fn keep(ch: *Checker, m: TypeId) bool {
-            const k = ch.ts.kind(m);
-            return k != .undefined and k != .null and k != .void;
-        }
-    }.keep);
+    return nonNullableInner(c, t, true);
 }
 
 /// Receiver narrowing for an optional-chain link (`a?.b`, `a?.[i]`, `a?.()`).
