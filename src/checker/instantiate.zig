@@ -1255,7 +1255,9 @@ pub fn mergeBaseObject(c: *Checker, derived: TypeId, base: TypeId, union_overloa
     // Preserve call/construct signatures from both sides: a callable
     // interface extending another accumulates every signature.
     if (!c.ts.objectHasSigs(derived) and !c.ts.objectHasSigs(base)) {
-        return c.ts.makeObject(props.items, sidx, nidx, c.ts.objectFlags(derived) & ~types.obj_flag_has_sigs);
+        const m = try c.ts.makeObject(props.items, sidx, nidx, c.ts.objectFlags(derived) & ~types.obj_flag_has_sigs);
+        try c.carryKeyNameTypes(m, &.{ derived, base });
+        return m;
     }
     var calls: std.ArrayList(TypeId) = .empty;
     defer calls.deinit(c.scratch());
@@ -1265,7 +1267,39 @@ pub fn mergeBaseObject(c: *Checker, derived: TypeId, base: TypeId, union_overloa
         for (0..c.ts.objectCallSigCount(o)) |i| try calls.append(c.scratch(), c.ts.objectCallSig(o, @intCast(i)));
         for (0..c.ts.objectConstructSigCount(o)) |i| try constructs.append(c.scratch(), c.ts.objectConstructSig(o, @intCast(i)));
     }
-    return c.ts.makeObjectSigs(props.items, sidx, nidx, c.ts.objectFlags(derived) & ~types.obj_flag_has_sigs, calls.items, constructs.items);
+    const merged = try c.ts.makeObjectSigs(props.items, sidx, nidx, c.ts.objectFlags(derived) & ~types.obj_flag_has_sigs, calls.items, constructs.items);
+    try c.carryKeyNameTypes(merged, &.{ derived, base });
+    return merged;
+}
+
+/// Carry `key_name_types` entries from the tables an object was BUILT from
+/// onto the object itself (see `Checker.key_name_types`). A member declared
+/// with a computed enum key is keyed by the member's VALUE and only NAMED by
+/// the enum member, and the naming lives in a side table against the interned
+/// object — so every place that re-interns a table (heritage folding, a
+/// homomorphic map over it) has to bring the names along or the enum identity
+/// is silently lost. `interface M extends Record<E, V>` was exactly that: the
+/// base materialized enum-named keys, the merge interned a fresh object, and
+/// `keyof M` came back a plain string union again.
+///
+/// `from` is searched in order, so a derived member's own name type wins over
+/// an inherited one. No-op for the overwhelming majority of objects, which
+/// have no such key.
+pub fn carryKeyNameTypes(c: *Checker, out: TypeId, from: []const TypeId) Error!void {
+    if (c.key_name_types.count() == 0) return;
+    if (c.ts.kind(out) != .object) return;
+    for (0..c.ts.objectPropCount(out)) |i| {
+        const name = c.ts.objectProp(out, @intCast(i)).name;
+        const key = (@as(u64, out) << 32) | name;
+        if (c.key_name_types.contains(key)) continue;
+        for (from) |src| {
+            if (c.ts.kind(src) != .object) continue;
+            if (c.key_name_types.get((@as(u64, src) << 32) | name)) |nt| {
+                try c.key_name_types.put(c.cm(), key, nt);
+                break;
+            }
+        }
+    }
 }
 
 /// Generic instance shape of a class: instance members + base instance.

@@ -34,6 +34,7 @@ const TpMap = @import("enums.zig").TpMap;
 const atom = Checker.atom;
 const containsFreeTypeParam = @import("enums.zig").containsFreeTypeParam;
 const containsTypeParam = @import("enums.zig").containsTypeParam;
+const EnumMemberCollect = @import("enums.zig").EnumMemberCollect;
 const instantiateId = @import("enums.zig").instantiateId;
 const keyofType = @import("typenode.zig").keyofType;
 const nodeKey = Checker.nodeKey;
@@ -183,7 +184,11 @@ pub fn finishCondPlan(c: *Checker, plan: CondPlan, chk: TypeId, extends_ty: Type
             .distribute => {
                 var parts: std.ArrayList(TypeId) = .empty;
                 defer parts.deinit(c.scratch());
-                for (try c.memberList(chk)) |m| {
+                const domain = blk2: {
+                    const d = try c.condDistributionDomain(chk, extends_ty);
+                    break :blk2 if (d == 0) chk else d;
+                };
+                for (try c.memberList(domain)) |m| {
                     // A distributive conditional's true/false branch may BE
                     // the check type (`T extends U ? never : T` = Exclude,
                     // `? T : never` = Extract). When the naked-type-param
@@ -216,6 +221,43 @@ pub fn condTrueBranch(c: *Checker, b: CondPlan.Bindings, true_ty: TypeId) Error!
     return tb;
 }
 
+/// The union a distributive conditional's check distributes over, or 0 when
+/// it does not distribute. A union check distributes over itself.
+///
+/// A WHOLE ENUM check distributes over its MEMBER types when the extends
+/// clause names members of that same enum. tsc's declared type of `E` IS
+/// `E.A | E.B | …`, so `Exclude<E, E.A>` subtracts a member there. ztsc keeps
+/// an enum as one nominal type, so `E extends E.A` simply answered false and
+/// `Exclude` handed back the whole enum — immich's
+/// `ConcurrentQueueName = Exclude<QueueName, QueueName.StorageTemplateMigration
+/// | …>` still carried all four excluded queues, which was invisible while
+/// `Record<E, V>` materialized an index signature and became four missing
+/// properties the moment it materialized named ones.
+///
+/// Gated on the extends clause mentioning the same enum so that nothing else
+/// changes shape: an unrelated test (`E extends string ? … : …`) answers the
+/// same for the enum and for every member, and leaving it undistributed keeps
+/// the result spelled `E` rather than as a member union.
+pub fn condDistributionDomain(c: *Checker, chk: TypeId, extends_ty: TypeId) Error!TypeId {
+    const s = &c.ts;
+    if (s.kind(chk) == .union_type) return chk;
+    if (s.kind(chk) != .enum_type or s.isEnumMember(chk)) return 0;
+    if (!try mentionsEnumMemberOf(c, extends_ty, s.enumSymbol(chk))) return 0;
+    const mu = (try c.enumMemberTypeUnion(s.enumSymbol(chk), 0)) orelse return 0;
+    return if (s.kind(mu) == .union_type) mu else 0;
+}
+
+/// Whether `t` is — or is a union containing — a member type of enum `sym`.
+fn mentionsEnumMemberOf(c: *Checker, t: TypeId, sym: SymbolId) Error!bool {
+    const s = &c.ts;
+    if (s.kind(t) == .enum_type) return s.isEnumMember(t) and s.enumSymbol(t) == sym;
+    if (s.kind(t) != .union_type) return false;
+    for (try c.memberList(t)) |m| {
+        if (s.kind(m) == .enum_type and s.isEnumMember(m) and s.enumSymbol(m) == sym) return true;
+    }
+    return false;
+}
+
 pub fn planConditional(c: *Checker, chk: TypeId, extends_ty: TypeId, distributive: bool) Error!CondPlan {
     if (c.inst_depth > max_instantiation_depth or c.inst_count > c.inst_budget) {
         c.inst_limit_tripped = true;
@@ -242,7 +284,7 @@ pub fn planConditional(c: *Checker, chk: TypeId, extends_ty: TypeId, distributiv
     // and the results unioned — this is what lets Awaited pick the callable
     // `then` argument out of its `| undefined | null`. Each member may pick
     // a different branch, so both are wanted.
-    if (distributive and s.kind(chk) == .union_type) {
+    if (distributive and (try c.condDistributionDomain(chk, extends_ty)) != 0) {
         return .{ .need_both = .distribute };
     }
     // Defer while a mapped key parameter is still unbound: a
@@ -1981,7 +2023,17 @@ pub fn materializeMapped(c: *Checker, key_param: TypeId, constraint: TypeId, val
                     }
                 }
                 const empty = props.items.len == 0 and sindex == 0 and nindex == 0;
-                if (arrayish.items.len == 0) return c.objectFromProps(props.items, sindex, nindex);
+                if (arrayish.items.len == 0) {
+                    const mapped = try c.objectFromProps(props.items, sindex, nindex);
+                    // An enum-keyed member is NAMED by the enum only in a side
+                    // table (see `carryKeyNameTypes`), so a homomorphic map
+                    // over such a source — `Partial<Record<E, V>>` — has to
+                    // bring the names across or `keyof` loses the enum. Only
+                    // an un-remapped map keeps the key: an `as` clause names
+                    // the property itself.
+                    if (as_clause == 0) try c.carryKeyNameTypes(mapped, &.{src});
+                    return mapped;
+                }
                 if (!empty) try arrayish.append(c.scratch(), try c.objectFromProps(props.items, sindex, nindex));
                 return s.makeIntersection(c.scratch(), arrayish.items);
             },
@@ -2043,12 +2095,37 @@ pub fn materializeMapped(c: *Checker, key_param: TypeId, constraint: TypeId, val
 
     var props: std.ArrayList(types.Prop) = .empty;
     defer props.deinit(c.scratch());
+    // Members whose NAME type is not the plain string literal of their atom —
+    // an enum-keyed property, see the `.enum_type` arm below and
+    // `Checker.key_name_types`.
+    var name_types: std.ArrayList(types.Prop) = .empty;
+    defer name_types.deinit(c.scratch());
     var sindex: TypeId = 0;
     var nindex: TypeId = 0;
     for (keys) |key_lit| {
         switch (s.kind(key_lit)) {
             .string => sindex = try c.substMappedKey(value, key_id, key_lit),
             .number => nindex = try c.substMappedKey(value, key_id, key_lit),
+            // An enum MEMBER key (`collectMappedKeys`' `.enum_type` arm).
+            // Keyed by the member's constant value, named by the member type
+            // itself so `keyof` answers `E.A` and not `"a"`. A remap (`as`)
+            // computes its own name and replaces the enum name outright, as
+            // it does for every other key.
+            .enum_type => {
+                if (!s.isEnumMember(key_lit)) continue;
+                const vname = (try c.literalKeyAtom(key_lit)) orelse continue;
+                const name = if (as_clause == 0)
+                    vname
+                else
+                    (try c.remapKey(as_clause, key_id, key_lit)) orelse continue;
+                const pt = try c.substMappedKey(value, key_id, key_lit);
+                var base: u32 = 0;
+                if (mod_src != 0) {
+                    if (try c.propOfTypeEx(mod_src, name, false)) |sp| base = sp.flags & mod_mask;
+                }
+                try props.append(c.scratch(), .{ .name = name, .ty = pt, .flags = applyPropModifiers(base, flags) });
+                if (as_clause == 0) try name_types.append(c.scratch(), .{ .name = name, .ty = key_lit });
+            },
             .string_literal => {
                 const name = (try c.remapKey(as_clause, key_id, key_lit)) orelse continue;
                 const pt = try c.substMappedKey(value, key_id, key_lit);
@@ -2093,7 +2170,11 @@ pub fn materializeMapped(c: *Checker, key_param: TypeId, constraint: TypeId, val
         }
     }
     if (props.items.len == 0 and sindex == 0 and nindex == 0) return types.empty_object_type;
-    return s.makeObject(props.items, sindex, nindex, 0);
+    const obj = try s.makeObject(props.items, sindex, nindex, 0);
+    for (name_types.items) |nt| {
+        try c.key_name_types.put(c.cm(), (@as(u64, obj) << 32) | nt.name, nt.ty);
+    }
+    return obj;
 }
 
 /// Re-bind a homomorphic mapped type's SOURCE inside its value template
@@ -2243,20 +2324,50 @@ pub fn collectMappedKeys(c: *Checker, constraint0: TypeId, out: *std.ArrayList(T
                 if (keep) try out.append(c.scratch(), cand);
             }
         },
-        // An enum key domain (`{ [P in E]: V }` / `Record<E, V>`) is
-        // materialized as an INDEX signature (`string` for a string enum,
-        // `number` for a numeric one), not named props: an object literal
-        // built with computed enum-member keys (`{ [E.A]: v }`) is keyed by
-        // the binder's text-derived placeholder, not by member value.
-        // Emitting named props here would make every such literal fail the
-        // now-required keys (spurious TS2739). An index signature keeps both
-        // sides consistent: `Object.values`/`entries` inference recovers `V`
-        // from the index (fixing the `unknown[]`/TS2339 collapse), and a
-        // `{}`-shaped computed-key literal stays assignable. The tradeoff is
-        // under-reporting a genuinely missing enum key — acceptable, and no
-        // worse than today (the map previously collapsed to `{}` outright).
+        // An enum key domain (`{ [P in E]: V }` / `Record<E, V>`) enumerates
+        // the enum's MEMBER types, one key each — tsc's own reading, where a
+        // whole enum simply IS the union of its members. `materializeMapped`
+        // then keys each property by the member's constant VALUE (the atom
+        // `literalKeyAtom` gives, which is what a computed enum key
+        // `[E.A]` is keyed by everywhere else) and NAMES it with the member
+        // type through `key_name_types`, so `keyof Record<E, V>` reports
+        // `E.A | E.B`.
+        //
+        // This used to emit a single INDEX signature (`string` for a string
+        // enum, `number` for a numeric one) on the reasoning that a computed
+        // enum key was keyed by a text-derived placeholder rather than by
+        // member value. It is not — `constSymbolKeyAtom` resolves it to the
+        // value — and the index signature cost `keyof` the enum: `keyof M`
+        // for an `interface M extends Record<E, …>` came back
+        // `string | number`, so a `<T extends keyof M>` parameter no longer
+        // satisfied `T extends E` and every kysely column typed by such a key
+        // was rejected (immich `user.repository.ts`'s `upsertMetadata`).
+        //
+        // A member whose value is COMPUTED has no key atom at all, so an enum
+        // carrying one keeps the index-signature fallback rather than
+        // silently dropping keys.
         .enum_type => {
-            const info = try c.enumInfo(s.enumSymbol(constraint));
+            if (s.isEnumMember(constraint)) {
+                try out.append(c.scratch(), constraint);
+                return;
+            }
+            const sym = s.enumSymbol(constraint);
+            var list: std.ArrayList(TypeId) = .empty;
+            defer list.deinit(c.scratch());
+            var collect: EnumMemberCollect = .{ .c = c, .list = &list, .sym = sym };
+            try c.eachEnumMember(sym, &collect, EnumMemberCollect.visit);
+            var all_named = list.items.len > 0;
+            for (list.items) |m| {
+                if ((try c.literalKeyAtom(m)) == null) {
+                    all_named = false;
+                    break;
+                }
+            }
+            if (all_named) {
+                try out.appendSlice(c.scratch(), list.items);
+                return;
+            }
+            const info = try c.enumInfo(sym);
             try out.append(c.scratch(), if (info.all_string) types.string_type else types.number_type);
         },
         else => try out.append(c.scratch(), constraint),
