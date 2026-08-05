@@ -1026,7 +1026,6 @@ pub fn boundReducible(c: *Checker, t: TypeId, depth: u32) Error!bool {
 /// pre-rewrite behavior.
 pub fn sigReferencesOuterParam(c: *Checker, sig: TypeId, bound: []const u32) Error!bool {
     const n_own = c.ts.fnTypeParamCount(sig);
-    if (n_own != 0 and !try c.higherOrderSigEligible(sig)) return false;
     if (try c.containsFreeTypeParam(sig, bound)) return true;
     if (n_own == 0) return false;
     // Own params are copied out *after* the two calls above: both intern, and
@@ -1707,18 +1706,35 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
             var cur_map: std.ArrayList(TpMap) = .empty;
             defer cur_map.deinit(c.scratch());
             var cur_id = map_id;
-            // Mint fresh params only for an eligible sig (all own bounds
-            // bare/absent); otherwise keep the original params + AST bounds
-            // (the pre-rewrite behavior for standalone generic functions).
-            const eligible = n_tps != 0 and map.len > 0 and try c.higherOrderSigEligible(t);
-            if (eligible) try cur_map.appendSlice(c.scratch(), map);
+            // Eligibility decides whether a rewritten bound is ENFORCED, not
+            // whether the substitution happens. Gating the substitution too
+            // left an ineligible signature's own bound standing over the
+            // ENCLOSING generic's parameter — a bound nothing can satisfy,
+            // because that parameter has just been substituted away. socket.io
+            // writes `emit<Ev extends EventNames<RemoveAcknowledgements<E>>>`
+            // on `StrictEventEmitter<…, E>`; `higherOrderSigEligible` declines
+            // the bound (its `Last`/`Parameters` chain has an `infer` in the
+            // extends clause, so `boundReducible` is false and there is no
+            // mapped/template shape at the top for `boundHasReducerShape`),
+            // and `Ev` was then clamped to a constraint still mentioning `E`.
+            // Every `server.emit('…')` in immich was TS2345 against an
+            // unreduced `IsAny<…>` chain.
+            //
+            // So the substitution is unconditional and only `fc` — the
+            // constraint the fresh parameter actually enforces — keeps the
+            // gate. An ineligible bound rides along as `widen_bound`, exactly
+            // as a bare bound already does: unenforced, but no longer a
+            // dangling reference.
+            const rewritable = n_tps != 0 and map.len > 0;
+            const eligible = rewritable and try c.higherOrderSigEligible(t);
+            if (rewritable) try cur_map.appendSlice(c.scratch(), map);
             // Index: the loop body resolves bounds and instantiates, both of
             // which intern and can move `extra` (see `memberAt`).
             for (0..n_tps) |tp_i| {
                 const tp = s.fnTypeParamAt(t, tp_i);
                 if (tpLookup(map, tp) != null) continue; // substituted away
                 var fresh: ?u32 = null;
-                if (eligible) {
+                if (rewritable) {
                     const od = try c.typeParamDefault(tp);
                     const oc = try c.typeParamConstraint(tp);
                     const nd = if (od != types.no_type) try c.instantiateId(od, cur_map.items, cur_id) else od;
@@ -1733,7 +1749,7 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
                     // it was never enforceable pre-rewrite (`bare_outer`),
                     // and enforcing its substituted form would erase a
                     // legitimate inference. Mint only when a bound moved.
-                    const fc = if (oc != types.no_type and c.ts.kind(oc) != .type_param) nc else types.no_type;
+                    const fc = if (eligible and oc != types.no_type and c.ts.kind(oc) != .type_param) nc else types.no_type;
                     // A bare bound stays unenforced, but its substituted form
                     // rides along for the literal-widening rule — see
                     // `FreshTp.widen_bound`.

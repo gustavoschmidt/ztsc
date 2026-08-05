@@ -1122,6 +1122,20 @@ pub const Store = struct {
     }
 
     pub fn makeTuple(s: *Store, elems: []const TupleElem) Error!TypeId {
+        // tsc's `getTupleTargetType`: "[...X[]] is equivalent to just X[]".
+        // A tuple whose ONLY element is a rest element already spelled as an
+        // array (or a readonly array) is that array — there is no positional
+        // information left for the tuple form to carry. It matters wherever a
+        // parameter list is reified: `Parameters<(...args: any[]) => void>`
+        // came back `[...any[]]`, and `ReadonlyArray<infer E>` then inferred
+        // `E = any[]` instead of `any`, which is how socket.io's
+        // `Last<Parameters<Map[K]>>` stopped being `any` and its whole
+        // `IsAny<…>` chain stopped reducing.
+        if (elems.len == 1 and (elems[0].flags & elem_flag_rest) != 0 and
+            s.kind(elems[0].ty) == .array)
+        {
+            return elems[0].ty;
+        }
         const start = s.pending.items.len;
         defer s.pending.items.len = start;
         for (elems) |e| {
