@@ -604,6 +604,7 @@ pub fn resolveSignatureCall(
         if (nargs < try c.requiredParams(inst) or nargs > try c.paramTotal(inst)) {
             c.rollbackArgDiags(saved_infer, infer_file, arg_nodes);
             c.inst_count = saved_inst_count;
+            c.newBudgetWindow();
             c.inst_limit_tripped = saved_inst_trip;
             continue;
         }
@@ -613,6 +614,7 @@ pub fn resolveSignatureCall(
         }
         c.rollbackArgDiags(saved_infer, infer_file, arg_nodes);
         c.inst_count = saved_inst_count;
+        c.newBudgetWindow();
         c.inst_limit_tripped = saved_inst_trip;
     }
     // No candidate matched. tsc does not report at the callee: it re-checks

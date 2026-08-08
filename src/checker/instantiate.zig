@@ -206,6 +206,25 @@ pub fn expandRef(c: *Checker, ref: TypeId) Error!TypeId {
         if (t == types.no_type) return types.error_type; // cycle
         return t;
     }
+    // A truncation already established for THIS budget window (below) is
+    // served from here. It is not a published answer — the entry dies with
+    // the window — but within the window it is the same answer re-derivation
+    // would produce, and re-deriving it is not cheap: the prologue below runs
+    // `typeParamsOf` (which re-reads the declaration's type-parameter list
+    // out of the AST, re-interning every name) and `buildInstMap` before
+    // `instantiate` can even reach the guard that truncates. drizzle-orm's
+    // `relate` walk over `PgSelectBase` / `SQLiteSelectBase` asks the same
+    // handful of references 3.0 M times inside ONE statement's window; without
+    // this it re-derived each one, which is 3.6 s and 1.69 GB of never-freed
+    // expansion prologue against 0.04 s and 21 MB with the repeat elided.
+    if (c.trunc_expansions.get(ref)) |epoch| {
+        if (epoch == c.budget_epoch) {
+            // The mark the real path would leave: a caller must not memoize
+            // anything built on a truncated subtree.
+            c.inst_limit_tripped = true;
+            return types.error_type;
+        }
+    }
     try c.expansions.put(c.cm(), ref, types.no_type); // in-progress
     const sym = c.ts.refSymbol(ref);
     const dwin = if (c.dprof.on) blk: {
@@ -287,8 +306,15 @@ pub fn expandRef(c: *Checker, ref: TypeId) Error!TypeId {
     // subtree and cost 26 keys and 0.8 s; this one fires only on the definite
     // marker, which after the split is rare — no declaration materialization
     // in immich truncates at all, and only one statement reaches its cap.
+    //
+    // Withdrawn from `expansions`, but RECORDED against the budget window that
+    // produced it (`budget_epoch`): a truncation is not a fact about `ref`,
+    // yet it is a fact about this window, and every later ask inside the same
+    // window would spend the whole prologue above to arrive at it again. See
+    // the lookup at the top.
     if (c.ts.kind(result) == .err and c.ts.kind(generic) != .err) {
         _ = c.expansions.remove(ref);
+        try c.trunc_expansions.put(c.cm(), ref, c.budget_epoch);
         return result;
     }
     // Origin tag: this object is the materialization of `ref =

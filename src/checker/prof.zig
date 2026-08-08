@@ -960,6 +960,74 @@
 //! zero times, and the same burn at checking level, which trips and reports
 //! the TS2589. It is pinned by the immich gate.
 //!
+//! ### The withdrawal's bill, and where to send it (2026-08-08)
+//!
+//! The withdrawal above cost drizzle-orm **19.5 ms / 18.1 MB -> 3.20 s /
+//! 1.61 GB at c1** (2.32 s / 4.04 GB at c4, and unstable run to run) — 120x
+//! wall, and the published BENCHMARKS.md row wrong in ztsc's favour ever
+//! since. Nothing else in the corpus moved, and drizzle's own diagnostics
+//! never moved either: 83 keys with the withdrawal, 83 without.
+//!
+//! The mechanism is not extra type work, it is extra *prologue*. `expandRef`
+//! is asked for a reference; the memo is withdrawn, so it re-derives
+//! `typeParamsOf` (which re-reads the declaration's type-parameter list out of
+//! the AST and re-interns every name through `atomOfToken` ->
+//! `scanner.tokenEnd`) and `buildInstMap`, and only then reaches an
+//! `instantiate` that answers in ONE visit because `chainRepeats` cuts it. The
+//! `--inst-profile` counters name it exactly: `PgSelectBase` **1,988,648
+//! calls** charging 43,226 visits, `SQLiteSelectBase` **1,094,615 calls**
+//! charging 146,786 — a fifth of a visit per call. `expandRef` also bumps its
+//! `args` dupe and its two lists onto the live instantiation arena, and
+//! `BumpArena.free` is a no-op for anything but the most recent block, so
+//! three million prologues that never return a type still leave their scratch
+//! behind: `check scratch high-water` 1,666,842,624 bytes, which IS the
+//! 1.69 GB peak. Both halves are the same repeat.
+//!
+//! The demand is the `substThis -> reduceMapped -> materializeMapped ->
+//! substMappedKey -> reduceIndexedAccess -> indexedAccessType ->
+//! resolveStructural -> expandRef` spine, entered from `checkClass`'s
+//! heritage relation on the two `…SelectBase` declarations. Every level of it
+//! re-asks the same handful of references; before the withdrawal the memo
+//! answered them, after it nothing did.
+//!
+//! So the truncation gets a memo that is scoped to what it is actually a fact
+//! about. It is not a fact about the reference — that is what df8ffb8 settled
+//! — but it IS a fact about the BUDGET WINDOW that produced it, so
+//! `trunc_expansions` keys it by `Checker.budget_epoch`, an id minted fresh
+//! wherever `inst_count` restarts or is refunded (`checkStatement`,
+//! `enterSymFile`, the variance window, the queued type-argument drain, an
+//! overload candidate's refund) and restored with the rest of the context by
+//! `restoreCtx`. Within a window the second ask is two hash probes; the first
+//! ask in the NEXT window re-expands exactly as before, which is the whole of
+//! what the immich fix needs — `ocr.repository.ts`'s statement is one window,
+//! and every later reader of `DynamicModule<DB>` is in another.
+//!
+//! drizzle **3.20 -> 0.16 s / 1608 -> 35 MB at c1**, 3.98 -> 0.15 s /
+//! 2624 -> 33 MB at c2, 2.32 -> 0.10 s / 4038 -> 33 MB at c4, 3.86 -> 0.15 s /
+//! 3064 -> 36 MB at c8 (interleaved medians of five against tsgo's 0.23 s /
+//! 275 MB). `PgSelectBase` 1,988,648 calls -> 31, `SQLiteSelectBase`
+//! 1,094,615 -> 44; `inst cache misses` 3,270,872 -> 133,914. immich stays at
+//! 0 diagnostics at c1/c4/c8 with wall and RSS unmoved (2.5 s / 382 MB at c1),
+//! and the other seven packages are unchanged to the tenth of a megabyte.
+//!
+//! What the epoch does NOT buy back is the ~2x node-visit difference against
+//! simply republishing the truncation (338,988 vs 183,976 `instantiations`,
+//! and 20.6 MB vs 0.7 MB of `check scratch high-water`). That gap is
+//! df8ffb8's semantics being paid for honestly: a published truncation also
+//! publishes `inst_limit_tripped == false` to everything downstream of it, so
+//! the whole subtree under a poisoned reference becomes memoizable. The
+//! withdrawal declines that, and the epoch memo declines it too — the fast
+//! path sets `inst_limit_tripped` exactly as the real path would, or the first
+//! ask in a window and the second would disagree about whether their callers
+//! may cache, which is the order-dependence the whole family is about.
+//!
+//! One shape measured and NOT taken: letting a declaration window (`enterSymFile`)
+//! INHERIT the enclosing statement's epoch instead of opening its own. It is a
+//! literal no-op on drizzle (0.16 s either way, byte-identical diagnostics),
+//! and it would serve a truncation from a spent statement into a window that
+//! was given a fresh budget precisely so it could succeed — the immich
+//! poisoning, re-scoped rather than fixed.
+//!
 //! ## Family 2, re-bucketed at 74 — and it isolates now (2026-08-04)
 //!
 //! With the scratch-project method fixed, the clusters that "needed the whole

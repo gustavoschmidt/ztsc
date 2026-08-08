@@ -618,6 +618,7 @@ pub fn measuredVariances(c: *Checker, owner: SymbolId) Error!?u32 {
     // whose relation happened to demand the measurement.
     const saved_suppress = c.suppress_inst_diag;
     const saved_count = c.inst_count;
+    const saved_epoch = c.budget_epoch;
     const saved_tripped = c.inst_limit_tripped;
     c.suppress_inst_diag = true;
     // …and the budget is a WINDOW here, not just an unbilled charge. The
@@ -644,6 +645,7 @@ pub fn measuredVariances(c: *Checker, owner: SymbolId) Error!?u32 {
     // Bounded work — one window per generic per checker, and the window is
     // still capped by `max_instantiation_count` from zero.
     c.inst_count = 0;
+    c.newBudgetWindow();
     c.inst_limit_tripped = false;
     // The relation stack is bookkeeping here too, and for a stronger reason
     // than the counters above: a measurement is a question about the GENERIC,
@@ -667,6 +669,7 @@ pub fn measuredVariances(c: *Checker, owner: SymbolId) Error!?u32 {
         c.rel_id_floor = saved_rel_id_floor;
         c.suppress_inst_diag = saved_suppress;
         c.inst_count = saved_count;
+        c.budget_epoch = saved_epoch;
         c.inst_limit_tripped = saved_tripped;
         c.variance_measure_depth -= 1;
         _ = c.measuring_variance.remove(owner);

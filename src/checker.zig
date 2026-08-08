@@ -675,7 +675,7 @@ pub const map_containers = [_][]const u8{
     "ctp_syms_seen",            "weak_types",             "lazy_member",
     "lazy_map",                 "pattern_root_decls",     "pattern_root_ids",
     "pattern_narrow_busy",      "key_name_types",         "enum_members",
-    "keyof_obj_cache",
+    "keyof_obj_cache",          "trunc_expansions",
 };
 
 /// One enum member as `eachEnumMember` yields it: the name atom and the
@@ -886,6 +886,14 @@ pub const Checker = struct {
     relation: IntMap(u64, u8) = .empty,
     /// ref TypeId -> expanded structural type.
     expansions: IntMap(TypeId, TypeId) = .empty,
+    /// ref TypeId -> the `budget_epoch` in which expanding it came back
+    /// TRUNCATED (see `expandRef`). A truncation is not a fact about the
+    /// reference, so it is never published to `expansions` — but it IS a fact
+    /// about the budget window that produced it, and re-deriving it costs the
+    /// full expansion prologue (`typeParamsOf`, `buildInstMap`, `canonMapId`)
+    /// every time. An entry from an EARLIER window is stale and ignored, so
+    /// the first reader in the next window recomputes exactly as before.
+    trunc_expansions: IntMap(TypeId, u64) = .empty,
     /// `.overloads` TypeId -> the index at which its LAST declaration group
     /// starts. An entry exists only for a merged global function whose
     /// signatures come from two groups of declarations (the default library,
@@ -1555,6 +1563,25 @@ pub const Checker = struct {
     /// the rest of the context, so a statement that demands a declaration
     /// gets its own cap back on the way out.
     inst_budget: u64 = max_instantiation_count,
+    /// Identity of the budget window in flight. Bumped — never reused — every
+    /// time `inst_count` starts over or is rolled back, i.e. at exactly the
+    /// points where "how much budget is left" stops being comparable with what
+    /// it was: a new source element (`checkStatement`), a declaration
+    /// materialization (`enterSymFile`), a variance measurement, a queued
+    /// type-argument check, and an overload candidate's refund. `restoreCtx`
+    /// puts the OUTER window's id back, because it puts the outer
+    /// `inst_count` back with it — the inner window is simply not part of the
+    /// outer one's ledger.
+    ///
+    /// It exists so a result that is an artifact of a spent budget can be
+    /// cached against the window that spent it instead of either being
+    /// republished forever (which makes the whole run's answer a function of
+    /// which element got there first — see `expandRef`) or recomputed from
+    /// scratch on every ask (which is quadratic, and on drizzle-orm was
+    /// 2 million re-derivations of one class table).
+    budget_epoch: u64 = 0,
+    /// Source of fresh `budget_epoch` ids. Monotonic per checker instance.
+    budget_epoch_next: u64 = 0,
     /// Every node-visit this checker performed, never reset. The budget above
     /// is scoped to a statement; this is the work counter the `--memory`
     /// report and `bench/repeat_sweep.sh` compare across runs.
@@ -2090,6 +2117,7 @@ pub const Checker = struct {
         this_type: TypeId,
         inst_count: u64,
         inst_budget: u64,
+        budget_epoch: u64,
         epoch_sym: SymbolId,
     };
 
@@ -2100,6 +2128,7 @@ pub const Checker = struct {
             .this_type = c.this_type,
             .inst_count = c.inst_count,
             .inst_budget = c.inst_budget,
+            .budget_epoch = c.budget_epoch,
             .epoch_sym = c.epoch_sym,
         };
     }
@@ -2110,7 +2139,16 @@ pub const Checker = struct {
         c.this_type = s.this_type;
         c.inst_count = s.inst_count;
         c.inst_budget = s.inst_budget;
+        c.budget_epoch = s.budget_epoch;
         c.epoch_sym = s.epoch_sym;
+    }
+
+    /// Open a fresh instantiation-budget window (see `budget_epoch`). Called
+    /// wherever `inst_count` restarts or is refunded, so nothing computed
+    /// against the previous window's remaining budget is served to this one.
+    pub fn newBudgetWindow(c: *Checker) void {
+        c.budget_epoch_next += 1;
+        c.budget_epoch = c.budget_epoch_next;
     }
 
     /// Switch to `sym`'s file (scope untouched; callers set it).
@@ -2155,6 +2193,7 @@ pub const Checker = struct {
         }
         c.inst_count = 0;
         c.inst_budget = max_decl_instantiation_count;
+        c.newBudgetWindow();
         return saved;
     }
 
