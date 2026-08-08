@@ -118,6 +118,8 @@ pub fn aliasInstance(c: *Checker, sym: SymbolId, args: []const TypeId, tok: Toke
 pub fn aliasGeneric(c: *Checker, sym: SymbolId) Error!TypeId {
     if (c.alias_generic.get(sym)) |t| return t;
     try c.alias_state.put(c.cm(), sym, 1);
+    const dwin = prof_zig.declEnter(c, sym, .alias);
+    defer prof_zig.declExit(c, dwin);
     const saved_ctx = c.enterSymFile(sym);
     defer c.restoreCtx(saved_ctx);
     // The alias body is a separate lexical declaration: its own type params
@@ -206,6 +208,18 @@ pub fn expandRef(c: *Checker, ref: TypeId) Error!TypeId {
     }
     try c.expansions.put(c.cm(), ref, types.no_type); // in-progress
     const sym = c.ts.refSymbol(ref);
+    const dwin = if (c.dprof.on) blk: {
+        const sf = c.symFlags(sym);
+        break :blk prof_zig.declEnter(c, sym, if (sf.class)
+            .expand_class
+        else if (sf.interface)
+            .expand_iface
+        else if (sf.type_alias)
+            .expand_alias
+        else
+            .expand_other);
+    } else prof_zig.DeclWin{};
+    defer prof_zig.declExit(c, dwin);
     const prof_before = c.inst_total;
     defer if (c.prof.on) prof_zig.noteExpand(c, sym, c.inst_total - prof_before);
     const args = try c.scratch().dupe(TypeId, c.ts.refArgs(ref));
@@ -988,6 +1002,8 @@ pub fn interfaceGeneric(c: *Checker, sym: SymbolId) Error!TypeId {
     try c.iface_generic.put(c.cm(), sym, types.no_type);
     try c.iface_stack.append(c.cm(), .{ .sym = sym });
     defer _ = c.iface_stack.pop();
+    const dwin = prof_zig.declEnter(c, sym, .iface);
+    defer prof_zig.declExit(c, dwin);
 
     // Constituents: a within-file interface is one symbol carrying every
     // reopened block's decls; a cross-file merged interface is a
@@ -1309,6 +1325,8 @@ pub fn classInstanceGeneric(c: *Checker, sym: SymbolId) Error!TypeId {
         return t;
     }
     try c.class_inst_generic.put(c.cm(), sym, types.no_type);
+    const dwin = prof_zig.declEnter(c, sym, .class);
+    defer prof_zig.declExit(c, dwin);
     const saved_ctx = c.enterSymFile(sym);
     defer c.restoreCtx(saved_ctx);
     // `this` inside member type nodes (a `foo(): this` return, a `x: this`

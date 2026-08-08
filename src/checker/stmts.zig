@@ -54,6 +54,7 @@ const typeof_names = Checker.typeof_names;
 
 pub fn checkStatement(c: *Checker, node: Node) Error!void {
     if (node == null_node) return;
+    if (c.dprof.on) prof_zig.noteStmtEntry(c);
     // Baseline anchor for any TS2589 raised while materializing types in
     // this statement (refined to finer spans at expression / assignment
     // boundaries), and the source element the instantiation budget is

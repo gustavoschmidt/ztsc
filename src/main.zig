@@ -111,6 +111,9 @@ const usage =
     \\                         pair with --checkers=1
     \\  --inst-focus=ID        restrict that profile's per-type histogram to
     \\                         one substitution root (a #id from its report)
+    \\  --decl-profile         dump the declaration-window TIME profile (what
+    \\                         share of the check phase materializes
+    \\                         declarations) to stderr; pair with --checkers=1
     \\  --eager-members        materialize every interface/class member table
     \\                         whole, instead of member-by-member on demand
     \\                         (bisect leg / oracle)
@@ -196,6 +199,10 @@ const Cli = struct {
     /// `--lazy-stats`: dump the lazy relation route.s hit/bail tally to stderr
     /// at seal. A diagnostic instrument; pair with `--checkers=1`.
     lazy_stats: bool = false,
+    /// `--decl-profile`: dump the declaration-window time split to stderr at
+    /// seal (see the second half of `checker/prof.zig`). A diagnostic
+    /// instrument; pair with `--checkers=1`.
+    decl_profile: bool = false,
     /// null = auto (pretty iff stderr is a TTY).
     pretty: ?bool = null,
     project: ?[]const u8 = null,
@@ -552,6 +559,7 @@ pub fn main(init: std.process.Init) !void {
     checker.prof_zig.focus_root = cli.inst_focus;
     checker.lazy_zig.lazy_members_on = !cli.eager_members;
     checker.lazy_zig.stats_on = cli.lazy_stats;
+    checker.prof_zig.decl_prof_on = cli.decl_profile;
 
     if (cli.help) {
         try out.print("{s}", .{usage});
@@ -1887,6 +1895,8 @@ fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8, bad_arg: *[]c
             cli.inst_profile = true;
         } else if (std.mem.eql(u8, arg, "--eager-members")) {
             cli.eager_members = true;
+        } else if (std.mem.eql(u8, arg, "--decl-profile")) {
+            cli.decl_profile = true;
         } else if (std.mem.eql(u8, arg, "--lazy-stats")) {
             cli.lazy_stats = true;
         } else if (std.mem.startsWith(u8, arg, "--inst-focus=")) {

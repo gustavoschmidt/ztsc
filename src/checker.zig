@@ -1516,6 +1516,9 @@ pub const Checker = struct {
     /// `checker/prof.zig`). `prof.on` is false in every normal run and the
     /// instrumentation points are single predictable branches.
     prof: prof_zig.InstProf = .{},
+    /// Declaration-window TIME profiler (`--decl-profile`; see the second
+    /// half of `checker/prof.zig`). Off in every normal run.
+    dprof: prof_zig.DeclProf = .{},
     /// Depth of an in-flight *side query*: a type looked up from inside the
     /// flow-narrowing walk, out of the checker's top-down order (see
     /// `declaredPathType`). While non-zero `diagFmt` drops diagnostics — the
@@ -1701,6 +1704,7 @@ pub const Checker = struct {
             .inst_arena = undefined,
             .inst_cache_on = inst_cache_on,
             .prof = .{ .on = prof_zig.enabled() },
+            .dprof = .{ .on = prof_zig.declEnabled() },
         };
         c.carena = try gpa.create(std.heap.ArenaAllocator);
         errdefer gpa.destroy(c.carena);
@@ -1832,6 +1836,7 @@ pub const Checker = struct {
         c.diag_seen.deinit(c.gpa);
         c.diags.deinit(c.gpa);
         c.prof.deinit(c.gpa);
+        c.dprof.deinit(c.gpa);
         inline for (map_containers) |n| @field(c, n).deinit(c.cm());
         if (c.ts.base != null) c.ts.deinit(); // overlay only; a base store is arena-owned
         c.carena.deinit();
@@ -1843,6 +1848,8 @@ pub const Checker = struct {
     }
 
     pub fn run(c: *Checker) Error!void {
+        prof_zig.declRunStart(c);
+        defer prof_zig.declRunEnd(c);
         for (c.owned) |f| {
             c.setFile(f);
             c.cur_scope = binder.file_scope;
@@ -1898,6 +1905,7 @@ pub const Checker = struct {
         c.stats.relation_bytes = c.relation.capacity() * (8 + 1);
         c.stats.instantiations = c.inst_total;
         if (c.prof.on) prof_zig.report(c);
+        if (c.dprof.on) prof_zig.declReport(c);
         if (lazy_zig.stats_on) {
             var buf: [512]u8 = undefined;
             var used: usize = 0;

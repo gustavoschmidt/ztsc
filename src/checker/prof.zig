@@ -1928,3 +1928,465 @@ pub fn report(c: *Checker) void {
         std.debug.dumpStackTrace(&st);
     }
 }
+
+// =========================================================================
+// DECLARATION-WINDOW TIME PROFILER (`--decl-profile`)
+// =========================================================================
+//
+// A separate, much cheaper axis from everything above: not node visits and
+// not budget trips, but WALL TIME, split between
+//
+//   * declaration materialization — the dynamic extent of an
+//     `interfaceGeneric` / `classInstanceGeneric` / `aliasGeneric`
+//     construction, and of an `expandRef` table construction; and
+//   * everything else, i.e. source-element (statement) checking.
+//
+// It exists to price the *shared frozen declaration base* candidate
+// (`checker.buildBaseStore`, "piece 2"): a pre-pass that materializes the
+// declaration surface once and hands it to every checker would be SERIAL,
+// so the declaration share of a single checker's check phase is a hard
+// floor under wall clock however many checkers run afterwards.
+//
+// **Accounting, precisely.** A timestamp is taken only on the 0 -> 1 and
+// 1 -> 0 transitions of `depth`, i.e. around the OUTERMOST window only.
+// Every nested window (an `expandRef` inside a class's member table, an
+// `interfaceGeneric` inside that) is inside some outermost window, so
+// summing outermost durations counts each nanosecond exactly once — there
+// is no double counting, and no need to subtract nested frames. The cost is
+// two `Instant.now()` reads per outermost window, and there are a few
+// thousand of them, so the instrument is invisible in the total (validate
+// with the `clock reads` line in the report).
+//
+// Windows are opened AFTER the memo check in each of the four functions, so
+// a memoized re-read is not a window and is charged to whatever it
+// interrupted. `interfaceGeneric` calls `enterSymFile` before its memo
+// check; the window still starts after it.
+//
+// Attribution is to the symbol that opened the OUTERMOST window, which is
+// the unit a pre-pass would materialize: pre-building that symbol builds
+// everything nested under it too.
+
+/// Process-global switch, set once by `main` from `--decl-profile` before
+/// any checker thread starts. Write-once before the pool spawns.
+pub var decl_prof_on: bool = false;
+
+pub fn declEnabled() bool {
+    return decl_prof_on;
+}
+
+/// The four windows, with `expandRef` split by what the reference names —
+/// the split the pre-pass decision turns on. `iface`/`class`/`alias` are the
+/// RUN-ONCE-PER-SYMBOL generic forms (what a shared frozen base could
+/// actually hold); an `expand_*` window is one SUBSTITUTION under one
+/// argument list, of which a symbol has as many as its consumers ask for.
+pub const DeclKind = enum(u8) {
+    iface = 0,
+    class = 1,
+    alias = 2,
+    expand_iface = 3,
+    expand_class = 4,
+    expand_alias = 5,
+    expand_other = 6,
+};
+const n_kinds = 7;
+
+/// Token returned by `declEnter`, handed back to `declExit`.
+pub const DeclWin = struct { outer: bool = false };
+
+const DeclTally = struct {
+    ns: u64 = 0,
+    calls: u64 = 0,
+    max_ns: u64 = 0,
+
+    fn add(t: *DeclTally, ns: u64) void {
+        t.calls += 1;
+        t.ns += ns;
+        if (ns > t.max_ns) t.max_ns = ns;
+    }
+};
+
+pub const DeclProf = struct {
+    on: bool = false,
+    /// Nesting depth of declaration windows.
+    depth: u32 = 0,
+    /// Start of the currently open OUTERMOST window, in ns.
+    t0: u64 = 0,
+    /// Symbol that opened the currently open outermost window.
+    root: SymbolId = 0,
+    root_kind: DeclKind = .iface,
+    /// One entry per LIVE window, innermost last. Carries each frame's start
+    /// and the time its children already consumed, so `declExit` can charge
+    /// SELF time (exclusive of nested windows) to the frame's own symbol.
+    stack: std.ArrayListUnmanaged(Frame) = .empty,
+    /// Self (exclusive) time by symbol — the concentration measure. The
+    /// inclusive-at-the-outermost-root measure (`by_sym`) is order-dependent:
+    /// whichever declaration is demanded FIRST absorbs the whole cascade
+    /// underneath it. Self time is not.
+    self_by_sym: std.AutoHashMapUnmanaged(SymbolId, DeclTally) = .empty,
+    /// Self time by kind.
+    self_ns: [n_kinds]u64 = @splat(0),
+    /// Sum of the outermost windows' durations. See the accounting note.
+    total_ns: u64 = 0,
+    /// Outermost windows opened (== clock read pairs).
+    outermost: u64 = 0,
+    /// Constructions by kind, at any depth (memo MISSES only).
+    counts: [n_kinds]u64 = @splat(0),
+    /// Outermost windows by kind, and their time.
+    outer_counts: [n_kinds]u64 = @splat(0),
+    outer_ns: [n_kinds]u64 = @splat(0),
+    /// Outermost-window time by the root symbol that opened it.
+    by_sym: std.AutoHashMapUnmanaged(SymbolId, DeclTally) = .empty,
+    /// `checkStatement` / `checkExpr` entries made while a window was live —
+    /// the "nested statement work" the accounting would otherwise hide.
+    nested_stmts: u64 = 0,
+    nested_exprs: u64 = 0,
+    /// Total entries, for scale.
+    total_exprs: u64 = 0,
+    total_stmts: u64 = 0,
+    /// OUTERMOST-under-a-window `checkExpr` entries and their inclusive time —
+    /// an UPPER BOUND on the source-element-shaped work that happens inside a
+    /// declaration window (upper, because a nested `expandRef` opened from
+    /// inside such an expression is counted here too).
+    expr_in_decl_depth: u32 = 0,
+    expr_in_decl_t0: u64 = 0,
+    expr_in_decl_roots: u64 = 0,
+    expr_in_decl_ns: u64 = 0,
+    expr_in_decl_node: u64 = 0,
+    /// Those roots by source position (`file << 32 | pos`).
+    expr_sites: std.AutoHashMapUnmanaged(u64, DeclTally) = .empty,
+    /// `instantiate` node visits charged inside an outermost window — a
+    /// second, clock-free corroboration of the time split.
+    visits_t0: u64 = 0,
+    visits_in_decl: u64 = 0,
+    /// The whole check phase (`Checker.run`).
+    run_ns: u64 = 0,
+    run_t0: u64 = 0,
+
+    pub fn deinit(p: *DeclProf, gpa: std.mem.Allocator) void {
+        p.by_sym.deinit(gpa);
+        p.self_by_sym.deinit(gpa);
+        p.stack.deinit(gpa);
+        p.expr_sites.deinit(gpa);
+    }
+
+    const Frame = struct {
+        sym: SymbolId,
+        kind: DeclKind,
+        t0: u64,
+        child_ns: u64,
+    };
+};
+
+/// Monotonic nanoseconds. `CLOCK_UPTIME_RAW` on macOS, `CLOCK_MONOTONIC` on
+/// Linux — the same clock `main.zig`'s phase `Timer` reads, so the check-phase
+/// figure here is directly comparable with `--timing`'s.
+fn nowNs(c: *Checker) u64 {
+    const ts = std.Io.Clock.now(.awake, c.io);
+    const ns = ts.nanoseconds;
+    return if (ns > 0) @intCast(ns) else 0;
+}
+
+/// Open a declaration-materialization window for `sym`. Call AFTER the
+/// memo check, so a memoized re-read is not a window.
+pub fn declEnter(c: *Checker, sym: SymbolId, kind: DeclKind) DeclWin {
+    if (!c.dprof.on) return .{};
+    const p = &c.dprof;
+    p.counts[@intFromEnum(kind)] += 1;
+    const outer = p.depth == 0;
+    p.depth += 1;
+    if (outer) {
+        p.root = sym;
+        p.root_kind = kind;
+        p.outermost += 1;
+        p.outer_counts[@intFromEnum(kind)] += 1;
+        p.visits_t0 = c.inst_total;
+    }
+    const t0 = nowNs(c);
+    if (outer) p.t0 = t0;
+    p.stack.append(c.gpa, .{ .sym = sym, .kind = kind, .t0 = t0, .child_ns = 0 }) catch {};
+    return .{ .outer = outer };
+}
+
+pub fn declExit(c: *Checker, w: DeclWin) void {
+    if (!c.dprof.on) return;
+    const p = &c.dprof;
+    p.depth -= 1;
+    const now = nowNs(c);
+    if (p.stack.pop()) |fr| {
+        const dur = now - fr.t0;
+        const self = dur - @min(dur, fr.child_ns);
+        p.self_ns[@intFromEnum(fr.kind)] += self;
+        if (p.self_by_sym.getOrPut(c.gpa, fr.sym)) |gop| {
+            if (!gop.found_existing) gop.value_ptr.* = .{};
+            gop.value_ptr.add(self);
+        } else |_| {}
+        if (p.stack.items.len > 0) p.stack.items[p.stack.items.len - 1].child_ns += dur;
+    }
+    if (!w.outer) return;
+    const ns = now - p.t0;
+    p.visits_in_decl += c.inst_total - p.visits_t0;
+    p.total_ns += ns;
+    p.outer_ns[@intFromEnum(p.root_kind)] += ns;
+    if (p.by_sym.getOrPut(c.gpa, p.root)) |gop| {
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        gop.value_ptr.add(ns);
+    } else |_| {}
+}
+
+/// A `checkStatement` entry (any depth).
+pub fn noteStmtEntry(c: *Checker) void {
+    c.dprof.total_stmts += 1;
+    if (c.dprof.depth > 0) c.dprof.nested_stmts += 1;
+}
+
+/// A `checkExpr` entry (any depth). Opens a timing window only for the
+/// OUTERMOST expression entered while a declaration window is live.
+pub fn exprEnter(c: *Checker, node: u32) DeclWin {
+    c.dprof.total_exprs += 1;
+    if (c.dprof.depth == 0) return .{};
+    c.dprof.nested_exprs += 1;
+    const outer = c.dprof.expr_in_decl_depth == 0;
+    c.dprof.expr_in_decl_depth += 1;
+    if (outer) {
+        c.dprof.expr_in_decl_roots += 1;
+        c.dprof.expr_in_decl_node = (@as(u64, c.cur_file) << 32) | c.nodeSpanStart(node);
+        c.dprof.expr_in_decl_t0 = nowNs(c);
+    }
+    return .{ .outer = outer };
+}
+
+pub fn exprExit(c: *Checker, w: DeclWin) void {
+    if (c.dprof.expr_in_decl_depth == 0) return;
+    c.dprof.expr_in_decl_depth -= 1;
+    if (!w.outer) return;
+    const ns = nowNs(c) - c.dprof.expr_in_decl_t0;
+    c.dprof.expr_in_decl_ns += ns;
+    if (c.dprof.expr_sites.getOrPut(c.gpa, c.dprof.expr_in_decl_node)) |gop| {
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        gop.value_ptr.add(ns);
+    } else |_| {}
+}
+
+pub fn declRunStart(c: *Checker) void {
+    if (!c.dprof.on) return;
+    c.dprof.run_t0 = nowNs(c);
+}
+
+pub fn declRunEnd(c: *Checker) void {
+    if (!c.dprof.on) return;
+    c.dprof.run_ns = nowNs(c) - c.dprof.run_t0;
+}
+
+fn labelDeclSym(c: *Checker, sym: SymbolId, w: *std.Io.Writer) void {
+    w.print("{s}", .{c.symbolName(sym)}) catch {};
+    const f = c.symFile(sym);
+    w.print("  [{s}]", .{c.prog.files[f].path}) catch {};
+}
+
+/// Render the declaration-window profile to stderr. Called from `seal`.
+pub fn declReport(c: *Checker) void {
+    const gpa = c.gpa;
+    var buf: [64 * 1024]u8 = undefined;
+    var stderr: std.Io.File.Writer = .init(.stderr(), c.io, &buf);
+    const w = &stderr.interface;
+    const p = &c.dprof;
+    const run_ms = @as(f64, @floatFromInt(p.run_ns)) / 1e6;
+    const decl_ms = @as(f64, @floatFromInt(p.total_ns)) / 1e6;
+    w.print("\n=== ztsc declaration-window profile (checker owning {d} file(s)) ===\n", .{c.owned.len}) catch {};
+    w.print("check phase (Checker.run):   {d:.1} ms\n", .{run_ms}) catch {};
+    w.print("declaration windows:         {d:.1} ms  ({d:.2}% of check phase)\n", .{
+        decl_ms, if (p.run_ns == 0) 0.0 else 100.0 * decl_ms / run_ms,
+    }) catch {};
+    w.print("source-element remainder:    {d:.1} ms\n", .{run_ms - decl_ms}) catch {};
+    w.print("outermost windows: {d}  (clock reads: {d})\n", .{
+        p.outermost, 2 * (p.outermost + p.expr_in_decl_roots),
+    }) catch {};
+    w.print("nested checkStatement entries: {d} of {d}   nested checkExpr entries: {d} of {d}\n", .{
+        p.nested_stmts, p.total_stmts, p.nested_exprs, p.total_exprs,
+    }) catch {};
+    w.print("statement-shaped work INSIDE windows (upper bound): {d:.1} ms over {d} roots ({d:.2}% of window time)\n", .{
+        @as(f64, @floatFromInt(p.expr_in_decl_ns)) / 1e6,
+        p.expr_in_decl_roots,
+        if (p.total_ns == 0) 0.0 else 100.0 * @as(f64, @floatFromInt(p.expr_in_decl_ns)) / @as(f64, @floatFromInt(p.total_ns)),
+    }) catch {};
+    w.print("instantiate node visits: {d} inside windows of {d} total ({d:.2}%)\n", .{
+        p.visits_in_decl,                                                                                                          c.inst_total,
+        if (c.inst_total == 0) 0.0 else 100.0 * @as(f64, @floatFromInt(p.visits_in_decl)) / @as(f64, @floatFromInt(c.inst_total)),
+    }) catch {};
+
+    w.writeAll("\n-- constructions by kind (memo misses) --\n") catch {};
+    const names = [_][]const u8{
+        "interfaceGeneric", "classInstanceGeneric", "aliasGeneric",
+        "expandRef/iface",  "expandRef/class",      "expandRef/alias",
+        "expandRef/other",
+    };
+    var self_sum: u64 = 0;
+    for (p.self_ns) |v| self_sum += v;
+    for (names, 0..) |n, i| {
+        w.print("  {s:<22} {d:>8} built  {d:>7} outermost  {d:>9.2} ms incl(outer)  {d:>9.2} ms self\n", .{
+            n,                                            p.counts[i],                                 p.outer_counts[i],
+            @as(f64, @floatFromInt(p.outer_ns[i])) / 1e6, @as(f64, @floatFromInt(p.self_ns[i])) / 1e6,
+        }) catch {};
+    }
+    w.print("  self total {d:.2} ms vs outermost-inclusive total {d:.2} ms (must agree)\n", .{
+        @as(f64, @floatFromInt(self_sum)) / 1e6, decl_ms,
+    }) catch {};
+    w.print("  run-once generic forms (iface+class+alias): {d:.2} ms = {d:.2}% of window time, {d:.2}% of check phase\n", .{
+        @as(f64, @floatFromInt(p.self_ns[0] + p.self_ns[1] + p.self_ns[2])) / 1e6,
+        if (self_sum == 0) 0.0 else 100.0 * @as(f64, @floatFromInt(p.self_ns[0] + p.self_ns[1] + p.self_ns[2])) / @as(f64, @floatFromInt(self_sum)),
+        if (p.run_ns == 0) 0.0 else 100.0 * @as(f64, @floatFromInt(p.self_ns[0] + p.self_ns[1] + p.self_ns[2])) / @as(f64, @floatFromInt(p.run_ns)),
+    }) catch {};
+    w.print("  memoized expansions surviving at seal: {d} (of {d} expandRef constructions)\n", .{
+        c.expansions.count(), p.counts[3] + p.counts[4] + p.counts[5] + p.counts[6],
+    }) catch {};
+
+    w.writeAll("\n-- statement-shaped roots INSIDE declaration windows (top 20) --\n") catch {};
+    {
+        const Row = struct {
+            key: u64,
+            t: DeclTally,
+            fn desc(_: void, a: @This(), b: @This()) bool {
+                return a.t.ns > b.t.ns;
+            }
+        };
+        var rows: std.ArrayListUnmanaged(Row) = .empty;
+        defer rows.deinit(gpa);
+        var it = p.expr_sites.iterator();
+        while (it.next()) |e| rows.append(gpa, .{ .key = e.key_ptr.*, .t = e.value_ptr.* }) catch {};
+        std.mem.sort(Row, rows.items, {}, Row.desc);
+        for (rows.items[0..@min(20, rows.items.len)]) |r| {
+            const fid: FileId = @intCast(r.key >> 32);
+            const f = &c.prog.files[fid];
+            const line, const col = lineCol(f.src, @truncate(r.key));
+            w.print("  {d:>10.3} ms {d:>6} x  {s}:{d}:{d}\n", .{
+                @as(f64, @floatFromInt(r.t.ns)) / 1e6, r.t.calls, f.path, line, col,
+            }) catch {};
+        }
+    }
+
+    w.writeAll("\n-- declaration-window time by root symbol (top 60) --\n") catch {};
+    {
+        const Row = struct {
+            key: SymbolId,
+            t: DeclTally,
+            fn desc(_: void, a: @This(), b: @This()) bool {
+                return a.t.ns > b.t.ns;
+            }
+        };
+        var rows: std.ArrayListUnmanaged(Row) = .empty;
+        defer rows.deinit(gpa);
+        var it = p.by_sym.iterator();
+        while (it.next()) |e| rows.append(gpa, .{ .key = e.key_ptr.*, .t = e.value_ptr.* }) catch {};
+        std.mem.sort(Row, rows.items, {}, Row.desc);
+        w.print("  distinct root symbols: {d}\n", .{rows.items.len}) catch {};
+        var cum: u64 = 0;
+        for (rows.items[0..@min(60, rows.items.len)], 0..) |r, i| {
+            cum += r.t.ns;
+            w.print("  {d:>4} {d:>10.3} ms {d:>7} win  cum {d:>6.2}%  ", .{
+                i + 1,
+                @as(f64, @floatFromInt(r.t.ns)) / 1e6,
+                r.t.calls,
+                if (p.total_ns == 0) 0.0 else 100.0 * @as(f64, @floatFromInt(cum)) / @as(f64, @floatFromInt(p.total_ns)),
+            }) catch {};
+            labelDeclSym(c, r.key, w);
+            w.writeAll("\n") catch {};
+        }
+        // Concentration curve: cumulative share at a few cut points.
+        w.writeAll("\n-- concentration curve (cumulative share of declaration time) --\n") catch {};
+        const cuts = [_]usize{ 1, 5, 10, 20, 50, 100, 200, 400, 800, 1600, 3200 };
+        var acc: u64 = 0;
+        var idx: usize = 0;
+        for (cuts) |k| {
+            if (idx >= rows.items.len) break;
+            while (idx < @min(k, rows.items.len)) : (idx += 1) acc += rows.items[idx].t.ns;
+            w.print("  top {d:>5} roots: {d:>6.2}%  ({d:.1} ms)\n", .{
+                @min(k, rows.items.len),
+                if (p.total_ns == 0) 0.0 else 100.0 * @as(f64, @floatFromInt(acc)) / @as(f64, @floatFromInt(p.total_ns)),
+                @as(f64, @floatFromInt(acc)) / 1e6,
+            }) catch {};
+        }
+    }
+
+    w.writeAll("\n-- SELF (exclusive) declaration time by symbol, top 40 + concentration --\n") catch {};
+    {
+        const Row = struct {
+            key: SymbolId,
+            t: DeclTally,
+            fn desc(_: void, a: @This(), b: @This()) bool {
+                return a.t.ns > b.t.ns;
+            }
+        };
+        var rows: std.ArrayListUnmanaged(Row) = .empty;
+        defer rows.deinit(gpa);
+        var it = p.self_by_sym.iterator();
+        var tot: u64 = 0;
+        while (it.next()) |e| {
+            rows.append(gpa, .{ .key = e.key_ptr.*, .t = e.value_ptr.* }) catch {};
+            tot += e.value_ptr.ns;
+        }
+        std.mem.sort(Row, rows.items, {}, Row.desc);
+        w.print("  distinct declarations: {d}   self total {d:.2} ms\n", .{
+            rows.items.len, @as(f64, @floatFromInt(tot)) / 1e6,
+        }) catch {};
+        var cum: u64 = 0;
+        for (rows.items[0..@min(40, rows.items.len)], 0..) |r, i| {
+            cum += r.t.ns;
+            w.print("  {d:>4} {d:>10.3} ms {d:>7} win  cum {d:>6.2}%  ", .{
+                i + 1,
+                @as(f64, @floatFromInt(r.t.ns)) / 1e6,
+                r.t.calls,
+                if (tot == 0) 0.0 else 100.0 * @as(f64, @floatFromInt(cum)) / @as(f64, @floatFromInt(tot)),
+            }) catch {};
+            labelDeclSym(c, r.key, w);
+            w.writeAll("\n") catch {};
+        }
+        w.writeAll("\n-- concentration curve on SELF time --\n") catch {};
+        const cuts = [_]usize{ 1, 5, 10, 20, 50, 100, 200, 400, 800, 1600, 3200, 6400 };
+        var acc: u64 = 0;
+        var idx: usize = 0;
+        for (cuts) |k| {
+            if (idx >= rows.items.len) break;
+            while (idx < @min(k, rows.items.len)) : (idx += 1) acc += rows.items[idx].t.ns;
+            w.print("  top {d:>5} decls: {d:>6.2}%  ({d:.1} ms)\n", .{
+                @min(k, rows.items.len),
+                if (tot == 0) 0.0 else 100.0 * @as(f64, @floatFromInt(acc)) / @as(f64, @floatFromInt(tot)),
+                @as(f64, @floatFromInt(acc)) / 1e6,
+            }) catch {};
+        }
+    }
+
+    // Per-FILE roll-up of the same time.
+    w.writeAll("\n-- SELF declaration time by originating file (top 25) --\n") catch {};
+    {
+        var by_file: std.AutoHashMapUnmanaged(FileId, DeclTally) = .empty;
+        defer by_file.deinit(gpa);
+        var it = p.self_by_sym.iterator();
+        while (it.next()) |e| {
+            const f = c.symFile(e.key_ptr.*);
+            if (by_file.getOrPut(gpa, f)) |gop| {
+                if (!gop.found_existing) gop.value_ptr.* = .{};
+                gop.value_ptr.ns += e.value_ptr.ns;
+                gop.value_ptr.calls += e.value_ptr.calls;
+            } else |_| {}
+        }
+        const Row = struct {
+            key: FileId,
+            t: DeclTally,
+            fn desc(_: void, a: @This(), b: @This()) bool {
+                return a.t.ns > b.t.ns;
+            }
+        };
+        var rows: std.ArrayListUnmanaged(Row) = .empty;
+        defer rows.deinit(gpa);
+        var it2 = by_file.iterator();
+        while (it2.next()) |e| rows.append(gpa, .{ .key = e.key_ptr.*, .t = e.value_ptr.* }) catch {};
+        std.mem.sort(Row, rows.items, {}, Row.desc);
+        w.print("  distinct files: {d}\n", .{rows.items.len}) catch {};
+        for (rows.items[0..@min(25, rows.items.len)]) |r| {
+            w.print("  {d:>10.3} ms {d:>7} win  {s}\n", .{
+                @as(f64, @floatFromInt(r.t.ns)) / 1e6, r.t.calls, c.prog.files[r.key].path,
+            }) catch {};
+        }
+    }
+    w.flush() catch {};
+}

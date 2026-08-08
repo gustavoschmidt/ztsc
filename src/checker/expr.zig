@@ -23,6 +23,7 @@ const Span = source.Span;
 const TypeId = types.TypeId;
 
 const checker_zig = @import("../checker.zig");
+const prof_zig = checker_zig.prof_zig;
 const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
 const FileId = checker_zig.FileId;
@@ -128,6 +129,8 @@ pub fn checkExprCached(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
 }
 
 pub fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
+    const ewin = if (c.dprof.on) prof_zig.exprEnter(c, node) else prof_zig.DeclWin{};
+    defer if (c.dprof.on) prof_zig.exprExit(c, ewin);
     const d = c.tree.nodeData(node);
     const main_tok = c.tree.nodeMainToken(node);
     switch (c.nodeTag(node)) {
