@@ -256,6 +256,23 @@ RSS spread was under 3% for ztsc on every package; tsgo's was noisier, up to ~7%
 
 ## Reproducing
 
+Everything on this page comes out of one script:
+
+```sh
+bench/fetch_real.sh   # once: vendor the pinned .d.ts + write tsconfigs
+bench/matrix.sh       # the whole matrix -> bench/RESULTS.md + bench/results.tsv
+```
+
+`bench/matrix.sh` sweeps ztsc over `--checkers=1,2,4,8` against tsgo on every
+package here and on the `bench/apps` application checkouts, interleaved and
+median-of-N, and writes both tables with a provenance header (date, commit,
+tsgo version, host, run counts). **Numbers on this page are copied out of
+`bench/RESULTS.md`, never retyped from a terminal** — a hand-transcribed
+drizzle-orm row once sat 120× stale for 147 commits. Pass a substring to
+narrow it: `bench/matrix.sh chalk`.
+
+The single-package recipe it automates, for reference:
+
 ```sh
 bench/fetch_real.sh                    # vendor the pinned .d.ts + write tsconfigs
 zig build bench                        # ReleaseFast binary -> zig-out/bench/ztsc
