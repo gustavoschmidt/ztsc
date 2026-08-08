@@ -3085,6 +3085,26 @@ pub fn reduceTemplateChunks(c: *Checker, head: Atom, holes: []const TypeId, chun
     c.inst_count += 1;
     c.inst_total += 1;
     defer c.inst_depth -= 1;
+    // Release this evaluation's scratch on the way out, the way a `relate`
+    // frame does. `evalTemplate` cross-products its builder list hole by
+    // hole, cloning every builder each round and "freeing" the previous
+    // generation — but `BumpArena.free` is a no-op for anything but the most
+    // recent block, and an `ArrayList` growing abandons each predecessor, so
+    // a wide cross product leaves the whole intermediate generation sequence
+    // live. Nothing it allocates outlives this call: both return paths hand
+    // back an interned `TypeId` (`makeTemplateLiteral` copies `holes`/`chunks`
+    // into store memory, `makeUnion` uses the scratch only for its flatten
+    // worklist), and `holes`/`chunks` themselves were bumped by the caller
+    // before this mark. The arena is captured rather than re-read because a
+    // nested top-level `instantiate` swaps a different one in for its own
+    // duration.
+    //
+    // Measured on immich: `check scratch high-water` 874,668,264 -> 237,658,344
+    // and peak RSS 1.201 -> 0.564 GB at one checker (2.554 -> 1.402 GB at
+    // four), diagnostics byte-identical.
+    const tpl_arena = c.scratch_arena;
+    const tpl_mark = tpl_arena.mark();
+    defer tpl_arena.restore(tpl_mark);
     // Still generic in any hole → defer (keep the deferred template type).
     for (holes) |h| {
         if (try c.containsTypeParam(h) or try c.containsMappedParam(h) or try c.containsInfer(h)) {
