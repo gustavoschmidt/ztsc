@@ -1803,6 +1803,18 @@ pub fn fixTypeArgs(c: *Checker, sym: SymbolId, args: []const TypeId, tok: TokenI
 /// a generic reference off the table the substitution would have been applied
 /// to.
 fn keyofObjectTable(c: *Checker, r: TypeId) Error!TypeId {
+    // Only valid while no new `key_name_types` entry has landed since: the
+    // answer reads that side table and it is written against an object after
+    // interning. See `Checker.keyof_obj_cache`.
+    if (c.keyof_obj_cache.get(r)) |k| {
+        if (k.gen == c.key_name_gen) return k.ty;
+    }
+    const computed = try keyofObjectTableUncached(c, r);
+    try c.keyof_obj_cache.put(c.cm(), r, .{ .ty = computed, .gen = c.key_name_gen });
+    return computed;
+}
+
+fn keyofObjectTableUncached(c: *Checker, r: TypeId) Error!TypeId {
     var parts: std.ArrayList(TypeId) = .empty;
     defer parts.deinit(c.scratch());
     for (0..c.ts.objectPropCount(r)) |i| {
@@ -2972,7 +2984,7 @@ pub fn objectTypeFromMembers(c: *Checker, member_nodes: []const Node, obj_flags:
         obj_flags;
     const obj = try c.ts.makeObjectSigs(props.items, sindex, nindex, flags, call_sigs.items, construct_sigs.items);
     for (name_types.items) |nt| {
-        try c.key_name_types.put(c.cm(), (@as(u64, obj) << 32) | nt.name, nt.ty);
+        try c.putKeyNameType(obj, nt.name, nt.ty);
     }
     return obj;
 }

@@ -2212,7 +2212,7 @@ pub fn materializeMapped(c: *Checker, key_param: TypeId, constraint: TypeId, val
     if (props.items.len == 0 and sindex == 0 and nindex == 0) return types.empty_object_type;
     const obj = try s.makeObject(props.items, sindex, nindex, 0);
     for (name_types.items) |nt| {
-        try c.key_name_types.put(c.cm(), (@as(u64, obj) << 32) | nt.name, nt.ty);
+        try c.putKeyNameType(obj, nt.name, nt.ty);
     }
     return obj;
 }

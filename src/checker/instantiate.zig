@@ -1311,7 +1311,7 @@ pub fn carryKeyNameTypes(c: *Checker, out: TypeId, from: []const TypeId) Error!v
         for (from) |src| {
             if (c.ts.kind(src) != .object) continue;
             if (c.key_name_types.get((@as(u64, src) << 32) | name)) |nt| {
-                try c.key_name_types.put(c.cm(), key, nt);
+                try c.putKeyNameType(out, name, nt);
                 break;
             }
         }

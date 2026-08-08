@@ -375,6 +375,17 @@ pub const Store = struct {
     data_b: std.ArrayList(u32) = .empty,
     extra: std.ArrayList(u32) = .empty,
     map: std.HashMapUnmanaged(TypeId, void, MapCtx, 80) = .empty,
+    /// Hash-cons key of every type this store owns, parallel to `kinds`
+    /// (index `id - base_len`). See `MapCtx.hash`: the intern map's growth
+    /// rehashes every stored key, and re-deriving a key's *shape* — the whole
+    /// `extra` payload, reached through three random-access SoA reads — and
+    /// Wyhashing it was measured at 6.5% of immich's check phase, because a
+    /// package whose types run ~5 per AST node outgrows `reserveTypes`'
+    /// estimate by an order of magnitude and pays the whole doubling
+    /// sequence. Storing the hash the intern already computed turns each
+    /// rehash into one array read. 4 bytes per type (10 MB on immich at one
+    /// checker).
+    shape_hash: std.ArrayList(u32) = .empty,
     /// Scratch for building candidate payloads before interning.
     pending: std.ArrayList(u32) = .empty,
     /// Frozen base this store overlays, or null for a base store. Read-only;
@@ -387,11 +398,22 @@ pub const Store = struct {
     /// Set by `freeze`; a frozen store is immutable and safe to share as a
     /// base. Guards against accidental post-freeze interning.
     frozen: bool = false,
+    /// Per `Kind`, the longest shape a FROZEN base holds — 0 when the base
+    /// holds no type of that kind at all. Set by `freeze`, read by an
+    /// overlay's `internType` to skip the base probe outright: a candidate
+    /// whose kind the base does not hold, or whose shape is longer than any
+    /// the base holds, cannot possibly be a base type, so hashing it a second
+    /// time to ask is pure loss. Today's base is 15 scalar intrinsics plus the
+    /// empty object, so this skips the probe for every composite — which is
+    /// exactly the population whose shapes are long. It stays exact if the
+    /// base ever carries a real payload (frozen-base piece 2): the test only
+    /// ever skips a lookup that could not have hit.
+    base_kind_words: [256]u32 = @splat(0),
 
     pub fn init(alloc: Allocator) Error!Store {
         var s: Store = .{ .alloc = alloc };
         // Index 0: none sentinel.
-        try s.appendRaw(.none, 0, 0);
+        try s.appendRaw(.none, 0, 0, hashShape32(.none, &.{ 0, 0 }));
         // Fixed-index intrinsics; order must match the constants above.
         const fixed = [_]Kind{
             .any,    .unknown,        .never,  .void,      .undefined,
@@ -400,7 +422,7 @@ pub const Store = struct {
         };
         for (fixed) |k| {
             const id: TypeId = @intCast(s.kinds.items.len);
-            try s.appendRaw(k, 0, 0);
+            try s.appendRaw(k, 0, 0, hashShape32(k, &.{ 0, 0 }));
             try s.map.putContext(s.alloc, id, {}, .{ .store = &s });
         }
         // empty object {} at index 16.
@@ -432,6 +454,17 @@ pub const Store = struct {
     /// frozen base of any number of overlays.
     pub fn freeze(s: *Store) void {
         s.frozen = true;
+        // Summarize the base's shapes for every overlay's `internType`
+        // base-probe skip (see `base_kind_words`). Only ids this store owns
+        // are considered; a base never overlays another base.
+        s.base_kind_words = @splat(0);
+        var i: u32 = 1; // skip the index-0 `none` sentinel
+        while (i < s.kinds.items.len) : (i += 1) {
+            var buf: [2]u32 = undefined;
+            const k = @intFromEnum(s.kinds.items[i]);
+            const n: u32 = @intCast(s.shapeWords(i, &buf).len);
+            if (n > s.base_kind_words[k]) s.base_kind_words[k] = n;
+        }
     }
 
     /// Release the store's own SoA arrays. Only meaningful when `alloc` is a
@@ -443,13 +476,15 @@ pub const Store = struct {
         s.data_b.deinit(s.alloc);
         s.extra.deinit(s.alloc);
         s.pending.deinit(s.alloc);
+        s.shape_hash.deinit(s.alloc);
         s.map.deinit(s.alloc);
     }
 
-    fn appendRaw(s: *Store, k: Kind, a: u32, b: u32) Error!void {
+    fn appendRaw(s: *Store, k: Kind, a: u32, b: u32, h: u32) Error!void {
         try s.kinds.append(s.alloc, k);
         try s.data_a.append(s.alloc, a);
         try s.data_b.append(s.alloc, b);
+        try s.shape_hash.append(s.alloc, h);
     }
 
     /// Total types visible through this store (base + overlay), excluding the
@@ -494,14 +529,14 @@ pub const Store = struct {
     /// base's bytes are shared across overlays; `overlayBytes` isolates this
     /// overlay's own footprint.
     pub fn typeBytes(s: *const Store) usize {
-        const local = s.kinds.items.len * (1 + 4 + 4) + s.extra.items.len * 4;
+        const local = s.kinds.items.len * (1 + 4 + 4 + 4) + s.extra.items.len * 4;
         return local + if (s.base) |b| b.typeBytes() else 0;
     }
 
     /// Bytes held by this store's own SoA arrays (overlay-local; excludes the
     /// shared base).
     pub fn overlayBytes(s: *const Store) usize {
-        return s.kinds.items.len * (1 + 4 + 4) + s.extra.items.len * 4;
+        return s.kinds.items.len * (1 + 4 + 4 + 4) + s.extra.items.len * 4;
     }
 
     /// Approximate bytes including intern map capacity.
@@ -972,18 +1007,33 @@ pub const Store = struct {
         }
     }
 
-    fn hashShape(kind_: Kind, words: []const u32) u64 {
+    /// The hash-cons key of a shape, stored per type in `shape_hash`. It is a
+    /// u32 rather than Wyhash's u64 so the side table costs 4 bytes per type
+    /// instead of 8; over 2.5 M types that is ~1,800 accidental collisions in
+    /// the whole run, each costing one extra `eql` — against 10 MB saved.
+    fn hashShape32(kind_: Kind, words: []const u32) u32 {
         var h = std.hash.Wyhash.init(@intFromEnum(kind_));
         h.update(std.mem.sliceAsBytes(words));
-        return h.final();
+        return @truncate(h.final());
+    }
+
+    /// Widen a stored 32-bit shape hash into the 64-bit value the hash map
+    /// consumes. `std.HashMapUnmanaged` takes its 7-bit slot fingerprint from
+    /// the TOP bits and its bucket index from the BOTTOM ones, so duplicating
+    /// the word keeps the two independent (they come from opposite ends of the
+    /// same well-mixed u32). Every producer of a map hash — candidate and
+    /// stored key alike — goes through here, so the two always agree.
+    inline fn spreadHash(h: u32) u64 {
+        return (@as(u64, h) << 32) | @as(u64, h);
     }
 
     const MapCtx = struct {
         store: *const Store,
+        /// Read back the key computed when the type was interned. This is the
+        /// map's rehash path (`grow`), which touches every stored key; see
+        /// `shape_hash` for why re-deriving them was worth removing.
         pub fn hash(ctx: MapCtx, id: TypeId) u64 {
-            var buf: [2]u32 = undefined;
-            const words = ctx.store.shapeWords(id, &buf);
-            return hashShape(ctx.store.kind(id), words);
+            return spreadHash(ctx.store.shape_hash.items[id - ctx.store.base_len]);
         }
         pub fn eql(ctx: MapCtx, x: TypeId, y: TypeId) bool {
             if (x == y) return true;
@@ -1000,8 +1050,12 @@ pub const Store = struct {
         store: *const Store,
         kind: Kind,
         words: []const u32,
+        /// Precomputed by `internType`. The candidate is looked up in TWO maps
+        /// (the frozen base's and this store's own) and Wyhashing its whole
+        /// payload once per lookup was ~6% of immich's check phase on its own.
+        h: u32,
         pub fn hash(ctx: PendingCtx, _: void) u64 {
-            return hashShape(ctx.kind, ctx.words);
+            return spreadHash(ctx.h);
         }
         pub fn eql(ctx: PendingCtx, _: void, existing: TypeId) bool {
             if (ctx.store.kind(existing) != ctx.kind) return false;
@@ -1015,20 +1069,30 @@ pub const Store = struct {
     /// words = [a, b]; for extra kinds words are appended to `extra` on miss.
     fn internType(s: *Store, kind_: Kind, words: []const u32, b_count: u32) Error!TypeId {
         std.debug.assert(!s.frozen);
+        // ONE hash for the whole call: the candidate is looked up in the base's
+        // map and then in this store's own, and the two agree on the key by
+        // construction (`spreadHash` of the same `hashShape32`).
+        const h = hashShape32(kind_, words);
         // Probe the frozen base first: a type structurally identical to a base
         // type resolves to the shared *base* id (no overlay duplication). The
         // candidate `words` reference only sub-ids that are integer-equal to
         // the base type's, so the raw-word hash/equality carries across stores.
+        //
+        // Skipped outright when the base holds no shape this candidate could
+        // equal — see `base_kind_words`.
         if (s.base) |base| {
-            if (base.map.getKeyAdapted(
-                @as(void, {}),
-                PendingCtx{ .store = base, .kind = kind_, .words = words },
-            )) |base_id| return base_id;
+            const cap = base.base_kind_words[@intFromEnum(kind_)];
+            if (cap != 0 and words.len <= cap) {
+                if (base.map.getKeyAdapted(
+                    @as(void, {}),
+                    PendingCtx{ .store = base, .kind = kind_, .words = words, .h = h },
+                )) |base_id| return base_id;
+            }
         }
         const gop = try s.map.getOrPutContextAdapted(
             s.alloc,
             @as(void, {}),
-            PendingCtx{ .store = s, .kind = kind_, .words = words },
+            PendingCtx{ .store = s, .kind = kind_, .words = words, .h = h },
             MapCtx{ .store = s },
         );
         if (gop.found_existing) return gop.key_ptr.*;
@@ -1039,14 +1103,14 @@ pub const Store = struct {
             .union_type, .intersection, .overloads => {
                 const start: u32 = @intCast(s.extra.items.len);
                 try s.extra.appendSlice(s.alloc, words);
-                try s.appendRaw(kind_, start, @intCast(s.extra.items.len));
+                try s.appendRaw(kind_, start, @intCast(s.extra.items.len), h);
             },
             .tuple, .object, .function, .ref, .conditional, .mapped, .template_literal_type => {
                 const start: u32 = @intCast(s.extra.items.len);
                 try s.extra.appendSlice(s.alloc, words);
-                try s.appendRaw(kind_, start, b_count);
+                try s.appendRaw(kind_, start, b_count, h);
             },
-            else => try s.appendRaw(kind_, words[0], words[1]),
+            else => try s.appendRaw(kind_, words[0], words[1], h),
         }
         gop.key_ptr.* = id;
         return id;

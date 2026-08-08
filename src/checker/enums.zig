@@ -307,11 +307,36 @@ pub const EnumMemberLookup = struct {
     }
 };
 
+/// `eachEnumMember`'s walk for one enum, memoized under its symbol — see
+/// `Checker.enum_members`. Every by-name consumer goes through here, so an
+/// enum's declaration is read once per checker instead of once per question.
+///
+/// The list is published only after the walk completes, so a re-entrant
+/// request for the SAME enum (an `aliasedEnumInitValue` cycle) falls through
+/// to a second walk exactly as it did before, and the depth cap in
+/// `enum_alias_depth` still bounds it.
+pub fn enumMembersOf(c: *Checker, sym: SymbolId) Error![]const checker_zig.EnumMemberEntry {
+    if (c.enum_members.get(sym)) |m| return m;
+    const Collect = struct {
+        c: *Checker,
+        list: std.ArrayList(checker_zig.EnumMemberEntry) = .empty,
+        fn visit(self: *@This(), name: Atom, value: TypeId) Error!void {
+            try self.list.append(self.c.ca(), .{ .name = name, .value = value });
+        }
+    };
+    var col: Collect = .{ .c = c };
+    try c.eachEnumMember(sym, &col, Collect.visit);
+    const out = col.list.items;
+    try c.enum_members.put(c.cm(), sym, out);
+    return out;
+}
+
 /// Does enum `sym` declare a member called `name`?
 pub fn enumHasMemberNamed(c: *Checker, sym: SymbolId, name: Atom) Error!bool {
-    var look: EnumMemberLookup = .{ .want = name };
-    try c.eachEnumMember(sym, &look, EnumMemberLookup.visit);
-    return look.found;
+    for (try enumMembersOf(c, sym)) |m| {
+        if (m.name == name) return true;
+    }
+    return false;
 }
 
 /// The constant VALUE literal of enum member `sym.name` (`"a"` / `0`), or
@@ -320,10 +345,14 @@ pub fn enumHasMemberNamed(c: *Checker, sym: SymbolId, name: Atom) Error!bool {
 /// `const k: "keydown" = EVENT.KEYDOWN` type-check while
 /// `const k: "paste" = EVENT.KEYDOWN` does not.
 pub fn enumMemberValue(c: *Checker, sym: SymbolId, name: Atom) Error!?TypeId {
-    var look: EnumMemberLookup = .{ .want = name };
-    try c.eachEnumMember(sym, &look, EnumMemberLookup.visit);
-    if (!look.found or look.value == types.no_type) return null;
-    return look.value;
+    // First declaration wins, matching `EnumMemberLookup`'s `if (self.found)`
+    // guard for an enum that declares the same name twice.
+    for (try enumMembersOf(c, sym)) |m| {
+        if (m.name != name) continue;
+        if (m.value == types.no_type) return null;
+        return m.value;
+    }
+    return null;
 }
 
 /// The member type of enum `sym` whose constant VALUE is the literal

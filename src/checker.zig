@@ -674,8 +674,53 @@ pub const map_containers = [_][]const u8{
     "nominal_bases",            "nominal_base_pool",      "keyof_mapped_active",
     "ctp_syms_seen",            "weak_types",             "lazy_member",
     "lazy_map",                 "pattern_root_decls",     "pattern_root_ids",
-    "pattern_narrow_busy",      "key_name_types",
+    "pattern_narrow_busy",      "key_name_types",         "enum_members",
+    "keyof_obj_cache",
 };
+
+/// One enum member as `eachEnumMember` yields it: the name atom and the
+/// constant value literal (`no_type` when the initializer is computed).
+pub const EnumMemberEntry = struct { name: Atom, value: TypeId };
+/// A memoized `keyof <object table>`, tagged with the `key_name_types`
+/// generation it was computed under — see `Checker.keyof_obj_cache`.
+pub const KeyofEntry = struct { ty: TypeId, gen: u32 };
+
+/// Hash context for a DENSE INTEGER key — one 64-bit avalanche instead of
+/// `AutoContext`'s Wyhash over the key's bytes.
+///
+/// Wyhash is the right default for arbitrary keys, but the checker's hottest
+/// maps are keyed by packed small integers (`inst_cache`'s
+/// `map_id << 32 | type_id`), and a general byte hash costs several times an
+/// integer mix on an 8-byte key. `instantiateId` probes `inst_cache` 11.1 M
+/// times on immich and inserts 5.9 M, which made this the single most executed
+/// hash in the run.
+///
+/// The mix is the standard MurmurHash3 64-bit finalizer: every input bit
+/// affects every output bit, so both halves of a packed key reach the bucket
+/// index (low bits) and the slot fingerprint (top 7 bits). Nothing observable
+/// depends on it — the maps it keys are pure memos, read only by `get`, and
+/// nothing iterates them.
+pub fn IntCtx(comptime K: type) type {
+    return struct {
+        pub fn hash(_: @This(), k: K) u64 {
+            var x: u64 = k;
+            x ^= x >> 33;
+            x *%= 0xff51afd7ed558ccd;
+            x ^= x >> 33;
+            x *%= 0xc4ceb9fe1a85ec53;
+            x ^= x >> 33;
+            return x;
+        }
+        pub fn eql(_: @This(), a: K, b: K) bool {
+            return a == b;
+        }
+    };
+}
+
+/// `std.AutoHashMapUnmanaged` with `IntCtx` in place of `AutoContext`.
+pub fn IntMap(comptime K: type, comptime V: type) type {
+    return std.HashMapUnmanaged(K, V, IntCtx(K), std.hash_map.default_max_load_percentage);
+}
 
 /// Where one symbol's declared heritage lives in `Checker.nominal_base_pool`.
 /// Eight bytes per symbol ever asked, and the pool holds four bytes per
@@ -768,19 +813,19 @@ pub const Checker = struct {
     /// misses and recomputes — fixing the first-check-wins staleness —
     /// while node-only readers still find the node's most-recent (canonical)
     /// type in the single slot.
-    node_types: std.AutoHashMapUnmanaged(u64, NodeType) = .empty,
+    node_types: IntMap(u64, NodeType) = .empty,
     /// (file << 32 | FnProto node) -> signature TypeId + the contextual
     /// signature it was built under. Arrow/function-expression signatures
     /// depend on `ctx_sig` (contextual parameter types), so — like
     /// `node_types` — a re-check under a different context must miss and
     /// recompute rather than return the first (stale) signature. Named
     /// declarations always pass `no_type`, so they still hit unconditionally.
-    sig_cache: std.AutoHashMapUnmanaged(u64, NodeType) = .empty,
+    sig_cache: IntMap(u64, NodeType) = .empty,
     /// (file << 32 | owner node) -> primary (lowest) scope id. Populated
     /// lazily per file by `faultScopes` on the first `scopeOf` read in that
     /// file (right-sizing), so a checker only maps scopes for files it
     /// actually traverses — not every file of the program, per instance.
-    node_scopes: std.AutoHashMapUnmanaged(u64, ScopeId) = .empty,
+    node_scopes: IntMap(u64, ScopeId) = .empty,
     /// Per-file flag: has this file's scope-owner map been faulted into
     /// `node_scopes` yet?
     scopes_faulted: []bool = &.{},
@@ -789,7 +834,7 @@ pub const Checker = struct {
     /// effectively `const`. Populated lazily per file by `ensureReassignScan`
     /// (see the `.start`/closure-capture gate in `flowTypeInner`). Order-
     /// invariant: a pure function of the file's assignment AST nodes.
-    reassigned_syms: std.AutoHashMapUnmanaged(SymbolId, void) = .empty,
+    reassigned_syms: IntMap(SymbolId, void) = .empty,
     /// `(sym, for_head_scope)` pairs where `sym` is assigned somewhere inside a
     /// `for`/`for..of`/`for..in` whose header scope is `for_head_scope` (each
     /// enclosing loop of an assignment is recorded, so nested loops are all
@@ -805,7 +850,7 @@ pub const Checker = struct {
     /// coarse, file-level over-approximation; `for` loops use the exact
     /// per-scope `member_written_in_loop`). Populated alongside
     /// `reassigned_syms` in `ensureReassignScan`.
-    member_written_syms: std.AutoHashMapUnmanaged(SymbolId, void) = .empty,
+    member_written_syms: IntMap(SymbolId, void) = .empty,
     /// `(root_sym, for_head_scope)` pairs where a member/element write rooted at
     /// `root_sym` occurs inside the loop whose header scope is `for_head_scope`.
     /// Lets a `for`-loop label keep a property-path narrowing whose root is not
@@ -820,9 +865,9 @@ pub const Checker = struct {
     /// Capped like tsc's `inlineLevel` to bound alias chains.
     alias_inline_level: u32 = 0,
     /// FileId -> module namespace object type (0 = in progress).
-    ns_types: std.AutoHashMapUnmanaged(FileId, TypeId) = .empty,
+    ns_types: IntMap(FileId, TypeId) = .empty,
     /// Ambient-module namespace-object cache, keyed by ambient_exports index.
-    ambient_ns_types: std.AutoHashMapUnmanaged(u32, TypeId) = .empty,
+    ambient_ns_types: IntMap(u32, TypeId) = .empty,
     /// (source << 32 | target) -> Relation.
     ///
     /// Its SIZE is traversal-order dependent, and deliberately so: the `2`
@@ -838,9 +883,9 @@ pub const Checker = struct {
     /// ids are the sort key every declaration and property table is reached
     /// through. See bench/repeat_sweep.sh, which pins both counters under a
     /// serial front end and documents why it cannot under a parallel one.
-    relation: std.AutoHashMapUnmanaged(u64, u8) = .empty,
+    relation: IntMap(u64, u8) = .empty,
     /// ref TypeId -> expanded structural type.
-    expansions: std.AutoHashMapUnmanaged(TypeId, TypeId) = .empty,
+    expansions: IntMap(TypeId, TypeId) = .empty,
     /// `.overloads` TypeId -> the index at which its LAST declaration group
     /// starts. An entry exists only for a merged global function whose
     /// signatures come from two groups of declarations (the default library,
@@ -850,7 +895,7 @@ pub const Checker = struct {
     /// and the printer see — while overload RESOLUTION tries the last group
     /// first (tsc's `reorderCandidates`). `overloadCandidates` applies it;
     /// everything else reads the members as stored. See `mergedFunctionValue`.
-    overload_rotate: std.AutoHashMapUnmanaged(TypeId, u32) = .empty,
+    overload_rotate: IntMap(TypeId, u32) = .empty,
     /// Instantiated interface/alias OBJECT TypeId -> its canonical origin
     /// `makeRef(sym, canonical-args)`. Two objects that carry the SAME origin
     /// ref denote the same nominal instantiation `G<A…>` (identical symbol AND
@@ -862,13 +907,13 @@ pub const Checker = struct {
     /// same generic type, whose nested keyof/mapped/conditional members reduce
     /// non-confluently into distinct interned objects. It is an identity-only
     /// shortcut (no variance): it fires solely when both origins are equal.
-    origin: std.AutoHashMapUnmanaged(TypeId, TypeId) = .empty,
+    origin: IntMap(TypeId, TypeId) = .empty,
     /// Declared (`in`/`out`) variance of a generic symbol's type parameters,
     /// packed 2 bits each (see `Variance`), lowest bits first. A cached 0 —
     /// the overwhelmingly common case — means "no parameter is annotated", so
     /// the relation's variance probe costs one hash lookup on hot paths.
     /// Parameters past the 16th are read as unannotated.
-    variance_cache: std.AutoHashMapUnmanaged(SymbolId, u32) = .empty,
+    variance_cache: IntMap(SymbolId, u32) = .empty,
     /// The two `G<…marker…>` references a variance MEASUREMENT is currently
     /// relating (`{0,0}` outside one). The relation must compare these
     /// structurally: answering them from `G`'s *declared* variance is what
@@ -880,22 +925,22 @@ pub const Checker = struct {
     /// first. A cached 0 means "no parameter yielded a verdict", so the
     /// relation's probe costs one hash lookup on hot paths. Parameters past
     /// the 10th are read as unmeasured.
-    measured_variance: std.AutoHashMapUnmanaged(SymbolId, u32) = .empty,
+    measured_variance: IntMap(SymbolId, u32) = .empty,
     /// Generic symbols whose measurement is on the stack right now. tsc's
     /// `emptyArray` sentinel: a pair of references to a generic that is
     /// measuring ITSELF is assumed related, which is what stops the
     /// measurement from chasing a generic that instantiates itself.
-    measuring_variance: std.AutoHashMapUnmanaged(SymbolId, void) = .empty,
+    measuring_variance: IntMap(SymbolId, void) = .empty,
     /// How many measurements are on the stack (`max_variance_measure_depth`).
     variance_measure_depth: u32 = 0,
     /// Every `G<…marker…>` reference ever minted for a variance measurement
     /// (tsc's `markerTypes`). Those pairs are what a measurement asks the
     /// relation about, so answering them FROM a variance verdict would make
     /// every measurement vacuously covariant.
-    marker_refs: std.AutoHashMapUnmanaged(TypeId, void) = .empty,
+    marker_refs: IntMap(TypeId, void) = .empty,
     /// Generic (uninstantiated) bodies per symbol: interface/class-instance/
     /// class-static/alias.
-    iface_generic: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
+    iface_generic: IntMap(SymbolId, TypeId) = .empty,
     /// Gray stack of interfaces currently mid-resolution in `interfaceGeneric`
     /// (the ones marked `no_type`). Each frame records whether it is presently
     /// resolving its `extends` bases. On a re-entry, if *every* frame from the
@@ -920,17 +965,17 @@ pub const Checker = struct {
     /// (`declaredBaseRefs`). Filled lazily, only for symbols the relation
     /// actually asks about, and empty-but-present for the ones with no
     /// heritage at all.
-    nominal_bases: std.AutoHashMapUnmanaged(SymbolId, BaseSpan) = .empty,
+    nominal_bases: IntMap(SymbolId, BaseSpan) = .empty,
     /// Backing store for `nominal_bases`: each symbol's declared base
     /// references, laid out contiguously in the order they were written.
     nominal_base_pool: std.ArrayListUnmanaged(TypeId) = .empty,
-    class_inst_generic: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
-    class_static_cache: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
+    class_inst_generic: IntMap(SymbolId, TypeId) = .empty,
+    class_static_cache: IntMap(SymbolId, TypeId) = .empty,
     /// Classes whose base-static fold is on the stack, so a malformed `extends`
     /// cycle skips the recursive base fold instead of overflowing (the result
     /// cache stays unpoisoned — static-field-initializer re-entry must still
     /// see the class's own members).
-    class_static_base_active: std.AutoHashMapUnmanaged(SymbolId, void) = .empty,
+    class_static_base_active: IntMap(SymbolId, void) = .empty,
     /// Mapped types whose key set `keyofMapped` is enumerating. An `as` clause
     /// is allowed to mention `keyof` of the very map it renames the keys of
     /// (sequelize's `InferAttributes<M>` filters `Key extends keyof Model`,
@@ -939,16 +984,16 @@ pub const Checker = struct {
     /// answer yet; re-entry defers with `keyof <map>` — the same result the
     /// non-enumerable path already returns — instead of recursing until the
     /// thread stack dies.
-    keyof_mapped_active: std.AutoHashMapUnmanaged(TypeId, void) = .empty,
+    keyof_mapped_active: IntMap(TypeId, void) = .empty,
     /// Composite types `collectTypeParamSyms` has already walked, for the
     /// duration of one top-level collect. See there.
-    ctp_syms_seen: std.AutoHashMapUnmanaged(TypeId, void) = .empty,
+    ctp_syms_seen: IntMap(TypeId, void) = .empty,
     /// Member symbols whose type is being resolved by `lazyRefProp` (the
     /// cycle-safe single-member lookup). A member whose own annotation indexes
     /// back into the class at the very member being resolved (`class C { a:
     /// C["a"] }`) is genuinely circular; re-entry returns null so the caller
     /// falls back to the ordinary not-found result instead of recursing.
-    lazy_member_active: std.AutoHashMapUnmanaged(SymbolId, void) = .empty,
+    lazy_member_active: IntMap(SymbolId, void) = .empty,
     /// Member symbols whose type `memberTypeOf` is computing, innermost last
     /// (both the eager whole-table walk and the lazy single-member lookup push
     /// here). A member that re-appears is one whose type demanded itself; the
@@ -967,13 +1012,24 @@ pub const Checker = struct {
     lazy_index_objs: std.ArrayListUnmanaged(TypeId) = .empty,
     /// Class symbol -> its *structural* constructor object (statics + construct
     /// signatures returning the instance). See `classConstructType`.
-    class_ctor_cache: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
+    class_ctor_cache: IntMap(SymbolId, TypeId) = .empty,
     /// The interned `typeof globalThis` marker (see `globalThisType`).
     global_this_ty: TypeId = types.no_type,
     /// Enum symbol -> value object type (the `typeof E` object with members).
-    enum_value_cache: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
+    enum_value_cache: IntMap(SymbolId, TypeId) = .empty,
     /// Enum symbol -> computed EnumInfo (const-ness, member values).
-    enum_info_cache: std.AutoHashMapUnmanaged(SymbolId, EnumInfo) = .empty,
+    enum_info_cache: IntMap(SymbolId, EnumInfo) = .empty,
+    /// Enum symbol -> its members' `(name, constant value)` in declaration
+    /// order — `eachEnumMember`'s walk, memoized. The walk re-derives every
+    /// member from the AST: it re-scans each name token, re-interns the text,
+    /// re-classifies each initializer and re-folds aliased constants. Nothing
+    /// in it depends on the caller, and every consumer asks about ONE member,
+    /// so a whole-enum walk per question is quadratic in the enum's size.
+    /// `enumMemberValue` alone (the relation, narrowing, and every enum-keyed
+    /// index) measured 4.3% of immich's check phase that way. Interning is
+    /// idempotent, so the memoized walk creates exactly the types the first
+    /// unmemoized one created, in the same order.
+    enum_members: IntMap(SymbolId, []const EnumMemberEntry) = .empty,
     /// Nesting of `aliasedEnumInitValue` — an enum member initialized with
     /// ANOTHER enum's member folds that member's constant value, and a cycle
     /// (`enum A { X = B.X }` / `enum B { X = A.X }`) would otherwise recur
@@ -983,15 +1039,15 @@ pub const Checker = struct {
     enum_alias_depth: u32 = 0,
     /// `(source enum symbol, target enum symbol)` -> whether the two relate
     /// structurally (tsc's `enumRelation`). See `enumsStructurallyRelated`.
-    enum_relation_cache: std.AutoHashMapUnmanaged(u64, bool) = .empty,
-    alias_generic: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
-    alias_state: std.AutoHashMapUnmanaged(SymbolId, u8) = .empty,
+    enum_relation_cache: IntMap(u64, bool) = .empty,
+    alias_generic: IntMap(SymbolId, TypeId) = .empty,
+    alias_state: IntMap(SymbolId, u8) = .empty,
     /// Alias symbols found to be (transitively) self-recursive while their
     /// generic body was materialized — marked when `aliasInstance` re-enters an
     /// in-progress alias (state == 1). Used to scope the recursion-accumulator
     /// default substitution in `fixTypeArgs` (RHF `PathInternal<T, Tr = T>`)
     /// away from non-recursive library defaults (redux `Reducer<S, A, P = S>`).
-    alias_recursive: std.AutoHashMapUnmanaged(SymbolId, void) = .empty,
+    alias_recursive: IntMap(SymbolId, void) = .empty,
     /// Narrowed-type cache per `(flow, reference, declared)` query, split by
     /// outcome so the overwhelmingly common one costs no value slot. See
     /// `FlowQ` for the packed key and why the split is behaviour-preserving.
@@ -1040,19 +1096,19 @@ pub const Checker = struct {
     /// `sym - pattern_root_base`. See `flow.zig`'s `pattern_root_base`.
     pattern_root_decls: std.ArrayListUnmanaged(u64) = .empty,
     /// The interning side of `pattern_root_decls` (decl -> index).
-    pattern_root_ids: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    pattern_root_ids: IntMap(u64, u32) = .empty,
     /// Re-entrancy guard for `narrowedPatternBinding` (tsc's
     /// `NodeCheckFlags.InCheckIdentifier`): the declarations whose pattern is
     /// having its narrowed parent type computed right now. Narrowing reads the
     /// guard expressions, which can name the pattern's own bindings.
-    pattern_narrow_busy: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    pattern_narrow_busy: IntMap(u64, void) = .empty,
     /// (flow << 32 | symbol) -> definitely-assigned (2 computing, 0/1 result).
-    da_cache: std.AutoHashMapUnmanaged(u64, u8) = .empty,
+    da_cache: IntMap(u64, u8) = .empty,
     /// Program-global flow id -> can control reach it (0 computing, 1 no,
     /// 2 yes). Consulted only when a flow query answered `never`, to tell a
     /// reference narrowed to nothing apart from one read in dead code — see
     /// `flowReachable`.
-    flow_reach: std.AutoHashMapUnmanaged(u32, u8) = .empty,
+    flow_reach: IntMap(u32, u8) = .empty,
     /// containsTypeParam memo, a dense `TriMemo` (see it for why not a map).
     ctp_cache: std.ArrayList(u8) = .empty,
     /// containsMappedParam memo, dense like `ctp_cache`.
@@ -1065,7 +1121,7 @@ pub const Checker = struct {
     /// pattern (kysely's `SelectQueryBuilderExpression<infer O>`, an interface
     /// whose members are functions returning itself) that cost is exponential
     /// in the depth cap.
-    infer_visited: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+    infer_visited: IntMap(u64, u64) = .empty,
     /// Generation of the in-flight `inferFromExtends` root, so a nested root
     /// (reached through an `instantiate` inside the walk) gets a fresh key
     /// space and the outer one's entries survive its return. Monotonic and
@@ -1086,7 +1142,7 @@ pub const Checker = struct {
     /// property access. Never populated for a result computed under a tripped
     /// instantiation limit (that answer is depth-dependent, not a function of
     /// the pair) — the same rule `inst_cache` follows.
-    subst_this_cache: std.AutoHashMapUnmanaged(u64, TypeId) = .empty,
+    subst_this_cache: IntMap(u64, TypeId) = .empty,
     /// containsInfer memo, dense like `ctp_cache`. `inferFromExtends` now asks
     /// it at every step (the `couldContainTypeVariables` prune), and the walk
     /// itself is a full structural descent, so it has to be O(1) on a repeat.
@@ -1107,11 +1163,11 @@ pub const Checker = struct {
     /// argument position on top of that. Both loops are self-time in the
     /// profile; the memo turns the repeated subtrees into one walk.
     /// Gated by `inst_cache_on` (`--no-inst-cache` is the oracle leg).
-    arrayish_elem_cache: std.AutoHashMapUnmanaged(TypeId, TypeId) = .empty,
+    arrayish_elem_cache: IntMap(TypeId, TypeId) = .empty,
     /// mentionsMappedParam memo, keyed `(t << 32 | key_id)`: 0 unknown/in
     /// progress, 1 no, 2 yes. Separate from `cmp_cache` because the answer
     /// depends on WHICH key parameter is asked about.
-    mmp_cache: std.AutoHashMapUnmanaged(u64, u8) = .empty,
+    mmp_cache: IntMap(u64, u8) = .empty,
     /// Instantiation memo: `(canonical_map_id << 32 | t) -> result`. A
     /// substitution is a pure function of `(t, map-contents)`; `map_id`
     /// canonically identifies the map's `(type-param, arg)` set (order- and
@@ -1120,7 +1176,7 @@ pub const Checker = struct {
     /// (`--no-inst-cache` disables it — the correctness oracle / benchmark
     /// "before" leg). Never populated for a subtree whose computation tripped
     /// the depth/count limit (`inst_limit_tripped`).
-    inst_cache: std.AutoHashMapUnmanaged(u64, TypeId) = .empty,
+    inst_cache: IntMap(u64, TypeId) = .empty,
     /// Canonical substitution-map interning: packed sorted `(sym,arg)` pair
     /// bytes -> a small stable id. The byte keys are duped into the checker
     /// arena (scratch is reset per statement).
@@ -1128,7 +1184,7 @@ pub const Checker = struct {
     inst_map_next: u32 = 1,
     /// `SymbolId -> declared constraint TypeId` (`no_type` = unconstrained).
     /// Avoids re-resolving the constraint AST on every assignability check.
-    tp_constraint_cache: std.AutoHashMapUnmanaged(SymbolId, TypeId) = .empty,
+    tp_constraint_cache: IntMap(SymbolId, TypeId) = .empty,
     /// `eraseParamsOf` memo, keyed `(owner << 32 | sig)`. Erasing a
     /// signature's type parameters to their constraints (tsc's
     /// `getBaseSignature`, cached there on the signature's links) is a pure
@@ -1143,10 +1199,10 @@ pub const Checker = struct {
     /// Gated by `inst_cache_on` and, like `inst_cache`, never populated for a
     /// result whose computation tripped the depth/count limit — a truncated
     /// erasure is a function of the live depth, not of `(sig, owner)`.
-    erase_cache: std.AutoHashMapUnmanaged(u64, TypeId) = .empty,
+    erase_cache: IntMap(u64, TypeId) = .empty,
     /// The same memo for the ERASE-TO-`any` half (tsc's `getErasedSignature`,
     /// cached on the signature as `erasedSignatureCache`), keyed the same way.
-    erase_any_cache: std.AutoHashMapUnmanaged(u64, TypeId) = .empty,
+    erase_any_cache: IntMap(u64, TypeId) = .empty,
     /// tsc's `symbol.links.nameType`, for the one case ztsc cannot recover
     /// from a member table: a member declared with a computed ENUM-MEMBER key
     /// (`{ [E.A]: T }`). The table keys by the atom the key evaluates to
@@ -1167,7 +1223,38 @@ pub const Checker = struct {
     /// would read the same name types. That is the one imprecision, and it is
     /// the safe direction: the two spell the same key set, and the enum form
     /// is the more specific answer.
-    key_name_types: std.AutoHashMapUnmanaged(u64, TypeId) = .empty,
+    key_name_types: IntMap(u64, TypeId) = .empty,
+    /// `keyofObjectTable`'s answer for one interned member table.
+    ///
+    /// The key set of an OBJECT is a pure function of that object: the
+    /// property names and their `private`/`protected` flags, the index
+    /// signatures' presence, and the `key_name_types` entries — all of which
+    /// are fixed when the object is interned (`objectTypeFromMembers` records
+    /// the name types before anyone can hold the id). Recomputing it interns a
+    /// string literal per property and builds a fresh union every time, and
+    /// the mapped-type machinery asks the same table over and over: `keyof` is
+    /// on half of immich's check-phase stacks, reached almost entirely through
+    /// `substMappedKey`.
+    ///
+    /// Keyed by the OBJECT, not by the `keyof` operand, so the lazy route
+    /// (`lazyShapeOf`'s generic table) and the eager one (`resolveStructural`'s
+    /// substituted table) share entries whenever they land on the same table —
+    /// which is the whole point of the lazy route.
+    /// NOT a pure function of the object id, which is the trap: the answer
+    /// reads `key_name_types`, a side table written against an object AFTER
+    /// it is interned (`carryKeyNameTypes`, whose own `contains` guard shows
+    /// it is built to accumulate). Objects are hash-consed, so one path can
+    /// intern a table and have its `keyof` cached before a second path
+    /// reaches the same TypeId and brings enum-member names along — the
+    /// cached union would then be plain string literals forever. Entries
+    /// therefore carry the `key_name_gen` they were computed under and are
+    /// ignored once it moves. The counter is bumped only by a genuinely new
+    /// `key_name_types` entry, which is rare (computed enum keys), so in
+    /// practice the cache is never invalidated on corpora that have none.
+    keyof_obj_cache: IntMap(TypeId, KeyofEntry) = .empty,
+    /// Bumped by `putKeyNameType` on each new `key_name_types` entry; see
+    /// `keyof_obj_cache`.
+    key_name_gen: u32 = 0,
     /// Higher-order type-param rewrite. When an object's generic call/
     /// construct signature (`interface H<T>{ <U extends C<T> = D<T>>(…):… }`) is
     /// instantiated under a map `M`, an own param `U` whose constraint/default
@@ -1179,12 +1266,12 @@ pub const Checker = struct {
     /// + merged symbol space) and are minted deterministically, keyed by
     /// `(orig_param_sym, canonical_map_id)`, so the same instantiation reuses the
     /// same fresh symbol (inst-cache coherent; `--no-inst-cache` agrees).
-    fresh_tp_ids: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    fresh_tp_ids: IntMap(u64, u32) = .empty,
     /// The same rewrite for the OTHER substitution that reaches a signature's
     /// own bounds — `substThis`, keyed by `(orig_param_sym, receiver TypeId)`.
     /// Separate table because a canonical map id and a `TypeId` are both `u32`
     /// and would collide in `fresh_tp_ids`; the records share `fresh_tp_info`.
-    this_tp_ids: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    this_tp_ids: IntMap(u64, u32) = .empty,
     fresh_tp_info: std.ArrayListUnmanaged(FreshTp) = .empty,
     fresh_tp_base: u32 = 0,
     fresh_tp_next: u32 = 0,
@@ -1194,7 +1281,7 @@ pub const Checker = struct {
     /// location — so a node's synthesized type is context-free and memoizable
     /// by node alone (unlike `node_types`, whose value is contextual). Gated by
     /// `inst_cache_on` so the oracle validates it.
-    type_node_cache: std.AutoHashMapUnmanaged(u64, TypeId) = .empty,
+    type_node_cache: IntMap(u64, TypeId) = .empty,
     /// Atom cache to avoid re-locking the shared interner.
     atom_cache: std.StringHashMapUnmanaged(Atom) = .empty,
     /// Recursion bound for the type-materializing fallback of qualified
@@ -1220,7 +1307,7 @@ pub const Checker = struct {
     infer_scopes: std.ArrayListUnmanaged(u64) = .empty,
     /// Mapped-type key parameter identity: mapped-type nodeKey -> a dense
     /// id for its `K` (stable across the memo-off re-evaluations of the node).
-    mapped_key_ids: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    mapped_key_ids: IntMap(u64, u32) = .empty,
     mapped_key_next: u32 = 1,
     /// Stack of the mapped key parameters currently in scope, outermost
     /// first. While building a mapped type's `as`/value branches, a bare
@@ -1285,10 +1372,10 @@ pub const Checker = struct {
     pending_type_args_pool: std.ArrayList(TypeId) = .empty,
     /// `nodeKey`s already queued in `pending_type_args`, so a type node
     /// converted once per contextual variation queues its check once.
-    pending_type_args_seen: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    pending_type_args_seen: IntMap(u64, void) = .empty,
     /// Per-generic-symbol memo of "declares a constrained type parameter"
     /// (see `symHasConstrainedTypeParam`) — the queue's admission test.
-    tp_constrained_cache: std.AutoHashMapUnmanaged(SymbolId, bool) = .empty,
+    tp_constrained_cache: IntMap(SymbolId, bool) = .empty,
     /// Depth of "checking a NON-STATIC class field's initializer" frames. Such
     /// an initializer runs at construction time, not at class-definition time,
     /// so a forward reference in it is not in the temporal dead zone — tsc's
@@ -1420,7 +1507,7 @@ pub const Checker = struct {
     /// Memo for `isWeakType`: TypeId -> 1 weak / 0 not. The weak-type check
     /// runs on every relation frame with an object-ish target, and answering
     /// it means resolving the target's members, so the answer is kept.
-    weak_types: std.AutoHashMapUnmanaged(TypeId, u8) = .empty,
+    weak_types: IntMap(TypeId, u8) = .empty,
     /// **Symbols eagerly, types lazily** (tsc's `createInstantiatedSymbolTable`
     /// / `getTypeOfSymbol` split) — see `lazyTableOf`.
     ///
@@ -1436,13 +1523,13 @@ pub const Checker = struct {
     /// substitution is an artifact of the budget epoch that produced it, and
     /// publishing one would answer every later reader with it (the rule
     /// `eraseParamsOf` and `inst_cache` already follow).
-    lazy_member: std.AutoHashMapUnmanaged(u64, TypeId) = .empty,
+    lazy_member: IntMap(u64, TypeId) = .empty,
     /// `ref` -> the type-parameter substitution its member table is read
     /// under, interned on the checker arena. Built once per reference rather
     /// than once per member: `buildInstMap` re-walks every declaration block's
     /// type-parameter list, which at 200 members would cost more than the
     /// substitutions it feeds.
-    lazy_map: std.AutoHashMapUnmanaged(TypeId, []@import("checker/enums.zig").TpMap) = .empty,
+    lazy_map: IntMap(TypeId, []@import("checker/enums.zig").TpMap) = .empty,
     /// Why the relation's lazy member route declined a pair, tallied per
     /// checker so the counters need no synchronization. Dumped at `seal` under
     /// `--lazy-stats`; pair with `--checkers=1`. See `LazyStat`.
@@ -1609,7 +1696,7 @@ pub const Checker = struct {
     chain_guards: std.ArrayListUnmanaged(RefKey) = .empty,
     /// Memo for `intersectionIsNever` (tsc's `getReducedType`), keyed by the
     /// intersection type.
-    never_isect: std.AutoHashMapUnmanaged(TypeId, bool) = .empty,
+    never_isect: IntMap(TypeId, bool) = .empty,
     stats: Stats = .{},
 
     // Well-known atoms (interned once in init).
@@ -3075,6 +3162,17 @@ pub const Checker = struct {
     pub const unionCallableSigs = instantiate_zig.unionCallableSigs;
     pub const mergeBaseObject = instantiate_zig.mergeBaseObject;
     pub const carryKeyNameTypes = instantiate_zig.carryKeyNameTypes;
+
+    /// The one write path for `key_name_types`. Bumps `key_name_gen` on a
+    /// genuinely new entry so `keyof_obj_cache` can tell that an object it
+    /// already answered for may have gained enum-member names since — see
+    /// that field. Never call `key_name_types.put` directly.
+    pub fn putKeyNameType(c: *Checker, obj: TypeId, name: Atom, ty: TypeId) Error!void {
+        const gop = try c.key_name_types.getOrPut(c.cm(), (@as(u64, obj) << 32) | name);
+        if (gop.found_existing and gop.value_ptr.* == ty) return;
+        gop.value_ptr.* = ty;
+        c.key_name_gen += 1;
+    }
     pub const classInstanceGeneric = instantiate_zig.classInstanceGeneric;
     pub const isCtorName = instantiate_zig.isCtorName;
     pub const refExpansionActive = instantiate_zig.refExpansionActive;
