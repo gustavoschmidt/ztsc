@@ -716,7 +716,10 @@ pub const Checker = struct {
     /// Heap-allocated so `Allocator` handles stay valid when the Checker
     /// struct moves.
     carena: *std.heap.ArenaAllocator,
-    /// Scratch arena: worklists, printer buffers; reset per statement.
+    /// Scratch arena: worklists, printer buffers. Released per EXPRESSION
+    /// (`checkExprCached` takes a mark and restores it), with a whole-arena
+    /// reset per statement behind that as a backstop — see `bump.zig` for the
+    /// contract, which no caller may loosen back to per-statement.
     /// `scratch_arena` is a *pointer* so it can be swapped for `inst_arena`
     /// during the outermost `instantiate()` call (see `instantiate`), routing
     /// every transient allocation made while materializing a generic type into

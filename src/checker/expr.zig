@@ -88,6 +88,37 @@ pub fn checkExprCached(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         }
     }
     c.stats.node_type_misses += 1;
+    // Release this expression's scratch on the way out, the way an
+    // `instantiateId` frame and a `relate` frame already do. An expression's
+    // answer is an interned `TypeId`; every worklist, property buffer and
+    // template builder its subtree made is dead at this return, and the
+    // scratch arena's only other rewind point is the per-statement reset —
+    // so a single long statement (a spec file's whole `describe`) otherwise
+    // holds every byte its body ever touched. Placed BELOW the `node_types`
+    // probe so a cache hit costs no mark/restore.
+    //
+    // This TIGHTENS the arena's contract from per-statement to
+    // per-expression: a buffer allocated while checking an expression may no
+    // longer be parked for later in the same statement. Buffers that do
+    // cross frames today are all allocated by an OUTER frame and read by
+    // that same outer frame (`planConcreteConditional`'s ids/vals,
+    // `inferTypeArgs`' candidate buffers, `flow_loop_stack`'s `parts`), so
+    // this mark sits strictly above them and cannot reach them. Anything
+    // added later that allocates in scratch inside an expression and reads
+    // it after that expression returns is a use-after-free.
+    //
+    // The arena is captured rather than re-read because a nested top-level
+    // `instantiate` swaps a different one in for its own duration; frames do
+    // run with `inst_arena` swapped in, and the swap is `defer`-balanced, so
+    // the arena in hand at exit is always the one the mark was taken on.
+    //
+    // Measured on immich: peak RSS 1.12 -> 0.36 GB at one checker and
+    // 2.40 -> 1.01 GB at four, diagnostics byte-identical over 36
+    // package/app x checker-count comparisons, including under a build that
+    // poisons every reclaimed range on `restore`.
+    const em_arena = c.scratch_arena;
+    const em_mark = em_arena.mark();
+    defer em_arena.restore(em_mark);
     const t = try c.checkExpr(node, ctx);
     // A side query is speculative — it runs out of the checker's top-down
     // order — so it must not publish its answer for the authoritative

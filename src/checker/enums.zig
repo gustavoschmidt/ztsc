@@ -1360,7 +1360,7 @@ pub fn canonMapId(c: *Checker, map: []const TpMap) Error!u32 {
     }
     const gop = try c.inst_map_ids.getOrPut(c.cm(), bytes);
     if (!gop.found_existing) {
-        gop.key_ptr.* = try c.ca().dupe(u8, bytes); // scratch is reset per stmt
+        gop.key_ptr.* = try c.ca().dupe(u8, bytes); // scratch dies with the expression
         gop.value_ptr.* = c.inst_map_next;
         c.inst_map_next += 1;
         c.stats.inst_maps += 1;

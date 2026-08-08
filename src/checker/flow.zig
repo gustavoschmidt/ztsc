@@ -1113,6 +1113,15 @@ pub fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, d
                     frame = c.flow_loop_stack.items.len;
                     const q: FlowQ = (@as(u64, c.cur_flow_base + flow) << 32) |
                         try c.refKeyIndex(key, declared);
+                    // `parts` is scratch-backed and this publishes it where a
+                    // deeper query can read it, so it is the one place in the
+                    // checker that hands a scratch buffer sideways. It stays
+                    // sound only because it is grown in THIS loop body alone,
+                    // always after the recursive `flowType` below has fully
+                    // unwound — i.e. always at this frame's own arena top,
+                    // above every mark an inner expression takes — and because
+                    // nested queries only read it. Growing it from anywhere
+                    // reachable by a deeper frame would be a use-after-free.
                     try c.flow_loop_stack.append(c.cm(), .{ .q = q, .parts = &parts });
                     c.flow_back_edge += 1;
                     // Everything a back edge re-checks (an assignment's

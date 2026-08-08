@@ -17,6 +17,17 @@
 //! chunks are kept and re-bumped, so the steady state performs no allocator
 //! traffic at all.
 //!
+//! Frames are taken at four grains, and together they define the contract:
+//! the outermost `instantiate` (arena swap), `instantiateId`, `relate`, and
+//! `checkExprCached`. The last is the binding one — **scratch is released per
+//! EXPRESSION, not per statement.** The per-statement reset still exists, but
+//! nothing may rely on it: a buffer allocated while checking an expression is
+//! gone when that expression returns its `TypeId`. The looser rule cost 875 MB
+//! of the 1.2 GB immich peak, all of it in one spec file's top-level
+//! `describe`, because a statement that runs for seconds never reaches its
+//! reset. Buffers that legitimately cross frames are allocated by an OUTER
+//! frame and read by that same frame, so every inner mark sits above them.
+//!
 //! `free` is a no-op and `resize` grows only the most recent allocation, which
 //! is what makes the mark stack sound: nothing an inner frame allocated can be
 //! reachable once its mark is restored, so restoring can never strand a live
