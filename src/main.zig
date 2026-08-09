@@ -782,6 +782,27 @@ pub fn main(init: std.process.Init) !void {
         }
         // Real sources first (their order/emptiness drove the check above), then
         // the auto-included `@types/*` ambient roots (tsc's default typeRoots).
+        //
+        // MEASURED, and it is not simply tsc's order. `createProgram` walks each
+        // root file with its whole import closure and only then processes the
+        // automatic type-reference directives, so tsc's `@types/*` land after
+        // the closure while ztsc's land between the roots and it. That is
+        // observable on social-app, where `setTimeout` is declared both by
+        // `@types/node` and by react-native's `globals.d.ts`: ztsc resolves
+        // `ReturnType<typeof setTimeout>` to `number` where tsc gets `Timeout`.
+        //
+        // Deferring the `@types/*` roots into a second BFS wave — after the
+        // real roots' closure is exhausted, which is literally tsc's order —
+        // was tried and is WORSE: social-app 222 -> 226. It does fix
+        // `ReturnType<typeof setTimeout>` (it becomes `Timeout`), but the CALL
+        // then resolves to an overload returning `number`, so nine
+        // `Timeout`-not-assignable-to-`number` reports become thirteen
+        // `number`-not-assignable-to-`Timeout` ones. Overload resolution reads
+        // the merged list from the front and `ReturnType` reads it from the
+        // back, so no single position for these roots satisfies both: the wave
+        // order is not the whole rule, and the next attempt needs tsc's actual
+        // merge precedence for a global function, not another guess at the
+        // seeding position.
         if (cfg.auto_type_files.len == 0) {
             entry_paths = cfg.root_files;
         } else {
