@@ -1819,6 +1819,14 @@ pub const Checker = struct {
     /// and intersections preserve top-level-ness (tsc's
     /// `isTypeParameterAtTopLevel` descends them); everything else does not.
     nontop_depth: u32 = 0,
+    /// Monotone count of candidate WRITES performed by `unify`'s `.type_param`
+    /// arm. tsc's `inferToMultipleTypes` decides whether a source constituent
+    /// was "matched" by watching `inferencePriority` — i.e. whether an
+    /// inference was MADE — not by whether the recorded answer changed.
+    /// Comparing the candidate array instead makes a re-inference of an
+    /// already-recorded candidate invisible, and the constituent then counts
+    /// as unmatched and rides into the naked type variable a second time.
+    infer_writes: u64 = 0,
     /// Non-zero while `unify` is running the contextual-RETURN pass
     /// (`fillFromReturnContext`), i.e. at tsc's `InferencePriority.ReturnType`.
     /// The distinction matters for the untargeted union-SOURCE rule, which
