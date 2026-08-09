@@ -737,6 +737,12 @@ pub const Checker = struct {
     /// diagnostics survive `seal`).
     owned: []const FileId,
     owned_mask: []bool = &.{},
+    /// PROFILER ONLY (`--dup-profile`): the OWNED file whose top-level walk is
+    /// live. Unlike `cur_file` it does not move under `enterSymFile`, so a
+    /// declaration materialized from three files deep still attributes its
+    /// demand to the file the partition actually assigned. See the
+    /// cross-checker duplication section of `src/checker/prof.zig`.
+    owned_file: FileId = 0,
     /// Current-file views (switched by `setFile`); all `tree`/`bind`/`src`
     /// uses below refer to the file being traversed *right now*.
     cur_file: FileId = 0,
@@ -1966,6 +1972,7 @@ pub const Checker = struct {
         defer prof_zig.declRunEnd(c);
         for (c.owned) |f| {
             c.setFile(f);
+            c.owned_file = f;
             c.cur_scope = binder.file_scope;
             c.fn_ctx = null;
             c.this_type = 0;

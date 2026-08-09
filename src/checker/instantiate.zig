@@ -116,9 +116,10 @@ pub fn aliasInstance(c: *Checker, sym: SymbolId, args: []const TypeId, tok: Toke
 }
 
 pub fn aliasGeneric(c: *Checker, sym: SymbolId) Error!TypeId {
+    prof_zig.declAsk(c, sym, .alias, sym);
     if (c.alias_generic.get(sym)) |t| return t;
     try c.alias_state.put(c.cm(), sym, 1);
-    const dwin = prof_zig.declEnter(c, sym, .alias);
+    const dwin = prof_zig.declEnter(c, sym, .alias, prof_zig.dupKey(.alias, sym));
     defer prof_zig.declExit(c, dwin);
     const saved_ctx = c.enterSymFile(sym);
     defer c.restoreCtx(saved_ctx);
@@ -201,7 +202,17 @@ pub fn refExpandsToObject(c: *Checker, t: TypeId) bool {
     return f.interface or f.class;
 }
 
+/// Profiler-only: which `DeclKind` an `expandRef` window of `sym` is.
+fn refDeclKind(c: *Checker, sym: SymbolId) prof_zig.DeclKind {
+    const sf = c.symFlags(sym);
+    if (sf.class) return .expand_class;
+    if (sf.interface) return .expand_iface;
+    if (sf.type_alias) return .expand_alias;
+    return .expand_other;
+}
+
 pub fn expandRef(c: *Checker, ref: TypeId) Error!TypeId {
+    if (prof_zig.dup_prof_on) prof_zig.declAsk(c, c.ts.refSymbol(ref), refDeclKind(c, c.ts.refSymbol(ref)), ref);
     if (c.expansions.get(ref)) |t| {
         if (t == types.no_type) return types.error_type; // cycle
         return t;
@@ -227,17 +238,10 @@ pub fn expandRef(c: *Checker, ref: TypeId) Error!TypeId {
     }
     try c.expansions.put(c.cm(), ref, types.no_type); // in-progress
     const sym = c.ts.refSymbol(ref);
-    const dwin = if (c.dprof.on) blk: {
-        const sf = c.symFlags(sym);
-        break :blk prof_zig.declEnter(c, sym, if (sf.class)
-            .expand_class
-        else if (sf.interface)
-            .expand_iface
-        else if (sf.type_alias)
-            .expand_alias
-        else
-            .expand_other);
-    } else prof_zig.DeclWin{};
+    const dwin = if (c.dprof.on)
+        prof_zig.declEnter(c, sym, refDeclKind(c, sym), prof_zig.dupKey(.expand_other, ref))
+    else
+        prof_zig.DeclWin{};
     defer prof_zig.declExit(c, dwin);
     const prof_before = c.inst_total;
     defer if (c.prof.on) prof_zig.noteExpand(c, sym, c.inst_total - prof_before);
@@ -1011,6 +1015,7 @@ pub fn emitBaseCycle(c: *Checker, sym: SymbolId) Error!void {
 /// Generic (type-params-as-themselves) instance shape of an interface,
 /// with `extends` bases merged (derived members win).
 pub fn interfaceGeneric(c: *Checker, sym: SymbolId) Error!TypeId {
+    prof_zig.declAsk(c, sym, .iface, sym);
     const saved_ctx = c.enterSymFile(sym);
     defer c.restoreCtx(saved_ctx);
     if (c.iface_generic.get(sym)) |t| {
@@ -1028,7 +1033,7 @@ pub fn interfaceGeneric(c: *Checker, sym: SymbolId) Error!TypeId {
     try c.iface_generic.put(c.cm(), sym, types.no_type);
     try c.iface_stack.append(c.cm(), .{ .sym = sym });
     defer _ = c.iface_stack.pop();
-    const dwin = prof_zig.declEnter(c, sym, .iface);
+    const dwin = prof_zig.declEnter(c, sym, .iface, prof_zig.dupKey(.iface, sym));
     defer prof_zig.declExit(c, dwin);
 
     // Constituents: a within-file interface is one symbol carrying every
@@ -1346,12 +1351,13 @@ pub fn carryKeyNameTypes(c: *Checker, out: TypeId, from: []const TypeId) Error!v
 
 /// Generic instance shape of a class: instance members + base instance.
 pub fn classInstanceGeneric(c: *Checker, sym: SymbolId) Error!TypeId {
+    prof_zig.declAsk(c, sym, .class, sym);
     if (c.class_inst_generic.get(sym)) |t| {
         if (t == types.no_type) return types.error_type;
         return t;
     }
     try c.class_inst_generic.put(c.cm(), sym, types.no_type);
-    const dwin = prof_zig.declEnter(c, sym, .class);
+    const dwin = prof_zig.declEnter(c, sym, .class, prof_zig.dupKey(.class, sym));
     defer prof_zig.declExit(c, dwin);
     const saved_ctx = c.enterSymFile(sym);
     defer c.restoreCtx(saved_ctx);

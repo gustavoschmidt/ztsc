@@ -1645,6 +1645,115 @@
 //! for diagnosing it.** The budget-ceiling family is closed from six
 //! independent directions and should not be reopened without a trip counter
 //! that is non-zero.
+//!
+//! ## PARTITIONING IS NOT A DECISION VARIABLE — CLOSED (2026-08-09)
+//!
+//! immich's cross-checker work duplication is real and it is large: at
+//! `--checkers=4` the four checkers together build **7,643,613 types and
+//! 35,250,204 instantiate node visits against a single checker's 2,507,374 and
+//! 11,121,728** — 3.05x and 3.17x redundancy for a byte-identical answer, and
+//! 100.16 G retired instructions against 38.75 G. The open question was
+//! whether a better PARTITION could recover it: file ids are BFS positions in
+//! the import graph, so a partition that grouped files by their demanded
+//! declaration sets rather than by node count might separate the work.
+//!
+//! **It cannot, and the reason is a hard lower bound rather than a search
+//! result.** `--partition-file=<path>` (`main.zig`) replaces the partition
+//! with an externally computed one so a candidate can be measured instead of
+//! modelled, and `--dup-profile` dumps the (declaration unit, self cost,
+//! demanding-file set) table that `bench/dup_partition.py` optimizes over.
+//!
+//! ### One file demands 57% of the program
+//!
+//! Give a checker exactly one file and read `--memory`'s per-checker `types`
+//! line (contention-free; the other checkers hold the rest of the program):
+//!
+//!     files owned                                    types built   check ms
+//!     src/services/media.service.spec.ts   (18 k nodes)  1,437,504     1,446
+//!     src/repositories/asset.repository.ts  (5.7 k)        499,582       482
+//!     src/utils/database.ts                 (4.7 k)        238,871       309
+//!     src/services/album.service.ts         (1.7 k)        239,437       257
+//!     src/repositories/sync.repository.ts   (3.3 k)        224,162       193
+//!     src/dtos/asset.dto.ts                 (0.9 k)         53,595        29
+//!     src/schema/tables/asset.table.ts      (0.5 k)            575       0.9
+//!     one 13-node migration                                     27       0.2
+//!     the other 620 files                                2,417,554     2,546
+//!
+//! The last two rows are the whole argument. There is NO fixed cost to being
+//! a checker (27 types, 0.2 ms), so 1,437,504 is genuinely ONE FILE's demand
+//! closure — 57.3% of the program's 2,507,374 — and 620 files build 2,417,554,
+//! so 1,428,980 of that one file's closure (99.4% of it) is inside the other
+//! checker's closure too. Every partition puts that file somewhere and
+//! whichever checker holds it pays its whole closure. **The makespan of any
+//! partition, at any checker count, is at least ~1.44 M types / ~1.4 s of
+//! check phase, against a whole-run wall bar of 1.272 s.** No partition can
+//! clear it.
+//!
+//! The same curve read the other way, by handing checker k exactly 2^k of the
+//! costliest files in one `--checkers=8` run: 1 file 1.437 M types, 2 files
+//! 1.458 M, 4 files 1.519 M, 8 files 1.675 M, 16 files 1.740 M, 32 files
+//! 1.693 M, 64 files 1.789 M, 500 files 1.918 M. **A checker's type count is
+//! logarithmic in how many files it owns** — 500x the files for 33% more
+//! types. Per-checker averages across whole runs say the same: 2.507 M at c1,
+//! 2.194 M at c2, 1.911 M at c4, 1.613 M at c8, i.e. a flat -0.30 M per
+//! DOUBLING of the checker count. Partitioning files four ways partitions the
+//! work 1.31 ways because the work is not a function of the file set.
+//!
+//! ### Four structurally maximal-difference partitions, measured
+//!
+//! At `--checkers=4`, all counters contention-free:
+//!
+//!     partition                       types built  inst visits  instructions
+//!     today (BFS runs + LPT deal)       7,639,145   35,227,889     100.29 G
+//!     contiguous BFS ranges (k = 1)     7,609,339   35,196,152     100.02 G
+//!     RANDOM (locality destroyed)       7,535,568   34,630,709      99.41 G
+//!     demand-closure optimized          7,506,614   34,531,368      99.03 G
+//!
+//! A **random** partition builds fewer types than the locality-aware one. The
+//! whole spread is 1.8%, and the last row is a hypergraph local search run
+//! directly against the measured demand sets under a hard node-weight balance
+//! — the "partition from the ACTUAL demanded-declaration sets" this question
+//! was about. Import locality is worth nothing here because every immich file
+//! transitively reaches kysely, the 60-table `DB` schema and the repository
+//! classes; there is no separable structure to find.
+//!
+//! Dropping the balance constraint DOES cut duplication — the same search
+//! minimizing the SUM lands 474 of 627 files on one checker for 4,612,382
+//! types, 20,739,258 visits, 62.75 G instructions and **462 MB peak RSS
+//! against 1,032 MB** — but its makespan is 3,989 ms against 3,004 ms. That is
+//! the tradeoff curve, and it only runs from "c4" to "c1": aggregate work and
+//! RSS are bought with wall, one for one.
+//!
+//! ### What that leaves, and the arithmetic that prices it
+//!
+//! Sharing derived state across checkers is the only remaining route, and two
+//! numbers bound it.
+//!
+//! * **A SERIAL pre-pass is exactly wall-neutral, by construction.** If every
+//!   checker would spend X on work the pre-pass does once, the makespan is
+//!   `X + (T - X) = T`. It is an aggregate-CPU and RSS instrument, never a
+//!   wall one. Re-derived at head as PLAN.md asked: `--decl-profile` at c1 now
+//!   reports declaration windows at **1,977.7 ms of a 2,384.8 ms check phase
+//!   (82.9%)**, of which the run-once generic forms — the only part a
+//!   demand-free pre-pass could build, since every expansion's argument list
+//!   comes from consumer code — are **330.4 ms (13.85% of the check phase)**.
+//!   `2103872` did not move the 1.98 s figure; it is the same floor PLAN.md
+//!   recorded, and it is 1.6x the whole-run wall bar on its own.
+//! * **A concurrent shared store's frictionless floor is ~1.0 s.** 38.75 G
+//!   instructions over 4 threads at the ~3.07x speedup ceiling this header
+//!   already measured for memory bandwidth is 12.6 G serial-equivalent, i.e.
+//!   ~0.83 s of check plus ~0.17 s of front end. Against that, the sampling
+//!   profile behind `2103872` put **42% of leaf samples in type interning and
+//!   hashing** — the shared store makes exactly that the contended structure,
+//!   so the realistic band is PLAN.md's modelled 1.3-1.6 s straddling a
+//!   1.272 s bar, and this measurement confirms the model rather than
+//!   improving it.
+//!
+//! One more datum for whoever prices the RSS half: at c4 the type arenas are
+//! **261 MB of the 1,128 MB peak**. The instantiate memo (18,968,503 misses at
+//! c4 against 5,907,484 at c1) is the larger consumer, so a shared TYPE store
+//! that did not also share the memo would leave most of the duplicated
+//! footprint standing.
 
 const std = @import("std");
 const types = @import("../types.zig");
@@ -2042,6 +2151,96 @@ pub fn declEnabled() bool {
     return decl_prof_on;
 }
 
+// =========================================================================
+// CROSS-CHECKER DUPLICATION (`--dup-profile`)
+// =========================================================================
+//
+// `--dup-profile` implies `--decl-profile` and adds one thing to it: for
+// every memoizable declaration UNIT it records the set of OWNED files that
+// ever asked for it, alongside the unit's own (nested-exclusive) build cost.
+// That pair is exactly the input a partition-quality question needs.
+//
+// Read the run at `--checkers=1`, where the memo is global and the demand
+// sets are therefore complete: a file that asks for an already-memoized unit
+// still records its ask (the ask is logged BEFORE the memo check), so the
+// recorded set is "every file that would have to build this unit if it were
+// alone on a checker", not "the file that happened to get there first".
+//
+// With that in hand, the cost of ANY partition P of the owned files is
+//
+//     cost(P) = sum over parts p of  sum over units u with files(u) & p != {}
+//                                        of  self_cost(u)
+//
+// and `cost({all files})` is the distinct work — the 1x floor. The ratio is
+// the duplication a given partition pays, and MINIMIZING it over balanced
+// partitions is the ceiling on what any better partition could ever buy.
+// `bench/dup_partition.py` does that minimization off the dump.
+//
+// The unit is deliberately FINER than the symbol: one `expandRef` unit is
+// one (symbol, argument-list) substitution, keyed by the reference's TypeId,
+// which is stable within the single store a `--checkers=1` run has. Keying
+// by symbol instead would charge a file that asks for one of
+// `SelectQueryBuilder`'s 1,131 expansions the cost of all of them, and would
+// overstate duplication by construction.
+pub var dup_prof_on: bool = false;
+
+const dup_kind_tag = [_]u64{ 2, 3, 4, 1, 1, 1, 1 }; // DeclKind -> key tag
+
+/// Identity of one memoizable declaration unit. `id` is the reference's
+/// TypeId for an `expandRef` window and the SYMBOL for a run-once generic
+/// form; the tag keeps the two spaces apart.
+pub fn dupKey(kind: DeclKind, id: u64) u64 {
+    return (dup_kind_tag[@intFromEnum(kind)] << 40) | id;
+}
+
+/// Record that the live owned file demands `key`. Call at the TOP of the
+/// materializing function, before its memo check — a memo hit is a demand.
+pub fn declAsk(c: *Checker, sym: SymbolId, kind: DeclKind, id: u64) void {
+    if (!dup_prof_on) return;
+    const p = &c.dprof;
+    const gop = p.units.getOrPut(c.gpa, dupKey(kind, id)) catch return;
+    if (!gop.found_existing) gop.value_ptr.* = .{ .sym = sym, .kind = kind };
+    const u = gop.value_ptr;
+    u.asks += 1;
+    const f = c.owned_file;
+    if (u.last_file == f) return;
+    u.last_file = f;
+    for (u.files.items) |g| if (g == f) return;
+    u.files.append(c.gpa, f) catch {};
+}
+
+/// Dump the raw (unit, cost, demanding-file-set) table. Machine-read by
+/// `bench/dup_partition.py`; deliberately not summarized here, because every
+/// interesting question about it is a partitioning question.
+fn dupReport(c: *Checker, w: *std.Io.Writer) void {
+    const p = &c.dprof;
+    w.writeAll("\n-- DUPDATA v1 --\n") catch {};
+    var seen: std.AutoHashMapUnmanaged(FileId, void) = .empty;
+    defer seen.deinit(c.gpa);
+    var it0 = p.units.iterator();
+    while (it0.next()) |e| for (e.value_ptr.files.items) |f| {
+        _ = seen.getOrPut(c.gpa, f) catch {};
+    };
+    for (c.owned) |f| _ = seen.getOrPut(c.gpa, f) catch {};
+    var itf = seen.keyIterator();
+    while (itf.next()) |f| {
+        w.print("F {d} {d} {s}\n", .{
+            f.*, c.prog.files[f.*].tree.nodes.len, c.prog.files[f.*].path,
+        }) catch {};
+    }
+    var it = p.units.iterator();
+    while (it.next()) |e| {
+        const u = e.value_ptr;
+        w.print("K {d} {s} {d} {d} {d} {d} {d}", .{
+            e.key_ptr.*, @tagName(u.kind), u.self_ns,         u.self_visits,
+            u.builds,    u.asks,           u.files.items.len,
+        }) catch {};
+        for (u.files.items) |f| w.print(" {d}", .{f}) catch {};
+        w.writeAll("\n") catch {};
+    }
+    w.writeAll("-- END DUPDATA --\n") catch {};
+}
+
 /// The four windows, with `expandRef` split by what the reference names —
 /// the split the pre-pass decision turns on. `iface`/`class`/`alias` are the
 /// RUN-ONCE-PER-SYMBOL generic forms (what a shared frozen base could
@@ -2129,12 +2328,19 @@ pub const DeclProf = struct {
     /// The whole check phase (`Checker.run`).
     run_ns: u64 = 0,
     run_t0: u64 = 0,
+    /// `--dup-profile` only: one entry per memoizable declaration UNIT
+    /// (`dupKey`), carrying the unit's self cost and the set of OWNED files
+    /// that ever asked for it. See the cross-checker duplication section.
+    units: std.AutoHashMapUnmanaged(u64, DupUnit) = .empty,
 
     pub fn deinit(p: *DeclProf, gpa: std.mem.Allocator) void {
         p.by_sym.deinit(gpa);
         p.self_by_sym.deinit(gpa);
         p.stack.deinit(gpa);
         p.expr_sites.deinit(gpa);
+        var it = p.units.valueIterator();
+        while (it.next()) |u| u.files.deinit(gpa);
+        p.units.deinit(gpa);
     }
 
     const Frame = struct {
@@ -2142,7 +2348,28 @@ pub const DeclProf = struct {
         kind: DeclKind,
         t0: u64,
         child_ns: u64,
+        /// `--dup-profile` only.
+        key: u64 = 0,
+        visits0: u64 = 0,
+        child_visits: u64 = 0,
     };
+};
+
+/// One memoizable declaration unit, as seen by `--dup-profile`.
+pub const DupUnit = struct {
+    sym: SymbolId,
+    kind: DeclKind,
+    /// Self (nested-window-exclusive) cost of BUILDING it, once.
+    self_ns: u64 = 0,
+    self_visits: u64 = 0,
+    builds: u64 = 0,
+    /// Every ask, memo hit or miss.
+    asks: u64 = 0,
+    /// Last owned file that asked — the run-length filter that keeps the
+    /// membership test off the hot path.
+    last_file: FileId = std.math.maxInt(FileId),
+    /// Owned files that ever asked, deduplicated.
+    files: std.ArrayListUnmanaged(FileId) = .empty,
 };
 
 /// Monotonic nanoseconds. `CLOCK_UPTIME_RAW` on macOS, `CLOCK_MONOTONIC` on
@@ -2156,7 +2383,12 @@ fn nowNs(c: *Checker) u64 {
 
 /// Open a declaration-materialization window for `sym`. Call AFTER the
 /// memo check, so a memoized re-read is not a window.
-pub fn declEnter(c: *Checker, sym: SymbolId, kind: DeclKind) DeclWin {
+///
+/// `key` names the memoizable UNIT the window builds (see `dupKey`); it is
+/// finer than `sym` for an `expandRef` window, where one symbol has as many
+/// units as its consumers ask argument lists for. Read only under
+/// `--dup-profile`.
+pub fn declEnter(c: *Checker, sym: SymbolId, kind: DeclKind, key: u64) DeclWin {
     if (!c.dprof.on) return .{};
     const p = &c.dprof;
     p.counts[@intFromEnum(kind)] += 1;
@@ -2171,7 +2403,15 @@ pub fn declEnter(c: *Checker, sym: SymbolId, kind: DeclKind) DeclWin {
     }
     const t0 = nowNs(c);
     if (outer) p.t0 = t0;
-    p.stack.append(c.gpa, .{ .sym = sym, .kind = kind, .t0 = t0, .child_ns = 0 }) catch {};
+    p.stack.append(c.gpa, .{
+        .sym = sym,
+        .kind = kind,
+        .t0 = t0,
+        .child_ns = 0,
+        .key = key,
+        .visits0 = c.inst_total,
+        .child_visits = 0,
+    }) catch {};
     return .{ .outer = outer };
 }
 
@@ -2188,6 +2428,16 @@ pub fn declExit(c: *Checker, w: DeclWin) void {
             if (!gop.found_existing) gop.value_ptr.* = .{};
             gop.value_ptr.add(self);
         } else |_| {}
+        if (dup_prof_on) {
+            const gross_visits = c.inst_total - fr.visits0;
+            const self_visits = gross_visits - @min(gross_visits, fr.child_visits);
+            if (p.units.getPtr(fr.key)) |u| {
+                u.self_ns += self;
+                u.self_visits += self_visits;
+                u.builds += 1;
+            }
+            if (p.stack.items.len > 0) p.stack.items[p.stack.items.len - 1].child_visits += gross_visits;
+        }
         if (p.stack.items.len > 0) p.stack.items[p.stack.items.len - 1].child_ns += dur;
     }
     if (!w.outer) return;
@@ -2456,5 +2706,6 @@ pub fn declReport(c: *Checker) void {
             }) catch {};
         }
     }
+    if (dup_prof_on) dupReport(c, w);
     w.flush() catch {};
 }

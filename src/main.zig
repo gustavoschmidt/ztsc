@@ -114,6 +114,10 @@ const usage =
     \\  --decl-profile         dump the declaration-window TIME profile (what
     \\                         share of the check phase materializes
     \\                         declarations) to stderr; pair with --checkers=1
+    \\  --dup-profile          implies --decl-profile and adds the raw
+    \\                         (declaration unit, cost, demanding files) table
+    \\                         the cross-checker duplication analysis reads;
+    \\                         pair with --checkers=1
     \\  --eager-members        materialize every interface/class member table
     \\                         whole, instead of member-by-member on demand
     \\                         (bisect leg / oracle)
@@ -203,6 +207,15 @@ const Cli = struct {
     /// seal (see the second half of `checker/prof.zig`). A diagnostic
     /// instrument; pair with `--checkers=1`.
     decl_profile: bool = false,
+    /// `--dup-profile`: implies `--decl-profile` and additionally records,
+    /// per memoizable declaration unit, the set of OWNED files that demand
+    /// it — the input to the partition-quality question. Pair with
+    /// `--checkers=1`; see the cross-checker duplication section of
+    /// `checker/prof.zig`.
+    dup_profile: bool = false,
+    /// `--partition-file=<path>`: benchmark aid; override the file->checker
+    /// partition with an externally computed one (see the read site).
+    partition_file: ?[]const u8 = null,
     /// null = auto (pretty iff stderr is a TTY).
     pretty: ?bool = null,
     project: ?[]const u8 = null,
@@ -559,7 +572,8 @@ pub fn main(init: std.process.Init) !void {
     checker.prof_zig.focus_root = cli.inst_focus;
     checker.lazy_zig.lazy_members_on = !cli.eager_members;
     checker.lazy_zig.stats_on = cli.lazy_stats;
-    checker.prof_zig.decl_prof_on = cli.decl_profile;
+    checker.prof_zig.decl_prof_on = cli.decl_profile or cli.dup_profile;
+    checker.prof_zig.dup_prof_on = cli.dup_profile;
 
     if (cli.help) {
         try out.print("{s}", .{usage});
@@ -1262,6 +1276,42 @@ pub fn main(init: std.process.Init) !void {
             loads[best] += run.cost;
         }
 
+        // BENCHMARK AID (`--partition-file=<path>`): replace the partition
+        // above with an externally computed one — one `<file-id> <checker>`
+        // pair per line, file ids as `--dup-profile` prints them. It exists
+        // so a candidate partition can be MEASURED (total instantiate visits,
+        // peak RSS) instead of modelled; see the cross-checker duplication
+        // section of `src/checker/prof.zig`. Files the file does not mention
+        // keep the partition's own assignment. Within a checker the walk stays
+        // biggest-first, as above.
+        if (cli.partition_file) |pf| {
+            const text = Io.Dir.cwd().readFileAlloc(io, pf, arena, .limited(64 << 20)) catch |e| {
+                std.debug.print("ztsc: cannot read --partition-file '{s}': {s}\n", .{ pf, @errorName(e) });
+                std.process.exit(1);
+            };
+            for (owned_lists) |*l| l.* = .empty;
+            var lines = std.mem.tokenizeAny(u8, text, "\r\n");
+            while (lines.next()) |line| {
+                var it = std.mem.tokenizeScalar(u8, line, ' ');
+                const fid_s = it.next() orelse continue;
+                const ck_s = it.next() orelse continue;
+                const fid = std.fmt.parseInt(u32, fid_s, 10) catch continue;
+                const ck = std.fmt.parseInt(u32, ck_s, 10) catch continue;
+                if (fid >= n_files) continue;
+                file_owner[fid] = @intCast(ck % n_checkers);
+            }
+            const cost_by_file = try arena.alloc(u64, n_files);
+            @memset(cost_by_file, 0);
+            for (items.items) |it| cost_by_file[it.file] = it.cost;
+            for (items.items) |it| try owned_lists[file_owner[it.file]].append(arena, it.file);
+            for (owned_lists) |*l| std.mem.sort(modules.FileId, l.items, cost_by_file, struct {
+                fn lessThan(cost: []const u64, x: modules.FileId, y: modules.FileId) bool {
+                    if (cost[x] != cost[y]) return cost[x] > cost[y];
+                    return x < y;
+                }
+            }.lessThan);
+        }
+
         // Shared frozen base type store (frozen-base piece 2): built
         // once, single-threaded here before any checker spawns, then handed to
         // every task read-only. Under `--no-frozen-store` each checker instead
@@ -1897,6 +1947,10 @@ fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8, bad_arg: *[]c
             cli.eager_members = true;
         } else if (std.mem.eql(u8, arg, "--decl-profile")) {
             cli.decl_profile = true;
+        } else if (std.mem.eql(u8, arg, "--dup-profile")) {
+            cli.dup_profile = true;
+        } else if (std.mem.startsWith(u8, arg, "--partition-file=")) {
+            cli.partition_file = arg["--partition-file=".len..];
         } else if (std.mem.eql(u8, arg, "--lazy-stats")) {
             cli.lazy_stats = true;
         } else if (std.mem.startsWith(u8, arg, "--inst-focus=")) {
