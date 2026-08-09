@@ -1834,6 +1834,28 @@ pub fn covSubtypeOf(c: *Checker, a: TypeId, b: TypeId) Error!bool {
         if (p.flags & types.prop_flag_optional == 0) continue;
         if (try c.propOfType(a, p.name) == null) return false;
     }
+    // An INDEX SIGNATURE on the target must be present on the source. This
+    // is the assignable/subtype gap that decides `reduce`: assignability
+    // gives an object literal an *implicit* index signature (`const r:
+    // Record<string, true> = {}` is legal), so `{}` — the covariant
+    // candidate the seed argument contributes — came back assignable to the
+    // callback accumulator's declared `Record<string, true>` and the
+    // covariant inference was kept. tsc runs this test under the SUBTYPE
+    // relation, where `getImplicitIndexInfoOfType` does not apply, so `{}`
+    // is not a subtype of `Record<string, true>` and the CONTRAVARIANT
+    // candidate — the annotated accumulator — wins, which is the whole
+    // point of keeping the two candidate sets apart.
+    //
+    // `arr.reduce((acc: Record<string, true>, e) => …, {})` inferred `{}`
+    // for the accumulator; every later read of the result was then an
+    // implicit-any element access (TS7053).
+    const ra = try c.resolveStructural(a);
+    inline for (.{ types.Store.objectStringIndex, types.Store.objectNumberIndex }) |idx| {
+        if (idx(&c.ts, rb) != 0) {
+            if (c.ts.kind(ra) != .object) return false;
+            if (idx(&c.ts, ra) == 0) return false;
+        }
+    }
     return true;
 }
 
