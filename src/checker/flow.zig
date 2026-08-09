@@ -2257,6 +2257,18 @@ pub fn narrowExcludeValue(c: *Checker, t: TypeId, v: TypeId) Error!TypeId {
     }
     const mt = try c.ts.regularLiteral(t);
     if (mt == v) return types.never_type;
+    // Under strictNullChecks tsc narrows `unknown` as if it were
+    // `undefined | null | {}` (`unknownUnionType`) and re-spells the FULL
+    // union `unknown` afterwards, so subtracting one nullish arm leaves the
+    // other two. `if (e !== null && e !== undefined)` on an `unknown` ends at
+    // `{}`, which carries `Object`'s apparent members.
+    if (c.ts.kind(mt) == .unknown) {
+        switch (c.ts.kind(v)) {
+            .null => return try c.ts.makeUnion(c.scratch(), &.{ types.undefined_type, types.empty_object_type }),
+            .undefined => return try c.ts.makeUnion(c.scratch(), &.{ types.null_type, types.empty_object_type }),
+            else => {},
+        }
+    }
     // A DEFERRED conditional or indexed access is not a union, so none of
     // the arms here can subtract the nullish constituent hiding inside it,
     // and `x !== undefined` left the type exactly as it found it. tsc's

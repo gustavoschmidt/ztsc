@@ -748,6 +748,10 @@ fn nonNullableInner(c: *Checker, t: TypeId, drop_void: bool) Error!TypeId {
 }
 
 fn nonNullableScalar(c: *Checker, t: TypeId) Error!TypeId {
+    // Under strictNullChecks tsc narrows `unknown` as if it were
+    // `undefined | null | {}` (`unknownUnionType`), so stripping the nullish
+    // arms leaves `{}` — `getNonNullableType(unknown)` is `{}`.
+    if (c.ts.kind(t) == .unknown) return types.empty_object_type;
     // A bare type parameter whose constraint may be nullish becomes `T & {}`
     // (tsc's `getNonNullableType` / `NonNullable<T>`). The `& {}` marker
     // keeps the value assignable back to a `T` slot while exposing the
@@ -882,6 +886,13 @@ pub fn getTruthyPart(c: *Checker, t: TypeId) Error!TypeId {
     return switch (s.kind(t)) {
         .null, .undefined, .void, .bool_false => types.never_type,
         .boolean => types.true_type,
+        // Under strictNullChecks tsc narrows `unknown` as if it were
+        // `undefined | null | {}` (`unknownUnionType`) and re-spells the full
+        // union `unknown` afterwards, so a guard that removes the nullish
+        // arms leaves `{}` — which carries `Object`'s apparent members.
+        // `if (!e) return; e.toString()` on an `unknown` catch value is the
+        // idiom that needs it.
+        .unknown => types.empty_object_type,
         // A truthy naked type parameter is `T & {}` — tsc's
         // `getAdjustedTypeWithFacts` maps the `Truthy` facts over the type
         // and replaces any constituent that can be nullish with
