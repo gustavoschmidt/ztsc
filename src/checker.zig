@@ -2057,10 +2057,35 @@ pub const Checker = struct {
         for (prog.files, 0..) |*pf, i| fbase[i + 1] = fbase[i] + @as(u32, @intCast(pf.bind.flow_tags.len));
         c.flow_base = fbase;
         c.cur_flow_base = fbase[first];
-        // Global node-id bases (see `node_base`).
+        // Global node-id bases (see `node_base`). Summed in PATH order, not in
+        // file-id order: a file id is handed out by the root-list walk and the
+        // module BFS under it, so a prefix sum over ids is a property of the
+        // order the roots happened to be listed in. The ids these bases build
+        // are printed (`uniqueSymAtom` renders `__@u<id>`), and social-app
+        // printed `__@u565602` under `--file-order=source` and `__@u842254`
+        // under `reverse` for the same property — the same defect the doc
+        // comment on `uniqueSymType` records against a mint-order counter, one
+        // level down. Sorting by path keeps the map exact (a permutation of the
+        // same prefix sums, so no two declarations can collide) while making it
+        // a property of the file SET.
         const nbase = try arena_alloc.alloc(u32, prog.files.len + 1);
-        nbase[0] = 0;
-        for (prog.files, 0..) |*pf, i| nbase[i + 1] = nbase[i] + @as(u32, @intCast(pf.tree.nodes.len));
+        {
+            const order = try arena_alloc.alloc(u32, prog.files.len);
+            for (order, 0..) |*o, i| o.* = @intCast(i);
+            const Lt = struct {
+                files: []const modules.ProgFile,
+                fn lt(ctx: @This(), a: u32, b: u32) bool {
+                    return std.mem.order(u8, ctx.files[a].path, ctx.files[b].path) == .lt;
+                }
+            };
+            std.mem.sortUnstable(u32, order, Lt{ .files = prog.files }, Lt.lt);
+            var acc: u32 = 0;
+            for (order) |f| {
+                nbase[f] = acc;
+                acc += @intCast(prog.files[f].tree.nodes.len);
+            }
+            nbase[prog.files.len] = acc;
+        }
         c.node_base = nbase;
         // Owner node -> primary scope map is filled lazily per file by
         // `faultScopes`; only the per-file "already faulted" flags are set up

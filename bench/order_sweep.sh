@@ -33,9 +33,14 @@
 # in the opposite order produced diagnostics that the forward order did not.
 # `--file-order` (src/main.zig) is the knob; this script is the sweep over it.
 #
-# What is compared: the set of (file, line, column, code) keys, exactly as
-# bench/convergence.sh compares them, so a key that moves reads the same way
-# in both reports. Message text is deliberately excluded.
+# What is compared, in two passes. First the set of (file, line, column, code)
+# keys, exactly as bench/convergence.sh compares them, so a key that moves
+# reads the same way in both reports. Then — only once the keys agree, or every
+# text diff would just be the moving key again — the full MESSAGE TEXT, sorted.
+# That second pass is not redundant: convergence.sh drops the text because
+# ztsc's wording diverges from tsgo's deliberately, but this gate compares ztsc
+# against itself, where `src/checker.zig:15` promises byte-identical output, and
+# a printed type can name something by a file id while the keys stay put.
 #
 # One caveat worth stating, because it is a real exception rather than a
 # tolerance: a program with DUPLICATE global declarations may legitimately
@@ -122,6 +127,21 @@ keys() {
         | sort -u
 }
 
+# lines <ztsc-stdout>: the same diagnostics with their MESSAGE TEXT kept, sorted
+# so the emission order (which follows the file order, legitimately) does not
+# count as a difference. Unlike bench/convergence.sh — which drops the text
+# because ztsc's wording diverges from tsgo's on purpose — this comparison is
+# ztsc against ITSELF, where the text must be identical too. It catches a class
+# the key comparison cannot see: `src/checker.zig:15` promises byte-identical
+# merged output, and a message can name a type whose PRINTED form is derived
+# from a file id. That is not hypothetical — `__@u<id>` unique-symbol member
+# names were file-id-derived, so social-app printed `__@u565602` under
+# `--file-order=source` and `__@u842254` under `reverse` for the same property,
+# with the keys identical and every gate silent.
+lines() {
+    sed -E "s|$CHECKOUT/||g" "$1" | grep ': error TS' | sort
+}
+
 # A filename-safe tag for an order spelling (`shuffle=2` -> `shuffle_2`).
 tag() { echo "${1//=/_}"; }
 
@@ -141,6 +161,7 @@ for n in $CHECKERS; do
             note_fail "c$n $o: truncated output — no 'ztsc: loaded' summary line"
         fi
         keys "$out" >"$TMP/keys.c$n.$t"
+        lines "$out" >"$TMP/lines.c$n.$t"
         printf '  %-12s %s diagnostic(s)\n' "$o" "$(grep -c ': error TS' "$out" || true)"
     done
 
@@ -173,6 +194,32 @@ for n in $CHECKERS; do
         echo "    every listed order reproduces it at THIS checker count, so the"
         echo "    repro needs no partition — bisect the root list down by hand and"
         echo "    compare the two orders of the surviving pair."
+    fi
+
+    # The text comparison, over the orders whose KEY sets already agree. Run
+    # separately because a moving key would make every text diff noise; when
+    # the keys agree, any remaining line difference is a printed type whose
+    # spelling depends on the order.
+    if [ "$n_vol" -eq 0 ]; then
+        ref="$TMP/lines.c$n.${tags[0]}"
+        text_moved=0
+        for t in "${tags[@]:1}"; do
+            cmp -s "$ref" "$TMP/lines.c$n.$t" || text_moved=$((text_moved + 1))
+        done
+        if [ "$text_moved" -ne 0 ]; then
+            note_fail "same diagnostics, different MESSAGE TEXT under $text_moved order(s)."
+            echo "    ${tags[0]} vs the first differing order (first 4 lines):"
+            for t in "${tags[@]:1}"; do
+                if ! cmp -s "$ref" "$TMP/lines.c$n.$t"; then
+                    diff "$ref" "$TMP/lines.c$n.$t" | head -4 | cut -c1-160 | sed 's/^/      /'
+                    break
+                fi
+            done
+            echo "    A printed type is naming something by a FILE ID. See the"
+            echo "    \`lines\` helper's comment for the one this check was built on."
+        else
+            echo "  message text identical across all orders"
+        fi
     fi
     echo
 done
