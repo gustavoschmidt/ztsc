@@ -1984,12 +1984,33 @@ pub const Store = struct {
         return false;
     }
 
-    /// Whether two types denote provably DIFFERENT single values.
+    /// Whether two types denote provably DISJOINT sets of single values.
+    ///
+    /// Each side is a unit type or a union of them — the shape a discriminant
+    /// has — and the answer is "no value satisfies both". `"c"` against
+    /// `"a" | "b"` is disjoint, which is what tsc's `getIntersectionType`
+    /// answers by distributing (`"c" & "a" | "c" & "b"` = `never`); a side with
+    /// any non-unit member is not provably anything and the pair is kept.
+    ///
+    /// The `A & { tag: "x" | "y" }` narrowing of a discriminated union is where
+    /// the union form appears: `SavedFeedItem & { type: "feed" | "list" }`
+    /// distributes over `SavedFeedItem`, and without this the `{ type:
+    /// "timeline"; view: undefined }` product survived — so `view` kept its
+    /// `undefined` constituent through every discriminant narrowing and each
+    /// use of it was a spurious TS18048.
     fn unitTypesDisjoint(s: *const Store, a: TypeId, b: TypeId) bool {
         if (a == b) return false;
-        const ka = unitKey(s, a) orelse return false;
-        const kb = unitKey(s, b) orelse return false;
-        return !std.mem.eql(u32, &ka, &kb);
+        const ams: []const TypeId = if (s.kind(a) == .union_type) s.members(a) else &.{a};
+        const bms: []const TypeId = if (s.kind(b) == .union_type) s.members(b) else &.{b};
+        if (ams.len == 0 or bms.len == 0) return false;
+        for (ams) |am| {
+            const ka = unitKey(s, am) orelse return false;
+            for (bms) |bm| {
+                const kb = unitKey(s, bm) orelse return false;
+                if (std.mem.eql(u32, &ka, &kb)) return false;
+            }
+        }
+        return true;
     }
 
     /// tsc's `getReducedType` / `isDiscriminantWithNeverType`: an intersection
