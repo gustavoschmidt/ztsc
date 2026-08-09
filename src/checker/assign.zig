@@ -2340,15 +2340,28 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
         // was rejected against the union of its repository class values.
         //
         // `classConstructType` is exactly that materialization and already
-        // exists for `InstanceType<T>`-style pattern matching. A
-        // `.class_value` SOURCE is deliberately left on the nominal path:
-        // making two class values structurally interchangeable is a much
-        // larger change than this divergence asks for, and every case that
-        // reaches here with one is already answered by the identity fast path
-        // or by the heritage walk above.
+        // exists for `InstanceType<T>`-style pattern matching.
+        //
+        // A `.class_value` SOURCE materializes too, and it has to: the
+        // identity fast path answers only the SAME symbol, and the heritage
+        // walk above relates INSTANCE sides (`Sub` → `Base`), never static
+        // ones — so `typeof Sub` was not assignable to `typeof Base` for any
+        // pair of distinct classes, not even `class Sub extends Base {}`. On
+        // react-native-reanimated that is the whole TS2684 family: every
+        // `FadeIn.duration(90)` calls `static duration<T extends typeof
+        // BaseAnimationBuilder>(this: T, …)`, and with the receiver rejected
+        // against the constraint, `T` fell back to the constraint itself and
+        // the `this` check reported the fallback.
+        //
+        // Materializing both sides is what tsc does, and it is not the
+        // nominal shortcut a subclass rule would be: a derived class whose
+        // constructor demands MORE arguments than the base's is genuinely not
+        // assignable to the base's static side, and a structural comparison
+        // still says so.
         .class_value => {
-            if (sk == .class_value) return false;
-            return c.structuralAssignable(s, try c.classConstructType(c.ts.classSymbol(t)));
+            const tgt_static = try c.classConstructType(c.ts.classSymbol(t));
+            if (sk != .class_value) return c.structuralAssignable(s, tgt_static);
+            return c.structuralAssignable(try c.classConstructType(c.ts.classSymbol(s)), tgt_static);
         },
         else => return false,
     }
@@ -4680,14 +4693,17 @@ pub fn callbackParamsCompatible(c: *Checker, s: TypeId, t: TypeId) Error!bool {
 /// (in place of TS2684): TS7 surfaces this specific error where tsc 5.5
 /// emitted the wrapper code.
 pub fn tryReportMissingProps(c: *Checker, src_t: TypeId, target: TypeId, span: Span) Error!bool {
-    const rs = try c.resolveStructural(src_t);
+    var rs = try c.resolveStructural(src_t);
     // A class value's static side is the same object the relation compares
     // against (see the `.class_value` arm of `isAssignableInner`), so a
-    // missing STATIC reports the same specific code a missing property does.
-    const rt = if (c.ts.kind(target) == .class_value and c.ts.kind(rs) != .class_value)
-        try c.classConstructType(c.ts.classSymbol(target))
-    else
-        try c.resolveStructural(target);
+    // missing STATIC reports the same specific code a missing property does —
+    // on EITHER side, since that arm materializes both. `const m: typeof Mid =
+    // Base` is TS2741 on `extraStatic`, not the TS2322 wrapper.
+    var rt = try c.resolveStructural(target);
+    if (c.ts.kind(target) == .class_value) {
+        rt = try c.classConstructType(c.ts.classSymbol(target));
+        if (c.ts.kind(rs) == .class_value) rs = try c.classConstructType(c.ts.classSymbol(rs));
+    }
     if (!isSourceObjecty(c.ts.kind(rs)) or c.ts.kind(rt) != .object) return false;
     var missing: std.ArrayList(Atom) = .empty;
     defer missing.deinit(c.scratch());

@@ -39,3 +39,23 @@ export async function bad() {
   const badArg = h.run("no");
   return [wrong, missing, badArg];
 }
+
+// A no-substitution TEMPLATE literal is a literal specifier too: tsc resolves
+// it exactly like the quoted form, so the module is a program dependency and
+// the `.then` callback still gets a contextual signature. Written with
+// backticks it parses to a different AST node, which is the whole point.
+export const viaTemplate = import(`./dyn`).then((m) => m.value);
+
+export async function viaTemplateAwait() {
+  const m = await import(`./dyn`);
+  const a: number = m.value;
+  return a;
+}
+
+// Negative controls on the template form.
+export async function badTemplate() {
+  const m = await import(`./dyn`);
+  const wrong: string = m.value;
+  const missing = m.nope;
+  return [wrong, missing];
+}

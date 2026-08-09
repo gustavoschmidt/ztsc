@@ -3564,17 +3564,19 @@ const Parser = struct {
                 return p.unsupportedFrom(start);
             },
             .keyword_infer => {
-                // `infer V`: a binder introduced in a conditional
-                // type's extends clause. A trailing `extends` constraint
-                // (`infer V extends C`) is out of subset — consume the
-                // constraint so the surrounding conditional still parses.
+                // `infer V`: a binder introduced in a conditional type's
+                // extends clause, optionally with a TS 4.8 constraint
+                // (`infer V extends C`) — kept, because it decides the
+                // conditional: an inference that does not satisfy `C` takes
+                // the FALSE branch.
                 const kw = try p.bump();
                 const name = try p.expectIdentLike();
+                var constraint: Node = null_node;
                 if (p.curTag() == .keyword_extends and !p.nlBefore()) {
                     _ = try p.bump();
-                    _ = try p.parseNonConditionalType();
+                    constraint = try p.parseNonConditionalType();
                 }
-                return p.addNode(.{ .tag = .infer_type, .main_token = kw, .data = .{ .lhs = name, .rhs = 0 } });
+                return p.addNode(.{ .tag = .infer_type, .main_token = kw, .data = .{ .lhs = name, .rhs = constraint } });
             },
             else => return p.parsePostfixType(),
         }

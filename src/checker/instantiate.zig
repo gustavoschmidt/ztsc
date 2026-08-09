@@ -1456,10 +1456,16 @@ pub fn classInstanceGeneric(c: *Checker, sym: SymbolId) Error!TypeId {
         if (c.baseRefProvisional(base_ref)) provisional = true;
     } else if (try c.baseExprConstructType(sym)) |base_ctor| {
         // `extends <value with construct signatures>`: the base instance is
-        // the construct signature's return type.
-        const inst = c.ts.objectConstructSig(base_ctor, 0);
-        const ret = c.ts.fnReturn(inst);
-        result = try c.mergeBaseObject(result, try c.resolveStructural(ret), false);
+        // the construct signature's return type — and when the base is an
+        // INTERSECTION of constructors (every mixin, including react-native's
+        // `Constructor<NativeMethods> & typeof ViewComponent`) it is the
+        // intersection of ALL of their returns, not just the first's.
+        // Overloads of one constructor all return the same instance, so this
+        // is a no-op for the single-base case.
+        for (0..c.ts.objectConstructSigCount(base_ctor)) |i| {
+            const ret = c.ts.fnReturn(c.ts.objectConstructSig(base_ctor, @intCast(i)));
+            result = try c.mergeBaseObject(result, try c.resolveStructural(ret), false);
+        }
     }
     // Cross-file `declare module` augmentation: an `interface Map`
     // block in another package folds its members into the resolved class's
@@ -1850,11 +1856,81 @@ pub fn baseExprConstructType(c: *Checker, sym: SymbolId) Error!?TypeId {
         if (try c.classBaseEntitySym(hd.lhs)) |bs| {
             if (c.symFlags(bs).class) return null;
         }
-        const bt = try c.resolveStructural(try c.checkExprCached(hd.lhs, types.no_type));
+        const bt = try baseCtorObject(c, try c.checkExprCached(hd.lhs, types.no_type));
         if (c.ts.kind(bt) == .object and c.ts.objectConstructSigCount(bt) > 0) return bt;
         return null;
     }
     return null;
+}
+
+/// The base expression's type as ONE structural constructor object.
+///
+/// A plain `{ new (…): R }` value resolves straight through, and that is all
+/// this used to accept. Two other shapes carry construct signatures and were
+/// silently dropped, taking the whole base with them:
+///
+///   * a `.class_value` (`declare const B: typeof C; class D extends B {}`),
+///     ztsc's nominal shortcut for a static side — `classConstructType` is
+///     the materialization of exactly that; and
+///   * an INTERSECTION of constructors, which is how every mixin is spelled.
+///     react-native writes each host component that way —
+///     `declare const ViewBase: Constructor<NativeMethods> & typeof
+///     ViewComponent; export class View extends ViewBase {}` — so `View`,
+///     `Text`, `ScrollView` and every sibling inherited neither `props` nor
+///     `NativeMethods`. A collapsed props type strips the contextual type off
+///     every JSX callback attribute on those components (`onLayout={e => …}`,
+///     `onScroll={e => …}`), and the missing methods are the TS2339 on
+///     `ref.current?.measure(…)` plus TS7006 on each of its parameters.
+///
+/// Members merge in written order and every constituent's construct
+/// signatures are kept, so the caller can intersect their return types into
+/// the base instance.
+fn baseCtorObject(c: *Checker, base0: TypeId) Error!TypeId {
+    const s = &c.ts;
+    const base = if (s.kind(base0) == .class_value)
+        try c.classConstructType(s.classSymbol(base0))
+    else
+        try c.resolveStructural(base0);
+    if (s.kind(base) != .intersection) return base;
+    var props: std.ArrayList(types.Prop) = .empty;
+    defer props.deinit(c.scratch());
+    var ctors: std.ArrayList(TypeId) = .empty;
+    defer ctors.deinit(c.scratch());
+    var calls: std.ArrayList(TypeId) = .empty;
+    defer calls.deinit(c.scratch());
+    var sidx: TypeId = 0;
+    var nidx: TypeId = 0;
+    for (try c.memberList(base)) |m0| {
+        const m = if (s.kind(m0) == .class_value)
+            try c.classConstructType(s.classSymbol(m0))
+        else
+            try c.resolveStructural(m0);
+        if (s.kind(m) != .object) continue;
+        for (0..s.objectPropCount(m)) |i| {
+            const p = s.objectProp(m, @intCast(i));
+            // Written order wins on a name collision, matching how tsc reads
+            // an intersection's property (the first constituent that has it).
+            var seen = false;
+            for (props.items) |q| {
+                if (q.name == p.name) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) try props.append(c.scratch(), p);
+        }
+        for (0..s.objectConstructSigCount(m)) |i| try ctors.append(c.scratch(), s.objectConstructSig(m, @intCast(i)));
+        for (0..s.objectCallSigCount(m)) |i| try calls.append(c.scratch(), s.objectCallSig(m, @intCast(i)));
+        if (sidx == 0) sidx = s.objectStringIndex(m);
+        if (nidx == 0) nidx = s.objectNumberIndex(m);
+    }
+    if (ctors.items.len == 0) return base;
+    std.mem.sort(types.Prop, props.items, {}, struct {
+        fn lt(_: void, a: types.Prop, b: types.Prop) bool {
+            return a.name < b.name;
+        }
+    }.lt);
+    return s.makeObjectSigs(props.items, sidx, nidx, 0, calls.items, ctors.items);
 }
 
 /// The declaration symbol behind an import target: a direct binding, or —

@@ -975,6 +975,11 @@ pub fn ctorSignatures(c: *Checker, sym: SymbolId, out: *std.ArrayList(TypeId)) E
 pub const TpMap = struct { sym: SymbolId, ty: TypeId };
 pub const InferKey = struct { cond: u64, name: Atom };
 
+/// A TS 4.8 `infer V extends C` binder: the written constraint plus the
+/// binder's name, which is needed to rebuild the `infer_var` reference the
+/// desugar puts in the check position. See `Checker.infer_constraints`.
+pub const InferConstraint = struct { ty: TypeId, name: Atom };
+
 /// Whether a higher-order signature is safe to instantiate-and-keep.
 /// The rewrite substitutes the sig body and mints fresh symbols for own
 /// params whose bounds move under the map. It is sound only when every own

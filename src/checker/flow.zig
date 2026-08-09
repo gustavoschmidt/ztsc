@@ -1524,18 +1524,44 @@ pub fn narrowByCondition(c: *Checker, t: TypeId, cond: Node, sense: bool, key: R
                 // binder. `const g = isImg(e) && files[e.fileId]; if (g) …`
                 // is the shape that needs it. The other polarity of each
                 // operator says nothing about either operand.
+                // The OTHER polarity of each operator is not silent either,
+                // it is a union of the two ways the operator can land
+                // (tsc `narrowTypeByBinaryExpression`): `a || b` true means
+                // "a true, OR a false and b true", and `a && b` false means
+                // "a false, OR a true and b false". `const terminal =
+                // s?.status === 'x' || s?.status === 'y'; if (terminal) s.n`
+                // needs it — each arm alone removes `undefined` from `s`, so
+                // their union does too, while returning `t` here keeps it.
                 .amp_amp => {
-                    if (!sense) return t;
-                    return c.narrowByCondition(try c.narrowByCondition(t, d.lhs, true, key, decl), d.rhs, true, key, decl);
+                    const lt = try c.narrowByCondition(t, d.lhs, true, key, decl);
+                    if (sense) return c.narrowByCondition(lt, d.rhs, true, key, decl);
+                    return c.makeUnion2(
+                        try c.narrowByCondition(t, d.lhs, false, key, decl),
+                        try c.narrowByCondition(lt, d.rhs, false, key, decl),
+                    );
                 },
                 .pipe_pipe => {
-                    if (sense) return t;
-                    return c.narrowByCondition(try c.narrowByCondition(t, d.lhs, false, key, decl), d.rhs, false, key, decl);
+                    const lf = try c.narrowByCondition(t, d.lhs, false, key, decl);
+                    if (!sense) return c.narrowByCondition(lf, d.rhs, false, key, decl);
+                    return c.makeUnion2(
+                        try c.narrowByCondition(t, d.lhs, true, key, decl),
+                        try c.narrowByCondition(lf, d.rhs, true, key, decl),
+                    );
                 },
                 else => return t,
             }
         },
-        .prefix_unary => return t, // `!` was decomposed by the binder
+        // A condition written directly in an `if` never reaches here — the
+        // binder decomposes `!` into separate flow nodes — but an *aliased*
+        // condition does, because `constAliasInit` hands the alias's
+        // initializer straight to this narrower, bypassing the binder. Exactly
+        // the reason the `&&` / `||` arms above exist, and `const isActive =
+        // !!v; if (!isActive) return;` is the shape that needs it. Only `!`
+        // says anything about its operand; `-`/`~`/`+`/`typeof`/`void` do not.
+        .prefix_unary => {
+            if (c.tree.tokens.tag(c.tree.nodeMainToken(cond)) != .bang) return t;
+            return c.narrowByCondition(t, d.lhs, !sense, key, decl);
+        },
         .call_expr, .call_expr_targs, .optional_call => {
             // A truthy optional-*call* chain (`if (a?.m())`, or the
             // fall-through of `if (!a?.m()) return`) implies its receivers
@@ -2706,6 +2732,19 @@ pub fn symExplicitlyTyped(c: *Checker, sym: SymbolId) bool {
     return annotated;
 }
 
+/// Does `sym` denote a NAMESPACE VALUE — a `namespace`/`module` declaration,
+/// or an import binding that names a whole module (`import * as NS from "m"`,
+/// and the re-exported `export * as NS` form)? tsc's `SymbolFlags.ValueModule`
+/// after alias resolution; see the call site for why it is resolved outright.
+fn symIsNamespaceValue(c: *Checker, sym: SymbolId) bool {
+    const f = c.symFlags(sym);
+    if (f.type_only) return false;
+    if (f.namespace_decl) return true;
+    if (!f.import_binding) return false;
+    const tgt = c.importTarget(sym) orelse return false;
+    return tgt.kind == .namespace or tgt.kind == .ambient_ns;
+}
+
 pub fn declaredPathTypeInner(c: *Checker, node: Node) Error!TypeId {
     switch (c.nodeTag(node)) {
         .paren_expr => return c.declaredPathTypeInner(c.tree.nodeData(node).lhs),
@@ -2737,6 +2776,21 @@ pub fn declaredPathTypeInner(c: *Checker, node: Node) Error!TypeId {
                     // `--checkers=4`, because the lib's `declare var
                     // Array: ArrayConstructor` was still cold in the
                     // checker that owned the file.
+                    // tsc's `getExplicitTypeOfSymbol` resolves a ValueModule
+                    // outright, and so must this: a namespace object's type
+                    // is a fact of the module graph, not an inference over a
+                    // body, so reading it neither depends on nor disturbs any
+                    // narrowing state — which is what the rule above guards.
+                    //
+                    // Without it the receiver of `NS.isFoo(x)` answered "no
+                    // information" whenever this checker had not already
+                    // materialized the namespace import, so the guard was
+                    // dropped and nothing narrowed — order-dependently, since
+                    // an already-`.computed` symbol short-circuits above.
+                    // Every @atproto/api guard on social-app is written that
+                    // way (`ChatBskyConvoDefs.isGroupConvo(prev.kind)`,
+                    // `AppBskyEmbedRecord.isView(embed)`).
+                    if (symIsNamespaceValue(c, sym)) break :blk try c.typeOfSymbol(sym);
                     if (!c.symExplicitlyTyped(sym)) break :blk types.no_type;
                     break :blk try c.typeOfSymbol(sym);
                 },

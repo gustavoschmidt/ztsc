@@ -106,8 +106,14 @@ pub fn callShape(c: *Checker, node: Node) CallShape {
 pub fn importCallType(c: *Checker, arg_nodes: []const Node) Error!TypeId {
     if (arg_nodes.len == 0) return types.any_type;
     const spec_node = arg_nodes[0];
-    if (c.nodeTag(spec_node) != .string_literal) return types.any_type;
-    const spec = try c.memberAtom(c.tree.nodeMainToken(spec_node));
+    // A no-substitution template literal is a literal specifier too, and the
+    // binder registers it as a dependency (`bindDynamicImport`); `memberAtom`
+    // only strips quotes, so the backticked form needs `templateAtom`.
+    const spec = switch (c.nodeTag(spec_node)) {
+        .string_literal => try c.memberAtom(c.tree.nodeMainToken(spec_node)),
+        .template_literal => try c.templateAtom(c.tree.nodeMainToken(spec_node)),
+        else => return types.any_type,
+    };
     var m: ModuleRef = blk: {
         if (c.prog.files.len != 0) {
             if (c.prog.files[c.cur_file].specs.get(spec)) |mfile| break :blk .{ .file = mfile };

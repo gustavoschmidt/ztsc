@@ -78,6 +78,15 @@ pub fn inferVarFromNode(c: *Checker, node: Node) Error!TypeId {
     // An `infer V` binder belongs to the immediately-enclosing conditional
     // (top of the scope stack) — its extends clause is where it is declared.
     const id = try c.inferVarId(c.infer_scopes.items[c.infer_scopes.items.len - 1], name);
+    // TS 4.8 `infer V extends C`. Recorded rather than baked into the type —
+    // the binder's identity is (conditional, name) and a two-word `infer_var`
+    // has no room for a third payload — and consumed by
+    // `conditionalTypeFromNode`, which turns it into an ordinary conditional.
+    const cn = c.tree.nodeData(node).rhs;
+    if (cn != null_node) {
+        const ct = try c.typeFromTypeNode(cn);
+        try c.infer_constraints.put(c.cm(), id, .{ .ty = ct, .name = name });
+    }
     return c.ts.makeInferVar(id, name, false);
 }
 
@@ -98,10 +107,11 @@ pub fn conditionalTypeFromNode(c: *Checker, node: Node) Error!TypeId {
     // "can this key index that object" check stays quiet inside it — see
     // `Checker.cond_true_depth`.
     c.cond_true_depth += 1;
-    const true_ty = try c.typeFromTypeNode(e.true_type);
+    const true_ty0 = try c.typeFromTypeNode(e.true_type);
     c.cond_true_depth -= 1;
     _ = c.infer_scopes.pop();
     const false_ty = try c.typeFromTypeNode(e.false_type);
+    const true_ty = try constrainInferBinders(c, extends_ty, true_ty0, false_ty);
     // Distributivity is a property of a *naked type-parameter* check. A
     // naked `infer` var (e.g. `F extends (...)=>any` inside Awaited, where
     // F is captured by an enclosing conditional) behaves the same way: once
@@ -458,6 +468,49 @@ pub fn planConcreteConditional(c: *Checker, chk: TypeId, extends_ty: TypeId) Err
         return .{ .take_true = .{ .ids = ids.items, .vals = vals } };
     }
     return .take_false; // infer binders are out of scope in the false branch
+}
+
+/// TS 4.8 constrained `infer`: a binder written `infer V extends C` only
+/// matches when the value inferred for it satisfies `C`; otherwise the whole
+/// conditional resolves to its FALSE branch.
+///
+/// Expressed as a rewrite of the true branch rather than as a check at
+/// reduction time, because a check there cannot SUBSTITUTE the constraint.
+/// atproto's `$TypedObject<V, Id, Hash>` is the case that forces it:
+///
+///     V extends { $type?: infer T extends $Type<Id, Hash> } ? V & { $type: T } : never
+///
+/// The binder is declared once, while `Id`/`Hash` are still the alias's own
+/// type parameters, so a stored constraint is the generic `$Type<Id, Hash>`
+/// and says nothing until the use site supplies the lexicon id. Written into
+/// the branch as `T extends $Type<Id, Hash> ? True : False`, the ordinary
+/// `instantiateId` substitutes it along with everything else, the inner
+/// conditional stays deferred while `T` is unbound (`planConditional`'s
+/// `.infer_var` fast path) and reduces the moment `substInfer` binds it.
+///
+/// This is what discriminates `chat.bsky.group.defs#joinLinkPreviewView` from
+/// every sibling lexicon type; without it `isJoinLinkPreviewView(x)` and every
+/// other generated atproto predicate narrowed to the union it started from.
+///
+/// Nests innermost-last so several constrained binders in one extends clause
+/// all have to hold; returns `true_ty` untouched — the overwhelmingly common
+/// case — when this conditional declares none.
+fn constrainInferBinders(c: *Checker, extends_ty: TypeId, true_ty: TypeId, false_ty: TypeId) Error!TypeId {
+    if (c.infer_constraints.count() == 0) return true_ty;
+    var ids: std.ArrayList(u32) = .empty;
+    defer ids.deinit(c.scratch());
+    var refs: std.ArrayList(u32) = .empty;
+    defer refs.deinit(c.scratch());
+    try c.collectInferVars(extends_ty, &ids, &refs);
+    var out = true_ty;
+    for (ids.items) |id| {
+        const cons = c.infer_constraints.get(id) orelse continue;
+        // Not distributive: the constraint judges the type inferred for the
+        // binder as a whole, it does not split a union inference into the
+        // members that pass and the members that fail.
+        out = try c.ts.makeConditional(try c.ts.makeInferVar(id, cons.name, true), cons.ty, out, false_ty, false);
+    }
+    return out;
 }
 
 /// Decidability rule for a check against an array pattern whose element is
