@@ -2354,6 +2354,17 @@ pub fn narrowByTypeofResolved(c: *Checker, t: TypeId, which: usize, sense: bool)
         var parts: std.ArrayList(TypeId) = .empty;
         defer parts.deinit(c.scratch());
         for (try c.memberList(t)) |m| {
+            // A constituent that is itself an ALIAS for a union — React's
+            // `ReactNode` inferred into a naked type variable is the case —
+            // has to be seen through, or the whole alias answers "not a
+            // string" and the `typeof child === 'string'` branch is `never`.
+            // tsc's unions are always flattened; ztsc's can hold a reference.
+            const rm = try c.resolveStructural(m);
+            if (rm != m and c.ts.kind(rm) == .union_type) {
+                const nm = try narrowByTypeofResolved(c, rm, which, sense);
+                if (nm != types.never_type) try parts.append(c.scratch(), nm);
+                continue;
+            }
             const keep = try c.typeofMatchesFn(m, which);
             const kept = if (sense) keep else !keep;
             if (kept) try parts.append(c.scratch(), m);
