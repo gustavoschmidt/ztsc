@@ -3449,6 +3449,7 @@ pub const Checker = struct {
     pub const eachEnumMember = enums_zig.eachEnumMember;
     pub const enumHasMemberNamed = enums_zig.enumHasMemberNamed;
     pub const enumMemberValue = enums_zig.enumMemberValue;
+    pub const enumMembersOf = enums_zig.enumMembersOf;
     pub const enumMemberTypeUnion = enums_zig.enumMemberTypeUnion;
     pub const enumMemberForValue = enums_zig.enumMemberForValue;
     pub const enumHasStringMember = enums_zig.enumHasStringMember;
