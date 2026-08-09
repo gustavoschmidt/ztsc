@@ -204,6 +204,7 @@ pub fn refExpandsToObject(c: *Checker, t: TypeId) bool {
 pub fn expandRef(c: *Checker, ref: TypeId) Error!TypeId {
     if (c.expansions.get(ref)) |t| {
         if (t == types.no_type) return types.error_type; // cycle
+        if (c.prof.on) prof_zig.noteExpandHit(c, ref);
         return t;
     }
     // A truncation already established for THIS budget window (below) is
@@ -240,7 +241,18 @@ pub fn expandRef(c: *Checker, ref: TypeId) Error!TypeId {
     } else prof_zig.DeclWin{};
     defer prof_zig.declExit(c, dwin);
     const prof_before = c.inst_total;
-    defer if (c.prof.on) prof_zig.noteExpand(c, sym, c.inst_total - prof_before);
+    // Self-cost bookkeeping: this frame's children charge into
+    // `expand_child_visits`, which is zeroed on entry and folded back into the
+    // parent's on exit (see `InstProf.expand_child_visits`).
+    const child_before = c.prof.expand_child_visits;
+    if (c.prof.on) c.prof.expand_child_visits = 0;
+    defer if (c.prof.on) {
+        const incl = c.inst_total - prof_before;
+        prof_zig.noteExpand(c, sym, incl);
+        prof_zig.noteExpandBuild(c, ref, incl);
+        prof_zig.noteExpandSelf(c, sym, incl - @min(incl, c.prof.expand_child_visits));
+        c.prof.expand_child_visits = child_before + incl;
+    };
     const args = try c.scratch().dupe(TypeId, c.ts.refArgs(ref));
     const f = c.symFlags(sym);
     var generic: TypeId = types.any_type;
@@ -270,7 +282,17 @@ pub fn expandRef(c: *Checker, ref: TypeId) Error!TypeId {
         var map_list: std.ArrayList(TpMap) = .empty;
         defer map_list.deinit(c.scratch());
         try c.buildInstMap(sym, args, &map_list);
+        const saved_generic = c.prof.expand_generic;
+        const saved_esym = c.prof.expand_sym;
+        if (c.prof.on) {
+            c.prof.expand_generic = generic;
+            c.prof.expand_sym = sym;
+        }
         result = try c.instantiate(generic, map_list.items);
+        if (c.prof.on) {
+            c.prof.expand_generic = saved_generic;
+            c.prof.expand_sym = saved_esym;
+        }
         // Recursive-reduction of a shrinking alias (see `reexpandShrinking`):
         // `Tail<"a.b.c">` instantiates its conditional body to the bare ref
         // `Tail<"b.c">`; eagerly re-expand while the argument metric strictly

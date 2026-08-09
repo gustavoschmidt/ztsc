@@ -1724,9 +1724,15 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
         .object => blk: {
             const props = try c.scratch().alloc(types.Prop, s.objectPropCount(t));
             defer c.scratch().free(props);
+            // Per-member charging, only for the ONE table an `expandRef` frame
+            // is substituting right now (see `InstProf.expand_generic`).
+            const charge_members = c.prof.on and t == c.prof.expand_generic and t != 0;
+            const charge_sym = c.prof.expand_sym;
             for (props, 0..) |*out, i| {
                 const p = s.objectProp(t, @intCast(i));
+                const before = if (charge_members) c.inst_total else 0;
                 out.* = .{ .name = p.name, .ty = try c.instantiateId(p.ty, map, map_id), .flags = p.flags };
+                if (charge_members) prof_zig.noteMemberCost(c, charge_sym, p.name, out.ty, c.inst_total - before);
             }
             const sidx = if (s.objectStringIndex(t) != 0) try c.instantiateId(s.objectStringIndex(t), map, map_id) else 0;
             const nidx = if (s.objectNumberIndex(t) != 0) try c.instantiateId(s.objectNumberIndex(t), map, map_id) else 0;
@@ -1837,8 +1843,11 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
                 if (rewritable) {
                     const od = try c.typeParamDefault(tp);
                     const oc = try c.typeParamConstraint(tp);
+                    const bound_before = if (c.prof.on) c.inst_total else 0;
                     const nd = if (od != types.no_type) try c.instantiateId(od, cur_map.items, cur_id) else od;
                     const nc = if (oc != types.no_type) try c.instantiateId(oc, cur_map.items, cur_id) else oc;
+                    const bound_cost = if (c.prof.on) c.inst_total - bound_before else 0;
+                    if (c.prof.on) c.stats.inst_bound_visits += bound_cost;
                     // Fresh param carries the substituted *default* (so a
                     // no-arg `<AD = DispatchType>()` resolves to the supplied
                     // dispatch). Its *constraint* is enforced only when it
@@ -1854,8 +1863,18 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
                     // rides along for the literal-widening rule — see
                     // `FreshTp.widen_bound`.
                     const wb = if (fc == types.no_type and oc != types.no_type and nc != oc) nc else types.no_type;
+                    if (c.prof.on) {
+                        if (fc != types.no_type) {
+                            c.stats.inst_bound_enforced += bound_cost;
+                        } else if (wb != types.no_type) {
+                            c.stats.inst_bound_widen += bound_cost;
+                        } else if (nc == oc and nd == od) {
+                            c.stats.inst_bound_discarded += bound_cost;
+                        }
+                    }
                     if (nc != oc or nd != od) {
                         fresh = try c.mintFreshTp(tp, cur_map.items, cur_id, fc, nd, od != types.no_type, wb);
+                        if (c.prof.on and fc != types.no_type) prof_zig.noteFreshBound(c, fresh.?, bound_cost);
                     }
                 }
                 if (fresh) |fid| {

@@ -12,6 +12,7 @@ const source = @import("../frontend/source.zig");
 const libs = @import("../libs.zig");
 const modules = @import("../link/modules.zig");
 const ZeroPagedArray = @import("../zeropage.zig").ZeroPagedArray;
+const prof_zig = @import("prof.zig");
 
 const Atom = intern.Atom;
 const SymbolId = binder.SymbolId;
@@ -619,7 +620,10 @@ pub fn typeParamFallback(c: *Checker, sym: SymbolId) Error!TypeId {
 }
 
 pub fn typeParamConstraint(c: *Checker, sym: SymbolId) Error!TypeId {
-    if (c.isFreshTp(sym)) return c.freshTp(sym).constraint;
+    if (c.isFreshTp(sym)) {
+        if (c.prof.on) prof_zig.noteFreshBoundRead(c, sym);
+        return c.freshTp(sym).constraint;
+    }
     if (c.inst_cache_on) {
         if (c.tp_constraint_cache.get(sym)) |t| return t;
     }

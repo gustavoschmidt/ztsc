@@ -1639,6 +1639,137 @@
 //! repeat 80/80, crash 128/128, excalidraw 17/0/0 CONVERGED, conformance
 //! 1082 -> 1084, e2e multi flat.
 //!
+//! ## The two populations were ONE population (2026-08-09)
+//!
+//! This header's "Where immich's remaining demand is" section reads
+//! `expandRef` by symbol and splits it in two — kysely's builders (many
+//! substitutions of one memoized table) and immich's own repository classes
+//! (ONE `classInstanceGeneric` each, "at half a million to a million visits",
+//! "a different problem"). **They are the same visits counted twice.**
+//! `noteExpand` charges `c.inst_total - prof_before`, which is INCLUSIVE of
+//! every nested expansion, and a repository class's table is materialized by
+//! running each un-annotated method body through the checker — which is where
+//! the kysely builders get expanded. `-- expandRef() by symbol, SELF --`
+//! subtracts the nested frames and settles it (immich `--checkers=1`, 11.12 M
+//! total node visits):
+//!
+//!     symbol                 inclusive        self    self share
+//!     SelectQueryBuilder     4,006,468   4,005,661        100.0%
+//!     ExpressionBuilder      1,647,976   1,647,974        100.0%
+//!     UpdateQueryBuilder     1,425,511   1,425,511        100.0%
+//!     InsertQueryBuilder     1,169,018   1,159,681         99.2%
+//!     OcrRepository          1,764,607   under 26,946     < 1.6%
+//!     AssetRepository        1,172,055     104,341          8.9%
+//!     SearchRepository       1,015,925     136,509         13.4%
+//!     SharedLinkRepository     550,218      54,716          9.9%
+//!     AlbumRepository          518,239      43,291          8.4%
+//!
+//! So the answer to "why does a no-type-parameter class's table cost a million
+//! node visits" is that **it does not**. Its own cost is 40 k - 140 k; 86-99%
+//! of the charge is the kysely builder tables its method bodies force, and
+//! `--decl-profile`'s SELF TIME says the same thing from the clock side
+//! (`SelectQueryBuilder` 604.9 ms of 2044.1 ms of declaration-window time,
+//! `AssetRepository` 28.2 ms, `OcrRepository` 13.8 ms). Four kysely builder
+//! tables are **74.1% of the whole program's instantiation demand**. There is
+//! no repository-class population to attack.
+//!
+//! ### The amortization axis, measured for the first time
+//!
+//! PLAN.md's one explicitly-unmeasured question — of the 20,176 `expandRef`
+//! expansions, how many produce a table anybody reads again. `expandRef`'s
+//! memo now counts its own hits per REFERENCE:
+//!
+//!     references expanded 19,975   memo re-reads 2,805,457
+//!     re-read  0 times   5,599 (28.0% of expansions, 11.9% of their visits)
+//!     re-read  1 time    2,886 (14.4%)
+//!     re-read  2-4       2,741 (13.7%)
+//!     re-read  5-19      5,667 (28.4%)
+//!     re-read 20+        3,082 (15.4%)
+//!
+//! Amortization is real in aggregate (140 re-reads per expansion on average)
+//! and absent for a quarter of the population. `SelectQueryBuilder` builds
+//! 1,019 tables of which **365 are never read again, carrying 1,419,041 node
+//! visits** — 12.8% of the run. That is the ceiling on what any laziness could
+//! win on this symbol, against a route this header measures as a 70-key
+//! regression twice, so it is a ceiling and not a plan.
+//!
+//! ### It is NOT re-derivation, and that is measured too
+//!
+//! `-- cost of ONE member --` charges each property of a table to its NAME
+//! across every expansion of that table, and dedupes on the RESULT type. The
+//! cost is spread over the join family, uniformly per expansion
+//! (`SelectQueryBuilder.leftJoin` 401,026 visits / 1,019 substitutions = 393
+//! each, max 394), and **only 190,533 visits — 1.7% of the run — reproduce a
+//! member result some earlier expansion of the same table already computed.**
+//! The argument lists really are distinct: 1,019 `SelectQueryBuilder`
+//! expansions carry 98 distinct `DB`, 242 distinct `TB` and 487 distinct `O`.
+//! So "make the table cheaper by not rebuilding what is already interned" has
+//! ~2% in it, not 30%.
+//!
+//! ## Where 32% of immich actually goes: EAGER TYPE-PARAMETER BOUNDS
+//!
+//! `instantiateId`'s `.function` arm substitutes each of a signature's OWN
+//! type parameters' constraint and default before minting the fresh symbol
+//! that carries them. On immich:
+//!
+//!     visits spent on a signature's OWN type-param bounds: 3,925,254 (35.3%)
+//!       of which enforced 3,923,665 / widen-only 782 / discarded 82
+//!     enforced bounds minted: 120,965 costing 3,892,451 visits
+//!       NEVER READ BACK:      106,507 costing 3,571,858 visits (32.1% of run)
+//!
+//! **88% of the constraints this checker computes are never asked for.** They
+//! are expensive because a kysely bound is a mapped type over every column of
+//! every table in scope — `and<E extends Readonly<FilterObject<DB, TB>>>` is
+//! 1,319,166 visits over 176 substitutions (7,495 each, 13.2% of the whole
+//! program in ONE member of ONE interface), and `FilterObject<DB, TB>` maps
+//! over `StringReference<DB, TB>`, the union of every `table.column` string.
+//!
+//! tsc does not pay this. `instantiateTypeParameter` clones the parameter and
+//! stores the MAPPER; `getConstraintOfTypeParameter` runs the substitution on
+//! demand, so a bound no call site ever resolves costs nothing. ztsc has
+//! exactly ONE reader of a fresh parameter's bound — `typeParamConstraint`'s
+//! `isFreshTp` arm (`props.zig:622`) — which is the choke point a deferral
+//! needs, and this is the first entry in this header that is about the
+//! `.function` arm rather than about member tables, so none of the negatives
+//! above bear on it.
+//!
+//! What blocks a two-line version, precisely: the mint decision is
+//! `if (nc != oc or nd != od)`, so today the substituted bound is needed to
+//! decide whether a fresh symbol is minted at all, and minting one where none
+//! was minted changes the interned signature's identity. Three things a
+//! deferral has to supply: (1) a `map_id -> []TpMap` reverse lookup, which
+//! `canonMapId` does not keep today (it interns the packed bytes on `ca()` and
+//! returns an id, with no id-indexed list); (2) `FreshTp` fields for the
+//! unsubstituted bound and its map, with `typeParamConstraint` resolving and
+//! memoizing on first read; and (3) an EXACT and cheap replacement for the
+//! movement test — a "does this node mention any symbol this map binds" walk
+//! over the *unreduced* constraint node, which is a handful of nodes
+//! (`Readonly<FilterObject<DB, TB>>` is a ref with two type-param args) and is
+//! not the Bloom summary this header rules out, because that one was applied
+//! at every `instantiateId` node and this one runs once per mint. The measured
+//! `discarded` figure — 82 visits of 3.9 M — says the test almost always
+//! answers "moved" on this corpus, so the risk is what it does to the OTHER
+//! gated packages, not to immich.
+//!
+//! ### Two candidates from PLAN.md's lane 1, both measured DOWN
+//!
+//! * **`instantiateId` unchanged-result early-out** (estimated there at 3-5%:
+//!   the `.object`/`.union`/`.function` arms always rebuild and re-intern, so
+//!   return `t` when no child moved). Implemented for `.object`, `.union`,
+//!   `.intersection`, `.overloads`, `.array` and `.tuple` — the arms whose
+//!   rebuild is a pure re-intern, and semantically inert because an identical
+//!   rebuild interns back to `t` anyway. It fires **29,804 times against
+//!   5,907,484 memo misses, 0.5%**, node visits are byte-identical
+//!   (11,121,728 either way), and an interleaved A/B on INSTRUCTIONS RETIRED
+//!   (the contention-proof counter; three runs a side at `--checkers=4`) put
+//!   it at **100.34 G against 100.16 G, i.e. 0.2% the WRONG way** — the
+//!   per-child comparison costs more than the 0.5% of re-interns it saves.
+//!   REVERTED. The estimate was off by an order of magnitude because
+//!   `containsTypeParam` already stops the common no-op at the door.
+//! * **Sub-structure shared across the five repository classes, rebuilt per
+//!   class.** There is none to share: their SELF cost is 8-13% of their charge
+//!   (table above), so there is no per-class rebuild to hoist.
+//!
 //! The instrument in this file has now done its job three times over and the
 //! lesson each time was the same: **every remaining key was ordinary type-
 //! system surface, and the profile was useful for LOCATING the frame, never
@@ -1735,6 +1866,50 @@ pub const InstProf = struct {
     cond_subst_visits: u64 = 0,
     /// Union constituents distributed through that arm.
     cond_subst_laps: u64 = 0,
+    /// Per-REFERENCE reuse of a published expansion: `calls` counts the times
+    /// `expandRef`'s memo answered for that reference AFTER the one call that
+    /// built it, and `visits` carries the build's own inclusive cost. This is
+    /// the amortization axis — the whole defence of eager whole-table
+    /// expansion is that one consumer pays and every later one reads free, and
+    /// nothing had ever counted the later ones. A reference whose entry is
+    /// never hit again served exactly ONE consumer.
+    expand_reuse: std.AutoHashMapUnmanaged(TypeId, Tally) = .empty,
+    /// `expandRef` by named symbol -> SELF (exclusive) work charged. The
+    /// inclusive tally above cannot separate the two populations immich shows,
+    /// because a repository class's table materialization CONTAINS every
+    /// kysely-builder expansion its method bodies force; subtracting the
+    /// nested frames says which symbol the visits are really spent in.
+    expands_self: std.AutoHashMapUnmanaged(SymbolId, Tally) = .empty,
+    /// Node visits the currently-open `expandRef` frame's CHILDREN charged.
+    /// Saved and restored by each frame, exactly like `DeclProf.Frame`.
+    expand_child_visits: u64 = 0,
+    /// The GENERIC member table the innermost `expandRef` is substituting, and
+    /// the symbol it belongs to. `instantiateId`'s `.object` arm recognises the
+    /// table by identity and charges each property's substitution to that
+    /// property's name — the axis that says WHICH of a builder interface's
+    /// hundred members the cost is in.
+    expand_generic: TypeId = 0,
+    expand_sym: SymbolId = 0,
+    /// `(symbol << 32) | name atom` -> substitution cost of that member.
+    member_costs: std.AutoHashMapUnmanaged(u64, Tally) = .empty,
+    /// `(symbol, member name, RESULT type)` triples already seen. A member
+    /// whose substitution under a fresh argument list lands on a type some
+    /// earlier expansion of the same table already produced is pure
+    /// re-derivation — the argument positions that member actually mentions
+    /// did not move. This set prices exactly that, and it is a LOWER bound
+    /// (`mintFreshTp` keys a rewritten bound on the whole map, so two
+    /// otherwise-identical signatures get distinct fresh symbols and are
+    /// counted as different results here).
+    member_seen: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    /// `(symbol << 32) | name atom` -> the re-derived share of `member_costs`.
+    member_dupes: std.AutoHashMapUnmanaged(u64, Tally) = .empty,
+    /// Fresh higher-order type-param symbol -> node visits its substituted
+    /// BOUND cost to produce, and whether anything ever read that bound back.
+    /// tsc stores a cloned parameter's mapper and resolves the constraint on
+    /// demand; ztsc computes it at mint time, so the difference between these
+    /// two numbers is what the eager model pays for nothing.
+    fresh_bound_cost: std.AutoHashMapUnmanaged(u32, u64) = .empty,
+    fresh_bound_read: std.AutoHashMapUnmanaged(u32, void) = .empty,
 
     pub fn deinit(p: *InstProf, gpa: std.mem.Allocator) void {
         p.sites.deinit(gpa);
@@ -1744,9 +1919,70 @@ pub const InstProf = struct {
         p.trip_epochs.deinit(gpa);
         p.per_type.deinit(gpa);
         p.focus_types.deinit(gpa);
+        p.expand_reuse.deinit(gpa);
+        p.expands_self.deinit(gpa);
+        p.member_costs.deinit(gpa);
+        p.member_seen.deinit(gpa);
+        p.member_dupes.deinit(gpa);
+        p.fresh_bound_cost.deinit(gpa);
+        p.fresh_bound_read.deinit(gpa);
         p.stmts.deinit(gpa);
     }
 };
+
+/// Record that `ref`'s expansion was BUILT, costing `visits` node visits.
+pub fn noteExpandBuild(c: *Checker, ref: TypeId, visits: u64) void {
+    if (c.prof.expand_reuse.getOrPut(c.gpa, ref)) |gop| {
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        gop.value_ptr.visits += visits;
+        gop.value_ptr.max_visits = visits;
+    } else |_| {}
+}
+
+/// Charge the cost of substituting fresh type-param `fid`'s bound.
+pub fn noteFreshBound(c: *Checker, fid: u32, visits: u64) void {
+    if (c.prof.fresh_bound_cost.getOrPut(c.gpa, fid)) |gop| {
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* += visits;
+    } else |_| {}
+}
+
+/// Record that fresh type-param `fid`'s bound was READ back.
+pub fn noteFreshBoundRead(c: *Checker, fid: u32) void {
+    c.prof.fresh_bound_read.put(c.gpa, fid, {}) catch {};
+}
+
+/// Charge one member's substitution inside a generic table expansion.
+pub fn noteMemberCost(c: *Checker, sym: SymbolId, name: u32, result: TypeId, visits: u64) void {
+    const key = (@as(u64, sym) << 32) | name;
+    if (c.prof.member_costs.getOrPut(c.gpa, key)) |gop| {
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        gop.value_ptr.add(visits);
+    } else |_| {}
+    const seen_key = (key *% 0x9E3779B97F4A7C15) ^ (@as(u64, result) *% 0xD6E8FEB86659FD93);
+    const g2 = c.prof.member_seen.getOrPut(c.gpa, seen_key) catch return;
+    if (!g2.found_existing) return;
+    if (c.prof.member_dupes.getOrPut(c.gpa, key)) |gop| {
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        gop.value_ptr.add(visits);
+    } else |_| {}
+}
+
+/// Charge one `expandRef`'s SELF (nested frames subtracted) cost to `sym`.
+pub fn noteExpandSelf(c: *Checker, sym: SymbolId, visits: u64) void {
+    if (c.prof.expands_self.getOrPut(c.gpa, sym)) |gop| {
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        gop.value_ptr.add(visits);
+    } else |_| {}
+}
+
+/// Record that `ref`'s already-published expansion was READ from the memo.
+pub fn noteExpandHit(c: *Checker, ref: TypeId) void {
+    if (c.prof.expand_reuse.getOrPut(c.gpa, ref)) |gop| {
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        gop.value_ptr.calls += 1;
+    } else |_| {}
+}
 
 /// Charge one top-level `instantiate` of `t` costing `visits` node visits to
 /// the call site `ret_addr`.
@@ -1910,6 +2146,33 @@ pub fn report(c: *Checker) void {
     w.print("uncached cond-check rebinding: {d} visits over {d} constituents\n", .{
         c.prof.cond_subst_visits, c.prof.cond_subst_laps,
     }) catch {};
+    w.print("visits spent on a signature's OWN type-param bounds: {d} ({d:.1}% of total)\n", .{
+        c.stats.inst_bound_visits,
+        if (c.inst_total == 0) 0.0 else 100.0 * @as(f64, @floatFromInt(c.stats.inst_bound_visits)) / @as(f64, @floatFromInt(c.inst_total)),
+    }) catch {};
+    w.print("  of which enforced {d} / widen-only {d} / discarded {d}\n", .{
+        c.stats.inst_bound_enforced, c.stats.inst_bound_widen, c.stats.inst_bound_discarded,
+    }) catch {};
+    {
+        var minted: u64 = 0;
+        var minted_cost: u64 = 0;
+        var unread: u64 = 0;
+        var unread_cost: u64 = 0;
+        var it = c.prof.fresh_bound_cost.iterator();
+        while (it.next()) |e| {
+            minted += 1;
+            minted_cost += e.value_ptr.*;
+            if (!c.prof.fresh_bound_read.contains(e.key_ptr.*)) {
+                unread += 1;
+                unread_cost += e.value_ptr.*;
+            }
+        }
+        w.print("  enforced bounds minted: {d} costing {d} visits; NEVER READ BACK: {d} ({d} visits, {d:.1}% of the run)\n", .{
+            minted,                                                                                                               minted_cost,
+            unread,                                                                                                               unread_cost,
+            if (c.inst_total == 0) 0.0 else 100.0 * @as(f64, @floatFromInt(unread_cost)) / @as(f64, @floatFromInt(c.inst_total)),
+        }) catch {};
+    }
 
     w.writeAll("\n-- visits by type kind --\n") catch {};
     {
@@ -1958,6 +2221,155 @@ pub fn report(c: *Checker) void {
     }
     w.writeAll("\n-- expandRef() by symbol --\n") catch {};
     dumpTally(SymbolId, w, gpa, &c.prof.expands, 25, labelSym, c) catch {};
+    w.writeAll("\n-- expandRef() by symbol, SELF (nested expansions subtracted) --\n") catch {};
+    dumpTally(SymbolId, w, gpa, &c.prof.expands_self, 25, labelSym, c) catch {};
+    w.writeAll("\n-- cost of ONE member, summed over every expansion of its table --\n") catch {};
+    {
+        const Row = struct {
+            key: u64,
+            t: Tally,
+            fn desc(_: void, a: @This(), b: @This()) bool {
+                return a.t.visits > b.t.visits;
+            }
+        };
+        var rows: std.ArrayListUnmanaged(Row) = .empty;
+        defer rows.deinit(gpa);
+        var it = c.prof.member_costs.iterator();
+        var tot: u64 = 0;
+        while (it.next()) |e| {
+            rows.append(gpa, .{ .key = e.key_ptr.*, .t = e.value_ptr.* }) catch {};
+            tot += e.value_ptr.visits;
+        }
+        std.mem.sort(Row, rows.items, {}, Row.desc);
+        var dup_tot: u64 = 0;
+        var dit = c.prof.member_dupes.iterator();
+        while (dit.next()) |e| dup_tot += e.value_ptr.visits;
+        w.print("  distinct (table, member) pairs: {d}   total charged: {d}\n", .{ rows.items.len, tot }) catch {};
+        w.print("  of which RE-DERIVED (same table, same member, same result type as an\n", .{}) catch {};
+        w.print("  earlier expansion): {d} visits ({d:.1}% of the charge, {d:.1}% of the whole run)\n", .{
+            dup_tot,
+            if (tot == 0) 0.0 else 100.0 * @as(f64, @floatFromInt(dup_tot)) / @as(f64, @floatFromInt(tot)),
+            if (c.inst_total == 0) 0.0 else 100.0 * @as(f64, @floatFromInt(dup_tot)) / @as(f64, @floatFromInt(c.inst_total)),
+        }) catch {};
+        var cum: u64 = 0;
+        for (rows.items[0..@min(30, rows.items.len)]) |r| {
+            cum += r.t.visits;
+            const sym: SymbolId = @intCast(r.key >> 32);
+            const d = c.prof.member_dupes.get(r.key) orelse Tally{};
+            const cum_pct = if (tot == 0) 0.0 else 100.0 * @as(f64, @floatFromInt(cum)) / @as(f64, @floatFromInt(tot));
+            w.print("  {d:>10} visits {d:>6} subs  re-derived {d:>10} / {d:>6}  cum {d:>5.1}%  {s}.{s}\n", .{
+                r.t.visits, r.t.calls, d.visits, d.calls, cum_pct, c.symbolName(sym), c.atomText(@truncate(r.key)),
+            }) catch {};
+        }
+    }
+    w.writeAll("\n-- expansion REUSE (was the published table ever read again?) --\n") catch {};
+    {
+        // Buckets over the per-reference memo-hit count. Bucket 0 is the
+        // population an eager whole-table expansion cannot be defended by
+        // amortization for: built once, served exactly the one consumer that
+        // forced it, never read again.
+        var n_built: u64 = 0;
+        var n_zero: u64 = 0;
+        var v_total: u64 = 0;
+        var v_zero: u64 = 0;
+        var hits_total: u64 = 0;
+        var b1: u64 = 0;
+        var b2: u64 = 0;
+        var b5: u64 = 0;
+        var b20: u64 = 0;
+        var it = c.prof.expand_reuse.iterator();
+        while (it.next()) |e| {
+            const t = e.value_ptr.*;
+            if (t.max_visits == 0 and t.visits == 0 and t.calls == 0) continue;
+            n_built += 1;
+            v_total += t.visits;
+            hits_total += t.calls;
+            switch (t.calls) {
+                0 => {
+                    n_zero += 1;
+                    v_zero += t.visits;
+                },
+                1 => b1 += 1,
+                2...4 => b2 += 1,
+                5...19 => b5 += 1,
+                else => b20 += 1,
+            }
+        }
+        const pct = struct {
+            fn f(a: u64, b: u64) f64 {
+                return if (b == 0) 0.0 else 100.0 * @as(f64, @floatFromInt(a)) / @as(f64, @floatFromInt(b));
+            }
+        }.f;
+        w.print("  references expanded: {d}   memo re-reads: {d}\n", .{ n_built, hits_total }) catch {};
+        w.print("  re-read   0 times: {d:>7} ({d:>5.1}% of expansions, {d:>5.1}% of their node visits)\n", .{ n_zero, pct(n_zero, n_built), pct(v_zero, v_total) }) catch {};
+        w.print("  re-read   1 time : {d:>7} ({d:>5.1}%)\n", .{ b1, pct(b1, n_built) }) catch {};
+        w.print("  re-read  2-4     : {d:>7} ({d:>5.1}%)\n", .{ b2, pct(b2, n_built) }) catch {};
+        w.print("  re-read  5-19    : {d:>7} ({d:>5.1}%)\n", .{ b5, pct(b5, n_built) }) catch {};
+        w.print("  re-read 20+      : {d:>7} ({d:>5.1}%)\n", .{ b20, pct(b20, n_built) }) catch {};
+    }
+    w.writeAll("\n-- expansion reuse by symbol (built / never-re-read / node visits wasted) --\n") catch {};
+    {
+        const Agg = struct { built: u64 = 0, zero: u64 = 0, visits: u64 = 0, zero_visits: u64 = 0 };
+        var by_sym: std.AutoHashMapUnmanaged(SymbolId, Agg) = .empty;
+        defer by_sym.deinit(gpa);
+        var it = c.prof.expand_reuse.iterator();
+        while (it.next()) |e| {
+            const ref = e.key_ptr.*;
+            if (c.ts.kind(ref) != .ref) continue;
+            const sym = c.ts.refSymbol(ref);
+            const t = e.value_ptr.*;
+            if (by_sym.getOrPut(gpa, sym)) |gop| {
+                if (!gop.found_existing) gop.value_ptr.* = .{};
+                gop.value_ptr.built += 1;
+                gop.value_ptr.visits += t.visits;
+                if (t.calls == 0) {
+                    gop.value_ptr.zero += 1;
+                    gop.value_ptr.zero_visits += t.visits;
+                }
+            } else |_| {}
+        }
+        const Row = struct {
+            key: SymbolId,
+            a: Agg,
+            fn desc(_: void, x: @This(), y: @This()) bool {
+                return x.a.visits > y.a.visits;
+            }
+        };
+        var rows: std.ArrayListUnmanaged(Row) = .empty;
+        defer rows.deinit(gpa);
+        var it2 = by_sym.iterator();
+        while (it2.next()) |e| rows.append(gpa, .{ .key = e.key_ptr.*, .a = e.value_ptr.* }) catch {};
+        std.mem.sort(Row, rows.items, {}, Row.desc);
+        for (rows.items[0..@min(20, rows.items.len)]) |r| {
+            w.print("  {d:>10} visits {d:>6} built {d:>6} never-re-read ({d:>10} of those visits)  ", .{
+                r.a.visits, r.a.built, r.a.zero, r.a.zero_visits,
+            }) catch {};
+            // Distinct type arguments per POSITION. A symbol whose expansions
+            // are 1,019 argument lists but only a handful of distinct values in
+            // the positions a given member mentions is re-deriving that member;
+            // one whose every position is nearly as wide as the expansion count
+            // is not.
+            var pos: [4]std.AutoHashMapUnmanaged(TypeId, void) = @splat(.empty);
+            defer for (&pos) |*p| p.deinit(gpa);
+            var it3 = c.prof.expand_reuse.iterator();
+            while (it3.next()) |e| {
+                const ref = e.key_ptr.*;
+                if (c.ts.kind(ref) != .ref) continue;
+                if (c.ts.refSymbol(ref) != r.key) continue;
+                const n = @min(4, c.ts.refArgCount(ref));
+                for (0..n) |i| pos[i].put(gpa, c.ts.refArgAt(ref, i), {}) catch {};
+            }
+            w.writeAll("distinct args [") catch {};
+            for (&pos, 0..) |*p, i| {
+                if (p.count() == 0) break;
+                if (i != 0) w.writeAll("/") catch {};
+                w.print("{d}", .{p.count()}) catch {};
+            }
+            w.writeAll("]  ") catch {};
+            labelDeclSym(c, r.key, w);
+            w.writeAll("\n") catch {};
+        }
+    }
     w.writeAll("\n-- budget trips by the declaration frame that was live --\n") catch {};
     dumpTally(SymbolId, w, gpa, &c.prof.trip_epochs, 25, labelEpoch, c) catch {};
     w.writeAll("\n-- resolveStructural() sites that forced an expansion --\n") catch {};

@@ -125,6 +125,20 @@ pub const Stats = struct {
     inst_hits: usize = 0,
     inst_misses: usize = 0,
     inst_maps: usize = 0,
+    /// Node visits spent substituting a SIGNATURE'S OWN type parameter's
+    /// constraint and default (`instantiateId`'s `.function` arm). tsc resolves
+    /// a cloned type parameter's constraint lazily; ztsc substitutes it eagerly
+    /// on every instantiation of the signature, and on a kysely-shaped library
+    /// a bound is a mapped type over every column of every table in scope.
+    inst_bound_visits: u64 = 0,
+    /// The share of `inst_bound_visits` whose substituted bound is ENFORCED as
+    /// the fresh parameter's constraint (`fc`).
+    inst_bound_enforced: u64 = 0,
+    /// The share carried only as `FreshTp.widen_bound` (unenforced).
+    inst_bound_widen: u64 = 0,
+    /// The share that moved nothing, so no fresh parameter was minted and the
+    /// substituted bound was discarded on the spot.
+    inst_bound_discarded: u64 = 0,
     /// `Checker.inst_count` at seal: the instantiation work this instance
     /// charged against `max_instantiation_count`, and the comparator for
     /// tsgo's `--extendedDiagnostics` Instantiations. Reported so the quantity
