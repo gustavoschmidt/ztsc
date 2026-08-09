@@ -1203,13 +1203,16 @@ const Binder = struct {
         return b.atomOf(stripQuotes(b.tokenText(tok)));
     }
 
+    /// Strips the delimiters off a literal module specifier. Backticks are
+    /// included because a no-substitution template literal is a legal
+    /// specifier for `import()` (`` import(`./m`) ``).
     fn stripQuotes(text: []const u8) []const u8 {
-        if (text.len >= 2 and (text[0] == '"' or text[0] == '\'')) {
+        if (text.len >= 2 and (text[0] == '"' or text[0] == '\'' or text[0] == '`')) {
             const last = text[text.len - 1];
             if (last == text[0]) return text[1 .. text.len - 1];
             return text[1..];
         }
-        if (text.len >= 1 and (text[0] == '"' or text[0] == '\'')) return text[1..];
+        if (text.len >= 1 and (text[0] == '"' or text[0] == '\'' or text[0] == '`')) return text[1..];
         return text;
     }
 
@@ -3221,10 +3224,18 @@ const Binder = struct {
     /// A side-effect record, like `bindImportType` — no local binding, and
     /// `linkImports` skips it. Not `type_only`: this is a runtime import.
     /// A computed specifier registers nothing (tsc cannot resolve it either).
+    /// A no-substitution template literal (`` import(`./m`) ``) IS a literal
+    /// specifier and tsc resolves it exactly like the quoted form — the AST
+    /// node is `.template_literal`, so it has to be admitted alongside
+    /// `.string_literal` here and in `importCallType`.
     fn bindDynamicImport(b: *Binder, node: Node) Error!void {
         const r = b.tree.extraData(ast.SubRange, b.tree.nodeData(node).rhs);
         const args = b.tree.extraRange(r.start, r.end);
-        if (args.len == 0 or b.nodeTag(args[0]) != .string_literal) return;
+        if (args.len == 0) return;
+        switch (b.nodeTag(args[0])) {
+            .string_literal, .template_literal => {},
+            else => return,
+        }
         const module = try b.moduleAtom(b.tree.nodeMainToken(args[0]));
         if (module == 0) return;
         try b.import_recs.append(b.scratch, .{

@@ -1524,18 +1524,44 @@ pub fn narrowByCondition(c: *Checker, t: TypeId, cond: Node, sense: bool, key: R
                 // binder. `const g = isImg(e) && files[e.fileId]; if (g) …`
                 // is the shape that needs it. The other polarity of each
                 // operator says nothing about either operand.
+                // The OTHER polarity of each operator is not silent either,
+                // it is a union of the two ways the operator can land
+                // (tsc `narrowTypeByBinaryExpression`): `a || b` true means
+                // "a true, OR a false and b true", and `a && b` false means
+                // "a false, OR a true and b false". `const terminal =
+                // s?.status === 'x' || s?.status === 'y'; if (terminal) s.n`
+                // needs it — each arm alone removes `undefined` from `s`, so
+                // their union does too, while returning `t` here keeps it.
                 .amp_amp => {
-                    if (!sense) return t;
-                    return c.narrowByCondition(try c.narrowByCondition(t, d.lhs, true, key, decl), d.rhs, true, key, decl);
+                    const lt = try c.narrowByCondition(t, d.lhs, true, key, decl);
+                    if (sense) return c.narrowByCondition(lt, d.rhs, true, key, decl);
+                    return c.makeUnion2(
+                        try c.narrowByCondition(t, d.lhs, false, key, decl),
+                        try c.narrowByCondition(lt, d.rhs, false, key, decl),
+                    );
                 },
                 .pipe_pipe => {
-                    if (sense) return t;
-                    return c.narrowByCondition(try c.narrowByCondition(t, d.lhs, false, key, decl), d.rhs, false, key, decl);
+                    const lf = try c.narrowByCondition(t, d.lhs, false, key, decl);
+                    if (!sense) return c.narrowByCondition(lf, d.rhs, false, key, decl);
+                    return c.makeUnion2(
+                        try c.narrowByCondition(t, d.lhs, true, key, decl),
+                        try c.narrowByCondition(lf, d.rhs, true, key, decl),
+                    );
                 },
                 else => return t,
             }
         },
-        .prefix_unary => return t, // `!` was decomposed by the binder
+        // A condition written directly in an `if` never reaches here — the
+        // binder decomposes `!` into separate flow nodes — but an *aliased*
+        // condition does, because `constAliasInit` hands the alias's
+        // initializer straight to this narrower, bypassing the binder. Exactly
+        // the reason the `&&` / `||` arms above exist, and `const isActive =
+        // !!v; if (!isActive) return;` is the shape that needs it. Only `!`
+        // says anything about its operand; `-`/`~`/`+`/`typeof`/`void` do not.
+        .prefix_unary => {
+            if (c.tree.tokens.tag(c.tree.nodeMainToken(cond)) != .bang) return t;
+            return c.narrowByCondition(t, d.lhs, !sense, key, decl);
+        },
         .call_expr, .call_expr_targs, .optional_call => {
             // A truthy optional-*call* chain (`if (a?.m())`, or the
             // fall-through of `if (!a?.m()) return`) implies its receivers
