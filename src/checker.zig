@@ -1860,13 +1860,20 @@ pub const Checker = struct {
     /// and intersections preserve top-level-ness (tsc's
     /// `isTypeParameterAtTopLevel` descends them); everything else does not.
     nontop_depth: u32 = 0,
-    /// Monotone count of candidate WRITES performed by `unify`'s `.type_param`
-    /// arm. tsc's `inferToMultipleTypes` decides whether a source constituent
-    /// was "matched" by watching `inferencePriority` — i.e. whether an
-    /// inference was MADE — not by whether the recorded answer changed.
-    /// Comparing the candidate array instead makes a re-inference of an
-    /// already-recorded candidate invisible, and the constituent then counts
-    /// as unmatched and rides into the naked type variable a second time.
+    /// Monotone count of candidate WRITES performed by `unify`. tsc's
+    /// `inferToMultipleTypes` decides whether a source constituent was
+    /// "matched" by watching `inferencePriority` — i.e. whether an inference
+    /// was MADE — not by whether the recorded answer changed. Comparing the
+    /// candidate array instead makes a re-inference of an already-recorded
+    /// candidate invisible, and the constituent then counts as unmatched and
+    /// rides into the naked type variable a second time.
+    ///
+    /// React Native's `StyleProp<T> = T | RegisteredStyle<T> |
+    /// RecursiveArray<…> | Falsy` is the shape that shows it: the array member
+    /// infers `T` first, so `RegisteredStyle<T>` re-inferring the same `T`
+    /// left the array untouched and the naked `T` swallowed the brand — every
+    /// `StyleSheet.flatten(style)` came back as
+    /// `TextStyle | RegisteredStyle<TextStyle>` instead of `TextStyle`.
     infer_writes: u64 = 0,
     /// Non-zero while `unify` is running the contextual-RETURN pass
     /// (`fillFromReturnContext`), i.e. at tsc's `InferencePriority.ReturnType`.
@@ -3286,6 +3293,7 @@ pub const Checker = struct {
     pub const hasValueMeaning = names_zig.hasValueMeaning;
     pub const hasTypeMeaning = names_zig.hasTypeMeaning;
     pub const resolveSpace = names_zig.resolveSpace;
+    pub const resolveTypeQuerySpace = names_zig.resolveTypeQuerySpace;
     pub const suggestName = names_zig.suggestName;
     pub const reportNameNotFound = names_zig.reportNameNotFound;
     pub const reportModuleNotFound = names_zig.reportModuleNotFound;

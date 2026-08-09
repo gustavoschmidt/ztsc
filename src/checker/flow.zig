@@ -2218,12 +2218,16 @@ pub fn narrowToValue(c: *Checker, t: TypeId, v: TypeId) Error!TypeId {
     // defeating the inferred-predicate disjointness gate (and under-
     // narrowing `if (x === null)`).
     if (c.ts.kind(v) == .null or c.ts.kind(v) == .undefined) return types.never_type;
-    // `=== <unique symbol>`: the comparand is a unit type whose only wider
-    // domain is `symbol` (a different unique symbol was ruled out by the
-    // identity test above), so every other constituent is excluded.
-    if (c.ts.kind(v) == .unique_symbol) return if (k == .symbol) v else types.never_type;
     if (try c.literalBaseOf(v) == mt) return v; // string narrowed by "a" / `E` by `E.A`
     if (k == .boolean and (c.ts.kind(v) == .bool_true or c.ts.kind(v) == .bool_false)) return v;
+    // `=== <unique symbol>`: a nominal `unique symbol` is equal to nothing
+    // but itself (the `mt == v` case above), so every other concrete member
+    // is excluded. `symbol` itself survives unnarrowed — verified against the
+    // oracle, which leaves `symbol` alone rather than narrowing it down to
+    // the unit.
+    if (c.ts.kind(v) == .unique_symbol) {
+        return if (k == .symbol) mt else types.never_type;
+    }
     if (c.ts.isLiteralLike(mt) or k == .null or k == .undefined) {
         return types.never_type; // different literal
     }
@@ -2255,6 +2259,18 @@ pub fn narrowExcludeValue(c: *Checker, t: TypeId, v: TypeId) Error!TypeId {
     }
     const mt = try c.ts.regularLiteral(t);
     if (mt == v) return types.never_type;
+    // Under strictNullChecks tsc narrows `unknown` as if it were
+    // `undefined | null | {}` (`unknownUnionType`) and re-spells the FULL
+    // union `unknown` afterwards, so subtracting one nullish arm leaves the
+    // other two. `if (e !== null && e !== undefined)` on an `unknown` ends at
+    // `{}`, which carries `Object`'s apparent members.
+    if (c.ts.kind(mt) == .unknown) {
+        switch (c.ts.kind(v)) {
+            .null => return try c.ts.makeUnion(c.scratch(), &.{ types.undefined_type, types.empty_object_type }),
+            .undefined => return try c.ts.makeUnion(c.scratch(), &.{ types.null_type, types.empty_object_type }),
+            else => {},
+        }
+    }
     // A DEFERRED conditional or indexed access is not a union, so none of
     // the arms here can subtract the nullish constituent hiding inside it,
     // and `x !== undefined` left the type exactly as it found it. tsc's
@@ -2340,6 +2356,17 @@ pub fn narrowByTypeofResolved(c: *Checker, t: TypeId, which: usize, sense: bool)
         var parts: std.ArrayList(TypeId) = .empty;
         defer parts.deinit(c.scratch());
         for (try c.memberList(t)) |m| {
+            // A constituent that is itself an ALIAS for a union — React's
+            // `ReactNode` inferred into a naked type variable is the case —
+            // has to be seen through, or the whole alias answers "not a
+            // string" and the `typeof child === 'string'` branch is `never`.
+            // tsc's unions are always flattened; ztsc's can hold a reference.
+            const rm = try c.resolveStructural(m);
+            if (rm != m and c.ts.kind(rm) == .union_type) {
+                const nm = try narrowByTypeofResolved(c, rm, which, sense);
+                if (nm != types.never_type) try parts.append(c.scratch(), nm);
+                continue;
+            }
             const keep = try c.typeofMatchesFn(m, which);
             const kept = if (sense) keep else !keep;
             if (kept) try parts.append(c.scratch(), m);
@@ -2477,6 +2504,21 @@ pub fn narrowByDiscriminant(c: *Checker, t: TypeId, prop: Atom, value: TypeId, s
     // fallback above exists for.
     const disc_over = if (c.ts.kind(decl) == .union_type) decl else t;
     if (!try c.isDiscriminantProp(disc_over, prop)) return t;
+    // tsc's `narrowTypeByEquality` subtracts on the NOT-EQUAL side only when
+    // the COMPARAND is a unit type: `if (valueType.flags & TypeFlags.Unit)
+    // return filterType(…); return type;`. A comparand that is a whole enum
+    // — or any union of units — has no Unit flag, so nothing is subtracted.
+    //
+    // social-app's `Conversation` screen is the shape: `const [prevState] =
+    // useState(convoState.status)` gives `prevState` the WHOLE `ConvoStatus`
+    // enum, and `if (prevState !== convoState.status)` then matched (and so
+    // removed) every constituent of the convo union, leaving `never` for the
+    // rest of the block.
+    const value_unit = blk: {
+        const rv = try c.ts.regularLiteral(value);
+        break :blk c.ts.isLiteralLike(rv) or c.ts.kind(rv) == .null or c.ts.kind(rv) == .undefined;
+    };
+    if (!sense and !value_unit) return t;
     const single = [_]TypeId{t};
     const members: []const TypeId = if (c.ts.kind(t) == .union_type) try c.memberList(t) else &single;
     for (members) |m| {

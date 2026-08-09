@@ -574,8 +574,27 @@ pub fn paramInfo(c: *Checker, pn: Node, index: u32, ctx_sig: TypeId, report_impl
         0;
 
     var ty: TypeId = types.no_type;
+    // tsc's `getTypeForVariableLikeDeclaration` order for a PARAMETER: the
+    // type annotation, then the CONTEXTUAL parameter type, and only then the
+    // initializer. ztsc had the last two the other way round, so a default
+    // erased the contextual type it was a default FOR — social-app's
+    // `build(params = {})`, written against
+    // `build: (params?: Record<string, any>) => string`, typed `params` as
+    // `{}` and every `params[name]` was a false TS7053.
+    var ctx_ty: TypeId = types.no_type;
+    if (type_ann == 0 and ctx_sig != types.no_type and c.ts.kind(ctx_sig) == .function) {
+        if (try c.paramTypeAt(ctx_sig, index)) |ct| ctx_ty = ct;
+    }
     if (type_ann != 0) {
         ty = try c.typeFromTypeNode(type_ann);
+    } else if (ctx_ty != types.no_type) {
+        // tsc's `removeOptionalityFromDeclaredType`: a parameter WITH an
+        // initializer cannot be `undefined` at the point its body reads it,
+        // so `undefined` comes off the declared type.
+        ty = if (init_node != 0) try c.removeUndefined(ctx_ty) else ctx_ty;
+        // The initializer is still checked — for its own diagnostics —
+        // against the type it is a default for.
+        if (init_node != 0) _ = try c.checkExprCached(init_node, ty);
     } else if (init_node != 0) {
         ty = try c.widenLiteral(try c.checkExprCached(init_node, types.no_type));
         // A parameter whose NAME is an object binding pattern takes its
@@ -589,8 +608,6 @@ pub fn paramInfo(c: *Checker, pn: Node, index: u32, ctx_sig: TypeId, report_impl
         // every property of `({ w = 1, h = 2 } = { w: 0, h: 0 })` came out
         // REQUIRED and `f({ w: 5 })` reported TS2345.
         ty = try c.optionalizePatternDefaults(ty, name_node);
-    } else if (ctx_sig != types.no_type and c.ts.kind(ctx_sig) == .function) {
-        if (try c.paramTypeAt(ctx_sig, index)) |ct| ty = ct;
     }
     if (ty == types.no_type) {
         // `noImplicitAny: false` suppresses TS7006 — the parameter still
@@ -1538,6 +1555,7 @@ pub fn declaratorType(c: *Checker, sym: SymbolId, decl: Node, is_const: bool) Er
             return c.bindingElementType(sym, decl, et);
         },
         .declarator_init => {
+            if (try freshSymbolConstType(c, decl, d.lhs, d.rhs, is_const)) |u| return u;
             const init_t = try c.checkExprCached(d.rhs, types.no_type);
             if (try c.inferredUniqueSymbol(decl, d.lhs, d.rhs, is_const, init_t)) |u| return u;
             const vt = try c.widenInitializer(init_t, is_const);
@@ -1550,6 +1568,7 @@ pub fn declaratorType(c: *Checker, sym: SymbolId, decl: Node, is_const: bool) Er
             if (e.type_ann != 0) {
                 vt = try c.annTypeMaybeUnique(e.type_ann, is_const, 1332, c.nodeSpan(d.lhs));
             } else if (e.init != 0) {
+                if (try freshSymbolConstType(c, decl, d.lhs, e.init, is_const)) |u| return u;
                 const init_t = try c.checkExprCached(e.init, types.no_type);
                 if (try c.inferredUniqueSymbol(decl, d.lhs, e.init, is_const, init_t)) |u| return u;
                 vt = try c.widenInitializer(init_t, is_const);
@@ -1559,6 +1578,33 @@ pub fn declaratorType(c: *Checker, sym: SymbolId, decl: Node, is_const: bool) Er
         },
         else => return types.any_type,
     }
+}
+
+/// tsc's `getESSymbolLikeTypeForNode`: a call to the global `Symbol` /
+/// `Symbol.for` produces a FRESH `unique symbol` type — not the plain
+/// `symbol` its signature returns — when it initializes a declaration that
+/// can hold one (`isValidESSymbolDeclaration`: a `const` variable with an
+/// identifier name, a `readonly static` field, a `readonly` property
+/// signature). The type is nominal, keyed by the declaration, so every
+/// reference to the const shares it.
+///
+/// The consequence is narrowing. `export const POST_TOMBSTONE =
+/// Symbol('PostTombstone')` is the sentinel a post-shadow cache returns, and
+/// `if (postShadowed === POST_TOMBSTONE) return null` only subtracts it from
+/// the union when the sentinel is a UNIT type. Left as `symbol`, `===`
+/// narrowed nothing and the whole `symbol | Shadow<PostView>` union survived
+/// into the code below the guard — a false TS2339 on every field of the post.
+///
+/// `null` when the declaration is not that shape, in which case the caller
+/// takes the ordinary widened-initializer path.
+fn freshSymbolConstType(c: *Checker, decl: Node, name: Node, init: Node, is_const: bool) Error!?TypeId {
+    if (!is_const) return null;
+    if (name == null_node or c.nodeTag(name) != .identifier) return null;
+    if (!c.isFreshSymbolCall(init)) return null;
+    // Checked for its own diagnostics; the type is the declaration's, not
+    // the call's.
+    _ = try c.checkExprCached(init, types.no_type);
+    return try c.uniqueSymType(decl);
 }
 
 /// Pin every symbol bound by a destructured parameter's pattern to the type

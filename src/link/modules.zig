@@ -465,6 +465,12 @@ pub const Program = struct {
     /// affected values still type as `any`. Defaults on (strict semantics); the
     /// driver sets it from the tsconfig. See `tsconfig.Config.no_implicit_any`.
     no_implicit_any: bool = true,
+    /// Effective `allowSyntheticDefaultImports`/`esModuleInterop`, as the
+    /// CHECKER needs it: `linkImports` uses the linker's own copy for a static
+    /// default import, but a DYNAMIC `import("m")` builds its type in the
+    /// checker (`importCallType`) and needs the same rule for the `default`
+    /// property it hands back. See `LinkOpts.allow_synthetic_default`.
+    allow_synthetic_default: bool = false,
     /// Effective `types: [… "*" …]` (tsc's `usesWildcardTypes`). Picks TS2580
     /// over TS2591 for the node-flavoured not-found diagnostics; the checker
     /// reads it in `reportNameNotFound`/`reportModuleNotFound`. See

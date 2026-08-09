@@ -1309,6 +1309,7 @@ pub fn main(init: std.process.Init) !void {
         .export_equals_atom = lr.export_equals_atom,
         .dual_targets = lr.dual_targets,
         .no_implicit_any = config_no_implicit_any,
+        .allow_synthetic_default = config_allow_synthetic_default,
         .types_wildcard = config_types_wildcard,
         .experimental_decorators = config_experimental_decorators,
         .jsx_runtime_file = jsx_runtime_fid orelse modules.no_file,

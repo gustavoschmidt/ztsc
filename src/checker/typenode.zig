@@ -1004,7 +1004,7 @@ pub fn typeofEntity(c: *Checker, node: Node) Error!TypeId {
     const tok = c.tree.nodeMainToken(node);
     if (c.tree.tokens.tag(tok) == .keyword_undefined) return types.undefined_type;
     const a = try c.atomOfToken(tok);
-    switch (c.resolveSpace(a, c.cur_scope, true)) {
+    switch (c.resolveTypeQuerySpace(a, c.cur_scope)) {
         .sym => |sym| return c.regularizeTypeQuery(try c.typeOfSymbol(sym)),
         .wrong_space => |sym| {
             // A type-only import binding is excluded from value space by

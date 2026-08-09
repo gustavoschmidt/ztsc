@@ -206,6 +206,16 @@ pub fn propOfTypeEx(c: *Checker, t: TypeId, name: Atom, allow_index: bool) Error
         .number, .number_literal, .number_literal_fresh, .boolean, .bool_true, .bool_false => {
             return c.primitiveInterfaceProp(t, name);
         },
+        // tsc's `getApparentType(objectType)` is `globalObjectType`, so the
+        // `object` KEYWORD carries the same `Object.prototype` members every
+        // object type does — `constructor`, `toString`, `hasOwnProperty`, …
+        // `typeof v === 'object' && v !== null && v.constructor === Object`
+        // is the idiom that needs it. Member access only, like the `.object`
+        // arm's own fallback.
+        .object_keyword => {
+            if (!allow_index) return null;
+            return c.objectInterfaceProp(name);
+        },
         .type_param => {
             const constraint = try c.typeParamConstraint(s.typeParamSymbol(t));
             if (constraint == types.no_type) return null;
@@ -748,6 +758,10 @@ fn nonNullableInner(c: *Checker, t: TypeId, drop_void: bool) Error!TypeId {
 }
 
 fn nonNullableScalar(c: *Checker, t: TypeId) Error!TypeId {
+    // Under strictNullChecks tsc narrows `unknown` as if it were
+    // `undefined | null | {}` (`unknownUnionType`), so stripping the nullish
+    // arms leaves `{}` — `getNonNullableType(unknown)` is `{}`.
+    if (c.ts.kind(t) == .unknown) return types.empty_object_type;
     // A bare type parameter whose constraint may be nullish becomes `T & {}`
     // (tsc's `getNonNullableType` / `NonNullable<T>`). The `& {}` marker
     // keeps the value assignable back to a `T` slot while exposing the
@@ -882,6 +896,13 @@ pub fn getTruthyPart(c: *Checker, t: TypeId) Error!TypeId {
     return switch (s.kind(t)) {
         .null, .undefined, .void, .bool_false => types.never_type,
         .boolean => types.true_type,
+        // Under strictNullChecks tsc narrows `unknown` as if it were
+        // `undefined | null | {}` (`unknownUnionType`) and re-spells the full
+        // union `unknown` afterwards, so a guard that removes the nullish
+        // arms leaves `{}` — which carries `Object`'s apparent members.
+        // `if (!e) return; e.toString()` on an `unknown` catch value is the
+        // idiom that needs it.
+        .unknown => types.empty_object_type,
         // A truthy naked type parameter is `T & {}` — tsc's
         // `getAdjustedTypeWithFacts` maps the `Truthy` facts over the type
         // and replaces any constituent that can be nullish with
