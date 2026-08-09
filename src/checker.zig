@@ -738,7 +738,7 @@ pub const map_containers = [_][]const u8{
     "lazy_map",                 "pattern_root_decls",     "pattern_root_ids",
     "pattern_narrow_busy",      "key_name_types",         "enum_members",
     "keyof_obj_cache",          "trunc_expansions",       "inst_map_bytes",
-    "tp_mentions",              "smk_cache",
+    "tp_mentions",              "smk_cache",              "rel_maybe",
 };
 
 /// One enum member as `eachEnumMember` yields it: the name atom and the
@@ -1586,6 +1586,47 @@ pub const Checker = struct {
     /// / `Unreliable`, same purpose: a measurement whose relation was truncated
     /// must fall back to the structural walk, not silently answer "bivariant".
     rel_guard_tripped: bool = false,
+    /// tsc's `Ternary.Maybe`, carried out-of-band. Set by every relation frame
+    /// that answered from ASSUMPTION rather than from evidence — an in-progress
+    /// (cycle) hit, the growing-instantiation guard, the depth cut — and read
+    /// by `relate` on the way out.
+    ///
+    /// A pair whose verdict rests on an assumption is not a fact about the
+    /// pair; it is a fact about the WALK that reached it. Publishing it to
+    /// `relation` makes the whole run's answer for that pair a function of
+    /// which walk arrived first, and which walk arrives first is a function of
+    /// the file order and of the `--checkers=N` partition — the exact
+    /// convergence defect this exists to close. tsc keeps such results on its
+    /// `maybeKeys` stack instead of in `relation`, and commits them only at a
+    /// frame that did not need the assumption.
+    ///
+    /// `relate` therefore clears it around the walk, and on the way out either
+    /// publishes (the walk used no assumption) or withdraws the in-progress
+    /// mark and propagates the flag to the caller, whose own verdict now rests
+    /// on the same assumption.
+    rel_assumed: bool = false,
+    /// tsc's `maybeKeys`: the `relation` keys whose in-progress mark is still
+    /// standing because the frame that wrote it could only answer from
+    /// assumption. They are NOT withdrawn when that frame returns — within the
+    /// outermost relation query they keep answering "related", which is what
+    /// stops a recursive pair from being re-walked once per re-ask — and they
+    /// are settled in one of three ways:
+    ///
+    ///   * an ancestor frame answers YES *without* consulting an assumption:
+    ///     the assumption held, so its whole group is published as related;
+    ///   * an ancestor answers NO: the group is withdrawn, and the ancestor's
+    ///     own NO is published only if it too needed no assumption;
+    ///   * the outermost frame returns with the group still pending: every
+    ///     remaining mark is withdrawn, so nothing derived from an assumption
+    ///     survives the query.
+    ///
+    /// The third case is where ztsc departs from tsc, which commits a
+    /// still-pending group as "succeeded" at its outermost frame. Committing
+    /// there publishes an answer whose derivation was an assumption, and WHICH
+    /// frame is outermost is a function of the walk that got there first —
+    /// i.e. of the file order and of the `--checkers=N` partition. Dropping is
+    /// the same answer for this query and no answer for the next one.
+    rel_maybe: std.ArrayListUnmanaged(u64) = .empty,
     /// Nesting depth of an INTERSECTION-target decomposition. tsc relates a
     /// source to each constituent of an intersection target with
     /// `IntersectionState.Target`, which — among other things — turns the
