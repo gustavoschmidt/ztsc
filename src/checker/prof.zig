@@ -1770,6 +1770,88 @@
 //!   class.** There is none to share: their SELF cost is 8-13% of their charge
 //!   (table above), so there is no per-class rebuild to hoist.
 //!
+//! ### It LANDED, and it is the largest single measured win on immich
+//!
+//! The deferral the section above describes is implemented. A fresh type
+//! parameter is minted with `FreshTp.pending_bound` — the UNSUBSTITUTED
+//! constraint — plus the canonical map id to substitute it under, and
+//! `typeParamConstraint`'s `isFreshTp` arm (`props.zig:623`) forces it on
+//! first read via `resolveFreshBound`. The three blockers were answered as:
+//!
+//! 1. `canonMapId` now keeps `Checker.inst_map_bytes`, an id-indexed list
+//!    ALIASING the key table's arena-owned packed bytes (no second copy), and
+//!    `mapForId` runs the interning backwards. Ids are dense from 1, so it is
+//!    an array index, and the bytes outlive any statement.
+//! 2. `pending_bound` / `pending_map` / `pending_enforce` /
+//!    `pending_default_moved` on `FreshTp`. The enforcement gate (`eligible`
+//!    and `kind(oc) != .type_param`) needs no substitution, so it is still
+//!    decided eagerly and only carried.
+//! 3. **The mint test**, which is the crux. `boundMayMove(oc, map)` compares
+//!    `map` against `tpMentions(oc)` — the set of type-param symbols `oc`
+//!    mentions, walked once per DISTINCT DECLARED CONSTRAINT (a few hundred
+//!    small unreduced nodes for a whole program) and memoized per `TypeId`.
+//!    The walk mirrors `containsTypeParamInner` arm for arm, on the ground
+//!    that that predicate is the gate `instantiate` itself early-outs on, so
+//!    anything it cannot reach cannot be substituted either; it saturates
+//!    (assume every symbol) at a signature that binds its own type parameters
+//!    rather than model shadowing, and at any arm the mirror does not cover.
+//!    An identity binding (`T := T`) is skipped, which matters because
+//!    re-instantiating an already-substituted signature produces them.
+//!
+//! The test is EXACT in the direction that can lose a diagnostic and only
+//! approximate in the direction that costs one extra mint:
+//!
+//! * `false` PROVES `instantiateId(oc, map) == oc`, so the caller uses `oc`
+//!   itself and skips the substitution outright — that is the `discarded`
+//!   population (82 visits on immich) collected for free, and it is also what
+//!   keeps `--no-inst-cache` an oracle, since with no map id to defer under
+//!   the eager path is all that runs.
+//! * `true` means "may move". A type that mentions a rebound symbol can still
+//!   substitute back to itself if a reduction cancels out, and then the eager
+//!   code would not have minted at all. That case is caught at RESOLUTION
+//!   time, where both `oc` and `nc` are in hand: a mint that was speculative
+//!   (`!pending_default_moved`) and resolves to `nc == oc` installs `oc` as an
+//!   ENFORCED constraint, which is what the original parameter carried.
+//!   Without that branch an ineligible bound would resolve to `no_type` and
+//!   silently delete a constraint the program declared.
+//!
+//! `Stats.bound_speculative` counts that branch firing. It is **zero on every
+//! gated corpus** — immich, all eight parity packages, excalidraw, outline,
+//! social-app, vscode — so on real code the cheap test and the exact one never
+//! disagreed on a bound anybody read. (It cannot see a speculative mint that
+//! is never forced; those are invisible by construction, and the only trace
+//! they leave is interned-type count. drizzle-orm gains 20 types out of
+//! 56,227 and its 83 diagnostics are byte-identical.)
+//!
+//! Measured, `--checkers=1` immich, interleaved against `b4a8fff`:
+//!
+//!     node visits    11,121,728 -> 7,539,111   (-32.2%)
+//!     memo misses     5,907,484 -> 4,311,271   (-27.0%)
+//!     interned types  2,507,374 -> 1,872,106   (-25.3%)
+//!     type arena        86.3 MB -> 64.7 MB     (-25.0%)
+//!     instructions      38.86 G -> 29.08 G     (-25.2%)
+//!     deferred bounds minted 128,345, forced 14,902 (11.6%)
+//!
+//! The predicted 3,571,858 never-read visits and the measured 3,582,617
+//! removed are the same number: essentially ALL of it was recovered, and
+//! `inst_bound_visits` falls from 3,925,254 (35.3% of the run) to 807.
+//!
+//! **The visit win is also a MEMORY win, and that was not obvious.** A
+//! constraint that is never substituted is a type that is never interned, so
+//! the type store shrinks in the same proportion as the visits — at
+//! `--checkers=4`, 7,643,613 -> 5,467,811 types and 261.1 -> 186.9 MB of type
+//! arena, peak RSS 1078 -> 816 MB (-24%) and instructions 100.20 -> 67.17 G
+//! (-33.0%). At `--checkers=8`: -36.0% instructions, -29.4% types, -23.6%
+//! RSS. This is the first change on this board that moves both bars at once,
+//! and it composes with the bounded-memo work rather than overlapping it.
+//!
+//! What it does NOT touch: everything without kysely-shaped bounds.
+//! excalidraw -0.5% instructions / -772 types, outline -0.1%, social-app
+//! -0.0%, vscode -1.0%, the `multi` corpus byte-identical in every counter.
+//! Among the packages only typebox (-14.2%), ajv (-11.5%) and hono (-6.9%)
+//! see anything, and RSS moves by at most +/-0.6 MB anywhere. Diagnostics are
+//! byte-identical on all of it, at c1 through c16.
+//!
 //! The instrument in this file has now done its job three times over and the
 //! lesson each time was the same: **every remaining key was ordinary type-
 //! system surface, and the profile was useful for LOCATING the frame, never
@@ -2152,6 +2234,12 @@ pub fn report(c: *Checker) void {
     }) catch {};
     w.print("  of which enforced {d} / widen-only {d} / discarded {d}\n", .{
         c.stats.inst_bound_enforced, c.stats.inst_bound_widen, c.stats.inst_bound_discarded,
+    }) catch {};
+    w.print("  deferred bounds minted {d}, forced {d} ({d:.1}%), speculative-and-forced {d}\n", .{
+        c.stats.bound_deferred,
+        c.stats.bound_forced,
+        if (c.stats.bound_deferred == 0) 0.0 else 100.0 * @as(f64, @floatFromInt(c.stats.bound_forced)) / @as(f64, @floatFromInt(c.stats.bound_deferred)),
+        c.stats.bound_speculative,
     }) catch {};
     {
         var minted: u64 = 0;

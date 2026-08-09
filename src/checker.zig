@@ -139,6 +139,17 @@ pub const Stats = struct {
     /// The share that moved nothing, so no fresh parameter was minted and the
     /// substituted bound was discarded on the spot.
     inst_bound_discarded: u64 = 0,
+    /// Fresh type parameters minted with an UNSUBSTITUTED bound
+    /// (`FreshTp.pending_bound`), and how many of those bounds anybody ever
+    /// asked for. Always counted (not prof-gated): the ratio is the whole
+    /// point of the deferral and it costs two increments per mint.
+    bound_deferred: u64 = 0,
+    bound_forced: u64 = 0,
+    /// Deferred bounds that, once forced, turned out NOT to move — the mints
+    /// `boundMayMove` made speculatively, where the eager code would have kept
+    /// the original parameter. Zero on every gated corpus; a non-zero here is
+    /// the interning-identity risk of the whole change, made observable.
+    bound_speculative: u64 = 0,
     /// `Checker.inst_count` at seal: the instantiation work this instance
     /// charged against `max_instantiation_count`, and the comparator for
     /// tsgo's `--extendedDiagnostics` Instantiations. Reported so the quantity
@@ -593,7 +604,34 @@ pub const FreshTp = struct {
     /// signature relation tests as `source.symbol === target.symbol` before
     /// erasing the pair to `any` (`signatureAssignableModeInnerErase`).
     orig: SymbolId = 0,
+    /// DEFERRED BOUND. When this is not `no_type`, `constraint` and
+    /// `widen_bound` above are not yet computed: this is the *unsubstituted*
+    /// constraint of `orig` and `pending_map` the canonical id of the map to
+    /// substitute it under. `resolveFreshBound` forces it (and clears this
+    /// field) on the first read through `typeParamConstraint` — the single
+    /// reader of a fresh parameter's bound — so a bound no call site ever
+    /// resolves costs nothing. On immich 88% of them are never read.
+    pending_bound: TypeId = types.no_type,
+    pending_map: u32 = 0,
+    /// Whether a forced bound is ENFORCED (`constraint`) rather than merely
+    /// carried for the literal-widening rule (`widen_bound`); the `eligible`
+    /// / `kind(oc) != .type_param` gate of the mint site, evaluated eagerly
+    /// because it needs no substitution.
+    pending_enforce: bool = false,
+    /// Whether this record would have been minted even had the constraint
+    /// turned out not to move — i.e. the DEFAULT moved. When false and the
+    /// forced bound turns out to equal the unsubstituted one, the mint was
+    /// speculative: the eager code would have kept the original parameter,
+    /// whose constraint is `pending_bound` *enforced*, so that is what the
+    /// resolution installs regardless of `pending_enforce`.
+    pending_default_moved: bool = false,
 };
+
+/// The set of type-parameter symbols a type mentions (`Checker.tp_mentions`).
+/// `saturated` means "gave up, assume every symbol": the walk stops at a
+/// signature that binds its own type parameters rather than reason about
+/// which of them shadow what.
+pub const Mentions = struct { syms: []const SymbolId, saturated: bool };
 
 /// One entry of `Checker.mapped_key_scopes`: a mapped type's key parameter
 /// `K`, in scope for that map's `as`/value branches (and for anything nested
@@ -689,7 +727,8 @@ pub const map_containers = [_][]const u8{
     "ctp_syms_seen",            "weak_types",             "lazy_member",
     "lazy_map",                 "pattern_root_decls",     "pattern_root_ids",
     "pattern_narrow_busy",      "key_name_types",         "enum_members",
-    "keyof_obj_cache",          "trunc_expansions",
+    "keyof_obj_cache",          "trunc_expansions",       "inst_map_bytes",
+    "tp_mentions",
 };
 
 /// One enum member as `eachEnumMember` yields it: the name atom and the
@@ -1204,6 +1243,17 @@ pub const Checker = struct {
     /// arena (scratch is reset per statement).
     inst_map_ids: std.StringHashMapUnmanaged(u32) = .empty,
     inst_map_next: u32 = 1,
+    /// The inverse of `inst_map_ids`: `id - 1` indexes the SAME arena-owned
+    /// packed bytes the key table holds, so a map id can be decoded back into
+    /// a `[]TpMap` long after the slice it came from died. Needed by the
+    /// deferred type-parameter bound (`FreshTp.pending_bound`), which records
+    /// a map id at mint time and substitutes under it on first read, possibly
+    /// in a different statement.
+    inst_map_bytes: std.ArrayListUnmanaged([]const u8) = .empty,
+    /// `TypeId -> the set of type-param symbols it mentions` (`tpMentions`).
+    /// Populated only for declared type-parameter constraints, which are few
+    /// and small; see `boundMayMove`.
+    tp_mentions: IntMap(TypeId, Mentions) = .empty,
     /// `SymbolId -> declared constraint TypeId` (`no_type` = unconstrained).
     /// Avoids re-resolving the constraint AST on every assignability check.
     tp_constraint_cache: IntMap(SymbolId, TypeId) = .empty,
@@ -3283,6 +3333,11 @@ pub const Checker = struct {
     pub const containsFreeTypeParam = enums_zig.containsFreeTypeParam;
     pub const tpLookup = enums_zig.tpLookup;
     pub const canonMapId = enums_zig.canonMapId;
+    pub const mapForId = enums_zig.mapForId;
+    pub const boundMayMove = enums_zig.boundMayMove;
+    pub const tpMentions = enums_zig.tpMentions;
+    pub const mintFreshTpDeferred = enums_zig.mintFreshTpDeferred;
+    pub const resolveFreshBound = enums_zig.resolveFreshBound;
     pub const isFreshTp = enums_zig.isFreshTp;
     pub const isConstTypeParamSym = enums_zig.isConstTypeParamSym;
     pub const freshTp = enums_zig.freshTp;

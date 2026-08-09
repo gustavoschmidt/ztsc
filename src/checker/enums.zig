@@ -1261,6 +1261,168 @@ pub fn containsTypeParamInner(c: *Checker, t: TypeId) Error!bool {
     }
 }
 
+/// Would substituting `map` through `t` change it? Answers **without
+/// performing the substitution**, and is used at exactly one site: the mint
+/// test of `instantiateId`'s `.function` arm, which otherwise has to compute
+/// a signature's own type-parameter bounds eagerly just to find out whether
+/// they moved (32% of immich's whole instantiation demand, 88% of it never
+/// read again — see `prof.zig`'s "EAGER TYPE-PARAMETER BOUNDS").
+///
+/// The answer is EXACT in the direction that matters. `false` is returned
+/// only when no symbol `map` rebinds occurs anywhere `instantiateId` could
+/// look, so a `false` guarantees `instantiateId(t, map) == t` and the caller
+/// may use `t` itself as the substituted bound. A `true` merely means "may
+/// move": a type that mentions a rebound symbol can still substitute back to
+/// itself if a reduction cancels it out, and the caller therefore treats a
+/// `true` as speculative (see `FreshTp.pending_default_moved`).
+pub fn boundMayMove(c: *Checker, t: TypeId, map: []const TpMap) Error!bool {
+    if (map.len == 0) return false;
+    if (!try c.containsTypeParam(t)) return false;
+    const m = try c.tpMentions(t);
+    if (m.saturated) return true;
+    for (m.syms) |sym| {
+        const rep = tpLookup(map, sym) orelse continue;
+        // An identity binding (`T := T`, which a re-instantiation of an
+        // already-substituted signature produces routinely) rebinds nothing.
+        if (c.ts.kind(rep) == .type_param and c.ts.typeParamSymbol(rep) == sym) continue;
+        return true;
+    }
+    return false;
+}
+
+/// The set of type-param symbols `t` mentions, memoized per `TypeId`. Mirrors
+/// `containsTypeParamInner` arm for arm — that predicate is the gate
+/// `instantiate` early-outs on, so anything it does not reach cannot be
+/// substituted either — and additionally saturates (see `Mentions`) at a
+/// signature that binds its own type parameters, rather than reasoning about
+/// which of them shadow an outer one.
+///
+/// Called only on DECLARED type-parameter constraints, of which a program has
+/// few and each is a small unreduced node (`Readonly<FilterObject<DB, TB>>`
+/// is a ref holding a ref holding two type params), so the walk is paid once
+/// per distinct bound and never on a materialized member table.
+pub fn tpMentions(c: *Checker, t: TypeId) Error!checker_zig.Mentions {
+    if (c.tp_mentions.get(t)) |m| return m;
+    var syms: std.ArrayList(u32) = .empty;
+    defer syms.deinit(c.scratch());
+    // Pre-seed against a cycle through `t` (a constraint that reaches itself
+    // through a recursive alias reference): a re-entry sees the saturated
+    // record and the outer walk overwrites it with the real answer.
+    try c.tp_mentions.put(c.cm(), t, .{ .syms = &.{}, .saturated = true });
+    const saturated = try tpMentionsInto(c, t, &syms, false);
+    const owned: []const u32 = if (saturated or syms.items.len == 0)
+        &.{}
+    else
+        try c.cm().dupe(u32, syms.items);
+    const m: checker_zig.Mentions = .{ .syms = owned, .saturated = saturated };
+    try c.tp_mentions.put(c.cm(), t, m);
+    return m;
+}
+
+fn tpMentionsInto(c: *Checker, t: TypeId, out: *std.ArrayList(u32), use_cache: bool) Error!bool {
+    const s = &c.ts;
+    if (!try c.containsTypeParam(t)) return false;
+    // A sub-node already walked contributes its cached set wholesale. The
+    // ROOT skips this: `tpMentions` has just seeded it with the saturated
+    // cycle guard that this lookup would otherwise read back as the answer.
+    if (use_cache) if (c.tp_mentions.get(t)) |m| {
+        if (m.saturated) return true;
+        for (m.syms) |sym| try addSym(c, out, sym);
+        return false;
+    };
+    switch (s.kind(t)) {
+        .type_param => {
+            try addSym(c, out, s.typeParamSymbol(t));
+            return false;
+        },
+        .union_type, .intersection, .overloads => {
+            for (0..s.memberCount(t)) |i| {
+                if (try tpMentionsInto(c, s.memberAt(t, i), out, true)) return true;
+            }
+            return false;
+        },
+        .array => return tpMentionsInto(c, s.arrayElem(t), out, true),
+        .tuple => {
+            for (0..s.tupleLen(t)) |i| {
+                if (try tpMentionsInto(c, s.tupleElem(t, @intCast(i)).ty, out, true)) return true;
+            }
+            return false;
+        },
+        .object => {
+            for (0..s.objectPropCount(t)) |i| {
+                if (try tpMentionsInto(c, s.objectProp(t, @intCast(i)).ty, out, true)) return true;
+            }
+            if (s.objectStringIndex(t) != 0 and try tpMentionsInto(c, s.objectStringIndex(t), out, true)) return true;
+            if (s.objectNumberIndex(t) != 0 and try tpMentionsInto(c, s.objectNumberIndex(t), out, true)) return true;
+            for (0..s.objectCallSigCount(t)) |i| {
+                if (try tpMentionsInto(c, s.objectCallSig(t, @intCast(i)), out, true)) return true;
+            }
+            for (0..s.objectConstructSigCount(t)) |i| {
+                if (try tpMentionsInto(c, s.objectConstructSig(t, @intCast(i)), out, true)) return true;
+            }
+            return false;
+        },
+        .function => {
+            // Own parameters shadow, and their bounds are themselves
+            // substituted by the `.function` arm — the very thing this walk
+            // is asked about. Give up rather than model it.
+            if (s.fnTypeParamCount(t) != 0) return true;
+            if (try tpMentionsInto(c, s.fnReturn(t), out, true)) return true;
+            for (0..s.fnParamCount(t)) |i| {
+                if (try tpMentionsInto(c, s.fnParam(t, @intCast(i)).ty, out, true)) return true;
+            }
+            if (s.fnThisType(t) != types.no_type and
+                try tpMentionsInto(c, s.fnThisType(t), out, true)) return true;
+            if (s.fnHasPredicate(t)) {
+                const pr = s.fnPredicate(t);
+                if (pr.ty != types.no_type and try tpMentionsInto(c, pr.ty, out, true)) return true;
+            }
+            return false;
+        },
+        .ref => {
+            for (0..s.refArgCount(t)) |i| {
+                if (try tpMentionsInto(c, s.refArgAt(t, i), out, true)) return true;
+            }
+            return false;
+        },
+        .this_type => return tpMentionsInto(c, s.thisTypeInstance(t), out, true),
+        .conditional => {
+            if (try tpMentionsInto(c, s.condCheck(t), out, true)) return true;
+            if (try tpMentionsInto(c, s.condExtends(t), out, true)) return true;
+            if (try tpMentionsInto(c, s.condTrue(t), out, true)) return true;
+            if (try tpMentionsInto(c, s.condFalse(t), out, true)) return true;
+            return false;
+        },
+        .index_access => {
+            if (try tpMentionsInto(c, s.indexAccessObj(t), out, true)) return true;
+            if (try tpMentionsInto(c, s.indexAccessIndex(t), out, true)) return true;
+            return false;
+        },
+        .mapped => {
+            if (try tpMentionsInto(c, s.mappedConstraint(t), out, true)) return true;
+            if (try tpMentionsInto(c, s.mappedValue(t), out, true)) return true;
+            if (s.mappedAs(t) != 0 and try tpMentionsInto(c, s.mappedAs(t), out, true)) return true;
+            if (s.mappedSource(t) != 0 and try tpMentionsInto(c, s.mappedSource(t), out, true)) return true;
+            return false;
+        },
+        .template_literal_type => {
+            for (0..s.templateHoleCount(t)) |i| {
+                if (try tpMentionsInto(c, s.templateHole(t, @intCast(i)), out, true)) return true;
+            }
+            return false;
+        },
+        .string_mapping => return tpMentionsInto(c, s.stringMappingArg(t), out, true),
+        .keyof_op => return tpMentionsInto(c, s.keyofOperand(t), out, true),
+        // `containsTypeParam` said yes and this arm cannot say where from.
+        else => return true,
+    }
+}
+
+fn addSym(c: *Checker, out: *std.ArrayList(u32), sym: u32) Error!void {
+    if (std.mem.indexOfScalar(u32, out.items, sym) != null) return;
+    try out.append(c.scratch(), sym);
+}
+
 /// True iff `t` mentions a *free* type parameter — one not bound by an
 /// enclosing signature's own `<...>`. Unlike `containsTypeParam`, a
 /// signature's own params are treated as bound (not free), so
@@ -1389,12 +1551,34 @@ pub fn canonMapId(c: *Checker, map: []const TpMap) Error!u32 {
     }
     const gop = try c.inst_map_ids.getOrPut(c.cm(), bytes);
     if (!gop.found_existing) {
-        gop.key_ptr.* = try c.ca().dupe(u8, bytes); // scratch dies with the expression
+        const owned = try c.ca().dupe(u8, bytes); // scratch dies with the expression
+        gop.key_ptr.* = owned;
         gop.value_ptr.* = c.inst_map_next;
         c.inst_map_next += 1;
         c.stats.inst_maps += 1;
+        // Ids are dense from 1, so `id - 1` indexes this list; it aliases the
+        // key table's bytes (no second copy) and exists only so `mapForId`
+        // can run the interning backwards.
+        std.debug.assert(c.inst_map_bytes.items.len + 1 == gop.value_ptr.*);
+        try c.inst_map_bytes.append(c.cm(), owned);
     }
     return gop.value_ptr.*;
+}
+
+/// The inverse of `canonMapId`: decode a canonical map id back into a
+/// (scratch-allocated, sorted by symbol) `[]TpMap`. The result is a *set*,
+/// not the original slice — which is exactly what a substitution needs, and
+/// is why deferring one is sound even though the slice it was built from
+/// died with its statement.
+pub fn mapForId(c: *Checker, mid: u32) Error![]const TpMap {
+    const bytes = c.inst_map_bytes.items[mid - 1];
+    const n = bytes.len / 8;
+    const out = try c.scratch().alloc(TpMap, n);
+    for (out, 0..) |*m, i| {
+        m.sym = std.mem.readInt(u32, bytes[i * 8 ..][0..4], .little);
+        m.ty = std.mem.readInt(u32, bytes[i * 8 + 4 ..][0..4], .little);
+    }
+    return out;
 }
 
 /// True for a fresh higher-order type-param symbol (`fresh_tp_ids`).
@@ -1447,6 +1631,133 @@ pub fn mintFreshTp(c: *Checker, orig: SymbolId, map: []const TpMap, map_id: ?u32
         });
     }
     return gop.value_ptr.*;
+}
+
+/// `mintFreshTp` with the CONSTRAINT left unevaluated: `oc` is the
+/// unsubstituted bound and `mid` the map to substitute it under, recorded on
+/// the record and forced by `resolveFreshBound` the first time anybody asks
+/// for the parameter's constraint. Everything else — the name, the `const`
+/// modifier, the origin, and the already-substituted default — is identical
+/// to the eager mint, and the record's identity still keys on `(orig, mid)`
+/// alone, so deferral does not change which fresh symbol a given
+/// (parameter, map) pair gets.
+pub fn mintFreshTpDeferred(
+    c: *Checker,
+    orig: SymbolId,
+    mid: u32,
+    oc: TypeId,
+    default: TypeId,
+    has_default: bool,
+    enforce: bool,
+    default_moved: bool,
+) Error!u32 {
+    const key = (@as(u64, orig) << 32) | mid;
+    const gop = try c.fresh_tp_ids.getOrPut(c.cm(), key);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = c.fresh_tp_next;
+        c.fresh_tp_next += 1;
+        try c.fresh_tp_info.append(c.cm(), .{
+            .name = c.symNameAtom(orig),
+            .constraint = types.no_type,
+            .default = default,
+            .has_default = has_default,
+            .const_tp = c.isConstTypeParamSym(orig),
+            .orig = c.tpOrigin(orig),
+            .widen_bound = types.no_type,
+            .pending_bound = oc,
+            .pending_map = mid,
+            .pending_enforce = enforce,
+            .pending_default_moved = default_moved,
+        });
+        c.stats.bound_deferred += 1;
+    }
+    return gop.value_ptr.*;
+}
+
+/// Force a deferred bound (`FreshTp.pending_bound`) — run the substitution
+/// the mint site skipped and install `constraint` / `widen_bound`. Idempotent
+/// and cheap after the first call. This is the ONLY place a deferred bound is
+/// paid for, and on immich it runs for 12% of the parameters that carry one.
+pub fn resolveFreshBound(c: *Checker, sym: SymbolId) Error!void {
+    const idx = sym - c.fresh_tp_base;
+    const oc = c.fresh_tp_info.items[idx].pending_bound;
+    if (oc == types.no_type) return;
+    const mid = c.fresh_tp_info.items[idx].pending_map;
+    const enforce = c.fresh_tp_info.items[idx].pending_enforce;
+    const default_moved = c.fresh_tp_info.items[idx].pending_default_moved;
+    // Cleared FIRST: substituting the bound can re-enter this parameter (a
+    // bound that reaches its own signature through a recursive alias), and a
+    // re-entry must see a finished — if unconstrained — record rather than
+    // recurse forever. The eager code had the same hole and filled it the
+    // same way, with `no_type`.
+    c.fresh_tp_info.items[idx].pending_bound = types.no_type;
+    c.stats.bound_forced += 1;
+    const map = try c.mapForId(mid);
+    const nc = try c.instantiate(oc, map);
+    // `instantiate` interns, which can append to `fresh_tp_info`; re-index.
+    const rec = &c.fresh_tp_info.items[idx];
+    if (nc == oc) c.stats.bound_speculative += @intFromBool(!default_moved);
+    if (nc == oc and !default_moved) {
+        // The mint was speculative — `boundMayMove` said "may" and the
+        // substitution turned out to be a no-op, so the eager code would not
+        // have minted at all and the signature would have kept the original
+        // parameter, whose constraint is `oc`, ENFORCED. Reproduce that:
+        // dropping to `no_type` here (which is what an ineligible bound gets)
+        // would delete a constraint the program declared.
+        rec.constraint = oc;
+        rec.widen_bound = types.no_type;
+        return;
+    }
+    rec.constraint = if (enforce) nc else types.no_type;
+    rec.widen_bound = if (!enforce and nc != oc) nc else types.no_type;
+}
+
+/// The pre-deferral mint path, unchanged, for the two cases a deferral does
+/// not cover: the memo is off (`--no-inst-cache`, so there is no canonical
+/// map id to defer under and the whole run is an oracle anyway), or
+/// `boundMayMove` proved the bound cannot move — in which case `nc == oc` is
+/// established WITHOUT substituting, and the only reason to mint is a moved
+/// default. Returns the fresh symbol, or null to keep the original parameter.
+fn eagerBound(
+    c: *Checker,
+    tp: SymbolId,
+    oc: TypeId,
+    od: TypeId,
+    nd: TypeId,
+    cur_map: []const TpMap,
+    cur_id: ?u32,
+    eligible: bool,
+    may_move: bool,
+    bound_before: u64,
+) Error!?u32 {
+    const nc = if (may_move) try c.instantiateId(oc, cur_map, cur_id) else oc;
+    const bound_cost = if (c.prof.on) c.inst_total - bound_before else 0;
+    if (c.prof.on) c.stats.inst_bound_visits += bound_cost;
+    // Fresh param carries the substituted *default* (so a no-arg
+    // `<AD = DispatchType>()` resolves to the supplied dispatch). Its
+    // *constraint* is enforced only when it was a structured, reducible bound
+    // (idb `StoreName extends StoreNames<DBTypes>` → a concrete store-name
+    // union that makes `"requests"` assignable). A *bare* bound
+    // (`filter<S extends T>`) carries no constraint: it was never enforceable
+    // pre-rewrite (`bare_outer`), and enforcing its substituted form would
+    // erase a legitimate inference. Mint only when a bound moved.
+    const fc = if (eligible and oc != types.no_type and c.ts.kind(oc) != .type_param) nc else types.no_type;
+    // A bare bound stays unenforced, but its substituted form rides along for
+    // the literal-widening rule — see `FreshTp.widen_bound`.
+    const wb = if (fc == types.no_type and oc != types.no_type and nc != oc) nc else types.no_type;
+    if (c.prof.on) {
+        if (fc != types.no_type) {
+            c.stats.inst_bound_enforced += bound_cost;
+        } else if (wb != types.no_type) {
+            c.stats.inst_bound_widen += bound_cost;
+        } else if (nc == oc and nd == od) {
+            c.stats.inst_bound_discarded += bound_cost;
+        }
+    }
+    if (nc == oc and nd == od) return null;
+    const fresh = try c.mintFreshTp(tp, cur_map, cur_id, fc, nd, od != types.no_type, wb);
+    if (c.prof.on and fc != types.no_type) prof_zig.noteFreshBound(c, fresh, bound_cost);
+    return fresh;
 }
 
 /// Mint (or reuse) a fresh symbol for own type-param `orig` when a signature
@@ -1845,36 +2156,28 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
                     const oc = try c.typeParamConstraint(tp);
                     const bound_before = if (c.prof.on) c.inst_total else 0;
                     const nd = if (od != types.no_type) try c.instantiateId(od, cur_map.items, cur_id) else od;
-                    const nc = if (oc != types.no_type) try c.instantiateId(oc, cur_map.items, cur_id) else oc;
-                    const bound_cost = if (c.prof.on) c.inst_total - bound_before else 0;
-                    if (c.prof.on) c.stats.inst_bound_visits += bound_cost;
-                    // Fresh param carries the substituted *default* (so a
-                    // no-arg `<AD = DispatchType>()` resolves to the supplied
-                    // dispatch). Its *constraint* is enforced only when it
-                    // was a structured, reducible bound (idb `StoreName
-                    // extends StoreNames<DBTypes>` → a concrete store-name
-                    // union that makes `"requests"` assignable). A *bare*
-                    // bound (`filter<S extends T>`) carries no constraint:
-                    // it was never enforceable pre-rewrite (`bare_outer`),
-                    // and enforcing its substituted form would erase a
-                    // legitimate inference. Mint only when a bound moved.
-                    const fc = if (eligible and oc != types.no_type and c.ts.kind(oc) != .type_param) nc else types.no_type;
-                    // A bare bound stays unenforced, but its substituted form
-                    // rides along for the literal-widening rule — see
-                    // `FreshTp.widen_bound`.
-                    const wb = if (fc == types.no_type and oc != types.no_type and nc != oc) nc else types.no_type;
-                    if (c.prof.on) {
-                        if (fc != types.no_type) {
-                            c.stats.inst_bound_enforced += bound_cost;
-                        } else if (wb != types.no_type) {
-                            c.stats.inst_bound_widen += bound_cost;
-                        } else if (nc == oc and nd == od) {
-                            c.stats.inst_bound_discarded += bound_cost;
-                        }
-                    }
-                    if (nc != oc or nd != od) {
-                        fresh = try c.mintFreshTp(tp, cur_map.items, cur_id, fc, nd, od != types.no_type, wb);
-                        if (c.prof.on and fc != types.no_type) prof_zig.noteFreshBound(c, fresh.?, bound_cost);
+                    // The constraint is the expensive half (a kysely bound is
+                    // a mapped type over every column of every table in
+                    // scope) and 88% of the ones this checker computes are
+                    // never read back. Decide whether it MOVES without
+                    // substituting it, and when it may, hand the substitution
+                    // to `resolveFreshBound` — the fresh parameter's bound has
+                    // exactly one reader, `typeParamConstraint`.
+                    const may_move = oc != types.no_type and try c.boundMayMove(oc, cur_map.items);
+                    if (may_move and cur_id != null) {
+                        // `may_move` IS the mint test on the constraint side;
+                        // the default half rides along on the record so a
+                        // resolution can tell a speculative mint from a real
+                        // one. Nothing is substituted here.
+                        const enforce = eligible and c.ts.kind(oc) != .type_param;
+                        fresh = try c.mintFreshTpDeferred(tp, cur_id.?, oc, nd, od != types.no_type, enforce, nd != od);
+                    } else {
+                        // Either the memo is off (no map id to defer under) or
+                        // the bound provably cannot move, in which case
+                        // `nc == oc` exactly and the substitution is skipped
+                        // outright — this is the `discarded` population the
+                        // eager code paid for and threw away.
+                        fresh = try eagerBound(c, tp, oc, od, nd, cur_map.items, cur_id, eligible, may_move, bound_before);
                     }
                 }
                 if (fresh) |fid| {
