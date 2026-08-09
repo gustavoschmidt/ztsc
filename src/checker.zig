@@ -3832,6 +3832,7 @@ pub const Checker = struct {
     pub const mentionsActiveInferVar = calls_zig.mentionsActiveInferVar;
     pub const partialParamCtx = calls_zig.partialParamCtx;
     pub const instantiateKnownParams = calls_zig.instantiateKnownParams;
+    pub const isFedEcho = calls_zig.isFedEcho;
     pub const paramIsBareCallbackReturn = calls_zig.paramIsBareCallbackReturn;
     pub const isBareOrUnionMember = calls_zig.isBareOrUnionMember;
     pub const inferTypeArgs = calls_zig.inferTypeArgs;

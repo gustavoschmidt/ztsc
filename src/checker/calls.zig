@@ -1033,6 +1033,34 @@ fn seedKeepsPropLiteral(c: *Checker, pt: TypeId, tp_syms: []const u32, seed: []c
     return false;
 }
 
+/// Is contravariant candidate `cand` nothing but the value `fed` that this
+/// call substituted into the argument's contextual type — either verbatim, or
+/// with union constituents the target position already matched away removed?
+/// Deliberately SYNTACTIC (constituent identity, not assignability): a
+/// genuinely narrower candidate from an ANNOTATED callback parameter is not a
+/// sub-union of the fed type, so it still counts as evidence.
+pub fn isFedEcho(c: *Checker, cand: TypeId, fed: TypeId) Error!bool {
+    if (cand == fed) return true;
+    if (c.ts.kind(fed) != .union_type) return false;
+    const fed_ms = try c.memberList(fed);
+    const cand_ms: []const TypeId = if (c.ts.kind(cand) == .union_type)
+        try c.scratch().dupe(TypeId, try c.memberList(cand))
+    else
+        &.{cand};
+    if (cand_ms.len >= fed_ms.len) return false;
+    for (cand_ms) |m| {
+        var found = false;
+        for (fed_ms) |f| {
+            if (f == m) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
 pub fn instantiateKnownParams(
     c: *Checker,
     t: TypeId,
@@ -1345,6 +1373,16 @@ pub fn inferTypeArgs(
         {
             const probe_cands = try c.scratch().alloc(TypeId, tp_syms.len);
             for (candidates, 0..) |cd, i| probe_cands[i] = cd;
+            // What pass two FEEDS each parameter, plus the pre-pass state —
+            // read by the contravariant echo guard after the re-check.
+            const fed2 = try c.scratch().alloc(TypeId, tp_syms.len);
+            const before2 = try c.scratch().alloc(TypeId, tp_syms.len);
+            const before_contra2 = try c.scratch().alloc(TypeId, tp_syms.len);
+            for (tp_syms, 0..) |_, i| {
+                fed2[i] = types.no_type;
+                before2[i] = candidates[i];
+                before_contra2[i] = contra[i];
+            }
             c.side_query_depth += 1;
             const ctx2 = blk: {
                 errdefer c.side_query_depth -= 1;
@@ -1388,6 +1426,7 @@ pub fn inferTypeArgs(
                     // `keyof` is `string`, which is how RTK's
                     // `slice.actions` became `{}`.
                     if (map2.items.len > 0) v = try c.instantiate(v, map2.items);
+                    fed2[i] = v;
                     try map2.append(c.scratch(), .{ .sym = sym, .ty = v });
                 }
                 break :blk try c.instantiate(pt, map2.items);
@@ -1395,6 +1434,39 @@ pub fn inferTypeArgs(
             c.side_query_depth -= 1;
             const at2 = try c.checkExprCached(an, ctx2);
             try c.unify(pt, at2, tp_syms, candidates, 0);
+            // The contravariant twin of the placeholder echo, for the
+            // object-literal two-pass path (Phase 2 has the same guard for a
+            // bare function argument). Pass two typed every un-annotated
+            // callback property from `fed2`, so a parameter position that
+            // mentions the type variable hands the substitution straight back
+            // as a CONTRAVARIANT candidate — and a contravariant candidate
+            // OUTRANKS the covariant one, so the echo replaces the real
+            // inference. tsc never sees it: for a context-sensitive argument
+            // it leaves the variable free (nothing to instantiate the
+            // contextual type with yet), so the parameter's type stays `T`
+            // and inferring `T` from `T` yields nothing.
+            //
+            // react-query's `useMutation({ onMutate, onError })` is the shape:
+            // `onMutate` returns `Ctx | undefined` (the covariant candidate)
+            // while `onError`'s `onMutateResult: TContext | undefined`
+            // parameter echoes the fed `Ctx | undefined` back, minus the
+            // `undefined` the target union already matched — a contravariant
+            // `Ctx`, which then rejected `onMutate`'s own return.
+            //
+            // Only a candidate that is our own guess or a part of it is
+            // dropped, and only for a parameter no earlier argument had
+            // already constrained.
+            for (contra, 0..) |*cc, i| {
+                if (cc.* == before_contra2[i] or cc.* == types.no_type) continue;
+                if (before2[i] != types.no_type or fed2[i] == types.no_type) continue;
+                // Only when pass two produced a real COVARIANT candidate to
+                // fall back on. Where the echo is the parameter's only
+                // evidence it is still the best guess available (dropping it
+                // leaves the parameter to its constraint, which loses the
+                // argument's shape outright).
+                if (candidates[i] == types.no_type) continue;
+                if (try c.isFedEcho(cc.*, fed2[i])) cc.* = before_contra2[i];
+            }
             continue;
         }
         var at = try c.checkExprCached(an, arg_ctx);
