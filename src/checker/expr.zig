@@ -1222,8 +1222,16 @@ pub fn jsxAttributeValueType(c: *Checker, value: Node, ctx: TypeId) Error!TypeId
             // `onPick?: (v: number) => void` — without the context every such
             // parameter raises TS7006). Other value kinds are checked
             // context-free.
+            // A CALL is contextually typed too, so the callee's generic
+            // inference gets tsc's `InferencePriority.ReturnType` seed: RN's
+            // `size={platform({web: 'tiny', native: 'small'})}`
+            // (`select<T>(spec: {[p in OS]?: T}): T | undefined`) keeps both
+            // literals only because the attribute's `ButtonSize | undefined`
+            // reaches the call — checked context-free every property widens
+            // to `string` and `T` infers `string`.
             const vctx = switch (c.nodeTag(cd.lhs)) {
                 .template_expr, .object_literal, .array_literal, .cond_expr, .arrow_fn, .function_expr => ctx,
+                .call_expr, .call_expr_targs, .optional_call => ctx,
                 else => types.no_type,
             };
             return c.checkExprCached(cd.lhs, vctx);
