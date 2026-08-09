@@ -574,8 +574,27 @@ pub fn paramInfo(c: *Checker, pn: Node, index: u32, ctx_sig: TypeId, report_impl
         0;
 
     var ty: TypeId = types.no_type;
+    // tsc's `getTypeForVariableLikeDeclaration` order for a PARAMETER: the
+    // type annotation, then the CONTEXTUAL parameter type, and only then the
+    // initializer. ztsc had the last two the other way round, so a default
+    // erased the contextual type it was a default FOR — social-app's
+    // `build(params = {})`, written against
+    // `build: (params?: Record<string, any>) => string`, typed `params` as
+    // `{}` and every `params[name]` was a false TS7053.
+    var ctx_ty: TypeId = types.no_type;
+    if (type_ann == 0 and ctx_sig != types.no_type and c.ts.kind(ctx_sig) == .function) {
+        if (try c.paramTypeAt(ctx_sig, index)) |ct| ctx_ty = ct;
+    }
     if (type_ann != 0) {
         ty = try c.typeFromTypeNode(type_ann);
+    } else if (ctx_ty != types.no_type) {
+        // tsc's `removeOptionalityFromDeclaredType`: a parameter WITH an
+        // initializer cannot be `undefined` at the point its body reads it,
+        // so `undefined` comes off the declared type.
+        ty = if (init_node != 0) try c.removeUndefined(ctx_ty) else ctx_ty;
+        // The initializer is still checked — for its own diagnostics —
+        // against the type it is a default for.
+        if (init_node != 0) _ = try c.checkExprCached(init_node, ty);
     } else if (init_node != 0) {
         ty = try c.widenLiteral(try c.checkExprCached(init_node, types.no_type));
         // A parameter whose NAME is an object binding pattern takes its
@@ -589,8 +608,6 @@ pub fn paramInfo(c: *Checker, pn: Node, index: u32, ctx_sig: TypeId, report_impl
         // every property of `({ w = 1, h = 2 } = { w: 0, h: 0 })` came out
         // REQUIRED and `f({ w: 5 })` reported TS2345.
         ty = try c.optionalizePatternDefaults(ty, name_node);
-    } else if (ctx_sig != types.no_type and c.ts.kind(ctx_sig) == .function) {
-        if (try c.paramTypeAt(ctx_sig, index)) |ct| ty = ct;
     }
     if (ty == types.no_type) {
         // `noImplicitAny: false` suppresses TS7006 — the parameter still
