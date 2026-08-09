@@ -360,11 +360,31 @@ pub fn checkJsxElement(c: *Checker, node: Node) Error!TypeId {
         props = (try c.jsxComponentProps(tag_ty, targs.items, node)) orelse types.no_type;
     }
     try c.checkJsxAttributes(node, e, props, is_component, c.jsxChildrenPresent(e));
+    // tsc's `getContextualTypeForChildJsxExpression`: a JSX child EXPRESSION is
+    // contextually typed by the `JSX.ElementChildrenAttribute` prop (usually
+    // `children`) of the tag's attributes type — the same type the identical
+    // value written as an explicit `children={…}` attribute would get.
+    // ztsc typed children at no context at all, so the RENDER-PROP idiom
+    // (`children: Node | ((state: State) => Node)`, which every social-app
+    // `Link`/`Button`/`Toggle.Item` is written with) left the arrow's
+    // parameters implicit `any` — TS7006 at each one.
+    //
+    // Scoped to the single-semantic-child case, which is what the idiom is:
+    // tsc maps a multi-child list through the field type's array-like element
+    // (indexed at the child's position), and typing every child at the whole
+    // field type instead would be wrong.
+    const child_ctx: TypeId = blk: {
+        if (!is_component or props == types.no_type) break :blk types.no_type;
+        if (c.jsxSemanticChildCount(e) != 1) break :blk types.no_type;
+        const rt = try c.resolveStructural(props);
+        if (rt == types.no_type) break :blk types.no_type;
+        break :blk try c.ctxPropType(rt, rt, try c.jsxChildrenAttrName());
+    };
     for (c.tree.extraRange(e.children_start, e.children_end)) |ch| {
         switch (c.nodeTag(ch)) {
             .jsx_expr_container => {
                 const cd = c.tree.nodeData(ch);
-                if (cd.lhs != null_node) _ = try c.checkExprCached(cd.lhs, types.no_type);
+                if (cd.lhs != null_node) _ = try c.checkExprCached(cd.lhs, child_ctx);
             },
             .jsx_element => _ = try c.checkJsxElement(ch),
             else => {}, // jsx_text
@@ -1131,11 +1151,26 @@ pub fn jsxChildrenAttrName(c: *Checker) Error!Atom {
 /// Whether a JSX element has meaningful children (any element/expression,
 /// or non-whitespace text) — whitespace-only text does not count.
 pub fn jsxChildrenPresent(c: *Checker, e: ast.JsxElementData) bool {
+    return c.jsxSemanticChildCount(e) != 0;
+}
+
+/// How many of a JSX element's children are SEMANTIC (tsc's
+/// `getSemanticJsxChildren`) — the count that decides whether the
+/// `children` prop type types one child directly or is spread across a list.
+/// Stops at two: no caller distinguishes higher counts.
+pub fn jsxSemanticChildCount(c: *Checker, e: ast.JsxElementData) u32 {
+    var n: u32 = 0;
     for (c.tree.extraRange(e.children_start, e.children_end)) |ch| {
         switch (c.nodeTag(ch)) {
-            .jsx_element => return true,
+            .jsx_element => {
+                n += 1;
+                if (n == 2) return n;
+            },
             .jsx_expr_container => {
-                if (c.tree.nodeData(ch).lhs != null_node) return true;
+                if (c.tree.nodeData(ch).lhs != null_node) {
+                    n += 1;
+                    if (n == 2) return n;
+                }
             },
             else => { // jsx_text
                 // tsc ignores text that is whitespace-only AND spans a
@@ -1153,12 +1188,15 @@ pub fn jsxChildrenPresent(c: *Checker, e: ast.JsxElementData) bool {
                             break;
                         }
                     }
-                    if (non_ws or !has_newline) return true;
+                    if (non_ws or !has_newline) {
+                        n += 1;
+                        if (n == 2) return n;
+                    }
                 }
             },
         }
     }
-    return false;
+    return n;
 }
 
 pub fn containsAtom(list: []const Atom, name: Atom) bool {

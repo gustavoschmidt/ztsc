@@ -3321,10 +3321,25 @@ pub fn narrowBySwitchClause(c: *Checker, t: TypeId, clause: Node, key: RefKey, d
     const vt = try c.ts.regularLiteral(try c.checkExprCached(test_node, types.no_type));
     const is_lit = c.ts.isLiteralLike(vt) or c.ts.kind(vt) == .null or c.ts.kind(vt) == .undefined;
     if (!is_lit) return t;
-    return if (prop == 0)
+    const narrowed = if (prop == 0)
         try c.narrowToValue(t, vt)
     else
         try c.narrowByDiscriminant(t, prop, vt, true, decl);
+    // An OPTIONAL discriminant read (`switch (x?.k)`) short-circuits to
+    // `undefined` when the receiver is nullish, so a `case` label that is not
+    // itself nullish forces the receiver non-nullish on that clause — tsc's
+    // optional-chain containment, which the `if (x?.k === lit)` path above
+    // already applies. The discriminant filter alone keeps `undefined` (a
+    // constituent with no `k` at all is conservatively kept), so a
+    // `switch (payload?.reason)` left every `case` body reading `payload` as
+    // possibly undefined. A switch compares with `===`, hence `strict`.
+    //
+    // Only the `case` clauses: `default:` is exactly where a short-circuited
+    // chain lands, so the receiver stays nullable there.
+    if (try c.optionalChainContainsRef(disc, key)) {
+        return c.narrowByOptChainContainment(narrowed, test_node, true, true);
+    }
+    return narrowed;
 }
 
 /// Every value the discriminant can take is covered by a `case` label, so

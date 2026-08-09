@@ -122,6 +122,10 @@ const usage =
     \\                         (declaration unit, cost, demanding files) table
     \\                         the cross-checker duplication analysis reads;
     \\                         pair with --checkers=1
+    \\  --file-order=ORDER     permute the root file list before seeding:
+    \\                         source (default), reverse, or shuffle=SEED.
+    \\                         The result must not change (correctness axis;
+    \\                         see bench/order_sweep.sh)
     \\  --eager-members        materialize every interface/class member table
     \\                         whole, instead of member-by-member on demand
     \\                         (bisect leg / oracle)
@@ -147,6 +151,18 @@ const Timer = struct {
         const ns = d.raw.nanoseconds;
         return if (ns > 0) @intCast(ns) else 0;
     }
+};
+
+/// How the program's root file list is ordered before it is seeded. The
+/// order is supposed to be unobservable — this exists so a gate can prove it.
+const FileOrder = union(enum) {
+    /// As the tsconfig `include` walk (or the command line) produced it.
+    source: void,
+    /// Exactly reversed. The cheapest permutation that moves every file.
+    reverse: void,
+    /// A seeded Fisher-Yates deal, so a failing order is reproducible from
+    /// the seed alone.
+    shuffle: u64,
 };
 
 const Cli = struct {
@@ -229,6 +245,13 @@ const Cli = struct {
     /// `--partition-file=<path>`: benchmark aid; override the file->checker
     /// partition with an externally computed one (see the read site).
     partition_file: ?[]const u8 = null,
+    /// `--file-order=<source|reverse|shuffle=SEED>`: permute the program's
+    /// ROOT file list before anything is seeded from it. A correctness axis,
+    /// not a benchmark aid: tsc's result does not depend on the order the
+    /// roots are listed in, so neither may ztsc's. Nothing else varies —
+    /// same files, same options, same `--checkers`. See `bench/order_sweep.sh`
+    /// and the read site near `entry_paths`.
+    file_order: FileOrder = .{ .source = {} },
     /// null = auto (pretty iff stderr is a TTY).
     pretty: ?bool = null,
     project: ?[]const u8 = null,
@@ -867,6 +890,26 @@ pub fn main(init: std.process.Init) !void {
     // symlink are two files with two symbol universes. Outside `node_modules`
     // the call is a no-op, so project roots keep the path the user typed (and
     // pay no realpath syscall).
+    // `--file-order`: permute the roots before a single id is handed out.
+    // Everything downstream — file ids, the BFS discovery order, the cost
+    // partition and its tie-breaks — is a function of this list, so this is
+    // the one place that can vary the axis. tsc's answer does not depend on
+    // root order; `bench/order_sweep.sh` is the gate that says ztsc's does
+    // not either.
+    switch (cli.file_order) {
+        .source => {},
+        .reverse => {
+            const permuted = try arena.dupe([]const u8, entry_paths);
+            std.mem.reverse([]const u8, permuted);
+            entry_paths = permuted;
+        },
+        .shuffle => |seed| {
+            const permuted = try arena.dupe([]const u8, entry_paths);
+            var prng: std.Random.DefaultPrng = .init(seed);
+            prng.random().shuffle([]const u8, permuted);
+            entry_paths = permuted;
+        },
+    }
     for (entry_paths) |p| {
         const norm = try ztsc.paths.normalizePath(arena, p);
         const key = try rcache.canonicalPath(io, resolve_scratch.allocator(), Io.Dir.cwd(), norm);
@@ -2063,6 +2106,18 @@ fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8, bad_arg: *[]c
             cli.dup_profile = true;
         } else if (std.mem.startsWith(u8, arg, "--partition-file=")) {
             cli.partition_file = arg["--partition-file=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--file-order=")) {
+            const v = arg["--file-order=".len..];
+            if (std.mem.eql(u8, v, "source")) {
+                cli.file_order = .{ .source = {} };
+            } else if (std.mem.eql(u8, v, "reverse")) {
+                cli.file_order = .{ .reverse = {} };
+            } else if (std.mem.startsWith(u8, v, "shuffle=")) {
+                cli.file_order = .{ .shuffle = std.fmt.parseInt(u64, v["shuffle=".len..], 10) catch
+                    return error.BadFlagValue };
+            } else if (std.mem.eql(u8, v, "shuffle")) {
+                cli.file_order = .{ .shuffle = 1 };
+            } else return error.BadFlagValue;
         } else if (std.mem.eql(u8, arg, "--lazy-stats")) {
             cli.lazy_stats = true;
         } else if (std.mem.startsWith(u8, arg, "--inst-focus=")) {

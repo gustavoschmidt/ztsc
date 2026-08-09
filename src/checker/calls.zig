@@ -2359,13 +2359,21 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                 if (m == tp_member) continue;
                 if (!try c.containsTypeParam(m)) continue;
                 for (src_members, 0..) |sm, i| {
-                    // Whether the pair MADE an inference, not whether the
-                    // candidate set changed: a second constituent inferring the
-                    // same type as the first is still a match. See
-                    // `Checker.infer_writes`.
-                    const writes = c.infer_writes;
+                    // "Was an inference MADE from this source constituent" —
+                    // tsc watches `inferencePriority`, not the recorded
+                    // answer. A constituent that re-proposes a candidate the
+                    // set ALREADY holds still counts as matched: comparing the
+                    // candidate array instead left it unmatched, and it then
+                    // rode into the naked variable a second time. An
+                    // intersection argument is where that bites, because every
+                    // constituent walks the same target property — `QueryOptions
+                    // <Link, Link> & {initialData?: …}` inferred `TData` from
+                    // the ref by origin pairing first, so the override object's
+                    // `InitialDataFunction<Link>` re-inference looked like a
+                    // no-op and the whole union became the answer.
+                    const writes_before = c.infer_writes;
                     try c.unify(m, sm, tp_syms, candidates, depth + 1);
-                    if (c.infer_writes != writes) matched[i] = true;
+                    if (c.infer_writes != writes_before) matched[i] = true;
                 }
             }
             // A wrapper member contributed a candidate for the naked var.
@@ -2520,7 +2528,35 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                 for (0..s.objectPropCount(param)) |i| {
                     const pp = s.objectProp(param, @intCast(i));
                     if (s.objectPropByName(ra, pp.name)) |ap| {
-                        try c.unify(pp.ty, ap.ty, tp_syms, candidates, depth + 1);
+                        // tsc's `inferFromProperties` pairs `getTypeOfSymbol`
+                        // on both sides, and under `strictNullChecks` an
+                        // OPTIONAL property's type carries `| undefined`. That
+                        // matters for union-to-union inference: the source's
+                        // `undefined` constituent pairs off identically with
+                        // the target's and is REMOVED, so only the residual
+                        // reaches the naked type variable. Dropping the
+                        // implicit `| undefined` left it unpaired, and it then
+                        // rode into every inferred argument —
+                        // `queryOptions({queryFn: () => link})` fed to
+                        // `fetchQuery<TQueryFnData, TData = TQueryFnData>`
+                        // (whose `initialData?: TData | InitialDataFunction<
+                        // TData>` is exactly this shape) inferred `TData =
+                        // ResolvedLink | undefined`, and every use of the
+                        // awaited result was a spurious TS18048.
+                        //
+                        // Only added when the source actually has an
+                        // `undefined` to pair with: an absent one cannot
+                        // subtract anything, and the extra union member would
+                        // only cost interning.
+                        var pt = pp.ty;
+                        if (pp.optional() and c.unionAnyMember(ap.ty, struct {
+                            fn f(ch: *Checker, m: TypeId) bool {
+                                return ch.ts.kind(m) == .undefined;
+                            }
+                        }.f)) {
+                            pt = try c.makeUnion2(pt, types.undefined_type);
+                        }
+                        try c.unify(pt, ap.ty, tp_syms, candidates, depth + 1);
                     }
                 }
                 const pidx = s.objectStringIndex(param);

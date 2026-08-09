@@ -1819,20 +1819,21 @@ pub const Checker = struct {
     /// and intersections preserve top-level-ness (tsc's
     /// `isTypeParameterAtTopLevel` descends them); everything else does not.
     nontop_depth: u32 = 0,
-    /// Bumped by every `unify` write into a candidate slot. tsc's
+    /// Monotone count of candidate WRITES performed by `unify`. tsc's
     /// `inferToMultipleTypes` decides whether a source constituent was
-    /// "matched" by a non-variable target constituent by watching whether
-    /// inferring the pair MADE an inference (`inferencePriority === priority`),
-    /// not by watching the candidate set change — a second constituent that
-    /// infers the SAME type as the first still counts. Comparing the candidate
-    /// array before and after missed exactly that case: in React Native's
-    /// `StyleProp<T> = T | RegisteredStyle<T> | RecursiveArray<…> | Falsy`, the
-    /// array member inferred `T` first, so `RegisteredStyle<T>` re-inferring
-    /// the same `T` left the array untouched, its source constituent counted
-    /// as unmatched, and the naked `T` swallowed the brand — every
+    /// "matched" by watching `inferencePriority` — i.e. whether an inference
+    /// was MADE — not by whether the recorded answer changed. Comparing the
+    /// candidate array instead makes a re-inference of an already-recorded
+    /// candidate invisible, and the constituent then counts as unmatched and
+    /// rides into the naked type variable a second time.
+    ///
+    /// React Native's `StyleProp<T> = T | RegisteredStyle<T> |
+    /// RecursiveArray<…> | Falsy` is the shape that shows it: the array member
+    /// infers `T` first, so `RegisteredStyle<T>` re-inferring the same `T`
+    /// left the array untouched and the naked `T` swallowed the brand — every
     /// `StyleSheet.flatten(style)` came back as
     /// `TextStyle | RegisteredStyle<TextStyle>` instead of `TextStyle`.
-    infer_writes: u32 = 0,
+    infer_writes: u64 = 0,
     /// Non-zero while `unify` is running the contextual-RETURN pass
     /// (`fillFromReturnContext`), i.e. at tsc's `InferencePriority.ReturnType`.
     /// The distinction matters for the untargeted union-SOURCE rule, which
@@ -3750,6 +3751,7 @@ pub const Checker = struct {
     pub const jsxIntrinsicAttrNames = expr_zig.jsxIntrinsicAttrNames;
     pub const jsxChildrenAttrName = expr_zig.jsxChildrenAttrName;
     pub const jsxChildrenPresent = expr_zig.jsxChildrenPresent;
+    pub const jsxSemanticChildCount = expr_zig.jsxSemanticChildCount;
     pub const containsAtom = expr_zig.containsAtom;
     pub const jsxAttributeValueType = expr_zig.jsxAttributeValueType;
     pub const checkIdentifier = expr_zig.checkIdentifier;

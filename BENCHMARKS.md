@@ -138,6 +138,14 @@ the union, and `BlobPart` where ztsc names its constituents). The property is
 held by `bench/convergence.sh`, a standing gate whose false-positive and
 under-report ceilings both sit at zero.
 
+One qualification, added when the axis was first measured: the claim is scoped
+to the order the tsconfig `include` walk produces. Permuting the *root file
+list* and holding everything else fixed, `--file-order=reverse` reports **19**
+rather than 17 — two extra `TS7053` keys in `packages/excalidraw/components/
+App.tsx`. Root order is not semantic, so those two are false positives that the
+default order happens not to reach. `bench/order_sweep.sh` is the gate for that
+axis; it does not pass yet, on this app or any other.
+
 For context on what the 17 are: excalidraw's own pinned `tsc` 4.9.4 reports
 **zero errors** on this tree. All 17 come from TypeScript 7's newer lib
 definitions — nine from the `Uint8Array`/`ArrayBuffer` generic parameters added
