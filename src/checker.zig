@@ -1819,6 +1819,14 @@ pub const Checker = struct {
     /// and intersections preserve top-level-ness (tsc's
     /// `isTypeParameterAtTopLevel` descends them); everything else does not.
     nontop_depth: u32 = 0,
+    /// Monotone count of candidate WRITES performed by `unify`'s `.type_param`
+    /// arm. tsc's `inferToMultipleTypes` decides whether a source constituent
+    /// was "matched" by watching `inferencePriority` — i.e. whether an
+    /// inference was MADE — not by whether the recorded answer changed.
+    /// Comparing the candidate array instead makes a re-inference of an
+    /// already-recorded candidate invisible, and the constituent then counts
+    /// as unmatched and rides into the naked type variable a second time.
+    infer_writes: u64 = 0,
     /// Non-zero while `unify` is running the contextual-RETURN pass
     /// (`fillFromReturnContext`), i.e. at tsc's `InferencePriority.ReturnType`.
     /// The distinction matters for the untargeted union-SOURCE rule, which
@@ -3737,6 +3745,7 @@ pub const Checker = struct {
     pub const jsxIntrinsicAttrNames = expr_zig.jsxIntrinsicAttrNames;
     pub const jsxChildrenAttrName = expr_zig.jsxChildrenAttrName;
     pub const jsxChildrenPresent = expr_zig.jsxChildrenPresent;
+    pub const jsxSemanticChildCount = expr_zig.jsxSemanticChildCount;
     pub const containsAtom = expr_zig.containsAtom;
     pub const jsxAttributeValueType = expr_zig.jsxAttributeValueType;
     pub const checkIdentifier = expr_zig.checkIdentifier;

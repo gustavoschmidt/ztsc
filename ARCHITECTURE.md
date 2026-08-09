@@ -187,6 +187,7 @@ bench/e2e.sh multi      # wall clock + peak RSS vs tsgo
 bench/crash_sweep.sh    # 8 packages × --checkers=1..16, crash + byte-identity
 bench/repeat_sweep.sh   # 8 packages × one config × N runs, byte-identity
 bench/convergence.sh    # one application × c1..c8, set-equality + tsgo scoreboard
+bench/order_sweep.sh    # one application × permuted root order, set-equality
 ```
 
 Plus the byte-identical check on a real project (see `CLAUDE.md`). If a lever
@@ -250,3 +251,22 @@ ratcheted (`CONVERGE_MAX_EXCESS` / `CONVERGE_MAX_UNDER`) so a change that
 adds a false positive fails while the absolute count is still large.
 `CONVERGE_SOFT=1` reports without the nonzero exit, which is how it runs
 until the fringe is closed.
+
+`bench/order_sweep.sh` varies the one axis none of the three above touch: the
+order the program's *root files* are listed in. A tsconfig `include` walk emits
+files in some order and a command line names them in some order; neither is
+semantic, so tsc's answer does not depend on either and ztsc's must not. But
+everything downstream is derived from that list — file ids are handed out in
+list order, module discovery BFSes from it, and the cost partition is built
+over it and breaks ties by id — so a result that moves when the list is
+permuted is a result that depends on which file happened to demand a type
+first. That is the same defect the convergence gate catches from the partition
+side, except reachable at a *fixed* checker count, which makes it far cheaper
+to shrink: no partition to reason about, just two orders of one file list.
+`--file-order=<source|reverse|shuffle=SEED>` (see the read site near
+`entry_paths` in `src/main.zig`) is the knob, and the script sweeps it and
+compares the same `(file, line, column, code)` key sets, ratcheted at zero
+volatile keys. The axis is not hypothetical and not confined to the unfinished
+apps: excalidraw, which the convergence gate holds at CONVERGED 17/17 for every
+checker count from 1 to 8, reports **19** under `--file-order=reverse` — two
+`TS7053` keys in `App.tsx` that no other gate can see.
