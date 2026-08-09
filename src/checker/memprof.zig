@@ -129,6 +129,21 @@ fn nowNs(c: *const Checker) u64 {
 
 extern "c" fn mincore(addr: *anyopaque, len: usize, vec: [*]u8) c_int;
 
+/// `mincore(2)`, however this target can reach it. Linux goes through the raw
+/// syscall so a libc-free build still compiles AND still measures; everywhere
+/// else the symbol comes from libc, and referencing it at all is gated on
+/// `link_libc` because linking it is the caller's build-time choice. Both
+/// branches are comptime-known, so exactly one survives.
+fn mincoreAvailable(ptr: [*]u8, len: usize, vec: [*]u8) bool {
+    if (comptime builtin.os.tag == .linux) {
+        return @as(isize, @bitCast(std.os.linux.mincore(ptr, len, vec))) == 0;
+    }
+    if (comptime builtin.link_libc) {
+        return mincore(@ptrCast(ptr), len, vec) == 0;
+    }
+    return false;
+}
+
 /// Resident bytes of a mapping, via `mincore`. Returns null where the call is
 /// unavailable or fails (Linux's `vec` semantics match Darwin's for bit 0).
 fn residentBytes(mapping: []align(std.heap.page_size_min) u8) ?u64 {
@@ -138,7 +153,7 @@ fn residentBytes(mapping: []align(std.heap.page_size_min) u8) ?u64 {
     const pages = (mapping.len + page - 1) / page;
     const vec = std.heap.page_allocator.alloc(u8, pages) catch return null;
     defer std.heap.page_allocator.free(vec);
-    if (mincore(@ptrCast(mapping.ptr), mapping.len, vec.ptr) != 0) return null;
+    if (!mincoreAvailable(mapping.ptr, mapping.len, vec.ptr)) return null;
     var n: u64 = 0;
     for (vec) |b| n += (b & 1);
     return n * page;
