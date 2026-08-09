@@ -45,6 +45,10 @@ pub const Volume = struct {
     lines: usize,
     bytes: usize,
     repeat: usize,
+    /// AST nodes actually enqueued to the checkers — the quantity
+    /// `defaultCheckers` keys on, so a run can be read against the
+    /// thresholds that chose its checker count.
+    check_nodes: u64 = 0,
 };
 
 /// One checker instance's wall time and partition size.
@@ -98,7 +102,7 @@ pub fn printTiming(
     try printPhase(out, "link", phases.link_ns, 0, 0);
     try printPhase(out, "check", phases.check_ns, lines_f, bytes_f);
     try out.print("  {s:<10} {d:>10.3}\n", .{ "total", total_ms });
-    try out.print("  per checker:\n", .{});
+    try out.print("  per checker: ({d} check node(s))\n", .{vol.check_nodes});
     for (checkers, 0..) |c, k| {
         try out.print("    checker[{d}] {d:>10.3} ms  {d} file(s)\n", .{ k, nsToMs(c.ns), c.files });
     }

@@ -507,10 +507,69 @@ const Worker = struct {
 /// trade-off, never the result.
 const small_program_nodes: u64 = 32_000;
 
-fn defaultCheckers(explicit: ?usize, cpu_count: usize, check_nodes: u64) usize {
+/// Check-work above which a program is large enough for the
+/// declaration-surface test below to apply at all.
+const large_program_nodes: u64 = 256_000;
+
+/// Parsed-to-checked node ratio above which a large program drops to two
+/// checkers: how much declaration surface each instance must re-materialize
+/// per unit of code it actually walks.
+///
+/// A checker instance does NOT split declaration work. Measured on immich, the
+/// set of distinct canonical types the program needs is invariant in checker
+/// count (2.51 M at one checker, ~2.5 M at four), but four checkers BUILD
+/// 7.64 M of them — 3.05x redundancy, with 87-93% of each instance's types
+/// also present in another's arena. The reason is structural rather than a bad
+/// partition: a checker's demand closure grows LOGARITHMICALLY in the files it
+/// owns (1 file 1.437 M types, 4 files 1.519 M, 16 files 1.740 M, 500 files
+/// 1.918 M), so splitting the files four ways splits the work ~1.3 ways. Four
+/// maximally different partitions — the shipped one, contiguous BFS ranges,
+/// random, and a demand-closure-optimized search — span 1.8% in total types,
+/// and the random one is not the worst.
+///
+/// What that redundancy costs tracks the declaration surface, because that is
+/// what each instance re-materializes. `check_nodes` alone cannot see it —
+/// immich (437,226) and excalidraw (409,224) are 7% apart and want DIFFERENT
+/// checker counts. The ratio does see it (median of 5, this host):
+///
+///   immich      2.61 ratio   c2 1.611 s / 384 MB   c4 1.844 s / 520 MB
+///   excalidraw  1.78 ratio   c2 0.398 s / 112 MB   c4 0.308 s / 120 MB
+///   8 packages  1.00 ratio   c4 faster than c2 on every one
+///
+/// immich at four checkers is strictly dominated — slower AND 136 MB heavier
+/// than at two — so this is not a memory-for-time trade, it is a bad operating
+/// point. excalidraw, nearly the same size, still pays off at four.
+///
+/// Both conditions are deliberately narrow: small and mid-size programs are
+/// untouched, and a large program with an ordinary dependency surface keeps
+/// four. Diagnostics are unaffected — output is byte-identical for any checker
+/// count (the determinism tests), so this only moves the resource trade-off.
+///
+/// **Evidentiary limit, stated because this moves a shipped default:** the
+/// threshold separates exactly two applications. The axis is mechanistic
+/// rather than fitted, but the boundary (1.78 vs 2.61) rests on one inversion.
+/// A large program whose declaration surface is bulky but cheap to materialize
+/// would be misclassified and would lose wall. Re-validate against outline,
+/// social-app and vscode when those checkouts are restored.
+const declaration_heavy_ratio: u64 = 220; // hundredths, i.e. 2.20x
+
+fn defaultCheckers(
+    explicit: ?usize,
+    cpu_count: usize,
+    check_nodes: u64,
+    parsed_nodes: u64,
+) usize {
     if (explicit) |n| return n;
     const wide = @min(4, cpu_count);
-    return if (check_nodes < small_program_nodes) @min(wide, 2) else wide;
+    // Too little work to repay a second instance's fixed state.
+    if (check_nodes < small_program_nodes) return @min(wide, 2);
+    // Large and declaration-heavy: extra instances re-materialize the same
+    // declaration surface instead of splitting it. Integer-only, so the
+    // choice cannot drift with floating-point rounding across hosts.
+    if (check_nodes >= large_program_nodes and
+        parsed_nodes * 100 >= check_nodes * declaration_heavy_ratio)
+        return @min(wide, 2);
+    return wide;
 }
 
 /// One checker instance: checks its partition on its own thread.
@@ -1175,7 +1234,13 @@ pub fn main(init: std.process.Init) !void {
     try items.ensureTotalCapacity(arena, n_files);
     @memset(file_owner, 0);
     var check_nodes: u64 = 0;
+    // Every parsed node, enqueued or not. The part that is NOT enqueued is the
+    // declaration surface (`.d.ts` under skipLibCheck, the embedded lib under
+    // skipDefaultLibCheck): never walked, but materialized on demand — once
+    // per checker instance that reaches it. See `declaration_heavy_ratio`.
+    var parsed_nodes: u64 = 0;
     for (0..n_files) |i| {
+        if (trees.items[i]) |tree| parsed_nodes += tree.nodes.len;
         // Embedded lib files are parsed/bound/linked (globals, lazy type
         // expansion) and, by default, also enqueued to a checker so the
         // pre-verified lib is walked just like tsc/tsgo at their defaults.
@@ -1193,7 +1258,7 @@ pub fn main(init: std.process.Init) !void {
         items.appendAssumeCapacity(.{ .file = @intCast(i), .cost = cost });
     }
 
-    const n_checkers: usize = @max(1, @min(defaultCheckers(cli.checkers, cpu_count, check_nodes), n_files));
+    const n_checkers: usize = @max(1, @min(defaultCheckers(cli.checkers, cpu_count, check_nodes, parsed_nodes), n_files));
     const tasks = try arena.alloc(CheckerTask, n_checkers);
     {
         const owned_lists = try arena.alloc(std.ArrayList(modules.FileId), n_checkers);
@@ -1626,6 +1691,7 @@ pub fn main(init: std.process.Init) !void {
             .lines = total_lines,
             .bytes = total_bytes,
             .repeat = cli.repeat,
+            .check_nodes = check_nodes,
         }, checker_times, .{
             .probes = resolve.fsProbeCount(),
             .lookups = rcache.lookups,
@@ -1976,6 +2042,39 @@ test "parseArgs flags and paths" {
     try std.testing.expectEqual(@as(usize, 2), cli.paths.len);
     try std.testing.expectEqualStrings("a.ts", cli.paths[0]);
     try std.testing.expectEqualStrings("b.ts", cli.paths[1]);
+}
+
+test "defaultCheckers: size and declaration-surface thresholds" {
+    const eq = std.testing.expectEqual;
+    // An explicit --checkers=N always wins, whatever the shape.
+    try eq(@as(usize, 7), defaultCheckers(7, 10, 1, 1));
+    try eq(@as(usize, 1), defaultCheckers(1, 10, 5_000_000, 20_000_000));
+    // Never more instances than cores.
+    try eq(@as(usize, 2), defaultCheckers(null, 2, 100_000, 100_000));
+
+    // Small program: two, whatever the surface (chalk, ajv).
+    try eq(@as(usize, 2), defaultCheckers(null, 10, 21_106, 21_106));
+    try eq(@as(usize, 2), defaultCheckers(null, 10, 27_991, 27_991));
+    // Mid-size, self-contained: four. The eight parity packages are all
+    // ratio 1.00 because a vendored `.d.ts` corpus is checked directly.
+    try eq(@as(usize, 4), defaultCheckers(null, 10, 37_004, 37_004)); // typebox
+    try eq(@as(usize, 4), defaultCheckers(null, 10, 66_444, 66_444)); // drizzle
+    try eq(@as(usize, 4), defaultCheckers(null, 10, 115_808, 115_808)); // hono
+
+    // The measured inversion, and the reason `check_nodes` alone cannot
+    // decide it: these two differ by 7% in check work and want different
+    // counts. immich 2.61x declaration surface -> two; excalidraw 1.78x -> four.
+    try eq(@as(usize, 2), defaultCheckers(null, 10, 437_226, 1_141_165));
+    try eq(@as(usize, 4), defaultCheckers(null, 10, 409_224, 727_326));
+
+    // Large but self-contained stays wide; declaration-heavy but small stays
+    // out of the new rule (the size gate is what keeps it narrow).
+    try eq(@as(usize, 4), defaultCheckers(null, 10, 900_000, 900_000));
+    try eq(@as(usize, 4), defaultCheckers(null, 10, 100_000, 900_000));
+
+    // Exactly at each boundary: the ratio test is `>=`, the size test `>=`.
+    try eq(@as(usize, 2), defaultCheckers(null, 10, large_program_nodes, large_program_nodes * 22 / 10));
+    try eq(@as(usize, 4), defaultCheckers(null, 10, large_program_nodes - 1, large_program_nodes * 22 / 10));
 }
 
 test "parseArgs workers, checkers and repeat" {
