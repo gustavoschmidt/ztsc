@@ -1375,18 +1375,38 @@ pub fn tpLookup(map: []const TpMap, sym: SymbolId) ?TypeId {
 /// id, so the id keys the instantiate memo soundly. Called once per
 /// top-level `instantiate`; the id is threaded down the recursion unchanged.
 pub fn canonMapId(c: *Checker, map: []const TpMap) Error!u32 {
-    const sorted = try c.scratch().dupe(TpMap, map);
-    std.mem.sort(TpMap, sorted, {}, struct {
-        fn lt(_: void, a: TpMap, b: TpMap) bool {
-            return a.sym < b.sym;
+    // `TpMap` is two `u32` fields and nothing else, so on a little-endian
+    // target its own bytes ARE the packed `(sym, arg)` key this used to build
+    // a second buffer for. Both the dupe and the pack loop were copies of a
+    // copy; `sliceAsBytes` reads the caller's slice in place. (The stored key
+    // is still duped into `carena` on a miss, so nothing borrows scratch.)
+    comptime std.debug.assert(@sizeOf(TpMap) == 8 and @import("builtin").cpu.arch.endian() == .little);
+    // Most maps arrive already ordered — they are built by appending a
+    // declaration's type parameters in order, and the common arities are one
+    // and two — so the sort's inputs are usually its own output. Checking
+    // costs a linear scan the pack loop was paying anyway and, when it holds,
+    // removes the scratch dupe as well as the sort.
+    var view: []const TpMap = map;
+    var ordered = true;
+    for (1..map.len) |i| {
+        if (map[i - 1].sym > map[i].sym) {
+            ordered = false;
+            break;
         }
-    }.lt);
-    // Pack each pair as two little-endian u32 words (8 bytes/pair).
-    const bytes = try c.scratch().alloc(u8, sorted.len * 8);
-    for (sorted, 0..) |m, i| {
-        std.mem.writeInt(u32, bytes[i * 8 ..][0..4], m.sym, .little);
-        std.mem.writeInt(u32, bytes[i * 8 + 4 ..][0..4], m.ty, .little);
     }
+    if (!ordered) {
+        const sorted = try c.scratch().dupe(TpMap, map);
+        // Stable, as before: a map may bind one symbol twice (an inner
+        // rebinding shadowing an outer one) and the canonical key has to keep
+        // the two in their arrival order or one map gets two ids.
+        std.mem.sort(TpMap, sorted, {}, struct {
+            fn lt(_: void, a: TpMap, b: TpMap) bool {
+                return a.sym < b.sym;
+            }
+        }.lt);
+        view = sorted;
+    }
+    const bytes = std.mem.sliceAsBytes(view);
     const gop = try c.inst_map_ids.getOrPut(c.cm(), bytes);
     if (!gop.found_existing) {
         gop.key_ptr.* = try c.ca().dupe(u8, bytes); // scratch dies with the expression
