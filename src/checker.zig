@@ -110,6 +110,13 @@ pub const Diag = struct {
     msg: []const u8,
 };
 
+/// Program AST-node count above which per-checker sizing estimates switch
+/// from this checker's OWN files to the whole program (see the type-store
+/// reserve in `init`). Set above every `bench/corpus/real` package (the
+/// largest, hono, is 115,808 nodes) so no gated peak-RSS row can move, and
+/// far below any application (immich is 1,138,954).
+pub const large_program_nodes: usize = 1 << 18;
+
 pub const Stats = struct {
     types_created: usize = 0,
     type_bytes: usize = 0,
@@ -1868,10 +1875,31 @@ pub const Checker = struct {
         // skipped. Reserving the full node count removes the last rehash too
         // but overshoots the final capacity, and cost 1-2 MB of peak RSS on
         // zod/drizzle/hono for ~1% more wall — not the trade this project makes.
+        //
+        // The estimate is taken over the WHOLE program's nodes, not this
+        // checker's own files, once the program is large enough for the
+        // difference to matter. A checker's type population is a function of
+        // the declarations it walks, and it walks the program: at
+        // `--checkers=4` immich's four checkers intern 1.81-1.96 M types EACH
+        // against a c1 total of 2.51 M, so per-checker demand is ~invariant in
+        // the checker count while `owned` is not. Dividing the estimate by the
+        // partition therefore made it 4x too small exactly where it is worth
+        // the most — immich's reserve was ~142 k against 1.9 M actual, four
+        // doublings short, and every one of those rehashes re-derives the full
+        // shape of every type already interned.
+        //
+        // Gated on program size because the small-program side of this is a
+        // peak-RSS question and the margins there are tight: all eight parity
+        // packages are under the gate (21 k - 116 k nodes), so their reserve —
+        // and their peak RSS, several rows of which sit within a few hundred
+        // kilobytes of the 20%-of-tsgo bar — is byte-identical to before.
         {
             var owned_nodes: usize = 0;
             for (owned) |f| owned_nodes += prog.files[f].tree.nodes.len;
-            try c.ts.reserveTypes(owned_nodes / 2);
+            var prog_nodes: usize = 0;
+            for (prog.files) |*pf| prog_nodes += pf.tree.nodes.len;
+            const est = if (prog_nodes > large_program_nodes) prog_nodes else owned_nodes;
+            try c.ts.reserveTypes(est / 2);
         }
         // Sized to include the merged-symbol range (ids ≥ totalSymbols()),
         // so merged ids are valid sym_types/sym_state indices. These
