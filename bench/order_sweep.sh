@@ -44,6 +44,14 @@
 # ever changes, the right fix is to exclude that key by name here, not to
 # raise a ceiling.
 #
+# Why an application and not the package corpus: measured, all eight packages
+# in bench/corpus/real are order-CLEAN — source/reverse/shuffle=1/shuffle=2 at
+# --checkers=1 agree key for key on every one of them (_types_node 19,
+# drizzle-orm 83, zod 8, ajv 5, _types_react 2, chalk 1, hono 0, typebox 0;
+# volatile 0 throughout). Same reason bench/convergence.sh needs an app: a
+# library's root list is short and homogeneous, so permuting it barely moves
+# which file demands a type first. Do not go looking for a repro there.
+#
 # The corpus is NOT vendored (a ~1 GB checkout per app), so it is passed in
 # and the script SKIPs (exit 0) when it is absent — CI without a checkout
 # keeps building. See bench/convergence.sh for the same arrangement.
