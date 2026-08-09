@@ -703,7 +703,7 @@ pub fn jsxClassComponentProps(c: *Checker, class_val: TypeId) Error!?TypeId {
     if (tps.items.len != 0) return null; // generic class component: unmodeled
     const inst = try c.ts.makeRef(cls, &.{});
     const rinst = try c.resolveStructural(inst);
-    if (try c.propOfType(rinst, name)) |p| return p.ty;
+    if (try c.propOfType(rinst, name)) |p| return try c.withIntrinsicClassAttributes(p.ty, inst);
     // No resolvable props member — a modeling gap, not a genuinely
     // props-less component (an empty `Component<{}>` still yields a `props`
     // member above). This surfaces for class components whose base is a
@@ -714,6 +714,28 @@ pub fn jsxClassComponentProps(c: *Checker, class_val: TypeId) Error!?TypeId {
     // rather than reject every attribute against `{}` — under-report over a
     // false positive.
     return null;
+}
+
+/// tsc's `getJsxPropsTypeFromClassType`: a CLASS component's attributes
+/// target is `IntrinsicClassAttributes<Instance> & Props` (the
+/// `IntrinsicAttributes &` part is added by the shared JSX path). In
+/// @types/react that interface is `{ ref?: Ref<T> }`, so without it every
+/// `<ClassComp ref={…}>` read `ref` as an EXCESS attribute and the whole
+/// element failed with TS2322 — 40+ hits on a React Native codebase, where
+/// `View`/`Text`/`ScrollView` are all class components. Returns `props`
+/// unchanged when the JSX namespace declares no such interface.
+pub fn withIntrinsicClassAttributes(c: *Checker, props: TypeId, inst: TypeId) Error!TypeId {
+    const sym = c.jsxNamespaceMember(c.atom_IntrinsicClassAttributes) orelse return props;
+    var tps: std.ArrayList(TypeParamInfo) = .empty;
+    defer tps.deinit(c.scratch());
+    try c.typeParamsOf(sym, &tps);
+    // tsc fills the single type parameter with the host class instance type;
+    // a non-generic declaration is used bare.
+    const args: []const TypeId = if (tps.items.len == 1) &.{inst} else &.{};
+    if (tps.items.len > 1) return props;
+    const ica = try c.namedTypeFromSymbol(sym, args, 0);
+    if (ica == types.error_type or ica == types.any_type) return props;
+    return c.ts.makeIntersection(c.scratch(), &.{ ica, props });
 }
 
 /// Name of the props member per `JSX.ElementAttributesProperty` — the name

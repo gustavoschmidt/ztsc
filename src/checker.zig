@@ -3725,6 +3725,7 @@ pub const Checker = struct {
     pub const constraintIsAnyIndex = expr_zig.constraintIsAnyIndex;
     pub const inferJsxTargs = expr_zig.inferJsxTargs;
     pub const jsxClassComponentProps = expr_zig.jsxClassComponentProps;
+    pub const withIntrinsicClassAttributes = expr_zig.withIntrinsicClassAttributes;
     pub const jsxPropsMemberName = expr_zig.jsxPropsMemberName;
     pub const checkJsxAttributes = expr_zig.checkJsxAttributes;
     pub const jsxAttrsObject = expr_zig.jsxAttrsObject;
