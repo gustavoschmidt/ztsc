@@ -686,7 +686,7 @@ test "noImplicitAny off: TS7006 suppressed, param still types as any" {
     const prog = try alloc.create(modules.Program);
     prog.* = try modules.singleFileProgram(alloc, "", src, tree, bound);
     prog.no_implicit_any = false; // the effective tsconfig value
-    const result = try checkFiles(alloc, testing.io, testing.allocator, &t.interner, prog, &.{0}, null, true);
+    const result = try checkFiles(alloc, testing.io, testing.allocator, &t.interner, prog, &.{0}, null, true, 0);
     try testing.expectEqual(@as(usize, 0), result.diagnostics.len);
 }
 

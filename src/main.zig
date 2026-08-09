@@ -553,6 +553,19 @@ const large_program_nodes: u64 = 256_000;
 /// social-app and vscode when those checkouts are restored.
 const declaration_heavy_ratio: u64 = 220; // hundredths, i.e. 2.20x
 
+/// Whether extra checker instances would RE-MATERIALIZE this program's
+/// declaration surface rather than split it — large, and carrying much more
+/// parsed surface than it walks. Integer-only, so the answer cannot drift
+/// with floating-point rounding across hosts.
+///
+/// Two independent decisions key on this, for the same reason: how many
+/// checkers to run, and whether an instance should size its type-store
+/// reserve from the whole program or from its own partition.
+pub fn declarationHeavy(check_nodes: u64, parsed_nodes: u64) bool {
+    return check_nodes >= large_program_nodes and
+        parsed_nodes * 100 >= check_nodes * declaration_heavy_ratio;
+}
+
 fn defaultCheckers(
     explicit: ?usize,
     cpu_count: usize,
@@ -563,12 +576,8 @@ fn defaultCheckers(
     const wide = @min(4, cpu_count);
     // Too little work to repay a second instance's fixed state.
     if (check_nodes < small_program_nodes) return @min(wide, 2);
-    // Large and declaration-heavy: extra instances re-materialize the same
-    // declaration surface instead of splitting it. Integer-only, so the
-    // choice cannot drift with floating-point rounding across hosts.
-    if (check_nodes >= large_program_nodes and
-        parsed_nodes * 100 >= check_nodes * declaration_heavy_ratio)
-        return @min(wide, 2);
+    // Extra instances would duplicate the declaration work, not divide it.
+    if (declarationHeavy(check_nodes, parsed_nodes)) return @min(wide, 2);
     return wide;
 }
 
@@ -584,6 +593,11 @@ const CheckerTask = struct {
     /// Enable the instantiation caching layer (`false` under
     /// `--no-inst-cache`).
     inst_cache: bool = true,
+    /// Node count to size this instance's type-store reserve from, or 0 to
+    /// size it from its own partition. Non-zero only for a program whose
+    /// declaration surface is not divisible (`declaration_heavy_ratio`),
+    /// where every instance interns roughly the whole program's types.
+    type_reserve_hint: usize = 0,
     result: ?checker.Check = null,
     err: ?anyerror = null,
     ns: u64 = 0,
@@ -596,7 +610,7 @@ const CheckerTask = struct {
         prog: *const modules.Program,
     ) void {
         const timer = Timer.start(io);
-        t.result = checker.checkFiles(t.arena.allocator(), io, gpa, interner, prog, t.owned, t.base, t.inst_cache) catch |err| blk: {
+        t.result = checker.checkFiles(t.arena.allocator(), io, gpa, interner, prog, t.owned, t.base, t.inst_cache, t.type_reserve_hint) catch |err| blk: {
             t.err = err;
             break :blk null;
         };
@@ -1358,6 +1372,14 @@ pub fn main(init: std.process.Init) !void {
                 .owned = owned_lists[k].items,
                 .base = base_store,
                 .inst_cache = !cli.no_inst_cache,
+                // Only when the surface is not divisible. On a program whose
+                // work DOES partition (the `multi` corpus, ratio 1.00), the
+                // whole-program estimate over-reserves ~4x and costs peak RSS
+                // for nothing: 41.2 -> 45.0 MiB measured.
+                .type_reserve_hint = if (declarationHeavy(check_nodes, parsed_nodes))
+                    @intCast(parsed_nodes)
+                else
+                    0,
             };
         }
     }
@@ -1654,7 +1676,7 @@ pub fn main(init: std.process.Init) !void {
         defer dump_arena.deinit();
         const all_files = try dump_arena.allocator().alloc(modules.FileId, n_files);
         for (all_files, 0..) |*f, i| f.* = @intCast(i);
-        _ = checker.checkFilesAndDump(dump_arena.allocator(), io, gpa, &interner, prog, all_files, null, true, out) catch {};
+        _ = checker.checkFilesAndDump(dump_arena.allocator(), io, gpa, &interner, prog, all_files, null, true, 0, out) catch {};
     }
 
     try out.print("ztsc: loaded {d} file(s) ({d} from CLI), {d} lines, {d} bytes, {d} tokens, {d} nodes, {d} symbols, {d} parse error(s), {d} bind error(s), {d} link error(s), {d} check error(s) ({d} worker(s), {d} checker(s))\n", .{

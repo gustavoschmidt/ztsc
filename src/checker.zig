@@ -112,12 +112,11 @@ pub const Diag = struct {
     msg: []const u8,
 };
 
-/// Program AST-node count above which per-checker sizing estimates switch
-/// from this checker's OWN files to the whole program (see the type-store
-/// reserve in `init`). Set above every `bench/corpus/real` package (the
-/// largest, hono, is 115,808 nodes) so no gated peak-RSS row can move, and
-/// far below any application (immich is 1,138,954).
-pub const large_program_nodes: usize = 1 << 18;
+// The type-store reserve estimate is chosen by the caller and arrives as
+// `Checker.init`'s `type_reserve_hint` — a size-only threshold lived here and
+// was wrong: it keyed on program size, but what decides whether an instance
+// interns the whole program's types is whether the DECLARATION SURFACE is
+// divisible. See `main.declarationHeavy`.
 
 pub const Stats = struct {
     types_created: usize = 0,
@@ -192,7 +191,7 @@ pub fn check(
 ) Error!Check {
     const prog = try arena.create(modules.Program);
     prog.* = try modules.singleFileProgram(arena, "", src, tree, bind);
-    return checkFiles(arena, io, gpa, interner, prog, &.{0}, null, true);
+    return checkFiles(arena, io, gpa, interner, prog, &.{0}, null, true, 0);
 }
 
 /// Type-check `owned` files of a linked multi-file program. Cross-file
@@ -210,8 +209,9 @@ pub fn checkFiles(
     owned: []const FileId,
     base: ?*const types.Store,
     inst_cache_on: bool,
+    type_reserve_hint: usize,
 ) Error!Check {
-    var c = try Checker.init(arena, io, gpa, interner, prog, owned, base, inst_cache_on);
+    var c = try Checker.init(arena, io, gpa, interner, prog, owned, base, inst_cache_on, type_reserve_hint);
     defer c.deinit();
     try c.run();
     return c.seal();
@@ -229,9 +229,10 @@ pub fn checkFilesAndDump(
     owned: []const FileId,
     base: ?*const types.Store,
     inst_cache_on: bool,
+    type_reserve_hint: usize,
     w: *std.Io.Writer,
 ) (Error || std.Io.Writer.Error)!Check {
-    var c = try Checker.init(arena, io, gpa, interner, prog, owned, base, inst_cache_on);
+    var c = try Checker.init(arena, io, gpa, interner, prog, owned, base, inst_cache_on, type_reserve_hint);
     defer c.deinit();
     try c.run();
     for (owned) |f| {
@@ -256,7 +257,7 @@ pub fn checkAndDump(
 ) (Error || std.Io.Writer.Error)!Check {
     const prog = try arena.create(modules.Program);
     prog.* = try modules.singleFileProgram(arena, "", src, tree, bind);
-    var c = try Checker.init(arena, io, gpa, interner, prog, &.{0}, null, true);
+    var c = try Checker.init(arena, io, gpa, interner, prog, &.{0}, null, true, 0);
     defer c.deinit();
     try c.run();
     try c.dumpTypes(w);
@@ -1910,6 +1911,13 @@ pub const Checker = struct {
         /// Enable the instantiation caching layer (`false` under
         /// `--no-inst-cache`, the correctness oracle / benchmark "before" leg).
         inst_cache_on: bool,
+        /// Node count to size the type-store reserve from, or 0 to size it
+        /// from this checker's OWN files. Non-zero only when the caller
+        /// determined the program's declaration surface is not divisible
+        /// across checkers, in which case every instance interns roughly the
+        /// whole program's types and `owned` badly under-predicts (see
+        /// `main.declaration_heavy_ratio`).
+        type_reserve_hint: usize,
     ) Error!Checker {
         const first = if (owned.len > 0) owned[0] else 0;
         const f0 = &prog.files[first];
@@ -1985,11 +1993,11 @@ pub const Checker = struct {
         // and their peak RSS, several rows of which sit within a few hundred
         // kilobytes of the 20%-of-tsgo bar — is byte-identical to before.
         {
-            var owned_nodes: usize = 0;
-            for (owned) |f| owned_nodes += prog.files[f].tree.nodes.len;
-            var prog_nodes: usize = 0;
-            for (prog.files) |*pf| prog_nodes += pf.tree.nodes.len;
-            const est = if (prog_nodes > large_program_nodes) prog_nodes else owned_nodes;
+            const est = if (type_reserve_hint != 0) type_reserve_hint else blk: {
+                var owned_nodes: usize = 0;
+                for (owned) |f| owned_nodes += prog.files[f].tree.nodes.len;
+                break :blk owned_nodes;
+            };
             try c.ts.reserveTypes(est / 2);
         }
         // Sized to include the merged-symbol range (ids ≥ totalSymbols()),
