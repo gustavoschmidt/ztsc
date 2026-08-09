@@ -3743,6 +3743,7 @@ pub const Checker = struct {
     pub const jsxIntrinsicAttrNames = expr_zig.jsxIntrinsicAttrNames;
     pub const jsxChildrenAttrName = expr_zig.jsxChildrenAttrName;
     pub const jsxChildrenPresent = expr_zig.jsxChildrenPresent;
+    pub const jsxSemanticChildCount = expr_zig.jsxSemanticChildCount;
     pub const containsAtom = expr_zig.containsAtom;
     pub const jsxAttributeValueType = expr_zig.jsxAttributeValueType;
     pub const checkIdentifier = expr_zig.checkIdentifier;
