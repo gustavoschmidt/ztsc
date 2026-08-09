@@ -1601,7 +1601,7 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
     }
     if (!try c.containsTypeParam(t)) return t;
     if (map_id) |mid| {
-        if (c.inst_cache.get((@as(u64, mid) << 32) | t)) |r| {
+        if (c.inst_cache.get(mid, t)) |r| {
             c.stats.inst_hits += 1;
             if (c.prof.on) c.prof.kind_hits[@intFromEnum(c.ts.kind(t))] += 1;
             return r;
@@ -2052,7 +2052,7 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
     // Memoize only when nothing below tripped the limit (a truncated result
     // is depth-dependent, not a pure function of `(t, map)`).
     if (map_id) |mid| {
-        if (!c.inst_limit_tripped) try c.inst_cache.put(c.cm(), (@as(u64, mid) << 32) | t, result);
+        if (!c.inst_limit_tripped) c.inst_cache.put(mid, t, result);
     }
     return result;
 }
