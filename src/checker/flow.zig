@@ -2154,7 +2154,10 @@ pub fn narrowByLiteralEquality(c: *Checker, t: TypeId, other: Node, strict: bool
         }
         return c.nonNullable(t);
     }
-    const is_literal = c.ts.isLiteralLike(ot) or is_nullish;
+    // A `unique symbol` is one of tsc's UNIT types (`TypeFlags.Unit` carries
+    // `UniqueESSymbol`), so comparing against a symbol-valued sentinel const
+    // narrows exactly like comparing against a literal.
+    const is_literal = c.ts.isLiteralLike(ot) or is_nullish or ok == .unique_symbol;
     if (!is_literal) return t;
     if (sense) {
         return c.narrowToValue(t, ot);
@@ -2215,6 +2218,14 @@ pub fn narrowToValue(c: *Checker, t: TypeId, v: TypeId) Error!TypeId {
     if (c.ts.kind(v) == .null or c.ts.kind(v) == .undefined) return types.never_type;
     if (try c.literalBaseOf(v) == mt) return v; // string narrowed by "a" / `E` by `E.A`
     if (k == .boolean and (c.ts.kind(v) == .bool_true or c.ts.kind(v) == .bool_false)) return v;
+    // `=== <unique symbol>`: a nominal `unique symbol` is equal to nothing
+    // but itself (the `mt == v` case above), so every other concrete member
+    // is excluded. `symbol` itself survives unnarrowed — verified against the
+    // oracle, which leaves `symbol` alone rather than narrowing it down to
+    // the unit.
+    if (c.ts.kind(v) == .unique_symbol) {
+        return if (k == .symbol) mt else types.never_type;
+    }
     if (c.ts.isLiteralLike(mt) or k == .null or k == .undefined) {
         return types.never_type; // different literal
     }

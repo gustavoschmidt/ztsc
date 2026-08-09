@@ -1521,6 +1521,7 @@ pub fn declaratorType(c: *Checker, sym: SymbolId, decl: Node, is_const: bool) Er
             return c.bindingElementType(sym, decl, et);
         },
         .declarator_init => {
+            if (try freshSymbolConstType(c, decl, d.lhs, d.rhs, is_const)) |u| return u;
             const init_t = try c.checkExprCached(d.rhs, types.no_type);
             const vt = try c.widenInitializer(init_t, is_const);
             if (c.nodeTag(d.lhs) == .identifier) return vt;
@@ -1532,6 +1533,7 @@ pub fn declaratorType(c: *Checker, sym: SymbolId, decl: Node, is_const: bool) Er
             if (e.type_ann != 0) {
                 vt = try c.annTypeMaybeUnique(e.type_ann, is_const, 1332, c.nodeSpan(d.lhs));
             } else if (e.init != 0) {
+                if (try freshSymbolConstType(c, decl, d.lhs, e.init, is_const)) |u| return u;
                 const init_t = try c.checkExprCached(e.init, types.no_type);
                 vt = try c.widenInitializer(init_t, is_const);
             }
@@ -1540,6 +1542,33 @@ pub fn declaratorType(c: *Checker, sym: SymbolId, decl: Node, is_const: bool) Er
         },
         else => return types.any_type,
     }
+}
+
+/// tsc's `getESSymbolLikeTypeForNode`: a call to the global `Symbol` /
+/// `Symbol.for` produces a FRESH `unique symbol` type — not the plain
+/// `symbol` its signature returns — when it initializes a declaration that
+/// can hold one (`isValidESSymbolDeclaration`: a `const` variable with an
+/// identifier name, a `readonly static` field, a `readonly` property
+/// signature). The type is nominal, keyed by the declaration, so every
+/// reference to the const shares it.
+///
+/// The consequence is narrowing. `export const POST_TOMBSTONE =
+/// Symbol('PostTombstone')` is the sentinel a post-shadow cache returns, and
+/// `if (postShadowed === POST_TOMBSTONE) return null` only subtracts it from
+/// the union when the sentinel is a UNIT type. Left as `symbol`, `===`
+/// narrowed nothing and the whole `symbol | Shadow<PostView>` union survived
+/// into the code below the guard — a false TS2339 on every field of the post.
+///
+/// `null` when the declaration is not that shape, in which case the caller
+/// takes the ordinary widened-initializer path.
+fn freshSymbolConstType(c: *Checker, decl: Node, name: Node, init: Node, is_const: bool) Error!?TypeId {
+    if (!is_const) return null;
+    if (name == null_node or c.nodeTag(name) != .identifier) return null;
+    if (!c.isFreshSymbolCall(init)) return null;
+    // Checked for its own diagnostics; the type is the declaration's, not
+    // the call's.
+    _ = try c.checkExprCached(init, types.no_type);
+    return try c.uniqueSymType(decl);
 }
 
 /// Pin every symbol bound by a destructured parameter's pattern to the type
