@@ -90,14 +90,20 @@ skip() {
 # `moduleResolution: node10` and `baseUrl`, so it stops at two config errors
 # having checked nothing). Scoring against an oracle that refuses to run is
 # not scoring, so the shared config is the one both compilers accept.
-PROJECT="$CHECKOUT/tsconfig.tsgo.json"
-[ -f "$PROJECT" ] || skip "$PROJECT missing (is this an excalidraw checkout?)"
+# Which config file inside the checkout. Defaults to excalidraw's, but any
+# app staged under bench/apps can be gated by naming its own bench config
+# (social-app ships tsconfig.check.json; outline/vscode have bench configs
+# staged for them). Both compilers are pointed at the SAME file, which is the
+# only property this gate needs.
+CONFIG="${CONFIG:-tsconfig.tsgo.json}"
+PROJECT="$CHECKOUT/$CONFIG"
+[ -f "$PROJECT" ] || skip "$PROJECT missing (set CONFIG=<name> for a non-excalidraw checkout)"
 [ -d "$CHECKOUT/node_modules" ] || skip "$CHECKOUT/node_modules missing — run \`yarn\` in the checkout"
 
 # Absolute, symlink-resolved, so the prefix stripped from a diagnostic path
 # below actually matches what ztsc prints.
 CHECKOUT="$(cd "$CHECKOUT" && pwd -P)"
-PROJECT="$CHECKOUT/tsconfig.tsgo.json"
+PROJECT="$CHECKOUT/$CONFIG"
 
 RUNS="${RUNS:-3}"
 MAX_CHECKERS="${MAX_CHECKERS:-8}"
@@ -119,7 +125,7 @@ NS=()
 for n in $(seq 1 "$MAX_CHECKERS"); do NS+=("$n"); done
 
 echo "convergence sweep: $CHECKOUT"
-echo "  project: tsconfig.tsgo.json · --checkers=${NS[0]}..${NS[${#NS[@]} - 1]} · $RUNS run(s) each"
+echo "  project: $CONFIG · --checkers=${NS[0]}..${NS[${#NS[@]} - 1]} · $RUNS run(s) each"
 echo
 
 failures=0
