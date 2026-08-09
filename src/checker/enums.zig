@@ -925,9 +925,31 @@ pub fn sigWithReturn(c: *Checker, sig: TypeId, ret: TypeId) Error!TypeId {
 
 /// Constructor signatures of a class (own or inherited); empty list
 /// means the default ctor.
+///
+/// An INHERITED signature is instantiated with the type arguments the
+/// heritage clause wrote: `class ViewComponent extends React.Component<
+/// ViewProps>` declares no constructor of its own, so it inherits
+/// `Component<P>`'s `constructor(props: P)` — and that signature has to read
+/// `constructor(props: ViewProps)`, not `constructor(props: P)`. Walking to
+/// the base SYMBOL alone dropped the reference's arguments and let the base
+/// class's own parameter escape into `typeof ViewComponent`, where nothing
+/// could ever bind it.
+///
+/// It surfaces through any pattern that reads a class's construct signature.
+/// `React.ComponentProps<typeof C>` is `typeof C extends
+/// JSXElementConstructor<infer P> ? P : …`, so the free parameter was what
+/// `infer P` matched: every React Native host component's props type came
+/// back as an unbound type parameter, and social-app reads
+/// `ComponentProps<typeof View>` (and of `Text`, `ScrollView`, `Pressable`,
+/// `TextInput`) to declare its own components' props.
 pub fn ctorSignatures(c: *Checker, sym: SymbolId, out: *std.ArrayList(TypeId)) Error!void {
     var cur = sym;
     var depth: u32 = 0;
+    // The heritage type ARGUMENTS accumulated down the `extends` chain, empty
+    // at the class the caller asked about (whose own signatures are already
+    // written in its own parameters). See the doc comment.
+    var map: std.ArrayList(TpMap) = .empty;
+    defer map.deinit(c.scratch());
     while (depth < 16) : (depth += 1) {
         const saved = c.enterSymFile(cur);
         defer c.restoreCtx(saved);
@@ -943,14 +965,15 @@ pub fn ctorSignatures(c: *Checker, sym: SymbolId, out: *std.ArrayList(TypeId)) E
                     // Overload signatures (no body) participate; the
                     // implementation is used only if it's alone.
                     const sig = try c.signatureOfProto(decl, d.lhs, true, true);
-                    if (d.rhs == 0) try out.append(c.scratch(), sig);
+                    if (d.rhs == 0) try out.append(c.scratch(), try applyHeritageArgs(c, sig, map.items));
                 }
                 if (out.items.len == 0) {
                     for (c.bind.declsOf(csym)) |decl| {
                         if (c.nodeTag(decl) != .class_method) continue;
                         const d = c.tree.nodeData(decl);
                         if (d.rhs != 0) {
-                            try out.append(c.scratch(), try c.signatureOfProto(decl, d.lhs, true, true));
+                            const sig = try c.signatureOfProto(decl, d.lhs, true, true);
+                            try out.append(c.scratch(), try applyHeritageArgs(c, sig, map.items));
                         }
                     }
                 }
@@ -963,13 +986,40 @@ pub fn ctorSignatures(c: *Checker, sym: SymbolId, out: *std.ArrayList(TypeId)) E
             // inherit the base value's construct signatures.
             if (try c.baseExprConstructType(cur)) |base_ctor| {
                 for (0..c.ts.objectConstructSigCount(base_ctor)) |i| {
-                    try out.append(c.scratch(), c.ts.objectConstructSig(base_ctor, @intCast(i)));
+                    const sig = c.ts.objectConstructSig(base_ctor, @intCast(i));
+                    try out.append(c.scratch(), try applyHeritageArgs(c, sig, map.items));
                 }
             }
             return;
         };
-        cur = c.ts.refSymbol(base);
+        const base_sym = c.ts.refSymbol(base);
+        // Compose this clause's arguments into the running map before
+        // descending. Composition (rather than replacement) is what makes a
+        // chain work: an argument written here may itself mention the CURRENT
+        // class's parameters (`class A<T> extends B<T[]>`), and those have
+        // already been resolved by the map built above it.
+        var btps: std.ArrayList(TypeParamInfo) = .empty;
+        defer btps.deinit(c.scratch());
+        try c.typeParamsOf(base_sym, &btps);
+        var next: std.ArrayList(TpMap) = .empty;
+        for (btps.items, 0..) |tp, i| {
+            if (i >= c.ts.refArgCount(base)) break;
+            var arg = c.ts.refArgAt(base, i);
+            if (map.items.len > 0) arg = try c.instantiate(arg, map.items);
+            try next.append(c.scratch(), .{ .sym = tp.sym, .ty = arg });
+        }
+        map.deinit(c.scratch());
+        map = next;
+        cur = base_sym;
     }
+}
+
+/// A constructor signature with the accumulated heritage-argument
+/// substitution applied. Empty map (the class's own constructors) is the
+/// identity, so nothing is instantiated that does not need to be.
+fn applyHeritageArgs(c: *Checker, sig: TypeId, map: []const TpMap) Error!TypeId {
+    if (map.len == 0) return sig;
+    return c.instantiate(sig, map);
 }
 
 pub const TpMap = struct { sym: SymbolId, ty: TypeId };
