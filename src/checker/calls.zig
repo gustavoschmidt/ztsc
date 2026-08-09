@@ -988,6 +988,51 @@ pub fn partialParamCtx(c: *Checker, pt0: TypeId, partial: []const TpMap) Error!T
     return c.ts.makeUnion(c.scratch(), kept.items);
 }
 
+/// The contextual-RETURN half of tsc's `instantiateContextualType`: an
+/// object-literal argument is checked against its parameter instantiated
+/// with `context.returnMapper` — the `InferencePriority.ReturnType`
+/// inferences made before any argument is looked at. When a parameter
+/// property is typed by a still-free type parameter whose return-seed names
+/// a literal domain, that seed IS the property's literal context, so the
+/// fresh literal survives (`isLiteralOfContextualType`).
+///
+/// `platform: Platform["select"]` (`select<T>(spec: { web?: T; native?: T }):
+/// T`) is the shape: `size={platform({web: 'tiny', native: 'small'})}` under
+/// a contextual `"large" | "medium" | "small" | "tiny" | undefined` keeps
+/// both literals in tsc, while a context-free check widens each property to
+/// `string` and infers `T = string`. Without a contextual return there is no
+/// seed and the widening is correct (tsc widens there too).
+fn seedKeepsPropLiteral(c: *Checker, pt: TypeId, tp_syms: []const u32, seed: []const TypeId, depth: u8) Error!bool {
+    const r = try c.resolveStructural(pt);
+    switch (c.ts.kind(r)) {
+        .intersection => {
+            if (depth >= 2) return false;
+            for (try c.memberList(r)) |m| {
+                if (m == r) continue;
+                if (try seedKeepsPropLiteral(c, m, tp_syms, seed, depth + 1)) return true;
+            }
+            return false;
+        },
+        .array => {
+            if (depth >= 2) return false;
+            return seedKeepsPropLiteral(c, c.ts.arrayElem(r), tp_syms, seed, depth + 1);
+        },
+        .object => {},
+        else => return false,
+    }
+    for (0..c.ts.objectPropCount(r)) |i| {
+        const p = c.ts.objectProp(r, @intCast(i));
+        const pr = try c.resolveStructural(p.ty);
+        if (c.ts.kind(pr) != .type_param) continue;
+        const sym = c.ts.typeParamSymbol(pr);
+        for (tp_syms, 0..) |s, j| {
+            if (s != sym or seed[j] == types.no_type) continue;
+            if (try c.isPrimitiveLiteralish(seed[j])) return true;
+        }
+    }
+    return false;
+}
+
 pub fn instantiateKnownParams(
     c: *Checker,
     t: TypeId,
@@ -1215,7 +1260,8 @@ pub fn inferTypeArgs(
             // have a literal-keeping type-variable property so unrelated
             // object-literal arguments (callback bags like `openDB({ upgrade
             // })`) keep their context-free check.
-            .object_literal => if (try c.paramWantsLiteralCtx(pt)) pt else types.no_type,
+            .object_literal => if ((try c.paramWantsLiteralCtx(pt)) or
+                (try seedKeepsPropLiteral(c, pt, tp_syms, ret_seed, 0))) pt else types.no_type,
             else => types.no_type,
         };
         // Fresh object literal into a bare type-param parameter (`truncate<T
