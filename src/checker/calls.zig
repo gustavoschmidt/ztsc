@@ -2137,6 +2137,9 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
         .type_param => {
             if (tpIndex(tp_syms, s.typeParamSymbol(param))) |i| {
                 const cand = arg;
+                // An inference was MADE here, whatever it does to the slot —
+                // see `Checker.infer_writes`.
+                c.infer_writes +%= 1;
                 if (c.nontop_depth > 0) {
                     if (c.topSlot(candidates, i)) |f| f.* = false;
                 }
@@ -2356,9 +2359,13 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                 if (m == tp_member) continue;
                 if (!try c.containsTypeParam(m)) continue;
                 for (src_members, 0..) |sm, i| {
-                    const snap = try c.scratch().dupe(TypeId, candidates);
+                    // Whether the pair MADE an inference, not whether the
+                    // candidate set changed: a second constituent inferring the
+                    // same type as the first is still a match. See
+                    // `Checker.infer_writes`.
+                    const writes = c.infer_writes;
                     try c.unify(m, sm, tp_syms, candidates, depth + 1);
-                    if (!std.mem.eql(TypeId, snap, candidates)) matched[i] = true;
+                    if (c.infer_writes != writes) matched[i] = true;
                 }
             }
             // A wrapper member contributed a candidate for the naked var.
@@ -3321,6 +3328,7 @@ pub fn inferReverseMapped(c: *Checker, m: TypeId, arg: TypeId, tp_syms: []const 
     }
     if (props.items.len == 0) return;
     const obj = try c.objectFromProps(props.items, 0, 0);
+    c.infer_writes +%= 1;
     // A reverse-mapped object found in a PARAMETER position is
     // contravariant evidence, exactly like the `.type_param` arm's
     // candidate. Writing it into the covariant accumulator let a callback
@@ -3465,6 +3473,7 @@ pub fn inferMappedKeySet(c: *Checker, m: TypeId, arg: TypeId, tp_syms: []const u
     // A key set is authoritative for its own param: an uninformative `any`
     // bound by a sibling union member (`Pick<S, K> | S | null`, where the
     // whole-`S` member matched first) must not survive next to it.
+    c.infer_writes +%= 1;
     candidates[ki] = if (candidates[ki] == types.no_type or candidates[ki] == types.any_type)
         keys
     else
@@ -3591,6 +3600,7 @@ pub fn bindAnyToTypeParams(c: *Checker, pattern: TypeId, tp_syms: []const u32, c
     switch (s.kind(pattern)) {
         .type_param => {
             if (tpIndex(tp_syms, s.typeParamSymbol(pattern))) |i| {
+                c.infer_writes +%= 1;
                 candidates[i] = if (candidates[i] == types.no_type)
                     types.any_type
                 else
