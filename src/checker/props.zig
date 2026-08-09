@@ -206,6 +206,16 @@ pub fn propOfTypeEx(c: *Checker, t: TypeId, name: Atom, allow_index: bool) Error
         .number, .number_literal, .number_literal_fresh, .boolean, .bool_true, .bool_false => {
             return c.primitiveInterfaceProp(t, name);
         },
+        // tsc's `getApparentType(objectType)` is `globalObjectType`, so the
+        // `object` KEYWORD carries the same `Object.prototype` members every
+        // object type does — `constructor`, `toString`, `hasOwnProperty`, …
+        // `typeof v === 'object' && v !== null && v.constructor === Object`
+        // is the idiom that needs it. Member access only, like the `.object`
+        // arm's own fallback.
+        .object_keyword => {
+            if (!allow_index) return null;
+            return c.objectInterfaceProp(name);
+        },
         .type_param => {
             const constraint = try c.typeParamConstraint(s.typeParamSymbol(t));
             if (constraint == types.no_type) return null;
