@@ -2502,6 +2502,21 @@ pub fn narrowByDiscriminant(c: *Checker, t: TypeId, prop: Atom, value: TypeId, s
     // fallback above exists for.
     const disc_over = if (c.ts.kind(decl) == .union_type) decl else t;
     if (!try c.isDiscriminantProp(disc_over, prop)) return t;
+    // tsc's `narrowTypeByEquality` subtracts on the NOT-EQUAL side only when
+    // the COMPARAND is a unit type: `if (valueType.flags & TypeFlags.Unit)
+    // return filterType(…); return type;`. A comparand that is a whole enum
+    // — or any union of units — has no Unit flag, so nothing is subtracted.
+    //
+    // social-app's `Conversation` screen is the shape: `const [prevState] =
+    // useState(convoState.status)` gives `prevState` the WHOLE `ConvoStatus`
+    // enum, and `if (prevState !== convoState.status)` then matched (and so
+    // removed) every constituent of the convo union, leaving `never` for the
+    // rest of the block.
+    const value_unit = blk: {
+        const rv = try c.ts.regularLiteral(value);
+        break :blk c.ts.isLiteralLike(rv) or c.ts.kind(rv) == .null or c.ts.kind(rv) == .undefined;
+    };
+    if (!sense and !value_unit) return t;
     const single = [_]TypeId{t};
     const members: []const TypeId = if (c.ts.kind(t) == .union_type) try c.memberList(t) else &single;
     for (members) |m| {
