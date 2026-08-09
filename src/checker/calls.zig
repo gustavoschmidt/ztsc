@@ -399,7 +399,14 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, chained: *bool,
             .union_type => {
                 var all_callable = true;
                 var saw_any = false;
+                // Where each union constituent's own signature list starts in
+                // `sigs`. tsc does NOT concatenate the lists into one overload
+                // set — `getUnionSignatures` COMBINES them position-wise — so
+                // the boundaries have to survive the gather.
+                var starts: std.ArrayList(u32) = .empty;
+                defer starts.deinit(c.scratch());
                 for (try c.memberList(r)) |m| {
+                    const before: u32 = @intCast(sigs.items.len);
                     const rm = try c.resolveStructural(m);
                     switch (c.ts.kind(rm)) {
                         .any, .err => saw_any = true,
@@ -450,6 +457,15 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, chained: *bool,
                             if (!member_callable) all_callable = false;
                         },
                         else => all_callable = false,
+                    }
+                    if (@as(u32, @intCast(sigs.items.len)) != before) {
+                        try starts.append(c.scratch(), before);
+                    }
+                }
+                if (all_callable and !saw_any and starts.items.len > 1) {
+                    if (try combinedUnionSignature(c, sigs.items, starts.items)) |combined| {
+                        sigs.clearRetainingCapacity();
+                        try sigs.append(c.scratch(), combined);
                     }
                 }
                 if (!all_callable) {
@@ -701,6 +717,93 @@ pub fn instantiateSigForCall(c: *Checker, sig: TypeId, explicit_targs: []const T
     var map = try c.scratch().alloc(TpMap, tps.len);
     for (tps, 0..) |tp, i| map[i] = .{ .sym = tp, .ty = args_buf[i] };
     return c.instantiate(sig, map);
+}
+
+/// tsc's `getUnionSignatures`: calling a UNION does not resolve against the
+/// constituents' signatures as if they were an overload set — the lists are
+/// COMBINED into one signature (`combineSignaturesOfUnionMembers`), whose
+/// parameters are the position-wise INTERSECTION of the constituents' and
+/// whose return type is their UNION.
+///
+/// That intersection is what makes a callback argument work. `(A[] | B[])
+/// .map(x => …)` hands the arrow `((x: A, …) => U) & ((x: B, …) => U)`, an
+/// intersection of two call signatures, which `intersectedCallSignature`
+/// then turns back into one parameter typed `A | B`. Resolving the lists as
+/// overloads instead picked the FIRST constituent's signature and typed `x`
+/// as `A` alone — every use of a `B`-only property was a false TS2339, and a
+/// `Promise<null> | Promise<T>` (the shape an `if (…) return
+/// Promise.resolve(null)` early exit produces) typed its `.then` callback
+/// `null`, so the body's null guard narrowed it to `never`.
+///
+/// `null` when the lists are not shaped for the combination — more than one
+/// signature in a constituent, a `this` type, mismatched type-parameter
+/// arity, or a rest parameter — in which case the caller keeps the gathered
+/// overload set, the prior behaviour.
+fn combinedUnionSignature(c: *Checker, sigs: []const TypeId, starts: []const u32) Error!?TypeId {
+    // Only the one-signature-per-constituent shape: tsc's `getUnionSignatures`
+    // has a whole matching pass for the rest, and guessing it wrong would
+    // change calls that resolve correctly today.
+    if (sigs.len != starts.len) return null;
+    var acc = sigs[0];
+    for (sigs[1..]) |right| {
+        acc = try combineTwoUnionSignatures(c, acc, right) orelse return null;
+    }
+    return acc;
+}
+
+/// One fold step of `combinedUnionSignature` (tsc's
+/// `combineSignaturesOfUnionMembers` -> `combineUnionParameters`).
+fn combineTwoUnionSignatures(c: *Checker, left: TypeId, right0: TypeId) Error!?TypeId {
+    const s = &c.ts;
+    if (s.kind(left) != .function or s.kind(right0) != .function) return null;
+    if (s.fnThisType(left) != 0 or s.fnThisType(right0) != 0) return null;
+    for ([2]TypeId{ left, right0 }) |sig| {
+        for (0..s.fnParamCount(sig)) |i| {
+            if (s.fnParam(sig, @intCast(i)).rest()) return null;
+        }
+    }
+    // The store may grow under `instantiate`/`makeUnion`, so the type-parameter
+    // list has to be copied out before anything else touches it.
+    const ltp = try c.scratch().dupe(u32, s.fnTypeParams(left));
+    defer c.scratch().free(ltp);
+    const rtp = try c.scratch().dupe(u32, s.fnTypeParams(right0));
+    defer c.scratch().free(rtp);
+    if (ltp.len != rtp.len) return null;
+    // tsc maps the right signature's type parameters onto the left's and keeps
+    // the left's list, so both sides speak the same parameters.
+    var right = right0;
+    if (rtp.len != 0) {
+        const map = try c.scratch().alloc(TpMap, rtp.len);
+        defer c.scratch().free(map);
+        for (rtp, 0..) |sym, i| map[i] = .{ .sym = sym, .ty = try s.makeTypeParam(ltp[i]) };
+        right = try c.instantiate(right0, map);
+        if (s.kind(right) != .function) return null;
+    }
+    const lc = s.fnParamCount(left);
+    const rc = s.fnParamCount(right);
+    const lreq = try c.requiredParams(left);
+    const rreq = try c.requiredParams(right);
+    const n = @max(lc, rc);
+    var params: std.ArrayList(types.Param) = .empty;
+    defer params.deinit(c.scratch());
+    for (0..n) |i| {
+        const idx: u32 = @intCast(i);
+        // `tryGetTypeAtPosition` answers `unknown` for a position the shorter
+        // signature does not declare, and `unknown` is the intersection's
+        // identity — the longer signature's type survives.
+        const lp: TypeId = if (idx < lc) s.fnParam(left, idx).ty else types.unknown_type;
+        const rp: TypeId = if (idx < rc) s.fnParam(right, idx).ty else types.unknown_type;
+        const name: Atom = if (idx < lc) s.fnParam(left, idx).name else s.fnParam(right, idx).name;
+        const optional = idx >= lreq and idx >= rreq;
+        const ty = try s.makeIntersection(c.scratch(), &.{ lp, rp });
+        try params.append(c.scratch(), .{
+            .name = name,
+            .ty = ty,
+            .flags = if (optional) types.param_flag_optional else 0,
+        });
+    }
+    const ret = try s.makeUnion(c.scratch(), &.{ s.fnReturn(left), s.fnReturn(right) });
+    return try s.makeFunction(params.items, ret, ltp, 0);
 }
 
 /// A TS 4.7 instantiation expression: `f<T>` in value position and
