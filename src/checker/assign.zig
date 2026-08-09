@@ -665,7 +665,42 @@ pub fn measuredVariances(c: *Checker, owner: SymbolId) Error!?u32 {
     // tsc measures in its own `getVariances` context for the same reason.
     const saved_rel_id_floor = c.rel_id_floor;
     c.rel_id_floor = c.rel_id_depth;
+    // The relation's IN-PROGRESS MARKS are the same story on the last axis the
+    // two isolations above do not cover, and it is the one that decides which
+    // overload a call resolves to.
+    //
+    // Every frame the demanding walk has open holds a `2` in `relation`
+    // ("assume related", the cycle cut). Those marks are facts about THAT
+    // walk, and a measurement running under them can read one — the marker
+    // instantiations it mints are references to the very generic whose members
+    // the demander is halfway through relating — and take an assumed YES where
+    // a measurement of the generic alone would have done the work and answered
+    // NO. The verdict is then cached under the symbol for the whole run, so a
+    // pair of instantiations relates by whatever the first demander happened to
+    // have on its stack: `Object.entries(description)` in social-app's
+    // `router.ts` picked the generic `entries<T>` overload under one partition
+    // and the `entries(o: {}): [string, any][]` overload under another, which
+    // is a `TS2339` on `unknown` that appears at `--checkers=2..8` and not at
+    // `--checkers=1`.
+    //
+    // So withdraw them for the duration and put them back after, exactly as
+    // `rel_id_floor` hides the growth stack. `rel_maybe` is precisely the set
+    // of keys standing at `2` right now (see `Checker.rel_maybe`), and it is a
+    // handful of entries deep on real programs, so the save/restore is cheap.
+    // Anything the measurement leaves standing itself is dropped first — a
+    // measurement publishes no assumptions either.
+    const saved_maybe = try c.scratch().dupe(u64, c.rel_maybe.items);
+    for (saved_maybe) |k| _ = c.relation.remove(k);
+    c.rel_maybe.clearRetainingCapacity();
+    const saved_rel_assumed = c.rel_assumed;
+    c.rel_assumed = false;
     defer {
+        for (c.rel_maybe.items) |k| _ = c.relation.remove(k);
+        c.rel_maybe.clearRetainingCapacity();
+        c.rel_maybe.appendSlice(c.cm(), saved_maybe) catch {};
+        for (saved_maybe) |k| c.relation.put(c.cm(), k, 2) catch {};
+        c.scratch().free(saved_maybe);
+        c.rel_assumed = saved_rel_assumed;
         c.rel_id_floor = saved_rel_id_floor;
         c.suppress_inst_diag = saved_suppress;
         c.inst_count = saved_count;
@@ -1323,9 +1358,21 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!bool {
     // adds a false positive. Returns before the `(s,t)` relation memo below,
     // so the capped result is never cached and a shallower re-encounter of
     // the same pair still computes the real answer.
-    if (c.rel_depth > max_relation_depth) return true;
+    if (c.rel_depth > max_relation_depth) {
+        c.rel_assumed = true;
+        return true;
+    }
     c.rel_depth += 1;
-    defer c.rel_depth -= 1;
+    defer {
+        c.rel_depth -= 1;
+        // Outermost frame: nothing may outlive the query on assumption alone.
+        // See `Checker.rel_maybe`.
+        if (c.rel_depth == 0 and c.rel_maybe.items.len != 0) {
+            for (c.rel_maybe.items) |k| _ = c.relation.remove(k);
+            c.rel_maybe.clearRetainingCapacity();
+            c.rel_assumed = false;
+        }
+    }
     // Release this frame's scratch on the way out, the same way an
     // `instantiateId` frame does (see `BumpArena`). The relation is the other
     // deep recursive walk, and the other big scratch consumer: it dupes a
@@ -1475,7 +1522,12 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!bool {
     if (cacheable) {
         if (c.relation.get(key)) |v| {
             c.stats.relation_hits += 1;
-            if (v == 2) return true; // in progress: assume (recursive types)
+            if (v == 2) {
+                // In progress: assume (recursive types). The assumption is
+                // the caller's to carry — see `Checker.rel_assumed`.
+                c.rel_assumed = true;
+                return true;
+            }
             return v == 1;
         }
     }
@@ -1494,6 +1546,7 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!bool {
         if (tr) |tref| {
             if (c.rel_id_depth >= max_relation_depth) {
                 c.rel_guard_tripped = true;
+                c.rel_assumed = true;
                 return true;
             }
             c.rel_src_ids[c.rel_id_depth] = .{ .sym = c.ts.refSymbol(sref), .ref = sref };
@@ -1511,12 +1564,20 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!bool {
     };
     if (pushed and (c.relIdDeeplyNested(true) or c.relIdDeeplyNested(false))) {
         c.rel_guard_tripped = true;
+        c.rel_assumed = true;
         return true;
     }
+    const maybe_start = c.rel_maybe.items.len;
     if (cacheable) {
         c.stats.relation_misses += 1;
         try c.relation.put(c.cm(), key, 2);
+        try c.rel_maybe.append(c.cm(), key);
     }
+    // tsc's `Ternary.Maybe` bookkeeping: this frame's own verdict starts out
+    // resting on nothing, and whatever the walk below assumes is folded back
+    // into the caller's on the way out. See `Checker.rel_assumed`.
+    const saved_assumed = c.rel_assumed;
+    c.rel_assumed = false;
     // Declared variance (`interface Box<in T>`/`<out T>`): two references
     // to the same generic symbol relate by their type ARGUMENTS, not by
     // their members (see `varianceVerdict`). Runs after the identity
@@ -1552,64 +1613,125 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!bool {
     // tsc's variance comparison keeps a structural fallback, so an inner
     // generic whose own annotation contradicts its members (already reported
     // on its own line) must not make its every USER a second report.
-    if (sr) |sref| {
-        if (tr) |tref| {
-            if (sref != tref and c.ts.refSymbol(sref) == c.ts.refSymbol(tref) and
-                !c.isVarianceMarkerRef(sref) and !c.isVarianceMarkerRef(tref))
-            {
-                if (try c.varianceVerdict(sref, tref)) |verdict| {
-                    if (verdict) {
-                        if (cacheable) try c.relation.put(c.cm(), key, 1);
-                        return true;
+    // …and one further restriction, which is a CONVERGENCE rule rather than a
+    // typing one: the probe runs only when both sides are DECLARED references
+    // (`.ref`), never when a side's reference facet was recovered from the
+    // `origin` side table.
+    //
+    // `origin` is written by `expandRef` and grows as the run proceeds, so
+    // "this interned object is the materialization of `G<A…>`" is a fact about
+    // what this checker has already expanded, not a fact about the object. A
+    // rule that DECIDES on it answers differently depending on whether some
+    // earlier file in the same partition happened to expand `G<A…>` first —
+    // and the variance probe decides: it answers YES where the structural walk
+    // below answers NO.
+    //
+    // social-app's `src/lib/routes/router.ts` is the case.
+    // `Object.entries(description)` with
+    // `description: Record<keyof T, string | string[]>` relates that mapped
+    // type to the generic overload's `{ [s: string]: U }` at `U = unknown`.
+    // Both sides are bare structural types; the target is the expansion of
+    // `Record<string, unknown>`, so it carries that origin ref IF AND ONLY IF
+    // this checker has already expanded `Record<string, unknown>` for some
+    // other file. Where it had, the probe matched `Record` on both sides,
+    // related the arguments by measured variance and answered YES — the
+    // generic overload won with `U` uninferred, so `pattern` came out
+    // `unknown` and `pattern.forEach` reported TS2339. Where it had not, the
+    // same call fell to `entries(o: {}): [string, any][]` and reported
+    // nothing. That is the diagnostic `bench/convergence.sh` saw at
+    // `--checkers=2..8` and not at `--checkers=1`.
+    //
+    // The reflexive origin fast-path above is deliberately NOT restricted: it
+    // fires only when the two origins are EQUAL, i.e. when both sides denote
+    // one and the same instantiation, where the answer is YES either way and
+    // the tag only saves a walk that non-confluent materializations would
+    // fail. The variance probe is the one that turns a structural NO into a
+    // YES on a pair whose arguments differ.
+    const declared_refs = sk == .ref and tk == .ref;
+    const verdict: RelVerdict = blk: {
+        if (sr) |sref| {
+            if (tr) |tref| {
+                if (declared_refs and sref != tref and c.ts.refSymbol(sref) == c.ts.refSymbol(tref) and
+                    !c.isVarianceMarkerRef(sref) and !c.isVarianceMarkerRef(tref))
+                {
+                    if (try c.varianceVerdict(sref, tref)) |verdict| {
+                        if (verdict) break :blk .yes;
+                        if (c.variance_marker_refs[0] == 0) {
+                            // A negative declared verdict is decisive only
+                            // while no measurement is in flight, so it must NOT
+                            // be memoized: the very same pair may be asked
+                            // again from inside a measurement, where the rule
+                            // above says to fall through to the structural
+                            // walk. Leave no trace either way.
+                            break :blk .no_nocache;
+                        }
                     }
-                    if (c.variance_marker_refs[0] == 0) {
-                        // A negative declared verdict is decisive only while
-                        // no measurement is in flight, so it must NOT be
-                        // memoized: the very same pair may be asked again
-                        // from inside a measurement, where the rule above
-                        // says to fall through to the structural walk. Drop
-                        // the in-progress mark instead of overwriting it, so
-                        // the pair leaves no trace either way.
-                        if (cacheable) _ = c.relation.remove(key);
-                        return false;
-                    }
-                }
-                // Nothing declared, or nothing decisive: MEASURE how the
-                // generic uses its parameters and relate the arguments by
-                // that (see `measuredVarianceVerdict`). Positive only — a
-                // failure still falls through to the structural walk below.
-                //
-                // `marker_refs` is tsc's `markerTypes`: a pair some
-                // measurement minted is the question, not something to answer
-                // from a verdict. (The DECLARED verdict above needs no such
-                // guard for a measured pair: a mixed `<in A, B>` measuring `B`
-                // leaves `A` identical on both sides and `B` unannotated, so
-                // `varianceVerdict` is never decisive on it.)
-                if (!c.marker_refs.contains(sref) and !c.marker_refs.contains(tref)) {
-                    if (try c.measuredVarianceVerdict(sref, tref)) {
-                        if (cacheable) try c.relation.put(c.cm(), key, 1);
-                        return true;
+                    // Nothing declared, or nothing decisive: MEASURE how the
+                    // generic uses its parameters and relate the arguments by
+                    // that (see `measuredVarianceVerdict`). Positive only — a
+                    // failure still falls through to the structural walk below.
+                    //
+                    // `marker_refs` is tsc's `markerTypes`: a pair some
+                    // measurement minted is the question, not something to answer
+                    // from a verdict. (The DECLARED verdict above needs no such
+                    // guard for a measured pair: a mixed `<in A, B>` measuring `B`
+                    // leaves `A` identical on both sides and `B` unannotated, so
+                    // `varianceVerdict` is never decisive on it.)
+                    if (!c.marker_refs.contains(sref) and !c.marker_refs.contains(tref)) {
+                        if (try c.measuredVarianceVerdict(sref, tref)) break :blk .yes;
                     }
                 }
             }
         }
-    }
-    // Nominal heritage fast path (see `nominalHeritageRelated`): a class or
-    // interface reaches a DECLARED base of itself without walking members.
-    // Positive-only; anything it cannot settle falls through to the
-    // structural walk below, so it never invents a "not related".
-    if (sr) |sref| {
-        if (tr) |tref| {
-            if (try c.nominalHeritageRelated(sref, tref)) {
-                if (cacheable) try c.relation.put(c.cm(), key, 1);
-                return true;
+        // Nominal heritage fast path (see `nominalHeritageRelated`): a class or
+        // interface reaches a DECLARED base of itself without walking members.
+        // Positive-only; anything it cannot settle falls through to the
+        // structural walk below, so it never invents a "not related".
+        if (sr) |sref| {
+            if (tr) |tref| {
+                if (try c.nominalHeritageRelated(sref, tref)) break :blk .yes;
+            }
+        }
+        break :blk if (try c.isAssignableInner(s, t, sk, tk)) .yes else .no;
+    };
+    // tsc's `Ternary.Maybe`: a verdict the walk could only reach by ASSUMING
+    // an in-progress pair (or by taking a growth/depth cut) is not published.
+    // See `Checker.rel_assumed` — publishing it is what made a pair's answer a
+    // function of which walk reached it first, i.e. of the file order and the
+    // `--checkers=N` partition.
+    const assumed = c.rel_assumed;
+    c.rel_assumed = saved_assumed or assumed;
+    if (cacheable) {
+        if (verdict == .yes) {
+            // Definite YES, or the outermost frame of the query: the walk
+            // closed without contradicting anything it assumed, so the whole
+            // group is published together. A YES that still rests on marks an
+            // ANCESTOR wrote stays pending for that ancestor to settle.
+            if (!assumed or (commit_at_root and c.rel_depth == 1)) {
+                for (c.rel_maybe.items[maybe_start..]) |k| try c.relation.put(c.cm(), k, 1);
+                c.rel_maybe.shrinkRetainingCapacity(maybe_start);
+            }
+        } else {
+            // NO withdraws every mark the walk stood on — they were assumed to
+            // reach a verdict that contradicts them.
+            for (c.rel_maybe.items[maybe_start..]) |k| _ = c.relation.remove(k);
+            c.rel_maybe.shrinkRetainingCapacity(maybe_start);
+            if (verdict == .no and (!assumed or commit_at_root)) {
+                try c.relation.put(c.cm(), key, 0);
             }
         }
     }
-    const result = try c.isAssignableInner(s, t, sk, tk);
-    if (cacheable) try c.relation.put(c.cm(), key, @intFromBool(result));
-    return result;
+    return verdict == .yes;
 }
+
+/// `relate`'s three outcomes: related, not related, and not related *and not
+/// memoizable* (a negative declared-variance verdict, decisive only while no
+/// variance measurement is in flight).
+const RelVerdict = enum { yes, no, no_nocache };
+
+/// A/B leg: tsc commits a still-pending maybe group at its outermost relation
+/// frame; with this off nothing derived from an assumption is ever published.
+const commit_at_root = true;
 
 /// How many references the nominal heritage walk holds before giving up (and
 /// the size of its stack-allocated queue). A declared `extends` graph is a
