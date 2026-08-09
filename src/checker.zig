@@ -2692,7 +2692,23 @@ pub const Checker = struct {
         const a = try c.atom(name);
         const sym = switch (c.resolveSpace(a, scope, true)) {
             .sym => |s| s,
-            else => return null,
+            // A TYPE-ONLY import of a const (`import { type ID as K }`, then
+            // `{ [K]?: boolean }`) has no VALUE meaning, so the value-space
+            // lookup misses it and the key degraded to the name placeholder —
+            // which is a plain string atom, so `keyof` reported
+            // `"__@k$…"` where tsc reports the enum-member literal.
+            // tsc's `isLateBindableName` resolves the entity name through the
+            // alias and reads the target's literal type regardless of the
+            // type-only modifier. Restricted to an IMPORT BINDING so a real
+            // type name in key position still falls back to the placeholder.
+            else => blk: {
+                const t = switch (c.resolveSpace(a, scope, false)) {
+                    .sym => |s| s,
+                    else => return null,
+                };
+                if (!c.symFlags(t).import_binding) return null;
+                break :blk t;
+            },
         };
         return try c.typeOfSymbol(sym);
     }
