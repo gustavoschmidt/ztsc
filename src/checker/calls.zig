@@ -11,6 +11,7 @@ const types = @import("../types.zig");
 const source = @import("../frontend/source.zig");
 const libs = @import("../libs.zig");
 const modules = @import("../link/modules.zig");
+const paths = @import("../link/paths.zig");
 const ZeroPagedArray = @import("../zeropage.zig").ZeroPagedArray;
 
 const Node = ast.Node;
@@ -139,6 +140,7 @@ pub fn importCallType(c: *Checker, arg_nodes: []const Node) Error!TypeId {
     // is how `import("pica").then((res) => res.default)` reaches pica. tsc
     // spreads `{ default: T }` over the module type; the intersection has
     // the same members.
+    var wrapped = false;
     if (c.prog.export_equals_atom != 0) {
         if (c.moduleExportTarget(m, c.prog.export_equals_atom)) |eq| {
             if (!eq.type_only) {
@@ -150,7 +152,32 @@ pub fn importCallType(c: *Checker, arg_nodes: []const Node) Error!TypeId {
                 };
                 const wrapper = try c.ts.makeObject(&.{.{ .name = c.atom_default, .ty = entity, .flags = types.prop_flag_readonly }}, 0, 0, 0);
                 inner = try c.ts.makeIntersection(c.scratch(), &.{ entity, wrapper });
+                wrapped = true;
             }
+        }
+    }
+    // tsc's `getTypeWithSyntheticDefaultImportType`: under
+    // allowSyntheticDefaultImports a module that declares no `default` of its
+    // own still hands `import("m")` one — the module namespace object itself
+    // — spread over the module type. Same rule `linkImports` applies to a
+    // STATIC default import, and gated the same way: only a DECLARATION file
+    // (or an ambient `declare module` block, which only ever appears in one)
+    // qualifies, because a real source file carrying ES-module syntax is
+    // known not to have a default and tsc reports TS1192 there.
+    //
+    // `(await import('@emoji-mart/data')).default` is the shape: an
+    // `index.d.ts` of nothing but interfaces, whose `default` was a false
+    // TS2339 on the empty namespace object.
+    if (!wrapped and c.prog.allow_synthetic_default and c.atom_default != 0 and
+        c.moduleExportTarget(m, c.atom_default) == null)
+    {
+        const eligible = switch (m) {
+            .file => |f| paths.isDeclarationPath(c.prog.files[f].path),
+            .ambient => true,
+        };
+        if (eligible) {
+            const wrapper = try c.ts.makeObject(&.{.{ .name = c.atom_default, .ty = inner, .flags = types.prop_flag_readonly }}, 0, 0, 0);
+            inner = try c.ts.makeIntersection(c.scratch(), &.{ inner, wrapper });
         }
     }
     return c.makePromise(inner);

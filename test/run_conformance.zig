@@ -397,6 +397,7 @@ fn runDirCase(
     }, jsx_runtime_module);
     const prog = &br.program;
     prog.no_implicit_any = no_implicit_any;
+    prog.allow_synthetic_default = allow_synthetic_default;
 
     const owned = try alloc.alloc(modules.FileId, prog.files.len);
     for (owned, 0..) |*f, i| f.* = @intCast(i);
