@@ -737,6 +737,7 @@ pub const map_containers = [_][]const u8{
     "pattern_root_decls",       "pattern_root_ids",     "pattern_narrow_busy",
     "key_name_types",           "enum_members",         "keyof_obj_cache",
     "trunc_expansions",         "inst_map_bytes",       "tp_mentions",
+    "smk_cache",
 };
 
 /// One enum member as `eachEnumMember` yields it: the name atom and the
@@ -764,7 +765,12 @@ pub const KeyofEntry = struct { ty: TypeId, gen: u32 };
 pub fn IntCtx(comptime K: type) type {
     return struct {
         pub fn hash(_: @This(), k: K) u64 {
-            var x: u64 = k;
+            // A key wider than the mix folds its halves in first; every input
+            // bit still reaches the finalizer (`smk_cache`'s 97-bit key).
+            var x: u64 = if (@bitSizeOf(K) > 64)
+                @as(u64, @truncate(k)) ^ (@as(u64, @truncate(k >> 64)) *% 0x9e3779b97f4a7c15)
+            else
+                k;
             x ^= x >> 33;
             x *%= 0xff51afd7ed558ccd;
             x ^= x >> 33;
@@ -1237,6 +1243,30 @@ pub const Checker = struct {
     /// progress, 1 no, 2 yes. Separate from `cmp_cache` because the answer
     /// depends on WHICH key parameter is asked about.
     mmp_cache: IntMap(u64, u8) = .empty,
+    /// `substMappedKey` memo, keyed `(t, key_id, key_ty, homo_index_mode)`.
+    ///
+    /// Binding a mapped type's key is a second substitution walk, structurally
+    /// parallel to `instantiate` but with its own recursion and — until this
+    /// memo — no cache at all and no `inst_count` charge, so its cost is
+    /// invisible in the node-visit counters every other experiment in
+    /// `prof.zig` is scored on. `materializeMapped` runs one walk PER KEY over
+    /// the same value template, and the templates that dominate this corpus
+    /// (kysely's `Selection`/`UpdateObject`, vitest's `Mocked`) are large
+    /// conditionals whose subterms mention the key in only one place, so the
+    /// same `(subterm, key)` pair recurs across keys, across materializations
+    /// of the same map, and across the many argument lists a builder chain
+    /// applies it under.
+    ///
+    /// Sound for the same reason `inst_cache` is: the result is a pure
+    /// function of the key, EXCEPT for the three pieces of live context the
+    /// key or the guards account for — `cond_check_subst` (a per-constituent
+    /// rebinding, so the memo is bypassed entirely while one is live),
+    /// `homo_index_mode` (whether an optional property contributes
+    /// `| undefined`, so it is in the key) and a truncated reduction (never
+    /// published, the rule `inst_cache` follows). `key_name_types` can grow
+    /// under a `keyof` in the template, so entries carry the generation they
+    /// were computed under exactly as `keyof_obj_cache` does.
+    smk_cache: IntMap(u128, KeyofEntry) = .empty,
     /// Instantiation memo: `(canonical_map_id << 32 | t) -> result`. A
     /// substitution is a pure function of `(t, map-contents)`; `map_id`
     /// canonically identifies the map's `(type-param, arg)` set (order- and

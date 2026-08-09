@@ -2756,8 +2756,71 @@ pub fn substMappedKey(c: *Checker, t: TypeId, key_id: u32, key_ty: TypeId) Error
     // substituted.
     if (c.cond_check_subst) |cs| {
         if (t == cs.from) return cs.to;
+        // A rebinding is live, so nothing below is a function of the key
+        // alone — take the uncached path (see `Checker.smk_cache`).
+        if (!try c.mentionsMappedParam(t, key_id)) return t;
+        return substMappedKeyInner(c, t, key_id, key_ty);
     }
     if (!try c.mentionsMappedParam(t, key_id)) return t;
+    if (!c.inst_cache_on or !smkWorthMemoizing(c.ts.kind(t))) {
+        return substMappedKeyInner(c, t, key_id, key_ty);
+    }
+    const memo_key = (@as(u128, @intFromBool(c.homo_index_mode)) << 96) |
+        (@as(u128, t) << 64) | (@as(u128, key_id) << 32) | key_ty;
+    if (c.smk_cache.get(memo_key)) |e| {
+        if (e.gen == c.key_name_gen) return e.ty;
+    }
+    const visits_before = c.inst_total;
+    const result = try substMappedKeyInner(c, t, key_id, key_ty);
+    // A truncated reduction is a fact about the live budget, not about the
+    // key — the rule `inst_cache` and `erase_cache` follow.
+    //
+    // …and only a walk that actually reached `instantiate` is worth an entry.
+    // A conditional that binds the key and then decides without substituting
+    // anything is free to recompute, and drizzle-orm's `.d.ts` aliases are
+    // millions of those: publishing them anyway costs it 14% of its
+    // instructions at `--checkers=1` (4.20 G against 3.69 G) for four saved
+    // node visits, and costs immich 6% of its peak RSS. The subtrees this
+    // memo is FOR — kysely's `Selection`/`UpdateObject`, vitest's `Mocked` —
+    // reduce an indexed access or instantiate a reference on every key, so
+    // they always charge at least one node visit.
+    if (!c.inst_limit_tripped and c.inst_total != visits_before) {
+        try c.smk_cache.put(c.cm(), memo_key, .{ .ty = result, .gen = c.key_name_gen });
+    }
+    return result;
+}
+
+/// Which `substMappedKey` arms carry a memo (`Checker.smk_cache`). Every other
+/// arm either answers in a couple of instructions or is a pure structural
+/// rebuild whose CHILDREN carry the reductions, so the probe costs more than
+/// the walk it saves and the sharing is picked up one level down anyway.
+///
+/// The set is measured, not reasoned (immich `--checkers=4` instructions
+/// retired / drizzle-orm `-p <dir>` at `--checkers=4`, against 100.4 G /
+/// 3.620 G):
+///
+///   | memoized kinds | immich | drizzle |
+///   |---|---:|---:|
+///   | every arm | 65.9 G | 3.876 G (+7.1%) |
+///   | composites + reducers | 67.7 G | 3.859 G (+6.6%) |
+///   | the four reducing kinds | 69.4 G | 3.856 G (+6.5%) |
+///   | **`.conditional` + `.mapped`** | **69.5 G** | **3.755 G (+3.7%)** |
+///
+/// `.index_access` and `.keyof_op` are drizzle's hot arms — its whole
+/// `reduceMapped -> substMappedKey -> reduceIndexedAccess` spine is unique
+/// keys, so it pays the probe and never reads one back — and they are worth
+/// exactly nothing on immich (byte-identical node visits with and without).
+/// The composite arms are worth 1.8 G on immich and 0.1 G against on drizzle;
+/// they are left out because drizzle-orm's `-p <dir>` row is the tightest
+/// wall margin in the corpus (46% of tsgo against a 50% bar).
+fn smkWorthMemoizing(k: types.Kind) bool {
+    return switch (k) {
+        .conditional, .mapped => true,
+        else => false,
+    };
+}
+
+fn substMappedKeyInner(c: *Checker, t: TypeId, key_id: u32, key_ty: TypeId) Error!TypeId {
     const s = &c.ts;
     switch (s.kind(t)) {
         .mapped_param => return if (s.mappedParamId(t) == key_id) key_ty else t,
