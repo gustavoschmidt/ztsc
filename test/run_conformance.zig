@@ -679,6 +679,105 @@ fn renderProgramDiags(
     return alloc.dupe(u8, out.written());
 }
 
+/// `renderProgramDiags` walks files in ID order, and a file's id is a
+/// function of the order its root was listed in — so two root orders of the
+/// same program render the same LINES in a different sequence. Sorting the
+/// lines drops that, leaving only what the order must not change: the set of
+/// diagnostics and their text.
+fn sortedLines(alloc: std.mem.Allocator, rendered: []const u8) ![]u8 {
+    var lines: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, rendered, '\n');
+    while (it.next()) |l| {
+        if (l.len != 0) try lines.append(alloc, l);
+    }
+    std.mem.sort([]const u8, lines.items, {}, struct {
+        fn lessThan(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.order(u8, x, y) == .lt;
+        }
+    }.lessThan);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    for (lines.items) |l| out.writer.print("{s}\n", .{l}) catch return error.OutOfMemory;
+    return alloc.dupe(u8, out.written());
+}
+
+// The ROOT-ORDER counterpart of the partition determinism test above, and
+// the unit-scale form of `bench/order_sweep.sh`.
+//
+// Nothing about a program's meaning depends on the order its roots were
+// listed in, but almost every id in the checker does: file ids come from the
+// discovery walk, and symbol ids, global node ids and (through creation
+// order) type ids all hang off those. A checker that lets any of that reach
+// an ANSWER reports different diagnostics for the same program under a
+// different `include` order — which is the same defect the partition gate
+// catches from the other side, since a partition is just another way of
+// changing who materializes a declaration first.
+//
+// The program below is built to put weight on the paths that have actually
+// carried it: a cross-file generic fold whose accumulator is annotated on the
+// callback (contravariant inference against an index-signature target — the
+// shape that made excalidraw's `App.tsx` report two TS7053s under
+// `--file-order=reverse` and none under `source`), an import cycle, and a
+// diagnostic in every file so the comparison has something to bite on.
+test "determinism: diagnostics byte-identical for any ROOT ORDER" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const d = tmp.dir;
+
+    try d.writeFile(io, .{ .sub_path = "fold.ts", .data =
+        \\export type Ids = { [k: string]: true };
+        \\export declare function fold<U>(cb: (acc: U) => U, init: U): U;
+        \\export declare function foldFlipped<U>(init: U, cb: (acc: U) => U): U;
+    });
+    var name_buf: [64]u8 = undefined;
+    var body_buf: [768]u8 = undefined;
+    for (0..8) |i| {
+        const name = try std.fmt.bufPrint(&name_buf, "u{d}.ts", .{i});
+        // `ids` must infer `Ids` from the annotated accumulator, not `{}` from
+        // the seed, or `ids["k"]` is an implicit-'any' element access. The
+        // ring import makes every file's turn at materializing `fold` depend
+        // on where the walk started.
+        const body = try std.fmt.bufPrint(&body_buf,
+            \\import {{ fold, foldFlipped, type Ids }} from "./fold";
+            \\import {{ next{d} }} from "./u{d}";
+            \\export const next{d}: number = {d};
+            \\const ids{d} = fold((acc: Ids) => acc, {{}});
+            \\const flip{d} = foldFlipped({{}}, (acc: Ids) => acc);
+            \\export const one{d}: true = ids{d}["k"];
+            \\export const two{d}: true = flip{d}["k"];
+            \\const wrong{d}: string = next{d};
+        , .{ (i + 1) % 8, (i + 1) % 8, i, i, i, i, i, i, i, i, i, i });
+        try d.writeFile(io, .{ .sub_path = name, .data = body });
+    }
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var interner = Interner.init();
+    defer interner.deinit(gpa);
+    const alloc = arena.allocator();
+
+    var fwd: [8][]const u8 = undefined;
+    var rev: [8][]const u8 = undefined;
+    for (0..8) |i| {
+        const nm = try std.fmt.allocPrint(alloc, "u{d}.ts", .{i});
+        fwd[i] = nm;
+        rev[7 - i] = nm;
+    }
+
+    const br_fwd = try modules.buildProgram(alloc, io, gpa, &interner, d, &fwd, .none, .{}, .{}, null);
+    const br_rev = try modules.buildProgram(alloc, io, gpa, &interner, d, &rev, .none, .{}, .{}, null);
+    try std.testing.expectEqual(br_fwd.program.files.len, br_rev.program.files.len);
+
+    const ref = try sortedLines(alloc, try renderProgramDiags(alloc, io, gpa, &interner, &br_fwd.program, 1));
+    // Exactly the eight `wrong<i>` lines: every `one<i>`/`two<i>` must be
+    // clean, which is what the contravariant inference buys.
+    try std.testing.expectEqual(@as(usize, 8), std.mem.count(u8, ref, "\n"));
+    const got = try sortedLines(alloc, try renderProgramDiags(alloc, io, gpa, &interner, &br_rev.program, 1));
+    try std.testing.expectEqualStrings(ref, got);
+}
+
 test "determinism: diagnostics byte-identical for N = 1, 2, 4, 8 checkers" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
