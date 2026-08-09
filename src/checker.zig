@@ -3346,6 +3346,7 @@ pub const Checker = struct {
     pub const widenInitializer = signatures_zig.widenInitializer;
     pub const forHeadBindingType = signatures_zig.forHeadBindingType;
     pub const declaratorType = signatures_zig.declaratorType;
+    pub const inferredUniqueSymbol = signatures_zig.inferredUniqueSymbol;
     pub const pinPatternParamSyms = signatures_zig.pinPatternParamSyms;
     pub const pinBindingSym = signatures_zig.pinBindingSym;
     pub const bindingElementType = signatures_zig.bindingElementType;
