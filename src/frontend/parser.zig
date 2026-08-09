@@ -1545,6 +1545,25 @@ const Parser = struct {
                 var init: Node = null_node;
                 if (try p.eat(.eq) != null) init = try p.parseAssignExpr(.{});
                 try p.pushScratch(try p.addNode(.{ .tag = .binding_property, .main_token = key, .data = .{ .lhs = value, .rhs = init } }));
+            } else if (p.curTag() == .l_bracket) {
+                // `{[key]: target}` / `{[key]: target = init}` — a computed
+                // binding key. The `= init` default is folded into the target
+                // as a `binding_default` so the node keeps its two slots
+                // (key, target) — bluesky's `const {[key]: _, ...rest} = prev`.
+                const lb = try p.bump();
+                const key_expr = try p.parseAssignExpr(.{});
+                _ = try p.expect(.r_bracket, .expected_r_bracket);
+                var target: Node = null_node;
+                if (try p.eat(.colon) != null) target = try p.parseBindingName();
+                if (try p.eat(.eq)) |eq_tok| {
+                    const init = try p.parseAssignExpr(.{});
+                    target = try p.addNode(.{ .tag = .binding_default, .main_token = eq_tok, .data = .{ .lhs = target, .rhs = init } });
+                }
+                try p.pushScratch(try p.addNode(.{
+                    .tag = .binding_property_computed,
+                    .main_token = lb,
+                    .data = .{ .lhs = key_expr, .rhs = target },
+                }));
             } else {
                 try p.fail(.expected_property_name);
                 if (p.curIdx() == before) break;
@@ -3946,9 +3965,20 @@ const Parser = struct {
             if (isIdentLike(p.peekTag(1)) and p.peekTag(2) == .colon) {
                 return p.parseIndexSignature(flags);
             }
+            // `['data-state']: string` / `[0]: T`. A computed key whose
+            // expression is a literal is late-bound to exactly that literal's
+            // own name, so it is indistinguishable from writing the name
+            // directly (bluesky's `RadixPassThroughTriggerProps`).
+            if ((p.peekTag(1) == .string_literal or p.peekTag(1) == .numeric_literal) and
+                p.peekTag(2) == .r_bracket)
+            {
+                _ = try p.bump(); // `[`
+                name_tok = try p.bump(); // literal
+                _ = try p.eat(.r_bracket);
+            }
             // Well-known-symbol key `[Symbol.iterator](): T` — keyed by a
             // synthetic atom, then parsed as an ordinary member below.
-            if (try p.eatWellKnownSymbolName()) |ntok| {
+            else if (try p.eatWellKnownSymbolName()) |ntok| {
                 name_tok = ntok;
                 flags |= ast.Flags.computed;
             } else if (isIdentLike(p.peekTag(1)) and p.peekTag(2) == .r_bracket) {

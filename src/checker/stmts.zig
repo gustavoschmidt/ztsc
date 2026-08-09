@@ -322,6 +322,11 @@ pub fn materializePatternTypes(c: *Checker, pat: Node) Error!void {
             }
             if (d.rhs != 0) _ = try c.checkExprCached(d.rhs, types.no_type);
         },
+        .binding_property_computed => {
+            const d = c.tree.nodeData(pat);
+            if (d.lhs != 0) _ = try c.checkExprCached(d.lhs, types.no_type);
+            if (d.rhs != 0) try c.materializePatternTypes(d.rhs);
+        },
         .binding_default => {
             const d = c.tree.nodeData(pat);
             try c.materializePatternTypes(d.lhs);
@@ -412,6 +417,14 @@ pub fn assignPatternFromType(c: *Checker, pat: Node, whole: TypeId) Error!void {
                         const a = try c.memberAtom(c.tree.nodeMainToken(el));
                         if (c.bind.lookupInScope(c.cur_scope, a)) |sym| c.setTypeOfSymbol(c.toGlobal(sym), pt);
                     }
+                } else if (c.nodeTag(el) == .binding_property_computed) {
+                    // `{[k]: target}` → `target: whole[typeof k]`.
+                    var pt: TypeId = types.any_type;
+                    if (ed.lhs != 0) {
+                        const kt = try c.checkExprCached(ed.lhs, types.no_type);
+                        pt = try c.indexedAccessType(try c.resolveStructural(whole), kt);
+                    }
+                    if (ed.rhs != 0) try c.assignPatternFromType(ed.rhs, pt);
                 }
             }
         },

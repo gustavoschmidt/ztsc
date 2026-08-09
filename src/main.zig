@@ -780,6 +780,10 @@ pub fn main(init: std.process.Init) !void {
         config_types_wildcard = cfg.types_wildcard;
         config_allow_synthetic_default = cfg.allow_synthetic_default_imports;
         config_jsx_runtime_module = cfg.jsx_runtime_module;
+        // `moduleSuffixes` widens every file probe the resolver makes, so it
+        // is installed on the resolver module rather than threaded through
+        // twenty signatures (resolution is single-owner; see `fs_probes`).
+        resolve.setModuleSuffixes(cfg.module_suffixes);
         config_ns = config_timer.readNs();
     }
 

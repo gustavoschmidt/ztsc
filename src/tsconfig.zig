@@ -114,6 +114,7 @@ pub fn loadInDir(io: Io, arena: Allocator, base: Io.Dir, config_path: []const u8
     }
 
     cfg.lib = acc.lib;
+    if (acc.module_suffixes) |ms| cfg.module_suffixes = ms;
     // Effective noImplicitAny = explicit value ?? strict. ztsc only runs strict
     // semantics (strict is true or absent — an explicit `false` errored above),
     // so the fallback is `true`; an explicit `noImplicitAny: false` still wins.
@@ -305,6 +306,12 @@ pub const Config = struct {
     /// absent. Fed to `libs.resolveLibSet` to pick the built-in lib blobs;
     /// null selects the default set (ES-core + DOM, matching tsgo).
     lib: ?[]const []const u8 = null,
+    /// `compilerOptions.moduleSuffixes` (TS 4.7), in order. Every candidate
+    /// file name is probed once per suffix, inserted before the extension
+    /// (tsc's `tryFile`); the empty string means the unsuffixed name. Empty
+    /// = the option is absent, i.e. probe the plain name only. React Native
+    /// projects set `[".ios", ".android", ".native", ""]`.
+    module_suffixes: []const []const u8 = &.{},
     /// `compilerOptions.skipLibCheck` or `skipDefaultLibCheck` set to true.
     /// Suppresses type-checking of the embedded default lib (which ztsc checks
     /// by default, matching tsc/tsgo). `skipLibCheck` additionally sets
@@ -957,6 +964,7 @@ const Merged = struct {
     jsx: ?[]const u8 = null,
     jsx_import_source: ?[]const u8 = null,
     lib: ?[]const []const u8 = null,
+    module_suffixes: ?[]const []const u8 = null,
     skip_lib_check: ?bool = null,
     skip_all_lib_check: ?bool = null,
     resolve_json_module: ?bool = null,
@@ -1142,6 +1150,15 @@ fn applyOwn(
                                 try note(arena, notes, "{s}: lib '{s}' is out of subset (ignored; ztsc ships es-core + dom)", .{ config_path, name });
                             }
                         }
+                    }
+                } else if (std.mem.eql(u8, okey, "moduleSuffixes")) {
+                    // TS 4.7 `moduleSuffixes`: every candidate file name is
+                    // probed once per suffix, inserted before the extension,
+                    // in the configured order. React Native projects set
+                    // `[".ios", ".android", ".native", ""]`, which is what
+                    // makes `import './threads'` pick `threads.native.d.ts`.
+                    if (try stringArray(arena, warnings, config_path, okey, oval)) |list| {
+                        acc.module_suffixes = list;
                     }
                 } else if (std.mem.eql(u8, okey, "resolveJsonModule")) {
                     if (oval == .boolean) {

@@ -986,6 +986,7 @@ pub fn bind(
         // as `N.member`), matching tsc — declaration files omit `export` on
         // namespace members that are nonetheless part of the public shape.
         .ambient = is_dts,
+        .is_dts = is_dts,
     };
 
     // Reserved entries (0-sentinel style, like the AST).
@@ -1115,6 +1116,17 @@ const Binder = struct {
     /// Includes `export {}` (a marker export with no bindings), which
     /// is exactly how a source file opts into module semantics.
     saw_module_syntax: bool = false,
+    /// Set once a top-level *export declaration* is bound — `export { … }`,
+    /// `export * from`, `export =`, or `export default <expr>`. Statements that
+    /// merely carry an `export` MODIFIER (`export const x`, `export default
+    /// function f() {}`) do not count. This is tsc's `hasExportDeclarations`,
+    /// and its absence in a `.d.ts` makes the file an *export context* (see
+    /// `applyExportContext`).
+    saw_export_declaration: bool = false,
+    /// The source is a `.d.ts` declaration file (tsc's `NodeFlags.Ambient` on
+    /// the source file). Read by `seal` for the export-context rule; `ambient`
+    /// is seeded from it but moves around during binding.
+    is_dts: bool = false,
     /// Name from `export as namespace X;` (the UMD global declaration), or 0.
     umd_name: Atom = 0,
     /// `declare module "spec" { … }` blocks collected during binding.
@@ -1733,19 +1745,36 @@ const Binder = struct {
                 b.exporting_node = saved;
             },
             .export_default => {
-                if (b.cur_scope == file_scope) b.saw_module_syntax = true;
+                if (b.cur_scope == file_scope) {
+                    b.saw_module_syntax = true;
+                    // `export default function f() {}` / `class C {}` is a
+                    // declaration with a modifier, not tsc's ExportAssignment.
+                    switch (b.nodeTag(d.lhs)) {
+                        .function_decl, .class_decl => {},
+                        else => b.saw_export_declaration = true,
+                    }
+                }
                 try b.bindExportDefault(node);
             },
             .export_named => {
-                if (b.cur_scope == file_scope) b.saw_module_syntax = true;
+                if (b.cur_scope == file_scope) {
+                    b.saw_module_syntax = true;
+                    b.saw_export_declaration = true;
+                }
                 try b.bindExportNamed(node);
             },
             .export_all => {
-                if (b.cur_scope == file_scope) b.saw_module_syntax = true;
+                if (b.cur_scope == file_scope) {
+                    b.saw_module_syntax = true;
+                    b.saw_export_declaration = true;
+                }
                 try b.bindExportAll(node);
             },
             .export_assign => {
-                if (b.cur_scope == file_scope) b.saw_module_syntax = true;
+                if (b.cur_scope == file_scope) {
+                    b.saw_module_syntax = true;
+                    b.saw_export_declaration = true;
+                }
                 try b.bindExportAssign(node);
             },
             // `export as namespace X;` — record the UMD global name. It is NOT
@@ -2084,6 +2113,12 @@ const Binder = struct {
                 }
                 if (d.rhs != 0) try b.bindExpr(d.rhs); // default initializer
             },
+            .binding_property_computed => {
+                // `[expr]: target` — the key is an ordinary expression read in
+                // the enclosing scope; only the target binds.
+                if (d.lhs != 0) try b.bindExpr(d.lhs);
+                if (d.rhs != 0) try b.bindPattern(d.rhs, kind, decl_node);
+            },
             .omitted, .error_node, .unsupported => {},
             else => {}, // not a pattern (recovery); no bindings
         }
@@ -2133,6 +2168,27 @@ const Binder = struct {
                 for (b.tree.nodeRange(body)) |stmt| try b.bindStatement(stmt);
             } else {
                 try b.bindExpr(body); // arrow expression body
+            }
+        }
+        // A NAMED function expression can call itself: tsc's `resolveName`
+        // stops at the `FunctionExpression` whose own name matches, so the
+        // name is visible in the body and nowhere else. Declared after the
+        // params/body so a parameter or local of the same name keeps the slot
+        // (it shadows the self-reference, as in tsc). Bluesky's
+        // `(function tick(last) { … frame = tick(next) … })(start)` needs it.
+        //
+        // Only a REAL `function name(…)` expression, which is why the `function`
+        // keyword is checked rather than `proto.name_token`: an object-literal
+        // method shorthand (`{ get(k) { … } }`) is also a `function_expr`, with
+        // its KEY as the name token, and binding that would shadow a same-named
+        // import inside the method body (bluesky's `get(key) { return get(key,
+        // store) }` over `idb-keyval`).
+        if (b.nodeTag(node) == .function_expr and proto.name_token != 0 and
+            b.tree.tokens.tag(b.tree.nodeMainToken(node)) == .keyword_function)
+        {
+            const self_atom = try b.atomOfToken(proto.name_token);
+            if (b.members.get(memberKey(s, self_atom)) == null) {
+                _ = try b.declare(s, self_atom, .function, node, proto.name_token, .{ .has_impl = body != 0 });
             }
         }
         b.restoreState(saved);
@@ -3006,10 +3062,7 @@ const Binder = struct {
                     }
                 }
             },
-            .arrow_fn, .function_expr => {
-                // Function-expression names are not bound (documented).
-                try b.bindFunctionLike(node, d.lhs, d.rhs, false);
-            },
+            .arrow_fn, .function_expr => try b.bindFunctionLike(node, d.lhs, d.rhs, false),
             .class_decl => try b.bindClass(node, false), // class expression
             .function_decl => try b.bindFunctionDecl(node), // recovery
             .interface_decl => try b.bindInterface(node),
@@ -3586,6 +3639,41 @@ const Binder = struct {
                 if (result.resolveWithGlobals(rec.local, rec.scope, b.global_scopes.items)) |sym| rec.sym = sym;
             }
         }
+        // tsc's *export context* (`setExportContextFlag` / `hasExportDeclarations`):
+        // a declaration file whose top level contains no export DECLARATION
+        // (`export { … }`, `export * from`, `export =`, `export default <expr>`)
+        // implicitly exports every top-level declaration, `export` modifier or
+        // not. React Native's `Appearance.d.ts` leans on it — `type
+        // ColorSchemeName` carries no modifier, yet
+        // `import {ColorSchemeName} from 'react-native'` (which reaches it via
+        // the barrel's `export *`) resolves for tsc.
+        if (b.is_dts and b.saw_module_syntax and !b.saw_export_declaration) {
+            const lo = members_start[file_scope];
+            const hi = members_start[file_scope + 1];
+            for (member_atoms[lo..hi], member_syms[lo..hi]) |atom, sym| {
+                if (symbol_flags[sym].exported) continue;
+                // ALIASES are exempt: tsc's `declareModuleMember` routes an
+                // `Alias` symbol to `container.locals` unless it is an export
+                // specifier or an `export import a = b`, so a plain `import {X}
+                // from …` is never re-exported by the context rule.
+                // `@atproto/api`'s `types.d.ts` proves it — it type-imports
+                // `AppBskyActorDefs`, and re-exporting that would shadow the
+                // real `export * as AppBskyActorDefs` with a type-only alias.
+                if (symbol_flags[sym].import_binding) continue;
+                symbol_flags[sym].exported = true;
+                const dlo = decls_start[sym];
+                try b.export_recs.append(b.scratch, .{
+                    .exported = atom,
+                    .local = atom,
+                    .module = 0,
+                    .sym = sym,
+                    .node = if (decls_start[sym + 1] > dlo) decls[dlo] else 0,
+                    .kind = .named,
+                    .type_only = false,
+                });
+            }
+        }
+
         result.imports = try arena.dupe(ImportRec, b.import_recs.items);
         result.exports = try arena.dupe(ExportRec, b.export_recs.items);
         result.diagnostics = try arena.dupe(Diagnostic, b.diags.items);

@@ -327,6 +327,13 @@ pub const Tag = enum(u8) {
     /// main_token = key token; lhs = optional target pattern (0 =
     /// shorthand), rhs = optional default initializer.
     binding_property,
+    /// `[expr]: target` — a binding property whose key is a computed name
+    /// (`const {[key]: v, ...rest} = o`). main_token = `[`; lhs = the key
+    /// expression, rhs = the target pattern (a `binding_default` when the
+    /// element carries `= init`). Kept apart from `binding_property` because
+    /// there is no key *token* to name the property with: every consumer that
+    /// reads `binding_property`'s main token as a member name would read `[`.
+    binding_property_computed,
     /// `pattern = default` inside array patterns / params-as-patterns.
     /// main_token = `=`; lhs = pattern, rhs = default expr.
     binding_default,
@@ -965,7 +972,7 @@ pub const Ast = struct {
                 },
 
                 // lhs node + optional rhs node.
-                .object_shorthand, .binding_property, .type_param, .param, .catch_clause => {
+                .object_shorthand, .binding_property, .binding_property_computed, .type_param, .param, .catch_clause => {
                     it.push(d.lhs);
                     it.push(d.rhs);
                 },

@@ -3142,6 +3142,33 @@ pub const Checker = struct {
         return null;
     }
 
+    /// The type of an `arguments` reference that resolved to no symbol: the
+    /// global `IArguments` interface, but only inside a NON-ARROW function
+    /// (tsc's `checkIdentifier` gates on `isInsideFunction` and an arrow
+    /// borrows its enclosing function's `arguments`, so any enclosing
+    /// `function`/method body is enough). Null at the top level, or when the
+    /// lib declares no `IArguments` (`--noLib`), so the reference still
+    /// reports TS2304 there.
+    pub fn implicitArgumentsType(c: *Checker) Error!?TypeId {
+        var cur = c.cur_scope;
+        var in_fn = false;
+        while (cur != binder.file_scope) : (cur = c.bind.scope_parents[cur]) {
+            if (c.bind.scope_kinds[cur] != .function) continue;
+            const owner = c.bind.scope_owners[cur];
+            if (owner == ast.null_node) continue;
+            switch (c.tree.nodeTag(owner)) {
+                .arrow_fn => continue, // transparent: inherits the outer one
+                .function_expr, .function_decl, .class_method => in_fn = true,
+                else => {},
+            }
+            break;
+        }
+        if (!in_fn) return null;
+        const sym = c.prog.globals.lookup(try c.atom("IArguments")) orelse return null;
+        if (!c.symFlags(sym).interface) return null;
+        return try c.ts.makeRef(sym, &.{});
+    }
+
     /// Nearest enclosing function/file scope (for TDZ containment).
     pub fn containerOf(c: *const Checker, s: ScopeId) ScopeId {
         var cur = s;

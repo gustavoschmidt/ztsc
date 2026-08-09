@@ -1282,6 +1282,12 @@ pub fn checkIdentifier(c: *Checker, node: Node) Error!TypeId {
             // whose members are the program's global value declarations
             // (see `globalThisType`).
             if (std.mem.eql(u8, c.atomText(a), "globalThis")) return c.globalThisType();
+            // `arguments` is implicit in every non-arrow function body (tsc
+            // has no symbol for it either — `checkIdentifier` answers
+            // `getGlobalIArgumentsType()` once `isInsideFunction` holds).
+            if (std.mem.eql(u8, c.atomText(a), "arguments")) {
+                if (try c.implicitArgumentsType()) |t| return t;
+            }
             if (c.suggestName(a, c.cur_scope, true)) |sugg| {
                 try c.diagFmt(2552, c.tokSpan(tok), "Cannot find name '{s}'. Did you mean '{s}'?", .{ c.tokenText(tok), c.atomText(sugg) });
             } else {
@@ -4156,6 +4162,11 @@ pub fn checkDestructuringElement(c: *Checker, el0: Node) Error!void {
         .binding_property => {
             if (d.rhs != null_node) _ = try c.checkExprCached(d.rhs, types.no_type);
             if (d.lhs != null_node) try c.checkDestructuringElement(d.lhs);
+        },
+        // `{[k]: target}` — the key IS evaluated; lhs is it, rhs the target.
+        .binding_property_computed => {
+            if (d.lhs != null_node) _ = try c.checkExprCached(d.lhs, types.no_type);
+            if (d.rhs != null_node) try c.checkDestructuringElement(d.rhs);
         },
         .binding_default => {
             if (d.rhs != null_node) _ = try c.checkExprCached(d.rhs, types.no_type);

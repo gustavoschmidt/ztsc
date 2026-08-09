@@ -1177,9 +1177,23 @@ const Linker = struct {
         return atoms.items[idx];
     }
 
-    /// Emit TS2305, or TS2724 when the module has a close export name.
+    /// Emit TS2305, or TS2724 when the module has a close export name, or
+    /// TS2459 when the module DECLARES the name at its top level and simply
+    /// did not export it (tsc's `reportNonExportedMember`, which outranks the
+    /// spelling suggestion — the name is spelled right, it is just private).
     fn diagNoExportedMember(l: *Linker, file: FileId, mfile_opt: ?FileId, module: Atom, name: Atom, span: Span) Error!void {
         if (mfile_opt) |mfile| {
+            const mb = l.files[mfile].bind;
+            if (mb.is_module) {
+                if (mb.lookupInScope(binder.file_scope, name)) |local_sym| {
+                    if (!mb.symbol_flags[local_sym].import_binding) {
+                        try l.diag(file, 2459, span, "Module '\"{s}\"' declares '{s}' locally, but it is not exported.", .{
+                            l.atomText(module), l.atomText(name),
+                        });
+                        return;
+                    }
+                }
+            }
             const sugg = try l.moduleExportSuggestion(mfile, name);
             if (sugg != 0) {
                 try l.diag(file, 2724, span, "'\"{s}\"' has no exported member named '{s}'. Did you mean '{s}'?", .{

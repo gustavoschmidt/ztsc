@@ -1826,6 +1826,8 @@ pub fn markReassignTarget(c: *Checker, target: Node, scope: ScopeId) Error!void 
         },
         // Cover grammar: `object_property`'s target is rhs (lhs is the key).
         .object_property => try c.markReassignTarget(c.tree.nodeData(n).rhs, scope),
+        // `{[k]: target}` — lhs is the key expression, rhs the target.
+        .binding_property_computed => try c.markReassignTarget(c.tree.nodeData(n).rhs, scope),
         .binding_property, .object_shorthand => {
             const d = c.tree.nodeData(n);
             if (d.lhs != 0) {
@@ -2001,7 +2003,7 @@ pub fn patternBindsSym(c: *Checker, pat: Node, sym: SymbolId) Error!bool {
         // main_token/lhs are the property KEY and rhs is the target. The
         // declaration form `binding_property` puts the target in lhs (0 when
         // shorthand), and `object_shorthand`'s lhs is the target identifier.
-        .object_property => return c.patternBindsSym(c.tree.nodeData(pat).rhs, sym),
+        .object_property, .binding_property_computed => return c.patternBindsSym(c.tree.nodeData(pat).rhs, sym),
         .binding_property, .object_shorthand => {
             const d = c.tree.nodeData(pat);
             if (d.lhs != 0) return c.patternBindsSym(d.lhs, sym);

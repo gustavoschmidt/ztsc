@@ -67,9 +67,36 @@ fn resolveStemFs(io: Io, alloc: Allocator, dir: Io.Dir, stem: []const u8, fs: ?*
     // the file's specifiers resolve). A previous fixed 256-byte buffer
     // silently failed on deep node_modules/@types paths — a wrong "module
     // not found" — so there is no length cap here.
-    if (endsWithAny(stem, &.{ ".d.ts", ".d.mts", ".d.cts", ".ts", ".tsx", ".mts", ".cts" })) {
-        buf[0] = stem;
-        n = 1;
+    // A specifier that already names a TypeScript extension is not taken
+    // literally: tsc strips the extension and re-probes the whole family
+    // (`tryAddingExtensions`), so `./subDays.ts` finds `subDays.d.ts`. That is
+    // how date-fns v4 ships — every barrel entry is `export * from "./x.ts"`
+    // and only `x.d.ts` exists. `.mts`/`.cts` keep to their own family.
+    if (endsWithAny(stem, &.{ ".d.mts", ".mts" })) {
+        const base = stem[0 .. stem.len - (if (std.mem.endsWith(u8, stem, ".d.mts")) ".d.mts".len else ".mts".len)];
+        buf[0] = try std.fmt.allocPrint(alloc, "{s}.mts", .{base});
+        buf[1] = try std.fmt.allocPrint(alloc, "{s}.d.mts", .{base});
+        n = 2;
+        return tryCandidates(io, alloc, dir, buf[0..n], fs);
+    }
+    if (endsWithAny(stem, &.{ ".d.cts", ".cts" })) {
+        const base = stem[0 .. stem.len - (if (std.mem.endsWith(u8, stem, ".d.cts")) ".d.cts".len else ".cts".len)];
+        buf[0] = try std.fmt.allocPrint(alloc, "{s}.cts", .{base});
+        buf[1] = try std.fmt.allocPrint(alloc, "{s}.d.cts", .{base});
+        n = 2;
+        return tryCandidates(io, alloc, dir, buf[0..n], fs);
+    }
+    if (endsWithAny(stem, &.{ ".d.ts", ".ts", ".tsx" })) {
+        const tsx = std.mem.endsWith(u8, stem, ".tsx");
+        const cut: usize = if (std.mem.endsWith(u8, stem, ".d.ts"))
+            ".d.ts".len
+        else if (tsx) ".tsx".len else ".ts".len;
+        const base = stem[0 .. stem.len - cut];
+        // `.tsx` prefers its exact match first; `.ts`/`.d.ts` prefer `.ts`.
+        buf[0] = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ base, if (tsx) "tsx" else "ts" });
+        buf[1] = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ base, if (tsx) "ts" else "tsx" });
+        buf[2] = try std.fmt.allocPrint(alloc, "{s}.d.ts", .{base});
+        n = 3;
         return tryCandidates(io, alloc, dir, buf[0..n], fs);
     }
     if (std.mem.endsWith(u8, stem, ".js") or std.mem.endsWith(u8, stem, ".jsx")) {
@@ -946,8 +973,7 @@ fn statExportTarget(
         // would type at all. A target that already names TypeScript was either
         // found by the `.declarations` pass or does not exist.
         if (!endsWithAny(p, &.{ ".js", ".jsx", ".mjs", ".cjs" })) return null;
-        if (try fileExistsFs(io, dir, p, fs)) return try alloc.dupe(u8, p);
-        return null;
+        return probeCandidate(io, alloc, dir, p, fs);
     }
     if (endsWithAny(p, &.{ ".d.ts", ".d.mts", ".d.cts", ".ts", ".tsx" })) {
         cands[0] = p;
@@ -983,15 +1009,59 @@ fn statExportTarget(
         // it unresolved so the import degrades exactly as before this feature.
         return null;
     }
-    for (cands[0..n]) |c| {
-        if (try fileExistsFs(io, dir, c, fs)) return try alloc.dupe(u8, c);
-    }
-    return null;
+    return tryCandidates(io, alloc, dir, cands[0..n], fs);
 }
 
 fn tryCandidates(io: Io, alloc: Allocator, dir: Io.Dir, cands: []const []const u8, fs: ?*FsCache) Error!?[]u8 {
     for (cands) |cand| {
+        if (try probeCandidate(io, alloc, dir, cand, fs)) |p| return p;
+    }
+    return null;
+}
+
+/// tsconfig `moduleSuffixes` (TS 4.7), in the configured order. Every
+/// candidate file name is probed once per suffix, the suffix inserted BEFORE
+/// the extension — tsc's `tryFile`, which wraps every single-file probe the
+/// resolver makes. The empty string means the unsuffixed name. Empty slice =
+/// the option is absent, which is the fast path (one stat, as before).
+///
+/// Set once by the driver before discovery starts; module resolution is
+/// single-owner (see `fs_probes`), so this needs no synchronization.
+var module_suffixes: []const []const u8 = &.{};
+
+pub fn setModuleSuffixes(list: []const []const u8) void {
+    module_suffixes = list;
+}
+
+/// Every extension the resolver ever appends, longest-first so `.d.ts` wins
+/// over `.ts` when both match the tail.
+const known_extensions = [_][]const u8{
+    ".d.mts", ".d.cts", ".d.ts", ".tsx", ".jsx", ".mts", ".cts", ".mjs", ".cjs", ".ts", ".js", ".json",
+};
+
+/// Stat one candidate path, honoring `module_suffixes`. Returns the matched
+/// path (owned by `alloc`), or null when nothing exists.
+fn probeCandidate(io: Io, alloc: Allocator, dir: Io.Dir, cand: []const u8, fs: ?*FsCache) Error!?[]u8 {
+    if (module_suffixes.len == 0) {
         if (try fileExistsFs(io, dir, cand, fs)) return try alloc.dupe(u8, cand);
+        return null;
+    }
+    var ext: []const u8 = "";
+    for (known_extensions) |e| {
+        if (std.mem.endsWith(u8, cand, e)) {
+            ext = e;
+            break;
+        }
+    }
+    const base = cand[0 .. cand.len - ext.len];
+    for (module_suffixes) |suf| {
+        if (suf.len == 0) {
+            if (try fileExistsFs(io, dir, cand, fs)) return try alloc.dupe(u8, cand);
+            continue;
+        }
+        const p = try std.fmt.allocPrint(alloc, "{s}{s}{s}", .{ base, suf, ext });
+        if (try fileExistsFs(io, dir, p, fs)) return p;
+        alloc.free(p);
     }
     return null;
 }
@@ -1004,8 +1074,7 @@ fn tryCandidates(io: Io, alloc: Allocator, dir: Io.Dir, cands: []const []const u
 /// loaded opaquely as `any` (`js_module_source`); ztsc never parses the JS.
 fn resolveJsStem(io: Io, alloc: Allocator, dir: Io.Dir, stem: []const u8, fs: ?*FsCache) Error!?[]u8 {
     if (endsWithAny(stem, &.{ ".js", ".jsx", ".mjs", ".cjs" })) {
-        if (try fileExistsFs(io, dir, stem, fs)) return try alloc.dupe(u8, stem);
-        return null;
+        return probeCandidate(io, alloc, dir, stem, fs);
     }
     var buf: [4][]const u8 = undefined;
     buf[0] = try std.fmt.allocPrint(alloc, "{s}.js", .{stem});

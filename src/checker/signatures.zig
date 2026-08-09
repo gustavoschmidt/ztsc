@@ -1701,6 +1701,18 @@ pub fn findBindingType(c: *Checker, pat: Node, name: Atom, whole: TypeId, out: *
                             return true;
                         }
                     },
+                    .binding_property_computed => {
+                        // `{[k]: v}` → `v: whole[typeof k]` (tsc's
+                        // `getIndexedAccessType` over the computed key). A
+                        // non-literal key lands on the index signature, which
+                        // is what `Record<string, T>` destructuring wants.
+                        var pt: TypeId = types.any_type;
+                        if (ed.lhs != 0) {
+                            const kt = try c.checkExprCached(ed.lhs, types.no_type);
+                            pt = try c.indexedAccessType(try c.resolveStructural(whole), kt);
+                        }
+                        if (try c.findBindingType(ed.rhs, name, pt, out, null)) return true;
+                    },
                     .rest_element => {
                         // `{a, b, ...rest}` → rest = `whole` minus the
                         // sibling-named keys (tsc's object rest type,
@@ -1810,7 +1822,14 @@ pub fn functionSymbolType(c: *Checker, sym: SymbolId) Error!TypeId {
     defer sigs.deinit(c.scratch());
     var impl_sig: TypeId = types.no_type;
     for (decls) |decl| {
-        if (c.nodeTag(decl) != .function_decl) continue;
+        // `function_expr` is here for the SELF-NAME of a named function
+        // expression (`const f = function recur(n) { … recur(…) … }`), which
+        // the binder declares in the expression's own scope. It never carries
+        // overloads, so it takes the implementation-signature path below.
+        switch (c.nodeTag(decl)) {
+            .function_decl, .function_expr => {},
+            else => continue,
+        }
         const d = c.tree.nodeData(decl);
         const sig = try c.signatureOfProto(decl, d.lhs, false, true);
         if (d.rhs == 0) {
