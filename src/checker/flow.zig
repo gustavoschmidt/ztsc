@@ -2730,6 +2730,19 @@ pub fn symExplicitlyTyped(c: *Checker, sym: SymbolId) bool {
     return annotated;
 }
 
+/// Does `sym` denote a NAMESPACE VALUE — a `namespace`/`module` declaration,
+/// or an import binding that names a whole module (`import * as NS from "m"`,
+/// and the re-exported `export * as NS` form)? tsc's `SymbolFlags.ValueModule`
+/// after alias resolution; see the call site for why it is resolved outright.
+fn symIsNamespaceValue(c: *Checker, sym: SymbolId) bool {
+    const f = c.symFlags(sym);
+    if (f.type_only) return false;
+    if (f.namespace_decl) return true;
+    if (!f.import_binding) return false;
+    const tgt = c.importTarget(sym) orelse return false;
+    return tgt.kind == .namespace or tgt.kind == .ambient_ns;
+}
+
 pub fn declaredPathTypeInner(c: *Checker, node: Node) Error!TypeId {
     switch (c.nodeTag(node)) {
         .paren_expr => return c.declaredPathTypeInner(c.tree.nodeData(node).lhs),
@@ -2761,6 +2774,21 @@ pub fn declaredPathTypeInner(c: *Checker, node: Node) Error!TypeId {
                     // `--checkers=4`, because the lib's `declare var
                     // Array: ArrayConstructor` was still cold in the
                     // checker that owned the file.
+                    // tsc's `getExplicitTypeOfSymbol` resolves a ValueModule
+                    // outright, and so must this: a namespace object's type
+                    // is a fact of the module graph, not an inference over a
+                    // body, so reading it neither depends on nor disturbs any
+                    // narrowing state — which is what the rule above guards.
+                    //
+                    // Without it the receiver of `NS.isFoo(x)` answered "no
+                    // information" whenever this checker had not already
+                    // materialized the namespace import, so the guard was
+                    // dropped and nothing narrowed — order-dependently, since
+                    // an already-`.computed` symbol short-circuits above.
+                    // Every @atproto/api guard on social-app is written that
+                    // way (`ChatBskyConvoDefs.isGroupConvo(prev.kind)`,
+                    // `AppBskyEmbedRecord.isView(embed)`).
+                    if (symIsNamespaceValue(c, sym)) break :blk try c.typeOfSymbol(sym);
                     if (!c.symExplicitlyTyped(sym)) break :blk types.no_type;
                     break :blk try c.typeOfSymbol(sym);
                 },
