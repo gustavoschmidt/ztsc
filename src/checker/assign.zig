@@ -1613,10 +1613,45 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!bool {
     // tsc's variance comparison keeps a structural fallback, so an inner
     // generic whose own annotation contradicts its members (already reported
     // on its own line) must not make its every USER a second report.
+    // …and one further restriction, which is a CONVERGENCE rule rather than a
+    // typing one: the probe runs only when both sides are DECLARED references
+    // (`.ref`), never when a side's reference facet was recovered from the
+    // `origin` side table.
+    //
+    // `origin` is written by `expandRef` and grows as the run proceeds, so
+    // "this interned object is the materialization of `G<A…>`" is a fact about
+    // what this checker has already expanded, not a fact about the object. A
+    // rule that DECIDES on it answers differently depending on whether some
+    // earlier file in the same partition happened to expand `G<A…>` first —
+    // and the variance probe decides: it answers YES where the structural walk
+    // below answers NO.
+    //
+    // social-app's `src/lib/routes/router.ts` is the case.
+    // `Object.entries(description)` with
+    // `description: Record<keyof T, string | string[]>` relates that mapped
+    // type to the generic overload's `{ [s: string]: U }` at `U = unknown`.
+    // Both sides are bare structural types; the target is the expansion of
+    // `Record<string, unknown>`, so it carries that origin ref IF AND ONLY IF
+    // this checker has already expanded `Record<string, unknown>` for some
+    // other file. Where it had, the probe matched `Record` on both sides,
+    // related the arguments by measured variance and answered YES — the
+    // generic overload won with `U` uninferred, so `pattern` came out
+    // `unknown` and `pattern.forEach` reported TS2339. Where it had not, the
+    // same call fell to `entries(o: {}): [string, any][]` and reported
+    // nothing. That is the diagnostic `bench/convergence.sh` saw at
+    // `--checkers=2..8` and not at `--checkers=1`.
+    //
+    // The reflexive origin fast-path above is deliberately NOT restricted: it
+    // fires only when the two origins are EQUAL, i.e. when both sides denote
+    // one and the same instantiation, where the answer is YES either way and
+    // the tag only saves a walk that non-confluent materializations would
+    // fail. The variance probe is the one that turns a structural NO into a
+    // YES on a pair whose arguments differ.
+    const declared_refs = sk == .ref and tk == .ref;
     const verdict: RelVerdict = blk: {
         if (sr) |sref| {
             if (tr) |tref| {
-                if (sref != tref and c.ts.refSymbol(sref) == c.ts.refSymbol(tref) and
+                if (declared_refs and sref != tref and c.ts.refSymbol(sref) == c.ts.refSymbol(tref) and
                     !c.isVarianceMarkerRef(sref) and !c.isVarianceMarkerRef(tref))
                 {
                     if (try c.varianceVerdict(sref, tref)) |verdict| {
