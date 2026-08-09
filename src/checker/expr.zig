@@ -723,7 +723,7 @@ pub fn jsxClassComponentProps(c: *Checker, class_val: TypeId) Error!?TypeId {
     if (tps.items.len != 0) return null; // generic class component: unmodeled
     const inst = try c.ts.makeRef(cls, &.{});
     const rinst = try c.resolveStructural(inst);
-    if (try c.propOfType(rinst, name)) |p| return p.ty;
+    if (try c.propOfType(rinst, name)) |p| return try c.withIntrinsicClassAttributes(p.ty, inst);
     // No resolvable props member — a modeling gap, not a genuinely
     // props-less component (an empty `Component<{}>` still yields a `props`
     // member above). This surfaces for class components whose base is a
@@ -734,6 +734,28 @@ pub fn jsxClassComponentProps(c: *Checker, class_val: TypeId) Error!?TypeId {
     // rather than reject every attribute against `{}` — under-report over a
     // false positive.
     return null;
+}
+
+/// tsc's `getJsxPropsTypeFromClassType`: a CLASS component's attributes
+/// target is `IntrinsicClassAttributes<Instance> & Props` (the
+/// `IntrinsicAttributes &` part is added by the shared JSX path). In
+/// @types/react that interface is `{ ref?: Ref<T> }`, so without it every
+/// `<ClassComp ref={…}>` read `ref` as an EXCESS attribute and the whole
+/// element failed with TS2322 — 40+ hits on a React Native codebase, where
+/// `View`/`Text`/`ScrollView` are all class components. Returns `props`
+/// unchanged when the JSX namespace declares no such interface.
+pub fn withIntrinsicClassAttributes(c: *Checker, props: TypeId, inst: TypeId) Error!TypeId {
+    const sym = c.jsxNamespaceMember(c.atom_IntrinsicClassAttributes) orelse return props;
+    var tps: std.ArrayList(TypeParamInfo) = .empty;
+    defer tps.deinit(c.scratch());
+    try c.typeParamsOf(sym, &tps);
+    // tsc fills the single type parameter with the host class instance type;
+    // a non-generic declaration is used bare.
+    const args: []const TypeId = if (tps.items.len == 1) &.{inst} else &.{};
+    if (tps.items.len > 1) return props;
+    const ica = try c.namedTypeFromSymbol(sym, args, 0);
+    if (ica == types.error_type or ica == types.any_type) return props;
+    return c.ts.makeIntersection(c.scratch(), &.{ ica, props });
 }
 
 /// Name of the props member per `JSX.ElementAttributesProperty` — the name
@@ -1238,8 +1260,16 @@ pub fn jsxAttributeValueType(c: *Checker, value: Node, ctx: TypeId) Error!TypeId
             // `onPick?: (v: number) => void` — without the context every such
             // parameter raises TS7006). Other value kinds are checked
             // context-free.
+            // A CALL is contextually typed too, so the callee's generic
+            // inference gets tsc's `InferencePriority.ReturnType` seed: RN's
+            // `size={platform({web: 'tiny', native: 'small'})}`
+            // (`select<T>(spec: {[p in OS]?: T}): T | undefined`) keeps both
+            // literals only because the attribute's `ButtonSize | undefined`
+            // reaches the call — checked context-free every property widens
+            // to `string` and `T` infers `string`.
             const vctx = switch (c.nodeTag(cd.lhs)) {
                 .template_expr, .object_literal, .array_literal, .cond_expr, .arrow_fn, .function_expr => ctx,
+                .call_expr, .call_expr_targs, .optional_call => ctx,
                 else => types.no_type,
             };
             return c.checkExprCached(cd.lhs, vctx);

@@ -2154,7 +2154,12 @@ pub fn narrowByLiteralEquality(c: *Checker, t: TypeId, other: Node, strict: bool
         }
         return c.nonNullable(t);
     }
-    const is_literal = c.ts.isLiteralLike(ot) or is_nullish;
+    // tsc's `isUnitType` covers `TypeFlags.Unit` = Literal | UniqueESSymbol |
+    // Nullable, so a `unique symbol` comparand narrows exactly like a literal
+    // one: `if (post === POST_TOMBSTONE)` must remove the tombstone
+    // constituent from `Shadow<PostView> | typeof POST_TOMBSTONE` on the else
+    // branch. Plain `symbol` is NOT a unit type and still narrows nothing.
+    const is_literal = c.ts.isLiteralLike(ot) or is_nullish or ok == .unique_symbol;
     if (!is_literal) return t;
     if (sense) {
         return c.narrowToValue(t, ot);
@@ -2213,6 +2218,10 @@ pub fn narrowToValue(c: *Checker, t: TypeId, v: TypeId) Error!TypeId {
     // defeating the inferred-predicate disjointness gate (and under-
     // narrowing `if (x === null)`).
     if (c.ts.kind(v) == .null or c.ts.kind(v) == .undefined) return types.never_type;
+    // `=== <unique symbol>`: the comparand is a unit type whose only wider
+    // domain is `symbol` (a different unique symbol was ruled out by the
+    // identity test above), so every other constituent is excluded.
+    if (c.ts.kind(v) == .unique_symbol) return if (k == .symbol) v else types.never_type;
     if (try c.literalBaseOf(v) == mt) return v; // string narrowed by "a" / `E` by `E.A`
     if (k == .boolean and (c.ts.kind(v) == .bool_true or c.ts.kind(v) == .bool_false)) return v;
     if (c.ts.isLiteralLike(mt) or k == .null or k == .undefined) {

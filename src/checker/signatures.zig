@@ -1485,6 +1485,23 @@ pub fn forHeadBindingType(c: *Checker, sym: SymbolId) Error!?TypeId {
     return try c.forOfElementType(rt, null_node, e.is_await != 0);
 }
 
+/// tsc's `getESSymbolLikeTypeForNode` / `isValidESSymbolDeclaration`: a
+/// `Symbol()` or `Symbol.for()` call typed for a CONST variable declaration
+/// with a plain identifier name yields a fresh `unique symbol` keyed to that
+/// declaration, not the lib's plain `symbol` return. Without it
+/// `const TOMB = Symbol('t')` types as `symbol`, so `typeof TOMB` is `symbol`
+/// too and `x === TOMB` cannot narrow the `Post | typeof TOMB` union — the
+/// `symbol` constituent survives into the else branch (6 TS2322 on
+/// social-app's post-shadow tombstone). Keyed on the declarator node, which
+/// is distinct from the annotation node an explicit `: unique symbol` uses.
+/// Null when the shape does not qualify, so the caller widens as before.
+pub fn inferredUniqueSymbol(c: *Checker, decl: Node, name: Node, init: Node, is_const: bool, init_t: TypeId) Error!?TypeId {
+    if (!is_const or c.nodeTag(name) != .identifier) return null;
+    if (c.ts.kind(init_t) != .symbol) return null;
+    if (!c.isFreshSymbolCall(init)) return null;
+    return try c.uniqueSymType(decl);
+}
+
 pub fn declaratorType(c: *Checker, sym: SymbolId, decl: Node, is_const: bool) Error!TypeId {
     // The initializer is being typed to *build* this variable's type, so
     // any function body inside it must not be walked yet — the same rule
@@ -1522,6 +1539,7 @@ pub fn declaratorType(c: *Checker, sym: SymbolId, decl: Node, is_const: bool) Er
         },
         .declarator_init => {
             const init_t = try c.checkExprCached(d.rhs, types.no_type);
+            if (try c.inferredUniqueSymbol(decl, d.lhs, d.rhs, is_const, init_t)) |u| return u;
             const vt = try c.widenInitializer(init_t, is_const);
             if (c.nodeTag(d.lhs) == .identifier) return vt;
             return c.bindingElementType(sym, decl, vt);
@@ -1533,6 +1551,7 @@ pub fn declaratorType(c: *Checker, sym: SymbolId, decl: Node, is_const: bool) Er
                 vt = try c.annTypeMaybeUnique(e.type_ann, is_const, 1332, c.nodeSpan(d.lhs));
             } else if (e.init != 0) {
                 const init_t = try c.checkExprCached(e.init, types.no_type);
+                if (try c.inferredUniqueSymbol(decl, d.lhs, e.init, is_const, init_t)) |u| return u;
                 vt = try c.widenInitializer(init_t, is_const);
             }
             if (c.nodeTag(d.lhs) == .identifier) return vt;

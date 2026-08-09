@@ -988,6 +988,79 @@ pub fn partialParamCtx(c: *Checker, pt0: TypeId, partial: []const TpMap) Error!T
     return c.ts.makeUnion(c.scratch(), kept.items);
 }
 
+/// The contextual-RETURN half of tsc's `instantiateContextualType`: an
+/// object-literal argument is checked against its parameter instantiated
+/// with `context.returnMapper` — the `InferencePriority.ReturnType`
+/// inferences made before any argument is looked at. When a parameter
+/// property is typed by a still-free type parameter whose return-seed names
+/// a literal domain, that seed IS the property's literal context, so the
+/// fresh literal survives (`isLiteralOfContextualType`).
+///
+/// `platform: Platform["select"]` (`select<T>(spec: { web?: T; native?: T }):
+/// T`) is the shape: `size={platform({web: 'tiny', native: 'small'})}` under
+/// a contextual `"large" | "medium" | "small" | "tiny" | undefined` keeps
+/// both literals in tsc, while a context-free check widens each property to
+/// `string` and infers `T = string`. Without a contextual return there is no
+/// seed and the widening is correct (tsc widens there too).
+fn seedKeepsPropLiteral(c: *Checker, pt: TypeId, tp_syms: []const u32, seed: []const TypeId, depth: u8) Error!bool {
+    const r = try c.resolveStructural(pt);
+    switch (c.ts.kind(r)) {
+        .intersection => {
+            if (depth >= 2) return false;
+            for (try c.memberList(r)) |m| {
+                if (m == r) continue;
+                if (try seedKeepsPropLiteral(c, m, tp_syms, seed, depth + 1)) return true;
+            }
+            return false;
+        },
+        .array => {
+            if (depth >= 2) return false;
+            return seedKeepsPropLiteral(c, c.ts.arrayElem(r), tp_syms, seed, depth + 1);
+        },
+        .object => {},
+        else => return false,
+    }
+    for (0..c.ts.objectPropCount(r)) |i| {
+        const p = c.ts.objectProp(r, @intCast(i));
+        const pr = try c.resolveStructural(p.ty);
+        if (c.ts.kind(pr) != .type_param) continue;
+        const sym = c.ts.typeParamSymbol(pr);
+        for (tp_syms, 0..) |s, j| {
+            if (s != sym or seed[j] == types.no_type) continue;
+            if (try c.isPrimitiveLiteralish(seed[j])) return true;
+        }
+    }
+    return false;
+}
+
+/// Is contravariant candidate `cand` nothing but the value `fed` that this
+/// call substituted into the argument's contextual type — either verbatim, or
+/// with union constituents the target position already matched away removed?
+/// Deliberately SYNTACTIC (constituent identity, not assignability): a
+/// genuinely narrower candidate from an ANNOTATED callback parameter is not a
+/// sub-union of the fed type, so it still counts as evidence.
+pub fn isFedEcho(c: *Checker, cand: TypeId, fed: TypeId) Error!bool {
+    if (cand == fed) return true;
+    if (c.ts.kind(fed) != .union_type) return false;
+    const fed_ms = try c.memberList(fed);
+    const cand_ms: []const TypeId = if (c.ts.kind(cand) == .union_type)
+        try c.scratch().dupe(TypeId, try c.memberList(cand))
+    else
+        &.{cand};
+    if (cand_ms.len >= fed_ms.len) return false;
+    for (cand_ms) |m| {
+        var found = false;
+        for (fed_ms) |f| {
+            if (f == m) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
 pub fn instantiateKnownParams(
     c: *Checker,
     t: TypeId,
@@ -1215,7 +1288,8 @@ pub fn inferTypeArgs(
             // have a literal-keeping type-variable property so unrelated
             // object-literal arguments (callback bags like `openDB({ upgrade
             // })`) keep their context-free check.
-            .object_literal => if (try c.paramWantsLiteralCtx(pt)) pt else types.no_type,
+            .object_literal => if ((try c.paramWantsLiteralCtx(pt)) or
+                (try seedKeepsPropLiteral(c, pt, tp_syms, ret_seed, 0))) pt else types.no_type,
             else => types.no_type,
         };
         // Fresh object literal into a bare type-param parameter (`truncate<T
@@ -1299,6 +1373,16 @@ pub fn inferTypeArgs(
         {
             const probe_cands = try c.scratch().alloc(TypeId, tp_syms.len);
             for (candidates, 0..) |cd, i| probe_cands[i] = cd;
+            // What pass two FEEDS each parameter, plus the pre-pass state —
+            // read by the contravariant echo guard after the re-check.
+            const fed2 = try c.scratch().alloc(TypeId, tp_syms.len);
+            const before2 = try c.scratch().alloc(TypeId, tp_syms.len);
+            const before_contra2 = try c.scratch().alloc(TypeId, tp_syms.len);
+            for (tp_syms, 0..) |_, i| {
+                fed2[i] = types.no_type;
+                before2[i] = candidates[i];
+                before_contra2[i] = contra[i];
+            }
             c.side_query_depth += 1;
             const ctx2 = blk: {
                 errdefer c.side_query_depth -= 1;
@@ -1342,6 +1426,7 @@ pub fn inferTypeArgs(
                     // `keyof` is `string`, which is how RTK's
                     // `slice.actions` became `{}`.
                     if (map2.items.len > 0) v = try c.instantiate(v, map2.items);
+                    fed2[i] = v;
                     try map2.append(c.scratch(), .{ .sym = sym, .ty = v });
                 }
                 break :blk try c.instantiate(pt, map2.items);
@@ -1349,6 +1434,39 @@ pub fn inferTypeArgs(
             c.side_query_depth -= 1;
             const at2 = try c.checkExprCached(an, ctx2);
             try c.unify(pt, at2, tp_syms, candidates, 0);
+            // The contravariant twin of the placeholder echo, for the
+            // object-literal two-pass path (Phase 2 has the same guard for a
+            // bare function argument). Pass two typed every un-annotated
+            // callback property from `fed2`, so a parameter position that
+            // mentions the type variable hands the substitution straight back
+            // as a CONTRAVARIANT candidate — and a contravariant candidate
+            // OUTRANKS the covariant one, so the echo replaces the real
+            // inference. tsc never sees it: for a context-sensitive argument
+            // it leaves the variable free (nothing to instantiate the
+            // contextual type with yet), so the parameter's type stays `T`
+            // and inferring `T` from `T` yields nothing.
+            //
+            // react-query's `useMutation({ onMutate, onError })` is the shape:
+            // `onMutate` returns `Ctx | undefined` (the covariant candidate)
+            // while `onError`'s `onMutateResult: TContext | undefined`
+            // parameter echoes the fed `Ctx | undefined` back, minus the
+            // `undefined` the target union already matched — a contravariant
+            // `Ctx`, which then rejected `onMutate`'s own return.
+            //
+            // Only a candidate that is our own guess or a part of it is
+            // dropped, and only for a parameter no earlier argument had
+            // already constrained.
+            for (contra, 0..) |*cc, i| {
+                if (cc.* == before_contra2[i] or cc.* == types.no_type) continue;
+                if (before2[i] != types.no_type or fed2[i] == types.no_type) continue;
+                // Only when pass two produced a real COVARIANT candidate to
+                // fall back on. Where the echo is the parameter's only
+                // evidence it is still the best guess available (dropping it
+                // leaves the parameter to its constraint, which loses the
+                // argument's shape outright).
+                if (candidates[i] == types.no_type) continue;
+                if (try c.isFedEcho(cc.*, fed2[i])) cc.* = before_contra2[i];
+            }
             continue;
         }
         var at = try c.checkExprCached(an, arg_ctx);

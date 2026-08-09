@@ -3377,6 +3377,28 @@ pub fn enumerableForms(c: *Checker, hole0: TypeId, out: *std.ArrayList(Atom)) Er
             }
             return true;
         },
+        // An enum interpolates as its constant VALUES. tsc needs no special
+        // case: a member type carries `StringLiteral | EnumLiteral` (so
+        // `addSpans` reads its `value` straight off) and a WHOLE enum IS the
+        // union of its members, which the union arm above distributes over.
+        // ztsc keeps the enum as one `.enum_type`, so both forms are spelled
+        // out here — without it `` `${AppLanguage}` `` stayed a symbolic
+        // pattern that no member string was comparable to (5 TS2678 on
+        // social-app's `switch (lang as `${AppLanguage}`)`).
+        .enum_type => {
+            const esym = s.enumSymbol(hole);
+            if (s.isEnumMember(hole)) {
+                const v = (try c.enumMemberValue(esym, s.enumMemberAtom(hole))) orelse return false;
+                return c.enumerableForms(v, out);
+            }
+            const members = try c.enumMembersOf(esym);
+            if (members.len == 0) return false;
+            for (members) |m| {
+                if (m.value == types.no_type) return false;
+                if (!try c.enumerableForms(m.value, out)) return false;
+            }
+            return true;
+        },
         // The `Core & string` template-hole idiom, generalized: `"a" & string`
         // (a single literal), `("a"|"b") & string` (a literal UNION, which the
         // single-literal `stringLiteralOf` path missed — it left the hole a

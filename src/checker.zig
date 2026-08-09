@@ -2717,7 +2717,23 @@ pub const Checker = struct {
         const a = try c.atom(name);
         const sym = switch (c.resolveSpace(a, scope, true)) {
             .sym => |s| s,
-            else => return null,
+            // A TYPE-ONLY import of a const (`import { type ID as K }`, then
+            // `{ [K]?: boolean }`) has no VALUE meaning, so the value-space
+            // lookup misses it and the key degraded to the name placeholder —
+            // which is a plain string atom, so `keyof` reported
+            // `"__@k$…"` where tsc reports the enum-member literal.
+            // tsc's `isLateBindableName` resolves the entity name through the
+            // alias and reads the target's literal type regardless of the
+            // type-only modifier. Restricted to an IMPORT BINDING so a real
+            // type name in key position still falls back to the placeholder.
+            else => blk: {
+                const t = switch (c.resolveSpace(a, scope, false)) {
+                    .sym => |s| s,
+                    else => return null,
+                };
+                if (!c.symFlags(t).import_binding) return null;
+                break :blk t;
+            },
         };
         return try c.typeOfSymbol(sym);
     }
@@ -3379,6 +3395,7 @@ pub const Checker = struct {
     pub const widenInitializer = signatures_zig.widenInitializer;
     pub const forHeadBindingType = signatures_zig.forHeadBindingType;
     pub const declaratorType = signatures_zig.declaratorType;
+    pub const inferredUniqueSymbol = signatures_zig.inferredUniqueSymbol;
     pub const pinPatternParamSyms = signatures_zig.pinPatternParamSyms;
     pub const pinBindingSym = signatures_zig.pinBindingSym;
     pub const bindingElementType = signatures_zig.bindingElementType;
@@ -3473,6 +3490,7 @@ pub const Checker = struct {
     pub const eachEnumMember = enums_zig.eachEnumMember;
     pub const enumHasMemberNamed = enums_zig.enumHasMemberNamed;
     pub const enumMemberValue = enums_zig.enumMemberValue;
+    pub const enumMembersOf = enums_zig.enumMembersOf;
     pub const enumMemberTypeUnion = enums_zig.enumMemberTypeUnion;
     pub const enumMemberForValue = enums_zig.enumMemberForValue;
     pub const enumHasStringMember = enums_zig.enumHasStringMember;
@@ -3758,6 +3776,7 @@ pub const Checker = struct {
     pub const constraintIsAnyIndex = expr_zig.constraintIsAnyIndex;
     pub const inferJsxTargs = expr_zig.inferJsxTargs;
     pub const jsxClassComponentProps = expr_zig.jsxClassComponentProps;
+    pub const withIntrinsicClassAttributes = expr_zig.withIntrinsicClassAttributes;
     pub const jsxPropsMemberName = expr_zig.jsxPropsMemberName;
     pub const checkJsxAttributes = expr_zig.checkJsxAttributes;
     pub const jsxAttrsObject = expr_zig.jsxAttrsObject;
@@ -3865,6 +3884,7 @@ pub const Checker = struct {
     pub const mentionsActiveInferVar = calls_zig.mentionsActiveInferVar;
     pub const partialParamCtx = calls_zig.partialParamCtx;
     pub const instantiateKnownParams = calls_zig.instantiateKnownParams;
+    pub const isFedEcho = calls_zig.isFedEcho;
     pub const paramIsBareCallbackReturn = calls_zig.paramIsBareCallbackReturn;
     pub const isBareOrUnionMember = calls_zig.isBareOrUnionMember;
     pub const inferTypeArgs = calls_zig.inferTypeArgs;
