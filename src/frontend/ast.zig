@@ -543,9 +543,10 @@ pub const Tag = enum(u8) {
     /// keyword; lhs = check type node, rhs = extra→ConditionalType (extends /
     /// true / false branches). `infer` binders live inside the extends branch.
     conditional_type,
-    /// `infer V`. main_token = `infer` keyword; lhs = the binder's name
-    /// token (a TokenIndex, not a node); rhs unused. Only meaningful inside a
-    /// conditional type's extends clause.
+    /// `infer V` / `infer V extends C`. main_token = `infer` keyword; lhs =
+    /// the binder's name token (a TokenIndex, not a node); rhs = the
+    /// constraint type node, or 0. Only meaningful inside a conditional
+    /// type's extends clause.
     infer_type,
     /// `{ [K in C as N]: V }` mapped type. main_token = `{`; lhs = extra
     /// → MappedTypeData. The key parameter `K` is scoped to the `as` and value
@@ -904,9 +905,11 @@ pub const Ast = struct {
                 .import_type,
                 // `unique symbol` — a leaf type operator, no child nodes.
                 .unique_symbol_type,
-                // `infer V` — lhs is the binder's name *token*, not a node.
-                .infer_type,
                 => {},
+
+                // `infer V extends C` — lhs is the binder's name *token*, not
+                // a node; the optional constraint hangs off rhs.
+                .infer_type => it.push(d.rhs),
 
                 // lhs only.
                 .paren_expr,
