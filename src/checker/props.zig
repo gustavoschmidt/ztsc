@@ -621,6 +621,9 @@ pub fn typeParamFallback(c: *Checker, sym: SymbolId) Error!TypeId {
 
 pub fn typeParamConstraint(c: *Checker, sym: SymbolId) Error!TypeId {
     if (c.isFreshTp(sym)) {
+        // THE choke point: a fresh parameter's bound is substituted here, on
+        // first read, and not at the mint site. See `resolveFreshBound`.
+        if (c.freshTp(sym).pending_bound != types.no_type) try c.resolveFreshBound(sym);
         if (c.prof.on) prof_zig.noteFreshBoundRead(c, sym);
         return c.freshTp(sym).constraint;
     }

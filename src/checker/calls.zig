@@ -1653,6 +1653,11 @@ pub fn inferTypeArgs(
             // concerned, and treating it as unconstrained widened kysely's
             // `selectAll("asset")` key to `string` — which then indexed the
             // schema to nothing and made the whole row type `{}`.
+            // `typeParamConstraint` above has already forced any deferred
+            // bound (`FreshTp.pending_bound`), which is what fills this in;
+            // the guard is here so the invariant is local rather than an
+            // ordering accident.
+            if (c.isFreshTp(tp) and c.freshTp(tp).pending_bound != types.no_type) try c.resolveFreshBound(tp);
             const widen_bound: TypeId = if (c.isFreshTp(tp)) c.freshTp(tp).widen_bound else types.no_type;
             const primitive_constraint = c.isConstTypeParamSym(tp) or
                 try c.constraintIsPrimitive(constraint) or
