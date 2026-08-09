@@ -226,9 +226,67 @@ pub fn finishCondPlan(c: *Checker, plan: CondPlan, chk: TypeId, extends_ty: Type
 /// `infer` variables into it, then drive a recursive alias the branch
 /// handed back (see `driveShrinkingAlias`).
 pub fn condTrueBranch(c: *Checker, b: CondPlan.Bindings, true_ty: TypeId) Error!TypeId {
-    const tb = try c.substInfer(true_ty, b.ids, b.vals);
+    const vals = try inferConstraintFallback(c, b, true_ty);
+    const tb = try c.substInfer(true_ty, b.ids, vals);
     if (try c.driveShrinkingAlias(tb)) |reduced| return reduced;
     return tb;
+}
+
+/// tsc's `getInferredType` constraint fallback. A binder that collected no
+/// candidate infers `unknown`; `getInferredType` then measures that against
+/// the binder's own constraint and, when it does not satisfy it — `unknown`
+/// satisfies nothing but `unknown`/`any` — REPLACES it with the constraint.
+///
+/// The case that needs it is an `infer` inside an OPTIONAL property, where a
+/// check type without that property matches the pattern and leaves the binder
+/// with nothing to infer from. atproto's `$TypedObject` is exactly that:
+///
+///     V extends { $type?: infer T extends $Type<Id, Hash> } ? V & { $type: T } : never
+///
+/// A `PostView["record"]` (`{ [_ in string]: unknown }`) declares no `$type`,
+/// so `T` inferred `unknown`, the constrained-binder rewrite read `unknown
+/// extends "app.bsky.feed.post"` as false, and every `isRecord(post.record)`
+/// in the atproto SDK narrowed its argument to `never` — a false TS2339 on
+/// every property read that followed.
+///
+/// The constraint is read back off the rewrite `constrainInferBinders` put in
+/// front of the true branch (`T extends C ? True : False`), because that copy
+/// — unlike the one in `Checker.infer_constraints`, which is recorded once at
+/// declaration time — has been instantiated along with the conditional and so
+/// names this use site's `Id`/`Hash`.
+fn inferConstraintFallback(c: *Checker, b: CondPlan.Bindings, true_ty: TypeId) Error![]const TypeId {
+    const s = &c.ts;
+    var any_unmatched = false;
+    for (b.vals) |v| {
+        if (v == types.unknown_type) any_unmatched = true;
+    }
+    if (!any_unmatched) return b.vals;
+    // The rewrite nests exactly one conditional per CONSTRAINED binder, each
+    // one's true branch holding the next — so that many levels off the front
+    // of the branch are wrappers, and anything deeper is the author's own
+    // conditional (which may well test the same binder) and is left alone.
+    var remaining: usize = 0;
+    for (b.ids) |id| {
+        if (c.infer_constraints.contains(id)) remaining += 1;
+    }
+    if (remaining == 0) return b.vals;
+    var t = true_ty;
+    var out: ?[]TypeId = null;
+    while (remaining > 0 and s.kind(t) == .conditional) {
+        const chk = s.condCheck(t);
+        if (s.kind(chk) != .infer_var) break;
+        const id = s.inferVarId(chk);
+        if (!c.infer_constraints.contains(id)) break;
+        if (indexOfId(b.ids, id)) |i| {
+            if (b.vals[i] == types.unknown_type) {
+                if (out == null) out = try c.scratch().dupe(TypeId, b.vals);
+                out.?[i] = s.condExtends(t);
+            }
+        }
+        remaining -= 1;
+        t = s.condTrue(t);
+    }
+    return out orelse b.vals;
 }
 
 /// The union a distributive conditional's check distributes over, or 0 when
