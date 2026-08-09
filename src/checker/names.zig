@@ -55,12 +55,40 @@ pub const Resolved = union(enum) {
 
 /// Resolve in the current file's scope chain; returns GLOBAL ids.
 pub fn resolveSpace(c: *Checker, a: Atom, from: ScopeId, want_value: bool) Resolved {
+    return resolveSpaceInner(c, a, from, want_value, false);
+}
+
+/// `resolveSpace` for the operand of a `typeof` TYPE QUERY, where a
+/// type-only import binding counts as a value.
+///
+/// tsc gives a type-only import alias the target's full meaning and reports
+/// TS1361 as a separate use-site check, so the binding SHADOWS an outer
+/// declaration of the same name whether or not the use is a value position.
+/// ztsc filters it out of value space instead, and the walk then simply kept
+/// going: `import type { File } from 'expo-file-system'` was skipped in the
+/// file scope and `typeof File` bound the DOM's global `File` constructor.
+/// expo's own `class File extends ExpoFileSystem.FileSystemFile` — where
+/// `FileSystemFile: typeof File` names that import — inherited the DOM's
+/// `Blob` instead of the file-system file, so `uri`, `exists`, `open`,
+/// `copy` and `delete` were all missing.
+///
+/// A type query is a TYPE position, so accepting the binding here reports no
+/// TS1361 that tsc does not: every value position still goes through
+/// `resolveSpace`.
+pub fn resolveTypeQuerySpace(c: *Checker, a: Atom, from: ScopeId) Resolved {
+    return resolveSpaceInner(c, a, from, true, true);
+}
+
+fn resolveSpaceInner(c: *Checker, a: Atom, from: ScopeId, want_value: bool, type_only_ok: bool) Resolved {
     var s = from;
     var wrong: SymbolId = binder.no_symbol;
     while (true) {
         if (c.bind.lookupInScope(s, a)) |sym| {
             const f = c.bind.symbol_flags[sym];
-            const ok = if (want_value) hasValueMeaning(f) else hasTypeMeaning(f);
+            const ok = if (want_value)
+                (hasValueMeaning(f) or (type_only_ok and f.import_binding and f.type_only))
+            else
+                hasTypeMeaning(f);
             if (ok) {
                 // A reference from inside a contributing file binds to the
                 // file-local declaration; if that declaration is a
@@ -71,6 +99,15 @@ pub fn resolveSpace(c: *Checker, a: Atom, from: ScopeId, want_value: bool) Resol
                 return .{ .sym = c.prog.mergedOf(g) orelse g };
             }
             if (wrong == binder.no_symbol) wrong = sym;
+            // A TYPE-ONLY import binding SHADOWS whatever an outer scope (or
+            // the lib) declares under the same name: tsc gives the alias the
+            // target's full meaning and reports TS1361 as a separate use-site
+            // check, so the walk must stop here rather than fall through to a
+            // global. `import type { File } from "expo-file-system"` followed
+            // by a value use of `File` is TS1361, not the DOM's constructor.
+            if (want_value and f.import_binding and f.type_only) {
+                return .{ .wrong_space = c.toGlobal(sym) };
+            }
         }
         // A bare name unresolved in *this* file's copy of a namespace body
         // may be declared in another file's contribution to the same
@@ -82,7 +119,10 @@ pub fn resolveSpace(c: *Checker, a: Atom, from: ScopeId, want_value: bool) Resol
         if (c.bind.scope_kinds[s] == .namespace) {
             if (c.mergedNsMemberOfScope(s, a)) |gsym| {
                 const gf = c.symFlags(gsym);
-                const ok = if (want_value) hasValueMeaning(gf) else hasTypeMeaning(gf);
+                const ok = if (want_value)
+                    (hasValueMeaning(gf) or (type_only_ok and gf.import_binding and gf.type_only))
+                else
+                    hasTypeMeaning(gf);
                 if (ok) return .{ .sym = gsym };
             }
         }

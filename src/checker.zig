@@ -3210,6 +3210,7 @@ pub const Checker = struct {
     pub const hasValueMeaning = names_zig.hasValueMeaning;
     pub const hasTypeMeaning = names_zig.hasTypeMeaning;
     pub const resolveSpace = names_zig.resolveSpace;
+    pub const resolveTypeQuerySpace = names_zig.resolveTypeQuerySpace;
     pub const suggestName = names_zig.suggestName;
     pub const reportNameNotFound = names_zig.reportNameNotFound;
     pub const reportModuleNotFound = names_zig.reportModuleNotFound;
