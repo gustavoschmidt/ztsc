@@ -114,6 +114,10 @@ const usage =
     \\  --decl-profile         dump the declaration-window TIME profile (what
     \\                         share of the check phase materializes
     \\                         declarations) to stderr; pair with --checkers=1
+    \\  --mem-profile          dump each checker's per-container byte
+    \\                         breakdown and footprint timeline to stderr
+    \\  --inst-memo-bits=N     log2 of the per-checker instantiation memo's
+    \\                         slot count (12 bytes a slot; measurement aid)
     \\  --eager-members        materialize every interface/class member table
     \\                         whole, instead of member-by-member on demand
     \\                         (bisect leg / oracle)
@@ -203,6 +207,15 @@ const Cli = struct {
     /// seal (see the second half of `checker/prof.zig`). A diagnostic
     /// instrument; pair with `--checkers=1`.
     decl_profile: bool = false,
+    /// `--mem-profile`: dump each checker instance's per-container capacity
+    /// breakdown, its demand-zeroed arrays' resident share, and its footprint
+    /// timeline to stderr at seal (see `checker/memprof.zig`).
+    mem_profile: bool = false,
+    /// `--inst-memo-bits=N`: override the instantiation memo's slot count
+    /// (`checker/memo.zig`'s `default_bits`). 0 = leave the default alone. A
+    /// measurement aid — the memo's size is the per-checker footprint's single
+    /// largest tunable.
+    inst_memo_bits: u6 = 0,
     /// null = auto (pretty iff stderr is a TTY).
     pretty: ?bool = null,
     project: ?[]const u8 = null,
@@ -560,6 +573,8 @@ pub fn main(init: std.process.Init) !void {
     checker.lazy_zig.lazy_members_on = !cli.eager_members;
     checker.lazy_zig.stats_on = cli.lazy_stats;
     checker.prof_zig.decl_prof_on = cli.decl_profile;
+    checker.memprof_zig.mem_prof_on = cli.mem_profile;
+    checker.memo_zig.bits_override = cli.inst_memo_bits;
 
     if (cli.help) {
         try out.print("{s}", .{usage});
@@ -1897,6 +1912,11 @@ fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8, bad_arg: *[]c
             cli.eager_members = true;
         } else if (std.mem.eql(u8, arg, "--decl-profile")) {
             cli.decl_profile = true;
+        } else if (std.mem.eql(u8, arg, "--mem-profile")) {
+            cli.mem_profile = true;
+        } else if (std.mem.startsWith(u8, arg, "--inst-memo-bits=")) {
+            cli.inst_memo_bits = std.fmt.parseInt(u6, arg["--inst-memo-bits=".len..], 10) catch
+                return error.BadFlagValue;
         } else if (std.mem.eql(u8, arg, "--lazy-stats")) {
             cli.lazy_stats = true;
         } else if (std.mem.startsWith(u8, arg, "--inst-focus=")) {

@@ -72,6 +72,8 @@ const parser = @import("frontend/parser.zig");
 const ZeroPagedArray = @import("zeropage.zig").ZeroPagedArray;
 pub const BumpArena = @import("checker/bump.zig").BumpArena;
 pub const prof_zig = @import("checker/prof.zig");
+pub const memprof_zig = @import("checker/memprof.zig");
+pub const memo_zig = @import("checker/memo.zig");
 pub const lazy_zig = @import("checker/instantiate.zig");
 
 const Ast = ast.Ast;
@@ -669,34 +671,34 @@ pub const LazyStat = enum(u8) {
 };
 
 pub const map_containers = [_][]const u8{
-    "node_types",               "sig_cache",              "node_scopes",
-    "reassigned_syms",          "reassigned_in_loop",     "member_written_syms",
-    "member_written_in_loop",   "ns_types",               "ambient_ns_types",
-    "relation",                 "expansions",             "overload_rotate",
-    "origin",                   "iface_generic",          "iface_stack",
-    "pending_class_decos",      "class_inst_generic",     "class_static_cache",
-    "class_static_base_active", "class_ctor_cache",       "enum_value_cache",
-    "enum_info_cache",          "enum_relation_cache",    "alias_generic",
-    "alias_state",              "alias_recursive",        "flow_same",
-    "flow_narrow",              "ref_keys",               "flow_loop_stack",
-    "flow_stack",               "flow_tmp",               "da_cache",
-    "ctp_cache",                "cmp_cache",              "ctt_cache",
-    "ci_cache",                 "infer_visited",          "subst_this_cache",
-    "mmp_cache",                "inst_cache",             "arrayish_elem_cache",
-    "tp_constraint_cache",      "erase_cache",            "erase_any_cache",
-    "inst_map_ids",             "fresh_tp_ids",           "this_tp_ids",
-    "fresh_tp_info",            "type_node_cache",        "atom_cache",
-    "infer_ids",                "infer_scopes",           "mapped_key_ids",
-    "mapped_key_scopes",        "inst_diag_at",           "infer_active",
-    "lazy_member_active",       "chain_guards",           "never_isect",
-    "deep_path_list",           "deep_path_ids",          "flow_reach",
-    "member_type_stack",        "lazy_index_objs",        "pending_type_args",
-    "pending_type_args_pool",   "pending_type_args_seen", "tp_constrained_cache",
-    "nominal_bases",            "nominal_base_pool",      "keyof_mapped_active",
-    "ctp_syms_seen",            "weak_types",             "lazy_member",
-    "lazy_map",                 "pattern_root_decls",     "pattern_root_ids",
-    "pattern_narrow_busy",      "key_name_types",         "enum_members",
-    "keyof_obj_cache",          "trunc_expansions",
+    "node_types",               "sig_cache",            "node_scopes",
+    "reassigned_syms",          "reassigned_in_loop",   "member_written_syms",
+    "member_written_in_loop",   "ns_types",             "ambient_ns_types",
+    "relation",                 "expansions",           "overload_rotate",
+    "origin",                   "iface_generic",        "iface_stack",
+    "pending_class_decos",      "class_inst_generic",   "class_static_cache",
+    "class_static_base_active", "class_ctor_cache",     "enum_value_cache",
+    "enum_info_cache",          "enum_relation_cache",  "alias_generic",
+    "alias_state",              "alias_recursive",      "flow_same",
+    "flow_narrow",              "ref_keys",             "flow_loop_stack",
+    "flow_stack",               "flow_tmp",             "da_cache",
+    "ctp_cache",                "cmp_cache",            "ctt_cache",
+    "ci_cache",                 "infer_visited",        "subst_this_cache",
+    "mmp_cache",                "arrayish_elem_cache",  "tp_constraint_cache",
+    "erase_cache",              "erase_any_cache",      "inst_map_ids",
+    "fresh_tp_ids",             "this_tp_ids",          "fresh_tp_info",
+    "type_node_cache",          "atom_cache",           "infer_ids",
+    "infer_scopes",             "mapped_key_ids",       "mapped_key_scopes",
+    "inst_diag_at",             "infer_active",         "lazy_member_active",
+    "chain_guards",             "never_isect",          "deep_path_list",
+    "deep_path_ids",            "flow_reach",           "member_type_stack",
+    "lazy_index_objs",          "pending_type_args",    "pending_type_args_pool",
+    "pending_type_args_seen",   "tp_constrained_cache", "nominal_bases",
+    "nominal_base_pool",        "keyof_mapped_active",  "ctp_syms_seen",
+    "weak_types",               "lazy_member",          "lazy_map",
+    "pattern_root_decls",       "pattern_root_ids",     "pattern_narrow_busy",
+    "key_name_types",           "enum_members",         "keyof_obj_cache",
+    "trunc_expansions",
 };
 
 /// One enum member as `eachEnumMember` yields it: the name atom and the
@@ -1205,7 +1207,13 @@ pub const Checker = struct {
     /// (`--no-inst-cache` disables it — the correctness oracle / benchmark
     /// "before" leg). Never populated for a subtree whose computation tripped
     /// the depth/count limit (`inst_limit_tripped`).
-    inst_cache: IntMap(u64, TypeId) = .empty,
+    ///
+    /// A BOUNDED direct-mapped cache, not an unbounded map: see
+    /// `checker/memo.zig` for why (as a growable map it reached 104 MiB per
+    /// instance at EVERY checker count — the largest single item in a
+    /// checker's footprint, and 416 MB of immich's 1027 MiB peak at
+    /// `--checkers=4`) and for why evicting an entry is sound.
+    inst_cache: memo_zig.InstMemo = .{},
     /// Canonical substitution-map interning: packed sorted `(sym,arg)` pair
     /// bytes -> a small stable id. The byte keys are duped into the checker
     /// arena (scratch is reset per statement).
@@ -1654,6 +1662,9 @@ pub const Checker = struct {
     /// Declaration-window TIME profiler (`--decl-profile`; see the second
     /// half of `checker/prof.zig`). Off in every normal run.
     dprof: prof_zig.DeclProf = .{},
+    /// Per-checker memory profiler (`--mem-profile`; see
+    /// `checker/memprof.zig`). Off in every normal run.
+    mprof: memprof_zig.MemProf = .{},
     /// Depth of an in-flight *side query*: a type looked up from inside the
     /// flow-narrowing walk, out of the checker's top-down order (see
     /// `declaredPathType`). While non-zero `diagFmt` drops diagnostics — the
@@ -1840,6 +1851,7 @@ pub const Checker = struct {
             .inst_cache_on = inst_cache_on,
             .prof = .{ .on = prof_zig.enabled() },
             .dprof = .{ .on = prof_zig.declEnabled() },
+            .mprof = .{ .on = memprof_zig.enabled() },
         };
         c.carena = try gpa.create(std.heap.ArenaAllocator);
         errdefer gpa.destroy(c.carena);
@@ -1919,6 +1931,11 @@ pub const Checker = struct {
         errdefer c.sym_types.free();
         c.sym_state = try ZeroPagedArray(SymState).alloc(total_syms);
         errdefer c.sym_state.free();
+        // Bounded instantiation memo (see `checker/memo.zig`): starts at
+        // 12 KiB, doubles as it fills, and stops at 3 MiB however much the
+        // program asks for.
+        if (inst_cache_on) c.inst_cache = try memo_zig.InstMemo.alloc();
+        errdefer c.inst_cache.free();
         c.owned_mask = try arena_alloc.alloc(bool, prog.files.len);
         @memset(c.owned_mask, false);
         for (owned) |f| c.owned_mask[f] = true;
@@ -1989,10 +2006,12 @@ pub const Checker = struct {
     pub fn deinit(c: *Checker) void {
         c.sym_types.free();
         c.sym_state.free();
+        c.inst_cache.free();
         c.diag_seen.deinit(c.gpa);
         c.diags.deinit(c.gpa);
         c.prof.deinit(c.gpa);
         c.dprof.deinit(c.gpa);
+        c.mprof.deinit(c.gpa);
         inline for (map_containers) |n| @field(c, n).deinit(c.cm());
         if (c.ts.base != null) c.ts.deinit(); // overlay only; a base store is arena-owned
         c.carena.deinit();
@@ -2006,6 +2025,7 @@ pub const Checker = struct {
     pub fn run(c: *Checker) Error!void {
         prof_zig.declRunStart(c);
         defer prof_zig.declRunEnd(c);
+        memprof_zig.runStart(c);
         for (c.owned) |f| {
             c.setFile(f);
             c.cur_scope = binder.file_scope;
@@ -2023,6 +2043,7 @@ pub const Checker = struct {
                 try c.drainDeferredBodies();
                 c.noteScratch();
                 _ = c.scratch_arena.reset(.{ .retain_with_limit = scratch_retain_limit });
+                if (c.mprof.on) memprof_zig.sample(c);
             }
         }
         // Every class instance type is now complete, so the written type
@@ -2062,6 +2083,7 @@ pub const Checker = struct {
         c.stats.instantiations = c.inst_total;
         if (c.prof.on) prof_zig.report(c);
         if (c.dprof.on) prof_zig.declReport(c);
+        if (c.mprof.on) memprof_zig.report(c);
         if (lazy_zig.stats_on) {
             var buf: [512]u8 = undefined;
             var used: usize = 0;
