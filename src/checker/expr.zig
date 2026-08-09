@@ -1679,6 +1679,29 @@ pub fn contextualArrayElemType(c: *Checker, rctx: TypeId) Error!TypeId {
             if (c.ts.kind(rcon) == .type_param) return types.no_type;
             return c.contextualArrayElemType(rcon);
         },
+        // An INTERFACE that extends `Array<T>` is array-like without being an
+        // `.array`: it resolves to an object carrying Array's numeric index
+        // signature. tsc reaches it through
+        // `getIndexTypeOfContextualType(t, numberType)` (and, failing that,
+        // `getIteratedTypeOrElementType`), so the elements of a literal in
+        // that position ARE contextually typed; ztsc's kind-keyed arms fell
+        // through to `no_type` and every element widened.
+        //
+        // React Native's `StyleProp<T>` is the shape that found it —
+        // `interface RecursiveArray<T> extends Array<T | ReadonlyArray<T> |
+        // RecursiveArray<T>> {}` — so `<Text style={[a.mt_sm, {fontWeight:
+        // '600'}]}>` widened `'600'` to `string` and the whole style array
+        // stopped being a `TextStyle`. The plain `Array<TextStyle>` spelling
+        // of the same target was always fine, which is the tell.
+        //
+        // Only a NUMBER index signature counts. A string-index-only object
+        // (`Record<string, X>`) is not an array-like position, and reading its
+        // index here would contextually type array elements against a type
+        // tsc never offers.
+        .object => {
+            const idx = c.ts.objectNumberIndex(rctx);
+            return if (idx != 0) idx else types.no_type;
+        },
         else => return types.no_type,
     }
 }
@@ -1703,6 +1726,13 @@ pub fn contextualElemTypeAt(c: *Checker, rctx: TypeId, i: u32) Error!TypeId {
             }
             if (elems.items.len == 0) return types.no_type;
             return c.ts.makeUnion(c.scratch(), elems.items);
+        },
+        // An `extends Array<T>` interface has no per-POSITION type, but its
+        // numeric index signature types every position — the same arm
+        // `contextualArrayElemType` grows above, for the tuple-context route.
+        .object => {
+            const idx = c.ts.objectNumberIndex(rctx);
+            return if (idx != 0) idx else types.no_type;
         },
         else => return types.no_type,
     }

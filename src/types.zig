@@ -1186,6 +1186,45 @@ pub const Store = struct {
     }
 
     pub fn makeTuple(s: *Store, elems: []const TupleElem) Error!TypeId {
+        // tsc's `createNormalizedTupleType`: a REST element whose type is
+        // itself a TUPLE contributes that tuple's elements positionally, so
+        // `[...[A, B], C]` IS `[A, B, C]` — and, the case that reaches this
+        // constantly, `[...[], K]` IS `[K]`.
+        //
+        // Instantiation is where it bites. bluesky's storage API declares
+        // `set<Key extends keyof Schema>(scopes: [...Scopes, Key], …)` on a
+        // `Storage<Scopes extends unknown[], Schema>`, and the device store is
+        // a `Storage<[], Device>`: substituting `Scopes := []` left a
+        // TWO-element tuple whose first element was an empty tuple spread.
+        // Position 0 then reads as `never` (an empty tuple has no element
+        // type), so every `device.get(['fontScale'])` in the app was
+        // "Type '"fontScale"' is not assignable to type 'never'".
+        //
+        // Splicing here rather than in the instantiation arm covers every
+        // construction site at once, and it terminates: an inner tuple was
+        // itself built through this function, so its own rest elements are
+        // already arrays or unresolved type params, never tuples.
+        for (elems) |e| {
+            if ((e.flags & elem_flag_rest) == 0 or s.kind(e.ty) != .tuple) continue;
+            var out: std.ArrayList(TupleElem) = .empty;
+            defer out.deinit(s.alloc);
+            for (elems) |el| {
+                if ((el.flags & elem_flag_rest) != 0 and s.kind(el.ty) == .tuple) {
+                    for (0..s.tupleLen(el.ty)) |i| {
+                        const inner = s.tupleElem(el.ty, @intCast(i));
+                        // A `readonly` spread makes what it splices in
+                        // readonly (tsc carries the modifier onto each
+                        // spliced element); the inner element keeps its own
+                        // optional/rest position.
+                        try out.append(s.alloc, .{
+                            .ty = inner.ty,
+                            .flags = inner.flags | (el.flags & elem_flag_readonly),
+                        });
+                    }
+                } else try out.append(s.alloc, el);
+            }
+            return s.makeTuple(out.items);
+        }
         // tsc's `getTupleTargetType`: "[...X[]] is equivalent to just X[]".
         // A tuple whose ONLY element is a rest element already spelled as an
         // array (or a readonly array) is that array — there is no positional
