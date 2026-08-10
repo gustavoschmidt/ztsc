@@ -1773,6 +1773,17 @@ pub const Checker = struct {
     /// count limit; suppresses memoization of the (truncated) results for that
     /// call. Reset at each top-level entry (`inst_depth == 0`).
     inst_limit_tripped: bool = false,
+    /// How many times the depth/count CEILING itself has fired in this checker,
+    /// run to date. Distinct from `inst_limit_tripped`, which that ceiling sets
+    /// but so do three ordinary recursion cuts that must also suppress
+    /// memoization (`chainRepeats`, `max_alias_depth`, the `substThis` guard).
+    ///
+    /// Read by `indexedAccessType` as "has this checker ever run out of room?",
+    /// which is what opens the lazy single-member route (`lazyIndexedProp`).
+    /// Zero for every package in `bench/corpus/real`, which is why that route
+    /// costs them literally nothing — see `lazyIndexedProp` for the measured
+    /// alternative.
+    inst_ceiling_trips: u64 = 0,
     /// Diagnostic anchor used when the instantiation limit is hit (TS2589 /
     /// TS2590), tracked at expression / statement / assignability boundaries
     /// where materialization is triggered. `ast.Ast.span` walks the whole

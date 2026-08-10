@@ -2012,6 +2012,7 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
     }
     if (c.inst_depth > max_instantiation_depth or c.inst_count > c.inst_budget) {
         c.inst_limit_tripped = true;
+        c.inst_ceiling_trips += 1;
         if (c.prof.on) {
             c.prof.tripped += 1;
             prof_zig.noteTrip(c);
