@@ -3570,7 +3570,23 @@ pub fn discriminatedUnionAssignable(c: *Checker, s: TypeId, t: TypeId) Error!boo
         .object, .intersection => {},
         else => return false,
     }
-    const members = try c.memberList(t);
+    // tsc runs this on `extractTypesOfKind(target, Object | Intersection |
+    // Substitution)`, not on the whole union: a PRIMITIVE constituent has no
+    // properties, so leaving it in makes every candidate discriminant fail the
+    // "present on every member" test and the split never runs at all.
+    // react-navigation's `to` prop is `LinkProps<ParamList> | string`, and
+    // that lone `string` is what stopped
+    // `to={{screen: cond ? 'CustomFeed' : 'ProfileList', params}}` — a source
+    // whose `screen` is a two-literal union — from ever being split.
+    var obj_members: std.ArrayList(TypeId) = .empty;
+    defer obj_members.deinit(c.scratch());
+    for (try c.memberList(t)) |m| {
+        switch (c.ts.kind(try c.resolveStructural(m))) {
+            .object, .intersection => try obj_members.append(c.scratch(), m),
+            else => {},
+        }
+    }
+    const members = obj_members.items;
     if (members.len < 2) return false;
     var dnames: std.ArrayList(Atom) = .empty;
     defer dnames.deinit(c.scratch());
