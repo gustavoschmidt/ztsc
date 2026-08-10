@@ -1848,7 +1848,22 @@ pub fn classBaseEntitySym(c: *Checker, node: Node) Error!?SymbolId {
     switch (c.nodeTag(node)) {
         .identifier => {
             const a = try c.atomOfToken(c.tree.nodeMainToken(node));
-            switch (c.resolveSpace(a, c.cur_scope, true)) {
+            var resolved = c.resolveSpace(a, c.cur_scope, true);
+            // A TYPE-ONLY import binding is excluded from value space by
+            // `hasValueMeaning`, so the value-space resolution above answers
+            // `.wrong_space` — but the binding still DENOTES the imported
+            // class, and an ambient class may legally extend it (see
+            // `checkClass`, which is where the emitted-position TS1361 lives).
+            // Dropping the base here cost the derived class every inherited
+            // member and every base type argument, so `expo-video`'s
+            // `VideoPlayer` was structurally unrelated to the `EventEmitter`
+            // its own hierarchy declares.
+            if (resolved == .wrong_space) {
+                const ws = resolved.wrong_space;
+                const wf = c.symFlags(ws);
+                if (wf.import_binding and wf.type_only) resolved = .{ .sym = ws };
+            }
+            switch (resolved) {
                 .sym => |sym| {
                     if (!c.symFlags(sym).import_binding) return sym;
                     const tgt = c.importTarget(sym) orelse return null;

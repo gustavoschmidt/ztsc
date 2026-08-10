@@ -785,8 +785,88 @@ pub fn collectInferVars(c: *Checker, t: TypeId, out: *std.ArrayList(u32), refs: 
         },
         .string_mapping => try c.collectInferVars(s.stringMappingArg(t), out, refs),
         .keyof_op => try c.collectInferVars(s.keyofOperand(t), out, refs),
+        // A mapped type parked by `reduceMapped` because its key set is still
+        // an `infer` var: `Record<infer K, V>` is `{ [P in K]: V }`, so the
+        // binder `K` lives in the mapped node, not in any arm above. Missing it
+        // meant the conditional collected NO binders, never ran the match, and
+        // then related its check type against an extends clause that still
+        // held a raw `infer` var — which relates to nothing, so every such
+        // conditional took its FALSE branch.
+        //
+        // Only the shapes the MATCHER can bind are claimed here. Ownership is
+        // not free: an owned binder that nothing matches resolves to `unknown`
+        // (see `planConcreteConditional`'s "unmatched → unknown"), and an
+        // extends clause full of `unknown` relates to almost anything, so the
+        // conditional flips to its TRUE branch with a meaningless value. That
+        // is strictly worse than not owning it. `mappedInferShape` is the one
+        // place that decides, and `inferFromExtendsInner`'s `.mapped` arm
+        // consumes the same answer.
+        .mapped => switch (try c.mappedInferShape(t)) {
+            .key_set => |con| {
+                try c.collectInferVars(con, out, refs);
+                if (s.mappedValue(t) != 0) try c.collectInferVars(s.mappedValue(t), out, refs);
+            },
+            .none => {},
+        },
         else => {},
     }
+}
+
+/// How a mapped-type PATTERN can bind `infer` binders. tsc's
+/// `inferToMappedType` has two branches, keyed on the mapped type's key set;
+/// this models exactly ONE of them, and deliberately declines the other.
+///
+/// The single source of truth for both `collectInferVars` (which binders the
+/// enclosing conditional OWNS) and `inferFromExtendsInner` (what they bind to).
+/// The two must never disagree: a binder that is owned but never matched
+/// resolves to `unknown`, and an extends clause full of `unknown` relates to
+/// almost anything, so the conditional flips to its TRUE branch carrying a
+/// meaningless value.
+pub const MappedInferShape = union(enum) {
+    /// tsc's `constraintType.flags & TypeFlags.TypeParameter` branch:
+    /// `{ [P in K]: V }` with an inference target in the key set K
+    /// (`Record<infer N, V>`). K binds `keyof source`, and V — if it holds a
+    /// binder of its own — the union of the source's property types.
+    key_set: TypeId,
+    none,
+};
+
+pub fn mappedInferShape(c: *Checker, pattern: TypeId) Error!MappedInferShape {
+    const s = &c.ts;
+    // A key REMAPPING (`as`) rewrites the key set, so the rule does not
+    // describe it.
+    if (s.mappedAs(pattern) != 0) return .none;
+
+    // tsc's OTHER branch — `constraintType.flags & TypeFlags.Index`, the
+    // HOMOMORPHIC key set `{ [P in keyof U]: X }` (written that way, which
+    // parks `U` in the mapped source, or left as a real `keyof U` constraint by
+    // instantiating `Pick<U, keyof U>`) — is NOT claimed here. tsc answers it
+    // with `inferTypeForHomomorphicMappedType`, which synthesizes a REVERSE
+    // MAPPED TYPE; ztsc has no such type, and the honest approximations are
+    // both wrong:
+    //
+    //   * bind `U` to the source anyway. Exact only when the template is the
+    //     identity `U[P]`; for a modifier (`Partial<infer U>`) or a wrapped
+    //     value it silently mis-binds. Worse, it is not free even when exact —
+    //     on immich it turned `As<T>` from `never` into the real repository
+    //     type, which made 47 casts that had been comparing against `never`
+    //     start comparing for real, and ztsc's COMPARABLE relation then
+    //     rejected all 47 (`Mocked<RepositoryInterface<X>> as X`) where tsc
+    //     accepts them. Measured 2026-08-10: 0 -> 47 false TS2352.
+    //   * own the binder without matching it, which is the `unknown` trap
+    //     above — measured as 1 false TS2345 on the same app.
+    //
+    // So the homomorphic branch stays UNOWNED, exactly as it was before this
+    // rule existed: the conditional keeps its false branch (`never`), a
+    // deterministic under-report registered in DEFERRED against
+    // `conditional/048`. Implementing it needs reverse mapped types AND the
+    // comparable-relation gap those 47 casts expose — neither is this rule's
+    // job, and guessing here manufactures false positives on correct code.
+    const con = s.mappedConstraint(pattern);
+    if (con == 0) return .none; // homomorphic: `U` lives in the mapped source
+    if (s.kind(con) == .keyof_op) return .none; // `Pick<U, keyof U>` after instantiation
+    if (!try c.containsInfer(con)) return .none;
+    return .{ .key_set = con };
 }
 
 /// Infer `infer` binders by structurally matching a concrete `source`
@@ -994,6 +1074,43 @@ fn inferFromExtendsInner(c: *Checker, source0: TypeId, pattern: TypeId, ids: []c
             }
             const rp = try c.resolveStructural(pattern);
             if (rp != pattern) try c.inferFromExtends(src, rp, ids, vals, contra, depth + 1);
+        },
+        // `{ [P in K]: X }` with an `infer` var in its KEY SET — tsc's
+        // `inferToMappedType`. `keyof source` is inferred for the key set and
+        // the union of the source's property types for the template `X`, which
+        // is what lets `T extends Record<infer K, V> ? K : never` name T's own
+        // keys. Without an arm here the pattern matched nothing, the var stayed
+        // unbound, and the whole conditional fell to its FALSE branch — expo's
+        // `InferEventName<TEventsMap> = TEventsMap extends Record<infer N
+        // extends keyof TEventsMap, AnyEventListener> ? N : never` resolved to
+        // `never`, so every `useEvent(player, 'statusChange', …)` rejected its
+        // own event name and the listener lost its contextual signature.
+        //
+        // `mappedInferShape` decides which binders this pattern owns, and
+        // `collectInferVars` claims exactly those — the two must stay in step.
+        .mapped => {
+            const con = switch (try c.mappedInferShape(pattern)) {
+                .key_set => |con| con,
+                .none => return,
+            };
+            const src = try c.resolveStructural(source0);
+            if (s.kind(src) != .object) return;
+            try c.inferFromExtends(try c.keyofType(src), con, ids, vals, contra, depth + 1);
+            const val = s.mappedValue(pattern);
+            if (val != 0 and try c.containsInfer(val)) {
+                var parts: std.ArrayList(TypeId) = .empty;
+                defer parts.deinit(c.scratch());
+                for (0..s.objectPropCount(src)) |i| {
+                    try parts.append(c.scratch(), s.objectProp(src, @intCast(i)).ty);
+                }
+                if (s.objectStringIndex(src) != 0) {
+                    try parts.append(c.scratch(), s.objectStringIndex(src));
+                }
+                if (parts.items.len != 0) {
+                    const u = try c.ts.makeUnion(c.scratch(), parts.items);
+                    try c.inferFromExtends(u, val, ids, vals, contra, depth + 1);
+                }
+            }
         },
         .object => {
             var src = try c.resolveStructural(source0);

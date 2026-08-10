@@ -183,3 +183,33 @@ instantiation/052_type_arg_constraint_structural.ts  -TS2344 26
 # `{ [s: string]: unknown }`, which exists only once some earlier file in the
 # partition has expanded `Rec<string, unknown>` (`seed.ts` here).
 assignability/mapped_index_origin  -TS2322 use.ts 15
+
+# A REVERSE MAPPED TYPE. tsc's `inferToMappedType` has two branches. ztsc
+# models the one keyed on a type-parameter key set (`Record<infer N, V>`; see
+# `mappedInferShape` and case 047) and declines the HOMOMORPHIC one,
+# `{ [P in keyof U]: X }` — reached both by writing it that way and by
+# instantiating `Pick<U, keyof U>`, which is immich's
+# `RepositoryInterface<T>`. tsc answers it with
+# `inferTypeForHomomorphicMappedType`, synthesizing a reverse mapped type;
+# ztsc has no such type, so the binder is left unowned and the conditional
+# keeps its false branch (`never`) — all four lines are missed errors.
+#
+# Both approximations were measured on immich (gated at 0) and both are false
+# positives, the direction the policy above refuses:
+#
+#   * OWN the binder without matching it -> it resolves to `unknown`, which
+#     relates to almost anything, so the conditional takes its TRUE branch with
+#     a meaningless value: 1 false TS2345 (`Argument of type 'unknown'`).
+#   * BIND it to the source -> exact only for the identity template `U[P]`, and
+#     even then not free: `As<T>` became the real repository type, so 47 casts
+#     that had been comparing against `never` started comparing for real and
+#     ztsc's COMPARABLE relation rejected every one
+#     (`Mocked<RepositoryInterface<X>> as X`, which tsc accepts): 0 -> 47 false
+#     TS2352.
+#
+# Closing this needs reverse mapped types AND that comparable-relation gap.
+# Measured 2026-08-10.
+conditional/048_infer_through_homomorphic_key_set_deferred.ts  -TS2322 31
+conditional/048_infer_through_homomorphic_key_set_deferred.ts  -TS2322 37
+conditional/048_infer_through_homomorphic_key_set_deferred.ts  -TS2322 41
+conditional/048_infer_through_homomorphic_key_set_deferred.ts  -TS2322 46

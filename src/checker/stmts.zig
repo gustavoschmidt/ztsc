@@ -1212,7 +1212,19 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
     if (class_sym != binder.no_symbol and data.extends != 0) {
         _ = try c.baseClassRef(class_sym);
         const hd = c.tree.nodeData(data.extends);
-        _ = try c.checkExprCached(hd.lhs, types.no_type);
+        // An AMBIENT class's `extends` clause is emitted nowhere, so tsc does
+        // not treat it as a value reference: `import type { Base }` followed by
+        // `declare class D extends Base<T>` is legal, and a `.d.ts` is ambient
+        // throughout. Checking the heritage expression as a value there
+        // reported a TS1361 tsc never issues — expo-modules-core's
+        // `SharedObject.d.ts` (`import type { EventEmitter }` +
+        // `declare class SharedObject … extends EventEmitter<TEventsMap>`) is
+        // exactly that shape. A NON-ambient `class D extends Base` still checks
+        // the expression, and still reports TS1361, because that clause is real
+        // emitted code.
+        if (!(c.ambient_ctx or data.flags & ast.Flags.declare != 0)) {
+            _ = try c.checkExprCached(hd.lhs, types.no_type);
+        }
         try c.checkStaticSideExtends(class_sym, data.name_token);
     }
 
