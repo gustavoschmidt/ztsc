@@ -1929,6 +1929,14 @@ pub const Checker = struct {
     /// copy, a generic argument's own type params) simply do not participate.
     /// Saved and restored around a nested call's inference.
     contra_cands: []TypeId = &.{},
+    /// The UNION of every contravariant candidate recorded for each type
+    /// parameter, alongside `contra_cands`'s common-subtype fold. tsc keeps
+    /// the candidates as a LIST and `getInferredType` asks
+    /// `some(inference.contraCandidates, t => isTypeSubtypeOf(inferredCovariantType, t))`
+    /// — whether ANY ONE of them still accepts the covariant answer — which
+    /// the folded common subtype alone cannot answer. Same ownership rule as
+    /// `contra_cands`.
+    contra_sup: []TypeId = &.{},
     contra_owner: ?[*]TypeId = null,
     /// Parameter-position nesting depth inside `unify`: odd means the current
     /// inference position is contravariant. tsc flips the same bit in
@@ -4098,6 +4106,7 @@ pub const Checker = struct {
     pub const combineCovariant = calls_zig.combineCovariant;
     pub const combineContravariant = calls_zig.combineContravariant;
     pub const contraSlot = calls_zig.contraSlot;
+    pub const noteContraCandidate = calls_zig.noteContraCandidate;
     pub const topSlot = calls_zig.topSlot;
     pub const revSlot = calls_zig.revSlot;
     pub const unify = calls_zig.unify;

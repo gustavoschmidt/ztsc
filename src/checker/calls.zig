@@ -1636,6 +1636,9 @@ pub fn inferTypeArgs(
     // A nested call's inference gets its own, and starts at variance zero.
     const contra = try c.scratch().alloc(TypeId, tp_syms.len);
     for (contra) |*x| x.* = types.no_type;
+    // Its per-candidate half (see `Checker.contra_sup`).
+    const contra_sup = try c.scratch().alloc(TypeId, tp_syms.len);
+    for (contra_sup) |*x| x.* = types.no_type;
     // tsc's `InferenceInfo.topLevel`, registered the same way.
     const top_flags = try c.scratch().alloc(bool, tp_syms.len);
     for (top_flags) |*x| x.* = true;
@@ -1643,6 +1646,7 @@ pub fn inferTypeArgs(
     const rev_flags = try c.scratch().alloc(bool, tp_syms.len);
     for (rev_flags) |*x| x.* = false;
     const saved_contra_cands = c.contra_cands;
+    const saved_contra_sup = c.contra_sup;
     const saved_contra_owner = c.contra_owner;
     const saved_contra_pos = c.contra_pos;
     const saved_top_flags = c.top_flags;
@@ -1651,6 +1655,7 @@ pub fn inferTypeArgs(
     const saved_rev_prio = c.rev_prio;
     const saved_nontop_depth = c.nontop_depth;
     c.contra_cands = contra;
+    c.contra_sup = contra_sup;
     c.contra_owner = candidates.ptr;
     c.contra_pos = 0;
     c.top_flags = top_flags;
@@ -1660,6 +1665,7 @@ pub fn inferTypeArgs(
     c.nontop_depth = 0;
     defer {
         c.contra_cands = saved_contra_cands;
+        c.contra_sup = saved_contra_sup;
         c.contra_owner = saved_contra_owner;
         c.contra_pos = saved_contra_pos;
         c.top_flags = saved_top_flags;
@@ -2280,8 +2286,28 @@ pub fn inferTypeArgs(
             c.fnExprIsContextSensitive(an)) continue;
         const at = try c.checkExprCached(an, pt_partial);
         try c.unify(pt0, at, tp_syms, candidates, 0);
+        // The contravariant echo, widened. A context-sensitive callback's
+        // parameter types ARE the contextual type we just fed it, so anything
+        // a parameter position of it yields for a variable we resolved is our
+        // own guess coming home — not evidence. Identity is too narrow a test
+        // for that: `useAnimatedReaction<P>(prepare: () => P, react: (prepared:
+        // P, previous: P | null) => void)` feeds `previous` the contextual
+        // `string | null`, and `P | null` against it infers `P = string` by
+        // union subtraction — a DIFFERENT type, which then outranked the
+        // covariant `string | null` that `() => hoveredItemSV.get()` supplies
+        // and reported TS2322 on the first argument. tsc never re-decides the
+        // variable here either: reading it for this argument's contextual type
+        // memoizes `inference.inferredType`, and nothing short of FIXING
+        // (`clearCachedInferences`) reopens it. An argument we fed nothing for
+        // (the parameter was still the `any` placeholder) is untouched, and so
+        // is a non-context-sensitive argument — an annotated callback carries
+        // real contravariant evidence, which is why tsc rejects
+        // `f7(() => sv.get(), sink)` for `sink: (p: string | null) => void`.
+        const ctx_sensitive = c.fnExprIsContextSensitive(an);
         for (contra, 0..) |*cc, i| {
-            if (cc.* != before_contra[i] and cc.* == fed[i]) cc.* = before_contra[i];
+            if (cc.* == before_contra[i]) continue;
+            if (cc.* == fed[i] or (ctx_sensitive and fed[i] != types.any_type))
+                cc.* = before_contra[i];
         }
         // Placeholder echo. A parameter with no candidate yet stands in as
         // `any` in this argument's contextual type, so a callback that
@@ -2337,11 +2363,24 @@ pub fn inferTypeArgs(
     // can be fed. Without the split, a callback's parameter type was
     // unioned into the same accumulator as the value the call actually
     // produces, and the union then satisfied neither.
+    //
+    // tsc asks that of the candidate LIST — `some(inference.contraCandidates,
+    // t => isTypeSubtypeOf(inferredCovariantType, t))` — not of the folded
+    // common subtype, so ONE parameter position that still accepts the
+    // covariant answer is enough. `useAnimatedReaction<P>(prepare: () => P,
+    // react: (prepared: P, previous: P | null) => void)` needs the difference:
+    // `prepared: P` contributes the contravariant candidate `string | null`
+    // and `previous: P | null` contributes `string` (union subtraction), whose
+    // common subtype is `string` — so testing the fold alone rejected the
+    // covariant `string | null` that `() => hoveredItemSV.get()` supplies and
+    // reported TS2322 on the FIRST argument. `contra_sup` is the union of the
+    // candidates, standing in for the `some` (see `Checker.contra_sup`).
     for (candidates, 0..) |*cd, i| {
         const ct = contra[i];
         if (ct == types.no_type) continue;
         if (cd.* != types.no_type and c.ts.kind(cd.*) != .never and
-            try c.covSubtypeOf(cd.*, ct)) continue;
+            (try c.covSubtypeOf(cd.*, ct) or
+                (contra_sup[i] != types.no_type and try c.covSubtypeOf(cd.*, contra_sup[i])))) continue;
         cd.* = ct;
     }
     // A provisional map over the raw candidates, so an inter-dependent
@@ -2760,6 +2799,16 @@ pub fn contraSlot(c: *Checker, candidates: []TypeId, i: usize) ?*TypeId {
     return &c.contra_cands[i];
 }
 
+/// Record `cand` in the union half of the contravariant candidate set (see
+/// `Checker.contra_sup`). Called wherever `contraSlot` is written.
+pub fn noteContraCandidate(c: *Checker, candidates: []TypeId, i: usize, cand: TypeId) Error!void {
+    if (c.contra_sup.len != candidates.len) return;
+    c.contra_sup[i] = if (c.contra_sup[i] == types.no_type)
+        cand
+    else
+        try c.ts.makeUnion(c.scratch(), &.{ c.contra_sup[i], cand });
+}
+
 /// The `topLevel` flag for type parameter `i`, when `candidates` is the
 /// accumulator the in-flight call registered (same identity rule as
 /// `contraSlot`).
@@ -2967,6 +3016,7 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                 // covariant set (tsc's `inferFromContravariantTypes`).
                 if (c.contraSlot(candidates, i)) |slot| {
                     slot.* = if (slot.* == types.no_type) cand else try c.combineContravariant(slot.*, cand);
+                    try c.noteContraCandidate(candidates, i, cand);
                     return;
                 }
                 // A DIRECT structural match outranks a reverse-mapped one
@@ -4286,6 +4336,7 @@ pub fn inferReverseMapped(c: *Checker, m: TypeId, arg: TypeId, tp_syms: []const 
     // first two arguments supply.
     if (c.contraSlot(candidates, idx)) |slot| {
         slot.* = if (slot.* == types.no_type) obj else try c.combineContravariant(slot.*, obj);
+        try c.noteContraCandidate(candidates, idx, obj);
         return;
     }
     // The reverse-mapped object is the authoritative inference for a
