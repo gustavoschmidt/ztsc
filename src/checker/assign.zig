@@ -223,11 +223,21 @@ pub fn mappedCastPeer(k: types.Kind) bool {
 
 /// One direction of the lenient comparable relation: does source `s0`
 /// overlap target `t0` when optional source props may satisfy required
-/// target props? Only the object/object and array/array shapes get the
-/// leniency (the shapes where optionality lives); anything else defers to
-/// the ordinary comparable check. Depth-capped at 8 — beyond that it
-/// answers `true` (under-report, per policy: a cast that deep is not worth
-/// a false rejection).
+/// target props? Depth-capped at 8 — beyond that it answers `true`
+/// (under-report, per policy: a cast that deep is not worth a false
+/// rejection).
+///
+/// Every composite shape needs an arm here, not just the ones that carry
+/// optionality. `castComparableRec` peels unions, conditionals and type
+/// parameters off its two operands before it ever calls this function, so it
+/// is tempting to assume they cannot arrive — but the intersection and
+/// object-property arms below RE-ENTER this walk with a constituent or a
+/// member type, which can be any shape at all. A shape with no arm falls off
+/// the end of the function and answers "no overlap", which fails the whole
+/// cast: that is a false positive, the one outcome this file's policy
+/// forbids. react-navigation's `TypedNavigator` alone reached three such
+/// holes — tuple, conditional and mapped — on a single cast, and all three
+/// had to close before that cast stopped reporting.
 pub fn lenientOverlap(c: *Checker, s0: TypeId, t0: TypeId, depth: u32) Error!bool {
     if (depth > 8) return true;
     const s = try c.resolveStructural(s0);
@@ -237,6 +247,67 @@ pub fn lenientOverlap(c: *Checker, s0: TypeId, t0: TypeId, depth: u32) Error!boo
     if (sk == .array and tk == .array) {
         return c.lenientComparable(c.ts.arrayElem(s), c.ts.arrayElem(t), depth + 1);
     }
+    // A tuple overlaps a tuple element by element, exactly as an array does
+    // by its element type. Only the arity guards are borrowed from
+    // `tupleAssignable` — the elements themselves need only OVERLAP, so a
+    // pair that differs in one position the other way round still overlaps.
+    // Both react-navigation shapes reach it: `PrivateValueStore<T>`'s whole
+    // variance brand is one tuple-typed property (`[ParamList,
+    // NavigationList, unknown]`), and `router.matchPath(href) as
+    // [keyof ParamList, Params?]` casts a `[string, …]` to a route-name tuple.
+    if (sk == .tuple and tk == .tuple) {
+        const s_len = c.ts.tupleLen(s);
+        const t_len = c.ts.tupleLen(t);
+        var t_required: u32 = 0;
+        var t_has_rest = false;
+        for (0..t_len) |i| {
+            const e = c.ts.tupleElem(t, @intCast(i));
+            if (e.rest()) t_has_rest = true else if (!e.optional()) t_required += 1;
+        }
+        var s_min: u32 = 0;
+        var s_has_rest = false;
+        for (0..s_len) |i| {
+            const e = c.ts.tupleElem(s, @intCast(i));
+            if (e.rest()) s_has_rest = true else if (!e.optional()) s_min += 1;
+        }
+        if (s_min < t_required) return false;
+        if (!t_has_rest and (s_len > t_len or s_has_rest)) return false;
+        for (0..s_len) |i| {
+            const se = c.ts.tupleElem(s, @intCast(i));
+            const st = if (se.rest()) try c.elemOfArrayish(se.ty) else se.ty;
+            const tt = try c.tupleElemTypeAt(t, @intCast(i)) orelse return false;
+            if (!try c.lenientComparable(st, tt, depth + 1)) return false;
+        }
+        return true;
+    }
+    // `castComparableRec` peels a deferred conditional off both operands
+    // before it ever calls here — but the intersection arm below re-enters
+    // this function with a CONSTITUENT, and react-navigation's
+    // `TypedNavigator` is
+    // `(undefined extends Config ? Internal : Static) & PrivateValueStore<…>`,
+    // so the constituent handed back IS a conditional. With no arm it fell off
+    // the end of the function and answered "no overlap", failing the cast.
+    // It distributes existentially, in this direction, exactly as at the top.
+    //
+    // (A union constituent is the same hole in principle and the same two
+    // lines to close, but no case in the corpus reaches it — measured, not
+    // assumed — so it is left out rather than added on speculation.)
+    if (tk == .conditional) {
+        return (try c.lenientOverlap(s0, c.ts.condTrue(t), depth)) or
+            (try c.lenientOverlap(s0, c.ts.condFalse(t), depth));
+    }
+    if (sk == .conditional) {
+        return (try c.lenientOverlap(c.ts.condTrue(s), t0, depth)) or
+            (try c.lenientOverlap(c.ts.condFalse(s), t0, depth));
+    }
+    // A still-generic mapped type is conceded against an object-shaped
+    // counterpart, the same concession `castComparableRec` already makes and
+    // for the same reason: its member set is unknown, so no member-based
+    // verdict exists. It reaches here only as an intersection constituent —
+    // `Omit<ComponentProps<Nav>, …> & DefaultNavigatorOptions<ParamList, …>`
+    // is every react-navigation navigator's prop type — and answering "no
+    // overlap" there is the false rejection the concession exists to avoid.
+    if ((tk == .mapped and mappedCastPeer(sk)) or (sk == .mapped and mappedCastPeer(tk))) return true;
     // Comparability distributes over a target intersection: the source must
     // overlap EACH constituent (tsc `typeRelatedToEachType`). The dogfood
     // cast `{…} as (A & { id: string })` overlaps in the `comparable(target,
@@ -248,6 +319,25 @@ pub fn lenientOverlap(c: *Checker, s0: TypeId, t0: TypeId, depth: u32) Error!boo
         }
         return true;
     }
+    // tsc's comparable relation is a RELATION: it is threaded through
+    // `signatureRelatedTo` exactly like assignability, so its two laxnesses
+    // (a union source needs only SOME constituent related; an optional source
+    // property satisfies a required target one) apply inside a signature's
+    // parameters and return type as well as at the top. ztsc's walk stopped
+    // at the first signature it met and answered "no overlap", so a union
+    // that a *property* position resolves (`{g: A|B} as {g: C|D}`) was a
+    // spurious TS2352 one step deeper (`{g: () => A|B} as {g: () => C|D}`).
+    // react-navigation's `TypedNavigator` is exactly that shape: the two
+    // navigator types differ only in their ParamList, and the constituent
+    // that overlaps — `FunctionComponent`, contravariant in its props — sits
+    // under `getComponent`'s return type.
+    // A CALLABLE OBJECT reaches a function target through its call
+    // signatures, exactly as `isAssignable`'s own `.function` target arm
+    // does — `memo(forwardRef(ListImpl)) as <ItemT>(props: …) => ReactElement`
+    // casts a `NamedExoticComponent` (a call signature plus `$$typeof`) to a
+    // bare generic function type, and only this direction can succeed: the
+    // reverse fails on the `$$typeof` the function does not have.
+    if (tk == .function) return c.sigListOverlap(s, t, false, depth);
     if (tk == .object) {
         for (0..c.ts.objectPropCount(t)) |i| {
             const tp = c.ts.objectProp(t, @intCast(i));
@@ -263,9 +353,81 @@ pub fn lenientOverlap(c: *Checker, s0: TypeId, t0: TypeId, depth: u32) Error!boo
             };
             if (!try c.lenientComparable(sp.ty, tp.ty, depth + 1)) return false;
         }
+        // A callable/constructable target is decided on its signatures too,
+        // not on its (often empty) property table: `{ new (p: A): X }` and
+        // `{ new (p: B): Y }` have no properties at all, so the property walk
+        // alone answered "overlap" for every pair of construct-signature
+        // types. tsc's `signaturesRelatedTo` requires each target signature
+        // to be met by SOME source signature; a target that asks for a
+        // signature the source cannot supply does not overlap.
+        if (!try c.sigListOverlap(s, t, false, depth)) return false;
+        if (!try c.sigListOverlap(s, t, true, depth)) return false;
         return true;
     }
     return false; // non-object shapes: the isComparable probes already ruled
+}
+
+/// How many call (or construct) signatures a type offers the overlap walk.
+/// A bare `.function` type is its own single call signature.
+fn overlapSigCount(c: *Checker, t: TypeId, is_construct: bool) u32 {
+    return switch (c.ts.kind(t)) {
+        .function => if (is_construct) 0 else 1,
+        .object => if (is_construct) c.ts.objectConstructSigCount(t) else c.ts.objectCallSigCount(t),
+        else => 0,
+    };
+}
+
+fn overlapSigAt(c: *Checker, t: TypeId, is_construct: bool, i: u32) TypeId {
+    if (c.ts.kind(t) == .function) return t;
+    return if (is_construct) c.ts.objectConstructSig(t, i) else c.ts.objectCallSig(t, i);
+}
+
+/// tsc's `signaturesRelatedTo` under the comparable relation: every target
+/// signature must overlap SOME source signature. A target with no signatures
+/// of this kind demands nothing.
+pub fn sigListOverlap(c: *Checker, s: TypeId, t: TypeId, is_construct: bool, depth: u32) Error!bool {
+    const t_count = overlapSigCount(c, t, is_construct);
+    if (t_count == 0) return true;
+    const s_count = overlapSigCount(c, s, is_construct);
+    if (s_count == 0) return false;
+    var ti: u32 = 0;
+    while (ti < t_count) : (ti += 1) {
+        const t_sig = overlapSigAt(c, t, is_construct, ti);
+        var matched = false;
+        var si: u32 = 0;
+        while (si < s_count) : (si += 1) {
+            if (try c.sigOverlap(overlapSigAt(c, s, is_construct, si), t_sig, depth)) {
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) return false;
+    }
+    return true;
+}
+
+/// Two signatures overlap when their arities are compatible and every paired
+/// parameter and the return type overlap. Parameters are compared with the
+/// same symmetric overlap test as everything else, which is tsc's *bivariant*
+/// parameter comparison — the comparable relation never gets to reject a cast
+/// on parameter variance alone. A `void` target return accepts any source
+/// return, exactly as in the assignability path.
+pub fn sigOverlap(c: *Checker, s: TypeId, t: TypeId, depth: u32) Error!bool {
+    if (depth > 8) return true;
+    if (c.ts.kind(s) != .function or c.ts.kind(t) != .function) return false;
+    // tsc's `compareSignaturesRelated` arity guard: a source that demands
+    // more arguments than the target can ever supply is not related.
+    if (try c.requiredParams(s) > try c.paramTotal(t)) return false;
+    const pairs = @min(try c.paramTotal(s), try c.paramTotal(t));
+    var i: u32 = 0;
+    while (i < pairs) : (i += 1) {
+        const sp = try c.paramTypeAt(s, i) orelse break;
+        const tp = try c.paramTypeAt(t, i) orelse break;
+        if (!try c.lenientComparable(sp, tp, depth + 1)) return false;
+    }
+    const t_ret = c.ts.fnReturn(t);
+    if (t_ret == types.void_type) return true;
+    return c.lenientComparable(c.ts.fnReturn(s), t_ret, depth + 1);
 }
 
 pub fn lenientComparable(c: *Checker, a: TypeId, b: TypeId, depth: u32) Error!bool {
