@@ -234,6 +234,33 @@ pub fn checkCallExpr(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Error!T
     return result;
 }
 
+/// tsc's `isUntypedFunctionCall`, minus its two `any` disjuncts:
+///
+///     !numCallSignatures && !numConstructSignatures &&
+///     !(apparentFuncType.flags & TypeFlags.Union) &&
+///     !(getReducedType(apparentFuncType).flags & TypeFlags.Never) &&
+///     isTypeAssignableTo(funcType, globalFunctionType)
+///
+/// A callee that carries no signatures of its own but IS assignable to the
+/// global `Function` is an untyped call: `resolveCallExpression` hands it to
+/// `resolveUntypedCall`, which types it `any` and reports nothing. The named
+/// fast path above catches a callee whose type is literally the `Function`
+/// reference; this catches everything that only *relates* to it — a type
+/// parameter constrained by `Function` (React's `useEvent` idiom) or by an
+/// interface that extends it.
+///
+/// Only reached on the paths that were about to report TS2349, so the
+/// assignability probe costs nothing on a well-typed call. The construct-side
+/// exclusions are tsc's `!numConstructSignatures`: a class value (`typeof C`)
+/// is assignable to `Function` but calling it is TS2348, not an untyped call.
+fn untypedFunctionCall(c: *Checker, callee_t: TypeId, apparent: TypeId, ak: types.Kind) Error!bool {
+    if (ak == .union_type or ak == .never or ak == .class_value) return false;
+    if (ak == .object and c.ts.objectConstructSigCount(apparent) != 0) return false;
+    const sym = c.prog.globals.lookup(c.atom_Function) orelse return false;
+    if (!c.symFlags(sym).interface) return false;
+    return c.isAssignable(callee_t, try c.ts.makeRef(sym, &.{}));
+}
+
 /// Call/new as an optional-chain link (see `memberChainInner`). Returns the
 /// return type WITHOUT the chain's short-circuit `undefined`; sets
 /// `chained.*` when this `?.()` — or an earlier link in the callee spine —
@@ -260,9 +287,15 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, chained: *bool,
     // `<T extends (…) => R>(fn: T) => fn(…)` — the useStableCallback shape
     // — fell to the switch's `else` and reported TS2349. tsc's
     // `resolveCallExpression` calls `getApparentType` on the callee first.
+    // The callee's APPARENT type, before `resolveStructural` expands an
+    // interface reference into its member table — the only form in which the
+    // global `Function` is still recognisable by name (see the untyped-call
+    // special case below).
+    var apparent_t = callee_t;
     if (rk == .type_param) {
         const bc = try c.transitiveBaseConstraint(r);
         if (bc != r) {
+            apparent_t = bc;
             r = try c.resolveStructural(bc);
             rk = c.ts.kind(r);
         }
@@ -337,10 +370,19 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, chained: *bool,
     // Calling a value of the global `Function` type: tsc treats `Function`
     // as callable, accepting any arguments and yielding `any` (the interface
     // body carries no call signature, so a structural resolve would report
-    // TS2349). Mirrors the assignable-to-`Function` special-case in the
-    // relation. Only for calls — `new (x: Function)` stays unmodeled.
-    if (!is_new and c.ts.kind(callee_t) == .ref and
-        c.globalSymNamed(c.ts.refSymbol(callee_t), "Function"))
+    // TS2349). This is tsc's `isUntypedFunctionCall`'s last disjunct —
+    // `!numCallSignatures && !numConstructSignatures && … &&
+    // isTypeAssignableTo(funcType, globalFunctionType)` — which
+    // `resolveCallExpression` answers with `resolveUntypedCall` (type `any`,
+    // no diagnostic). Only for calls — `new (x: Function)` stays unmodeled.
+    //
+    // The APPARENT type carries it too: `<T extends Function>(fn?: T)` then
+    // `fn(...args)` is a call on a type parameter whose base constraint is
+    // `Function`, and `T` is assignable to `Function`, so tsc takes the same
+    // untyped-call route. Testing only `callee_t` left every such body
+    // (React's `useNonReactiveCallback`/`useEvent` idiom) at TS2349.
+    if (!is_new and c.ts.kind(apparent_t) == .ref and
+        c.globalSymNamed(c.ts.refSymbol(apparent_t), "Function"))
     {
         for (shape.arg_nodes) |an| {
             if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
@@ -464,6 +506,12 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, chained: *bool,
             // Callable object with call signatures.
             .object => {
                 if (c.ts.objectCallSigCount(r) == 0) {
+                    if (try untypedFunctionCall(c, callee_t, r, rk)) {
+                        for (shape.arg_nodes) |an| {
+                            if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
+                        }
+                        return types.any_type;
+                    }
                     try c.diagFmt(2349, c.nodeSpan(shape.callee), "This expression is not callable.", .{});
                     for (shape.arg_nodes) |an| {
                         if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
@@ -569,6 +617,12 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, chained: *bool,
                 }
             },
             else => {
+                if (try untypedFunctionCall(c, callee_t, r, rk)) {
+                    for (shape.arg_nodes) |an| {
+                        if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
+                    }
+                    return types.any_type;
+                }
                 try c.diagFmt(2349, c.nodeSpan(shape.callee), "This expression is not callable.", .{});
                 for (shape.arg_nodes) |an| {
                     if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
