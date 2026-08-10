@@ -980,16 +980,22 @@ pub const Checker = struct {
     /// every time. An entry from an EARLIER window is stale and ignored, so
     /// the first reader in the next window recomputes exactly as before.
     trunc_expansions: IntMap(TypeId, u64) = .empty,
-    /// `.overloads` TypeId -> where its declaration-GROUP starts live in
-    /// `overload_group_pool`. An entry exists only for a merged global function
-    /// whose signatures come from two or more groups of declarations (the
-    /// default library, and each module's `declare global { … }` augmentation
-    /// of the same name). The interned member list is in declaration order —
-    /// what `getSignaturesOfType` reports, and so what `ReturnType`/`Parameters`
-    /// and the printer see — while overload RESOLUTION visits the groups
-    /// back-to-front (tsc's `reorderCandidates`).
-    /// `appendOverloadCandidates` applies it; everything else reads the members
-    /// as stored. See `mergedFunctionValue`.
+    /// TypeId -> where its declaration-GROUP starts live in
+    /// `overload_group_pool`. Two kinds of key, and an entry exists only when
+    /// the signatures come from two or more groups of declarations:
+    ///
+    ///   * an `.overloads` set built by `mergedFunctionValue` for a merged
+    ///     global function (the default library, and each module's
+    ///     `declare global { … }` augmentation of the same name);
+    ///   * the GENERIC object of an interface whose call signatures are spread
+    ///     over two or more `interface` declarations (`interfaceGeneric`).
+    ///
+    /// Both lists are stored in declaration order — what `getSignaturesOfType`
+    /// reports, and so what `ReturnType`/`Parameters`, `inferFromObjectSigs`
+    /// and the printer see (all of which align from the END) — while overload
+    /// RESOLUTION visits the groups back-to-front (tsc's `reorderCandidates`).
+    /// `appendOverloadCandidates` / `appendObjectCallCandidates` apply the
+    /// reversal at the call site and nowhere else.
     overload_groups: IntMap(TypeId, BaseSpan) = .empty,
     /// Ascending start indices into a merged overload set's member list, one
     /// per declaration group, indexed by `overload_groups`. `starts[0]` is
@@ -3590,6 +3596,7 @@ pub const Checker = struct {
     pub const expandoMemberType = signatures_zig.expandoMemberType;
     pub const mergedFunctionValue = signatures_zig.mergedFunctionValue;
     pub const appendOverloadCandidates = signatures_zig.appendOverloadCandidates;
+    pub const appendObjectCallCandidates = signatures_zig.appendObjectCallCandidates;
     pub const lastCallSig = signatures_zig.lastCallSig;
     pub const variableSymbolType = signatures_zig.variableSymbolType;
     pub const importedSymbolType = signatures_zig.importedSymbolType;

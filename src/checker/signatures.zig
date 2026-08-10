@@ -1237,6 +1237,81 @@ pub fn appendOverloadCandidates(c: *Checker, out: *std.ArrayList(TypeId), ov: Ty
     }
 }
 
+/// Append the call signatures of a callable OBJECT in overload-RESOLUTION
+/// order — tsc's `reorderCandidates` again, this time for the shape it
+/// actually shows up in most often: an interface declared more than once,
+/// each declaration carrying its own call signature.
+///
+/// tsc groups a candidate list by `signature.declaration.parent` and splices
+/// each new group in at the FRONT, so the groups are visited back-to-front
+/// with the order inside a group preserved. `getSignaturesOfType` keeps
+/// declaration order, and everything that is not a call site reads it that
+/// way — `ReturnType`/`Parameters` and `inferFromSignatures` align from the
+/// END, the printer prints in order — so the reversal must stay here, at the
+/// call site, and must never be baked into the stored table.
+///
+/// tippy.js is the canonical case:
+///
+///     interface Tippy<TProps = Props> extends TippyStatics {
+///       (targets: SingleTarget, …): Instance<TProps>;
+///     }
+///     interface Tippy<TProps = Props> extends TippyStatics {
+///       (targets: MultipleTargets, …): Instance<TProps>[];
+///     }
+///
+/// Resolution order is `[MultipleTargets, SingleTarget]`, so the LAST
+/// candidate — the one a failed overload resolution reports against — is the
+/// `SingleTarget` one, and its error lands on argument 0.
+///
+/// `Tippy` reaches a call site as a fresh instantiated object, which carries
+/// no boundaries of its own; it is routed back to the generic table the
+/// boundaries were recorded against through its `origin` ref (`expandRef`
+/// tags every materialization of `G<A…>` with the canonical ref, generic
+/// arguments included). Anything that route cannot resolve — a plain object
+/// type literal, a class instance, an inherited-only signature list — keeps
+/// the stored order.
+pub fn appendObjectCallCandidates(c: *Checker, out: *std.ArrayList(TypeId), obj: TypeId) Error!void {
+    const n = c.ts.objectCallSigCount(obj);
+    const appendAll = struct {
+        fn f(ck: *Checker, dst: *std.ArrayList(TypeId), o: TypeId, cnt: u32) Error!void {
+            for (0..cnt) |i| try dst.append(ck.scratch(), ck.ts.objectCallSig(o, @intCast(i)));
+        }
+    }.f;
+    if (n < 2) return appendAll(c, out, obj, n);
+    const span = callSigGroupsOf(c, obj) orelse return appendAll(c, out, obj, n);
+    // `bounds` is `groups + 1` ascending offsets: group `i` is
+    // `[bounds[i], bounds[i + 1])` and `bounds[len - 1]` is the end of the
+    // declarations' own (non-inherited) prefix. The boundaries index the
+    // GENERIC table's call-signature list; instantiation copies that list
+    // position for position, so a mismatch can only mean this object is not
+    // that table's instance after all — fall back to the stored order rather
+    // than drop or duplicate a signature.
+    const bounds = c.overload_group_pool.items[span.start..][0..span.len];
+    if (bounds.len < 3 or bounds[0] != 0 or bounds[bounds.len - 1] > n) {
+        return appendAll(c, out, obj, n);
+    }
+    var i = bounds.len - 1;
+    while (i > 0) {
+        i -= 1;
+        for (bounds[i]..bounds[i + 1]) |k| try out.append(c.scratch(), c.ts.objectCallSig(obj, @intCast(k)));
+    }
+    // Anything past the prefix is INHERITED. tsc restarts its grouping at the
+    // end of the result list whenever the declaring symbol changes, so those
+    // stay after the reversed groups, in order.
+    for (bounds[bounds.len - 1]..n) |k| try out.append(c.scratch(), c.ts.objectCallSig(obj, @intCast(k)));
+}
+
+/// The declaration-group boundaries recorded for `obj`'s call signatures:
+/// `obj` itself when it IS the generic table, else the table its `origin` ref
+/// names (`interfaceGeneric`'s memo, read without materializing anything).
+fn callSigGroupsOf(c: *Checker, obj: TypeId) ?checker_zig.BaseSpan {
+    if (c.overload_groups.get(obj)) |s| return s;
+    const orig = c.origin.get(obj) orelse return null;
+    if (c.ts.kind(orig) != .ref) return null;
+    const generic = c.iface_generic.get(c.ts.refSymbol(orig)) orelse return null;
+    return c.overload_groups.get(generic);
+}
+
 /// The last call signature (a `.function` TypeId) reachable from any
 /// callable shape: a bare function, an overload set (tsc's
 /// `inferFromSignatures` aligns from the end, so the last wins), a
