@@ -1081,6 +1081,33 @@ pub fn main(init: std.process.Init) !void {
                     try resolveSpecInto(arena, scratch, gpa, io, &interner, &rcache, paths_map, config_resolve_json, paths.items[i], rec.module, &seen, &path_ids, &paths, &atoms, &files);
                 }
             }
+            // A `declare module "spec" { … }` block inside a file that is
+            // itself a MODULE is a module *augmentation*, and its specifier is
+            // a module reference of this file exactly like an import is —
+            // tsc's `getModuleNames` appends `file.moduleAugmentations` to
+            // `file.imports` before `processImportedModules` resolves them.
+            // Without it `f.specs` only held specifiers some import/export
+            // clause happened to name, so `mergeAugmentations` could not find
+            // the augmented file and dropped the block: an augmentation that
+            // is the ONLY mention of the module in its file never merged.
+            //
+            // That is the shape a package uses to augment ITSELF from a
+            // sibling file — @tiptap/core's `dist/commands/*.d.ts` each carry
+            // `declare module '@tiptap/core' { interface Commands<R> { … } }`
+            // while importing only relative paths — so `Commands` stayed
+            // empty except for the handful of third-party extension packages
+            // (which DO import '@tiptap/core' for other reasons), and every
+            // `editor.commands.*` / `editor.chain().*` was a TS2339.
+            //
+            // Gated on `b.is_module`, tsc's `isExternalModuleFile`: in a
+            // SCRIPT the same block is a standalone ambient module declaration
+            // (@types/node's `declare module "fs"`), not an augmentation, and
+            // must not resolve to anything.
+            if (b.is_module) {
+                for (b.ambient_modules) |am| {
+                    try resolveSpecInto(arena, scratch, gpa, io, &interner, &rcache, paths_map, config_resolve_json, paths.items[i], am.spec, &seen, &path_ids, &paths, &atoms, &files);
+                }
+            }
             // Pull @types/node into the program on the first Node built-in
             // import (`node:fs`, `path`, …), like tsc auto-including @types: its
             // ambient `declare module "fs"` / `declare module "node:fs"` blocks

@@ -1129,7 +1129,19 @@ pub fn typeofEntity(c: *Checker, node: Node) Error!TypeId {
         }
         if (c.ts.kind(rb) == .any or c.ts.kind(rb) == .err) return rb;
         if (try c.propOfType(rb, name)) |p| {
-            return c.regularizeTypeQuery(p.ty);
+            // An OPTIONAL property's type includes `undefined` (tsc bakes it
+            // in at declaration with `addOptionality`, so `getTypeOfSymbol`
+            // — which is all a type query reads — already carries it). ztsc
+            // keeps `| undefined` out of the stored property type and unions
+            // it in at every read instead, so the type query has to do the
+            // same or `typeof obj.optProp` comes back strictly narrower than
+            // tsc's. social-app's `post-shadow.ts` declares
+            // `let embed: typeof post.embed` over an optional `embed?:` and
+            // assigns it only under a guard: with the `undefined` missing,
+            // the declared type excluded `undefined` and definite-assignment
+            // analysis reported a spurious TS2454.
+            const pt = if (p.optional()) try c.makeUnion2(p.ty, types.undefined_type) else p.ty;
+            return c.regularizeTypeQuery(pt);
         }
         // Unknown member: stay silent (`any`) rather than risk a false
         // positive — the value-position access reports it where written.

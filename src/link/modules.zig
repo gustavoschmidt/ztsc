@@ -217,6 +217,16 @@ pub fn buildProgram(
                 try resolveOne(arena, scratch, io, &rcache, dir, interner, path, rec.module, &spec_atoms, &spec_files, &seen, &path_ids, &pending);
             }
         }
+        // A `declare module "spec" { … }` block in a file that is itself a
+        // MODULE is a module augmentation, and its specifier is a module
+        // reference of this file just like an import (tsc's `getModuleNames`
+        // = `file.imports` ++ `file.moduleAugmentations`). See the same loop
+        // in the CLI driver for what dropping it cost.
+        if (bound.is_module) {
+            for (bound.ambient_modules) |am| {
+                try resolveOne(arena, scratch, io, &rcache, dir, interner, path, am.spec, &spec_atoms, &spec_files, &seen, &path_ids, &pending);
+            }
+        }
         sortSpecs(spec_atoms.items, spec_files.items);
 
         try files.append(arena, .{

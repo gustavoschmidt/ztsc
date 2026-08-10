@@ -4055,7 +4055,21 @@ pub fn checkBinary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             const key_union = try c.ts.makeUnion(c.scratch(), &.{ types.string_type, types.number_type, types.symbol_type });
             _ = try c.checkAssignable(lt, key_union, d.lhs, c.nodeSpan(d.lhs));
             const rk = c.ts.kind(try c.resolveStructural(rt));
-            if (!isNonPrimitiveKind(rk) and rk != .any and rk != .err and rk != .type_param and rk != .union_type and rk != .unknown) {
+            // `never` is not a primitive for this test. tsc asks
+            // `allTypesAssignableToKind(rightType, NonPrimitive |
+            // InstantiableNonPrimitive)`, which ends in
+            // `isTypeAssignableTo(source, nonPrimitiveType)` — and `never` is
+            // assignable to everything, so tsc never reports here. A kind test
+            // has to say so explicitly.
+            //
+            // The operand reaches `never` through ordinary narrowing, not
+            // through an error: social-app's `EmptyState` writes
+            // `typeof icon === 'function' || (typeof icon === 'object' && icon
+            // && 'render' in icon)` over `ComponentType<any> | ReactElement`,
+            // and the FALSE branch of the first disjunct drops both callable
+            // constituents (tsc's `TypeofNEFunction` facts do the same), so the
+            // second disjunct is checked against `never`.
+            if (!isNonPrimitiveKind(rk) and rk != .any and rk != .err and rk != .never and rk != .type_param and rk != .union_type and rk != .unknown) {
                 try c.diagFmt(2361, c.nodeSpan(d.rhs), "The right-hand side of an 'in' expression must not be a primitive.", .{});
             }
             return types.boolean_type;

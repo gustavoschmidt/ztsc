@@ -963,6 +963,9 @@ fn inferFromExtendsInner(c: *Checker, source0: TypeId, pattern: TypeId, ids: []c
             if (vals[idx] == types.no_type) {
                 vals[idx] = source0;
             } else if (contra) {
+                // tsc's `getTypeFromInference` intersects the contravariant
+                // candidates — which is what makes `UnionToIntersection<U>`
+                // work once a union source distributes over the pattern.
                 vals[idx] = try c.ts.makeIntersection(c.scratch(), &.{ vals[idx], source0 });
             } else {
                 vals[idx] = try c.makeUnion2(vals[idx], source0);
@@ -1231,6 +1234,51 @@ fn inferFromExtendsInner(c: *Checker, source0: TypeId, pattern: TypeId, ids: []c
             // wrongly rejecting `mockResolvedValueOnce(null)` as TS2769).
             if (s.kind(src) == .overloads) {
                 if (try c.lastCallSig(src)) |sig| src = sig else return;
+            }
+            // A UNION source against a single-signature pattern infers from
+            // each constituent (tsc's `inferFromTypes`: once the target is
+            // neither a union nor a type variable, "source is a union type,
+            // infer from each constituent type"). The candidates then combine
+            // by position — `getTypeFromInference` unions covariant candidates
+            // and INTERSECTS contravariant ones — which is the entire
+            // mechanism behind the `UnionToIntersection<U>` idiom:
+            //
+            //     type UnionToIntersection<U> =
+            //       (U extends any ? (k: U) => void : never) extends
+            //         (k: infer I) => void ? I : never
+            //
+            // The distributive check type is a UNION of one-parameter
+            // functions, so `I` collects one contravariant candidate per
+            // constituent and comes out as their intersection. Without this
+            // the whole pattern matched nothing and the conditional fell to
+            // its `never` branch: tiptap's `UnionCommands`/`SingleCommands`/
+            // `ChainedCommands` are built exactly this way, so social-app's
+            // `TextInput.web.tsx` saw `editor.commands` and `editor.chain()`
+            // as `never` and every command on them was a TS2339.
+            //
+            // Deliberately limited to the TOP of the match (`depth == 0`),
+            // where the pattern is the conditional's whole extends clause and
+            // the source is its check type. Deeper, a union source reaching a
+            // signature pattern is one arm of a multi-constituent union TARGET
+            // (`ref?: RefCallback<M> | RefObject<M | null> | null`), and tsc
+            // orders those by inference PRIORITY — a candidate found through a
+            // lower-priority arm is dropped once a higher-priority one exists.
+            // ztsc has no priority ladder, so distributing there only adds
+            // candidates tsc would discard: doing it flipped
+            // `TRef extends AnimatedComponentType<any, infer Instance>` in
+            // react-native-reanimated to its false branch and every
+            // `useAnimatedRef<Animated.View>()` stopped matching its own
+            // component's `ref`.
+            if (depth == 0 and s.kind(src) == .union_type) {
+                const umembers = try c.scratch().dupe(TypeId, try c.memberList(src));
+                defer c.scratch().free(umembers);
+                // Same `depth`, not `depth + 1`: distributing a union over the
+                // same target is not a structural descent (tsc recurses with no
+                // notion of depth here), and charging it a level pushed deep
+                // chains past `max_infer_depth` and truncated candidates that
+                // used to bind.
+                for (umembers) |m| try c.inferFromExtends(m, pattern, ids, vals, contra, depth);
+                return;
             }
             if (s.kind(src) != .function) return;
             // A generic *source* signature must be reduced to its base
@@ -2079,6 +2127,32 @@ pub fn applyPropModifiers(base: u32, flags: u32) u32 {
     return f;
 }
 
+/// tsc's `CheckFlags.StripOptional` (`getTypeOfMappedSymbol`'s
+/// `removeMissingOrUndefinedType(propType)`): a mapped type that REMOVES
+/// optionality (`-?`) from a source property that WAS optional also removes
+/// `undefined` from that property's type — `Required<{a?: X}>` is `{a: X}`,
+/// and `Required<{a?: X | undefined}>` is `{a: X}` too.
+///
+/// ztsc normally keeps `| undefined` out of a stored property type and unions
+/// it in at read time from `prop_flag_optional`, so for a source whose props
+/// are declared directly the flag clear in `applyPropModifiers` is already
+/// enough. It is NOT enough once the source is itself a materialized mapped
+/// type: a NON-homomorphic map (`Pick`, `Omit`) computes its value through
+/// `T[K]`, which bakes the `| undefined` into the stored type, so
+/// `Required<Pick<P, "image">>` came out `{ image: X | undefined }` — flag
+/// cleared, undefined still there. social-app's `EditImageInner`, whose
+/// parameter is `Required<Pick<EditImageDialogProps, 'image'>> & Omit<…>`,
+/// then reported TS18048 on every `image.…` read.
+///
+/// Gated on the SOURCE property being optional, exactly as tsc gates
+/// `StripOptional` on `symbol.flags & SymbolFlags.Optional`: a REQUIRED
+/// property declared `a: X | undefined` keeps its `undefined` under `-?`.
+fn stripMappedOptional(c: *Checker, pt: TypeId, base: u32, flags: u32) Error!TypeId {
+    if (flags & types.mapped_flag_optional_remove == 0) return pt;
+    if (base & types.prop_flag_optional == 0) return pt;
+    return c.removeUndefined(pt);
+}
+
 pub fn applyElemModifiers(base: u32, flags: u32) u32 {
     var f = base;
     if (flags & types.mapped_flag_readonly_add != 0) f |= types.elem_flag_readonly;
@@ -2308,7 +2382,7 @@ pub fn materializeMapped(c: *Checker, key_param: TypeId, constraint: TypeId, val
                     if (p.nonPublic()) continue;
                     const key_lit = try s.makeStringLiteral(p.name, false);
                     const name = (try c.remapKey(as_clause, key_id, key_lit)) orelse continue;
-                    const pt = try c.substMappedKey(value, key_id, key_lit);
+                    const pt = try stripMappedOptional(c, try c.substMappedKey(value, key_id, key_lit), p.flags, flags);
                     try props.append(c.scratch(), .{ .name = name, .ty = pt, .flags = applyPropModifiers(p.flags, flags) });
                 }
                 // Preserve the source's index signatures: a homomorphic map
@@ -2433,30 +2507,30 @@ pub fn materializeMapped(c: *Checker, key_param: TypeId, constraint: TypeId, val
                     vname
                 else
                     (try c.remapKey(as_clause, key_id, key_lit)) orelse continue;
-                const pt = try c.substMappedKey(value, key_id, key_lit);
                 var base: u32 = 0;
                 if (mod_src != 0) {
                     if (try c.propOfTypeEx(mod_src, name, false)) |sp| base = sp.flags & mod_mask;
                 }
+                const pt = try stripMappedOptional(c, try c.substMappedKey(value, key_id, key_lit), base, flags);
                 try props.append(c.scratch(), .{ .name = name, .ty = pt, .flags = applyPropModifiers(base, flags) });
                 if (as_clause == 0) try name_types.append(c.scratch(), .{ .name = name, .ty = key_lit });
             },
             .string_literal => {
                 const name = (try c.remapKey(as_clause, key_id, key_lit)) orelse continue;
-                const pt = try c.substMappedKey(value, key_id, key_lit);
                 var base: u32 = 0;
                 if (mod_src != 0) {
                     if (try c.propOfTypeEx(mod_src, s.literalAtom(key_lit), false)) |sp| base = sp.flags & mod_mask;
                 }
+                const pt = try stripMappedOptional(c, try c.substMappedKey(value, key_id, key_lit), base, flags);
                 try props.append(c.scratch(), .{ .name = name, .ty = pt, .flags = applyPropModifiers(base, flags) });
             },
             .number_literal, .number_literal_fresh => {
                 const nm = try c.numberLiteralAtom(key_lit);
-                const pt = try c.substMappedKey(value, key_id, key_lit);
                 var base: u32 = 0;
                 if (mod_src != 0) {
                     if (try c.propOfTypeEx(mod_src, nm, false)) |sp| base = sp.flags & mod_mask;
                 }
+                const pt = try stripMappedOptional(c, try c.substMappedKey(value, key_id, key_lit), base, flags);
                 try props.append(c.scratch(), .{ .name = nm, .ty = pt, .flags = applyPropModifiers(base, flags) });
             },
             // A key that is not usable as a property name on its own. With
