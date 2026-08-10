@@ -949,9 +949,20 @@ pub fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, d
             // Use the declared type instead: there is no valid narrowing at an
             // unreachable definition point.
             if (ante == binder.unreachable_flow) return declared;
-            // Property paths, `this` and binding-pattern pseudo-roots never
-            // continue into an enclosing function's flow.
-            if (key.len != 0 or isPseudoRoot(key.sym)) return declared;
+            // Property paths and `this` never continue into an enclosing
+            // function's flow — tsc's Start arm excludes exactly
+            // PropertyAccess, ElementAccess and `this`.
+            if (key.len != 0 or key.sym == this_flow_root) return declared;
+            // A BINDING-PATTERN pseudo-reference is none of those, and tsc
+            // asks for it with no `flowContainer` at all, so it crosses every
+            // closure boundary unconditionally. It may: the pattern only ever
+            // stands for a `const` declarator or a never-assigned parameter
+            // (`narrowedPatternBinding`'s own gate), so the narrowing a guard
+            // gave it cannot be undone by an assignment somewhere else.
+            // Without this the sibling narrowing evaporated the moment it was
+            // read inside a callback — `lists.map((l, i) => i === lists.length
+            // - 1 …)` after `isPending`/`isError` were ruled out.
+            if (isPatternRoot(key.sym)) return c.flowType(ante, key, declared, depth + 1);
             // Only a reference *captured* by this closure may continue into
             // the definition-point flow. A reference to something the
             // closure declares itself (its parameters, its own locals) is
