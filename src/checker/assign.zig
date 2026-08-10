@@ -2501,10 +2501,21 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
         if (sk == .template_literal_type or sk == .string_mapping) return true;
         return false;
     }
-    // Template-literal pattern *source*: assignable only to `string` (fast
-    // path via `literalBase`) or an identical pattern (`s == t`). Reaching
-    // here means neither — so no.
-    if (sk == .template_literal_type or sk == .string_mapping) return false;
+    // Template-literal pattern / string-mapping *source* against anything
+    // else: `string` answers for it. Both are SUBTYPES of `string` — that is
+    // what `literalBase` says two frames up — and tsc reaches an object target
+    // through `getApparentType`, which hands a template literal the very same
+    // global `String` interface it hands `string`. So `string <: T` implies
+    // `template <: T`, and delegating is sound in the only direction that
+    // matters: it can never accept more than `string` does.
+    //
+    // A flat `return false` here was a false positive on every object-ish
+    // target `string` itself satisfies — `{}` above all, which is how
+    // `Property.Transform = Globals | (string & {})` is spelled: a
+    // `` `translate(${number}px)` `` reaching that intersection met `string`
+    // and then failed `{}`. (The string-literal and pattern targets are
+    // already answered above; what is left here is the object/primitive tail.)
+    if (sk == .template_literal_type or sk == .string_mapping) return c.isAssignable(types.string_type, t);
     // Any callable value — arrow/normal functions, overload sets, classes
     // used as values, and callable object/interface types — is assignable
     // to the global `Function` interface. tsc models this via the apparent
