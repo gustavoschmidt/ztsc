@@ -673,11 +673,36 @@ fn patternDiscriminantTok(c: *Checker, node: Node, key: RefKey) Error!?TokenInde
     return c.tree.nodeMainToken(el);
 }
 
+/// tsc's `isPastLastAssignment` (TS 5.4). `sym` is known to be assigned
+/// somewhere in this file; the narrowing at a closure's definition point
+/// survives the crossing only when the reference starts strictly after the
+/// last such assignment's extended position (`recordLastAssign`).
+///
+/// tsc's eligibility test is `isParameterOrMutableLocalVariable`, which admits
+/// parameters, `catch` variables and non-exported non-global `let`s — and
+/// **not `var`**, whose declaration is hoisted out of the block it is written
+/// in. A `var` that is assigned anywhere therefore stays at its declared type
+/// across a closure, exactly as before this rule existed.
+fn pastLastAssignment(c: *Checker, sym: SymbolId, sf: binder.SymbolFlags) bool {
+    if (!(sf.let_decl or sf.param or sf.catch_param)) return false;
+    const at = c.last_assign_pos.get(sym) orelse return false;
+    if (at == no_past_assignment) return false;
+    if (c.flow_ref_node == null_node) return false;
+    return at < c.nodeSpanStart(c.flow_ref_node);
+}
+
 pub fn flowTypeOfKey(c: *Checker, node: Node, key: RefKey, declared: TypeId) Error!TypeId {
     var t = declared;
     if (c.isNarrowable(declared)) {
         if (c.bind.flowAt(node)) |flow| {
             c.stats.flow_queries += 1;
+            // The reference the closure-crossing arm places against
+            // `last_assign_pos`. Saved and restored because narrowing a
+            // condition re-checks expressions, which can start a nested flow
+            // query for a different reference.
+            const saved_ref = c.flow_ref_node;
+            defer c.flow_ref_node = saved_ref;
+            c.flow_ref_node = node;
             t = try c.flowType(flow, key, declared, 0);
             // The tail of tsc's `getFlowTypeOfReference`. tsc has *two*
             // `never`s: the ordinary one a guard narrows a reference down to,
@@ -996,9 +1021,8 @@ pub fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, d
                 //     (only function-expression/arrow/method containers extend
                 //     the flow — a hoisted `function` captures at its
                 //     definition point, before any guard),
-                //   • reassignment anywhere (conservative vs tsc's
-                //     position-based `lastAssignmentPos`; only ever
-                //     under-narrows, never a new false positive).
+                //   • an assignment the reference is not textually past
+                //     (tsc's `isPastLastAssignment`, below).
                 if (!(sf.let_decl or sf.var_decl or sf.param or sf.catch_param)) return declared;
                 if (sf.exported) return declared;
                 if (c.symFile(key.sym) != c.cur_file) return declared;
@@ -1009,7 +1033,8 @@ pub fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, d
                     else => return declared, // function declaration etc.
                 }
                 try c.ensureReassignScan();
-                if (c.reassigned_syms.contains(key.sym)) return declared;
+                if (c.reassigned_syms.contains(key.sym) and
+                    !pastLastAssignment(c, key.sym, sf)) return declared;
             }
             return c.flowType(ante, key, declared, depth + 1);
         },
@@ -1849,6 +1874,14 @@ pub fn identIsSym(c: *Checker, node: Node, sym: SymbolId) Error!bool {
 /// `x++`, or a destructuring-assignment element). Runs once per file
 /// (`reassign_scanned`); the declarator initializer is *not* a
 /// reassignment. Order-invariant — a pure function of the file's AST.
+///
+/// It doubles as ztsc's `markNodeAssignments`: every symbol it records also
+/// gets a `last_assign_pos` entry (see `recordLastAssign`), which is what
+/// TS 5.4's "preserved narrowing in closures following the last assignment"
+/// reads. tsc walks the declaring function's AST for the same information;
+/// the flow graph carries exactly the same assignment nodes (each `.assign`
+/// flow node IS an assignment / update expression), so the walk is over
+/// `flow_tags` instead — same set, one linear pass, no parent pointers.
 pub fn ensureReassignScan(c: *Checker) Error!void {
     if (c.reassign_scanned[c.cur_file]) return;
     c.reassign_scanned[c.cur_file] = true;
@@ -1861,13 +1894,13 @@ pub fn ensureReassignScan(c: *Checker) Error!void {
         const scope = b.flowScope(flow);
         switch (c.nodeTag(node)) {
             .assign => {
-                try c.markReassignTarget(c.tree.nodeData(node).lhs, scope);
+                try c.markReassignTarget(c.tree.nodeData(node).lhs, scope, node);
                 try c.markMemberWriteRoot(c.tree.nodeData(node).lhs, scope);
             },
             .prefix_unary, .postfix_unary => {
                 switch (c.tree.tokens.tag(c.tree.nodeMainToken(node))) {
                     .plus_plus, .minus_minus => {
-                        try c.markReassignTarget(c.tree.nodeData(node).lhs, scope);
+                        try c.markReassignTarget(c.tree.nodeData(node).lhs, scope, node);
                         try c.markMemberWriteRoot(c.tree.nodeData(node).lhs, scope);
                     },
                     else => {},
@@ -1875,6 +1908,14 @@ pub fn ensureReassignScan(c: *Checker) Error!void {
             },
             // declarator_init / declarator_full / for-in-of bindings are
             // the variable's *initialization*, not a reassignment.
+            //
+            // `for (x of xs)` over an ALREADY-declared `x` IS an assignment
+            // to tsc's `markNodeAssignments`, and is deliberately still left
+            // out: adding it would put `x` into `reassigned_syms`, which four
+            // other consumers (`stableIndexSymbol`, the loop-label shortcut,
+            // `narrowedPatternBinding`) read as "not effectively const" — a
+            // tightening well outside the 5.4 rule. Leaving it out only ever
+            // preserves MORE narrowing, which is the pre-existing answer.
             else => {},
         }
     }
@@ -1897,7 +1938,7 @@ pub fn recordReassign(c: *Checker, sym: SymbolId, scope: ScopeId) Error!void {
     }
 }
 
-pub fn markReassignTarget(c: *Checker, target: Node, scope: ScopeId) Error!void {
+pub fn markReassignTarget(c: *Checker, target: Node, scope: ScopeId, at: Node) Error!void {
     if (target == null_node) return;
     var n = target;
     while (c.nodeTag(n) == .paren_expr) n = c.tree.nodeData(n).lhs;
@@ -1905,38 +1946,148 @@ pub fn markReassignTarget(c: *Checker, target: Node, scope: ScopeId) Error!void 
         .identifier => {
             const a = try c.atomOfToken(c.tree.nodeMainToken(n));
             switch (c.resolveSpace(a, scope, true)) {
-                .sym => |s| try c.recordReassign(s, scope),
+                .sym => |s| {
+                    try c.recordReassign(s, scope);
+                    try recordLastAssign(c, s, scope, at);
+                },
                 else => {},
             }
         },
         // Destructuring-assignment target: `[a] = …` / `({a} = …)`.
         .array_literal, .object_literal, .array_pattern, .object_pattern => {
             for (c.tree.nodeRange(n)) |el| {
-                if (el != null_node) try c.markReassignTarget(el, scope);
+                if (el != null_node) try c.markReassignTarget(el, scope, at);
             }
         },
         // Cover grammar: `object_property`'s target is rhs (lhs is the key).
-        .object_property => try c.markReassignTarget(c.tree.nodeData(n).rhs, scope),
+        .object_property => try c.markReassignTarget(c.tree.nodeData(n).rhs, scope, at),
         // `{[k]: target}` — lhs is the key expression, rhs the target.
-        .binding_property_computed => try c.markReassignTarget(c.tree.nodeData(n).rhs, scope),
+        .binding_property_computed => try c.markReassignTarget(c.tree.nodeData(n).rhs, scope, at),
         .binding_property, .object_shorthand => {
             const d = c.tree.nodeData(n);
             if (d.lhs != 0) {
-                try c.markReassignTarget(d.lhs, scope);
+                try c.markReassignTarget(d.lhs, scope, at);
             } else {
                 const a = try c.memberAtom(c.tree.nodeMainToken(n));
                 switch (c.resolveSpace(a, scope, true)) {
-                    .sym => |s| try c.recordReassign(s, scope),
+                    .sym => |s| {
+                        try c.recordReassign(s, scope);
+                        try recordLastAssign(c, s, scope, at);
+                    },
                     else => {},
                 }
             }
         },
         .binding_default, .rest_element, .spread_element => {
-            try c.markReassignTarget(c.tree.nodeData(n).lhs, scope);
+            try c.markReassignTarget(c.tree.nodeData(n).lhs, scope, at);
         },
         // member_expr (`o.p = v`) reassigns a property, not a variable.
         else => {},
     }
+}
+
+/// "No reference is ever past this symbol's last assignment" — the pre-TS-5.4
+/// answer, and what `last_assign_pos` stores whenever the position cannot be
+/// pinned down (see `recordLastAssign`).
+pub const no_past_assignment: u32 = std.math.maxInt(u32);
+
+/// tsc's `markNodeAssignments` + `extendAssignmentPosition`, for one
+/// assignment of `sym` at `at` (the assignment/update expression node) in
+/// `scope`.
+///
+/// tsc records `symbol.lastAssignmentPos = max(previous, extended)`, where
+/// `extended` walks from the assignment identifier up through its ancestors
+/// and takes the END of the OUTERMOST enclosing *statement* that begins after
+/// the declaration — so an assignment and a reference that share such a
+/// statement (both inside one `if`/`while`/`try`) never count as "reference
+/// after assignment", however the two are ordered textually. An assignment
+/// made from a DIFFERENT function than the declaring one is recorded as
+/// `Number.MAX_VALUE`: it can run at any time, so no reference is ever past
+/// it.
+///
+/// ztsc has no parent pointers, so the outermost enclosing statement is found
+/// top-down instead: the declaring scope's own statement list is indexed by
+/// start offset, the statement containing `at` is located by binary search,
+/// and a bare `{ … }` block — the one statement kind tsc's list does NOT
+/// include, and so treats as transparent — is descended into. The statement's
+/// END is the next sibling's start (or the bound inherited from the level
+/// above), which is exactly tsc's `node.end` up to the trivia between two
+/// statements; tsc compares against `location.pos`, which counts that same
+/// trivia on the other side.
+///
+/// A declaring scope whose statements cannot be listed (a `for` header, a
+/// `catch` clause, a namespace body) records `no_past_assignment`, i.e. the
+/// pre-5.4 behaviour — never a narrowing that tsc would not also make.
+fn recordLastAssign(c: *Checker, sym: SymbolId, scope: ScopeId, at: Node) Error!void {
+    const gop = try c.last_assign_pos.getOrPut(c.cm(), sym);
+    if (!gop.found_existing) gop.value_ptr.* = 0;
+    if (gop.value_ptr.* == no_past_assignment) return;
+    gop.value_ptr.* = @max(gop.value_ptr.*, extendedAssignPos(c, sym, scope, at));
+}
+
+fn extendedAssignPos(c: *Checker, sym: SymbolId, scope: ScopeId, at: Node) u32 {
+    if (c.symFile(sym) != c.cur_file) return no_past_assignment;
+    const decl_scope = c.symScope(sym);
+    // tsc: `referencingFunction !== declaringFunction` ⇒ MAX_VALUE.
+    if (c.containerOf(scope) != c.containerOf(decl_scope)) return no_past_assignment;
+    var stmts = stmtsOfScope(c, decl_scope) orelse return no_past_assignment;
+    const pos = c.nodeSpanStart(at);
+    var upper: u32 = no_past_assignment;
+    // Descend through transparent bare blocks to the outermost statement kind
+    // tsc's `extendAssignmentPosition` actually stops at.
+    var guard: u32 = 0;
+    while (guard < 64) : (guard += 1) {
+        const i = stmtIndexContaining(c, stmts, pos) orelse return upper;
+        const next = if (i + 1 < stmts.len) c.nodeSpanStart(stmts[i + 1]) else upper;
+        if (c.nodeTag(stmts[i]) != .block) return next;
+        upper = next;
+        stmts = c.tree.nodeRange(stmts[i]);
+        if (stmts.len == 0) return upper;
+    }
+    return no_past_assignment;
+}
+
+/// Index of the last statement in `stmts` that starts at or before `pos`, or
+/// null when `pos` precedes the whole list. `stmts` is in source order, so a
+/// binary search over the (cheap) span STARTS finds it.
+fn stmtIndexContaining(c: *Checker, stmts: []const Node, pos: u32) ?usize {
+    if (stmts.len == 0 or c.nodeSpanStart(stmts[0]) > pos) return null;
+    var lo: usize = 0;
+    var hi: usize = stmts.len;
+    while (hi - lo > 1) {
+        const mid = lo + (hi - lo) / 2;
+        if (c.nodeSpanStart(stmts[mid]) <= pos) lo = mid else hi = mid;
+    }
+    return lo;
+}
+
+/// The statement list a scope's declarations sit directly in, or null when
+/// the scope is not one (`for` header, `catch` clause, class body, …).
+fn stmtsOfScope(c: *Checker, scope: ScopeId) ?[]const Node {
+    const owner = c.bind.scope_owners[scope];
+    return switch (c.bind.scope_kinds[scope]) {
+        // The file scope owns node 0, which is the `root` node: a range of
+        // the file's top-level statements.
+        .file => c.tree.nodeRange(ast.root_node),
+        .block => c.tree.nodeRange(owner),
+        .function => blk: {
+            const body = fnBodyOf(c, owner);
+            if (body == null_node or c.nodeTag(body) != .block) break :blk null;
+            break :blk c.tree.nodeRange(body);
+        },
+        else => null,
+    };
+}
+
+/// The body node of a function-like declaration (`null_node` when it has
+/// none, e.g. an overload signature or an ambient declaration).
+fn fnBodyOf(c: *Checker, node: Node) Node {
+    return switch (c.nodeTag(node)) {
+        .function_decl, .function_expr, .class_method, .arrow_fn => c.tree.nodeData(node).rhs,
+        // `{ m() {} }` — the method's function value carries the body.
+        .object_method => fnBodyOf(c, c.tree.nodeData(node).rhs),
+        else => null_node,
+    };
 }
 
 /// Record the ROOT symbol of a member/element-write target (`o.p = …`,

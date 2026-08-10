@@ -740,6 +740,7 @@ pub const map_containers = [_][]const u8{
     "enum_members",           "keyof_obj_cache",          "trunc_expansions",
     "inst_map_bytes",         "tp_mentions",              "smk_cache",
     "rel_maybe",              "spec_sym_types",           "spec_tainted",
+    "last_assign_pos",
 };
 
 /// One enum member as `eachEnumMember` yields it: the name atom and the
@@ -910,6 +911,16 @@ pub const Checker = struct {
     /// (see the `.start`/closure-capture gate in `flowTypeInner`). Order-
     /// invariant: a pure function of the file's assignment AST nodes.
     reassigned_syms: IntMap(SymbolId, void) = .empty,
+    /// tsc's `Symbol.lastAssignmentPos` (TS 5.4's "preserved narrowing in
+    /// closures following the last assignment"): for every symbol in
+    /// `reassigned_syms`, the source offset a reference must start *after* for
+    /// the narrowing at the closure's definition point to survive the crossing.
+    /// Computed by `markNodeAssignments`' mirror inside `ensureReassignScan`;
+    /// `no_past_assignment` (all ones) means "no reference is ever past it" —
+    /// the pre-5.4 behaviour — and is what an assignment inside a *nested*
+    /// function, or a declaring scope this cannot index statements of, records.
+    /// Read only by `pastLastAssignment`.
+    last_assign_pos: IntMap(SymbolId, u32) = .empty,
     /// `(sym, for_head_scope)` pairs where `sym` is assigned somewhere inside a
     /// `for`/`for..of`/`for..in` whose header scope is `for_head_scope` (each
     /// enclosing loop of an assignment is recorded, so nested loops are all
@@ -1170,6 +1181,16 @@ pub const Checker = struct {
     /// answer being computed right now is taken against a partial fixpoint, so
     /// it belongs in `flow_tmp` rather than the persistent cache.
     flow_back_edge: u32 = 0,
+    /// The reference node the in-flight flow query was started for
+    /// (`flowTypeOfKey`), valid in `cur_file`. Only the closure-crossing arm
+    /// of `flowTypeInner` reads it, and only to place the reference against
+    /// `last_assign_pos` — tsc makes the same decision one level up, in
+    /// `checkIdentifier`, before it ever enters the flow walk. It is NOT part
+    /// of the `(flow, key)` memo key and must not become one: a `.start` flow
+    /// node belongs to exactly one closure, and every reference inside that
+    /// closure sits inside the same statement of the declaring block, so the
+    /// past/not-past answer is constant over the references that can reach it.
+    flow_ref_node: Node = ast.null_node,
     /// Interned narrowing reference keys (RefQ -> dense index).
     ref_keys: std.AutoHashMapUnmanaged(RefQ, u32) = .empty,
     /// Over-deep reference paths, indexed by `RefKey.deep - 1`. Appended to
