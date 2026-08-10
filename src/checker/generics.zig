@@ -2079,6 +2079,32 @@ pub fn applyPropModifiers(base: u32, flags: u32) u32 {
     return f;
 }
 
+/// tsc's `CheckFlags.StripOptional` (`getTypeOfMappedSymbol`'s
+/// `removeMissingOrUndefinedType(propType)`): a mapped type that REMOVES
+/// optionality (`-?`) from a source property that WAS optional also removes
+/// `undefined` from that property's type — `Required<{a?: X}>` is `{a: X}`,
+/// and `Required<{a?: X | undefined}>` is `{a: X}` too.
+///
+/// ztsc normally keeps `| undefined` out of a stored property type and unions
+/// it in at read time from `prop_flag_optional`, so for a source whose props
+/// are declared directly the flag clear in `applyPropModifiers` is already
+/// enough. It is NOT enough once the source is itself a materialized mapped
+/// type: a NON-homomorphic map (`Pick`, `Omit`) computes its value through
+/// `T[K]`, which bakes the `| undefined` into the stored type, so
+/// `Required<Pick<P, "image">>` came out `{ image: X | undefined }` — flag
+/// cleared, undefined still there. social-app's `EditImageInner`, whose
+/// parameter is `Required<Pick<EditImageDialogProps, 'image'>> & Omit<…>`,
+/// then reported TS18048 on every `image.…` read.
+///
+/// Gated on the SOURCE property being optional, exactly as tsc gates
+/// `StripOptional` on `symbol.flags & SymbolFlags.Optional`: a REQUIRED
+/// property declared `a: X | undefined` keeps its `undefined` under `-?`.
+fn stripMappedOptional(c: *Checker, pt: TypeId, base: u32, flags: u32) Error!TypeId {
+    if (flags & types.mapped_flag_optional_remove == 0) return pt;
+    if (base & types.prop_flag_optional == 0) return pt;
+    return c.removeUndefined(pt);
+}
+
 pub fn applyElemModifiers(base: u32, flags: u32) u32 {
     var f = base;
     if (flags & types.mapped_flag_readonly_add != 0) f |= types.elem_flag_readonly;
@@ -2308,7 +2334,7 @@ pub fn materializeMapped(c: *Checker, key_param: TypeId, constraint: TypeId, val
                     if (p.nonPublic()) continue;
                     const key_lit = try s.makeStringLiteral(p.name, false);
                     const name = (try c.remapKey(as_clause, key_id, key_lit)) orelse continue;
-                    const pt = try c.substMappedKey(value, key_id, key_lit);
+                    const pt = try stripMappedOptional(c, try c.substMappedKey(value, key_id, key_lit), p.flags, flags);
                     try props.append(c.scratch(), .{ .name = name, .ty = pt, .flags = applyPropModifiers(p.flags, flags) });
                 }
                 // Preserve the source's index signatures: a homomorphic map
@@ -2433,30 +2459,30 @@ pub fn materializeMapped(c: *Checker, key_param: TypeId, constraint: TypeId, val
                     vname
                 else
                     (try c.remapKey(as_clause, key_id, key_lit)) orelse continue;
-                const pt = try c.substMappedKey(value, key_id, key_lit);
                 var base: u32 = 0;
                 if (mod_src != 0) {
                     if (try c.propOfTypeEx(mod_src, name, false)) |sp| base = sp.flags & mod_mask;
                 }
+                const pt = try stripMappedOptional(c, try c.substMappedKey(value, key_id, key_lit), base, flags);
                 try props.append(c.scratch(), .{ .name = name, .ty = pt, .flags = applyPropModifiers(base, flags) });
                 if (as_clause == 0) try name_types.append(c.scratch(), .{ .name = name, .ty = key_lit });
             },
             .string_literal => {
                 const name = (try c.remapKey(as_clause, key_id, key_lit)) orelse continue;
-                const pt = try c.substMappedKey(value, key_id, key_lit);
                 var base: u32 = 0;
                 if (mod_src != 0) {
                     if (try c.propOfTypeEx(mod_src, s.literalAtom(key_lit), false)) |sp| base = sp.flags & mod_mask;
                 }
+                const pt = try stripMappedOptional(c, try c.substMappedKey(value, key_id, key_lit), base, flags);
                 try props.append(c.scratch(), .{ .name = name, .ty = pt, .flags = applyPropModifiers(base, flags) });
             },
             .number_literal, .number_literal_fresh => {
                 const nm = try c.numberLiteralAtom(key_lit);
-                const pt = try c.substMappedKey(value, key_id, key_lit);
                 var base: u32 = 0;
                 if (mod_src != 0) {
                     if (try c.propOfTypeEx(mod_src, nm, false)) |sp| base = sp.flags & mod_mask;
                 }
+                const pt = try stripMappedOptional(c, try c.substMappedKey(value, key_id, key_lit), base, flags);
                 try props.append(c.scratch(), .{ .name = nm, .ty = pt, .flags = applyPropModifiers(base, flags) });
             },
             // A key that is not usable as a property name on its own. With
