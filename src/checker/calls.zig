@@ -2056,6 +2056,28 @@ pub fn inferTypeArgs(
     // the argument is our own guess coming home, not evidence.
     const fed = try c.scratch().alloc(TypeId, tp_syms.len);
     const before_contra = try c.scratch().alloc(TypeId, tp_syms.len);
+    // tsc's `nonFixingMapper` leaves an un-inferred type parameter FREE in the
+    // contextual type, and every contextual READ then takes its apparent type
+    // (`getApparentTypeOfContextualType`). ztsc substitutes the `any`
+    // placeholder, which erases the parameter wherever it is NESTED — the
+    // RETURN type of a callback parameter above all — so the object literal
+    // returned from `useAnimatedStyle<Style extends ViewStyle | ImageStyle |
+    // TextStyle>(updater: () => Style)` saw no contextual type at all and every
+    // fresh literal in it widened (`pointerEvents: 'box-none' | 'none'` →
+    // `string`). Feed the apparent type — the instantiated constraint — which
+    // is what the contextual read would have produced anyway.
+    // `partialParamCtx` already does exactly this for a parameter that IS a
+    // bare type variable; this is the same rule one level in.
+    //
+    // Restricted to type parameters that occur ONLY in the callback's RETURN
+    // position. A contextual PARAMETER type is where the `any` placeholder is
+    // load-bearing — the placeholder-echo guard below reads it straight back,
+    // and tsc's own contextual parameter type is the still-free variable,
+    // which infers nothing either — so substituting the constraint there
+    // manufactures inference evidence the argument does not carry (measured:
+    // excalidraw 15 -> 45, immich 0 -> 1).
+    const partial_ctx = try c.scratch().alloc(TpMap, tp_syms.len);
+    const param_mentioned = try c.scratch().alloc(bool, tp_syms.len);
     ai = 0;
     for (arg_nodes) |an| {
         if (an == null_node) continue;
@@ -2063,13 +2085,32 @@ pub fn inferTypeArgs(
         const tag = c.nodeTag(an);
         if (tag != .arrow_fn and tag != .function_expr) continue;
         const pt0 = try c.paramTypeAtInferred(sig, ai, partial) orelse continue;
+        const rp0 = try c.resolveStructural(pt0);
+        const ret_only = c.ts.kind(rp0) == .function;
+        if (ret_only) {
+            for (param_mentioned) |*m| m.* = false;
+            var pi: u32 = 0;
+            while (pi < c.ts.fnParamCount(rp0)) : (pi += 1) {
+                const pty = c.ts.fnParam(rp0, pi).ty;
+                try markMentionedTps(c, pty, tp_syms, param_mentioned, 0);
+            }
+        }
+        for (partial, 0..) |p, i| {
+            partial_ctx[i] = p;
+            if (!ret_only or param_mentioned[i]) continue;
+            if (seeded[i] or p.ty != types.any_type) continue;
+            const con = try c.typeParamConstraint(tp_syms[i]);
+            if (con == types.no_type) continue;
+            const ci = try c.instantiate(con, partial);
+            if (c.ts.kind(ci) != .any) partial_ctx[i] = .{ .sym = tp_syms[i], .ty = ci };
+        }
         for (partial, 0..) |p, i| {
             placeheld[i] = !seeded[i] and p.ty == types.any_type;
             before[i] = candidates[i];
-            fed[i] = p.ty;
+            fed[i] = partial_ctx[i].ty;
             before_contra[i] = contra[i];
         }
-        const pt_partial = try c.partialParamCtx(pt0, partial);
+        const pt_partial = try c.partialParamCtx(pt0, partial_ctx);
         // A CONTEXT-SENSITIVE function argument this candidate hands NO
         // contextual signature is not an inference source, and walking it is
         // worse than useless. Its un-annotated parameters become implicit
