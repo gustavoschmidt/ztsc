@@ -2589,6 +2589,80 @@ pub fn revSlot(c: *Checker, candidates: []TypeId, i: usize) ?*bool {
     return &c.rev_flags[i];
 }
 
+/// tsc's `inferFromTupleTypes` prefix/suffix rule, for the one case ztsc's
+/// index-for-index pairing gets wrong: a target tuple with FIXED elements
+/// AFTER a variadic one.
+///
+/// `inferFromTupleTypes` does not walk a tuple pair from index 0. It computes
+/// a `startLength` — the fixed elements before the target's first variadic —
+/// and an `endLength` — the fixed elements after its last one — pairs the
+/// prefix from the START, pairs the suffix from the END, and gives whatever
+/// is between them to the variadic element. Index-for-index pairing is what
+/// that reduces to when the target has no variadic at all, which is why this
+/// is a strict addition and the loop below is untouched otherwise.
+///
+/// social-app's storage layer is the shape: `useStorage<Store, Key extends
+/// keyof StorageSchema<Store>>(storage: Store, scopes: [...StorageScopes<Store>,
+/// Key])` called as `useStorage(device, ['themeKey'])`, where
+/// `StorageScopes<device>` reduces to `[]`. Paired from index 0, `...Scopes`
+/// swallowed `'themeKey'`, `Key` was never inferred and fell back to its
+/// constraint `keyof Device` — so every read came back as the union of every
+/// value type in the schema, and the write side rejected every value. Writing
+/// the spread out (`[...[], K]`) hides the bug, because `makeTuple` flattens a
+/// rest element whose type is already a tuple.
+///
+/// Returns whether it handled the pair. The middle is packed back into a tuple
+/// and offered to the variadic element's own type, which is what that element
+/// denotes (`checkConstArrayLiteral` stores the whole array/tuple type on a
+/// rest element, not its element type), so both a `...S` type parameter and a
+/// classic `...X[]` rest see the shape they expect.
+fn tupleWithTrailingFixed(
+    c: *Checker,
+    param: TypeId,
+    ra: TypeId,
+    tp_syms: []const u32,
+    candidates: []TypeId,
+    depth: u32,
+) Error!bool {
+    const s = &c.ts;
+    const pn = s.tupleLen(param);
+    const an = s.tupleLen(ra);
+    var rest_at: ?u32 = null;
+    for (0..pn) |i| {
+        if (s.tupleElem(param, @intCast(i)).rest()) {
+            // More than one variadic element: tsc's rule is written for a
+            // single one (`startLength`/`endLength` are measured against the
+            // FIRST and LAST), and nothing in this corpus needs the general
+            // case. Leave those to the existing loop.
+            if (rest_at != null) return false;
+            rest_at = @intCast(i);
+        }
+    }
+    const r = rest_at orelse return false;
+    const suffix = pn - r - 1;
+    if (suffix == 0) return false; // rest is last — today's loop already
+    // The argument must be long enough to fill both fixed ends; if it is not,
+    // there is no consistent split and the ordinary pairing is no worse.
+    if (an < r + suffix) return false;
+    // A variadic element in the SOURCE would make "which argument element is
+    // at position n from the end" undecidable here.
+    for (0..an) |i| if (s.tupleElem(ra, @intCast(i)).rest()) return false;
+    for (0..r) |i| {
+        try c.unify(s.tupleElem(param, @intCast(i)).ty, s.tupleElem(ra, @intCast(i)).ty, tp_syms, candidates, depth + 1);
+    }
+    for (0..suffix) |i| {
+        const pi: u32 = @intCast(pn - 1 - i);
+        const ai: u32 = @intCast(an - 1 - i);
+        try c.unify(s.tupleElem(param, pi).ty, s.tupleElem(ra, ai).ty, tp_syms, candidates, depth + 1);
+    }
+    const mid_len = an - r - suffix;
+    const mid = try c.scratch().alloc(types.TupleElem, mid_len);
+    defer c.scratch().free(mid);
+    for (mid, 0..) |*m, i| m.* = s.tupleElem(ra, @intCast(r + i));
+    try c.unify(s.tupleElem(param, r).ty, try s.makeTuple(mid), tp_syms, candidates, depth + 1);
+    return true;
+}
+
 pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, candidates: []TypeId, depth: u32) Error!void {
     if (depth > 16) return;
     // tsc's `inferFromTypes` opens with `if (!couldContainTypeVariables(target))
@@ -2801,6 +2875,7 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                 return;
             }
             if (s.kind(ra) == .tuple) {
+                if (try tupleWithTrailingFixed(c, param, ra, tp_syms, candidates, depth)) return;
                 const n = @min(s.tupleLen(param), s.tupleLen(ra));
                 for (0..n) |i| {
                     try c.unify(s.tupleElem(param, @intCast(i)).ty, s.tupleElem(ra, @intCast(i)).ty, tp_syms, candidates, depth + 1);
