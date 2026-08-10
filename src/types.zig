@@ -280,6 +280,16 @@ pub const obj_flag_global_this: u32 = 8;
 /// Left clear when a string/number index is present too, so the shared slot
 /// is never mis-reported.
 pub const obj_flag_symbol_index: u32 = 16;
+/// The object was WRITTEN as an object literal (tsc's `ObjectFlags.
+/// ObjectLiteral`, which is a distinct bit from `ObjectFlags.FreshLiteral`).
+/// Freshness — the excess-property/weak-type trigger — is stripped the moment
+/// the literal is contextually consumed; the *origin* survives that, and is
+/// what tsc's `unionObjectAndArrayLiteralCandidates` and its widening context
+/// (`getWidenedTypeOfObjectLiteral`) key off. Cleared only by the widening
+/// that tsc's `getWidenedType` performs on a mutable location, which is where
+/// `getWidenedTypeOfObjectLiteral` builds a fresh anonymous type and keeps
+/// neither bit.
+pub const obj_flag_literal_origin: u32 = 32;
 pub const prop_flag_optional: u32 = 1;
 pub const prop_flag_readonly: u32 = 2;
 /// A `private`/`protected` class member (tsc's `ModifierFlags.NonPublic`).
@@ -623,6 +633,12 @@ pub const Store = struct {
     }
     pub fn objectIsFresh(s: *const Store, id: TypeId) bool {
         return s.kind(id) == .object and s.objectFlags(id) & obj_flag_fresh != 0;
+    }
+    /// Was this object WRITTEN as an object literal (tsc's
+    /// `ObjectFlags.ObjectLiteral`)? Outlives freshness — see
+    /// `obj_flag_literal_origin`.
+    pub fn objectIsLiteralOrigin(s: *const Store, id: TypeId) bool {
+        return s.kind(id) == .object and s.objectFlags(id) & obj_flag_literal_origin != 0;
     }
     /// An object/type-literal shape carries an *implied* string index signature
     /// for the index-signature relation; interface / class-instance shapes
@@ -1313,9 +1329,28 @@ pub const Store = struct {
         return s.internType(.object, s.pending.items[start..], @intCast(props.len));
     }
 
-    /// The regular (non-fresh) variant of a fresh object literal type.
+    /// The regular (non-fresh) variant of a fresh object literal type. The
+    /// literal ORIGIN (`obj_flag_literal_origin`) survives — tsc's
+    /// `getRegularTypeOfObjectLiteral` clears `FreshLiteral` and keeps
+    /// `ObjectLiteral`.
     pub fn regular(s: *Store, id: TypeId) Error!TypeId {
         if (!s.objectIsFresh(id)) return id;
+        return s.clearObjFlags(id, obj_flag_fresh);
+    }
+
+    /// The WIDENED variant of an object literal type: both its freshness and
+    /// its literal origin are gone, because tsc's `getWidenedTypeOfObjectLiteral`
+    /// builds a new anonymous type carrying neither flag. This is what a
+    /// mutable location (`const x = { … }`) and an inference result are widened
+    /// to, and it is what stops a widened literal from re-entering the
+    /// object-literal candidate union at a later call.
+    pub fn widenedObject(s: *Store, id: TypeId) Error!TypeId {
+        if (s.kind(id) != .object) return id;
+        if (s.objectFlags(id) & (obj_flag_fresh | obj_flag_literal_origin) == 0) return id;
+        return s.clearObjFlags(id, obj_flag_fresh | obj_flag_literal_origin);
+    }
+
+    fn clearObjFlags(s: *Store, id: TypeId, mask: u32) Error!TypeId {
         const a = s.dataA(id);
         const n = s.dataB(id);
         // The fresh object may live in the frozen base; read its shape words
@@ -1329,7 +1364,7 @@ pub const Store = struct {
         else
             3 + 3 * n;
         try s.pending.appendSlice(s.alloc, own.extra.items[a .. a + len]);
-        s.pending.items[start] &= ~obj_flag_fresh;
+        s.pending.items[start] &= ~mask;
         return s.internType(.object, s.pending.items[start..], n);
     }
 

@@ -1553,13 +1553,19 @@ pub fn isEvolvingVar(c: *Checker, sym: SymbolId) bool {
 }
 
 /// The declared type of an un-annotated declarator's initializer. A `const`
-/// keeps its literal types (`regular`, not `widenLiteral`), but an
+/// keeps its literal types (`widenObjectLiterals`, not `widenLiteral`), but an
 /// initializer that is a union of *fresh object literals* — `cond ? {a} :
 /// {b}`, `x || {b}` — is still one widening context and gets the
 /// sibling-`undefined` normalization either way.
+///
+/// `const` changes nothing for an OBJECT literal: tsc widens every mutable
+/// location with `getWidenedType`, and `const` only keeps `getWidenedLiteralType`
+/// from running over the primitive literals. So the object is widened in both
+/// branches — losing its literal origin — and a later generic call no longer
+/// treats the variable as an object-literal inference candidate.
 pub fn widenInitializer(c: *Checker, init_t: TypeId, is_const: bool) Error!TypeId {
     const norm = try c.normalizeFreshObjectSiblings(init_t);
-    return if (is_const) c.ts.regular(norm) else c.widenLiteral(norm);
+    return if (is_const) c.widenObjectLiterals(norm) else c.widenLiteral(norm);
 }
 
 /// The element type a `for..of` / `for..in` head gives the binding `sym`,
