@@ -376,9 +376,25 @@ pub fn inferredPredicate(c: *Checker, params: []const types.Param, ret: TypeId, 
         const key = RefKey{ .sym = psym };
         const true_ty = try c.narrowByGuardExpr(declared, guard, sense, key, 0, declared);
         if (true_ty == declared or c.ts.kind(true_ty) == .never) continue;
-        const false_ty = try c.narrowByGuardExpr(declared, guard, !sense, key, 0, declared);
-        // Soundness: the false branch must fully exclude the narrowed type.
-        if (try c.typesOverlap(true_ty, false_ty)) continue;
+        // Soundness, exactly as `checkIfExpressionRefinesParameter` states it:
+        //
+        //     const falseSubtype = getFlowTypeOfReference(
+        //         param.name, initType, trueType, func, falseCondition);
+        //     return falseSubtype.flags & TypeFlags.Never ? trueType : undefined;
+        //
+        // The false condition narrows the TRUE TYPE (with the parameter's
+        // declared type still the declared type) and must reach `never`. ztsc
+        // narrowed the DECLARED type instead and rejected on any overlap with
+        // `true_ty`, which is a strictly stronger test and fails whenever the
+        // declared union has a constituent that is a SUPERTYPE of the narrowed
+        // type: `@atproto/api`'s `Preferences` ends in a bare `{$type: string}`,
+        // which survives the false branch and is trivially overlapped by
+        // `Preferences & LiveEventPreferences`, so `updated.find(p =>
+        // asPredicate(validate…)(p))` got no predicate at all and `find` fell to
+        // its non-guard overload — TS2339 on the result and TS2322 on the
+        // enclosing `mutationFn`.
+        const false_ty = try c.narrowByGuardExpr(true_ty, guard, !sense, key, 0, declared);
+        if (c.ts.kind(false_ty) != .never) continue;
         if (found != null) return null; // ambiguous: two params narrowed
         found = types.Predicate{ .param = @intCast(pi), .ty = true_ty, .asserts = false };
     }

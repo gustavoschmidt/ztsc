@@ -234,6 +234,33 @@ pub fn checkCallExpr(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Error!T
     return result;
 }
 
+/// tsc's `isUntypedFunctionCall`, minus its two `any` disjuncts:
+///
+///     !numCallSignatures && !numConstructSignatures &&
+///     !(apparentFuncType.flags & TypeFlags.Union) &&
+///     !(getReducedType(apparentFuncType).flags & TypeFlags.Never) &&
+///     isTypeAssignableTo(funcType, globalFunctionType)
+///
+/// A callee that carries no signatures of its own but IS assignable to the
+/// global `Function` is an untyped call: `resolveCallExpression` hands it to
+/// `resolveUntypedCall`, which types it `any` and reports nothing. The named
+/// fast path above catches a callee whose type is literally the `Function`
+/// reference; this catches everything that only *relates* to it — a type
+/// parameter constrained by `Function` (React's `useEvent` idiom) or by an
+/// interface that extends it.
+///
+/// Only reached on the paths that were about to report TS2349, so the
+/// assignability probe costs nothing on a well-typed call. The construct-side
+/// exclusions are tsc's `!numConstructSignatures`: a class value (`typeof C`)
+/// is assignable to `Function` but calling it is TS2348, not an untyped call.
+fn untypedFunctionCall(c: *Checker, callee_t: TypeId, apparent: TypeId, ak: types.Kind) Error!bool {
+    if (ak == .union_type or ak == .never or ak == .class_value) return false;
+    if (ak == .object and c.ts.objectConstructSigCount(apparent) != 0) return false;
+    const sym = c.prog.globals.lookup(c.atom_Function) orelse return false;
+    if (!c.symFlags(sym).interface) return false;
+    return c.isAssignable(callee_t, try c.ts.makeRef(sym, &.{}));
+}
+
 /// Call/new as an optional-chain link (see `memberChainInner`). Returns the
 /// return type WITHOUT the chain's short-circuit `undefined`; sets
 /// `chained.*` when this `?.()` — or an earlier link in the callee spine —
@@ -260,9 +287,15 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, chained: *bool,
     // `<T extends (…) => R>(fn: T) => fn(…)` — the useStableCallback shape
     // — fell to the switch's `else` and reported TS2349. tsc's
     // `resolveCallExpression` calls `getApparentType` on the callee first.
+    // The callee's APPARENT type, before `resolveStructural` expands an
+    // interface reference into its member table — the only form in which the
+    // global `Function` is still recognisable by name (see the untyped-call
+    // special case below).
+    var apparent_t = callee_t;
     if (rk == .type_param) {
         const bc = try c.transitiveBaseConstraint(r);
         if (bc != r) {
+            apparent_t = bc;
             r = try c.resolveStructural(bc);
             rk = c.ts.kind(r);
         }
@@ -335,10 +368,19 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, chained: *bool,
     // Calling a value of the global `Function` type: tsc treats `Function`
     // as callable, accepting any arguments and yielding `any` (the interface
     // body carries no call signature, so a structural resolve would report
-    // TS2349). Mirrors the assignable-to-`Function` special-case in the
-    // relation. Only for calls — `new (x: Function)` stays unmodeled.
-    if (!is_new and c.ts.kind(callee_t) == .ref and
-        c.globalSymNamed(c.ts.refSymbol(callee_t), "Function"))
+    // TS2349). This is tsc's `isUntypedFunctionCall`'s last disjunct —
+    // `!numCallSignatures && !numConstructSignatures && … &&
+    // isTypeAssignableTo(funcType, globalFunctionType)` — which
+    // `resolveCallExpression` answers with `resolveUntypedCall` (type `any`,
+    // no diagnostic). Only for calls — `new (x: Function)` stays unmodeled.
+    //
+    // The APPARENT type carries it too: `<T extends Function>(fn?: T)` then
+    // `fn(...args)` is a call on a type parameter whose base constraint is
+    // `Function`, and `T` is assignable to `Function`, so tsc takes the same
+    // untyped-call route. Testing only `callee_t` left every such body
+    // (React's `useNonReactiveCallback`/`useEvent` idiom) at TS2349.
+    if (!is_new and c.ts.kind(apparent_t) == .ref and
+        c.globalSymNamed(c.ts.refSymbol(apparent_t), "Function"))
     {
         for (shape.arg_nodes) |an| {
             if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
@@ -462,6 +504,12 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, chained: *bool,
             // Callable object with call signatures.
             .object => {
                 if (c.ts.objectCallSigCount(r) == 0) {
+                    if (try untypedFunctionCall(c, callee_t, r, rk)) {
+                        for (shape.arg_nodes) |an| {
+                            if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
+                        }
+                        return types.any_type;
+                    }
                     try c.diagFmt(2349, c.nodeSpan(shape.callee), "This expression is not callable.", .{});
                     for (shape.arg_nodes) |an| {
                         if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
@@ -563,6 +611,12 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, chained: *bool,
                 }
             },
             else => {
+                if (try untypedFunctionCall(c, callee_t, r, rk)) {
+                    for (shape.arg_nodes) |an| {
+                        if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
+                    }
+                    return types.any_type;
+                }
                 try c.diagFmt(2349, c.nodeSpan(shape.callee), "This expression is not callable.", .{});
                 for (shape.arg_nodes) |an| {
                     if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
@@ -1576,6 +1630,9 @@ pub fn inferTypeArgs(
     // A nested call's inference gets its own, and starts at variance zero.
     const contra = try c.scratch().alloc(TypeId, tp_syms.len);
     for (contra) |*x| x.* = types.no_type;
+    // Its per-candidate half (see `Checker.contra_sup`).
+    const contra_sup = try c.scratch().alloc(TypeId, tp_syms.len);
+    for (contra_sup) |*x| x.* = types.no_type;
     // tsc's `InferenceInfo.topLevel`, registered the same way.
     const top_flags = try c.scratch().alloc(bool, tp_syms.len);
     for (top_flags) |*x| x.* = true;
@@ -1583,6 +1640,7 @@ pub fn inferTypeArgs(
     const rev_flags = try c.scratch().alloc(bool, tp_syms.len);
     for (rev_flags) |*x| x.* = false;
     const saved_contra_cands = c.contra_cands;
+    const saved_contra_sup = c.contra_sup;
     const saved_contra_owner = c.contra_owner;
     const saved_contra_pos = c.contra_pos;
     const saved_top_flags = c.top_flags;
@@ -1591,6 +1649,7 @@ pub fn inferTypeArgs(
     const saved_rev_prio = c.rev_prio;
     const saved_nontop_depth = c.nontop_depth;
     c.contra_cands = contra;
+    c.contra_sup = contra_sup;
     c.contra_owner = candidates.ptr;
     c.contra_pos = 0;
     c.top_flags = top_flags;
@@ -1600,6 +1659,7 @@ pub fn inferTypeArgs(
     c.nontop_depth = 0;
     defer {
         c.contra_cands = saved_contra_cands;
+        c.contra_sup = saved_contra_sup;
         c.contra_owner = saved_contra_owner;
         c.contra_pos = saved_contra_pos;
         c.top_flags = saved_top_flags;
@@ -2220,8 +2280,28 @@ pub fn inferTypeArgs(
             c.fnExprIsContextSensitive(an)) continue;
         const at = try c.checkExprCached(an, pt_partial);
         try c.unify(pt0, at, tp_syms, candidates, 0);
+        // The contravariant echo, widened. A context-sensitive callback's
+        // parameter types ARE the contextual type we just fed it, so anything
+        // a parameter position of it yields for a variable we resolved is our
+        // own guess coming home — not evidence. Identity is too narrow a test
+        // for that: `useAnimatedReaction<P>(prepare: () => P, react: (prepared:
+        // P, previous: P | null) => void)` feeds `previous` the contextual
+        // `string | null`, and `P | null` against it infers `P = string` by
+        // union subtraction — a DIFFERENT type, which then outranked the
+        // covariant `string | null` that `() => hoveredItemSV.get()` supplies
+        // and reported TS2322 on the first argument. tsc never re-decides the
+        // variable here either: reading it for this argument's contextual type
+        // memoizes `inference.inferredType`, and nothing short of FIXING
+        // (`clearCachedInferences`) reopens it. An argument we fed nothing for
+        // (the parameter was still the `any` placeholder) is untouched, and so
+        // is a non-context-sensitive argument — an annotated callback carries
+        // real contravariant evidence, which is why tsc rejects
+        // `f7(() => sv.get(), sink)` for `sink: (p: string | null) => void`.
+        const ctx_sensitive = c.fnExprIsContextSensitive(an);
         for (contra, 0..) |*cc, i| {
-            if (cc.* != before_contra[i] and cc.* == fed[i]) cc.* = before_contra[i];
+            if (cc.* == before_contra[i]) continue;
+            if (cc.* == fed[i] or (ctx_sensitive and fed[i] != types.any_type))
+                cc.* = before_contra[i];
         }
         // Placeholder echo. A parameter with no candidate yet stands in as
         // `any` in this argument's contextual type, so a callback that
@@ -2277,11 +2357,24 @@ pub fn inferTypeArgs(
     // can be fed. Without the split, a callback's parameter type was
     // unioned into the same accumulator as the value the call actually
     // produces, and the union then satisfied neither.
+    //
+    // tsc asks that of the candidate LIST — `some(inference.contraCandidates,
+    // t => isTypeSubtypeOf(inferredCovariantType, t))` — not of the folded
+    // common subtype, so ONE parameter position that still accepts the
+    // covariant answer is enough. `useAnimatedReaction<P>(prepare: () => P,
+    // react: (prepared: P, previous: P | null) => void)` needs the difference:
+    // `prepared: P` contributes the contravariant candidate `string | null`
+    // and `previous: P | null` contributes `string` (union subtraction), whose
+    // common subtype is `string` — so testing the fold alone rejected the
+    // covariant `string | null` that `() => hoveredItemSV.get()` supplies and
+    // reported TS2322 on the FIRST argument. `contra_sup` is the union of the
+    // candidates, standing in for the `some` (see `Checker.contra_sup`).
     for (candidates, 0..) |*cd, i| {
         const ct = contra[i];
         if (ct == types.no_type) continue;
         if (cd.* != types.no_type and c.ts.kind(cd.*) != .never and
-            try c.covSubtypeOf(cd.*, ct)) continue;
+            (try c.covSubtypeOf(cd.*, ct) or
+                (contra_sup[i] != types.no_type and try c.covSubtypeOf(cd.*, contra_sup[i])))) continue;
         cd.* = ct;
     }
     // A provisional map over the raw candidates, so an inter-dependent
@@ -2700,6 +2793,16 @@ pub fn contraSlot(c: *Checker, candidates: []TypeId, i: usize) ?*TypeId {
     return &c.contra_cands[i];
 }
 
+/// Record `cand` in the union half of the contravariant candidate set (see
+/// `Checker.contra_sup`). Called wherever `contraSlot` is written.
+pub fn noteContraCandidate(c: *Checker, candidates: []TypeId, i: usize, cand: TypeId) Error!void {
+    if (c.contra_sup.len != candidates.len) return;
+    c.contra_sup[i] = if (c.contra_sup[i] == types.no_type)
+        cand
+    else
+        try c.ts.makeUnion(c.scratch(), &.{ c.contra_sup[i], cand });
+}
+
 /// The `topLevel` flag for type parameter `i`, when `candidates` is the
 /// accumulator the in-flight call registered (same identity rule as
 /// `contraSlot`).
@@ -2907,6 +3010,7 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                 // covariant set (tsc's `inferFromContravariantTypes`).
                 if (c.contraSlot(candidates, i)) |slot| {
                     slot.* = if (slot.* == types.no_type) cand else try c.combineContravariant(slot.*, cand);
+                    try c.noteContraCandidate(candidates, i, cand);
                     return;
                 }
                 // A DIRECT structural match outranks a reverse-mapped one
@@ -3662,6 +3766,22 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                 if (ncall == 0) return;
                 ra = s.objectCallSig(ra, ncall - 1);
             }
+            // An OVERLOAD SET argument — merged `declare function`
+            // declarations, which is what `console.error` becomes once
+            // @types/node's three signatures merge. Same rule as the callable
+            // object just above and for the same reason (`inferFromSignatures`
+            // pairs `sourceSignatures[sourceLen - len + i]` with
+            // `targetSignatures[targetLen - len + i]`, so a one-signature
+            // parameter takes the source's LAST overload) — but ztsc had no
+            // `.overloads` arm here at all and simply bailed. `Promise.catch`'s
+            // `TResult` was then left at its DEFAULT `never`, the parameter
+            // printed as `((reason: any) => PromiseLike<never>) | null |
+            // undefined`, and every `.catch(console.error)` was TS2345.
+            if (s.kind(ra) == .overloads) {
+                const ms = try c.memberList(ra);
+                if (ms.len == 0) return;
+                ra = ms[ms.len - 1];
+            }
             if (s.kind(ra) != .function) return;
             // A *generic function value* passed where a function is
             // expected (`.then(getProjectTransform)`): first instantiate
@@ -4210,6 +4330,7 @@ pub fn inferReverseMapped(c: *Checker, m: TypeId, arg: TypeId, tp_syms: []const 
     // first two arguments supply.
     if (c.contraSlot(candidates, idx)) |slot| {
         slot.* = if (slot.* == types.no_type) obj else try c.combineContravariant(slot.*, obj);
+        try c.noteContraCandidate(candidates, idx, obj);
         return;
     }
     // The reverse-mapped object is the authoritative inference for a

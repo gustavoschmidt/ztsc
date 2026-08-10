@@ -1956,6 +1956,14 @@ pub const Checker = struct {
     /// copy, a generic argument's own type params) simply do not participate.
     /// Saved and restored around a nested call's inference.
     contra_cands: []TypeId = &.{},
+    /// The UNION of every contravariant candidate recorded for each type
+    /// parameter, alongside `contra_cands`'s common-subtype fold. tsc keeps
+    /// the candidates as a LIST and `getInferredType` asks
+    /// `some(inference.contraCandidates, t => isTypeSubtypeOf(inferredCovariantType, t))`
+    /// — whether ANY ONE of them still accepts the covariant answer — which
+    /// the folded common subtype alone cannot answer. Same ownership rule as
+    /// `contra_cands`.
+    contra_sup: []TypeId = &.{},
     contra_owner: ?[*]TypeId = null,
     /// Parameter-position nesting depth inside `unify`: odd means the current
     /// inference position is contravariant. tsc flips the same bit in
@@ -2028,6 +2036,11 @@ pub const Checker = struct {
     /// assertion: object/array literals produce readonly, non-widened,
     /// literal-typed members (recursively). Cleared at function bodies.
     const_ctx: bool = false,
+    /// The template-expression node of the tagged template currently being
+    /// resolved. tsc's constant folding of a template expression tests
+    /// `node.parent.kind !== SyntaxKind.TaggedTemplateExpression`; ztsc has no
+    /// parent links, so `checkTaggedTemplate` marks its own template here.
+    tagged_tpl: Node = null_node,
     /// Type-parameter symbols of every `inferTypeArgs` call currently on the
     /// stack (innermost last). A symbol in here but *not* in the current call's
     /// `tp_syms` is an OUTER call's still-in-flight inference variable — tsc
@@ -3708,6 +3721,7 @@ pub const Checker = struct {
     pub const eachEnumMember = enums_zig.eachEnumMember;
     pub const enumHasMemberNamed = enums_zig.enumHasMemberNamed;
     pub const enumMemberValue = enums_zig.enumMemberValue;
+    pub const constTemplateAtom = enums_zig.constTemplateAtom;
     pub const enumMembersOf = enums_zig.enumMembersOf;
     pub const enumMemberTypeUnion = enums_zig.enumMemberTypeUnion;
     pub const enumMemberForValue = enums_zig.enumMemberForValue;
@@ -4122,6 +4136,7 @@ pub const Checker = struct {
     pub const combineCovariant = calls_zig.combineCovariant;
     pub const combineContravariant = calls_zig.combineContravariant;
     pub const contraSlot = calls_zig.contraSlot;
+    pub const noteContraCandidate = calls_zig.noteContraCandidate;
     pub const topSlot = calls_zig.topSlot;
     pub const revSlot = calls_zig.revSlot;
     pub const unify = calls_zig.unify;
