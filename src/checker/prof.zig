@@ -518,6 +518,83 @@
 //! checking-level half of the boundary is pinned by conformance
 //! instantiation/002 and the relation half by the immich app gate.
 //!
+//! ## social-app / zod: the unmatched property, and what is left (2026-08-10)
+//!
+//! social-app's `src/state/persisted/schema.ts:194` reports TS2589 on
+//! `schema.safeParse(objData)` where tsgo is clean, and the whole
+//! persisted-storage family (14 keys) descends from it: once `Schema =
+//! z.infer<typeof schema>` degrades to `any`, every `persisted.get(k)` yields
+//! the union of all value types. It reduces to **27 files and 0.19 s** — that
+//! schema, real zod 3.25.76, four stubbed imports — which is the cheapest
+//! instrument in this file for the shape.
+//!
+//! **The keystone is ONE member of `ZodObject` that nothing in the program
+//! calls.** `expandRef` of `ZodObject<40-property shape, …>` costs 511,511
+//! node visits against a 250,000 statement budget, and 782,273 of the run's
+//! member charge — 98% of that table — is `ZodObject.required`, whose return
+//! type is `ZodObject<{[k in keyof T]: deoptional<T[k]>}, …>`. Confirmed by
+//! neutralizing exactly that one return type in a private copy of zod's
+//! `.d.cts`: the repro goes from **2 diagnostics / 818,964 visits / 421 budget
+//! trips to 0 / 47,995 / 0**.
+//!
+//! tsc never computes it, on two independent lazinesses this checker does not
+//! have: `instantiateSignature` clones a signature with `resolvedReturnType`
+//! undefined, and `createInstantiatedSymbolTable` gives instantiated members
+//! `target` + `mapper` and no type. ztsc substitutes a member table eagerly
+//! and, in `instantiateId`'s `.function` arm, a signature's return type with
+//! it. That is the root cause and it is architectural — the two cheap
+//! approximations of it are the ones this file has already closed (per-member
+//! laziness at `propertyTypeOf`, twice) and the budget family.
+//!
+//! ### What DID land: tsc's `getUnmatchedProperty`
+//!
+//! `deoptional<T>` asks `T extends ZodOptional<infer U>` once per schema
+//! property. `ZodOptional` declares `unwrap()`, which no other Zod class has,
+//! so every one of those pairs is dead on a NAME — but `structuralAssignable`
+//! asked presence and type together, per property, in atom order, and zod's
+//! fluent API is built out of `ZodOptional<this>` / `ZodEffects<this, …>` /
+//! `ZodBranded<this, B>` returns, so each name ahead of `unwrap` recursed into
+//! a strictly larger instantiation of the same family. tsc's
+//! `propertiesRelatedTo` opens with `getUnmatchedProperty` over the whole
+//! target and fails on the name alone, before relating one member type.
+//!
+//! Hoisting that scan is a strict fast path — it returns false exactly where
+//! the loop already did — and on an isolated `deoptional<ZodString>` it is
+//! **4,463,273 -> 1,673 node visits**. On social-app it is diagnostically
+//! inert (125 keys, byte-identical at c1, 126 at c4) and RSS-neutral
+//! (498.0 -> 497.6 MB). Pinned by conformance
+//! `assignability/094_unmatched_property_decides_first`.
+//!
+//! It does NOT clear the keystone, and the reason is worth recording: the
+//! remaining `deoptional` arguments are the schema's own nested `z.object`s,
+//! and answering `ZodObject<Shape2, …> extends ZodOptional<infer U>` needs
+//! `ZodObject<Shape2, …>` RESOLVED before the name can be looked up — which
+//! pays for that table's `required`, which recurses. The lazy relation route
+//! (`lazyRefRelate`), which could answer the name off the memoized generic
+//! table for nothing, is never reached for these pairs at all: over the whole
+//! repro it is entered 2,791 times and `hit=0` (`same_symbol` 2,277,
+//! `tbl_already_expanded` 441). Making it `this`-aware — the step this file
+//! names for kysely — would not help either, because `this_types` declines
+//! **zero** pairs here.
+//!
+//! ### Two negatives, measured on social-app (do not re-run these)
+//!
+//! * **`unify`'s `.ref` arm resolving the argument BELOW the same-symbol
+//!   identity pairing** instead of above it. The resolution is pure waste on
+//!   that arm — tsc pairs two references to one generic by their type
+//!   arguments and never touches their members — and it does cut work
+//!   (isolated `deoptional<ZodString>` 4.46 M -> 3.45 M visits). social-app
+//!   nevertheless went **3.5 -> 7.2 s user and 498 -> 525 MB** for zero keys.
+//!   It is the prepayment mechanism this file records three times over, on a
+//!   fourth route: the eager resolution ran early with the budget low,
+//!   completed, and was memoized for every later reader.
+//! * **A growing-instantiation guard for INFERENCE** — `unify` carrying tsc's
+//!   `invokeOnce` `sourceStack`/`targetStack` with `isDeeplyNestedType` and
+//!   the both-sides-expanding rule, the twin of `relIdDeeplyNested`. It never
+//!   fires on this corpus (isolated repro moved by 2 visits of 4.46 M),
+//!   because the recursion is through type ARGUMENTS, whose frames do not
+//!   both denote generic instantiations, and it cost social-app 525 MB.
+//!
 //! ## The successor family, traced: a truncation is not an arity (2026-08-04)
 //!
 //! The 15 keys the budget refund left behind were read as a `Selection<…>` /
