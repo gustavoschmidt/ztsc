@@ -882,6 +882,7 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
     defer provided.deinit(c.scratch());
     var has_spread = false;
     var spread_opaque = false; // a spread whose props we could not enumerate
+    var spread_any = false; // saw a spread of `any` (tsc's `hasSpreadAnyType`)
     var spread_non_object = false; // saw a primitive spread (TS2698)
     var last_spread_ty: TypeId = types.no_type; // for the TS2559 message
 
@@ -892,6 +893,7 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
             if (sd.lhs == null_node) continue;
             const sty = try c.resolveStructural(try c.checkExprCached(sd.lhs, types.no_type));
             last_spread_ty = sty;
+            if (c.ts.kind(sty) == .any or c.ts.kind(sty) == .err) spread_any = true;
             switch (try c.jsxSpreadInfo(sty, &provided)) {
                 .non_object => {
                     spread_non_object = true;
@@ -945,6 +947,25 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
     }
 
     if (rt == types.no_type) return;
+
+    // tsc's `hasSpreadAnyType` (`createJsxAttributesTypeFromAttributesProperty`):
+    // a spread attribute whose type is `any` makes the WHOLE attributes object
+    // `any` — `return hasSpreadAnyType ? anyType : spread` — so every check
+    // below is answered by that `any`: no per-attribute assignability, no
+    // excess property, no missing required prop, no weak type. It is not the
+    // same as an un-enumerable spread (a union, a type parameter, an index
+    // signature), for which tsc builds a real spread type and keeps checking;
+    // only `any` erases the object.
+    //
+    // The attribute VALUE expressions were still checked in the walk above,
+    // which is where tsc checks them too (`checkJsxAttribute` runs for every
+    // attribute whether or not the flag is set).
+    //
+    // `web: (value: any) => any` — an identity-on-web / nothing-on-native
+    // helper — is the shape that makes this load-bearing: every
+    // `<Button {...web({dataSet: …})} href={href}>` in a react-native app
+    // spreads `any`, and tsc checks none of that element's attributes.
+    if (spread_any) return;
 
     // JSX children satisfy the ElementChildrenAttribute prop (usually
     // `children`) on component tags — count it as provided.
