@@ -2382,6 +2382,26 @@ pub fn covLiteralShape(c: *Checker, t: TypeId) bool {
         // time it becomes a candidate, and testing that instead made
         // `f({x: {a: 1}, y: {b: 2}})` keep only the leftmost candidate.
         .object => c.ts.objectIsLiteralOrigin(t),
+        // The ACCUMULATED union of literal candidates is still the literal
+        // candidate set. tsc does not fold literals pairwise at all —
+        // `unionObjectAndArrayLiteralCandidates` pulls every object/array
+        // literal out of the candidate list in one pass and replaces them
+        // with a single `getUnionType(…, Subtype)` — so a third literal joins
+        // the same union rather than meeting a union on the supertype rule.
+        // Without this the pairwise fold answered `covSubtypeOf(a, b) ? b : a`
+        // for `union-so-far` vs `third literal`, which are unrelated, and
+        // DROPPED the third: `sel({a: {x: 1}, b: {y: 2}, c: {z: 3}})` inferred
+        // `{x} | {y}` and reported `{z}` as unassignable. It also made the
+        // answer depend on the order the candidates arrived in — object member
+        // order is atom-derived and atoms are numbered in file order — so the
+        // same program disagreed with itself under `--file-order`
+        // (bench/order_sweep.sh). A set union has neither defect.
+        .union_type => {
+            const ms = c.ts.members(t);
+            if (ms.len == 0) return false;
+            for (ms) |m| if (!c.covLiteralShape(m)) return false;
+            return true;
+        },
         else => false,
     };
 }
