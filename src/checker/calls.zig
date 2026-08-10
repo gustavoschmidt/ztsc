@@ -661,6 +661,13 @@ pub fn resolveSignatureCall(
         return if (instance_ret != types.no_type) instance_ret else c.ts.fnReturn(inst);
     }
     // Overloads: first signature whose arity fits and whose args check.
+    //
+    // tsc's `resolveCall` keeps two rejection piles: `candidatesForArgumentError`
+    // (arity fit, arguments did not) and `candidatesForArgumentArityError`. Only
+    // the first pile decides how the failure is REPORTED, and how many are in it
+    // decides where the report lands — so count them here.
+    var arg_err_count: usize = 0;
+    var last_arg_err: TypeId = types.no_type;
     for (sigs) |sig| {
         // With explicit type arguments, only a signature with the matching
         // type-parameter count is a candidate (tsc). Skips e.g. the
@@ -724,6 +731,8 @@ pub fn resolveSignatureCall(
         c.inst_count = saved_inst_count;
         c.newBudgetWindow();
         c.inst_limit_tripped = saved_inst_trip;
+        arg_err_count += 1;
+        last_arg_err = sig;
     }
     // No candidate matched. tsc does not report at the callee: it re-checks
     // the LAST candidate with error reporting on and files the TS2769 where
@@ -732,10 +741,36 @@ pub fn resolveSignatureCall(
     // (`fetch(url, { body: aSharedArrayBuffer })` is TS2769 on `body`).
     // So run that check, take the span of the first diagnostic it filed
     // inside this call, withdraw them all, and anchor the TS2769 there.
+    //
+    // "The LAST candidate" is the last one that got as far as ARGUMENT
+    // checking, not the last declared signature: tsc re-reports out of
+    // `candidatesForArgumentError`, which a signature rejected on arity never
+    // joins. Taking `sigs[len - 1]` blindly re-checked, e.g., `useState`'s
+    // zero-parameter overload against a one-argument call, whose only
+    // complaint is an arity error nowhere near the argument at fault.
+    //
+    // How MANY candidates reached argument checking decides whether there is a
+    // TS2769 at all. With exactly ONE there is no overload set left to talk
+    // about, so tsc files that candidate's own applicability diagnostics
+    // verbatim (TS2345 / TS2353 / …) at their own spans and no TS2769 —
+    // `useState<S>(x)` beside `useState<S = undefined>()` reports the plain
+    // argument error. With two or more it heads them with "No overload matches
+    // this call. The last overload gave the following error." and files the
+    // result at that last candidate's own anchor, whatever the candidate count
+    // (verified against tsgo 7.0.2 at two, three and four candidates).
     const call_span = c.nodeSpan(node);
     const saved = c.diags.items.len;
-    const inst_last = try c.instantiateSigForCall(sigs[sigs.len - 1], explicit_targs, arg_nodes, node, ret_ctx);
+    const report_sig = if (last_arg_err != types.no_type) last_arg_err else sigs[sigs.len - 1];
+    const inst_last = try c.instantiateSigForCall(report_sig, explicit_targs, arg_nodes, node, ret_ctx);
     try c.checkCallArguments(node, inst_last, arg_nodes, true);
+    if (arg_err_count == 1) {
+        // Keep the candidate's own diagnostics; tsc files no TS2769 here.
+        const inst_one = try c.instantiateSigForCall(sigs[0], explicit_targs, arg_nodes, node, ret_ctx);
+        for (arg_nodes) |an| {
+            if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
+        }
+        return if (instance_ret != types.no_type) instance_ret else c.ts.fnReturn(inst_one);
+    }
     var anchor = c.nodeSpan(c.callShape(node).callee);
     for (c.diags.items[saved..]) |d| {
         if (d.file != c.cur_file) continue;
@@ -2951,6 +2986,28 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                         .string, .string_literal, .template_literal_type, .string_mapping => return,
                         else => {},
                     }
+                    // tsc's `inferFromIndexTypes`, in the direction the
+                    // object-param arm below already covers the reverse of.
+                    // `U[]` is a reference to `Array<U>`, whose apparent
+                    // members include `[n: number]: U`; a source object that
+                    // declares a number index (`ConcatArray<T>`,
+                    // `ArrayLike<T>`, `readonly [n: number]: T` interfaces)
+                    // pairs with it and fixes `U` outright. This is the only
+                    // route for a source that is array-LIKE without being
+                    // iterable — `ConcatArray<T>` has no `[Symbol.iterator]`,
+                    // so the iteration probe below sees nothing.
+                    //
+                    // It matters most for CONTEXTUAL-RETURN inference: the
+                    // contextual type of `xs.concat(ys.map(f))`'s argument is
+                    // `ConcatArray<Slice>`, and without this `U` in `map`'s
+                    // `U[]` return stayed unbound, so the arrow's body got no
+                    // contextual type, its object literal widened
+                    // (`type: string` instead of `type: "b"`), and every
+                    // `concat` overload rejected it — TS2769.
+                    if (s.kind(ra) == .object and s.objectNumberIndex(ra) != 0) {
+                        try c.unify(s.arrayElem(param), s.objectNumberIndex(ra), tp_syms, candidates, depth + 1);
+                        return;
+                    }
                     if (try c.iterationElementType(ra)) |elem| {
                         try c.unify(s.arrayElem(param), elem, tp_syms, candidates, depth + 1);
                     }
@@ -4511,8 +4568,20 @@ pub fn argumentsMatch(c: *Checker, sig: TypeId, arg_nodes: []const Node) Error!b
         // parameter is a template-literal type (`watch(`contacts.${index}.type`)`
         // against `N extends FieldPath<T>`) is spuriously rejected — again, the
         // single-signature path already types it by `pt`.
+        // A CONDITIONAL expression forwards the contextual type to both of
+        // its branches (tsc's `getContextualType` → `ContextFlags` pass-
+        // through for `ConditionalExpression`), so it is context-typed for
+        // exactly the reason an object literal is: probed context-free, the
+        // literal in a branch widens its discriminant and every candidate is
+        // rejected. `useState<MessageEmbedState | undefined>(p ? {type:
+        // 'post', uri: p} : undefined)` came out `{ type: string; uri: string
+        // } | undefined` and fell out TS2769 — while the *single*-signature
+        // form of the same call, which goes straight to `checkCallArguments`
+        // with `pt`, was accepted. tsc has no allowlist here at all:
+        // `checkApplicableSignature` runs `checkExpressionWithContextualType`
+        // on every argument.
         const ctx_typed = switch (tag) {
-            .arrow_fn, .function_expr, .array_literal, .object_literal, .template_expr, .call_expr, .call_expr_targs, .optional_call, .new_expr, .new_expr_bare, .new_expr_targs => true,
+            .arrow_fn, .function_expr, .array_literal, .object_literal, .template_expr, .cond_expr, .call_expr, .call_expr_targs, .optional_call, .new_expr, .new_expr_bare, .new_expr_targs => true,
             else => false,
         };
         // A function argument is probed on TRIAL. Its parameters take their
