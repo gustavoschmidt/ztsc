@@ -1132,35 +1132,18 @@ pub fn partialParamCtx(c: *Checker, pt0: TypeId, partial: []const TpMap) Error!T
 /// both literals in tsc, while a context-free check widens each property to
 /// `string` and infers `T = string`. Without a contextual return there is no
 /// seed and the widening is correct (tsc widens there too).
-fn seedKeepsPropLiteral(c: *Checker, pt: TypeId, tp_syms: []const u32, seed: []const TypeId, depth: u8) Error!bool {
-    const r = try c.resolveStructural(pt);
-    switch (c.ts.kind(r)) {
-        .intersection => {
-            if (depth >= 2) return false;
-            for (try c.memberList(r)) |m| {
-                if (m == r) continue;
-                if (try seedKeepsPropLiteral(c, m, tp_syms, seed, depth + 1)) return true;
-            }
-            return false;
-        },
-        .array => {
-            if (depth >= 2) return false;
-            return seedKeepsPropLiteral(c, c.ts.arrayElem(r), tp_syms, seed, depth + 1);
-        },
-        .object => {},
-        else => return false,
-    }
-    for (0..c.ts.objectPropCount(r)) |i| {
-        const p = c.ts.objectProp(r, @intCast(i));
-        const pr = try c.resolveStructural(p.ty);
-        if (c.ts.kind(pr) != .type_param) continue;
-        const sym = c.ts.typeParamSymbol(pr);
-        for (tp_syms, 0..) |s, j| {
-            if (s != sym or seed[j] == types.no_type) continue;
-            if (try c.isPrimitiveLiteralish(seed[j])) return true;
-        }
-    }
-    return false;
+///
+/// The test is simply whether the seed RESOLVES anything in the parameter:
+/// `instantiateInstantiableTypes(contextualType, returnMapper)` is what tsc
+/// hands down, and a parameter the mapper does not touch is handed down
+/// unchanged. Nothing about the seed's own shape enters it — a seed that is a
+/// literal domain keeps a fresh property literal, and a seed that is an
+/// ordinary object (`style={platform({web: {minHeight: '100%'}, default: …})}`
+/// under `StyleProp<ViewStyle>`) contextually types the property's own nested
+/// literal, which is where its `` `${number}%` `` member keeps `'100%'` from
+/// widening to `string`.
+fn seedResolvesParam(c: *Checker, pt: TypeId, tp_syms: []const u32, seed: []const TypeId) Error!bool {
+    return (try c.instantiateKnownParams(pt, tp_syms, seed, seed)) != pt;
 }
 
 /// tsc's `ObjectFlags.NonInferrableType`, recomputed on demand: does `t`
@@ -1617,7 +1600,7 @@ pub fn inferTypeArgs(
             // object-literal arguments (callback bags like `openDB({ upgrade
             // })`) keep their context-free check.
             .object_literal => if ((try c.paramWantsLiteralCtx(pt)) or
-                (try seedKeepsPropLiteral(c, pt, tp_syms, ret_seed, 0))) pt else types.no_type,
+                (try seedResolvesParam(c, pt, tp_syms, ret_seed))) pt else types.no_type,
             else => types.no_type,
         };
         // Fresh object literal into a bare type-param parameter (`truncate<T
@@ -2250,6 +2233,15 @@ pub fn inferTypeArgs(
                 // already yields the regular base primitive.
                 out[i] = try c.ts.regularLiteral(out[i]);
             }
+            // `getCovariantInference` ends with `return getWidenedType(
+            // unwidenedType)` UNCONDITIONALLY — the three-way choice above is
+            // only about the CANDIDATES' literal types. That final widening is
+            // where an object-literal candidate union is normalized against its
+            // siblings (`{a: 1} | {b: 2}` ⇒ `{a: number; b?: undefined} |
+            // {a?: undefined; b: number}`) and where the literal origin is
+            // dropped, so it must run even when the literal-widening arm did
+            // not (a type parameter at the top level of the return type).
+            out[i] = try c.widenObjectLiterals(out[i]);
             // Candidate violating the constraint falls back to the
             // constraint (tsc then re-checks args against it). But skip
             // the fallback when the constraint — after substituting the
@@ -2336,7 +2328,12 @@ pub fn clampToConstraint(c: *Checker, cand: TypeId, constraint: TypeId, fell_bac
 pub fn covLiteralShape(c: *Checker, t: TypeId) bool {
     return switch (c.ts.kind(t)) {
         .array, .tuple => true,
-        .object => c.ts.objectIsFresh(t),
+        // tsc's `isObjectOrArrayLiteralType` tests `ObjectFlags.ObjectLiteral`,
+        // which is the literal's ORIGIN, not its freshness: a literal written
+        // as the property of another literal has already lost freshness by the
+        // time it becomes a candidate, and testing that instead made
+        // `f({x: {a: 1}, y: {b: 2}})` keep only the leftmost candidate.
+        .object => c.ts.objectIsLiteralOrigin(t),
         else => false,
     };
 }

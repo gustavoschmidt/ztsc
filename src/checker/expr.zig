@@ -2651,7 +2651,7 @@ pub fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Sub
                         var vt = try c.checkExprCached(pd.rhs, pctx);
                         if (c.const_ctx) {
                             vt = try c.ts.regularLiteral(vt);
-                        } else if (!try c.keepLiteral(vt, pctx)) vt = try c.widenLiteral(vt);
+                        } else if (!try c.keepLiteral(vt, pctx)) vt = try c.widenPropValue(vt);
                         try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = vt });
                         continue;
                     }
@@ -2672,7 +2672,7 @@ pub fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Sub
                         var vt = try c.checkExprCached(pd.rhs, pctx);
                         if (c.const_ctx) {
                             vt = try c.ts.regularLiteral(vt);
-                        } else if (!try c.keepLiteral(vt, pctx)) vt = try c.widenLiteral(vt);
+                        } else if (!try c.keepLiteral(vt, pctx)) vt = try c.widenPropValue(vt);
                         try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = vt });
                         continue;
                     }
@@ -2693,7 +2693,7 @@ pub fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Sub
                     var vt = try c.checkExprCached(pd.rhs, pctx);
                     if (c.const_ctx) {
                         vt = try c.ts.regularLiteral(vt);
-                    } else if (!try c.keepLiteral(vt, pctx)) vt = try c.widenLiteral(vt);
+                    } else if (!try c.keepLiteral(vt, pctx)) vt = try c.widenPropValue(vt);
                     switch (key_kind) {
                         .string_literal => {
                             try upsertProp(c.scratch(), &props, &prop_index, .{ .name = c.ts.dataA(rk), .ty = vt });
@@ -2709,7 +2709,7 @@ pub fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Sub
                 var vt = try c.checkExprCached(pd.rhs, pctx);
                 if (c.const_ctx) {
                     vt = try c.ts.regularLiteral(vt);
-                } else if (!try c.keepLiteral(vt, pctx)) vt = try c.widenLiteral(vt);
+                } else if (!try c.keepLiteral(vt, pctx)) vt = try c.widenPropValue(vt);
                 try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = vt });
             },
             .object_shorthand => {
@@ -2718,7 +2718,7 @@ pub fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Sub
                 const pctx = try c.ctxPropType(rctx, ctx, key);
                 if (c.const_ctx) {
                     vt = try c.ts.regularLiteral(vt);
-                } else if (!try c.keepLiteral(vt, pctx)) vt = try c.widenLiteral(vt);
+                } else if (!try c.keepLiteral(vt, pctx)) vt = try c.widenPropValue(vt);
                 if (pd.rhs != 0) _ = try c.checkExprCached(pd.rhs, types.no_type);
                 try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = vt });
             },
@@ -2848,7 +2848,7 @@ pub fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Sub
     }
     const sidx = if (str_index_vals.items.len > 0) try c.ts.makeUnion(c.scratch(), str_index_vals.items) else 0;
     const nidx = if (num_index_vals.items.len > 0) try c.ts.makeUnion(c.scratch(), num_index_vals.items) else 0;
-    const obj = try c.ts.makeObject(props.items, sidx, nidx, types.obj_flag_fresh);
+    const obj = try c.ts.makeObject(props.items, sidx, nidx, types.obj_flag_fresh | types.obj_flag_literal_origin);
     // A type-parameter spread (`{ ...data, extra }`, `data: T`) yields
     // `T & { extra }` so the literal stays assignable to `T`.
     if (generic_spreads.items.len > 0) {

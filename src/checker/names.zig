@@ -328,10 +328,33 @@ pub fn literalBaseOf(c: *Checker, t: TypeId) Error!TypeId {
     return c.ts.literalBase(t);
 }
 
-/// Fresh literal -> base primitive; unions widen fresh members; fresh
-/// object literals lose freshness (their props were already widened at
-/// creation unless contextually kept).
+/// Fresh literal -> base primitive; unions widen fresh members; object
+/// literals are WIDENED (`widenObjectLiterals`), losing both their freshness
+/// and their literal origin — this is tsc's mutable-location widening
+/// (`getWidenedType`), so it belongs at a variable initializer, an inferred
+/// return, or an inference result, not at a property of a literal still being
+/// built (that is `widenPropValue`).
 pub fn widenLiteral(c: *Checker, t: TypeId) Error!TypeId {
+    return widenLiteralInner(c, t, true);
+}
+
+/// Widening for a value written *inside* another literal — an object-literal
+/// property or an array-literal element. tsc reaches these through
+/// `checkExpressionForMutableLocation`, whose
+/// `getWidenedLiteralLikeTypeForContextualType` widens a fresh PRIMITIVE
+/// literal and calls `getRegularTypeOfLiteralType`, neither of which touches
+/// an object type's flags: a nested object literal keeps `ObjectLiteral` (and
+/// in tsc its freshness too, which is how nested excess-property checking
+/// works — ztsc drives that from the syntax instead, so freshness is still
+/// dropped here).
+///
+/// Keeping the ORIGIN is what makes `f({x: {a: 1}, y: {b: 2}})` infer the
+/// object-literal candidate UNION rather than the leftmost candidate alone.
+pub fn widenPropValue(c: *Checker, t: TypeId) Error!TypeId {
+    return widenLiteralInner(c, t, false);
+}
+
+fn widenLiteralInner(c: *Checker, t: TypeId, widen_objects: bool) Error!TypeId {
     if (c.ts.isFreshLiteral(t)) {
         const base = try c.literalBaseOf(t);
         return if (base != types.no_type) base else t;
@@ -340,18 +363,43 @@ pub fn widenLiteral(c: *Checker, t: TypeId) Error!TypeId {
         .union_type => {
             var any_fresh = false;
             for (try c.memberList(t)) |m| {
-                if (c.ts.isFreshLiteral(m) or c.ts.objectIsFresh(m)) any_fresh = true;
+                if (c.ts.isFreshLiteral(m) or c.ts.objectIsLiteralOrigin(m)) any_fresh = true;
             }
             if (!any_fresh) return t;
-            // Sibling normalization runs while the members are still fresh
-            // (see `normalizeFreshObjectSiblings`), before they de-freshen.
+            // Sibling normalization runs before the members are widened away
+            // (see `normalizeFreshObjectSiblings`).
+            const norm = if (widen_objects) try c.normalizeFreshObjectSiblings(t) else t;
+            var list: std.ArrayList(TypeId) = .empty;
+            defer list.deinit(c.scratch());
+            for (try c.memberList(norm)) |m| try list.append(c.scratch(), try widenLiteralInner(c, m, widen_objects));
+            return c.ts.makeUnion(c.scratch(), list.items);
+        },
+        .object => return if (widen_objects) c.ts.widenedObject(t) else c.ts.regular(t),
+        else => return t,
+    }
+}
+
+/// tsc's `getWidenedType` restricted to its object-literal half: the union of
+/// inference candidates is widened unconditionally at the end of
+/// `getCovariantInference`, even when the literal-widening arm above it was
+/// skipped because the type parameter occurs at the top level of the return
+/// type. That widening is what normalizes the object-literal siblings against
+/// each other and then strips their literal origin.
+pub fn widenObjectLiterals(c: *Checker, t: TypeId) Error!TypeId {
+    switch (c.ts.kind(t)) {
+        .union_type => {
+            var any = false;
+            for (try c.memberList(t)) |m| {
+                if (c.ts.objectIsLiteralOrigin(m)) any = true;
+            }
+            if (!any) return t;
             const norm = try c.normalizeFreshObjectSiblings(t);
             var list: std.ArrayList(TypeId) = .empty;
             defer list.deinit(c.scratch());
-            for (try c.memberList(norm)) |m| try list.append(c.scratch(), try c.widenLiteral(m));
+            for (try c.memberList(norm)) |m| try list.append(c.scratch(), try c.ts.widenedObject(m));
             return c.ts.makeUnion(c.scratch(), list.items);
         },
-        .object => return c.ts.regular(t),
+        .object => return c.ts.widenedObject(t),
         else => return t,
     }
 }
@@ -368,27 +416,30 @@ pub fn widenLiteral(c: *Checker, t: TypeId) Error!TypeId {
 /// legal: both constituents carry `file`, one of them only as `undefined`.
 /// A *declared* union (`declare const r: {file: string} | {errorMessage:
 /// number}`) is not normalized and `r.file` really is an error — which is
-/// exactly why this keys off freshness and runs before the members
-/// de-freshen.
+/// exactly why this keys off the literal ORIGIN (tsc's
+/// `ObjectFlags.ObjectLiteral`, the flag `getWidenedTypeWithContext` tests)
+/// and runs before the members are widened. Freshness is the wrong key: it is
+/// gone by the time an object literal written as a property of another
+/// literal reaches an inference candidate union.
 ///
-/// Members that are not fresh objects are left alone and do not contribute
-/// names, so a mixed `cond ? { a: 1 } : someDeclaredThing` normalizes
-/// nothing. Returns `u` unchanged unless at least two fresh object members
-/// actually differ in their key sets.
+/// Members that were not written as object literals are left alone and do not
+/// contribute names, so a mixed `cond ? { a: 1 } : someDeclaredThing`
+/// normalizes nothing. Returns `u` unchanged unless at least two literal
+/// members actually differ in their key sets.
 pub fn normalizeFreshObjectSiblings(c: *Checker, u: TypeId) Error!TypeId {
     const s = &c.ts;
     if (s.kind(u) != .union_type) return u;
     const members = try c.memberList(u);
     var fresh_count: u32 = 0;
     for (members) |m| {
-        if (s.objectIsFresh(m)) fresh_count += 1;
+        if (s.objectIsLiteralOrigin(m)) fresh_count += 1;
     }
     if (fresh_count < 2) return u;
     // The union of every fresh member's property names.
     var names: std.ArrayList(Atom) = .empty;
     defer names.deinit(c.scratch());
     for (members) |m| {
-        if (!s.objectIsFresh(m)) continue;
+        if (!s.objectIsLiteralOrigin(m)) continue;
         for (0..s.objectPropCount(m)) |i| {
             const p = s.objectProp(m, @intCast(i));
             if (indexOfAtom(names.items, p.name) == null) try names.append(c.scratch(), p.name);
@@ -398,7 +449,7 @@ pub fn normalizeFreshObjectSiblings(c: *Checker, u: TypeId) Error!TypeId {
     defer out.deinit(c.scratch());
     var changed = false;
     for (members) |m| {
-        if (!s.objectIsFresh(m) or s.objectPropCount(m) == names.items.len) {
+        if (!s.objectIsLiteralOrigin(m) or s.objectPropCount(m) == names.items.len) {
             try out.append(c.scratch(), m);
             continue;
         }
@@ -463,13 +514,13 @@ pub fn finalizeInferredReturn(c: *Checker, u: TypeId) Error!TypeId {
     // fresh object members against each other, then de-freshen them
     // (`widenReturnMember` deliberately left them fresh for this).
     const norm = try c.normalizeFreshObjectSiblings(u);
-    if (c.ts.kind(norm) == .object) return c.ts.regular(norm);
+    if (c.ts.kind(norm) == .object) return c.ts.widenedObject(norm);
     if (c.ts.kind(norm) != .union_type) return norm;
     var list: std.ArrayList(TypeId) = .empty;
     defer list.deinit(c.scratch());
     var changed = false;
     for (try c.memberList(norm)) |m| {
-        const r = if (c.ts.kind(m) == .object) try c.ts.regular(m) else m;
+        const r = if (c.ts.kind(m) == .object) try c.ts.widenedObject(m) else m;
         if (r != m) changed = true;
         try list.append(c.scratch(), r);
     }
@@ -491,7 +542,7 @@ pub fn widenToContext(c: *Checker, t: TypeId, ret_ctx: TypeId) Error!TypeId {
         .union_type => {
             var any_fresh = false;
             for (try c.memberList(t)) |m| {
-                if (c.ts.isFreshLiteral(m) or c.ts.objectIsFresh(m)) any_fresh = true;
+                if (c.ts.isFreshLiteral(m) or c.ts.objectIsLiteralOrigin(m)) any_fresh = true;
             }
             if (!any_fresh) return t;
             var list: std.ArrayList(TypeId) = .empty;
