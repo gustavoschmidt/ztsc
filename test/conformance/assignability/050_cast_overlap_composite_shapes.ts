@@ -62,6 +62,23 @@ function mappedConstituent<T>(v: Renamed<T> & {g: () => Comp<Small>}): Renamed<T
   return v as Renamed<T> & {g: () => Comp<Big>}
 }
 
+// POSITIVE: a CALLABLE OBJECT against a bare function target, reached through
+// its call signature — `memo(forwardRef(f)) as <T>(props: …) => ReactElement`
+// casts a `NamedExoticComponent` (a call signature plus `$$typeof`) to a
+// function type. Only this direction can succeed: the reverse fails on the
+// `$$typeof` a function does not have.
+interface Exotic<P, R> {
+  (props: P): R
+  readonly $$typeof: string
+}
+declare const ex: Exotic<{a: string}, Comp<Small>>
+const c7 = ex as (props: {a: string}) => Comp<Big>
+
+// NEGATIVE: the same callable object whose call signature does not overlap
+// the function target at all. tsc: TS2352.
+declare const ex2: Exotic<{a: string}, {a: string}>
+const b0 = ex2 as (props: {a: string}) => number
+
 // NEGATIVE: a function return that genuinely does not overlap. tsc: TS2352.
 declare const n1: {g: () => {a: string}}
 const b1 = n1 as {g: () => number}

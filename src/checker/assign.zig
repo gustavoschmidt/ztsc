@@ -331,7 +331,13 @@ pub fn lenientOverlap(c: *Checker, s0: TypeId, t0: TypeId, depth: u32) Error!boo
     // navigator types differ only in their ParamList, and the constituent
     // that overlaps — `FunctionComponent`, contravariant in its props — sits
     // under `getComponent`'s return type.
-    if (sk == .function and tk == .function) return c.sigOverlap(s, t, depth);
+    // A CALLABLE OBJECT reaches a function target through its call
+    // signatures, exactly as `isAssignable`'s own `.function` target arm
+    // does — `memo(forwardRef(ListImpl)) as <ItemT>(props: …) => ReactElement`
+    // casts a `NamedExoticComponent` (a call signature plus `$$typeof`) to a
+    // bare generic function type, and only this direction can succeed: the
+    // reverse fails on the `$$typeof` the function does not have.
+    if (tk == .function) return c.sigListOverlap(s, t, false, depth);
     if (tk == .object) {
         for (0..c.ts.objectPropCount(t)) |i| {
             const tp = c.ts.objectProp(t, @intCast(i));
