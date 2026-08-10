@@ -6,16 +6,16 @@ not retype from a terminal. Re-run the script rather than editing a cell.
 
 | provenance | |
 |---|---|
-| measured | 2026-08-09T05:37:57Z |
-| ztsc commit | `d09472f` (working tree: clean) |
-| ztsc binary | `/var/folders/_p/yggnz0zd6fd35b9dw9p92ylc0000gn/T//ztsc-matrix-32790/out/bench/ztsc` (ReleaseFast, built by this run into a private prefix) |
+| measured | 2026-08-10T18:02:39Z |
+| ztsc commit | `1c0ec4d` (working tree: clean) |
+| ztsc binary | `/var/folders/_p/yggnz0zd6fd35b9dw9p92ylc0000gn/T//ztsc-matrix-54165/out/bench/ztsc` (ReleaseFast, built by this run into a private prefix) |
 | tsgo baseline | Version 7.0.2 -- `bench/baselines/tsgo/node_modules/@typescript/typescript-darwin-arm64/lib/tsc` |
 | host | Darwin 25.6.0 arm64 / Apple M4 / 10 cores |
 | runs (median of) | 9 per package leg, 5 per application leg, interleaved round-robin, one untimed warm-up per tool per target |
 | checker sweep | ztsc `--checkers=1,2,4,8`; tsgo has no checker knob and runs at its own default |
-| timer | `bench/timeit.py` (`perf_counter` + `getrusage(RUSAGE_CHILDREN)`); spawn floor 2.06 ms, paid by both legs |
-| targets | 10 measured, 3 skipped (outline, social-app, vscode) |
-| total run time | 2m 47.0s (whole script, ReleaseFast build included) |
+| timer | `bench/timeit.py` (`perf_counter` + `getrusage(RUSAGE_CHILDREN)`); spawn floor 1.65 ms, paid by both legs |
+| targets | 12 measured, 1 skipped (vscode) |
+| total run time | 70m 28.9s (whole script, ReleaseFast build included) |
 
 Cells read `value (% of tsgo)`. A `!` marks a cell over one of the project
 bars -- wall <= 50% of tsgo, peak RSS <= 20% of tsgo, the "at least 2x faster
@@ -34,27 +34,27 @@ The eight `bench/corpus/real` packages, each run as `-p <dir>` against its own
 
 | package | c1 | c2 | c4 | c8 | tsgo | bar (50%) |
 |---|---:|---:|---:|---:|---:|---:|
-| @types/node 22.7.4 | 25.9 (41%) | 19.2 (30%) | 16.6 (26%) | 14.9 (23%) | 63.5 | 31.8 |
-| @types/react 18.3.11 | 43.7 (13%) | 35.7 (11%) | 31.2 (9%) | 27.0 (8%) | 338.8 | 169.4 |
-| drizzle-orm 0.33.0 | 251.4 (72%) ! | 227.0 (65%) ! | 144.9 (42%) | 221.5 (63%) ! | 348.9 | 174.4 |
-| hono 4.6.3 | 46.8 (20%) | 36.3 (15%) | 31.5 (13%) | 29.6 (13%) | 234.5 | 117.2 |
-| @sinclair/typebox 0.33.12 | 23.6 (38%) | 21.7 (35%) | 19.2 (31%) | 19.3 (31%) | 62.0 | 31.0 |
-| ajv 8.17.1 | 13.9 (48%) | 11.2 (39%) | 10.6 (37%) | 10.1 (35%) | 28.7 | 14.3 |
-| zod 3.23.8 | 44.2 (21%) | 35.8 (17%) | 27.9 (13%) | 29.3 (14%) | 208.6 | 104.3 |
-| chalk 5.3.0 | 9.1 (39%) | 7.8 (34%) | 7.2 (31%) | 7.3 (31%) | 23.2 | 11.6 |
+| @types/node 22.7.4 | 19.5 (39%) | 15.5 (31%) | 14.3 (29%) | 12.7 (25%) | 50.0 | 25.0 |
+| @types/react 18.3.11 | 35.0 (13%) | 28.1 (10%) | 24.6 (9%) | 21.6 (8%) | 271.0 | 135.5 |
+| drizzle-orm 0.33.0 | 206.2 (71%) ! | 190.0 (66%) ! | 129.3 (45%) | 183.9 (64%) ! | 288.9 | 144.4 |
+| hono 4.6.3 | 39.0 (19%) | 30.4 (15%) | 27.0 (14%) | 25.4 (13%) | 200.0 | 100.0 |
+| @sinclair/typebox 0.33.12 | 24.9 (45%) | 22.4 (41%) | 18.7 (34%) | 20.5 (37%) | 55.3 | 27.6 |
+| ajv 8.17.1 | 11.9 (46%) | 9.9 (38%) | 9.2 (36%) | 8.9 (34%) | 25.9 | 12.9 |
+| zod 3.23.8 | 37.1 (20%) | 31.0 (17%) | 24.9 (14%) | 25.5 (14%) | 182.9 | 91.4 |
+| chalk 5.3.0 | 8.2 (41%) | 6.9 (35%) | 6.4 (32%) | 6.5 (33%) | 19.9 | 9.9 |
 
 ### Peak RSS -- MB, median of 9
 
 | package | c1 | c2 | c4 | c8 | tsgo | bar (20%) |
 |---|---:|---:|---:|---:|---:|---:|
-| @types/node 22.7.4 | 16.5 (16%) | 17.7 (17%) | 18.8 (18%) | 21.4 (21%) ! | 101.6 | 20.3 |
-| @types/react 18.3.11 | 21.0 (11%) | 20.1 (11%) | 22.8 (12%) | 26.2 (14%) | 187.6 | 37.5 |
-| drizzle-orm 0.33.0 | 34.6 (13%) | 33.2 (12%) | 33.3 (12%) | 35.6 (13%) | 275.0 | 55.0 |
-| hono 4.6.3 | 22.1 (14%) | 23.2 (15%) | 25.3 (16%) | 27.5 (18%) | 155.5 | 31.1 |
-| @sinclair/typebox 0.33.12 | 13.2 (17%) | 15.8 (20%) ! | 15.2 (19%) | 17.3 (22%) ! | 78.2 | 15.6 |
-| ajv 8.17.1 | 9.5 (19%) | 10.0 (20%) ! | 11.0 (22%) ! | 12.8 (26%) ! | 49.8 | 9.9 |
-| zod 3.23.8 | 20.8 (15%) | 20.4 (15%) | 22.9 (17%) | 24.9 (18%) | 137.9 | 27.6 |
-| chalk 5.3.0 | 7.7 (18%) | 8.1 (19%) | 9.1 (21%) ! | 9.1 (21%) ! | 43.5 | 8.7 |
+| @types/node 22.7.4 | 16.7 (17%) | 17.8 (18%) | 18.6 (18%) | 20.7 (20%) ! | 101.2 | 20.2 |
+| @types/react 18.3.11 | 21.3 (12%) | 20.5 (11%) | 22.6 (13%) | 25.3 (14%) | 179.6 | 35.9 |
+| drizzle-orm 0.33.0 | 34.8 (13%) | 33.4 (12%) | 33.2 (12%) | 35.5 (13%) | 276.2 | 55.2 |
+| hono 4.6.3 | 22.2 (15%) | 23.4 (15%) | 25.1 (16%) | 27.0 (18%) | 152.5 | 30.5 |
+| @sinclair/typebox 0.33.12 | 13.6 (17%) | 15.9 (20%) ! | 16.2 (21%) ! | 16.6 (21%) ! | 78.3 | 15.7 |
+| ajv 8.17.1 | 9.7 (20%) | 10.1 (20%) ! | 11.2 (22%) ! | 12.7 (26%) ! | 49.8 | 9.9 |
+| zod 3.23.8 | 21.0 (16%) | 20.5 (15%) | 22.9 (17%) | 24.5 (18%) | 135.6 | 27.1 |
+| chalk 5.3.0 | 7.8 (18%) | 8.2 (19%) | 9.1 (21%) ! | 9.2 (21%) ! | 43.4 | 8.7 |
 
 ## Applications
 
@@ -76,14 +76,18 @@ The **parity** column is what a row may be used for:
 
 | application | parity | c1 | c2 | c4 | c8 | tsgo | bar (50%) |
 |---|---|---:|---:|---:|---:|---:|---:|
-| excalidraw | gated | 0.560 (69%) ! | 0.347 (43%) | 0.273 (34%) | 0.238 (29%) | 0.811 | 0.406 |
-| immich | gated | 1.839 (47%) | 1.603 (41%) | 1.847 (47%) | 2.092 (54%) ! | 3.897 | 1.948 |
+| excalidraw | gated | 0.494 (67%) ! | 0.311 (42%) | 0.251 (34%) | 0.220 (30%) | 0.737 | 0.368 |
+| immich | gated | 1.715 (48%) | 1.498 (42%) | 1.754 (49%) | 1.983 (55%) ! | 3.599 | 1.800 |
+| outline | staged | 224.134 (3162%) ! | 195.705 (2761%) ! | 148.017 (2088%) ! | 85.625 (1208%) ! | 7.089 | 3.544 |
+| social-app | staged | 3.554 (129%) ! | 3.494 (127%) ! | 4.482 (163%) ! | 5.565 (202%) ! | 2.752 | 1.376 |
 
 ### Peak RSS -- MB, median of 5
 
 | application | parity | c1 | c2 | c4 | c8 | tsgo | bar (20%) |
 |---|---|---:|---:|---:|---:|---:|---:|
-| excalidraw | gated | 98.3 (15%) | 107.6 (17%) | 111.1 (18%) | 131.9 (21%) ! | 634.3 | 126.9 |
-| immich | gated | 260.5 (12%) | 379.4 (17%) | 520.6 (24%) ! | 843.4 (38%) ! | 2204.1 | 440.8 |
+| excalidraw | gated | 98.4 (15%) | 108.1 (17%) | 111.5 (17%) | 133.3 (21%) ! | 640.0 | 128.0 |
+| immich | gated | 261.0 (12%) | 362.5 (17%) | 524.9 (24%) ! | 839.5 (38%) ! | 2192.0 | 438.4 |
+| outline | staged | 8524.4 (293%) ! | 8392.4 (289%) ! | 7414.0 (255%) ! | 5534.4 (190%) ! | 2906.2 | 581.2 |
+| social-app | staged | 470.0 (26%) ! | 810.2 (46%) ! | 1291.2 (73%) ! | 2274.7 (128%) ! | 1775.5 | 355.1 |
 
 Machine-readable sibling: `bench/results.tsv`, one row per target x leg.
