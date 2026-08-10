@@ -4619,7 +4619,19 @@ pub fn checkSatisfies(c: *Checker, src_t: TypeId, target: TypeId, expr_node: Nod
 /// least one narrower diagnostic was emitted.
 pub fn elaborateLiteralError(c: *Checker, expr_node0: Node, src_t: TypeId, target: TypeId) Error!bool {
     var expr_node = expr_node0;
-    while (c.nodeTag(expr_node) == .paren_expr) expr_node = c.tree.nodeData(expr_node).lhs;
+    // tsc's `elaborateError` starts with `skipOuterExpressions(node)` and then
+    // unwraps a JSX expression container (`elaborateError` handles
+    // `JsxExpression` by recursing on `node.expression`). A JSX attribute's
+    // value node IS the container, so without this every `style={[…]}` /
+    // `x={{…}}` attribute lost its element-wise elaboration and was reported
+    // whole — at a span no `@ts-ignore` above the offending element covers.
+    while (true) {
+        switch (c.nodeTag(expr_node)) {
+            .paren_expr, .jsx_expr_container => expr_node = c.tree.nodeData(expr_node).lhs,
+            else => break,
+        }
+        if (expr_node == null_node) return false;
+    }
     const rt = try c.resolveStructural(target);
     // tsc's `getBestMatchIndexedAccessTypeOrUndefined`: an element/property
     // of a UNION target is first looked up on the union ITSELF, and only
@@ -4641,7 +4653,11 @@ pub fn elaborateLiteralError(c: *Checker, expr_node0: Node, src_t: TypeId, targe
     switch (c.nodeTag(expr_node)) {
         .array_literal => {
             const rtk = c.ts.kind(rt);
-            if (rtk != .array and rtk != .tuple and !is_union) return false;
+            // `.object` with a numeric index signature is array-like — see
+            // `elemTypeAt`. tsc's `elaborateArrayLiteral` bails only on a
+            // PRIMITIVE target; the shapes it can actually index are these.
+            const index_arraylike = rtk == .object and c.ts.objectNumberIndex(rt) != 0;
+            if (rtk != .array and rtk != .tuple and !index_arraylike and !is_union) return false;
             var reported = false;
             var i: u32 = 0;
             for (c.tree.nodeRange(expr_node)) |el| {
@@ -4656,7 +4672,8 @@ pub fn elaborateLiteralError(c: *Checker, expr_node0: Node, src_t: TypeId, targe
                 }
                 const tt = if (is_union)
                     ((try c.unionElemTypeAt(rt, i)) orelse (try c.elemTypeAt(alt, i)) orelse continue)
-                else if (rtk == .array) c.ts.arrayElem(rt) else (try c.tupleElemTypeAt(rt, i) orelse continue);
+                else
+                    ((try c.elemTypeAt(rt, i)) orelse continue);
                 const et = c.nodeType(el) orelse continue;
                 if (try c.isAssignable(et, tt)) continue;
                 if (!try c.elaborateLiteralError(el, et, tt)) {
@@ -4875,6 +4892,15 @@ pub fn elemTypeAt(c: *Checker, t: TypeId, i: u32) Error!?TypeId {
     return switch (c.ts.kind(r)) {
         .array => c.ts.arrayElem(r),
         .tuple => try c.tupleElemTypeAt(r, i),
+        // An interface that DERIVES from `Array` (react-native's
+        // `RecursiveArray<T> extends Array<T | ReadonlyArray<T> |
+        // RecursiveArray<T>>`) is not `.array`-kinded here, but it carries
+        // `Array`'s numeric index signature — and tsc's
+        // `getIndexedAccessTypeOrUndefined(target, numberLiteral(i))` reads
+        // exactly that. Without it every `style={[…]}` array literal against
+        // `StyleProp<T>` lost its element-wise elaboration and was reported
+        // whole, at a span no `@ts-ignore` above the offending element covers.
+        .object => if (c.ts.objectNumberIndex(r) != 0) c.ts.objectNumberIndex(r) else null,
         // A string is indexable by number through `String`'s numeric index
         // signature (`("a" | "b" | ("a" | "b")[])[0]` is `string`, which is
         // exactly why tsc does NOT elaborate that union element-wise).
@@ -4920,11 +4946,18 @@ pub fn bestMatchingUnionMember(c: *Checker, src_t: TypeId, ut: TypeId) Error!?Ty
     if (ms.len == 0) return null;
     const rs = try c.resolveStructural(src_t);
     const sk = c.ts.kind(rs);
-    // (1) array/tuple source -> the array/tuple constituent.
+    // (1) array/tuple source -> the array/tuple constituent. An interface
+    // deriving from `Array` (`RecursiveArray<T>`) is array-like through its
+    // inherited numeric index signature and counts here too: it is what
+    // tsc's (5) `findMostOverlappyType` picks anyway, since `keyof` an
+    // Array-derived interface overlaps `keyof` the source array on every
+    // `Array` member while a sibling object constituent overlaps on none.
     if (sk == .array or sk == .tuple) {
         for (ms) |m| {
-            const mk = c.ts.kind(try c.resolveStructural(m));
+            const rm = try c.resolveStructural(m);
+            const mk = c.ts.kind(rm);
             if (mk == .array or mk == .tuple) return m;
+            if (mk == .object and c.ts.objectNumberIndex(rm) != 0) return m;
         }
     }
     if (sk != .object) return null;

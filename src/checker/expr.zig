@@ -976,6 +976,15 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
     // Per-attribute value assignability + excess, for explicit attrs.
     var first_excess: Span = .{ .start = 0, .end = 0 };
     var have_excess = false;
+    // tsc's `checkTypeRelatedToAndOptionallyElaborate`: when the ELABORATION
+    // (`elaborateJsxComponents` → `elaborateElementwise`) reported at least one
+    // per-attribute error, the top-level `checkTypeRelatedTo` is never run at
+    // all — so the whole-attributes-object diagnostics (excess property,
+    // missing required prop, weak type) are suppressed by any attribute-level
+    // failure. `elaborateElementwise` `continue`s over an attribute the target
+    // does not know, so an EXCESS attribute never sets this; only a known prop
+    // whose value mismatches does.
+    var attr_elaborated = false;
     for (built.items) |b| {
         if (b.overwritten) continue; // shadowed by a later spread (TS2783)
         if (try c.propOfType(rt, b.name)) |p| {
@@ -998,7 +1007,7 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
                 try c.makeUnion2(p.ty, types.undefined_type)
             else
                 p.ty;
-            _ = try c.checkAssignable(b.ty, target, b.value, vspan);
+            if (!try c.checkAssignable(b.ty, target, b.value, vspan)) attr_elaborated = true;
         } else if (try c.unionNestedPropType(rt, b.name)) |nested| {
             // A prop that lives in a UNION member of an intersection props
             // type (`Base & (VariantA | VariantB)`) is not found by
@@ -1006,7 +1015,7 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
             // the excess arm below only fires for an open target, silently.
             // Check it against the union of the arms that declare it, the
             // same type the attribute's contextual lookup above uses.
-            _ = try c.checkAssignable(b.ty, nested, b.value, c.tokSpan(b.name_tok));
+            if (!try c.checkAssignable(b.ty, nested, b.value, c.tokSpan(b.name_tok))) attr_elaborated = true;
         } else if (target_open and !containsAtom(ia_names.items, b.name)) {
             if (!have_excess) {
                 first_excess = c.tokSpan(b.name_tok);
@@ -1016,6 +1025,13 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
     }
 
     if (!is_obj_target) return; // lenient target: value checks only
+
+    // An attribute-level elaboration already reported: tsc stops here (see
+    // `attr_elaborated`). This is a real suppression, not a cosmetic one —
+    // tsc's error lands on the narrow attribute node, where a `@ts-expect-error`
+    // written above that attribute absorbs it, while the whole-object error
+    // would land on a line no directive covers.
+    if (attr_elaborated) return;
 
     // When `JSX.IntrinsicAttributes` exists, a component's effective props
     // target is the intersection `IntrinsicAttributes & Props`, for which
