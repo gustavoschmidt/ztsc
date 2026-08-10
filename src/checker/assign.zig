@@ -3554,6 +3554,46 @@ pub fn isUnitLikeKind(k: types.Kind) bool {
 /// member. Handles a SINGLE discriminant property (the overwhelmingly
 /// common shape); a multi-discriminant grid falls through to the plain
 /// single-member path (a sound under-accept, never a false accept).
+/// The unit (or unit-union) value a union constituent gives a candidate
+/// discriminant property, or null when it gives none.
+///
+/// Looks THROUGH an intersection: tsc's `getPropertyOfType` on an
+/// intersection intersects the constituents' property types, and
+/// `getIntersectionType` then drops a base primitive that a literal of the
+/// same primitive is intersected with (`removeRedundantPrimitiveTypes`), so
+/// `{id: string} & {id: Nux.A}` has `id: Nux.A`. ztsc's store deliberately
+/// leaves an ENUM member out of that reduction — its primitive domain follows
+/// its value, which the store cannot read — so the pair stays live as
+/// `string & Nux.A` and the discriminant scan rejected it as non-unit.
+fn discriminantUnitOf(c: *Checker, t: TypeId) Error!?TypeId {
+    const r = try c.resolveStructural(t);
+    if (try c.isUnitOrUnitUnion(r)) return r;
+    if (c.ts.kind(r) != .intersection) return null;
+    var found: TypeId = types.no_type;
+    for (try c.memberList(r)) |m| {
+        const rm = try c.resolveStructural(m);
+        if (!try c.isUnitOrUnitUnion(rm)) continue;
+        // Two different unit constituents make the intersection uninhabited,
+        // not a discriminant this scan can read.
+        if (found != types.no_type and found != rm) return null;
+        found = rm;
+    }
+    return if (found == types.no_type) null else found;
+}
+
+/// Collects one enum-MEMBER type per member of an enum symbol — the
+/// constituents tsc's union model of an enum type has.
+const EnumMemberTypes = struct {
+    c: *Checker,
+    sym: SymbolId,
+    out: *std.ArrayList(TypeId),
+
+    pub fn visit(self: *EnumMemberTypes, name: Atom, value: TypeId) Error!void {
+        _ = value;
+        try self.out.append(self.c.scratch(), try self.c.ts.makeEnumMember(self.sym, name, false));
+    }
+};
+
 pub fn discriminatedUnionAssignable(c: *Checker, s: TypeId, t: TypeId) Error!bool {
     const sr = try c.resolveStructural(s);
     // The source may be a plain object or an INTERSECTION of objects.
@@ -3584,11 +3624,10 @@ pub fn discriminatedUnionAssignable(c: *Checker, s: TypeId, t: TypeId) Error!boo
                 ok = false;
                 break;
             };
-            const mr = try c.resolveStructural(mp.ty);
-            if (!try c.isUnitOrUnitUnion(mr)) {
+            const mr = (try discriminantUnitOf(c, mp.ty)) orelse {
                 ok = false;
                 break;
-            }
+            };
             if (first_val == 0) first_val = mr else if (mr != first_val) differs = true;
         }
         if (!ok or !differs) continue;
@@ -3597,16 +3636,35 @@ pub fn discriminatedUnionAssignable(c: *Checker, s: TypeId, t: TypeId) Error!boo
         // accept the source.
         const src_disc = try c.resolveStructural(dprop.ty);
         const singleton = [_]TypeId{src_disc};
-        const src_consts: []const TypeId = if (c.ts.kind(src_disc) == .union_type)
+        var src_consts: []const TypeId = if (c.ts.kind(src_disc) == .union_type)
             try c.memberList(src_disc)
         else
             &singleton;
+        // tsc models an enum TYPE as the UNION of its member literal types, so
+        // `typeRelatedToDiscriminatedType`'s cross product
+        // (`sourcePropertyType.flags & TypeFlags.Union ? types : [type]`)
+        // splits a whole-enum discriminant across the target's per-member
+        // constituents. ztsc models an enum as one nominal type, so the
+        // cross product had a single element that matched no constituent:
+        // bluesky's `saveNux({id, completed: true, data: undefined})` — `id:
+        // Nux`, target a union of `… & {id: Nux.ActivitySubscriptions}` and
+        // fifteen siblings — was TS2345. Expanded only here, where tsc's own
+        // algorithm asks for the constituents.
+        var enum_members: std.ArrayList(TypeId) = .empty;
+        defer enum_members.deinit(c.scratch());
+        if (c.ts.kind(src_disc) == .enum_type and !c.ts.isEnumMember(src_disc)) {
+            const esym = c.ts.enumSymbol(src_disc);
+            var collect: EnumMemberTypes = .{ .c = c, .sym = esym, .out = &enum_members };
+            try c.eachEnumMember(esym, &collect, EnumMemberTypes.visit);
+            if (enum_members.items.len > 1) src_consts = enum_members.items;
+        }
         var all_ok = true;
         for (src_consts) |lv| {
             var covered = false;
             for (members) |m| {
                 const mp = (try c.propOfType(m, dprop.name)) orelse continue;
-                if (!try c.isAssignable(lv, mp.ty)) continue;
+                const mv = (try discriminantUnitOf(c, mp.ty)) orelse continue;
+                if (!try c.isAssignable(lv, mv)) continue;
                 covered = true;
                 if (!try c.nonDiscPropsAssignable(sr, m, dprop.name)) {
                     all_ok = false;
