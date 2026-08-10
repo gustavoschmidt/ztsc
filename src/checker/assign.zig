@@ -3775,7 +3775,13 @@ pub fn discriminatedUnionAssignable(c: *Checker, s: TypeId, t: TypeId) Error!boo
             var covered = false;
             for (members) |m| {
                 const mp = (try c.propOfType(m, dprop.name)) orelse continue;
-                const mv = (try discriminantUnitOf(c, mp.ty)) orelse continue;
+                // Prefer the unit read out of an intersection (`string & Nux.X`
+                // covers `Nux.X`, not every string), but a member whose
+                // discriminant is a plain non-unit still covers what it
+                // accepts — `{id: string} | {id?: undefined}` splits an
+                // `id: string | undefined` only because the `string` member
+                // covers the `string` case.
+                const mv = (try discriminantUnitOf(c, mp.ty)) orelse mp.ty;
                 if (!try c.isAssignable(lv, mv)) continue;
                 covered = true;
                 if (!try c.nonDiscPropsAssignable(sr, m, dprop.name)) {
