@@ -2155,6 +2155,32 @@ pub fn isCompound(k: types.Kind) bool {
     };
 }
 
+/// A target NO object type can ever be assignable to — tsc's non-
+/// `StructuredOrInstantiable` targets, minus the ones an object DOES reach
+/// (`object`, `Function`, an enum's nominal rule, `any`/`unknown`, which are
+/// all settled before this is consulted). Used to answer an interface/class
+/// reference against a primitive without expanding it.
+fn primitiveOnlyTarget(k: types.Kind) bool {
+    return switch (k) {
+        .string,
+        .number,
+        .boolean,
+        .bigint,
+        .symbol,
+        .bool_true,
+        .bool_false,
+        .string_literal,
+        .number_literal,
+        .number_literal_fresh,
+        .bigint_literal,
+        .unique_symbol,
+        .null,
+        .undefined,
+        => true,
+        else => false,
+    };
+}
+
 pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: types.Kind) Error!bool {
     // Deferred conditional *source* is handled first (before union
     // distribution): it resolves to one of its branches, so it is
@@ -2495,6 +2521,35 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
     // key, and consulting the memo would read our own in-progress mark and
     // answer "related" without expanding anything. See `relate`.
     if (sk == .ref or tk == .ref) {
+        // tsc's `recursiveTypeRelatedTo` gate: it recurses into a source's
+        // structure only when BOTH sides are `StructuredOrInstantiable`. A
+        // PRIMITIVE target is not, so `isSimpleTypeRelatedTo` answers the pair
+        // (no) and the source's members are never resolved. ztsc expanded the
+        // reference first and asked afterwards — the same "no", at the cost of
+        // materializing a whole member table to reach it.
+        //
+        // That cost is not the reason this gate exists: the expansion can be
+        // *wrong*. An interface/class reference expanded while its own table is
+        // still materializing answers `error_type` (`classInstanceGeneric`'s
+        // in-progress mark), and `error_type` relates to EVERYTHING — so the
+        // pair came back "assignable" and the relation memo published it under
+        // the reference's key, where every later reader inherited it.
+        //
+        // react-native-gesture-handler is exactly that shape: `BaseGesture<T>`
+        // declares `simultaneousWithExternalGesture(...g: Exclude<GestureRef,
+        // number>[])`, and `GestureRef` is a union over `BaseGesture<…>` — so
+        // materializing the class's own member table asks whether each
+        // `BaseGesture<…>` extends `number`, re-entering the table that is
+        // being built. Every constituent answered "yes" off `error_type`, so
+        // `Exclude<GestureRef, number>` reduced to just its `RefObject` arms
+        // and every `.blocksExternalGesture(gesture)` in the app was a
+        // phantom TS2345.
+        //
+        // `refExpandsToObject` is the no-expansion half of the gate: an
+        // interface or class reference is an object type for every argument
+        // list, whatever its members turn out to be (aliases are excluded —
+        // their bodies reduce, so a `.ref` alias may well BE a primitive).
+        if (sk == .ref and c.refExpandsToObject(s) and primitiveOnlyTarget(tk)) return false;
         // Lazy member route (see `lazyRefRelate`): decide the pair by reading
         // member names and flags off the generic tables, substituting only the
         // members the comparison actually reaches. Answers null for every
