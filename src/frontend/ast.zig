@@ -40,6 +40,9 @@ pub const TokenIndex = u32;
 /// Index into `Ast.nodes`. 0 is the root; as a child reference, 0 = none.
 pub const Node = u32;
 pub const null_node: Node = 0;
+/// The `root` node — a range of the file's top-level statements. Shares index
+/// 0 with `null_node`, which is why it is only ever named explicitly.
+pub const root_node: Node = 0;
 
 /// Index into `Ast.extra_data`. 0 is a reserved dummy word, so 0 = none.
 pub const ExtraIndex = u32;

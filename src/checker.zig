@@ -740,6 +740,7 @@ pub const map_containers = [_][]const u8{
     "enum_members",           "keyof_obj_cache",          "trunc_expansions",
     "inst_map_bytes",         "tp_mentions",              "smk_cache",
     "rel_maybe",              "spec_sym_types",           "spec_tainted",
+    "last_assign_pos",
 };
 
 /// One enum member as `eachEnumMember` yields it: the name atom and the
@@ -910,6 +911,16 @@ pub const Checker = struct {
     /// (see the `.start`/closure-capture gate in `flowTypeInner`). Order-
     /// invariant: a pure function of the file's assignment AST nodes.
     reassigned_syms: IntMap(SymbolId, void) = .empty,
+    /// tsc's `Symbol.lastAssignmentPos` (TS 5.4's "preserved narrowing in
+    /// closures following the last assignment"): for every symbol in
+    /// `reassigned_syms`, the source offset a reference must start *after* for
+    /// the narrowing at the closure's definition point to survive the crossing.
+    /// Computed by `markNodeAssignments`' mirror inside `ensureReassignScan`;
+    /// `no_past_assignment` (all ones) means "no reference is ever past it" —
+    /// the pre-5.4 behaviour — and is what an assignment inside a *nested*
+    /// function, or a declaring scope this cannot index statements of, records.
+    /// Read only by `pastLastAssignment`.
+    last_assign_pos: IntMap(SymbolId, u32) = .empty,
     /// `(sym, for_head_scope)` pairs where `sym` is assigned somewhere inside a
     /// `for`/`for..of`/`for..in` whose header scope is `for_head_scope` (each
     /// enclosing loop of an assignment is recorded, so nested loops are all
@@ -969,16 +980,22 @@ pub const Checker = struct {
     /// every time. An entry from an EARLIER window is stale and ignored, so
     /// the first reader in the next window recomputes exactly as before.
     trunc_expansions: IntMap(TypeId, u64) = .empty,
-    /// `.overloads` TypeId -> where its declaration-GROUP starts live in
-    /// `overload_group_pool`. An entry exists only for a merged global function
-    /// whose signatures come from two or more groups of declarations (the
-    /// default library, and each module's `declare global { … }` augmentation
-    /// of the same name). The interned member list is in declaration order —
-    /// what `getSignaturesOfType` reports, and so what `ReturnType`/`Parameters`
-    /// and the printer see — while overload RESOLUTION visits the groups
-    /// back-to-front (tsc's `reorderCandidates`).
-    /// `appendOverloadCandidates` applies it; everything else reads the members
-    /// as stored. See `mergedFunctionValue`.
+    /// TypeId -> where its declaration-GROUP starts live in
+    /// `overload_group_pool`. Two kinds of key, and an entry exists only when
+    /// the signatures come from two or more groups of declarations:
+    ///
+    ///   * an `.overloads` set built by `mergedFunctionValue` for a merged
+    ///     global function (the default library, and each module's
+    ///     `declare global { … }` augmentation of the same name);
+    ///   * the GENERIC object of an interface whose call signatures are spread
+    ///     over two or more `interface` declarations (`interfaceGeneric`).
+    ///
+    /// Both lists are stored in declaration order — what `getSignaturesOfType`
+    /// reports, and so what `ReturnType`/`Parameters`, `inferFromObjectSigs`
+    /// and the printer see (all of which align from the END) — while overload
+    /// RESOLUTION visits the groups back-to-front (tsc's `reorderCandidates`).
+    /// `appendOverloadCandidates` / `appendObjectCallCandidates` apply the
+    /// reversal at the call site and nowhere else.
     overload_groups: IntMap(TypeId, BaseSpan) = .empty,
     /// Ascending start indices into a merged overload set's member list, one
     /// per declaration group, indexed by `overload_groups`. `starts[0]` is
@@ -1170,6 +1187,16 @@ pub const Checker = struct {
     /// answer being computed right now is taken against a partial fixpoint, so
     /// it belongs in `flow_tmp` rather than the persistent cache.
     flow_back_edge: u32 = 0,
+    /// The reference node the in-flight flow query was started for
+    /// (`flowTypeOfKey`), valid in `cur_file`. Only the closure-crossing arm
+    /// of `flowTypeInner` reads it, and only to place the reference against
+    /// `last_assign_pos` — tsc makes the same decision one level up, in
+    /// `checkIdentifier`, before it ever enters the flow walk. It is NOT part
+    /// of the `(flow, key)` memo key and must not become one: a `.start` flow
+    /// node belongs to exactly one closure, and every reference inside that
+    /// closure sits inside the same statement of the declaring block, so the
+    /// past/not-past answer is constant over the references that can reach it.
+    flow_ref_node: Node = ast.null_node,
     /// Interned narrowing reference keys (RefQ -> dense index).
     ref_keys: std.AutoHashMapUnmanaged(RefQ, u32) = .empty,
     /// Over-deep reference paths, indexed by `RefKey.deep - 1`. Appended to
@@ -3570,6 +3597,7 @@ pub const Checker = struct {
     pub const expandoMemberType = signatures_zig.expandoMemberType;
     pub const mergedFunctionValue = signatures_zig.mergedFunctionValue;
     pub const appendOverloadCandidates = signatures_zig.appendOverloadCandidates;
+    pub const appendObjectCallCandidates = signatures_zig.appendObjectCallCandidates;
     pub const lastCallSig = signatures_zig.lastCallSig;
     pub const variableSymbolType = signatures_zig.variableSymbolType;
     pub const importedSymbolType = signatures_zig.importedSymbolType;

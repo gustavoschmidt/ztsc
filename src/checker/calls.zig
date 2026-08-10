@@ -321,9 +321,7 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, chained: *bool,
                 // An object member carrying call signatures — e.g. RTK's
                 // `createAsyncThunk: CreateAsyncThunkFunction<C> & { withTypes }`,
                 // whose callable arm is an interface with a call signature.
-                .object => for (0..c.ts.objectCallSigCount(rm)) |i| {
-                    try isect_sigs.append(c.scratch(), c.ts.objectCallSig(rm, @intCast(i)));
-                },
+                .object => try c.appendObjectCallCandidates(&isect_sigs, rm),
                 else => {},
             }
         }
@@ -470,9 +468,7 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, chained: *bool,
                     }
                     return types.error_type;
                 }
-                for (0..c.ts.objectCallSigCount(r)) |i| {
-                    try sigs.append(c.scratch(), c.ts.objectCallSig(r, @intCast(i)));
-                }
+                try c.appendObjectCallCandidates(&sigs, r);
             },
             // Calling a union (e.g. `(A[] | B[]).map(...)`, where the member
             // access yields a union of the constituents' call-signature
@@ -500,11 +496,10 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, chained: *bool,
                         .function => try sigs.append(c.scratch(), rm),
                         .overloads => try c.appendOverloadCandidates(&sigs, rm),
                         .object => {
-                            const n = c.ts.objectCallSigCount(rm);
-                            if (n == 0) {
+                            if (c.ts.objectCallSigCount(rm) == 0) {
                                 all_callable = false;
                             } else {
-                                for (0..n) |i| try sigs.append(c.scratch(), c.ts.objectCallSig(rm, @intCast(i)));
+                                try c.appendObjectCallCandidates(&sigs, rm);
                             }
                         },
                         // A union member that is itself an INTERSECTION —
@@ -531,9 +526,8 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, chained: *bool,
                                         member_callable = true;
                                     },
                                     .object => {
-                                        const n = c.ts.objectCallSigCount(ri);
-                                        if (n != 0) {
-                                            for (0..n) |i| try sigs.append(c.scratch(), c.ts.objectCallSig(ri, @intCast(i)));
+                                        if (c.ts.objectCallSigCount(ri) != 0) {
+                                            try c.appendObjectCallCandidates(&sigs, ri);
                                             member_callable = true;
                                         }
                                     },
