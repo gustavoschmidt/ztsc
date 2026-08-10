@@ -963,6 +963,9 @@ fn inferFromExtendsInner(c: *Checker, source0: TypeId, pattern: TypeId, ids: []c
             if (vals[idx] == types.no_type) {
                 vals[idx] = source0;
             } else if (contra) {
+                // tsc's `getTypeFromInference` intersects the contravariant
+                // candidates — which is what makes `UnionToIntersection<U>`
+                // work once a union source distributes over the pattern.
                 vals[idx] = try c.ts.makeIntersection(c.scratch(), &.{ vals[idx], source0 });
             } else {
                 vals[idx] = try c.makeUnion2(vals[idx], source0);
@@ -1231,6 +1234,51 @@ fn inferFromExtendsInner(c: *Checker, source0: TypeId, pattern: TypeId, ids: []c
             // wrongly rejecting `mockResolvedValueOnce(null)` as TS2769).
             if (s.kind(src) == .overloads) {
                 if (try c.lastCallSig(src)) |sig| src = sig else return;
+            }
+            // A UNION source against a single-signature pattern infers from
+            // each constituent (tsc's `inferFromTypes`: once the target is
+            // neither a union nor a type variable, "source is a union type,
+            // infer from each constituent type"). The candidates then combine
+            // by position — `getTypeFromInference` unions covariant candidates
+            // and INTERSECTS contravariant ones — which is the entire
+            // mechanism behind the `UnionToIntersection<U>` idiom:
+            //
+            //     type UnionToIntersection<U> =
+            //       (U extends any ? (k: U) => void : never) extends
+            //         (k: infer I) => void ? I : never
+            //
+            // The distributive check type is a UNION of one-parameter
+            // functions, so `I` collects one contravariant candidate per
+            // constituent and comes out as their intersection. Without this
+            // the whole pattern matched nothing and the conditional fell to
+            // its `never` branch: tiptap's `UnionCommands`/`SingleCommands`/
+            // `ChainedCommands` are built exactly this way, so social-app's
+            // `TextInput.web.tsx` saw `editor.commands` and `editor.chain()`
+            // as `never` and every command on them was a TS2339.
+            //
+            // Deliberately limited to the TOP of the match (`depth == 0`),
+            // where the pattern is the conditional's whole extends clause and
+            // the source is its check type. Deeper, a union source reaching a
+            // signature pattern is one arm of a multi-constituent union TARGET
+            // (`ref?: RefCallback<M> | RefObject<M | null> | null`), and tsc
+            // orders those by inference PRIORITY — a candidate found through a
+            // lower-priority arm is dropped once a higher-priority one exists.
+            // ztsc has no priority ladder, so distributing there only adds
+            // candidates tsc would discard: doing it flipped
+            // `TRef extends AnimatedComponentType<any, infer Instance>` in
+            // react-native-reanimated to its false branch and every
+            // `useAnimatedRef<Animated.View>()` stopped matching its own
+            // component's `ref`.
+            if (depth == 0 and s.kind(src) == .union_type) {
+                const umembers = try c.scratch().dupe(TypeId, try c.memberList(src));
+                defer c.scratch().free(umembers);
+                // Same `depth`, not `depth + 1`: distributing a union over the
+                // same target is not a structural descent (tsc recurses with no
+                // notion of depth here), and charging it a level pushed deep
+                // chains past `max_infer_depth` and truncated candidates that
+                // used to bind.
+                for (umembers) |m| try c.inferFromExtends(m, pattern, ids, vals, contra, depth);
+                return;
             }
             if (s.kind(src) != .function) return;
             // A generic *source* signature must be reduced to its base
