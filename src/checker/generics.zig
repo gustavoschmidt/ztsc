@@ -2017,7 +2017,23 @@ pub fn materializeMapped(c: *Checker, key_param: TypeId, constraint: TypeId, val
                 for (0..s.tupleLen(src)) |i| {
                     const e = s.tupleElem(src, @intCast(i));
                     const key_lit = try s.makeNumberLiteral(@floatFromInt(i), false);
-                    const et = try c.substMappedKey(value, key_id, key_lit);
+                    var et = try c.substMappedKey(value, key_id, key_lit);
+                    // A REST slot stores its ARRAY type (`...string[]` holds
+                    // `string[]`; every reader — `tupleElemTypeAt`,
+                    // `indexedAccessType`'s numeric arm — unwraps it with
+                    // `elemOfArrayish`). `T[i]` therefore hands back the
+                    // ELEMENT type, which is the right thing to run the value
+                    // template over (tsc's `instantiateMappedTupleType` maps a
+                    // rest element's element type too) but the wrong thing to
+                    // store back: dropping the wrapper made `Readonly<[U,
+                    // ...U[]]>` come out `readonly [U, ...U]`, and every reader
+                    // then unwrapped a non-array to nothing. Concretely, zod's
+                    // `z.enum(['a','b','c'])` — whose `create` constrains its
+                    // tuple by `Readonly<[U, ...U[]]>` — lost the contextual
+                    // `U` for every element past the first, so the literals
+                    // widened to `string` and `z.infer` gave `string` where the
+                    // schema says `'a' | 'b' | 'c'`.
+                    if (e.rest() and s.kind(e.ty) == .array) et = try s.makeArrayLike(e.ty, et);
                     try elems.append(c.scratch(), .{ .ty = et, .flags = applyElemModifiers(e.flags, flags) });
                 }
                 return s.makeTuple(elems.items);

@@ -1967,6 +1967,76 @@
 //! c4 against 5,907,484 at c1) is the larger consumer, so a shared TYPE store
 //! that did not also share the memo would leave most of the duplicated
 //! footprint standing.
+//!
+//! ## `z.infer` on a 40-property schema (social-app, 2026-08-09)
+//!
+//! A DIFFERENT population from everything above, and the one place in this
+//! whole family where reading one member instead of a table is a win.
+//!
+//! social-app's `state/persisted/schema.ts` reported TS2589 on
+//! `type Schema = z.infer<typeof schema>`, so `Schema` was `any` and every
+//! `persisted.get(k)` in the app was too: twelve TS7006 across nine files hung
+//! off it. `z.infer<T>` is `T["_output"]`, and answering it went through
+//! `indexedAccessType` -> `resolveStructural` -> `expandRef`, which
+//! materializes the WHOLE `ZodObject<Shape, …>` table.
+//!
+//! `--inst-profile` on an isolated repro (that schema, the app's real zod, 28
+//! files, 1 s per run): 5.58 M node visits, of which `#14846 index_access
+//! T["_output"]` is 5,018,756 over THREE top-level entries, max 5,000,289 —
+//! the whole 5 M declaration cap in one substitution. By symbol, `expandRef`
+//! is `ZodObject` 5,549,784 / 29 calls and `deoptional` 5,520,967 / 5. The
+//! per-member axis names the cost precisely: `ZodObject.required` is 779,211
+//! visits over 13 substitutions (53% of the charge), and the rest is a flat
+//! tail of `ZodType`'s fluent API — `refine`, `superRefine`, `transform`,
+//! `optional`, `array`, `catch`, `brand`, `pipe`, `or`, `and` — each returning
+//! a WRAPPER OF `this` (`ZodEffects<this, …>`, `ZodOptional<this>`,
+//! `ZodPipeline<this, …>`) whose own table comes in behind it: `ZodType` 1,640
+//! expansions, `ZodEffects` 1,728, and nine more wrappers besides.
+//!
+//! **None of that is needed.** `_output` is a bare type parameter on the folded
+//! generic table, so substituting it alone is one map lookup. Deleting
+//! `required()` from zod's `.d.ts` does NOT fix it (still trips) — the tail is
+//! the cost, and only skipping the table skips the tail. `lazyIndexedProp`
+//! does that; the repro goes 0.98 s user / 2 diagnostics -> 0.14 s / 0, and
+//! social-app 179 -> 168 keys with wall 10.3 -> 7.3 s and peak RSS 480 ->
+//! 359 MB at c1 (17.3 -> 8.7 s, 2.62 -> 1.83 GB at c8).
+//!
+//! ### The gate is the whole result, and it took three measurements
+//!
+//! prof.zig already records that member-granular laziness is a large
+//! regression when it displaces an expansion that would have completed. That
+//! verdict holds here too, and drizzle-orm — whose `relate` walk asks
+//! `indexedAccessType` for the same handful of builder references millions of
+//! times inside ONE statement — prices every candidate gate (all c1):
+//!
+//!   * lazy for EVERY nominal `Ref["name"]`: 446 -> 800 ms, 34.9 -> 132.6 MB,
+//!     node visits 338 k -> 584 k, budget trips 0 -> 540;
+//!   * lazy only for references whose expansion already FAILED
+//!     (`trunc_expansions`): 315 -> 480 ms. drizzle fills that table with
+//!     ordinary `extends`-cycle cuts and half a million asks land on them, so
+//!     it is not the population it looks like;
+//!   * a gate tight enough never to fire at all (measured: zero hits, node
+//!     visits within 4 of baseline) but asked PER ACCESS as two hash lookups:
+//!     333 -> 538 ms. **The ask is the cost, not the answer.**
+//!
+//! What works is a one-word counter, `Checker.inst_ceiling_trips`: has this
+//! checker ever hit the depth/count ceiling? It is ZERO for all eight packages
+//! in `bench/corpus/real` (all byte-identical, node visit for node visit, with
+//! the route compiled in) and for excalidraw, so the healthy corpus pays a
+//! predictable-false branch. It is deliberately NOT `inst_limit_tripped`, which
+//! the ceiling sets but so do three ordinary recursion cuts (`chainRepeats`,
+//! `max_alias_depth`, `substThis`) that fire all over drizzle.
+//!
+//! ### What is left on this schema
+//!
+//! One TS2589 moves from `schema.ts:132` (`z.infer`) to `schema.ts:194`
+//! (`schema.safeParse(objData)`), plus its one TS7006. That is a VALUE-position
+//! property access, so it goes through `propertyTypeOf` and materializes the
+//! same table — the route prof.zig measures as a regression twice on immich.
+//! The remaining table is 513,209 visits for one expansion; `required()` is
+//! 53% of it and removing it does not clear the trip, so the residue is the
+//! `this`-wrapper tail and would need the relation and inference sites to stop
+//! forcing whole tables, which is the same open item this header ends on.
 
 const std = @import("std");
 const types = @import("../types.zig");

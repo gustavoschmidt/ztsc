@@ -601,6 +601,57 @@ pub fn lazyNumberIndex(c: *Checker, ref: TypeId, generic: TypeId) Error!TypeId {
     return lazyMemberAt(c, ref, g, lazySlotNumberIndex(c, generic));
 }
 
+/// A TYPE-LEVEL indexed access `Ref["name"]` answered by substituting ONE
+/// member of `ref`'s table — tsc's own shape for `getIndexedAccessType`, which
+/// asks `getPropertyOfType` for one symbol and lets `getTypeOfSymbol`
+/// instantiate that member alone. Null whenever the eager path is the right
+/// one (see `lazyTableOf`'s eligibility rules; an already-materialized table is
+/// one of them, and is why this never re-derives what is already free).
+///
+/// The shape it exists for is zod's. `z.infer<typeof schema>` is
+/// `(typeof schema)['_output']`; `_output` is a bare type parameter on
+/// `ZodType`'s generic table, so substituting it is one map lookup — while the
+/// ~60-member table around it is not, because `ZodType`'s fluent API returns
+/// `ZodOptional<this>`, `ZodEffects<this, …>`, `ZodPipeline<this, …>` and
+/// eleven more wrappers, each of which drags its own member table in behind it.
+/// On social-app's ~40-property `z.object({…})` that table costs the whole 5 M
+/// declaration budget, so `type Schema = z.infer<typeof schema>` resolved to
+/// `any` and took twelve implicit-any-parameter reports across nine files with
+/// it. The isolated repro (that schema, real zod, 28 files) goes from 0.98 s
+/// user and two diagnostics to 0.14 s and none.
+///
+/// **`indexedAccessType` asks only once `inst_ceiling_trips != 0` — once this
+/// checker has run out of instantiation room at least once — and that gate is
+/// the design, not a safety belt.** Three measurements on drizzle-orm at
+/// `--checkers=1`, whose `relate` walk asks `indexedAccessType` for the same
+/// handful of builder references millions of times inside ONE statement:
+///
+///   * Answering EVERY nominal `Ref["name"]` this way costs 446 -> 800 ms and
+///     34.9 -> 132.6 MB, node visits 338 k -> 584 k, budget trips 0 -> 540.
+///     That is precisely the mechanism prof.zig records for the
+///     `propertyTypeOf` conversion: the eager expansion runs early, completes,
+///     and is memoized under the ref for every later reader; substitute one
+///     member instead and each reader re-derives what the table prepaid for.
+///   * Restricting it to references whose expansion already FAILED
+///     (`trunc_expansions`) does not help: drizzle fills that table with
+///     ordinary `extends`-cycle cuts, half a million asks land on them, and it
+///     is 315 -> 480 ms.
+///   * Even a gate tight enough never to fire at all is not free if it is asked
+///     per access: two hash lookups per ask, zero hits, node visits within 4 of
+///     the baseline — and still 333 -> 538 ms.
+///
+/// A one-word counter read is the only gate cheap enough, and it is exactly the
+/// right question: nothing in `bench/corpus/real` trips the ceiling even once
+/// (all eight packages are byte-identical, node visit for node visit, with this
+/// route compiled in), so the route costs the healthy corpus nothing and turns
+/// on only where the eager path has already proven it cannot finish.
+pub fn lazyIndexedProp(c: *Checker, obj: TypeId, name: Atom) Error!?types.Prop {
+    if (c.inst_ceiling_trips == 0) return null;
+    if (c.ts.kind(obj) != .ref) return null;
+    const generic = (try lazyTableOf(c, obj)) orelse return null;
+    return lazyPropNamed(c, obj, generic, name);
+}
+
 /// A materialized generic instantiation carries an origin tag (see `origin`)
 /// only when it lands on a structural shape whose identity the reflexive /
 /// equivalence fast-path can exploit: an object, a function, or an

@@ -43,6 +43,7 @@ const inferTypeArgs = @import("calls.zig").inferTypeArgs;
 const inferVarFromNode = @import("generics.zig").inferVarFromNode;
 const instantiate = @import("enums.zig").instantiate;
 const intrinsicStringMapping = @import("generics.zig").intrinsicStringMapping;
+const lazyIndexedProp = @import("instantiate.zig").lazyIndexedProp;
 const lazyRefProp = @import("instantiate.zig").lazyRefProp;
 const propOfType = @import("props.zig").propOfType;
 const scopeOf = Checker.scopeOf;
@@ -2139,6 +2140,15 @@ fn indexedAccessTypeInner(c: *Checker, obj: TypeId, idx: TypeId) Error!TypeId {
         try c.lazy_index_objs.append(c.cm(), obj);
         defer _ = c.lazy_index_objs.pop();
         if (try c.lazyRefProp(obj, c.ts.literalAtom(idx), 0)) |p| {
+            return if (p.optional() and !c.homo_index_mode) c.makeUnion2(p.ty, types.undefined_type) else p.ty;
+        }
+    }
+    // ONE member of a nominal reference, instead of its whole table — but only
+    // once this checker has already run out of instantiation room at least
+    // once. See `lazyIndexedProp` for why the gate is the design and not a
+    // safety belt.
+    if (c.inst_ceiling_trips != 0 and c.ts.kind(idx) == .string_literal) {
+        if (try lazyIndexedProp(c, obj, c.ts.literalAtom(idx))) |p| {
             return if (p.optional() and !c.homo_index_mode) c.makeUnion2(p.ty, types.undefined_type) else p.ty;
         }
     }
