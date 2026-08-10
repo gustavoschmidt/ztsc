@@ -1672,6 +1672,24 @@ pub fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         const raw = try c.checkExprCached(el, ectx);
         var et = raw;
         if (!try c.keepLiteral(et, ectx)) et = try c.widenLiteral(et);
+        // tsc's `checkExpressionForMutableLocation` ends
+        // `getWidenedLiteralLikeTypeForContextualType` with
+        // `getRegularTypeOfLiteralType` on BOTH arms: an element whose literal
+        // the contextual type KEEPS still loses its FRESHNESS. Freshness is a
+        // property of an expression, not of a type an expression lands in, and
+        // an element type is the latter — nothing about `['a', 'b']` should
+        // still say "this `'a'` came from a literal and may widen".
+        //
+        // It escapes through inference. zod's
+        // `z.enum<U extends string, T extends Readonly<[U, ...U[]]>>(values: T)`
+        // infers `T` as the tuple, so a fresh element became a fresh member of
+        // `ZodEnum<T>['_output'] = T[number]` — and social-app's
+        // `useState(() => persisted.get('colorMode'))` then widened that union
+        // to `string`, because `getCovariantInference`'s widening arm fires on
+        // an unconstrained `S` and only fresh literals widen. The `U` half of
+        // the same signature was already regular (`primitiveConstraint`'s arm
+        // in `inferTypeArgs` does exactly this call); the tuple half was not.
+        et = try c.ts.regularLiteral(et);
         try elem_types.append(c.scratch(), et);
         try raw_types.append(c.scratch(), raw);
         try tuple_elems.append(c.scratch(), .{ .ty = et });
