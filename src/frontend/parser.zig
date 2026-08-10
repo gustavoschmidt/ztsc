@@ -3623,6 +3623,12 @@ const Parser = struct {
                 const inner = if (p.curTag() == .keyword_import)
                     // `typeof import("m")[.value]`.
                     try p.parseImportType()
+                else if (p.curTag() == .keyword_this)
+                    // `typeof this[.a.b]` — a type query may name the `this`
+                    // VALUE, which no other entity-name position may. Seeded
+                    // as `.this_expr` so the checker reads the enclosing
+                    // declaration's `this`, not a name called "this".
+                    try p.parseEntityNameFrom(try p.leaf(.this_expr))
                 else
                     try p.parseEntityName();
                 // `typeof f<T>` — a type-position instantiation expression.
@@ -3668,7 +3674,12 @@ const Parser = struct {
 
     /// `A` / `A.B.C` in type positions.
     fn parseEntityName(p: *Parser) PE!Node {
-        var name = try p.leaf(.identifier);
+        return p.parseEntityNameFrom(try p.leaf(.identifier));
+    }
+
+    /// The `.B.C` tail of an entity name, over an already-parsed head.
+    fn parseEntityNameFrom(p: *Parser, head: Node) PE!Node {
+        var name = head;
         while (p.curTag() == .dot) {
             const dot = try p.bump();
             const part = try p.expectMemberName();

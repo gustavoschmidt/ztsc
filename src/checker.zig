@@ -1946,8 +1946,20 @@ pub const Checker = struct {
     /// a homomorphic mapped parameter). tsc keeps only the candidates at the
     /// best priority it saw, so a direct structural candidate replaces a
     /// reverse-mapped one outright and a reverse-mapped one arriving second is
-    /// discarded. Shares `contra_owner`'s identity check.
+    /// discarded. Also carries tsc's `InferencePriority.NakedTypeVariable` —
+    /// an inference made directly to a bare type variable reached through a
+    /// conditional's branch, which is "less specific" the same way and loses
+    /// to a direct candidate by the same rule.
+    ///
+    /// Identity is `rev_owner`, NOT `contra_owner`: the two-round
+    /// context-sensitive probe infers this very call into a SCRATCH copy of
+    /// the candidate array, and the priority tier has to hold there too —
+    /// the probe's answer is what pins each context-sensitive callback's
+    /// parameter types for the authoritative pass. Contravariant candidates
+    /// and the top-level flags deliberately do NOT follow it there: those
+    /// are read back after the walk, and the probe's copy is discarded.
     rev_flags: []bool = &.{},
+    rev_owner: ?[*]TypeId = null,
     /// Non-zero while `unify` is running *inside* a homomorphic-mapped-parameter
     /// inference (the alias-identity pairing in `inferReverseMapped`), so the
     /// candidates it records carry the same `InferencePriority.
@@ -3647,6 +3659,7 @@ pub const Checker = struct {
     pub const memberIsAbstract = instantiate_zig.memberIsAbstract;
     pub const abstractSatisfiedElsewhere = instantiate_zig.abstractSatisfiedElsewhere;
     pub const classChainMemberIsAbstract = instantiate_zig.classChainMemberIsAbstract;
+    pub const classChainMemberType = instantiate_zig.classChainMemberType;
     pub const checkAbstractImplementation = instantiate_zig.checkAbstractImplementation;
     pub const collectClassMemberAtoms = instantiate_zig.collectClassMemberAtoms;
     pub const max_eager_alias_depth = instantiate_zig.max_eager_alias_depth;

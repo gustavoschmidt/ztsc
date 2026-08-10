@@ -961,6 +961,20 @@ pub fn regularizeTypeQuery(c: *Checker, t: TypeId) Error!TypeId {
 
 pub fn typeofEntity(c: *Checker, node: Node) Error!TypeId {
     if (node == null_node) return types.any_type;
+    // `typeof this` / `typeof this.a.b` — legal only in a type query, and
+    // only where a `this` value exists (a class or interface body). The
+    // query names the `this` VALUE, so the answer is the enclosing
+    // declaration's `this` type; `this` is a value, never a name, so it
+    // must not go through the identifier path (which would report TS2304).
+    // Same reading as `this` in a TYPE position, polymorphic marker
+    // included — `self: typeof this` on a base class read through a
+    // SUBCLASS instance is the subclass, not the base.
+    if (c.nodeTag(node) == .this_expr) {
+        if (c.this_type == 0) return types.any_type;
+        if (c.ts.kind(c.this_type) != .ref) return c.this_type;
+        c.has_this_types = true;
+        return c.ts.makeThisType(c.this_type);
+    }
     // `typeof import("m")` — the module's value-namespace object type.
     if (c.nodeTag(node) == .import_type) {
         const m = (try c.resolveImportTypeModule(node, true)) orelse return types.error_type;
@@ -991,10 +1005,31 @@ pub fn typeofEntity(c: *Checker, node: Node) Error!TypeId {
         // Primitive.div>` (the shape every Radix component's props are
         // built from) collapsed to `{}`, so every attribute on such a
         // component read as excess.
-        const base = try c.typeofEntity(d.lhs);
+        var base = try c.typeofEntity(d.lhs);
+        // A `typeof this.x` base is the polymorphic `this`; the PROPERTY it
+        // qualifies is read off the home instance. Keeping the marker here
+        // would defer the lookup behind `substThis`, and this member is
+        // being resolved while that very table is built — there is no later
+        // receiver to supply.
+        if (c.ts.kind(base) == .this_type) base = c.ts.thisTypeInstance(base);
+        const name = try c.memberAtom(d.rhs);
         const rb = try c.resolveStructural(base);
+        // A class whose member table is still materializing resolves to
+        // `err` (`expandRef`'s cycle cut), and a type query rooted at the
+        // very class being built is exactly that: `resolveHandle: typeof
+        // this.com.atproto.identity.resolveHandle` asks for a property of
+        // its own home instance. tsc answers it because a member's type is
+        // resolved per-SYMBOL, not by folding the whole table, so read the
+        // one member's declaration directly rather than surrendering the
+        // query — an `err` here erases every type built on it (@atproto's
+        // `Agent` declares its whole call surface this way, so every
+        // response type it returns came back untyped).
+        if (c.ts.kind(rb) == .err) {
+            if (try c.classChainMemberType(base, name, 0)) |mt|
+                return c.regularizeTypeQuery(mt);
+        }
         if (c.ts.kind(rb) == .any or c.ts.kind(rb) == .err) return rb;
-        if (try c.propOfType(rb, try c.memberAtom(d.rhs))) |p| {
+        if (try c.propOfType(rb, name)) |p| {
             return c.regularizeTypeQuery(p.ty);
         }
         // Unknown member: stay silent (`any`) rather than risk a false
