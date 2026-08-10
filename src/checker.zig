@@ -3767,6 +3767,7 @@ pub const Checker = struct {
     pub const collectInferVars = generics_zig.collectInferVars;
     pub const mappedInferShape = generics_zig.mappedInferShape;
     pub const inferFromExtends = generics_zig.inferFromExtends;
+    pub const inferCloselyMatched = generics_zig.inferCloselyMatched;
     pub const inferFromObjectSigs = generics_zig.inferFromObjectSigs;
     pub const inferFromTemplate = generics_zig.inferFromTemplate;
     pub const bindTemplateInfer = generics_zig.bindTemplateInfer;

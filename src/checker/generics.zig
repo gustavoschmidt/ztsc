@@ -1029,6 +1029,37 @@ fn inferPrioSlot(c: *Checker, vals: []TypeId, idx: usize) ?*u16 {
     return &c.infer_prio_of[idx];
 }
 
+/// The generic instantiation a materialized type came from — tsc's
+/// `aliasSymbol`/`aliasTypeArguments` for an alias and `symbol`/`typeArguments`
+/// for an interface, both of which ztsc records as the `origin` ref
+/// (`makeRef(sym, args)`). A `.ref` that has not been expanded answers for
+/// itself.
+fn originRefOf(c: *Checker, t: TypeId) ?TypeId {
+    const s = &c.ts;
+    if (s.kind(t) == .ref) return t;
+    if (c.origin.get(t)) |o| {
+        if (s.kind(o) == .ref) return o;
+    }
+    return null;
+}
+
+fn originGenericSymbol(c: *Checker, t: TypeId) ?u32 {
+    const o = originRefOf(c, t) orelse return null;
+    return c.ts.refSymbol(o);
+}
+
+/// tsc's `isTypeCloselyMatchedBy` — "s and t are two instantiations of the
+/// same generic", by declaring symbol for an object type and by alias symbol
+/// for an alias. It is the second of `inferFromMatchingTypes`'s two passes
+/// over a union's constituents, and it is what pairs `RefCallback<X>` with
+/// `RefCallback<infer M>` inside a multi-constituent union target instead of
+/// offering each target the whole source union.
+pub fn inferCloselyMatched(c: *Checker, src: TypeId, pat: TypeId) bool {
+    const a = originGenericSymbol(c, src) orelse return false;
+    const b = originGenericSymbol(c, pat) orelse return false;
+    return a == b;
+}
+
 /// tsc's `inferToMultipleTypes`, union form: every target constituent that
 /// can bind receives the source, and the ones that ARE a binder receive it
 /// last and at `InferencePriority.NakedTypeVariable` —
@@ -1588,7 +1619,87 @@ fn inferFromExtendsInner(c: *Checker, source0: TypeId, pattern: TypeId, ids: []c
                 if (rem.items.len == 0 or rem.items.len == sms.len) break :blk source0;
                 break :blk try s.makeUnion(c.scratch(), rem.items);
             };
-            try inferToUnionTargets(c, residual, pms, ids, vals, contra, depth);
+            // tsc runs `inferFromMatchingTypes` TWICE over the two constituent
+            // lists: once with `isTypeOrBaseIdenticalTo` (the subtraction
+            // above) and then again with `isTypeCloselyMatchedBy`, which pairs
+            // a source and a target constituent that are two instantiations of
+            // the SAME generic — `s.symbol === t.symbol` for an object, or
+            // `s.aliasSymbol === t.aliasSymbol` for an alias. Each such pair is
+            // inferred on its own and BOTH sides are then removed, so a target
+            // constituent never sees a source constituent that some other
+            // target already accounts for.
+            //
+            // This is what makes a multi-constituent union target infer at all.
+            // React 19's
+            //     interface RefAttributes<T> {
+            //       ref?: RefCallback<T> | RefObject<T | null> | null
+            //     }
+            //     type ComponentRef<T> =
+            //       ComponentPropsWithRef<T> extends RefAttributes<infer M> ? M : never
+            // reaches here with the whole source union
+            // `RefCallback<ScrollView> | RefObject<ScrollView | null>` and two
+            // wrapper targets. Handing that union to each target infers
+            // nothing — a union is neither a function nor a `RefObject` — so
+            // `M` stayed unbound, the extends check failed and the conditional
+            // took its `never` branch. Every `useAnimatedRef<Animated.X>()`
+            // in react-native-reanimated resolves its `.current` through this
+            // conditional, so the ref's methods (`getScrollResponder`,
+            // `getScrollableNode`) were all TS2339.
+            //
+            // Pairing by symbol is deliberately narrower than distributing
+            // every source constituent into every target: it manufactures no
+            // candidate from an unrelated pair, which is exactly the failure
+            // mode that made the unrestricted distribution regress
+            // reanimated's `AnimatedComponentRef<Instance>` union (see
+            // `conditional/049`).
+            var t_paired = try c.scratch().alloc(bool, pms.len);
+            @memset(t_paired, false);
+            var any_close = false;
+            const rms: []const TypeId = if (s.kind(residual) == .union_type)
+                try c.scratch().dupe(TypeId, try c.memberList(residual))
+            else
+                &.{residual};
+            var s_paired = try c.scratch().alloc(bool, rms.len);
+            @memset(s_paired, false);
+            for (pms, 0..) |pm, ti| {
+                if (!try c.containsInfer(pm)) continue;
+                for (rms, 0..) |sm, si| {
+                    if (!c.inferCloselyMatched(sm, pm)) continue;
+                    try c.inferFromExtends(sm, pm, ids, vals, contra, depth + 1);
+                    t_paired[ti] = true;
+                    s_paired[si] = true;
+                    any_close = true;
+                }
+            }
+            if (!any_close) {
+                try inferToUnionTargets(c, residual, pms, ids, vals, contra, depth);
+                return;
+            }
+            // `if (targets.length === 0) return;` — every inference-bearing
+            // target constituent has been accounted for by a pair.
+            var left_t = false;
+            for (pms, 0..) |m, ti| {
+                if (t_paired[ti]) continue;
+                if (try c.containsInfer(m)) left_t = true;
+            }
+            if (!left_t) return;
+            var rest: std.ArrayList(TypeId) = .empty;
+            defer rest.deinit(c.scratch());
+            for (rms, 0..) |sm, si| {
+                if (!s_paired[si]) try rest.append(c.scratch(), sm);
+            }
+            // `if (sources.length === 0)` — tsc still offers the source it
+            // started with rather than nothing at all.
+            const rest_src = if (rest.items.len == 0)
+                residual
+            else
+                try s.makeUnion(c.scratch(), rest.items);
+            var left: std.ArrayList(TypeId) = .empty;
+            defer left.deinit(c.scratch());
+            for (pms, 0..) |m, ti| {
+                if (!t_paired[ti]) try left.append(c.scratch(), m);
+            }
+            try inferToUnionTargets(c, rest_src, left.items, ids, vals, contra, depth);
         },
         // Intersection pattern (`object & { then(onfulfilled: infer F, …) }`
         // for Awaited; `NextExt & infer Ext` for a redux StoreEnhancer).
