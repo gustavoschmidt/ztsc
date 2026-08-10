@@ -1163,32 +1163,230 @@ fn seedKeepsPropLiteral(c: *Checker, pt: TypeId, tp_syms: []const u32, seed: []c
     return false;
 }
 
-/// Is contravariant candidate `cand` nothing but the value `fed` that this
-/// call substituted into the argument's contextual type — either verbatim, or
-/// with union constituents the target position already matched away removed?
-/// Deliberately SYNTACTIC (constituent identity, not assignability): a
-/// genuinely narrower candidate from an ANNOTATED callback parameter is not a
-/// sub-union of the fed type, so it still counts as evidence.
-pub fn isFedEcho(c: *Checker, cand: TypeId, fed: TypeId) Error!bool {
-    if (cand == fed) return true;
-    if (c.ts.kind(fed) != .union_type) return false;
-    const fed_ms = try c.memberList(fed);
-    const cand_ms: []const TypeId = if (c.ts.kind(cand) == .union_type)
-        try c.scratch().dupe(TypeId, try c.memberList(cand))
-    else
-        &.{cand};
-    if (cand_ms.len >= fed_ms.len) return false;
-    for (cand_ms) |m| {
-        var found = false;
-        for (fed_ms) |f| {
-            if (f == m) {
-                found = true;
-                break;
+/// tsc's `ObjectFlags.NonInferrableType`, recomputed on demand: does `t`
+/// carry a `types.any_function_type` anywhere a propagating flag would have
+/// reached — an object literal's property, an array or tuple element, a
+/// union or intersection member? Only asked while `Checker.aft_seen` says one
+/// was minted, so the ordinary inference path never runs it.
+fn containsAnyFunctionType(c: *Checker, t: TypeId, depth: u32) Error!bool {
+    if (t == types.any_function_type) return true;
+    if (depth > 4) return false;
+    const s = &c.ts;
+    switch (s.kind(t)) {
+        .array => return containsAnyFunctionType(c, s.arrayElem(t), depth + 1),
+        .tuple => {
+            for (0..s.tupleLen(t)) |i| {
+                if (try containsAnyFunctionType(c, s.tupleElem(t, @intCast(i)).ty, depth + 1)) return true;
             }
-        }
-        if (!found) return false;
+            return false;
+        },
+        .union_type, .intersection => {
+            const ms = try c.scratch().dupe(TypeId, try c.memberList(t));
+            defer c.scratch().free(ms);
+            for (ms) |m| {
+                if (try containsAnyFunctionType(c, m, depth + 1)) return true;
+            }
+            return false;
+        },
+        .object => {
+            for (0..s.objectPropCount(t)) |i| {
+                if (try containsAnyFunctionType(c, s.objectProp(t, @intCast(i)).ty, depth + 1)) return true;
+            }
+            return false;
+        },
+        else => return false,
     }
-    return true;
+}
+
+/// Would the pass-two contextual type `ctx2` leave one of `node`'s
+/// context-sensitive function properties with NO call signature? That is the
+/// one outcome the skipped round cannot be allowed to produce: the property's
+/// parameters would go implicit `any` in the AUTHORITATIVE pass, which is a
+/// diagnostic tsc does not report and the context-free reading did not
+/// produce either.
+fn ctxSensitiveLosesSignature(c: *Checker, node: Node, ctx2: TypeId, depth: u8) Error!bool {
+    if (depth > 4) return false;
+    const rp = try c.resolveStructural(ctx2);
+    switch (c.ts.kind(rp)) {
+        .object, .union_type, .intersection => {},
+        else => return false,
+    }
+    for (c.tree.nodeRange(node)) |m| {
+        if (m == null_node) continue;
+        switch (c.nodeTag(m)) {
+            .object_property, .object_method => {},
+            else => continue,
+        }
+        const val = c.tree.nodeData(m).rhs;
+        if (val == null_node) continue;
+        const key = try c.memberAtom(c.tree.nodeMainToken(m));
+        const prop_ty = try c.ctxPropType(rp, ctx2, key);
+        switch (c.nodeTag(val)) {
+            .arrow_fn, .function_expr => {
+                if (!c.fnExprIsContextSensitive(val)) continue;
+                if (prop_ty == types.no_type) return true;
+                if (try c.contextualCallSig(prop_ty) == types.no_type) return true;
+            },
+            .object_literal => {
+                if (prop_ty == types.no_type) continue;
+                if (try ctxSensitiveLosesSignature(c, val, prop_ty, depth + 1)) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+/// Mark every one of `tp_syms` that `t` mentions. The walk mirrors
+/// `instantiateSignature`'s: it visits what the mapper would visit.
+fn markMentionedTps(c: *Checker, t: TypeId, tp_syms: []const u32, fixed: []bool, depth: u32) Error!void {
+    if (depth > 6) return;
+    const s = &c.ts;
+    switch (s.kind(t)) {
+        .type_param => {
+            if (tpIndex(tp_syms, s.typeParamSymbol(t))) |i| fixed[i] = true;
+        },
+        .array => try markMentionedTps(c, s.arrayElem(t), tp_syms, fixed, depth + 1),
+        .tuple => {
+            for (0..s.tupleLen(t)) |i| {
+                try markMentionedTps(c, s.tupleElem(t, @intCast(i)).ty, tp_syms, fixed, depth + 1);
+            }
+        },
+        .union_type, .intersection => {
+            const ms = try c.scratch().dupe(TypeId, try c.memberList(t));
+            defer c.scratch().free(ms);
+            for (ms) |m| try markMentionedTps(c, m, tp_syms, fixed, depth + 1);
+        },
+        .ref => {
+            const args = try c.scratch().dupe(TypeId, s.refArgs(t));
+            defer c.scratch().free(args);
+            for (args) |a| try markMentionedTps(c, a, tp_syms, fixed, depth + 1);
+        },
+        .object => {
+            for (0..s.objectPropCount(t)) |i| {
+                try markMentionedTps(c, s.objectProp(t, @intCast(i)).ty, tp_syms, fixed, depth + 1);
+            }
+        },
+        .function => {
+            for (0..s.fnParamCount(t)) |i| {
+                try markMentionedTps(c, s.fnParam(t, @intCast(i)).ty, tp_syms, fixed, depth + 1);
+            }
+            try markMentionedTps(c, s.fnReturn(t), tp_syms, fixed, depth + 1);
+        },
+        .conditional => {
+            try markMentionedTps(c, s.condCheck(t), tp_syms, fixed, depth + 1);
+            try markMentionedTps(c, s.condExtends(t), tp_syms, fixed, depth + 1);
+            try markMentionedTps(c, s.condTrue(t), tp_syms, fixed, depth + 1);
+            try markMentionedTps(c, s.condFalse(t), tp_syms, fixed, depth + 1);
+        },
+        .index_access => try markMentionedTps(c, s.indexAccessObj(t), tp_syms, fixed, depth + 1),
+        .keyof_op => try markMentionedTps(c, s.keyofOperand(t), tp_syms, fixed, depth + 1),
+        .mapped => {
+            try markMentionedTps(c, s.mappedConstraint(t), tp_syms, fixed, depth + 1);
+            try markMentionedTps(c, s.mappedValue(t), tp_syms, fixed, depth + 1);
+        },
+        else => {},
+    }
+}
+
+/// Which type parameters will the SECOND inference round fix when it
+/// contextually types the context-sensitive function properties of the
+/// object literal `node` against the parameter type `pt`?
+///
+/// tsc's `contextuallyCheckFunctionExpressionOrObjectLiteralMethod` gives a
+/// context-sensitive function expression its parameter types from
+/// `instantiateSignature(contextualSignature, inferenceContext.mapper)` —
+/// the FIXING mapper — so every type parameter that signature mentions is
+/// pinned at the value inference has reached, and `inferFromTypes` records
+/// no further candidate for it (`if (!inference.isFixed)`).
+///
+/// Crucially that is the PARAMETER positions only. `instantiateSignature`
+/// leaves `resolvedReturnType` undefined and instantiates the return type
+/// lazily, off a mapper stored on the signature, and `instantiateSymbol` is
+/// lazy the same way — so what actually runs the fixing mapper is
+/// `assignContextualParameterTypes` reading one contextual parameter type
+/// per parameter the callback declares. A type parameter named only in the
+/// contextual RETURN is never asked for, so it is never fixed.
+///
+/// That asymmetry is exactly what react-query needs. `useQuery`'s
+/// `placeholderData: (prev: TData | undefined) => TData | undefined` names
+/// `TData` in a PARAMETER, so the callback contributes nothing and `TData`
+/// keeps the value `queryFn` gave it. `useMutation`'s
+/// `onMutate: (vars: TVars) => TContext | undefined` names `TContext` only
+/// in its return, so `onMutate` still determines `TContext` — even though
+/// the sibling `onError`'s `ctx: TContext | undefined` parameter fixes it,
+/// because by then `onMutate`'s candidate is already in hand.
+///
+/// `param_pos` collects the first case, `ret_only` the second: a parameter
+/// some context-sensitive property names in its contextual RETURN and not in
+/// that same property's own parameters. A parameter in `param_pos` records
+/// no CONTRAVARIANT candidate from this pass (what comes back from a fixed
+/// parameter position is the substitution, not evidence); one that is also
+/// in `ret_only` still records the covariant candidate that other property's
+/// return carries.
+///
+/// The one thing this does not model is tsc's ORDER sensitivity — there the
+/// fixing happens as each property is checked, so a `T`-fixing property
+/// written BEFORE the property whose return supplies `T` pins `T` at its
+/// pre-argument value. Property order is otherwise irrelevant to inference,
+/// and the shapes that rely on it are pathological, so both marks are
+/// gathered over the whole literal.
+fn markCtxSensitiveFixed(
+    c: *Checker,
+    node: Node,
+    pt: TypeId,
+    tp_syms: []const u32,
+    param_pos: []bool,
+    ret_only: []bool,
+    depth: u8,
+) Error!void {
+    if (depth > 4) return;
+    const rp = try c.resolveStructural(pt);
+    // Only a materialized member table can name a property. A parameter type
+    // that is still a bare type variable or a generic mapped type has none,
+    // and asking for one drags the key-domain walk through a self-referential
+    // constraint (`T extends Record<keyof T, number>`) — a question with no
+    // answer and no bearing on which parameters get fixed.
+    switch (c.ts.kind(rp)) {
+        .object, .union_type, .intersection => {},
+        else => return,
+    }
+    for (c.tree.nodeRange(node)) |m| {
+        if (m == null_node) continue;
+        switch (c.nodeTag(m)) {
+            .object_property, .object_method => {},
+            else => continue,
+        }
+        const val = c.tree.nodeData(m).rhs;
+        if (val == null_node) continue;
+        const key = try c.memberAtom(c.tree.nodeMainToken(m));
+        const prop_ty = try c.ctxPropType(rp, pt, key);
+        if (prop_ty == types.no_type) continue;
+        switch (c.nodeTag(val)) {
+            .arrow_fn, .function_expr => {
+                if (!c.fnExprIsContextSensitive(val)) continue;
+                const sig = try c.contextualCallSig(prop_ty);
+                if (sig == types.no_type or c.ts.kind(sig) != .function) continue;
+                const mine = try c.scratch().alloc(bool, tp_syms.len);
+                defer c.scratch().free(mine);
+                for (mine) |*x| x.* = false;
+                const th = c.ts.fnThisType(sig);
+                if (th != 0) try markMentionedTps(c, th, tp_syms, mine, 0);
+                for (0..c.ts.fnParamCount(sig)) |i| {
+                    try markMentionedTps(c, c.ts.fnParam(sig, @intCast(i)).ty, tp_syms, mine, 0);
+                }
+                const rets = try c.scratch().alloc(bool, tp_syms.len);
+                defer c.scratch().free(rets);
+                for (rets) |*x| x.* = false;
+                try markMentionedTps(c, c.ts.fnReturn(sig), tp_syms, rets, 0);
+                for (0..tp_syms.len) |i| {
+                    if (mine[i]) param_pos[i] = true else if (rets[i]) ret_only[i] = true;
+                }
+            },
+            .object_literal => try markCtxSensitiveFixed(c, val, prop_ty, tp_syms, param_pos, ret_only, depth + 1),
+            else => {},
+        }
+    }
 }
 
 pub fn instantiateKnownParams(
@@ -1508,94 +1706,165 @@ pub fn inferTypeArgs(
             const fed2 = try c.scratch().alloc(TypeId, tp_syms.len);
             const before2 = try c.scratch().alloc(TypeId, tp_syms.len);
             const before_contra2 = try c.scratch().alloc(TypeId, tp_syms.len);
+            // Which parameters pass two FIXES by handing a context-sensitive
+            // property its parameter types — see `markCtxSensitiveFixed`.
+            const cs_param = try c.scratch().alloc(bool, tp_syms.len);
+            const cs_ret_only = try c.scratch().alloc(bool, tp_syms.len);
             for (tp_syms, 0..) |_, i| {
                 fed2[i] = types.no_type;
                 before2[i] = candidates[i];
                 before_contra2[i] = contra[i];
+                cs_param[i] = false;
+                cs_ret_only[i] = false;
             }
+            try markCtxSensitiveFixed(c, an, pt, tp_syms, cs_param, cs_ret_only, 0);
             c.side_query_depth += 1;
             const ctx2 = blk: {
                 errdefer c.side_query_depth -= 1;
-                const probe = try c.checkExprCached(an, arg_ctx);
-                try c.unify(pt, probe, tp_syms, probe_cands, 0);
-                // Every type parameter is FIXED for pass two: one the probe
-                // could not infer takes its default/constraint (tsc fixes a
-                // type parameter before instantiating the contextual type of
-                // a context-sensitive argument). Leaving it free would hand
-                // the callback a bare type variable — `key: K` compared
-                // against a literal is then a spurious TS2367, where the
-                // constraint `keyof T` is exactly the domain tsc uses.
-                // Resolved in declaration order so a later parameter's
-                // constraint sees the earlier ones (`K extends keyof T`).
+                const saved_aft = c.aft_seen;
+                defer c.aft_seen = saved_aft;
                 var map2: std.ArrayList(TpMap) = .empty;
                 defer map2.deinit(c.scratch());
-                for (tp_syms, 0..) |sym, i| {
-                    var v = if (probe_cands[i] != types.no_type) probe_cands[i] else ret_seed[i];
-                    if (v == types.no_type) {
-                        // Default, else constraint, else the `any`
-                        // placeholder the contextual pass over function
-                        // ARGUMENTS already uses for an unresolved
-                        // parameter — `unknown` would be a stricter type
-                        // than the call can justify and would turn every
-                        // use of the callback's parameter into an error.
-                        v = try c.typeParamDefault(sym);
-                        if (v == types.no_type) v = try c.typeParamConstraint(sym);
-                        if (v == types.no_type) v = types.any_type;
+                var result: TypeId = types.no_type;
+                // Attempt 0 is tsc's round one, under
+                // `CheckMode.SkipContextSensitive` (`resolveCall` sets it
+                // whenever some argument is context sensitive, and
+                // `chooseOverload` clears it for round two). Every
+                // context-sensitive property of this literal reads as
+                // `anyFunctionType`, which `inferFromTypes` refuses, so the
+                // round leaves exactly the type parameters those properties
+                // would have determined UNCONSTRAINED — and the ones the
+                // literal's other properties determine are inferred for
+                // real. Without it a callback property was walked with no
+                // contextual type at all, and the implicit-`any` reading of
+                // its body became a candidate: react-query's
+                // `useQuery({queryKey, queryFn, placeholderData: prev =>
+                // prev || {…}})` fixed the query's data type from the
+                // FALLBACK object instead of from `queryFn`.
+                //
+                // Attempt 1 is the pre-two-round CONTEXT-FREE reading, taken
+                // only when round one left so little that pass two would hand
+                // a context-sensitive property no call signature at all. tsc
+                // never needs it because a parameter round one cannot reach
+                // is one another ARGUMENT supplies — jotai's
+                // `store.set(atom, { onSelect: (color, event) => … })` takes
+                // `Value` from the atom. ztsc infers that parameter from this
+                // very literal, so refusing the literal leaves the callback's
+                // parameters implicit `any` for real. The provisional reading
+                // is worse than tsc's answer and better than none, and it is
+                // reached only when the faithful round yields nothing usable.
+                var attempt: u8 = 0;
+                while (true) : (attempt += 1) {
+                    for (candidates, 0..) |cd, i| probe_cands[i] = cd;
+                    map2.clearRetainingCapacity();
+                    {
+                        const saved_skip = c.skip_ctx_sensitive;
+                        // tsc's `inferTypeArguments` only checks an argument
+                        // under the round's check mode when
+                        // `couldContainTypeVariables(paramType)`. A parameter
+                        // type with no type variable in it has nothing for two
+                        // rounds to decide, and skipping the callback there
+                        // only costs: `store.set(atom, …)`'s rest element
+                        // resolves to `any` here (the `Args[number]` tsc keeps
+                        // is instantiated through the inference context, which
+                        // ztsc has no equivalent of), so the literal is its own
+                        // only reading either way.
+                        c.skip_ctx_sensitive = attempt == 0 and try c.containsTypeParam(pt);
+                        c.aft_seen = false;
+                        defer c.skip_ctx_sensitive = saved_skip;
+                        const probe = try c.checkExprCached(an, arg_ctx);
+                        try c.unify(pt, probe, tp_syms, probe_cands, 0);
                     }
-                    // Declaration order applies to a probe CANDIDATE too,
-                    // not only to a fallback: the probe read the argument
-                    // while the earlier parameters were still free, so its
-                    // candidate can carry them (`reducers`' inferred
-                    // `{ a: (state: State) => void }` still naming the
-                    // `State` that `initialState` has since pinned).
-                    // Handing that to pass two left the free variable in
-                    // the contextual type, so pass two re-derived the same
-                    // half-open candidate and the constraint check
-                    // (`CR extends SliceCaseReducers<State>`) rejected it —
-                    // clamping the parameter to its constraint, whose
-                    // `keyof` is `string`, which is how RTK's
-                    // `slice.actions` became `{}`.
-                    if (map2.items.len > 0) v = try c.instantiate(v, map2.items);
-                    fed2[i] = v;
-                    try map2.append(c.scratch(), .{ .sym = sym, .ty = v });
+                    // Every type parameter is FIXED for pass two: one the
+                    // probe could not infer takes its default/constraint (tsc
+                    // fixes a type parameter before instantiating the
+                    // contextual type of a context-sensitive argument).
+                    // Leaving it free would hand the callback a bare type
+                    // variable — `key: K` compared against a literal is then a
+                    // spurious TS2367, where the constraint `keyof T` is
+                    // exactly the domain tsc uses. Resolved in declaration
+                    // order so a later parameter's constraint sees the earlier
+                    // ones (`K extends keyof T`).
+                    for (tp_syms, 0..) |sym, i| {
+                        var v = if (probe_cands[i] != types.no_type) probe_cands[i] else ret_seed[i];
+                        if (v == types.no_type) {
+                            // Default, else constraint, else `unknown` — tsc's
+                            // `getInferredType` exactly: no candidate takes the
+                            // type parameter's default, and with no default
+                            // `getDefaultTypeArgumentType()` answers `unknown`,
+                            // which the constraint check that follows then
+                            // narrows to the constraint if there is one.
+                            //
+                            // NOT `any`. Round one now leaves a parameter that
+                            // only a context-sensitive property could have
+                            // determined genuinely unconstrained, so this
+                            // fallback is reached for parameters that DO come
+                            // back in pass two — and an `any` fed into a
+                            // callback's parameter position is read straight
+                            // back as an `any` candidate, which absorbs the
+                            // real one a sibling property's return carries.
+                            // react-query's `useInfiniteQuery({queryFn,
+                            // getNextPageParam})` is the shape:
+                            // `getNextPageParam(lastPage: TQueryFnData, …)`
+                            // handed the `any` back and buried the page type
+                            // `queryFn` had just supplied.
+                            v = try c.typeParamDefault(sym);
+                            if (v == types.no_type) v = try c.typeParamConstraint(sym);
+                            if (v == types.no_type) v = types.unknown_type;
+                        }
+                        // Declaration order applies to a probe CANDIDATE too,
+                        // not only to a fallback: the probe read the argument
+                        // while the earlier parameters were still free, so its
+                        // candidate can carry them (`reducers`' inferred
+                        // `{ a: (state: State) => void }` still naming the
+                        // `State` that `initialState` has since pinned).
+                        // Handing that to pass two left the free variable in
+                        // the contextual type, so pass two re-derived the same
+                        // half-open candidate and the constraint check
+                        // (`CR extends SliceCaseReducers<State>`) rejected it —
+                        // clamping the parameter to its constraint, whose
+                        // `keyof` is `string`, which is how RTK's
+                        // `slice.actions` became `{}`.
+                        if (map2.items.len > 0) v = try c.instantiate(v, map2.items);
+                        fed2[i] = v;
+                        try map2.append(c.scratch(), .{ .sym = sym, .ty = v });
+                    }
+                    result = try c.instantiate(pt, map2.items);
+                    if (attempt > 0) break;
+                    if (!c.aft_seen) break; // nothing was skipped
+                    // The one outcome the skipped round must not produce: a
+                    // pass-two contextual type that gives a context-sensitive
+                    // property NO call signature. Its parameters would then be
+                    // implicit `any` in the AUTHORITATIVE pass — a diagnostic
+                    // tsc does not report, because a parameter its round one
+                    // cannot reach is one another ARGUMENT supplies. Where
+                    // ztsc has no other source, the provisional CONTEXT-FREE
+                    // reading is kept: worse than tsc's answer, better than
+                    // none.
+                    if (!try ctxSensitiveLosesSignature(c, an, result, 0)) break;
                 }
-                break :blk try c.instantiate(pt, map2.items);
+                break :blk result;
             };
             c.side_query_depth -= 1;
             const at2 = try c.checkExprCached(an, ctx2);
             try c.unify(pt, at2, tp_syms, candidates, 0);
-            // The contravariant twin of the placeholder echo, for the
-            // object-literal two-pass path (Phase 2 has the same guard for a
-            // bare function argument). Pass two typed every un-annotated
-            // callback property from `fed2`, so a parameter position that
-            // mentions the type variable hands the substitution straight back
-            // as a CONTRAVARIANT candidate — and a contravariant candidate
-            // OUTRANKS the covariant one, so the echo replaces the real
-            // inference. tsc never sees it: for a context-sensitive argument
-            // it leaves the variable free (nothing to instantiate the
-            // contextual type with yet), so the parameter's type stays `T`
-            // and inferring `T` from `T` yields nothing.
-            //
-            // react-query's `useMutation({ onMutate, onError })` is the shape:
-            // `onMutate` returns `Ctx | undefined` (the covariant candidate)
-            // while `onError`'s `onMutateResult: TContext | undefined`
-            // parameter echoes the fed `Ctx | undefined` back, minus the
-            // `undefined` the target union already matched — a contravariant
-            // `Ctx`, which then rejected `onMutate`'s own return.
-            //
-            // Only a candidate that is our own guess or a part of it is
-            // dropped, and only for a parameter no earlier argument had
-            // already constrained.
-            for (contra, 0..) |*cc, i| {
-                if (cc.* == before_contra2[i] or cc.* == types.no_type) continue;
-                if (before2[i] != types.no_type or fed2[i] == types.no_type) continue;
-                // Only when pass two produced a real COVARIANT candidate to
-                // fall back on. Where the echo is the parameter's only
-                // evidence it is still the best guess available (dropping it
-                // leaves the parameter to its constraint, which loses the
-                // argument's shape outright).
-                if (candidates[i] == types.no_type) continue;
-                if (try c.isFedEcho(cc.*, fed2[i])) cc.* = before_contra2[i];
+            // A parameter this pass FIXED takes no candidate from this pass.
+            // tsc's `inferFromTypes` opens the type-variable arm with
+            // `if (!inference.isFixed)`, and fixing is what
+            // `instantiateSignature(contextualSignature,
+            // inferenceContext.mapper)` did to every parameter named in a
+            // context-sensitive property's contextual PARAMETER positions —
+            // see `markCtxSensitiveFixed`. The value it is fixed AT is the
+            // one this pass fed, so pass one's reading stands and pass two
+            // adds nothing: what comes back from such a position is the
+            // substitution itself, not evidence.
+            for (0..tp_syms.len) |i| {
+                if (!cs_param[i]) continue;
+                contra[i] = before_contra2[i];
+                if (cs_ret_only[i]) continue;
+                candidates[i] = before2[i];
+                if (candidates[i] == types.no_type and probe_cands[i] != types.no_type)
+                    candidates[i] = probe_cands[i];
             }
             continue;
         }
@@ -2303,6 +2572,17 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
     switch (s.kind(param)) {
         .type_param => {
             if (tpIndex(tp_syms, s.typeParamSymbol(param))) |i| {
+                // tsc's `inferFromTypes` refuses a source carrying
+                // `ObjectFlags.NonInferrableType` as a candidate for a type
+                // variable, and `anyFunctionType` is the archetype: it is
+                // what a context-sensitive function argument reads as while
+                // the first inference round runs, so recording it would fix
+                // the very parameter that round exists to leave open. The
+                // flag PROPAGATES, so an object literal that merely carries
+                // one is refused whole — which is what leaves redux-toolkit's
+                // `CR` free after round one instead of pinned to a bag of
+                // placeholders.
+                if (c.aft_seen and try containsAnyFunctionType(c, arg, 0)) return;
                 const cand = arg;
                 // An inference was MADE here, whatever it does to the slot —
                 // see `Checker.infer_writes`.

@@ -74,7 +74,18 @@ pub const true_type: TypeId = 14;
 pub const false_type: TypeId = 15;
 /// `{}` — the empty (non-fresh) object type.
 pub const empty_object_type: TypeId = 16;
-pub const first_free_index: TypeId = 17;
+/// tsc's `anyFunctionType`: the placeholder a CONTEXT-SENSITIVE function
+/// expression is typed as while a call's first inference round runs under
+/// `CheckMode.SkipContextSensitive`. It carries no properties and no call
+/// signatures, so nothing structural is learned from it, and
+/// `inferFromTypes` refuses it outright as a candidate for a type variable
+/// (tsc marks it `ObjectFlags.NonInferrableType`) — the round-1 reading of
+/// such an argument is an artifact of running before the type arguments
+/// exist, and the second round re-derives it for real. Distinct from `{}`
+/// only by the not-inferable flag, which is what keeps it a separate
+/// interned id.
+pub const any_function_type: TypeId = 17;
+pub const first_free_index: TypeId = 18;
 
 pub const Kind = enum(u8) {
     /// Reserved index 0.
@@ -428,6 +439,9 @@ pub const Store = struct {
         // empty object {} at index 16.
         const eo = try s.makeObject(&.{}, no_type, no_type, 0);
         std.debug.assert(eo == empty_object_type);
+        // `anyFunctionType` at index 17.
+        const aft = try s.makeObject(&.{}, no_type, no_type, obj_flag_not_inferable);
+        std.debug.assert(aft == any_function_type);
         return s;
     }
 

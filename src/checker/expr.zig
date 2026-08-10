@@ -76,18 +76,55 @@ const widenLiteral = @import("names.zig").widenLiteral;
 // expressions
 // =====================================================================
 
+/// Does tsc's `checkMode` — and so `CheckMode.SkipContextSensitive` — reach
+/// this node's own subexpressions? The set is exactly the one
+/// `isContextSensitive` recurses through: the forms whose type is built out
+/// of a subexpression's type, so a context-sensitive part makes the whole
+/// context sensitive. Everything else (a call, a member access, a function
+/// BODY) starts a fresh, ordinary check.
+fn skipModePropagates(c: *Checker, node: Node, tag: ast.Tag) bool {
+    return switch (tag) {
+        .paren_expr, .object_literal, .array_literal, .cond_expr => true,
+        .binary => switch (c.tree.tokens.tag(c.tree.nodeMainToken(node))) {
+            .pipe_pipe, .question_question => true,
+            else => false,
+        },
+        else => false,
+    };
+}
+
 pub fn checkExprCached(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     if (node == null_node) return types.any_type;
+    // tsc's `CheckMode.SkipContextSensitive`, the first of a generic call's
+    // two inference rounds: a context-sensitive function expression is
+    // typed as `anyFunctionType` rather than walked. Its parameters have no
+    // contextual type yet — the type arguments that would supply one are
+    // what this round exists to infer — so walking it would only publish
+    // implicit-`any` readings of its body and feed `inferFromTypes` a
+    // source tsc refuses outright. The second round re-checks it for real.
+    const saved_skip = c.skip_ctx_sensitive;
+    if (saved_skip) {
+        const tag = c.nodeTag(node);
+        if ((tag == .arrow_fn or tag == .function_expr) and c.fnExprIsContextSensitive(node)) {
+            c.aft_seen = true;
+            return types.any_function_type;
+        }
+        if (!skipModePropagates(c, node, tag)) c.skip_ctx_sensitive = false;
+    }
+    defer c.skip_ctx_sensitive = saved_skip;
     // Anchor any TS2589 raised while materializing this expression's type
     // (instantiation limit) at the expression's span.
     c.anchorInst(node);
     const key = c.nodeKey(node);
-    if (c.node_types.get(key)) |e| {
+    // A node still under the skip flag has a PROVISIONAL type — the real one
+    // depends on properties this round deliberately did not read — so it
+    // neither trusts nor fills the memo.
+    if (!c.skip_ctx_sensitive) if (c.node_types.get(key)) |e| {
         if (e.ctx == ctx) {
             c.stats.node_type_hits += 1;
             return e.ty;
         }
-    }
+    };
     c.stats.node_type_misses += 1;
     // Release this expression's scratch on the way out, the way an
     // `instantiateId` frame and a `relate` frame already do. An expression's
@@ -124,7 +161,8 @@ pub fn checkExprCached(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     // A side query is speculative — it runs out of the checker's top-down
     // order — so it must not publish its answer for the authoritative
     // check to read back.
-    if (c.side_query_depth == 0 and c.no_publish_depth == 0) try c.node_types.put(c.cm(), key, .{ .ty = t, .ctx = ctx });
+    if (c.side_query_depth == 0 and c.no_publish_depth == 0 and !c.skip_ctx_sensitive)
+        try c.node_types.put(c.cm(), key, .{ .ty = t, .ctx = ctx });
     return t;
 }
 
