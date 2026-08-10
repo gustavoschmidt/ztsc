@@ -2059,6 +2059,48 @@ pub fn classChainMemberIsAbstract(c: *Checker, t: TypeId, name: Atom, depth: u32
     return c.classChainMemberIsAbstract(nb, name, depth + 1);
 }
 
+/// The declared type of instance member `name` on a class/interface
+/// reference `t`, read from that member's own DECLARATION instead of from
+/// the folded instance table, and walking the `extends` chain with the
+/// reference's type arguments substituted in.
+///
+/// This is the lazy half of `classInstanceGeneric`: it answers ONE member
+/// without demanding the whole table, which is what makes it usable while
+/// that table is still materializing. A `typeof this.x` written as a member
+/// of the very class that declares `x` is exactly that situation — the fold
+/// cuts to `err` and there is no table to read, but the member's own
+/// declaration is perfectly resolvable. Null when the name is not declared
+/// anywhere on the chain.
+pub fn classChainMemberType(c: *Checker, t: TypeId, name: Atom, depth: u32) Error!?TypeId {
+    if (depth >= 64 or c.ts.kind(t) != .ref) return null;
+    const sym = c.ts.refSymbol(t);
+    const f = c.symFlags(sym);
+    if (!f.class and !f.interface) return null;
+    var map: std.ArrayList(TpMap) = .empty;
+    defer map.deinit(c.scratch());
+    const args = c.ts.refArgs(t);
+    if (args.len > 0) try c.buildInstMap(sym, args, &map);
+    {
+        const saved = c.enterSymFile(sym);
+        defer c.restoreCtx(saved);
+        if (c.bind.membersScopeOf(c.localOf(sym))) |ms| {
+            const lo = c.bind.scope_members_start[ms];
+            const hi = c.bind.scope_members_start[ms + 1];
+            for (lo..hi) |i| {
+                if (c.bind.member_atoms[i] != name) continue;
+                const mt = try c.memberTypeOf(c.toGlobal(c.bind.member_syms[i]));
+                return if (map.items.len == 0) mt else try c.instantiate(mt, map.items);
+            }
+        }
+    }
+    // The base reference is written in the derived class's own parameters,
+    // so the derived reference's arguments have to reach it before the walk
+    // continues.
+    const nb = try c.baseClassRef(sym) orelse return null;
+    const base_ref = if (map.items.len == 0) nb else try c.instantiate(nb, map.items);
+    return c.classChainMemberType(base_ref, name, depth + 1);
+}
+
 /// Whether a class member symbol's declaration is `abstract`.
 pub fn memberIsAbstract(c: *Checker, msym: SymbolId) bool {
     for (c.declsOf(msym)) |decl| {

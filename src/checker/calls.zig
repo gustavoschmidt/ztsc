@@ -1516,6 +1516,7 @@ pub fn inferTypeArgs(
     const saved_contra_pos = c.contra_pos;
     const saved_top_flags = c.top_flags;
     const saved_rev_flags = c.rev_flags;
+    const saved_rev_owner = c.rev_owner;
     const saved_rev_prio = c.rev_prio;
     const saved_nontop_depth = c.nontop_depth;
     c.contra_cands = contra;
@@ -1523,6 +1524,7 @@ pub fn inferTypeArgs(
     c.contra_pos = 0;
     c.top_flags = top_flags;
     c.rev_flags = rev_flags;
+    c.rev_owner = candidates.ptr;
     c.rev_prio = 0;
     c.nontop_depth = 0;
     defer {
@@ -1531,6 +1533,7 @@ pub fn inferTypeArgs(
         c.contra_pos = saved_contra_pos;
         c.top_flags = saved_top_flags;
         c.rev_flags = saved_rev_flags;
+        c.rev_owner = saved_rev_owner;
         c.rev_prio = saved_rev_prio;
         c.nontop_depth = saved_nontop_depth;
     }
@@ -1772,6 +1775,22 @@ pub fn inferTypeArgs(
                         c.skip_ctx_sensitive = attempt == 0 and try c.containsTypeParam(pt);
                         c.aft_seen = false;
                         defer c.skip_ctx_sensitive = saved_skip;
+                        // The probe is THIS call's inference, just accumulated
+                        // into a scratch array, so the priority tier has to
+                        // hold for it — otherwise a candidate tsc records at
+                        // `NakedTypeVariable` priority lands here at full
+                        // priority and pins the very parameter the probe's
+                        // answer will hand every context-sensitive callback.
+                        const probe_rev = try c.scratch().alloc(bool, tp_syms.len);
+                        for (probe_rev) |*x| x.* = false;
+                        const outer_rev_flags = c.rev_flags;
+                        const outer_rev_owner = c.rev_owner;
+                        c.rev_flags = probe_rev;
+                        c.rev_owner = probe_cands.ptr;
+                        defer {
+                            c.rev_flags = outer_rev_flags;
+                            c.rev_owner = outer_rev_owner;
+                        }
                         const probe = try c.checkExprCached(an, arg_ctx);
                         try c.unify(pt, probe, tp_syms, probe_cands, 0);
                     }
@@ -2295,6 +2314,35 @@ pub fn tpIndex(tp_syms: []const u32, sym: u32) ?usize {
     return null;
 }
 
+/// Is `t` a BARE inference variable of the call being solved — tsc's
+/// "naked type variable" (`getInferenceInfoForType` answering for the type
+/// itself, not for something wrapping it)?
+pub fn isNakedInferVar(c: *Checker, t: TypeId, tp_syms: []const u32) bool {
+    if (c.ts.kind(t) != .type_param) return false;
+    return tpIndex(tp_syms, c.ts.typeParamSymbol(t)) != null;
+}
+
+/// Does `t` name any of `tp_syms` anywhere inside it? Answers the question
+/// "is this candidate really evidence, or does it just echo a variable the
+/// call has not solved yet".
+///
+/// Gated on `containsTypeParam` — a memoized bit — so a candidate with no
+/// type parameter at all costs one lookup and never reaches the member walk
+/// behind `tpMentions`. A signature that binds its OWN parameters saturates
+/// there, which reads here as "mentions", and erring that way is the safe
+/// direction: it falls back to the base-constraint erasure that is tsc's
+/// unconditional behaviour for a generic argument signature.
+pub fn echoesInferVar(c: *Checker, t: TypeId, tp_syms: []const u32) Error!bool {
+    if (tp_syms.len == 0) return false;
+    if (!try c.containsTypeParam(t)) return false;
+    const m = try c.tpMentions(t);
+    if (m.saturated) return true;
+    for (m.syms) |sym| {
+        if (tpIndex(tp_syms, sym) != null) return true;
+    }
+    return false;
+}
+
 /// A candidate that violates its param's constraint is normally clamped to
 /// the constraint. When the candidate is a UNION, prefer the
 /// constraint-satisfying members over erasing the whole inference — this
@@ -2515,10 +2563,11 @@ pub fn topSlot(c: *Checker, candidates: []TypeId, i: usize) ?*bool {
     return &c.top_flags[i];
 }
 
-/// The reverse-mapped-priority flag for type parameter `i` (same identity
-/// rule as `contraSlot`).
+/// The lower-priority flag for type parameter `i`. Identity is `rev_owner`
+/// rather than `contra_owner`, so the two-round probe's scratch accumulator
+/// can register for the priority tier alone (see `Checker.rev_flags`).
 pub fn revSlot(c: *Checker, candidates: []TypeId, i: usize) ?*bool {
-    if (c.contra_owner != candidates.ptr) return null;
+    if (c.rev_owner != candidates.ptr) return null;
     if (c.rev_flags.len != candidates.len) return null;
     return &c.rev_flags[i];
 }
@@ -3378,18 +3427,33 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                 var all_unbound = true;
                 var erased_self = false;
                 for (own_syms, own_cands) |sym, cand0| {
-                    // A candidate that IS one of the parameters this call is
-                    // still solving carries no information: it would leave
-                    // the argument's signature mentioning the very variable
+                    // A candidate that MENTIONS one of the parameters this
+                    // call is still solving carries no information: it would
+                    // leave the argument's signature naming the very variable
                     // being inferred, and since parameters are contravariant
                     // that self-candidate then outranks the real covariant
                     // evidence and the signature stays uninstantiated. tsc
                     // erases a generic argument signature's own parameters
                     // to their base constraints (`getBaseSignature`) before
                     // inferring from it, which is what the fallback does.
+                    //
+                    // The mention need not be the whole candidate. react-query
+                    // declares `placeholderData?: NonFunctionGuard<TQueryData>
+                    // | PlaceholderDataFunction<NonFunctionGuard<TQueryData>>`
+                    // and `keepPreviousData` is `<T>(prev: T | undefined) => T
+                    // | undefined`, so `T`'s candidate is the CONDITIONAL
+                    // `NonFunctionGuard<TQueryData>` — not a bare parameter,
+                    // but every bit as self-referential. Substituted, it made
+                    // the query's own data type infer to a type mentioning
+                    // itself, and every consumer of the result read the
+                    // unreduced conditional instead of the queried shape.
+                    //
+                    // Only THIS call's variables disqualify a candidate: an
+                    // enclosing function's parameter is an ordinary type here
+                    // and must keep flowing (`xs.map(identity)` inside
+                    // `<T>(xs: T[])` still infers through `T`).
                     const self_ref = cand0 != types.no_type and
-                        s.kind(cand0) == .type_param and
-                        tpIndex(tp_syms, s.typeParamSymbol(cand0)) != null;
+                        try echoesInferVar(c, cand0, tp_syms);
                     if (self_ref) erased_self = true;
                     const cand = if (self_ref) types.no_type else cand0;
                     if (cand != types.no_type) all_unbound = false;
@@ -3508,8 +3572,33 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
             // nothing, while the true branch reaches the reverse-mapped
             // inference below. This is how `configureStore({ reducer: {…} })`
             // recovers `S` from the object-literal reducer map.
-            try c.unify(s.condTrue(param), arg, tp_syms, candidates, depth + 1);
-            try c.unify(s.condFalse(param), arg, tp_syms, candidates, depth + 1);
+            //
+            // A branch that is a NAKED inference variable is inferred LAST and
+            // at lower priority — tsc's `inferToMultipleTypes`, reached
+            // through `inferToConditionalType`: "inferences directly to naked
+            // type variables are given lower priority as they are less
+            // specific". Any candidate an ordinary position supplies
+            // therefore REPLACES what the branch offers.
+            //
+            // react-query's `placeholderData?: NonFunctionGuard<TQueryData> |
+            // PlaceholderDataFunction<NonFunctionGuard<TQueryData>>` is the
+            // shape that needs it: `NonFunctionGuard<T> = T extends Function ?
+            // never : T`, so every candidate that property can offer reaches
+            // the query's data type only through the false branch. At full
+            // priority the erased `unknown` it yields outranked nothing and
+            // was folded into the real data type `queryFn` supplies, so
+            // `useQuery({queryKey, queryFn, placeholderData: keepPreviousData})`
+            // came back `unknown` and every read off `data` was a TS2339.
+            const t_naked = isNakedInferVar(c, s.condTrue(param), tp_syms);
+            const f_naked = isNakedInferVar(c, s.condFalse(param), tp_syms);
+            if (!t_naked) try c.unify(s.condTrue(param), arg, tp_syms, candidates, depth + 1);
+            if (!f_naked) try c.unify(s.condFalse(param), arg, tp_syms, candidates, depth + 1);
+            if (t_naked or f_naked) {
+                c.rev_prio += 1;
+                defer c.rev_prio -= 1;
+                if (t_naked) try c.unify(s.condTrue(param), arg, tp_syms, candidates, depth + 1);
+                if (f_naked) try c.unify(s.condFalse(param), arg, tp_syms, candidates, depth + 1);
+            }
         },
         .intersection => {
             // A branded alias — `LineSegment<P> = [P, P] & { _brand: … }`,
