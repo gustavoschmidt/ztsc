@@ -1013,10 +1013,13 @@ pub fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, d
                 // function-expression/arrow container walk in
                 // `checkIdentifier`). Excluded, so the declared type stands:
                 //   • non let/var/param/catch symbols,
-                //   • module/global top-level or exported variables — a
-                //     top-level `let` may be reassigned by any function, so
-                //     tsc never trusts the narrowing across a closure (a
-                //     top-level `const` still does, via the const path above),
+                //   • exported variables, and a top-level variable of a
+                //     SCRIPT — tsc's `isMutableLocalVariableDeclaration`
+                //     admits a `let` that is neither exported nor global, and
+                //     a script's top level IS the global scope, where any file
+                //     may reassign the binding. A MODULE's top-level `let` is
+                //     a module-local and does qualify (a top-level `const`
+                //     qualifies either way, via the const path above),
                 //   • the crossed closure being a *function declaration*
                 //     (only function-expression/arrow/method containers extend
                 //     the flow — a hoisted `function` captures at its
@@ -1027,7 +1030,16 @@ pub fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, d
                 if (sf.exported) return declared;
                 if (c.symFile(key.sym) != c.cur_file) return declared;
                 const decl_scope = c.bind.symbol_scopes[c.localOf(key.sym)];
-                if (c.bind.scope_kinds[c.containerOf(decl_scope)] != .function) return declared;
+                switch (c.bind.scope_kinds[c.containerOf(decl_scope)]) {
+                    .function => {},
+                    // A module's top level. `var` is left out here even though
+                    // the function case still admits it: tsc admits neither,
+                    // and the function case is a pre-existing looseness this
+                    // does not propagate.
+                    .file => if (!c.bind.is_module or
+                        !(sf.let_decl or sf.param or sf.catch_param)) return declared,
+                    else => return declared,
+                }
                 switch (c.nodeTag(b.flowNode(flow))) {
                     .arrow_fn, .function_expr, .object_method, .class_method => {},
                     else => return declared, // function declaration etc.

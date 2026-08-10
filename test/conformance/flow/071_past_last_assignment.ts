@@ -117,6 +117,19 @@ export function classExpressionMethod() {
   }
 }
 
+// A MODULE's top-level `let` is a module-local, not a global, so it is a
+// mutable local variable like any other. (A SCRIPT's top-level `let` is not —
+// flow/065 is that file, and its narrowing does not cross.)
+let moduleLocal: string | undefined;
+moduleLocal = 'hi';
+export function readsAModuleLocal() {
+  if (moduleLocal) {
+    reg(() => {
+      use(moduleLocal);
+    });
+  }
+}
+
 // --- rejected: each boundary of the rule -----------------------------------
 
 // Assigned again after the closure: the reference is not past that assignment.
