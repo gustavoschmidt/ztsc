@@ -2367,6 +2367,7 @@ pub const Checker = struct {
         inst_budget: u64,
         budget_epoch: u64,
         epoch_sym: SymbolId,
+        const_ctx: bool,
     };
 
     pub fn saveCtx(c: *const Checker) SavedCtx {
@@ -2378,6 +2379,7 @@ pub const Checker = struct {
             .inst_budget = c.inst_budget,
             .budget_epoch = c.budget_epoch,
             .epoch_sym = c.epoch_sym,
+            .const_ctx = c.const_ctx,
         };
     }
 
@@ -2389,6 +2391,7 @@ pub const Checker = struct {
         c.inst_budget = s.inst_budget;
         c.budget_epoch = s.budget_epoch;
         c.epoch_sym = s.epoch_sym;
+        c.const_ctx = s.const_ctx;
     }
 
     /// Open a fresh instantiation-budget window (see `budget_epoch`). Called
@@ -2431,6 +2434,25 @@ pub const Checker = struct {
     /// there, which is also where the truncation belongs — but no source
     /// element can be poisoned by the cost of a declaration it merely
     /// referenced.
+    ///
+    /// A const ASSERTION context (`const_ctx`) is dropped for the same reason
+    /// and it is the same defect. `x as const` sets a single mutable flag that
+    /// object/array literals read to keep their members literal and readonly;
+    /// materializing another declaration's type is not part of that assertion,
+    /// but the demand can land anywhere. social-app's
+    ///
+    ///     export const ScrollbarOffsetContext = createContext({
+    ///       isWithinOffsetView: false,
+    ///     })
+    ///
+    /// kept its property at `false` instead of widening to `boolean` exactly
+    /// when the first walk to demand the symbol reached it from inside an
+    /// `as const` — `Context<{ isWithinOffsetView: false }>` then rejected the
+    /// provider's `{ isWithinOffsetView: boolean }` value. The materialized
+    /// type is memoized per symbol, so whichever walk got there first fixed the
+    /// answer for the whole run, and the TS2322 appeared under
+    /// `--file-order=shuffle=3` and not under `source`. `restoreCtx` puts the
+    /// caller's flag back.
     pub fn enterSymFile(c: *Checker, sym: SymbolId) SavedCtx {
         const saved = c.saveCtx();
         const f = c.symFile(sym);
@@ -2439,6 +2461,7 @@ pub const Checker = struct {
             c.setFile(f);
             c.this_type = 0;
         }
+        c.const_ctx = false;
         c.inst_count = 0;
         c.inst_budget = max_decl_instantiation_count;
         c.newBudgetWindow();
