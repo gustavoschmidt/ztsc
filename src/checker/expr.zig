@@ -411,22 +411,38 @@ pub fn checkJsxElement(c: *Checker, node: Node) Error!TypeId {
     // `Link`/`Button`/`Toggle.Item` is written with) left the arrow's
     // parameters implicit `any` — TS7006 at each one.
     //
-    // Scoped to the single-semantic-child case, which is what the idiom is:
-    // tsc maps a multi-child list through the field type's array-like element
-    // (indexed at the child's position), and typing every child at the whole
-    // field type instead would be wrong.
-    const child_ctx: TypeId = blk: {
+    // With ONE semantic child the field type types it directly; with several,
+    // tsc maps the field type through each ARRAY-LIKE constituent's element at
+    // that child's position (`mapType(childFieldType, t => isArrayLikeType(t) ?
+    // getIndexedAccessType(t, getNumberLiteralType(childIndex)) : t)`) and
+    // leaves the non-array constituents alone. Without the multi-child half,
+    // `<PagerWithHeader>{a}{b}{c}</PagerWithHeader>` — whose `children` is
+    // `(((p: P) => JSX.Element) | null)[] | ((p: P) => JSX.Element)` — left
+    // each render prop's destructured parameter implicit `any`.
+    const child_field: TypeId = blk: {
         if (!is_component or props == types.no_type) break :blk types.no_type;
-        if (c.jsxSemanticChildCount(e) != 1) break :blk types.no_type;
         const rt = try c.resolveStructural(props);
         if (rt == types.no_type) break :blk types.no_type;
         break :blk try c.ctxPropType(rt, rt, try c.jsxChildrenAttrName());
     };
+    const single_child = c.jsxSemanticChildCount(e) == 1;
+    var child_i: u32 = 0;
     for (c.tree.extraRange(e.children_start, e.children_end)) |ch| {
+        const semantic = c.jsxChildIsSemantic(ch);
+        defer if (semantic) {
+            child_i += 1;
+        };
         switch (c.nodeTag(ch)) {
             .jsx_expr_container => {
                 const cd = c.tree.nodeData(ch);
-                if (cd.lhs != null_node) _ = try c.checkExprCached(cd.lhs, child_ctx);
+                if (cd.lhs == null_node) continue;
+                const child_ctx: TypeId = if (child_field == types.no_type)
+                    types.no_type
+                else if (single_child)
+                    child_field
+                else
+                    try c.jsxChildCtxAt(child_field, child_i);
+                _ = try c.checkExprCached(cd.lhs, child_ctx);
             },
             .jsx_element => _ = try c.checkJsxElement(ch),
             else => {}, // jsx_text
@@ -1033,6 +1049,15 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
     // Per-attribute value assignability + excess, for explicit attrs.
     var first_excess: Span = .{ .start = 0, .end = 0 };
     var have_excess = false;
+    // tsc's `checkTypeRelatedToAndOptionallyElaborate`: when the ELABORATION
+    // (`elaborateJsxComponents` → `elaborateElementwise`) reported at least one
+    // per-attribute error, the top-level `checkTypeRelatedTo` is never run at
+    // all — so the whole-attributes-object diagnostics (excess property,
+    // missing required prop, weak type) are suppressed by any attribute-level
+    // failure. `elaborateElementwise` `continue`s over an attribute the target
+    // does not know, so an EXCESS attribute never sets this; only a known prop
+    // whose value mismatches does.
+    var attr_elaborated = false;
     for (built.items) |b| {
         if (b.overwritten) continue; // shadowed by a later spread (TS2783)
         if (try c.propOfType(rt, b.name)) |p| {
@@ -1055,7 +1080,7 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
                 try c.makeUnion2(p.ty, types.undefined_type)
             else
                 p.ty;
-            _ = try c.checkAssignable(b.ty, target, b.value, vspan);
+            if (!try c.checkAssignable(b.ty, target, b.value, vspan)) attr_elaborated = true;
         } else if (try c.unionNestedPropType(rt, b.name)) |nested| {
             // A prop that lives in a UNION member of an intersection props
             // type (`Base & (VariantA | VariantB)`) is not found by
@@ -1063,7 +1088,7 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
             // the excess arm below only fires for an open target, silently.
             // Check it against the union of the arms that declare it, the
             // same type the attribute's contextual lookup above uses.
-            _ = try c.checkAssignable(b.ty, nested, b.value, c.tokSpan(b.name_tok));
+            if (!try c.checkAssignable(b.ty, nested, b.value, c.tokSpan(b.name_tok))) attr_elaborated = true;
         } else if (target_open and !containsAtom(ia_names.items, b.name)) {
             if (!have_excess) {
                 first_excess = c.tokSpan(b.name_tok);
@@ -1073,6 +1098,13 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
     }
 
     if (!is_obj_target) return; // lenient target: value checks only
+
+    // An attribute-level elaboration already reported: tsc stops here (see
+    // `attr_elaborated`). This is a real suppression, not a cosmetic one —
+    // tsc's error lands on the narrow attribute node, where a `@ts-expect-error`
+    // written above that attribute absorbs it, while the whole-object error
+    // would land on a line no directive covers.
+    if (attr_elaborated) return;
 
     // When `JSX.IntrinsicAttributes` exists, a component's effective props
     // target is the intersection `IntrinsicAttributes & Props`, for which
@@ -1303,42 +1335,60 @@ pub fn jsxChildrenPresent(c: *Checker, e: ast.JsxElementData) bool {
 pub fn jsxSemanticChildCount(c: *Checker, e: ast.JsxElementData) u32 {
     var n: u32 = 0;
     for (c.tree.extraRange(e.children_start, e.children_end)) |ch| {
-        switch (c.nodeTag(ch)) {
-            .jsx_element => {
-                n += 1;
-                if (n == 2) return n;
-            },
-            .jsx_expr_container => {
-                if (c.tree.nodeData(ch).lhs != null_node) {
-                    n += 1;
-                    if (n == 2) return n;
-                }
-            },
-            else => { // jsx_text
-                // tsc ignores text that is whitespace-only AND spans a
-                // newline (trivia between lines); same-line whitespace is
-                // a meaningful space child.
-                const span = c.nodeSpan(ch);
-                if (span.end <= c.src.len and span.start < span.end) {
-                    var has_newline = false;
-                    var non_ws = false;
-                    for (c.src[span.start..span.end]) |ch2| {
-                        if (ch2 == '\n' or ch2 == '\r') {
-                            has_newline = true;
-                        } else if (ch2 != ' ' and ch2 != '\t') {
-                            non_ws = true;
-                            break;
-                        }
-                    }
-                    if (non_ws or !has_newline) {
-                        n += 1;
-                        if (n == 2) return n;
-                    }
-                }
-            },
-        }
+        if (!c.jsxChildIsSemantic(ch)) continue;
+        n += 1;
+        if (n == 2) return n;
     }
     return n;
+}
+
+/// One child's half of `getSemanticJsxChildren`, so the children walk can
+/// number the semantic children as it goes.
+pub fn jsxChildIsSemantic(c: *Checker, ch: Node) bool {
+    switch (c.nodeTag(ch)) {
+        .jsx_element => return true,
+        .jsx_expr_container => return c.tree.nodeData(ch).lhs != null_node,
+        else => { // jsx_text
+            // tsc ignores text that is whitespace-only AND spans a newline
+            // (trivia between lines); same-line whitespace is a meaningful
+            // space child.
+            const span = c.nodeSpan(ch);
+            if (span.end > c.src.len or span.start >= span.end) return false;
+            var has_newline = false;
+            for (c.src[span.start..span.end]) |ch2| {
+                if (ch2 == '\n' or ch2 == '\r') {
+                    has_newline = true;
+                } else if (ch2 != ' ' and ch2 != '\t') {
+                    return true; // non-whitespace
+                }
+            }
+            return !has_newline;
+        },
+    }
+}
+
+/// tsc's `getContextualTypeForChildJsxExpression` for a MULTI-child element:
+/// `mapType(childFieldType, t => isArrayLikeType(t) ? getIndexedAccessType(t,
+/// getNumberLiteralType(childIndex)) : t)`. A constituent that is not
+/// array-like types the child whole; an array-like one contributes its element
+/// at this child's position.
+pub fn jsxChildCtxAt(c: *Checker, field: TypeId, i: u32) Error!TypeId {
+    const r = try c.resolveStructural(field);
+    switch (c.ts.kind(r)) {
+        .union_type => {
+            const ms = try c.memberList(r);
+            const buf = try c.scratch().alloc(TypeId, ms.len);
+            for (ms, 0..) |m, k| buf[k] = try c.jsxChildCtxAt(m, i);
+            return c.ts.makeUnion(c.scratch(), buf);
+        },
+        .array => return c.ts.arrayElem(r),
+        .tuple => return (try c.tupleElemTypeAt(r, i)) orelse field,
+        .object => {
+            const idx = c.ts.objectNumberIndex(r);
+            return if (idx != 0) idx else field;
+        },
+        else => return field,
+    }
 }
 
 pub fn containsAtom(list: []const Atom, name: Atom) bool {
