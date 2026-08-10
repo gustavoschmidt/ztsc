@@ -81,6 +81,146 @@ pub const EnumInfo = struct {
 
 pub const EnumInitKind = enum { numeric, string, computed };
 
+// =====================================================================
+// the syntactic constant evaluator (tsc's `createEvaluator`)
+// =====================================================================
+
+/// tsc evaluates a template EXPRESSION as a compile-time constant before it
+/// decides between `string` and a template-literal type
+/// (`checkTemplateExpression`: `const evaluated = node.parent.kind !==
+/// TaggedTemplateExpression && evaluate(node).value; if (evaluated !==
+/// undefined) return getFreshTypeOfLiteralType(getStringLiteralType(evaluated))`).
+/// So `` const D = `feedgen|${VIDEO_FEED_URI}` `` — where the substitution
+/// names a `const` whose own initializer is a string constant — has the
+/// single string literal type `"feedgen|at://…"`, NOT `string`, and is
+/// therefore assignable to `` `feedgen|${string}` ``.
+///
+/// This mirrors `utilities.ts`'s `createEvaluator` over the *syntax*, not
+/// over checked types: tsc only folds a name that resolves to an enum member
+/// or to a `const` variable with **no type annotation** and an initializer
+/// (`evaluateEntityNameExpression` -> `isConstantVariable(symbol) &&
+/// declaration && !declaration.type && declaration.initializer`). Folding on
+/// the checked type instead would also fold `declare const x: 'abc'`, which
+/// tsc leaves as `string` — a false NEGATIVE. The operator arms tsc supports
+/// on numbers (`|`, `&`, `<<`, `+`, …) are deliberately left out: omitting a
+/// case only under-folds, which can never turn a tsc error into silence.
+///
+/// Appends the value's string form to `out`; returns false when the
+/// expression is not a compile-time constant.
+pub fn evalConstToString(c: *Checker, node: Node, out: *std.ArrayList(u8), depth: u8) Error!bool {
+    if (depth > max_const_eval_depth or node == null_node) return false;
+    const d = c.tree.nodeData(node);
+    const main_tok = c.tree.nodeMainToken(node);
+    switch (c.nodeTag(node)) {
+        .string_literal => {
+            try out.appendSlice(c.scratch(), c.atomText(try c.memberAtom(main_tok)));
+            return true;
+        },
+        // A no-substitution template is a string constant (tsc folds
+        // `NoSubstitutionTemplateLiteral` to its cooked text).
+        .template_literal => {
+            try out.appendSlice(c.scratch(), c.atomText(try c.templateAtom(main_tok)));
+            return true;
+        },
+        .number_literal => {
+            try appendNumber(c, out, c.numberTokenValue(main_tok));
+            return true;
+        },
+        .paren_expr => return evalConstToString(c, d.lhs, out, depth + 1),
+        .prefix_unary => {
+            const op = c.tree.tokens.tag(main_tok);
+            if ((op == .minus or op == .plus) and d.lhs != null_node and c.nodeTag(d.lhs) == .number_literal) {
+                const v = c.numberTokenValue(c.tree.nodeMainToken(d.lhs));
+                try appendNumber(c, out, if (op == .minus) -v else v);
+                return true;
+            }
+            return false;
+        },
+        .template_expr => {
+            try out.appendSlice(c.scratch(), c.templateHeadText(main_tok));
+            for (c.tree.nodeRange(node)) |sub| {
+                if (sub == null_node) return false;
+                if (!try evalConstToString(c, sub, out, depth + 1)) return false;
+                const ctok = c.templateChunkTokAfter(main_tok, c.nodeSpan(sub).end);
+                try out.appendSlice(c.scratch(), c.templateChunkText(ctok));
+            }
+            return true;
+        },
+        .identifier, .member_expr => return evalConstEntityName(c, node, out, depth),
+        else => return false,
+    }
+}
+
+const max_const_eval_depth: u8 = 16;
+
+fn appendNumber(c: *Checker, out: *std.ArrayList(u8), v: f64) Error!void {
+    var buf: [64]u8 = undefined;
+    const s = if (v == @floor(v) and @abs(v) < 1e15)
+        std.fmt.bufPrint(&buf, "{d}", .{@as(i64, @intFromFloat(v))}) catch return
+    else
+        std.fmt.bufPrint(&buf, "{d}", .{v}) catch return;
+    try out.appendSlice(c.scratch(), s);
+}
+
+/// tsc's `evaluateEntityNameExpression`: an enum member folds to its constant
+/// value, a `const` variable with no annotation folds to its initializer's
+/// value, anything else is not a constant.
+fn evalConstEntityName(c: *Checker, node: Node, out: *std.ArrayList(u8), depth: u8) Error!bool {
+    // `E.M` / `NS.E.M` — the enum-member arm, shared with the enum walk.
+    if (c.nodeTag(node) == .member_expr) {
+        const d = c.tree.nodeData(node);
+        const saved_scope = c.cur_scope;
+        defer c.cur_scope = saved_scope;
+        if (try c.enumSymOfQualifier(d.lhs)) |esym| {
+            const v = (try c.enumMemberValue(esym, try c.memberAtom(d.rhs))) orelse return false;
+            switch (c.ts.kind(v)) {
+                .string_literal => try out.appendSlice(c.scratch(), c.atomText(c.ts.literalAtom(v))),
+                .number_literal, .number_literal_fresh => try appendNumber(c, out, c.ts.numberValue(v)),
+                else => return false,
+            }
+            return true;
+        }
+        return false;
+    }
+    const a = try c.atomOfToken(c.tree.nodeMainToken(node));
+    var sym = switch (c.resolveSpace(a, c.cur_scope, true)) {
+        .sym => |s| s,
+        else => return false,
+    };
+    // Follow import aliases to the declaration that carries the initializer
+    // (tsc's `resolveEntityName` resolves through aliases before the test).
+    var hops: u8 = 0;
+    while (c.symFlags(sym).import_binding) : (hops += 1) {
+        if (hops >= 8) return false;
+        const tgt = c.importTarget(sym) orelse return false;
+        if (tgt.kind != .binding) return false;
+        sym = c.toGlobalIn(tgt.file, tgt.payload);
+    }
+    if (!c.symFlags(sym).const_decl) return false;
+    const decls = c.declsOf(sym);
+    if (decls.len != 1) return false;
+    const decl = decls[0];
+    const saved = c.enterSymFile(sym);
+    defer c.restoreCtx(saved);
+    c.cur_scope = c.symScope(sym);
+    // `declarator_init` is exactly `!declaration.type && declaration.initializer`
+    // with a plain name — a `declarator_full` carries an annotation (or is a
+    // pattern), which tsc refuses to fold.
+    if (c.nodeTag(decl) != .declarator_init) return false;
+    const dd = c.tree.nodeData(decl);
+    if (c.nodeTag(dd.lhs) != .identifier) return false;
+    return evalConstToString(c, dd.rhs, out, depth + 1);
+}
+
+/// The folded string value of a template expression, or null when it is not a
+/// compile-time constant.
+pub fn constTemplateAtom(c: *Checker, node: Node) Error!?Atom {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(c.scratch());
+    if (!try evalConstToString(c, node, &out, 0)) return null;
+    return try c.atom(out.items);
+}
+
 /// The constant value of an enum member initializer that REFERENCES another
 /// constant enum member — `Asc = AssetOrder.Asc`, or `B = A` naming a member
 /// of the same enum. tsc's `computeConstantValue` evaluates an entity-name

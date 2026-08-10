@@ -210,10 +210,20 @@ pub fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             // `` `setUint${BITS[bytes]}` as const `` widened to `string`,
             // which cannot index a `DataView` — a TS7053 false positive on
             // the standard "compute the accessor name" idiom.
-            if (c.const_ctx or c.isConstTypeVar(ctx) or try c.ctxWantsTemplate(ctx)) return c.templateExprType(node);
             for (c.tree.nodeRange(node)) |sub| {
                 if (sub != null_node) _ = try c.checkExprCached(sub, types.no_type);
             }
+            // tsc folds a template expression that is a compile-time CONSTANT
+            // to a fresh string literal *before* either of those two tests
+            // (`checkTemplateExpression`: `const evaluated = node.parent.kind
+            // !== TaggedTemplateExpression && evaluate(node).value; if
+            // (evaluated !== undefined) return
+            // getFreshTypeOfLiteralType(getStringLiteralType(evaluated))`).
+            // See `evalConstToString`.
+            if (node != c.tagged_tpl) {
+                if (try c.constTemplateAtom(node)) |a| return c.ts.makeStringLiteral(a, true);
+            }
+            if (c.const_ctx or c.isConstTypeVar(ctx) or try c.ctxWantsTemplate(ctx)) return c.templateExprType(node);
             return types.string_type;
         },
         .tagged_template => return c.checkTaggedTemplate(node, ctx),
@@ -1613,6 +1623,13 @@ pub fn checkUseBeforeAssigned(c: *Checker, sym: SymbolId, node: Node, tok: Token
 pub fn checkTaggedTemplate(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     const d = c.tree.nodeData(node);
     const tag_ty = try c.checkExprCached(d.lhs, types.no_type);
+    // tsc's constant folding of a template expression is explicitly skipped
+    // when its parent is a tagged template (`node.parent.kind !==
+    // SyntaxKind.TaggedTemplateExpression`); ztsc has no parent links, so the
+    // tagged template marks its own template node for the duration.
+    const prev_tagged = c.tagged_tpl;
+    c.tagged_tpl = d.rhs;
+    defer c.tagged_tpl = prev_tagged;
     // The substitutions are checked by the template node itself; do it first
     // so their diagnostics land whatever the tag turns out to be.
     _ = try c.checkExprCached(d.rhs, types.no_type);

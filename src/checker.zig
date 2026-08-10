@@ -2001,6 +2001,11 @@ pub const Checker = struct {
     /// assertion: object/array literals produce readonly, non-widened,
     /// literal-typed members (recursively). Cleared at function bodies.
     const_ctx: bool = false,
+    /// The template-expression node of the tagged template currently being
+    /// resolved. tsc's constant folding of a template expression tests
+    /// `node.parent.kind !== SyntaxKind.TaggedTemplateExpression`; ztsc has no
+    /// parent links, so `checkTaggedTemplate` marks its own template here.
+    tagged_tpl: Node = null_node,
     /// Type-parameter symbols of every `inferTypeArgs` call currently on the
     /// stack (innermost last). A symbol in here but *not* in the current call's
     /// `tp_syms` is an OUTER call's still-in-flight inference variable — tsc
@@ -3679,6 +3684,7 @@ pub const Checker = struct {
     pub const eachEnumMember = enums_zig.eachEnumMember;
     pub const enumHasMemberNamed = enums_zig.enumHasMemberNamed;
     pub const enumMemberValue = enums_zig.enumMemberValue;
+    pub const constTemplateAtom = enums_zig.constTemplateAtom;
     pub const enumMembersOf = enums_zig.enumMembersOf;
     pub const enumMemberTypeUnion = enums_zig.enumMemberTypeUnion;
     pub const enumMemberForValue = enums_zig.enumMemberForValue;
