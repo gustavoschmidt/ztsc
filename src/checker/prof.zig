@@ -2114,6 +2114,69 @@
 //! 53% of it and removing it does not clear the trip, so the residue is the
 //! `this`-wrapper tail and would need the relation and inference sites to stop
 //! forcing whole tables, which is the same open item this header ends on.
+//!
+//! ## That last TS2589, CLOSED — and the keystone was not `required` (2026-08-10)
+//!
+//! The successor item above (`propertyTypeOf` reading one member) was carried
+//! on this board as "measured a regression twice on immich, do not re-run".
+//! **That verdict expired without anyone noticing, and the reason is the same
+//! one-word counter `lazyIndexedProp` already routes on.** Both regressions
+//! (453 -> 522 and 453 -> 523) were taken when immich tripped the
+//! instantiation ceiling thousands of times a run; measured today, at
+//! `--checkers=1`:
+//!
+//!     immich       6,534,512 node visits   budget trips 0
+//!     excalidraw     123,842 node visits   budget trips 0
+//!     social-app   8,784,585 node visits   budget trips 350
+//!
+//! immich and excalidraw no longer trip AT ALL — the call-resolution and
+//! eager-bound work closed every one — so gating the conversion on
+//! `inst_ceiling_trips != 0` puts both of them, and all eight packages in
+//! `bench/corpus/real`, on the eager path they measure best on, and turns the
+//! lazy route on only where the eager path has already proven it cannot
+//! finish. The regression mechanism this file documents four times (the eager
+//! table is a PREPAYMENT the later readers live off) is a statement about
+//! programs that finish; it says nothing about one that does not.
+//!
+//! `propertyTypeOf` now asks `lazyIndexedProp` — the same entry point, the same
+//! gate, the same `lazyMemberAt` truncation fallback — before
+//! `resolveStructural`. Measured on the 32-file `schema.ts` repro (that schema,
+//! real zod 3.25.76, four stubbed imports, 0.2 s a run):
+//!
+//!     node visits   800,606 -> 550,899   budget trips 462 -> 295
+//!     diagnostics         2 -> 0
+//!
+//! and on the apps: **social-app 78 -> 76 keys at c1, zero added** (the two that
+//! go are exactly `schema.ts:194` TS2589 and its `schema.ts:199` TS7006), wall
+//! 5.75 -> 3.54 s, peak RSS 482 -> 481 MB; excalidraw byte-identical at
+//! 2 link + 15 check; immich byte-identical at 0.
+//!
+//! ### The `ZodObject.required` keystone is FALSE, and this is the measurement
+//!
+//! An earlier session recorded `ZodObject.required` as 98% of the run's member
+//! charge and predicted that neutralizing its return type alone would take the
+//! repro to zero. It does not. Replacing
+//! `required(): ZodObject<{[k in keyof T]: deoptional<T[k]>}, …>` with
+//! `required(): ZodObject<T, …>` in a private copy of zod's `.d.cts`:
+//!
+//!     node visits   800,606 -> 799,940 (-0.08%)   trips 462 -> 464
+//!     diagnostics         2 -> 2
+//!
+//! The member axis is INCLUSIVE, and `ZodObject`'s own exclusive charge is
+//! 16,425 visits of 800,606. The real spend is the flat `this`-wrapper tail the
+//! section above named — `ZodType` 218,151 self over 1,731 expansions,
+//! `ZodEffects` 192,032 over 1,649, `deoptional` 106,901, then `ZodNullable`,
+//! `ZodReadonly`, `ZodPipeline`, `ZodBranded` — so deleting any ONE member just
+//! moves the charge. Only skipping the table skips the tail, which is why the
+//! fix is the same one `lazyIndexedProp` already was in type position.
+//!
+//! Two lazinesses tsc has that this checker still does not — `instantiate
+//! Signature` leaving `resolvedReturnType` undefined, and `createInstantiated
+//! SymbolTable` storing `(target, mapper)` — were the hypothesis this closure
+//! was expected to need. It needed neither: `lazyMemberAt` IS
+//! `createInstantiatedSymbolTable` at member granularity, and with the ceiling
+//! gate in front of it the deferred-return-type project buys nothing this
+//! corpus can see.
 
 const std = @import("std");
 const types = @import("../types.zig");

@@ -1729,6 +1729,24 @@ pub fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         const raw = try c.checkExprCached(el, ectx);
         var et = raw;
         if (!try c.keepLiteral(et, ectx)) et = try c.widenLiteral(et);
+        // tsc's `checkExpressionForMutableLocation` ends
+        // `getWidenedLiteralLikeTypeForContextualType` with
+        // `getRegularTypeOfLiteralType` on BOTH arms: an element whose literal
+        // the contextual type KEEPS still loses its FRESHNESS. Freshness is a
+        // property of an expression, not of a type an expression lands in, and
+        // an element type is the latter — nothing about `['a', 'b']` should
+        // still say "this `'a'` came from a literal and may widen".
+        //
+        // It escapes through inference. zod's
+        // `z.enum<U extends string, T extends Readonly<[U, ...U[]]>>(values: T)`
+        // infers `T` as the tuple, so a fresh element became a fresh member of
+        // `ZodEnum<T>['_output'] = T[number]` — and social-app's
+        // `useState(() => persisted.get('colorMode'))` then widened that union
+        // to `string`, because `getCovariantInference`'s widening arm fires on
+        // an unconstrained `S` and only fresh literals widen. The `U` half of
+        // the same signature was already regular (`primitiveConstraint`'s arm
+        // in `inferTypeArgs` does exactly this call); the tuple half was not.
+        et = try c.ts.regularLiteral(et);
         try elem_types.append(c.scratch(), et);
         try raw_types.append(c.scratch(), raw);
         try tuple_elems.append(c.scratch(), .{ .ty = et });
@@ -3271,6 +3289,38 @@ pub fn propertyTypeOf(c: *Checker, t: TypeId, name: Atom, name_tok: TokenIndex) 
                 var pt = try c.substThis(p.ty, t);
                 if (p.optional()) pt = try c.makeUnion2(pt, types.undefined_type);
                 return pt;
+            }
+            // A VALUE-position read of ONE member of a generic reference,
+            // substituted on its own — tsc's `getTypeOfPropertyOfType`, which
+            // asks `getPropertyOfType` for a single symbol out of the
+            // instantiated table `createInstantiatedSymbolTable` built from
+            // `(target, mapper)` pairs, and only then runs `getTypeOfSymbol` on
+            // that one symbol. ztsc materializes the whole table instead.
+            //
+            // Gated exactly as the type-position twin is (`lazyIndexedProp`):
+            // only once THIS checker has already hit the instantiation ceiling,
+            // which is the one condition under which the eager table is not a
+            // prepayment but a loss. prof.zig records this conversion as a
+            // large regression on immich twice — the mechanism being that the
+            // whole-table expansion runs early, completes, and is memoized for
+            // every later reader — and both of those measurements were taken
+            // when immich still tripped the ceiling thousands of times. It
+            // trips ZERO times today, as do excalidraw and every package in
+            // `bench/corpus/real`, so the healthy corpus never takes this route
+            // and pays one predictable-false branch for it. social-app's
+            // `z.object({…40 props})` does trip, and there `schema.safeParse`
+            // spends the entire 250,000-node statement budget materializing
+            // `ZodObject`'s ~40-member table — of which it reads exactly one
+            // member — because `required(): ZodObject<{[k in keyof T]:
+            // deoptional<T[k]>}, …>` and the `ZodOptional<this>` /
+            // `ZodEffects<this, …>` fluent tail behind it drag in a thousand
+            // more expansions.
+            if (k == .ref) {
+                if (try c.lazyIndexedProp(t, name)) |p| {
+                    var pt = try c.substThis(p.ty, t);
+                    if (p.optional()) pt = try c.makeUnion2(pt, types.undefined_type);
+                    return pt;
+                }
             }
             const r = try c.resolveStructural(t);
             if (c.ts.kind(r) == .any or c.ts.kind(r) == .err) return types.any_type;
