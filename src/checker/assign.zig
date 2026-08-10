@@ -5346,6 +5346,25 @@ pub fn targetKnowsProp(c: *Checker, rt: TypeId, key: Atom) Error!bool {
             return false;
         },
         .any, .err, .unknown => return true,
+        // tsc's `isKnownProperty` ends in `return false`: only an OBJECT (or
+        // a union/intersection that recurses into one) can know a name. The
+        // constituents below carry no members at all and are reached only
+        // through the union/intersection recursion above — most often as the
+        // `| undefined` an OPTIONAL parameter or property adds. Answering
+        // "known" for them switched the excess-property check off for every
+        // optional target: `cloneElement(child, { style: … })`, whose last
+        // React overload takes `props?: Partial<P> & Attributes`, silently
+        // accepted `style` where tsc reports TS2353 — and, in an OVERLOAD
+        // set, the missing diagnostic also cost the TS2769 its ANCHOR (the
+        // last candidate's re-check found nothing to point at, so the error
+        // landed on the callee instead of on the offending property, out of
+        // reach of the `@ts-expect-error` directly above it).
+        //
+        // The remaining `true` is the conservative answer for a target whose
+        // members ztsc cannot enumerate here (a type parameter, a
+        // conditional/mapped/keyof node, a callable): claiming a name is
+        // excess in one of those risks a false TS2353.
+        .undefined, .null, .void, .never => return false,
         else => return true, // non-object targets: not our business here
     }
 }
