@@ -1228,6 +1228,24 @@ pub const Checker = struct {
     /// Recursive `inferFromExtends` calls made by the in-flight inference root.
     /// Its guards arm only past `max_infer_steps` — see the escape hatch there.
     infer_steps: u64 = 0,
+    /// tsc's `priority` — the `InferencePriority` bitmask of the position
+    /// `inferFromExtends` is currently walking. `inferWithPriority` ORs a bit
+    /// in for the duration of one descent; a LOWER numeric value is a BETTER
+    /// candidate. See `generics.InferPrio`.
+    infer_prio: u16 = 0,
+    /// Nesting depth of `inferFromExtends`'s CONDITIONAL-pattern arm, capped
+    /// at `generics.max_infer_cond_depth` — see there for the measurement that
+    /// sets the ceiling.
+    infer_cond_depth: u32 = 0,
+    /// tsc's `InferenceInfo.priority` — the best priority any candidate has been
+    /// recorded at, one per `infer` binder of the in-flight match, parallel to
+    /// the `vals` array. A better priority CLEARS the binder and takes over; a
+    /// worse one is discarded; an equal one combines. `infer_prio_owner` is the
+    /// identity of the `vals` array they belong to, so a nested match reached
+    /// through an `instantiate` inside this walk simply does not participate
+    /// (the same ownership rule `contra_owner` uses in `calls.zig`).
+    infer_prio_of: []u16 = &.{},
+    infer_prio_owner: ?[*]TypeId = null,
     /// `substThis` memo, keyed `(t << 32 | repl)`. Substituting a receiver into
     /// a member type is a pure function of the two interned ids, and the walk
     /// REBUILDS whole object shapes — drizzle's query builders declare `this`

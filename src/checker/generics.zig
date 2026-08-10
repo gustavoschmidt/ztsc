@@ -543,9 +543,23 @@ pub fn planConcreteConditional(c: *Checker, chk: TypeId, extends_ty: TypeId) Err
         c.infer_gen = c.infer_gen_next;
         c.infer_gen_next +%= 1;
         c.infer_steps = 0;
+        // tsc's `InferenceInfo.priority`, one per binder, seeded worse than
+        // every real priority so the first candidate always takes over. Saved
+        // and restored around a nested match the same way `infer_gen` is.
+        const saved_prio_of = c.infer_prio_of;
+        const saved_prio_owner = c.infer_prio_owner;
+        const saved_prio = c.infer_prio;
+        const prio_of = try c.scratch().alloc(u16, ids.items.len);
+        for (prio_of) |*p| p.* = InferPrio.max_value;
+        c.infer_prio_of = prio_of;
+        c.infer_prio_owner = vals.ptr;
+        c.infer_prio = InferPrio.none;
         defer {
             c.infer_gen = saved_gen;
             c.infer_steps = saved_steps;
+            c.infer_prio_of = saved_prio_of;
+            c.infer_prio_owner = saved_prio_owner;
+            c.infer_prio = saved_prio;
         }
         try c.inferFromExtends(chk, extends_ty, ids.items, vals, false, 0);
         for (vals) |*v| {
@@ -955,11 +969,121 @@ pub const max_infer_depth: u32 = 24;
 /// all, exactly as before" from "this will not finish".
 pub const max_infer_steps: u64 = 100_000;
 
+/// How deep the `.conditional` pattern arm nests. A conditional target is
+/// speculative evidence — at most ONE of its two branches is real — so a
+/// candidate found inside a nested conditional's branch is a guess about a
+/// guess, and tsc keeps it only until any better-priority candidate appears.
+///
+/// ztsc bounds the descent instead of resolving it at the end, because the
+/// descent is where the cost is. Measured on immich (`--inst-profile`,
+/// `--checkers=1`), instantiation node visits by ceiling:
+///
+///     no arm at all   6.66 M   (the pre-feature baseline)
+///     depth 1         6.67 M   (+0.2%)
+///     depth 2         8.55 M   (+28%)
+///     unbounded       9.14 M   (+37%)
+///
+/// and every level past the first bound NOTHING that any gate can see —
+/// social-app, excalidraw, immich and the eight parity packages report the
+/// same key sets at depth 1 as unbounded. This is the same kind of ceiling as
+/// `max_infer_depth` and `max_infer_steps`: not a change to what the walk
+/// means, but a line past which exhaustiveness stops being affordable. Raise
+/// it only with a case that needs it and a re-measurement.
+pub const max_infer_cond_depth: u32 = 1;
+
+/// tsc's `InferencePriority`, verbatim bit values. A candidate's priority is
+/// the OR of every demotion on the path from the extends clause down to the
+/// binder, and `getInferredType` keeps only the candidates recorded at the
+/// LOWEST (best) priority a binder ever saw — a naked variable reached through
+/// a conditional's branch is "less specific" evidence than a direct structural
+/// match and stands down for one.
+///
+/// Only the bits ztsc's `inferFromExtends` can currently produce are named
+/// here; the rest of tsc's ladder is listed for the record so the values do
+/// not drift when another one is implemented.
+pub const InferPrio = struct {
+    pub const none: u16 = 0;
+    /// Naked type variable in a union or intersection target.
+    pub const naked_type_variable: u16 = 1 << 0;
+    pub const speculative_tuple: u16 = 1 << 1;
+    pub const substitute_source: u16 = 1 << 2;
+    pub const homomorphic_mapped_type: u16 = 1 << 3;
+    pub const partial_homomorphic_mapped_type: u16 = 1 << 4;
+    pub const mapped_type_constraint: u16 = 1 << 5;
+    /// Conditional type in a contravariant position.
+    pub const contravariant_conditional: u16 = 1 << 6;
+    pub const return_type: u16 = 1 << 7;
+    pub const literal_keyof: u16 = 1 << 8;
+    pub const no_constraints: u16 = 1 << 9;
+    pub const always_strict: u16 = 1 << 10;
+    /// Seed: worse than every real priority, so the first candidate always wins.
+    pub const max_value: u16 = 1 << 11;
+};
+
+/// The best priority binder `idx` has recorded a candidate at, when `vals` is
+/// the array the in-flight match registered (tsc's `InferenceInfo.priority`).
+/// Null for every other accumulator handed to the walk.
+fn inferPrioSlot(c: *Checker, vals: []TypeId, idx: usize) ?*u16 {
+    if (c.infer_prio_owner != vals.ptr) return null;
+    if (c.infer_prio_of.len != vals.len) return null;
+    return &c.infer_prio_of[idx];
+}
+
+/// tsc's `inferToMultipleTypes`, union form: every target constituent that
+/// can bind receives the source, and the ones that ARE a binder receive it
+/// last and at `InferencePriority.NakedTypeVariable` —
+///
+///     // Inferences directly to naked type variables are given lower priority
+///     // as they are less specific.
+///     if (typeVariableCount > 0) for (const t of targets)
+///       if (getInferenceInfoForType(t)) inferWithPriority(source, t, NakedTypeVariable);
+///
+/// so a wrapper constituent that names the binder structurally
+/// (`RefObject<M | null>`) outranks the bare `M | undefined` arm beside it.
+fn inferToUnionTargets(c: *Checker, src0: TypeId, targets: []const TypeId, ids: []const u32, vals: []TypeId, contra: bool, depth: u32) Error!void {
+    const s = &c.ts;
+    var naked = false;
+    for (targets) |m| {
+        if (!try c.containsInfer(m)) continue;
+        if (s.kind(m) == .infer_var) {
+            naked = true;
+            continue;
+        }
+        try c.inferFromExtends(src0, m, ids, vals, contra, depth + 1);
+    }
+    if (!naked) return;
+    const saved = c.infer_prio;
+    c.infer_prio |= InferPrio.naked_type_variable;
+    defer c.infer_prio = saved;
+    for (targets) |m| {
+        if (s.kind(m) != .infer_var) continue;
+        if (!try c.containsInfer(m)) continue;
+        try c.inferFromExtends(src0, m, ids, vals, contra, depth + 1);
+    }
+}
+
 fn inferFromExtendsInner(c: *Checker, source0: TypeId, pattern: TypeId, ids: []const u32, vals: []TypeId, contra: bool, depth: u32) Error!void {
     const s = &c.ts;
     switch (s.kind(pattern)) {
         .infer_var => {
             const idx = indexOfId(ids, s.inferVarId(pattern)) orelse return;
+            // tsc's `inferFromTypes` type-variable case:
+            //
+            //     if (inference.priority === undefined || priority < inference.priority) {
+            //       inference.candidates = undefined; inference.priority = priority;
+            //     }
+            //     if (priority === inference.priority) { …record the candidate… }
+            //
+            // A better priority throws the whole candidate set away and starts
+            // over; a worse one contributes nothing at all.
+            if (inferPrioSlot(c, vals, idx)) |p| {
+                if (c.infer_prio > p.*) return;
+                if (c.infer_prio < p.*) {
+                    p.* = c.infer_prio;
+                    vals[idx] = source0;
+                    return;
+                }
+            }
             if (vals[idx] == types.no_type) {
                 vals[idx] = source0;
             } else if (contra) {
@@ -1370,6 +1494,62 @@ fn inferFromExtendsInner(c: *Checker, source0: TypeId, pattern: TypeId, ids: []c
             if (base_map.items.len != 0) sr = try c.instantiate(sr, base_map.items);
             try c.inferFromExtends(sr, s.fnReturn(pattern), ids, vals, contra, depth + 1);
         },
+        // A CONDITIONAL pattern — tsc's `inferFromTypes`:
+        //
+        //     else if (target.flags & TypeFlags.Conditional) {
+        //       invokeOnce(source, target, (source, target) => {
+        //         const savePriority = priority;
+        //         priority |= contravariant ? InferencePriority.ContravariantConditional : 0;
+        //         const targetTypes = [getTrueTypeFromConditionalType(target),
+        //                              getFalseTypeFromConditionalType(target)];
+        //         inferToMultipleTypes(source, targetTypes, target.flags);
+        //         priority = savePriority;
+        //       });
+        //     }
+        //
+        // The source is offered to BOTH branches, and everything it binds
+        // there is demoted — `ContravariantConditional` in a contravariant
+        // position, and `NakedTypeVariable` for a branch that IS the binder,
+        // since `inferToMultipleTypes` treats the two branches as a union
+        // target. Both demotions matter: this is the weakest evidence the walk
+        // can produce (the conditional has not been decided, so at most one
+        // branch is real), and the ladder is what lets a direct structural
+        // match elsewhere throw it away.
+        //
+        // With no arm here, a binder reachable only through a conditional was
+        // never inferred at all. react-native-reanimated's
+        //     type ExtractElementRef<TRef> =
+        //       TRef extends ElementType
+        //         ? ComponentRef<TRef> extends never ? TRef : ComponentRef<TRef>
+        //         : TRef
+        // wraps every occurrence of `Instance` inside
+        // `AnimatedComponentRef<Instance>`, so `TRef extends
+        // AnimatedComponentType<any, infer Instance>` left `Instance` at
+        // `unknown` and every `useAnimatedRef<Animated.X>().current` lost its
+        // members.
+        .conditional => {
+            if (c.infer_cond_depth >= max_infer_cond_depth) return;
+            c.infer_cond_depth += 1;
+            defer c.infer_cond_depth -= 1;
+            const saved = c.infer_prio;
+            if (contra) c.infer_prio |= InferPrio.contravariant_conditional;
+            defer c.infer_prio = saved;
+            const branches = [2]TypeId{ s.condTrue(pattern), s.condFalse(pattern) };
+            // `inferToMultipleTypes`, union form: the non-variable branches
+            // first, then the naked ones at `NakedTypeVariable`.
+            for (branches) |b| {
+                if (s.kind(b) == .infer_var) continue;
+                if (!try c.containsInfer(b)) continue;
+                try c.inferFromExtends(source0, b, ids, vals, contra, depth + 1);
+            }
+            const inner = c.infer_prio;
+            for (branches) |b| {
+                if (s.kind(b) != .infer_var) continue;
+                c.infer_prio = inner | InferPrio.naked_type_variable;
+                try c.inferFromExtends(source0, b, ids, vals, contra, depth + 1);
+                c.infer_prio = inner;
+            }
+        },
         .union_type => {
             // tsc's `inferFromTypes` union rule, the same one `unify`'s
             // `.union_type` arm already applies to a call's arguments: "first
@@ -1408,9 +1588,7 @@ fn inferFromExtendsInner(c: *Checker, source0: TypeId, pattern: TypeId, ids: []c
                 if (rem.items.len == 0 or rem.items.len == sms.len) break :blk source0;
                 break :blk try s.makeUnion(c.scratch(), rem.items);
             };
-            for (pms) |m| {
-                if (try c.containsInfer(m)) try c.inferFromExtends(residual, m, ids, vals, contra, depth + 1);
-            }
+            try inferToUnionTargets(c, residual, pms, ids, vals, contra, depth);
         },
         // Intersection pattern (`object & { then(onfulfilled: infer F, …) }`
         // for Awaited; `NextExt & infer Ext` for a redux StoreEnhancer).
