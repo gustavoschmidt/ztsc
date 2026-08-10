@@ -2777,6 +2777,28 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                         .string, .string_literal, .template_literal_type, .string_mapping => return,
                         else => {},
                     }
+                    // tsc's `inferFromIndexTypes`, in the direction the
+                    // object-param arm below already covers the reverse of.
+                    // `U[]` is a reference to `Array<U>`, whose apparent
+                    // members include `[n: number]: U`; a source object that
+                    // declares a number index (`ConcatArray<T>`,
+                    // `ArrayLike<T>`, `readonly [n: number]: T` interfaces)
+                    // pairs with it and fixes `U` outright. This is the only
+                    // route for a source that is array-LIKE without being
+                    // iterable — `ConcatArray<T>` has no `[Symbol.iterator]`,
+                    // so the iteration probe below sees nothing.
+                    //
+                    // It matters most for CONTEXTUAL-RETURN inference: the
+                    // contextual type of `xs.concat(ys.map(f))`'s argument is
+                    // `ConcatArray<Slice>`, and without this `U` in `map`'s
+                    // `U[]` return stayed unbound, so the arrow's body got no
+                    // contextual type, its object literal widened
+                    // (`type: string` instead of `type: "b"`), and every
+                    // `concat` overload rejected it — TS2769.
+                    if (s.kind(ra) == .object and s.objectNumberIndex(ra) != 0) {
+                        try c.unify(s.arrayElem(param), s.objectNumberIndex(ra), tp_syms, candidates, depth + 1);
+                        return;
+                    }
                     if (try c.iterationElementType(ra)) |elem| {
                         try c.unify(s.arrayElem(param), elem, tp_syms, candidates, depth + 1);
                     }
