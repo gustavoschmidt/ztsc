@@ -2877,6 +2877,58 @@ pub fn mappedAddsOptional(c: *Checker, m: TypeId) bool {
     return c.ts.mappedFlags(m) & types.mapped_flag_optional_add != 0;
 }
 
+/// The STRING INDEX SIGNATURE a still-generic mapped type apparently has, or
+/// null when it has none.
+///
+/// tsc's `resolveMappedTypeMembers` does not leave `{[P in K]: V}` memberless
+/// just because `K` is generic: it runs `forEachType(getLowerBoundOfKeyType(K),
+/// addMemberForKeyType)`, and `getLowerBoundOfKeyType` reduces `keyof T` to
+/// `getIndexType(getApparentType(T))`. A key type that is not a literal name
+/// then becomes an INDEX signature of the template rather than a property. So
+/// under `T extends Record<string, any>`, `Record<keyof T, V>` really does have
+/// `[x: string]: V`.
+///
+/// social-app's router is the shape that needs it: `constructor(description:
+/// Record<keyof T, string | string[]>)` then `Object.entries(description)`.
+/// Without the index signature nothing pairs with `entries<V>(o: {[s: string]:
+/// V})`'s parameter — neither the inference nor the assignability — so the call
+/// fell to the `entries(o: {}): [string, any][]` overload, `pattern` was `any`,
+/// and `pattern.forEach(subPattern => …)` reported TS7006.
+///
+/// Deliberately narrow: a `k as …` remapping is not modelled, and a key set
+/// whose lower bound is a set of literal names materializes as PROPERTIES and
+/// is not this route's question.
+pub fn mappedApparentStringIndex(c: *Checker, m: TypeId) Error!?TypeId {
+    const s = &c.ts;
+    if (s.mappedAs(m) != 0) return null;
+    const lower = try mappedKeyLowerBound(c, try c.mappedKeySet(m));
+    var covers_string = false;
+    const parts: []const TypeId = if (s.kind(lower) == .union_type) try c.memberList(lower) else &.{lower};
+    for (parts) |p| {
+        switch (s.kind(p)) {
+            .string, .number => covers_string = true,
+            else => {},
+        }
+    }
+    if (!covers_string) return null;
+    return try c.substMappedKey(s.mappedValue(m), s.mappedParamId(s.mappedKeyParam(m)), types.string_type);
+}
+
+/// tsc's `getLowerBoundOfKeyType`, restricted to the arm that matters here:
+/// `keyof T` reduces to `keyof (apparent T)`, so a type parameter's CONSTRAINT
+/// is what says which keys the map can iterate. Anything else is its own lower
+/// bound.
+fn mappedKeyLowerBound(c: *Checker, ks: TypeId) Error!TypeId {
+    if (c.ts.kind(ks) != .keyof_op) return ks;
+    const operand = c.ts.keyofOperand(ks);
+    const apparent = if (c.ts.kind(operand) == .type_param)
+        try c.transitiveBaseConstraint(operand)
+    else
+        operand;
+    if (apparent == operand) return ks;
+    return c.keyofType(try c.resolveStructural(apparent));
+}
+
 /// Assignability for a DEFERRED mapped type — one whose key set is still
 /// generic, so it has no members to walk. Without these rules such a type
 /// is opaque: `Mutable<T>` was not assignable to `Readonly<T>`, to another
@@ -2922,6 +2974,27 @@ pub fn mappedAssignable(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: t
         if (!try c.isAssignable(try c.keyofType(s), try c.mappedKeySet(t))) return null;
         const access = try c.reduceIndexedAccess(s, c.ts.mappedKeyParam(t));
         return if (try c.isAssignable(access, c.ts.mappedValue(t))) true else null;
+    }
+    // A still-generic map whose key set covers the string key space has an
+    // apparent INDEX SIGNATURE (`mappedApparentStringIndex`), so it relates to
+    // a pure index-signature target — `Object.entries`' `{[s: string]: V}`.
+    // Restricted to a target with no NAMED members: a deferred map declares no
+    // property this side could satisfy one with.
+    if (sk == .mapped) {
+        const rt = try c.resolveStructural(t);
+        if (c.ts.kind(rt) == .object and
+            c.ts.objectPropCount(rt) == 0 and
+            c.ts.objectCallSigCount(rt) == 0 and
+            c.ts.objectConstructSigCount(rt) == 0 and
+            c.ts.objectStringIndex(rt) != 0)
+        {
+            if (try c.mappedApparentStringIndex(s)) |tmpl| {
+                if (!try c.isAssignable(tmpl, c.ts.objectStringIndex(rt))) return null;
+                const nidx = c.ts.objectNumberIndex(rt);
+                if (nidx != 0 and !try c.isAssignable(tmpl, nidx)) return null;
+                return true;
+            }
+        }
     }
     // A homomorphic identity map with only modifier changes IS its source
     // (`Readonly<P>` → `P`). A map that adds `?` is not, and one that

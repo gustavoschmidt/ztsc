@@ -3109,6 +3109,20 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                 }
                 return;
             }
+            // A still-generic MAPPED source against an index-signature
+            // pattern. tsc's `inferFromIndexTypes` reads
+            // `getIndexInfosOfType(source)`, and `resolveMappedTypeMembers`
+            // gives `{[P in keyof T]: V}` a string index of `V` whenever the
+            // key set's lower bound covers the string key space — see
+            // `mappedApparentStringIndex`. Without it `Object.entries(d)` on a
+            // `Record<keyof T, V>` left `V` uninferred and fell to the
+            // `entries(o: {}): [string, any][]` overload.
+            if (s.kind(ra) == .mapped and s.objectStringIndex(param) != 0) {
+                if (try c.mappedApparentStringIndex(ra)) |tmpl| {
+                    try c.unify(s.objectStringIndex(param), tmpl, tp_syms, candidates, depth + 1);
+                }
+                return;
+            }
             if (s.kind(ra) == .object) {
                 // Same-origin fast path (tsc's `inferFromTypes` same-reference
                 // rule). A generic interface/alias parameter whose type args
