@@ -3356,15 +3356,30 @@ pub fn templateHeadText(c: *Checker, tok: TokenIndex) []const u8 {
 }
 
 /// Does the contextual type want a template-literal-typed value? True when
-/// `ctx` is (or a union contains) a template-literal type — the only case
-/// in which a template *expression* should keep a template-literal type
-/// instead of widening to `string`. Gating on this keeps every other
-/// template expression at `string` (zero blast radius).
+/// `ctx` is (or a union contains) a string-literal or template-literal type —
+/// tsc's `isTemplateLiteralContextualType` (`TypeFlags.StringLiteral |
+/// TypeFlags.TemplateLiteral`), which is what `checkTemplateExpression`
+/// consults before it widens a template expression to `string`.
+///
+/// The STRING-LITERAL half is what makes a template over a literal union land
+/// on a literal-union target: `` navigation.navigate(`${tab}Tab`) `` with
+/// `tab: "Home" | "Search" | …` is contextually a union of route-name
+/// literals, so tsc builds `` `${"Home" | "Search" | …}Tab` `` — which expands
+/// to exactly those route names — instead of `string`. Widening lost it, and
+/// social-app's `Drawer`/`BottomBar` tab dispatch was a phantom TS2322/TS2345
+/// pair on every such call.
+///
+/// (An earlier attempt at this half was reverted: it exposed a SEPARATE hole,
+/// a template-literal type not relating to `{}`, which made excalidraw's
+/// `` transform: `translate(${n}px, …)` `` against `Globals | (string & {})`
+/// two fresh TS2322. That relation is fixed at its own site — see the
+/// template-literal source arm in `isAssignableInner` — so the two no longer
+/// interact.)
 pub fn ctxWantsTemplate(c: *Checker, ctx: TypeId) Error!bool {
     if (ctx == types.no_type) return false;
     const r = try c.resolveStructural(ctx);
     switch (c.ts.kind(r)) {
-        .template_literal_type => return true,
+        .template_literal_type, .string_literal => return true,
         .union_type => {
             for (try c.memberList(r)) |m| if (try c.ctxWantsTemplate(m)) return true;
             return false;
@@ -3427,6 +3442,30 @@ pub fn templateChunkTokAfter(c: *Checker, head_tok: TokenIndex, after: u32) Toke
 /// substitution types, rather than widening to `string`. This lets
 /// `` `material-symbols:${status.icon}` `` (`status.icon: string`) satisfy a
 /// `` `${string}:${string}` `` target — matching tsc's contextual typing.
+/// tsc's `isTypeAssignableTo(type, templateConstraintType)` for one
+/// template-expression hole — `templateConstraintType` is
+/// `string | number | bigint | boolean | null | undefined`, the primitives a
+/// template can actually spell. Anything else (an object, a symbol) is
+/// replaced by `string`, so `` `${o}Tab` `` is `` `${string}Tab` ``.
+///
+/// A generic hole is decided through the relation, not by kind: `T extends
+/// keyof AssetExifTable` IS assignable to the constraint, which is what keeps
+/// `` `excluded.${col}` `` a template over `T` (and kysely's `eb.ref` overload
+/// resolvable) instead of collapsing it to `` `excluded.${string}` ``.
+fn templateHoleSpellable(c: *Checker, t: TypeId) Error!bool {
+    const s = &c.ts;
+    var buf: [6]TypeId = .{
+        types.string_type,
+        types.number_type,
+        types.bigint_type,
+        types.boolean_type,
+        types.null_type,
+        types.undefined_type,
+    };
+    const constraint = s.makeUnion(c.scratch(), &buf) catch return true;
+    return c.isAssignable(t, constraint);
+}
+
 pub fn templateExprType(c: *Checker, node: Node) Error!TypeId {
     const main_tok = c.tree.nodeMainToken(node);
     const head = try c.atom(c.templateHeadText(main_tok));
@@ -3436,7 +3475,14 @@ pub fn templateExprType(c: *Checker, node: Node) Error!TypeId {
     defer chunks.deinit(c.scratch());
     for (c.tree.nodeRange(node)) |sub| {
         const st = if (sub != null_node) try c.checkExprCached(sub, types.no_type) else types.string_type;
-        try holes.append(c.scratch(), st);
+        // tsc's `checkTemplateExpression`:
+        // `types.push(isTypeAssignableTo(type, templateConstraintType) ? type
+        // : stringType)`. A hole whose value is not one of the primitives a
+        // template can spell (`string | number | bigint | boolean | null |
+        // undefined`) contributes `string`, not itself — so `` `${o}Tab` ``
+        // over an `object` is `` `${string}Tab` ``, which a
+        // `` `${string}Tab` `` target accepts.
+        try holes.append(c.scratch(), if (try templateHoleSpellable(c, st)) st else types.string_type);
         const ctok = c.templateChunkTokAfter(main_tok, c.nodeSpan(sub).end);
         try chunks.append(c.scratch(), try c.atom(c.templateChunkText(ctok)));
     }

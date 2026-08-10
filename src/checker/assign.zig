@@ -2155,6 +2155,32 @@ pub fn isCompound(k: types.Kind) bool {
     };
 }
 
+/// A target NO object type can ever be assignable to — tsc's non-
+/// `StructuredOrInstantiable` targets, minus the ones an object DOES reach
+/// (`object`, `Function`, an enum's nominal rule, `any`/`unknown`, which are
+/// all settled before this is consulted). Used to answer an interface/class
+/// reference against a primitive without expanding it.
+fn primitiveOnlyTarget(k: types.Kind) bool {
+    return switch (k) {
+        .string,
+        .number,
+        .boolean,
+        .bigint,
+        .symbol,
+        .bool_true,
+        .bool_false,
+        .string_literal,
+        .number_literal,
+        .number_literal_fresh,
+        .bigint_literal,
+        .unique_symbol,
+        .null,
+        .undefined,
+        => true,
+        else => false,
+    };
+}
+
 pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: types.Kind) Error!bool {
     // Deferred conditional *source* is handled first (before union
     // distribution): it resolves to one of its branches, so it is
@@ -2346,6 +2372,18 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
         if (sk == .object or sk == .ref or sk == .intersection) {
             if (try c.discriminatedUnionAssignable(s, t)) return true;
         }
+        // The same rule for a TUPLE source. A tuple is an ordinary object
+        // type in tsc — its elements are the properties `"0"`, `"1"`, … — so
+        // `typeRelatedToDiscriminatedType` applies to it unchanged, and the
+        // shape it decides is every "overloaded" argument list spelled as a
+        // union of tuples. react-navigation's `navigate` is exactly that:
+        // `navigate(...args: ["Home", undefined?, Opts?] | ["Search", …] | …)`,
+        // and a call whose first argument is a route-name UNION builds the
+        // spread tuple `["HomeTab" | "SearchTab"]` (tsc's
+        // `getSpreadArgumentType`), which fits no single constituent.
+        if (sk == .tuple) {
+            if (try c.discriminatedTupleAssignable(s, t)) return true;
+        }
         return false;
     }
     if (tk == .intersection) {
@@ -2475,10 +2513,21 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
         if (sk == .template_literal_type or sk == .string_mapping) return true;
         return false;
     }
-    // Template-literal pattern *source*: assignable only to `string` (fast
-    // path via `literalBase`) or an identical pattern (`s == t`). Reaching
-    // here means neither — so no.
-    if (sk == .template_literal_type or sk == .string_mapping) return false;
+    // Template-literal pattern / string-mapping *source* against anything
+    // else: `string` answers for it. Both are SUBTYPES of `string` — that is
+    // what `literalBase` says two frames up — and tsc reaches an object target
+    // through `getApparentType`, which hands a template literal the very same
+    // global `String` interface it hands `string`. So `string <: T` implies
+    // `template <: T`, and delegating is sound in the only direction that
+    // matters: it can never accept more than `string` does.
+    //
+    // A flat `return false` here was a false positive on every object-ish
+    // target `string` itself satisfies — `{}` above all, which is how
+    // `Property.Transform = Globals | (string & {})` is spelled: a
+    // `` `translate(${number}px)` `` reaching that intersection met `string`
+    // and then failed `{}`. (The string-literal and pattern targets are
+    // already answered above; what is left here is the object/primitive tail.)
+    if (sk == .template_literal_type or sk == .string_mapping) return c.isAssignable(types.string_type, t);
     // Any callable value — arrow/normal functions, overload sets, classes
     // used as values, and callable object/interface types — is assignable
     // to the global `Function` interface. tsc models this via the apparent
@@ -2495,6 +2544,35 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
     // key, and consulting the memo would read our own in-progress mark and
     // answer "related" without expanding anything. See `relate`.
     if (sk == .ref or tk == .ref) {
+        // tsc's `recursiveTypeRelatedTo` gate: it recurses into a source's
+        // structure only when BOTH sides are `StructuredOrInstantiable`. A
+        // PRIMITIVE target is not, so `isSimpleTypeRelatedTo` answers the pair
+        // (no) and the source's members are never resolved. ztsc expanded the
+        // reference first and asked afterwards — the same "no", at the cost of
+        // materializing a whole member table to reach it.
+        //
+        // That cost is not the reason this gate exists: the expansion can be
+        // *wrong*. An interface/class reference expanded while its own table is
+        // still materializing answers `error_type` (`classInstanceGeneric`'s
+        // in-progress mark), and `error_type` relates to EVERYTHING — so the
+        // pair came back "assignable" and the relation memo published it under
+        // the reference's key, where every later reader inherited it.
+        //
+        // react-native-gesture-handler is exactly that shape: `BaseGesture<T>`
+        // declares `simultaneousWithExternalGesture(...g: Exclude<GestureRef,
+        // number>[])`, and `GestureRef` is a union over `BaseGesture<…>` — so
+        // materializing the class's own member table asks whether each
+        // `BaseGesture<…>` extends `number`, re-entering the table that is
+        // being built. Every constituent answered "yes" off `error_type`, so
+        // `Exclude<GestureRef, number>` reduced to just its `RefObject` arms
+        // and every `.blocksExternalGesture(gesture)` in the app was a
+        // phantom TS2345.
+        //
+        // `refExpandsToObject` is the no-expansion half of the gate: an
+        // interface or class reference is an object type for every argument
+        // list, whatever its members turn out to be (aliases are excluded —
+        // their bodies reduce, so a `.ref` alias may well BE a primitive).
+        if (sk == .ref and c.refExpandsToObject(s) and primitiveOnlyTarget(tk)) return false;
         // Lazy member route (see `lazyRefRelate`): decide the pair by reading
         // member names and flags off the generic tables, substituting only the
         // members the comparison actually reaches. Answers null for every
@@ -3565,7 +3643,23 @@ pub fn discriminatedUnionAssignable(c: *Checker, s: TypeId, t: TypeId) Error!boo
         .object, .intersection => {},
         else => return false,
     }
-    const members = try c.memberList(t);
+    // tsc runs this on `extractTypesOfKind(target, Object | Intersection |
+    // Substitution)`, not on the whole union: a PRIMITIVE constituent has no
+    // properties, so leaving it in makes every candidate discriminant fail the
+    // "present on every member" test and the split never runs at all.
+    // react-navigation's `to` prop is `LinkProps<ParamList> | string`, and
+    // that lone `string` is what stopped
+    // `to={{screen: cond ? 'CustomFeed' : 'ProfileList', params}}` — a source
+    // whose `screen` is a two-literal union — from ever being split.
+    var obj_members: std.ArrayList(TypeId) = .empty;
+    defer obj_members.deinit(c.scratch());
+    for (try c.memberList(t)) |m| {
+        switch (c.ts.kind(try c.resolveStructural(m))) {
+            .object, .intersection => try obj_members.append(c.scratch(), m),
+            else => {},
+        }
+    }
+    const members = obj_members.items;
     if (members.len < 2) return false;
     var dnames: std.ArrayList(Atom) = .empty;
     defer dnames.deinit(c.scratch());
@@ -3578,6 +3672,7 @@ pub fn discriminatedUnionAssignable(c: *Checker, s: TypeId, t: TypeId) Error!boo
         // member values.
         var first_val: TypeId = 0;
         var differs = false;
+        var any_unit = false;
         var ok = true;
         for (members) |m| {
             const mp = (try c.propOfType(m, dprop.name)) orelse {
@@ -3585,13 +3680,22 @@ pub fn discriminatedUnionAssignable(c: *Checker, s: TypeId, t: TypeId) Error!boo
                 break;
             };
             const mr = try c.resolveStructural(mp.ty);
-            if (!try c.isUnitOrUnitUnion(mr)) {
-                ok = false;
-                break;
-            }
+            if (try c.isUnitOrUnitUnion(mr)) any_unit = true;
             if (first_val == 0) first_val = mr else if (mr != first_val) differs = true;
         }
-        if (!ok or !differs) continue;
+        // tsc's `isDiscriminantProperty`: the union's synthesized property
+        // must carry BOTH `CheckFlags.HasNonUniformType` (the constituents do
+        // not all give it the same type) and `CheckFlags.HasLiteralType` (at
+        // least ONE of them gives it a unit type) — not "every constituent is
+        // a unit", which is what this loop used to demand. A union that splits
+        // an optional key into "present as `T`" and "absent" is the common
+        // shape that requirement excluded: react-navigation's
+        // `NavigatorID extends string ? {id: NavigatorID} : {id?: undefined}`
+        // instantiated at `string | undefined` is
+        // `{id: string} | {id?: undefined}`, and an `id: string | undefined`
+        // read back out of it fits neither constituent alone — only the
+        // by-cases split, which is exactly what this function computes.
+        if (!ok or !differs or !any_unit) continue;
         // Every source discriminant constituent must be covered by ≥1
         // member, and every matched member's non-discriminant props must
         // accept the source.
@@ -3613,6 +3717,73 @@ pub fn discriminatedUnionAssignable(c: *Checker, s: TypeId, t: TypeId) Error!boo
                 }
             }
             if (!covered) {
+                all_ok = false;
+                break;
+            }
+        }
+        if (all_ok) return true;
+    }
+    return false;
+}
+
+/// `discriminatedUnionAssignable` for a TUPLE source against a union of
+/// tuples — tsc's `typeRelatedToDiscriminatedType` with the element positions
+/// standing in for the properties `"0"`, `"1"`, … that a tuple's members
+/// actually are.
+///
+/// One position is split (the first eligible), which is the same
+/// single-discriminant simplification the object form makes: a position whose
+/// SOURCE type is a union, whose member types are not all the same, and at
+/// least one of which is a unit (tsc's `isDiscriminantProperty`,
+/// `HasNonUniformType | HasLiteralType`). Each case is then re-related to the
+/// whole union, which is sound in the direction that matters: a value of
+/// `[A | B, X]` is a value of `[A, X]` or of `[B, X]`, so if both reach the
+/// union so does every value of the original.
+pub fn discriminatedTupleAssignable(c: *Checker, s: TypeId, t: TypeId) Error!bool {
+    const sr = try c.resolveStructural(s);
+    if (c.ts.kind(sr) != .tuple) return false;
+    const members = try c.memberList(t);
+    if (members.len < 2) return false;
+    const s_len = c.ts.tupleLen(sr);
+    for (0..s_len) |pos| {
+        const i: u32 = @intCast(pos);
+        const se = c.ts.tupleElem(sr, i);
+        if (se.rest()) continue;
+        const src_el = try c.resolveStructural(se.ty);
+        if (c.ts.kind(src_el) != .union_type) continue;
+        // The target side has to look like a discriminant at this position.
+        var first_val: TypeId = 0;
+        var differs = false;
+        var any_unit = false;
+        var ok = true;
+        for (members) |m| {
+            const mr = try c.resolveStructural(m);
+            if (c.ts.kind(mr) != .tuple or c.ts.tupleLen(mr) <= i) {
+                ok = false;
+                break;
+            }
+            const me = c.ts.tupleElem(mr, i);
+            if (me.rest()) {
+                ok = false;
+                break;
+            }
+            const mt = try c.resolveStructural(me.ty);
+            if (try c.isUnitOrUnitUnion(mt)) any_unit = true;
+            if (first_val == 0) first_val = mt else if (mt != first_val) differs = true;
+        }
+        if (!ok or !differs or !any_unit) continue;
+        // Split: every case of the source's element must reach the union.
+        var elems: std.ArrayList(types.TupleElem) = .empty;
+        defer elems.deinit(c.scratch());
+        var all_ok = true;
+        for (try c.memberList(src_el)) |lv| {
+            elems.clearRetainingCapacity();
+            for (0..s_len) |j| {
+                const e = c.ts.tupleElem(sr, @intCast(j));
+                try elems.append(c.scratch(), if (j == pos) .{ .ty = lv, .flags = e.flags } else e);
+            }
+            const one = try c.ts.makeTuple(elems.items);
+            if (one == sr or !try c.isAssignable(one, t)) {
                 all_ok = false;
                 break;
             }
