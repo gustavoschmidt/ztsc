@@ -3146,6 +3146,32 @@ pub fn structuralAssignable(c: *Checker, s: TypeId, t: TypeId) Error!bool {
         const k = c.ts.kind(s);
         return k != .null and k != .undefined and k != .void;
     }
+    // tsc's `getUnmatchedProperty`, which `propertiesRelatedTo` runs to
+    // completion BEFORE it relates a single property type. The loop below
+    // already fails on a required target property the source lacks — but it
+    // finds out in property order, so a pair that is unrelated for a name the
+    // walk reaches late pays a full recursive relation for every name before
+    // it. Answering the presence question over the whole table first is a
+    // strict fast path: it returns `false` exactly where the loop already
+    // does, only sooner.
+    //
+    // The cost of NOT having it is not marginal on a fluent generic API.
+    // zod's `deoptional<T>` asks `ZodString extends ZodOptional<infer U>`;
+    // `ZodOptional` declares `unwrap()`, which `ZodString` has not got, so
+    // the pair is dead — but `unwrap` sorts late among ~60 members, and every
+    // earlier one (`and`, `array`, `brand`, `catch`, `default`, `optional`,
+    // `pipe`, `refine`, …) hands back a `Wrapper<this>` whose relation
+    // recurses into another instantiation of the same family. One
+    // `deoptional<ZodString>` cost 4.46 M node visits before this pre-pass.
+    //
+    // Name-only: `propOfTypeEx` is the same lookup the loop performs and its
+    // answer is memoized, so the pre-pass does no work the loop would not
+    // have done anyway — it only reorders when the work happens.
+    for (0..n) |i| {
+        const tp = c.ts.objectProp(t, @intCast(i));
+        if (tp.optional()) continue;
+        if ((try c.propOfTypeEx(s, tp.name, false)) == null) return false;
+    }
     for (0..n) |i| {
         const tp = c.ts.objectProp(t, @intCast(i));
         // A source string index signature does NOT satisfy a required named
