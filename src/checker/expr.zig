@@ -3618,6 +3618,23 @@ pub fn indexChainInner(c: *Checker, node: Node, chained: *bool, narrow: bool) Er
                 result = c.ts.objectStringIndex(r);
             } else if (rk == .array or rk == .tuple or rk == .string) {
                 result = types.any_type;
+            } else if (rk == .object and c.ts.objectIsLiteralOrigin(r)) {
+                // An OBJECT LITERAL indexed by the whole `string` domain is
+                // not an implicit-any access for tsc: `getPropertyTypeForIndexType`
+                // answers `getUnionType(append(map(getPropertiesOfType(objectType),
+                // getTypeOfSymbol), undefinedType))` for
+                // `isObjectLiteralType(objectType) && indexType.flags &
+                // (Number | String)`, with no diagnostic. That is what types
+                // the "inline lookup table" idiom —
+                // `({400: 'Inter-Regular', …})[String(weight)] || 'Inter-Regular'`
+                // — which ztsc reported as TS7053.
+                var vals: std.ArrayList(TypeId) = .empty;
+                defer vals.deinit(c.scratch());
+                for (0..c.ts.objectPropCount(r)) |i| {
+                    try vals.append(c.scratch(), c.ts.objectProp(r, @intCast(i)).ty);
+                }
+                try vals.append(c.scratch(), types.undefined_type);
+                result = try c.ts.makeUnion(c.scratch(), vals.items);
             } else {
                 // A plain `string` key into an object with no string index
                 // signature is, for tsc, an implicit-'any' element access
