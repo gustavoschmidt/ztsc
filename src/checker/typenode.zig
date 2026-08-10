@@ -1901,15 +1901,44 @@ pub fn fixTypeArgs(c: *Checker, sym: SymbolId, args: []const TypeId, tok: TokenI
             // `Queue`'s OWN parameters, which nothing downstream can ever
             // close, so `queue.add(name, data)` was TS2345 against a type
             // spelled with the class's own type parameters in it.
+            //
+            // A NAKED TYPE PARAMETER in an earlier position counts as ground
+            // for this test, for the same reason `swappable_earlier` above
+            // accepts one: threading it in RENAMES a bound name and expands
+            // nothing. Neither hazard the unsubstituted branch exists for can
+            // fire on a rename — a conditional over an abstract argument is
+            // still deferred after it, and a recursive `.d.ts` term is no more
+            // materialized than it was — while leaving it alone is the same
+            // unsoundness the bullmq case describes one paragraph up.
+            //
+            // react-navigation is the case: `NavigationProp<ParamList, …,
+            // State extends NavigationState = NavigationState<ParamList>, …>`
+            // written as `NavigationProp<T>` inside
+            // `getRootNavigation<T extends {}>(nav: NavigationProp<T>)` kept
+            // `State = NavigationState<ParamList>` over the ALIAS's own
+            // `ParamList`. Instantiating the signature at `T = AllParams` then
+            // closed `T` and left `ParamList` free, so the parameter's
+            // `dispatch` was spelled `(state: {routeNames: Keyof<ParamList>[]})`
+            // and no argument could ever meet it (two TS2345 on one call, plus
+            // the cascade through the uninferred return type).
             const ground_earlier = blk: {
                 for (out[0..i]) |a| {
+                    if (c.ts.kind(a) == .type_param) continue;
                     if (try c.containsTypeParam(a)) break :blk false;
                 }
                 break :blk true;
             };
+            // A default that resolved to a bare NAMED REFERENCE is a third
+            // safe case whatever the earlier arguments are: instantiating a
+            // `.ref` rewrites its argument list and expands nothing, so it can
+            // neither re-materialize a recursive `.d.ts` term nor unmask a
+            // deferred reduction — the two hazards the lenient branch exists
+            // for. It is also the shape that most often carries the leak,
+            // `State extends NavigationState = NavigationState<ParamList>`.
+            const shallow_default = c.ts.kind(def) == .ref;
             if (bare_earlier != null and (swappable_earlier or recursive or !c.symInDeclFile(sym))) {
                 out[i] = out[bare_earlier.?];
-            } else if (c.symInDeclFile(sym) and !ground_earlier) {
+            } else if (c.symInDeclFile(sym) and !ground_earlier and !shallow_default) {
                 // A *complex* or non-recursive library default (e.g. RTK's
                 // `ExtractStoreExtensionsFromEnhancerTuple` tuple default, or
                 // `Reducer`'s `PreloadedState = S`) stays unsubstituted:
