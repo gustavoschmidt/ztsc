@@ -1839,6 +1839,31 @@ pub const Checker = struct {
     /// a side query also turns `any` into an inference wildcard and swallows
     /// diagnostics, both of which change which overload is picked.
     no_publish_depth: u32 = 0,
+    /// tsc's `CheckMode.SkipContextSensitive`, in flight for the FIRST of a
+    /// call's two inference rounds. While set, a context-sensitive function
+    /// expression — one whose type depends on the contextual type it is
+    /// handed, i.e. one with an un-annotated parameter — is typed as
+    /// `types.any_function_type` instead of being walked, and no expression
+    /// checked under the flag reads or writes the `node_types` memo (its
+    /// answer is provisional by construction).
+    ///
+    /// It propagates exactly as tsc's `checkMode` does: through a
+    /// parenthesized expression, an object or array literal's elements, a
+    /// conditional's branches and a `||`/`??` operand — the same forms
+    /// `isContextSensitive` recurses through — and STOPS at everything else,
+    /// so a nested call's own arguments and a function BODY are checked
+    /// normally. `checkExprCached` is the single place that maintains it.
+    skip_ctx_sensitive: bool = false,
+    /// Did the walk under `skip_ctx_sensitive` actually produce a
+    /// `types.any_function_type`? tsc propagates
+    /// `ObjectFlags.NonInferrableType` up through every type built out of one
+    /// — an object literal with a context-sensitive property carries it, and
+    /// so does a tuple built around such an argument — and `inferFromTypes`
+    /// then refuses the whole thing as a candidate for a type variable.
+    /// ztsc interns its object types, so the flag cannot live on the type;
+    /// this says whether any is in flight at all, and `unify` pays for the
+    /// containment scan only while it is set.
+    aft_seen: bool = false,
     /// Contravariant inference candidates for the in-flight call, one per type
     /// parameter — tsc's `InferenceInfo.contraCandidates`. `contra_owner` is
     /// the identity of the covariant accumulator they belong to, so the many
@@ -3949,7 +3974,6 @@ pub const Checker = struct {
     pub const mentionsActiveInferVar = calls_zig.mentionsActiveInferVar;
     pub const partialParamCtx = calls_zig.partialParamCtx;
     pub const instantiateKnownParams = calls_zig.instantiateKnownParams;
-    pub const isFedEcho = calls_zig.isFedEcho;
     pub const paramIsBareCallbackReturn = calls_zig.paramIsBareCallbackReturn;
     pub const isBareOrUnionMember = calls_zig.isBareOrUnionMember;
     pub const inferTypeArgs = calls_zig.inferTypeArgs;
