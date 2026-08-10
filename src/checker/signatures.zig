@@ -1098,11 +1098,11 @@ pub fn expandoMemberType(c: *Checker, sym: SymbolId) Error!TypeId {
 }
 
 /// Fold every callable constituent of a merged global function symbol into
-/// one overload set — in DECLARATION order, with the split point recorded
-/// in `overload_rotate` for the call path. Returns null when fewer than two
-/// constituents are callable (the overwhelmingly common single-contributor
-/// global keeps its type via the caller's existing first-value-constituent
-/// path).
+/// one overload set — in DECLARATION order, with one group boundary per
+/// contributing declaration recorded in `overload_groups` for the call path.
+/// Returns null when fewer than two constituents are callable (the
+/// overwhelmingly common single-contributor global keeps its type via the
+/// caller's existing first-value-constituent path).
 ///
 /// The two orders are tsc's, and they differ. A merged symbol's signatures
 /// are `getSignaturesOfSymbol`'s — the symbol's declarations in the order
@@ -1113,17 +1113,36 @@ pub fn expandoMemberType(c: *Checker, sym: SymbolId) Error!TypeId {
 /// @types/node's `setTimeout(…): NodeJS.Timeout` last. That is the order
 /// `getSignaturesOfType` reports, hence the order the printer shows and the
 /// order `ReturnType`/`Parameters` see (they align from the END, so they
-/// answer with the node signature).
+/// answer with the LAST group's signature).
 ///
 /// Overload RESOLUTION does not use that order. `resolveCall` runs the list
 /// through `reorderCandidates` first, which groups the signatures by
-/// declaring parent and moves each later group ahead of the earlier ones,
-/// keeping the order within a group. With two groups that is a swap: node's
-/// signatures are tried first and lib.dom's last, which is why
+/// declaring parent and splices each new group in at the front, keeping the
+/// order within a group — i.e. it visits the groups back-to-front, so the
+/// LAST declaration group is tried first. That is why
 /// `setTimeout(() => {}, 1)` is a `NodeJS.Timeout` while
 /// `setTimeout(someString, 1)` — which only lib.dom accepts — is a `number`,
 /// and why a call that matches NEITHER (`fetch(url, { body: aSharedBuffer })`)
 /// is TS2769 rather than a bare argument error.
+///
+/// Back-to-front is not the same as one rotation of a lib/non-lib split, and
+/// the difference is observable the moment a THIRD group appears. social-app
+/// merges `setTimeout` from lib.dom (`number`), @types/node's `declare global`
+/// (`NodeJS.Timeout`) and react-native's `declare global` (`number`); a single
+/// rotation yields `[node, react-native, lib]`, so the CALL answered
+/// `Timeout` while `ReturnType<typeof setTimeout>` — which aligns from the end
+/// of declaration order — answered `number`, and every
+/// `slot = setTimeout(…)` was a phantom TS2322. Reversing the groups puts
+/// react-native first, and both paths land on the same last group. With
+/// exactly two groups a rotation and a reversal coincide, which is why this
+/// only ever showed up with three.
+///
+/// The library counts as ONE group however many shards it was split into:
+/// `src/lib/gen_lib.js` shards lib.dom/lib.esnext at top-level declaration
+/// boundaries purely so the front end parallelizes, and tsc sees each
+/// `lib.*.d.ts` as a single SourceFile — a single parent, a single group.
+/// Grouping per shard would reverse overloads of one name that happen to
+/// straddle a shard boundary.
 ///
 /// Keeping only the non-lib group, as this did before, got the call site
 /// right and everything else wrong: one signature can never be an overload
@@ -1159,41 +1178,63 @@ pub fn mergedFunctionValue(c: *Checker, parts: []const u32) Error!?TypeId {
             try nonlib.append(c.scratch(), t);
     }
     if (nonlib.items.len + lib.items.len < 2) return null;
-    // Declaration order: the library group, then the augmenting group.
+    // Declaration order: the library (one group, however many shards it came
+    // from), then one group per augmenting contributor, in merge order.
     var sigs: std.ArrayList(TypeId) = .empty;
     defer sigs.deinit(c.scratch());
-    for (lib.items) |o| {
-        if (c.ts.kind(o) == .overloads) {
-            for (c.ts.members(o)) |mm| try sigs.append(c.scratch(), mm);
-        } else try sigs.append(c.scratch(), o);
+    var starts: std.ArrayList(u32) = .empty;
+    defer starts.deinit(c.scratch());
+    const appendSigs = struct {
+        fn f(ck: *Checker, dst: *std.ArrayList(TypeId), o: TypeId) Error!void {
+            if (ck.ts.kind(o) == .overloads) {
+                for (ck.ts.members(o)) |mm| try dst.append(ck.scratch(), mm);
+            } else try dst.append(ck.scratch(), o);
+        }
+    }.f;
+    if (lib.items.len != 0) {
+        try starts.append(c.scratch(), 0);
+        for (lib.items) |o| try appendSigs(c, &sigs, o);
     }
-    const split: u32 = @intCast(sigs.items.len);
     for (nonlib.items) |o| {
-        if (c.ts.kind(o) == .overloads) {
-            for (c.ts.members(o)) |mm| try sigs.append(c.scratch(), mm);
-        } else try sigs.append(c.scratch(), o);
+        try starts.append(c.scratch(), @intCast(sigs.items.len));
+        try appendSigs(c, &sigs, o);
     }
     if (sigs.items.len == 1) return sigs.items[0];
     const t = try c.ts.makeOverloads(sigs.items);
-    if (split != 0 and split != sigs.items.len) {
-        try c.overload_rotate.put(c.cm(), t, split);
+    if (starts.items.len > 1) {
+        const at: u32 = @intCast(c.overload_group_pool.items.len);
+        try c.overload_group_pool.appendSlice(c.cm(), starts.items);
+        try c.overload_groups.put(c.cm(), t, .{ .start = at, .len = @intCast(starts.items.len) });
     }
     return t;
 }
 
 /// Append `ov`'s call signatures in overload-RESOLUTION order — tsc's
 /// `reorderCandidates`. Identical to the stored member order except for a
-/// merged global function, where the last declaration group is tried
-/// first (see `mergedFunctionValue`).
+/// merged global function, whose declaration groups are visited back-to-front
+/// (order preserved within a group), so the LAST group is tried first — see
+/// `mergedFunctionValue`.
 pub fn appendOverloadCandidates(c: *Checker, out: *std.ArrayList(TypeId), ov: TypeId) Error!void {
     const ms = try c.memberList(ov);
-    const rot = c.overload_rotate.get(ov) orelse 0;
-    if (rot == 0 or rot >= ms.len) {
+    const span = c.overload_groups.get(ov) orelse {
+        try out.appendSlice(c.scratch(), ms);
+        return;
+    };
+    const starts = c.overload_group_pool.items[span.start..][0..span.len];
+    // The recorded boundaries index the member list this set was interned
+    // with; a mismatch can only mean the interner handed back a different
+    // set, so fall back to the stored order rather than drop signatures.
+    if (starts.len < 2 or starts[0] != 0 or starts[starts.len - 1] >= ms.len) {
         try out.appendSlice(c.scratch(), ms);
         return;
     }
-    try out.appendSlice(c.scratch(), ms[rot..]);
-    try out.appendSlice(c.scratch(), ms[0..rot]);
+    var i = starts.len;
+    while (i > 0) {
+        i -= 1;
+        const lo = starts[i];
+        const hi = if (i + 1 < starts.len) starts[i + 1] else @as(u32, @intCast(ms.len));
+        try out.appendSlice(c.scratch(), ms[lo..hi]);
+    }
 }
 
 /// The last call signature (a `.function` TypeId) reachable from any

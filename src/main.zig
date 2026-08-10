@@ -709,6 +709,11 @@ pub fn main(init: std.process.Init) !void {
 
     // With no file arguments, drive the run from a tsconfig.json.
     var entry_paths = cli.paths;
+    // How many of `entry_paths` are REAL roots; the rest are the auto-included
+    // `@types/*` ambient roots, which are ordered as a second wave (see the
+    // renumbering block). Every root is real when the run is driven by CLI
+    // file arguments.
+    var n_real_roots = entry_paths.len;
     // The `config` phase: discovery, `extends` chasing, the `include` walk and
     // `collectAutoTypes`. Stays 0 when the run is driven by CLI file arguments.
     var config_ns: u64 = 0;
@@ -782,27 +787,28 @@ pub fn main(init: std.process.Init) !void {
         }
         // Real sources first (their order/emptiness drove the check above), then
         // the auto-included `@types/*` ambient roots (tsc's default typeRoots).
+        // `n_real_roots` splits the two: the `@types/*` roots are seeded for
+        // DISCOVERY here (so the wavefront still front-ends them in parallel)
+        // but ORDERED as a second BFS wave, after the real roots' import
+        // closure is exhausted — literally `createProgram`'s order, which walks
+        // each root file with its whole closure and only then processes the
+        // automatic type-reference directives.
         //
-        // MEASURED, and it is not simply tsc's order. `createProgram` walks each
-        // root file with its whole import closure and only then processes the
-        // automatic type-reference directives, so tsc's `@types/*` land after
-        // the closure while ztsc's land between the roots and it. That is
-        // observable on social-app, where `setTimeout` is declared both by
-        // `@types/node` and by react-native's `globals.d.ts`: ztsc resolves
-        // `ReturnType<typeof setTimeout>` to `number` where tsc gets `Timeout`.
+        // File order is merge order for a `declare global` augmentation, and
+        // merge order decides which declaration group of a merged global
+        // function comes LAST. social-app declares `setTimeout` in lib.dom,
+        // in @types/node and in react-native's `globals.d.ts`; with the
+        // `@types/*` roots ordered between the roots and their closure, node
+        // landed BEFORE react-native and every `ReturnType<typeof setTimeout>`
+        // came back `number` where tsc says `Timeout`.
         //
-        // Deferring the `@types/*` roots into a second BFS wave — after the
-        // real roots' closure is exhausted, which is literally tsc's order —
-        // was tried and is WORSE: social-app 222 -> 226. It does fix
-        // `ReturnType<typeof setTimeout>` (it becomes `Timeout`), but the CALL
-        // then resolves to an overload returning `number`, so nine
-        // `Timeout`-not-assignable-to-`number` reports become thirteen
-        // `number`-not-assignable-to-`Timeout` ones. Overload resolution reads
-        // the merged list from the front and `ReturnType` reads it from the
-        // back, so no single position for these roots satisfies both: the wave
-        // order is not the whole rule, and the next attempt needs tsc's actual
-        // merge precedence for a global function, not another guess at the
-        // seeding position.
+        // Deferring them was tried once before on its own and was worse: it
+        // fixed `ReturnType` and broke the CALL, because overload resolution
+        // used to read the merged list as one rotation of a lib/non-lib split
+        // rather than group-by-group from the end. With
+        // `mergedFunctionValue`/`appendOverloadCandidates` visiting declaration
+        // groups back-to-front, both paths read the same last group and the
+        // two halves of the answer finally agree.
         if (cfg.auto_type_files.len == 0) {
             entry_paths = cfg.root_files;
         } else {
@@ -811,6 +817,7 @@ pub fn main(init: std.process.Init) !void {
             @memcpy(combined[cfg.root_files.len..], cfg.auto_type_files);
             entry_paths = combined;
         }
+        n_real_roots = cfg.root_files.len;
         paths_map = cfg.paths;
         config_lib = cfg.lib;
         config_skip_lib = cfg.skip_lib_check;
@@ -916,28 +923,37 @@ pub fn main(init: std.process.Init) !void {
     // partition and its tie-breaks — is a function of this list, so this is
     // the one place that can vary the axis. tsc's answer does not depend on
     // root order; `bench/order_sweep.sh` is the gate that says ztsc's does
-    // not either.
+    // not either. Only the REAL roots permute: the auto-included `@types/*`
+    // tail is not a user-visible ordering, and tsc always processes it after
+    // the roots' closure however the roots were listed.
     switch (cli.file_order) {
         .source => {},
         .reverse => {
             const permuted = try arena.dupe([]const u8, entry_paths);
-            std.mem.reverse([]const u8, permuted);
+            std.mem.reverse([]const u8, permuted[0..n_real_roots]);
             entry_paths = permuted;
         },
         .shuffle => |seed| {
             const permuted = try arena.dupe([]const u8, entry_paths);
             var prng: std.Random.DefaultPrng = .init(seed);
-            prng.random().shuffle([]const u8, permuted);
+            prng.random().shuffle([]const u8, permuted[0..n_real_roots]);
             entry_paths = permuted;
         },
     }
-    for (entry_paths) |p| {
-        const norm = try ztsc.paths.normalizePath(arena, p);
-        const key = try rcache.canonicalPath(io, resolve_scratch.allocator(), Io.Dir.cwd(), norm);
-        const gop = try path_ids.getOrPut(arena, key);
-        if (!gop.found_existing) {
-            gop.value_ptr.* = @intCast(paths.items.len);
-            try paths.append(arena, key);
+    // `n_root_entries` is where the auto-included `@types/*` roots start in
+    // `paths` — the second BFS wave in the renumbering block below. A
+    // `@types/*` path already seen as a real root keeps its first position.
+    var n_root_entries: usize = 0;
+    for ([2][]const []const u8{ entry_paths[0..n_real_roots], entry_paths[n_real_roots..] }, 0..) |wave, wi| {
+        if (wi == 1) n_root_entries = paths.items.len;
+        for (wave) |p| {
+            const norm = try ztsc.paths.normalizePath(arena, p);
+            const key = try rcache.canonicalPath(io, resolve_scratch.allocator(), Io.Dir.cwd(), norm);
+            const gop = try path_ids.getOrPut(arena, key);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = @intCast(paths.items.len);
+                try paths.append(arena, key);
+            }
         }
     }
     _ = resolve_scratch.reset(.retain_capacity);
@@ -1166,23 +1182,33 @@ pub fn main(init: std.process.Init) !void {
     // permute every per-file table into that order. Everything downstream
     // (link, checker partition, printing) sees only the renumbered ids, so
     // output is byte-identical for any --workers/--checkers combination.
+    //
+    // TWO waves: the libs and the real roots with their whole import closure,
+    // and only then the auto-included `@types/*` ambient roots with theirs.
+    // That is `createProgram`'s order — root files first, automatic type
+    // reference directives after — and file order is the merge order a
+    // `declare global` augmentation of an existing global gets, so it decides
+    // which declaration group of `setTimeout` is last. See the seeding site.
     {
         const order = try arena.alloc(u32, n_files); // BFS position -> discovery id
         const new_ids = try arena.alloc(u32, n_files); // discovery id -> BFS position
         @memset(new_ids, modules.no_file);
         var tail: usize = 0;
-        for (0..n_entries) |i| {
-            new_ids[i] = @intCast(tail);
-            order[tail] = @intCast(i);
-            tail += 1;
-        }
         var head: usize = 0;
-        while (head < tail) : (head += 1) {
-            for (edge_lists.items[order[head]]) |fid| {
-                if (new_ids[fid] != modules.no_file) continue;
-                new_ids[fid] = @intCast(tail);
-                order[tail] = fid;
+        for ([2][2]usize{ .{ 0, n_root_entries }, .{ n_root_entries, n_entries } }) |wave| {
+            for (wave[0]..wave[1]) |i| {
+                if (new_ids[i] != modules.no_file) continue;
+                new_ids[i] = @intCast(tail);
+                order[tail] = @intCast(i);
                 tail += 1;
+            }
+            while (head < tail) : (head += 1) {
+                for (edge_lists.items[order[head]]) |fid| {
+                    if (new_ids[fid] != modules.no_file) continue;
+                    new_ids[fid] = @intCast(tail);
+                    order[tail] = fid;
+                    tail += 1;
+                }
             }
         }
         // Every discovered file was discovered through a recorded edge,
