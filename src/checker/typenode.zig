@@ -520,17 +520,116 @@ pub fn augmentModuleTypeSym(c: *Checker, from: ScopeId, a: Atom) Error!?SymbolId
 /// body scope. The caller filters by space/`exported`.
 pub fn namespaceMemberSym(c: *Checker, ns_sym: SymbolId, name: Atom) ?SymbolId {
     if (c.prog.isMergedId(ns_sym)) {
-        return c.prog.mergedSym(ns_sym).members.lookup(name);
+        if (c.prog.mergedSym(ns_sym).members.lookup(name)) |m| return m;
+        for (c.prog.mergedSym(ns_sym).parts) |p| {
+            if (nsReexportMemberSym(c, p, name)) |g| return g;
+        }
+        return null;
     }
     const nb = c.symBind(ns_sym);
     const ns = nb.namespaceScopeOf(c.localOf(ns_sym)) orelse return null;
-    const local = nb.lookupInScope(ns, name) orelse return null;
+    const local = nb.lookupInScope(ns, name) orelse
+        return nsReexportMemberSym(c, ns_sym, name);
     // Route through the cross-file merge index, like `targetTypeSym`: a
     // member of an `export = <namespace>` module reached as `ns.I` may be
     // the real half of a `declare module` augmentation merge, and the
     // file-local declaration alone carries none of the augmented members.
     const g = c.toGlobalIn(c.symFile(ns_sym), local);
     return c.prog.mergedOf(g) orelse g;
+}
+
+/// The member a namespace body publishes with `export { X }` / `export { X as
+/// name }`, or null.
+///
+/// tsc reads such a specifier as an export OF THE NAMESPACE, in every meaning
+/// the aliased entity has: `namespace N { export { X }; }` makes `N.X` name
+/// whatever `X` names, as a type and as a value. ztsc's binder does not
+/// *declare* the exported name in the body scope — it records the specifier as
+/// an `.ns_named` export record (see `bindExportNamed`, which keeps namespace
+/// re-exports out of the module export table) — so `lookupInScope` above cannot
+/// see it and the whole qualified name degraded to `any` (value position) or
+/// TS2694 (type position).
+///
+/// expo's `expo-modules-core` is written this way: `global.d.ts` imports
+/// `EventEmitter`/`SharedObject` and re-exports them into `declare namespace
+/// ExpoGlobal { export { EventEmitter }; export { SharedObject }; }`, which the
+/// package's public surface then names as `typeof ExpoGlobal.SharedObject`.
+/// With the member unresolved, `class VideoPlayer extends SharedObject<…>`
+/// inherited nothing at all.
+fn nsReexportMemberSym(c: *Checker, ns_sym: SymbolId, name: Atom) ?SymbolId {
+    if (c.prog.isMergedId(ns_sym)) return null;
+    const file = c.symFile(ns_sym);
+    const nb = c.prog.files[file].bind;
+    const ns = nb.namespaceScopeOf(c.localOf(ns_sym)) orelse return null;
+    for (nb.exports) |rec| {
+        if (rec.kind != .ns_named or rec.scope != ns) continue;
+        if (rec.exported != name or rec.sym == binder.no_symbol) continue;
+        return aliasDeclSym(c, c.toGlobalIn(file, rec.sym));
+    }
+    return null;
+}
+
+/// Follow an import binding to the declaration it aliases, so a namespace
+/// re-export of an *imported* name yields the class/interface/namespace symbol
+/// its consumers can materialize rather than the local alias (which carries no
+/// members of its own). Stops at the first non-`binding` target — a whole
+/// module-namespace object has no single declaration symbol — and at a fixed
+/// hop count, so a re-export cycle terminates.
+fn aliasDeclSym(c: *Checker, sym0: SymbolId) SymbolId {
+    var sym = c.prog.mergedOf(sym0) orelse sym0;
+    var hops: u8 = 0;
+    while (c.symFlags(sym).import_binding and hops < 8) : (hops += 1) {
+        const tgt = c.typeMeaningTarget(c.importTarget(sym) orelse return sym);
+        if (tgt.kind != .binding) return sym;
+        const g = c.toGlobalIn(tgt.file, tgt.payload);
+        const next = c.prog.mergedOf(g) orelse g;
+        if (next == sym) return sym;
+        sym = next;
+    }
+    return sym;
+}
+
+/// Append one value property per `export { X as name }` in namespace `ns_sym`'s
+/// body — the value-space half of `nsReexportMemberSym`, for the namespace
+/// object type. Names already present in `props` (a real declaration in the
+/// body scope) win, as they do in the declaration loop.
+pub fn nsReexportProps(c: *Checker, ns_sym: SymbolId, props: *std.ArrayList(types.Prop)) Error!void {
+    if (c.prog.isMergedId(ns_sym)) {
+        for (c.prog.mergedSym(ns_sym).parts) |p| try nsReexportPropsIn(c, p, props);
+        return;
+    }
+    try nsReexportPropsIn(c, ns_sym, props);
+}
+
+fn nsReexportPropsIn(c: *Checker, ns_sym: SymbolId, props: *std.ArrayList(types.Prop)) Error!void {
+    const file = c.symFile(ns_sym);
+    const nb = c.prog.files[file].bind;
+    const ns = nb.namespaceScopeOf(c.localOf(ns_sym)) orelse return;
+    for (nb.exports) |rec| {
+        if (rec.kind != .ns_named or rec.scope != ns or rec.type_only) continue;
+        if (rec.exported == 0 or rec.sym == binder.no_symbol) continue;
+        const msym = c.toGlobalIn(file, rec.sym);
+        const mf = c.symFlags(msym);
+        if (!hasValueMeaning(mf)) continue;
+        var dup = false;
+        for (props.items) |p| {
+            if (p.name == rec.exported) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) continue;
+        var flags: u32 = 0;
+        if (mf.const_decl or mf.readonly_member) flags |= types.prop_flag_readonly;
+        try props.append(c.scratch(), .{
+            .name = rec.exported,
+            // The alias symbol itself: `typeOfSymbol` follows an import
+            // binding through the link, so the re-exported name gets the
+            // same type a direct import of it would.
+            .ty = try c.typeOfSymbol(msym),
+            .flags = flags,
+        });
+    }
 }
 
 /// If namespace scope `s` belongs to a symbol that is a cross-file merge

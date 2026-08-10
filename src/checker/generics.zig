@@ -785,6 +785,20 @@ pub fn collectInferVars(c: *Checker, t: TypeId, out: *std.ArrayList(u32), refs: 
         },
         .string_mapping => try c.collectInferVars(s.stringMappingArg(t), out, refs),
         .keyof_op => try c.collectInferVars(s.keyofOperand(t), out, refs),
+        // A mapped type parked by `reduceMapped` because its key set is still
+        // an `infer` var: `Record<infer K, V>` is `{ [P in K]: V }`, so the
+        // binder `K` lives in the mapped node, not in any arm above. Missing it
+        // meant the conditional collected NO binders, never ran the match, and
+        // then related its check type against an extends clause that still
+        // held a raw `infer` var — which relates to nothing, so every such
+        // conditional took its FALSE branch. `containsInfer` already descends
+        // here (this walk is a subset of it), so the arms must agree.
+        .mapped => {
+            if (s.mappedConstraint(t) != 0) try c.collectInferVars(s.mappedConstraint(t), out, refs);
+            if (s.mappedSource(t) != 0) try c.collectInferVars(s.mappedSource(t), out, refs);
+            if (s.mappedValue(t) != 0) try c.collectInferVars(s.mappedValue(t), out, refs);
+            if (s.mappedAs(t) != 0) try c.collectInferVars(s.mappedAs(t), out, refs);
+        },
         else => {},
     }
 }
@@ -994,6 +1008,43 @@ fn inferFromExtendsInner(c: *Checker, source0: TypeId, pattern: TypeId, ids: []c
             }
             const rp = try c.resolveStructural(pattern);
             if (rp != pattern) try c.inferFromExtends(src, rp, ids, vals, contra, depth + 1);
+        },
+        // `{ [P in K]: X }` with an `infer` var in its KEY SET — tsc's
+        // `inferToMappedType`. `keyof source` is inferred for the key set and
+        // the union of the source's property types for the template `X`, which
+        // is what lets `T extends Record<infer K, V> ? K : never` name T's own
+        // keys. Without an arm here the pattern matched nothing, the var stayed
+        // unbound, and the whole conditional fell to its FALSE branch — expo's
+        // `InferEventName<TEventsMap> = TEventsMap extends Record<infer N
+        // extends keyof TEventsMap, AnyEventListener> ? N : never` resolved to
+        // `never`, so every `useEvent(player, 'statusChange', …)` rejected its
+        // own event name and the listener lost its contextual signature.
+        //
+        // Only the plain `[P in K]` form: a HOMOMORPHIC map (`[P in keyof T]`,
+        // which carries a source) and a key-remapping `as` clause select
+        // different rules in tsc and are left to the existing paths.
+        .mapped => {
+            const con = s.mappedConstraint(pattern);
+            if (con == 0 or s.mappedAs(pattern) != 0 or s.mappedSource(pattern) != 0) return;
+            if (!try c.containsInfer(con)) return;
+            const src = try c.resolveStructural(source0);
+            if (s.kind(src) != .object) return;
+            try c.inferFromExtends(try c.keyofType(src), con, ids, vals, contra, depth + 1);
+            const val = s.mappedValue(pattern);
+            if (val != 0 and try c.containsInfer(val)) {
+                var parts: std.ArrayList(TypeId) = .empty;
+                defer parts.deinit(c.scratch());
+                for (0..s.objectPropCount(src)) |i| {
+                    try parts.append(c.scratch(), s.objectProp(src, @intCast(i)).ty);
+                }
+                if (s.objectStringIndex(src) != 0) {
+                    try parts.append(c.scratch(), s.objectStringIndex(src));
+                }
+                if (parts.items.len != 0) {
+                    const u = try c.ts.makeUnion(c.scratch(), parts.items);
+                    try c.inferFromExtends(u, val, ids, vals, contra, depth + 1);
+                }
+            }
         },
         .object => {
             var src = try c.resolveStructural(source0);

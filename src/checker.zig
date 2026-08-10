@@ -3453,6 +3453,7 @@ pub const Checker = struct {
     pub const materializeTypeRef = typenode_zig.materializeTypeRef;
     pub const augmentModuleTypeSym = typenode_zig.augmentModuleTypeSym;
     pub const namespaceMemberSym = typenode_zig.namespaceMemberSym;
+    pub const nsReexportProps = typenode_zig.nsReexportProps;
     pub const mergedNsMemberOfScope = typenode_zig.mergedNsMemberOfScope;
     pub const resolveImportTypeModule = typenode_zig.resolveImportTypeModule;
     pub const ambientIndex = typenode_zig.ambientIndex;

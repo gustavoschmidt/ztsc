@@ -808,6 +808,10 @@ pub fn classStaticType(c: *Checker, sym: SymbolId) Error!TypeId {
                 .flags = flags,
             });
         }
+        // …plus the names the body re-exports with `export { X as Y }`, which
+        // the binder records as export records rather than declaring in the
+        // body scope, so the member index above does not carry them.
+        try c.nsReexportProps(sym, &props);
     }
     var result = try c.ts.makeObject(props.items, 0, 0, 0);
     // Static members are inherited: `typeof D` includes `typeof Base`'s
