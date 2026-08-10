@@ -81,6 +81,10 @@ pub fn checkExprCached(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     // Anchor any TS2589 raised while materializing this expression's type
     // (instantiation limit) at the expression's span.
     c.anchorInst(node);
+    // The outermost side query has returned: drop every per-symbol type it
+    // memoized before this expression is walked under the authoritative
+    // state (see `Checker.spec_sym_types` and `dropSpeculativeSymTypes`).
+    if (c.side_query_depth == 0 and c.spec_sym_types.items.len != 0) c.dropSpeculativeSymTypes();
     const key = c.nodeKey(node);
     if (c.node_types.get(key)) |e| {
         if (e.ctx == ctx) {

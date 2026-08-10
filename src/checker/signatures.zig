@@ -190,6 +190,7 @@ pub fn signatureOfProtoCtx(
                     if (ctx_sig != types.no_type and gsym != binder.no_symbol and gsym < c.sym_types.items.len) {
                         c.sym_types.items[gsym] = body_ty;
                         c.sym_state.items[gsym] = .computed;
+                        markSpeculativePin(c, gsym);
                     } else {
                         c.setTypeOfSymbol(gsym, body_ty);
                     }
@@ -826,15 +827,24 @@ pub fn collectReturns(c: *Checker, node: Node, out: *std.ArrayList(Node), out_sc
 
 pub fn typeOfSymbol(c: *Checker, sym: SymbolId) Error!TypeId {
     if (sym == binder.no_symbol or sym >= c.sym_types.items.len) return types.any_type;
-    if (c.sym_state.items[sym] == .computed) return c.sym_types.items[sym];
+    if (c.sym_state.items[sym] == .computed) {
+        // Reading a tainted memo taints whatever is being computed around it
+        // (see `Checker.spec_sym_types`).
+        if (c.spec_tainted.count() != 0 and c.spec_tainted.contains(sym)) c.spec_taint_reads += 1;
+        return c.sym_types.items[sym];
+    }
     if (c.sym_state.items[sym] == .in_progress) return types.any_type; // circular
     c.sym_state.items[sym] = .in_progress;
+    const before = c.spec_taint_reads;
     const t = c.computeTypeOfSymbol(sym) catch |err| {
         c.sym_state.items[sym] = .not_computed;
         return err;
     };
     c.sym_types.items[sym] = t;
     c.sym_state.items[sym] = .computed;
+    // Tainted only if this computation actually read a speculative pin. A side
+    // query that materializes an unrelated declaration keeps its memo.
+    if (c.side_query_depth != 0 and c.spec_taint_reads != before) try markSpeculative(c, sym);
     return t;
 }
 
@@ -843,6 +853,51 @@ pub fn setTypeOfSymbol(c: *Checker, sym: SymbolId, t: TypeId) void {
     if (c.sym_state.items[sym] == .computed) return;
     c.sym_types.items[sym] = t;
     c.sym_state.items[sym] = .computed;
+    markSpeculativePin(c, sym);
+}
+
+/// Seed the taint from a parameter pin made while a side query is on the
+/// stack: the value is whatever contextual signature the probe was running
+/// with, and every local the probe derives from it inherits that.
+///
+/// A PARAMETER pin is tainted but never dropped. It is re-made from scratch on
+/// every materialization of the function, so the authoritative pass overwrites
+/// the probe's value on its own; dropping it instead leaves the parameter to
+/// `computeTypeOfSymbol`, which re-derives an un-annotated parameter with no
+/// contextual signature at all — measured as four fresh TS7006s on social-app
+/// and three more on immich at `--checkers=3`, every one of them "Parameter
+/// 'eb' implicitly has an 'any' type". Everything else this pins IS dropped:
+/// a `for (const post of draft.posts)` binding is pinned once and never again,
+/// which is exactly the entry the probe poisons.
+///
+/// Best-effort: an OOM here costs the taint, which is what the old code lacked
+/// entirely.
+pub fn markSpeculativePin(c: *Checker, sym: SymbolId) void {
+    if (c.side_query_depth == 0) return;
+    if (c.symFlags(sym).param) {
+        _ = c.spec_tainted.getOrPut(c.cm(), sym) catch return;
+        return;
+    }
+    markSpeculative(c, sym) catch {};
+}
+
+fn markSpeculative(c: *Checker, sym: SymbolId) Error!void {
+    _ = try c.spec_tainted.getOrPut(c.cm(), sym);
+    try c.spec_sym_types.append(c.cm(), sym);
+}
+
+/// Undo every tainted `sym_types` entry. Run from the top of
+/// `checkExprCached` — i.e. before the authoritative pass walks anything, and
+/// in particular before it re-pins the callback parameters it is about to
+/// check the body under. Draining any later undoes those pins too, and
+/// `computeTypeOfSymbol` re-derives an un-annotated parameter with no
+/// contextual signature at all, i.e. as `any`.
+pub fn dropSpeculativeSymTypes(c: *Checker) void {
+    for (c.spec_sym_types.items) |s| {
+        if (s < c.sym_state.items.len) c.sym_state.items[s] = .not_computed;
+    }
+    c.spec_sym_types.clearRetainingCapacity();
+    c.spec_tainted.clearRetainingCapacity();
 }
 
 pub fn computeTypeOfSymbol(c: *Checker, sym: SymbolId) Error!TypeId {
@@ -1670,6 +1725,7 @@ pub fn pinBindingSym(c: *Checker, pn: Node, name: Atom, whole: TypeId, force: bo
     };
     c.sym_types.items[gsym] = t;
     c.sym_state.items[gsym] = .computed;
+    markSpeculativePin(c, gsym);
 }
 
 /// Type of `sym` when bound by a destructuring pattern whose whole
