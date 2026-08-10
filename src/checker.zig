@@ -3606,6 +3606,7 @@ pub const Checker = struct {
     pub const lazyMemberAt = instantiate_zig.lazyMemberAt;
     pub const lazyPropAt = instantiate_zig.lazyPropAt;
     pub const lazyPropNamed = instantiate_zig.lazyPropNamed;
+    pub const lazyIndexedProp = instantiate_zig.lazyIndexedProp;
     pub const lazyStringIndex = instantiate_zig.lazyStringIndex;
     pub const lazyNumberIndex = instantiate_zig.lazyNumberIndex;
     pub const originTaggable = instantiate_zig.originTaggable;

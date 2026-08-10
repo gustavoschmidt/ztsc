@@ -3215,6 +3215,38 @@ pub fn propertyTypeOf(c: *Checker, t: TypeId, name: Atom, name_tok: TokenIndex) 
                 if (p.optional()) pt = try c.makeUnion2(pt, types.undefined_type);
                 return pt;
             }
+            // A VALUE-position read of ONE member of a generic reference,
+            // substituted on its own — tsc's `getTypeOfPropertyOfType`, which
+            // asks `getPropertyOfType` for a single symbol out of the
+            // instantiated table `createInstantiatedSymbolTable` built from
+            // `(target, mapper)` pairs, and only then runs `getTypeOfSymbol` on
+            // that one symbol. ztsc materializes the whole table instead.
+            //
+            // Gated exactly as the type-position twin is (`lazyIndexedProp`):
+            // only once THIS checker has already hit the instantiation ceiling,
+            // which is the one condition under which the eager table is not a
+            // prepayment but a loss. prof.zig records this conversion as a
+            // large regression on immich twice — the mechanism being that the
+            // whole-table expansion runs early, completes, and is memoized for
+            // every later reader — and both of those measurements were taken
+            // when immich still tripped the ceiling thousands of times. It
+            // trips ZERO times today, as do excalidraw and every package in
+            // `bench/corpus/real`, so the healthy corpus never takes this route
+            // and pays one predictable-false branch for it. social-app's
+            // `z.object({…40 props})` does trip, and there `schema.safeParse`
+            // spends the entire 250,000-node statement budget materializing
+            // `ZodObject`'s ~40-member table — of which it reads exactly one
+            // member — because `required(): ZodObject<{[k in keyof T]:
+            // deoptional<T[k]>}, …>` and the `ZodOptional<this>` /
+            // `ZodEffects<this, …>` fluent tail behind it drag in a thousand
+            // more expansions.
+            if (k == .ref) {
+                if (try c.lazyIndexedProp(t, name)) |p| {
+                    var pt = try c.substThis(p.ty, t);
+                    if (p.optional()) pt = try c.makeUnion2(pt, types.undefined_type);
+                    return pt;
+                }
+            }
             const r = try c.resolveStructural(t);
             if (c.ts.kind(r) == .any or c.ts.kind(r) == .err) return types.any_type;
             if (try c.propOfType(r, name)) |p| {
