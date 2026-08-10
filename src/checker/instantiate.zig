@@ -1749,6 +1749,54 @@ pub fn ctorClassOwnsMember(c: *Checker, name: Atom) bool {
     return false;
 }
 
+/// The class symbol a heritage EXPRESSION denotes through its *type* — tsc's
+/// `resolveBaseTypesOfClass` first arm, `baseConstructorType.symbol &&
+/// baseConstructorType.symbol.flags & SymbolFlags.Class`. The base entity need
+/// not be the class binding itself: a `const` whose declared type is a class's
+/// static side denotes that class just as well, and tsc then takes the NOMINAL
+/// route (`getTypeFromClassOrInterfaceReference`) rather than reading a
+/// construct signature's return type.
+///
+/// `expo-modules-core` publishes its whole class hierarchy this way —
+/// `export declare const SharedObject: typeof ExpoGlobal.SharedObject` beside
+/// a same-named type alias — so `expo-video`'s
+/// `class VideoPlayer extends SharedObject<VideoPlayerEvents>` had its base
+/// resolved off the construct signature, whose return type still mentions the
+/// base's own unbound parameter. `VideoPlayer` therefore carried
+/// `_TEventsMap_DONT_USE_IT?: any` instead of the events map, and every
+/// `useEventListener(player, 'timeUpdate', evt => …)` lost the contextual
+/// listener type its `TEventsMap` inference hangs on (TS7006 on `evt`).
+///
+/// Null unless the written type-argument arity is one this base accepts:
+/// falling back to the construct-signature route keeps the pre-existing
+/// (lenient) answer rather than adding a TS2314/TS2707 `fixTypeArgs` reports.
+fn baseCtorClassSym(c: *Checker, expr: Node, targ_count: usize) Error!?SymbolId {
+    const bt = try c.checkExprCached(expr, types.no_type);
+    if (c.ts.kind(bt) != .class_value) return null;
+    const bsym = c.ts.classSymbol(bt);
+    var tps: std.ArrayList(TypeParamInfo) = .empty;
+    defer tps.deinit(c.scratch());
+    try c.typeParamsOf(bsym, &tps);
+    if (targ_count > tps.items.len) return null;
+    var min: usize = 0;
+    for (tps.items) |tp| {
+        if (tp.default == 0) min += 1;
+    }
+    if (targ_count < min) return null;
+    return bsym;
+}
+
+/// How many type arguments a heritage clause writes.
+fn heritageArgCount(c: *Checker, hd: ast.Data) usize {
+    if (hd.rhs == 0) return 0;
+    const r = c.tree.extraData(ast.SubRange, hd.rhs);
+    var n: usize = 0;
+    for (c.tree.extraRange(r.start, r.end)) |an| {
+        if (an != null_node) n += 1;
+    }
+    return n;
+}
+
 /// The `extends` base of a class as a ref (or null). The base name
 /// resolves in the class's own file (so imported bases work).
 pub fn baseClassRef(c: *Checker, sym: SymbolId) Error!?TypeId {
@@ -1762,8 +1810,12 @@ pub fn baseClassRef(c: *Checker, sym: SymbolId) Error!?TypeId {
         const saved = c.cur_scope;
         defer c.cur_scope = saved;
         if (try c.scopeOf(decl)) |s| c.cur_scope = s;
-        const base_sym = (try c.classBaseEntitySym(hd.lhs)) orelse return null;
-        if (!c.symFlags(base_sym).class) return null;
+        const base_sym = blk: {
+            if (try c.classBaseEntitySym(hd.lhs)) |bs| {
+                if (c.symFlags(bs).class) break :blk bs;
+            }
+            break :blk (try baseCtorClassSym(c, hd.lhs, heritageArgCount(c, hd))) orelse return null;
+        };
         var targs: std.ArrayList(TypeId) = .empty;
         defer targs.deinit(c.scratch());
         if (hd.rhs != 0) {
@@ -1831,8 +1883,13 @@ pub fn baseClassSym(c: *Checker, sym: SymbolId) Error!?SymbolId {
         const saved = c.cur_scope;
         defer c.cur_scope = saved;
         if (try c.scopeOf(decl)) |s| c.cur_scope = s;
-        const base_sym = (try c.classBaseEntitySym(hd.lhs)) orelse return null;
-        if (!c.symFlags(base_sym).class) return null;
+        const base_sym = blk: {
+            if (try c.classBaseEntitySym(hd.lhs)) |bs| {
+                if (c.symFlags(bs).class) break :blk bs;
+            }
+            // Same static side `baseClassRef` now takes the instance from.
+            break :blk (try baseCtorClassSym(c, hd.lhs, heritageArgCount(c, hd))) orelse return null;
+        };
         if (base_sym == sym) return null; // self-extends: no static inherit
         return base_sym;
     }
