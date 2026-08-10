@@ -2372,6 +2372,18 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
         if (sk == .object or sk == .ref or sk == .intersection) {
             if (try c.discriminatedUnionAssignable(s, t)) return true;
         }
+        // The same rule for a TUPLE source. A tuple is an ordinary object
+        // type in tsc — its elements are the properties `"0"`, `"1"`, … — so
+        // `typeRelatedToDiscriminatedType` applies to it unchanged, and the
+        // shape it decides is every "overloaded" argument list spelled as a
+        // union of tuples. react-navigation's `navigate` is exactly that:
+        // `navigate(...args: ["Home", undefined?, Opts?] | ["Search", …] | …)`,
+        // and a call whose first argument is a route-name UNION builds the
+        // spread tuple `["HomeTab" | "SearchTab"]` (tsc's
+        // `getSpreadArgumentType`), which fits no single constituent.
+        if (sk == .tuple) {
+            if (try c.discriminatedTupleAssignable(s, t)) return true;
+        }
         return false;
     }
     if (tk == .intersection) {
@@ -3616,6 +3628,73 @@ pub fn discriminatedUnionAssignable(c: *Checker, s: TypeId, t: TypeId) Error!boo
                 }
             }
             if (!covered) {
+                all_ok = false;
+                break;
+            }
+        }
+        if (all_ok) return true;
+    }
+    return false;
+}
+
+/// `discriminatedUnionAssignable` for a TUPLE source against a union of
+/// tuples — tsc's `typeRelatedToDiscriminatedType` with the element positions
+/// standing in for the properties `"0"`, `"1"`, … that a tuple's members
+/// actually are.
+///
+/// One position is split (the first eligible), which is the same
+/// single-discriminant simplification the object form makes: a position whose
+/// SOURCE type is a union, whose member types are not all the same, and at
+/// least one of which is a unit (tsc's `isDiscriminantProperty`,
+/// `HasNonUniformType | HasLiteralType`). Each case is then re-related to the
+/// whole union, which is sound in the direction that matters: a value of
+/// `[A | B, X]` is a value of `[A, X]` or of `[B, X]`, so if both reach the
+/// union so does every value of the original.
+pub fn discriminatedTupleAssignable(c: *Checker, s: TypeId, t: TypeId) Error!bool {
+    const sr = try c.resolveStructural(s);
+    if (c.ts.kind(sr) != .tuple) return false;
+    const members = try c.memberList(t);
+    if (members.len < 2) return false;
+    const s_len = c.ts.tupleLen(sr);
+    for (0..s_len) |pos| {
+        const i: u32 = @intCast(pos);
+        const se = c.ts.tupleElem(sr, i);
+        if (se.rest()) continue;
+        const src_el = try c.resolveStructural(se.ty);
+        if (c.ts.kind(src_el) != .union_type) continue;
+        // The target side has to look like a discriminant at this position.
+        var first_val: TypeId = 0;
+        var differs = false;
+        var any_unit = false;
+        var ok = true;
+        for (members) |m| {
+            const mr = try c.resolveStructural(m);
+            if (c.ts.kind(mr) != .tuple or c.ts.tupleLen(mr) <= i) {
+                ok = false;
+                break;
+            }
+            const me = c.ts.tupleElem(mr, i);
+            if (me.rest()) {
+                ok = false;
+                break;
+            }
+            const mt = try c.resolveStructural(me.ty);
+            if (try c.isUnitOrUnitUnion(mt)) any_unit = true;
+            if (first_val == 0) first_val = mt else if (mt != first_val) differs = true;
+        }
+        if (!ok or !differs or !any_unit) continue;
+        // Split: every case of the source's element must reach the union.
+        var elems: std.ArrayList(types.TupleElem) = .empty;
+        defer elems.deinit(c.scratch());
+        var all_ok = true;
+        for (try c.memberList(src_el)) |lv| {
+            elems.clearRetainingCapacity();
+            for (0..s_len) |j| {
+                const e = c.ts.tupleElem(sr, @intCast(j));
+                try elems.append(c.scratch(), if (j == pos) .{ .ty = lv, .flags = e.flags } else e);
+            }
+            const one = try c.ts.makeTuple(elems.items);
+            if (one == sr or !try c.isAssignable(one, t)) {
                 all_ok = false;
                 break;
             }

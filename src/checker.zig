@@ -3897,6 +3897,7 @@ pub const Checker = struct {
     pub const computeIntersectionIsNever = assign_zig.computeIntersectionIsNever;
     pub const isUnitLikeKind = assign_zig.isUnitLikeKind;
     pub const discriminatedUnionAssignable = assign_zig.discriminatedUnionAssignable;
+    pub const discriminatedTupleAssignable = assign_zig.discriminatedTupleAssignable;
     pub const collectPropNames = assign_zig.collectPropNames;
     pub const isUnitOrUnitUnion = assign_zig.isUnitOrUnitUnion;
     pub const nonDiscPropsAssignable = assign_zig.nonDiscPropsAssignable;
