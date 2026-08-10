@@ -371,6 +371,37 @@ pub fn planConditional(c: *Checker, chk: TypeId, extends_ty: TypeId, distributiv
     const ext_generic = try c.containsFreeTypeParam(extends_ty, &.{}) or try c.containsMappedParam(extends_ty) or try c.containsThisType(extends_ty);
     const chk_generic = try c.containsFreeTypeParam(chk, &.{}) or try c.containsMappedParam(chk) or try c.containsThisType(chk);
     if (chk_generic or ext_generic) {
+        // `extends any` / `extends unknown` is decidably TRUE, whatever the
+        // check turns out to be: tsc's `getConditionalType` short-circuits on
+        // `inferredExtendsType.flags & AnyOrUnknown` and never asks the
+        // relation at all. Its ONE precondition is that the check type is not
+        // deferred — and tsc's deferral test (`isDeferredType` →
+        // `isGenericObjectType || isGenericIndexType`) is *shallow*: a bare
+        // type variable, `keyof T`, an indexed access, a conditional, a
+        // generic mapped type. A concrete container that merely carries free
+        // params inside it — `Box<T>`, `{ q: T }`, `T[]`, `Box<T> | string` —
+        // is NOT generic there, so tsc resolves it now. ztsc's general test is
+        // the DEEP `containsFreeTypeParam` scan, which called all of those
+        // generic and deferred them.
+        //
+        // The idiom that forces it is react-query's `NoInfer`:
+        //     type NoInfer<T> = [T][T extends any ? 0 : never];
+        // Instantiated at `NoInfer<InfiniteData<T>>` the inner check is the
+        // reference `InfiniteData<T>`, so tsc reads `0` and the index reduces
+        // back to `InfiniteData<T>`. Deferring left the whole thing as an
+        // unreduced `[InfiniteData<T>][InfiniteData<T> extends any ? 0 :
+        // never]`, on which every property read raised a false TS2339.
+        //
+        // Only the any/unknown short-circuit is taken here, not tsc's general
+        // non-generic-check resolution: the latter decides by relating the
+        // PERMISSIVE and RESTRICTIVE instantiations of the two sides (which is
+        // what keeps `{ a: T } extends { a: string }` deferred rather than
+        // false), and ztsc has neither. An any/unknown target needs no
+        // relation, so this arm is exact.
+        const ext_k = s.kind(extends_ty);
+        if ((ext_k == .any or ext_k == .unknown) and !try c.isGenericObjectForIndex(chk)) {
+            return c.planConcreteConditional(chk, extends_ty);
+        }
         // Narrow decidability carve-out (see objectDecidablyNotExtends): a
         // concrete-shaped object check whose free params live only in
         // property values has a fixed shape. When the target is decidable
