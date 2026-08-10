@@ -739,6 +739,7 @@ pub const map_containers = [_][]const u8{
     "pattern_narrow_busy",      "key_name_types",         "enum_members",
     "keyof_obj_cache",          "trunc_expansions",       "inst_map_bytes",
     "tp_mentions",              "smk_cache",              "rel_maybe",
+    "spec_sym_types",           "spec_tainted",
 };
 
 /// One enum member as `eachEnumMember` yields it: the name atom and the
@@ -1823,6 +1824,58 @@ pub const Checker = struct {
     /// authoritative top-down check reports at the narrowed type, and a
     /// narrowing query must never be the thing that files an error.
     side_query_depth: u32 = 0,
+    /// Symbols whose type memo (`sym_types`/`sym_state`) was filled from a
+    /// SIDE QUERY's own parameter pins — the speculative half of the rule
+    /// `checkExprCached` already applies to `node_types`.
+    ///
+    /// A side query walks expressions out of the checker's top-down order and
+    /// under state the authoritative pass does not share: the context-sensitive
+    /// two-pass argument probe (`checker/calls.zig`) walks a callback body once
+    /// with every still-free type parameter standing in as `any`, then re-walks
+    /// it with the parameters fixed. `node_types` is withheld from that first
+    /// pass, but `typeOfSymbol` is first-writer-wins and *permanent*, so every
+    /// local the probe declared kept the probe's answer: social-app's
+    /// `useMutation({ onSuccess: async (_, { draft }) => … })` pinned the
+    /// `for (const post of draft.posts)` binding to `any` (a NAMED parameter is
+    /// re-pinned per materialization, so it recovers on its own — a destructured
+    /// one is pinned first-writer-wins, and the bindings under it never were),
+    /// and a later `isDraftEmbedImage(item)` then inferred its type parameter
+    /// from `any`. Whether the probe or the authoritative walk reached the body
+    /// first is a function of which file demanded the enclosing declaration,
+    /// i.e. of the root order and the partition — so the resulting TS2339 moved
+    /// with `--file-order`.
+    ///
+    /// Recorded rather than withheld: within the side query the memo still
+    /// serves (a probe that re-derives every local it touches is quadratic),
+    /// and the entries are dropped the moment the outermost side query has
+    /// returned, so the authoritative walk recomputes them under its own state.
+    /// `dropSpeculativeSymTypes` is the drain; `checkExprCached` runs it.
+    ///
+    /// TAINTED, not merely speculative. Dropping *everything* a side query
+    /// memoized is correct but costs the recomputation of every library
+    /// declaration a probe happened to reach first — measured at +37% wall on
+    /// social-app and +26% on excalidraw. What actually differs under a probe
+    /// is what the probe PINNED, so a pin made at `side_query_depth > 0` seeds
+    /// the taint and `typeOfSymbol` inherits it: `spec_taint_reads` counts
+    /// reads of a tainted symbol, and a symbol whose own computation read one
+    /// is tainted in turn. A symbol computed from clean inputs keeps its memo,
+    /// which is the overwhelming majority — with the taint in place both apps
+    /// come out FASTER than before the fix, a probe no longer re-deriving what
+    /// an earlier probe already memoized.
+    ///
+    /// Tracked beside `sym_state` rather than as a fourth `SymState`: the state
+    /// byte has readers outside this file (`checker/flow.zig`'s explicit-type
+    /// fast path), and a value they do not know silently changes what they
+    /// answer — measured as four fresh social-app false positives.
+    spec_sym_types: std.ArrayListUnmanaged(SymbolId) = .empty,
+    /// Membership half of `spec_sym_types`, empty outside a side query — which
+    /// is what keeps the read barrier in `typeOfSymbol` to a load and a
+    /// compare on the overwhelmingly common path.
+    spec_tainted: IntMap(SymbolId, void) = .empty,
+    /// Monotonic count of reads of a tainted symbol. Read only as a
+    /// *difference* across one `computeTypeOfSymbol`, which is what makes the
+    /// taint transitive through arbitrarily deep nesting.
+    spec_taint_reads: u64 = 0,
     /// Nesting depth of a conditional type's TRUE branch, while its type
     /// nodes are being synthesized. tsc wraps every occurrence of the check
     /// type inside that branch in a *substitution type* constrained by the
@@ -2408,6 +2461,7 @@ pub const Checker = struct {
         inst_budget: u64,
         budget_epoch: u64,
         epoch_sym: SymbolId,
+        const_ctx: bool,
     };
 
     pub fn saveCtx(c: *const Checker) SavedCtx {
@@ -2419,6 +2473,7 @@ pub const Checker = struct {
             .inst_budget = c.inst_budget,
             .budget_epoch = c.budget_epoch,
             .epoch_sym = c.epoch_sym,
+            .const_ctx = c.const_ctx,
         };
     }
 
@@ -2430,6 +2485,7 @@ pub const Checker = struct {
         c.inst_budget = s.inst_budget;
         c.budget_epoch = s.budget_epoch;
         c.epoch_sym = s.epoch_sym;
+        c.const_ctx = s.const_ctx;
     }
 
     /// Open a fresh instantiation-budget window (see `budget_epoch`). Called
@@ -2472,6 +2528,25 @@ pub const Checker = struct {
     /// there, which is also where the truncation belongs — but no source
     /// element can be poisoned by the cost of a declaration it merely
     /// referenced.
+    ///
+    /// A const ASSERTION context (`const_ctx`) is dropped for the same reason
+    /// and it is the same defect. `x as const` sets a single mutable flag that
+    /// object/array literals read to keep their members literal and readonly;
+    /// materializing another declaration's type is not part of that assertion,
+    /// but the demand can land anywhere. social-app's
+    ///
+    ///     export const ScrollbarOffsetContext = createContext({
+    ///       isWithinOffsetView: false,
+    ///     })
+    ///
+    /// kept its property at `false` instead of widening to `boolean` exactly
+    /// when the first walk to demand the symbol reached it from inside an
+    /// `as const` — `Context<{ isWithinOffsetView: false }>` then rejected the
+    /// provider's `{ isWithinOffsetView: boolean }` value. The materialized
+    /// type is memoized per symbol, so whichever walk got there first fixed the
+    /// answer for the whole run, and the TS2322 appeared under
+    /// `--file-order=shuffle=3` and not under `source`. `restoreCtx` puts the
+    /// caller's flag back.
     pub fn enterSymFile(c: *Checker, sym: SymbolId) SavedCtx {
         const saved = c.saveCtx();
         const f = c.symFile(sym);
@@ -2480,6 +2555,7 @@ pub const Checker = struct {
             c.setFile(f);
             c.this_type = 0;
         }
+        c.const_ctx = false;
         c.inst_count = 0;
         c.inst_budget = max_decl_instantiation_count;
         c.newBudgetWindow();
@@ -3466,6 +3542,7 @@ pub const Checker = struct {
     pub const collectReturns = signatures_zig.collectReturns;
     pub const typeOfSymbol = signatures_zig.typeOfSymbol;
     pub const setTypeOfSymbol = signatures_zig.setTypeOfSymbol;
+    pub const dropSpeculativeSymTypes = signatures_zig.dropSpeculativeSymTypes;
     pub const computeTypeOfSymbol = signatures_zig.computeTypeOfSymbol;
     pub const withExpandoProps = signatures_zig.withExpandoProps;
     pub const callableClassValue = signatures_zig.callableClassValue;
