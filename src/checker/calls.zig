@@ -1775,6 +1775,49 @@ pub fn inferTypeArgs(
                         const probe = try c.checkExprCached(an, arg_ctx);
                         try c.unify(pt, probe, tp_syms, probe_cands, 0);
                     }
+                    // The properties EARLIER in the literal have already
+                    // contributed by the time tsc instantiates a later
+                    // context-sensitive property's contextual signature — the
+                    // fixing mapper pins each parameter at what inference has
+                    // reached *at that point*, not at what round one alone
+                    // reached. react-query's `useMutation({mutationFn,
+                    // onMutate, onError})` is the shape that needs it:
+                    // `onMutate` determines `TOnMutateResult` through its
+                    // RETURN and `onError` names it in a PARAMETER, so tsc
+                    // fixes it at `onMutate`'s answer and `onError`'s
+                    // `context` is the real thing. Round one cannot see it —
+                    // `onMutate` is context sensitive, so round one skipped
+                    // it — and feeding `unknown` to pass two is not a
+                    // provisional reading that some later pass corrects: pass
+                    // two IS the authoritative walk, so it reported
+                    // `context.prevConvo` against `{}`.
+                    //
+                    // So a parameter that some context-sensitive property
+                    // determines through its return, and that round one left
+                    // open, is re-derived from a second speculative read with
+                    // the skip OFF. Nothing else takes a candidate from it —
+                    // in particular not a parameter the callback names in its
+                    // own PARAMETERS, which is the placeholder echo round one
+                    // exists to refuse.
+                    if (attempt == 0) {
+                        var want_ret_only = false;
+                        for (0..tp_syms.len) |i| {
+                            if (cs_ret_only[i] and probe_cands[i] == types.no_type) want_ret_only = true;
+                        }
+                        if (want_ret_only) {
+                            const ro_cands = try c.scratch().alloc(TypeId, tp_syms.len);
+                            for (candidates, 0..) |cd, i| ro_cands[i] = cd;
+                            const saved_aft2 = c.aft_seen;
+                            c.aft_seen = false;
+                            const ro_probe = try c.checkExprCached(an, arg_ctx);
+                            try c.unify(pt, ro_probe, tp_syms, ro_cands, 0);
+                            c.aft_seen = saved_aft2;
+                            for (0..tp_syms.len) |i| {
+                                if (!cs_ret_only[i] or probe_cands[i] != types.no_type) continue;
+                                probe_cands[i] = ro_cands[i];
+                            }
+                        }
+                    }
                     // Every type parameter is FIXED for pass two: one the
                     // probe could not infer takes its default/constraint (tsc
                     // fixes a type parameter before instantiating the

@@ -88,6 +88,25 @@ const m = useMutation({
 });
 export const snap: number = m.ctx.snapshot;
 
+// And the callback that NAMES it in a parameter is handed the real thing,
+// not the value round one stopped at. `onMutate` is context sensitive, so
+// round one — which skips it — leaves `TContext` open; the parameter is
+// fixed at what the properties BEFORE it have contributed, which by then
+// includes `onMutate`'s return. The pass that types this body is the
+// authoritative one, so getting it wrong is a reported error, not a
+// provisional reading something later corrects.
+export function ctxIsReal() {
+  let out = 0;
+  useMutation({
+    mutationFn: async ({ id }: { id: string }) => ({ ok: id }),
+    onMutate: async (_v) => ({ snapshot: 1 }),
+    onSuccess: (_d, _v, ctx) => {
+      out = ctx ? ctx.snapshot : 0;
+    },
+  });
+  return out;
+}
+
 // NEGATIVE -----------------------------------------------------------------
 
 // The callback parameter really is the inferred type, so a wrong use is
