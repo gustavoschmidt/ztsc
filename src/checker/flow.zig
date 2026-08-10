@@ -510,25 +510,66 @@ fn objectPatternOf(c: *Checker, decl: Node) ?Node {
     return pat;
 }
 
-/// The ANNOTATED type of a destructuring declaration's whole value —
-/// tsc's `getTypeForBindingElementParent`, restricted to the annotated forms.
-/// An unannotated parameter's type is contextual and an unannotated
-/// declarator's comes from an initializer checked in another scope; leaving
-/// both out keeps this a pure function of the declaration (so `--checkers=N`
-/// partitions cannot disagree about it) at the cost of narrowing fewer
-/// destructurings than tsc — sound under-narrowing either way.
-fn patternParentType(c: *Checker, decl: Node) Error!TypeId {
+/// The type of a destructuring declaration's whole value — tsc's
+/// `getTypeForBindingElementParent`.
+///
+/// An annotation answers directly. A `const` declarator without one is typed
+/// by its INITIALIZER, exactly as `declaratorType` types it — `const
+/// {assets, canceled} = await picker()` is the common spelling of a
+/// destructured discriminated union, and refusing it left every such
+/// `if (canceled) return` un-narrowed. The initializer is re-typed through
+/// `checkExprCached` (in practice a cache hit: the caller already asked for
+/// the binding's declared type, which walks the same expression) under the
+/// same `defer_bodies` guard `declaratorType` uses, so a demand arriving
+/// here first cannot walk a function body that the declarator path would
+/// have deferred — the order-dependence that guard exists to prevent.
+///
+/// An unannotated PARAMETER is still left out: its type is contextual, so it
+/// is not a function of the declaration at all. Sound under-narrowing.
+fn patternParentType(c: *Checker, decl: Node, is_const: bool) Error!TypeId {
     const d = c.tree.nodeData(decl);
+    var init_node: Node = null_node;
     const ann: Node = switch (c.nodeTag(decl)) {
         // `.param` carries its (optional) annotation directly in `rhs`;
         // `.param_full` moves it into the side table with flags/initializer.
         .param => d.rhs,
         .param_full => c.tree.extraData(ast.ParamFull, d.rhs).type_ann,
-        .declarator_full => c.tree.extraData(ast.DeclaratorFull, d.rhs).type_ann,
+        .declarator_init => blk: {
+            init_node = d.rhs;
+            break :blk null_node;
+        },
+        .declarator_full => blk: {
+            const e = c.tree.extraData(ast.DeclaratorFull, d.rhs);
+            init_node = e.init;
+            break :blk e.type_ann;
+        },
         else => null_node,
     };
-    if (ann == null_node) return types.no_type;
-    return c.typeFromTypeNode(ann);
+    if (ann != null_node) return c.typeFromTypeNode(ann);
+    if (init_node == null_node or !is_const) return types.no_type;
+    c.defer_bodies += 1;
+    defer c.defer_bodies -= 1;
+    const init_t = try c.checkExprCached(init_node, types.no_type);
+    return c.widenInitializer(init_t, is_const);
+}
+
+/// `patternParentType` resolved to a UNION, or `no_type` when the declaration
+/// destructures anything else. Every identifier bound by the pattern asks the
+/// same question of the same declaration, and for an unannotated `const` the
+/// answer costs an initializer walk — so it is memoized per declaration. The
+/// memo is a pure function of the declaration (the same reason the value is
+/// safe to share across the file), so no `--checkers=N` partition can see a
+/// different answer than another.
+fn patternParentUnion(c: *Checker, decl: Node, is_const: bool, key: u64) Error!TypeId {
+    if (c.pattern_parent_types.get(key)) |t| return t;
+    const whole = try patternParentType(c, decl, is_const);
+    var parent: TypeId = types.no_type;
+    if (whole != types.no_type) {
+        const r = try c.resolveStructural(whole);
+        if (c.ts.kind(r) == .union_type) parent = r;
+    }
+    try c.pattern_parent_types.put(c.cm(), key, parent);
+    return parent;
 }
 
 /// The direct `binding_property` of `pat` that binds `name`, if it is one
@@ -582,15 +623,16 @@ pub fn narrowedPatternBinding(c: *Checker, node: Node, sym: SymbolId) Error!?Typ
     try c.ensureReassignScan();
     if (c.reassigned_syms.contains(sym)) return null;
 
-    const whole = try patternParentType(c, decl);
-    if (whole == types.no_type) return null;
-    const parent = try c.resolveStructural(whole);
-    if (c.ts.kind(parent) != .union_type) return null;
-
+    // tsc's `InCheckIdentifier` node flag, set *around* the parent-type
+    // computation as well as the flow walk (an unannotated declarator's
+    // parent type re-enters the checker through its initializer).
     const busy_key = c.nodeKey(decl);
     if (c.pattern_narrow_busy.contains(busy_key)) return null;
     try c.pattern_narrow_busy.put(c.cm(), busy_key, {});
     defer _ = c.pattern_narrow_busy.remove(busy_key);
+
+    const parent = try patternParentUnion(c, decl, f.const_decl, busy_key);
+    if (parent == types.no_type) return null;
 
     const root = (try patternRoot(c, decl)) orelse return null;
     const narrowed = try c.flowTypeOfKey(node, .{ .sym = root }, parent);
@@ -907,9 +949,20 @@ pub fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, d
             // Use the declared type instead: there is no valid narrowing at an
             // unreachable definition point.
             if (ante == binder.unreachable_flow) return declared;
-            // Property paths, `this` and binding-pattern pseudo-roots never
-            // continue into an enclosing function's flow.
-            if (key.len != 0 or isPseudoRoot(key.sym)) return declared;
+            // Property paths and `this` never continue into an enclosing
+            // function's flow — tsc's Start arm excludes exactly
+            // PropertyAccess, ElementAccess and `this`.
+            if (key.len != 0 or key.sym == this_flow_root) return declared;
+            // A BINDING-PATTERN pseudo-reference is none of those, and tsc
+            // asks for it with no `flowContainer` at all, so it crosses every
+            // closure boundary unconditionally. It may: the pattern only ever
+            // stands for a `const` declarator or a never-assigned parameter
+            // (`narrowedPatternBinding`'s own gate), so the narrowing a guard
+            // gave it cannot be undone by an assignment somewhere else.
+            // Without this the sibling narrowing evaporated the moment it was
+            // read inside a callback — `lists.map((l, i) => i === lists.length
+            // - 1 …)` after `isPending`/`isError` were ruled out.
+            if (isPatternRoot(key.sym)) return c.flowType(ante, key, declared, depth + 1);
             // Only a reference *captured* by this closure may continue into
             // the definition-point flow. A reference to something the
             // closure declares itself (its parameters, its own locals) is
@@ -1420,6 +1473,18 @@ pub fn narrowByCondition(c: *Checker, t: TypeId, cond: Node, sense: bool, key: R
         .identifier => {
             if (try c.refMatches(cond, key)) {
                 return if (sense) c.getTruthyPart(t) else c.getFalsyPart(t, true);
+            }
+            // A bare identifier can also READ a discriminant rather than be
+            // one: a binding destructured out of a union stands for the
+            // property it binds, so `if (canceled)` / `if (detached)`
+            // discriminates the union the same way `if (x.canceled)` does.
+            // This is `getDiscriminantPropertyAccess` inside tsc's
+            // `narrowTypeByTruthiness`; without it only the equality and
+            // `switch` forms narrowed the siblings, and the boolean
+            // discriminant — the form that has no comparand to write — did
+            // not narrow at all.
+            if (try c.discriminantOfRef(cond, key)) |prop_tok| {
+                return c.narrowByPropTruthiness(t, try c.memberAtom(prop_tok), sense, decl);
             }
             // Aliased-condition narrowing (tsc TS4.4 "control flow analysis
             // of aliased conditions and discriminants"): the condition is a

@@ -1031,6 +1031,11 @@ const Ctx = struct {
 
 const CondFlows = struct { t: FlowId, f: FlowId };
 
+/// One `?.` of an optional chain being bound: the flow the short-circuit test
+/// is made in, the expression tested (the link's receiver), and the flow the
+/// chain continues in when it did *not* short-circuit.
+const ChainTest = struct { ante: FlowId, expr: Node, taken: FlowId };
+
 const Binder = struct {
     arena: Allocator,
     scratch: Allocator,
@@ -1076,6 +1081,9 @@ const Binder = struct {
     pendings: std.ArrayList(Pending) = .empty,
     ante_links: std.ArrayList(Link) = .empty,
     flow_pairs: std.ArrayList(Link) = .empty, // value=node, next=flow
+    /// Short-circuit tests of the optional chains currently being bound
+    /// (`bindOptionalChain`); a nested chain occupies a suffix of the stack.
+    chain_sc: std.ArrayList(ChainTest) = .empty,
 
     refs: std.ArrayList(Ref) = .empty,
     import_recs: std.ArrayList(ImportRec) = .empty,
@@ -2957,17 +2965,226 @@ const Binder = struct {
         return false;
     }
 
+    // --- optional chains ------------------------------------------------------
+    //
+    // tsc's `bindOptionalChainFlow`/`bindOptionalChain`/`bindOptionalChainRest`.
+    // An optional chain is a short-circuiting conditional written as a postfix
+    // expression: `a?.b.c(d)` evaluates `b.c(d)` only when `a` is non-nullish,
+    // so *inside the chain* — including the argument list, which the parser
+    // hangs off a node several links above the `?.` — `a` is already known
+    // non-nullish. tsc gets that by binding the chain's REST under the
+    // non-short-circuited branch of a flow condition on the receiver; without
+    // it `trending?.trends?.map(t => trending.recId)` reports TS18048 on the
+    // second `trending`.
+
+    /// The receiver of a chain link, or `null_node` when `node` is not a link
+    /// shape. tsc's `isOptionalChain` walks exactly these four forms; a
+    /// parenthesis is not one of them, which is why `(a?.b).c` ends the chain.
+    fn chainReceiver(b: *const Binder, node: Node) Node {
+        return switch (b.nodeTag(node)) {
+            .member_expr,
+            .optional_member_expr,
+            .index_expr,
+            .optional_index_expr,
+            .call_expr,
+            .call_expr_targs,
+            .optional_call,
+            .non_null,
+            => b.tree.nodeData(node).lhs,
+            else => null_node,
+        };
+    }
+
+    /// tsc's `isOptionalChainRoot`: the link that carries the `?.` itself.
+    fn isChainRoot(b: *const Binder, node: Node) bool {
+        return switch (b.nodeTag(node)) {
+            .optional_member_expr, .optional_index_expr, .optional_call => true,
+            else => false,
+        };
+    }
+
+    /// tsc's `isOptionalChain`: a `?.` link, or a link whose receiver is one.
+    fn isOptionalChain(b: *const Binder, node: Node) bool {
+        var n = node;
+        while (n != null_node) {
+            if (b.isChainRoot(n)) return true;
+            n = b.chainReceiver(n);
+        }
+        return false;
+    }
+
+    /// Does this link bind an expression *after* its own `?.` would be tested?
+    /// A property name and a `!` do not; an element index and a non-empty
+    /// argument list do. (Type arguments do, syntactically, but types carry no
+    /// flow.)
+    fn linkBindsRest(b: *const Binder, node: Node) bool {
+        const d = b.tree.nodeData(node);
+        return switch (b.nodeTag(node)) {
+            .index_expr, .optional_index_expr => true,
+            .call_expr => blk: {
+                const r = b.tree.extraData(ast.SubRange, d.rhs);
+                break :blk r.end > r.start;
+            },
+            .call_expr_targs, .optional_call => blk: {
+                const info = b.tree.extraData(ast.CallInfo, d.rhs);
+                break :blk info.args_end > info.args_start;
+            },
+            else => false,
+        };
+    }
+
+    /// Is there anything in this chain for the short-circuit conditions to
+    /// govern? `a?.b.c` has no rest at all: every link is a property name, so
+    /// binding it under the non-short-circuited flow and binding it under the
+    /// entry flow are the same thing, and in VALUE position (where the flow is
+    /// restored afterwards either way) the conditions would be pure garbage.
+    /// `?.` is far too common to spend flow nodes on that.
+    fn chainHasRest(b: *const Binder, node: Node) bool {
+        var above = false;
+        var out = false;
+        var n = node;
+        while (n != null_node) {
+            const rest = b.linkBindsRest(n);
+            // Everything seen so far — this link's own rest included — is
+            // bound after this `?.` is tested. The deepest root wins.
+            if (b.isChainRoot(n)) out = above or rest;
+            above = above or rest;
+            var recv = b.chainReceiver(n);
+            while (b.nodeTag(recv) == .paren_expr) recv = b.tree.nodeData(recv).lhs;
+            n = recv;
+        }
+        return out;
+    }
+
+    /// Bind one link of an optional chain: its receiver (recursively), then —
+    /// when the link carries a `?.` — the condition that decides whether the
+    /// chain short-circuits, and finally the link's own "rest" (element index
+    /// or call arguments) under the *non*-short-circuited flow.
+    ///
+    /// Every `?.` pushes its test onto `chain_sc`; the caller turns those into
+    /// the chain's short-circuit edges.
+    fn bindChainLink(b: *Binder, node: Node) Error!void {
+        const d = b.tree.nodeData(node);
+        // tsc attaches a reference's flow node in `bindWorker`, which runs
+        // before the node's children — so a chain link records the flow the
+        // chain was *entered* in, not the one its own `?.` produced.
+        switch (b.nodeTag(node)) {
+            .member_expr, .optional_member_expr => try b.attachFlow(node),
+            .index_expr, .optional_index_expr => {
+                if (isNarrowableIndex(b, d.rhs)) try b.attachFlow(node);
+            },
+            else => {},
+        }
+
+        // The receiver. tsc reaches through parentheses here (its
+        // `isTopLevelLogicalExpression` skips them), so `(a?.b)?.c` still
+        // binds `.c` knowing `a` is non-nullish.
+        const recv = d.lhs;
+        var inner = recv;
+        while (b.nodeTag(inner) == .paren_expr) inner = b.tree.nodeData(inner).lhs;
+        if (inner != null_node and b.isOptionalChain(inner)) {
+            try b.bindChainLink(inner);
+        } else {
+            try b.bindExpr(recv);
+        }
+
+        if (b.isChainRoot(node)) {
+            const taken = try b.addFlow(.cond_true, b.cur_flow, recv);
+            try b.chain_sc.append(b.scratch, .{ .ante = b.cur_flow, .expr = recv, .taken = taken });
+            b.cur_flow = taken;
+        }
+
+        // `bindOptionalChainRest`.
+        switch (b.nodeTag(node)) {
+            .index_expr, .optional_index_expr => try b.bindExpr(d.rhs),
+            .call_expr => {
+                const r = b.tree.extraData(ast.SubRange, d.rhs);
+                for (b.tree.extraRange(r.start, r.end)) |a| try b.bindExpr(a);
+            },
+            .call_expr_targs, .optional_call => {
+                const info = b.tree.extraData(ast.CallInfo, d.rhs);
+                for (b.tree.extraRange(info.targs_start, info.targs_end)) |t| try b.bindType(t);
+                for (b.tree.extraRange(info.args_start, info.args_end)) |a| try b.bindExpr(a);
+            },
+            // A property name and a `!` have no rest to bind.
+            else => {},
+        }
+    }
+
+    /// An optional chain in VALUE position (tsc's `isTopLevelLogicalExpression`
+    /// arm of `bindOptionalChainFlow`): the flow afterwards joins every
+    /// short-circuit edge with both outcomes of the whole chain.
+    ///
+    /// When the chain moved `cur_flow` only through its own `?.` conditions —
+    /// the overwhelming majority: no assignment, `&&`, or `?:` anywhere in an
+    /// index or argument — that join is *by construction* the flow the chain
+    /// started in: `narrow(t, e, true) ∪ narrow(t, e, false) == t` telescopes
+    /// the whole ladder back to its base. Restoring it directly keeps the
+    /// common case at one flow node per `?.` instead of four.
+    fn bindOptionalChainValue(b: *Binder, node: Node) Error!void {
+        const pre = b.cur_flow;
+        const base = b.chain_sc.items.len;
+        defer b.chain_sc.shrinkRetainingCapacity(base);
+        try b.bindChainLink(node);
+        const tests = b.chain_sc.items[base..];
+        if (b.chainIsLinear(tests, pre)) {
+            b.cur_flow = pre;
+            return;
+        }
+        const pid = try b.newPending();
+        for (tests) |t| try b.pendAdd(pid, try b.addFlow(.cond_false, t.ante, t.expr));
+        try b.pendAdd(pid, try b.addFlow(.cond_true, b.cur_flow, node));
+        try b.pendAdd(pid, try b.addFlow(.cond_false, b.cur_flow, node));
+        b.cur_flow = try b.finishPending(pid);
+    }
+
+    /// Did the chain's flow advance *only* through its own `?.` conditions?
+    fn chainIsLinear(b: *const Binder, tests: []const ChainTest, pre: FlowId) bool {
+        var prev = pre;
+        for (tests) |t| {
+            if (t.ante != prev) return false;
+            prev = t.taken;
+        }
+        return b.cur_flow == prev;
+    }
+
+    /// An optional chain used as a CONDITION. The true outcome sits at the end
+    /// of the non-short-circuited chain; the false outcome joins that with
+    /// every short-circuit edge, so a chain that yielded `undefined` because
+    /// its receiver was nullish does not narrow the receiver on the else
+    /// branch (`if (a?.b) {} else { a.b }` must still report on `a`).
+    fn bindOptionalChainCondition(b: *Binder, node: Node) Error!CondFlows {
+        const pre = b.cur_flow;
+        const base = b.chain_sc.items.len;
+        defer b.chain_sc.shrinkRetainingCapacity(base);
+        try b.bindChainLink(node);
+        const t = try b.addFlow(.cond_true, b.cur_flow, node);
+        const pid = try b.newPending();
+        for (b.chain_sc.items[base..]) |sc| {
+            try b.pendAdd(pid, try b.addFlow(.cond_false, sc.ante, sc.expr));
+        }
+        try b.pendAdd(pid, try b.addFlow(.cond_false, b.cur_flow, node));
+        b.cur_flow = pre;
+        return .{ .t = t, .f = try b.finishPending(pid) };
+    }
+
     fn bindExpr(b: *Binder, node: Node) Error!void {
         if (node == null_node) return;
         const d = b.tree.nodeData(node);
         switch (b.nodeTag(node)) {
             .identifier => try b.bindIdentifierRef(node),
             .member_expr, .optional_member_expr => {
+                if (b.isOptionalChain(node) and b.chainHasRest(node)) return b.bindOptionalChainValue(node);
                 try b.bindExpr(d.lhs);
                 // Narrowable reference (`x.y` discriminants): attach flow.
                 try b.attachFlow(node);
             },
+            .non_null => {
+                if (b.isOptionalChain(node) and b.chainHasRest(node)) return b.bindOptionalChainValue(node);
+                try b.bindExpr(d.lhs);
+            },
             .index_expr, .optional_index_expr => {
+                if (b.isOptionalChain(node) and b.chainHasRest(node)) return b.bindOptionalChainValue(node);
                 try b.bindExpr(d.lhs);
                 try b.bindExpr(d.rhs);
                 // An element access whose index is a literal (`arr[0]`) or a
@@ -3029,6 +3246,11 @@ const Binder = struct {
                 try b.bindType(d.rhs);
             },
             .call_expr_targs, .optional_call, .new_expr_targs => {
+                if (b.nodeTag(node) != .new_expr_targs and b.isOptionalChain(node) and
+                    b.chainHasRest(node))
+                {
+                    return b.bindOptionalChainValue(node);
+                }
                 try b.bindExpr(d.lhs);
                 const info = b.tree.extraData(ast.CallInfo, d.rhs);
                 for (b.tree.extraRange(info.targs_start, info.targs_end)) |t| try b.bindType(t);
@@ -3103,6 +3325,7 @@ const Binder = struct {
             },
 
             .call_expr => {
+                if (b.isOptionalChain(node) and b.chainHasRest(node)) return b.bindOptionalChainValue(node);
                 // `import("m")` in *expression* position is a module
                 // dependency exactly like the type-position `import("m")`.
                 if (b.nodeTag(d.lhs) == .import_expr) try b.bindDynamicImport(node);
@@ -3171,6 +3394,19 @@ const Binder = struct {
                     return .{ .t = try b.finishPending(pid), .f = rhs.f };
                 },
                 else => {},
+            },
+            // An optional chain is itself a short-circuiting condition; its
+            // outcomes are built from the chain's own tests.
+            .member_expr,
+            .optional_member_expr,
+            .index_expr,
+            .optional_index_expr,
+            .call_expr,
+            .call_expr_targs,
+            .optional_call,
+            .non_null,
+            => {
+                if (b.isOptionalChain(node)) return b.bindOptionalChainCondition(node);
             },
             else => {},
         }

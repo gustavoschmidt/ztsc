@@ -1184,6 +1184,11 @@ pub const Checker = struct {
     /// having its narrowed parent type computed right now. Narrowing reads the
     /// guard expressions, which can name the pattern's own bindings.
     pattern_narrow_busy: IntMap(u64, void) = .empty,
+    /// Memo for `patternParentType` + its union test: declaration
+    /// (`file << 32 | node`) -> the destructured UNION, or `no_type` when the
+    /// declaration has none. Every identifier bound by a destructuring asks,
+    /// and for an unannotated `const` the answer costs an initializer walk.
+    pattern_parent_types: IntMap(u64, TypeId) = .empty,
     /// (flow << 32 | symbol) -> definitely-assigned (2 computing, 0/1 result).
     da_cache: IntMap(u64, u8) = .empty,
     /// Program-global flow id -> can control reach it (0 computing, 1 no,
