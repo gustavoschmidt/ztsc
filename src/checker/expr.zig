@@ -506,7 +506,7 @@ pub fn jsxComponentProps(c: *Checker, tag_ty: TypeId, explicit_targs: []const Ty
             const sigs = try c.memberList(t);
             break :blk if (sigs.len > 0) sigs[0] else return null;
         },
-        .class_value => return c.jsxClassComponentProps(t),
+        .class_value => return c.jsxClassComponentProps(t, explicit_targs, node),
         // A callable *object* — a call/construct-signature-bearing interface
         // used as a component — takes its first call signature.
         .object => if (c.ts.objectCallSigCount(t) > 0)
@@ -754,15 +754,29 @@ pub fn inferJsxTargs(c: *Checker, sig: TypeId, tps: []const u32, e: ast.JsxEleme
 /// Props of a class component: read the member named by
 /// `JSX.ElementAttributesProperty` (its single member's name, e.g. `props`)
 /// off the class instance type. Null when the selector namespace is absent
-/// (tsc leaves such attributes unchecked) or the class is generic (own type
-/// params — an uncommon shape we do not model here).
-pub fn jsxClassComponentProps(c: *Checker, class_val: TypeId) Error!?TypeId {
+/// (tsc leaves such attributes unchecked).
+///
+/// A GENERIC class component takes the same route tsc does for a generic
+/// function component: tsc resolves `<C …/>` as a call against `typeof C`'s
+/// construct signatures (`resolveJsxOpeningLikeElement`), so the class's own
+/// type parameters are the signature's, inferred from the attributes object;
+/// `getJsxPropsTypeForSignatureFromMember` then reads `props` off the
+/// signature's RETURN — the instantiated instance type. Modelled here by
+/// synthesising exactly that signature (`(props: P<T…>) => C<T…>`) and handing
+/// it to `inferJsxTargs`, the same inference the function-component path uses.
+///
+/// react-native's lists are the shape this unblocks: `class FlatList<ItemT =
+/// any> extends FlatListComponent<ItemT, FlatListProps<ItemT>>`. Bailing out
+/// left the whole attributes target unknown — not merely `ItemT = any` — so
+/// EVERY callback attribute lost its contextual type, `keyExtractor={(item,
+/// index) => …}` and `onScroll={e => …}` alike (TS7006 on each parameter).
+pub fn jsxClassComponentProps(c: *Checker, class_val: TypeId, explicit_targs: []const TypeId, node: Node) Error!?TypeId {
     const name = (try c.jsxPropsMemberName()) orelse return null;
     const cls = c.ts.classSymbol(class_val);
     var tps: std.ArrayList(TypeParamInfo) = .empty;
     defer tps.deinit(c.scratch());
     try c.typeParamsOf(cls, &tps);
-    if (tps.items.len != 0) return null; // generic class component: unmodeled
+    if (tps.items.len != 0) return jsxGenericClassComponentProps(c, cls, tps.items, name, explicit_targs, node);
     const inst = try c.ts.makeRef(cls, &.{});
     const rinst = try c.resolveStructural(inst);
     if (try c.propOfType(rinst, name)) |p| return try c.withIntrinsicClassAttributes(p.ty, inst);
@@ -776,6 +790,49 @@ pub fn jsxClassComponentProps(c: *Checker, class_val: TypeId) Error!?TypeId {
     // rather than reject every attribute against `{}` — under-report over a
     // false positive.
     return null;
+}
+
+/// The generic half of `jsxClassComponentProps` (see its doc comment): infer
+/// the class's own type arguments from the attributes, then read `props` off
+/// the instantiated instance.
+///
+/// Explicit type arguments (`<FlatList<Img> …/>`) short-circuit the inference,
+/// exactly as they do on the function-component path. A count mismatch falls
+/// back to inference rather than reporting — the JSX path has no TS2558 site.
+fn jsxGenericClassComponentProps(
+    c: *Checker,
+    cls: SymbolId,
+    tps: []const TypeParamInfo,
+    name: Atom,
+    explicit_targs: []const TypeId,
+    node: Node,
+) Error!?TypeId {
+    const inst = blk: {
+        if (explicit_targs.len == tps.len) break :blk try c.ts.makeRef(cls, explicit_targs);
+        // `(props: P<T…>) => C<T…>` written in the class's own parameters —
+        // tsc's construct signature for `typeof C`, whose type parameters ARE
+        // the class's. The props member is read off the generic instance, so
+        // a base-class `props: Readonly<P>` reaches it through the ordinary
+        // heritage fold.
+        const tp_syms = try c.scratch().alloc(u32, tps.len);
+        const tp_tys = try c.scratch().alloc(TypeId, tps.len);
+        for (tps, 0..) |tp, i| {
+            tp_syms[i] = tp.sym;
+            tp_tys[i] = try c.ts.makeTypeParam(tp.sym);
+        }
+        const generic_inst = try c.ts.makeRef(cls, tp_tys);
+        const gp = (try c.propOfType(try c.resolveStructural(generic_inst), name)) orelse return null;
+        const sig = try c.ts.makeFunction(
+            &.{.{ .name = name, .ty = gp.ty }},
+            generic_inst,
+            tp_syms,
+            0,
+        );
+        const e = c.tree.extraData(ast.JsxElementData, c.tree.nodeData(node).lhs);
+        break :blk c.ts.fnReturn(try c.inferJsxTargs(sig, tp_syms, e));
+    };
+    const p = (try c.propOfType(try c.resolveStructural(inst), name)) orelse return null;
+    return try c.withIntrinsicClassAttributes(p.ty, inst);
 }
 
 /// tsc's `getJsxPropsTypeFromClassType`: a CLASS component's attributes

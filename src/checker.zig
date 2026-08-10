@@ -3877,6 +3877,7 @@ pub const Checker = struct {
     pub const isCompound = assign_zig.isCompound;
     pub const isAssignableInner = assign_zig.isAssignableInner;
     pub const mappedKeySet = assign_zig.mappedKeySet;
+    pub const mappedApparentStringIndex = assign_zig.mappedApparentStringIndex;
     pub const mappedAddsOptional = assign_zig.mappedAddsOptional;
     pub const mappedAssignable = assign_zig.mappedAssignable;
     pub const indexAccessTargetConstraint = assign_zig.indexAccessTargetConstraint;

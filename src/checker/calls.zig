@@ -183,6 +183,50 @@ pub fn importCallType(c: *Checker, arg_nodes: []const Node) Error!TypeId {
     return c.makePromise(inner);
 }
 
+/// The construct signatures a `super(…)` call resolves against, appended to
+/// `out`; false when there is no base class to read them off (the call is then
+/// left as untyped as it was before).
+///
+/// tsc's `resolveCallExpression` never treats `super` as a value in call
+/// position: it takes the containing class's base constructor type and resolves
+/// against `getInstantiatedConstructorsForTypeArguments(superType,
+/// baseTypeNode.typeArguments)`. ztsc types the `super` KEYWORD as `any`
+/// (`checkExpr`'s `.super_expr` arm), which made every `super(…)` an UNTYPED
+/// call — its arguments checked with no contextual type at all.
+///
+/// social-app's `class BskyAppAgent extends AtpAgent { constructor({service}) {
+/// super({ service, async fetch(...args) {…} }) } }` is the cost: the object
+/// literal never saw `AtpAgentOptions`, so the `fetch` method never saw
+/// `typeof globalThis.fetch` and its rest parameter was an implicit any.
+///
+/// The return type is replaced with `void` — a super call is a statement, and
+/// the base constructor's declared return (the instance) is not its value.
+fn superCtorSigs(c: *Checker, out: *std.ArrayList(TypeId)) Error!bool {
+    const cls = c.ctor_class_sym;
+    if (cls == binder.no_symbol) return false;
+    const base_ref = (try c.baseClassRef(cls)) orelse return false;
+    const base_sym = c.ts.refSymbol(base_ref);
+    var raw: std.ArrayList(TypeId) = .empty;
+    defer raw.deinit(c.scratch());
+    try c.ctorSignatures(base_sym, &raw);
+    if (raw.items.len == 0) return false;
+    // The heritage arguments the `extends` clause wrote, exactly as
+    // `ctorSignatures` composes them one level down.
+    var tps: std.ArrayList(TypeParamInfo) = .empty;
+    defer tps.deinit(c.scratch());
+    try c.typeParamsOf(base_sym, &tps);
+    const map = try c.scratch().alloc(TpMap, tps.items.len);
+    for (tps.items, 0..) |tp, i| map[i] = .{
+        .sym = tp.sym,
+        .ty = if (i < c.ts.refArgCount(base_ref)) c.ts.refArgAt(base_ref, i) else types.any_type,
+    };
+    for (raw.items) |sig0| {
+        const sig = if (map.len > 0) try c.instantiate(sig0, map) else sig0;
+        try out.append(c.scratch(), try c.sigWithReturn(sig, types.void_type));
+    }
+    return true;
+}
+
 pub fn checkCallExpr(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Error!TypeId {
     var chained = false;
     const result = try c.checkCallExprInner(node, is_new, &chained, ctx);
@@ -220,6 +264,21 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, chained: *bool,
         const bc = try c.transitiveBaseConstraint(r);
         if (bc != r) {
             r = try c.resolveStructural(bc);
+            rk = c.ts.kind(r);
+        }
+    }
+    // `super(…)` is not a call on a value. tsc's `resolveCallExpression`
+    // special-cases it and resolves against the BASE class's construct
+    // signatures (`getInstantiatedConstructorsForTypeArguments(superType,
+    // baseTypeNode.typeArguments)`) — see `superCtorSigs`.
+    var super_sigs: std.ArrayList(TypeId) = .empty;
+    defer super_sigs.deinit(c.scratch());
+    if (!is_new and c.nodeTag(shape.callee) == .super_expr) {
+        if (try superCtorSigs(c, &super_sigs)) {
+            r = if (super_sigs.items.len == 1)
+                super_sigs.items[0]
+            else
+                try c.ts.makeOverloads(super_sigs.items);
             rk = c.ts.kind(r);
         }
     }
@@ -3047,6 +3106,20 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                         const psig = s.objectConstructSig(param, @intCast(i));
                         try c.unify(s.fnReturn(psig), inst, tp_syms, candidates, depth + 1);
                     }
+                }
+                return;
+            }
+            // A still-generic MAPPED source against an index-signature
+            // pattern. tsc's `inferFromIndexTypes` reads
+            // `getIndexInfosOfType(source)`, and `resolveMappedTypeMembers`
+            // gives `{[P in keyof T]: V}` a string index of `V` whenever the
+            // key set's lower bound covers the string key space — see
+            // `mappedApparentStringIndex`. Without it `Object.entries(d)` on a
+            // `Record<keyof T, V>` left `V` uninferred and fell to the
+            // `entries(o: {}): [string, any][]` overload.
+            if (s.kind(ra) == .mapped and s.objectStringIndex(param) != 0) {
+                if (try c.mappedApparentStringIndex(ra)) |tmpl| {
+                    try c.unify(s.objectStringIndex(param), tmpl, tp_syms, candidates, depth + 1);
                 }
                 return;
             }
