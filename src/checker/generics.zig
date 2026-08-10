@@ -1411,20 +1411,24 @@ fn inferFromExtendsInner(c: *Checker, source0: TypeId, pattern: TypeId, ids: []c
             // `TextInput.web.tsx` saw `editor.commands` and `editor.chain()`
             // as `never` and every command on them was a TS2339.
             //
-            // Deliberately limited to the TOP of the match (`depth == 0`),
-            // where the pattern is the conditional's whole extends clause and
-            // the source is its check type. Deeper, a union source reaching a
-            // signature pattern is one arm of a multi-constituent union TARGET
-            // (`ref?: RefCallback<M> | RefObject<M | null> | null`), and tsc
-            // orders those by inference PRIORITY — a candidate found through a
-            // lower-priority arm is dropped once a higher-priority one exists.
-            // ztsc has no priority ladder, so distributing there only adds
-            // candidates tsc would discard: doing it flipped
-            // `TRef extends AnimatedComponentType<any, infer Instance>` in
-            // react-native-reanimated to its false branch and every
-            // `useAnimatedRef<Animated.View>()` stopped matching its own
-            // component's `ref`.
-            if (depth == 0 and s.kind(src) == .union_type) {
+            // This used to be limited to the TOP of the match (`depth == 0`).
+            // Deeper, a union source reaching a signature pattern is one arm of
+            // a multi-constituent union TARGET (`ref?: RefCallback<M> |
+            // RefObject<M | null> | null`), and distributing there manufactured
+            // candidates that flipped `TRef extends AnimatedComponentType<any,
+            // infer Instance>` in react-native-reanimated to its false branch —
+            // every `useAnimatedRef<Animated.View>()` stopped matching its own
+            // component's `ref` (3 added keys on social-app).
+            //
+            // The restriction is gone because its cause is: a union target now
+            // pairs its constituents by generic identity
+            // (`isTypeCloselyMatchedBy`) instead of handing each of them the
+            // whole union, and a conditional target infers into both branches
+            // at a demoted priority — so `Instance` has a real candidate and no
+            // junk one can displace it. Removing the guard is a no-op on every
+            // gate (social-app, excalidraw, immich, the eight parity packages,
+            // conformance) and on immich's instantiation node visits.
+            if (s.kind(src) == .union_type) {
                 const umembers = try c.scratch().dupe(TypeId, try c.memberList(src));
                 defer c.scratch().free(umembers);
                 // Same `depth`, not `depth + 1`: distributing a union over the
