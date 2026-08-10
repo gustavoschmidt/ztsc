@@ -186,7 +186,7 @@ function runOracle(entryAbs, opts) {
   for (const line of ((r.stdout || "") + (r.stderr || "")).split("\n")) {
     const m = DIAG_RE.exec(line);
     if (!m) continue;
-    diags.push({ file: path.resolve(m[1]), line: +m[2], code: +m[4] });
+    diags.push({ file: path.resolve(m[1]), line: +m[2], col: +m[3], code: +m[4] });
   }
   return diags;
 }
@@ -216,7 +216,12 @@ dirs.sort();
 for (const file of files) {
   const abs = path.resolve(file);
   const diags = runOracle(abs).filter((d) => d.file === abs); // lib errors etc.
-  diags.sort((a, b) => a.line - b.line || a.code - b.code);
+  // Column before code: two diagnostics on one line must keep the order tsgo
+  // EMITS them in, which is by position. Sorting by code instead put TS2339
+  // ahead of TS18048 on a line where tsgo prints 18048 (col 10) first, and
+  // --check reported a MISMATCH against a snapshot that was in fact correct.
+  // The column is dropped from the snapshot format, but it still has to sort.
+  diags.sort((a, b) => a.line - b.line || a.col - b.col || a.code - b.code);
   const lines = diags.map((d) => `TS${d.code} ${d.line}`);
   const content = lines.length ? lines.join("\n") + "\n" : "";
   emit(file.replace(/\.tsx?$/, "") + ".expected", content, path.relative(confDir, file));
@@ -229,10 +234,11 @@ for (const dir of dirs) {
   const rows = diags.map((d) => ({
     file: path.relative(base, d.file).split(path.sep).join("/"),
     line: d.line,
+    col: d.col,
     code: d.code,
   }));
   rows.sort((a, b) =>
-    a.file < b.file ? -1 : a.file > b.file ? 1 : a.line - b.line || a.code - b.code);
+    a.file < b.file ? -1 : a.file > b.file ? 1 : a.line - b.line || a.col - b.col || a.code - b.code);
   const lines = rows.map((r) => `TS${r.code} ${r.file} ${r.line}`);
   const content = lines.length ? lines.join("\n") + "\n" : "";
   emit(path.join(dir, "expected"), content, path.relative(confDir, dir));
