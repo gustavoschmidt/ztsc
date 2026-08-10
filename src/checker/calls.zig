@@ -3722,6 +3722,22 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                 if (ncall == 0) return;
                 ra = s.objectCallSig(ra, ncall - 1);
             }
+            // An OVERLOAD SET argument — merged `declare function`
+            // declarations, which is what `console.error` becomes once
+            // @types/node's three signatures merge. Same rule as the callable
+            // object just above and for the same reason (`inferFromSignatures`
+            // pairs `sourceSignatures[sourceLen - len + i]` with
+            // `targetSignatures[targetLen - len + i]`, so a one-signature
+            // parameter takes the source's LAST overload) — but ztsc had no
+            // `.overloads` arm here at all and simply bailed. `Promise.catch`'s
+            // `TResult` was then left at its DEFAULT `never`, the parameter
+            // printed as `((reason: any) => PromiseLike<never>) | null |
+            // undefined`, and every `.catch(console.error)` was TS2345.
+            if (s.kind(ra) == .overloads) {
+                const ms = try c.memberList(ra);
+                if (ms.len == 0) return;
+                ra = ms[ms.len - 1];
+            }
             if (s.kind(ra) != .function) return;
             // A *generic function value* passed where a function is
             // expected (`.then(getProjectTransform)`): first instantiate
