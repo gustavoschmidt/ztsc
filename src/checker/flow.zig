@@ -1576,7 +1576,7 @@ pub fn narrowByCondition(c: *Checker, t: TypeId, cond: Node, sense: bool, key: R
                     }
                     const rt = try c.checkExprCached(d.rhs, types.no_type);
                     if (try c.instanceofInstanceType(rt)) |inst|
-                        return c.narrowByInstance(t, inst, sense);
+                        return c.narrowByInstance(t, inst, sense, true);
                     return t;
                 },
                 // `a && b` true implies both operands are truthy; `a || b`
@@ -3141,7 +3141,7 @@ pub fn narrowByGuardCall(c: *Checker, t: TypeId, call: Node, sense: bool, key: R
     const pred = g.pred;
     if (pred.asserts) return t; // assertion fns narrow after the call, not here
     if (pred.ty == types.no_type) return t;
-    return c.narrowByInstance(t, pred.ty, sense);
+    return c.narrowByInstance(t, pred.ty, sense, false);
 }
 
 /// tsc's `narrowTypeByTypePredicate` optional-chain arm: the guarded
@@ -3179,7 +3179,7 @@ pub fn narrowByAssertCall(c: *Checker, t: TypeId, call: Node, key: RefKey, decl:
     }
     // `asserts x is T` names its subject positionally: it must be the arg.
     if (!try c.refMatches(g.arg, key)) return t;
-    return c.narrowByInstance(t, g.pred.ty, true);
+    return c.narrowByInstance(t, g.pred.ty, true, false);
 }
 
 /// tsc's `getInstanceType(constructorType)`: prefer the `prototype`
@@ -3278,7 +3278,11 @@ pub fn admitsNullish(c: *Checker, instance: TypeId, k: types.Kind) Error!bool {
     return false;
 }
 
-pub fn narrowByInstance(c: *Checker, t: TypeId, instance: TypeId, sense: bool) Error!TypeId {
+/// tsc's `getNarrowedType(type, candidate, assumeTrue, checkDerived)`.
+/// `check_derived` marks the `instanceof` caller, whose relation is
+/// `isTypeDerivedFrom` (nominal) rather than the subtype relation a type
+/// predicate uses.
+pub fn narrowByInstance(c: *Checker, t: TypeId, instance: TypeId, sense: bool, check_derived: bool) Error!TypeId {
     if (c.ts.kind(t) == .union_type) {
         var parts: std.ArrayList(TypeId) = .empty;
         defer parts.deinit(c.scratch());
@@ -3363,6 +3367,27 @@ pub fn narrowByInstance(c: *Checker, t: TypeId, instance: TypeId, sense: bool) E
         // `s.map(...)` in the true branch reported TS2339 on `string`.
         return c.ts.makeIntersection(c.scratch(), &.{ t, instance });
     }
+    // assumeFalse on a NON-union subject. tsc does not simply keep it:
+    //
+    //     const trueType = getNarrowedType(type, candidate, /*assumeTrue*/ true, …);
+    //     return filterType(type, t => !isTypeSubsetOf(t, trueType));
+    //
+    // and for a non-union subject `isTypeSubsetOf` degenerates to identity, so
+    // a subject a TYPE PREDICATE narrows to ITSELF is excluded outright —
+    // `never`. Keeping it made every `!guard(x)` branch of an already-narrow
+    // `x` a no-op, which is what refused the TS 5.5 inferred predicate for
+    // `updated.find(p => asPredicate(validate…)(p))`: its true branch is a
+    // single intersection, so the soundness re-narrow could never reach
+    // `never`.
+    //
+    // NOT for `instanceof` (`checkDerived`), whose assumeFalse arm is
+    // `filterType(type, t => !isTypeDerivedFrom(t, candidate))` — a nominal
+    // test that ztsc answers structurally. Two error classes that add no
+    // members are structurally identical to `Error`, so the identity test
+    // above would wrongly make the `else` of `e instanceof MaxHiddenRepliesError`
+    // (on `e: Error`) `never`.
+    if (!check_derived and try narrowByInstance(c, t, instance, true, check_derived) == t)
+        return types.never_type;
     return t;
 }
 
