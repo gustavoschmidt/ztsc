@@ -3436,6 +3436,7 @@ pub const Checker = struct {
     pub const toLower = names_zig.toLower;
     pub const literalBaseOf = names_zig.literalBaseOf;
     pub const widenLiteral = names_zig.widenLiteral;
+    pub const baseTypeOfLiteral = names_zig.baseTypeOfLiteral;
     pub const widenPropValue = names_zig.widenPropValue;
     pub const widenObjectLiterals = names_zig.widenObjectLiterals;
     pub const isConstTypeVar = names_zig.isConstTypeVar;

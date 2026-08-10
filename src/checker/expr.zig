@@ -297,7 +297,13 @@ pub fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             const tt = try c.typeFromTypeNode(d.rhs);
             const et = try c.checkExprCached(d.lhs, tt);
             if (tt == types.error_type) return et;
-            if (!try c.castComparable(try c.widenLiteral(et), tt)) {
+            // tsc's `checkAssertionWorker` compares the target against
+            // `getRegularTypeOfObjectLiteral(getBaseTypeOfLiteralType(exprType))`
+            // — the source's literal types stand for their BASE primitives,
+            // whether or not they are fresh. That is what makes
+            // `` `calc(100% - ${8}px)` as '100%' `` legal (the source is judged
+            // `string`), along with the plain `x as "def"` / `1 as 2` forms.
+            if (!try c.castComparable(try c.baseTypeOfLiteral(try c.widenLiteral(et)), tt)) {
                 try c.diagFmt(2352, c.nodeSpan(node), "Conversion of type '{s}' to type '{s}' may be a mistake because neither type sufficiently overlaps with the other. If this was intentional, convert the expression to 'unknown' first.", .{
                     try c.typeToString(et), try c.typeToString(tt),
                 });

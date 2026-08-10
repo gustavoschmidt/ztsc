@@ -328,6 +328,34 @@ pub fn literalBaseOf(c: *Checker, t: TypeId) Error!TypeId {
     return c.ts.literalBase(t);
 }
 
+/// tsc's `getBaseTypeOfLiteralType`: EVERY literal type — fresh or not —
+/// stands for its base primitive here, an enum member for its whole enum, a
+/// template pattern / string-mapping for `string`, and a union member-wise.
+/// Everything else is returned unchanged.
+///
+/// Distinct from `widenLiteral`, which is tsc's *widening* (`getWidenedType`)
+/// and only fires on FRESHNESS: a declared `const x: "abc"` never widens, and
+/// must not. This one is what `checkAssertionWorker` runs on the source of an
+/// `as` cast before the comparable test, which is why `x as "def"` and `1 as 2`
+/// are legal TypeScript: the cast is judged `string`-vs-`"def"`, not
+/// `"abc"`-vs-`"def"`.
+pub fn baseTypeOfLiteral(c: *Checker, t: TypeId) Error!TypeId {
+    if (c.ts.kind(t) == .union_type) {
+        var list: std.ArrayList(TypeId) = .empty;
+        defer list.deinit(c.scratch());
+        var moved = false;
+        for (try c.memberList(t)) |m| {
+            const b = try baseTypeOfLiteral(c, m);
+            if (b != m) moved = true;
+            try list.append(c.scratch(), b);
+        }
+        if (!moved) return t;
+        return c.ts.makeUnion(c.scratch(), list.items);
+    }
+    const base = try literalBaseOf(c, t);
+    return if (base != types.no_type) base else t;
+}
+
 /// Fresh literal -> base primitive; unions widen fresh members; object
 /// literals are WIDENED (`widenObjectLiterals`), losing both their freshness
 /// and their literal origin — this is tsc's mutable-location widening
