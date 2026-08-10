@@ -3571,6 +3571,7 @@ pub fn discriminatedUnionAssignable(c: *Checker, s: TypeId, t: TypeId) Error!boo
         // member values.
         var first_val: TypeId = 0;
         var differs = false;
+        var any_unit = false;
         var ok = true;
         for (members) |m| {
             const mp = (try c.propOfType(m, dprop.name)) orelse {
@@ -3578,13 +3579,22 @@ pub fn discriminatedUnionAssignable(c: *Checker, s: TypeId, t: TypeId) Error!boo
                 break;
             };
             const mr = try c.resolveStructural(mp.ty);
-            if (!try c.isUnitOrUnitUnion(mr)) {
-                ok = false;
-                break;
-            }
+            if (try c.isUnitOrUnitUnion(mr)) any_unit = true;
             if (first_val == 0) first_val = mr else if (mr != first_val) differs = true;
         }
-        if (!ok or !differs) continue;
+        // tsc's `isDiscriminantProperty`: the union's synthesized property
+        // must carry BOTH `CheckFlags.HasNonUniformType` (the constituents do
+        // not all give it the same type) and `CheckFlags.HasLiteralType` (at
+        // least ONE of them gives it a unit type) — not "every constituent is
+        // a unit", which is what this loop used to demand. A union that splits
+        // an optional key into "present as `T`" and "absent" is the common
+        // shape that requirement excluded: react-navigation's
+        // `NavigatorID extends string ? {id: NavigatorID} : {id?: undefined}`
+        // instantiated at `string | undefined` is
+        // `{id: string} | {id?: undefined}`, and an `id: string | undefined`
+        // read back out of it fits neither constituent alone — only the
+        // by-cases split, which is exactly what this function computes.
+        if (!ok or !differs or !any_unit) continue;
         // Every source discriminant constituent must be covered by ≥1
         // member, and every matched member's non-discriminant props must
         // accept the source.
