@@ -1153,15 +1153,23 @@ pub fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, d
             var frame: usize = 0;
             var published = false;
             for (antes, 0..) |a, i| {
-                // Publish only when the entry edge actually carries a
-                // narrowing. With `parts[0] == declared` the partial union
-                // *is* the declared type, so every answer it could give is
-                // the answer the old in-progress sentinel already gave —
-                // and skipping the publication keeps the re-walk (and the
-                // suppressed expression memo below) off the overwhelming
-                // majority of loops, which is what keeps the check phase
-                // where it was.
-                if (looping and i == 1 and parts.items.len != 0 and parts.items[0] != declared) {
+                // tsc publishes as soon as ONE antecedent has been gathered,
+                // whatever it says (`flowLoopTypes[i].length` is the only
+                // test in `getTypeAtFlowLoopLabel`'s in-process check), and
+                // this must not be narrowed to "only when the entry edge
+                // narrowed". The partial's *value* is indeed uninteresting
+                // when `parts[0] == declared` — it is the declared type
+                // either way — but publication is also what raises
+                // `flow_back_edge`, and that is what keeps every node the
+                // back edge re-walks OUT of the persistent cache. Skipping it
+                // let a node whose walk bottoms out in an in-flight ancestor
+                // answer `declared` and then keep that answer forever in
+                // `flow_same`, so a later authoritative query read "nothing
+                // narrows here" for the whole tail of the loop body: social-
+                // app's `const {success, type, mimeType} = await …; if
+                // (!success) continue;` kept its sibling narrowing at every
+                // guard inside the body and lost it at the joins between them.
+                if (looping and i == 1 and parts.items.len != 0) {
                     published = true;
                     frame = c.flow_loop_stack.items.len;
                     const q: FlowQ = (@as(u64, c.cur_flow_base + flow) << 32) |
