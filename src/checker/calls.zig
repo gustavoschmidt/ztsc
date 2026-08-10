@@ -4344,8 +4344,20 @@ pub fn argumentsMatch(c: *Checker, sig: TypeId, arg_nodes: []const Node) Error!b
         // parameter is a template-literal type (`watch(`contacts.${index}.type`)`
         // against `N extends FieldPath<T>`) is spuriously rejected — again, the
         // single-signature path already types it by `pt`.
+        // A CONDITIONAL expression forwards the contextual type to both of
+        // its branches (tsc's `getContextualType` → `ContextFlags` pass-
+        // through for `ConditionalExpression`), so it is context-typed for
+        // exactly the reason an object literal is: probed context-free, the
+        // literal in a branch widens its discriminant and every candidate is
+        // rejected. `useState<MessageEmbedState | undefined>(p ? {type:
+        // 'post', uri: p} : undefined)` came out `{ type: string; uri: string
+        // } | undefined` and fell out TS2769 — while the *single*-signature
+        // form of the same call, which goes straight to `checkCallArguments`
+        // with `pt`, was accepted. tsc has no allowlist here at all:
+        // `checkApplicableSignature` runs `checkExpressionWithContextualType`
+        // on every argument.
         const ctx_typed = switch (tag) {
-            .arrow_fn, .function_expr, .array_literal, .object_literal, .template_expr, .call_expr, .call_expr_targs, .optional_call, .new_expr, .new_expr_bare, .new_expr_targs => true,
+            .arrow_fn, .function_expr, .array_literal, .object_literal, .template_expr, .cond_expr, .call_expr, .call_expr_targs, .optional_call, .new_expr, .new_expr_bare, .new_expr_targs => true,
             else => false,
         };
         // A function argument is probed on TRIAL. Its parameters take their
