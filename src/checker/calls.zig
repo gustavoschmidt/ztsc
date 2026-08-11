@@ -3234,15 +3234,85 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
             // over — `Pick<T, K> | T | null` against a forwarded `state`
             // union then takes its key set from a single constituent instead
             // of the whole source (conformance `inference/085`).
-            const per_constituent = n_tp == 1 and s.kind(arg_residual) == .union_type;
-            const src_members: []const TypeId = if (per_constituent)
-                try c.memberList(arg_residual)
+            //
+            // …and tsc runs `inferFromMatchingTypes` a SECOND time over what
+            // the identity pass above left, with `isTypeCloselyMatchedBy`: a
+            // source and a target constituent that are two instantiations of
+            // the same generic (`s.symbol === t.symbol`, or the same alias
+            // symbol) are inferred as a PAIR and both sides are then struck
+            // from the lists. Only the residual of THAT reaches
+            // `inferToMultipleTypes`. `inferFromExtends` already does this
+            // for the conditional-`infer` path (`inferCloselyMatched`); the
+            // call-inference path did not, and handed every target
+            // constituent the whole union instead.
+            //
+            // React 19's `Ref<T> = RefCallback<T> | RefObject<T | null> |
+            // null` is the shape that needs it. `mergeRefs([scrollEdgeRef,
+            // ref])` hands `((node: any) => void) | RefObject<Props>` to it;
+            // the `RefObject<T | null>` member pairs off by symbol, leaving
+            // the bare callback for `RefCallback<T>` — which is a `.function`
+            // pattern and bails on a union argument outright (`if (kind(ra)
+            // != .function) return`). Without the pairing the callback's
+            // `any` parameter was never seen at all, so `T` collapsed to the
+            // object ref's `Props` where tsc common-supertypes the two
+            // candidates to `any`, and the JSX `ref=` attribute was rejected.
+            //
+            // Pairing by SYMBOL is what keeps this from being the blunt
+            // "offer every source constituent to every target": that
+            // manufactures candidates from unrelated pairs. `Iterator.next()`
+            // returns `IteratorYieldResult<T> | IteratorReturnResult<TReturn>`,
+            // and offering `IteratorReturnResult<void>` to
+            // `IteratorYieldResult<T>` pairs their `value` properties and
+            // infers `T = void` — which is what turns every `Array.from(gen)`
+            // into `void[]`.
+            const pms = try c.scratch().dupe(TypeId, try c.memberList(param));
+            const rms: []const TypeId = if (s.kind(arg_residual) == .union_type)
+                try c.scratch().dupe(TypeId, try c.memberList(arg_residual))
             else
                 &.{arg_residual};
+            const tgt_paired = try c.scratch().alloc(bool, pms.len);
+            @memset(tgt_paired, false);
+            const src_paired = try c.scratch().alloc(bool, rms.len);
+            @memset(src_paired, false);
+            var any_close = false;
+            if (s.kind(arg_residual) == .union_type) {
+                for (pms, 0..) |pm, ti| {
+                    if (pm == tp_member) continue;
+                    if (!try c.containsTypeParam(pm)) continue;
+                    for (rms, 0..) |sm, si| {
+                        if (!c.inferCloselyMatched(sm, pm)) continue;
+                        try c.unify(pm, sm, tp_syms, candidates, depth + 1);
+                        tgt_paired[ti] = true;
+                        src_paired[si] = true;
+                        any_close = true;
+                    }
+                }
+            }
+            // `sources` after both passes. tsc returns outright when nothing
+            // is left on either side (`if (targets.length === 0) return;`,
+            // and the `sources.length === 0` arm re-offers the whole source
+            // at `NakedTypeVariable` priority); ztsc keeps offering what it
+            // started with, so a still-unpaired target is no worse off than
+            // it was before the pass existed.
+            const rest_src: TypeId = if (!any_close) arg_residual else blk2: {
+                var rest: std.ArrayList(TypeId) = .empty;
+                defer rest.deinit(c.scratch());
+                for (rms, 0..) |sm, si| {
+                    if (!src_paired[si]) try rest.append(c.scratch(), sm);
+                }
+                if (rest.items.len == 0) break :blk2 arg_residual;
+                break :blk2 try s.makeUnion(c.scratch(), rest.items);
+            };
+            const per_constituent = n_tp == 1 and s.kind(rest_src) == .union_type;
+            const src_members: []const TypeId = if (per_constituent)
+                try c.memberList(rest_src)
+            else
+                &.{rest_src};
             const matched = try c.scratch().alloc(bool, src_members.len);
             @memset(matched, false);
-            for (try c.memberList(param)) |m| {
+            for (pms, 0..) |m, ti| {
                 if (m == tp_member) continue;
+                if (tgt_paired[ti]) continue;
                 if (!try c.containsTypeParam(m)) continue;
                 for (src_members, 0..) |sm, i| {
                     // "Was an inference MADE from this source constituent" —
@@ -4594,6 +4664,28 @@ pub fn bindAnyToTypeParams(c: *Checker, pattern: TypeId, tp_syms: []const u32, c
         .type_param => {
             if (tpIndex(tp_syms, s.typeParamSymbol(pattern))) |i| {
                 c.infer_writes +%= 1;
+                // `any` is evidence like any other, so it obeys the same
+                // co-/contra-variant split `unify`'s `.type_param` arm does.
+                // tsc records every candidate through the one `contravariant
+                // && !bivariant ? contraCandidates : candidates` test in
+                // `inferFromTypes` — there is no `any` fast path there at
+                // all. Writing it to the covariant set from a PARAMETER
+                // position lets a plain `(instance: T | null) => void`
+                // pattern handed a `(node: any) => void` argument pin `T` to
+                // `any` outright, where tsc keeps `any` as a contravariant
+                // candidate and `getInferredType` then prefers the covariant
+                // answer because it is a subtype of it. Only a METHOD
+                // pattern — React's bivariance-hacked `RefCallback<T>` —
+                // infers its parameters covariantly, and there `contraSlot`
+                // declines and `any` wins the covariant fold.
+                if (c.contraSlot(candidates, i)) |slot| {
+                    slot.* = if (slot.* == types.no_type)
+                        types.any_type
+                    else
+                        try c.combineContravariant(slot.*, types.any_type);
+                    try c.noteContraCandidate(candidates, i, types.any_type);
+                    return;
+                }
                 candidates[i] = if (candidates[i] == types.no_type)
                     types.any_type
                 else
