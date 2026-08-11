@@ -961,44 +961,111 @@ fn measureOneVariance(c: *Checker, owner: SymbolId, tps: []const TypeParamInfo, 
     return .invariant;
 }
 
+/// What a measured-variance comparison of two references to the same generic
+/// concluded. See `measuredVarianceVerdict`.
+pub const VarianceOutcome = enum {
+    /// The arguments relate as the parameters are used: the pair is related.
+    related,
+    /// They do not, and the measurement that says so is complete — tsc returns
+    /// `Ternary.False` from `relateVariances` here and never consults the
+    /// members. DECISIVE.
+    unrelated,
+    /// Nothing was concluded: some parameter is unmeasured, the generic is
+    /// measuring itself, or the `void` exemption applies. The structural walk
+    /// answers, exactly as it did before this existed.
+    undecided,
+};
+
 /// tsc's `relateVariances` over MEASURED variance: two references to the same
 /// generic relate by their type ARGUMENTS, which is what keeps the relation
 /// off a body that instantiates the generic again one level deeper.
 ///
-/// Purely additive — the verdict is only ever believed when it is POSITIVE.
-/// A failed variance check falls through to the structural walk, where tsc
-/// would have returned "not related" outright; that is an under-report by
-/// construction and never a false positive, and it is what keeps every
-/// relation ztsc decided before this existed unchanged.
+/// A COMPLETE measurement is decisive in BOTH directions, which is tsc's rule
+/// and not a strengthening of it: `relateVariances` returns `Ternary.False`
+/// when the arguments do not relate, and `structuredTypeRelatedTo` returns
+/// that verdict without looking at a single member. (tsc does re-run the
+/// structural walk for an *invariant* parameter when it is reporting errors —
+/// purely to elaborate WHICH member makes the generic invariant — and then
+/// discards a success: "use variance error (there is no structural one) and
+/// return false".)
 ///
-/// The exception is a generic measuring ITSELF (`measuring_variance`): the
-/// pair is assumed related, tsc's `Ternary.Unknown` for a recursive
-/// `getVariances`. Variance is therefore measured only from occurrences that
-/// are not nested inside a recursive instantiation of the same generic — and
-/// that assumption is what terminates `ZodOptional<this>` inside `ZodType`.
-pub fn measuredVarianceVerdict(c: *Checker, s_ref: TypeId, t_ref: TypeId) Error!bool {
+/// Believing only the positive half is not a conservative simplification, it
+/// is a different type system, because the structural walk is CO-INDUCTIVE: a
+/// recursive pair on the stack answers "assume related" (`Checker.rel_assumed`),
+/// so a mutually-recursive family whose arguments are genuinely unrelated walks
+/// in a circle and comes back YES. outline's models layer is that shape —
+///
+/// ```ts
+/// class Store<T extends Base> { add = (i: T | Partial<T>): T => i as T; }
+/// class Base { store: Store<Base>; id = ""; }
+/// class Collection extends Base { store: CollectionsStore; name = ""; }
+/// ```
+///
+/// `T` is invariant in `Store` (a parameter of an arrow-initialised FIELD, so
+/// contravariant, and the return, so covariant), and `Base` is not assignable
+/// to `Collection`, so `Store<Collection>` is not assignable to `Store<Base>`
+/// and `Collection` is not assignable to `Base`. The structural walk instead
+/// reaches `Collection → Base` again through `Partial<Collection>`, assumes it,
+/// and confirms the assumption it started from — ~290 diagnostics tsc reports
+/// and ztsc did not, plus the whole TS1240 decorator family downstream of them.
+///
+/// Two exemptions, both tsc's:
+///
+///   * a generic measuring ITSELF (`measuring_variance`) is related, tsc's
+///     `Ternary.Unknown` for a recursive `getVariances`. Variance is therefore
+///     measured only from occurrences that are not nested inside a recursive
+///     instantiation of the same generic — and that assumption is what
+///     terminates `ZodOptional<this>` inside `ZodType`;
+///   * `hasCovariantVoidArgument`: a `void` argument at a COVARIANT parameter
+///     means the parameter is only ever returned, and a caller that asked for
+///     `void` accepts anything back, so the pair gets the structural walk
+///     rather than a verdict.
+///
+/// Anything the measurement could not settle — an `unmeasured` parameter, or a
+/// generic the measurement declined (`measuredVariances` → null, which is
+/// tsc's `Unmeasurable`/`Unreliable` and its `AllowsStructuralFallback`) —
+/// stays `undecided` and is left to the members as before.
+pub fn measuredVarianceVerdict(c: *Checker, s_ref: TypeId, t_ref: TypeId) Error!VarianceOutcome {
     const st = &c.ts;
     const n = st.refArgCount(s_ref);
-    if (n == 0 or n != st.refArgCount(t_ref)) return false;
+    if (n == 0 or n != st.refArgCount(t_ref)) return .undecided;
     const owner = st.refSymbol(s_ref);
-    if (c.measuring_variance.contains(owner)) return true;
-    if (n > max_measured_params) return false;
-    const bits = (try c.measuredVariances(owner)) orelse return false;
-    if (bits == 0) return false;
+    if (c.measuring_variance.contains(owner)) return .related;
+    if (n > max_measured_params) return .undecided;
+    const bits = (try c.measuredVariances(owner)) orelse return .undecided;
+    if (bits == 0) return .undecided;
+    // Pass 1, over the WHOLE list and relating nothing: does the measurement
+    // license a verdict at all? tsc asks the same two questions of the whole
+    // variance array before it trusts a failure — `some(variances, v => v &
+    // AllowsStructuralFallback)` for an unmeasurable/unreliable parameter, and
+    // `hasCovariantVoidArgument` for a `void` argument at a covariant one (the
+    // parameter is then only ever returned, and a caller who asked for `void`
+    // accepts anything back).
+    var decisive = true;
+    for (0..n) |i| {
+        const v = measuredAt(bits, i);
+        if (v == .unmeasured or (v == .covariant and st.kind(st.refArgAt(t_ref, i)) == .void)) {
+            decisive = false;
+            break;
+        }
+    }
+    // Pass 2: relate the arguments as the parameters are used, stopping at the
+    // first one that does not — tsc's `typeArgumentsRelatedTo`.
     for (0..n) |i| {
         const sa = st.refArgAt(s_ref, i);
         const ta = st.refArgAt(t_ref, i);
         if (sa == ta) continue;
-        switch (measuredAt(bits, i)) {
-            .unmeasured => return false,
-            .independent => {},
-            .covariant => if (!try c.isAssignable(sa, ta)) return false,
-            .contravariant => if (!try c.isAssignable(ta, sa)) return false,
-            .bivariant => if (!(try c.isAssignable(sa, ta)) and !(try c.isAssignable(ta, sa))) return false,
-            .invariant => if (!(try c.isAssignable(sa, ta)) or !(try c.isAssignable(ta, sa))) return false,
-        }
+        const ok = switch (measuredAt(bits, i)) {
+            .unmeasured => false,
+            .independent => true,
+            .covariant => try c.isAssignable(sa, ta),
+            .contravariant => try c.isAssignable(ta, sa),
+            .bivariant => (try c.isAssignable(sa, ta)) or (try c.isAssignable(ta, sa)),
+            .invariant => (try c.isAssignable(sa, ta)) and (try c.isAssignable(ta, sa)),
+        };
+        if (!ok) return if (decisive) .unrelated else .undecided;
     }
-    return true;
+    return .related;
 }
 
 // =====================================================================
@@ -1830,8 +1897,11 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!bool {
                     }
                     // Nothing declared, or nothing decisive: MEASURE how the
                     // generic uses its parameters and relate the arguments by
-                    // that (see `measuredVarianceVerdict`). Positive only — a
-                    // failure still falls through to the structural walk below.
+                    // that (see `measuredVarianceVerdict`). A COMPLETE
+                    // measurement decides the pair either way — tsc's
+                    // `relateVariances` returns `Ternary.False` without looking
+                    // at a member — and anything it could not settle falls
+                    // through to the structural walk below.
                     //
                     // `marker_refs` is tsc's `markerTypes`: a pair some
                     // measurement minted is the question, not something to answer
@@ -1840,7 +1910,11 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!bool {
                     // leaves `A` identical on both sides and `B` unannotated, so
                     // `varianceVerdict` is never decisive on it.)
                     if (!c.marker_refs.contains(sref) and !c.marker_refs.contains(tref)) {
-                        if (try c.measuredVarianceVerdict(sref, tref)) break :blk .yes;
+                        switch (try c.measuredVarianceVerdict(sref, tref)) {
+                            .related => break :blk .yes,
+                            .unrelated => if (measured_variance_decides) break :blk .no,
+                            .undecided => {},
+                        }
                     }
                 }
             }
@@ -1895,6 +1969,14 @@ const RelVerdict = enum { yes, no, no_nocache };
 /// frame; with this off nothing derived from an assumption is ever published.
 const commit_at_root = true;
 
+/// A/B leg: a COMPLETE measured-variance comparison that fails decides the pair
+/// (tsc's `relateVariances` → `Ternary.False`, no structural fallback). With
+/// this off the verdict is believed only when positive and a failure falls
+/// through to the members — which is unsound for a mutually-recursive family,
+/// because the structural walk is co-inductive and comes back YES. See
+/// `measuredVarianceVerdict`.
+const measured_variance_decides = false;
+
 /// How many references the nominal heritage walk holds before giving up (and
 /// the size of its stack-allocated queue). A declared `extends` graph is a
 /// handful of links wide in practice; past the cap the structural walk
@@ -1906,13 +1988,19 @@ pub const max_heritage_walk: usize = 64;
 ///
 /// `class HTMLDivElement extends HTMLElement` (and `interface
 /// DataHTMLAttributes<T> extends HTMLAttributes<T>`) makes the derived type a
-/// subtype of the base BY DECLARATION: TypeScript checks that at the
-/// declaration (TS2415 / TS2430), so every later use may take it as given —
-/// which is exactly what the structural walk was re-deriving, once per pair,
-/// over the several hundred members of a lib interface. B1's TS2344 gate made
-/// that walk the dominant cost of the check phase on `.d.ts` corpora that
-/// write nominal constraints (`T extends HTMLElement` appears 119 times in
-/// @types/react), which is what this path is for.
+/// subtype of the base whenever it only ADDS to it: the base's members are
+/// literally the base's members, so the structural walk was re-deriving —
+/// once per pair, over the several hundred members of a lib interface — a
+/// verdict that type identity settles. B1's TS2344 gate made that walk the
+/// dominant cost of the check phase on `.d.ts` corpora that write nominal
+/// constraints (`T extends HTMLElement` appears 119 times in @types/react),
+/// which is what this path is for.
+///
+/// "Only adds to it" is the load-bearing qualifier and is CHECKED, not assumed
+/// — see `heritageInheritsUnchanged`. An `extends` clause is not a guarantee
+/// that the relation holds; a derived declaration that redeclares an inherited
+/// member at an incompatible type is reported (TS2415/TS2416) and is still not
+/// assignable to its base.
 ///
 /// Both sides must denote a generic reference (`refFacetOf`) and the target's
 /// symbol must be a class or an interface — a nominal declaration is the only
@@ -1969,7 +2057,16 @@ pub fn nominalHeritageRelated(c: *Checker, src_ref: TypeId, tgt_ref: TypeId) Err
         for (buf[0..n]) |b0| {
             const b = if (map_list.items.len > 0) try c.instantiate(b0, map_list.items) else b0;
             if (s.kind(b) != .ref) continue;
-            if (s.refSymbol(b) == tsym and heritageArgsIdentical(c, b, tgt_ref)) return true;
+            if (s.refSymbol(b) == tsym and heritageArgsIdentical(c, b, tgt_ref)) {
+                // The `extends` edge is not by itself proof: a derived
+                // declaration may REDECLARE an inherited member at a type the
+                // base's does not accept (tsc reports TS2415/TS2416 on the
+                // declaration and still answers "not related" at every use).
+                // Verify the inherited members came through untouched — see
+                // `heritageInheritsUnchanged`. Anything else falls through to
+                // the structural walk, which decides it properly.
+                return heritageInheritsUnchanged(c, src_ref, b);
+            }
             if (qlen == queue.len) return false;
             var dup = false;
             for (queue[0..qlen]) |q| {
@@ -1985,6 +2082,73 @@ pub fn nominalHeritageRelated(c: *Checker, src_ref: TypeId, tgt_ref: TypeId) Err
         }
     }
     return false;
+}
+
+/// Did `src_ref` inherit `base`'s members WITHOUT redeclaring any of them?
+///
+/// This is the premise `nominalHeritageRelated` needs and an `extends` clause
+/// alone does not supply. TypeScript's heritage check is not a guarantee that
+/// the derived type is assignable to the base — it is a DIAGNOSTIC (TS2415, and
+/// TS2416 per offending member) about the case where it is not. A class that
+/// redeclares an inherited member at an unrelated type is reported *there* and
+/// stays unassignable to its own base everywhere else:
+///
+/// ```ts
+/// class Store<T> { add = (i: T): T => i; }     // T invariant
+/// class Base { store!: Store<Base>; id = ""; }
+/// class Sub extends Base { store!: Store<Sub>; name = ""; }
+/// declare const s: Sub;
+/// const b: Base = s;                            // tsc: TS2322
+/// ```
+///
+/// Taking `extends Base` as given answers YES here, and answers it for the
+/// whole cascade that rests on it — outline's `Collection`/`Model` pair, whose
+/// `store` fields are two instantiations of an invariant `Store<T>`, is exactly
+/// this shape at scale (~290 missing diagnostics).
+///
+/// The test is deliberately by TYPE IDENTITY, not by relating: an inherited
+/// member that was not redeclared IS the base's member, instantiated through
+/// the same arguments, so the two sides hold the very same `TypeId` and the
+/// pair is related for free. A redeclared member — even one that is perfectly
+/// compatible — fails the test and hands the pair to the structural walk,
+/// which is the answer it would have had before the fast path existed. So this
+/// only ever costs a walk, never an answer.
+///
+/// The comparison runs against the base instantiation the heritage walk
+/// REACHED, not against the written target: when the target's argument is `any`
+/// (`ZodType<any, any, any>` vs `ZodString`'s written `ZodType<string,
+/// ZodStringDef, string>`) the two differ, and it is the reached one whose
+/// members `src_ref` actually inherited. `any` on the target relates to the
+/// reached base under any variance, so the second leg needs nothing checked.
+fn heritageInheritsUnchanged(c: *Checker, src_ref: TypeId, base: TypeId) Error!bool {
+    const st = try c.expandRef(src_ref);
+    const bt = try c.expandRef(base);
+    const s = &c.ts;
+    if (s.kind(st) != .object or s.kind(bt) != .object) return false;
+    const n = s.objectPropCount(bt);
+    for (0..n) |i| {
+        const bp = s.objectProp(bt, @intCast(i));
+        const sp = (try c.propOfTypeEx(st, bp.name, false)) orelse return false;
+        if (sp.ty != bp.ty) return false;
+        if (sp.optional() != bp.optional()) return false;
+    }
+    // Index signatures and call/construct signatures are inherited the same
+    // way and compared the same way. A base that has none demands nothing.
+    if (s.objectStringIndex(bt) != 0 and s.objectStringIndex(st) != s.objectStringIndex(bt)) return false;
+    if (s.objectNumberIndex(bt) != 0 and s.objectNumberIndex(st) != s.objectNumberIndex(bt)) return false;
+    if (s.objectCallSigCount(bt) != 0) {
+        if (s.objectCallSigCount(st) != s.objectCallSigCount(bt)) return false;
+        for (0..s.objectCallSigCount(bt)) |i| {
+            if (s.objectCallSig(st, @intCast(i)) != s.objectCallSig(bt, @intCast(i))) return false;
+        }
+    }
+    if (s.objectConstructSigCount(bt) != 0) {
+        if (s.objectConstructSigCount(st) != s.objectConstructSigCount(bt)) return false;
+        for (0..s.objectConstructSigCount(bt)) |i| {
+            if (s.objectConstructSig(st, @intCast(i)) != s.objectConstructSig(bt, @intCast(i))) return false;
+        }
+    }
+    return true;
 }
 
 /// Do two references to the SAME generic carry arguments that make them the
@@ -3950,6 +4114,19 @@ pub fn nonDiscPropsAssignable(c: *Checker, s: TypeId, member: TypeId, excl: Atom
 /// Function ↔ callable-object relate in both directions; a `class_value`
 /// satisfies construct signatures (constructable) — under-reporting exact
 /// shape mismatches rather than spuriously rejecting a valid class value.
+///
+/// The under-report is load-bearing for ~24 of outline's keys — `typeof
+/// Collection` satisfies `new (...args: never[]) => Model` here even though
+/// `Collection` is not assignable to `Model` — and MATERIALIZING the class
+/// value instead (`classConstructType`, as the `.class_value` target arm of
+/// `isAssignableInner` does) fixes exactly those 24. It also makes the pair's
+/// answer depend on WHEN it is first asked: in one program `typeof Notice`
+/// against `{ new (...args: any[]): Extension<any> | Mark<any> | Node<any> }`
+/// answers YES from one file and NO from another (outline
+/// `shared/editor/nodes/index.ts` vs a probe file added to the same run) —
+/// i.e. something under `classConstructType` / `classStaticType` is being
+/// memoized from a provisional class table. Left as-is until that is found;
+/// the fix is not safe without it.
 pub fn sourceSatisfiesSigs(c: *Checker, s: TypeId, t: TypeId, is_construct: bool) Error!bool {
     const sk = c.ts.kind(s);
     if (sk == .any or sk == .err) return true;
