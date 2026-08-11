@@ -656,6 +656,17 @@ pub fn paramInfo(c: *Checker, pn: Node, index: u32, ctx_sig: TypeId, report_impl
 /// `checkExprCached` → `checkFunctionLikeExpr`. With no context it is
 /// `types.no_type`, and normal widening applies (tsc's
 /// isLiteralOfContextualType).
+/// tsc's `mayReturnNever`: may a function-like whose body only throws infer
+/// `never` rather than `void`? Only an arrow and a function expression — and an
+/// object-literal method, which the parser models as an `object_method` holding
+/// a `function_expr`, so it is already covered by that arm.
+fn mayReturnNever(c: *Checker, fn_node: Node) bool {
+    return switch (c.nodeTag(fn_node)) {
+        .arrow_fn, .function_expr => true,
+        else => false,
+    };
+}
+
 pub fn inferReturnType(c: *Checker, fn_node: Node, body: Node, ret_ctx: TypeId) Error!TypeId {
     if (body == 0) return types.any_type;
     // Establish *this* function's async/generator context while checking
@@ -699,7 +710,30 @@ pub fn inferReturnType(c: *Checker, fn_node: Node, body: Node, ret_ctx: TypeId) 
         // `() => { throw new Error(…); }` is therefore usable wherever a
         // `() => [number, string]` is wanted; typed `void` it was a
         // phantom TS2322/TS2345 at every such callback.
-        if (c.stmtListTerminal(c.tree.nodeRange(body))) return types.never_type;
+        //
+        // …but only where tsc's `mayReturnNever` says so, and that is a
+        // syntactic test on the function itself: an ARROW, a function
+        // EXPRESSION, or an OBJECT-LITERAL method (whose body is a
+        // `function_expr` here). A function DECLARATION and a CLASS member —
+        // method, accessor, static — infer `void` from the same body, on the
+        // grounds that a throwing declaration is a stub someone means to fill
+        // in, not a `never`-returning contract for every caller.
+        //
+        // The distinction is load-bearing for an abstract-base-class hierarchy,
+        // which is the shape it was found on:
+        //
+        // ```ts
+        // class Node { toMarkdown(s: string) { throw new Error("nope"); } }
+        // class Paragraph extends Node { toMarkdown(s: string) { … } }
+        // ```
+        //
+        // `never` for the base makes every subclass that actually implements
+        // the method unassignable to its own base (`void` ⊄ `never`) — 26
+        // phantom TS2322s on outline's editor-node registry once the heritage
+        // fast path stopped hiding the pair.
+        if (c.stmtListTerminal(c.tree.nodeRange(body)) and mayReturnNever(c, fn_node)) {
+            return types.never_type;
+        }
         return types.void_type;
     }
     var parts: std.ArrayList(TypeId) = .empty;
