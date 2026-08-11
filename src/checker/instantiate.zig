@@ -1469,7 +1469,20 @@ pub fn carryKeyNameTypes(c: *Checker, out: TypeId, from: []const TypeId) Error!v
 }
 
 /// Generic instance shape of a class: instance members + base instance.
-pub fn classInstanceGeneric(c: *Checker, sym: SymbolId) Error!TypeId {
+pub fn classInstanceGeneric(c: *Checker, sym0: SymbolId) Error!TypeId {
+    // A class a cross-file `declare module "pkg" { interface C { … } }`
+    // augmentation merged into keeps its FULL table under the merged id —
+    // that is where the interface constituents are folded, below. A
+    // reference that arrived as `ref(<class>)` rather than `ref(<merged>)`
+    // must see the same table: type positions route through
+    // `Program.mergedOf` already, but a VALUE position never does
+    // (`new C()`, `extends C`, the return of a `typeof C` construct
+    // signature all build the instance ref from the class symbol itself).
+    // Without this the augmented and un-augmented views of one class are two
+    // different shapes, and assigning between them is a phantom TS2739 —
+    // outline augments `prosemirror-inputrules`' `InputRule` with its
+    // `@internal` `match`/`handler`/`undoable` and hits exactly that.
+    const sym = c.prog.mergedOf(sym0) orelse sym0;
     prof_zig.declAsk(c, sym, .class, sym);
     if (c.class_inst_generic.get(sym)) |t| {
         if (t == types.no_type) return types.error_type;
@@ -1599,7 +1612,11 @@ pub fn classInstanceGeneric(c: *Checker, sym: SymbolId) Error!TypeId {
 /// when the answer is incomplete. Transitivity is free: a derived class that
 /// folded a provisional base sees no memo entry for it and marks itself
 /// provisional in turn.
-pub fn classTableProvisional(c: *Checker, sym: SymbolId) bool {
+pub fn classTableProvisional(c: *Checker, sym0: SymbolId) bool {
+    // Same normalization `classInstanceGeneric` applies: an augmented class's
+    // table is memoized under the merged id, and asking about the raw one
+    // must read that entry rather than report a permanent "provisional".
+    const sym = c.prog.mergedOf(sym0) orelse sym0;
     const g = c.class_inst_generic.get(sym) orelse return true;
     return g == types.no_type;
 }
@@ -1646,7 +1663,9 @@ pub const lazy_base_depth: u32 = 16;
 /// Is `sym`'s class member table being materialized further down this
 /// checker's stack? `classInstanceGeneric` marks in-progress with `no_type`,
 /// and answers `error_type` — a cut, not a result — for the whole window.
-pub fn classGenericInProgress(c: *Checker, sym: SymbolId) bool {
+pub fn classGenericInProgress(c: *Checker, sym0: SymbolId) bool {
+    // The merged id is the one `classInstanceGeneric` marks (see there).
+    const sym = c.prog.mergedOf(sym0) orelse sym0;
     const g = c.class_inst_generic.get(sym) orelse return false;
     return g == types.no_type;
 }
