@@ -218,7 +218,12 @@ pub fn constTemplateAtom(c: *Checker, node: Node) Error!?Atom {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(c.scratch());
     if (!try evalConstToString(c, node, &out, 0)) return null;
-    return try c.atom(out.items);
+    // `internText`, NOT `atom`: the folded value lives in a scratch buffer that
+    // is freed on return, and `atom_cache` keeps its KEY as the caller's slice.
+    // Caching it leaves a dangling key that the next rehash walks — a
+    // segfault whose crash site is wherever the map happens to grow, which is
+    // why this reproduced only on excalidraw at `--checkers=2`.
+    return try c.internText(out.items);
 }
 
 /// The constant value of an enum member initializer that REFERENCES another
