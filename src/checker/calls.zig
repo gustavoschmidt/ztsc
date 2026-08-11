@@ -4186,6 +4186,25 @@ pub fn intersectionMembersPair(c: *Checker, pm: TypeId, am: TypeId) Error!bool {
     const rp = try c.resolveStructural(pm);
     const ra = try c.resolveStructural(am);
     const pk = s.kind(rp);
+    // A CLASS VALUE (`typeof C`) argument against a constituent that carries a
+    // CONSTRUCT signature. `.class_value` is a nominal shortcut with no
+    // structure of its own, so the kind test below can never match it — yet a
+    // construct-signature constituent is precisely the part of an intersection
+    // a class value answers, and the `.object` arm of `unify` already infers
+    // through it when the parameter is that object on its own (`this: { new ():
+    // M }` binds `M` from the receiver).
+    //
+    // sequelize's `ModelStatic<M> = NonConstructor<typeof Model> & { new (): M
+    // }` is written as an intersection, and it is a `this` parameter — so with
+    // no pair, `M` took no candidate at all and fell back to its `Model`
+    // constraint: every `User.findOne()` / `.findAll()` result was a bare
+    // `Model`, and every property read off one a TS2339 (12.5 K of them on
+    // outline, unmasked the moment the map over the static side stopped
+    // collapsing to `{}` — see `materializeMapped`'s `.class_value` arm).
+    //
+    // `inferFromExtends`' `.object` arm bridges the same nominal/structural gap
+    // for a conditional's construct-signature pattern (`InstanceType<T>`).
+    if (pk == .object and s.kind(ra) == .class_value and s.objectConstructSigCount(rp) > 0) return true;
     if (pk != s.kind(ra)) return false;
     return switch (pk) {
         .object => try c.constituentRelatesTo(rp, ra),

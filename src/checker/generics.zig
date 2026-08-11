@@ -2610,6 +2610,35 @@ pub fn materializeMapped(c: *Checker, key_param: TypeId, constraint: TypeId, val
         if (isPrimitiveForHomomorphicMap(s.kind(src))) return src;
         switch (s.kind(src)) {
             .any, .err => return types.any_type,
+            // `{ [P in keyof T]: … }` over a CLASS STATIC SIDE / namespace value
+            // (`typeof C`). `.class_value` is a nominal shortcut that carries no
+            // properties of its own — every reader materializes them through
+            // `classStaticType` (`propOfTypeEx`, and `keyofType`'s own
+            // `.class_value` arm) — so it fell to the `else` below and the whole
+            // map collapsed to `{}` while `keyof typeof C` still answered the
+            // full static key set. Map the static object instead: same key set
+            // `keyof src`, so the two stay in agreement.
+            //
+            // Construct signatures are deliberately not carried: tsc's
+            // `keyof typeof C` covers the static properties only, and a mapped
+            // type never reproduces call/construct signatures.
+            //
+            // sequelize is built on this idiom — `NonConstructorKeys<T> = { [P
+            // in keyof T]: T[P] extends new () => any ? never : P }[keyof T]`,
+            // `ModelStatic<M> = Pick<typeof Model, NonConstructorKeys<typeof
+            // Model>> & { new (): M }`. With the map empty, `NonConstructorKeys`
+            // indexed a `{}` and answered `unknown`, `Pick<T, unknown>` gave
+            // `{}`, and `ModelStatic<M>` degenerated to exactly `{ new (): M }`:
+            // every `Model.findAll`/`.findOne`/`.scope(…)` on outline's models
+            // was a TS2339, and the argument checks tsc does report at those
+            // same calls went missing.
+            .class_value => {
+                const statics = try c.classStaticType(s.classSymbol(src));
+                // Self-referential (`classStaticType` handed back the value
+                // type itself): no members to map.
+                if (statics == src) return types.empty_object_type;
+                return c.materializeMapped(key_param, constraint, value, as_clause, statics, flags);
+            },
             .array => {
                 // A homomorphic map over an array yields an array; the
                 // element is the value with `K` bound to the number index.
@@ -3034,6 +3063,16 @@ pub fn collectHomoProps(c: *Checker, t: TypeId, out: *std.ArrayList(types.Prop))
         },
         .intersection => {
             for (try c.memberList(r)) |m| try c.collectHomoProps(m, out);
+        },
+        // A class static side / namespace value (`typeof C`) reached as an
+        // INTERSECTION constituent (`{ [P in keyof (typeof C & X)]: … }`). The
+        // bare-source case is handled in `materializeMapped`'s own
+        // `.class_value` arm; here the statics have to be collected, or
+        // `keyof` (whose `.intersection` arm does include them) and the map
+        // would disagree about the key set.
+        .class_value => {
+            const statics = try c.classStaticType(c.ts.classSymbol(r));
+            if (statics != r) try c.collectHomoProps(statics, out);
         },
         else => {},
     }
