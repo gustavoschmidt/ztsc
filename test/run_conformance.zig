@@ -779,6 +779,72 @@ test "determinism: diagnostics byte-identical for any ROOT ORDER" {
     try std.testing.expectEqualStrings(ref, got);
 }
 
+// The root-order axis reduced to the one decision that actually carried it,
+// and the smallest program that moves it.
+//
+// A `?:` whose arms are `Item[]` and `any[]` is a MUTUALLY assignable pair for
+// the assignability relation (`any` relates both ways), so `reduceSubtypes`
+// has to break the tie. It used to break it on the lower TypeId, and TypeIds
+// are minted in demand order: whichever file first asked for one of the two
+// array types made that one the winner for the whole run. Here `seed.ts`
+// touches `loose` and nothing else, so it mints `any[]` first; `use.ts`
+// writes the `?:` with `items` on the left, so reaching it first mints
+// `Item[]` first. Two roots, two orders, and the surviving arm flipped —
+// `p[0].nope` was clean under one and a TS2339 under the other, which is
+// excalidraw's two TS7053s in eleven lines instead of 280,000.
+//
+// The fix lets an ANY-ROOTED twin outrank its concrete counterpart
+// (`anyRooted`, typenode.zig), which is tsc's own winner
+// (`strictSubtypeRelation`: `any` is a subtype of nothing) and a property of
+// the types rather than of the walk, so both orders now keep the `any[]` arm
+// and the program is clean in both.
+test "determinism: a mutually assignable `any` twin does not move with ROOT ORDER" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const d = tmp.dir;
+
+    try d.writeFile(io, .{ .sub_path = "pair.ts", .data =
+        \\export declare const items: { tag: "x" }[];
+        \\export declare const loose: any[];
+    });
+    // Mints `any[]` before anything mints `{ tag: "x" }[]`.
+    try d.writeFile(io, .{ .sub_path = "seed.ts", .data =
+        \\import { loose } from "./pair";
+        \\export const seeded: number = loose.length;
+    });
+    // Mints `{ tag: "x" }[]` first (left arm), then asks which twin survived.
+    try d.writeFile(io, .{ .sub_path = "use.ts", .data =
+        \\import { items, loose } from "./pair";
+        \\export function pick(cond: boolean) {
+        \\  const p = cond ? items : loose;
+        \\  return p[0].nope;
+        \\}
+    });
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var interner = Interner.init();
+    defer interner.deinit(gpa);
+    const alloc = arena.allocator();
+
+    const fwd = [_][]const u8{ "seed.ts", "use.ts" };
+    const rev = [_][]const u8{ "use.ts", "seed.ts" };
+    const br_fwd = try modules.buildProgram(alloc, io, gpa, &interner, d, &fwd, .none, .{}, .{}, null);
+    const br_rev = try modules.buildProgram(alloc, io, gpa, &interner, d, &rev, .none, .{}, .{}, null);
+    try std.testing.expectEqual(br_fwd.program.files.len, br_rev.program.files.len);
+
+    const ref = try sortedLines(alloc, try renderProgramDiags(alloc, io, gpa, &interner, &br_fwd.program, 1));
+    const got = try sortedLines(alloc, try renderProgramDiags(alloc, io, gpa, &interner, &br_rev.program, 1));
+    try std.testing.expectEqualStrings(ref, got);
+    // And the surviving arm is tsc's: `any[]`, so the member read is legal.
+    // Asserted separately from the equality above, because two orders that
+    // agree on the WRONG arm would satisfy that on its own.
+    try std.testing.expectEqualStrings("", ref);
+}
+
 test "determinism: diagnostics byte-identical for N = 1, 2, 4, 8 checkers" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;

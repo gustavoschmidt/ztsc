@@ -2940,8 +2940,12 @@ pub fn logicalUnion(c: *Checker, a: TypeId, b: TypeId) Error!TypeId {
 }
 
 /// Remove union members that are subtypes of another member. Mutually
-/// assignable members (e.g. `any[]` vs `Item[]`) collapse to exactly one
-/// (the first kept). tsc guard mirrored from `strictSubtypeRelation`: an
+/// assignable members (e.g. `any[]` vs `Item[]`) collapse to exactly one —
+/// the any-rooted one (`anyRooted`), which is tsc's winner and, unlike the
+/// TypeId this used to compare, a property of the program rather than of the
+/// order its roots were listed in.
+///
+/// tsc guard mirrored from `strictSubtypeRelation`: an
 /// *empty anonymous object type* (`{}` — the `?? {}` / `|| {}` fallback)
 /// never absorbs another member — `T | {}` must not collapse to `{}` —
 /// while `{}` itself is still absorbed by a member it's assignable to
@@ -2958,8 +2962,9 @@ pub fn logicalUnion(c: *Checker, a: TypeId, b: TypeId) Error!TypeId {
 /// yet, so letting it absorb would throw away a sibling's properties on the
 /// strength of a shape that is still being formed.
 ///
-/// Order-invariant: members are already TypeId-sorted by `makeUnion`, and
-/// the kept set is a deterministic function of that order.
+/// An ANY-ROOTED twin outranks its concrete counterpart rather than racing it
+/// for the lower TypeId — see `anyRooted` for why the latter was a root-order
+/// bug, and for the shape the rank deliberately does not cover.
 pub fn reduceSubtypes(c: *Checker, t: TypeId) Error!TypeId {
     if (c.ts.kind(t) != .union_type) return t;
     const members = try c.memberList(t);
@@ -2984,9 +2989,23 @@ pub fn reduceSubtypes(c: *Checker, t: TypeId) Error!TypeId {
             if (!m_empty and try c.isAssignable(o, m)) {
                 // Mutually assignable: exactly one twin survives. A fresh
                 // literal always yields — it can never absorb, so keeping
-                // it here would keep both. Otherwise keep whichever of the
-                // two was reached first.
+                // it here would keep both.
                 if (m_fresh) continue :outer;
+                // tsc's subtype relation is ASYMMETRIC exactly where the
+                // assignability relation is not (`anyRooted`): an any-rooted
+                // twin is not a subtype of the concrete one, so it is the one
+                // that survives. Consulted before the reached-first fallback
+                // because that fallback reads a TypeId, which is not a
+                // property of the program.
+                const m_any = try anyRooted(c, m, 0);
+                const o_any = try anyRooted(c, o, 0);
+                if (m_any != o_any) {
+                    // `m` is the any-carrying twin: `o` cannot absorb it.
+                    if (m_any) continue;
+                    // `m` is the concrete twin: it IS the subtype, so it goes
+                    // whether or not `o` has been kept yet.
+                    continue :outer;
+                }
                 for (kept.items) |k| if (k == o) continue :outer;
             } else {
                 // Strict subtype (or the `{}` member itself): m is redundant.
@@ -2997,6 +3016,77 @@ pub fn reduceSubtypes(c: *Checker, t: TypeId) Error!TypeId {
     }
     if (kept.items.len == members.len) return t;
     return c.ts.makeUnion(c.scratch(), kept.items);
+}
+
+/// Is `t` ANY-ROOTED — `any` itself, or an array/tuple whose every element is
+/// any-rooted? The tie-break `reduceSubtypes` needs for a mutually assignable
+/// pair, and the one place tsc's SUBTYPE relation is asymmetric where ztsc's
+/// assignability relation is not.
+///
+/// tsc reduces a `||`/`??`/`?:` union with `strictSubtypeRelation`, in which
+/// `T` is a subtype of `any` but `any` is a subtype of nothing except `any`
+/// and `unknown`. So `string[] | any[]` is not a symmetric pair for tsc at
+/// all: the concrete arm is the subtype, it is the arm that goes, and the
+/// result is `any[]` (measured against tsgo 7.0.2, which types `c ? xs : ys`
+/// as `any[]` for `xs: string[]`, `ys: any[]`).
+///
+/// ztsc's assignability relation cannot see that — `any` relates in both
+/// directions — so the two arms came back MUTUALLY assignable and the
+/// reduction fell through to "keep whichever of the two was reached first",
+/// i.e. the lower TypeId. That is the bug: TypeIds are handed out in demand
+/// order, demand order follows file ids, and file ids follow the ROOT FILE
+/// ORDER, so the surviving arm — and the type of every expression derived from
+/// it — moved when the `include` walk was permuted, which `src/checker.zig:15`
+/// promises cannot happen.
+///
+/// It was excalidraw's last order-dependent result. `App.tsx`'s
+///
+///     const elementsWithinSelection = this.state.selectionElement
+///       ? getElementsWithinSelection(…)
+///       : [];
+///
+/// is `NonDeletedExcalidrawElement[] | any[]` here, because ztsc types a bare
+/// `[]` as `any[]` (evolving arrays are out of subset — see
+/// `checkArrayLiteral`) where tsc types it `never[]`. Under
+/// `--file-order=source` the `any[]` arm happened to hold the lower id and
+/// won; under `reverse` the concrete arm did, so the `.reduce` twelve lines
+/// below ran on a typed array instead of on `any` and reported two TS7053s
+/// that no other order reported.
+///
+/// ANY-ROOTED, not "contains an `any` anywhere", and the restriction is load
+/// bearing rather than a cost guard. Keeping the any-carrying twin is
+/// information-preserving exactly when the `any` swallows the whole compared
+/// value: nothing can be read off it, so nothing can be reported through it,
+/// and the worst case is the under-report ztsc already accepts for `[]`. When
+/// the twin is an OBJECT whose `any` sits inside one property, keeping it
+/// throws the other twin's properties away — and that invents diagnostics.
+/// Measured: social-app's `loggedOutFetch` returns
+/// `{success: boolean; data: OutputSchema}` in one arm and
+/// `{success: boolean; data: {feed: any[]}}` in the other (that `any[]` is
+/// again a bare `[]`), the two are mutually assignable, and preferring the
+/// any-carrying arm dropped `OutputSchema`'s `cursor` — one fresh TS2339 on an
+/// app that is otherwise 0. tsc keeps the concrete arm there because its
+/// `{feed: never[]}` IS a strict subtype; ztsc's `any` placeholder points the
+/// opposite way, so the rank is not consulted for that shape and the
+/// reached-first fallback stands. That leaves object twins minted in different
+/// FILES a residual order hazard; none is reachable on the gated corpus, and
+/// closing it properly means a real subtype relation, not a better tie-break.
+fn anyRooted(c: *Checker, t: TypeId, depth: u32) Error!bool {
+    const s = &c.ts;
+    if (s.kind(t) == .any) return true;
+    if (depth > 2) return false;
+    switch (s.kind(t)) {
+        .array => return anyRooted(c, s.arrayElem(t), depth + 1),
+        .tuple => {
+            const n = s.tupleLen(t);
+            if (n == 0) return false;
+            for (0..n) |i| {
+                if (!try anyRooted(c, s.tupleElem(t, @intCast(i)).ty, depth + 1)) return false;
+            }
+            return true;
+        },
+        else => return false,
+    }
 }
 
 /// tsc's `hasExcessProperties`, asked of two *types* rather than of a
