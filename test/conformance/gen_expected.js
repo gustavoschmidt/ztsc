@@ -104,6 +104,7 @@ function optionsForDir(dir) {
   let noImplicitAny; // tri-state: undefined = inherit strict
   let noUncheckedSideEffectImports = false;
   let experimentalDecorators = false;
+  let resolvePackageJsonExports, resolvePackageJsonImports; // tri-state
   let jsx, jsxImportSource;
   try {
     const co = JSON.parse(fs.readFileSync(cfgPath, "utf8")).compilerOptions;
@@ -114,6 +115,8 @@ function optionsForDir(dir) {
     if (co && typeof co.noImplicitAny === "boolean") noImplicitAny = co.noImplicitAny;
     if (co && co.noUncheckedSideEffectImports === true) noUncheckedSideEffectImports = true;
     if (co && co.experimentalDecorators === true) experimentalDecorators = true;
+    if (co && typeof co.resolvePackageJsonExports === "boolean") resolvePackageJsonExports = co.resolvePackageJsonExports;
+    if (co && typeof co.resolvePackageJsonImports === "boolean") resolvePackageJsonImports = co.resolvePackageJsonImports;
     if (co && typeof co.jsx === "string") jsx = co.jsx;
     if (co && typeof co.jsxImportSource === "string") jsxImportSource = co.jsxImportSource;
   } catch {
@@ -152,6 +155,13 @@ function optionsForDir(dir) {
   // against the standard `Class*DecoratorContext` signatures
   // (run_conformance.zig dirCaseBoolOption).
   if (experimentalDecorators) out.push("--experimentalDecorators");
+  // `resolvePackageJsonExports`/`resolvePackageJsonImports`: the default OPTIONS
+  // pass `--moduleResolution bundler`, under which both are on. A case that
+  // turns one off must tell the oracle too, or the snapshot describes a
+  // different resolution than ztsc performs (run_conformance.zig reads the same
+  // keys with the same `orelse true` default).
+  if (resolvePackageJsonExports === false) out.push("--resolvePackageJsonExports", "false");
+  if (resolvePackageJsonImports === false) out.push("--resolvePackageJsonImports", "false");
   // `jsx`: the default OPTIONS pass `--jsx preserve` (cases declare their own
   // global `JSX` namespace). A case that selects the *automatic* runtime
   // (`react-jsx`) moves the `JSX` namespace into the

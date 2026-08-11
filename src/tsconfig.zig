@@ -37,6 +37,12 @@
 //!   - `target` / `module` / `moduleResolution` are accepted and ignored
 //!     (surfaced as notes under `--verbose`): ztsc always checks its fixed
 //!     esnext/bundler-resolution subset.
+//!   - `resolvePackageJsonExports` / `resolvePackageJsonImports` are honored,
+//!     defaulting to `true` (the bundler value — they do NOT follow the ignored
+//!     `moduleResolution`). `resolvePackageJsonExports: false` makes module
+//!     resolution ignore every dependency's `"exports"` map, falling back to the
+//!     legacy `"types"`/`"typings"`/`"main"`/`index` path; the `"imports"` map is
+//!     not implemented at all, so its flag only records the option.
 //!   - `baseUrl` + `paths`: minimal support — exact keys and single-`*`
 //!     patterns mapped to relative directories; feeds module resolution
 //!     (tsc rule: exact match wins, else the pattern with the longest
@@ -134,6 +140,21 @@ pub fn loadInDir(io: Io, arena: Allocator, base: Io.Dir, config_path: []const u8
     cfg.skip_all_lib_check = acc.skip_all_lib_check orelse false;
     cfg.resolve_json_module = acc.resolve_json_module orelse false;
     cfg.no_unchecked_side_effect_imports = acc.no_unchecked_side_effect_imports orelse false;
+    // `resolvePackageJsonExports`/`resolvePackageJsonImports` default ON: tsc
+    // derives them from `moduleResolution` (on for node16/nodenext/bundler) and
+    // ztsc always resolves with the bundler algorithm, so only an explicit
+    // `false` changes any resolution. Resolved here, above the `types`
+    // type-directive resolution (`collectAutoTypes` →
+    // `resolve.resolveTypeDirective`), which is the first thing that needs it —
+    // the driver carries the same value into its `ResolveCache` for imports.
+    cfg.resolve_pkg_json_exports = acc.resolve_pkg_json_exports orelse true;
+    cfg.resolve_pkg_json_imports = acc.resolve_pkg_json_imports orelse true;
+    if (!cfg.resolve_pkg_json_exports) {
+        try note(arena, &notes, "'resolvePackageJsonExports' is off: 'package.json' \"exports\" maps are ignored entirely — every specifier resolves through the legacy \"types\"/\"typings\"/\"main\"/index path, and a subpath a map does not name is no longer blocked", .{});
+    }
+    if (!cfg.resolve_pkg_json_imports) {
+        try note(arena, &notes, "'resolvePackageJsonImports' is off: 'package.json' \"imports\" maps are ignored (ztsc never reads them, so this is already its behavior)", .{});
+    }
     // Effective allowSyntheticDefaultImports = explicit value ?? esModuleInterop
     // ?? (module is system || moduleResolution is bundler). ztsc always resolves
     // with the bundler algorithm (`moduleResolution` is accepted and ignored
@@ -272,7 +293,7 @@ pub fn loadInDir(io: Io, arena: Allocator, base: Io.Dir, config_path: []const u8
             if (std.mem.eql(u8, t, "*")) cfg.types_wildcard = true;
         }
     }
-    cfg.auto_type_files = try collectAutoTypes(io, arena, base, cfg.dir, type_roots_abs, acc.types);
+    cfg.auto_type_files = try collectAutoTypes(io, arena, base, cfg.dir, type_roots_abs, acc.types, cfg.resolve_pkg_json_exports);
     if (cfg.auto_type_files.len > 0) {
         try note(arena, &notes, "auto-included {d} '@types' package(s) as ambient roots (tsc's default typeRoots); override with 'typeRoots'/'types'", .{cfg.auto_type_files.len});
     }
@@ -363,6 +384,20 @@ pub const Config = struct {
     /// `compilerOptions.resolveJsonModule`: a `*.json` import that names an
     /// existing file resolves (typed opaquely as `any`) rather than TS2307.
     resolve_json_module: bool = false,
+    /// `compilerOptions.resolvePackageJsonExports`: when false, a dependency's
+    /// `package.json` `"exports"` map is ignored entirely and every specifier
+    /// resolves through the legacy `"types"`/`"typings"`/`"main"`/`index` path.
+    /// Default true (see `resolve.ResolveOpts.resolve_pkg_json_exports` for the
+    /// resolver-side contract and why the default does not follow
+    /// `moduleResolution`). A real project turns this off when its dependencies
+    /// publish `exports` maps with no `types` condition, which otherwise hide
+    /// the declarations their own `"types"` key points at.
+    resolve_pkg_json_exports: bool = true,
+    /// `compilerOptions.resolvePackageJsonImports`: when false, a `#`-prefixed
+    /// specifier ignores the importing package's `"imports"` map. Default true.
+    /// ztsc does not implement that map at all, so the option is recorded and
+    /// carried to the resolver but changes nothing today.
+    resolve_pkg_json_imports: bool = true,
     /// `compilerOptions.noUncheckedSideEffectImports` (TS 5.6+). tsc's default is
     /// OFF: a side-effect-only `import "m"` whose specifier resolves to nothing
     /// is silently accepted, because bundler plugins routinely own such
@@ -830,8 +865,10 @@ fn segMatch(cs: bool, pat: []const u8, name: []const u8) bool {
 /// the project directory (`resolve.resolveTypeDirective`). The secondary leg
 /// is what makes a non-`@types` entry work: `types: ["vitest/globals"]`
 /// resolves to `node_modules/vitest/globals.d.ts` through the package's
-/// `exports` map. An empty `types` yields nothing; an entry that resolves
-/// nowhere is skipped: tsc's TS2688 for it is a *file-less* global diagnostic
+/// `exports` map — unless `use_pkg_exports` is false
+/// (`resolvePackageJsonExports`), which resolves the directive through the
+/// legacy fields like every other specifier. An empty `types` yields nothing;
+/// an entry that resolves nowhere is skipped: tsc's TS2688 for it is a *file-less* global diagnostic
 /// (the directive lives in the config, not in a source file), and ztsc prints
 /// only file-anchored ones — an under-report. The same directive written as a
 /// `/// <reference types="…" />` inside a source file does get TS2688, from
@@ -843,6 +880,7 @@ fn collectAutoTypes(
     project_dir: []const u8,
     type_roots: ?[]const []const u8,
     types: ?[]const []const u8,
+    use_pkg_exports: bool,
 ) Error![]const []const u8 {
     // The `@types` root directories to scan, nearest first.
     var roots: std.ArrayList([]const u8) = .empty;
@@ -889,7 +927,7 @@ fn collectAutoTypes(
                 }
             }
             if (found == null) {
-                found = try resolve.resolveTypeDirective(io, arena, base, project_dir, name);
+                found = try resolve.resolveTypeDirective(io, arena, base, project_dir, name, use_pkg_exports);
             }
             if (found) |f| {
                 const gop = try seen.getOrPut(arena, f);
@@ -968,6 +1006,8 @@ const Merged = struct {
     skip_lib_check: ?bool = null,
     skip_all_lib_check: ?bool = null,
     resolve_json_module: ?bool = null,
+    resolve_pkg_json_exports: ?bool = null,
+    resolve_pkg_json_imports: ?bool = null,
     no_unchecked_side_effect_imports: ?bool = null,
     es_module_interop: ?bool = null,
     allow_synthetic_default_imports: ?bool = null,
@@ -1165,6 +1205,21 @@ fn applyOwn(
                         acc.resolve_json_module = oval.boolean;
                     } else {
                         try warn(arena, warnings, "{s}: 'resolveJsonModule' must be a boolean (ignored)", .{config_path});
+                    }
+                } else if (std.mem.eql(u8, okey, "resolvePackageJsonExports")) {
+                    // Turning this off is the pre-`exports` resolver: no
+                    // `exports` map resolves, hides a legacy field, or blocks a
+                    // subpath (`resolve.resolvePackageAt`).
+                    if (oval == .boolean) {
+                        acc.resolve_pkg_json_exports = oval.boolean;
+                    } else {
+                        try warn(arena, warnings, "{s}: 'resolvePackageJsonExports' must be a boolean (ignored)", .{config_path});
+                    }
+                } else if (std.mem.eql(u8, okey, "resolvePackageJsonImports")) {
+                    if (oval == .boolean) {
+                        acc.resolve_pkg_json_imports = oval.boolean;
+                    } else {
+                        try warn(arena, warnings, "{s}: 'resolvePackageJsonImports' must be a boolean (ignored)", .{config_path});
                     }
                 } else if (std.mem.eql(u8, okey, "noUncheckedSideEffectImports")) {
                     if (oval == .boolean) {

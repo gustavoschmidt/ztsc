@@ -1,0 +1,13 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "noEmit": true,
+    "target": "esnext",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "types": [],
+    "resolvePackageJsonExports": false,
+    "resolvePackageJsonImports": false
+  },
+  "files": ["entry.ts"]
+}
