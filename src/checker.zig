@@ -4171,6 +4171,7 @@ pub const Checker = struct {
     pub const bindAnyToTypeParams = calls_zig.bindAnyToTypeParams;
     pub const argumentsMatch = calls_zig.argumentsMatch;
     pub const checkCallArguments = calls_zig.checkCallArguments;
+    pub const checkCallArgumentsAnchored = calls_zig.checkCallArgumentsAnchored;
     pub const CallShape = calls_zig.CallShape;
 
     const flow_zig = @import("checker/flow.zig");

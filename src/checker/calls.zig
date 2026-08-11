@@ -810,7 +810,8 @@ pub fn resolveSignatureCall(
     const saved = c.diags.items.len;
     const report_sig = if (last_arg_err != types.no_type) last_arg_err else sigs[sigs.len - 1];
     const inst_last = try c.instantiateSigForCall(report_sig, explicit_targs, arg_nodes, node, ret_ctx);
-    try c.checkCallArguments(node, inst_last, arg_nodes, true);
+    var arg_anchor: ?Span = null;
+    try c.checkCallArgumentsAnchored(node, inst_last, arg_nodes, true, &arg_anchor);
     if (arg_err_count == 1) {
         // Keep the candidate's own diagnostics; tsc files no TS2769 here.
         const inst_one = try c.instantiateSigForCall(sigs[0], explicit_targs, arg_nodes, node, ret_ctx);
@@ -819,8 +820,26 @@ pub fn resolveSignatureCall(
         }
         return if (instance_ret != types.no_type) instance_ret else c.ts.fnReturn(inst_one);
     }
+    // WHICH diagnostic marks the spot. tsc's `reportCallResolutionErrors`
+    // re-runs `getSignatureApplicabilityError` on the last candidate, and that
+    // function's error node is the ARGUMENT it stopped at (moved onto an inner
+    // property/element only by `elaborateError`). Everything else the re-check
+    // says is incidental: `checkCallArguments` type-checks each argument
+    // expression before relating it, and an argument that is itself a failing
+    // call — `router.post("x", validate(Schema), handler)`, outline's shape —
+    // files its OWN diagnostic first, deeper inside. Taking the first
+    // diagnostic in source range therefore anchored the TS2769 on the inner
+    // call's argument (`Schema`, col 12) where tsc anchors it on the outer
+    // call's argument (`validate(…)`, col 3) — 167 of outline's TS2769/TS2345
+    // keys were the right diagnostic at the wrong column, counted twice:
+    // once as excess here, once as under-report there. So ask the argument
+    // walk directly where it blamed, and keep the "first diagnostic in range"
+    // scan only as the fallback for a candidate whose failure is not an
+    // argument relation at all.
     var anchor = c.nodeSpan(c.callShape(node).callee);
-    for (c.diags.items[saved..]) |d| {
+    if (arg_anchor) |a| {
+        anchor = a;
+    } else for (c.diags.items[saved..]) |d| {
         if (d.file != c.cur_file) continue;
         if (d.span.start < call_span.start or d.span.start >= call_span.end) continue;
         anchor = d.span;
@@ -4834,6 +4853,19 @@ pub fn argumentsMatch(c: *Checker, sig: TypeId, arg_nodes: []const Node) Error!b
 }
 
 pub fn checkCallArguments(c: *Checker, node: Node, sig: TypeId, arg_nodes: []const Node, report: bool) Error!void {
+    return checkCallArgumentsAnchored(c, node, sig, arg_nodes, report, null);
+}
+
+/// `checkCallArguments`, reporting back WHERE it blamed the arguments.
+///
+/// `anchor_out`, when given, receives the span of the first diagnostic this
+/// walk files *about an argument* — the argument's own span, or the inner
+/// property/element span an elaboration moved it to. It stays null when the
+/// arguments are fine (or when the only complaint is arity, which is not a
+/// per-argument blame). Overload-failure reporting needs exactly that span
+/// for its TS2769 and cannot recover it from the diagnostic list, which also
+/// holds whatever the argument expressions said about themselves.
+pub fn checkCallArgumentsAnchored(c: *Checker, node: Node, sig: TypeId, arg_nodes: []const Node, report: bool, anchor_out: ?*?Span) Error!void {
     // Owned-file guard (see `checkJsxElement`). `void` result, and the
     // call's *type* is settled before this runs: `resolveSignatureCall`
     // returns `fnReturn(inst)`, where `inst` comes from
@@ -4939,11 +4971,13 @@ pub fn checkCallArguments(c: *Checker, node: Node, sig: TypeId, arg_nodes: []con
         }
         if (report and !try c.isAssignable(at, pt)) {
             if (reported_arg) continue;
+            const before = c.diags.items.len;
             if (!try c.elaborateCallbackError(an, at, pt) and
                 !try c.elaborateLiteralError(an, at, pt))
             {
-                try c.reportNotAssignable(2345, at, pt, c.nodeSpan(an));
+                try c.reportNotAssignable(2345, at, pt, argErrorSpan(c, an));
             }
+            noteArgBlame(c, anchor_out, before, c.nodeSpan(an), argErrorSpan(c, an));
             reported_arg = true;
         } else if (report and !reported_arg) {
             // The excess-property check is part of the same walk tsc stops
@@ -4952,12 +4986,13 @@ pub fn checkCallArguments(c: *Checker, node: Node, sig: TypeId, arg_nodes: []con
             const before = c.diags.items.len;
             try c.excessPropertyCheck(an, at, pt);
             if (c.diags.items.len == before and
-                try c.freshLiteralUnionMismatch(an, at, pt, 2345, c.nodeSpan(an)))
+                try c.freshLiteralUnionMismatch(an, at, pt, 2345, argErrorSpan(c, an)))
             {
                 reported_arg = true;
             } else if (c.diags.items.len != before) {
                 reported_arg = true;
             }
+            if (reported_arg) noteArgBlame(c, anchor_out, before, c.nodeSpan(an), argErrorSpan(c, an));
         }
     }
     if (report and !reported_arg and rest_union != null) {
@@ -4966,8 +5001,106 @@ pub fn checkCallArguments(c: *Checker, node: Node, sig: TypeId, arg_nodes: []con
         if (!try c.isAssignable(packed_ty, rest_ty)) {
             // tsc's error node: the single rest argument, or the range from
             // the first to the last of them; with none at all, the call.
-            const span = if (packed_first != null_node) c.nodeSpan(packed_first) else c.nodeSpan(node);
+            const span = if (packed_first != null_node) argErrorSpan(c, packed_first) else c.nodeSpan(node);
+            const before = c.diags.items.len;
             try c.reportNotAssignable(2345, packed_ty, rest_ty, span);
+            noteArgBlame(c, anchor_out, before, span, span);
         }
     }
+}
+
+/// Record where an argument report landed, for `resolveSignatureCall`'s TS2769.
+///
+/// The span taken is the first diagnostic the report just filed that lies
+/// INSIDE the argument — `elaborateLiteralError` and the excess-property check
+/// legitimately move the blame onto a property of an object-literal argument,
+/// exactly as tsc's `elaborateError` does, and that inner node is then also
+/// tsc's TS2769 anchor. A diagnostic filed outside `arg_span` is something the
+/// report merely triggered; `fallback` (the argument's own error span) stands in
+/// for it, as it does when the report was swallowed as a duplicate of one
+/// already filed.
+fn noteArgBlame(c: *Checker, anchor_out: ?*?Span, before: usize, arg_span: Span, fallback: Span) void {
+    const out = anchor_out orelse return;
+    if (out.* != null) return;
+    for (c.diags.items[before..]) |d| {
+        if (d.file != c.cur_file) continue;
+        if (d.span.start < arg_span.start or d.span.start >= arg_span.end) continue;
+        out.* = d.span;
+        return;
+    }
+    out.* = fallback;
+}
+
+/// tsc's `getErrorSpanForNode` for an argument expression.
+///
+/// ztsc's `nodeSpan` is the span of a node's whole token subtree, which is what
+/// tsc's `node.pos`/`node.end` give for most expressions — but not for the two
+/// FUNCTION forms, and a function is what a callback argument usually is:
+///
+///   * a FUNCTION EXPRESSION errors on its NAME (`errorNode = node.name`), so
+///     `React.forwardRef(function Layout_(props, ref) {…})` blames `Layout_`,
+///     not the `function` keyword nine columns to its left. Anonymous ones fall
+///     back to the first token, which is what the subtree span already gives.
+///   * an ARROW FUNCTION errors from `skipTrivia(node.pos)`
+///     (`getErrorSpanForArrowFunction`) — the leftmost token of the whole arrow,
+///     including the `async` modifier and the parameter list's `(`. Neither is a
+///     token of any child node, so the subtree span starts at the first
+///     PARAMETER instead: `useEventListener("keydown", (event: KeyboardEvent)
+///     => {…})` blamed `event`, one column right of tsc's `(`, and
+///     `router.post("x", async (ctx) => {…})` blamed `ctx`, seven right of
+///     tsc's `async`.
+///
+/// The arrow's opening tokens are recovered from the source text rather than the
+/// token array (the AST records only the `=>`); an intervening comment stops the
+/// walk, leaving the span where it already was.
+fn argErrorSpan(c: *Checker, n: Node) Span {
+    const span = c.nodeSpan(n);
+    switch (c.nodeTag(n)) {
+        .function_expr => {
+            const name_tok = c.tree.extraData(ast.FnProto, c.tree.nodeData(n).lhs).name_token;
+            if (name_tok == 0) return span;
+            return .{
+                .start = c.tree.tokens.start(name_tok),
+                .end = c.tree.tokens.end(c.src, name_tok),
+            };
+        },
+        .arrow_fn => {
+            var start = span.start;
+            // `(params)` — the parameter list's own parens. With no parameters
+            // the subtree starts at the `=>`, so the empty pair `()` is
+            // stepped over as a unit.
+            var i = skipTriviaBack(c.src, start);
+            if (i > 0 and c.src[i - 1] == ')') {
+                const j = skipTriviaBack(c.src, i - 1);
+                if (j > 0 and c.src[j - 1] == '(') i = j;
+            }
+            if (i > 0 and c.src[i - 1] == '(') {
+                start = i - 1;
+                i = skipTriviaBack(c.src, start);
+            }
+            // `async` — a modifier, part of the arrow's `pos` in tsc.
+            if (i >= 5 and std.mem.eql(u8, c.src[i - 5 .. i], "async") and
+                (i == 5 or !isIdentByte(c.src[i - 6])))
+            {
+                start = i - 5;
+            }
+            return .{ .start = start, .end = span.end };
+        },
+        else => return span,
+    }
+}
+
+/// The offset of the first non-whitespace byte at or before `at`, exclusive of
+/// `at` itself. Comments are NOT skipped: a `//` run cannot be recognized
+/// scanning backwards, and stopping at one only leaves the span unmoved.
+fn skipTriviaBack(src: []const u8, at: u32) u32 {
+    var i = at;
+    while (i > 0 and (src[i - 1] == ' ' or src[i - 1] == '\t' or
+        src[i - 1] == '\n' or src[i - 1] == '\r')) : (i -= 1)
+    {}
+    return i;
+}
+
+fn isIdentByte(ch: u8) bool {
+    return ch == '_' or ch == '$' or std.ascii.isAlphanumeric(ch);
 }
