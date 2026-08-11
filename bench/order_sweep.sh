@@ -139,7 +139,9 @@ keys() {
 # `--file-order=source` and `__@u842254` under `reverse` for the same property,
 # with the keys identical and every gate silent.
 lines() {
-    sed -E "s|$CHECKOUT/||g" "$1" | grep ': error TS' | sort
+    # `|| true`: a fully-clean app (social-app since wave 5) matches nothing,
+    # and under pipefail an empty grep would kill the sweep as a failure.
+    sed -E "s|$CHECKOUT/||g" "$1" | { grep ': error TS' || true; } | sort
 }
 
 # A filename-safe tag for an order spelling (`shuffle=2` -> `shuffle_2`).
