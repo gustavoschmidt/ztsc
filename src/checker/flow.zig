@@ -2707,7 +2707,39 @@ pub fn typeofMatches(c: *Checker, t: TypeId, which: usize) bool {
     };
 }
 
-pub fn narrowByDiscriminant(c: *Checker, t: TypeId, prop: Atom, value: TypeId, sense: bool, decl: TypeId) Error!TypeId {
+/// The UNION facet of `t`, seeing through a deferred type-alias reference.
+///
+/// tsc's unions are always flattened by the time narrowing sees them:
+/// `getDeclaredTypeOfTypeAlias` hands `getDiscriminantPropertyAccess` a real
+/// union object, and a RECURSIVE alias is no different — the recursion is
+/// carried by deferred member resolution, not by a different type shape.
+/// ztsc defers such an alias as a `.ref` instead, because that laziness is
+/// what terminates
+///
+///     type R = { type: 'a'; view: string } | { type: 'w'; media: R }
+///
+/// at all. The cost was that every union-shaped narrowing test — "is this a
+/// discriminated union?", "which constituents survive?" — asked its question
+/// of the reference, got "not a union", and declined to narrow: `r.media`
+/// stayed `R` after `r.media.type === 'a'`, so reading `r.media.view`
+/// reported TS2339, and social-app's `MediaPreview` kept the whole recursive
+/// `Embed` constituent inside `e.media.view` and reported TS2322 against
+/// `PostView['embed']`. Non-recursive aliases were unaffected, which is why
+/// the shape needed a self-referential union to show at all.
+///
+/// Resolving here is one level and non-recursive: the members it yields may
+/// themselves be references, which stay lazy exactly as before. It is used
+/// for the DECISION only — every caller returns the original `t` when nothing
+/// was filtered, so a narrowing that is a no-op still reports as the alias.
+fn unionFacet(c: *Checker, t: TypeId) Error!TypeId {
+    if (c.ts.kind(t) != .ref) return t;
+    const r = try c.resolveStructural(t);
+    return if (c.ts.kind(r) == .union_type) r else t;
+}
+
+pub fn narrowByDiscriminant(c: *Checker, t0: TypeId, prop: Atom, value: TypeId, sense: bool, decl0: TypeId) Error!TypeId {
+    const t = try unionFacet(c, t0);
+    const decl = try unionFacet(c, decl0);
     var parts: std.ArrayList(TypeId) = .empty;
     defer parts.deinit(c.scratch());
     // Also filter a single (non-union) member: once a discriminated union
@@ -2793,11 +2825,17 @@ pub fn narrowByDiscriminant(c: *Checker, t: TypeId, prop: Atom, value: TypeId, s
         };
         if (kept) try parts.append(c.scratch(), m);
     }
+    // Nothing filtered: hand back the type the caller passed in, not the
+    // resolved facet, so a no-op narrowing never expands a deferred alias
+    // (`unionFacet`).
+    if (parts.items.len == members.len) return t0;
     return c.ts.makeUnion(c.scratch(), parts.items);
 }
 
-pub fn narrowByPropTruthiness(c: *Checker, t: TypeId, prop: Atom, sense: bool, decl: TypeId) Error!TypeId {
-    if (c.ts.kind(t) != .union_type) return t;
+pub fn narrowByPropTruthiness(c: *Checker, t0: TypeId, prop: Atom, sense: bool, decl0: TypeId) Error!TypeId {
+    const t = try unionFacet(c, t0);
+    const decl = try unionFacet(c, decl0);
+    if (c.ts.kind(t) != .union_type) return t0;
     // tsc's `narrowTypeByTruthiness` reaches the per-member filter only
     // through `getDiscriminantPropertyAccess`, which requires `prop` to be a
     // DISCRIMINANT of the union (`isDiscriminantProperty`). Without that gate
@@ -2806,10 +2844,11 @@ pub fn narrowByPropTruthiness(c: *Checker, t: TypeId, prop: Atom, sense: bool, d
     // the falsy branch and left `never`, so the `||`'s right operand reported
     // TS2339 on the same reference. tsc leaves the union untouched there.
     if (!try c.isDiscriminantProp(if (c.ts.kind(decl) == .union_type) decl else t, prop))
-        return t;
+        return t0;
     var parts: std.ArrayList(TypeId) = .empty;
     defer parts.deinit(c.scratch());
-    for (try c.memberList(t)) |m| {
+    const truth_members = try c.memberList(t);
+    for (truth_members) |m| {
         const rm = try c.resolveStructural(m);
         var keep = true;
         if (try c.propOfType(rm, prop)) |p| {
@@ -2824,6 +2863,7 @@ pub fn narrowByPropTruthiness(c: *Checker, t: TypeId, prop: Atom, sense: bool, d
         }
         if (keep) try parts.append(c.scratch(), m);
     }
+    if (parts.items.len == truth_members.len) return t0;
     return c.ts.makeUnion(c.scratch(), parts.items);
 }
 
@@ -3652,7 +3692,12 @@ pub fn narrowBySwitchClause(c: *Checker, t: TypeId, clause: Node, key: RefKey, d
 /// that is not a unit value, a member without the discriminant property, a
 /// non-literal discriminant — so the caller falls back to the per-member
 /// subtraction, which is sound but coarser.
-pub fn switchDefaultCovered(c: *Checker, sw: Node, t: TypeId, prop: Atom, decl: TypeId) Error!bool {
+pub fn switchDefaultCovered(c: *Checker, sw: Node, t0: TypeId, prop: Atom, decl0: TypeId) Error!bool {
+    // Same deferred-alias unwrap the equality path needs (`unionFacet`):
+    // `switch (r.media.type)` on a recursive alias must see the union it
+    // stands for, or exhaustiveness is judged over a one-member list.
+    const t = try unionFacet(c, t0);
+    const decl = try unionFacet(c, decl0);
     // Discriminant-based exhaustiveness needs an actual discriminated union,
     // for the same reason `narrowByDiscriminant` does — tsc reaches
     // `narrowTypeBySwitchOnDiscriminantProperty` only through
