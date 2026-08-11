@@ -1267,6 +1267,15 @@ pub fn containsTypeParamInner(c: *Checker, t: TypeId) Error!bool {
                 const pr = s.fnPredicate(t);
                 if (pr.ty != types.no_type and try c.containsTypeParam(pr.ty)) return true;
             }
+            // And so can the `this` type: `static springify<T extends typeof
+            // C>(this: T, ms?: number): C` names `T` nowhere else.
+            // `instantiateId`'s `.function` arm substitutes the `this` type,
+            // so this predicate — the early-out that decides whether that arm
+            // runs at all — has to see it, or the signature is judged
+            // concrete and `this` stays the bare type parameter. The receiver
+            // check then compares `typeof ZoomIn` against an uninstantiated
+            // `T` (TS2684) even though inference had a candidate for it.
+            if (s.fnThisType(t) != 0 and try c.containsTypeParam(s.fnThisType(t))) return true;
             return false;
         },
         .ref => {
@@ -1544,6 +1553,9 @@ pub fn containsFreeTypeParam(c: *Checker, t: TypeId, bound: []const u32) Error!b
                 const pr = s.fnPredicate(t);
                 if (pr.ty != types.no_type and try c.containsFreeTypeParam(pr.ty, inner)) return true;
             }
+            // Same slot `containsTypeParamInner` reads: a signature can name a
+            // type param in its `this` type and nowhere else.
+            if (s.fnThisType(t) != 0 and try c.containsFreeTypeParam(s.fnThisType(t), inner)) return true;
             return false;
         },
         .ref => {
