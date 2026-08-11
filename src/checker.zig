@@ -1571,6 +1571,21 @@ pub const Checker = struct {
     /// function body. A *static* field initializer does run at definition time
     /// and is deliberately not counted here. Read by `checkTdz`.
     instance_field_init_depth: u32 = 0,
+    /// Re-entrancy guard for the syntactic key walk (`declaredKeyUnion`).
+    /// Resolving a heritage clause's type ARGUMENTS is an ordinary type-node
+    /// conversion, and one of them can be a `keyof` of the very class being
+    /// walked (`class A extends B<keyof A>`), which would come straight back
+    /// here. The second entry declines and the caller keeps its old answer.
+    declared_keys_active: bool = false,
+    /// Live depth of `materializeMapped`. tsc resolves a mapped type's
+    /// properties LAZILY — `getTypeOfSymbol` on a mapped member runs when the
+    /// member is read, never while the map is created — so a circle that
+    /// closes only because ztsc materializes the map eagerly is not tsc's
+    /// circle. Read by `lazyRefProp`, which declines a member whose own type
+    /// an outer frame is already computing rather than closing (and naming)
+    /// that circle. Same argument as `lazy_index_objs`, for the demand tsc
+    /// never issues at all.
+    mapped_value_depth: u32 = 0,
     inst_depth: u32 = 0,
     /// Live recursion depth of alias-instance expansion (`aliasInstance`).
     /// `alias_state` already breaks *direct* self-recursion with a lazy ref, but
@@ -3721,6 +3736,8 @@ pub const Checker = struct {
     pub const classGenericInProgress = instantiate_zig.classGenericInProgress;
     pub const classTableProvisional = instantiate_zig.classTableProvisional;
     pub const baseRefProvisional = instantiate_zig.baseRefProvisional;
+    pub const keyofInProgressRef = instantiate_zig.keyofInProgressRef;
+    pub const declaredKeyUnion = instantiate_zig.declaredKeyUnion;
     pub const lazyRefProp = instantiate_zig.lazyRefProp;
     pub const lazyThisProp = instantiate_zig.lazyThisProp;
     pub const ctorClassOwnsMember = instantiate_zig.ctorClassOwnsMember;

@@ -2044,6 +2044,13 @@ pub fn keyofType(c: *Checker, t: TypeId) Error!TypeId {
     // expanded that interface's whole table per argument list only to read the
     // names back out of it.
     if (try c.lazyShapeOf(t)) |generic| return keyofObjectTable(c, generic);
+    // The member table is being built further down this stack — a member
+    // whose type is inferred ran an expression check that came back here —
+    // so nothing can read it and `resolveStructural` below would take
+    // `expandRef`'s cycle cut. Member NAMES are a function of the
+    // declarations, and reading them there is what makes this answer
+    // independent of who asked first. See `keyofInProgressRef`.
+    if (try c.keyofInProgressRef(t)) |k| return k;
     const r = try c.resolveStructural(t);
     switch (c.ts.kind(r)) {
         .err => {

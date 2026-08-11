@@ -2584,6 +2584,11 @@ pub fn isPrimitiveForHomomorphicMap(k: types.Kind) bool {
 /// maps iterate the src_type's own members (preserving modifiers and
 /// array/tuple-ness); others iterate the constraint's literal members.
 pub fn materializeMapped(c: *Checker, key_param: TypeId, constraint: TypeId, value: TypeId, as_clause: TypeId, src_type: TypeId, flags: u32) Error!TypeId {
+    // tsc builds a mapped type's members lazily; ztsc builds them here. See
+    // `Checker.mapped_value_depth` for the one thing that depends on the
+    // difference.
+    c.mapped_value_depth += 1;
+    defer c.mapped_value_depth -= 1;
     const s = &c.ts;
     const key_id = s.mappedParamId(key_param);
     const homomorphic = flags & types.mapped_flag_homomorphic != 0;
