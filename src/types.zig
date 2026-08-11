@@ -290,6 +290,35 @@ pub const obj_flag_symbol_index: u32 = 16;
 /// `getWidenedTypeOfObjectLiteral` builds a fresh anonymous type and keeps
 /// neither bit.
 pub const obj_flag_literal_origin: u32 = 32;
+/// The shape came from an interface (or class) whose `extends` heritage
+/// resolved to `any` — `interface DefaultState extends DefaultStateExtends {}`
+/// with `type DefaultStateExtends = any`, which is how `@types/koa` declares
+/// its user-augmentable state — AND which declares nothing of its own.
+///
+/// tsc handles that shape in two places, and both are observable:
+///
+///  1. `resolveObjectTypeMembers` contributes `[x: string]: any` for an `any`
+///     base instead of the base's index infos (its `anyBaseTypeIndexInfo`), so
+///     every property read succeeds with `any` and `keyof` is `string | number`.
+///     That part is just the string-index slot; it applies even when the
+///     interface declares members of its own.
+///  2. `getNormalizedType` — via `getSingleBaseForNonAugmentingSubtype` — swaps
+///     a NON-GENERIC class/interface reference with exactly one base type and no
+///     own members for that base type before the relation runs. With the base
+///     being `any`, the interface therefore *relates* as `any`: it is assignable
+///     to every object target (verified against the oracle: to `Date`, to
+///     `[number, string]`, to a class with a `private` member, to `{ auth:
+///     never }`, and to `Function`, which is what makes calling it legal),
+///     while a plain `{ [x: string]: any }` is assignable to none of those.
+///     It is NOT assignable to a primitive target — `isRelatedTo` answers the
+///     object→primitive pair from the *un*-normalized source, so `const n:
+///     number = state` stays TS2322.
+///
+/// This flag records (2); (1) is the string-index slot on the same object. Only
+/// the `!allow_index` (relation) arm of `propOfTypeEx` reads it — answering
+/// `any` for every name is exactly what makes the source satisfy an arbitrary
+/// target property list, which is the whole of what normalizing to `any` buys.
+pub const obj_flag_any_base: u32 = 64;
 pub const prop_flag_optional: u32 = 1;
 pub const prop_flag_readonly: u32 = 2;
 /// A `private`/`protected` class member (tsc's `ModifierFlags.NonPublic`).
@@ -645,6 +674,12 @@ pub const Store = struct {
     /// (marked `obj_flag_not_inferable`) do not.
     pub fn objectHasImpliedIndex(s: *const Store, id: TypeId) bool {
         return s.kind(id) == .object and s.objectFlags(id) & obj_flag_not_inferable == 0;
+    }
+    /// An interface shape whose only base is `any` and which declares nothing
+    /// of its own, so the relation treats it as `any` would be — see
+    /// `obj_flag_any_base`.
+    pub fn objectRelatesAsAny(s: *const Store, id: TypeId) bool {
+        return s.kind(id) == .object and s.objectFlags(id) & obj_flag_any_base != 0;
     }
     pub fn objectStringIndex(s: *const Store, id: TypeId) TypeId {
         if (id < s.base_len) return s.base.?.objectStringIndex(id);

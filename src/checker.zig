@@ -3691,7 +3691,10 @@ pub const Checker = struct {
     pub const mergeBaseResolved = instantiate_zig.mergeBaseResolved;
     pub const arrayInterfaceObject = instantiate_zig.arrayInterfaceObject;
     pub const unionCallableSigs = instantiate_zig.unionCallableSigs;
-    pub const mergeBaseObject = instantiate_zig.mergeBaseObject;
+    /// `typenode`'s wrapper, not `instantiate`'s: it adds the `any`-base
+    /// heritage case (`types.obj_flag_any_base`) that `instantiate`'s
+    /// object-only guard drops, and delegates every other pair to it verbatim.
+    pub const mergeBaseObject = typenode_zig.mergeBaseObject;
     pub const carryKeyNameTypes = instantiate_zig.carryKeyNameTypes;
 
     /// The one write path for `key_name_types`. Bumps `key_name_gen` on a
