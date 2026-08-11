@@ -388,8 +388,21 @@ fn runDirCase(
     // `buildProgram` runs, not just the checker; gen_expected.js forwards the
     // same flag to the oracle.
     const experimental_decorators = try dirCaseBoolOption(alloc, io, conf_dir, case_rel, "experimentalDecorators");
+    // `resolvePackageJsonExports`/`resolvePackageJsonImports` default ON (the
+    // bundler value the whole suite runs under), so these are `orelse true` and
+    // NOT dirCaseBoolOption — a case turns one off explicitly and
+    // gen_expected.js forwards the same `--resolvePackageJson*=false` to the
+    // oracle. With exports off, a dependency's `exports` map is ignored and the
+    // legacy `"types"`/`"main"`/index path resolves instead.
+    const resolve_pkg_json_exports = (try dirCaseOptBool(alloc, io, conf_dir, case_rel, "resolvePackageJsonExports")) orelse true;
+    const resolve_pkg_json_imports = (try dirCaseOptBool(alloc, io, conf_dir, case_rel, "resolvePackageJsonImports")) orelse true;
     const jsx_runtime_module = try dirCaseJsxRuntimeModule(alloc, io, conf_dir, case_rel);
-    var br = try modules.buildProgram(alloc, io, gpa, interner, conf_dir, &.{entry}, lib_set, .{ .resolve_json = resolve_json, .allow_js = allow_js }, .{
+    var br = try modules.buildProgram(alloc, io, gpa, interner, conf_dir, &.{entry}, lib_set, .{
+        .resolve_json = resolve_json,
+        .allow_js = allow_js,
+        .resolve_pkg_json_exports = resolve_pkg_json_exports,
+        .resolve_pkg_json_imports = resolve_pkg_json_imports,
+    }, .{
         .allow_synthetic_default = allow_synthetic_default,
         .no_implicit_any = no_implicit_any,
         .no_unchecked_side_effect_imports = no_unchecked_side_effect_imports,

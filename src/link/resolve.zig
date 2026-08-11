@@ -27,7 +27,12 @@
 //!   TS2307, may miss a real one). When `exports` is absent the legacy path is
 //!   byte-for-byte unchanged. `package.json` is parsed with the shared JSONC
 //!   parser (`tsconfig.parseJsonc`); the `"types"`/`"typings"` legacy fields
-//!   still use the minimal string scanner.
+//!   still use the minimal string scanner. `typesVersions` — the pre-`exports`
+//!   redirection layer — is honored on the legacy path, for the version range
+//!   spellings `*` and `>=X[.Y]` (see `typesVersionsPaths`). tsconfig
+//!   `resolvePackageJsonExports: false` switches the whole map off
+//!   (`ResolveOpts.resolve_pkg_json_exports`), leaving only that legacy path —
+//!   see the option's doc comment.
 //! - Triple-slash `/// <reference path=… />` / `types=…` directives are the
 //!   second way a file enters the module graph; they are scanned out of a
 //!   file's leading comment block (`scanReferences`) and resolved here too.
@@ -163,8 +168,14 @@ pub fn resolveTypesPackageMain(io: Io, alloc: Allocator, dir: Io.Dir, pkg_dir: [
 /// `node_modules/vitest/globals.d.ts` through the package's `exports` map (or
 /// its `"types"` field / `index.d.ts` for a bare name). Declarations only: a
 /// type directive never falls back to a JS `main`.
-pub fn resolveTypeDirective(io: Io, alloc: Allocator, dir: Io.Dir, from_dir: []const u8, name: []const u8) Error!?[]u8 {
-    return resolvePackage(io, alloc, dir, from_dir, name, false, null);
+///
+/// `use_exports` is the caller's `resolvePackageJsonExports` (see
+/// `ResolveOpts.resolve_pkg_json_exports`): a type directive is resolved by the
+/// same node walk as an import, so the option gates its `exports` map too. The
+/// caller passes it explicitly because this entry point runs during config load,
+/// before any `ResolveCache` exists.
+pub fn resolveTypeDirective(io: Io, alloc: Allocator, dir: Io.Dir, from_dir: []const u8, name: []const u8, use_exports: bool) Error!?[]u8 {
+    return resolvePackage(io, alloc, dir, from_dir, name, false, use_exports, null);
 }
 
 /// Stat a `*.json` stem (already `dir`-relative, ending in `.json`) as a
@@ -318,7 +329,7 @@ pub const ResolveCache = struct {
         ref: RefDirective,
     ) Error!?[]const u8 {
         const fs: ?*FsCache = if (rc.enabled) &rc.fs else null;
-        const resolved = (try resolveReference(io, scratch, dir, importer, ref, fs)) orelse return null;
+        const resolved = (try resolveReference(io, scratch, dir, importer, ref, rc.opts, fs)) orelse return null;
         return try rc.canonicalize(io, scratch, dir, resolved);
     }
 
@@ -464,6 +475,10 @@ pub const FsCache = struct {
     /// `package.json` path → its `exports` value, or null when the file has no
     /// `exports` key (or does not parse — the uncached leg ignores it too).
     pkg_exports: std.StringHashMapUnmanaged(?tsconfig.Value) = .empty,
+    /// `package.json` path → the `typesVersions` mapping object that applies to
+    /// this compiler version, or null (no key, no matching version range, or a
+    /// shape that is not an object). Same memo discipline as `pkg_exports`.
+    pkg_typesver: std.StringHashMapUnmanaged(?tsconfig.Value.Object) = .empty,
     /// Arena bytes the memos own (keys + values), for the `--timing` line.
     bytes: usize = 0,
     /// `stat_files` scoreboard: calls, and calls answered from memory.
@@ -544,6 +559,20 @@ pub const FsCache = struct {
         return val;
     }
 
+    /// The applicable `typesVersions` mapping of the `package.json` at `path`
+    /// (memoized exactly like `packageExports`; see `typesVersionsPaths`).
+    fn packageTypesVersions(fc: *FsCache, path: []const u8, text: []const u8) Error!?tsconfig.Value.Object {
+        if (fc.pkg_typesver.get(path)) |v| return v;
+        const val = typesVersionsPaths(fc.arena, text);
+        const key = fc.pkg_json.getKey(path) orelse key: {
+            const k = try fc.arena.dupe(u8, path);
+            fc.bytes += k.len;
+            break :key k;
+        };
+        try fc.pkg_typesver.put(fc.arena, key, val);
+        return val;
+    }
+
     /// Realpath of directory `d` (cache-arena owned), or null when the OS call
     /// failed. One syscall per distinct directory for the whole run.
     fn realDir(fc: *FsCache, io: Io, dir: Io.Dir, d: []const u8) Error!?[]const u8 {
@@ -610,6 +639,103 @@ fn exportsOf(alloc: Allocator, text: []const u8) ?tsconfig.Value {
     };
 }
 
+/// The TypeScript version ztsc answers `typesVersions` range keys as. It is the
+/// version of the vendored lib and of the pinned oracle (tsgo 7.0.2), so a
+/// package that ships a version-gated declaration set hands ztsc the same set it
+/// hands the oracle.
+const ts_version_major = 7;
+const ts_version_minor = 0;
+
+/// The `typesVersions` mapping (a `paths`-shaped object) that applies to this
+/// compiler, or null when the `package.json` has no `typesVersions`, no version
+/// key matches, or the shape is wrong.
+///
+/// `typesVersions` is the pre-`exports` way to ship a version-gated declaration
+/// layout: `{ ">=4.0": { "*": ["dist/types/*"] } }`. tsc takes the FIRST version
+/// key whose range matches and treats its value as a `paths` table rooted at the
+/// package directory. Only the two range spellings real packages use are
+/// understood — `*` and `>=<major>[.<minor>]` — and an unrecognized range simply
+/// does not match, which is the safe direction: an unmapped package resolves
+/// exactly as it did before `typesVersions` existed.
+fn typesVersionsPaths(alloc: Allocator, text: []const u8) ?tsconfig.Value.Object {
+    // Same backslash-free literal-key test as `exportsOf`: no parse for the
+    // overwhelming majority of packages, which ship no `typesVersions` at all.
+    if (std.mem.indexOfScalar(u8, text, '\\') == null and
+        std.mem.indexOf(u8, text, "\"typesVersions\"") == null) return null;
+    const root = tsconfig.parseJsonc(alloc, text) catch return null;
+    if (root != .object) return null;
+    const tv = root.object.get("typesVersions") orelse return null;
+    if (tv != .object) return null;
+    for (tv.object.keys, tv.object.vals) |range, map| {
+        if (map != .object) continue;
+        if (versionRangeMatches(range)) return map.object;
+    }
+    return null;
+}
+
+/// Does a `typesVersions` range key cover this compiler? `*` always does;
+/// `>=X[.Y]` does when the compiler version is at least that. Anything else
+/// (`<4.0`, a full semver range with operators) does not match — see
+/// `typesVersionsPaths` for why that is the safe answer.
+fn versionRangeMatches(range: []const u8) bool {
+    const r = std.mem.trim(u8, range, " ");
+    if (std.mem.eql(u8, r, "*")) return true;
+    if (!std.mem.startsWith(u8, r, ">=")) return false;
+    var it = std.mem.splitScalar(u8, std.mem.trim(u8, r[2..], " "), '.');
+    const major = std.fmt.parseInt(u32, it.first(), 10) catch return false;
+    const minor: u32 = if (it.next()) |m| (std.fmt.parseInt(u32, m, 10) catch 0) else 0;
+    if (ts_version_major != major) return ts_version_major > major;
+    return ts_version_minor >= minor;
+}
+
+/// Map `sub` (a package-relative module name — `"server/mcp.js"`, or the
+/// package's own entry file name for a root import) through a `typesVersions`
+/// table. Same rule as tsconfig `paths`: an exact key wins, else the `*` pattern
+/// with the longest matched prefix; the capture is substituted into each target.
+/// Returns the targets in order (package-relative, `alloc`-owned), or an empty
+/// slice when no key matches.
+fn mapTypesVersions(alloc: Allocator, obj: tsconfig.Value.Object, sub: []const u8) Error![]const []const u8 {
+    var exact: ?usize = null;
+    var best: ?usize = null;
+    var best_prefix: usize = 0;
+    for (obj.keys, 0..) |key, i| {
+        if (std.mem.indexOfScalar(u8, key, '*')) |star| {
+            const prefix = key[0..star];
+            const suffix = key[star + 1 ..];
+            if (sub.len >= prefix.len + suffix.len and
+                std.mem.startsWith(u8, sub, prefix) and
+                std.mem.endsWith(u8, sub, suffix))
+            {
+                if (best == null or prefix.len > best_prefix) {
+                    best = i;
+                    best_prefix = prefix.len;
+                }
+            }
+        } else if (std.mem.eql(u8, key, sub)) {
+            exact = i;
+        }
+    }
+    const idx = exact orelse (best orelse return &.{});
+    const key = obj.keys[idx];
+    if (obj.vals[idx] != .array) return &.{};
+    var out: std.ArrayList([]const u8) = .empty;
+    for (obj.vals[idx].array) |t| {
+        if (t != .string) continue;
+        var target: []const u8 = t.string;
+        if (exact == null) {
+            const star = std.mem.indexOfScalar(u8, key, '*').?;
+            const captured = sub[star .. sub.len - (key.len - star - 1)];
+            if (std.mem.indexOfScalar(u8, t.string, '*')) |vstar| {
+                target = try std.fmt.allocPrint(alloc, "{s}{s}{s}", .{
+                    t.string[0..vstar], captured, t.string[vstar + 1 ..],
+                });
+            }
+        }
+        try out.append(alloc, target);
+    }
+    return out.toOwnedSlice(alloc);
+}
+
 /// Per-run resolution options that are not a pure function of (dir, spec):
 /// `resolveJsonModule` and the `baseUrl` bare-specifier anchor. Carried on the
 /// `ResolveCache` (set once at init) so `resolveSpecifier`'s determinism
@@ -618,6 +744,9 @@ fn exportsOf(alloc: Allocator, text: []const u8) ?tsconfig.Value {
 pub const ResolveOpts = struct {
     /// tsconfig `resolveJsonModule`: a `*.json` specifier that names an existing
     /// file resolves to it (typed opaquely as `any`; see `json_module_source`).
+    /// Relative, `baseUrl`-anchored, and `node_modules` forms all resolve — a
+    /// package's data files are ordinary files at ordinary paths
+    /// (`resolveJsonPackage`).
     resolve_json: bool = false,
     /// tsconfig `baseUrl`, already resolved to a `dir`-relative directory, or
     /// null. A bare (non-relative) specifier probes `baseUrl/<spec>` — for both
@@ -639,6 +768,37 @@ pub const ResolveOpts = struct {
     /// package whose map names only JavaScript is untyped with `allowJs` on or
     /// off, and tsc reports TS7016 either way (`resolvePackage` phase 2).
     allow_js: bool = false,
+    /// tsconfig `resolvePackageJsonExports`. When false, a `package.json`
+    /// `"exports"` map is ignored ENTIRELY — the map neither resolves a
+    /// specifier nor hides the legacy fields, so every bare specifier and
+    /// subpath takes the pre-`exports` path (`"types"`/`"typings"`, the
+    /// declaration twin of `"main"`, `index.*`, a subpath's own directory
+    /// `package.json`) and an unmatched subpath is no longer blocked.
+    ///
+    /// The default is `true` and stays true regardless of `moduleResolution`:
+    /// tsc derives it (on for node16/nodenext/bundler, never used under node10),
+    /// while ztsc always runs the bundler algorithm and accepts-and-ignores
+    /// `moduleResolution`, so the bundler default is the only one it can have.
+    /// Only an explicit `false` in a tsconfig changes any resolution.
+    ///
+    /// This is not a niche switch: a package that publishes an `exports` map
+    /// with no `types` condition hides its own top-level `"types"` key, and a
+    /// project that hits enough of those turns the option off wholesale rather
+    /// than patch each dependency (`@hocuspocus/*` and `redlock` in the outline
+    /// app: `exports` names only `.esm.js`/`.cjs`, while a perfectly good
+    /// `index.d.ts` sits behind `"types"`).
+    resolve_pkg_json_exports: bool = true,
+    /// tsconfig `resolvePackageJsonImports`. When false, a `#`-prefixed
+    /// ("private imports") specifier ignores the importing package's
+    /// `package.json` `"imports"` map.
+    ///
+    /// ztsc does not implement the `"imports"` map at all — a `#foo` specifier
+    /// is resolved as an ordinary bare specifier, finds no `node_modules/#foo`,
+    /// and stays unresolved — so `false` is already the behavior and this field
+    /// only records the option (accepted, not silently mis-parsed) and marks the
+    /// gate for whenever the map is implemented. Same default reasoning as
+    /// `resolve_pkg_json_exports`.
+    resolve_pkg_json_imports: bool = true,
 };
 
 pub const RefKind = enum { path, types };
@@ -1092,20 +1252,84 @@ fn resolveStemOrJs(io: Io, alloc: Allocator, dir: Io.Dir, stem: []const u8, allo
     return null;
 }
 
+/// Length of the package-name prefix of a bare specifier: `"pkg/sub"` → 3,
+/// `"@scope/pkg/sub"` → 11, a specifier that is only a package name → its whole
+/// length. (`"@scope/pkg"` keeps both segments; a scoped name is two.)
+fn packageNameLen(spec: []const u8) usize {
+    const first = std.mem.indexOfScalar(u8, spec, '/') orelse return spec.len;
+    if (spec[0] != '@') return first;
+    return std.mem.indexOfScalarPos(u8, spec, first + 1, '/') orelse spec.len;
+}
+
+/// A bare `*.json` specifier (`pkg/lib/data.json`) through the `node_modules`
+/// walk. tsc resolves a JSON module by ordinary node resolution, so a package
+/// that ships data files exposes them at their real path — the outline app
+/// imports `nodemailer/lib/well-known/services.json`, which is a plain file in a
+/// plain package. Exact match only: tsc appends no extension to a `*.json`
+/// specifier and probes no `index`, so this is one stat per walk level.
+///
+/// A package that publishes an `exports` map is skipped while
+/// `resolvePackageJsonExports` is on. The map is a closed set of entry points, so
+/// a data file it does not name is unresolvable for tsc as well, and ztsc's map
+/// resolution has no `*.json` leg — leaving those specifiers unresolved is both
+/// exactly today's behavior and the half of tsc's rule that cannot invent a
+/// resolution tsc refuses. (A `*.json` a map DOES name therefore stays an
+/// under-report: TS2307 where tsc resolves.)
+fn resolveJsonPackage(
+    io: Io,
+    alloc: Allocator,
+    dir: Io.Dir,
+    importer_dir: []const u8,
+    spec: []const u8,
+    use_exports: bool,
+    fs: ?*FsCache,
+) Error!?[]u8 {
+    // `<pkg>` alone is never a `*.json` module; a subpath is required.
+    const pkg_len = packageNameLen(spec);
+    if (pkg_len >= spec.len) return null;
+
+    var d = importer_dir;
+    while (true) {
+        const level_ok = if (fs) |fc| try fc.hasNodeModules(io, dir, alloc, d) else true;
+        if (level_ok) {
+            const nm = if (d.len == 0)
+                try std.fmt.allocPrint(alloc, "node_modules/{s}", .{spec[0..pkg_len]})
+            else
+                try std.fmt.allocPrint(alloc, "{s}/node_modules/{s}", .{ d, spec[0..pkg_len] });
+            defer alloc.free(nm);
+            const blocked = use_exports and try packageHasExports(io, alloc, dir, nm, fs);
+            if (!blocked) {
+                const cand = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ nm, spec[pkg_len + 1 ..] });
+                if (try fileExistsFs(io, dir, cand, fs)) return cand;
+                alloc.free(cand);
+            }
+        }
+        if (d.len == 0 or std.mem.eql(u8, d, "/") or std.mem.eql(u8, d, ".")) break;
+        d = dirnamePart(d);
+    }
+    return null;
+}
+
+/// Whether the package at `nm` (`…/node_modules/<pkg>`, base-relative) publishes
+/// a `package.json` `"exports"` map. Reads and parses through the same memos the
+/// main walk uses, so this costs nothing the walk has not already paid.
+fn packageHasExports(io: Io, alloc: Allocator, dir: Io.Dir, nm: []const u8, fs: ?*FsCache) Error!bool {
+    const pj = try std.fmt.allocPrint(alloc, "{s}/package.json", .{nm});
+    defer alloc.free(pj);
+    if (fs) |fc| {
+        const text = (try fc.packageJson(io, dir, pj)) orelse return false;
+        return (try fc.packageExports(pj, text)) != null;
+    }
+    bumpProbe();
+    const text = dir.readFileAlloc(io, pj, alloc, .limited(1 << 20)) catch return false;
+    defer alloc.free(text);
+    return exportsOf(alloc, text) != null;
+}
+
 /// Resolve a bare (package) specifier by walking `node_modules` up from
 /// the importer's directory.
-fn resolvePackage(io: Io, alloc: Allocator, dir: Io.Dir, importer_dir: []const u8, spec: []const u8, allow_js: bool, fs: ?*FsCache) Error!?[]u8 {
-    // Split "pkg/sub" / "@scope/pkg/sub".
-    var pkg_len: usize = spec.len;
-    if (std.mem.indexOfScalar(u8, spec, '/')) |first| {
-        if (spec[0] == '@') {
-            if (std.mem.indexOfScalarPos(u8, spec, first + 1, '/')) |second| {
-                pkg_len = second;
-            }
-        } else {
-            pkg_len = first;
-        }
-    }
+fn resolvePackage(io: Io, alloc: Allocator, dir: Io.Dir, importer_dir: []const u8, spec: []const u8, allow_js: bool, use_exports: bool, fs: ?*FsCache) Error!?[]u8 {
+    const pkg_len = packageNameLen(spec);
     const pkg = spec[0..pkg_len];
     const sub = if (pkg_len < spec.len) spec[pkg_len + 1 ..] else "";
 
@@ -1132,7 +1356,7 @@ fn resolvePackage(io: Io, alloc: Allocator, dir: Io.Dir, importer_dir: []const u
     // React surface `any`.
     var d = importer_dir;
     while (true) {
-        if (try resolvePackageAt(io, alloc, dir, d, pkg, sub, .declarations, false, fs)) |p| {
+        if (try resolvePackageAt(io, alloc, dir, d, pkg, sub, .declarations, false, use_exports, fs)) |p| {
             // An `exports`-blocked subpath means "the real package publishes no
             // *declarations* here", not "resolution is over": tsc still consults
             // `@types/<pkg>` for the same subpath. `react/jsx-runtime` is the
@@ -1142,13 +1366,13 @@ fn resolvePackage(io: Io, alloc: Allocator, dir: Io.Dir, importer_dir: []const u
             // opaque any-module here typed the whole JSX namespace as `any`.
             if (paths.isBlockedSubpathPath(p)) {
                 if (types_pkg) |tp| {
-                    if (try resolvePackageAt(io, alloc, dir, d, tp, sub, .declarations, false, fs)) |q| return q;
+                    if (try resolvePackageAt(io, alloc, dir, d, tp, sub, .declarations, false, use_exports, fs)) |q| return q;
                 }
             }
             return p;
         }
         if (types_pkg) |tp| {
-            if (try resolvePackageAt(io, alloc, dir, d, tp, sub, .declarations, false, fs)) |p| return p;
+            if (try resolvePackageAt(io, alloc, dir, d, tp, sub, .declarations, false, use_exports, fs)) |p| return p;
         }
         if (d.len == 0 or std.mem.eql(u8, d, "/") or std.mem.eql(u8, d, ".")) break;
         d = dirnamePart(d);
@@ -1158,17 +1382,23 @@ fn resolvePackage(io: Io, alloc: Allocator, dir: Io.Dir, importer_dir: []const u
     // `allowJs`: the file sits in `node_modules`, so tsc never adds it to the
     // program either way — it types the module `any` and reports TS7016 at the
     // specifier, which is what an opaque any-module here reproduces.
-    d = importer_dir;
-    while (true) {
-        if (try resolvePackageAt(io, alloc, dir, d, pkg, sub, .javascript, false, fs)) |p| return p;
-        if (d.len == 0 or std.mem.eql(u8, d, "/") or std.mem.eql(u8, d, ".")) break;
-        d = dirnamePart(d);
+    //
+    // With `resolvePackageJsonExports` off there is no map to read a target
+    // from, so the whole walk is skipped rather than walked for a guaranteed
+    // null (`resolvePackageAt` would short-circuit on the same flag).
+    if (use_exports) {
+        d = importer_dir;
+        while (true) {
+            if (try resolvePackageAt(io, alloc, dir, d, pkg, sub, .javascript, false, use_exports, fs)) |p| return p;
+            if (d.len == 0 or std.mem.eql(u8, d, "/") or std.mem.eql(u8, d, ".")) break;
+            d = dirnamePart(d);
+        }
     }
     // Phase 3: the legacy `main`/index JavaScript entry, under allowJs.
     if (allow_js) {
         d = importer_dir;
         while (true) {
-            if (try resolvePackageAt(io, alloc, dir, d, pkg, sub, .declarations, true, fs)) |p| return p;
+            if (try resolvePackageAt(io, alloc, dir, d, pkg, sub, .declarations, true, use_exports, fs)) |p| return p;
             if (d.len == 0 or std.mem.eql(u8, d, "/") or std.mem.eql(u8, d, ".")) break;
             d = dirnamePart(d);
         }
@@ -1256,7 +1486,12 @@ const PackagePhase = enum {
 /// Resolve `<pkg>/<sub>` under one directory level's `node_modules`, honoring
 /// `package.json` `"types"`/`"typings"` (for a bare package) or a relative
 /// stem (for a subpath). Null when nothing resolves at this level.
-fn resolvePackageAt(io: Io, alloc: Allocator, dir: Io.Dir, d: []const u8, pkg: []const u8, sub: []const u8, phase: PackagePhase, allow_js: bool, fs: ?*FsCache) Error!?[]u8 {
+///
+/// `use_exports` false (tsconfig `resolvePackageJsonExports: false`) skips the
+/// `exports` map entirely, so this is the pre-`exports` resolver: the map cannot
+/// resolve anything, cannot hide the legacy `"types"` key, and cannot block an
+/// unmatched subpath.
+fn resolvePackageAt(io: Io, alloc: Allocator, dir: Io.Dir, d: []const u8, pkg: []const u8, sub: []const u8, phase: PackagePhase, allow_js: bool, use_exports: bool, fs: ?*FsCache) Error!?[]u8 {
     // Nothing under `<d>/node_modules` can resolve when that directory does not
     // exist, so one memoized stat per walk level replaces every probe below.
     // Pure short-circuit: the package.json read and all stem candidates would
@@ -1324,7 +1559,12 @@ fn resolvePackageAt(io: Io, alloc: Allocator, dir: Io.Dir, d: []const u8, pkg: [
     //     the body was already read once for the run, but the walk re-parsed it
     //     at every level of every specifier. The uncached leg parses into the
     //     per-file scratch exactly as before.
-    if (pj_text) |text| {
+    //
+    //     `resolvePackageJsonExports: false` takes the whole block out: the
+    //     body is still read (the legacy leg below wants `"types"`/`"main"`
+    //     from it), it is simply never asked for an `exports` key.
+    const exports_text: ?[]const u8 = if (use_exports) pj_text else null;
+    if (exports_text) |text| {
         const exports_opt = if (fs) |fc| try fc.packageExports(pj, text) else exportsOf(alloc, text);
         if (exports_opt) |exports_val| {
             const subpath: []const u8 = if (sub.len == 0)
@@ -1368,7 +1608,29 @@ fn resolvePackageAt(io: Io, alloc: Allocator, dir: Io.Dir, d: []const u8, pkg: [
     if (phase == .javascript) return null;
 
     // (2) Legacy resolution (exports absent or unmatched).
+    //
+    //     `typesVersions` is part of it: the pre-`exports` redirection layer,
+    //     which tsc consults BEFORE the plain candidate for a subpath and before
+    //     the `"types"` entry for the package root
+    //     (`tryLoadModuleUsingPaths`/`loadNodeModuleFromDirectoryWorker`). Three
+    //     of the outline app's dependencies ship declarations reachable ONLY
+    //     through it — `@modelcontextprotocol/sdk` (`{"*": {"*":
+    //     ["./dist/esm/*"]}}`), `@faker-js/faker`, `@simplewebauthn/server` —
+    //     and with `resolvePackageJsonExports` off there is no map left to find
+    //     them by, so skipping it would trade one family of false positives for
+    //     another.
+    const version_paths: ?tsconfig.Value.Object = if (pj_text) |text|
+        (if (fs) |fc| try fc.packageTypesVersions(pj, text) else typesVersionsPaths(alloc, text))
+    else
+        null;
     if (sub.len > 0) {
+        if (version_paths) |vp| {
+            for (try mapTypesVersions(alloc, vp, sub)) |target| {
+                const stem = try joinNormalize(alloc, nm, target);
+                defer alloc.free(stem);
+                if (try resolveStemOrJs(io, alloc, dir, stem, allow_js, fs)) |p| return p;
+            }
+        }
         const stem = try joinNormalize(alloc, nm, sub);
         defer alloc.free(stem);
         if (try resolveStemOrJs(io, alloc, dir, stem, allow_js, fs)) |p| return p;
@@ -1393,9 +1655,37 @@ fn resolvePackageAt(io: Io, alloc: Allocator, dir: Io.Dir, d: []const u8, pkg: [
     if (pj_text) |text| {
         if (packageTypesField(text)) |types_rel| {
             resolved_types = true;
+            // The root import goes through `typesVersions` FIRST, under the name
+            // of the entry the package declares — tsc maps the entry path, not
+            // the specifier (`@faker-js/faker` declares `"types": "index.d.ts"`
+            // and maps `"*" → "dist/types/*"`, so the real declarations are
+            // `dist/types/index.d.ts` and the declared `index.d.ts` does not
+            // exist at all).
+            if (version_paths) |vp| {
+                for (try mapTypesVersions(alloc, vp, types_rel)) |target| {
+                    const stem = try joinNormalize(alloc, nm, target);
+                    defer alloc.free(stem);
+                    if (try resolveStemFs(io, alloc, dir, stem, fs)) |p| return p;
+                }
+            }
             const stem = try joinNormalize(alloc, nm, types_rel);
             defer alloc.free(stem);
             if (try resolveStemFs(io, alloc, dir, stem, fs)) |p| return p;
+        }
+    }
+    // No `"types"` to name: tsc maps `index` instead (`@simplewebauthn/server`
+    // maps the literal key `"."`, which no entry-file name can match, so this
+    // leg is what a `{".": [...]}` table needs — see the `"index"` and `"."`
+    // spellings both being tried).
+    if (!resolved_types) {
+        if (version_paths) |vp| {
+            for ([2][]const u8{ "index", "." }) |name| {
+                for (try mapTypesVersions(alloc, vp, name)) |target| {
+                    const stem = try joinNormalize(alloc, nm, target);
+                    defer alloc.free(stem);
+                    if (try resolveStemFs(io, alloc, dir, stem, fs)) |p| return p;
+                }
+            }
         }
     }
     if (!resolved_types) {
@@ -1472,15 +1762,16 @@ fn resolveSpecifierFs(
         if (is_json) return resolveJsonFileFs(io, alloc, dir, stem, fs);
         return resolveStemOrJs(io, alloc, dir, stem, opts.allow_js, fs);
     }
-    // A bare `*.json` specifier resolves against `baseUrl` only (tsc's baseUrl
-    // rule; the `public/api/x.json` shape) — never node_modules.
+    // A bare `*.json` specifier resolves against `baseUrl` first (tsc's baseUrl
+    // rule; the `public/api/x.json` shape), then through the `node_modules` walk
+    // like any other bare specifier.
     if (is_json) {
         if (opts.base_url) |bu| {
             const stem = try joinNormalize(alloc, bu, spec);
             defer alloc.free(stem);
             if (try resolveJsonFileFs(io, alloc, dir, stem, fs)) |p| return p;
         }
-        return null;
+        return resolveJsonPackage(io, alloc, dir, importer_dir, spec, opts.resolve_pkg_json_exports, fs);
     }
     // A bare non-json specifier resolves against `baseUrl` BEFORE the
     // node_modules walk (tsc bundler/node order: paths → baseUrl → node_modules;
@@ -1491,7 +1782,7 @@ fn resolveSpecifierFs(
         defer alloc.free(stem);
         if (try resolveStemOrJs(io, alloc, dir, stem, opts.allow_js, fs)) |p| return p;
     }
-    return resolvePackage(io, alloc, dir, importer_dir, spec, opts.allow_js, fs);
+    return resolvePackage(io, alloc, dir, importer_dir, spec, opts.allow_js, opts.resolve_pkg_json_exports, fs);
 }
 
 // ===========================================================================
@@ -1546,6 +1837,7 @@ fn resolveReference(
     dir: Io.Dir,
     importer: []const u8,
     ref: RefDirective,
+    opts: ResolveOpts,
     fs: ?*FsCache,
 ) Error!?[]u8 {
     switch (ref.kind) {
@@ -1555,10 +1847,13 @@ fn resolveReference(
             return resolveStemFs(io, alloc, dir, stem, fs);
         },
         .types => {
+            // A `types=` directive is a package resolution, so it honors
+            // `resolvePackageJsonExports` exactly like an import does.
+            const use_exports = opts.resolve_pkg_json_exports;
             const scoped = try std.fmt.allocPrint(alloc, "@types/{s}", .{ref.spec});
             defer alloc.free(scoped);
-            if (try resolvePackage(io, alloc, dir, dirnamePart(importer), scoped, false, fs)) |p| return p;
-            return resolvePackage(io, alloc, dir, dirnamePart(importer), ref.spec, false, fs);
+            if (try resolvePackage(io, alloc, dir, dirnamePart(importer), scoped, false, use_exports, fs)) |p| return p;
+            return resolvePackage(io, alloc, dir, dirnamePart(importer), ref.spec, false, use_exports, fs);
         },
     }
 }
@@ -2160,6 +2455,32 @@ test "resolveSpecifier: resolveJsonModule gates *.json resolution" {
     try testing.expectEqual(@as(?[]u8, null), try resolveSpecifier(io, alloc, d, "src/a.ts", "./data/missing.json", on));
     // With the option off, an existing *.json does NOT resolve as a module.
     try testing.expectEqual(@as(?[]u8, null), try resolveSpecifier(io, alloc, d, "src/a.ts", "./data/config.json", .{}));
+
+    // A package's data file resolves through the node_modules walk, exactly like
+    // any other bare specifier (`nodemailer/lib/well-known/services.json`).
+    try d.createDirPath(io, "node_modules/plainpkg/lib/well-known");
+    try d.writeFile(io, .{ .sub_path = "node_modules/plainpkg/package.json", .data = "{ \"name\": \"plainpkg\", \"main\": \"lib/index.js\" }" });
+    try d.writeFile(io, .{ .sub_path = "node_modules/plainpkg/lib/well-known/services.json", .data = "{}" });
+    try testing.expectEqualStrings(
+        "node_modules/plainpkg/lib/well-known/services.json",
+        (try resolveSpecifier(io, alloc, d, "src/a.ts", "plainpkg/lib/well-known/services.json", on)).?,
+    );
+    // Exact match only — no extension probing, no `index.json`, and the option
+    // still gates it.
+    try testing.expectEqual(@as(?[]u8, null), try resolveSpecifier(io, alloc, d, "src/a.ts", "plainpkg/lib/well-known/nope.json", on));
+    try testing.expectEqual(@as(?[]u8, null), try resolveSpecifier(io, alloc, d, "src/a.ts", "plainpkg/lib/well-known/services.json", .{}));
+    // A package that publishes an `exports` map keeps its closed entry-point set:
+    // ztsc has no `*.json` leg for the map, so the specifier stays unresolved
+    // rather than resolving behind tsc's back (documented under-report). With
+    // `resolvePackageJsonExports` off there is no map, and the file resolves.
+    try d.createDirPath(io, "node_modules/mappedpkg/data");
+    try d.writeFile(io, .{ .sub_path = "node_modules/mappedpkg/package.json", .data = "{ \"exports\": { \".\": \"./index.js\" } }" });
+    try d.writeFile(io, .{ .sub_path = "node_modules/mappedpkg/data/list.json", .data = "{}" });
+    try testing.expectEqual(@as(?[]u8, null), try resolveSpecifier(io, alloc, d, "src/a.ts", "mappedpkg/data/list.json", on));
+    try testing.expectEqualStrings(
+        "node_modules/mappedpkg/data/list.json",
+        (try resolveSpecifier(io, alloc, d, "src/a.ts", "mappedpkg/data/list.json", .{ .resolve_json = true, .base_url = ".", .resolve_pkg_json_exports = false })).?,
+    );
 }
 
 test "packageMainField: minimal scan" {
@@ -2261,4 +2582,164 @@ test "resolveSpecifier: allowJs resolves JS-only package/main and relative .js a
     try testing.expectEqual(@as(?[]u8, null), try resolveSpecifier(io, alloc, d, "src/a.ts", "./legacy", off));
     // The typed package still resolves to its declarations with allowJs off.
     try testing.expectEqualStrings("node_modules/typed/index.d.ts", (try resolveSpecifier(io, alloc, d, "src/a.ts", "typed", off)).?);
+}
+
+// `typesVersions` — the pre-`exports` redirection layer, in the three real
+// shapes the outline app depends on. It applies whenever the legacy leg runs, so
+// the cases here use packages with no `exports` map; the exports-off case is the
+// next test.
+test "resolvePackage: typesVersions redirects subpaths and the package entry" {
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const d = tmp.dir;
+    try d.createDirPath(io, "src");
+    try d.writeFile(io, .{ .sub_path = "src/a.ts", .data = "" });
+
+    // (1) `{"*": {"*": ["./dist/esm/*"]}}` — every subpath redirected, and the
+    // `.js` specifier resolves to the `.d.ts` at the mapped location
+    // (@modelcontextprotocol/sdk).
+    try d.createDirPath(io, "node_modules/sdk/dist/esm/server");
+    try d.writeFile(io, .{ .sub_path = "node_modules/sdk/package.json", .data =
+        \\{ "name": "sdk", "typesVersions": { "*": { "*": ["./dist/esm/*"] } } }
+    });
+    try d.writeFile(io, .{ .sub_path = "node_modules/sdk/dist/esm/server/mcp.d.ts", .data = "" });
+    try testing.expectEqualStrings(
+        "node_modules/sdk/dist/esm/server/mcp.d.ts",
+        (try resolveSpecifier(io, alloc, d, "src/a.ts", "sdk/server/mcp.js", .{})).?,
+    );
+
+    // (2) `{">=4.0": {"*": ["dist/types/*"]}}` with a `"types"` that does not
+    // exist: the ENTRY NAME is what gets mapped (@faker-js/faker).
+    try d.createDirPath(io, "node_modules/faker/dist/types");
+    try d.writeFile(io, .{ .sub_path = "node_modules/faker/package.json", .data =
+        \\{ "name": "faker", "types": "index.d.ts",
+        \\  "typesVersions": { ">=4.0": { "*": ["dist/types/*"] } } }
+    });
+    try d.writeFile(io, .{ .sub_path = "node_modules/faker/dist/types/index.d.ts", .data = "" });
+    try testing.expectEqualStrings(
+        "node_modules/faker/dist/types/index.d.ts",
+        (try resolveSpecifier(io, alloc, d, "src/a.ts", "faker", .{})).?,
+    );
+
+    // (3) Literal keys, no `"types"` field (@simplewebauthn/server): `"."` names
+    // the package entry and `"helpers"` an exact subpath.
+    try d.createDirPath(io, "node_modules/webauthn/esm/helpers");
+    try d.createDirPath(io, "node_modules/webauthn/script");
+    try d.writeFile(io, .{ .sub_path = "node_modules/webauthn/package.json", .data =
+        \\{ "name": "webauthn", "main": "./script/index.js",
+        \\  "typesVersions": { "*": { ".": ["esm/index.d.ts"], "helpers": ["esm/helpers/index.d.ts"] } } }
+    });
+    try d.writeFile(io, .{ .sub_path = "node_modules/webauthn/esm/index.d.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "node_modules/webauthn/esm/helpers/index.d.ts", .data = "" });
+    try testing.expectEqualStrings(
+        "node_modules/webauthn/esm/helpers/index.d.ts",
+        (try resolveSpecifier(io, alloc, d, "src/a.ts", "webauthn/helpers", .{})).?,
+    );
+    try testing.expectEqualStrings(
+        "node_modules/webauthn/esm/index.d.ts",
+        (try resolveSpecifier(io, alloc, d, "src/a.ts", "webauthn", .{})).?,
+    );
+
+    // A range this compiler does not satisfy is not a mapping: the package
+    // resolves as if it had no `typesVersions` at all.
+    try d.createDirPath(io, "node_modules/old/legacy");
+    try d.writeFile(io, .{ .sub_path = "node_modules/old/package.json", .data =
+        \\{ "name": "old", "types": "index.d.ts",
+        \\  "typesVersions": { "<4.0": { "*": ["legacy/*"] } } }
+    });
+    try d.writeFile(io, .{ .sub_path = "node_modules/old/index.d.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "node_modules/old/legacy/index.d.ts", .data = "" });
+    try testing.expectEqualStrings(
+        "node_modules/old/index.d.ts",
+        (try resolveSpecifier(io, alloc, d, "src/a.ts", "old", .{})).?,
+    );
+}
+
+test "versionRangeMatches: the two spellings real packages ship" {
+    try testing.expect(versionRangeMatches("*"));
+    try testing.expect(versionRangeMatches(">=4.0"));
+    try testing.expect(versionRangeMatches(">=3.1"));
+    try testing.expect(versionRangeMatches(">=7"));
+    try testing.expect(versionRangeMatches(">=7.0"));
+    try testing.expect(!versionRangeMatches(">=7.1"));
+    try testing.expect(!versionRangeMatches(">=8.0"));
+    // Unrecognized spellings do not match (the pre-`typesVersions` answer).
+    try testing.expect(!versionRangeMatches("<4.0"));
+    try testing.expect(!versionRangeMatches("4.0"));
+    try testing.expect(!versionRangeMatches(">=abc"));
+}
+
+// tsconfig `resolvePackageJsonExports: false` — the `exports` map is ignored
+// ENTIRELY, so the three things a present map does (resolve a target, hide the
+// legacy `"types"` key, block an unnamed subpath) all stop happening and every
+// specifier takes the pre-`exports` path. With the option at its default (true)
+// the same tree resolves exactly as before.
+test "resolveSpecifier: resolvePackageJsonExports gates the exports map" {
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const d = tmp.dir;
+    try d.createDirPath(io, "src");
+    // `hidden`: an `exports` map with no `types` condition, next to a perfectly
+    // good top-level `"types"` the map hides (the `@hocuspocus/server` /
+    // `redlock` shape that makes a project set the option in the first place).
+    try d.createDirPath(io, "node_modules/hidden/dist");
+    try d.createDirPath(io, "node_modules/hidden/lib/internal");
+    try d.writeFile(io, .{ .sub_path = "node_modules/hidden/package.json", .data =
+        \\{ "name": "hidden", "main": "dist/index.js", "types": "index.d.ts",
+        \\  "exports": { ".": { "import": "./dist/index.js" } } }
+    });
+    try d.writeFile(io, .{ .sub_path = "node_modules/hidden/index.d.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "node_modules/hidden/dist/index.js", .data = "" });
+    // A subpath the map does not name, with a real declaration file behind it.
+    try d.writeFile(io, .{ .sub_path = "node_modules/hidden/lib/internal/util.d.ts", .data = "" });
+    // `mapped`: a well-formed map WITH a `types` condition pointing somewhere
+    // other than the legacy `index.d.ts` — the two legs must be told apart.
+    try d.createDirPath(io, "node_modules/mapped/types");
+    try d.writeFile(io, .{ .sub_path = "node_modules/mapped/package.json", .data =
+        \\{ "name": "mapped", "exports": { ".": { "types": "./types/api.d.ts" } } }
+    });
+    try d.writeFile(io, .{ .sub_path = "node_modules/mapped/types/api.d.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "node_modules/mapped/index.d.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "src/a.ts", .data = "" });
+
+    const on: ResolveOpts = .{}; // default: exports honored
+    const off: ResolveOpts = .{ .resolve_pkg_json_exports = false };
+
+    // Default (map honored): the map names only JavaScript, so the package is
+    // the opaque JS any-module and the legacy `"types"` stays hidden.
+    const js = (try resolveSpecifier(io, alloc, d, "src/a.ts", "hidden", on)).?;
+    try testing.expectEqualStrings("node_modules/hidden/dist/index.js", js);
+    try testing.expect(paths.isJsModulePath(js));
+    // Option off: the legacy `"types"` wins and the module is typed.
+    try testing.expectEqualStrings(
+        "node_modules/hidden/index.d.ts",
+        (try resolveSpecifier(io, alloc, d, "src/a.ts", "hidden", off)).?,
+    );
+    // Default: a subpath the map does not name is blocked (synthetic path,
+    // reported as tsc's TS2307) even though the file exists.
+    const blocked = (try resolveSpecifier(io, alloc, d, "src/a.ts", "hidden/lib/internal/util", on)).?;
+    try testing.expect(paths.isBlockedSubpathPath(blocked));
+    // Option off: nothing blocks it — the plain relative stem resolves.
+    try testing.expectEqualStrings(
+        "node_modules/hidden/lib/internal/util.d.ts",
+        (try resolveSpecifier(io, alloc, d, "src/a.ts", "hidden/lib/internal/util", off)).?,
+    );
+    // A `types` condition is a resolution the option takes away: with it off,
+    // the same package falls back to `index.d.ts`.
+    try testing.expectEqualStrings(
+        "node_modules/mapped/types/api.d.ts",
+        (try resolveSpecifier(io, alloc, d, "src/a.ts", "mapped", on)).?,
+    );
+    try testing.expectEqualStrings(
+        "node_modules/mapped/index.d.ts",
+        (try resolveSpecifier(io, alloc, d, "src/a.ts", "mapped", off)).?,
+    );
 }

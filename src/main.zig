@@ -728,6 +728,11 @@ pub fn main(init: std.process.Init) !void {
     // tsconfig resolveJsonModule + baseUrl (for `*.json` module resolution).
     var config_resolve_json = false;
     var config_base_url: ?[]const u8 = null;
+    // tsconfig resolvePackageJsonExports/Imports (both default ON — see
+    // `tsconfig.Config`; a config that turns exports off gets the pre-`exports`
+    // resolver).
+    var config_resolve_pkg_exports = true;
+    var config_resolve_pkg_imports = true;
     // tsconfig allowJs (resolve JS-only deps as `any`) + effective noImplicitAny.
     var config_allow_js = false;
     var config_no_implicit_any = true;
@@ -823,6 +828,8 @@ pub fn main(init: std.process.Init) !void {
         config_skip_lib = cfg.skip_lib_check;
         config_skip_all_lib = cfg.skip_all_lib_check;
         config_resolve_json = cfg.resolve_json_module;
+        config_resolve_pkg_exports = cfg.resolve_pkg_json_exports;
+        config_resolve_pkg_imports = cfg.resolve_pkg_json_imports;
         config_base_url = cfg.base_url;
         config_allow_js = cfg.allow_js;
         config_no_implicit_any = cfg.no_implicit_any;
@@ -892,6 +899,8 @@ pub fn main(init: std.process.Init) !void {
         .resolve_json = config_resolve_json,
         .base_url = config_base_url,
         .allow_js = config_allow_js,
+        .resolve_pkg_json_exports = config_resolve_pkg_exports,
+        .resolve_pkg_json_imports = config_resolve_pkg_imports,
     });
 
     // --- Single-owner discovery (no wave barrier) --------------------------
