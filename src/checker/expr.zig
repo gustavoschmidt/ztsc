@@ -210,8 +210,25 @@ pub fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             // `` `setUint${BITS[bytes]}` as const `` widened to `string`,
             // which cannot index a `DataView` — a TS7053 false positive on
             // the standard "compute the accessor name" idiom.
+            // A tagged template's substitutions are the tag call's ARGUMENTS,
+            // so each takes its contextual type from the tag's parameter at
+            // its position — position 0 being the strings array, which tsc
+            // fills with a synthetic expression. Every real template tag
+            // collects them through a REST parameter, so that lookup is
+            // `paramTypeAt`'s rest arm. Without a contextual type at all,
+            // every `styled.div`…${(props) => props.$size}`` interpolation
+            // left its parameter implicit `any` — 341 of outline's excess
+            // keys were that one TS7006.
+            const tpl_sig = if (node == c.tagged_tpl) c.tagged_tpl_sig else types.no_type;
+            var sub_i: u32 = 1;
             for (c.tree.nodeRange(node)) |sub| {
-                if (sub != null_node) _ = try c.checkExprCached(sub, types.no_type);
+                if (sub == null_node) continue;
+                defer sub_i += 1;
+                const sub_ctx: TypeId = if (tpl_sig == types.no_type)
+                    types.no_type
+                else
+                    (try c.paramTypeAt(tpl_sig, sub_i)) orelse types.no_type;
+                _ = try c.checkExprCached(sub, sub_ctx);
             }
             // tsc folds a template expression that is a compile-time CONSTANT
             // to a fresh string literal *before* either of those two tests
@@ -532,19 +549,28 @@ pub fn jsxRuntimeNamespaceMember(c: *Checker, member: Atom) ?SymbolId {
 /// typing is skipped).
 pub fn jsxComponentProps(c: *Checker, tag_ty: TypeId, explicit_targs: []const TypeId, node: Node) Error!?TypeId {
     const t = try c.resolveStructural(tag_ty);
-    var sig = switch (c.ts.kind(t)) {
-        .function => t,
-        .overloads => blk: {
-            const sigs = try c.memberList(t);
-            break :blk if (sigs.len > 0) sigs[0] else return null;
+    if (c.ts.kind(t) == .class_value) return c.jsxClassComponentProps(t, explicit_targs, node);
+    var sigs: std.ArrayList(TypeId) = .empty;
+    defer sigs.deinit(c.scratch());
+    try collectJsxCallSigs(c, t, &sigs);
+    if (sigs.items.len == 0) return null;
+    if (sigs.items.len == 1) return try jsxPropsOfSig(c, sigs.items[0], explicit_targs, node);
+    return try chooseJsxSignature(c, sigs.items, explicit_targs, node);
+}
+
+/// The call signatures a component tag offers, in declaration order — the list
+/// tsc's `resolveJsxOpeningLikeElement` hands to `resolveCall`.
+fn collectJsxCallSigs(c: *Checker, t: TypeId, out: *std.ArrayList(TypeId)) Error!void {
+    switch (c.ts.kind(t)) {
+        .function => try out.append(c.scratch(), t),
+        .overloads => try out.appendSlice(c.scratch(), try c.memberList(t)),
+        // A callable *object* — a call-signature-bearing interface used as a
+        // component. styled-components' `StyledComponentBase` is this shape,
+        // with two: `(props: P & { as?: never })` and the polymorphic
+        // `<AsC>(props: P & { as?: AsC })` behind it.
+        .object => for (0..c.ts.objectCallSigCount(t)) |i| {
+            try out.append(c.scratch(), c.ts.objectCallSig(t, @intCast(i)));
         },
-        .class_value => return c.jsxClassComponentProps(t, explicit_targs, node),
-        // A callable *object* — a call/construct-signature-bearing interface
-        // used as a component — takes its first call signature.
-        .object => if (c.ts.objectCallSigCount(t) > 0)
-            c.ts.objectCallSig(t, 0)
-        else
-            return null,
         // A function merged with a namespace
         // (`declare function Icon(…); declare namespace Icon { … }`) types as
         // an *intersection* of the function value and the namespace object
@@ -552,23 +578,84 @@ pub fn jsxComponentProps(c: *Checker, tag_ty: TypeId, explicit_targs: []const Ty
         // constituent; without this the whole props target is dropped and
         // every attribute goes unchecked (missing/excess/value all silently
         // pass — e.g. a bad `<Icon name>` slips through).
-        .intersection => blk: {
-            for (try c.memberList(t)) |m| {
-                const rm = try c.resolveStructural(m);
-                switch (c.ts.kind(rm)) {
-                    .function => break :blk rm,
-                    .overloads => {
-                        const sigs = try c.memberList(rm);
-                        if (sigs.len > 0) break :blk sigs[0];
-                    },
-                    .object => if (c.ts.objectCallSigCount(rm) > 0) break :blk c.ts.objectCallSig(rm, 0),
-                    else => {},
-                }
+        .intersection => for (try c.memberList(t)) |m| {
+            const rm = try c.resolveStructural(m);
+            switch (c.ts.kind(rm)) {
+                .function, .overloads, .object => {
+                    try collectJsxCallSigs(c, rm, out);
+                    if (out.items.len > 0) return;
+                },
+                else => {},
             }
-            return null;
         },
-        else => return null,
-    };
+        else => {},
+    }
+}
+
+/// A JSX element with a MULTI-SIGNATURE component type is resolved the way a
+/// call is: tsc builds the attributes object and runs `resolveCall` over the
+/// whole signature list, taking the first candidate it satisfies.
+///
+/// ztsc took `sigs[0]` unconditionally, which is wrong for exactly the shape
+/// the polymorphic-`as` idiom is built out of. styled-components declares
+///
+///     (props: Own & { as?: never | undefined }): Element;
+///     <AsC extends string>(props: Own & { as?: AsC | undefined }): Element;
+///
+/// so `<Styled as="p">` has to fall through to the second signature; against
+/// the first it read `Type '"p"' is not assignable to type 'undefined'`, once
+/// per styled element in the program.
+///
+/// The acceptance test is the reporting walk itself, run with its diagnostics
+/// withdrawn — the same trick `argumentsMatch` plays for a call argument, and
+/// for the same reason: a probe must reject exactly what the report would
+/// complain about, or a candidate is accepted and then diagnosed. The
+/// withdrawal is scoped to the element's own source range, so a diagnostic the
+/// probe merely triggered while materializing some other declaration survives,
+/// and `no_publish_depth` keeps a declined candidate's contextual reading of an
+/// attribute out of the `node_types` memo.
+///
+/// The instantiation budget is deliberately NOT refunded, unlike the call
+/// path's, where a candidate probing a wide union constraint could bankrupt the
+/// overload behind it. A refund means `newBudgetWindow`, whose fresh epoch
+/// invalidates memoized types program-wide; a JSX candidate's probe is one
+/// attributes relation, bounded by the element's attribute count rather than by
+/// a library's type graph, so there is nothing here worth that reach. Measured
+/// both ways on outline: identical key sets.
+fn chooseJsxSignature(c: *Checker, sigs: []const TypeId, explicit_targs: []const TypeId, node: Node) Error!?TypeId {
+    const e = c.tree.extraData(ast.JsxElementData, c.tree.nodeData(node).lhs);
+    const has_children = c.jsxChildrenPresent(e);
+    const elem = c.nodeSpan(node);
+    var last: ?TypeId = null;
+    for (sigs) |s| {
+        const props = (try jsxPropsOfSig(c, s, explicit_targs, node)) orelse continue;
+        last = props;
+        const saved = c.diags.items.len;
+        c.no_publish_depth += 1;
+        {
+            errdefer c.no_publish_depth -= 1;
+            try c.checkJsxAttributes(node, e, props, true, has_children);
+        }
+        c.no_publish_depth -= 1;
+        var rejected = false;
+        for (c.diags.items[saved..]) |d| {
+            if (d.file != c.cur_file) continue;
+            if (d.span.start < elem.start or d.span.start >= elem.end) continue;
+            rejected = true;
+            break;
+        }
+        c.rollbackDiags(saved, .{ .file = c.cur_file, .lo = elem.start, .hi = elem.end });
+        if (!rejected) return props;
+    }
+    // No candidate is clean. tsc reports out of the last one it tried, so the
+    // element is checked (and diagnosed) against that one's props.
+    return last;
+}
+
+/// The props type a single component signature exposes: its first parameter,
+/// with type arguments bound.
+fn jsxPropsOfSig(c: *Checker, sig_in: TypeId, explicit_targs: []const TypeId, node: Node) Error!?TypeId {
+    var sig = sig_in;
     // Bind explicit type arguments (`<Select<string> …>`) into the signature
     // so the props type is concrete. Mirrors the explicit-targ path of a
     // generic call; a count mismatch reports TS2558 there. With no explicit
@@ -1634,11 +1721,13 @@ pub fn checkTaggedTemplate(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     // SyntaxKind.TaggedTemplateExpression`); ztsc has no parent links, so the
     // tagged template marks its own template node for the duration.
     const prev_tagged = c.tagged_tpl;
+    const prev_tpl_sig = c.tagged_tpl_sig;
     c.tagged_tpl = d.rhs;
-    defer c.tagged_tpl = prev_tagged;
-    // The substitutions are checked by the template node itself; do it first
-    // so their diagnostics land whatever the tag turns out to be.
-    _ = try c.checkExprCached(d.rhs, types.no_type);
+    c.tagged_tpl_sig = types.no_type;
+    defer {
+        c.tagged_tpl = prev_tagged;
+        c.tagged_tpl_sig = prev_tpl_sig;
+    }
     const r = try c.resolveStructural(tag_ty);
     var sigs: std.ArrayList(TypeId) = .empty;
     defer sigs.deinit(c.scratch());
@@ -1650,7 +1739,12 @@ pub fn checkTaggedTemplate(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         },
         else => {},
     }
-    if (sigs.items.len == 0) return types.any_type;
+    if (sigs.items.len == 0) {
+        // Nothing to draw a contextual type from, but the substitutions are
+        // still expressions and still have to be checked.
+        _ = try c.checkExprCached(d.rhs, types.no_type);
+        return types.any_type;
+    }
     // Argument nodes: the template stands in for the strings array (its own
     // parameter is `TemplateStringsArray`, which carries no type parameter in
     // any real tag, so what it contributes to inference is nothing), then one
@@ -1675,7 +1769,22 @@ pub fn checkTaggedTemplate(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             }
         }
     }
+    // Inference walks the substitutions too, so it gets the uninstantiated
+    // signature's parameters — the best contextual type available before the
+    // type arguments exist (a tag written `styled.div<Props>` arrives here
+    // already instantiated, through the `instantiation_expr` its type args
+    // built, so for that shape the two are the same signature). When they are
+    // not, whatever that provisional pass said about the substitutions is
+    // withdrawn and re-derived below under the resolved parameters.
+    c.tagged_tpl_sig = chosen;
+    const tpl_span = c.nodeSpan(d.rhs);
+    const saved = c.diags.items.len;
     const inst = try c.instantiateSigForCall(chosen, &.{}, args.items, node, ctx);
+    if (inst != chosen) {
+        c.rollbackDiags(saved, .{ .file = c.cur_file, .lo = tpl_span.start, .hi = tpl_span.end });
+    }
+    c.tagged_tpl_sig = inst;
+    _ = try c.checkExprCached(d.rhs, types.no_type);
     return c.ts.fnReturn(inst);
 }
 

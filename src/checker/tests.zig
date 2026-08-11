@@ -1320,3 +1320,97 @@ test "elaboration: a recursive pair terminates" {
         \\const b: B = a;
     , &.{2322});
 }
+
+/// Expect exactly these (code, blamed source text) pairs, in span order: each
+/// diagnostic's span must START at the first occurrence of its snippet in
+/// `src`. `expectCodes` cannot see a blame node that moved without changing
+/// the code, and the conformance snapshots record only lines.
+fn expectCodesAt(src: []const u8, expected: []const struct { u16, []const u8 }) !void {
+    var t = try TestCheck.init(src);
+    defer t.deinit();
+    var ok = t.result.diagnostics.len == expected.len;
+    if (ok) {
+        for (expected, t.result.diagnostics) |want, got| {
+            const at = std.mem.indexOf(u8, src, want[1]) orelse return error.SnippetNotInSource;
+            if (want[0] != got.code or at != got.span.start) ok = false;
+        }
+    }
+    if (!ok) {
+        std.debug.print("--- source: {s}\n--- got {d} diagnostics:\n", .{ src, t.result.diagnostics.len });
+        for (t.result.diagnostics) |dd| {
+            std.debug.print("  TS{d} @{d} \"{s}\" {s}\n", .{
+                dd.code,
+                dd.span.start,
+                src[dd.span.start..@min(dd.span.end, dd.span.start + 24)],
+                dd.msg,
+            });
+        }
+        std.debug.print("--- wanted:\n", .{});
+        for (expected) |w| {
+            std.debug.print("  TS{d} @{d} \"{s}\"\n", .{ w[0], std.mem.indexOf(u8, src, w[1]) orelse 0, w[1] });
+        }
+        return error.TestExpectedEqual;
+    }
+}
+
+test "overload failure anchors the TS2769 on the failing argument" {
+    // tsc's `reportCallResolutionErrors` re-runs the last candidate's
+    // applicability check and reports where THAT would have — on the argument.
+    // An argument that is itself a failing call files its own diagnostic
+    // deeper inside first, and that one is not the anchor.
+    try expectCodesAt(
+        \\declare function wrap(x: number): number;
+        \\interface R {
+        \\  post(a: string, b: string, c: (x: string) => void): void;
+        \\  post(a: string, b: boolean, c: (x: string) => void): void;
+        \\}
+        \\declare const r: R;
+        \\r.post("x", wrap("nope"), (x: string) => {});
+    , &.{
+        .{ 2769, "wrap(\"nope\")" },
+        .{ 2345, "\"nope\")" },
+    });
+    // With no nested diagnostic to be distracted by, the argument itself.
+    try expectCodesAt(
+        \\interface R {
+        \\  m(a: string, b: string): void;
+        \\  m(a: string, b: boolean): void;
+        \\}
+        \\declare const r: R;
+        \\r.m("x", 12);
+    , &.{.{ 2769, "12)" }});
+}
+
+test "an argument's error span follows tsc's getErrorSpanForNode" {
+    // An ARROW spans from its own `pos`: the `async` modifier and the
+    // parameter list's `(`, neither of which is a token of any child node.
+    try expectCodesAt(
+        \\declare function h(cb: (x: number) => void, n: number): void;
+        \\h(async (x: string) => {}, 1);
+    , &.{.{ 2345, "async (x: string)" }});
+    try expectCodesAt(
+        \\declare function h(cb: (x: number) => void, n: number): void;
+        \\h((x: string) => {}, 1);
+    , &.{.{ 2345, "(x: string) =>" }});
+    // No parameters at all: the empty pair still opens the span (the AST has
+    // no token before the `=>` to derive it from).
+    try expectCodesAt(
+        \\declare function m(f: string, n: number): void;
+        \\m(() => {}, 2);
+    , &.{.{ 2345, "() => {}" }});
+    // An unparenthesized single parameter already starts where tsc's does.
+    try expectCodesAt(
+        \\declare function h(cb: (x: number) => void, n: number): void;
+        \\h(x => x.length, 1);
+    , &.{.{ 2339, "length" }});
+    // A named FUNCTION EXPRESSION errors on its name.
+    try expectCodesAt(
+        \\declare function k(f: (x: number) => void): void;
+        \\k(function named(x: string) {});
+    , &.{.{ 2345, "named(x: string)" }});
+    // An anonymous one has no name to move to; the `function` keyword stands.
+    try expectCodesAt(
+        \\declare function k(f: (x: number) => void): void;
+        \\k(function (x: string) {});
+    , &.{.{ 2345, "function (x: string)" }});
+}

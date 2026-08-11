@@ -2059,6 +2059,14 @@ pub const Checker = struct {
     /// `node.parent.kind !== SyntaxKind.TaggedTemplateExpression`; ztsc has no
     /// parent links, so `checkTaggedTemplate` marks its own template here.
     tagged_tpl: Node = null_node,
+    /// The signature `tagged_tpl`'s tag resolved to, or `no_type` before it is
+    /// picked. A tagged template's substitutions are the tag call's ARGUMENTS
+    /// (tsc's `getEffectiveCallArguments`: a synthetic first argument standing
+    /// for the strings array, then one per span), so each is contextually typed
+    /// by the tag's parameter at its position. The template node is what walks
+    /// them, and it is reached through `checkExprCached` rather than called
+    /// directly, so the signature travels here.
+    tagged_tpl_sig: TypeId = types.no_type,
     /// Type-parameter symbols of every `inferTypeArgs` call currently on the
     /// stack (innermost last). A symbol in here but *not* in the current call's
     /// `tp_syms` is an OUTER call's still-in-flight inference variable — tsc
@@ -4174,6 +4182,7 @@ pub const Checker = struct {
     pub const bindAnyToTypeParams = calls_zig.bindAnyToTypeParams;
     pub const argumentsMatch = calls_zig.argumentsMatch;
     pub const checkCallArguments = calls_zig.checkCallArguments;
+    pub const checkCallArgumentsAnchored = calls_zig.checkCallArgumentsAnchored;
     pub const CallShape = calls_zig.CallShape;
 
     const flow_zig = @import("checker/flow.zig");
