@@ -36,6 +36,7 @@ const checkFunctionLikeExpr = @import("expr.zig").checkFunctionLikeExpr;
 const checkJsxElement = @import("expr.zig").checkJsxElement;
 const classStaticType = @import("enums.zig").classStaticType;
 const diagFmt = Checker.diagFmt;
+const elaborate = @import("elaborate.zig");
 const elaborateLiteralError = @import("assign.zig").elaborateLiteralError;
 const fixTypeArgs = @import("typenode.zig").fixTypeArgs;
 const guardCallOf = @import("flow.zig").guardCallOf;
@@ -1081,6 +1082,118 @@ pub fn checkNamespace(c: *Checker, node: Node) Error!void {
     }
 }
 
+/// TS2415 / TS2416: the INSTANCE side of a derived class must extend its base
+/// — `D` assignable to `B` — which is what makes a derived member that
+/// redeclares an inherited one at an incompatible type an error rather than a
+/// silent narrowing of the instance type.
+///
+/// tsc's `checkClassLikeDeclaration`:
+///
+/// ```ts
+/// if (!checkTypeAssignableTo(typeWithThis, baseWithThis, /*errorNode*/ undefined)) {
+///     issueMemberSpecificError(node, typeWithThis, baseWithThis,
+///         Diagnostics.Class_0_incorrectly_extends_base_class_1);
+/// } else {
+///     // Report static side error only when instance type is assignable
+///     checkTypeAssignableTo(staticType, getTypeWithoutSignatures(staticBaseType), …);
+/// }
+/// ```
+///
+/// Two properties of that shape are load-bearing and are reproduced here:
+///
+///   * the pair is related ONCE with no error node, and the diagnostic is
+///     produced by a second, per-member pass (`issueMemberSpecificError`).
+///     That pass walks the class's OWN instance members and, for each name the
+///     derived and the base BOTH have, relates the two property types; every
+///     failing member reports its own TS2416. Only when no member failed —
+///     the mismatch is in an index signature, a call signature, or a member
+///     the base does not declare — does the broad TS2415 fire, once, on the
+///     class name;
+///   * the STATIC side (TS2417, `checkStaticSideExtends`) is checked only when
+///     the instance side passed, so a class whose members contradict the base
+///     reports the member, not both halves of the same story.
+///
+/// Guarded exactly as the `implements` check next to it: nothing is concluded
+/// about a class whose base ztsc could not resolve (`hasUnresolvedBase`), where
+/// the instance type is missing whatever that base contributed and the verdict
+/// would be about ztsc's gap rather than the code.
+///
+/// Returns whether the instance side is assignable, i.e. whether the caller
+/// should go on to the static side.
+pub fn checkInstanceSideExtends(c: *Checker, class_sym: SymbolId, members: []const Node, this_t: TypeId, name_token: ast.TokenIndex) Error!bool {
+    const base_ref = try c.baseClassRef(class_sym) orelse return true;
+    if (base_ref == types.error_type or base_ref == types.any_type or base_ref == this_t) return true;
+    if (try c.hasUnresolvedBase(class_sym)) return true;
+    if (try c.isAssignable(this_t, base_ref)) return true;
+
+    const derived = try c.resolveStructural(this_t);
+    const base = try c.resolveStructural(base_ref);
+    var issued = false;
+    // The per-member pass walks the SYNTAX members, in source order, exactly
+    // as tsc's `for (const member of node.members)` does. That is not just a
+    // convenient way to reach the names: it decides which members are
+    // candidates at all. A CONSTRUCTOR PARAMETER PROPERTY (`constructor(public
+    // a: string)`) declares `a` on the instance type but is not a member node,
+    // so tsc never blames it and reports the broad TS2415 instead — walking
+    // the member SCOPE, which does contain `a`, would report TS2416 where the
+    // oracle reports TS2415.
+    for (members) |member| {
+        if (member == null_node) continue;
+        const md = c.tree.nodeData(member);
+        const flags: u32 = switch (c.nodeTag(member)) {
+            .class_field => c.tree.extraData(ast.Field, md.lhs).flags,
+            .class_method => c.tree.extraData(ast.FnProto, md.lhs).flags,
+            // A decorator, an index signature, a static block, a `;` — none of
+            // them is a named member (tsc's `member.name` is undefined and
+            // `getPropertyOfType` finds nothing for the member's own symbol).
+            else => continue,
+        };
+        // tsc's `if (isStatic(member)) continue;` — this is the INSTANCE side.
+        if (flags & ast.Flags.static != 0) continue;
+        const name_atom = try c.memberKey(c.tree.nodeMainToken(member), flags);
+        if (c.isCtorName(name_atom)) continue;
+        const prop = (try c.propOfTypeEx(derived, name_atom, false)) orelse continue;
+        const base_prop = (try c.propOfTypeEx(base, name_atom, false)) orelse continue;
+        if (prop.ty == base_prop.ty) continue;
+        if (try c.isAssignable(prop.ty, base_prop.ty)) continue;
+        issued = true;
+        // tsc's `rootChain`: the TS2416 headline is the ROOT of the chain the
+        // ordinary relation would have printed, so the "Type 'X' is not
+        // assignable to type 'Y'." line the headline usually carries appears
+        // one level in, with the structural derivation under it.
+        try c.diagFmt(2416, c.tokSpan(c.tree.nodeMainToken(member)), "Property '{s}' in type '{s}' is not assignable to the same property in base type '{s}'.\n  Type '{s}' is not assignable to type '{s}'.{s}", .{
+            c.atomText(name_atom),
+            try c.typeToString(this_t),
+            try c.typeToString(base_ref),
+            try c.typeToString(prop.ty),
+            try c.typeToString(base_prop.ty),
+            try indentChain(c, try elaborate.chainText(c, prop.ty, base_prop.ty)),
+        });
+    }
+    if (!issued and name_token != 0) {
+        try c.diagFmt(2415, c.tokSpan(name_token), "Class '{s}' incorrectly extends base class '{s}'.{s}", .{
+            c.symbolName(class_sym),
+            try c.typeToString(base_ref),
+            try elaborate.chainText(c, this_t, base_ref),
+        });
+    }
+    return false;
+}
+
+/// One extra indentation level for a derivation chain nested under a headline
+/// that already spent one (`checkInstanceSideExtends`). `chainText` renders
+/// from column 2; TS2416's chain hangs off the relation line the headline
+/// pushed down, so every line moves right by two.
+fn indentChain(c: *Checker, chain: []const u8) Error![]const u8 {
+    if (chain.len == 0) return chain;
+    var out: std.Io.Writer.Allocating = .init(c.scratch());
+    for (chain) |ch| {
+        out.writer.writeByte(ch) catch return error.OutOfMemory;
+        if (ch == '\n') out.writer.writeAll("  ") catch return error.OutOfMemory;
+    }
+    return out.written();
+}
+
 /// TS2417: the static side of a derived class must extend the static side
 /// of its base — `typeof D` assignable to `typeof B`, which is what makes a
 /// derived static that shadows a base static with an incompatible type an
@@ -1106,8 +1219,10 @@ pub fn checkStaticSideExtends(c: *Checker, class_sym: SymbolId, name_token: ast.
     const base_static = try c.classStaticType(base);
     if (derived_static == base_static) return;
     if (try c.isAssignable(derived_static, base_static)) return;
-    try c.diagFmt(2417, c.tokSpan(name_token), "Class static side 'typeof {s}' incorrectly extends base class static side 'typeof {s}'.", .{
-        c.symbolName(class_sym), c.symbolName(base),
+    try c.diagFmt(2417, c.tokSpan(name_token), "Class static side 'typeof {s}' incorrectly extends base class static side 'typeof {s}'.{s}", .{
+        c.symbolName(class_sym),
+        c.symbolName(base),
+        try elaborate.chainText(c, derived_static, base_static),
     });
 }
 
@@ -1530,7 +1645,13 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
         if (!(c.ambient_ctx or data.flags & ast.Flags.declare != 0)) {
             _ = try c.checkExprCached(hd.lhs, types.no_type);
         }
-        try c.checkStaticSideExtends(class_sym, data.name_token);
+        // tsc's order: the instance side first, and the static side only when
+        // it passed (`checkClassLikeDeclaration`'s "Report static side error
+        // only when instance type is assignable").
+        const class_members = c.tree.extraRange(data.members_start, data.members_end);
+        if (try checkInstanceSideExtends(c, class_sym, class_members, this_t, data.name_token)) {
+            try c.checkStaticSideExtends(class_sym, data.name_token);
+        }
     }
 
     // implements clauses: instance assignable to each interface. Skipped

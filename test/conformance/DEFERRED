@@ -213,19 +213,3 @@ conditional/048_infer_through_homomorphic_key_set_deferred.ts  -TS2322 31
 conditional/048_infer_through_homomorphic_key_set_deferred.ts  -TS2322 37
 conditional/048_infer_through_homomorphic_key_set_deferred.ts  -TS2322 41
 conditional/048_infer_through_homomorphic_key_set_deferred.ts  -TS2322 46
-
-# TS2415/TS2416 — "Class 'D' incorrectly extends base class 'B'" and its
-# per-member elaboration — are not implemented. tsc produces them by relating
-# the DERIVED class type to the BASE class type at the declaration
-# (`checkClassLikeDeclaration` -> `issueMemberSpecificError`) and there is no
-# such check in ztsc; it is a declaration-site check, not a relation gap.
-#
-# The relation itself now answers this pair correctly, which is what the case
-# is for: the TS2322s on lines 29, 33 and 74 all match, and the three controls
-# (an add-only subclass, an identical redeclaration, a bivariant method-syntax
-# member) stay clean. Only the diagnostic AT the declaration is missing, so the
-# entries are deterministic under-reports.
-#
-# Measured 2026-08-11.
-classes/derived_redeclares_base_member.ts  -TS2416 25
-classes/derived_redeclares_base_member.ts  -TS2416 68
