@@ -1608,17 +1608,39 @@ fn resolvePackageAt(io: Io, alloc: Allocator, dir: Io.Dir, d: []const u8, pkg: [
     if (phase == .javascript) return null;
 
     // (2) Legacy resolution (exports absent or unmatched).
-    //
-    //     `typesVersions` is part of it: the pre-`exports` redirection layer,
-    //     which tsc consults BEFORE the plain candidate for a subpath and before
-    //     the `"types"` entry for the package root
-    //     (`tryLoadModuleUsingPaths`/`loadNodeModuleFromDirectoryWorker`). Three
-    //     of the outline app's dependencies ship declarations reachable ONLY
-    //     through it — `@modelcontextprotocol/sdk` (`{"*": {"*":
-    //     ["./dist/esm/*"]}}`), `@faker-js/faker`, `@simplewebauthn/server` —
-    //     and with `resolvePackageJsonExports` off there is no map left to find
-    //     them by, so skipping it would trade one family of false positives for
-    //     another.
+    return resolvePackageLegacy(io, alloc, dir, nm, pj, pj_text, sub, allow_js, fs);
+}
+
+/// tsc's legacy, pre-`exports` package entry resolution for the package rooted
+/// at `nm` (base-relative), with `pj`/`pj_text` its already-read
+/// `package.json` path and body (null when it has none). `sub` is the import
+/// subpath ("" for the package root).
+///
+/// Split out of `resolvePackageAt` because it is not specific to a
+/// `node_modules/<pkg>` directory: a tsconfig `paths` substitution that names a
+/// package directory gets the very same treatment from tsc
+/// (`resolvePathsCandidate`).
+fn resolvePackageLegacy(
+    io: Io,
+    alloc: Allocator,
+    dir: Io.Dir,
+    nm: []const u8,
+    pj: []const u8,
+    pj_text: ?[]const u8,
+    sub: []const u8,
+    allow_js: bool,
+    fs: ?*FsCache,
+) Error!?[]u8 {
+    // `typesVersions` is part of it: the pre-`exports` redirection layer,
+    // which tsc consults BEFORE the plain candidate for a subpath and before
+    // the `"types"` entry for the package root
+    // (`tryLoadModuleUsingPaths`/`loadNodeModuleFromDirectoryWorker`). Three
+    // of the outline app's dependencies ship declarations reachable ONLY
+    // through it — `@modelcontextprotocol/sdk` (`{"*": {"*":
+    // ["./dist/esm/*"]}}`), `@faker-js/faker`, `@simplewebauthn/server` —
+    // and with `resolvePackageJsonExports` off there is no map left to find
+    // them by, so skipping it would trade one family of false positives for
+    // another.
     const version_paths: ?tsconfig.Value.Object = if (pj_text) |text|
         (if (fs) |fc| try fc.packageTypesVersions(pj, text) else typesVersionsPaths(alloc, text))
     else
@@ -1716,6 +1738,65 @@ fn resolvePackageAt(io: Io, alloc: Allocator, dir: Io.Dir, d: []const u8, pkg: [
         if (try resolveStemOrJs(io, alloc, dir, idx, allow_js, fs)) |p| return p;
     }
     return null;
+}
+
+/// The file half of `resolveStem`: the extension-substitution candidates for
+/// `stem`, WITHOUT the `<stem>/index.*` legs. tsc keeps the two apart
+/// (`loadModuleFromFile`, then `loadNodeModuleFromDirectory`) and slots the
+/// directory's `package.json` between them. `resolveStem` fuses them, which is
+/// harmless for a plain relative import and wrong for a candidate that names a
+/// package directory — see `resolvePathsCandidate`.
+fn resolveFileStemFs(io: Io, alloc: Allocator, dir: Io.Dir, stem: []const u8, fs: ?*FsCache) Error!?[]u8 {
+    // A stem that already carries an extension has no `index` legs to drop:
+    // `resolveStemFs` returns file candidates only for those families.
+    if (endsWithAny(stem, &.{ ".d.mts", ".mts", ".d.cts", ".cts", ".d.ts", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs" })) {
+        return resolveStemFs(io, alloc, dir, stem, fs);
+    }
+    var buf: [3][]const u8 = undefined;
+    buf[0] = try std.fmt.allocPrint(alloc, "{s}.ts", .{stem});
+    buf[1] = try std.fmt.allocPrint(alloc, "{s}.tsx", .{stem});
+    buf[2] = try std.fmt.allocPrint(alloc, "{s}.d.ts", .{stem});
+    return tryCandidates(io, alloc, dir, buf[0..3], fs);
+}
+
+/// Load one *already substituted* tsconfig `paths` candidate — tsc's
+/// `tryLoadModuleUsingPaths`, which hands each substitution to the same
+/// "load as file, then as folder" loader the `node_modules` walk uses
+/// (`nodeLoadModuleByRelativeName` with `considerPackageJson`), `package.json`
+/// included.
+///
+/// The `package.json` step is the one that decides a candidate naming a
+/// *package directory*, and probing stems alone silently drops it. With
+/// `"*": ["./node_modules/*", "./node_modules/@types/*"]` — the idiom for a
+/// project that resolves bare specifiers through a fixed `node_modules` — a
+/// package that publishes `"types": "./types/index.d.ts"` and no top-level
+/// `index.d.ts` (sequelize) misses the FIRST substitution and lands on the
+/// DefinitelyTyped stub named by the second. The real package's own
+/// declarations then lose to `@types/<pkg>`, which tsc consults only for a
+/// package that ships no types at all: sequelize's `class Model` became
+/// `@types/sequelize`'s unrelated `interface Model`, and every static on it
+/// (`findAll`, `findByPk`, …) vanished from `typeof <model>`.
+///
+/// Candidate order is tsc's: file (extension substitution) → `package.json`
+/// (`typesVersions` → `types`/`typings` → `main`, with declaration extensions
+/// substituted for the runtime one) → `index.*`. Declarations only, exactly
+/// like the `resolveStem` this replaces — a `paths` candidate still never
+/// resolves to raw JavaScript. No `exports` map either: a substituted target is
+/// a path, not a bare package specifier, so Node's export gate does not apply
+/// (tsc reaches it through the relative loader for the same reason).
+pub fn resolvePathsCandidate(io: Io, alloc: Allocator, dir: Io.Dir, cand: []const u8) Error!?[]u8 {
+    if (try resolveFileStemFs(io, alloc, dir, cand, null)) |p| return p;
+    const pj = try std.fmt.allocPrint(alloc, "{s}/package.json", .{cand});
+    defer alloc.free(pj);
+    var pj_owned: ?[]u8 = null;
+    defer if (pj_owned) |t| alloc.free(t);
+    var pj_text: ?[]const u8 = null;
+    bumpProbe();
+    if (dir.readFileAlloc(io, pj, alloc, .limited(1 << 20))) |t| {
+        pj_owned = t;
+        pj_text = t;
+    } else |_| {}
+    return resolvePackageLegacy(io, alloc, dir, cand, pj, pj_text, "", false, null);
 }
 
 // -------------------------------------------------------------------------
@@ -2741,5 +2822,195 @@ test "resolveSpecifier: resolvePackageJsonExports gates the exports map" {
     try testing.expectEqualStrings(
         "node_modules/mapped/index.d.ts",
         (try resolveSpecifier(io, alloc, d, "src/a.ts", "mapped", off)).?,
+    );
+}
+
+// A tsconfig `paths` substitution is loaded by tsc's FULL "load as file or
+// folder" loader — `tryLoadModuleUsingPaths` hands each candidate to
+// `nodeLoadModuleByRelativeName` with `considerPackageJson`, the same loader the
+// `node_modules` walk uses. Probing stems alone (the old behaviour) drops the
+// `package.json` step, and that step is the only one that can resolve a
+// candidate naming a package directory whose declarations sit behind a `"types"`
+// pin.
+//
+// The shape below is the sequelize one, minimized: a real package with a
+// `"types"` pin and NO top-level `index.d.ts`, a `@types/<pkg>` sibling that
+// does have one, and the `"*": [node_modules/*, node_modules/@types/*]` table
+// that puts them in that order. The miss on the first substitution fell through
+// to the second, so the real package's declarations lost to the DefinitelyTyped
+// stub — an inversion of tsc's rule, which reaches `@types/<pkg>` only for a
+// package that ships no types at all.
+test "resolvePathsCandidate: a package-directory candidate resolves through package.json" {
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const d = tmp.dir;
+
+    // The real package: `"types"` points into a subdirectory, and the package
+    // root holds no `index.*` at all.
+    try d.createDirPath(io, "node_modules/orm/types");
+    try d.writeFile(io, .{ .sub_path = "node_modules/orm/package.json", .data =
+        \\{ "name": "orm", "main": "./lib/index.js", "types": "./types/index.d.ts" }
+    });
+    try d.writeFile(io, .{ .sub_path = "node_modules/orm/types/index.d.ts", .data = "" });
+    // The DefinitelyTyped stub next to it, reachable by a literal `index.d.ts`.
+    try d.createDirPath(io, "node_modules/@types/orm");
+    try d.writeFile(io, .{ .sub_path = "node_modules/@types/orm/package.json", .data =
+        \\{ "name": "@types/orm", "types": "index.d.ts" }
+    });
+    try d.writeFile(io, .{ .sub_path = "node_modules/@types/orm/index.d.ts", .data = "" });
+
+    // The first substitution resolves — through `package.json`, not a stem — so
+    // the `@types` substitution is never reached.
+    try testing.expectEqualStrings(
+        "node_modules/orm/types/index.d.ts",
+        (try resolvePathsCandidate(io, alloc, d, "node_modules/orm")).?,
+    );
+
+    // The rule is about the real package having declarations, not about `@types`
+    // coming second: a package with none still misses, and the caller's next
+    // substitution (the `@types` twin) is what answers.
+    try d.createDirPath(io, "node_modules/plainjs/lib");
+    try d.writeFile(io, .{ .sub_path = "node_modules/plainjs/package.json", .data =
+        \\{ "name": "plainjs", "main": "./lib/index.js" }
+    });
+    try d.writeFile(io, .{ .sub_path = "node_modules/plainjs/lib/index.js", .data = "" });
+    try d.createDirPath(io, "node_modules/@types/plainjs");
+    try d.writeFile(io, .{ .sub_path = "node_modules/@types/plainjs/index.d.ts", .data = "" });
+    try testing.expectEqual(
+        @as(?[]u8, null),
+        try resolvePathsCandidate(io, alloc, d, "node_modules/plainjs"),
+    );
+    try testing.expectEqualStrings(
+        "node_modules/@types/plainjs/index.d.ts",
+        (try resolvePathsCandidate(io, alloc, d, "node_modules/@types/plainjs")).?,
+    );
+
+    // `main` with no `types`: the declaration twin of the runtime entry wins,
+    // exactly as it does inside the `node_modules` walk.
+    try d.createDirPath(io, "node_modules/mainonly/lib");
+    try d.writeFile(io, .{ .sub_path = "node_modules/mainonly/package.json", .data =
+        \\{ "name": "mainonly", "main": "lib/index.js" }
+    });
+    try d.writeFile(io, .{ .sub_path = "node_modules/mainonly/lib/index.d.ts", .data = "" });
+    try testing.expectEqualStrings(
+        "node_modules/mainonly/lib/index.d.ts",
+        (try resolvePathsCandidate(io, alloc, d, "node_modules/mainonly")).?,
+    );
+
+    // `typesVersions` still redirects the entry a `paths` candidate names.
+    try d.createDirPath(io, "node_modules/versioned/dist/types");
+    try d.writeFile(io, .{ .sub_path = "node_modules/versioned/package.json", .data =
+        \\{ "name": "versioned", "types": "index.d.ts",
+        \\  "typesVersions": { ">=4.0": { "*": ["dist/types/*"] } } }
+    });
+    try d.writeFile(io, .{ .sub_path = "node_modules/versioned/dist/types/index.d.ts", .data = "" });
+    try testing.expectEqualStrings(
+        "node_modules/versioned/dist/types/index.d.ts",
+        (try resolvePathsCandidate(io, alloc, d, "node_modules/versioned")).?,
+    );
+
+    // Order is tsc's: the directory's `package.json` beats its `index.*`, and a
+    // FILE candidate beats the directory entirely.
+    try d.createDirPath(io, "node_modules/both/decls");
+    try d.writeFile(io, .{ .sub_path = "node_modules/both/package.json", .data =
+        \\{ "name": "both", "types": "./decls/main.d.ts" }
+    });
+    try d.writeFile(io, .{ .sub_path = "node_modules/both/decls/main.d.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "node_modules/both/index.d.ts", .data = "" });
+    try testing.expectEqualStrings(
+        "node_modules/both/decls/main.d.ts",
+        (try resolvePathsCandidate(io, alloc, d, "node_modules/both")).?,
+    );
+    try d.writeFile(io, .{ .sub_path = "node_modules/both.d.ts", .data = "" });
+    try testing.expectEqualStrings(
+        "node_modules/both.d.ts",
+        (try resolvePathsCandidate(io, alloc, d, "node_modules/both")).?,
+    );
+
+    // The candidate shapes that already worked are untouched: a plain source
+    // file (the `@server/*` mapping), a directory carrying only an `index.*` and
+    // no package.json, and a target naming a declaration file outright
+    // (outline's `vite` mapping).
+    try d.createDirPath(io, "server/models/base");
+    try d.writeFile(io, .{ .sub_path = "server/models/base/Model.ts", .data = "" });
+    try d.createDirPath(io, "shared/utils");
+    try d.writeFile(io, .{ .sub_path = "shared/utils/index.ts", .data = "" });
+    try testing.expectEqualStrings(
+        "server/models/base/Model.ts",
+        (try resolvePathsCandidate(io, alloc, d, "server/models/base/Model")).?,
+    );
+    try testing.expectEqualStrings(
+        "shared/utils/index.ts",
+        (try resolvePathsCandidate(io, alloc, d, "shared/utils")).?,
+    );
+    try testing.expectEqualStrings(
+        "node_modules/orm/types/index.d.ts",
+        (try resolvePathsCandidate(io, alloc, d, "node_modules/orm/types/index.d.ts")).?,
+    );
+    // Nothing there at all stays null, so the caller tries the next substitution.
+    try testing.expectEqual(
+        @as(?[]u8, null),
+        try resolvePathsCandidate(io, alloc, d, "node_modules/nosuch"),
+    );
+}
+
+// The end-to-end shape the fix is for, driven through the same two-step the CLI
+// driver performs (`Paths.mapSpecifier` → `resolvePathsCandidate` per candidate,
+// in order): the `"*"` table, a real package with a `"types"` pin, its `@types`
+// sibling, and an importer that lives INSIDE `node_modules` — tsc applies
+// `paths` to those importers too, so this is the sequelize-typescript case.
+test "paths: the real package's types pin beats the @types sibling, node_modules importer included" {
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const d = tmp.dir;
+
+    try d.createDirPath(io, "src");
+    try d.writeFile(io, .{ .sub_path = "src/a.ts", .data = "" });
+    try d.createDirPath(io, "node_modules/orm/types");
+    try d.writeFile(io, .{ .sub_path = "node_modules/orm/package.json", .data =
+        \\{ "name": "orm", "main": "./lib/index.js", "types": "./types/index.d.ts" }
+    });
+    try d.writeFile(io, .{ .sub_path = "node_modules/orm/types/index.d.ts", .data = "" });
+    try d.createDirPath(io, "node_modules/@types/orm");
+    try d.writeFile(io, .{ .sub_path = "node_modules/@types/orm/index.d.ts", .data = "" });
+    // The intermediate package whose declarations import the real one.
+    try d.createDirPath(io, "node_modules/orm-decorators/dist");
+    try d.writeFile(io, .{ .sub_path = "node_modules/orm-decorators/package.json", .data =
+        \\{ "name": "orm-decorators", "types": "dist/index.d.ts" }
+    });
+    try d.writeFile(io, .{ .sub_path = "node_modules/orm-decorators/dist/index.d.ts", .data = "" });
+
+    const table: tsconfig.Paths = .{
+        .keys = &.{"*"},
+        .vals = &.{&.{ "./node_modules/*", "./node_modules/@types/*" }},
+        .base = ".",
+    };
+    // `mapSpecifier` yields the substitutions in table order; the driver takes
+    // the first that loads. Both importers — the project file and the one inside
+    // `node_modules` — go through the same table and must land on the real
+    // package.
+    const cands = try table.mapSpecifier(alloc, "orm");
+    try testing.expectEqual(@as(usize, 2), cands.len);
+    try testing.expectEqualStrings("node_modules/orm", cands[0]);
+    try testing.expectEqualStrings("node_modules/@types/orm", cands[1]);
+    try testing.expectEqualStrings(
+        "node_modules/orm/types/index.d.ts",
+        (try resolvePathsCandidate(io, alloc, d, cands[0])).?,
+    );
+
+    // And the `orm-decorators` entry the project imports resolves through its
+    // own `"types"` pin the same way.
+    const dec = try table.mapSpecifier(alloc, "orm-decorators");
+    try testing.expectEqualStrings(
+        "node_modules/orm-decorators/dist/index.d.ts",
+        (try resolvePathsCandidate(io, alloc, d, dec[0])).?,
     );
 }
