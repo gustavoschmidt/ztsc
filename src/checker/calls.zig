@@ -843,6 +843,19 @@ pub fn resolveSignatureCall(
         if (d.file != c.cur_file) continue;
         if (d.span.start < call_span.start or d.span.start >= call_span.end) continue;
         anchor = d.span;
+        // Map it up to the ARGUMENT that contains it. Reaching this fallback
+        // means the re-check related every argument cleanly even though
+        // `argumentsMatch` rejected them all — the two are not the same test
+        // (freshness and the excess-property gate reject only in the first) —
+        // so the only diagnostics in range are incidental ones from inside an
+        // argument. tsc's error node is an argument either way.
+        for (arg_nodes) |an| {
+            if (an == null_node) continue;
+            const full = c.nodeSpan(an);
+            if (d.span.start < full.start or d.span.start >= full.end) continue;
+            anchor = argErrorSpan(c, an);
+            break;
+        }
         break;
     }
     c.rollbackDiags(saved, .{ .file = c.cur_file, .lo = call_span.start, .hi = call_span.end });
