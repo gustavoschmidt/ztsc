@@ -326,28 +326,49 @@ fn weightedLevTenths(a: []const u8, b: []const u8, cap_tenths: usize, scratch: [
     return if (res > cap_tenths) null else res;
 }
 
+/// tsc's initial `bestDistance` for a name of `name_len` characters —
+/// `floor(len*0.4)+1` — expressed in tenths as an INCLUSIVE acceptance bound
+/// (tsc compares against `bestDistance - 0.1`, so the largest distance that
+/// still qualifies is one tenth below the bound itself).
+pub fn spellInitialCapTenths(name_len: usize) usize {
+    return (name_len * 40 / 100 + 1) * 10 - 1;
+}
+
+/// The distance ONE candidate scores against `name` under tsc's
+/// `getSpellingSuggestion` rules, or null when the candidate is inadmissible
+/// or scores worse than `cap_tenths`. Split out of `spellingSuggestion` for
+/// the callers that own their candidate iteration (the checker's scope walk
+/// and property walk, which need their own deterministic tie-break and a
+/// shrinking bound). `scratch` must hold at least `2 * (cand.len + 1)` slots.
+///
+/// The admissibility filters are tsc's, in tsc's order: the
+/// `maximumLengthDifference = max(2, floor(len*0.34))` length pre-filter, the
+/// identical-name skip, and the rule that a candidate under three characters
+/// only competes when it differs from `name` by CASE alone.
+pub fn spellCandidateDistance(name: []const u8, cand: []const u8, cap_tenths: usize, scratch: []usize) ?usize {
+    const max_len_diff: usize = @max(2, name.len * 34 / 100);
+    const diff = if (cand.len > name.len) cand.len - name.len else name.len - cand.len;
+    if (diff > max_len_diff) return null;
+    if (std.mem.eql(u8, cand, name)) return null;
+    if (cand.len < 3 and !eqlIgnoreCase(cand, name)) return null;
+    return weightedLevTenths(name, cand, cap_tenths, scratch);
+}
+
 /// tsc's `getSpellingSuggestion` (core.ts): pick the closest candidate name to
 /// `name` under the weighted edit distance, or null when none is close enough.
-/// Thresholds match tsc exactly — `maximumLengthDifference = max(2,
-/// floor(len*0.34))` (a length pre-filter) and an initial best distance of
-/// `floor(len*0.4)+1`. Ties on distance are broken toward the
+/// Thresholds match tsc exactly — see `spellCandidateDistance` and
+/// `spellInitialCapTenths`. Ties on distance are broken toward the
 /// lexicographically-smaller name so the choice is stable across --workers
 /// (the determinism contract), where tsc would take iteration order.
 /// Returns the winning index into `candidates`, or null.
 pub fn spellingSuggestion(gpa: Allocator, name: []const u8, candidates: []const []const u8) ?usize {
     if (name.len == 0) return null;
-    const max_len_diff: usize = @max(2, name.len * 34 / 100);
-    // Initial threshold (tenths): (floor(len*0.4)+1)*10. A candidate is
-    // accepted when its distance is strictly below the current threshold, i.e.
-    // distance_tenths <= threshold_tenths - 1 (tsc's `bestDistance - 0.1`).
-    // Acceptance threshold (tenths): a candidate qualifies when its distance is
-    // strictly below `floor(len*0.4)+1` (tsc's `bestDistance - 0.1`), i.e.
-    // distance_tenths <= threshold_tenths - 1. The threshold is FIXED here (not
-    // lowered as tsc does) so every qualifying candidate competes; the global
-    // minimum is then chosen with a deterministic lexicographic tie-break. This
-    // yields tsc's global-minimum pick while staying byte-identical across
-    // --workers regardless of candidate iteration order.
-    const cap: usize = (name.len * 40 / 100 + 1) * 10 - 1;
+    // The bound is FIXED here (not lowered as tsc does) so every qualifying
+    // candidate competes; the global minimum is then chosen with a
+    // deterministic lexicographic tie-break. This yields tsc's global-minimum
+    // pick while staying byte-identical across --workers regardless of
+    // candidate iteration order.
+    const cap: usize = spellInitialCapTenths(name.len);
     var best: ?usize = null;
     var best_d: usize = undefined;
     // DP scratch sized for the longest candidate.
@@ -356,11 +377,7 @@ pub fn spellingSuggestion(gpa: Allocator, name: []const u8, candidates: []const 
     const scratch = gpa.alloc(usize, 2 * (max_cand + 1)) catch return null;
     defer gpa.free(scratch);
     for (candidates, 0..) |cand, i| {
-        const diff = if (cand.len > name.len) cand.len - name.len else name.len - cand.len;
-        if (diff > max_len_diff) continue;
-        if (std.mem.eql(u8, cand, name)) continue;
-        if (cand.len < 3 and !eqlIgnoreCase(cand, name)) continue;
-        const d = weightedLevTenths(name, cand, cap, scratch) orelse continue;
+        const d = spellCandidateDistance(name, cand, cap, scratch) orelse continue;
         if (best == null or d < best_d or
             (d == best_d and std.mem.order(u8, cand, candidates[best.?]) == .lt))
         {

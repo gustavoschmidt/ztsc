@@ -1556,15 +1556,17 @@ pub fn classInstanceGeneric(c: *Checker, sym0: SymbolId) Error!TypeId {
     if (iface_half) {
         result = try c.mergeBaseObject(result, try c.interfaceConstituentDirect(sym, sym), true);
     }
-    // Merge base class instance. A base whose own table is still
-    // materializing further down this stack resolves to `err`, which
-    // `mergeBaseObject`'s object-only guard drops — the derived instance
-    // then silently loses EVERY inherited member. The fold still cuts (there
-    // is nothing else it could do mid-cycle), but the incomplete table it
-    // produced is marked provisional so it is never memoized.
+    // Merge base class instance. A base this checker cannot see completely
+    // right now resolves to `err`, which `mergeBaseObject`'s object-only guard
+    // drops — the derived instance then silently loses EVERY inherited member.
+    // The fold still cuts (there is nothing else it could do mid-cycle), but
+    // the incomplete table it produced is marked provisional so it is never
+    // memoized. `baseRefCut` decides; see there for the three ways a base cuts.
     if (try c.baseClassRef(sym)) |base_ref| {
-        result = try c.mergeBaseObject(result, try c.resolveStructural(base_ref), false);
+        const bstruct = try c.resolveStructural(base_ref);
+        result = try c.mergeBaseObject(result, bstruct, false);
         if (c.baseRefProvisional(base_ref)) provisional = true;
+        if (c.ts.kind(bstruct) == .err and c.baseRefCut(base_ref)) provisional = true;
     } else if (try c.baseExprConstructType(sym)) |base_ctor| {
         // `extends <value with construct signatures>`: the base instance is
         // the construct signature's return type — and when the base is an
@@ -1575,7 +1577,9 @@ pub fn classInstanceGeneric(c: *Checker, sym0: SymbolId) Error!TypeId {
         // is a no-op for the single-base case.
         for (0..c.ts.objectConstructSigCount(base_ctor)) |i| {
             const ret = c.ts.fnReturn(c.ts.objectConstructSig(base_ctor, @intCast(i)));
-            result = try c.mergeBaseObject(result, try c.resolveStructural(ret), false);
+            const rstruct = try c.resolveStructural(ret);
+            result = try c.mergeBaseObject(result, rstruct, false);
+            if (c.ts.kind(rstruct) == .err and (c.baseRefProvisional(ret) or c.baseRefCut(ret))) provisional = true;
         }
     }
     // Cross-file `declare module` augmentation: an `interface Map`
@@ -1632,6 +1636,42 @@ pub fn baseRefProvisional(c: *Checker, base_ref: TypeId) bool {
     return c.classTableProvisional(sym);
 }
 
+/// A base folded to `err`: was that a CUT — a fact about this checker's
+/// current stack — rather than a fact about the base itself?
+///
+/// A GENERIC base has two independent memos on the way to its member table,
+/// and `classTableProvisional` only watches the first. `class_inst_generic`
+/// holds the un-substituted table (`classInstanceGeneric`); `expansions` holds
+/// the substitution of it for one argument list (`expandRef`). Either can be
+/// the frame we are nested inside, and either cuts to `err`:
+///
+///   * the base class's own generic table is still materializing further down
+///     the stack — `baseRefProvisional`, checked by the caller;
+///   * that table is COMPLETE, but substituting THESE type arguments into it
+///     is a frame we are nested inside, so `expansions[base_ref]` is still
+///     the in-progress marker. outline's `class CollectionsStore extends
+///     Store<Collection>` is exactly this shape: `Store`'s generic table is
+///     long finished, and materializing `Store<Collection>` is what re-entered
+///     `CollectionsStore`, so `classTableProvisional(Store)` truthfully says
+///     "complete" while `Store<Collection>` answers `err`. Every one of
+///     `CollectionsStore`'s 40-odd inherited members — `add`, `fetch`,
+///     `rootStore`, `isLoaded` — was dropped and the 24-member remainder
+///     memoized for the rest of the run;
+///   * the substitution ran out of budget inside THIS budget window
+///     (`trunc_expansions`) — `expandRef` withdraws its own memo for that and
+///     the same reasoning applies one level up.
+///
+/// Only consulted when the base actually resolved to `err`, so a base that is
+/// legitimately non-object (an `any` mixin, an intersection) is untouched, and
+/// a class whose base is permanently unresolvable still memoizes its table
+/// rather than rebuilding it on every property access.
+pub fn baseRefCut(c: *Checker, base_ref: TypeId) bool {
+    if (c.ts.kind(base_ref) != .ref) return false;
+    if (c.expansions.get(base_ref)) |e| return e == types.no_type;
+    if (c.trunc_expansions.get(base_ref)) |epoch| return epoch == c.budget_epoch;
+    return false;
+}
+
 /// Fold the `extends` bases written on a class's same-file `interface` half
 /// into its instance type; members already in `acc` (the class's own and the
 /// interface half's declared members, plus the class's `extends` base) win.
@@ -1645,8 +1685,10 @@ pub fn classInterfaceHalfBases(c: *Checker, sym: SymbolId, acc: TypeId, provisio
     try c.interfaceHeritageTypes(sym, &bases);
     var own = acc;
     for (bases.items) |b| {
-        own = try c.mergeBaseResolved(own, try c.resolveStructural(b));
+        const rb = try c.resolveStructural(b);
+        own = try c.mergeBaseResolved(own, rb);
         if (c.baseRefProvisional(b)) provisional.* = true;
+        if (c.ts.kind(rb) == .err and c.baseRefCut(b)) provisional.* = true;
     }
     return own;
 }
