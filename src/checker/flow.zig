@@ -176,6 +176,24 @@ pub const RefKey = struct {
     /// 1-based `deep_path_list` id, or 0 when the path is inline.
     deep: u16 = 0,
     len: u8 = 0,
+    /// A `strictPropertyInitialization` query (`thisPropUnassigned`) rather
+    /// than an ordinary narrowing query: the walk starts from tsc's
+    /// `initialType` — `declared | undefined` — instead of the declared type,
+    /// so that reaching the top of the constructor's flow *is* the answer
+    /// "this path never wrote the property". tsc passes the two types
+    /// separately (`getFlowTypeOfReference(ref, declaredType, initialType)`);
+    /// ztsc's walk carries one, so the difference rides in the reference key.
+    ///
+    /// It has to live in the KEY rather than beside it: `FlowQ` interns
+    /// `(flow, reference, declared)` and caches the answer under it, and the
+    /// same triple is queried both ways — an ordinary read of `this.x` inside
+    /// the constructor asks for the same reference at the same flow node with
+    /// the same declared type, and must not read back an initialization
+    /// verdict (or leave one behind). Riding in the key makes the two query
+    /// families disjoint by construction, and it is free: it fills the
+    /// padding byte `deep`/`len` already left in a 20-byte struct, so `RefQ`
+    /// keeps its 24-byte commitment.
+    opt_init: bool = false,
 };
 
 /// One interned over-deep link sequence (see `RefKey.deep`). Slots past
@@ -955,6 +973,16 @@ pub fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, d
     switch (b.flow_tags[flow]) {
         .none => return declared,
         .start => {
+            // tsc's `initialType`, taken at the top of the flow graph (see
+            // `RefKey.opt_init`): the constructor has not run yet, so the
+            // property still reads `undefined`. This is the ONLY place
+            // `undefined` enters a `strictPropertyInitialization` walk — a
+            // definite write answers the declared type, and narrowing can
+            // only ever remove constituents — which is what makes "the answer
+            // still admits `undefined`" mean "some path left it unwritten".
+            if (key.opt_init) {
+                return c.ts.makeUnion(c.scratch(), &.{ declared, types.undefined_type });
+            }
             // A function/arrow body's start records its definition-point
             // flow as the antecedent. For a constant bare-identifier
             // reference captured by this closure, continue analysis in the
@@ -1069,6 +1097,22 @@ pub fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, d
         .cond_true, .cond_false => {
             const cond = b.flowNode(flow);
             const ante = b.flow_a[flow];
+            // tsc's `createFlowCondition`: the edge that contradicts a literal
+            // `true`/`false` KEYWORD does not exist. That is what makes
+            // `while (true) { this.x = v; break; }` a definite assignment —
+            // the loop's fall-out edge is unreachable, so the only way past
+            // the loop is the `break`, after the write. (`while (1)` is *not*
+            // covered, in tsc either: only the two keywords are.)
+            //
+            // Applied to initialization queries alone. It is tsc's rule for
+            // every reference, but ztsc's binder builds both edges
+            // unconditionally today, and retrofitting the rule into the graph
+            // would re-shape narrowing for all of them — a change with its own
+            // measurement, not a side effect of this one.
+            if (key.opt_init and cond != null_node) {
+                const dead: ast.Tag = if (b.flow_tags[flow] == .cond_true) .false_literal else .true_literal;
+                if (c.nodeTag(cond) == dead) return types.never_type;
+            }
             const before = try c.flowType(ante, key, declared, depth + 1);
             if (before == types.never_type) return before;
             const sense = b.flow_tags[flow] == .cond_true;
@@ -1101,6 +1145,15 @@ pub fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, d
         .call_stmt => {
             const call = b.flowNode(flow);
             const ante = b.flow_a[flow];
+            // tsc's `getTypeAtFlowCall`: a call statement whose signature
+            // returns `never` ENDS the flow (`unreachableNeverType`). ztsc
+            // normally asks that question once, at the end of the walk
+            // (`flowTypeOfKey`'s reachability test), which is all an ordinary
+            // read needs — it just wants its declared type back. An
+            // initialization query has to see it *here*: a `never` call is what
+            // makes `constructor() { fail(); }` initialize everything, because
+            // nothing flows out of the constructor at all.
+            if (key.opt_init and try callStmtReturnsNever(c, flow)) return types.never_type;
             const before = try c.flowType(ante, key, declared, depth + 1);
             if (before == types.never_type) return before;
             // The assertion callee is re-checked here; resolve it in the
@@ -1291,6 +1344,109 @@ pub fn assignmentRefines(c: *Checker, declared: TypeId) bool {
     };
 }
 
+/// Does a write with this assignment operator INITIALIZE the property — i.e.
+/// can `undefined` not survive it on any path?
+///
+/// `=` does. So do `??=` and `||=`, and not because tsc classifies them as
+/// `AssignmentKind.Definite` (it does, via
+/// `isLogicalOrCoalescingAssignmentOperator`) but because of what their flow
+/// graph says: tsc binds `x ??= v` as a conditional, and the branch that
+/// *skips* the write is the one where `x` was already non-nullish — truthy, for
+/// `||=` — so neither branch leaves `undefined` behind. `&&=` is the mirror
+/// image: its skipping branch is the FALSY one, which keeps `undefined`, so
+/// `this.x &&= v` never initializes `x` and the oracle still reports TS2564.
+/// ztsc's binder builds one unconditional assign node for all three, so the
+/// distinction is drawn here rather than in the graph; the verdict is the same.
+///
+/// Every other compound operator reads before it writes and is not a definite
+/// write in tsc either (`AssignmentKind.Compound`, whose arm hands back the type
+/// from before the write).
+fn definiteAssignOp(op: scanner.Tag) bool {
+    return switch (op) {
+        .eq, .pipe_pipe_eq, .question_question_eq => true,
+        else => false,
+    };
+}
+
+/// Does the destructuring-assignment target `node` write the reference `key`
+/// anywhere inside it? Every element target of an object/array cover-grammar
+/// pattern is its own definite write in tsc's flow graph, and nesting, defaults
+/// and rest elements make the shape arbitrary, so this is a syntactic search
+/// rather than a positional decode.
+///
+/// Over-approximating is the safe direction: a `this.x` that appears only in an
+/// element's DEFAULT expression is a read, and counting it as a write can only
+/// lose a TS2564, never invent one. Nested function bodies are excluded — a
+/// `this.x` there is not part of this write at all.
+fn patternWritesRef(c: *Checker, node: Node, key: RefKey) Error!bool {
+    if (node == null_node) return false;
+    if (try c.refMatches(node, key)) return true;
+    switch (c.nodeTag(node)) {
+        .arrow_fn, .function_expr, .function_decl, .object_method, .class_decl => return false,
+        else => {},
+    }
+    var it = c.tree.childIterator(node);
+    while (it.next()) |child| {
+        if (try patternWritesRef(c, child, key)) return true;
+    }
+    return false;
+}
+
+/// Is `target` the element access `this["<key's member>"]` — the string-index
+/// spelling of the one-link `this`-rooted reference `key` stands for? See the
+/// call site for why the equivalence lives here and not in `refMatchesPath`.
+fn writesThisStringIndex(c: *Checker, target: Node, key: RefKey) Error!bool {
+    if (key.sym != this_flow_root or key.len != 1 or key.deep != 0) return false;
+    if (key.path[0].isIndex()) return false;
+    var n = c.referenceCandidate(target);
+    while (c.nodeTag(n) == .paren_expr) n = c.tree.nodeData(n).lhs;
+    switch (c.nodeTag(n)) {
+        .index_expr, .optional_index_expr => {},
+        else => return false,
+    }
+    const d = c.tree.nodeData(n);
+    if (c.nodeTag(d.lhs) != .this_expr) return false;
+    var idx = d.rhs;
+    while (c.nodeTag(idx) == .paren_expr) idx = c.tree.nodeData(idx).lhs;
+    if (c.nodeTag(idx) != .string_literal) return false;
+    return (try c.memberAtom(c.tree.nodeMainToken(idx))) == key.path[0].atom();
+}
+
+/// tsc's `containsUndefinedType`: does `t` have an `undefined` constituent?
+/// Strictly `undefined` — `void` is a separate type there
+/// (`getFalsyFlags(voidType) & TypeFlags.Undefined` is 0), which is why tsc
+/// reports TS2564 for an uninitialized `x: void` and not for `x: undefined`.
+/// `containsUndefinedish` folds the two together and is the wrong predicate
+/// here.
+pub fn hasUndefinedMember(c: *Checker, t: TypeId) bool {
+    return c.unionAnyMember(t, struct {
+        fn f(ch: *Checker, m: TypeId) bool {
+            return ch.ts.kind(m) == .undefined;
+        }
+    }.f);
+}
+
+/// tsc's `isPropertyInitializedInConstructor`, inverted: does some path
+/// reaching `flow` leave `this.<name>` unwritten?
+///
+/// `flow` is the constructor's RETURN join (the binder's `flowAt(ctor)`, tsc's
+/// `returnFlowNode`) for TS2564, or a reference's own flow node for TS2565.
+/// The walk is the ordinary narrowing walk with `RefKey.opt_init` set, so
+/// `undefined` enters only at the top of the constructor's flow and only a
+/// definite write or a narrowing can remove it.
+///
+/// `false` on anything untrackable (an unfoldable member atom, a path the
+/// interner refused): the property is then treated as initialized, which is the
+/// under-reporting side.
+pub fn thisPropUnassigned(c: *Checker, flow: FlowId, name: Atom, declared: TypeId) Error!bool {
+    if (!PathElem.memberFits(name)) return false;
+    const elems = [1]PathElem{.member(name)};
+    var key = (try c.makeRefKey(this_flow_root, elems[0..])) orelse return false;
+    key.opt_init = true;
+    const t = try c.flowType(flow, key, declared, 0);
+    return hasUndefinedMember(c, t);
+}
+
 /// If the assign-flow node writes the reference (or invalidates a
 /// property path by writing its root), the type after the assignment;
 /// null when it is unrelated.
@@ -1341,6 +1497,15 @@ pub fn assignNarrows(c: *Checker, target: Node, key: RefKey, declared: TypeId) E
             // Full path write: <ref> = v narrows the tracked reference.
             if (key.len != 0 and try c.refMatches(d.lhs, key)) {
                 const op = c.tree.tokens.tag(c.tree.nodeMainToken(target));
+                // A COMPOUND write is not an initialization: tsc's
+                // `getAssignmentTargetKind` calls `=` and the three logical
+                // assignments *definite* and everything else compound, and its
+                // compound arm hands back the type from BEFORE the write — so
+                // `this.x += 1` in a constructor still leaves TS2564 (and
+                // reports TS2565 for the read the operator performs). ztsc's
+                // arm below instead types the whole expression, which answers
+                // the declared type: right for narrowing, wrong here.
+                if (key.opt_init and !definiteAssignOp(op)) return null;
                 // A compound assignment writes a PATH exactly as it writes a
                 // variable, and tsc narrows both (a property access is a
                 // reference in the flow graph). `session.startSegment ??= i`
@@ -1406,11 +1571,44 @@ pub fn assignNarrows(c: *Checker, target: Node, key: RefKey, declared: TypeId) E
                 }
                 return declared;
             }
+            // A destructuring assignment can write a `this` property —
+            // `({ a: this.a } = o)`, `[this.a] = arr`, `({ a: this.a = d } = o)`.
+            // tsc records each element target as its own definite write
+            // (`bindDestructuringTargetFlow`); ztsc's narrowing does not track
+            // property paths through a pattern and answers "unrelated", which
+            // is a sound loss of narrowing but would MANUFACTURE a TS2564.
+            // Only the initialization query needs the write, and only its
+            // presence, so the pattern is scanned for the reference itself.
+            if (key.opt_init) {
+                const op = c.tree.tokens.tag(c.tree.nodeMainToken(target));
+                switch (c.nodeTag(d.lhs)) {
+                    .object_literal, .array_literal, .object_pattern, .array_pattern => {
+                        if (try patternWritesRef(c, d.lhs, key)) return declared;
+                    },
+                    // `this["x"] = v` writes the same property as `this.x = v`
+                    // — tsc's `isMatchingReference` compares accesses through
+                    // `getAccessedPropertyName`, which reads a string-literal
+                    // index as a property name. ztsc's narrowing does not
+                    // unify the two spellings (the binder only tracks an
+                    // element access indexed by a number or a stable
+                    // identifier), and widening it there would re-shape
+                    // narrowing for every reference; the initialization query
+                    // needs only to see the WRITE, so the widening is here.
+                    .index_expr, .optional_index_expr => {
+                        if (definiteAssignOp(op) and try writesThisStringIndex(c, d.lhs, key)) return declared;
+                    },
+                    else => {},
+                }
+            }
             return null;
         },
         .prefix_unary, .postfix_unary => {
             const d = c.tree.nodeData(target);
             if (try c.refMatches(d.lhs, key)) {
+                // `this.x++` is compound in tsc's sense: see the note in the
+                // `.assign` arm. It reads before it writes, so it neither
+                // initializes the property nor hides TS2565.
+                if (key.opt_init) return null;
                 return try c.assignmentReduced(declared, types.number_type);
             }
             if (try c.refPrefixWritten(d.lhs, key)) return declared;

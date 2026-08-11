@@ -1151,6 +1151,311 @@ fn checkFieldInitSelfRefs(c: *Checker, members: []const Node, field: Node, expr:
     while (it.next()) |child| try checkFieldInitSelfRefs(c, members, field, child);
 }
 
+/// One instance property declaration that `strictPropertyInitialization` has
+/// to judge: it has no initializer, no `!`, a type that cannot be `undefined`,
+/// and a name the flow graph can key. Collected while the members are checked
+/// (the annotation is typed exactly once, by the member walk) and judged after,
+/// so the constructor's body has been checked before its flow is queried.
+const InitCand = struct { member: Node, ty: TypeId };
+
+/// tsc's `isPropertyWithoutInitializer` plus the surrounding filters in
+/// `checkPropertyInitialization`, applied to one `class_field`:
+///
+///   * an initializer, a definite-assignment assertion (`x!:`), `abstract`, a
+///     `declare` modifier or `static` all exempt the declaration outright
+///     (`static` because TS2564 is an *instance* check — the outer loop tests
+///     `!isStatic(member)`);
+///   * `?` exempts it because the property type then includes `undefined`,
+///     which is also what exempts an explicit `| undefined`, `any` and
+///     `unknown` (`type.flags & AnyOrUnknown || containsUndefinedType(type)`);
+///   * the name must be an identifier, a private name or a computed name —
+///     tsc's `isIdentifier(propName) || isPrivateIdentifier(propName) ||
+///     isComputedPropertyName(propName)` — so a QUOTED or numeric member name
+///     (`"quoted": string`) is silently skipped, verified against the oracle.
+///
+/// A computed name is skipped here rather than reported: ztsc keys such a
+/// member by a placeholder atom (`memberNameKey`) that a `this[k]` write does
+/// not produce, so the flow query could not see the write and would invent a
+/// TS2564. A documented under-report — the alternative manufactures errors.
+fn initCandidate(c: *Checker, member: Node, e: ast.Field, ann: TypeId) bool {
+    if (e.init != 0) return false;
+    const exempt = ast.Flags.definite | ast.Flags.abstract | ast.Flags.declare |
+        ast.Flags.static | ast.Flags.optional | ast.Flags.computed;
+    if (e.flags & exempt != 0) return false;
+    switch (c.tree.tokens.tag(c.tree.nodeMainToken(member))) {
+        .string_literal, .numeric_literal => return false,
+        else => {},
+    }
+    if (ann == types.no_type or ann == types.error_type) return false;
+    switch (c.ts.kind(ann)) {
+        .any, .unknown, .err => return false,
+        else => {},
+    }
+    return !c.hasUndefinedMember(ann);
+}
+
+/// tsc's `findConstructorDeclaration`: the class's own constructor *with a
+/// body* (an overload signature is not the implementation), or `null_node`.
+/// A base class's constructor does not count — the check is per class.
+fn constructorWithBody(c: *Checker, members: []const Node) Node {
+    for (members) |m| {
+        if (m == null_node or c.nodeTag(m) != .class_method) continue;
+        const md = c.tree.nodeData(m);
+        if (md.rhs == 0) continue;
+        const proto = c.tree.extraData(ast.FnProto, md.lhs);
+        if (proto.flags & ast.Flags.static != 0) continue;
+        if (c.tree.tokens.tag(c.tree.nodeMainToken(m)) != .keyword_constructor) continue;
+        return m;
+    }
+    return null_node;
+}
+
+/// Is `node` (a call expression) an IIFE — tsc's
+/// `getImmediatelyInvokedFunctionExpression`, whose body the binder there folds
+/// into the *containing* control flow (`isImmediatelyInvoked` in
+/// `bindContainer`)? Async and generator functions are excluded, as they are
+/// there: their bodies do not run to completion at the call.
+fn iifeBody(c: *Checker, node: Node) Node {
+    switch (c.nodeTag(node)) {
+        .call_expr, .call_expr_targs => {},
+        else => return null_node,
+    }
+    var callee = c.callShape(node).callee;
+    while (c.nodeTag(callee) == .paren_expr) callee = c.tree.nodeData(callee).lhs;
+    const cd = c.tree.nodeData(callee);
+    switch (c.nodeTag(callee)) {
+        .arrow_fn, .function_expr => {
+            const proto = c.tree.extraData(ast.FnProto, cd.lhs);
+            if (proto.flags & (ast.Flags.async | ast.Flags.generator) != 0) return null_node;
+            return cd.rhs;
+        },
+        else => return null_node,
+    }
+}
+
+/// Does the constructor body contain either construct whose flow ztsc models
+/// more widely than tsc — an IIFE, or a `try` with a `finally`? Asked once per
+/// constructor so that `writeHiddenFromFlow`, which is a walk per PROPERTY, is
+/// only ever run for the constructors that can actually need it (a class with
+/// forty uninitialized fields otherwise pays forty body walks for nothing).
+fn ctorHasWidenedFlow(c: *Checker, node: Node) bool {
+    if (node == null_node) return false;
+    switch (c.nodeTag(node)) {
+        .class_decl => return false,
+        .arrow_fn, .function_expr, .function_decl, .object_method => return false,
+        .try_stmt => {
+            if (c.tree.extraData(ast.Try, c.tree.nodeData(node).rhs).finally_block != 0) return true;
+        },
+        else => {},
+    }
+    if (iifeBody(c, node) != null_node) return true;
+    var it = c.tree.childIterator(node);
+    while (it.next()) |child| {
+        if (ctorHasWidenedFlow(c, child)) return true;
+    }
+    return false;
+}
+
+/// Does the constructor body write `this.<name>` somewhere ztsc's flow graph
+/// cannot carry the write to the constructor's exit? Two constructs, both of
+/// which tsc models more precisely:
+///
+///   * an IIFE — tsc binds its body into the containing flow, so
+///     `(() => { this.x = v; })()` initializes `x`; ztsc gives every
+///     function-like its own flow graph, and the write is invisible from
+///     outside;
+///   * the `try`/`catch` blocks of a `try … finally` — tsc's `FlowReduceLabel`
+///     re-runs the finally body's flow restricted to the *normal exit* edges,
+///     so `try { this.x = v; } finally {}` initializes `x`; ztsc has no reduce
+///     label and joins the pre-`try` edge into the statement's exit, which
+///     unions the write away.
+///
+/// Where the graph is too wide the flow verdict is "not assigned", so both would
+/// manufacture a TS2564 on code tsc accepts. Suppressing on the syntactic write
+/// is the under-reporting side of both — a write inside a *conditional* IIFE
+/// (or one whose `try` sits in a branch) is a report tsc makes and ztsc does
+/// not, which is the accepted direction.
+fn writeHiddenFromFlow(c: *Checker, node: Node, name: intern.Atom, hidden: bool) Error!bool {
+    if (node == null_node) return false;
+    switch (c.nodeTag(node)) {
+        // A nested class's members are not this constructor's writes, and a
+        // non-invoked function body never runs at construction time.
+        .class_decl => return false,
+        .arrow_fn, .function_expr, .function_decl, .object_method => return false,
+        .try_stmt => {
+            const d = c.tree.nodeData(node);
+            const e = c.tree.extraData(ast.Try, d.rhs);
+            const lost = hidden or e.finally_block != 0;
+            if (try writeHiddenFromFlow(c, d.lhs, name, lost)) return true;
+            if (try writeHiddenFromFlow(c, e.catch_clause, name, lost)) return true;
+            return writeHiddenFromFlow(c, e.finally_block, name, hidden);
+        },
+        .assign => {
+            const d = c.tree.nodeData(node);
+            // The same "initializes it" predicate `flow.definiteAssignOp` uses:
+            // `&&=` is deliberately absent (its skipping branch keeps
+            // `undefined`), so a hidden `this.x &&= v` suppresses nothing.
+            const definite = switch (c.tree.tokens.tag(c.tree.nodeMainToken(node))) {
+                .eq, .pipe_pipe_eq, .question_question_eq => true,
+                else => false,
+            };
+            if (hidden and definite and writesThisProp(c, d.lhs, name)) return true;
+            if (try writeHiddenFromFlow(c, d.lhs, name, hidden)) return true;
+            return writeHiddenFromFlow(c, d.rhs, name, hidden);
+        },
+        else => {},
+    }
+    const body = iifeBody(c, node);
+    if (body != null_node and try writeHiddenFromFlow(c, body, name, true)) return true;
+    var it = c.tree.childIterator(node);
+    while (it.next()) |child| {
+        if (try writeHiddenFromFlow(c, child, name, hidden)) return true;
+    }
+    return false;
+}
+
+/// Is `target` a write of `this.<name>` — either spelling (`this.name`,
+/// `this["name"]`)? Used by `writeHiddenFromFlow`, which has no reference key
+/// to hand and only needs the name.
+fn writesThisProp(c: *Checker, target: Node, name: intern.Atom) bool {
+    var n = target;
+    while (c.nodeTag(n) == .paren_expr) n = c.tree.nodeData(n).lhs;
+    const d = c.tree.nodeData(n);
+    switch (c.nodeTag(n)) {
+        .member_expr, .optional_member_expr => {
+            if (c.nodeTag(d.lhs) != .this_expr) return false;
+            return (c.memberAtom(d.rhs) catch return false) == name;
+        },
+        .index_expr, .optional_index_expr => {
+            if (c.nodeTag(d.lhs) != .this_expr) return false;
+            var idx = d.rhs;
+            while (c.nodeTag(idx) == .paren_expr) idx = c.tree.nodeData(idx).lhs;
+            if (c.nodeTag(idx) != .string_literal) return false;
+            return (c.memberAtom(c.tree.nodeMainToken(idx)) catch return false) == name;
+        },
+        else => return false,
+    }
+}
+
+/// TS2564 — tsc's `checkPropertyInitialization`, gated on
+/// `strictNullChecks && strictPropertyInitialization` (both implied by
+/// `strict`, which ztsc always runs) and on the class not being ambient.
+///
+/// For each candidate: with no constructor at all nothing can have been
+/// assigned, so it reports; otherwise it asks the flow graph whether every path
+/// out of the constructor wrote `this.<name>` — `thisPropUnassigned` at the
+/// constructor's return join, tsc's `isPropertyInitializedInConstructor` over
+/// `constructor.returnFlowNode`. Reported at the property NAME (tsc's
+/// `member.name`), which is the field node's main token, so a modifier list
+/// (`private readonly x: T`) does not move the column.
+fn checkPropertyInit(c: *Checker, ctor: Node, widened: bool, cands: []const InitCand) Error!void {
+    const ret_flow: binder.FlowId = if (ctor == null_node)
+        binder.no_flow
+    else
+        c.bind.flowAt(ctor) orelse binder.no_flow;
+    for (cands) |cand| {
+        const tok = c.tree.nodeMainToken(cand.member);
+        if (ctor != null_node and ret_flow != binder.no_flow) {
+            const name = try c.memberAtom(tok);
+            if (!try c.thisPropUnassigned(ret_flow, name, cand.ty)) continue;
+            const body = c.tree.nodeData(ctor).rhs;
+            if (widened and try writeHiddenFromFlow(c, body, name, false)) continue;
+        }
+        try c.diagFmt(2564, c.tokSpan(tok), "Property '{s}' has no initializer and is not definitely assigned in the constructor.", .{c.tokenText(tok)});
+    }
+}
+
+/// TS2565 — the `assumeUninitialized` half of tsc's
+/// `getFlowTypeOfAccessExpression`: a `this.<name>` READ inside the constructor
+/// of the class that declares `<name>`, reached on a path that has not written
+/// it yet, is "used before being assigned".
+///
+/// tsc reaches it from the property-access checker, gated on
+/// `getControlFlowContainer(node) === the constructor` and on the declaration
+/// being a property with no `!` and no initializer — i.e. exactly the TS2564
+/// candidate set (`abstract` differs, but an abstract member read in a
+/// constructor is TS2715 there, not this). ztsc walks the constructor body for
+/// those reads instead, which keeps the query off the property-access hot path:
+/// the answer is a diagnostic only — the *type* of the read is the declared
+/// type either way, which is already what ztsc's ordinary walk returns.
+///
+/// Writes are not reads: tsc's function returns before this check when the
+/// access is a DEFINITE assignment target, so `this.x = v` is silent while the
+/// read a compound `this.x += v` / `this.x++` performs is not.
+fn checkPropertyUseBeforeAssigned(c: *Checker, body: Node, widened: bool, cands: []const InitCand) Error!void {
+    if (!widened) return useBeforeAssignedWalk(c, body, cands, false);
+    // A write ztsc's flow graph cannot carry (`writeHiddenFromFlow`) hides
+    // itself from a read's query exactly as it does from the exit's, so the same
+    // properties are dropped here.
+    var live: std.ArrayList(InitCand) = .empty;
+    defer live.deinit(c.scratch());
+    for (cands) |cand| {
+        const name = try c.memberAtom(c.tree.nodeMainToken(cand.member));
+        if (try writeHiddenFromFlow(c, body, name, false)) continue;
+        try live.append(c.scratch(), cand);
+    }
+    if (live.items.len == 0) return;
+    try useBeforeAssignedWalk(c, body, live.items, false);
+}
+
+/// Walk one node of a constructor body looking for `this.<candidate>` reads.
+/// `is_target` marks a subtree that is the left-hand side of a definite
+/// assignment: the access at its root is a write (silent), but everything
+/// *inside* it is still an ordinary read (`this.a.b = v` reads `this.a`), and a
+/// destructuring pattern's element targets are writes in turn.
+fn useBeforeAssignedWalk(c: *Checker, node: Node, cands: []const InitCand, is_target: bool) Error!void {
+    if (node == null_node) return;
+    switch (c.nodeTag(node)) {
+        // A nested function or class is a different control-flow container, so
+        // a `this.x` there is not this constructor's business (tsc's
+        // `getControlFlowContainer`).
+        .arrow_fn, .function_expr, .function_decl, .object_method, .class_decl => return,
+        .member_expr, .optional_member_expr => {
+            const d = c.tree.nodeData(node);
+            if (!is_target and c.nodeTag(d.lhs) == .this_expr) {
+                const name = try c.memberAtom(d.rhs);
+                for (cands) |cand| {
+                    if ((try c.memberAtom(c.tree.nodeMainToken(cand.member))) != name) continue;
+                    if (c.bind.flowAt(node)) |flow| {
+                        if (try c.thisPropUnassigned(flow, name, cand.ty)) {
+                            try c.diagFmt(2565, c.tokSpan(d.rhs), "Property '{s}' is used before being assigned.", .{c.tokenText(d.rhs)});
+                        }
+                    }
+                    break;
+                }
+            }
+            return useBeforeAssignedWalk(c, d.lhs, cands, false);
+        },
+        .assign => {
+            const d = c.tree.nodeData(node);
+            // Here the predicate IS tsc's `getAssignmentTargetKind`, which puts
+            // all three logical assignments in `Definite` and so returns from
+            // `getFlowTypeOfAccessExpression` before the TS2565 check: the read
+            // `this.x &&= v` performs is silent, even though the write does not
+            // initialize `x` (see `flow.definiteAssignOp`).
+            const definite = switch (c.tree.tokens.tag(c.tree.nodeMainToken(node))) {
+                .eq, .pipe_pipe_eq, .amp_amp_eq, .question_question_eq => true,
+                else => false,
+            };
+            try useBeforeAssignedWalk(c, d.lhs, cands, definite);
+            return useBeforeAssignedWalk(c, d.rhs, cands, false);
+        },
+        // Inside a destructuring target the element positions stay targets;
+        // their defaults (the `.assign`/`binding_default` right side) do not,
+        // which the arms above already separate.
+        .object_literal, .array_literal, .object_property, .object_shorthand, .spread_element, .paren_expr => {
+            if (is_target) {
+                var it = c.tree.childIterator(node);
+                while (it.next()) |child| try useBeforeAssignedWalk(c, child, cands, true);
+                return;
+            }
+        },
+        else => {},
+    }
+    var it = c.tree.childIterator(node);
+    while (it.next()) |child| try useBeforeAssignedWalk(c, child, cands, false);
+}
+
 pub fn checkClass(c: *Checker, node: Node) Error!void {
     const d = c.tree.nodeData(node);
     const data = c.tree.extraData(ast.ClassData, d.lhs);
@@ -1265,6 +1570,21 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
 
     const class_is_abstract = data.flags & ast.Flags.abstract != 0;
 
+    // `strictPropertyInitialization` (implied by `strict`, and ztsc runs no
+    // other mode) checks every instance property for a definite assignment.
+    // tsc skips the whole check inside an AMBIENT class — a `declare class`, or
+    // any class in a `.d.ts` or `declare namespace` body (`node.flags &
+    // NodeFlags.Ambient`) — where there is no constructor body to analyze.
+    // The candidates are collected as the members are checked and judged after
+    // the loop, so the constructor's body is already checked when its flow is
+    // queried. Foreign files are skipped for the same reason
+    // `checkFunctionBody` skips them: `seal` drops their diagnostics, and their
+    // bodies are never walked, so the query would have nothing to read.
+    const check_prop_init = !(c.ambient_ctx or data.flags & ast.Flags.declare != 0) and
+        c.owned_mask[c.cur_file];
+    var init_cands: std.ArrayList(InitCand) = .empty;
+    defer init_cands.deinit(c.scratch());
+
     // Members.
     const members = c.tree.extraRange(data.members_start, data.members_end);
     for (members, 0..) |member, mi| {
@@ -1285,6 +1605,9 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
                 if (e.type_ann != 0) {
                     const ok = is_static and e.flags & ast.Flags.readonly != 0;
                     ann = try c.annTypeMaybeUnique(e.type_ann, ok, 1331, c.tokSpan(c.tree.nodeMainToken(member)));
+                }
+                if (check_prop_init and initCandidate(c, member, e, ann)) {
+                    try init_cands.append(c.scratch(), .{ .member = member, .ty = ann });
                 }
                 // A `unique symbol` static-readonly field, like a const,
                 // takes only a fresh `Symbol()` initializer without TS2322.
@@ -1349,6 +1672,15 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
             },
             else => {},
         }
+    }
+
+    if (init_cands.items.len != 0) {
+        c.this_type = this_t;
+        const ctor = constructorWithBody(c, members);
+        const body = if (ctor == null_node) null_node else c.tree.nodeData(ctor).rhs;
+        const widened = ctorHasWidenedFlow(c, body);
+        try checkPropertyInit(c, ctor, widened, init_cands.items);
+        if (ctor != null_node) try checkPropertyUseBeforeAssigned(c, body, widened, init_cands.items);
     }
 }
 
