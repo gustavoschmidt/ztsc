@@ -1098,6 +1098,15 @@ const Binder = struct {
     cur_scope: ScopeId = file_scope,
     var_scope: ScopeId = file_scope,
     cur_flow: FlowId = no_flow,
+    /// The pending join for the enclosing CONSTRUCTOR's return edges, or null
+    /// when the current function is not a constructor body. tsc's
+    /// `currentReturnTarget`, built for constructors only — the note in
+    /// `bindContainer` says why: *"We create a return control flow graph for
+    /// IIFEs and constructors. For constructors we use the return control flow
+    /// graph in strict property initialization checks."* Saved/restored by
+    /// `saveState`, so a `return` inside a callback declared in the constructor
+    /// does not join the constructor's exit.
+    ctor_return: ?PendingId = null,
     ctxs: std.ArrayList(Ctx) = .empty,
     /// Contexts below this index belong to enclosing functions.
     ctx_base: usize = 0,
@@ -1283,6 +1292,7 @@ const Binder = struct {
         ctx_base: usize,
         ctx_len: usize,
         stack_len: usize,
+        ctor_return: ?PendingId,
     };
 
     fn saveState(b: *Binder) SavedState {
@@ -1293,6 +1303,7 @@ const Binder = struct {
             .ctx_base = b.ctx_base,
             .ctx_len = b.ctxs.items.len,
             .stack_len = b.scope_stack.items.len,
+            .ctor_return = b.ctor_return,
         };
     }
 
@@ -1303,6 +1314,7 @@ const Binder = struct {
         b.ctx_base = s.ctx_base;
         b.ctxs.items.len = s.ctx_len;
         b.scope_stack.items.len = s.stack_len;
+        b.ctor_return = s.ctor_return;
     }
 
     // --- symbols ------------------------------------------------------------
@@ -1713,6 +1725,10 @@ const Binder = struct {
             },
             .return_stmt => {
                 try b.bindExpr(d.lhs);
+                // Inside a constructor, a `return` is an edge to the exit join
+                // the initialization check queries (`ctor_return`); everywhere
+                // else the flow simply ends.
+                if (b.ctor_return) |pid| try b.pendAdd(pid, b.cur_flow);
                 b.cur_flow = unreachable_flow;
             },
             .break_stmt => {
@@ -2165,6 +2181,12 @@ const Binder = struct {
         const s = try b.pushScope(.function, node);
         b.var_scope = s;
         b.ctx_base = b.ctxs.items.len;
+        // tsc's `currentReturnTarget`: a CONSTRUCTOR gets a return-edge join so
+        // `strictPropertyInitialization` can ask what every path out of it left
+        // assigned (`checkPropertyInit`). Cleared for every other function-like
+        // so a nested `return` never joins an enclosing constructor's exit.
+        const ret_pid: ?PendingId = if (is_ctor and body != 0) try b.newPending() else null;
+        b.ctor_return = ret_pid;
 
         try b.bindTypeParams(proto.tp_start, proto.tp_end);
         for (b.tree.extraRange(proto.params_start, proto.params_end)) |param| {
@@ -2179,6 +2201,17 @@ const Binder = struct {
                 for (b.tree.nodeRange(body)) |stmt| try b.bindStatement(stmt);
             } else {
                 try b.bindExpr(body); // arrow expression body
+            }
+            if (ret_pid) |pid| {
+                // The fall-off-the-end edge, then the join itself, recorded
+                // against the constructor node — the one node/flow pair whose
+                // key is the declaration rather than a reference, which is why
+                // no `attachFlow` caller can collide with it. A body that ends
+                // unreachable with no `return` leaves the join empty, and
+                // `finishPending` answers `unreachable_flow`: nothing flows out
+                // of `constructor() { throw … }`, so it initializes everything.
+                try b.pendAdd(pid, b.cur_flow);
+                try b.flow_pairs.append(b.scratch, .{ .value = node, .next = try b.finishPending(pid) });
             }
         }
         // A NAMED function expression can call itself: tsc's `resolveName`
@@ -4166,7 +4199,7 @@ test "golden: class members vs statics, parameter properties" {
         \\    scope 5: function s
         \\    scope 6: function constructor
         \\      z: param
-        \\flow: nodes=4 attach=0 (start=4 assign=0 cond=0 branch=0 loop=0 switch=0 call=0)
+        \\flow: nodes=4 attach=1 (start=4 assign=0 cond=0 branch=0 loop=0 switch=0 call=0)
         \\
     );
 }
