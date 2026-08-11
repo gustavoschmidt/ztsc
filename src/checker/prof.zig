@@ -2177,6 +2177,90 @@
 //! `createInstantiatedSymbolTable` at member granularity, and with the ceiling
 //! gate in front of it the deferred-return-type project buys nothing this
 //! corpus can see.
+//!
+//! ## immich's c3-only partition hole, CLOSED — and the budget WAS the symptom
+//!
+//! immich reported three keys at `--checkers=3` and nowhere else
+//! (`person.repository.ts:422` — TS2589 at :9, TS2769 + TS7006 at :66), which is
+//! a violation of the contract at `checker.zig:15`. The header above says not to
+//! reopen the ceiling family without a non-zero trip counter. There was one, and
+//! it named ONE statement: `--inst-profile` on a 13-file program containing only
+//! that file put `422:9` at the full **250,001** node visits with the next
+//! costliest statement at 26,611, and every one of the 255 trips in `<source
+//! element>`. So this was not a charging question — the statement's own demand
+//! was an order of magnitude past the cap, and which partition paid for the
+//! kysely tables first decided whether it came in under.
+//!
+//! It reduces to SEVEN lines against immich's `src/schema` and real kysely, no
+//! `where`, no callback parameters, tsgo byte-clean:
+//!
+//!     export function b(db: Kysely<DB>) {
+//!       return db.with('removed', (db) => db.deleteFrom('asset_face'));
+//!     }
+//!
+//! and a pre-typed `expression` argument costs the same 224,947, so contextual
+//! typing is not in it. `--inst-focus` on `QueryCreator.with<N, E>` (476,882
+//! visits over 9 calls, max 241,542 — the outlier this header's FIRST section
+//! recorded at 316,401 and left unexplained) shows a flat tail: ~45 subterms of
+//! the reference-expression family, each visited ~2,900 times, 39% of the charge
+//! in `.conditional` and 20% in `.index_access`. The expansion tally says where
+//! from: `InsertQueryBuilder` **499 tables built under 491 distinct output
+//! arguments**, 225 of them never re-read.
+//!
+//! The frame is `inferFromExtendsInner`'s `.ref` arm — `resolveStructural
+//! (pattern)`, 454,592 visits over 514 calls. `ExtractRowFromCommonTableExpres
+//! sion<CTE>` asks the builder against `Expression<infer QO>`,
+//! `InsertQueryBuilder<any, any, infer QO>` and `UpdateQueryBuilder<any, any,
+//! any, infer QO>` in turn; a `DeleteQueryBuilder` source is dead on
+//! `expressionType`, `values` and `set` respectively, and each pattern's whole
+//! ~35-member table was materialized before one name was looked up. tsc's
+//! `inferFromProperties` reads `getTypeOfSymbol(targetProp)` only inside
+//! `if (sourceProp)`, and `propertiesRelatedTo` opens with
+//! `getUnmatchedProperty` — so tsc never builds those tables at all.
+//!
+//! **The fix is that scan, hoisted to the conditional's decision site**
+//! (`unmatchedPatternProperty` in generics.zig): a required property name on the
+//! extends pattern's memoized GENERIC table that the check type has not got
+//! makes the check false for every binding of the pattern's `infer` variables,
+//! so `planConcreteConditional` returns `.take_false` without inferring and
+//! without relating. Names and optionality carry through a substitution
+//! untouched, so the answer cannot change when the arguments arrive.
+//!
+//!     seven-line repro   statement charge 250,001 -> 18,090, trips 119 -> 0
+//!                        run node visits 2,517,141 -> 2,230,934 (-11%)
+//!     immich             c1..c8 all 0 keys (was 0/0/3/0/0/0/0/0)
+//!     immich c4          wall 1.497 -> 1.327 s, peak RSS 525 -> 489 MB
+//!     excalidraw         17/17 converged at c1..c8, order sweep unchanged
+//!                        (the 2 pre-existing reverse-order TS7053), wall/RSS flat
+//!     social-app         0 keys at c1/c4/c8; wall +1.5%, RSS +3% (staged app,
+//!                        already outside both bars at every checker count)
+//!     parity corpus      8/8 at 0/0, `multi` wall/RSS byte-flat
+//!     conformance        1197/1197, pinned by
+//!                        `conditional/052_unmatched_property_kills_infer_pattern`
+//!
+//! ### The losing half, re-confirmed a FOURTH time on this arm
+//!
+//! The obvious first shape was the other one: keep the walk but read the
+//! pattern's names off the generic table and substitute ONE member per matching
+//! name (`lazyTableOf`/`lazyMemberAt`, exactly what the `.object` arm's loop
+//! consumes). Semantically identical by construction, and it is a **large
+//! regression** — the same seven-line repro went **2,517,141 -> 7,228,638 node
+//! visits and 119 -> 44,633 trips**, because ~20 of the pattern's ~35 names ARE
+//! shared and each was then substituted alone, deep in a spent budget, instead of
+//! once as part of a table every later reader read free. The rule this header
+//! states three times over holds on the inference arm too: **read a generic
+//! table's names freely; do not substitute one member in place of the table.**
+//! What makes the screen the free half is that the members it skips are not
+//! deferred to a later reader — on this route they are never read at all.
+//!
+//! ### Found on the way, not fixed
+//!
+//! `propOfTypeEx(t, name, false)` does not see the apparent `Object.prototype`
+//! members, so `PlainObj extends { toString: () => infer U } ? U : F` takes the
+//! FALSE branch where tsc binds `U = string`. Pre-existing (identical at
+//! `80a5fa6`) and independent of this change, which uses the same lookup
+//! `structuralAssignable`'s own pre-pass does and so cannot diverge from the
+//! relation. It is an UNDER-report, so it belongs to the under-report pass.
 
 const std = @import("std");
 const types = @import("../types.zig");

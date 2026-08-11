@@ -474,6 +474,90 @@ pub fn resolveConcreteConditional(c: *Checker, chk: TypeId, extends_ty: TypeId, 
     return c.finishCondPlan(plan, chk, extends_ty, true_ty, false_ty, distributive);
 }
 
+/// tsc's `getUnmatchedProperty`, asked of a conditional's extends clause while
+/// that clause is still an UNMATERIALIZED nominal reference: does the pattern's
+/// member table declare a required property name the check type has not got?
+///
+/// When it does, `chk extends pattern` is false for every binding of the
+/// pattern's `infer` variables — property NAMES and OPTIONALITY are carried
+/// through a substitution untouched by `instantiateId`'s `.object` arm, so the
+/// scan's answer cannot change once the arguments arrive — and the conditional
+/// resolves to its FALSE branch, whose scope holds no binder. So the whole
+/// inference walk and the relation under it are dead work, and the pattern's
+/// member table need never be built at all.
+///
+/// `structuralAssignable` already opens with this same scan (see there, and
+/// conformance `assignability/094`), against `propOfTypeEx(…, false)` — the
+/// lookup used here, so the two answer alike. What it cannot do is run before
+/// its two sides are resolved, which is where the cost is: materializing the
+/// pattern is what `inferFromExtendsInner`'s `.ref` arm spends, and on a fluent
+/// generic API the pair is usually dead on ONE name.
+///
+/// kysely's `ExtractRowFromCommonTableExpression<CTE>` is the case that forced
+/// it. It asks a query builder against `Expression<infer QO>`,
+/// `InsertQueryBuilder<any, any, infer QO>` and
+/// `UpdateQueryBuilder<any, any, any, infer QO>` in turn; a `DeleteQueryBuilder`
+/// source is dead on `expressionType`, `values` and `set` respectively, and each
+/// pattern was being materialized in full first — ~35 members apiece, every one
+/// a mapped or conditional type over every column of every table in the schema.
+/// immich's `db.with('removed', (db) => db.deleteFrom('asset_face')…)` spent the
+/// entire 250,000-node statement budget there, so whether the statement resolved
+/// depended on how much of those tables the checker's own partition had already
+/// paid for: the same statement was clean at `--checkers=1` and TS2589 (plus a
+/// TS2769/TS7006 cascade) at `--checkers=3`. One statement, 250,001 node visits
+/// down to 20,820.
+///
+/// This is the FREE half of the lazy-member split, not the losing one: it reads
+/// a generic table's names and substitutes nothing, so no later reader inherits
+/// a bill (prof.zig records the other half measured negative four times, the
+/// fourth on this very arm — reading one pattern member per matching name
+/// instead took the same repro from 2.5 M node visits to 7.2 M).
+///
+/// Deliberately narrow, because everything it declines keeps today's path:
+///
+///   * the pattern must be a nominal interface/class reference whose generic
+///     member table is already memoized (`lazyShapeOf` — it never BUILDS one,
+///     for the reason given there);
+///   * the check type must resolve to a single object or an intersection. A
+///     union, `any`, `unknown`, `never` or a type variable is decided by an arm
+///     of the relation this scan does not model — `never` relates to
+///     everything, so screening it would take the wrong branch;
+///   * two references to the SAME generic are the variance question, which is
+///     not a structural walk at all.
+fn unmatchedPatternProperty(c: *Checker, chk: TypeId, pattern: TypeId) Error!bool {
+    const s = &c.ts;
+    const generic = (try c.lazyShapeOf(pattern)) orelse return false;
+    // Cheap first: a table with no required property can never screen a pair
+    // out, and this runs before the check type is resolved.
+    const n = s.objectPropCount(generic);
+    var required = false;
+    for (0..n) |i| {
+        if (!s.objectProp(generic, @intCast(i)).optional()) {
+            required = true;
+            break;
+        }
+    }
+    if (!required) return false;
+    const src = try c.resolveStructural(chk);
+    switch (s.kind(src)) {
+        .object => {
+            if (c.refFacetOf(src, .object)) |os| {
+                if (s.refSymbol(os) == s.refSymbol(pattern)) return false;
+            }
+        },
+        .intersection => {},
+        else => return false,
+    }
+    for (0..n) |i| {
+        // Re-read per iteration: `propOfTypeEx` interns, which can move the
+        // store's property arrays (see `memberAt`).
+        const p = s.objectProp(generic, @intCast(i));
+        if (p.optional()) continue;
+        if ((try c.propOfTypeEx(src, p.name, false)) == null) return true;
+    }
+    return false;
+}
+
 pub fn planConcreteConditional(c: *Checker, chk: TypeId, extends_ty: TypeId) Error!CondPlan {
     // Kept in scratch, never freed here: `ids`/`vals` are handed back to
     // the caller, which substitutes them into a branch it has yet to
@@ -532,6 +616,12 @@ pub fn planConcreteConditional(c: *Checker, chk: TypeId, extends_ty: TypeId) Err
         for (any_vals) |*v| v.* = types.any_type;
         return .{ .both_any = .{ .ids = ids.items, .vals = any_vals } };
     }
+    // tsc's `getUnmatchedProperty`, asked BEFORE the extends pattern is
+    // materialized — see `unmatchedPatternProperty`. It settles the whole
+    // conditional, so it runs ahead of both the inference walk and the
+    // relation, neither of which can then pay for a member table whose types
+    // the answer never depended on.
+    if (try unmatchedPatternProperty(c, chk, extends_ty)) return .take_false;
     const vals = try c.scratch().alloc(TypeId, ids.items.len);
     for (vals) |*v| v.* = types.no_type;
     if (ids.items.len > 0) {
