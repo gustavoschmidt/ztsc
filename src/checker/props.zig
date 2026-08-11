@@ -81,7 +81,25 @@ pub fn propOfTypeEx(c: *Checker, t: TypeId, name: Atom, allow_index: bool) Error
             if (s.objectCallSigCount(t) > 0 or s.objectConstructSigCount(t) > 0) {
                 if (try c.functionInterfaceProp(name)) |p| return p;
             }
-            if (!allow_index) return null;
+            if (!allow_index) {
+                // An interface whose only base is `any` and which declares
+                // nothing of its own RELATES as `any` (tsc's
+                // `getNormalizedType` -> `getSingleBaseForNonAugmentingSubtype`
+                // swaps the reference for its single base before the relation
+                // runs). Answering `any` for every name is that rule expressed
+                // where the relation asks the question: `propertiesRelatedTo`
+                // then finds each target property present and `any`-typed, so
+                // `@types/koa`'s `DefaultState` satisfies `{ state: { auth:
+                // … } }` — and satisfies `Function`, which is what makes
+                // calling it legal. See `types.obj_flag_any_base` for what the
+                // oracle says the rule does and does not reach. A DECLARED
+                // `[k: string]: any` gets none of this and still answers null,
+                // which is what keeps it TS2741 against a required property.
+                if (s.objectRelatesAsAny(t)) {
+                    return .{ .name = name, .ty = types.any_type, .flags = 0 };
+                }
+                return null;
+            }
             // Every object type also has the apparent members of the global
             // `Object` interface — `hasOwnProperty`, `toString`,
             // `valueOf`, … — the tail of tsc's `getPropertyOfType`

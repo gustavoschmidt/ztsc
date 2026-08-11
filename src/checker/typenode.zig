@@ -45,6 +45,7 @@ const instantiate = @import("enums.zig").instantiate;
 const intrinsicStringMapping = @import("generics.zig").intrinsicStringMapping;
 const lazyIndexedProp = @import("instantiate.zig").lazyIndexedProp;
 const lazyRefProp = @import("instantiate.zig").lazyRefProp;
+const mergeBaseObjectPlain = @import("instantiate.zig").mergeBaseObject;
 const propOfType = @import("props.zig").propOfType;
 const scopeOf = Checker.scopeOf;
 const scratch = Checker.scratch;
@@ -3122,6 +3123,154 @@ pub fn isEmptyAnonObject(c: *Checker, t: TypeId) bool {
 /// `keyof T` and TS's `PropertyKey`.
 pub fn propertyKeyType(c: *Checker) Error!TypeId {
     return c.ts.makeUnion(c.scratch(), &.{ types.string_type, types.number_type, types.symbol_type });
+}
+
+/// Fold one heritage base into a derived interface/class shape.
+///
+/// Everything except an `any` base is `instantiate.mergeBaseObject` verbatim.
+/// An `any` base is the case that one silently dropped (its object-only guard
+/// handed `derived` straight back), and it is not a no-op in tsc:
+/// `interface DefaultState extends DefaultStateExtends {}` over
+/// `type DefaultStateExtends = any` — `@types/koa`'s user-augmentable request
+/// state — is an interface that accepts EVERY property read. tsc's
+/// `resolveObjectTypeMembers` substitutes `anyBaseTypeIndexInfo`
+/// (`[x: string]: any`) for an `any` base's index infos, and — when the
+/// interface declares nothing of its own — `getNormalizedType` additionally
+/// relates the whole shape as `any`. See `types.obj_flag_any_base` for the
+/// oracle-verified surface of both halves.
+///
+/// A base that is `any` because it FAILED to resolve is a different animal:
+/// `error_type`, not `.any`, so it still contributes nothing.
+pub fn mergeBaseObject(c: *Checker, derived: TypeId, base: TypeId, union_overloads: bool) Error!TypeId {
+    const s = &c.ts;
+    if (s.kind(base) == .any and s.kind(derived) == .object) return anyBaseShape(c, derived);
+    const merged = try mergeBaseObjectPlain(c, derived, base, union_overloads);
+    if (s.kind(base) != .object or s.kind(merged) != .object) return merged;
+    // A SECOND base decides whether "relates as `any`" survives the fold, and
+    // `mergeBaseObjectPlain` carries `derived`'s flags through unexamined.
+    // tsc's condition is `getBaseTypes(target).length === 1`, so:
+    //   `interface R extends Any, B {}` — `Any` was folded first and flagged
+    //   the accumulator; `B` is a real object base, so R has two bases and must
+    //   NOT relate as `any` (it is missing B's members from tsc's answer too).
+    //   `interface T extends P {}` where P relates as `any` — T has the single
+    //   base P, declares nothing, and tsc normalizes T -> P -> `any` (the
+    //   `getNormalizedType` loop), so the flag has to reach T as well.
+    if (s.objectRelatesAsAny(base)) {
+        if (!s.objectRelatesAsAny(merged) and bareInterfaceShape(s, derived) and !anyBaseOwnerIsGeneric(c)) {
+            return withAnyBaseFlag(c, merged, true);
+        }
+        return merged;
+    }
+    if (s.objectRelatesAsAny(merged)) return withAnyBaseFlag(c, merged, false);
+    return merged;
+}
+
+/// `derived` with an `any` base folded in: a `[x: string]: any` index signature
+/// (unless it declares an index of its own — a declared signature wins over an
+/// inherited one, tsc's `findIndexInfo` filter), plus `obj_flag_any_base` when
+/// the interface declares nothing at all, which is the extra condition tsc's
+/// `getSingleBaseForNonAugmentingSubtype` puts on relating as `any`.
+fn anyBaseShape(c: *Checker, derived: TypeId) Error!TypeId {
+    const s = &c.ts;
+    // `[k: symbol]: V` parks its value type in the string slot
+    // (`obj_flag_symbol_index`), so an interface declaring one has no string
+    // index for tsc's purposes and should still inherit `any`. ztsc has only
+    // the one slot to put it in, so leave that shape exactly as it was rather
+    // than lose the symbol keying.
+    if (s.objectFlags(derived) & types.obj_flag_symbol_index != 0) return derived;
+    const own_sidx = s.objectStringIndex(derived);
+    const relates_as_any = bareInterfaceShape(s, derived) and !anyBaseOwnerIsGeneric(c);
+    const sidx = if (own_sidx != 0) own_sidx else types.any_type;
+    var flags = s.objectFlags(derived);
+    if (relates_as_any) flags |= types.obj_flag_any_base;
+    if (sidx == own_sidx and flags == s.objectFlags(derived)) return derived;
+    return rebuildObject(c, derived, sidx, flags);
+}
+
+/// Does the interface declare NOTHING of its own — the `getMembersOfSymbol(
+/// type.symbol).size === 0` half of tsc's non-augmenting-subtype test, read off
+/// the shape that ztsc has already built from those members?
+fn bareInterfaceShape(s: *const types.Store, derived: TypeId) bool {
+    return s.objectPropCount(derived) == 0 and !s.objectHasSigs(derived) and
+        s.objectStringIndex(derived) == 0 and s.objectNumberIndex(derived) == 0;
+}
+
+/// Is the interface whose bases are being folded GENERIC? tsc bails out of
+/// `getSingleBaseForNonAugmentingSubtype` on `getMembersOfSymbol(type.symbol)
+/// .size`, and TypeScript's binder declares an interface's TYPE PARAMETERS in
+/// that very member table — so a generic interface never relates as its single
+/// base, however empty its body. Verified by instrumenting tsc: `interface
+/// G<X> extends A {}` logs `own-members=1` and stays unassignable to an
+/// unrelated class, while `interface G3 extends A {}` logs `OK … -> any`.
+///
+/// Only `interfaceConstituentApplyBases` marks its frame `resolving_base`, so
+/// this reads the interface whose Phase-2 fold we are inside. Any other caller
+/// (a class's `interface` half) answers "generic" and settles for the index
+/// signature alone rather than trust an unrelated stack top.
+fn anyBaseOwnerIsGeneric(c: *Checker) bool {
+    if (c.iface_stack.items.len == 0) return true;
+    const frame = c.iface_stack.items[c.iface_stack.items.len - 1];
+    if (!frame.resolving_base) return true;
+    return symDeclaresTypeParams(c, frame.sym);
+}
+
+/// Does any `interface` declaration of `sym` (or of a cross-file merge's
+/// constituents) carry a type-parameter list? Read straight off the AST — no
+/// scope walk, no type conversion — in each declaration's OWN file context,
+/// because a merged symbol's declarations are spread across trees.
+fn symDeclaresTypeParams(c: *Checker, sym: SymbolId) bool {
+    if (c.prog.isMergedId(sym)) {
+        for (c.prog.mergedSym(sym).parts) |p| {
+            if (symDeclaresTypeParams(c, p)) return true;
+        }
+        return false;
+    }
+    const saved_ctx = c.enterSymFile(sym);
+    defer c.restoreCtx(saved_ctx);
+    for (c.declsOf(sym)) |decl| {
+        if (c.nodeTag(decl) != .interface_decl) continue;
+        const data = c.tree.extraData(ast.InterfaceData, c.tree.nodeData(decl).lhs);
+        if (data.tp_start != data.tp_end) return true;
+    }
+    return false;
+}
+
+/// `merged` with `obj_flag_any_base` set or cleared, everything else identical.
+fn withAnyBaseFlag(c: *Checker, merged: TypeId, on: bool) Error!TypeId {
+    const s = &c.ts;
+    const flags = if (on)
+        s.objectFlags(merged) | types.obj_flag_any_base
+    else
+        s.objectFlags(merged) & ~types.obj_flag_any_base;
+    if (flags == s.objectFlags(merged)) return merged;
+    return rebuildObject(c, merged, s.objectStringIndex(merged), flags);
+}
+
+/// Re-intern an object with a new string index and/or flags, carrying its
+/// properties, signatures, number index and enum key names across unchanged.
+fn rebuildObject(c: *Checker, from: TypeId, sidx: TypeId, flags: u32) Error!TypeId {
+    const s = &c.ts;
+    var props: std.ArrayList(types.Prop) = .empty;
+    defer props.deinit(c.scratch());
+    for (0..s.objectPropCount(from)) |i| {
+        try props.append(c.scratch(), s.objectProp(from, @intCast(i)));
+    }
+    var calls: std.ArrayList(TypeId) = .empty;
+    defer calls.deinit(c.scratch());
+    var constructs: std.ArrayList(TypeId) = .empty;
+    defer constructs.deinit(c.scratch());
+    for (0..s.objectCallSigCount(from)) |i| try calls.append(c.scratch(), s.objectCallSig(from, @intCast(i)));
+    for (0..s.objectConstructSigCount(from)) |i| try constructs.append(c.scratch(), s.objectConstructSig(from, @intCast(i)));
+    const m = try s.makeObjectSigs(
+        props.items,
+        sidx,
+        s.objectNumberIndex(from),
+        flags & ~types.obj_flag_has_sigs,
+        calls.items,
+        constructs.items,
+    );
+    try c.carryKeyNameTypes(m, &.{from});
+    return m;
 }
 
 /// Object type from interface/object-literal-type member nodes.
