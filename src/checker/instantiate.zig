@@ -13,6 +13,7 @@ const libs = @import("../libs.zig");
 const modules = @import("../link/modules.zig");
 const ZeroPagedArray = @import("../zeropage.zig").ZeroPagedArray;
 
+const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Node = ast.Node;
 const null_node = ast.null_node;
@@ -1691,6 +1692,16 @@ pub fn refExpansionActive(c: *Checker, ref: TypeId) bool {
     return e == types.no_type;
 }
 
+/// Is `msym`'s own type already being computed further down this stack?
+/// `memberTypeOf` pushes each member it resolves onto `member_type_stack` and
+/// reports the circle when it is re-entered.
+fn memberTypeInFlight(c: *Checker, msym: SymbolId) bool {
+    for (c.member_type_stack.items) |m| {
+        if (m == msym) return true;
+    }
+    return false;
+}
+
 /// ONE named member of a class `ref`, resolved without materializing the
 /// whole member table. Null when the name is not a member of the class or
 /// its bases — the caller then takes its ordinary not-found path.
@@ -1744,6 +1755,19 @@ pub fn lazyRefProp(c: *Checker, ref: TypeId, name: Atom, depth: u32) Error!?type
             // itself. Genuinely circular; leave it to the caller's
             // not-found path rather than recursing.
             if (c.lazy_member_active.contains(msym)) return null;
+            // …and the same for a member whose type an OUTER frame is already
+            // computing, when the demand comes from a mapped type being
+            // materialized. Reading it would close a circle through
+            // `memberTypeOf`, which NAMES it (TS7022 / TS7023 / TS2502) — but
+            // tsc never issues this read at all: it builds a mapped type's
+            // members lazily, so `Partial<Omit<C, K>>` created inside `C`'s
+            // own table window asks for no member's type until long after the
+            // window has closed. Answer not-found and let the caller take its
+            // ordinary path, exactly as `lazy_member_active` does. Outside a
+            // mapped materialization the circle IS tsc's and is reported —
+            // see `classes/062_inferred_return_this_cycle`,
+            // `indexed/021_self_referential_member_annotation`.
+            if (c.mapped_value_depth > 0 and memberTypeInFlight(c, msym)) return null;
             try c.lazy_member_active.put(c.cm(), msym, {});
             defer _ = c.lazy_member_active.remove(msym);
             const mf = c.symFlags(msym);
@@ -1812,6 +1836,268 @@ pub fn ctorClassOwnsMember(c: *Checker, name: Atom) bool {
         if (c.bind.member_atoms[i] == name) return true;
     }
     return false;
+}
+
+/// ---------------------------------------------------------------------
+/// Declared key NAMES, read off the declarations
+/// ---------------------------------------------------------------------
+///
+/// tsc materializes a nominal type in two halves. `resolveDeclaredMembers`
+/// builds the member SYMBOL table from the declaration syntax alone — no
+/// annotation is resolved, no initializer is checked — and `getTypeOfSymbol`
+/// types one member later, on demand. The first half is therefore never
+/// observable half-built, which is why `keyof C` answers the same set for
+/// every asker in every order.
+///
+/// ztsc has ONE pass: `classInstanceGeneric` / `interfaceGeneric` resolve
+/// every member's type as they build the table. A member whose type is
+/// INFERRED — outline's `add = (item: PartialExcept<T, "id"> | T): T => …` —
+/// runs a whole expression check inside that window, and the check can demand
+/// `keyof` of the very class being built. The table is marked in progress, so
+/// the read took `expandRef`'s cycle cut: `keyof Model` came back as an
+/// unresolvable deferred node, `Exclude<keyof Model, "id">` collapsed to
+/// `never`, `Partial<Omit<Model, "id">>` to `{}`, and the collapse was
+/// memoized into whatever composite happened to ask first. Written OUTSIDE
+/// the cycle the same type computes correctly — so the answer depended on
+/// demand order, and demand order depends on the partition.
+///
+/// This is the missing first half, for the one question that needs it. It
+/// resolves no member annotation and checks no initializer, so it cannot
+/// re-enter the window it is answering inside of.
+///
+/// It answers null — and the caller keeps its previous behavior — for every
+/// shape whose key set is NOT a function of the declarations alone:
+///
+///   * a mixin / expression base (`class D extends mix(B)`), whose members
+///     come from a construct signature's return type;
+///   * an `extends` clause naming anything but a class/interface (an alias,
+///     `Array<T>`, an intersection), which only the fold can read;
+///   * a computed ENUM-MEMBER key, whose key TYPE lives in `key_name_types`
+///     keyed by the interned table this route never builds.
+const declared_keys_depth: u32 = 32;
+
+const DeclKey = struct { name: Atom, non_public: bool };
+
+const DeclKeyWalk = struct {
+    keys: std.ArrayList(DeclKey) = .empty,
+    index: std.AutoHashMapUnmanaged(Atom, void) = .empty,
+    visited: std.ArrayList(SymbolId) = .empty,
+    str_index: bool = false,
+    sym_index: bool = false,
+    num_index: bool = false,
+
+    /// First writer wins, which is the merge direction the table fold uses:
+    /// a derived member overrides the inherited one of the same name, and the
+    /// walk visits derived before base.
+    fn add(w: *DeclKeyWalk, alloc: Allocator, name: Atom, non_public: bool) Error!void {
+        const gop = try w.index.getOrPut(alloc, name);
+        if (gop.found_existing) return;
+        try w.keys.append(alloc, .{ .name = name, .non_public = non_public });
+    }
+
+    fn deinit(w: *DeclKeyWalk, alloc: Allocator) void {
+        w.keys.deinit(alloc);
+        w.index.deinit(alloc);
+        w.visited.deinit(alloc);
+    }
+};
+
+/// `keyof <class ref>` answered off the declarations, for the case where the
+/// member table cannot be read because it is being built further down this
+/// stack. Null when the ordinary path is the right one — the operand is not
+/// such a reference, its table is readable, or its key set is not derivable
+/// from syntax (see `declaredKeyUnion`).
+///
+/// CLASSES only. An interface's table is materialized by a declaration walk
+/// too (`interfaceGeneric`), so it has the same window — but the deferral it
+/// falls back to is already sound there, and answering an interface off the
+/// declarations is measurably not: @tiptap's `Commands<T>` is reopened by
+/// every extension package through `declare module`, and a `keyof Commands`
+/// read from inside its own materialization came back without the members a
+/// later constituent contributes (social-app lost `focus`/`blur` off
+/// `ChainedCommands`, three TS2339 on a package that is at parity). A class
+/// cannot be reopened that way, which is what makes its declared key set a
+/// function of syntax alone.
+pub fn keyofInProgressRef(c: *Checker, t: TypeId) Error!?TypeId {
+    if (c.ts.kind(t) != .ref) return null;
+    const sym = c.ts.refSymbol(t);
+    if (!c.symFlags(sym).class) return null;
+    if (!classGenericInProgress(c, sym)) return null;
+    return declaredKeyUnion(c, sym);
+}
+
+/// The key union of a class or interface symbol, derived from its
+/// declarations. Null when some part of the shape is not derivable.
+pub fn declaredKeyUnion(c: *Checker, sym: SymbolId) Error!?TypeId {
+    if (c.declared_keys_active) return null; // see `Checker.declared_keys_active`
+    c.declared_keys_active = true;
+    defer c.declared_keys_active = false;
+    var w = DeclKeyWalk{};
+    defer w.deinit(c.scratch());
+    if (!try walkDeclaredKeys(c, sym, &w, 0)) return null;
+    var parts: std.ArrayList(TypeId) = .empty;
+    defer parts.deinit(c.scratch());
+    for (w.keys.items) |k| {
+        // A `private`/`protected` member is not a key — `keyofObjectTable`'s
+        // rule, and the reason `Pick<C, keyof C>` is the public surface.
+        if (k.non_public) continue;
+        try parts.append(c.scratch(), try c.ts.makeStringLiteral(k.name, false));
+    }
+    // The index-signature domains `keyofObjectTable` contributes. A
+    // `symbol`-keyed signature shares the string slot, and only owns the key
+    // domain outright when nothing else claims it (`obj_flag_symbol_index`).
+    if (w.str_index or w.sym_index) {
+        if (w.sym_index and !w.str_index and !w.num_index) {
+            try parts.append(c.scratch(), types.symbol_type);
+        } else {
+            try parts.append(c.scratch(), types.string_type);
+            try parts.append(c.scratch(), types.number_type);
+        }
+    }
+    if (w.num_index) try parts.append(c.scratch(), types.number_type);
+    return try c.ts.makeUnion(c.scratch(), parts.items);
+}
+
+/// Accumulate `sym`'s declared key names into `w`, in the order the table
+/// fold would give them precedence. False means "not derivable" — the whole
+/// answer is then discarded.
+fn walkDeclaredKeys(c: *Checker, sym: SymbolId, w: *DeclKeyWalk, depth: u32) Error!bool {
+    if (depth >= declared_keys_depth) return false;
+    // A heritage diamond reaches the same base twice; a malformed `extends`
+    // cycle reaches the same symbol forever.
+    for (w.visited.items) |v| {
+        if (v == sym) return true;
+    }
+    try w.visited.append(c.scratch(), sym);
+    const f = c.symFlags(sym);
+    if (!f.class and !f.interface) return false;
+    if (!f.class) return walkInterfaceKeys(c, sym, w, depth);
+
+    // A class: own instance members, then the same-file `interface` half and
+    // any cross-file interface augmentation, then the `extends` base — the
+    // order `classInstanceGeneric` folds them in.
+    {
+        const saved_ctx = c.enterSymFile(sym);
+        defer c.restoreCtx(saved_ctx);
+        if (c.bind.membersScopeOf(c.localOf(sym))) |ms| {
+            const kscope = c.symScope(sym);
+            const lo = c.bind.scope_members_start[ms];
+            const hi = c.bind.scope_members_start[ms + 1];
+            for (lo..hi) |i| {
+                const name = try c.nominalizeComputedKey(c.bind.member_atoms[i], kscope);
+                if (isCtorName(c, name)) continue;
+                const mf = c.symFlags(c.toGlobal(c.bind.member_syms[i]));
+                try w.add(c.scratch(), name, mf.non_public);
+            }
+        }
+    }
+    // Declaration-merged interface blocks. Their DIRECT members join here;
+    // their own `extends` bases are folded only for the same-file half
+    // (`classInterfaceHalfBases`), exactly as `classInstanceGeneric` does.
+    const iface_half = !c.prog.isMergedId(sym) and f.interface;
+    if (iface_half) {
+        if (!try declKeysOfInterfaceBlocks(c, sym, w)) return false;
+    } else if (c.prog.isMergedId(sym)) {
+        for (c.prog.mergedSym(sym).parts) |p| {
+            if (!c.symFlags(p).interface) continue;
+            if (!try declKeysOfInterfaceBlocks(c, p, w)) return false;
+        }
+    }
+    if (try classExtendsClause(c, sym)) {
+        const base_ref = (try baseClassRef(c, sym)) orelse return false; // mixin / unmodeled
+        if (c.ts.kind(base_ref) != .ref) return false;
+        const bsym = c.ts.refSymbol(base_ref);
+        if (bsym != sym and !try walkDeclaredKeys(c, bsym, w, depth + 1)) return false;
+    }
+    if (iface_half and !try declKeysOfHeritage(c, sym, w, depth)) return false;
+    return true;
+}
+
+/// An interface symbol: every constituent's direct members, then every
+/// constituent's `extends` bases (`interfaceGeneric`'s two phases).
+fn walkInterfaceKeys(c: *Checker, sym: SymbolId, w: *DeclKeyWalk, depth: u32) Error!bool {
+    var one = [_]SymbolId{sym};
+    const parts: []const SymbolId = if (c.prog.isMergedId(sym)) c.prog.mergedSym(sym).parts else one[0..];
+    for (parts) |p| {
+        if (!c.symFlags(p).interface) continue;
+        if (!try declKeysOfInterfaceBlocks(c, p, w)) return false;
+    }
+    for (parts) |p| {
+        if (!c.symFlags(p).interface) continue;
+        if (!try declKeysOfHeritage(c, p, w, depth)) return false;
+    }
+    return true;
+}
+
+/// Does `sym` write an `extends` clause on any of its class declarations?
+fn classExtendsClause(c: *Checker, sym: SymbolId) Error!bool {
+    const saved_ctx = c.enterSymFile(sym);
+    defer c.restoreCtx(saved_ctx);
+    for (c.declsOf(sym)) |decl| {
+        if (c.nodeTag(decl) != .class_decl) continue;
+        const data = c.tree.extraData(ast.ClassData, c.tree.nodeData(decl).lhs);
+        if (data.extends != 0) return true;
+    }
+    return false;
+}
+
+/// The `extends` bases written on `sym`'s interface declaration blocks.
+fn declKeysOfHeritage(c: *Checker, sym: SymbolId, w: *DeclKeyWalk, depth: u32) Error!bool {
+    const saved_ctx = c.enterSymFile(sym);
+    defer c.restoreCtx(saved_ctx);
+    var bases: std.ArrayList(TypeId) = .empty;
+    defer bases.deinit(c.scratch());
+    try c.interfaceHeritageTypes(sym, &bases);
+    for (bases.items) |b| {
+        if (c.ts.kind(b) != .ref) return false; // alias / array / intersection base
+        const bsym = c.ts.refSymbol(b);
+        const bf = c.symFlags(bsym);
+        if (!bf.class and !bf.interface) return false;
+        if (bsym == sym) continue;
+        if (!try walkDeclaredKeys(c, bsym, w, depth + 1)) return false;
+    }
+    return true;
+}
+
+/// Direct member names of every `interface` declaration block of `sym` —
+/// `objectTypeFromMembers`, restricted to what names a key.
+fn declKeysOfInterfaceBlocks(c: *Checker, sym: SymbolId, w: *DeclKeyWalk) Error!bool {
+    const saved_ctx = c.enterSymFile(sym);
+    defer c.restoreCtx(saved_ctx);
+    for (c.declsOf(sym)) |decl| {
+        if (c.nodeTag(decl) != .interface_decl) continue;
+        const saved_scope = c.cur_scope;
+        defer c.cur_scope = saved_scope;
+        if (try c.scopeOf(decl)) |s| c.cur_scope = s;
+        const data = c.tree.extraData(ast.InterfaceData, c.tree.nodeData(decl).lhs);
+        for (c.tree.extraRange(data.members_start, data.members_end)) |m| {
+            if (m == null_node) continue;
+            const md = c.tree.nodeData(m);
+            switch (c.nodeTag(m)) {
+                .property_signature, .method_signature => {
+                    const tok = c.tree.nodeMainToken(m);
+                    // A computed enum-member key is NAMED by the enum member,
+                    // and that name type is recorded against the interned
+                    // table this route never builds.
+                    if (try c.memberNameType(tok, md.rhs) != types.no_type) return false;
+                    try w.add(c.scratch(), try c.memberKey(tok, md.rhs), false);
+                },
+                .index_signature => {
+                    const e = c.tree.extraData(ast.IndexSig, md.lhs);
+                    const key = try c.typeFromTypeNode(e.key_type);
+                    if (key == types.number_type) {
+                        w.num_index = true;
+                    } else if (key == types.symbol_type) {
+                        w.sym_index = true;
+                    } else {
+                        w.str_index = true;
+                    }
+                },
+                else => {}, // call / construct signatures key nothing
+            }
+        }
+    }
+    return true;
 }
 
 /// The class symbol a heritage EXPRESSION denotes through its *type* — tsc's
