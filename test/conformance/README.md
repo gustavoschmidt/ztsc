@@ -14,6 +14,9 @@ organized by area:
 - `classes/` — fields, methods, statics, `extends`/`implements`, generics.
 - `literals/` — literal widening, freshness, excess property checks.
 - `flow/` — assignment narrowing, loops, TDZ, definite assignment.
+- `errors/` — which diagnostic tsc picks for a given failure, where the
+  code and the message text are the thing under test (spelling
+  suggestions: TS2551 vs TS2339, TS2552 vs TS2304).
 - `modules/` — multi-file cases: named/default/namespace/type-only
   imports, re-export chains, `export *`, import cycles, diamonds,
   `.d.ts` declare forms, `node_modules` packages, TS2307/TS2305/TS1361/

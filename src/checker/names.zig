@@ -142,8 +142,34 @@ fn resolveSpaceInner(c: *Checker, a: Atom, from: ScopeId, want_value: bool, type
     return .none;
 }
 
+/// Longest name this module will score. tsc has no ceiling; a stack DP row
+/// needs one. The length pre-filter inside `spellCandidateDistance` already
+/// bounds an admissible candidate to `name.len * 1.34 + 2`, so a name at the
+/// ceiling admits nothing wider than `spell_scratch_len`.
+const spell_max_len = 160;
+const spell_scratch_len = 256;
+
+/// Weighted edit distance in tenths (tsc's `levenshteinWithMax` costs) of
+/// `cand` against `name`, or null when the candidate is inadmissible, too long
+/// to score on the stack, or worse than `cap` tenths. `cap` is INCLUSIVE.
+fn spellDistance(name: []const u8, cand: []const u8, cap: usize) ?usize {
+    if (cand.len >= spell_scratch_len) return null;
+    var scratch: [2 * spell_scratch_len]usize = undefined;
+    return intern.spellCandidateDistance(name, cand, cap, scratch[0 .. 2 * (cand.len + 1)]);
+}
+
 /// Edit distance <= threshold spelling suggestion among scope-visible
 /// names (tsc's TS2552/TS2551 "Did you mean ...?").
+///
+/// The metric is tsc's `getSpellingSuggestion`, not a plain Levenshtein
+/// distance: a substitution costs TWICE an insert or a delete (0.1 when the
+/// two characters differ only in case), and the bound to beat is
+/// `floor(name.len * 0.4) + 1`. The asymmetry is the whole point — tsc will
+/// suggest a name reachable by adding or dropping characters (`remove` for
+/// `move`) and refuses one that needs letters exchanged (`store` for `sort`,
+/// `restore` for `rootStore`, `all` for `add`), where a symmetric-cost
+/// distance says yes to all of them and turns tsc's plain TS2339/TS2304 into
+/// a bogus "Did you mean".
 ///
 /// tsc iterates each scope's symbol table in DECLARATION order and only
 /// replaces the incumbent on a strictly smaller distance, so among
@@ -165,11 +191,14 @@ fn resolveSpaceInner(c: *Checker, a: Atom, from: ScopeId, want_value: bool, type
 /// never does.
 pub fn suggestName(c: *Checker, a: Atom, from: ScopeId, want_value: bool) ?Atom {
     const text = c.atomText(a);
-    if (text.len < 3) return null;
+    if (text.len == 0 or text.len > spell_max_len) return null;
     var best: ?Atom = null;
     var best_sym: binder.SymbolId = 0;
     var best_scope: ScopeId = 0;
-    var best_d: usize = @max(2, (text.len * 34 + 99) / 100) + 1;
+    // Inclusive acceptance bound in tenths; shrinks to the incumbent's
+    // distance so a strictly closer candidate wins outright and an exactly
+    // tied one falls to the declaration-order tie-break below.
+    var best_d: usize = intern.spellInitialCapTenths(text.len);
     var s = from;
     while (true) {
         const lo = c.bind.scope_members_start[s];
@@ -182,9 +211,9 @@ pub fn suggestName(c: *Checker, a: Atom, from: ScopeId, want_value: bool) ?Atom 
             const ok = if (want_value) hasValueMeaning(f) else hasTypeMeaning(f);
             if (!ok) continue;
             const cand_text = c.atomText(cand);
-            const d = editDistance(text, cand_text, best_d);
-            const better = d < best_d or
-                (best != null and d == best_d and s == best_scope and sym < best_sym);
+            const d = spellDistance(text, cand_text, best_d) orelse continue;
+            const better = best == null or d < best_d or
+                (d == best_d and s == best_scope and sym < best_sym);
             if (!better) continue;
             best_d = d;
             best_sym = sym;
@@ -234,56 +263,30 @@ pub fn reportModuleNotFound(c: *Checker, spec_tok: ast.TokenIndex) Error!void {
     }
 }
 
+/// `suggestName`'s property twin (the TS2551 "Did you mean" arm of a failed
+/// member access), on tsc's `getSpellingSuggestion` metric — see there.
 pub fn suggestProp(c: *Checker, a: Atom, obj: TypeId) ?Atom {
     const text = c.atomText(a);
-    if (text.len < 3) return null;
+    if (text.len == 0 or text.len > spell_max_len) return null;
     var best: ?Atom = null;
-    var best_d: usize = @max(2, (text.len * 34 + 99) / 100) + 1;
+    var best_d: usize = intern.spellInitialCapTenths(text.len);
     const t = c.resolveStructural(obj) catch return null;
     if (c.ts.kind(t) != .object) return null;
     for (0..c.ts.objectPropCount(t)) |i| {
         const p = c.ts.objectProp(t, @intCast(i));
         const cand_text = c.atomText(p.name);
-        const d = editDistance(text, cand_text, best_d);
-        if (d < best_d) {
+        const d = spellDistance(text, cand_text, best_d) orelse continue;
+        if (best == null or d < best_d) {
             best_d = d;
             best = p.name;
-        } else if (d == best_d and best != null and
-            std.mem.order(u8, cand_text, c.atomText(best.?)) == .lt)
-        {
-            // Tie on edit distance: prefer the lexicographically smaller
-            // name so the suggestion is byte-identical across --workers
-            // (props are iterated in atom order, which is not stable).
+        } else if (d == best_d and std.mem.order(u8, cand_text, c.atomText(best.?)) == .lt) {
+            // Tie on distance: prefer the lexicographically smaller name so
+            // the suggestion is byte-identical across --workers (props are
+            // iterated in atom order, which is not stable).
             best = p.name;
         }
     }
     return best;
-}
-
-pub fn editDistance(a: []const u8, b: []const u8, cap: usize) usize {
-    if (a.len > 32 or b.len > 32) return cap + 1;
-    const big = @max(a.len, b.len);
-    const small = @min(a.len, b.len);
-    if (big - small > cap) return cap + 1;
-    var row: [33]usize = undefined;
-    for (0..b.len + 1) |j| row[j] = j;
-    var i: usize = 1;
-    while (i <= a.len) : (i += 1) {
-        var prev = row[0];
-        row[0] = i;
-        var j: usize = 1;
-        while (j <= b.len) : (j += 1) {
-            const tmp = row[j];
-            const cost: usize = if (toLower(a[i - 1]) == toLower(b[j - 1])) 0 else 1;
-            row[j] = @min(@min(row[j] + 1, row[j - 1] + 1), prev + cost);
-            prev = tmp;
-        }
-    }
-    return row[b.len];
-}
-
-pub fn toLower(ch: u8) u8 {
-    return if (ch >= 'A' and ch <= 'Z') ch + 32 else ch;
 }
 
 // =====================================================================
