@@ -2063,7 +2063,11 @@ fn resolveSpecInto(
                 const r = if (is_json)
                     try resolve.resolveJsonFile(io, scratch, Io.Dir.cwd(), cand)
                 else
-                    try resolve.resolveStem(io, scratch, Io.Dir.cwd(), cand);
+                    // Full "load as file or folder" — a substitution that names
+                    // a package directory is resolved through its
+                    // `package.json`, not just by stem probing
+                    // (`resolvePathsCandidate`).
+                    try resolve.resolvePathsCandidate(io, scratch, Io.Dir.cwd(), cand);
                 if (r) |rr| {
                     mapped = rr;
                     break;
