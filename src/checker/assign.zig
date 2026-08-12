@@ -4553,22 +4553,22 @@ pub fn signatureAssignableModeInnerErase(c: *Checker, s: TypeId, t: TypeId, mode
     // `compareSignaturesRelated` reads `strictVariance` off
     // `target.declaration.kind` (`MethodDeclaration` / `MethodSignature` /
     // `Constructor`) and never looks at the source's. Taking either side's
-    // flag therefore lets a class METHOD launder itself past
-    // `strictFunctionTypes` into a function-typed PROPERTY — oracle-verified
-    // in `test/conformance/assignability/method_source_property_target_
-    // strict_variance.ts`, whose missed lines are registered in
-    // `test/conformance/DEFERRED`.
+    // flag let a class METHOD launder itself past `strictFunctionTypes` into
+    // a function-typed PROPERTY, so a method source related its parameters
+    // bivariantly no matter what it was assigned to — oracle-verified in
+    // `test/conformance/assignability/method_source_property_target_strict_
+    // variance.ts`, four lines of which used to be registered as
+    // under-reports in `test/conformance/DEFERRED`.
     //
-    // Dropping the source disjunct is still held, and the DEFERRED block
-    // carries the measurement. The excalidraw blocker it used to name is
-    // CLOSED (`discriminatedUnionAssignable` now adds the optionality tsc's
-    // `propertyRelatedTo` adds to a member's discriminant); what remains is
-    // the rest-parameter packing gap below, which the strict rule exposes on
-    // immich: `(event: string, ...args: [number] | [string]) => void` →
-    // `(...args: any[]) => any`, where tsc accepts and ztsc's packed-rest
-    // comparison (`restTupleAtPosition`) rejects. See DEFERRED.
-    const bivariant = (c.ts.fnFlags(s) & types.fn_flag_method != 0) or
-        (c.ts.fnFlags(t) & types.fn_flag_method != 0);
+    // Both blockers the DEFERRED block named are closed: excalidraw's
+    // `Delta.create` pair by `discriminatedUnionAssignable` (a member's
+    // discriminant carries the optionality tsc's `propertyRelatedTo` adds),
+    // and the rest-parameter packing gap by `anyRestFrom` below — source-side
+    // bivariance was the only thing hiding
+    // `(event: string, ...args: [number] | [string]) => void` against
+    // `(...args: any[]) => any`, which is immich's `EventRepository.emit`
+    // through vitest's `Mocked<T>`.
+    const bivariant = c.ts.fnFlags(t) & types.fn_flag_method != 0;
     // Erase generics: to `any` in tsc's `erase = true` positions, to their
     // constraints otherwise (the documented simplification of the 1-vs-1 case
     // tsc handles by instantiating the source in the target's context).
