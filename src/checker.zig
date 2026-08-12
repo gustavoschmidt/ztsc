@@ -464,7 +464,56 @@ pub const max_relation_depth = 900;
 /// only drop diagnostics, never invent one. It is nevertheless recorded
 /// (`rel_guard_tripped`), because a NEGATIVE verdict built on an assumed YES
 /// is not evidence — see that field.
+///
+/// WHAT IT COSTS, and why every looser variant was measured out (2026-08-12).
+/// The growth test compares each occurrence of a symbol with the PREVIOUS one,
+/// so a spine that merely ALTERNATES between two instantiations —
+/// `Store<Sub>` → `Store<Base>` → `Store<Sub>` → …, which a property-held
+/// `add = (i: Partial<T>) => T` produces because the parameter position flips
+/// the direction at every level — reads as growth and is cut at the second
+/// link. That alternation is BOUNDED (a finite set of pairs, which the
+/// relation's own in-progress mark closes), so the cut is pure loss:
+/// `assignability/096` cases 2 and 3 are its two registered under-reports.
+///
+/// Four ways out were built and measured. Every one of them widens the walk
+/// enough to expose FOUR pre-existing false positives in immich — kysely's
+/// `DeleteQueryBuilder<DB, TB, O>` / `SelectQueryBuilder`, where the verdict
+/// `"session" | "user"` ⊄ `"session"` comes from a variance comparison that
+/// today never completes because this guard cuts it first, and whose
+/// truncation is what makes it fall back to the structural walk tsc uses.
+/// immich reports 0 diagnostics at every `--checkers=1..8` today.
+///
+///   limit 3, this test           immich 4 keys at every N; wall 1.12 → 1.17 s
+///   tsc's both-sides rule        immich 0 keys, wall 1.12 → 8.73 s (7.8×);
+///     (`relation_guard_both_sides`)  zod 0.043 → 0.109 s at maxDepth 5
+///   monotone growth test         immich 4–5 keys AND a convergence break
+///     (cut only while every       (c1 = 5, c2…c6 = 4, c7 = 5, c8 = 4)
+///      occurrence beats every
+///      earlier one, cap 8)
+///   limit 3 outside a variance   immich 4 keys at every N (so the measurement
+///     measurement, 2 inside       is not the only path that widens)
+///
+/// So the alternation cut is not the thing to fix first: kysely's variance
+/// verdict is. Until it is, this stays at 2. Outline — the app the loosening
+/// was attempted for — does not move a single key under ANY of the four
+/// (1863 keys at `--checkers=1`, 1872 at 4, unchanged); its missing
+/// `Collection`/`Document` ⊄ `Model` family is `assignability/097` and the
+/// inference-falls-back-to-the-constraint rule, not this guard.
 pub const max_relation_identity_repeats = 2;
+/// Does the deeply-nested guard follow tsc's `expandingFlags ===
+/// ExpandingFlags.Both` — assume the pair related only once BOTH sides have
+/// been seen re-entering, each side's bit sticky for the whole subtree below
+/// the frame that set it — instead of firing on either side alone?
+///
+/// This is what tsc does (`recursiveTypeRelatedTo`), and it is OFF: it costs
+/// immich's server package 1.12 → 8.73 s at `--checkers=4` and zod 0.043 →
+/// 0.109 s, because ztsc's recursion identity is the generic's SYMBOL where
+/// tsc's `getRecursionIdentity` is the deferred type reference's AST NODE, a
+/// much finer key. Both sides of a real spine rarely qualify under so coarse
+/// an identity, so the cut effectively stops happening. Compiled, so the next
+/// attempt at tsc-exact semantics starts from a working switch rather than a
+/// rewrite — but a finer identity has to come first.
+pub const relation_guard_both_sides = false;
 /// How many times one generic may be re-entered by the polymorphic-`this`
 /// rewrite (`substThis`) before its subject is left symbolic. The instantiation
 /// analogue of `max_relation_identity_repeats`, and chosen the same way — see
@@ -1676,6 +1725,14 @@ pub const Checker = struct {
     /// `measuredVariances`. The frames below the floor are still live and still
     /// pop themselves; only `relIdDeeplyNested`'s window moves.
     rel_id_floor: u32 = 0,
+    /// tsc's `ExpandingFlags`, one bit per side (1 = source, 2 = target).
+    /// `relIdDeeplyNested` is consulted for a side only while its bit is clear,
+    /// and once set the bit stays set for the whole subtree below the frame that
+    /// set it (each frame saves and restores the value it inherited). The pair is
+    /// assumed related only when BOTH bits are set — tsc's
+    /// `expandingFlags === ExpandingFlags.Both`. Reset behind `rel_id_floor` for
+    /// the same reason the floor exists.
+    rel_expanding: u2 = 0,
     /// Set whenever the growing-instantiation guard answered a pair from
     /// assumption rather than from its members. A relation run that consulted
     /// the guard is not evidence for a NEGATIVE verdict, so the two callers
