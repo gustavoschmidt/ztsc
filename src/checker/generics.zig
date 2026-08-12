@@ -911,7 +911,7 @@ pub fn collectInferVars(c: *Checker, t: TypeId, out: *std.ArrayList(u32), refs: 
 /// resolves to `unknown`, and an extends clause full of `unknown` relates to
 /// almost anything, so the conditional flips to its TRUE branch carrying a
 /// meaningless value.
-pub const MappedInferShape = union(enum) {
+const MappedInferShape = union(enum) {
     /// tsc's `constraintType.flags & TypeFlags.TypeParameter` branch:
     /// `{ [P in K]: V }` with an inference target in the key set K
     /// (`Record<infer N, V>`). K binds `keyof source`, and V — if it holds a
@@ -1034,7 +1034,7 @@ pub fn inferFromExtends(c: *Checker, source0: TypeId, pattern: TypeId, ids: []co
 
 /// Ceiling on `inferFromExtends`'s structural descent. A cut here is what makes
 /// the visited guard depth-sensitive — see there.
-pub const max_infer_depth: u32 = 24;
+const max_infer_depth: u32 = 24;
 
 /// Recursive `inferFromExtends` calls one inference may make before its guards
 /// arm (see the escape hatch there). Chosen from measurement, not taste: over
@@ -2217,6 +2217,7 @@ pub const isPrimitiveForHomomorphicMap = mapped_zig.isPrimitiveForHomomorphicMap
 pub const materializeMapped = mapped_zig.materializeMapped;
 pub const substHomoSource = mapped_zig.substHomoSource;
 pub const collectHomoProps = mapped_zig.collectHomoProps;
+pub const HomoIndex = mapped_zig.HomoIndex;
 pub const collectHomoIndex = mapped_zig.collectHomoIndex;
 pub const collectMappedKeys = mapped_zig.collectMappedKeys;
 pub const objectFromProps = mapped_zig.objectFromProps;

@@ -459,15 +459,13 @@ pub fn materializeMapped(c: *Checker, key_param: TypeId, constraint: TypeId, val
                 var sindex: TypeId = 0;
                 var nindex: TypeId = 0;
                 if (as_clause == 0) {
-                    var src_sidx: TypeId = 0;
-                    var src_nidx: TypeId = 0;
-                    try c.collectHomoIndex(src, &src_sidx, &src_nidx);
-                    if (src_sidx != 0) {
+                    const src_index = try c.collectHomoIndex(src);
+                    if (src_index.string != 0) {
                         var v = try c.substMappedKey(value, key_id, types.string_type);
                         if (flags & types.mapped_flag_optional_add != 0) v = try c.makeUnion2(v, types.undefined_type);
                         sindex = v;
                     }
-                    if (src_nidx != 0) {
+                    if (src_index.number != 0) {
                         var v = try c.substMappedKey(value, key_id, types.number_type);
                         if (flags & types.mapped_flag_optional_add != 0) v = try c.makeUnion2(v, types.undefined_type);
                         nindex = v;
@@ -745,20 +743,33 @@ pub fn collectHomoProps(c: *Checker, t: TypeId, out: *std.ArrayList(types.Prop))
     }
 }
 
+/// The value types of a homomorphic mapped source's index signatures; `0`
+/// for a signature the source does not have.
+pub const HomoIndex = struct {
+    string: TypeId = 0,
+    number: TypeId = 0,
+};
+
 /// Collect the string/number index-signature value types of a homomorphic
-/// mapped source (object, or an intersection of objects). Sets `*sidx` /
-/// `*nidx` to the source's index value type when present (first constituent
-/// wins — intersection index-value merging is a rare edge left to the
-/// source shape). Used so a homomorphic map preserves index signatures.
-pub fn collectHomoIndex(c: *Checker, t: TypeId, sidx: *TypeId, nidx: *TypeId) Error!void {
+/// mapped source (object, or an intersection of objects). First constituent
+/// with a given signature wins — intersection index-value merging is a rare
+/// edge left to the source shape. Used so a homomorphic map preserves index
+/// signatures.
+pub fn collectHomoIndex(c: *Checker, t: TypeId) Error!HomoIndex {
+    var found: HomoIndex = .{};
+    try collectHomoIndexInto(c, t, &found);
+    return found;
+}
+
+fn collectHomoIndexInto(c: *Checker, t: TypeId, found: *HomoIndex) Error!void {
     const r = try c.resolveStructural(t);
     switch (c.ts.kind(r)) {
         .object => {
-            if (sidx.* == 0) sidx.* = c.ts.objectStringIndex(r);
-            if (nidx.* == 0) nidx.* = c.ts.objectNumberIndex(r);
+            if (found.string == 0) found.string = c.ts.objectStringIndex(r);
+            if (found.number == 0) found.number = c.ts.objectNumberIndex(r);
         },
         .intersection => {
-            for (try c.memberList(r)) |m| try c.collectHomoIndex(m, sidx, nidx);
+            for (try c.memberList(r)) |m| try collectHomoIndexInto(c, m, found);
         },
         else => {},
     }
