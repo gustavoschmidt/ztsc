@@ -446,6 +446,35 @@ pub fn typeFromTypeNameEx(c: *Checker, name_node: Node, args: []const TypeId, ou
     }
 }
 
+/// `NoInfer<T>` — `T`, in a position inference must not read.
+///
+/// tsc represents it as a substitution type over `T` whose constraint is
+/// `unknown`; the only thing that reads the marker is `inferFromTypes`, which
+/// adds no candidate from one. ztsc has no substitution kind, so the wrapper is
+/// the shape the ecosystem used before the intrinsic existed and which ztsc's
+/// inference already declines: `[T][T extends any ? 0 : never]`, whose index is
+/// a conditional over `T` and therefore deferred exactly as long as `T` is. Both
+/// halves collapse the moment `T` is substituted — the conditional to `0`, the
+/// access to element 0 — so the relation, `typeToString` and every message read
+/// plain `T`, never the wrapper. msw ships the same trick by hand
+/// (`type NoInfer<T> = [T][T extends any ? 0 : never]`, with a comment saying
+/// why), which is what pins the encoding.
+///
+/// A type inference could not land on anyway (tsc's `isNoInferTargetType`) is
+/// returned unwrapped: `NoInfer<string>` is `string`, and deferring an access
+/// that resolves straight back to it would only cost.
+fn noInferWrapper(c: *Checker, t: TypeId) Error!TypeId {
+    if (!try c.containsFreeTypeParam(t, &.{})) return t;
+    const idx = try c.ts.makeConditional(
+        t,
+        types.any_type,
+        try c.ts.makeNumberLiteral(0, false),
+        types.never_type,
+        c.ts.kind(t) == .type_param,
+    );
+    return c.reduceIndexedAccess(try c.ts.makeTuple(&.{.{ .ty = t, .flags = 0 }}), idx);
+}
+
 /// Materialize a resolved type-space symbol `sym` into its `TypeId`
 /// (type-parameter / enum / alias-instance / interface-or-class ref),
 /// applying `args`. Shared by the ordinary scope-resolution arm and the
@@ -464,6 +493,29 @@ pub fn materializeTypeRef(c: *Checker, sym: SymbolId, args: []const TypeId, tok:
             if (intrinsicStringMapping(c.atomText(a))) |kind_idx| {
                 if (c.aliasBodyIsIntrinsic(sym)) return c.applyStringMapping(kind_idx, args[0]);
             }
+            // `type NoInfer<T> = intrinsic` (lib.esnext.0.d.ts). tsc wraps the
+            // argument in a SUBSTITUTION type whose constraint is `unknown`
+            // (`getNoInferType`), which is `T` for every purpose except that
+            // `inferFromTypes` adds no candidate from it. ztsc has no
+            // substitution kind, so the wrapper is the shape the ecosystem used
+            // before the intrinsic existed and which ztsc already blocks
+            // inference through — `[T][T extends any ? 0 : never]`, a deferred
+            // indexed access whose index never resolves while `T` is generic.
+            // It reduces to exactly `T` the moment `T` is substituted, so the
+            // relation and every message read `T` and not the wrapper.
+            if (std.mem.eql(u8, c.atomText(a), "NoInfer") and c.aliasBodyIsIntrinsic(sym)) {
+                return noInferWrapper(c, args[0]);
+            }
+        }
+        // `type BuiltinIteratorReturn = intrinsic` (lib.esnext.1.d.ts) — the
+        // `TReturn` every built-in iterator declares. `undefined` under
+        // `strictBuiltinIteratorReturn`, which `strict` implies and ztsc runs
+        // no other mode: `new Set([1]).values().next().value` is
+        // `number | undefined`, not `any`.
+        if (args.len == 0 and std.mem.eql(u8, c.atomText(a), "BuiltinIteratorReturn") and
+            c.aliasBodyIsIntrinsic(sym))
+        {
+            return types.undefined_type;
         }
         return c.aliasInstance(sym, args, tok);
     }
