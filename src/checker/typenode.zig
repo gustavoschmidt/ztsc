@@ -3313,10 +3313,13 @@ pub fn objectTypeFromMembers(c: *Checker, member_nodes: []const Node, obj_flags:
     }
     var order: std.ArrayList(Atom) = .empty;
     defer order.deinit(c.scratch());
-    // Members declared with a computed ENUM-MEMBER key, as (atom, name type)
-    // — tsc's `symbol.links.nameType`. Recorded against the interned object
-    // below so `keyof` can report `E.A` where the table is keyed `"AV1"`.
-    // See `Checker.key_name_types`; empty for every type with no such key.
+    // Members whose declaration name is not the plain string literal of their
+    // atom — a computed ENUM-MEMBER key, or a NUMERIC name (`{ 200: T }`) —
+    // as (atom, name type); tsc's `symbol.links.nameType`. Recorded against
+    // the interned object below so `keyof` can report `E.A` where the table is
+    // keyed `"AV1"`, and `200` where it is keyed `"200"`. See
+    // `Checker.memberNameType` and `Checker.key_name_types`; empty for every
+    // type with no such member.
     var name_types: std.ArrayList(struct { name: Atom, ty: TypeId }) = .empty;
     defer name_types.deinit(c.scratch());
     // Method names declared optional (`m?(): T`) — tsc marks the resulting
@@ -3354,6 +3357,12 @@ pub fn objectTypeFromMembers(c: *Checker, member_nodes: []const Node, obj_flags:
             },
             .method_signature => {
                 const name = try c.memberKey(c.tree.nodeMainToken(m), md.rhs);
+                {
+                    // A numeric / enum-member METHOD name is named the same
+                    // way a property name is (`{ 200(): void }`).
+                    const nt = try c.memberNameType(c.tree.nodeMainToken(m), md.rhs);
+                    if (nt != types.no_type) try name_types.append(c.scratch(), .{ .name = name, .ty = nt });
+                }
                 // `get x(): T` / `set x(v: T)` accessor signatures: the
                 // property type is the getter return (or setter param).
                 const is_get = md.rhs & ast.Flags.get != 0;
