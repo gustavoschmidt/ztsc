@@ -409,17 +409,6 @@ pub fn eachEnumMember(
     }
 }
 
-pub const EnumMemberLookup = struct {
-    want: Atom,
-    found: bool = false,
-    value: TypeId = types.no_type,
-    pub fn visit(self: *EnumMemberLookup, name: Atom, value: TypeId) Error!void {
-        if (self.found or name != self.want) return;
-        self.found = true;
-        self.value = value;
-    }
-};
-
 /// `eachEnumMember`'s walk for one enum, memoized under its symbol — see
 /// `Checker.enum_members`. Every by-name consumer goes through here, so an
 /// enum's declaration is read once per checker instead of once per question.
@@ -458,8 +447,8 @@ pub fn enumHasMemberNamed(c: *Checker, sym: SymbolId, name: Atom) Error!bool {
 /// `const k: "keydown" = EVENT.KEYDOWN` type-check while
 /// `const k: "paste" = EVENT.KEYDOWN` does not.
 pub fn enumMemberValue(c: *Checker, sym: SymbolId, name: Atom) Error!?TypeId {
-    // First declaration wins, matching `EnumMemberLookup`'s `if (self.found)`
-    // guard for an enum that declares the same name twice.
+    // First declaration wins, for an enum that declares the same name twice
+    // (`enumMembersOf` keeps both entries, in declaration order).
     for (try enumMembersOf(c, sym)) |m| {
         if (m.name != name) continue;
         if (m.value == types.no_type) return null;
@@ -475,24 +464,26 @@ pub fn enumMemberValue(c: *Checker, sym: SymbolId, name: Atom) Error!?TypeId {
 /// ztsc keeps the enum as ONE type, so a guard written against the raw value
 /// has to be translated into the member type before the value narrowers can
 /// keep or subtract it (see `narrowByLiteralEquality`).
-pub const EnumMemberByValue = struct {
-    c: *Checker,
-    sym: SymbolId,
-    want: TypeId,
-    found: TypeId = types.no_type,
-    pub fn visit(self: *EnumMemberByValue, name: Atom, value: TypeId) Error!void {
-        if (self.found != types.no_type or value == types.no_type) return;
-        if ((try self.c.ts.regularLiteral(value)) != self.want) return;
-        self.found = try self.c.ts.makeEnumMember(self.sym, name, false);
-    }
-};
-
 pub fn enumMemberForValue(c: *Checker, sym: SymbolId, value: TypeId) Error!?TypeId {
-    var look: EnumMemberByValue = .{ .c = c, .sym = sym, .want = try c.ts.regularLiteral(value) };
-    try c.eachEnumMember(sym, &look, EnumMemberByValue.visit);
+    const ByValue = struct {
+        c: *Checker,
+        sym: SymbolId,
+        want: TypeId,
+        found: TypeId = types.no_type,
+        fn visit(self: *@This(), name: Atom, v: TypeId) Error!void {
+            if (self.found != types.no_type or v == types.no_type) return;
+            if ((try self.c.ts.regularLiteral(v)) != self.want) return;
+            self.found = try self.c.ts.makeEnumMember(self.sym, name, false);
+        }
+    };
+    var look: ByValue = .{ .c = c, .sym = sym, .want = try c.ts.regularLiteral(value) };
+    try c.eachEnumMember(sym, &look, ByValue.visit);
     return if (look.found == types.no_type) null else look.found;
 }
 
+/// `eachEnumMember` visitor collecting one member TYPE per distinct member
+/// name. Stays `pub` — unlike this file's other visitors it has a second
+/// consumer, `generics.zig`'s whole-enum key expansion.
 pub const EnumMemberCollect = struct {
     c: *Checker,
     list: *std.ArrayList(TypeId),
@@ -576,14 +567,6 @@ pub fn enumValueType(c: *Checker, sym: SymbolId) Error!TypeId {
     return result;
 }
 
-/// Nominal enum assignability. Identical types (same enum, same member)
-/// are caught by `s == t` upstream, and `E.A → E` by the `literalBaseOf`
-/// fast path, so what is left here is the widening in and out of the
-/// primitive domain. Oracle-verified: a numeric enum (and a numeric
-/// *member*) interconverts with `number` and accepts a numeric literal of
-/// its own value; a string enum is a subtype of `string` but nothing —
-/// not `string`, not the matching string literal — widens *into* it; and
-/// `E → E.A`, `E.A → E.B` and `E1.A → E2.A` are all rejected.
 /// Collects `(name, value)` for every member of an enum, for the structural
 /// enum comparison below.
 const EnumPair = struct { name: Atom, value: TypeId };
@@ -670,6 +653,19 @@ fn crossEnumAssignable(c: *Checker, s: TypeId, t: TypeId) Error!bool {
     return (try c.ts.regularLiteral(sv)) == (try c.ts.regularLiteral(tv));
 }
 
+/// Nominal enum assignability. Identical types (same enum, same member)
+/// are caught by `s == t` upstream, and `E.A → E` by the `literalBaseOf`
+/// fast path, so what is left here is the widening in and out of the
+/// primitive domain. Oracle-verified: a numeric enum (and a numeric
+/// *member*) interconverts with `number` and accepts a numeric literal of
+/// its own value; a string enum is a subtype of `string` but nothing —
+/// not `string`, not the matching string literal — widens *into* it; and
+/// `E → E.A`, `E.A → E.B` and `E1.A → E2.A` are all rejected.
+///
+/// `sk`/`tk` are caller-supplied rather than re-derived from `s`/`t`: the
+/// sole caller (`assign.zig`'s relation) has already switched on both kinds
+/// to get here and passes the values it holds. At least one of them is
+/// `.enum_type`.
 pub fn enumAssignable(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: types.Kind) Error!bool {
     if (sk == .enum_type and tk == .enum_type) {
         if (c.ts.enumSymbol(s) != c.ts.enumSymbol(t)) return crossEnumAssignable(c, s, t);
