@@ -3538,14 +3538,13 @@ pub fn structuralAssignable(c: *Checker, s: TypeId, t: TypeId) Error!bool {
     // strictNullChecks tsc rejects all of these (TS2322), whatever the
     // target's optionality.
     //
-    // `unknown` is the same hole one step up and is NOT closed here — see
-    // `test/conformance/assignability/unknown_not_assignable_to_object.ts`
-    // and its `DEFERRED` block. tsc relates `unknown` to `any` and `unknown`
-    // and to nothing else, but here it reaches both the empty-object fast
-    // path ("anything non-nullish") and the all-optional fall-through, so it
-    // is assignable to `{}`, to `{ a?: number }` and to every `Partial<T>`.
+    // `unknown` is the same hole one step up: tsc relates the top type to
+    // `any` and `unknown` and to nothing else, where here it would reach both
+    // the empty-object fast path ("anything non-nullish") and the all-optional
+    // fall-through — so it was assignable to `{}`, to `{ a?: number }` and to
+    // every `Partial<T>`.
     switch (c.ts.kind(s)) {
-        .null, .undefined, .void => return false,
+        .null, .undefined, .void, .unknown => return false,
         else => {},
     }
     const n = c.ts.objectPropCount(t);
