@@ -1,42 +1,17 @@
-//! ZTSC CLI driver: argument parsing, thread pool, phase orchestration.
+//! ZTSC CLI: argument parsing, tsconfig loading, and the phase orchestration
+//! around the two halves that do the work — `driver.build` (discovery,
+//! front end, renumbering, link) and the check phase it schedules with
+//! schedule.zig. What stays here is the process's own business: what the user
+//! asked for, what the config says, what gets printed, and the exit code.
 //!
-//! The built-in lib runs its own front end first (`libs.frontEndLibs`):
-//! the shards are parsed on a small thread budget and then bound
-//! single-threaded in fixed order, which is what pins the interner's atoms
-//! before any concurrent user-file work. Its output enters discovery as
-//! ready-made completions, so the lib is never queued to the pool.
-//!
-//! Atoms the *concurrent* front end hands out are pinned differently: they
-//! are reassigned once discovery is done, replaying each file's first-touch
-//! list in graph order so the ids are the ones a single-threaded front end
-//! would have produced (`Interner.renumber`, the renumbering block below).
-//! Atoms are sort keys — scope member tables, merged namespace members,
-//! object property records — so without it the checker's traversal order,
-//! and the work it did, moved with worker scheduling.
-//!
-//! Module discovery is single-owner with a completion queue: the main
-//! thread is the sole owner of
-//! the module graph and seen-set (no locks on graph state); workers run
-//! the whole per-file front end (load/parse/bind) and push per-file
-//! completion messages `(file, import specifiers)`; the main thread
-//! resolves each completion's module specifiers (bundler-style, see
-//! modules.zig) as it arrives and enqueues newly discovered files
-//! immediately — no wave barrier, so already-discovered work never waits
-//! on an unrelated slow file. After discovery, files are renumbered into
-//! a deterministic graph-derived order (BFS from the entry files,
-//! tie-break = specifier order within the importing file — the same order
-//! the old wavefront discovery produced). A serial `link` phase then
-//! builds sealed per-file import/export tables; the check phase
-//! partitions the program's files across N independent checker instances
-//! (`--checkers=N`; the default is min(4, cores), dropped to 2 when there
-//! is less than `small_program_nodes` of check work to spread), each with its own type
-//! store/caches, reading the shared immutable AST/binder/link data without
-//! locks.
+//! The CLI-overrides-tsconfig precedence rules are settled in ONE place
+//! (`effectiveOptions`) and handed to the driver as values; nothing below
+//! re-reads the config.
 //!
 //! Output determinism: the file order is derived from the graph, never
-//! from scheduling; every diagnostic is tagged with its file; each file's
-//! check diagnostics come from exactly the checker that owns it, and the
-//! final print is per file (in graph order), position-sorted —
+//! from scheduling (driver.zig); every diagnostic is tagged with its file;
+//! each file's check diagnostics come from exactly the checker that owns it,
+//! and the final print is per file (in graph order), position-sorted —
 //! byte-identical for any --workers/--checkers combination. `--timing`
 //! reports the per-phase split (`config` is tsconfig loading and its
 //! `include` walk; load/parse/bind are summed per-file worker times,
@@ -50,8 +25,6 @@ const Io = std.Io;
 const ztsc = @import("ztsc");
 const Source = ztsc.source.Source;
 const Interner = ztsc.intern.Interner;
-const parser = ztsc.parser;
-const binder = ztsc.binder;
 const checker = ztsc.checker;
 const libs = ztsc.libs;
 const modules = ztsc.modules;
@@ -59,8 +32,6 @@ const resolve = ztsc.resolve;
 const types = ztsc.types;
 const driver = ztsc.driver;
 const schedule = ztsc.schedule;
-const Ast = ztsc.ast.Ast;
-const Bind = binder.Bind;
 const Timer = driver.Timer;
 const FileOrder = driver.FileOrder;
 
@@ -277,213 +248,6 @@ const Emitter = struct {
         } else {
             try e.out.print("{s}:{d}:{d}: error: {s}\n", .{ path, lc.line + 1, lc.col + 1, msg });
         }
-    }
-};
-
-/// A unit of discovery work handed to a worker: one file to front-end.
-/// The path slice lives in the main arena and is stable for the run.
-const WorkItem = struct {
-    file: modules.FileId,
-    path: []const u8,
-};
-
-/// Per-file completion message a worker sends back to the main thread:
-/// the sealed front-end outputs plus per-phase timings. Payloads live in
-/// the worker's arena and are read-only once the message is pushed.
-const Completion = struct {
-    file: modules.FileId,
-    src: ?Source = null,
-    tree: ?*Ast = null,
-    bind: ?*Bind = null,
-    err: ?anyerror = null,
-    /// The file's own path, interned before it is parsed — the first string
-    /// this file contributes to the program-wide interning order (see the
-    /// renumbering block below). 0 for the lib shards, whose atoms are already
-    /// pinned, and for a file that never loaded.
-    path_atom: ztsc.intern.Atom = 0,
-    load_ns: u64 = 0,
-    parse_ns: u64 = 0,
-    bind_ns: u64 = 0,
-};
-
-/// Unbounded FIFO channel (mutex + condition). Buffer memory comes from
-/// the channel's own arena and is only touched under the lock, so the
-/// channel is safe with any number of producers and consumers. Message
-/// passing is the only worker<->main communication during discovery; the
-/// module graph itself stays main-thread-owned with no locks.
-fn Channel(comptime T: type) type {
-    return struct {
-        io: Io,
-        arena: std.heap.ArenaAllocator,
-        mutex: Io.Mutex = .init,
-        cond: Io.Condition = .init,
-        buf: std.ArrayList(T) = .empty,
-        head: usize = 0,
-        closed: bool = false,
-
-        const Self = @This();
-
-        fn init(io: Io) Self {
-            return .{ .io = io, .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
-        }
-
-        fn deinit(c: *Self) void {
-            c.arena.deinit();
-        }
-
-        fn push(c: *Self, item: T) error{OutOfMemory}!void {
-            c.mutex.lockUncancelable(c.io);
-            defer c.mutex.unlock(c.io);
-            try c.buf.append(c.arena.allocator(), item);
-            c.cond.signal(c.io);
-        }
-
-        /// Blocks until an item is available; null after close() once the
-        /// buffer is drained.
-        fn pop(c: *Self) ?T {
-            c.mutex.lockUncancelable(c.io);
-            defer c.mutex.unlock(c.io);
-            while (c.head == c.buf.items.len) {
-                if (c.closed) return null;
-                c.cond.waitUncancelable(c.io, &c.mutex);
-            }
-            const item = c.buf.items[c.head];
-            c.head += 1;
-            return item;
-        }
-
-        fn close(c: *Self) void {
-            c.mutex.lockUncancelable(c.io);
-            defer c.mutex.unlock(c.io);
-            c.closed = true;
-            c.cond.broadcast(c.io);
-        }
-    };
-}
-
-/// One pool worker. Each worker owns an arena allocator; everything a worker
-/// allocates while processing files (line tables, tokens, ASTs, binder
-/// output) lives in its arena and is never individually freed. Workers pull
-/// one file at a time from the work channel, run the whole per-file front
-/// end on it, and push a completion — no phase or wave barriers.
-const Worker = struct {
-    arena: std.heap.ArenaAllocator,
-    /// Scratch space for benchmark re-runs (`--repeat`); reset between runs.
-    scratch: std.heap.ArenaAllocator,
-    /// Segments the worker's small source files are packed into, so the
-    /// front end pays no per-file page rounding. Private to the worker,
-    /// which is what makes the pack's bump cursor lock-free.
-    pack: ztsc.source.Pack = .{},
-    thread: std.Thread = undefined,
-    files_loaded: usize = 0,
-    /// The grammar options every file this worker parses is parsed under
-    /// (`jsx` is per-file and filled in at the call site). Settled from the
-    /// tsconfig before any worker is spawned, so it needs no synchronization.
-    parse_opts: parser.Opts = .{},
-
-    fn discoverRun(
-        w: *Worker,
-        io: Io,
-        gpa: std.mem.Allocator,
-        interner: *Interner,
-        repeat: usize,
-        work: *Channel(WorkItem),
-        done: *Channel(Completion),
-    ) void {
-        while (work.pop()) |item| {
-            var c: Completion = .{ .file = item.file };
-            w.processFile(io, gpa, interner, item.path, repeat, &c);
-            done.push(c) catch @panic("ztsc: out of memory (completion queue)");
-        }
-    }
-
-    /// The whole per-file front end: load -> parse (which tokenizes) -> bind.
-    /// Outputs and per-phase timings land in `c`; on the first error the
-    /// remaining phases are skipped (same per-phase skip behavior the
-    /// wavefront scheduler had). `repeat > 1` re-runs each phase into
-    /// scratch (benchmarks).
-    fn processFile(
-        w: *Worker,
-        io: Io,
-        gpa: std.mem.Allocator,
-        interner: *Interner,
-        path: []const u8,
-        repeat: usize,
-        c: *Completion,
-    ) void {
-        const alloc = w.arena.allocator();
-
-        var timer = Timer.start(io);
-        const src = if (libs.libSourceFor(path)) |lib_bytes|
-            Source.fromBytes(alloc, path, lib_bytes) catch |err| {
-                c.err = err;
-                return;
-            }
-        else if (ztsc.paths.anyModuleSourceFor(path)) |any_bytes|
-            // A resolved JSON module (resolveJsonModule) or JS module (allowJs):
-            // type it opaquely as `any` from a synthetic body instead of parsing
-            // the raw JSON/JS as TypeScript.
-            Source.fromBytes(alloc, path, any_bytes) catch |err| {
-                c.err = err;
-                return;
-            }
-        else
-            Source.load(io, alloc, path, &w.pack) catch |err| {
-                c.err = err;
-                return;
-            };
-        c.src = src;
-        w.files_loaded += 1;
-        // Exercise the shared interner from every worker thread.
-        c.path_atom = interner.intern(io, gpa, path) catch |err| {
-            c.err = err;
-            return;
-        };
-        c.load_ns = timer.readNs();
-
-        // No standalone tokenize pass: the parser tokenizes internally
-        // into `tree.tokens` (what the binder reads), so a separate scan
-        // would be pure throwaway work (~5.8% of front-end CPU). Token
-        // stats are derived from `tree.tokens`.
-        timer = Timer.start(io);
-        var r: usize = 1;
-        while (r < repeat) : (r += 1) {
-            var opts = w.parse_opts;
-            opts.jsx = parser.isJsxPath(path);
-            var tree = parser.parseOpts(w.scratch.allocator(), src.bytes, opts) catch break;
-            std.mem.doNotOptimizeAway(&tree);
-            _ = w.scratch.reset(.retain_capacity);
-        }
-        const tree = alloc.create(Ast) catch |err| {
-            c.err = err;
-            return;
-        };
-        var file_opts = w.parse_opts;
-        file_opts.jsx = parser.isJsxPath(path);
-        tree.* = parser.parseOpts(alloc, src.bytes, file_opts) catch |err| {
-            c.err = err;
-            return;
-        };
-        c.tree = tree;
-        c.parse_ns = timer.readNs();
-
-        timer = Timer.start(io);
-        r = 1;
-        while (r < repeat) : (r += 1) {
-            var b = binder.bind(w.scratch.allocator(), io, gpa, interner, tree, src.bytes, parser.isDeclarationPath(path)) catch break;
-            std.mem.doNotOptimizeAway(&b);
-            _ = w.scratch.reset(.retain_capacity);
-        }
-        const b = alloc.create(Bind) catch |err| {
-            c.err = err;
-            return;
-        };
-        b.* = binder.bind(alloc, io, gpa, interner, tree, src.bytes, parser.isDeclarationPath(path)) catch |err| {
-            c.err = err;
-            return;
-        };
-        c.bind = b;
-        c.bind_ns = timer.readNs();
     }
 };
 
@@ -710,507 +474,47 @@ pub fn main(init: std.process.Init) !void {
     // Not capped by the entry count: discovery finds more files.
     const cpu_count = std.Thread.getCpuCount() catch 1;
     const n_workers: usize = @max(1, cli.workers orelse cpu_count);
-    const workers = try arena.alloc(Worker, n_workers);
-    for (workers) |*w| w.* = .{
-        .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
-        .scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator),
-        .parse_opts = .{ .experimental_decorators = config_experimental_decorators },
-    };
 
-    // Transient allocator for module resolution: candidate path strings and
-    // package.json bodies are discarded after each file's specifiers
-    // resolve. Mirrors the serial buildProgram path (modules.zig). Reset per
-    // file so it never grows past one file's resolution working set.
-    var resolve_scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer resolve_scratch.deinit();
-
-    // Resolution memo: the same specifier imported from many files
-    // resolves once. Lives in `arena` (spans the whole discovery run). Created
-    // before the program roots are seeded because they, too, go through its
-    // canonical-path step (see below).
-    var rcache = resolve.ResolveCache.init(arena, !cli.no_resolve_cache, .{
-        .resolve_json = config_resolve_json,
-        .base_url = config_base_url,
-        .allow_js = config_allow_js,
-        .resolve_pkg_json_exports = config_resolve_pkg_exports,
-        .resolve_pkg_json_imports = config_resolve_pkg_imports,
-        .module_suffixes = config_module_suffixes,
+    // --- Front end: discover, parse, bind, renumber, link ------------------
+    var dr = try driver.build(arena, gpa, io, &interner, .{
+        .entry_paths = entry_paths,
+        .n_real_roots = n_real_roots,
+        .file_order = cli.file_order,
+        .lib_set = lib_set,
+        .n_workers = n_workers,
+        .repeat = cli.repeat,
+        .resolve_cache = !cli.no_resolve_cache,
+        .resolve_opts = .{
+            .resolve_json = config_resolve_json,
+            .base_url = config_base_url,
+            .allow_js = config_allow_js,
+            .resolve_pkg_json_exports = config_resolve_pkg_exports,
+            .resolve_pkg_json_imports = config_resolve_pkg_imports,
+            .module_suffixes = config_module_suffixes,
+        },
+        .paths_map = paths_map,
+        .jsx_runtime_module = config_jsx_runtime_module,
+        .link_opts = .{
+            .allow_synthetic_default = config_allow_synthetic_default,
+            .no_implicit_any = config_no_implicit_any,
+            .no_unchecked_side_effect_imports = config_no_unchecked_side_effect_imports,
+            .types_wildcard = config_types_wildcard,
+            .experimental_decorators = config_experimental_decorators,
+        },
     });
-
-    // --- Single-owner discovery (no wave barrier) --------------------------
-    // The main thread is the sole owner of the module graph and seen-set;
-    // workers front-end one file at a time and push completions; the main
-    // thread resolves each completion as it arrives and enqueues newly
-    // discovered files immediately.
-    var paths: std.ArrayList([]const u8) = .empty;
-    var path_ids: std.StringHashMapUnmanaged(u32) = .empty;
-    // Inject the selected built-in lib blobs as the first entries (files 0..).
-    // Their synthetic paths route to the embedded sources in the worker front
-    // end; their top-level decls become the program globals. Empty under
-    // --noLib / lib:[].
-    var lib_buf: [libs.max_lib_files]libs.LibFile = undefined;
-    for (libs.libFiles(lib_set, &lib_buf)) |lf| {
-        try path_ids.put(arena, lf.path, @intCast(paths.items.len));
-        try paths.append(arena, lf.path);
-    }
-    // Program roots. A root under `node_modules` — in practice the auto-included
-    // `@types/*` ambient roots, which pnpm exposes as symlinks into its store —
-    // is keyed by its canonical path, the same identity the module resolver
-    // gives the very same file when an `import` reaches it. Without that step
-    // `node_modules/@types/react/index.d.ts` and the store path behind the
-    // symlink are two files with two symbol universes. Outside `node_modules`
-    // the call is a no-op, so project roots keep the path the user typed (and
-    // pay no realpath syscall).
-    // `--file-order`: permute the roots before a single id is handed out.
-    // Everything downstream — file ids, the BFS discovery order, the cost
-    // partition and its tie-breaks — is a function of this list, so this is
-    // the one place that can vary the axis. tsc's answer does not depend on
-    // root order; `bench/order_sweep.sh` is the gate that says ztsc's does
-    // not either. Only the REAL roots permute: the auto-included `@types/*`
-    // tail is not a user-visible ordering, and tsc always processes it after
-    // the roots' closure however the roots were listed.
-    switch (cli.file_order) {
-        .source => {},
-        .reverse => {
-            const permuted = try arena.dupe([]const u8, entry_paths);
-            std.mem.reverse([]const u8, permuted[0..n_real_roots]);
-            entry_paths = permuted;
-        },
-        .shuffle => |seed| {
-            const permuted = try arena.dupe([]const u8, entry_paths);
-            var prng: std.Random.DefaultPrng = .init(seed);
-            prng.random().shuffle([]const u8, permuted[0..n_real_roots]);
-            entry_paths = permuted;
-        },
-    }
-    // `n_root_entries` is where the auto-included `@types/*` roots start in
-    // `paths` — the second BFS wave in the renumbering block below. A
-    // `@types/*` path already seen as a real root keeps its first position.
-    var n_root_entries: usize = 0;
-    for ([2][]const []const u8{ entry_paths[0..n_real_roots], entry_paths[n_real_roots..] }, 0..) |wave, wi| {
-        if (wi == 1) n_root_entries = paths.items.len;
-        for (wave) |p| {
-            const norm = try ztsc.paths.normalizePath(arena, p);
-            const key = try rcache.canonicalPath(io, resolve_scratch.allocator(), Io.Dir.cwd(), norm);
-            const gop = try path_ids.getOrPut(arena, key);
-            if (!gop.found_existing) {
-                gop.value_ptr.* = @intCast(paths.items.len);
-                try paths.append(arena, key);
-            }
-        }
-    }
-    _ = resolve_scratch.reset(.retain_capacity);
-    const n_entries = paths.items.len;
-
-    var results: std.ArrayList(?Source) = .empty;
-    var trees: std.ArrayList(?*Ast) = .empty;
-    var binds: std.ArrayList(?*Bind) = .empty;
-    var errs: std.ArrayList(?anyerror) = .empty;
-    // Per-file path atom, in the order the front end interned it (first for
-    // the file); feeds the deterministic renumbering after discovery.
-    var path_atoms: std.ArrayList(ztsc.intern.Atom) = .empty;
-    var spec_atoms_all: std.ArrayList([]ztsc.intern.Atom) = .empty;
-    var spec_files_all: std.ArrayList([]modules.FileId) = .empty;
-    // Per-file resolved FileIds in first-occurrence specifier order
-    // (unresolved skipped) — the edges of the deterministic BFS below.
-    var edge_lists: std.ArrayList([]const modules.FileId) = .empty;
-    // Per-file `/// <reference types="X" />` directives that resolved to
-    // nothing; the linker replays them as TS2688.
-    var type_ref_misses_all: std.ArrayList([]const modules.TypeRefMiss) = .empty;
-
-    var load_ns: u64 = 0;
-    var parse_ns: u64 = 0;
-    var bind_ns: u64 = 0;
-    var resolve_ns: u64 = 0;
-    var renumber_ns: u64 = 0;
-
-    var work = Channel(WorkItem).init(io);
-    defer work.deinit();
-    var done = Channel(Completion).init(io);
-    defer done.deinit();
-
-    // The lib's front end: parse and bind the injected shards single-threaded,
-    // before any worker runs, and *keep* the results. Single-threaded is what
-    // pins the atoms (an `Atom` encodes shard-local insertion order, so the
-    // lib's strings must be interned in a fixed order ahead of the concurrent
-    // user-file work). Keeping the products is what makes the pass pay for
-    // itself: the shards never enter the work queue, so the lib is parsed and
-    // bound once per run instead of once here and again on a worker.
-    //
-    // Per-shard arenas, not the process arena: `init.arena` is thread-safe, so
-    // every allocation there takes a lock, and this is one of the
-    // allocation-heaviest stretches of the run (and its parse pass is
-    // concurrent). They live as long as the program — the AST and binder
-    // output are program data — so they are only released at the end.
-    var lib_fe = try libs.frontEndLibs(arena, io, gpa, &interner, lib_set, n_workers);
-    defer lib_fe.deinit();
-    const lib_units = lib_fe.units;
-
-    // Everything interned up to here came from a single-threaded phase, so its
-    // ids are already the same on every run and the lib's sealed binder output
-    // (which is kept, never re-bound) can keep pointing at them. Ids handed out
-    // past this point are scheduling-dependent and get reassigned once
-    // discovery is done — see the renumbering block below.
-    interner.freezePrefix();
-
-    const discover_timer = Timer.start(io);
-    for (workers) |*w| {
-        w.thread = try std.Thread.spawn(.{}, Worker.discoverRun, .{
-            w, io, gpa, &interner, cli.repeat, &work, &done,
-        });
-    }
-
-    var outstanding: usize = 0;
-    try growPerFile(arena, paths.items.len, &results, &trees, &binds, &errs, &path_atoms, &spec_atoms_all, &spec_files_all, &edge_lists, &type_ref_misses_all);
-    // The lib shards hold file ids 0..lib_units.len and are already
-    // front-ended, so they enter the discovery loop as ready-made completions
-    // instead of as work. Everything downstream — specifier resolution,
-    // `/// <reference>` scanning, the BFS renumbering — sees an ordinary
-    // completion and cannot tell the difference.
-    for (lib_units, 0..) |*u, i| {
-        try done.push(.{
-            .file = @intCast(i),
-            .src = u.src,
-            .tree = u.tree,
-            .bind = u.bind,
-            .parse_ns = u.parse_ns,
-            .bind_ns = u.bind_ns,
-        });
-        outstanding += 1;
-    }
-    for (paths.items[lib_units.len..], lib_units.len..) |p, i| {
-        try work.push(.{ .file = @intCast(i), .path = p });
-        outstanding += 1;
-    }
-
-    // FileId of the auto-injected `@types/node` (null until the first Node
-    // built-in import pulls it in); see the discovery loop below.
-    var node_types_fid: ?u32 = null;
-    // FileId of the auto-injected `<jsxImportSource>/jsx-runtime` (null until
-    // the first `.tsx` file pulls it in); see the discovery loop below.
-    var jsx_runtime_fid: ?u32 = null;
-    resolve.resetFsProbeCount();
-
-    while (outstanding > 0) {
-        // The done channel is never closed while work is outstanding.
-        const c = done.pop().?;
-        outstanding -= 1;
-        const i = c.file;
-        results.items[i] = c.src;
-        trees.items[i] = c.tree;
-        binds.items[i] = c.bind;
-        errs.items[i] = c.err;
-        path_atoms.items[i] = c.path_atom;
-        load_ns += c.load_ns;
-        parse_ns += c.parse_ns;
-        bind_ns += c.bind_ns;
-
-        // Resolve this file's module specifiers (main thread only;
-        // discovers files).
-        const resolve_timer = Timer.start(io);
-        var atoms: std.ArrayList(ztsc.intern.Atom) = .empty;
-        var files: std.ArrayList(modules.FileId) = .empty;
-        var ref_files: std.ArrayList(modules.FileId) = .empty;
-        const known_before = paths.items.len;
-        if (binds.items[i]) |b| {
-            const scratch = resolve_scratch.allocator();
-            var seen: std.AutoHashMapUnmanaged(ztsc.intern.Atom, void) = .empty;
-            defer seen.deinit(gpa);
-            for (b.imports) |rec| {
-                try resolveSpecInto(arena, scratch, gpa, io, &interner, &rcache, paths_map, config_resolve_json, paths.items[i], rec.module, &seen, &path_ids, &paths, &atoms, &files);
-            }
-            for (b.exports) |rec| {
-                if (rec.module != 0) {
-                    try resolveSpecInto(arena, scratch, gpa, io, &interner, &rcache, paths_map, config_resolve_json, paths.items[i], rec.module, &seen, &path_ids, &paths, &atoms, &files);
-                }
-            }
-            // A `declare module "spec" { … }` block inside a file that is
-            // itself a MODULE is a module *augmentation*, and its specifier is
-            // a module reference of this file exactly like an import is —
-            // tsc's `getModuleNames` appends `file.moduleAugmentations` to
-            // `file.imports` before `processImportedModules` resolves them.
-            // Without it `f.specs` only held specifiers some import/export
-            // clause happened to name, so `mergeAugmentations` could not find
-            // the augmented file and dropped the block: an augmentation that
-            // is the ONLY mention of the module in its file never merged.
-            //
-            // That is the shape a package uses to augment ITSELF from a
-            // sibling file — @tiptap/core's `dist/commands/*.d.ts` each carry
-            // `declare module '@tiptap/core' { interface Commands<R> { … } }`
-            // while importing only relative paths — so `Commands` stayed
-            // empty except for the handful of third-party extension packages
-            // (which DO import '@tiptap/core' for other reasons), and every
-            // `editor.commands.*` / `editor.chain().*` was a TS2339.
-            //
-            // Gated on `b.is_module`, tsc's `isExternalModuleFile`: in a
-            // SCRIPT the same block is a standalone ambient module declaration
-            // (@types/node's `declare module "fs"`), not an augmentation, and
-            // must not resolve to anything.
-            if (b.is_module) {
-                for (b.ambient_modules) |am| {
-                    try resolveSpecInto(arena, scratch, gpa, io, &interner, &rcache, paths_map, config_resolve_json, paths.items[i], am.spec, &seen, &path_ids, &paths, &atoms, &files);
-                }
-            }
-            // Pull @types/node into the program on the first Node built-in
-            // import (`node:fs`, `path`, …), like tsc auto-including @types: its
-            // ambient `declare module "fs"` / `declare module "node:fs"` blocks
-            // then resolve those specifiers. Injected once, discovered like a
-            // triple-slash reference so the deterministic BFS reaches it (and,
-            // via its own `/// <reference>` refs, every submodule .d.ts).
-            if (node_types_fid == null) {
-                for (b.imports) |rec| {
-                    if (!ztsc.paths.isNodeBuiltin(interner.lookup(io, rec.module))) continue;
-                    if (try rcache.resolve(io, scratch, Io.Dir.cwd(), paths.items[i], "@types/node")) |np| {
-                        const pgop = try path_ids.getOrPut(arena, np);
-                        if (pgop.found_existing) {
-                            node_types_fid = pgop.value_ptr.*;
-                        } else {
-                            const stable = try arena.dupe(u8, np);
-                            pgop.key_ptr.* = stable;
-                            node_types_fid = @intCast(paths.items.len);
-                            pgop.value_ptr.* = node_types_fid.?;
-                            try paths.append(arena, stable);
-                        }
-                        try ref_files.append(arena, node_types_fid.?);
-                    }
-                    break;
-                }
-            }
-            // Under the automatic JSX runtime the `JSX` namespace is an export
-            // of `<jsxImportSource>/jsx-runtime`, not a global — @types/react 19
-            // ships no `declare global { namespace JSX }` at all. tsc puts that
-            // module in the program for every JSX file; do the same on the first
-            // `.tsx` we see, discovered like a triple-slash reference so the
-            // deterministic BFS reaches it. Its FileId is handed to the checker
-            // (`Program.jsx_runtime_file`) as the JSX-namespace fallback.
-            if (jsx_runtime_fid == null and config_jsx_runtime_module != null and
-                std.mem.endsWith(u8, paths.items[i], ".tsx"))
-            {
-                if (try rcache.resolve(io, scratch, Io.Dir.cwd(), paths.items[i], config_jsx_runtime_module.?)) |jp| {
-                    const pgop = try path_ids.getOrPut(arena, jp);
-                    if (pgop.found_existing) {
-                        jsx_runtime_fid = pgop.value_ptr.*;
-                    } else {
-                        const stable = try arena.dupe(u8, jp);
-                        pgop.key_ptr.* = stable;
-                        jsx_runtime_fid = @intCast(paths.items.len);
-                        pgop.value_ptr.* = jsx_runtime_fid.?;
-                        try paths.append(arena, stable);
-                    }
-                    try ref_files.append(arena, jsx_runtime_fid.?);
-                }
-            }
-            // Triple-slash `/// <reference>` directives pull extra files into
-            // the program — program inputs, not import bindings. Their
-            // resolved ids join the discovery edge list so the deterministic
-            // BFS renumbering below reaches them.
-            if (results.items[i]) |src| {
-                var misses: std.ArrayList(modules.TypeRefMiss) = .empty;
-                for (try resolve.scanReferences(scratch, src.bytes)) |ref| {
-                    const rfid = try discoverReferenceInto(arena, scratch, io, &rcache, paths.items[i], ref, &path_ids, &paths);
-                    try ref_files.append(arena, rfid);
-                    // An unresolvable `types=` directive is tsc's TS2688; the
-                    // linker reports it, since only this loop knows resolution
-                    // failed. `path=` misses are TS6053, not implemented.
-                    if (rfid == modules.no_file and ref.kind == .types) {
-                        try misses.append(arena, modules.typeRefMiss(ref));
-                    }
-                }
-                type_ref_misses_all.items[i] = misses.items;
-            }
-            _ = resolve_scratch.reset(.retain_capacity);
-        }
-        var edges: std.ArrayList(modules.FileId) = .empty;
-        for (files.items) |fid| {
-            if (fid != modules.no_file) try edges.append(arena, fid);
-        }
-        for (ref_files.items) |fid| {
-            if (fid != modules.no_file) try edges.append(arena, fid);
-        }
-        edge_lists.items[i] = edges.items;
-        sortSpecPairs(atoms.items, files.items);
-        spec_atoms_all.items[i] = atoms.items;
-        spec_files_all.items[i] = files.items;
-
-        // Enqueue newly discovered files right away.
-        try growPerFile(arena, paths.items.len, &results, &trees, &binds, &errs, &path_atoms, &spec_atoms_all, &spec_files_all, &edge_lists, &type_ref_misses_all);
-        for (known_before..paths.items.len) |nf| {
-            try work.push(.{ .file = @intCast(nf), .path = paths.items[nf] });
-            outstanding += 1;
-        }
-        resolve_ns += resolve_timer.readNs();
-    }
-    work.close();
-    for (workers) |*w| w.thread.join();
-    const discover_ns = discover_timer.readNs();
+    // The lib shards' arenas hold AST and binder output the checkers read, so
+    // they are released only at the very end of the run.
+    defer dr.lib_fe.deinit();
+    const prog = dr.prog;
+    const links = prog.links;
+    const paths = dr.files.paths;
+    const results = dr.files.results;
+    const trees = dr.files.trees;
+    const binds = dr.files.binds;
+    const errs = dr.files.errs;
+    const workers = dr.workers;
     const n_files = paths.items.len;
-
-    // --- Deterministic file order (graph-derived, not scheduling-derived) --
-    // Completion order depends on scheduling; output order must not. BFS
-    // from the entry files, tie-break = specifier order within each
-    // importing file (the exact order wavefront discovery produced), then
-    // permute every per-file table into that order. Everything downstream
-    // (link, checker partition, printing) sees only the renumbered ids, so
-    // output is byte-identical for any --workers/--checkers combination.
-    //
-    // TWO waves: the libs and the real roots with their whole import closure,
-    // and only then the auto-included `@types/*` ambient roots with theirs.
-    // That is `createProgram`'s order — root files first, automatic type
-    // reference directives after — and file order is the merge order a
-    // `declare global` augmentation of an existing global gets, so it decides
-    // which declaration group of `setTimeout` is last. See the seeding site.
-    {
-        const order = try arena.alloc(u32, n_files); // BFS position -> discovery id
-        const new_ids = try arena.alloc(u32, n_files); // discovery id -> BFS position
-        @memset(new_ids, modules.no_file);
-        var tail: usize = 0;
-        var head: usize = 0;
-        for ([2][2]usize{ .{ 0, n_root_entries }, .{ n_root_entries, n_entries } }) |wave| {
-            for (wave[0]..wave[1]) |i| {
-                if (new_ids[i] != modules.no_file) continue;
-                new_ids[i] = @intCast(tail);
-                order[tail] = @intCast(i);
-                tail += 1;
-            }
-            while (head < tail) : (head += 1) {
-                for (edge_lists.items[order[head]]) |fid| {
-                    if (new_ids[fid] != modules.no_file) continue;
-                    new_ids[fid] = @intCast(tail);
-                    order[tail] = fid;
-                    tail += 1;
-                }
-            }
-        }
-        // Every discovered file was discovered through a recorded edge,
-        // so the BFS reaches all of them.
-        std.debug.assert(tail == n_files);
-
-        try permuteInPlace([]const u8, arena, paths.items, order);
-        try permuteInPlace(?Source, arena, results.items, order);
-        try permuteInPlace(?*Ast, arena, trees.items, order);
-        try permuteInPlace(?*Bind, arena, binds.items, order);
-        try permuteInPlace(?anyerror, arena, errs.items, order);
-        try permuteInPlace(ztsc.intern.Atom, arena, path_atoms.items, order);
-        try permuteInPlace([]ztsc.intern.Atom, arena, spec_atoms_all.items, order);
-        try permuteInPlace([]modules.FileId, arena, spec_files_all.items, order);
-        try permuteInPlace([]const modules.TypeRefMiss, arena, type_ref_misses_all.items, order);
-        if (jsx_runtime_fid) |f| jsx_runtime_fid = new_ids[f];
-        // Remap the resolved FileIds inside the spec maps.
-        for (spec_files_all.items) |spec_files| {
-            for (spec_files) |*fid| {
-                if (fid.* != modules.no_file) fid.* = new_ids[fid.*];
-            }
-        }
-    }
-
-    // --- Deterministic atom ids (file order, not scheduling order) --------
-    // An `Atom` encodes its shard-local insertion index, and the front end
-    // interns from every worker at once, so the ids a run hands out depend on
-    // which worker got there first. Atoms are sort keys downstream — a scope's
-    // member table, a merged namespace's member index, an object type's
-    // property records — so that scheduling noise reached the checker as a
-    // different *traversal order*, and (through the assignability memo's
-    // in-progress marks) a different set of walked subtrees. Diagnostics never
-    // moved, but the work counters did, and a program sitting on the
-    // instantiation budget could have tipped either way.
-    //
-    // The fix is to assign the ids a single-threaded front end would have.
-    // Each file recorded the atoms it touched in first-touch order
-    // (`Bind.first_touch`, preceded by its own path); replaying those lists in
-    // the program's graph-derived file order is exactly the sequence a serial
-    // run interns in, so `Interner.renumber` can hand out the serial ids and
-    // every table sorted by atom lands where the serial run put it. Serial
-    // runs get an identity permutation and skip the rewrite entirely.
-    {
-        const renumber_timer = Timer.start(io);
-        var order: std.ArrayList(ztsc.intern.Atom) = .empty;
-        defer order.deinit(gpa);
-        // The lib shards are bound before the pool starts; their atoms are in
-        // the frozen prefix and never move.
-        for (lib_units.len..n_files) |i| {
-            if (path_atoms.items[i] != 0) try order.append(gpa, path_atoms.items[i]);
-            if (binds.items[i]) |b| try order.appendSlice(gpa, b.first_touch);
-        }
-        const rn = try interner.renumber(gpa, gpa, order.items);
-        defer gpa.free(rn.map);
-        if (rn.uncovered != 0) {
-            // An interning site the replay does not know about: the id space is
-            // scheduling-dependent again. Loud, because nothing downstream can
-            // detect it.
-            std.debug.print(
-                "ztsc: internal: {d} atom(s) outside the recorded interning order\n",
-                .{rn.uncovered},
-            );
-        }
-        if (!rn.identity) {
-            for (binds.items[lib_units.len..]) |maybe_bind| {
-                if (maybe_bind) |b| try b.remapAtoms(gpa, rn.map);
-            }
-            for (spec_atoms_all.items, spec_files_all.items) |spec_atoms, spec_files| {
-                for (spec_atoms) |*a| a.* = rn.map[a.*];
-                sortSpecPairs(spec_atoms, spec_files);
-            }
-        }
-        renumber_ns = renumber_timer.readNs();
-    }
-
-    // --- Link (serial): program assembly + import/export tables ----------
-    const link_timer = Timer.start(io);
-    const prog_files = try arena.alloc(modules.ProgFile, n_files);
-    var empty_tree: ?*Ast = null;
-    var empty_bind: ?*Bind = null;
-    for (0..n_files) |i| {
-        // Substitute an empty file for load/parse failures so ids stay
-        // dense (the error is reported below).
-        var tree = trees.items[i];
-        var bnd = binds.items[i];
-        const src_bytes: []const u8 = if (results.items[i]) |s| s.bytes else "";
-        if (tree == null or bnd == null) {
-            if (empty_tree == null) {
-                empty_tree = try arena.create(Ast);
-                empty_tree.?.* = try parser.parse(arena, "");
-                empty_bind = try arena.create(Bind);
-                empty_bind.?.* = try binder.bind(arena, io, gpa, &interner, empty_tree.?, "", false);
-            }
-            tree = empty_tree;
-            bnd = empty_bind;
-        }
-        prog_files[i] = .{
-            .path = paths.items[i],
-            .src = if (trees.items[i] == null) "" else src_bytes,
-            .tree = tree.?,
-            .bind = bnd.?,
-            .specs = .{ .atoms = spec_atoms_all.items[i], .files = spec_files_all.items[i] },
-            .type_ref_misses = type_ref_misses_all.items[i],
-        };
-    }
-    const lr = try modules.link(arena, gpa, io, &interner, prog_files, .{
-        .allow_synthetic_default = config_allow_synthetic_default,
-        .no_implicit_any = config_no_implicit_any,
-        .no_unchecked_side_effect_imports = config_no_unchecked_side_effect_imports,
-        .types_wildcard = config_types_wildcard,
-    });
-    const links = lr.links;
-    const prog = try arena.create(modules.Program);
-    prog.* = .{
-        .files = prog_files,
-        .sym_base = lr.sym_base,
-        .links = links,
-        .globals = lr.globals,
-        .merged = lr.merged,
-        .ambient_exports = lr.ambient_exports,
-        .ambient_specs = lr.ambient_specs,
-        .constit_keys = lr.constit_keys,
-        .constit_vals = lr.constit_vals,
-        .export_equals_atom = lr.export_equals_atom,
-        .dual_targets = lr.dual_targets,
-        .no_implicit_any = config_no_implicit_any,
-        .allow_synthetic_default = config_allow_synthetic_default,
-        .types_wildcard = config_types_wildcard,
-        .experimental_decorators = config_experimental_decorators,
-        .jsx_runtime_file = jsx_runtime_fid orelse modules.no_file,
-    };
-    const link_ns = link_timer.readNs();
+    const n_entries = dr.n_entries;
 
     // --- Check (N independent checker instances) --------------------------------
     const check_timer = Timer.start(io);
@@ -1601,16 +905,17 @@ pub fn main(init: std.process.Init) !void {
     if (cli.timing) {
         const checker_times = try arena.alloc(ztsc.report.CheckerTime, tasks.len);
         for (tasks, checker_times) |*t, *ct| ct.* = .{ .ns = t.ns, .files = t.owned.len };
+        const rcache = dr.rcache;
         const fs_counts = rcache.fs.entryCounts();
         try ztsc.report.printTiming(out, .{
             .config_ns = config_ns,
-            .load_ns = load_ns,
-            .parse_ns = parse_ns,
-            .bind_ns = bind_ns,
-            .resolve_ns = resolve_ns,
-            .discover_ns = discover_ns,
-            .renumber_ns = renumber_ns,
-            .link_ns = link_ns,
+            .load_ns = dr.timings.load_ns,
+            .parse_ns = dr.timings.parse_ns,
+            .bind_ns = dr.timings.bind_ns,
+            .resolve_ns = dr.timings.resolve_ns,
+            .discover_ns = dr.timings.discover_ns,
+            .renumber_ns = dr.timings.renumber_ns,
+            .link_ns = dr.timings.link_ns,
             .check_ns = check_ns,
             .total_ns = total_ns,
         }, .{
@@ -1707,156 +1012,6 @@ pub fn main(init: std.process.Init) !void {
     // diagnostics were reported, 0 for a clean check.
     if (failed > 0) std.process.exit(2);
     if (parse_diags > 0 or bind_diags > 0 or link_diags > 0 or check_diags > 0) std.process.exit(1);
-}
-
-/// Grow every per-file table to `n` slots (null/empty defaults). Only the
-/// main thread touches these tables; workers communicate exclusively
-/// through the channels.
-fn growPerFile(
-    arena: std.mem.Allocator,
-    n: usize,
-    results: *std.ArrayList(?Source),
-    trees: *std.ArrayList(?*Ast),
-    binds: *std.ArrayList(?*Bind),
-    errs: *std.ArrayList(?anyerror),
-    path_atoms: *std.ArrayList(ztsc.intern.Atom),
-    spec_atoms_all: *std.ArrayList([]ztsc.intern.Atom),
-    spec_files_all: *std.ArrayList([]modules.FileId),
-    edge_lists: *std.ArrayList([]const modules.FileId),
-    type_ref_misses_all: *std.ArrayList([]const modules.TypeRefMiss),
-) !void {
-    while (results.items.len < n) {
-        try results.append(arena, null);
-        try trees.append(arena, null);
-        try binds.append(arena, null);
-        try errs.append(arena, null);
-        try path_atoms.append(arena, 0);
-        try spec_atoms_all.append(arena, &.{});
-        try spec_files_all.append(arena, &.{});
-        try edge_lists.append(arena, &.{});
-        try type_ref_misses_all.append(arena, &.{});
-    }
-}
-
-/// Reorder `items` so that items[k] becomes the old items[order[k]].
-fn permuteInPlace(comptime T: type, arena: std.mem.Allocator, items: []T, order: []const u32) !void {
-    const copy = try arena.dupe(T, items);
-    for (order, 0..) |old, k| items[k] = copy[old];
-}
-
-/// Resolve one module specifier of `importer`; appends to the spec map and
-/// discovers new files into `paths`.
-fn resolveSpecInto(
-    arena: std.mem.Allocator,
-    scratch: std.mem.Allocator,
-    gpa: std.mem.Allocator,
-    io: Io,
-    interner: *Interner,
-    rcache: *resolve.ResolveCache,
-    paths_map: ?ztsc.tsconfig.Paths,
-    resolve_json: bool,
-    importer: []const u8,
-    module_atom: ztsc.intern.Atom,
-    seen: *std.AutoHashMapUnmanaged(ztsc.intern.Atom, void),
-    path_ids: *std.StringHashMapUnmanaged(u32),
-    paths: *std.ArrayList([]const u8),
-    atoms: *std.ArrayList(ztsc.intern.Atom),
-    files: *std.ArrayList(modules.FileId),
-) !void {
-    if (module_atom == 0) return;
-    const gop = try seen.getOrPut(gpa, module_atom);
-    if (gop.found_existing) return;
-    const spec = interner.lookup(io, module_atom);
-    var fid: modules.FileId = modules.no_file;
-    // All candidate paths and package.json bodies are transient — build
-    // them in `scratch` (reset per file by the caller). Only the resolved
-    // path is retained, duped into `arena` below.
-    //
-    // tsconfig `paths` mapping applies to bare specifiers first;
-    // unmatched or unresolved candidates fall through to normal
-    // resolution, like tsc.
-    var mapped: ?[]const u8 = null;
-    if (paths_map) |pm| {
-        if (spec.len > 0 and spec[0] != '.' and spec[0] != '/') {
-            // A `paths`-mapped `*.json` (`@fixtures/apis/x.json`) resolves to the
-            // JSON file directly — `resolveStem` only probes TS/declaration
-            // extensions and would miss it.
-            const is_json = resolve_json and std.mem.endsWith(u8, spec, ".json");
-            for (try pm.mapSpecifier(scratch, spec)) |cand| {
-                const r = if (is_json)
-                    try resolve.resolveJsonFile(io, scratch, Io.Dir.cwd(), cand)
-                else
-                    // Full "load as file or folder" — a substitution that names
-                    // a package directory is resolved through its
-                    // `package.json`, not just by stem probing
-                    // (`resolvePathsCandidate`), under the same `ResolveOpts`
-                    // every other probe of this run sees.
-                    try rcache.pathsCandidate(io, scratch, Io.Dir.cwd(), cand);
-                if (r) |rr| {
-                    mapped = rr;
-                    break;
-                }
-            }
-        }
-    }
-    // `paths`-mapped bare specifiers bypass the cache: their resolution is a
-    // different decision (a tsconfig remap), rare, and one `resolveStem` call.
-    // Everything else — the common case — goes through the memo.
-    if (mapped orelse try rcache.resolve(io, scratch, Io.Dir.cwd(), importer, spec)) |resolved| {
-        const pgop = try path_ids.getOrPut(arena, resolved);
-        if (pgop.found_existing) {
-            fid = pgop.value_ptr.*;
-        } else {
-            // Give the map a stable key and `paths` a stable slice: the
-            // scratch-owned `resolved` is about to be reset away.
-            const stable = try arena.dupe(u8, resolved);
-            pgop.key_ptr.* = stable;
-            fid = @intCast(paths.items.len);
-            pgop.value_ptr.* = fid;
-            try paths.append(arena, stable);
-        }
-    }
-    try atoms.append(arena, module_atom);
-    try files.append(arena, fid);
-}
-
-/// Discover a triple-slash reference target as a program input: resolve
-/// it and, if new, append it to `paths`/`path_ids` so the scheduler enqueues
-/// it. Unlike `resolveSpecInto`, it records no import-specifier binding.
-/// Resolution goes through `ResolveCache.resolveRef`, so the target is keyed by
-/// its canonical path — the same identity an `import` of that file would get.
-fn discoverReferenceInto(
-    arena: std.mem.Allocator,
-    scratch: std.mem.Allocator,
-    io: Io,
-    rcache: *resolve.ResolveCache,
-    importer: []const u8,
-    ref: resolve.RefDirective,
-    path_ids: *std.StringHashMapUnmanaged(u32),
-    paths: *std.ArrayList([]const u8),
-) !modules.FileId {
-    if (try rcache.resolveRef(io, scratch, Io.Dir.cwd(), importer, ref)) |resolved| {
-        const pgop = try path_ids.getOrPut(arena, resolved);
-        if (pgop.found_existing) return pgop.value_ptr.*;
-        const stable = try arena.dupe(u8, resolved);
-        pgop.key_ptr.* = stable;
-        const fid: modules.FileId = @intCast(paths.items.len);
-        pgop.value_ptr.* = fid;
-        try paths.append(arena, stable);
-        return fid;
-    }
-    return modules.no_file;
-}
-
-fn sortSpecPairs(atoms: []ztsc.intern.Atom, files: []modules.FileId) void {
-    var i: usize = 1;
-    while (i < atoms.len) : (i += 1) {
-        var j = i;
-        while (j > 0 and atoms[j - 1] > atoms[j]) : (j -= 1) {
-            std.mem.swap(ztsc.intern.Atom, &atoms[j - 1], &atoms[j]);
-            std.mem.swap(modules.FileId, &files[j - 1], &files[j]);
-        }
-    }
 }
 
 /// Parse argv. On error, `bad_arg` names the offending argument.
