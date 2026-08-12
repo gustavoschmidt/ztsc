@@ -8,7 +8,8 @@
 const std = @import("std");
 const source = @import("source.zig");
 
-pub const Span = source.Span;
+/// In-file alias only; consumers name `source.Span` / `span.Span`.
+const Span = source.Span;
 
 pub const Code = enum(u16) {
     // --- scanner-surfaced errors -----------------------------------------

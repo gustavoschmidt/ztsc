@@ -45,6 +45,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const intern = @import("intern.zig");
+const ast = @import("frontend/ast.zig");
 
 pub const Atom = intern.Atom;
 pub const Error = error{OutOfMemory};
@@ -244,12 +245,14 @@ pub const string_mapping_uncapitalize: u32 = 3;
 
 // Mapped-type modifier flags, stored in a mapped type's `data_b` (and
 // repeated as its final extra word so they participate in hash-cons identity).
-// Set by the parser (`+`/`-`/bare) and interpreted by the checker.
-pub const mapped_flag_readonly_add: u32 = 1; // `+readonly` / `readonly`
-pub const mapped_flag_readonly_remove: u32 = 2; // `-readonly`
-pub const mapped_flag_optional_add: u32 = 4; // `+?` / `?`
-pub const mapped_flag_optional_remove: u32 = 8; // `-?`
-pub const mapped_flag_homomorphic: u32 = 16; // constraint was `keyof T`
+// Set by the parser (`+`/`-`/bare) and interpreted by the checker. They are
+// DECLARED in ast.zig, next to the `MappedTypeData.flags` field the parser
+// writes them into; re-exported here for the checker.
+pub const mapped_flag_readonly_add = ast.mapped_flag_readonly_add;
+pub const mapped_flag_readonly_remove = ast.mapped_flag_readonly_remove;
+pub const mapped_flag_optional_add = ast.mapped_flag_optional_add;
+pub const mapped_flag_optional_remove = ast.mapped_flag_optional_remove;
+pub const mapped_flag_homomorphic = ast.mapped_flag_homomorphic;
 
 pub const obj_flag_fresh: u32 = 1;
 /// The object is an interface or class-instance shape: it does NOT carry an

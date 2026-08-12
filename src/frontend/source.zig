@@ -18,21 +18,10 @@ const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
-/// A half-open byte range [start, end) into a source file.
-pub const Span = struct {
-    start: u32,
-    end: u32,
-
-    pub fn len(s: Span) u32 {
-        return s.end - s.start;
-    }
-};
-
-/// Zero-based line/column position.
-pub const LineCol = struct {
-    line: u32,
-    col: u32,
-};
+// Position types live in span.zig (no file-loading dependency); re-exported
+// here so every existing `source.Span` / `source.LineCol` keeps working.
+pub const Span = @import("span.zig").Span;
+pub const LineCol = @import("span.zig").LineCol;
 
 /// How the source bytes are owned.
 pub const Backing = union(enum) {
@@ -69,11 +58,11 @@ pub const Pack = struct {
     reserved_bytes: usize = 0,
 
     /// Files this size or larger keep a private mapping instead.
-    pub const mmap_threshold: usize = 128 << 10;
+    const mmap_threshold: usize = 128 << 10;
     /// Size of one segment, header included. A page multiple, so a segment
     /// pays no rounding of its own. The tail abandoned when a file does not
     /// fit is at most one file's worth (< `mmap_threshold`, ~5 KB typical).
-    pub const segment_size: usize = 1 << 20;
+    const segment_size: usize = 1 << 20;
 
     const Segment = struct {
         next: ?*Segment,
@@ -228,8 +217,10 @@ pub const Source = struct {
     }
 };
 
-/// Greatest index i such that line_starts[i] <= offset.
-fn lineOfOffset(line_starts: []const u32, offset: u32) u32 {
+/// Greatest index i such that line_starts[i] <= offset. Public because
+/// diagnostic rendering walks a line table it holds directly, without a
+/// `Source` around it.
+pub fn lineOfOffset(line_starts: []const u32, offset: u32) u32 {
     std.debug.assert(line_starts.len > 0);
     var lo: usize = 0;
     var hi: usize = line_starts.len; // exclusive

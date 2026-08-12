@@ -39,7 +39,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-pub const Error = error{OutOfMemory};
+/// In-file alias for the scan error set.
+const Error = error{OutOfMemory};
 
 /// A half-open byte range of a source line whose semantic diagnostics are
 /// suppressed. Ranges are disjoint and sorted ascending.
@@ -59,7 +60,9 @@ pub const File = struct {
     pub const none: File = .{};
 
     /// True if this file carries any directive at all (fast path guard).
-    pub fn any(f: File) bool {
+    /// Only the directive tests ask; real fast paths test `nocheck` and
+    /// `ignored.len` where they already hold the fields.
+    fn any(f: File) bool {
         return f.nocheck or f.ignored.len > 0;
     }
 

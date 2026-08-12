@@ -23,12 +23,12 @@
 //!   low-level `Scanner` scans `/` as `slash`/`slash_eq` and exposes
 //!   `reScanSlashAsRegex` (tsc: `reScanSlashToken`). Similarly a `}` closing a
 //!   template substitution is rescanned via `reScanTemplateToken`
-//!   (tsc: `reScanTemplateToken`). The whole-file driver `tokenize` applies
-//!   template brace-depth tracking (exact) and a previous-token heuristic for
-//!   regex-vs-division (the classic lexer approximation: division after
-//!   identifier-like tokens, literals, `)`, `]`, `++`, `--`; regex otherwise).
-//!   The heuristic mislabels rare forms like `if (x) /re/.test(y)`; the
-//!   parser will use the rescan API with real grammar context instead.
+//!   (tsc: `reScanTemplateToken`). There is deliberately NO whole-file driver
+//!   here: the parser pulls tokens itself and calls the rescan entry points
+//!   with real grammar context, since any standalone previous-token heuristic
+//!   mislabels forms like `if (x) /re/.test(y)`. The scanner's own tests drive
+//!   `Scanner.next()` in a loop with such a heuristic (`tokenizeForTest`), and
+//!   that loop is the only place it exists.
 //! - **Maximal munch for `>` sequences**: `>>`, `>>>`, `>>=`, `>>>=`, `>=` are
 //!   single tokens (unlike tsc, which scans lone `>` and rescans on demand).
 //!   The parser splits `>>` when closing nested generics — trivial with
@@ -56,70 +56,33 @@ const Allocator = std.mem.Allocator;
 /// preceded-by-newline flag.
 pub const max_source_len: usize = (1 << 31) - 1;
 
-/// Tokenize a whole source file into a SoA token stream (ends with `.eof`).
-///
-/// Applies exact template brace-depth tracking (so `}` tokens that close a
-/// `${...}` substitution are rescanned into template middle/tail parts) and
-/// the previous-token heuristic for regex-vs-division described in the module
-/// docs. Never fails on malformed input — only on OOM / oversized source.
-pub fn tokenize(alloc: Allocator, src: []const u8) error{ OutOfMemory, SourceTooLarge }!Tokens {
-    if (src.len > max_source_len) return error.SourceTooLarge;
+/// Scan a JSX name starting at `at` (must be an identifier-start byte): an
+/// identifier run that also spans `-` (`data-foo`, `aria-label`, custom
+/// elements `my-widget`). Returns the byte offset just past the name.
+/// Used only by the parser's `rescanJsxName` — plain scanning still lexes
+/// `-` as subtraction, so non-JSX code is untouched.
+pub fn scanJsxName(src: []const u8, at_index: u32) u32 {
+    var i = at_index;
+    while (i < src.len and (isIdentCont(src[i]) or src[i] == '-')) : (i += 1) {}
+    return i;
+}
 
-    var tags: std.ArrayList(Tag) = .empty;
-    errdefer tags.deinit(alloc);
-    var starts: std.ArrayList(u32) = .empty;
-    errdefer starts.deinit(alloc);
-    // ~4.5 source bytes per token empirically; reserve conservatively.
-    try tags.ensureTotalCapacityPrecise(alloc, src.len / 4 + 4);
-    try starts.ensureTotalCapacityPrecise(alloc, src.len / 4 + 4);
-
-    // One entry per open template substitution: the count of unmatched `{`
-    // inside it. A `}` at count 0 closes the substitution itself.
-    var template_stack: std.ArrayList(u32) = .empty;
-    defer template_stack.deinit(alloc);
-
-    var s = Scanner.init(src);
-    var prev_tag: Tag = .eof; // regex allowed at stream start
-    while (true) {
-        var tok = s.next();
-        switch (tok.tag) {
-            .slash, .slash_eq => {
-                if (!prev_tag.endsExpression()) tok = s.reScanSlashAsRegex(tok);
-            },
-            .l_brace => {
-                if (template_stack.items.len > 0) {
-                    template_stack.items[template_stack.items.len - 1] += 1;
-                }
-            },
-            .r_brace => {
-                if (template_stack.items.len > 0) {
-                    const depth = &template_stack.items[template_stack.items.len - 1];
-                    if (depth.* == 0) {
-                        tok = s.reScanTemplateToken(tok);
-                        switch (tok.tag) {
-                            .template_middle => {}, // substitution list continues
-                            .template_tail, .unterminated_template => _ = template_stack.pop(),
-                            else => unreachable,
-                        }
-                    } else {
-                        depth.* -= 1;
-                    }
-                }
-            },
-            .template_head => try template_stack.append(alloc, 0),
-            else => {},
-        }
-
-        try tags.append(alloc, tok.tag);
-        try starts.append(alloc, tok.start | @as(u32, if (tok.newline_before) Tokens.newline_flag else 0));
-        if (tok.tag == .eof) break;
-        prev_tag = tok.tag;
+/// Scan a JSX attribute's quoted value starting at the quote at `at`,
+/// returning the offset just past the closing quote (or end of file if
+/// there is none). A JSX attribute string runs to the matching quote and
+/// nothing else: raw line breaks are content, and `\` is a literal byte,
+/// not an escape (tsc: `scanString(/*jsxAttributeString*/ true)`).
+/// Null when there is no closing quote before end of file — the caller
+/// leaves the token alone so the ordinary unterminated-string diagnostic
+/// still fires. Used only by the parser's `rescanJsxAttributeString`.
+pub fn scanJsxString(src: []const u8, at_index: u32) ?u32 {
+    if (at_index >= src.len) return null;
+    const quote = src[at_index];
+    var i = at_index + 1;
+    while (i < src.len) : (i += 1) {
+        if (src[i] == quote) return i + 1;
     }
-
-    return .{
-        .tags = try tags.toOwnedSlice(alloc),
-        .starts = try starts.toOwnedSlice(alloc),
-    };
+    return null;
 }
 
 /// Recompute a token's end offset by rescanning it from its start.
@@ -166,16 +129,10 @@ pub fn tokenEnd(src: []const u8, tag: Tag, start: u32) u32 {
             var s = Scanner{ .src = src, .index = start };
             return s.scanJsxChild(start).end;
         },
-        .jsx_name => {
-            const s = Scanner{ .src = src, .index = start };
-            return s.scanJsxName(start);
-        },
-        .jsx_string => {
-            const s = Scanner{ .src = src, .index = start };
-            // Only ever produced for a terminated string (see the parser's
-            // `rescanJsxAttributeString`); the fallback keeps this total.
-            return s.scanJsxString(start) orelse @as(u32, @intCast(src.len));
-        },
+        .jsx_name => return scanJsxName(src, start),
+        // Only ever produced for a terminated string (see the parser's
+        // `rescanJsxAttributeString`); the fallback keeps this total.
+        .jsx_string => return scanJsxString(src, start) orelse @as(u32, @intCast(src.len)),
         else => {
             var s = Scanner{ .src = src, .index = start };
             return s.next().end;
@@ -205,7 +162,9 @@ pub const Tokens = struct {
         return t.starts[i] & start_mask;
     }
 
-    pub fn precededByNewline(t: *const Tokens, i: usize) bool {
+    /// Only the scanner's own ASI test reads this; the parser keeps the flag
+    /// in its own token store and unpacks it there.
+    fn precededByNewline(t: *const Tokens, i: usize) bool {
         return t.starts[i] & newline_flag != 0;
     }
 
@@ -219,7 +178,9 @@ pub const Tokens = struct {
         return t.tags.len * @sizeOf(Tag) + t.starts.len * @sizeOf(u32);
     }
 
-    pub fn deinit(t: *Tokens, alloc: Allocator) void {
+    /// The parser owns its token arrays in its own arena; only the scanner's
+    /// tests allocate a `Tokens` that has to be freed.
+    fn deinit(t: *Tokens, alloc: Allocator) void {
         alloc.free(t.tags);
         alloc.free(t.starts);
         t.* = undefined;
@@ -422,8 +383,9 @@ pub const Tag = enum(u8) {
             @intFromEnum(tag) <= @intFromEnum(Tag.keyword_using);
     }
 
-    /// Reserved words that can never be identifiers.
-    pub fn isReservedKeyword(tag: Tag) bool {
+    /// Reserved words that can never be identifiers. (Classification kept for
+    /// symmetry with the other three predicates; only the tests read it.)
+    fn isReservedKeyword(tag: Tag) bool {
         return @intFromEnum(tag) >= @intFromEnum(Tag.keyword_break) and
             @intFromEnum(tag) <= @intFromEnum(Tag.keyword_with);
     }
@@ -440,32 +402,6 @@ pub const Tag = enum(u8) {
     pub fn isContextualKeyword(tag: Tag) bool {
         return @intFromEnum(tag) >= @intFromEnum(Tag.keyword_abstract) and
             @intFromEnum(tag) <= @intFromEnum(Tag.keyword_using);
-    }
-
-    /// True for tags that behave like an expression end for the tokenize()
-    /// regex-vs-division heuristic (division preferred after these).
-    fn endsExpression(tag: Tag) bool {
-        return switch (tag) {
-            .identifier,
-            .private_identifier,
-            .numeric_literal,
-            .bigint_literal,
-            .string_literal,
-            .regexp_literal,
-            .no_substitution_template_literal,
-            .template_tail,
-            .r_paren,
-            .r_bracket,
-            .plus_plus,
-            .minus_minus,
-            .keyword_this,
-            .keyword_true,
-            .keyword_false,
-            .keyword_null,
-            .keyword_super,
-            => true,
-            else => tag.isContextualKeyword(),
-        };
     }
 };
 
@@ -598,35 +534,6 @@ pub const Scanner = struct {
             s.index += 1;
         }
         return .{ .tag = .jsx_text, .start = start, .end = s.index, .newline_before = false };
-    }
-
-    /// Scan a JSX name starting at `at` (must be an identifier-start byte): an
-    /// identifier run that also spans `-` (`data-foo`, `aria-label`, custom
-    /// elements `my-widget`). Returns the byte offset just past the name.
-    /// Used only by the parser's `rescanJsxName` — plain scanning still lexes
-    /// `-` as subtraction, so non-JSX code is untouched.
-    pub fn scanJsxName(s: *const Scanner, at_index: u32) u32 {
-        var i = at_index;
-        while (i < s.src.len and (isIdentCont(s.src[i]) or s.src[i] == '-')) : (i += 1) {}
-        return i;
-    }
-
-    /// Scan a JSX attribute's quoted value starting at the quote at `at`,
-    /// returning the offset just past the closing quote (or end of file if
-    /// there is none). A JSX attribute string runs to the matching quote and
-    /// nothing else: raw line breaks are content, and `\` is a literal byte,
-    /// not an escape (tsc: `scanString(/*jsxAttributeString*/ true)`).
-    /// Null when there is no closing quote before end of file — the caller
-    /// leaves the token alone so the ordinary unterminated-string diagnostic
-    /// still fires. Used only by the parser's `rescanJsxAttributeString`.
-    pub fn scanJsxString(s: *const Scanner, at_index: u32) ?u32 {
-        if (at_index >= s.src.len) return null;
-        const quote = s.src[at_index];
-        var i = at_index + 1;
-        while (i < s.src.len) : (i += 1) {
-            if (s.src[i] == quote) return i + 1;
-        }
-        return null;
     }
 
     inline fn punctEnd(s: *Scanner, len: u32) u32 {
@@ -1113,10 +1020,99 @@ inline fn isIdentCont(c: u8) bool {
 
 const testing = std.testing;
 
+/// Test-only whole-file driver: pull `Scanner.next()` in a loop into a
+/// `Tokens` store, tracking template brace depth exactly and picking
+/// regex-vs-division with the classic previous-token heuristic (division after
+/// identifier-like tokens, literals, `)`, `]`, `++`, `--`; regex otherwise).
+/// The parser does none of this — it asks for the rescans with real grammar
+/// context — so the heuristic lives here, with the tests that need a stream.
+fn tokenizeForTest(alloc: Allocator, src: []const u8) error{ OutOfMemory, SourceTooLarge }!Tokens {
+    if (src.len > max_source_len) return error.SourceTooLarge;
+
+    var tags: std.ArrayList(Tag) = .empty;
+    errdefer tags.deinit(alloc);
+    var starts: std.ArrayList(u32) = .empty;
+    errdefer starts.deinit(alloc);
+
+    // One entry per open template substitution: the count of unmatched `{`
+    // inside it. A `}` at count 0 closes the substitution itself.
+    var template_stack: std.ArrayList(u32) = .empty;
+    defer template_stack.deinit(alloc);
+
+    var s = Scanner.init(src);
+    var prev_tag: Tag = .eof; // regex allowed at stream start
+    while (true) {
+        var tok = s.next();
+        switch (tok.tag) {
+            .slash, .slash_eq => {
+                if (!endsExpression(prev_tag)) tok = s.reScanSlashAsRegex(tok);
+            },
+            .l_brace => {
+                if (template_stack.items.len > 0) {
+                    template_stack.items[template_stack.items.len - 1] += 1;
+                }
+            },
+            .r_brace => {
+                if (template_stack.items.len > 0) {
+                    const depth = &template_stack.items[template_stack.items.len - 1];
+                    if (depth.* == 0) {
+                        tok = s.reScanTemplateToken(tok);
+                        switch (tok.tag) {
+                            .template_middle => {}, // substitution list continues
+                            .template_tail, .unterminated_template => _ = template_stack.pop(),
+                            else => unreachable,
+                        }
+                    } else {
+                        depth.* -= 1;
+                    }
+                }
+            },
+            .template_head => try template_stack.append(alloc, 0),
+            else => {},
+        }
+
+        try tags.append(alloc, tok.tag);
+        try starts.append(alloc, tok.start | @as(u32, if (tok.newline_before) Tokens.newline_flag else 0));
+        if (tok.tag == .eof) break;
+        prev_tag = tok.tag;
+    }
+
+    return .{
+        .tags = try tags.toOwnedSlice(alloc),
+        .starts = try starts.toOwnedSlice(alloc),
+    };
+}
+
+/// True for tags that behave like an expression end for `tokenizeForTest`'s
+/// regex-vs-division heuristic (division preferred after these).
+fn endsExpression(tag: Tag) bool {
+    return switch (tag) {
+        .identifier,
+        .private_identifier,
+        .numeric_literal,
+        .bigint_literal,
+        .string_literal,
+        .regexp_literal,
+        .no_substitution_template_literal,
+        .template_tail,
+        .r_paren,
+        .r_bracket,
+        .plus_plus,
+        .minus_minus,
+        .keyword_this,
+        .keyword_true,
+        .keyword_false,
+        .keyword_null,
+        .keyword_super,
+        => true,
+        else => tag.isContextualKeyword(),
+    };
+}
+
 fn expectTokens(src: []const u8, expected: []const Tag) !void {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const toks = try tokenize(arena.allocator(), src);
+    const toks = try tokenizeForTest(arena.allocator(), src);
     try testing.expectEqualSlices(Tag, expected, toks.tags);
 }
 
@@ -1233,7 +1229,7 @@ test "golden: ASI newline flags" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const src = "a\nb c/*\n*/d //x\ne";
-    const toks = try tokenize(arena.allocator(), src);
+    const toks = try tokenizeForTest(arena.allocator(), src);
     try testing.expectEqualSlices(Tag, &.{
         .identifier, .identifier, .identifier, .identifier, .identifier, .eof,
     }, toks.tags);
@@ -1305,7 +1301,7 @@ test "errors: unterminated string" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const src = "\"abc";
-    const toks = try tokenize(arena.allocator(), src);
+    const toks = try tokenizeForTest(arena.allocator(), src);
     try testing.expectEqualSlices(Tag, &.{ .unterminated_string_literal, .eof }, toks.tags);
     try testing.expectEqual(@as(u32, 0), toks.start(0));
     try testing.expectEqual(@as(u32, 4), toks.end(src, 0));
@@ -1328,7 +1324,7 @@ test "errors: unterminated comment and regex" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const src = "x = 1; /* trailing";
-    const toks = try tokenize(arena.allocator(), src);
+    const toks = try tokenizeForTest(arena.allocator(), src);
     try testing.expectEqualSlices(Tag, &.{
         .identifier, .eq, .numeric_literal, .semicolon, .unterminated_comment, .eof,
     }, toks.tags);
@@ -1345,7 +1341,7 @@ test "token ends: recomputed ends are consistent with starts" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const src = "`a${ x / 2 }b${y}c`; foo(/re/g, 1_2n) // c\n'str' ??= .5";
-    const toks = try tokenize(arena.allocator(), src);
+    const toks = try tokenizeForTest(arena.allocator(), src);
     var i: usize = 0;
     while (i < toks.len()) : (i += 1) {
         const start = toks.start(i);
@@ -1365,20 +1361,20 @@ test "token ends: recomputed ends are consistent with starts" {
 test "tokens: SoA store is 5 bytes per token" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const toks = try tokenize(arena.allocator(), "let x = 1 + 2;");
+    const toks = try tokenizeForTest(arena.allocator(), "let x = 1 + 2;");
     try testing.expectEqual(@as(usize, 8), toks.len()); // incl. eof
     try testing.expectEqual(@as(usize, 8 * 5), toks.byteSize());
 }
 
-test "tokenize with non-arena allocator frees cleanly" {
-    var toks = try tokenize(testing.allocator, "let x = `a${b}c`;");
+test "token stream with a non-arena allocator frees cleanly" {
+    var toks = try tokenizeForTest(testing.allocator, "let x = `a${b}c`;");
     defer toks.deinit(testing.allocator);
     try testing.expectEqual(Tag.template_head, toks.tag(3));
 }
 
 /// Shared fuzz/stress oracle: scanning must terminate, always make progress,
 /// and produce a bounded number of tokens; rescan entry points must also make
-/// progress. Also runs the tokenize() driver end to end.
+/// progress. Also runs the test-only whole-file driver end to end.
 fn checkScannerOnArbitraryBytes(alloc: Allocator, input: []const u8) !void {
     var s = Scanner.init(input);
     var count: usize = 0;
@@ -1407,7 +1403,7 @@ fn checkScannerOnArbitraryBytes(alloc: Allocator, input: []const u8) !void {
             else => {},
         }
     }
-    var toks = try tokenize(alloc, input);
+    var toks = try tokenizeForTest(alloc, input);
     defer toks.deinit(alloc);
     try testing.expect(toks.len() >= 1);
     try testing.expectEqual(Tag.eof, toks.tag(toks.len() - 1));
