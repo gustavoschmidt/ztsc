@@ -7,6 +7,12 @@ node_modules/
 # see BENCHMARKS.md) — like bench/corpus, regenerated rather than vendored
 bench/apps/
 
+# Microsoft's TypeScript test corpus (Apache-2.0), fetched by
+# bench/fetch_ts_suite.sh for the ztsc-vs-tsgo divergence sweep, plus that
+# sweep's materialized cases and reports. Deliberately never vendored — see
+# the licensing note at the top of bench/fetch_ts_suite.sh.
+bench/ts-suite/
+
 # Claude Code local state — agent worktrees are full checkouts plus build cache
 .claude/
 
