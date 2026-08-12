@@ -2414,9 +2414,94 @@ pub fn inferTypeArgs(
     // params already substituted — `keyof T` becomes `keyof {…}` before the
     // satisfaction test, instead of staying a deferred `keyof T` that no
     // literal is assignable to.
-    var prov = try c.scratch().alloc(TpMap, tp_syms.len);
-    for (tp_syms, 0..) |tp, i| {
-        prov[i] = .{ .sym = tp, .ty = if (candidates[i] != types.no_type) candidates[i] else types.any_type };
+    //
+    // A parameter that instantiation FRESHENED (`FreshTp`, minted when the
+    // receiver's substitution moved its constraint or default) answers to a
+    // new symbol, but a SIBLING's constraint that names it was only rewritten
+    // when the sibling comes later in the list: the rewrite map is built as
+    // the loop walks the parameters, so a bound naming a parameter declared
+    // AFTER it still points at the original declaration symbol. Both symbols
+    // therefore have to resolve to the same value here, which the alias
+    // entries appended after the parameters' own do — `prov[n_tp..]` shadow
+    // nothing (an original whose fresh copy is in this very list is skipped)
+    // and are kept in step with their parameter by `setProv`.
+    //
+    // i18next's `t()` is the shape:
+    //
+    //     interface TFunction<N, TKPrefix, ActualNS = …> {
+    //       <TKeys extends TFuncKey<UsedNS, TKPrefix>, …,
+    //        UsedNS extends Namespace = … : ActualNS | DefaultNamespace>
+    //         (key: TKeys | TKeys[], options: PassedOpt): …
+    //     }
+    //
+    // `UsedNS`'s default names the INTERFACE parameter `ActualNS`, so reading
+    // `t` off an instantiated `TFunction` freshens `UsedNS` — while `TKeys`,
+    // whose own bound moves not at all, keeps its symbol and its bound keeps
+    // naming the ORIGINAL `UsedNS`. `TFuncKey<UsedNS, …>` then never reduced,
+    // no argument was assignable to the unreduced conditional, and every
+    // two-argument `t(key, {opts})` in outline was a TS2769.
+    // The alias is minted only where the reference is genuinely dangling: a
+    // bound at position `i` naming the original of a parameter freshened at
+    // position `j > i`. A bound naming an EARLIER sibling was rewritten to the
+    // fresh symbol when it was minted (the rewrite map grows as that loop
+    // walks), so aliasing there binds a symbol that is already bound — and
+    // doing it anyway perturbs unrelated overload sets: es-toolkit's
+    // `filter<T extends object, U extends T[keyof T]>` is a forward reference,
+    // and `filter(users.all, (u) => …)` lost its callback's contextual type
+    // (a TS7006 on `u`) when the alias did not distinguish the two directions.
+    //
+    // Nothing here runs unless some parameter WAS freshened: the bounds are
+    // read up front to answer the gate, and reading them forces every
+    // deferred one (`FreshTp.pending_bound`) earlier than the resolution loop
+    // below would have. On a signature with no fresh parameter there is
+    // nothing to alias, so that cost — and that reordering — is skipped.
+    var cons: []TypeId = &.{};
+    var n_alias: usize = 0;
+    for (tp_syms) |tp| {
+        if (origTpSym(c, tp) == null) continue;
+        cons = try c.scratch().alloc(TypeId, tp_syms.len);
+        for (tp_syms, 0..) |t2, i| cons[i] = try c.typeParamConstraint(t2);
+        break;
+    }
+    for (tp_syms, 0..) |tp, j| {
+        const orig = origTpSym(c, tp) orelse continue;
+        if (tpIndex(tp_syms, orig) == null and try boundsName(c, cons[0..j], orig)) n_alias += 1;
+    }
+    var prov = try c.scratch().alloc(TpMap, tp_syms.len + n_alias);
+    // `alias_slot[i]` is the index in `prov` of the alias entry mirroring
+    // parameter `i`, or `prov.len` when it has none.
+    const alias_slot = try c.scratch().alloc(usize, tp_syms.len);
+    {
+        var next = tp_syms.len;
+        for (tp_syms, 0..) |tp, i| {
+            const seed_ty = if (candidates[i] != types.no_type) candidates[i] else types.any_type;
+            prov[i] = .{ .sym = tp, .ty = seed_ty };
+            alias_slot[i] = prov.len;
+            const orig = origTpSym(c, tp) orelse continue;
+            if (tpIndex(tp_syms, orig) != null) continue;
+            if (!try boundsName(c, cons[0..i], orig)) continue;
+            prov[next] = .{ .sym = orig, .ty = seed_ty };
+            alias_slot[i] = next;
+            next += 1;
+        }
+    }
+    // Only the bound that actually names a dangling original is read under
+    // the aliased map; every other bound keeps the exact map it saw before,
+    // so the repair cannot reach a signature it has no business in.
+    const aliased = try c.scratch().alloc(bool, tp_syms.len);
+    @memset(aliased, false);
+    if (n_alias != 0) {
+        for (cons, 0..) |con, i| {
+            if (con == types.no_type) continue;
+            if (!try c.containsTypeParam(con)) continue;
+            const m = try c.tpMentions(con);
+            if (m.saturated) continue;
+            for (m.syms) |sym| {
+                for (prov[tp_syms.len..]) |al| {
+                    if (al.sym == sym) aliased[i] = true;
+                }
+            }
+        }
     }
     // `infos[i].constraint` is an AST node id in the type param's
     // *declaring* file (e.g. a foreign generic's `.d.ts`), not in `c.tree`
@@ -2438,8 +2523,10 @@ pub fn inferTypeArgs(
     // reaches per-signature inference here).
     const sig_ret: TypeId = if (c.ts.kind(sig) == .function) c.ts.fnReturn(sig) else types.no_type;
     for (tp_syms, 0..) |tp, i| {
-        var constraint: TypeId = try c.typeParamConstraint(tp);
-        if (constraint != types.no_type) constraint = try c.instantiate(constraint, prov);
+        var constraint: TypeId = if (cons.len != 0) cons[i] else try c.typeParamConstraint(tp);
+        if (constraint != types.no_type) {
+            constraint = try c.instantiate(constraint, if (aliased[i]) prov else prov[0..tp_syms.len]);
+        }
         if (candidates[i] != types.no_type) {
             out[i] = candidates[i];
             // tsc's `getCovariantInference` widens a fresh-literal inference
@@ -2545,12 +2632,41 @@ pub fn inferTypeArgs(
             // Uninferable param with a default takes it, instantiated under
             // the params resolved so far (`B = A` sees the inferred `A`).
             const def = try c.typeParamDefault(tp);
-            out[i] = try c.instantiate(def, prov);
+            out[i] = try c.instantiate(def, prov[0..tp_syms.len]);
         } else {
             out[i] = if (constraint != types.no_type) constraint else types.unknown_type;
         }
         prov[i].ty = out[i];
+        if (alias_slot[i] != prov.len) prov[alias_slot[i]].ty = out[i];
     }
+}
+
+/// Does any of these (raw, unsubstituted) type-parameter bounds mention `sym`?
+/// A bound that gave up on the question (`Mentions.saturated` — it nests a
+/// signature binding its own parameters) answers NO: the alias it would gate
+/// is a repair for a dangling reference we can actually see, and guessing at
+/// one only risks binding a parameter that is legitimately free.
+fn boundsName(c: *Checker, cons: []const TypeId, sym: u32) Error!bool {
+    for (cons) |con| {
+        if (con == types.no_type) continue;
+        if (!try c.containsTypeParam(con)) continue;
+        const m = try c.tpMentions(con);
+        if (m.saturated) continue;
+        for (m.syms) |s| {
+            if (s == sym) return true;
+        }
+    }
+    return false;
+}
+
+/// The DECLARATION symbol a signature type parameter stands for: itself, or —
+/// when instantiation freshened it (`FreshTp`) — the original it was minted
+/// from. Null when there is no distinct original.
+fn origTpSym(c: *Checker, tp: u32) ?u32 {
+    if (!c.isFreshTp(tp)) return null;
+    const orig = c.freshTp(tp).orig;
+    if (orig == 0 or orig == tp) return null;
+    return orig;
 }
 
 pub fn tpIndex(tp_syms: []const u32, sym: u32) ?usize {
