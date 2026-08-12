@@ -17,6 +17,30 @@ zig build bench           # ReleaseFast binary -> zig-out/bench/ztsc
 bench/e2e.sh multi        # end-to-end vs tsgo
 ```
 
+## Module design
+
+Keep modules small and single-purpose, and keep APIs functional:
+
+- **One responsibility per file.** When a file accumulates a second concern
+  (or a >1000-line cluster with its own vocabulary), split it out. Name files
+  after what they contain, not where the code used to live.
+- **Functional APIs**: explicit inputs → returned values. Return structs,
+  optionals, or tagged unions instead of `*bool`/out-parameter signalling.
+  Never smuggle a result through a context field when it can be returned.
+- **No hidden state.** Allocators, `Io`, and configuration are parameters,
+  never module-level `var`s or hardcoded `std.heap.page_allocator`. Mutable
+  state is acceptable only for memos/caches, cycle-detection stacks, arenas,
+  and accumulators — and each one carries a comment justifying it (ideally
+  with a measurement).
+- **Separate pure computation from stateful wrappers**: memo probe → pure
+  `computeX` function → memo store. Extract pure helpers so they can be
+  unit-tested without constructing the surrounding context object.
+- **`pub` means "has a consumer in another file."** De-pub anything only used
+  within its own file; delete anything with no consumer at all. Don't leave
+  dead imports behind.
+- **No duplicated logic across files** — two copies of a predicate or a
+  pipeline WILL drift; extract and share instead.
+
 ## Before every commit
 
 Run `zig fmt build.zig src test` — CI runs `zig fmt --check` on those paths
