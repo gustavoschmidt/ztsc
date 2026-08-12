@@ -1,6 +1,11 @@
-//! Signatures, symbol typing, and imported symbols.
-//! Split mechanically from checker.zig; functions take the
-//! `Checker` context as their first parameter.
+//! Signatures and symbol typing: what a declaration's parameters, return
+//! type, and symbol resolve to. Functions take the `Checker` context as
+//! their first parameter.
+//!
+//! Two concerns symbol typing drives were split out and are re-exported
+//! below so `Checker`'s method aliases keep resolving here:
+//! `destructure.zig` (what a binding pattern gives each name) and
+//! `modvalue.zig` (the value meaning of a module reference).
 
 const std = @import("std");
 const ast = @import("../frontend/ast.zig");
@@ -10,7 +15,6 @@ const binder = @import("../frontend/binder.zig");
 const types = @import("../types.zig");
 const source = @import("../frontend/source.zig");
 const libs = @import("../libs.zig");
-const modules = @import("../link/modules.zig");
 const ZeroPagedArray = @import("../zeropage.zig").ZeroPagedArray;
 
 const Node = ast.Node;
@@ -23,11 +27,9 @@ const TypeId = types.TypeId;
 const checker_zig = @import("../checker.zig");
 const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
-const FileId = checker_zig.FileId;
 const check = checker_zig.check;
 const DeferredBody = checker_zig.DeferredBody;
 
-const PathElem = @import("flow.zig").PathElem;
 const RefKey = @import("flow.zig").RefKey;
 const argumentsMatch = @import("calls.zig").argumentsMatch;
 const assignNarrows = @import("flow.zig").assignNarrows;
@@ -39,8 +41,8 @@ const checkFunctionBody = @import("stmts.zig").checkFunctionBody;
 const checkFunctionLikeExpr = @import("expr.zig").checkFunctionLikeExpr;
 const checkObjectLiteral = @import("expr.zig").checkObjectLiteral;
 const classStaticType = @import("enums.zig").classStaticType;
-const containsAtom = @import("expr.zig").containsAtom;
 const containsTypeParam = @import("enums.zig").containsTypeParam;
+const destructure = @import("destructure.zig");
 const drainDeferredBodies = @import("stmts.zig").drainDeferredBodies;
 const eraseTypeParams = @import("assign.zig").eraseTypeParams;
 const expandRef = @import("instantiate.zig").expandRef;
@@ -48,7 +50,7 @@ const finalizeInferredReturn = @import("names.zig").finalizeInferredReturn;
 const hasValueMeaning = @import("names.zig").hasValueMeaning;
 const identIsSym = @import("flow.zig").identIsSym;
 const interfaceGeneric = @import("instantiate.zig").interfaceGeneric;
-const max_deep_ref_depth = @import("flow.zig").max_deep_ref_depth;
+const modvalue = @import("modvalue.zig");
 const narrowByCondition = @import("flow.zig").narrowByCondition;
 const narrowByGuardCall = @import("flow.zig").narrowByGuardCall;
 const run = Checker.run;
@@ -492,53 +494,6 @@ pub fn predicateFromNode(c: *Checker, node: Node, params: []const types.Param) E
     return .{ .param = param, .ty = target, .asserts = asserts };
 }
 
-/// Mark optional every property of `t` that the object binding pattern
-/// `pat` destructures WITH A DEFAULT.
-///
-/// tsc arrives here from the other side: the initializer of a
-/// binding-pattern declaration is contextually typed by the pattern's
-/// implied type — in which a destructured-with-default name is optional —
-/// and `checkObjectLiteral`'s `contextualTypeHasPattern` branch copies that
-/// `Optional` flag onto each matching literal property. The part of that
-/// which the parameter's *type* depends on is exactly this flag transfer,
-/// so it is done directly. (The other half of tsc's branch, TS2353 for an
-/// initializer property the pattern does not name, is a separate
-/// diagnostic and is not synthesized here.)
-///
-/// Only a plain object type is rewritten: an initializer that is not an
-/// object literal (a union, a callable) keeps whatever it has.
-pub fn optionalizePatternDefaults(c: *Checker, t: TypeId, pat: Node) Error!TypeId {
-    if (pat == null_node or c.nodeTag(pat) != .object_pattern) return t;
-    if (c.ts.kind(t) != .object) return t;
-    if (c.ts.objectCallSigCount(t) != 0 or c.ts.objectConstructSigCount(t) != 0) return t;
-    const n = c.ts.objectPropCount(t);
-    if (n == 0) return t;
-    var props: std.ArrayList(types.Prop) = .empty;
-    defer props.deinit(c.scratch());
-    var changed = false;
-    for (0..n) |i| {
-        var p = c.ts.objectProp(t, @intCast(i));
-        if (p.flags & types.prop_flag_optional == 0 and try c.patternDefaultsProp(pat, p.name)) {
-            p.flags |= types.prop_flag_optional;
-            changed = true;
-        }
-        try props.append(c.scratch(), p);
-    }
-    if (!changed) return t;
-    return c.ts.makeObject(props.items, c.ts.objectStringIndex(t), c.ts.objectNumberIndex(t), c.ts.objectFlags(t));
-}
-
-/// Does the object binding pattern `pat` destructure `name` with a default?
-pub fn patternDefaultsProp(c: *Checker, pat: Node, name: Atom) Error!bool {
-    for (c.tree.nodeRange(pat)) |el| {
-        if (el == null_node or c.nodeTag(el) != .binding_property) continue;
-        const ed = c.tree.nodeData(el);
-        if (ed.rhs == 0) continue; // no default
-        if ((try c.memberAtom(c.tree.nodeMainToken(el))) == name) return true;
-    }
-    return false;
-}
-
 /// tsc's `parameterInitializerContainsUndefined`: can the parameter's
 /// default expression itself produce `undefined`? If it can, the parameter
 /// really is undefined-able inside the body and
@@ -776,19 +731,13 @@ pub fn inferReturnType(c: *Checker, fn_node: Node, body: Node, ret_ctx: TypeId) 
         if (ret_ctx != types.no_type) return c.widenToContext(raw, ret_ctx);
         return c.finalizeInferredReturn(try c.widenReturnMember(raw));
     }
-    var rets: std.ArrayList(Node) = .empty;
-    defer rets.deinit(c.scratch());
-    var ret_scopes: std.ArrayList(ScopeId) = .empty;
-    defer ret_scopes.deinit(c.scratch());
-    var bare_return = false;
     // Base scope for the body: a function/arrow body block binds its
     // statements directly in the function scope (no separate block scope),
     // so start from the function's own scope.
     const base_scope = (try c.scopeOf(fn_node)) orelse c.cur_scope;
-    for (c.tree.nodeRange(body)) |stmt| {
-        if (stmt != null_node) try c.collectReturns(stmt, &rets, &ret_scopes, &bare_return, base_scope);
-    }
-    if (rets.items.len == 0) {
+    var rets = try c.collectReturns(c.tree.nodeRange(body), base_scope);
+    defer rets.deinit(c.scratch());
+    if (rets.exprs.items.len == 0) {
         // A block body with no `return` at all whose endpoint is
         // UNREACHABLE never produces a value: tsc infers `never`, not
         // `void` (`getReturnTypeFromBody` → `functionHasImplicitReturn`).
@@ -828,11 +777,11 @@ pub fn inferReturnType(c: *Checker, fn_node: Node, body: Node, ret_ctx: TypeId) 
     // block's locals), not the ambient scope of this type probe.
     const saved_scope = c.cur_scope;
     defer c.cur_scope = saved_scope;
-    for (rets.items, ret_scopes.items) |r, sc| {
+    for (rets.exprs.items, rets.scopes.items) |r, sc| {
         c.cur_scope = sc;
         try parts.append(c.scratch(), try c.checkExprCached(r, ret_ctx));
     }
-    if (bare_return or !c.stmtListTerminal(c.tree.nodeRange(body))) {
+    if (rets.bare or !c.stmtListTerminal(c.tree.nodeRange(body))) {
         try parts.append(c.scratch(), types.undefined_type);
     }
     // The several `return` statements of one function are ONE widening
@@ -870,17 +819,10 @@ pub fn inferGeneratorReturn(c: *Checker, fn_node: Node, body: Node) Error!TypeId
     if (!c.symFlags(gen_sym).interface) return types.any_type;
     if (c.nodeTag(body) != .block) return types.any_type;
 
-    var yields: std.ArrayList(Node) = .empty;
-    defer yields.deinit(c.scratch());
-    var yield_scopes: std.ArrayList(ScopeId) = .empty;
-    defer yield_scopes.deinit(c.scratch());
-    var bare_yield = false;
-    var delegated = false;
     const base_scope = (try c.scopeOf(fn_node)) orelse c.cur_scope;
-    for (c.tree.nodeRange(body)) |stmt| {
-        if (stmt != null_node) try c.collectYields(stmt, &yields, &yield_scopes, &bare_yield, &delegated, base_scope);
-    }
-    if (delegated) return types.any_type;
+    var yields = try c.collectYields(c.tree.nodeRange(body), base_scope);
+    defer yields.deinit(c.scratch());
+    if (yields.delegated) return types.any_type;
 
     var yield_ty: TypeId = types.never_type;
     {
@@ -899,30 +841,71 @@ pub fn inferGeneratorReturn(c: *Checker, fn_node: Node, body: Node) Error!TypeId
         defer c.cur_scope = saved_scope;
         var parts: std.ArrayList(TypeId) = .empty;
         defer parts.deinit(c.scratch());
-        for (yields.items, yield_scopes.items) |y, sc| {
+        for (yields.exprs.items, yields.scopes.items) |y, sc| {
             c.cur_scope = sc;
             try parts.append(c.scratch(), try c.widenLiteral(try c.checkExprCached(y, types.no_type)));
         }
-        if (bare_yield) try parts.append(c.scratch(), types.undefined_type);
+        if (yields.bare) try parts.append(c.scratch(), types.undefined_type);
         yield_ty = try c.ts.makeUnion(c.scratch(), parts.items);
     }
     const ret_ty = try c.inferReturnType(fn_node, body, types.no_type);
     return c.ts.makeRef(gen_sym, &.{ yield_ty, ret_ty, types.unknown_type });
 }
 
-pub fn collectYields(c: *Checker, node: Node, out: *std.ArrayList(Node), out_scopes: *std.ArrayList(ScopeId), bare: *bool, delegated: *bool, scope: ScopeId) Error!void {
+/// The `yield` operands of one generator body: each yielded expression with
+/// the scope it resolves in, whether a BARE `yield` (which contributes
+/// `undefined`) occurred, and whether a `yield*` delegation did — the last
+/// abandons inference entirely, so it is a property of the whole body rather
+/// than of any one site.
+pub const YieldSites = struct {
+    exprs: std.ArrayList(Node) = .empty,
+    scopes: std.ArrayList(ScopeId) = .empty,
+    bare: bool = false,
+    delegated: bool = false,
+
+    pub fn deinit(self: *YieldSites, gpa: std.mem.Allocator) void {
+        self.exprs.deinit(gpa);
+        self.scopes.deinit(gpa);
+    }
+};
+
+/// The `return` sites of one function body: each returned expression with the
+/// scope it resolves in, plus whether a bare `return;` occurred.
+pub const ReturnSites = struct {
+    exprs: std.ArrayList(Node) = .empty,
+    scopes: std.ArrayList(ScopeId) = .empty,
+    bare: bool = false,
+
+    pub fn deinit(self: *ReturnSites, gpa: std.mem.Allocator) void {
+        self.exprs.deinit(gpa);
+        self.scopes.deinit(gpa);
+    }
+};
+
+/// Collect the `yield` sites of the body statements `stmts`, which bind in
+/// `scope`. The caller owns the result (`deinit` with `c.scratch()`).
+pub fn collectYields(c: *Checker, stmts: []const Node, scope: ScopeId) Error!YieldSites {
+    var sites: YieldSites = .{};
+    errdefer sites.deinit(c.scratch());
+    for (stmts) |stmt| {
+        if (stmt != null_node) try walkYields(c, stmt, &sites, scope);
+    }
+    return sites;
+}
+
+fn walkYields(c: *Checker, node: Node, sites: *YieldSites, scope: ScopeId) Error!void {
     if (node == null_node) return;
     switch (c.nodeTag(node)) {
         .yield_expr => {
             const d = c.tree.nodeData(node);
             if (d.rhs != 0) {
-                delegated.* = true;
+                sites.delegated = true;
                 return;
             }
             if (d.lhs != 0) {
-                try out.append(c.scratch(), d.lhs);
-                try out_scopes.append(c.scratch(), scope);
-            } else bare.* = true;
+                try sites.exprs.append(c.scratch(), d.lhs);
+                try sites.scopes.append(c.scratch(), scope);
+            } else sites.bare = true;
         },
         // Don't descend into nested functions/classes: their yields belong
         // to them (and only a generator may contain one at all).
@@ -931,18 +914,29 @@ pub fn collectYields(c: *Checker, node: Node, out: *std.ArrayList(Node), out_sco
     }
     const inner = (try c.scopeOf(node)) orelse scope;
     var it = c.tree.childIterator(node);
-    while (it.next()) |child| try c.collectYields(child, out, out_scopes, bare, delegated, inner);
+    while (it.next()) |child| try walkYields(c, child, sites, inner);
 }
 
-pub fn collectReturns(c: *Checker, node: Node, out: *std.ArrayList(Node), out_scopes: ?*std.ArrayList(ScopeId), bare: *bool, scope: ScopeId) Error!void {
+/// Collect the `return` sites of the body statements `stmts`, which bind in
+/// `scope`. The caller owns the result (`deinit` with `c.scratch()`).
+pub fn collectReturns(c: *Checker, stmts: []const Node, scope: ScopeId) Error!ReturnSites {
+    var sites: ReturnSites = .{};
+    errdefer sites.deinit(c.scratch());
+    for (stmts) |stmt| {
+        if (stmt != null_node) try walkReturns(c, stmt, &sites, scope);
+    }
+    return sites;
+}
+
+fn walkReturns(c: *Checker, node: Node, sites: *ReturnSites, scope: ScopeId) Error!void {
     if (node == null_node) return;
     switch (c.nodeTag(node)) {
         .return_stmt => {
             const d = c.tree.nodeData(node);
             if (d.lhs != 0) {
-                try out.append(c.scratch(), d.lhs);
-                if (out_scopes) |os| try os.append(c.scratch(), scope);
-            } else bare.* = true;
+                try sites.exprs.append(c.scratch(), d.lhs);
+                try sites.scopes.append(c.scratch(), scope);
+            } else sites.bare = true;
             return;
         },
         // Don't descend into nested functions/classes.
@@ -953,7 +947,7 @@ pub fn collectReturns(c: *Checker, node: Node, out: *std.ArrayList(Node), out_sc
     // that construct's scope; track it as we descend.
     const inner = (try c.scopeOf(node)) orelse scope;
     var it = c.tree.childIterator(node);
-    while (it.next()) |child| try c.collectReturns(child, out, out_scopes, bare, inner);
+    while (it.next()) |child| try walkReturns(c, child, sites, inner);
 }
 
 // =====================================================================
@@ -1501,216 +1495,18 @@ pub fn variableSymbolType(c: *Checker, sym: SymbolId) Error!TypeId {
     return types.any_type;
 }
 
-// =====================================================================
-// imported symbols
-// =====================================================================
+// The value meaning of a module reference lives in `modvalue.zig`;
+// re-exported here because symbol typing above drives it and `Checker`'s
+// method aliases — plus calls.zig's direct import of `ambientNamespaceType` —
+// name this file.
+pub const ambientNamespaceType = modvalue.ambientNamespaceType;
+pub const appendAugmentedModuleExports = modvalue.appendAugmentedModuleExports;
+pub const dualHasValue = modvalue.dualHasValue;
+pub const dualValueType = modvalue.dualValueType;
+pub const importedSymbolType = modvalue.importedSymbolType;
+pub const namespaceObjectType = modvalue.namespaceObjectType;
+pub const targetValueType = modvalue.targetValueType;
 
-/// Value type of an import binding, via the sealed link tables.
-pub fn importedSymbolType(c: *Checker, sym: SymbolId) Error!TypeId {
-    const tgt = c.importTarget(sym) orelse return types.any_type; // unlinked
-    return c.targetValueType(tgt);
-}
-
-/// The VALUE half of a `.dual` binding: property `name` of the export-assigned
-/// value's type, or null when that value's type has no such property (the
-/// binding then has only the meanings its `type_tgt` carries).
-pub fn dualValueType(c: *Checker, d: modules.DualTarget) Error!?TypeId {
-    const v = d.value_tgt;
-    const base = try c.typeOfSymbol(c.toGlobalIn(v.file, v.payload));
-    const p = (try c.propOfType(base, v.name)) orelse return null;
-    return p.ty;
-}
-
-/// True when a `.dual` binding really does have a value meaning through its
-/// export-assigned value's type. Lets a value-position reference decide
-/// between "both meanings" and "type meaning only" (TS2693).
-pub fn dualHasValue(c: *Checker, tgt: modules.Target) Error!bool {
-    if (tgt.kind != .dual) return false;
-    return (try c.dualValueType(c.prog.dual_targets[tgt.payload])) != null;
-}
-
-pub fn targetValueType(c: *Checker, tgt: modules.Target) Error!TypeId {
-    switch (tgt.kind) {
-        .any => return types.any_type,
-        .binding => return c.typeOfSymbol(c.toGlobalIn(tgt.file, tgt.payload)),
-        .namespace => return c.namespaceObjectType(tgt.file),
-        .ambient_ns => return c.ambientNamespaceType(tgt.payload),
-        // `import { X } from "m"` where `m` is `export = <value>` and `X`
-        // is a property of that value's TYPE. A missing property stays
-        // `any` (the link phase could not have known, and the lenient
-        // fallback it replaces was `any` too).
-        .export_equals_prop => {
-            const base = try c.typeOfSymbol(c.toGlobalIn(tgt.file, tgt.payload));
-            const p = (try c.propOfType(base, tgt.name)) orelse return types.any_type;
-            return p.ty;
-        },
-        // Both meanings available (tsc's `combineValueAndTypeSymbols`): the
-        // VALUE meaning is the property of the export-assigned value's type.
-        // The link phase could not check that the property exists, so a miss
-        // falls back to the member's own value meaning — which is what the
-        // binding resolved to before the dual existed.
-        .dual => {
-            const d = c.prog.dual_targets[tgt.payload];
-            if (try c.dualValueType(d)) |t| return t;
-            return c.targetValueType(d.type_tgt);
-        },
-        .default_expr => {
-            const saved = c.saveCtx();
-            defer c.restoreCtx(saved);
-            c.setFile(tgt.file);
-            c.cur_scope = binder.file_scope;
-            const inner = c.tree.nodeData(tgt.payload).lhs;
-            switch (c.nodeTag(inner)) {
-                .function_decl => return c.signatureOfProto(inner, c.tree.nodeData(inner).lhs, false, true),
-                // Unnamed `export default class`: documented cut.
-                .class_decl => return types.any_type,
-                else => return c.widenLiteral(try c.checkExprCached(inner, types.no_type)),
-            }
-        },
-    }
-}
-
-/// The module namespace object of `file` (`import * as ns`): one
-/// read-only property per value-space export. Type-space-only exports
-/// (interfaces, aliases, `export type`) are omitted — accessing them
-/// as values is a property error, close to tsc's behavior. Cycle-safe.
-pub fn namespaceObjectType(c: *Checker, file: FileId) Error!TypeId {
-    if (c.ns_types.get(file)) |t| {
-        if (t == types.no_type) return types.any_type; // ns cycle
-        return t;
-    }
-    try c.ns_types.put(c.cm(), file, types.no_type);
-    // `export = X` module (e.g. `@types/react` `export = React`): the value
-    // namespace object is the value type of the export-equals target, not an
-    // empty object built from the (absent) named exports. `typeof
-    // import("react").createContext` must reach React's members.
-    if (c.prog.links.len != 0) {
-        if (c.prog.links[file].exportTarget(c.prog.export_equals_atom)) |eq| {
-            if (!eq.type_only) {
-                const t = try c.targetValueType(eq);
-                try c.ns_types.put(c.cm(), file, t);
-                return t;
-            }
-        }
-    }
-    var props: std.ArrayList(types.Prop) = .empty;
-    defer props.deinit(c.scratch());
-    if (c.prog.links.len != 0) {
-        const l = &c.prog.links[file];
-        for (l.export_atoms, l.export_targets) |name, tgt| {
-            if (name == c.prog.export_equals_atom) continue; // reserved key
-            if (tgt.type_only) continue;
-            var ty: TypeId = types.any_type;
-            switch (tgt.kind) {
-                .binding => {
-                    const g0 = c.toGlobalIn(tgt.file, tgt.payload);
-                    // A cross-file `declare module` augmentation may have
-                    // merged this export (`namespace control` + a plugin's
-                    // `namespace control { sideBySide }`): use the merged
-                    // view so `L.control.sideBySide` resolves.
-                    const g = c.prog.mergedOf(g0) orelse g0;
-                    const f = c.symFlags(g);
-                    if (!hasValueMeaning(f)) continue;
-                    ty = try c.typeOfSymbol(g);
-                },
-                .namespace => ty = try c.namespaceObjectType(tgt.file),
-                .ambient_ns => ty = try c.ambientNamespaceType(tgt.payload),
-                .default_expr, .export_equals_prop => ty = try c.targetValueType(tgt),
-                // A re-exported dual contributes to the namespace object
-                // through its value half. Without one it falls back to the
-                // member, which — being a type-only interface in the shape
-                // that motivates duals — is then omitted like any other.
-                .dual => {
-                    const d = c.prog.dual_targets[tgt.payload];
-                    if (try c.dualValueType(d)) |vt| {
-                        ty = vt;
-                    } else if (c.targetTypeSym(d.type_tgt)) |g| {
-                        if (!hasValueMeaning(c.symFlags(g))) continue;
-                        ty = try c.typeOfSymbol(g);
-                    } else {
-                        ty = try c.targetValueType(d.type_tgt);
-                    }
-                },
-                .any => {},
-            }
-            try props.append(c.scratch(), .{ .name = name, .ty = ty, .flags = types.prop_flag_readonly });
-        }
-    }
-    // Cross-package `declare module "M" { const drawLocal … }` value
-    // augmentations add fresh exports to M's namespace object that have no
-    // constituent in M's own export table (so no merge formed). Fold them
-    // in: `import L from "leaflet"; L.drawLocal` (leaflet-draw augments
-    // leaflet). Members already present as a real export are skipped (those
-    // merge through the export-table path above).
-    try c.appendAugmentedModuleExports(file, &props);
-    const obj = try c.ts.makeObject(props.items, 0, 0, 0);
-    try c.ns_types.put(c.cm(), file, obj);
-    return obj;
-}
-
-/// Append value-space members contributed by cross-file `declare module`
-/// augmentation blocks whose specifier resolves to `file`, for names not
-/// already collected. Deterministic: files then block members in id order.
-pub fn appendAugmentedModuleExports(c: *Checker, file: FileId, props: *std.ArrayList(types.Prop)) Error!void {
-    for (c.prog.files, 0..) |*pf, fi| {
-        const b = pf.bind;
-        if (!b.is_module or b.ambient_modules.len == 0) continue;
-        const base = c.prog.sym_base[fi];
-        for (b.ambient_modules) |am| {
-            const mfile = pf.specs.get(am.spec) orelse continue;
-            if (mfile != file) continue;
-            const lo = b.scope_members_start[am.scope];
-            const hi = b.scope_members_start[am.scope + 1];
-            for (lo..hi) |i| {
-                const g = base + b.member_syms[i];
-                const f = c.symFlags(g);
-                if (!hasValueMeaning(f)) continue;
-                const name = b.member_atoms[i];
-                var dup = false;
-                for (props.items) |p| {
-                    if (p.name == name) {
-                        dup = true;
-                        break;
-                    }
-                }
-                if (dup) continue;
-                var flags: u32 = types.prop_flag_readonly;
-                if (!f.const_decl and !f.readonly_member) flags = 0;
-                try props.append(c.scratch(), .{
-                    .name = name,
-                    .ty = try c.typeOfSymbol(c.prog.mergedOf(g) orelse g),
-                    .flags = flags,
-                });
-            }
-        }
-    }
-}
-
-/// Namespace object of an ambient module (`import * as ns from "fs"`):
-///  one read-only property per value-space export. Cycle-safe via
-/// `ambient_ns_types`.
-pub fn ambientNamespaceType(c: *Checker, idx: u32) Error!TypeId {
-    if (c.ambient_ns_types.get(idx)) |t| {
-        if (t == types.no_type) return types.any_type; // cycle
-        return t;
-    }
-    try c.ambient_ns_types.put(c.cm(), idx, types.no_type);
-    var props: std.ArrayList(types.Prop) = .empty;
-    defer props.deinit(c.scratch());
-    const ae = c.prog.ambient_exports[idx];
-    for (ae.atoms, ae.targets) |name, tgt| {
-        if (name == c.prog.export_equals_atom) continue; // reserved key
-        if (tgt.type_only) continue;
-        const ty = try c.targetValueType(tgt);
-        try props.append(c.scratch(), .{ .name = name, .ty = ty, .flags = types.prop_flag_readonly });
-    }
-    const obj = try c.ts.makeObject(props.items, 0, 0, 0);
-    try c.ambient_ns_types.put(c.cm(), idx, obj);
-    return obj;
-}
-
-/// Type of one variable declarator for `sym` (no_type if this decl
-/// contributes none, e.g. bare `declarator` in a multi-decl symbol).
 /// Is `sym` an *evolving* variable — tsc's "auto" type? A `let`/`var` with
 /// no type annotation and either no initializer at all or one that is
 /// literally `null` or `undefined` gets a declared type that does not
@@ -1831,6 +1627,8 @@ pub fn inferredUniqueSymbol(c: *Checker, decl: Node, name: Node, init: Node, is_
     return try c.uniqueSymType(decl);
 }
 
+/// Type of one variable declarator for `sym` (no_type if this decl
+/// contributes none, e.g. bare `declarator` in a multi-decl symbol).
 pub fn declaratorType(c: *Checker, sym: SymbolId, decl: Node, is_const: bool) Error!TypeId {
     // The initializer is being typed to *build* this variable's type, so
     // any function body inside it must not be walked yet — the same rule
@@ -1919,277 +1717,19 @@ fn freshSymbolConstType(c: *Checker, decl: Node, name: Node, init: Node, is_cons
     return try c.uniqueSymType(decl);
 }
 
-/// Pin every symbol bound by a destructured parameter's pattern to the type
-/// the parameter (contextual or annotated) gives it. The counterpart of the
-/// named-parameter pin in `signatureOfProtoCtx`: without it those symbols
-/// have no pinned type and `computeTypeOfSymbol` re-derives them from the
-/// declaration alone, with no contextual signature to read.
-///
-/// Each binding's type comes from `bindingElementType`, the same walk
-/// `computeTypeOfSymbol` would use, so optional properties, defaults, and
-/// object/array rests behave identically — only the starting `whole` is
-/// better. `force` mirrors the named case: a contextual signature
-/// overwrites, because the same arrow is materialized once per overload
-/// candidate and the last materialization is the one the body is checked
-/// under.
-pub fn pinPatternParamSyms(c: *Checker, pn: Node, pat: Node, whole: TypeId, force: bool) Error!void {
-    if (pat == null_node) return;
-    const d = c.tree.nodeData(pat);
-    switch (c.nodeTag(pat)) {
-        .identifier => try c.pinBindingSym(pn, try c.atomOfToken(c.tree.nodeMainToken(pat)), whole, force),
-        .object_pattern => {
-            for (c.tree.nodeRange(pat)) |el| {
-                if (el == null_node) continue;
-                const ed = c.tree.nodeData(el);
-                switch (c.nodeTag(el)) {
-                    .binding_property => {
-                        if (ed.lhs != 0) {
-                            try c.pinPatternParamSyms(pn, ed.lhs, whole, force);
-                        } else {
-                            try c.pinBindingSym(pn, try c.memberAtom(c.tree.nodeMainToken(el)), whole, force);
-                        }
-                    },
-                    .rest_element => try c.pinPatternParamSyms(pn, ed.lhs, whole, force),
-                    else => {},
-                }
-            }
-        },
-        .array_pattern => {
-            for (c.tree.nodeRange(pat)) |el| {
-                if (el == null_node or c.nodeTag(el) == .omitted) continue;
-                try c.pinPatternParamSyms(pn, el, whole, force);
-            }
-        },
-        .binding_default, .rest_element => try c.pinPatternParamSyms(pn, d.lhs, whole, force),
-        else => {},
-    }
-}
-
-pub fn pinBindingSym(c: *Checker, pn: Node, name: Atom, whole: TypeId, force: bool) Error!void {
-    const psym = c.bind.lookupInScope(c.cur_scope, name) orelse return;
-    if (!c.bind.symbol_flags[psym].param) return;
-    const gsym = c.toGlobal(psym);
-    if (gsym == binder.no_symbol or gsym >= c.sym_types.items.len) return;
-    if (!force and c.sym_state.items[gsym] == .computed) return;
-    // Re-entrancy: `bindingElementType` checks the pattern's defaults, which
-    // can read this very symbol. Leave the slot alone while computing.
-    if (c.sym_state.items[gsym] == .in_progress) return;
-    const saved = c.sym_state.items[gsym];
-    c.sym_state.items[gsym] = .in_progress;
-    const t = c.bindingElementType(gsym, pn, whole) catch |err| {
-        c.sym_state.items[gsym] = saved;
-        return err;
-    };
-    c.sym_types.items[gsym] = t;
-    c.sym_state.items[gsym] = .computed;
-    markSpeculativePin(c, gsym);
-}
-
-/// Type of `sym` when bound by a destructuring pattern whose whole
-/// value has type `whole`: walk the pattern to the binding position.
-pub fn bindingElementType(c: *Checker, sym: SymbolId, decl: Node, whole: TypeId) Error!TypeId {
-    const d = c.tree.nodeData(decl);
-    const pattern: Node = switch (c.nodeTag(decl)) {
-        .declarator, .declarator_init, .declarator_full, .param, .param_full => d.lhs,
-        else => decl,
-    };
-    const name = c.symNameAtom(sym);
-    var result: TypeId = types.any_type;
-    _ = try c.findBindingType(pattern, name, whole, &result, try c.bindingFlowBase(sym, decl));
-    return result;
-}
-
-/// A destructured binding inherits the NARROWING of the property it comes
-/// from: `const { multiElement } = this.state` inside `if
-/// (this.state.multiElement)` binds the narrowed, non-null type. tsc builds
-/// a synthetic `<initializer>["prop"]` element access carrying the
-/// declaration's flow node and asks `getFlowTypeOfReference` about it
-/// (`getFlowTypeOfDestructuring`); the equivalent here is to extend the
-/// initializer's reference key by each pattern link and query the flow graph
-/// at the declaration.
-///
-/// Only when the initializer is itself a tracked reference and the
-/// declaration lives in the file being checked — a cross-file symbol is
-/// never flow-narrowed, and its flow ids belong to another graph.
-pub const BindFlow = struct { node: Node, key: RefKey };
-
-pub fn bindingFlowBase(c: *Checker, sym: SymbolId, decl: Node) Error!?BindFlow {
-    if (c.symFile(sym) != c.cur_file) return null;
-    const d = c.tree.nodeData(decl);
-    const init_node: Node = switch (c.nodeTag(decl)) {
-        .declarator_init => d.rhs,
-        .declarator_full => c.tree.extraData(ast.DeclaratorFull, d.rhs).init,
-        else => return null,
-    };
-    if (init_node == null_node) return null;
-    const key = (try c.buildRefKey(init_node)) orelse return null;
-    return .{ .node = init_node, .key = key };
-}
-
-/// The reference key one pattern link deeper, or null when the path would
-/// exceed the tracked depth (sound under-narrowing).
-pub fn extendRefKey(c: *Checker, base: RefKey, elem: PathElem) Error!?RefKey {
-    if (base.len >= max_deep_ref_depth) return null;
-    var elems: [max_deep_ref_depth]PathElem = undefined;
-    var buf: [max_deep_ref_depth]PathElem = undefined;
-    const path = c.refPath(&base, &buf);
-    @memcpy(elems[0..path.len], path);
-    elems[path.len] = elem;
-    return c.makeRefKey(base.sym, elems[0 .. path.len + 1]);
-}
-
-pub fn findBindingType(c: *Checker, pat: Node, name: Atom, whole: TypeId, out: *TypeId, bf: ?BindFlow) Error!bool {
-    if (pat == null_node) return false;
-    const d = c.tree.nodeData(pat);
-    switch (c.nodeTag(pat)) {
-        .identifier => {
-            if ((try c.atomOfToken(c.tree.nodeMainToken(pat))) == name) {
-                out.* = whole;
-                return true;
-            }
-            return false;
-        },
-        .object_pattern => {
-            for (c.tree.nodeRange(pat)) |el| {
-                if (el == null_node) continue;
-                const ed = c.tree.nodeData(el);
-                switch (c.nodeTag(el)) {
-                    .binding_property => {
-                        const key = try c.memberAtom(c.tree.nodeMainToken(el));
-                        var pt: TypeId = types.any_type;
-                        if (try c.propOfType(try c.resolveStructural(whole), key)) |p| {
-                            pt = if (p.optional()) try c.makeUnion2(p.ty, types.undefined_type) else p.ty;
-                        }
-                        // Inherit the narrowing of `<initializer>.key` at the
-                        // declaration (see `bindingFlowBase`).
-                        var sub_bf: ?BindFlow = null;
-                        if (bf) |b| {
-                            if (PathElem.memberFits(key)) {
-                                if (try c.extendRefKey(b.key, .member(key))) |k| {
-                                    pt = try c.flowTypeOfKey(b.node, k, pt);
-                                    sub_bf = .{ .node = b.node, .key = k };
-                                }
-                            }
-                        }
-                        if (ed.rhs != 0) pt = try c.removeUndefined(pt); // default strips undefined
-                        if (ed.lhs != 0) {
-                            if (try c.findBindingType(ed.lhs, name, pt, out, sub_bf)) return true;
-                        } else if (key == name) {
-                            out.* = pt;
-                            return true;
-                        }
-                    },
-                    .binding_property_computed => {
-                        // `{[k]: v}` → `v: whole[typeof k]` (tsc's
-                        // `getIndexedAccessType` over the computed key). A
-                        // non-literal key lands on the index signature, which
-                        // is what `Record<string, T>` destructuring wants.
-                        var pt: TypeId = types.any_type;
-                        if (ed.lhs != 0) {
-                            const kt = try c.checkExprCached(ed.lhs, types.no_type);
-                            pt = try c.indexedAccessType(try c.resolveStructural(whole), kt);
-                        }
-                        if (try c.findBindingType(ed.rhs, name, pt, out, null)) return true;
-                    },
-                    .rest_element => {
-                        // `{a, b, ...rest}` → rest = `whole` minus the
-                        // sibling-named keys (tsc's object rest type,
-                        // `Omit<whole, "a"|"b">`). Binding it to the whole
-                        // object wrongly kept the destructured props, which
-                        // then read as duplicated by a later spread (TS2783).
-                        const rest_ty = try c.objectRestType(whole, pat);
-                        if (try c.findBindingType(ed.lhs, name, rest_ty, out, null)) return true;
-                    },
-                    else => {},
-                }
-            }
-            return false;
-        },
-        .array_pattern => {
-            const r = try c.resolveStructural(whole);
-            var i: u32 = 0;
-            for (c.tree.nodeRange(pat)) |el| {
-                if (el == null_node) continue;
-                defer i += 1;
-                if (c.nodeTag(el) == .omitted) continue;
-                var et: TypeId = types.any_type;
-                switch (c.ts.kind(r)) {
-                    .array => et = c.ts.arrayElem(r),
-                    .tuple => {
-                        if (i < c.ts.tupleLen(r)) et = c.ts.tupleElem(r, i).ty;
-                    },
-                    else => {},
-                }
-                if (c.nodeTag(el) == .rest_element) {
-                    const ed = c.tree.nodeData(el);
-                    const rest_t = try c.ts.makeArray(et);
-                    if (try c.findBindingType(ed.lhs, name, rest_t, out, null)) return true;
-                } else if (c.nodeTag(el) == .binding_default) {
-                    const ed = c.tree.nodeData(el);
-                    if (try c.findBindingType(ed.lhs, name, try c.removeUndefined(et), out, null)) return true;
-                } else {
-                    if (try c.findBindingType(el, name, et, out, null)) return true;
-                }
-            }
-            return false;
-        },
-        .binding_default => return c.findBindingType(d.lhs, name, whole, out, bf),
-        .rest_element => return c.findBindingType(d.lhs, name, whole, out, null),
-        else => return false,
-    }
-}
-
-/// Object binding-pattern rest type: `whole` with every key named by a
-/// sibling `binding_property` in `pat` removed (tsc's `{a, ...rest}` →
-/// `rest = Omit<whole, "a">`). Objects and intersections of objects are
-/// filtered (index signatures preserved); anything else (unions, generics,
-/// `any`) falls back to `whole` unchanged — lenient, matching how the rest
-/// of the checker treats non-enumerable shapes.
-pub fn objectRestType(c: *Checker, whole: TypeId, pat: Node) Error!TypeId {
-    const r = try c.resolveStructural(whole);
-    const kind = c.ts.kind(r);
-    if (kind != .object and kind != .intersection) return whole;
-
-    var excluded: std.ArrayList(Atom) = .empty;
-    defer excluded.deinit(c.scratch());
-    for (c.tree.nodeRange(pat)) |el| {
-        if (el == null_node) continue;
-        if (c.nodeTag(el) == .binding_property) {
-            try excluded.append(c.scratch(), try c.memberAtom(c.tree.nodeMainToken(el)));
-        }
-    }
-
-    var props: std.ArrayList(types.Prop) = .empty;
-    defer props.deinit(c.scratch());
-    var sidx: TypeId = 0;
-    var nidx: TypeId = 0;
-    // Flatten one level: a plain object contributes its own props; an
-    // intersection contributes each object member's props (later members
-    // win on a name clash, mirroring intersection member order). A member
-    // that is not a plain object makes the shape non-enumerable → bail to
-    // `whole` rather than drop constraints.
-    const members: []const TypeId = if (kind == .intersection) try c.memberList(r) else &.{r};
-    for (members) |m| {
-        const rm = try c.resolveStructural(m);
-        if (c.ts.kind(rm) != .object) return whole;
-        if (c.ts.objectStringIndex(rm) != 0) sidx = c.ts.objectStringIndex(rm);
-        if (c.ts.objectNumberIndex(rm) != 0) nidx = c.ts.objectNumberIndex(rm);
-        for (0..c.ts.objectPropCount(rm)) |i| {
-            const p = c.ts.objectProp(rm, @intCast(i));
-            if (containsAtom(excluded.items, p.name)) continue;
-            var replaced = false;
-            for (props.items) |*existing| {
-                if (existing.name == p.name) {
-                    existing.* = p;
-                    replaced = true;
-                    break;
-                }
-            }
-            if (!replaced) try props.append(c.scratch(), p);
-        }
-    }
-    return c.ts.makeObject(props.items, sidx, nidx, 0);
-}
+// Destructuring lives in `destructure.zig`; re-exported here because symbol
+// typing above drives it and `Checker`'s method aliases — plus flow.zig's
+// direct import of `findBindingType` — name this file.
+pub const BindFlow = destructure.BindFlow;
+pub const bindingElementType = destructure.bindingElementType;
+pub const bindingFlowBase = destructure.bindingFlowBase;
+pub const extendRefKey = destructure.extendRefKey;
+pub const findBindingType = destructure.findBindingType;
+pub const objectRestType = destructure.objectRestType;
+pub const optionalizePatternDefaults = destructure.optionalizePatternDefaults;
+pub const patternDefaultsProp = destructure.patternDefaultsProp;
+pub const pinBindingSym = destructure.pinBindingSym;
+pub const pinPatternParamSyms = destructure.pinPatternParamSyms;
 
 pub fn functionSymbolType(c: *Checker, sym: SymbolId) Error!TypeId {
     const saved = c.enterSymFile(sym);

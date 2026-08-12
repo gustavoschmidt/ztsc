@@ -1,14 +1,17 @@
-//! Statements & declarations: classes, interfaces, aliases, reachability.
-//! Split mechanically from checker.zig; functions take the
+//! Statements & declarations: variable declarations, loops, switches,
+//! function bodies, classes, interfaces, aliases. Functions take the
 //! `Checker` context as their first parameter.
+//!
+//! Three concerns the statement walk drives were split out and are
+//! re-exported below so `Checker`'s method aliases keep resolving here:
+//! `reachability.zig` (endpoint analysis), `iteration.zig` (the `for..of`
+//! protocol), and `decorators.zig`.
 
 const std = @import("std");
 const ast = @import("../frontend/ast.zig");
-const scanner = @import("../frontend/scanner.zig");
 const intern = @import("../intern.zig");
 const binder = @import("../frontend/binder.zig");
 const types = @import("../types.zig");
-const source = @import("../frontend/source.zig");
 const libs = @import("../libs.zig");
 const modules = @import("../link/modules.zig");
 const ZeroPagedArray = @import("../zeropage.zig").ZeroPagedArray;
@@ -35,6 +38,7 @@ const checkExprCached = @import("expr.zig").checkExprCached;
 const checkFunctionLikeExpr = @import("expr.zig").checkFunctionLikeExpr;
 const checkJsxElement = @import("expr.zig").checkJsxElement;
 const classStaticType = @import("enums.zig").classStaticType;
+const decorators = @import("decorators.zig");
 const diagFmt = Checker.diagFmt;
 const elaborate = @import("elaborate.zig");
 const elaborateLiteralError = @import("assign.zig").elaborateLiteralError;
@@ -44,11 +48,12 @@ const inferReturnType = @import("signatures.zig").inferReturnType;
 const isComparable = @import("assign.zig").isComparable;
 const isNonPrimitiveKind = @import("assign.zig").isNonPrimitiveKind;
 const isNullishUnion = @import("flow.zig").isNullishUnion;
+const iteration = @import("iteration.zig");
+const reachability = @import("reachability.zig");
 const run = Checker.run;
 const seal = Checker.seal;
 const typeFromQualifiedName = @import("typenode.zig").typeFromQualifiedName;
 const typeOfSymbol = @import("signatures.zig").typeOfSymbol;
-const typeof_names = Checker.typeof_names;
 
 // =====================================================================
 // statements & declarations
@@ -460,138 +465,14 @@ pub fn assignPatternFromType(c: *Checker, pat: Node, whole: TypeId) Error!void {
     }
 }
 
-/// Element type of `for (x of expr)`, diagnosing TS2488 when `expr` is not
-/// iterable. Arrays/tuples/strings resolve directly; everything else goes
-/// through the `[Symbol.iterator]()` protocol (`iterationElementType`).
-pub fn forOfElementType(c: *Checker, rt: TypeId, right_node: Node, is_await: bool) Error!TypeId {
-    if (is_await) {
-        if (try c.asyncIterationElementType(rt)) |e| return e;
-        if (right_node != 0) {
-            try c.diagFmt(2504, c.nodeSpan(right_node), "Type '{s}' must have a '[Symbol.asyncIterator]()' method that returns an async iterator.", .{try c.typeToString(rt)});
-        }
-        return types.any_type;
-    }
-    if (try c.iterationElementType(rt)) |e| return e;
-    if (right_node != 0) {
-        try c.diagFmt(2488, c.nodeSpan(right_node), "Type '{s}' must have a '[Symbol.iterator]()' method that returns an iterator.", .{try c.typeToString(rt)});
-    }
-    return types.any_type;
-}
-
-/// The type produced by iterating `rt` (the `x` in `for (x of rt)` and the
-/// element of `[...rt]`), or null when `rt` is not iterable. Handles
-/// arrays/tuples/strings directly, `Generator`/`Iterator`/`IterableIterator`
-/// refs, and the general `[Symbol.iterator]() -> { next(): { value } }`
-/// protocol (so `Map`/`Set` and user-defined iterables work).
-pub fn iterationElementType(c: *Checker, rt: TypeId) Error!?TypeId {
-    const r = try c.resolveStructural(rt);
-    switch (c.ts.kind(r)) {
-        .array => return c.ts.arrayElem(r),
-        .tuple => return try c.numberIndexType(r),
-        .string, .string_literal => return types.string_type,
-        .any, .err => return types.any_type,
-        .union_type => {
-            var parts: std.ArrayList(TypeId) = .empty;
-            defer parts.deinit(c.scratch());
-            for (try c.memberList(r)) |m| {
-                const e = (try c.iterationElementType(m)) orelse return null;
-                try parts.append(c.scratch(), e);
-            }
-            return try c.ts.makeUnion(c.scratch(), parts.items);
-        },
-        else => {},
-    }
-    // `[Symbol.iterator](): Iterator<E>` protocol.
-    if (try c.propOfType(r, c.atom_sym_iterator)) |p| {
-        const ret = try c.callableReturn(p.ty);
-        if (ret != 0) {
-            // Lib iterables return `IterableIterator<E>`/`Iterator<E>`.
-            const y2 = c.generatorYieldType(ret);
-            if (y2 != 0) return y2;
-            // General protocol: the iterator's `next()` result `value`.
-            if (try c.iteratorNextValue(ret, false)) |v| return v;
-        }
-    }
-    return null;
-}
-
-/// The type produced by `for await (x of rt)`: the
-/// `[Symbol.asyncIterator]()` protocol, falling back to the sync protocol
-/// with `Awaited<…>` applied to the element (tsc allows `for await` over
-/// a plain iterable). Null when `rt` is neither.
-pub fn asyncIterationElementType(c: *Checker, rt: TypeId) Error!?TypeId {
-    const r = try c.resolveStructural(rt);
-    switch (c.ts.kind(r)) {
-        .any, .err => return types.any_type,
-        .union_type => {
-            var parts: std.ArrayList(TypeId) = .empty;
-            defer parts.deinit(c.scratch());
-            for (try c.memberList(r)) |m| {
-                const e = (try c.asyncIterationElementType(m)) orelse return null;
-                try parts.append(c.scratch(), e);
-            }
-            return try c.ts.makeUnion(c.scratch(), parts.items);
-        },
-        else => {},
-    }
-    if (try c.propOfType(r, c.atom_sym_asyncIterator)) |p| {
-        const ret = try c.callableReturn(p.ty);
-        if (ret != 0) {
-            const y = c.asyncGeneratorYieldType(ret);
-            if (y != 0) return y;
-            if (try c.iteratorNextValue(ret, true)) |v| return v;
-        }
-        return null;
-    }
-    if (try c.iterationElementType(rt)) |e| return try c.awaitedType(e);
-    return null;
-}
-
-/// Return type of a callable prop (`.function` or the first `.overloads`
-/// signature); 0 if `ty` is not callable.
-pub fn callableReturn(c: *Checker, ty: TypeId) Error!TypeId {
-    switch (c.ts.kind(ty)) {
-        .function => return c.ts.fnReturn(ty),
-        .overloads => {
-            const sigs = try c.memberList(ty);
-            return if (sigs.len > 0) c.ts.fnReturn(sigs[0]) else 0;
-        },
-        else => return 0,
-    }
-}
-
-/// The `value` type of an iterator's `next()` result, i.e. the yield type
-/// of an arbitrary (non-lib-named) iterator object. Null if `iter` has no
-/// `next(): { value }` shape. With `is_async`, `next()`'s `Promise<…>`
-/// return is unwrapped first (the `AsyncIterator` protocol).
-pub fn iteratorNextValue(c: *Checker, iter: TypeId, is_async: bool) Error!?TypeId {
-    const r = try c.resolveStructural(iter);
-    const nextp = (try c.propOfType(r, c.atom_next)) orelse return null;
-    var ret = try c.callableReturn(nextp.ty);
-    if (ret == 0) return null;
-    if (is_async) ret = try c.awaitedType(ret);
-    const rr = try c.resolveStructural(ret);
-    if (c.ts.kind(rr) == .union_type) {
-        // The lib's `next(): IteratorResult<T, TReturn>` is the union
-        // `IteratorYieldResult<T> | IteratorReturnResult<TReturn>`,
-        // discriminated on `done`: the iteration type is the `value` of
-        // the constituents whose `done` is not literally `true`.
-        var parts: std.ArrayList(TypeId) = .empty;
-        defer parts.deinit(c.scratch());
-        for (try c.memberList(rr)) |m| {
-            const rm = try c.resolveStructural(m);
-            if (try c.propOfType(rm, c.atom_done)) |dp| {
-                if (c.ts.kind(try c.resolveStructural(dp.ty)) == .bool_true) continue;
-            }
-            const vp = (try c.propOfType(rm, c.atom_value)) orelse continue;
-            try parts.append(c.scratch(), vp.ty);
-        }
-        if (parts.items.len == 0) return null;
-        return try c.ts.makeUnion(c.scratch(), parts.items);
-    }
-    const valp = (try c.propOfType(rr, c.atom_value)) orelse return null;
-    return valp.ty;
-}
+// The iteration protocol lives in `iteration.zig`, next to the `await`/yield
+// half it shares a walk with; re-exported here because the `for..of` walk
+// above drives it and `Checker`'s method aliases name this file.
+pub const asyncIterationElementType = iteration.asyncIterationElementType;
+pub const callableReturn = iteration.callableReturn;
+pub const forOfElementType = iteration.forOfElementType;
+pub const iterationElementType = iteration.iterationElementType;
+pub const iteratorNextValue = iteration.iteratorNextValue;
 
 pub fn checkSwitch(c: *Checker, node: Node) Error!void {
     const d = c.tree.nodeData(node);
@@ -834,15 +715,13 @@ pub fn checkFunctionBody(c: *Checker, node: Node, proto_idx: u32, body: Node, si
             const exempt = k == .void or k == .any or k == .err or k == .unknown or k == .none or
                 c.containsUndefinedish(eff_ann);
             if (!exempt) {
-                var rets: std.ArrayList(Node) = .empty;
+                // Only the presence of returns matters here, so the scope
+                // handed over is irrelevant — nothing re-checks the operands.
+                var rets = try c.collectReturns(c.tree.nodeRange(body), binder.file_scope);
                 defer rets.deinit(c.scratch());
-                var bare = false;
-                for (c.tree.nodeRange(body)) |stmt| {
-                    if (stmt != null_node) try c.collectReturns(stmt, &rets, null, &bare, binder.file_scope);
-                }
                 const span = if (proto.name_token != 0) c.tokSpan(proto.name_token) else c.tokSpan(c.tree.nodeMainToken(node));
                 if (!c.stmtListTerminal(c.tree.nodeRange(body))) {
-                    if (rets.items.len == 0 and !bare) {
+                    if (rets.exprs.items.len == 0 and !rets.bare) {
                         try c.diagFmt(2355, span, "A function whose declared type is neither 'undefined', 'void', nor 'any' must return a value.", .{});
                     } else {
                         try c.diagFmt(2366, span, "Function lacks ending return statement and return type does not include 'undefined'.", .{});
@@ -861,202 +740,15 @@ pub fn checkFunctionBody(c: *Checker, node: Node, proto_idx: u32, body: Node, si
     }
 }
 
-// --- syntactic reachability (2366/return-undefined inference) ---------
-
-pub fn stmtListTerminal(c: *Checker, stmts: []const Node) bool {
-    // Does control flow fall off the end of this list? Walk forward tracking
-    // reachability: the first terminal statement (return/throw/terminal
-    // loop…) kills it, and straight-line code never revives it. A terminal
-    // statement in the *middle* therefore makes the whole list terminal —
-    // trailing dead code or a hoisted `function`/type declaration after a
-    // `return` does not resurrect the endpoint (the previous "inspect the
-    // last statement only" rule wrongly did, adding a phantom `| undefined`
-    // to the inferred return type of the common
-    // `return { … }; function helper() {…}` hook pattern).
-    var reachable = true;
-    for (stmts) |s| {
-        if (s == null_node or !reachable) continue;
-        if (c.stmtTerminal(s)) reachable = false;
-    }
-    return !reachable;
-}
-
-pub fn stmtTerminal(c: *Checker, node: Node) bool {
-    const d = c.tree.nodeData(node);
-    switch (c.nodeTag(node)) {
-        .return_stmt, .throw_stmt => return true,
-        // tsc's endpoint analysis is CFA, not syntax: `functionHasImplicit
-        // Return` reads `isReachableFlowNode(func.endFlowNode)`, whose Call
-        // arm ends the flow at a call whose signature returns `never`. So
-        // `this.handleError(e): never` as the last statement of a `catch`
-        // makes the endpoint unreachable — no TS2366, and no phantom
-        // `| undefined` on an inferred return type. `flowReachable` already
-        // reads this for narrowing; both endpoint consumers need it too.
-        .expr_stmt => return switch (c.nodeTag(d.lhs)) {
-            .call_expr, .call_expr_targs, .optional_call => c.callReturnsNever(d.lhs) catch false,
-            else => false,
-        },
-        .block => return c.stmtListTerminal(c.tree.nodeRange(node)),
-        .if_else_stmt => {
-            const e = c.tree.extraData(ast.IfElse, d.rhs);
-            return c.stmtTerminal(e.then_stmt) and c.stmtTerminal(e.else_stmt);
-        },
-        .labeled_stmt => return c.stmtTerminal(d.lhs),
-        .try_stmt => {
-            const e = c.tree.extraData(ast.Try, d.rhs);
-            // A `finally` that itself ends abruptly (return/throw) makes the
-            // whole statement terminal regardless of the try/catch bodies.
-            if (e.finally_block != null_node and c.stmtTerminal(e.finally_block)) return true;
-            // Otherwise the statement can complete normally if the try block
-            // can, or — when a catch exists — if the catch block can. It is
-            // terminal only when neither falls through.
-            const try_terminal = c.stmtTerminal(d.lhs);
-            if (e.catch_clause != null_node) {
-                const catch_block = c.tree.nodeData(e.catch_clause).rhs;
-                return try_terminal and c.stmtTerminal(catch_block);
-            }
-            return try_terminal;
-        },
-        .switch_stmt => return c.switchTerminal(node),
-        .while_stmt => {
-            // while (true) without break is terminal-ish.
-            if (c.nodeTag(d.lhs) == .true_literal and !c.containsBreak(d.rhs)) return true;
-            return false;
-        },
-        .for_stmt => {
-            const e = c.tree.extraData(ast.For, d.lhs);
-            if (e.cond == 0 and !c.containsBreak(d.rhs)) return true;
-            return false;
-        },
-        else => return false,
-    }
-}
-
-/// A switch is terminal if it has a default (or is exhaustive over a
-/// literal-union discriminant), every clause ends terminally, and no
-/// clause breaks out.
-pub fn switchTerminal(c: *Checker, node: Node) bool {
-    const d = c.tree.nodeData(node);
-    const r = c.tree.extraData(ast.SubRange, d.rhs);
-    var has_default = false;
-    var n_cases: usize = 0;
-    for (c.tree.extraRange(r.start, r.end)) |clause| {
-        if (clause == null_node) continue;
-        const cd = c.tree.nodeData(clause);
-        if (c.nodeTag(clause) == .default_clause) has_default = true else n_cases += 1;
-        const cr = c.tree.extraData(ast.SubRange, cd.rhs);
-        const stmts = c.tree.extraRange(cr.start, cr.end);
-        for (stmts) |s| {
-            if (s != null_node and c.containsBreak(s)) return false;
-        }
-        // A clause with statements must end terminally (empty clauses
-        // fall through to the next).
-        var has_stmt = false;
-        for (stmts) |s| {
-            if (s != null_node) has_stmt = true;
-        }
-        if (has_stmt and !c.stmtListTerminal(stmts)) return false;
-    }
-    if (has_default) return true;
-    // Exhaustiveness: discriminant type's union members all covered.
-    return c.switchIsExhaustive(node);
-}
-
-pub fn switchIsExhaustive(c: *Checker, node: Node) bool {
-    const d = c.tree.nodeData(node);
-    // switch (typeof x): exhaustive when every typeof outcome of x's
-    // type is covered by a case string.
-    if (c.nodeTag(d.lhs) == .prefix_unary and
-        c.tree.tokens.tag(c.tree.nodeMainToken(d.lhs)) == .keyword_typeof)
-    {
-        return c.typeofSwitchIsExhaustive(node, c.tree.nodeData(d.lhs).lhs);
-    }
-    // The discriminant type may not be cached yet: `switchIsExhaustive` is
-    // reached from `inferReturnType`, a type probe that checks only the
-    // `return` expressions, never the switch discriminant. Synthesize it on
-    // demand (memoized by `checkExprCached`) so an exhaustive switch over a
-    // literal-union parameter — `switch (fmt) { case 'a': … }` covering
-    // every `FormatKey` member — is recognized as terminal, and the
-    // function's inferred return type gains no phantom `| undefined`.
-    const disc_t0 = c.nodeType(d.lhs) orelse (c.checkExprCached(d.lhs, types.no_type) catch return false);
-    const disc_t1 = c.resolveStructural(disc_t0) catch return false;
-    // A whole-enum discriminant is the union of its member types (tsc), so
-    // `switch (e) { case E.A: … case E.B: … }` over every member IS
-    // exhaustive. Expanding here keeps the one covering loop below.
-    const disc_t = if (c.ts.kind(disc_t1) == .enum_type and !c.ts.isEnumMember(disc_t1))
-        ((c.enumMemberTypeUnion(c.ts.enumSymbol(disc_t1), 0) catch return false) orelse return false)
-    else
-        disc_t1;
-    if (c.ts.kind(disc_t) != .union_type) return false;
-    const r = c.tree.extraData(ast.SubRange, d.rhs);
-    for (0..c.ts.memberCount(disc_t)) |mi| {
-        const rm = c.ts.regularLiteral(c.ts.memberAt(disc_t, mi)) catch return false;
-        if (!c.ts.isLiteralLike(rm) and
-            c.ts.kind(rm) != .null and c.ts.kind(rm) != .undefined) return false;
-        var covered = false;
-        for (c.tree.extraRange(r.start, r.end)) |clause| {
-            if (clause == null_node or c.nodeTag(clause) != .case_clause) continue;
-            const test_node = c.tree.nodeData(clause).lhs;
-            if (test_node == 0) continue;
-            // Case-label literals may be unchecked in the return-type probe
-            // (it types only `return` expressions) — synthesize on demand
-            // (memoized) so switch coverage is seen.
-            const tt0 = c.nodeType(test_node) orelse (c.checkExprCached(test_node, types.no_type) catch continue);
-            const tt = c.ts.regularLiteral(tt0) catch continue;
-            if (tt == rm) covered = true;
-        }
-        if (!covered) return false;
-    }
-    return true;
-}
-
-pub fn typeofSwitchIsExhaustive(c: *Checker, sw: Node, operand: Node) bool {
-    const t = c.nodeType(operand) orelse (c.checkExprCached(operand, types.no_type) catch return false);
-    const r = c.tree.extraData(ast.SubRange, c.tree.nodeData(sw).rhs);
-    // For each possible typeof outcome of t, require a covering case.
-    for (0..typeof_names.len) |which| {
-        var possible = false;
-        if (c.ts.kind(t) == .union_type) {
-            for (c.ts.members(t)) |m| {
-                if (c.typeofMatches(m, which)) possible = true;
-            }
-        } else {
-            possible = c.typeofMatches(t, which);
-        }
-        if (!possible) continue;
-        var covered = false;
-        for (c.tree.extraRange(r.start, r.end)) |clause| {
-            if (clause == null_node or c.nodeTag(clause) != .case_clause) continue;
-            const test_node = c.tree.nodeData(clause).lhs;
-            if (test_node == 0) continue;
-            // Case-label literals may be unchecked in the return-type probe
-            // (it types only `return` expressions) — synthesize on demand
-            // (memoized) so switch coverage is seen.
-            const tt0 = c.nodeType(test_node) orelse (c.checkExprCached(test_node, types.no_type) catch continue);
-            const tt = c.ts.regularLiteral(tt0) catch continue;
-            if (c.ts.kind(tt) != .string_literal) continue;
-            if (c.ts.literalAtom(tt) == c.typeof_atoms[which]) covered = true;
-        }
-        if (!covered) return false;
-    }
-    return true;
-}
-
-pub fn containsBreak(c: *Checker, node: Node) bool {
-    if (node == null_node) return false;
-    switch (c.nodeTag(node)) {
-        .break_stmt => return true,
-        // Breaks inside nested loops/switches target those.
-        .while_stmt, .do_stmt, .for_stmt, .for_in_stmt, .for_of_stmt, .switch_stmt => return false,
-        .arrow_fn, .function_expr, .function_decl, .class_decl => return false,
-        else => {},
-    }
-    var it = c.tree.childIterator(node);
-    while (it.next()) |child| {
-        if (c.containsBreak(child)) return true;
-    }
-    return false;
-}
+// Syntactic reachability lives in `reachability.zig`; re-exported here because
+// the statement walk above drives it and `Checker`'s method aliases name this
+// file.
+pub const containsBreak = reachability.containsBreak;
+pub const stmtListTerminal = reachability.stmtListTerminal;
+pub const stmtTerminal = reachability.stmtTerminal;
+pub const switchIsExhaustive = reachability.switchIsExhaustive;
+pub const switchTerminal = reachability.switchTerminal;
+pub const typeofSwitchIsExhaustive = reachability.typeofSwitchIsExhaustive;
 
 // --- classes / interfaces / aliases ------------------------------------
 
@@ -1128,7 +820,7 @@ pub fn checkNamespace(c: *Checker, node: Node) Error!void {
 ///
 /// Returns whether the instance side is assignable, i.e. whether the caller
 /// should go on to the static side.
-pub fn checkInstanceSideExtends(c: *Checker, class_sym: SymbolId, members: []const Node, this_t: TypeId, name_token: ast.TokenIndex) Error!bool {
+fn checkInstanceSideExtends(c: *Checker, class_sym: SymbolId, members: []const Node, this_t: TypeId, name_token: ast.TokenIndex) Error!bool {
     const base_ref = try c.baseClassRef(class_sym) orelse return true;
     if (base_ref == types.error_type or base_ref == types.any_type or base_ref == this_t) return true;
     if (try c.hasUnresolvedBase(class_sym)) return true;
@@ -1189,10 +881,11 @@ pub fn checkInstanceSideExtends(c: *Checker, class_sym: SymbolId, members: []con
 }
 
 /// One extra indentation level for a derivation chain nested under a headline
-/// that already spent one (`checkInstanceSideExtends`). `chainText` renders
-/// from column 2; TS2416's chain hangs off the relation line the headline
-/// pushed down, so every line moves right by two.
-fn indentChain(c: *Checker, chain: []const u8) Error![]const u8 {
+/// that already spent one (`checkInstanceSideExtends`, and `decorators.zig`'s
+/// legacy argument failure). `chainText` renders from column 2; TS2416's chain
+/// hangs off the relation line the headline pushed down, so every line moves
+/// right by two.
+pub fn indentChain(c: *Checker, chain: []const u8) Error![]const u8 {
     if (chain.len == 0) return chain;
     var out: std.Io.Writer.Allocating = .init(c.scratch());
     for (chain) |ch| {
@@ -1630,13 +1323,7 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
             types.any_type;
         for (decos) |deco| {
             const dt = try c.checkDecorator(deco);
-            if (c.prog.experimental_decorators) {
-                // Legacy dialect: the runtime hands a class decorator the
-                // constructor function alone.
-                try checkLegacyDecoratorSig(c, deco, dt, .class, .{ .a = .{ class_val, types.any_type, types.any_type }, .count = 1 });
-            } else {
-                try c.checkDecoratorSig(deco, dt, .class, class_val);
-            }
+            try decorators.checkClassDecoratorSig(c, deco, dt, class_val);
         }
         c.cur_scope = saved_ds;
     }
@@ -1819,461 +1506,19 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
     }
 }
 
-/// Type-check a decorator expression (`@expr`) and return its type.
-/// Standard decorators name-resolve and type-check the expression: an
-/// undefined name ⇒ TS2304, and the callee/args of a factory `@f(args)`
-/// are checked. The returned type is the decorator function itself (for a
-/// factory, the call's return type) — the value `checkDecoratorSig` relates
-/// against the expected context-typed decorator signature.
-pub fn checkDecorator(c: *Checker, node: Node) Error!TypeId {
-    const expr = c.tree.nodeData(node).lhs;
-    if (expr == null_node) return types.any_type;
-    return c.checkExprCached(expr, types.no_type);
-}
-
-/// The position a decorator is applied to. Drives which TS12xx code and
-/// which `Class*DecoratorContext` shape apply (tsc §checkDecorators).
-pub const DecoPos = enum { class, method, getter, setter, field, accessor };
-
-pub fn decoCode(pos: DecoPos) u16 {
-    return switch (pos) {
-        .class => 1238, // class decorator
-        .field, .accessor => 1240, // property decorator
-        .method, .getter, .setter => 1241, // method decorator
-    };
-}
-
-pub fn decoContextName(pos: DecoPos) []const u8 {
-    return switch (pos) {
-        .class => "ClassDecoratorContext",
-        .method => "ClassMethodDecoratorContext",
-        .getter => "ClassGetterDecoratorContext",
-        .setter => "ClassSetterDecoratorContext",
-        .field => "ClassFieldDecoratorContext",
-        .accessor => "ClassAccessorDecoratorContext",
-    };
-}
-
-/// Signature check for a class-member decorator: classify the member's
-/// position, build the `value` argument type tsc synthesizes for it, and
-/// relate the decorator against the expected context-typed signature.
-pub fn checkMemberDecoratorSig(c: *Checker, deco: Node, dt: TypeId, target: Node, this_t: TypeId, class_sym: SymbolId) Error!void {
-    if (c.prog.experimental_decorators) return checkLegacyMemberDeco(c, deco, dt, target, this_t, class_sym);
-    const md = c.tree.nodeData(target);
-    var pos: DecoPos = .method;
-    var value: TypeId = types.any_type;
-    switch (c.nodeTag(target)) {
-        .class_field => {
-            const e = c.tree.extraData(ast.Field, md.lhs);
-            if (e.flags & ast.Flags.accessor != 0) {
-                pos = .accessor;
-                // `accessor x` decorators receive a
-                // `ClassAccessorDecoratorTarget<This, Value>`.
-                value = c.decoContextRef("ClassAccessorDecoratorTarget");
-            } else {
-                pos = .field;
-                // Field decorators receive `undefined` as the value.
-                value = types.undefined_type;
-            }
-        },
-        .class_method => {
-            const proto = c.tree.extraData(ast.FnProto, md.lhs);
-            if (proto.flags & ast.Flags.get != 0) {
-                pos = .getter;
-            } else if (proto.flags & ast.Flags.set != 0) {
-                pos = .setter;
-            } else {
-                pos = .method;
-            }
-            const is_static = proto.flags & ast.Flags.static != 0;
-            const saved = c.this_type;
-            c.this_type = if (is_static and class_sym != binder.no_symbol)
-                try c.ts.makeClassValue(class_sym)
-            else
-                this_t;
-            // The value is the member's own function type. Suppress TS7006
-            // here — the member's own pass reports implicit-any.
-            value = c.signatureOfProto(target, md.lhs, true, false) catch types.any_type;
-            c.this_type = saved;
-        },
-        else => return,
-    }
-    try c.checkDecoratorSig(deco, dt, pos, value);
-}
-
-// =====================================================================
-// legacy (`experimentalDecorators`) decorator signature resolution
-// =====================================================================
-
-/// The argument list tsc synthesizes for a LEGACY decorator call
-/// (`getEffectiveDecoratorArguments`). `count` is how many arguments the
-/// runtime actually hands over — 1 for a class, 2 for a property, 3 for an
-/// `accessor` field or a method-family member — and is what the arity
-/// message reports.
-const LegacyDecoArgs = struct {
-    /// `[target, propertyKey, descriptor]`, `any` where not modeled.
-    a: [3]TypeId = .{ types.any_type, types.any_type, types.any_type },
-    count: u32,
-    /// Method-family position (method / get / set). tsc's
-    /// `getLegacyDecoratorArgumentCount` hands the descriptor only to a
-    /// signature that declares MORE than two parameters, so a two-parameter
-    /// method decorator is arity-checked against two arguments even though
-    /// the runtime passes three.
-    method_shape: bool = false,
-};
-
-/// Legacy signature check for a class-member decorator: classify the member,
-/// synthesize the `(target, propertyKey, descriptor)` tuple the runtime
-/// passes it, and resolve the decorator call against it.
-fn checkLegacyMemberDeco(c: *Checker, deco: Node, dt: TypeId, target: Node, this_t: TypeId, class_sym: SymbolId) Error!void {
-    const md = c.tree.nodeData(target);
-    var args: LegacyDecoArgs = .{ .count = 2 };
-    var pos: DecoPos = .method;
-    switch (c.nodeTag(target)) {
-        .class_field => {
-            const e = c.tree.extraData(ast.Field, md.lhs);
-            const is_accessor = e.flags & ast.Flags.accessor != 0;
-            pos = if (is_accessor) .accessor else .field;
-            args.a[0] = legacyDecoTarget(c, e.flags & ast.Flags.static != 0, this_t, class_sym);
-            const key = try legacyDecoKeyAtom(c, target, e.flags);
-            args.a[1] = try legacyDecoKeyType(c, key);
-            args.count = if (is_accessor) 3 else 2;
-            // An `accessor` field is handed a descriptor too, over the
-            // field's own type. Read off the class's member table — already
-            // materialized by the eager expansion at the top of the class
-            // walk — rather than out of the annotation, whose own
-            // diagnostics belong to the member's pass, not the decorator's.
-            if (is_accessor) {
-                const pt: TypeId = if (key != 0) blk: {
-                    const p = (try c.propOfType(args.a[0], key)) orelse break :blk types.any_type;
-                    break :blk p.ty;
-                } else types.any_type;
-                args.a[2] = legacyDescriptorType(c, pt);
-            }
-        },
-        .class_method => {
-            const proto = c.tree.extraData(ast.FnProto, md.lhs);
-            // A constructor takes no decorator (the grammar rejects it) and
-            // tsc has no head message for that position.
-            if (c.isCtorName(try c.memberAtom(c.tree.nodeMainToken(target)))) return;
-            const is_get = proto.flags & ast.Flags.get != 0;
-            const is_set = proto.flags & ast.Flags.set != 0;
-            pos = if (is_get) .getter else if (is_set) .setter else .method;
-            args.a[0] = legacyDecoTarget(c, proto.flags & ast.Flags.static != 0, this_t, class_sym);
-            args.a[1] = try legacyDecoKeyType(c, try legacyDecoKeyAtom(c, target, proto.flags));
-            args.count = 3;
-            args.method_shape = true;
-            // `TypedPropertyDescriptor<T>` over the member's own type: the
-            // function type for a method, and the PROPERTY type — the
-            // getter's return, the setter's parameter — for an accessor
-            // (tsc's `getTypeOfNode` on the declaration).
-            const saved = c.this_type;
-            c.this_type = args.a[0];
-            const fn_t = c.signatureOfProto(target, md.lhs, true, false) catch types.any_type;
-            c.this_type = saved;
-            var member_t = fn_t;
-            if (c.ts.kind(fn_t) == .function) {
-                if (is_get) {
-                    member_t = c.ts.fnReturn(fn_t);
-                } else if (is_set) {
-                    member_t = if (c.ts.fnParamCount(fn_t) > 0) c.ts.fnParam(fn_t, 0).ty else types.any_type;
-                }
-            }
-            args.a[2] = legacyDescriptorType(c, member_t);
-        },
-        else => return,
-    }
-    try checkLegacyDecoratorSig(c, deco, dt, pos, args);
-}
-
-/// The `target` argument: the constructor function for a static member (and
-/// for a class decorator), the instance type — tsc's declared type, so a
-/// generic class contributes its own type parameters — for an instance one.
-fn legacyDecoTarget(c: *Checker, is_static: bool, this_t: TypeId, class_sym: SymbolId) TypeId {
-    if (class_sym == binder.no_symbol) return types.any_type;
-    if (!is_static) return this_t;
-    return c.ts.makeClassValue(class_sym) catch types.any_type;
-}
-
-/// The member's name atom, or 0 for a name whose key tsc does not spell as a
-/// string literal — a computed or private one, where it answers `string` or
-/// the key's own symbol type and guessing either way could invent a
-/// rejection.
-fn legacyDecoKeyAtom(c: *Checker, target: Node, flags: u32) Error!intern.Atom {
-    if (flags & (ast.Flags.computed | ast.Flags.computed_sym) != 0) return 0;
-    const tok = c.tree.nodeMainToken(target);
-    switch (c.tree.tokens.tag(tok)) {
-        .identifier, .string_literal, .numeric_literal => {},
-        // A keyword-spelled member name (`delete`, `default`, …) is an
-        // identifier for this purpose; anything else (private names) is not.
-        else => if (!scanner.Tag.isKeyword(c.tree.tokens.tag(tok))) return 0,
-    }
-    return c.memberAtom(tok);
-}
-
-/// The `propertyKey` argument: the string-literal type of the member's name
-/// (tsc's `getClassElementPropertyKeyType`).
-fn legacyDecoKeyType(c: *Checker, key: intern.Atom) Error!TypeId {
-    if (key == 0) return types.any_type;
-    return c.ts.makeStringLiteral(key, false);
-}
-
-/// `TypedPropertyDescriptor<T>`, or `any` when the lib does not declare it.
-fn legacyDescriptorType(c: *Checker, t: TypeId) TypeId {
-    if (t == types.no_type or t == types.error_type) return types.any_type;
-    const a = c.atom("TypedPropertyDescriptor") catch return types.any_type;
-    const sym = c.prog.globals.lookup(a) orelse return types.any_type;
-    if (!c.symFlags(sym).interface) return types.any_type;
-    return c.ts.makeRef(sym, &.{t}) catch types.any_type;
-}
-
-/// Resolve a LEGACY decorator against the argument tuple the runtime hands
-/// it, and report tsc's TS1238/1240/1241 when no call signature accepts it
-/// ("Unable to resolve signature of … decorator when called as an
-/// expression.", with the argument or arity failure chained beneath).
-///
-/// tsc runs the ordinary call resolution here, so this mirrors
-/// `resolveDecorator` → `chooseOverload`: a candidate is rejected on arity
-/// first (`hasCorrectArity` counts the arguments tsc would actually pass a
-/// signature of that shape) and on argument assignability second, and the
-/// argument failure outranks the arity one in the report.
-///
-/// Deliberately narrower than tsc in three places, each an under-report and
-/// never a false positive: an OVERLOADED decorator is left alone (tsc's
-/// report there is a nested "No overload matches this call" chain), a
-/// GENERIC signature is left alone (its parameters are only judgeable after
-/// inference), and a non-callable decorator is left alone (tsc's "This
-/// expression is not callable"). The decorator's RETURN type — tsc also
-/// requires `void`/`any` for a property decorator and a descriptor for a
-/// method one, under the same TS12xx codes — is not checked here either.
-fn checkLegacyDecoratorSig(c: *Checker, deco: Node, dt: TypeId, pos: DecoPos, args: LegacyDecoArgs) Error!void {
-    const r = try c.resolveStructural(dt);
-    const sig = switch (c.ts.kind(r)) {
-        .function => r,
-        // A callable object with exactly one signature resolves like a plain
-        // function; more than one is an overload set (skipped, above).
-        .object => if (c.ts.objectCallSigCount(r) == 1) c.ts.objectCallSig(r, 0) else return,
-        else => return,
-    };
-    if (c.ts.fnTypeParams(sig).len > 0) return;
-    const params = c.ts.fnParamCount(sig);
-    const min = try c.requiredParams(sig);
-    const max = try c.paramTotal(sig);
-    // tsc's `signatureHasRestParameter` (the declared `...`) versus its
-    // `hasEffectiveRestParameter` (a rest that does NOT expand to a fixed
-    // parameter list): the first decides whether the decorator merely looks
-    // uncalled, the second which arity wording applies.
-    const has_rest = params > 0 and c.ts.fnParam(sig, params - 1).rest();
-    const unbounded = max == std.math.maxInt(u32);
-    // How many arguments tsc counts against THIS signature
-    // (`getDecoratorArgumentCount`) — the method family drops the
-    // descriptor for a signature of two parameters or fewer.
-    const argc: u32 = if (args.method_shape) (if (params <= 2) 2 else 3) else args.count;
-
-    // tsc's `isPotentiallyUncalledDecorator`: a signature that takes no
-    // required argument and cannot absorb the ones the runtime passes is
-    // reported as a decorator FACTORY someone forgot to call (TS1329,
-    // "Did you mean to call it first"), not as a broken decorator. ztsc
-    // under-reports that family — and must not report the arity failure in
-    // its place.
-    if (min == 0 and !has_rest and params < argc) return;
-
-    if (argc < min or argc > max) {
-        // "expects N" / "N-M" / "at least N", over the same three cases as
-        // tsc's argument-arity error. The count blamed is the number of
-        // arguments the RUNTIME passes (tsc reports `args.length`), which
-        // for a small method decorator is not the `argc` above.
-        var buf: [32]u8 = undefined;
-        const expects: []const u8 = if (unbounded)
-            std.fmt.bufPrint(&buf, "at least {d}", .{min}) catch unreachable
-        else if (min != max)
-            std.fmt.bufPrint(&buf, "{d}-{d}", .{ min, max }) catch unreachable
-        else
-            std.fmt.bufPrint(&buf, "{d}", .{min}) catch unreachable;
-        // TOO FEW arguments is blamed on the whole call — the decorator, `@`
-        // included; TOO MANY is blamed on the span of the surplus arguments,
-        // and every synthesized argument's node is the decorator's own
-        // expression, so that span is the expression (tsc's
-        // `getArgumentArityError`: `getDiagnosticForCallNode` for the first
-        // case, `createDiagnosticForNodeArray(args…)` for the second).
-        const span = if (argc > max) decoExprSpan(c, deco) else c.nodeSpan(deco);
-        try c.diagFmt(decoCode(pos), span, "Unable to resolve signature of {s} decorator when called as an expression.\n  The runtime will invoke the decorator with {d} arguments, but the decorator expects {s}.", .{
-            decoPosWord(pos), args.count, expects,
-        });
-        return;
-    }
-
-    var i: u32 = 0;
-    while (i < args.count) : (i += 1) {
-        const at = args.a[i];
-        if (at == types.no_type or at == types.any_type or at == types.error_type) continue;
-        // Past the parameter list tsc relates the argument to `any`.
-        const pt = (try c.paramTypeAt(sig, i)) orelse continue;
-        if (try c.isAssignable(at, pt)) continue;
-        const span = decoExprSpan(c, deco);
-        // The derivation tsc prints under the argument line, shifted one
-        // level deeper than it renders under a bare TS2345 headline.
-        const chain = try indentChain(c, try elaborate.chainText(c, at, pt));
-        try c.diagFmt(decoCode(pos), span, "Unable to resolve signature of {s} decorator when called as an expression.\n  Argument of type '{s}' is not assignable to parameter of type '{s}'.{s}", .{
-            decoPosWord(pos), try c.typeToString(at), try c.typeToString(pt), chain,
-        });
-        return; // tsc reports the first failing argument only
-    }
-}
-
-/// The span of a decorator's expression (`Field` in `@Field`) — where every
-/// argument tsc synthesizes for the decorator call points, and so where an
-/// argument-level failure is blamed. Falls back to the decorator itself for
-/// the recovered `@` with nothing after it.
-fn decoExprSpan(c: *Checker, deco: Node) source.Span {
-    const expr = c.tree.nodeData(deco).lhs;
-    return if (expr != null_node) c.nodeSpan(expr) else c.nodeSpan(deco);
-}
-
-/// The member word tsc names in the "Unable to resolve signature of …"
-/// headline. An accessor (`get`/`set`) is a *method* decorator there; an
-/// `accessor` field is a *property* one.
-fn decoPosWord(pos: DecoPos) []const u8 {
-    return switch (pos) {
-        .class => "class",
-        .field, .accessor => "property",
-        .method, .getter, .setter => "method",
-    };
-}
-
-/// Build a `.ref` to a decorator-family lib interface by name (default
-/// type args), or `any` when absent (e.g. `--noLib`).
-pub fn decoContextRef(c: *Checker, name: []const u8) TypeId {
-    const a = c.atom(name) catch return types.any_type;
-    const sym = c.prog.globals.lookup(a) orelse return types.any_type;
-    if (!c.symFlags(sym).interface) return types.any_type;
-    return c.ts.makeRef(sym, &.{}) catch types.any_type;
-}
-
-/// Relate a decorator against the expected `(value, context) => …` shape
-/// for its position and emit TS1238/1240/1241 when no call signature fits
-/// (tsc: "Unable to resolve signature of … decorator when called as an
-/// expression."). Policy: under-report freely, never a false positive —
-/// generic decorators and any/unknown parameter types are always accepted,
-/// and the `value`/`context` relations run only where a mismatch is
-/// unambiguous.
-pub fn checkDecoratorSig(c: *Checker, deco: Node, dt: TypeId, pos: DecoPos, value: TypeId) Error!void {
-    // `experimentalDecorators` selects the LEGACY dialect, where the runtime
-    // hands a decorator `(target, propertyKey, descriptorOrParameterIndex)` —
-    // a different call shape from the standard `(value, context)` this
-    // function models, and one whose own diagnostics are a different family
-    // (TS1270/TS1271, not TS1238/1240/1241). Checking a legacy decorator
-    // against the standard shape reports every one of them: Nest's
-    // `@Column()`, `@WebSocketServer()`, `@ApiProperty()` and friends all
-    // fail. Accept them all instead — an under-report, per the no-false-
-    // positive rule. See `tsconfig.Config.experimental_decorators`.
-    if (c.prog.experimental_decorators) return;
-    const r = try c.resolveStructural(dt);
-    var sigs: std.ArrayList(TypeId) = .empty;
-    defer sigs.deinit(c.scratch());
-    switch (c.ts.kind(r)) {
-        .any, .unknown, .err => return, // permissive: no reliable shape
-        .function => try sigs.append(c.scratch(), r),
-        .overloads => {
-            for (try c.memberList(r)) |m| try sigs.append(c.scratch(), m);
-        },
-        .object => {
-            if (c.ts.objectCallSigCount(r) == 0) return; // non-callable: under-report
-            for (0..c.ts.objectCallSigCount(r)) |i| {
-                try sigs.append(c.scratch(), c.ts.objectCallSig(r, @intCast(i)));
-            }
-        },
-        else => return, // not callable in a shape we model: under-report
-    }
-    if (sigs.items.len == 0) return;
-
-    // Expected context interface for this position (null under --noLib →
-    // context relation is skipped, value/arity relation still applies).
-    const ctx_atom = c.atom(decoContextName(pos)) catch 0;
-    const ctx_sym: ?SymbolId = if (ctx_atom != 0) c.prog.globals.lookup(ctx_atom) else null;
-
-    for (sigs.items) |sig| {
-        if (try c.decoSigMatches(sig, pos, value, ctx_sym)) return; // some overload fits
-    }
-    const expr = c.tree.nodeData(deco).lhs;
-    const span = if (expr != null_node) c.nodeSpan(expr) else c.nodeSpan(deco);
-    try c.diagFmt(decoCode(pos), span, "Unable to resolve signature of {s} decorator when called as an expression.", .{switch (pos) {
-        .class => "class",
-        .field, .accessor => "property",
-        .method, .getter, .setter => "method",
-    }});
-}
-
-/// Does one decorator call signature accept the runtime `(value, context)`
-/// call? Conservative: a generic signature or any indeterminate parameter
-/// is treated as a match (under-report, never a false positive).
-pub fn decoSigMatches(c: *Checker, sig: TypeId, pos: DecoPos, value: TypeId, ctx_sym: ?SymbolId) Error!bool {
-    // Generic decorators need inference we don't model here — accept.
-    if (c.ts.fnTypeParams(sig).len > 0) return true;
-    // The runtime invokes a decorator with 2 arguments; a signature that
-    // *requires* more can never resolve (tsc: "expects N").
-    if (try c.requiredParams(sig) > 2) return false;
-    // Value argument vs the first parameter.
-    if (try c.paramTypeAt(sig, 0)) |p0| {
-        if (!try c.decoAcceptsValue(pos, value, p0)) return false;
-    }
-    // Context argument vs the second parameter: fail only on an
-    // unambiguous decorator-context kind mismatch.
-    if (ctx_sym != null) {
-        if (try c.paramTypeAt(sig, 1)) |p1| {
-            if (c.decoContextMismatch(p1, ctx_sym.?)) return false;
-        }
-    }
-    return true;
-}
-
-/// True if `value` is acceptable as the first decorator argument for `p0`.
-/// Permissive supertypes (`any`/`unknown`/`object`/`Function`, a matching
-/// context/target ref, or a constructor-typed parameter for a class
-/// decorator) are accepted without an assignability probe so an incomplete
-/// relation cannot produce a false positive.
-pub fn decoAcceptsValue(c: *Checker, pos: DecoPos, value: TypeId, p0: TypeId) Error!bool {
-    switch (c.ts.kind(p0)) {
-        .any, .unknown, .err, .object_keyword => return true,
-        .ref => {
-            const psym = c.ts.refSymbol(p0);
-            if (c.globalSymNamed(psym, "Function")) return true;
-            if (pos == .accessor and c.globalSymNamed(psym, "ClassAccessorDecoratorTarget")) return true;
-        },
-        .object => {
-            // A constructor-typed parameter accepts a class value.
-            if (pos == .class and c.ts.objectConstructSigCount(p0) > 0) return true;
-        },
-        else => {},
-    }
-    if (value == 0 or value == types.error_type or value == types.any_type) return true;
-    return c.isAssignable(value, p0);
-}
-
-/// True when `p1` is a ref to a *different* decorator-context interface
-/// than expected (e.g. `ClassMethodDecoratorContext` where a class
-/// decorator wants `ClassDecoratorContext`). Anything else (a union like
-/// `DecoratorContext`, `any`, an unrelated type) is accepted.
-pub fn decoContextMismatch(c: *Checker, p1: TypeId, ctx_sym: SymbolId) bool {
-    if (c.ts.kind(p1) != .ref) return false;
-    const psym = c.ts.refSymbol(p1);
-    const family = [_][]const u8{
-        "ClassDecoratorContext",       "ClassMethodDecoratorContext",
-        "ClassGetterDecoratorContext", "ClassSetterDecoratorContext",
-        "ClassFieldDecoratorContext",  "ClassAccessorDecoratorContext",
-    };
-    for (family) |name| {
-        if (c.globalSymNamed(psym, name)) return psym != ctx_sym;
-    }
-    return false;
-}
-
-/// Is `sym` the global interface/type named `name`?
-pub fn globalSymNamed(c: *Checker, sym: SymbolId, name: []const u8) bool {
-    const a = c.atom(name) catch return false;
-    const g = c.prog.globals.lookup(a) orelse return false;
-    return g == sym;
-}
+// Decorator checking lives in `decorators.zig`; re-exported here because the
+// class walk above drives it and `Checker`'s method aliases name this file.
+pub const DecoPos = decorators.DecoPos;
+pub const checkDecorator = decorators.checkDecorator;
+pub const checkDecoratorSig = decorators.checkDecoratorSig;
+pub const checkMemberDecoratorSig = decorators.checkMemberDecoratorSig;
+pub const decoAcceptsValue = decorators.decoAcceptsValue;
+pub const decoCode = decorators.decoCode;
+pub const decoContextMismatch = decorators.decoContextMismatch;
+pub const decoContextName = decorators.decoContextName;
+pub const decoContextRef = decorators.decoContextRef;
+pub const decoSigMatches = decorators.decoSigMatches;
+pub const globalSymNamed = decorators.globalSymNamed;
 
 pub fn checkInterfaceDecl(c: *Checker, node: Node) Error!void {
     // Eagerly expand so member-type diagnostics (2304 in bodies, 7006 in

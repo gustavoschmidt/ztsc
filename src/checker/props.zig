@@ -1,6 +1,10 @@
-//! Properties and type parts.
-//! Split mechanically from checker.zig; functions take the
+//! Property lookup and type-parameter parts: what member a type has, and
+//! what a type parameter's constraint/default/arity are. Functions take the
 //! `Checker` context as their first parameter.
+//!
+//! Two concerns were split out and are re-exported below so `Checker`'s
+//! method aliases keep resolving here: `iteration.zig` (promises, `await`,
+//! yield types) and `nullability.zig` (the nullish/truthiness facts).
 
 const std = @import("std");
 const ast = @import("../frontend/ast.zig");
@@ -27,6 +31,8 @@ const check = checker_zig.check;
 const atom = Checker.atom;
 const globalThisType = @import("instantiate.zig").globalThisType;
 const instantiate = @import("enums.zig").instantiate;
+const iteration = @import("iteration.zig");
+const nullability = @import("nullability.zig");
 const resolveStructural = @import("instantiate.zig").resolveStructural;
 const run = Checker.run;
 
@@ -563,139 +569,18 @@ pub fn primitiveInterfaceProp(c: *Checker, t: TypeId, name: Atom) Error!?types.P
     return c.propOfType(try c.resolveStructural(ref), name);
 }
 
-/// Wrap `payload` in the global `Promise<T>`. Falls back to `any`
-/// when the lib has no `Promise` interface (e.g. `--noLib`).
-pub fn makePromise(c: *Checker, payload: TypeId) Error!TypeId {
-    const sym = c.prog.globals.lookup(c.atom_Promise) orelse return types.any_type;
-    if (!c.symFlags(sym).interface) return types.any_type;
-    return c.ts.makeRef(sym, &.{payload});
-}
-
-/// Whether `t` is a `.ref` to `Promise`/`PromiseLike` whose first type
-/// argument is exactly the type parameter `tp_sym` (the `PromiseLike<T>`
-/// member of a `.then` onfulfilled return `T | PromiseLike<T>`).
-pub fn isPromiseLikeOf(c: *Checker, t: TypeId, tp_sym: u32) bool {
-    if (c.ts.kind(t) != .ref) return false;
-    const sym = c.ts.refSymbol(t);
-    const p = c.prog.globals.lookup(c.atom_Promise);
-    const pl = c.prog.globals.lookup(c.atom_PromiseLike);
-    if ((p == null or sym != p.?) and (pl == null or sym != pl.?)) return false;
-    const args = c.ts.refArgs(t);
-    if (args.len == 0) return false;
-    return c.ts.kind(args[0]) == .type_param and c.ts.typeParamSymbol(args[0]) == tp_sym;
-}
-
-/// `Awaited<T>`: unwrap a `Promise<T>` / `PromiseLike<T>` to `T`, to a
-/// fixed point; any other type passes through (await on a non-thenable
-/// yields the value itself).
-///
-/// The lib types both of them (`Promise<T> extends PromiseLike<T>`, and
-/// `then` returns `PromiseLike<TResult>`), so a bare `PromiseLike<T>`
-/// receiver is ordinary — `await pool.all()` on a `PromiseLike<unknown[]>`
-/// is `unknown[]`, not `PromiseLike<unknown[]>`. tsc's `Awaited<T>` is
-/// structural over *any* thenable and recursive; ztsc recognizes the two
-/// lib names and recurses, which covers every nesting of them
-/// (`Promise<PromiseLike<T>>`, `PromiseLike<Promise<T>>`, …). A
-/// hand-written thenable that is neither is still a gap (under-report:
-/// the value keeps its object type).
-pub fn awaitedType(c: *Checker, t: TypeId) Error!TypeId {
-    return c.awaitedTypeRec(t, 0);
-}
-
-pub fn awaitedTypeRec(c: *Checker, t: TypeId, depth: u32) Error!TypeId {
-    // A self-referential alias (`type P = Promise<P>`) would spin; the cap
-    // is far above any real nesting and only ever leaves the type unwrapped.
-    if (depth >= 16) return t;
-    // `Awaited<T>` distributes over unions: `await (Promise<X> | undefined)`
-    // is `X | undefined` (tsc). Without this, a `Promise<X> | undefined`
-    // receiver — common now that optional chains yield `... | undefined` —
-    // fails to unwrap and surfaces spurious property/callable errors.
-    if (c.ts.kind(t) == .union_type) {
-        var parts: std.ArrayList(TypeId) = .empty;
-        defer parts.deinit(c.scratch());
-        for (try c.memberList(t)) |m| try parts.append(c.scratch(), try c.awaitedTypeRec(m, depth + 1));
-        return c.ts.makeUnion(c.scratch(), parts.items);
-    }
-    // An INTERSECTION awaits through its thenable constituent. tsc reads
-    // the awaited type off the `then` member (`getPromisedTypeOfPromise`),
-    // and in `Promise<T> & { resolve; reject }` — the promise-with-
-    // resolvers shape — `then` comes from the promise half, so the result
-    // is `T`. Returning the whole intersection instead made every read off
-    // an awaited resolvable promise report TS2339.
-    if (c.ts.kind(t) == .intersection) {
-        for (try c.memberList(t)) |m| {
-            const a = try c.awaitedType(m);
-            if (a != m) return a;
-        }
-        return t;
-    }
-    if (c.ts.kind(t) == .ref) {
-        const sym = c.ts.refSymbol(t);
-        const p = c.prog.globals.lookup(c.atom_Promise);
-        const pl = c.prog.globals.lookup(c.atom_PromiseLike);
-        if ((p != null and sym == p.?) or (pl != null and sym == pl.?)) {
-            const args = c.ts.refArgs(t);
-            if (args.len >= 1) return c.awaitedTypeRec(args[0], depth + 1);
-        }
-    }
-    return t;
-}
-
-/// If `t` is a ref to one of the lib's iterator interfaces whose first
-/// type arg is the yield element (`Generator<T>`/`Iterator<T>`/
-/// `IterableIterator<T>`, plus the TS ≥5.6 `IteratorObject<T>` and the
-/// named built-in iterators like `MapIterator<T>`), return that `T`;
-/// otherwise 0.
-pub fn generatorYieldType(c: *Checker, t: TypeId) TypeId {
-    if (c.ts.kind(t) != .ref) return 0;
-    const sym = c.ts.refSymbol(t);
-    const names = [_]Atom{
-        c.atom_Generator,      c.atom_Iterator,       c.atom_IterableIterator,
-        c.atom_IteratorObject, c.atom_ArrayIterator,  c.atom_MapIterator,
-        c.atom_SetIterator,    c.atom_StringIterator, c.atom_RegExpStringIterator,
-    };
-    for (names) |name| {
-        const g = c.prog.globals.lookup(name) orelse continue;
-        if (sym == g) {
-            const args = c.ts.refArgs(t);
-            if (args.len >= 1) return args[0];
-            return 0;
-        }
-    }
-    return 0;
-}
-
-/// Async analogue of `generatorYieldType`: the first type arg of a lib
-/// async-iterator ref (`AsyncGenerator<T>`/`AsyncIterator<T>`/
-/// `AsyncIterableIterator<T>`/`AsyncIteratorObject<T>`), else 0.
-pub fn asyncGeneratorYieldType(c: *Checker, t: TypeId) TypeId {
-    if (c.ts.kind(t) != .ref) return 0;
-    const sym = c.ts.refSymbol(t);
-    const names = [_]Atom{
-        c.atom_AsyncGenerator,        c.atom_AsyncIterator,
-        c.atom_AsyncIterableIterator, c.atom_AsyncIteratorObject,
-    };
-    for (names) |name| {
-        const g = c.prog.globals.lookup(name) orelse continue;
-        if (sym == g) {
-            const args = c.ts.refArgs(t);
-            if (args.len >= 1) return args[0];
-            return 0;
-        }
-    }
-    return 0;
-}
-
-/// Union of a tuple's element types (the element type used when a tuple
-/// borrows `Array<T>` members).
-pub fn tupleElementUnion(c: *Checker, t: TypeId) Error!TypeId {
-    const s = &c.ts;
-    const n = s.tupleLen(t);
-    var parts: std.ArrayList(TypeId) = .empty;
-    defer parts.deinit(c.scratch());
-    for (0..n) |i| try parts.append(c.scratch(), s.tupleElem(t, @intCast(i)).ty);
-    return s.makeUnion(c.scratch(), parts.items);
-}
+// Promises, `await`, and generator yield types live in `iteration.zig`, next
+// to the `for..of` half they share a walk with; re-exported here because
+// `Checker`'s method aliases and `calls.zig` name this file.
+pub const asyncGeneratorYieldType = iteration.asyncGeneratorYieldType;
+pub const awaitedType = iteration.awaitedType;
+// Alias-only, and no caller left: kept `pub` because `Checker`'s alias block
+// (which this refactor may not touch) still names it through this file.
+pub const awaitedTypeRec = iteration.awaitedTypeRec;
+pub const generatorYieldType = iteration.generatorYieldType;
+pub const isPromiseLikeOf = iteration.isPromiseLikeOf;
+pub const makePromise = iteration.makePromise;
+pub const tupleElementUnion = iteration.tupleElementUnion;
 
 /// Uninferred own-type-param value for contextual signature instantiation:
 /// declared default, else constraint, else `unknown` (tsc's order).
@@ -787,311 +672,19 @@ pub fn sigTargArityOk(c: *Checker, sig: TypeId, n: usize) bool {
     return n >= c.sigMinTargs(tps);
 }
 
-pub fn removeUndefined(c: *Checker, t: TypeId) Error!TypeId {
-    return c.filterUnion(t, struct {
-        fn keep(ch: *Checker, m: TypeId) bool {
-            return ch.ts.kind(m) != .undefined;
-        }
-    }.keep);
-}
-
-pub fn nonNullable(c: *Checker, t: TypeId) Error!TypeId {
-    return nonNullableInner(c, t, false);
-}
-
-/// tsc's `getAdjustedTypeWithFacts(t, NEUndefinedOrNull)` is a `mapType`: the
-/// `NonNullable<…>` instantiation is applied CONSTITUENT BY CONSTITUENT, not
-/// only to a union as a whole. A bare TYPE PARAMETER therefore has to be
-/// reachable from inside a union too — a `T` narrowed by
-/// `typeof value === 'number'` is `number & T | T`, and stripping nullish from
-/// that has to leave the `T` arm as `T & {}`. Filtering the union by KIND
-/// alone left it as `T`, so immich's
-/// `validate<T>(value: T): NonNullable<T> | null` reported TS2322 on its own
-/// `return value ?? null` — but only once a guard had turned the bare
-/// parameter into a union.
-///
-/// The DEFERRED conditional / indexed-access arm deliberately does NOT come
-/// along. It marks a whole type whose nullish arm is hidden inside its
-/// constraint, and a union has already separated its nullish arms out:
-/// marking a constituent there stops the conditional from reducing for every
-/// later reader. excalidraw's
-/// `rest.startBinding: (T extends "arrow" ? Binding : never) | undefined`
-/// read through `?? null` is the shape — five fresh TS2322/TS2345 spelled
-/// `{} & T extends "arrow" ? …`.
-fn nonNullableInner(c: *Checker, t: TypeId, drop_void: bool) Error!TypeId {
-    if (c.ts.kind(t) == .union_type) {
-        var parts: std.ArrayList(TypeId) = .empty;
-        defer parts.deinit(c.scratch());
-        for (try c.memberList(t)) |m| {
-            const k = c.ts.kind(m);
-            if (k == .undefined or k == .null or (drop_void and k == .void)) continue;
-            const nm = if (k == .type_param) try nonNullableScalar(c, m) else m;
-            if (nm != types.never_type) try parts.append(c.scratch(), nm);
-        }
-        return c.ts.makeUnion(c.scratch(), parts.items);
-    }
-    const scalar = try nonNullableScalar(c, t);
-    if (drop_void and c.ts.kind(scalar) == .void) return types.never_type;
-    return scalar;
-}
-
-fn nonNullableScalar(c: *Checker, t: TypeId) Error!TypeId {
-    // Under strictNullChecks tsc narrows `unknown` as if it were
-    // `undefined | null | {}` (`unknownUnionType`), so stripping the nullish
-    // arms leaves `{}` — `getNonNullableType(unknown)` is `{}`.
-    if (c.ts.kind(t) == .unknown) return types.empty_object_type;
-    // A bare type parameter whose constraint may be nullish becomes `T & {}`
-    // (tsc's `getNonNullableType` / `NonNullable<T>`). The `& {}` marker
-    // keeps the value assignable back to a `T` slot while exposing the
-    // constraint's non-nullish apparent members (see the intersection arm of
-    // `propOfTypeEx`). A type param already known non-nullish is unchanged.
-    if (c.ts.kind(t) == .type_param) {
-        const con = try c.typeParamConstraint(c.ts.typeParamSymbol(t));
-        if (con == types.no_type or c.containsNullish(con)) {
-            return c.ts.makeIntersection(c.scratch(), &.{ t, types.empty_object_type });
-        }
-        return t;
-    }
-    // A DEFERRED conditional or indexed access is not a union, so filtering
-    // leaves it whole and the nullish constituent hiding in its constraint
-    // survives the guard. tsc's `getAdjustedTypeWithFacts` handles exactly
-    // this: for `NEUndefined` it maps each constituent that *could* be
-    // undefined onto its BASE CONSTRAINT and re-applies the fact there. So
-    // `K extends keyof M ? M[K] | undefined : never` guarded by
-    // `!== undefined` becomes `M[K]`'s constraint without `undefined`,
-    // instead of staying the whole conditional — which is what made
-    // `ShapeCache.generateElementShape`'s inferred return keep an
-    // `undefined` arm past its own `if (cachedShape !== undefined) return`,
-    // and every `.forEach` on the result report an implicit `any`.
-    // The `& {}` marker used for a bare type parameter is deliberately not
-    // used here: there is no `T` slot to stay assignable to.
-    switch (c.ts.kind(t)) {
-        .conditional, .index_access => {
-            const base = try c.transitiveBaseConstraint(t);
-            if (base != t and base != types.no_type and c.containsNullish(base)) {
-                return c.ts.makeIntersection(c.scratch(), &.{ t, types.empty_object_type });
-            }
-        },
-        else => {},
-    }
-    return c.filterUnion(t, struct {
-        fn keep(ch: *Checker, m: TypeId) bool {
-            const k = ch.ts.kind(m);
-            return k != .undefined and k != .null;
-        }
-    }.keep);
-}
-
-/// `??`'s left operand. tsc's `getNonNullableType` is
-/// `getTypeWithFacts(t, NEUndefinedOrNull)`, and `VoidFacts` does not carry
-/// `NEUndefinedOrNull` — so `void` is filtered out alongside `undefined`
-/// and `null`, and `(boolean | void) ?? false` is `boolean`. Scoped to
-/// `??`: the same strip inside the general `nonNullable` (which also serves
-/// `!` and comparison narrowing) regressed a `void` receiver.
-pub fn nonNullableNullish(c: *Checker, t: TypeId) Error!TypeId {
-    return nonNullableInner(c, t, true);
-}
-
-/// Receiver narrowing for an optional-chain link (`a?.b`, `a?.[i]`, `a?.()`).
-/// Beyond null/undefined it also drops `void`: a `.catch(() => {})` /
-/// `.then(…)` tail types a promise `T | void`, and tsc lets `x?.prop` reach
-/// through the `void` constituent to `T`'s members (the whole chain already
-/// yields `… | undefined`). Scoped to the chain sites so the general
-/// `nonNullable` used by `??`, `!`, and comparison narrowing is unaffected.
-/// A receiver that is *only* nullish/void keeps the plain `nonNullable`
-/// result so a bare-`void` access still behaves as before.
-pub fn nonNullableChain(c: *Checker, t: TypeId) Error!TypeId {
-    const nn = try c.nonNullable(t);
-    const dropped = try c.filterUnion(nn, struct {
-        fn keep(ch: *Checker, m: TypeId) bool {
-            return ch.ts.kind(m) != .void;
-        }
-    }.keep);
-    return if (c.ts.kind(dropped) == .never) nn else dropped;
-}
-
-pub fn filterUnion(c: *Checker, t: TypeId, comptime keep: fn (*Checker, TypeId) bool) Error!TypeId {
-    if (c.ts.kind(t) == .union_type) {
-        var parts: std.ArrayList(TypeId) = .empty;
-        defer parts.deinit(c.scratch());
-        for (try c.memberList(t)) |m| {
-            if (keep(c, m)) try parts.append(c.scratch(), m);
-        }
-        return c.ts.makeUnion(c.scratch(), parts.items);
-    }
-    return if (keep(c, t)) t else types.never_type;
-}
-
-pub fn containsNullish(c: *Checker, t: TypeId) bool {
-    return c.unionAnyMember(t, struct {
-        fn f(ch: *Checker, m: TypeId) bool {
-            const k = ch.ts.kind(m);
-            return k == .null or k == .undefined or k == .void or k == .unknown;
-        }
-    }.f);
-}
-
-pub fn containsNull(c: *Checker, t: TypeId) bool {
-    return c.unionAnyMember(t, struct {
-        fn f(ch: *Checker, m: TypeId) bool {
-            return ch.ts.kind(m) == .null;
-        }
-    }.f);
-}
-
-pub fn containsUndefinedish(c: *Checker, t: TypeId) bool {
-    return c.unionAnyMember(t, struct {
-        fn f(ch: *Checker, m: TypeId) bool {
-            const k = ch.ts.kind(m);
-            return k == .undefined or k == .void;
-        }
-    }.f);
-}
-
-pub fn unionAnyMember(c: *Checker, t: TypeId, comptime f: fn (*Checker, TypeId) bool) bool {
-    if (c.ts.kind(t) == .union_type) {
-        for (0..c.ts.memberCount(t)) |i| {
-            if (f(c, c.ts.memberAt(t, i))) return true;
-        }
-        return false;
-    }
-    return f(c, t);
-}
-
-/// The definitely-truthy part of `t` (removes null/undefined/false/
-/// falsy literals; boolean -> true; object types kept).
-pub fn getTruthyPart(c: *Checker, t: TypeId) Error!TypeId {
-    if (c.ts.kind(t) == .union_type) {
-        var parts: std.ArrayList(TypeId) = .empty;
-        defer parts.deinit(c.scratch());
-        for (try c.memberList(t)) |m| {
-            const p = try c.getTruthyPart(m);
-            if (p != types.never_type) try parts.append(c.scratch(), p);
-        }
-        return c.ts.makeUnion(c.scratch(), parts.items);
-    }
-    const s = &c.ts;
-    return switch (s.kind(t)) {
-        .null, .undefined, .void, .bool_false => types.never_type,
-        .boolean => types.true_type,
-        // Under strictNullChecks tsc narrows `unknown` as if it were
-        // `undefined | null | {}` (`unknownUnionType`) and re-spells the full
-        // union `unknown` afterwards, so a guard that removes the nullish
-        // arms leaves `{}` — which carries `Object`'s apparent members.
-        // `if (!e) return; e.toString()` on an `unknown` catch value is the
-        // idiom that needs it.
-        .unknown => types.empty_object_type,
-        // A truthy naked type parameter is `T & {}` — tsc's
-        // `getAdjustedTypeWithFacts` maps the `Truthy` facts over the type
-        // and replaces any constituent that can be nullish with
-        // `NonNullable<…>`. Without it `<T extends P | null>(p: T)` guarded
-        // by `if (p)` still sees the nullish constraint and reports every
-        // member access on it. `nonNullable` builds the same marker the
-        // intersection arm of `propOfTypeEx` already consumes.
-        .type_param => try c.nonNullable(t),
-        .string_literal => if (c.atomText(s.literalAtom(t)).len == 0) types.never_type else t,
-        .number_literal, .number_literal_fresh => if (s.numberValue(t) == 0) types.never_type else t,
-        .bigint_literal => blk: {
-            const text = c.atomText(s.literalAtom(t));
-            break :blk if (isZeroBigInt(text)) types.never_type else t;
-        },
-        else => t,
-    };
-}
-
-/// The definitely-falsy part of `t` (tsc's `A && B` left contribution
-/// and falsy-branch narrowing): string -> "", number -> 0, boolean ->
-/// false, bigint -> 0n; object types contribute nothing.
-pub fn getFalsyPart(c: *Checker, t: TypeId, for_narrowing: bool) Error!TypeId {
-    if (c.ts.kind(t) == .union_type) {
-        var parts: std.ArrayList(TypeId) = .empty;
-        defer parts.deinit(c.scratch());
-        for (try c.memberList(t)) |m| {
-            const p = try c.getFalsyPart(m, for_narrowing);
-            if (p != types.never_type) try parts.append(c.scratch(), p);
-        }
-        return c.ts.makeUnion(c.scratch(), parts.items);
-    }
-    const s = &c.ts;
-    return switch (s.kind(t)) {
-        .null, .undefined, .void, .bool_false => t,
-        .boolean => types.false_type,
-        .bool_true => types.never_type,
-        .any, .err => types.any_type,
-        .unknown => types.unknown_type,
-        .string => if (for_narrowing) types.string_type else try s.makeStringLiteral(try c.atom(""), false),
-        .number => if (for_narrowing) types.number_type else try s.makeNumberLiteral(0, false),
-        .bigint => if (for_narrowing) types.bigint_type else try s.makeBigIntLiteral(try c.atom("0n"), false),
-        .string_literal => if (c.atomText(s.literalAtom(t)).len == 0) t else types.never_type,
-        .number_literal, .number_literal_fresh => if (s.numberValue(t) == 0) t else types.never_type,
-        .bigint_literal => if (isZeroBigInt(c.atomText(s.literalAtom(t)))) t else types.never_type,
-        else => types.never_type, // objects, functions, tuples, refs...
-    };
-}
-
-/// Can a value of `t` be falsy? tsc asks this (`getTypeFacts(left,
-/// TypeFacts.Falsy)`) before building the `||` result: when the answer is
-/// no the right operand is unreachable and the result is just the left
-/// operand's type, with no union and no reduction. Undecidable shapes —
-/// `any`, a bare type parameter, an unresolved conditional — answer "yes",
-/// which keeps the union ztsc built before.
-pub fn canBeFalsy(c: *Checker, t: TypeId, depth: u32) Error!bool {
-    if (depth > 8) return true;
-    const s = &c.ts;
-    switch (s.kind(t)) {
-        .union_type => {
-            for (try c.memberList(t)) |m| {
-                if (try c.canBeFalsy(m, depth + 1)) return true;
-            }
-            return false;
-        },
-        // One always-truthy constituent makes the whole intersection so.
-        .intersection => {
-            for (try c.memberList(t)) |m| {
-                if (!try c.canBeFalsy(m, depth + 1)) return false;
-            }
-            return true;
-        },
-        .object, .array, .tuple, .function, .overloads, .class_value, .bool_true, .symbol, .unique_symbol, .object_keyword => return false,
-        .string_literal => return c.atomText(s.literalAtom(t)).len == 0,
-        .number_literal, .number_literal_fresh => return s.numberValue(t) == 0,
-        .bigint_literal => return isZeroBigInt(c.atomText(s.literalAtom(t))),
-        .ref, .this_type => {
-            const r = try c.resolveStructural(t);
-            if (r == t) return true;
-            return c.canBeFalsy(r, depth + 1);
-        },
-        else => return true,
-    }
-}
-
-/// Can a value of `t` be `null` or `undefined`? The `??` counterpart of
-/// `canBeFalsy` (tsc's `getTypeFacts(left, TypeFacts.EQUndefinedOrNull)`):
-/// `a ?? b` is just `a`'s type when the answer is no. `void` counts — it
-/// admits `undefined` — and undecidable shapes again answer "yes".
-pub fn canBeNullish(c: *Checker, t: TypeId, depth: u32) Error!bool {
-    if (depth > 8) return true;
-    switch (c.ts.kind(t)) {
-        .null, .undefined, .void, .any, .unknown, .err, .type_param => return true,
-        .union_type, .intersection => {
-            for (try c.memberList(t)) |m| {
-                if (try c.canBeNullish(m, depth + 1)) return true;
-            }
-            return false;
-        },
-        .ref, .this_type => {
-            const r = try c.resolveStructural(t);
-            if (r == t) return true;
-            return c.canBeNullish(r, depth + 1);
-        },
-        .conditional, .infer_var, .mapped_param => return true,
-        else => return false,
-    }
-}
-
-pub fn isZeroBigInt(text: []const u8) bool {
-    for (text) |ch| {
-        if (ch >= '1' and ch <= '9') return false;
-    }
-    return true;
-}
+// Nullish/truthiness facts live in `nullability.zig`; re-exported here
+// because `Checker`'s method aliases name this file.
+pub const canBeFalsy = nullability.canBeFalsy;
+pub const canBeNullish = nullability.canBeNullish;
+pub const containsNull = nullability.containsNull;
+pub const containsNullish = nullability.containsNullish;
+pub const containsUndefinedish = nullability.containsUndefinedish;
+pub const filterUnion = nullability.filterUnion;
+pub const getFalsyPart = nullability.getFalsyPart;
+pub const getTruthyPart = nullability.getTruthyPart;
+pub const isZeroBigInt = nullability.isZeroBigInt;
+pub const nonNullable = nullability.nonNullable;
+pub const nonNullableChain = nullability.nonNullableChain;
+pub const nonNullableNullish = nullability.nonNullableNullish;
+pub const removeUndefined = nullability.removeUndefined;
+pub const unionAnyMember = nullability.unionAnyMember;
