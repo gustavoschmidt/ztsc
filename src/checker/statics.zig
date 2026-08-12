@@ -17,7 +17,7 @@ const checker_zig = @import("../checker.zig");
 const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
 
-const TpMap = @import("enums.zig").TpMap;
+const TpMap = @import("subst.zig").TpMap;
 const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
 const hasValueMeaning = @import("names.zig").hasValueMeaning;
 const isCtorName = @import("instantiate.zig").isCtorName;
