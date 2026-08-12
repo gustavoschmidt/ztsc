@@ -584,6 +584,14 @@ pub const NodeType = struct { ty: TypeId, ctx: TypeId };
 /// One in-progress `interfaceGeneric` resolution (base-cycle detection).
 pub const IfaceFrame = struct { sym: SymbolId, resolving_base: bool = false };
 
+/// One in-progress `classStaticType` build (see `class_static_stack`).
+pub const StaticFrame = struct { sym: SymbolId, in_base: bool = false };
+
+/// How deep `classStaticType` may nest before it cuts the base fold outright.
+/// A backstop only: the deepest real chain measured (outline's sequelize
+/// models, reached through their own static members) is 12.
+pub const max_class_static_depth = 96;
+
 /// Bounds of a fresh higher-order type-param symbol (see `fresh_tp_ids`). The
 /// constraint/default are already `M`-instantiated TypeIds (`no_type` = none).
 pub const FreshTp = struct {
@@ -710,36 +718,36 @@ pub const LazyStat = enum(u8) {
 };
 
 pub const map_containers = [_][]const u8{
-    "node_types",             "sig_cache",                "node_scopes",
-    "reassigned_syms",        "reassigned_in_loop",       "member_written_syms",
-    "member_written_in_loop", "ns_types",                 "ambient_ns_types",
-    "relation",               "expansions",               "overload_groups",
-    "overload_group_pool",    "origin",                   "iface_generic",
-    "iface_stack",            "pending_class_decos",      "class_inst_generic",
-    "class_static_cache",     "class_static_base_active", "class_ctor_cache",
-    "enum_value_cache",       "enum_info_cache",          "enum_relation_cache",
-    "alias_generic",          "alias_state",              "alias_recursive",
-    "flow_same",              "flow_narrow",              "ref_keys",
-    "flow_loop_stack",        "flow_stack",               "flow_tmp",
-    "da_cache",               "ctp_cache",                "cmp_cache",
-    "ctt_cache",              "ci_cache",                 "infer_visited",
-    "subst_this_cache",       "mmp_cache",                "arrayish_elem_cache",
-    "tp_constraint_cache",    "erase_cache",              "erase_any_cache",
-    "inst_map_ids",           "fresh_tp_ids",             "this_tp_ids",
-    "fresh_tp_info",          "type_node_cache",          "atom_cache",
-    "infer_ids",              "infer_constraints",        "infer_scopes",
-    "mapped_key_ids",         "mapped_key_scopes",        "inst_diag_at",
-    "infer_active",           "lazy_member_active",       "chain_guards",
-    "never_isect",            "deep_path_list",           "deep_path_ids",
-    "flow_reach",             "member_type_stack",        "lazy_index_objs",
-    "pending_type_args",      "pending_type_args_pool",   "pending_type_args_seen",
-    "tp_constrained_cache",   "nominal_bases",            "nominal_base_pool",
-    "keyof_mapped_active",    "ctp_syms_seen",            "weak_types",
-    "lazy_member",            "lazy_map",                 "pattern_root_decls",
-    "pattern_root_ids",       "pattern_narrow_busy",      "key_name_types",
-    "enum_members",           "keyof_obj_cache",          "trunc_expansions",
-    "inst_map_bytes",         "tp_mentions",              "smk_cache",
-    "rel_maybe",              "spec_sym_types",           "spec_tainted",
+    "node_types",             "sig_cache",              "node_scopes",
+    "reassigned_syms",        "reassigned_in_loop",     "member_written_syms",
+    "member_written_in_loop", "ns_types",               "ambient_ns_types",
+    "relation",               "expansions",             "overload_groups",
+    "overload_group_pool",    "origin",                 "iface_generic",
+    "iface_stack",            "pending_class_decos",    "class_inst_generic",
+    "class_static_cache",     "class_static_stack",     "class_ctor_cache",
+    "enum_value_cache",       "enum_info_cache",        "enum_relation_cache",
+    "alias_generic",          "alias_state",            "alias_recursive",
+    "flow_same",              "flow_narrow",            "ref_keys",
+    "flow_loop_stack",        "flow_stack",             "flow_tmp",
+    "da_cache",               "ctp_cache",              "cmp_cache",
+    "ctt_cache",              "ci_cache",               "infer_visited",
+    "subst_this_cache",       "mmp_cache",              "arrayish_elem_cache",
+    "tp_constraint_cache",    "erase_cache",            "erase_any_cache",
+    "inst_map_ids",           "fresh_tp_ids",           "this_tp_ids",
+    "fresh_tp_info",          "type_node_cache",        "atom_cache",
+    "infer_ids",              "infer_constraints",      "infer_scopes",
+    "mapped_key_ids",         "mapped_key_scopes",      "inst_diag_at",
+    "infer_active",           "lazy_member_active",     "chain_guards",
+    "never_isect",            "deep_path_list",         "deep_path_ids",
+    "flow_reach",             "member_type_stack",      "lazy_index_objs",
+    "pending_type_args",      "pending_type_args_pool", "pending_type_args_seen",
+    "tp_constrained_cache",   "nominal_bases",          "nominal_base_pool",
+    "keyof_mapped_active",    "ctp_syms_seen",          "weak_types",
+    "lazy_member",            "lazy_map",               "pattern_root_decls",
+    "pattern_root_ids",       "pattern_narrow_busy",    "key_name_types",
+    "enum_members",           "keyof_obj_cache",        "trunc_expansions",
+    "inst_map_bytes",         "tp_mentions",            "smk_cache",
+    "rel_maybe",              "spec_sym_types",         "spec_tainted",
     "last_assign_pos",
 };
 
@@ -1076,11 +1084,32 @@ pub const Checker = struct {
     nominal_base_pool: std.ArrayListUnmanaged(TypeId) = .empty,
     class_inst_generic: IntMap(SymbolId, TypeId) = .empty,
     class_static_cache: IntMap(SymbolId, TypeId) = .empty,
-    /// Classes whose base-static fold is on the stack, so a malformed `extends`
-    /// cycle skips the recursive base fold instead of overflowing (the result
-    /// cache stays unpoisoned — static-field-initializer re-entry must still
-    /// see the class's own members).
-    class_static_base_active: IntMap(SymbolId, void) = .empty,
+    /// Gray stack of the classes `classStaticType` is presently building,
+    /// innermost last. Each frame records whether it is at that moment folding
+    /// its base class's statics.
+    ///
+    /// On a re-entry, only a slice that is in the base phase *the whole way*
+    /// from the re-entered class up to the top is a real `extends` cycle; that
+    /// is the one case the fold must cut. A re-entry reached through a MEMBER
+    /// edge — a static field initializer, or a member type that mentions
+    /// another class — is legal and must be allowed to fold its own base,
+    /// exactly as it would have outside the window. Cutting those too (which a
+    /// flat "is this class mid-fold" set cannot avoid) is what dropped every
+    /// inherited static from the classes below outline's `IdModel`, and which
+    /// demand landed inside the window was a partition accident. Same shape as
+    /// `iface_stack`, which decides TS2310 the same way.
+    class_static_stack: std.ArrayListUnmanaged(StaticFrame) = .empty,
+    /// Did the static object `classStaticType` just returned have its base
+    /// fold CUT — either by an `extends` cycle / the depth backstop, or
+    /// because a base it folded was itself cut? Such an object is missing
+    /// every inherited static, so neither it
+    /// nor anything folded over it may be memoized: the window closes when the
+    /// outer frame finishes, and the next demand rebuilds the whole chain.
+    ///
+    /// Set on every return from `classStaticType` (and consumed by
+    /// `classConstructType`), so read it IMMEDIATELY after the call — any
+    /// intervening work can overwrite it.
+    class_static_cut: bool = false,
     /// Mapped types whose key set `keyofMapped` is enumerating. An `as` clause
     /// is allowed to mention `keyof` of the very map it renames the keys of
     /// (sequelize's `InferAttributes<M>` filters `Key extends keyof Model`,

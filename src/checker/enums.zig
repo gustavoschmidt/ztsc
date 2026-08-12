@@ -871,8 +871,40 @@ pub fn ownStaticMemberProp(c: *Checker, cls: SymbolId, name: Atom) Error!?types.
     return null;
 }
 
+/// Would folding `sym`'s base statics right now close an `extends` cycle?
+///
+/// True only when `sym` is already on `class_static_stack` AND every frame
+/// from it to the top is in its base phase — i.e. the path back to it runs
+/// through `extends` edges and nothing else. A re-entry that passes through a
+/// member edge (a static initializer, a member annotation naming another
+/// class) leaves a non-base frame in between and is not a cycle: it is an
+/// ordinary nested demand, and it must be free to fold its own base or the
+/// answer depends on who asked first.
+fn staticBaseCycle(c: *Checker, sym: SymbolId) bool {
+    var i = c.class_static_stack.items.len;
+    while (i > 0) {
+        i -= 1;
+        const f = c.class_static_stack.items[i];
+        if (!f.in_base) return false;
+        if (f.sym == sym) return true;
+    }
+    return false;
+}
+
 pub fn classStaticType(c: *Checker, sym: SymbolId) Error!TypeId {
-    if (c.class_static_cache.get(sym)) |t| return t;
+    // Only complete objects are ever memoized, so a hit is never cut.
+    if (c.class_static_cache.get(sym)) |t| {
+        c.class_static_cut = false;
+        return t;
+    }
+    // Is this re-entry an `extends` cycle (or past the depth backstop)? Both
+    // answers are properties of the heritage graph alone, so both are the same
+    // whoever asks first. See `Checker.class_static_stack`.
+    const cycle = staticBaseCycle(c, sym) or
+        c.class_static_stack.items.len >= checker_zig.max_class_static_depth;
+    try c.class_static_stack.append(c.cm(), .{ .sym = sym });
+    const my_frame = c.class_static_stack.items.len - 1;
+    defer _ = c.class_static_stack.pop();
     const saved_ctx = c.enterSymFile(sym);
     defer c.restoreCtx(saved_ctx);
     // `this` inside a static member is the class's constructor type (tsc),
@@ -962,20 +994,29 @@ pub fn classStaticType(c: *Checker, sym: SymbolId) Error!TypeId {
     // Static members are inherited: `typeof D` includes `typeof Base`'s
     // statics (own members win over inherited). This is how leaflet's
     // `Map.include`/`GridLayer.extend` reach the static `extend`/`include`
-    // declared on the root `class Class`. Guard the recursion against a
-    // malformed `extends` cycle without poisoning the result cache — a
-    // static-field initializer that reads a sibling static re-enters this
-    // function and must still see the class's own members.
-    if (!c.class_static_base_active.contains(sym)) {
+    // declared on the root `class Class`. A malformed `extends` cycle cuts the
+    // recursion (`staticBaseCycle`) and yields the class's own members alone —
+    // which is also what a static-field initializer that reads a sibling
+    // static needs to see when it re-enters this function.
+    //
+    // `cut` = did this object lose its inherited statics? See
+    // `Checker.class_static_cut`.
+    var cut = false;
+    if (!cycle) {
         if (try c.baseClassSym(sym)) |base| {
-            try c.class_static_base_active.put(c.cm(), sym, {});
+            c.class_static_stack.items[my_frame].in_base = true;
+            c.class_static_cut = false;
             const base_static = try c.classStaticType(base);
-            _ = c.class_static_base_active.remove(sym);
+            cut = c.class_static_cut;
+            c.class_static_stack.items[my_frame].in_base = false;
             result = try c.mergeBaseObject(result, base_static, false);
         } else if (blk: {
-            try c.class_static_base_active.put(c.cm(), sym, {});
-            defer _ = c.class_static_base_active.remove(sym);
-            break :blk try c.baseExprConstructType(sym);
+            c.class_static_stack.items[my_frame].in_base = true;
+            defer c.class_static_stack.items[my_frame].in_base = false;
+            c.class_static_cut = false;
+            const b = try c.baseExprConstructType(sym);
+            cut = c.class_static_cut;
+            break :blk b;
         }) |base_ctor| {
             // `class D extends <expression>`: the STATIC side inherits the
             // base expression's own members, exactly as it inherits a base
@@ -1005,8 +1046,17 @@ pub fn classStaticType(c: *Checker, sym: SymbolId) Error!TypeId {
             );
             result = try c.mergeBaseObject(result, base_static, false);
         }
-    }
-    try c.class_static_cache.put(c.cm(), sym, result);
+    } else cut = true;
+    c.class_static_cut = cut;
+    // A cut object is missing every inherited static. Memoizing it is what
+    // made `typeof ParanoidModel` (outline, three classes below sequelize's
+    // `Model`) lose `findAll`/`findOne`/`scope`/… for the rest of the run:
+    // one demand reached `IdModel` while `IdModel`'s own base fold was on the
+    // stack, cached the own-members-only answer, and every class below it
+    // folded THAT and cached the hole permanently. Which demand arrives inside
+    // the window is a partition/order accident, so the diagnostics moved with
+    // `--checkers`. Leaving a cut object uncached costs one rebuild.
+    if (!cut) try c.class_static_cache.put(c.cm(), sym, result);
     return result;
 }
 
@@ -1048,6 +1098,10 @@ pub fn classConstructType(c: *Checker, cls: SymbolId) Error!TypeId {
         try sigs.append(c.scratch(), try c.ts.makeFunction(&.{}, inst, &.{}, 0));
     }
     const statics = try c.classStaticType(cls);
+    // …and inherits its cut: a constructor object built over a static table
+    // that lost its inherited members is just as incomplete, so it must not
+    // outlive the window either (see `Checker.class_static_cut`).
+    const cut = c.class_static_cut;
     var props: std.ArrayList(types.Prop) = .empty;
     defer props.deinit(c.scratch());
     if (c.ts.kind(statics) == .object) {
@@ -1056,7 +1110,8 @@ pub fn classConstructType(c: *Checker, cls: SymbolId) Error!TypeId {
         }
     }
     const obj = try c.ts.makeObjectSigs(props.items, 0, 0, types.obj_flag_not_inferable, &.{}, sigs.items);
-    try c.class_ctor_cache.put(c.cm(), cls, obj);
+    c.class_static_cut = cut;
+    if (!cut) try c.class_ctor_cache.put(c.cm(), cls, obj);
     return obj;
 }
 
