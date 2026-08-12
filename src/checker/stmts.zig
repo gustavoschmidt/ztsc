@@ -715,15 +715,13 @@ pub fn checkFunctionBody(c: *Checker, node: Node, proto_idx: u32, body: Node, si
             const exempt = k == .void or k == .any or k == .err or k == .unknown or k == .none or
                 c.containsUndefinedish(eff_ann);
             if (!exempt) {
-                var rets: std.ArrayList(Node) = .empty;
+                // Only the presence of returns matters here, so the scope
+                // handed over is irrelevant — nothing re-checks the operands.
+                var rets = try c.collectReturns(c.tree.nodeRange(body), binder.file_scope);
                 defer rets.deinit(c.scratch());
-                var bare = false;
-                for (c.tree.nodeRange(body)) |stmt| {
-                    if (stmt != null_node) try c.collectReturns(stmt, &rets, null, &bare, binder.file_scope);
-                }
                 const span = if (proto.name_token != 0) c.tokSpan(proto.name_token) else c.tokSpan(c.tree.nodeMainToken(node));
                 if (!c.stmtListTerminal(c.tree.nodeRange(body))) {
-                    if (rets.items.len == 0 and !bare) {
+                    if (rets.exprs.items.len == 0 and !rets.bare) {
                         try c.diagFmt(2355, span, "A function whose declared type is neither 'undefined', 'void', nor 'any' must return a value.", .{});
                     } else {
                         try c.diagFmt(2366, span, "Function lacks ending return statement and return type does not include 'undefined'.", .{});
@@ -822,7 +820,7 @@ pub fn checkNamespace(c: *Checker, node: Node) Error!void {
 ///
 /// Returns whether the instance side is assignable, i.e. whether the caller
 /// should go on to the static side.
-pub fn checkInstanceSideExtends(c: *Checker, class_sym: SymbolId, members: []const Node, this_t: TypeId, name_token: ast.TokenIndex) Error!bool {
+fn checkInstanceSideExtends(c: *Checker, class_sym: SymbolId, members: []const Node, this_t: TypeId, name_token: ast.TokenIndex) Error!bool {
     const base_ref = try c.baseClassRef(class_sym) orelse return true;
     if (base_ref == types.error_type or base_ref == types.any_type or base_ref == this_t) return true;
     if (try c.hasUnresolvedBase(class_sym)) return true;

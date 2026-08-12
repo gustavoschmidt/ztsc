@@ -726,19 +726,13 @@ pub fn inferReturnType(c: *Checker, fn_node: Node, body: Node, ret_ctx: TypeId) 
         if (ret_ctx != types.no_type) return c.widenToContext(raw, ret_ctx);
         return c.finalizeInferredReturn(try c.widenReturnMember(raw));
     }
-    var rets: std.ArrayList(Node) = .empty;
-    defer rets.deinit(c.scratch());
-    var ret_scopes: std.ArrayList(ScopeId) = .empty;
-    defer ret_scopes.deinit(c.scratch());
-    var bare_return = false;
     // Base scope for the body: a function/arrow body block binds its
     // statements directly in the function scope (no separate block scope),
     // so start from the function's own scope.
     const base_scope = (try c.scopeOf(fn_node)) orelse c.cur_scope;
-    for (c.tree.nodeRange(body)) |stmt| {
-        if (stmt != null_node) try c.collectReturns(stmt, &rets, &ret_scopes, &bare_return, base_scope);
-    }
-    if (rets.items.len == 0) {
+    var rets = try c.collectReturns(c.tree.nodeRange(body), base_scope);
+    defer rets.deinit(c.scratch());
+    if (rets.exprs.items.len == 0) {
         // A block body with no `return` at all whose endpoint is
         // UNREACHABLE never produces a value: tsc infers `never`, not
         // `void` (`getReturnTypeFromBody` → `functionHasImplicitReturn`).
@@ -778,11 +772,11 @@ pub fn inferReturnType(c: *Checker, fn_node: Node, body: Node, ret_ctx: TypeId) 
     // block's locals), not the ambient scope of this type probe.
     const saved_scope = c.cur_scope;
     defer c.cur_scope = saved_scope;
-    for (rets.items, ret_scopes.items) |r, sc| {
+    for (rets.exprs.items, rets.scopes.items) |r, sc| {
         c.cur_scope = sc;
         try parts.append(c.scratch(), try c.checkExprCached(r, ret_ctx));
     }
-    if (bare_return or !c.stmtListTerminal(c.tree.nodeRange(body))) {
+    if (rets.bare or !c.stmtListTerminal(c.tree.nodeRange(body))) {
         try parts.append(c.scratch(), types.undefined_type);
     }
     // The several `return` statements of one function are ONE widening
@@ -820,17 +814,10 @@ pub fn inferGeneratorReturn(c: *Checker, fn_node: Node, body: Node) Error!TypeId
     if (!c.symFlags(gen_sym).interface) return types.any_type;
     if (c.nodeTag(body) != .block) return types.any_type;
 
-    var yields: std.ArrayList(Node) = .empty;
-    defer yields.deinit(c.scratch());
-    var yield_scopes: std.ArrayList(ScopeId) = .empty;
-    defer yield_scopes.deinit(c.scratch());
-    var bare_yield = false;
-    var delegated = false;
     const base_scope = (try c.scopeOf(fn_node)) orelse c.cur_scope;
-    for (c.tree.nodeRange(body)) |stmt| {
-        if (stmt != null_node) try c.collectYields(stmt, &yields, &yield_scopes, &bare_yield, &delegated, base_scope);
-    }
-    if (delegated) return types.any_type;
+    var yields = try c.collectYields(c.tree.nodeRange(body), base_scope);
+    defer yields.deinit(c.scratch());
+    if (yields.delegated) return types.any_type;
 
     var yield_ty: TypeId = types.never_type;
     {
@@ -849,30 +836,71 @@ pub fn inferGeneratorReturn(c: *Checker, fn_node: Node, body: Node) Error!TypeId
         defer c.cur_scope = saved_scope;
         var parts: std.ArrayList(TypeId) = .empty;
         defer parts.deinit(c.scratch());
-        for (yields.items, yield_scopes.items) |y, sc| {
+        for (yields.exprs.items, yields.scopes.items) |y, sc| {
             c.cur_scope = sc;
             try parts.append(c.scratch(), try c.widenLiteral(try c.checkExprCached(y, types.no_type)));
         }
-        if (bare_yield) try parts.append(c.scratch(), types.undefined_type);
+        if (yields.bare) try parts.append(c.scratch(), types.undefined_type);
         yield_ty = try c.ts.makeUnion(c.scratch(), parts.items);
     }
     const ret_ty = try c.inferReturnType(fn_node, body, types.no_type);
     return c.ts.makeRef(gen_sym, &.{ yield_ty, ret_ty, types.unknown_type });
 }
 
-pub fn collectYields(c: *Checker, node: Node, out: *std.ArrayList(Node), out_scopes: *std.ArrayList(ScopeId), bare: *bool, delegated: *bool, scope: ScopeId) Error!void {
+/// The `yield` operands of one generator body: each yielded expression with
+/// the scope it resolves in, whether a BARE `yield` (which contributes
+/// `undefined`) occurred, and whether a `yield*` delegation did — the last
+/// abandons inference entirely, so it is a property of the whole body rather
+/// than of any one site.
+pub const YieldSites = struct {
+    exprs: std.ArrayList(Node) = .empty,
+    scopes: std.ArrayList(ScopeId) = .empty,
+    bare: bool = false,
+    delegated: bool = false,
+
+    pub fn deinit(self: *YieldSites, gpa: std.mem.Allocator) void {
+        self.exprs.deinit(gpa);
+        self.scopes.deinit(gpa);
+    }
+};
+
+/// The `return` sites of one function body: each returned expression with the
+/// scope it resolves in, plus whether a bare `return;` occurred.
+pub const ReturnSites = struct {
+    exprs: std.ArrayList(Node) = .empty,
+    scopes: std.ArrayList(ScopeId) = .empty,
+    bare: bool = false,
+
+    pub fn deinit(self: *ReturnSites, gpa: std.mem.Allocator) void {
+        self.exprs.deinit(gpa);
+        self.scopes.deinit(gpa);
+    }
+};
+
+/// Collect the `yield` sites of the body statements `stmts`, which bind in
+/// `scope`. The caller owns the result (`deinit` with `c.scratch()`).
+pub fn collectYields(c: *Checker, stmts: []const Node, scope: ScopeId) Error!YieldSites {
+    var sites: YieldSites = .{};
+    errdefer sites.deinit(c.scratch());
+    for (stmts) |stmt| {
+        if (stmt != null_node) try walkYields(c, stmt, &sites, scope);
+    }
+    return sites;
+}
+
+fn walkYields(c: *Checker, node: Node, sites: *YieldSites, scope: ScopeId) Error!void {
     if (node == null_node) return;
     switch (c.nodeTag(node)) {
         .yield_expr => {
             const d = c.tree.nodeData(node);
             if (d.rhs != 0) {
-                delegated.* = true;
+                sites.delegated = true;
                 return;
             }
             if (d.lhs != 0) {
-                try out.append(c.scratch(), d.lhs);
-                try out_scopes.append(c.scratch(), scope);
-            } else bare.* = true;
+                try sites.exprs.append(c.scratch(), d.lhs);
+                try sites.scopes.append(c.scratch(), scope);
+            } else sites.bare = true;
         },
         // Don't descend into nested functions/classes: their yields belong
         // to them (and only a generator may contain one at all).
@@ -881,18 +909,29 @@ pub fn collectYields(c: *Checker, node: Node, out: *std.ArrayList(Node), out_sco
     }
     const inner = (try c.scopeOf(node)) orelse scope;
     var it = c.tree.childIterator(node);
-    while (it.next()) |child| try c.collectYields(child, out, out_scopes, bare, delegated, inner);
+    while (it.next()) |child| try walkYields(c, child, sites, inner);
 }
 
-pub fn collectReturns(c: *Checker, node: Node, out: *std.ArrayList(Node), out_scopes: ?*std.ArrayList(ScopeId), bare: *bool, scope: ScopeId) Error!void {
+/// Collect the `return` sites of the body statements `stmts`, which bind in
+/// `scope`. The caller owns the result (`deinit` with `c.scratch()`).
+pub fn collectReturns(c: *Checker, stmts: []const Node, scope: ScopeId) Error!ReturnSites {
+    var sites: ReturnSites = .{};
+    errdefer sites.deinit(c.scratch());
+    for (stmts) |stmt| {
+        if (stmt != null_node) try walkReturns(c, stmt, &sites, scope);
+    }
+    return sites;
+}
+
+fn walkReturns(c: *Checker, node: Node, sites: *ReturnSites, scope: ScopeId) Error!void {
     if (node == null_node) return;
     switch (c.nodeTag(node)) {
         .return_stmt => {
             const d = c.tree.nodeData(node);
             if (d.lhs != 0) {
-                try out.append(c.scratch(), d.lhs);
-                if (out_scopes) |os| try os.append(c.scratch(), scope);
-            } else bare.* = true;
+                try sites.exprs.append(c.scratch(), d.lhs);
+                try sites.scopes.append(c.scratch(), scope);
+            } else sites.bare = true;
             return;
         },
         // Don't descend into nested functions/classes.
@@ -903,7 +942,7 @@ pub fn collectReturns(c: *Checker, node: Node, out: *std.ArrayList(Node), out_sc
     // that construct's scope; track it as we descend.
     const inner = (try c.scopeOf(node)) orelse scope;
     var it = c.tree.childIterator(node);
-    while (it.next()) |child| try c.collectReturns(child, out, out_scopes, bare, inner);
+    while (it.next()) |child| try walkReturns(c, child, sites, inner);
 }
 
 // =====================================================================
