@@ -264,6 +264,14 @@ pub fn buildProgram(
 
 /// Build the sealed per-file link tables and the merged global table. Serial;
 /// results live in `arena`.
+///
+/// **`files` is mutated.** It is taken as `[]ProgFile`, not `[]const`, because
+/// `applyAmbientModulePrecedence` rewrites `f.specs.files`: a specifier claimed
+/// by a global `declare module "spec"` has its resolved FileId cleared, so
+/// every consumer downstream reads the ambient module rather than the file the
+/// resolver found. The patch replaces the slice (the original array is left
+/// alone) and is the only write; after `link` returns, the program is immutable
+/// and shared lock-free by the checkers.
 pub fn link(
     arena: Allocator,
     gpa: Allocator,
@@ -294,11 +302,11 @@ pub fn link(
         .no_unchecked_side_effect_imports = link_opts.no_unchecked_side_effect_imports,
         .types_wildcard = link_opts.types_wildcard,
         .atom_export_equals = interner.intern(io, gpa, "export=") catch return Error.OutOfMemory,
-        .state = try scratch.alloc(u8, files.len),
+        .state = try scratch.alloc(Linker.TableState, files.len),
         .tables = try scratch.alloc(std.AutoArrayHashMapUnmanaged(Atom, Target), files.len),
         .diags = try scratch.alloc(std.ArrayList(LinkDiag), files.len),
     };
-    @memset(l.state, 0);
+    @memset(l.state, .unvisited);
     for (l.tables) |*t| t.* = .empty;
     for (l.diags) |*d| d.* = .empty;
 
@@ -325,10 +333,8 @@ pub fn link(
         try l.reportUnresolvedModules(fid);
         try l.reportModuleGrammar(fid);
 
-        var locals: std.ArrayList(u32) = .empty;
-        var targets: std.ArrayList(Target) = .empty;
-        try l.linkImports(fid, &locals, &targets);
-        try sortByKeyU32(scratch, locals.items, targets.items);
+        const imports = try l.linkImports(fid);
+        try sortByKeyU32(scratch, imports.locals, imports.targets);
 
         // Seal the export table sorted by atom.
         const t = &l.tables[i];
@@ -340,8 +346,8 @@ pub fn link(
         try sortByKeyU32(scratch, atoms, etargets);
 
         out[i] = .{
-            .import_locals = try arena.dupe(u32, locals.items),
-            .import_targets = try arena.dupe(Target, targets.items),
+            .import_locals = try arena.dupe(u32, imports.locals),
+            .import_targets = try arena.dupe(Target, imports.targets),
             .export_atoms = atoms,
             .export_targets = etargets,
             .diags = try arena.dupe(LinkDiag, l.diags[i].items),
@@ -918,8 +924,11 @@ const Linker = struct {
     /// export/ambient table (`export=` can never be a real export name). Skipped
     /// by the namespace-object builders and `export *` merge.
     atom_export_equals: Atom,
-    /// 0 = not built, 1 = building (cycle), 2 = done.
-    state: []u8,
+    /// Per-file export-table build state. `building` is what makes the
+    /// re-export walk cycle-safe: a file that is asked for its table while its
+    /// own is still being built gets the partial table back rather than
+    /// recursing (see `table`).
+    state: []TableState,
     tables: []std.AutoArrayHashMapUnmanaged(Atom, Target),
     diags: []std.ArrayList(LinkDiag),
     /// Ambient/augmentation module registry: specifier atom → export
@@ -944,6 +953,16 @@ const Linker = struct {
     /// TS2305/TS2459/TS2724 — are settled by `resolvePendingReexports`, once
     /// every star merge has run. See the `reexport_named` arm of `table`.
     pending_reexports: std.ArrayListUnmanaged(PendingReexport) = .empty,
+
+    /// One file's import table before it is sealed: parallel arrays of local
+    /// import-binding symbol and resolved `Target`, scratch-owned and in
+    /// statement order (the caller sorts them by key).
+    const ImportLinks = struct { locals: []u32, targets: []Target };
+
+    /// Export-table build state of one file. `building` and `done` answer the
+    /// same way — the table pointer is stable and a cycle reads the partial
+    /// table — but they are distinct so the state means something to a reader.
+    const TableState = enum(u8) { unvisited, building, done };
 
     const visit_limit = 256;
     /// Fixed-point bound for the ambient `export *` merge (`starMergeAmbient`):
@@ -1069,8 +1088,8 @@ const Linker = struct {
 
     /// The flattened export table of `file` (built on demand, cycle-safe).
     fn table(l: *Linker, file: FileId) Error!*std.AutoArrayHashMapUnmanaged(Atom, Target) {
-        if (l.state[file] == 2 or l.state[file] == 1) return &l.tables[file];
-        l.state[file] = 1;
+        if (l.state[file] != .unvisited) return &l.tables[file];
+        l.state[file] = .building;
         const f = &l.files[file];
         const t = &l.tables[file];
 
@@ -1228,7 +1247,7 @@ const Linker = struct {
             }
         }
 
-        l.state[file] = 2;
+        l.state[file] = .done;
         return t;
     }
 
@@ -2041,7 +2060,11 @@ const Linker = struct {
     /// (see `effectiveModuleFile`). Diagnostics fire only when the module is known
     /// (a real file or an ambient declaration); a wholly unknown specifier is
     /// left to `reportUnresolvedModules` (TS2307).
-    fn linkImports(l: *Linker, file: FileId, locals: *std.ArrayList(u32), targets: *std.ArrayList(Target)) Error!void {
+    ///
+    /// Returns the file's whole import table (scratch-owned, statement order).
+    fn linkImports(l: *Linker, file: FileId) Error!ImportLinks {
+        var locals: std.ArrayList(u32) = .empty;
+        var targets: std.ArrayList(Target) = .empty;
         const f = &l.files[file];
         for (f.bind.imports) |rec| {
             if (rec.kind == .side_effect) continue;
@@ -2187,6 +2210,7 @@ const Linker = struct {
             try locals.append(l.scratch, local_sym);
             try targets.append(l.scratch, tgt);
         }
+        return .{ .locals = locals.items, .targets = targets.items };
     }
 };
 

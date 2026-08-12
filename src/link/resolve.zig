@@ -789,6 +789,15 @@ pub const ResolveOpts = struct {
 /// sole thread in `buildProgram`), so the counter is never truly contended,
 /// but it is atomic anyway — cheap insurance against a future parallel caller
 /// and race-free under the test runner's threads.
+///
+/// It stays a module-level global on purpose, unlike `moduleSuffixes`, which
+/// moved onto `ResolveOpts`: a probe is issued from legs that hold no cache
+/// object at all — the uncached `--no-resolve-cache` leg (`Fs.cache == null`)
+/// and the config-time entry points (`resolveTypeDirective`,
+/// `resolveTypesPackageMain`), which run before any `ResolveCache` exists. A
+/// counter on `FsCache` would silently stop counting exactly the probes the
+/// scoreboard exists to compare against. It is a pure observation — no
+/// resolution reads it — so a global costs nothing in answers.
 var fs_probes: std.atomic.Value(u64) = .init(0);
 
 inline fn bumpProbe() void {
