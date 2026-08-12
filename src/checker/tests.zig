@@ -36,7 +36,7 @@ const TestCheck = struct {
     interner: Interner,
     result: Check,
 
-    pub fn init(src: []const u8) !TestCheck {
+    fn init(src: []const u8) !TestCheck {
         var t: TestCheck = undefined;
         t.arena = std.heap.ArenaAllocator.init(testing.allocator);
         errdefer t.arena.deinit();
@@ -51,7 +51,7 @@ const TestCheck = struct {
         return t;
     }
 
-    pub fn deinit(t: *TestCheck) void {
+    fn deinit(t: *TestCheck) void {
         t.interner.deinit(testing.allocator);
         t.arena.deinit();
     }

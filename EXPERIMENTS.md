@@ -8,6 +8,9 @@ recognize when it happens. Where an entry says an implementation was
 built, it was committed in full verified form and then reverted, so the
 code survives in git history rather than dying in a working tree.
 
+The dated instantiation-perf research log lives in docs/perf-log.md, moved
+verbatim from src/checker/prof.zig.
+
 ---
 
 ## Frozen-base lib payload — built, verified, measured out (2026-07-15)

@@ -87,12 +87,12 @@ pub fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr
                 buf[m] = x;
                 m += 1;
             }
-            const sorted = try c.sortMembersStructural(buf[0..m], depth + 1);
+            const sorted = try sortMembersStructural(c, buf[0..m], depth + 1);
             var first = true;
             for (sorted) |x| {
                 if (!first) try w.writeAll(" | ");
                 first = false;
-                try c.printTypeParen(w, x, depth + 1, .union_member);
+                try printTypeParen(c, w, x, depth + 1, .union_member);
             }
             for (all) |x| {
                 if (s.kind(x) != .null) continue;
@@ -108,14 +108,14 @@ pub fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr
             }
         },
         .intersection => {
-            const sorted = try c.sortMembersStructural(s.members(t), depth + 1);
+            const sorted = try sortMembersStructural(c, s.members(t), depth + 1);
             for (sorted, 0..) |x, i| {
                 if (i > 0) try w.writeAll(" & ");
-                try c.printTypeParen(w, x, depth + 1, .isect_member);
+                try printTypeParen(c, w, x, depth + 1, .isect_member);
             }
         },
         .array => {
-            try c.printTypeParen(w, s.arrayElem(t), depth + 1, .operand);
+            try printTypeParen(c, w, s.arrayElem(t), depth + 1, .operand);
             try w.writeAll("[]");
         },
         .tuple => {
@@ -145,12 +145,12 @@ pub fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr
             for (0..ncall) |i| {
                 if (!first) try w.writeAll(" ");
                 first = false;
-                try c.printSigMember(w, s.objectCallSig(t, @intCast(i)), false, depth + 1);
+                try printSigMember(c, w, s.objectCallSig(t, @intCast(i)), false, depth + 1);
             }
             for (0..nconstruct) |i| {
                 if (!first) try w.writeAll(" ");
                 first = false;
-                try c.printSigMember(w, s.objectConstructSig(t, @intCast(i)), true, depth + 1);
+                try printSigMember(c, w, s.objectConstructSig(t, @intCast(i)), true, depth + 1);
             }
             // Properties are *stored* sorted by name atom (canonical for
             // interning), but atom ids depend on the parallel intern order,
@@ -159,7 +159,7 @@ pub fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr
             // names are unique within an object, so this is a total order
             // and byte-identical for any worker/checker count (determinism
             // contract). Storage stays atom-sorted (lookup/interning intact).
-            const order = c.propDisplayOrder(t, n) catch return error.WriteFailed;
+            const order = propDisplayOrder(c, t, n) catch return error.WriteFailed;
             for (order) |i| {
                 const p = s.objectProp(t, i);
                 if (!first) try w.writeAll(" ");
@@ -246,7 +246,7 @@ pub fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr
         .infer_var => try w.print("infer {s}", .{c.atomText(s.inferVarName(t))}),
         .mapped_param => try w.print("{s}", .{c.atomText(s.mappedParamName(t))}),
         .index_access => {
-            try c.printTypeParen(w, s.indexAccessObj(t), depth + 1, .operand);
+            try printTypeParen(c, w, s.indexAccessObj(t), depth + 1, .operand);
             try w.writeAll("[");
             try c.printType(w, s.indexAccessIndex(t), depth + 1);
             try w.writeAll("]");
@@ -266,9 +266,9 @@ pub fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr
             try w.writeAll(" }");
         },
         .conditional => {
-            try c.printTypeParen(w, s.condCheck(t), depth + 1, .operand);
+            try printTypeParen(c, w, s.condCheck(t), depth + 1, .operand);
             try w.writeAll(" extends ");
-            try c.printTypeParen(w, s.condExtends(t), depth + 1, .operand);
+            try printTypeParen(c, w, s.condExtends(t), depth + 1, .operand);
             try w.writeAll(" ? ");
             try c.printType(w, s.condTrue(t), depth + 1);
             try w.writeAll(" : ");
@@ -292,12 +292,12 @@ pub fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr
         },
         .keyof_op => {
             try w.writeAll("keyof ");
-            try c.printTypeParen(w, s.keyofOperand(t), depth + 1, .operand);
+            try printTypeParen(c, w, s.keyofOperand(t), depth + 1, .operand);
         },
     }
 }
 
-pub fn stringMappingName(kind_idx: u32) []const u8 {
+fn stringMappingName(kind_idx: u32) []const u8 {
     return switch (kind_idx) {
         types.string_mapping_uppercase => "Uppercase",
         types.string_mapping_lowercase => "Lowercase",
@@ -309,7 +309,7 @@ pub fn stringMappingName(kind_idx: u32) []const u8 {
 
 /// Print a call/construct signature in object-member form:
 /// `<T>(a: A): R;` for a call sig, `new <T>(a: A): R;` for a construct sig.
-pub fn printSigMember(c: *Checker, w: *std.Io.Writer, sig: TypeId, is_construct: bool, depth: u32) PrintErr!void {
+fn printSigMember(c: *Checker, w: *std.Io.Writer, sig: TypeId, is_construct: bool, depth: u32) PrintErr!void {
     const s = c.ts;
     if (is_construct) try w.writeAll("new ");
     const tps = s.fnTypeParams(sig);
@@ -340,9 +340,9 @@ pub fn printSigMember(c: *Checker, w: *std.Io.Writer, sig: TypeId, is_construct:
 /// `&` binds tighter than `|`, so an intersection needs no parens inside a
 /// union but a union DOES need them inside an intersection (`(B | C) & A`,
 /// not `B | C & A`, which reads as `B | (C & A)`).
-pub const PrintPos = enum { union_member, isect_member, operand };
+const PrintPos = enum { union_member, isect_member, operand };
 
-pub fn printTypeParen(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32, pos: PrintPos) PrintErr!void {
+fn printTypeParen(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32, pos: PrintPos) PrintErr!void {
     const needs = switch (c.ts.kind(t)) {
         .function => true,
         .union_type => pos != .union_member,
@@ -356,11 +356,11 @@ pub fn printTypeParen(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32, pos
 
 /// One display-time member of a union/intersection paired with its
 /// structural sort key.
-pub const DisplayMember = struct { ty: TypeId, key: []const u8 };
+const DisplayMember = struct { ty: TypeId, key: []const u8 };
 
 /// Order-preserving 8-byte big-endian encoding of an f64 so number-literal
 /// sort keys compare numerically as raw bytes (`-1` < `0` < `2` < `10`).
-pub fn encodeF64Key(v: f64) [8]u8 {
+fn encodeF64Key(v: f64) [8]u8 {
     var bits: u64 = @bitCast(v);
     bits = if (bits >> 63 != 0) ~bits else bits | (@as(u64, 1) << 63);
     var out: [8]u8 = undefined;
@@ -376,12 +376,12 @@ pub fn encodeF64Key(v: f64) [8]u8 {
 /// text, never raw TypeIds) for everything else. Keying on *structure*, not
 /// on id assignment, is what keeps union/intersection display order stable
 /// when lib types are relocated to low base ids.
-pub fn writeSortKey(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr!void {
+fn writeSortKey(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr!void {
     const k = c.ts.kind(t);
     try w.writeByte(@intFromEnum(k));
     if (depth > 6) return;
     switch (k) {
-        .array => try c.writeSortKey(w, c.ts.arrayElem(t), depth + 1),
+        .array => try writeSortKey(c, w, c.ts.arrayElem(t), depth + 1),
         .number_literal, .number_literal_fresh => try w.writeAll(&encodeF64Key(c.ts.numberValue(t))),
         // Render the key at *exactly* the display depth (`depth`, not
         // `depth + 1`): union/intersection members are displayed via
@@ -401,12 +401,12 @@ pub fn writeSortKey(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) Print
 /// scratch-owned slice of the reordered TypeIds is returned. Members that
 /// render identically produce equal keys and print byte-identically either
 /// way, so an unstable sort stays deterministic.
-pub fn sortMembersStructural(c: *Checker, members: []const TypeId, depth: u32) PrintErr![]TypeId {
+fn sortMembersStructural(c: *Checker, members: []const TypeId, depth: u32) PrintErr![]TypeId {
     const sc = c.scratch();
     const items = sc.alloc(DisplayMember, members.len) catch return error.WriteFailed;
     for (members, 0..) |mem, i| {
         var aw: std.Io.Writer.Allocating = .init(sc);
-        try c.writeSortKey(&aw.writer, mem, depth);
+        try writeSortKey(c, &aw.writer, mem, depth);
         items[i] = .{ .ty = mem, .key = aw.written() };
     }
     std.mem.sort(DisplayMember, items, {}, struct {
@@ -428,7 +428,7 @@ pub fn sortMembersStructural(c: *Checker, members: []const TypeId, depth: u32) P
 /// content-derived and therefore byte-identical for any worker/checker count
 /// either way. Names are unique within an object, so the order
 /// is total (an unstable sort stays deterministic). Scratch-owned slice.
-pub fn propDisplayOrder(c: *Checker, t: TypeId, n: usize) Error![]u32 {
+fn propDisplayOrder(c: *Checker, t: TypeId, n: usize) Error![]u32 {
     const order = try c.scratch().alloc(u32, n);
     for (order, 0..) |*x, i| x.* = @intCast(i);
     const Ctx = struct { c: *Checker, t: TypeId };

@@ -38,10 +38,10 @@ pub fn enabled() bool {
 
 /// One sample of a checker's own footprint, taken at a top-level statement
 /// boundary.
-pub const Sample = struct { ns: u64, bytes: u64 };
+const Sample = struct { ns: u64, bytes: u64 };
 
 /// Hands each instance a stable printable id, in spawn order.
-pub var next_index: std.atomic.Value(u32) = .init(0);
+var next_index: std.atomic.Value(u32) = .init(0);
 
 pub const MemProf = struct {
     on: bool = false,
@@ -81,7 +81,7 @@ fn entriesOf(v: anytype) u64 {
 
 /// Bytes the type store's own arrays hold, at capacity (overlay only — a
 /// frozen base is shared by every checker and counted once).
-pub fn storeBytes(c: *const Checker) u64 {
+fn storeBytes(c: *const Checker) u64 {
     const s = &c.ts;
     return bytesOf(s.kinds) + bytesOf(s.data_a) + bytesOf(s.data_b) +
         bytesOf(s.extra) + bytesOf(s.shape_hash) + bytesOf(s.pending) + bytesOf(s.map);
@@ -90,7 +90,7 @@ pub fn storeBytes(c: *const Checker) u64 {
 /// Everything this checker instance holds that it can name, at capacity.
 /// Deliberately cheap (a few dozen `capacity` reads), so it can be sampled at
 /// every top-level statement.
-pub fn ownBytes(c: *const Checker) u64 {
+fn ownBytes(c: *const Checker) u64 {
     var n: u64 = storeBytes(c);
     inline for (checker_zig.map_containers) |f| n += bytesOf(@field(c, f));
     n += c.carena.queryCapacity();

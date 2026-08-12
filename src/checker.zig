@@ -61,7 +61,6 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const ast = @import("frontend/ast.zig");
-const scanner = @import("frontend/scanner.zig");
 const intern = @import("intern.zig");
 const binder = @import("frontend/binder.zig");
 const types = @import("types.zig");
@@ -98,7 +97,7 @@ pub const FileId = modules.FileId;
 /// load-bearing: `sym_state` is a demand-zeroed `ZeroPagedArray`, so an
 /// untouched entry reads as `.not_computed` without ever being written — and
 /// without faulting its page resident. Do not reorder or renumber.
-pub const SymState = enum(u8) {
+const SymState = enum(u8) {
     not_computed = 0,
     in_progress = 1,
     computed = 2,
@@ -175,7 +174,9 @@ pub const Check = struct {
 };
 
 /// Type-check one bound file with an unlinked single-file program
-/// (imports type as `any`; no module diagnostics). Diagnostics and message
+/// (imports type as `any`; no module diagnostics). Exists for
+/// `checker/tests.zig`, whose cases are single files with no link step;
+/// every real entry point goes through `checkFiles`. Diagnostics and message
 /// strings go into `arena`; all type storage and caches live in an
 /// internal checker arena that is freed on return (the caller keeps only
 /// diagnostics + stats). Total on arbitrary parser/binder output: never
@@ -240,27 +241,6 @@ pub fn checkFilesAndDump(
         try w.print(";; {s}\n", .{prog.files[f].path});
         try c.dumpTypes(w);
     }
-    return c.seal();
-}
-
-/// Like `check`, but also renders `--dump-types` output (one
-/// `name: type` line per file-scope value declaration) into `w`.
-pub fn checkAndDump(
-    arena: Allocator,
-    io: Io,
-    gpa: Allocator,
-    interner: *Interner,
-    tree: *const Ast,
-    bind: *const Bind,
-    src: []const u8,
-    w: *std.Io.Writer,
-) (Error || std.Io.Writer.Error)!Check {
-    const prog = try arena.create(modules.Program);
-    prog.* = try modules.singleFileProgram(arena, "", src, tree, bind);
-    var c = try Checker.init(arena, io, gpa, interner, prog, &.{0}, null, true, 0);
-    defer c.deinit();
-    try c.run();
-    try c.dumpTypes(w);
     return c.seal();
 }
 
@@ -525,7 +505,7 @@ pub const rel_id_buckets = 64;
 /// One live relation frame's recursion identity for one side: the generic
 /// (`sym`) and the exact instantiation of it (`ref`, the interned origin ref).
 /// `relIdDeeplyNested` counts occurrences of `sym` whose `ref` keeps growing.
-pub const RelId = struct { sym: SymbolId, ref: TypeId };
+const RelId = struct { sym: SymbolId, ref: TypeId };
 /// Recursion-depth cap for alias-instance expansion (`aliasInstance`; see the
 /// `alias_depth` field). Fires only on pathological mutually-recursive generic
 /// alias chains (e.g. `@scalar/typebox`'s conditional type modules, whose
@@ -538,7 +518,7 @@ pub const RelId = struct { sym: SymbolId, ref: TypeId };
 pub const max_alias_depth = 200;
 pub const max_type_string = 160;
 
-pub const FnCtx = struct {
+const FnCtx = struct {
     /// Effective return-check target (0 = none / inferring). For an async
     /// function this is the awaited *payload* `T` of the declared
     /// `Promise<T>`, not the `Promise<T>` itself.
@@ -634,13 +614,13 @@ pub const PendingTypeArgs = struct {
 
 /// A memoized expression type together with the contextual type it was
 /// synthesized under (contextual re-check cache).
-pub const NodeType = struct { ty: TypeId, ctx: TypeId };
+const NodeType = struct { ty: TypeId, ctx: TypeId };
 
 /// One in-progress `interfaceGeneric` resolution (base-cycle detection).
-pub const IfaceFrame = struct { sym: SymbolId, resolving_base: bool = false };
+const IfaceFrame = struct { sym: SymbolId, resolving_base: bool = false };
 
 /// One in-progress `classStaticType` build (see `class_static_stack`).
-pub const StaticFrame = struct { sym: SymbolId, in_base: bool = false };
+const StaticFrame = struct { sym: SymbolId, in_base: bool = false };
 
 /// How deep `classStaticType` may nest before it cuts the base fold outright.
 /// A backstop only: the deepest real chain measured (outline's sequelize
@@ -811,7 +791,7 @@ pub const map_containers = [_][]const u8{
 pub const EnumMemberEntry = struct { name: Atom, value: TypeId };
 /// A memoized `keyof <object table>`, tagged with the `key_name_types`
 /// generation it was computed under — see `Checker.keyof_obj_cache`.
-pub const KeyofEntry = struct { ty: TypeId, gen: u32 };
+const KeyofEntry = struct { ty: TypeId, gen: u32 };
 
 /// Hash context for a DENSE INTEGER key — one 64-bit avalanche instead of
 /// `AutoContext`'s Wyhash over the key's bytes.
@@ -2643,7 +2623,7 @@ pub const Checker = struct {
     /// file/scope context: a lazy demand that crosses into another file must
     /// not carry the demanding frame's `this` — nor spend the demanding
     /// frame's budget — with it (see `enterSymFile`).
-    pub const SavedCtx = struct {
+    const SavedCtx = struct {
         file: FileId,
         scope: ScopeId,
         this_type: TypeId,
@@ -2882,58 +2862,8 @@ pub const Checker = struct {
     // small helpers
     // =====================================================================
 
-    pub fn atom(c: *Checker, text: []const u8) Error!Atom {
-        const gop = try c.atom_cache.getOrPut(c.cm(), text);
-        if (!gop.found_existing) {
-            gop.value_ptr.* = try c.interner.intern(c.io, c.gpa, text);
-        }
-        return gop.value_ptr.*;
-    }
-
-    /// Intern text from a *transient* buffer (a scratch/stack slice). Goes
-    /// straight to the interner (which copies the bytes) instead of `atom`,
-    /// whose `atom_cache` would otherwise store the caller's slice as a key and
-    /// dangle once the buffer is freed. Use for any computed/temporary string.
-    pub fn internText(c: *Checker, text: []const u8) Error!Atom {
-        return c.interner.intern(c.io, c.gpa, text);
-    }
-
-    pub fn atomText(c: *Checker, a: Atom) []const u8 {
-        if (a == 0) return "";
-        return c.interner.lookup(c.io, a);
-    }
-
     pub fn tokenText(c: *const Checker, tok: TokenIndex) []const u8 {
         return c.tree.tokenSlice(c.src, tok);
-    }
-
-    pub fn atomOfToken(c: *Checker, tok: TokenIndex) Error!Atom {
-        return c.atom(c.tokenText(tok));
-    }
-
-    /// Property-name atom: string keys lose quotes.
-    pub fn memberAtom(c: *Checker, tok: TokenIndex) Error!Atom {
-        const text = c.tokenText(tok);
-        switch (c.tree.tokens.tag(tok)) {
-            // `.jsx_string` is a JSX attribute's quoted value.
-            .string_literal, .jsx_string => return c.atom(stripQuotes(text)),
-            else => return c.atom(text),
-        }
-    }
-
-    /// Member-name atom honoring a `[Symbol.iterator]` computed key (mirrors the
-    /// binder's `memberKey`): with the `computed` flag set, `tok` names the
-    /// well-known symbol and the member is keyed by a synthetic `__@name` atom.
-    pub fn memberKey(c: *Checker, tok: TokenIndex, flags: u32) Error!Atom {
-        if (flags & ast.Flags.computed_sym != 0) {
-            // `[k]` / `[a.b]` computed key naming a const `unique symbol`:
-            // resolve it in the current scope to its nominal `__@u<id>` atom.
-            return c.computedSymKey(tok, flags, c.cur_scope);
-        }
-        if (flags & ast.Flags.computed != 0) {
-            if (ast.wellKnownSymbolKey(c.tokenText(tok))) |k| return c.atom(k);
-        }
-        return c.memberAtom(tok);
     }
 
     /// Nominal `unique symbol` type for the `unique symbol` annotation node
@@ -2949,267 +2879,6 @@ pub const Checker = struct {
     /// partition. A global node id is a property of the program.
     pub fn uniqueSymType(c: *Checker, ann: Node) Error!TypeId {
         return c.ts.makeUniqueSymbol(c.node_base[c.cur_file] + ann);
-    }
-
-    /// Synthetic member atom for a value whose type is a `unique symbol`, so a
-    /// computed key `{ [k]: … }` and an element access `o[k]` agree on the
-    /// property name. `__@` cannot begin a real identifier, so it never
-    /// collides with an ordinary member (mirrors `wellKnownSymbolKey`).
-    pub fn uniqueSymAtom(c: *Checker, t: TypeId) Error!?Atom {
-        const r = try c.ts.regular(t);
-        if (c.ts.kind(r) != .unique_symbol) return null;
-        var buf: [24]u8 = undefined;
-        const s = std.fmt.bufPrint(&buf, "__@u{d}", .{c.ts.uniqueSymId(r)}) catch unreachable;
-        return try c.internText(s); // stack buffer: copy, don't store as a cache key
-    }
-
-    /// Prefix of a computed-key placeholder atom (see `computedSymPlaceholder`).
-    pub const computed_sym_prefix = "__@k$";
-
-    /// The member name a computed key `[expr]` denotes when `expr`'s type is a
-    /// LITERAL — tsc's late-bound name rule (`isLateBindableName`: a computed
-    /// name is bindable when its type is a string literal, a numeric literal,
-    /// or a unique symbol). A string enum member counts: `[E.A]` with
-    /// `A = "a"` declares the property `"a"`, and `keyof` over such a map is
-    /// the union of the VALUES, not of anything derived from how the keys were
-    /// spelled.
-    ///
-    /// Sibling of `uniqueSymAtom`, which covers the third case. Without this
-    /// one, every `{ [E.A]: T }` map kept the syntactic placeholder as its
-    /// member name, so `m.a` was TS2339, `keyof M` printed the placeholders
-    /// back at the user, and no `E`-typed key was assignable to it.
-    pub fn literalKeyAtom(c: *Checker, ty: TypeId) Error!?Atom {
-        const r = try c.ts.regular(ty);
-        switch (c.ts.kind(r)) {
-            .string_literal => return c.ts.literalAtom(r),
-            .number_literal, .number_literal_fresh => {
-                var buf: [32]u8 = undefined;
-                var w = std.Io.Writer.fixed(&buf);
-                print_zig.printNumber(&w, c.ts.numberValue(r)) catch return null;
-                // Stack buffer: `internText` copies. `atom` would keep the
-                // transient slice as an `atom_cache` key and dangle.
-                return try c.internText(w.buffered());
-            },
-            // An enum MEMBER stands for its own constant value; a whole enum
-            // type (or a computed member with no constant) does not.
-            .enum_type => {
-                if (!c.ts.isEnumMember(r)) return null;
-                const v = (try c.enumMemberValue(c.ts.enumSymbol(r), c.ts.enumMemberAtom(r))) orelse return null;
-                if (v == r) return null; // no self-recursion on an opaque member
-                return c.literalKeyAtom(v);
-            },
-            else => return null,
-        }
-    }
-
-    /// The nominal member atom a computed-key expression of type `ty` denotes:
-    /// the `__@u<id>` of a `unique symbol`, else the literal name it spells
-    /// out. Null when `ty` is neither, and the caller falls back to the
-    /// syntactic placeholder.
-    pub fn computedKeyAtomOfType(c: *Checker, ty: TypeId) Error!?Atom {
-        if (try c.uniqueSymAtom(ty)) |a| return a;
-        return c.literalKeyAtom(ty);
-    }
-
-    /// Placeholder member atom for a computed const-`unique symbol` key, keyed
-    /// by the identifier text (matches the binder's `computedSymPlaceholder`).
-    /// Used as a lenient fallback when the key identifier can't be resolved to
-    /// a `unique symbol` (e.g. a plain `symbol`, or an unresolved import): the
-    /// member still exists and is keyed by name, degrading nominal identity to
-    /// same-name matching rather than emitting a spurious error.
-    pub fn computedSymPlaceholder(c: *Checker, name: []const u8) Error!Atom {
-        const s = try std.fmt.allocPrint(c.scratch(), "{s}{s}", .{ computed_sym_prefix, name });
-        return c.internText(s); // scratch slice: copy, don't store as a cache key
-    }
-
-    /// Resolve a computed-key identifier `name` (a `[k]` key) in `scope` to the
-    /// member atom it denotes: the nominal `__@u<id>` of a const `unique
-    /// symbol`, or the literal name a string/number-literal constant spells out
-    /// (`computedKeyAtomOfType`). Returns null when it is neither — the caller
-    /// then falls back to the name placeholder. Resolution goes through the value
-    /// space and `typeOfSymbol`, so an imported key resolves to the *declaring*
-    /// site's nominal id, giving cross-file key identity for free.
-    pub fn constSymbolKeyAtom(c: *Checker, name: []const u8, scope: ScopeId) Error!?Atom {
-        const ty = (try c.constSymbolKeyType(name, scope)) orelse return null;
-        return c.computedKeyAtomOfType(ty);
-    }
-
-    /// The TYPE a computed-key identifier denotes — the resolution half of
-    /// `constSymbolKeyAtom`, split out because the key's type is also its
-    /// tsc `nameType` (see `memberNameType`): `[E.A]` is keyed by the atom
-    /// `"AV1"` but NAMED by the enum-member literal `E.A`, and `keyof` has to
-    /// report the latter.
-    pub fn constSymbolKeyType(c: *Checker, name: []const u8, scope: ScopeId) Error!?TypeId {
-        if (std.mem.indexOfScalar(u8, name, '.')) |dot| {
-            // Qualified `[a.b]` key: resolve `a` in the value space, then find
-            // the member *symbol* `b` directly on it (class statics, namespace
-            // exports). Symbol-level lookup goes through `typeOfSymbol`'s
-            // per-member guard, so a self-referential key (`[C.k]` inside `C`
-            // itself, node's `[EventEmitter.captureRejectionSymbol]`) resolves
-            // nominally without re-entering the class-static materialization.
-            // `name` may live in scratch (see `computedSymKey`): intern the
-            // pieces via `internText` — `atom` would store the transient
-            // slice as an `atom_cache` key and dangle after a scratch reset.
-            const obj = switch (c.resolveSpace(try c.internText(name[0..dot]), scope, true)) {
-                .sym => |s| s,
-                else => return null,
-            };
-            const member = try c.internText(name[dot + 1 ..]);
-            if (c.qualifiedKeyMemberSym(obj, member)) |msym| {
-                return try c.typeOfSymbol(msym);
-            }
-            // Fallback for a base that is not itself a class/namespace (an
-            // import binding, or a var whose *type* carries the member —
-            // rxjs's `[Symbol.observable]` on `var Symbol: SymbolConstructor`):
-            // materialize the base's type. Depth-bounded: an alias cycle
-            // re-resolving the same key degrades to the placeholder.
-            if (c.computed_key_depth >= 4) return null;
-            c.computed_key_depth += 1;
-            defer c.computed_key_depth -= 1;
-            const p = (try c.propOfType(try c.typeOfSymbol(obj), member)) orelse return null;
-            return p.ty;
-        }
-        const a = try c.atom(name);
-        const sym = switch (c.resolveSpace(a, scope, true)) {
-            .sym => |s| s,
-            // A TYPE-ONLY import of a const (`import { type ID as K }`, then
-            // `{ [K]?: boolean }`) has no VALUE meaning, so the value-space
-            // lookup misses it and the key degraded to the name placeholder —
-            // which is a plain string atom, so `keyof` reported
-            // `"__@k$…"` where tsc reports the enum-member literal.
-            // tsc's `isLateBindableName` resolves the entity name through the
-            // alias and reads the target's literal type regardless of the
-            // type-only modifier. Restricted to an IMPORT BINDING so a real
-            // type name in key position still falls back to the placeholder.
-            else => blk: {
-                const t = switch (c.resolveSpace(a, scope, false)) {
-                    .sym => |s| s,
-                    else => return null,
-                };
-                if (!c.symFlags(t).import_binding) return null;
-                break :blk t;
-            },
-        };
-        return try c.typeOfSymbol(sym);
-    }
-
-    /// tsc's `symbol.links.nameType` for a member whose DECLARATION name is
-    /// not the plain string literal of the atom it is keyed by — tsc's
-    /// `getLiteralTypeFromPropertyName`, which types the name node itself
-    /// rather than the escaped name. Two cases:
-    ///
-    ///   * a computed ENUM-MEMBER key (`{ [E.A]: T }`). A member table keys by
-    ///     atom, and an enum member's atom is its VALUE (`"AV1"`), so `keyof`
-    ///     read back a plain string-literal union and lost the enum's identity
-    ///     — `T extends keyof M` then did not satisfy `T extends E`.
-    ///   * a NUMERIC name (`{ 200: T }`, `{ [200]: T }`, `[k]` with
-    ///     `const k = 200`). tsc checks the numeric literal, so the key type
-    ///     is the NUMBER literal `200`; a QUOTED `{ "200": T }` names the
-    ///     string `"200"` and is unaffected (verified against tsc: the two
-    ///     spell different key sets and neither is assignable to the other).
-    ///     Without it octokit's `SuccessStatuses & keyof Responses` — numeric
-    ///     status codes on both sides — intersected to `never` and every
-    ///     `Endpoints[…]["response"]` read came out `unknown`.
-    ///
-    /// Returns `no_type` for every other key, which is every key that names
-    /// itself: an ordinary identifier or string key. A `unique symbol` key is
-    /// already nominal through its `__@u<id>` atom.
-    pub fn memberNameType(c: *Checker, tok: TokenIndex, flags: u32) Error!TypeId {
-        if (flags & ast.Flags.computed_sym == 0) {
-            // A plain (`200:`) or computed (`[200]:`) numeric name. Both key
-            // the table by the digits `memberAtom` interns, so the numeric
-            // literal is only the right name type when those digits ARE the
-            // number's canonical rendering: `{ 0x10: T }` / `{ 1e3: T }` are
-            // keyed `"0x10"` / `"1e3"` here where tsc keys them `"16"` /
-            // `"1000"`, and naming them `16` / `1000` would leave the key type
-            // and the member name disagreeing — a key `keyof` reports that no
-            // indexed access can read. Those stay as they were (see the
-            // `memberAtom` normalization gap).
-            if (c.tree.tokens.tag(tok) != .numeric_literal) return types.no_type;
-            return c.numericNameType(c.numberTokenValue(tok), c.tokenText(tok));
-        }
-        const name = if (flags & ast.Flags.computed_sym_qual != 0)
-            try std.fmt.allocPrint(c.scratch(), "{s}.{s}", .{ c.tokenText(tok - 2), c.tokenText(tok) })
-        else
-            c.tokenText(tok);
-        const ty = (try c.constSymbolKeyType(name, c.cur_scope)) orelse return types.no_type;
-        const r = try c.ts.regular(ty);
-        switch (c.ts.kind(r)) {
-            // `[k]` with `const k = 200`: `literalKeyAtom` keys the member by
-            // the canonical rendering already, so the numeric literal always
-            // agrees with the atom. `ts.regular` only sheds an OBJECT's
-            // freshness, so a fresh literal needs `regularLiteral`.
-            .number_literal, .number_literal_fresh => return c.ts.regularLiteral(r),
-            .enum_type => if (c.ts.isEnumMember(r)) return r,
-            else => {},
-        }
-        return types.no_type;
-    }
-
-    /// The NUMBER literal type a numeric member name denotes, or `no_type`
-    /// when `text` is not that number's canonical rendering — the atom the
-    /// member is keyed by. See `memberNameType`.
-    pub fn numericNameType(c: *Checker, value: f64, text: []const u8) Error!TypeId {
-        var buf: [32]u8 = undefined;
-        var w = std.Io.Writer.fixed(&buf);
-        print_zig.printNumber(&w, value) catch return types.no_type;
-        if (!std.mem.eql(u8, w.buffered(), text)) return types.no_type;
-        return c.ts.makeNumberLiteral(value, false);
-    }
-
-    /// Member symbol `name` of `obj` for qualified computed-key resolution:
-    /// a class's static (own class, or the class constituent of a merge), or
-    /// a namespace export. Null when `obj` is neither, or the member is
-    /// absent — the caller then falls back to type materialization.
-    pub fn qualifiedKeyMemberSym(c: *Checker, obj: SymbolId, name: Atom) ?SymbolId {
-        if (c.prog.isMergedId(obj)) {
-            const m = c.prog.mergedSym(obj);
-            for (m.parts) |p| {
-                if (c.symFlags(p).class) {
-                    if (c.classStaticMemberSym(p, name)) |s| return s;
-                }
-            }
-            if (m.flags.namespace_decl) return c.namespaceMemberSym(obj, name);
-            return null;
-        }
-        const f = c.symFlags(obj);
-        if (f.class) {
-            if (c.classStaticMemberSym(obj, name)) |s| return s;
-        }
-        if (f.namespace_decl) return c.namespaceMemberSym(obj, name);
-        return null;
-    }
-
-    /// Static member `name` of class `cls` as a global symbol id, or null.
-    pub fn classStaticMemberSym(c: *Checker, cls: SymbolId, name: Atom) ?SymbolId {
-        const cb = c.symBind(cls);
-        const ss = cb.staticsScopeOf(c.localOf(cls)) orelse return null;
-        const local = cb.lookupInScope(ss, name) orelse return null;
-        return c.toGlobalIn(c.symFile(cls), local);
-    }
-
-    /// Final member atom for a computed const-symbol key token, resolved in
-    /// `scope`: the nominal `__@u<id>` when the key denotes a `unique symbol`,
-    /// else the name placeholder. For a qualified `[a.b]` key the object
-    /// identifier sits two tokens before the member identifier (see parser).
-    pub fn computedSymKey(c: *Checker, tok: TokenIndex, flags: u32, scope: ScopeId) Error!Atom {
-        const name = if (flags & ast.Flags.computed_sym_qual != 0)
-            try std.fmt.allocPrint(c.scratch(), "{s}.{s}", .{ c.tokenText(tok - 2), c.tokenText(tok) })
-        else
-            c.tokenText(tok);
-        if (try c.constSymbolKeyAtom(name, scope)) |k| return k;
-        return c.computedSymPlaceholder(name);
-    }
-
-    /// Rekey a bound member atom (from the binder's member index) to its
-    /// nominal `__@u<id>` when it is a computed-key placeholder; otherwise
-    /// return it unchanged. `scope` must reach the key identifier's binding.
-    pub fn nominalizeComputedKey(c: *Checker, name: Atom, scope: ScopeId) Error!Atom {
-        const text = c.atomText(name);
-        if (!std.mem.startsWith(u8, text, computed_sym_prefix)) return name;
-        const ident = text[computed_sym_prefix.len..];
-        if (try c.constSymbolKeyAtom(ident, scope)) |k| return k;
-        return name;
     }
 
     /// Resolve a declaration's type annotation that is allowed to be a
@@ -3254,294 +2923,8 @@ pub const Checker = struct {
         }
     }
 
-    /// If `node` is syntactically `Symbol.<wellKnownName>` (e.g.
-    /// `Symbol.iterator`), returns the synthetic member key `__@<name>` used by
-    /// the declaration side (`ast.wellKnownSymbolKey`). Matches the identifier
-    /// text `Symbol` like the binder/parser do — a purely syntactic recognizer,
-    /// independent of whether the real lib types `Symbol.iterator` as a
-    /// `unique symbol`.
-    pub fn wellKnownKeyOfExpr(c: *const Checker, node: Node) ?[]const u8 {
-        if (node == null_node or c.nodeTag(node) != .member_expr) return null;
-        const md = c.tree.nodeData(node);
-        if (c.nodeTag(md.lhs) != .identifier) return null;
-        if (!std.mem.eql(u8, c.tokenText(c.tree.nodeMainToken(md.lhs)), "Symbol")) return null;
-        return ast.wellKnownSymbolKey(c.tokenText(md.rhs));
-    }
-
-    pub fn stripQuotes(text: []const u8) []const u8 {
-        if (text.len >= 2 and (text[0] == '"' or text[0] == '\'')) {
-            if (text[text.len - 1] == text[0]) return text[1 .. text.len - 1];
-            return text[1..];
-        }
-        if (text.len >= 1 and (text[0] == '"' or text[0] == '\'')) return text[1..];
-        return text;
-    }
-
-    pub fn tokSpan(c: *const Checker, tok: TokenIndex) Span {
-        const start = c.tree.tokens.start(tok);
-        return .{ .start = start, .end = scanner.tokenEnd(c.src, c.tree.tokens.tag(tok), start) };
-    }
-
-    pub fn nodeSpan(c: *const Checker, node: Node) Span {
-        return c.tree.span(c.src, node);
-    }
-
-    /// `nodeSpan(node).start` without the O(subtree) walk where the AST
-    /// shape makes the start derivable from `main_token`. Debug builds
-    /// cross-check every fast answer against the real span, so a wrong
-    /// `Ast.spanStart` arm trips the conformance suite instead of silently
-    /// moving a diagnostic.
-    pub fn nodeSpanStart(c: *const Checker, node: Node) u32 {
-        if (c.tree.spanStart(node)) |start| {
-            if (std.debug.runtime_safety) std.debug.assert(start == c.nodeSpan(node).start);
-            return start;
-        }
-        return c.nodeSpan(node).start;
-    }
-
-    /// Deferred `inst_span`: either a node (span computed on demand) or an
-    /// explicit span pushed by a caller that has one in hand already. Both
-    /// carry the file they were recorded in — a byte offset is only a
-    /// position in the tree it came from.
-    pub const InstAnchor = union(enum) {
-        node: struct { file: FileId, node: Node },
-        span: struct { file: FileId, span: Span },
-    };
-
-    /// The anchor resolved to the (file, span) pair it was recorded at.
-    ///
-    /// Materializing a type switches the current-file context
-    /// (`enterSymFile`) without moving the anchor, so a limit tripped deep
-    /// inside a foreign declaration still carries the *demand* site's node —
-    /// and the demand site is the position to report. `cur_file` at the
-    /// moment of the trip is not: whether the expansion happened to route
-    /// through a foreign declaration, rather than meeting this checker's
-    /// already-materialized copy of it, is a property of the partition.
-    /// The anchor's own file is the only frame its byte offset means
-    /// anything in, so the span is computed against that file's tree and
-    /// source rather than `c.tree`/`c.src`, which follow `cur_file`.
-    pub fn instSpanHere(c: *const Checker) struct { FileId, Span } {
-        return switch (c.inst_anchor) {
-            .span => |s| .{ s.file, s.span },
-            .node => |n| .{ n.file, c.prog.files[n.file].tree.span(c.prog.files[n.file].src, n.node) },
-        };
-    }
-
-    /// Whether an instantiation-budget trip happening *right now* is a
-    /// user-facing TS2589, or a silent "no evidence" cut. Every guard site
-    /// that would `instLimitDiag(2589, …)` asks this first.
-    ///
-    /// The two are different questions and tsc keeps them apart by WHERE the
-    /// recursion is detected. At the CHECKING level — materializing an
-    /// annotation, a cast, a call's return — tsc's `instantiateType` guard
-    /// (`instantiationDepth`/`instantiationCount`) reports
-    /// `Type_instantiation_is_excessively_deep_and_possibly_infinite` and
-    /// hands back `errorType`. Inside the assignability RELATION it does not:
-    /// `recursiveTypeRelatedTo` detects a same-symbol recursion with
-    /// `isDeeplyNestedType` and answers `Ternary.Maybe` — the pair is assumed
-    /// related, silently, with no diagnostic and nothing cached. A relation is
-    /// a *question*, and running out of budget while answering it is an
-    /// absence of evidence, not a property of the program.
-    ///
-    /// ztsc needs the separation more than tsc does, because its relation asks
-    /// for orders of magnitude more instantiation than tsc's: ztsc substitutes
-    /// eagerly and structurally where tsc defers. Relating one pair of kysely
-    /// builder references — `ExpressionBuilder<DB & {sharedBy: UserTable},
-    /// 'partner'|'sharedBy'>` against `ExpressionBuilder<DB, 'partner'>`,
-    /// immich's shape, on which tsc is clean — walks a spine of
-    /// `SelectQueryBuilder`/`ExpressionBuilder` frames that mints a fresh
-    /// interned pair at every level. Nothing repeats, so neither the relation
-    /// memo nor `relIdDeeplyNested`'s growth test closes it (the refs SHRINK
-    /// down that spine, and the growth test counts only strictly later
-    /// instantiations), and the walk was measured still running past
-    /// 40,000,000 node visits at `max_instantiation_depth` 400. Whatever
-    /// budget it is given it will exhaust, so the trip carries exactly one
-    /// bit of information — "ztsc gave up" — which is what tsc answers
-    /// `Maybe` to.
-    ///
-    /// Reporting it anyway is a false positive, and unlike the report the
-    /// truncation itself is harmless here: `error_type` relates to everything,
-    /// so the relation's answer with the cut is the assumed-YES it would have
-    /// given at `max_relation_depth` one layer up. `inst_limit_tripped` still
-    /// fires, so the truncated result is still kept out of every memo.
-    ///
-    /// The direction of the unsoundness is the one `max_relation_depth` and
-    /// `max_relation_identity_repeats` already take, and the one tsc takes:
-    /// assume-related can only DROP a diagnostic, never invent one. What it
-    /// deliberately does NOT do is suppress TS2589 generally — a trip while
-    /// materializing an annotation still reports (conformance
-    /// instantiation/002), because that one is a property of the type.
-    pub fn instDiagAllowed(c: *const Checker) bool {
-        return !c.suppress_inst_diag and c.rel_depth == 0;
-    }
-
-    /// Report an instantiation-limit diagnostic (TS2589 / TS2590) at a
-    /// canonical, partition-independent anchor: at most one per file and
-    /// code, at the lexically-first anchor seen in that file.
-    ///
-    /// The record is filed under the *anchor's* file, never `cur_file`. The
-    /// anchor is only ever set while walking a file this checker owns
-    /// (`checkStatement`/`anchorInst` and the expression boundaries), so it
-    /// always survives `seal`'s owned-file filter — and a trip that unwound
-    /// through a foreign `.d.ts` is reported at the site that demanded it
-    /// instead of dropped.
-    ///
-    /// The limit is a resource cap, not a property of a single expression:
-    /// `instantiateId`'s memo short-circuits before the depth guard, so
-    /// *which* of a file's several deep materializations actually trips
-    /// depends on what this checker instance already had cached — i.e. on
-    /// the partition. Collapsing a file's trips to their lexically-first
-    /// anchor makes the reported position a function of the program alone.
-    /// Costs one hash lookup per trip (a handful per run).
-    pub fn instLimitDiag(c: *Checker, code: u16, msg: []const u8) Error!void {
-        const file, const span = c.instSpanHere();
-        const gop = try c.inst_diag_at.getOrPut(c.cm(), (@as(u64, file) << 32) | code);
-        if (gop.found_existing) {
-            const prev = &c.diags.items[gop.value_ptr.*];
-            if (span.start < prev.span.start) prev.span = span;
-            return;
-        }
-        gop.value_ptr.* = c.diags.items.len;
-        try c.diags.append(c.gpa, .{ .code = code, .file = file, .span = span, .msg = try c.out.dupe(u8, msg) });
-    }
-
-    pub fn anchorInst(c: *Checker, node: Node) void {
-        c.inst_anchor = .{ .node = .{ .file = c.cur_file, .node = node } };
-    }
-
     pub fn nodeTag(c: *const Checker, node: Node) ast.Tag {
         return c.tree.nodeTag(node);
-    }
-
-    pub fn diagFmt(c: *Checker, code: u16, span: Span, comptime fmt: []const u8, args: anytype) Error!void {
-        // A side query re-checks an expression out of order to inspect its
-        // type; the authoritative top-down check reports at the resolved type.
-        if (c.side_query_depth > 0) return;
-        const key = (@as(u128, c.cur_file) << 64) | (@as(u128, code) << 32) | span.start;
-        const gop = try c.diag_seen.getOrPut(c.gpa, key);
-        if (gop.found_existing) return;
-        const msg = try std.fmt.allocPrint(c.out, fmt, args);
-        try c.diags.append(c.gpa, .{ .code = code, .file = c.cur_file, .span = span, .msg = msg });
-    }
-
-    /// Has a diagnostic with this code already been filed at this span?
-    /// (`diagFmt`'s dedupe key, asked without filing anything.)
-    ///
-    /// An elaboration that ran once has to keep answering "yes, I elaborated"
-    /// on every re-check of the same expression, even when its own diagnostic
-    /// would now be swallowed as a duplicate — otherwise the caller concludes
-    /// nothing was reported and falls back to the whole-expression error,
-    /// which lands *beside* the earlier nested one.
-    pub fn diagAlreadyFiled(c: *Checker, code: u16, span: Span) bool {
-        return c.diag_seen.contains((@as(u128, c.cur_file) << 64) | (@as(u128, code) << 32) | span.start);
-    }
-
-    /// The source region a speculative check is allowed to have spoken about:
-    /// everything a rejected overload candidate says *inside* it is an artifact
-    /// of that candidate and must be withdrawn; everything outside it is
-    /// collateral from work the probe merely happened to trigger and must
-    /// survive. `hi == 0` means "the whole file" (unused today, but it makes an
-    /// empty region unrepresentable).
-    pub const SpecRegion = struct { file: FileId, lo: u32, hi: u32 };
-
-    /// Withdraw the diagnostics a speculative stretch of checking filed inside
-    /// `spec`, restoring the state a *silent* probe would have left.
-    ///
-    /// Two things make this more than `diags.items.len = saved`.
-    ///
-    /// (1) `diagFmt` writes a second, permanent record: the (file, code,
-    ///     span-start) key in `diag_seen`. Truncating the list alone erases the
-    ///     diagnostic *and keeps its suppression*, so the next check of the same
-    ///     expression is swallowed forever. A rejected overload candidate
-    ///     contextually types an arrow argument, walks its body, files the body's
-    ///     errors, and the truncation then poisons every one of those spans
-    ///     against the WINNING candidate's re-walk: the body is checked twice
-    ///     and reported zero times, which is indistinguishable from never being
-    ///     checked at all.
-    ///
-    /// (2) The probe also drags in work that is not speculative at all. Checking
-    ///     an argument materializes whatever symbols it mentions, and
-    ///     materializing `const f = (…) => {…}` from another file walks that
-    ///     arrow's body — under `no_publish_depth == 0`, so its type IS memoized.
-    ///     Those diagnostics belong to the other file's own check, are produced
-    ///     exactly once, and the blanket truncation deleted them with no second
-    ///     chance: the memo makes sure the body is never walked again. That is
-    ///     how whole top-level bodies (data/encryption.ts's `decryptData`, via a
-    ///     `new Uint8Array(await decryptData(…))` overload probe in data/encode.ts)
-    ///     went unreported. Restricting the withdrawal to `spec` keeps them.
-    ///
-    /// `instLimitDiag` stores *indices* into `diags`; any pointing into the
-    /// window are dropped rather than remapped (the map is empty on nearly every
-    /// run — hence the count guard — and a dropped anchor at worst lets a later
-    /// trip re-file the file's single TS2589, where the previous code left the
-    /// index dangling onto an unrelated diagnostic).
-    ///
-    /// KNOWN RESIDUAL. A withdrawal is only recoverable if the winning candidate
-    /// re-walks the same expression. It does for the argument itself (the
-    /// contextual type differs per candidate, so `node_types` misses) and for an
-    /// argument that IS a function expression (`no_publish_depth`), but not for
-    /// a function expression nested inside an argument and typed context-free —
-    /// an IIFE, `promises.concat((async () => { … })())`. That body's answer is
-    /// published, so the re-check hits the memo and its diagnostics stay
-    /// withdrawn. One site in the excalidraw corpus (element/image.ts:54 of
-    /// 4166 instrumented arrow bodies). Withholding the whole probed argument
-    /// from `node_types` closes it and was measured TWICE:
-    ///   - first pass: +3 excess keys — a duplicate whole-argument TS2345
-    ///     beside its own nested elaboration, plus two partition-dependent keys
-    ///     including a TS1308;
-    ///   - re-measured after `diagAlreadyFiled` fixed the duplicate: +2 excess
-    ///     keys, exactly `data/encryption.ts:86:5 TS2345` and
-    ///     `packages/utils/export.ts:126:18 TS1308`, for zero matched keys and
-    ///     zero under-reports closed on the oracle's key set.
-    /// Still not worth taking: the one site it fixes is an under-report the
-    /// oracle does not name, and it costs two false positives.
-    pub fn rollbackDiags(c: *Checker, saved: usize, spec: SpecRegion) void {
-        if (c.diags.items.len == saved) return;
-        // `remove` invalidates the iterator, so restart after each hit.
-        while (c.inst_diag_at.count() > 0) {
-            var stale: ?u64 = null;
-            var it = c.inst_diag_at.iterator();
-            while (it.next()) |e| {
-                if (e.value_ptr.* >= saved) {
-                    stale = e.key_ptr.*;
-                    break;
-                }
-            }
-            _ = c.inst_diag_at.remove(stale orelse break);
-        }
-        var w = saved;
-        for (c.diags.items[saved..]) |d| {
-            if (d.file == spec.file and d.span.start >= spec.lo and
-                (spec.hi == 0 or d.span.start < spec.hi))
-            {
-                _ = c.diag_seen.remove((@as(u128, d.file) << 64) | (@as(u128, d.code) << 32) | d.span.start);
-                continue;
-            }
-            c.diags.items[w] = d;
-            w += 1;
-        }
-        c.diags.items.len = w;
-    }
-
-    /// `rollbackDiags` for an overload probe: the speculative region is the
-    /// argument list's own byte range in `file`. Computed here rather than by
-    /// the caller because the span of the last argument is an O(subtree) walk
-    /// and the overwhelmingly common rejection files no diagnostic at all.
-    pub fn rollbackArgDiags(c: *Checker, saved: usize, file: FileId, arg_nodes: []const Node) void {
-        if (c.diags.items.len == saved) return;
-        // Arguments are in source order, so the region is [start of the first,
-        // end of the last] — one cheap start and one subtree walk, not one per
-        // argument.
-        var first: Node = null_node;
-        var last: Node = null_node;
-        for (arg_nodes) |an| {
-            if (an == null_node) continue;
-            if (first == null_node) first = an;
-            last = an;
-        }
-        // No arguments at all: nothing the candidate said can be about them.
-        if (first == null_node) return;
-        c.rollbackDiags(saved, .{ .file = file, .lo = c.nodeSpanStart(first), .hi = c.nodeSpan(last).end });
     }
 
     pub fn scopeOf(c: *Checker, node: Node) Error!?ScopeId {
@@ -3635,6 +3018,44 @@ pub const Checker = struct {
 
     // === decls relocated to src/checker/*.zig =============================
 
+    const cdiags_zig = @import("checker/cdiags.zig");
+    pub const tokSpan = cdiags_zig.tokSpan;
+    pub const nodeSpan = cdiags_zig.nodeSpan;
+    pub const nodeSpanStart = cdiags_zig.nodeSpanStart;
+    /// Named by `inst_anchor`'s declaration above; not part of any API.
+    const InstAnchor = cdiags_zig.InstAnchor;
+    pub const instSpanHere = cdiags_zig.instSpanHere;
+    pub const instDiagAllowed = cdiags_zig.instDiagAllowed;
+    pub const instLimitDiag = cdiags_zig.instLimitDiag;
+    pub const anchorInst = cdiags_zig.anchorInst;
+    pub const diagFmt = cdiags_zig.diagFmt;
+    pub const diagAlreadyFiled = cdiags_zig.diagAlreadyFiled;
+    pub const rollbackDiags = cdiags_zig.rollbackDiags;
+    pub const rollbackArgDiags = cdiags_zig.rollbackArgDiags;
+
+    const atoms_zig = @import("checker/atoms.zig");
+    pub const atom = atoms_zig.atom;
+    pub const internText = atoms_zig.internText;
+    pub const atomText = atoms_zig.atomText;
+    pub const atomOfToken = atoms_zig.atomOfToken;
+    pub const memberAtom = atoms_zig.memberAtom;
+    pub const memberKey = atoms_zig.memberKey;
+    pub const uniqueSymAtom = atoms_zig.uniqueSymAtom;
+    pub const computed_sym_prefix = atoms_zig.computed_sym_prefix;
+    pub const literalKeyAtom = atoms_zig.literalKeyAtom;
+    pub const computedKeyAtomOfType = atoms_zig.computedKeyAtomOfType;
+    pub const computedSymPlaceholder = atoms_zig.computedSymPlaceholder;
+    pub const constSymbolKeyAtom = atoms_zig.constSymbolKeyAtom;
+    pub const constSymbolKeyType = atoms_zig.constSymbolKeyType;
+    pub const memberNameType = atoms_zig.memberNameType;
+    pub const numericNameType = atoms_zig.numericNameType;
+    pub const qualifiedKeyMemberSym = atoms_zig.qualifiedKeyMemberSym;
+    pub const classStaticMemberSym = atoms_zig.classStaticMemberSym;
+    pub const computedSymKey = atoms_zig.computedSymKey;
+    pub const nominalizeComputedKey = atoms_zig.nominalizeComputedKey;
+    pub const wellKnownKeyOfExpr = atoms_zig.wellKnownKeyOfExpr;
+    pub const stripQuotes = atoms_zig.stripQuotes;
+
     const names_zig = @import("checker/names.zig");
     pub const hasValueMeaning = names_zig.hasValueMeaning;
     pub const hasTypeMeaning = names_zig.hasTypeMeaning;
@@ -3659,19 +3080,9 @@ pub const Checker = struct {
     const print_zig = @import("checker/print.zig");
     pub const typeToString = print_zig.typeToString;
     pub const printType = print_zig.printType;
-    pub const stringMappingName = print_zig.stringMappingName;
-    pub const printSigMember = print_zig.printSigMember;
-    pub const printTypeParen = print_zig.printTypeParen;
-    pub const encodeF64Key = print_zig.encodeF64Key;
-    pub const writeSortKey = print_zig.writeSortKey;
-    pub const sortMembersStructural = print_zig.sortMembersStructural;
-    pub const propDisplayOrder = print_zig.propDisplayOrder;
-    pub const printNumber = print_zig.printNumber;
     pub const symbolName = print_zig.symbolName;
     pub const dumpTypes = print_zig.dumpTypes;
     pub const PrintErr = print_zig.PrintErr;
-    pub const PrintPos = print_zig.PrintPos;
-    pub const DisplayMember = print_zig.DisplayMember;
 
     const typenode_zig = @import("checker/typenode.zig");
     pub const typeFromTypeNode = typenode_zig.typeFromTypeNode;
