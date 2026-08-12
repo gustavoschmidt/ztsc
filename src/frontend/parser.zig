@@ -4065,6 +4065,7 @@ const Parser = struct {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+const source = @import("source.zig");
 
 /// Parse `src` and render the root's children as newline-joined
 /// S-expressions (the golden format).
@@ -5229,7 +5230,7 @@ test "recovery: junk between statements" {
 
 /// Recursively assert child spans nest within their parent's span and stay
 /// inside the file.
-fn checkSpansNested(tree: *const ast.Ast, src: []const u8, node: ast.Node, parent: ast.Span) !void {
+fn checkSpansNested(tree: *const ast.Ast, src: []const u8, node: ast.Node, parent: source.Span) !void {
     const sp = tree.span(src, node);
     try testing.expect(sp.start <= sp.end);
     try testing.expect(sp.end <= src.len);
@@ -5280,7 +5281,7 @@ test "spans: derived spans nest within parents on a corpus sample" {
         }
         return error.TestUnexpectedDiagnostics;
     }
-    const file_span: ast.Span = .{ .start = 0, .end = @intCast(src.len) };
+    const file_span: source.Span = .{ .start = 0, .end = @intCast(src.len) };
     var it = tree.childIterator(0);
     while (it.next()) |child| {
         try checkSpansNested(&tree, src, child, file_span);
