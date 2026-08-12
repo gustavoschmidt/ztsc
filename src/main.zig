@@ -208,6 +208,120 @@ const Cli = struct {
     paths: []const []const u8 = &.{},
 };
 
+/// The options the run actually uses: the tsconfig's answers with the CLI's
+/// overrides already applied. Produced once, by `effectiveOptions`, so the
+/// precedence rules live in one testable place instead of in fifteen
+/// `var config_*` locals threaded through main().
+///
+/// The defaults below are the no-tsconfig defaults (a run driven by bare file
+/// arguments), which are NOT all `false`: ztsc always resolves with the
+/// bundler algorithm, and tsc's rule makes `allowSyntheticDefaultImports`
+/// default to true under it.
+const Effective = struct {
+    // --- module resolution ---
+    resolve_json: bool = false,
+    base_url: ?[]const u8 = null,
+    allow_js: bool = false,
+    /// Both default ON — see `tsconfig.Config`; a config that turns exports
+    /// off gets the pre-`exports` resolver.
+    resolve_pkg_json_exports: bool = true,
+    resolve_pkg_json_imports: bool = true,
+    /// tsconfig `moduleSuffixes` — widens every candidate probe the resolver
+    /// makes; carried on `ResolveOpts` like every other resolution input.
+    module_suffixes: []const []const u8 = &.{},
+    /// tsconfig `paths`.
+    paths_map: ?ztsc.tsconfig.Paths = null,
+    /// `<jsxImportSource>/jsx-runtime` under the automatic JSX runtime; null
+    /// under the classic runtime (global `JSX` namespace only).
+    jsx_runtime_module: ?[]const u8 = null,
+
+    // --- link / program semantics ---
+    allow_synthetic_default: bool = true,
+    no_implicit_any: bool = true,
+    /// tsconfig noUncheckedSideEffectImports (tsc's default is off).
+    no_unchecked_side_effect_imports: bool = false,
+    /// tsconfig `types: [… "*" …]` — TS2580 instead of TS2591 (see LinkOpts).
+    types_wildcard: bool = false,
+    /// tsconfig experimentalDecorators (legacy decorator dialect; grammar +
+    /// the decorator signature check both change).
+    experimental_decorators: bool = false,
+
+    // --- lib injection and diagnostic suppression ---
+    /// Which built-in lib blobs to inject.
+    lib_set: libs.LibSet = .default,
+    /// Skip type-checking the embedded pre-verified lib?
+    skip_default_lib_check: bool = false,
+    /// Honor `skipLibCheck`, the superset: no diagnostic located in ANY
+    /// `.d.ts` is surfaced.
+    skip_all_dts_check: bool = false,
+
+    fn resolveOpts(e: Effective) resolve.ResolveOpts {
+        return .{
+            .resolve_json = e.resolve_json,
+            .base_url = e.base_url,
+            .allow_js = e.allow_js,
+            .resolve_pkg_json_exports = e.resolve_pkg_json_exports,
+            .resolve_pkg_json_imports = e.resolve_pkg_json_imports,
+            .module_suffixes = e.module_suffixes,
+        };
+    }
+
+    fn linkOpts(e: Effective) modules.LinkOpts {
+        return .{
+            .allow_synthetic_default = e.allow_synthetic_default,
+            .no_implicit_any = e.no_implicit_any,
+            .no_unchecked_side_effect_imports = e.no_unchecked_side_effect_imports,
+            .types_wildcard = e.types_wildcard,
+            .experimental_decorators = e.experimental_decorators,
+        };
+    }
+};
+
+/// Settle every option the run needs from the CLI and the tsconfig (null when
+/// the run is driven by bare file arguments). Pure — no I/O, no allocation —
+/// so the precedence rules can be tested directly.
+fn effectiveOptions(cli: Cli, cfg: ?ztsc.tsconfig.Config) Effective {
+    var e: Effective = .{};
+    if (cfg) |c| {
+        e.resolve_json = c.resolve_json_module;
+        e.base_url = c.base_url;
+        e.allow_js = c.allow_js;
+        e.resolve_pkg_json_exports = c.resolve_pkg_json_exports;
+        e.resolve_pkg_json_imports = c.resolve_pkg_json_imports;
+        e.module_suffixes = c.module_suffixes;
+        e.paths_map = c.paths;
+        e.jsx_runtime_module = c.jsx_runtime_module;
+        e.allow_synthetic_default = c.allow_synthetic_default_imports;
+        e.no_implicit_any = c.no_implicit_any;
+        e.no_unchecked_side_effect_imports = c.no_unchecked_side_effect_imports;
+        e.types_wildcard = c.types_wildcard;
+        e.experimental_decorators = c.experimental_decorators;
+        // tsconfig skipLibCheck/skipDefaultLibCheck.
+        e.skip_default_lib_check = c.skip_lib_check;
+        // skipLibCheck only (the superset: ALL `.d.ts`, not just the lib).
+        // Those files are still parsed/bound/linked so their types flow into
+        // `.ts`/`.tsx` checking. Only the tsconfig drives this; the
+        // `--skip-default-lib-check` CLI flag stays default-lib-only (tsc's
+        // `--skipDefaultLibCheck`).
+        e.skip_all_dts_check = c.skip_all_lib_check;
+    }
+
+    // The CLI flag, when given, overrides the tsconfig
+    // `skipLibCheck`/`skipDefaultLibCheck` value. Default is to check the lib
+    // (matching tsc/tsgo).
+    if (cli.skip_default_lib_check) |v| e.skip_default_lib_check = v;
+
+    // Which built-in lib blobs to inject. Precedence: --noLib wins (nothing),
+    // then an explicit --lib flag, then the tsconfig `lib` field, else the
+    // default set (ES-core + DOM — tsgo's target-esnext default includes DOM).
+    e.lib_set = if (cli.no_lib)
+        .none
+    else
+        libs.resolveLibSet(cli.lib orelse if (cfg) |c| c.lib else null);
+
+    return e;
+}
+
 /// Routes diagnostics to the plain machine format or the pretty renderer,
 /// tracking totals for the tsc-style summary line.
 const Emitter = struct {
@@ -261,16 +375,17 @@ pub fn main(init: std.process.Init) !void {
     const out = &stdout_writer.interface;
 
     const args = try init.minimal.args.toSlice(arena);
-    var bad_arg: []const u8 = "";
-    const cli = parseArgs(arena, args, &bad_arg) catch |err| {
-        switch (err) {
-            error.UnknownFlag => std.debug.print("ztsc: unknown option '{s}'\n", .{bad_arg}),
-            error.BadFlagValue => std.debug.print("ztsc: bad value for option '{s}'\n", .{bad_arg}),
-            error.MissingFlagValue => std.debug.print("ztsc: option '{s}' needs a value\n", .{bad_arg}),
-            else => return err,
-        }
-        std.debug.print("try 'ztsc --help'\n", .{});
-        std.process.exit(2);
+    const cli = switch (try parseArgs(arena, args)) {
+        .ok => |c| c,
+        .bad => |b| {
+            switch (b.problem) {
+                .unknown_flag => std.debug.print("ztsc: unknown option '{s}'\n", .{b.arg}),
+                .bad_value => std.debug.print("ztsc: bad value for option '{s}'\n", .{b.arg}),
+                .missing_value => std.debug.print("ztsc: option '{s}' needs a value\n", .{b.arg}),
+            }
+            std.debug.print("try 'ztsc --help'\n", .{});
+            std.process.exit(2);
+        },
     };
 
     // Write-once, before any checker thread exists (see `prof.profile_on`).
@@ -314,42 +429,9 @@ pub fn main(init: std.process.Init) !void {
     // The `config` phase: discovery, `extends` chasing, the `include` walk and
     // `collectAutoTypes`. Stays 0 when the run is driven by CLI file arguments.
     var config_ns: u64 = 0;
-    var paths_map: ?ztsc.tsconfig.Paths = null;
-    // The tsconfig `lib` field (null when no config / no field), consulted below
-    // to pick the built-in lib blobs.
-    var config_lib: ?[]const []const u8 = null;
-    // tsconfig skipLibCheck/skipDefaultLibCheck (false when no config / unset).
-    var config_skip_lib = false;
-    // tsconfig skipLibCheck only (superset: skips ALL .d.ts, not just the lib).
-    var config_skip_all_lib = false;
-    // tsconfig resolveJsonModule + baseUrl (for `*.json` module resolution).
-    var config_resolve_json = false;
-    var config_base_url: ?[]const u8 = null;
-    // tsconfig resolvePackageJsonExports/Imports (both default ON — see
-    // `tsconfig.Config`; a config that turns exports off gets the pre-`exports`
-    // resolver).
-    var config_resolve_pkg_exports = true;
-    var config_resolve_pkg_imports = true;
-    // tsconfig allowJs (resolve JS-only deps as `any`) + effective noImplicitAny.
-    var config_allow_js = false;
-    var config_no_implicit_any = true;
-    // tsconfig experimentalDecorators (legacy decorator dialect; grammar + the
-    // decorator signature check both change). See `tsconfig.Config`.
-    var config_experimental_decorators = false;
-    // tsconfig noUncheckedSideEffectImports (tsc's default is off).
-    var config_no_unchecked_side_effect_imports = false;
-    // tsconfig `types: [… "*" …]` — TS2580 instead of TS2591 (see LinkOpts).
-    var config_types_wildcard = false;
-    // Effective allowSyntheticDefaultImports. With no tsconfig (bare file
-    // arguments) ztsc still resolves with the bundler algorithm, and tsc's rule
-    // makes the flag default to true under bundler resolution.
-    var config_allow_synthetic_default = true;
-    // `<jsxImportSource>/jsx-runtime` under the automatic JSX runtime; null
-    // under the classic runtime (global `JSX` namespace only).
-    var config_jsx_runtime_module: ?[]const u8 = null;
-    // tsconfig `moduleSuffixes` — widens every candidate probe the resolver
-    // makes; carried on `ResolveOpts` like every other resolution input.
-    var config_module_suffixes: []const []const u8 = &.{};
+    // The loaded tsconfig, or null when the run is driven by CLI file
+    // arguments. Read exactly once, by `effectiveOptions` below.
+    var config: ?ztsc.tsconfig.Config = null;
     if (cli.paths.len == 0) {
         const config_timer = Timer.start(io);
         const config_path: []const u8 = blk: {
@@ -423,46 +505,11 @@ pub fn main(init: std.process.Init) !void {
             entry_paths = combined;
         }
         n_real_roots = cfg.root_files.len;
-        paths_map = cfg.paths;
-        config_lib = cfg.lib;
-        config_skip_lib = cfg.skip_lib_check;
-        config_skip_all_lib = cfg.skip_all_lib_check;
-        config_resolve_json = cfg.resolve_json_module;
-        config_resolve_pkg_exports = cfg.resolve_pkg_json_exports;
-        config_resolve_pkg_imports = cfg.resolve_pkg_json_imports;
-        config_base_url = cfg.base_url;
-        config_allow_js = cfg.allow_js;
-        config_no_implicit_any = cfg.no_implicit_any;
-        config_experimental_decorators = cfg.experimental_decorators;
-        config_no_unchecked_side_effect_imports = cfg.no_unchecked_side_effect_imports;
-        config_types_wildcard = cfg.types_wildcard;
-        config_allow_synthetic_default = cfg.allow_synthetic_default_imports;
-        config_jsx_runtime_module = cfg.jsx_runtime_module;
-        config_module_suffixes = cfg.module_suffixes;
+        config = cfg;
         config_ns = config_timer.readNs();
     }
 
-    // Effective decision: skip type-checking the embedded pre-verified lib?
-    // Default is to check it (matching tsc/tsgo). The CLI flag, when given,
-    // overrides the tsconfig `skipLibCheck`/`skipDefaultLibCheck` value.
-    const skip_default_lib_check = cli.skip_default_lib_check orelse config_skip_lib;
-
-    // Effective decision: honor `skipLibCheck` (the superset of
-    // `skipDefaultLibCheck`)? When set, no diagnostic located in ANY `.d.ts`
-    // file is surfaced — the default lib, dependency `.d.ts`, and project-local
-    // `.d.ts` alike — so ztsc's output matches tsc's on valid `.d.ts`. Those
-    // files are still parsed/bound/linked so their types flow into `.ts`/`.tsx`
-    // checking. Only the tsconfig drives this; the `--skip-default-lib-check`
-    // CLI flag stays default-lib-only (tsc's `--skipDefaultLibCheck`).
-    const skip_all_dts_check = config_skip_all_lib;
-
-    // Which built-in lib blobs to inject. Precedence: --noLib wins (nothing),
-    // then an explicit --lib flag, then the tsconfig `lib` field, else the
-    // default set (ES-core + DOM — tsgo's target-esnext default includes DOM).
-    const lib_set: libs.LibSet = if (cli.no_lib)
-        .none
-    else
-        libs.resolveLibSet(cli.lib orelse config_lib);
+    const opt = effectiveOptions(cli, config);
 
     // Pretty diagnostics: tsc-style excerpts + colors; default follows the
     // terminal, --pretty / --pretty=false forces.
@@ -480,27 +527,14 @@ pub fn main(init: std.process.Init) !void {
         .entry_paths = entry_paths,
         .n_real_roots = n_real_roots,
         .file_order = cli.file_order,
-        .lib_set = lib_set,
+        .lib_set = opt.lib_set,
         .n_workers = n_workers,
         .repeat = cli.repeat,
         .resolve_cache = !cli.no_resolve_cache,
-        .resolve_opts = .{
-            .resolve_json = config_resolve_json,
-            .base_url = config_base_url,
-            .allow_js = config_allow_js,
-            .resolve_pkg_json_exports = config_resolve_pkg_exports,
-            .resolve_pkg_json_imports = config_resolve_pkg_imports,
-            .module_suffixes = config_module_suffixes,
-        },
-        .paths_map = paths_map,
-        .jsx_runtime_module = config_jsx_runtime_module,
-        .link_opts = .{
-            .allow_synthetic_default = config_allow_synthetic_default,
-            .no_implicit_any = config_no_implicit_any,
-            .no_unchecked_side_effect_imports = config_no_unchecked_side_effect_imports,
-            .types_wildcard = config_types_wildcard,
-            .experimental_decorators = config_experimental_decorators,
-        },
+        .resolve_opts = opt.resolveOpts(),
+        .paths_map = opt.paths_map,
+        .jsx_runtime_module = opt.jsx_runtime_module,
+        .link_opts = opt.linkOpts(),
     });
     // The lib shards' arenas hold AST and binder output the checkers read, so
     // they are released only at the very end of the run.
@@ -543,8 +577,8 @@ pub fn main(init: std.process.Init) !void {
         // diagnostics, and its types are resolved lazily on demand from
         // `.ts` files (not by walking it), so its check pass is dead work —
         // don't enqueue it. Pure time savings, deterministic (path-based).
-        skipped[i] = (skip_default_lib_check and libs.isLibPath(paths.items[i])) or
-            (skip_all_dts_check and ztsc.paths.isDeclarationPath(paths.items[i]));
+        skipped[i] = (opt.skip_default_lib_check and libs.isLibPath(paths.items[i])) or
+            (opt.skip_all_dts_check and ztsc.paths.isDeclarationPath(paths.items[i]));
     }
     const check_work = try schedule.costModel(arena, node_counts, skipped);
 
@@ -639,7 +673,7 @@ pub fn main(init: std.process.Init) !void {
     // Path-based, so identical for any --workers/--checkers count (determinism).
     const dts_skipped = try arena.alloc(bool, paths.items.len);
     for (paths.items, 0..) |p, i|
-        dts_skipped[i] = skip_all_dts_check and !is_lib[i] and ztsc.paths.isDeclarationPath(p);
+        dts_skipped[i] = opt.skip_all_dts_check and !is_lib[i] and ztsc.paths.isDeclarationPath(p);
 
     // `@ts-nocheck` / `@ts-ignore` / `@ts-expect-error` suppression, scanned
     // from each file's comment trivia at parse time. Unlike `dts_skipped` this
@@ -1014,14 +1048,29 @@ pub fn main(init: std.process.Init) !void {
     if (parse_diags > 0 or bind_diags > 0 or link_diags > 0 or check_diags > 0) std.process.exit(1);
 }
 
-/// Parse argv. On error, `bad_arg` names the offending argument.
-fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8, bad_arg: *[]const u8) !Cli {
+/// Why an argument was rejected. One message per case, printed by main.
+const ArgProblem = enum { unknown_flag, bad_value, missing_value };
+
+/// What `parseArgs` produces: the settled CLI, or the first argument it could
+/// not accept together with the reason. A returned value rather than an error
+/// plus an out-parameter, so nothing has to be written on every loop iteration
+/// to keep a diagnostic available for a failure that usually never happens.
+const ParseResult = union(enum) {
+    ok: Cli,
+    bad: struct { problem: ArgProblem, arg: []const u8 },
+
+    fn reject(problem: ArgProblem, arg: []const u8) ParseResult {
+        return .{ .bad = .{ .problem = problem, .arg = arg } };
+    }
+};
+
+/// Parse argv.
+fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8) error{OutOfMemory}!ParseResult {
     var cli: Cli = .{};
     var paths: std.ArrayList([]const u8) = .empty;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-        bad_arg.* = arg;
         if (std.mem.eql(u8, arg, "--timing")) {
             cli.timing = true;
         } else if (std.mem.eql(u8, arg, "--memory")) {
@@ -1068,7 +1117,7 @@ fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8, bad_arg: *[]c
             cli.mem_profile = true;
         } else if (std.mem.startsWith(u8, arg, "--inst-memo-bits=")) {
             cli.inst_memo_bits = std.fmt.parseInt(u6, arg["--inst-memo-bits=".len..], 10) catch
-                return error.BadFlagValue;
+                return .reject(.bad_value, arg);
         } else if (std.mem.eql(u8, arg, "--dup-profile")) {
             cli.dup_profile = true;
         } else if (std.mem.startsWith(u8, arg, "--partition-file=")) {
@@ -1081,15 +1130,15 @@ fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8, bad_arg: *[]c
                 cli.file_order = .{ .reverse = {} };
             } else if (std.mem.startsWith(u8, v, "shuffle=")) {
                 cli.file_order = .{ .shuffle = std.fmt.parseInt(u64, v["shuffle=".len..], 10) catch
-                    return error.BadFlagValue };
+                    return .reject(.bad_value, arg) };
             } else if (std.mem.eql(u8, v, "shuffle")) {
                 cli.file_order = .{ .shuffle = 1 };
-            } else return error.BadFlagValue;
+            } else return .reject(.bad_value, arg);
         } else if (std.mem.eql(u8, arg, "--lazy-stats")) {
             cli.lazy_stats = true;
         } else if (std.mem.startsWith(u8, arg, "--inst-focus=")) {
             cli.inst_focus = std.fmt.parseInt(u32, arg["--inst-focus=".len..], 10) catch
-                return error.BadFlagValue;
+                return .reject(.bad_value, arg);
             cli.inst_profile = true;
         } else if (std.mem.eql(u8, arg, "--pretty")) {
             cli.pretty = true;
@@ -1100,44 +1149,71 @@ fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8, bad_arg: *[]c
             } else if (std.mem.eql(u8, v, "false")) {
                 cli.pretty = false;
             } else {
-                return error.BadFlagValue;
+                return .reject(.bad_value, arg);
             }
         } else if (std.mem.eql(u8, arg, "--project") or std.mem.eql(u8, arg, "-p")) {
             i += 1;
-            if (i >= args.len) return error.MissingFlagValue;
+            if (i >= args.len) return .reject(.missing_value, arg);
             cli.project = args[i];
         } else if (std.mem.startsWith(u8, arg, "--project=")) {
             cli.project = arg["--project=".len..];
         } else if (std.mem.startsWith(u8, arg, "--workers=")) {
             const n = std.fmt.parseInt(usize, arg["--workers=".len..], 10) catch
-                return error.BadFlagValue;
-            if (n == 0) return error.BadFlagValue;
+                return .reject(.bad_value, arg);
+            if (n == 0) return .reject(.bad_value, arg);
             cli.workers = n;
         } else if (std.mem.startsWith(u8, arg, "--checkers=")) {
             const n = std.fmt.parseInt(usize, arg["--checkers=".len..], 10) catch
-                return error.BadFlagValue;
-            if (n == 0) return error.BadFlagValue;
+                return .reject(.bad_value, arg);
+            if (n == 0) return .reject(.bad_value, arg);
             cli.checkers = n;
         } else if (std.mem.startsWith(u8, arg, "--repeat=")) {
             cli.repeat = std.fmt.parseInt(usize, arg["--repeat=".len..], 10) catch
-                return error.BadFlagValue;
-            if (cli.repeat == 0) return error.BadFlagValue;
+                return .reject(.bad_value, arg);
+            if (cli.repeat == 0) return .reject(.bad_value, arg);
         } else if (std.mem.startsWith(u8, arg, "-") and arg.len > 1) {
-            return error.UnknownFlag;
+            return .reject(.unknown_flag, arg);
         } else {
             try paths.append(arena, arg);
         }
     }
     cli.paths = paths.items;
-    return cli;
+    return .{ .ok = cli };
+}
+
+/// `parseArgs` on a well-formed argv, or a test failure naming the argument
+/// it rejected.
+fn parseOk(arena: std.mem.Allocator, args: []const [:0]const u8) !Cli {
+    return switch (try parseArgs(arena, args)) {
+        .ok => |c| c,
+        .bad => |b| {
+            std.debug.print("parseArgs rejected '{s}' ({s})\n", .{ b.arg, @tagName(b.problem) });
+            return error.TestUnexpectedResult;
+        },
+    };
+}
+
+/// Assert `args` is rejected for `problem` at argument `arg`.
+fn expectRejected(
+    arena: std.mem.Allocator,
+    args: []const [:0]const u8,
+    problem: ArgProblem,
+    arg: []const u8,
+) !void {
+    switch (try parseArgs(arena, args)) {
+        .ok => return error.TestUnexpectedResult,
+        .bad => |b| {
+            try std.testing.expectEqual(problem, b.problem);
+            try std.testing.expectEqualStrings(arg, b.arg);
+        },
+    }
 }
 
 test "parseArgs flags and paths" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var bad: []const u8 = "";
     const args = [_][:0]const u8{ "ztsc", "--timing", "a.ts", "--memory", "b.ts" };
-    const cli = try parseArgs(arena.allocator(), &args, &bad);
+    const cli = try parseOk(arena.allocator(), &args);
     try std.testing.expect(cli.timing);
     try std.testing.expect(cli.memory);
     try std.testing.expect(!cli.version);
@@ -1149,68 +1225,116 @@ test "parseArgs flags and paths" {
 test "parseArgs workers, checkers and repeat" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var bad: []const u8 = "";
+    const a = arena.allocator();
     const args = [_][:0]const u8{ "ztsc", "--workers=4", "--checkers=2", "--repeat=10", "a.ts" };
-    const cli = try parseArgs(arena.allocator(), &args, &bad);
+    const cli = try parseOk(a, &args);
     try std.testing.expectEqual(@as(?usize, 4), cli.workers);
     try std.testing.expectEqual(@as(?usize, 2), cli.checkers);
     try std.testing.expectEqual(@as(usize, 10), cli.repeat);
 
-    const bad_workers = [_][:0]const u8{ "ztsc", "--workers=0" };
-    try std.testing.expectError(error.BadFlagValue, parseArgs(arena.allocator(), &bad_workers, &bad));
-    const bad_checkers = [_][:0]const u8{ "ztsc", "--checkers=0" };
-    try std.testing.expectError(error.BadFlagValue, parseArgs(arena.allocator(), &bad_checkers, &bad));
-    const bad_repeat = [_][:0]const u8{ "ztsc", "--repeat=x" };
-    try std.testing.expectError(error.BadFlagValue, parseArgs(arena.allocator(), &bad_repeat, &bad));
-    try std.testing.expectEqualStrings("--repeat=x", bad);
+    try expectRejected(a, &.{ "ztsc", "--workers=0" }, .bad_value, "--workers=0");
+    try expectRejected(a, &.{ "ztsc", "--checkers=0" }, .bad_value, "--checkers=0");
+    try expectRejected(a, &.{ "ztsc", "--repeat=x" }, .bad_value, "--repeat=x");
 }
 
 test "parseArgs rejects unknown flags" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var bad: []const u8 = "";
-    const args = [_][:0]const u8{ "ztsc", "--nope" };
-    try std.testing.expectError(error.UnknownFlag, parseArgs(arena.allocator(), &args, &bad));
-    try std.testing.expectEqualStrings("--nope", bad);
-    const short = [_][:0]const u8{ "ztsc", "-x" };
-    try std.testing.expectError(error.UnknownFlag, parseArgs(arena.allocator(), &short, &bad));
+    const a = arena.allocator();
+    try expectRejected(a, &.{ "ztsc", "--nope" }, .unknown_flag, "--nope");
+    try expectRejected(a, &.{ "ztsc", "-x" }, .unknown_flag, "-x");
 }
 
 test "parseArgs tsconfig flags: pretty, project, help, verbose" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var bad: []const u8 = "";
+    const a = arena.allocator();
 
     const a1 = [_][:0]const u8{ "ztsc", "--pretty", "--verbose", "a.ts" };
-    const c1 = try parseArgs(arena.allocator(), &a1, &bad);
+    const c1 = try parseOk(a, &a1);
     try std.testing.expectEqual(@as(?bool, true), c1.pretty);
     try std.testing.expect(c1.verbose);
 
     const a2 = [_][:0]const u8{ "ztsc", "--pretty=false" };
-    const c2 = try parseArgs(arena.allocator(), &a2, &bad);
+    const c2 = try parseOk(a, &a2);
     try std.testing.expectEqual(@as(?bool, false), c2.pretty);
 
     const a3 = [_][:0]const u8{"ztsc"};
-    const c3 = try parseArgs(arena.allocator(), &a3, &bad);
+    const c3 = try parseOk(a, &a3);
     try std.testing.expectEqual(@as(?bool, null), c3.pretty);
 
     const a4 = [_][:0]const u8{ "ztsc", "-p", "proj/dir" };
-    const c4 = try parseArgs(arena.allocator(), &a4, &bad);
+    const c4 = try parseOk(a, &a4);
     try std.testing.expectEqualStrings("proj/dir", c4.project.?);
 
     const a5 = [_][:0]const u8{ "ztsc", "--project=x/tsconfig.json" };
-    const c5 = try parseArgs(arena.allocator(), &a5, &bad);
+    const c5 = try parseOk(a, &a5);
     try std.testing.expectEqualStrings("x/tsconfig.json", c5.project.?);
 
-    const a6 = [_][:0]const u8{ "ztsc", "-p" };
-    try std.testing.expectError(error.MissingFlagValue, parseArgs(arena.allocator(), &a6, &bad));
-
-    const a7 = [_][:0]const u8{ "ztsc", "--pretty=maybe" };
-    try std.testing.expectError(error.BadFlagValue, parseArgs(arena.allocator(), &a7, &bad));
+    try expectRejected(a, &.{ "ztsc", "-p" }, .missing_value, "-p");
+    try expectRejected(a, &.{ "ztsc", "--pretty=maybe" }, .bad_value, "--pretty=maybe");
 
     const a8 = [_][:0]const u8{ "ztsc", "-h" };
-    const c8 = try parseArgs(arena.allocator(), &a8, &bad);
+    const c8 = try parseOk(a, &a8);
     try std.testing.expect(c8.help);
+}
+
+test "effectiveOptions: the CLI overrides the tsconfig, and only where it says so" {
+    const cfg: ztsc.tsconfig.Config = .{
+        .path = "tsconfig.json",
+        .dir = ".",
+        .lib = &.{"es2015"},
+        .skip_lib_check = true,
+        .skip_all_lib_check = true,
+        .allow_js = true,
+        .no_implicit_any = false,
+        .experimental_decorators = true,
+        .resolve_json_module = true,
+        .resolve_pkg_json_exports = false,
+        .allow_synthetic_default_imports = false,
+        .base_url = "src",
+        .jsx_runtime_module = "react/jsx-runtime",
+    };
+
+    // No tsconfig: the documented bare-file-argument defaults. Bundler
+    // resolution is why allowSyntheticDefaultImports starts true.
+    const bare = effectiveOptions(.{}, null);
+    try std.testing.expect(bare.allow_synthetic_default);
+    try std.testing.expect(bare.no_implicit_any);
+    try std.testing.expect(bare.resolve_pkg_json_exports);
+    try std.testing.expect(!bare.skip_default_lib_check);
+    try std.testing.expect(!bare.skip_all_dts_check);
+    try std.testing.expectEqual(@as(?[]const u8, null), bare.jsx_runtime_module);
+
+    // With a tsconfig and no overriding flags, every field is the config's.
+    const from_cfg = effectiveOptions(.{}, cfg);
+    try std.testing.expect(from_cfg.skip_default_lib_check);
+    try std.testing.expect(from_cfg.skip_all_dts_check);
+    try std.testing.expect(from_cfg.allow_js);
+    try std.testing.expect(!from_cfg.no_implicit_any);
+    try std.testing.expect(from_cfg.experimental_decorators);
+    try std.testing.expect(from_cfg.resolve_json);
+    try std.testing.expect(!from_cfg.resolve_pkg_json_exports);
+    try std.testing.expect(!from_cfg.allow_synthetic_default);
+    try std.testing.expectEqualStrings("src", from_cfg.base_url.?);
+    try std.testing.expectEqualStrings("react/jsx-runtime", from_cfg.jsx_runtime_module.?);
+    try std.testing.expectEqual(libs.resolveLibSet(&.{"es2015"}), from_cfg.lib_set);
+
+    // `--skip-default-lib-check` is a tri-state: absent leaves the config's
+    // value (above), present wins in EITHER direction — and it never touches
+    // the skipLibCheck superset, which only a tsconfig can set.
+    try std.testing.expect(!effectiveOptions(.{ .skip_default_lib_check = false }, cfg).skip_default_lib_check);
+    try std.testing.expect(effectiveOptions(.{ .skip_default_lib_check = false }, cfg).skip_all_dts_check);
+    try std.testing.expect(effectiveOptions(.{ .skip_default_lib_check = true }, null).skip_default_lib_check);
+    try std.testing.expect(!effectiveOptions(.{ .skip_default_lib_check = true }, null).skip_all_dts_check);
+
+    // Lib precedence: --noLib beats everything, then --lib, then the config.
+    try std.testing.expectEqual(libs.LibSet.none, effectiveOptions(.{ .no_lib = true, .lib = &.{"dom"} }, cfg).lib_set);
+    try std.testing.expectEqual(
+        libs.resolveLibSet(&.{"dom"}),
+        effectiveOptions(.{ .lib = &.{"dom"} }, cfg).lib_set,
+    );
+    try std.testing.expectEqual(libs.resolveLibSet(null), effectiveOptions(.{}, null).lib_set);
 }
 
 test "arena accounting sanity: capacity grows with allocations and covers usage" {
