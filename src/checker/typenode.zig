@@ -2067,7 +2067,21 @@ pub fn keyofType(c: *Checker, t: TypeId) Error!TypeId {
             if (c.ts.kind(t) == .ref) return c.ts.makeKeyof(t);
             return c.makeUnion2(types.string_type, c.makeUnion2(types.number_type, types.symbol_type) catch unreachable);
         },
-        .any => return c.makeUnion2(types.string_type, c.makeUnion2(types.number_type, types.symbol_type) catch unreachable),
+        // `keyof any` AND `keyof never` are both the whole key domain — the
+        // last line of tsc's `getIndexType` tests them together
+        // (`type.flags & (TypeFlags.Any | TypeFlags.Never) ? stringNumberSymbolType`),
+        // and only `keyof unknown` is `never`. Reading `keyof never` as `never`
+        // (the `else` arm below) empties every mapped type built over it, and
+        // `{ [K in keyof never]: … }` is not a curiosity: `hoist-non-react-
+        // statics`' `NonReactStatics<S>` maps over `keyof S`, and
+        // styled-components hands it `never` for every non-component inner tag
+        // (`StyledComponent<C, …> = string & StyledComponentBase<…> &
+        // NonReactStatics<C extends ComponentType<any> ? C : never>`). Emptied,
+        // that member vanishes from the intersection, `typeof SomeStyled` stops
+        // satisfying `AnyStyledComponent`, `styled(Component)` falls to the
+        // wrong overload, and every prop of every wrapped styled component is
+        // checked against the wrong target.
+        .any, .never => return c.makeUnion2(types.string_type, c.makeUnion2(types.number_type, types.symbol_type) catch unreachable),
         .object => return keyofObjectTable(c, r),
         .array, .tuple => return types.number_type, // approximation (no lib members)
         // `keyof typeof N` for a namespace or class value. `.class_value`
