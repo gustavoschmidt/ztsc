@@ -9,9 +9,6 @@ const intern = @import("../intern.zig");
 const binder = @import("../frontend/binder.zig");
 const types = @import("../types.zig");
 const source = @import("../frontend/source.zig");
-const libs = @import("../libs.zig");
-const modules = @import("../link/modules.zig");
-const ZeroPagedArray = @import("../zeropage.zig").ZeroPagedArray;
 
 const Node = ast.Node;
 const null_node = ast.null_node;
@@ -35,7 +32,6 @@ const classInstanceGeneric = @import("instantiate.zig").classInstanceGeneric;
 const classStaticType = @import("enums.zig").classStaticType;
 const expandRef = @import("instantiate.zig").expandRef;
 const findBindingType = @import("signatures.zig").findBindingType;
-const indexChainInner = @import("expr.zig").indexChainInner;
 const inferReturnType = @import("signatures.zig").inferReturnType;
 const init = Checker.init;
 const lazyRefProp = @import("instantiate.zig").lazyRefProp;
@@ -118,7 +114,10 @@ pub const no_past_assignment = reassign_scan.no_past_assignment;
 pub const markMemberWriteRoot = reassign_scan.markMemberWriteRoot;
 pub const recordMemberWrite = reassign_scan.recordMemberWrite;
 
-pub inline fn isPatternRoot(sym: SymbolId) bool {
+/// Is `sym` a binding-pattern pseudo-root (`pattern_root_base`), as opposed to
+/// a real symbol or the `this` sentinel? Only the flow walk mints and consumes
+/// these, so unlike `isPseudoRoot` it has no reader outside this file.
+inline fn isPatternRoot(sym: SymbolId) bool {
     return sym >= pattern_root_base and sym != this_flow_root;
 }
 
@@ -126,7 +125,7 @@ pub inline fn isPatternRoot(sym: SymbolId) bool {
 /// pattern) as a pseudo-reference root. Null when the sentinel range is
 /// exhausted or would collide with the fresh-type-param space — the reference
 /// is then simply not tracked (sound under-narrowing).
-pub fn patternRoot(c: *Checker, decl: Node) Error!?SymbolId {
+fn patternRoot(c: *Checker, decl: Node) Error!?SymbolId {
     if (c.fresh_tp_base != 0 and c.fresh_tp_base >= pattern_root_base) return null;
     const gop = try c.pattern_root_ids.getOrPut(c.cm(), c.nodeKey(decl));
     if (!gop.found_existing) {
@@ -141,7 +140,7 @@ pub fn patternRoot(c: *Checker, decl: Node) Error!?SymbolId {
 }
 
 /// The `(file, node)` declaration a pattern pseudo-root stands for.
-pub fn patternRootDecl(c: *const Checker, sym: SymbolId) u64 {
+fn patternRootDecl(c: *const Checker, sym: SymbolId) u64 {
     return c.pattern_root_decls.items[sym - pattern_root_base];
 }
 
