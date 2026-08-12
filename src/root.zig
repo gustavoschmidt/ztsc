@@ -1,9 +1,16 @@
 //! ZTSC — Zig TypeScript Checker (library root).
 //!
 //! Module layout: the public modules re-exported for use across the crate.
+//!
+//! This file serves two roles with different membership rules: the `pub const`
+//! list is the crate's public surface (what a consumer may name), while the
+//! `test {}` block at the bottom is the unit-test roster `zig build test`
+//! walks. Every module with in-file tests belongs in the roster whether or not
+//! it belongs in the surface — a module left out of it is silently untested.
 
 pub const source = @import("frontend/source.zig");
 pub const intern = @import("intern.zig");
+pub const spelling = @import("spelling.zig");
 pub const zeropage = @import("zeropage.zig");
 pub const scanner = @import("frontend/scanner.zig");
 pub const diagnostics = @import("frontend/diagnostics.zig");
@@ -18,6 +25,8 @@ pub const resolve = @import("link/resolve.zig");
 pub const modules = @import("link/modules.zig");
 pub const checker = @import("checker.zig");
 pub const tsconfig = @import("tsconfig.zig");
+pub const jsonc = @import("jsonc.zig");
+pub const glob = @import("glob.zig");
 pub const render = @import("report/render.zig");
 pub const report = @import("report/report.zig");
 
@@ -26,6 +35,7 @@ pub const version = "0.0.1-dev";
 test {
     _ = source;
     _ = intern;
+    _ = spelling;
     _ = zeropage;
     _ = scanner;
     _ = diagnostics;
@@ -40,6 +50,8 @@ test {
     _ = modules;
     _ = checker;
     _ = tsconfig;
+    _ = jsonc;
+    _ = glob;
     _ = render;
     _ = report;
 }
