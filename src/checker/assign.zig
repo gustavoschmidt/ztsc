@@ -2050,7 +2050,7 @@ const measured_variance_decides = false;
 /// the size of its stack-allocated queue). A declared `extends` graph is a
 /// handful of links wide in practice; past the cap the structural walk
 /// answers, as it did before the fast path.
-pub const max_heritage_walk: usize = 64;
+const max_heritage_walk: usize = 64;
 
 /// Is the source RELATED TO the target because the target IS one of the
 /// source's declared bases?
@@ -2397,7 +2397,7 @@ pub fn condTrueUnderExtends(c: *Checker, cond: TypeId) Error!TypeId {
 /// Returns the branch unchanged unless the check type is a bare type
 /// parameter (the only case a substitution can express), so a caller pays one
 /// `instantiate` and only where the substitution can matter.
-pub fn condTrueOverExtends(c: *Checker, cond: TypeId) Error!TypeId {
+fn condTrueOverExtends(c: *Checker, cond: TypeId) Error!TypeId {
     const s = &c.ts;
     const chk = s.condCheck(cond);
     const tru = s.condTrue(cond);
@@ -2433,7 +2433,7 @@ pub fn condTrueOverExtends(c: *Checker, cond: TypeId) Error!TypeId {
 /// structurally on the `ZodPipe<…>` that `transform` returns.
 ///
 /// Additive: every caller falls through to its previous rule on `false`.
-pub fn condBranchwiseRelated(c: *Checker, s: TypeId, t: TypeId) Error!bool {
+fn condBranchwiseRelated(c: *Checker, s: TypeId, t: TypeId) Error!bool {
     const st = &c.ts;
     if (st.condExtends(s) != st.condExtends(t)) return false;
     const s_chk = st.condCheck(s);
@@ -3050,7 +3050,7 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
 /// be: `table` is the member table to read names, flags and counts out of, and
 /// `ref` is the reference whose substitution a member's TYPE is computed under
 /// (0 when `table` is already the materialized object). See `lazyTableOf`.
-pub const ObjSide = struct {
+const ObjSide = struct {
     table: TypeId,
     ref: TypeId = 0,
 
