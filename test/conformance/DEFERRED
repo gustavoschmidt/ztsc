@@ -259,3 +259,48 @@ assignability/097_written_type_argument_constraint_sites.ts  -TS2344 32
 assignability/097_written_type_argument_constraint_sites.ts  -TS2344 42
 assignability/097_written_type_argument_constraint_sites.ts  -TS2344 43
 assignability/097_written_type_argument_constraint_sites.ts  -TS2344 48
+
+# LEGACY (`experimentalDecorators`) decorator resolution, the parts ztsc does
+# not do. The call itself IS resolved now (`checkLegacyDecoratorSig`, and
+# 010_legacy_signature_failures pins every code, span and wording it produces —
+# outline's sixty TS1240s among them). What is left out is, in order of the
+# case's own numbering:
+#
+#   * an OVERLOAD SET where every candidate fails (51). tsc reports the last
+#     candidate's argument error inside a nested "No overload matches this
+#     call." / "The last overload gave the following error." chain, a second
+#     reporting shape on top of the head message; ztsc resolves a single
+#     signature only.
+#   * a GENERIC decorator (52). Its parameters are only judgeable after the
+#     type arguments are inferred from the synthesized tuple, and this path
+#     does no inference.
+#   * a NON-CALLABLE decorator (53) — tsc's "This expression is not callable."
+#     Its guard is `isUntypedFunctionCall`, i.e. assignability to the global
+#     `Function`, so a `Function`-typed decorator must stay silent while a
+#     plain object must not; the distinction is not modelled.
+#   * TS1329, a decorator FACTORY left uncalled (54). This one is not just
+#     skipped but explicitly suppressed: the arity failure ztsc would
+#     otherwise report is the WRONG diagnostic for the shape (tsc's
+#     `isPotentiallyUncalledDecorator` runs ahead of the arity check), so the
+#     guard is in `checkLegacyDecoratorSig` and the missing report is the
+#     price of not inventing a different one.
+#   * a UNION-typed decorator (55), whose call signature is the union's
+#     combined one (parameters intersected).
+#   * the decorator's RETURN type (56) — TS1270/TS1271, a separate family from
+#     the signature codes and a separate check.
+#   * PARAMETER decorators (58, 59): TS1239 is unreachable because the parser
+#     DISCARDS a legacy parameter decorator's expression rather than hanging it
+#     off the parameter (`parseParam`), so there is no node to resolve. This is
+#     a frontend gap, not a checker one.
+#
+# Every entry is a missed error on a shape the oracle rejects; none of them can
+# turn into a false positive, which is why the resolution landed without them.
+# Measured 2026-08-12.
+decorators/011_legacy_signature_gaps  -TS1240 entry.ts 51
+decorators/011_legacy_signature_gaps  -TS1240 entry.ts 52
+decorators/011_legacy_signature_gaps  -TS1240 entry.ts 53
+decorators/011_legacy_signature_gaps  -TS1329 entry.ts 54
+decorators/011_legacy_signature_gaps  -TS1240 entry.ts 55
+decorators/011_legacy_signature_gaps  -TS1271 entry.ts 56
+decorators/011_legacy_signature_gaps  -TS1239 entry.ts 58
+decorators/011_legacy_signature_gaps  -TS1239 entry.ts 59
