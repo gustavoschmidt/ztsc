@@ -1665,6 +1665,84 @@ pub fn isBareOrUnionMember(c: *Checker, t: TypeId, tp_sym: u32) bool {
     return false;
 }
 
+/// The in-flight type-argument inference of one call — tsc's
+/// `InferenceContext`, whose per-type-parameter rows are its `InferenceInfo`s.
+/// `inferTypeArgs` builds one, publishes it as `Checker.infer_ctx` for the
+/// duration of that call's inference and restores the enclosing one on the way
+/// out (a nested call gets its own, starting at variance zero); `unify` and the
+/// reverse-mapped subsystem reach it through the `contraSlot`, `topSlot` and
+/// `revSlot` accessors.
+///
+/// `unify`'s signature carries only the covariant `candidates` array, and many
+/// of the arrays it is handed are NOT this context's: a reverse-mapped
+/// element's own accumulator, a speculative copy, a generic argument's own type
+/// parameters. `owner` is what tells them apart — the accessors compare it
+/// against the `candidates.ptr` they were handed, so a foreign array gets
+/// `null` back and the walk runs without side tables.
+pub const InferCtx = struct {
+    /// Identity of the covariant accumulator that `contra`, `contra_sup` and
+    /// `top_flags` belong to: `inferTypeArgs`'s own `candidates.ptr`.
+    owner: ?[*]TypeId = null,
+    /// Contravariant inference candidates, one per type parameter — tsc's
+    /// `InferenceInfo.contraCandidates`.
+    contra: []TypeId = &.{},
+    /// The UNION of every contravariant candidate recorded for each type
+    /// parameter, alongside `contra`'s common-subtype fold. tsc keeps the
+    /// candidates as a LIST and `getInferredType` asks
+    /// `some(inference.contraCandidates, t => isTypeSubtypeOf(inferredCovariantType, t))`
+    /// — whether ANY ONE of them still accepts the covariant answer — which the
+    /// folded common subtype alone cannot answer.
+    contra_sup: []TypeId = &.{},
+    /// tsc's `InferenceInfo.topLevel`, one flag per type parameter: false once a
+    /// candidate has been recorded from a position that is not at the top level
+    /// of the parameter type it came from. Only a still-top-level parameter
+    /// widens a fresh-literal candidate (`getCovariantInference`).
+    top_flags: []bool = &.{},
+    /// The priority tier. Registered SEPARATELY from `owner` — see `Rev`.
+    rev: Rev = .{},
+    /// Parameter-position nesting depth inside `unify`: odd means the current
+    /// inference position is contravariant. tsc flips the same bit in
+    /// `inferFromContravariantTypes` when it descends a signature's parameters.
+    contra_pos: u32 = 0,
+    /// Non-zero while `unify` is running *inside* a homomorphic-mapped-parameter
+    /// inference (the alias-identity pairing in `inferReverseMapped`), so the
+    /// candidates it records carry the same `InferencePriority.
+    /// HomomorphicMappedType` the reverse-mapped rebuild they replace does: they
+    /// stand down for a direct structural match and are discarded when one
+    /// already answered.
+    rev_prio: u32 = 0,
+    /// Nesting depth inside `unify` below a non-top-level constructor. Unions
+    /// and intersections preserve top-level-ness (tsc's
+    /// `isTypeParameterAtTopLevel` descends them); everything else does not.
+    nontop_depth: u32 = 0,
+
+    /// tsc's `InferencePriority.HomomorphicMappedType`, one flag per type
+    /// parameter: true while the only evidence recorded for it came from
+    /// REVERSE-MAPPED inference (`Partial<T>`, `Readonly<T>`, a homomorphic
+    /// mapped parameter). tsc keeps only the candidates at the best priority it
+    /// saw, so a direct structural candidate replaces a reverse-mapped one
+    /// outright and a reverse-mapped one arriving second is discarded. Also
+    /// carries tsc's `InferencePriority.NakedTypeVariable` — an inference made
+    /// directly to a bare type variable reached through a conditional's branch,
+    /// which is "less specific" the same way and loses to a direct candidate by
+    /// the same rule.
+    ///
+    /// It carries its OWN `owner`, deliberately: the two-round context-sensitive
+    /// probe in `inferTypeArgs` infers this very call into a SCRATCH copy of the
+    /// candidate array, and the priority tier has to hold there too — the
+    /// probe's answer is what pins each context-sensitive callback's parameter
+    /// types for the authoritative pass. So the probe re-points this half at its
+    /// scratch array while the rest of the context keeps pointing at the real
+    /// accumulator: `revSlot` answers for the probe, `contraSlot` and `topSlot`
+    /// do not. Contravariant candidates and the top-level flags must NOT follow
+    /// it there — those are read back after the walk, and the probe's copy is
+    /// discarded.
+    pub const Rev = struct {
+        owner: ?[*]TypeId = null,
+        flags: []bool = &.{},
+    };
+};
+
 /// Basic unification: gather candidates for each type parameter from
 /// argument types matched against parameter positions; default to the
 /// constraint or `unknown`.
@@ -1686,7 +1764,7 @@ pub fn inferTypeArgs(
     // A nested call's inference gets its own, and starts at variance zero.
     const contra = try c.scratch().alloc(TypeId, tp_syms.len);
     for (contra) |*x| x.* = types.no_type;
-    // Its per-candidate half (see `Checker.contra_sup`).
+    // Its per-candidate half (see `InferCtx.contra_sup`).
     const contra_sup = try c.scratch().alloc(TypeId, tp_syms.len);
     for (contra_sup) |*x| x.* = types.no_type;
     // tsc's `InferenceInfo.topLevel`, registered the same way.
@@ -1695,35 +1773,17 @@ pub fn inferTypeArgs(
     // tsc's `InferencePriority.HomomorphicMappedType`, registered the same way.
     const rev_flags = try c.scratch().alloc(bool, tp_syms.len);
     for (rev_flags) |*x| x.* = false;
-    const saved_contra_cands = c.contra_cands;
-    const saved_contra_sup = c.contra_sup;
-    const saved_contra_owner = c.contra_owner;
-    const saved_contra_pos = c.contra_pos;
-    const saved_top_flags = c.top_flags;
-    const saved_rev_flags = c.rev_flags;
-    const saved_rev_owner = c.rev_owner;
-    const saved_rev_prio = c.rev_prio;
-    const saved_nontop_depth = c.nontop_depth;
-    c.contra_cands = contra;
-    c.contra_sup = contra_sup;
-    c.contra_owner = candidates.ptr;
-    c.contra_pos = 0;
-    c.top_flags = top_flags;
-    c.rev_flags = rev_flags;
-    c.rev_owner = candidates.ptr;
-    c.rev_prio = 0;
-    c.nontop_depth = 0;
-    defer {
-        c.contra_cands = saved_contra_cands;
-        c.contra_sup = saved_contra_sup;
-        c.contra_owner = saved_contra_owner;
-        c.contra_pos = saved_contra_pos;
-        c.top_flags = saved_top_flags;
-        c.rev_flags = saved_rev_flags;
-        c.rev_owner = saved_rev_owner;
-        c.rev_prio = saved_rev_prio;
-        c.nontop_depth = saved_nontop_depth;
-    }
+    // Publish the whole context at once, and put the enclosing call's back
+    // when this one is done.
+    const saved_ctx = c.infer_ctx;
+    c.infer_ctx = .{
+        .owner = candidates.ptr,
+        .contra = contra,
+        .contra_sup = contra_sup,
+        .top_flags = top_flags,
+        .rev = .{ .owner = candidates.ptr, .flags = rev_flags },
+    };
+    defer c.infer_ctx = saved_ctx;
 
     // This call's inference variables are in flight for the whole of it —
     // see `infer_active`. A NESTED call's contextual-return inference must
@@ -1968,16 +2028,16 @@ pub fn inferTypeArgs(
                         // `NakedTypeVariable` priority lands here at full
                         // priority and pins the very parameter the probe's
                         // answer will hand every context-sensitive callback.
+                        // Only the priority half is re-registered: the rest of
+                        // the context keeps pointing at the real accumulator,
+                        // so the probe's walk records no contravariant
+                        // candidate and clears no top-level flag (see
+                        // `InferCtx.Rev`).
                         const probe_rev = try c.scratch().alloc(bool, tp_syms.len);
                         for (probe_rev) |*x| x.* = false;
-                        const outer_rev_flags = c.rev_flags;
-                        const outer_rev_owner = c.rev_owner;
-                        c.rev_flags = probe_rev;
-                        c.rev_owner = probe_cands.ptr;
-                        defer {
-                            c.rev_flags = outer_rev_flags;
-                            c.rev_owner = outer_rev_owner;
-                        }
+                        const outer_rev = c.infer_ctx.rev;
+                        c.infer_ctx.rev = .{ .owner = probe_cands.ptr, .flags = probe_rev };
+                        defer c.infer_ctx.rev = outer_rev;
                         const probe = try c.checkExprCached(an, arg_ctx);
                         try c.unify(pt, probe, tp_syms, probe_cands, 0);
                     }
@@ -2444,7 +2504,7 @@ pub fn inferTypeArgs(
     // common subtype is `string` — so testing the fold alone rejected the
     // covariant `string | null` that `() => hoveredItemSV.get()` supplies and
     // reported TS2322 on the FIRST argument. `contra_sup` is the union of the
-    // candidates, standing in for the `some` (see `Checker.contra_sup`).
+    // candidates, standing in for the `some` (see `InferCtx.contra_sup`).
     for (candidates, 0..) |*cd, i| {
         const ct = contra[i];
         if (ct == types.no_type) continue;
@@ -3025,38 +3085,45 @@ pub fn combineContravariant(c: *Checker, prev: TypeId, cand: TypeId) Error!TypeI
 /// current inference position is a parameter position AND `candidates` is
 /// the accumulator the in-flight call registered.
 pub fn contraSlot(c: *Checker, candidates: []TypeId, i: usize) ?*TypeId {
-    if (c.contra_pos % 2 == 0) return null;
-    if (c.contra_owner != candidates.ptr) return null;
-    if (c.contra_cands.len != candidates.len) return null;
-    return &c.contra_cands[i];
+    const ctx = &c.infer_ctx;
+    if (ctx.contra_pos % 2 == 0) return null;
+    if (ctx.owner != candidates.ptr) return null;
+    if (ctx.contra.len != candidates.len) return null;
+    return &ctx.contra[i];
 }
 
 /// Record `cand` in the union half of the contravariant candidate set (see
-/// `Checker.contra_sup`). Called wherever `contraSlot` is written.
+/// `InferCtx.contra_sup`). Called wherever `contraSlot` is written — which is
+/// where the ownership check has already been made, so this only has to agree
+/// on the shape.
 pub fn noteContraCandidate(c: *Checker, candidates: []TypeId, i: usize, cand: TypeId) Error!void {
-    if (c.contra_sup.len != candidates.len) return;
-    c.contra_sup[i] = if (c.contra_sup[i] == types.no_type)
+    const ctx = &c.infer_ctx;
+    if (ctx.contra_sup.len != candidates.len) return;
+    ctx.contra_sup[i] = if (ctx.contra_sup[i] == types.no_type)
         cand
     else
-        try c.ts.makeUnion(c.scratch(), &.{ c.contra_sup[i], cand });
+        try c.ts.makeUnion(c.scratch(), &.{ ctx.contra_sup[i], cand });
 }
 
 /// The `topLevel` flag for type parameter `i`, when `candidates` is the
 /// accumulator the in-flight call registered (same identity rule as
 /// `contraSlot`).
 pub fn topSlot(c: *Checker, candidates: []TypeId, i: usize) ?*bool {
-    if (c.contra_owner != candidates.ptr) return null;
-    if (c.top_flags.len != candidates.len) return null;
-    return &c.top_flags[i];
+    const ctx = &c.infer_ctx;
+    if (ctx.owner != candidates.ptr) return null;
+    if (ctx.top_flags.len != candidates.len) return null;
+    return &ctx.top_flags[i];
 }
 
-/// The lower-priority flag for type parameter `i`. Identity is `rev_owner`
-/// rather than `contra_owner`, so the two-round probe's scratch accumulator
-/// can register for the priority tier alone (see `Checker.rev_flags`).
+/// The lower-priority flag for type parameter `i`. Identity is the priority
+/// half's OWN owner rather than the context's, so the two-round probe's
+/// scratch accumulator can register for the priority tier alone (see
+/// `InferCtx.Rev`).
 pub fn revSlot(c: *Checker, candidates: []TypeId, i: usize) ?*bool {
-    if (c.rev_owner != candidates.ptr) return null;
-    if (c.rev_flags.len != candidates.len) return null;
-    return &c.rev_flags[i];
+    const rev = &c.infer_ctx.rev;
+    if (rev.owner != candidates.ptr) return null;
+    if (rev.flags.len != candidates.len) return null;
+    return &rev.flags[i];
 }
 
 /// tsc's `inferFromTupleTypes` prefix/suffix rule, for the one case ztsc's
@@ -3218,9 +3285,9 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
         .type_param, .union_type, .intersection => false,
         else => true,
     };
-    if (buries) c.nontop_depth += 1;
+    if (buries) c.infer_ctx.nontop_depth += 1;
     defer if (buries) {
-        c.nontop_depth -= 1;
+        c.infer_ctx.nontop_depth -= 1;
     };
     switch (s.kind(param)) {
         .type_param => {
@@ -3240,7 +3307,7 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                 // An inference was MADE here, whatever it does to the slot —
                 // see `Checker.infer_writes`.
                 c.infer_writes +%= 1;
-                if (c.nontop_depth > 0) {
+                if (c.infer_ctx.nontop_depth > 0) {
                     if (c.topSlot(candidates, i)) |f| f.* = false;
                 }
                 // A candidate found in a PARAMETER position is
@@ -3259,7 +3326,7 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                 // homomorphic-mapped parameter stands down for a direct
                 // incumbent.
                 if (c.revSlot(candidates, i)) |rf| {
-                    if (c.rev_prio > 0) {
+                    if (c.infer_ctx.rev_prio > 0) {
                         if (candidates[i] != types.no_type and !rf.*) return;
                         rf.* = true;
                     } else if (rf.*) {
@@ -4193,9 +4260,9 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                 // signature was written as a METHOD, whose parameters tsc
                 // relates bivariantly and infers from covariantly.
                 const bivariant = s.fnFlags(param) & types.fn_flag_method != 0;
-                if (!bivariant) c.contra_pos += 1;
+                if (!bivariant) c.infer_ctx.contra_pos += 1;
                 defer if (!bivariant) {
-                    c.contra_pos -= 1;
+                    c.infer_ctx.contra_pos -= 1;
                 };
                 for (0..n) |i| {
                     try c.unify(s.fnParam(param, @intCast(i)).ty, s.fnParam(ra, @intCast(i)).ty, tp_syms, candidates, depth + 1);
@@ -4298,8 +4365,8 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
             if (!t_naked) try c.unify(s.condTrue(param), arg, tp_syms, candidates, depth + 1);
             if (!f_naked) try c.unify(s.condFalse(param), arg, tp_syms, candidates, depth + 1);
             if (t_naked or f_naked) {
-                c.rev_prio += 1;
-                defer c.rev_prio -= 1;
+                c.infer_ctx.rev_prio += 1;
+                defer c.infer_ctx.rev_prio -= 1;
                 if (t_naked) try c.unify(s.condTrue(param), arg, tp_syms, candidates, depth + 1);
                 if (f_naked) try c.unify(s.condFalse(param), arg, tp_syms, candidates, depth + 1);
             }
@@ -4595,8 +4662,8 @@ pub fn inferReverseMapped(c: *Checker, m: TypeId, arg: TypeId, tp_syms: []const 
                     // postProcess)` must answer the `S` its first two
                     // arguments supply, not the `Observed` that
                     // `postProcess`'s erased `Partial<Observed>` names).
-                    c.rev_prio += 1;
-                    defer c.rev_prio -= 1;
+                    c.infer_ctx.rev_prio += 1;
+                    defer c.infer_ctx.rev_prio -= 1;
                     for (0..n) |i| try c.unify(pa[i], aa[i], tp_syms, candidates, depth + 1);
                     return;
                 }

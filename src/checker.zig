@@ -1334,7 +1334,7 @@ pub const Checker = struct {
     /// worse one is discarded; an equal one combines. `infer_prio_owner` is the
     /// identity of the `vals` array they belong to, so a nested match reached
     /// through an `instantiate` inside this walk simply does not participate
-    /// (the same ownership rule `contra_owner` uses in `calls.zig`).
+    /// (the same ownership rule `calls.InferCtx.owner` uses).
     infer_prio_of: []u16 = &.{},
     infer_prio_owner: ?[*]TypeId = null,
     /// `substThis` memo, keyed `(t << 32 | repl)`. Substituting a receiver into
@@ -2054,63 +2054,16 @@ pub const Checker = struct {
     /// this says whether any is in flight at all, and `unify` pays for the
     /// containment scan only while it is set.
     aft_seen: bool = false,
-    /// Contravariant inference candidates for the in-flight call, one per type
-    /// parameter — tsc's `InferenceInfo.contraCandidates`. `contra_owner` is
-    /// the identity of the covariant accumulator they belong to, so the many
-    /// other arrays `unify` is handed (a reverse-mapped element, a speculative
-    /// copy, a generic argument's own type params) simply do not participate.
-    /// Saved and restored around a nested call's inference.
-    contra_cands: []TypeId = &.{},
-    /// The UNION of every contravariant candidate recorded for each type
-    /// parameter, alongside `contra_cands`'s common-subtype fold. tsc keeps
-    /// the candidates as a LIST and `getInferredType` asks
-    /// `some(inference.contraCandidates, t => isTypeSubtypeOf(inferredCovariantType, t))`
-    /// — whether ANY ONE of them still accepts the covariant answer — which
-    /// the folded common subtype alone cannot answer. Same ownership rule as
-    /// `contra_cands`.
-    contra_sup: []TypeId = &.{},
-    contra_owner: ?[*]TypeId = null,
-    /// Parameter-position nesting depth inside `unify`: odd means the current
-    /// inference position is contravariant. tsc flips the same bit in
-    /// `inferFromContravariantTypes` when it descends a signature's parameters.
-    contra_pos: u32 = 0,
-    /// tsc's `InferenceInfo.topLevel`, one flag per type parameter of the
-    /// in-flight call: false once a candidate has been recorded from a position
-    /// that is not at the top level of the parameter type it came from. Only a
-    /// still-top-level parameter widens a fresh-literal candidate
-    /// (`getCovariantInference`). Shares `contra_owner`'s identity check.
-    top_flags: []bool = &.{},
-    /// tsc's `InferencePriority.HomomorphicMappedType`, one flag per type
-    /// parameter of the in-flight call: true while the only evidence recorded
-    /// for it came from REVERSE-MAPPED inference (`Partial<T>`, `Readonly<T>`,
-    /// a homomorphic mapped parameter). tsc keeps only the candidates at the
-    /// best priority it saw, so a direct structural candidate replaces a
-    /// reverse-mapped one outright and a reverse-mapped one arriving second is
-    /// discarded. Also carries tsc's `InferencePriority.NakedTypeVariable` —
-    /// an inference made directly to a bare type variable reached through a
-    /// conditional's branch, which is "less specific" the same way and loses
-    /// to a direct candidate by the same rule.
-    ///
-    /// Identity is `rev_owner`, NOT `contra_owner`: the two-round
-    /// context-sensitive probe infers this very call into a SCRATCH copy of
-    /// the candidate array, and the priority tier has to hold there too —
-    /// the probe's answer is what pins each context-sensitive callback's
-    /// parameter types for the authoritative pass. Contravariant candidates
-    /// and the top-level flags deliberately do NOT follow it there: those
-    /// are read back after the walk, and the probe's copy is discarded.
-    rev_flags: []bool = &.{},
-    rev_owner: ?[*]TypeId = null,
-    /// Non-zero while `unify` is running *inside* a homomorphic-mapped-parameter
-    /// inference (the alias-identity pairing in `inferReverseMapped`), so the
-    /// candidates it records carry the same `InferencePriority.
-    /// HomomorphicMappedType` the reverse-mapped rebuild they replace does: they
-    /// stand down for a direct structural match and are discarded when one
-    /// already answered.
-    rev_prio: u32 = 0,
-    /// Nesting depth inside `unify` below a non-top-level constructor. Unions
-    /// and intersections preserve top-level-ness (tsc's
-    /// `isTypeParameterAtTopLevel` descends them); everything else does not.
-    nontop_depth: u32 = 0,
+    /// The in-flight call's type-argument inference — tsc's
+    /// `InferenceContext`: the contravariant candidates, the top-level and
+    /// priority flags, and the variance/top-level depths `unify` walks with.
+    /// `inferTypeArgs` publishes one here for the duration of a call's
+    /// inference and restores the enclosing one afterwards; the accessors
+    /// (`contraSlot`, `topSlot`, `revSlot`) match it against the `candidates`
+    /// array they are handed, so the many other arrays `unify` is asked to fill
+    /// (a reverse-mapped element, a speculative copy, a generic argument's own
+    /// type params) simply do not participate. See `calls.InferCtx`.
+    infer_ctx: @import("checker/calls.zig").InferCtx = .{},
     /// Monotone count of candidate WRITES performed by `unify`. tsc's
     /// `inferToMultipleTypes` decides whether a source constituent was
     /// "matched" by watching `inferencePriority` — i.e. whether an inference
@@ -3743,6 +3696,7 @@ pub const Checker = struct {
     pub const checkCallArguments = calls_zig.checkCallArguments;
     pub const checkCallArgumentsAnchored = calls_zig.checkCallArgumentsAnchored;
     pub const CallShape = calls_zig.CallShape;
+    pub const InferCtx = calls_zig.InferCtx;
 
     const flow_zig = @import("checker/flow.zig");
     pub const makeRefKey = flow_zig.makeRefKey;
