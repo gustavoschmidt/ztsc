@@ -55,7 +55,6 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const scanner = @import("scanner.zig");
 const ast = @import("ast.zig");
-const types = @import("../types.zig");
 const diagnostics = @import("diagnostics.zig");
 const directives = @import("directives.zig");
 
@@ -65,7 +64,9 @@ const Node = ast.Node;
 const null_node = ast.null_node;
 const Code = diagnostics.Code;
 
-pub const Error = error{OutOfMemory};
+/// Internal error set of the node-building helpers. NOT `parse`'s error set,
+/// which also carries `SourceTooLarge`.
+const Error = error{OutOfMemory};
 /// Internal error set: Backtrack is only raised while speculating and never
 /// escapes `parse`.
 const PE = error{ OutOfMemory, Backtrack };
@@ -82,11 +83,9 @@ pub fn isJsxPath(path: []const u8) bool {
 /// A `.d.ts`/`.d.mts`/`.d.cts` declaration file is an entirely ambient context:
 /// every declaration is implicitly `declare`, so namespace members are visible
 /// as `N.member` without an explicit `export` (tsc's ambient-namespace rule).
-pub fn isDeclarationPath(path: []const u8) bool {
-    return std.mem.endsWith(u8, path, ".d.ts") or
-        std.mem.endsWith(u8, path, ".d.mts") or
-        std.mem.endsWith(u8, path, ".d.cts");
-}
+/// One implementation, in the path utilities; re-exported here because the
+/// front end's callers reach for it as `parser.isDeclarationPath`.
+pub const isDeclarationPath = @import("../link/paths.zig").isDeclarationPath;
 
 /// Everything the tsconfig can change about the GRAMMAR itself. Kept to the
 /// options that decide whether a byte sequence parses at all, so a file's
@@ -99,6 +98,13 @@ pub const Opts = struct {
     /// whose grammar allows decorators on PARAMETERS. Off (the standard TC39
     /// dialect) a parameter decorator is TS1206. See `tsconfig.Config`.
     experimental_decorators: bool = false,
+    /// Backing allocator for the transient parse arena (see `parseOpts`).
+    /// Null — the default — uses `std.heap.page_allocator`, which is what
+    /// every caller wants: the arena is freed before `parseOpts` returns, so
+    /// going straight to the OS avoids churning a shared allocator from many
+    /// parse threads at once. Set it to hand the parse its own memory (tests,
+    /// a failing allocator, an allocation budget).
+    scratch: ?std.mem.Allocator = null,
 };
 
 pub fn parse(gpa: Allocator, src: []const u8) error{ OutOfMemory, SourceTooLarge }!ast.Ast {
@@ -111,7 +117,7 @@ pub fn parseOpts(gpa: Allocator, src: []const u8, opts: Opts) error{ OutOfMemory
     // doubling reallocs and their final tail slack are freed here, then
     // seal exact-size copies into `gpa` (the retained per-file arena). The
     // AST is pointer-free u32 data, so a flat copy is self-consistent.
-    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var scratch = std.heap.ArenaAllocator.init(opts.scratch orelse std.heap.page_allocator);
     defer scratch.deinit();
     var p: Parser = .{
         .gpa = scratch.allocator(),
@@ -3792,18 +3798,18 @@ const Parser = struct {
         if (p.curTag() == .plus and p.peekTag(1) == .keyword_readonly) {
             _ = try p.bump();
             _ = try p.bump();
-            flags |= types.mapped_flag_readonly_add;
+            flags |= ast.mapped_flag_readonly_add;
             is_mapped = true;
         } else if (p.curTag() == .minus and p.peekTag(1) == .keyword_readonly) {
             _ = try p.bump();
             _ = try p.bump();
-            flags |= types.mapped_flag_readonly_remove;
+            flags |= ast.mapped_flag_readonly_remove;
             is_mapped = true;
         } else if (p.curTag() == .keyword_readonly and p.peekTag(1) == .l_bracket and
             isIdentLike(p.peekTag(2)) and p.peekTag(3) == .keyword_in)
         {
             _ = try p.bump();
-            flags |= types.mapped_flag_readonly_add;
+            flags |= ast.mapped_flag_readonly_add;
             is_mapped = true;
         } else if (p.curTag() == .l_bracket and isIdentLike(p.peekTag(1)) and p.peekTag(2) == .keyword_in) {
             is_mapped = true;
@@ -3890,14 +3896,14 @@ const Parser = struct {
         if (p.curTag() == .plus and p.peekTag(1) == .question) {
             _ = try p.bump();
             _ = try p.bump();
-            flags |= types.mapped_flag_optional_add;
+            flags |= ast.mapped_flag_optional_add;
         } else if (p.curTag() == .minus and p.peekTag(1) == .question) {
             _ = try p.bump();
             _ = try p.bump();
-            flags |= types.mapped_flag_optional_remove;
+            flags |= ast.mapped_flag_optional_remove;
         } else if (p.curTag() == .question) {
             _ = try p.bump();
-            flags |= types.mapped_flag_optional_add;
+            flags |= ast.mapped_flag_optional_add;
         }
         var value: Node = null_node;
         if (try p.eat(.colon) != null) value = try p.parseType();

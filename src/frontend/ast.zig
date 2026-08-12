@@ -579,8 +579,19 @@ pub const ConditionalType = struct { extends_type: Node, true_type: Node, false_
 /// Payload for a `mapped_type_node`. `key_name_token` names `K`;
 /// `constraint` is the `in` operand; `as_type` is the optional remap (or
 /// `null_node`); `value` is the property type (or `null_node`); `flags` carries
-/// the modifier bits (`mapped_flag_*` in types.zig).
+/// the modifier bits (`mapped_flag_*` below).
 pub const MappedTypeData = struct { key_name_token: TokenIndex, constraint: Node, as_type: Node, value: Node, flags: u32 };
+
+// Mapped-type modifier flags, stored in `MappedTypeData.flags`. Set by the
+// parser (`+`/`-`/bare) and interpreted by the checker, which carries them
+// through into a mapped type's `data_b` (and repeats them as its final extra
+// word so they participate in hash-cons identity); types.zig re-exports them
+// under the same names.
+pub const mapped_flag_readonly_add: u32 = 1; // `+readonly` / `readonly`
+pub const mapped_flag_readonly_remove: u32 = 2; // `-readonly`
+pub const mapped_flag_optional_add: u32 = 4; // `+?` / `?`
+pub const mapped_flag_optional_remove: u32 = 8; // `-?`
+pub const mapped_flag_homomorphic: u32 = 16; // constraint was `keyof T`
 /// Payload for a `template_literal_type_node`. `holes_start..holes_end`
 /// is a SubRange of the interpolation type nodes; `chunks_start..chunks_end` is
 /// a parallel range of chunk token indices (one per hole: the `template_middle`
