@@ -49,7 +49,10 @@ const Io = std.Io;
 const tsconfig = @import("../tsconfig.zig");
 const paths = @import("paths.zig");
 
-const Error = @import("modules.zig").Error;
+/// Resolution's only failure mode is allocation. Spelled with the standard
+/// error set rather than the link layer's alias so this file has no back-edge
+/// to modules.zig (`modules.Error` IS this set).
+const Error = Allocator.Error;
 const blockedSubpathPath = paths.blockedSubpathPath;
 const dirnamePart = paths.dirnamePart;
 const endsWithAny = paths.endsWithAny;
