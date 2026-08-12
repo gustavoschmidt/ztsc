@@ -98,7 +98,7 @@ pub const FileId = modules.FileId;
 /// load-bearing: `sym_state` is a demand-zeroed `ZeroPagedArray`, so an
 /// untouched entry reads as `.not_computed` without ever being written — and
 /// without faulting its page resident. Do not reorder or renumber.
-pub const SymState = enum(u8) {
+const SymState = enum(u8) {
     not_computed = 0,
     in_progress = 1,
     computed = 2,
@@ -175,7 +175,9 @@ pub const Check = struct {
 };
 
 /// Type-check one bound file with an unlinked single-file program
-/// (imports type as `any`; no module diagnostics). Diagnostics and message
+/// (imports type as `any`; no module diagnostics). Exists for
+/// `checker/tests.zig`, whose cases are single files with no link step;
+/// every real entry point goes through `checkFiles`. Diagnostics and message
 /// strings go into `arena`; all type storage and caches live in an
 /// internal checker arena that is freed on return (the caller keeps only
 /// diagnostics + stats). Total on arbitrary parser/binder output: never
@@ -240,27 +242,6 @@ pub fn checkFilesAndDump(
         try w.print(";; {s}\n", .{prog.files[f].path});
         try c.dumpTypes(w);
     }
-    return c.seal();
-}
-
-/// Like `check`, but also renders `--dump-types` output (one
-/// `name: type` line per file-scope value declaration) into `w`.
-pub fn checkAndDump(
-    arena: Allocator,
-    io: Io,
-    gpa: Allocator,
-    interner: *Interner,
-    tree: *const Ast,
-    bind: *const Bind,
-    src: []const u8,
-    w: *std.Io.Writer,
-) (Error || std.Io.Writer.Error)!Check {
-    const prog = try arena.create(modules.Program);
-    prog.* = try modules.singleFileProgram(arena, "", src, tree, bind);
-    var c = try Checker.init(arena, io, gpa, interner, prog, &.{0}, null, true, 0);
-    defer c.deinit();
-    try c.run();
-    try c.dumpTypes(w);
     return c.seal();
 }
 
@@ -525,7 +506,7 @@ pub const rel_id_buckets = 64;
 /// One live relation frame's recursion identity for one side: the generic
 /// (`sym`) and the exact instantiation of it (`ref`, the interned origin ref).
 /// `relIdDeeplyNested` counts occurrences of `sym` whose `ref` keeps growing.
-pub const RelId = struct { sym: SymbolId, ref: TypeId };
+const RelId = struct { sym: SymbolId, ref: TypeId };
 /// Recursion-depth cap for alias-instance expansion (`aliasInstance`; see the
 /// `alias_depth` field). Fires only on pathological mutually-recursive generic
 /// alias chains (e.g. `@scalar/typebox`'s conditional type modules, whose
@@ -538,7 +519,7 @@ pub const RelId = struct { sym: SymbolId, ref: TypeId };
 pub const max_alias_depth = 200;
 pub const max_type_string = 160;
 
-pub const FnCtx = struct {
+const FnCtx = struct {
     /// Effective return-check target (0 = none / inferring). For an async
     /// function this is the awaited *payload* `T` of the declared
     /// `Promise<T>`, not the `Promise<T>` itself.
@@ -634,13 +615,13 @@ pub const PendingTypeArgs = struct {
 
 /// A memoized expression type together with the contextual type it was
 /// synthesized under (contextual re-check cache).
-pub const NodeType = struct { ty: TypeId, ctx: TypeId };
+const NodeType = struct { ty: TypeId, ctx: TypeId };
 
 /// One in-progress `interfaceGeneric` resolution (base-cycle detection).
-pub const IfaceFrame = struct { sym: SymbolId, resolving_base: bool = false };
+const IfaceFrame = struct { sym: SymbolId, resolving_base: bool = false };
 
 /// One in-progress `classStaticType` build (see `class_static_stack`).
-pub const StaticFrame = struct { sym: SymbolId, in_base: bool = false };
+const StaticFrame = struct { sym: SymbolId, in_base: bool = false };
 
 /// How deep `classStaticType` may nest before it cuts the base fold outright.
 /// A backstop only: the deepest real chain measured (outline's sequelize
@@ -811,7 +792,7 @@ pub const map_containers = [_][]const u8{
 pub const EnumMemberEntry = struct { name: Atom, value: TypeId };
 /// A memoized `keyof <object table>`, tagged with the `key_name_types`
 /// generation it was computed under — see `Checker.keyof_obj_cache`.
-pub const KeyofEntry = struct { ty: TypeId, gen: u32 };
+const KeyofEntry = struct { ty: TypeId, gen: u32 };
 
 /// Hash context for a DENSE INTEGER key — one 64-bit avalanche instead of
 /// `AutoContext`'s Wyhash over the key's bytes.
@@ -2643,7 +2624,7 @@ pub const Checker = struct {
     /// file/scope context: a lazy demand that crosses into another file must
     /// not carry the demanding frame's `this` — nor spend the demanding
     /// frame's budget — with it (see `enterSymFile`).
-    pub const SavedCtx = struct {
+    const SavedCtx = struct {
         file: FileId,
         scope: ScopeId,
         this_type: TypeId,
