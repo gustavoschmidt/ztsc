@@ -2312,6 +2312,70 @@ pub fn condTrueUnderExtends(c: *Checker, cond: TypeId) Error!TypeId {
     return c.reduceIndexedAccess(s.indexAccessObj(tru), s.condExtends(cond));
 }
 
+/// The same reading of a true branch as `condTrueUnderExtends`, for the other
+/// place the check type occurs: as the OBJECT of an indexed access (or
+/// anywhere else), rather than as its index. `T extends { _zod: { input: any
+/// } } ? T["_zod"]["input"] : unknown` — zod's `core.input<T>` — is that
+/// shape, and tsc reads its true branch as `(T & { _zod: … })["_zod"]["input"]`,
+/// whose base constraint is the `any` the extends type declares.
+///
+/// Substituting the check type with the EXTENDS type is the same widening
+/// `condTrueUnderExtends` performs, so it is likewise sound for a SOURCE
+/// position only: on the true branch every instantiation has `check <:
+/// extends`, and an indexed access is covariant in its object type.
+///
+/// Returns the branch unchanged unless the check type is a bare type
+/// parameter (the only case a substitution can express), so a caller pays one
+/// `instantiate` and only where the substitution can matter.
+pub fn condTrueOverExtends(c: *Checker, cond: TypeId) Error!TypeId {
+    const s = &c.ts;
+    const chk = s.condCheck(cond);
+    const tru = s.condTrue(cond);
+    if (s.kind(chk) != .type_param) return tru;
+    const map = [_]TpMap{.{ .sym = s.typeParamSymbol(chk), .ty = s.condExtends(cond) }};
+    return c.instantiate(tru, &map);
+}
+
+/// tsc's `structuredTypeRelatedTo`, conditional source against conditional
+/// target: the two `extends` types have to be identical, but the two CHECK
+/// types need only be related in EITHER direction
+/// (`isRelatedTo(source.checkType, target.checkType) ||
+/// isRelatedTo(target.checkType, source.checkType)`). Both conditionals then
+/// resolve the same way for any substitution that makes either check type
+/// concrete, so the pair relates branch-wise.
+///
+/// ztsc used to require the check types to be EQUAL, which is what made a
+/// DECLARATION-SITE VARIANCE MEASUREMENT of a parameter used behind such a
+/// conditional come out INVARIANT. The measurement substitutes the
+/// `sub`/`super` marker pair for the parameter (`measureOneVariance`) — a
+/// pair of check types related in exactly one direction — so neither
+/// `G<sub> → G<super>` nor its reverse could get past the conditional, and
+/// two instantiations of the generic then had to agree exactly.
+///
+/// zod v4 is built on that shape: `$ZodPipeDef<A, B>` carries
+/// `transform?: (…) => util.MaybeAsync<core.input<B>>` and
+/// `reverseTransform?: (value: core.input<B>, …) => util.MaybeAsync<core.output<A>>`,
+/// and `core.input<T>` is the deferred conditional
+/// `T extends { _zod: { input: any } } ? T["_zod"]["input"] : unknown`. With
+/// `A`/`B` measured invariant rather than bivariant, every
+/// `ZodObject<…> → ZodType<Record<string, unknown>>` — the
+/// `validate(Schema)` middleware signature all over outline's routes — failed
+/// structurally on the `ZodPipe<…>` that `transform` returns.
+///
+/// Additive: every caller falls through to its previous rule on `false`.
+pub fn condBranchwiseRelated(c: *Checker, s: TypeId, t: TypeId) Error!bool {
+    const st = &c.ts;
+    if (st.condExtends(s) != st.condExtends(t)) return false;
+    const s_chk = st.condCheck(s);
+    const t_chk = st.condCheck(t);
+    if (s_chk != t_chk) {
+        if (!(try c.isAssignable(s_chk, t_chk)) and !(try c.isAssignable(t_chk, s_chk))) return false;
+    }
+    const tru_ok = (try c.isAssignable(st.condTrue(s), st.condTrue(t))) or
+        (try c.isAssignable(try condTrueOverExtends(c, s), st.condTrue(t)));
+    return tru_ok and try c.isAssignable(st.condFalse(s), st.condFalse(t));
+}
+
 pub fn isCompound(k: types.Kind) bool {
     return switch (k) {
         .union_type, .intersection, .array, .tuple, .object, .function, .overloads, .ref, .class_value, .conditional, .mapped, .index_access, .template_literal_type, .keyof_op => true,
@@ -2355,6 +2419,7 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
             return (try c.isAssignable(c.ts.condTrue(s), c.ts.condTrue(t))) and
                 (try c.isAssignable(c.ts.condFalse(s), c.ts.condFalse(t)));
         }
+        if (tk == .conditional and try condBranchwiseRelated(c, s, t)) return true;
         // A UNION target may contain the matching conditional
         // (`T[] | (M extends X ? T : T[])`, the shape a function that
         // widens its own conditional return type has). Apply the same
@@ -2365,9 +2430,7 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
             for (try c.memberList(t)) |m| {
                 const rm = try c.resolveStructural(m);
                 if (c.ts.kind(rm) != .conditional) continue;
-                if (c.ts.condCheck(s) != c.ts.condCheck(rm) or c.ts.condExtends(s) != c.ts.condExtends(rm)) continue;
-                if ((try c.isAssignable(c.ts.condTrue(s), c.ts.condTrue(rm))) and
-                    (try c.isAssignable(c.ts.condFalse(s), c.ts.condFalse(rm)))) return true;
+                if (try condBranchwiseRelated(c, s, rm)) return true;
             }
         }
         return (try c.isAssignable(try c.condTrueUnderExtends(s), t)) and
