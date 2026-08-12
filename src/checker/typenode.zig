@@ -3555,6 +3555,29 @@ pub fn gatherSpreadProps(
             // (tsc), i.e. one alternative supplies no property at all — so
             // every folded property is optional when the union has one.
             var has_empty = false;
+            // Index signatures ARE carried out of the fold. tsc strips the
+            // nullish (and empty-object) members first — `tryMergeUnionOf
+            // ObjectTypeAndEmptyObject` — and when exactly ONE carrier is
+            // left it spreads that carrier through `getAnonymousPartial
+            // Type`, which keeps its index infos verbatim. So `{ ...attrs }`
+            // over `{ [x: string]: JSONValue } | undefined` keeps the string
+            // index instead of collapsing to `{}` (every `attrs.href` read
+            // was a bogus TS2339).
+            //
+            // With two or more carriers tsc DISTRIBUTES instead and each arm
+            // keeps only its own index infos. The fold is one object and
+            // cannot say that, so it carries an index kind only when EVERY
+            // carrier declares one, and unions their value types: a carrier
+            // without an index would, distributed, reject exactly the
+            // accesses the index permits, so carrying it anyway would
+            // silence real errors.
+            var idx_carriers: usize = 0;
+            var all_str = true;
+            var all_num = true;
+            var idx_str: std.ArrayList(TypeId) = .empty;
+            defer idx_str.deinit(c.scratch());
+            var idx_num: std.ArrayList(TypeId) = .empty;
+            defer idx_num.deinit(c.scratch());
             for (members) |m| {
                 const rm = try c.resolveStructural(m);
                 switch (c.ts.kind(rm)) {
@@ -3562,20 +3585,31 @@ pub fn gatherSpreadProps(
                         var mprops: std.ArrayList(types.Prop) = .empty;
                         var mindex: std.AutoHashMapUnmanaged(Atom, u32) = .empty;
                         defer mindex.deinit(c.scratch());
-                        // A union member's index signatures are not carried
-                        // into the fold (they were not before this arm
-                        // recursed either); a throwaway sink keeps the
-                        // recursive gather's contract.
-                        var sink_s: std.ArrayList(TypeId) = .empty;
-                        defer sink_s.deinit(c.scratch());
-                        var sink_n: std.ArrayList(TypeId) = .empty;
-                        defer sink_n.deinit(c.scratch());
-                        try c.gatherSpreadProps(rm, &mprops, &mindex, &sink_s, &sink_n);
+                        var ms: std.ArrayList(TypeId) = .empty;
+                        defer ms.deinit(c.scratch());
+                        var mn: std.ArrayList(TypeId) = .empty;
+                        defer mn.deinit(c.scratch());
+                        try c.gatherSpreadProps(rm, &mprops, &mindex, &ms, &mn);
                         try objs.append(c.scratch(), mprops.items);
+                        // An EMPTY object member (`{}`) is one of the members
+                        // tsc strips, so it neither votes on nor supplies an
+                        // index — it only makes the folded properties
+                        // optional, which an empty property list already
+                        // does.
+                        if (mprops.items.len == 0 and ms.items.len == 0 and mn.items.len == 0) continue;
+                        idx_carriers += 1;
+                        if (ms.items.len == 0) all_str = false;
+                        if (mn.items.len == 0) all_num = false;
+                        try idx_str.appendSlice(c.scratch(), ms.items);
+                        try idx_num.appendSlice(c.scratch(), mn.items);
                     },
                     .null, .undefined, .void => has_empty = true,
                     else => return,
                 }
+            }
+            if (idx_carriers > 0) {
+                if (all_str) try str_index_vals.appendSlice(c.scratch(), idx_str.items);
+                if (all_num) try num_index_vals.appendSlice(c.scratch(), idx_num.items);
             }
             if (objs.items.len == 0) return;
             var names: std.ArrayList(Atom) = .empty;
