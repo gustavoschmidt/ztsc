@@ -1735,7 +1735,28 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!bool {
         .any, .err, .never, .none => return true,
         else => {},
     }
-    if (tk == .void) return sk == .undefined or sk == .void;
+    // `void` accepts `undefined` and itself (tsc `isSimpleTypeRelatedTo`:
+    // `s & Undefined && t & (Undefined | Void)`), and nothing else — but this
+    // arm ran ahead of the SOURCE-UNION distribution in `isAssignableInner`
+    // and so answered for `void | undefined` as one opaque source. tsc has no
+    // such arm: it relates a union source constituent-wise, and each of those
+    // two constituents is related to `void`, so the union is. `void |
+    // undefined` is what a `.then(…)` callback or an optional-void return
+    // annotation produces, and it was rejected by the very type it came from.
+    // Falling THROUGH for a union source is the whole fix — every constituent
+    // comes back to this arm one frame down. A lazy alias `.ref` that stands
+    // for such a union (`type MaybeVoid = void | undefined`) is resolved here,
+    // the same way the union-target arm resolves one.
+    if (tk == .void) {
+        if (sk == .undefined or sk == .void) return true;
+        if (sk != .union_type) {
+            if (sk == .ref and !c.refExpandsToObject(s)) {
+                const rs = try c.resolveStructural(s);
+                if (rs != s and c.ts.kind(rs) == .union_type) return c.isAssignable(rs, t);
+            }
+            return false;
+        }
+    }
 
     // Literal -> base primitive.
     const base = try c.literalBaseOf(s);
@@ -3156,18 +3177,25 @@ fn lazyStructural(c: *Checker, sv: ObjSide, tv: ObjSide) Error!bool {
     for (0..n) |i| {
         const ti: u32 = @intCast(i);
         const t_opt = tv.flagsAt(c, ti) & types.prop_flag_optional != 0;
-        const si = sv.slotOf(c, tv.nameAt(c, ti)) orelse {
+        var st: TypeId = undefined;
+        if (sv.slotOf(c, tv.nameAt(c, ti))) |si| {
+            const s_opt = sv.flagsAt(c, si) & types.prop_flag_optional != 0;
+            if (s_opt and !t_opt) return false;
+            st = try sv.typeAt(c, si);
+            if (s_opt) st = try c.makeUnion2(st, types.undefined_type);
+        } else if (try c.objectInterfaceProp(tv.nameAt(c, ti))) |op| {
+            // The apparent global-`Object` member of that name — both sides
+            // here are object shapes, so the augment applies (see
+            // `relationSrcProp`, the eager walk's form of this).
+            st = op.ty;
+        } else {
             // The source has no member of that name — the eager walk's
             // `propOfTypeEx` miss, reached without substituting anything on
             // either side. This is the short circuit the whole conversion is
             // for: the answer never depended on the other members' types.
             if (t_opt) continue;
             return false;
-        };
-        const s_opt = sv.flagsAt(c, si) & types.prop_flag_optional != 0;
-        if (s_opt and !t_opt) return false;
-        var st = try sv.typeAt(c, si);
-        if (s_opt) st = try c.makeUnion2(st, types.undefined_type);
+        }
         var tt = try tv.typeAt(c, ti);
         if (t_opt) tt = try c.makeUnion2(tt, types.undefined_type);
         if (!try c.isAssignable(st, tt)) return false;
@@ -3187,7 +3215,14 @@ fn lazyStructural(c: *Checker, sv: ObjSide, tv: ObjSide) Error!bool {
     }
     if (tv.hasNumberIndex(c)) {
         const nidx = try tv.numberIndex(c);
-        if (sv.hasNumberIndex(c)) {
+        // The `any`-valued exemption applies to EVERY index info of the
+        // target, the number one included, whenever the target also has a
+        // string index signature — see `structuralAssignable`, which is the
+        // eager form of this walk.
+        const nidx_any = tv.hasStringIndex(c) and c.ts.kind(try c.resolveStructural(nidx)) == .any;
+        if (nidx_any) {
+            // vacuously related
+        } else if (sv.hasNumberIndex(c)) {
             if (!try c.isAssignable(try sv.numberIndex(c), nidx)) return false;
         } else if (sv.hasStringIndex(c)) {
             if (!try c.isAssignable(try sv.stringIndex(c), nidx)) return false;
@@ -3526,6 +3561,44 @@ pub fn tupleElemTypeAt(c: *Checker, t: TypeId, i: u32) Error!?TypeId {
     return null;
 }
 
+/// The RELATION's source-side property lookup: tsc's `getPropertyOfType`,
+/// including the tail `propOfTypeEx(…, false)` deliberately stops before —
+/// `return getPropertyOfObjectType(globalObjectType, name)`. Every object type
+/// also carries the apparent members of the global `Object` interface
+/// (`toString`, `valueOf`, `hasOwnProperty`, `constructor`, `isPrototypeOf`,
+/// `propertyIsEnumerable`, `toLocaleString`), so a source that declares none of
+/// them still satisfies a target that asks for one. That is what makes
+/// `object`, `{}`, and any interface or class instance assignable to `Object` —
+/// the target every `Object`-typed parameter in a lib, and in every hand-written
+/// API that predates `unknown`, is spelled with. Without it those pairs were
+/// TS2740 ("missing the following properties from type 'Object'"), and so was
+/// `{ toString(): string }`, `Object | number`, and `{ constructor: Function }`.
+///
+/// Member access already had the augment (`propOfTypeEx` with `allow_index`);
+/// what it stops short of is the RELATION, on the grounds that the
+/// excess-property check must not consult the global object type. That much is
+/// right — `isKnownProperty` does not, and neither may a *target*'s own
+/// property list — but `propertiesRelatedTo` and `getUnmatchedProperty` both
+/// call the augmenting `getPropertyOfType` on the SOURCE, so the relation does
+/// get it.
+///
+/// Consulted for an OPTIONAL target property too, exactly where tsc consults
+/// it: `getUnmatchedProperty` skips optional names, but the loop after it
+/// relates every target property the source *has*, and with the augment the
+/// source has these. `{ toString?: () => number }` is therefore a failure for
+/// every object rather than a vacuously satisfied weak type (oracle-verified,
+/// `assignability/object_interface_apparent_members`).
+///
+/// Restricted to sources whose apparent type is an object type: `object` maps
+/// to `{}` (tsc `getApparentType`, `TypeFlags.NonPrimitive → emptyObjectType`),
+/// while a primitive maps to its own lib interface, which declares these
+/// members itself and reaches them through `propOfTypeEx`.
+fn relationSrcProp(c: *Checker, s: TypeId, name: Atom) Error!?types.Prop {
+    if (try c.propOfTypeEx(s, name, false)) |p| return p;
+    if (!isNonPrimitiveKind(c.ts.kind(s))) return null;
+    return c.objectInterfaceProp(name);
+}
+
 /// Object-target structural check. `s` is any structural source
 /// (object, array/tuple/string via length lookup, function, ...).
 pub fn structuralAssignable(c: *Checker, s: TypeId, t: TypeId) Error!bool {
@@ -3582,7 +3655,7 @@ pub fn structuralAssignable(c: *Checker, s: TypeId, t: TypeId) Error!bool {
     for (0..n) |i| {
         const tp = c.ts.objectProp(t, @intCast(i));
         if (tp.optional()) continue;
-        if ((try c.propOfTypeEx(s, tp.name, false)) == null) return false;
+        if ((try relationSrcProp(c, s, tp.name)) == null) return false;
     }
     for (0..n) |i| {
         const tp = c.ts.objectProp(t, @intCast(i));
@@ -3590,7 +3663,7 @@ pub fn structuralAssignable(c: *Checker, s: TypeId, t: TypeId) Error!bool {
         // target property (tsc TS2741/TS2740); it is related separately as an
         // index signature below. So `{ [k: string]: any }` is not assignable
         // to `Date`/`{ x: number }`.
-        const sp = (try c.propOfTypeEx(s, tp.name, false)) orelse {
+        const sp = (try relationSrcProp(c, s, tp.name)) orelse {
             if (tp.optional()) continue;
             return false;
         };
@@ -3642,7 +3715,31 @@ pub fn structuralAssignable(c: *Checker, s: TypeId, t: TypeId) Error!bool {
     // object satisfies via a source number index, a source string index
     // (string keys subsume numeric ones), or — when it has an implied index
     // — its *numerically named* properties.
-    if (nidx != 0) {
+    //
+    // The `any`-valued exemption above is a rule about the index info being
+    // related, not about the string one: tsc runs the SAME test for every
+    // info of the target (`for (const targetInfo of indexInfos)`), and its
+    // condition is `!sourceIsPrimitive && targetHasStringIndex &&
+    // targetInfo.type & TypeFlags.Any` — "the target has a string index
+    // signature *somewhere*" AND "*this* info's value type is `any`". So a
+    // target spelled `{ [x: string]: any; [x: number]: any }` is satisfied by
+    // any non-primitive source through both of its infos, while
+    // `{ [x: number]: any }` alone (no string index) and
+    // `{ [x: string]: any; [x: number]: string }` (this info not `any`) are
+    // satisfied by neither — all three oracle-verified.
+    //
+    // Leaving the number arm unguarded cost an interface/class/function
+    // source that whole target, and that target is `NonReactStatics<any>` —
+    // a member of styled-components' `StyledComponent<C,T,O,A> = string &
+    // StyledComponentBase<…> & NonReactStatics<…>`, i.e. of
+    // `AnyStyledComponent`. So `typeof SomeStyled` failed
+    // `C extends AnyStyledComponent`, every `styled(SomeStyled)` fell to the
+    // second overload, and every prop of every such element was checked
+    // against `StyledComponentPropsWithAs<…>` instead of the inner
+    // component's own props.
+    const nidx_any = nidx != 0 and sidx != 0 and isNonPrimitiveKind(c.ts.kind(s)) and
+        c.ts.kind(try c.resolveStructural(nidx)) == .any;
+    if (nidx != 0 and !nidx_any) {
         switch (c.ts.kind(s)) {
             .array => {
                 if (!try c.isAssignable(c.ts.arrayElem(s), nidx)) return false;
@@ -5776,7 +5873,13 @@ pub fn tryReportMissingProps(c: *Checker, src_t: TypeId, target: TypeId, span: S
         // structuralAssignable): keep the missing-property diagnostic in
         // step with the relation so `{ [k: string]: any }` → `Date` reports
         // the missing Date members (TS2740), not a bare TS2322.
-        if ((try c.propOfTypeEx(rs, tp.name, false)) == null) {
+        //
+        // The apparent global-`Object` members DO count as present, for the
+        // same reason (`relationSrcProp`): a source that fails on its own
+        // missing `own` must not be reported as missing `toString` as well,
+        // which is the difference between tsc's TS2741 (one name) and a
+        // TS2739 listing two.
+        if ((try relationSrcProp(c, rs, tp.name)) == null) {
             try missing.append(c.scratch(), tp.name);
         }
     }
@@ -5889,6 +5992,23 @@ pub fn isSourceObjecty(k: types.Kind) bool {
     return k == .object or k == .intersection;
 }
 
+/// Is `t` the global `Object` interface, or a union with it as a constituent?
+/// tsc's `isTypeSubsetOf(globalObjectType, t)`, the excess-property check's
+/// other wholesale bail beside `isEmptyObjectType`.
+fn targetIsGlobalObjectIface(c: *Checker, t: TypeId) Error!bool {
+    const k = c.ts.kind(t);
+    if (k == .union_type) {
+        for (try c.memberList(t)) |m| {
+            if (try targetIsGlobalObjectIface(c, m)) return true;
+        }
+        return false;
+    }
+    if (k == .ref) return c.prog.globals.lookup(c.atom_Object) == c.ts.refSymbol(t);
+    // A materialized `Object` still names the reference it came from (`origin`).
+    if (c.refFacetOf(t, k)) |r| return c.prog.globals.lookup(c.atom_Object) == c.ts.refSymbol(r);
+    return false;
+}
+
 /// tsc's excess property check: only *fresh* object literals, checked
 /// against object-ish targets; recurses into nested literal properties.
 pub fn excessPropertyCheck(c: *Checker, expr_node: Node, src_t: TypeId, target: TypeId) Error!void {
@@ -5916,7 +6036,18 @@ pub fn excessPropertyScan(c: *Checker, expr_node: Node, src_t: TypeId, target: T
     }
     if (c.nodeTag(node) != .object_literal) return false;
     if (!c.ts.objectIsFresh(src_t)) return false;
+    // tsc's `hasExcessProperties` bails outright when the target is the global
+    // `Object` interface — `isTypeSubsetOf(globalObjectType, target)`, tested in
+    // the same breath as the `isEmptyObjectType(target)` bail below — so
+    // `const o: Object = { a: 1 }` is legal, and so is the `Object | number`
+    // form (`isTypeSubsetOfUnion`). `Object` is not a shape a literal is
+    // measured against: every object type already carries its apparent members
+    // (see `relationSrcProp`), which is why the relation accepts the literal at
+    // all. Latent until the relation started accepting it: the pair used to
+    // fail with TS2740 before the excess check was ever consulted.
+    if (try targetIsGlobalObjectIface(c, target)) return false;
     const rt = try c.resolveStructural(target);
+    if (try targetIsGlobalObjectIface(c, rt)) return false;
     switch (c.ts.kind(rt)) {
         .object => {
             if (c.ts.objectStringIndex(rt) != 0 or c.ts.objectNumberIndex(rt) != 0) return false;
