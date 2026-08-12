@@ -1,19 +1,19 @@
-// WHERE a type argument is written decides whether its constraint is checked.
+// WHERE a type argument is written must not decide whether its constraint is
+// checked. Four sites write a list, all four are one question, and tsc reports
+// all four:
 //
-// ztsc queues the TS2344 gate from `typeFromTypeNode` (see
-// `queueTypeArgConstraints`), which covers a type reference written in a TYPE
-// position — the alias below. Three other written argument lists never reach
-// the queue:
-//
+//   * a type reference,             `type A = G<Bad>`
 //   * a class heritage clause,      `class D extends G<Bad> {}`
 //   * an interface heritage clause, `interface I extends G<Bad> {}`
 //   * an explicit list on a call,   `f<Bad>(x)`
 //
-// All four sites are one question, and tsc reports all four. The three that
-// ztsc misses are registered in test/conformance/DEFERRED; they are the root of
-// outline's twelve missing TS2344 keys (`Collection`/`Document` against
-// `Store<T extends Model>`), the fact itself being one ztsc already decides
-// correctly — the alias case proves it.
+// ztsc used to queue the gate from `typeFromTypeNode` alone, so only the type
+// reference was checked — the root of outline's twelve missing TS2344 keys
+// (`Collection`/`Document` against `Store<T extends Model>`), every one of them
+// an `extends` clause or an explicit call list. The relation fact was never the
+// gap: the alias case here decided it correctly all along. `baseClassRef`,
+// `interfaceHeritageTypes` and `resolveSignatureCall` now reach it too, each
+// from the point where the clause's arguments are converted.
 
 abstract class Model {
     id = "";

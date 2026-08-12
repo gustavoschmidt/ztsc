@@ -416,6 +416,10 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, chained: *bool,
             for (tps.items, 0..) |tp, i| tp_syms[i] = tp.sym;
             const inst_args = try c.scratch().alloc(TypeId, tps.items.len);
             if (targs.items.len > 0) {
+                // `new G<Bad>(…)`'s list belongs to the CLASS, so it is gated
+                // on the class's own type-parameter constraints — the same
+                // written-list question as `G<Bad>` in a type position.
+                try c.queueTypeArgConstraints(node, cls, targs.items);
                 const fixed = try c.fixTypeArgs(cls, targs.items, c.tree.nodeMainToken(node)) orelse return types.error_type;
                 @memcpy(inst_args, fixed);
             } else if (tps.items.len > 0) {
@@ -680,6 +684,17 @@ pub fn checkThisArg(c: *Checker, node: Node, sig: TypeId) Error!void {
     }
 }
 
+/// Whether `node` is a call/`new` that WROTE a type-argument list — i.e. one
+/// whose type arguments `writtenTypeArgNodes` can read back at the TS2344
+/// drain. `resolveSignatureCall` also serves synthesized call sites (`super(…)`,
+/// tagged templates, decorators) whose nodes carry no list of their own.
+fn writesTypeArgs(c: *const Checker, node: Node) bool {
+    return switch (c.nodeTag(node)) {
+        .call_expr_targs, .new_expr_targs, .optional_call => true,
+        else => false,
+    };
+}
+
 pub fn countArgs(arg_nodes: []const Node) usize {
     var n: usize = 0;
     for (arg_nodes) |a| {
@@ -703,6 +718,15 @@ pub fn resolveSignatureCall(
     if (sigs.len == 0) return types.any_type;
     const nargs = countArgs(arg_nodes);
     if (sigs.len == 1) {
+        // An explicit list on a call is one of the four sites tsc gates on the
+        // type parameters' constraints (TS2344 — see
+        // `checkSigTypeArgConstraints`). Only for a LONE candidate: with an
+        // overload set tsc's failure is TS2769 about the whole set, and a
+        // per-candidate constraint verdict there would be a diagnostic about
+        // the candidate ztsc happened to look at.
+        if (explicit_targs.len > 0 and writesTypeArgs(c, node)) {
+            try c.queueSigTypeArgConstraints(node, sigs[0], explicit_targs);
+        }
         const inst = try c.instantiateSigForCall(sigs[0], explicit_targs, arg_nodes, node, ret_ctx);
         if (instance_ret == types.no_type) try c.checkThisArg(node, inst);
         try c.checkCallArguments(node, inst, arg_nodes, true);

@@ -319,6 +319,30 @@ pub const obj_flag_literal_origin: u32 = 32;
 /// `any` for every name is exactly what makes the source satisfy an arbitrary
 /// target property list, which is the whole of what normalizing to `any` buys.
 pub const obj_flag_any_base: u32 = 64;
+/// The object's index signatures ARE a mapped type's own key set, so `keyof`
+/// reports exactly their key types and does not widen a string index to
+/// `string | number`.
+///
+/// tsc never asks an index signature this question: a mapped type stays a
+/// `MappedType`, and `getIndexType` answers it from
+/// `getConstraintTypeFromMappedType` — so `keyof Record<string, V>` is `string`,
+/// and `const k: keyof Record<string, V> = 0` is an error. ztsc materializes a
+/// mapped type whose key set is concrete into an ordinary object, and the
+/// `[k: string]: V` that comes out is indistinguishable from a written one,
+/// whose `keyof` genuinely IS `string | number` (a numeric key reads a string
+/// index signature). This flag is that distinction, which is also why it is a
+/// flag and not a side table: interning must keep `Record<string, V>` and
+/// `{ [k: string]: V }` apart, exactly as tsc's two type objects are apart.
+///
+/// A HOMOMORPHIC map propagates it from its source (`{ [K in keyof S]: … }` has
+/// the key set `keyof S`, whatever that is), so a map over a written index
+/// signature keeps the widening and a map over a `Record` keeps the flag.
+///
+/// Outline writes `keyof typeof codeLanguages` for a `Record<string,
+/// CodeLanguage>` and hands it to `FrequencyTracker<T extends string>`: without
+/// this, `string | number` failed the constraint and every read through the
+/// tracker's `filter?: (item: T) => boolean` was a false TS2322/TS2344.
+pub const obj_flag_mapped_keys: u32 = 128;
 pub const prop_flag_optional: u32 = 1;
 pub const prop_flag_readonly: u32 = 2;
 /// A `private`/`protected` class member (tsc's `ModifierFlags.NonPublic`).

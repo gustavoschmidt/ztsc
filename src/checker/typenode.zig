@@ -1446,7 +1446,43 @@ pub fn queueTypeArgConstraints(c: *Checker, node: Node, sym: SymbolId, args: []c
     // and queueing those would hold an entry and its arguments for the rest
     // of the run for a drain that would immediately skip them.
     if (!try c.symHasConstrainedTypeParam(sym)) return;
-    // Nor is anything to decide when no WRITTEN argument is a decided set:
+    try queuePendingTypeArgs(c, node, sym, 0, args);
+}
+
+/// Queue the written type-argument list of an explicit list on a CALL
+/// (`f<Bad>(x)`, `h.get<Bad>(…)`) for the same TS2344 gate a type reference
+/// gets — tsc runs one `checkTypeArguments` for every site that writes a list.
+///
+/// The constraints come off the SIGNATURE's own type parameters rather than a
+/// generic symbol's, so the entry carries the signature; everything else (the
+/// deferral to the drain, the admission tests, the pairing against the written
+/// nodes) is shared with `queueTypeArgConstraints`.
+pub fn queueSigTypeArgConstraints(c: *Checker, node: Node, sig: TypeId, args: []const TypeId) Error!void {
+    if (args.len == 0) return;
+    if (c.cur_file >= c.owned_mask.len or !c.owned_mask[c.cur_file]) return;
+    const tps = c.ts.fnTypeParams(sig);
+    if (tps.len == 0 or args.len > tps.len) return;
+    const gop = try c.pending_type_args_seen.getOrPut(c.cm(), c.nodeKey(node));
+    if (gop.found_existing) return;
+    // Same "nothing to decide, nothing to keep" test as the symbol path: most
+    // generic signatures constrain no parameter at all.
+    {
+        var any_constrained = false;
+        for (tps[0..@min(tps.len, args.len)]) |tp| {
+            if (try c.typeParamConstraint(tp) != types.no_type) {
+                any_constrained = true;
+                break;
+            }
+        }
+        if (!any_constrained) return;
+    }
+    try queuePendingTypeArgs(c, node, binder.no_symbol, sig, args);
+}
+
+/// The part of the queue every written-list site shares: the last admission
+/// test, and the entry itself.
+fn queuePendingTypeArgs(c: *Checker, node: Node, sym: SymbolId, sig: TypeId, args: []const TypeId) Error!void {
+    // Nothing to decide when no WRITTEN argument is a decided set:
     // `undecidableType` is a pure function of the argument's `TypeId`, so its
     // answer at the drain is the answer here, and a reference all of whose
     // arguments are still type variables or deferred nodes (zod's
@@ -1470,18 +1506,34 @@ pub fn queueTypeArgConstraints(c: *Checker, node: Node, sym: SymbolId, args: []c
         .file = c.cur_file,
         .node = node,
         .sym = sym,
+        .sig = sig,
         .this_type = c.this_type,
         .args_start = args_start,
         .args_len = @intCast(args.len),
     });
 }
 
-/// The WRITTEN type-argument nodes of a `type_ref`, straight out of the tree.
-/// Immutable program data for the life of the program, so the TS2344 queue
-/// keeps the reference node instead of a copy of this list.
+/// The WRITTEN type-argument nodes of one of the four nodes that can carry a
+/// list, straight out of the tree. Immutable program data for the life of the
+/// program, so the TS2344 queue keeps the node instead of a copy of this list.
+///
+/// A `type_ref` and a `heritage` clause both hold the list as a `SubRange` at
+/// `rhs` — except that a heritage clause with no list at all writes `0` there,
+/// which is not a valid extra index. A call/`new` with type arguments holds it
+/// inside its `CallInfo`.
 fn writtenTypeArgNodes(c: *const Checker, node: Node) []const Node {
-    const r = c.tree.extraData(ast.SubRange, c.tree.nodeData(node).rhs);
-    return c.tree.extraRange(r.start, r.end);
+    const d = c.tree.nodeData(node);
+    switch (c.nodeTag(node)) {
+        .call_expr_targs, .new_expr_targs, .optional_call => {
+            const info = c.tree.extraData(ast.CallInfo, d.rhs);
+            return c.tree.extraRange(info.targs_start, info.targs_end);
+        },
+        else => {
+            if (d.rhs == 0) return &.{};
+            const r = c.tree.extraData(ast.SubRange, d.rhs);
+            return c.tree.extraRange(r.start, r.end);
+        },
+    }
 }
 
 /// Run every queued TS2344 constraint check. Called once, after every
@@ -1526,7 +1578,11 @@ pub fn drainTypeArgConstraints(c: *Checker) Error!void {
         }
         c.inst_count = 0;
         c.newBudgetWindow();
-        try c.checkTypeArgConstraints(p.sym, args.items, arg_nodes);
+        if (p.sig != 0) {
+            try checkSigTypeArgConstraints(c, p.sig, args.items, arg_nodes);
+        } else {
+            try c.checkTypeArgConstraints(p.sym, args.items, arg_nodes);
+        }
     }
     c.pending_type_args.clearRetainingCapacity();
     c.pending_type_args_pool.clearRetainingCapacity();
@@ -1581,11 +1637,6 @@ pub fn checkTypeArgConstraints(c: *Checker, sym: SymbolId, args: []const TypeId,
     for (tps.items, 0..) |tp, i| {
         if (i >= args.len or i >= arg_nodes.len) break;
         if (tp.constraint == 0) continue;
-        const an = arg_nodes[i];
-        if (an == null_node) continue;
-        const arg = args[i];
-        if (arg == types.any_type or arg == types.unknown_type) continue;
-        if (try c.undecidableType(arg)) continue;
         var con: TypeId = undefined;
         {
             const saved = c.enterSymFile(tp.sym);
@@ -1593,33 +1644,101 @@ pub fn checkTypeArgConstraints(c: *Checker, sym: SymbolId, args: []const TypeId,
             c.cur_scope = c.symScope(tp.sym);
             con = try c.typeFromTypeNode(tp.constraint);
         }
-        // A constraint WRITTEN in terms of `this` is undecidable here for the
-        // same reason a `this` argument is (see `undecidableType`): its meaning
-        // depends on the instantiating class, and a `this` operand keeps every
-        // conditional over it deferred, so instantiating it under this
-        // reference's arguments re-expands without ever reducing. Asked before
-        // the instantiation, which is the part that ran away — the two residual
-        // TS2589s on drizzle's `PgSelectQueryBuilderBase` / `SQLiteSelectBase`
-        // heritage clauses were exactly this.
-        if (try c.containsThisType(con)) continue;
-        con = try c.instantiate(con, map_list.items);
-        if (!try c.decidableConstraintSet(con)) continue;
-        if (try c.isAssignable(arg, con)) continue;
-        // tsc replaces the "does not satisfy" head with the specific
-        // missing-property error whenever that is what went wrong
-        // (`reportRelationError` → `getExactOptionalUnassignableProperties`
-        // path): `Holder<{ s: string }>` against `T extends Shape` is
-        // TS2741, not TS2344.
-        if (try c.tryReportMissingProps(arg, con, c.nodeSpan(an))) continue;
-        // A constraint violation elaborates like any other failed relation
-        // (`elaborate.zig`): the argument and the constraint are the pair, and
-        // tsc chains the same derivation under this head as under TS2322.
-        try c.diagFmt(2344, c.nodeSpan(an), "Type '{s}' does not satisfy the constraint '{s}'.{s}", .{
-            try c.typeToString(arg),
-            try c.typeToString(con),
-            try elaborate.chainText(c, arg, con),
-        });
+        try checkOneTypeArgConstraint(c, args[i], con, map_list.items, arg_nodes[i]);
     }
+}
+
+/// TS2344 for an explicit type-argument list written on a CALL, against the
+/// SIGNATURE's own type parameters (tsc's `checkTypeArguments`, reached from
+/// `resolveCall`). Same shape as `checkTypeArgConstraints` — see there for why
+/// each silent case is silent — with two differences that follow from the
+/// parameters being a signature's rather than a symbol's:
+///
+///   * the constraint is read off the parameter symbol (`typeParamConstraint`,
+///     which also handles a FRESH higher-order parameter whose bound is
+///     already a TypeId), not off a declaration node this list owns, and
+///   * the mapper leaves an unwritten tail parameter as itself, exactly as
+///     `buildInstMap` does for a defaulted tail.
+///
+/// tsc REJECTS a candidate whose type arguments fail, then reports this from
+/// `candidateForTypeArgumentError`; the reported return type still comes from
+/// the written arguments (`pickLongestCandidateSignature` →
+/// `getTypeArgumentsFromNodes` only fills what was not written). ztsc reports
+/// without rejecting, which is the same diagnostic and the same downstream
+/// typing, and keeps the failure out of overload resolution.
+pub fn checkSigTypeArgConstraints(c: *Checker, sig: TypeId, args: []const TypeId, arg_nodes: []const Node) Error!void {
+    if (args.len == 0) return;
+    if (c.ts.kind(sig) != .function) return;
+    const tps = try c.scratch().dupe(u32, c.ts.fnTypeParams(sig));
+    defer c.scratch().free(tps);
+    if (tps.len == 0) return;
+    // Arity is another check's business (TS2558), and a mismatched list pairs
+    // arguments with the wrong parameters, so say nothing.
+    if (args.len > tps.len or args.len < c.sigMinTargs(tps)) return;
+    const map = try c.scratch().alloc(TpMap, tps.len);
+    defer c.scratch().free(map);
+    for (tps, 0..) |tp, i| {
+        map[i] = .{
+            .sym = tp,
+            .ty = if (i < args.len) args[i] else try c.ts.makeTypeParam(tp),
+        };
+    }
+    for (tps, 0..) |tp, i| {
+        if (i >= args.len or i >= arg_nodes.len) break;
+        const con = try c.typeParamConstraint(tp);
+        if (con == types.no_type) continue;
+        try checkOneTypeArgConstraint(c, args[i], con, map, arg_nodes[i]);
+    }
+}
+
+/// The TS2344 verdict for ONE written type argument against its parameter's
+/// (not yet instantiated) constraint. Shared by every site that writes a
+/// list — a type reference, both heritage clauses, and an explicit list on a
+/// call — so all four report the same message, from the same tests, at the
+/// argument's own span.
+fn checkOneTypeArgConstraint(c: *Checker, arg: TypeId, con0: TypeId, map: []const TpMap, an: Node) Error!void {
+    if (an == null_node) return;
+    if (arg == types.any_type or arg == types.unknown_type) return;
+    if (try c.undecidableType(arg)) return;
+    // A class whose `extends` chain reaches a base ztsc could not resolve has
+    // an INCOMPLETE member set by construction, so "does not satisfy" against
+    // it is a verdict about the missing base, not about the code — the same
+    // reason `checkClass` skips its `implements` clauses (`hasUnresolvedBase`).
+    // `@types/node`'s `class ReadableBase extends Stream` reaches `Stream`
+    // through an `import S = internal.Stream` entity alias, and every
+    // `StreamOptions<Readable>`/`<Writable>` heritage clause was a false
+    // "missing compose, pipe".
+    if (c.ts.kind(arg) == .ref and c.symFlags(c.ts.refSymbol(arg)).class and
+        try c.hasUnresolvedBase(c.ts.refSymbol(arg)))
+    {
+        return;
+    }
+    // A constraint WRITTEN in terms of `this` is undecidable here for the
+    // same reason a `this` argument is (see `undecidableType`): its meaning
+    // depends on the instantiating class, and a `this` operand keeps every
+    // conditional over it deferred, so instantiating it under this
+    // reference's arguments re-expands without ever reducing. Asked before
+    // the instantiation, which is the part that ran away — the two residual
+    // TS2589s on drizzle's `PgSelectQueryBuilderBase` / `SQLiteSelectBase`
+    // heritage clauses were exactly this.
+    if (try c.containsThisType(con0)) return;
+    const con = try c.instantiate(con0, map);
+    if (!try c.decidableConstraintSet(con)) return;
+    if (try c.isAssignable(arg, con)) return;
+    // tsc replaces the "does not satisfy" head with the specific
+    // missing-property error whenever that is what went wrong
+    // (`reportRelationError` → `getExactOptionalUnassignableProperties`
+    // path): `Holder<{ s: string }>` against `T extends Shape` is
+    // TS2741, not TS2344.
+    if (try c.tryReportMissingProps(arg, con, c.nodeSpan(an))) return;
+    // A constraint violation elaborates like any other failed relation
+    // (`elaborate.zig`): the argument and the constraint are the pair, and
+    // tsc chains the same derivation under this head as under TS2322.
+    try c.diagFmt(2344, c.nodeSpan(an), "Type '{s}' does not satisfy the constraint '{s}'.{s}", .{
+        try c.typeToString(arg),
+        try c.typeToString(con),
+        try elaborate.chainText(c, arg, con),
+    });
 }
 
 /// Budget for the TS2344 gates' structural scans. Running out answers
@@ -2024,6 +2143,11 @@ fn keyofObjectTableUncached(c: *Checker, r: TypeId) Error!TypeId {
         // (nestjs-cls' `ClsStore`, immich `config.repository.ts:302-304`).
         if (c.ts.objectFlags(r) & types.obj_flag_symbol_index != 0) {
             try parts.append(c.scratch(), types.symbol_type);
+        } else if (c.ts.objectFlags(r) & types.obj_flag_mapped_keys != 0) {
+            // The signature IS a mapped type's key set, and `keyof` of a mapped
+            // type is its constraint: `keyof Record<string, V>` is `string`
+            // alone, never `string | number`. See `obj_flag_mapped_keys`.
+            try parts.append(c.scratch(), types.string_type);
         } else {
             try parts.append(c.scratch(), types.string_type);
             try parts.append(c.scratch(), types.number_type);

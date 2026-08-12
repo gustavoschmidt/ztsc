@@ -1316,7 +1316,17 @@ pub fn interfaceHeritageTypes(c: *Checker, sym: SymbolId, out: *std.ArrayList(Ty
                     if (an != null_node) try targs.append(c.scratch(), try c.typeFromTypeNode(an));
                 }
             }
-            try out.append(c.scratch(), try c.typeFromTypeName(hd.lhs, targs.items));
+            var target: SymbolId = binder.no_symbol;
+            const base = try c.typeFromTypeNameEx(hd.lhs, targs.items, &target);
+            // `interface I extends G<Bad>` is the same written list as
+            // `class D extends G<Bad>` (see `baseClassRef`) and the same gate.
+            // Every caller enters `sym`'s own file first, which is what makes
+            // the clause node index `c.tree` and the queue attribute the
+            // diagnostic to the declaring file.
+            if (target != binder.no_symbol) {
+                try c.queueTypeArgConstraints(h, target, targs.items);
+            }
+            try out.append(c.scratch(), base);
         }
     }
 }
@@ -2232,6 +2242,17 @@ pub fn baseClassRef(c: *Checker, sym: SymbolId) Error!?TypeId {
                 if (an != null_node) try targs.append(c.scratch(), try c.typeFromTypeNode(an));
             }
         }
+        // `class D extends G<Bad>` writes a type-argument list, and tsc gates
+        // it on `G`'s constraints exactly as it gates one written in a type
+        // position (`checkClassLikeDeclaration` → `checkTypeReferenceNode` on
+        // the heritage clause). ztsc reaches the gate here rather than in
+        // `checkClass` because the arguments are converted here — and because
+        // this is entered under the CLASS's own file context, so the queue's
+        // owned-file test and the entry's `file` are the clause's own however
+        // the base was demanded (`nominalBases`, a member lookup, the
+        // declaration walk). The queue dedupes on the clause node, so a class
+        // whose base is asked for a hundred times is judged once.
+        try c.queueTypeArgConstraints(data.extends, base_sym, targs.items);
         const name_tok = switch (c.nodeTag(hd.lhs)) {
             .identifier => c.tree.nodeMainToken(hd.lhs),
             else => c.tree.nodeData(hd.lhs).rhs,
