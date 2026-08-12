@@ -49,6 +49,14 @@ pub fn propOfType(c: *Checker, t: TypeId, name: Atom) Error!?types.Prop {
 /// not assignable to `Date`/`{ x: number }`. Only the relation callers pass
 /// false; the index signature is related separately (indexSignaturesRelatedTo).
 pub fn propOfTypeEx(c: *Checker, t: TypeId, name: Atom, allow_index: bool) Error!?types.Prop {
+    return propOfTypeIdx(c, t, name, allow_index, null);
+}
+
+/// `propOfTypeEx` with the provenance of the answer reported back: when
+/// `from_index` is non-null it is set whenever the property came from a string
+/// INDEX SIGNATURE rather than from a declared/apparent member. Only the
+/// intersection arm asks — see the note there.
+fn propOfTypeIdx(c: *Checker, t: TypeId, name: Atom, allow_index: bool, from_index: ?*bool) Error!?types.Prop {
     const s = &c.ts;
     switch (s.kind(t)) {
         .object => {
@@ -119,6 +127,7 @@ pub fn propOfTypeEx(c: *Checker, t: TypeId, name: Atom, allow_index: bool) Error
             // ((el) => ReactNode) }` type as the index VALUE rather than
             // as `Object.hasOwnProperty`, so calling it was TS2349.
             if (s.objectStringIndex(t) != 0) {
+                if (from_index) |f| f.* = true;
                 return .{ .name = name, .ty = s.objectStringIndex(t), .flags = 0 };
             }
             return null;
@@ -138,7 +147,7 @@ pub fn propOfTypeEx(c: *Checker, t: TypeId, name: Atom, allow_index: bool) Error
             var flags: u32 = 0;
             for (members) |m| {
                 const r = try c.resolveStructural(m);
-                const p = (try c.propOfTypeEx(r, name, allow_index)) orelse return null;
+                const p = (try propOfTypeIdx(c, r, name, allow_index, from_index)) orelse return null;
                 try parts.append(c.scratch(), p.ty);
                 flags |= p.flags;
             }
@@ -159,7 +168,49 @@ pub fn propOfTypeEx(c: *Checker, t: TypeId, name: Atom, allow_index: bool) Error
                     break;
                 }
             }
+            // A sibling's INDEX SIGNATURE must not outrank a constituent's
+            // declared property. tsc keeps the two steps apart:
+            // `getPropertyOfType` on an intersection consults no index
+            // signature at all, and only when it comes back empty does
+            // `checkPropertyAccessExpression` ask for an applicable index info.
+            // The `.object` arm above already orders those two for a lone
+            // object, but a constituent is asked in ISOLATION, so it answers
+            // from its own index before its sibling is ever consulted — and
+            // `any & X` is `any`. So each constituent's answer carries its
+            // provenance, and a declared one wins.
+            //
+            // The FREE-TYPE-PARAMETER guard is deliberate, and it is a cost
+            // bound rather than a semantic one. An `any`-valued index signature
+            // reaching this arm is usually ztsc's *stand-in* for a constituent
+            // it could not reduce (`transitiveBaseConstraint` of a mapped type
+            // whose key domain is still generic answers `{ [x: string]: any }`),
+            // so preferring the sibling everywhere makes the checker
+            // materialize whole regions of a library's type graph the `any`
+            // used to cut off. styled-components is the case in point:
+            // unguarded, the sibling also wins for the `propTypes`,
+            // `defaultProps` and `withComponent` that `NonReactStatics` maps
+            // over every `StyledComponent` — `WeakValidationMap`/`Partial` over
+            // the full ~270-property `StyledComponentProps`, and a
+            // `withComponent` whose return type is another `StyledComponent`,
+            // i.e. the same expansion again. Where the declared property is
+            // CONCRETE the `any` costs only precision the stand-in had already
+            // given up; where it names a free parameter it costs an inference
+            // candidate, which is unrecoverable. `containsFreeTypeParam` with
+            // an empty scope is exactly that test — a generic METHOD's own
+            // parameters are bound by its own signature and do not count.
+            //
+            // styled-components' polymorphic `as` is that generic case. The
+            // second call signature takes `StyledComponentProps<AsC, …> & { as?:
+            // AsC | undefined; … }`, whose first constituent is a conditional
+            // still deferred on the free `AsC`; its default constraint bottoms
+            // out in exactly such a mapped type. `as` answered `any`, so the
+            // attribute-driven inference in `inferJsxTargs` had no target worth
+            // a candidate, `AsC` fell back to its default `C`, and every
+            // `<Styled as="p">` in the program read `Type '"p"' is not
+            // assignable to type '"span" | undefined'`.
             var found: ?types.Prop = null;
+            var idx_found: ?types.Prop = null;
+            var all: ?types.Prop = null;
             for (members) |m| {
                 const r = try c.resolveStructural(m);
                 var lookup = r;
@@ -169,16 +220,25 @@ pub fn propOfTypeEx(c: *Checker, t: TypeId, name: Atom, allow_index: bool) Error
                         lookup = try c.resolveStructural(try c.nonNullable(con));
                     }
                 }
-                if (try c.propOfTypeEx(lookup, name, allow_index)) |p| {
-                    if (found == null) {
-                        found = p;
-                    } else {
-                        const merged = try c.ts.makeIntersection(c.scratch(), &.{ found.?.ty, p.ty });
-                        found = .{ .name = name, .ty = merged, .flags = found.?.flags & p.flags };
+                var via_index = false;
+                if (try propOfTypeIdx(c, lookup, name, allow_index, &via_index)) |p| {
+                    for ([_]*?types.Prop{ if (via_index) &idx_found else &found, &all }) |slot| {
+                        if (slot.* == null) {
+                            slot.* = p;
+                        } else {
+                            const merged = try c.ts.makeIntersection(c.scratch(), &.{ slot.*.?.ty, p.ty });
+                            slot.* = .{ .name = name, .ty = merged, .flags = slot.*.?.flags & p.flags };
+                        }
                     }
                 }
             }
-            return found;
+            if (found) |p| {
+                if (idx_found == null or try c.containsFreeTypeParam(p.ty, &.{})) return p;
+            }
+            if (found == null and idx_found != null) {
+                if (from_index) |f| f.* = true;
+            }
+            return all;
         },
         // A template-literal pattern and a string-transform intrinsic are
         // subtypes of `string` (`Store.literalBase`), so their apparent
@@ -237,7 +297,7 @@ pub fn propOfTypeEx(c: *Checker, t: TypeId, name: Atom, allow_index: bool) Error
         .type_param => {
             const constraint = try c.typeParamConstraint(s.typeParamSymbol(t));
             if (constraint == types.no_type) return null;
-            return c.propOfTypeEx(try c.resolveStructural(constraint), name, allow_index);
+            return propOfTypeIdx(c, try c.resolveStructural(constraint), name, allow_index, from_index);
         },
         .mapped => {
             // A DEFERRED homomorphic map has no members of its own, but its
@@ -272,7 +332,7 @@ pub fn propOfTypeEx(c: *Checker, t: TypeId, name: Atom, allow_index: bool) Error
                 );
                 // key set still generic
                 if (s.kind(inst) == .mapped) return c.objectInterfaceProp(name);
-                return c.propOfTypeEx(inst, name, allow_index);
+                return propOfTypeIdx(c, inst, name, allow_index, from_index);
             }
             // A NON-homomorphic map (`Pick`/`Omit`/`Record` applied to a
             // generic) defers on its *constraint*, not a source, so the
@@ -286,7 +346,7 @@ pub fn propOfTypeEx(c: *Checker, t: TypeId, name: Atom, allow_index: bool) Error
             const rbc = try c.resolveStructural(bc);
             // key set still generic
             if (s.kind(rbc) == .mapped) return c.objectInterfaceProp(name);
-            return c.propOfTypeEx(rbc, name, allow_index);
+            return propOfTypeIdx(c, rbc, name, allow_index, from_index);
         },
         // A still-deferred conditional has the apparent members of its
         // DEFAULT CONSTRAINT — tsc's `getDefaultConstraintOfConditionalType`,
@@ -299,15 +359,15 @@ pub fn propOfTypeEx(c: *Checker, t: TypeId, name: Atom, allow_index: bool) Error
         .conditional => {
             const u = try c.makeUnion2(try c.condTrueUnderExtends(t), s.condFalse(t));
             if (u == t) return null;
-            return c.propOfTypeEx(u, name, allow_index);
+            return propOfTypeIdx(c, u, name, allow_index, from_index);
         },
-        .ref => return c.propOfTypeEx(try c.resolveStructural(t), name, allow_index),
-        .class_value => return classValueProp(c, s.classSymbol(t), name, allow_index),
+        .ref => return propOfTypeIdx(c, try c.resolveStructural(t), name, allow_index, from_index),
+        .class_value => return classValueProp(c, s.classSymbol(t), name, allow_index, from_index),
         .enum_type => {
             // A value of enum type borrows its base primitive's members.
             const info = try c.enumInfo(s.enumSymbol(t));
             const base: TypeId = if (info.all_string) types.string_type else types.number_type;
-            return c.propOfTypeEx(base, name, allow_index);
+            return propOfTypeIdx(c, base, name, allow_index, from_index);
         },
         // A bare function type or overload set (arrow/normal function,
         // `(x) => y`, an overloaded signature) has the apparent members of
@@ -431,9 +491,9 @@ pub fn functionInterfaceProp(c: *Checker, name: Atom) Error!?types.Prop {
 /// Source 3 is what a bare `.class_value` arm was missing: `Class.name` — the
 /// idiom every DI container, test factory and log line in a Nest/Angular
 /// codebase is built on — was TS2339 on every class in the program.
-fn classValueProp(c: *Checker, cls: SymbolId, name: Atom, allow_index: bool) Error!?types.Prop {
+fn classValueProp(c: *Checker, cls: SymbolId, name: Atom, allow_index: bool, from_index: ?*bool) Error!?types.Prop {
     if (try c.ownStaticMemberProp(cls, name)) |p| return p;
-    if (try c.propOfTypeEx(try c.classStaticType(cls), name, allow_index)) |p| return p;
+    if (try propOfTypeIdx(c, try c.classStaticType(cls), name, allow_index, from_index)) |p| return p;
     if (name == c.atom_prototype and name != 0) {
         var tps: std.ArrayList(checker_zig.Checker.TypeParamInfo) = .empty;
         defer tps.deinit(c.scratch());
