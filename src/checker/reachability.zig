@@ -9,7 +9,6 @@
 //! discriminant's TYPE, and this runs from inside a return-type probe that
 //! has not typed it yet, so the type is synthesized on demand (memoized).
 
-const std = @import("std");
 const ast = @import("../frontend/ast.zig");
 const types = @import("../types.zig");
 

@@ -1,6 +1,10 @@
-//! Properties and type parts.
-//! Split mechanically from checker.zig; functions take the
+//! Property lookup and type-parameter parts: what member a type has, and
+//! what a type parameter's constraint/default/arity are. Functions take the
 //! `Checker` context as their first parameter.
+//!
+//! Two concerns were split out and are re-exported below so `Checker`'s
+//! method aliases keep resolving here: `iteration.zig` (promises, `await`,
+//! yield types) and `nullability.zig` (the nullish/truthiness facts).
 
 const std = @import("std");
 const ast = @import("../frontend/ast.zig");

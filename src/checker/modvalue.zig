@@ -21,10 +21,6 @@ const FileId = checker_zig.FileId;
 
 const hasValueMeaning = @import("names.zig").hasValueMeaning;
 
-// =====================================================================
-// imported symbols
-// =====================================================================
-
 /// Value type of an import binding, via the sealed link tables.
 pub fn importedSymbolType(c: *Checker, sym: SymbolId) Error!TypeId {
     const tgt = c.importTarget(sym) orelse return types.any_type; // unlinked

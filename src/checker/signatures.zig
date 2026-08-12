@@ -1,6 +1,11 @@
-//! Signatures, symbol typing, and imported symbols.
-//! Split mechanically from checker.zig; functions take the
-//! `Checker` context as their first parameter.
+//! Signatures and symbol typing: what a declaration's parameters, return
+//! type, and symbol resolve to. Functions take the `Checker` context as
+//! their first parameter.
+//!
+//! Two concerns symbol typing drives were split out and are re-exported
+//! below so `Checker`'s method aliases keep resolving here:
+//! `destructure.zig` (what a binding pattern gives each name) and
+//! `modvalue.zig` (the value meaning of a module reference).
 
 const std = @import("std");
 const ast = @import("../frontend/ast.zig");
