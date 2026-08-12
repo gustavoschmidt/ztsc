@@ -2602,7 +2602,31 @@ pub fn instantiateId(c: *Checker, t: TypeId, map: []const TpMap, map_id: ?u32) E
                         const tru_m = try c.instantiateId(s.condTrue(t), map, null);
                         const fls_m = try c.instantiateId(s.condFalse(t), map, null);
                         c.cond_check_subst = saved_subst;
-                        try parts.append(c.scratch(), try c.reduceConditional(m, ext_m, tru_m, fls_m, false));
+                        // Distributivity is spent only on a member that cannot
+                        // grow: a STILL-GENERIC member (`keyof P` for an
+                        // unbound `P`) becomes a union of its own once that
+                        // parameter arrives, and those constituents need the
+                        // same one-at-a-time treatment. Baking `false` here
+                        // froze the member as a single whole-union test, so the
+                        // later expansion was asked `"as" | "size" | "ellipsis"
+                        // extends "as" | "size"` — false — and `Exclude` handed
+                        // back every key it was supposed to remove.
+                        //
+                        // styled-components' `.attrs` is that shape, two alias
+                        // hops deep: `MakeAttrsOptional<C, O, A>` reaches
+                        // `OmitU<P & O, A>` → `PickU<T, Exclude<keyof T, K>>`,
+                        // whose `keyof (P & O)` is `keyof P | keyof O` — a union
+                        // of two DEFERRED keyofs. With the exclusion lost, every
+                        // prop `.attrs({…})` supplies stayed REQUIRED in the
+                        // component's props, so `<Title>text</Title>` was missing
+                        // `as`/`size`, the first (non-polymorphic) call signature
+                        // was rejected, and the element re-checked against the
+                        // polymorphic `as` signature with `AsC` inferred as
+                        // `string`/`unknown` — one TS2322 per styled element.
+                        const m_open = try c.containsFreeTypeParam(m, &.{}) or
+                            try c.containsMappedParam(m) or
+                            try c.containsThisType(m);
+                        try parts.append(c.scratch(), try c.reduceConditional(m, ext_m, tru_m, fls_m, m_open));
                     }
                     break :blk try s.makeUnion(c.scratch(), parts.items);
                 }

@@ -67,3 +67,55 @@ interface Two {
 declare const T2: Two;
 export const d = <T2 kind="b" s="x" />;
 export const e = <T2 kind="a" n={1} />;
+
+// The same first-signature choice, reached through the props type
+// styled-components' `.attrs({…})` actually builds. `Own` here plays the part
+// of `O & NewA` — the template's own props INTERSECTED with the widened attrs
+// object, whose members are REQUIRED — and `Keys` the part of `A | keyof NewA`,
+// the set `MakeAttrsOptional` is supposed to hand back as optional. Getting
+// `Omit` right is what decides the signature: with `as`/`size` still required
+// in the first signature's props, `<Attrs>text</Attrs>` fails it (TS2322,
+// "missing the following properties: as, size") and the element is re-checked
+// against the polymorphic one, which infers `AsC` from nothing.
+//
+// The composition is two alias hops deep on purpose — that is what broke.
+// `keyof (Base & Own)` is `keyof Base | keyof Own`, a union of two DEFERRED
+// keyofs, and a distributive conditional (`Exclude`) that distributes over it
+// spent its distributivity one level too early: each member was frozen as a
+// single whole-union test, so once `Own` arrived, `"as" | "size" | "ellipsis"
+// extends "as" | "size"` answered false and `Exclude` returned every key it
+// was meant to remove.
+type PickU<T, K extends keyof T> = T extends any ? { [P in K]: T[P] } : never;
+type OmitU<T, K extends keyof T> = T extends any ? PickU<T, Exclude<keyof T, K>> : never;
+
+type AttrsBase = { className?: string };
+
+type AttrsOptional<Own extends object, Keys extends keyof (AttrsBase & Own), Base extends object = AttrsBase> =
+  Base extends any
+    ? OmitU<Base & Own, Keys & keyof (Base & Own)> & Partial<PickU<Base & Own, Keys & keyof (Base & Own)>>
+    : never;
+
+interface PolyAttrs<Own extends object, Keys extends keyof (AttrsBase & Own)> {
+  (props: AttrsOptional<Own, Keys> & { as?: never | undefined }): JSX.Element;
+  <AsC extends string = "span">(
+    props: AttrsOptional<Own, Keys> & { as?: AsC | undefined },
+  ): JSX.Element;
+}
+
+declare const Attrs: PolyAttrs<
+  { size?: "large" | "small"; ellipsis?: boolean } & { as: string; size: string },
+  "as" | "size"
+>;
+
+// The first signature: `as` and `size` are OPTIONAL here, so no attribute is
+// missing and the polymorphic sibling is never reached.
+export const f = <Attrs />;
+export const g = <Attrs size="large" />;
+// The second signature, `AsC = "h2"`.
+export const h = <Attrs as="h2" />;
+
+// The exclusion itself, read straight out of the same two-hop composition.
+type KeysLeft<Own extends object, Keys extends keyof any, Base = { className?: string }> =
+  Base extends any ? Exclude<keyof (Base & Own), Keys> : never;
+declare const left: KeysLeft<{ as: string; size: string; ellipsis?: boolean }, "as" | "size">;
+export const i: "className" | "ellipsis" = left;
