@@ -436,7 +436,12 @@ fn signatureStep(c: *Checker, s: TypeId, t: TypeId, is_ctor: bool) Error!?Found 
     const sn = store.fnParamCount(ss);
     const tn = store.fnParamCount(ts_);
     // A method's parameters relate bivariantly (`fn_flag_method`), so only a
-    // pair that fails BOTH ways is what made the relation fail.
+    // pair that fails BOTH ways is what made the relation fail. Either side's
+    // flag counts here for one reason only: to mirror `assign.zig`'s
+    // `signatureAssignableModeInnerErase` exactly, or this walk re-judges a
+    // pair on terms the relation never used. tsc reads the TARGET's
+    // declaration kind alone — see the note there for why the source
+    // disjunct is still in place.
     const bivariant = (store.fnFlags(ss) & types.fn_flag_method) != 0 or
         (store.fnFlags(ts_) & types.fn_flag_method) != 0;
     var i: u32 = 0;

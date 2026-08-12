@@ -213,3 +213,58 @@ conditional/048_infer_through_homomorphic_key_set_deferred.ts  -TS2322 31
 conditional/048_infer_through_homomorphic_key_set_deferred.ts  -TS2322 37
 conditional/048_infer_through_homomorphic_key_set_deferred.ts  -TS2322 41
 conditional/048_infer_through_homomorphic_key_set_deferred.ts  -TS2322 46
+
+# `unknown` AGAINST AN OBJECT TARGET. `unknown` is the top type and tsc
+# relates it only to `any` and `unknown`; ztsc's `structuralAssignable`
+# instead reaches the empty-object fast path ("accepts anything non-nullish")
+# and, for a target every property of which is optional, falls off the end of
+# the property loop — so `unknown` is assignable to `{}`, to `{ a?: number }`,
+# and to `Partial<T>`. (`Record<string, number>` and a target with a REQUIRED
+# property are already rejected, by the index-signature and unmatched-property
+# walks respectively.)
+#
+# The one-line fix (reject `.unknown` in `structuralAssignable`, next to
+# `null`/`undefined`/`void`) is written and measured, 2026-08-11, and is held
+# for two reasons:
+#
+#   * ALONE it is net-negative: it converts 2 outline keys and costs 10 false
+#     TS2339 (`Property 'x' does not exist on type 'never'`) in
+#     styled-components interpolation callbacks. `styled(C)<Props>` resolves
+#     its tagged-template overload by relating a not-yet-contextually-typed
+#     arrow whose parameters read `unknown`; with `unknown` no longer
+#     satisfying `CSSObject` the overload is rejected and the props parameter
+#     collapses to `never`. The real defect is the first-pass treatment of a
+#     CONTEXT-SENSITIVE argument (tsc substitutes `anyFunctionType`), not this
+#     rule.
+#   * PAIRED with the target-only bivariance rule below it converts 78 outline
+#     keys (74 of them the whole `TestServer.post` family) where each alone
+#     converts 2 — the two are one fix, and that one is blocked on the
+#     union-target gap described there.
+assignability/unknown_not_assignable_to_object.ts  -TS2322 7
+assignability/unknown_not_assignable_to_object.ts  -TS2322 9
+assignability/unknown_not_assignable_to_object.ts  -TS2322 13
+assignability/unknown_not_assignable_to_object.ts  -TS2322 15
+
+# BIVARIANCE FROM THE TARGET'S DECLARATION KIND ALONE. tsc's
+# `compareSignaturesRelated` computes `strictVariance` from
+# `target.declaration.kind` and never consults the source's, so a class METHOD
+# assigned to a function-typed PROPERTY relates its parameters
+# contravariantly; only a method TARGET is bivariant. ztsc takes either side's
+# `fn_flag_method` (src/checker/assign.zig,
+# `signatureAssignableModeInnerErase`), so every method source is bivariant
+# and these four lines are missed.
+#
+# Measured 2026-08-11: dropping the source disjunct converts 2 outline keys
+# and costs 4 false positives — 3 on excalidraw (`Delta.create(deleted,
+# inserted, ElementsChange.stripIrrelevantProps)` in
+# `packages/excalidraw/change.ts:918/938/950`, a gate at ceiling 0) and 1 on
+# outline. All four are one pre-existing gap one level down: related for real,
+# the contravariant step asks `Partial<ElementPartial>` →
+# `Partial<Ordered<ExcalidrawElement>>`, where the target distributes over a
+# discriminated union of element types and the source is the single
+# `Omit`-of-the-union object. tsc relates that pair and ztsc's union-target
+# walk does not, so the strict rule waits on it.
+assignability/method_source_property_target_strict_variance.ts  -TS2322 19
+assignability/method_source_property_target_strict_variance.ts  -TS2322 20
+assignability/method_source_property_target_strict_variance.ts  -TS2345 22
+assignability/method_source_property_target_strict_variance.ts  -TS2345 23

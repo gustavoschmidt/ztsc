@@ -385,7 +385,20 @@ fn overlapSigAt(c: *Checker, t: TypeId, is_construct: bool, i: u32) TypeId {
 /// tsc's `signaturesRelatedTo` under the comparable relation: every target
 /// signature must overlap SOME source signature. A target with no signatures
 /// of this kind demands nothing.
-pub fn sigListOverlap(c: *Checker, s: TypeId, t: TypeId, is_construct: bool, depth: u32) Error!bool {
+pub fn sigListOverlap(c: *Checker, s0: TypeId, t0: TypeId, is_construct: bool, depth: u32) Error!bool {
+    // A class value's construct signatures are nominal shortcuts, not stored
+    // on an object table — materialize them here exactly as
+    // `sourceSatisfiesSigs` does for assignability, or `typeof C` offers the
+    // overlap walk no constructor at all and every `x === SomeClass` against
+    // a `{ new (…): …ic }`-typed operand reads as a non-overlapping TS2367.
+    const s = if (is_construct and c.ts.kind(s0) == .class_value)
+        try c.classConstructType(c.ts.classSymbol(s0))
+    else
+        s0;
+    const t = if (is_construct and c.ts.kind(t0) == .class_value)
+        try c.classConstructType(c.ts.classSymbol(t0))
+    else
+        t0;
     const t_count = overlapSigCount(c, t, is_construct);
     if (t_count == 0) return true;
     const s_count = overlapSigCount(c, s, is_construct);
@@ -508,6 +521,21 @@ pub fn typesHaveOverlapRec(c: *Checker, a: TypeId, b: TypeId, depth: u32) Error!
     if (try c.enumOverlapsStringLiteral(ra, rb)) return true;
     if (try c.enumOverlapsStringLiteral(rb, ra)) return true;
     if (try c.isComparable(a, b)) return true;
+    // A CLASS VALUE reaches the comparable relation through its
+    // CONSTRUCTORS, which the mutual-assignability probe above cannot use:
+    // tsc threads the comparable relation through `signatureRelatedTo`, so a
+    // construct signature's parameters compare bivariantly and its return
+    // distributes existentially over a union target. `typeof SimpleImage`
+    // therefore overlaps `{ new (…args: any[]): Extension<any> | Mark<any> |
+    // Node<any> }` even though it is not ASSIGNABLE to it — outline's
+    // `inlineExtensions.filter((n) => n !== SimpleImage)`, where every
+    // element is that constructor type. `castComparableRec` is ztsc's
+    // rendering of the same relation (it is what TS2352 already asks), and
+    // the fallback is scoped to the shape that needs it rather than
+    // re-deciding every TS2367 on the looser relation.
+    if (ka == .class_value or kb == .class_value) {
+        if (try c.castComparableRec(a, b, depth)) return true;
+    }
     // tsc's *comparable* relation distributes EXISTENTIALLY over an
     // intersection (`someTypeRelatedToType`): the relation holds as soon as
     // ONE constituent relates. A branded primitive therefore overlaps a
@@ -3509,6 +3537,13 @@ pub fn structuralAssignable(c: *Checker, s: TypeId, t: TypeId) Error!bool {
     // `Partial<T>`) fell through the loop and returned true. Under
     // strictNullChecks tsc rejects all of these (TS2322), whatever the
     // target's optionality.
+    //
+    // `unknown` is the same hole one step up and is NOT closed here — see
+    // `test/conformance/assignability/unknown_not_assignable_to_object.ts`
+    // and its `DEFERRED` block. tsc relates `unknown` to `any` and `unknown`
+    // and to nothing else, but here it reaches both the empty-object fast
+    // path ("anything non-nullish") and the all-optional fall-through, so it
+    // is assignable to `{}`, to `{ a?: number }` and to every `Partial<T>`.
     switch (c.ts.kind(s)) {
         .null, .undefined, .void => return false,
         else => {},
@@ -4193,13 +4228,18 @@ pub fn nonDiscPropsAssignable(c: *Checker, s: TypeId, member: TypeId, excl: Atom
 pub fn sourceSatisfiesSigs(c: *Checker, s: TypeId, t: TypeId, is_construct: bool) Error!bool {
     const sk = c.ts.kind(s);
     if (sk == .any or sk == .err) return true;
-    if (is_construct and sk == .class_value) return true;
     var src: std.ArrayList(TypeId) = .empty;
     defer src.deinit(c.scratch());
     switch (sk) {
         .function => if (!is_construct) try src.append(c.scratch(), s),
         .overloads => if (!is_construct) {
             for (try c.memberList(s)) |m| try src.append(c.scratch(), m);
+        },
+        .class_value => if (is_construct) {
+            const mat = try c.classConstructType(c.ts.classSymbol(s));
+            for (0..c.ts.objectConstructSigCount(mat)) |i| {
+                try src.append(c.scratch(), c.ts.objectConstructSig(mat, @intCast(i)));
+            }
         },
         .object => {
             const cnt = if (is_construct) c.ts.objectConstructSigCount(s) else c.ts.objectCallSigCount(s);
@@ -4494,6 +4534,26 @@ pub fn signatureAssignableModeInnerErase(c: *Checker, s: TypeId, t: TypeId, mode
     // their constraints and the instantiated (non-generic) source relates in
     // full — so it never accepts what the erasure path would soundly reject.
     if (try c.genericSourceRelatesByInference(s, t)) return true;
+    // tsc decides bivariance from the TARGET's declaration kind ALONE:
+    // `compareSignaturesRelated` reads `strictVariance` off
+    // `target.declaration.kind` (`MethodDeclaration` / `MethodSignature` /
+    // `Constructor`) and never looks at the source's. Taking either side's
+    // flag therefore lets a class METHOD launder itself past
+    // `strictFunctionTypes` into a function-typed PROPERTY — oracle-verified
+    // in `test/conformance/assignability/method_source_property_target_
+    // strict_variance.ts`, whose missed lines are registered in
+    // `test/conformance/DEFERRED`.
+    //
+    // Dropping the source disjunct is NOT yet safe, measured 2026-08-11:
+    // it converts 2 outline keys and costs 3 false positives on excalidraw
+    // (`Delta.create(deleted, inserted, ElementsChange.stripIrrelevantProps)`
+    // in `packages/excalidraw/change.ts`, a hard gate at ceiling 0) plus one
+    // on outline. All four are the SAME pre-existing gap one level down: with
+    // the parameters related contravariantly for real, ztsc has to answer
+    // `Partial<ElementPartial>` → `Partial<Ordered<ExcalidrawElement>>`,
+    // where the target distributes over a discriminated union of element
+    // types and the source is the single `Omit`-of-the-union object. tsc
+    // relates that pair; ztsc's union-target walk does not. Close that first.
     const bivariant = (c.ts.fnFlags(s) & types.fn_flag_method != 0) or
         (c.ts.fnFlags(t) & types.fn_flag_method != 0);
     // Erase generics: to `any` in tsc's `erase = true` positions, to their
@@ -5214,6 +5274,32 @@ pub fn elaborateLiteralError(c: *Checker, expr_node0: Node, src_t: TypeId, targe
             // PRIMITIVE target; the shapes it can actually index are these.
             const index_arraylike = rtk == .object and c.ts.objectNumberIndex(rt) != 0;
             if (rtk != .array and rtk != .tuple and !index_arraylike and !is_union) return false;
+            // tsc re-checks the literal with `forceTuple` and elaborates
+            // element-wise ONLY when the result is TUPLE-LIKE
+            // (`elaborateArrayLiteral` → `generateLimitedTupleElements`).
+            // Spreading an ARRAY contributes a VARIADIC element, and
+            // `createNormalizedTupleType` collapses everything between the
+            // FIRST and the LAST rest/variadic position into a single rest —
+            // so a literal with TWO OR MORE array spreads normalizes to a
+            // plain array type, which is not tuple-like, and the whole
+            // literal is reported once at the assignment span instead of
+            // once per offending element. outline's `richExtensions: Nodes =
+            // [...inlineExtensions.filter(…), Image, CodeBlock, …,
+            // ...listExtensions, ...tableExtensions]` is that shape: tsc
+            // reports the declaration name once and ztsc reported ten
+            // element positions. ONE array spread still leaves fixed
+            // positions around it, so the literal stays a tuple and the
+            // element-wise elaboration stands; a spread of a TUPLE expands
+            // inline and contributes no variadic at all.
+            var array_spreads: u32 = 0;
+            for (c.tree.nodeRange(expr_node)) |el| {
+                if (el == null_node or c.nodeTag(el) != .spread_element) continue;
+                const op = c.tree.nodeData(el).lhs;
+                if (op == null_node) return false;
+                const ot = c.nodeType(op) orelse return false;
+                if (c.ts.kind(try c.resolveStructural(ot)) != .tuple) array_spreads += 1;
+            }
+            if (array_spreads >= 2) return false;
             var reported = false;
             var i: u32 = 0;
             for (c.tree.nodeRange(expr_node)) |el| {
