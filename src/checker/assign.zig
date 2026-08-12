@@ -855,6 +855,11 @@ pub fn measuredVariances(c: *Checker, owner: SymbolId) Error!?u32 {
     // tsc measures in its own `getVariances` context for the same reason.
     const saved_rel_id_floor = c.rel_id_floor;
     c.rel_id_floor = c.rel_id_depth;
+    // The expanding flags are read from the same stack the floor hides, so they
+    // are part of the same isolation: a bit inherited from the demanding walk
+    // would make the measurement's cut depend on that walk.
+    const saved_rel_expanding = c.rel_expanding;
+    c.rel_expanding = 0;
     // The relation's IN-PROGRESS MARKS are the same story on the last axis the
     // two isolations above do not cover, and it is the one that decides which
     // overload a call resolves to.
@@ -892,6 +897,7 @@ pub fn measuredVariances(c: *Checker, owner: SymbolId) Error!?u32 {
         c.scratch().free(saved_maybe);
         c.rel_assumed = saved_rel_assumed;
         c.rel_id_floor = saved_rel_id_floor;
+        c.rel_expanding = saved_rel_expanding;
         c.suppress_inst_diag = saved_suppress;
         c.inst_count = saved_count;
         c.budget_epoch = saved_epoch;
@@ -1840,10 +1846,24 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!bool {
         c.rel_src_buckets[relIdBucket(c.rel_src_ids[c.rel_id_depth].sym)] -= 1;
         c.rel_tgt_buckets[relIdBucket(c.rel_tgt_ids[c.rel_id_depth].sym)] -= 1;
     };
-    if (pushed and (c.relIdDeeplyNested(true) or c.relIdDeeplyNested(false))) {
-        c.rel_guard_tripped = true;
-        c.rel_assumed = true;
-        return true;
+    // The expanding flags are per-FRAME state that children inherit, so the
+    // save/restore is function-scoped even though only tsc's rule reads them.
+    const saved_expanding = c.rel_expanding;
+    defer c.rel_expanding = saved_expanding;
+    if (pushed) {
+        if (comptime checker_zig.relation_guard_both_sides) {
+            if (c.rel_expanding & 1 == 0 and c.relIdDeeplyNested(true)) c.rel_expanding |= 1;
+            if (c.rel_expanding & 2 == 0 and c.relIdDeeplyNested(false)) c.rel_expanding |= 2;
+            if (c.rel_expanding == 3) {
+                c.rel_guard_tripped = true;
+                c.rel_assumed = true;
+                return true;
+            }
+        } else if (c.relIdDeeplyNested(true) or c.relIdDeeplyNested(false)) {
+            c.rel_guard_tripped = true;
+            c.rel_assumed = true;
+            return true;
+        }
     }
     const maybe_start = c.rel_maybe.items.len;
     if (cacheable) {
@@ -2318,18 +2338,19 @@ pub fn relIdDeeplyNested(c: *const Checker, src: bool) bool {
     const ids = if (src) &c.rel_src_ids else &c.rel_tgt_ids;
     const top = ids[c.rel_id_depth - 1];
     const buckets = if (src) &c.rel_src_buckets else &c.rel_tgt_buckets;
+    const limit = checker_zig.max_relation_identity_repeats;
     // The bucket filter counts the WHOLE live stack, floor included, so it
     // stays a conservative pre-filter when a floor is set: it can only let
     // through a scan that then finds nothing, never skip one that would have
     // found something.
-    if (buckets[relIdBucket(top.sym)] < checker_zig.max_relation_identity_repeats) return false;
+    if (buckets[relIdBucket(top.sym)] < limit) return false;
     var seen: u32 = 0;
     var last: TypeId = 0;
     for (ids[c.rel_id_floor..c.rel_id_depth]) |id| {
         if (id.sym != top.sym) continue;
         if (id.ref > last) {
             seen += 1;
-            if (seen >= checker_zig.max_relation_identity_repeats) return true;
+            if (seen >= limit) return true;
         }
         last = id.ref;
     }

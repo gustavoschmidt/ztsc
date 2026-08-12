@@ -215,3 +215,47 @@ conditional/048_infer_through_homomorphic_key_set_deferred.ts  -TS2322 41
 conditional/048_infer_through_homomorphic_key_set_deferred.ts  -TS2322 46
 
 
+
+# An ALTERNATING relation spine. `relIdDeeplyNested`'s growth test compares
+# each occurrence of a generic on the live relation stack with the PREVIOUS
+# occurrence of the same generic, so a spine that alternates between two fixed
+# instantiations — `Store<Sub>` -> `Store<Base>` -> `Store<Sub>` -> …, which a
+# property-held `add = (i: Partial<T>) => T` produces because the parameter
+# position flips the relation's direction at every level — reads as growth and
+# is cut at `max_relation_identity_repeats` (2). The cut assumes the pair
+# related, which drops the fact at the bottom of the alternation. Case 1 needs
+# no turn of it and is reported; cases 2 and 3 (3 is outline's real shape) need
+# one and are not.
+#
+# The alternation is BOUNDED — a finite set of pairs, which the relation's own
+# in-progress mark closes — so the cut is pure loss, and four looser guards
+# were built and measured on 2026-08-12. Every one widens the walk enough to
+# expose four PRE-EXISTING false positives in immich (kysely's
+# `DeleteQueryBuilder`/`SelectQueryBuilder`, whose variance comparison only
+# falls back to the structural walk tsc uses because this guard truncates it),
+# and tsc's own both-sides rule additionally costs immich 1.12 -> 8.73 s.
+# Per-variant numbers are recorded at `max_relation_identity_repeats`; the
+# thing to fix first is kysely's variance verdict, not this cut.
+assignability/096_alternating_instantiation_spine.ts  -TS2416 44
+assignability/096_alternating_instantiation_spine.ts  -TS2322 48
+assignability/096_alternating_instantiation_spine.ts  -TS2416 60
+assignability/096_alternating_instantiation_spine.ts  -TS2322 64
+
+# WHERE a type argument is written decides whether ztsc checks its constraint.
+# The TS2344 gate is queued from `typeFromTypeNode` (`queueTypeArgConstraints`),
+# which sees a reference written in a TYPE position — line 39. Three other
+# written argument lists never reach the queue and so are never checked:
+# a class heritage clause (32, 42), an interface heritage clause (43) and an
+# explicit list on a call (48). tsc reports all four.
+#
+# This is the root of outline's twelve missing TS2344 keys (`Collection` /
+# `Document` against `Store<T extends Model>`, every one of them an `extends`
+# clause or an explicit call list). The relation fact itself is NOT missing —
+# line 39 proves ztsc decides it — so the fix is to reach the gate from the
+# heritage and call-argument paths, not anything about the relation. Left
+# deferred here because those paths are outside this change's ownership.
+# Measured 2026-08-12.
+assignability/097_written_type_argument_constraint_sites.ts  -TS2344 32
+assignability/097_written_type_argument_constraint_sites.ts  -TS2344 42
+assignability/097_written_type_argument_constraint_sites.ts  -TS2344 43
+assignability/097_written_type_argument_constraint_sites.ts  -TS2344 48
