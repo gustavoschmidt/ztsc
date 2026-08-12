@@ -61,7 +61,6 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const ast = @import("frontend/ast.zig");
-const scanner = @import("frontend/scanner.zig");
 const intern = @import("intern.zig");
 const binder = @import("frontend/binder.zig");
 const types = @import("types.zig");
