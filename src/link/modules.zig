@@ -311,6 +311,13 @@ pub fn link(
     // Then the ambient/augmentation module registry, which import
     // resolution and TS2307 suppression consult below.
     try l.buildAmbient();
+    // Only now can a file's `export * from "spec"` whose `spec` is an ambient
+    // module (`@types/fs-extra`'s `export * from "fs"`) merge: its source names
+    // did not exist while the file tables were being built.
+    try l.starMergeFilesFromAmbient();
+    // With every export table final, the re-exports that could not find their
+    // name in a still-growing one get their answer — and their diagnostic.
+    try l.resolvePendingReexports();
 
     const out = try arena.alloc(FileLinks, files.len);
     for (0..files.len) |i| {
@@ -1111,6 +1118,19 @@ fn globalSymName(files: []const ProgFile, sym_base: []const u32, sym: u32) Atom 
 // linking
 // ===========================================================================
 
+/// A `export { local as exported } from "module"` record whose `local` the
+/// target module did not export *yet* — parked by `table` and settled by
+/// `resolvePendingReexports` after the star merges.
+const PendingReexport = struct {
+    file: FileId,
+    mfile: FileId,
+    module: Atom,
+    local: Atom,
+    exported: Atom,
+    node: ast.Node,
+    type_only: bool,
+};
+
 const Linker = struct {
     arena: Allocator,
     scratch: Allocator,
@@ -1155,8 +1175,16 @@ const Linker = struct {
     /// Backing store for `.dual` targets (`Target.payload` indexes it).
     /// Append-only; sealed into the arena at the end of `link`.
     duals: std.ArrayListUnmanaged(DualTarget) = .empty,
+    /// `export { X } from "m"` records whose `X` was not in m's export table
+    /// when that table was built, in statement order. Their lookup — and their
+    /// TS2305/TS2459/TS2724 — are settled by `resolvePendingReexports`, once
+    /// every star merge has run. See the `reexport_named` arm of `table`.
+    pending_reexports: std.ArrayListUnmanaged(PendingReexport) = .empty,
 
     const visit_limit = 256;
+    /// Fixed-point bound for the ambient `export *` merge (`starMergeAmbient`):
+    /// a star chain longer than this stops growing rather than spinning.
+    const star_rounds = 8;
 
     fn atomText(l: *Linker, a: Atom) []const u8 {
         if (a == 0) return "";
@@ -1330,7 +1358,25 @@ const Linker = struct {
                         final.type_only = final.type_only or rec.type_only;
                         try l.put(t, rec.exported, final);
                     } else {
-                        try l.diagNoExportedMember(file, mfile, rec.module, rec.local, l.nodeSpan(file, rec.node));
+                        // Not "missing" yet — only missing FROM A TABLE THAT CAN
+                        // STILL GROW. `m`'s own `export * from "<ambient
+                        // module>"` merges after every file table exists
+                        // (`starMergeFilesFromAmbient`), so a name that reaches
+                        // `m` that way is not there to be found at this point,
+                        // and reporting here accused `export { createWriteStream
+                        // } from "fs-extra"` of a member the import form of the
+                        // same name resolves. The lookup and the diagnostic both
+                        // move to `resolvePendingReexports`, past the merge; the
+                        // `any` keeps the name bound until then.
+                        try l.pending_reexports.append(l.scratch, .{
+                            .file = file,
+                            .mfile = mfile,
+                            .module = rec.module,
+                            .local = rec.local,
+                            .exported = rec.exported,
+                            .node = rec.node,
+                            .type_only = rec.type_only,
+                        });
                         try l.put(t, rec.exported, .{ .kind = .any });
                     }
                 },
@@ -1363,6 +1409,12 @@ const Linker = struct {
         }
 
         // Pass 2: `export *` star merges (never `default`; first wins).
+        //
+        // Only a star whose source is a RESOLVED FILE settles here. One whose
+        // source is served by an ambient `declare module "spec"` block instead
+        // (`export * from "fs"`) cannot: the registry those names live in is
+        // built after every file table (`buildAmbient`), so it is empty at this
+        // point. That half runs as a deferred pass — `starMergeFilesFromAmbient`.
         for (f.bind.exports) |rec| {
             if (rec.kind != .reexport_all) continue;
             const mfile = f.specs.get(rec.module) orelse continue;
@@ -1780,7 +1832,6 @@ const Linker = struct {
     /// Order-invariant: the fixed point does not depend on visit order, since
     /// every round only *adds* names no round could have taken differently.
     fn starMergeAmbient(l: *Linker) Error!void {
-        const star_rounds = 8;
         // A specifier whose blocks declare NOTHING of their own — `declare
         // module "node:fs" { export * from "fs"; }`, which is how every
         // `node:` alias in `@types/node` that is not an `import … = require`
@@ -1826,6 +1877,149 @@ const Linker = struct {
             }
             if (!changed) break;
         }
+    }
+
+    /// Deferred second half of `table`'s pass 2: a FILE's `export * from "spec"`
+    /// whose `spec` is served by an ambient `declare module "spec" { … }` block
+    /// rather than by a resolved file.
+    ///
+    /// `@types/fs-extra`'s `index.d.ts` is the shape — `export * from "fs"` on
+    /// top of its own overloads. "fs" resolves to no file (`@types/node`
+    /// declares it as an ambient module), so pass 2's `f.specs.get(rec.module)
+    /// orelse continue` dropped the star whole and fs-extra's export table was
+    /// its own declarations only. Every name the star contributes then went
+    /// missing from all three ways of reaching the table at once: `import fs
+    /// from "fs-extra"` (the `esModuleInterop` synthetic default, which IS this
+    /// module's namespace object), `import * as fs from "fs-extra"`, and
+    /// `import { createWriteStream } from "fs-extra"` — TS2339/TS2551/TS2305 on
+    /// every `fs.createWriteStream` / `fs.readFileSync` / `fs.ReadStream` an
+    /// application writes through the alias.
+    ///
+    /// It cannot run inside `table`: the ambient registry is filled only after
+    /// every file table exists (`buildAmbient`), so the source names are not
+    /// there yet. Hence a pass of its own — and, once a file table grows here,
+    /// a re-run of BOTH other star merges, because that table is itself a
+    /// possible star source: for the file→file direction (`export * from
+    /// "fs-extra"` in a package that re-bundles it, whose pass-2 merge read the
+    /// smaller table) and for the ambient one (`declare module "m" { export *
+    /// from "fs-extra"; }`). All three reach a joint fixed point rather than
+    /// each settling alone.
+    ///
+    /// Same rules as both existing star merges: `default` and the reserved
+    /// `export=` key never travel, and the first contributor of a name wins,
+    /// which keeps a module's own declaration (pass 1) ahead of any star's.
+    /// Order-invariant: every round only *adds* names, and never one another
+    /// round could have taken differently. `join_rounds` is a safety valve, not
+    /// a depth budget — growth is monotone, so the loop cannot oscillate, and a
+    /// sweep that changes nothing ends it.
+    fn starMergeFilesFromAmbient(l: *Linker) Error!void {
+        const join_rounds = 64;
+        var round: u32 = 0;
+        while (round < join_rounds) : (round += 1) {
+            var changed = false;
+            for (l.files, 0..) |*f, fi| {
+                for (f.bind.exports, 0..) |rec, ri| {
+                    if (rec.kind != .reexport_all) continue;
+                    // A star written inside a `declare module` block re-exports
+                    // into that block's specifier, not into the file around it;
+                    // `starMergeAmbient` owns those. (`bindExportAll` records no
+                    // scope, so the block's record RANGE is what separates them.)
+                    if (inAmbientBlock(f, ri)) continue;
+                    const t = &l.tables[fi];
+                    if (f.specs.get(rec.module)) |mfile| {
+                        // The file→file direction, which pass 2 already ran once
+                        // — repeated here only so a source table that grew below
+                        // reaches the modules that star it. Nothing new on the
+                        // first round.
+                        if (mfile == fi) continue;
+                        const src = &l.tables[mfile];
+                        for (src.keys(), src.values()) |name, tgt| {
+                            if (try l.starPutFile(t, name, tgt, rec.type_only)) changed = true;
+                        }
+                        continue;
+                    }
+                    const key = l.ambientKey(rec.module) orelse continue;
+                    // Snapshot: only the source's entries are read, and the put
+                    // below grows a FILE table, never this one.
+                    const src = l.ambient.values()[l.ambient.getIndex(key).?];
+                    for (src.keys(), src.values()) |name, tgt| {
+                        if (try l.starPutFile(t, name, tgt, rec.type_only)) changed = true;
+                    }
+                }
+            }
+            if (!changed) break;
+            try l.starMergeAmbient();
+        }
+    }
+
+    /// Settle every `export { X } from "m"` whose `X` was not in m's table when
+    /// that table was built: look it up again now that all three star merges
+    /// have run, and either bind it or report the missing member.
+    ///
+    /// Deferring the *diagnostic* is the point. A re-export is only wrong if the
+    /// name is missing from m's FINAL export set, and m's set is not final until
+    /// `starMergeFilesFromAmbient` has folded in whatever its `export * from
+    /// "<ambient module>"` contributes — so `export { createWriteStream } from
+    /// "fs-extra"` used to be TS2305 while `import { createWriteStream } from
+    /// "fs-extra"` (resolved in `linkImports`, which runs later) succeeded. The
+    /// suggestion search moves with it, for the same reason: TS2724's
+    /// "did you mean" should be drawn from the full table.
+    ///
+    /// Records are settled in the order `table` parked them, which is statement
+    /// order, so the file's own last-wins export precedence is preserved: a slot
+    /// another statement has since claimed with a real target is left alone, and
+    /// only the placeholder `any` this record itself put is replaced.
+    fn resolvePendingReexports(l: *Linker) Error!void {
+        for (l.pending_reexports.items) |p| {
+            var found = try l.lookupExport(p.mfile, p.local, 0);
+            // The parked path's `export =` fallback, repeated so the two stay
+            // one rule. Nothing adds that key to a table after `table` ran, so
+            // in practice a module with an `export =` never parks a record.
+            if (found == null) {
+                if (try l.lookupExport(p.mfile, l.atom_export_equals, 0)) |exeq| {
+                    found = (try l.exportEqualsMeanings(exeq, p.local)) orelse
+                        .{ .kind = .any };
+                }
+            }
+            if (found) |tgt| {
+                const t = &l.tables[p.file];
+                if (t.get(p.exported)) |cur| {
+                    if (cur.kind != .any) continue;
+                }
+                var final = tgt;
+                final.type_only = final.type_only or p.type_only;
+                try l.put(t, p.exported, final);
+            } else {
+                try l.diagNoExportedMember(p.file, p.mfile, p.module, p.local, l.nodeSpan(p.file, p.node));
+            }
+        }
+    }
+
+    /// One `export *`-merged name into a FILE's export table (`starPut`'s twin
+    /// for the file side). True when it was actually new.
+    fn starPutFile(
+        l: *Linker,
+        dst: *std.AutoArrayHashMapUnmanaged(Atom, Target),
+        name: Atom,
+        tgt: Target,
+        type_only: bool,
+    ) Error!bool {
+        if (name == l.atom_default or name == l.atom_export_equals) return false;
+        if (dst.contains(name)) return false;
+        var final = tgt;
+        final.type_only = final.type_only or type_only;
+        try dst.put(l.scratch, name, final);
+        return true;
+    }
+
+    /// True when export record `ri` of `f` was written inside one of the file's
+    /// `declare module "spec" { … }` blocks (the blocks own contiguous ranges of
+    /// `bind.exports`) rather than at the file's own top level.
+    fn inAmbientBlock(f: *const ProgFile, ri: usize) bool {
+        for (f.bind.ambient_modules) |am| {
+            if (ri >= am.export_start and ri < am.export_end) return true;
+        }
+        return false;
     }
 
     /// One `export *`-merged name into ambient table `dst_idx`. True when it
