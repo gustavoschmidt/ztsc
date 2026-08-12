@@ -5,12 +5,18 @@
 //! is the checker's side of `link/modules.zig`: one function per target kind,
 //! plus the two cycle-safe namespace-object caches and the `declare module`
 //! augmentations that fold extra exports into them.
+//!
+//! `globalThis` closes the set at the bottom: the outermost "namespace object"
+//! of all, read the same way — one member per value-space entry of the sealed
+//! `prog.globals` table, on demand.
 
 const std = @import("std");
 const binder = @import("../frontend/binder.zig");
+const intern = @import("../intern.zig");
 const modules = @import("../link/modules.zig");
 const types = @import("../types.zig");
 
+const Atom = intern.Atom;
 const SymbolId = binder.SymbolId;
 const TypeId = types.TypeId;
 
@@ -223,4 +229,51 @@ pub fn ambientNamespaceType(c: *Checker, idx: u32) Error!TypeId {
     const obj = try c.ts.makeObject(props.items, 0, 0, 0);
     try c.ambient_ns_types.put(c.cm(), idx, obj);
     return obj;
+}
+
+/// `typeof globalThis` — the global-scope object. A single interned marker
+/// object with no stored properties; `propOfTypeEx` resolves its members
+/// against `prog.globals` on demand. See `types.obj_flag_global_this`.
+///
+/// Materializing the members eagerly is not an option: the program's merged
+/// global value table is thousands of names deep with a full lib, and it is
+/// self-referential (`declare var window: Window & typeof globalThis`), so
+/// any eager fold would have to break the cycle at whichever point it was
+/// first triggered — making `window`'s type depend on traversal order and
+/// so on the checker count. Lazy lookup has neither problem.
+pub fn globalThisType(c: *Checker) Error!TypeId {
+    if (c.global_this_ty == types.no_type) {
+        c.global_this_ty = try c.ts.makeObject(&.{}, 0, 0, types.obj_flag_global_this | types.obj_flag_not_inferable);
+    }
+    return c.global_this_ty;
+}
+
+/// A member of the global scope object: a program-global *var*, *function*,
+/// *namespace* or `declare module` value (`prog.globals`, the same table the
+/// bare-name fallback in `resolveSpace` consults).
+///
+/// BLOCK-SCOPED globals are deliberately excluded. A global `const` / `let`
+/// / `class` / `enum` is in lexical scope but is not a property of the
+/// global object, and tsc reports exactly that — `globalThis.someConst` is
+/// TS2339 while the bare `someConst` resolves (oracle-verified against the
+/// pinned tsgo). Type-space-only globals (`interface Window`) are not
+/// members either; those are the `globalThisHasValue` = false case, which
+/// the access site turns into TS7017 rather than TS2339.
+pub fn globalThisProp(c: *Checker, name: Atom) Error!?types.Prop {
+    const sym = c.prog.globals.lookup(name) orelse return null;
+    const f = c.symFlags(sym);
+    if (!hasValueMeaning(f)) return null;
+    if (f.const_decl or f.let_decl or f.class or f.enum_decl) return null;
+    const flags: u32 = if (f.readonly_member) types.prop_flag_readonly else 0;
+    return .{ .name = name, .ty = try c.typeOfSymbol(sym), .flags = flags };
+}
+
+/// Whether `name` names a program global with VALUE meaning at all —
+/// block-scoped or not. Distinguishes tsc's two failure messages on
+/// `globalThis.x`: a known-but-block-scoped global is TS2339 ("Property 'x'
+/// does not exist"), an entirely unknown name is TS7017 (the implicit-any
+/// index message).
+pub fn globalThisHasValue(c: *Checker, name: Atom) bool {
+    const sym = c.prog.globals.lookup(name) orelse return false;
+    return hasValueMeaning(c.symFlags(sym));
 }
