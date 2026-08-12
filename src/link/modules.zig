@@ -30,6 +30,11 @@
 //!     import-of-re-export chains followed the same way. A missing named
 //!     export is TS2305; a missing default is TS2613 (when a same-named
 //!     named export exists) or TS1192.
+//! - **A global `declare module "spec"` outranks the file the resolver found**
+//!   for the same non-relative specifier (`applyAmbientModulePrecedence`,
+//!   tsc's `tryFindAmbientModule` ahead of `getResolvedModule`). The file is
+//!   still loaded — it is a program root either way — it just never answers an
+//!   import. Pattern modules (`declare module "*.css"`) stay behind resolution.
 //! - Checkers treat the sealed tables as read-only: no locks anywhere on
 //!   the check path (the immutability boundary).
 //! - Out of subset (documented): `export =` / `import x = require(...)`
@@ -275,12 +280,17 @@ pub fn link(
     gpa: Allocator,
     io: Io,
     interner: *Interner,
-    files: []const ProgFile,
+    files: []ProgFile,
     link_opts: LinkOpts,
 ) Error!LinkResult {
     var scratch_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch_arena.deinit();
     const scratch = scratch_arena.allocator();
+
+    // tsc looks a non-relative specifier up in the ambient module declarations
+    // BEFORE it consults the resolved file; apply that precedence once, up
+    // front, so every specifier consumer downstream agrees on the answer.
+    try applyAmbientModulePrecedence(arena, scratch, io, interner, files);
 
     var l: Linker = .{
         .arena = arena,
@@ -371,6 +381,93 @@ pub fn link(
     }
 
     return .{ .links = out, .sym_base = sym_base, .globals = gm.globals, .merged = gm.merged, .ambient_exports = amb, .ambient_specs = amb_specs, .constit_keys = gm.constit_keys, .constit_vals = gm.constit_vals, .export_equals_atom = l.atom_export_equals, .dual_targets = try arena.dupe(DualTarget, l.duals.items) };
+}
+
+/// Give a globally declared ambient module precedence over the file the
+/// resolver found for the same specifier — tsc's `resolveExternalModuleName`,
+/// whose FIRST act on a non-relative specifier is
+/// `tryFindAmbientModule(name, /*withAugmentations*/ true)`: an exactly-named
+/// `declare module "name"` living in `globals` is returned outright and the
+/// resolved file is never even looked at. Only *pattern* modules (`declare
+/// module "*.css"`) are consulted after resolution, which is where ztsc's
+/// `ambientKey` fallback already puts them.
+///
+/// Resolution itself must stay file-first: tsc loads that file into the program
+/// too (module resolution and symbol resolution are separate passes), it merely
+/// never binds an import to it. So the precedence is applied here instead, by
+/// clearing the resolved `FileId` out of every `SpecMap` entry an ambient module
+/// claims. Every consumer — the linker's export/import tables and the checker's
+/// `import("…")` / `require("…")` paths alike — reads through `SpecMap.get`, so
+/// one edit here is the single `resolveExternalModuleName` tsc has, rather than
+/// a precedence check bolted onto each call site.
+///
+/// **Only a `declare module "spec"` in a file that is itself a SCRIPT counts.**
+/// The same block inside a MODULE file is a module *augmentation* (tsc's
+/// `isModuleAugmentationExternal`); it is declared into that file's locals, never
+/// into `globals`, and must merge into the module it names instead of replacing
+/// it. Without that guard an app's own `declare module "react" { interface
+/// CSSProperties … }` would make every `import … from "react"` resolve to the
+/// augmentation's two-entry table.
+///
+/// outline is what this is for. `@types/yazl`'s `index.d.ts` does `import {
+/// Buffer } from "buffer"`, and because it sits inside `node_modules` the node
+/// walk finds a real package there — the browser polyfill `node_modules/buffer`,
+/// a module exporting its own unrelated `Buffer` class. Every other file in the
+/// program means `@types/node`'s ambient `declare module "buffer"`, whose
+/// `Buffer` is the merged global interface, so passing a plain `Buffer` to
+/// `ZipFile.addBuffer` was TS2345 against a same-named stranger. tsc binds both
+/// sides to the ambient module and sees one type.
+fn applyAmbientModulePrecedence(
+    arena: Allocator,
+    scratch: Allocator,
+    io: Io,
+    interner: *Interner,
+    files: []ProgFile,
+) Error!void {
+    var claimed: std.AutoArrayHashMapUnmanaged(Atom, void) = .empty;
+    defer claimed.deinit(scratch);
+    for (files) |*f| {
+        if (f.bind.is_module) continue; // augmentation, not a global declaration
+        for (f.bind.ambient_modules) |am| {
+            if (am.spec == 0) continue;
+            const text = interner.lookup(io, am.spec);
+            // A pattern module stays behind resolution (`ambientKey`), and a
+            // relative name is not an ambient module at all — tsc's
+            // `tryFindAmbientModule` bails on `isExternalModuleNameRelative`.
+            if (std.mem.indexOfScalar(u8, text, '*') != null) continue;
+            if (isRelativeSpecifier(text)) continue;
+            try claimed.put(scratch, am.spec, {});
+        }
+    }
+    if (claimed.count() == 0) return;
+    for (files) |*f| {
+        // Most files name no claimed specifier; only copy one whose map changes.
+        var hit = false;
+        for (f.specs.atoms, f.specs.files) |atom, fid| {
+            if (fid != no_file and claimed.contains(atom)) {
+                hit = true;
+                break;
+            }
+        }
+        if (!hit) continue;
+        const patched = try arena.dupe(FileId, f.specs.files);
+        for (f.specs.atoms, patched) |atom, *fid| {
+            if (fid.* != no_file and claimed.contains(atom)) fid.* = no_file;
+        }
+        f.specs.files = patched;
+    }
+}
+
+/// tsc's `isExternalModuleNameRelative`: a specifier is relative when it starts
+/// with `/`, `./` or `../` (`.` and `..` alone included).
+fn isRelativeSpecifier(spec: []const u8) bool {
+    if (spec.len == 0) return false;
+    if (spec[0] == '/') return true;
+    if (!std.mem.startsWith(u8, spec, ".")) return false;
+    if (spec.len == 1) return true; // "."
+    if (spec[1] == '/') return true; // "./…"
+    if (spec[1] != '.') return false;
+    return spec.len == 2 or spec[2] == '/'; // ".." / "../…"
 }
 
 /// Wrap one already-bound file as an unlinked Program (legacy single-file paths).
@@ -2050,12 +2147,15 @@ const Linker = struct {
     /// up in the globals as an exactly-named ambient module (`declare module
     /// "png-chunks-extract"`) BEFORE it consults the resolved file; only
     /// *pattern* ambient modules (`declare module "*.css"`) are consulted
-    /// after resolution fails. ztsc resolves file-first, which is right when
-    /// the resolved file is itself a module — `declare module "x"` inside a
-    /// module file is an *augmentation*, and must merge into the module it
-    /// names rather than replace it. It is wrong in the two cases below, and
-    /// the precedence flip is scoped to exactly those, so no augmentation can
-    /// be turned into a replacement.
+    /// after resolution fails. `applyAmbientModulePrecedence` performs that flip
+    /// program-wide before linking starts, for every specifier a GLOBAL `declare
+    /// module` claims — so by the time this runs, `f.specs.get` has already
+    /// answered null for those. What is left here are the specifiers whose
+    /// ambient block sits in a MODULE file, i.e. an *augmentation*, which must
+    /// merge into the module it names rather than replace it. That is right when
+    /// the resolved file is itself a module; it is wrong in the two cases below,
+    /// and the flip stays scoped to exactly those, so no augmentation can be
+    /// turned into a replacement.
     ///
     /// 1. A SYNTHETIC opaque `any` module. Under `allowJs` a JS-only
     ///    dependency loads as `declare const j: any; export = j;`
