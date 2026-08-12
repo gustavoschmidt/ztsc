@@ -686,6 +686,46 @@ pub fn inferReturnType(c: *Checker, fn_node: Node, body: Node, ret_ctx: TypeId) 
         .is_generator = proto.flags & ast.Flags.generator != 0,
         .yield_type = 0,
     };
+    // …and *this* function's receiver, for exactly the same reason.
+    // `checkFunctionBody` installs the explicit `this` parameter's type
+    // before walking the body; this probe walks the same expressions and
+    // did not, so a `this.x` inside it resolved against the ambient
+    // receiver — the enclosing class's instance or static side — and then
+    // MEMOIZED that answer in `node_types`, which the real body walk
+    // afterwards reads back. The divergence is therefore invisible unless
+    // the enclosing class happens to declare the same member name, which
+    // is precisely the case for a static helper that forwards to a
+    // same-named inherited static.
+    //
+    // sequelize's `ModelStatic<M>` is that shape:
+    //
+    // ```ts
+    // static createWithCtx<M extends Model>(this: ModelStatic<M>, …) {
+    //   return this.create(values, hookContext);   // Model.create<M2>
+    // }
+    // ```
+    //
+    // `create` resolved on `typeof Model` instead of on `ModelStatic<M>`,
+    // so its own `this: ModelStatic<M2>` was inferred from the class value
+    // and `M2` came out as the class's instance type rather than `M`. The
+    // helper's inferred return type became a CONCRETE `Promise<Model<any,
+    // any>>` — no longer mentioning `M` — so every caller got it, and
+    // outline reported 39 `Property 'x' does not exist on type
+    // 'Model<any, any>'` keys against it.
+    const saved_this = c.this_type;
+    defer c.this_type = saved_this;
+    for (c.tree.extraRange(proto.params_start, proto.params_end)) |pn| {
+        if (pn == null_node) continue;
+        // A `this` annotation is only a receiver annotation in LEADING
+        // position, which is where `signatureOfProto` reads it too.
+        if (c.thisParamAnn(pn)) |ann_node| {
+            if (ann_node != 0) {
+                const tt = try c.typeFromTypeNode(ann_node);
+                if (tt != types.no_type) c.this_type = tt;
+            }
+        }
+        break;
+    }
     if (c.nodeTag(body) != .block) {
         const raw = try c.checkExprCached(body, ret_ctx);
         if (ret_ctx != types.no_type) return c.widenToContext(raw, ret_ctx);
