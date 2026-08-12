@@ -3374,14 +3374,33 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
             // `string | string[] | undefined` must infer `string | undefined`;
             // matching the wrapper alone gives `string`.
             //
-            // Scoped to the shape the bookkeeping is FOR: exactly one naked
-            // type-param member, which is also the only case tsc's `matched`
-            // array is consulted in (`typeVariableCount === 1`). With no naked
-            // member the wrapper keeps the whole union, because splitting it
-            // there changes what a wrapper INFERS rather than what is left
-            // over — `Pick<T, K> | T | null` against a forwarded `state`
-            // union then takes its key set from a single constituent instead
-            // of the whole source (conformance `inference/085`).
+            // The `matched` bookkeeping is only CONSULTED when there is
+            // exactly one naked type-param member (tsc's `typeVariableCount
+            // === 1`), but the SPLIT itself is unconditional in tsc, so a
+            // target union with no naked member at all splits too. It has to:
+            // a wrapper cannot invert a union — the `.function` arm bails
+            // because a union is not a function, and the `.object` arm has no
+            // properties to pair — so handing it the whole argument yields no
+            // candidate whatsoever.
+            //
+            // @types/react 17's `forwardRef<T, P>(render: RenderFn<T, P>)` is
+            // that shape: the only mention of `T` is the render function's
+            // `ref` parameter, `ForwardedRef<T> = ((instance: T | null) =>
+            // void) | MutableRefObject<T | null> | null`, and the argument's
+            // `Ref<Div> = RefCallback<Div> | RefObject<Div> | null` pairs off
+            // by symbol on neither arm (`RefObject` and `MutableRefObject` are
+            // different interfaces; `RefCallback` is an indexed access with no
+            // counterpart alias). `T` fell to `unknown` and every
+            // `React.forwardRef((props, ref) => …)` was rejected against
+            // `ForwardRefRenderFunction<unknown, P>` — 18 keys on outline,
+            // conformance `inference/123`.
+            //
+            // Splitting is safe here only BECAUSE the by-symbol pass below
+            // runs first: without it, offering every source constituent to
+            // every target constituent manufactures candidates from unrelated
+            // pairs (`IteratorReturnResult<void>` into `IteratorYieldResult
+            // <T>` pairs their `value` members and turns every
+            // `Array.from(gen)` into `void[]`).
             //
             // …and tsc runs `inferFromMatchingTypes` a SECOND time over what
             // the identity pass above left, with `isTypeCloselyMatchedBy`: a
@@ -3451,7 +3470,7 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                 if (rest.items.len == 0) break :blk2 arg_residual;
                 break :blk2 try s.makeUnion(c.scratch(), rest.items);
             };
-            const per_constituent = n_tp == 1 and s.kind(rest_src) == .union_type;
+            const per_constituent = n_tp <= 1 and s.kind(rest_src) == .union_type;
             const src_members: []const TypeId = if (per_constituent)
                 try c.memberList(rest_src)
             else
