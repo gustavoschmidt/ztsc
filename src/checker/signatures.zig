@@ -714,17 +714,62 @@ pub fn inferReturnType(c: *Checker, fn_node: Node, body: Node, ret_ctx: TypeId) 
     // 'Model<any, any>'` keys against it.
     const saved_this = c.this_type;
     defer c.this_type = saved_this;
+    // Tracked as its own flag, not as `c.this_type != saved_this`: an
+    // annotation naming the enclosing class itself (`pinned(this: Base)` inside
+    // `class Base`) resolves to the type already there, and it must still count
+    // as WRITTEN — it is what pins the receiver against the polymorphic form
+    // installed below.
+    var this_annotated = false;
     for (c.tree.extraRange(proto.params_start, proto.params_end)) |pn| {
         if (pn == null_node) continue;
         // A `this` annotation is only a receiver annotation in LEADING
         // position, which is where `signatureOfProto` reads it too.
         if (c.thisParamAnn(pn)) |ann_node| {
+            this_annotated = true;
             if (ann_node != 0) {
                 const tt = try c.typeFromTypeNode(ann_node);
                 if (tt != types.no_type) c.this_type = tt;
             }
         }
         break;
+    }
+    // A class INSTANCE method's receiver is POLYMORPHIC. tsc types the `this`
+    // EXPRESSION inside such a method as the class's *this-type* (a marker
+    // standing for "whatever the receiver turns out to be"), not as the class's
+    // own instance type — so a return type DERIVED from `this` stays
+    // parameterized on the receiver and resolves per call site.
+    //
+    // `signatureOfProtoCtx` already builds that marker for an explicit
+    // `foo(): this` annotation. The INFERRED path did not, so a method that
+    // merely FORWARDS a `this`-returning one collapsed at its declaration:
+    //
+    // ```ts
+    // save(): Promise<this> { … }
+    // saveWithCtx(ctx) { return this.save({ …ctx }); }   // inferred
+    // ```
+    //
+    // came out `Promise<Base>` for every caller instead of `Promise<Sub>`.
+    // sequelize's `save(options?): Promise<this>` behind outline's model base
+    // class is exactly that, and it cost 15 keys across four files
+    // (`server/models/Document.ts:1200` printed the mismatch against `this`
+    // verbatim). `return this` and `return { me: this }` are the same bug one
+    // step smaller, and both are covered by the fixture.
+    //
+    // Deliberately narrow:
+    //
+    //   * an explicit `this` parameter is a written override of the receiver,
+    //     and the loop above has already installed it (`this_annotated`);
+    //   * a STATIC's receiver is the class VALUE — `this` there is the
+    //     constructor, whose polymorphic form ztsc does not model;
+    //   * an object-literal method (a `function_expr` here) has no polymorphic
+    //     `this` at all, only a contextual `ThisType<T>`;
+    //   * the ambient receiver must be the class's instance REFERENCE, the
+    //     same guard the explicit-annotation path uses.
+    if (!this_annotated and c.nodeTag(fn_node) == .class_method and
+        proto.flags & ast.Flags.static == 0 and c.ts.kind(c.this_type) == .ref)
+    {
+        c.this_type = try c.ts.makeThisType(c.this_type);
+        c.has_this_types = true;
     }
     if (c.nodeTag(body) != .block) {
         const raw = try c.checkExprCached(body, ret_ctx);
