@@ -1918,7 +1918,11 @@ pub fn ctorClassOwnsMember(c: *Checker, name: Atom) bool {
 ///     keyed by the interned table this route never builds.
 const declared_keys_depth: u32 = 32;
 
-const DeclKey = struct { name: Atom, non_public: bool };
+/// `name_ty` is the member's tsc `nameType` when it has one that this route
+/// can derive from syntax alone — a NUMERIC declaration name (see
+/// `Checker.memberNameType`); `no_type` means the key is the plain string
+/// literal of the atom.
+const DeclKey = struct { name: Atom, non_public: bool, name_ty: TypeId = types.no_type };
 
 const DeclKeyWalk = struct {
     keys: std.ArrayList(DeclKey) = .empty,
@@ -1932,9 +1936,13 @@ const DeclKeyWalk = struct {
     /// a derived member overrides the inherited one of the same name, and the
     /// walk visits derived before base.
     fn add(w: *DeclKeyWalk, alloc: Allocator, name: Atom, non_public: bool) Error!void {
+        return w.addNamed(alloc, name, non_public, types.no_type);
+    }
+
+    fn addNamed(w: *DeclKeyWalk, alloc: Allocator, name: Atom, non_public: bool, name_ty: TypeId) Error!void {
         const gop = try w.index.getOrPut(alloc, name);
         if (gop.found_existing) return;
-        try w.keys.append(alloc, .{ .name = name, .non_public = non_public });
+        try w.keys.append(alloc, .{ .name = name, .non_public = non_public, .name_ty = name_ty });
     }
 
     fn deinit(w: *DeclKeyWalk, alloc: Allocator) void {
@@ -1983,6 +1991,10 @@ pub fn declaredKeyUnion(c: *Checker, sym: SymbolId) Error!?TypeId {
         // A `private`/`protected` member is not a key — `keyofObjectTable`'s
         // rule, and the reason `Pick<C, keyof C>` is the public surface.
         if (k.non_public) continue;
+        if (k.name_ty != types.no_type) {
+            try parts.append(c.scratch(), k.name_ty);
+            continue;
+        }
         try parts.append(c.scratch(), try c.ts.makeStringLiteral(k.name, false));
     }
     // The index-signature domains `keyofObjectTable` contributes. A
@@ -2118,11 +2130,14 @@ fn declKeysOfInterfaceBlocks(c: *Checker, sym: SymbolId, w: *DeclKeyWalk) Error!
             switch (c.nodeTag(m)) {
                 .property_signature, .method_signature => {
                     const tok = c.tree.nodeMainToken(m);
-                    // A computed enum-member key is NAMED by the enum member,
-                    // and that name type is recorded against the interned
-                    // table this route never builds.
-                    if (try c.memberNameType(tok, md.rhs) != types.no_type) return false;
-                    try w.add(c.scratch(), try c.memberKey(tok, md.rhs), false);
+                    const nt = try c.memberNameType(tok, md.rhs);
+                    // A NUMERIC name (`{ 200: T }`) is named by the number
+                    // literal, which is a function of the token — this route
+                    // can carry it. A computed enum-member key is NAMED by the
+                    // enum member, and that name type is recorded against the
+                    // interned table this route never builds.
+                    if (nt != types.no_type and c.ts.kind(nt) != .number_literal) return false;
+                    try w.addNamed(c.scratch(), try c.memberKey(tok, md.rhs), false, nt);
                 },
                 .index_signature => {
                     const e = c.tree.extraData(ast.IndexSig, md.lhs);

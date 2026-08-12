@@ -3030,29 +3030,68 @@ pub const Checker = struct {
         return try c.typeOfSymbol(sym);
     }
 
-    /// tsc's `symbol.links.nameType` for a member declared with a computed
-    /// key: the ENUM-MEMBER literal type `[E.A]` denotes. A member table keys
-    /// by atom, and an enum member's atom is its VALUE (`"AV1"`), so `keyof`
-    /// read back a plain string-literal union and lost the enum's identity —
-    /// `T extends keyof M` then did not satisfy `T extends E`. Returns
-    /// `no_type` for every other key, which is every key that has no name
-    /// type: an ordinary identifier or string key names itself.
+    /// tsc's `symbol.links.nameType` for a member whose DECLARATION name is
+    /// not the plain string literal of the atom it is keyed by — tsc's
+    /// `getLiteralTypeFromPropertyName`, which types the name node itself
+    /// rather than the escaped name. Two cases:
     ///
-    /// Only enum members are recorded. A `unique symbol` key is already
-    /// nominal through its `__@u<id>` atom, and a string/number-literal const
-    /// key names exactly the atom it produces, so neither needs the side
-    /// table — and keeping it to the one case that needs it keeps the map
-    /// empty on every program that has no enum-keyed type.
+    ///   * a computed ENUM-MEMBER key (`{ [E.A]: T }`). A member table keys by
+    ///     atom, and an enum member's atom is its VALUE (`"AV1"`), so `keyof`
+    ///     read back a plain string-literal union and lost the enum's identity
+    ///     — `T extends keyof M` then did not satisfy `T extends E`.
+    ///   * a NUMERIC name (`{ 200: T }`, `{ [200]: T }`, `[k]` with
+    ///     `const k = 200`). tsc checks the numeric literal, so the key type
+    ///     is the NUMBER literal `200`; a QUOTED `{ "200": T }` names the
+    ///     string `"200"` and is unaffected (verified against tsc: the two
+    ///     spell different key sets and neither is assignable to the other).
+    ///     Without it octokit's `SuccessStatuses & keyof Responses` — numeric
+    ///     status codes on both sides — intersected to `never` and every
+    ///     `Endpoints[…]["response"]` read came out `unknown`.
+    ///
+    /// Returns `no_type` for every other key, which is every key that names
+    /// itself: an ordinary identifier or string key. A `unique symbol` key is
+    /// already nominal through its `__@u<id>` atom.
     pub fn memberNameType(c: *Checker, tok: TokenIndex, flags: u32) Error!TypeId {
-        if (flags & ast.Flags.computed_sym == 0) return types.no_type;
+        if (flags & ast.Flags.computed_sym == 0) {
+            // A plain (`200:`) or computed (`[200]:`) numeric name. Both key
+            // the table by the digits `memberAtom` interns, so the numeric
+            // literal is only the right name type when those digits ARE the
+            // number's canonical rendering: `{ 0x10: T }` / `{ 1e3: T }` are
+            // keyed `"0x10"` / `"1e3"` here where tsc keys them `"16"` /
+            // `"1000"`, and naming them `16` / `1000` would leave the key type
+            // and the member name disagreeing — a key `keyof` reports that no
+            // indexed access can read. Those stay as they were (see the
+            // `memberAtom` normalization gap).
+            if (c.tree.tokens.tag(tok) != .numeric_literal) return types.no_type;
+            return c.numericNameType(c.numberTokenValue(tok), c.tokenText(tok));
+        }
         const name = if (flags & ast.Flags.computed_sym_qual != 0)
             try std.fmt.allocPrint(c.scratch(), "{s}.{s}", .{ c.tokenText(tok - 2), c.tokenText(tok) })
         else
             c.tokenText(tok);
         const ty = (try c.constSymbolKeyType(name, c.cur_scope)) orelse return types.no_type;
         const r = try c.ts.regular(ty);
-        if (c.ts.kind(r) != .enum_type or !c.ts.isEnumMember(r)) return types.no_type;
-        return r;
+        switch (c.ts.kind(r)) {
+            // `[k]` with `const k = 200`: `literalKeyAtom` keys the member by
+            // the canonical rendering already, so the numeric literal always
+            // agrees with the atom. `ts.regular` only sheds an OBJECT's
+            // freshness, so a fresh literal needs `regularLiteral`.
+            .number_literal, .number_literal_fresh => return c.ts.regularLiteral(r),
+            .enum_type => if (c.ts.isEnumMember(r)) return r,
+            else => {},
+        }
+        return types.no_type;
+    }
+
+    /// The NUMBER literal type a numeric member name denotes, or `no_type`
+    /// when `text` is not that number's canonical rendering — the atom the
+    /// member is keyed by. See `memberNameType`.
+    pub fn numericNameType(c: *Checker, value: f64, text: []const u8) Error!TypeId {
+        var buf: [32]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        print_zig.printNumber(&w, value) catch return types.no_type;
+        if (!std.mem.eql(u8, w.buffered(), text)) return types.no_type;
+        return c.ts.makeNumberLiteral(value, false);
     }
 
     /// Member symbol `name` of `obj` for qualified computed-key resolution:
