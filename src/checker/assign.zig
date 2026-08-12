@@ -2771,7 +2771,25 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
             // null}` even though the same relation succeeds when the target
             // is spelled out. Re-dispatch so the intersection-target rule
             // (each constituent must be met) runs.
-            if (rt != t and c.ts.kind(rt) == .intersection) return c.isAssignable(s, rt);
+            //
+            // A UNION body is the same case with the same cure, and it is not
+            // hypothetical: an alias in a CYCLE is spelled as the lazy `.ref`
+            // everywhere it is reached while its own body still resolves, so
+            // the ref itself ends up as a MEMBER of some other union — and
+            // `typeRelatedToSomeType`'s member loop then hands this pair every
+            // intersection-shaped source it is given. outline's action tree is
+            // that shape: `ActionVariant = Action | … | ActionWithChildren`,
+            // and `ActionWithChildren` spells `children: (ActionVariant |
+            // ActionGroup | ActionSeparator)[]`, so the element union keeps
+            // `ActionVariant` as a ref while each of its four constituents is
+            // an intersection (`BaseAction & { variant: "action" }`). All four
+            // died here, which made a REFLEXIVE `(ActionVariant | ActionGroup
+            // | ActionSeparator)[]` write fail — while the same union spelled
+            // out, or rebuilt by a distributive conditional (which
+            // re-normalizes it), succeeded.
+            if (rt != t and (c.ts.kind(rt) == .intersection or c.ts.kind(rt) == .union_type)) {
+                return c.isAssignable(s, rt);
+            }
             return c.structuralAssignable(s, rt);
         }
         // A deferred CONDITIONAL target is answered by the arm just below,
@@ -5521,7 +5539,21 @@ pub fn elaborateLiteralError(c: *Checker, expr_node0: Node, src_t: TypeId, targe
             return reported;
         },
         .object_literal => {
-            if (c.ts.kind(rt) != .object and !is_union) return false;
+            // tsc's `elaborateObjectLiteralError` bails only on a PRIMITIVE
+            // or `never` target; every shape `getIndexedAccessTypeOrUndefined`
+            // can name a property of elaborates, and that includes an
+            // INTERSECTION (`getPropertyOfUnionOrIntersectionType`). Requiring
+            // a lone object here meant a target as ordinary as `Big & { extra?:
+            // 1 }` lost its per-property anchor: the whole literal was reported
+            // once at the argument's `{`, which is neither tsc's code (TS2345
+            // rather than the property's TS2322) nor tsc's line — so a
+            // `@ts-expect-error` sitting on the offending PROPERTY suppressed
+            // tsgo's report and not ztsc's. outline's
+            // `server/middlewares/authentication.test.ts` mocks a koa context
+            // against `{ body; response } & { state } & DefaultContext &
+            // ExtendableContext` that way, fifteen times in one file.
+            const is_isect = c.ts.kind(rt) == .intersection;
+            if (c.ts.kind(rt) != .object and !is_union and !is_isect) return false;
             var reported = false;
             for (c.tree.nodeRange(expr_node)) |prop| {
                 if (prop == null_node) continue;
@@ -5545,7 +5577,7 @@ pub fn elaborateLiteralError(c: *Checker, expr_node0: Node, src_t: TypeId, targe
                     else
                         continue)
                 else
-                    (c.ts.objectPropByName(rt, key) orelse continue);
+                    ((try declaredPropOfTarget(c, rt, key)) orelse continue);
                 // An OPTIONAL target property accepts `undefined` — the same
                 // `| undefined` `structuralAssignable` folds in before it
                 // compares. Without it this elaboration re-judged every
@@ -5572,6 +5604,46 @@ pub fn elaborateLiteralError(c: *Checker, expr_node0: Node, src_t: TypeId, targe
             return reported;
         },
         else => return false,
+    }
+}
+
+/// The DECLARED property `key` of an elaboration target, tsc's
+/// `getPropertyOfType` restricted to what `getIndexedAccessTypeOrUndefined`'s
+/// first step can see: a lone object's own member, or — over an INTERSECTION —
+/// the intersection of the member as each constituent declares it
+/// (`getPropertyOfUnionOrIntersectionType`; present when ANY constituent has
+/// it, optional/readonly only when EVERY one of them says so, hence the `and`
+/// on flags).
+///
+/// Deliberately narrower than `propOfType`: no index signature, no apparent
+/// `Object`/`Function` member, and no `objectRelatesAsAny` stand-in. All three
+/// answer for a name the target never declared, and this lookup exists to
+/// decide whether the literal's property has a counterpart worth blaming — an
+/// `any` from a sibling's `[k: string]: any` would swallow every real mismatch
+/// next to it (`@types/koa`'s `DefaultContext` sits in exactly such an
+/// intersection). A name found nowhere is left alone: it is either excess,
+/// which the excess-property check owns, or index-covered, which the
+/// lone-object arm has always skipped too.
+fn declaredPropOfTarget(c: *Checker, rt: TypeId, key: Atom) Error!?types.Prop {
+    switch (c.ts.kind(rt)) {
+        .object => return c.ts.objectPropByName(rt, key),
+        .intersection => {
+            var out: ?types.Prop = null;
+            for (try c.memberList(rt)) |m| {
+                const p = (try declaredPropOfTarget(c, try c.resolveStructural(m), key)) orelse continue;
+                if (out) |o| {
+                    out = .{
+                        .name = o.name,
+                        .ty = try c.ts.makeIntersection(c.scratch(), &.{ o.ty, p.ty }),
+                        .flags = o.flags & p.flags,
+                    };
+                } else {
+                    out = p;
+                }
+            }
+            return out;
+        },
+        else => return null,
     }
 }
 
@@ -5823,6 +5895,11 @@ pub fn bestMatchingUnionMember(c: *Checker, src_t: TypeId, ut: TypeId) Error!?Ty
             const name = c.ts.objectProp(rs, i).name;
             if ((try c.propOfType(rm, name)) != null) n += 1;
         }
+        // `>=`, so the LAST constituent of a tie wins — tsc's
+        // `findMostOverlappyType` writes `len >= matchingCount`. Load-bearing:
+        // `Alg | { iv: number }` against `{ name, iv }` overlaps on one name in
+        // each arm, and only the later arm can name the offending `iv`
+        // (conformance `assignability/091_fresh_literal_union_property_types`).
         if (n > 0 and n >= best_n) {
             best_n = n;
             best = m;
