@@ -4043,7 +4043,22 @@ pub fn discriminatedUnionAssignable(c: *Checker, s: TypeId, t: TypeId) Error!boo
                 // accepts — `{id: string} | {id?: undefined}` splits an
                 // `id: string | undefined` only because the `string` member
                 // covers the `string` case.
-                const mv = (try discriminantUnitOf(c, mp.ty)) orelse mp.ty;
+                var mv = (try discriminantUnitOf(c, mp.ty)) orelse mp.ty;
+                // An OPTIONAL member property accepts `undefined` on top of
+                // its declared type: tsc's `typeRelatedToDiscriminatedType`
+                // does not compare against the raw property type but calls
+                // `propertyRelatedTo`, whose target side is
+                // `addOptionality(getNonMissingTypeOfSymbol(targetProp),
+                // /*isProperty*/ false, targetIsOptional)`. Without it the
+                // `undefined` constituent that an all-optional source's own
+                // discriminant carries is covered by no member and the split
+                // never runs — `Partial<Omit<Partial<Ordered<Element>>, …>>`
+                // → `Partial<Ordered<ExcalidrawElement>>` (excalidraw's
+                // `Delta.create(deleted, inserted, stripIrrelevantProps)`),
+                // where the source is the single `Omit`-of-the-union object
+                // whose `type` is the whole tag union and the target is the
+                // union that splits that tag across thirteen members.
+                if (mp.optional()) mv = try c.makeUnion2(mv, types.undefined_type);
                 if (!try c.isAssignable(lv, mv)) continue;
                 covered = true;
                 if (!try c.nonDiscPropsAssignable(sr, m, dprop.name)) {
@@ -4544,16 +4559,14 @@ pub fn signatureAssignableModeInnerErase(c: *Checker, s: TypeId, t: TypeId, mode
     // strict_variance.ts`, whose missed lines are registered in
     // `test/conformance/DEFERRED`.
     //
-    // Dropping the source disjunct is NOT yet safe, measured 2026-08-11:
-    // it converts 2 outline keys and costs 3 false positives on excalidraw
-    // (`Delta.create(deleted, inserted, ElementsChange.stripIrrelevantProps)`
-    // in `packages/excalidraw/change.ts`, a hard gate at ceiling 0) plus one
-    // on outline. All four are the SAME pre-existing gap one level down: with
-    // the parameters related contravariantly for real, ztsc has to answer
-    // `Partial<ElementPartial>` → `Partial<Ordered<ExcalidrawElement>>`,
-    // where the target distributes over a discriminated union of element
-    // types and the source is the single `Omit`-of-the-union object. tsc
-    // relates that pair; ztsc's union-target walk does not. Close that first.
+    // Dropping the source disjunct is still held, and the DEFERRED block
+    // carries the measurement. The excalidraw blocker it used to name is
+    // CLOSED (`discriminatedUnionAssignable` now adds the optionality tsc's
+    // `propertyRelatedTo` adds to a member's discriminant); what remains is
+    // the rest-parameter packing gap below, which the strict rule exposes on
+    // immich: `(event: string, ...args: [number] | [string]) => void` →
+    // `(...args: any[]) => any`, where tsc accepts and ztsc's packed-rest
+    // comparison (`restTupleAtPosition`) rejects. See DEFERRED.
     const bivariant = (c.ts.fnFlags(s) & types.fn_flag_method != 0) or
         (c.ts.fnFlags(t) & types.fn_flag_method != 0);
     // Erase generics: to `any` in tsc's `erase = true` positions, to their
