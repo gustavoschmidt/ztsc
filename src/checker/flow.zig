@@ -362,11 +362,26 @@ pub fn stableIndexSymbol(c: *Checker, rhs: Node) Error!?SymbolId {
     while (c.nodeTag(n) == .paren_expr) n = c.tree.nodeData(n).lhs;
     if (c.nodeTag(n) != .identifier) return null;
     const a = try c.atomOfToken(c.tree.nodeMainToken(n));
-    const sym = switch (c.resolveSpace(a, c.cur_scope, true)) {
+    var sym = switch (c.resolveSpace(a, c.cur_scope, true)) {
         .sym => |s| s,
         else => return null,
     };
     if (sym == binder.no_symbol) return null;
+    // An IMPORTED key is the normal spelling of this idiom — outline declares
+    // `export const PAGINATION_SYMBOL = Symbol.for("pagination")` in one file
+    // and guards `users[PAGINATION_SYMBOL]` in another. tsc resolves the index
+    // through aliases before its `isConstVariable` test
+    // (`tryGetNameFromEntityNameExpression` → `resolveEntityName`), so an
+    // import binding must land on the declaration it names — both because the
+    // local alias carries none of the flags below, and because keying the path
+    // on the TARGET makes the two spellings name one reference.
+    var hops: u8 = 0;
+    while (c.symFlags(sym).import_binding) : (hops += 1) {
+        if (hops >= 8) return null; // re-export cycle: untracked
+        const tgt = c.importTarget(sym) orelse return null;
+        if (tgt.kind != .binding) return null; // a namespace object, not a value
+        sym = c.toGlobalIn(tgt.file, tgt.payload);
+    }
     if (!PathElem.symFits(sym)) return null;
     const sf = c.symFlags(sym);
     if (sf.const_decl) return sym;
