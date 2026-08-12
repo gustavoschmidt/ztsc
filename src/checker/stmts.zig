@@ -43,6 +43,7 @@ const guardCallOf = @import("flow.zig").guardCallOf;
 const inferReturnType = @import("signatures.zig").inferReturnType;
 const isComparable = @import("assign.zig").isComparable;
 const isNonPrimitiveKind = @import("assign.zig").isNonPrimitiveKind;
+const isNullishUnion = @import("flow.zig").isNullishUnion;
 const run = Checker.run;
 const seal = Checker.seal;
 const typeFromQualifiedName = @import("typenode.zig").typeFromQualifiedName;
@@ -352,9 +353,16 @@ pub fn checkForInOf(c: *Checker, node: Node) Error!void {
         elem_t = try c.forOfElementType(rt, e.right, e.is_await != 0);
     } else {
         elem_t = types.string_type; // for..in keys
-        const rk = c.ts.kind(try c.resolveStructural(rt));
+        // `for (const k in maybeUndefined)` is legal JS — enumerating
+        // `null`/`undefined` produces no keys — so tsc's
+        // `checkForInStatement` runs the right-hand side through
+        // `getNonNullableTypeIfNeeded` before testing its kind, and prints
+        // the STRIPPED type in the diagnostic. (The body's own view of the
+        // subject is `forInSubjectNarrows`, the flow half of the same rule.)
+        const rt_nn = if (isNullishUnion(c, rt)) try c.nonNullable(rt) else rt;
+        const rk = c.ts.kind(try c.resolveStructural(rt_nn));
         if (!isNonPrimitiveKind(rk) and rk != .any and rk != .err and rk != .unknown and rk != .type_param) {
-            try c.diagFmt(2407, c.nodeSpan(e.right), "The right-hand side of a 'for...in' statement must be of type 'any', an object type or a type parameter, but here has type '{s}'.", .{try c.typeToString(rt)});
+            try c.diagFmt(2407, c.nodeSpan(e.right), "The right-hand side of a 'for...in' statement must be of type 'any', an object type or a type parameter, but here has type '{s}'.", .{try c.typeToString(rt_nn)});
         }
     }
     // Bind the left side.
