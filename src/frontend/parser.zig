@@ -358,7 +358,7 @@ const Parser = struct {
         if (!isNameLike(t.tag)) return;
         const norm_end = scanner.tokenEnd(p.src, t.tag, t.start);
         if (norm_end >= p.src.len or p.src[norm_end] != '-') return;
-        const end = p.scn.scanJsxName(t.start);
+        const end = scanner.scanJsxName(p.src, t.start);
         p.la[0] = .{ .tag = .jsx_name, .start = t.start, .end = end, .newline_before = t.newline_before };
         p.scn.index = end;
         p.la_len = 1;
@@ -377,7 +377,7 @@ const Parser = struct {
             .string_literal, .unterminated_string_literal => {},
             else => return,
         }
-        const end = p.scn.scanJsxString(t.start) orelse return;
+        const end = scanner.scanJsxString(p.src, t.start) orelse return;
         p.la[0] = .{ .tag = .jsx_string, .start = t.start, .end = end, .newline_before = t.newline_before };
         p.scn.index = end;
         p.la_len = 1;
