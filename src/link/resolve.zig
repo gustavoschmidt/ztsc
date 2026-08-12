@@ -49,6 +49,7 @@ const Io = std.Io;
 const tsconfig = @import("../tsconfig.zig");
 const paths = @import("paths.zig");
 const pkgjson = @import("package_json.zig");
+const references = @import("references.zig");
 
 /// Resolution's only failure mode is allocation. Spelled with the standard
 /// error set rather than the link layer's alias so this file has no back-edge
@@ -71,6 +72,13 @@ const exportsConditionActive = pkgjson.exportsConditionActive;
 const typesVersionsPaths = pkgjson.typesVersionsPaths;
 const mapTypesVersions = pkgjson.mapTypesVersions;
 
+/// Triple-slash reference directives (references.zig), re-exported: a
+/// specifier and a directive are two spellings of the same question, and every
+/// caller already holds the resolver.
+pub const RefDirective = references.RefDirective;
+pub const scanReferences = references.scanReferences;
+const resolveReference = references.resolveReference;
+
 /// Resolve a relative-or-package file stem with the documented extension
 /// order. `stem` is a normalized path relative to `dir`. Public because
 /// tsconfig `paths` mapping feeds mapped candidates through it.
@@ -80,7 +88,7 @@ pub fn resolveStem(io: Io, alloc: Allocator, dir: Io.Dir, stem: []const u8) Erro
 
 /// `resolveStem` with the resolution context (`Fs`) threaded in — the same
 /// probes under `f.cache`'s memo, or every stat re-issued without it.
-fn resolveStemFs(f: Fs, alloc: Allocator, stem: []const u8) Error!?[]u8 {
+pub fn resolveStemFs(f: Fs, alloc: Allocator, stem: []const u8) Error!?[]u8 {
     var buf: [6][]const u8 = undefined;
     var n: usize = 0;
     // Candidate paths are built with `alloc` (a scratch arena, freed after
@@ -208,42 +216,6 @@ pub fn resolveJsonFile(io: Io, alloc: Allocator, dir: Io.Dir, stem: []const u8) 
 fn resolveJsonFileFs(f: Fs, alloc: Allocator, stem: []const u8) Error!?[]u8 {
     if (try f.exists(stem)) return try alloc.dupe(u8, stem);
     return null;
-}
-
-/// Scan the leading `///`-comment block of `src` for reference directives.
-/// tsc only honors them before the first token, so scanning stops at the
-/// first non-trivia character. Slices into `src` (no allocation of text).
-pub fn scanReferences(alloc: Allocator, src: []const u8) Error![]RefDirective {
-    var out: std.ArrayList(RefDirective) = .empty;
-    var i: usize = 0;
-    while (i < src.len) {
-        while (i < src.len and (src[i] == ' ' or src[i] == '\t' or src[i] == '\r' or src[i] == '\n')) i += 1;
-        if (i + 1 < src.len and src[i] == '/' and src[i + 1] == '/') {
-            const start = i;
-            while (i < src.len and src[i] != '\n') i += 1;
-            const line = src[start..i];
-            // Triple-slash only.
-            if (line.len >= 3 and line[2] == '/') {
-                if (parseReference(line[3..])) |d| {
-                    // `spec` is always a subslice of `src` (the scanner never
-                    // copies), so its byte offset is a pointer difference —
-                    // the anchor a directive diagnostic (TS2688) reports at.
-                    var with_pos = d;
-                    with_pos.pos = @intCast(@intFromPtr(d.spec.ptr) - @intFromPtr(src.ptr));
-                    try out.append(alloc, with_pos);
-                }
-            }
-            continue;
-        }
-        if (i + 1 < src.len and src[i] == '/' and src[i + 1] == '*') {
-            i += 2;
-            while (i + 1 < src.len and !(src[i] == '*' and src[i + 1] == '/')) i += 1;
-            i = if (i + 1 < src.len) i + 2 else src.len;
-            continue;
-        }
-        break; // first real token — directives must precede it
-    }
-    return out.toOwnedSlice(alloc);
 }
 
 pub fn fsProbeCount() u64 {
@@ -655,7 +627,7 @@ pub const FsCache = struct {
 /// lives in the methods below and nowhere else — callers never see which leg
 /// they are on, which is what makes the uncached leg a usable oracle for the
 /// cached one.
-const Fs = struct {
+pub const Fs = struct {
     io: Io,
     dir: Io.Dir,
     /// Filesystem-fact memos, or null for the uncached leg.
@@ -800,20 +772,6 @@ pub const ResolveOpts = struct {
     /// installs it (config-time type-directive resolution), which quietly gave
     /// those a different answer than the same probe during discovery.
     module_suffixes: []const []const u8 = &.{},
-};
-
-pub const RefKind = enum { path, types };
-
-/// A `/// <reference path=… />` / `<reference types=… />` directive; `spec`
-/// slices into the source. `lib=` references are ignored (built-in libs).
-pub const RefDirective = struct {
-    kind: RefKind,
-    spec: []const u8,
-    /// Byte offset of `spec[0]` in the scanned source — the first character
-    /// *inside* the opening quote, which is where tsc anchors the directive's
-    /// own diagnostic (TS2688). Filled by `scanReferences`; 0 when a caller
-    /// builds a directive by hand (resolution never reads it).
-    pos: u32 = 0,
 };
 
 // =========================================================================
@@ -1186,7 +1144,7 @@ fn packageHasExports(f: Fs, alloc: Allocator, nm: []const u8) Error!bool {
 
 /// Resolve a bare (package) specifier by walking `node_modules` up from
 /// the importer's directory.
-fn resolvePackage(f: Fs, alloc: Allocator, importer_dir: []const u8, spec: []const u8, allow_js: bool, use_exports: bool) Error!?[]u8 {
+pub fn resolvePackage(f: Fs, alloc: Allocator, importer_dir: []const u8, spec: []const u8, allow_js: bool, use_exports: bool) Error!?[]u8 {
     const pkg_len = packageNameLen(spec);
     const pkg = spec[0..pkg_len];
     const sub = if (pkg_len < spec.len) spec[pkg_len + 1 ..] else "";
@@ -1688,77 +1646,6 @@ fn resolveSpecifierFs(
     return resolvePackage(f, alloc, importer_dir, spec, f.opts.allow_js, f.opts.resolve_pkg_json_exports);
 }
 
-// ===========================================================================
-// triple-slash reference directives
-// ===========================================================================
-
-/// Parse the body of a `///` comment (text after the three slashes) into a
-/// reference directive, or null if it is not `<reference path|types=…/>`.
-fn parseReference(body: []const u8) ?RefDirective {
-    var s = body;
-    while (s.len > 0 and (s[0] == ' ' or s[0] == '\t')) s = s[1..];
-    if (!std.mem.startsWith(u8, s, "<reference")) return null;
-    if (attrValue(s, "path")) |v| return .{ .kind = .path, .spec = v };
-    if (attrValue(s, "types")) |v| return .{ .kind = .types, .spec = v };
-    return null;
-}
-
-/// Value of a `key="…"` / `key='…'` attribute in `s`, or null.
-fn attrValue(s: []const u8, key: []const u8) ?[]const u8 {
-    var from: usize = 0;
-    while (std.mem.indexOfPos(u8, s, from, key)) |at| {
-        var k = at + key.len;
-        while (k < s.len and (s[k] == ' ' or s[k] == '\t')) k += 1;
-        if (k < s.len and s[k] == '=') {
-            k += 1;
-            while (k < s.len and (s[k] == ' ' or s[k] == '\t')) k += 1;
-            if (k < s.len and (s[k] == '"' or s[k] == '\'')) {
-                const q = s[k];
-                k += 1;
-                const vstart = k;
-                while (k < s.len and s[k] != q) k += 1;
-                if (k < s.len) return s[vstart..k];
-            }
-        }
-        from = at + key.len;
-    }
-    return null;
-}
-
-/// Resolve a reference directive to a file path (owned by `alloc`), or null.
-/// `path` references resolve relative to the referencing file's directory;
-/// `types` references resolve like a bare package, preferring `@types/<name>`.
-/// `f` carries the same filesystem context (and memos) the module resolver
-/// uses.
-///
-/// The result is *not* canonicalized — callers that key the module graph by path
-/// must run it through `ResolveCache.canonicalPath` (or call
-/// `ResolveCache.resolveRef`, which does both), or a symlinked package
-/// directory becomes a second copy of a file already in the graph.
-fn resolveReference(
-    f: Fs,
-    alloc: Allocator,
-    importer: []const u8,
-    ref: RefDirective,
-) Error!?[]u8 {
-    switch (ref.kind) {
-        .path => {
-            const stem = try joinNormalize(alloc, dirnamePart(importer), ref.spec);
-            defer alloc.free(stem);
-            return resolveStemFs(f, alloc, stem);
-        },
-        .types => {
-            // A `types=` directive is a package resolution, so it honors
-            // `resolvePackageJsonExports` exactly like an import does.
-            const use_exports = f.opts.resolve_pkg_json_exports;
-            const scoped = try std.fmt.allocPrint(alloc, "@types/{s}", .{ref.spec});
-            defer alloc.free(scoped);
-            if (try resolvePackage(f, alloc, dirnamePart(importer), scoped, false, use_exports)) |p| return p;
-            return resolvePackage(f, alloc, dirnamePart(importer), ref.spec, false, use_exports);
-        },
-    }
-}
-
 // -------------------------------------------------------------------------
 // tests
 // -------------------------------------------------------------------------
@@ -2253,38 +2140,6 @@ test "ResolveCache: reference directives and roots canonicalize to one path" {
     try testing.expectEqualStrings(canonical, try off.canonicalPath(io, alloc, d, "node_modules/@types/pkg/index.d.ts"));
     const off_ref = try off.resolveRef(io, alloc, d, "node_modules/.pnpm/other@1/node_modules/other/index.d.ts", .{ .kind = .types, .spec = "pkg" });
     try testing.expectEqualStrings(canonical, off_ref.?);
-}
-
-// (b2) `scanReferences` reports each directive's name span, which is where the
-// unresolved-directive diagnostic (TS2688) lands — one character past the
-// opening quote, name length wide, whatever precedes it on the line.
-test "scanReferences: kind, spec and name offset" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const src =
-        \\/// <reference types="nope" />
-        \\/// <reference types='@scope/nope' />
-        \\   /// <reference path="./other.d.ts" />
-        \\/// <reference lib="es2015" />
-        \\export const x = 1;
-        \\/// <reference types="after-first-token" />
-        \\
-    ;
-    const refs = try scanReferences(arena.allocator(), src);
-    try testing.expectEqual(@as(usize, 3), refs.len);
-    try testing.expectEqual(RefKind.types, refs[0].kind);
-    try testing.expectEqualStrings("nope", refs[0].spec);
-    // `/// <reference types="` is 22 characters, so the name starts at byte 22
-    // (column 23, the oracle's anchor).
-    try testing.expectEqual(@as(u32, 22), refs[0].pos);
-    try testing.expectEqualStrings("nope", src[refs[0].pos..][0..refs[0].spec.len]);
-    try testing.expectEqualStrings("@scope/nope", refs[1].spec);
-    try testing.expectEqualStrings("@scope/nope", src[refs[1].pos..][0..refs[1].spec.len]);
-    // Indentation shifts the offset; a `path=` directive keeps its own kind.
-    try testing.expectEqual(RefKind.path, refs[2].kind);
-    try testing.expectEqualStrings("./other.d.ts", src[refs[2].pos..][0..refs[2].spec.len]);
-    // `lib=` is not a program input here, and nothing past the first real token
-    // is a directive at all.
 }
 
 // (c) resolveJsonModule: a `*.json` specifier resolves to the JSON file only
