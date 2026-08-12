@@ -1451,22 +1451,33 @@ fn inferFromExtendsInner(c: *Checker, source0: TypeId, pattern: TypeId, ids: []c
             //     `ForwardRefExoticComponent<P> & {…}`, whose call sig lives
             //     INSIDE an object member rather than as a bare `.function` —
             //     is still left to the object/construct-signature path below.)
+            //
+            // WHICH constituent, when more than one is callable, is the same
+            // end-aligned rule: tsc's `getSignaturesOfType` on an intersection
+            // concatenates its constituents' signatures in declaration order,
+            // and `inferFromSignatures` pairs the two lists from the END, so a
+            // single-signature pattern reads the LAST callable constituent —
+            // and, within it, its last signature. Oracle-verified against
+            // tsgo 7.0.2 in
+            // `test/conformance/inference/intersection_infers_last_call_
+            // signature.ts`: `(() => "x") & (() => "y")` infers `"y"`, a third
+            // constituent wins over both, an object member in between changes
+            // nothing, and `((...) => "plain") & typeof overloaded` infers the
+            // OVERLOAD SET's last return while the reverse order infers
+            // `"plain"`.
             if (s.kind(src) == .intersection) {
-                var callable: TypeId = types.no_type; // overload set
-                var fn_member: TypeId = types.no_type; // bare call signature
+                var callable: TypeId = types.no_type;
                 for (try c.memberList(src)) |m| {
                     const rm = try c.resolveStructural(m);
-                    if (s.kind(rm) == .overloads) {
-                        callable = rm;
-                    } else if (s.kind(rm) == .function and fn_member == types.no_type) {
-                        fn_member = rm;
+                    switch (s.kind(rm)) {
+                        .overloads, .function => callable = rm,
+                        else => {},
                     }
                 }
-                if (callable != types.no_type) {
-                    if (try c.lastCallSig(callable)) |sig| src = sig else return;
-                } else if (fn_member != types.no_type) {
-                    src = fn_member;
-                } else return;
+                if (callable == types.no_type) return;
+                // An overload set reduces to its last call signature just
+                // below, by the same rule.
+                src = callable;
             }
             // A plain overload set — the type of a multiply-declared method
             // reached through property/indexed access (`S['m']`, e.g. jest's
