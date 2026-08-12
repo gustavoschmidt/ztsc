@@ -2062,8 +2062,8 @@ pub const Checker = struct {
     /// (`contraSlot`, `topSlot`, `revSlot`) match it against the `candidates`
     /// array they are handed, so the many other arrays `unify` is asked to fill
     /// (a reverse-mapped element, a speculative copy, a generic argument's own
-    /// type params) simply do not participate. See `calls.InferCtx`.
-    infer_ctx: @import("checker/calls.zig").InferCtx = .{},
+    /// type params) simply do not participate. See `infer.InferCtx`.
+    infer_ctx: @import("checker/infer.zig").InferCtx = .{},
     /// Monotone count of candidate WRITES performed by `unify`. tsc's
     /// `inferToMultipleTypes` decides whether a source constituent was
     /// "matched" by watching `inferencePriority` — i.e. whether an inference
