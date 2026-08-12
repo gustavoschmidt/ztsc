@@ -89,7 +89,30 @@ const resolve = @import("link/resolve.zig");
 const jsonc = @import("jsonc.zig");
 const glob = @import("glob.zig");
 
-pub const Error = error{OutOfMemory};
+const Error = error{OutOfMemory};
+
+/// The state every leg of a config load carries but none of it owns: the
+/// config arena and the two diagnostic sinks that end up on `Config`. Passed by
+/// value — it is three words, and the lists behind the pointers are what the
+/// callees actually append to.
+///
+/// A `warn` is a problem with the config the user should fix; a `note` is an
+/// "accepted and ignored" remark, printed only under `--verbose`. Both are
+/// plain strings allocated out of `arena`, so they live exactly as long as the
+/// `Config` that carries them.
+const Ctx = struct {
+    arena: Allocator,
+    warnings: *std.ArrayList([]const u8),
+    notes: *std.ArrayList([]const u8),
+
+    fn warn(cx: Ctx, comptime fmt: []const u8, args: anytype) Error!void {
+        try cx.warnings.append(cx.arena, try std.fmt.allocPrint(cx.arena, fmt, args));
+    }
+
+    fn note(cx: Ctx, comptime fmt: []const u8, args: anytype) Error!void {
+        try cx.notes.append(cx.arena, try std.fmt.allocPrint(cx.arena, fmt, args));
+    }
+};
 
 // ===========================================================================
 // config
@@ -102,18 +125,19 @@ pub fn load(io: Io, arena: Allocator, config_path: []const u8) LoadError!Config 
 
 /// Load `config_path` (relative to `base`), resolve its `extends` chain,
 /// merge, and expand its file list. All returned paths are relative to `base`.
-pub fn loadInDir(io: Io, arena: Allocator, base: Io.Dir, config_path: []const u8) LoadError!Config {
+fn loadInDir(io: Io, arena: Allocator, base: Io.Dir, config_path: []const u8) LoadError!Config {
     var cfg: Config = .{
         .path = config_path,
         .dir = paths.dirnamePart(config_path),
     };
     var warnings: std.ArrayList([]const u8) = .empty;
     var notes: std.ArrayList([]const u8) = .empty;
+    const cx: Ctx = .{ .arena = arena, .warnings = &warnings, .notes = &notes };
 
     // Merge the `extends` chain (base configs applied first, this config last).
     var acc: Merged = .{};
     var chain: std.ArrayList([]const u8) = .empty;
-    try mergeConfig(io, arena, base, config_path, cfg.dir, &acc, &warnings, &notes, &chain, true);
+    try mergeConfig(io, cx, base, config_path, cfg.dir, &acc, &chain, true);
 
     // `strict` is evaluated on the merged value (child overrides base per-key):
     // only an explicit final `false` is the unsupported case.
@@ -128,15 +152,15 @@ pub fn loadInDir(io: Io, arena: Allocator, base: Io.Dir, config_path: []const u8
     // so the fallback is `true`; an explicit `noImplicitAny: false` still wins.
     cfg.no_implicit_any = acc.no_implicit_any orelse (acc.strict orelse true);
     if (!cfg.no_implicit_any) {
-        try note(arena, &notes, "'noImplicitAny' is off: implicit-'any' diagnostics (TS7006/TS7053) are suppressed; unannotated values still type as 'any'", .{});
+        try cx.note("'noImplicitAny' is off: implicit-'any' diagnostics (TS7006/TS7053) are suppressed; unannotated values still type as 'any'", .{});
     }
     cfg.experimental_decorators = acc.experimental_decorators orelse false;
     if (cfg.experimental_decorators) {
-        try note(arena, &notes, "'experimentalDecorators' honored: parameter decorators are accepted and decorator signatures are not checked against the standard 'Class*DecoratorContext' shapes (the legacy dialect calls them differently)", .{});
+        try cx.note("'experimentalDecorators' honored: parameter decorators are accepted and decorator signatures are not checked against the standard 'Class*DecoratorContext' shapes (the legacy dialect calls them differently)", .{});
     }
     cfg.allow_js = acc.allow_js orelse false;
     if (cfg.allow_js) {
-        try note(arena, &notes, "'allowJs' honored: a specifier resolving only to a .js file is typed opaquely as 'any' (ztsc never parses JS; 'checkJs' is unsupported)", .{});
+        try cx.note("'allowJs' honored: a specifier resolving only to a .js file is typed opaquely as 'any' (ztsc never parses JS; 'checkJs' is unsupported)", .{});
     }
     cfg.skip_lib_check = acc.skip_lib_check orelse false;
     cfg.skip_all_lib_check = acc.skip_all_lib_check orelse false;
@@ -152,10 +176,10 @@ pub fn loadInDir(io: Io, arena: Allocator, base: Io.Dir, config_path: []const u8
     cfg.resolve_pkg_json_exports = acc.resolve_pkg_json_exports orelse true;
     cfg.resolve_pkg_json_imports = acc.resolve_pkg_json_imports orelse true;
     if (!cfg.resolve_pkg_json_exports) {
-        try note(arena, &notes, "'resolvePackageJsonExports' is off: 'package.json' \"exports\" maps are ignored entirely — every specifier resolves through the legacy \"types\"/\"typings\"/\"main\"/index path, and a subpath a map does not name is no longer blocked", .{});
+        try cx.note("'resolvePackageJsonExports' is off: 'package.json' \"exports\" maps are ignored entirely — every specifier resolves through the legacy \"types\"/\"typings\"/\"main\"/index path, and a subpath a map does not name is no longer blocked", .{});
     }
     if (!cfg.resolve_pkg_json_imports) {
-        try note(arena, &notes, "'resolvePackageJsonImports' is off: 'package.json' \"imports\" maps are ignored (ztsc never reads them, so this is already its behavior)", .{});
+        try cx.note("'resolvePackageJsonImports' is off: 'package.json' \"imports\" maps are ignored (ztsc never reads them, so this is already its behavior)", .{});
     }
     // Effective allowSyntheticDefaultImports = explicit value ?? esModuleInterop
     // ?? (module is system || moduleResolution is bundler). ztsc always resolves
@@ -166,9 +190,9 @@ pub fn loadInDir(io: Io, arena: Allocator, base: Io.Dir, config_path: []const u8
     // `esModuleInterop`.
     cfg.allow_synthetic_default_imports = acc.allow_synthetic_default_imports orelse acc.es_module_interop orelse true;
     if (cfg.allow_synthetic_default_imports) {
-        try note(arena, &notes, "'allowSyntheticDefaultImports' is on (explicit, via 'esModuleInterop', or by default under bundler resolution): a default import of a module with no default export binds to the module namespace object (the synthesized default)", .{});
+        try cx.note("'allowSyntheticDefaultImports' is on (explicit, via 'esModuleInterop', or by default under bundler resolution): a default import of a module with no default export binds to the module namespace object (the synthesized default)", .{});
     } else {
-        try note(arena, &notes, "'allowSyntheticDefaultImports'/'esModuleInterop' explicitly off: a default import of a module with no default export raises TS1192", .{});
+        try cx.note("'allowSyntheticDefaultImports'/'esModuleInterop' explicitly off: a default import of a module with no default export raises TS1192", .{});
     }
     if (acc.base_url) |bu| {
         cfg.base_url = try joinNormalize(arena, acc.base_url_dir, bu);
@@ -178,16 +202,16 @@ pub fn loadInDir(io: Io, arena: Allocator, base: Io.Dir, config_path: []const u8
     if (acc.jsx) |j| {
         if (std.mem.eql(u8, j, "react-jsx") or std.mem.eql(u8, j, "react-jsxdev")) {
             cfg.jsx_runtime_module = try std.fmt.allocPrint(arena, "{s}/jsx-runtime", .{acc.jsx_import_source orelse "react"});
-            try note(arena, &notes, "'jsx: {s}': the `JSX` namespace is read from '{s}' (automatic runtime), falling back to a global `JSX` namespace", .{ j, cfg.jsx_runtime_module.? });
+            try cx.note("'jsx: {s}': the `JSX` namespace is read from '{s}' (automatic runtime), falling back to a global `JSX` namespace", .{ j, cfg.jsx_runtime_module.? });
         }
     }
     if (cfg.skip_all_lib_check) {
-        try note(arena, &notes, "'skipLibCheck' honored: no diagnostics are surfaced from any .d.ts file (default lib and dependency/project .d.ts alike); their types still flow into .ts checking", .{});
+        try cx.note("'skipLibCheck' honored: no diagnostics are surfaced from any .d.ts file (default lib and dependency/project .d.ts alike); their types still flow into .ts checking", .{});
     } else if (acc.skip_lib_check) |sv| {
         if (sv) {
-            try note(arena, &notes, "'skipDefaultLibCheck' honored: the embedded default lib is not type-checked (other .d.ts files are still checked; use 'skipLibCheck' to skip those too)", .{});
+            try cx.note("'skipDefaultLibCheck' honored: the embedded default lib is not type-checked (other .d.ts files are still checked; use 'skipLibCheck' to skip those too)", .{});
         } else {
-            try note(arena, &notes, "'skipLibCheck'/'skipDefaultLibCheck' is not enabled; the embedded default lib is type-checked (matching tsc/tsgo)", .{});
+            try cx.note("'skipLibCheck'/'skipDefaultLibCheck' is not enabled; the embedded default lib is type-checked (matching tsc/tsgo)", .{});
         }
     }
 
@@ -204,17 +228,17 @@ pub fn loadInDir(io: Io, arena: Allocator, base: Io.Dir, config_path: []const u8
         var vals: std.ArrayList([]const []const u8) = .empty;
         for (po.keys, po.vals) |pkey, pval| {
             if (std.mem.count(u8, pkey, "*") > 1) {
-                try warn(arena, &warnings, "{s}: paths pattern '{s}' has more than one '*' (ignored)", .{ acc.paths_path, pkey });
+                try cx.warn("{s}: paths pattern '{s}' has more than one '*' (ignored)", .{ acc.paths_path, pkey });
                 continue;
             }
             if (pval != .array) {
-                try warn(arena, &warnings, "{s}: paths entry '{s}' must be an array (ignored)", .{ acc.paths_path, pkey });
+                try cx.warn("{s}: paths entry '{s}' must be an array (ignored)", .{ acc.paths_path, pkey });
                 continue;
             }
             var targets: std.ArrayList([]const u8) = .empty;
             for (pval.array) |t| {
                 if (t != .string or std.mem.count(u8, t.string, "*") > 1) {
-                    try warn(arena, &warnings, "{s}: bad substitution in paths entry '{s}' (skipped)", .{ acc.paths_path, pkey });
+                    try cx.warn("{s}: bad substitution in paths entry '{s}' (skipped)", .{ acc.paths_path, pkey });
                     continue;
                 }
                 try targets.append(arena, t.string);
@@ -274,7 +298,7 @@ pub fn loadInDir(io: Io, arena: Allocator, base: Io.Dir, config_path: []const u8
             .case_sensitive = caseSensitiveFs(io, arena, base, config_path),
             .base_abs = baseAbsPath(io, arena, base),
         };
-        const matched = try expandInclude(io, arena, base, &matcher, include_dir, inc_abs.items, exc_abs.items, &warnings, cfg.path);
+        const matched = try expandInclude(io, cx, base, &matcher, include_dir, inc_abs.items, exc_abs.items, cfg.path);
         for (matched) |m| {
             const gop = try seen.getOrPut(arena, m);
             if (!gop.found_existing) try root_files.append(arena, m);
@@ -297,7 +321,7 @@ pub fn loadInDir(io: Io, arena: Allocator, base: Io.Dir, config_path: []const u8
     }
     cfg.auto_type_files = try collectAutoTypes(io, arena, base, cfg.dir, type_roots_abs, acc.types, cfg.resolve_pkg_json_exports);
     if (cfg.auto_type_files.len > 0) {
-        try note(arena, &notes, "auto-included {d} '@types' package(s) as ambient roots (tsc's default typeRoots); override with 'typeRoots'/'types'", .{cfg.auto_type_files.len});
+        try cx.note("auto-included {d} '@types' package(s) as ambient roots (tsc's default typeRoots); override with 'typeRoots'/'types'", .{cfg.auto_type_files.len});
     }
 
     cfg.warnings = try warnings.toOwnedSlice(arena);
@@ -520,7 +544,7 @@ pub fn findUpward(io: Io, arena: Allocator) Error!?[]u8 {
 /// Look for `tsconfig.json` in `base`, then each parent, up to `max_levels`
 /// parents. Returns the base-relative path ("tsconfig.json",
 /// "../tsconfig.json", ...) or null.
-pub fn findUpwardInDir(io: Io, arena: Allocator, base: Io.Dir, max_levels: usize) Error!?[]u8 {
+fn findUpwardInDir(io: Io, arena: Allocator, base: Io.Dir, max_levels: usize) Error!?[]u8 {
     var prefix: std.ArrayList(u8) = .empty;
     var level: usize = 0;
     while (level <= max_levels) : (level += 1) {
@@ -765,38 +789,36 @@ const Merged = struct {
 /// (whose failures warn and degrade to no-extends).
 fn mergeConfig(
     io: Io,
-    arena: Allocator,
+    cx: Ctx,
     base: Io.Dir,
     config_path: []const u8,
     dir: []const u8,
     acc: *Merged,
-    warnings: *std.ArrayList([]const u8),
-    notes: *std.ArrayList([]const u8),
     chain: *std.ArrayList([]const u8),
     is_root: bool,
 ) LoadError!void {
-    try chain.append(arena, config_path);
+    try chain.append(cx.arena, config_path);
     defer _ = chain.pop();
 
-    const text = base.readFileAlloc(io, config_path, arena, .limited(16 << 20)) catch |err| switch (err) {
+    const text = base.readFileAlloc(io, config_path, cx.arena, .limited(16 << 20)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             if (is_root) return error.NotFound;
-            try warn(arena, warnings, "{s}: cannot read config referenced by 'extends' (ignored)", .{config_path});
+            try cx.warn("{s}: cannot read config referenced by 'extends' (ignored)", .{config_path});
             return;
         },
     };
-    const root = parseJsonc(arena, text) catch |err| switch (err) {
+    const root = parseJsonc(cx.arena, text) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.SyntaxError => {
             if (is_root) return error.SyntaxError;
-            try warn(arena, warnings, "{s}: config referenced by 'extends' is not valid JSON (ignored)", .{config_path});
+            try cx.warn("{s}: config referenced by 'extends' is not valid JSON (ignored)", .{config_path});
             return;
         },
     };
     if (root != .object) {
         if (is_root) return error.SyntaxError;
-        try warn(arena, warnings, "{s}: config referenced by 'extends' is not an object (ignored)", .{config_path});
+        try cx.warn("{s}: config referenced by 'extends' is not an object (ignored)", .{config_path});
         return;
     }
 
@@ -806,46 +828,44 @@ fn mergeConfig(
             .string => &.{ev},
             .array => ev.array,
             else => blk: {
-                try warn(arena, warnings, "{s}: 'extends' must be a string or an array of strings (ignored)", .{config_path});
+                try cx.warn("{s}: 'extends' must be a string or an array of strings (ignored)", .{config_path});
                 break :blk &.{};
             },
         };
         for (specs) |sv| {
             if (sv != .string) {
-                try warn(arena, warnings, "{s}: non-string entry in 'extends' (skipped)", .{config_path});
+                try cx.warn("{s}: non-string entry in 'extends' (skipped)", .{config_path});
                 continue;
             }
             const spec = sv.string;
-            const resolved = try resolveExtends(io, arena, base, dir, spec);
+            const resolved = try resolveExtends(io, cx.arena, base, dir, spec);
             if (resolved) |rp| {
                 var cyclic = false;
                 for (chain.items) |c| {
                     if (std.mem.eql(u8, c, rp)) cyclic = true;
                 }
                 if (cyclic) {
-                    try warn(arena, warnings, "{s}: TS18000: circularity detected resolving 'extends' to '{s}' (ignored)", .{ config_path, rp });
+                    try cx.warn("{s}: TS18000: circularity detected resolving 'extends' to '{s}' (ignored)", .{ config_path, rp });
                     continue;
                 }
-                try mergeConfig(io, arena, base, rp, paths.dirnamePart(rp), acc, warnings, notes, chain, false);
+                try mergeConfig(io, cx, base, rp, paths.dirnamePart(rp), acc, chain, false);
             } else {
-                try warn(arena, warnings, "{s}: cannot find config '{s}' referenced by 'extends' (ignored)", .{ config_path, spec });
+                try cx.warn("{s}: cannot find config '{s}' referenced by 'extends' (ignored)", .{ config_path, spec });
             }
         }
     }
 
-    try applyOwn(arena, root.object, dir, config_path, acc, warnings, notes);
+    try applyOwn(cx, root.object, dir, config_path, acc);
 }
 
 /// Apply one config object's own keys into `acc` (its `extends` already
 /// handled). Later calls (the extending config) overwrite per-key.
 fn applyOwn(
-    arena: Allocator,
+    cx: Ctx,
     obj: Value.Object,
     dir: []const u8,
     config_path: []const u8,
     acc: *Merged,
-    warnings: *std.ArrayList([]const u8),
-    notes: *std.ArrayList([]const u8),
 ) Error!void {
     for (obj.keys, obj.vals) |key, val| {
         if (std.mem.eql(u8, key, "extends")) {
@@ -854,23 +874,23 @@ fn applyOwn(
             // Editor/schema hints (common in shared base configs); tsc ignores
             // these silently, so we do too — no warning.
         } else if (std.mem.eql(u8, key, "files")) {
-            if (try stringArray(arena, warnings, config_path, key, val)) |list| {
+            if (try stringArray(cx, config_path, key, val)) |list| {
                 acc.files = list;
                 acc.files_dir = dir;
             }
         } else if (std.mem.eql(u8, key, "include")) {
-            if (try stringArray(arena, warnings, config_path, key, val)) |list| {
+            if (try stringArray(cx, config_path, key, val)) |list| {
                 acc.include = list;
                 acc.include_dir = dir;
             }
         } else if (std.mem.eql(u8, key, "exclude")) {
-            if (try stringArray(arena, warnings, config_path, key, val)) |list| {
+            if (try stringArray(cx, config_path, key, val)) |list| {
                 acc.exclude = list;
                 acc.exclude_dir = dir;
             }
         } else if (std.mem.eql(u8, key, "compilerOptions")) {
             if (val != .object) {
-                try warn(arena, warnings, "{s}: 'compilerOptions' must be an object (ignored)", .{config_path});
+                try cx.warn("{s}: 'compilerOptions' must be an object (ignored)", .{config_path});
                 continue;
             }
             for (val.object.keys, val.object.vals) |okey, oval| {
@@ -878,15 +898,15 @@ fn applyOwn(
                     if (oval == .boolean) {
                         acc.strict = oval.boolean;
                     } else {
-                        try warn(arena, warnings, "{s}: 'strict' must be a boolean (ignored)", .{config_path});
+                        try cx.warn("{s}: 'strict' must be a boolean (ignored)", .{config_path});
                     }
                 } else if (std.mem.eql(u8, okey, "noEmit")) {
-                    try note(arena, notes, "{s}: 'noEmit' ignored (ztsc never emits)", .{config_path});
+                    try cx.note("{s}: 'noEmit' ignored (ztsc never emits)", .{config_path});
                 } else if (std.mem.eql(u8, okey, "target") or
                     std.mem.eql(u8, okey, "module") or
                     std.mem.eql(u8, okey, "moduleResolution"))
                 {
-                    try note(arena, notes, "{s}: '{s}' accepted and ignored (ztsc always checks its fixed esnext/bundler subset)", .{ config_path, okey });
+                    try cx.note("{s}: '{s}' accepted and ignored (ztsc always checks its fixed esnext/bundler subset)", .{ config_path, okey });
                 } else if (std.mem.eql(u8, okey, "jsx")) {
                     // Kept only to decide where the `JSX` namespace lives: under
                     // the automatic runtime (`react-jsx`/`react-jsxdev`) tsc
@@ -899,15 +919,15 @@ fn applyOwn(
                 } else if (std.mem.eql(u8, okey, "jsxFactory") or
                     std.mem.eql(u8, okey, "jsxFragmentFactory"))
                 {
-                    try note(arena, notes, "{s}: '{s}' accepted and ignored (ztsc type-checks JSX via the ambient/global `JSX` namespace; it never emits)", .{ config_path, okey });
+                    try cx.note("{s}: '{s}' accepted and ignored (ztsc type-checks JSX via the ambient/global `JSX` namespace; it never emits)", .{ config_path, okey });
                 } else if (std.mem.eql(u8, okey, "lib")) {
-                    if (try stringArray(arena, warnings, config_path, okey, oval)) |libs| {
+                    if (try stringArray(cx, config_path, okey, oval)) |libs| {
                         acc.lib = libs;
                         for (libs) |name| {
                             if (!std.ascii.startsWithIgnoreCase(name, "es") and
                                 !std.ascii.startsWithIgnoreCase(name, "dom"))
                             {
-                                try note(arena, notes, "{s}: lib '{s}' is out of subset (ignored; ztsc ships es-core + dom)", .{ config_path, name });
+                                try cx.note("{s}: lib '{s}' is out of subset (ignored; ztsc ships es-core + dom)", .{ config_path, name });
                             }
                         }
                     }
@@ -917,14 +937,14 @@ fn applyOwn(
                     // in the configured order. React Native projects set
                     // `[".ios", ".android", ".native", ""]`, which is what
                     // makes `import './threads'` pick `threads.native.d.ts`.
-                    if (try stringArray(arena, warnings, config_path, okey, oval)) |list| {
+                    if (try stringArray(cx, config_path, okey, oval)) |list| {
                         acc.module_suffixes = list;
                     }
                 } else if (std.mem.eql(u8, okey, "resolveJsonModule")) {
                     if (oval == .boolean) {
                         acc.resolve_json_module = oval.boolean;
                     } else {
-                        try warn(arena, warnings, "{s}: 'resolveJsonModule' must be a boolean (ignored)", .{config_path});
+                        try cx.warn("{s}: 'resolveJsonModule' must be a boolean (ignored)", .{config_path});
                     }
                 } else if (std.mem.eql(u8, okey, "resolvePackageJsonExports")) {
                     // Turning this off is the pre-`exports` resolver: no
@@ -933,66 +953,66 @@ fn applyOwn(
                     if (oval == .boolean) {
                         acc.resolve_pkg_json_exports = oval.boolean;
                     } else {
-                        try warn(arena, warnings, "{s}: 'resolvePackageJsonExports' must be a boolean (ignored)", .{config_path});
+                        try cx.warn("{s}: 'resolvePackageJsonExports' must be a boolean (ignored)", .{config_path});
                     }
                 } else if (std.mem.eql(u8, okey, "resolvePackageJsonImports")) {
                     if (oval == .boolean) {
                         acc.resolve_pkg_json_imports = oval.boolean;
                     } else {
-                        try warn(arena, warnings, "{s}: 'resolvePackageJsonImports' must be a boolean (ignored)", .{config_path});
+                        try cx.warn("{s}: 'resolvePackageJsonImports' must be a boolean (ignored)", .{config_path});
                     }
                 } else if (std.mem.eql(u8, okey, "noUncheckedSideEffectImports")) {
                     if (oval == .boolean) {
                         acc.no_unchecked_side_effect_imports = oval.boolean;
                     } else {
-                        try warn(arena, warnings, "{s}: 'noUncheckedSideEffectImports' must be a boolean (ignored)", .{config_path});
+                        try cx.warn("{s}: 'noUncheckedSideEffectImports' must be a boolean (ignored)", .{config_path});
                     }
                 } else if (std.mem.eql(u8, okey, "esModuleInterop")) {
                     if (oval == .boolean) {
                         acc.es_module_interop = oval.boolean;
                     } else {
-                        try warn(arena, warnings, "{s}: 'esModuleInterop' must be a boolean (ignored)", .{config_path});
+                        try cx.warn("{s}: 'esModuleInterop' must be a boolean (ignored)", .{config_path});
                     }
                 } else if (std.mem.eql(u8, okey, "allowSyntheticDefaultImports")) {
                     if (oval == .boolean) {
                         acc.allow_synthetic_default_imports = oval.boolean;
                     } else {
-                        try warn(arena, warnings, "{s}: 'allowSyntheticDefaultImports' must be a boolean (ignored)", .{config_path});
+                        try cx.warn("{s}: 'allowSyntheticDefaultImports' must be a boolean (ignored)", .{config_path});
                     }
                 } else if (std.mem.eql(u8, okey, "noImplicitAny")) {
                     if (oval == .boolean) {
                         acc.no_implicit_any = oval.boolean;
                     } else {
-                        try warn(arena, warnings, "{s}: 'noImplicitAny' must be a boolean (ignored)", .{config_path});
+                        try cx.warn("{s}: 'noImplicitAny' must be a boolean (ignored)", .{config_path});
                     }
                 } else if (std.mem.eql(u8, okey, "experimentalDecorators")) {
                     if (oval == .boolean) {
                         acc.experimental_decorators = oval.boolean;
                     } else {
-                        try warn(arena, warnings, "{s}: 'experimentalDecorators' must be a boolean (ignored)", .{config_path});
+                        try cx.warn("{s}: 'experimentalDecorators' must be a boolean (ignored)", .{config_path});
                     }
                 } else if (std.mem.eql(u8, okey, "emitDecoratorMetadata")) {
                     // Emit-only (it makes tsc write `design:type` metadata
                     // calls); it has no effect on type checking, and ztsc
                     // never emits.
-                    try note(arena, notes, "{s}: 'emitDecoratorMetadata' accepted and ignored (emit-only; ztsc never emits)", .{config_path});
+                    try cx.note("{s}: 'emitDecoratorMetadata' accepted and ignored (emit-only; ztsc never emits)", .{config_path});
                 } else if (std.mem.eql(u8, okey, "allowJs")) {
                     if (oval == .boolean) {
                         acc.allow_js = oval.boolean;
                     } else {
-                        try warn(arena, warnings, "{s}: 'allowJs' must be a boolean (ignored)", .{config_path});
+                        try cx.warn("{s}: 'allowJs' must be a boolean (ignored)", .{config_path});
                     }
                 } else if (std.mem.eql(u8, okey, "types")) {
                     // `types: [...]` restricts auto-`@types` inclusion to the
                     // listed packages; `types: []` disables it. Applied in
                     // `collectAutoTypes`. A non-array is ignored (auto-include).
-                    if (try stringArray(arena, warnings, config_path, okey, oval)) |list| {
+                    if (try stringArray(cx, config_path, okey, oval)) |list| {
                         acc.types = list;
                     }
                 } else if (std.mem.eql(u8, okey, "typeRoots")) {
                     // `typeRoots: [...]` overrides the default walk-up set of
                     // `@types` root directories (anchored to this config's dir).
-                    if (try stringArray(arena, warnings, config_path, okey, oval)) |list| {
+                    if (try stringArray(cx, config_path, okey, oval)) |list| {
                         acc.type_roots = list;
                         acc.type_roots_dir = dir;
                     }
@@ -1005,7 +1025,7 @@ fn applyOwn(
                             acc.skip_all_lib_check = oval.boolean;
                         }
                     } else {
-                        try warn(arena, warnings, "{s}: '{s}' must be a boolean (ignored)", .{ config_path, okey });
+                        try cx.warn("{s}: '{s}' must be a boolean (ignored)", .{ config_path, okey });
                     }
                 } else if (std.mem.eql(u8, okey, "outDir") or std.mem.eql(u8, okey, "declarationDir")) {
                     // Never used as an output location (ztsc does not emit),
@@ -1021,16 +1041,16 @@ fn applyOwn(
                         // Worded for the general case: this fires while merging
                         // one config, before it is known whether some config in
                         // the chain has an `exclude` that drops the default.
-                        try note(arena, notes, "{s}: '{s}' accepted; ztsc never emits, so it affects only the default 'exclude', which any explicit 'exclude' replaces", .{ config_path, okey });
+                        try cx.note("{s}: '{s}' accepted; ztsc never emits, so it affects only the default 'exclude', which any explicit 'exclude' replaces", .{ config_path, okey });
                     } else {
-                        try warn(arena, warnings, "{s}: '{s}' must be a string (ignored)", .{ config_path, okey });
+                        try cx.warn("{s}: '{s}' must be a string (ignored)", .{ config_path, okey });
                     }
                 } else if (std.mem.eql(u8, okey, "baseUrl")) {
                     if (oval == .string) {
                         acc.base_url = oval.string;
                         acc.base_url_dir = dir;
                     } else {
-                        try warn(arena, warnings, "{s}: 'baseUrl' must be a string (ignored)", .{config_path});
+                        try cx.warn("{s}: 'baseUrl' must be a string (ignored)", .{config_path});
                     }
                 } else if (std.mem.eql(u8, okey, "paths")) {
                     if (oval == .object) {
@@ -1038,14 +1058,14 @@ fn applyOwn(
                         acc.paths_dir = dir;
                         acc.paths_path = config_path;
                     } else {
-                        try warn(arena, warnings, "{s}: 'paths' must be an object (ignored)", .{config_path});
+                        try cx.warn("{s}: 'paths' must be an object (ignored)", .{config_path});
                     }
                 } else {
-                    try warn(arena, warnings, "{s}: unknown compiler option '{s}' (ignored)", .{ config_path, okey });
+                    try cx.warn("{s}: unknown compiler option '{s}' (ignored)", .{ config_path, okey });
                 }
             }
         } else {
-            try warn(arena, warnings, "{s}: unknown option '{s}' (ignored)", .{ config_path, key });
+            try cx.warn("{s}: unknown option '{s}' (ignored)", .{ config_path, key });
         }
     }
 }
@@ -1209,32 +1229,25 @@ fn appendExclude(arena: Allocator, out: *std.ArrayList([]const u8), pat: []const
         try std.fmt.allocPrint(arena, "{s}/**/*", .{pat}));
 }
 
-fn warn(arena: Allocator, list: *std.ArrayList([]const u8), comptime fmt: []const u8, args: anytype) Error!void {
-    try list.append(arena, try std.fmt.allocPrint(arena, fmt, args));
-}
-
-const note = warn;
-
 fn stringArray(
-    arena: Allocator,
-    warnings: *std.ArrayList([]const u8),
+    cx: Ctx,
     config_path: []const u8,
     key: []const u8,
     val: Value,
 ) Error!?[]const []const u8 {
     if (val != .array) {
-        try warn(arena, warnings, "{s}: '{s}' must be an array of strings (ignored)", .{ config_path, key });
+        try cx.warn("{s}: '{s}' must be an array of strings (ignored)", .{ config_path, key });
         return null;
     }
     var out: std.ArrayList([]const u8) = .empty;
     for (val.array) |item| {
         if (item != .string) {
-            try warn(arena, warnings, "{s}: non-string entry in '{s}' (skipped)", .{ config_path, key });
+            try cx.warn("{s}: non-string entry in '{s}' (skipped)", .{ config_path, key });
             continue;
         }
-        try out.append(arena, item.string);
+        try out.append(cx.arena, item.string);
     }
-    return try out.toOwnedSlice(arena);
+    return try out.toOwnedSlice(cx.arena);
 }
 
 fn joinNormalize(arena: Allocator, dir: []const u8, rest: []const u8) Error![]u8 {
@@ -1276,15 +1289,15 @@ fn hasTsExt(name: []const u8) bool {
 /// Returned paths are base-relative and sorted.
 fn expandInclude(
     io: Io,
-    arena: Allocator,
+    cx: Ctx,
     base: Io.Dir,
     m: *Matcher,
     walk_root: []const u8,
     include: []const []const u8,
     exclude: []const []const u8,
-    warnings: *std.ArrayList([]const u8),
     config_path: []const u8,
 ) Error![]const []const u8 {
+    const arena = cx.arena;
     var out: std.ArrayList([]const u8) = .empty;
     var stack: std.ArrayList([]const u8) = .empty;
     try stack.append(arena, walk_root);
@@ -1293,7 +1306,7 @@ fn expandInclude(
         const open_path = if (cur.len == 0) "." else cur;
         var d = base.openDir(io, open_path, .{ .iterate = true }) catch {
             if (std.mem.eql(u8, cur, walk_root)) {
-                try warn(arena, warnings, "{s}: cannot open directory '{s}'", .{ config_path, open_path });
+                try cx.warn("{s}: cannot open directory '{s}'", .{ config_path, open_path });
             }
             continue;
         };
@@ -1961,8 +1974,10 @@ test "expandInclude: one tree, both case rules — the sensitive half runs every
     }) |c| {
         for ([_]bool{ true, false }) |cs| {
             var warnings: std.ArrayList([]const u8) = .empty;
+            var notes: std.ArrayList([]const u8) = .empty;
+            const cx: Ctx = .{ .arena = alloc, .warnings = &warnings, .notes = &notes };
             var m: Matcher = .{ .case_sensitive = cs, .base_abs = root };
-            const got = try expandInclude(io, alloc, d, &m, "proj", c.include, c.exclude, &warnings, "proj/tsconfig.json");
+            const got = try expandInclude(io, cx, d, &m, "proj", c.include, c.exclude, "proj/tsconfig.json");
             const want = if (cs) c.cs_want else c.ci_want;
             try testing.expectEqual(want.len, got.len);
             for (got, want) |g, w| try testing.expectEqualStrings(w, g);
