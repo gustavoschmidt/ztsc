@@ -103,6 +103,21 @@ pub const AmbientExport = program.AmbientExport;
 /// Serial wavefront: load, parse, bind and resolve transitively from
 /// `entries` (paths relative to `dir`), then link. Everything lives in
 /// `arena`.
+///
+/// Tests and tools only — the CLI runs driver.zig's parallel pipeline. The
+/// per-FILE half of discovery is now literally the same code in both
+/// (`Discovery` below), which is the half that had drifted. What is still
+/// two implementations is the SCHEDULING half, and deliberately so: this walks
+/// one pending list in one thread and assigns ids in discovery order, while
+/// the driver front-ends files on a worker pool and re-derives the ids from
+/// the import graph afterwards.
+///
+/// TODO: the remaining shared-by-convention parts are the seeding of the lib
+/// shards and the entry paths (which this does not canonicalize, and which
+/// therefore cannot see a root reached twice through a symlink) and the
+/// `@types/node` auto-injection (which this does not do at all). A test-only
+/// program built from a config that needs either will differ from the CLI's;
+/// fold them in here, not in a third copy.
 pub fn buildProgram(
     arena: Allocator,
     io: Io,
