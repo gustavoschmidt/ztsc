@@ -750,6 +750,9 @@ pub fn main(init: std.process.Init) !void {
     // `<jsxImportSource>/jsx-runtime` under the automatic JSX runtime; null
     // under the classic runtime (global `JSX` namespace only).
     var config_jsx_runtime_module: ?[]const u8 = null;
+    // tsconfig `moduleSuffixes` — widens every candidate probe the resolver
+    // makes; carried on `ResolveOpts` like every other resolution input.
+    var config_module_suffixes: []const []const u8 = &.{};
     if (cli.paths.len == 0) {
         const config_timer = Timer.start(io);
         const config_path: []const u8 = blk: {
@@ -838,10 +841,7 @@ pub fn main(init: std.process.Init) !void {
         config_types_wildcard = cfg.types_wildcard;
         config_allow_synthetic_default = cfg.allow_synthetic_default_imports;
         config_jsx_runtime_module = cfg.jsx_runtime_module;
-        // `moduleSuffixes` widens every file probe the resolver makes, so it
-        // is installed on the resolver module rather than threaded through
-        // twenty signatures (resolution is single-owner; see `fs_probes`).
-        resolve.setModuleSuffixes(cfg.module_suffixes);
+        config_module_suffixes = cfg.module_suffixes;
         config_ns = config_timer.readNs();
     }
 
@@ -901,6 +901,7 @@ pub fn main(init: std.process.Init) !void {
         .allow_js = config_allow_js,
         .resolve_pkg_json_exports = config_resolve_pkg_exports,
         .resolve_pkg_json_imports = config_resolve_pkg_imports,
+        .module_suffixes = config_module_suffixes,
     });
 
     // --- Single-owner discovery (no wave barrier) --------------------------
@@ -2066,8 +2067,9 @@ fn resolveSpecInto(
                     // Full "load as file or folder" — a substitution that names
                     // a package directory is resolved through its
                     // `package.json`, not just by stem probing
-                    // (`resolvePathsCandidate`).
-                    try resolve.resolvePathsCandidate(io, scratch, Io.Dir.cwd(), cand);
+                    // (`resolvePathsCandidate`), under the same `ResolveOpts`
+                    // every other probe of this run sees.
+                    try rcache.pathsCandidate(io, scratch, Io.Dir.cwd(), cand);
                 if (r) |rr| {
                     mapped = rr;
                     break;

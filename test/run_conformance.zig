@@ -408,6 +408,17 @@ fn runDirCase(
         .no_unchecked_side_effect_imports = no_unchecked_side_effect_imports,
         .experimental_decorators = experimental_decorators,
     }, jsx_runtime_module);
+    // `load_failures` is the one channel `buildProgram` cannot fold into a
+    // diagnostic: a path that entered the program (an entry, a resolved
+    // specifier, a reference target) and then could not be READ is substituted
+    // by an empty file, so the case would silently check nothing where it meant
+    // to check something. Nothing about a conformance case should ever hit it —
+    // an unresolved specifier never becomes a program path — so treat it as a
+    // harness failure rather than letting a green run hide it.
+    for (br.load_failures) |bd| {
+        std.debug.print("conformance: {s}: could not load '{s}': {s}\n", .{ case_rel, bd.path, @errorName(bd.err) });
+    }
+    if (br.load_failures.len != 0) return error.ProgramFileLoadFailed;
     const prog = &br.program;
     prog.no_implicit_any = no_implicit_any;
     prog.allow_synthetic_default = allow_synthetic_default;

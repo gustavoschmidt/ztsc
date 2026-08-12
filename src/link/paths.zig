@@ -11,7 +11,10 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const Error = @import("modules.zig").Error;
+/// The only failure these helpers can have is allocation. Spelled with the
+/// standard error set (not the link layer's alias) so this file imports
+/// nothing from the layer above it — paths.zig is a leaf.
+const Error = Allocator.Error;
 
 /// True for a TypeScript *declaration* file (`.d.ts`, `.d.mts`, `.d.cts`). These
 /// never emit and — under `skipLibCheck` — have all their diagnostics
@@ -213,7 +216,7 @@ pub fn endsWithAny(s: []const u8, exts: []const []const u8) bool {
 /// namespace, and named — as `any` without a spurious TS1192/TS2305. The
 /// loaders special-case a `.json` program path to this text instead of parsing
 /// the raw JSON as TypeScript.
-pub const json_module_source = "declare const j: any;\nexport = j;\n";
+const json_module_source = "declare const j: any;\nexport = j;\n";
 
 /// Synthetic source substituted for a resolved JavaScript module under
 /// `allowJs`, and for the JavaScript an `exports` map names when the package
@@ -223,7 +226,7 @@ pub const json_module_source = "declare const j: any;\nexport = j;\n";
 /// raising TS2307. Under `noImplicitAny` tsc reports TS7016 at the specifier
 /// for such a module when it came from `node_modules`; the linker does the
 /// same (`Linker.reportUnresolvedModules`).
-pub const js_module_source = json_module_source;
+const js_module_source = json_module_source;
 
 /// Synthetic program-path suffix marking an `exports`-blocked subpath — a
 /// `<pkg>/<sub>` import where `<pkg>` publishes an `exports` map that does NOT
