@@ -1150,6 +1150,57 @@ pub fn inferCloselyMatched(c: *Checker, src: TypeId, pat: TypeId) bool {
     return a == b;
 }
 
+/// tsc's `getSignaturesOfType(intersection, kind)` — `resolveIntersectionTypeMembers`
+/// builds an intersection's signature list by CONCATENATING its constituents'
+/// lists in declaration order:
+///
+///     callSignatures = appendSignatures(callSignatures, getSignaturesOfType(t, Call));
+///
+/// and `getSignaturesOfType` on an interface reads its RESOLVED members, so a
+/// signature a constituent only INHERITS is in the list too. `inferFromSignatures`
+/// then pairs source and target lists from the END, so a single-signature pattern
+/// — every `T extends (…) => infer R`, `T extends new (…) => infer R` and
+/// `JSXElementConstructor<infer P>` — reads the LAST signature of the whole
+/// concatenation: the last signature of the last constituent that has one.
+///
+/// Returns that signature (a `.function` TypeId, ready to hand to
+/// `inferFromExtends`), or null when no constituent is callable of this kind.
+///
+/// Before this the two inference arms below only recognised a BARE `.function`
+/// or `.overloads` constituent, so an intersection whose callable member is an
+/// interface or type literal — the shape every `styled(X)` component has, and
+/// every `Callable & {…}` value object — matched nothing, left the binder at
+/// `unknown`, and dropped the conditional to its FALSE branch. It cost outline
+/// ~90 keys on styled-components alone (`ComponentProps<typeof Styled>` fell to
+/// `JSXElementConstructor`'s fallback, so every prop of every styled component
+/// was an excess TS2322/TS7006).
+fn intersectionLastSig(c: *Checker, isect: TypeId, is_construct: bool) Error!?TypeId {
+    const s = &c.ts;
+    // Duped: `resolveStructural` and the signature readers below intern, which
+    // can move the store's member arrays (see `memberAt`).
+    const members = try c.scratch().dupe(TypeId, try c.memberList(isect));
+    defer c.scratch().free(members);
+    var last: ?TypeId = null;
+    for (members) |m| {
+        const rm = try c.resolveStructural(m);
+        switch (s.kind(rm)) {
+            // A bare function type has a call signature and no construct one.
+            .function => if (!is_construct) {
+                last = rm;
+            },
+            .overloads => if (!is_construct) {
+                if (try c.lastCallSig(rm)) |sig| last = sig;
+            },
+            .object => {
+                const n = if (is_construct) s.objectConstructSigCount(rm) else s.objectCallSigCount(rm);
+                if (n > 0) last = if (is_construct) s.objectConstructSig(rm, n - 1) else s.objectCallSig(rm, n - 1);
+            },
+            else => {},
+        }
+    }
+    return last;
+}
+
 /// tsc's `inferToMultipleTypes`, union form: every target constituent that
 /// can bind receives the source, and the ones that ARE a binder receive it
 /// last and at `InferencePriority.NakedTypeVariable` —
@@ -1387,9 +1438,6 @@ fn inferFromExtendsInner(c: *Checker, source0: TypeId, pattern: TypeId, ids: []c
             // intrinsic element, because `ComponentProps<'div'>` is
             // `ClassAttributes<HTMLDivElement> & HTMLAttributes<…>` — an
             // intersection.
-            //
-            // Signature inference below still needs a single object, so
-            // the intersection only feeds the property loop.
             if (s.kind(src) == .intersection) {
                 for (0..s.objectPropCount(pattern)) |i| {
                     const pp = s.objectProp(pattern, @intCast(i));
@@ -1399,6 +1447,24 @@ fn inferFromExtendsInner(c: *Checker, source0: TypeId, pattern: TypeId, ids: []c
                     // matching the plain-object branch below.
                     if (try c.propOfTypeEx(src, pp.name, false)) |sp| {
                         try c.inferFromExtends(sp.ty, pp.ty, ids, vals, contra, depth + 1);
+                    }
+                }
+                // tsc's `inferFromObjectTypes` runs `inferFromSignatures` for
+                // both signature kinds on an INTERSECTION source too — an
+                // intersection's own signature list is the concatenation of its
+                // constituents' (see `intersectionLastSig`), so the pattern's
+                // last signature pairs with the last one in that list. This is
+                // the construct-signature half of the styled-components /
+                // `ComponentProps` failure: `JSXElementConstructor<infer P>`'s
+                // class constituent is a `new (props: infer P) => …` OBJECT, so
+                // it lands here and not in the `.function` arm.
+                inline for (.{ false, true }) |is_construct| {
+                    const pn = if (is_construct) s.objectConstructSigCount(pattern) else s.objectCallSigCount(pattern);
+                    if (pn > 0) {
+                        if (try intersectionLastSig(c, src, is_construct)) |ssig| {
+                            const psig = if (is_construct) s.objectConstructSig(pattern, pn - 1) else s.objectCallSig(pattern, pn - 1);
+                            try c.inferFromExtends(ssig, psig, ids, vals, contra, depth + 1);
+                        }
                     }
                 }
                 return;
@@ -1447,18 +1513,17 @@ fn inferFromExtendsInner(c: *Checker, source0: TypeId, pattern: TypeId, ids: []c
             //     `declare function` value carrying own properties) → infer
             //     through that bare call-signature member, so
             //     `ComponentProps<typeof Icon>` = its props type, not
-            //     `unknown`. (A callable OBJECT member — React's
-            //     `ForwardRefExoticComponent<P> & {…}`, whose call sig lives
-            //     INSIDE an object member rather than as a bare `.function` —
-            //     is still left to the object/construct-signature path below.)
+            //     `unknown`;
+            //   * a callable OBJECT (interface or type literal) member —
+            //     React's `ForwardRefExoticComponent<P> & {…}` and every
+            //     styled-components `StyledComponent`, whose call signature
+            //     lives INSIDE an object member, and may be INHERITED by it,
+            //     rather than sitting there as a bare `.function`.
             //
-            // WHICH constituent, when more than one is callable, is the same
-            // end-aligned rule: tsc's `getSignaturesOfType` on an intersection
-            // concatenates its constituents' signatures in declaration order,
-            // and `inferFromSignatures` pairs the two lists from the END, so a
-            // single-signature pattern reads the LAST callable constituent —
-            // and, within it, its last signature. Oracle-verified against
-            // tsgo 7.0.2 in
+            // WHICH constituent, when more than one is callable, is the
+            // end-aligned rule `intersectionLastSig` implements — the last
+            // signature of the last callable constituent. Oracle-verified
+            // against tsgo 7.0.2 in
             // `test/conformance/inference/intersection_infers_last_call_
             // signature.ts`: `(() => "x") & (() => "y")` infers `"y"`, a third
             // constituent wins over both, an object member in between changes
@@ -1466,18 +1531,7 @@ fn inferFromExtendsInner(c: *Checker, source0: TypeId, pattern: TypeId, ids: []c
             // OVERLOAD SET's last return while the reverse order infers
             // `"plain"`.
             if (s.kind(src) == .intersection) {
-                var callable: TypeId = types.no_type;
-                for (try c.memberList(src)) |m| {
-                    const rm = try c.resolveStructural(m);
-                    switch (s.kind(rm)) {
-                        .overloads, .function => callable = rm,
-                        else => {},
-                    }
-                }
-                if (callable == types.no_type) return;
-                // An overload set reduces to its last call signature just
-                // below, by the same rule.
-                src = callable;
+                src = (try intersectionLastSig(c, src, false)) orelse return;
             }
             // A plain overload set — the type of a multiply-declared method
             // reached through property/indexed access (`S['m']`, e.g. jest's
