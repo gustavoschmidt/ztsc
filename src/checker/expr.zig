@@ -3638,6 +3638,16 @@ pub fn indexChainInner(c: *Checker, node: Node, chained: *bool, narrow: bool) Er
             }
             result = types.error_type;
         }
+        // A symbol-keyed element access is a TRACKED reference like any other
+        // constant-keyed one (`PathElem.elementSym`), so it takes the same
+        // narrowing step the tail of this function applies — this arm's early
+        // return was skipping it, which is why `if (page[SYM]) { page[SYM]
+        // .total }` stayed optional and reported TS2532.
+        if (narrow) {
+            if (try c.buildRefKey(node)) |ref| {
+                result = try c.flowTypeOfKey(node, ref, result);
+            }
+        }
         return result;
     }
     const ik = c.ts.kind(try c.ts.regularLiteral(idx_t));

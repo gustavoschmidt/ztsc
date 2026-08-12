@@ -28,6 +28,8 @@ const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
 const check = checker_zig.check;
 
+const CallShape = @import("calls.zig").CallShape;
+const countArgs = @import("calls.zig").countArgs;
 const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
 const atom = Checker.atom;
 const checkDeclarator = @import("stmts.zig").checkDeclarator;
@@ -360,11 +362,26 @@ pub fn stableIndexSymbol(c: *Checker, rhs: Node) Error!?SymbolId {
     while (c.nodeTag(n) == .paren_expr) n = c.tree.nodeData(n).lhs;
     if (c.nodeTag(n) != .identifier) return null;
     const a = try c.atomOfToken(c.tree.nodeMainToken(n));
-    const sym = switch (c.resolveSpace(a, c.cur_scope, true)) {
+    var sym = switch (c.resolveSpace(a, c.cur_scope, true)) {
         .sym => |s| s,
         else => return null,
     };
     if (sym == binder.no_symbol) return null;
+    // An IMPORTED key is the normal spelling of this idiom — outline declares
+    // `export const PAGINATION_SYMBOL = Symbol.for("pagination")` in one file
+    // and guards `users[PAGINATION_SYMBOL]` in another. tsc resolves the index
+    // through aliases before its `isConstVariable` test
+    // (`tryGetNameFromEntityNameExpression` → `resolveEntityName`), so an
+    // import binding must land on the declaration it names — both because the
+    // local alias carries none of the flags below, and because keying the path
+    // on the TARGET makes the two spellings name one reference.
+    var hops: u8 = 0;
+    while (c.symFlags(sym).import_binding) : (hops += 1) {
+        if (hops >= 8) return null; // re-export cycle: untracked
+        const tgt = c.importTarget(sym) orelse return null;
+        if (tgt.kind != .binding) return null; // a namespace object, not a value
+        sym = c.toGlobalIn(tgt.file, tgt.payload);
+    }
     if (!PathElem.symFits(sym)) return null;
     const sf = c.symFlags(sym);
     if (sf.const_decl) return sym;
@@ -812,7 +829,8 @@ fn callStmtReturnsNever(c: *Checker, flow: FlowId) Error!bool {
 /// `checkExprCached` would report a phantom TS2304.
 pub fn callReturnsNever(c: *Checker, call: Node) Error!bool {
     if (call == null_node) return false;
-    const callee = c.callShape(call).callee;
+    const shape = c.callShape(call);
+    const callee = shape.callee;
     const saved = c.cur_scope;
     defer c.cur_scope = saved;
     if (c.bind.flowAt(callee)) |f| c.cur_scope = c.bind.flowScope(f);
@@ -826,7 +844,13 @@ pub fn callReturnsNever(c: *Checker, call: Node) Error!bool {
         else => return false,
     };
     if (callee_t == types.no_type) return false;
-    const sig = (try c.lastCallSig(callee_t)) orelse return false;
+    // The RESOLVED signature, not the last declared one: an overload set is
+    // read by tsc through `getEffectsSignature`, and an assertion set whose
+    // *other* overload returns `never` (`declare function invariant(v: any,
+    // m: string): asserts v; declare function invariant(v: false, m: string):
+    // never;`) otherwise reads as "this call ends the flow" for every call —
+    // killing the narrowing the very same statement just made.
+    const sig = (try effectsSignature(c, call, shape, callee_t)) orelse return false;
     return c.ts.kind(c.ts.fnReturn(sig)) == .never;
 }
 
@@ -1076,7 +1100,21 @@ pub fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, d
                 if (c.reassigned_syms.contains(key.sym) and
                     !pastLastAssignment(c, key.sym, sf)) return declared;
             }
-            return c.flowType(ante, key, declared, depth + 1);
+            const outer = try c.flowType(ante, key, declared, depth + 1);
+            // tsc's two `never`s, at the closure boundary (see
+            // `flowTypeOfKey`'s tail for the other place the distinction is
+            // drawn). A definition point standing in code no path reaches
+            // answers `unreachableNeverType`, and every reader of that is
+            // handed the DECLARED type — the closure's own body is reachable
+            // whatever surrounds its definition, since it may be invoked from
+            // anywhere. `invariant(res?.data, "…")` in outline's stores is the
+            // shape: `res` is `any`, so the call resolves to
+            // `@types/invariant`'s FIRST overload — `(testValue: false, …):
+            // never`, which `any` satisfies — the statement ends the flow, and
+            // the `runInAction(() => … res.data …)` callback right after it
+            // read every capture as `never` (36 fresh TS2339s).
+            if (c.ts.kind(outer) == .never and !try c.flowReachable(ante)) return declared;
+            return outer;
         },
         .unreachable_ => return types.never_type,
         .assign => {
@@ -1084,6 +1122,12 @@ pub fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, d
             const ante = b.flow_a[flow];
             // Re-evaluating the initializer/rhs resolves names in the scope
             // where the assignment lives, not the reference's query scope.
+            // The `for..in` test below is a name resolution too (it matches
+            // the loop's right-hand side against the queried reference), so
+            // it shares the scope — but only the TEST does: walking the
+            // antecedent has to happen back in the query's own scope, exactly
+            // as the fall-through below does.
+            var strip_nullish = false;
             {
                 const saved = c.cur_scope;
                 defer c.cur_scope = saved;
@@ -1091,8 +1135,21 @@ pub fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, d
                 if (try c.assignNarrows(target, key, declared)) |narrowed| {
                     return narrowed;
                 }
+                strip_nullish = try forInSubjectMatches(c, flow, target, key);
             }
-            return c.flowType(ante, key, declared, depth + 1);
+            const before = try c.flowType(ante, key, declared, depth + 1);
+            // The tail of tsc's `getTypeAtFlowAssignment`: the assignment that
+            // binds a `for..in` KEY strips nullish from the object being
+            // enumerated, for the whole body. `for (const k in
+            // maybeUndefined)` is legal JS — enumerating `undefined` yields no
+            // keys — so tsc reports nothing on the header
+            // (`checkForInStatement` runs `getNonNullableTypeIfNeeded` over
+            // the right-hand side) and nothing inside the body either, because
+            // a body only runs when there was an object to enumerate.
+            // outline's `for (const key in extra) { … extra[key] … }` over an
+            // optional parameter was 3 × TS2407 plus 3 × TS18048.
+            if (strip_nullish and isNullishUnion(c, before)) return try c.nonNullable(before);
+            return before;
         },
         .cond_true, .cond_false => {
             const cond = b.flowNode(flow);
@@ -1146,14 +1203,25 @@ pub fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, d
             const call = b.flowNode(flow);
             const ante = b.flow_a[flow];
             // tsc's `getTypeAtFlowCall`: a call statement whose signature
-            // returns `never` ENDS the flow (`unreachableNeverType`). ztsc
-            // normally asks that question once, at the end of the walk
-            // (`flowTypeOfKey`'s reachability test), which is all an ordinary
-            // read needs — it just wants its declared type back. An
-            // initialization query has to see it *here*: a `never` call is what
-            // makes `constructor() { fail(); }` initialize everything, because
-            // nothing flows out of the constructor at all.
-            if (key.opt_init and try callStmtReturnsNever(c, flow)) return types.never_type;
+            // returns `never` ENDS the flow (`unreachableNeverType`), for
+            // every query and not just an initialization one.
+            //
+            // The end of the walk asks the same question once
+            // (`flowTypeOfKey`'s reachability test), which is all a read
+            // *standing after* the `never` call needs — it just wants its
+            // declared type back. But a read whose flow only PASSES THROUGH
+            // such an edge on one of several antecedents needs the answer
+            // *here*: `if (!file) { ctx.throw(err); } return file.size;`
+            // joins the `!file` true-branch, dead because koa's `ctx.throw`
+            // returns `never`, with the false branch where `file` is defined
+            // — and `never` drops out of that union, which is the whole
+            // mechanism by which a throw helper ends a block. Asked at the
+            // end instead, the reference's own flow node is plainly
+            // reachable and the dead branch's `undefined` survived.
+            // (Same reason an initialization query needs it: a `never` call
+            // is what makes `constructor() { fail(); }` initialize
+            // everything — nothing flows out of the constructor at all.)
+            if (try callStmtReturnsNever(c, flow)) return types.never_type;
             const before = try c.flowType(ante, key, declared, depth + 1);
             if (before == types.never_type) return before;
             // The assertion callee is re-checked here; resolve it in the
@@ -1445,6 +1513,50 @@ pub fn thisPropUnassigned(c: *Checker, flow: FlowId, name: Atom, declared: TypeI
     key.opt_init = true;
     const t = try c.flowType(flow, key, declared, 0);
     return hasUndefinedMember(c, t);
+}
+
+/// Is this assign-flow node a `for..in` key binding whose ENUMERATED OBJECT
+/// is the reference being asked about? Then the type inside the loop is the
+/// antecedent's with nullish stripped (tsc's `getTypeAtFlowAssignment`, last
+/// arm). The binder marks the per-iteration key binding with an `.assign`
+/// flow whose node is the loop's own initializer and whose scope is the
+/// loop's `.for_head`, and that scope's owner is the `for..in` statement —
+/// which is how the right-hand side is reached from here.
+///
+/// Restricted to the DECLARATION form, as tsc is (`isVariableDeclaration`):
+/// `for (k in maybeUndefined)` — assigning to an existing binding — narrows
+/// nothing there either.
+fn forInSubjectMatches(c: *Checker, flow: FlowId, target: Node, key: RefKey) Error!bool {
+    const b = c.bind;
+    switch (c.nodeTag(target)) {
+        .var_decl_one, .var_decl => {},
+        else => return false,
+    }
+    const scope = b.flowScope(flow);
+    if (b.scope_kinds[scope] != .for_head) return false;
+    const owner = b.scope_owners[scope];
+    if (owner == null_node or c.nodeTag(owner) != .for_in_stmt) return false;
+    const e = c.tree.extraData(ast.ForInOf, c.tree.nodeData(owner).lhs);
+    if (e.left != target) return false;
+    return c.refMatches(e.right, key);
+}
+
+/// Does this type carry a `null`/`undefined` constituent to strip? tsc's
+/// `getNonNullableTypeIfNeeded` guard, kept syntactic so that a type whose
+/// nullish arm is hidden behind a constraint (a bare type parameter) is left
+/// exactly as it was.
+///
+/// The union kind is checked before the member walk because `members` is a
+/// raw `extra` slice keyed by kind: an `.object`'s payload words are an extra
+/// index and a property count, so reading them as a member range is not a
+/// wrong answer but an invalid slice.
+pub fn isNullishUnion(c: *Checker, t: TypeId) bool {
+    if (isNullishKind(c.ts.kind(t))) return true;
+    if (c.ts.kind(t) != .union_type) return false;
+    for (c.ts.members(t)) |m| {
+        if (isNullishKind(c.ts.kind(m))) return true;
+    }
+    return false;
 }
 
 /// If the assign-flow node writes the reference (or invalidates a
@@ -3456,33 +3568,187 @@ pub fn guardCallOf(c: *Checker, call: Node) Error!?GuardCall {
         else => try c.checkExprCached(callee, types.no_type),
     };
     if (callee_t == types.no_type) return null;
-    if (!c.ts.fnHasPredicate(callee_t)) return null;
-    // A GENERIC guard names its own type parameter in the predicate
-    // (`isMemberOf = <T extends string>(coll: readonly T[], v: string):
-    // v is T`). The DECLARED signature therefore narrows the argument to
-    // the naked `T`; tsc reads the predicate off the call's RESOLVED
-    // signature, whose `T` is the inferred type argument. There is no
-    // resolved-signature memo here, so re-run the same inference the call
-    // itself ran — silently, since anything it files inside the argument
-    // list is an artifact of this side query and the real check of the
-    // call reports it (or not) on its own.
-    const sig_t = if (c.ts.fnTypeParams(callee_t).len == 0) callee_t else blk: {
-        const saved = c.diags.items.len;
-        var targs: std.ArrayList(TypeId) = .empty;
-        defer targs.deinit(c.scratch());
-        for (shape.targ_nodes) |tn| {
-            if (tn != null_node) try targs.append(c.scratch(), try c.typeFromTypeNode(tn));
-        }
-        const inst = try c.instantiateSigForCall(callee_t, targs.items, shape.arg_nodes, call, types.no_type);
-        c.rollbackArgDiags(saved, c.cur_file, shape.arg_nodes);
-        break :blk if (c.ts.fnHasPredicate(inst)) inst else callee_t;
-    };
+    const sig_t = (try effectsSignature(c, call, shape, callee_t)) orelse return null;
+    if (!c.ts.fnHasPredicate(sig_t)) return null; // `never` return, no predicate
     const pred = c.ts.fnPredicate(sig_t);
     if (pred.param == types.Predicate.this_param) return null; // `this is T`: gap
     if (pred.param >= shape.arg_nodes.len) return null;
     const arg = shape.arg_nodes[pred.param];
     if (arg == null_node) return null;
     return .{ .pred = pred, .arg = arg };
+}
+
+/// The signature this call resolves to, when it is one a FLOW NODE cares
+/// about — a type predicate, or a `never` return. tsc's `getEffectsSignature`.
+///
+/// The callee's type is not a `.function` nearly as often as it looks. An
+/// OVERLOAD SET is an `.overloads` type, and a callable declared through an
+/// interface or an object type literal — `interface InvariantStatic { (v:
+/// false, m: string): never; (v: any, m: string): asserts v }`, which is
+/// `@types/invariant`'s exact shape and outline's most-used assertion — is an
+/// `.object` carrying call signatures. Asking `fnHasPredicate` about either
+/// answers "no" (it demands `kind == .function`), so every predicate declared
+/// that way was invisible and neither `asserts x` nor `x is T` narrowed.
+///
+/// tsc reads the predicate off the call's RESOLVED signature, so:
+///
+///  * gather the callee's call signatures (`getSignaturesOfType`), and stop
+///    at once unless one of them has a predicate or returns `never` — that
+///    keeps the ordinary call, which is the overwhelming majority, at one
+///    kind switch;
+///  * a lone non-generic signature *is* the answer (tsc's first branch);
+///  * otherwise re-run overload resolution — arity, then `argumentsMatch` —
+///    exactly as `resolveSignatureCall` does, because WHICH overload wins
+///    decides what the call means to the flow graph: `invariant(false, m)`
+///    picks the `never` overload and `invariant(maybe, m)` the `asserts`
+///    one. Taking the last signature of the set instead (what the `never`
+///    probe used to do) reads `declare function v(v: any, m: string):
+///    asserts v; declare function v(v: false, m: string): never;` as a call
+///    that ends the flow, which cancels the assertion it just made. This
+///    runs silently: every diagnostic and every instantiation charge it makes
+///    inside the argument list is an artifact of a flow-side query, and the
+///    real check of the call files its own.
+fn effectsSignature(c: *Checker, call: Node, shape: CallShape, callee_t: TypeId) Error!?TypeId {
+    var sigs: std.ArrayList(TypeId) = .empty;
+    defer sigs.deinit(c.scratch());
+    try collectCallSigs(c, callee_t, &sigs, 0);
+    if (sigs.items.len == 0) return null;
+    var any_effect = false;
+    for (sigs.items) |s| {
+        if (sigHasEffect(c, s)) {
+            any_effect = true;
+            break;
+        }
+    }
+    if (!any_effect) return null;
+
+    const saved_diags = c.diags.items.len;
+    const saved_file = c.cur_file;
+    const saved_inst_count = c.inst_count;
+    const saved_inst_trip = c.inst_limit_tripped;
+    defer {
+        c.rollbackArgDiags(saved_diags, saved_file, shape.arg_nodes);
+        c.inst_count = saved_inst_count;
+        c.newBudgetWindow();
+        c.inst_limit_tripped = saved_inst_trip;
+    }
+
+    var targs: std.ArrayList(TypeId) = .empty;
+    defer targs.deinit(c.scratch());
+    for (shape.targ_nodes) |tn| {
+        if (tn != null_node) try targs.append(c.scratch(), try c.typeFromTypeNode(tn));
+    }
+
+    // A single signature: no choice to make, so the only work left is the
+    // instantiation a GENERIC guard needs (`isMemberOf = <T extends string>
+    // (coll: readonly T[], v: string): v is T` narrows to the INFERRED `T`,
+    // not the naked type parameter).
+    if (sigs.items.len == 1) {
+        const sig = sigs.items[0];
+        if (c.ts.fnTypeParams(sig).len == 0) return sig;
+        const inst = try c.instantiateSigForCall(sig, targs.items, shape.arg_nodes, call, types.no_type);
+        return if (sigHasEffect(c, inst)) inst else sig;
+    }
+
+    const nargs = countArgs(shape.arg_nodes);
+    var fallback: ?TypeId = null;
+    // tsc's `resolveCall` runs `chooseOverload` TWICE over a multi-candidate
+    // set: first under the SUBTYPE relation, and only if nothing matched under
+    // the ASSIGNABLE one. The single rule that separates the two here is that
+    // `any` is a subtype of nothing but `any`/`unknown` while being assignable
+    // to everything — and it decides `@types/invariant` outright.
+    // `invariant(result, "…")` over an `any` argument matches
+    // `(testValue: false, format: string): never` under assignability, so a
+    // one-pass probe reads outline's most common assertion as a call that ENDS
+    // the flow, and every narrowing after it (`authenticationParams.expiresIn`,
+    // 40 statements later) is lost. Under the subtype relation `any` misses
+    // `false`, the `asserts testValue` overload wins, and the assertion
+    // narrows — which is what tsc reports.
+    var pass: u8 = 0;
+    while (pass < 2) : (pass += 1) {
+        for (sigs.items) |sig| {
+            if (targs.items.len > 0 and !c.sigTargArityOk(sig, targs.items.len)) continue;
+            const inst = try c.instantiateSigForCall(sig, targs.items, shape.arg_nodes, call, types.no_type);
+            if (nargs < try c.requiredParams(inst) or nargs > try c.paramTotal(inst)) continue;
+            // The first arity-fitting candidate stands in for a call whose
+            // arguments no overload accepts: tsc's failure path keeps a
+            // candidate too, and a call that is already an error should not
+            // also lose its narrowing.
+            if (fallback == null) fallback = inst;
+            if (pass == 0 and try anyArgMissesSubtype(c, inst, shape.arg_nodes)) continue;
+            if (try c.argumentsMatch(inst, shape.arg_nodes)) {
+                return if (sigHasEffect(c, inst)) inst else null;
+            }
+        }
+    }
+    const fb = fallback orelse return null;
+    return if (sigHasEffect(c, fb)) fb else null;
+}
+
+/// The one place the subtype relation is stricter than the assignable one for
+/// an overload probe: an `any` argument. `isSimpleTypeRelatedTo` short-circuits
+/// on an `any` SOURCE for the assignable and comparable relations only, so
+/// under subtyping `any` reaches a parameter typed `any`/`unknown` and nothing
+/// else.
+///
+/// Only plain reference and literal arguments are examined — a context-
+/// sensitive argument (an arrow, an object literal) has no type until a
+/// candidate's parameter gives it one, and none of them is `any`-rooted on its
+/// own, so leaving them out keeps this test free of the candidate-order
+/// dependence that probing them would introduce.
+fn anyArgMissesSubtype(c: *Checker, sig: TypeId, arg_nodes: []const Node) Error!bool {
+    var ai: u32 = 0;
+    for (arg_nodes) |an| {
+        if (an == null_node) continue;
+        defer ai += 1;
+        switch (c.nodeTag(an)) {
+            .identifier,
+            .member_expr,
+            .optional_member_expr,
+            .index_expr,
+            .optional_index_expr,
+            .this_expr,
+            .non_null,
+            .paren_expr,
+            => {},
+            else => continue,
+        }
+        const at = try c.checkExprCached(an, types.no_type);
+        switch (c.ts.kind(at)) {
+            .any, .err => {},
+            else => continue,
+        }
+        const pt = (try c.paramTypeAt(sig, ai)) orelse continue;
+        switch (c.ts.kind(try c.resolveStructural(pt))) {
+            .any, .unknown, .err => continue,
+            else => return true,
+        }
+    }
+    return false;
+}
+
+/// tsc's `hasTypePredicateOrNeverReturnType`: the two things a signature can
+/// say to the flow graph.
+fn sigHasEffect(c: *Checker, sig: TypeId) bool {
+    if (c.ts.kind(sig) != .function) return false;
+    return c.ts.fnHasPredicate(sig) or c.ts.kind(c.ts.fnReturn(sig)) == .never;
+}
+
+/// `getSignaturesOfType(type, Call)`: the call signatures a callee offers,
+/// in declaration order. An intersection concatenates its members' lists,
+/// same rule `checkCallExprInner` follows.
+fn collectCallSigs(c: *Checker, t0: TypeId, out: *std.ArrayList(TypeId), depth: u32) Error!void {
+    if (depth > 4) return;
+    const t = try c.resolveStructural(t0);
+    switch (c.ts.kind(t)) {
+        .function => try out.append(c.scratch(), t),
+        .overloads => for (try c.memberList(t)) |m| try out.append(c.scratch(), m),
+        .object => for (0..c.ts.objectCallSigCount(t)) |i| {
+            try out.append(c.scratch(), c.ts.objectCallSig(t, @intCast(i)));
+        },
+        .intersection => for (try c.memberList(t)) |m| try collectCallSigs(c, m, out, depth + 1),
+        else => {},
+    }
 }
 
 /// tsc's `isDeclarationWithExplicitTypeAnnotation`, asked the other way
