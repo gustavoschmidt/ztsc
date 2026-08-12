@@ -177,7 +177,6 @@ pub const Worker = struct {
     /// which is what makes the pack's bump cursor lock-free.
     pack: source.Pack = .{},
     thread: std.Thread = undefined,
-    files_loaded: usize = 0,
     /// The grammar options every file this worker parses is parsed under
     /// (`jsx` is per-file and filled in at the call site). Settled from the
     /// tsconfig before any worker is spawned, so it needs no synchronization.
@@ -235,7 +234,6 @@ pub const Worker = struct {
                 return;
             };
         c.src = src;
-        w.files_loaded += 1;
         // Exercise the shared interner from every worker thread.
         c.path_atom = interner.intern(io, gpa, path) catch |err| {
             c.err = err;
