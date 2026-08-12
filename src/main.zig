@@ -57,8 +57,12 @@ const libs = ztsc.libs;
 const modules = ztsc.modules;
 const resolve = ztsc.resolve;
 const types = ztsc.types;
+const driver = ztsc.driver;
+const schedule = ztsc.schedule;
 const Ast = ztsc.ast.Ast;
 const Bind = binder.Bind;
+const Timer = driver.Timer;
+const FileOrder = driver.FileOrder;
 
 const usage =
     \\usage: ztsc [options] [files...]
@@ -136,34 +140,6 @@ const usage =
     \\config, or file-system errors.
     \\
 ;
-
-/// Minimal monotonic wall-clock timer over std.Io's clock API.
-const Timer = struct {
-    io: Io,
-    start_ts: Io.Clock.Timestamp,
-
-    fn start(io: Io) Timer {
-        return .{ .io = io, .start_ts = .now(io, .awake) };
-    }
-
-    fn readNs(t: *const Timer) u64 {
-        const d = t.start_ts.untilNow(t.io);
-        const ns = d.raw.nanoseconds;
-        return if (ns > 0) @intCast(ns) else 0;
-    }
-};
-
-/// How the program's root file list is ordered before it is seeded. The
-/// order is supposed to be unobservable — this exists so a gate can prove it.
-const FileOrder = union(enum) {
-    /// As the tsconfig `include` walk (or the command line) produced it.
-    source: void,
-    /// Exactly reversed. The cheapest permutation that moves every file.
-    reverse: void,
-    /// A seeded Fisher-Yates deal, so a failing order is reproducible from
-    /// the seed alone.
-    shuffle: u64,
-};
 
 const Cli = struct {
     timing: bool = false,
@@ -508,149 +484,6 @@ const Worker = struct {
         };
         c.bind = b;
         c.bind_ns = timer.readNs();
-    }
-};
-
-/// Check-work (AST nodes to walk) below which a run drops to two checkers.
-///
-/// A checker instance is not free. Each carries its own type-store overlay,
-/// per-symbol state arrays, scratch/instantiation arenas, relation and
-/// instantiation caches, thread, and its thread's share of the general
-/// allocator's size-class slabs — measured at ~0.35 MB of fixed state per
-/// instance on ajv, against ~90 KB of types the instance actually interns.
-/// Adding instances also re-materializes lib types once per instance that
-/// reaches them.
-///
-/// That fixed cost is worth paying when there is enough work to spread, and
-/// the corpus shows the trade inverting sharply around this size. Going from
-/// four checkers to two (median of 11 runs / 5 runs):
-///
-///   chalk       21.1k nodes   RSS -7.8%   wall +8.1%
-///   @types/prop-types 21.0k   RSS -7.4%   wall +6.9%
-///   ajv         28.0k nodes   RSS -11.4%  wall +1.7%
-///   ---- threshold ----
-///   date-fns    36.8k nodes   RSS -2.2%   wall +7.6%
-///   typebox     37.0k nodes   RSS -0.3%   wall +14.8%
-///   @types/react 101.6k       RSS -7.7%   wall +14.9%
-///   zod         98.2k nodes   RSS -6.8%   wall +21.9%
-///
-/// Below the line the memory saved is large and the wall cost small; above
-/// it the wall cost multiplies while the memory saving collapses. An
-/// explicit `--checkers=N` always wins over this.
-///
-/// Diagnostics are unaffected: output is byte-identical for any checker
-/// count (see the determinism tests), so this only moves the resource
-/// trade-off, never the result.
-const small_program_nodes: u64 = 32_000;
-
-/// Check-work above which a program is large enough for the
-/// declaration-surface test below to apply at all.
-const large_program_nodes: u64 = 256_000;
-
-/// Parsed-to-checked node ratio above which a large program drops to two
-/// checkers: how much declaration surface each instance must re-materialize
-/// per unit of code it actually walks.
-///
-/// A checker instance does NOT split declaration work. Measured on immich, the
-/// set of distinct canonical types the program needs is invariant in checker
-/// count (2.51 M at one checker, ~2.5 M at four), but four checkers BUILD
-/// 7.64 M of them — 3.05x redundancy, with 87-93% of each instance's types
-/// also present in another's arena. The reason is structural rather than a bad
-/// partition: a checker's demand closure grows LOGARITHMICALLY in the files it
-/// owns (1 file 1.437 M types, 4 files 1.519 M, 16 files 1.740 M, 500 files
-/// 1.918 M), so splitting the files four ways splits the work ~1.3 ways. Four
-/// maximally different partitions — the shipped one, contiguous BFS ranges,
-/// random, and a demand-closure-optimized search — span 1.8% in total types,
-/// and the random one is not the worst.
-///
-/// What that redundancy costs tracks the declaration surface, because that is
-/// what each instance re-materializes. `check_nodes` alone cannot see it —
-/// immich (437,226) and excalidraw (409,224) are 7% apart and want DIFFERENT
-/// checker counts. The ratio does see it (median of 5, this host):
-///
-///   immich      2.61 ratio   c2 1.611 s / 384 MB   c4 1.844 s / 520 MB
-///   excalidraw  1.78 ratio   c2 0.398 s / 112 MB   c4 0.308 s / 120 MB
-///   8 packages  1.00 ratio   c4 faster than c2 on every one
-///
-/// immich at four checkers is strictly dominated — slower AND 136 MB heavier
-/// than at two — so this is not a memory-for-time trade, it is a bad operating
-/// point. excalidraw, nearly the same size, still pays off at four.
-///
-/// Both conditions are deliberately narrow: small and mid-size programs are
-/// untouched, and a large program with an ordinary dependency surface keeps
-/// four. Diagnostics are unaffected — output is byte-identical for any checker
-/// count (the determinism tests), so this only moves the resource trade-off.
-///
-/// **Evidentiary limit, stated because this moves a shipped default:** the
-/// threshold separates exactly two applications. The axis is mechanistic
-/// rather than fitted, but the boundary (1.78 vs 2.61) rests on one inversion.
-/// A large program whose declaration surface is bulky but cheap to materialize
-/// would be misclassified and would lose wall. Re-validate against outline,
-/// social-app and vscode when those checkouts are restored.
-const declaration_heavy_ratio: u64 = 220; // hundredths, i.e. 2.20x
-
-/// Whether extra checker instances would RE-MATERIALIZE this program's
-/// declaration surface rather than split it — large, and carrying much more
-/// parsed surface than it walks. Integer-only, so the answer cannot drift
-/// with floating-point rounding across hosts.
-///
-/// Two independent decisions key on this, for the same reason: how many
-/// checkers to run, and whether an instance should size its type-store
-/// reserve from the whole program or from its own partition.
-pub fn declarationHeavy(check_nodes: u64, parsed_nodes: u64) bool {
-    return check_nodes >= large_program_nodes and
-        parsed_nodes * 100 >= check_nodes * declaration_heavy_ratio;
-}
-
-fn defaultCheckers(
-    explicit: ?usize,
-    cpu_count: usize,
-    check_nodes: u64,
-    parsed_nodes: u64,
-) usize {
-    if (explicit) |n| return n;
-    const wide = @min(4, cpu_count);
-    // Too little work to repay a second instance's fixed state.
-    if (check_nodes < small_program_nodes) return @min(wide, 2);
-    // Extra instances would duplicate the declaration work, not divide it.
-    if (declarationHeavy(check_nodes, parsed_nodes)) return @min(wide, 2);
-    return wide;
-}
-
-/// One checker instance: checks its partition on its own thread.
-const CheckerTask = struct {
-    arena: std.heap.ArenaAllocator,
-    thread: std.Thread = undefined,
-    owned: []const modules.FileId = &.{},
-    /// Shared frozen base type store, or null under
-    /// `--no-frozen-store`. Read-only; the same pointer is handed to every
-    /// task so all overlays share one base.
-    base: ?*const types.Store = null,
-    /// Enable the instantiation caching layer (`false` under
-    /// `--no-inst-cache`).
-    inst_cache: bool = true,
-    /// Node count to size this instance's type-store reserve from, or 0 to
-    /// size it from its own partition. Non-zero only for a program whose
-    /// declaration surface is not divisible (`declaration_heavy_ratio`),
-    /// where every instance interns roughly the whole program's types.
-    type_reserve_hint: usize = 0,
-    result: ?checker.Check = null,
-    err: ?anyerror = null,
-    ns: u64 = 0,
-
-    fn run(
-        t: *CheckerTask,
-        io: Io,
-        gpa: std.mem.Allocator,
-        interner: *Interner,
-        prog: *const modules.Program,
-    ) void {
-        const timer = Timer.start(io);
-        t.result = checker.checkFiles(t.arena.allocator(), io, gpa, interner, prog, t.owned, t.base, t.inst_cache, t.type_reserve_hint) catch |err| blk: {
-            t.err = err;
-            break :blk null;
-        };
-        t.ns = timer.readNs();
     }
 };
 
@@ -1386,157 +1219,46 @@ pub fn main(init: std.process.Init) !void {
     const file_owner = try arena.alloc(u32, n_files);
 
     // Cost-based partition, weighted by per-file AST node count
-    // (≈ check cost, known post-parse) — see the run split below for how
-    // the weights are spent. Built before the checker count is chosen,
-    // because the total is what chooses it.
-    const Item = struct { file: u32, cost: u64 };
-    var items: std.ArrayList(Item) = .empty;
-    try items.ensureTotalCapacity(arena, n_files);
-    @memset(file_owner, 0);
-    var check_nodes: u64 = 0;
-    // Every parsed node, enqueued or not. The part that is NOT enqueued is the
-    // declaration surface (`.d.ts` under skipLibCheck, the embedded lib under
-    // skipDefaultLibCheck): never walked, but materialized on demand — once
-    // per checker instance that reaches it. See `declaration_heavy_ratio`.
-    var parsed_nodes: u64 = 0;
+    // (≈ check cost, known post-parse) — see `schedule.partition` for how the
+    // weights are spent. Built before the checker count is chosen, because
+    // the total is what chooses it. Both per-file inputs are decided here
+    // because only main knows the effective options; the model itself is
+    // pure (schedule.zig).
+    const node_counts = try arena.alloc(u64, n_files);
+    const skipped = try arena.alloc(bool, n_files);
     for (0..n_files) |i| {
-        if (trees.items[i]) |tree| parsed_nodes += tree.nodes.len;
+        node_counts[i] = if (trees.items[i]) |tree| tree.nodes.len else 0;
         // Embedded lib files are parsed/bound/linked (globals, lazy type
         // expansion) and, by default, also enqueued to a checker so the
         // pre-verified lib is walked just like tsc/tsgo at their defaults.
         // `--skip-default-lib-check` (or tsconfig skipLibCheck/
         // skipDefaultLibCheck) drops them — pure time savings, since lib
         // diagnostics are never surfaced (tsc's skipDefaultLibCheck).
-        if (skip_default_lib_check and libs.isLibPath(paths.items[i])) continue;
+        //
         // skipLibCheck: a non-lib `.d.ts` produces no surfaced check
         // diagnostics, and its types are resolved lazily on demand from
         // `.ts` files (not by walking it), so its check pass is dead work —
         // don't enqueue it. Pure time savings, deterministic (path-based).
-        if (skip_all_dts_check and ztsc.paths.isDeclarationPath(paths.items[i])) continue;
-        const cost: u64 = if (trees.items[i]) |tree| tree.nodes.len else 0;
-        check_nodes += cost;
-        items.appendAssumeCapacity(.{ .file = @intCast(i), .cost = cost });
+        skipped[i] = (skip_default_lib_check and libs.isLibPath(paths.items[i])) or
+            (skip_all_dts_check and ztsc.paths.isDeclarationPath(paths.items[i]));
     }
+    const check_work = try schedule.costModel(arena, node_counts, skipped);
 
-    const n_checkers: usize = @max(1, @min(defaultCheckers(cli.checkers, cpu_count, check_nodes, parsed_nodes), n_files));
-    const tasks = try arena.alloc(CheckerTask, n_checkers);
+    const n_checkers: usize = @max(1, @min(schedule.defaultCheckers(cli.checkers, cpu_count, check_work.check_nodes, check_work.parsed_nodes), n_files));
+    const tasks = try arena.alloc(schedule.CheckerTask, n_checkers);
     {
-        const owned_lists = try arena.alloc(std.ArrayList(modules.FileId), n_checkers);
-        for (owned_lists) |*l| l.* = .empty;
-        // Locality-aware, balanced partition. File ids are BFS positions in
-        // the import graph (see the renumbering above), so a contiguous id
-        // range is import-adjacent and its dependency closures largely
-        // overlap: checking that range on one checker materializes each
-        // foreign type once instead of once per checker that reaches it.
-        //
-        // Pure contiguity (one range per checker) wins the locality but
-        // loses the wall clock — node count mispredicts check time region by
-        // region, so one checker straggles. Cutting the order into two
-        // equal-node-weight runs per checker and dealing the runs
-        // longest-first onto the least-loaded checker (LPT) keeps most of the
-        // locality and pairs an expensive region with a cheap one. Measured
-        // on a 6.1k-file project at --checkers=4: check 265 -> 242 ms, peak
-        // RSS 226 -> 218 MB. k = 1 leaves a straggler; k >= 3 fragments the
-        // locality without buying the balance back, and both measured slower
-        // than k = 2, as did a boustrophedon deal, a DFS (subtree-contiguous)
-        // order, and re-weighting `.d.ts` nodes.
-        //
-        // Deterministic: the order is the file ids, the weights are fixed
-        // post-parse, and every tie breaks by run start / checker index, so
-        // any --checkers=N still yields byte-identical diagnostics.
-        const Run = struct { start: usize, end: usize, cost: u64 };
-        var runs: std.ArrayList(Run) = .empty;
-        {
-            var total_cost: u64 = 0;
-            for (items.items) |it| total_cost += it.cost;
-            const n_runs = n_checkers * 2;
-            var acc: u64 = 0;
-            var run_base: u64 = 0;
-            var start: usize = 0;
-            var r: usize = 0;
-            for (items.items, 0..) |it, idx| {
-                acc += it.cost;
-                // Cumulative target, so rounding never drifts across cuts.
-                if (acc >= total_cost * (r + 1) / n_runs and r + 1 < n_runs) {
-                    try runs.append(arena, .{ .start = start, .end = idx + 1, .cost = acc - run_base });
-                    run_base = acc;
-                    start = idx + 1;
-                    r += 1;
-                }
-            }
-            if (start < items.items.len)
-                try runs.append(arena, .{ .start = start, .end = items.items.len, .cost = acc - run_base });
-        }
-        std.mem.sort(Run, runs.items, {}, struct {
-            fn lessThan(_: void, x: Run, y: Run) bool {
-                if (x.cost != y.cost) return x.cost > y.cost; // biggest first
-                return x.start < y.start; // deterministic tie-break
-            }
-        }.lessThan);
-
-        const loads = try arena.alloc(u64, n_checkers);
-        @memset(loads, 0);
-        for (runs.items) |run| {
-            // Least-loaded checker; ties resolve to the lowest index.
-            var best: usize = 0;
-            for (loads[1..], 1..) |l, k| {
-                if (l < loads[best]) best = k;
-            }
-            // Inside a run, walk biggest-first (the cost-partition order). Only the
-            // run permutes, so every other run's [start,end) is untouched and
-            // `run.cost` — an order-independent sum — still holds. Walk order
-            // does not move ownership, but it does move peak RSS: leading with
-            // the big files keeps their scratch peaks off the tail of a grown
-            // arena, worth ~20 MB at --checkers=1 on a 6.1k-file project.
-            const slice = items.items[run.start..run.end];
-            std.mem.sort(Item, slice, {}, struct {
-                fn lessThan(_: void, x: Item, y: Item) bool {
-                    if (x.cost != y.cost) return x.cost > y.cost; // biggest first
-                    return x.file < y.file; // deterministic tie-break
-                }
-            }.lessThan);
-            for (slice) |it| {
-                try owned_lists[best].append(arena, it.file);
-                file_owner[it.file] = @intCast(best);
-            }
-            loads[best] += run.cost;
-        }
-
-        // BENCHMARK AID (`--partition-file=<path>`): replace the partition
-        // above with an externally computed one — one `<file-id> <checker>`
-        // pair per line, file ids as `--dup-profile` prints them. It exists
-        // so a candidate partition can be MEASURED (total instantiate visits,
-        // peak RSS) instead of modelled; see the cross-checker duplication
-        // section of `src/checker/prof.zig`. Files the file does not mention
-        // keep the partition's own assignment. Within a checker the walk stays
-        // biggest-first, as above.
-        if (cli.partition_file) |pf| {
-            const text = Io.Dir.cwd().readFileAlloc(io, pf, arena, .limited(64 << 20)) catch |e| {
+        // BENCHMARK AID (`--partition-file=<path>`): the partition can be
+        // replaced with an externally computed one — one `<file-id> <checker>`
+        // pair per line. Reading it is main's job; interpreting it is
+        // `schedule.partition`'s.
+        const partition_text: ?[]const u8 = if (cli.partition_file) |pf|
+            Io.Dir.cwd().readFileAlloc(io, pf, arena, .limited(64 << 20)) catch |e| {
                 std.debug.print("ztsc: cannot read --partition-file '{s}': {s}\n", .{ pf, @errorName(e) });
                 std.process.exit(1);
-            };
-            for (owned_lists) |*l| l.* = .empty;
-            var lines = std.mem.tokenizeAny(u8, text, "\r\n");
-            while (lines.next()) |line| {
-                var it = std.mem.tokenizeScalar(u8, line, ' ');
-                const fid_s = it.next() orelse continue;
-                const ck_s = it.next() orelse continue;
-                const fid = std.fmt.parseInt(u32, fid_s, 10) catch continue;
-                const ck = std.fmt.parseInt(u32, ck_s, 10) catch continue;
-                if (fid >= n_files) continue;
-                file_owner[fid] = @intCast(ck % n_checkers);
             }
-            const cost_by_file = try arena.alloc(u64, n_files);
-            @memset(cost_by_file, 0);
-            for (items.items) |it| cost_by_file[it.file] = it.cost;
-            for (items.items) |it| try owned_lists[file_owner[it.file]].append(arena, it.file);
-            for (owned_lists) |*l| std.mem.sort(modules.FileId, l.items, cost_by_file, struct {
-                fn lessThan(cost: []const u64, x: modules.FileId, y: modules.FileId) bool {
-                    if (cost[x] != cost[y]) return cost[x] > cost[y];
-                    return x < y;
-                }
-            }.lessThan);
-        }
+        else
+            null;
+        const owned = try schedule.partition(arena, check_work.items, n_checkers, file_owner, partition_text);
 
         // Shared frozen base type store (frozen-base piece 2): built
         // once, single-threaded here before any checker spawns, then handed to
@@ -1551,15 +1273,15 @@ pub fn main(init: std.process.Init) !void {
         for (tasks, 0..) |*t, k| {
             t.* = .{
                 .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
-                .owned = owned_lists[k].items,
+                .owned = owned[k],
                 .base = base_store,
                 .inst_cache = !cli.no_inst_cache,
                 // Only when the surface is not divisible. On a program whose
                 // work DOES partition (the `multi` corpus, ratio 1.00), the
                 // whole-program estimate over-reserves ~4x and costs peak RSS
                 // for nothing: 41.2 -> 45.0 MiB measured.
-                .type_reserve_hint = if (declarationHeavy(check_nodes, parsed_nodes))
-                    @intCast(parsed_nodes)
+                .type_reserve_hint = if (schedule.declarationHeavy(check_work.check_nodes, check_work.parsed_nodes))
+                    @intCast(check_work.parsed_nodes)
                 else
                     0,
             };
@@ -1569,7 +1291,7 @@ pub fn main(init: std.process.Init) !void {
         tasks[0].run(io, gpa, &interner, prog);
     } else {
         for (tasks) |*t| {
-            t.thread = try std.Thread.spawn(.{}, CheckerTask.run, .{ t, io, gpa, &interner, prog });
+            t.thread = try std.Thread.spawn(.{}, schedule.CheckerTask.run, .{ t, io, gpa, &interner, prog });
         }
         for (tasks) |*t| t.thread.join();
     }
@@ -1895,7 +1617,7 @@ pub fn main(init: std.process.Init) !void {
             .lines = total_lines,
             .bytes = total_bytes,
             .repeat = cli.repeat,
-            .check_nodes = check_nodes,
+            .check_nodes = check_work.check_nodes,
         }, checker_times, .{
             .probes = resolve.fsProbeCount(),
             .lookups = rcache.lookups,
@@ -2267,39 +1989,6 @@ test "parseArgs flags and paths" {
     try std.testing.expectEqual(@as(usize, 2), cli.paths.len);
     try std.testing.expectEqualStrings("a.ts", cli.paths[0]);
     try std.testing.expectEqualStrings("b.ts", cli.paths[1]);
-}
-
-test "defaultCheckers: size and declaration-surface thresholds" {
-    const eq = std.testing.expectEqual;
-    // An explicit --checkers=N always wins, whatever the shape.
-    try eq(@as(usize, 7), defaultCheckers(7, 10, 1, 1));
-    try eq(@as(usize, 1), defaultCheckers(1, 10, 5_000_000, 20_000_000));
-    // Never more instances than cores.
-    try eq(@as(usize, 2), defaultCheckers(null, 2, 100_000, 100_000));
-
-    // Small program: two, whatever the surface (chalk, ajv).
-    try eq(@as(usize, 2), defaultCheckers(null, 10, 21_106, 21_106));
-    try eq(@as(usize, 2), defaultCheckers(null, 10, 27_991, 27_991));
-    // Mid-size, self-contained: four. The eight parity packages are all
-    // ratio 1.00 because a vendored `.d.ts` corpus is checked directly.
-    try eq(@as(usize, 4), defaultCheckers(null, 10, 37_004, 37_004)); // typebox
-    try eq(@as(usize, 4), defaultCheckers(null, 10, 66_444, 66_444)); // drizzle
-    try eq(@as(usize, 4), defaultCheckers(null, 10, 115_808, 115_808)); // hono
-
-    // The measured inversion, and the reason `check_nodes` alone cannot
-    // decide it: these two differ by 7% in check work and want different
-    // counts. immich 2.61x declaration surface -> two; excalidraw 1.78x -> four.
-    try eq(@as(usize, 2), defaultCheckers(null, 10, 437_226, 1_141_165));
-    try eq(@as(usize, 4), defaultCheckers(null, 10, 409_224, 727_326));
-
-    // Large but self-contained stays wide; declaration-heavy but small stays
-    // out of the new rule (the size gate is what keeps it narrow).
-    try eq(@as(usize, 4), defaultCheckers(null, 10, 900_000, 900_000));
-    try eq(@as(usize, 4), defaultCheckers(null, 10, 100_000, 900_000));
-
-    // Exactly at each boundary: the ratio test is `>=`, the size test `>=`.
-    try eq(@as(usize, 2), defaultCheckers(null, 10, large_program_nodes, large_program_nodes * 22 / 10));
-    try eq(@as(usize, 4), defaultCheckers(null, 10, large_program_nodes - 1, large_program_nodes * 22 / 10));
 }
 
 test "parseArgs workers, checkers and repeat" {

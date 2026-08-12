@@ -24,6 +24,8 @@ pub const paths = @import("link/paths.zig");
 pub const resolve = @import("link/resolve.zig");
 pub const modules = @import("link/modules.zig");
 pub const checker = @import("checker.zig");
+pub const driver = @import("driver.zig");
+pub const schedule = @import("schedule.zig");
 pub const tsconfig = @import("tsconfig.zig");
 pub const jsonc = @import("jsonc.zig");
 pub const glob = @import("glob.zig");
@@ -49,6 +51,8 @@ test {
     _ = resolve;
     _ = modules;
     _ = checker;
+    _ = driver;
+    _ = schedule;
     _ = tsconfig;
     _ = jsonc;
     _ = glob;
