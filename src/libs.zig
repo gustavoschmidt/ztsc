@@ -254,7 +254,7 @@ fn elapsedNs(from: Io.Clock.Timestamp, to: Io.Clock.Timestamp) u64 {
 /// Intern every atom the lib front end produces, discarding the parse/bind
 /// products. Identical interner side effects to `frontEndLibs` (what the CLI
 /// runs); for callers that only need the atoms.
-pub fn seedLibAtoms(io: Io, gpa: Allocator, interner: *Interner, set: LibSet) !void {
+fn seedLibAtoms(io: Io, gpa: Allocator, interner: *Interner, set: LibSet) !void {
     var seed_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer seed_arena.deinit();
     var fe = try frontEndLibs(seed_arena.allocator(), io, gpa, interner, set, 1);
@@ -294,14 +294,14 @@ pub const LibFile = struct { path: []const u8, source: []const u8 };
 // linker merges their globals cross-file exactly as if they were one file —
 // which is in fact how tsc itself sees the lib (one SourceFile per lib.*.d.ts).
 // KEEP THESE COUNTS IN SYNC WITH src/lib/gen_lib.js (ES_SHARDS / DOM_SHARDS).
-pub const es_shard_count = 4;
-pub const dom_shard_count = 8;
+const es_shard_count = 4;
+const dom_shard_count = 8;
 
 /// Synthetic paths of the injected ES-core lib shards (sharded later for the parallel front-end).
 /// They have no on-disk location; the loaders special-case these exact paths and
 /// use the matching embedded source. The leading NUL keeps them from colliding
 /// with any real filesystem path.
-pub const lib_paths = [es_shard_count][]const u8{
+const lib_paths = [es_shard_count][]const u8{
     "\x00lib/lib.esnext.0.d.ts", "\x00lib/lib.esnext.1.d.ts",
     "\x00lib/lib.esnext.2.d.ts", "\x00lib/lib.esnext.3.d.ts",
 };
@@ -309,7 +309,7 @@ pub const lib_paths = [es_shard_count][]const u8{
 /// surface, DOM excluded). Bound once per run; their top-level declarations
 /// become the program's global symbols. Their own diagnostics are suppressed
 /// (like tsc's default lib) — see the print loop in main.zig.
-pub const lib_sources = [es_shard_count][]const u8{
+const lib_sources = [es_shard_count][]const u8{
     @embedFile("lib/lib.esnext.0.d.ts"), @embedFile("lib/lib.esnext.1.d.ts"),
     @embedFile("lib/lib.esnext.2.d.ts"), @embedFile("lib/lib.esnext.3.d.ts"),
 };
@@ -317,7 +317,7 @@ pub const lib_sources = [es_shard_count][]const u8{
 /// Synthetic paths of the injected DOM lib shards. Loaded when tsconfig
 /// `lib` selects "dom" (or by default — tsgo's target-esnext default includes
 /// DOM). Provide browser globals plus the real `console`.
-pub const dom_lib_paths = [dom_shard_count][]const u8{
+const dom_lib_paths = [dom_shard_count][]const u8{
     "\x00lib/lib.dom.0.d.ts", "\x00lib/lib.dom.1.d.ts",
     "\x00lib/lib.dom.2.d.ts", "\x00lib/lib.dom.3.d.ts",
     "\x00lib/lib.dom.4.d.ts", "\x00lib/lib.dom.5.d.ts",
@@ -325,23 +325,19 @@ pub const dom_lib_paths = [dom_shard_count][]const u8{
 };
 /// The embedded DOM lib shard texts (browser globals + `Console`; es* deps
 /// omitted, supplied by the esnext blob it always loads alongside).
-pub const dom_lib_sources = [dom_shard_count][]const u8{
+const dom_lib_sources = [dom_shard_count][]const u8{
     @embedFile("lib/lib.dom.0.d.ts"), @embedFile("lib/lib.dom.1.d.ts"),
     @embedFile("lib/lib.dom.2.d.ts"), @embedFile("lib/lib.dom.3.d.ts"),
     @embedFile("lib/lib.dom.4.d.ts"), @embedFile("lib/lib.dom.5.d.ts"),
     @embedFile("lib/lib.dom.6.d.ts"), @embedFile("lib/lib.dom.7.d.ts"),
 };
 
-/// FileId of the first ES-core lib shard, matched by path (or `no_file`). The
-/// esnext shards are always injected as a contiguous block starting here.
-pub const lib_path = lib_paths[0];
-
 /// Synthetic path of the minimal `console` shim. Loaded ONLY when esnext
 /// is selected without dom (backend configs, lib:["esnext"]): `console` lives
 /// in lib.dom, so without DOM there is no `console`. DOM configs use lib.dom's
 /// richer `Console` and skip this (no duplicate `var console`).
-pub const console_shim_path = "\x00lib/lib.console.d.ts";
-pub const console_shim_source = @embedFile("lib/lib.console.d.ts");
+const console_shim_path = "\x00lib/lib.console.d.ts";
+const console_shim_source = @embedFile("lib/lib.console.d.ts");
 
 /// Upper bound on injected lib files: every es shard + every dom shard + the
 /// console shim. Sizes the fixed-capacity `LibFile` buffers callers pass in.
