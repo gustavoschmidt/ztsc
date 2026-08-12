@@ -12,24 +12,13 @@ const std = @import("std");
 const Io = std.Io;
 const source = @import("../frontend/source.zig");
 
-pub const Span = source.Span;
+const Span = source.Span;
 
 const reset = "\x1b[0m";
 const red = "\x1b[31m";
 const cyan = "\x1b[36m";
 const yellow = "\x1b[33m";
 const grey = "\x1b[90m";
-
-fn lineOfOffset(line_starts: []const u32, offset: u32) u32 {
-    std.debug.assert(line_starts.len > 0);
-    var lo: usize = 0;
-    var hi: usize = line_starts.len;
-    while (hi - lo > 1) {
-        const mid = lo + (hi - lo) / 2;
-        if (line_starts[mid] <= offset) lo = mid else hi = mid;
-    }
-    return @intCast(lo);
-}
 
 /// Render one diagnostic tsc-style. `ts_code` 0 means "no tsc code"
 /// (scanner/parser diagnostics): the header shows plain `error:`.
@@ -44,7 +33,7 @@ pub fn renderPretty(
     msg: []const u8,
 ) Io.Writer.Error!void {
     const start: u32 = @min(span.start, @as(u32, @intCast(src.len)));
-    const line = lineOfOffset(line_starts, start);
+    const line = source.lineOfOffset(line_starts, start);
     const line_start = line_starts[line];
     var line_end: u32 = if (line + 1 < line_starts.len)
         line_starts[line + 1] - 1 // strip the '\n'
