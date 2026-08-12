@@ -4651,6 +4651,11 @@ pub fn signatureAssignableModeInnerErase(c: *Checker, s: TypeId, t: TypeId, mode
     while (i < pairs) : (i += 1) {
         if (rest_pair) |r| {
             if (i == r) {
+                // A TARGET that packs to a bare `any[]` here imposes nothing:
+                // see `anyRestFrom`. The packed comparison below would reject
+                // it, because `any[]` is not assignable to a tuple with a
+                // required element.
+                if (try anyRestFrom(c, te, i)) continue;
                 const st = try c.restTupleAtPosition(se, i);
                 const tt = try c.restTupleAtPosition(te, i);
                 if (try c.isAssignable(tt, st)) continue;
@@ -5022,6 +5027,66 @@ pub fn paramTotal(c: *Checker, sig: TypeId) Error!u32 {
         return count - 1 + len;
     }
     return std.math.maxInt(u32);
+}
+
+/// Is everything `sig` accepts from position `pos` onward an UNBOUNDED rest
+/// parameter whose element type is `any`? — `(...args: any[])` at position 0,
+/// `(first: T, ...args: any[])` at position 1, `(...args: any)` (tsc's
+/// `getEffectiveRestType` turns a bare `any` rest into `any[]`), and the
+/// variadic tail of `(...args: [any, ...any[]])`.
+///
+/// It answers the one asymmetry in tsc's whole-list rest comparison. Where
+/// either side's rest is not a single tuple, `compareSignaturesRelated` packs
+/// both parameter lists into a tuple at that position
+/// (`getRestTypeAtPosition`) and relates them contravariantly — and a packed
+/// tuple with a required element is not something `any[]` satisfies:
+/// `any[]` -> `[event: string, string]` is rejected as a plain assignment, by
+/// tsgo and by ztsc alike. tsc nevertheless accepts every signature pair whose
+/// TARGET packs to a bare `any[]` there, which is what makes
+///
+///     declare const q: (event: string, ...args: [number] | [string]) => void;
+///     declare let p: (...args: any[]) => any;
+///     p = q;
+///
+/// legal. Measured against the pinned oracle (tsgo 7.0.2) — see
+/// `test/conformance/assignability/rest_union_packed_against_any_rest.ts`,
+/// which pins every boundary below:
+///
+///   * ACCEPTED for a target rest of `any[]`, `readonly any[]`, `Array<any>`,
+///     `any`, `[...any[]]`, `[any, ...any[]]`, with or without a leading fixed
+///     target parameter, and whatever the target's return type is (so this is
+///     not tsc's `isAnySignature`, which also demands one parameter, no type
+///     parameters and an `any` return — a target of
+///     `<T>(...args: any[]) => number` is accepted on its parameters and
+///     rejected on its return alone).
+///   * REJECTED, with the packed tuple named, for `unknown[]`, `number[]`,
+///     `(string | number)[]`, `[unknown, ...unknown[]]` — `any` is the whole
+///     rule, not "array of something wide".
+///   * REJECTED when the position being packed is NOT the target's own rest
+///     position, because the packed target is then a tuple with a fixed head
+///     (`[a: string, ...any[]]`) rather than a bare `any[]`, and tsc compares
+///     it in full.
+///   * a FIXED tuple rest (`(...args: [any])`) is excluded: it has a
+///     positional expansion, so tsc packs `[any]` and rejects a source that
+///     needs two elements ("Source has 1 element(s) but target requires 2").
+fn anyRestFrom(c: *Checker, sig: TypeId, pos: u32) Error!bool {
+    const count = c.ts.fnParamCount(sig);
+    if (count == 0) return false;
+    const last = c.ts.fnParam(sig, count - 1);
+    if (!last.rest()) return false;
+    // Unbounded: a rest typed by a fully fixed tuple expands positionally.
+    if ((try c.paramTotal(sig)) != std.math.maxInt(u32)) return false;
+    // `pos` has to be the rest's own position, not one before it.
+    if (pos + 1 != try c.effParamCount(sig)) return false;
+    // `elemOfArrayish` answers `any` for anything it does not recognize — a
+    // bare type-parameter rest (`...args: A`) among them — so the rest's own
+    // shape is checked first, and only then its element type.
+    switch (c.ts.kind(try c.resolveStructural(last.ty))) {
+        .any => return true,
+        .array, .tuple => {},
+        else => return false,
+    }
+    return (try c.paramTypeAt(sig, pos)) == types.any_type;
 }
 
 /// Number of effective parameter *positions* — `paramTotal` without the
