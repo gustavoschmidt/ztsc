@@ -1,10 +1,13 @@
 //! The program: module graph, cross-file symbol linking, global merge.
 //!
-//! This is the project-wide data contract — `FileId`, `Program`, `ProgFile`,
-//! `Target` — plus the two ways a program is built (the parallel driver in
+//! This is where a program is BUILT: the two ways in (the parallel driver in
 //! main.zig calls `link` directly; `buildProgram` is the serial wavefront the
-//! tests and tools use). Specifier resolution lives in resolve.zig, the
-//! embedded libs in libs.zig, and the lexical path helpers in paths.zig.
+//! tests and tools use) and the linker underneath them. The data contract they
+//! fill in — `FileId`, `Program`, `ProgFile`, `Target` — is program.zig, and
+//! re-exported here, so `modules.Program` still names it. Specifier resolution
+//! lives in resolve.zig, `package.json` reading in package_json.zig,
+//! triple-slash directives in references.zig, the embedded libs in libs.zig,
+//! and the lexical path helpers in paths.zig.
 //!
 //! Design decisions:
 //!

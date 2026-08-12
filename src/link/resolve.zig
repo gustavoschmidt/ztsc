@@ -41,6 +41,13 @@
 //! never runs concurrently): `ResolveCache` memoizes whole
 //! `(importer_dir, spec)` answers, and the `FsCache` under it memoizes the
 //! filesystem facts a first-time specifier still pays for.
+//!
+//! Every private function here takes one `Fs` — where to look, how to ask,
+//! what to remember, and the run's `ResolveOpts` — so the cached and uncached
+//! legs differ in exactly one place (the `Fs` methods) rather than at every
+//! call site. Two neighbours carry the parts that are not filesystem work at
+//! all: package_json.zig reads a `package.json` body, references.zig scans and
+//! resolves triple-slash directives.
 
 const std = @import("std");
 const builtin = @import("builtin");
