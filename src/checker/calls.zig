@@ -416,6 +416,10 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, chained: *bool,
             for (tps.items, 0..) |tp, i| tp_syms[i] = tp.sym;
             const inst_args = try c.scratch().alloc(TypeId, tps.items.len);
             if (targs.items.len > 0) {
+                // `new G<Bad>(…)`'s list belongs to the CLASS, so it is gated
+                // on the class's own type-parameter constraints — the same
+                // written-list question as `G<Bad>` in a type position.
+                try c.queueTypeArgConstraints(node, cls, targs.items);
                 const fixed = try c.fixTypeArgs(cls, targs.items, c.tree.nodeMainToken(node)) orelse return types.error_type;
                 @memcpy(inst_args, fixed);
             } else if (tps.items.len > 0) {
@@ -680,6 +684,17 @@ pub fn checkThisArg(c: *Checker, node: Node, sig: TypeId) Error!void {
     }
 }
 
+/// Whether `node` is a call/`new` that WROTE a type-argument list — i.e. one
+/// whose type arguments `writtenTypeArgNodes` can read back at the TS2344
+/// drain. `resolveSignatureCall` also serves synthesized call sites (`super(…)`,
+/// tagged templates, decorators) whose nodes carry no list of their own.
+fn writesTypeArgs(c: *const Checker, node: Node) bool {
+    return switch (c.nodeTag(node)) {
+        .call_expr_targs, .new_expr_targs, .optional_call => true,
+        else => false,
+    };
+}
+
 pub fn countArgs(arg_nodes: []const Node) usize {
     var n: usize = 0;
     for (arg_nodes) |a| {
@@ -703,6 +718,15 @@ pub fn resolveSignatureCall(
     if (sigs.len == 0) return types.any_type;
     const nargs = countArgs(arg_nodes);
     if (sigs.len == 1) {
+        // An explicit list on a call is one of the four sites tsc gates on the
+        // type parameters' constraints (TS2344 — see
+        // `checkSigTypeArgConstraints`). Only for a LONE candidate: with an
+        // overload set tsc's failure is TS2769 about the whole set, and a
+        // per-candidate constraint verdict there would be a diagnostic about
+        // the candidate ztsc happened to look at.
+        if (explicit_targs.len > 0 and writesTypeArgs(c, node)) {
+            try c.queueSigTypeArgConstraints(node, sigs[0], explicit_targs);
+        }
         const inst = try c.instantiateSigForCall(sigs[0], explicit_targs, arg_nodes, node, ret_ctx);
         if (instance_ret == types.no_type) try c.checkThisArg(node, inst);
         try c.checkCallArguments(node, inst, arg_nodes, true);
@@ -2217,9 +2241,29 @@ pub fn inferTypeArgs(
     // ALIASES `candidates` in the uncontextual case, so it cannot be
     // consulted again once argument inference starts writing candidates.
     const seeded = try c.scratch().alloc(bool, tp_syms.len);
+    // A callback argument's contextual type must carry the CONSTRAINT CLAMP the
+    // final answer carries. tsc reaches every inference variable in a
+    // contextual type through `getInferredType`, whose last act is "if the
+    // inferred type does not satisfy the constraint, use the constraint
+    // instead" — so the callback is handed the clamped type, and its body is
+    // checked against THAT. ztsc applied the clamp only at the end, after
+    // Phase 2 had already published the callback body's memos under the
+    // violating inference, and those memos are what the authoritative check
+    // reads back (see the note on the walk below): outline's
+    // `everyActiveModel(context, Document, (d) => d.isStarred)` typed `d` as
+    // `Document` and lost the whole `Property 'x' does not exist on type
+    // 'Model'` family that tsc reports once `T` clamps to `Model`.
+    //
+    // Only where Phase 2 has something to feed, and only against a constraint
+    // this call has fully resolved — see `clampSeedToConstraint`.
+    const clamp_seed = anyFunctionArg(c, arg_nodes);
     for (tp_syms, 0..) |tp, i| {
         seeded[i] = seed[i] != types.no_type;
-        partial[i] = .{ .sym = tp, .ty = if (seeded[i]) seed[i] else types.any_type };
+        var ty: TypeId = if (seeded[i]) seed[i] else types.any_type;
+        if (clamp_seed and seeded[i]) {
+            ty = try clampSeedToConstraint(c, tp, tp_syms, partial[0..i], ty);
+        }
+        partial[i] = .{ .sym = tp, .ty = ty };
     }
     // Placeholder-echo candidates, demoted to a fallback (see below).
     const echo_any = try c.scratch().alloc(TypeId, tp_syms.len);
@@ -2703,6 +2747,52 @@ pub fn echoesInferVar(c: *Checker, t: TypeId, tp_syms: []const u32) Error!bool {
         if (tpIndex(tp_syms, sym) != null) return true;
     }
     return false;
+}
+
+/// Whether any argument is a function EXPRESSION — the only thing Phase 2 of
+/// `inferTypeArgs` contextually types, and so the only reason to pay for the
+/// seed's constraint clamp.
+fn anyFunctionArg(c: *const Checker, arg_nodes: []const Node) bool {
+    for (arg_nodes) |an| {
+        if (an == null_node) continue;
+        switch (c.nodeTag(an)) {
+            .arrow_fn, .function_expr => return true,
+            else => {},
+        }
+    }
+    return false;
+}
+/// The constraint clamp, applied to a Phase-2 SEED rather than to the final
+/// answer (see the call site). `sofar` is the partial map built for the
+/// parameters before this one, so an inter-dependent constraint
+/// (`K extends keyof T`) is judged with `T` already substituted — the same
+/// ordering the final loop uses.
+///
+/// Deliberately narrower than the final clamp, because this one decides what a
+/// callback body is CHECKED against and a wrong answer here publishes wrong
+/// diagnostics rather than merely losing an inference:
+///
+///   * `any` / `unknown` constraints admit everything, so there is nothing to
+///     clamp to,
+///   * a constraint still mentioning a free type parameter is one this call has
+///     not resolved (a later sibling, or the receiver's own parameter — see the
+///     `bare_outer` note at the final clamp): `isAssignable` against it always
+///     fails, and clamping would erase a legitimate inference,
+///   * and an argument that already satisfies its constraint is untouched,
+///     which is the overwhelming majority.
+fn clampSeedToConstraint(c: *Checker, tp: u32, tp_syms: []const u32, sofar: []const TpMap, cand: TypeId) Error!TypeId {
+    _ = tp_syms;
+    var con = try c.typeParamConstraint(tp);
+    if (con == types.no_type) return cand;
+    if (sofar.len != 0) con = try c.instantiate(con, sofar);
+    switch (c.ts.kind(con)) {
+        .any, .unknown, .err => return cand,
+        else => {},
+    }
+    if (try c.containsFreeTypeParam(con, &.{})) return cand;
+    if (try c.isAssignable(cand, con)) return cand;
+    var fell_back = false;
+    return c.clampToConstraint(cand, con, &fell_back);
 }
 
 /// A candidate that violates its param's constraint is normally clamped to
@@ -5142,6 +5232,20 @@ pub fn checkCallArgumentsAnchored(c: *Checker, node: Node, sig: TypeId, arg_node
             if (!try c.elaborateCallbackError(an, at, pt) and
                 !try c.elaborateLiteralError(an, at, pt))
             {
+                // NOT refined to tsc's TS2741/2739/2740 missing-property
+                // headline, which tsc does apply in argument position too
+                // (verified against the oracle for one, two and six missing
+                // properties). `tryReportMissingProps` decides that from the
+                // pair alone, while tsc only reaches the unmatched-property
+                // branch when the relation got as far as comparing properties;
+                // a pair that failed EARLIER keeps the TS2345 head.
+                // assignability/094 (`Opt<T>`'s base type argument) and
+                // narrowing/085 (a `T & string` source) are both that shape, and
+                // both flip to a wrong code when the refinement is applied here.
+                // Outline pays two keys for it (shares.tsx:72,
+                // templates.tsx:270 — right position, TS2345 where tsgo says
+                // TS2740); the refinement belongs where the relation knows why
+                // it failed, i.e. next to `reportNotAssignable`'s 2322 arm.
                 try c.reportNotAssignable(2345, at, pt, argErrorSpan(c, an));
             }
             noteArgBlame(c, anchor_out, before, c.nodeSpan(an), argErrorSpan(c, an));

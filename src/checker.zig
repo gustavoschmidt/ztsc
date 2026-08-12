@@ -600,7 +600,7 @@ pub const DeferredBody = struct {
 /// once every statement of every owned file has been checked, when every
 /// class table is complete.
 ///
-/// Six `u32`s and no per-entry allocation. The written argument *nodes* are
+/// Seven `u32`s and no per-entry allocation. The written argument *nodes* are
 /// not kept: they are a `SubRange` of the (immutable) tree, so the drain reads
 /// them back out of `node`. Their *types* are kept — re-converting them at the
 /// drain is not sound, because an argument may be written under a binder that
@@ -612,11 +612,17 @@ pub const PendingTypeArgs = struct {
     /// File the reference was written in — where its diagnostics belong, and
     /// whose tree `node` indexes.
     file: FileId,
-    /// The `type_ref` node. The drain re-reads its written argument nodes
-    /// (`writtenTypeArgNodes`) instead of the queue storing a copy.
+    /// The node that WROTE the list: a `type_ref`, a `heritage` clause, or a
+    /// call/`new` with type arguments. The drain re-reads its written argument
+    /// nodes (`writtenTypeArgNodes`) instead of the queue storing a copy.
     node: Node,
-    /// The generic the name resolved to.
+    /// The generic the name resolved to — `no_symbol` when `sig` carries the
+    /// type parameters instead.
     sym: SymbolId,
+    /// The SIGNATURE whose own type parameters the list supplies, for an
+    /// explicit list on a call (`no_type` for every other site, where `sym`'s
+    /// declared parameters are the ones being checked).
+    sig: TypeId = types.no_type,
     /// `this` in force at the reference, so a constraint mentioning `this`
     /// resolves at drain time exactly as it would have in place.
     this_type: TypeId,
@@ -3705,6 +3711,7 @@ pub const Checker = struct {
     pub const fixTypeArgs = typenode_zig.fixTypeArgs;
     pub const symHasConstrainedTypeParam = typenode_zig.symHasConstrainedTypeParam;
     pub const queueTypeArgConstraints = typenode_zig.queueTypeArgConstraints;
+    pub const queueSigTypeArgConstraints = typenode_zig.queueSigTypeArgConstraints;
     pub const drainTypeArgConstraints = typenode_zig.drainTypeArgConstraints;
     pub const checkTypeArgConstraints = typenode_zig.checkTypeArgConstraints;
     pub const undecidableType = typenode_zig.undecidableType;
@@ -3982,6 +3989,7 @@ pub const Checker = struct {
     pub const collectHomoIndex = generics_zig.collectHomoIndex;
     pub const collectMappedKeys = generics_zig.collectMappedKeys;
     pub const objectFromProps = generics_zig.objectFromProps;
+    pub const objectFromPropsFlags = generics_zig.objectFromPropsFlags;
     pub const remapKey = generics_zig.remapKey;
     pub const numberLiteralAtom = generics_zig.numberLiteralAtom;
     pub const reduceIndexedAccess = generics_zig.reduceIndexedAccess;

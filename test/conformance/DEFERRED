@@ -241,25 +241,6 @@ assignability/096_alternating_instantiation_spine.ts  -TS2322 48
 assignability/096_alternating_instantiation_spine.ts  -TS2416 60
 assignability/096_alternating_instantiation_spine.ts  -TS2322 64
 
-# WHERE a type argument is written decides whether ztsc checks its constraint.
-# The TS2344 gate is queued from `typeFromTypeNode` (`queueTypeArgConstraints`),
-# which sees a reference written in a TYPE position — line 39. Three other
-# written argument lists never reach the queue and so are never checked:
-# a class heritage clause (32, 42), an interface heritage clause (43) and an
-# explicit list on a call (48). tsc reports all four.
-#
-# This is the root of outline's twelve missing TS2344 keys (`Collection` /
-# `Document` against `Store<T extends Model>`, every one of them an `extends`
-# clause or an explicit call list). The relation fact itself is NOT missing —
-# line 39 proves ztsc decides it — so the fix is to reach the gate from the
-# heritage and call-argument paths, not anything about the relation. Left
-# deferred here because those paths are outside this change's ownership.
-# Measured 2026-08-12.
-assignability/097_written_type_argument_constraint_sites.ts  -TS2344 32
-assignability/097_written_type_argument_constraint_sites.ts  -TS2344 42
-assignability/097_written_type_argument_constraint_sites.ts  -TS2344 43
-assignability/097_written_type_argument_constraint_sites.ts  -TS2344 48
-
 # LEGACY (`experimentalDecorators`) decorator resolution, the parts ztsc does
 # not do. The call itself IS resolved now (`checkLegacyDecoratorSig`, and
 # 010_legacy_signature_failures pins every code, span and wording it produces —

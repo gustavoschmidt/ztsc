@@ -2894,8 +2894,19 @@ pub fn materializeMapped(c: *Checker, key_param: TypeId, constraint: TypeId, val
                     }
                 }
                 const empty = props.items.len == 0 and sindex == 0 and nindex == 0;
+                // A homomorphic map's key set is `keyof src`, so whether its
+                // index signatures ARE that key set is exactly whether the
+                // source's were (see `obj_flag_mapped_keys`): a map over
+                // `Record<string, V>` keeps the flag, a map over a written
+                // `{ [k: string]: V }` keeps the `string | number` widening.
+                const obj_flags: u32 = if ((sindex != 0 or nindex != 0) and
+                    s.kind(src) == .object and
+                    s.objectFlags(src) & types.obj_flag_mapped_keys != 0)
+                    types.obj_flag_mapped_keys
+                else
+                    0;
                 if (arrayish.items.len == 0) {
-                    const mapped = try c.objectFromProps(props.items, sindex, nindex);
+                    const mapped = try c.objectFromPropsFlags(props.items, sindex, nindex, obj_flags);
                     // An enum-keyed member is NAMED by the enum only in a side
                     // table (see `carryKeyNameTypes`), so a homomorphic map
                     // over such a source — `Partial<Record<E, V>>` — has to
@@ -2905,7 +2916,7 @@ pub fn materializeMapped(c: *Checker, key_param: TypeId, constraint: TypeId, val
                     if (as_clause == 0) try c.carryKeyNameTypes(mapped, &.{src});
                     return mapped;
                 }
-                if (!empty) try arrayish.append(c.scratch(), try c.objectFromProps(props.items, sindex, nindex));
+                if (!empty) try arrayish.append(c.scratch(), try c.objectFromPropsFlags(props.items, sindex, nindex, obj_flags));
                 return s.makeIntersection(c.scratch(), arrayish.items);
             },
             else => return types.empty_object_type,
@@ -3041,7 +3052,13 @@ pub fn materializeMapped(c: *Checker, key_param: TypeId, constraint: TypeId, val
         }
     }
     if (props.items.len == 0 and sindex == 0 and nindex == 0) return types.empty_object_type;
-    const obj = try s.makeObject(props.items, sindex, nindex, 0);
+    // The index signatures here came out of the map's own key set — a `string`
+    // or `number` member of the constraint — so `keyof` must report exactly
+    // that set (see `obj_flag_mapped_keys`).
+    const obj = try s.makeObject(props.items, sindex, nindex, if (sindex != 0 or nindex != 0)
+        types.obj_flag_mapped_keys
+    else
+        0);
     for (name_types.items) |nt| {
         try c.putKeyNameType(obj, nt.name, nt.ty);
     }
@@ -3261,6 +3278,11 @@ pub fn collectMappedKeys(c: *Checker, constraint0: TypeId, out: *std.ArrayList(T
 /// (0 = none) — a homomorphic mapped type over an index-signatured source
 /// must preserve those signatures, not just the named props.
 pub fn objectFromProps(c: *Checker, props: []const types.Prop, sindex: TypeId, nindex: TypeId) Error!TypeId {
+    return objectFromPropsFlags(c, props, sindex, nindex, 0);
+}
+
+/// `objectFromProps` with object flags to carry onto the result.
+pub fn objectFromPropsFlags(c: *Checker, props: []const types.Prop, sindex: TypeId, nindex: TypeId, obj_flags: u32) Error!TypeId {
     var index: std.AutoHashMapUnmanaged(Atom, u32) = .empty;
     defer index.deinit(c.scratch());
     var out: std.ArrayList(types.Prop) = .empty;
@@ -3273,7 +3295,7 @@ pub fn objectFromProps(c: *Checker, props: []const types.Prop, sindex: TypeId, n
             try out.append(c.scratch(), p);
         }
     }
-    return c.ts.makeObject(out.items, sindex, nindex, 0);
+    return c.ts.makeObject(out.items, sindex, nindex, obj_flags);
 }
 
 /// Resolve a mapped type's `as` remap for one src_type key. Returns the new
