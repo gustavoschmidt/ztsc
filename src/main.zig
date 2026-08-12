@@ -1,42 +1,17 @@
-//! ZTSC CLI driver: argument parsing, thread pool, phase orchestration.
+//! ZTSC CLI: argument parsing, tsconfig loading, and the phase orchestration
+//! around the two halves that do the work — `driver.build` (discovery,
+//! front end, renumbering, link) and the check phase it schedules with
+//! schedule.zig. What stays here is the process's own business: what the user
+//! asked for, what the config says, what gets printed, and the exit code.
 //!
-//! The built-in lib runs its own front end first (`libs.frontEndLibs`):
-//! the shards are parsed on a small thread budget and then bound
-//! single-threaded in fixed order, which is what pins the interner's atoms
-//! before any concurrent user-file work. Its output enters discovery as
-//! ready-made completions, so the lib is never queued to the pool.
-//!
-//! Atoms the *concurrent* front end hands out are pinned differently: they
-//! are reassigned once discovery is done, replaying each file's first-touch
-//! list in graph order so the ids are the ones a single-threaded front end
-//! would have produced (`Interner.renumber`, the renumbering block below).
-//! Atoms are sort keys — scope member tables, merged namespace members,
-//! object property records — so without it the checker's traversal order,
-//! and the work it did, moved with worker scheduling.
-//!
-//! Module discovery is single-owner with a completion queue: the main
-//! thread is the sole owner of
-//! the module graph and seen-set (no locks on graph state); workers run
-//! the whole per-file front end (load/parse/bind) and push per-file
-//! completion messages `(file, import specifiers)`; the main thread
-//! resolves each completion's module specifiers (bundler-style, see
-//! modules.zig) as it arrives and enqueues newly discovered files
-//! immediately — no wave barrier, so already-discovered work never waits
-//! on an unrelated slow file. After discovery, files are renumbered into
-//! a deterministic graph-derived order (BFS from the entry files,
-//! tie-break = specifier order within the importing file — the same order
-//! the old wavefront discovery produced). A serial `link` phase then
-//! builds sealed per-file import/export tables; the check phase
-//! partitions the program's files across N independent checker instances
-//! (`--checkers=N`; the default is min(4, cores), dropped to 2 when there
-//! is less than `small_program_nodes` of check work to spread), each with its own type
-//! store/caches, reading the shared immutable AST/binder/link data without
-//! locks.
+//! The CLI-overrides-tsconfig precedence rules are settled in ONE place
+//! (`effectiveOptions`) and handed to the driver as values; nothing below
+//! re-reads the config.
 //!
 //! Output determinism: the file order is derived from the graph, never
-//! from scheduling; every diagnostic is tagged with its file; each file's
-//! check diagnostics come from exactly the checker that owns it, and the
-//! final print is per file (in graph order), position-sorted —
+//! from scheduling (driver.zig); every diagnostic is tagged with its file;
+//! each file's check diagnostics come from exactly the checker that owns it,
+//! and the final print is per file (in graph order), position-sorted —
 //! byte-identical for any --workers/--checkers combination. `--timing`
 //! reports the per-phase split (`config` is tsconfig loading and its
 //! `include` walk; load/parse/bind are summed per-file worker times,
@@ -50,15 +25,15 @@ const Io = std.Io;
 const ztsc = @import("ztsc");
 const Source = ztsc.source.Source;
 const Interner = ztsc.intern.Interner;
-const parser = ztsc.parser;
-const binder = ztsc.binder;
 const checker = ztsc.checker;
 const libs = ztsc.libs;
 const modules = ztsc.modules;
 const resolve = ztsc.resolve;
 const types = ztsc.types;
-const Ast = ztsc.ast.Ast;
-const Bind = binder.Bind;
+const driver = ztsc.driver;
+const schedule = ztsc.schedule;
+const Timer = driver.Timer;
+const FileOrder = driver.FileOrder;
 
 const usage =
     \\usage: ztsc [options] [files...]
@@ -136,34 +111,6 @@ const usage =
     \\config, or file-system errors.
     \\
 ;
-
-/// Minimal monotonic wall-clock timer over std.Io's clock API.
-const Timer = struct {
-    io: Io,
-    start_ts: Io.Clock.Timestamp,
-
-    fn start(io: Io) Timer {
-        return .{ .io = io, .start_ts = .now(io, .awake) };
-    }
-
-    fn readNs(t: *const Timer) u64 {
-        const d = t.start_ts.untilNow(t.io);
-        const ns = d.raw.nanoseconds;
-        return if (ns > 0) @intCast(ns) else 0;
-    }
-};
-
-/// How the program's root file list is ordered before it is seeded. The
-/// order is supposed to be unobservable — this exists so a gate can prove it.
-const FileOrder = union(enum) {
-    /// As the tsconfig `include` walk (or the command line) produced it.
-    source: void,
-    /// Exactly reversed. The cheapest permutation that moves every file.
-    reverse: void,
-    /// A seeded Fisher-Yates deal, so a failing order is reproducible from
-    /// the seed alone.
-    shuffle: u64,
-};
 
 const Cli = struct {
     timing: bool = false,
@@ -261,6 +208,120 @@ const Cli = struct {
     paths: []const []const u8 = &.{},
 };
 
+/// The options the run actually uses: the tsconfig's answers with the CLI's
+/// overrides already applied. Produced once, by `effectiveOptions`, so the
+/// precedence rules live in one testable place instead of in fifteen
+/// `var config_*` locals threaded through main().
+///
+/// The defaults below are the no-tsconfig defaults (a run driven by bare file
+/// arguments), which are NOT all `false`: ztsc always resolves with the
+/// bundler algorithm, and tsc's rule makes `allowSyntheticDefaultImports`
+/// default to true under it.
+const Effective = struct {
+    // --- module resolution ---
+    resolve_json: bool = false,
+    base_url: ?[]const u8 = null,
+    allow_js: bool = false,
+    /// Both default ON — see `tsconfig.Config`; a config that turns exports
+    /// off gets the pre-`exports` resolver.
+    resolve_pkg_json_exports: bool = true,
+    resolve_pkg_json_imports: bool = true,
+    /// tsconfig `moduleSuffixes` — widens every candidate probe the resolver
+    /// makes; carried on `ResolveOpts` like every other resolution input.
+    module_suffixes: []const []const u8 = &.{},
+    /// tsconfig `paths`.
+    paths_map: ?ztsc.tsconfig.Paths = null,
+    /// `<jsxImportSource>/jsx-runtime` under the automatic JSX runtime; null
+    /// under the classic runtime (global `JSX` namespace only).
+    jsx_runtime_module: ?[]const u8 = null,
+
+    // --- link / program semantics ---
+    allow_synthetic_default: bool = true,
+    no_implicit_any: bool = true,
+    /// tsconfig noUncheckedSideEffectImports (tsc's default is off).
+    no_unchecked_side_effect_imports: bool = false,
+    /// tsconfig `types: [… "*" …]` — TS2580 instead of TS2591 (see LinkOpts).
+    types_wildcard: bool = false,
+    /// tsconfig experimentalDecorators (legacy decorator dialect; grammar +
+    /// the decorator signature check both change).
+    experimental_decorators: bool = false,
+
+    // --- lib injection and diagnostic suppression ---
+    /// Which built-in lib blobs to inject.
+    lib_set: libs.LibSet = .default,
+    /// Skip type-checking the embedded pre-verified lib?
+    skip_default_lib_check: bool = false,
+    /// Honor `skipLibCheck`, the superset: no diagnostic located in ANY
+    /// `.d.ts` is surfaced.
+    skip_all_dts_check: bool = false,
+
+    fn resolveOpts(e: Effective) resolve.ResolveOpts {
+        return .{
+            .resolve_json = e.resolve_json,
+            .base_url = e.base_url,
+            .allow_js = e.allow_js,
+            .resolve_pkg_json_exports = e.resolve_pkg_json_exports,
+            .resolve_pkg_json_imports = e.resolve_pkg_json_imports,
+            .module_suffixes = e.module_suffixes,
+        };
+    }
+
+    fn linkOpts(e: Effective) modules.LinkOpts {
+        return .{
+            .allow_synthetic_default = e.allow_synthetic_default,
+            .no_implicit_any = e.no_implicit_any,
+            .no_unchecked_side_effect_imports = e.no_unchecked_side_effect_imports,
+            .types_wildcard = e.types_wildcard,
+            .experimental_decorators = e.experimental_decorators,
+        };
+    }
+};
+
+/// Settle every option the run needs from the CLI and the tsconfig (null when
+/// the run is driven by bare file arguments). Pure — no I/O, no allocation —
+/// so the precedence rules can be tested directly.
+fn effectiveOptions(cli: Cli, cfg: ?ztsc.tsconfig.Config) Effective {
+    var e: Effective = .{};
+    if (cfg) |c| {
+        e.resolve_json = c.resolve_json_module;
+        e.base_url = c.base_url;
+        e.allow_js = c.allow_js;
+        e.resolve_pkg_json_exports = c.resolve_pkg_json_exports;
+        e.resolve_pkg_json_imports = c.resolve_pkg_json_imports;
+        e.module_suffixes = c.module_suffixes;
+        e.paths_map = c.paths;
+        e.jsx_runtime_module = c.jsx_runtime_module;
+        e.allow_synthetic_default = c.allow_synthetic_default_imports;
+        e.no_implicit_any = c.no_implicit_any;
+        e.no_unchecked_side_effect_imports = c.no_unchecked_side_effect_imports;
+        e.types_wildcard = c.types_wildcard;
+        e.experimental_decorators = c.experimental_decorators;
+        // tsconfig skipLibCheck/skipDefaultLibCheck.
+        e.skip_default_lib_check = c.skip_lib_check;
+        // skipLibCheck only (the superset: ALL `.d.ts`, not just the lib).
+        // Those files are still parsed/bound/linked so their types flow into
+        // `.ts`/`.tsx` checking. Only the tsconfig drives this; the
+        // `--skip-default-lib-check` CLI flag stays default-lib-only (tsc's
+        // `--skipDefaultLibCheck`).
+        e.skip_all_dts_check = c.skip_all_lib_check;
+    }
+
+    // The CLI flag, when given, overrides the tsconfig
+    // `skipLibCheck`/`skipDefaultLibCheck` value. Default is to check the lib
+    // (matching tsc/tsgo).
+    if (cli.skip_default_lib_check) |v| e.skip_default_lib_check = v;
+
+    // Which built-in lib blobs to inject. Precedence: --noLib wins (nothing),
+    // then an explicit --lib flag, then the tsconfig `lib` field, else the
+    // default set (ES-core + DOM — tsgo's target-esnext default includes DOM).
+    e.lib_set = if (cli.no_lib)
+        .none
+    else
+        libs.resolveLibSet(cli.lib orelse if (cfg) |c| c.lib else null);
+
+    return e;
+}
+
 /// Routes diagnostics to the plain machine format or the pretty renderer,
 /// tracking totals for the tsc-style summary line.
 const Emitter = struct {
@@ -304,356 +365,6 @@ const Emitter = struct {
     }
 };
 
-/// A unit of discovery work handed to a worker: one file to front-end.
-/// The path slice lives in the main arena and is stable for the run.
-const WorkItem = struct {
-    file: modules.FileId,
-    path: []const u8,
-};
-
-/// Per-file completion message a worker sends back to the main thread:
-/// the sealed front-end outputs plus per-phase timings. Payloads live in
-/// the worker's arena and are read-only once the message is pushed.
-const Completion = struct {
-    file: modules.FileId,
-    src: ?Source = null,
-    tree: ?*Ast = null,
-    bind: ?*Bind = null,
-    err: ?anyerror = null,
-    /// The file's own path, interned before it is parsed — the first string
-    /// this file contributes to the program-wide interning order (see the
-    /// renumbering block below). 0 for the lib shards, whose atoms are already
-    /// pinned, and for a file that never loaded.
-    path_atom: ztsc.intern.Atom = 0,
-    load_ns: u64 = 0,
-    parse_ns: u64 = 0,
-    bind_ns: u64 = 0,
-};
-
-/// Unbounded FIFO channel (mutex + condition). Buffer memory comes from
-/// the channel's own arena and is only touched under the lock, so the
-/// channel is safe with any number of producers and consumers. Message
-/// passing is the only worker<->main communication during discovery; the
-/// module graph itself stays main-thread-owned with no locks.
-fn Channel(comptime T: type) type {
-    return struct {
-        io: Io,
-        arena: std.heap.ArenaAllocator,
-        mutex: Io.Mutex = .init,
-        cond: Io.Condition = .init,
-        buf: std.ArrayList(T) = .empty,
-        head: usize = 0,
-        closed: bool = false,
-
-        const Self = @This();
-
-        fn init(io: Io) Self {
-            return .{ .io = io, .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
-        }
-
-        fn deinit(c: *Self) void {
-            c.arena.deinit();
-        }
-
-        fn push(c: *Self, item: T) error{OutOfMemory}!void {
-            c.mutex.lockUncancelable(c.io);
-            defer c.mutex.unlock(c.io);
-            try c.buf.append(c.arena.allocator(), item);
-            c.cond.signal(c.io);
-        }
-
-        /// Blocks until an item is available; null after close() once the
-        /// buffer is drained.
-        fn pop(c: *Self) ?T {
-            c.mutex.lockUncancelable(c.io);
-            defer c.mutex.unlock(c.io);
-            while (c.head == c.buf.items.len) {
-                if (c.closed) return null;
-                c.cond.waitUncancelable(c.io, &c.mutex);
-            }
-            const item = c.buf.items[c.head];
-            c.head += 1;
-            return item;
-        }
-
-        fn close(c: *Self) void {
-            c.mutex.lockUncancelable(c.io);
-            defer c.mutex.unlock(c.io);
-            c.closed = true;
-            c.cond.broadcast(c.io);
-        }
-    };
-}
-
-/// One pool worker. Each worker owns an arena allocator; everything a worker
-/// allocates while processing files (line tables, tokens, ASTs, binder
-/// output) lives in its arena and is never individually freed. Workers pull
-/// one file at a time from the work channel, run the whole per-file front
-/// end on it, and push a completion — no phase or wave barriers.
-const Worker = struct {
-    arena: std.heap.ArenaAllocator,
-    /// Scratch space for benchmark re-runs (`--repeat`); reset between runs.
-    scratch: std.heap.ArenaAllocator,
-    /// Segments the worker's small source files are packed into, so the
-    /// front end pays no per-file page rounding. Private to the worker,
-    /// which is what makes the pack's bump cursor lock-free.
-    pack: ztsc.source.Pack = .{},
-    thread: std.Thread = undefined,
-    files_loaded: usize = 0,
-    /// The grammar options every file this worker parses is parsed under
-    /// (`jsx` is per-file and filled in at the call site). Settled from the
-    /// tsconfig before any worker is spawned, so it needs no synchronization.
-    parse_opts: parser.Opts = .{},
-
-    fn discoverRun(
-        w: *Worker,
-        io: Io,
-        gpa: std.mem.Allocator,
-        interner: *Interner,
-        repeat: usize,
-        work: *Channel(WorkItem),
-        done: *Channel(Completion),
-    ) void {
-        while (work.pop()) |item| {
-            var c: Completion = .{ .file = item.file };
-            w.processFile(io, gpa, interner, item.path, repeat, &c);
-            done.push(c) catch @panic("ztsc: out of memory (completion queue)");
-        }
-    }
-
-    /// The whole per-file front end: load -> parse (which tokenizes) -> bind.
-    /// Outputs and per-phase timings land in `c`; on the first error the
-    /// remaining phases are skipped (same per-phase skip behavior the
-    /// wavefront scheduler had). `repeat > 1` re-runs each phase into
-    /// scratch (benchmarks).
-    fn processFile(
-        w: *Worker,
-        io: Io,
-        gpa: std.mem.Allocator,
-        interner: *Interner,
-        path: []const u8,
-        repeat: usize,
-        c: *Completion,
-    ) void {
-        const alloc = w.arena.allocator();
-
-        var timer = Timer.start(io);
-        const src = if (libs.libSourceFor(path)) |lib_bytes|
-            Source.fromBytes(alloc, path, lib_bytes) catch |err| {
-                c.err = err;
-                return;
-            }
-        else if (ztsc.paths.anyModuleSourceFor(path)) |any_bytes|
-            // A resolved JSON module (resolveJsonModule) or JS module (allowJs):
-            // type it opaquely as `any` from a synthetic body instead of parsing
-            // the raw JSON/JS as TypeScript.
-            Source.fromBytes(alloc, path, any_bytes) catch |err| {
-                c.err = err;
-                return;
-            }
-        else
-            Source.load(io, alloc, path, &w.pack) catch |err| {
-                c.err = err;
-                return;
-            };
-        c.src = src;
-        w.files_loaded += 1;
-        // Exercise the shared interner from every worker thread.
-        c.path_atom = interner.intern(io, gpa, path) catch |err| {
-            c.err = err;
-            return;
-        };
-        c.load_ns = timer.readNs();
-
-        // No standalone tokenize pass: the parser tokenizes internally
-        // into `tree.tokens` (what the binder reads), so a separate scan
-        // would be pure throwaway work (~5.8% of front-end CPU). Token
-        // stats are derived from `tree.tokens`.
-        timer = Timer.start(io);
-        var r: usize = 1;
-        while (r < repeat) : (r += 1) {
-            var opts = w.parse_opts;
-            opts.jsx = parser.isJsxPath(path);
-            var tree = parser.parseOpts(w.scratch.allocator(), src.bytes, opts) catch break;
-            std.mem.doNotOptimizeAway(&tree);
-            _ = w.scratch.reset(.retain_capacity);
-        }
-        const tree = alloc.create(Ast) catch |err| {
-            c.err = err;
-            return;
-        };
-        var file_opts = w.parse_opts;
-        file_opts.jsx = parser.isJsxPath(path);
-        tree.* = parser.parseOpts(alloc, src.bytes, file_opts) catch |err| {
-            c.err = err;
-            return;
-        };
-        c.tree = tree;
-        c.parse_ns = timer.readNs();
-
-        timer = Timer.start(io);
-        r = 1;
-        while (r < repeat) : (r += 1) {
-            var b = binder.bind(w.scratch.allocator(), io, gpa, interner, tree, src.bytes, parser.isDeclarationPath(path)) catch break;
-            std.mem.doNotOptimizeAway(&b);
-            _ = w.scratch.reset(.retain_capacity);
-        }
-        const b = alloc.create(Bind) catch |err| {
-            c.err = err;
-            return;
-        };
-        b.* = binder.bind(alloc, io, gpa, interner, tree, src.bytes, parser.isDeclarationPath(path)) catch |err| {
-            c.err = err;
-            return;
-        };
-        c.bind = b;
-        c.bind_ns = timer.readNs();
-    }
-};
-
-/// Check-work (AST nodes to walk) below which a run drops to two checkers.
-///
-/// A checker instance is not free. Each carries its own type-store overlay,
-/// per-symbol state arrays, scratch/instantiation arenas, relation and
-/// instantiation caches, thread, and its thread's share of the general
-/// allocator's size-class slabs — measured at ~0.35 MB of fixed state per
-/// instance on ajv, against ~90 KB of types the instance actually interns.
-/// Adding instances also re-materializes lib types once per instance that
-/// reaches them.
-///
-/// That fixed cost is worth paying when there is enough work to spread, and
-/// the corpus shows the trade inverting sharply around this size. Going from
-/// four checkers to two (median of 11 runs / 5 runs):
-///
-///   chalk       21.1k nodes   RSS -7.8%   wall +8.1%
-///   @types/prop-types 21.0k   RSS -7.4%   wall +6.9%
-///   ajv         28.0k nodes   RSS -11.4%  wall +1.7%
-///   ---- threshold ----
-///   date-fns    36.8k nodes   RSS -2.2%   wall +7.6%
-///   typebox     37.0k nodes   RSS -0.3%   wall +14.8%
-///   @types/react 101.6k       RSS -7.7%   wall +14.9%
-///   zod         98.2k nodes   RSS -6.8%   wall +21.9%
-///
-/// Below the line the memory saved is large and the wall cost small; above
-/// it the wall cost multiplies while the memory saving collapses. An
-/// explicit `--checkers=N` always wins over this.
-///
-/// Diagnostics are unaffected: output is byte-identical for any checker
-/// count (see the determinism tests), so this only moves the resource
-/// trade-off, never the result.
-const small_program_nodes: u64 = 32_000;
-
-/// Check-work above which a program is large enough for the
-/// declaration-surface test below to apply at all.
-const large_program_nodes: u64 = 256_000;
-
-/// Parsed-to-checked node ratio above which a large program drops to two
-/// checkers: how much declaration surface each instance must re-materialize
-/// per unit of code it actually walks.
-///
-/// A checker instance does NOT split declaration work. Measured on immich, the
-/// set of distinct canonical types the program needs is invariant in checker
-/// count (2.51 M at one checker, ~2.5 M at four), but four checkers BUILD
-/// 7.64 M of them — 3.05x redundancy, with 87-93% of each instance's types
-/// also present in another's arena. The reason is structural rather than a bad
-/// partition: a checker's demand closure grows LOGARITHMICALLY in the files it
-/// owns (1 file 1.437 M types, 4 files 1.519 M, 16 files 1.740 M, 500 files
-/// 1.918 M), so splitting the files four ways splits the work ~1.3 ways. Four
-/// maximally different partitions — the shipped one, contiguous BFS ranges,
-/// random, and a demand-closure-optimized search — span 1.8% in total types,
-/// and the random one is not the worst.
-///
-/// What that redundancy costs tracks the declaration surface, because that is
-/// what each instance re-materializes. `check_nodes` alone cannot see it —
-/// immich (437,226) and excalidraw (409,224) are 7% apart and want DIFFERENT
-/// checker counts. The ratio does see it (median of 5, this host):
-///
-///   immich      2.61 ratio   c2 1.611 s / 384 MB   c4 1.844 s / 520 MB
-///   excalidraw  1.78 ratio   c2 0.398 s / 112 MB   c4 0.308 s / 120 MB
-///   8 packages  1.00 ratio   c4 faster than c2 on every one
-///
-/// immich at four checkers is strictly dominated — slower AND 136 MB heavier
-/// than at two — so this is not a memory-for-time trade, it is a bad operating
-/// point. excalidraw, nearly the same size, still pays off at four.
-///
-/// Both conditions are deliberately narrow: small and mid-size programs are
-/// untouched, and a large program with an ordinary dependency surface keeps
-/// four. Diagnostics are unaffected — output is byte-identical for any checker
-/// count (the determinism tests), so this only moves the resource trade-off.
-///
-/// **Evidentiary limit, stated because this moves a shipped default:** the
-/// threshold separates exactly two applications. The axis is mechanistic
-/// rather than fitted, but the boundary (1.78 vs 2.61) rests on one inversion.
-/// A large program whose declaration surface is bulky but cheap to materialize
-/// would be misclassified and would lose wall. Re-validate against outline,
-/// social-app and vscode when those checkouts are restored.
-const declaration_heavy_ratio: u64 = 220; // hundredths, i.e. 2.20x
-
-/// Whether extra checker instances would RE-MATERIALIZE this program's
-/// declaration surface rather than split it — large, and carrying much more
-/// parsed surface than it walks. Integer-only, so the answer cannot drift
-/// with floating-point rounding across hosts.
-///
-/// Two independent decisions key on this, for the same reason: how many
-/// checkers to run, and whether an instance should size its type-store
-/// reserve from the whole program or from its own partition.
-pub fn declarationHeavy(check_nodes: u64, parsed_nodes: u64) bool {
-    return check_nodes >= large_program_nodes and
-        parsed_nodes * 100 >= check_nodes * declaration_heavy_ratio;
-}
-
-fn defaultCheckers(
-    explicit: ?usize,
-    cpu_count: usize,
-    check_nodes: u64,
-    parsed_nodes: u64,
-) usize {
-    if (explicit) |n| return n;
-    const wide = @min(4, cpu_count);
-    // Too little work to repay a second instance's fixed state.
-    if (check_nodes < small_program_nodes) return @min(wide, 2);
-    // Extra instances would duplicate the declaration work, not divide it.
-    if (declarationHeavy(check_nodes, parsed_nodes)) return @min(wide, 2);
-    return wide;
-}
-
-/// One checker instance: checks its partition on its own thread.
-const CheckerTask = struct {
-    arena: std.heap.ArenaAllocator,
-    thread: std.Thread = undefined,
-    owned: []const modules.FileId = &.{},
-    /// Shared frozen base type store, or null under
-    /// `--no-frozen-store`. Read-only; the same pointer is handed to every
-    /// task so all overlays share one base.
-    base: ?*const types.Store = null,
-    /// Enable the instantiation caching layer (`false` under
-    /// `--no-inst-cache`).
-    inst_cache: bool = true,
-    /// Node count to size this instance's type-store reserve from, or 0 to
-    /// size it from its own partition. Non-zero only for a program whose
-    /// declaration surface is not divisible (`declaration_heavy_ratio`),
-    /// where every instance interns roughly the whole program's types.
-    type_reserve_hint: usize = 0,
-    result: ?checker.Check = null,
-    err: ?anyerror = null,
-    ns: u64 = 0,
-
-    fn run(
-        t: *CheckerTask,
-        io: Io,
-        gpa: std.mem.Allocator,
-        interner: *Interner,
-        prog: *const modules.Program,
-    ) void {
-        const timer = Timer.start(io);
-        t.result = checker.checkFiles(t.arena.allocator(), io, gpa, interner, prog, t.owned, t.base, t.inst_cache, t.type_reserve_hint) catch |err| blk: {
-            t.err = err;
-            break :blk null;
-        };
-        t.ns = timer.readNs();
-    }
-};
-
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const gpa = init.gpa;
@@ -664,16 +375,17 @@ pub fn main(init: std.process.Init) !void {
     const out = &stdout_writer.interface;
 
     const args = try init.minimal.args.toSlice(arena);
-    var bad_arg: []const u8 = "";
-    const cli = parseArgs(arena, args, &bad_arg) catch |err| {
-        switch (err) {
-            error.UnknownFlag => std.debug.print("ztsc: unknown option '{s}'\n", .{bad_arg}),
-            error.BadFlagValue => std.debug.print("ztsc: bad value for option '{s}'\n", .{bad_arg}),
-            error.MissingFlagValue => std.debug.print("ztsc: option '{s}' needs a value\n", .{bad_arg}),
-            else => return err,
-        }
-        std.debug.print("try 'ztsc --help'\n", .{});
-        std.process.exit(2);
+    const cli = switch (try parseArgs(arena, args)) {
+        .ok => |c| c,
+        .bad => |b| {
+            switch (b.problem) {
+                .unknown_flag => std.debug.print("ztsc: unknown option '{s}'\n", .{b.arg}),
+                .bad_value => std.debug.print("ztsc: bad value for option '{s}'\n", .{b.arg}),
+                .missing_value => std.debug.print("ztsc: option '{s}' needs a value\n", .{b.arg}),
+            }
+            std.debug.print("try 'ztsc --help'\n", .{});
+            std.process.exit(2);
+        },
     };
 
     // Write-once, before any checker thread exists (see `prof.profile_on`).
@@ -717,42 +429,9 @@ pub fn main(init: std.process.Init) !void {
     // The `config` phase: discovery, `extends` chasing, the `include` walk and
     // `collectAutoTypes`. Stays 0 when the run is driven by CLI file arguments.
     var config_ns: u64 = 0;
-    var paths_map: ?ztsc.tsconfig.Paths = null;
-    // The tsconfig `lib` field (null when no config / no field), consulted below
-    // to pick the built-in lib blobs.
-    var config_lib: ?[]const []const u8 = null;
-    // tsconfig skipLibCheck/skipDefaultLibCheck (false when no config / unset).
-    var config_skip_lib = false;
-    // tsconfig skipLibCheck only (superset: skips ALL .d.ts, not just the lib).
-    var config_skip_all_lib = false;
-    // tsconfig resolveJsonModule + baseUrl (for `*.json` module resolution).
-    var config_resolve_json = false;
-    var config_base_url: ?[]const u8 = null;
-    // tsconfig resolvePackageJsonExports/Imports (both default ON — see
-    // `tsconfig.Config`; a config that turns exports off gets the pre-`exports`
-    // resolver).
-    var config_resolve_pkg_exports = true;
-    var config_resolve_pkg_imports = true;
-    // tsconfig allowJs (resolve JS-only deps as `any`) + effective noImplicitAny.
-    var config_allow_js = false;
-    var config_no_implicit_any = true;
-    // tsconfig experimentalDecorators (legacy decorator dialect; grammar + the
-    // decorator signature check both change). See `tsconfig.Config`.
-    var config_experimental_decorators = false;
-    // tsconfig noUncheckedSideEffectImports (tsc's default is off).
-    var config_no_unchecked_side_effect_imports = false;
-    // tsconfig `types: [… "*" …]` — TS2580 instead of TS2591 (see LinkOpts).
-    var config_types_wildcard = false;
-    // Effective allowSyntheticDefaultImports. With no tsconfig (bare file
-    // arguments) ztsc still resolves with the bundler algorithm, and tsc's rule
-    // makes the flag default to true under bundler resolution.
-    var config_allow_synthetic_default = true;
-    // `<jsxImportSource>/jsx-runtime` under the automatic JSX runtime; null
-    // under the classic runtime (global `JSX` namespace only).
-    var config_jsx_runtime_module: ?[]const u8 = null;
-    // tsconfig `moduleSuffixes` — widens every candidate probe the resolver
-    // makes; carried on `ResolveOpts` like every other resolution input.
-    var config_module_suffixes: []const []const u8 = &.{};
+    // The loaded tsconfig, or null when the run is driven by CLI file
+    // arguments. Read exactly once, by `effectiveOptions` below.
+    var config: ?ztsc.tsconfig.Config = null;
     if (cli.paths.len == 0) {
         const config_timer = Timer.start(io);
         const config_path: []const u8 = blk: {
@@ -826,46 +505,11 @@ pub fn main(init: std.process.Init) !void {
             entry_paths = combined;
         }
         n_real_roots = cfg.root_files.len;
-        paths_map = cfg.paths;
-        config_lib = cfg.lib;
-        config_skip_lib = cfg.skip_lib_check;
-        config_skip_all_lib = cfg.skip_all_lib_check;
-        config_resolve_json = cfg.resolve_json_module;
-        config_resolve_pkg_exports = cfg.resolve_pkg_json_exports;
-        config_resolve_pkg_imports = cfg.resolve_pkg_json_imports;
-        config_base_url = cfg.base_url;
-        config_allow_js = cfg.allow_js;
-        config_no_implicit_any = cfg.no_implicit_any;
-        config_experimental_decorators = cfg.experimental_decorators;
-        config_no_unchecked_side_effect_imports = cfg.no_unchecked_side_effect_imports;
-        config_types_wildcard = cfg.types_wildcard;
-        config_allow_synthetic_default = cfg.allow_synthetic_default_imports;
-        config_jsx_runtime_module = cfg.jsx_runtime_module;
-        config_module_suffixes = cfg.module_suffixes;
+        config = cfg;
         config_ns = config_timer.readNs();
     }
 
-    // Effective decision: skip type-checking the embedded pre-verified lib?
-    // Default is to check it (matching tsc/tsgo). The CLI flag, when given,
-    // overrides the tsconfig `skipLibCheck`/`skipDefaultLibCheck` value.
-    const skip_default_lib_check = cli.skip_default_lib_check orelse config_skip_lib;
-
-    // Effective decision: honor `skipLibCheck` (the superset of
-    // `skipDefaultLibCheck`)? When set, no diagnostic located in ANY `.d.ts`
-    // file is surfaced — the default lib, dependency `.d.ts`, and project-local
-    // `.d.ts` alike — so ztsc's output matches tsc's on valid `.d.ts`. Those
-    // files are still parsed/bound/linked so their types flow into `.ts`/`.tsx`
-    // checking. Only the tsconfig drives this; the `--skip-default-lib-check`
-    // CLI flag stays default-lib-only (tsc's `--skipDefaultLibCheck`).
-    const skip_all_dts_check = config_skip_all_lib;
-
-    // Which built-in lib blobs to inject. Precedence: --noLib wins (nothing),
-    // then an explicit --lib flag, then the tsconfig `lib` field, else the
-    // default set (ES-core + DOM — tsgo's target-esnext default includes DOM).
-    const lib_set: libs.LibSet = if (cli.no_lib)
-        .none
-    else
-        libs.resolveLibSet(cli.lib orelse config_lib);
+    const opt = effectiveOptions(cli, config);
 
     // Pretty diagnostics: tsc-style excerpts + colors; default follows the
     // terminal, --pretty / --pretty=false forces.
@@ -877,507 +521,34 @@ pub fn main(init: std.process.Init) !void {
     // Not capped by the entry count: discovery finds more files.
     const cpu_count = std.Thread.getCpuCount() catch 1;
     const n_workers: usize = @max(1, cli.workers orelse cpu_count);
-    const workers = try arena.alloc(Worker, n_workers);
-    for (workers) |*w| w.* = .{
-        .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
-        .scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator),
-        .parse_opts = .{ .experimental_decorators = config_experimental_decorators },
-    };
 
-    // Transient allocator for module resolution: candidate path strings and
-    // package.json bodies are discarded after each file's specifiers
-    // resolve. Mirrors the serial buildProgram path (modules.zig). Reset per
-    // file so it never grows past one file's resolution working set.
-    var resolve_scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer resolve_scratch.deinit();
-
-    // Resolution memo: the same specifier imported from many files
-    // resolves once. Lives in `arena` (spans the whole discovery run). Created
-    // before the program roots are seeded because they, too, go through its
-    // canonical-path step (see below).
-    var rcache = resolve.ResolveCache.init(arena, !cli.no_resolve_cache, .{
-        .resolve_json = config_resolve_json,
-        .base_url = config_base_url,
-        .allow_js = config_allow_js,
-        .resolve_pkg_json_exports = config_resolve_pkg_exports,
-        .resolve_pkg_json_imports = config_resolve_pkg_imports,
-        .module_suffixes = config_module_suffixes,
+    // --- Front end: discover, parse, bind, renumber, link ------------------
+    var dr = try driver.build(arena, gpa, io, &interner, .{
+        .entry_paths = entry_paths,
+        .n_real_roots = n_real_roots,
+        .file_order = cli.file_order,
+        .lib_set = opt.lib_set,
+        .n_workers = n_workers,
+        .repeat = cli.repeat,
+        .resolve_cache = !cli.no_resolve_cache,
+        .resolve_opts = opt.resolveOpts(),
+        .paths_map = opt.paths_map,
+        .jsx_runtime_module = opt.jsx_runtime_module,
+        .link_opts = opt.linkOpts(),
     });
-
-    // --- Single-owner discovery (no wave barrier) --------------------------
-    // The main thread is the sole owner of the module graph and seen-set;
-    // workers front-end one file at a time and push completions; the main
-    // thread resolves each completion as it arrives and enqueues newly
-    // discovered files immediately.
-    var paths: std.ArrayList([]const u8) = .empty;
-    var path_ids: std.StringHashMapUnmanaged(u32) = .empty;
-    // Inject the selected built-in lib blobs as the first entries (files 0..).
-    // Their synthetic paths route to the embedded sources in the worker front
-    // end; their top-level decls become the program globals. Empty under
-    // --noLib / lib:[].
-    var lib_buf: [libs.max_lib_files]libs.LibFile = undefined;
-    for (libs.libFiles(lib_set, &lib_buf)) |lf| {
-        try path_ids.put(arena, lf.path, @intCast(paths.items.len));
-        try paths.append(arena, lf.path);
-    }
-    // Program roots. A root under `node_modules` — in practice the auto-included
-    // `@types/*` ambient roots, which pnpm exposes as symlinks into its store —
-    // is keyed by its canonical path, the same identity the module resolver
-    // gives the very same file when an `import` reaches it. Without that step
-    // `node_modules/@types/react/index.d.ts` and the store path behind the
-    // symlink are two files with two symbol universes. Outside `node_modules`
-    // the call is a no-op, so project roots keep the path the user typed (and
-    // pay no realpath syscall).
-    // `--file-order`: permute the roots before a single id is handed out.
-    // Everything downstream — file ids, the BFS discovery order, the cost
-    // partition and its tie-breaks — is a function of this list, so this is
-    // the one place that can vary the axis. tsc's answer does not depend on
-    // root order; `bench/order_sweep.sh` is the gate that says ztsc's does
-    // not either. Only the REAL roots permute: the auto-included `@types/*`
-    // tail is not a user-visible ordering, and tsc always processes it after
-    // the roots' closure however the roots were listed.
-    switch (cli.file_order) {
-        .source => {},
-        .reverse => {
-            const permuted = try arena.dupe([]const u8, entry_paths);
-            std.mem.reverse([]const u8, permuted[0..n_real_roots]);
-            entry_paths = permuted;
-        },
-        .shuffle => |seed| {
-            const permuted = try arena.dupe([]const u8, entry_paths);
-            var prng: std.Random.DefaultPrng = .init(seed);
-            prng.random().shuffle([]const u8, permuted[0..n_real_roots]);
-            entry_paths = permuted;
-        },
-    }
-    // `n_root_entries` is where the auto-included `@types/*` roots start in
-    // `paths` — the second BFS wave in the renumbering block below. A
-    // `@types/*` path already seen as a real root keeps its first position.
-    var n_root_entries: usize = 0;
-    for ([2][]const []const u8{ entry_paths[0..n_real_roots], entry_paths[n_real_roots..] }, 0..) |wave, wi| {
-        if (wi == 1) n_root_entries = paths.items.len;
-        for (wave) |p| {
-            const norm = try ztsc.paths.normalizePath(arena, p);
-            const key = try rcache.canonicalPath(io, resolve_scratch.allocator(), Io.Dir.cwd(), norm);
-            const gop = try path_ids.getOrPut(arena, key);
-            if (!gop.found_existing) {
-                gop.value_ptr.* = @intCast(paths.items.len);
-                try paths.append(arena, key);
-            }
-        }
-    }
-    _ = resolve_scratch.reset(.retain_capacity);
-    const n_entries = paths.items.len;
-
-    var results: std.ArrayList(?Source) = .empty;
-    var trees: std.ArrayList(?*Ast) = .empty;
-    var binds: std.ArrayList(?*Bind) = .empty;
-    var errs: std.ArrayList(?anyerror) = .empty;
-    // Per-file path atom, in the order the front end interned it (first for
-    // the file); feeds the deterministic renumbering after discovery.
-    var path_atoms: std.ArrayList(ztsc.intern.Atom) = .empty;
-    var spec_atoms_all: std.ArrayList([]ztsc.intern.Atom) = .empty;
-    var spec_files_all: std.ArrayList([]modules.FileId) = .empty;
-    // Per-file resolved FileIds in first-occurrence specifier order
-    // (unresolved skipped) — the edges of the deterministic BFS below.
-    var edge_lists: std.ArrayList([]const modules.FileId) = .empty;
-    // Per-file `/// <reference types="X" />` directives that resolved to
-    // nothing; the linker replays them as TS2688.
-    var type_ref_misses_all: std.ArrayList([]const modules.TypeRefMiss) = .empty;
-
-    var load_ns: u64 = 0;
-    var parse_ns: u64 = 0;
-    var bind_ns: u64 = 0;
-    var resolve_ns: u64 = 0;
-    var renumber_ns: u64 = 0;
-
-    var work = Channel(WorkItem).init(io);
-    defer work.deinit();
-    var done = Channel(Completion).init(io);
-    defer done.deinit();
-
-    // The lib's front end: parse and bind the injected shards single-threaded,
-    // before any worker runs, and *keep* the results. Single-threaded is what
-    // pins the atoms (an `Atom` encodes shard-local insertion order, so the
-    // lib's strings must be interned in a fixed order ahead of the concurrent
-    // user-file work). Keeping the products is what makes the pass pay for
-    // itself: the shards never enter the work queue, so the lib is parsed and
-    // bound once per run instead of once here and again on a worker.
-    //
-    // Per-shard arenas, not the process arena: `init.arena` is thread-safe, so
-    // every allocation there takes a lock, and this is one of the
-    // allocation-heaviest stretches of the run (and its parse pass is
-    // concurrent). They live as long as the program — the AST and binder
-    // output are program data — so they are only released at the end.
-    var lib_fe = try libs.frontEndLibs(arena, io, gpa, &interner, lib_set, n_workers);
-    defer lib_fe.deinit();
-    const lib_units = lib_fe.units;
-
-    // Everything interned up to here came from a single-threaded phase, so its
-    // ids are already the same on every run and the lib's sealed binder output
-    // (which is kept, never re-bound) can keep pointing at them. Ids handed out
-    // past this point are scheduling-dependent and get reassigned once
-    // discovery is done — see the renumbering block below.
-    interner.freezePrefix();
-
-    const discover_timer = Timer.start(io);
-    for (workers) |*w| {
-        w.thread = try std.Thread.spawn(.{}, Worker.discoverRun, .{
-            w, io, gpa, &interner, cli.repeat, &work, &done,
-        });
-    }
-
-    var outstanding: usize = 0;
-    try growPerFile(arena, paths.items.len, &results, &trees, &binds, &errs, &path_atoms, &spec_atoms_all, &spec_files_all, &edge_lists, &type_ref_misses_all);
-    // The lib shards hold file ids 0..lib_units.len and are already
-    // front-ended, so they enter the discovery loop as ready-made completions
-    // instead of as work. Everything downstream — specifier resolution,
-    // `/// <reference>` scanning, the BFS renumbering — sees an ordinary
-    // completion and cannot tell the difference.
-    for (lib_units, 0..) |*u, i| {
-        try done.push(.{
-            .file = @intCast(i),
-            .src = u.src,
-            .tree = u.tree,
-            .bind = u.bind,
-            .parse_ns = u.parse_ns,
-            .bind_ns = u.bind_ns,
-        });
-        outstanding += 1;
-    }
-    for (paths.items[lib_units.len..], lib_units.len..) |p, i| {
-        try work.push(.{ .file = @intCast(i), .path = p });
-        outstanding += 1;
-    }
-
-    // FileId of the auto-injected `@types/node` (null until the first Node
-    // built-in import pulls it in); see the discovery loop below.
-    var node_types_fid: ?u32 = null;
-    // FileId of the auto-injected `<jsxImportSource>/jsx-runtime` (null until
-    // the first `.tsx` file pulls it in); see the discovery loop below.
-    var jsx_runtime_fid: ?u32 = null;
-    resolve.resetFsProbeCount();
-
-    while (outstanding > 0) {
-        // The done channel is never closed while work is outstanding.
-        const c = done.pop().?;
-        outstanding -= 1;
-        const i = c.file;
-        results.items[i] = c.src;
-        trees.items[i] = c.tree;
-        binds.items[i] = c.bind;
-        errs.items[i] = c.err;
-        path_atoms.items[i] = c.path_atom;
-        load_ns += c.load_ns;
-        parse_ns += c.parse_ns;
-        bind_ns += c.bind_ns;
-
-        // Resolve this file's module specifiers (main thread only;
-        // discovers files).
-        const resolve_timer = Timer.start(io);
-        var atoms: std.ArrayList(ztsc.intern.Atom) = .empty;
-        var files: std.ArrayList(modules.FileId) = .empty;
-        var ref_files: std.ArrayList(modules.FileId) = .empty;
-        const known_before = paths.items.len;
-        if (binds.items[i]) |b| {
-            const scratch = resolve_scratch.allocator();
-            var seen: std.AutoHashMapUnmanaged(ztsc.intern.Atom, void) = .empty;
-            defer seen.deinit(gpa);
-            for (b.imports) |rec| {
-                try resolveSpecInto(arena, scratch, gpa, io, &interner, &rcache, paths_map, config_resolve_json, paths.items[i], rec.module, &seen, &path_ids, &paths, &atoms, &files);
-            }
-            for (b.exports) |rec| {
-                if (rec.module != 0) {
-                    try resolveSpecInto(arena, scratch, gpa, io, &interner, &rcache, paths_map, config_resolve_json, paths.items[i], rec.module, &seen, &path_ids, &paths, &atoms, &files);
-                }
-            }
-            // A `declare module "spec" { … }` block inside a file that is
-            // itself a MODULE is a module *augmentation*, and its specifier is
-            // a module reference of this file exactly like an import is —
-            // tsc's `getModuleNames` appends `file.moduleAugmentations` to
-            // `file.imports` before `processImportedModules` resolves them.
-            // Without it `f.specs` only held specifiers some import/export
-            // clause happened to name, so `mergeAugmentations` could not find
-            // the augmented file and dropped the block: an augmentation that
-            // is the ONLY mention of the module in its file never merged.
-            //
-            // That is the shape a package uses to augment ITSELF from a
-            // sibling file — @tiptap/core's `dist/commands/*.d.ts` each carry
-            // `declare module '@tiptap/core' { interface Commands<R> { … } }`
-            // while importing only relative paths — so `Commands` stayed
-            // empty except for the handful of third-party extension packages
-            // (which DO import '@tiptap/core' for other reasons), and every
-            // `editor.commands.*` / `editor.chain().*` was a TS2339.
-            //
-            // Gated on `b.is_module`, tsc's `isExternalModuleFile`: in a
-            // SCRIPT the same block is a standalone ambient module declaration
-            // (@types/node's `declare module "fs"`), not an augmentation, and
-            // must not resolve to anything.
-            if (b.is_module) {
-                for (b.ambient_modules) |am| {
-                    try resolveSpecInto(arena, scratch, gpa, io, &interner, &rcache, paths_map, config_resolve_json, paths.items[i], am.spec, &seen, &path_ids, &paths, &atoms, &files);
-                }
-            }
-            // Pull @types/node into the program on the first Node built-in
-            // import (`node:fs`, `path`, …), like tsc auto-including @types: its
-            // ambient `declare module "fs"` / `declare module "node:fs"` blocks
-            // then resolve those specifiers. Injected once, discovered like a
-            // triple-slash reference so the deterministic BFS reaches it (and,
-            // via its own `/// <reference>` refs, every submodule .d.ts).
-            if (node_types_fid == null) {
-                for (b.imports) |rec| {
-                    if (!ztsc.paths.isNodeBuiltin(interner.lookup(io, rec.module))) continue;
-                    if (try rcache.resolve(io, scratch, Io.Dir.cwd(), paths.items[i], "@types/node")) |np| {
-                        const pgop = try path_ids.getOrPut(arena, np);
-                        if (pgop.found_existing) {
-                            node_types_fid = pgop.value_ptr.*;
-                        } else {
-                            const stable = try arena.dupe(u8, np);
-                            pgop.key_ptr.* = stable;
-                            node_types_fid = @intCast(paths.items.len);
-                            pgop.value_ptr.* = node_types_fid.?;
-                            try paths.append(arena, stable);
-                        }
-                        try ref_files.append(arena, node_types_fid.?);
-                    }
-                    break;
-                }
-            }
-            // Under the automatic JSX runtime the `JSX` namespace is an export
-            // of `<jsxImportSource>/jsx-runtime`, not a global — @types/react 19
-            // ships no `declare global { namespace JSX }` at all. tsc puts that
-            // module in the program for every JSX file; do the same on the first
-            // `.tsx` we see, discovered like a triple-slash reference so the
-            // deterministic BFS reaches it. Its FileId is handed to the checker
-            // (`Program.jsx_runtime_file`) as the JSX-namespace fallback.
-            if (jsx_runtime_fid == null and config_jsx_runtime_module != null and
-                std.mem.endsWith(u8, paths.items[i], ".tsx"))
-            {
-                if (try rcache.resolve(io, scratch, Io.Dir.cwd(), paths.items[i], config_jsx_runtime_module.?)) |jp| {
-                    const pgop = try path_ids.getOrPut(arena, jp);
-                    if (pgop.found_existing) {
-                        jsx_runtime_fid = pgop.value_ptr.*;
-                    } else {
-                        const stable = try arena.dupe(u8, jp);
-                        pgop.key_ptr.* = stable;
-                        jsx_runtime_fid = @intCast(paths.items.len);
-                        pgop.value_ptr.* = jsx_runtime_fid.?;
-                        try paths.append(arena, stable);
-                    }
-                    try ref_files.append(arena, jsx_runtime_fid.?);
-                }
-            }
-            // Triple-slash `/// <reference>` directives pull extra files into
-            // the program — program inputs, not import bindings. Their
-            // resolved ids join the discovery edge list so the deterministic
-            // BFS renumbering below reaches them.
-            if (results.items[i]) |src| {
-                var misses: std.ArrayList(modules.TypeRefMiss) = .empty;
-                for (try resolve.scanReferences(scratch, src.bytes)) |ref| {
-                    const rfid = try discoverReferenceInto(arena, scratch, io, &rcache, paths.items[i], ref, &path_ids, &paths);
-                    try ref_files.append(arena, rfid);
-                    // An unresolvable `types=` directive is tsc's TS2688; the
-                    // linker reports it, since only this loop knows resolution
-                    // failed. `path=` misses are TS6053, not implemented.
-                    if (rfid == modules.no_file and ref.kind == .types) {
-                        try misses.append(arena, modules.typeRefMiss(ref));
-                    }
-                }
-                type_ref_misses_all.items[i] = misses.items;
-            }
-            _ = resolve_scratch.reset(.retain_capacity);
-        }
-        var edges: std.ArrayList(modules.FileId) = .empty;
-        for (files.items) |fid| {
-            if (fid != modules.no_file) try edges.append(arena, fid);
-        }
-        for (ref_files.items) |fid| {
-            if (fid != modules.no_file) try edges.append(arena, fid);
-        }
-        edge_lists.items[i] = edges.items;
-        sortSpecPairs(atoms.items, files.items);
-        spec_atoms_all.items[i] = atoms.items;
-        spec_files_all.items[i] = files.items;
-
-        // Enqueue newly discovered files right away.
-        try growPerFile(arena, paths.items.len, &results, &trees, &binds, &errs, &path_atoms, &spec_atoms_all, &spec_files_all, &edge_lists, &type_ref_misses_all);
-        for (known_before..paths.items.len) |nf| {
-            try work.push(.{ .file = @intCast(nf), .path = paths.items[nf] });
-            outstanding += 1;
-        }
-        resolve_ns += resolve_timer.readNs();
-    }
-    work.close();
-    for (workers) |*w| w.thread.join();
-    const discover_ns = discover_timer.readNs();
+    // The lib shards' arenas hold AST and binder output the checkers read, so
+    // they are released only at the very end of the run.
+    defer dr.lib_fe.deinit();
+    const prog = dr.prog;
+    const links = prog.links;
+    const paths = dr.files.paths;
+    const results = dr.files.results;
+    const trees = dr.files.trees;
+    const binds = dr.files.binds;
+    const errs = dr.files.errs;
+    const workers = dr.workers;
     const n_files = paths.items.len;
-
-    // --- Deterministic file order (graph-derived, not scheduling-derived) --
-    // Completion order depends on scheduling; output order must not. BFS
-    // from the entry files, tie-break = specifier order within each
-    // importing file (the exact order wavefront discovery produced), then
-    // permute every per-file table into that order. Everything downstream
-    // (link, checker partition, printing) sees only the renumbered ids, so
-    // output is byte-identical for any --workers/--checkers combination.
-    //
-    // TWO waves: the libs and the real roots with their whole import closure,
-    // and only then the auto-included `@types/*` ambient roots with theirs.
-    // That is `createProgram`'s order — root files first, automatic type
-    // reference directives after — and file order is the merge order a
-    // `declare global` augmentation of an existing global gets, so it decides
-    // which declaration group of `setTimeout` is last. See the seeding site.
-    {
-        const order = try arena.alloc(u32, n_files); // BFS position -> discovery id
-        const new_ids = try arena.alloc(u32, n_files); // discovery id -> BFS position
-        @memset(new_ids, modules.no_file);
-        var tail: usize = 0;
-        var head: usize = 0;
-        for ([2][2]usize{ .{ 0, n_root_entries }, .{ n_root_entries, n_entries } }) |wave| {
-            for (wave[0]..wave[1]) |i| {
-                if (new_ids[i] != modules.no_file) continue;
-                new_ids[i] = @intCast(tail);
-                order[tail] = @intCast(i);
-                tail += 1;
-            }
-            while (head < tail) : (head += 1) {
-                for (edge_lists.items[order[head]]) |fid| {
-                    if (new_ids[fid] != modules.no_file) continue;
-                    new_ids[fid] = @intCast(tail);
-                    order[tail] = fid;
-                    tail += 1;
-                }
-            }
-        }
-        // Every discovered file was discovered through a recorded edge,
-        // so the BFS reaches all of them.
-        std.debug.assert(tail == n_files);
-
-        try permuteInPlace([]const u8, arena, paths.items, order);
-        try permuteInPlace(?Source, arena, results.items, order);
-        try permuteInPlace(?*Ast, arena, trees.items, order);
-        try permuteInPlace(?*Bind, arena, binds.items, order);
-        try permuteInPlace(?anyerror, arena, errs.items, order);
-        try permuteInPlace(ztsc.intern.Atom, arena, path_atoms.items, order);
-        try permuteInPlace([]ztsc.intern.Atom, arena, spec_atoms_all.items, order);
-        try permuteInPlace([]modules.FileId, arena, spec_files_all.items, order);
-        try permuteInPlace([]const modules.TypeRefMiss, arena, type_ref_misses_all.items, order);
-        if (jsx_runtime_fid) |f| jsx_runtime_fid = new_ids[f];
-        // Remap the resolved FileIds inside the spec maps.
-        for (spec_files_all.items) |spec_files| {
-            for (spec_files) |*fid| {
-                if (fid.* != modules.no_file) fid.* = new_ids[fid.*];
-            }
-        }
-    }
-
-    // --- Deterministic atom ids (file order, not scheduling order) --------
-    // An `Atom` encodes its shard-local insertion index, and the front end
-    // interns from every worker at once, so the ids a run hands out depend on
-    // which worker got there first. Atoms are sort keys downstream — a scope's
-    // member table, a merged namespace's member index, an object type's
-    // property records — so that scheduling noise reached the checker as a
-    // different *traversal order*, and (through the assignability memo's
-    // in-progress marks) a different set of walked subtrees. Diagnostics never
-    // moved, but the work counters did, and a program sitting on the
-    // instantiation budget could have tipped either way.
-    //
-    // The fix is to assign the ids a single-threaded front end would have.
-    // Each file recorded the atoms it touched in first-touch order
-    // (`Bind.first_touch`, preceded by its own path); replaying those lists in
-    // the program's graph-derived file order is exactly the sequence a serial
-    // run interns in, so `Interner.renumber` can hand out the serial ids and
-    // every table sorted by atom lands where the serial run put it. Serial
-    // runs get an identity permutation and skip the rewrite entirely.
-    {
-        const renumber_timer = Timer.start(io);
-        var order: std.ArrayList(ztsc.intern.Atom) = .empty;
-        defer order.deinit(gpa);
-        // The lib shards are bound before the pool starts; their atoms are in
-        // the frozen prefix and never move.
-        for (lib_units.len..n_files) |i| {
-            if (path_atoms.items[i] != 0) try order.append(gpa, path_atoms.items[i]);
-            if (binds.items[i]) |b| try order.appendSlice(gpa, b.first_touch);
-        }
-        const rn = try interner.renumber(gpa, gpa, order.items);
-        defer gpa.free(rn.map);
-        if (rn.uncovered != 0) {
-            // An interning site the replay does not know about: the id space is
-            // scheduling-dependent again. Loud, because nothing downstream can
-            // detect it.
-            std.debug.print(
-                "ztsc: internal: {d} atom(s) outside the recorded interning order\n",
-                .{rn.uncovered},
-            );
-        }
-        if (!rn.identity) {
-            for (binds.items[lib_units.len..]) |maybe_bind| {
-                if (maybe_bind) |b| try b.remapAtoms(gpa, rn.map);
-            }
-            for (spec_atoms_all.items, spec_files_all.items) |spec_atoms, spec_files| {
-                for (spec_atoms) |*a| a.* = rn.map[a.*];
-                sortSpecPairs(spec_atoms, spec_files);
-            }
-        }
-        renumber_ns = renumber_timer.readNs();
-    }
-
-    // --- Link (serial): program assembly + import/export tables ----------
-    const link_timer = Timer.start(io);
-    const prog_files = try arena.alloc(modules.ProgFile, n_files);
-    var empty_tree: ?*Ast = null;
-    var empty_bind: ?*Bind = null;
-    for (0..n_files) |i| {
-        // Substitute an empty file for load/parse failures so ids stay
-        // dense (the error is reported below).
-        var tree = trees.items[i];
-        var bnd = binds.items[i];
-        const src_bytes: []const u8 = if (results.items[i]) |s| s.bytes else "";
-        if (tree == null or bnd == null) {
-            if (empty_tree == null) {
-                empty_tree = try arena.create(Ast);
-                empty_tree.?.* = try parser.parse(arena, "");
-                empty_bind = try arena.create(Bind);
-                empty_bind.?.* = try binder.bind(arena, io, gpa, &interner, empty_tree.?, "", false);
-            }
-            tree = empty_tree;
-            bnd = empty_bind;
-        }
-        prog_files[i] = .{
-            .path = paths.items[i],
-            .src = if (trees.items[i] == null) "" else src_bytes,
-            .tree = tree.?,
-            .bind = bnd.?,
-            .specs = .{ .atoms = spec_atoms_all.items[i], .files = spec_files_all.items[i] },
-            .type_ref_misses = type_ref_misses_all.items[i],
-        };
-    }
-    const lr = try modules.link(arena, gpa, io, &interner, prog_files, .{
-        .allow_synthetic_default = config_allow_synthetic_default,
-        .no_implicit_any = config_no_implicit_any,
-        .no_unchecked_side_effect_imports = config_no_unchecked_side_effect_imports,
-        .types_wildcard = config_types_wildcard,
-    });
-    const links = lr.links;
-    const prog = try arena.create(modules.Program);
-    prog.* = .{
-        .files = prog_files,
-        .sym_base = lr.sym_base,
-        .links = links,
-        .globals = lr.globals,
-        .merged = lr.merged,
-        .ambient_exports = lr.ambient_exports,
-        .ambient_specs = lr.ambient_specs,
-        .constit_keys = lr.constit_keys,
-        .constit_vals = lr.constit_vals,
-        .export_equals_atom = lr.export_equals_atom,
-        .dual_targets = lr.dual_targets,
-        .no_implicit_any = config_no_implicit_any,
-        .allow_synthetic_default = config_allow_synthetic_default,
-        .types_wildcard = config_types_wildcard,
-        .experimental_decorators = config_experimental_decorators,
-        .jsx_runtime_file = jsx_runtime_fid orelse modules.no_file,
-    };
-    const link_ns = link_timer.readNs();
+    const n_entries = dr.n_entries;
 
     // --- Check (N independent checker instances) --------------------------------
     const check_timer = Timer.start(io);
@@ -1386,157 +557,46 @@ pub fn main(init: std.process.Init) !void {
     const file_owner = try arena.alloc(u32, n_files);
 
     // Cost-based partition, weighted by per-file AST node count
-    // (≈ check cost, known post-parse) — see the run split below for how
-    // the weights are spent. Built before the checker count is chosen,
-    // because the total is what chooses it.
-    const Item = struct { file: u32, cost: u64 };
-    var items: std.ArrayList(Item) = .empty;
-    try items.ensureTotalCapacity(arena, n_files);
-    @memset(file_owner, 0);
-    var check_nodes: u64 = 0;
-    // Every parsed node, enqueued or not. The part that is NOT enqueued is the
-    // declaration surface (`.d.ts` under skipLibCheck, the embedded lib under
-    // skipDefaultLibCheck): never walked, but materialized on demand — once
-    // per checker instance that reaches it. See `declaration_heavy_ratio`.
-    var parsed_nodes: u64 = 0;
+    // (≈ check cost, known post-parse) — see `schedule.partition` for how the
+    // weights are spent. Built before the checker count is chosen, because
+    // the total is what chooses it. Both per-file inputs are decided here
+    // because only main knows the effective options; the model itself is
+    // pure (schedule.zig).
+    const node_counts = try arena.alloc(u64, n_files);
+    const skipped = try arena.alloc(bool, n_files);
     for (0..n_files) |i| {
-        if (trees.items[i]) |tree| parsed_nodes += tree.nodes.len;
+        node_counts[i] = if (trees.items[i]) |tree| tree.nodes.len else 0;
         // Embedded lib files are parsed/bound/linked (globals, lazy type
         // expansion) and, by default, also enqueued to a checker so the
         // pre-verified lib is walked just like tsc/tsgo at their defaults.
         // `--skip-default-lib-check` (or tsconfig skipLibCheck/
         // skipDefaultLibCheck) drops them — pure time savings, since lib
         // diagnostics are never surfaced (tsc's skipDefaultLibCheck).
-        if (skip_default_lib_check and libs.isLibPath(paths.items[i])) continue;
+        //
         // skipLibCheck: a non-lib `.d.ts` produces no surfaced check
         // diagnostics, and its types are resolved lazily on demand from
         // `.ts` files (not by walking it), so its check pass is dead work —
         // don't enqueue it. Pure time savings, deterministic (path-based).
-        if (skip_all_dts_check and ztsc.paths.isDeclarationPath(paths.items[i])) continue;
-        const cost: u64 = if (trees.items[i]) |tree| tree.nodes.len else 0;
-        check_nodes += cost;
-        items.appendAssumeCapacity(.{ .file = @intCast(i), .cost = cost });
+        skipped[i] = (opt.skip_default_lib_check and libs.isLibPath(paths.items[i])) or
+            (opt.skip_all_dts_check and ztsc.paths.isDeclarationPath(paths.items[i]));
     }
+    const check_work = try schedule.costModel(arena, node_counts, skipped);
 
-    const n_checkers: usize = @max(1, @min(defaultCheckers(cli.checkers, cpu_count, check_nodes, parsed_nodes), n_files));
-    const tasks = try arena.alloc(CheckerTask, n_checkers);
+    const n_checkers: usize = @max(1, @min(schedule.defaultCheckers(cli.checkers, cpu_count, check_work.check_nodes, check_work.parsed_nodes), n_files));
+    const tasks = try arena.alloc(schedule.CheckerTask, n_checkers);
     {
-        const owned_lists = try arena.alloc(std.ArrayList(modules.FileId), n_checkers);
-        for (owned_lists) |*l| l.* = .empty;
-        // Locality-aware, balanced partition. File ids are BFS positions in
-        // the import graph (see the renumbering above), so a contiguous id
-        // range is import-adjacent and its dependency closures largely
-        // overlap: checking that range on one checker materializes each
-        // foreign type once instead of once per checker that reaches it.
-        //
-        // Pure contiguity (one range per checker) wins the locality but
-        // loses the wall clock — node count mispredicts check time region by
-        // region, so one checker straggles. Cutting the order into two
-        // equal-node-weight runs per checker and dealing the runs
-        // longest-first onto the least-loaded checker (LPT) keeps most of the
-        // locality and pairs an expensive region with a cheap one. Measured
-        // on a 6.1k-file project at --checkers=4: check 265 -> 242 ms, peak
-        // RSS 226 -> 218 MB. k = 1 leaves a straggler; k >= 3 fragments the
-        // locality without buying the balance back, and both measured slower
-        // than k = 2, as did a boustrophedon deal, a DFS (subtree-contiguous)
-        // order, and re-weighting `.d.ts` nodes.
-        //
-        // Deterministic: the order is the file ids, the weights are fixed
-        // post-parse, and every tie breaks by run start / checker index, so
-        // any --checkers=N still yields byte-identical diagnostics.
-        const Run = struct { start: usize, end: usize, cost: u64 };
-        var runs: std.ArrayList(Run) = .empty;
-        {
-            var total_cost: u64 = 0;
-            for (items.items) |it| total_cost += it.cost;
-            const n_runs = n_checkers * 2;
-            var acc: u64 = 0;
-            var run_base: u64 = 0;
-            var start: usize = 0;
-            var r: usize = 0;
-            for (items.items, 0..) |it, idx| {
-                acc += it.cost;
-                // Cumulative target, so rounding never drifts across cuts.
-                if (acc >= total_cost * (r + 1) / n_runs and r + 1 < n_runs) {
-                    try runs.append(arena, .{ .start = start, .end = idx + 1, .cost = acc - run_base });
-                    run_base = acc;
-                    start = idx + 1;
-                    r += 1;
-                }
-            }
-            if (start < items.items.len)
-                try runs.append(arena, .{ .start = start, .end = items.items.len, .cost = acc - run_base });
-        }
-        std.mem.sort(Run, runs.items, {}, struct {
-            fn lessThan(_: void, x: Run, y: Run) bool {
-                if (x.cost != y.cost) return x.cost > y.cost; // biggest first
-                return x.start < y.start; // deterministic tie-break
-            }
-        }.lessThan);
-
-        const loads = try arena.alloc(u64, n_checkers);
-        @memset(loads, 0);
-        for (runs.items) |run| {
-            // Least-loaded checker; ties resolve to the lowest index.
-            var best: usize = 0;
-            for (loads[1..], 1..) |l, k| {
-                if (l < loads[best]) best = k;
-            }
-            // Inside a run, walk biggest-first (the cost-partition order). Only the
-            // run permutes, so every other run's [start,end) is untouched and
-            // `run.cost` — an order-independent sum — still holds. Walk order
-            // does not move ownership, but it does move peak RSS: leading with
-            // the big files keeps their scratch peaks off the tail of a grown
-            // arena, worth ~20 MB at --checkers=1 on a 6.1k-file project.
-            const slice = items.items[run.start..run.end];
-            std.mem.sort(Item, slice, {}, struct {
-                fn lessThan(_: void, x: Item, y: Item) bool {
-                    if (x.cost != y.cost) return x.cost > y.cost; // biggest first
-                    return x.file < y.file; // deterministic tie-break
-                }
-            }.lessThan);
-            for (slice) |it| {
-                try owned_lists[best].append(arena, it.file);
-                file_owner[it.file] = @intCast(best);
-            }
-            loads[best] += run.cost;
-        }
-
-        // BENCHMARK AID (`--partition-file=<path>`): replace the partition
-        // above with an externally computed one — one `<file-id> <checker>`
-        // pair per line, file ids as `--dup-profile` prints them. It exists
-        // so a candidate partition can be MEASURED (total instantiate visits,
-        // peak RSS) instead of modelled; see the cross-checker duplication
-        // section of `src/checker/prof.zig`. Files the file does not mention
-        // keep the partition's own assignment. Within a checker the walk stays
-        // biggest-first, as above.
-        if (cli.partition_file) |pf| {
-            const text = Io.Dir.cwd().readFileAlloc(io, pf, arena, .limited(64 << 20)) catch |e| {
+        // BENCHMARK AID (`--partition-file=<path>`): the partition can be
+        // replaced with an externally computed one — one `<file-id> <checker>`
+        // pair per line. Reading it is main's job; interpreting it is
+        // `schedule.partition`'s.
+        const partition_text: ?[]const u8 = if (cli.partition_file) |pf|
+            Io.Dir.cwd().readFileAlloc(io, pf, arena, .limited(64 << 20)) catch |e| {
                 std.debug.print("ztsc: cannot read --partition-file '{s}': {s}\n", .{ pf, @errorName(e) });
                 std.process.exit(1);
-            };
-            for (owned_lists) |*l| l.* = .empty;
-            var lines = std.mem.tokenizeAny(u8, text, "\r\n");
-            while (lines.next()) |line| {
-                var it = std.mem.tokenizeScalar(u8, line, ' ');
-                const fid_s = it.next() orelse continue;
-                const ck_s = it.next() orelse continue;
-                const fid = std.fmt.parseInt(u32, fid_s, 10) catch continue;
-                const ck = std.fmt.parseInt(u32, ck_s, 10) catch continue;
-                if (fid >= n_files) continue;
-                file_owner[fid] = @intCast(ck % n_checkers);
             }
-            const cost_by_file = try arena.alloc(u64, n_files);
-            @memset(cost_by_file, 0);
-            for (items.items) |it| cost_by_file[it.file] = it.cost;
-            for (items.items) |it| try owned_lists[file_owner[it.file]].append(arena, it.file);
-            for (owned_lists) |*l| std.mem.sort(modules.FileId, l.items, cost_by_file, struct {
-                fn lessThan(cost: []const u64, x: modules.FileId, y: modules.FileId) bool {
-                    if (cost[x] != cost[y]) return cost[x] > cost[y];
-                    return x < y;
-                }
-            }.lessThan);
-        }
+        else
+            null;
+        const owned = try schedule.partition(arena, check_work.items, n_checkers, file_owner, partition_text);
 
         // Shared frozen base type store (frozen-base piece 2): built
         // once, single-threaded here before any checker spawns, then handed to
@@ -1551,15 +611,15 @@ pub fn main(init: std.process.Init) !void {
         for (tasks, 0..) |*t, k| {
             t.* = .{
                 .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
-                .owned = owned_lists[k].items,
+                .owned = owned[k],
                 .base = base_store,
                 .inst_cache = !cli.no_inst_cache,
                 // Only when the surface is not divisible. On a program whose
                 // work DOES partition (the `multi` corpus, ratio 1.00), the
                 // whole-program estimate over-reserves ~4x and costs peak RSS
                 // for nothing: 41.2 -> 45.0 MiB measured.
-                .type_reserve_hint = if (declarationHeavy(check_nodes, parsed_nodes))
-                    @intCast(parsed_nodes)
+                .type_reserve_hint = if (schedule.declarationHeavy(check_work.check_nodes, check_work.parsed_nodes))
+                    @intCast(check_work.parsed_nodes)
                 else
                     0,
             };
@@ -1569,7 +629,7 @@ pub fn main(init: std.process.Init) !void {
         tasks[0].run(io, gpa, &interner, prog);
     } else {
         for (tasks) |*t| {
-            t.thread = try std.Thread.spawn(.{}, CheckerTask.run, .{ t, io, gpa, &interner, prog });
+            t.thread = try std.Thread.spawn(.{}, schedule.CheckerTask.run, .{ t, io, gpa, &interner, prog });
         }
         for (tasks) |*t| t.thread.join();
     }
@@ -1613,7 +673,7 @@ pub fn main(init: std.process.Init) !void {
     // Path-based, so identical for any --workers/--checkers count (determinism).
     const dts_skipped = try arena.alloc(bool, paths.items.len);
     for (paths.items, 0..) |p, i|
-        dts_skipped[i] = skip_all_dts_check and !is_lib[i] and ztsc.paths.isDeclarationPath(p);
+        dts_skipped[i] = opt.skip_all_dts_check and !is_lib[i] and ztsc.paths.isDeclarationPath(p);
 
     // `@ts-nocheck` / `@ts-ignore` / `@ts-expect-error` suppression, scanned
     // from each file's comment trivia at parse time. Unlike `dts_skipped` this
@@ -1879,23 +939,24 @@ pub fn main(init: std.process.Init) !void {
     if (cli.timing) {
         const checker_times = try arena.alloc(ztsc.report.CheckerTime, tasks.len);
         for (tasks, checker_times) |*t, *ct| ct.* = .{ .ns = t.ns, .files = t.owned.len };
+        const rcache = dr.rcache;
         const fs_counts = rcache.fs.entryCounts();
         try ztsc.report.printTiming(out, .{
             .config_ns = config_ns,
-            .load_ns = load_ns,
-            .parse_ns = parse_ns,
-            .bind_ns = bind_ns,
-            .resolve_ns = resolve_ns,
-            .discover_ns = discover_ns,
-            .renumber_ns = renumber_ns,
-            .link_ns = link_ns,
+            .load_ns = dr.timings.load_ns,
+            .parse_ns = dr.timings.parse_ns,
+            .bind_ns = dr.timings.bind_ns,
+            .resolve_ns = dr.timings.resolve_ns,
+            .discover_ns = dr.timings.discover_ns,
+            .renumber_ns = dr.timings.renumber_ns,
+            .link_ns = dr.timings.link_ns,
             .check_ns = check_ns,
             .total_ns = total_ns,
         }, .{
             .lines = total_lines,
             .bytes = total_bytes,
             .repeat = cli.repeat,
-            .check_nodes = check_nodes,
+            .check_nodes = check_work.check_nodes,
         }, checker_times, .{
             .probes = resolve.fsProbeCount(),
             .lookups = rcache.lookups,
@@ -1987,164 +1048,29 @@ pub fn main(init: std.process.Init) !void {
     if (parse_diags > 0 or bind_diags > 0 or link_diags > 0 or check_diags > 0) std.process.exit(1);
 }
 
-/// Grow every per-file table to `n` slots (null/empty defaults). Only the
-/// main thread touches these tables; workers communicate exclusively
-/// through the channels.
-fn growPerFile(
-    arena: std.mem.Allocator,
-    n: usize,
-    results: *std.ArrayList(?Source),
-    trees: *std.ArrayList(?*Ast),
-    binds: *std.ArrayList(?*Bind),
-    errs: *std.ArrayList(?anyerror),
-    path_atoms: *std.ArrayList(ztsc.intern.Atom),
-    spec_atoms_all: *std.ArrayList([]ztsc.intern.Atom),
-    spec_files_all: *std.ArrayList([]modules.FileId),
-    edge_lists: *std.ArrayList([]const modules.FileId),
-    type_ref_misses_all: *std.ArrayList([]const modules.TypeRefMiss),
-) !void {
-    while (results.items.len < n) {
-        try results.append(arena, null);
-        try trees.append(arena, null);
-        try binds.append(arena, null);
-        try errs.append(arena, null);
-        try path_atoms.append(arena, 0);
-        try spec_atoms_all.append(arena, &.{});
-        try spec_files_all.append(arena, &.{});
-        try edge_lists.append(arena, &.{});
-        try type_ref_misses_all.append(arena, &.{});
-    }
-}
+/// Why an argument was rejected. One message per case, printed by main.
+const ArgProblem = enum { unknown_flag, bad_value, missing_value };
 
-/// Reorder `items` so that items[k] becomes the old items[order[k]].
-fn permuteInPlace(comptime T: type, arena: std.mem.Allocator, items: []T, order: []const u32) !void {
-    const copy = try arena.dupe(T, items);
-    for (order, 0..) |old, k| items[k] = copy[old];
-}
+/// What `parseArgs` produces: the settled CLI, or the first argument it could
+/// not accept together with the reason. A returned value rather than an error
+/// plus an out-parameter, so nothing has to be written on every loop iteration
+/// to keep a diagnostic available for a failure that usually never happens.
+const ParseResult = union(enum) {
+    ok: Cli,
+    bad: struct { problem: ArgProblem, arg: []const u8 },
 
-/// Resolve one module specifier of `importer`; appends to the spec map and
-/// discovers new files into `paths`.
-fn resolveSpecInto(
-    arena: std.mem.Allocator,
-    scratch: std.mem.Allocator,
-    gpa: std.mem.Allocator,
-    io: Io,
-    interner: *Interner,
-    rcache: *resolve.ResolveCache,
-    paths_map: ?ztsc.tsconfig.Paths,
-    resolve_json: bool,
-    importer: []const u8,
-    module_atom: ztsc.intern.Atom,
-    seen: *std.AutoHashMapUnmanaged(ztsc.intern.Atom, void),
-    path_ids: *std.StringHashMapUnmanaged(u32),
-    paths: *std.ArrayList([]const u8),
-    atoms: *std.ArrayList(ztsc.intern.Atom),
-    files: *std.ArrayList(modules.FileId),
-) !void {
-    if (module_atom == 0) return;
-    const gop = try seen.getOrPut(gpa, module_atom);
-    if (gop.found_existing) return;
-    const spec = interner.lookup(io, module_atom);
-    var fid: modules.FileId = modules.no_file;
-    // All candidate paths and package.json bodies are transient — build
-    // them in `scratch` (reset per file by the caller). Only the resolved
-    // path is retained, duped into `arena` below.
-    //
-    // tsconfig `paths` mapping applies to bare specifiers first;
-    // unmatched or unresolved candidates fall through to normal
-    // resolution, like tsc.
-    var mapped: ?[]const u8 = null;
-    if (paths_map) |pm| {
-        if (spec.len > 0 and spec[0] != '.' and spec[0] != '/') {
-            // A `paths`-mapped `*.json` (`@fixtures/apis/x.json`) resolves to the
-            // JSON file directly — `resolveStem` only probes TS/declaration
-            // extensions and would miss it.
-            const is_json = resolve_json and std.mem.endsWith(u8, spec, ".json");
-            for (try pm.mapSpecifier(scratch, spec)) |cand| {
-                const r = if (is_json)
-                    try resolve.resolveJsonFile(io, scratch, Io.Dir.cwd(), cand)
-                else
-                    // Full "load as file or folder" — a substitution that names
-                    // a package directory is resolved through its
-                    // `package.json`, not just by stem probing
-                    // (`resolvePathsCandidate`), under the same `ResolveOpts`
-                    // every other probe of this run sees.
-                    try rcache.pathsCandidate(io, scratch, Io.Dir.cwd(), cand);
-                if (r) |rr| {
-                    mapped = rr;
-                    break;
-                }
-            }
-        }
+    fn reject(problem: ArgProblem, arg: []const u8) ParseResult {
+        return .{ .bad = .{ .problem = problem, .arg = arg } };
     }
-    // `paths`-mapped bare specifiers bypass the cache: their resolution is a
-    // different decision (a tsconfig remap), rare, and one `resolveStem` call.
-    // Everything else — the common case — goes through the memo.
-    if (mapped orelse try rcache.resolve(io, scratch, Io.Dir.cwd(), importer, spec)) |resolved| {
-        const pgop = try path_ids.getOrPut(arena, resolved);
-        if (pgop.found_existing) {
-            fid = pgop.value_ptr.*;
-        } else {
-            // Give the map a stable key and `paths` a stable slice: the
-            // scratch-owned `resolved` is about to be reset away.
-            const stable = try arena.dupe(u8, resolved);
-            pgop.key_ptr.* = stable;
-            fid = @intCast(paths.items.len);
-            pgop.value_ptr.* = fid;
-            try paths.append(arena, stable);
-        }
-    }
-    try atoms.append(arena, module_atom);
-    try files.append(arena, fid);
-}
+};
 
-/// Discover a triple-slash reference target as a program input: resolve
-/// it and, if new, append it to `paths`/`path_ids` so the scheduler enqueues
-/// it. Unlike `resolveSpecInto`, it records no import-specifier binding.
-/// Resolution goes through `ResolveCache.resolveRef`, so the target is keyed by
-/// its canonical path — the same identity an `import` of that file would get.
-fn discoverReferenceInto(
-    arena: std.mem.Allocator,
-    scratch: std.mem.Allocator,
-    io: Io,
-    rcache: *resolve.ResolveCache,
-    importer: []const u8,
-    ref: resolve.RefDirective,
-    path_ids: *std.StringHashMapUnmanaged(u32),
-    paths: *std.ArrayList([]const u8),
-) !modules.FileId {
-    if (try rcache.resolveRef(io, scratch, Io.Dir.cwd(), importer, ref)) |resolved| {
-        const pgop = try path_ids.getOrPut(arena, resolved);
-        if (pgop.found_existing) return pgop.value_ptr.*;
-        const stable = try arena.dupe(u8, resolved);
-        pgop.key_ptr.* = stable;
-        const fid: modules.FileId = @intCast(paths.items.len);
-        pgop.value_ptr.* = fid;
-        try paths.append(arena, stable);
-        return fid;
-    }
-    return modules.no_file;
-}
-
-fn sortSpecPairs(atoms: []ztsc.intern.Atom, files: []modules.FileId) void {
-    var i: usize = 1;
-    while (i < atoms.len) : (i += 1) {
-        var j = i;
-        while (j > 0 and atoms[j - 1] > atoms[j]) : (j -= 1) {
-            std.mem.swap(ztsc.intern.Atom, &atoms[j - 1], &atoms[j]);
-            std.mem.swap(modules.FileId, &files[j - 1], &files[j]);
-        }
-    }
-}
-
-/// Parse argv. On error, `bad_arg` names the offending argument.
-fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8, bad_arg: *[]const u8) !Cli {
+/// Parse argv.
+fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8) error{OutOfMemory}!ParseResult {
     var cli: Cli = .{};
     var paths: std.ArrayList([]const u8) = .empty;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-        bad_arg.* = arg;
         if (std.mem.eql(u8, arg, "--timing")) {
             cli.timing = true;
         } else if (std.mem.eql(u8, arg, "--memory")) {
@@ -2191,7 +1117,7 @@ fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8, bad_arg: *[]c
             cli.mem_profile = true;
         } else if (std.mem.startsWith(u8, arg, "--inst-memo-bits=")) {
             cli.inst_memo_bits = std.fmt.parseInt(u6, arg["--inst-memo-bits=".len..], 10) catch
-                return error.BadFlagValue;
+                return .reject(.bad_value, arg);
         } else if (std.mem.eql(u8, arg, "--dup-profile")) {
             cli.dup_profile = true;
         } else if (std.mem.startsWith(u8, arg, "--partition-file=")) {
@@ -2204,15 +1130,15 @@ fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8, bad_arg: *[]c
                 cli.file_order = .{ .reverse = {} };
             } else if (std.mem.startsWith(u8, v, "shuffle=")) {
                 cli.file_order = .{ .shuffle = std.fmt.parseInt(u64, v["shuffle=".len..], 10) catch
-                    return error.BadFlagValue };
+                    return .reject(.bad_value, arg) };
             } else if (std.mem.eql(u8, v, "shuffle")) {
                 cli.file_order = .{ .shuffle = 1 };
-            } else return error.BadFlagValue;
+            } else return .reject(.bad_value, arg);
         } else if (std.mem.eql(u8, arg, "--lazy-stats")) {
             cli.lazy_stats = true;
         } else if (std.mem.startsWith(u8, arg, "--inst-focus=")) {
             cli.inst_focus = std.fmt.parseInt(u32, arg["--inst-focus=".len..], 10) catch
-                return error.BadFlagValue;
+                return .reject(.bad_value, arg);
             cli.inst_profile = true;
         } else if (std.mem.eql(u8, arg, "--pretty")) {
             cli.pretty = true;
@@ -2223,44 +1149,71 @@ fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8, bad_arg: *[]c
             } else if (std.mem.eql(u8, v, "false")) {
                 cli.pretty = false;
             } else {
-                return error.BadFlagValue;
+                return .reject(.bad_value, arg);
             }
         } else if (std.mem.eql(u8, arg, "--project") or std.mem.eql(u8, arg, "-p")) {
             i += 1;
-            if (i >= args.len) return error.MissingFlagValue;
+            if (i >= args.len) return .reject(.missing_value, arg);
             cli.project = args[i];
         } else if (std.mem.startsWith(u8, arg, "--project=")) {
             cli.project = arg["--project=".len..];
         } else if (std.mem.startsWith(u8, arg, "--workers=")) {
             const n = std.fmt.parseInt(usize, arg["--workers=".len..], 10) catch
-                return error.BadFlagValue;
-            if (n == 0) return error.BadFlagValue;
+                return .reject(.bad_value, arg);
+            if (n == 0) return .reject(.bad_value, arg);
             cli.workers = n;
         } else if (std.mem.startsWith(u8, arg, "--checkers=")) {
             const n = std.fmt.parseInt(usize, arg["--checkers=".len..], 10) catch
-                return error.BadFlagValue;
-            if (n == 0) return error.BadFlagValue;
+                return .reject(.bad_value, arg);
+            if (n == 0) return .reject(.bad_value, arg);
             cli.checkers = n;
         } else if (std.mem.startsWith(u8, arg, "--repeat=")) {
             cli.repeat = std.fmt.parseInt(usize, arg["--repeat=".len..], 10) catch
-                return error.BadFlagValue;
-            if (cli.repeat == 0) return error.BadFlagValue;
+                return .reject(.bad_value, arg);
+            if (cli.repeat == 0) return .reject(.bad_value, arg);
         } else if (std.mem.startsWith(u8, arg, "-") and arg.len > 1) {
-            return error.UnknownFlag;
+            return .reject(.unknown_flag, arg);
         } else {
             try paths.append(arena, arg);
         }
     }
     cli.paths = paths.items;
-    return cli;
+    return .{ .ok = cli };
+}
+
+/// `parseArgs` on a well-formed argv, or a test failure naming the argument
+/// it rejected.
+fn parseOk(arena: std.mem.Allocator, args: []const [:0]const u8) !Cli {
+    return switch (try parseArgs(arena, args)) {
+        .ok => |c| c,
+        .bad => |b| {
+            std.debug.print("parseArgs rejected '{s}' ({s})\n", .{ b.arg, @tagName(b.problem) });
+            return error.TestUnexpectedResult;
+        },
+    };
+}
+
+/// Assert `args` is rejected for `problem` at argument `arg`.
+fn expectRejected(
+    arena: std.mem.Allocator,
+    args: []const [:0]const u8,
+    problem: ArgProblem,
+    arg: []const u8,
+) !void {
+    switch (try parseArgs(arena, args)) {
+        .ok => return error.TestUnexpectedResult,
+        .bad => |b| {
+            try std.testing.expectEqual(problem, b.problem);
+            try std.testing.expectEqualStrings(arg, b.arg);
+        },
+    }
 }
 
 test "parseArgs flags and paths" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var bad: []const u8 = "";
     const args = [_][:0]const u8{ "ztsc", "--timing", "a.ts", "--memory", "b.ts" };
-    const cli = try parseArgs(arena.allocator(), &args, &bad);
+    const cli = try parseOk(arena.allocator(), &args);
     try std.testing.expect(cli.timing);
     try std.testing.expect(cli.memory);
     try std.testing.expect(!cli.version);
@@ -2269,104 +1222,119 @@ test "parseArgs flags and paths" {
     try std.testing.expectEqualStrings("b.ts", cli.paths[1]);
 }
 
-test "defaultCheckers: size and declaration-surface thresholds" {
-    const eq = std.testing.expectEqual;
-    // An explicit --checkers=N always wins, whatever the shape.
-    try eq(@as(usize, 7), defaultCheckers(7, 10, 1, 1));
-    try eq(@as(usize, 1), defaultCheckers(1, 10, 5_000_000, 20_000_000));
-    // Never more instances than cores.
-    try eq(@as(usize, 2), defaultCheckers(null, 2, 100_000, 100_000));
-
-    // Small program: two, whatever the surface (chalk, ajv).
-    try eq(@as(usize, 2), defaultCheckers(null, 10, 21_106, 21_106));
-    try eq(@as(usize, 2), defaultCheckers(null, 10, 27_991, 27_991));
-    // Mid-size, self-contained: four. The eight parity packages are all
-    // ratio 1.00 because a vendored `.d.ts` corpus is checked directly.
-    try eq(@as(usize, 4), defaultCheckers(null, 10, 37_004, 37_004)); // typebox
-    try eq(@as(usize, 4), defaultCheckers(null, 10, 66_444, 66_444)); // drizzle
-    try eq(@as(usize, 4), defaultCheckers(null, 10, 115_808, 115_808)); // hono
-
-    // The measured inversion, and the reason `check_nodes` alone cannot
-    // decide it: these two differ by 7% in check work and want different
-    // counts. immich 2.61x declaration surface -> two; excalidraw 1.78x -> four.
-    try eq(@as(usize, 2), defaultCheckers(null, 10, 437_226, 1_141_165));
-    try eq(@as(usize, 4), defaultCheckers(null, 10, 409_224, 727_326));
-
-    // Large but self-contained stays wide; declaration-heavy but small stays
-    // out of the new rule (the size gate is what keeps it narrow).
-    try eq(@as(usize, 4), defaultCheckers(null, 10, 900_000, 900_000));
-    try eq(@as(usize, 4), defaultCheckers(null, 10, 100_000, 900_000));
-
-    // Exactly at each boundary: the ratio test is `>=`, the size test `>=`.
-    try eq(@as(usize, 2), defaultCheckers(null, 10, large_program_nodes, large_program_nodes * 22 / 10));
-    try eq(@as(usize, 4), defaultCheckers(null, 10, large_program_nodes - 1, large_program_nodes * 22 / 10));
-}
-
 test "parseArgs workers, checkers and repeat" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var bad: []const u8 = "";
+    const a = arena.allocator();
     const args = [_][:0]const u8{ "ztsc", "--workers=4", "--checkers=2", "--repeat=10", "a.ts" };
-    const cli = try parseArgs(arena.allocator(), &args, &bad);
+    const cli = try parseOk(a, &args);
     try std.testing.expectEqual(@as(?usize, 4), cli.workers);
     try std.testing.expectEqual(@as(?usize, 2), cli.checkers);
     try std.testing.expectEqual(@as(usize, 10), cli.repeat);
 
-    const bad_workers = [_][:0]const u8{ "ztsc", "--workers=0" };
-    try std.testing.expectError(error.BadFlagValue, parseArgs(arena.allocator(), &bad_workers, &bad));
-    const bad_checkers = [_][:0]const u8{ "ztsc", "--checkers=0" };
-    try std.testing.expectError(error.BadFlagValue, parseArgs(arena.allocator(), &bad_checkers, &bad));
-    const bad_repeat = [_][:0]const u8{ "ztsc", "--repeat=x" };
-    try std.testing.expectError(error.BadFlagValue, parseArgs(arena.allocator(), &bad_repeat, &bad));
-    try std.testing.expectEqualStrings("--repeat=x", bad);
+    try expectRejected(a, &.{ "ztsc", "--workers=0" }, .bad_value, "--workers=0");
+    try expectRejected(a, &.{ "ztsc", "--checkers=0" }, .bad_value, "--checkers=0");
+    try expectRejected(a, &.{ "ztsc", "--repeat=x" }, .bad_value, "--repeat=x");
 }
 
 test "parseArgs rejects unknown flags" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var bad: []const u8 = "";
-    const args = [_][:0]const u8{ "ztsc", "--nope" };
-    try std.testing.expectError(error.UnknownFlag, parseArgs(arena.allocator(), &args, &bad));
-    try std.testing.expectEqualStrings("--nope", bad);
-    const short = [_][:0]const u8{ "ztsc", "-x" };
-    try std.testing.expectError(error.UnknownFlag, parseArgs(arena.allocator(), &short, &bad));
+    const a = arena.allocator();
+    try expectRejected(a, &.{ "ztsc", "--nope" }, .unknown_flag, "--nope");
+    try expectRejected(a, &.{ "ztsc", "-x" }, .unknown_flag, "-x");
 }
 
 test "parseArgs tsconfig flags: pretty, project, help, verbose" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var bad: []const u8 = "";
+    const a = arena.allocator();
 
     const a1 = [_][:0]const u8{ "ztsc", "--pretty", "--verbose", "a.ts" };
-    const c1 = try parseArgs(arena.allocator(), &a1, &bad);
+    const c1 = try parseOk(a, &a1);
     try std.testing.expectEqual(@as(?bool, true), c1.pretty);
     try std.testing.expect(c1.verbose);
 
     const a2 = [_][:0]const u8{ "ztsc", "--pretty=false" };
-    const c2 = try parseArgs(arena.allocator(), &a2, &bad);
+    const c2 = try parseOk(a, &a2);
     try std.testing.expectEqual(@as(?bool, false), c2.pretty);
 
     const a3 = [_][:0]const u8{"ztsc"};
-    const c3 = try parseArgs(arena.allocator(), &a3, &bad);
+    const c3 = try parseOk(a, &a3);
     try std.testing.expectEqual(@as(?bool, null), c3.pretty);
 
     const a4 = [_][:0]const u8{ "ztsc", "-p", "proj/dir" };
-    const c4 = try parseArgs(arena.allocator(), &a4, &bad);
+    const c4 = try parseOk(a, &a4);
     try std.testing.expectEqualStrings("proj/dir", c4.project.?);
 
     const a5 = [_][:0]const u8{ "ztsc", "--project=x/tsconfig.json" };
-    const c5 = try parseArgs(arena.allocator(), &a5, &bad);
+    const c5 = try parseOk(a, &a5);
     try std.testing.expectEqualStrings("x/tsconfig.json", c5.project.?);
 
-    const a6 = [_][:0]const u8{ "ztsc", "-p" };
-    try std.testing.expectError(error.MissingFlagValue, parseArgs(arena.allocator(), &a6, &bad));
-
-    const a7 = [_][:0]const u8{ "ztsc", "--pretty=maybe" };
-    try std.testing.expectError(error.BadFlagValue, parseArgs(arena.allocator(), &a7, &bad));
+    try expectRejected(a, &.{ "ztsc", "-p" }, .missing_value, "-p");
+    try expectRejected(a, &.{ "ztsc", "--pretty=maybe" }, .bad_value, "--pretty=maybe");
 
     const a8 = [_][:0]const u8{ "ztsc", "-h" };
-    const c8 = try parseArgs(arena.allocator(), &a8, &bad);
+    const c8 = try parseOk(a, &a8);
     try std.testing.expect(c8.help);
+}
+
+test "effectiveOptions: the CLI overrides the tsconfig, and only where it says so" {
+    const cfg: ztsc.tsconfig.Config = .{
+        .path = "tsconfig.json",
+        .dir = ".",
+        .lib = &.{"es2015"},
+        .skip_lib_check = true,
+        .skip_all_lib_check = true,
+        .allow_js = true,
+        .no_implicit_any = false,
+        .experimental_decorators = true,
+        .resolve_json_module = true,
+        .resolve_pkg_json_exports = false,
+        .allow_synthetic_default_imports = false,
+        .base_url = "src",
+        .jsx_runtime_module = "react/jsx-runtime",
+    };
+
+    // No tsconfig: the documented bare-file-argument defaults. Bundler
+    // resolution is why allowSyntheticDefaultImports starts true.
+    const bare = effectiveOptions(.{}, null);
+    try std.testing.expect(bare.allow_synthetic_default);
+    try std.testing.expect(bare.no_implicit_any);
+    try std.testing.expect(bare.resolve_pkg_json_exports);
+    try std.testing.expect(!bare.skip_default_lib_check);
+    try std.testing.expect(!bare.skip_all_dts_check);
+    try std.testing.expectEqual(@as(?[]const u8, null), bare.jsx_runtime_module);
+
+    // With a tsconfig and no overriding flags, every field is the config's.
+    const from_cfg = effectiveOptions(.{}, cfg);
+    try std.testing.expect(from_cfg.skip_default_lib_check);
+    try std.testing.expect(from_cfg.skip_all_dts_check);
+    try std.testing.expect(from_cfg.allow_js);
+    try std.testing.expect(!from_cfg.no_implicit_any);
+    try std.testing.expect(from_cfg.experimental_decorators);
+    try std.testing.expect(from_cfg.resolve_json);
+    try std.testing.expect(!from_cfg.resolve_pkg_json_exports);
+    try std.testing.expect(!from_cfg.allow_synthetic_default);
+    try std.testing.expectEqualStrings("src", from_cfg.base_url.?);
+    try std.testing.expectEqualStrings("react/jsx-runtime", from_cfg.jsx_runtime_module.?);
+    try std.testing.expectEqual(libs.resolveLibSet(&.{"es2015"}), from_cfg.lib_set);
+
+    // `--skip-default-lib-check` is a tri-state: absent leaves the config's
+    // value (above), present wins in EITHER direction — and it never touches
+    // the skipLibCheck superset, which only a tsconfig can set.
+    try std.testing.expect(!effectiveOptions(.{ .skip_default_lib_check = false }, cfg).skip_default_lib_check);
+    try std.testing.expect(effectiveOptions(.{ .skip_default_lib_check = false }, cfg).skip_all_dts_check);
+    try std.testing.expect(effectiveOptions(.{ .skip_default_lib_check = true }, null).skip_default_lib_check);
+    try std.testing.expect(!effectiveOptions(.{ .skip_default_lib_check = true }, null).skip_all_dts_check);
+
+    // Lib precedence: --noLib beats everything, then --lib, then the config.
+    try std.testing.expectEqual(libs.LibSet.none, effectiveOptions(.{ .no_lib = true, .lib = &.{"dom"} }, cfg).lib_set);
+    try std.testing.expectEqual(
+        libs.resolveLibSet(&.{"dom"}),
+        effectiveOptions(.{ .lib = &.{"dom"} }, cfg).lib_set,
+    );
+    try std.testing.expectEqual(libs.resolveLibSet(null), effectiveOptions(.{}, null).lib_set);
 }
 
 test "arena accounting sanity: capacity grows with allocations and covers usage" {

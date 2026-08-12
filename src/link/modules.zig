@@ -56,6 +56,9 @@ const source = @import("../frontend/source.zig");
 const libs = @import("../libs.zig");
 const paths = @import("paths.zig");
 const resolve = @import("resolve.zig");
+// Only for `Discovery.paths_map` (the tsconfig `paths` table). tsconfig.zig
+// imports this file back, but only inside a test, so the cycle is inert.
+const tsconfig = @import("../tsconfig.zig");
 
 const Ast = ast.Ast;
 const Bind = binder.Bind;
@@ -100,6 +103,21 @@ pub const AmbientExport = program.AmbientExport;
 /// Serial wavefront: load, parse, bind and resolve transitively from
 /// `entries` (paths relative to `dir`), then link. Everything lives in
 /// `arena`.
+///
+/// Tests and tools only — the CLI runs driver.zig's parallel pipeline. The
+/// per-FILE half of discovery is now literally the same code in both
+/// (`Discovery` below), which is the half that had drifted. What is still
+/// two implementations is the SCHEDULING half, and deliberately so: this walks
+/// one pending list in one thread and assigns ids in discovery order, while
+/// the driver front-ends files on a worker pool and re-derives the ids from
+/// the import graph afterwards.
+///
+/// TODO: the remaining shared-by-convention parts are the seeding of the lib
+/// shards and the entry paths (which this does not canonicalize, and which
+/// therefore cannot see a root reached twice through a symlink) and the
+/// `@types/node` auto-injection (which this does not do at all). A test-only
+/// program built from a config that needs either will differ from the CLI's;
+/// fold them in here, not in a third copy.
 pub fn buildProgram(
     arena: Allocator,
     io: Io,
@@ -141,6 +159,22 @@ pub fn buildProgram(
         }
     }
 
+    // The per-file half of discovery, shared verbatim with the parallel
+    // driver. `pending` IS the discovery order here, so it doubles as the
+    // shared `paths` list.
+    const disco: Discovery = .{
+        .arena = arena,
+        .store = scratch,
+        .seen_alloc = scratch,
+        .scratch = scratch,
+        .io = io,
+        .dir = dir,
+        .interner = interner,
+        .rcache = &rcache,
+        .paths = &pending,
+        .path_ids = &path_ids,
+    };
+
     var jsx_runtime_fid: FileId = no_file;
     var next: usize = 0;
     while (next < pending.items.len) : (next += 1) {
@@ -175,29 +209,15 @@ pub fn buildProgram(
         if (jsx_runtime_fid == no_file and jsx_runtime_module != null and
             std.mem.endsWith(u8, path, ".tsx"))
         {
-            if (try rcache.resolve(io, scratch, dir, path, jsx_runtime_module.?)) |jp| {
-                const stable = try arena.dupe(u8, jp);
-                const gop = try path_ids.getOrPut(scratch, stable);
-                if (!gop.found_existing) {
-                    gop.value_ptr.* = @intCast(pending.items.len);
-                    try pending.append(scratch, stable);
-                }
-                jsx_runtime_fid = gop.value_ptr.*;
-            }
+            if (try disco.discoverModule(path, jsx_runtime_module.?)) |jf| jsx_runtime_fid = jf;
         }
 
         // Triple-slash `/// <reference>` directives pull extra files into the
         // program — not import bindings, just program inputs.
         var type_ref_misses: std.ArrayList(TypeRefMiss) = .empty;
         for (try resolve.scanReferences(scratch, bytes)) |ref| {
-            if (try rcache.resolveRef(io, scratch, dir, path, ref)) |resolved| {
-                const stable = try arena.dupe(u8, resolved);
-                const gop = try path_ids.getOrPut(scratch, stable);
-                if (!gop.found_existing) {
-                    gop.value_ptr.* = @intCast(pending.items.len);
-                    try pending.append(scratch, stable);
-                }
-            } else if (ref.kind == .types) {
+            const rfid = try disco.discoverReference(path, ref);
+            if (rfid == no_file and ref.kind == .types) {
                 try type_ref_misses.append(arena, typeRefMiss(ref));
             }
         }
@@ -206,25 +226,8 @@ pub fn buildProgram(
         var spec_atoms: std.ArrayList(Atom) = .empty;
         var spec_files: std.ArrayList(FileId) = .empty;
         var seen: std.AutoHashMapUnmanaged(Atom, void) = .empty;
-        for (bound.imports) |rec| {
-            try resolveOne(arena, scratch, io, &rcache, dir, interner, path, rec.module, &spec_atoms, &spec_files, &seen, &path_ids, &pending);
-        }
-        for (bound.exports) |rec| {
-            if (rec.module != 0) {
-                try resolveOne(arena, scratch, io, &rcache, dir, interner, path, rec.module, &spec_atoms, &spec_files, &seen, &path_ids, &pending);
-            }
-        }
-        // A `declare module "spec" { … }` block in a file that is itself a
-        // MODULE is a module augmentation, and its specifier is a module
-        // reference of this file just like an import (tsc's `getModuleNames`
-        // = `file.imports` ++ `file.moduleAugmentations`). See the same loop
-        // in the CLI driver for what dropping it cost.
-        if (bound.is_module) {
-            for (bound.ambient_modules) |am| {
-                try resolveOne(arena, scratch, io, &rcache, dir, interner, path, am.spec, &spec_atoms, &spec_files, &seen, &path_ids, &pending);
-            }
-        }
-        sortSpecs(spec_atoms.items, spec_files.items);
+        try disco.fileSpecs(path, bound, &seen, &spec_atoms, &spec_files);
+        sortSpecPairs(spec_atoms.items, spec_files.items);
 
         try files.append(arena, .{
             .path = path,
@@ -2268,45 +2271,194 @@ fn sortByKeyU32(scratch: Allocator, keys: []u32, vals: []Target) Error!void {
 }
 
 // ===========================================================================
-// serial program builder (tests, tools; main.zig runs the parallel version)
+// discovery: turning one bound file's module references into file ids
+//
+// Both program builders share this. `buildProgram` above walks a pending list
+// serially; the CLI driver (driver.zig) resolves each worker completion as it
+// arrives. What they must agree on is the per-FILE step — which references
+// count as module references, how a specifier becomes a path, and how a path
+// becomes a file id — because a difference there is a difference in the
+// program, and the two copies have drifted before.
 // ===========================================================================
 
-fn resolveOne(
+/// Everything a file's specifier resolution needs that does not vary from
+/// file to file. The caller owns the discovery state this points at
+/// (`paths` is the discovery order, `path_ids` its inverse) and drives the
+/// scheduling; this only answers "what does this file reference".
+pub const Discovery = struct {
+    /// Program-lifetime allocator: the resolved path strings kept in `paths`
+    /// (and used as `path_ids` keys) are duped into it.
     arena: Allocator,
+    /// Backs the discovery bookkeeping: `paths`, `path_ids`, and the per-file
+    /// spec-map lists. Separate from `arena` because the serial builder keeps
+    /// this state in scratch and only the paths themselves must outlive it.
+    store: Allocator,
+    /// Backs the caller's per-file `seen` set. Separate again: the parallel
+    /// driver creates and frees one per completion, so it must not grow an
+    /// arena that lives for the whole run.
+    seen_alloc: Allocator,
+    /// Transient — candidate paths and `package.json` bodies. The caller
+    /// resets it between files; nothing here retains a pointer into it.
     scratch: Allocator,
     io: Io,
-    rcache: *ResolveCache,
+    /// The directory relative paths resolve against.
     dir: Io.Dir,
     interner: *Interner,
-    importer: []const u8,
-    module_atom: Atom,
-    spec_atoms: *std.ArrayList(Atom),
-    spec_files: *std.ArrayList(FileId),
-    seen: *std.AutoHashMapUnmanaged(Atom, void),
+    rcache: *ResolveCache,
+    /// tsconfig `paths`, or null when the run has no config.
+    paths_map: ?tsconfig.Paths = null,
+    /// tsconfig `resolveJsonModule`, needed here (not just in `ResolveOpts`)
+    /// because a `paths`-mapped `*.json` takes its own resolution route.
+    resolve_json: bool = false,
+    /// Discovered files in discovery order; a file's id is its index.
+    paths: *std.ArrayList([]const u8),
+    /// Path -> file id, over the very same strings `paths` holds.
     path_ids: *std.StringHashMapUnmanaged(FileId),
-    pending: *std.ArrayList([]const u8),
-) !void {
-    if (module_atom == 0) return;
-    const gop = try seen.getOrPut(scratch, module_atom);
-    if (gop.found_existing) return;
-    const spec = interner.lookup(io, module_atom);
-    var fid: FileId = no_file;
-    if (try rcache.resolve(io, scratch, dir, importer, spec)) |resolved| {
-        const stable = try arena.dupe(u8, resolved);
-        const pgop = try path_ids.getOrPut(scratch, stable);
-        if (pgop.found_existing) {
-            fid = pgop.value_ptr.*;
-        } else {
-            fid = @intCast(pending.items.len);
-            pgop.value_ptr.* = fid;
-            try pending.append(scratch, stable);
+
+    /// The file id of an already-resolved path, discovering it (appending to
+    /// `paths`) if this is its first mention.
+    pub fn fileFor(d: *const Discovery, resolved: []const u8) !FileId {
+        const gop = try d.path_ids.getOrPut(d.store, resolved);
+        if (gop.found_existing) return gop.value_ptr.*;
+        // Give the map a stable key and `paths` a stable slice: `resolved` is
+        // usually scratch-owned and about to be reset away.
+        const stable = try d.arena.dupe(u8, resolved);
+        gop.key_ptr.* = stable;
+        const fid: FileId = @intCast(d.paths.items.len);
+        gop.value_ptr.* = fid;
+        try d.paths.append(d.store, stable);
+        return fid;
+    }
+
+    /// Resolve one module specifier of `importer`, appending the
+    /// (atom, file) pair to the file's spec map and discovering new files.
+    /// A specifier already seen in this file contributes nothing (the spec
+    /// map is keyed by atom).
+    pub fn resolveSpec(
+        d: *const Discovery,
+        importer: []const u8,
+        module_atom: Atom,
+        seen: *std.AutoHashMapUnmanaged(Atom, void),
+        atoms: *std.ArrayList(Atom),
+        files: *std.ArrayList(FileId),
+    ) !void {
+        if (module_atom == 0) return;
+        const gop = try seen.getOrPut(d.seen_alloc, module_atom);
+        if (gop.found_existing) return;
+        const spec = d.interner.lookup(d.io, module_atom);
+        var fid: FileId = no_file;
+        // tsconfig `paths` mapping applies to bare specifiers first;
+        // unmatched or unresolved candidates fall through to normal
+        // resolution, like tsc.
+        var mapped: ?[]const u8 = null;
+        if (d.paths_map) |pm| {
+            if (spec.len > 0 and spec[0] != '.' and spec[0] != '/') {
+                // A `paths`-mapped `*.json` (`@fixtures/apis/x.json`) resolves to the
+                // JSON file directly — `resolveStem` only probes TS/declaration
+                // extensions and would miss it.
+                const is_json = d.resolve_json and std.mem.endsWith(u8, spec, ".json");
+                for (try pm.mapSpecifier(d.scratch, spec)) |cand| {
+                    const r = if (is_json)
+                        try resolve.resolveJsonFile(d.io, d.scratch, d.dir, cand)
+                    else
+                        // Full "load as file or folder" — a substitution that names
+                        // a package directory is resolved through its
+                        // `package.json`, not just by stem probing
+                        // (`resolvePathsCandidate`), under the same `ResolveOpts`
+                        // every other probe of this run sees.
+                        try d.rcache.pathsCandidate(d.io, d.scratch, d.dir, cand);
+                    if (r) |rr| {
+                        mapped = rr;
+                        break;
+                    }
+                }
+            }
+        }
+        // `paths`-mapped bare specifiers bypass the cache: their resolution is a
+        // different decision (a tsconfig remap), rare, and one `resolveStem` call.
+        // Everything else — the common case — goes through the memo.
+        if (mapped orelse try d.rcache.resolve(d.io, d.scratch, d.dir, importer, spec)) |resolved| {
+            fid = try d.fileFor(resolved);
+        }
+        try atoms.append(d.store, module_atom);
+        try files.append(d.store, fid);
+    }
+
+    /// Every module reference of one bound file, in tsc's order. The result is
+    /// the file's spec map (unsorted — the caller sorts with `sortSpecPairs`,
+    /// which the atom renumbering may have to redo).
+    pub fn fileSpecs(
+        d: *const Discovery,
+        importer: []const u8,
+        bound: *const Bind,
+        seen: *std.AutoHashMapUnmanaged(Atom, void),
+        atoms: *std.ArrayList(Atom),
+        files: *std.ArrayList(FileId),
+    ) !void {
+        for (bound.imports) |rec| {
+            try d.resolveSpec(importer, rec.module, seen, atoms, files);
+        }
+        for (bound.exports) |rec| {
+            if (rec.module != 0) {
+                try d.resolveSpec(importer, rec.module, seen, atoms, files);
+            }
+        }
+        // A `declare module "spec" { … }` block inside a file that is
+        // itself a MODULE is a module *augmentation*, and its specifier is
+        // a module reference of this file exactly like an import is —
+        // tsc's `getModuleNames` appends `file.moduleAugmentations` to
+        // `file.imports` before `processImportedModules` resolves them.
+        // Without it `f.specs` only held specifiers some import/export
+        // clause happened to name, so `mergeAugmentations` could not find
+        // the augmented file and dropped the block: an augmentation that
+        // is the ONLY mention of the module in its file never merged.
+        //
+        // That is the shape a package uses to augment ITSELF from a
+        // sibling file — @tiptap/core's `dist/commands/*.d.ts` each carry
+        // `declare module '@tiptap/core' { interface Commands<R> { … } }`
+        // while importing only relative paths — so `Commands` stayed
+        // empty except for the handful of third-party extension packages
+        // (which DO import '@tiptap/core' for other reasons), and every
+        // `editor.commands.*` / `editor.chain().*` was a TS2339.
+        //
+        // Gated on `bound.is_module`, tsc's `isExternalModuleFile`: in a
+        // SCRIPT the same block is a standalone ambient module declaration
+        // (@types/node's `declare module "fs"`), not an augmentation, and
+        // must not resolve to anything.
+        if (bound.is_module) {
+            for (bound.ambient_modules) |am| {
+                try d.resolveSpec(importer, am.spec, seen, atoms, files);
+            }
         }
     }
-    try spec_atoms.append(scratch, module_atom);
-    try spec_files.append(scratch, fid);
-}
 
-fn sortSpecs(atoms: []Atom, files: []FileId) void {
+    /// Pull a module into the program as a program INPUT rather than as an
+    /// import binding — the auto-injected `@types/node` and
+    /// `<jsxImportSource>/jsx-runtime`. Null when it does not resolve.
+    pub fn discoverModule(d: *const Discovery, importer: []const u8, spec: []const u8) !?FileId {
+        const resolved = try d.rcache.resolve(d.io, d.scratch, d.dir, importer, spec) orelse
+            return null;
+        return try d.fileFor(resolved);
+    }
+
+    /// Discover a triple-slash reference target as a program input. Unlike
+    /// `resolveSpec` it records no import-specifier binding, and resolution
+    /// goes through `ResolveCache.resolveRef`, so the target is keyed by its
+    /// canonical path — the same identity an `import` of that file would get.
+    /// `no_file` when the directive resolves to nothing (a `types=` miss is
+    /// the linker's TS2688; the caller decides).
+    pub fn discoverReference(d: *const Discovery, importer: []const u8, ref: resolve.RefDirective) !FileId {
+        if (try d.rcache.resolveRef(d.io, d.scratch, d.dir, importer, ref)) |resolved| {
+            return try d.fileFor(resolved);
+        }
+        return no_file;
+    }
+};
+
+/// Sort a file's spec map by atom, keeping the (atom, file) pairs together.
+/// Insertion sort: a file's specifiers arrive nearly sorted (atoms are handed
+/// out in source order), and the run of one file's specifiers is short.
+pub fn sortSpecPairs(atoms: []Atom, files: []FileId) void {
     var i: usize = 1;
     while (i < atoms.len) : (i += 1) {
         var j = i;
