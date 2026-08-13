@@ -778,7 +778,7 @@ pub fn propertyKeyType(c: *Checker) Error!TypeId {
 
 /// Fold one heritage base into a derived interface/class shape.
 ///
-/// Everything except an `any` base is `instantiate.mergeBaseObject` verbatim.
+/// Everything except an `any` base is `classes.mergeBaseObjectPlain` verbatim.
 /// An `any` base is the case that one silently dropped (its object-only guard
 /// handed `derived` straight back), and it is not a no-op in tsc:
 /// `interface DefaultState extends DefaultStateExtends {}` over

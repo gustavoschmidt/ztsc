@@ -1363,7 +1363,8 @@ pub const Checker = struct {
     /// `infer_visited` entry must never let a shallower repeat be skipped.
     infer_trunc: bool = false,
     /// Recursive `inferFromExtends` calls made by the in-flight inference root.
-    /// Its guards arm only past `max_infer_steps` — see the escape hatch there.
+    /// Its guards arm only past `generics.max_infer_steps` — see the escape
+    /// hatch there.
     infer_steps: u64 = 0,
     /// tsc's `priority` — the `InferencePriority` bitmask of the position
     /// `inferFromExtends` is currently walking. `inferWithPriority` ORs a bit
