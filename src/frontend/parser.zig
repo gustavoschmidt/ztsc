@@ -347,6 +347,19 @@ const Parser = struct {
         });
     }
 
+    /// A diagnostic spanning a whole consumed token run, `from`..`to`
+    /// inclusive — the shape tsc's `parseErrorAt(node.pos, node.end)` gives a
+    /// grammar error blamed on an entire expression rather than one token.
+    fn errAtRange(p: *Parser, code: Code, from: u32, to: u32) Error!void {
+        const start = p.tok_starts.items[from] & scanner.Tokens.start_mask;
+        const to_start = p.tok_starts.items[to] & scanner.Tokens.start_mask;
+        const end = scanner.tokenEnd(p.src, p.tok_tags.items[to], to_start);
+        try p.diags.append(p.gpa, .{
+            .code = code,
+            .span = .{ .start = start, .end = if (end > start) end else start + 1 },
+        });
+    }
+
     fn tokTagAt(p: *Parser, tok: u32) TokTag {
         return p.tok_tags.items[tok];
     }
@@ -2699,7 +2712,57 @@ const Parser = struct {
         if (bad) try p.errAtToken(.nullish_mixed_with_logical, op_tok);
     }
 
+    /// tsc's `parseUnaryExpressionOrHigher`: parse one unary expression, then
+    /// — and only at this outermost level — enforce the ES2016 exponentiation
+    /// grammar, whose left operand is an `UpdateExpression`, never a
+    /// `UnaryExpression`. `-a ** b` is therefore a syntax error asking for
+    /// parentheses; `++a ** b` and `a++ ** b` are updates and are fine.
+    ///
+    /// The check lives here rather than one level down in
+    /// `parseSimpleUnaryExpr` for the reason tsc splits the two functions:
+    /// in `- -a ** b` only the OUTER unary is the left operand of `**`, so
+    /// exactly one error is due. Nested prefix operators recurse into
+    /// `parseSimpleUnaryExpr`, which never looks at what follows.
     fn parseUnaryExpr(p: *Parser, ctx: ExprCtx) PE!Node {
+        const first_tok = p.curIdx();
+        const node = try p.parseSimpleUnaryExpr(ctx);
+        if (p.curTag() == .asterisk_asterisk) {
+            // Speculation reports nothing (`checkNullishMixing`'s rule): a
+            // discarded parse must not leave a diagnostic behind, and the
+            // real parse that follows reaches this same point.
+            if (p.spec == 0) {
+                if (expLhsCode(p, node)) |code| try p.errAtRange(code, first_tok, p.lastIdx());
+            }
+        }
+        return node;
+    }
+
+    /// The grammar code owed for a `**` left operand that parsed as `node`, or
+    /// null when the operand is an `UpdateExpression` (a `++`/`--` prefix or
+    /// postfix, or a plain left-hand-side expression) and therefore legal.
+    fn expLhsCode(p: *Parser, node: Node) ?Code {
+        const main = p.nodes.items(.main_token)[node];
+        return switch (p.nodes.items(.tag)[node]) {
+            .prefix_unary => switch (p.tokTagAt(main)) {
+                .plus => .exp_lhs_plus,
+                .minus => .exp_lhs_minus,
+                .tilde => .exp_lhs_tilde,
+                .bang => .exp_lhs_bang,
+                .keyword_delete => .exp_lhs_delete,
+                .keyword_void => .exp_lhs_void,
+                .keyword_typeof => .exp_lhs_typeof,
+                .keyword_await => .exp_lhs_await,
+                // `++x` / `--x` are UpdateExpressions: legal.
+                else => null,
+            },
+            // `<T>x ** 2`. `x as T` cannot arrive here — `as` is parsed by
+            // `parseBinaryExpr`, above this function.
+            .as_expr => if (p.tokTagAt(main) == .lt) .exp_lhs_type_assertion else null,
+            else => null,
+        };
+    }
+
+    fn parseSimpleUnaryExpr(p: *Parser, ctx: ExprCtx) PE!Node {
         // Legacy angle-bracket type assertion `<T>expr`. Only in files where
         // JSX is off: in a `.tsx`/`.jsx` file a `<` in expression position
         // opens an element and tsc rejects this assertion form outright.
@@ -2711,7 +2774,7 @@ const Parser = struct {
         switch (p.curTag()) {
             .bang, .tilde, .plus, .minus, .plus_plus, .minus_minus, .keyword_typeof, .keyword_void, .keyword_delete => {
                 const op = try p.bump();
-                const operand = try p.parseUnaryExpr(ctx);
+                const operand = try p.parseSimpleUnaryExpr(ctx);
                 return p.addNode(.{ .tag = .prefix_unary, .main_token = op, .data = .{ .lhs = operand, .rhs = 0 } });
             },
             .keyword_await => {
@@ -2719,7 +2782,7 @@ const Parser = struct {
                 // an ordinary identifier.
                 if (canStartExpression(p.peekTag(1)) and p.peekTag(1) != .colon) {
                     const op = try p.bump();
-                    const operand = try p.parseUnaryExpr(ctx);
+                    const operand = try p.parseSimpleUnaryExpr(ctx);
                     return p.addNode(.{ .tag = .prefix_unary, .main_token = op, .data = .{ .lhs = operand, .rhs = 0 } });
                 }
             },
@@ -2741,7 +2804,7 @@ const Parser = struct {
         else
             try p.parseType();
         _ = try p.expectGt();
-        const operand = try p.parseUnaryExpr(ctx);
+        const operand = try p.parseSimpleUnaryExpr(ctx);
         return p.addNode(.{ .tag = .as_expr, .main_token = lt, .data = .{ .lhs = operand, .rhs = ty } });
     }
 
