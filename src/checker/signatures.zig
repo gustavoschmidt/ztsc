@@ -31,6 +31,7 @@ const containsTypeParam = @import("enums.zig").containsTypeParam;
 const destructure = @import("destructure.zig");
 const finalizeInferredReturn = @import("names.zig").finalizeInferredReturn;
 const hasValueMeaning = @import("names.zig").hasValueMeaning;
+const implicit_any = @import("implicit_any.zig");
 const modvalue = @import("modvalue.zig");
 const narrowByCondition = @import("flow.zig").narrowByCondition;
 const widenLiteral = @import("names.zig").widenLiteral;
@@ -53,7 +54,7 @@ pub fn signatureOfProtoCtx(
     node: Node,
     proto_idx: u32,
     is_method: bool,
-    report_implicit: bool,
+    report_implicit0: bool,
     ctx_sig: TypeId,
 ) Error!TypeId {
     if (c.sig_cache.get(c.nodeKey(node))) |cached| {
@@ -63,6 +64,12 @@ pub fn signatureOfProtoCtx(
     const saved_scope = c.cur_scope;
     defer c.cur_scope = saved_scope;
     if (try c.scopeOf(node)) |s| c.cur_scope = s;
+    // tsc suppresses the whole implicit-'any' family on a `private` member of
+    // an ambient class (`declare class C { private m(a); }`, and every such
+    // member in a `.d.ts`): its parameter types are unobservable from
+    // outside, so no annotation is demanded. Decided after the scope switch —
+    // ambient-ness is read off the enclosing scope chain.
+    const report_implicit = report_implicit0 and !implicit_any.isPrivateAmbientMember(c, node);
 
     // Type parameters (global symbol ids in the signature type).
     var tps: std.ArrayList(u32) = .empty;
@@ -547,6 +554,10 @@ fn paramInfo(c: *Checker, pn: Node, index: u32, ctx_sig: TypeId, report_implicit
         if (init_node != 0) _ = try c.checkExprCached(init_node, ty);
     } else if (init_node != 0) {
         ty = try c.widenLiteral(try c.checkExprCached(init_node, types.no_type));
+        // tsc's `padTupleType`: `([x, y] = [1])` pads the pattern's unfilled
+        // positions with `any`, and each padded element with no default of
+        // its own is a TS7031.
+        if (report_implicit) try implicit_any.reportPaddedTupleImplicitAny(c, name_node, init_node, ty);
         // A parameter whose NAME is an object binding pattern takes its
         // type from the initializer, but each property the pattern
         // destructures WITH A DEFAULT is optional there — the default
@@ -566,6 +577,10 @@ fn paramInfo(c: *Checker, pn: Node, index: u32, ctx_sig: TypeId, report_implicit
             const tok = c.tree.nodeMainToken(name_node);
             try c.diagFmt(7006, c.tokSpan(tok), "Parameter '{s}' implicitly has an 'any' type.", .{c.tokenText(tok)});
         }
+        // A DESTRUCTURED parameter has no name to report TS7006 against: tsc
+        // builds its type out of the pattern instead and reports TS7031 at
+        // each leaf the pattern leaves as `any`.
+        if (report_implicit and name == 0) try implicit_any.reportPatternImplicitAny(c, name_node);
         ty = types.any_type;
     }
     // `x?: T` reads as T | undefined.
