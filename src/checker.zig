@@ -1729,10 +1729,9 @@ pub const Checker = struct {
     /// / `Unreliable`, same purpose: a measurement whose relation was truncated
     /// must fall back to the structural walk, not silently answer "bivariant".
     rel_guard_tripped: bool = false,
-    /// tsc's `Ternary.Maybe`, carried out-of-band. Set by every relation frame
-    /// that answered from ASSUMPTION rather than from evidence — an in-progress
-    /// (cycle) hit, the growing-instantiation guard, the depth cut — and read
-    /// by `relate` on the way out.
+    /// tsc's `Ternary.Maybe`: did the walk below the live relation frame answer
+    /// from ASSUMPTION rather than from evidence — an in-progress (cycle) hit,
+    /// the growing-instantiation guard, the depth cut?
     ///
     /// A pair whose verdict rests on an assumption is not a fact about the
     /// pair; it is a fact about the WALK that reached it. Publishing it to
@@ -1743,10 +1742,22 @@ pub const Checker = struct {
     /// `maybeKeys` stack instead of in `relation`, and commits them only at a
     /// frame that did not need the assumption.
     ///
-    /// `relate` therefore clears it around the walk, and on the way out either
-    /// publishes (the walk used no assumption) or withdraws the in-progress
-    /// mark and propagates the flag to the caller, whose own verdict now rests
-    /// on the same assumption.
+    /// HALF of a protocol, and the half that is not a return value. A relation
+    /// frame RETURNS its own provisional-ness (`assign.RelAnswer`), and the
+    /// memo writes decide from that returned answer, so no frame can answer
+    /// optimistically without saying so in its type. But a frame reaches the
+    /// rest of the walk through `isAssignableInner` and through per-shape
+    /// helpers spread over several checker files, all of which answer with a
+    /// bare `bool` and would have to grow a verdict parameter apiece to say
+    /// otherwise — and `isAssignable`, the 60-caller public entry point, would
+    /// have to change shape with them. So this field is where THOSE frames
+    /// report back: `relate` clears it, runs the walk, and reads what the walk
+    /// deposited; `assign.relateFolded` is the one place a returned answer is
+    /// folded into it, on every path that leaves the returned protocol.
+    ///
+    /// Only `relate`'s read (post-clear) decides anything. A value visible at
+    /// `rel_depth == 0` is inert: every other reader (`relate`'s save,
+    /// `variance.measuredVariances`') only restores it afterwards.
     rel_assumed: bool = false,
     /// tsc's `maybeKeys`: the `relation` keys whose in-progress mark is still
     /// standing because the frame that wrote it could only answer from
