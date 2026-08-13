@@ -250,6 +250,7 @@ pub const Worker = struct {
         while (r < repeat) : (r += 1) {
             var opts = w.parse_opts;
             opts.jsx = parser.isJsxPath(path);
+            opts.dts = parser.isDeclarationPath(path);
             var tree = parser.parseOpts(w.scratch.allocator(), src.bytes, opts) catch break;
             std.mem.doNotOptimizeAway(&tree);
             _ = w.scratch.reset(.retain_capacity);
@@ -260,6 +261,7 @@ pub const Worker = struct {
         };
         var file_opts = w.parse_opts;
         file_opts.jsx = parser.isJsxPath(path);
+        file_opts.dts = parser.isDeclarationPath(path);
         tree.* = parser.parseOpts(alloc, src.bytes, file_opts) catch |err| {
             c.err = err;
             return;

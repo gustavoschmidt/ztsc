@@ -585,6 +585,30 @@ fn checkTdz(c: *Checker, sym: SymbolId, node: Node, tok: TokenIndex) Error!void 
     try c.diagFmt(2448, c.tokSpan(tok), "{s} '{s}' used before its declaration.", .{ kindname, c.tokenText(tok) });
 }
 
+/// tsc's `symbol.valueDeclaration` for a variable symbol: the FIRST
+/// declarator among its declarations. Which one it is matters, because the
+/// modifier rules below read that declaration alone and a merged symbol can
+/// mix them — `var i: I; declare var i: I;` is an ordinary variable that
+/// happens to also have an ambient declaration, and tsc still reports it
+/// unassigned. A merge may also lead with a TYPE-space declaration
+/// (`interface Array` beside `declare var Array: ArrayConstructor`), which is
+/// not the value declaration and is skipped.
+fn valueDeclarator(c: *Checker, decls: []const Node) ?Node {
+    for (decls) |decl| switch (c.nodeTag(decl)) {
+        .declarator, .declarator_init, .declarator_full => return decl,
+        else => {},
+    };
+    return null;
+}
+
+/// Was `decl` written in an ambient context? The parser records tsc's
+/// `NodeFlags.Ambient` on the declarator itself (see `parseDeclarator`).
+fn isAmbientDeclarator(c: *Checker, decl: Node) bool {
+    if (c.nodeTag(decl) != .declarator_full) return false;
+    const e = c.tree.extraData(ast.DeclaratorFull, c.tree.nodeData(decl).rhs);
+    return e.flags & ast.Flags.declare != 0;
+}
+
 fn checkUseBeforeAssigned(c: *Checker, sym: SymbolId, node: Node, tok: TokenIndex, declared: TypeId) Error!void {
     // Only for declarations without initializer whose type excludes
     // undefined/any, used in the same function container.
@@ -604,6 +628,16 @@ fn checkUseBeforeAssigned(c: *Checker, sym: SymbolId, node: Node, tok: TokenInde
             else => has_init = true, // params, for-of bindings, recovery
         }
     }
+    // An AMBIENT declaration (`declare var x: T`, or any `var`/`let` in a
+    // `.d.ts` / `declare namespace` / `declare global` body) has no
+    // initializer to write, so the flow walk always reports it unassigned —
+    // but it describes something the runtime already provides. tsc closes
+    // `assumeInitialized` on `declaration.flags & NodeFlags.Ambient` before
+    // any flow analysis and regardless of where the use sits, so a use even
+    // ahead of the declaration is exempt too.
+    if (valueDeclarator(c, decls)) |vd| {
+        if (isAmbientDeclarator(c, vd)) return;
+    }
     // A use *before* the declaration (TDZ position) is also
     // definitely-unassigned even when the declarator has an
     // initializer (tsc reports 2448 + 2454 together).
@@ -617,9 +651,20 @@ fn checkUseBeforeAssigned(c: *Checker, sym: SymbolId, node: Node, tok: TokenInde
     if (c.containsUndefinedish(declared)) return;
     if (c.containerOf(c.cur_scope) != c.containerOf(c.symScope(sym))) return;
     const flow = c.bind.flowAt(node) orelse return;
-    if (!try c.definitelyAssigned(flow, sym)) {
-        try c.diagFmt(2454, c.tokSpan(tok), "Variable '{s}' is used before being assigned.", .{c.tokenText(tok)});
-    }
+    if (try c.definitelyAssigned(flow, sym)) return;
+    // The assignment walk alone is not tsc's answer. tsc runs the ordinary
+    // narrowing walk over `declared | undefined` (`getOptionalType` is the
+    // initial type whenever `assumeInitialized` is false) and reports only
+    // when undefined SURVIVES it — `getFalsyFlags(flowType) & Undefined`.
+    // So a guard that rules undefined out silences the diagnostic even
+    // though nothing was ever assigned: `isC1(x) && x.p`, `if (x) …`,
+    // `typeof x === "string" && …`. The narrowing walk answers that
+    // directly, and it is asked only once the cheap walk has decided to
+    // report — every clean reference still costs one boolean walk.
+    const optional = try c.makeUnion2(declared, types.undefined_type);
+    const narrowed = try c.flowTypeOfReference(node, sym, optional);
+    if (!c.containsUndefinedish(narrowed)) return;
+    try c.diagFmt(2454, c.tokSpan(tok), "Variable '{s}' is used before being assigned.", .{c.tokenText(tok)});
 }
 
 /// ``tag`a${x}b` `` — a CALL of `tag` with the template's cooked-strings
