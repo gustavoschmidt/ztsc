@@ -470,7 +470,7 @@ pub fn build(
         .path_ids = &path_ids,
     };
 
-    const entries = try seedRoots(arena, io, rcache, &resolve_scratch, &tables.paths, &path_ids, opts);
+    const entries = try seedRoots(arena, &disco, &resolve_scratch, opts);
 
     var work = Channel(WorkItem).init(io);
     defer work.deinit();
@@ -568,19 +568,15 @@ pub fn build(
             defer seen.deinit(gpa);
             try disco.fileSpecs(importer, b, &seen, &atoms, &files);
             // Pull @types/node into the program on the first Node built-in
-            // import (`node:fs`, `path`, …), like tsc auto-including @types: its
-            // ambient `declare module "fs"` / `declare module "node:fs"` blocks
-            // then resolve those specifiers. Injected once, discovered like a
-            // triple-slash reference so the deterministic BFS reaches it (and,
-            // via its own `/// <reference>` refs, every submodule .d.ts).
+            // import (`node:fs`, `path`, …), like tsc auto-including @types
+            // (`Discovery.discoverNodeTypes`, shared with the serial builder).
+            // Injected once, discovered like a triple-slash reference so the
+            // deterministic BFS reaches it (and, via its own `/// <reference>`
+            // refs, every submodule .d.ts).
             if (node_types_fid == null) {
-                for (b.imports) |rec| {
-                    if (!paths_mod.isNodeBuiltin(interner.lookup(io, rec.module))) continue;
-                    if (try disco.discoverModule(importer, "@types/node")) |nf| {
-                        node_types_fid = nf;
-                        try ref_files.append(arena, nf);
-                    }
-                    break;
+                if (try disco.discoverNodeTypes(importer, b)) |nf| {
+                    node_types_fid = nf;
+                    try ref_files.append(arena, nf);
                 }
             }
             // Under the automatic JSX runtime the `JSX` namespace is an export
@@ -673,24 +669,16 @@ pub fn build(
 const Entries = struct { root_end: usize, total: usize };
 
 /// Seed the file table with the built-in lib shards and the program roots.
+/// Both seeding steps are `modules.Discovery`'s, shared with the serial
+/// `buildProgram`, so the two pipelines cannot disagree about which files a
+/// program starts from.
 fn seedRoots(
     arena: Allocator,
-    io: Io,
-    rcache: *resolve.ResolveCache,
+    disco: *const modules.Discovery,
     resolve_scratch: *std.heap.ArenaAllocator,
-    file_paths: *std.ArrayList([]const u8),
-    path_ids: *std.StringHashMapUnmanaged(FileId),
     opts: Options,
 ) !Entries {
-    // Inject the selected built-in lib blobs as the first entries (files 0..).
-    // Their synthetic paths route to the embedded sources in the worker front
-    // end; their top-level decls become the program globals. Empty under
-    // --noLib / lib:[].
-    var lib_buf: [libs.max_lib_files]libs.LibFile = undefined;
-    for (libs.libFiles(opts.lib_set, &lib_buf)) |lf| {
-        try path_ids.put(arena, lf.path, @intCast(file_paths.items.len));
-        try file_paths.append(arena, lf.path);
-    }
+    try disco.seedLibs(opts.lib_set);
 
     // `--file-order`: permute the roots before a single id is handed out.
     // Everything downstream — file ids, the BFS discovery order, the cost
@@ -716,14 +704,7 @@ fn seedRoots(
         },
     }
 
-    // Program roots. A root under `node_modules` — in practice the auto-included
-    // `@types/*` ambient roots, which pnpm exposes as symlinks into its store —
-    // is keyed by its canonical path, the same identity the module resolver
-    // gives the very same file when an `import` reaches it. Without that step
-    // `node_modules/@types/react/index.d.ts` and the store path behind the
-    // symlink are two files with two symbol universes. Outside `node_modules`
-    // the call is a no-op, so project roots keep the path the user typed (and
-    // pay no realpath syscall).
+    // Program roots (canonicalized — see `Discovery.seedEntry`).
     //
     // `root_end` is where the auto-included `@types/*` roots start in `paths`
     // — the second BFS wave in the renumbering block. A `@types/*` path
@@ -731,19 +712,11 @@ fn seedRoots(
     var root_end: usize = 0;
     const waves = [2][]const []const u8{ entry_paths[0..opts.n_real_roots], entry_paths[opts.n_real_roots..] };
     for (waves, 0..) |wave, wi| {
-        if (wi == 1) root_end = file_paths.items.len;
-        for (wave) |p| {
-            const norm = try paths_mod.normalizePath(arena, p);
-            const key = try rcache.canonicalPath(io, resolve_scratch.allocator(), Io.Dir.cwd(), norm);
-            const gop = try path_ids.getOrPut(arena, key);
-            if (!gop.found_existing) {
-                gop.value_ptr.* = @intCast(file_paths.items.len);
-                try file_paths.append(arena, key);
-            }
-        }
+        if (wi == 1) root_end = disco.paths.items.len;
+        for (wave) |p| _ = try disco.seedEntry(p);
     }
     _ = resolve_scratch.reset(.retain_capacity);
-    return .{ .root_end = root_end, .total = file_paths.items.len };
+    return .{ .root_end = root_end, .total = disco.paths.items.len };
 }
 
 /// The seeded prefix of the file table: the lib shards, then the real roots,
