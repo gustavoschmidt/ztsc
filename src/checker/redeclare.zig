@@ -212,14 +212,14 @@ pub fn checkSubsequentVarDecl(c: *Checker, decl: Node, is_const: bool) Error!voi
     };
     const f = c.symFlags(sym);
     if (!(f.var_decl or f.let_decl or f.const_decl)) return;
-    // The value declaration has to be in THIS file. A cross-file reference
-    // resolves to the MERGED symbol, which can fold declarations tsc keeps
-    // apart — a namespace local that was never `export`ed merges into the
-    // cross-file namespace member index here, so `namespace A { var Origin:
-    // string }` in one file was compared against another file's `export var
-    // Origin: Point`. This check cannot see which constituents are really
-    // one symbol, so it declines the whole cross-file case (which loses the
-    // genuine `var x = 3;` / `var x = true;` across two script files).
+    // A cross-file MERGED symbol folds declarations tsc keeps apart: a
+    // namespace local that was never `export`ed still lands in the merged
+    // namespace member index here, so `namespace A { var Origin: string }`
+    // in one file was compared against another file's `export var Origin:
+    // Point`. This check cannot see which constituents are really one
+    // symbol, so it declines them — which also costs the genuine `var x = 3;`
+    // / `var x = true;` spread across two script files.
+    if (c.prog.isMergedId(sym)) return;
     const first = firstValueDecl(c, sym) orelse return;
     if (first == decl) return;
     const sym_ty = try c.typeOfSymbol(sym);
