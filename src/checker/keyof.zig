@@ -398,7 +398,7 @@ fn indexedAccessTypeInner(c: *Checker, obj: TypeId, idx: TypeId) Error!TypeId {
         // push and a pop.
         try c.lazy_index_objs.append(c.cm(), obj);
         defer _ = c.lazy_index_objs.pop();
-        if (try c.lazyRefProp(obj, c.ts.literalAtom(idx), 0)) |p| {
+        if (try c.lazyRefProp(obj, c.ts.literalAtom(idx))) |p| {
             return if (p.optional() and !c.homo_index_mode) c.makeUnion2(p.ty, types.undefined_type) else p.ty;
         }
     }

@@ -968,7 +968,7 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!RelAnswer {
                 // instantiation carries an unreduced config `C1 = P & Omit<…>`
                 // and the other the concrete reduction `C2 = P`.
                 if (c.ts.refSymbol(os) == c.ts.refSymbol(ot)) {
-                    if (try c.originArgEquiv(os, ot, 0)) return .yes;
+                    if (try c.originArgEquiv(os, ot)) return .yes;
                 }
             }
         }
@@ -980,14 +980,14 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!RelAnswer {
         if (tr) |ot| {
             if (ot == s) return .yes;
             if (c.ts.refSymbol(ot) == c.ts.refSymbol(s) and
-                try c.originArgEquiv(ot, s, 0)) return .yes;
+                try c.originArgEquiv(ot, s)) return .yes;
         }
     }
     if (tk == .ref and originTaggable(sk)) {
         if (sr) |os| {
             if (os == t) return .yes;
             if (c.ts.refSymbol(os) == c.ts.refSymbol(t) and
-                try c.originArgEquiv(os, t, 0)) return .yes;
+                try c.originArgEquiv(os, t)) return .yes;
         }
     }
     // Trivial targets/sources.

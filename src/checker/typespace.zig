@@ -921,7 +921,7 @@ pub fn typeofEntity(c: *Checker, node: Node) Error!TypeId {
         // `Agent` declares its whole call surface this way, so every
         // response type it returns came back untyped).
         if (c.ts.kind(rb) == .err) {
-            if (try c.classChainMemberType(base, name, 0)) |mt|
+            if (try c.classChainMemberType(base, name)) |mt|
                 return c.regularizeTypeQuery(mt);
         }
         if (c.ts.kind(rb) == .any or c.ts.kind(rb) == .err) return rb;

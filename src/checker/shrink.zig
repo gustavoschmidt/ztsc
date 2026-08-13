@@ -168,7 +168,12 @@ fn reduceForOriginEquiv(c: *Checker, t: TypeId) Error!TypeId {
 /// origin tag. Anything else — including `unknown`/`any` collapse against a
 /// concrete type — is NOT equivalent, so a genuinely different instantiation
 /// still fails the relation.
-pub fn originArgEquiv(c: *Checker, a0: TypeId, b0: TypeId, depth: u32) Error!bool {
+pub fn originArgEquiv(c: *Checker, a0: TypeId, b0: TypeId) Error!bool {
+    return originArgEquivRec(c, a0, b0, 0);
+}
+
+/// `originArgEquiv`, carrying the walk depth (see `origin_equiv_depth`).
+fn originArgEquivRec(c: *Checker, a0: TypeId, b0: TypeId, depth: u32) Error!bool {
     if (a0 == b0) return true;
     if (depth > origin_equiv_depth) return false;
     const s = &c.ts;
@@ -179,7 +184,7 @@ pub fn originArgEquiv(c: *Checker, a0: TypeId, b0: TypeId, depth: u32) Error!boo
         if (na == s.refArgCount(b0)) {
             var all = true;
             for (0..na) |i| {
-                if (!try c.originArgEquiv(s.refArgAt(a0, i), s.refArgAt(b0, i), depth + 1)) {
+                if (!try originArgEquivRec(c, s.refArgAt(a0, i), s.refArgAt(b0, i), depth + 1)) {
                     all = false;
                     break;
                 }
@@ -206,7 +211,7 @@ pub fn originArgEquiv(c: *Checker, a0: TypeId, b0: TypeId, depth: u32) Error!boo
             const ea = s.tupleElem(a, @intCast(i));
             const eb = s.tupleElem(b, @intCast(i));
             if (ea.flags != eb.flags) return false;
-            if (!try c.originArgEquiv(ea.ty, eb.ty, depth + 1)) return false;
+            if (!try originArgEquivRec(c, ea.ty, eb.ty, depth + 1)) return false;
         }
         return true;
     }
@@ -217,7 +222,7 @@ pub fn originArgEquiv(c: *Checker, a0: TypeId, b0: TypeId, depth: u32) Error!boo
             if (c.origin.get(b)) |ob| {
                 if (oa == ob) return true;
                 if (s.kind(oa) == .ref and s.kind(ob) == .ref and s.refSymbol(oa) == s.refSymbol(ob)) {
-                    return try c.originArgEquiv(oa, ob, depth + 1);
+                    return try originArgEquivRec(c, oa, ob, depth + 1);
                 }
             }
         }
