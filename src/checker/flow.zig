@@ -1007,11 +1007,15 @@ fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth
 /// was then entered from whichever side the partition happened to schedule
 /// first, `.some((e) => …)` on the `any` result lost its contextual
 /// signature in some `--checkers=N` and not others.
+///
+/// A declared `unknown` used to refine here too, which is NOT tsc's rule and
+/// cost a dozen keys on `unknown`'s own conformance case: `const u: unknown =
+/// undefined` typed every later reference `undefined`, so `u === aString`
+/// narrowed to `never` and `let s: string = u` reported a phantom TS2322.
+/// `unknown` is exactly the declared type that says "the value is not
+/// characterised by where it came from".
 fn assignmentRefines(c: *Checker, declared: TypeId) bool {
-    return switch (c.ts.kind(declared)) {
-        .union_type, .unknown => true,
-        else => false,
-    };
+    return c.ts.kind(declared) == .union_type;
 }
 
 /// Does a write with this assignment operator INITIALIZE the property — i.e.

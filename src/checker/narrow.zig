@@ -52,6 +52,14 @@ pub fn narrowByLiteralEquality(c: *Checker, t: TypeId, other: Node, strict: bool
         }
         return c.nonNullable(t);
     }
+    // `unknown === <anything>`: the one place a NON-unit comparand narrows.
+    // tsc's `narrowTypeByEquality` gives an `unknown` reference the comparand's
+    // own type when that type is primitive, and `object` when it is an object
+    // type — a strict comparison can only succeed when the two sides share a
+    // value, and `unknown` has nothing of its own to filter.
+    if (strict and sense and c.ts.kind(t) == .unknown) {
+        if (try unknownEqualityNarrow(c, ot)) |n| return n;
+    }
     // tsc's `isUnitType` covers `TypeFlags.Unit` = Literal | UniqueESSymbol |
     // Nullable, so a `unique symbol` comparand narrows exactly like a literal
     // one: `if (post === POST_TOMBSTONE)` must remove the tombstone
@@ -63,6 +71,33 @@ pub fn narrowByLiteralEquality(c: *Checker, t: TypeId, other: Node, strict: bool
         return c.narrowToValue(t, ot);
     }
     return c.narrowExcludeValue(t, ot);
+}
+
+/// What a strict `unknown === v` narrows the reference to, or null when `v`
+/// tells us nothing (tsc's `narrowTypeByEquality`, the `TypeFlags.Unknown &&
+/// assumeTrue` arm):
+///
+///   - a PRIMITIVE comparand hands over its own type, so `u === aString` is
+///     `string` and `u === NumberEnum.A` is `NumberEnum.A` — the comparand
+///     UNRESOLVED, since that is the name the narrowing must keep;
+///   - an OBJECT comparand hands over `object` (tsc's `nonPrimitiveType`), not
+///     its own shape: equality proves only that the value is a reference;
+///   - anything else — a union, an intersection, a type variable — narrows
+///     nothing, so the reference stays `unknown`.
+fn unknownEqualityNarrow(c: *Checker, v: TypeId) Error!?TypeId {
+    switch (c.ts.kind(v)) {
+        // Nominal kinds whose structural resolution would erase the very
+        // identity the narrowing is meant to keep.
+        .enum_type, .unique_symbol => return v,
+        else => {},
+    }
+    return switch (c.ts.kind(try c.resolveStructural(v))) {
+        .string, .number, .bigint, .boolean, .symbol, .void, .undefined, .null, .object_keyword => v,
+        .string_literal, .number_literal, .number_literal_fresh, .bigint_literal => v,
+        .bool_true, .bool_false, .template_literal_type, .string_mapping => v,
+        .object, .array, .tuple, .function, .overloads, .class_value => types.object_keyword_type,
+        else => null,
+    };
 }
 
 /// Translate a plain literal comparand into the ENUM MEMBER type it names,
