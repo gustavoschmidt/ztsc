@@ -79,11 +79,14 @@ const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
 pub fn checkInterfaceExtends(c: *Checker, sym: SymbolId, node: Node, name_token: ast.TokenIndex) Error!void {
     if (name_token == 0) return;
     if (!isFirstInterfaceDecl(c, sym, node)) return;
-    // Most interfaces extend nothing, and everything below — the type-parameter
-    // list, the heritage re-walk, one relation per base — costs something. One
-    // syntactic scan of the declarations skips all of it.
+    // Everything below — the type-parameter list, the heritage re-walk, one
+    // relation per base — costs something, and for the overwhelming majority
+    // of interfaces the answer is a foregone "yes, it extends it". Two cheap
+    // screens decide that without resolving a type: `hasHeritage` (does it
+    // extend anything at all?) and `heritageCanConflict`.
     if (!hasHeritage(c, sym)) return;
     if ((try c.interfaceGeneric(sym)) == types.error_type) return;
+    if (!try heritageCanConflict(c, sym, node)) return;
     const self = try selfReference(c, sym) orelse return;
 
     var bases: std.ArrayList(TypeId) = .empty;
@@ -119,10 +122,12 @@ pub fn checkInterfaceExtends(c: *Checker, sym: SymbolId, node: Node, name_token:
 
     if (!try checkInheritedPropertiesIdentical(c, self, bases.items, &own, name_token)) return;
 
+    const derived = try c.resolveStructural(self);
     for (bases.items) |base| {
         if (!try relatableBase(c, base) or base == self) continue;
-        if (try genericOverrideUnrelatable(c, self, base, &own)) continue;
+        if (try inheritedVerbatim(c, derived, try c.resolveStructural(base))) continue;
         if (try c.isAssignable(self, base)) continue;
+        if (try untrustworthyOverride(c, sym, self, base, &own)) continue;
         try c.diagFmt(2430, c.tokSpan(name_token), "Interface '{s}' incorrectly extends interface '{s}'.{s}", .{
             try c.typeToString(self),
             try c.typeToString(base),
@@ -157,6 +162,142 @@ fn selfReference(c: *Checker, sym: SymbolId) Error!?TypeId {
     return try c.ts.makeRef(sym, args);
 }
 
+/// Could this interface's heritage produce a diagnostic at all? A cheap
+/// screen, run before anything resolves a type.
+///
+/// `interfaceGeneric` builds the interface by folding each base's members in
+/// and letting the declared ones win. If no declared name collides with a base
+/// member, and no two bases share a name, then every base survives the fold
+/// verbatim: the interface extends each of them by construction (no TS2430)
+/// and no two of them disagree (no TS2320). The heritage clauses then never
+/// have to be resolved a second time.
+///
+/// That matters because re-resolving them is not cheap: `typeFromTypeName`
+/// runs `fixTypeArgs` (type-parameter list, defaults, arity) and interns a
+/// fresh reference for every clause and every written type argument. Measured
+/// on `@types/react`, `zod` and `rxjs`, doing it for every interface cost
+/// 13-20% of check CPU; resolving the base NAME to a symbol - all this screen
+/// does - costs nothing measurable, and the property NAMES it then reads come
+/// off objects the fold already built.
+///
+/// Everything the screen cannot rule out returns true and pays full price:
+///
+///   * an interface written as more than one block, or merged with a `class`
+///     that has its own `extends` - its declarations may live in other files,
+///     so this file's tree cannot read them;
+///   * a base written as a qualified name, or one that does not resolve to a
+///     class or interface (an alias, an import, `Array<T>`) - its member set
+///     is not readable this way;
+///   * a base carrying call, construct or index signatures - the fold unions
+///     or drops overloads, and an index signature constrains members the
+///     derived adds, so "contains it verbatim" is no longer the whole story;
+///   * a name two bases share, or one the interface declares itself - the
+///     only two ways the fold can drop something. This is the common decline
+///     (292 of 372 on `@types/react`) and it is the case with real work to do.
+///
+/// Property NAMES are instantiation-independent (an interface has no mapped
+/// members), so the uninstantiated base is the right thing to ask.
+fn heritageCanConflict(c: *Checker, sym: SymbolId, node: Node) Error!bool {
+    if (!soleInterfaceBlock(c, sym, node)) return true;
+    const data = c.tree.extraData(ast.InterfaceData, c.tree.nodeData(node).lhs);
+
+    var own: std.AutoHashMapUnmanaged(Atom, void) = .empty;
+    defer own.deinit(c.scratch());
+    try ownMemberNames(c, sym, &own);
+    // Names an earlier base already contributed. Scratch-lived, one interface.
+    var seen: std.AutoHashMapUnmanaged(Atom, void) = .empty;
+    defer seen.deinit(c.scratch());
+
+    // The clauses are resolved in THIS declaration's scope, exactly as
+    // `interfaceHeritageTypes` would; `soleInterfaceBlock` guarantees there is
+    // no other one.
+    const saved_scope = c.cur_scope;
+    defer c.cur_scope = saved_scope;
+    if (try c.scopeOf(node)) |s| c.cur_scope = s;
+
+    for (c.tree.extraRange(data.extends_start, data.extends_end)) |h| {
+        if (h == null_node or c.nodeTag(h) != .heritage) continue;
+        const name_node = c.tree.nodeData(h).lhs;
+        if (c.nodeTag(name_node) != .identifier) return true;
+        // `resolveSpace` already answers with a GLOBAL symbol id (see
+        // `typeFromTypeNameEx`, which uses it unmapped).
+        const base_sym = switch (c.resolveSpace(try c.atomOfToken(c.tree.nodeMainToken(name_node)), c.cur_scope, false)) {
+            .sym => |bs| bs,
+            else => return true,
+        };
+        const f = c.symFlags(base_sym);
+        // An import binding has to be followed to its target before its
+        // members are readable; that is `typeFromTypeNameEx`'s job, not this
+        // screen's.
+        if (f.import_binding) return true;
+        const base = if (f.interface)
+            try c.interfaceGeneric(base_sym)
+        else if (f.class)
+            try c.classInstanceGeneric(base_sym)
+        else
+            return true;
+        const r = try c.resolveStructural(base);
+        if (c.ts.kind(r) != .object) return true;
+        if (c.ts.objectCallSigCount(r) != 0 or c.ts.objectConstructSigCount(r) != 0) return true;
+        if (c.ts.objectStringIndex(r) != types.no_type or c.ts.objectNumberIndex(r) != types.no_type) return true;
+        for (0..c.ts.objectPropCount(r)) |i| {
+            const name = c.ts.objectProp(r, @intCast(i)).name;
+            if (own.contains(name)) return true;
+            const gop = try seen.getOrPut(c.scratch(), name);
+            if (gop.found_existing) return true;
+        }
+    }
+    return false;
+}
+
+/// Is `node` - the declaration being checked, and by `isFirstInterfaceDecl`
+/// the symbol's first - the symbol's ONLY `interface` block, with no merged
+/// `class` half carrying its own `extends`? Then every heritage clause the
+/// symbol has is written in this node, in this file's tree and this node's
+/// scope, which is what lets the screen read them syntactically.
+fn soleInterfaceBlock(c: *Checker, sym: SymbolId, node: Node) bool {
+    for (c.declsOf(sym)) |decl| {
+        switch (c.nodeTag(decl)) {
+            .interface_decl => if (decl != node) return false,
+            .class_decl => {
+                if (c.tree.extraData(ast.ClassData, c.tree.nodeData(decl).lhs).extends != 0) return false;
+            },
+            else => {},
+        }
+    }
+    return true;
+}
+
+/// Did the interface inherit this base UNCHANGED? Then it extends it, and no
+/// relation has to run to find that out.
+///
+/// A base whose every property survives the fold at the identical TypeId and
+/// identical flags is present in the result verbatim - nothing was shadowed by
+/// an own member, and nothing was shadowed by an earlier base. A type that
+/// literally contains another's members relates to it trivially.
+///
+/// `heritageCanConflict` answers the same question more cheaply for the
+/// interfaces it can read syntactically; this is the fallback for the ones it
+/// cannot (a reopened block, a qualified base name).
+///
+/// Bases carrying call or construct signatures fall through to the relation:
+/// `mergeBaseObjectPlain` may union or drop overloads, so their presence in
+/// the result is not the same simple fact.
+fn inheritedVerbatim(c: *Checker, derived: TypeId, base: TypeId) Error!bool {
+    if (c.ts.kind(derived) != .object or c.ts.kind(base) != .object) return false;
+    if (c.ts.objectCallSigCount(base) != 0 or c.ts.objectConstructSigCount(base) != 0) return false;
+    const si = c.ts.objectStringIndex(base);
+    if (si != types.no_type and c.ts.objectStringIndex(derived) != si) return false;
+    const ni = c.ts.objectNumberIndex(base);
+    if (ni != types.no_type and c.ts.objectNumberIndex(derived) != ni) return false;
+    for (0..c.ts.objectPropCount(base)) |i| {
+        const p = c.ts.objectProp(base, @intCast(i));
+        const d = c.ts.objectPropByName(derived, p.name) orelse return false;
+        if (d.ty != p.ty or d.flags != p.flags) return false;
+    }
+    return true;
+}
+
 /// A base ztsc resolved well enough to relate against.
 ///
 /// An unresolved base (`err`) contributes nothing to the interface's own
@@ -179,9 +320,11 @@ fn relatableBase(c: *Checker, base: TypeId) Error!bool {
     return c.ts.kind(try c.resolveStructural(base)) == .object;
 }
 
-/// Does this interface override a base member with a GENERIC signature the
-/// base does not have? Then ztsc's verdict on the pair is not trustworthy and
-/// the check declines.
+/// The relation just said this interface does NOT extend its base. Is that
+/// verdict trustworthy? Two override shapes say no, and the check declines
+/// rather than report a TS2430 tsc does not.
+///
+/// (1) An own member with a GENERIC signature the base does not have.
 ///
 /// tsc's `compareSignaturesRelated` instantiates a generic SOURCE signature in
 /// the target's context (`instantiateSignatureInContextOf`) before comparing
@@ -191,19 +334,41 @@ fn relatableBase(c: *Checker, base: TypeId) Error!bool {
 /// `T` still free it compares `string` against the uninstantiated `U` and says
 /// no, which would report TS2430 on code tsc accepts (`deeplyNestedCheck.ts`).
 ///
-/// The screen is deliberately narrow — a generic member on the DERIVED side,
+/// This arm is deliberately narrow — a generic member on the DERIVED side,
 /// shadowing a base member — because the reverse shape (a generic member in
 /// the BASE, as in `subtypingWithGenericCallSignaturesWithOptionalParameters`)
 /// is a genuine under-report of the same relation gap and must not be turned
-/// into silence here as well. Removing this screen is the observable test that
-/// the relation gap is fixed.
-fn genericOverrideUnrelatable(
+/// into silence here as well.
+///
+/// (2) An own member written with METHOD syntax that redeclares a base member.
+/// tsc relates methods BIVARIANTLY — `strictFunctionTypes` exempts them, so a
+/// redeclaration only has to relate in one direction, either one. ztsc applies
+/// the exemption inside its signature relation but loses it where the member
+/// is reached through the optional form (`m?(…)`, stored as
+/// `((…) => …) | undefined`) and the two `this` parameters name classes its
+/// model does not relate. `@types/node`'s
+/// `DuplexOptions.construct?(this: Duplex, …)` over
+/// `WritableOptions.construct?(this: Writable, …)` is both at once, and it
+/// reported a TS2430 tsc does not.
+///
+/// That arm is syntactic on purpose: what it needs is how the member was
+/// WRITTEN (method versus property-with-a-function-type), which is exactly the
+/// distinction tsc's bivariance rule keys on and which the resolved type no
+/// longer carries. Property-written members (`a: (x: T) => T`) are unaffected,
+/// which is what keeps the `subtypingWith…` and
+/// `callSignatureAssignabilityInInheritance` families reporting.
+///
+/// Removing either arm is the observable test that the corresponding relation
+/// gap is fixed.
+fn untrustworthyOverride(
     c: *Checker,
+    sym: SymbolId,
     self: TypeId,
     base: TypeId,
     own: *const std.AutoHashMapUnmanaged(Atom, void),
 ) Error!bool {
     if (own.count() == 0) return false;
+    if (try methodOverridesBaseMember(c, sym, base)) return true;
     const derived = try c.resolveStructural(self);
     const rb = try c.resolveStructural(base);
     for (0..c.ts.objectPropCount(derived)) |i| {
@@ -227,6 +392,26 @@ fn hasGenericSignature(c: *Checker, t: TypeId) Error!bool {
     }
     for (0..c.ts.objectConstructSigCount(r)) |i| {
         if (c.ts.fnTypeParams(c.ts.objectConstructSig(r, @intCast(i))).len != 0) return true;
+    }
+    return false;
+}
+
+/// Does this interface redeclare a base member with METHOD syntax? See
+/// `untrustworthyOverride` arm (2).
+fn methodOverridesBaseMember(c: *Checker, sym: SymbolId, base: TypeId) Error!bool {
+    const rb = try c.resolveStructural(base);
+    if (c.ts.kind(rb) != .object) return false;
+    const saved = c.enterSymFile(sym);
+    defer c.restoreCtx(saved);
+    for (c.declsOf(sym)) |decl| {
+        if (c.nodeTag(decl) != .interface_decl) continue;
+        const data = c.tree.extraData(ast.InterfaceData, c.tree.nodeData(decl).lhs);
+        for (c.tree.extraRange(data.members_start, data.members_end)) |m| {
+            if (m == null_node or c.nodeTag(m) != .method_signature) continue;
+            const proto = c.tree.extraData(ast.FnProto, c.tree.nodeData(m).lhs);
+            const name = try c.memberKey(c.tree.nodeMainToken(m), proto.flags);
+            if (c.ts.objectPropByName(rb, name) != null) return true;
+        }
     }
     return false;
 }
@@ -308,7 +493,19 @@ fn checkInheritedPropertiesIdentical(
 fn propsIdentical(c: *Checker, a: types.Prop, b: types.Prop) Error!bool {
     if (a.optional() != b.optional()) return false;
     if (a.ty == b.ty) return true;
-    return (try c.isAssignable(a.ty, b.ty)) and (try c.isAssignable(b.ty, a.ty));
+    // For an OPTIONAL property, `undefined` is part of what tsc reads out of
+    // the symbol (`getTypeOfSymbol` adds it under `strictNullChecks`), but
+    // ztsc's representations disagree about whether it is spelled in the
+    // stored type: a mapped `Partial<T>` leaves `port: number` and sets the
+    // flag, while a written `port?: number | undefined` stores the union. The
+    // two describe the same property, so the flag decides and `undefined` is
+    // normalized away on both sides before comparing. Without this,
+    // `@types/node`'s `https.AgentOptions extends http.AgentOptions,
+    // tls.ConnectionOptions` reported a TS2320 tsc does not.
+    const at = if (a.optional()) try c.removeUndefined(a.ty) else a.ty;
+    const bt = if (b.optional()) try c.removeUndefined(b.ty) else b.ty;
+    if (at == bt) return true;
+    return (try c.isAssignable(at, bt)) and (try c.isAssignable(bt, at));
 }
 
 /// Collapse repeated bases of a GENERIC interface written as several blocks.
