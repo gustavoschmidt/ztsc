@@ -286,10 +286,9 @@ pub fn narrowedPatternBinding(c: *Checker, node: Node, sym: SymbolId) Error!?Typ
     const narrowed = try c.flowTypeOfKey(node, .{ .sym = root }, parent);
     if (narrowed == parent) return null;
     if (c.ts.kind(narrowed) == .never) return types.never_type;
-    var out: TypeId = types.no_type;
-    if (!try c.findBindingType(pat, name, narrowed, &out, null)) return null;
-    if (out == types.no_type) return null;
-    return out;
+    const bound = (try c.findBindingType(pat, name, narrowed, null)) orelse return null;
+    if (bound == types.no_type) return null;
+    return bound;
 }
 
 /// Is `node` a bare identifier bound by the object pattern behind the

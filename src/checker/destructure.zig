@@ -103,9 +103,8 @@ pub fn bindingElementType(c: *Checker, sym: SymbolId, decl: Node, whole: TypeId)
         else => decl,
     };
     const name = c.symNameAtom(sym);
-    var result: TypeId = types.any_type;
-    _ = try c.findBindingType(pattern, name, whole, &result, try c.bindingFlowBase(sym, decl));
-    return result;
+    const bf = try c.bindingFlowBase(sym, decl);
+    return (try c.findBindingType(pattern, name, whole, bf)) orelse types.any_type;
 }
 
 /// A destructured binding inherits the NARROWING of the property it comes
@@ -147,16 +146,15 @@ pub fn extendRefKey(c: *Checker, base: RefKey, elem: PathElem) Error!?RefKey {
     return c.makeRefKey(base.sym, elems[0 .. path.len + 1]);
 }
 
-pub fn findBindingType(c: *Checker, pat: Node, name: Atom, whole: TypeId, out: *TypeId, bf: ?BindFlow) Error!bool {
-    if (pat == null_node) return false;
+/// The type `name` receives when the pattern `pat` destructures a value of
+/// type `whole` — null when the pattern binds no such name.
+pub fn findBindingType(c: *Checker, pat: Node, name: Atom, whole: TypeId, bf: ?BindFlow) Error!?TypeId {
+    if (pat == null_node) return null;
     const d = c.tree.nodeData(pat);
     switch (c.nodeTag(pat)) {
         .identifier => {
-            if ((try c.atomOfToken(c.tree.nodeMainToken(pat))) == name) {
-                out.* = whole;
-                return true;
-            }
-            return false;
+            if ((try c.atomOfToken(c.tree.nodeMainToken(pat))) == name) return whole;
+            return null;
         },
         .object_pattern => {
             for (c.tree.nodeRange(pat)) |el| {
@@ -182,10 +180,9 @@ pub fn findBindingType(c: *Checker, pat: Node, name: Atom, whole: TypeId, out: *
                         }
                         if (ed.rhs != 0) pt = try c.removeUndefined(pt); // default strips undefined
                         if (ed.lhs != 0) {
-                            if (try c.findBindingType(ed.lhs, name, pt, out, sub_bf)) return true;
+                            if (try c.findBindingType(ed.lhs, name, pt, sub_bf)) |t| return t;
                         } else if (key == name) {
-                            out.* = pt;
-                            return true;
+                            return pt;
                         }
                     },
                     .binding_property_computed => {
@@ -198,7 +195,7 @@ pub fn findBindingType(c: *Checker, pat: Node, name: Atom, whole: TypeId, out: *
                             const kt = try c.checkExprCached(ed.lhs, types.no_type);
                             pt = try c.indexedAccessType(try c.resolveStructural(whole), kt);
                         }
-                        if (try c.findBindingType(ed.rhs, name, pt, out, null)) return true;
+                        if (try c.findBindingType(ed.rhs, name, pt, null)) |t| return t;
                     },
                     .rest_element => {
                         // `{a, b, ...rest}` → rest = `whole` minus the
@@ -207,12 +204,12 @@ pub fn findBindingType(c: *Checker, pat: Node, name: Atom, whole: TypeId, out: *
                         // object wrongly kept the destructured props, which
                         // then read as duplicated by a later spread (TS2783).
                         const rest_ty = try c.objectRestType(whole, pat);
-                        if (try c.findBindingType(ed.lhs, name, rest_ty, out, null)) return true;
+                        if (try c.findBindingType(ed.lhs, name, rest_ty, null)) |t| return t;
                     },
                     else => {},
                 }
             }
-            return false;
+            return null;
         },
         .array_pattern => {
             const r = try c.resolveStructural(whole);
@@ -232,19 +229,19 @@ pub fn findBindingType(c: *Checker, pat: Node, name: Atom, whole: TypeId, out: *
                 if (c.nodeTag(el) == .rest_element) {
                     const ed = c.tree.nodeData(el);
                     const rest_t = try c.ts.makeArray(et);
-                    if (try c.findBindingType(ed.lhs, name, rest_t, out, null)) return true;
+                    if (try c.findBindingType(ed.lhs, name, rest_t, null)) |t| return t;
                 } else if (c.nodeTag(el) == .binding_default) {
                     const ed = c.tree.nodeData(el);
-                    if (try c.findBindingType(ed.lhs, name, try c.removeUndefined(et), out, null)) return true;
+                    if (try c.findBindingType(ed.lhs, name, try c.removeUndefined(et), null)) |t| return t;
                 } else {
-                    if (try c.findBindingType(el, name, et, out, null)) return true;
+                    if (try c.findBindingType(el, name, et, null)) |t| return t;
                 }
             }
-            return false;
+            return null;
         },
-        .binding_default => return c.findBindingType(d.lhs, name, whole, out, bf),
-        .rest_element => return c.findBindingType(d.lhs, name, whole, out, null),
-        else => return false,
+        .binding_default => return c.findBindingType(d.lhs, name, whole, bf),
+        .rest_element => return c.findBindingType(d.lhs, name, whole, null),
+        else => return null,
     }
 }
 
