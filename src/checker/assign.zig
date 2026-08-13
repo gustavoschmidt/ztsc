@@ -2418,7 +2418,7 @@ const ObjSide = struct {
 /// Tally one declined pair and answer "not this route's question" (see
 /// `LazyStat`). Costs a predictable-false branch when `--lazy-stats` is off.
 fn note(c: *Checker, why: checker_zig.LazyStat) ?bool {
-    if (lazy_zig.stats_on) c.lazy_stats[@intFromEnum(why)] += 1;
+    if (c.opts.lazy_stats) c.lazy_stats[@intFromEnum(why)] += 1;
     return null;
 }
 
@@ -2481,7 +2481,7 @@ fn lazyRefRelate(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: types.Ki
         if ((try c.containsThisType(s)) or (try c.containsThisType(t)) or
             (try c.containsThisType(sv.table)) or (try c.containsThisType(tv.table))) return note(c, .this_types);
     }
-    if (lazy_zig.stats_on) c.lazy_stats[@intFromEnum(checker_zig.LazyStat.hit)] += 1;
+    if (c.opts.lazy_stats) c.lazy_stats[@intFromEnum(checker_zig.LazyStat.hit)] += 1;
     // The frame this replaces pushed the same two references onto the
     // growing-instantiation stack a second time (its own `refFacetOf` of each
     // materialization is the very reference this frame holds). Push them here

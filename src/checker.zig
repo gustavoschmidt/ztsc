@@ -73,7 +73,6 @@ pub const BumpArena = @import("checker/bump.zig").BumpArena;
 pub const prof_zig = @import("checker/prof.zig");
 const memprof_zig = @import("checker/memprof.zig");
 const memo_zig = @import("checker/memo.zig");
-const lazy_zig = @import("checker/instantiate.zig");
 
 const Ast = ast.Ast;
 const Node = ast.Node;
@@ -2276,14 +2275,6 @@ pub const Checker = struct {
         /// values off its own `Checker` rather than off a process global.
         opts: Options,
     ) Error!Checker {
-        // Compatibility mirror: `checker/assign.zig` reads `lazy_zig.stats_on`
-        // by module path on the lazy relation route, and that file is not this
-        // refactor's to change. Every instance of a run writes the identical
-        // value here (options are passed by value and never differ between
-        // threads), so the store stays as write-once-in-effect as it was when
-        // `main` performed it before the pool spawned. Delete the global once
-        // `assign.zig` can read `c.opts.lazy_stats` instead.
-        lazy_zig.stats_on = opts.lazy_stats;
         const first = if (owned.len > 0) owned[0] else 0;
         const f0 = &prog.files[first];
         var c: Checker = .{

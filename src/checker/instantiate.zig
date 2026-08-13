@@ -347,19 +347,6 @@ pub fn expandRef(c: *Checker, ref: TypeId) Error!TypeId {
 // any diagnostic movement can be bisected against the eager path in the same
 // binary. It was a process global until it became a per-run option.
 
-/// COMPATIBILITY MIRROR of `checker.Options.lazy_stats` (`--lazy-stats`: dump
-/// the relation route's hit / bail tally at `seal`, see `LazyStat`).
-///
-/// The option is the source of truth and every other reader takes it off the
-/// checker (`c.opts.lazy_stats`); this global exists only because
-/// `checker/assign.zig` still reads the switch by module path, on a hot
-/// predictable-false branch. `Checker.init` writes it from the options, and
-/// since options are passed by value and are identical for every instance of a
-/// run, all instances write the same value — the store is as write-once in
-/// effect as `main`'s pre-spawn write was. Delete once `assign.zig` reads
-/// `c.opts.lazy_stats`.
-pub var stats_on: bool = false;
-
 /// The GENERIC member table `ref`'s expansion substitutes, when that table
 /// can be read member-by-member instead of materialized whole — else null,
 /// and the caller expands eagerly exactly as before.
