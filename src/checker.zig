@@ -3458,7 +3458,6 @@ pub const Checker = struct {
     pub const makePromise = props_zig.makePromise;
     pub const isPromiseLikeOf = props_zig.isPromiseLikeOf;
     pub const awaitedType = props_zig.awaitedType;
-    pub const awaitedTypeRec = props_zig.awaitedTypeRec;
     pub const generatorYieldType = props_zig.generatorYieldType;
     pub const asyncGeneratorYieldType = props_zig.asyncGeneratorYieldType;
     pub const tupleElementUnion = props_zig.tupleElementUnion;

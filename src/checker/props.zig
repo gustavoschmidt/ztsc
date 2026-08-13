@@ -576,7 +576,6 @@ pub const asyncGeneratorYieldType = iteration.asyncGeneratorYieldType;
 pub const awaitedType = iteration.awaitedType;
 // Alias-only, and no caller left: kept `pub` because `Checker`'s alias block
 // (which this refactor may not touch) still names it through this file.
-pub const awaitedTypeRec = iteration.awaitedTypeRec;
 pub const generatorYieldType = iteration.generatorYieldType;
 pub const isPromiseLikeOf = iteration.isPromiseLikeOf;
 pub const makePromise = iteration.makePromise;
