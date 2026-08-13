@@ -231,7 +231,7 @@ const ParseJob = struct {
                 j.errs[i] = e;
                 continue;
             };
-            tree.* = parser.parse(a, lf.source) catch |e| {
+            tree.* = parser.parseOpts(a, lf.source, .{ .dts = true }) catch |e| {
                 j.errs[i] = e;
                 continue;
             };
@@ -375,7 +375,7 @@ test "seedLibAtoms: covers every atom the lib binder produces (atom determinism)
     var last_bind: *const Bind = undefined;
     for (libFiles(set, &buf)) |lf| {
         const tree = try a.create(Ast);
-        tree.* = try parser.parse(a, lf.source);
+        tree.* = try parser.parseOpts(a, lf.source, .{ .dts = true });
         const b_ptr = try a.create(Bind);
         b_ptr.* = try binder.bind(a, io, gpa, &itn1, tree, lf.source, true);
         last_bind = b_ptr;

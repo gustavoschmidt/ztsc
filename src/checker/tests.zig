@@ -590,6 +590,46 @@ test "TDZ and use-before-assigned" {
     try expectCodes("declare const c: boolean; let y: number; if (c) { y = 1; } const z: number = y;", &.{2454});
 }
 
+test "TS2454: ambient declarations are assigned by definition" {
+    // An ambient declaration has no initializer to write, but describes
+    // something the runtime already provides: tsc's `assumeInitialized`
+    // closes on `declaration.flags & NodeFlags.Ambient`.
+    try expectClean("declare var x: number; const n: number = x;");
+    try expectClean("declare let y: string; const s: string = y;");
+    // Before any flow analysis, so a use ahead of the declaration is exempt.
+    try expectClean("const n: number = x; declare var x: number;");
+    // A `declare module` body is an ambient context; its `var`s inherit it
+    // (so does `declare global`, whose members only reach a use site through
+    // the linker — see the end-to-end suite).
+    try expectClean("declare module \"m\" { var g: number; export const n: number; }");
+    // The context is scoped to the ambient declaration: an ordinary `let`
+    // beside it still reports.
+    try expectCodes("declare var x: number; let y: number; const n: number = y;", &.{2454});
+    // Only the symbol's VALUE declaration (the first) is consulted: an
+    // ordinary `var` that also has an ambient declaration is still a
+    // variable nothing assigns.
+    try expectCodes("var m: number; declare var m: number; const n: number = m;", &.{2454});
+}
+
+test "TS2454: a guard that rules undefined out silences the report" {
+    // tsc reports on the FLOW type, not on the assignment walk: the first
+    // reference still admits undefined, the guarded one no longer does.
+    try expectCodes(
+        "declare function isStr(x: unknown): x is string; let u: string | number; const r = isStr(u) && u.length;",
+        &.{2454},
+    );
+    try expectCodes(
+        "let p: { a: number }; const t = p && p.a;",
+        &.{2454},
+    );
+    try expectCodes(
+        "let v: number; if (typeof v === \"number\") { const z: number = v; }",
+        &.{2454},
+    );
+    // …and an unguarded second reference still reports, once per reference.
+    try expectCodes("let y: number; const a: number = y; const b: number = y;", &.{ 2454, 2454 });
+}
+
 test "cannot find name / wrong space / suggestions" {
     try expectCodes("missing();", &.{2304});
     try expectCodes("const x: NotAType = 1;", &.{2304});

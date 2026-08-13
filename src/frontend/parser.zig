@@ -98,6 +98,10 @@ pub const Opts = struct {
     /// whose grammar allows decorators on PARAMETERS. Off (the standard TC39
     /// dialect) a parameter decorator is TS1206. See `tsconfig.Config`.
     experimental_decorators: bool = false,
+    /// The file is a declaration file (`.d.ts`/`.d.mts`/`.d.cts`), which is
+    /// an ambient context from its first token: every declaration in it
+    /// behaves as if written `declare`. See `Parser.ambient`.
+    dts: bool = false,
     /// Backing allocator for the transient parse arena (see `parseOpts`).
     /// Null — the default — uses `std.heap.page_allocator`, which is what
     /// every caller wants: the arena is freed before `parseOpts` returns, so
@@ -126,6 +130,7 @@ pub fn parseOpts(gpa: Allocator, src: []const u8, opts: Opts) error{ OutOfMemory
         .scn = scanner.Scanner.init(src),
         .jsx = opts.jsx,
         .experimental_decorators = opts.experimental_decorators,
+        .ambient = opts.dts,
     };
     p.parseRoot() catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -149,6 +154,16 @@ const Parser = struct {
     /// Legacy (`experimentalDecorators`) grammar: parameter decorators are
     /// legal. See `Opts.experimental_decorators`.
     experimental_decorators: bool = false,
+
+    /// AMBIENT CONTEXT (tsc's `NodeFlags.Ambient`, propagated by
+    /// `setContextFlag` while parsing): true inside a `declare` declaration,
+    /// inside a `declare namespace`/`declare global`/`declare module "…"`
+    /// body, and throughout a `.d.ts` file. Saved/restored around each body
+    /// like every other parse context flag — a plain `namespace` nested in an
+    /// ambient one stays ambient, which is what tsc means by the flag.
+    /// Recorded on the nodes that need it (`parseDeclarator`), because a
+    /// declarator has no link back to the statement that carries `declare`.
+    ambient: bool = false,
 
     /// Lookahead queue of scanned-but-not-consumed tokens; la[0] is current.
     la: [max_la]Token = undefined,
@@ -809,6 +824,13 @@ const Parser = struct {
                             return p.parseEnumDecl(ast.Flags.declare | ast.Flags.const_enum);
                         }
                         _ = try p.bump();
+                        // `declare` leaves no trace on the variable statement
+                        // node itself (it starts at `var`/`let`/`const`), so
+                        // the ambient context is what carries the modifier to
+                        // the declarators. See `Parser.ambient`.
+                        const was_ambient = p.ambient;
+                        p.ambient = true;
+                        defer p.ambient = was_ambient;
                         return p.parseVarStatement();
                     },
                     .keyword_function => {
@@ -1001,6 +1023,21 @@ const Parser = struct {
             }
             return p.addNode(.{ .tag = .declarator_init, .main_token = name_tok, .data = .{ .lhs = name, .rhs = init } });
         }
+        // An AMBIENT declarator (`declare var x: T`, or any `var`/`let` in a
+        // `.d.ts` / `declare namespace` / `declare global` body) records the
+        // context on itself: the variable statement keeps no `declare` bit
+        // (it starts at `var`), and a declarator has no parent link to look
+        // for one. Read as "assigned by definition" — tsc's
+        // `NodeFlags.Ambient` arm of `assumeInitialized`.
+        //
+        // Deliberately confined to the long form, so the bit never changes
+        // which node tag a declarator gets: an ambient declarator with
+        // neither annotation nor `!` is typed from its initializer or is
+        // `any`, and both of those are already exempt from every rule that
+        // reads the bit. Widening the long form to cover them would retag
+        // every `export const x = "lit"` in every `.d.ts`, which downstream
+        // reads as "annotated" (`constEnumString`, `symExplicitlyTyped`).
+        if (p.ambient) flags |= ast.Flags.declare;
         const extra = try p.addExtra(ast.DeclaratorFull{ .flags = flags, .type_ann = type_ann, .init = init });
         return p.addNode(.{ .tag = .declarator_full, .main_token = name_tok, .data = .{ .lhs = name, .rhs = extra } });
     }
@@ -1961,6 +1998,11 @@ const Parser = struct {
         _ = try p.expect(.l_brace, .expected_l_brace);
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
+        // `declare namespace N { ... }` makes the whole body ambient; a plain
+        // `namespace` nested in an ambient one inherits it.
+        const was_ambient = p.ambient;
+        p.ambient = was_ambient or flags & ast.Flags.declare != 0;
+        defer p.ambient = was_ambient;
         try p.parseStatementList(top, .r_brace);
         _ = try p.expect(.r_brace, .expected_r_brace);
         const body = try p.scratchToSpan(top);
@@ -1983,6 +2025,9 @@ const Parser = struct {
         _ = try p.expect(.l_brace, .expected_l_brace);
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
+        const was_ambient = p.ambient;
+        p.ambient = true;
+        defer p.ambient = was_ambient;
         try p.parseStatementList(top, .r_brace);
         _ = try p.expect(.r_brace, .expected_r_brace);
         const body = try p.scratchToSpan(top);
@@ -2027,6 +2072,9 @@ const Parser = struct {
         _ = try p.expect(.l_brace, .expected_l_brace);
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
+        const was_ambient = p.ambient;
+        p.ambient = true;
+        defer p.ambient = was_ambient;
         try p.parseStatementList(top, .r_brace);
         _ = try p.expect(.r_brace, .expected_r_brace);
         const body = try p.scratchToSpan(top);
@@ -4160,6 +4208,25 @@ test "golden: let without init, var multiple declarators" {
     );
     try expectSExpr("var a = 1, b, c: string;",
         \\(var_decl var (declarator_init (identifier a) (number_literal 1)) (declarator (identifier b)) (declarator_full (identifier c) (identifier string)))
+    );
+}
+
+test "golden: ambient context marks declarators `declare`" {
+    // `declare` leaves no bit on the variable statement (it starts at `var`),
+    // so each declarator carries the ambient context itself.
+    try expectSExpr("declare var x: number;",
+        \\(var_decl_one var (declarator_full :declare (identifier x) (identifier number)))
+    );
+    try expectSExpr("declare namespace N { let m: number; }",
+        \\(namespace_decl :declare N (var_decl_one let (declarator_full :declare (identifier m) (identifier number))))
+    );
+    try expectSExpr("declare global { var g: string; }",
+        \\(namespace_decl :declare global (var_decl_one var (declarator_full :declare (identifier g) (identifier string))))
+    );
+    // …and only there: the context is restored on the way out.
+    try expectSExpr("declare var x: number; let y: number;",
+        \\(var_decl_one var (declarator_full :declare (identifier x) (identifier number)))
+        \\(var_decl_one let (declarator_full (identifier y) (identifier number)))
     );
 }
 

@@ -191,6 +191,7 @@ pub fn buildProgram(
         const tree = try arena.create(Ast);
         tree.* = try parser.parseOpts(arena, bytes, .{
             .jsx = parser.isJsxPath(path),
+            .dts = parser.isDeclarationPath(path),
             .experimental_decorators = link_opts.experimental_decorators,
         });
         const bound = try arena.create(Bind);
@@ -504,7 +505,7 @@ pub fn singleWithLibProgram(
     const files = try arena.alloc(ProgFile, lib_list.len + 1);
     for (lib_list, 0..) |lf, i| {
         const lib_tree = try arena.create(Ast);
-        lib_tree.* = try parser.parse(arena, lf.source);
+        lib_tree.* = try parser.parseOpts(arena, lf.source, .{ .dts = true });
         const lib_bind = try arena.create(Bind);
         lib_bind.* = try binder.bind(arena, io, gpa, interner, lib_tree, lf.source, true);
         files[i] = .{ .path = lf.path, .src = lf.source, .tree = lib_tree, .bind = lib_bind };
