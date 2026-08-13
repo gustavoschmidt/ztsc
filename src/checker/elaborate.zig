@@ -233,6 +233,9 @@ fn sourceIsItsOwnStandIn(c: *Checker, s: TypeId) bool {
     switch (k) {
         .type_param, .index_access, .conditional, .keyof_op, .this_type, .infer_var => return false,
         .intersection => {
+            // Borrowing `members` is safe here only because nothing in the
+            // walk interns a type (`kind` and `refFacetOf` are both pure
+            // lookups) — hence no `Error!` on this function.
             for (c.ts.members(s)) |m| {
                 if (!sourceIsItsOwnStandIn(c, m)) return false;
             }
