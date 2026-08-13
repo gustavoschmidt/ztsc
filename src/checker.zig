@@ -1213,9 +1213,22 @@ pub const Checker = struct {
     /// (both the eager whole-table walk and the lazy single-member lookup push
     /// here). A member that re-appears is one whose type demanded itself; the
     /// slice from its first occurrence to the top is exactly the circle, which
-    /// `reportMemberCycle` names (TS2502 / TS7022 / TS7023). Reporting only —
-    /// the recursion is cut where it always was.
+    /// `reportMemberCycle` names (TS2502 / TS7022 / TS7023), and where the
+    /// recursion is cut: re-entry answers `any`, tsc's `pushTypeResolution`.
     member_type_stack: std.ArrayListUnmanaged(SymbolId) = .empty,
+    /// Type parameters whose DEFAULT `fixTypeArgs` is evaluating, innermost
+    /// last. `interface S<T = S> {}` resolves `T`'s default by materializing
+    /// `S`, which needs `T`'s default again — tsc's `pushTypeResolution(tp,
+    /// Default)`, TS2716. A parameter already on the stack answers `any`
+    /// instead of re-entering.
+    tp_default_stack: std.ArrayListUnmanaged(SymbolId) = .empty,
+    /// Type parameters whose CONSTRAINT `typeParamConstraint` is resolving,
+    /// innermost last. A constraint that reads back through its own parameter
+    /// — `<T extends Foo | T["hello"]>`, tsc's TS2313 — re-enters the
+    /// resolution before `tp_constraint_cache` has anything to answer with, so
+    /// the memo cannot break it. tsc's `pushTypeResolution(tp, Constraint)`:
+    /// a parameter already on the stack answers "no constraint".
+    tp_constraint_stack: std.ArrayListUnmanaged(SymbolId) = .empty,
     /// Object types of the single-member indexed accesses currently in flight
     /// (`C["m"]` taken while `C`'s own table is materializing). A GENERIC one
     /// is an access tsc defers — it answers with an unresolved

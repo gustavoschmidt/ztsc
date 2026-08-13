@@ -820,6 +820,16 @@ pub fn fixTypeArgs(c: *Checker, sym: SymbolId, args: []const TypeId, tok: TokenI
         if (i < args.len) {
             out[i] = args[i];
         } else if (tp.default != 0) {
+            // A default that resolves back through its own parameter —
+            // `interface SelfReference<T = SelfReference> {}`, tsc's TS2716 —
+            // materializes the same reference, which fills the same default,
+            // forever. tsc's `pushTypeResolution(tp, Default)`: a parameter
+            // whose default is already being evaluated answers `any` rather
+            // than re-entering. (ztsc does not report TS2716 itself.)
+            if (std.mem.indexOfScalar(SymbolId, c.tp_default_stack.items, tp.sym) != null) {
+                out[i] = types.any_type;
+                continue;
+            }
             // Defaults are nodes of the declaring file; evaluate there,
             // then substitute the already-resolved params so `B = A` sees
             // the supplied `A` (and `C = B` the defaulted `B`).
@@ -835,6 +845,8 @@ pub fn fixTypeArgs(c: *Checker, sym: SymbolId, args: []const TypeId, tok: TokenI
                 const saved = c.enterSymFile(dsym);
                 defer c.restoreCtx(saved);
                 c.cur_scope = c.symScope(dsym);
+                try c.tp_default_stack.append(c.cm(), tp.sym);
+                defer _ = c.tp_default_stack.pop();
                 def = try c.typeFromTypeNode(tp.default);
             }
             // A *bare* default reference to an earlier own param (`Tr = T`)

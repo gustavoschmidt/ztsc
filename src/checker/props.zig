@@ -609,6 +609,17 @@ pub fn typeParamConstraint(c: *Checker, sym: SymbolId) Error!TypeId {
     if (c.inst_cache_on) {
         if (c.tp_constraint_cache.get(sym)) |t| return t;
     }
+    // The memo is written on the way OUT, so it cannot break a constraint that
+    // reads back through its own parameter (`<T extends Foo | T["hello"]>`,
+    // tsc's TS2313): the re-entry arrives before there is anything to answer
+    // with. tsc's `pushTypeResolution(tp, Constraint)` — a parameter already
+    // being resolved has no constraint yet, and `no_type` is that answer. Not
+    // memoized: it is a property of this circle, not of the parameter.
+    if (std.mem.indexOfScalar(SymbolId, c.tp_constraint_stack.items, sym) != null) {
+        return types.no_type;
+    }
+    try c.tp_constraint_stack.append(c.cm(), sym);
+    defer _ = c.tp_constraint_stack.pop();
     const result = try typeParamConstraintUncached(c, sym);
     if (c.inst_cache_on) try c.tp_constraint_cache.put(c.cm(), sym, result);
     return result;
