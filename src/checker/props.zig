@@ -290,9 +290,27 @@ fn propOfTypeIdx(c: *Checker, t: TypeId, name: Atom, allow_index: bool, from_ind
             return c.objectInterfaceProp(name);
         },
         .type_param => {
-            const constraint = try c.typeParamConstraint(s.typeParamSymbol(t));
-            if (constraint == types.no_type) return null;
-            return propOfTypeIdx(c, try c.resolveStructural(constraint), name, allow_index, from_index);
+            // Walk the constraint chain iteratively — `U extends T extends
+            // {…}` — instead of re-entering this arm per hop. A CIRCULAR
+            // constraint (`T extends T`, or `T extends U` with `U extends T`;
+            // tsc's TS2313) recursed here until the stack died. tsc's
+            // `getBaseConstraintOfType` answers undefined for a circular
+            // constraint — no apparent members — which is the `null` below.
+            // Same fixpoint break and 8-hop chain bound as
+            // `indexObjBaseConstraint` / `transitiveBaseConstraint`.
+            var cur = t;
+            var hops: u32 = 0;
+            while (hops < 8) : (hops += 1) {
+                const constraint = try c.typeParamConstraint(s.typeParamSymbol(cur));
+                if (constraint == types.no_type) return null;
+                const next = try c.resolveStructural(constraint);
+                if (next == cur) return null;
+                if (s.kind(next) != .type_param) {
+                    return propOfTypeIdx(c, next, name, allow_index, from_index);
+                }
+                cur = next;
+            }
+            return null;
         },
         .mapped => {
             // A DEFERRED homomorphic map has no members of its own, but its

@@ -285,3 +285,22 @@ decorators/011_legacy_signature_gaps  -TS1240 entry.ts 55
 decorators/011_legacy_signature_gaps  -TS1271 entry.ts 56
 decorators/011_legacy_signature_gaps  -TS1239 entry.ts 58
 decorators/011_legacy_signature_gaps  -TS1239 entry.ts 59
+
+# TS2313, "Type parameter '<T>' has a circular constraint." ztsc has no
+# circular-constraint reporter at all — no site in src/ emits 2313 — so this is
+# a whole missing check, not a cut that went quiet. Until this case it was
+# unreachable in a different sense: `propOfTypeIdx`'s `.type_param` arm
+# recursed once per constraint hop, so the very first property read through a
+# circular constraint overflowed the stack instead of reporting anything. The
+# arm now walks the chain iteratively and a circular constraint answers "no
+# apparent members" (tsc's `getBaseConstraintOfType`, undefined for a circular
+# constraint), which is what makes the oracle's TS2339s on the same lines
+# match.
+#
+# A missed error, not a false positive: the reads still fail with the oracle's
+# own TS2339, so nothing correct is rejected. Reporting TS2313 is a declaration
+# check on the type parameter list and belongs with the other TS23xx
+# declaration checks, not in the apparent-type walk. Measured 2026-08-13.
+instantiation/057_circular_type_param_constraint.ts  -TS2313 15
+instantiation/057_circular_type_param_constraint.ts  -TS2313 20
+instantiation/057_circular_type_param_constraint.ts  -TS2313 20
