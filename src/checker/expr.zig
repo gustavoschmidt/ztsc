@@ -3422,6 +3422,10 @@ fn checkArithmeticOperands(c: *Checker, node: Node, op: scanner.Tag, lt0: TypeId
     // other keeps them out of the error arm entirely.
     const l_big = try isBigintish(c, lt);
     const r_big = try isBigintish(c, rt);
+    // Neither side could be a bigint — every ordinary arithmetic expression —
+    // so nothing below can change the answer and the two `isNumberish` walks
+    // are never paid for.
+    if (!l_big and !r_big) return .{ .ty = types.number_type, .ok = ok };
     const l_num = try isNumberish(c, lt);
     const r_num = try isNumberish(c, rt);
     if (l_big and r_big and !l_num and !r_num) return .{ .ty = types.bigint_type, .ok = ok };
