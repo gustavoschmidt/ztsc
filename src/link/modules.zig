@@ -318,6 +318,11 @@ pub fn link(
     // Group the `declare module "spec"` blocks by the file they augment; the
     // export tables fold each block's new declarations in.
     try l.indexAugmentations();
+    // Index the program's global declarations, so an `export { x }` naming a
+    // global resolves instead of reporting TS2304. Must precede table
+    // building; the full global MERGE runs afterwards, once the tables it
+    // needs are sealed.
+    try l.indexGlobals();
     // Build every export table (deterministic file order).
     for (0..files.len) |i| _ = try l.table(@intCast(i));
     // Then the ambient/augmentation module registry, which import
@@ -593,6 +598,39 @@ fn globalSymFlags(files: []const ProgFile, sym_base: []const u32, sym: u32) bind
 /// constituent list; the checker materializes its type by folding each
 /// constituent's declarations across files. Merge is a pure symbol-table
 /// operation — no types are compared here (invariant 1).
+/// Walk every GLOBAL declaration of the program — each file's own script-level
+/// top level first, then every `declare global { … }` augmentation block, each
+/// pass in FileId order.
+///
+/// That order is tsc's merge order: `initializeTypeChecker` folds the
+/// non-module files' locals into `globals` and only afterwards merges the
+/// collected global-scope augmentations, and merge order decides precedence
+/// (`mergeSymbol` keeps the target's existing value declaration, so a script's
+/// `declare var expect: jest.Expect` wins the *value* over a module's `declare
+/// global { const expect: … }` whichever file was loaded first). The FIRST
+/// visit of a name is therefore its value winner — `parts[0]` in
+/// `mergeGlobals`, and the target `indexGlobals` records. Type space is
+/// unaffected either way: every constituent still folds, and interface merging
+/// is an order-independent name-sorted union.
+fn eachGlobalDecl(
+    files: []const ProgFile,
+    ctx: anytype,
+    comptime f: fn (@TypeOf(ctx), FileId, Atom, u32) Error!void,
+) Error!void {
+    for ([2]bool{ false, true }) |aug_pass| {
+        for (files, 0..) |*pf, fi| {
+            const b = pf.bind;
+            if (b.global_atoms.len == 0) continue;
+            const split = @min(b.global_aug_start, b.global_atoms.len);
+            const lo = if (aug_pass) split else 0;
+            const hi = if (aug_pass) b.global_atoms.len else split;
+            for (b.global_atoms[lo..hi], b.global_syms[lo..hi]) |atom, local| {
+                try f(ctx, @intCast(fi), atom, local);
+            }
+        }
+    }
+}
+
 fn mergeGlobals(
     arena: Allocator,
     scratch: Allocator,
@@ -601,34 +639,21 @@ fn mergeGlobals(
     links: []const FileLinks,
     export_equals_atom: Atom,
 ) Error!GlobalMerge {
-    // Accumulate name -> constituent global ids in TWO passes over the files,
-    // each pass in FileId order: first every *script*'s own top level, then
-    // every `declare global { … }` augmentation block (`global_aug_start`
-    // splits each file's harvest). That is tsc's merge order — `initialize
-    // TypeChecker` folds the non-module files' locals into `globals` and only
-    // afterwards merges the collected global-scope augmentations — and merge
-    // order decides precedence: `mergeSymbol` keeps the target's existing
-    // value declaration, so a script's `declare var expect: jest.Expect` wins
-    // the *value* over a module's `declare global { const expect: … }` no
-    // matter which file was loaded first. `parts[0]` is that winner here.
-    // Type space is unaffected: every constituent still folds (interface
-    // merging is order-independent by name-sorted union).
+    // Accumulate name -> constituent global ids in the merge order
+    // `eachGlobalDecl` documents.
     var acc: std.AutoArrayHashMapUnmanaged(Atom, std.ArrayListUnmanaged(u32)) = .empty;
-    for ([2]bool{ false, true }) |aug_pass| {
-        for (files, 0..) |*f, fi| {
-            const b = f.bind;
-            if (b.global_atoms.len == 0) continue;
-            const split = @min(b.global_aug_start, b.global_atoms.len);
-            const lo = if (aug_pass) split else 0;
-            const hi = if (aug_pass) b.global_atoms.len else split;
-            const base = sym_base[fi];
-            for (b.global_atoms[lo..hi], b.global_syms[lo..hi]) |atom, local| {
-                const gop = try acc.getOrPut(scratch, atom);
-                if (!gop.found_existing) gop.value_ptr.* = .empty;
-                try gop.value_ptr.append(scratch, base + local);
-            }
+    const Collect = struct {
+        acc: *std.AutoArrayHashMapUnmanaged(Atom, std.ArrayListUnmanaged(u32)),
+        scratch: Allocator,
+        sym_base: []const u32,
+        fn visit(self: *@This(), fi: FileId, atom: Atom, local: u32) Error!void {
+            const gop = try self.acc.getOrPut(self.scratch, atom);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            try gop.value_ptr.append(self.scratch, self.sym_base[fi] + local);
         }
-    }
+    };
+    var col: Collect = .{ .acc = &acc, .scratch = scratch, .sym_base = sym_base };
+    try eachGlobalDecl(files, &col, Collect.visit);
 
     var m: Merger = .{ .arena = arena, .scratch = scratch, .files = files, .sym_base = sym_base };
 
@@ -950,6 +975,12 @@ const Linker = struct {
     aug_start: []u32 = &.{},
     aug_files: []FileId = &.{},
     aug_blocks: []u32 = &.{},
+    /// Every GLOBAL declaration name -> the `.binding` target of its
+    /// value-winning contributor. Built by `indexGlobals` before any export
+    /// table, so `export { x }` naming a global resolves rather than
+    /// reporting TS2304. Scratch-only: the sealed `Program` carries the full
+    /// merged `Globals` table instead.
+    global_decls: std.AutoHashMapUnmanaged(Atom, Target) = .empty,
     /// Backing store for `.dual` targets (`Target.payload` indexes it).
     /// Append-only; sealed into the arena at the end of `link`.
     duals: std.ArrayListUnmanaged(DualTarget) = .empty,
@@ -1049,6 +1080,24 @@ const Linker = struct {
         return .{ .start = start, .end = scanner.tokenEnd(l.files[file].src, tree.tokens.tag(tok), start) };
     }
 
+    /// Index every GLOBAL declaration name to the `(file, local)` of its
+    /// value-winning contributor (see `eachGlobalDecl` for the order). Reads
+    /// only sealed per-file bind data, so it runs before any export table —
+    /// which is what an `export { x }` naming a global needs.
+    fn indexGlobals(l: *Linker) Error!void {
+        const Index = struct {
+            l: *Linker,
+            fn visit(self: *@This(), fi: FileId, atom: Atom, local: u32) Error!void {
+                const gop = try self.l.global_decls.getOrPut(self.l.scratch, atom);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = .{ .kind = .binding, .file = fi, .payload = local };
+                }
+            }
+        };
+        var idx: Index = .{ .l = l };
+        try eachGlobalDecl(l.files, &idx, Index.visit);
+    }
+
     /// Group every `declare module "spec" { … }` block by the *file* its
     /// specifier resolves to. Reads only sealed per-file bind data and the
     /// already-built specifier maps, so it runs before any export table.
@@ -1106,7 +1155,16 @@ const Linker = struct {
                         const tgt = try l.finalizeLocal(file, rec.sym, rec.local, rec.type_only, 0);
                         try l.put(t, rec.exported, tgt);
                     } else if (rec.local != 0) {
-                        try l.diag(file, 2304, l.nodeSpan(file, rec.node), "Cannot find name '{s}'.", .{l.atomText(rec.local)});
+                        // A module may re-export a GLOBAL: `declare var x` in
+                        // a script, `export { x }` in a module. The name has
+                        // no local symbol here, and tsc's `resolveName` walks
+                        // on into the global table rather than reporting
+                        // TS2304.
+                        if (l.global_decls.get(rec.local)) |tgt| {
+                            try l.put(t, rec.exported, tgt);
+                        } else {
+                            try l.diag(file, 2304, l.nodeSpan(file, rec.node), "Cannot find name '{s}'.", .{l.atomText(rec.local)});
+                        }
                     }
                 },
                 .default => {

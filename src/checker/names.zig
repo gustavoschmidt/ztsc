@@ -134,6 +134,48 @@ fn resolveSpaceInner(c: *Checker, a: Atom, from: ScopeId, want_value: bool, type
     return .none;
 }
 
+/// What a bare private name `#x` resolved to.
+pub const PrivateName = union(enum) {
+    /// The declaring class member (a LOCAL symbol id in the current file).
+    member: binder.SymbolId,
+    /// Inside a class body, but no class on the chain declares the name.
+    no_such_member,
+    /// No enclosing class body at all — TS18016.
+    outside_class,
+};
+
+/// Resolve a bare private name, tsc's
+/// `lookupSymbolForPrivateIdentifierDeclaration`: walk out through the
+/// enclosing CLASS scopes and take the first that declares the name, on
+/// either its instance or its static side. The grammar admits a bare `#x`
+/// in exactly one expression — the ergonomic brand check `#x in obj` — so
+/// this is not a hot path.
+///
+/// A class's member scopes are NOT in the lexical chain (a method body's
+/// parent is the class scope itself), so they are reached through the owner
+/// node `bindClass` gives all three.
+pub fn resolvePrivateName(c: *Checker, a: Atom, from: ScopeId) PrivateName {
+    var s = from;
+    var in_class = false;
+    while (true) {
+        if (c.bind.scope_kinds[s] == .class) {
+            in_class = true;
+            const owner = c.bind.scope_owners[s];
+            for (c.bind.scope_kinds, 0..) |k, i| {
+                switch (k) {
+                    .class_members, .class_statics => {},
+                    else => continue,
+                }
+                if (c.bind.scope_owners[i] != owner) continue;
+                if (c.bind.lookupInScope(@intCast(i), a)) |sym| return .{ .member = sym };
+            }
+        }
+        if (s == binder.file_scope) break;
+        s = c.bind.scope_parents[s];
+    }
+    return if (in_class) .no_such_member else .outside_class;
+}
+
 /// Longest name this module will score. tsc has no ceiling; a stack DP row
 /// needs one. The length pre-filter inside `spellCandidateDistance` already
 /// bounds an admissible candidate to `name.len * 1.34 + 2`, so a name at the
