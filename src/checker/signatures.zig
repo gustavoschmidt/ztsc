@@ -272,6 +272,9 @@ pub fn signatureOfProtoCtx(
     } else if (c.tree.nodeData(node).rhs == 0 and c.nodeTag(node) != .function_type and c.nodeTag(node) != .method_signature) {
         ret = types.any_type; // overload signature without annotation
     }
+    if (proto.return_type == 0 and report_implicit and c.prog.no_implicit_any) {
+        try implicit_any.reportMissingReturnType(c, node, proto);
+    }
 
     // TS 5.5 inferred type predicate: a boolean-returning single-param
     // callback whose body narrows that param synthesizes an implicit

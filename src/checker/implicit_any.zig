@@ -202,6 +202,35 @@ fn arrayLiteralArity(c: *Checker, init_node: Node) ?u32 {
     return @intCast(els.len);
 }
 
+/// The RETURN-type member of the implicit-'any' family: a signature with no
+/// return-type annotation AND NO BODY has nothing to infer from, so its return
+/// type is `any` and tsc says which kind of signature it was —
+///   TS7010 a named function/method  (at the name),
+///   TS7020 a bare call signature    (at the `(`),
+///   TS7013 a construct signature    (at the `new`).
+///
+/// Silent for the forms that have no return type to annotate (a constructor, a
+/// SET accessor) and for a GET accessor, whose missing return type is the
+/// property-flavoured TS7033 instead (not implemented). A signature WITH a
+/// body infers its return type and reports nothing; `function_type` and
+/// `method_signature` always carry one syntactically.
+pub fn reportMissingReturnType(c: *Checker, node: Node, proto: ast.FnProto) Error!void {
+    if (node == null_node) return;
+    switch (c.nodeTag(node)) {
+        .call_signature => return c.diagFmt(7020, c.nodeSpan(node), "Call signature, which lacks return-type annotation, implicitly has an 'any' return type.", .{}),
+        .construct_signature => return c.diagFmt(7013, c.nodeSpan(node), "Construct signature, which lacks return-type annotation, implicitly has an 'any' return type.", .{}),
+        .function_decl, .class_method, .method_signature => {},
+        else => return,
+    }
+    if (c.tree.nodeData(node).rhs != 0) return; // has a body: inferred, not implicit
+    if (proto.flags & (ast.Flags.get | ast.Flags.set) != 0) return;
+    if (proto.name_token == 0) return;
+    if (c.nodeTag(node) == .class_method and
+        proto.flags & ast.Flags.static == 0 and
+        c.tree.tokens.tag(proto.name_token) == .keyword_constructor) return;
+    try c.diagFmt(7010, c.tokSpan(proto.name_token), "'{s}', which lacks return-type annotation, implicitly has an 'any' return type.", .{c.tokenText(proto.name_token)});
+}
+
 /// One TS7031, named and located by the binding's own name token.
 fn reportBindingElement(c: *Checker, tok: TokenIndex) Error!void {
     if (!c.prog.no_implicit_any) return;
