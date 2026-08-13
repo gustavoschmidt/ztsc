@@ -45,9 +45,36 @@ pub const Resolved = union(enum) {
     none,
 };
 
+/// Which SPACE a lookup is asking about — tsc's `meaning` argument to
+/// `resolveName`. A name is skipped, and the walk continues outward, unless
+/// the symbol it found carries the requested meaning.
+pub const Meaning = enum {
+    value,
+    type_space,
+    /// The qualifier of a dotted name (`A.B`), which must be a container:
+    /// a namespace, an enum, or an alias that may resolve to one. A `class`
+    /// carries type meaning and is NOT a container, which is what lets
+    /// `var x = class C { prop: C.type }` find the outer `namespace C`
+    /// (tsc's `resolveName(..., SymbolFlags.Namespace)`).
+    namespace,
+
+    fn matches(m: Meaning, f: binder.SymbolFlags) bool {
+        return switch (m) {
+            .value => hasValueMeaning(f),
+            .type_space => hasTypeMeaning(f),
+            .namespace => f.namespace_decl or f.enum_decl or f.import_binding,
+        };
+    }
+};
+
 /// Resolve in the current file's scope chain; returns GLOBAL ids.
 pub fn resolveSpace(c: *Checker, a: Atom, from: ScopeId, want_value: bool) Resolved {
-    return resolveSpaceInner(c, a, from, want_value, false);
+    return resolveSpaceInner(c, a, from, if (want_value) .value else .type_space, false);
+}
+
+/// `resolveSpace` for the QUALIFIER of a dotted name — see `Meaning`.
+pub fn resolveNamespaceSpace(c: *Checker, a: Atom, from: ScopeId) Resolved {
+    return resolveSpaceInner(c, a, from, .namespace, false);
 }
 
 /// `resolveSpace` for the operand of a `typeof` TYPE QUERY, where a
@@ -68,19 +95,18 @@ pub fn resolveSpace(c: *Checker, a: Atom, from: ScopeId, want_value: bool) Resol
 /// TS1361 that tsc does not: every value position still goes through
 /// `resolveSpace`.
 pub fn resolveTypeQuerySpace(c: *Checker, a: Atom, from: ScopeId) Resolved {
-    return resolveSpaceInner(c, a, from, true, true);
+    return resolveSpaceInner(c, a, from, .value, true);
 }
 
-fn resolveSpaceInner(c: *Checker, a: Atom, from: ScopeId, want_value: bool, type_only_ok: bool) Resolved {
+fn resolveSpaceInner(c: *Checker, a: Atom, from: ScopeId, meaning: Meaning, type_only_ok: bool) Resolved {
+    const want_value = meaning == .value;
     var s = from;
     var wrong: SymbolId = binder.no_symbol;
     while (true) {
         if (c.bind.lookupInScope(s, a)) |sym| {
             const f = c.bind.symbol_flags[sym];
-            const ok = if (want_value)
-                (hasValueMeaning(f) or (type_only_ok and f.import_binding and f.type_only))
-            else
-                hasTypeMeaning(f);
+            const ok = meaning.matches(f) or
+                (want_value and type_only_ok and f.import_binding and f.type_only);
             if (ok) {
                 // A reference from inside a contributing file binds to the
                 // file-local declaration; if that declaration is a
@@ -111,10 +137,8 @@ fn resolveSpaceInner(c: *Checker, a: Atom, from: ScopeId, want_value: bool, type
         if (c.bind.scope_kinds[s] == .namespace) {
             if (c.mergedNsMemberOfScope(s, a)) |gsym| {
                 const gf = c.symFlags(gsym);
-                const ok = if (want_value)
-                    (hasValueMeaning(gf) or (type_only_ok and gf.import_binding and gf.type_only))
-                else
-                    hasTypeMeaning(gf);
+                const ok = meaning.matches(gf) or
+                    (want_value and type_only_ok and gf.import_binding and gf.type_only);
                 if (ok) return .{ .sym = gsym };
             }
         }
@@ -126,8 +150,7 @@ fn resolveSpaceInner(c: *Checker, a: Atom, from: ScopeId, want_value: bool, type
     // The table already holds GLOBAL SymbolIds.
     if (c.prog.globals.lookup(a)) |gsym| {
         const gf = c.symFlags(gsym);
-        const ok = if (want_value) hasValueMeaning(gf) else hasTypeMeaning(gf);
-        if (ok) return .{ .sym = gsym };
+        if (meaning.matches(gf)) return .{ .sym = gsym };
         if (wrong == binder.no_symbol) return .{ .wrong_space = gsym };
     }
     if (wrong != binder.no_symbol) return .{ .wrong_space = c.toGlobal(wrong) };

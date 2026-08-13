@@ -80,7 +80,23 @@ pub fn typesIdentical(c: *Checker, a: TypeId, b: TypeId) Error!bool {
     // leaves this check with no identity evidence at all, so it answers
     // "identical" rather than reading the heuristic as a difference.
     if (allOptional(c, ea) and allOptional(c, eb)) return true;
+    // An object with NOTHING in it — no property, no index signature, no
+    // call or construct signature — is ztsc failing to materialize a shape
+    // rather than a program that wrote `{}`. A `declare class Point` merged
+    // with a `declare namespace Point` comes back empty here, and comparing
+    // that against the `{ x: number; y: number }` it should have been is a
+    // report about ztsc, not about the two declarations.
+    if (isEmptyObject(c, ea) or isEmptyObject(c, eb)) return true;
     return (try c.isAssignable(ea, eb)) and (try c.isAssignable(eb, ea));
+}
+
+fn isEmptyObject(c: *Checker, t: TypeId) bool {
+    if (c.ts.kind(t) != .object) return false;
+    return c.ts.objectPropCount(t) == 0 and
+        c.ts.objectCallSigCount(t) == 0 and
+        c.ts.objectConstructSigCount(t) == 0 and
+        c.ts.objectStringIndex(t) == types.no_type and
+        c.ts.objectNumberIndex(t) == types.no_type;
 }
 
 /// An object type with at least one property, all of them optional.
@@ -196,7 +212,15 @@ pub fn checkSubsequentVarDecl(c: *Checker, decl: Node, is_const: bool) Error!voi
     };
     const f = c.symFlags(sym);
     if (!(f.var_decl or f.let_decl or f.const_decl)) return;
-    const first = firstValueDecl(c, sym);
+    // The value declaration has to be in THIS file. A cross-file reference
+    // resolves to the MERGED symbol, which can fold declarations tsc keeps
+    // apart — a namespace local that was never `export`ed merges into the
+    // cross-file namespace member index here, so `namespace A { var Origin:
+    // string }` in one file was compared against another file's `export var
+    // Origin: Point`. This check cannot see which constituents are really
+    // one symbol, so it declines the whole cross-file case (which loses the
+    // genuine `var x = 3;` / `var x = true;` across two script files).
+    const first = firstValueDecl(c, sym) orelse return;
     if (first == decl) return;
     const sym_ty = try c.typeOfSymbol(sym);
     const decl_ty = try c.declaratorType(sym, decl, is_const);
@@ -205,7 +229,7 @@ pub fn checkSubsequentVarDecl(c: *Checker, decl: Node, is_const: bool) Error!voi
     // a = 1;`) and the one verdict mutual assignability cannot reach — but
     // only when the program really asked for it; see `topTypeIsDeclared`.
     if (isAnyLike(c, sym_ty) != isAnyLike(c, decl_ty)) {
-        const any_decl = if (isAnyLike(c, decl_ty)) decl else (first orelse return);
+        const any_decl = if (isAnyLike(c, decl_ty)) decl else first;
         if (!topTypeIsDeclared(c, any_decl)) return;
     } else if (try typesIdentical(c, sym_ty, decl_ty)) return;
     try c.diagFmt(

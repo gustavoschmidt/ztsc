@@ -723,7 +723,11 @@ pub fn resolveNsContainer(c: *Checker, node: Node) Error!?NsContainer {
     switch (c.nodeTag(node)) {
         .identifier => {
             const a = try c.atomOfToken(c.tree.nodeMainToken(node));
-            switch (c.resolveSpace(a, c.cur_scope, false)) {
+            // NAMESPACE meaning, not type meaning: a `class` is a type but
+            // not a container, and stopping at one hid an outer namespace of
+            // the same name — `var x = class C { prop: C.type }` inside
+            // `namespace C { export interface type {} }`.
+            switch (c.resolveNamespaceSpace(a, c.cur_scope)) {
                 .sym => |sym| {
                     if (c.symFlags(sym).namespace_decl) return .{ .ns = sym };
                     if (c.symFlags(sym).import_binding) {
