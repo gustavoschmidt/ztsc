@@ -75,23 +75,10 @@ const TypeId = types.TypeId;
 const SymbolId = binder.SymbolId;
 const FileId = u32;
 
-/// Process-global switch, set once by `main` from `--inst-profile` before any
-/// checker thread starts, and read once per `Checker.init`. Write-once before
-/// the pool spawns, so no synchronization is needed.
-pub var profile_on: bool = false;
-
-/// `--inst-focus=<type-id>`: the ONE root type whose substitution the
-/// per-type histogram should be restricted to. The unrestricted histogram
-/// answers "which subterm does this run re-walk most", which a run-wide sum
-/// answers badly when one top-level entry is itself the outlier — read a
-/// root's id out of the `by root type` section and feed it back here to get
-/// that entry's own breakdown. Write-once alongside `profile_on`.
-pub var focus_root: TypeId = 0;
-
-/// Whether the profiler is enabled for this process.
-pub fn enabled() bool {
-    return profile_on;
-}
+// The profiler's two switches — "is it on" and "which root is it focused on" —
+// are `checker.Options.profile` / `.profile_focus_root`, read off the checker
+// as `c.prof.on` and `c.opts.profile_focus_root`. They were process globals
+// until they became per-run options.
 
 const Tally = struct {
     calls: u64 = 0,
@@ -138,10 +125,11 @@ pub const InstProf = struct {
     /// The trip's TS2589 is anchored at the demanding statement, which is a
     /// different thing entirely — this is the frame that spent the budget.
     trip_epochs: std.AutoHashMapUnmanaged(SymbolId, Tally) = .empty,
-    /// Non-zero while a top-level `instantiate` of `focus_root` is live —
-    /// see `focus_root`. Nested so a re-entrant focused root still counts.
+    /// Non-zero while a top-level `instantiate` of the focused root is live —
+    /// see `Options.profile_focus_root`. Nested so a re-entrant focused root
+    /// still counts.
     focus_depth: u32 = 0,
-    /// `per_type`, restricted to visits charged under `focus_root`. The
+    /// `per_type`, restricted to visits charged under the focused root. The
     /// unrestricted histogram sums a whole run and cannot say which subterm
     /// ONE enormous substitution walked; this one can.
     focus_types: std.AutoHashMapUnmanaged(TypeId, Tally) = .empty,
@@ -310,8 +298,9 @@ pub fn noteVisit(c: *Checker, t: TypeId) void {
 }
 
 /// Open/close a focus window around a top-level `instantiate` (see
-/// `focus_root`). Returns whether this entry opened one.
+/// `Options.profile_focus_root`). Returns whether this entry opened one.
 pub fn focusEnter(c: *Checker, t: TypeId) bool {
+    const focus_root = c.opts.profile_focus_root;
     if (focus_root == 0 or t != focus_root) return false;
     c.prof.focus_depth += 1;
     return true;
@@ -511,8 +500,8 @@ pub fn report(c: *Checker) void {
     dumpTally(TypeId, w, gpa, &c.prof.roots, 25, labelRoot, c) catch {};
     w.writeAll("\n-- most re-instantiated individual types --\n") catch {};
     dumpTally(TypeId, w, gpa, &c.prof.per_type, 30, labelRoot, c) catch {};
-    if (focus_root != 0) {
-        w.print("\n-- visits under root #{d} only, by type --\n", .{focus_root}) catch {};
+    if (c.opts.profile_focus_root != 0) {
+        w.print("\n-- visits under root #{d} only, by type --\n", .{c.opts.profile_focus_root}) catch {};
         dumpTally(TypeId, w, gpa, &c.prof.focus_types, 40, labelRoot, c) catch {};
         w.writeAll("\n-- visits under that root, by kind --\n") catch {};
         for (c.prof.focus_kinds, 0..) |v, i| {
@@ -751,13 +740,8 @@ pub fn report(c: *Checker) void {
 // the unit a pre-pass would materialize: pre-building that symbol builds
 // everything nested under it too.
 
-/// Process-global switch, set once by `main` from `--decl-profile` before
-/// any checker thread starts. Write-once before the pool spawns.
-pub var decl_prof_on: bool = false;
-
-pub fn declEnabled() bool {
-    return decl_prof_on;
-}
+// `--decl-profile` is `checker.Options.decl_prof`, read off the checker as
+// `c.dprof.on`. It was a process global until it became a per-run option.
 
 // =========================================================================
 // CROSS-CHECKER DUPLICATION (`--dup-profile`)
@@ -790,7 +774,8 @@ pub fn declEnabled() bool {
 // by symbol instead would charge a file that asks for one of
 // `SelectQueryBuilder`'s 1,131 expansions the cost of all of them, and would
 // overstate duplication by construction.
-pub var dup_prof_on: bool = false;
+//
+// The switch itself is `checker.Options.dup_prof`, read as `c.opts.dup_prof`.
 
 const dup_kind_tag = [_]u64{ 2, 3, 4, 1, 1, 1, 1 }; // DeclKind -> key tag
 
@@ -804,7 +789,7 @@ pub fn dupKey(kind: DeclKind, id: u64) u64 {
 /// Record that the live owned file demands `key`. Call at the TOP of the
 /// materializing function, before its memo check — a memo hit is a demand.
 pub fn declAsk(c: *Checker, sym: SymbolId, kind: DeclKind, id: u64) void {
-    if (!dup_prof_on) return;
+    if (!c.opts.dup_prof) return;
     const p = &c.dprof;
     const gop = p.units.getOrPut(c.gpa, dupKey(kind, id)) catch return;
     if (!gop.found_existing) gop.value_ptr.* = .{ .sym = sym, .kind = kind };
@@ -1036,7 +1021,7 @@ pub fn declExit(c: *Checker, w: DeclWin) void {
             if (!gop.found_existing) gop.value_ptr.* = .{};
             gop.value_ptr.add(self);
         } else |_| {}
-        if (dup_prof_on) {
+        if (c.opts.dup_prof) {
             const gross_visits = c.inst_total - fr.visits0;
             const self_visits = gross_visits - @min(gross_visits, fr.child_visits);
             if (p.units.getPtr(fr.key)) |u| {
@@ -1319,6 +1304,6 @@ pub fn declReport(c: *Checker) void {
             }) catch {};
         }
     }
-    if (dup_prof_on) dupReport(c, w);
+    if (c.opts.dup_prof) dupReport(c, w);
     w.flush() catch {};
 }

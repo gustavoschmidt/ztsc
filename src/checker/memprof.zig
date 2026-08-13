@@ -27,14 +27,8 @@ const builtin = @import("builtin");
 const checker_zig = @import("../checker.zig");
 const Checker = checker_zig.Checker;
 
-/// Process-global switch, set once by `main` from `--mem-profile` before any
-/// checker thread starts, and read once per `Checker.init`. Write-once before
-/// the pool spawns, so no synchronization is needed.
-pub var mem_prof_on: bool = false;
-
-pub fn enabled() bool {
-    return mem_prof_on;
-}
+// `--mem-profile` is `checker.Options.mem_prof`, read off the checker as
+// `c.mprof.on`. It was a process global until it became a per-run option.
 
 /// One sample of a checker's own footprint, taken at a top-level statement
 /// boundary.

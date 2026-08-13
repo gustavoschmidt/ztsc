@@ -47,7 +47,7 @@ const TestCheck = struct {
         tree.* = try parser.parse(alloc, src);
         const bound = try alloc.create(Bind);
         bound.* = try binder.bind(alloc, testing.io, testing.allocator, &t.interner, tree, src, false);
-        t.result = try check(alloc, testing.io, testing.allocator, &t.interner, tree, bound, src);
+        t.result = try check(alloc, testing.io, testing.allocator, &t.interner, tree, bound, src, .{});
         return t;
     }
 
@@ -686,7 +686,7 @@ test "noImplicitAny off: TS7006 suppressed, param still types as any" {
     const prog = try alloc.create(modules.Program);
     prog.* = try modules.singleFileProgram(alloc, "", src, tree, bound);
     prog.no_implicit_any = false; // the effective tsconfig value
-    const result = try checkFiles(alloc, testing.io, testing.allocator, &t.interner, prog, &.{0}, null, true, 0);
+    const result = try checkFiles(alloc, testing.io, testing.allocator, &t.interner, prog, &.{0}, null, true, 0, .{});
     try testing.expectEqual(@as(usize, 0), result.diagnostics.len);
 }
 
@@ -814,7 +814,7 @@ test "stress: checker total on random and token soup" {
         };
         const bound = try alloc.create(Bind);
         bound.* = try binder.bind(alloc, testing.io, testing.allocator, &interner, tree, buf[0..len], false);
-        const result = try check(alloc, testing.io, testing.allocator, &interner, tree, bound, buf[0..len]);
+        const result = try check(alloc, testing.io, testing.allocator, &interner, tree, bound, buf[0..len], .{});
         for (result.diagnostics) |dd| {
             try testing.expect(dd.span.start <= len + 1);
             try testing.expect(dd.code != 0);
@@ -845,7 +845,7 @@ fn fuzzCheckerOne(_: void, smith: *std.testing.Smith) !void {
     tree.* = parser.parse(alloc, source_buf[0..len]) catch return;
     const bound = try alloc.create(Bind);
     bound.* = try binder.bind(alloc, testing.io, testing.allocator, &interner, tree, source_buf[0..len], false);
-    _ = try check(alloc, testing.io, testing.allocator, &interner, tree, bound, source_buf[0..len]);
+    _ = try check(alloc, testing.io, testing.allocator, &interner, tree, bound, source_buf[0..len], .{});
 }
 
 test "fuzz: checker on arbitrary bytes" {

@@ -141,6 +141,10 @@ pub const CheckerTask = struct {
     /// Enable the instantiation caching layer (`false` under
     /// `--no-inst-cache`).
     inst_cache: bool = true,
+    /// This run's checker options (instruments and bisect legs). The same
+    /// value is copied into every task, so all instances see identical
+    /// options — see `checker.Options`.
+    opts: checker.Options = .{},
     /// Node count to size this instance's type-store reserve from, or 0 to
     /// size it from its own partition. Non-zero only for a program whose
     /// declaration surface is not divisible (`declaration_heavy_ratio`),
@@ -158,7 +162,7 @@ pub const CheckerTask = struct {
         prog: *const modules.Program,
     ) void {
         const timer = Timer.start(io);
-        t.result = checker.checkFiles(t.arena.allocator(), io, gpa, interner, prog, t.owned, t.base, t.inst_cache, t.type_reserve_hint) catch |err| blk: {
+        t.result = checker.checkFiles(t.arena.allocator(), io, gpa, interner, prog, t.owned, t.base, t.inst_cache, t.type_reserve_hint, t.opts) catch |err| blk: {
             t.err = err;
             break :blk null;
         };

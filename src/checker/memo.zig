@@ -116,11 +116,6 @@ pub const min_bits: u6 = 10;
 const grow_at_num: u32 = 1;
 const grow_at_den: u32 = 2;
 
-/// Process-global slot-count override (`--inst-memo-bits=N`), written once by
-/// `main` before any checker thread starts. Pins the table at exactly 2^N
-/// slots with no growth — a measurement aid. 0 = the adaptive default.
-pub var bits_override: u6 = 0;
-
 pub const InstMemo = struct {
     slots: ZeroPagedArray(Entry) = .{},
     mask: u32 = 0,
@@ -131,8 +126,10 @@ pub const InstMemo = struct {
     cap_bits: u6 = 0,
 
     /// A memo that starts at `min_bits` slots and doubles up to `max_bits`.
-    /// `--inst-memo-bits=N` pins it at 2^N with no growth.
-    pub fn alloc() error{OutOfMemory}!InstMemo {
+    /// A non-zero `bits_override` (`checker.Options.inst_memo_bits`, from
+    /// `--inst-memo-bits=N`) instead pins it at 2^N with no growth — a
+    /// measurement aid.
+    pub fn alloc(bits_override: u6) error{OutOfMemory}!InstMemo {
         const pinned = bits_override != 0;
         const start: u6 = if (pinned) bits_override else min_bits;
         const n_slots = @as(usize, 1) << start;
@@ -223,9 +220,7 @@ pub const InstMemo = struct {
 };
 
 test "InstMemo: stores, reads back, and never reports a free slot as a hit" {
-    bits_override = 8;
-    defer bits_override = 0;
-    var m = try InstMemo.alloc();
+    var m = try InstMemo.alloc(8);
     defer m.free();
     try std.testing.expectEqual(@as(?u32, null), m.get(1, 2));
     m.put(1, 2, 42);
@@ -239,9 +234,7 @@ test "InstMemo: stores, reads back, and never reports a free slot as a hit" {
 
 test "InstMemo: a colliding write evicts, and the evicted key reads as absent" {
     // Pinned, so the growth path cannot rescue the collision this is about.
-    bits_override = 4;
-    defer bits_override = 0;
-    var m = try InstMemo.alloc();
+    var m = try InstMemo.alloc(4);
     defer m.free();
     var i: u32 = 1;
     var first: u32 = 0;
@@ -265,7 +258,7 @@ test "InstMemo: a colliding write evicts, and the evicted key reads as absent" {
 }
 
 test "InstMemo: grows up to the cap, then stops and evicts instead" {
-    var m = try InstMemo.alloc();
+    var m = try InstMemo.alloc(0);
     defer m.free();
     try std.testing.expectEqual(min_bits, m.bits);
     // Fill well past the starting size: the table must double rather than
@@ -279,9 +272,7 @@ test "InstMemo: grows up to the cap, then stops and evicts instead" {
     try std.testing.expect(m.mappedBytes() < (@as(usize, 1) << max_bits) * @sizeOf(Entry));
 
     // At the cap the table stops growing.
-    bits_override = min_bits;
-    defer bits_override = 0;
-    var pinned = try InstMemo.alloc();
+    var pinned = try InstMemo.alloc(min_bits);
     defer pinned.free();
     const cap_slots = pinned.mask + 1;
     i = 1;

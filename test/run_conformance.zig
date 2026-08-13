@@ -238,7 +238,7 @@ fn runCase(alloc: std.mem.Allocator, io: Io, gpa: std.mem.Allocator, interner: *
     // Exercise the shared frozen base type store, like the CLI default.
     const base = try alloc.create(ztsc.types.Store);
     base.* = try checker.buildBaseStore(alloc);
-    const result = try checker.checkFiles(alloc, io, gpa, interner, prog, owned, base, true, 0);
+    const result = try checker.checkFiles(alloc, io, gpa, interner, prog, owned, base, true, 0, .{});
 
     // Parser-surfaced diagnostics with a tsc analogue (e.g. TS1206 parameter
     // decorators); other parser codes map to tsCode 0 and are ignored.
@@ -427,7 +427,7 @@ fn runDirCase(
     for (owned, 0..) |*f, i| f.* = @intCast(i);
     const base = try alloc.create(ztsc.types.Store);
     base.* = try checker.buildBaseStore(alloc);
-    const result = try checker.checkFiles(alloc, io, gpa, interner, prog, owned, base, true, 0);
+    const result = try checker.checkFiles(alloc, io, gpa, interner, prog, owned, base, true, 0, .{});
 
     for (prog.files, 0..) |*pf, i| {
         // Skip the injected lib files (ES-core, DOM, console shim; the first
@@ -675,7 +675,7 @@ fn renderProgramDiags(
         while (i < prog.files.len) : (i += n_checkers) {
             try owned.append(alloc, @intCast(i));
         }
-        results[k] = try checker.checkFiles(alloc, io, gpa, interner, prog, owned.items, base, true, 0);
+        results[k] = try checker.checkFiles(alloc, io, gpa, interner, prog, owned.items, base, true, 0, .{});
     }
 
     const Line = struct { start: u32, code: u16, msg: []const u8 };

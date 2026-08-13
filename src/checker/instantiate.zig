@@ -196,7 +196,7 @@ fn refDeclKind(c: *Checker, sym: SymbolId) prof_zig.DeclKind {
 }
 
 pub fn expandRef(c: *Checker, ref: TypeId) Error!TypeId {
-    if (prof_zig.dup_prof_on) prof_zig.declAsk(c, c.ts.refSymbol(ref), refDeclKind(c, c.ts.refSymbol(ref)), ref);
+    if (c.opts.dup_prof) prof_zig.declAsk(c, c.ts.refSymbol(ref), refDeclKind(c, c.ts.refSymbol(ref)), ref);
     if (c.expansions.get(ref)) |t| {
         if (t == types.no_type) return types.error_type; // cycle
         if (c.prof.on) prof_zig.noteExpandHit(c, ref);
@@ -342,14 +342,22 @@ pub fn expandRef(c: *Checker, ref: TypeId) Error!TypeId {
 // lazy member tables — "symbols eagerly, types lazily"
 // =====================================================================
 
-/// Process-global switch for the lazy member route (`--eager-members` turns
-/// it off). Written once by `main` before the checker pool spawns, so it
-/// needs no synchronization; it exists so any diagnostic movement can be
-/// bisected against the eager path in the same binary.
-pub var lazy_members_on: bool = true;
+// The lazy member route's switch (`--eager-members` turns it off) is
+// `checker.Options.lazy_members`, read as `c.opts.lazy_members`. It exists so
+// any diagnostic movement can be bisected against the eager path in the same
+// binary. It was a process global until it became a per-run option.
 
-/// `--lazy-stats`: dump the relation route's hit / bail tally at `seal` (see
-/// `LazyStat`). Write-once before the pool spawns, like `lazy_members_on`.
+/// COMPATIBILITY MIRROR of `checker.Options.lazy_stats` (`--lazy-stats`: dump
+/// the relation route's hit / bail tally at `seal`, see `LazyStat`).
+///
+/// The option is the source of truth and every other reader takes it off the
+/// checker (`c.opts.lazy_stats`); this global exists only because
+/// `checker/assign.zig` still reads the switch by module path, on a hot
+/// predictable-false branch. `Checker.init` writes it from the options, and
+/// since options are passed by value and are identical for every instance of a
+/// run, all instances write the same value — the store is as write-once in
+/// effect as `main`'s pre-spawn write was. Delete once `assign.zig` reads
+/// `c.opts.lazy_stats`.
 pub var stats_on: bool = false;
 
 /// The GENERIC member table `ref`'s expansion substitutes, when that table
@@ -459,7 +467,7 @@ pub fn lazyShapeOf(c: *Checker, ref: TypeId) Error!?TypeId {
 }
 
 pub fn lazyShapeOutcome(c: *Checker, ref: TypeId) Error!TableOutcome {
-    if (!lazy_members_on) return .{ .no = .tbl_disabled };
+    if (!c.opts.lazy_members) return .{ .no = .tbl_disabled };
     if (c.ts.kind(ref) != .ref) return .{ .no = .tgt_not_ref };
     const sym = c.ts.refSymbol(ref);
     const f = c.symFlags(sym);

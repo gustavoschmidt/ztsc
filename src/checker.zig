@@ -71,9 +71,9 @@ const parser = @import("frontend/parser.zig");
 const ZeroPagedArray = @import("zeropage.zig").ZeroPagedArray;
 pub const BumpArena = @import("checker/bump.zig").BumpArena;
 pub const prof_zig = @import("checker/prof.zig");
-pub const memprof_zig = @import("checker/memprof.zig");
-pub const memo_zig = @import("checker/memo.zig");
-pub const lazy_zig = @import("checker/instantiate.zig");
+const memprof_zig = @import("checker/memprof.zig");
+const memo_zig = @import("checker/memo.zig");
+const lazy_zig = @import("checker/instantiate.zig");
 
 const Ast = ast.Ast;
 const Node = ast.Node;
@@ -173,6 +173,50 @@ pub const Check = struct {
     stats: Stats,
 };
 
+/// Per-run switches: which instruments are armed and which route the checker
+/// takes. Chosen once by the caller — `main` from the command line, tests from
+/// the defaults — and passed BY VALUE into every checker instance, so the N
+/// threads of a `--checkers=N` run cannot see different options.
+///
+/// These were process-global `var`s in `checker/prof.zig`,
+/// `checker/instantiate.zig`, `checker/memprof.zig` and `checker/memo.zig`,
+/// written once by `main` before the pool spawned. The defaults here reproduce
+/// those globals' initial values exactly, so a caller that passes `.{}` gets
+/// the behavior an un-flagged run has always had.
+///
+/// Every field is a diagnostic instrument or a bisect leg except
+/// `lazy_members`, which is on in every real run.
+pub const Options = struct {
+    /// `--inst-profile`: dump the instantiation-demand profile (where a
+    /// statement's instantiation budget goes) to stderr at seal.
+    profile: bool = false,
+    /// `--inst-focus=<type-id>`: restrict the profile's per-type histogram to
+    /// the ONE top-level substitution root with this id. 0 (the default) is
+    /// the unrestricted, run-wide histogram — the id space starts at 1, so
+    /// zero is a sentinel rather than a valid root, exactly as it was when
+    /// this lived in `prof.focus_root`.
+    profile_focus_root: types.TypeId = 0,
+    /// `--decl-profile`: dump the declaration-window time split at seal.
+    /// Implied by `dup_prof`.
+    decl_prof: bool = false,
+    /// `--dup-profile`: additionally record, per memoizable declaration unit,
+    /// the set of owned files that demanded it. Implies `decl_prof`.
+    dup_prof: bool = false,
+    /// The lazy member route (`--eager-members` turns it off): read an
+    /// interface/class reference's member table member-by-member instead of
+    /// materializing it whole. ON by default — the eager path is the bisect
+    /// leg, not the normal one.
+    lazy_members: bool = true,
+    /// `--lazy-stats`: dump the lazy relation route's hit/bail tally at seal.
+    lazy_stats: bool = false,
+    /// `--mem-profile`: dump this instance's own-footprint samples at seal.
+    mem_prof: bool = false,
+    /// `--inst-memo-bits=N`: pin the instantiation memo at exactly 2^N slots
+    /// with no growth, a measurement aid. 0 (the default) is the adaptive
+    /// table that starts at `memo.min_bits` and doubles to `memo.max_bits`.
+    inst_memo_bits: u6 = 0,
+};
+
 /// Type-check one bound file with an unlinked single-file program
 /// (imports type as `any`; no module diagnostics). Exists for
 /// `checker/tests.zig`, whose cases are single files with no link step;
@@ -189,10 +233,11 @@ pub fn check(
     tree: *const Ast,
     bind: *const Bind,
     src: []const u8,
+    opts: Options,
 ) Error!Check {
     const prog = try arena.create(modules.Program);
     prog.* = try modules.singleFileProgram(arena, "", src, tree, bind);
-    return checkFiles(arena, io, gpa, interner, prog, &.{0}, null, true, 0);
+    return checkFiles(arena, io, gpa, interner, prog, &.{0}, null, true, 0, opts);
 }
 
 /// Type-check `owned` files of a linked multi-file program. Cross-file
@@ -211,8 +256,10 @@ pub fn checkFiles(
     base: ?*const types.Store,
     inst_cache_on: bool,
     type_reserve_hint: usize,
+    /// Per-run instrument/route switches; `.{}` is the un-flagged run.
+    opts: Options,
 ) Error!Check {
-    var c = try Checker.init(arena, io, gpa, interner, prog, owned, base, inst_cache_on, type_reserve_hint);
+    var c = try Checker.init(arena, io, gpa, interner, prog, owned, base, inst_cache_on, type_reserve_hint, opts);
     defer c.deinit();
     try c.run();
     return c.seal();
@@ -231,9 +278,11 @@ pub fn checkFilesAndDump(
     base: ?*const types.Store,
     inst_cache_on: bool,
     type_reserve_hint: usize,
+    /// Per-run instrument/route switches; `.{}` is the un-flagged run.
+    opts: Options,
     w: *std.Io.Writer,
 ) (Error || std.Io.Writer.Error)!Check {
-    var c = try Checker.init(arena, io, gpa, interner, prog, owned, base, inst_cache_on, type_reserve_hint);
+    var c = try Checker.init(arena, io, gpa, interner, prog, owned, base, inst_cache_on, type_reserve_hint, opts);
     defer c.deinit();
     try c.run();
     for (owned) |f| {
@@ -1953,6 +2002,11 @@ pub const Checker = struct {
     /// the instantiate memo, map interning, constraint memo, and type-node
     /// memo. The depth/count limits are independent of it.
     inst_cache_on: bool = true,
+    /// This run's instrument/route switches (see `Options`), copied in at
+    /// `init`. Immutable for the instance's lifetime and identical across
+    /// every instance of a run, which is what makes reading it from a checker
+    /// thread as safe as the process globals it replaced.
+    opts: Options = .{},
     /// While set, `instantiateId`'s depth/count guard truncates silently
     /// (no TS2589) — used for origin-tag bookkeeping (`tagInstantiatedOrigin`).
     suppress_inst_diag: bool = false,
@@ -2217,7 +2271,19 @@ pub const Checker = struct {
         /// whole program's types and `owned` badly under-predicts (see
         /// `main.declaration_heavy_ratio`).
         type_reserve_hint: usize,
+        /// Per-run instrument/route switches (see `Options`). Copied into the
+        /// instance, so every thread of a `--checkers=N` run reads the same
+        /// values off its own `Checker` rather than off a process global.
+        opts: Options,
     ) Error!Checker {
+        // Compatibility mirror: `checker/assign.zig` reads `lazy_zig.stats_on`
+        // by module path on the lazy relation route, and that file is not this
+        // refactor's to change. Every instance of a run writes the identical
+        // value here (options are passed by value and never differ between
+        // threads), so the store stays as write-once-in-effect as it was when
+        // `main` performed it before the pool spawned. Delete the global once
+        // `assign.zig` can read `c.opts.lazy_stats` instead.
+        lazy_zig.stats_on = opts.lazy_stats;
         const first = if (owned.len > 0) owned[0] else 0;
         const f0 = &prog.files[first];
         var c: Checker = .{
@@ -2235,9 +2301,10 @@ pub const Checker = struct {
             .scratch_arena = undefined,
             .inst_arena = undefined,
             .inst_cache_on = inst_cache_on,
-            .prof = .{ .on = prof_zig.enabled() },
-            .dprof = .{ .on = prof_zig.declEnabled() },
-            .mprof = .{ .on = memprof_zig.enabled() },
+            .opts = opts,
+            .prof = .{ .on = opts.profile },
+            .dprof = .{ .on = opts.decl_prof },
+            .mprof = .{ .on = opts.mem_prof },
         };
         c.carena = try gpa.create(std.heap.ArenaAllocator);
         errdefer gpa.destroy(c.carena);
@@ -2320,7 +2387,7 @@ pub const Checker = struct {
         // Bounded instantiation memo (see `checker/memo.zig`): starts at
         // 12 KiB, doubles as it fills, and stops at 3 MiB however much the
         // program asks for.
-        if (inst_cache_on) c.inst_cache = try memo_zig.InstMemo.alloc();
+        if (inst_cache_on) c.inst_cache = try memo_zig.InstMemo.alloc(opts.inst_memo_bits);
         errdefer c.inst_cache.free();
         c.owned_mask = try arena_alloc.alloc(bool, prog.files.len);
         @memset(c.owned_mask, false);
@@ -2496,7 +2563,7 @@ pub const Checker = struct {
         if (c.prof.on) prof_zig.report(c);
         if (c.dprof.on) prof_zig.declReport(c);
         if (c.mprof.on) memprof_zig.report(c);
-        if (lazy_zig.stats_on) {
+        if (c.opts.lazy_stats) {
             var buf: [512]u8 = undefined;
             var used: usize = 0;
             inline for (@typeInfo(LazyStat).@"enum".fields) |f| {
@@ -2684,7 +2751,7 @@ pub const Checker = struct {
     pub fn enterSymFile(c: *Checker, sym: SymbolId) SavedCtx {
         const saved = c.saveCtx();
         const f = c.symFile(sym);
-        if (prof_zig.enabled()) c.epoch_sym = sym;
+        if (c.prof.on) c.epoch_sym = sym;
         if (f != c.cur_file) {
             c.setFile(f);
             c.this_type = 0;
