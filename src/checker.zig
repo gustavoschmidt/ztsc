@@ -3753,6 +3753,7 @@ pub const Checker = struct {
     pub const decoAcceptsValue = stmts_zig.decoAcceptsValue;
     pub const decoContextMismatch = stmts_zig.decoContextMismatch;
     pub const globalSymNamed = stmts_zig.globalSymNamed;
+    pub const propAssignedInCtor = stmts_zig.propAssignedInCtor;
     pub const DecoPos = stmts_zig.DecoPos;
 };
 

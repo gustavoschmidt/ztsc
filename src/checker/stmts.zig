@@ -31,6 +31,7 @@ const classStaticType = @import("enums.zig").classStaticType;
 const decorators = @import("decorators.zig");
 const diagFmt = Checker.diagFmt;
 const elaborate = @import("elaborate.zig");
+const heritage = @import("heritage.zig");
 const isNonPrimitiveKind = @import("assign.zig").isNonPrimitiveKind;
 const isNullishUnion = @import("flow.zig").isNullishUnion;
 const iteration = @import("iteration.zig");
@@ -1147,20 +1148,31 @@ fn writesThisProp(c: *Checker, target: Node, name: intern.Atom) bool {
 /// `member.name`), which is the field node's main token, so a modifier list
 /// (`private readonly x: T`) does not move the column.
 fn checkPropertyInit(c: *Checker, ctor: Node, widened: bool, cands: []const InitCand) Error!void {
-    const ret_flow: binder.FlowId = if (ctor == null_node)
-        binder.no_flow
-    else
-        c.bind.flowAt(ctor) orelse binder.no_flow;
     for (cands) |cand| {
         const tok = c.tree.nodeMainToken(cand.member);
-        if (ctor != null_node and ret_flow != binder.no_flow) {
-            const name = try c.memberAtom(tok);
-            if (!try c.thisPropUnassigned(ret_flow, name, cand.ty)) continue;
-            const body = c.tree.nodeData(ctor).rhs;
-            if (widened and try writeHiddenFromFlow(c, body, name, false)) continue;
-        }
+        const name = try c.memberAtom(tok);
+        if (try propAssignedInCtor(c, ctor, widened, name, cand.ty)) continue;
         try c.diagFmt(2564, c.tokSpan(tok), "Property '{s}' has no initializer and is not definitely assigned in the constructor.", .{c.tokenText(tok)});
     }
+}
+
+/// tsc's `isPropertyInitializedInConstructor`: does every path out of `ctor`
+/// write `this.<name>`? With no constructor at all, nothing was assigned.
+///
+/// Shared by the two checks that ask it — TS2564 above and `heritage.zig`'s
+/// TS2612 — because they must agree: a property the flow graph calls
+/// initialized is exempt from both, and a divergence would report one class
+/// of property twice and another not at all.
+///
+/// `widened` is `ctorHasWidenedFlow(body)`, hoisted by the caller so the
+/// syntactic scan runs once per class rather than once per property.
+pub fn propAssignedInCtor(c: *Checker, ctor: Node, widened: bool, name: intern.Atom, declared: TypeId) Error!bool {
+    if (ctor == null_node) return false;
+    const ret_flow = c.bind.flowAt(ctor) orelse return false;
+    if (!try c.thisPropUnassigned(ret_flow, name, declared)) return true;
+    // Writes ztsc's flow graph cannot see (an IIFE body, a `try` under a
+    // `finally`) still initialize the property; see `writeHiddenFromFlow`.
+    return widened and try writeHiddenFromFlow(c, c.tree.nodeData(ctor).rhs, name, false);
 }
 
 /// TS2565 — the `assumeUninitialized` half of tsc's
@@ -1478,13 +1490,22 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
         }
     }
 
+    // Both remaining checks read the constructor's FLOW, so they run after the
+    // member walk has checked its body. `widened` is scanned once and shared.
+    c.this_type = this_t;
+    const ctor = constructorWithBody(c, members);
+    const ctor_body = if (ctor == null_node) null_node else c.tree.nodeData(ctor).rhs;
+    const widened = ctorHasWidenedFlow(c, ctor_body);
     if (init_cands.items.len != 0) {
-        c.this_type = this_t;
-        const ctor = constructorWithBody(c, members);
-        const body = if (ctor == null_node) null_node else c.tree.nodeData(ctor).rhs;
-        const widened = ctorHasWidenedFlow(c, body);
         try checkPropertyInit(c, ctor, widened, init_cands.items);
-        if (ctor != null_node) try checkPropertyUseBeforeAssigned(c, body, widened, init_cands.items);
+        if (ctor != null_node) try checkPropertyUseBeforeAssigned(c, ctor_body, widened, init_cands.items);
+    }
+    // `check_prop_init` is exactly "not ambient, and this file is ours to
+    // report on" — the same two conditions TS2612 needs, for the same two
+    // reasons (an ambient member emits no field; a foreign file's flow is
+    // never built).
+    if (class_sym != binder.no_symbol and check_prop_init) {
+        try heritage.checkBasePropertyOverwrites(c, class_sym, this_t, members, ctor, widened);
     }
 }
 
@@ -1515,6 +1536,7 @@ fn checkInterfaceDecl(c: *Checker, node: Node) Error!void {
         if (c.bind.symbol_flags[sym].interface) {
             _ = try c.interfaceGeneric(c.toGlobal(sym));
             try evalTypeParamDecls(c, c.toGlobal(sym));
+            try heritage.checkInterfaceExtends(c, c.toGlobal(sym), node, data.name_token);
         }
     }
 }
