@@ -61,6 +61,7 @@ const directives = @import("directives.zig");
 const TokTag = scanner.Tag;
 const Token = scanner.Token;
 const Node = ast.Node;
+const TokenIndex = ast.TokenIndex;
 const null_node = ast.null_node;
 const Code = diagnostics.Code;
 
@@ -3068,19 +3069,20 @@ const Parser = struct {
             if (p.atLt()) targs = try p.parseTypeArgs();
         }
         const attrs = try p.parseJsxAttributes();
-        var self_closing: u32 = 0;
+        var close_lt: TokenIndex = 0;
         var children: ast.SubRange = .{ .start = 0, .end = 0 };
         if (p.curTag() == .slash) {
             _ = try p.bump(); // '/'
             _ = try p.expect(.gt, .expected_gt);
-            self_closing = 1;
         } else {
             _ = try p.expect(.gt, .expected_gt);
-            children = try p.parseJsxChildren();
+            const kids = try p.parseJsxChildren();
+            children = kids.range;
+            close_lt = kids.close_lt;
         }
         const data = try p.addExtra(ast.JsxElementData{
             .tag = tag,
-            .self_closing = self_closing,
+            .close_lt = close_lt,
             .targs_start = targs.start,
             .targs_end = targs.end,
             .attrs_start = attrs.start,
@@ -3152,11 +3154,16 @@ const Parser = struct {
         }
     }
 
+    /// The children of one non-self-closing element plus the `<` token of the
+    /// `</tag>` that ended them (0 when the closing tag was never reached).
+    const JsxChildren = struct { range: ast.SubRange, close_lt: TokenIndex };
+
     /// Children of a non-self-closing element, up to the matching `</tag>`
     /// (whose closing tag this consumes).
-    fn parseJsxChildren(p: *Parser) PE!ast.SubRange {
+    fn parseJsxChildren(p: *Parser) PE!JsxChildren {
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
+        var close_lt: TokenIndex = 0;
         var pos = p.lastTokEnd(); // just past the opening '>'
         while (true) {
             const tok = p.scn.scanJsxChild(pos);
@@ -3179,7 +3186,7 @@ const Parser = struct {
                 .lt => {
                     p.jsxResync(tok.start);
                     if (p.peekTag(1) == .slash) {
-                        _ = try p.bump(); // '<'
+                        close_lt = try p.bump(); // '<'
                         _ = try p.bump(); // '/'
                         if (p.curTag() != .gt) _ = try p.parseJsxTagName();
                         _ = try p.expect(.gt, .expected_gt);
@@ -3195,7 +3202,7 @@ const Parser = struct {
                 },
             }
         }
-        return p.scratchToSpan(top);
+        return .{ .range = try p.scratchToSpan(top), .close_lt = close_lt };
     }
 
     fn parsePrimaryExpr(p: *Parser, ctx: ExprCtx) PE!Node {

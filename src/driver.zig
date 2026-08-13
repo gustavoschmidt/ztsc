@@ -901,6 +901,7 @@ fn linkProgram(
         .types_wildcard = link_opts.types_wildcard,
         .experimental_decorators = link_opts.experimental_decorators,
         .jsx_runtime_file = jsx_runtime_file,
+        .jsx_factory_ns = link_opts.jsx_factory_ns,
     };
     return prog;
 }

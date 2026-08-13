@@ -771,6 +771,35 @@ pub fn containerFromImportTarget(c: *Checker, tgt0: modules.Target) ?NsContainer
     }
 }
 
+/// The namespace container an ENTITY-NAME `import X = A.B` alias stands for,
+/// or null (including for every other kind of binding).
+///
+/// The binder records an import *record* only for `import X = require("m")`:
+/// the entity-name form names something already in the program, so there is no
+/// module to link and `importTarget` returns null. Alias consumers then see an
+/// "unlinked" binding and degrade to `any`. The RHS is resolved here instead —
+/// in the ALIAS's own file and scope, which is not the use site's, so the walk
+/// enters that file first (`enterSymFile`).
+///
+/// preact publishes its JSX namespace this way (`declare global { export
+/// import JSX = JSXInternal }`), which left `JSX.Element` /
+/// `JSX.IntrinsicElements` resolving to nothing at all.
+pub fn importEqualsEntityContainer(c: *Checker, sym0: SymbolId) Error!?NsContainer {
+    const sym = c.reprSym(sym0);
+    if (!c.symFlags(sym).import_binding) return null;
+    if (c.importTarget(sym) != null) return null; // module form: not ours
+    for (c.declsOf(sym)) |decl| {
+        if (c.prog.files[c.symFile(sym)].tree.nodeTag(decl) != .import_equals) continue;
+        const saved = c.enterSymFile(sym);
+        defer c.restoreCtx(saved);
+        c.cur_scope = c.symScope(sym);
+        const e = c.tree.extraData(ast.ImportEquals, c.tree.nodeData(decl).lhs);
+        if (e.module_token != 0 or e.entity == null_node) return null;
+        return try c.resolveNsContainer(e.entity);
+    }
+    return null;
+}
+
 /// Resolve member `name` of a container to a *nested* namespace container
 /// (for a deeper `a.b.c` qualifier). Requires the member to be an exported
 /// namespace (or a re-export/namespace-import of one). Null otherwise.

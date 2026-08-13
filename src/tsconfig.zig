@@ -205,6 +205,13 @@ fn loadInDir(io: Io, arena: Allocator, base: Io.Dir, config_path: []const u8) Lo
             try cx.note("'jsx: {s}': the `JSX` namespace is read from '{s}' (automatic runtime), falling back to a global `JSX` namespace", .{ j, cfg.jsx_runtime_module.? });
         }
     }
+    if (acc.jsx_factory) |f| {
+        const root = f[0 .. std.mem.indexOfScalar(u8, f, '.') orelse f.len];
+        if (root.len != 0) {
+            cfg.jsx_factory_ns = root;
+            try cx.note("'jsxFactory: {s}': the `JSX` namespace is read from `{s}.JSX`, falling back to a global `JSX` namespace", .{ f, root });
+        }
+    }
     if (cfg.skip_all_lib_check) {
         try cx.note("'skipLibCheck' honored: no diagnostics are surfaced from any .d.ts file (default lib and dependency/project .d.ts alike); their types still flow into .ts checking", .{});
     } else if (acc.skip_lib_check) |sv| {
@@ -454,6 +461,13 @@ pub const Config = struct {
     /// without this every intrinsic element (`<div>`, `<input>`) has an unknown
     /// props type and its attribute values lose their contextual type.
     jsx_runtime_module: ?[]const u8 = null,
+    /// The ROOT identifier of `compilerOptions.jsxFactory` (`"MyLib"` for
+    /// `"MyLib.createElement"`), or null when unset. tsc's `getJsxNamespace`
+    /// makes that name the container the `JSX` namespace is read out of —
+    /// `MyLib.JSX.IntrinsicElements` — in preference to the global one. Only
+    /// the root matters: the rest of the entity name is the emit factory,
+    /// which ztsc never uses.
+    jsx_factory_ns: ?[]const u8 = null,
     /// Non-fatal warnings (unknown options, bad shapes) for stderr.
     warnings: []const []const u8 = &.{},
     /// Accepted-and-ignored option notes, shown under --verbose only.
@@ -745,6 +759,7 @@ const Merged = struct {
     experimental_decorators: ?bool = null,
     jsx: ?[]const u8 = null,
     jsx_import_source: ?[]const u8 = null,
+    jsx_factory: ?[]const u8 = null,
     lib: ?[]const []const u8 = null,
     module_suffixes: ?[]const []const u8 = null,
     skip_lib_check: ?bool = null,
@@ -916,9 +931,15 @@ fn applyOwn(
                     if (oval == .string) acc.jsx = oval.string;
                 } else if (std.mem.eql(u8, okey, "jsxImportSource")) {
                     if (oval == .string) acc.jsx_import_source = oval.string;
-                } else if (std.mem.eql(u8, okey, "jsxFactory") or
-                    std.mem.eql(u8, okey, "jsxFragmentFactory"))
-                {
+                } else if (std.mem.eql(u8, okey, "jsxFactory")) {
+                    // Read only for its FIRST identifier: tsc's
+                    // `getJsxNamespace` takes `jsxFactory`'s root name as the
+                    // namespace that holds the `JSX` namespace, so
+                    // `jsxFactory: "MyLib.createElement"` types every
+                    // intrinsic element through `MyLib.JSX.IntrinsicElements`.
+                    // Emit is never affected — ztsc does not emit.
+                    if (oval == .string) acc.jsx_factory = oval.string;
+                } else if (std.mem.eql(u8, okey, "jsxFragmentFactory")) {
                     try cx.note("{s}: '{s}' accepted and ignored (ztsc type-checks JSX via the ambient/global `JSX` namespace; it never emits)", .{ config_path, okey });
                 } else if (std.mem.eql(u8, okey, "lib")) {
                     if (try stringArray(cx, config_path, okey, oval)) |libs| {

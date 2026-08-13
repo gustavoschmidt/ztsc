@@ -234,6 +234,10 @@ const Effective = struct {
     /// `<jsxImportSource>/jsx-runtime` under the automatic JSX runtime; null
     /// under the classic runtime (global `JSX` namespace only).
     jsx_runtime_module: ?[]const u8 = null,
+    /// Root identifier of tsconfig `jsxFactory` (`MyLib` for
+    /// `MyLib.createElement`); the container tsc reads the `JSX` namespace
+    /// out of. Null when unset.
+    jsx_factory_ns: ?[]const u8 = null,
 
     // --- link / program semantics ---
     allow_synthetic_default: bool = true,
@@ -273,6 +277,7 @@ const Effective = struct {
             .no_unchecked_side_effect_imports = e.no_unchecked_side_effect_imports,
             .types_wildcard = e.types_wildcard,
             .experimental_decorators = e.experimental_decorators,
+            .jsx_factory_ns = e.jsx_factory_ns,
         };
     }
 };
@@ -291,6 +296,7 @@ fn effectiveOptions(cli: Cli, cfg: ?ztsc.tsconfig.Config) Effective {
         e.module_suffixes = c.module_suffixes;
         e.paths_map = c.paths;
         e.jsx_runtime_module = c.jsx_runtime_module;
+        e.jsx_factory_ns = c.jsx_factory_ns;
         e.allow_synthetic_default = c.allow_synthetic_default_imports;
         e.no_implicit_any = c.no_implicit_any;
         e.no_unchecked_side_effect_imports = c.no_unchecked_side_effect_imports;

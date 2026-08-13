@@ -2274,6 +2274,9 @@ pub const Checker = struct {
     atom_IntrinsicAttributes: Atom = 0,
     atom_IntrinsicClassAttributes: Atom = 0,
     atom_children: Atom = 0,
+    /// `Program.jsx_factory_ns` interned (0 when no `jsxFactory` is set): the
+    /// container tsc reads the `JSX` namespace out of before the global one.
+    atom_jsx_factory_ns: Atom = 0,
 
     pub const typeof_names = [8][]const u8{
         "string", "number", "bigint", "boolean", "symbol", "undefined", "object", "function",
@@ -2497,6 +2500,7 @@ pub const Checker = struct {
         c.atom_IntrinsicAttributes = try c.atom("IntrinsicAttributes");
         c.atom_IntrinsicClassAttributes = try c.atom("IntrinsicClassAttributes");
         c.atom_children = try c.atom("children");
+        if (c.prog.jsx_factory_ns) |ns| c.atom_jsx_factory_ns = try c.atom(ns);
         for (typeof_names, 0..) |n, i| c.typeof_atoms[i] = try c.atom(n);
         var tu: [8]TypeId = undefined;
         for (c.typeof_atoms, 0..) |a, i| tu[i] = try c.ts.makeStringLiteral(a, false);
@@ -3154,6 +3158,7 @@ pub const Checker = struct {
     pub const enumSymFromImportTarget = typenode_zig.enumSymFromImportTarget;
     pub const resolveNsContainer = typenode_zig.resolveNsContainer;
     pub const containerFromImportTarget = typenode_zig.containerFromImportTarget;
+    pub const importEqualsEntityContainer = typenode_zig.importEqualsEntityContainer;
     pub const nestNsContainer = typenode_zig.nestNsContainer;
     pub const containerMemberSym = typenode_zig.containerMemberSym;
     pub const qualifierText = typenode_zig.qualifierText;

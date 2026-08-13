@@ -622,11 +622,17 @@ pub const FnProto = struct {
     return_type: Node,
 };
 /// One JSX element/fragment. `tag` is the tag expression (identifier or
-/// member_expr; 0 for a `<>…</>` fragment). `self_closing != 0` marks
-/// `<tag/>` (no children). Attributes and children are node ranges in extra.
+/// member_expr; 0 for a `<>…</>` fragment). Attributes and children are node
+/// ranges in extra.
 pub const JsxElementData = struct {
     tag: Node,
-    self_closing: u32,
+    /// Token index of the closing tag's `<` (`</tag>`), or 0 for `<tag/>` —
+    /// a self-closing element has no closing tag. tsc resolves the closing
+    /// tag name as a second, independent reference (`getIntrinsicTagSymbol`
+    /// runs on the JsxClosingElement too), so an intrinsic tag with no
+    /// `JSX.IntrinsicElements` in scope reports TS7026 at BOTH `<`s. There
+    /// is no closing-element node to hang that on, so the token rides here.
+    close_lt: TokenIndex,
     /// Explicit type arguments on a component opening tag
     /// (`<Select<string> …>`; empty range when absent). Closing tags never
     /// carry type arguments (per TS).

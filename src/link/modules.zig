@@ -262,6 +262,7 @@ pub fn buildProgram(
             .types_wildcard = link_opts.types_wildcard,
             .experimental_decorators = link_opts.experimental_decorators,
             .jsx_runtime_file = jsx_runtime_fid,
+            .jsx_factory_ns = link_opts.jsx_factory_ns,
         },
         .load_failures = try arena.dupe(BuildDiag, failures.items),
     };
@@ -1416,11 +1417,32 @@ const Linker = struct {
 
     /// Final target of a local symbol used as an export: follow import
     /// bindings to their defining module.
+    /// Whether `local_sym` is declared by an entity-name `import X = A.B`
+    /// (as opposed to `import X = require("m")`, which has an import record).
+    fn isEntityImportEquals(f: *const ProgFile, local_sym: u32) bool {
+        for (f.bind.declsOf(local_sym)) |decl| {
+            if (f.tree.nodeTag(decl) != .import_equals) continue;
+            const e = f.tree.extraData(ast.ImportEquals, f.tree.nodeData(decl).lhs);
+            return e.module_token == 0 and e.entity != ast.null_node;
+        }
+        return false;
+    }
+
     fn finalizeLocal(l: *Linker, file: FileId, local_sym: u32, local_atom: Atom, type_only: bool, depth: u32) Error!Target {
         if (depth > visit_limit) return .{ .kind = .any };
         const f = &l.files[file];
         const flags = f.bind.symbol_flags[local_sym];
         if (!flags.import_binding) {
+            return .{ .kind = .binding, .file = file, .payload = local_sym, .type_only = type_only };
+        }
+        // An ENTITY-NAME `import X = A.B` is an import binding with no import
+        // record — it names something already in the program, so there is no
+        // module for the linker to follow and the loop below would fall out to
+        // `any`. Target the alias DECLARATION instead and let the checker
+        // resolve the entity (`importEqualsEntityContainer`), which is where
+        // scope-sensitive name resolution lives. preact's jsx-runtime exports
+        // its whole `JSX` namespace as `export import JSX = JSXInternal`.
+        if (isEntityImportEquals(f, local_sym)) {
             return .{ .kind = .binding, .file = file, .payload = local_sym, .type_only = type_only };
         }
         // Find the import record that created this binding. Matched on scope
