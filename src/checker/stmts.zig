@@ -782,6 +782,60 @@ fn checkNamespace(c: *Checker, node: Node) Error!void {
     }
 }
 
+/// Instantiation budget one derived-vs-base relation may spend
+/// (`relatesToBase`). An order of magnitude below the source element's own
+/// ceiling (`max_instantiation_count`), and deliberately so: what this
+/// relation materializes is the BASE's declaration, and the only question it
+/// asks is whether the two sides already agree.
+///
+/// Measured on drizzle-orm at `--checkers=4`, where the partition puts
+/// `prisma/mysql/session.d.ts` on a checker that owns none of `mysql-core`:
+/// the full ceiling spends 250,000 instantiations and 272 ms building that
+/// package from nothing before answering YES, and 25,000 answers the same YES
+/// in 39 ms. On a checker that does own `mysql-core` the relation costs 27
+/// instantiations either way — the ceiling is only ever reached by the cold
+/// partition, which is exactly the work this bounds.
+const max_base_relation_instantiations: u64 = 25_000;
+
+/// One derived-vs-base relation (`D` to `B`, or `typeof D` to `typeof B`),
+/// run in its own instantiation WINDOW — the one `measuredVariances` opens for
+/// a variance measurement, and for the same reason.
+///
+/// What this relation materializes is the BASE's declaration, which usually
+/// lives in another file. A checker that does not own that file has to build
+/// it from nothing, and that is not work the class declaration asked for:
+/// charged to the declaration's own budget it spends the source element's
+/// whole ceiling, after which every remaining instantiation in the statement
+/// truncates and nothing more is published — a regime an order of magnitude
+/// more expensive than the work it replaces. drizzle-orm's
+/// `PrismaMySqlSession extends MySqlSession` is the case, and it is
+/// partition-dependent exactly as that argument predicts: the relation costs
+/// 27 instantiations on a checker that already owns `mysql-core` and over
+/// 250,000 on one that does not. The window keeps the cost where it belongs
+/// and, capped at `max_base_relation_instantiations`, keeps it bounded.
+///
+/// A window that runs out answers YES, which is what the relation concludes
+/// anyway once its subtrees truncate to `error_type` (which relates to
+/// everything). So the failure mode is the one the whole check already
+/// documents next to `hasUnresolvedBase`: nothing is concluded about a base
+/// ztsc could not finish building, and the cost is an under-report.
+fn relatesToBase(c: *Checker, derived: TypeId, base: TypeId) Error!bool {
+    const saved_count = c.inst_count;
+    const saved_epoch = c.budget_epoch;
+    const saved_tripped = c.inst_limit_tripped;
+    const saved_budget = c.inst_budget;
+    c.inst_count = 0;
+    c.inst_budget = max_base_relation_instantiations;
+    c.newBudgetWindow();
+    c.inst_limit_tripped = false;
+    const ok = c.isAssignable(derived, base);
+    c.inst_budget = saved_budget;
+    c.inst_count = saved_count;
+    c.budget_epoch = saved_epoch;
+    c.inst_limit_tripped = saved_tripped;
+    return ok;
+}
+
 /// TS2415 / TS2416: the INSTANCE side of a derived class must extend its base
 /// — `D` assignable to `B` — which is what makes a derived member that
 /// redeclares an inherited one at an incompatible type an error rather than a
@@ -824,7 +878,8 @@ fn checkInstanceSideExtends(c: *Checker, class_sym: SymbolId, members: []const N
     const base_ref = try c.baseClassRef(class_sym) orelse return true;
     if (base_ref == types.error_type or base_ref == types.any_type or base_ref == this_t) return true;
     if (try c.hasUnresolvedBase(class_sym)) return true;
-    if (try c.isAssignable(this_t, base_ref)) return true;
+    // Windowed and bounded — see `relatesToBase`.
+    if (try relatesToBase(c, this_t, base_ref)) return true;
 
     const derived = try c.resolveStructural(this_t);
     const base = try c.resolveStructural(base_ref);
@@ -919,7 +974,7 @@ fn checkStaticSideExtends(c: *Checker, class_sym: SymbolId, name_token: ast.Toke
     const derived_static = try c.classStaticType(class_sym);
     const base_static = try c.classStaticType(base);
     if (derived_static == base_static) return;
-    if (try c.isAssignable(derived_static, base_static)) return;
+    if (try relatesToBase(c, derived_static, base_static)) return;
     try c.diagFmt(2417, c.tokSpan(name_token), "Class static side 'typeof {s}' incorrectly extends base class static side 'typeof {s}'.{s}", .{
         c.symbolName(class_sym),
         c.symbolName(base),
