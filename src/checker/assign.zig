@@ -655,7 +655,24 @@ pub fn refFacetOf(c: *Checker, ty: TypeId, k: types.Kind) ?TypeId {
 }
 
 pub fn isAssignable(c: *Checker, s0: TypeId, t0: TypeId) Error!bool {
-    return relate(c, s0, t0, true);
+    return relateFolded(c, s0, t0, true);
+}
+
+/// One relation frame, run for its BOOLEAN only: whether the answer rests on an
+/// assumption is folded into the caller's ambient accumulator
+/// (`Checker.rel_assumed`) on the way out.
+///
+/// This is the seam between the two halves of the `Ternary.Maybe` protocol.
+/// `relate` RETURNS its provisional-ness (`RelAnswer`), so no frame can answer
+/// optimistically without saying so; but a frame's DESCENDANTS are reached
+/// through `isAssignableInner` and through helpers spread over several files,
+/// none of which thread a verdict, so they still report back through the field.
+/// Every path that leaves the returned protocol goes through here, which is
+/// what keeps the two halves in step — see `Checker.rel_assumed`.
+fn relateFolded(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!bool {
+    const answer = try relate(c, s0, t0, memoize);
+    if (answer.assumed()) c.rel_assumed = true;
+    return answer.related();
 }
 
 /// tsc's `isWeakType`: an object type with at least one property, EVERY
@@ -861,16 +878,13 @@ pub fn weakTypeMismatch(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: t
 /// below). Both frames then carry the same key, so letting the inner one
 /// consult the memo would read the outer one's own in-progress mark and
 /// answer "related" without doing any work at all.
-fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!bool {
+fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!RelAnswer {
     // Structural-relation recursion guard (see `max_relation_depth`). Past
     // the cap, assume the pair related — this only drops diagnostics, never
     // adds a false positive. Returns before the `(s,t)` relation memo below,
     // so the capped result is never cached and a shallower re-encounter of
     // the same pair still computes the real answer.
-    if (c.rel_depth > max_relation_depth) {
-        c.rel_assumed = true;
-        return true;
-    }
+    if (c.rel_depth > max_relation_depth) return .assumed_yes;
     c.rel_depth += 1;
     defer {
         c.rel_depth -= 1;
@@ -886,9 +900,9 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!bool {
     // `instantiateId` frame does (see `BumpArena`). The relation is the other
     // deep recursive walk, and the other big scratch consumer: it dupes a
     // member list and builds property worklists per frame, millions of times
-    // within a single statement, and none of it outlives the `bool` the frame
-    // answers with — the memo lives on the checker arena and elaboration is a
-    // separate re-walk of the failing path (`elaborate.zig`), not a record
+    // within a single statement, and none of it outlives the `RelAnswer` the
+    // frame answers with — the memo lives on the checker arena and elaboration
+    // is a separate re-walk of the failing path (`elaborate.zig`), not a record
     // kept from this one. The arena is captured rather than re-read because a
     // nested top-level `instantiate` swaps a different one in for its own
     // duration.
@@ -904,7 +918,7 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!bool {
     var t = try c.ts.regularLiteral(t1);
     s = try c.ts.regular(s);
     t = try c.ts.regular(t);
-    if (s == t) return true;
+    if (s == t) return .yes;
     // The same simplification, one level down: a `this` NESTED inside a
     // deferred operator (`this extends {_zod:…} ? this["_zod"]["output"] :
     // unknown`, zod's `output<this>`) relates through its apparent instance
@@ -920,7 +934,9 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!bool {
     if (c.has_this_types and ((try c.containsThisType(s)) or (try c.containsThisType(t)))) {
         const sa = try c.substThis(s, this_apparent);
         const ta = try c.substThis(t, this_apparent);
-        if (sa != s or ta != t) return c.isAssignable(sa, ta);
+        // Delegated wholesale, answer and all: the rewritten pair IS this
+        // frame's question, so its provisional-ness is this frame's too.
+        if (sa != s or ta != t) return relate(c, sa, ta, true);
     }
     const sk = c.ts.kind(s);
     const tk = c.ts.kind(t);
@@ -941,7 +957,7 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!bool {
         if (sr) |os| {
             if (tr) |ot| {
                 // Reflexive identity: same interned origin ref (see `origin`).
-                if (os == ot) return true;
+                if (os == ot) return .yes;
                 // Variance-free EQUIVALENCE: both denote `G<…>` for the same
                 // `G`, and each arg pair is equal — by TypeId identity or by a
                 // SOUND reduction (`T & {} ≡ T`; interned structural forms
@@ -952,7 +968,7 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!bool {
                 // instantiation carries an unreduced config `C1 = P & Omit<…>`
                 // and the other the concrete reduction `C2 = P`.
                 if (c.ts.refSymbol(os) == c.ts.refSymbol(ot)) {
-                    if (try c.originArgEquiv(os, ot, 0)) return true;
+                    if (try c.originArgEquiv(os, ot, 0)) return .yes;
                 }
             }
         }
@@ -962,29 +978,30 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!bool {
     // reflexive in both directions.
     if (sk == .ref and originTaggable(tk)) {
         if (tr) |ot| {
-            if (ot == s) return true;
+            if (ot == s) return .yes;
             if (c.ts.refSymbol(ot) == c.ts.refSymbol(s) and
-                try c.originArgEquiv(ot, s, 0)) return true;
+                try c.originArgEquiv(ot, s, 0)) return .yes;
         }
     }
     if (tk == .ref and originTaggable(sk)) {
         if (sr) |os| {
-            if (os == t) return true;
+            if (os == t) return .yes;
             if (c.ts.refSymbol(os) == c.ts.refSymbol(t) and
-                try c.originArgEquiv(os, t, 0)) return true;
+                try c.originArgEquiv(os, t, 0)) return .yes;
         }
     }
     // Trivial targets/sources.
     switch (tk) {
-        .any, .err, .unknown, .none => return true,
+        .any, .err, .unknown, .none => return .yes,
         else => {},
     }
-    if (tk == .never) return sk == .never; // even `any` is not assignable to never
+    // even `any` is not assignable to never
+    if (tk == .never) return if (sk == .never) .yes else .no;
     // An uninhabited intersection source denotes `never`, which relates to
     // everything (tsc's `getReducedType`). See `intersectionIsNever`.
-    if (sk == .intersection and try c.intersectionIsNever(s)) return true;
+    if (sk == .intersection and try c.intersectionIsNever(s)) return .yes;
     switch (sk) {
-        .any, .err, .never, .none => return true,
+        .any, .err, .never, .none => return .yes,
         else => {},
     }
     // `void` accepts `undefined` and itself (tsc `isSimpleTypeRelatedTo`:
@@ -1000,19 +1017,20 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!bool {
     // for such a union (`type MaybeVoid = void | undefined`) is resolved here,
     // the same way the union-target arm resolves one.
     if (tk == .void) {
-        if (sk == .undefined or sk == .void) return true;
+        if (sk == .undefined or sk == .void) return .yes;
         if (sk != .union_type) {
             if (sk == .ref and !c.refExpandsToObject(s)) {
                 const rs = try c.resolveStructural(s);
-                if (rs != s and c.ts.kind(rs) == .union_type) return c.isAssignable(rs, t);
+                // Delegated wholesale, as the `this` rewrite above is.
+                if (rs != s and c.ts.kind(rs) == .union_type) return relate(c, rs, t, true);
             }
-            return false;
+            return .no;
         }
     }
 
     // Literal -> base primitive.
     const base = try c.literalBaseOf(s);
-    if (base != types.no_type and base == t) return true;
+    if (base != types.no_type and base == t) return .yes;
 
     // The weak-type rule (tsc's `isPerformingCommonPropertyChecks`), ahead of
     // the memo and the structural walk: a WEAK target — all-optional, no
@@ -1034,7 +1052,7 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!bool {
     defer if (src_fresh) {
         c.weak_rule_off -= 1;
     };
-    if (try c.weakTypeMismatch(s, t, sk, tk, src_fresh)) return false;
+    if (try c.weakTypeMismatch(s, t, sk, tk, src_fresh)) return .no;
 
     // Cache compound comparisons (recursion termination for refs), keyed on
     // what each side DENOTES rather than on the TypeId it happens to be: a
@@ -1053,12 +1071,11 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!bool {
         if (c.relation.get(key)) |v| {
             c.stats.relation_hits += 1;
             if (v == 2) {
-                // In progress: assume (recursive types). The assumption is
-                // the caller's to carry — see `Checker.rel_assumed`.
-                c.rel_assumed = true;
-                return true;
+                // In progress: assume (recursive types). The assumption rides
+                // out on the answer — see `RelAnswer`.
+                return .assumed_yes;
             }
-            return v == 1;
+            return if (v == 1) .yes else .no;
         }
     }
     // Growing-instantiation guard (tsc's `isDeeplyNestedType`, see
@@ -1076,8 +1093,7 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!bool {
         if (tr) |tref| {
             if (c.rel_id_depth >= max_relation_depth) {
                 c.rel_guard_tripped = true;
-                c.rel_assumed = true;
-                return true;
+                return .assumed_yes;
             }
             c.rel_src_ids[c.rel_id_depth] = .{ .sym = c.ts.refSymbol(sref), .ref = sref };
             c.rel_tgt_ids[c.rel_id_depth] = .{ .sym = c.ts.refSymbol(tref), .ref = tref };
@@ -1102,13 +1118,11 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!bool {
             if (c.rel_expanding & 2 == 0 and c.relIdDeeplyNested(false)) c.rel_expanding |= 2;
             if (c.rel_expanding == 3) {
                 c.rel_guard_tripped = true;
-                c.rel_assumed = true;
-                return true;
+                return .assumed_yes;
             }
         } else if (c.relIdDeeplyNested(true) or c.relIdDeeplyNested(false)) {
             c.rel_guard_tripped = true;
-            c.rel_assumed = true;
-            return true;
+            return .assumed_yes;
         }
     }
     const maybe_start = c.rel_maybe.items.len;
@@ -1118,8 +1132,14 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!bool {
         try c.rel_maybe.append(c.cm(), key);
     }
     // tsc's `Ternary.Maybe` bookkeeping: this frame's own verdict starts out
-    // resting on nothing, and whatever the walk below assumes is folded back
-    // into the caller's on the way out. See `Checker.rel_assumed`.
+    // resting on nothing, and the field becomes the window in which the walk
+    // below reports what IT assumed. Everything the walk reaches through
+    // `isAssignableInner` and through the helpers in other files answers with a
+    // bare `bool`, so the field is how their assumptions get back here; a
+    // nested `relate` returns its own (`RelAnswer`) and `relateFolded` deposits
+    // it here on arrival. Restored — not OR-ed — on the way out: this frame's
+    // answer is RETURNED, and its own caller's `relateFolded` folds it in.
+    // See `Checker.rel_assumed`.
     const saved_assumed = c.rel_assumed;
     c.rel_assumed = false;
     // Declared variance (`interface Box<in T>`/`<out T>`): two references
@@ -1247,18 +1267,19 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!bool {
     };
     // tsc's `Ternary.Maybe`: a verdict the walk could only reach by ASSUMING
     // an in-progress pair (or by taking a growth/depth cut) is not published.
-    // See `Checker.rel_assumed` — publishing it is what made a pair's answer a
-    // function of which walk reached it first, i.e. of the file order and the
-    // `--checkers=N` partition.
-    const assumed = c.rel_assumed;
-    c.rel_assumed = saved_assumed or assumed;
+    // See `RelAnswer` — publishing such a verdict is what made a pair's answer
+    // a function of which walk reached it first, i.e. of the file order and the
+    // `--checkers=N` partition. THE MEMO WRITES BELOW DECIDE FROM `answer`, so
+    // the provisional bit cannot be forgotten the way an ambient flag can.
+    const answer = RelAnswer.of(verdict == .yes, c.rel_assumed);
+    c.rel_assumed = saved_assumed;
     if (cacheable) {
-        if (verdict == .yes) {
+        if (answer.related()) {
             // Definite YES, or the outermost frame of the query: the walk
             // closed without contradicting anything it assumed, so the whole
             // group is published together. A YES that still rests on marks an
             // ANCESTOR wrote stays pending for that ancestor to settle.
-            if (!assumed or (commit_at_root and c.rel_depth == 1)) {
+            if (!answer.assumed() or (commit_at_root and c.rel_depth == 1)) {
                 for (c.rel_maybe.items[maybe_start..]) |k| try c.relation.put(c.cm(), k, 1);
                 c.rel_maybe.shrinkRetainingCapacity(maybe_start);
             }
@@ -1267,17 +1288,53 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!bool {
             // reach a verdict that contradicts them.
             for (c.rel_maybe.items[maybe_start..]) |k| _ = c.relation.remove(k);
             c.rel_maybe.shrinkRetainingCapacity(maybe_start);
-            if (verdict == .no and (!assumed or commit_at_root)) {
+            if (verdict == .no and (!answer.assumed() or commit_at_root)) {
                 try c.relation.put(c.cm(), key, 0);
             }
         }
     }
-    return verdict == .yes;
+    return answer;
 }
 
-/// `relate`'s three outcomes: related, not related, and not related *and not
-/// memoizable* (a negative declared-variance verdict, decisive only while no
-/// variance measurement is in flight).
+/// What ONE relation frame answered, and whether that answer is EVIDENCE or an
+/// ASSUMPTION — tsc's `Ternary.Maybe`, RETURNED rather than smuggled through a
+/// context field the caller has to remember to read.
+///
+/// A frame answers from assumption when it met the pair already in progress
+/// (the co-inductive cycle cut), when it hit the depth cap
+/// (`max_relation_depth`), or when the growing-instantiation guard cut it
+/// (`relIdDeeplyNested`). Such an answer is a fact about the WALK that reached
+/// the pair, not about the pair, so it must never reach the `relation` memo —
+/// which is why the memo writes above read `answer` and not a flag: a new
+/// optimistic early return in `relate` cannot be added without naming an
+/// `assumed_*` case, whereas it could always be added without setting a field.
+///
+/// The NO half carries the bit too. A negative verdict the walk reached while
+/// standing on an assumption is provisional in exactly the same way, and the
+/// caller's own verdict inherits it (`relateFolded`).
+const RelAnswer = enum {
+    no,
+    yes,
+    assumed_no,
+    assumed_yes,
+
+    fn of(is_related: bool, on_assumption: bool) RelAnswer {
+        if (on_assumption) return if (is_related) .assumed_yes else .assumed_no;
+        return if (is_related) .yes else .no;
+    }
+    fn related(a: RelAnswer) bool {
+        return a == .yes or a == .assumed_yes;
+    }
+    fn assumed(a: RelAnswer) bool {
+        return a == .assumed_no or a == .assumed_yes;
+    }
+};
+
+/// The three ways one frame's own `relation` entry can go: publish related,
+/// publish not-related, and not related *and not memoizable* (a negative
+/// declared-variance verdict, decisive only while no variance measurement is in
+/// flight). Orthogonal to `RelAnswer`, which is what the frame hands its
+/// CALLER; this is only about the write.
 const RelVerdict = enum { yes, no, no_nocache };
 
 /// A/B leg: tsc commits a still-pending maybe group at its outermost relation
@@ -2143,7 +2200,7 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
         const rt = try c.resolveStructural(t);
         if (rs == s and rt == t) return false;
         if (rs == rt) return true;
-        return relate(c, rs, rt, false);
+        return relateFolded(c, rs, rt, false);
     }
     // Enum types are nominal (identical enums caught by s == t earlier).
     //
@@ -2429,6 +2486,17 @@ fn lazyRefRelate(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: types.Ki
     // growing-instantiation stack a second time (its own `refFacetOf` of each
     // materialization is the very reference this frame holds). Push them here
     // too, so the guard trips at the same depth it does today.
+    //
+    // KNOWN ASYMMETRY, recorded rather than changed (it decides diagnostics).
+    // Both guard cuts on this route — here and the `relIdDeeplyNested` one
+    // below — answer "related" from ASSUMPTION, exactly as `relate`'s own two
+    // do, but only `rel_guard_tripped` is raised: this route returns a bare
+    // `bool` to `isAssignableInner`, so it has no way to say `.assumed_yes`
+    // (see `RelAnswer`), and the frame it stands in for would have said it.
+    // The demanding `relate` frame therefore reads the cut as EVIDENCE and may
+    // publish it to `relation`, which is the memo poisoning the returned
+    // protocol exists to prevent. Closing it means giving this route a way to
+    // report the assumption, and that suppresses memo writes that happen today.
     if (c.rel_id_depth >= max_relation_depth) {
         c.rel_guard_tripped = true;
         return true;
