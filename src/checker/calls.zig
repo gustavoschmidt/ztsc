@@ -81,7 +81,7 @@ pub fn callShape(c: *Checker, node: Node) CallShape {
 /// statement level, or deliberately opaque), and a program with no lib
 /// (no global `Promise` to wrap with). No diagnostic is reported here —
 /// resolution failures belong to the resolver.
-pub fn importCallType(c: *Checker, arg_nodes: []const Node) Error!TypeId {
+fn importCallType(c: *Checker, arg_nodes: []const Node) Error!TypeId {
     if (arg_nodes.len == 0) return types.any_type;
     const spec_node = arg_nodes[0];
     // A no-substitution template literal is a literal specifier too, and the
@@ -248,7 +248,7 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
     // own. tsc's `getTypeOfImportCall`: the module's namespace object,
     // wrapped in `Promise`.
     if (!is_new and c.nodeTag(shape.callee) == .import_expr) {
-        return .{ .ty = try c.importCallType(shape.arg_nodes), .chained = chained };
+        return .{ .ty = try importCallType(c, shape.arg_nodes), .chained = chained };
     }
     var callee_t = if (c.isOptionalChain(shape.callee)) blk: {
         const link = try c.chainObjType(shape.callee);
@@ -424,7 +424,7 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
                     const self_args = try c.scratch().alloc(TypeId, tps.items.len);
                     for (tps.items, 0..) |tp, i| self_args[i] = try c.ts.makeTypeParam(tp.sym);
                     const self_sig = try c.sigWithReturn(ctor, try c.ts.makeRef(cls, self_args));
-                    try c.inferTypeArgs(self_sig, tp_syms, shape.arg_nodes, inst_args, ctx, types.no_type);
+                    try inferTypeArgs(c, self_sig, tp_syms, shape.arg_nodes, inst_args, ctx, types.no_type);
                 } else {
                     for (inst_args) |*x| x.* = types.any_type;
                 }
@@ -629,7 +629,7 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
     // constructor (a lone candidate is not dropped for it): every
     // `new Kysely<DB>(config)` in immich was TS2769.
     const sig_targs: []const TypeId = if (is_new and instance_ret != types.no_type) &.{} else targs.items;
-    const result = try c.resolveSignatureCall(node, sigs.items, sig_targs, shape.arg_nodes, instance_ret, call_ctx);
+    const result = try resolveSignatureCall(c, node, sigs.items, sig_targs, shape.arg_nodes, instance_ret, call_ctx);
     return .{ .ty = result, .chained = chained };
 }
 
@@ -637,7 +637,7 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
 /// (`f(this: T, …)`): the call's receiver must be assignable to `T`
 /// (TS2684). A member call `obj.m()` uses `obj`'s type; a bare call uses
 /// `void` (no receiver).
-pub fn checkThisArg(c: *Checker, node: Node, sig: TypeId) Error!void {
+fn checkThisArg(c: *Checker, node: Node, sig: TypeId) Error!void {
     // Owned-file guard (see `checkJsxElement`): `void`, and its only
     // payload is TS2684/TS2739 on the call's receiver — dropped by `seal`
     // in a foreign file. The receiver `checkExprCached` it skips is a memo
@@ -686,7 +686,7 @@ pub fn countArgs(arg_nodes: []const Node) usize {
 /// Pick a signature (first match for overloads, like tsc), infer type
 /// arguments, check arguments, and return the (instantiated) return
 /// type; `instance_ret` overrides the return for `new`.
-pub fn resolveSignatureCall(
+fn resolveSignatureCall(
     c: *Checker,
     node: Node,
     sigs: []const TypeId,
@@ -708,8 +708,8 @@ pub fn resolveSignatureCall(
             try c.queueSigTypeArgConstraints(node, sigs[0], explicit_targs);
         }
         const inst = try c.instantiateSigForCall(sigs[0], explicit_targs, arg_nodes, node, ret_ctx);
-        if (instance_ret == types.no_type) try c.checkThisArg(node, inst);
-        try c.checkCallArguments(node, inst, arg_nodes, true);
+        if (instance_ret == types.no_type) try checkThisArg(c, node, inst);
+        try checkCallArguments(c, node, inst, arg_nodes, true);
         return if (instance_ret != types.no_type) instance_ret else c.ts.fnReturn(inst);
     }
     // Overloads: first signature whose arity fits and whose args check.
@@ -776,7 +776,7 @@ pub fn resolveSignatureCall(
             continue;
         }
         if (try c.argumentsMatch(inst, arg_nodes)) {
-            try c.checkCallArguments(node, inst, arg_nodes, true);
+            try checkCallArguments(c, node, inst, arg_nodes, true);
             return if (instance_ret != types.no_type) instance_ret else c.ts.fnReturn(inst);
         }
         c.rollbackArgDiags(saved_infer, infer_file, arg_nodes);
@@ -815,7 +815,7 @@ pub fn resolveSignatureCall(
     const report_sig = if (last_arg_err != types.no_type) last_arg_err else sigs[sigs.len - 1];
     const inst_last = try c.instantiateSigForCall(report_sig, explicit_targs, arg_nodes, node, ret_ctx);
     var arg_anchor: ?Span = null;
-    try c.checkCallArgumentsAnchored(node, inst_last, arg_nodes, true, &arg_anchor);
+    try checkCallArgumentsAnchored(c, node, inst_last, arg_nodes, true, &arg_anchor);
     if (arg_err_count == 1) {
         // Keep the candidate's own diagnostics; tsc files no TS2769 here.
         const inst_one = try c.instantiateSigForCall(sigs[0], explicit_targs, arg_nodes, node, ret_ctx);
@@ -917,7 +917,7 @@ pub fn instantiateSigForCall(c: *Checker, sig: TypeId, explicit_targs: []const T
                 else => {},
             }
         }
-        try c.inferTypeArgs(sig, tps, arg_nodes, args_buf, ret_ctx, recv_ty);
+        try inferTypeArgs(c, sig, tps, arg_nodes, args_buf, ret_ctx, recv_ty);
     }
     var map = try c.scratch().alloc(TpMap, tps.len);
     for (tps, 0..) |tp, i| map[i] = .{ .sym = tp, .ty = args_buf[i] };
@@ -1068,7 +1068,7 @@ pub fn instantiationExprType(c: *Checker, base: TypeId, targ_nodes: []const Node
     }
 
     if (inst_call.items.len == 0 and inst_construct.items.len == 0) {
-        try c.diagFmt(2635, c.typeArgsSpan(targ_nodes, node), "Type '{s}' has no signatures for which the type argument list is applicable.", .{try c.typeToString(base)});
+        try c.diagFmt(2635, typeArgsSpan(c, targ_nodes, node), "Type '{s}' has no signatures for which the type argument list is applicable.", .{try c.typeToString(base)});
         return types.error_type;
     }
     if (!rebuild_object) {
@@ -1095,7 +1095,7 @@ pub fn instantiationExprType(c: *Checker, base: TypeId, targ_nodes: []const Node
 /// The span of a type-argument list `<A, B>`, for the diagnostics tsc
 /// anchors there rather than on the whole expression. Falls back to the
 /// node when the list is empty or malformed.
-pub fn typeArgsSpan(c: *Checker, targ_nodes: []const Node, node: Node) Span {
+fn typeArgsSpan(c: *Checker, targ_nodes: []const Node, node: Node) Span {
     if (targ_nodes.len == 0) return c.nodeSpan(node);
     const first = c.nodeSpan(targ_nodes[0]);
     const last = c.nodeSpan(targ_nodes[targ_nodes.len - 1]);
@@ -1115,7 +1115,7 @@ pub const instantiateKnownParams = infer_zig.instantiateKnownParams;
 pub const paramIsBareCallbackReturn = infer_zig.paramIsBareCallbackReturn;
 pub const isBareOrUnionMember = infer_zig.isBareOrUnionMember;
 pub const InferCtx = infer_zig.InferCtx;
-pub const inferTypeArgs = infer_zig.inferTypeArgs;
+const inferTypeArgs = infer_zig.inferTypeArgs;
 pub const tpIndex = infer_zig.tpIndex;
 pub const clampToConstraint = infer_zig.clampToConstraint;
 pub const covLiteralShape = infer_zig.covLiteralShape;
@@ -1253,7 +1253,7 @@ pub fn argumentsMatch(c: *Checker, sig: TypeId, arg_nodes: []const Node) Error!b
     return true;
 }
 
-pub fn checkCallArguments(c: *Checker, node: Node, sig: TypeId, arg_nodes: []const Node, report: bool) Error!void {
+fn checkCallArguments(c: *Checker, node: Node, sig: TypeId, arg_nodes: []const Node, report: bool) Error!void {
     return checkCallArgumentsAnchored(c, node, sig, arg_nodes, report, null);
 }
 
@@ -1266,7 +1266,7 @@ pub fn checkCallArguments(c: *Checker, node: Node, sig: TypeId, arg_nodes: []con
 /// per-argument blame). Overload-failure reporting needs exactly that span
 /// for its TS2769 and cannot recover it from the diagnostic list, which also
 /// holds whatever the argument expressions said about themselves.
-pub fn checkCallArgumentsAnchored(c: *Checker, node: Node, sig: TypeId, arg_nodes: []const Node, report: bool, anchor_out: ?*?Span) Error!void {
+fn checkCallArgumentsAnchored(c: *Checker, node: Node, sig: TypeId, arg_nodes: []const Node, report: bool, anchor_out: ?*?Span) Error!void {
     // Owned-file guard (see `checkJsxElement`). `void` result, and the
     // call's *type* is settled before this runs: `resolveSignatureCall`
     // returns `fnReturn(inst)`, where `inst` comes from

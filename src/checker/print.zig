@@ -26,7 +26,7 @@ const scratch = Checker.scratch;
 pub fn typeToString(c: *Checker, t: TypeId) Error![]const u8 {
     var aw: std.Io.Writer.Allocating = .init(c.out);
     defer aw.deinit();
-    c.printType(&aw.writer, t, 0) catch |err| switch (err) {
+    printType(c, &aw.writer, t, 0) catch |err| switch (err) {
         error.WriteFailed => return error.OutOfMemory,
     };
     var s = aw.written();
@@ -42,7 +42,7 @@ pub fn typeToString(c: *Checker, t: TypeId) Error![]const u8 {
 /// slices across their recursion. Keep it that way.
 pub const PrintErr = std.Io.Writer.Error;
 
-pub fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr!void {
+fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr!void {
     if (t == types.no_type) return w.writeAll("any");
     if (depth > 6) return w.writeAll("...");
     const s = &c.ts;
@@ -117,7 +117,7 @@ pub fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr
                 if (i > 0) try w.writeAll(", ");
                 const e = s.tupleElem(t, @intCast(i));
                 if (e.rest()) try w.writeAll("...");
-                try c.printType(w, e.ty, depth + 1);
+                try printType(c, w, e.ty, depth + 1);
                 if (e.optional()) try w.writeAll("?");
             }
             try w.writeAll("]");
@@ -156,20 +156,20 @@ pub fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr
                 if (!first) try w.writeAll(" ");
                 first = false;
                 try w.print("{s}{s}: ", .{ c.atomText(p.name), if (p.optional()) "?" else "" });
-                try c.printType(w, p.ty, depth + 1);
+                try printType(c, w, p.ty, depth + 1);
                 try w.writeAll(";");
             }
             if (sidx != 0) {
                 if (!first) try w.writeAll(" ");
                 first = false;
                 try w.writeAll("[x: string]: ");
-                try c.printType(w, sidx, depth + 1);
+                try printType(c, w, sidx, depth + 1);
                 try w.writeAll(";");
             }
             if (nidx != 0) {
                 if (!first) try w.writeAll(" ");
                 try w.writeAll("[x: number]: ");
-                try c.printType(w, nidx, depth + 1);
+                try printType(c, w, nidx, depth + 1);
                 try w.writeAll(";");
             }
             try w.writeAll(" }");
@@ -191,7 +191,7 @@ pub fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr
             const this_ty = s.fnThisType(t);
             if (this_ty != 0) {
                 try w.writeAll("this: ");
-                try c.printType(w, this_ty, depth + 1);
+                try printType(c, w, this_ty, depth + 1);
                 if (s.fnParamCount(t) > 0) try w.writeAll(", ");
             }
             for (0..s.fnParamCount(t)) |i| {
@@ -201,16 +201,16 @@ pub fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr
                 if (p.name != 0) {
                     try w.print("{s}{s}: ", .{ c.atomText(p.name), if (p.flags & types.param_flag_optional != 0) "?" else "" });
                 }
-                try c.printType(w, p.ty, depth + 1);
+                try printType(c, w, p.ty, depth + 1);
             }
             try w.writeAll(") => ");
-            try c.printType(w, s.fnReturn(t), depth + 1);
+            try printType(c, w, s.fnReturn(t), depth + 1);
         },
         .overloads => {
             try w.writeAll("{ ");
             for (s.members(t), 0..) |m, i| {
                 if (i > 0) try w.writeAll(" ");
-                try c.printType(w, m, depth + 1);
+                try printType(c, w, m, depth + 1);
                 try w.writeAll(";");
             }
             try w.writeAll(" }");
@@ -222,7 +222,7 @@ pub fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr
                 try w.writeAll("<");
                 for (args, 0..) |a, i| {
                     if (i > 0) try w.writeAll(", ");
-                    try c.printType(w, a, depth + 1);
+                    try printType(c, w, a, depth + 1);
                 }
                 try w.writeAll(">");
             }
@@ -239,21 +239,21 @@ pub fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr
         .index_access => {
             try printTypeParen(c, w, s.indexAccessObj(t), depth + 1, .operand);
             try w.writeAll("[");
-            try c.printType(w, s.indexAccessIndex(t), depth + 1);
+            try printType(c, w, s.indexAccessIndex(t), depth + 1);
             try w.writeAll("]");
         },
         .mapped => {
             try w.writeAll("{ [");
-            try c.printType(w, s.mappedKeyParam(t), depth + 1);
+            try printType(c, w, s.mappedKeyParam(t), depth + 1);
             try w.writeAll(" in ");
             if (s.mappedHomomorphic(t)) {
                 try w.writeAll("keyof ");
-                try c.printType(w, s.mappedSource(t), depth + 1);
+                try printType(c, w, s.mappedSource(t), depth + 1);
             } else {
-                try c.printType(w, s.mappedConstraint(t), depth + 1);
+                try printType(c, w, s.mappedConstraint(t), depth + 1);
             }
             try w.writeAll("]: ");
-            try c.printType(w, s.mappedValue(t), depth + 1);
+            try printType(c, w, s.mappedValue(t), depth + 1);
             try w.writeAll(" }");
         },
         .conditional => {
@@ -261,16 +261,16 @@ pub fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr
             try w.writeAll(" extends ");
             try printTypeParen(c, w, s.condExtends(t), depth + 1, .operand);
             try w.writeAll(" ? ");
-            try c.printType(w, s.condTrue(t), depth + 1);
+            try printType(c, w, s.condTrue(t), depth + 1);
             try w.writeAll(" : ");
-            try c.printType(w, s.condFalse(t), depth + 1);
+            try printType(c, w, s.condFalse(t), depth + 1);
         },
         .template_literal_type => {
             try w.writeAll("`");
             try w.writeAll(c.atomText(s.templateHead(t)));
             for (0..s.templateHoleCount(t)) |i| {
                 try w.writeAll("${");
-                try c.printType(w, s.templateHole(t, @intCast(i)), depth + 1);
+                try printType(c, w, s.templateHole(t, @intCast(i)), depth + 1);
                 try w.writeAll("}");
                 try w.writeAll(c.atomText(s.templateChunk(t, @intCast(i))));
             }
@@ -278,7 +278,7 @@ pub fn printType(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr
         },
         .string_mapping => {
             try w.print("{s}<", .{stringMappingName(s.stringMappingKind(t))});
-            try c.printType(w, s.stringMappingArg(t), depth + 1);
+            try printType(c, w, s.stringMappingArg(t), depth + 1);
             try w.writeAll(">");
         },
         .keyof_op => {
@@ -320,10 +320,10 @@ fn printSigMember(c: *Checker, w: *std.Io.Writer, sig: TypeId, is_construct: boo
         if (p.name != 0) {
             try w.print("{s}{s}: ", .{ c.atomText(p.name), if (p.flags & types.param_flag_optional != 0) "?" else "" });
         }
-        try c.printType(w, p.ty, depth + 1);
+        try printType(c, w, p.ty, depth + 1);
     }
     try w.writeAll("): ");
-    try c.printType(w, s.fnReturn(sig), depth + 1);
+    try printType(c, w, s.fnReturn(sig), depth + 1);
     try w.writeAll(";");
 }
 
@@ -341,7 +341,7 @@ fn printTypeParen(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32, pos: Pr
         else => false,
     };
     if (needs) try w.writeAll("(");
-    try c.printType(w, t, depth);
+    try printType(c, w, t, depth);
     if (needs) try w.writeAll(")");
 }
 
@@ -383,7 +383,7 @@ fn writeSortKey(c: *Checker, w: *std.Io.Writer, t: TypeId, depth: u32) PrintErr!
         // partitions (a deep-union member-order divergence across
         // --checkers). Matching the depth makes the key equal iff the two
         // members render identically, so order is TypeId-independent.
-        else => try c.printType(w, t, depth),
+        else => try printType(c, w, t, depth),
     }
 }
 

@@ -414,7 +414,7 @@ pub fn lazyTableOutcome(c: *Checker, ref: TypeId) Error!TableOutcome {
     if (c.ts.objectCallSigCount(generic) != 0 or c.ts.objectConstructSigCount(generic) != 0) {
         return .{ .no = .tbl_has_sigs };
     }
-    if (try c.lazyRefMap(ref)) |_| return .{ .table = generic };
+    if (try lazyRefMap(c, ref)) |_| return .{ .table = generic };
     return .{ .no = .tbl_no_type_params };
 }
 
@@ -476,7 +476,7 @@ pub fn lazyShapeOutcome(c: *Checker, ref: TypeId) Error!TableOutcome {
 /// reference and kept on the checker arena. Null when the reference's symbol
 /// declares no type parameters — `expandRef` hands back the generic itself in
 /// that case, so there is nothing to substitute and nothing to defer.
-pub fn lazyRefMap(c: *Checker, ref: TypeId) Error!?[]const TpMap {
+fn lazyRefMap(c: *Checker, ref: TypeId) Error!?[]const TpMap {
     if (c.lazy_map.get(ref)) |m| return if (m.len == 0) null else m;
     const sym = c.ts.refSymbol(ref);
     var tps: std.ArrayList(TypeParamInfo) = .empty;
@@ -528,7 +528,7 @@ fn lazySlotNumberIndex(c: *Checker, generic: TypeId) u32 {
 pub fn lazyMemberAt(c: *Checker, ref: TypeId, generic_ty: TypeId, slot: u32) Error!TypeId {
     const key = (@as(u64, ref) << 32) | slot;
     if (c.lazy_member.get(key)) |t| return t;
-    const map = (try c.lazyRefMap(ref)) orelse return generic_ty;
+    const map = (try lazyRefMap(c, ref)) orelse return generic_ty;
     const result = try c.instantiate(generic_ty, map);
     if (!c.inst_limit_tripped) {
         try c.lazy_member.put(c.cm(), key, result);

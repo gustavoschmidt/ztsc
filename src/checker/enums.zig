@@ -206,7 +206,7 @@ pub fn constTemplateAtom(c: *Checker, node: Node) Error!?Atom {
 ///
 /// `own` is the enum being walked, so a self-reference resolves against its
 /// own members without going back through the scope chain.
-pub fn aliasedEnumInitValue(c: *Checker, own: SymbolId, init_node: Node) Error!?TypeId {
+fn aliasedEnumInitValue(c: *Checker, own: SymbolId, init_node: Node) Error!?TypeId {
     if (c.enum_alias_depth >= 8) return null;
     c.enum_alias_depth += 1;
     defer c.enum_alias_depth -= 1;
@@ -240,7 +240,7 @@ pub fn aliasedEnumInitValue(c: *Checker, own: SymbolId, init_node: Node) Error!?
 /// Classify an enum member initializer for constant folding. Only literal
 /// numbers (incl. unary `-`/`+`) and string literals fold to constants;
 /// anything else is "computed".
-pub fn classifyEnumInit(c: *Checker, node: Node) struct { kind: EnumInitKind, value: f64 } {
+fn classifyEnumInit(c: *Checker, node: Node) struct { kind: EnumInitKind, value: f64 } {
     switch (c.nodeTag(node)) {
         .number_literal => return .{ .kind = .numeric, .value = c.numberTokenValue(c.tree.nodeMainToken(node)) },
         .prefix_unary => {
@@ -267,7 +267,7 @@ pub fn classifyEnumInit(c: *Checker, node: Node) struct { kind: EnumInitKind, va
 /// The cooked text of a constant string enum initializer — quoted or in
 /// backticks (see `classifyEnumInit`). The token spellings differ, so the
 /// atom has to be read through the matching accessor.
-pub fn enumInitAtom(c: *Checker, init_node: Node) Error!Atom {
+fn enumInitAtom(c: *Checker, init_node: Node) Error!Atom {
     const tok = c.tree.nodeMainToken(init_node);
     if (c.nodeTag(init_node) == .template_literal) return c.templateAtom(tok);
     return c.memberAtom(tok);
@@ -303,7 +303,7 @@ pub fn enumInfo(c: *Checker, sym: SymbolId) Error!EnumInfo {
                 }
                 continue;
             }
-            const ci = c.classifyEnumInit(init_node);
+            const ci = classifyEnumInit(c, init_node);
             switch (ci.kind) {
                 .numeric => {
                     try values.append(c.scratch(), ci.value);
@@ -319,7 +319,7 @@ pub fn enumInfo(c: *Checker, sym: SymbolId) Error!EnumInfo {
                     // CONSTANT (see `aliasedEnumInitValue`): folding it is
                     // what keeps a string enum's `all_string` classification
                     // when one of its members aliases another enum's.
-                    if (try c.aliasedEnumInitValue(sym, init_node)) |v| {
+                    if (try aliasedEnumInitValue(c, sym, init_node)) |v| {
                         if (c.ts.kind(v) == .string_literal) {
                             has_string = true;
                             auto_ok = false;
@@ -376,10 +376,10 @@ pub fn eachEnumMember(
                 try f(ctx, name, v);
                 continue;
             }
-            const ci = c.classifyEnumInit(init_node);
+            const ci = classifyEnumInit(c, init_node);
             switch (ci.kind) {
                 .string => {
-                    const av = try c.enumInitAtom(init_node);
+                    const av = try enumInitAtom(c, init_node);
                     auto_ok = false;
                     try f(ctx, name, try c.ts.makeStringLiteral(av, false));
                 },
@@ -391,7 +391,7 @@ pub fn eachEnumMember(
                 .computed => {
                     // A reference to another constant enum member folds to
                     // that member's value (see `aliasedEnumInitValue`).
-                    if (try c.aliasedEnumInitValue(sym, init_node)) |v| {
+                    if (try aliasedEnumInitValue(c, sym, init_node)) |v| {
                         if (c.ts.kind(v) == .number_literal or c.ts.kind(v) == .number_literal_fresh) {
                             auto = c.ts.numberValue(v) + 1;
                             auto_ok = true;
@@ -526,7 +526,7 @@ pub fn enumHasStringMember(c: *Checker, sym: SymbolId) bool {
         for (c.tree.extraRange(data.members_start, data.members_end)) |m| {
             if (m == null_node or c.nodeTag(m) != .enum_member) continue;
             const init_node = c.tree.nodeData(m).lhs;
-            if (init_node != null_node and c.classifyEnumInit(init_node).kind == .string) return true;
+            if (init_node != null_node and classifyEnumInit(c, init_node).kind == .string) return true;
         }
     }
     return false;
@@ -734,8 +734,8 @@ pub fn enumHasStringValue(c: *Checker, sym: SymbolId, val: Atom) Error!bool {
             if (m == null_node or c.nodeTag(m) != .enum_member) continue;
             const init_node = c.tree.nodeData(m).lhs;
             if (init_node == null_node) continue;
-            if (c.classifyEnumInit(init_node).kind != .string) continue;
-            if ((try c.enumInitAtom(init_node)) == val) return true;
+            if (classifyEnumInit(c, init_node).kind != .string) continue;
+            if ((try enumInitAtom(c, init_node)) == val) return true;
         }
     }
     return false;
@@ -759,7 +759,7 @@ pub fn enumIsStringValued(c: *Checker, sym: SymbolId) Error!bool {
             // An uninitialized member is auto-numbered: the enum is not
             // string-valued.
             if (init_node == null_node) return false;
-            if (c.classifyEnumInit(init_node).kind != .string) return false;
+            if (classifyEnumInit(c, init_node).kind != .string) return false;
             any = true;
         }
     }
@@ -788,7 +788,7 @@ pub fn checkEnum(c: *Checker, node: Node) Error!void {
         // non-literal ("computed") initializer may still be a constant
         // enum expression (e.g. a reference to a `const`), which tsc lets
         // a subsequent member continue — so we don't force TS1061 there.
-        prev_numeric_const = c.classifyEnumInit(init_node).kind != .string;
+        prev_numeric_const = classifyEnumInit(c, init_node).kind != .string;
     }
 }
 

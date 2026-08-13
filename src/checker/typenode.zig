@@ -101,7 +101,7 @@ pub const typeParamsOf = typeparams_zig.typeParamsOf;
 pub const undecidableType = typeparams_zig.undecidableType;
 
 /// `keyof` and indexed access (keyof.zig).
-pub const checkIndexedAccessIndexType = keyof_zig.checkIndexedAccessIndexType;
+const checkIndexedAccessIndexType = keyof_zig.checkIndexedAccessIndexType;
 pub const indexableConstituent = keyof_zig.indexableConstituent;
 pub const indexedAccessType = keyof_zig.indexedAccessType;
 pub const intersectKeySets = keyof_zig.intersectKeySets;
@@ -140,7 +140,7 @@ pub fn typeFromTypeNode(c: *Checker, node: Node) Error!TypeId {
     if (cacheable) {
         if (c.type_node_cache.get(key)) |t| return t;
     }
-    const result = try c.typeFromTypeNodeUncached(node);
+    const result = try typeFromTypeNodeUncached(c, node);
     if (cacheable) try c.type_node_cache.put(c.cm(), key, result);
     return result;
 }
@@ -166,7 +166,7 @@ pub fn typeNodeCacheable(tag: ast.Tag) bool {
     };
 }
 
-pub fn typeFromTypeNodeUncached(c: *Checker, node: Node) Error!TypeId {
+fn typeFromTypeNodeUncached(c: *Checker, node: Node) Error!TypeId {
     const d = c.tree.nodeData(node);
     switch (c.nodeTag(node)) {
         .identifier => return c.typeFromTypeName(node, &.{}),
@@ -309,7 +309,7 @@ pub fn typeFromTypeNodeUncached(c: *Checker, node: Node) Error!TypeId {
             const obj = try c.typeFromTypeNode(d.lhs);
             const idx = try c.typeFromTypeNode(d.rhs);
             const acc = try c.reduceIndexedAccess(obj, idx);
-            try c.checkIndexedAccessIndexType(acc, node);
+            try checkIndexedAccessIndexType(c, acc, node);
             return acc;
         },
         .conditional_type => return c.conditionalTypeFromNode(node),
@@ -630,13 +630,13 @@ pub fn reduceSubtypes(c: *Checker, t: TypeId) Error!TypeId {
     var kept: std.ArrayList(TypeId) = .empty;
     defer kept.deinit(c.scratch());
     outer: for (members, 0..) |m, i| {
-        const m_empty = c.isEmptyAnonObject(m);
+        const m_empty = isEmptyAnonObject(c, m);
         const m_fresh = c.ts.objectIsFresh(m);
         for (members, 0..) |o, j| {
             if (i == j) continue;
             if (c.ts.objectIsFresh(o)) continue; // a fresh literal never absorbs
-            if (c.isEmptyAnonObject(o)) continue; // `{}` never absorbs
-            if (m_fresh and try c.freshHasExcessProp(m, o)) continue;
+            if (isEmptyAnonObject(c, o)) continue; // `{}` never absorbs
+            if (m_fresh and try freshHasExcessProp(c, m, o)) continue;
             if (!try c.isAssignable(m, o)) continue; // m not a subtype of o
             if (!m_empty and try c.isAssignable(o, m)) {
                 // Mutually assignable: exactly one twin survives. A fresh
@@ -745,7 +745,7 @@ fn anyRooted(c: *Checker, t: TypeId, depth: u32) Error!bool {
 /// literal's syntax: does the fresh object literal `m` declare a property
 /// `o` does not know? A target with an index signature, or the empty object
 /// type, knows every property and never reports one.
-pub fn freshHasExcessProp(c: *Checker, m: TypeId, o0: TypeId) Error!bool {
+fn freshHasExcessProp(c: *Checker, m: TypeId, o0: TypeId) Error!bool {
     const s = &c.ts;
     if (s.kind(m) != .object) return false;
     const o = try c.resolveStructural(o0);
@@ -762,7 +762,7 @@ pub fn freshHasExcessProp(c: *Checker, m: TypeId, o0: TypeId) Error!bool {
 /// properties, no call/construct signatures, and no index signatures.
 /// Named refs are not resolved — only literal `{}` shapes qualify (the
 /// `|| {}` / `?? {}` fallback), matching tsc's Anonymous-flag check.
-pub fn isEmptyAnonObject(c: *Checker, t: TypeId) bool {
+fn isEmptyAnonObject(c: *Checker, t: TypeId) bool {
     const s = &c.ts;
     if (s.kind(t) != .object) return false;
     return s.objectPropCount(t) == 0 and
@@ -1132,7 +1132,7 @@ pub fn gatherSpreadProps(
                 // this, every prop of `{ id, active, ...overrides }` (with
                 // `overrides: Partial<X>`) became optional and failed
                 // assignment to the required target (TS2322 factory FPs).
-                try c.addSpreadProp(p, props, prop_index);
+                try addSpreadProp(c, p, props, prop_index);
             }
         },
         .intersection => {
@@ -1155,7 +1155,7 @@ pub fn gatherSpreadProps(
             }
             for (names.items) |p| {
                 const merged = (try c.propOfTypeEx(st, p.name, false)) orelse p;
-                try c.addSpreadProp(merged, props, prop_index);
+                try addSpreadProp(c, merged, props, prop_index);
             }
         },
         .union_type => {
@@ -1267,7 +1267,7 @@ pub fn gatherSpreadProps(
                 var flags: u8 = 0;
                 if (optional) flags |= types.prop_flag_optional;
                 if (readonly) flags |= types.prop_flag_readonly;
-                try c.addSpreadProp(.{
+                try addSpreadProp(c, .{
                     .name = nm,
                     .ty = try c.ts.makeUnion(c.scratch(), parts.items),
                     .flags = flags,
@@ -1284,7 +1284,7 @@ pub fn gatherSpreadProps(
 /// keeps its optionality and the value types union — so an explicit
 /// required property stays required even when a later `Partial<…>` spread
 /// re-supplies it.
-pub fn addSpreadProp(
+fn addSpreadProp(
     c: *Checker,
     p: types.Prop,
     props: *std.ArrayList(types.Prop),

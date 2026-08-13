@@ -171,7 +171,7 @@ pub fn finishCondPlan(c: *Checker, plan: CondPlan, chk: TypeId, extends_ty: Type
         .take_false => return false_ty,
         .take_true => |b| return c.condTrueBranch(b, true_ty),
         .both_any => |b| {
-            const t = try c.substInfer(true_ty, b.ids, b.vals);
+            const t = try substInfer(c, true_ty, b.ids, b.vals);
             return c.makeUnion2(t, false_ty);
         },
         .need_both => |rest| switch (rest) {
@@ -180,7 +180,7 @@ pub fn finishCondPlan(c: *Checker, plan: CondPlan, chk: TypeId, extends_ty: Type
                 var parts: std.ArrayList(TypeId) = .empty;
                 defer parts.deinit(c.scratch());
                 const domain = blk2: {
-                    const d = try c.condDistributionDomain(chk, extends_ty);
+                    const d = try condDistributionDomain(c, chk, extends_ty);
                     break :blk2 if (d == 0) chk else d;
                 };
                 for (try c.memberList(domain)) |m| {
@@ -212,7 +212,7 @@ pub fn finishCondPlan(c: *Checker, plan: CondPlan, chk: TypeId, extends_ty: Type
 /// handed back (see `driveShrinkingAlias`).
 pub fn condTrueBranch(c: *Checker, b: CondPlan.Bindings, true_ty: TypeId) Error!TypeId {
     const vals = try inferConstraintFallback(c, b, true_ty);
-    const tb = try c.substInfer(true_ty, b.ids, vals);
+    const tb = try substInfer(c, true_ty, b.ids, vals);
     if (try c.driveShrinkingAlias(tb)) |reduced| return reduced;
     return tb;
 }
@@ -291,7 +291,7 @@ fn inferConstraintFallback(c: *Checker, b: CondPlan.Bindings, true_ty: TypeId) E
 /// changes shape: an unrelated test (`E extends string ? … : …`) answers the
 /// same for the enum and for every member, and leaving it undistributed keeps
 /// the result spelled `E` rather than as a member union.
-pub fn condDistributionDomain(c: *Checker, chk: TypeId, extends_ty: TypeId) Error!TypeId {
+fn condDistributionDomain(c: *Checker, chk: TypeId, extends_ty: TypeId) Error!TypeId {
     const s = &c.ts;
     if (s.kind(chk) == .union_type) return chk;
     if (s.kind(chk) != .enum_type or s.isEnumMember(chk)) return 0;
@@ -337,7 +337,7 @@ pub fn planConditional(c: *Checker, chk: TypeId, extends_ty: TypeId, distributiv
     // and the results unioned — this is what lets Awaited pick the callable
     // `then` argument out of its `| undefined | null`. Each member may pick
     // a different branch, so both are wanted.
-    if (distributive and (try c.condDistributionDomain(chk, extends_ty)) != 0) {
+    if (distributive and (try condDistributionDomain(c, chk, extends_ty)) != 0) {
         return .{ .need_both = .distribute };
     }
     // Defer while a mapped key parameter is still unbound: a
@@ -385,7 +385,7 @@ pub fn planConditional(c: *Checker, chk: TypeId, extends_ty: TypeId, distributiv
         // relation, so this arm is exact.
         const ext_k = s.kind(extends_ty);
         if ((ext_k == .any or ext_k == .unknown) and !try c.isGenericObjectForIndex(chk)) {
-            return c.planConcreteConditional(chk, extends_ty);
+            return planConcreteConditional(c, chk, extends_ty);
         }
         // Narrow decidability carve-out (see objectDecidablyNotExtends): a
         // concrete-shaped object check whose free params live only in
@@ -424,7 +424,7 @@ pub fn planConditional(c: *Checker, chk: TypeId, extends_ty: TypeId, distributiv
         }
         if (!ext_generic) {
             const chk_shape = if (s.kind(chk_d) == .ref) try c.resolveStructural(chk_d) else chk_d;
-            if (s.kind(chk_shape) == .object and try c.objectDecidablyNotExtends(chk_shape, ext_d)) {
+            if (s.kind(chk_shape) == .object and try objectDecidablyNotExtends(c, chk_shape, ext_d)) {
                 return .take_false;
             }
         }
@@ -436,7 +436,7 @@ pub fn planConditional(c: *Checker, chk: TypeId, extends_ty: TypeId, distributiv
         // this is what lets Awaited unwrap a real Promise's `then` callback
         // without erasing the method's own `TResult` params.
         if (!ext_generic and s.kind(chk) == .function and s.kind(try c.resolveStructural(extends_ty)) == .function) {
-            return c.planConcreteConditional(chk, extends_ty);
+            return planConcreteConditional(c, chk, extends_ty);
         }
         // An array/tuple check against an array pattern whose element is a
         // bare `infer` — the lib's `FlatArray`, `Arr extends
@@ -446,16 +446,16 @@ pub fn planConditional(c: *Checker, chk: TypeId, extends_ty: TypeId, distributiv
         // therefore cannot change the answer, so resolve instead of
         // deferring. Deferring left `arr.flat()` as an unreduced
         // conditional that related to nothing.
-        if (!ext_generic and try c.arrayDecidablyExtends(chk, extends_ty)) {
-            return c.planConcreteConditional(chk, extends_ty);
+        if (!ext_generic and try arrayDecidablyExtends(c, chk, extends_ty)) {
+            return planConcreteConditional(c, chk, extends_ty);
         }
         return .{ .need_both = .defer_symbolic };
     }
-    return c.planConcreteConditional(chk, extends_ty);
+    return planConcreteConditional(c, chk, extends_ty);
 }
 
 pub fn resolveConcreteConditional(c: *Checker, chk: TypeId, extends_ty: TypeId, true_ty: TypeId, false_ty: TypeId, distributive: bool) Error!TypeId {
-    const plan = try c.planConcreteConditional(chk, extends_ty);
+    const plan = try planConcreteConditional(c, chk, extends_ty);
     return c.finishCondPlan(plan, chk, extends_ty, true_ty, false_ty, distributive);
 }
 
@@ -543,7 +543,7 @@ fn unmatchedPatternProperty(c: *Checker, chk: TypeId, pattern: TypeId) Error!boo
     return false;
 }
 
-pub fn planConcreteConditional(c: *Checker, chk: TypeId, extends_ty: TypeId) Error!CondPlan {
+fn planConcreteConditional(c: *Checker, chk: TypeId, extends_ty: TypeId) Error!CondPlan {
     // Kept in scratch, never freed here: `ids`/`vals` are handed back to
     // the caller, which substitutes them into a branch it has yet to
     // materialize. The enclosing substitution frame's arena mark releases
@@ -551,7 +551,7 @@ pub fn planConcreteConditional(c: *Checker, chk: TypeId, extends_ty: TypeId) Err
     var ids: std.ArrayList(u32) = .empty;
     var refs: std.ArrayList(u32) = .empty;
     defer refs.deinit(c.scratch());
-    try c.collectInferVars(extends_ty, &ids, &refs);
+    try collectInferVars(c, extends_ty, &ids, &refs);
     // A conditional binds exactly the `infer V` DECLARATIONS in its own
     // extends clause. A bare mention of a binder owned by an ENCLOSING
     // conditional is a free type variable — not this conditional's to bind
@@ -587,7 +587,7 @@ pub fn planConcreteConditional(c: *Checker, chk: TypeId, extends_ty: TypeId) Err
     // `substInfer` supplies `M` and re-enters here with a real tuple.
     var chk_vars: std.ArrayList(u32) = .empty;
     defer chk_vars.deinit(c.scratch());
-    try c.collectInferVars(chk, &chk_vars, &chk_vars);
+    try collectInferVars(c, chk, &chk_vars, &chk_vars);
     for (chk_vars.items) |v| {
         if (indexOfId(ids.items, v) == null)
             return .{ .need_both = .defer_symbolic };
@@ -641,7 +641,7 @@ pub fn planConcreteConditional(c: *Checker, chk: TypeId, extends_ty: TypeId) Err
             if (v.* == types.no_type) v.* = types.unknown_type; // unmatched → unknown
         }
     }
-    const resolved_extends = try c.substInfer(extends_ty, ids.items, vals);
+    const resolved_extends = try substInfer(c, extends_ty, ids.items, vals);
     if (try c.isAssignable(chk, resolved_extends)) {
         return .{ .take_true = .{ .ids = ids.items, .vals = vals } };
     }
@@ -679,7 +679,7 @@ fn constrainInferBinders(c: *Checker, extends_ty: TypeId, true_ty: TypeId, false
     defer ids.deinit(c.scratch());
     var refs: std.ArrayList(u32) = .empty;
     defer refs.deinit(c.scratch());
-    try c.collectInferVars(extends_ty, &ids, &refs);
+    try collectInferVars(c, extends_ty, &ids, &refs);
     var out = true_ty;
     for (ids.items) |id| {
         const cons = c.infer_constraints.get(id) orelse continue;
@@ -700,9 +700,9 @@ fn constrainInferBinders(c: *Checker, extends_ty: TypeId, true_ty: TypeId, false
 /// with a *constrained* element (`ReadonlyArray<string>`) decides nothing —
 /// whether `T[]` matches it depends on `T` — so that still defers, as does
 /// a check whose top-level shape is itself a variable.
-pub fn arrayDecidablyExtends(c: *Checker, chk: TypeId, extends_ty: TypeId) Error!bool {
+fn arrayDecidablyExtends(c: *Checker, chk: TypeId, extends_ty: TypeId) Error!bool {
     const s = &c.ts;
-    if (!try c.isArrayShaped(chk)) return false;
+    if (!try isArrayShaped(c, chk)) return false;
     const ext = try c.resolveStructural(extends_ty);
     if (s.kind(ext) != .array) return false;
     return s.kind(s.arrayElem(ext)) == .infer_var;
@@ -713,7 +713,7 @@ pub fn arrayDecidablyExtends(c: *Checker, chk: TypeId, extends_ty: TypeId) Error
 /// type in a branded-primitive codebase has) is array-shaped through the
 /// intersection: one constituent is the tuple, and an intersection's values
 /// satisfy every constituent.
-pub fn isArrayShaped(c: *Checker, t: TypeId) Error!bool {
+fn isArrayShaped(c: *Checker, t: TypeId) Error!bool {
     // An interface/class instance is an object for every argument list, and
     // an object is not array-shaped — so the whole member table need not be
     // materialized to say no. See `refExpandsToObject`.
@@ -723,7 +723,7 @@ pub fn isArrayShaped(c: *Checker, t: TypeId) Error!bool {
         .array, .tuple, .function => return true,
         .intersection => {
             for (0..c.ts.memberCount(r)) |i| {
-                if (try c.isArrayShaped(c.ts.memberAt(r, i))) return true;
+                if (try isArrayShaped(c, c.ts.memberAt(r, i))) return true;
             }
             return false;
         },
@@ -743,7 +743,7 @@ pub fn isArrayShaped(c: *Checker, t: TypeId) Error!bool {
 ///   * an object lacking a required member NAME is not assignable to a
 ///     structural target that requires it (Awaited's `then` branch).
 /// Anything else stays deferred (return false).
-pub fn objectDecidablyNotExtends(c: *Checker, chk_obj: TypeId, extends_ty: TypeId) Error!bool {
+fn objectDecidablyNotExtends(c: *Checker, chk_obj: TypeId, extends_ty: TypeId) Error!bool {
     const s = &c.ts;
     const ext = try c.resolveStructural(extends_ty);
     switch (s.kind(ext)) {
@@ -778,7 +778,7 @@ pub fn objectDecidablyNotExtends(c: *Checker, chk_obj: TypeId, extends_ty: TypeI
         .union_type => {
             // A union is out of reach exactly when every constituent is.
             for (try c.memberList(ext)) |m| {
-                if (!try c.objectDecidablyNotExtends(chk_obj, m)) return false;
+                if (!try objectDecidablyNotExtends(c, chk_obj, m)) return false;
             }
             return true;
         },
@@ -832,7 +832,7 @@ pub fn indexOfAtom(atoms: []const Atom, needle: Atom) ?usize {
 /// conditional owns; bare REFERENCES to a binder declared by an enclosing
 /// conditional land in `refs` (see `types.infer_var_reference`). One walk
 /// serves both so the hot conditional path pays for a single traversal.
-pub fn collectInferVars(c: *Checker, t: TypeId, out: *std.ArrayList(u32), refs: ?*std.ArrayList(u32)) Error!void {
+fn collectInferVars(c: *Checker, t: TypeId, out: *std.ArrayList(u32), refs: ?*std.ArrayList(u32)) Error!void {
     // The only arm that writes is `.infer_var`, and this walk's arms are a
     // strict SUBSET of `containsInfer`'s — so a subtree that holds no binder
     // can be skipped whole. `containsInfer` is memoized per interned type, so
@@ -846,34 +846,34 @@ pub fn collectInferVars(c: *Checker, t: TypeId, out: *std.ArrayList(u32), refs: 
             const bucket = if (s.inferVarIsRef(t)) (refs orelse return) else out;
             if (indexOfId(bucket.items, id) == null) try bucket.append(c.scratch(), id);
         },
-        .array => try c.collectInferVars(s.arrayElem(t), out, refs),
+        .array => try collectInferVars(c, s.arrayElem(t), out, refs),
         .union_type, .intersection, .overloads => {
-            for (0..s.memberCount(t)) |i| try c.collectInferVars(s.memberAt(t, i), out, refs);
+            for (0..s.memberCount(t)) |i| try collectInferVars(c, s.memberAt(t, i), out, refs);
         },
         .tuple => {
-            for (0..s.tupleLen(t)) |i| try c.collectInferVars(s.tupleElem(t, @intCast(i)).ty, out, refs);
+            for (0..s.tupleLen(t)) |i| try collectInferVars(c, s.tupleElem(t, @intCast(i)).ty, out, refs);
         },
         .object => {
-            for (0..s.objectPropCount(t)) |i| try c.collectInferVars(s.objectProp(t, @intCast(i)).ty, out, refs);
-            if (s.objectStringIndex(t) != 0) try c.collectInferVars(s.objectStringIndex(t), out, refs);
-            if (s.objectNumberIndex(t) != 0) try c.collectInferVars(s.objectNumberIndex(t), out, refs);
+            for (0..s.objectPropCount(t)) |i| try collectInferVars(c, s.objectProp(t, @intCast(i)).ty, out, refs);
+            if (s.objectStringIndex(t) != 0) try collectInferVars(c, s.objectStringIndex(t), out, refs);
+            if (s.objectNumberIndex(t) != 0) try collectInferVars(c, s.objectNumberIndex(t), out, refs);
             // Call/construct signatures carry infer vars too (`new (x: infer
             // P) => …`, a `JSXElementConstructor` construct constituent).
-            for (0..s.objectCallSigCount(t)) |i| try c.collectInferVars(s.objectCallSig(t, @intCast(i)), out, refs);
-            for (0..s.objectConstructSigCount(t)) |i| try c.collectInferVars(s.objectConstructSig(t, @intCast(i)), out, refs);
+            for (0..s.objectCallSigCount(t)) |i| try collectInferVars(c, s.objectCallSig(t, @intCast(i)), out, refs);
+            for (0..s.objectConstructSigCount(t)) |i| try collectInferVars(c, s.objectConstructSig(t, @intCast(i)), out, refs);
         },
         .function => {
-            for (0..s.fnParamCount(t)) |i| try c.collectInferVars(s.fnParam(t, @intCast(i)).ty, out, refs);
-            try c.collectInferVars(s.fnReturn(t), out, refs);
+            for (0..s.fnParamCount(t)) |i| try collectInferVars(c, s.fnParam(t, @intCast(i)).ty, out, refs);
+            try collectInferVars(c, s.fnReturn(t), out, refs);
         },
         .ref => {
-            for (0..s.refArgCount(t)) |i| try c.collectInferVars(s.refArgAt(t, i), out, refs);
+            for (0..s.refArgCount(t)) |i| try collectInferVars(c, s.refArgAt(t, i), out, refs);
         },
         .template_literal_type => {
-            for (0..s.templateHoleCount(t)) |i| try c.collectInferVars(s.templateHole(t, @intCast(i)), out, refs);
+            for (0..s.templateHoleCount(t)) |i| try collectInferVars(c, s.templateHole(t, @intCast(i)), out, refs);
         },
-        .string_mapping => try c.collectInferVars(s.stringMappingArg(t), out, refs),
-        .keyof_op => try c.collectInferVars(s.keyofOperand(t), out, refs),
+        .string_mapping => try collectInferVars(c, s.stringMappingArg(t), out, refs),
+        .keyof_op => try collectInferVars(c, s.keyofOperand(t), out, refs),
         // A mapped type parked by `reduceMapped` because its key set is still
         // an `infer` var: `Record<infer K, V>` is `{ [P in K]: V }`, so the
         // binder `K` lives in the mapped node, not in any arm above. Missing it
@@ -890,10 +890,10 @@ pub fn collectInferVars(c: *Checker, t: TypeId, out: *std.ArrayList(u32), refs: 
         // is strictly worse than not owning it. `mappedInferShape` is the one
         // place that decides, and `inferFromExtendsInner`'s `.mapped` arm
         // consumes the same answer.
-        .mapped => switch (try c.mappedInferShape(t)) {
+        .mapped => switch (try mappedInferShape(c, t)) {
             .key_set => |con| {
-                try c.collectInferVars(con, out, refs);
-                if (s.mappedValue(t) != 0) try c.collectInferVars(s.mappedValue(t), out, refs);
+                try collectInferVars(c, con, out, refs);
+                if (s.mappedValue(t) != 0) try collectInferVars(c, s.mappedValue(t), out, refs);
             },
             .none => {},
         },
@@ -920,7 +920,7 @@ const MappedInferShape = union(enum) {
     none,
 };
 
-pub fn mappedInferShape(c: *Checker, pattern: TypeId) Error!MappedInferShape {
+fn mappedInferShape(c: *Checker, pattern: TypeId) Error!MappedInferShape {
     const s = &c.ts;
     // A key REMAPPING (`as`) rewrites the key set, so the rule does not
     // describe it.
@@ -1373,7 +1373,7 @@ fn inferFromExtendsInner(c: *Checker, source0: TypeId, pattern: TypeId, ids: []c
         // `mappedInferShape` decides which binders this pattern owns, and
         // `collectInferVars` claims exactly those — the two must stay in step.
         .mapped => {
-            const con = switch (try c.mappedInferShape(pattern)) {
+            const con = switch (try mappedInferShape(c, pattern)) {
                 .key_set => |con| con,
                 .none => return,
             };
@@ -1467,8 +1467,8 @@ fn inferFromExtendsInner(c: *Checker, source0: TypeId, pattern: TypeId, ids: []c
             // (a function type with extra members) carries call sigs. Infer
             // through both signature kinds, aligning source→pattern sigs from
             // the end like tsc's `inferFromSignatures`.
-            try c.inferFromObjectSigs(src, pattern, false, ids, vals, contra, depth);
-            try c.inferFromObjectSigs(src, pattern, true, ids, vals, contra, depth);
+            try inferFromObjectSigs(c, src, pattern, false, ids, vals, contra, depth);
+            try inferFromObjectSigs(c, src, pattern, true, ids, vals, contra, depth);
         },
         .function => {
             var src = try c.resolveStructural(source0);
@@ -1913,9 +1913,9 @@ fn inferFromExtendsInner(c: *Checker, source0: TypeId, pattern: TypeId, ids: []c
         .template_literal_type => {
             const src = try c.resolveStructural(source0);
             if (try c.stringLiteralOf(src)) |atom_| {
-                try c.inferFromTemplate(c.atomText(atom_), pattern, ids, vals);
+                try inferFromTemplate(c, c.atomText(atom_), pattern, ids, vals);
             } else if (s.kind(src) == .template_literal_type) {
-                try c.inferFromTemplateSource(src, pattern, ids, vals, contra, depth);
+                try inferFromTemplateSource(c, src, pattern, ids, vals, contra, depth);
             }
         },
         else => {},
@@ -1929,7 +1929,7 @@ fn inferFromExtendsInner(c: *Checker, source0: TypeId, pattern: TypeId, ids: []c
 /// from the source's last signature. Each paired signature is a `.function`
 /// TypeId, so the recursion lands back in the `.function` arm (params
 /// contravariant, return covariant).
-pub fn inferFromObjectSigs(c: *Checker, src: TypeId, pattern: TypeId, is_construct: bool, ids: []const u32, vals: []TypeId, contra: bool, depth: u32) Error!void {
+fn inferFromObjectSigs(c: *Checker, src: TypeId, pattern: TypeId, is_construct: bool, ids: []const u32, vals: []TypeId, contra: bool, depth: u32) Error!void {
     const s = &c.ts;
     const scount = if (is_construct) s.objectConstructSigCount(src) else s.objectCallSigCount(src);
     const pcount = if (is_construct) s.objectConstructSigCount(pattern) else s.objectCallSigCount(pattern);
@@ -2033,7 +2033,7 @@ fn containsInferInner(c: *Checker, t: TypeId) Error!bool {
 }
 
 /// Replace `infer` binders (`ids[i]`) with their inferred `vals[i]`.
-pub fn substInfer(c: *Checker, t: TypeId, ids: []const u32, vals: []const TypeId) Error!TypeId {
+fn substInfer(c: *Checker, t: TypeId, ids: []const u32, vals: []const TypeId) Error!TypeId {
     if (ids.len == 0 or !try c.containsInfer(t)) return t;
     const s = &c.ts;
     switch (s.kind(t)) {
@@ -2041,23 +2041,23 @@ pub fn substInfer(c: *Checker, t: TypeId, ids: []const u32, vals: []const TypeId
             const idx = indexOfId(ids, s.inferVarId(t)) orelse return t;
             return vals[idx];
         },
-        .array => return s.makeArrayLike(t, try c.substInfer(s.arrayElem(t), ids, vals)),
+        .array => return s.makeArrayLike(t, try substInfer(c, s.arrayElem(t), ids, vals)),
         .union_type => {
             var parts: std.ArrayList(TypeId) = .empty;
             defer parts.deinit(c.scratch());
-            for (try c.memberList(t)) |m| try parts.append(c.scratch(), try c.substInfer(m, ids, vals));
+            for (try c.memberList(t)) |m| try parts.append(c.scratch(), try substInfer(c, m, ids, vals));
             return s.makeUnion(c.scratch(), parts.items);
         },
         .intersection => {
             var parts: std.ArrayList(TypeId) = .empty;
             defer parts.deinit(c.scratch());
-            for (try c.memberList(t)) |m| try parts.append(c.scratch(), try c.substInfer(m, ids, vals));
+            for (try c.memberList(t)) |m| try parts.append(c.scratch(), try substInfer(c, m, ids, vals));
             return s.makeIntersection(c.scratch(), parts.items);
         },
         .overloads => {
             var parts: std.ArrayList(TypeId) = .empty;
             defer parts.deinit(c.scratch());
-            for (try c.memberList(t)) |m| try parts.append(c.scratch(), try c.substInfer(m, ids, vals));
+            for (try c.memberList(t)) |m| try parts.append(c.scratch(), try substInfer(c, m, ids, vals));
             return s.makeOverloads(parts.items);
         },
         .tuple => {
@@ -2065,7 +2065,7 @@ pub fn substInfer(c: *Checker, t: TypeId, ids: []const u32, vals: []const TypeId
             defer elems.deinit(c.scratch());
             for (0..s.tupleLen(t)) |i| {
                 const e = s.tupleElem(t, @intCast(i));
-                try elems.append(c.scratch(), .{ .ty = try c.substInfer(e.ty, ids, vals), .flags = e.flags });
+                try elems.append(c.scratch(), .{ .ty = try substInfer(c, e.ty, ids, vals), .flags = e.flags });
             }
             return s.makeTuple(elems.items);
         },
@@ -2074,10 +2074,10 @@ pub fn substInfer(c: *Checker, t: TypeId, ids: []const u32, vals: []const TypeId
             defer props.deinit(c.scratch());
             for (0..s.objectPropCount(t)) |i| {
                 const p = s.objectProp(t, @intCast(i));
-                try props.append(c.scratch(), .{ .name = p.name, .ty = try c.substInfer(p.ty, ids, vals), .flags = p.flags });
+                try props.append(c.scratch(), .{ .name = p.name, .ty = try substInfer(c, p.ty, ids, vals), .flags = p.flags });
             }
-            const sidx = if (s.objectStringIndex(t) != 0) try c.substInfer(s.objectStringIndex(t), ids, vals) else 0;
-            const nidx = if (s.objectNumberIndex(t) != 0) try c.substInfer(s.objectNumberIndex(t), ids, vals) else 0;
+            const sidx = if (s.objectStringIndex(t) != 0) try substInfer(c, s.objectStringIndex(t), ids, vals) else 0;
+            const nidx = if (s.objectNumberIndex(t) != 0) try substInfer(c, s.objectNumberIndex(t), ids, vals) else 0;
             // Preserve and substitute call/construct signatures — dropping
             // them (the old `makeObject` path) lost the inferred `new (props:
             // P) => …` shape needed to decide a construct-pattern conditional.
@@ -2087,8 +2087,8 @@ pub fn substInfer(c: *Checker, t: TypeId, ids: []const u32, vals: []const TypeId
             defer call_sigs.deinit(c.scratch());
             var construct_sigs: std.ArrayList(TypeId) = .empty;
             defer construct_sigs.deinit(c.scratch());
-            for (0..s.objectCallSigCount(t)) |i| try call_sigs.append(c.scratch(), try c.substInfer(s.objectCallSig(t, @intCast(i)), ids, vals));
-            for (0..s.objectConstructSigCount(t)) |i| try construct_sigs.append(c.scratch(), try c.substInfer(s.objectConstructSig(t, @intCast(i)), ids, vals));
+            for (0..s.objectCallSigCount(t)) |i| try call_sigs.append(c.scratch(), try substInfer(c, s.objectCallSig(t, @intCast(i)), ids, vals));
+            for (0..s.objectConstructSigCount(t)) |i| try construct_sigs.append(c.scratch(), try substInfer(c, s.objectConstructSig(t, @intCast(i)), ids, vals));
             return s.makeObjectSigs(props.items, sidx, nidx, s.objectFlags(t), call_sigs.items, construct_sigs.items);
         },
         .function => {
@@ -2096,16 +2096,16 @@ pub fn substInfer(c: *Checker, t: TypeId, ids: []const u32, vals: []const TypeId
             defer params.deinit(c.scratch());
             for (0..s.fnParamCount(t)) |i| {
                 const p = s.fnParam(t, @intCast(i));
-                try params.append(c.scratch(), .{ .name = p.name, .ty = try c.substInfer(p.ty, ids, vals), .flags = p.flags });
+                try params.append(c.scratch(), .{ .name = p.name, .ty = try substInfer(c, p.ty, ids, vals), .flags = p.flags });
             }
-            const ret = try c.substInfer(s.fnReturn(t), ids, vals);
+            const ret = try substInfer(c, s.fnReturn(t), ids, vals);
             const this_ty = s.fnThisType(t);
-            return s.makeFunctionThis(params.items, ret, s.fnTypeParams(t), s.fnFlags(t), null, if (this_ty != 0) try c.substInfer(this_ty, ids, vals) else 0);
+            return s.makeFunctionThis(params.items, ret, s.fnTypeParams(t), s.fnFlags(t), null, if (this_ty != 0) try substInfer(c, this_ty, ids, vals) else 0);
         },
         .ref => {
             var args: std.ArrayList(TypeId) = .empty;
             defer args.deinit(c.scratch());
-            for (try c.refArgsList(t)) |a| try args.append(c.scratch(), try c.substInfer(a, ids, vals));
+            for (try c.refArgsList(t)) |a| try args.append(c.scratch(), try substInfer(c, a, ids, vals));
             return s.makeRef(s.refSymbol(t), args.items);
         },
         .conditional => {
@@ -2131,14 +2131,14 @@ pub fn substInfer(c: *Checker, t: TypeId, ids: []const u32, vals: []const TypeId
                         const vals2 = try c.scratch().dupe(TypeId, vals);
                         for (try c.memberList(cv)) |m| {
                             vals2[vi] = m;
-                            try parts.append(c.scratch(), try c.substInfer(t, ids, vals2));
+                            try parts.append(c.scratch(), try substInfer(c, t, ids, vals2));
                         }
                         return s.makeUnion(c.scratch(), parts.items);
                     }
                 }
             }
-            const chk = try c.substInfer(check0, ids, vals);
-            const ext = try c.substInfer(s.condExtends(t), ids, vals);
+            const chk = try substInfer(c, check0, ids, vals);
+            const ext = try substInfer(c, s.condExtends(t), ids, vals);
             // Decide FIRST, substitute the winning branch only — the same
             // split `instantiateId`'s `.conditional` arm makes, and for the
             // same reason. This arm is reached with a whole FALL-THROUGH
@@ -2164,38 +2164,38 @@ pub fn substInfer(c: *Checker, t: TypeId, ids: []const u32, vals: []const TypeId
             const plan = try c.planConditional(chk, ext, s.condDistributive(t));
             switch (plan) {
                 .value => |v| return v,
-                .take_false => return c.substInfer(s.condFalse(t), ids, vals),
-                .take_true => |b| return c.condTrueBranch(b, try c.substInfer(s.condTrue(t), ids, vals)),
+                .take_false => return substInfer(c, s.condFalse(t), ids, vals),
+                .take_true => |b| return c.condTrueBranch(b, try substInfer(c, s.condTrue(t), ids, vals)),
                 .both_any, .need_both => {
-                    const tru = try c.substInfer(s.condTrue(t), ids, vals);
-                    const fls = try c.substInfer(s.condFalse(t), ids, vals);
+                    const tru = try substInfer(c, s.condTrue(t), ids, vals);
+                    const fls = try substInfer(c, s.condFalse(t), ids, vals);
                     return c.finishCondPlan(plan, chk, ext, tru, fls, s.condDistributive(t));
                 },
             }
         },
         .index_access => {
-            const obj = try c.substInfer(s.indexAccessObj(t), ids, vals);
-            const idx = try c.substInfer(s.indexAccessIndex(t), ids, vals);
+            const obj = try substInfer(c, s.indexAccessObj(t), ids, vals);
+            const idx = try substInfer(c, s.indexAccessIndex(t), ids, vals);
             return c.reduceIndexedAccess(obj, idx);
         },
         .template_literal_type => {
             var holes: std.ArrayList(TypeId) = .empty;
             defer holes.deinit(c.scratch());
-            for (0..s.templateHoleCount(t)) |i| try holes.append(c.scratch(), try c.substInfer(s.templateHole(t, @intCast(i)), ids, vals));
+            for (0..s.templateHoleCount(t)) |i| try holes.append(c.scratch(), try substInfer(c, s.templateHole(t, @intCast(i)), ids, vals));
             return c.reduceTemplate(s.templateHead(t), holes.items, t);
         },
-        .string_mapping => return c.applyStringMapping(s.stringMappingKind(t), try c.substInfer(s.stringMappingArg(t), ids, vals)),
-        .keyof_op => return c.keyofType(try c.substInfer(s.keyofOperand(t), ids, vals)),
+        .string_mapping => return c.applyStringMapping(s.stringMappingKind(t), try substInfer(c, s.stringMappingArg(t), ids, vals)),
+        .keyof_op => return c.keyofType(try substInfer(c, s.keyofOperand(t), ids, vals)),
         // Re-enter `reduceMapped` with the branches' `infer` vars bound: a
         // mapped alias deferred while its key source was still an `infer` var
         // (see `reduceMapped`) now materializes its key set. Without this arm
         // the map falls through unchanged and stays `{}`.
         .mapped => {
             const kp = s.mappedKeyParam(t); // key param identity is stable
-            const con = try c.substInfer(s.mappedConstraint(t), ids, vals);
-            const val = try c.substInfer(s.mappedValue(t), ids, vals);
-            const as_c = if (s.mappedAs(t) != 0) try c.substInfer(s.mappedAs(t), ids, vals) else 0;
-            const src = if (s.mappedSource(t) != 0) try c.substInfer(s.mappedSource(t), ids, vals) else 0;
+            const con = try substInfer(c, s.mappedConstraint(t), ids, vals);
+            const val = try substInfer(c, s.mappedValue(t), ids, vals);
+            const as_c = if (s.mappedAs(t) != 0) try substInfer(c, s.mappedAs(t), ids, vals) else 0;
+            const src = if (s.mappedSource(t) != 0) try substInfer(c, s.mappedSource(t), ids, vals) else 0;
             return c.reduceMapped(kp, con, val, as_c, src, s.mappedFlags(t));
         },
         else => return t,
@@ -2257,8 +2257,8 @@ pub const matchTemplatePattern = template_zig.matchTemplatePattern;
 pub const matchTplHole = template_zig.matchTplHole;
 pub const holeAccepts = template_zig.holeAccepts;
 pub const isNumericString = template_zig.isNumericString;
-pub const inferFromTemplate = template_zig.inferFromTemplate;
+const inferFromTemplate = template_zig.inferFromTemplate;
 pub const bindTemplateInfer = template_zig.bindTemplateInfer;
-pub const inferFromTemplateSource = template_zig.inferFromTemplateSource;
+const inferFromTemplateSource = template_zig.inferFromTemplateSource;
 pub const matchTemplateParts = template_zig.matchTemplateParts;
 pub const normalizeTextlessTemplate = template_zig.normalizeTextlessTemplate;
