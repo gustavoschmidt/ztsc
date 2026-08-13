@@ -110,11 +110,18 @@ pub fn checkInterfaceExtends(c: *Checker, sym: SymbolId, node: Node, name_token:
     }
     try dropRepeatedBases(c, sym, &bases);
 
-    if (!try checkInheritedPropertiesIdentical(c, sym, self, bases.items, name_token)) return;
+    // The interface's OWN member names, read once: both checks below need
+    // them (`checkInheritedPropertiesIdentical` to seed, the generic-override
+    // screen to identify what this interface redeclares).
+    var own: std.AutoHashMapUnmanaged(Atom, void) = .empty;
+    defer own.deinit(c.scratch());
+    try ownMemberNames(c, sym, &own);
+
+    if (!try checkInheritedPropertiesIdentical(c, self, bases.items, &own, name_token)) return;
 
     for (bases.items) |base| {
         if (!try relatableBase(c, base) or base == self) continue;
-        if (try genericOverrideUnrelatable(c, sym, self, base)) continue;
+        if (try genericOverrideUnrelatable(c, self, base, &own)) continue;
         if (try c.isAssignable(self, base)) continue;
         try c.diagFmt(2430, c.tokSpan(name_token), "Interface '{s}' incorrectly extends interface '{s}'.{s}", .{
             try c.typeToString(self),
@@ -190,10 +197,12 @@ fn relatableBase(c: *Checker, base: TypeId) Error!bool {
 /// is a genuine under-report of the same relation gap and must not be turned
 /// into silence here as well. Removing this screen is the observable test that
 /// the relation gap is fixed.
-fn genericOverrideUnrelatable(c: *Checker, sym: SymbolId, self: TypeId, base: TypeId) Error!bool {
-    var own: std.AutoHashMapUnmanaged(Atom, void) = .empty;
-    defer own.deinit(c.scratch());
-    try ownMemberNames(c, sym, &own);
+fn genericOverrideUnrelatable(
+    c: *Checker,
+    self: TypeId,
+    base: TypeId,
+    own: *const std.AutoHashMapUnmanaged(Atom, void),
+) Error!bool {
     if (own.count() == 0) return false;
     const derived = try c.resolveStructural(self);
     const rb = try c.resolveStructural(base);
@@ -252,9 +261,9 @@ fn hasGenericSignature(c: *Checker, t: TypeId) Error!bool {
 /// Returns whether the caller should go on to TS2430.
 fn checkInheritedPropertiesIdentical(
     c: *Checker,
-    sym: SymbolId,
     self: TypeId,
     bases: []const TypeId,
+    own: *const std.AutoHashMapUnmanaged(Atom, void),
     name_token: ast.TokenIndex,
 ) Error!bool {
     if (bases.len < 2) return true;
@@ -263,9 +272,6 @@ fn checkInheritedPropertiesIdentical(
     // property of one interface, freed with the check.
     var seen: std.AutoHashMapUnmanaged(Atom, struct { prop: types.Prop, from: TypeId }) = .empty;
     defer seen.deinit(c.scratch());
-    var own: std.AutoHashMapUnmanaged(Atom, void) = .empty;
-    defer own.deinit(c.scratch());
-    try ownMemberNames(c, sym, &own);
 
     var ok = true;
     for (bases) |base| {
