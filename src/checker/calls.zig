@@ -455,6 +455,57 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
             for (0..c.ts.objectConstructSigCount(r)) |i| {
                 try sigs.append(c.scratch(), c.ts.objectConstructSig(r, @intCast(i)));
             }
+        } else if (rk == .union_type) {
+            // `new (typeof A | typeof B)()`. tsc resolves a union callee's
+            // signatures with `getUnionSignatures` over the constituents'
+            // CONSTRUCT lists, the same combination the call side gets
+            // (`combinedUnionSignature`): the union is constructable iff every
+            // constituent is, and the result type is the union of the
+            // constituents' instance types. Without this arm every
+            // `new cls()` on a union of class values — the
+            // `[A, B].map(c => new c())` idiom — was a false TS2351.
+            var ctor_starts: std.ArrayList(u32) = .empty;
+            defer ctor_starts.deinit(c.scratch());
+            switch (try unionCtorSigs(c, r, &sigs, &ctor_starts)) {
+                .ok => |u| {
+                    // tsc's `resolveNewExpression` reports TS2511 when ANY
+                    // selected construct signature is abstract; a union
+                    // carries no `symbol` of its own, so the flag has to come
+                    // from the constituents.
+                    if (u.abstract) {
+                        try c.diagFmt(2511, c.nodeSpan(node), "Cannot create an instance of an abstract class.", .{});
+                    }
+                    if (u.any or sigs.items.len == 0) {
+                        for (shape.arg_nodes) |an| {
+                            if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
+                        }
+                        return .{ .ty = types.any_type, .chained = chained };
+                    }
+                    if (ctor_starts.items.len > 1) {
+                        if (try combinedUnionSignature(c, sigs.items, ctor_starts.items)) |combined| {
+                            sigs.clearRetainingCapacity();
+                            try sigs.append(c.scratch(), combined);
+                        }
+                    }
+                },
+                // A shape this arm does not model (a GENERIC class value,
+                // whose construct signatures would have to carry the class's
+                // own type parameters). `any`, silently: an under-report,
+                // where the TS2351 it replaces was a false positive.
+                .unmodeled => {
+                    for (shape.arg_nodes) |an| {
+                        if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
+                    }
+                    return .{ .ty = types.any_type, .chained = chained };
+                },
+                .not_constructable => {
+                    try c.diagFmt(2351, c.nodeSpan(shape.callee), "This expression is not constructable.", .{});
+                    for (shape.arg_nodes) |an| {
+                        if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
+                    }
+                    return .{ .ty = types.error_type, .chained = chained };
+                },
+            }
         } else {
             try c.diagFmt(2351, c.nodeSpan(shape.callee), "This expression is not constructable.", .{});
             for (shape.arg_nodes) |an| {
@@ -944,6 +995,87 @@ pub fn instantiateSigForCall(c: *Checker, sig: TypeId, explicit_targs: []const T
 /// signature in a constituent, a `this` type, mismatched type-parameter
 /// arity, or a rest parameter — in which case the caller keeps the gathered
 /// overload set, the prior behaviour.
+/// What `unionCtorSigs` found: either a gathered signature set (with the two
+/// facts the caller must act on before resolving it) or a reason not to
+/// resolve one at all.
+const UnionCtors = union(enum) {
+    ok: struct {
+        /// A constituent is an abstract class value → TS2511.
+        abstract: bool,
+        /// A constituent is `any`/`err`, so the whole `new` is `any`.
+        any: bool,
+    },
+    /// A constituent this arm does not model: caller answers `any` silently.
+    unmodeled,
+    /// A constituent carries no construct signature → TS2351.
+    not_constructable,
+};
+
+/// Construct signatures of a UNION callee, gathered per constituent (tsc's
+/// `getUnionSignatures` input lists). `starts` records where each
+/// constituent's own list begins in `sigs`, which is what lets
+/// `combinedUnionSignature` combine them position-wise instead of treating
+/// the concatenation as one overload set.
+///
+/// A class-value constituent contributes its constructor signatures with the
+/// return type rewritten to the INSTANCE type — a `.class_value`'s own
+/// signature returns are not the instance (the single-class path overrides
+/// them with `instance_ret`). A class with no declared constructor
+/// contributes the default zero-argument one.
+fn unionCtorSigs(
+    c: *Checker,
+    r: TypeId,
+    sigs: *std.ArrayList(TypeId),
+    starts: *std.ArrayList(u32),
+) Error!UnionCtors {
+    var abstract = false;
+    var any = false;
+    for (try c.memberList(r)) |m| {
+        const before: u32 = @intCast(sigs.items.len);
+        const rm = try c.resolveStructural(m);
+        switch (c.ts.kind(rm)) {
+            .any, .err => any = true,
+            // A `never` constituent contributes nothing and blocks nothing —
+            // the same rule the union CALL arm applies.
+            .never => {},
+            .class_value => {
+                const cls = c.ts.classSymbol(rm);
+                var tps: std.ArrayList(TypeParamInfo) = .empty;
+                defer tps.deinit(c.scratch());
+                try c.typeParamsOf(cls, &tps);
+                // A GENERIC class value would need its construct signatures
+                // to carry the class's own type parameters (tsc's
+                // `typeof C` does; ztsc substitutes instead — see the
+                // single-class path's `inst_args`), which this gather has no
+                // way to express.
+                if (tps.items.len != 0) return .unmodeled;
+                if (try c.classIsAbstract(cls)) abstract = true;
+                const inst = try c.ts.makeRef(cls, &.{});
+                var cs: std.ArrayList(TypeId) = .empty;
+                defer cs.deinit(c.scratch());
+                try c.ctorSignatures(cls, &cs);
+                if (cs.items.len == 0) {
+                    try sigs.append(c.scratch(), try c.ts.makeFunction(&.{}, inst, &.{}, 0));
+                } else for (cs.items) |sig| {
+                    try sigs.append(c.scratch(), try c.sigWithReturn(sig, inst));
+                }
+            },
+            .object => {
+                const n = c.ts.objectConstructSigCount(rm);
+                if (n == 0) return .not_constructable;
+                for (0..n) |i| {
+                    try sigs.append(c.scratch(), c.ts.objectConstructSig(rm, @intCast(i)));
+                }
+            },
+            else => return .not_constructable,
+        }
+        if (@as(u32, @intCast(sigs.items.len)) != before) {
+            try starts.append(c.scratch(), before);
+        }
+    }
+    return .{ .ok = .{ .abstract = abstract, .any = any } };
+}
+
 fn combinedUnionSignature(c: *Checker, sigs: []const TypeId, starts: []const u32) Error!?TypeId {
     // Only the one-signature-per-constituent shape: tsc's `getUnionSignatures`
     // has a whole matching pass for the rest, and guessing it wrong would
