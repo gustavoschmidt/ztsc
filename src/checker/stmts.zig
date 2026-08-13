@@ -1491,21 +1491,24 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
     }
 
     // Both remaining checks read the constructor's FLOW, so they run after the
-    // member walk has checked its body. `widened` is scanned once and shared.
-    c.this_type = this_t;
-    const ctor = constructorWithBody(c, members);
-    const ctor_body = if (ctor == null_node) null_node else c.tree.nodeData(ctor).rhs;
-    const widened = ctorHasWidenedFlow(c, ctor_body);
-    if (init_cands.items.len != 0) {
-        try checkPropertyInit(c, ctor, widened, init_cands.items);
-        if (ctor != null_node) try checkPropertyUseBeforeAssigned(c, ctor_body, widened, init_cands.items);
-    }
-    // `check_prop_init` is exactly "not ambient, and this file is ours to
-    // report on" — the same two conditions TS2612 needs, for the same two
-    // reasons (an ambient member emits no field; a foreign file's flow is
-    // never built).
-    if (class_sym != binder.no_symbol and check_prop_init) {
-        try heritage.checkBasePropertyOverwrites(c, class_sym, this_t, members, ctor, widened);
+    // member walk has checked its body. `check_prop_init` is exactly "not
+    // ambient, and this file is ours to report on" — the two conditions TS2612
+    // needs as well, for the same two reasons (an ambient member emits no
+    // field; a foreign file's flow is never built).
+    const wants_2612 = class_sym != binder.no_symbol and check_prop_init and data.extends != 0;
+    if (init_cands.items.len != 0 or wants_2612) {
+        c.this_type = this_t;
+        const ctor = constructorWithBody(c, members);
+        const ctor_body = if (ctor == null_node) null_node else c.tree.nodeData(ctor).rhs;
+        // One syntactic scan of the constructor body, shared by both checks.
+        const widened = ctorHasWidenedFlow(c, ctor_body);
+        if (init_cands.items.len != 0) {
+            try checkPropertyInit(c, ctor, widened, init_cands.items);
+            if (ctor != null_node) try checkPropertyUseBeforeAssigned(c, ctor_body, widened, init_cands.items);
+        }
+        if (wants_2612) {
+            try heritage.checkBasePropertyOverwrites(c, class_sym, this_t, members, ctor, widened);
+        }
     }
 }
 

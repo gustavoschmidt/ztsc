@@ -79,6 +79,10 @@ const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
 pub fn checkInterfaceExtends(c: *Checker, sym: SymbolId, node: Node, name_token: ast.TokenIndex) Error!void {
     if (name_token == 0) return;
     if (!isFirstInterfaceDecl(c, sym, node)) return;
+    // Most interfaces extend nothing, and everything below — the type-parameter
+    // list, the heritage re-walk, one relation per base — costs something. One
+    // syntactic scan of the declarations skips all of it.
+    if (!hasHeritage(c, sym)) return;
     if ((try c.interfaceGeneric(sym)) == types.error_type) return;
     const self = try selfReference(c, sym) orelse return;
 
@@ -104,11 +108,13 @@ pub fn checkInterfaceExtends(c: *Checker, sym: SymbolId, node: Node, name_token:
         }
         try c.interfaceHeritageTypes(sym, &bases);
     }
+    try dropRepeatedBases(c, sym, &bases);
 
     if (!try checkInheritedPropertiesIdentical(c, sym, self, bases.items, name_token)) return;
 
     for (bases.items) |base| {
         if (!try relatableBase(c, base) or base == self) continue;
+        if (try genericOverrideUnrelatable(c, sym, self, base)) continue;
         if (try c.isAssignable(self, base)) continue;
         try c.diagFmt(2430, c.tokSpan(name_token), "Interface '{s}' incorrectly extends interface '{s}'.{s}", .{
             try c.typeToString(self),
@@ -164,6 +170,56 @@ fn relatableBase(c: *Checker, base: TypeId) Error!bool {
     if (base == types.error_type or base == types.any_type) return false;
     if (c.ts.kind(base) == .err) return false;
     return c.ts.kind(try c.resolveStructural(base)) == .object;
+}
+
+/// Does this interface override a base member with a GENERIC signature the
+/// base does not have? Then ztsc's verdict on the pair is not trustworthy and
+/// the check declines.
+///
+/// tsc's `compareSignaturesRelated` instantiates a generic SOURCE signature in
+/// the target's context (`instantiateSignatureInContextOf`) before comparing
+/// parameters, so `child<U extends Extract<keyof T, string>>(path: U)` relates
+/// to `child(path: string)` by solving `U := string`. ztsc's relation does
+/// that only once the outer type arguments are known; with the interface's own
+/// `T` still free it compares `string` against the uninstantiated `U` and says
+/// no, which would report TS2430 on code tsc accepts (`deeplyNestedCheck.ts`).
+///
+/// The screen is deliberately narrow — a generic member on the DERIVED side,
+/// shadowing a base member — because the reverse shape (a generic member in
+/// the BASE, as in `subtypingWithGenericCallSignaturesWithOptionalParameters`)
+/// is a genuine under-report of the same relation gap and must not be turned
+/// into silence here as well. Removing this screen is the observable test that
+/// the relation gap is fixed.
+fn genericOverrideUnrelatable(c: *Checker, sym: SymbolId, self: TypeId, base: TypeId) Error!bool {
+    var own: std.AutoHashMapUnmanaged(Atom, void) = .empty;
+    defer own.deinit(c.scratch());
+    try ownMemberNames(c, sym, &own);
+    if (own.count() == 0) return false;
+    const derived = try c.resolveStructural(self);
+    const rb = try c.resolveStructural(base);
+    for (0..c.ts.objectPropCount(derived)) |i| {
+        const p = c.ts.objectProp(derived, @intCast(i));
+        if (!own.contains(p.name)) continue;
+        const bp = (try c.propOfTypeEx(rb, p.name, false)) orelse continue;
+        if (try hasGenericSignature(c, p.ty) and !try hasGenericSignature(c, bp.ty)) return true;
+    }
+    return false;
+}
+
+/// Does `t` carry a call or construct signature with type parameters of its
+/// own? A method's type is a bare `.function`; an overload set or a callable
+/// object carries them on an `.object`.
+fn hasGenericSignature(c: *Checker, t: TypeId) Error!bool {
+    const r = try c.resolveStructural(t);
+    if (c.ts.kind(r) == .function) return c.ts.fnTypeParams(r).len != 0;
+    if (c.ts.kind(r) != .object) return false;
+    for (0..c.ts.objectCallSigCount(r)) |i| {
+        if (c.ts.fnTypeParams(c.ts.objectCallSig(r, @intCast(i))).len != 0) return true;
+    }
+    for (0..c.ts.objectConstructSigCount(r)) |i| {
+        if (c.ts.fnTypeParams(c.ts.objectConstructSig(r, @intCast(i))).len != 0) return true;
+    }
+    return false;
 }
 
 /// TS2320, tsc's `checkInheritedPropertiesAreIdentical`: two of an
@@ -249,6 +305,48 @@ fn propsIdentical(c: *Checker, a: types.Prop, b: types.Prop) Error!bool {
     return (try c.isAssignable(a.ty, b.ty)) and (try c.isAssignable(b.ty, a.ty));
 }
 
+/// Collapse repeated bases of a GENERIC interface written as several blocks.
+///
+/// Each block gets its own type-parameter symbols in ztsc, so
+/// `interface I<T> extends B<T> {}` written twice produces two base types that
+/// differ only in WHICH `T` they carry. tsc unifies the lists first
+/// (`checkTypeParameterListsIdentical`, TS2428 when they disagree) and ends up
+/// with one `B<T>`; ztsc ends up with `B<T₁>` and `B<T₂>`, which compare
+/// non-identical property by property. react16.d.ts's twice-declared
+/// `HTMLAttributes<T> extends DOMAttributes<T>` is the shape, and it
+/// manufactured a TS2320 in 26 otherwise-matching cases plus a TS2430 on a
+/// reduction of it.
+///
+/// Keeping the FIRST base per symbol is what tsc's unification amounts to
+/// here. Restricted to the multi-block generic case so that a single block's
+/// `extends A<string>, A<number>` — where tsc really does compare two
+/// different instantiations — keeps both.
+fn dropRepeatedBases(c: *Checker, sym: SymbolId, bases: *std.ArrayList(TypeId)) Error!void {
+    if (bases.items.len < 2) return;
+    var blocks: usize = 0;
+    for (c.declsOf(sym)) |decl| {
+        if (c.nodeTag(decl) == .interface_decl) blocks += 1;
+    }
+    if (blocks < 2) return;
+    var tps: std.ArrayList(TypeParamInfo) = .empty;
+    defer tps.deinit(c.scratch());
+    try c.typeParamsOf(sym, &tps);
+    if (tps.items.len == 0) return;
+
+    var kept: usize = 0;
+    outer: for (bases.items) |b| {
+        if (c.ts.kind(b) == .ref) {
+            const s = c.ts.refSymbol(b);
+            for (bases.items[0..kept]) |k| {
+                if (c.ts.kind(k) == .ref and c.ts.refSymbol(k) == s) continue :outer;
+            }
+        }
+        bases.items[kept] = b;
+        kept += 1;
+    }
+    bases.shrinkRetainingCapacity(kept);
+}
+
 /// The member names the interface's own blocks declare — tsc's
 /// `resolveDeclaredMembers(type).declaredProperties`, reduced to the names,
 /// which is all the seeding above needs.
@@ -270,6 +368,27 @@ fn isFirstInterfaceDecl(c: *Checker, sym: SymbolId, node: Node) bool {
     for (c.declsOf(sym)) |decl| {
         if (c.nodeTag(decl) != .interface_decl) continue;
         return decl == node;
+    }
+    return false;
+}
+
+/// Does any declaration of `sym` write a heritage clause? Syntax only: the
+/// `extends` list of any `interface` block, or the `extends` of a merged
+/// `class` half. With none, `getBaseTypes` would be empty and neither TS2320
+/// nor TS2430 has anything to say.
+fn hasHeritage(c: *Checker, sym: SymbolId) bool {
+    for (c.declsOf(sym)) |decl| {
+        const d = c.tree.nodeData(decl);
+        switch (c.nodeTag(decl)) {
+            .interface_decl => {
+                const data = c.tree.extraData(ast.InterfaceData, d.lhs);
+                if (data.extends_end > data.extends_start) return true;
+            },
+            .class_decl => {
+                if (c.tree.extraData(ast.ClassData, d.lhs).extends != 0) return true;
+            },
+            else => {},
+        }
     }
     return false;
 }
@@ -369,7 +488,7 @@ pub fn checkBasePropertyOverwrites(
         if (text.len != 0 and text[0] == '#') continue;
         const name = try c.memberKey(tok, e.flags);
 
-        const base = try baseClassMember(c, base_ref, name, 0) orelse continue;
+        const base = try baseClassMember(c, class_sym, base_ref, name) orelse continue;
         if (!base.is_field) continue; // a method or an accessor in the base
         if (base.flags & (ast.Flags.private | ast.Flags.abstract | ast.Flags.accessor) != 0) continue;
 
@@ -413,24 +532,44 @@ fn propertyDisplayName(c: *Checker, tok: ast.TokenIndex, name: Atom) []const u8 
 /// members answer: a name the base's merged `interface` half declares is not
 /// found here, which is exactly tsc's `base.valueDeclaration.parent.kind ===
 /// InterfaceDeclaration` screen.
-fn baseClassMember(c: *Checker, t: TypeId, name: Atom, depth: u32) Error!?BaseMember {
-    if (depth >= 64 or c.ts.kind(t) != .ref) return null;
-    const sym = c.ts.refSymbol(t);
-    if (!c.symFlags(sym).class) return null;
-    {
-        const saved = c.enterSymFile(sym);
-        defer c.restoreCtx(saved);
-        if (c.bind.membersScopeOf(c.localOf(sym))) |ms| {
-            const lo = c.bind.scope_members_start[ms];
-            const hi = c.bind.scope_members_start[ms + 1];
-            for (lo..hi) |i| {
-                if (c.bind.member_atoms[i] != name) continue;
-                if (memberDeclKind(c, c.toGlobal(c.bind.member_syms[i]))) |m| return m;
+///
+/// The walk stops at a class it has already visited. `class C extends E`,
+/// `class D extends C`, `class E extends D` is a base CYCLE: tsc reports
+/// TS2506 and leaves `getBaseTypes` empty, so nothing is inherited and no
+/// member of those classes overrides anything. Without the visited set the
+/// walk goes all the way round and finds the class's OWN member as its own
+/// base member, reporting TS2612 on all three
+/// (`classExtendsItselfIndirectly`).
+fn baseClassMember(c: *Checker, origin: SymbolId, t0: TypeId, name: Atom) Error!?BaseMember {
+    // Cycle-detection stack, bounded by the same depth every other `extends`
+    // walk here uses. Local to one lookup, and seeded with the class the walk
+    // started from so `class C extends E` cannot rediscover `C`'s own members.
+    var seen: [64]SymbolId = undefined;
+    seen[0] = origin;
+    var n: usize = 1;
+    var t = t0;
+    while (n < seen.len) {
+        if (c.ts.kind(t) != .ref) return null;
+        const sym = c.ts.refSymbol(t);
+        if (!c.symFlags(sym).class) return null;
+        for (seen[0..n]) |s| if (s == sym) return null;
+        seen[n] = sym;
+        n += 1;
+        {
+            const saved = c.enterSymFile(sym);
+            defer c.restoreCtx(saved);
+            if (c.bind.membersScopeOf(c.localOf(sym))) |ms| {
+                const lo = c.bind.scope_members_start[ms];
+                const hi = c.bind.scope_members_start[ms + 1];
+                for (lo..hi) |i| {
+                    if (c.bind.member_atoms[i] != name) continue;
+                    if (memberDeclKind(c, c.toGlobal(c.bind.member_syms[i]))) |m| return m;
+                }
             }
         }
+        t = try c.baseClassRef(sym) orelse return null;
     }
-    const next = try c.baseClassRef(sym) orelse return null;
-    return baseClassMember(c, next, name, depth + 1);
+    return null;
 }
 
 /// The first class-body declaration of a member symbol, as a `BaseMember`.
