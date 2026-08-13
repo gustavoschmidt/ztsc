@@ -695,7 +695,34 @@ pub fn main(init: std.process.Init) !void {
     for (trees.items, 0..) |maybe_tree, i|
         cdirs[i] = if (maybe_tree) |tree| tree.comment_directives else .none;
 
+    // THE SYNTACTIC GATE. tsc reports the whole program's syntactic
+    // diagnostics and, if there is even one, never runs the semantic pass:
+    //
+    //     addRange(allDiagnostics, program.getSyntacticDiagnostics(...));
+    //     if (allDiagnostics.length === configFileParsingDiagnosticsLength) {
+    //         ... getOptionsDiagnostics / getGlobalDiagnostics ...
+    //         if (allDiagnostics.length === configFileParsingDiagnosticsLength)
+    //             ... getSemanticDiagnostics ...
+    //     }
+    //
+    // It is PROGRAM-wide, not per-file — verified against tsgo 7.0.2 with a
+    // two-file project (a parse error in `a.ts` suppressed a TS2322 in `b.ts`).
+    // The reason is sound rather than incidental: a file the parser could not
+    // read produces a tree the binder and checker then reason about wrongly, and
+    // its exports are wrong for every importer, so the whole program's semantic
+    // answers are suspect.
+    //
+    // Scope: only diagnostics whose class is `.syntactic` arm the gate, and only
+    // from files ztsc actually reports on. `.grammar` diagnostics carry TS1xxx
+    // codes but come from tsc's grammar-check pass, which is semantic — they are
+    // gated, not gating. `.subset` (ztsc's "not supported yet") never gates: tsc
+    // parses that construct happily, so there is no gate of tsc's to mirror and
+    // arming one would silently stop checking a project over a missing feature.
+    // Lib and `skipLibCheck`-suppressed `.d.ts` files are excluded for the same
+    // reason their diagnostics are: a parser-subset gap there is not evidence
+    // about the user's code.
     var parse_diags: usize = 0;
+    var syntactic_error = false;
     for (trees.items, 0..) |maybe_tree, i| {
         const tree = maybe_tree orelse continue;
         total_tokens += tree.tokens.len();
@@ -704,7 +731,30 @@ pub fn main(init: std.process.Init) !void {
         node_bytes += tree.nodeBytes();
         extra_bytes += tree.extraBytes();
         ast_token_bytes += tree.tokens.byteSize();
-        if (!is_lib[i] and !dts_skipped[i]) parse_diags += tree.diagnostics.len;
+        if (is_lib[i] or dts_skipped[i]) continue;
+        for (tree.diagnostics) |d| {
+            switch (d.code.class()) {
+                .syntactic => {
+                    syntactic_error = true;
+                    parse_diags += 1;
+                },
+                .subset => parse_diags += 1,
+                .grammar => {},
+            }
+        }
+    }
+    // A grammar diagnostic is semantic, so it is only counted (and only
+    // reported) when the gate is open. Second pass because the gate is not known
+    // until every file has been seen.
+    if (!syntactic_error) {
+        for (trees.items, 0..) |maybe_tree, i| {
+            const tree = maybe_tree orelse continue;
+            if (is_lib[i] or dts_skipped[i]) continue;
+            for (tree.diagnostics) |d| {
+                if (d.code.class() != .grammar) continue;
+                if (!cdirs[i].suppresses(d.span.start)) parse_diags += 1;
+            }
+        }
     }
 
     var total_symbols: usize = 0;
@@ -724,7 +774,7 @@ pub fn main(init: std.process.Init) !void {
         bind_scope_bytes += b.scopeBytes();
         bind_flow_bytes += b.flowBytes();
         bind_record_bytes += b.recordBytes();
-        if (is_lib[i] or dts_skipped[i]) continue;
+        if (is_lib[i] or dts_skipped[i] or syntactic_error) continue;
         for (b.diagnostics) |d| {
             if (!cdirs[i].suppresses(d.span.start)) bind_diags += 1;
         }
@@ -732,7 +782,7 @@ pub fn main(init: std.process.Init) !void {
 
     var link_diags: usize = 0;
     for (links, 0..) |*l, i| {
-        if (is_lib[i] or dts_skipped[i]) continue;
+        if (is_lib[i] or dts_skipped[i] or syntactic_error) continue;
         for (l.diags) |d| {
             if (!cdirs[i].suppresses(d.span.start)) link_diags += 1;
         }
@@ -756,6 +806,7 @@ pub fn main(init: std.process.Init) !void {
     for (tasks) |*t| {
         const ck = t.result orelse continue;
         for (ck.diagnostics) |d| {
+            if (syntactic_error) break;
             if (is_lib[d.file] or dts_skipped[d.file]) continue;
             if (cdirs[d.file].suppresses(d.span.start)) continue;
             check_diags += 1;
@@ -846,7 +897,15 @@ pub fn main(init: std.process.Init) !void {
         // Parser diagnostics: those with a tsc analogue (e.g. TS1206) render
         // with their code and sort into the merged stream; the rest keep their
         // own messages.
+        const cd = cdirs[i];
         for (tree.diagnostics) |d| {
+            // A grammar diagnostic (TS1274, TS1206, TS5076, ...) is one of
+            // tsc's SEMANTIC diagnostics despite its TS1xxx number, so the
+            // syntactic gate and the comment directives both apply to it.
+            if (d.code.class() == .grammar) {
+                if (syntactic_error) continue;
+                if (cd.suppresses(d.span.start)) continue;
+            }
             const ts = d.code.tsCode();
             if (ts != 0) {
                 try merged.append(gpa, .{ .code = ts, .start = d.span.start, .end = d.span.end, .msg = d.message() });
@@ -857,11 +916,12 @@ pub fn main(init: std.process.Init) !void {
         // Bind, link and check diagnostics are *semantic*, so a `@ts-nocheck`
         // file pragma or a preceding `@ts-ignore`/`@ts-expect-error` drops
         // them (tsc excludes exactly these three from a `@ts-nocheck` file and
-        // filters the same set through the comment-directive map). Parser
-        // diagnostics above are syntactic and always survive.
-        const cd = cdirs[i];
+        // filters the same set through the comment-directive map), and so does
+        // a syntactic error anywhere in the program (see the gate above).
+        // Syntactic parser diagnostics survive both.
         if (binds.items[i]) |b| {
             for (b.diagnostics) |d| {
+                if (syntactic_error) break;
                 if (cd.suppresses(d.span.start)) continue;
                 const ts = d.code.tsCode();
                 if (ts != 0) {
@@ -871,14 +931,19 @@ pub fn main(init: std.process.Init) !void {
                 }
             }
         }
-        for (links[i].diags) |d| {
-            if (cd.suppresses(d.span.start)) continue;
-            try merged.append(gpa, .{ .code = d.code, .start = d.span.start, .end = d.span.end, .msg = d.msg });
+        if (!syntactic_error) {
+            for (links[i].diags) |d| {
+                if (cd.suppresses(d.span.start)) continue;
+                try merged.append(gpa, .{ .code = d.code, .start = d.span.start, .end = d.span.end, .msg = d.msg });
+            }
         }
+        // The owning checker's cursor is advanced past this file either way, so
+        // later files stay aligned with their own diagnostics under the gate.
         const owner = file_owner[i];
         if (tasks[owner].result) |ck| {
             var cur = cursors[owner];
             while (cur < ck.diagnostics.len and ck.diagnostics[cur].file == i) : (cur += 1) {
+                if (syntactic_error) continue;
                 const d = ck.diagnostics[cur];
                 if (cd.suppresses(d.span.start)) continue;
                 try merged.append(gpa, .{ .code = d.code, .start = d.span.start, .end = d.span.end, .msg = d.msg });

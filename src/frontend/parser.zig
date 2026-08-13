@@ -1628,7 +1628,7 @@ const Parser = struct {
                     .data = .{ .lhs = key_expr, .rhs = target },
                 }));
             } else {
-                try p.fail(.expected_property_name);
+                try p.fail(.expected_binding_pattern_property);
                 if (p.curIdx() == before) break;
             }
             if (try p.eat(.comma) == null and p.curTag() != .r_brace) {
@@ -1673,10 +1673,15 @@ const Parser = struct {
         defer p.scratch.shrinkRetainingCapacity(top);
         while (p.curTag() != .r_brace and p.curTag() != .eof) {
             const before = p.curIdx();
+            const diags_before = p.diags.items.len;
             if (try p.eat(.semicolon) != null) continue;
             try p.pushScratch(try p.parseClassMember());
             if (p.curIdx() == before) {
-                try p.errAtCur(.expected_class_member);
+                // The member parse consumed nothing. If it already said why
+                // (a member-name failure reports TS1068 at this very token),
+                // do not say it a second time — tsc reports one diagnostic
+                // here, and a duplicate key is a false positive.
+                if (p.diags.items.len == diags_before) try p.errAtCur(.expected_class_member);
                 _ = try p.bump();
             }
         }
@@ -1817,7 +1822,9 @@ const Parser = struct {
                 if (isNameLike(p.curTag())) {
                     name_tok = try p.bump();
                 } else {
-                    try p.fail(.expected_property_name);
+                    // A CLASS member name: tsc's `parseClassElement` answers
+                    // TS1068 here, not the object-literal TS1136.
+                    try p.fail(.expected_class_member);
                     return p.errorNode();
                 }
             },
@@ -4059,11 +4066,15 @@ const Parser = struct {
         defer p.scratch.shrinkRetainingCapacity(top);
         while (p.curTag() != .r_brace and p.curTag() != .eof) {
             const before = p.curIdx();
+            const diags_before = p.diags.items.len;
             try p.pushScratch(try p.parseTypeMember());
             // Separators: `;` or `,`, or just a newline.
             _ = try p.eat(.semicolon) orelse try p.eat(.comma);
             if (p.curIdx() == before) {
-                try p.errAtCur(.expected_type_member);
+                // `parseTypeMember` already reported TS1131 at this token when
+                // it failed on the member name; one diagnostic per token is
+                // what tsc emits, so do not double it.
+                if (p.diags.items.len == diags_before) try p.errAtCur(.expected_type_member);
                 _ = try p.bump();
             }
         }

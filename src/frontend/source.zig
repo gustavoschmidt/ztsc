@@ -206,7 +206,19 @@ pub const Source = struct {
     }
 
     /// Map a byte offset to zero-based line/column via binary search.
+    /// tsc's `getLineAndCharacterOfPosition`. A file ending in a line break has
+    /// one more LINE START than it has lines of text: tsc's `computeLineStarts`
+    /// records the offset after every break unconditionally, so the end-of-file
+    /// offset lands on a final empty line. `line_starts` deliberately omits that
+    /// entry (`lineCount` is a count of lines with text, which is what the
+    /// throughput reports mean), so the EOF offset is special-cased here instead
+    /// — otherwise every diagnostic anchored at EOF (`'}' expected`,
+    /// `'catch' or 'finally' expected`, an unterminated comment) reports one
+    /// line short of where tsc puts it.
     pub fn lineCol(s: *const Source, offset: u32) LineCol {
+        if (offset >= s.bytes.len and s.bytes.len > 0 and s.bytes[s.bytes.len - 1] == '\n') {
+            return .{ .line = @intCast(s.line_starts.len), .col = offset - @as(u32, @intCast(s.bytes.len)) };
+        }
         const line = lineOfOffset(s.line_starts, offset);
         return .{ .line = line, .col = offset - s.line_starts[line] };
     }
@@ -277,6 +289,27 @@ test "line table: no trailing newline" {
     var src = try Source.fromBytes(arena.allocator(), "t.ts", text);
     try std.testing.expectEqual(@as(u32, 2), src.lineCount());
     try std.testing.expectEqual(LineCol{ .line = 1, .col = 0 }, src.lineCol(2));
+}
+
+test "line table: the EOF offset of a newline-terminated file is its own line" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // tsc reports `try { }\n` + EOF as 2:1, not 1:9 — the file has one line of
+    // text but two line STARTS, and the diagnostic sits on the second.
+    var src = try Source.fromBytes(arena.allocator(), "t.ts", "try { }\n");
+    try std.testing.expectEqual(@as(u32, 1), src.lineCount());
+    try std.testing.expectEqual(LineCol{ .line = 0, .col = 7 }, src.lineCol(7));
+    try std.testing.expectEqual(LineCol{ .line = 1, .col = 0 }, src.lineCol(8));
+    // Several trailing breaks each open a line; the last one holds EOF.
+    var two = try Source.fromBytes(arena.allocator(), "t.ts", "a\n\n");
+    try std.testing.expectEqual(LineCol{ .line = 1, .col = 0 }, two.lineCol(2));
+    try std.testing.expectEqual(LineCol{ .line = 2, .col = 0 }, two.lineCol(3));
+    // Without a trailing break EOF stays on the last line of text.
+    var bare = try Source.fromBytes(arena.allocator(), "t.ts", "a\nb");
+    try std.testing.expectEqual(LineCol{ .line = 1, .col = 1 }, bare.lineCol(3));
+    // An empty file has no break to open a line.
+    var empty = try Source.fromBytes(arena.allocator(), "t.ts", "");
+    try std.testing.expectEqual(LineCol{ .line = 0, .col = 0 }, empty.lineCol(0));
 }
 
 test "span length" {
