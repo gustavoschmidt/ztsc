@@ -61,10 +61,24 @@ pub const max_source_len: usize = (1 << 31) - 1;
 /// elements `my-widget`). Returns the byte offset just past the name.
 /// Used only by the parser's `rescanJsxName` — plain scanning still lexes
 /// `-` as subtraction, so non-JSX code is untouched.
+///
+/// Spans exactly what `identifierRest` spans, plus `-`: an identifier may
+/// carry `\uXXXX` / `\u{H+}` escapes and non-ASCII bytes, and a name whose
+/// FIRST character is one of those (`<\u{0061}-b>`) must still advance. A
+/// plain `isIdentCont` loop stops dead on the leading backslash and returns
+/// `at_index`, which handed the parser a zero-length token and rewound the
+/// scanner onto it — an infinite loop, not a diagnostic.
 pub fn scanJsxName(src: []const u8, at_index: u32) u32 {
-    var i = at_index;
-    while (i < src.len and (isIdentCont(src[i]) or src[i] == '-')) : (i += 1) {}
-    return i;
+    var s = Scanner{ .src = src, .index = at_index };
+    while (s.index < src.len) {
+        const c = src[s.index];
+        if (isIdentCont(c) or c >= 0x80 or c == '-') {
+            s.index += 1;
+        } else if (c == '\\') {
+            if (!s.consumeIdentifierEscape()) break;
+        } else break;
+    }
+    return s.index;
 }
 
 /// Scan a JSX attribute's quoted value starting at the quote at `at`,

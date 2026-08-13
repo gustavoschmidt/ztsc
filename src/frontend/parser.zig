@@ -365,6 +365,12 @@ const Parser = struct {
         const norm_end = scanner.tokenEnd(p.src, t.tag, t.start);
         if (norm_end >= p.src.len or p.src[norm_end] != '-') return;
         const end = scanner.scanJsxName(p.src, t.start);
+        // A merge may only ever EXTEND the token. Anything else rewinds
+        // `p.scn.index` to at or before where this token already started, and
+        // the parser re-reads it forever instead of making progress. There is
+        // no input for which shortening is the right answer, so leaving the
+        // token alone is both the safe and the correct fallback.
+        if (end <= norm_end) return;
         p.la[0] = .{ .tag = .jsx_name, .start = t.start, .end = end, .newline_before = t.newline_before };
         p.scn.index = end;
         p.la_len = 1;
@@ -5151,6 +5157,60 @@ test "jsx parses cleanly in tsx mode" {
         const tree = try parseOpts(arena.allocator(), "const a = x < y;", .{});
         try testing.expectEqual(@as(usize, 0), tree.diagnostics.len);
     }
+}
+
+test "jsx: a hyphenated name whose identifier part is escaped terminates" {
+    // `rescanJsxName` merges `<name>-<name>` runs into one token by rescanning
+    // from the token's START. `scanJsxName` used a bare `isIdentCont` loop, so
+    // a name whose first character is a `\u` escape stopped on the backslash
+    // and returned the start offset: a ZERO-LENGTH token, with the scanner
+    // rewound onto it, which the parser then re-read forever. Only the
+    // hyphenated forms hang — without a `-` the merge never runs — so the
+    // escaped-but-unhyphenated cases are here to hold the pair together.
+    //
+    // These are all errors for tsc (TS17021, "Unicode escape sequence cannot
+    // appear here"), which ztsc does not report; what is under test is that
+    // parsing TERMINATES and consumes the name, not the diagnostic.
+    const cases = [_][]const u8{
+        "; <\\u0061-b></a-b>;",
+        "; <\\u{0061}-b></a-b>;",
+        "; <a-\\u0063></a-c>;",
+        "; <a-\\u{0063}></a-c>;",
+        "; <\\u0061></a>;",
+        "; <\\u{0061}></a>;",
+        "; <Comp\\u{0061} x={12} />;",
+        "; <x.\\u0076ideo />;",
+        ";<video data-\\u0076ideo />;",
+        ";<video \\u0073rc=\"\" />;",
+        // A malformed escape must not merge either: `\u` with no digits is
+        // not an identifier escape, so the name is left exactly as lexed.
+        "; <\\u-b></a-b>;",
+        "; <\\-b></a-b>;",
+    };
+    for (cases) |src| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const tree = try parseOpts(arena.allocator(), src, .{ .jsx = true });
+        // Termination is the assertion; the tree must still cover the source.
+        try testing.expect(tree.nodes.len > 0);
+    }
+}
+
+test "scanJsxName spans escapes, non-ASCII and hyphens, and always advances" {
+    // Exactly `identifierRest`'s span plus `-`.
+    try testing.expectEqual(@as(u32, 5), scanner.scanJsxName("a-b-c", 0));
+    try testing.expectEqual(@as(u32, 8), scanner.scanJsxName("data-foo", 0));
+    // A leading escape is consumed, and so is the `-name` run after it.
+    try testing.expectEqual(@as(u32, 8), scanner.scanJsxName("\\u0061-b", 0));
+    try testing.expectEqual(@as(u32, 10), scanner.scanJsxName("\\u{0061}-b", 0));
+    // An escape in the middle, and a non-ASCII identifier byte.
+    try testing.expectEqual(@as(u32, 8), scanner.scanJsxName("a-\\u0063", 0));
+    try testing.expectEqual(@as(u32, 5), scanner.scanJsxName("caf\xC3\xA9", 0));
+    // A malformed escape stops the scan rather than consuming a partial one.
+    try testing.expectEqual(@as(u32, 0), scanner.scanJsxName("\\u-b", 0));
+    // Stopping at the start is exactly the case `rescanJsxName` must refuse to
+    // install, since it would rewind the scanner onto the same token.
+    try testing.expectEqual(@as(u32, 0), scanner.scanJsxName("+b", 0));
 }
 
 test "jsx name rescan does not disturb subtraction lexing" {
