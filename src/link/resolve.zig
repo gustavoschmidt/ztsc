@@ -349,11 +349,21 @@ pub const ResolveCache = struct {
 
     /// The realpath of `dir` (cached, arena-owned) for re-relativizing canonical
     /// paths, or null if the OS call failed (then canonical paths stay absolute).
+    ///
+    /// `Dir.realPath` fcntls the directory HANDLE, and the CLI's base directory
+    /// is `Io.Dir.cwd()`, whose handle is the sentinel `AT.FDCWD` — not a real
+    /// descriptor, so the fcntl fails with EBADF and every canonicalized
+    /// `node_modules` path used to stay absolute for the whole (normal) run.
+    /// `realPathFile(".")` answers for both shapes: libc `realpath` for the
+    /// cwd sentinel, `openat`+fcntl for a real handle. `realPath` is still
+    /// tried first — it is one syscall and needs no path buffer.
     fn dirRealBase(rc: *ResolveCache, io: Io, dir: Io.Dir) ?[]const u8 {
         if (!rc.real_base_done) {
             rc.real_base_done = true;
             var buf: [std.fs.max_path_bytes]u8 = undefined;
             if (dir.realPath(io, &buf)) |n| {
+                rc.real_base = rc.arena.dupe(u8, buf[0..n]) catch null;
+            } else |_| if (dir.realPathFile(io, ".", &buf)) |n| {
                 rc.real_base = rc.arena.dupe(u8, buf[0..n]) catch null;
             } else |_| {}
         }
