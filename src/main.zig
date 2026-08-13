@@ -158,7 +158,7 @@ const Cli = struct {
     /// A diagnostic instrument; pair with `--checkers=1`.
     inst_profile: bool = false,
     /// `--inst-focus=<type-id>`: restrict the profile's per-type histogram to
-    /// one top-level substitution root (see `prof.focus_root`). Implies
+    /// one top-level substitution root (see `checker.Options.profile_focus_root`). Implies
     /// `--inst-profile`.
     inst_focus: u32 = 0,
     /// `--eager-members`: materialize an interface/class reference's whole
@@ -388,15 +388,19 @@ pub fn main(init: std.process.Init) !void {
         },
     };
 
-    // Write-once, before any checker thread exists (see `prof.profile_on`).
-    checker.prof_zig.profile_on = cli.inst_profile;
-    checker.prof_zig.focus_root = cli.inst_focus;
-    checker.lazy_zig.lazy_members_on = !cli.eager_members;
-    checker.lazy_zig.stats_on = cli.lazy_stats;
-    checker.prof_zig.decl_prof_on = cli.decl_profile or cli.dup_profile;
-    checker.prof_zig.dup_prof_on = cli.dup_profile;
-    checker.memprof_zig.mem_prof_on = cli.mem_profile;
-    checker.memo_zig.bits_override = cli.inst_memo_bits;
+    // This run's checker options: built once here, then copied by value into
+    // every checker instance (see `checker.Options`). Instruments and bisect
+    // legs only — nothing here changes an un-flagged run.
+    const check_opts: checker.Options = .{
+        .profile = cli.inst_profile,
+        .profile_focus_root = cli.inst_focus,
+        .decl_prof = cli.decl_profile or cli.dup_profile,
+        .dup_prof = cli.dup_profile,
+        .lazy_members = !cli.eager_members,
+        .lazy_stats = cli.lazy_stats,
+        .mem_prof = cli.mem_profile,
+        .inst_memo_bits = cli.inst_memo_bits,
+    };
 
     if (cli.help) {
         try out.print("{s}", .{usage});
@@ -614,6 +618,7 @@ pub fn main(init: std.process.Init) !void {
                 .owned = owned[k],
                 .base = base_store,
                 .inst_cache = !cli.no_inst_cache,
+                .opts = check_opts,
                 // Only when the surface is not divisible. On a program whose
                 // work DOES partition (the `multi` corpus, ratio 1.00), the
                 // whole-program estimate over-reserves ~4x and costs peak RSS
@@ -918,7 +923,7 @@ pub fn main(init: std.process.Init) !void {
         defer dump_arena.deinit();
         const all_files = try dump_arena.allocator().alloc(modules.FileId, n_files);
         for (all_files, 0..) |*f, i| f.* = @intCast(i);
-        _ = checker.checkFilesAndDump(dump_arena.allocator(), io, gpa, &interner, prog, all_files, null, true, 0, out) catch {};
+        _ = checker.checkFilesAndDump(dump_arena.allocator(), io, gpa, &interner, prog, all_files, null, true, 0, check_opts, out) catch {};
     }
 
     try out.print("ztsc: loaded {d} file(s) ({d} from CLI), {d} lines, {d} bytes, {d} tokens, {d} nodes, {d} symbols, {d} parse error(s), {d} bind error(s), {d} link error(s), {d} check error(s) ({d} worker(s), {d} checker(s))\n", .{
