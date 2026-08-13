@@ -435,8 +435,7 @@ pub fn inferJsxTargs(c: *Checker, sig: TypeId, tps: []const u32, e: ast.JsxEleme
             if (constraint != types.no_type and !bare_outer and !any_index_ok and
                 !try c.isAssignable(candidates[i], constraint))
             {
-                var fell_back = false;
-                args_buf[i] = try c.clampToConstraint(candidates[i], constraint, &fell_back);
+                args_buf[i] = (try c.clampToConstraint(candidates[i], constraint)).ty;
             }
         } else if (c.typeParamHasDefault(tp)) {
             args_buf[i] = try c.instantiate(try c.typeParamDefault(tp), prov);

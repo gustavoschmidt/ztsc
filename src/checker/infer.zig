@@ -1634,8 +1634,7 @@ pub fn inferTypeArgs(
             if (constraint != types.no_type and !bare_outer and
                 !try c.isAssignable(candidates[i], constraint))
             {
-                var fell_back = false;
-                out[i] = try c.clampToConstraint(out[i], constraint, &fell_back);
+                out[i] = (try c.clampToConstraint(out[i], constraint)).ty;
             }
         } else if (c.typeParamHasDefault(tp)) {
             // Uninferable param with a default takes it, instantiated under
@@ -1756,9 +1755,13 @@ fn clampSeedToConstraint(c: *Checker, tp: u32, tp_syms: []const u32, sofar: []co
     }
     if (try c.containsFreeTypeParam(con, &.{})) return cand;
     if (try c.isAssignable(cand, con)) return cand;
-    var fell_back = false;
-    return c.clampToConstraint(cand, con, &fell_back);
+    return (try c.clampToConstraint(cand, con)).ty;
 }
+
+/// What `clampToConstraint` answered: the type to use for the inference, and
+/// whether the FULL constraint clamp was taken rather than the
+/// constraint-satisfying subset of a union candidate.
+pub const Clamped = struct { ty: TypeId, fell_back: bool };
 
 /// A candidate that violates its param's constraint is normally clamped to
 /// the constraint. When the candidate is a UNION, prefer the
@@ -1768,9 +1771,9 @@ fn clampSeedToConstraint(c: *Checker, tp: u32, tp_syms: []const u32, sofar: []co
 /// `Dispatch<SetStateAction<E>>`, contributing `E | ((p:E)=>E)` to `T`),
 /// which the covariant candidate (`E` from `value`) should win over. tsc
 /// keeps covariant and contravariant candidates separate and prefers
-/// covariant; this approximates that at the resolution seam. `fell_back` is
-/// set only when the full constraint clamp is used.
-pub fn clampToConstraint(c: *Checker, cand: TypeId, constraint: TypeId, fell_back: *bool) Error!TypeId {
+/// covariant; this approximates that at the resolution seam. The answer's
+/// `fell_back` is set only when the full constraint clamp is used.
+pub fn clampToConstraint(c: *Checker, cand: TypeId, constraint: TypeId) Error!Clamped {
     if (c.ts.kind(cand) == .union_type) {
         const members = try c.memberList(cand);
         var keep: std.ArrayList(TypeId) = .empty;
@@ -1780,11 +1783,10 @@ pub fn clampToConstraint(c: *Checker, cand: TypeId, constraint: TypeId, fell_bac
         }
         if (keep.items.len > 0 and keep.items.len < members.len) {
             const filtered = try c.ts.makeUnion(c.scratch(), keep.items);
-            if (try c.isAssignable(filtered, constraint)) return filtered;
+            if (try c.isAssignable(filtered, constraint)) return .{ .ty = filtered, .fell_back = false };
         }
     }
-    fell_back.* = true;
-    return constraint;
+    return .{ .ty = constraint, .fell_back = true };
 }
 
 /// Is this candidate one of the *literal* shapes tsc's
