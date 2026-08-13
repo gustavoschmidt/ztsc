@@ -95,6 +95,22 @@ fn keyofObjectTableUncached(c: *Checker, r: TypeId) Error!TypeId {
     return c.ts.makeUnion(c.scratch(), parts.items);
 }
 
+/// The answer for an operand whose key set cannot be read right now: its
+/// structure is still materializing further down this stack, or the walk has
+/// come back around to it.
+///
+/// A `.ref` DEFERS. It is NOT the same thing as `any`: answering the full
+/// `string | number | symbol` domain bakes that answer into whatever composite
+/// is being built — react-hook-form's `Merge<A, B>` interned `keyof A & keyof
+/// B` as `("message"|…) & (string|number|symbol)`, so every key took the "in
+/// both" branch and `FieldErrors<T>[k]` came out with `unknown` members.
+/// Deferring keeps `keyof <ref>` reducible. Anything else has no deferred form
+/// to fall back to and answers the whole key domain.
+fn unreadableKeySet(c: *Checker, t: TypeId) Error!TypeId {
+    if (c.ts.kind(t) == .ref) return c.ts.makeKeyof(t);
+    return c.makeUnion2(types.string_type, c.makeUnion2(types.number_type, types.symbol_type) catch unreachable);
+}
+
 /// keyof T for the resolved structural type (object-ish only; the v0.0.1
 /// subset has non-generic keys).
 pub fn keyofType(c: *Checker, t: TypeId) Error!TypeId {
@@ -113,22 +129,31 @@ pub fn keyofType(c: *Checker, t: TypeId) Error!TypeId {
     // declarations, and reading them there is what makes this answer
     // independent of who asked first. See `keyofInProgressRef`.
     if (try c.keyofInProgressRef(t)) |k| return k;
+    // This operand's key set is already being computed further up the stack.
+    // A recursive conditional alias can resolve to a union that has the alias
+    // itself as a constituent, and the `.union_type` arm below asks for each
+    // constituent's key set in turn — so the walk comes straight back here on
+    // the same type and recursed until the stack died. Its key set is exactly
+    // as unreadable as a structure still materializing, and gets the same
+    // answer.
+    // …and the same answer once the walk is deeper than any real key set
+    // nests. The laps are not always the same type: each expansion of a
+    // recursive conditional alias mints a fresh one, so no visited set closes
+    // it and only a depth bound can. See `max_keyof_depth`.
+    if (std.mem.indexOfScalar(TypeId, c.keyof_stack.items, t) != null or
+        c.keyof_stack.items.len >= checker_zig.max_keyof_depth)
+    {
+        return unreadableKeySet(c, t);
+    }
+    try c.keyof_stack.append(c.cm(), t);
+    defer _ = c.keyof_stack.pop();
     const r = try c.resolveStructural(t);
     switch (c.ts.kind(r)) {
-        .err => {
-            // A `.ref` that does not resolve to a structure is NOT the same
-            // thing as `any`: it is a reference we cannot read the key set of
-            // yet (a self-recursive alias whose body is still materializing
-            // resolves to `error` through `expandRef`'s cycle cut). Answering
-            // the full `string | number | symbol` domain bakes that answer
-            // into whatever composite is being built — react-hook-form's
-            // `Merge<A, B>` interned `keyof A & keyof B` as
-            // `("message"|…) & (string|number|symbol)`, so every key took the
-            // "in both" branch and `FieldErrors<T>[k]` came out with `unknown`
-            // members. Deferring keeps `keyof <ref>` reducible.
-            if (c.ts.kind(t) == .ref) return c.ts.makeKeyof(t);
-            return c.makeUnion2(types.string_type, c.makeUnion2(types.number_type, types.symbol_type) catch unreachable);
-        },
+        // A `.ref` that does not resolve to a structure is a reference whose
+        // key set we cannot read yet — a self-recursive alias whose body is
+        // still materializing resolves to `error` through `expandRef`'s cycle
+        // cut.
+        .err => return unreadableKeySet(c, t),
         // `keyof any` AND `keyof never` are both the whole key domain — the
         // last line of tsc's `getIndexType` tests them together
         // (`type.flags & (TypeFlags.Any | TypeFlags.Never) ? stringNumberSymbolType`),

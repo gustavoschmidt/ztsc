@@ -466,6 +466,19 @@ pub const scratch_retain_limit = 256 * 1024;
 /// far below the worker-thread stack-overflow depth, leaving a wide safety
 /// margin on the smallest (main-thread) stack.
 pub const max_relation_depth = 900;
+/// How deep `keyofType`'s own recursion may nest before the operand's key set
+/// is treated as unreadable. `keyof` over a recursive conditional alias
+/// expands the alias to ask each constituent for its keys, and each expansion
+/// is a FRESH top-level instantiation — `instantiateId` resets `inst_depth` at
+/// every entry — so the instantiation budget never accumulates across the
+/// laps and cannot close this walk. Type-level arithmetic (`TupleOf`,
+/// `Multiply`, tuple-recursive `Add`) drives it thousands deep.
+///
+/// Two orders of magnitude above real nesting, which is a union of unions a
+/// few levels deep. The answer at the bound is `unreadableKeySet` — the same
+/// answer the operand gets when its structure is still materializing — so it
+/// stays a deferral, not an invented key set.
+pub const max_keyof_depth = 100;
 /// How many times ONE generic may reappear on the relation's live source or
 /// target stack, each time as a strictly LATER instantiation of itself, before
 /// the pair is assumed related — tsc's `isDeeplyNestedType` maxDepth.
@@ -1229,6 +1242,13 @@ pub const Checker = struct {
     /// the memo cannot break it. tsc's `pushTypeResolution(tp, Constraint)`:
     /// a parameter already on the stack answers "no constraint".
     tp_constraint_stack: std.ArrayListUnmanaged(SymbolId) = .empty,
+    /// Operands whose key set `keyofType` is computing, innermost last. A
+    /// recursive conditional alias can resolve to a union that lists the alias
+    /// itself among its constituents; the union arm asks each constituent for
+    /// its key set, so the walk returns to the same type. Re-entry answers
+    /// `unreadableKeySet` — the same answer a structure still materializing
+    /// gets, which is what this is.
+    keyof_stack: std.ArrayListUnmanaged(TypeId) = .empty,
     /// Object types of the single-member indexed accesses currently in flight
     /// (`C["m"]` taken while `C`'s own table is materializing). A GENERIC one
     /// is an access tsc defers — it answers with an unresolved
