@@ -2347,8 +2347,17 @@ const Binder = struct {
         const data = b.tree.extraData(ast.ImportEquals, d.lhs);
         if (b.cur_scope == file_scope) b.saw_module_syntax = true;
         const local = try b.atomOfToken(data.name_token);
-        const sym = try b.declare(b.cur_scope, local, .import_value, node, data.name_token, .{});
-        if (data.flags & ast.Flags.exported != 0) b.sym_flags.items[sym].exported = true;
+        // `export import X = …` carries its `export` as a MODIFIER FLAG — the
+        // parser does not wrap it in an `export_decl` — so `noteExport` has to
+        // be armed by hand. Without the record the alias was marked `exported`
+        // for namespace-member lookup but published nothing at file scope:
+        // `export import Alias = Inner` in a module was invisible to every
+        // importer (TS2305 "has no exported member"). preact's jsx-runtime
+        // publishes its whole `JSX` namespace exactly this way.
+        const saved_exporting = b.exporting_node;
+        if (data.flags & ast.Flags.exported != 0) b.exporting_node = node;
+        defer b.exporting_node = saved_exporting;
+        _ = try b.declare(b.cur_scope, local, .import_value, node, data.name_token, .{});
         if (data.module_token != 0) {
             const module = try b.moduleAtom(data.module_token);
             if (module != 0) {

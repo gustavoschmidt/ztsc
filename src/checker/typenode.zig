@@ -59,6 +59,7 @@ pub const NsContainer = typespace_zig.NsContainer;
 pub const ambientIndex = typespace_zig.ambientIndex;
 pub const augmentModuleTypeSym = typespace_zig.augmentModuleTypeSym;
 pub const containerFromImportTarget = typespace_zig.containerFromImportTarget;
+pub const importEqualsEntityContainer = typespace_zig.importEqualsEntityContainer;
 pub const containerMemberSym = typespace_zig.containerMemberSym;
 pub const enumSymFromImportTarget = typespace_zig.enumSymFromImportTarget;
 pub const enumSymOfQualifier = typespace_zig.enumSymOfQualifier;

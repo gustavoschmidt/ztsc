@@ -31,6 +31,7 @@ const containsTypeParam = @import("enums.zig").containsTypeParam;
 const destructure = @import("destructure.zig");
 const finalizeInferredReturn = @import("names.zig").finalizeInferredReturn;
 const hasValueMeaning = @import("names.zig").hasValueMeaning;
+const implicit_any = @import("implicit_any.zig");
 const modvalue = @import("modvalue.zig");
 const narrowByCondition = @import("flow.zig").narrowByCondition;
 const widenLiteral = @import("names.zig").widenLiteral;
@@ -53,7 +54,7 @@ pub fn signatureOfProtoCtx(
     node: Node,
     proto_idx: u32,
     is_method: bool,
-    report_implicit: bool,
+    report_implicit0: bool,
     ctx_sig: TypeId,
 ) Error!TypeId {
     if (c.sig_cache.get(c.nodeKey(node))) |cached| {
@@ -63,6 +64,15 @@ pub fn signatureOfProtoCtx(
     const saved_scope = c.cur_scope;
     defer c.cur_scope = saved_scope;
     if (try c.scopeOf(node)) |s| c.cur_scope = s;
+    // tsc suppresses the whole implicit-'any' family on a `private` member of
+    // an ambient class (`declare class C { private m(a); }`, and every such
+    // member in a `.d.ts`): its parameter types are unobservable from
+    // outside, so no annotation is demanded. Decided after the scope switch —
+    // ambient-ness is read off the enclosing scope chain.
+    const report_implicit = report_implicit0 and !implicit_any.isPrivateAmbientMember(c, node);
+    // A SET accessor's parameter takes its type from the paired GET
+    // accessor's return type, not from anything at the setter itself.
+    const setter_ctx = try setterParamTypeFromGetter(c, node, proto);
 
     // Type parameters (global symbol ids in the signature type).
     var tps: std.ArrayList(u32) = .empty;
@@ -117,7 +127,7 @@ pub fn signatureOfProtoCtx(
                 continue;
             }
         }
-        const p = try paramInfo(c, pn, pi, ctx_sig, report_implicit);
+        const p = try paramInfo(c, pn, pi, ctx_sig, report_implicit, setter_ctx);
         // A parameter with an initializer (`x = 'grey'`) is optional at the
         // call site and accepts `undefined` — passing `undefined` triggers
         // the default (tsc's `getTypeOfParameter` adds the optional type).
@@ -261,6 +271,9 @@ pub fn signatureOfProtoCtx(
         ret = types.any_type;
     } else if (c.tree.nodeData(node).rhs == 0 and c.nodeTag(node) != .function_type and c.nodeTag(node) != .method_signature) {
         ret = types.any_type; // overload signature without annotation
+    }
+    if (proto.return_type == 0 and report_implicit and c.prog.no_implicit_any) {
+        try implicit_any.reportMissingReturnType(c, node, proto);
     }
 
     // TS 5.5 inferred type predicate: a boolean-returning single-param
@@ -491,7 +504,54 @@ fn paramInitCanBeUndefined(c: *Checker, pn: Node) Error!bool {
     return (try c.removeUndefined(it)) != it;
 }
 
-fn paramInfo(c: *Checker, pn: Node, index: u32, ctx_sig: TypeId, report_implicit: bool) Error!types.Param {
+/// tsc's `getTypeForVariableLikeDeclaration` arm for a SET-accessor
+/// parameter: the parameter's type is the paired GET accessor's return type
+/// (annotated or inferred), never anything written at the setter. `no_type`
+/// when this is not a setter, or when the property has no getter — a LONE
+/// setter keeps its own parameter, whose missing annotation is exactly the
+/// TS7006 tsc reports there.
+///
+/// Routed through `memberTypeOf` rather than the getter's signature directly:
+/// the accessor pair shares one member symbol, whose type IS the getter's
+/// return type, and going through the symbol inherits the member-type cycle
+/// guard (`get x() { return this.x; }` must terminate).
+fn setterParamTypeFromGetter(c: *Checker, node: Node, proto: ast.FnProto) Error!TypeId {
+    if (proto.flags & ast.Flags.set == 0) return types.no_type;
+    if (c.nodeTag(node) != .class_method) return types.no_type;
+    const getter = pairedGetter(c, node, proto) orelse return types.no_type;
+    const gproto = c.tree.extraData(ast.FnProto, c.tree.nodeData(getter).lhs);
+    if (gproto.return_type != 0) return c.typeFromTypeNode(gproto.return_type);
+    const gsig = try c.signatureOfProto(getter, c.tree.nodeData(getter).lhs, true, false);
+    return if (c.ts.kind(gsig) == .function) c.ts.fnReturn(gsig) else types.no_type;
+}
+
+/// The GET accessor declared alongside this SET accessor in the same class,
+/// or null. Found through the enclosing class's member LIST rather than
+/// through the shared member symbol: a setter's signature is built from
+/// several places, and only the syntax is reliably in hand at all of them.
+fn pairedGetter(c: *Checker, setter: Node, proto: ast.FnProto) ?Node {
+    var s = c.cur_scope;
+    while (c.bind.scope_kinds[s] != .class) {
+        if (s == binder.file_scope) return null;
+        s = c.bind.scope_parents[s];
+    }
+    const class_node = c.bind.scope_owners[s];
+    if (class_node == null_node or c.nodeTag(class_node) != .class_decl) return null;
+    const data = c.tree.extraData(ast.ClassData, c.tree.nodeData(class_node).lhs);
+    const want_static = proto.flags & ast.Flags.static;
+    const name = c.tokenText(c.tree.nodeMainToken(setter));
+    for (c.tree.extraRange(data.members_start, data.members_end)) |m| {
+        if (m == null_node or c.nodeTag(m) != .class_method) continue;
+        const mp = c.tree.extraData(ast.FnProto, c.tree.nodeData(m).lhs);
+        if (mp.flags & ast.Flags.get == 0) continue;
+        if (mp.flags & ast.Flags.static != want_static) continue;
+        if (!std.mem.eql(u8, c.tokenText(c.tree.nodeMainToken(m)), name)) continue;
+        return m;
+    }
+    return null;
+}
+
+fn paramInfo(c: *Checker, pn: Node, index: u32, ctx_sig: TypeId, report_implicit: bool, setter_ctx: TypeId) Error!types.Param {
     const d = c.tree.nodeData(pn);
     var name_node: Node = 0;
     var type_ann: Node = 0;
@@ -532,7 +592,9 @@ fn paramInfo(c: *Checker, pn: Node, index: u32, ctx_sig: TypeId, report_implicit
     // `build: (params?: Record<string, any>) => string`, typed `params` as
     // `{}` and every `params[name]` was a false TS7053.
     var ctx_ty: TypeId = types.no_type;
-    if (type_ann == 0 and ctx_sig != types.no_type and c.ts.kind(ctx_sig) == .function) {
+    if (type_ann == 0 and setter_ctx != types.no_type and index == 0) {
+        ctx_ty = setter_ctx;
+    } else if (type_ann == 0 and ctx_sig != types.no_type and c.ts.kind(ctx_sig) == .function) {
         if (try c.paramTypeAt(ctx_sig, index)) |ct| ctx_ty = ct;
     }
     if (type_ann != 0) {
@@ -547,6 +609,10 @@ fn paramInfo(c: *Checker, pn: Node, index: u32, ctx_sig: TypeId, report_implicit
         if (init_node != 0) _ = try c.checkExprCached(init_node, ty);
     } else if (init_node != 0) {
         ty = try c.widenLiteral(try c.checkExprCached(init_node, types.no_type));
+        // tsc's `padTupleType`: `([x, y] = [1])` pads the pattern's unfilled
+        // positions with `any`, and each padded element with no default of
+        // its own is a TS7031.
+        if (report_implicit) try implicit_any.reportPaddedTupleImplicitAny(c, name_node, init_node, ty);
         // A parameter whose NAME is an object binding pattern takes its
         // type from the initializer, but each property the pattern
         // destructures WITH A DEFAULT is optional there — the default
@@ -564,8 +630,20 @@ fn paramInfo(c: *Checker, pn: Node, index: u32, ctx_sig: TypeId, report_implicit
         // types as `any` below, only the diagnostic is gone.
         if (report_implicit and name != 0 and c.prog.no_implicit_any) {
             const tok = c.tree.nodeMainToken(name_node);
-            try c.diagFmt(7006, c.tokSpan(tok), "Parameter '{s}' implicitly has an 'any' type.", .{c.tokenText(tok)});
+            // tsc's `reportImplicitAny` picks the diagnostic off the
+            // declaration: a REST parameter gets its own, TS7019, because the
+            // type it falls to is `any[]` rather than `any` — and it is
+            // anchored at the parameter (the `...`), not at the name.
+            if (flags & types.param_flag_rest != 0) {
+                try c.diagFmt(7019, c.nodeSpan(pn), "Rest parameter '{s}' implicitly has an 'any[]' type.", .{c.tokenText(tok)});
+            } else {
+                try c.diagFmt(7006, c.tokSpan(tok), "Parameter '{s}' implicitly has an 'any' type.", .{c.tokenText(tok)});
+            }
         }
+        // A DESTRUCTURED parameter has no name to report TS7006 against: tsc
+        // builds its type out of the pattern instead and reports TS7031 at
+        // each leaf the pattern leaves as `any`.
+        if (report_implicit and name == 0) try implicit_any.reportPatternImplicitAny(c, name_node);
         ty = types.any_type;
     }
     // `x?: T` reads as T | undefined.
@@ -1120,7 +1198,7 @@ fn computeTypeOfSymbol(c: *Checker, sym: SymbolId) Error!TypeId {
         for (decls) |decl| {
             switch (c.nodeTag(decl)) {
                 .param, .param_full => {
-                    const p = try paramInfo(c, decl, 0, types.no_type, false);
+                    const p = try paramInfo(c, decl, 0, types.no_type, false, types.no_type);
                     // Pattern params: paramInfo names only identifiers;
                     // for destructured params fall through to any.
                     if (p.name != 0 and p.name == c.symNameAtom(sym)) return p.ty;
@@ -1902,7 +1980,7 @@ pub fn memberTypeOf(c: *Checker, sym: SymbolId) Error!TypeId {
                 return types.any_type;
             },
             .param, .param_full => {
-                const p = try paramInfo(c, decl, 0, types.no_type, false);
+                const p = try paramInfo(c, decl, 0, types.no_type, false, types.no_type);
                 return p.ty;
             },
             else => {},

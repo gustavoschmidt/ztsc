@@ -43,6 +43,7 @@ const TpMap = @import("enums.zig").TpMap;
 const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
 const containsAtom = @import("expr.zig").containsAtom;
 const hasTypeMeaning = @import("names.zig").hasTypeMeaning;
+const NsContainer = @import("typespace.zig").NsContainer;
 const tpIndex = @import("calls.zig").tpIndex;
 
 pub fn checkJsxElement(c: *Checker, node: Node) Error!TypeId {
@@ -75,6 +76,19 @@ pub fn checkJsxElement(c: *Checker, node: Node) Error!TypeId {
             } else {
                 try c.diagFmt(2339, c.nodeSpan(e.tag), "Property '{s}' does not exist on type 'JSX.IntrinsicElements'.", .{c.atomText(tag_atom)});
             }
+        } else {
+            // tsc's `getIntrinsicTagSymbol`: with no `JSX.IntrinsicElements`
+            // in scope the intrinsic tag's props type is the error type, and
+            // under `noImplicitAny` that is reported as TS7026 — the JSX
+            // counterpart of the implicit-'any' family. A `.tsx` file with no
+            // JSX namespace at all (no React typings, `jsx: preserve`) is the
+            // common shape; ztsc silently typed the props as "unknown target".
+            //
+            // The report is per TAG REFERENCE, not per element: tsc resolves
+            // the closing tag name independently, so `<a></a>` reports twice.
+            // Fragments (`<>…</>`) resolve no tag and never report.
+            try jsxIntrinsicImplicitAny(c, c.tree.nodeMainToken(node));
+            if (e.close_lt != 0) try jsxIntrinsicImplicitAny(c, e.close_lt);
         }
     } else {
         is_component = true;
@@ -139,6 +153,14 @@ pub fn checkJsxElement(c: *Checker, node: Node) Error!TypeId {
     return (try c.jsxNamespaceType(c.atom_Element)) orelse types.any_type;
 }
 
+/// TS7026 at one intrinsic-tag reference (`lt` = the tag's `<`), raised when
+/// `JSX.IntrinsicElements` does not resolve. Gated on `noImplicitAny` exactly
+/// like the rest of the TS70xx family.
+fn jsxIntrinsicImplicitAny(c: *Checker, lt: TokenIndex) Error!void {
+    if (!c.prog.no_implicit_any) return;
+    try c.diagFmt(7026, c.tokSpan(lt), "JSX element implicitly has type 'any' because no interface 'JSX.IntrinsicElements' exists.", .{});
+}
+
 /// Whether a JSX tag node is an intrinsic element (simple lowercase-initial
 /// identifier). Uppercase or dotted names are component values.
 pub fn isIntrinsicJsxTag(c: *Checker, tag: Node) bool {
@@ -151,50 +173,99 @@ pub fn isIntrinsicJsxTag(c: *Checker, tag: Node) bool {
 /// `JSX.IntrinsicElements`) from the global `JSX` namespace, or null when
 /// no such namespace/member exists.
 pub fn jsxNamespaceType(c: *Checker, member: Atom) Error!?TypeId {
-    const g = c.jsxNamespaceMember(member) orelse return null;
+    const g = (try c.jsxNamespaceMember(member)) orelse return null;
     return try c.namedTypeFromSymbol(g, &.{}, 0);
 }
 
 /// The (global) symbol for `JSX.<member>`, or null when the namespace or
 /// member is absent. Existence checks use this directly so generic members
 /// (e.g. `IntrinsicClassAttributes<T>`) are never instantiated bare.
-pub fn jsxNamespaceMember(c: *Checker, member: Atom) ?SymbolId {
-    const jsx_sym = switch (c.resolveSpace(c.atom_JSX, c.cur_scope, false)) {
-        .sym => |s| if (c.symFlags(s).namespace_decl) s else return c.jsxRuntimeNamespaceMember(member),
-        else => return c.jsxRuntimeNamespaceMember(member),
-    };
-    // Through `namespaceMemberSym`, so a `JSX` namespace declared in more
-    // than one file is looked up in its MERGED member index. Reaching into
-    // one declaration's body scope directly (`namespaceScopeOf` on the
-    // merged symbol's representative constituent) saw only that file's
-    // members: a project that adds its own custom elements with a script
-    // `declare namespace JSX { interface IntrinsicElements { "em-emoji":
-    // any } }` shadowed the whole React/preact `IntrinsicElements`, and
-    // every `<div>` in the project became TS2339.
-    const g = c.namespaceMemberSym(jsx_sym, member) orelse return c.jsxRuntimeNamespaceMember(member);
-    const mf = c.symFlags(g);
-    if (!(mf.exported and hasTypeMeaning(mf))) return c.jsxRuntimeNamespaceMember(member);
-    return g;
+pub fn jsxNamespaceMember(c: *Checker, member: Atom) Error!?SymbolId {
+    if (try jsxFactoryNamespaceMember(c, member)) |g| return g;
+    switch (c.resolveSpace(c.atom_JSX, c.cur_scope, false)) {
+        .sym => |s| if (try jsxNamespaceSym(c, s)) |ns| {
+            if (nsTypeMember(c, ns, member)) |g| return g;
+        },
+        else => {},
+    }
+    return try jsxRuntimeNamespaceMember(c, member);
 }
 
-/// The automatic-JSX-runtime fallback for `JSX.<member>`: under
-/// `jsx: "react-jsx"` the namespace is an *export* of the
-/// `<jsxImportSource>/jsx-runtime` module rather than a global — @types/react
-/// 19 dropped `declare global { namespace JSX }` entirely, so the global
-/// lookup above finds nothing and every intrinsic element would type its
-/// props as "unknown target" (no contextual type for `onChange={(e) => …}`,
-/// no TS2339 for a bogus tag). The driver puts that module in the program
-/// and hands its FileId over as `Program.jsx_runtime_file`.
-pub fn jsxRuntimeNamespaceMember(c: *Checker, member: Atom) ?SymbolId {
+/// The namespace a symbol that NAMES the JSX namespace denotes: itself when it
+/// is a namespace declaration, else the namespace an entity-name `import`
+/// alias stands for. preact publishes its namespace as
+/// `export import JSX = JSXInternal` (module-level, and again inside
+/// `declare global`), which is an import binding rather than a
+/// `namespace_decl`: without the second arm the whole namespace (Element,
+/// IntrinsicElements, …) resolved to nothing and every `<div>` lost its props
+/// type — then reported TS7026.
+fn jsxNamespaceSym(c: *Checker, sym: SymbolId) Error!?SymbolId {
+    if (c.symFlags(sym).namespace_decl) return sym;
+    return switch ((try c.importEqualsEntityContainer(sym)) orelse return null) {
+        .ns => |n| n,
+        .module => null,
+    };
+}
+
+/// Exported type-space member `member` of JSX namespace `ns_sym`, or null.
+///
+/// Through `namespaceMemberSym`, so a `JSX` namespace declared in more than
+/// one file is looked up in its MERGED member index. Reaching into one
+/// declaration's body scope directly (`namespaceScopeOf` on the merged
+/// symbol's representative constituent) saw only that file's members: a
+/// project that adds its own custom elements with a script `declare namespace
+/// JSX { interface IntrinsicElements { "em-emoji": any } }` shadowed the whole
+/// React/preact `IntrinsicElements`, and every `<div>` in the project became
+/// TS2339.
+fn nsTypeMember(c: *Checker, ns_sym: SymbolId, member: Atom) ?SymbolId {
+    const g = c.namespaceMemberSym(ns_sym, member) orelse return null;
+    const mf = c.symFlags(g);
+    return if (mf.exported and hasTypeMeaning(mf)) g else null;
+}
+
+/// `<jsxFactory-root>.JSX.<member>` — tsc's `getJsxNamespaceAt` step between
+/// the automatic-runtime container and the global `JSX`. With
+/// `jsxFactory: "MyLib.createElement"` the namespace that types every
+/// intrinsic element is `MyLib.JSX`, so a library that ships its factory and
+/// its `JSX.IntrinsicElements` together (the inline-factory idiom) needs no
+/// global namespace at all. Null when `jsxFactory` is unset — tsc's default
+/// root is `React`, but ztsc already reaches @types/react 19's namespace
+/// through the jsx-runtime module and 18's through the global it declares,
+/// so probing `React.JSX` unprompted would only add work.
+fn jsxFactoryNamespaceMember(c: *Checker, member: Atom) Error!?SymbolId {
+    if (c.atom_jsx_factory_ns == 0) return null;
+    const root = switch (c.resolveSpace(c.atom_jsx_factory_ns, c.cur_scope, false)) {
+        .sym => |s| s,
+        else => return null,
+    };
+    const f = c.symFlags(root);
+    const ct: NsContainer = if (f.namespace_decl)
+        .{ .ns = root }
+    else if (f.import_binding) blk: {
+        if (c.importTarget(root)) |t| break :blk c.containerFromImportTarget(t) orelse return null;
+        break :blk (try c.importEqualsEntityContainer(root)) orelse return null;
+    } else return null;
+    const jsx_ns = c.nestNsContainer(ct, c.atom_JSX) orelse return null;
+    const g = c.containerMemberSym(jsx_ns, member) orelse return null;
+    const mf = c.symFlags(g);
+    return if (mf.exported and hasTypeMeaning(mf)) g else null;
+}
+
+/// tsc's `getJsxNamespaceContainerForImplicitImport`. Under `jsx: "react-jsx"`
+/// the namespace is an *export* of the `<jsxImportSource>/jsx-runtime` module
+/// rather than a global — @types/react 19 dropped
+/// `declare global { namespace JSX }` entirely, so the global lookup finds
+/// nothing and every intrinsic element would type its props as "unknown
+/// target" (no contextual type for `onChange={(e) => …}`, no TS2339 for a
+/// bogus tag). The driver puts that module in the program and hands its FileId
+/// over as `Program.jsx_runtime_file`.
+pub fn jsxRuntimeNamespaceMember(c: *Checker, member: Atom) Error!?SymbolId {
     const f = c.prog.jsx_runtime_file;
     if (f == modules.no_file or c.prog.links.len == 0) return null;
     const ns_tgt = c.prog.links[f].exportTarget(c.atom_JSX) orelse return null;
-    const ns_sym = c.targetTypeSym(ns_tgt) orelse return null;
-    if (!c.symFlags(ns_sym).namespace_decl) return null;
-    const g = c.namespaceMemberSym(ns_sym, member) orelse return null;
-    const mf = c.symFlags(g);
-    if (!(mf.exported and hasTypeMeaning(mf))) return null;
-    return g;
+    const ns_sym0 = c.targetTypeSym(ns_tgt) orelse return null;
+    const ns_sym = (try jsxNamespaceSym(c, ns_sym0)) orelse return null;
+    return nsTypeMember(c, ns_sym, member);
 }
 
 /// Props type of a component tag. Function components: the first parameter
@@ -204,6 +275,20 @@ pub fn jsxRuntimeNamespaceMember(c: *Checker, member: Atom) ?SymbolId {
 /// typing is skipped).
 pub fn jsxComponentProps(c: *Checker, tag_ty: TypeId, explicit_targs: []const TypeId, node: Node) Error!?TypeId {
     const t = try c.resolveStructural(tag_ty);
+    // tsc's `resolveCustomJsxElementAttributesType` distributes over a UNION
+    // tag type and unions the per-constituent props. @types/react's
+    // `ComponentType<P> = ComponentClass<P> | StatelessComponent<P>` is that
+    // shape, so a `React.ComponentType<Props>`-typed component had NO props
+    // target at all: every attribute went unchecked and a render-prop child
+    // lost its contextual signature (TS7006/TS7031 on its parameters).
+    if (c.ts.kind(t) == .union_type) {
+        var acc: TypeId = types.no_type;
+        for (try c.memberList(t)) |m| {
+            const p = (try jsxComponentProps(c, m, explicit_targs, node)) orelse continue;
+            acc = if (acc == types.no_type) p else try c.makeUnion2(acc, p);
+        }
+        return if (acc == types.no_type) null else acc;
+    }
     if (c.ts.kind(t) == .class_value) return c.jsxClassComponentProps(t, explicit_targs, node);
     var sigs: std.ArrayList(TypeId) = .empty;
     defer sigs.deinit(c.scratch());
@@ -542,7 +627,7 @@ fn jsxGenericClassComponentProps(
 /// `View`/`Text`/`ScrollView` are all class components. Returns `props`
 /// unchanged when the JSX namespace declares no such interface.
 pub fn withIntrinsicClassAttributes(c: *Checker, props: TypeId, inst: TypeId) Error!TypeId {
-    const sym = c.jsxNamespaceMember(c.atom_IntrinsicClassAttributes) orelse return props;
+    const sym = (try c.jsxNamespaceMember(c.atom_IntrinsicClassAttributes)) orelse return props;
     var tps: std.ArrayList(TypeParamInfo) = .empty;
     defer tps.deinit(c.scratch());
     try c.typeParamsOf(sym, &tps);
@@ -621,7 +706,7 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
     defer ia_names.deinit(c.scratch());
     var has_intrinsic_attrs = false;
     if (is_component) {
-        if (c.jsxNamespaceMember(c.atom_IntrinsicAttributes) != null) {
+        if ((try c.jsxNamespaceMember(c.atom_IntrinsicAttributes)) != null) {
             has_intrinsic_attrs = true;
             try c.jsxIntrinsicAttrNames(&ia_names);
         }
@@ -796,7 +881,7 @@ pub fn checkJsxAttributes(c: *Checker, node: Node, e: ast.JsxElementData, props:
     // props type. Empirically bisected against tsgo 7.0.2; matched as
     // observed. Excess is always the plain TS2322 form.
     const raw_2322 = has_intrinsic_attrs and
-        c.jsxNamespaceMember(c.atom_IntrinsicClassAttributes) == null;
+        (try c.jsxNamespaceMember(c.atom_IntrinsicClassAttributes)) == null;
 
     if (have_excess) {
         // Excess wins over missing and is never refined to a

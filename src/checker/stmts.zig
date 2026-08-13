@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const ast = @import("../frontend/ast.zig");
+const implicit_any = @import("implicit_any.zig");
 const intern = @import("../intern.zig");
 const binder = @import("../frontend/binder.zig");
 const types = @import("../types.zig");
@@ -242,7 +243,12 @@ fn checkDeclarator(c: *Checker, decl: Node, is_const: bool) Error!void {
     try c.checkSubsequentVarDecl(decl, is_const);
     const d = c.tree.nodeData(decl);
     switch (c.nodeTag(decl)) {
-        .declarator => {},
+        // `var [a], {b};` — no annotation and no initializer, so the pattern
+        // is the only source of type information and every leaf it binds is
+        // an implicit `any` (TS7031). Only a VAR STATEMENT reaches here; a
+        // `for…of`/`for…in` head takes its declarator's type from the
+        // iterable and is checked elsewhere.
+        .declarator => try implicit_any.reportPatternImplicitAny(c, d.lhs),
         .declarator_init => {
             _ = try c.checkExprCached(d.rhs, types.no_type);
             // Materialize the symbol's type (infers + caches).

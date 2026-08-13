@@ -1407,8 +1407,15 @@ pub fn objLitIsShallowContextSensitive(c: *Checker, node: Node) bool {
 fn objLitIsContextSensitiveAt(c: *Checker, node: Node, depth: u8, shallow: bool) bool {
     for (c.tree.nodeRange(node)) |m| {
         if (m == null_node) continue;
+        // tsc's `isContextSensitive` has an explicit ParenthesizedExpression
+        // arm: `children: (({ x }) => { })` is exactly as context sensitive
+        // as the arrow written bare. Reading the paren node's own tag here
+        // made the whole literal look insensitive, so the two-round
+        // inference never deferred it and the arrow reached the
+        // authoritative pass with no contextual type at all — TS7031 on
+        // every destructured parameter it declares.
         const val = switch (c.nodeTag(m)) {
-            .object_property, .object_method => c.tree.nodeData(m).rhs,
+            .object_property, .object_method => skipParens(c, c.tree.nodeData(m).rhs),
             else => continue,
         };
         if (val == null_node) continue;
@@ -2726,11 +2733,7 @@ fn indexChainInner(c: *Checker, node: Node, narrow: bool) Error!ChainLink {
         .miss => |m| blk: {
             switch (m) {
                 .none => {},
-                .absent_key => if (c.prog.no_implicit_any) {
-                    try c.diagFmt(7053, c.nodeSpan(node), "Element implicitly has an 'any' type because expression of type '{s}' can't be used to index type '{s}'.", .{
-                        try c.typeToString(idx_t), try c.typeToString(obj_t),
-                    });
-                },
+                .absent_key => try reportIndexImplicitAny(c, node, d.lhs, idx_t, obj_t),
                 .tuple_range => |tr| try c.diagFmt(2493, c.nodeSpan(d.rhs), "Tuple type '{s}' of length '{d}' has no element at index '{d}'.", .{
                     try c.typeToString(tr.tuple), c.ts.tupleLen(tr.tuple), tr.index,
                 }),
@@ -2754,11 +2757,7 @@ fn indexChainInner(c: *Checker, node: Node, narrow: bool) Error!ChainLink {
                 // missing-property TS2339 (which is reserved for dotted `o.k`).
                 // Suppressed under `noImplicitAny: false`; the result is `any`
                 // either way.
-                if (c.prog.no_implicit_any) {
-                    try c.diagFmt(7053, c.nodeSpan(node), "Element implicitly has an 'any' type because expression of type '{s}' can't be used to index type '{s}'.", .{
-                        try c.typeToString(idx_t), try c.typeToString(obj_t),
-                    });
-                }
+                try reportIndexImplicitAny(c, node, d.lhs, idx_t, obj_t);
                 result = types.any_type;
             }
         },
@@ -2830,12 +2829,8 @@ fn indexChainInner(c: *Checker, node: Node, narrow: bool) Error!ChainLink {
                 // 'number'"), which ztsc does not implement, so those stay
                 // silent above. Suppressed under `noImplicitAny: false`; the
                 // result is `any` either way.
-                if (rk == .object and c.prog.no_implicit_any and
-                    c.ts.objectFlags(r) & types.obj_flag_global_this == 0)
-                {
-                    try c.diagFmt(7053, c.nodeSpan(node), "Element implicitly has an 'any' type because expression of type '{s}' can't be used to index type '{s}'.", .{
-                        try c.typeToString(idx_t), try c.typeToString(obj_t),
-                    });
+                if (rk == .object and c.ts.objectFlags(r) & types.obj_flag_global_this == 0) {
+                    try reportIndexImplicitAny(c, node, d.lhs, idx_t, obj_t);
                 }
                 result = types.any_type;
             }
@@ -3519,10 +3514,58 @@ fn baseOfLiteralType(c: *Checker, t: TypeId) Error!TypeId {
     return if (base != types.no_type) base else t;
 }
 
+/// One implicit-'any' ELEMENT ACCESS report, TS7052 or TS7053.
+///
+/// tsc's `getSuggestionForNonexistentIndexSignature`: an object that carries a
+/// `get`/`set` METHOD taking this very key is a map-like meant to be CALLED,
+/// not indexed, and tsc says so with its own code —
+/// "Element implicitly has an 'any' type because type 'T' has no index
+/// signature. Did you mean to call 'x.get'?" (TS7052). Everything else is the
+/// generic TS7053. Both are gated on `noImplicitAny`; the access types as
+/// `any` either way.
+pub fn reportIndexImplicitAny(c: *Checker, node: Node, recv: Node, idx_t: TypeId, obj_t: TypeId) Error!void {
+    if (!c.prog.no_implicit_any) return;
+    const r = try c.resolveStructural(obj_t);
+    // tsc picks `set` for an assignment target and `get` otherwise. ztsc has
+    // no write context at this site, so it asks for `get` only: an object
+    // carrying BOTH (the map-like shape this diagnostic exists for) reports
+    // TS7052 in either position, and a `get`-less object correctly falls
+    // through to TS7053 on a read. The one documented gap is a `set`-only
+    // object in WRITE position, which tsc calls TS7052 and this calls TS7053.
+    if (try c.propOfType(r, try c.atom("get"))) |prop| accessor: {
+        const sig = try c.contextualCallSig(prop.ty);
+        if (sig == types.no_type or c.ts.kind(sig) != .function) break :accessor;
+        if (c.ts.fnParamCount(sig) == 0) break :accessor;
+        if (!try c.isAssignable(idx_t, c.ts.fnParam(sig, 0).ty)) break :accessor;
+        // tsc spells the suggestion as `<receiver>.get` when the receiver is
+        // a plain name, and as the bare method otherwise.
+        const base = skipParens(c, recv);
+        if (base != null_node and c.nodeTag(base) == .identifier) {
+            try c.diagFmt(7052, c.nodeSpan(node), "Element implicitly has an 'any' type because type '{s}' has no index signature. Did you mean to call '{s}.get'?", .{ try c.typeToString(obj_t), c.tokenText(c.tree.nodeMainToken(base)) });
+        } else {
+            try c.diagFmt(7052, c.nodeSpan(node), "Element implicitly has an 'any' type because type '{s}' has no index signature. Did you mean to call 'get'?", .{try c.typeToString(obj_t)});
+        }
+        return;
+    }
+    try c.diagFmt(7053, c.nodeSpan(node), "Element implicitly has an 'any' type because expression of type '{s}' can't be used to index type '{s}'.", .{
+        try c.typeToString(idx_t), try c.typeToString(obj_t),
+    });
+}
+
+/// The expression inside any number of parentheses. tsc's `skipParentheses`:
+/// a parenthesized expression is transparent to every syntactic question
+/// about the value it wraps (is it an arrow? an identifier? an array
+/// literal?), so anything that switches on an expression's SHAPE has to look
+/// through it first.
+pub fn skipParens(c: *const Checker, node: Node) Node {
+    var n = node;
+    while (n != null_node and c.nodeTag(n) == .paren_expr) n = c.tree.nodeData(n).lhs;
+    return n;
+}
+
 /// Does this assignment target name an evolving (`auto`-typed) variable?
 fn assignTargetIsEvolving(c: *Checker, target0: Node) bool {
-    var n = target0;
-    while (n != null_node and c.nodeTag(n) == .paren_expr) n = c.tree.nodeData(n).lhs;
+    const n = skipParens(c, target0);
     if (n == null_node or c.nodeTag(n) != .identifier) return false;
     const a = c.atomOfToken(c.tree.nodeMainToken(n)) catch return false;
     return switch (c.resolveSpace(a, c.cur_scope, true)) {
@@ -3819,8 +3862,7 @@ fn setterParamOfProto(c: *Checker, decl: Node, proto_idx: u32) Error!?TypeId {
 /// so writing a not-yet-assigned `let` through a destructuring assignment
 /// reported TS2454 at the write site itself.
 fn checkDestructuringElement(c: *Checker, el0: Node) Error!void {
-    var el = el0;
-    while (el != null_node and c.nodeTag(el) == .paren_expr) el = c.tree.nodeData(el).lhs;
+    const el = skipParens(c, el0);
     if (el == null_node) return;
     const d = c.tree.nodeData(el);
     switch (c.nodeTag(el)) {

@@ -45,6 +45,10 @@ pub const LinkOpts = struct {
     /// unresolved-specifier diagnostic for a side-effect-only import. See
     /// `reportUnresolvedModules`.
     no_unchecked_side_effect_imports: bool = false,
+    /// Root identifier of tsconfig `jsxFactory` (see `Program.jsx_factory_ns`).
+    /// Carried here only to reach the `Program` the driver builds from these
+    /// options; the link phase itself never reads it.
+    jsx_factory_ns: ?[]const u8 = null,
     /// tsconfig `types` contains the `"*"` wildcard (tsc's `usesWildcardTypes`).
     /// Only reachable effect: the node-flavoured not-found diagnostics drop
     /// their "and then add 'node' to the types field" tail and become TS2580
@@ -131,6 +135,13 @@ pub const Program = struct {
     /// off this module's exports there; the checker falls back to it when no
     /// global `JSX` namespace exists. See `tsconfig.Config.jsx_runtime_module`.
     jsx_runtime_file: FileId = no_file,
+    /// The ROOT identifier of tsconfig `jsxFactory` (`MyLib` for
+    /// `MyLib.createElement`), or null. tsc's `getJsxNamespaceAt` reads the
+    /// `JSX` namespace out of that container (`MyLib.JSX.IntrinsicElements`)
+    /// before it falls back to the global one, so a project with an inline
+    /// factory and its own local `JSX` namespace types its intrinsic elements
+    /// from there. See `tsconfig.Config.jsx_factory_ns`.
+    jsx_factory_ns: ?[]const u8 = null,
 
     /// Count of real per-file symbols (merged ids start here).
     pub fn totalSymbols(p: *const Program) u32 {
