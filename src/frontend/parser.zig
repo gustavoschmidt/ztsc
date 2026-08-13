@@ -1931,12 +1931,15 @@ const Parser = struct {
         return p.lastIdx();
     }
 
-    /// A JSX tag or attribute name: an identifier that may span `-`
-    /// (`data-foo`, `<my-widget>`). Rescans first so the hyphenated run is a
-    /// single `.jsx_name` token.
+    /// A JSX tag or attribute name: `JsxIdentifier` is an *IdentifierName*, so
+    /// every reserved word is legal here (`<Foo in="SourceAlpha" for="x">`, the
+    /// SVG filter attributes, `<svg.default />`) — tsc parses both positions
+    /// with `parseIdentifierName`. Additionally it may span `-` (`data-foo`,
+    /// `<my-widget>`); the rescan runs first so the hyphenated run is a single
+    /// `.jsx_name` token.
     fn expectJsxName(p: *Parser) PE!u32 {
         p.rescanJsxName();
-        if (p.curTag() == .jsx_name or isIdentLike(p.curTag())) return p.bump();
+        if (p.curTag() == .jsx_name or isNameLike(p.curTag())) return p.bump();
         try p.fail(.expected_identifier);
         return p.lastIdx();
     }
@@ -5276,6 +5279,14 @@ test "jsx parses cleanly in tsx mode" {
         "const l = <div title=\"line one\nline two\" id=\"x\" />;",
         "const m = <div title='one\ntwo' />;",
         "const n = <div title=\"a\\b > c / d { e\" />;",
+        // A JSX name is an IdentifierName, so reserved words are legal in both
+        // the attribute and the tag position. The SVG filter primitives use
+        // `in`/`in2`, and `for`/`class`/`default`/`if` all appear as attribute
+        // names in real .tsx. Before this, `in="SourceAlpha"` ended the
+        // attribute list and produced a cascade of "expected '>'".
+        "const o = <feColorMatrix in=\"SourceAlpha\" in2=\"hardAlpha\" />;",
+        "const p = <label for=\"x\" class=\"y\" default=\"z\" if=\"q\" />;",
+        "const q = <Foo.default x={1} />;",
     };
     for (cases) |src| {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
