@@ -275,6 +275,20 @@ pub fn jsxRuntimeNamespaceMember(c: *Checker, member: Atom) Error!?SymbolId {
 /// typing is skipped).
 pub fn jsxComponentProps(c: *Checker, tag_ty: TypeId, explicit_targs: []const TypeId, node: Node) Error!?TypeId {
     const t = try c.resolveStructural(tag_ty);
+    // tsc's `resolveCustomJsxElementAttributesType` distributes over a UNION
+    // tag type and unions the per-constituent props. @types/react's
+    // `ComponentType<P> = ComponentClass<P> | StatelessComponent<P>` is that
+    // shape, so a `React.ComponentType<Props>`-typed component had NO props
+    // target at all: every attribute went unchecked and a render-prop child
+    // lost its contextual signature (TS7006/TS7031 on its parameters).
+    if (c.ts.kind(t) == .union_type) {
+        var acc: TypeId = types.no_type;
+        for (try c.memberList(t)) |m| {
+            const p = (try jsxComponentProps(c, m, explicit_targs, node)) orelse continue;
+            acc = if (acc == types.no_type) p else try c.makeUnion2(acc, p);
+        }
+        return if (acc == types.no_type) null else acc;
+    }
     if (c.ts.kind(t) == .class_value) return c.jsxClassComponentProps(t, explicit_targs, node);
     var sigs: std.ArrayList(TypeId) = .empty;
     defer sigs.deinit(c.scratch());

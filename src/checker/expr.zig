@@ -1376,8 +1376,15 @@ pub fn objLitIsShallowContextSensitive(c: *Checker, node: Node) bool {
 fn objLitIsContextSensitiveAt(c: *Checker, node: Node, depth: u8, shallow: bool) bool {
     for (c.tree.nodeRange(node)) |m| {
         if (m == null_node) continue;
+        // tsc's `isContextSensitive` has an explicit ParenthesizedExpression
+        // arm: `children: (({ x }) => { })` is exactly as context sensitive
+        // as the arrow written bare. Reading the paren node's own tag here
+        // made the whole literal look insensitive, so the two-round
+        // inference never deferred it and the arrow reached the
+        // authoritative pass with no contextual type at all — TS7031 on
+        // every destructured parameter it declares.
         const val = switch (c.nodeTag(m)) {
-            .object_property, .object_method => c.tree.nodeData(m).rhs,
+            .object_property, .object_method => skipParens(c, c.tree.nodeData(m).rhs),
             else => continue,
         };
         if (val == null_node) continue;
@@ -3465,10 +3472,20 @@ fn baseOfLiteralType(c: *Checker, t: TypeId) Error!TypeId {
     return if (base != types.no_type) base else t;
 }
 
+/// The expression inside any number of parentheses. tsc's `skipParentheses`:
+/// a parenthesized expression is transparent to every syntactic question
+/// about the value it wraps (is it an arrow? an identifier? an array
+/// literal?), so anything that switches on an expression's SHAPE has to look
+/// through it first.
+pub fn skipParens(c: *const Checker, node: Node) Node {
+    var n = node;
+    while (n != null_node and c.nodeTag(n) == .paren_expr) n = c.tree.nodeData(n).lhs;
+    return n;
+}
+
 /// Does this assignment target name an evolving (`auto`-typed) variable?
 fn assignTargetIsEvolving(c: *Checker, target0: Node) bool {
-    var n = target0;
-    while (n != null_node and c.nodeTag(n) == .paren_expr) n = c.tree.nodeData(n).lhs;
+    const n = skipParens(c, target0);
     if (n == null_node or c.nodeTag(n) != .identifier) return false;
     const a = c.atomOfToken(c.tree.nodeMainToken(n)) catch return false;
     return switch (c.resolveSpace(a, c.cur_scope, true)) {
@@ -3765,8 +3782,7 @@ fn setterParamOfProto(c: *Checker, decl: Node, proto_idx: u32) Error!?TypeId {
 /// so writing a not-yet-assigned `let` through a destructuring assignment
 /// reported TS2454 at the write site itself.
 fn checkDestructuringElement(c: *Checker, el0: Node) Error!void {
-    var el = el0;
-    while (el != null_node and c.nodeTag(el) == .paren_expr) el = c.tree.nodeData(el).lhs;
+    const el = skipParens(c, el0);
     if (el == null_node) return;
     const d = c.tree.nodeData(el);
     switch (c.nodeTag(el)) {

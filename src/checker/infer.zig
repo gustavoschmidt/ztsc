@@ -27,6 +27,7 @@ const Error = checker_zig.Error;
 
 const TpMap = @import("enums.zig").TpMap;
 const isUnitLikeKind = @import("assign.zig").isUnitLikeKind;
+const skipParens = @import("expr.zig").skipParens;
 
 /// tsc's `InferencePriority.ReturnType`: infer still-unbound type params by
 /// unifying the signature's return type against the structurally-resolved
@@ -303,7 +304,12 @@ fn ctxSensitiveLosesSignature(c: *Checker, node: Node, ctx2: TypeId, depth: u8) 
             .object_property, .object_method => {},
             else => continue,
         }
-        const val = c.tree.nodeData(m).rhs;
+        // Through `skipParens`: a parenthesized callback (`children: (({ x })
+        // => { })`) is the same context-sensitive property as an unwrapped
+        // one, and reading the paren node's tag instead put it in the
+        // `else` arm — the fallback never fired and its parameters stayed
+        // implicit `any` in the authoritative pass (TS7006/TS7031).
+        const val = skipParens(c, c.tree.nodeData(m).rhs);
         if (val == null_node) continue;
         const key = try c.memberAtom(c.tree.nodeMainToken(m));
         const prop_ty = try c.ctxPropType(rp, ctx2, key);
@@ -443,7 +449,10 @@ fn markCtxSensitiveFixed(
             .object_property, .object_method => {},
             else => continue,
         }
-        const val = c.tree.nodeData(m).rhs;
+        // Parens are transparent here, exactly as in
+        // `ctxSensitiveLosesSignature`: `(({ x }) => { })` is the same
+        // context-sensitive property as the arrow written bare.
+        const val = skipParens(c, c.tree.nodeData(m).rhs);
         if (val == null_node) continue;
         const key = try c.memberAtom(c.tree.nodeMainToken(m));
         const prop_ty = try c.ctxPropType(rp, pt, key);
