@@ -32,19 +32,24 @@ const Error = checker_zig.Error;
 ///
 /// A real identity relation is a structural walk of its own, and ztsc has
 /// none: the assignability engine answers a different question and belongs to
-/// nobody here to extend. So this decides identity from what is available,
-/// in three steps, each of which can only *widen* the set of pairs called
-/// identical — a missed TS2403 is an under-report, an invented one is a false
-/// error on legal code.
+/// nobody here to extend. So this decides identity from what is available.
+/// EVERY step below can only *widen* the set of pairs called identical — a
+/// missed TS2403 is an under-report, an invented one is a false error on
+/// legal code, and the check is only worth having in the first place if it
+/// never does the latter.
 ///
 ///   1. `TypeId` equality. The store is hash-consed (unions sorted and
 ///      deduped, object properties sorted by name atom, a signature's whole
 ///      payload in the key), so structurally identical types built through it
 ///      are already the same id. `A | B` and `B | A` land here.
-///   2. `resolveStructural` on each side, which puts a named type
+///   2. The refusals: inputs ztsc reached by giving up rather than by reading
+///      the program (`identityUndecidable`), and a literal beside its own
+///      base, which is ztsc's widening diverging rather than the two
+///      declarations.
+///   3. `resolveStructural` on each side, which puts a named type
 ///      (`interface Point`, a `.ref`) and the structure it stands for on the
 ///      same footing.
-///   3. MUTUAL assignability. This is the loose step and the load-bearing
+///   4. MUTUAL assignability. This is the loose step and the load-bearing
 ///      one: `interface Point` versus a widened `{ x: number, y: number }`
 ///      object literal, and `{ (s: string): number }` versus `(s: string) =>
 ///      number`, are identical to tsc but differ in ztsc's object flags and
