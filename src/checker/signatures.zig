@@ -1094,6 +1094,7 @@ fn computeTypeOfSymbol(c: *Checker, sym: SymbolId) Error!TypeId {
         return ns_val;
     }
     if (f.enum_decl) return c.enumValueType(sym);
+    if (f.enum_member) return c.enumMemberSymbolType(sym);
     if (f.class) return callableClassValue(c, sym, f);
     if (f.function) return withExpandoProps(c, sym, try functionSymbolType(c, sym));
     if (f.expando_member) return expandoMemberType(c, sym);
@@ -1607,7 +1608,7 @@ fn inferredUniqueSymbol(c: *Checker, decl: Node, name: Node, init: Node, is_cons
 
 /// Type of one variable declarator for `sym` (no_type if this decl
 /// contributes none, e.g. bare `declarator` in a multi-decl symbol).
-fn declaratorType(c: *Checker, sym: SymbolId, decl: Node, is_const: bool) Error!TypeId {
+pub fn declaratorType(c: *Checker, sym: SymbolId, decl: Node, is_const: bool) Error!TypeId {
     // The initializer is being typed to *build* this variable's type, so
     // any function body inside it must not be walked yet — the same rule
     // the class-field arm of `computeTypeOfSymbol` already applies (see

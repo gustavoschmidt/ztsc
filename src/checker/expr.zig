@@ -32,6 +32,7 @@ const diagFmt = Checker.diagFmt;
 const flowTypeOfReference = @import("flow.zig").flowTypeOfReference;
 const gatherSpreadProps = @import("typenode.zig").gatherSpreadProps;
 const globalThisType = @import("instantiate.zig").globalThisType;
+const names_zig = @import("names.zig");
 const hasTypeMeaning = @import("names.zig").hasTypeMeaning;
 const hasValueMeaning = @import("names.zig").hasValueMeaning;
 const indexableConstituent = @import("typenode.zig").indexableConstituent;
@@ -476,10 +477,33 @@ pub fn containsAtom(list: []const Atom, name: Atom) bool {
     return false;
 }
 
+/// A bare private name — the left operand of the ergonomic brand check
+/// `#x in obj`, the one expression position the grammar admits it in. It
+/// names a member of an enclosing class, which is not in the lexical scope
+/// chain, so it never goes through `resolveSpace`.
+///
+/// A name no enclosing class declares keeps the generic not-found message:
+/// tsc reports TS2339 against the type of the RIGHT operand there, which is
+/// the `in` operator's to give, not this expression's.
+fn checkPrivateName(c: *Checker, tok: TokenIndex, a: Atom) Error!TypeId {
+    switch (names_zig.resolvePrivateName(c, a, c.cur_scope)) {
+        .member => |local| return c.typeOfSymbol(c.toGlobal(local)),
+        .outside_class => {
+            try c.diagFmt(18016, c.tokSpan(tok), "Private identifiers are not allowed outside class bodies.", .{});
+            return types.error_type;
+        },
+        .no_such_member => {
+            try c.reportNameNotFound(tok);
+            return types.error_type;
+        },
+    }
+}
+
 fn checkIdentifier(c: *Checker, node: Node) Error!TypeId {
     const tok = c.tree.nodeMainToken(node);
     if (c.tree.tokens.tag(tok) == .keyword_undefined) return types.undefined_type;
     const a = try c.atomOfToken(tok);
+    if (c.tree.tokens.tag(tok) == .private_identifier) return checkPrivateName(c, tok, a);
     switch (c.resolveSpace(a, c.cur_scope, true)) {
         .sym => |sym| {
             const f = c.symFlags(sym);
@@ -552,6 +576,13 @@ fn checkIdentifier(c: *Checker, node: Node) Error!TypeId {
             // `getGlobalIArgumentsType()` once `isInsideFunction` holds).
             if (std.mem.eql(u8, c.atomText(a), "arguments")) {
                 if (try c.implicitArgumentsType()) |t| return t;
+            }
+            // A primitive TYPE name in a value position is TS2693, ahead of
+            // both the suggestion and the not-found message (tsc's
+            // `checkAndReportErrorForUsingTypeAsValue`).
+            if (names_zig.primitiveTypeNameUsedAsValue(c.tokenText(tok))) {
+                try c.diagFmt(2693, c.tokSpan(tok), "'{s}' only refers to a type, but is being used as a value here.", .{c.tokenText(tok)});
+                return types.error_type;
             }
             if (c.suggestName(a, c.cur_scope, true)) |sugg| {
                 try c.diagFmt(2552, c.tokSpan(tok), "Cannot find name '{s}'. Did you mean '{s}'?", .{ c.tokenText(tok), c.atomText(sugg) });

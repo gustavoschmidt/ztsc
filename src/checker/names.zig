@@ -30,7 +30,8 @@ const indexOfAtom = @import("generics.zig").indexOfAtom;
 pub fn hasValueMeaning(f: binder.SymbolFlags) bool {
     if (f.import_binding and f.type_only) return false;
     return f.var_decl or f.let_decl or f.const_decl or f.function or f.class or
-        f.param or f.catch_param or f.import_binding or f.enum_decl or f.namespace_decl;
+        f.param or f.catch_param or f.import_binding or f.enum_decl or f.namespace_decl or
+        f.enum_member;
 }
 
 pub fn hasTypeMeaning(f: binder.SymbolFlags) bool {
@@ -44,9 +45,36 @@ pub const Resolved = union(enum) {
     none,
 };
 
+/// Which SPACE a lookup is asking about — tsc's `meaning` argument to
+/// `resolveName`. A name is skipped, and the walk continues outward, unless
+/// the symbol it found carries the requested meaning.
+pub const Meaning = enum {
+    value,
+    type_space,
+    /// The qualifier of a dotted name (`A.B`), which must be a container:
+    /// a namespace, an enum, or an alias that may resolve to one. A `class`
+    /// carries type meaning and is NOT a container, which is what lets
+    /// `var x = class C { prop: C.type }` find the outer `namespace C`
+    /// (tsc's `resolveName(..., SymbolFlags.Namespace)`).
+    namespace,
+
+    fn matches(m: Meaning, f: binder.SymbolFlags) bool {
+        return switch (m) {
+            .value => hasValueMeaning(f),
+            .type_space => hasTypeMeaning(f),
+            .namespace => f.namespace_decl or f.enum_decl or f.import_binding,
+        };
+    }
+};
+
 /// Resolve in the current file's scope chain; returns GLOBAL ids.
 pub fn resolveSpace(c: *Checker, a: Atom, from: ScopeId, want_value: bool) Resolved {
-    return resolveSpaceInner(c, a, from, want_value, false);
+    return resolveSpaceInner(c, a, from, if (want_value) .value else .type_space, false);
+}
+
+/// `resolveSpace` for the QUALIFIER of a dotted name — see `Meaning`.
+pub fn resolveNamespaceSpace(c: *Checker, a: Atom, from: ScopeId) Resolved {
+    return resolveSpaceInner(c, a, from, .namespace, false);
 }
 
 /// `resolveSpace` for the operand of a `typeof` TYPE QUERY, where a
@@ -67,19 +95,18 @@ pub fn resolveSpace(c: *Checker, a: Atom, from: ScopeId, want_value: bool) Resol
 /// TS1361 that tsc does not: every value position still goes through
 /// `resolveSpace`.
 pub fn resolveTypeQuerySpace(c: *Checker, a: Atom, from: ScopeId) Resolved {
-    return resolveSpaceInner(c, a, from, true, true);
+    return resolveSpaceInner(c, a, from, .value, true);
 }
 
-fn resolveSpaceInner(c: *Checker, a: Atom, from: ScopeId, want_value: bool, type_only_ok: bool) Resolved {
+fn resolveSpaceInner(c: *Checker, a: Atom, from: ScopeId, meaning: Meaning, type_only_ok: bool) Resolved {
+    const want_value = meaning == .value;
     var s = from;
     var wrong: SymbolId = binder.no_symbol;
     while (true) {
         if (c.bind.lookupInScope(s, a)) |sym| {
             const f = c.bind.symbol_flags[sym];
-            const ok = if (want_value)
-                (hasValueMeaning(f) or (type_only_ok and f.import_binding and f.type_only))
-            else
-                hasTypeMeaning(f);
+            const ok = meaning.matches(f) or
+                (want_value and type_only_ok and f.import_binding and f.type_only);
             if (ok) {
                 // A reference from inside a contributing file binds to the
                 // file-local declaration; if that declaration is a
@@ -110,10 +137,8 @@ fn resolveSpaceInner(c: *Checker, a: Atom, from: ScopeId, want_value: bool, type
         if (c.bind.scope_kinds[s] == .namespace) {
             if (c.mergedNsMemberOfScope(s, a)) |gsym| {
                 const gf = c.symFlags(gsym);
-                const ok = if (want_value)
-                    (hasValueMeaning(gf) or (type_only_ok and gf.import_binding and gf.type_only))
-                else
-                    hasTypeMeaning(gf);
+                const ok = meaning.matches(gf) or
+                    (want_value and type_only_ok and gf.import_binding and gf.type_only);
                 if (ok) return .{ .sym = gsym };
             }
         }
@@ -125,12 +150,53 @@ fn resolveSpaceInner(c: *Checker, a: Atom, from: ScopeId, want_value: bool, type
     // The table already holds GLOBAL SymbolIds.
     if (c.prog.globals.lookup(a)) |gsym| {
         const gf = c.symFlags(gsym);
-        const ok = if (want_value) hasValueMeaning(gf) else hasTypeMeaning(gf);
-        if (ok) return .{ .sym = gsym };
+        if (meaning.matches(gf)) return .{ .sym = gsym };
         if (wrong == binder.no_symbol) return .{ .wrong_space = gsym };
     }
     if (wrong != binder.no_symbol) return .{ .wrong_space = c.toGlobal(wrong) };
     return .none;
+}
+
+/// What a bare private name `#x` resolved to.
+pub const PrivateName = union(enum) {
+    /// The declaring class member (a LOCAL symbol id in the current file).
+    member: binder.SymbolId,
+    /// Inside a class body, but no class on the chain declares the name.
+    no_such_member,
+    /// No enclosing class body at all — TS18016.
+    outside_class,
+};
+
+/// Resolve a bare private name, tsc's
+/// `lookupSymbolForPrivateIdentifierDeclaration`: walk out through the
+/// enclosing CLASS scopes and take the first that declares the name, on
+/// either its instance or its static side. The grammar admits a bare `#x`
+/// in exactly one expression — the ergonomic brand check `#x in obj` — so
+/// this is not a hot path.
+///
+/// A class's member scopes are NOT in the lexical chain (a method body's
+/// parent is the class scope itself), so they are reached through the owner
+/// node `bindClass` gives all three.
+pub fn resolvePrivateName(c: *Checker, a: Atom, from: ScopeId) PrivateName {
+    var s = from;
+    var in_class = false;
+    while (true) {
+        if (c.bind.scope_kinds[s] == .class) {
+            in_class = true;
+            const owner = c.bind.scope_owners[s];
+            for (c.bind.scope_kinds, 0..) |k, i| {
+                switch (k) {
+                    .class_members, .class_statics => {},
+                    else => continue,
+                }
+                if (c.bind.scope_owners[i] != owner) continue;
+                if (c.bind.lookupInScope(@intCast(i), a)) |sym| return .{ .member = sym };
+            }
+        }
+        if (s == binder.file_scope) break;
+        s = c.bind.scope_parents[s];
+    }
+    return if (in_class) .no_such_member else .outside_class;
 }
 
 /// Longest name this module will score. tsc has no ceiling; a stack DP row
@@ -180,12 +246,26 @@ fn spellDistance(name: []const u8, cand: []const u8, cap: usize) ?usize {
 /// one declared earlier in the file, so comparing ids across scopes would
 /// let an outer candidate beat an inner one; tsc's shrinking threshold
 /// never does.
+///
+/// The walk ends in the GLOBAL (lib) table, exactly as `resolveSpaceInner`
+/// does: `getSuggestedSymbolForNonexistentSymbol` rides tsc's ordinary
+/// `resolveNameHelper`, whose last stop is the global symbol table, so an
+/// unresolved `$ERROR` really does suggest the lib's `Error`. Scanning the
+/// whole table is only reached on the ERROR path (a name that resolved to
+/// nothing), which is where tsc computes suggestions too, and the length
+/// pre-filter inside `spellCandidateDistance` rejects all but a sliver of it
+/// before any DP row is built.
 pub fn suggestName(c: *Checker, a: Atom, from: ScopeId, want_value: bool) ?Atom {
     const text = c.atomText(a);
     if (text.len == 0 or text.len > spell_max_len) return null;
     var best: ?Atom = null;
     var best_sym: binder.SymbolId = 0;
     var best_scope: ScopeId = 0;
+    // The incumbent came from the global table rather than a lexical scope,
+    // so the declaration-order tie-break must compare global ids with global
+    // ids (a lexical `SymbolId` and a program-wide global id are different
+    // numbering spaces).
+    var best_global = false;
     // Inclusive acceptance bound in tenths; shrinks to the incumbent's
     // distance so a strictly closer candidate wins outright and an exactly
     // tied one falls to the declaration-order tie-break below.
@@ -204,15 +284,34 @@ pub fn suggestName(c: *Checker, a: Atom, from: ScopeId, want_value: bool) ?Atom 
             const cand_text = c.atomText(cand);
             const d = spellDistance(text, cand_text, best_d) orelse continue;
             const better = best == null or d < best_d or
-                (d == best_d and s == best_scope and sym < best_sym);
+                (d == best_d and !best_global and s == best_scope and sym < best_sym);
             if (!better) continue;
             best_d = d;
             best_sym = sym;
             best_scope = s;
+            best_global = false;
             best = cand;
         }
         if (s == binder.file_scope) break;
         s = c.bind.scope_parents[s];
+    }
+    // Globals are visited last, so a lexical candidate at the same distance
+    // keeps the suggestion (tsc only replaces on a strictly smaller one);
+    // among globals the smaller id — the earlier lib declaration — wins.
+    for (c.prog.globals.atoms, c.prog.globals.syms) |cand, gsym| {
+        if (cand == a) continue;
+        const gf = c.symFlags(gsym);
+        const ok = if (want_value) hasValueMeaning(gf) else hasTypeMeaning(gf);
+        if (!ok) continue;
+        const cand_text = c.atomText(cand);
+        const d = spellDistance(text, cand_text, best_d) orelse continue;
+        const better = best == null or d < best_d or
+            (d == best_d and best_global and gsym < best_sym);
+        if (!better) continue;
+        best_d = d;
+        best_sym = gsym;
+        best_global = true;
+        best = cand;
     }
     return best;
 }
@@ -227,6 +326,20 @@ pub fn suggestName(c: *Checker, a: Atom, from: ScopeId, want_value: bool) ?Atom 
 /// over both — tsc tries `getSuggestedSymbolForNonexistentSymbol` before it
 /// falls back to the not-found message, so `require` with `Required` in scope
 /// is TS2552, not TS2591.
+/// tsc's `checkAndReportErrorForUsingTypeAsValue`: six primitive TYPE names
+/// are never values, and a value-position use of one is TS2693 rather than
+/// any not-found message — checked before the spelling suggestion, so
+/// `var x = number` is "'number' only refers to a type" and not "did you mean
+/// 'Number'". The list is tsc's, verbatim; `bigint`, `symbol`, `object`,
+/// `void` and `undefined` are deliberately NOT on it.
+pub fn primitiveTypeNameUsedAsValue(text: []const u8) bool {
+    const names = [_][]const u8{ "any", "string", "number", "boolean", "never", "unknown" };
+    for (names) |n| {
+        if (std.mem.eql(u8, text, n)) return true;
+    }
+    return false;
+}
+
 pub fn reportNameNotFound(c: *Checker, tok: ast.TokenIndex) Error!void {
     const text = c.tokenText(tok);
     if (!paths.isNodeGlobalName(text)) {

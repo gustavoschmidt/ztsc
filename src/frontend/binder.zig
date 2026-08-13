@@ -136,6 +136,8 @@ const DeclKind = enum {
     interface,
     type_alias,
     enum_decl,
+    /// One member of an enum body (tsc's `SymbolFlags.EnumMember`).
+    enum_member,
     namespace,
     /// A `namespace`/`module` whose body is type-only (see
     /// `SymbolFlags.ns_uninstantiated`). Same symbol shape as `.namespace`,
@@ -163,6 +165,7 @@ const DeclKind = enum {
             .interface => .{ .interface = true },
             .type_alias => .{ .type_alias = true },
             .enum_decl => .{ .enum_decl = true },
+            .enum_member => .{ .enum_member = true },
             .namespace => .{ .namespace_decl = true },
             .namespace_type => .{ .namespace_decl = true, .ns_uninstantiated = true },
             .type_param => .{ .type_param = true },
@@ -207,6 +210,10 @@ const DeclKind = enum {
             // Two enum blocks (incl. const enum) with the same name merge;
             // everything else in value or type space clashes (bar namespace).
             .enum_decl => (mask_value | mask_type) & ~(fbits(.{ .enum_decl = true }) | fbits(.{ .namespace_decl = true })),
+            // tsc's `EnumMemberExcludes = EnumMember`: members share a table
+            // with nothing else, so only another member of the same name
+            // clashes (`enum E { A, A }` — TS2300 at both spellings).
+            .enum_member => fbits(.{ .enum_member = true }),
             // A namespace merges with another namespace, function, class,
             // enum, interface, and type alias; it clashes with var/let/const.
             .namespace => (mask_value & ~(fbits(.{ .namespace_decl = true }) |
@@ -242,6 +249,10 @@ const DeclKind = enum {
             .interface, .type_alias, .type_param, .import_type => true,
             else => false,
         };
+    }
+
+    fn isImport(k: DeclKind) bool {
+        return k == .import_value or k == .import_type;
     }
 };
 
@@ -285,7 +296,10 @@ pub fn bind(
     try b.sym_decl_head.append(b.scratch, 0);
     try b.sym_decl_tail.append(b.scratch, 0);
     try b.sym_decl_count.append(b.scratch, 0);
+    try b.sym_reported.append(b.scratch, 0);
+    try b.sym_block.append(b.scratch, 0);
     try b.decl_links.append(b.scratch, .{ .value = 0, .next = 0 });
+    try b.decl_name_toks.append(b.scratch, 0);
     try b.ante_links.append(b.scratch, .{ .value = 0, .next = 0 });
 
     try b.scope_parents.append(b.scratch, 0);
@@ -341,7 +355,21 @@ const Binder = struct {
     sym_decl_head: std.ArrayList(u32) = .empty,
     sym_decl_tail: std.ArrayList(u32) = .empty,
     sym_decl_count: std.ArrayList(u32) = .empty,
+    /// How many of a symbol's declarations an earlier failed merge has
+    /// already named, so `reportDuplicate` reports each spelling once. Pure
+    /// bookkeeping for the diagnostic; scratch-only, never sealed.
+    sym_reported: std.ArrayList(u32) = .empty,
+    /// The declaration BLOCK (`cur_block`) a symbol was most recently
+    /// declared in — see `mergesAcrossBlocks`. Scratch-only bookkeeping for
+    /// the duplicate-member diagnostic.
+    sym_block: std.ArrayList(Node) = .empty,
     decl_links: std.ArrayList(Link) = .empty,
+    /// Name token of each `decl_links` entry, so a failed merge can point at
+    /// declarations bound earlier. Parallel to `decl_links` and, like it,
+    /// scratch-only — the sealed `Bind` keeps declaration NODES, and
+    /// recovering a name token from a node would mean a switch over every
+    /// declaration shape.
+    decl_name_toks: std.ArrayList(TokenIndex) = .empty,
 
     // scopes under construction
     scope_parents: std.ArrayList(ScopeId) = .empty,
@@ -358,6 +386,9 @@ const Binder = struct {
     member_scopes: std.AutoHashMapUnmanaged(SymbolId, ScopeId) = .empty,
     static_scopes: std.AutoHashMapUnmanaged(SymbolId, ScopeId) = .empty,
     namespace_scopes: std.AutoHashMapUnmanaged(SymbolId, ScopeId) = .empty,
+    /// Enum symbol -> its member scope, so every block of a merged `enum E`
+    /// binds into one table (the same reuse `namespace_scopes` gives bodies).
+    enum_scopes: std.AutoHashMapUnmanaged(SymbolId, ScopeId) = .empty,
     /// Expando-function symbol -> the scope its `fn.prop = …` properties are
     /// declared in (created on the first such assignment).
     expando_scopes: std.AutoHashMapUnmanaged(SymbolId, ScopeId) = .empty,
@@ -403,6 +434,11 @@ const Binder = struct {
     pending_label: Atom = 0,
     /// True while binding the name(s) of an `export`ed declaration.
     exporting_node: Node = 0,
+    /// The class / interface / object-type declaration whose members are
+    /// being bound (0 outside one). Two blocks of a merging container share a
+    /// member scope, and a name repeated ACROSS them merges rather than
+    /// clashing — see `mergesAcrossBlocks`.
+    cur_block: Node = 0,
     /// True while binding inside an ambient (`declare`) namespace body, where
     /// members are implicitly exported (visible as `N.member` without an
     /// explicit `export`), matching tsc's ambient-context rule.
@@ -465,20 +501,33 @@ const Binder = struct {
         return b.tree.tokenSlice(b.src, tok);
     }
 
+    /// Atom of an identifier-ish token, `\uXXXX` escapes decoded — the name
+    /// tsc files the symbol under (`escapedText`). The decoded bytes are
+    /// duplicated into the binder's scratch arena before they reach
+    /// `atom_cache`, which stores the caller's slice as its key.
+    fn atomOfIdent(b: *Binder, text: []const u8) Error!Atom {
+        var buf: [scanner.max_unescaped_ident]u8 = undefined;
+        const decoded = scanner.unescapeIdentifier(text, &buf) orelse return b.atomOf(text);
+        if (b.atom_cache.get(decoded)) |a| return a;
+        return b.atomOf(try b.scratch.dupe(u8, decoded));
+    }
+
     /// Atom of an identifier-ish token.
     fn atomOfToken(b: *Binder, tok: TokenIndex) Error!Atom {
-        return b.atomOf(b.tokenText(tok));
+        return b.atomOfIdent(b.tokenText(tok));
     }
 
     /// Atom of a member/property name token; string keys lose their quotes
-    /// so `"a"` and `a` name the same member. (Escapes are not decoded in
-    /// the binder — the corpus subset does not rely on escaped member names.)
+    /// so `"a"` and `a` name the same member. An identifier key's `\uXXXX`
+    /// escapes are decoded (`o.a` is `o.a`); a STRING key's are not —
+    /// string escapes are a different grammar, and `memberAtom`'s job is the
+    /// syntactic key.
     fn memberAtom(b: *Binder, tok: TokenIndex) Error!Atom {
         const text = b.tokenText(tok);
         switch (b.tree.tokens.tag(tok)) {
             // `.jsx_string` is a JSX attribute's quoted value.
             .string_literal, .jsx_string => return b.atomOf(stripQuotes(text)),
-            else => return b.atomOf(text),
+            else => return b.atomOfIdent(text),
         }
     }
 
@@ -608,9 +657,10 @@ const Binder = struct {
 
     // --- symbols ------------------------------------------------------------
 
-    fn appendDecl(b: *Binder, sym: SymbolId, node: Node) Error!void {
+    fn appendDecl(b: *Binder, sym: SymbolId, node: Node, name_tok: TokenIndex) Error!void {
         const link: u32 = @intCast(b.decl_links.items.len);
         try b.decl_links.append(b.scratch, .{ .value = node, .next = 0 });
+        try b.decl_name_toks.append(b.scratch, name_tok);
         if (b.sym_decl_head.items[sym] == 0) {
             b.sym_decl_head.items[sym] = link;
         } else {
@@ -645,19 +695,74 @@ const Binder = struct {
     /// Pick the diagnostic code for a declaration that failed the excludes
     /// check against `existing`. Choices documented in the module header;
     /// golden-tested against the codes tsc reports for the common cases.
+    /// Which message a failed merge gets, in tsc's `declareSymbol` order:
+    /// an `enum` on either side wins, then a block-scoped EXISTING symbol,
+    /// then the generic duplicate.
+    ///
+    /// The block-scoped arm reads the EXISTING symbol's flags alone, and
+    /// `class` is not one of tsc's `SymbolFlags.BlockScopedVariable` bits.
+    /// Both halves were verified against the pinned oracle in each order:
+    /// `let x; var x;` and `let x; class x {}` are TS2451, while `var x;
+    /// let x;`, `class x {} let x;` and `class x {} var x;` are all TS2300.
     fn dupCode(existing: SymbolFlags, kind: DeclKind) Code {
         if (existing.catch_param) return .catch_redeclare;
         const e_import = existing.import_binding;
-        const n_import = kind == .import_value or kind == .import_type;
+        const n_import = kind.isImport();
         if (e_import != n_import) return .import_conflict;
         if (e_import and n_import) return .duplicate_identifier;
-        // Pure type-space collisions are plain duplicates.
-        if (kind.isTypeOnly() or (existing.bits() & mask_value) == 0)
-            return .duplicate_identifier;
-        if (kind == .class and existing.class) return .duplicate_identifier;
-        if (kind.isBlockScoped() or (existing.bits() & mask_let_const_class) != 0)
-            return .block_scoped_redeclare;
+        if (existing.enum_decl or kind == .enum_decl) return .enum_merge_conflict;
+        if (existing.let_decl or existing.const_decl) return .block_scoped_redeclare;
         return .duplicate_identifier;
+    }
+
+    /// Report a failed merge the way tsc does: at EVERY declaration of the
+    /// name, not only at the newcomer. tsc's `declareSymbol` runs
+    /// `addDuplicateDeclarationErrorsForSymbols` over `symbol.declarations`
+    /// *and* over the incoming node, so `var g; var g; class g {}` is three
+    /// TS2300s and `let f; let f; let f;` three TS2451s — one per spelling of
+    /// the name, which is what the oracle prints.
+    ///
+    /// `sym_reported` is how many of the symbol's declarations have already
+    /// been named in some earlier clash. tsc re-reports them and lets its
+    /// diagnostic collection deduplicate; carrying the count instead keeps
+    /// the walk O(new declarations) and needs no dedup pass. The newcomer is
+    /// appended by the caller straight after, hence the `+ 1`.
+    /// Report `code` at the symbol's FIRST declaration. TS2440 needs it: the
+    /// message names the import declaration, which may be the one already in
+    /// the table (`let b = 1; import { b } from "./m";` points at line 2's
+    /// import, not at the `let`).
+    fn diagAtFirstDecl(b: *Binder, sym: SymbolId, code: Code) Error!void {
+        const link = b.sym_decl_head.items[sym];
+        if (link == 0) return;
+        try b.diag(code, b.decl_name_toks.items[link]);
+    }
+
+    /// Do the declarations already in the table and the one now being bound
+    /// belong to DIFFERENT blocks of a merging container? Two `interface I`
+    /// blocks — and a `class C` + `interface C` pair — contribute to one
+    /// member table, and tsc merges same-named members across them instead of
+    /// calling them duplicates; a type conflict there is TS2717
+    /// ("Subsequent property declarations must have the same type"), not
+    /// TS2300. Within ONE block a repeated name is a genuine duplicate, which
+    /// is why this keys off the block and not off the scope.
+    fn mergesAcrossBlocks(b: *Binder, scope: ScopeId, sym: SymbolId) bool {
+        switch (b.scope_kinds.items[scope]) {
+            .class_members, .class_statics, .interface_members => {},
+            else => return false,
+        }
+        return b.sym_block.items[sym] != b.cur_block;
+    }
+
+    fn reportDuplicate(b: *Binder, sym: SymbolId, code: Code, name_tok: TokenIndex) Error!void {
+        const already = b.sym_reported.items[sym];
+        var link = b.sym_decl_head.items[sym];
+        var i: u32 = 0;
+        while (link != 0) : (link = b.decl_links.items[link].next) {
+            if (i >= already) try b.diag(code, b.decl_name_toks.items[link]);
+            i += 1;
+        }
+        try b.diag(code, name_tok);
+        b.sym_reported.items[sym] = i + 1;
     }
 
     /// Declare `atom` in `scope`. Merges with an existing symbol when the
@@ -702,23 +807,58 @@ const Binder = struct {
             }
         }
 
+        const n_import = kind.isImport();
         const gop = try b.members.getOrPut(b.scratch, memberKey(scope, atom));
         if (gop.found_existing) {
             const sym = gop.value_ptr.*;
             const existing = b.sym_flags.items[sym];
-            if (effectiveBits(existing) & kind.excludes() != 0) {
-                try b.diag(dupCode(existing, kind), name_tok);
+            if (effectiveBits(existing) & kind.excludes() != 0 and
+                !b.mergesAcrossBlocks(scope, sym))
+            {
+                const code = dupCode(existing, kind);
+                switch (code) {
+                    // TS2492 names the REDECLARATION alone and leaves the
+                    // `catch (e)` binding unmarked; a duplicate TYPE
+                    // PARAMETER likewise names only the later one (tsc
+                    // catches that one in `checkTypeParameters`, comparing
+                    // each against its predecessors, not in `declareSymbol`).
+                    .catch_redeclare => try b.diag(code, name_tok),
+                    // TS2440 always lands on the IMPORT declaration, whichever
+                    // side of the clash it is: `import {a} …; let a = 1;` and
+                    // `let b = 1; import {b} …` both point at the import.
+                    .import_conflict => if (n_import)
+                        try b.diag(code, name_tok)
+                    else
+                        try b.diagAtFirstDecl(sym, code),
+                    else => if (kind == .type_param or existing.type_param)
+                        try b.diag(code, name_tok)
+                    else
+                        try b.reportDuplicate(sym, code, name_tok),
+                }
             } else if (kind == .function or kind == .method) {
-                // Overload grouping: at most one implementation.
+                // Overload grouping: at most one implementation. tsc names
+                // every declaration of the name, overload signatures
+                // included — `function f(): void; function f() {} function
+                // f() {}` is three TS2393s, not one. A CONSTRUCTOR gets its
+                // own message (TS2392) instead.
                 if (flags.has_impl and existing.has_impl) {
-                    try b.diag(.duplicate_function_implementation, name_tok);
+                    // A class constructor is spelled with the `constructor`
+                    // keyword and is never static.
+                    const is_ctor = !extra_flags.static_member and
+                        b.tree.tokens.tag(name_tok) == .keyword_constructor;
+                    const code: Code = if (is_ctor)
+                        .duplicate_constructor_implementation
+                    else
+                        .duplicate_function_implementation;
+                    try b.reportDuplicate(sym, code, name_tok);
                 }
                 try b.checkFunctionClassMerge(sym, existing, flags, name_tok);
             } else if (kind == .class) {
                 try b.checkFunctionClassMerge(sym, existing, flags, name_tok);
             }
             b.sym_flags.items[sym] = existing.merge(flags);
-            try b.appendDecl(sym, decl_node);
+            b.sym_block.items[sym] = b.cur_block;
+            try b.appendDecl(sym, decl_node, name_tok);
             try b.noteExport(sym, atom, scope);
             return sym;
         }
@@ -730,8 +870,10 @@ const Binder = struct {
         try b.sym_decl_head.append(b.scratch, 0);
         try b.sym_decl_tail.append(b.scratch, 0);
         try b.sym_decl_count.append(b.scratch, 0);
+        try b.sym_reported.append(b.scratch, 0);
+        try b.sym_block.append(b.scratch, b.cur_block);
         gop.value_ptr.* = sym;
-        try b.appendDecl(sym, decl_node);
+        try b.appendDecl(sym, decl_node, name_tok);
         try b.noteExport(sym, atom, scope);
         return sym;
     }
@@ -1622,6 +1764,16 @@ const Binder = struct {
         defer b.exporting_node = clear_export;
 
         const cs = try b.pushScope(.class, node);
+        // A class EXPRESSION's name is not declared in the enclosing scope,
+        // but it IS visible inside its own body — `var x = class C { m(c: C)
+        // {} }` names the class (tsc gives the ClassExpression a local
+        // symbol in its own scope). Declared here, in the class scope, so it
+        // shadows nothing outside.
+        if (!declare_name and data.name_token != 0) {
+            _ = try b.declare(cs, try b.atomOfToken(data.name_token), .class, node, data.name_token, .{
+                .nonambient_class = !b.ambient,
+            });
+        }
         try b.bindTypeParams(data.tp_start, data.tp_end);
 
         if (data.extends != 0) try b.bindHeritage(data.extends, true);
@@ -1635,6 +1787,9 @@ const Binder = struct {
             try b.member_scopes.put(b.scratch, class_sym, ms);
             try b.static_scopes.put(b.scratch, class_sym, ss);
         }
+        const saved_block = b.cur_block;
+        b.cur_block = node;
+        defer b.cur_block = saved_block;
 
         for (b.tree.extraRange(data.members_start, data.members_end)) |member| {
             if (member == null_node) continue;
@@ -1692,16 +1847,54 @@ const Binder = struct {
         }
     }
 
-    /// An enum declares one symbol (a value and a type). Member names live in
-    /// the enum's value object, materialized by the checker from the AST; the
-    /// binder only declares the enum symbol and binds member initializers in
-    /// the enclosing scope (so references in `A = expr` resolve/flow normally).
+    /// An enum declares one symbol (a value and a type) plus a scope holding
+    /// its MEMBERS. The member types still come from the value object the
+    /// checker materializes off the AST; what the scope adds is tsc's
+    /// `resolveName` case for `SyntaxKind.EnumDeclaration`, which consults
+    /// the enum's own table before any enclosing one — so `enum E { A = 1,
+    /// B = A }` names the member (and shadows an outer `A`), and two members
+    /// of one name are TS2300 at both spellings.
+    ///
+    /// Every block of a merged `enum E` shares one scope, keyed by the enum
+    /// symbol exactly as `bindNamespace` keys namespace bodies: a second
+    /// block sees the first block's members (`enum E { A0 = 100 } enum E {
+    /// … = A0 }`).
     fn bindEnum(b: *Binder, node: Node) Error!void {
         const d = b.tree.nodeData(node);
         const data = b.tree.extraData(ast.EnumData, d.lhs);
+        var sym: SymbolId = no_symbol;
         if (data.name_token != 0) {
             const atom = try b.atomOfToken(data.name_token);
-            _ = try b.declare(b.cur_scope, atom, .enum_decl, node, data.name_token, .{});
+            sym = try b.declare(b.cur_scope, atom, .enum_decl, node, data.name_token, .{});
+        }
+        var e_scope: ScopeId = 0;
+        if (sym != no_symbol) {
+            if (b.enum_scopes.get(sym)) |existing| {
+                e_scope = existing;
+            } else {
+                e_scope = try b.newScope(.enum_body, node, b.cur_scope);
+                try b.enum_scopes.put(b.scratch, sym, e_scope);
+            }
+        } else {
+            e_scope = try b.newScope(.enum_body, node, b.cur_scope);
+        }
+
+        // Only the lexical scope changes: an enum body declares no variables
+        // and starts no flow of its own, so `var_scope`/`cur_flow` stay put
+        // and a member initializer keeps flowing in the enclosing container.
+        const saved_scope = b.cur_scope;
+        b.cur_scope = e_scope;
+        defer b.cur_scope = saved_scope;
+        // Members are declared in TWO passes so a member initializer can name
+        // a member declared after it — tsc's table is complete before any
+        // initializer is evaluated, and `enum E { A = B, B = 1 }` really does
+        // resolve `B` (the *value* is the separate `computeConstantValue`
+        // question, which reports its own TS2651/TS18033).
+        for (b.tree.extraRange(data.members_start, data.members_end)) |member| {
+            if (member == null_node or b.nodeTag(member) != .enum_member) continue;
+            const name_tok = b.tree.nodeMainToken(member);
+            const atom = try b.memberAtom(name_tok);
+            _ = try b.declare(e_scope, atom, .enum_member, member, name_tok, .{});
         }
         for (b.tree.extraRange(data.members_start, data.members_end)) |member| {
             if (member == null_node or b.nodeTag(member) != .enum_member) continue;
@@ -1912,6 +2105,23 @@ const Binder = struct {
             sym = try b.declare(b.cur_scope, atom, .interface, node, data.name_token, .{});
         }
         const saved_scope = b.cur_scope;
+        const saved_block = b.cur_block;
+        b.cur_block = node;
+        defer b.cur_block = saved_block;
+
+        // Each block gets its OWN type-parameter scope, while merged blocks
+        // share ONE members scope — which is parented to the FIRST block's.
+        // A later block's type parameters are therefore off the members'
+        // parent chain, and `interface A<T> { x: T } interface A<U> { y: U }`
+        // reports a spurious "Cannot find name 'U'". tsc reports TS2428
+        // ("All declarations of 'A' must have identical type parameters")
+        // there and never resolves `U` at all, so the two agree on nothing
+        // but the code. Sharing this scope the way the members scope is
+        // shared was tried and reverted: it makes every block's parameters
+        // one symbol, which loses the per-block DEFAULTS that
+        // `test/conformance/instantiation/040_merged_interface_type_param_defaults.ts`
+        // pins (real `@types/node` depends on them). The fix is TS2428 plus a
+        // per-block parameter list, not one scope.
         const is = try b.pushScope(.interface, node);
         try b.bindTypeParams(data.tp_start, data.tp_end);
         for (b.tree.extraRange(data.extends_start, data.extends_end)) |h| {
@@ -2768,6 +2978,11 @@ const Binder = struct {
             .function_type, .method_signature, .constructor_type => try b.bindFunctionType(node, d.lhs),
             .object_type => {
                 const ms = try b.newScope(.interface_members, node, b.cur_scope);
+                // An object-type literal is its own (unshared) block, so a
+                // repeated member name in it is always a duplicate.
+                const saved_block = b.cur_block;
+                b.cur_block = node;
+                defer b.cur_block = saved_block;
                 for (b.tree.nodeRange(node)) |member| {
                     if (member != null_node) try b.bindTypeMember(member, ms);
                 }
@@ -3086,6 +3301,7 @@ const Binder = struct {
         const ssp = try sealPairMap(arena, b.scratch, &b.static_scopes);
         const nsp = try sealPairMap(arena, b.scratch, &b.namespace_scopes);
         const xsp = try sealPairMap(arena, b.scratch, &b.expando_scopes);
+        const esp = try sealPairMap(arena, b.scratch, &b.enum_scopes);
 
         // Flow: convert label pending ids into flow_extra ranges.
         const n_flows = b.flow_tags.items.len;
@@ -3147,6 +3363,8 @@ const Binder = struct {
             .ns_scope_ids = nsp.vals,
             .expando_scope_syms = xsp.keys,
             .expando_scope_ids = xsp.vals,
+            .enum_scope_syms = esp.keys,
+            .enum_scope_ids = esp.vals,
             .flow_tags = flow_tags,
             .flow_a = flow_a,
             .flow_b = flow_b,
@@ -3623,16 +3841,32 @@ test "golden: type alias with type params" {
 
 // --- duplicate-declaration diagnostics --------------------------------------
 
-test "dup: let/let redeclare is TS2451" {
-    try expectBindCodes("let x = 1; let x = 2;", &.{.block_scoped_redeclare});
+// Every failed merge is reported at EVERY spelling of the name, tsc's
+// `addDuplicateDeclarationErrorsForSymbols` — see `reportDuplicate`. The
+// expectations below (codes AND counts) were read off the pinned tsgo 7.0.2
+// oracle, one probe file per group.
+
+test "dup: let/let redeclare is TS2451, once per declaration" {
+    try expectBindCodes("let x = 1; let x = 2;", &.{ .block_scoped_redeclare, .block_scoped_redeclare });
+    // Three declarations, three diagnostics — never nine.
+    try expectBindCodes(
+        "let x = 1; let x = 2; let x = 3;",
+        &.{ .block_scoped_redeclare, .block_scoped_redeclare, .block_scoped_redeclare },
+    );
     try testing.expectEqual(@as(u16, 2451), Code.block_scoped_redeclare.tsCode());
 }
 
-test "dup: var-vs-let in both orders is TS2451" {
-    try expectBindCodes("var x; let x;", &.{.block_scoped_redeclare});
-    try expectBindCodes("let x; var x;", &.{.block_scoped_redeclare});
-    // Order-independence across blocks: the var hoists past the let's scope.
-    try expectBindCodes("let x; { var x; }", &.{.block_scoped_redeclare});
+test "dup: var-vs-let picks the code off the EXISTING symbol" {
+    // tsc's `declareSymbol` tests `symbol.flags & BlockScopedVariable` — the
+    // symbol already in the table — so the two orders differ.
+    try expectBindCodes("var x; let x;", &.{ .duplicate_identifier, .duplicate_identifier });
+    try expectBindCodes("let x; var x;", &.{ .block_scoped_redeclare, .block_scoped_redeclare });
+    // Order-independence across blocks: the var hoists past the let's scope
+    // and lands in the same table, so the clash names both spellings.
+    try expectBindCodes("let x; { var x; }", &.{ .block_scoped_redeclare, .block_scoped_redeclare });
+    // A `let` INSIDE the block the var hoisted out of is the transit check,
+    // which has only the newcomer to name (ztsc reports TS2451 where tsc has
+    // the more specific TS2481 — a pre-existing divergence, not this rule).
     try expectBindCodes("{ var x; let x; }", &.{.block_scoped_redeclare});
     // No conflict when the block-scoped name is in a sibling/inner scope.
     try expectBindCodes("var x; { let x; }", &.{});
@@ -3640,15 +3874,34 @@ test "dup: var-vs-let in both orders is TS2451" {
 }
 
 test "dup: class/let and class/class" {
-    try expectBindCodes("let A; class A {}", &.{.block_scoped_redeclare});
-    try expectBindCodes("class A {} let A;", &.{.block_scoped_redeclare});
-    try expectBindCodes("class A {} class A {}", &.{.duplicate_identifier});
+    // A `class` is not one of tsc's `BlockScopedVariable` bits, so it only
+    // yields TS2451 when the *existing* symbol is a `let`/`const`.
+    try expectBindCodes("let A; class A {}", &.{ .block_scoped_redeclare, .block_scoped_redeclare });
+    try expectBindCodes("class A {} let A;", &.{ .duplicate_identifier, .duplicate_identifier });
+    try expectBindCodes("class A {} var A;", &.{ .duplicate_identifier, .duplicate_identifier });
+    try expectBindCodes("class A {} class A {}", &.{ .duplicate_identifier, .duplicate_identifier });
 }
 
 test "dup: var/function is TS2300, var/var and var/param merge" {
-    try expectBindCodes("function f() {} var f;", &.{.duplicate_identifier});
+    try expectBindCodes("function f() {} var f;", &.{ .duplicate_identifier, .duplicate_identifier });
     try expectBindCodes("var x; var x;", &.{});
     try expectBindCodes("function f(x: number) { var x; }", &.{});
+    // Declarations that merged silently are still named when a LATER one
+    // clashes: `var g; var g; class g {}` is three TS2300s.
+    try expectBindCodes(
+        "var g; var g; class g {}",
+        &.{ .duplicate_identifier, .duplicate_identifier, .duplicate_identifier },
+    );
+}
+
+test "dup: an enum on either side of a failed merge is TS2567" {
+    try expectBindCodes("enum E { A } var E;", &.{ .enum_merge_conflict, .enum_merge_conflict });
+    try expectBindCodes("var E; enum E { A }", &.{ .enum_merge_conflict, .enum_merge_conflict });
+    try expectBindCodes("enum E { A } class E {}", &.{ .enum_merge_conflict, .enum_merge_conflict });
+    // Enum+enum and enum+namespace still merge.
+    try expectBindCodes("enum E { A } enum E { B }", &.{});
+    try expectBindCodes("enum E { A } namespace E { export const v = 1; }", &.{});
+    try testing.expectEqual(@as(u16, 2567), Code.enum_merge_conflict.tsCode());
 }
 
 test "dup: a type-only namespace merges with a variable, an instantiated one does not" {
@@ -3661,65 +3914,127 @@ test "dup: a type-only namespace merges with a variable, an instantiated one doe
     try expectBindCodes("namespace O { namespace Inner { type A = number; } } let O: number;", &.{});
     try expectBindCodes("namespace C { const enum K { A } } let C: number;", &.{});
     // A value in the body makes it instantiated, and the clash is real again.
-    try expectBindCodes("namespace P { export const v = 1; } const P = 2;", &.{.block_scoped_redeclare});
-    try expectBindCodes("namespace Q { function f() {} } const Q = 2;", &.{.block_scoped_redeclare});
-    try expectBindCodes("namespace R { enum K { A } } const R = 2;", &.{.block_scoped_redeclare});
-    try expectBindCodes("namespace S { namespace In { export class C {} } } const S = 2;", &.{.block_scoped_redeclare});
+    // The code comes off the EXISTING symbol: a namespace is not a
+    // `BlockScopedVariable`, so `namespace P {…} const P` is TS2300 while
+    // `const V; namespace V {…}` is TS2451 (both oracle-verified).
+    const dup2: []const Code = &.{ .duplicate_identifier, .duplicate_identifier };
+    try expectBindCodes("namespace P { export const v = 1; } const P = 2;", dup2);
+    try expectBindCodes("namespace Q { function f() {} } const Q = 2;", dup2);
+    try expectBindCodes("namespace R { enum K { A } } const R = 2;", dup2);
+    try expectBindCodes("namespace S { namespace In { export class C {} } } const S = 2;", dup2);
+    try expectBindCodes(
+        "const V = 2; namespace V { export const v = 1; }",
+        &.{ .block_scoped_redeclare, .block_scoped_redeclare },
+    );
     // The flag is an AND over merged blocks, not an OR: one instantiated block
     // makes the whole symbol a value module whichever order it is bound in.
-    try expectBindCodes("namespace T { type A = number; } namespace T { export const v = 1; } const T = 2;", &.{.block_scoped_redeclare});
-    try expectBindCodes("namespace U { export const v = 1; } namespace U { type A = number; } const U = 2;", &.{.block_scoped_redeclare});
+    // Both namespace blocks are declarations of the name, so the clash names
+    // all three spellings.
+    const dup3: []const Code = &.{ .duplicate_identifier, .duplicate_identifier, .duplicate_identifier };
+    try expectBindCodes("namespace T { type A = number; } namespace T { export const v = 1; } const T = 2;", dup3);
+    try expectBindCodes("namespace U { export const v = 1; } namespace U { type A = number; } const U = 2;", dup3);
 }
 
 test "dup: two function implementations is TS2393, overloads are fine" {
-    try expectBindCodes("function f() {} function f() {}", &.{.duplicate_function_implementation});
+    const impl2: []const Code = &.{ .duplicate_function_implementation, .duplicate_function_implementation };
+    try expectBindCodes("function f() {} function f() {}", impl2);
     try expectBindCodes("function f(): void; function f() {}", &.{});
     try expectBindCodes(
         "class C { m(): void; m(a: number): void; m(a?: number) {} }",
         &.{},
     );
+    try expectBindCodes("class C { m() {} m() {} }", impl2);
+    // The overload SIGNATURE is a declaration of the name too, so it is named
+    // alongside both implementations (oracle-verified: three TS2393s).
     try expectBindCodes(
-        "class C { m() {} m() {} }",
-        &.{.duplicate_function_implementation},
+        "function f(): void; function f() {} function f() {}",
+        &.{ .duplicate_function_implementation, .duplicate_function_implementation, .duplicate_function_implementation },
     );
 }
 
 test "dup: duplicate parameters are TS2300 (strict mode)" {
-    try expectBindCodes("function f(a: number, a: string) {}", &.{.duplicate_identifier});
-    try expectBindCodes("function f([a, b]: any, { a: a2, c: a }: any) {}", &.{.duplicate_identifier});
+    const dup2: []const Code = &.{ .duplicate_identifier, .duplicate_identifier };
+    try expectBindCodes("function f(a: number, a: string) {}", dup2);
+    try expectBindCodes("function f([a, b]: any, { a: a2, c: a }: any) {}", dup2);
 }
 
 test "dup: import conflicts are TS2440, duplicate imports TS2300" {
+    // TS2440 names the IMPORT declaration and nothing else, in either
+    // order — the message *is* "Import declaration conflicts with local
+    // declaration of 'a'" (oracle-verified in both orders).
     try expectBindCodes("import { a } from \"./m\"; let a = 1;", &.{.import_conflict});
     try expectBindCodes("let a = 1; import { a } from \"./m\";", &.{.import_conflict});
-    try expectBindCodes("import { a } from \"./m\"; import { a } from \"./n\";", &.{.duplicate_identifier});
+    // Two imports of one name are an ordinary duplicate, at both spellings.
+    try expectBindCodes(
+        "import { a } from \"./m\"; import { a } from \"./n\";",
+        &.{ .duplicate_identifier, .duplicate_identifier },
+    );
     // Type-only imports live in type space only.
     try expectBindCodes("import type { T } from \"./m\"; let T = 1;", &.{});
     try expectBindCodes("import type { T } from \"./m\"; type T = number;", &.{.import_conflict});
 }
 
+test "dup: a name repeated across MERGING blocks is not a duplicate" {
+    // Two `interface I` blocks (and a class + interface pair) share one
+    // member table; a same-named member merges there and a type conflict is
+    // TS2717, not TS2300. Within one block it is still a duplicate.
+    try expectBindCodes("interface I { a: number; } interface I { a: string; }", &.{});
+    try expectBindCodes("class C { p: number; } interface C { p: string; }", &.{});
+    try expectBindCodes(
+        "interface I { a: number; a: string; }",
+        &.{ .duplicate_identifier, .duplicate_identifier },
+    );
+    // An object-type literal is its own block.
+    try expectBindCodes(
+        "type T = { a: number; a: string; };",
+        &.{ .duplicate_identifier, .duplicate_identifier },
+    );
+}
+
+test "dup: a duplicate type parameter names only the later one" {
+    // tsc catches these in `checkTypeParameters`, comparing each parameter
+    // against its predecessors — so only the second is reported.
+    try expectBindCodes("interface I<T, T> {}", &.{.duplicate_identifier});
+    try expectBindCodes("class C<T, T> {}", &.{.duplicate_identifier});
+    try expectBindCodes("function f<T, T>() {}", &.{.duplicate_identifier});
+    try expectBindCodes("type A<T, T> = T;", &.{.duplicate_identifier});
+}
+
+test "dup: two constructor implementations are TS2392, not TS2393" {
+    try expectBindCodes(
+        "class C { constructor(a: number) {} constructor(b: string) {} }",
+        &.{ .duplicate_constructor_implementation, .duplicate_constructor_implementation },
+    );
+    try expectBindCodes("class C { constructor(); constructor(a?: number) {} }", &.{});
+    try testing.expectEqual(@as(u16, 2392), Code.duplicate_constructor_implementation.tsCode());
+}
+
 test "dup: catch-clause redeclaration is TS2492, var escape is allowed" {
+    // The one code that is NOT repeated at every spelling: tsc marks the
+    // redeclaration and leaves the `catch (e)` binding alone.
     try expectBindCodes("try {} catch (e) { let e; }", &.{.catch_redeclare});
     try expectBindCodes("try {} catch (e) { var e; }", &.{});
 }
 
 test "dup: type-space clashes" {
-    try expectBindCodes("interface I {} type I = number;", &.{.duplicate_identifier});
-    try expectBindCodes("type T = number; type T = string;", &.{.duplicate_identifier});
-    try expectBindCodes("class C {} type C = number;", &.{.duplicate_identifier});
+    const dup2: []const Code = &.{ .duplicate_identifier, .duplicate_identifier };
+    try expectBindCodes("interface I {} type I = number;", dup2);
+    try expectBindCodes("type T = number; type T = string;", dup2);
+    try expectBindCodes("class C {} type C = number;", dup2);
     // Value/type space sharing is legal (one merged symbol).
     try expectBindCodes("var x = 1; interface x {}", &.{});
     try expectBindCodes("function f() {} interface f {}", &.{});
 }
 
 test "dup: class members" {
-    try expectBindCodes("class C { x: number; x: string; }", &.{.duplicate_identifier});
+    const dup2: []const Code = &.{ .duplicate_identifier, .duplicate_identifier };
+    try expectBindCodes("class C { x: number; x: string; }", dup2);
     try expectBindCodes("class C { x: number; m() {} }", &.{});
     // Instance and static sides are separate tables.
     try expectBindCodes("class C { x: number; static x: string; }", &.{});
     // get/set pairs merge silently.
     try expectBindCodes("class C { get v(): number { return 1; } set v(n: number) {} }", &.{});
-    try expectBindCodes("interface I { a: number; a: string; }", &.{.duplicate_identifier});
+    try expectBindCodes("interface I { a: number; a: string; }", dup2);
 }
 
 // --- flow graph structure -----------------------------------------------------

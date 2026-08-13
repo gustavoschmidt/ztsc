@@ -236,6 +236,10 @@ fn checkAmbientInitializer(c: *Checker, decl: Node, is_const: bool) Error!void {
 }
 
 fn checkDeclarator(c: *Checker, decl: Node, is_const: bool) Error!void {
+    // TS2403 — every declaration of a name after the first must have an
+    // identical type. Runs before the initializer checks so the type demand
+    // is the same one `typeOfSymbol` would make on its own.
+    try c.checkSubsequentVarDecl(decl, is_const);
     const d = c.tree.nodeData(decl);
     switch (c.nodeTag(decl)) {
         .declarator => {},
