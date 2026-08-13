@@ -530,7 +530,7 @@ fn flowType(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth: u32
         while (i > 0) : (i -= 1) {
             const fr = &c.flow_loop_stack.items[i - 1];
             if (fr.q != q or fr.parts.items.len == 0) continue;
-            return c.ts.makeUnion(c.scratch(), fr.parts.items);
+            return narrow.recombineUnknown(c, try c.ts.makeUnion(c.scratch(), fr.parts.items));
         }
     }
     // `flow_same` covers both states that answer `declared`: a query still
@@ -967,7 +967,9 @@ fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth
                 if (c.flow_back_edge == 0) c.flow_tmp.clearRetainingCapacity();
             }
             if (parts.items.len == 0) return types.never_type;
-            const joined = try c.ts.makeUnion(c.scratch(), parts.items);
+            // `recombineUnknown`: a join whose branches between them re-spell
+            // `unknown` must hand `unknown` back, not its expansion.
+            const joined = narrow.recombineUnknown(c, try c.ts.makeUnion(c.scratch(), parts.items));
             // tsc joins the antecedents of an EVOLVING (`auto`-typed)
             // variable with `UnionReduction.Subtype`, so a branch that
             // assigns `{ appState: … }` and one that assigns the

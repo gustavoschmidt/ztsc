@@ -73,6 +73,34 @@ pub fn narrowByLiteralEquality(c: *Checker, t: TypeId, other: Node, strict: bool
     return c.narrowExcludeValue(t, ot);
 }
 
+/// tsc's `recombineUnknownType`: `{} | null | undefined` (`unknownUnionType`)
+/// IS `unknown`, and tsc re-spells it the moment a narrowing that expanded
+/// `unknown` into it hands the type back.
+///
+/// A flow JOIN is where the expansion otherwise escapes: `if (u === undefined)`
+/// leaves `undefined` on one branch and `{} | null` on the other, and their
+/// union is the expanded spelling. Every later query then sees a union where
+/// tsc sees `unknown` — which silently disables every `unknown`-only rule
+/// downstream, `narrowTypeByEquality`'s included.
+pub fn recombineUnknown(c: *Checker, t: TypeId) TypeId {
+    if (c.ts.kind(t) != .union_type) return t;
+    const members = c.ts.members(t);
+    if (members.len != 3) return t;
+    var has_empty = false;
+    var has_null = false;
+    var has_undef = false;
+    for (members) |m| {
+        switch (c.ts.kind(m)) {
+            .null => has_null = true,
+            .undefined => has_undef = true,
+            else => if (m == types.empty_object_type) {
+                has_empty = true;
+            } else return t,
+        }
+    }
+    return if (has_empty and has_null and has_undef) types.unknown_type else t;
+}
+
 /// What a strict `unknown === v` narrows the reference to, or null when `v`
 /// tells us nothing (tsc's `narrowTypeByEquality`, the `TypeFlags.Unknown &&
 /// assumeTrue` arm):
