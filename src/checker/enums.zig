@@ -228,11 +228,13 @@ fn aliasedEnumInitValue(c: *Checker, own: SymbolId, init_node: Node) Error!?Type
             if (esym == own) return null; // a member of THIS enum, mid-walk
             return c.enumMemberValue(esym, name);
         },
-        // The bare-name form (`B = A`, a member of the same enum) is left
-        // alone: ztsc's binder declares no scope for an enum body — member
-        // names live in the value object the checker materializes — so such
-        // a reference is already TS2304 and folding its value would not make
-        // the declaration check.
+        // The bare-name form (`B = A`, a member of the same enum) RESOLVES
+        // — `bindEnum` gives the body its own scope — but is not folded:
+        // `own` is mid-walk here, so re-entering `enumMembersOf` for it
+        // would recurse, and the values of the members already visited are
+        // not threaded through this call. The member is classified
+        // `computed`, exactly as it was before the scope existed, so this is
+        // a pure under-fold: a value tsc knows and ztsc does not.
         else => return null,
     }
 }
@@ -431,6 +433,28 @@ pub fn enumMembersOf(c: *Checker, sym: SymbolId) Error![]const checker_zig.EnumM
     const out = col.list.items;
     try c.enum_members.put(c.cm(), sym, out);
     return out;
+}
+
+/// The enum a MEMBER symbol belongs to, as a global (possibly cross-file
+/// merged) symbol: members live in the enum's body scope, which
+/// `enumOfScope` maps straight back to the enum symbol.
+pub fn enumOfMemberSym(c: *Checker, sym: SymbolId) ?SymbolId {
+    const local = c.localOf(sym);
+    const b = c.symBind(sym);
+    const scope = b.symbol_scopes[local];
+    const owner = b.enumOfScope(scope) orelse return null;
+    const g = c.toGlobalIn(c.symFile(sym), owner);
+    return c.prog.mergedOf(g) orelse g;
+}
+
+/// `getTypeOfSymbol` for an enum MEMBER symbol — the member literal type
+/// `E.A`, the same type `E.A` produces at a property access (`memberTypeOf`
+/// builds it with the same `makeEnumMember` call). A member whose enclosing
+/// enum cannot be recovered degrades to `number`, never to an error type:
+/// the reference itself resolved.
+pub fn enumMemberSymbolType(c: *Checker, sym: SymbolId) Error!TypeId {
+    const esym = enumOfMemberSym(c, sym) orelse return types.number_type;
+    return c.ts.makeEnumMember(esym, c.symNameAtom(sym), false);
 }
 
 /// Does enum `sym` declare a member called `name`?
@@ -771,6 +795,19 @@ pub fn enumIsStringValued(c: *Checker, sym: SymbolId) Error!bool {
 pub fn checkEnum(c: *Checker, node: Node) Error!void {
     const d = c.tree.nodeData(node);
     const data = c.tree.extraData(ast.EnumData, d.lhs);
+    // Initializers are checked INSIDE the enum's member scope, so a bare
+    // member name resolves to the member (and shadows an outer binding of
+    // the same name) — tsc's `resolveName` case for an EnumDeclaration
+    // location. Reached through the enum SYMBOL rather than `scopeOf(node)`,
+    // because merged blocks share one scope owned by the first of them.
+    const saved_scope = c.cur_scope;
+    defer c.cur_scope = saved_scope;
+    if (data.name_token != 0) {
+        const a = try c.atomOfToken(data.name_token);
+        if (c.bind.lookupInScope(c.cur_scope, a)) |local| {
+            if (c.bind.enumScopeOf(local)) |s| c.cur_scope = s;
+        }
+    }
     // A member with no initializer is only legal when the previous member
     // (or the start of the enum) is a numeric constant it can continue.
     var prev_numeric_const = true;

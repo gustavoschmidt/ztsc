@@ -29,6 +29,7 @@
 
 const std = @import("std");
 const ast = @import("../frontend/ast.zig");
+const scanner = @import("../frontend/scanner.zig");
 const intern = @import("../intern.zig");
 const binder = @import("../frontend/binder.zig");
 const types = @import("../types.zig");
@@ -67,17 +68,30 @@ pub fn atomText(c: *Checker, a: Atom) []const u8 {
     return c.interner.lookup(c.io, a);
 }
 
-pub fn atomOfToken(c: *Checker, tok: TokenIndex) Error!Atom {
-    return c.atom(c.tokenText(tok));
+/// Atom of an identifier-ish token, `\uXXXX` escapes decoded — tsc's
+/// `escapedText`, the name the binder filed the symbol under (mirrors
+/// `Binder.atomOfIdent`, and must keep mirroring it: the two index the same
+/// symbol tables). The decoded bytes live in a stack buffer, so they go
+/// straight to the interner rather than through `atom`, whose cache would
+/// keep the dangling slice as a key.
+fn atomOfIdentText(c: *Checker, text: []const u8) Error!Atom {
+    var buf: [scanner.max_unescaped_ident]u8 = undefined;
+    const decoded = scanner.unescapeIdentifier(text, &buf) orelse return c.atom(text);
+    return c.internText(decoded);
 }
 
-/// Property-name atom: string keys lose quotes.
+pub fn atomOfToken(c: *Checker, tok: TokenIndex) Error!Atom {
+    return atomOfIdentText(c, c.tokenText(tok));
+}
+
+/// Property-name atom: string keys lose quotes; an identifier key's `\uXXXX`
+/// escapes are decoded (a string key's are not — see `Binder.memberAtom`).
 pub fn memberAtom(c: *Checker, tok: TokenIndex) Error!Atom {
     const text = c.tokenText(tok);
     switch (c.tree.tokens.tag(tok)) {
         // `.jsx_string` is a JSX attribute's quoted value.
         .string_literal, .jsx_string => return c.atom(stripQuotes(text)),
-        else => return c.atom(text),
+        else => return atomOfIdentText(c, text),
     }
 }
 

@@ -45,6 +45,11 @@ pub const ScopeKind = enum(u8) {
     interface,
     interface_members,
     namespace,
+    /// The member table of one `enum` (shared by every block of a merged
+    /// enum). Entered while binding member initializers, so a bare name
+    /// there resolves to a member of the same enum first — tsc's
+    /// `resolveName` case for `SyntaxKind.EnumDeclaration`.
+    enum_body,
     type_alias,
     for_head,
     catch_clause,
@@ -125,7 +130,13 @@ pub const SymbolFlags = packed struct(u32) {
     /// `never` for them) — and with `keyof` every mapped type over it,
     /// `Pick<T, keyof T>` most of all.
     non_public: bool = false,
-    _pad: u2 = 0,
+    /// One member of an `enum` body. tsc's `SymbolFlags.EnumMember`: a VALUE
+    /// (its type is the member literal `E.A`), declared in the enum's own
+    /// symbol table, which `resolveName` consults at the EnumDeclaration
+    /// location — so a bare `A` inside a member initializer names the member
+    /// and shadows an outer `A`. Two members of one name are TS2300.
+    enum_member: bool = false,
+    _pad: u1 = 0,
 
     pub fn bits(f: SymbolFlags) u32 {
         return @bitCast(f);
@@ -305,6 +316,10 @@ pub const Bind = struct {
     /// expando functions (the common case).
     expando_scope_syms: []const SymbolId = &.{},
     expando_scope_ids: []const ScopeId = &.{},
+    /// Enum symbol -> its member scope, sorted by symbol id. Every block of a
+    /// merged `enum E` shares the one entry. Empty for a file with no enums.
+    enum_scope_syms: []const SymbolId = &.{},
+    enum_scope_ids: []const ScopeId = &.{},
 
     // --- flow graph (SoA; 0 = none, 1 = shared unreachable) ---------------
     flow_tags: []const FlowTag,
@@ -382,7 +397,9 @@ pub const Bind = struct {
     /// strings.
     ///
     /// internal: read by the binder test that enforces the reminder.
-    pub const remap_field_count = 37;
+    /// (39 includes `enum_scope_syms`/`enum_scope_ids`, which hold symbol and
+    /// scope ids — no atoms — so they need no rewrite.)
+    pub const remap_field_count = 39;
 
     /// Rewrite every atom this file stored through `map` (old atom -> new
     /// atom), restoring the atom-sorted order of the tables that have one.
@@ -522,6 +539,22 @@ pub const Bind = struct {
         return searchPair(b.ns_scope_syms, b.ns_scope_ids, sym);
     }
 
+    /// Member scope of an enum symbol — where its member symbols live and
+    /// where a member initializer's names resolve (`bindEnum`).
+    pub fn enumScopeOf(b: *const Bind, sym: SymbolId) ?ScopeId {
+        return searchPair(b.enum_scope_syms, b.enum_scope_ids, sym);
+    }
+
+    /// The enum symbol whose members live in `scope`, or null when `scope` is
+    /// not an enum body. The reverse of `enumScopeOf`; enums per file are few,
+    /// so the pair list is scanned rather than carrying a second sorted copy.
+    pub fn enumOfScope(b: *const Bind, scope: ScopeId) ?SymbolId {
+        for (b.enum_scope_ids, b.enum_scope_syms) |id, sym| {
+            if (id == scope) return sym;
+        }
+        return null;
+    }
+
     /// Expando-property scope of a function symbol, if any.
     pub fn expandoScopeOf(b: *const Bind, sym: SymbolId) ?ScopeId {
         return searchPair(b.expando_scope_syms, b.expando_scope_ids, sym);
@@ -595,7 +628,8 @@ pub const Bind = struct {
             b.member_atoms.len * (@sizeOf(Atom) + @sizeOf(SymbolId)) +
             b.member_scope_syms.len * 2 * @sizeOf(u32) +
             b.static_scope_syms.len * 2 * @sizeOf(u32) +
-            b.ns_scope_syms.len * 2 * @sizeOf(u32);
+            b.ns_scope_syms.len * 2 * @sizeOf(u32) +
+            b.enum_scope_syms.len * 2 * @sizeOf(u32);
     }
 
     /// Exact bytes of the sealed flow graph + node attachment map.

@@ -30,7 +30,8 @@ const indexOfAtom = @import("generics.zig").indexOfAtom;
 pub fn hasValueMeaning(f: binder.SymbolFlags) bool {
     if (f.import_binding and f.type_only) return false;
     return f.var_decl or f.let_decl or f.const_decl or f.function or f.class or
-        f.param or f.catch_param or f.import_binding or f.enum_decl or f.namespace_decl;
+        f.param or f.catch_param or f.import_binding or f.enum_decl or f.namespace_decl or
+        f.enum_member;
 }
 
 pub fn hasTypeMeaning(f: binder.SymbolFlags) bool {
@@ -180,12 +181,26 @@ fn spellDistance(name: []const u8, cand: []const u8, cap: usize) ?usize {
 /// one declared earlier in the file, so comparing ids across scopes would
 /// let an outer candidate beat an inner one; tsc's shrinking threshold
 /// never does.
+///
+/// The walk ends in the GLOBAL (lib) table, exactly as `resolveSpaceInner`
+/// does: `getSuggestedSymbolForNonexistentSymbol` rides tsc's ordinary
+/// `resolveNameHelper`, whose last stop is the global symbol table, so an
+/// unresolved `$ERROR` really does suggest the lib's `Error`. Scanning the
+/// whole table is only reached on the ERROR path (a name that resolved to
+/// nothing), which is where tsc computes suggestions too, and the length
+/// pre-filter inside `spellCandidateDistance` rejects all but a sliver of it
+/// before any DP row is built.
 pub fn suggestName(c: *Checker, a: Atom, from: ScopeId, want_value: bool) ?Atom {
     const text = c.atomText(a);
     if (text.len == 0 or text.len > spell_max_len) return null;
     var best: ?Atom = null;
     var best_sym: binder.SymbolId = 0;
     var best_scope: ScopeId = 0;
+    // The incumbent came from the global table rather than a lexical scope,
+    // so the declaration-order tie-break must compare global ids with global
+    // ids (a lexical `SymbolId` and a program-wide global id are different
+    // numbering spaces).
+    var best_global = false;
     // Inclusive acceptance bound in tenths; shrinks to the incumbent's
     // distance so a strictly closer candidate wins outright and an exactly
     // tied one falls to the declaration-order tie-break below.
@@ -204,15 +219,34 @@ pub fn suggestName(c: *Checker, a: Atom, from: ScopeId, want_value: bool) ?Atom 
             const cand_text = c.atomText(cand);
             const d = spellDistance(text, cand_text, best_d) orelse continue;
             const better = best == null or d < best_d or
-                (d == best_d and s == best_scope and sym < best_sym);
+                (d == best_d and !best_global and s == best_scope and sym < best_sym);
             if (!better) continue;
             best_d = d;
             best_sym = sym;
             best_scope = s;
+            best_global = false;
             best = cand;
         }
         if (s == binder.file_scope) break;
         s = c.bind.scope_parents[s];
+    }
+    // Globals are visited last, so a lexical candidate at the same distance
+    // keeps the suggestion (tsc only replaces on a strictly smaller one);
+    // among globals the smaller id — the earlier lib declaration — wins.
+    for (c.prog.globals.atoms, c.prog.globals.syms) |cand, gsym| {
+        if (cand == a) continue;
+        const gf = c.symFlags(gsym);
+        const ok = if (want_value) hasValueMeaning(gf) else hasTypeMeaning(gf);
+        if (!ok) continue;
+        const cand_text = c.atomText(cand);
+        const d = spellDistance(text, cand_text, best_d) orelse continue;
+        const better = best == null or d < best_d or
+            (d == best_d and best_global and gsym < best_sym);
+        if (!better) continue;
+        best_d = d;
+        best_sym = gsym;
+        best_global = true;
+        best = cand;
     }
     return best;
 }
@@ -227,6 +261,20 @@ pub fn suggestName(c: *Checker, a: Atom, from: ScopeId, want_value: bool) ?Atom 
 /// over both — tsc tries `getSuggestedSymbolForNonexistentSymbol` before it
 /// falls back to the not-found message, so `require` with `Required` in scope
 /// is TS2552, not TS2591.
+/// tsc's `checkAndReportErrorForUsingTypeAsValue`: six primitive TYPE names
+/// are never values, and a value-position use of one is TS2693 rather than
+/// any not-found message — checked before the spelling suggestion, so
+/// `var x = number` is "'number' only refers to a type" and not "did you mean
+/// 'Number'". The list is tsc's, verbatim; `bigint`, `symbol`, `object`,
+/// `void` and `undefined` are deliberately NOT on it.
+pub fn primitiveTypeNameUsedAsValue(text: []const u8) bool {
+    const names = [_][]const u8{ "any", "string", "number", "boolean", "never", "unknown" };
+    for (names) |n| {
+        if (std.mem.eql(u8, text, n)) return true;
+    }
+    return false;
+}
+
 pub fn reportNameNotFound(c: *Checker, tok: ast.TokenIndex) Error!void {
     const text = c.tokenText(tok);
     if (!paths.isNodeGlobalName(text)) {

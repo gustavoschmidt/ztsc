@@ -32,6 +32,7 @@ const diagFmt = Checker.diagFmt;
 const flowTypeOfReference = @import("flow.zig").flowTypeOfReference;
 const gatherSpreadProps = @import("typenode.zig").gatherSpreadProps;
 const globalThisType = @import("instantiate.zig").globalThisType;
+const names_zig = @import("names.zig");
 const hasTypeMeaning = @import("names.zig").hasTypeMeaning;
 const hasValueMeaning = @import("names.zig").hasValueMeaning;
 const indexableConstituent = @import("typenode.zig").indexableConstituent;
@@ -552,6 +553,13 @@ fn checkIdentifier(c: *Checker, node: Node) Error!TypeId {
             // `getGlobalIArgumentsType()` once `isInsideFunction` holds).
             if (std.mem.eql(u8, c.atomText(a), "arguments")) {
                 if (try c.implicitArgumentsType()) |t| return t;
+            }
+            // A primitive TYPE name in a value position is TS2693, ahead of
+            // both the suggestion and the not-found message (tsc's
+            // `checkAndReportErrorForUsingTypeAsValue`).
+            if (names_zig.primitiveTypeNameUsedAsValue(c.tokenText(tok))) {
+                try c.diagFmt(2693, c.tokSpan(tok), "'{s}' only refers to a type, but is being used as a value here.", .{c.tokenText(tok)});
+                return types.error_type;
             }
             if (c.suggestName(a, c.cur_scope, true)) |sugg| {
                 try c.diagFmt(2552, c.tokSpan(tok), "Cannot find name '{s}'. Did you mean '{s}'?", .{ c.tokenText(tok), c.atomText(sugg) });

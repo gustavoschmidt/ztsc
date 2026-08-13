@@ -81,6 +81,70 @@ pub fn scanJsxName(src: []const u8, at_index: u32) u32 {
     return s.index;
 }
 
+/// The NAME an identifier token spells, with its `\uXXXX` / `\u{H+}` escapes
+/// resolved to UTF-8 — tsc's `escapedText`, which is what every symbol table
+/// is keyed by: `var А = 1;` declares `А`, and a later plain `А` is the
+/// same name. Returns null when `text` carries no escape (the overwhelmingly
+/// common case) so callers keep the zero-copy source slice, and also when the
+/// decoded name would not fit `buf` or an escape is malformed — a name is
+/// then filed under its raw spelling, which is exactly today's behavior.
+///
+/// A decoded name is never longer than its source (`\uXXXX` is six bytes and
+/// yields at most four), so `buf.len >= text.len` always suffices. The
+/// `\` probe is a single scan of a short slice on a path that already
+/// rescans the token to find its end.
+///
+/// `max_unescaped_ident` is the stack buffer every caller uses: an escaped
+/// identifier longer than that keeps its raw spelling.
+pub const max_unescaped_ident = 512;
+
+pub fn unescapeIdentifier(text: []const u8, buf: []u8) ?[]const u8 {
+    if (std.mem.indexOfScalar(u8, text, '\\') == null) return null;
+    if (buf.len < text.len) return null;
+    var out: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] != '\\') {
+            buf[out] = text[i];
+            out += 1;
+            i += 1;
+            continue;
+        }
+        if (i + 1 >= text.len or text[i + 1] != 'u') return null;
+        var j = i + 2;
+        var cp: u32 = 0;
+        if (j < text.len and text[j] == '{') {
+            j += 1;
+            var digits: u32 = 0;
+            while (j < text.len and isHexDigit(text[j])) : (j += 1) {
+                cp = cp *% 16 + hexValue(text[j]);
+                digits += 1;
+            }
+            if (digits == 0 or j >= text.len or text[j] != '}') return null;
+            j += 1;
+        } else {
+            if (j + 4 > text.len) return null;
+            for (text[j .. j + 4]) |h| {
+                if (!isHexDigit(h)) return null;
+                cp = cp * 16 + hexValue(h);
+            }
+            j += 4;
+        }
+        // A lone surrogate or an out-of-range code point has no UTF-8 form;
+        // leave the whole name raw rather than inventing bytes for it.
+        if (cp > 0x10FFFF or (cp >= 0xD800 and cp <= 0xDFFF)) return null;
+        const n = std.unicode.utf8Encode(@intCast(cp), buf[out..]) catch return null;
+        out += n;
+        i = j;
+    }
+    return buf[0..out];
+}
+
+fn hexValue(c: u8) u32 {
+    if (c >= '0' and c <= '9') return c - '0';
+    return (c | 0x20) - 'a' + 10;
+}
+
 /// Scan a JSX attribute's quoted value starting at the quote at `at`,
 /// returning the offset just past the closing quote (or end of file if
 /// there is none). A JSX attribute string runs to the matching quote and

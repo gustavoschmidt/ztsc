@@ -84,10 +84,20 @@ pub const Code = enum(u16) {
     /// TS2300: two declarations of the same name that cannot merge
     /// (class+class, function+var, duplicate params, type+interface, ...).
     duplicate_identifier,
-    /// TS2451: block-scoped (let/const/class) redeclaration, incl. var-vs-let.
+    /// TS2451: block-scoped (`let`/`const`) redeclaration. tsc picks this
+    /// over `duplicate_identifier` on the EXISTING symbol's flags only, and a
+    /// `class` is not a `BlockScopedVariable` there — see `dupCode`.
     block_scoped_redeclare,
+    /// TS2567: a failed merge with an `enum` on either side. tsc gives the
+    /// enum its own message ahead of both the block-scoped and the plain
+    /// duplicate one (`enum E {} var E;`, `var E; enum E {}`,
+    /// `enum E {} class E {}`).
+    enum_merge_conflict,
     /// TS2393: two function (or method) declarations with bodies.
     duplicate_function_implementation,
+    /// TS2392: the same, for a class CONSTRUCTOR — tsc gives it its own
+    /// message.
+    duplicate_constructor_implementation,
     /// TS2813: a class declaration merged with function declarations of the
     /// same name, and the class is not ambient. Reported on the class.
     class_cannot_implement_overloads,
@@ -153,7 +163,9 @@ pub const Code = enum(u16) {
             .const_modifier_not_valid_here => "'const' modifier can only appear on a type parameter of a function, method or class",
             .duplicate_identifier => "duplicate identifier",
             .block_scoped_redeclare => "cannot redeclare block-scoped variable",
+            .enum_merge_conflict => "Enum declarations can only merge with namespace or other enum declarations.",
             .duplicate_function_implementation => "duplicate function implementation",
+            .duplicate_constructor_implementation => "Multiple constructor implementations are not allowed.",
             .class_cannot_implement_overloads => "Class declaration cannot implement overload list.",
             .function_merge_needs_ambient_class => "Function with bodies can only merge with classes that are ambient.",
             .import_conflict => "import declaration conflicts with local declaration",
@@ -169,7 +181,9 @@ pub const Code = enum(u16) {
         return switch (code) {
             .duplicate_identifier => 2300,
             .block_scoped_redeclare => 2451,
+            .enum_merge_conflict => 2567,
             .duplicate_function_implementation => 2393,
+            .duplicate_constructor_implementation => 2392,
             .class_cannot_implement_overloads => 2813,
             .function_merge_needs_ambient_class => 2814,
             .import_conflict => 2440,
