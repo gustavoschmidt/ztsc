@@ -79,6 +79,23 @@ pub const Code = enum(u16) {
     /// type-alias type parameter — the two declaration forms that have no
     /// call site to infer from, so `const` inference has nothing to mean.
     const_modifier_not_valid_here,
+    /// TS17006: `ExponentiationExpression : UpdateExpression ** Exponentiation`
+    /// — the left operand of `**` may not be a *unary* expression, because
+    /// `-a ** b` reads as `-(a ** b)` in some languages and `(-a) ** b` in
+    /// others and ES2016 refused to pick. One code per operator so that
+    /// `message()` stays a table of static strings (the text names the
+    /// operator, tsc's `{0}`).
+    exp_lhs_plus,
+    exp_lhs_minus,
+    exp_lhs_tilde,
+    exp_lhs_bang,
+    exp_lhs_delete,
+    exp_lhs_void,
+    exp_lhs_typeof,
+    exp_lhs_await,
+    /// TS17007: the same grammar rule, reached through the angle-bracket type
+    /// assertion `<T>x ** 2`, which tsc words differently.
+    exp_lhs_type_assertion,
 
     // --- bind errors, tsc-compatible codes via tsCode() ---------------
     /// TS2300: two declarations of the same name that cannot merge
@@ -161,6 +178,15 @@ pub const Code = enum(u16) {
             .out_modifier_not_valid_here => "'out' modifier can only appear on a type parameter of a class, interface or type alias",
             .in_must_precede_out => "'in' modifier must precede 'out' modifier.",
             .const_modifier_not_valid_here => "'const' modifier can only appear on a type parameter of a function, method or class",
+            .exp_lhs_plus => expLhsMessage("+"),
+            .exp_lhs_minus => expLhsMessage("-"),
+            .exp_lhs_tilde => expLhsMessage("~"),
+            .exp_lhs_bang => expLhsMessage("!"),
+            .exp_lhs_delete => expLhsMessage("delete"),
+            .exp_lhs_void => expLhsMessage("void"),
+            .exp_lhs_typeof => expLhsMessage("typeof"),
+            .exp_lhs_await => expLhsMessage("await"),
+            .exp_lhs_type_assertion => "A type assertion expression is not allowed in the left-hand side of an exponentiation expression. Consider enclosing the expression in parentheses.",
             .duplicate_identifier => "duplicate identifier",
             .block_scoped_redeclare => "cannot redeclare block-scoped variable",
             .enum_merge_conflict => "Enum declarations can only merge with namespace or other enum declarations.",
@@ -192,10 +218,27 @@ pub const Code = enum(u16) {
             .in_modifier_not_valid_here, .out_modifier_not_valid_here => 1274,
             .in_must_precede_out => 1029,
             .const_modifier_not_valid_here => 1277,
+            .exp_lhs_plus,
+            .exp_lhs_minus,
+            .exp_lhs_tilde,
+            .exp_lhs_bang,
+            .exp_lhs_delete,
+            .exp_lhs_void,
+            .exp_lhs_typeof,
+            .exp_lhs_await,
+            => 17006,
+            .exp_lhs_type_assertion => 17007,
             else => 0,
         };
     }
 };
+
+/// TS17006's text differs between operators only in the quoted operator, so
+/// the nine `exp_lhs_*` arms share one comptime template instead of nine
+/// hand-copied sentences that would drift.
+fn expLhsMessage(comptime op: []const u8) []const u8 {
+    return "An unary expression with the '" ++ op ++ "' operator is not allowed in the left-hand side of an exponentiation expression. Consider enclosing the expression in parentheses.";
+}
 
 /// A single diagnostic: error code plus source span. 8 bytes of span +
 /// 2 bytes of code (padded to 12 in arrays; fine for current volumes).
