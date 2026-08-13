@@ -9,10 +9,11 @@
 //!     var a: any;      // the value declaration — `a` is `any`
 //!     var a = 1;       // TS2403: must be of type 'any', but here has 'number'
 //!
-//! Identity, not assignability: `any` and `number` are mutually assignable
-//! and still an error, which is the whole point of the check.
+//! tsc compares the two with its IDENTITY relation, not with assignability:
+//! `any` and `number` are mutually assignable and still an error. ztsc has no
+//! identity relation, so `typesIdentical` approximates one — see there for
+//! exactly which way it errs.
 
-const std = @import("std");
 const ast = @import("../frontend/ast.zig");
 const binder = @import("../frontend/binder.zig");
 const types = @import("../types.zig");
@@ -51,18 +52,62 @@ const Error = checker_zig.Error;
 ///      assignability does not — two spread unions, two signatures differing
 ///      only under `any` — is simply not reported.
 ///
-/// `any` (and `unknown`) is the one place mutual assignability is WRONG in
-/// the reporting direction rather than the silent one: it relates to
-/// everything both ways, while tsc's identity relation matches it only with
-/// itself. `var a: any; var a = 1;` is the canonical TS2403 and would be
-/// silenced. So a top-level `any`/`unknown` on exactly one side settles the
-/// question before the relation is asked.
+/// `any`/`unknown` is the one place mutual assignability errs in the
+/// REPORTING direction rather than the silent one — it relates to everything
+/// both ways, while tsc's identity relation matches it only with itself — so
+/// the caller settles that case before asking (see `checkSubsequentVarDecl`).
 pub fn typesIdentical(c: *Checker, a: TypeId, b: TypeId) Error!bool {
     if (a == b) return true;
+    if (identityUndecidable(c, a) or identityUndecidable(c, b)) return true;
+    // A literal and its own base primitive. tsc widens an initializer before
+    // it compares (`getWidenedTypeForVariableLikeDeclaration`), so a pair
+    // that differs only by that widening is ztsc's widening diverging, not
+    // the program's two declarations: `var r = foo(1, 2); var r = foo({}, 1);`
+    // is `number` twice to tsc and `2` then `number` here.
+    if (c.ts.literalBase(a) == b or c.ts.literalBase(b) == a) return true;
     const ea = c.resolveStructural(a) catch return true;
     const eb = c.resolveStructural(b) catch return true;
     if (ea == eb) return true;
+    // Two WEAK types (every property optional) are unrelated by assignability
+    // in both directions — that is tsc's weak-type screen (TS2559), a
+    // heuristic on top of the structural relation rather than a structural
+    // fact, since neither side has a required member the other lacks. It
+    // leaves this check with no identity evidence at all, so it answers
+    // "identical" rather than reading the heuristic as a difference.
+    if (allOptional(c, ea) and allOptional(c, eb)) return true;
     return (try c.isAssignable(ea, eb)) and (try c.isAssignable(eb, ea));
+}
+
+/// An object type with at least one property, all of them optional.
+fn allOptional(c: *Checker, t: TypeId) bool {
+    if (c.ts.kind(t) != .object) return false;
+    const n = c.ts.objectPropCount(t);
+    if (n == 0) return false;
+    for (0..n) |i| {
+        if (c.ts.objectProp(t, @intCast(i)).flags & types.prop_flag_optional == 0) return false;
+    }
+    return true;
+}
+
+/// Types whose identity this module refuses to judge, because ztsc reaches
+/// them by giving up rather than by reading the program:
+///
+///   * `unknown` is what a failed inference leaves behind (`xs.map(identity)`
+///     is `number[]` to tsc and `unknown[]` here), `err` what a reported
+///     error leaves, and `void` what an unresolved value declaration leaves.
+///   * a `class_value` (`typeof C`, and a namespace object) is NOMINAL here,
+///     so it is never mutually assignable with the structural type tsc
+///     considers identical to it.
+///
+/// Answering "identical" for these is the same under-report the rest of the
+/// approximation makes, and it is what keeps a divergence that belongs to
+/// inference or to overload resolution from surfacing as a TS2403.
+fn identityUndecidable(c: *Checker, t: TypeId) bool {
+    return switch (c.ts.kind(t)) {
+        .unknown, .void, .err, .class_value => true,
+        .array => identityUndecidable(c, c.ts.arrayElem(t)),
+        else => false,
+    };
 }
 
 /// Is `t` the top type — the one thing mutual assignability cannot tell apart

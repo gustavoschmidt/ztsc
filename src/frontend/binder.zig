@@ -250,6 +250,10 @@ const DeclKind = enum {
             else => false,
         };
     }
+
+    fn isImport(k: DeclKind) bool {
+        return k == .import_value or k == .import_type;
+    }
 };
 
 /// Bind a sealed parse tree. Output goes into `arena` (the per-file binder
@@ -703,7 +707,7 @@ const Binder = struct {
     fn dupCode(existing: SymbolFlags, kind: DeclKind) Code {
         if (existing.catch_param) return .catch_redeclare;
         const e_import = existing.import_binding;
-        const n_import = kind == .import_value or kind == .import_type;
+        const n_import = kind.isImport();
         if (e_import != n_import) return .import_conflict;
         if (e_import and n_import) return .duplicate_identifier;
         if (existing.enum_decl or kind == .enum_decl) return .enum_merge_conflict;
@@ -803,7 +807,7 @@ const Binder = struct {
             }
         }
 
-        const n_import = kind == .import_value or kind == .import_type;
+        const n_import = kind.isImport();
         const gop = try b.members.getOrPut(b.scratch, memberKey(scope, atom));
         if (gop.found_existing) {
             const sym = gop.value_ptr.*;
@@ -1760,6 +1764,16 @@ const Binder = struct {
         defer b.exporting_node = clear_export;
 
         const cs = try b.pushScope(.class, node);
+        // A class EXPRESSION's name is not declared in the enclosing scope,
+        // but it IS visible inside its own body — `var x = class C { m(c: C)
+        // {} }` names the class (tsc gives the ClassExpression a local
+        // symbol in its own scope). Declared here, in the class scope, so it
+        // shadows nothing outside.
+        if (!declare_name and data.name_token != 0) {
+            _ = try b.declare(cs, try b.atomOfToken(data.name_token), .class, node, data.name_token, .{
+                .nonambient_class = !b.ambient,
+            });
+        }
         try b.bindTypeParams(data.tp_start, data.tp_end);
 
         if (data.extends != 0) try b.bindHeritage(data.extends, true);
@@ -2091,6 +2105,23 @@ const Binder = struct {
             sym = try b.declare(b.cur_scope, atom, .interface, node, data.name_token, .{});
         }
         const saved_scope = b.cur_scope;
+        const saved_block = b.cur_block;
+        b.cur_block = node;
+        defer b.cur_block = saved_block;
+
+        // Each block gets its OWN type-parameter scope, while merged blocks
+        // share ONE members scope — which is parented to the FIRST block's.
+        // A later block's type parameters are therefore off the members'
+        // parent chain, and `interface A<T> { x: T } interface A<U> { y: U }`
+        // reports a spurious "Cannot find name 'U'". tsc reports TS2428
+        // ("All declarations of 'A' must have identical type parameters")
+        // there and never resolves `U` at all, so the two agree on nothing
+        // but the code. Sharing this scope the way the members scope is
+        // shared was tried and reverted: it makes every block's parameters
+        // one symbol, which loses the per-block DEFAULTS that
+        // `test/conformance/instantiation/040_merged_interface_type_param_defaults.ts`
+        // pins (real `@types/node` depends on them). The fix is TS2428 plus a
+        // per-block parameter list, not one scope.
         const is = try b.pushScope(.interface, node);
         try b.bindTypeParams(data.tp_start, data.tp_end);
         for (b.tree.extraRange(data.extends_start, data.extends_end)) |h| {
@@ -2110,9 +2141,6 @@ const Binder = struct {
             ms = try b.newScope(.interface_members, node, is);
         }
 
-        const saved_block = b.cur_block;
-        b.cur_block = node;
-        defer b.cur_block = saved_block;
         for (b.tree.extraRange(data.members_start, data.members_end)) |member| {
             if (member == null_node) continue;
             try b.bindTypeMember(member, ms);
