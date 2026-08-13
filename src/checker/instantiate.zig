@@ -525,22 +525,46 @@ fn lazySlotNumberIndex(c: *Checker, generic: TypeId) u32 {
 /// would have given with no lazy layer at all. The lazy route can therefore
 /// only win: it either substitutes one member instead of two hundred, or it
 /// pays exactly what the eager path paid.
+///
+/// …except that "pays exactly what the eager path paid" was per ASK, not once:
+/// the fallback answer was not remembered either, so a spent window re-ran the
+/// whole prologue — `lazyRefMap` plus a top-level `instantiate` that exists
+/// only to truncate — on every repeat. `trunc_lazy_member` remembers it for the
+/// window, which is what `trunc_expansions` already does one grain up.
 pub fn lazyMemberAt(c: *Checker, ref: TypeId, generic_ty: TypeId, slot: u32) Error!TypeId {
     const key = (@as(u64, ref) << 32) | slot;
     if (c.lazy_member.get(key)) |t| return t;
+    // A member that already truncated in THIS budget window (see
+    // `trunc_lazy_member`). Serving it from here is not a published answer —
+    // the entry dies with the epoch — but within the window it is the answer
+    // the work below would reach, and reaching it is not cheap: `lazyRefMap`
+    // interns the reference's substitution and `instantiate` re-enters the
+    // top-level frame before it can even see that the ceiling is spent.
+    if (c.trunc_lazy_member.get(key)) |e| {
+        if (e.epoch == c.budget_epoch) {
+            // The mark the real path would leave: a caller must not memoize
+            // anything built on a truncated subtree.
+            c.inst_limit_tripped = true;
+            return e.ty;
+        }
+    }
     const map = (try lazyRefMap(c, ref)) orelse return generic_ty;
     const result = try c.instantiate(generic_ty, map);
     if (!c.inst_limit_tripped) {
         try c.lazy_member.put(c.cm(), key, result);
         return result;
     }
-    const whole = try c.expandRef(ref);
-    if (c.ts.kind(whole) != .object) return result;
-    const n = c.ts.objectPropCount(whole);
-    if (slot < n) return c.ts.objectProp(whole, slot).ty;
-    if (slot == n) return c.ts.objectStringIndex(whole);
-    if (slot == n + 1) return c.ts.objectNumberIndex(whole);
-    return result;
+    const answer = blk: {
+        const whole = try c.expandRef(ref);
+        if (c.ts.kind(whole) != .object) break :blk result;
+        const n = c.ts.objectPropCount(whole);
+        if (slot < n) break :blk c.ts.objectProp(whole, slot).ty;
+        if (slot == n) break :blk c.ts.objectStringIndex(whole);
+        if (slot == n + 1) break :blk c.ts.objectNumberIndex(whole);
+        break :blk result;
+    };
+    try c.trunc_lazy_member.put(c.cm(), key, .{ .ty = answer, .epoch = c.budget_epoch });
+    return answer;
 }
 
 /// Property `i` of `ref`'s table, its type substituted on demand.

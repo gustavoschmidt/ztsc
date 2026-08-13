@@ -837,12 +837,12 @@ pub const map_containers = [_][]const u8{
     "pending_type_args",      "pending_type_args_pool", "pending_type_args_seen",
     "tp_constrained_cache",   "nominal_bases",          "nominal_base_pool",
     "keyof_mapped_active",    "ctp_syms_seen",          "weak_types",
-    "lazy_member",            "lazy_map",               "pattern_root_decls",
-    "pattern_root_ids",       "pattern_narrow_busy",    "key_name_types",
-    "enum_members",           "keyof_obj_cache",        "trunc_expansions",
-    "inst_map_bytes",         "tp_mentions",            "smk_cache",
-    "rel_maybe",              "spec_sym_types",         "spec_tainted",
-    "last_assign_pos",
+    "lazy_member",            "trunc_lazy_member",      "lazy_map",
+    "pattern_root_decls",     "pattern_root_ids",       "pattern_narrow_busy",
+    "key_name_types",         "enum_members",           "keyof_obj_cache",
+    "trunc_expansions",       "inst_map_bytes",         "tp_mentions",
+    "smk_cache",              "rel_maybe",              "spec_sym_types",
+    "spec_tainted",           "last_assign_pos",
 };
 
 /// One enum member as `eachEnumMember` yields it: the name atom and the
@@ -851,6 +851,9 @@ pub const EnumMemberEntry = struct { name: Atom, value: TypeId };
 /// A memoized `keyof <object table>`, tagged with the `key_name_types`
 /// generation it was computed under — see `Checker.keyof_obj_cache`.
 const KeyofEntry = struct { ty: TypeId, gen: u32 };
+/// A member substitution that TRUNCATED, tagged with the budget epoch it
+/// truncated under — see `Checker.trunc_lazy_member`.
+const TruncMember = struct { ty: TypeId, epoch: u64 };
 
 /// Hash context for a DENSE INTEGER key — one 64-bit avalanche instead of
 /// `AutoContext`'s Wyhash over the key's bytes.
@@ -1931,6 +1934,25 @@ pub const Checker = struct {
     /// publishing one would answer every later reader with it (the rule
     /// `eraseParamsOf` and `inst_cache` already follow).
     lazy_member: IntMap(u64, TypeId) = .empty,
+    /// The same key -> the answer a TRUNCATED member substitution settled on,
+    /// tagged with the budget epoch that produced it (`TruncMember`).
+    ///
+    /// `lazy_member` deliberately never publishes a truncated result, and the
+    /// fallback `lazyMemberAt` takes instead — read the member out of the
+    /// whole-table expansion — is stable within a window but was re-derived on
+    /// every ask, prologue and all: `lazyRefMap` interns the reference's
+    /// substitution and `instantiate` re-enters the top-level frame (arena
+    /// swap, `canonMapId`) only to hit the spent ceiling and truncate again.
+    /// One statement of drizzle-orm's `SQLiteSelectBase` asks for the same
+    /// members 213 k times once its window is spent; the repeats alone were
+    /// 78 MB of substitution-map buffers and 147 MB of the 152 MB scratch
+    /// high-water that made `--checkers=4` peak at 172 MB.
+    ///
+    /// So the truncation is remembered for its WINDOW, exactly as
+    /// `trunc_expansions` remembers a truncated whole-table expansion and for
+    /// the same reason: within the window it is the answer re-derivation would
+    /// produce, and the entry dies with the epoch rather than being published.
+    trunc_lazy_member: IntMap(u64, TruncMember) = .empty,
     /// `ref` -> the type-parameter substitution its member table is read
     /// under, interned on the checker arena. Built once per reference rather
     /// than once per member: `buildInstMap` re-walks every declaration block's
