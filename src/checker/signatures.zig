@@ -1760,12 +1760,18 @@ fn functionSymbolType(c: *Checker, sym: SymbolId) Error!TypeId {
 /// like their siblings. Anything else (a parameter property, a member with
 /// no declaration node of a shape handled here) reports nothing: the cut
 /// itself is unchanged, so silence is the pre-existing behaviour.
-fn reportMemberCycle(c: *Checker, cycle: []const SymbolId) Error!void {
-    // A circle that only closed because an indexed access tsc defers was
-    // taken eagerly is not tsc's circle — see `lazy_index_objs`.
+/// Whether the circle currently on `member_type_stack` closed only because
+/// ztsc took eagerly an indexed access that tsc defers — see `lazy_index_objs`.
+/// Not tsc's circle: it must neither be reported nor cut, or the deferred
+/// access loses the type it would have resolved to.
+fn spuriousIndexCycle(c: *Checker) Error!bool {
     for (c.lazy_index_objs.items) |obj| {
-        if (try c.containsTypeParam(obj)) return;
+        if (try c.containsTypeParam(obj)) return true;
     }
+    return false;
+}
+
+fn reportMemberCycle(c: *Checker, cycle: []const SymbolId) Error!void {
     for (cycle) |msym| {
         const saved = c.enterSymFile(msym);
         defer c.restoreCtx(saved);
@@ -1806,15 +1812,17 @@ fn reportMemberCycle(c: *Checker, cycle: []const SymbolId) Error!void {
 pub fn memberTypeOf(c: *Checker, sym: SymbolId) Error!TypeId {
     // A member whose type demands itself: `a: A["a"]` through the lazy
     // single-member lookup, `m() { return this.m(); }` through the
-    // reserved-signature slot, `p = this.p` through both. Every one of
-    // those cuts the recursion *below* this frame (the caller's not-found
-    // path / the placeholder signature) and stays silent; naming the circle
-    // is this report. Detection only — the cut, and therefore termination,
-    // is exactly as before.
+    // reserved-signature slot, `p = this.p` through both, and a getter
+    // annotated `get foo(): typeof this.foo` straight through this frame.
+    // Only the first three cut the recursion *below* here; the getter has no
+    // such cut and used to recurse until the stack died. This is tsc's
+    // `pushTypeResolution` cut instead: a symbol already being resolved
+    // answers `any`, and naming the circle is the report.
     for (c.member_type_stack.items, 0..) |m, i| {
         if (m != sym) continue;
+        if (try spuriousIndexCycle(c)) break;
         try reportMemberCycle(c, c.member_type_stack.items[i..]);
-        break;
+        return types.any_type;
     }
     try c.member_type_stack.append(c.cm(), sym);
     defer _ = c.member_type_stack.pop();

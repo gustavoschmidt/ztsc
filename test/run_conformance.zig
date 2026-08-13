@@ -990,6 +990,65 @@ test "cycle stress: N-file import ring + diamonds terminate cleanly" {
     }
 }
 
+test "an import with no module specifier does not fault module discovery" {
+    // Broken import syntax records an import binding with NO specifier — atom
+    // 0, the "no atom" sentinel `Discovery.resolveSpec` skips. The sibling
+    // Node-builtin probe (`discoverNodeTypes`) had no such screen and handed
+    // atom 0 to `Interner.lookup`, whose `atom - 1` wrapped and indexed the
+    // shard's string list out of bounds: SIGBUS under ReleaseFast, an
+    // integer-overflow panic in Debug, on ANY program containing one.
+    //
+    // Only broken syntax reaches it — `bindImportEquals` already screens
+    // `module != 0`, and every other import form carries a string literal — so
+    // this is a build-time gate, not a diagnostic one: the forms below must
+    // parse, bind, discover and check to completion. The probe runs per file
+    // until `@types/node` is found, and this tmpdir has none, so every file
+    // here is probed.
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const d = tmp.dir;
+
+    try d.writeFile(io, .{ .sub_path = "dep.ts", .data =
+        \\export const dep: number = 0;
+    });
+    // A namespace import with the clause and the specifier transposed.
+    try d.writeFile(io, .{ .sub_path = "a.ts", .data =
+        \\import * from Zero from "./dep";
+        \\export const a: number = 1;
+    });
+    // A reserved word where the namespace binding belongs.
+    try d.writeFile(io, .{ .sub_path = "b.ts", .data =
+        \\import * as while from "./dep";
+        \\export const b: number = 2;
+    });
+    try d.writeFile(io, .{ .sub_path = "entry.ts", .data =
+        \\import { a } from "./a";
+        \\import { b } from "./b";
+        \\export const n: number = a + b;
+    });
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var interner = Interner.init();
+    defer interner.deinit(gpa);
+    const alloc = arena.allocator();
+
+    const br = try modules.buildProgram(alloc, io, gpa, &interner, d, &.{"entry.ts"}, .none, .{}, .{}, null);
+    // entry + a + b, but NOT dep: both broken forms lose the specifier, so
+    // neither records a module reference for discovery to follow. That is the
+    // shape under test — an import binding with nothing to resolve.
+    try std.testing.expectEqual(@as(usize, 3), br.program.files.len);
+    // Checking must reach the end too, and stay order-independent while it does.
+    const ref = try renderProgramDiags(alloc, io, gpa, &interner, &br.program, 1);
+    for ([_]usize{ 2, 4 }) |n| {
+        const got = try renderProgramDiags(alloc, io, gpa, &interner, &br.program, n);
+        try std.testing.expectEqualStrings(ref, got);
+    }
+}
+
 test "determinism: cross-file base cycles report identically for N = 1, 2, 4, 8" {
     // Regression for base-cycle detection. Many mutually-unrelated "packages", each a pair of
     // files whose interfaces form a cross-file `extends` cycle (A extends B,

@@ -99,6 +99,11 @@ pub const Interner = struct {
     /// since writers may grow the index list concurrently). The returned
     /// slice itself is stable for the interner's lifetime.
     pub fn lookup(self: *Interner, io: Io, atom: Atom) []const u8 {
+        // 0 is the "no atom" sentinel, never a valid string: it has no bytes to
+        // return, and `atom - 1` would wrap into an out-of-bounds index. Callers
+        // holding a maybe-absent atom (an import with no specifier, an anonymous
+        // export) must test for 0 first, as `resolveSpec` does.
+        std.debug.assert(atom != 0);
         const raw = atom - 1; // undo the +1 that keeps 0 free as a sentinel
         const shard = &self.shards[raw & shard_mask];
         const local = raw >> shard_bits;

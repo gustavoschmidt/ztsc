@@ -285,3 +285,45 @@ decorators/011_legacy_signature_gaps  -TS1240 entry.ts 55
 decorators/011_legacy_signature_gaps  -TS1271 entry.ts 56
 decorators/011_legacy_signature_gaps  -TS1239 entry.ts 58
 decorators/011_legacy_signature_gaps  -TS1239 entry.ts 59
+
+# TS2313, "Type parameter '<T>' has a circular constraint." ztsc has no
+# circular-constraint reporter at all — no site in src/ emits 2313 — so this is
+# a whole missing check, not a cut that went quiet. Until this case it was
+# unreachable in a different sense: `propOfTypeIdx`'s `.type_param` arm
+# recursed once per constraint hop, so the very first property read through a
+# circular constraint overflowed the stack instead of reporting anything. The
+# arm now walks the chain iteratively and a circular constraint answers "no
+# apparent members" (tsc's `getBaseConstraintOfType`, undefined for a circular
+# constraint), which is what makes the oracle's TS2339s on the same lines
+# match.
+#
+# A missed error, not a false positive: the reads still fail with the oracle's
+# own TS2339, so nothing correct is rejected. Reporting TS2313 is a declaration
+# check on the type parameter list and belongs with the other TS23xx
+# declaration checks, not in the apparent-type walk. Measured 2026-08-13.
+instantiation/057_circular_type_param_constraint.ts  -TS2313 15
+instantiation/057_circular_type_param_constraint.ts  -TS2313 20
+instantiation/057_circular_type_param_constraint.ts  -TS2313 20
+
+# TS2716, "Type parameter '<T>' has a circular default", and the TS2313 /
+# TS2536 pair a circular CONSTRAINT draws. Both cases exist because the cut
+# they gate did not exist: filling a self-referential default re-entered
+# `fixTypeArgs`, and resolving a constraint that reads back through its own
+# parameter re-entered `typeParamConstraint`, each until the stack died. Both
+# now take tsc's `pushTypeResolution` cut — `any` for the default, "no
+# constraint" for the constraint — which is what lets these declarations
+# resolve at all.
+#
+# ztsc emits none of these three codes anywhere in src/, so this is missing
+# reporting, not a cut gone quiet, and it is the same gap already recorded for
+# 057. Missed errors, never false positives: nothing correct is rejected, and
+# the declarations that follow keep checking. Reporting them belongs with the
+# TS23xx declaration checks over the type parameter list, not in the
+# resolution cuts these cases gate. Measured 2026-08-13.
+instantiation/058_circular_type_param_default.ts  -TS2716 7
+instantiation/058_circular_type_param_default.ts  -TS2716 12
+instantiation/059_constraint_reads_own_param.ts  -TS2313 14
+instantiation/059_constraint_reads_own_param.ts  -TS2536 14
+instantiation/059_constraint_reads_own_param.ts  -TS2313 17
+instantiation/059_constraint_reads_own_param.ts  -TS2536 17
+instantiation/059_constraint_reads_own_param.ts  -TS2313 17

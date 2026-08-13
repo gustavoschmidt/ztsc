@@ -466,6 +466,19 @@ pub const scratch_retain_limit = 256 * 1024;
 /// far below the worker-thread stack-overflow depth, leaving a wide safety
 /// margin on the smallest (main-thread) stack.
 pub const max_relation_depth = 900;
+/// How deep `keyofType`'s own recursion may nest before the operand's key set
+/// is treated as unreadable. `keyof` over a recursive conditional alias
+/// expands the alias to ask each constituent for its keys, and each expansion
+/// is a FRESH top-level instantiation — `instantiateId` resets `inst_depth` at
+/// every entry — so the instantiation budget never accumulates across the
+/// laps and cannot close this walk. Type-level arithmetic (`TupleOf`,
+/// `Multiply`, tuple-recursive `Add`) drives it thousands deep.
+///
+/// Two orders of magnitude above real nesting, which is a union of unions a
+/// few levels deep. The answer at the bound is `unreadableKeySet` — the same
+/// answer the operand gets when its structure is still materializing — so it
+/// stays a deferral, not an invented key set.
+pub const max_keyof_depth = 100;
 /// How many times ONE generic may reappear on the relation's live source or
 /// target stack, each time as a strictly LATER instantiation of itself, before
 /// the pair is assumed related — tsc's `isDeeplyNestedType` maxDepth.
@@ -1213,9 +1226,29 @@ pub const Checker = struct {
     /// (both the eager whole-table walk and the lazy single-member lookup push
     /// here). A member that re-appears is one whose type demanded itself; the
     /// slice from its first occurrence to the top is exactly the circle, which
-    /// `reportMemberCycle` names (TS2502 / TS7022 / TS7023). Reporting only —
-    /// the recursion is cut where it always was.
+    /// `reportMemberCycle` names (TS2502 / TS7022 / TS7023), and where the
+    /// recursion is cut: re-entry answers `any`, tsc's `pushTypeResolution`.
     member_type_stack: std.ArrayListUnmanaged(SymbolId) = .empty,
+    /// Type parameters whose DEFAULT `fixTypeArgs` is evaluating, innermost
+    /// last. `interface S<T = S> {}` resolves `T`'s default by materializing
+    /// `S`, which needs `T`'s default again — tsc's `pushTypeResolution(tp,
+    /// Default)`, TS2716. A parameter already on the stack answers `any`
+    /// instead of re-entering.
+    tp_default_stack: std.ArrayListUnmanaged(SymbolId) = .empty,
+    /// Type parameters whose CONSTRAINT `typeParamConstraint` is resolving,
+    /// innermost last. A constraint that reads back through its own parameter
+    /// — `<T extends Foo | T["hello"]>`, tsc's TS2313 — re-enters the
+    /// resolution before `tp_constraint_cache` has anything to answer with, so
+    /// the memo cannot break it. tsc's `pushTypeResolution(tp, Constraint)`:
+    /// a parameter already on the stack answers "no constraint".
+    tp_constraint_stack: std.ArrayListUnmanaged(SymbolId) = .empty,
+    /// Operands whose key set `keyofType` is computing, innermost last. A
+    /// recursive conditional alias can resolve to a union that lists the alias
+    /// itself among its constituents; the union arm asks each constituent for
+    /// its key set, so the walk returns to the same type. Re-entry answers
+    /// `unreadableKeySet` — the same answer a structure still materializing
+    /// gets, which is what this is.
+    keyof_stack: std.ArrayListUnmanaged(TypeId) = .empty,
     /// Object types of the single-member indexed accesses currently in flight
     /// (`C["m"]` taken while `C`'s own table is materializing). A GENERIC one
     /// is an access tsc defers — it answers with an unresolved
