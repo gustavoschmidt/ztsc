@@ -693,22 +693,28 @@ pub const UnionIndexMiss = union(enum) {
     tuple_range: struct { tuple: TypeId, index: u32 },
 };
 
+/// A distributed element access either resolved to an element type or stopped
+/// on a constituent (`UnionIndexMiss`).
+pub const UnionIndexResult = union(enum) {
+    resolved: TypeId,
+    miss: UnionIndexMiss,
+};
+
 /// `o[k]` where the KEY is a union of literals: tsc's `getIndexedAccessType`
-/// distributes, so the access is `o[k1] | o[k2] | …`. Returns null — leaving
-/// the caller's own single-key handling in charge — unless every constituent
-/// resolves, so a key set that is partly unknown still reaches the caller's
-/// implicit-any reporting instead of being silently narrowed here.
+/// distributes, so the access is `o[k1] | o[k2] | …`. Answers a `.miss` —
+/// leaving the caller's own single-key handling in charge — unless every
+/// constituent resolves, so a key set that is partly unknown still reaches the
+/// caller's implicit-any reporting instead of being silently narrowed here.
 ///
-/// `miss` names the constituent that stopped a distribution, but only where
-/// the answer is certain: a receiver whose member set ztsc models exactly
-/// (an object, or a union/intersection of them) for an absent key, a tuple
-/// for an out-of-range numeric key. Array/tuple *string* keys and every
-/// non-literal constituent leave `.none` — their key sets involve lib
+/// A `.miss` names the constituent that stopped a distribution, but only
+/// where the answer is certain: a receiver whose member set ztsc models
+/// exactly (an object, or a union/intersection of them) for an absent key, a
+/// tuple for an out-of-range numeric key. Array/tuple *string* keys and every
+/// non-literal constituent answer `.miss = .none` — their key sets involve lib
 /// members ztsc approximates, and a wrong "cannot index" there would be a
 /// false positive.
-pub fn unionIndexElemType(c: *Checker, r: TypeId, idx_t: TypeId, miss: *UnionIndexMiss) Error!?TypeId {
-    miss.* = .none;
-    if (c.ts.kind(idx_t) != .union_type) return null;
+pub fn unionIndexElemType(c: *Checker, r: TypeId, idx_t: TypeId) Error!UnionIndexResult {
+    if (c.ts.kind(idx_t) != .union_type) return .{ .miss = .none };
     const rk = c.ts.kind(r);
     // A branded tuple indexes through its tuple constituent, as in the
     // single-number-literal arm.
@@ -717,7 +723,7 @@ pub fn unionIndexElemType(c: *Checker, r: TypeId, idx_t: TypeId, miss: *UnionInd
     else
         r;
     const keys = try c.memberList(idx_t);
-    if (keys.len == 0 or keys.len > max_union_index_keys) return null;
+    if (keys.len == 0 or keys.len > max_union_index_keys) return .{ .miss = .none };
     const parts = try c.scratch().alloc(TypeId, keys.len);
     for (keys, 0..) |k, i| {
         const rl = try c.ts.regularLiteral(k);
@@ -729,8 +735,8 @@ pub fn unionIndexElemType(c: *Checker, r: TypeId, idx_t: TypeId, miss: *UnionInd
                 } else if (rk == .object and c.ts.objectStringIndex(r) != 0) {
                     parts[i] = c.ts.objectStringIndex(r);
                 } else {
-                    if (rk == .object or rk == .union_type or rk == .intersection) miss.* = .absent_key;
-                    return null;
+                    const certain = rk == .object or rk == .union_type or rk == .intersection;
+                    return .{ .miss = if (certain) .absent_key else .none };
                 }
             },
             .number_literal => {
@@ -745,7 +751,7 @@ pub fn unionIndexElemType(c: *Checker, r: TypeId, idx_t: TypeId, miss: *UnionInd
                         parts[i] = if (p.optional()) try c.makeUnion2(p.ty, types.undefined_type) else p.ty;
                         continue;
                     }
-                    return null;
+                    return .{ .miss = .none };
                 }
                 const v = c.ts.numberValue(rl);
                 const iv: u32 = if (v >= 0 and v == @floor(v) and v < 4096) @intFromFloat(v) else 4096;
@@ -755,14 +761,13 @@ pub fn unionIndexElemType(c: *Checker, r: TypeId, idx_t: TypeId, miss: *UnionInd
                 } else if (try c.tupleElemTypeAt(rt, iv)) |et| {
                     parts[i] = et;
                 } else {
-                    miss.* = .{ .tuple_range = .{ .tuple = rt, .index = iv } };
-                    return null;
+                    return .{ .miss = .{ .tuple_range = .{ .tuple = rt, .index = iv } } };
                 }
             },
-            else => return null,
+            else => return .{ .miss = .none },
         }
     }
-    return try c.ts.makeUnion(c.scratch(), parts);
+    return .{ .resolved = try c.ts.makeUnion(c.scratch(), parts) };
 }
 
 /// The constituent of an intersection that carries element access — a

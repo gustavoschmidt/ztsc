@@ -117,7 +117,6 @@ pub const typeParamsOf = typeparams_zig.typeParamsOf;
 pub const undecidableType = typeparams_zig.undecidableType;
 
 /// `keyof` and indexed access (keyof.zig).
-pub const UnionIndexMiss = keyof_zig.UnionIndexMiss;
 pub const checkIndexedAccessIndexType = keyof_zig.checkIndexedAccessIndexType;
 pub const indexableConstituent = keyof_zig.indexableConstituent;
 pub const indexedAccessType = keyof_zig.indexedAccessType;

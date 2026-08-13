@@ -30,7 +30,6 @@ const check = checker_zig.check;
 
 const TpMap = @import("enums.zig").TpMap;
 const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
-const UnionIndexMiss = @import("typenode.zig").UnionIndexMiss;
 const buildRefKey = @import("flow.zig").buildRefKey;
 const checkFunctionBody = @import("stmts.zig").checkFunctionBody;
 const classInstanceGeneric = @import("instantiate.zig").classInstanceGeneric;
@@ -2615,8 +2614,6 @@ pub fn indexChainInner(c: *Checker, node: Node, narrow: bool) Error!ChainLink {
     // yields `any` — so every read through a `Record<SomeUnion, T>` lost
     // its type, and with it the contextual signature of any callback the
     // read fed (`map[dir].map((c) => c)`).
-    var miss: UnionIndexMiss = .none;
-    const distributed = try c.unionIndexElemType(r, idx_t, &miss);
     // A key set that did NOT distribute is still reported on: tsc's
     // `getIndexedAccessType` errors on the offending constituent and the
     // access falls back to `any` (TS7053) or to the receiver's numeric index
@@ -2624,17 +2621,23 @@ pub fn indexChainInner(c: *Checker, node: Node, narrow: bool) Error!ChainLink {
     // certain shapes reach here (see `UnionIndexMiss`); the fallback type
     // below is unchanged either way, so whatever the access already reported
     // downstream still reports.
-    switch (miss) {
-        .none => {},
-        .absent_key => if (c.prog.no_implicit_any) {
-            try c.diagFmt(7053, c.nodeSpan(node), "Element implicitly has an 'any' type because expression of type '{s}' can't be used to index type '{s}'.", .{
-                try c.typeToString(idx_t), try c.typeToString(obj_t),
-            });
+    const distributed: ?TypeId = switch (try c.unionIndexElemType(r, idx_t)) {
+        .resolved => |ut| ut,
+        .miss => |m| blk: {
+            switch (m) {
+                .none => {},
+                .absent_key => if (c.prog.no_implicit_any) {
+                    try c.diagFmt(7053, c.nodeSpan(node), "Element implicitly has an 'any' type because expression of type '{s}' can't be used to index type '{s}'.", .{
+                        try c.typeToString(idx_t), try c.typeToString(obj_t),
+                    });
+                },
+                .tuple_range => |tr| try c.diagFmt(2493, c.nodeSpan(d.rhs), "Tuple type '{s}' of length '{d}' has no element at index '{d}'.", .{
+                    try c.typeToString(tr.tuple), c.ts.tupleLen(tr.tuple), tr.index,
+                }),
+            }
+            break :blk null;
         },
-        .tuple_range => |tr| try c.diagFmt(2493, c.nodeSpan(d.rhs), "Tuple type '{s}' of length '{d}' has no element at index '{d}'.", .{
-            try c.typeToString(tr.tuple), c.ts.tupleLen(tr.tuple), tr.index,
-        }),
-    }
+    };
     if (distributed) |ut| {
         result = ut;
     } else switch (ik) {
