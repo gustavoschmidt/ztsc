@@ -2,21 +2,17 @@
 
 const std = @import("std");
 const ast = @import("../frontend/ast.zig");
-const scanner = @import("../frontend/scanner.zig");
 const intern = @import("../intern.zig");
 const binder = @import("../frontend/binder.zig");
 const types = @import("../types.zig");
 const source = @import("../frontend/source.zig");
-const libs = @import("../libs.zig");
 const modules = @import("../link/modules.zig");
-const ZeroPagedArray = @import("../zeropage.zig").ZeroPagedArray;
 
 const Io = std.Io;
 const Ast = ast.Ast;
 const Atom = intern.Atom;
 const Interner = intern.Interner;
 const Bind = binder.Bind;
-const SymbolId = binder.SymbolId;
 
 const checker_zig = @import("../checker.zig");
 const Checker = checker_zig.Checker;

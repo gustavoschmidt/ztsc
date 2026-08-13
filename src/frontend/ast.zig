@@ -27,7 +27,6 @@
 //! (read-only) after parse; nothing here mutates after `Parse.parse` returns.
 
 const std = @import("std");
-const Allocator = std.mem.Allocator;
 const scanner = @import("scanner.zig");
 const diagnostics = @import("diagnostics.zig");
 const source = @import("source.zig");

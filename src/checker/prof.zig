@@ -70,7 +70,6 @@ const binder = @import("../frontend/binder.zig");
 
 const checker_zig = @import("../checker.zig");
 const Checker = checker_zig.Checker;
-const Error = checker_zig.Error;
 const TypeId = types.TypeId;
 const SymbolId = binder.SymbolId;
 const FileId = u32;

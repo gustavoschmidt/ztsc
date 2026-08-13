@@ -7,34 +7,23 @@
 //! yield types) and `nullability.zig` (the nullish/truthiness facts).
 
 const std = @import("std");
-const ast = @import("../frontend/ast.zig");
-const scanner = @import("../frontend/scanner.zig");
 const intern = @import("../intern.zig");
 const binder = @import("../frontend/binder.zig");
 const types = @import("../types.zig");
-const source = @import("../frontend/source.zig");
-const libs = @import("../libs.zig");
-const modules = @import("../link/modules.zig");
-const ZeroPagedArray = @import("../zeropage.zig").ZeroPagedArray;
 const prof_zig = @import("prof.zig");
 
 const Atom = intern.Atom;
 const SymbolId = binder.SymbolId;
 const TypeId = types.TypeId;
-const Store = types.Store;
 
 const checker_zig = @import("../checker.zig");
 const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
-const check = checker_zig.check;
 
-const atom = Checker.atom;
-const globalThisType = @import("instantiate.zig").globalThisType;
 const instantiate = @import("enums.zig").instantiate;
 const iteration = @import("iteration.zig");
 const nullability = @import("nullability.zig");
 const resolveStructural = @import("instantiate.zig").resolveStructural;
-const run = Checker.run;
 
 // =====================================================================
 // properties & type parts

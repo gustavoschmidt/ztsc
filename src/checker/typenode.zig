@@ -20,13 +20,9 @@
 
 const std = @import("std");
 const ast = @import("../frontend/ast.zig");
-const scanner = @import("../frontend/scanner.zig");
 const intern = @import("../intern.zig");
 const binder = @import("../frontend/binder.zig");
 const types = @import("../types.zig");
-const source = @import("../frontend/source.zig");
-const libs = @import("../libs.zig");
-const ZeroPagedArray = @import("../zeropage.zig").ZeroPagedArray;
 
 const Allocator = std.mem.Allocator;
 const Node = ast.Node;
@@ -38,23 +34,11 @@ const TypeId = types.TypeId;
 const checker_zig = @import("../checker.zig");
 const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
-const Check = checker_zig.Check;
-const check = checker_zig.check;
 
 const annTypeMaybeUnique = Checker.annTypeMaybeUnique;
-const atom = Checker.atom;
-const checkIdentifier = @import("expr.zig").checkIdentifier;
-const classStaticType = @import("enums.zig").classStaticType;
-const expandRef = @import("instantiate.zig").expandRef;
-const inferTypeArgs = @import("calls.zig").inferTypeArgs;
 const inferVarFromNode = @import("generics.zig").inferVarFromNode;
-const instantiate = @import("enums.zig").instantiate;
-const lazyRefProp = @import("instantiate.zig").lazyRefProp;
 const mergeBaseObjectPlain = @import("classes.zig").mergeBaseObjectPlain;
-const propOfType = @import("props.zig").propOfType;
-const scopeOf = Checker.scopeOf;
 const scratch = Checker.scratch;
-const signatureAssignableModeInner = @import("assign.zig").signatureAssignableModeInner;
 const signatureOfProto = @import("signatures.zig").signatureOfProto;
 
 const keyof_zig = @import("keyof.zig");

@@ -8,7 +8,6 @@ const scanner = @import("../frontend/scanner.zig");
 const intern = @import("../intern.zig");
 const binder = @import("../frontend/binder.zig");
 const types = @import("../types.zig");
-const source = @import("../frontend/source.zig");
 
 const Node = ast.Node;
 const null_node = ast.null_node;
@@ -21,25 +20,16 @@ const TypeId = types.TypeId;
 const checker_zig = @import("../checker.zig");
 const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
-const check = checker_zig.check;
 
 const CallShape = @import("calls.zig").CallShape;
 const countArgs = @import("calls.zig").countArgs;
 const atom = Checker.atom;
-const checkDeclarator = @import("stmts.zig").checkDeclarator;
-const checkIdentifier = @import("expr.zig").checkIdentifier;
-const classInstanceGeneric = @import("instantiate.zig").classInstanceGeneric;
-const classStaticType = @import("enums.zig").classStaticType;
-const expandRef = @import("instantiate.zig").expandRef;
 const findBindingType = @import("signatures.zig").findBindingType;
-const inferReturnType = @import("signatures.zig").inferReturnType;
 const init = Checker.init;
-const lazyRefProp = @import("instantiate.zig").lazyRefProp;
 const lazy_base_depth = @import("instantiate.zig").lazy_base_depth;
 const propOfType = @import("props.zig").propOfType;
 const reduceSubtypes = @import("typenode.zig").reduceSubtypes;
 const refExpansionActive = @import("instantiate.zig").refExpansionActive;
-const run = Checker.run;
 const typeOfSymbol = @import("signatures.zig").typeOfSymbol;
 
 // =====================================================================

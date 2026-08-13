@@ -6,61 +6,36 @@
 
 const std = @import("std");
 const ast = @import("../frontend/ast.zig");
-const scanner = @import("../frontend/scanner.zig");
 const intern = @import("../intern.zig");
 const binder = @import("../frontend/binder.zig");
 const types = @import("../types.zig");
 const source = @import("../frontend/source.zig");
-const libs = @import("../libs.zig");
-const modules = @import("../link/modules.zig");
 const paths = @import("../link/paths.zig");
-const ZeroPagedArray = @import("../zeropage.zig").ZeroPagedArray;
 
 const Node = ast.Node;
 const null_node = ast.null_node;
 const Atom = intern.Atom;
-const Bind = binder.Bind;
 const Span = source.Span;
 const TypeId = types.TypeId;
 
 const checker_zig = @import("../checker.zig");
 const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
-const Check = checker_zig.Check;
-const check = checker_zig.check;
 
 const ModuleRef = @import("typenode.zig").ModuleRef;
-const Resolved = @import("names.zig").Resolved;
 const TpMap = @import("enums.zig").TpMap;
 const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
 const ambientNamespaceType = @import("signatures.zig").ambientNamespaceType;
-const atom = Checker.atom;
 const ChainLink = @import("expr.zig").ChainLink;
-const checkConstArrayLiteral = @import("expr.zig").checkConstArrayLiteral;
 const checkExprCached = @import("expr.zig").checkExprCached;
-const checkJsxElement = @import("expr.zig").checkJsxElement;
-const containsTypeParamInner = @import("enums.zig").containsTypeParamInner;
-const ctxWantsTemplate = @import("generics.zig").ctxWantsTemplate;
-const enterSymFile = Checker.enterSymFile;
 const freshLiteralRejects = @import("assign.zig").freshLiteralRejects;
-const inferFromExtends = @import("generics.zig").inferFromExtends;
-const init = Checker.init;
 const instantiate = @import("enums.zig").instantiate;
 const isAssignable = @import("assign.zig").isAssignable;
-const keyofType = @import("typenode.zig").keyofType;
-const memberChainInner = @import("expr.zig").memberChainInner;
 const memberList = @import("typenode.zig").memberList;
-const numberIndexType = @import("typenode.zig").numberIndexType;
-const propOfType = @import("props.zig").propOfType;
 const resolveStructural = @import("instantiate.zig").resolveStructural;
 const rollbackDiags = Checker.rollbackDiags;
-const run = Checker.run;
 const scratch = Checker.scratch;
-const seal = Checker.seal;
-const symScope = Checker.symScope;
 const transitiveBaseConstraint = @import("assign.zig").transitiveBaseConstraint;
-const tupleElementUnion = @import("props.zig").tupleElementUnion;
-const typeParamConstraint = @import("props.zig").typeParamConstraint;
 
 // =====================================================================
 // calls

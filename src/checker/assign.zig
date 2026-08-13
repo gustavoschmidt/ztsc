@@ -13,15 +13,10 @@
 //! Functions take the `Checker` context as their first parameter.
 
 const std = @import("std");
-const scanner = @import("../frontend/scanner.zig");
 const intern = @import("../intern.zig");
 const binder = @import("../frontend/binder.zig");
 const types = @import("../types.zig");
-const libs = @import("../libs.zig");
-const modules = @import("../link/modules.zig");
-const ZeroPagedArray = @import("../zeropage.zig").ZeroPagedArray;
 
-const Io = std.Io;
 const Atom = intern.Atom;
 const SymbolId = binder.SymbolId;
 const TypeId = types.TypeId;
@@ -29,18 +24,12 @@ const TypeId = types.TypeId;
 const checker_zig = @import("../checker.zig");
 const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
-const Check = checker_zig.Check;
-const check = checker_zig.check;
 const max_relation_depth = checker_zig.max_relation_depth;
 
 const TpMap = @import("enums.zig").TpMap;
 const this_apparent = @import("enums.zig").this_apparent;
-const aliasInstance = @import("instantiate.zig").aliasInstance;
-const atom = Checker.atom;
 const baseConstraintOf = @import("expr.zig").baseConstraintOf;
-const diagAlreadyFiled = Checker.diagAlreadyFiled;
 const enumAssignable = @import("enums.zig").enumAssignable;
-const indexedAccessType = @import("typenode.zig").indexedAccessType;
 const instantiate = @import("enums.zig").instantiate;
 const isEmptyObjectType = @import("instantiate.zig").isEmptyObjectType;
 const originTaggable = @import("instantiate.zig").originTaggable;
@@ -48,7 +37,6 @@ const propOfType = @import("props.zig").propOfType;
 const lazy_zig = @import("instantiate.zig");
 const resolveStructural = @import("instantiate.zig").resolveStructural;
 const restUnionOptionalAt = @import("typenode.zig").restUnionOptionalAt;
-const run = Checker.run;
 const variance_zig = @import("variance.zig");
 const report_zig = @import("assign_report.zig");
 
