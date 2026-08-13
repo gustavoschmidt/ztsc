@@ -3,15 +3,8 @@
 //! `Checker` context as their first parameter.
 
 const std = @import("std");
-const ast = @import("../frontend/ast.zig");
-const scanner = @import("../frontend/scanner.zig");
-const intern = @import("../intern.zig");
 const binder = @import("../frontend/binder.zig");
 const types = @import("../types.zig");
-const source = @import("../frontend/source.zig");
-const libs = @import("../libs.zig");
-const modules = @import("../link/modules.zig");
-const ZeroPagedArray = @import("../zeropage.zig").ZeroPagedArray;
 
 const Io = std.Io;
 const SymbolId = binder.SymbolId;
@@ -22,9 +15,7 @@ const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
 const max_type_string = checker_zig.max_type_string;
 
-const atom = Checker.atom;
 const hasValueMeaning = @import("names.zig").hasValueMeaning;
-const run = Checker.run;
 const scratch = Checker.scratch;
 
 // =====================================================================

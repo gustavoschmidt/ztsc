@@ -1042,7 +1042,7 @@ const max_infer_depth: u32 = 24;
 /// inference makes ~4.6k calls, while kysely's `ExpressionOrFactory` match
 /// makes tens of millions. Anything in the wide gap between separates "walk it
 /// all, exactly as before" from "this will not finish".
-pub const max_infer_steps: u64 = 100_000;
+const max_infer_steps: u64 = 100_000;
 
 /// How deep the `.conditional` pattern arm nests. A conditional target is
 /// speculative evidence — at most ONE of its two branches is real — so a
@@ -1064,7 +1064,7 @@ pub const max_infer_steps: u64 = 100_000;
 /// `max_infer_depth` and `max_infer_steps`: not a change to what the walk
 /// means, but a line past which exhaustiveness stops being affordable. Raise
 /// it only with a case that needs it and a re-measurement.
-pub const max_infer_cond_depth: u32 = 1;
+const max_infer_cond_depth: u32 = 1;
 
 /// tsc's `InferencePriority`, verbatim bit values. A candidate's priority is
 /// the OR of every demotion on the path from the extends clause down to the
@@ -1076,7 +1076,7 @@ pub const max_infer_cond_depth: u32 = 1;
 /// Only the bits ztsc's `inferFromExtends` can currently produce are named
 /// here; the rest of tsc's ladder is listed for the record so the values do
 /// not drift when another one is implemented.
-pub const InferPrio = struct {
+const InferPrio = struct {
     pub const none: u16 = 0;
     /// Naked type variable in a union or intersection target.
     pub const naked_type_variable: u16 = 1 << 0;

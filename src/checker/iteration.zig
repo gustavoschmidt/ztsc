@@ -60,10 +60,10 @@ pub fn isPromiseLikeOf(c: *Checker, t: TypeId, tp_sym: u32) bool {
 /// hand-written thenable that is neither is still a gap (under-report:
 /// the value keeps its object type).
 pub fn awaitedType(c: *Checker, t: TypeId) Error!TypeId {
-    return c.awaitedTypeRec(t, 0);
+    return awaitedTypeRec(c, t, 0);
 }
 
-pub fn awaitedTypeRec(c: *Checker, t: TypeId, depth: u32) Error!TypeId {
+fn awaitedTypeRec(c: *Checker, t: TypeId, depth: u32) Error!TypeId {
     // A self-referential alias (`type P = Promise<P>`) would spin; the cap
     // is far above any real nesting and only ever leaves the type unwrapped.
     if (depth >= 16) return t;
@@ -74,7 +74,7 @@ pub fn awaitedTypeRec(c: *Checker, t: TypeId, depth: u32) Error!TypeId {
     if (c.ts.kind(t) == .union_type) {
         var parts: std.ArrayList(TypeId) = .empty;
         defer parts.deinit(c.scratch());
-        for (try c.memberList(t)) |m| try parts.append(c.scratch(), try c.awaitedTypeRec(m, depth + 1));
+        for (try c.memberList(t)) |m| try parts.append(c.scratch(), try awaitedTypeRec(c, m, depth + 1));
         return c.ts.makeUnion(c.scratch(), parts.items);
     }
     // An INTERSECTION awaits through its thenable constituent. tsc reads
@@ -96,7 +96,7 @@ pub fn awaitedTypeRec(c: *Checker, t: TypeId, depth: u32) Error!TypeId {
         const pl = c.prog.globals.lookup(c.atom_PromiseLike);
         if ((p != null and sym == p.?) or (pl != null and sym == pl.?)) {
             const args = c.ts.refArgs(t);
-            if (args.len >= 1) return c.awaitedTypeRec(args[0], depth + 1);
+            if (args.len >= 1) return awaitedTypeRec(c, args[0], depth + 1);
         }
     }
     return t;

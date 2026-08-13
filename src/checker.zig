@@ -65,7 +65,6 @@ const intern = @import("intern.zig");
 const binder = @import("frontend/binder.zig");
 const types = @import("types.zig");
 const source = @import("frontend/source.zig");
-const libs = @import("libs.zig");
 const modules = @import("link/modules.zig");
 const parser = @import("frontend/parser.zig");
 const ZeroPagedArray = @import("zeropage.zig").ZeroPagedArray;
@@ -73,7 +72,6 @@ pub const BumpArena = @import("checker/bump.zig").BumpArena;
 pub const prof_zig = @import("checker/prof.zig");
 const memprof_zig = @import("checker/memprof.zig");
 const memo_zig = @import("checker/memo.zig");
-const lazy_zig = @import("checker/instantiate.zig");
 
 const Ast = ast.Ast;
 const Node = ast.Node;
@@ -84,7 +82,6 @@ const Interner = intern.Interner;
 const Bind = binder.Bind;
 const SymbolId = binder.SymbolId;
 const ScopeId = binder.ScopeId;
-const FlowId = binder.FlowId;
 const Span = source.Span;
 const TypeId = types.TypeId;
 const Store = types.Store;
@@ -1366,7 +1363,8 @@ pub const Checker = struct {
     /// `infer_visited` entry must never let a shallower repeat be skipped.
     infer_trunc: bool = false,
     /// Recursive `inferFromExtends` calls made by the in-flight inference root.
-    /// Its guards arm only past `max_infer_steps` — see the escape hatch there.
+    /// Its guards arm only past `generics.max_infer_steps` — see the escape
+    /// hatch there.
     infer_steps: u64 = 0,
     /// tsc's `priority` — the `InferencePriority` bitmask of the position
     /// `inferFromExtends` is currently walking. `inferWithPriority` ORs a bit
@@ -1709,7 +1707,7 @@ pub const Checker = struct {
     /// terminates (as `error_type`) instead of overflowing the worker stack.
     alias_depth: u32 = 0,
     /// Live nesting of `driveShrinkingAlias`, bounded by
-    /// `max_eager_alias_depth` (see that constant).
+    /// `shrink.max_eager_alias_depth` (see that constant).
     eager_alias_depth: u32 = 0,
     /// Live recursion depth of the structural assignability relation
     /// (`isAssignable`), checked against `max_relation_depth` to break the
@@ -2276,14 +2274,6 @@ pub const Checker = struct {
         /// values off its own `Checker` rather than off a process global.
         opts: Options,
     ) Error!Checker {
-        // Compatibility mirror: `checker/assign.zig` reads `lazy_zig.stats_on`
-        // by module path on the lazy relation route, and that file is not this
-        // refactor's to change. Every instance of a run writes the identical
-        // value here (options are passed by value and never differ between
-        // threads), so the store stays as write-once-in-effect as it was when
-        // `main` performed it before the pool spawned. Delete the global once
-        // `assign.zig` can read `c.opts.lazy_stats` instead.
-        lazy_zig.stats_on = opts.lazy_stats;
         const first = if (owned.len > 0) owned[0] else 0;
         const f0 = &prog.files[first];
         var c: Checker = .{
@@ -3266,16 +3256,12 @@ pub const Checker = struct {
     pub const lazyNumberIndex = instantiate_zig.lazyNumberIndex;
     pub const originTaggable = instantiate_zig.originTaggable;
     pub const driveShrinkingAlias = instantiate_zig.driveShrinkingAlias;
-    pub const refArgsSettled = instantiate_zig.refArgsSettled;
     pub const isEmptyObjectType = instantiate_zig.isEmptyObjectType;
     pub const globalThisType = instantiate_zig.globalThisType;
     pub const globalThisProp = instantiate_zig.globalThisProp;
     pub const globalThisHasValue = instantiate_zig.globalThisHasValue;
-    pub const reduceForOriginEquiv = instantiate_zig.reduceForOriginEquiv;
     pub const originArgEquiv = instantiate_zig.originArgEquiv;
     pub const reexpandShrinking = instantiate_zig.reexpandShrinking;
-    pub const refStrictlyShrinks = instantiate_zig.refStrictlyShrinks;
-    pub const shrinkMetric = instantiate_zig.shrinkMetric;
     pub const emitBaseCycle = instantiate_zig.emitBaseCycle;
     pub const interfaceGeneric = instantiate_zig.interfaceGeneric;
     pub const setInterfaceThis = instantiate_zig.setInterfaceThis;
@@ -3327,9 +3313,6 @@ pub const Checker = struct {
     pub const classChainMemberType = instantiate_zig.classChainMemberType;
     pub const checkAbstractImplementation = instantiate_zig.checkAbstractImplementation;
     pub const collectClassMemberAtoms = instantiate_zig.collectClassMemberAtoms;
-    pub const max_eager_alias_depth = instantiate_zig.max_eager_alias_depth;
-    pub const origin_equiv_depth = instantiate_zig.origin_equiv_depth;
-    pub const shrink_reexpand_ceiling = instantiate_zig.shrink_reexpand_ceiling;
     pub const lazy_base_depth = instantiate_zig.lazy_base_depth;
 
     const enums_zig = @import("checker/enums.zig");
@@ -3474,7 +3457,6 @@ pub const Checker = struct {
     pub const makePromise = props_zig.makePromise;
     pub const isPromiseLikeOf = props_zig.isPromiseLikeOf;
     pub const awaitedType = props_zig.awaitedType;
-    pub const awaitedTypeRec = props_zig.awaitedTypeRec;
     pub const generatorYieldType = props_zig.generatorYieldType;
     pub const asyncGeneratorYieldType = props_zig.asyncGeneratorYieldType;
     pub const tupleElementUnion = props_zig.tupleElementUnion;

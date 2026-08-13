@@ -40,7 +40,7 @@ const originTaggable = @import("instantiate.zig").originTaggable;
 /// keeps a GROWING recursion from being driven forever, since the
 /// enclosing-ref comparison `reexpandShrinking` uses is not available at
 /// that call site.
-pub const max_eager_alias_depth: u32 = 8;
+const max_eager_alias_depth: u32 = 8;
 
 /// A recursive alias reached through a resolved conditional's TRUE BRANCH
 /// has no enclosing `.ref` for `expandRef` to re-expand from, so the
@@ -75,7 +75,7 @@ pub fn driveShrinkingAlias(c: *Checker, ref: TypeId) Error!?TypeId {
     // lazy would. A free outer type parameter is fine — the reduction is
     // the same for every substitution, which is exactly why the enclosing
     // conditional resolved at all (`arrayDecidablyExtends`).
-    if (!try c.refArgsSettled(ref)) return null;
+    if (!try refArgsSettled(c, ref)) return null;
     if (originTaggable(c.ts.kind(try c.aliasGeneric(sym)))) return null;
     c.eager_alias_depth += 1;
     defer c.eager_alias_depth -= 1;
@@ -97,7 +97,7 @@ pub fn driveShrinkingAlias(c: *Checker, ref: TypeId) Error!?TypeId {
 /// through are walked; a materialized object/function is settled by
 /// definition, and walking one would visit an app's whole element type on
 /// every hop.
-pub fn refArgsSettled(c: *Checker, t: TypeId) Error!bool {
+fn refArgsSettled(c: *Checker, t: TypeId) Error!bool {
     return refArgsSettledRec(c, t, 0);
 }
 
@@ -141,14 +141,14 @@ fn refArgsSettledRec(c: *Checker, t: TypeId, depth: u32) Error!bool {
 /// Depth ceiling on the recursive origin-arg equivalence walk (see
 /// `originArgEquiv`) — a belt on top of the structure-only reduction, which
 /// already terminates (each hop peels a ref/intersection/tuple layer).
-pub const origin_equiv_depth: u32 = 8;
+const origin_equiv_depth: u32 = 8;
 
 /// Canonicalize a type for origin-arg equivalence: resolve refs to their
 /// structural form, and drop empty-object members from an intersection
 /// (`T & {} ≡ T` — `{}` adds no constraint to an object member, a SOUND
 /// rewrite). Returns the interned TypeId so two structurally-identical
 /// reductions compare equal by identity, never by assignability.
-pub fn reduceForOriginEquiv(c: *Checker, t: TypeId) Error!TypeId {
+fn reduceForOriginEquiv(c: *Checker, t: TypeId) Error!TypeId {
     const r = try c.resolveStructural(t);
     if (c.ts.kind(r) != .intersection) return r;
     var non_empty: std.ArrayList(TypeId) = .empty;
@@ -157,7 +157,7 @@ pub fn reduceForOriginEquiv(c: *Checker, t: TypeId) Error!TypeId {
         const rm = try c.resolveStructural(m);
         if (!c.isEmptyObjectType(rm)) try non_empty.append(c.scratch(), rm);
     }
-    if (non_empty.items.len == 1) return try c.reduceForOriginEquiv(non_empty.items[0]);
+    if (non_empty.items.len == 1) return try reduceForOriginEquiv(c, non_empty.items[0]);
     return r;
 }
 
@@ -168,7 +168,12 @@ pub fn reduceForOriginEquiv(c: *Checker, t: TypeId) Error!TypeId {
 /// origin tag. Anything else — including `unknown`/`any` collapse against a
 /// concrete type — is NOT equivalent, so a genuinely different instantiation
 /// still fails the relation.
-pub fn originArgEquiv(c: *Checker, a0: TypeId, b0: TypeId, depth: u32) Error!bool {
+pub fn originArgEquiv(c: *Checker, a0: TypeId, b0: TypeId) Error!bool {
+    return originArgEquivRec(c, a0, b0, 0);
+}
+
+/// `originArgEquiv`, carrying the walk depth (see `origin_equiv_depth`).
+fn originArgEquivRec(c: *Checker, a0: TypeId, b0: TypeId, depth: u32) Error!bool {
     if (a0 == b0) return true;
     if (depth > origin_equiv_depth) return false;
     const s = &c.ts;
@@ -179,7 +184,7 @@ pub fn originArgEquiv(c: *Checker, a0: TypeId, b0: TypeId, depth: u32) Error!boo
         if (na == s.refArgCount(b0)) {
             var all = true;
             for (0..na) |i| {
-                if (!try c.originArgEquiv(s.refArgAt(a0, i), s.refArgAt(b0, i), depth + 1)) {
+                if (!try originArgEquivRec(c, s.refArgAt(a0, i), s.refArgAt(b0, i), depth + 1)) {
                     all = false;
                     break;
                 }
@@ -187,8 +192,8 @@ pub fn originArgEquiv(c: *Checker, a0: TypeId, b0: TypeId, depth: u32) Error!boo
             if (all) return true;
         }
     }
-    const a = try c.reduceForOriginEquiv(a0);
-    const b = try c.reduceForOriginEquiv(b0);
+    const a = try reduceForOriginEquiv(c, a0);
+    const b = try reduceForOriginEquiv(c, b0);
     // Identity after reduction — but not for the trivial top/bottom types,
     // whose relation the normal walk already handles permissively (guards
     // against a cycle-truncated `error_type` on both sides reading as equal).
@@ -206,7 +211,7 @@ pub fn originArgEquiv(c: *Checker, a0: TypeId, b0: TypeId, depth: u32) Error!boo
             const ea = s.tupleElem(a, @intCast(i));
             const eb = s.tupleElem(b, @intCast(i));
             if (ea.flags != eb.flags) return false;
-            if (!try c.originArgEquiv(ea.ty, eb.ty, depth + 1)) return false;
+            if (!try originArgEquivRec(c, ea.ty, eb.ty, depth + 1)) return false;
         }
         return true;
     }
@@ -217,7 +222,7 @@ pub fn originArgEquiv(c: *Checker, a0: TypeId, b0: TypeId, depth: u32) Error!boo
             if (c.origin.get(b)) |ob| {
                 if (oa == ob) return true;
                 if (s.kind(oa) == .ref and s.kind(ob) == .ref and s.refSymbol(oa) == s.refSymbol(ob)) {
-                    return try c.originArgEquiv(oa, ob, depth + 1);
+                    return try originArgEquivRec(c, oa, ob, depth + 1);
                 }
             }
         }
@@ -230,7 +235,7 @@ pub fn originArgEquiv(c: *Checker, a0: TypeId, b0: TypeId, depth: u32) Error!boo
 /// guarantees termination, since the metric is a non-negative integer that
 /// strictly decreases each hop). Hitting it stops expanding and keeps the
 /// lazy ref — exactly the pre-fix behavior.
-pub const shrink_reexpand_ceiling: u32 = 100;
+const shrink_reexpand_ceiling: u32 = 100;
 
 /// Eagerly reduce a recursive alias reference whose argument demonstrably
 /// SHRINKS on each hop. `result0` is what `Alias<args>` (identified by
@@ -286,7 +291,7 @@ pub fn reexpandShrinking(c: *Checker, orig_ref: TypeId, result0: TypeId) Error!T
         // `orig`) or reduce to a union (not a bare ref), so they never take
         // this entry — only the strict-shrink path, which correctly stops.
         const entry = iter == 0 and c.ts.refSymbol(prev_ref) != rsym;
-        if (!entry and !c.refStrictlyShrinks(prev_ref, result)) break; // not shrinking → leave lazy
+        if (!entry and !refStrictlyShrinks(c, prev_ref, result)) break; // not shrinking → leave lazy
         prev_ref = result;
         result = try c.expandRef(result);
     }
@@ -311,21 +316,21 @@ pub fn reexpandShrinking(c: *Checker, orig_ref: TypeId, result0: TypeId) Error!T
 ///
 /// For a CROSS-alias hop (mutual recursion A→B), no positional correspondence
 /// holds, so fall back to the conservative SUMMED strict-decrease test.
-pub fn refStrictlyShrinks(c: *Checker, prev_ref: TypeId, cur_ref: TypeId) bool {
+fn refStrictlyShrinks(c: *Checker, prev_ref: TypeId, cur_ref: TypeId) bool {
     const s = &c.ts;
     if (s.kind(prev_ref) != .ref or s.kind(cur_ref) != .ref)
-        return c.shrinkMetric(cur_ref) < c.shrinkMetric(prev_ref);
+        return shrinkMetric(c, cur_ref) < shrinkMetric(c, prev_ref);
     if (s.refSymbol(prev_ref) == s.refSymbol(cur_ref)) {
         const pargs = s.refArgs(prev_ref);
         const cargs = s.refArgs(cur_ref);
         if (pargs.len == cargs.len and pargs.len > 0) {
             for (pargs, cargs) |p, q| {
-                if (c.shrinkMetric(q) < c.shrinkMetric(p)) return true;
+                if (shrinkMetric(c, q) < shrinkMetric(c, p)) return true;
             }
             return false;
         }
     }
-    return c.shrinkMetric(cur_ref) < c.shrinkMetric(prev_ref);
+    return shrinkMetric(c, cur_ref) < shrinkMetric(c, prev_ref);
 }
 
 /// A conservative structural size metric used only to decide whether a
@@ -335,7 +340,7 @@ pub fn refStrictlyShrinks(c: *Checker, prev_ref: TypeId, cur_ref: TypeId) bool {
 /// number literals contribute their text length; tuples/objects/refs charge
 /// per element so arity is visible; everything else is a small constant.
 /// Bounded by a depth cap so a pathological argument can't blow the stack.
-pub fn shrinkMetric(c: *Checker, t: TypeId) u64 {
+fn shrinkMetric(c: *Checker, t: TypeId) u64 {
     return shrinkMetricRec(c, t, 0);
 }
 

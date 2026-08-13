@@ -776,7 +776,12 @@ fn memberTypeInFlight(c: *Checker, msym: SymbolId) bool {
 /// symbol on demand, and only the member that is *itself* circular is an
 /// error. This is that lookup — the same lazy-member idea `globalThisType`
 /// already relies on for the self-referential global table.
-pub fn lazyRefProp(c: *Checker, ref: TypeId, name: Atom, depth: u32) Error!?types.Prop {
+pub fn lazyRefProp(c: *Checker, ref: TypeId, name: Atom) Error!?types.Prop {
+    return lazyRefPropRec(c, ref, name, 0);
+}
+
+/// `lazyRefProp`, carrying the `extends`-walk depth (see `lazy_base_depth`).
+fn lazyRefPropRec(c: *Checker, ref: TypeId, name: Atom, depth: u32) Error!?types.Prop {
     if (depth >= lazy_base_depth) return null;
     const sym = c.ts.refSymbol(ref);
     // Interfaces are not on this path: `interfaceGeneric` folds heritage
@@ -841,7 +846,7 @@ pub fn lazyRefProp(c: *Checker, ref: TypeId, name: Atom, depth: u32) Error!?type
         // also on the stack stays on the lazy path.
         if (try c.baseClassRef(sym)) |base_ref| {
             if (c.refExpansionActive(base_ref)) {
-                found = try c.lazyRefProp(base_ref, name, depth + 1);
+                found = try lazyRefPropRec(c, base_ref, name, depth + 1);
             } else {
                 const b = try c.resolveStructural(base_ref);
                 found = try c.propOfTypeEx(b, name, false);
@@ -874,7 +879,7 @@ pub fn lazyRefProp(c: *Checker, ref: TypeId, name: Atom, depth: u32) Error!?type
 pub fn lazyThisProp(c: *Checker, recv: TypeId, name: Atom) Error!?types.Prop {
     const t = if (c.ts.kind(recv) == .this_type) c.ts.thisTypeInstance(recv) else recv;
     if (!c.refExpansionActive(t)) return null;
-    return c.lazyRefProp(t, name, 0);
+    return lazyRefProp(c, t, name);
 }
 
 /// Is `name` an OWN instance member (field, param-property, accessor,
@@ -1580,7 +1585,12 @@ fn classChainMemberIsAbstractRec(c: *Checker, t: TypeId, name: Atom, depth: u32)
 /// cuts to `err` and there is no table to read, but the member's own
 /// declaration is perfectly resolvable. Null when the name is not declared
 /// anywhere on the chain.
-pub fn classChainMemberType(c: *Checker, t: TypeId, name: Atom, depth: u32) Error!?TypeId {
+pub fn classChainMemberType(c: *Checker, t: TypeId, name: Atom) Error!?TypeId {
+    return classChainMemberTypeRec(c, t, name, 0);
+}
+
+/// `classChainMemberType`, carrying the `extends`-walk depth.
+fn classChainMemberTypeRec(c: *Checker, t: TypeId, name: Atom, depth: u32) Error!?TypeId {
     if (depth >= 64 or c.ts.kind(t) != .ref) return null;
     const sym = c.ts.refSymbol(t);
     const f = c.symFlags(sym);
@@ -1607,7 +1617,7 @@ pub fn classChainMemberType(c: *Checker, t: TypeId, name: Atom, depth: u32) Erro
     // continues.
     const nb = try c.baseClassRef(sym) orelse return null;
     const base_ref = if (map.items.len == 0) nb else try c.instantiate(nb, map.items);
-    return c.classChainMemberType(base_ref, name, depth + 1);
+    return classChainMemberTypeRec(c, base_ref, name, depth + 1);
 }
 
 /// Whether a class member symbol's declaration is `abstract`.

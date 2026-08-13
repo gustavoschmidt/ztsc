@@ -116,7 +116,7 @@ pub fn varianceVerdict(c: *Checker, s_ref: TypeId, t_ref: TypeId) Error!?bool {
             // Unannotated: equal arguments hold under ANY variance, so
             // they stay decidable here; anything else defers the whole
             // pair to the structural walk.
-            .none => if (!try c.originArgEquiv(sa, ta, 0)) {
+            .none => if (!try c.originArgEquiv(sa, ta)) {
                 decisive = false;
             },
             .covariant => if (!try c.isAssignable(sa, ta)) return false,

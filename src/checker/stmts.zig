@@ -12,13 +12,9 @@ const ast = @import("../frontend/ast.zig");
 const intern = @import("../intern.zig");
 const binder = @import("../frontend/binder.zig");
 const types = @import("../types.zig");
-const libs = @import("../libs.zig");
-const modules = @import("../link/modules.zig");
-const ZeroPagedArray = @import("../zeropage.zig").ZeroPagedArray;
 
 const Node = ast.Node;
 const null_node = ast.null_node;
-const Bind = binder.Bind;
 const SymbolId = binder.SymbolId;
 const TypeId = types.TypeId;
 
@@ -26,33 +22,19 @@ const checker_zig = @import("../checker.zig");
 const Checker = checker_zig.Checker;
 const prof_zig = checker_zig.prof_zig;
 const Error = checker_zig.Error;
-const Check = checker_zig.Check;
-const check = checker_zig.check;
 const max_instantiation_count = checker_zig.max_instantiation_count;
-const DeferredBody = checker_zig.DeferredBody;
 
 const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
-const assignNarrows = @import("flow.zig").assignNarrows;
 const baseClassRef = @import("instantiate.zig").baseClassRef;
 const checkExprCached = @import("expr.zig").checkExprCached;
-const checkFunctionLikeExpr = @import("expr.zig").checkFunctionLikeExpr;
-const checkJsxElement = @import("expr.zig").checkJsxElement;
 const classStaticType = @import("enums.zig").classStaticType;
 const decorators = @import("decorators.zig");
 const diagFmt = Checker.diagFmt;
 const elaborate = @import("elaborate.zig");
-const elaborateLiteralError = @import("assign.zig").elaborateLiteralError;
-const fixTypeArgs = @import("typenode.zig").fixTypeArgs;
-const guardCallOf = @import("flow.zig").guardCallOf;
-const inferReturnType = @import("signatures.zig").inferReturnType;
-const isComparable = @import("assign.zig").isComparable;
 const isNonPrimitiveKind = @import("assign.zig").isNonPrimitiveKind;
 const isNullishUnion = @import("flow.zig").isNullishUnion;
 const iteration = @import("iteration.zig");
 const reachability = @import("reachability.zig");
-const run = Checker.run;
-const seal = Checker.seal;
-const typeFromQualifiedName = @import("typenode.zig").typeFromQualifiedName;
 const typeOfSymbol = @import("signatures.zig").typeOfSymbol;
 
 // =====================================================================

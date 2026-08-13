@@ -8,15 +8,12 @@ const scanner = @import("../frontend/scanner.zig");
 const intern = @import("../intern.zig");
 const binder = @import("../frontend/binder.zig");
 const types = @import("../types.zig");
-const libs = @import("../libs.zig");
 const modules = @import("../link/modules.zig");
-const ZeroPagedArray = @import("../zeropage.zig").ZeroPagedArray;
 
 const Node = ast.Node;
 const null_node = ast.null_node;
 const TokenIndex = ast.TokenIndex;
 const Atom = intern.Atom;
-const Bind = binder.Bind;
 const SymbolId = binder.SymbolId;
 const TypeId = types.TypeId;
 
@@ -24,47 +21,31 @@ const checker_zig = @import("../checker.zig");
 const prof_zig = checker_zig.prof_zig;
 const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
-const FileId = checker_zig.FileId;
-const Check = checker_zig.Check;
-const check = checker_zig.check;
 
 const TpMap = @import("enums.zig").TpMap;
 const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
-const UnionIndexMiss = @import("typenode.zig").UnionIndexMiss;
 const buildRefKey = @import("flow.zig").buildRefKey;
 const checkFunctionBody = @import("stmts.zig").checkFunctionBody;
-const classInstanceGeneric = @import("instantiate.zig").classInstanceGeneric;
-const computeTypeOfSymbol = @import("signatures.zig").computeTypeOfSymbol;
 const containerOf = Checker.containerOf;
 const ctxWantsTemplate = @import("generics.zig").ctxWantsTemplate;
 const diagFmt = Checker.diagFmt;
-const elemOfArrayish = @import("typenode.zig").elemOfArrayish;
-const expandRef = @import("instantiate.zig").expandRef;
 const flowTypeOfReference = @import("flow.zig").flowTypeOfReference;
 const gatherSpreadProps = @import("typenode.zig").gatherSpreadProps;
 const globalThisType = @import("instantiate.zig").globalThisType;
 const hasTypeMeaning = @import("names.zig").hasTypeMeaning;
 const hasValueMeaning = @import("names.zig").hasValueMeaning;
 const indexableConstituent = @import("typenode.zig").indexableConstituent;
-const inferTypeArgs = @import("calls.zig").inferTypeArgs;
 const init = Checker.init;
 const instantiate = @import("enums.zig").instantiate;
-const interfaceConstituentDirect = @import("instantiate.zig").interfaceConstituentDirect;
 const isNonPrimitiveKind = @import("assign.zig").isNonPrimitiveKind;
-const lazyRefProp = @import("instantiate.zig").lazyRefProp;
-const max_deep_ref_depth = @import("flow.zig").max_deep_ref_depth;
-const namespaceMemberSym = @import("typenode.zig").namespaceMemberSym;
 const propOfType = @import("props.zig").propOfType;
 const pushChainGuards = @import("flow.zig").pushChainGuards;
 const reduceSubtypes = @import("typenode.zig").reduceSubtypes;
 const resolveStructural = @import("instantiate.zig").resolveStructural;
-const run = Checker.run;
 const scratch = Checker.scratch;
-const seal = Checker.seal;
 const signatureOfProtoCtx = @import("signatures.zig").signatureOfProtoCtx;
 const templateExprType = @import("generics.zig").templateExprType;
 const tupleElemTypeAt = @import("assign.zig").tupleElemTypeAt;
-const unify = @import("calls.zig").unify;
 const uniqueSymAtom = Checker.uniqueSymAtom;
 const upsertProp = @import("typenode.zig").upsertProp;
 const widenLiteral = @import("names.zig").widenLiteral;
@@ -2243,23 +2224,16 @@ pub fn isOptionalChain(c: *Checker, node: Node) bool {
 pub const ChainLink = struct { ty: TypeId, chained: bool };
 
 /// Type of a chain link's object/callee, WITHOUT the chain's short-circuit
-/// `undefined` (that is tracked in `chained`). Only called when `node` is
-/// itself an optional chain, so downstream declared-nullish still reports.
-pub fn chainObjType(c: *Checker, node: Node, chained: *bool) Error!TypeId {
-    switch (c.nodeTag(node)) {
-        .member_expr, .optional_member_expr => {
-            const link = try c.memberChainInner(node);
-            if (link.chained) chained.* = true;
-            return link.ty;
-        },
-        .index_expr, .optional_index_expr => {
-            const link = try c.indexChainInner(node, true);
-            if (link.chained) chained.* = true;
-            return link.ty;
-        },
-        .call_expr, .call_expr_targs, .optional_call => return c.checkCallExprInner(node, false, chained, types.no_type),
-        else => return c.checkExprCached(node, types.no_type),
-    }
+/// `undefined` (that is tracked in the link's `chained`). Only called when
+/// `node` is itself an optional chain, so downstream declared-nullish still
+/// reports.
+pub fn chainObjType(c: *Checker, node: Node) Error!ChainLink {
+    return switch (c.nodeTag(node)) {
+        .member_expr, .optional_member_expr => c.memberChainInner(node),
+        .index_expr, .optional_index_expr => c.indexChainInner(node, true),
+        .call_expr, .call_expr_targs, .optional_call => c.checkCallExprInner(node, false, types.no_type),
+        else => .{ .ty = try c.checkExprCached(node, types.no_type), .chained = false },
+    };
 }
 
 pub fn checkMemberExpr(c: *Checker, node: Node) Error!TypeId {
@@ -2279,10 +2253,11 @@ pub fn memberChainInner(c: *Checker, node: Node) Error!ChainLink {
     const d = c.tree.nodeData(node);
     const own_optional = c.nodeTag(node) == .optional_member_expr;
     var chained = false;
-    var obj_t = if (c.isOptionalChain(d.lhs))
-        try c.chainObjType(d.lhs, &chained)
-    else
-        try c.checkExprCached(d.lhs, types.no_type);
+    var obj_t = if (c.isOptionalChain(d.lhs)) blk: {
+        const link = try c.chainObjType(d.lhs);
+        if (link.chained) chained = true;
+        break :blk link.ty;
+    } else try c.checkExprCached(d.lhs, types.no_type);
     const name_tok: TokenIndex = d.rhs;
     const name = try c.memberAtom(name_tok);
     if (own_optional) {
@@ -2538,10 +2513,11 @@ pub fn indexChainInner(c: *Checker, node: Node, narrow: bool) Error!ChainLink {
     const d = c.tree.nodeData(node);
     const own_optional = c.nodeTag(node) == .optional_index_expr;
     var chained = false;
-    var obj_t = if (c.isOptionalChain(d.lhs))
-        try c.chainObjType(d.lhs, &chained)
-    else
-        try c.checkExprCached(d.lhs, types.no_type);
+    var obj_t = if (c.isOptionalChain(d.lhs)) blk: {
+        const link = try c.chainObjType(d.lhs);
+        if (link.chained) chained = true;
+        break :blk link.ty;
+    } else try c.checkExprCached(d.lhs, types.no_type);
     // The index expression runs only on the chain's non-nullish branch, so
     // it sees the chain's own guards (`pushChainGuards`).
     const idx_t = idx: {
@@ -2615,8 +2591,6 @@ pub fn indexChainInner(c: *Checker, node: Node, narrow: bool) Error!ChainLink {
     // yields `any` — so every read through a `Record<SomeUnion, T>` lost
     // its type, and with it the contextual signature of any callback the
     // read fed (`map[dir].map((c) => c)`).
-    var miss: UnionIndexMiss = .none;
-    const distributed = try c.unionIndexElemType(r, idx_t, &miss);
     // A key set that did NOT distribute is still reported on: tsc's
     // `getIndexedAccessType` errors on the offending constituent and the
     // access falls back to `any` (TS7053) or to the receiver's numeric index
@@ -2624,17 +2598,23 @@ pub fn indexChainInner(c: *Checker, node: Node, narrow: bool) Error!ChainLink {
     // certain shapes reach here (see `UnionIndexMiss`); the fallback type
     // below is unchanged either way, so whatever the access already reported
     // downstream still reports.
-    switch (miss) {
-        .none => {},
-        .absent_key => if (c.prog.no_implicit_any) {
-            try c.diagFmt(7053, c.nodeSpan(node), "Element implicitly has an 'any' type because expression of type '{s}' can't be used to index type '{s}'.", .{
-                try c.typeToString(idx_t), try c.typeToString(obj_t),
-            });
+    const distributed: ?TypeId = switch (try c.unionIndexElemType(r, idx_t)) {
+        .resolved => |ut| ut,
+        .miss => |m| blk: {
+            switch (m) {
+                .none => {},
+                .absent_key => if (c.prog.no_implicit_any) {
+                    try c.diagFmt(7053, c.nodeSpan(node), "Element implicitly has an 'any' type because expression of type '{s}' can't be used to index type '{s}'.", .{
+                        try c.typeToString(idx_t), try c.typeToString(obj_t),
+                    });
+                },
+                .tuple_range => |tr| try c.diagFmt(2493, c.nodeSpan(d.rhs), "Tuple type '{s}' of length '{d}' has no element at index '{d}'.", .{
+                    try c.typeToString(tr.tuple), c.ts.tupleLen(tr.tuple), tr.index,
+                }),
+            }
+            break :blk null;
         },
-        .tuple_range => |tr| try c.diagFmt(2493, c.nodeSpan(d.rhs), "Tuple type '{s}' of length '{d}' has no element at index '{d}'.", .{
-            try c.typeToString(tr.tuple), c.ts.tupleLen(tr.tuple), tr.index,
-        }),
-    }
+    };
     if (distributed) |ut| {
         result = ut;
     } else switch (ik) {

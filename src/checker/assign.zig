@@ -13,15 +13,10 @@
 //! Functions take the `Checker` context as their first parameter.
 
 const std = @import("std");
-const scanner = @import("../frontend/scanner.zig");
 const intern = @import("../intern.zig");
 const binder = @import("../frontend/binder.zig");
 const types = @import("../types.zig");
-const libs = @import("../libs.zig");
-const modules = @import("../link/modules.zig");
-const ZeroPagedArray = @import("../zeropage.zig").ZeroPagedArray;
 
-const Io = std.Io;
 const Atom = intern.Atom;
 const SymbolId = binder.SymbolId;
 const TypeId = types.TypeId;
@@ -29,18 +24,12 @@ const TypeId = types.TypeId;
 const checker_zig = @import("../checker.zig");
 const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
-const Check = checker_zig.Check;
-const check = checker_zig.check;
 const max_relation_depth = checker_zig.max_relation_depth;
 
 const TpMap = @import("enums.zig").TpMap;
 const this_apparent = @import("enums.zig").this_apparent;
-const aliasInstance = @import("instantiate.zig").aliasInstance;
-const atom = Checker.atom;
 const baseConstraintOf = @import("expr.zig").baseConstraintOf;
-const diagAlreadyFiled = Checker.diagAlreadyFiled;
 const enumAssignable = @import("enums.zig").enumAssignable;
-const indexedAccessType = @import("typenode.zig").indexedAccessType;
 const instantiate = @import("enums.zig").instantiate;
 const isEmptyObjectType = @import("instantiate.zig").isEmptyObjectType;
 const originTaggable = @import("instantiate.zig").originTaggable;
@@ -48,7 +37,6 @@ const propOfType = @import("props.zig").propOfType;
 const lazy_zig = @import("instantiate.zig");
 const resolveStructural = @import("instantiate.zig").resolveStructural;
 const restUnionOptionalAt = @import("typenode.zig").restUnionOptionalAt;
-const run = Checker.run;
 const variance_zig = @import("variance.zig");
 const report_zig = @import("assign_report.zig");
 
@@ -968,7 +956,7 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!RelAnswer {
                 // instantiation carries an unreduced config `C1 = P & Omit<…>`
                 // and the other the concrete reduction `C2 = P`.
                 if (c.ts.refSymbol(os) == c.ts.refSymbol(ot)) {
-                    if (try c.originArgEquiv(os, ot, 0)) return .yes;
+                    if (try c.originArgEquiv(os, ot)) return .yes;
                 }
             }
         }
@@ -980,14 +968,14 @@ fn relate(c: *Checker, s0: TypeId, t0: TypeId, memoize: bool) Error!RelAnswer {
         if (tr) |ot| {
             if (ot == s) return .yes;
             if (c.ts.refSymbol(ot) == c.ts.refSymbol(s) and
-                try c.originArgEquiv(ot, s, 0)) return .yes;
+                try c.originArgEquiv(ot, s)) return .yes;
         }
     }
     if (tk == .ref and originTaggable(sk)) {
         if (sr) |os| {
             if (os == t) return .yes;
             if (c.ts.refSymbol(os) == c.ts.refSymbol(t) and
-                try c.originArgEquiv(os, t, 0)) return .yes;
+                try c.originArgEquiv(os, t)) return .yes;
         }
     }
     // Trivial targets/sources.
@@ -2418,7 +2406,7 @@ const ObjSide = struct {
 /// Tally one declined pair and answer "not this route's question" (see
 /// `LazyStat`). Costs a predictable-false branch when `--lazy-stats` is off.
 fn note(c: *Checker, why: checker_zig.LazyStat) ?bool {
-    if (lazy_zig.stats_on) c.lazy_stats[@intFromEnum(why)] += 1;
+    if (c.opts.lazy_stats) c.lazy_stats[@intFromEnum(why)] += 1;
     return null;
 }
 
@@ -2481,7 +2469,7 @@ fn lazyRefRelate(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: types.Ki
         if ((try c.containsThisType(s)) or (try c.containsThisType(t)) or
             (try c.containsThisType(sv.table)) or (try c.containsThisType(tv.table))) return note(c, .this_types);
     }
-    if (lazy_zig.stats_on) c.lazy_stats[@intFromEnum(checker_zig.LazyStat.hit)] += 1;
+    if (c.opts.lazy_stats) c.lazy_stats[@intFromEnum(checker_zig.LazyStat.hit)] += 1;
     // The frame this replaces pushed the same two references onto the
     // growing-instantiation stack a second time (its own `refFacetOf` of each
     // materialization is the very reference this frame holds). Push them here

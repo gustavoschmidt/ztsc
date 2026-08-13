@@ -6,60 +6,36 @@
 
 const std = @import("std");
 const ast = @import("../frontend/ast.zig");
-const scanner = @import("../frontend/scanner.zig");
 const intern = @import("../intern.zig");
 const binder = @import("../frontend/binder.zig");
 const types = @import("../types.zig");
 const source = @import("../frontend/source.zig");
-const libs = @import("../libs.zig");
-const modules = @import("../link/modules.zig");
 const paths = @import("../link/paths.zig");
-const ZeroPagedArray = @import("../zeropage.zig").ZeroPagedArray;
 
 const Node = ast.Node;
 const null_node = ast.null_node;
 const Atom = intern.Atom;
-const Bind = binder.Bind;
 const Span = source.Span;
 const TypeId = types.TypeId;
 
 const checker_zig = @import("../checker.zig");
 const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
-const Check = checker_zig.Check;
-const check = checker_zig.check;
 
 const ModuleRef = @import("typenode.zig").ModuleRef;
-const Resolved = @import("names.zig").Resolved;
 const TpMap = @import("enums.zig").TpMap;
 const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
 const ambientNamespaceType = @import("signatures.zig").ambientNamespaceType;
-const atom = Checker.atom;
-const checkConstArrayLiteral = @import("expr.zig").checkConstArrayLiteral;
+const ChainLink = @import("expr.zig").ChainLink;
 const checkExprCached = @import("expr.zig").checkExprCached;
-const checkJsxElement = @import("expr.zig").checkJsxElement;
-const containsTypeParamInner = @import("enums.zig").containsTypeParamInner;
-const ctxWantsTemplate = @import("generics.zig").ctxWantsTemplate;
-const enterSymFile = Checker.enterSymFile;
 const freshLiteralRejects = @import("assign.zig").freshLiteralRejects;
-const inferFromExtends = @import("generics.zig").inferFromExtends;
-const init = Checker.init;
 const instantiate = @import("enums.zig").instantiate;
 const isAssignable = @import("assign.zig").isAssignable;
-const keyofType = @import("typenode.zig").keyofType;
-const memberChainInner = @import("expr.zig").memberChainInner;
 const memberList = @import("typenode.zig").memberList;
-const numberIndexType = @import("typenode.zig").numberIndexType;
-const propOfType = @import("props.zig").propOfType;
 const resolveStructural = @import("instantiate.zig").resolveStructural;
 const rollbackDiags = Checker.rollbackDiags;
-const run = Checker.run;
 const scratch = Checker.scratch;
-const seal = Checker.seal;
-const symScope = Checker.symScope;
 const transitiveBaseConstraint = @import("assign.zig").transitiveBaseConstraint;
-const tupleElementUnion = @import("props.zig").tupleElementUnion;
-const typeParamConstraint = @import("props.zig").typeParamConstraint;
 
 // =====================================================================
 // calls
@@ -229,10 +205,9 @@ fn superCtorSigs(c: *Checker, out: *std.ArrayList(TypeId)) Error!bool {
 }
 
 pub fn checkCallExpr(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Error!TypeId {
-    var chained = false;
-    const result = try c.checkCallExprInner(node, is_new, &chained, ctx);
-    if (chained) return c.makeUnion2(result, types.undefined_type);
-    return result;
+    const link = try c.checkCallExprInner(node, is_new, ctx);
+    if (link.chained) return c.makeUnion2(link.ty, types.undefined_type);
+    return link.ty;
 }
 
 /// tsc's `isUntypedFunctionCall`, minus its two `any` disjuncts:
@@ -262,22 +237,26 @@ fn untypedFunctionCall(c: *Checker, callee_t: TypeId, apparent: TypeId, ak: type
     return c.isAssignable(callee_t, try c.ts.makeRef(sym, &.{}));
 }
 
-/// Call/new as an optional-chain link (see `memberChainInner`). Returns the
-/// return type WITHOUT the chain's short-circuit `undefined`; sets
-/// `chained.*` when this `?.()` — or an earlier link in the callee spine —
-/// short-circuits on a nullish callee.
-pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, chained: *bool, ctx: TypeId) Error!TypeId {
+/// Call/new as an optional-chain link (see `memberChainInner`). Answers the
+/// return type WITHOUT the chain's short-circuit `undefined`, plus `chained`
+/// when this `?.()` — or an earlier link in the callee spine — short-circuits
+/// on a nullish callee.
+pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Error!ChainLink {
+    var chained = false;
     const shape = c.callShape(node);
     // `import("m")` is not an ordinary call — `import` has no type of its
     // own. tsc's `getTypeOfImportCall`: the module's namespace object,
     // wrapped in `Promise`.
-    if (!is_new and c.nodeTag(shape.callee) == .import_expr) return c.importCallType(shape.arg_nodes);
-    var callee_t = if (c.isOptionalChain(shape.callee))
-        try c.chainObjType(shape.callee, chained)
-    else
-        try c.checkExprCached(shape.callee, types.no_type);
+    if (!is_new and c.nodeTag(shape.callee) == .import_expr) {
+        return .{ .ty = try c.importCallType(shape.arg_nodes), .chained = chained };
+    }
+    var callee_t = if (c.isOptionalChain(shape.callee)) blk: {
+        const link = try c.chainObjType(shape.callee);
+        if (link.chained) chained = true;
+        break :blk link.ty;
+    } else try c.checkExprCached(shape.callee, types.no_type);
     if (shape.optional) {
-        if (c.containsNullish(callee_t)) chained.* = true;
+        if (c.containsNullish(callee_t)) chained = true;
         callee_t = try c.nonNullableChain(callee_t);
     }
     var r = try c.resolveStructural(callee_t);
@@ -364,7 +343,7 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, chained: *bool,
         for (shape.arg_nodes) |an| {
             if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
         }
-        return if (rk == .err) types.error_type else types.any_type;
+        return .{ .ty = if (rk == .err) types.error_type else types.any_type, .chained = chained };
     }
     // Calling a value of the global `Function` type: tsc treats `Function`
     // as callable, accepting any arguments and yielding `any` (the interface
@@ -386,7 +365,7 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, chained: *bool,
         for (shape.arg_nodes) |an| {
             if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
         }
-        return types.any_type;
+        return .{ .ty = types.any_type, .chained = chained };
     }
 
     // Explicit type arguments.
@@ -421,7 +400,7 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, chained: *bool,
                 // on the class's own type-parameter constraints — the same
                 // written-list question as `G<Bad>` in a type position.
                 try c.queueTypeArgConstraints(node, cls, targs.items);
-                const fixed = try c.fixTypeArgs(cls, targs.items, c.tree.nodeMainToken(node)) orelse return types.error_type;
+                const fixed = try c.fixTypeArgs(cls, targs.items, c.tree.nodeMainToken(node)) orelse return .{ .ty = types.error_type, .chained = chained };
                 @memcpy(inst_args, fixed);
             } else if (tps.items.len > 0) {
                 // Infer class type args from ctor arguments.
@@ -460,7 +439,7 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, chained: *bool,
                 if (countArgs(shape.arg_nodes) > 0) {
                     try c.diagFmt(2554, c.nodeSpan(node), "Expected 0 arguments, but got {d}.", .{countArgs(shape.arg_nodes)});
                 }
-                return instance_ret;
+                return .{ .ty = instance_ret, .chained = chained };
             }
             // Instantiate ctor sigs with the class args.
             var map = try c.scratch().alloc(TpMap, tps.items.len);
@@ -481,7 +460,7 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, chained: *bool,
             for (shape.arg_nodes) |an| {
                 if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
             }
-            return types.error_type;
+            return .{ .ty = types.error_type, .chained = chained };
         }
     } else {
         switch (rk) {
@@ -492,7 +471,7 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, chained: *bool,
                     for (shape.arg_nodes) |an| {
                         if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
                     }
-                    return types.error_type;
+                    return .{ .ty = types.error_type, .chained = chained };
                 }
                 try sigs.appendSlice(c.scratch(), isect_sigs.items);
             },
@@ -504,7 +483,7 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, chained: *bool,
                 for (shape.arg_nodes) |an| {
                     if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
                 }
-                return types.never_type;
+                return .{ .ty = types.never_type, .chained = chained };
             },
             // Callable object with call signatures.
             .object => {
@@ -513,13 +492,13 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, chained: *bool,
                         for (shape.arg_nodes) |an| {
                             if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
                         }
-                        return types.any_type;
+                        return .{ .ty = types.any_type, .chained = chained };
                     }
                     try c.diagFmt(2349, c.nodeSpan(shape.callee), "This expression is not callable.", .{});
                     for (shape.arg_nodes) |an| {
                         if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
                     }
-                    return types.error_type;
+                    return .{ .ty = types.error_type, .chained = chained };
                 }
                 try c.appendObjectCallCandidates(&sigs, r);
             },
@@ -606,13 +585,13 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, chained: *bool,
                     for (shape.arg_nodes) |an| {
                         if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
                     }
-                    return types.error_type;
+                    return .{ .ty = types.error_type, .chained = chained };
                 }
                 if (saw_any or sigs.items.len == 0) {
                     for (shape.arg_nodes) |an| {
                         if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
                     }
-                    return types.any_type;
+                    return .{ .ty = types.any_type, .chained = chained };
                 }
             },
             else => {
@@ -620,13 +599,13 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, chained: *bool,
                     for (shape.arg_nodes) |an| {
                         if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
                     }
-                    return types.any_type;
+                    return .{ .ty = types.any_type, .chained = chained };
                 }
                 try c.diagFmt(2349, c.nodeSpan(shape.callee), "This expression is not callable.", .{});
                 for (shape.arg_nodes) |an| {
                     if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
                 }
-                return types.error_type;
+                return .{ .ty = types.error_type, .chained = chained };
             },
         }
     }
@@ -651,7 +630,7 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, chained: *bool,
     // `new Kysely<DB>(config)` in immich was TS2769.
     const sig_targs: []const TypeId = if (is_new and instance_ret != types.no_type) &.{} else targs.items;
     const result = try c.resolveSignatureCall(node, sigs.items, sig_targs, shape.arg_nodes, instance_ret, call_ctx);
-    return result;
+    return .{ .ty = result, .chained = chained };
 }
 
 /// Receiver check for a signature with an explicit `this` parameter

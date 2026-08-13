@@ -20,13 +20,9 @@
 
 const std = @import("std");
 const ast = @import("../frontend/ast.zig");
-const scanner = @import("../frontend/scanner.zig");
 const intern = @import("../intern.zig");
 const binder = @import("../frontend/binder.zig");
 const types = @import("../types.zig");
-const source = @import("../frontend/source.zig");
-const libs = @import("../libs.zig");
-const ZeroPagedArray = @import("../zeropage.zig").ZeroPagedArray;
 
 const Allocator = std.mem.Allocator;
 const Node = ast.Node;
@@ -38,23 +34,11 @@ const TypeId = types.TypeId;
 const checker_zig = @import("../checker.zig");
 const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
-const Check = checker_zig.Check;
-const check = checker_zig.check;
 
 const annTypeMaybeUnique = Checker.annTypeMaybeUnique;
-const atom = Checker.atom;
-const checkIdentifier = @import("expr.zig").checkIdentifier;
-const classStaticType = @import("enums.zig").classStaticType;
-const expandRef = @import("instantiate.zig").expandRef;
-const inferTypeArgs = @import("calls.zig").inferTypeArgs;
 const inferVarFromNode = @import("generics.zig").inferVarFromNode;
-const instantiate = @import("enums.zig").instantiate;
-const lazyRefProp = @import("instantiate.zig").lazyRefProp;
 const mergeBaseObjectPlain = @import("classes.zig").mergeBaseObjectPlain;
-const propOfType = @import("props.zig").propOfType;
-const scopeOf = Checker.scopeOf;
 const scratch = Checker.scratch;
-const signatureAssignableModeInner = @import("assign.zig").signatureAssignableModeInner;
 const signatureOfProto = @import("signatures.zig").signatureOfProto;
 
 const keyof_zig = @import("keyof.zig");
@@ -117,7 +101,6 @@ pub const typeParamsOf = typeparams_zig.typeParamsOf;
 pub const undecidableType = typeparams_zig.undecidableType;
 
 /// `keyof` and indexed access (keyof.zig).
-pub const UnionIndexMiss = keyof_zig.UnionIndexMiss;
 pub const checkIndexedAccessIndexType = keyof_zig.checkIndexedAccessIndexType;
 pub const indexableConstituent = keyof_zig.indexableConstituent;
 pub const indexedAccessType = keyof_zig.indexedAccessType;
@@ -795,7 +778,7 @@ pub fn propertyKeyType(c: *Checker) Error!TypeId {
 
 /// Fold one heritage base into a derived interface/class shape.
 ///
-/// Everything except an `any` base is `instantiate.mergeBaseObject` verbatim.
+/// Everything except an `any` base is `classes.mergeBaseObjectPlain` verbatim.
 /// An `any` base is the case that one silently dropped (its object-only guard
 /// handed `derived` straight back), and it is not a no-op in tsc:
 /// `interface DefaultState extends DefaultStateExtends {}` over
