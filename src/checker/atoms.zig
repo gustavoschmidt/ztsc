@@ -151,7 +151,7 @@ pub fn literalKeyAtom(c: *Checker, ty: TypeId) Error!?Atom {
 /// the `__@u<id>` of a `unique symbol`, else the literal name it spells
 /// out. Null when `ty` is neither, and the caller falls back to the
 /// syntactic placeholder.
-pub fn computedKeyAtomOfType(c: *Checker, ty: TypeId) Error!?Atom {
+fn computedKeyAtomOfType(c: *Checker, ty: TypeId) Error!?Atom {
     if (try c.uniqueSymAtom(ty)) |a| return a;
     return c.literalKeyAtom(ty);
 }
@@ -174,9 +174,9 @@ pub fn computedSymPlaceholder(c: *Checker, name: []const u8) Error!Atom {
 /// then falls back to the name placeholder. Resolution goes through the value
 /// space and `typeOfSymbol`, so an imported key resolves to the *declaring*
 /// site's nominal id, giving cross-file key identity for free.
-pub fn constSymbolKeyAtom(c: *Checker, name: []const u8, scope: ScopeId) Error!?Atom {
-    const ty = (try c.constSymbolKeyType(name, scope)) orelse return null;
-    return c.computedKeyAtomOfType(ty);
+fn constSymbolKeyAtom(c: *Checker, name: []const u8, scope: ScopeId) Error!?Atom {
+    const ty = (try constSymbolKeyType(c, name, scope)) orelse return null;
+    return computedKeyAtomOfType(c, ty);
 }
 
 /// The TYPE a computed-key identifier denotes — the resolution half of
@@ -184,7 +184,7 @@ pub fn constSymbolKeyAtom(c: *Checker, name: []const u8, scope: ScopeId) Error!?
 /// tsc `nameType` (see `memberNameType`): `[E.A]` is keyed by the atom
 /// `"AV1"` but NAMED by the enum-member literal `E.A`, and `keyof` has to
 /// report the latter.
-pub fn constSymbolKeyType(c: *Checker, name: []const u8, scope: ScopeId) Error!?TypeId {
+fn constSymbolKeyType(c: *Checker, name: []const u8, scope: ScopeId) Error!?TypeId {
     if (std.mem.indexOfScalar(u8, name, '.')) |dot| {
         // Qualified `[a.b]` key: resolve `a` in the value space, then find
         // the member *symbol* `b` directly on it (class statics, namespace
@@ -200,7 +200,7 @@ pub fn constSymbolKeyType(c: *Checker, name: []const u8, scope: ScopeId) Error!?
             else => return null,
         };
         const member = try c.internText(name[dot + 1 ..]);
-        if (c.qualifiedKeyMemberSym(obj, member)) |msym| {
+        if (qualifiedKeyMemberSym(c, obj, member)) |msym| {
             return try c.typeOfSymbol(msym);
         }
         // Fallback for a base that is not itself a class/namespace (an
@@ -271,13 +271,13 @@ pub fn memberNameType(c: *Checker, tok: TokenIndex, flags: u32) Error!TypeId {
         // indexed access can read. Those stay as they were (see the
         // `memberAtom` normalization gap).
         if (c.tree.tokens.tag(tok) != .numeric_literal) return types.no_type;
-        return c.numericNameType(c.numberTokenValue(tok), c.tokenText(tok));
+        return numericNameType(c, c.numberTokenValue(tok), c.tokenText(tok));
     }
     const name = if (flags & ast.Flags.computed_sym_qual != 0)
         try std.fmt.allocPrint(c.scratch(), "{s}.{s}", .{ c.tokenText(tok - 2), c.tokenText(tok) })
     else
         c.tokenText(tok);
-    const ty = (try c.constSymbolKeyType(name, c.cur_scope)) orelse return types.no_type;
+    const ty = (try constSymbolKeyType(c, name, c.cur_scope)) orelse return types.no_type;
     const r = try c.ts.regular(ty);
     switch (c.ts.kind(r)) {
         // `[k]` with `const k = 200`: `literalKeyAtom` keys the member by
@@ -294,7 +294,7 @@ pub fn memberNameType(c: *Checker, tok: TokenIndex, flags: u32) Error!TypeId {
 /// The NUMBER literal type a numeric member name denotes, or `no_type`
 /// when `text` is not that number's canonical rendering — the atom the
 /// member is keyed by. See `memberNameType`.
-pub fn numericNameType(c: *Checker, value: f64, text: []const u8) Error!TypeId {
+fn numericNameType(c: *Checker, value: f64, text: []const u8) Error!TypeId {
     var buf: [32]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     print_zig.printNumber(&w, value) catch return types.no_type;
@@ -306,12 +306,12 @@ pub fn numericNameType(c: *Checker, value: f64, text: []const u8) Error!TypeId {
 /// a class's static (own class, or the class constituent of a merge), or
 /// a namespace export. Null when `obj` is neither, or the member is
 /// absent — the caller then falls back to type materialization.
-pub fn qualifiedKeyMemberSym(c: *Checker, obj: SymbolId, name: Atom) ?SymbolId {
+fn qualifiedKeyMemberSym(c: *Checker, obj: SymbolId, name: Atom) ?SymbolId {
     if (c.prog.isMergedId(obj)) {
         const m = c.prog.mergedSym(obj);
         for (m.parts) |p| {
             if (c.symFlags(p).class) {
-                if (c.classStaticMemberSym(p, name)) |s| return s;
+                if (classStaticMemberSym(c, p, name)) |s| return s;
             }
         }
         if (m.flags.namespace_decl) return c.namespaceMemberSym(obj, name);
@@ -319,14 +319,14 @@ pub fn qualifiedKeyMemberSym(c: *Checker, obj: SymbolId, name: Atom) ?SymbolId {
     }
     const f = c.symFlags(obj);
     if (f.class) {
-        if (c.classStaticMemberSym(obj, name)) |s| return s;
+        if (classStaticMemberSym(c, obj, name)) |s| return s;
     }
     if (f.namespace_decl) return c.namespaceMemberSym(obj, name);
     return null;
 }
 
 /// Static member `name` of class `cls` as a global symbol id, or null.
-pub fn classStaticMemberSym(c: *Checker, cls: SymbolId, name: Atom) ?SymbolId {
+fn classStaticMemberSym(c: *Checker, cls: SymbolId, name: Atom) ?SymbolId {
     const cb = c.symBind(cls);
     const ss = cb.staticsScopeOf(c.localOf(cls)) orelse return null;
     const local = cb.lookupInScope(ss, name) orelse return null;
@@ -342,7 +342,7 @@ pub fn computedSymKey(c: *Checker, tok: TokenIndex, flags: u32, scope: ScopeId) 
         try std.fmt.allocPrint(c.scratch(), "{s}.{s}", .{ c.tokenText(tok - 2), c.tokenText(tok) })
     else
         c.tokenText(tok);
-    if (try c.constSymbolKeyAtom(name, scope)) |k| return k;
+    if (try constSymbolKeyAtom(c, name, scope)) |k| return k;
     return c.computedSymPlaceholder(name);
 }
 
@@ -353,7 +353,7 @@ pub fn nominalizeComputedKey(c: *Checker, name: Atom, scope: ScopeId) Error!Atom
     const text = c.atomText(name);
     if (!std.mem.startsWith(u8, text, computed_sym_prefix)) return name;
     const ident = text[computed_sym_prefix.len..];
-    if (try c.constSymbolKeyAtom(ident, scope)) |k| return k;
+    if (try constSymbolKeyAtom(c, ident, scope)) |k| return k;
     return name;
 }
 

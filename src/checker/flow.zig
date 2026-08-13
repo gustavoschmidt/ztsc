@@ -61,18 +61,18 @@ pub const pattern_root_base = refkey.pattern_root_base;
 pub const isPseudoRoot = refkey.isPseudoRoot;
 pub const makeRefKey = refkey.makeRefKey;
 pub const refPath = refkey.refPath;
-pub const refKeyIndex = refkey.refKeyIndex;
+const refKeyIndex = refkey.refKeyIndex;
 pub const constIndexOf = refkey.constIndexOf;
 pub const stableIndexSymbol = refkey.stableIndexSymbol;
 pub const buildRefKey = refkey.buildRefKey;
 pub const referenceCandidate = refkey.referenceCandidate;
-pub const refMatches = refkey.refMatches;
+const refMatches = refkey.refMatches;
 pub const refMatchesPath = refkey.refMatchesPath;
-pub const refPrefixWritten = refkey.refPrefixWritten;
+const refPrefixWritten = refkey.refPrefixWritten;
 pub const isNarrowable = refkey.isNarrowable;
 
 const narrow = @import("narrow.zig");
-pub const narrowByLiteralEquality = narrow.narrowByLiteralEquality;
+const narrowByLiteralEquality = narrow.narrowByLiteralEquality;
 pub const narrowToValue = narrow.narrowToValue;
 pub const unionHasKind = narrow.unionHasKind;
 pub const narrowExcludeValue = narrow.narrowExcludeValue;
@@ -82,16 +82,16 @@ pub const typeofMatchesFn = narrow.typeofMatchesFn;
 pub const enumTypeofDomain = narrow.enumTypeofDomain;
 pub const hasCallableShape = narrow.hasCallableShape;
 pub const typeofMatches = narrow.typeofMatches;
-pub const narrowByDiscriminant = narrow.narrowByDiscriminant;
-pub const narrowByPropTruthiness = narrow.narrowByPropTruthiness;
+const narrowByDiscriminant = narrow.narrowByDiscriminant;
+const narrowByPropTruthiness = narrow.narrowByPropTruthiness;
 pub const isDiscriminantProp = narrow.isDiscriminantProp;
 pub const propDeclaredForIn = narrow.propDeclaredForIn;
-pub const narrowByInProp = narrow.narrowByInProp;
+const narrowByInProp = narrow.narrowByInProp;
 pub const instanceTypeOfConstructor = narrow.instanceTypeOfConstructor;
 pub const instanceofInstanceType = narrow.instanceofInstanceType;
 pub const isNullishKind = narrow.isNullishKind;
 pub const admitsNullish = narrow.admitsNullish;
-pub const narrowByInstance = narrow.narrowByInstance;
+const narrowByInstance = narrow.narrowByInstance;
 /// Not re-exported: `switchDefaultCovered` is the only reader outside
 /// `narrow.zig`, and it reaches it directly rather than as a `Checker` method.
 const unionFacet = narrow.unionFacet;
@@ -340,7 +340,7 @@ pub fn flowTypeOfKey(c: *Checker, node: Node, key: RefKey, declared: TypeId) Err
             const saved_ref = c.flow_ref_node;
             defer c.flow_ref_node = saved_ref;
             c.flow_ref_node = node;
-            t = try c.flowType(flow, key, declared, 0);
+            t = try flowType(c, flow, key, declared, 0);
             // The tail of tsc's `getFlowTypeOfReference`. tsc has *two*
             // `never`s: the ordinary one a guard narrows a reference down to,
             // and `unreachableNeverType`, which is what the walk answers when
@@ -351,16 +351,16 @@ pub fn flowTypeOfKey(c: *Checker, node: Node, key: RefKey, declared: TypeId) Err
             // reports TS2339. ztsc computes both with the one `never_type`,
             // so the distinction is drawn here, by asking the graph whether
             // the reference's own flow node is reachable at all.
-            if (c.ts.kind(t) == .never and !try c.flowReachable(flow)) t = declared;
+            if (c.ts.kind(t) == .never and !try flowReachable(c, flow)) t = declared;
         }
     }
-    return c.applyChainGuards(key, t);
+    return applyChainGuards(c, key, t);
 }
 
 /// tsc's `isReachableFlowNode`. Only asked on a `never` answer (a fraction of
 /// a percent of queries), so the memo is there to bound a pathological graph
 /// rather than to carry a hot path.
-pub fn flowReachable(c: *Checker, flow: FlowId) Error!bool {
+fn flowReachable(c: *Checker, flow: FlowId) Error!bool {
     if (flow == binder.no_flow) return true;
     if (flow == binder.unreachable_flow) return false;
     const cache_key = c.cur_flow_base + flow;
@@ -381,7 +381,7 @@ fn flowReachableInner(c: *Checker, flow: FlowId) Error!bool {
         .unreachable_ => return false,
         .branch_label => {
             for (b.flowAntecedents(flow)) |a| {
-                if (try c.flowReachable(a)) return true;
+                if (try flowReachable(c, a)) return true;
             }
             return false;
         },
@@ -390,7 +390,7 @@ fn flowReachableInner(c: *Checker, flow: FlowId) Error!bool {
         .loop_label => {
             const antes = b.flowAntecedents(flow);
             if (antes.len == 0) return false;
-            return c.flowReachable(antes[0]);
+            return flowReachable(c, antes[0]);
         },
         // tsc's Call arm: a call statement whose signature returns `never`
         // (`invariant(false)`, `fail(msg): never`) ends the flow — the
@@ -398,13 +398,13 @@ fn flowReachableInner(c: *Checker, flow: FlowId) Error!bool {
         // at its declared type.
         .call_stmt => {
             if (try callStmtReturnsNever(c, flow)) return false;
-            return c.flowReachable(b.flow_a[flow]);
+            return flowReachable(c, b.flow_a[flow]);
         },
         // A `switch_no_match` edge is deliberately NOT tested for
         // exhaustiveness here: the fall-out of an exhaustive `switch` is
         // where tsc reports `never` on the discriminant, so it must stay
         // "reachable" and let the narrowed `never` through.
-        else => return c.flowReachable(b.flow_a[flow]),
+        else => return flowReachable(c, b.flow_a[flow]),
     }
 }
 
@@ -438,9 +438,9 @@ pub fn callReturnsNever(c: *Checker, call: Node) Error!bool {
     if (c.bind.flowAt(callee)) |f| c.cur_scope = c.bind.flowScope(f);
     const callee_t = switch (c.nodeTag(callee)) {
         .member_expr, .optional_member_expr, .index_expr, .optional_index_expr => c.nodeType(callee) orelse
-            try c.declaredPathType(callee),
-        .identifier => if (c.calleeNeedsExplicitDecl(callee))
-            c.nodeType(callee) orelse try c.declaredPathType(callee)
+            try declaredPathType(c, callee),
+        .identifier => if (calleeNeedsExplicitDecl(c, callee))
+            c.nodeType(callee) orelse try declaredPathType(c, callee)
         else
             try c.checkExprCached(callee, types.no_type),
         else => return false,
@@ -491,7 +491,7 @@ pub fn pushChainGuards(c: *Checker, node: Node) Error!void {
 /// Non-nullish for a reference an enclosing chain has already guarded.
 /// Applied *after* flow narrowing (and after the untracked-reference early
 /// outs) so it composes with whatever the flow graph knows.
-pub fn applyChainGuards(c: *Checker, key: RefKey, t: TypeId) Error!TypeId {
+fn applyChainGuards(c: *Checker, key: RefKey, t: TypeId) Error!TypeId {
     if (c.chain_guards.items.len == 0) return t;
     for (c.chain_guards.items) |k| {
         if (std.meta.eql(k, key)) return c.nonNullableChain(t);
@@ -504,7 +504,7 @@ pub fn applyChainGuards(c: *Checker, key: RefKey, t: TypeId) Error!TypeId {
 /// scan of a push/pop stack is the right shape: a second hash map on the
 /// `flowType` hot path measured +330 ms of check time on the dogfood app,
 /// three times the whole flow phase.
-pub fn flowInFlight(c: *const Checker, q: FlowQ) bool {
+fn flowInFlight(c: *const Checker, q: FlowQ) bool {
     var i: usize = c.flow_stack.items.len;
     while (i > 0) : (i -= 1) {
         if (c.flow_stack.items[i - 1] == q) return true;
@@ -512,11 +512,11 @@ pub fn flowInFlight(c: *const Checker, q: FlowQ) bool {
     return false;
 }
 
-pub fn flowType(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth: u32) Error!TypeId {
+fn flowType(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth: u32) Error!TypeId {
     if (flow == binder.no_flow) return declared;
     if (flow == binder.unreachable_flow) return types.never_type;
     if (depth > 4000) return declared; // pathological chains: stay sound
-    const q: FlowQ = (@as(u64, c.cur_flow_base + flow) << 32) | try c.refKeyIndex(key, declared);
+    const q: FlowQ = (@as(u64, c.cur_flow_base + flow) << 32) | try refKeyIndex(c, key, declared);
     // tsc's `getTypeAtFlowLoopLabel` in-process check. Re-entering a loop
     // label that is still computing (the walk came back round the loop, or
     // an assignment's right-hand side reads the very reference the label is
@@ -546,11 +546,11 @@ pub fn flowType(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth:
         // bounded, and memoize in `flow_tmp`. Everywhere else the old,
         // cheap answer stands: outside a back-edge walk there is no partial
         // for an in-flight node to swallow.
-        if (c.flow_back_edge != 0 and c.flow_busy_depth < 4 and c.flowInFlight(q)) {
+        if (c.flow_back_edge != 0 and c.flow_busy_depth < 4 and flowInFlight(c, q)) {
             if (c.flow_tmp.get(q)) |t| return t;
             c.flow_busy_depth += 1;
             defer c.flow_busy_depth -= 1;
-            const r = try c.flowTypeInner(flow, key, declared, depth);
+            const r = try flowTypeInner(c, flow, key, declared, depth);
             try c.flow_tmp.put(c.cm(), q, r);
             return r;
         }
@@ -577,7 +577,7 @@ pub fn flowType(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth:
     // entry *is* the final answer, so the common case never writes twice.
     try c.flow_same.put(c.cm(), q, {});
     try c.flow_stack.append(c.cm(), q);
-    const result = try c.flowTypeInner(flow, key, declared, depth);
+    const result = try flowTypeInner(c, flow, key, declared, depth);
     _ = c.flow_stack.pop();
     if (c.flow_back_edge != 0) {
         _ = c.flow_same.remove(q);
@@ -594,7 +594,7 @@ pub fn flowType(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth:
     return result;
 }
 
-pub fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth: u32) Error!TypeId {
+fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, depth: u32) Error!TypeId {
     const b = c.bind;
     switch (b.flow_tags[flow]) {
         .none => return declared,
@@ -641,7 +641,7 @@ pub fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, d
             // Without this the sibling narrowing evaporated the moment it was
             // read inside a callback — `lists.map((l, i) => i === lists.length
             // - 1 …)` after `isPending`/`isError` were ruled out.
-            if (isPatternRoot(key.sym)) return c.flowType(ante, key, declared, depth + 1);
+            if (isPatternRoot(key.sym)) return flowType(c, ante, key, declared, depth + 1);
             // Only a reference *captured* by this closure may continue into
             // the definition-point flow. A reference to something the
             // closure declares itself (its parameters, its own locals) is
@@ -702,7 +702,7 @@ pub fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, d
                 if (c.reassigned_syms.contains(key.sym) and
                     !pastLastAssignment(c, key.sym, sf)) return declared;
             }
-            const outer = try c.flowType(ante, key, declared, depth + 1);
+            const outer = try flowType(c, ante, key, declared, depth + 1);
             // tsc's two `never`s, at the closure boundary (see
             // `flowTypeOfKey`'s tail for the other place the distinction is
             // drawn). A definition point standing in code no path reaches
@@ -715,7 +715,7 @@ pub fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, d
             // never`, which `any` satisfies — the statement ends the flow, and
             // the `runInAction(() => … res.data …)` callback right after it
             // read every capture as `never` (36 fresh TS2339s).
-            if (c.ts.kind(outer) == .never and !try c.flowReachable(ante)) return declared;
+            if (c.ts.kind(outer) == .never and !try flowReachable(c, ante)) return declared;
             return outer;
         },
         .unreachable_ => return types.never_type,
@@ -734,12 +734,12 @@ pub fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, d
                 const saved = c.cur_scope;
                 defer c.cur_scope = saved;
                 c.cur_scope = b.flowScope(flow);
-                if (try c.assignNarrows(target, key, declared)) |narrowed| {
+                if (try assignNarrows(c, target, key, declared)) |narrowed| {
                     return narrowed;
                 }
                 strip_nullish = try forInSubjectMatches(c, flow, target, key);
             }
-            const before = try c.flowType(ante, key, declared, depth + 1);
+            const before = try flowType(c, ante, key, declared, depth + 1);
             // The tail of tsc's `getTypeAtFlowAssignment`: the assignment that
             // binds a `for..in` KEY strips nullish from the object being
             // enumerated, for the whole body. `for (const k in
@@ -772,7 +772,7 @@ pub fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, d
                 const dead: ast.Tag = if (b.flow_tags[flow] == .cond_true) .false_literal else .true_literal;
                 if (c.nodeTag(cond) == dead) return types.never_type;
             }
-            const before = try c.flowType(ante, key, declared, depth + 1);
+            const before = try flowType(c, ante, key, declared, depth + 1);
             if (before == types.never_type) return before;
             const sense = b.flow_tags[flow] == .cond_true;
             const saved = c.cur_scope;
@@ -783,12 +783,12 @@ pub fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, d
         .switch_clause => {
             const clause = b.flowNode(flow);
             const ante = b.flow_a[flow];
-            const before = try c.flowType(ante, key, declared, depth + 1);
+            const before = try flowType(c, ante, key, declared, depth + 1);
             if (before == types.never_type) return before;
             const saved = c.cur_scope;
             defer c.cur_scope = saved;
             c.cur_scope = b.flowScope(flow);
-            return c.narrowBySwitchClause(before, clause, key, declared);
+            return narrowBySwitchClause(c, before, clause, key, declared);
         },
         .switch_no_match => {
             const sw = b.flowNode(flow);
@@ -799,7 +799,7 @@ pub fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, d
             // An exhaustive `default`-less switch cannot fall out of its
             // clause list, so this edge does not exist.
             if (c.switchIsExhaustive(sw)) return types.never_type;
-            return c.flowType(ante, key, declared, depth + 1);
+            return flowType(c, ante, key, declared, depth + 1);
         },
         .call_stmt => {
             const call = b.flowNode(flow);
@@ -824,7 +824,7 @@ pub fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, d
             // is what makes `constructor() { fail(); }` initialize
             // everything — nothing flows out of the constructor at all.)
             if (try callStmtReturnsNever(c, flow)) return types.never_type;
-            const before = try c.flowType(ante, key, declared, depth + 1);
+            const before = try flowType(c, ante, key, declared, depth + 1);
             if (before == types.never_type) return before;
             // The assertion callee is re-checked here; resolve it in the
             // scope where the call statement lives (it may be reached via a
@@ -832,7 +832,7 @@ pub fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, d
             const saved = c.cur_scope;
             defer c.cur_scope = saved;
             c.cur_scope = b.flowScope(flow);
-            return c.narrowByAssertCall(before, call, key, declared);
+            return narrowByAssertCall(c, before, call, key, declared);
         },
         .branch_label, .loop_label => {
             const antes = b.flowAntecedents(flow);
@@ -897,7 +897,7 @@ pub fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, d
                     c.member_written_syms.contains(key.sym));
                 const assigned_in_loop = root_assigned or member_written;
                 if (!assigned_in_loop) {
-                    const entry_t = try c.flowType(antes[0], key, declared, depth + 1);
+                    const entry_t = try flowType(c, antes[0], key, declared, depth + 1);
                     if (entry_t != declared) return entry_t;
                 }
             }
@@ -933,7 +933,7 @@ pub fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, d
                     published = true;
                     frame = c.flow_loop_stack.items.len;
                     const q: FlowQ = (@as(u64, c.cur_flow_base + flow) << 32) |
-                        try c.refKeyIndex(key, declared);
+                        try refKeyIndex(c, key, declared);
                     // `parts` is scratch-backed and this publishes it where a
                     // deeper query can read it, so it is the one place in the
                     // checker that hands a scratch buffer sideways. It stays
@@ -953,7 +953,7 @@ pub fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, d
                     // `flowTypeCache` around exactly this walk.
                     c.no_publish_depth += 1;
                 }
-                const t = try c.flowType(a, key, declared, depth + 1);
+                const t = try flowType(c, a, key, declared, depth + 1);
                 if (t != types.never_type) try parts.append(c.scratch(), t);
             }
             if (published) {
@@ -975,7 +975,7 @@ pub fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, d
             // whose first constituent lacks the other's properties. Without
             // it every later `v?.someProp` reported TS2339.
             if (key.len == 0 and !isPseudoRoot(key.sym) and c.isEvolvingVar(key.sym)) {
-                return c.reduceEvolvingJoin(joined);
+                return reduceEvolvingJoin(c, joined);
             }
             return joined;
         },
@@ -1007,7 +1007,7 @@ pub fn flowTypeInner(c: *Checker, flow: FlowId, key: RefKey, declared: TypeId, d
 /// was then entered from whichever side the partition happened to schedule
 /// first, `.some((e) => …)` on the `any` result lost its contextual
 /// signature in some `--checkers=N` and not others.
-pub fn assignmentRefines(c: *Checker, declared: TypeId) bool {
+fn assignmentRefines(c: *Checker, declared: TypeId) bool {
     return switch (c.ts.kind(declared)) {
         .union_type, .unknown => true,
         else => false,
@@ -1050,7 +1050,7 @@ fn definiteAssignOp(op: scanner.Tag) bool {
 /// `this.x` there is not part of this write at all.
 fn patternWritesRef(c: *Checker, node: Node, key: RefKey) Error!bool {
     if (node == null_node) return false;
-    if (try c.refMatches(node, key)) return true;
+    if (try refMatches(c, node, key)) return true;
     switch (c.nodeTag(node)) {
         .arrow_fn, .function_expr, .function_decl, .object_method, .class_decl => return false,
         else => {},
@@ -1113,7 +1113,7 @@ pub fn thisPropUnassigned(c: *Checker, flow: FlowId, name: Atom, declared: TypeI
     const elems = [1]PathElem{.member(name)};
     var key = (try c.makeRefKey(this_flow_root, elems[0..])) orelse return false;
     key.opt_init = true;
-    const t = try c.flowType(flow, key, declared, 0);
+    const t = try flowType(c, flow, key, declared, 0);
     return hasUndefinedMember(c, t);
 }
 
@@ -1140,7 +1140,7 @@ fn forInSubjectMatches(c: *Checker, flow: FlowId, target: Node, key: RefKey) Err
     if (owner == null_node or c.nodeTag(owner) != .for_in_stmt) return false;
     const e = c.tree.extraData(ast.ForInOf, c.tree.nodeData(owner).lhs);
     if (e.left != target) return false;
-    return c.refMatches(e.right, key);
+    return refMatches(c, e.right, key);
 }
 
 /// Does this type carry a `null`/`undefined` constituent to strip? tsc's
@@ -1164,27 +1164,27 @@ pub fn isNullishUnion(c: *Checker, t: TypeId) bool {
 /// If the assign-flow node writes the reference (or invalidates a
 /// property path by writing its root), the type after the assignment;
 /// null when it is unrelated.
-pub fn assignNarrows(c: *Checker, target: Node, key: RefKey, declared: TypeId) Error!?TypeId {
+fn assignNarrows(c: *Checker, target: Node, key: RefKey, declared: TypeId) Error!?TypeId {
     if (target == null_node) return null;
     const root_sym = key.sym;
     switch (c.nodeTag(target)) {
         .declarator_init => {
             const d = c.tree.nodeData(target);
-            if (!try c.patternBindsSym(d.lhs, root_sym)) return null;
+            if (!try patternBindsSym(c, d.lhs, root_sym)) return null;
             if (key.len != 0) return declared; // root re-init: reset path
             if (c.nodeTag(d.lhs) != .identifier) return declared;
-            if (!c.assignmentRefines(declared)) return declared;
+            if (!assignmentRefines(c, declared)) return declared;
             const vt = c.nodeType(d.rhs) orelse try c.checkExprCached(d.rhs, types.no_type);
-            return try c.assignmentReduced(declared, vt);
+            return try assignmentReduced(c, declared, vt);
         },
         .declarator_full => {
             const d = c.tree.nodeData(target);
-            if (!try c.patternBindsSym(d.lhs, root_sym)) return null;
+            if (!try patternBindsSym(c, d.lhs, root_sym)) return null;
             const e = c.tree.extraData(ast.DeclaratorFull, d.rhs);
             if (key.len != 0) return declared;
             if (e.init == 0) return declared;
             if (c.nodeTag(d.lhs) != .identifier) return declared;
-            if (!c.assignmentRefines(declared)) return declared;
+            if (!assignmentRefines(c, declared)) return declared;
             // Reading this variable can reach its declaration's flow node
             // BEFORE the declaration statement itself is checked — a JSX
             // attribute referring to a `const cb: CB = (props) => …`
@@ -1204,12 +1204,12 @@ pub fn assignNarrows(c: *Checker, target: Node, key: RefKey, declared: TypeId) E
             else
                 types.no_type;
             const vt = c.nodeType(e.init) orelse try c.checkExprCached(e.init, ctx);
-            return try c.assignmentReduced(declared, vt);
+            return try assignmentReduced(c, declared, vt);
         },
         .assign => {
             const d = c.tree.nodeData(target);
             // Full path write: <ref> = v narrows the tracked reference.
-            if (key.len != 0 and try c.refMatches(d.lhs, key)) {
+            if (key.len != 0 and try refMatches(c, d.lhs, key)) {
                 const op = c.tree.tokens.tag(c.tree.nodeMainToken(target));
                 // A COMPOUND write is not an initialization: tsc's
                 // `getAssignmentTargetKind` calls `=` and the three logical
@@ -1229,15 +1229,15 @@ pub fn assignNarrows(c: *Checker, target: Node, key: RefKey, declared: TypeId) E
                 if (op != .eq) {
                     const vt = c.nodeType(target) orelse
                         try c.checkExprCached(target, types.no_type);
-                    return try c.assignmentReduced(declared, vt);
+                    return try assignmentReduced(c, declared, vt);
                 }
-                if (!c.assignmentRefines(declared)) return declared;
+                if (!assignmentRefines(c, declared)) return declared;
                 const vt = c.nodeType(d.rhs) orelse try c.checkExprCached(d.rhs, types.no_type);
-                return try c.assignmentReduced(declared, vt);
+                return try assignmentReduced(c, declared, vt);
             }
             // Writing any proper prefix of the path (its root, or an
             // intermediate member) invalidates the whole subtree.
-            if (try c.refPrefixWritten(d.lhs, key)) return declared;
+            if (try refPrefixWritten(c, d.lhs, key)) return declared;
             if (c.nodeTag(d.lhs) == .identifier) {
                 if (!try c.identIsSym(d.lhs, root_sym)) return null;
                 // key.len != 0 was caught above by refPrefixWritten.
@@ -1263,24 +1263,24 @@ pub fn assignNarrows(c: *Checker, target: Node, key: RefKey, declared: TypeId) E
                     const vt = c.nodeType(target) orelse
                         try c.checkExprCached(target, types.no_type);
                     if (evolving) return try c.widenLiteral(vt);
-                    return try c.assignmentReduced(declared, vt);
+                    return try assignmentReduced(c, declared, vt);
                 }
-                if (!evolving and !c.assignmentRefines(declared)) return declared;
+                if (!evolving and !assignmentRefines(c, declared)) return declared;
                 const vt = c.nodeType(d.rhs) orelse try c.checkExprCached(d.rhs, types.no_type);
                 if (evolving) return try c.widenLiteral(vt);
-                return try c.assignmentReduced(declared, vt);
+                return try assignmentReduced(c, declared, vt);
             }
-            if (try c.patternBindsSym(d.lhs, root_sym)) {
+            if (try patternBindsSym(c, d.lhs, root_sym)) {
                 // `[, width, height] = match` assigns a *position* of the
                 // right-hand side, and tsc reduces the declared type by that
                 // element's type just like a plain `width = …` (its
                 // `getAssignedType` walks the destructuring target). Falling
                 // back to `declared` here re-widened a `string | null` that
                 // an earlier `width = width || "50"` had already narrowed.
-                if (key.len == 0 and c.assignmentRefines(declared)) {
+                if (key.len == 0 and assignmentRefines(c, declared)) {
                     const rt = c.nodeType(d.rhs) orelse try c.checkExprCached(d.rhs, types.no_type);
-                    if (try c.destructuredAssignType(d.lhs, c.symNameAtom(root_sym), rt)) |vt| {
-                        return try c.assignmentReduced(declared, vt);
+                    if (try destructuredAssignType(c, d.lhs, c.symNameAtom(root_sym), rt)) |vt| {
+                        return try assignmentReduced(c, declared, vt);
                     }
                 }
                 return declared;
@@ -1318,19 +1318,19 @@ pub fn assignNarrows(c: *Checker, target: Node, key: RefKey, declared: TypeId) E
         },
         .prefix_unary, .postfix_unary => {
             const d = c.tree.nodeData(target);
-            if (try c.refMatches(d.lhs, key)) {
+            if (try refMatches(c, d.lhs, key)) {
                 // `this.x++` is compound in tsc's sense: see the note in the
                 // `.assign` arm. It reads before it writes, so it neither
                 // initializes the property nor hides TS2565.
                 if (key.opt_init) return null;
-                return try c.assignmentReduced(declared, types.number_type);
+                return try assignmentReduced(c, declared, types.number_type);
             }
-            if (try c.refPrefixWritten(d.lhs, key)) return declared;
+            if (try refPrefixWritten(c, d.lhs, key)) return declared;
             return null;
         },
         // for-of / for-in left (var decl or expression).
         .var_decl_one, .var_decl => {
-            if (try c.varDeclBindsSym(target, root_sym)) {
+            if (try varDeclBindsSym(c, target, root_sym)) {
                 if (key.len != 0) return declared;
                 // The element type was computed when the statement was
                 // checked; the symbol type already reflects it.
@@ -1343,7 +1343,7 @@ pub fn assignNarrows(c: *Checker, target: Node, key: RefKey, declared: TypeId) E
             return declared;
         },
         else => {
-            if (try c.patternBindsSym(target, root_sym)) return declared;
+            if (try patternBindsSym(c, target, root_sym)) return declared;
             return null;
         },
     }
@@ -1357,7 +1357,7 @@ pub fn assignNarrows(c: *Checker, target: Node, key: RefKey, declared: TypeId) E
 /// narrowing requires this — an alias snapshots the condition at its
 /// declaration point, so a reassignable subject could make the snapshot
 /// stale (mirrors tsc's `isConstantReference`).
-pub fn isConstantRefSym(c: *Checker, key: RefKey) Error!bool {
+fn isConstantRefSym(c: *Checker, key: RefKey) Error!bool {
     if (key.len != 0) return false;
     if (isPseudoRoot(key.sym)) return false;
     const sf = c.symFlags(key.sym);
@@ -1380,9 +1380,9 @@ pub fn isConstantRefSym(c: *Checker, key: RefKey) Error!bool {
 ///     boolean = …` does not narrow), and bind a plain identifier (no
 ///     destructured alias),
 ///   • same-file, non-exported (so the initializer resolves in scope).
-pub fn constAliasInit(c: *Checker, cond: Node, key: RefKey) Error!?Node {
+fn constAliasInit(c: *Checker, cond: Node, key: RefKey) Error!?Node {
     if (c.nodeTag(cond) != .identifier) return null;
-    if (!try c.isConstantRefSym(key)) return null;
+    if (!try isConstantRefSym(c, key)) return null;
     const a = try c.atomOfToken(c.tree.nodeMainToken(cond));
     const sym = switch (c.resolveSpace(a, c.cur_scope, true)) {
         .sym => |s| s,
@@ -1428,7 +1428,7 @@ pub fn narrowByCondition(c: *Checker, t: TypeId, cond: Node, sense: bool, key: R
             return t;
         },
         .identifier => {
-            if (try c.refMatches(cond, key)) {
+            if (try refMatches(c, cond, key)) {
                 return if (sense) c.getTruthyPart(t) else c.getFalsyPart(t, true);
             }
             // A bare identifier can also READ a discriminant rather than be
@@ -1440,8 +1440,8 @@ pub fn narrowByCondition(c: *Checker, t: TypeId, cond: Node, sense: bool, key: R
             // `switch` forms narrowed the siblings, and the boolean
             // discriminant — the form that has no comparand to write — did
             // not narrow at all.
-            if (try c.discriminantOfRef(cond, key)) |prop_tok| {
-                return c.narrowByPropTruthiness(t, try c.memberAtom(prop_tok), sense, decl);
+            if (try discriminantOfRef(c, cond, key)) |prop_tok| {
+                return narrowByPropTruthiness(c, t, try c.memberAtom(prop_tok), sense, decl);
             }
             // Aliased-condition narrowing (tsc TS4.4 "control flow analysis
             // of aliased conditions and discriminants"): the condition is a
@@ -1452,7 +1452,7 @@ pub fn narrowByCondition(c: *Checker, t: TypeId, cond: Node, sense: bool, key: R
             // reference so the snapshot cannot go stale); the level cap
             // bounds alias-of-alias chains.
             if (c.alias_inline_level < 5) {
-                if (try c.constAliasInit(cond, key)) |init_expr| {
+                if (try constAliasInit(c, cond, key)) |init_expr| {
                     c.alias_inline_level += 1;
                     defer c.alias_inline_level -= 1;
                     return c.narrowByCondition(t, init_expr, sense, key, decl);
@@ -1462,18 +1462,18 @@ pub fn narrowByCondition(c: *Checker, t: TypeId, cond: Node, sense: bool, key: R
         },
         .member_expr, .optional_member_expr => {
             // The path itself is the condition.
-            if (try c.refMatches(cond, key)) {
+            if (try refMatches(c, cond, key)) {
                 return if (sense) c.getTruthyPart(t) else c.getFalsyPart(t, true);
             }
             // `if (<ref>.p)` / `if (<ref>?.p)` — discriminate the tracked
             // reference by the truthiness of an extra property `p`.
-            if (try c.refMatches(d.lhs, key)) {
+            if (try refMatches(c, d.lhs, key)) {
                 var base = t;
                 if (c.nodeTag(cond) == .optional_member_expr and sense) {
                     base = try c.nonNullable(base);
                 }
                 const prop = try c.memberAtom(d.rhs);
-                return c.narrowByPropTruthiness(base, prop, sense, decl);
+                return narrowByPropTruthiness(c, base, prop, sense, decl);
             }
             // A truthy optional chain (`if (a?.b.c)`, `if (!a?.b.c)` else)
             // implies its receivers did not short-circuit: narrow a contained
@@ -1481,7 +1481,7 @@ pub fn narrowByCondition(c: *Checker, t: TypeId, cond: Node, sense: bool, key: R
             // `narrowTypeByTruthiness` optional-chain-containment rule — it
             // fires on the true branch only (a falsy chain says nothing about
             // whether the receiver was nullish).
-            if (sense and try c.optionalChainContainsRef(cond, key)) {
+            if (sense and try optionalChainContainsRef(c, cond, key)) {
                 return c.nonNullable(t);
             }
             return t;
@@ -1493,10 +1493,10 @@ pub fn narrowByCondition(c: *Checker, t: TypeId, cond: Node, sense: bool, key: R
         // node tag: a truthy chain implies its receivers did not
         // short-circuit, so the member arm's containment rule applies.
         .index_expr, .optional_index_expr => {
-            if (try c.refMatches(cond, key)) {
+            if (try refMatches(c, cond, key)) {
                 return if (sense) c.getTruthyPart(t) else c.getFalsyPart(t, true);
             }
-            if (sense and try c.optionalChainContainsRef(cond, key)) {
+            if (sense and try optionalChainContainsRef(c, cond, key)) {
                 return c.nonNullable(t);
             }
             return t;
@@ -1508,32 +1508,32 @@ pub fn narrowByCondition(c: *Checker, t: TypeId, cond: Node, sense: bool, key: R
                     const strict = op == .eq_eq_eq or op == .bang_eq_eq;
                     var eff_sense = sense;
                     if (op == .bang_eq_eq or op == .bang_eq) eff_sense = !sense;
-                    return c.narrowByEqualityCond(t, d.lhs, d.rhs, strict, eff_sense, key, decl);
+                    return narrowByEqualityCond(c, t, d.lhs, d.rhs, strict, eff_sense, key, decl);
                 },
                 .keyword_in => {
                     // `"p" in x`
-                    if (!try c.refMatches(d.rhs, key)) return t;
+                    if (!try refMatches(c, d.rhs, key)) return t;
                     const lhs_t = try c.checkExprCached(d.lhs, types.no_type);
                     const rl = try c.ts.regularLiteral(lhs_t);
                     if (c.ts.kind(rl) != .string_literal) return t;
-                    return c.narrowByInProp(t, c.ts.literalAtom(rl), sense);
+                    return narrowByInProp(c, t, c.ts.literalAtom(rl), sense);
                 },
                 .keyword_instanceof => {
-                    if (!try c.refMatches(d.lhs, key)) {
+                    if (!try refMatches(c, d.lhs, key)) {
                         // `a?.b instanceof C` being true implies the chain
                         // did not short-circuit, so its receivers are not
                         // nullish — the same optional-chain containment rule
                         // the truthiness arms above apply, and the reason
                         // `if (cached?.image instanceof Promise) await
                         // cached.image;` is legal. False says nothing.
-                        if (sense and try c.optionalChainContainsRef(d.lhs, key)) {
+                        if (sense and try optionalChainContainsRef(c, d.lhs, key)) {
                             return c.nonNullable(t);
                         }
                         return t;
                     }
                     const rt = try c.checkExprCached(d.rhs, types.no_type);
                     if (try c.instanceofInstanceType(rt)) |inst|
-                        return c.narrowByInstance(t, inst, sense, true);
+                        return narrowByInstance(c, t, inst, sense, true);
                     return t;
                 },
                 // `a && b` true implies both operands are truthy; `a || b`
@@ -1592,25 +1592,25 @@ pub fn narrowByCondition(c: *Checker, t: TypeId, cond: Node, sense: bool, key: R
             // (tsc's `narrowTypeByTruthiness` optional-chain containment);
             // fires on the truthy branch only. This is what lets the common
             // `if (!raw?.trim()) return ''; …raw…` guard narrow `raw`.
-            if (sense and try c.optionalChainContainsRef(cond, key)) {
+            if (sense and try optionalChainContainsRef(c, cond, key)) {
                 return c.nonNullable(t);
             }
-            return c.narrowByGuardCall(t, cond, sense, key);
+            return narrowByGuardCall(c, t, cond, sense, key);
         },
         else => return t,
     }
 }
 
-pub fn narrowByEqualityCond(c: *Checker, t: TypeId, lhs: Node, rhs: Node, strict: bool, sense: bool, key: RefKey, decl: TypeId) Error!TypeId {
+fn narrowByEqualityCond(c: *Checker, t: TypeId, lhs: Node, rhs: Node, strict: bool, sense: bool, key: RefKey, decl: TypeId) Error!TypeId {
     // typeof <ref> === "..."
-    if (try c.typeofTargetOf(lhs, key)) {
+    if (try typeofTargetOf(c, lhs, key)) {
         const rt = try c.ts.regularLiteral(try c.checkExprCached(rhs, types.no_type));
         if (c.ts.kind(rt) == .string_literal) {
             return c.narrowByTypeof(t, c.ts.literalAtom(rt), sense);
         }
         return t;
     }
-    if (try c.typeofTargetOf(rhs, key)) {
+    if (try typeofTargetOf(c, rhs, key)) {
         const lt = try c.ts.regularLiteral(try c.checkExprCached(lhs, types.no_type));
         if (c.ts.kind(lt) == .string_literal) {
             return c.narrowByTypeof(t, c.ts.literalAtom(lt), sense);
@@ -1623,42 +1623,42 @@ pub fn narrowByEqualityCond(c: *Checker, t: TypeId, lhs: Node, rhs: Node, strict
     // "undefined"`, that receiver did not short-circuit — narrow it non-null
     // (tsc's `narrowTypeByTypeof` optional-chain-containment rule). `sense`
     // here is already equals-folded (`!==`/`!=` inverted by the caller).
-    if (try c.typeofChainContainsRef(lhs, key)) {
-        return c.narrowByTypeofChainContainment(t, rhs, sense);
+    if (try typeofChainContainsRef(c, lhs, key)) {
+        return narrowByTypeofChainContainment(c, t, rhs, sense);
     }
-    if (try c.typeofChainContainsRef(rhs, key)) {
-        return c.narrowByTypeofChainContainment(t, lhs, sense);
+    if (try typeofChainContainsRef(c, rhs, key)) {
+        return narrowByTypeofChainContainment(c, t, lhs, sense);
     }
     // <ref> === <literal> / <literal> === <ref>
-    if (try c.refMatches(lhs, key)) {
-        return c.narrowByLiteralEquality(t, rhs, strict, sense);
+    if (try refMatches(c, lhs, key)) {
+        return narrowByLiteralEquality(c, t, rhs, strict, sense);
     }
-    if (try c.refMatches(rhs, key)) {
-        return c.narrowByLiteralEquality(t, lhs, strict, sense);
+    if (try refMatches(c, rhs, key)) {
+        return narrowByLiteralEquality(c, t, lhs, strict, sense);
     }
     // <ref>.k === <literal> narrows <ref> by its discriminant. `<ref>` is
     // the tracked reference — a root symbol (`x.k`, key.len == 0) or a
     // member path (`f.geometry.k`, narrowing the union stored at the
     // tracked `f.geometry`). The union `t` is `<ref>`'s type, so the same
     // discriminant filter applies regardless of the reference's depth.
-    if (try c.discriminantOfRef(lhs, key)) |prop_tok| {
+    if (try discriminantOfRef(c, lhs, key)) |prop_tok| {
         const other = try c.ts.regularLiteral(try c.checkExprCached(rhs, types.no_type));
-        const narrowed = try c.narrowByDiscriminant(t, try c.memberAtom(prop_tok), other, sense, decl);
+        const narrowed = try narrowByDiscriminant(c, t, try c.memberAtom(prop_tok), other, sense, decl);
         // An OPTIONAL discriminant read (`x?.k === lit`) short-circuits to
         // `undefined` when the receiver is nullish, so the equality also
         // forces the receiver non-nullish on the asserting branch (tsc's
         // optional-chain containment). The discriminant filter alone keeps
         // `undefined` (no `k` prop → conservatively kept), so strip it too.
         if (c.nodeTag(lhs) == .optional_member_expr) {
-            return c.narrowByOptChainContainment(narrowed, rhs, strict, sense);
+            return narrowByOptChainContainment(c, narrowed, rhs, strict, sense);
         }
         return narrowed;
     }
-    if (try c.discriminantOfRef(rhs, key)) |prop_tok| {
+    if (try discriminantOfRef(c, rhs, key)) |prop_tok| {
         const other = try c.ts.regularLiteral(try c.checkExprCached(lhs, types.no_type));
-        const narrowed = try c.narrowByDiscriminant(t, try c.memberAtom(prop_tok), other, sense, decl);
+        const narrowed = try narrowByDiscriminant(c, t, try c.memberAtom(prop_tok), other, sense, decl);
         if (c.nodeTag(rhs) == .optional_member_expr) {
-            return c.narrowByOptChainContainment(narrowed, lhs, strict, sense);
+            return narrowByOptChainContainment(c, narrowed, lhs, strict, sense);
         }
         return narrowed;
     }
@@ -1667,11 +1667,11 @@ pub fn narrowByEqualityCond(c: *Checker, t: TypeId, lhs: Node, rhs: Node, strict
     // If `a` were nullish the whole chain short-circuits to `undefined`, so
     // when the comparison to `value` can only hold for a non-undefined (and,
     // for `==`/`!=`, non-null) `value`, the receiver did not short-circuit.
-    if (try c.optionalChainContainsRef(lhs, key)) {
-        return c.narrowByOptChainContainment(t, rhs, strict, sense);
+    if (try optionalChainContainsRef(c, lhs, key)) {
+        return narrowByOptChainContainment(c, t, rhs, strict, sense);
     }
-    if (try c.optionalChainContainsRef(rhs, key)) {
-        return c.narrowByOptChainContainment(t, lhs, strict, sense);
+    if (try optionalChainContainsRef(c, rhs, key)) {
+        return narrowByOptChainContainment(c, t, lhs, strict, sense);
     }
     return t;
 }
@@ -1681,12 +1681,12 @@ pub fn narrowByEqualityCond(c: *Checker, t: TypeId, lhs: Node, rhs: Node, strict
 /// link — i.e. `key`'s reference is a container of the chain's short-circuit
 /// (tsc's `optionalChainContainsReference`). Only fires for a chain that
 /// actually has a `?.` link; a plain `a.b.c` never matches.
-pub fn optionalChainContainsRef(c: *Checker, node: Node, key: RefKey) Error!bool {
+fn optionalChainContainsRef(c: *Checker, node: Node, key: RefKey) Error!bool {
     var n = node;
     while (c.nodeTag(n) == .paren_expr) n = c.tree.nodeData(n).lhs;
     while (c.isOptionalChain(n)) {
         n = c.tree.nodeData(n).lhs; // step to this link's object/callee
-        if (try c.refMatches(n, key)) return true;
+        if (try refMatches(c, n, key)) return true;
     }
     return false;
 }
@@ -1700,23 +1700,23 @@ pub fn optionalChainContainsRef(c: *Checker, node: Node, key: RefKey) Error!bool
 /// `sense` true means "narrow when every comparand constituent is
 /// non-nullish and not any/unknown"; `sense` false means "narrow when every
 /// comparand constituent is nullish".
-pub fn narrowByOptChainContainment(c: *Checker, t: TypeId, value: Node, strict: bool, sense: bool) Error!TypeId {
+fn narrowByOptChainContainment(c: *Checker, t: TypeId, value: Node, strict: bool, sense: bool) Error!TypeId {
     const vt = try c.checkExprCached(value, types.no_type);
-    if (c.optChainComparandRemovesNullable(vt, strict, sense)) return c.nonNullable(t);
+    if (optChainComparandRemovesNullable(c, vt, strict, sense)) return c.nonNullable(t);
     return t;
 }
 
-pub fn optChainComparandRemovesNullable(c: *Checker, vt: TypeId, strict: bool, sense: bool) bool {
+fn optChainComparandRemovesNullable(c: *Checker, vt: TypeId, strict: bool, sense: bool) bool {
     if (c.ts.kind(vt) == .union_type) {
         for (c.ts.members(vt)) |m| {
-            if (!c.optChainComparandConstituentOk(m, strict, sense)) return false;
+            if (!optChainComparandConstituentOk(c, m, strict, sense)) return false;
         }
         return true;
     }
-    return c.optChainComparandConstituentOk(vt, strict, sense);
+    return optChainComparandConstituentOk(c, vt, strict, sense);
 }
 
-pub fn optChainComparandConstituentOk(c: *Checker, m: TypeId, strict: bool, sense: bool) bool {
+fn optChainComparandConstituentOk(c: *Checker, m: TypeId, strict: bool, sense: bool) bool {
     const k = c.ts.kind(m);
     const nullish = k == .undefined or k == .void or (!strict and k == .null);
     if (sense) {
@@ -1729,19 +1729,19 @@ pub fn optChainComparandConstituentOk(c: *Checker, m: TypeId, strict: bool, sens
     return nullish;
 }
 
-pub fn typeofTargetOf(c: *Checker, node: Node, key: RefKey) Error!bool {
+fn typeofTargetOf(c: *Checker, node: Node, key: RefKey) Error!bool {
     if (node == null_node or c.nodeTag(node) != .prefix_unary) return false;
     if (c.tree.tokens.tag(c.tree.nodeMainToken(node)) != .keyword_typeof) return false;
-    return c.refMatches(c.tree.nodeData(node).lhs, key);
+    return refMatches(c, c.tree.nodeData(node).lhs, key);
 }
 
 /// `node` is `typeof <expr>` whose `<expr>` is an optional chain containing
 /// `key`'s reference at an optional link (but is not the ref itself — that
 /// exact case is `typeofTargetOf`).
-pub fn typeofChainContainsRef(c: *Checker, node: Node, key: RefKey) Error!bool {
+fn typeofChainContainsRef(c: *Checker, node: Node, key: RefKey) Error!bool {
     if (node == null_node or c.nodeTag(node) != .prefix_unary) return false;
     if (c.tree.tokens.tag(c.tree.nodeMainToken(node)) != .keyword_typeof) return false;
-    return c.optionalChainContainsRef(c.tree.nodeData(node).lhs, key);
+    return optionalChainContainsRef(c, c.tree.nodeData(node).lhs, key);
 }
 
 /// Narrow a chain receiver `t` to non-null when a `typeof <chain>` branch
@@ -1749,7 +1749,7 @@ pub fn typeofChainContainsRef(c: *Checker, node: Node, key: RefKey) Error!bool {
 /// branch truthiness (true ⇒ the branch asserts `typeof(chain) == literal`).
 /// The chain did not short-circuit iff its `typeof` is not `"undefined"`, so
 /// narrow iff `sense == (literal != "undefined")`.
-pub fn narrowByTypeofChainContainment(c: *Checker, t: TypeId, value: Node, sense: bool) Error!TypeId {
+fn narrowByTypeofChainContainment(c: *Checker, t: TypeId, value: Node, sense: bool) Error!TypeId {
     const rt = try c.ts.regularLiteral(try c.checkExprCached(value, types.no_type));
     if (c.ts.kind(rt) != .string_literal) return t;
     const is_undef_lit = c.ts.literalAtom(rt) == c.typeof_atoms[5]; // "undefined"
@@ -1771,7 +1771,7 @@ pub fn narrowByTypeofChainContainment(c: *Checker, t: TypeId, value: Node, sense
 /// is likewise irrelevant: the union being filtered is the reference's own
 /// type whether it is a root symbol (`x?.k`) or a member path
 /// (`s.openDialog?.k`).
-pub fn discriminantOfRef(c: *Checker, node: Node, key: RefKey) Error!?TokenIndex {
+fn discriminantOfRef(c: *Checker, node: Node, key: RefKey) Error!?TokenIndex {
     if (node == null_node) return null;
     // A binding-pattern pseudo-reference reads its discriminant through a
     // sibling BINDING, not a member access (see `narrowedPatternBinding`).
@@ -1781,7 +1781,7 @@ pub fn discriminantOfRef(c: *Checker, node: Node, key: RefKey) Error!?TokenIndex
         else => return null,
     }
     const d = c.tree.nodeData(node);
-    if (!try c.refMatches(d.lhs, key)) return null;
+    if (!try refMatches(c, d.lhs, key)) return null;
     return d.rhs;
 }
 
@@ -1808,11 +1808,11 @@ pub fn identIsSym(c: *Checker, node: Node, sym: SymbolId) Error!bool {
 /// target is parsed as an array/object *literal*, with `object_property` /
 /// `object_shorthand` / `spread_element` in place of the binding nodes.
 /// Returning null keeps the caller's conservative "reset to declared".
-pub fn destructuredAssignType(c: *Checker, pat: Node, name: Atom, whole: TypeId) Error!?TypeId {
+fn destructuredAssignType(c: *Checker, pat: Node, name: Atom, whole: TypeId) Error!?TypeId {
     if (pat == null_node) return null;
     const d = c.tree.nodeData(pat);
     switch (c.nodeTag(pat)) {
-        .paren_expr => return c.destructuredAssignType(d.lhs, name, whole),
+        .paren_expr => return destructuredAssignType(c, d.lhs, name, whole),
         .identifier => {
             if ((try c.atomOfToken(c.tree.nodeMainToken(pat))) != name) return null;
             return whole;
@@ -1820,7 +1820,7 @@ pub fn destructuredAssignType(c: *Checker, pat: Node, name: Atom, whole: TypeId)
         // `[a] = xs` inside a target is a default (`[a = 1] = xs`), which
         // strips `undefined` exactly as a binding default does.
         .assign, .binding_default => {
-            const inner = (try c.destructuredAssignType(d.lhs, name, whole)) orelse return null;
+            const inner = (try destructuredAssignType(c, d.lhs, name, whole)) orelse return null;
             return try c.removeUndefined(inner);
         },
         .array_literal, .array_pattern => {
@@ -1850,10 +1850,10 @@ pub fn destructuredAssignType(c: *Checker, pat: Node, name: Atom, whole: TypeId)
                 const tag = c.nodeTag(el);
                 if (tag == .rest_element or tag == .spread_element) {
                     const rest = try c.ts.makeArray(et);
-                    if (try c.destructuredAssignType(c.tree.nodeData(el).lhs, name, rest)) |v| return v;
+                    if (try destructuredAssignType(c, c.tree.nodeData(el).lhs, name, rest)) |v| return v;
                     continue;
                 }
-                if (try c.destructuredAssignType(el, name, et)) |v| return v;
+                if (try destructuredAssignType(c, el, name, et)) |v| return v;
             }
             return null;
         },
@@ -1872,7 +1872,7 @@ pub fn destructuredAssignType(c: *Checker, pat: Node, name: Atom, whole: TypeId)
                         else
                             p.ty;
                         const tgt = if (c.nodeTag(el) == .object_property) ed.rhs else ed.lhs;
-                        if (try c.destructuredAssignType(tgt, name, pt)) |v| return v;
+                        if (try destructuredAssignType(c, tgt, name, pt)) |v| return v;
                     },
                     .object_shorthand => {
                         const keyed = try c.memberAtom(c.tree.nodeMainToken(el));
@@ -1892,7 +1892,7 @@ pub fn destructuredAssignType(c: *Checker, pat: Node, name: Atom, whole: TypeId)
     }
 }
 
-pub fn patternBindsSym(c: *Checker, pat: Node, sym: SymbolId) Error!bool {
+fn patternBindsSym(c: *Checker, pat: Node, sym: SymbolId) Error!bool {
     if (pat == null_node) return false;
     // A pattern never binds `this`, nor another pattern's pseudo-root.
     if (isPseudoRoot(sym)) return false;
@@ -1900,7 +1900,7 @@ pub fn patternBindsSym(c: *Checker, pat: Node, sym: SymbolId) Error!bool {
         .identifier => return (try c.atomOfToken(c.tree.nodeMainToken(pat))) == c.symNameAtom(sym),
         .array_pattern, .object_pattern, .array_literal, .object_literal => {
             for (c.tree.nodeRange(pat)) |el| {
-                if (el != null_node and try c.patternBindsSym(el, sym)) return true;
+                if (el != null_node and try patternBindsSym(c, el, sym)) return true;
             }
             return false;
         },
@@ -1908,35 +1908,35 @@ pub fn patternBindsSym(c: *Checker, pat: Node, sym: SymbolId) Error!bool {
         // main_token/lhs are the property KEY and rhs is the target. The
         // declaration form `binding_property` puts the target in lhs (0 when
         // shorthand), and `object_shorthand`'s lhs is the target identifier.
-        .object_property, .binding_property_computed => return c.patternBindsSym(c.tree.nodeData(pat).rhs, sym),
+        .object_property, .binding_property_computed => return patternBindsSym(c, c.tree.nodeData(pat).rhs, sym),
         .binding_property, .object_shorthand => {
             const d = c.tree.nodeData(pat);
-            if (d.lhs != 0) return c.patternBindsSym(d.lhs, sym);
+            if (d.lhs != 0) return patternBindsSym(c, d.lhs, sym);
             return (try c.memberAtom(c.tree.nodeMainToken(pat))) == c.symNameAtom(sym);
         },
         .binding_default, .rest_element, .spread_element => {
-            return c.patternBindsSym(c.tree.nodeData(pat).lhs, sym);
+            return patternBindsSym(c, c.tree.nodeData(pat).lhs, sym);
         },
         else => return false,
     }
 }
 
-pub fn varDeclBindsSym(c: *Checker, decl: Node, sym: SymbolId) Error!bool {
+fn varDeclBindsSym(c: *Checker, decl: Node, sym: SymbolId) Error!bool {
     const d = c.tree.nodeData(decl);
     if (c.nodeTag(decl) == .var_decl_one) {
-        return c.declaratorBindsSym(d.lhs, sym);
+        return declaratorBindsSym(c, d.lhs, sym);
     }
     for (c.tree.nodeRange(decl)) |dn| {
-        if (dn != null_node and try c.declaratorBindsSym(dn, sym)) return true;
+        if (dn != null_node and try declaratorBindsSym(c, dn, sym)) return true;
     }
     return false;
 }
 
-pub fn declaratorBindsSym(c: *Checker, decl: Node, sym: SymbolId) Error!bool {
+fn declaratorBindsSym(c: *Checker, decl: Node, sym: SymbolId) Error!bool {
     const d = c.tree.nodeData(decl);
     return switch (c.nodeTag(decl)) {
-        .declarator, .declarator_init, .declarator_full => c.patternBindsSym(d.lhs, sym),
-        else => c.patternBindsSym(decl, sym),
+        .declarator, .declarator_init, .declarator_full => patternBindsSym(c, d.lhs, sym),
+        else => patternBindsSym(c, decl, sym),
     };
 }
 
@@ -1962,7 +1962,7 @@ pub fn declaratorBindsSym(c: *Checker, decl: Node, sym: SymbolId) Error!bool {
 /// ztsc's relation lets them satisfy an object whose properties are all
 /// optional, so a plain `reduceSubtypes` would absorb the `null` that a
 /// branch which assigns nothing still contributes.
-pub fn reduceEvolvingJoin(c: *Checker, joined: TypeId) Error!TypeId {
+fn reduceEvolvingJoin(c: *Checker, joined: TypeId) Error!TypeId {
     if (c.ts.kind(joined) != .union_type) return joined;
     var nullish: std.ArrayList(TypeId) = .empty;
     defer nullish.deinit(c.scratch());
@@ -1981,7 +1981,7 @@ pub fn reduceEvolvingJoin(c: *Checker, joined: TypeId) Error!TypeId {
     return c.ts.makeUnion(c.scratch(), nullish.items);
 }
 
-pub fn assignmentReduced(c: *Checker, declared: TypeId, assigned0: TypeId) Error!TypeId {
+fn assignmentReduced(c: *Checker, declared: TypeId, assigned0: TypeId) Error!TypeId {
     const dk = c.ts.kind(declared);
     if (dk == .any or dk == .err or dk == .unknown) {
         if (dk == .unknown) return c.widenLiteral(assigned0);
@@ -2017,7 +2017,7 @@ pub fn assignmentReduced(c: *Checker, declared: TypeId, assigned0: TypeId) Error
 ///
 /// Returns `no_type` for anything it cannot resolve exactly; the caller
 /// treats that as "no information" (sound under-narrowing).
-pub fn declaredPathType(c: *Checker, node: Node) Error!TypeId {
+fn declaredPathType(c: *Checker, node: Node) Error!TypeId {
     c.side_query_depth += 1;
     defer c.side_query_depth -= 1;
     // A property lookup can materialize a generic instantiation and trip
@@ -2027,13 +2027,13 @@ pub fn declaredPathType(c: *Checker, node: Node) Error!TypeId {
     const saved = c.suppress_inst_diag;
     defer c.suppress_inst_diag = saved;
     c.suppress_inst_diag = true;
-    return c.declaredPathTypeInner(node);
+    return declaredPathTypeInner(c, node);
 }
 
 /// tsc's `isDeclarationWithExplicitTypeAnnotation`, asked of every
 /// declaration of a variable symbol: only such a symbol may be
 /// materialized from inside a flow walk (see `declaredPathTypeInner`).
-pub fn symExplicitlyTyped(c: *Checker, sym: SymbolId) bool {
+fn symExplicitlyTyped(c: *Checker, sym: SymbolId) bool {
     const f = c.symFlags(sym);
     if (!(f.var_decl or f.let_decl or f.const_decl)) return false;
     const saved = c.enterSymFile(sym);
@@ -2070,9 +2070,9 @@ fn symIsNamespaceValue(c: *Checker, sym: SymbolId) bool {
     return tgt.kind == .namespace or tgt.kind == .ambient_ns;
 }
 
-pub fn declaredPathTypeInner(c: *Checker, node: Node) Error!TypeId {
+fn declaredPathTypeInner(c: *Checker, node: Node) Error!TypeId {
     switch (c.nodeTag(node)) {
-        .paren_expr => return c.declaredPathTypeInner(c.tree.nodeData(node).lhs),
+        .paren_expr => return declaredPathTypeInner(c, c.tree.nodeData(node).lhs),
         .this_expr => return if (c.this_type != 0) c.this_type else types.no_type,
         .identifier => {
             const tok = c.tree.nodeMainToken(node);
@@ -2116,7 +2116,7 @@ pub fn declaredPathTypeInner(c: *Checker, node: Node) Error!TypeId {
                     // way (`ChatBskyConvoDefs.isGroupConvo(prev.kind)`,
                     // `AppBskyEmbedRecord.isView(embed)`).
                     if (symIsNamespaceValue(c, sym)) break :blk try c.typeOfSymbol(sym);
-                    if (!c.symExplicitlyTyped(sym)) break :blk types.no_type;
+                    if (!symExplicitlyTyped(c, sym)) break :blk types.no_type;
                     break :blk try c.typeOfSymbol(sym);
                 },
                 else => types.no_type,
@@ -2124,14 +2124,14 @@ pub fn declaredPathTypeInner(c: *Checker, node: Node) Error!TypeId {
         },
         .member_expr, .optional_member_expr => {
             const d = c.tree.nodeData(node);
-            const obj = try c.declaredPathTypeInner(d.lhs);
+            const obj = try declaredPathTypeInner(c, d.lhs);
             if (obj == types.no_type) return types.no_type;
             const name = try c.memberAtom(d.rhs);
             const recv = try c.nonNullable(obj);
             // The identifier arm's rule, one level down: a property lookup
             // on a class whose own member table is mid-materialization
             // would *build* that table, so answer "no information" instead.
-            if (try c.classSideOnCycle(recv, 0)) return types.no_type;
+            if (try classSideOnCycle(c, recv, 0)) return types.no_type;
             const p = (try c.propOfType(recv, name)) orelse return types.no_type;
             return p.ty;
         },
@@ -2168,7 +2168,7 @@ pub fn declaredPathTypeInner(c: *Checker, node: Node) Error!TypeId {
 /// `propOfType` runs, byte for byte as before); on it the query answers
 /// `no_type`, "no information" — the sound under-narrowing it already
 /// promises for everything it cannot resolve exactly.
-pub fn classSideOnCycle(c: *Checker, recv: TypeId, depth: u32) Error!bool {
+fn classSideOnCycle(c: *Checker, recv: TypeId, depth: u32) Error!bool {
     if (depth >= lazy_base_depth) return false;
     const statics = switch (c.ts.kind(recv)) {
         .class_value => true,
@@ -2201,7 +2201,7 @@ pub fn classSideOnCycle(c: *Checker, recv: TypeId, depth: u32) Error!bool {
             try c.ts.makeClassValue(base)
         else
             try c.ts.makeRef(base, &.{});
-        return c.classSideOnCycle(base_recv, depth + 1);
+        return classSideOnCycle(c, base_recv, depth + 1);
     }
     return false;
 }
@@ -2212,7 +2212,7 @@ pub const GuardCall = struct { pred: types.Predicate, arg: Node };
 
 /// If `call`'s callee is a predicate signature, return that predicate
 /// together with the argument in the guarded parameter's position.
-pub fn guardCallOf(c: *Checker, call: Node) Error!?GuardCall {
+fn guardCallOf(c: *Checker, call: Node) Error!?GuardCall {
     const shape = c.callShape(call);
     // Obtain the callee's type for predicate inspection. When the callee is
     // a MEMBER/element access (`rule.abstract.startsWith`), re-checking it
@@ -2248,9 +2248,9 @@ pub fn guardCallOf(c: *Checker, call: Node) Error!?GuardCall {
     const callee = shape.callee;
     const callee_t = switch (c.nodeTag(callee)) {
         .member_expr, .optional_member_expr, .index_expr, .optional_index_expr => c.nodeType(callee) orelse
-            try c.declaredPathType(callee),
-        .identifier => if (c.calleeNeedsExplicitDecl(callee))
-            c.nodeType(callee) orelse try c.declaredPathType(callee)
+            try declaredPathType(c, callee),
+        .identifier => if (calleeNeedsExplicitDecl(c, callee))
+            c.nodeType(callee) orelse try declaredPathType(c, callee)
         else
             try c.checkExprCached(callee, types.no_type),
         else => try c.checkExprCached(callee, types.no_type),
@@ -2452,7 +2452,7 @@ fn collectCallSigs(c: *Checker, t0: TypeId, out: *std.ArrayList(TypeId), depth: 
 /// so a declaration that carries one can be resolved without inferring
 /// anything, and a declaration that carries none has no predicate to
 /// find — resolving it could only cost a body walk.
-pub fn calleeNeedsExplicitDecl(c: *Checker, callee: Node) bool {
+fn calleeNeedsExplicitDecl(c: *Checker, callee: Node) bool {
     const tok = c.tree.nodeMainToken(callee);
     const a = c.atomOfToken(tok) catch return false;
     const sym = switch (c.resolveSpace(a, c.cur_scope, true)) {
@@ -2469,12 +2469,12 @@ pub fn calleeNeedsExplicitDecl(c: *Checker, callee: Node) bool {
         switch (c.nodeTag(decl)) {
             .declarator_init => {
                 // `const x = <init>` — no annotation by construction.
-                if (d.rhs != 0 and c.initReturnsPredicate(d.rhs)) return false;
+                if (d.rhs != 0 and initReturnsPredicate(c, d.rhs)) return false;
             },
             .declarator_full => {
                 const e = c.tree.extraData(ast.DeclaratorFull, d.rhs);
                 if (e.type_ann != 0) return false; // annotated: resolve it
-                if (e.init != 0 and c.initReturnsPredicate(e.init)) return false;
+                if (e.init != 0 and initReturnsPredicate(c, e.init)) return false;
             },
             else => {},
         }
@@ -2485,7 +2485,7 @@ pub fn calleeNeedsExplicitDecl(c: *Checker, callee: Node) bool {
 /// Is `init` a function/arrow literal whose RETURN TYPE ANNOTATION is a
 /// type predicate (`x is T` / `asserts x is T`)? The only initializer
 /// shape a guard probe can learn anything from without inferring.
-pub fn initReturnsPredicate(c: *Checker, init_node: Node) bool {
+fn initReturnsPredicate(c: *Checker, init_node: Node) bool {
     switch (c.nodeTag(init_node)) {
         .arrow_fn, .function_expr => {},
         else => return false,
@@ -2498,13 +2498,13 @@ pub fn initReturnsPredicate(c: *Checker, init_node: Node) bool {
 /// `if (isT(x))` — a user-defined type guard used in a condition.
 /// True branch narrows the argument to the predicate type; the false
 /// branch takes the complement (union filtering handles both).
-pub fn narrowByGuardCall(c: *Checker, t: TypeId, call: Node, sense: bool, key: RefKey) Error!TypeId {
-    const g = (try c.guardCallOf(call)) orelse return t;
-    if (!try c.refMatches(g.arg, key)) return c.narrowByGuardArgChain(t, g, sense, key);
+fn narrowByGuardCall(c: *Checker, t: TypeId, call: Node, sense: bool, key: RefKey) Error!TypeId {
+    const g = (try guardCallOf(c, call)) orelse return t;
+    if (!try refMatches(c, g.arg, key)) return narrowByGuardArgChain(c, t, g, sense, key);
     const pred = g.pred;
     if (pred.asserts) return t; // assertion fns narrow after the call, not here
     if (pred.ty == types.no_type) return t;
-    return c.narrowByInstance(t, pred.ty, sense, false);
+    return narrowByInstance(c, t, pred.ty, sense, false);
 }
 
 /// tsc's `narrowTypeByTypePredicate` optional-chain arm: the guarded
@@ -2515,20 +2515,20 @@ pub fn narrowByGuardCall(c: *Checker, t: TypeId, call: Node, sense: bool, key: R
 /// short-circuit — narrow it to non-null. Only the true branch says
 /// anything (a failed predicate is equally consistent with a nullish
 /// receiver), which is why tsc gates this on `assumeTrue`.
-pub fn narrowByGuardArgChain(c: *Checker, t: TypeId, g: GuardCall, sense: bool, key: RefKey) Error!TypeId {
+fn narrowByGuardArgChain(c: *Checker, t: TypeId, g: GuardCall, sense: bool, key: RefKey) Error!TypeId {
     if (!sense) return t;
     if (g.pred.asserts) return t; // narrows after the call, not in the condition
     if (g.pred.ty == types.no_type) return t;
     if (try c.admitsNullish(g.pred.ty, .undefined)) return t;
-    if (!try c.optionalChainContainsRef(g.arg, key)) return t;
+    if (!try optionalChainContainsRef(c, g.arg, key)) return t;
     return c.nonNullable(t);
 }
 
 /// `assertIsT(x);` — an assertion-function call statement narrows the
 /// argument to the asserted type for the rest of the flow; a bare
 /// `asserts cond` narrows by truthiness.
-pub fn narrowByAssertCall(c: *Checker, t: TypeId, call: Node, key: RefKey, decl: TypeId) Error!TypeId {
-    const g = (try c.guardCallOf(call)) orelse return t;
+fn narrowByAssertCall(c: *Checker, t: TypeId, call: Node, key: RefKey, decl: TypeId) Error!TypeId {
+    const g = (try guardCallOf(c, call)) orelse return t;
     if (!g.pred.asserts) return t; // plain guards don't narrow as statements
     if (g.pred.ty == types.no_type) {
         // `asserts cond` (no `is T`): tsc's `narrowTypeByAssertion` hands
@@ -2541,27 +2541,27 @@ pub fn narrowByAssertCall(c: *Checker, t: TypeId, call: Node, key: RefKey, decl:
         return c.narrowByCondition(t, g.arg, true, key, decl);
     }
     // `asserts x is T` names its subject positionally: it must be the arg.
-    if (!try c.refMatches(g.arg, key)) return t;
-    return c.narrowByInstance(t, g.pred.ty, true, false);
+    if (!try refMatches(c, g.arg, key)) return t;
+    return narrowByInstance(c, t, g.pred.ty, true, false);
 }
 
-pub fn narrowBySwitchClause(c: *Checker, t: TypeId, clause: Node, key: RefKey, decl: TypeId) Error!TypeId {
+fn narrowBySwitchClause(c: *Checker, t: TypeId, clause: Node, key: RefKey, decl: TypeId) Error!TypeId {
     if (clause == null_node) return t;
     // Find the owning switch statement's discriminant: clause nodes
     // don't back-reference it, so scan: the discriminant condition
     // narrows only when it's the reference or `ref.prop`.
-    const sw = c.switchOfClause(clause) orelse return t;
+    const sw = switchOfClause(c, clause) orelse return t;
     const disc = c.tree.nodeData(sw).lhs;
     const is_default = c.nodeTag(clause) == .default_clause;
 
     var prop: Atom = 0;
     var direct = false;
-    if (try c.refMatches(disc, key)) {
+    if (try refMatches(c, disc, key)) {
         direct = true;
-    } else if (try c.discriminantOfRef(disc, key)) |prop_tok| {
+    } else if (try discriminantOfRef(c, disc, key)) |prop_tok| {
         prop = try c.memberAtom(prop_tok);
     }
-    if (!direct and prop == 0 and c.nodeTag(disc) == .prefix_unary and try c.typeofTargetOf(disc, key)) {
+    if (!direct and prop == 0 and c.nodeTag(disc) == .prefix_unary and try typeofTargetOf(c, disc, key)) {
         // switch (typeof x)
         if (is_default) return t;
         const test_node = c.tree.nodeData(clause).lhs;
@@ -2583,7 +2583,7 @@ pub fn narrowBySwitchClause(c: *Checker, t: TypeId, clause: Node, key: RefKey, d
         // (`type: "line" | "arrow"`) — and a naked type parameter
         // (`switch (t)` on `T extends "a" | "b"`) — alive in `default:`,
         // which is the false positive on every `assertNever(x)` idiom.
-        if (try c.switchDefaultCovered(sw, t, prop, decl)) return types.never_type;
+        if (try switchDefaultCovered(c, sw, t, prop, decl)) return types.never_type;
         // Exclude every case value.
         var cur = t;
         const r = c.tree.extraData(ast.SubRange, c.tree.nodeData(sw).rhs);
@@ -2596,7 +2596,7 @@ pub fn narrowBySwitchClause(c: *Checker, t: TypeId, clause: Node, key: RefKey, d
             cur = if (prop == 0)
                 try c.narrowExcludeValue(cur, vt)
             else
-                try c.narrowByDiscriminant(cur, prop, vt, false, decl);
+                try narrowByDiscriminant(c, cur, prop, vt, false, decl);
         }
         return cur;
     }
@@ -2608,7 +2608,7 @@ pub fn narrowBySwitchClause(c: *Checker, t: TypeId, clause: Node, key: RefKey, d
     const narrowed = if (prop == 0)
         try c.narrowToValue(t, vt)
     else
-        try c.narrowByDiscriminant(t, prop, vt, true, decl);
+        try narrowByDiscriminant(c, t, prop, vt, true, decl);
     // An OPTIONAL discriminant read (`switch (x?.k)`) short-circuits to
     // `undefined` when the receiver is nullish, so a `case` label that is not
     // itself nullish forces the receiver non-nullish on that clause — tsc's
@@ -2620,8 +2620,8 @@ pub fn narrowBySwitchClause(c: *Checker, t: TypeId, clause: Node, key: RefKey, d
     //
     // Only the `case` clauses: `default:` is exactly where a short-circuited
     // chain lands, so the receiver stays nullable there.
-    if (try c.optionalChainContainsRef(disc, key)) {
-        return c.narrowByOptChainContainment(narrowed, test_node, true, true);
+    if (try optionalChainContainsRef(c, disc, key)) {
+        return narrowByOptChainContainment(c, narrowed, test_node, true, true);
     }
     return narrowed;
 }
@@ -2635,7 +2635,7 @@ pub fn narrowBySwitchClause(c: *Checker, t: TypeId, clause: Node, key: RefKey, d
 /// that is not a unit value, a member without the discriminant property, a
 /// non-literal discriminant — so the caller falls back to the per-member
 /// subtraction, which is sound but coarser.
-pub fn switchDefaultCovered(c: *Checker, sw: Node, t0: TypeId, prop: Atom, decl0: TypeId) Error!bool {
+fn switchDefaultCovered(c: *Checker, sw: Node, t0: TypeId, prop: Atom, decl0: TypeId) Error!bool {
     // Same deferred-alias unwrap the equality path needs (`unionFacet`):
     // `switch (r.media.type)` on a recursive alias must see the union it
     // stands for, or exhaustiveness is judged over a one-member list.
@@ -2677,13 +2677,13 @@ pub fn switchDefaultCovered(c: *Checker, sw: Node, t0: TypeId, prop: Atom, decl0
             if (p.optional()) return false;
             d = p.ty;
         }
-        if (!try c.discriminantCovered(d, vals.items, 0)) return false;
+        if (!try discriminantCovered(c, d, vals.items, 0)) return false;
     }
     return true;
 }
 
 /// Every value of the discriminant type `d0` is one of `vals`.
-pub fn discriminantCovered(c: *Checker, d0: TypeId, vals: []const TypeId, depth: u32) Error!bool {
+fn discriminantCovered(c: *Checker, d0: TypeId, vals: []const TypeId, depth: u32) Error!bool {
     if (depth > 4) return false;
     var d = try c.resolveStructural(d0);
     // A naked type parameter stands for its constraint: tsc substitutes
@@ -2694,7 +2694,7 @@ pub fn discriminantCovered(c: *Checker, d0: TypeId, vals: []const TypeId, depth:
         // Every constituent must be covered.
         .union_type => {
             for (try c.memberList(d)) |dm| {
-                if (!try c.discriminantCovered(dm, vals, depth + 1)) return false;
+                if (!try discriminantCovered(c, dm, vals, depth + 1)) return false;
             }
             return true;
         },
@@ -2702,7 +2702,7 @@ pub fn discriminantCovered(c: *Checker, d0: TypeId, vals: []const TypeId, depth:
         // covered constituent covers the whole.
         .intersection => {
             for (try c.memberList(d)) |dm| {
-                if (try c.discriminantCovered(dm, vals, depth + 1)) return true;
+                if (try discriminantCovered(c, dm, vals, depth + 1)) return true;
             }
             return false;
         },
@@ -2719,7 +2719,7 @@ pub fn discriminantCovered(c: *Checker, d0: TypeId, vals: []const TypeId, depth:
 
 /// The switch statement owning a case/default clause (linear scan of
 /// switch nodes; cached would be overkill for the subset).
-pub fn switchOfClause(c: *Checker, clause: Node) ?Node {
+fn switchOfClause(c: *Checker, clause: Node) ?Node {
     // Clause nodes are created right after their tests and before the
     // switch node itself; scan forward from the clause for a switch
     // whose clause range contains it.
@@ -2745,12 +2745,12 @@ pub fn definitelyAssigned(c: *Checker, flow: FlowId, sym: SymbolId) Error!bool {
         return v == 1;
     }
     try c.da_cache.put(c.cm(), key, 2);
-    const result = try c.definitelyAssignedInner(flow, sym);
+    const result = try definitelyAssignedInner(c, flow, sym);
     try c.da_cache.put(c.cm(), key, @intFromBool(result));
     return result;
 }
 
-pub fn definitelyAssignedInner(c: *Checker, flow: FlowId, sym: SymbolId) Error!bool {
+fn definitelyAssignedInner(c: *Checker, flow: FlowId, sym: SymbolId) Error!bool {
     const b = c.bind;
     switch (b.flow_tags[flow]) {
         .none => return true,
@@ -2758,7 +2758,7 @@ pub fn definitelyAssignedInner(c: *Checker, flow: FlowId, sym: SymbolId) Error!b
         .start => return false,
         .assign => {
             const target = b.flowNode(flow);
-            if (try c.assignTargetsSymForDa(target, sym)) return true;
+            if (try assignTargetsSymForDa(c, target, sym)) return true;
             return c.definitelyAssigned(b.flow_a[flow], sym);
         },
         .cond_true, .cond_false, .switch_clause, .call_stmt => {
@@ -2785,24 +2785,24 @@ pub fn definitelyAssignedInner(c: *Checker, flow: FlowId, sym: SymbolId) Error!b
     }
 }
 
-pub fn assignTargetsSymForDa(c: *Checker, target: Node, sym: SymbolId) Error!bool {
+fn assignTargetsSymForDa(c: *Checker, target: Node, sym: SymbolId) Error!bool {
     if (target == null_node) return false;
     switch (c.nodeTag(target)) {
-        .declarator_init => return c.patternBindsSym(c.tree.nodeData(target).lhs, sym),
+        .declarator_init => return patternBindsSym(c, c.tree.nodeData(target).lhs, sym),
         .declarator_full => {
             const d = c.tree.nodeData(target);
             const e = c.tree.extraData(ast.DeclaratorFull, d.rhs);
             if (e.init == 0) return false;
-            return c.patternBindsSym(d.lhs, sym);
+            return patternBindsSym(c, d.lhs, sym);
         },
         .assign => {
             const d = c.tree.nodeData(target);
-            return c.patternBindsSym(d.lhs, sym);
+            return patternBindsSym(c, d.lhs, sym);
         },
         .prefix_unary, .postfix_unary => {
             return c.identIsSym(c.tree.nodeData(target).lhs, sym);
         },
-        .var_decl_one, .var_decl => return c.varDeclBindsSym(target, sym),
-        else => return c.patternBindsSym(target, sym),
+        .var_decl_one, .var_decl => return varDeclBindsSym(c, target, sym),
+        else => return patternBindsSym(c, target, sym),
     }
 }

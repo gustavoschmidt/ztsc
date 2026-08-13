@@ -139,7 +139,7 @@ pub fn checkExprCached(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     const em_arena = c.scratch_arena;
     const em_mark = em_arena.mark();
     defer em_arena.restore(em_mark);
-    const t = try c.checkExpr(node, ctx);
+    const t = try checkExpr(c, node, ctx);
     // A side query is speculative — it runs out of the checker's top-down
     // order — so it must not publish its answer for the authoritative
     // check to read back.
@@ -148,13 +148,13 @@ pub fn checkExprCached(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     return t;
 }
 
-pub fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
+fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     const ewin = if (c.dprof.on) prof_zig.exprEnter(c, node) else prof_zig.DeclWin{};
     defer if (c.dprof.on) prof_zig.exprExit(c, ewin);
     const d = c.tree.nodeData(node);
     const main_tok = c.tree.nodeMainToken(node);
     switch (c.nodeTag(node)) {
-        .identifier => return c.checkIdentifier(node),
+        .identifier => return checkIdentifier(c, node),
         .number_literal => return c.ts.makeNumberLiteral(c.numberTokenValue(main_tok), true),
         .string_literal => return c.ts.makeStringLiteral(try c.memberAtom(main_tok), true),
         .bigint_literal => return c.ts.makeBigIntLiteral(try c.atomOfToken(main_tok), true),
@@ -221,7 +221,7 @@ pub fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             if (c.const_ctx or c.isConstTypeVar(ctx) or try c.ctxWantsTemplate(ctx)) return c.templateExprType(node);
             return types.string_type;
         },
-        .tagged_template => return c.checkTaggedTemplate(node, ctx),
+        .tagged_template => return checkTaggedTemplate(c, node, ctx),
         // An array/object literal whose CONTEXTUAL type is a `const` type
         // parameter is checked in a const context — tsc's `isConstContext`
         // arm `isValidConstAssertionArgument(node) &&
@@ -237,12 +237,12 @@ pub fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
                 c.const_ctx = prev;
             };
             return if (c.nodeTag(node) == .array_literal)
-                c.checkArrayLiteral(node, ctx)
+                checkArrayLiteral(c, node, ctx)
             else
-                c.checkObjectLiteral(node, ctx);
+                checkObjectLiteral(c, node, ctx);
         },
-        .member_expr, .optional_member_expr => return c.checkMemberExpr(node),
-        .index_expr, .optional_index_expr => return c.checkIndexExpr(node, true),
+        .member_expr, .optional_member_expr => return checkMemberExpr(c, node),
+        .index_expr, .optional_index_expr => return checkIndexExpr(c, node, true),
         .call_expr, .call_expr_targs, .optional_call => return c.checkCallExpr(node, false, ctx),
         .new_expr, .new_expr_targs, .new_expr_bare => return c.checkCallExpr(node, true, ctx),
         .instantiation_expr => {
@@ -250,8 +250,8 @@ pub fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             const r = c.tree.extraData(ast.SubRange, d.rhs);
             return c.instantiationExprType(base, c.tree.extraRange(r.start, r.end), node);
         },
-        .binary => return c.checkBinary(node, ctx),
-        .assign => return c.checkAssignExpr(node),
+        .binary => return checkBinary(c, node, ctx),
+        .assign => return checkAssignExpr(c, node),
         .cond_expr => {
             const e = c.tree.extraData(ast.CondExpr, d.rhs);
             _ = try c.checkExprCached(d.lhs, types.no_type);
@@ -261,10 +261,10 @@ pub fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             // (tsc: `getUnionType([type1, type2], UnionReduction.Subtype)`).
             return c.logicalUnion(then_t, else_t);
         },
-        .prefix_unary => return c.checkPrefixUnary(node, ctx),
+        .prefix_unary => return checkPrefixUnary(c, node, ctx),
         .postfix_unary => {
             const ot = try c.checkExprCached(d.lhs, types.no_type);
-            try c.checkArithmeticOperand(ot, d.lhs);
+            try checkArithmeticOperand(c, ot, d.lhs);
             return types.number_type;
         },
         .non_null => {
@@ -324,7 +324,7 @@ pub fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             _ = try c.checkSatisfies(et, tt, d.lhs, c.nodeSpan(d.lhs));
             return et;
         },
-        .arrow_fn, .function_expr => return c.checkFunctionLikeExpr(node, ctx),
+        .arrow_fn, .function_expr => return checkFunctionLikeExpr(c, node, ctx),
         .class_decl => {
             try c.checkClass(node);
             return types.any_type; // class expressions: minimal support
@@ -437,15 +437,15 @@ pub fn typeParamAtTopLevel(c: *Checker, ret: TypeId, sym: u32) Error!bool {
 /// keeps the passed string literal. `no_type` (no constraint) is not primitive.
 pub fn constraintIsPrimitive(c: *Checker, constraint: TypeId) Error!bool {
     if (constraint == types.no_type) return false;
-    return c.typeHasPrimitive(try c.resolveStructural(constraint));
+    return typeHasPrimitive(c, try c.resolveStructural(constraint));
 }
 
-pub fn typeHasPrimitive(c: *Checker, t: TypeId) Error!bool {
+fn typeHasPrimitive(c: *Checker, t: TypeId) Error!bool {
     return switch (c.ts.kind(t)) {
         .string, .number, .boolean, .bigint, .symbol, .undefined, .null, .void, .never, .unique_symbol, .enum_type, .string_literal, .number_literal, .number_literal_fresh, .bigint_literal, .bool_true, .bool_false, .template_literal_type, .string_mapping, .keyof_op => true,
         .union_type, .intersection => blk: {
             for (try c.memberList(t)) |m| {
-                if (try c.typeHasPrimitive(try c.resolveStructural(m))) break :blk true;
+                if (try typeHasPrimitive(c, try c.resolveStructural(m))) break :blk true;
             }
             break :blk false;
         },
@@ -476,7 +476,7 @@ pub fn containsAtom(list: []const Atom, name: Atom) bool {
     return false;
 }
 
-pub fn checkIdentifier(c: *Checker, node: Node) Error!TypeId {
+fn checkIdentifier(c: *Checker, node: Node) Error!TypeId {
     const tok = c.tree.nodeMainToken(node);
     if (c.tree.tokens.tag(tok) == .keyword_undefined) return types.undefined_type;
     const a = try c.atomOfToken(tok);
@@ -517,10 +517,10 @@ pub fn checkIdentifier(c: *Checker, node: Node) Error!TypeId {
             // (flow, sym) memo that every reader re-derives on miss.
             if (c.owned_mask[c.cur_file]) {
                 if ((f.let_decl or f.const_decl or f.class) and !f.function and !f.var_decl and !f.param) {
-                    try c.checkTdz(sym, node, tok);
+                    try checkTdz(c, sym, node, tok);
                 }
                 if ((f.let_decl or f.var_decl) and !f.param and !f.const_decl) {
-                    try c.checkUseBeforeAssigned(sym, node, tok, declared);
+                    try checkUseBeforeAssigned(c, sym, node, tok, declared);
                 }
             }
             // Flow narrowing. A binding destructured out of a discriminated
@@ -563,7 +563,7 @@ pub fn checkIdentifier(c: *Checker, node: Node) Error!TypeId {
     }
 }
 
-pub fn checkTdz(c: *Checker, sym: SymbolId, node: Node, tok: TokenIndex) Error!void {
+fn checkTdz(c: *Checker, sym: SymbolId, node: Node, tok: TokenIndex) Error!void {
     _ = node;
     if (c.symFile(sym) != c.cur_file) return; // cross-file: no TDZ
     const decls = c.declsOf(sym);
@@ -585,7 +585,7 @@ pub fn checkTdz(c: *Checker, sym: SymbolId, node: Node, tok: TokenIndex) Error!v
     try c.diagFmt(2448, c.tokSpan(tok), "{s} '{s}' used before its declaration.", .{ kindname, c.tokenText(tok) });
 }
 
-pub fn checkUseBeforeAssigned(c: *Checker, sym: SymbolId, node: Node, tok: TokenIndex, declared: TypeId) Error!void {
+fn checkUseBeforeAssigned(c: *Checker, sym: SymbolId, node: Node, tok: TokenIndex, declared: TypeId) Error!void {
     // Only for declarations without initializer whose type excludes
     // undefined/any, used in the same function container.
     if (c.symFile(sym) != c.cur_file) return; // cross-file: assigned
@@ -637,7 +637,7 @@ pub fn checkUseBeforeAssigned(c: *Checker, sym: SymbolId, node: Node, tok: Token
 /// synthesized `TemplateStringsArray` argument to relate exactly as tsc
 /// builds it, and getting that subtly wrong is a false positive on every
 /// tagged template in a program; answering with the return type is pure gain.
-pub fn checkTaggedTemplate(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
+fn checkTaggedTemplate(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     const d = c.tree.nodeData(node);
     const tag_ty = try c.checkExprCached(d.lhs, types.no_type);
     // tsc's constant folding of a template expression is explicitly skipped
@@ -712,7 +712,7 @@ pub fn checkTaggedTemplate(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     return c.ts.fnReturn(inst);
 }
 
-pub fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
+fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     // `[...] as const`: a readonly tuple of the (non-widened) element
     // types. Nested literals recurse because const_ctx stays set.
     //
@@ -724,7 +724,7 @@ pub fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     // readonly flag is invisible to the relation, so the difference is only
     // observable on an element WRITE — which is exactly where getting it
     // wrong would be a false TS2540.
-    if (c.const_ctx) return c.checkConstArrayLiteral(node, !try c.ctxIsMutableArrayLike(ctx));
+    if (c.const_ctx) return checkConstArrayLiteral(c, node, !try ctxIsMutableArrayLike(c, ctx));
     const rctx = if (ctx != types.no_type) try c.resolveStructural(ctx) else types.no_type;
     // Tuple context: a direct tuple contextual type, or an inference target
     // `T` whose constraint is tuple-like. `Promise.all([a, b])` infers into
@@ -765,7 +765,7 @@ pub fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     // the element type of each array-like constituent (so array-literal
     // elements are contextually typed — literals stay literal instead of
     // widening).
-    const ctx_elem: TypeId = if (!ctx_tuple) try c.contextualArrayElemType(rctx) else types.no_type;
+    const ctx_elem: TypeId = if (!ctx_tuple) try contextualArrayElemType(c, rctx) else types.no_type;
 
     var elem_types: std.ArrayList(TypeId) = .empty;
     defer elem_types.deinit(c.scratch());
@@ -828,13 +828,13 @@ pub fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             // gives the inner literal a contextual `number`, so it widens to
             // `number[]` and matches neither branch.
             ectx = if (c.ts.kind(rctx) == .union_type)
-                try c.contextualElemTypeAt(rctx, i)
+                try contextualElemTypeAt(c, rctx, i)
             else
                 try c.tupleElemTypeAt(ctx_tuple_ty, i) orelse types.no_type;
         }
         const raw = try c.checkExprCached(el, ectx);
         var et = raw;
-        if (!try c.keepLiteral(et, ectx)) et = try c.widenLiteral(et);
+        if (!try keepLiteral(c, et, ectx)) et = try c.widenLiteral(et);
         // tsc's `checkExpressionForMutableLocation` ends
         // `getWidenedLiteralLikeTypeForContextualType` with
         // `getRegularTypeOfLiteralType` on BOTH arms: an element whose literal
@@ -871,7 +871,7 @@ pub fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             // array/tuple branch (tsc's empty-array typing). A single
             // array branch keeps its element type (display/inference).
             if (rctx != types.no_type and c.ts.kind(rctx) == .union_type and
-                try c.multiArrayLikeBranches(rctx))
+                try multiArrayLikeBranches(c, rctx))
                 return c.ts.makeArray(types.never_type);
             // The contextual element is a FREE inference variable of a call
             // in flight (`mk<T>(xs: T[])` called as `mk([])`): echoing it
@@ -888,7 +888,7 @@ pub fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         }
         return c.ts.makeArray(types.any_type); // evolving arrays out of scope
     }
-    return c.ts.makeArray(try c.arrayLiteralElemType(raw_types.items, elem_types.items));
+    return c.ts.makeArray(try arrayLiteralElemType(c, raw_types.items, elem_types.items));
 }
 
 /// tsc's `createArrayLiteralType`: an array literal's element type is
@@ -915,7 +915,7 @@ pub fn checkArrayLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
 /// This is what keeps `[{ a: 1 }, { a: 1, b: 2 }]` a two-member union (both
 /// fresh, neither absorbs) while `[a, ab]` of two DECLARED types reduces to
 /// `A`, matching tsc on both.
-pub fn arrayLiteralElemType(c: *Checker, raw: []const TypeId, widened: []const TypeId) Error!TypeId {
+fn arrayLiteralElemType(c: *Checker, raw: []const TypeId, widened: []const TypeId) Error!TypeId {
     std.debug.assert(raw.len == widened.len);
     const plain = try c.ts.makeUnion(c.scratch(), widened);
     if (raw.len < 2) return plain;
@@ -951,7 +951,7 @@ pub fn arrayLiteralElemType(c: *Checker, raw: []const TypeId, widened: []const T
 /// every array-like constituent (mirrors tsc's per-element
 /// `getContextualTypeForElementExpression` mapping over the union). Returns
 /// `no_type` when nothing array-like is present.
-pub fn contextualArrayElemType(c: *Checker, rctx: TypeId) Error!TypeId {
+fn contextualArrayElemType(c: *Checker, rctx: TypeId) Error!TypeId {
     if (rctx == types.no_type) return types.no_type;
     switch (c.ts.kind(rctx)) {
         .array => return c.ts.arrayElem(rctx),
@@ -959,7 +959,7 @@ pub fn contextualArrayElemType(c: *Checker, rctx: TypeId) Error!TypeId {
             var elems: std.ArrayList(TypeId) = .empty;
             defer elems.deinit(c.scratch());
             for (try c.memberList(rctx)) |m| {
-                const e = try c.contextualArrayElemType(try c.resolveStructural(m));
+                const e = try contextualArrayElemType(c, try c.resolveStructural(m));
                 if (e != types.no_type) try elems.append(c.scratch(), e);
             }
             if (elems.items.len == 0) return types.no_type;
@@ -989,7 +989,7 @@ pub fn contextualArrayElemType(c: *Checker, rctx: TypeId) Error!TypeId {
             if (con == types.no_type) return types.no_type;
             const rcon = try c.resolveStructural(con);
             if (c.ts.kind(rcon) == .type_param) return types.no_type;
-            return c.contextualArrayElemType(rcon);
+            return contextualArrayElemType(c, rcon);
         },
         // An INTERFACE that extends `Array<T>` is array-like without being an
         // `.array`: it resolves to an object carrying Array's numeric index
@@ -1025,7 +1025,7 @@ pub fn contextualArrayElemType(c: *Checker, rctx: TypeId) Error!TypeId {
 /// rest element past the fixed part), an array constituent its element type,
 /// and anything else nothing. Returns `no_type` when no constituent holds an
 /// element there.
-pub fn contextualElemTypeAt(c: *Checker, rctx: TypeId, i: u32) Error!TypeId {
+fn contextualElemTypeAt(c: *Checker, rctx: TypeId, i: u32) Error!TypeId {
     switch (c.ts.kind(rctx)) {
         .tuple => return try c.tupleElemTypeAt(rctx, i) orelse types.no_type,
         .array => return c.ts.arrayElem(rctx),
@@ -1033,7 +1033,7 @@ pub fn contextualElemTypeAt(c: *Checker, rctx: TypeId, i: u32) Error!TypeId {
             var elems: std.ArrayList(TypeId) = .empty;
             defer elems.deinit(c.scratch());
             for (try c.memberList(rctx)) |m| {
-                const e = try c.contextualElemTypeAt(try c.resolveStructural(m), i);
+                const e = try contextualElemTypeAt(c, try c.resolveStructural(m), i);
                 if (e != types.no_type) try elems.append(c.scratch(), e);
             }
             if (elems.items.len == 0) return types.no_type;
@@ -1054,7 +1054,7 @@ pub fn contextualElemTypeAt(c: *Checker, rctx: TypeId, i: u32) Error!TypeId {
 /// more array-like constituents (`E[] | E[][]`, `A[] | B[]`). Used to
 /// detect the ambiguous empty-array-literal case where folding every
 /// branch's element type would produce an array assignable to no branch.
-pub fn multiArrayLikeBranches(c: *Checker, rctx: TypeId) Error!bool {
+fn multiArrayLikeBranches(c: *Checker, rctx: TypeId) Error!bool {
     if (c.ts.kind(rctx) != .union_type) return false;
     var n: usize = 0;
     for (try c.memberList(rctx)) |m| {
@@ -1072,7 +1072,7 @@ pub fn multiArrayLikeBranches(c: *Checker, rctx: TypeId) Error!bool {
 ///
 /// `ro` is false only for the mutable-array-like contextual type described in
 /// `checkArrayLiteral` — the elements are still non-widened, just writable.
-pub fn checkConstArrayLiteral(c: *Checker, node: Node, ro: bool) Error!TypeId {
+fn checkConstArrayLiteral(c: *Checker, node: Node, ro: bool) Error!TypeId {
     const rof: u32 = if (ro) types.elem_flag_readonly else 0;
     var elems: std.ArrayList(types.TupleElem) = .empty;
     defer elems.deinit(c.scratch());
@@ -1112,11 +1112,11 @@ pub fn checkConstArrayLiteral(c: *Checker, node: Node, ro: bool) Error!TypeId {
 /// `someType(contextualType, …)`): a mutable `T[]`, a tuple whose elements
 /// are writable, or a type parameter whose constraint is one. Only consulted
 /// inside a const context, so it costs nothing on the ordinary path.
-pub fn ctxIsMutableArrayLike(c: *Checker, ctx: TypeId) Error!bool {
-    return c.ctxIsMutableArrayLikeAt(ctx, 0);
+fn ctxIsMutableArrayLike(c: *Checker, ctx: TypeId) Error!bool {
+    return ctxIsMutableArrayLikeAt(c, ctx, 0);
 }
 
-pub fn ctxIsMutableArrayLikeAt(c: *Checker, ctx: TypeId, depth: u32) Error!bool {
+fn ctxIsMutableArrayLikeAt(c: *Checker, ctx: TypeId, depth: u32) Error!bool {
     if (ctx == types.no_type or depth > 3) return false;
     const t = try c.resolveStructural(ctx);
     switch (c.ts.kind(t)) {
@@ -1129,13 +1129,13 @@ pub fn ctxIsMutableArrayLikeAt(c: *Checker, ctx: TypeId, depth: u32) Error!bool 
         },
         .union_type => {
             for (try c.memberList(t)) |m| {
-                if (try c.ctxIsMutableArrayLikeAt(m, depth + 1)) return true;
+                if (try ctxIsMutableArrayLikeAt(c, m, depth + 1)) return true;
             }
             return false;
         },
         .type_param => {
             const con = try c.typeParamConstraint(c.ts.typeParamSymbol(t));
-            return c.ctxIsMutableArrayLikeAt(con, depth + 1);
+            return ctxIsMutableArrayLikeAt(c, con, depth + 1);
         },
         else => return false,
     }
@@ -1143,7 +1143,7 @@ pub fn ctxIsMutableArrayLikeAt(c: *Checker, ctx: TypeId, depth: u32) Error!bool 
 
 /// Collect the free type-param symbols reachable in `t` (structural walk,
 /// no expansion — a `ref` contributes its args, not its resolved body).
-pub fn collectTypeParamSyms(c: *Checker, t: TypeId, out: *std.ArrayList(u32)) Error!void {
+fn collectTypeParamSyms(c: *Checker, t: TypeId, out: *std.ArrayList(u32)) Error!void {
     c.ctp_syms_seen.clearRetainingCapacity();
     return collectTypeParamSymsInner(c, t, out);
 }
@@ -1262,7 +1262,7 @@ pub fn baseConstraintOf(c: *Checker, t: TypeId) Error!TypeId {
     if (c.ts.kind(t) == .this_type) return c.ts.thisTypeInstance(t);
     var syms: std.ArrayList(u32) = .empty;
     defer syms.deinit(c.scratch());
-    try c.collectTypeParamSyms(t, &syms);
+    try collectTypeParamSyms(c, t, &syms);
     if (syms.items.len == 0) return t;
     const map = try c.scratch().alloc(TpMap, syms.items.len);
     for (syms.items, 0..) |sym, i| {
@@ -1314,7 +1314,7 @@ pub fn isPrimitiveLiteralish(c: *Checker, t: TypeId) Error!bool {
 /// every callback parameter inside it fell to implicit `any` — TS7006 at
 /// call sites that are correct TypeScript.
 pub fn objLitIsContextSensitive(c: *Checker, node: Node) bool {
-    return c.objLitIsContextSensitiveAt(node, 0, false);
+    return objLitIsContextSensitiveAt(c, node, 0, false);
 }
 
 /// The same question restricted to the literal's OWN properties — no
@@ -1325,10 +1325,10 @@ pub fn objLitIsContextSensitive(c: *Checker, node: Node) bool {
 /// them. Only a literal whose sensitivity is NESTED is read against a
 /// property type that may itself still be a bare inference variable.
 pub fn objLitIsShallowContextSensitive(c: *Checker, node: Node) bool {
-    return c.objLitIsContextSensitiveAt(node, 0, true);
+    return objLitIsContextSensitiveAt(c, node, 0, true);
 }
 
-pub fn objLitIsContextSensitiveAt(c: *Checker, node: Node, depth: u8, shallow: bool) bool {
+fn objLitIsContextSensitiveAt(c: *Checker, node: Node, depth: u8, shallow: bool) bool {
     for (c.tree.nodeRange(node)) |m| {
         if (m == null_node) continue;
         const val = switch (c.nodeTag(m)) {
@@ -1346,7 +1346,7 @@ pub fn objLitIsContextSensitiveAt(c: *Checker, node: Node, depth: u8, shallow: b
             // shape — the sensitivity lives entirely inside `reducers`.
             .object_literal => {
                 if (shallow) continue;
-                if (depth < 4 and c.objLitIsContextSensitiveAt(val, depth + 1, false)) return true;
+                if (depth < 4 and objLitIsContextSensitiveAt(c, val, depth + 1, false)) return true;
                 continue;
             },
             else => continue,
@@ -1454,10 +1454,10 @@ fn maybeKind(c: *Checker, t: TypeId, want: types.Kind) Error!bool {
 }
 
 pub fn paramWantsLiteralCtx(c: *Checker, pt: TypeId) Error!bool {
-    return c.paramWantsLiteralCtxAt(pt, 0);
+    return paramWantsLiteralCtxAt(c, pt, 0);
 }
 
-pub fn paramWantsLiteralCtxAt(c: *Checker, pt: TypeId, depth: u8) Error!bool {
+fn paramWantsLiteralCtxAt(c: *Checker, pt: TypeId, depth: u8) Error!bool {
     const r = try c.resolveStructural(pt);
     // A `const` type parameter always wants the contextual read: that IS the
     // feature. Handing the parameter down is what puts the argument in a
@@ -1475,7 +1475,7 @@ pub fn paramWantsLiteralCtxAt(c: *Checker, pt: TypeId, depth: u8) Error!bool {
     if (c.ts.kind(r) == .intersection and depth < 2) {
         for (try c.memberList(r)) |m| {
             if (m == r) continue;
-            if (try c.paramWantsLiteralCtxAt(m, depth + 1)) return true;
+            if (try paramWantsLiteralCtxAt(c, m, depth + 1)) return true;
         }
         return false;
     }
@@ -1492,7 +1492,7 @@ pub fn paramWantsLiteralCtxAt(c: *Checker, pt: TypeId, depth: u8) Error!bool {
     // are object literals whose `value` property is the literal-constrained
     // inference target. Checked context-free, `{ value: Breed.Nellore }`
     // widens the enum member to the whole enum and `T` is inferred as `Breed`.
-    if (c.ts.kind(r) == .array and depth < 2) return c.paramWantsLiteralCtxAt(c.ts.arrayElem(r), depth + 1);
+    if (c.ts.kind(r) == .array and depth < 2) return paramWantsLiteralCtxAt(c, c.ts.arrayElem(r), depth + 1);
     if (c.ts.kind(r) != .object) return false;
     for (0..c.ts.objectPropCount(r)) |i| {
         const p = c.ts.objectProp(r, @intCast(i));
@@ -1514,7 +1514,7 @@ pub fn paramWantsLiteralCtxAt(c: *Checker, pt: TypeId, depth: u8) Error!bool {
 /// fresh literal should be kept instead of widened? (tsc's
 /// isLiteralOfContextualType; contextual `boolean` counts because it
 /// *is* `true | false` — our canonical form collapses that union.)
-pub fn keepLiteral(c: *Checker, t: TypeId, ctx: TypeId) Error!bool {
+fn keepLiteral(c: *Checker, t: TypeId, ctx: TypeId) Error!bool {
     if (ctx == types.no_type) return false;
     if (!c.ts.isFreshLiteral(t)) return true;
     return c.contextAdmitsLiteral(ctx, t);
@@ -1532,7 +1532,7 @@ pub fn contextAdmitsLiteral(c: *Checker, ctx: TypeId, lit: TypeId) Error!bool {
     // before the arms compare. Without it a string-literal context (`keyof`
     // of an object with enum-computed keys) rejected an enum member and the
     // property value widened to the whole enum.
-    const clk = try c.enumMemberLiteralKind(lit, lk);
+    const clk = try enumMemberLiteralKind(c, lit, lk);
     switch (c.ts.kind(r)) {
         .string_literal => return clk == .string_literal,
         .number_literal, .number_literal_fresh => return clk == .number_literal or clk == .number_literal_fresh,
@@ -1588,12 +1588,12 @@ pub fn contextAdmitsLiteral(c: *Checker, ctx: TypeId, lit: TypeId) Error!bool {
             // An enum MEMBER is a string/number literal too (tsc gives it
             // `TypeFlags.StringLiteral | EnumLiteral`), so the type-variable
             // rule below must judge it by the kind of its declared value.
-            const elk = try c.enumMemberLiteralKind(lit, lk);
+            const elk = try enumMemberLiteralKind(c, lit, lk);
             if (try c.containsTypeParam(constraint)) {
                 const base = try c.baseConstraintOf(constraint);
                 if (base != constraint) {
                     if (try c.contextAdmitsLiteral(base, lit)) return true;
-                    return c.constraintKeepsLiteralKind(base, elk);
+                    return constraintKeepsLiteralKind(c, base, elk);
                 }
             }
             // tsc's `isLiteralOfContextualType` type-VARIABLE rule: a
@@ -1603,7 +1603,7 @@ pub fn contextAdmitsLiteral(c: *Checker, ctx: TypeId, lit: TypeId) Error!bool {
             // position. That is what makes `isMemberOf<T extends string>(
             // coll: readonly T[], v)` called with `["a", "b"]` infer
             // `T = "a" | "b"` instead of `string`.
-            return c.constraintKeepsLiteralKind(constraint, elk);
+            return constraintKeepsLiteralKind(c, constraint, elk);
         },
         else => return false,
     }
@@ -1614,7 +1614,7 @@ pub fn contextAdmitsLiteral(c: *Checker, ctx: TypeId, lit: TypeId) Error!bool {
 /// numeric one). Non-members answer with `fallback` (their own kind). tsc
 /// carries both flags on one type; ztsc models an enum member as its own
 /// `.enum_type` kind, so the mapping is explicit.
-pub fn enumMemberLiteralKind(c: *Checker, lit: TypeId, fallback: types.Kind) Error!types.Kind {
+fn enumMemberLiteralKind(c: *Checker, lit: TypeId, fallback: types.Kind) Error!types.Kind {
     if (!c.ts.isEnumMember(lit)) return fallback;
     const v = try c.enumMemberValue(c.ts.enumSymbol(lit), c.ts.enumMemberAtom(lit)) orelse return fallback;
     return c.ts.kind(v);
@@ -1625,12 +1625,12 @@ pub fn enumMemberLiteralKind(c: *Checker, lit: TypeId, fallback: types.Kind) Err
 /// contain the primitive that `lk` is a literal of? Unions and
 /// intersections are searched; a bare `string`/`number`/`bigint`/`boolean`
 /// answers for its own literal kind.
-pub fn constraintKeepsLiteralKind(c: *Checker, constraint: TypeId, lk: types.Kind) Error!bool {
+fn constraintKeepsLiteralKind(c: *Checker, constraint: TypeId, lk: types.Kind) Error!bool {
     const r = try c.resolveStructural(constraint);
     switch (c.ts.kind(r)) {
         .union_type, .intersection => {
             for (try c.memberList(r)) |m| {
-                if (try c.constraintKeepsLiteralKind(m, lk)) return true;
+                if (try constraintKeepsLiteralKind(c, m, lk)) return true;
             }
             return false;
         },
@@ -1645,7 +1645,7 @@ pub fn constraintKeepsLiteralKind(c: *Checker, constraint: TypeId, lk: types.Kin
 /// The literal type an object-literal property value denotes *syntactically*
 /// — a string/number/boolean literal — for use as a discriminant when the
 /// contextual type is a union. `no_type` for anything else (no full check).
-pub fn discriminantLiteralOf(c: *Checker, node: Node) Error!TypeId {
+fn discriminantLiteralOf(c: *Checker, node: Node) Error!TypeId {
     if (node == null_node) return types.no_type;
     return switch (c.nodeTag(node)) {
         .string_literal => try c.ts.makeStringLiteral(try c.memberAtom(c.tree.nodeMainToken(node)), false),
@@ -1666,14 +1666,14 @@ pub fn discriminantLiteralOf(c: *Checker, node: Node) Error!TypeId {
 /// the union (each removed member has a discriminant that rejects the source
 /// literal, so it can never be the target) — an empty result means no arm
 /// matched, so the original union stands and the mismatch is reported.
-pub fn discriminateCtxUnion(c: *Checker, node: Node, rctx: TypeId) Error!TypeId {
+fn discriminateCtxUnion(c: *Checker, node: Node, rctx: TypeId) Error!TypeId {
     var surviving = try c.memberList(rctx);
     var narrowed = false;
     for (c.tree.nodeRange(node)) |prop| {
         if (prop == null_node or c.nodeTag(prop) != .object_property) continue;
         const pd = c.tree.nodeData(prop);
         if (pd.lhs != 0 and c.nodeTag(pd.lhs) == .computed_name) continue;
-        const lit = try c.discriminantLiteralOf(pd.rhs);
+        const lit = try discriminantLiteralOf(c, pd.rhs);
         if (lit == types.no_type) continue;
         const key = try c.memberAtom(c.tree.nodeMainToken(prop));
         var keep: std.ArrayList(TypeId) = .empty;
@@ -1717,7 +1717,7 @@ pub const DistSpread = struct { node: Node, members: []const TypeId };
 /// arms discriminate on. Distributing only one of the two left the other
 /// folded, which is the same lost-correlation failure the single-spread
 /// distribution was introduced to fix.
-pub fn distributableSpreads(c: *Checker, node: Node, out: *std.ArrayList(DistSpread)) Error!void {
+fn distributableSpreads(c: *Checker, node: Node, out: *std.ArrayList(DistSpread)) Error!void {
     var product: usize = 1;
     for (c.tree.nodeRange(node)) |prop| {
         if (prop == null_node or c.nodeTag(prop) != .spread_element) continue;
@@ -1754,7 +1754,7 @@ pub fn distributableSpreads(c: *Checker, node: Node, out: *std.ArrayList(DistSpr
     }
 }
 
-pub fn checkObjectLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
+fn checkObjectLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     // tsc's `getSpreadType` DISTRIBUTES over a union spread source:
     // `{ ...(A | B), x }` is `{ ...A, x } | { ...B, x }`, and each
     // constituent keeps the correlation between the properties that came
@@ -1765,7 +1765,7 @@ pub fn checkObjectLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     // target. Distribute here, where the literal's type can be a union.
     var dist: std.ArrayList(DistSpread) = .empty;
     defer dist.deinit(c.scratch());
-    try c.distributableSpreads(node, &dist);
+    try distributableSpreads(c, node, &dist);
     if (dist.items.len > 0) {
         // Cartesian product over the distributable spreads, `max_spread_
         // distribution` constituents at most. `pick[i]` selects the member
@@ -1780,7 +1780,7 @@ pub fn checkObjectLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             for (dist.items, 0..) |d, i| {
                 try subst.append(c.scratch(), .{ .node = d.node, .ty = d.members[pick[i]] });
             }
-            try outs.append(c.scratch(), try c.objectLiteralType(node, ctx, subst.items));
+            try outs.append(c.scratch(), try objectLiteralType(c, node, ctx, subst.items));
             // Odometer step, least-significant spread first.
             var i = dist.items.len;
             while (i > 0) {
@@ -1792,7 +1792,7 @@ pub fn checkObjectLiteral(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             }
         }
     }
-    return c.objectLiteralType(node, ctx, &.{});
+    return objectLiteralType(c, node, ctx, &.{});
 }
 
 /// A spread element whose source type is replaced by `ty` for one
@@ -1802,10 +1802,10 @@ pub const Subst = struct { node: Node, ty: TypeId };
 /// One constituent of an object literal's type. `dist` names the spread
 /// elements whose source types are replaced for this constituent (see
 /// `checkObjectLiteral`); it is empty for an undistributed literal.
-pub fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) Error!TypeId {
+fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Subst) Error!TypeId {
     var rctx = if (ctx != types.no_type) try c.resolveStructural(ctx) else types.no_type;
     if (rctx != types.no_type and c.ts.kind(rctx) == .union_type) {
-        rctx = try c.discriminateCtxUnion(node, rctx);
+        rctx = try discriminateCtxUnion(c, node, rctx);
     }
     var props: std.ArrayList(types.Prop) = .empty;
     defer props.deinit(c.scratch());
@@ -1853,7 +1853,7 @@ pub fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Sub
                         var vt = try c.checkExprCached(pd.rhs, pctx);
                         if (c.const_ctx) {
                             vt = try c.ts.regularLiteral(vt);
-                        } else if (!try c.keepLiteral(vt, pctx)) vt = try c.widenPropValue(vt);
+                        } else if (!try keepLiteral(c, vt, pctx)) vt = try c.widenPropValue(vt);
                         try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = vt });
                         continue;
                     }
@@ -1874,7 +1874,7 @@ pub fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Sub
                         var vt = try c.checkExprCached(pd.rhs, pctx);
                         if (c.const_ctx) {
                             vt = try c.ts.regularLiteral(vt);
-                        } else if (!try c.keepLiteral(vt, pctx)) vt = try c.widenPropValue(vt);
+                        } else if (!try keepLiteral(c, vt, pctx)) vt = try c.widenPropValue(vt);
                         try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = vt });
                         continue;
                     }
@@ -1888,14 +1888,14 @@ pub fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Sub
                     const key_kind = c.ts.kind(rk);
                     const pctx: TypeId = if (rctx == types.no_type) types.no_type else switch (key_kind) {
                         .string_literal => try c.ctxPropType(rctx, ctx, c.ts.dataA(rk)),
-                        .string, .template_literal_type, .string_mapping => try c.ctxIndexType(rctx, false),
-                        .number, .number_literal, .number_literal_fresh => try c.ctxIndexType(rctx, true),
+                        .string, .template_literal_type, .string_mapping => try ctxIndexType(c, rctx, false),
+                        .number, .number_literal, .number_literal_fresh => try ctxIndexType(c, rctx, true),
                         else => types.no_type,
                     };
                     var vt = try c.checkExprCached(pd.rhs, pctx);
                     if (c.const_ctx) {
                         vt = try c.ts.regularLiteral(vt);
-                    } else if (!try c.keepLiteral(vt, pctx)) vt = try c.widenPropValue(vt);
+                    } else if (!try keepLiteral(c, vt, pctx)) vt = try c.widenPropValue(vt);
                     switch (key_kind) {
                         .string_literal => {
                             try upsertProp(c.scratch(), &props, &prop_index, .{ .name = c.ts.dataA(rk), .ty = vt });
@@ -1911,7 +1911,7 @@ pub fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Sub
                 var vt = try c.checkExprCached(pd.rhs, pctx);
                 if (c.const_ctx) {
                     vt = try c.ts.regularLiteral(vt);
-                } else if (!try c.keepLiteral(vt, pctx)) vt = try c.widenPropValue(vt);
+                } else if (!try keepLiteral(c, vt, pctx)) vt = try c.widenPropValue(vt);
                 try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = vt });
             },
             .object_shorthand => {
@@ -1920,7 +1920,7 @@ pub fn objectLiteralType(c: *Checker, node: Node, ctx: TypeId, dist: []const Sub
                 const pctx = try c.ctxPropType(rctx, ctx, key);
                 if (c.const_ctx) {
                     vt = try c.ts.regularLiteral(vt);
-                } else if (!try c.keepLiteral(vt, pctx)) vt = try c.widenPropValue(vt);
+                } else if (!try keepLiteral(c, vt, pctx)) vt = try c.widenPropValue(vt);
                 if (pd.rhs != 0) _ = try c.checkExprCached(pd.rhs, types.no_type);
                 try upsertProp(c.scratch(), &props, &prop_index, .{ .name = key, .ty = vt });
             },
@@ -2089,7 +2089,7 @@ pub fn unionNestedPropType(c: *Checker, rt: TypeId, key: Atom) Error!?TypeId {
 /// passes disagreed and the later one clobbered the first's cached node
 /// type, surfacing as a whole-function TS2322 whose two printed types were
 /// identical but for this one index signature.
-pub fn ctxIndexType(c: *Checker, rctx: TypeId, want_number: bool) Error!TypeId {
+fn ctxIndexType(c: *Checker, rctx: TypeId, want_number: bool) Error!TypeId {
     switch (c.ts.kind(rctx)) {
         .object => {
             const idx = if (want_number) c.ts.objectNumberIndex(rctx) else c.ts.objectStringIndex(rctx);
@@ -2101,7 +2101,7 @@ pub fn ctxIndexType(c: *Checker, rctx: TypeId, want_number: bool) Error!TypeId {
             var parts: std.ArrayList(TypeId) = .empty;
             defer parts.deinit(c.scratch());
             for (try c.memberList(rctx)) |m| {
-                const it = try c.ctxIndexType(try c.resolveStructural(m), want_number);
+                const it = try ctxIndexType(c, try c.resolveStructural(m), want_number);
                 if (it != types.no_type) try parts.append(c.scratch(), it);
             }
             if (parts.items.len == 0) return types.no_type;
@@ -2111,7 +2111,7 @@ pub fn ctxIndexType(c: *Checker, rctx: TypeId, want_number: bool) Error!TypeId {
         // reads an intersection's index signatures.
         .intersection => {
             for (try c.memberList(rctx)) |m| {
-                const it = try c.ctxIndexType(try c.resolveStructural(m), want_number);
+                const it = try ctxIndexType(c, try c.resolveStructural(m), want_number);
                 if (it != types.no_type) return it;
             }
             return types.no_type;
@@ -2229,15 +2229,15 @@ pub const ChainLink = struct { ty: TypeId, chained: bool };
 /// reports.
 pub fn chainObjType(c: *Checker, node: Node) Error!ChainLink {
     return switch (c.nodeTag(node)) {
-        .member_expr, .optional_member_expr => c.memberChainInner(node),
-        .index_expr, .optional_index_expr => c.indexChainInner(node, true),
+        .member_expr, .optional_member_expr => memberChainInner(c, node),
+        .index_expr, .optional_index_expr => indexChainInner(c, node, true),
         .call_expr, .call_expr_targs, .optional_call => c.checkCallExprInner(node, false, types.no_type),
         else => .{ .ty = try c.checkExprCached(node, types.no_type), .chained = false },
     };
 }
 
-pub fn checkMemberExpr(c: *Checker, node: Node) Error!TypeId {
-    const link = try c.memberChainInner(node);
+fn checkMemberExpr(c: *Checker, node: Node) Error!TypeId {
+    const link = try memberChainInner(c, node);
     if (link.chained) return c.makeUnion2(link.ty, types.undefined_type);
     return link.ty;
 }
@@ -2249,7 +2249,7 @@ pub fn checkMemberExpr(c: *Checker, node: Node) Error!TypeId {
 /// non-`?.` continuation whose object is *declared* nullish still reports
 /// TS2532/18047-9 via `checkNullishAccess` (the marker distinguishes the
 /// chain's own undefined from an inherently-nullable intermediate).
-pub fn memberChainInner(c: *Checker, node: Node) Error!ChainLink {
+fn memberChainInner(c: *Checker, node: Node) Error!ChainLink {
     const d = c.tree.nodeData(node);
     const own_optional = c.nodeTag(node) == .optional_member_expr;
     var chained = false;
@@ -2266,9 +2266,9 @@ pub fn memberChainInner(c: *Checker, node: Node) Error!ChainLink {
         }
         obj_t = try c.nonNullableChain(obj_t);
     } else {
-        obj_t = try c.checkNullishAccess(obj_t, d.lhs, node);
+        obj_t = try checkNullishAccess(c, obj_t, d.lhs, node);
     }
-    var pt = try c.propertyTypeOf(obj_t, name, name_tok);
+    var pt = try propertyTypeOf(c, obj_t, name, name_tok);
     // Property-path narrowing: peel the whole access spine into a member
     // path (`x.p`, `this.p`, `x.a.b`, …) capped at `max_deep_ref_depth`.
     if (try c.buildRefKey(node)) |key| {
@@ -2280,7 +2280,7 @@ pub fn memberChainInner(c: *Checker, node: Node) Error!ChainLink {
 /// TS18047/18048/18049 (entity names) / TS2531/2532/2533 (expressions)
 /// for non-optional access on possibly-nullish objects. Returns the
 /// non-nullable remainder to continue checking with.
-pub fn checkNullishAccess(c: *Checker, t: TypeId, obj_node: Node, access_node: Node) Error!TypeId {
+fn checkNullishAccess(c: *Checker, t: TypeId, obj_node: Node, access_node: Node) Error!TypeId {
     const k = c.ts.kind(t);
     const has_null = c.containsNull(t) or k == .null;
     const has_undef = c.containsUndefinedish(t) or k == .undefined or k == .void;
@@ -2297,7 +2297,7 @@ pub fn checkNullishAccess(c: *Checker, t: TypeId, obj_node: Node, access_node: N
         }
         break :blk c.nodeTag(n) == .this_expr;
     };
-    const name_opt: ?[]const u8 = if (this_rooted) null else c.entityNameOf(obj_node);
+    const name_opt: ?[]const u8 = if (this_rooted) null else entityNameOf(c, obj_node);
     if (name_opt) |name| {
         if (has_null and has_undef) {
             try c.diagFmt(18049, span, "'{s}' is possibly 'null' or 'undefined'.", .{name});
@@ -2327,7 +2327,7 @@ pub fn checkNullishAccess(c: *Checker, t: TypeId, obj_node: Node, access_node: N
 }
 
 /// Render an entity-name-ish expression (a, a.b, a.b.c) or null.
-pub fn entityNameOf(c: *Checker, node: Node) ?[]const u8 {
+fn entityNameOf(c: *Checker, node: Node) ?[]const u8 {
     switch (c.nodeTag(node)) {
         .identifier => return c.tokenText(c.tree.nodeMainToken(node)),
         .member_expr, .optional_member_expr => {
@@ -2335,7 +2335,7 @@ pub fn entityNameOf(c: *Checker, node: Node) ?[]const u8 {
             // A `?.` link still roots an entity-name path, so tsc uses the
             // named codes (18047-9) rather than the object codes (2531-3)
             // for a nullish access on `a?.b`.
-            const base = c.entityNameOf(d.lhs) orelse return null;
+            const base = entityNameOf(c, d.lhs) orelse return null;
             _ = base;
             // Rebuild from source bytes: span of the whole node.
             const span = c.nodeSpan(node);
@@ -2351,7 +2351,7 @@ pub fn entityNameOf(c: *Checker, node: Node) ?[]const u8 {
 }
 
 /// Property `name` on `t`, with TS2339/TS2551 on failure.
-pub fn propertyTypeOf(c: *Checker, t: TypeId, name: Atom, name_tok: TokenIndex) Error!TypeId {
+fn propertyTypeOf(c: *Checker, t: TypeId, name: Atom, name_tok: TokenIndex) Error!TypeId {
     const k = c.ts.kind(t);
     switch (k) {
         .any, .err, .none => return types.any_type,
@@ -2502,14 +2502,14 @@ pub fn numericKeyProp(c: *Checker, r: TypeId, lit: TypeId) Error!?types.Prop {
     return c.propOfType(r, try c.internText(txt));
 }
 
-pub fn checkIndexExpr(c: *Checker, node: Node, narrow: bool) Error!TypeId {
-    const link = try c.indexChainInner(node, narrow);
+fn checkIndexExpr(c: *Checker, node: Node, narrow: bool) Error!TypeId {
+    const link = try indexChainInner(c, node, narrow);
     if (link.chained) return c.makeUnion2(link.ty, types.undefined_type);
     return link.ty;
 }
 
 /// Element access as an optional-chain link (see `memberChainInner`).
-pub fn indexChainInner(c: *Checker, node: Node, narrow: bool) Error!ChainLink {
+fn indexChainInner(c: *Checker, node: Node, narrow: bool) Error!ChainLink {
     const d = c.tree.nodeData(node);
     const own_optional = c.nodeTag(node) == .optional_index_expr;
     var chained = false;
@@ -2530,7 +2530,7 @@ pub fn indexChainInner(c: *Checker, node: Node, narrow: bool) Error!ChainLink {
         if (c.containsNullish(obj_t)) chained = true;
         obj_t = try c.nonNullableChain(obj_t);
     } else {
-        obj_t = try c.checkNullishAccess(obj_t, d.lhs, node);
+        obj_t = try checkNullishAccess(c, obj_t, d.lhs, node);
     }
     const r = try c.resolveStructural(obj_t);
     const rk = c.ts.kind(r);
@@ -2773,7 +2773,7 @@ pub fn indexChainInner(c: *Checker, node: Node, narrow: bool) Error!ChainLink {
     return .{ .ty = result, .chained = chained };
 }
 
-pub fn checkPrefixUnary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
+fn checkPrefixUnary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     const d = c.tree.nodeData(node);
     const op = c.tree.tokens.tag(c.tree.nodeMainToken(node));
     switch (op) {
@@ -2852,7 +2852,7 @@ pub fn checkPrefixUnary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             // other non-bigint operand. `isBigintish` is the assignability
             // test, so exclude the operands that are equally numberish;
             // this mirrors the binary `-`/`*` arm below.
-            if (try c.isBigintish(ot) and !try c.isNumberish(ot)) return types.bigint_type;
+            if (try isBigintish(c, ot) and !try isNumberish(c, ot)) return types.bigint_type;
             return types.number_type;
         },
         .plus, .tilde => {
@@ -2861,7 +2861,7 @@ pub fn checkPrefixUnary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         },
         .plus_plus, .minus_minus => {
             const ot = try c.checkExprCached(d.lhs, types.no_type);
-            try c.checkArithmeticOperand(ot, d.lhs);
+            try checkArithmeticOperand(c, ot, d.lhs);
             return types.number_type;
         },
         else => {
@@ -2871,8 +2871,8 @@ pub fn checkPrefixUnary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     }
 }
 
-pub fn isNumberish(c: *Checker, t: TypeId) Error!bool {
-    return c.hasPrimitiveFacet(t, struct {
+fn isNumberish(c: *Checker, t: TypeId) Error!bool {
+    return hasPrimitiveFacet(c, t, struct {
         fn f(ch: *Checker, m: TypeId) bool {
             return switch (ch.ts.kind(m)) {
                 .number, .number_literal, .number_literal_fresh, .any, .err, .never => true,
@@ -2883,8 +2883,8 @@ pub fn isNumberish(c: *Checker, t: TypeId) Error!bool {
     }.f, 0);
 }
 
-pub fn isBigintish(c: *Checker, t: TypeId) Error!bool {
-    return c.hasPrimitiveFacet(t, struct {
+fn isBigintish(c: *Checker, t: TypeId) Error!bool {
+    return hasPrimitiveFacet(c, t, struct {
         fn f(ch: *Checker, m: TypeId) bool {
             return switch (ch.ts.kind(m)) {
                 .bigint, .bigint_literal, .any, .err, .never => true,
@@ -2894,8 +2894,8 @@ pub fn isBigintish(c: *Checker, t: TypeId) Error!bool {
     }.f, 0);
 }
 
-pub fn isStringish(c: *Checker, t: TypeId) Error!bool {
-    return c.hasPrimitiveFacet(t, struct {
+fn isStringish(c: *Checker, t: TypeId) Error!bool {
+    return hasPrimitiveFacet(c, t, struct {
         fn f(ch: *Checker, m: TypeId) bool {
             return switch (ch.ts.kind(m)) {
                 .string, .string_literal, .any, .err, .never => true,
@@ -2918,7 +2918,7 @@ pub fn isStringish(c: *Checker, t: TypeId) Error!bool {
 /// without touching the allocator; only the recursive fallback copies the
 /// members to scratch, because expanding a ref mid-iteration can intern a
 /// type and invalidate the store slice.
-pub fn hasPrimitiveFacet(c: *Checker, t: TypeId, comptime f: fn (*Checker, TypeId) bool, depth: u32) Error!bool {
+fn hasPrimitiveFacet(c: *Checker, t: TypeId, comptime f: fn (*Checker, TypeId) bool, depth: u32) Error!bool {
     if (f(c, t)) return true;
     if (depth > 8) return false;
     switch (c.ts.kind(t)) {
@@ -2934,7 +2934,7 @@ pub fn hasPrimitiveFacet(c: *Checker, t: TypeId, comptime f: fn (*Checker, TypeI
             }
             if (all) return true;
             for (try c.memberList(t)) |m| {
-                if (!try c.hasPrimitiveFacet(m, f, depth + 1)) return false;
+                if (!try hasPrimitiveFacet(c, m, f, depth + 1)) return false;
             }
             return true;
         },
@@ -2943,30 +2943,30 @@ pub fn hasPrimitiveFacet(c: *Checker, t: TypeId, comptime f: fn (*Checker, TypeI
                 if (f(c, c.ts.memberAt(t, i))) return true;
             }
             for (try c.memberList(t)) |m| {
-                if (try c.hasPrimitiveFacet(m, f, depth + 1)) return true;
+                if (try hasPrimitiveFacet(c, m, f, depth + 1)) return true;
             }
             return false;
         },
         .ref => {
             const rs = try c.resolveStructural(t);
             if (rs == t) return false;
-            return c.hasPrimitiveFacet(rs, f, depth + 1);
+            return hasPrimitiveFacet(c, rs, f, depth + 1);
         },
         .type_param => {
             const con = try c.typeParamConstraint(c.ts.typeParamSymbol(t));
             if (con == types.no_type or con == t) return false;
-            return c.hasPrimitiveFacet(con, f, depth + 1);
+            return hasPrimitiveFacet(c, con, f, depth + 1);
         },
         else => return false,
     }
 }
 
-pub fn isArithmeticOperand(c: *Checker, t: TypeId) Error!bool {
-    return (try c.isNumberish(t)) or (try c.isBigintish(t));
+fn isArithmeticOperand(c: *Checker, t: TypeId) Error!bool {
+    return (try isNumberish(c, t)) or (try isBigintish(c, t));
 }
 
-pub fn checkArithmeticOperand(c: *Checker, t: TypeId, node: Node) Error!void {
-    if (try c.isArithmeticOperand(t)) return;
+fn checkArithmeticOperand(c: *Checker, t: TypeId, node: Node) Error!void {
+    if (try isArithmeticOperand(c, t)) return;
     try c.diagFmt(2356, c.nodeSpan(node), "An arithmetic operand must be of type 'any', 'number', 'bigint' or an enum type.", .{});
 }
 
@@ -2979,7 +2979,7 @@ pub fn checkArithmeticOperand(c: *Checker, t: TypeId, node: Node) Error!void {
 /// so a value typed as a constructor interface is recognized; a union is
 /// valid iff every constituent is, an intersection iff any is, and a
 /// type-parameter defers to its constraint.
-pub fn instanceofRhsIsFunctionLike(c: *Checker, t: TypeId, depth: u32) Error!bool {
+fn instanceofRhsIsFunctionLike(c: *Checker, t: TypeId, depth: u32) Error!bool {
     if (depth > 8) return true; // give up conservatively — never over-report
     switch (c.ts.kind(t)) {
         .any, .err, .function, .overloads, .class_value => return true,
@@ -2997,26 +2997,26 @@ pub fn instanceofRhsIsFunctionLike(c: *Checker, t: TypeId, depth: u32) Error!boo
         },
         .union_type => {
             for (try c.memberList(rs)) |m| {
-                if (!try c.instanceofRhsIsFunctionLike(m, depth + 1)) return false;
+                if (!try instanceofRhsIsFunctionLike(c, m, depth + 1)) return false;
             }
             return true;
         },
         .intersection => {
             for (try c.memberList(rs)) |m| {
-                if (try c.instanceofRhsIsFunctionLike(m, depth + 1)) return true;
+                if (try instanceofRhsIsFunctionLike(c, m, depth + 1)) return true;
             }
             return false;
         },
         .type_param => {
             const con = try c.typeParamConstraint(c.ts.typeParamSymbol(rs));
             if (con == types.no_type or con == rs or con == t) return false;
-            return c.instanceofRhsIsFunctionLike(con, depth + 1);
+            return instanceofRhsIsFunctionLike(c, con, depth + 1);
         },
         else => return false,
     }
 }
 
-pub fn checkBinary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
+fn checkBinary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     const d = c.tree.nodeData(node);
     const op = c.tree.tokens.tag(c.tree.nodeMainToken(node));
     switch (op) {
@@ -3064,12 +3064,12 @@ pub fn checkBinary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             const lk = c.ts.kind(lt);
             const rk = c.ts.kind(rt);
             if (lk == .any or rk == .any or lk == .err or rk == .err) return types.any_type;
-            if (try c.isStringish(lt) or try c.isStringish(rt)) {
+            if (try isStringish(c, lt) or try isStringish(c, rt)) {
                 // string + anything stringifiable
                 return types.string_type;
             }
-            if (try c.isNumberish(lt) and try c.isNumberish(rt)) return types.number_type;
-            if (try c.isBigintish(lt) and try c.isBigintish(rt)) return types.bigint_type;
+            if (try isNumberish(c, lt) and try isNumberish(c, rt)) return types.number_type;
+            if (try isBigintish(c, lt) and try isBigintish(c, rt)) return types.bigint_type;
             try c.diagFmt(2365, c.nodeSpan(node), "Operator '+' cannot be applied to types '{s}' and '{s}'.", .{
                 try c.typeToString(lt), try c.typeToString(rt),
             });
@@ -3078,14 +3078,14 @@ pub fn checkBinary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         .minus, .asterisk, .slash, .percent, .asterisk_asterisk, .lt_lt, .gt_gt, .gt_gt_gt, .amp, .pipe, .caret => {
             const lt = try c.checkExprCached(d.lhs, types.no_type);
             const rt = try c.checkExprCached(d.rhs, types.no_type);
-            if (!try c.isArithmeticOperand(lt)) {
+            if (!try isArithmeticOperand(c, lt)) {
                 try c.diagFmt(2362, c.nodeSpan(d.lhs), "The left-hand side of an arithmetic operation must be of type 'any', 'number', 'bigint' or an enum type.", .{});
             }
-            if (!try c.isArithmeticOperand(rt)) {
+            if (!try isArithmeticOperand(c, rt)) {
                 try c.diagFmt(2363, c.nodeSpan(d.rhs), "The right-hand side of an arithmetic operation must be of type 'any', 'number', 'bigint' or an enum type.", .{});
             }
-            if (try c.isBigintish(lt) and try c.isBigintish(rt) and
-                !try c.isNumberish(lt) and !try c.isNumberish(rt)) return types.bigint_type;
+            if (try isBigintish(c, lt) and try isBigintish(c, rt) and
+                !try isNumberish(c, lt) and !try isNumberish(c, rt)) return types.bigint_type;
             return types.number_type;
         },
         .lt, .gt, .lt_eq, .gt_eq => {
@@ -3105,8 +3105,8 @@ pub fn checkBinary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             const lk = c.ts.kind(ls);
             const rk = c.ts.kind(rs);
             const ok = lk == .any or rk == .any or lk == .err or rk == .err or blk: {
-                const lnum = try c.isNumberish(ls) or try c.isBigintish(ls);
-                const rnum = try c.isNumberish(rs) or try c.isBigintish(rs);
+                const lnum = try isNumberish(c, ls) or try isBigintish(c, ls);
+                const rnum = try isNumberish(c, rs) or try isBigintish(c, rs);
                 if (lnum and rnum) break :blk true;
                 if (!lnum and !rnum) break :blk (try c.isComparable(ls, rs));
                 break :blk false;
@@ -3132,7 +3132,7 @@ pub fn checkBinary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         .keyword_instanceof => {
             _ = try c.checkExprCached(d.lhs, types.no_type);
             const rt = try c.checkExprCached(d.rhs, types.no_type);
-            if (!try c.instanceofRhsIsFunctionLike(rt, 0)) {
+            if (!try instanceofRhsIsFunctionLike(c, rt, 0)) {
                 try c.diagFmt(2359, c.nodeSpan(d.rhs), "The right-hand side of an 'instanceof' expression must be of type 'any' or of a type assignable to the 'Function' interface type.", .{});
             }
             return types.boolean_type;
@@ -3178,16 +3178,16 @@ pub fn checkBinary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     }
 }
 
-pub fn checkAssignExpr(c: *Checker, node: Node) Error!TypeId {
+fn checkAssignExpr(c: *Checker, node: Node) Error!TypeId {
     const d = c.tree.nodeData(node);
     const op = c.tree.tokens.tag(c.tree.nodeMainToken(node));
-    const target_t = try c.checkAssignmentTarget(d.lhs);
+    const target_t = try checkAssignmentTarget(c, d.lhs);
     // Writing an evolving (`auto`-typed) variable is unchecked: its
     // `null`/`undefined` declared type is where the flow type starts, not
     // a constraint on what may be stored (tsc's autoType). The type itself
     // is still what `checkAssignmentTarget` returned, so `+=` classifies
     // the operand the same way it would for any other declared type.
-    const unchecked = c.assignTargetIsEvolving(d.lhs);
+    const unchecked = assignTargetIsEvolving(c, d.lhs);
     var rhs_ctx: TypeId = if (op == .eq) target_t else types.no_type;
     if (target_t == types.error_type or unchecked) rhs_ctx = types.no_type;
     const rt = try c.checkExprCached(d.rhs, rhs_ctx);
@@ -3211,14 +3211,14 @@ pub fn checkAssignExpr(c: *Checker, node: Node) Error!TypeId {
         // `x += 1` on a branded `number & { _brand }` therefore fails the
         // same way `x = x + 1` does: the operation widens to `number`.
         else => {
-            const lt = try c.compoundTargetBase(target_t);
-            const res = try c.compoundResultType(op, lt, rt);
+            const lt = try compoundTargetBase(c, target_t);
+            const res = try compoundResultType(c, op, lt, rt);
             if (res == types.no_type) {
                 // Operands too coarse to classify (`any`/error, or not
                 // arithmetic at all — where tsc reports TS2362/TS2363/TS2365
                 // and skips the assignment check). Keep the old, unchecked
                 // approximation of the expression's type.
-                if (op == .plus_eq and try c.isStringish(lt)) return types.string_type;
+                if (op == .plus_eq and try isStringish(c, lt)) return types.string_type;
                 return types.number_type;
             }
             if (!unchecked and lt != types.error_type and lt != types.any_type) {
@@ -3240,13 +3240,13 @@ pub fn checkAssignExpr(c: *Checker, node: Node) Error!TypeId {
 /// `string` there. Only literal, enum-member and boolean-literal types
 /// widen; a branded `number & { _brand }` is not a literal type and stays
 /// exactly as declared, which is why `mv += 1` on it still fails.
-pub fn compoundTargetBase(c: *Checker, t: TypeId) Error!TypeId {
+fn compoundTargetBase(c: *Checker, t: TypeId) Error!TypeId {
     if (c.ts.kind(t) == .union_type) {
         var list: std.ArrayList(TypeId) = .empty;
         defer list.deinit(c.scratch());
         var changed = false;
         for (try c.memberList(t)) |m| {
-            const b = try c.compoundTargetBase(m);
+            const b = try compoundTargetBase(c, m);
             if (b != m) changed = true;
             try list.append(c.scratch(), b);
         }
@@ -3264,24 +3264,24 @@ pub fn compoundTargetBase(c: *Checker, t: TypeId) Error!TypeId {
 /// and error operands (tsc's result is `any`, which never fails the check)
 /// and operands that are not arithmetic at all, where tsc reports the
 /// operand diagnostic and skips the assignment check entirely.
-pub fn compoundResultType(c: *Checker, op: scanner.Tag, lt: TypeId, rt: TypeId) Error!TypeId {
+fn compoundResultType(c: *Checker, op: scanner.Tag, lt: TypeId, rt: TypeId) Error!TypeId {
     const lk = c.ts.kind(lt);
     const rk = c.ts.kind(rt);
     if (lk == .any or rk == .any or lk == .err or rk == .err) return types.no_type;
     if (op == .plus_eq) {
-        if (try c.isStringish(lt) or try c.isStringish(rt)) return types.string_type;
-        if (try c.isNumberish(lt) and try c.isNumberish(rt)) return types.number_type;
-        if (try c.isBigintish(lt) and try c.isBigintish(rt)) return types.bigint_type;
+        if (try isStringish(c, lt) or try isStringish(c, rt)) return types.string_type;
+        if (try isNumberish(c, lt) and try isNumberish(c, rt)) return types.number_type;
+        if (try isBigintish(c, lt) and try isBigintish(c, rt)) return types.bigint_type;
         return types.no_type;
     }
-    if (!try c.isArithmeticOperand(lt) or !try c.isArithmeticOperand(rt)) return types.no_type;
-    if (try c.isBigintish(lt) and try c.isBigintish(rt) and
-        !try c.isNumberish(lt) and !try c.isNumberish(rt)) return types.bigint_type;
+    if (!try isArithmeticOperand(c, lt) or !try isArithmeticOperand(c, rt)) return types.no_type;
+    if (try isBigintish(c, lt) and try isBigintish(c, rt) and
+        !try isNumberish(c, lt) and !try isNumberish(c, rt)) return types.bigint_type;
     return types.number_type;
 }
 
 /// Does this assignment target name an evolving (`auto`-typed) variable?
-pub fn assignTargetIsEvolving(c: *Checker, target0: Node) bool {
+fn assignTargetIsEvolving(c: *Checker, target0: Node) bool {
     var n = target0;
     while (n != null_node and c.nodeTag(n) == .paren_expr) n = c.tree.nodeData(n).lhs;
     if (n == null_node or c.nodeTag(n) != .identifier) return false;
@@ -3294,7 +3294,7 @@ pub fn assignTargetIsEvolving(c: *Checker, target0: Node) bool {
 
 /// Type of an assignment target; reports TS2588 (const) and TS2540
 /// (readonly property).
-pub fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
+fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
     switch (c.nodeTag(node)) {
         .identifier => {
             const tok = c.tree.nodeMainToken(node);
@@ -3322,7 +3322,7 @@ pub fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
         .member_expr => {
             const d = c.tree.nodeData(node);
             var obj_t = try c.checkExprCached(d.lhs, types.no_type);
-            obj_t = try c.checkNullishAccess(obj_t, d.lhs, node);
+            obj_t = try checkNullishAccess(c, obj_t, d.lhs, node);
             const name = try c.memberAtom(d.rhs);
             const r = try c.resolveStructural(obj_t);
             if (try c.propOfType(r, name)) |p| {
@@ -3339,7 +3339,7 @@ pub fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
                 // TS 4.3 split accessors (`get x(): A; set x(v: B)`): the
                 // WRITE type is the setter's parameter, not the property's
                 // (getter's) type. See `setterWriteType`.
-                const wt = (try c.setterWriteType(obj_t, name, 0)) orelse p.ty;
+                const wt = (try setterWriteType(c, obj_t, name, 0)) orelse p.ty;
                 // An optional property accepts `undefined` as a write target
                 // (exactOptionalPropertyTypes is off): `x.opt = undefined` is
                 // legal. Fold `| undefined` in exactly as the read path does,
@@ -3347,7 +3347,7 @@ pub fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
                 if (p.optional()) return c.makeUnion2(wt, types.undefined_type);
                 return wt;
             }
-            return c.propertyTypeOf(obj_t, name, d.rhs);
+            return propertyTypeOf(c, obj_t, name, d.rhs);
         },
         .index_expr => {
             // Writing to a readonly tuple element (from `as const`) is
@@ -3360,7 +3360,7 @@ pub fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
             // checked on the ordinary element-write path.
             if (c.nodeTag(d.rhs) == .string_literal) {
                 const key = try c.memberAtom(c.tree.nodeMainToken(d.rhs));
-                if (try c.setterWriteType(obj_t, key, 0)) |wt| return wt;
+                if (try setterWriteType(c, obj_t, key, 0)) |wt| return wt;
             }
             const r = try c.resolveStructural(obj_t);
             if (c.ts.kind(r) == .tuple) {
@@ -3374,7 +3374,7 @@ pub fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
                     }
                 }
             }
-            return c.checkIndexExpr(node, false);
+            return checkIndexExpr(c, node, false);
         },
         .array_literal, .object_literal, .array_pattern, .object_pattern => {
             // Destructuring-assignment pattern in the expression cover
@@ -3383,7 +3383,7 @@ pub fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
             // `checkExprCached`: an element identifier must resolve as an
             // assignment target (no TDZ / definite-assignment read check)
             // and a property KEY is a name, not a reference.
-            for (c.tree.nodeRange(node)) |el| try c.checkDestructuringElement(el);
+            for (c.tree.nodeRange(node)) |el| try checkDestructuringElement(c, el);
             return types.any_type;
         },
         else => return c.checkExprCached(node, types.no_type),
@@ -3416,13 +3416,13 @@ pub fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
 /// `TypeId`, and a type may be built by one checker and read by another.
 /// The answer has to stay a pure function of the program; closing that gap
 /// is the full design's job, not a memo's.
-pub fn setterWriteType(c: *Checker, t0: TypeId, name: Atom, depth: u32) Error!?TypeId {
+fn setterWriteType(c: *Checker, t0: TypeId, name: Atom, depth: u32) Error!?TypeId {
     if (depth > 8) return null;
     const t = if (c.ts.kind(t0) == .this_type) c.ts.thisTypeInstance(t0) else t0;
     switch (c.ts.kind(t)) {
         .union_type, .intersection => {
             for (c.ts.members(t)) |m| {
-                if (try c.setterWriteType(m, name, depth + 1)) |wt| return wt;
+                if (try setterWriteType(c, m, name, depth + 1)) |wt| return wt;
             }
             return null;
         },
@@ -3430,9 +3430,9 @@ pub fn setterWriteType(c: *Checker, t0: TypeId, name: Atom, depth: u32) Error!?T
             const sym = c.ts.refSymbol(t);
             const f = c.symFlags(sym);
             const raw: ?TypeId = if (f.interface)
-                try c.interfaceSetterParam(sym, name, depth)
+                try interfaceSetterParam(c, sym, name, depth)
             else if (f.class)
-                try c.classSetterParam(sym, name, depth)
+                try classSetterParam(c, sym, name, depth)
             else
                 null;
             const wt = raw orelse return null;
@@ -3458,7 +3458,7 @@ pub fn setterWriteType(c: *Checker, t0: TypeId, name: Atom, depth: u32) Error!?T
 /// reopened block), else on one of its `extends` bases. Converted in the
 /// interface's own file context with its `this` bound, exactly as
 /// `interfaceConstituentDirect` converts the member the getter came from.
-pub fn interfaceSetterParam(c: *Checker, sym: SymbolId, name: Atom, depth: u32) Error!?TypeId {
+fn interfaceSetterParam(c: *Checker, sym: SymbolId, name: Atom, depth: u32) Error!?TypeId {
     const saved_ctx = c.enterSymFile(sym);
     defer c.restoreCtx(saved_ctx);
     const saved_this = c.this_type;
@@ -3469,7 +3469,7 @@ pub fn interfaceSetterParam(c: *Checker, sym: SymbolId, name: Atom, depth: u32) 
         if (try c.scopeOf(decl)) |s| c.cur_scope = s;
         const data = c.tree.extraData(ast.InterfaceData, c.tree.nodeData(decl).lhs);
         const members = c.tree.extraRange(data.members_start, data.members_end);
-        if (try c.setterParamInMembers(members, name)) |wt| return wt;
+        if (try setterParamInMembers(c, members, name)) |wt| return wt;
     }
     // Inherited: walk `extends`. The bases are already materialized (the
     // property was found on the resolved shape), so this is a cache hit.
@@ -3489,7 +3489,7 @@ pub fn interfaceSetterParam(c: *Checker, sym: SymbolId, name: Atom, depth: u32) 
                 }
             }
             const base = try c.typeFromTypeName(hd.lhs, targs.items);
-            if (try c.setterWriteType(base, name, depth + 1)) |wt| return wt;
+            if (try setterWriteType(c, base, name, depth + 1)) |wt| return wt;
         }
     }
     return null;
@@ -3497,13 +3497,13 @@ pub fn interfaceSetterParam(c: *Checker, sym: SymbolId, name: Atom, depth: u32) 
 
 /// Scan a member-node list for `set <name>(v)` and answer its parameter
 /// type.
-pub fn setterParamInMembers(c: *Checker, members: []const Node, name: Atom) Error!?TypeId {
+fn setterParamInMembers(c: *Checker, members: []const Node, name: Atom) Error!?TypeId {
     for (members) |m| {
         if (m == null_node or c.nodeTag(m) != .method_signature) continue;
         const md = c.tree.nodeData(m);
         if (md.rhs & ast.Flags.set == 0) continue;
         if (try c.memberKey(c.tree.nodeMainToken(m), md.rhs) != name) continue;
-        return try c.setterParamOfProto(m, md.lhs);
+        return try setterParamOfProto(c, m, md.lhs);
     }
     return null;
 }
@@ -3511,7 +3511,7 @@ pub fn setterParamInMembers(c: *Checker, members: []const Node, name: Atom) Erro
 /// The parameter type of `set <name>(v)` declared on class `sym`, else on
 /// its base class. `this` is the class instance, as `classInstanceGeneric`
 /// binds it while converting the members.
-pub fn classSetterParam(c: *Checker, sym: SymbolId, name: Atom, depth: u32) Error!?TypeId {
+fn classSetterParam(c: *Checker, sym: SymbolId, name: Atom, depth: u32) Error!?TypeId {
     const saved_ctx = c.enterSymFile(sym);
     defer c.restoreCtx(saved_ctx);
     const saved_this = c.this_type;
@@ -3538,20 +3538,20 @@ pub fn classSetterParam(c: *Checker, sym: SymbolId, name: Atom, depth: u32) Erro
                 const d = c.tree.nodeData(decl);
                 const proto = c.tree.extraData(ast.FnProto, d.lhs);
                 if (proto.flags & ast.Flags.set == 0) continue;
-                return try c.setterParamOfProto(decl, d.lhs);
+                return try setterParamOfProto(c, decl, d.lhs);
             }
             return null;
         }
     }
     if (try c.baseClassRef(sym)) |base_ref| {
-        return c.setterWriteType(base_ref, name, depth + 1);
+        return setterWriteType(c, base_ref, name, depth + 1);
     }
     return null;
 }
 
 /// The declared type of a set accessor's single parameter. A setter with no
 /// parameter (an error elsewhere) has no write type.
-pub fn setterParamOfProto(c: *Checker, decl: Node, proto_idx: u32) Error!?TypeId {
+fn setterParamOfProto(c: *Checker, decl: Node, proto_idx: u32) Error!?TypeId {
     const sig = try c.signatureOfProto(decl, proto_idx, true, false);
     if (c.ts.kind(sig) != .function or c.ts.fnParamCount(sig) == 0) return null;
     return c.ts.fnParam(sig, 0).ty;
@@ -3566,7 +3566,7 @@ pub fn setterParamOfProto(c: *Checker, decl: Node, proto_idx: u32) Error!?TypeId
 /// (TS2304 on `({ width: dx } = …)`) and the target identifier as a *read*,
 /// so writing a not-yet-assigned `let` through a destructuring assignment
 /// reported TS2454 at the write site itself.
-pub fn checkDestructuringElement(c: *Checker, el0: Node) Error!void {
+fn checkDestructuringElement(c: *Checker, el0: Node) Error!void {
     var el = el0;
     while (el != null_node and c.nodeTag(el) == .paren_expr) el = c.tree.nodeData(el).lhs;
     if (el == null_node) return;
@@ -3577,42 +3577,42 @@ pub fn checkDestructuringElement(c: *Checker, el0: Node) Error!void {
         .object_property => {
             if (d.lhs != null_node and c.nodeTag(d.lhs) == .computed_name)
                 _ = try c.checkExprCached(c.tree.nodeData(d.lhs).lhs, types.no_type);
-            try c.checkDestructuringElement(d.rhs);
+            try checkDestructuringElement(c, d.rhs);
         },
         // `{ a }` / `{ a = init }` — lhs is the target identifier, rhs the
         // default.
         .object_shorthand => {
             if (d.rhs != null_node) _ = try c.checkExprCached(d.rhs, types.no_type);
-            try c.checkDestructuringElement(d.lhs);
+            try checkDestructuringElement(c, d.lhs);
         },
         // Declaration-shaped pattern nodes (a `for (…of…)` head can carry
         // one): main_token is the key, lhs the target (0 when shorthand).
         .binding_property => {
             if (d.rhs != null_node) _ = try c.checkExprCached(d.rhs, types.no_type);
-            if (d.lhs != null_node) try c.checkDestructuringElement(d.lhs);
+            if (d.lhs != null_node) try checkDestructuringElement(c, d.lhs);
         },
         // `{[k]: target}` — the key IS evaluated; lhs is it, rhs the target.
         .binding_property_computed => {
             if (d.lhs != null_node) _ = try c.checkExprCached(d.lhs, types.no_type);
-            if (d.rhs != null_node) try c.checkDestructuringElement(d.rhs);
+            if (d.rhs != null_node) try checkDestructuringElement(c, d.rhs);
         },
         .binding_default => {
             if (d.rhs != null_node) _ = try c.checkExprCached(d.rhs, types.no_type);
-            try c.checkDestructuringElement(d.lhs);
+            try checkDestructuringElement(c, d.lhs);
         },
         // `[a = init] = …`: the cover grammar parses the default as a plain
         // assignment expression.
         .assign => {
             if (c.tree.tokens.tag(c.tree.nodeMainToken(el)) == .eq) {
                 _ = try c.checkExprCached(d.rhs, types.no_type);
-                try c.checkDestructuringElement(d.lhs);
+                try checkDestructuringElement(c, d.lhs);
             } else {
                 _ = try c.checkExprCached(el, types.no_type);
             }
         },
-        .spread_element, .rest_element => try c.checkDestructuringElement(d.lhs),
+        .spread_element, .rest_element => try checkDestructuringElement(c, d.lhs),
         .omitted, .error_node, .unsupported => {},
-        else => _ = try c.checkAssignmentTarget(el),
+        else => _ = try checkAssignmentTarget(c, el),
     }
 }
 
@@ -3635,7 +3635,7 @@ pub fn checkDestructuringElement(c: *Checker, el0: Node) Error!void {
 /// `this` type makes the combination ambiguous, so the whole set answers
 /// `no_type` and the arrow keeps its context-free check (the prior behaviour
 /// for every intersection).
-pub fn intersectedCallSignature(c: *Checker, rctx: TypeId) Error!TypeId {
+fn intersectedCallSignature(c: *Checker, rctx: TypeId) Error!TypeId {
     const s = &c.ts;
     var sigs: std.ArrayList(TypeId) = .empty;
     defer sigs.deinit(c.scratch());
@@ -3790,7 +3790,7 @@ pub fn contextualCallSig(c: *Checker, ctx: TypeId) Error!TypeId {
                 if (c.ts.objectCallSigCount(rctx) == 1) {
                     ctx_sig = c.ts.objectCallSig(rctx, 0);
                 } else if (c.ts.objectCallSigCount(rctx) > 1) {
-                    ctx_sig = try c.intersectedCallSignature(rctx);
+                    ctx_sig = try intersectedCallSignature(c, rctx);
                 }
             },
             // An OVERLOAD SET. `getSignaturesOfType` treats it exactly as it
@@ -3799,7 +3799,7 @@ pub fn contextualCallSig(c: *Checker, ctx: TypeId) Error!TypeId {
             // both `lib.dom` and `@types/node` (`fetch`, `Console.trace`)
             // arrives here, and leaving it alone reported TS7006 on every
             // parameter of the arrow written for it.
-            .overloads => ctx_sig = try c.intersectedCallSignature(rctx),
+            .overloads => ctx_sig = try intersectedCallSignature(c, rctx),
             .union_type => {
                 for (try c.memberList(rctx)) |m| {
                     const rm = try c.resolveStructural(m);
@@ -3815,7 +3815,7 @@ pub fn contextualCallSig(c: *Checker, ctx: TypeId) Error!TypeId {
                     // intersection of callables arrives as
                     // `(A & B) | undefined`.
                     if (c.ts.kind(rm) == .intersection) {
-                        const isig = try c.intersectedCallSignature(rm);
+                        const isig = try intersectedCallSignature(c, rm);
                         if (isig != types.no_type) {
                             ctx_sig = isig;
                             break;
@@ -3833,7 +3833,7 @@ pub fn contextualCallSig(c: *Checker, ctx: TypeId) Error!TypeId {
             // attribute value's contextual type is
             // `((open: boolean) => void) & ReactEventHandler<…>` and the
             // arrow written for it reported TS7006 on every parameter.
-            .intersection => ctx_sig = try c.intersectedCallSignature(rctx),
+            .intersection => ctx_sig = try intersectedCallSignature(c, rctx),
             else => {},
         }
     }
@@ -3860,7 +3860,7 @@ pub fn fnExprIsContextSensitive(c: *Checker, node: Node) bool {
     return false;
 }
 
-pub fn checkFunctionLikeExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
+fn checkFunctionLikeExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
     // A const assertion does not propagate into function bodies.
     const prev_cc = c.const_ctx;
     c.const_ctx = false;

@@ -78,7 +78,7 @@ pub fn checkStatement(c: *Checker, node: Node) Error!void {
             if (try c.scopeOf(node)) |s| c.cur_scope = s;
             for (c.tree.nodeRange(node)) |stmt| try c.checkStatement(stmt);
         },
-        .var_decl_one, .var_decl => try c.checkVarDeclStatement(node),
+        .var_decl_one, .var_decl => try checkVarDeclStatement(c, node),
         .expr_stmt => _ = try c.checkExprCached(d.lhs, types.no_type),
         .empty_stmt, .debugger_stmt, .error_node, .unsupported, .omitted => {},
         .if_stmt => {
@@ -106,7 +106,7 @@ pub fn checkStatement(c: *Checker, node: Node) Error!void {
             if (try c.scopeOf(node)) |s| c.cur_scope = s;
             if (e.init != 0) {
                 switch (c.nodeTag(e.init)) {
-                    .var_decl_one, .var_decl => try c.checkVarDeclStatement(e.init),
+                    .var_decl_one, .var_decl => try checkVarDeclStatement(c, e.init),
                     else => _ = try c.checkExprCached(e.init, types.no_type),
                 }
             }
@@ -114,8 +114,8 @@ pub fn checkStatement(c: *Checker, node: Node) Error!void {
             if (e.update != 0) _ = try c.checkExprCached(e.update, types.no_type);
             try c.checkStatement(d.rhs);
         },
-        .for_in_stmt, .for_of_stmt => try c.checkForInOf(node),
-        .switch_stmt => try c.checkSwitch(node),
+        .for_in_stmt, .for_of_stmt => try checkForInOf(c, node),
+        .switch_stmt => try checkSwitch(c, node),
         .case_clause, .default_clause => {}, // handled by checkSwitch
         .try_stmt => {
             const e = c.tree.extraData(ast.Try, d.rhs);
@@ -136,16 +136,16 @@ pub fn checkStatement(c: *Checker, node: Node) Error!void {
             if (e.finally_block != 0) try c.checkStatement(e.finally_block);
         },
         .throw_stmt => _ = try c.checkExprCached(d.lhs, types.no_type),
-        .return_stmt => try c.checkReturn(node),
+        .return_stmt => try checkReturn(c, node),
         .break_stmt, .continue_stmt => {},
         .labeled_stmt => try c.checkStatement(d.lhs),
-        .function_decl => try c.checkFunctionDecl(node),
+        .function_decl => try checkFunctionDecl(c, node),
         .decorator => try c.pending_class_decos.append(c.cm(), node),
         .class_decl => try c.checkClass(node),
-        .interface_decl => try c.checkInterfaceDecl(node),
-        .type_alias => try c.checkTypeAliasDecl(node),
+        .interface_decl => try checkInterfaceDecl(c, node),
+        .type_alias => try checkTypeAliasDecl(c, node),
         .enum_decl => try c.checkEnum(node),
-        .namespace_decl => try c.checkNamespace(node),
+        .namespace_decl => try checkNamespace(c, node),
         .import_decl => {}, // module graph
         .export_named, .export_all => {},
         .export_decl => try c.checkStatement(d.lhs),
@@ -198,18 +198,18 @@ fn precededByDeclare(c: *Checker, node: Node) bool {
     return mt > 0 and c.tree.tokens.tag(mt - 1) == .keyword_declare;
 }
 
-pub fn checkVarDeclStatement(c: *Checker, node: Node) Error!void {
+fn checkVarDeclStatement(c: *Checker, node: Node) Error!void {
     const d = c.tree.nodeData(node);
     const is_const = c.tree.tokens.tag(c.tree.nodeMainToken(node)) == .keyword_const;
     const ambient = c.ambient_ctx or precededByDeclare(c, node);
     if (c.nodeTag(node) == .var_decl_one) {
         if (ambient) try checkAmbientInitializer(c, d.lhs, is_const);
-        try c.checkDeclarator(d.lhs, is_const);
+        try checkDeclarator(c, d.lhs, is_const);
     } else {
         for (c.tree.nodeRange(node)) |decl| {
             if (decl == null_node) continue;
             if (ambient) try checkAmbientInitializer(c, decl, is_const);
-            try c.checkDeclarator(decl, is_const);
+            try checkDeclarator(c, decl, is_const);
         }
     }
 }
@@ -235,14 +235,14 @@ fn checkAmbientInitializer(c: *Checker, decl: Node, is_const: bool) Error!void {
     try c.diagFmt(1039, c.nodeSpan(init), "Initializers are not allowed in ambient contexts.", .{});
 }
 
-pub fn checkDeclarator(c: *Checker, decl: Node, is_const: bool) Error!void {
+fn checkDeclarator(c: *Checker, decl: Node, is_const: bool) Error!void {
     const d = c.tree.nodeData(decl);
     switch (c.nodeTag(decl)) {
         .declarator => {},
         .declarator_init => {
             _ = try c.checkExprCached(d.rhs, types.no_type);
             // Materialize the symbol's type (infers + caches).
-            try c.materializePatternTypes(d.lhs);
+            try materializePatternTypes(c, d.lhs);
         },
         .declarator_full => {
             const e = c.tree.extraData(ast.DeclaratorFull, d.rhs);
@@ -257,7 +257,7 @@ pub fn checkDeclarator(c: *Checker, decl: Node, is_const: bool) Error!void {
             // that one form, matching tsc.
             if (e.init != 0 and e.type_ann != 0 and c.nodeTag(e.type_ann) == .unique_symbol_type and c.isFreshSymbolCall(e.init)) {
                 _ = try c.checkExprCached(e.init, ann);
-                try c.materializePatternTypes(d.lhs);
+                try materializePatternTypes(c, d.lhs);
                 return;
             }
             if (e.init != 0) {
@@ -275,7 +275,7 @@ pub fn checkDeclarator(c: *Checker, decl: Node, is_const: bool) Error!void {
                     }
                 }
             }
-            try c.materializePatternTypes(d.lhs);
+            try materializePatternTypes(c, d.lhs);
         },
         else => {},
     }
@@ -283,7 +283,7 @@ pub fn checkDeclarator(c: *Checker, decl: Node, is_const: bool) Error!void {
 
 /// Force typeOfSymbol for every name bound by a pattern so inference
 /// diagnostics fire deterministically at the declaration site.
-pub fn materializePatternTypes(c: *Checker, pat: Node) Error!void {
+fn materializePatternTypes(c: *Checker, pat: Node) Error!void {
     if (pat == null_node) return;
     switch (c.nodeTag(pat)) {
         .identifier => {
@@ -295,13 +295,13 @@ pub fn materializePatternTypes(c: *Checker, pat: Node) Error!void {
         },
         .array_pattern, .object_pattern => {
             for (c.tree.nodeRange(pat)) |el| {
-                if (el != null_node) try c.materializePatternTypes(el);
+                if (el != null_node) try materializePatternTypes(c, el);
             }
         },
         .binding_property => {
             const d = c.tree.nodeData(pat);
             if (d.lhs != 0) {
-                try c.materializePatternTypes(d.lhs);
+                try materializePatternTypes(c, d.lhs);
             } else {
                 const a = try c.memberAtom(c.tree.nodeMainToken(pat));
                 switch (c.resolveSpace(a, c.cur_scope, true)) {
@@ -314,19 +314,19 @@ pub fn materializePatternTypes(c: *Checker, pat: Node) Error!void {
         .binding_property_computed => {
             const d = c.tree.nodeData(pat);
             if (d.lhs != 0) _ = try c.checkExprCached(d.lhs, types.no_type);
-            if (d.rhs != 0) try c.materializePatternTypes(d.rhs);
+            if (d.rhs != 0) try materializePatternTypes(c, d.rhs);
         },
         .binding_default => {
             const d = c.tree.nodeData(pat);
-            try c.materializePatternTypes(d.lhs);
+            try materializePatternTypes(c, d.lhs);
             _ = try c.checkExprCached(d.rhs, types.no_type);
         },
-        .rest_element => try c.materializePatternTypes(c.tree.nodeData(pat).lhs),
+        .rest_element => try materializePatternTypes(c, c.tree.nodeData(pat).lhs),
         else => {},
     }
 }
 
-pub fn checkForInOf(c: *Checker, node: Node) Error!void {
+fn checkForInOf(c: *Checker, node: Node) Error!void {
     const d = c.tree.nodeData(node);
     const e = c.tree.extraData(ast.ForInOf, d.lhs);
     const is_of = c.nodeTag(node) == .for_of_stmt;
@@ -370,7 +370,7 @@ pub fn checkForInOf(c: *Checker, node: Node) Error!void {
                                 c.setTypeOfSymbol(c.toGlobal(sym), elem_t);
                             }
                         } else {
-                            try c.assignPatternFromType(dd.lhs, elem_t);
+                            try assignPatternFromType(c, dd.lhs, elem_t);
                         }
                     },
                     .declarator_full => {
@@ -379,7 +379,7 @@ pub fn checkForInOf(c: *Checker, node: Node) Error!void {
                             const ann = try c.typeFromTypeNode(ee.type_ann);
                             _ = try c.checkAssignable(elem_t, ann, 0, c.nodeSpan(dd.lhs));
                         }
-                        try c.materializePatternTypes(dd.lhs);
+                        try materializePatternTypes(c, dd.lhs);
                     },
                     else => {},
                 }
@@ -392,7 +392,7 @@ pub fn checkForInOf(c: *Checker, node: Node) Error!void {
 
 /// Pre-set the types of identifiers bound in a destructuring pattern
 /// from the element type (for-of patterns).
-pub fn assignPatternFromType(c: *Checker, pat: Node, whole: TypeId) Error!void {
+fn assignPatternFromType(c: *Checker, pat: Node, whole: TypeId) Error!void {
     if (pat == null_node) return;
     switch (c.nodeTag(pat)) {
         .identifier => {
@@ -408,7 +408,7 @@ pub fn assignPatternFromType(c: *Checker, pat: Node, whole: TypeId) Error!void {
                     var pt: TypeId = types.any_type;
                     if (try c.propOfType(try c.resolveStructural(whole), key)) |p| pt = p.ty;
                     if (ed.lhs != 0) {
-                        try c.assignPatternFromType(ed.lhs, pt);
+                        try assignPatternFromType(c, ed.lhs, pt);
                     } else {
                         const a = try c.memberAtom(c.tree.nodeMainToken(el));
                         if (c.bind.lookupInScope(c.cur_scope, a)) |sym| c.setTypeOfSymbol(c.toGlobal(sym), pt);
@@ -420,7 +420,7 @@ pub fn assignPatternFromType(c: *Checker, pat: Node, whole: TypeId) Error!void {
                         const kt = try c.checkExprCached(ed.lhs, types.no_type);
                         pt = try c.indexedAccessType(try c.resolveStructural(whole), kt);
                     }
-                    if (ed.rhs != 0) try c.assignPatternFromType(ed.rhs, pt);
+                    if (ed.rhs != 0) try assignPatternFromType(c, ed.rhs, pt);
                 }
             }
         },
@@ -438,11 +438,11 @@ pub fn assignPatternFromType(c: *Checker, pat: Node, whole: TypeId) Error!void {
                     },
                     else => {},
                 }
-                try c.assignPatternFromType(el, et);
+                try assignPatternFromType(c, el, et);
             }
         },
-        .binding_default => try c.assignPatternFromType(c.tree.nodeData(pat).lhs, whole),
-        .rest_element => try c.assignPatternFromType(c.tree.nodeData(pat).lhs, try c.ts.makeArray(whole)),
+        .binding_default => try assignPatternFromType(c, c.tree.nodeData(pat).lhs, whole),
+        .rest_element => try assignPatternFromType(c, c.tree.nodeData(pat).lhs, try c.ts.makeArray(whole)),
         else => {},
     }
 }
@@ -456,7 +456,7 @@ pub const forOfElementType = iteration.forOfElementType;
 pub const iterationElementType = iteration.iterationElementType;
 pub const iteratorNextValue = iteration.iteratorNextValue;
 
-pub fn checkSwitch(c: *Checker, node: Node) Error!void {
+fn checkSwitch(c: *Checker, node: Node) Error!void {
     const d = c.tree.nodeData(node);
     const disc_t = try c.checkExprCached(d.lhs, types.no_type);
     const saved = c.cur_scope;
@@ -485,7 +485,7 @@ pub fn checkSwitch(c: *Checker, node: Node) Error!void {
     }
 }
 
-pub fn checkReturn(c: *Checker, node: Node) Error!void {
+fn checkReturn(c: *Checker, node: Node) Error!void {
     const d = c.tree.nodeData(node);
     const ctx = c.fn_ctx orelse {
         if (d.lhs != 0) _ = try c.checkExprCached(d.lhs, types.no_type);
@@ -536,7 +536,7 @@ pub fn checkReturn(c: *Checker, node: Node) Error!void {
     }
 }
 
-pub fn checkFunctionDecl(c: *Checker, node: Node) Error!void {
+fn checkFunctionDecl(c: *Checker, node: Node) Error!void {
     const d = c.tree.nodeData(node);
     // Builds the signature (reports 7006 etc. once).
     _ = try c.signatureOfProto(node, d.lhs, false, true);
@@ -737,7 +737,7 @@ pub const typeofSwitchIsExhaustive = reachability.typeofSwitchIsExhaustive;
 /// Check a namespace body: enter the (merged) namespace scope and check
 /// each body statement there. Member visibility/typing is materialized by
 /// classStaticType (value) and typeFromQualifiedName (type).
-pub fn checkNamespace(c: *Checker, node: Node) Error!void {
+fn checkNamespace(c: *Checker, node: Node) Error!void {
     const d = c.tree.nodeData(node);
     const data = c.tree.extraData(ast.NamespaceData, d.lhs);
     const saved = c.cur_scope;
@@ -895,7 +895,7 @@ pub fn indentChain(c: *Checker, chain: []const u8) Error![]const u8 {
 /// derived does not shadow is present verbatim and relates trivially. Only a
 /// genuine incompatible shadow can fail, which keeps this off valid code.
 /// Reported on the class name, tsc's `node.name || node`.
-pub fn checkStaticSideExtends(c: *Checker, class_sym: SymbolId, name_token: ast.TokenIndex) Error!void {
+fn checkStaticSideExtends(c: *Checker, class_sym: SymbolId, name_token: ast.TokenIndex) Error!void {
     if (name_token == 0) return;
     const base = try c.baseClassSym(class_sym) orelse return;
     const derived_static = try c.classStaticType(class_sym);
@@ -1286,7 +1286,7 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
         // fire even for unused classes.
         _ = try c.resolveStructural(this_t);
         _ = try c.classStaticType(class_sym);
-        try c.evalTypeParamDecls(class_sym);
+        try evalTypeParamDecls(c, class_sym);
     }
 
     // Class-position decorators (`@deco class C {}`): evaluated in the
@@ -1304,7 +1304,7 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
         else
             types.any_type;
         for (decos) |deco| {
-            const dt = try c.checkDecorator(deco);
+            const dt = try checkDecorator(c, deco);
             try decorators.checkClassDecoratorSig(c, deco, dt, class_val);
         }
         c.cur_scope = saved_ds;
@@ -1333,7 +1333,7 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
         // only when instance type is assignable").
         const class_members = c.tree.extraRange(data.members_start, data.members_end);
         if (try checkInstanceSideExtends(c, class_sym, class_members, this_t, data.name_token)) {
-            try c.checkStaticSideExtends(class_sym, data.name_token);
+            try checkStaticSideExtends(c, class_sym, data.name_token);
         }
     }
 
@@ -1462,7 +1462,7 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
                 // surrounding the class (at class-definition time), so its
                 // `this` is the enclosing `this`, not the instance.
                 c.this_type = saved_this;
-                const dt = try c.checkDecorator(member);
+                const dt = try checkDecorator(c, member);
                 // The decorated member is the next non-decorator member.
                 var target: Node = null_node;
                 var k = mi + 1;
@@ -1472,7 +1472,7 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
                         break;
                     }
                 }
-                if (target != null_node) try c.checkMemberDecoratorSig(member, dt, target, this_t, class_sym);
+                if (target != null_node) try checkMemberDecoratorSig(c, member, dt, target, this_t, class_sym);
             },
             else => {},
         }
@@ -1491,9 +1491,9 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
 // Decorator checking lives in `decorators.zig`; re-exported here because the
 // class walk above drives it and `Checker`'s method aliases name this file.
 pub const DecoPos = decorators.DecoPos;
-pub const checkDecorator = decorators.checkDecorator;
+const checkDecorator = decorators.checkDecorator;
 pub const checkDecoratorSig = decorators.checkDecoratorSig;
-pub const checkMemberDecoratorSig = decorators.checkMemberDecoratorSig;
+const checkMemberDecoratorSig = decorators.checkMemberDecoratorSig;
 pub const decoAcceptsValue = decorators.decoAcceptsValue;
 pub const decoCode = decorators.decoCode;
 pub const decoContextMismatch = decorators.decoContextMismatch;
@@ -1502,7 +1502,7 @@ pub const decoContextRef = decorators.decoContextRef;
 pub const decoSigMatches = decorators.decoSigMatches;
 pub const globalSymNamed = decorators.globalSymNamed;
 
-pub fn checkInterfaceDecl(c: *Checker, node: Node) Error!void {
+fn checkInterfaceDecl(c: *Checker, node: Node) Error!void {
     // Eagerly expand so member-type diagnostics (2304 in bodies, 7006 in
     // method signatures) fire even for unused interfaces.
     const d = c.tree.nodeData(node);
@@ -1514,12 +1514,12 @@ pub fn checkInterfaceDecl(c: *Checker, node: Node) Error!void {
     if (c.bind.lookupInScope(c.cur_scope, a)) |sym| {
         if (c.bind.symbol_flags[sym].interface) {
             _ = try c.interfaceGeneric(c.toGlobal(sym));
-            try c.evalTypeParamDecls(c.toGlobal(sym));
+            try evalTypeParamDecls(c, c.toGlobal(sym));
         }
     }
 }
 
-pub fn checkTypeAliasDecl(c: *Checker, node: Node) Error!void {
+fn checkTypeAliasDecl(c: *Checker, node: Node) Error!void {
     const d = c.tree.nodeData(node);
     const data = c.tree.extraData(ast.TypeAlias, d.lhs);
     if (data.name_token == 0) return;
@@ -1527,7 +1527,7 @@ pub fn checkTypeAliasDecl(c: *Checker, node: Node) Error!void {
     if (c.bind.lookupInScope(c.cur_scope, a)) |sym| {
         if (c.bind.symbol_flags[sym].type_alias) {
             _ = try c.aliasGeneric(c.toGlobal(sym));
-            try c.evalTypeParamDecls(c.toGlobal(sym));
+            try evalTypeParamDecls(c, c.toGlobal(sym));
         }
     }
 }
@@ -1539,7 +1539,7 @@ pub fn checkTypeAliasDecl(c: *Checker, node: Node) Error!void {
 /// along here: its callers — class, interface and type alias — are exactly
 /// the three declaration forms that HAVE declaration-site variance, and it
 /// is the same "check what the type parameter list declares" pass.
-pub fn evalTypeParamDecls(c: *Checker, sym: SymbolId) Error!void {
+fn evalTypeParamDecls(c: *Checker, sym: SymbolId) Error!void {
     var tps: std.ArrayList(TypeParamInfo) = .empty;
     defer tps.deinit(c.scratch());
     try c.typeParamsOf(sym, &tps);

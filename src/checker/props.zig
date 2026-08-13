@@ -82,7 +82,7 @@ fn propOfTypeIdx(c: *Checker, t: TypeId, name: Atom, allow_index: bool, from_ind
             // (`.bind`/`.call`/`.apply`/`.name`/`.length`/…). Plain
             // (non-callable) objects do NOT — an absent member stays TS2339.
             if (s.objectCallSigCount(t) > 0 or s.objectConstructSigCount(t) > 0) {
-                if (try c.functionInterfaceProp(name)) |p| return p;
+                if (try functionInterfaceProp(c, name)) |p| return p;
             }
             if (!allow_index) {
                 // An interface whose only base is `any` and which declares
@@ -274,10 +274,10 @@ fn propOfTypeIdx(c: *Checker, t: TypeId, name: Atom, allow_index: bool, from_ind
                 const flags: u32 = if (s.kind(t) == .array) 0 else types.prop_flag_readonly;
                 return .{ .name = name, .ty = types.number_type, .flags = flags };
             }
-            return c.primitiveInterfaceProp(t, name);
+            return primitiveInterfaceProp(c, t, name);
         },
         .number, .number_literal, .number_literal_fresh, .boolean, .bool_true, .bool_false => {
-            return c.primitiveInterfaceProp(t, name);
+            return primitiveInterfaceProp(c, t, name);
         },
         // tsc's `getApparentType(objectType)` is `globalObjectType`, so the
         // `object` KEYWORD carries the same `Object.prototype` members every
@@ -367,7 +367,7 @@ fn propOfTypeIdx(c: *Checker, t: TypeId, name: Atom, allow_index: bool, from_ind
         // A bare function type or overload set (arrow/normal function,
         // `(x) => y`, an overloaded signature) has the apparent members of
         // the global `Function` interface.
-        .function, .overloads => return c.functionInterfaceProp(name),
+        .function, .overloads => return functionInterfaceProp(c, name),
         else => return null,
     }
 }
@@ -459,7 +459,7 @@ fn keyofStillGeneric(c: *Checker, t: TypeId, depth: u32) Error!bool {
 /// function-shaped type. Returns null when the lib has no `Function`
 /// interface (`--noLib`) or the property genuinely isn't a `Function`
 /// member, so a bogus member on a callable still degrades to TS2339.
-pub fn functionInterfaceProp(c: *Checker, name: Atom) Error!?types.Prop {
+fn functionInterfaceProp(c: *Checker, name: Atom) Error!?types.Prop {
     const sym = c.prog.globals.lookup(c.atom_Function) orelse return null;
     if (!c.symFlags(sym).interface) return null;
     const ref = try c.ts.makeRef(sym, &.{});
@@ -502,7 +502,7 @@ fn classValueProp(c: *Checker, cls: SymbolId, name: Atom, allow_index: bool, fro
             .flags = types.prop_flag_readonly,
         };
     }
-    return c.functionInterfaceProp(name);
+    return functionInterfaceProp(c, name);
 }
 
 /// Look `name` up on the global `Object` interface — the
@@ -530,7 +530,7 @@ pub fn objectInterfaceProp(c: *Checker, name: Atom) Error!?types.Prop {
 /// -> `String.toUpperCase`, etc. Returns null when no lib is loaded or
 /// the interface is missing, so member access degrades to TS2339 exactly
 /// as it did lib-free.
-pub fn primitiveInterfaceProp(c: *Checker, t: TypeId, name: Atom) Error!?types.Prop {
+fn primitiveInterfaceProp(c: *Checker, t: TypeId, name: Atom) Error!?types.Prop {
     const s = &c.ts;
     var iface_atom: Atom = 0;
     var elem: TypeId = types.no_type;
@@ -591,12 +591,12 @@ pub fn typeParamConstraint(c: *Checker, sym: SymbolId) Error!TypeId {
     if (c.inst_cache_on) {
         if (c.tp_constraint_cache.get(sym)) |t| return t;
     }
-    const result = try c.typeParamConstraintUncached(sym);
+    const result = try typeParamConstraintUncached(c, sym);
     if (c.inst_cache_on) try c.tp_constraint_cache.put(c.cm(), sym, result);
     return result;
 }
 
-pub fn typeParamConstraintUncached(c: *Checker, sym: SymbolId) Error!TypeId {
+fn typeParamConstraintUncached(c: *Checker, sym: SymbolId) Error!TypeId {
     const saved = c.enterSymFile(sym);
     defer c.restoreCtx(saved);
     const decls = c.declsOf(sym);

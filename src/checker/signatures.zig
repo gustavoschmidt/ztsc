@@ -111,13 +111,13 @@ pub fn signatureOfProtoCtx(
         if (pn == null_node) continue;
         if (!seen_param) {
             seen_param = true;
-            if (c.thisParamAnn(pn)) |ann_node| {
+            if (thisParamAnn(c, pn)) |ann_node| {
                 this_ty = if (ann_node != 0) try c.typeFromTypeNode(ann_node) else types.any_type;
                 if (this_ty == types.no_type) this_ty = types.any_type;
                 continue;
             }
         }
-        const p = try c.paramInfo(pn, pi, ctx_sig, report_implicit);
+        const p = try paramInfo(c, pn, pi, ctx_sig, report_implicit);
         // A parameter with an initializer (`x = 'grey'`) is optional at the
         // call site and accepts `undefined` — passing `undefined` triggers
         // the default (tsc's `getTypeOfParameter` adds the optional type).
@@ -148,7 +148,7 @@ pub fn signatureOfProtoCtx(
         {
             const stripped = try c.removeUndefined(p.ty);
             if (stripped != p.ty and stripped != types.never_type and
-                !try c.paramInitCanBeUndefined(pn))
+                !try paramInitCanBeUndefined(c, pn))
             {
                 body_ty = stripped;
             }
@@ -209,7 +209,7 @@ pub fn signatureOfProtoCtx(
         // `x is T` / `asserts x[ is T]`: a plain guard returns boolean;
         // an assertion function returns void (no value required, so no
         // TS2355). The predicate rides along for call-site narrowing.
-        const p = try c.predicateFromNode(proto.return_type, params.items);
+        const p = try predicateFromNode(c, proto.return_type, params.items);
         pred = p;
         ret = if (p.asserts) types.void_type else types.boolean_type;
     } else if (proto.return_type != 0 and c.nodeTag(proto.return_type) == .this_expr and
@@ -230,7 +230,7 @@ pub fn signatureOfProtoCtx(
                 c.nodeTag(node) == .function_decl or c.nodeTag(node) == .class_method))
         {
             try c.sig_cache.put(c.cm(), c.nodeKey(node), .{ .ty = try c.ts.makeFunction(params.items, try c.makePromise(types.any_type), tps.items, if (is_method) types.fn_flag_method else 0), .ctx = ctx_sig });
-            const payload = try c.awaitedType(try c.inferReturnType(node, c.tree.nodeData(node).rhs, if (ret_ctx != types.no_type) try c.awaitedType(ret_ctx) else types.no_type));
+            const payload = try c.awaitedType(try inferReturnType(c, node, c.tree.nodeData(node).rhs, if (ret_ctx != types.no_type) try c.awaitedType(ret_ctx) else types.no_type));
             ret = try c.makePromise(payload);
         } else {
             ret = try c.makePromise(types.void_type);
@@ -243,7 +243,7 @@ pub fn signatureOfProtoCtx(
             // Reserve the cache slot to break recursion, as the ordinary
             // inferred-return path does.
             try c.sig_cache.put(c.cm(), c.nodeKey(node), .{ .ty = try c.ts.makeFunction(params.items, types.any_type, tps.items, if (is_method) types.fn_flag_method else 0), .ctx = ctx_sig });
-            ret = try c.inferGeneratorReturn(node, c.tree.nodeData(node).rhs);
+            ret = try inferGeneratorReturn(c, node, c.tree.nodeData(node).rhs);
         } else {
             // `async function*` and generator shapes with no body keep the
             // old `any`.
@@ -256,7 +256,7 @@ pub fn signatureOfProtoCtx(
         // Reserve the cache slot to break recursion (self-recursive
         // unannotated functions infer any, TS7023-adjacent).
         try c.sig_cache.put(c.cm(), c.nodeKey(node), .{ .ty = try c.ts.makeFunction(params.items, types.any_type, tps.items, if (is_method) types.fn_flag_method else 0), .ctx = ctx_sig });
-        ret = try c.inferReturnType(node, c.tree.nodeData(node).rhs, ret_ctx);
+        ret = try inferReturnType(c, node, c.tree.nodeData(node).rhs, ret_ctx);
     } else if (proto.flags & (ast.Flags.get) != 0) {
         ret = types.any_type;
     } else if (c.tree.nodeData(node).rhs == 0 and c.nodeTag(node) != .function_type and c.nodeTag(node) != .method_signature) {
@@ -271,7 +271,7 @@ pub fn signatureOfProtoCtx(
     if (pred == null and tps.items.len == 0 and
         (c.nodeTag(node) == .arrow_fn or c.nodeTag(node) == .function_expr))
     {
-        pred = try c.inferredPredicate(params.items, ret, c.tree.nodeData(node).rhs);
+        pred = try inferredPredicate(c, params.items, ret, c.tree.nodeData(node).rhs);
     }
 
     const sig = try c.ts.makeFunctionThis(params.items, ret, tps.items, if (is_method) types.fn_flag_method else 0, pred, this_ty);
@@ -288,7 +288,7 @@ pub fn signatureOfProtoCtx(
 /// must differ from the declared type AND the false branch must exclude the
 /// narrowed type entirely. That gate rejects truthiness (`!!x`, `x => !!x`)
 /// exactly as tsc does: the falsy branch of `number | null` keeps `number`.
-pub fn inferredPredicate(c: *Checker, params: []const types.Param, ret: TypeId, body: Node) Error!?types.Predicate {
+fn inferredPredicate(c: *Checker, params: []const types.Param, ret: TypeId, body: Node) Error!?types.Predicate {
     if (body == null_node) return null;
     switch (c.ts.kind(ret)) {
         .boolean, .bool_true, .bool_false => {},
@@ -354,7 +354,7 @@ pub fn inferredPredicate(c: *Checker, params: []const types.Param, ret: TypeId, 
             else => continue,
         };
         const key = RefKey{ .sym = psym };
-        const true_ty = try c.narrowByGuardExpr(declared, guard, sense, key, 0, declared);
+        const true_ty = try narrowByGuardExpr(c, declared, guard, sense, key, 0, declared);
         if (true_ty == declared or c.ts.kind(true_ty) == .never) continue;
         // Soundness, exactly as `checkIfExpressionRefinesParameter` states it:
         //
@@ -373,7 +373,7 @@ pub fn inferredPredicate(c: *Checker, params: []const types.Param, ret: TypeId, 
         // asPredicate(validate…)(p))` got no predicate at all and `find` fell to
         // its non-guard overload — TS2339 on the result and TS2322 on the
         // enclosing `mutationFn`.
-        const false_ty = try c.narrowByGuardExpr(true_ty, guard, !sense, key, 0, declared);
+        const false_ty = try narrowByGuardExpr(c, true_ty, guard, !sense, key, 0, declared);
         if (c.ts.kind(false_ty) != .never) continue;
         if (found != null) return null; // ambiguous: two params narrowed
         found = types.Predicate{ .param = @intCast(pi), .ty = true_ty, .asserts = false };
@@ -391,29 +391,29 @@ pub fn inferredPredicate(c: *Checker, params: []const types.Param, ret: TypeId, 
 /// (and the De Morgan dual for `||`). Leaves delegate to
 /// `narrowByCondition`; unhandled shapes return `t`, which the caller's
 /// `true_ty == declared` gate then rejects (no predicate — old behavior).
-pub fn narrowByGuardExpr(c: *Checker, t: TypeId, cond: Node, sense: bool, key: RefKey, depth: u32, decl: TypeId) Error!TypeId {
+fn narrowByGuardExpr(c: *Checker, t: TypeId, cond: Node, sense: bool, key: RefKey, depth: u32, decl: TypeId) Error!TypeId {
     if (cond == null_node or depth > 8) return t;
     const d = c.tree.nodeData(cond);
     switch (c.nodeTag(cond)) {
-        .paren_expr => return c.narrowByGuardExpr(t, d.lhs, sense, key, depth + 1, decl),
+        .paren_expr => return narrowByGuardExpr(c, t, d.lhs, sense, key, depth + 1, decl),
         .prefix_unary => {
             if (c.tree.tokens.tag(c.tree.nodeMainToken(cond)) != .bang)
                 return t;
-            return c.narrowByGuardExpr(t, d.lhs, !sense, key, depth + 1, decl);
+            return narrowByGuardExpr(c, t, d.lhs, !sense, key, depth + 1, decl);
         },
         .binary => switch (c.tree.tokens.tag(c.tree.nodeMainToken(cond))) {
             .amp_amp => {
-                const a_true = try c.narrowByGuardExpr(t, d.lhs, true, key, depth + 1, decl);
-                if (sense) return c.narrowByGuardExpr(a_true, d.rhs, true, key, depth + 1, decl);
-                const a_false = try c.narrowByGuardExpr(t, d.lhs, false, key, depth + 1, decl);
-                const b_false = try c.narrowByGuardExpr(a_true, d.rhs, false, key, depth + 1, decl);
+                const a_true = try narrowByGuardExpr(c, t, d.lhs, true, key, depth + 1, decl);
+                if (sense) return narrowByGuardExpr(c, a_true, d.rhs, true, key, depth + 1, decl);
+                const a_false = try narrowByGuardExpr(c, t, d.lhs, false, key, depth + 1, decl);
+                const b_false = try narrowByGuardExpr(c, a_true, d.rhs, false, key, depth + 1, decl);
                 return c.makeUnion2(a_false, b_false);
             },
             .pipe_pipe => {
-                const a_false = try c.narrowByGuardExpr(t, d.lhs, false, key, depth + 1, decl);
-                if (!sense) return c.narrowByGuardExpr(a_false, d.rhs, false, key, depth + 1, decl);
-                const a_true = try c.narrowByGuardExpr(t, d.lhs, true, key, depth + 1, decl);
-                const b_true = try c.narrowByGuardExpr(a_false, d.rhs, true, key, depth + 1, decl);
+                const a_false = try narrowByGuardExpr(c, t, d.lhs, false, key, depth + 1, decl);
+                if (!sense) return narrowByGuardExpr(c, a_false, d.rhs, false, key, depth + 1, decl);
+                const a_true = try narrowByGuardExpr(c, t, d.lhs, true, key, depth + 1, decl);
+                const b_true = try narrowByGuardExpr(c, a_false, d.rhs, true, key, depth + 1, decl);
                 return c.makeUnion2(a_true, b_true);
             },
             else => return c.narrowByCondition(t, cond, sense, key, decl),
@@ -437,7 +437,7 @@ pub fn typesOverlap(c: *Checker, a: TypeId, b: TypeId) Error!bool {
 
 /// If `pn` is a leading `this` parameter (`this: T`), return its type
 /// annotation node (0 when unannotated); otherwise null.
-pub fn thisParamAnn(c: *Checker, pn: Node) ?Node {
+fn thisParamAnn(c: *Checker, pn: Node) ?Node {
     const d = c.tree.nodeData(pn);
     const name_node: Node = switch (c.nodeTag(pn)) {
         .param, .param_full => d.lhs,
@@ -454,7 +454,7 @@ pub fn thisParamAnn(c: *Checker, pn: Node) ?Node {
 /// Resolve a `.type_predicate` return-type node into a `Predicate`:
 /// map the guarded name to a parameter index and evaluate the target
 /// type. `this is T` uses the `this_param` sentinel.
-pub fn predicateFromNode(c: *Checker, node: Node, params: []const types.Param) Error!types.Predicate {
+fn predicateFromNode(c: *Checker, node: Node, params: []const types.Param) Error!types.Predicate {
     const d = c.tree.nodeData(node);
     const asserts = d.rhs != 0;
     const target: TypeId = if (d.lhs != 0) try c.typeFromTypeNode(d.lhs) else types.no_type;
@@ -481,7 +481,7 @@ pub fn predicateFromNode(c: *Checker, node: Node, params: []const types.Param) E
 /// diagnostic, so the authoritative check of the same initializer — which
 /// happens later, under the annotation as its contextual type — is
 /// unaffected.
-pub fn paramInitCanBeUndefined(c: *Checker, pn: Node) Error!bool {
+fn paramInitCanBeUndefined(c: *Checker, pn: Node) Error!bool {
     if (c.nodeTag(pn) != .param_full) return false;
     const e = c.tree.extraData(ast.ParamFull, c.tree.nodeData(pn).rhs);
     if (e.init == 0) return false;
@@ -491,7 +491,7 @@ pub fn paramInitCanBeUndefined(c: *Checker, pn: Node) Error!bool {
     return (try c.removeUndefined(it)) != it;
 }
 
-pub fn paramInfo(c: *Checker, pn: Node, index: u32, ctx_sig: TypeId, report_implicit: bool) Error!types.Param {
+fn paramInfo(c: *Checker, pn: Node, index: u32, ctx_sig: TypeId, report_implicit: bool) Error!types.Param {
     const d = c.tree.nodeData(pn);
     var name_node: Node = 0;
     var type_ann: Node = 0;
@@ -557,7 +557,7 @@ pub fn paramInfo(c: *Checker, pn: Node, index: u32, ctx_sig: TypeId, report_impl
         // (`checkObjectLiteral`/`contextualTypeHasPattern`). Without it
         // every property of `({ w = 1, h = 2 } = { w: 0, h: 0 })` came out
         // REQUIRED and `f({ w: 5 })` reported TS2345.
-        ty = try c.optionalizePatternDefaults(ty, name_node);
+        ty = try optionalizePatternDefaults(c, ty, name_node);
     }
     if (ty == types.no_type) {
         // `noImplicitAny: false` suppresses TS7006 — the parameter still
@@ -600,7 +600,7 @@ fn mayReturnNever(c: *Checker, fn_node: Node) bool {
     };
 }
 
-pub fn inferReturnType(c: *Checker, fn_node: Node, body: Node, ret_ctx: TypeId) Error!TypeId {
+fn inferReturnType(c: *Checker, fn_node: Node, body: Node, ret_ctx: TypeId) Error!TypeId {
     if (body == 0) return types.any_type;
     // Establish *this* function's async/generator context while checking
     // its body: `await`/`yield` legality (TS1308/TS1163…) must be judged
@@ -657,7 +657,7 @@ pub fn inferReturnType(c: *Checker, fn_node: Node, body: Node, ret_ctx: TypeId) 
         if (pn == null_node) continue;
         // A `this` annotation is only a receiver annotation in LEADING
         // position, which is where `signatureOfProto` reads it too.
-        if (c.thisParamAnn(pn)) |ann_node| {
+        if (thisParamAnn(c, pn)) |ann_node| {
             this_annotated = true;
             if (ann_node != 0) {
                 const tt = try c.typeFromTypeNode(ann_node);
@@ -792,13 +792,13 @@ pub fn inferReturnType(c: *Checker, fn_node: Node, body: Node, ret_ctx: TypeId) 
 /// `any`, so this narrows the gap rather than trading it for a wrong
 /// answer. Same for `async function*` (`AsyncGenerator`'s own shape) and
 /// for a generator without a body.
-pub fn inferGeneratorReturn(c: *Checker, fn_node: Node, body: Node) Error!TypeId {
+fn inferGeneratorReturn(c: *Checker, fn_node: Node, body: Node) Error!TypeId {
     const gen_sym = c.prog.globals.lookup(c.atom_Generator) orelse return types.any_type;
     if (!c.symFlags(gen_sym).interface) return types.any_type;
     if (c.nodeTag(body) != .block) return types.any_type;
 
     const base_scope = (try c.scopeOf(fn_node)) orelse c.cur_scope;
-    var yields = try c.collectYields(c.tree.nodeRange(body), base_scope);
+    var yields = try collectYields(c, c.tree.nodeRange(body), base_scope);
     defer yields.deinit(c.scratch());
     if (yields.delegated) return types.any_type;
 
@@ -826,7 +826,7 @@ pub fn inferGeneratorReturn(c: *Checker, fn_node: Node, body: Node) Error!TypeId
         if (yields.bare) try parts.append(c.scratch(), types.undefined_type);
         yield_ty = try c.ts.makeUnion(c.scratch(), parts.items);
     }
-    const ret_ty = try c.inferReturnType(fn_node, body, types.no_type);
+    const ret_ty = try inferReturnType(c, fn_node, body, types.no_type);
     return c.ts.makeRef(gen_sym, &.{ yield_ty, ret_ty, types.unknown_type });
 }
 
@@ -862,7 +862,7 @@ pub const ReturnSites = struct {
 
 /// Collect the `yield` sites of the body statements `stmts`, which bind in
 /// `scope`. The caller owns the result (`deinit` with `c.scratch()`).
-pub fn collectYields(c: *Checker, stmts: []const Node, scope: ScopeId) Error!YieldSites {
+fn collectYields(c: *Checker, stmts: []const Node, scope: ScopeId) Error!YieldSites {
     var sites: YieldSites = .{};
     errdefer sites.deinit(c.scratch());
     for (stmts) |stmt| {
@@ -943,7 +943,7 @@ pub fn typeOfSymbol(c: *Checker, sym: SymbolId) Error!TypeId {
     if (c.sym_state.items[sym] == .in_progress) return types.any_type; // circular
     c.sym_state.items[sym] = .in_progress;
     const before = c.spec_taint_reads;
-    const t = c.computeTypeOfSymbol(sym) catch |err| {
+    const t = computeTypeOfSymbol(c, sym) catch |err| {
         c.sym_state.items[sym] = .not_computed;
         return err;
     };
@@ -1007,7 +1007,7 @@ pub fn dropSpeculativeSymTypes(c: *Checker) void {
     c.spec_tainted.clearRetainingCapacity();
 }
 
-pub fn computeTypeOfSymbol(c: *Checker, sym: SymbolId) Error!TypeId {
+fn computeTypeOfSymbol(c: *Checker, sym: SymbolId) Error!TypeId {
     // A merged symbol's value type. For a merged *namespace* the
     // value object is anchored to the merged id — `classStaticType` walks
     // the merged member index; a cross-file kind combination
@@ -1029,7 +1029,7 @@ pub fn computeTypeOfSymbol(c: *Checker, sym: SymbolId) Error!TypeId {
             // `setTimeout(): NodeJS.Timeout`, plus `namespace setTimeout`)
             // folds every overload node-first, so `typeof setTimeout` stays
             // callable with the node return type.
-            if (try c.mergedFunctionValue(m.parts)) |ft| {
+            if (try mergedFunctionValue(c, m.parts)) |ft| {
                 return c.ts.makeIntersection(c.scratch(), &.{ ft, ns_val });
             }
             for (m.parts) |p| {
@@ -1039,7 +1039,7 @@ pub fn computeTypeOfSymbol(c: *Checker, sym: SymbolId) Error!TypeId {
                     break;
                 }
                 if (pf.var_decl or pf.let_decl or pf.const_decl) {
-                    ns_val = try c.ts.makeIntersection(c.scratch(), &.{ try c.variableSymbolType(p), ns_val });
+                    ns_val = try c.ts.makeIntersection(c.scratch(), &.{ try variableSymbolType(c, p), ns_val });
                     break;
                 }
             }
@@ -1049,7 +1049,7 @@ pub fn computeTypeOfSymbol(c: *Checker, sym: SymbolId) Error!TypeId {
         // `setInterval(): number` + @types/node's `global{}`
         // `setInterval(): NodeJS.Timeout`) merges into one overload set,
         // node's signatures first — see `mergedFunctionValue`.
-        if (try c.mergedFunctionValue(m.parts)) |ft| return ft;
+        if (try mergedFunctionValue(c, m.parts)) |ft| return ft;
         // A callable class split across files (`class C` here, `function C`
         // overloads there): keep both signature sets, call side first, the
         // same shape the same-file merge takes in `callableClassValue`.
@@ -1059,7 +1059,7 @@ pub fn computeTypeOfSymbol(c: *Checker, sym: SymbolId) Error!TypeId {
             for (m.parts) |p| {
                 const pf = c.symFlags(p);
                 if (pf.class and cls == types.no_type) cls = try c.ts.makeClassValue(p);
-                if (pf.function and fnv == types.no_type) fnv = try c.functionSymbolType(p);
+                if (pf.function and fnv == types.no_type) fnv = try functionSymbolType(c, p);
             }
             if (cls != types.no_type and fnv != types.no_type)
                 return c.ts.makeIntersection(c.scratch(), &.{ fnv, cls });
@@ -1070,7 +1070,7 @@ pub fn computeTypeOfSymbol(c: *Checker, sym: SymbolId) Error!TypeId {
         return types.any_type;
     }
     const f = c.symFlags(sym);
-    if (f.import_binding) return c.importedSymbolType(sym);
+    if (f.import_binding) return importedSymbolType(c, sym);
     // A namespace is a value object of its exported members, modeled as a
     // `class_value` anchored to the namespace symbol (so it prints
     // `typeof N` and resolves members via classStaticType). When merged
@@ -1083,20 +1083,20 @@ pub fn computeTypeOfSymbol(c: *Checker, sym: SymbolId) Error!TypeId {
             // `class_value` already carries the namespace's static members;
             // a callable class still needs its call signatures folded in.
             if (!f.function) return ns_val;
-            return c.ts.makeIntersection(c.scratch(), &.{ try c.functionSymbolType(sym), ns_val });
+            return c.ts.makeIntersection(c.scratch(), &.{ try functionSymbolType(c, sym), ns_val });
         }
-        if (f.function) return c.ts.makeIntersection(c.scratch(), &.{ try c.functionSymbolType(sym), ns_val });
+        if (f.function) return c.ts.makeIntersection(c.scratch(), &.{ try functionSymbolType(c, sym), ns_val });
         if (f.enum_decl) return c.ts.makeIntersection(c.scratch(), &.{ try c.enumValueType(sym), ns_val });
         // Same-file `var X: T` + `namespace X {…}` (a namespace merged onto a
         // typed global within one file): keep T's members.
         if (f.var_decl or f.let_decl or f.const_decl)
-            return c.ts.makeIntersection(c.scratch(), &.{ try c.variableSymbolType(sym), ns_val });
+            return c.ts.makeIntersection(c.scratch(), &.{ try variableSymbolType(c, sym), ns_val });
         return ns_val;
     }
     if (f.enum_decl) return c.enumValueType(sym);
-    if (f.class) return c.callableClassValue(sym, f);
-    if (f.function) return c.withExpandoProps(sym, try c.functionSymbolType(sym));
-    if (f.expando_member) return c.expandoMemberType(sym);
+    if (f.class) return callableClassValue(c, sym, f);
+    if (f.function) return withExpandoProps(c, sym, try functionSymbolType(c, sym));
+    if (f.expando_member) return expandoMemberType(c, sym);
     if (f.property or f.method or f.getter or f.setter) return c.memberTypeOf(sym);
 
     // The remaining cases traverse decl nodes: switch to the symbol's
@@ -1119,7 +1119,7 @@ pub fn computeTypeOfSymbol(c: *Checker, sym: SymbolId) Error!TypeId {
         for (decls) |decl| {
             switch (c.nodeTag(decl)) {
                 .param, .param_full => {
-                    const p = try c.paramInfo(decl, 0, types.no_type, false);
+                    const p = try paramInfo(c, decl, 0, types.no_type, false);
                     // Pattern params: paramInfo names only identifiers;
                     // for destructured params fall through to any.
                     if (p.name != 0 and p.name == c.symNameAtom(sym)) return p.ty;
@@ -1131,7 +1131,7 @@ pub fn computeTypeOfSymbol(c: *Checker, sym: SymbolId) Error!TypeId {
         return types.any_type;
     }
     if (f.var_decl or f.let_decl or f.const_decl)
-        return c.withExpandoProps(sym, try c.variableSymbolType(sym));
+        return withExpandoProps(c, sym, try variableSymbolType(c, sym));
     return types.any_type;
 }
 
@@ -1149,10 +1149,10 @@ pub fn computeTypeOfSymbol(c: *Checker, sym: SymbolId) Error!TypeId {
 /// same shape a function merged with a namespace already uses. Call
 /// signatures come first so overload resolution sees them in declaration
 /// order.
-pub fn callableClassValue(c: *Checker, sym: SymbolId, f: binder.SymbolFlags) Error!TypeId {
+fn callableClassValue(c: *Checker, sym: SymbolId, f: binder.SymbolFlags) Error!TypeId {
     const cls = try c.ts.makeClassValue(sym);
     if (!f.function) return cls;
-    return c.ts.makeIntersection(c.scratch(), &.{ try c.functionSymbolType(sym), cls });
+    return c.ts.makeIntersection(c.scratch(), &.{ try functionSymbolType(c, sym), cls });
 }
 
 /// Fold a function value's *expando* properties into its type: the
@@ -1162,7 +1162,7 @@ pub fn callableClassValue(c: *Checker, sym: SymbolId, f: binder.SymbolFlags) Err
 /// none. tsc models this as one anonymous type carrying both the call
 /// signatures and the members; the intersection is the same shape ztsc
 /// already uses for a function merged with a namespace.
-pub fn withExpandoProps(c: *Checker, sym: SymbolId, base: TypeId) Error!TypeId {
+fn withExpandoProps(c: *Checker, sym: SymbolId, base: TypeId) Error!TypeId {
     if (!c.symFlags(sym).expando) return base;
     const saved = c.enterSymFile(sym);
     defer c.restoreCtx(saved);
@@ -1187,7 +1187,7 @@ pub fn withExpandoProps(c: *Checker, sym: SymbolId, base: TypeId) Error!TypeId {
 /// Type of one expando property: the widened type of the assigned
 /// expression, unioned over every `fn.prop = value` statement that
 /// declares it (tsc widens each assignment and unions them).
-pub fn expandoMemberType(c: *Checker, sym: SymbolId) Error!TypeId {
+fn expandoMemberType(c: *Checker, sym: SymbolId) Error!TypeId {
     const saved = c.enterSymFile(sym);
     defer c.restoreCtx(saved);
     c.cur_scope = c.symScope(sym);
@@ -1256,7 +1256,7 @@ pub fn expandoMemberType(c: *Checker, sym: SymbolId) Error!TypeId {
 /// set, so a call matching no signature reported the failing argument
 /// instead of TS2769, and a call only the library signature accepts failed
 /// outright.
-pub fn mergedFunctionValue(c: *Checker, parts: []const u32) Error!?TypeId {
+fn mergedFunctionValue(c: *Checker, parts: []const u32) Error!?TypeId {
     var nonlib: std.ArrayList(TypeId) = .empty;
     defer nonlib.deinit(c.scratch());
     var lib: std.ArrayList(TypeId) = .empty;
@@ -1452,7 +1452,7 @@ pub fn lastCallSig(c: *Checker, t0: TypeId) Error!?TypeId {
 /// (switches to the symbol's file/scope) so it can also be called for a
 /// symbol that additionally carries a `namespace` meaning (e.g. `@types/node`
 /// declares `var console: Console` alongside `namespace console { … }`).
-pub fn variableSymbolType(c: *Checker, sym: SymbolId) Error!TypeId {
+fn variableSymbolType(c: *Checker, sym: SymbolId) Error!TypeId {
     const saved = c.enterSymFile(sym);
     defer c.restoreCtx(saved);
     c.cur_scope = c.symScope(sym);
@@ -1467,7 +1467,7 @@ pub fn variableSymbolType(c: *Checker, sym: SymbolId) Error!TypeId {
             .declarator, .declarator_init, .declarator_full => {},
             else => continue,
         }
-        const t = try c.declaratorType(sym, decl, is_const);
+        const t = try declaratorType(c, sym, decl, is_const);
         if (t != types.no_type) return t;
     }
     return types.any_type;
@@ -1481,7 +1481,7 @@ pub const ambientNamespaceType = modvalue.ambientNamespaceType;
 pub const appendAugmentedModuleExports = modvalue.appendAugmentedModuleExports;
 pub const dualHasValue = modvalue.dualHasValue;
 pub const dualValueType = modvalue.dualValueType;
-pub const importedSymbolType = modvalue.importedSymbolType;
+const importedSymbolType = modvalue.importedSymbolType;
 pub const namespaceObjectType = modvalue.namespaceObjectType;
 pub const targetValueType = modvalue.targetValueType;
 
@@ -1569,7 +1569,7 @@ pub fn widenInitializer(c: *Checker, init_t: TypeId, is_const: bool) Error!TypeI
 /// the element type `checkForInOf` later tries to set — every use of the
 /// loop variable in the body silently becomes `any`, taking with it the
 /// narrowings and the contextual types that would have come from it.
-pub fn forHeadBindingType(c: *Checker, sym: SymbolId) Error!?TypeId {
+fn forHeadBindingType(c: *Checker, sym: SymbolId) Error!?TypeId {
     const scope = c.symScope(sym);
     if (c.bind.scope_kinds[scope] != .for_head) return null;
     const owner = c.bind.scope_owners[scope];
@@ -1598,7 +1598,7 @@ pub fn forHeadBindingType(c: *Checker, sym: SymbolId) Error!?TypeId {
 /// social-app's post-shadow tombstone). Keyed on the declarator node, which
 /// is distinct from the annotation node an explicit `: unique symbol` uses.
 /// Null when the shape does not qualify, so the caller widens as before.
-pub fn inferredUniqueSymbol(c: *Checker, decl: Node, name: Node, init: Node, is_const: bool, init_t: TypeId) Error!?TypeId {
+fn inferredUniqueSymbol(c: *Checker, decl: Node, name: Node, init: Node, is_const: bool, init_t: TypeId) Error!?TypeId {
     if (!is_const or c.nodeTag(name) != .identifier) return null;
     if (c.ts.kind(init_t) != .symbol) return null;
     if (!c.isFreshSymbolCall(init)) return null;
@@ -1607,7 +1607,7 @@ pub fn inferredUniqueSymbol(c: *Checker, decl: Node, name: Node, init: Node, is_
 
 /// Type of one variable declarator for `sym` (no_type if this decl
 /// contributes none, e.g. bare `declarator` in a multi-decl symbol).
-pub fn declaratorType(c: *Checker, sym: SymbolId, decl: Node, is_const: bool) Error!TypeId {
+fn declaratorType(c: *Checker, sym: SymbolId, decl: Node, is_const: bool) Error!TypeId {
     // The initializer is being typed to *build* this variable's type, so
     // any function body inside it must not be walked yet — the same rule
     // the class-field arm of `computeTypeOfSymbol` already applies (see
@@ -1638,14 +1638,14 @@ pub fn declaratorType(c: *Checker, sym: SymbolId, decl: Node, is_const: bool) Er
         .declarator => {
             // No initializer and no annotation: either a loop head binding
             // (typed by what is iterated) or a bare `let x;`.
-            const et = (try c.forHeadBindingType(sym)) orelse return types.any_type;
+            const et = (try forHeadBindingType(c, sym)) orelse return types.any_type;
             if (c.nodeTag(d.lhs) == .identifier) return et;
             return c.bindingElementType(sym, decl, et);
         },
         .declarator_init => {
             if (try freshSymbolConstType(c, decl, d.lhs, d.rhs, is_const)) |u| return u;
             const init_t = try c.checkExprCached(d.rhs, types.no_type);
-            if (try c.inferredUniqueSymbol(decl, d.lhs, d.rhs, is_const, init_t)) |u| return u;
+            if (try inferredUniqueSymbol(c, decl, d.lhs, d.rhs, is_const, init_t)) |u| return u;
             const vt = try c.widenInitializer(init_t, is_const);
             if (c.nodeTag(d.lhs) == .identifier) return vt;
             return c.bindingElementType(sym, decl, vt);
@@ -1658,7 +1658,7 @@ pub fn declaratorType(c: *Checker, sym: SymbolId, decl: Node, is_const: bool) Er
             } else if (e.init != 0) {
                 if (try freshSymbolConstType(c, decl, d.lhs, e.init, is_const)) |u| return u;
                 const init_t = try c.checkExprCached(e.init, types.no_type);
-                if (try c.inferredUniqueSymbol(decl, d.lhs, e.init, is_const, init_t)) |u| return u;
+                if (try inferredUniqueSymbol(c, decl, d.lhs, e.init, is_const, init_t)) |u| return u;
                 vt = try c.widenInitializer(init_t, is_const);
             }
             if (c.nodeTag(d.lhs) == .identifier) return vt;
@@ -1704,12 +1704,12 @@ pub const bindingFlowBase = destructure.bindingFlowBase;
 pub const extendRefKey = destructure.extendRefKey;
 pub const findBindingType = destructure.findBindingType;
 pub const objectRestType = destructure.objectRestType;
-pub const optionalizePatternDefaults = destructure.optionalizePatternDefaults;
+const optionalizePatternDefaults = destructure.optionalizePatternDefaults;
 pub const patternDefaultsProp = destructure.patternDefaultsProp;
 pub const pinBindingSym = destructure.pinBindingSym;
 pub const pinPatternParamSyms = destructure.pinPatternParamSyms;
 
-pub fn functionSymbolType(c: *Checker, sym: SymbolId) Error!TypeId {
+fn functionSymbolType(c: *Checker, sym: SymbolId) Error!TypeId {
     const saved = c.enterSymFile(sym);
     defer c.restoreCtx(saved);
     c.cur_scope = c.symScope(sym);
@@ -1848,7 +1848,7 @@ pub fn memberTypeOf(c: *Checker, sym: SymbolId) Error!TypeId {
             const proto = c.tree.extraData(ast.FnProto, d.lhs);
             if (proto.flags & ast.Flags.get != 0) {
                 if (proto.return_type != 0) return c.typeFromTypeNode(proto.return_type);
-                if (tag == .class_method and d.rhs != 0) return c.inferReturnType(decl, d.rhs, types.no_type);
+                if (tag == .class_method and d.rhs != 0) return inferReturnType(c, decl, d.rhs, types.no_type);
             }
         }
         for (decls) |decl| {
@@ -1893,7 +1893,7 @@ pub fn memberTypeOf(c: *Checker, sym: SymbolId) Error!TypeId {
                 return types.any_type;
             },
             .param, .param_full => {
-                const p = try c.paramInfo(decl, 0, types.no_type, false);
+                const p = try paramInfo(c, decl, 0, types.no_type, false);
                 return p.ty;
             },
             else => {},
