@@ -2242,23 +2242,16 @@ pub fn isOptionalChain(c: *Checker, node: Node) bool {
 pub const ChainLink = struct { ty: TypeId, chained: bool };
 
 /// Type of a chain link's object/callee, WITHOUT the chain's short-circuit
-/// `undefined` (that is tracked in `chained`). Only called when `node` is
-/// itself an optional chain, so downstream declared-nullish still reports.
-pub fn chainObjType(c: *Checker, node: Node, chained: *bool) Error!TypeId {
-    switch (c.nodeTag(node)) {
-        .member_expr, .optional_member_expr => {
-            const link = try c.memberChainInner(node);
-            if (link.chained) chained.* = true;
-            return link.ty;
-        },
-        .index_expr, .optional_index_expr => {
-            const link = try c.indexChainInner(node, true);
-            if (link.chained) chained.* = true;
-            return link.ty;
-        },
-        .call_expr, .call_expr_targs, .optional_call => return c.checkCallExprInner(node, false, chained, types.no_type),
-        else => return c.checkExprCached(node, types.no_type),
-    }
+/// `undefined` (that is tracked in the link's `chained`). Only called when
+/// `node` is itself an optional chain, so downstream declared-nullish still
+/// reports.
+pub fn chainObjType(c: *Checker, node: Node) Error!ChainLink {
+    return switch (c.nodeTag(node)) {
+        .member_expr, .optional_member_expr => c.memberChainInner(node),
+        .index_expr, .optional_index_expr => c.indexChainInner(node, true),
+        .call_expr, .call_expr_targs, .optional_call => c.checkCallExprInner(node, false, types.no_type),
+        else => .{ .ty = try c.checkExprCached(node, types.no_type), .chained = false },
+    };
 }
 
 pub fn checkMemberExpr(c: *Checker, node: Node) Error!TypeId {
@@ -2278,10 +2271,11 @@ pub fn memberChainInner(c: *Checker, node: Node) Error!ChainLink {
     const d = c.tree.nodeData(node);
     const own_optional = c.nodeTag(node) == .optional_member_expr;
     var chained = false;
-    var obj_t = if (c.isOptionalChain(d.lhs))
-        try c.chainObjType(d.lhs, &chained)
-    else
-        try c.checkExprCached(d.lhs, types.no_type);
+    var obj_t = if (c.isOptionalChain(d.lhs)) blk: {
+        const link = try c.chainObjType(d.lhs);
+        if (link.chained) chained = true;
+        break :blk link.ty;
+    } else try c.checkExprCached(d.lhs, types.no_type);
     const name_tok: TokenIndex = d.rhs;
     const name = try c.memberAtom(name_tok);
     if (own_optional) {
@@ -2537,10 +2531,11 @@ pub fn indexChainInner(c: *Checker, node: Node, narrow: bool) Error!ChainLink {
     const d = c.tree.nodeData(node);
     const own_optional = c.nodeTag(node) == .optional_index_expr;
     var chained = false;
-    var obj_t = if (c.isOptionalChain(d.lhs))
-        try c.chainObjType(d.lhs, &chained)
-    else
-        try c.checkExprCached(d.lhs, types.no_type);
+    var obj_t = if (c.isOptionalChain(d.lhs)) blk: {
+        const link = try c.chainObjType(d.lhs);
+        if (link.chained) chained = true;
+        break :blk link.ty;
+    } else try c.checkExprCached(d.lhs, types.no_type);
     // The index expression runs only on the chain's non-nullish branch, so
     // it sees the chain's own guards (`pushChainGuards`).
     const idx_t = idx: {
