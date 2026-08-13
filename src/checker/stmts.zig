@@ -682,7 +682,14 @@ pub fn checkFunctionBody(c: *Checker, node: Node, proto_idx: u32, body: Node, si
         if (e.init != 0 and e.type_ann != 0) {
             const ann_t = try c.typeFromTypeNode(e.type_ann);
             const it = try c.checkExprCached(e.init, ann_t);
-            _ = try c.checkAssignable(it, ann_t, e.init, c.nodeSpan(e.init));
+            // tsc's `checkVariableLikeDeclaration` anchors an initializer
+            // mismatch at the DECLARATION (`errorNode = node`), not at the
+            // initializer, and only descends into the initializer when the
+            // elaboration finds something narrower to blame — exactly what a
+            // `var`/`const` declarator already does here. A parameter's
+            // declaration starts at its name, so `function f<T extends
+            // Number>(x: T = 1)` reports on `x`, not on the `1`.
+            _ = try c.checkAssignable(it, ann_t, e.init, c.nodeSpan(pn));
         } else if (e.init != 0) {
             _ = try c.checkExprCached(e.init, types.no_type);
         }

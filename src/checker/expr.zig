@@ -3410,8 +3410,27 @@ fn checkArithmeticOperands(c: *Checker, node: Node, op: scanner.Tag, lt0: TypeId
         ok = false;
         try c.diagFmt(2363, c.nodeSpan(rhs), "The right-hand side of an arithmetic operation must be of type 'any', 'number', 'bigint' or an enum type.", .{});
     }
-    if (try isBigintish(c, lt) and try isBigintish(c, rt) and
-        !try isNumberish(c, lt) and !try isNumberish(c, rt)) return .{ .ty = types.bigint_type, .ok = ok };
+    // tsc's bigint dispatch (`checkBinaryLikeExpressionWorker`): `bigint` when
+    // both sides are bigint-like, `number` when neither could be — and when
+    // EXACTLY ONE is, the operator itself is the error
+    // (`reportOperatorError(bothAreBigIntLike)`), with `errorType` as the
+    // result so no write-back check runs. Without that arm `bigInt -= 2`
+    // silently produced `number` and the write-back reported a TS2322 where
+    // tsgo reports the TS2365 on the pair — ten of them in
+    // `numberVsBigIntOperations`. `any`/`err`/`never` answer true to BOTH
+    // predicates, so requiring `!num` on the bigint side and `!big` on the
+    // other keeps them out of the error arm entirely.
+    const l_big = try isBigintish(c, lt);
+    const r_big = try isBigintish(c, rt);
+    const l_num = try isNumberish(c, lt);
+    const r_num = try isNumberish(c, rt);
+    if (l_big and r_big and !l_num and !r_num) return .{ .ty = types.bigint_type, .ok = ok };
+    if (ok and ((l_big and !l_num and r_num and !r_big) or (r_big and !r_num and l_num and !l_big))) {
+        try c.diagFmt(2365, c.nodeSpan(node), "Operator '{s}' cannot be applied to types '{s}' and '{s}'.", .{
+            c.tokenText(c.tree.nodeMainToken(node)), try c.typeToString(lt), try c.typeToString(rt),
+        });
+        return .{ .ty = types.error_type, .ok = false };
+    }
     return .{ .ty = types.number_type, .ok = ok };
 }
 
