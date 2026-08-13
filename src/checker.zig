@@ -1708,7 +1708,7 @@ pub const Checker = struct {
     /// terminates (as `error_type`) instead of overflowing the worker stack.
     alias_depth: u32 = 0,
     /// Live nesting of `driveShrinkingAlias`, bounded by
-    /// `max_eager_alias_depth` (see that constant).
+    /// `shrink.max_eager_alias_depth` (see that constant).
     eager_alias_depth: u32 = 0,
     /// Live recursion depth of the structural assignability relation
     /// (`isAssignable`), checked against `max_relation_depth` to break the
@@ -3257,16 +3257,12 @@ pub const Checker = struct {
     pub const lazyNumberIndex = instantiate_zig.lazyNumberIndex;
     pub const originTaggable = instantiate_zig.originTaggable;
     pub const driveShrinkingAlias = instantiate_zig.driveShrinkingAlias;
-    pub const refArgsSettled = instantiate_zig.refArgsSettled;
     pub const isEmptyObjectType = instantiate_zig.isEmptyObjectType;
     pub const globalThisType = instantiate_zig.globalThisType;
     pub const globalThisProp = instantiate_zig.globalThisProp;
     pub const globalThisHasValue = instantiate_zig.globalThisHasValue;
-    pub const reduceForOriginEquiv = instantiate_zig.reduceForOriginEquiv;
     pub const originArgEquiv = instantiate_zig.originArgEquiv;
     pub const reexpandShrinking = instantiate_zig.reexpandShrinking;
-    pub const refStrictlyShrinks = instantiate_zig.refStrictlyShrinks;
-    pub const shrinkMetric = instantiate_zig.shrinkMetric;
     pub const emitBaseCycle = instantiate_zig.emitBaseCycle;
     pub const interfaceGeneric = instantiate_zig.interfaceGeneric;
     pub const setInterfaceThis = instantiate_zig.setInterfaceThis;
@@ -3318,9 +3314,6 @@ pub const Checker = struct {
     pub const classChainMemberType = instantiate_zig.classChainMemberType;
     pub const checkAbstractImplementation = instantiate_zig.checkAbstractImplementation;
     pub const collectClassMemberAtoms = instantiate_zig.collectClassMemberAtoms;
-    pub const max_eager_alias_depth = instantiate_zig.max_eager_alias_depth;
-    pub const origin_equiv_depth = instantiate_zig.origin_equiv_depth;
-    pub const shrink_reexpand_ceiling = instantiate_zig.shrink_reexpand_ceiling;
     pub const lazy_base_depth = instantiate_zig.lazy_base_depth;
 
     const enums_zig = @import("checker/enums.zig");

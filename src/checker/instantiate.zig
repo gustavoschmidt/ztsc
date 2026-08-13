@@ -674,16 +674,9 @@ const classes = @import("classes.zig");
 const modvalue = @import("modvalue.zig");
 const shrink = @import("shrink.zig");
 
-pub const max_eager_alias_depth = shrink.max_eager_alias_depth;
-pub const origin_equiv_depth = shrink.origin_equiv_depth;
-pub const shrink_reexpand_ceiling = shrink.shrink_reexpand_ceiling;
 pub const driveShrinkingAlias = shrink.driveShrinkingAlias;
-pub const refArgsSettled = shrink.refArgsSettled;
-pub const reduceForOriginEquiv = shrink.reduceForOriginEquiv;
 pub const originArgEquiv = shrink.originArgEquiv;
 pub const reexpandShrinking = shrink.reexpandShrinking;
-pub const refStrictlyShrinks = shrink.refStrictlyShrinks;
-pub const shrinkMetric = shrink.shrinkMetric;
 
 pub const globalThisType = modvalue.globalThisType;
 pub const globalThisProp = modvalue.globalThisProp;
