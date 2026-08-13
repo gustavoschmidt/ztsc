@@ -2475,18 +2475,25 @@ fn lazyRefRelate(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: types.Ki
     // materialization is the very reference this frame holds). Push them here
     // too, so the guard trips at the same depth it does today.
     //
-    // KNOWN ASYMMETRY, recorded rather than changed (it decides diagnostics).
     // Both guard cuts on this route — here and the `relIdDeeplyNested` one
     // below — answer "related" from ASSUMPTION, exactly as `relate`'s own two
-    // do, but only `rel_guard_tripped` is raised: this route returns a bare
-    // `bool` to `isAssignableInner`, so it has no way to say `.assumed_yes`
-    // (see `RelAnswer`), and the frame it stands in for would have said it.
-    // The demanding `relate` frame therefore reads the cut as EVIDENCE and may
-    // publish it to `relation`, which is the memo poisoning the returned
-    // protocol exists to prevent. Closing it means giving this route a way to
-    // report the assumption, and that suppresses memo writes that happen today.
+    // do, so both raise `rel_assumed` next to `rel_guard_tripped`. This route
+    // returns a bare `bool` to `isAssignableInner` and so cannot say
+    // `.assumed_yes` itself (see `RelAnswer`), but it does not have to: it runs
+    // INSIDE the demanding `relate` frame's walk, and `rel_assumed` is the
+    // half of the protocol that carries exactly this — what the bare-`bool`
+    // descendants assumed — back to the frame that cleared it (see
+    // `Checker.rel_assumed`). `relate` folds the field into its own
+    // `RelAnswer`, so a verdict resting on a cut here is withheld from the
+    // `relation` memo instead of being published as evidence. Raising only
+    // `rel_guard_tripped` was the memo poisoning the returned protocol exists
+    // to prevent; the two variance consumers of `rel_guard_tripped`
+    // (`measureOneVariance`, `checkVarianceAnnotations`) are unaffected, and
+    // `measuredVariances` already saves and restores `rel_assumed` around its
+    // whole measurement.
     if (c.rel_id_depth >= max_relation_depth) {
         c.rel_guard_tripped = true;
+        c.rel_assumed = true;
         return true;
     }
     const ssrc = if (sv.ref != 0) sv.ref else (c.refFacetOf(s, sk) orelse 0);
@@ -2504,6 +2511,7 @@ fn lazyRefRelate(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: types.Ki
     };
     if (ssrc != 0 and (c.relIdDeeplyNested(true) or c.relIdDeeplyNested(false))) {
         c.rel_guard_tripped = true;
+        c.rel_assumed = true;
         return true;
     }
     return try lazyStructural(c, sv, tv);
