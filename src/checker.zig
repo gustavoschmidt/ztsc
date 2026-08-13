@@ -3437,6 +3437,7 @@ pub const Checker = struct {
     pub const propOfType = props_zig.propOfType;
     pub const propOfTypeEx = props_zig.propOfTypeEx;
     pub const objectInterfaceProp = props_zig.objectInterfaceProp;
+    pub const arrayApparentObject = props_zig.arrayApparentObject;
     pub const makePromise = props_zig.makePromise;
     pub const isPromiseLikeOf = props_zig.isPromiseLikeOf;
     pub const awaitedType = props_zig.awaitedType;

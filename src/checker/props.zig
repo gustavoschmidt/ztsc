@@ -549,6 +549,15 @@ pub fn objectInterfaceProp(c: *Checker, name: Atom) Error!?types.Prop {
 /// the interface is missing, so member access degrades to TS2339 exactly
 /// as it did lib-free.
 fn primitiveInterfaceProp(c: *Checker, t: TypeId, name: Atom) Error!?types.Prop {
+    const iface = (try primitiveInterfaceOf(c, t)) orelse return null;
+    return c.propOfType(iface, name);
+}
+
+/// The lib interface `t` borrows its apparent members from, RESOLVED to an
+/// object type: `T[]` and `[A, B]` -> `Array<…>`, `"x"` -> `String`, and so on.
+/// Null when no lib is loaded, the interface is missing, or `t` is not one of
+/// the bridged kinds — every caller then degrades exactly as it did lib-free.
+fn primitiveInterfaceOf(c: *Checker, t: TypeId) Error!?TypeId {
     const s = &c.ts;
     var iface_atom: Atom = 0;
     var elem: TypeId = types.no_type;
@@ -573,7 +582,19 @@ fn primitiveInterfaceProp(c: *Checker, t: TypeId, name: Atom) Error!?types.Prop 
     if (!c.symFlags(sym).interface) return null;
     const args: []const TypeId = if (has_elem) &.{elem} else &.{};
     const ref = try s.makeRef(sym, args);
-    return c.propOfType(try c.resolveStructural(ref), name);
+    return try c.resolveStructural(ref);
+}
+
+/// The apparent object type of an ARRAY or TUPLE — the `Array<T>` instance
+/// whose members tsc's `getUnmatchedProperty` scans when such a type is the
+/// TARGET of a relation. Null for anything else, and when no lib is loaded.
+pub fn arrayApparentObject(c: *Checker, t: TypeId) Error!?TypeId {
+    switch (c.ts.kind(t)) {
+        .array, .tuple => {},
+        else => return null,
+    }
+    const iface = (try primitiveInterfaceOf(c, t)) orelse return null;
+    return if (c.ts.kind(iface) == .object) iface else null;
 }
 
 // Promises, `await`, and generator yield types live in `iteration.zig`, next

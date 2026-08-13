@@ -162,7 +162,12 @@ pub fn chainText(c: *Checker, s0: TypeId, t0: TypeId) Error![]const u8 {
         }
         if (dup) break;
         try seen.append(c.scratch(), key);
-        const found = (try findStep(c, s, t, levels.items.len)) orelse break;
+        // The missing-property tail is suppressed at the TOP level: there the
+        // caller has already morphed the headline into TS2741/TS2739
+        // (`tryReportMissingProps`), so repeating it would print the same
+        // sentence twice. `reachesUnmatchedProperty` is the same descent asked
+        // with the tail left in.
+        const found = (try findStep(c, s, t, levels.items.len > 0)) orelse break;
         switch (found) {
             .tail => |tl| {
                 tail = tl;
@@ -187,13 +192,69 @@ fn stepTo(kind: StepKind, s: TypeId, t: TypeId) Found {
     return .{ .step = .{ .step = .{ .kind = kind }, .s = s, .t = t } };
 }
 
+/// Does the descent land on an UNMATCHED PROPERTY at the top level — i.e. is
+/// this pair one tsc would have rejected from inside `propertiesRelatedTo`,
+/// with `reportUnmatchedProperty` replacing the head message?
+///
+/// tsc's `overrideNextErrorInfo` swallows exactly ONE enclosing message, so the
+/// head survives whenever the relation descended a level between it and
+/// `propertiesRelatedTo`. Two things count as a level, and both are visible in
+/// tsgo's output as a missing-property sentence naming a type OTHER than the
+/// head's source:
+///
+///   - the pre-property gauntlet `findStep` already walks — two references to
+///     the same generic compared by argument, a union constituent, an
+///     intersection member, an array/tuple boundary;
+///   - a step onto the source's stand-in: the base CONSTRAINT of a type
+///     variable (`takeObj(x: T)` says `Property 'id' is missing in type
+///     '{ a: number; }'` under a TS2345 head) and `getSingleBaseForNonAugmenting
+///     Subtype`, which swaps a class/interface that declares nothing of its own
+///     for its single base (`takeOpt(str: Str)` says `… in type 'Base<string>'`).
+///
+/// ztsc has no descent for the second kind — `resolveStructural` folds a
+/// constraint, and heritage is folded into the derived shape at build time — so
+/// `sourceIsItsOwnStandIn` declines the refinement for the source shapes where
+/// tsc would have taken that step, rather than guess which name tsc printed.
+pub fn reachesUnmatchedProperty(c: *Checker, s0: TypeId, t0: TypeId) Error!bool {
+    if (!sourceIsItsOwnStandIn(c, s0)) return false;
+    const found = (try findStep(c, s0, t0, true)) orelse return false;
+    return switch (found) {
+        .tail => |tl| tl == .missing,
+        .step => false,
+    };
+}
+
+/// Is `s` a type tsc would relate under its OWN name — i.e. neither a type
+/// variable (whose apparent type stands in) nor a named class/interface
+/// reference (whose single base may stand in)? An intersection qualifies only
+/// when every constituent does, since its apparent type is taken as a whole.
+fn sourceIsItsOwnStandIn(c: *Checker, s: TypeId) bool {
+    const k = c.ts.kind(s);
+    switch (k) {
+        .type_param, .index_access, .conditional, .keyof_op, .this_type, .infer_var => return false,
+        .intersection => {
+            for (c.ts.members(s)) |m| {
+                if (!sourceIsItsOwnStandIn(c, m)) return false;
+            }
+            return true;
+        },
+        else => {},
+    }
+    // A named class/interface: `getSingleBaseForNonAugmentingSubtype` may swap
+    // it for its base, and ztsc cannot see that it did.
+    return c.refFacetOf(s, k) == null;
+}
+
 /// The single most informative sub-relation of a pair already known to fail,
 /// or null when nothing below it explains the failure (the pair is the leaf).
+///
+/// `missing_ok` admits the missing-property TAIL; `chainText` clears it at the
+/// top level, where the headline already carries that sentence.
 ///
 /// Every branch is guarded by an `isAssignable` call on the sub-pair, so a
 /// step is only ever taken where ztsc's own relation says "no" — the chain can
 /// never claim a cause ztsc does not hold.
-fn findStep(c: *Checker, s0: TypeId, t0: TypeId, depth: usize) Error!?Found {
+fn findStep(c: *Checker, s0: TypeId, t0: TypeId, missing_ok: bool) Error!?Found {
     const store = &c.ts;
 
     // Two references to the same generic: tsc relates them by ARGUMENTS, and
@@ -293,7 +354,7 @@ fn findStep(c: *Checker, s0: TypeId, t0: TypeId, depth: usize) Error!?Found {
     // tsc's `structuredTypeRelatedTo` order, and the order the messages must
     // nest in.
     if (store.kind(t) == .object) {
-        if (try propertyStep(c, s0, s, t, depth)) |f| return f;
+        if (try propertyStep(c, s0, s, t, missing_ok)) |f| return f;
     }
 
     if (try signatureStep(c, s, t, false)) |f| return f;
@@ -348,7 +409,7 @@ fn bestUnionMatch(c: *Checker, s: TypeId, t: TypeId) Error!?TypeId {
 
 /// A missing required property (the chain's tail) or the first incompatible
 /// one (a `.property` step).
-fn propertyStep(c: *Checker, s0: TypeId, s: TypeId, t: TypeId, depth: usize) Error!?Found {
+fn propertyStep(c: *Checker, s0: TypeId, s: TypeId, t: TypeId, missing_ok: bool) Error!?Found {
     const store = &c.ts;
     const objecty = switch (store.kind(s)) {
         .object, .intersection => true,
@@ -358,10 +419,7 @@ fn propertyStep(c: *Checker, s0: TypeId, s: TypeId, t: TypeId, depth: usize) Err
     const n = store.objectPropCount(t);
 
     // tsc checks for an UNMATCHED property before relating any matched one.
-    // Skipped at depth 0: there the caller has already morphed the headline
-    // into TS2741/TS2739 (`tryReportMissingProps`), so repeating it would
-    // print the same sentence twice.
-    if (depth > 0) {
+    if (missing_ok) {
         var missing: std.ArrayList(Atom) = .empty;
         for (0..n) |i| {
             const tp = store.objectProp(t, @intCast(i));
@@ -414,9 +472,10 @@ fn atomTextLess(c: *Checker, a: Atom, b: Atom) bool {
 }
 
 /// The single call (or construct) signature of `ty`, when it has exactly one.
-/// tsc only elaborates the 1-vs-1 case; with overload sets it cannot say which
-/// signature was meant, and neither can we.
-fn singleSig(c: *Checker, ty: TypeId, is_ctor: bool) ?TypeId {
+/// tsc's `getSingleCallSignature` — it only elaborates the 1-vs-1 case; with
+/// overload sets it cannot say which signature was meant, and neither can we.
+/// `ty` must already be `resolveStructural`ed.
+pub fn singleSig(c: *Checker, ty: TypeId, is_ctor: bool) ?TypeId {
     const store = &c.ts;
     switch (store.kind(ty)) {
         .function => return if (is_ctor) null else ty,

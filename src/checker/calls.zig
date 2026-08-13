@@ -1376,20 +1376,13 @@ fn checkCallArgumentsAnchored(c: *Checker, node: Node, sig: TypeId, arg_nodes: [
             if (!try c.elaborateCallbackError(an, at, pt) and
                 !try c.elaborateLiteralError(an, at, pt))
             {
-                // NOT refined to tsc's TS2741/2739/2740 missing-property
-                // headline, which tsc does apply in argument position too
-                // (verified against the oracle for one, two and six missing
-                // properties). `tryReportMissingProps` decides that from the
-                // pair alone, while tsc only reaches the unmatched-property
-                // branch when the relation got as far as comparing properties;
-                // a pair that failed EARLIER keeps the TS2345 head.
-                // assignability/094 (`Opt<T>`'s base type argument) and
-                // narrowing/085 (a `T & string` source) are both that shape, and
-                // both flip to a wrong code when the refinement is applied here.
-                // Outline pays two keys for it (shares.tsx:72,
-                // templates.tsx:270 — right position, TS2345 where tsgo says
-                // TS2740); the refinement belongs where the relation knows why
-                // it failed, i.e. next to `reportNotAssignable`'s 2322 arm.
+                // `reportNotAssignable` owns the TS2741/2739/2740
+                // missing-property refinement, which tsc applies in argument
+                // position too; its 2345 arm gates it on `elaborate`'s descent
+                // reaching an unmatched property, so a pair that failed
+                // EARLIER in the walk — assignability/094 (`Opt<T>`'s base
+                // type argument) and narrowing/085 (a `T & string` source) are
+                // both that shape — keeps the TS2345 head.
                 try c.reportNotAssignable(2345, at, pt, argErrorSpan(c, an));
             }
             noteArgBlame(c, anchor_out, before, c.nodeSpan(an), argErrorSpan(c, an));

@@ -354,7 +354,73 @@ pub fn elaborateLiteralError(c: *Checker, expr_node0: Node, src_t: TypeId, targe
             }
             return reported;
         },
+        .arrow_fn => return elaborateArrowBody(c, expr_node, src_t, rt),
         else => return false,
+    }
+}
+
+/// tsc's `elaborateArrowFunction`: a concise-body arrow written with no
+/// parameter annotations is blamed at its RETURN EXPRESSION rather than at the
+/// arrow itself — and that expression is elaborated in turn, so
+/// `{ m: () => ({ a: '' }) }` lands on the inner `a` rather than on `m`.
+///
+/// The bails are tsc's, in tsc's order: a block body (nothing to blame), any
+/// annotated parameter (the writer stated the signature, so the signature is
+/// the error), a source that is not a single call signature, and a target with
+/// no call signature at all. Measured against tsgo 7.0.2: `(n: number) => 1`
+/// and `() => { return 1 }` both keep the whole-arrow span, while `() => 1`
+/// moves to the `1`.
+fn elaborateArrowBody(c: *Checker, node: Node, src_t: TypeId, rt: TypeId) Error!bool {
+    const body = c.tree.nodeData(node).rhs;
+    if (body == null_node or c.nodeTag(body) == .block) return false;
+    if (anyParamAnnotated(c, node)) return false;
+    const s_sig = elaborate.singleSig(c, try c.resolveStructural(src_t), false) orelse return false;
+    const t_ret = (try callSigReturnUnion(c, rt)) orelse return false;
+    const s_ret = c.ts.fnReturn(s_sig);
+    if (try c.isAssignable(s_ret, t_ret)) return false;
+    if (try elaborateLiteralError(c, body, s_ret, t_ret)) return true;
+    // A re-check of this same arrow must still answer "elaborated" (see
+    // `diagAlreadyFiled`); the anchor is the body, which is where this arm
+    // reports.
+    if (!c.diagAlreadyFiled(2322, c.nodeSpan(body))) {
+        try c.reportNotAssignable(2322, s_ret, t_ret, c.nodeSpan(body));
+    }
+    return true;
+}
+
+/// Does any parameter of the function-like `node` carry a type annotation?
+/// tsc's `some(node.parameters, hasType)` — the `elaborateArrowFunction` bail.
+fn anyParamAnnotated(c: *Checker, node: Node) bool {
+    const proto = c.tree.extraData(ast.FnProto, c.tree.nodeData(node).lhs);
+    for (c.tree.extraRange(proto.params_start, proto.params_end)) |p| {
+        if (p == null_node) continue;
+        const pd = c.tree.nodeData(p);
+        const ann: Node = switch (c.nodeTag(p)) {
+            .param => pd.rhs,
+            .param_full => c.tree.extraData(ast.ParamFull, pd.rhs).type_ann,
+            else => 0,
+        };
+        if (ann != 0) return true;
+    }
+    return false;
+}
+
+/// tsc's `getUnionType(map(getSignaturesOfType(target, Call), getReturnTypeOfSignature))`:
+/// the type an arrow's concise body is elaborated against. Null when the
+/// target has no call signature. `rt` must already be `resolveStructural`ed.
+fn callSigReturnUnion(c: *Checker, rt: TypeId) Error!?TypeId {
+    switch (c.ts.kind(rt)) {
+        .function => return c.ts.fnReturn(rt),
+        .object => {
+            const n = c.ts.objectCallSigCount(rt);
+            if (n == 0) return null;
+            var acc = c.ts.fnReturn(c.ts.objectCallSig(rt, 0));
+            for (1..n) |i| {
+                acc = try c.makeUnion2(acc, c.ts.fnReturn(c.ts.objectCallSig(rt, @intCast(i))));
+            }
+            return acc;
+        },
+        else => return null,
     }
 }
 
@@ -693,6 +759,44 @@ pub fn callbackParamsCompatible(c: *Checker, s: TypeId, t: TypeId) Error!bool {
     return true;
 }
 
+/// Required properties of the object `rt` that `rs` has not got, appended to
+/// `out` in the target's stored order (the caller sorts).
+fn collectMissingProps(c: *Checker, rs: TypeId, rt: TypeId, out: *std.ArrayList(Atom)) Error!void {
+    for (0..c.ts.objectPropCount(rt)) |i| {
+        const tp = c.ts.objectProp(rt, @intCast(i));
+        if (tp.optional()) continue;
+        // A source index signature does not supply a named property (see
+        // structuralAssignable): keep the missing-property diagnostic in
+        // step with the relation so `{ [k: string]: any }` → `Date` reports
+        // the missing Date members (TS2740), not a bare TS2322.
+        //
+        // The apparent global-`Object` members DO count as present, for the
+        // same reason (`relationSrcProp`): a source that fails on its own
+        // missing `own` must not be reported as missing `toString` as well,
+        // which is the difference between tsc's TS2741 (one name) and a
+        // TS2739 listing two.
+        if ((try assign.relationSrcProp(c, rs, tp.name)) == null) {
+            try out.append(c.scratch(), tp.name);
+        }
+    }
+}
+
+/// The fixed element POSITIONS of the tuple `rt` that `rs` has not got, named
+/// as tsc names them — `'0'`, `'1'`, … A rest or optional element is not
+/// required, and neither is anything past the first rest.
+fn collectMissingTupleIndices(c: *Checker, rs: TypeId, rt: TypeId, out: *std.ArrayList(Atom)) Error!void {
+    var buf: [24]u8 = undefined;
+    for (0..c.ts.tupleLen(rt)) |i| {
+        const e = c.ts.tupleElem(rt, @intCast(i));
+        if (e.rest()) break;
+        if (e.optional()) continue;
+        const name = try c.internText(std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable);
+        if ((try assign.relationSrcProp(c, rs, name)) == null) {
+            try out.append(c.scratch(), name);
+        }
+    }
+}
+
 /// Missing-property refinement: when `src` is object-y and `target` is an
 /// object type with required properties absent from `src`, report the
 /// specific missing-property error (TS2741 for one, TS2739 for several) at
@@ -712,25 +816,29 @@ pub fn tryReportMissingProps(c: *Checker, src_t: TypeId, target: TypeId, span: S
         rt = try c.classConstructType(c.ts.classSymbol(target));
         if (c.ts.kind(rs) == .class_value) rs = try c.classConstructType(c.ts.classSymbol(rs));
     }
-    if (!isSourceObjecty(c.ts.kind(rs)) or c.ts.kind(rt) != .object) return false;
+    if (!isSourceObjecty(c.ts.kind(rs))) return false;
     var missing: std.ArrayList(Atom) = .empty;
     defer missing.deinit(c.scratch());
-    for (0..c.ts.objectPropCount(rt)) |i| {
-        const tp = c.ts.objectProp(rt, @intCast(i));
-        if (tp.optional()) continue;
-        // A source index signature does not supply a named property (see
-        // structuralAssignable): keep the missing-property diagnostic in
-        // step with the relation so `{ [k: string]: any }` → `Date` reports
-        // the missing Date members (TS2740), not a bare TS2322.
+    switch (c.ts.kind(rt)) {
+        .object => try collectMissingProps(c, rs, rt, &missing),
+        // tsc relates an ARRAY-LIKE target through its apparent type, the
+        // global `Array<T>` interface, so a plain object source is missing
+        // every one of its members: `let a: any[] = {x: 1}` is TS2740, not a
+        // bare TS2322. (A FUNCTION source is not — `isSourceObjecty` already
+        // excludes it, which is tsc's `shouldReportUnmatchedPropertyError`
+        // bailing on a source that is all signature and no property.)
         //
-        // The apparent global-`Object` members DO count as present, for the
-        // same reason (`relationSrcProp`): a source that fails on its own
-        // missing `own` must not be reported as missing `toString` as well,
-        // which is the difference between tsc's TS2741 (one name) and a
-        // TS2739 listing two.
-        if ((try assign.relationSrcProp(c, rs, tp.name)) == null) {
-            try missing.append(c.scratch(), tp.name);
-        }
+        // A TUPLE requires each fixed element position by NAME on top of
+        // those, and for an array-like source that is the whole story:
+        // `interface StrNum extends Array<string|number> { 0: string; 1:
+        // number; length: 2 }` against `[number, number, number]` is TS2741
+        // on '2'.
+        .array, .tuple => {
+            const app = (try c.arrayApparentObject(rt)) orelse return false;
+            try collectMissingProps(c, rs, app, &missing);
+            if (c.ts.kind(rt) == .tuple) try collectMissingTupleIndices(c, rs, rt, &missing);
+        },
+        else => return false,
     }
     // Emit the missing names in name-*text* order. They were gathered in
     // the target's stored (atom-sorted) prop order, which varies across
@@ -780,9 +888,24 @@ pub fn reportNotAssignable(c: *Checker, code: u16, src_t: TypeId, target: TypeId
             return;
         }
     }
-    // Missing-property refinement (tsc: 2739 / 2741 instead of 2322).
-    if (code == 2322) {
+    // Missing-property refinement (tsc: 2739 / 2741 instead of 2322 / 2345).
+    //
+    // tsc reaches `reportUnmatchedProperty` from inside `propertiesRelatedTo`,
+    // i.e. only once the relation got as far as comparing MEMBERS, and there
+    // `shouldSkipElaboration` makes that sentence REPLACE the head message —
+    // in argument position too, where the head would have been TS2345.
+    // `tryReportMissingProps` decides from the type pair alone, which at an
+    // assignment agrees with tsc closely enough to stand on its own, but in
+    // argument position does not: pairs that failed EARLIER in the walk (a
+    // same-reference variance comparison, an intersection member) also present
+    // as "target has properties the source lacks", and tsc keeps the TS2345
+    // head for those. So the argument arm asks `elaborate`'s descent — the
+    // same pre-property gauntlet the relation itself takes — whether the top
+    // level really lands on an unmatched property.
+    if (code == 2322 or (code == 2345 and try elaborate.reachesUnmatchedProperty(c, src_t, target))) {
         if (try c.tryReportMissingProps(src_t, target, span)) return;
+    }
+    if (code == 2322) {
         // Did-you-mean morph (tsc: TS2820): a string-literal source rejected
         // by a union of string literals with a close member. tsc's
         // getSuggestedTypeForNonexistentStringLiteralType.
