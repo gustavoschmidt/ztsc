@@ -72,8 +72,9 @@ pub fn joinNormalize(alloc: Allocator, dir: []const u8, rest: []const u8) Error!
 /// The Node.js built-in modules tsc resolves via an auto-included `@types/node`
 /// (its `declare module "fs"` / `declare module "node:fs"` blocks). `node:`-
 /// prefixed specifiers are always built-ins; the bare names cover the common
-/// unprefixed imports. Used by the driver to pull `@types/node` into the program
-/// on demand so those ambient blocks register and the import resolves.
+/// unprefixed imports. Used by `modules.Discovery.discoverNodeTypes` — both
+/// program builders — to pull `@types/node` into the program on demand so those
+/// ambient blocks register and the import resolves.
 pub fn isNodeBuiltin(spec: []const u8) bool {
     if (std.mem.startsWith(u8, spec, "node:")) return true;
     const builtins = [_][]const u8{

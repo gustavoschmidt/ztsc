@@ -1,7 +1,7 @@
 //! The program: module graph, cross-file symbol linking, global merge.
 //!
 //! This is where a program is BUILT: the two ways in (the parallel driver in
-//! main.zig calls `link` directly; `buildProgram` is the serial wavefront the
+//! driver.zig calls `link` directly; `buildProgram` is the serial wavefront the
 //! tests and tools use) and the linker underneath them. The data contract they
 //! fill in — `FileId`, `Program`, `ProgFile`, `Target` — is program.zig, and
 //! re-exported here, so `modules.Program` still names it. Specifier resolution
@@ -104,20 +104,23 @@ pub const AmbientExport = program.AmbientExport;
 /// `entries` (paths relative to `dir`), then link. Everything lives in
 /// `arena`.
 ///
-/// Tests and tools only — the CLI runs driver.zig's parallel pipeline. The
-/// per-FILE half of discovery is now literally the same code in both
-/// (`Discovery` below), which is the half that had drifted. What is still
-/// two implementations is the SCHEDULING half, and deliberately so: this walks
-/// one pending list in one thread and assigns ids in discovery order, while
-/// the driver front-ends files on a worker pool and re-derives the ids from
-/// the import graph afterwards.
+/// Tests and tools only — the CLI runs driver.zig's parallel pipeline. Every
+/// decision about WHICH files a program contains is now literally the same
+/// code in both: the per-FILE half of discovery, the seeding of the lib shards
+/// and of the (canonicalized) entry paths, and the `@types/node`
+/// auto-injection — all `Discovery` below.
 ///
-/// TODO: the remaining shared-by-convention parts are the seeding of the lib
-/// shards and the entry paths (which this does not canonicalize, and which
-/// therefore cannot see a root reached twice through a symlink) and the
-/// `@types/node` auto-injection (which this does not do at all). A test-only
-/// program built from a config that needs either will differ from the CLI's;
-/// fold them in here, not in a third copy.
+/// What is still two implementations is the SCHEDULING half, and deliberately
+/// so: this walks one pending list in one thread and assigns ids in discovery
+/// order, while the driver front-ends files on a worker pool and re-derives
+/// the ids from the import graph afterwards.
+///
+/// TODO: file ORDER is the last shared-by-convention piece. The driver seeds
+/// the auto-included `@types/*` roots as a second BFS wave and renumbers
+/// everything by the import graph; this assigns ids in pending order and has
+/// no wave split, so a program with a `declare global` merge can still see a
+/// different last-writer here than the CLI does. Sharing it means giving this
+/// path the driver's renumbering, not a third ordering rule.
 pub fn buildProgram(
     arena: Allocator,
     io: Io,
@@ -143,25 +146,10 @@ pub fn buildProgram(
     var pending: std.ArrayList([]const u8) = .empty;
     var failures: std.ArrayList(BuildDiag) = .empty;
 
-    // Inject the selected built-in lib blobs as the first entries (files 0..).
-    var lib_buf: [max_lib_files]LibFile = undefined;
-    for (libs.libFiles(lib_set, &lib_buf)) |lf| {
-        try path_ids.put(scratch, lf.path, @intCast(pending.items.len));
-        try pending.append(scratch, lf.path);
-    }
-
-    for (entries) |e| {
-        const norm = try paths.normalizePath(arena, e);
-        const gop = try path_ids.getOrPut(scratch, norm);
-        if (!gop.found_existing) {
-            gop.value_ptr.* = @intCast(files.items.len + pending.items.len);
-            try pending.append(scratch, norm);
-        }
-    }
-
-    // The per-file half of discovery, shared verbatim with the parallel
-    // driver. `pending` IS the discovery order here, so it doubles as the
-    // shared `paths` list.
+    // Discovery, shared verbatim with the parallel driver: the lib/root
+    // seeding, the per-file specifier resolution, and the auto-injections.
+    // `pending` IS the discovery order here, so it doubles as the shared
+    // `paths` list.
     const disco: Discovery = .{
         .arena = arena,
         .store = scratch,
@@ -175,7 +163,13 @@ pub fn buildProgram(
         .path_ids = &path_ids,
     };
 
+    try disco.seedLibs(lib_set);
+    for (entries) |e| _ = try disco.seedEntry(e);
+
     var jsx_runtime_fid: FileId = no_file;
+    // Set once `@types/node` is in the program; until then every file that
+    // imports a Node built-in asks for it (see `discoverNodeTypes`).
+    var node_types_fid: ?FileId = null;
     var next: usize = 0;
     while (next < pending.items.len) : (next += 1) {
         const path = pending.items[next];
@@ -227,6 +221,10 @@ pub fn buildProgram(
         var spec_files: std.ArrayList(FileId) = .empty;
         var seen: std.AutoHashMapUnmanaged(Atom, void) = .empty;
         try disco.fileSpecs(path, bound, &seen, &spec_atoms, &spec_files);
+        // Pull `@types/node` in on the first Node built-in import, exactly as
+        // the CLI driver does, so its ambient `declare module "fs"` blocks
+        // register and those specifiers resolve.
+        if (node_types_fid == null) node_types_fid = try disco.discoverNodeTypes(path, bound);
         sortSpecPairs(spec_atoms.items, spec_files.items);
 
         try files.append(arena, .{
@@ -2315,6 +2313,32 @@ pub const Discovery = struct {
     /// Path -> file id, over the very same strings `paths` holds.
     path_ids: *std.StringHashMapUnmanaged(FileId),
 
+    /// Seed the selected built-in lib blobs as the first files (ids 0..).
+    /// Their synthetic paths carry the embedded sources (`libs.libSourceFor`),
+    /// which is how both front ends load them, and their top-level decls become
+    /// the program globals. Empty under `--noLib` / `lib: []`. Must run before
+    /// any other seeding: the lib shards own the ids from 0 up.
+    pub fn seedLibs(d: *const Discovery, lib_set: LibSet) !void {
+        var buf: [max_lib_files]LibFile = undefined;
+        for (libs.libFiles(lib_set, &buf)) |lf| _ = try d.fileFor(lf.path);
+    }
+
+    /// Seed one program root and return its file id (the id it already has if
+    /// this path was seeded before).
+    ///
+    /// A root under `node_modules` — in practice the auto-included `@types/*`
+    /// ambient roots, which pnpm exposes as symlinks into its store — is keyed
+    /// by its canonical path, the same identity the module resolver gives the
+    /// very same file when an `import` reaches it. Without that step
+    /// `node_modules/@types/react/index.d.ts` and the store path behind the
+    /// symlink are two files with two symbol universes. Outside `node_modules`
+    /// `canonicalPath` is a no-op, so project roots keep the path the user
+    /// typed (and pay no realpath syscall).
+    pub fn seedEntry(d: *const Discovery, path: []const u8) !FileId {
+        const norm = try paths.normalizePath(d.arena, path);
+        return try d.fileFor(try d.rcache.canonicalPath(d.io, d.scratch, d.dir, norm));
+    }
+
     /// The file id of an already-resolved path, discovering it (appending to
     /// `paths`) if this is its first mention.
     pub fn fileFor(d: *const Discovery, resolved: []const u8) !FileId {
@@ -2441,6 +2465,24 @@ pub const Discovery = struct {
         return try d.fileFor(resolved);
     }
 
+    /// Auto-include `@types/node` on account of `bound`'s imports, like tsc's
+    /// automatic `@types` inclusion: a Node built-in specifier (`node:fs`,
+    /// `path`, …) is answered by `@types/node`'s ambient `declare module "fs"`
+    /// / `declare module "node:fs"` blocks, which only register once that
+    /// package is a program input. Null when the file imports no built-in, or
+    /// when `@types/node` is not installed — the caller keeps asking on later
+    /// files, so a program that installs it later in the graph still gets it.
+    ///
+    /// Only the FIRST built-in import of the file is tried: one probe per file
+    /// until the package is found, none afterwards (the caller stops asking).
+    pub fn discoverNodeTypes(d: *const Discovery, importer: []const u8, bound: *const Bind) !?FileId {
+        for (bound.imports) |rec| {
+            if (!paths.isNodeBuiltin(d.interner.lookup(d.io, rec.module))) continue;
+            return try d.discoverModule(importer, "@types/node");
+        }
+        return null;
+    }
+
     /// Discover a triple-slash reference target as a program input. Unlike
     /// `resolveSpec` it records no import-specifier binding, and resolution
     /// goes through `ResolveCache.resolveRef`, so the target is keyed by its
@@ -2467,4 +2509,135 @@ pub fn sortSpecPairs(atoms: []Atom, files: []FileId) void {
             std.mem.swap(FileId, &files[j - 1], &files[j]);
         }
     }
+}
+
+// ===========================================================================
+// tests: the seeding both program builders share
+// ===========================================================================
+
+const testing = std.testing;
+
+/// One `Discovery` over throwaway state, for the seeding tests: everything in
+/// one arena, since a test's scratch never has to outlive it.
+fn testDiscovery(
+    alloc: Allocator,
+    io: Io,
+    dir: Io.Dir,
+    interner: *Interner,
+    rcache: *ResolveCache,
+    file_paths: *std.ArrayList([]const u8),
+    path_ids: *std.StringHashMapUnmanaged(FileId),
+) Discovery {
+    return .{
+        .arena = alloc,
+        .store = alloc,
+        .seen_alloc = alloc,
+        .scratch = alloc,
+        .io = io,
+        .dir = dir,
+        .interner = interner,
+        .rcache = rcache,
+        .paths = file_paths,
+        .path_ids = path_ids,
+    };
+}
+
+// The lib shards own the file ids from 0 up, and the roots follow them — the
+// contract `buildProgram` and driver.zig's `seedRoots` both rely on (the
+// driver hands `lib_units.len` to the renumbering as the first BFS wave).
+test "Discovery.seedLibs: the lib shards are files 0.., roots follow" {
+    const io = testing.io;
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const alloc = arena_inst.allocator();
+
+    var interner = Interner.init();
+    defer interner.deinit(testing.allocator);
+    var rcache = ResolveCache.init(alloc, true, .{});
+    var file_paths: std.ArrayList([]const u8) = .empty;
+    var path_ids: std.StringHashMapUnmanaged(FileId) = .empty;
+    const disco = testDiscovery(alloc, io, Io.Dir.cwd(), &interner, &rcache, &file_paths, &path_ids);
+
+    var buf: [max_lib_files]LibFile = undefined;
+    const lib_list = libs.libFiles(.es_only, &buf);
+    try disco.seedLibs(.es_only);
+    try testing.expectEqual(lib_list.len, file_paths.items.len);
+    for (lib_list, 0..) |lf, i| try testing.expectEqualStrings(lf.path, file_paths.items[i]);
+
+    // A root outside `node_modules` keeps the path the user typed (normalized),
+    // and takes the next id. Seeding it twice is one file.
+    try testing.expectEqual(@as(FileId, @intCast(lib_list.len)), try disco.seedEntry("./src/main.ts"));
+    try testing.expectEqual(@as(FileId, @intCast(lib_list.len)), try disco.seedEntry("src/main.ts"));
+    try testing.expectEqualStrings("src/main.ts", file_paths.items[lib_list.len]);
+}
+
+// Roots are canonicalized, so a root reached through a `node_modules` symlink
+// and the store path behind it are ONE file rather than two files with two
+// symbol universes. The driver always did this; the serial `buildProgram` did
+// not until both went through `seedEntry`.
+test "Discovery.seedEntry: a symlinked node_modules root is one file" {
+    const io = testing.io;
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const alloc = arena_inst.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const d = tmp.dir;
+    try d.createDirPath(io, "node_modules/.pnpm/@types+pkg@1/node_modules/@types/pkg");
+    try d.writeFile(io, .{
+        .sub_path = "node_modules/.pnpm/@types+pkg@1/node_modules/@types/pkg/index.d.ts",
+        .data = "export declare const x: number;\n",
+    });
+    try d.createDirPath(io, "node_modules/@types");
+    try d.symLink(io, "../.pnpm/@types+pkg@1/node_modules/@types/pkg", "node_modules/@types/pkg", .{ .is_directory = true });
+
+    var interner = Interner.init();
+    defer interner.deinit(testing.allocator);
+    var rcache = ResolveCache.init(alloc, true, .{});
+    var file_paths: std.ArrayList([]const u8) = .empty;
+    var path_ids: std.StringHashMapUnmanaged(FileId) = .empty;
+    const disco = testDiscovery(alloc, io, d, &interner, &rcache, &file_paths, &path_ids);
+
+    const canonical = "node_modules/.pnpm/@types+pkg@1/node_modules/@types/pkg/index.d.ts";
+    const via_link = try disco.seedEntry("node_modules/@types/pkg/index.d.ts");
+    const via_store = try disco.seedEntry(canonical);
+    try testing.expectEqual(via_link, via_store);
+    try testing.expectEqual(@as(usize, 1), file_paths.items.len);
+    try testing.expectEqualStrings(canonical, file_paths.items[0]);
+}
+
+// A Node built-in import pulls `@types/node` into the program — the CLI's
+// behavior, which the serial builder now gets from the same
+// `Discovery.discoverNodeTypes`. Without it the ambient `declare module "fs"`
+// never registers and the import is unresolved.
+test "buildProgram: a node builtin import auto-injects @types/node" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var arena_inst = std.heap.ArenaAllocator.init(gpa);
+    defer arena_inst.deinit();
+    const alloc = arena_inst.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const d = tmp.dir;
+    try d.createDirPath(io, "node_modules/@types/node");
+    try d.writeFile(io, .{
+        .sub_path = "node_modules/@types/node/index.d.ts",
+        .data = "declare module \"node:fs\" { export const readFileSync: () => string; }\n",
+    });
+    try d.writeFile(io, .{
+        .sub_path = "entry.ts",
+        .data = "import { readFileSync } from \"node:fs\";\nexport const s = readFileSync();\n",
+    });
+
+    var interner = Interner.init();
+    defer interner.deinit(gpa);
+    const br = try buildProgram(alloc, io, gpa, &interner, d, &.{"entry.ts"}, .none, .{}, .{}, null);
+    try testing.expectEqual(@as(usize, 0), br.load_failures.len);
+    try testing.expectEqual(@as(usize, 2), br.program.files.len);
+    try testing.expectEqualStrings("entry.ts", br.program.files[0].path);
+    try testing.expectEqualStrings("node_modules/@types/node/index.d.ts", br.program.files[1].path);
+    // The ambient block answered the import: no unresolved-module diagnostic.
+    for (br.program.links) |fl| try testing.expectEqual(@as(usize, 0), fl.diags.len);
 }
