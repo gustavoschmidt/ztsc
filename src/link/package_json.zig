@@ -144,6 +144,26 @@ pub fn exportsOf(alloc: Allocator, text: []const u8) ?tsconfig.Value {
     };
 }
 
+/// The `imports` value of a `package.json` body — the "private imports" map a
+/// `#specifier` resolves through — or null when it has none / does not parse.
+/// Same literal-key screen as `exportsOf`, for the same reason: no parse (and
+/// no parse graph in the cache arena) for a package that has no such map.
+pub fn importsOf(alloc: Allocator, text: []const u8) ?tsconfig.Value {
+    if (std.mem.indexOfScalar(u8, text, '\\') == null and
+        std.mem.indexOf(u8, text, "\"imports\"") == null) return null;
+    const root = tsconfig.parseJsonc(alloc, text) catch return null;
+    return switch (root) {
+        .object => |ro| ro.get("imports"),
+        else => null,
+    };
+}
+
+/// `package.json` `"name"` field — the package's own name, which it may use to
+/// import itself (Node's "self-reference"; see `resolveSelfName`).
+pub fn packageNameField(text: []const u8) ?[]const u8 {
+    return packageStringField(text, &.{"\"name\""});
+}
+
 /// The TypeScript version ztsc answers `typesVersions` range keys as. It is the
 /// version of the vendored lib and of the pinned oracle (tsgo 7.0.2), so a
 /// package that ships a version-gated declaration set hands ztsc the same set it
