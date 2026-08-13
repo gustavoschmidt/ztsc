@@ -2477,6 +2477,12 @@ pub const Discovery = struct {
     /// until the package is found, none afterwards (the caller stops asking).
     pub fn discoverNodeTypes(d: *const Discovery, importer: []const u8, bound: *const Bind) !?FileId {
         for (bound.imports) |rec| {
+            // A syntactically broken import records no specifier — `import *
+            // from Zero from "./0"`, `import * as while from "foo"`. Atom 0 is
+            // the same "no specifier" sentinel `resolveSpec` skips; passing it
+            // to `lookup` indexes the shard's string list with a wrapped
+            // `0 - 1`.
+            if (rec.module == 0) continue;
             if (!paths.isNodeBuiltin(d.interner.lookup(d.io, rec.module))) continue;
             return try d.discoverModule(importer, "@types/node");
         }
