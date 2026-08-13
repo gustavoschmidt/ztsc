@@ -573,6 +573,59 @@ test "operators: arithmetic, plus, comparisons, 2367" {
     try expectCodes("declare const a: \"x\" | \"y\"; if (a === \"z\") {}", &.{2367});
 }
 
+test "nullish operands: TS18050 and the possibly-nullish codes" {
+    // The literal `null` keyword / identifier `undefined` in a position that
+    // may not hold them: TS18050, in place of the operand diagnostic.
+    try expectCodes("null * 1;", &.{18050});
+    try expectCodes("1 * undefined;", &.{18050});
+    try expectCodes("null * undefined;", &.{ 18050, 18050 });
+    try expectCodes("null - null;", &.{ 18050, 18050 });
+    try expectCodes("null ** 2;", &.{18050});
+    try expectCodes("null << 1;", &.{18050});
+    try expectCodes("null < 1;", &.{18050});
+    try expectCodes("1 > undefined;", &.{18050});
+    try expectCodes("-null;", &.{18050});
+    try expectCodes("+undefined;", &.{18050});
+    try expectCodes("~null;", &.{18050});
+    try expectCodes("let x = 1; x *= null;", &.{18050});
+    try expectCodes("let x = 1; x += null;", &.{18050});
+    try expectCodes("null.foo;", &.{18050});
+    try expectCodes("declare const o: {}; null in o;", &.{18050});
+    // `+` screens its operands only when NEITHER side is string-like.
+    try expectClean("null + \"a\";");
+    try expectClean("\"a\" + null;");
+    try expectClean("let s = \"a\"; s += null;");
+    try expectCodes("null + 1;", &.{18050});
+    try expectCodes("undefined + undefined;", &.{ 18050, 18050 });
+    // TS18050 is a test on the NODE, not the type: anything but the bare
+    // keyword falls back to the "Object is possibly ..." codes.
+    try expectCodes("(null) * 1;", &.{2531});
+    try expectCodes("(undefined) * 1;", &.{2532});
+    try expectCodes("[null][0] * 1;", &.{2531});
+    // A named nullish operand keeps the entity-name codes.
+    try expectCodes("declare const n: number | undefined; n * 1;", &.{18048});
+    try expectCodes("declare const n: number | null; n * 1;", &.{18047});
+    try expectCodes("declare const n: number | null | undefined; n * 1;", &.{18049});
+    try expectCodes("declare const o: { p: number | undefined }; o.p * 1;", &.{18048});
+    try expectCodes("function f(n?: number) { n++; }", &.{18048});
+    // The screen REPLACES the operand diagnostic, and only for the nullish
+    // operand: the other side is still classified on its own.
+    try expectCodes("declare const s: string; null * s;", &.{ 18050, 2363 });
+    try expectCodes("declare const n: number; null * n;", &.{18050});
+    try expectClean("declare const a: any; null + a;");
+    // `void` is not nullish (tsc masks with `Undefined | Null`).
+    try expectCodes("declare const v: void; v * 1;", &.{2362});
+    // Compound assignment classifies the same operands its binary form does.
+    try expectCodes("declare const o: {}; let x = 1; x *= o;", &.{2363});
+    try expectCodes("declare const b: boolean; let y = true; y |= b;", &.{2447});
+    try expectCodes("declare const o: {}; let z = 1; z += o;", &.{2365});
+    // ... on the target's READ type, so a narrowed target is accepted.
+    try expectClean("function f(o: { z?: number }) { if (o.z) { o.z += 1; } }");
+    // Relational operands are named by their base type, not their literal.
+    try expectCodes("declare const l: \"a\"; declare const n: number; l > n;", &.{2365});
+    try expectClean("declare const a: \"x\"; declare const b: \"y\"; a < b;");
+}
+
 test "logical operator result types" {
     try expectClean("declare const s: string; declare const n: number; const r: \"\" | number = s && n;");
     try expectClean("declare const s: string | null; const r: string = s ?? \"fallback\";");

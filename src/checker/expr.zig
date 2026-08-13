@@ -264,7 +264,7 @@ fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         .prefix_unary => return checkPrefixUnary(c, node, ctx),
         .postfix_unary => {
             const ot = try c.checkExprCached(d.lhs, types.no_type);
-            try checkArithmeticOperand(c, ot, d.lhs);
+            try checkArithmeticOperand(c, try checkNonNullType(c, ot, d.lhs), d.lhs);
             return types.number_type;
         },
         .non_null => {
@@ -2247,7 +2247,7 @@ fn checkMemberExpr(c: *Checker, node: Node) Error!TypeId {
 /// short-circuit `undefined`, and `chained` when this `?.` link — or an
 /// earlier one in the object spine — short-circuits on a nullish object. A
 /// non-`?.` continuation whose object is *declared* nullish still reports
-/// TS2532/18047-9 via `checkNullishAccess` (the marker distinguishes the
+/// TS2532/18047-9 via `checkNonNullType` (the marker distinguishes the
 /// chain's own undefined from an inherently-nullable intermediate).
 fn memberChainInner(c: *Checker, node: Node) Error!ChainLink {
     const d = c.tree.nodeData(node);
@@ -2266,7 +2266,7 @@ fn memberChainInner(c: *Checker, node: Node) Error!ChainLink {
         }
         obj_t = try c.nonNullableChain(obj_t);
     } else {
-        obj_t = try checkNullishAccess(c, obj_t, d.lhs, node);
+        obj_t = try checkNonNullType(c, obj_t, d.lhs);
     }
     var pt = try propertyTypeOf(c, obj_t, name, name_tok);
     // Property-path narrowing: peel the whole access spine into a member
@@ -2277,16 +2277,45 @@ fn memberChainInner(c: *Checker, node: Node) Error!ChainLink {
     return .{ .ty = pt, .chained = chained };
 }
 
-/// TS18047/18048/18049 (entity names) / TS2531/2532/2533 (expressions)
-/// for non-optional access on possibly-nullish objects. Returns the
-/// non-nullable remainder to continue checking with.
-fn checkNullishAccess(c: *Checker, t: TypeId, obj_node: Node, access_node: Node) Error!TypeId {
-    const k = c.ts.kind(t);
-    const has_null = c.containsNull(t) or k == .null;
-    const has_undef = c.containsUndefinedish(t) or k == .undefined or k == .void;
+/// tsc's `checkNonNullType` (`checkNonNullTypeWithReporter` +
+/// `reportObjectPossiblyNullOrUndefinedError`): the gate every position that
+/// may not hold `null`/`undefined` runs its operand through — a non-optional
+/// property-access or element-access receiver, an arithmetic / relational /
+/// `in` operand, a `++`/`--` operand. It reports the diagnostic tsc picks for
+/// the SYNTACTIC shape of the operand and returns the non-nullable remainder
+/// to continue checking with:
+///
+///   * the `null` keyword, or the identifier `undefined`
+///       → TS18050 "The value 'null' / 'undefined' cannot be used here."
+///   * any other entity name (`a`, `a.b`, `a?.b`)
+///       → TS18047/18048/18049 "'a' is possibly 'null'/'undefined'/…"
+///   * anything else (a parenthesized expression, a call, `this.x`, …)
+///       → TS2531/2532/2533 "Object is possibly 'null'/'undefined'/…"
+///
+/// TS18050 is a test on the NODE, not on the type: `(null) * 1` and
+/// `[null][0] * 1` carry the very same `null` type and still get TS2531,
+/// because neither node is the keyword itself.
+///
+/// tsc rejects an `unknown` operand here too, ahead of the nullish test
+/// (TS18046 for an entity name, TS2571 otherwise). ztsc does not: over the
+/// TypeScript test suite that arm traded 20 missing keys for 14 spurious
+/// ones, because it turns every place ztsc infers `unknown` and tsc infers
+/// a real type into a NEW diagnostic. It belongs with the inference gaps,
+/// not here.
+///
+/// `void` is deliberately NOT nullish here: tsc masks the operand's falsy
+/// flags with `TypeFlags.Nullable`, which is `Undefined | Null` only, so
+/// `v.toString()` on a `void` receiver reports the missing property rather
+/// than "possibly 'undefined'".
+fn checkNonNullType(c: *Checker, t: TypeId, obj_node: Node) Error!TypeId {
+    const has_null = c.containsNull(t);
+    const has_undef = c.hasUndefinedMember(t);
     if (!has_null and !has_undef) return t;
-    _ = access_node;
     const span = c.nodeSpan(obj_node);
+    if (nullishKeywordOf(c, obj_node)) |kw| {
+        try c.diagFmt(18050, span, "The value '{s}' cannot be used here.", .{kw});
+        return nonNullRemainder(c, t);
+    }
     // tsc's entity-name codes (18047-49) apply to identifier-rooted
     // paths only; a `this`-rooted path gets the expression codes
     // (2531-33, "Object is possibly ...").
@@ -2315,12 +2344,30 @@ fn checkNullishAccess(c: *Checker, t: TypeId, obj_node: Node, access_node: Node)
             try c.diagFmt(2532, span, "Object is possibly 'undefined'.", .{});
         }
     }
-    // tsc's `checkNonNullTypeWithReporter`: once the nullish access has been
-    // reported, a remainder that is `never` (the object was *only* nullish —
-    // `null`, `undefined`, or a reference the flow narrowed to nothing else)
-    // degrades to the error type, not to `never`. That keeps the single
-    // "possibly null/undefined" diagnostic from being doubled by a TS2339 on
-    // `never` from the member lookup that follows.
+    return nonNullRemainder(c, t);
+}
+
+/// The literal `null` keyword / identifier `undefined` that tsc names in
+/// TS18050, or null when the operand is any other expression. Written
+/// syntactically, with no paren-stripping, because that is exactly how tsc
+/// asks (`node.kind === NullKeyword`, `isIdentifier(node) && text ===
+/// "undefined"`).
+fn nullishKeywordOf(c: *Checker, node: Node) ?[]const u8 {
+    return switch (c.nodeTag(node)) {
+        .null_literal => "null",
+        .identifier => if (std.mem.eql(u8, c.tokenText(c.tree.nodeMainToken(node)), "undefined")) "undefined" else null,
+        else => null,
+    };
+}
+
+/// tsc's `checkNonNullTypeWithReporter` tail: once the nullish operand has
+/// been reported, a remainder that is `never` (the operand was *only*
+/// nullish — `null`, `undefined`, or a reference the flow narrowed to
+/// nothing else) degrades to the error type, not to `never`. That keeps the
+/// single "possibly null/undefined" diagnostic from being doubled by a
+/// TS2339 from the member lookup — or a TS2362/TS2365 from the operator —
+/// that follows.
+fn nonNullRemainder(c: *Checker, t: TypeId) Error!TypeId {
     const nn = try c.nonNullable(t);
     if (c.ts.kind(nn) == .never) return types.error_type;
     return nn;
@@ -2360,7 +2407,7 @@ fn propertyTypeOf(c: *Checker, t: TypeId, name: Atom, name_tok: TokenIndex) Erro
         // must NOT arrive here are handled where tsc handles them: a read in
         // unreachable code answers with the DECLARED type (`flowTypeOfKey`),
         // and the empty remainder of a nullish access degrades to the error
-        // type after its own diagnostic (`checkNullishAccess`).
+        // type after its own diagnostic (`checkNonNullType`).
         .never => {
             try c.diagFmt(2339, c.tokSpan(name_tok), "Property '{s}' does not exist on type 'never'.", .{
                 c.atomText(name),
@@ -2530,7 +2577,7 @@ fn indexChainInner(c: *Checker, node: Node, narrow: bool) Error!ChainLink {
         if (c.containsNullish(obj_t)) chained = true;
         obj_t = try c.nonNullableChain(obj_t);
     } else {
-        obj_t = try checkNullishAccess(c, obj_t, d.lhs, node);
+        obj_t = try checkNonNullType(c, obj_t, d.lhs);
     }
     const r = try c.resolveStructural(obj_t);
     const rk = c.ts.kind(r);
@@ -2839,7 +2886,13 @@ fn checkPrefixUnary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             // `++`/`--` and binary arithmetic, never here (oracle-verified
             // clean for string / string|number / {} operands). Emitting it
             // for `.map((v: string | number) => +v)` was a false positive.
+            //
+            // A NULLISH operand is still rejected — tsc runs the operand
+            // through `checkNonNullType` here (TS18050 / TS18047-9 / TS2531-3)
+            // and then computes the result from the ORIGINAL type, so the
+            // screen contributes a diagnostic and nothing else.
             const ot = try c.checkExprCached(d.lhs, types.no_type);
+            _ = try checkNonNullType(c, ot, d.lhs);
             const rl = try c.ts.regularLiteral(ot);
             if (c.ts.kind(rl) == .number_literal) {
                 return c.ts.makeNumberLiteral(-c.ts.numberValue(rl), c.ts.isFreshLiteral(ot));
@@ -2856,12 +2909,13 @@ fn checkPrefixUnary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             return types.number_type;
         },
         .plus, .tilde => {
-            _ = try c.checkExprCached(d.lhs, types.no_type);
+            const ot = try c.checkExprCached(d.lhs, types.no_type);
+            _ = try checkNonNullType(c, ot, d.lhs);
             return types.number_type;
         },
         .plus_plus, .minus_minus => {
             const ot = try c.checkExprCached(d.lhs, types.no_type);
-            try checkArithmeticOperand(c, ot, d.lhs);
+            try checkArithmeticOperand(c, try checkNonNullType(c, ot, d.lhs), d.lhs);
             return types.number_type;
         },
         else => {
@@ -3061,32 +3115,12 @@ fn checkBinary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         .plus => {
             const lt = try c.checkExprCached(d.lhs, types.no_type);
             const rt = try c.checkExprCached(d.rhs, types.no_type);
-            const lk = c.ts.kind(lt);
-            const rk = c.ts.kind(rt);
-            if (lk == .any or rk == .any or lk == .err or rk == .err) return types.any_type;
-            if (try isStringish(c, lt) or try isStringish(c, rt)) {
-                // string + anything stringifiable
-                return types.string_type;
-            }
-            if (try isNumberish(c, lt) and try isNumberish(c, rt)) return types.number_type;
-            if (try isBigintish(c, lt) and try isBigintish(c, rt)) return types.bigint_type;
-            try c.diagFmt(2365, c.nodeSpan(node), "Operator '+' cannot be applied to types '{s}' and '{s}'.", .{
-                try c.typeToString(lt), try c.typeToString(rt),
-            });
-            return types.error_type;
+            return (try checkPlusOperands(c, node, lt, rt, d.lhs, d.rhs)).ty;
         },
         .minus, .asterisk, .slash, .percent, .asterisk_asterisk, .lt_lt, .gt_gt, .gt_gt_gt, .amp, .pipe, .caret => {
             const lt = try c.checkExprCached(d.lhs, types.no_type);
             const rt = try c.checkExprCached(d.rhs, types.no_type);
-            if (!try isArithmeticOperand(c, lt)) {
-                try c.diagFmt(2362, c.nodeSpan(d.lhs), "The left-hand side of an arithmetic operation must be of type 'any', 'number', 'bigint' or an enum type.", .{});
-            }
-            if (!try isArithmeticOperand(c, rt)) {
-                try c.diagFmt(2363, c.nodeSpan(d.rhs), "The right-hand side of an arithmetic operation must be of type 'any', 'number', 'bigint' or an enum type.", .{});
-            }
-            if (try isBigintish(c, lt) and try isBigintish(c, rt) and
-                !try isNumberish(c, lt) and !try isNumberish(c, rt)) return types.bigint_type;
-            return types.number_type;
+            return (try checkArithmeticOperands(c, node, op, lt, rt, d.lhs, d.rhs)).ty;
         },
         .lt, .gt, .lt_eq, .gt_eq => {
             const lt = try c.checkExprCached(d.lhs, types.no_type);
@@ -3100,8 +3134,20 @@ fn checkBinary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             // assignable to `{valueOf():number}` (oracle-verified), while
             // still admitting `Date > Date`, `string > string`, and any two
             // structurally-comparable object types.
-            const ls = try c.nonNullable(lt);
-            const rs = try c.nonNullable(rt);
+            //
+            // The strip is the REPORTING `checkNonNullType` — `null < 1` is a
+            // TS18050 on the operand, not a TS2365 on the pair — and what
+            // survives it is widened with `getBaseTypeOfLiteralType`, which
+            // is both the classification tsc applies and the type it NAMES:
+            // `"a" > 1` reads "types 'string' and 'number'", never
+            // "types '\"a\"' and 'number'".
+            // `nonNullable` runs BEHIND the reporting screen because it does
+            // more than drop constituents: a bare type parameter comes back
+            // as `T & {}`, which is what makes `t < a` against `{}`
+            // comparable (`checkNonNullType` leaves a non-nullish `T`
+            // untouched, and a bare `T` is comparable to nothing).
+            const ls = try baseOfLiteralType(c, try c.nonNullable(try checkNonNullType(c, lt, d.lhs)));
+            const rs = try baseOfLiteralType(c, try c.nonNullable(try checkNonNullType(c, rt, d.rhs)));
             const lk = c.ts.kind(ls);
             const rk = c.ts.kind(rs);
             const ok = lk == .any or rk == .any or lk == .err or rk == .err or blk: {
@@ -3113,7 +3159,7 @@ fn checkBinary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             };
             if (!ok) {
                 try c.diagFmt(2365, c.nodeSpan(node), "Operator '{s}' cannot be applied to types '{s}' and '{s}'.", .{
-                    c.tokenText(c.tree.nodeMainToken(node)), try c.typeToString(lt), try c.typeToString(rt),
+                    c.tokenText(c.tree.nodeMainToken(node)), try c.typeToString(ls), try c.typeToString(rs),
                 });
             }
             return types.boolean_type;
@@ -3138,8 +3184,12 @@ fn checkBinary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             return types.boolean_type;
         },
         .keyword_in => {
-            const lt = try c.checkExprCached(d.lhs, types.no_type);
-            const rt = try c.checkExprCached(d.rhs, types.no_type);
+            const lt0 = try c.checkExprCached(d.lhs, types.no_type);
+            const rt0 = try c.checkExprCached(d.rhs, types.no_type);
+            // Both operands are screened for `null`/`undefined` first, like
+            // every other non-nullable position (tsc's `checkInExpression`).
+            const lt = try checkNonNullType(c, lt0, d.lhs);
+            const rt = try checkNonNullType(c, rt0, d.rhs);
             // tsc's `checkInExpression` relates the left operand to
             // `string | number | symbol` as a WHOLE, rather than asking
             // whether it carries one primitive facet. The difference is a
@@ -3210,43 +3260,156 @@ fn checkAssignExpr(c: *Checker, node: Node) Error!TypeId {
         // with the value type computed by `checkBinaryLikeExpressionWorker`).
         // `x += 1` on a branded `number & { _brand }` therefore fails the
         // same way `x = x + 1` does: the operation widens to `number`.
+        //
+        // The operation itself is checked by the very code its binary form
+        // uses (tsc runs one `checkBinaryLikeExpressionWorker` for `*` and
+        // `*=` alike), so `x1 *= {}` reports the same TS2362/TS2363 on its
+        // operands that `x1 * {}` does, and `b |= b` the same TS2447.
         else => {
-            const lt = try compoundTargetBase(c, target_t);
-            const res = try compoundResultType(c, op, lt, rt);
-            if (res == types.no_type) {
-                // Operands too coarse to classify (`any`/error, or not
-                // arithmetic at all — where tsc reports TS2362/TS2363/TS2365
-                // and skips the assignment check). Keep the old, unchecked
-                // approximation of the expression's type.
-                if (op == .plus_eq and try isStringish(c, lt)) return types.string_type;
-                return types.number_type;
-            }
-            if (!unchecked and lt != types.error_type and lt != types.any_type) {
+            // The operand is the target READ, not the target WRITE: tsc
+            // classifies `checkExpression(left)` and only `checkAssignment
+            // Operator` consults the write type. The two differ wherever a
+            // property has a wider setter than getter (`get x(): number` /
+            // `set x(v: number | undefined)`) and wherever the flow has
+            // narrowed the target (`if (this.z) this.z += dz`), and reading
+            // the write type there rejected code tsc accepts. Re-checking
+            // `d.lhs` as an expression cannot double-report: `diagFmt`
+            // dedupes on (file, code, span).
+            const read_t = if (target_t == types.error_type)
+                types.error_type
+            else
+                try c.checkExprCached(d.lhs, types.no_type);
+            const lt = try baseOfLiteralType(c, read_t);
+            const res = if (op == .plus_eq)
+                try checkPlusOperands(c, node, lt, rt, d.lhs, d.rhs)
+            else
+                try checkArithmeticOperands(c, node, op, lt, rt, d.lhs, d.rhs);
+            // A reported operand means tsc never reaches the write-back
+            // (`if (leftOk && rightOk) checkAssignmentOperator(resultType)`),
+            // so the operand diagnostic is never doubled by a TS2322.
+            if (res.ok and !unchecked and target_t != types.error_type and target_t != types.any_type) {
                 // No expression node: the source type is synthesized by the
                 // operator, so there is no literal to elaborate or excess-check.
-                _ = try c.checkAssignable(res, lt, null_node, c.nodeSpan(d.lhs));
+                _ = try c.checkAssignable(res.ty, try baseOfLiteralType(c, target_t), null_node, c.nodeSpan(d.lhs));
             }
-            return res;
+            return res.ty;
         },
     }
 }
 
-/// The type a compound assignment's TARGET reads (and is written back) as:
-/// tsc's `checkIdentifier` returns `getBaseTypeOfLiteralType(flowType)` for
-/// a reference in assignment-target position, so a literal type widens to
-/// its base before either the operand classification or the write-back
-/// check sees it. That is what makes `let d: -1 | 1 = 1; d *= -1` and
-/// `let s: "a" | "b"; s += "x"` legal — the target reads as `number` /
-/// `string` there. Only literal, enum-member and boolean-literal types
-/// widen; a branded `number & { _brand }` is not a literal type and stays
-/// exactly as declared, which is why `mv += 1` on it still fails.
-fn compoundTargetBase(c: *Checker, t: TypeId) Error!TypeId {
+/// What an operator arm computed: the expression's type, and whether both
+/// operands passed. A compound assignment needs the second half — tsc runs
+/// its write-back assignability check only when neither operand was
+/// reported.
+const OperandCheck = struct { ty: TypeId, ok: bool };
+
+/// tsc's `checkBinaryLikeExpressionWorker` for `+` / `+=`.
+///
+/// The nullish screen runs only when NEITHER side is string-like: `null +
+/// "a"` is a legal concatenation, so the null operand is never reported
+/// there, while `null + 1` is TS18050 on the operand rather than TS2365 on
+/// the pair.
+fn checkPlusOperands(c: *Checker, node: Node, lt0: TypeId, rt0: TypeId, lhs: Node, rhs: Node) Error!OperandCheck {
+    var lt = lt0;
+    var rt = rt0;
+    if (!try isStringish(c, lt) and !try isStringish(c, rt)) {
+        lt = try checkNonNullType(c, lt, lhs);
+        rt = try checkNonNullType(c, rt, rhs);
+    }
+    const lk = c.ts.kind(lt);
+    const rk = c.ts.kind(rt);
+    // `any` first: tsc reaches its string result through STRICT
+    // assignability (`isTypeAssignableToKind(t, StringLike, true)`), which
+    // `any` fails, and lands on the `isTypeAny` arm instead. Reading `any`
+    // as string-like retyped every evolving `var a; a += n` as `string`, and
+    // every later `a << 1` became a spurious TS2362.
+    if (lk == .any or rk == .any or lk == .err or rk == .err) return .{ .ty = types.any_type, .ok = true };
+    // string + anything stringifiable
+    if (try isStringish(c, lt) or try isStringish(c, rt)) return .{ .ty = types.string_type, .ok = true };
+    if (try isNumberish(c, lt) and try isNumberish(c, rt)) return .{ .ty = types.number_type, .ok = true };
+    if (try isBigintish(c, lt) and try isBigintish(c, rt)) return .{ .ty = types.bigint_type, .ok = true };
+    try c.diagFmt(2365, c.nodeSpan(node), "Operator '{s}' cannot be applied to types '{s}' and '{s}'.", .{
+        c.tokenText(c.tree.nodeMainToken(node)), try c.typeToString(lt), try c.typeToString(rt),
+    });
+    return .{ .ty = types.error_type, .ok = false };
+}
+
+/// tsc's `checkBinaryLikeExpressionWorker` for the arithmetic operators
+/// (`- * / % ** << >> >>> & | ^`) and their compound forms. Both operands
+/// are screened for `null`/`undefined` first, and the screen REPLACES the
+/// operand diagnostic: a purely nullish operand degrades to the error type,
+/// which every arithmetic classification accepts, so `null * 1` is one
+/// TS18050 rather than a TS2362.
+fn checkArithmeticOperands(c: *Checker, node: Node, op: scanner.Tag, lt0: TypeId, rt0: TypeId, lhs: Node, rhs: Node) Error!OperandCheck {
+    const lt = try checkNonNullType(c, lt0, lhs);
+    const rt = try checkNonNullType(c, rt0, rhs);
+    // `|`, `&`, `^` (and `|=`, `&=`, `^=`) between two booleans is almost
+    // always a typo for the logical operator, and tsc says so INSTEAD of
+    // rejecting the operands: one TS2447 on the operator token, no
+    // TS2362/TS2363, and a `number` result.
+    if (suggestedBooleanOperator(op)) |suggested| {
+        if (isBooleanLike(c, lt) and isBooleanLike(c, rt)) {
+            const tok = c.tree.nodeMainToken(node);
+            try c.diagFmt(2447, c.tokSpan(tok), "The '{s}' operator is not allowed for boolean types. Consider using '{s}' instead.", .{
+                c.tokenText(tok), suggested,
+            });
+            return .{ .ty = types.number_type, .ok = false };
+        }
+    }
+    var ok = true;
+    if (!try isArithmeticOperand(c, lt)) {
+        ok = false;
+        try c.diagFmt(2362, c.nodeSpan(lhs), "The left-hand side of an arithmetic operation must be of type 'any', 'number', 'bigint' or an enum type.", .{});
+    }
+    if (!try isArithmeticOperand(c, rt)) {
+        ok = false;
+        try c.diagFmt(2363, c.nodeSpan(rhs), "The right-hand side of an arithmetic operation must be of type 'any', 'number', 'bigint' or an enum type.", .{});
+    }
+    if (try isBigintish(c, lt) and try isBigintish(c, rt) and
+        !try isNumberish(c, lt) and !try isNumberish(c, rt)) return .{ .ty = types.bigint_type, .ok = ok };
+    return .{ .ty = types.number_type, .ok = ok };
+}
+
+/// The logical operator tsc suggests in TS2447 for a bitwise operator
+/// applied to two booleans (`getSuggestedBooleanOperator`), or null for
+/// every other operator.
+fn suggestedBooleanOperator(op: scanner.Tag) ?[]const u8 {
+    return switch (op) {
+        .pipe, .pipe_eq => "||",
+        .amp, .amp_eq => "&&",
+        .caret, .caret_eq => "!==",
+        else => null,
+    };
+}
+
+/// tsc's `TypeFlags.BooleanLike` — a flag test, not assignability, so a
+/// union like `boolean | undefined` is deliberately not boolean-like here.
+fn isBooleanLike(c: *Checker, t: TypeId) bool {
+    return switch (c.ts.kind(t)) {
+        .boolean, .bool_true, .bool_false => true,
+        else => false,
+    };
+}
+
+/// tsc's `getBaseTypeOfLiteralType`, mapped over a union. Only literal,
+/// enum-member and boolean-literal types widen; a branded
+/// `number & { _brand }` is not a literal type and stays exactly as
+/// declared.
+///
+/// Two positions need it. A compound assignment's TARGET reads (and is
+/// written back) as its base type — `checkIdentifier` returns
+/// `getBaseTypeOfLiteralType(flowType)` for a reference in assignment-target
+/// position — which is what makes `let d: -1 | 1 = 1; d *= -1` and
+/// `let s: "a" | "b"; s += "x"` legal while `mv += 1` on a branded number
+/// still fails. A relational operand is widened the same way, so `"a" > 1`
+/// is classified as (and REPORTED as) `string` against `number`.
+fn baseOfLiteralType(c: *Checker, t: TypeId) Error!TypeId {
     if (c.ts.kind(t) == .union_type) {
         var list: std.ArrayList(TypeId) = .empty;
         defer list.deinit(c.scratch());
         var changed = false;
         for (try c.memberList(t)) |m| {
-            const b = try compoundTargetBase(c, m);
+            const b = try baseOfLiteralType(c, m);
             if (b != m) changed = true;
             try list.append(c.scratch(), b);
         }
@@ -3255,29 +3418,6 @@ fn compoundTargetBase(c: *Checker, t: TypeId) Error!TypeId {
     }
     const base = try c.literalBaseOf(t);
     return if (base != types.no_type) base else t;
-}
-
-/// Result type of a compound assignment's operation (`+=`, `-=`, `*=`, …),
-/// mirroring what `checkBinaryExpr` computes for the plain operator — or
-/// `no_type` when the operands are not classified sharply enough for the
-/// back-assignability check to be sound. That "give up" case covers `any`
-/// and error operands (tsc's result is `any`, which never fails the check)
-/// and operands that are not arithmetic at all, where tsc reports the
-/// operand diagnostic and skips the assignment check entirely.
-fn compoundResultType(c: *Checker, op: scanner.Tag, lt: TypeId, rt: TypeId) Error!TypeId {
-    const lk = c.ts.kind(lt);
-    const rk = c.ts.kind(rt);
-    if (lk == .any or rk == .any or lk == .err or rk == .err) return types.no_type;
-    if (op == .plus_eq) {
-        if (try isStringish(c, lt) or try isStringish(c, rt)) return types.string_type;
-        if (try isNumberish(c, lt) and try isNumberish(c, rt)) return types.number_type;
-        if (try isBigintish(c, lt) and try isBigintish(c, rt)) return types.bigint_type;
-        return types.no_type;
-    }
-    if (!try isArithmeticOperand(c, lt) or !try isArithmeticOperand(c, rt)) return types.no_type;
-    if (try isBigintish(c, lt) and try isBigintish(c, rt) and
-        !try isNumberish(c, lt) and !try isNumberish(c, rt)) return types.bigint_type;
-    return types.number_type;
 }
 
 /// Does this assignment target name an evolving (`auto`-typed) variable?
@@ -3310,6 +3450,19 @@ fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
                         try c.diagFmt(2632, c.tokSpan(tok), "Cannot assign to '{s}' because it is an import.", .{c.tokenText(tok)});
                         return types.error_type;
                     }
+                    // Assigning to a name that is not a VARIABLE at all — a
+                    // class, enum, function or namespace — is refused by
+                    // tsc's `checkIdentifier`, which answers `errorType`
+                    // (TS2628-31; ztsc has none of those diagnostics yet).
+                    // The type answer is the load-bearing half: it is what
+                    // stops `class f {}; f -= 1` from ALSO reporting the
+                    // operand as non-arithmetic and the result as
+                    // unassignable, neither of which tsc says.
+                    if (!sf.var_decl and !sf.let_decl and !sf.param and !sf.catch_param and
+                        (sf.class or sf.enum_decl or sf.namespace_decl or sf.function))
+                    {
+                        return types.error_type;
+                    }
                     return c.typeOfSymbol(sym);
                 },
                 .wrong_space => return types.error_type,
@@ -3322,7 +3475,7 @@ fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
         .member_expr => {
             const d = c.tree.nodeData(node);
             var obj_t = try c.checkExprCached(d.lhs, types.no_type);
-            obj_t = try checkNullishAccess(c, obj_t, d.lhs, node);
+            obj_t = try checkNonNullType(c, obj_t, d.lhs);
             const name = try c.memberAtom(d.rhs);
             const r = try c.resolveStructural(obj_t);
             if (try c.propOfType(r, name)) |p| {
