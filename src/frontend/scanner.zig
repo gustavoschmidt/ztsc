@@ -792,7 +792,7 @@ pub const Scanner = struct {
             },
             else => {
                 if (c >= 0x80) {
-                    if (utf8SeqLen(s.src, s.index) == 0) {
+                    if (isBinaryContent(s.src, s.index)) {
                         s.index = @intCast(s.src.len);
                         return .binary_content;
                     }
@@ -825,12 +825,11 @@ pub const Scanner = struct {
             const c = s.src[s.index];
             if (c >= 0x80) {
                 // Any well-formed non-ASCII sequence continues the name (ztsc
-                // does not table ID_Continue); a malformed one ends it, so the
+                // does not table ID_Continue); binary content ends it, so the
                 // next `next()` reaches the `binary_content` arm and the file
                 // gets tsc's single "appears to be binary" answer.
-                const n = utf8SeqLen(s.src, s.index);
-                if (n == 0) break;
-                s.index += n;
+                if (isBinaryContent(s.src, s.index)) break;
+                s.index += utf8SeqLen(s.src, s.index);
             } else if (isIdentCont(c)) {
                 s.index += 1;
             } else if (c == '\\') {
@@ -1119,6 +1118,21 @@ const keyword_map = std.StaticStringMap(Tag).initComptime(.{
 
 inline fn isDigit(c: u8) bool {
     return c >= '0' and c <= '9';
+}
+
+/// Whether the character at `i` (a byte >= 0x80) means "this file is not text".
+///
+/// tsc decodes the whole source before scanning, so its condition is on the
+/// decoded CHARACTER: `U+FFFD`. That is reachable two ways, and both count —
+/// bytes that begin no valid UTF-8 sequence (tsc's decoder substitutes U+FFFD
+/// for them), and a well-formed `EF BF BD` that spells U+FFFD outright. The
+/// second is not hypothetical: the corpus harness decodes each case with
+/// replacement, so `compiler/TransportStream.ts` — 550 bytes of binary junk —
+/// arrives as valid UTF-8 containing one U+FFFD, and tsc answers TS1490 for it.
+fn isBinaryContent(src: []const u8, i: u32) bool {
+    if (utf8SeqLen(src, i) == 0) return true;
+    return src[i] == 0xEF and @as(usize, i) + 2 < src.len and
+        src[i + 1] == 0xBF and src[i + 2] == 0xBD;
 }
 
 /// How far to step over the FIRST character of an identifier: one byte for
@@ -1449,6 +1463,10 @@ test "golden: a byte that starts no UTF-8 sequence is binary content to end of f
     // A malformed sequence INSIDE a name ends the name, and the next token is
     // the binary one — never a silently-truncated identifier.
     try expectTokens("ab\x88cd", &.{ .identifier, .binary_content, .eof });
+    // A well-formed U+FFFD counts too: it is the character tsc's decoder would
+    // have produced, and the only reason to see one is binary content.
+    try expectTokens("var a\n\xEF\xBF\xBD var b = 1;", &.{ .keyword_var, .identifier, .binary_content, .eof });
+    try expectTokens("ab\xEF\xBF\xBDcd", &.{ .identifier, .binary_content, .eof });
 }
 
 test "golden: private identifiers and decorators" {
