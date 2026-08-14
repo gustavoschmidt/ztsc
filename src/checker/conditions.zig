@@ -100,7 +100,24 @@ pub fn checkUncalledFunction(c: *Checker, node: Node, ty: types.TypeId, body: No
     }
     const name_tok = switch (c.nodeTag(loc)) {
         .identifier => c.tree.nodeMainToken(loc),
-        .member_expr => c.tree.nodeData(loc).rhs,
+        .member_expr => blk: {
+            // tsc's `isPropertyExpressionCast` exemption: a member read off a
+            // TYPE ASSERTION is how code narrows an `unknown` by hand
+            // (`if ((result as I).always)`), and the assertion is the author
+            // saying the shape is not to be trusted — so the "always defined"
+            // claim is not made. `isTypeAssertion` skips parentheses first.
+            var obj = c.tree.nodeData(loc).lhs;
+            while (c.nodeTag(obj) == .paren_expr) {
+                const inner = c.tree.nodeData(obj).lhs;
+                if (inner == null_node) break;
+                obj = inner;
+            }
+            switch (c.nodeTag(obj)) {
+                .as_expr, .satisfies_expr => return,
+                else => {},
+            }
+            break :blk c.tree.nodeData(loc).rhs;
+        },
         else => return,
     };
     if (!try isAlwaysDefinedFunction(c, ty)) return;

@@ -1109,6 +1109,10 @@ fn initCandidate(c: *Checker, member: Node, e: ast.Field, ann: TypeId) bool {
 fn fieldTypeIsImplicitAny(c: *Checker, members: []const Node, member: Node, e: ast.Field, extends: Node) Error!bool {
     const name = try c.memberAtom(c.tree.nodeMainToken(member));
     if (e.flags & ast.Flags.static != 0) {
+        // `static prototype` is not a declaration tsc types at all — it collides
+        // with the constructor function's own `prototype` and is rejected
+        // outright (TS2699), so no implicit-`any` claim is made about it.
+        if (name == c.atom_prototype) return false;
         // A `static { … }` block is parsed as a plain `.block` member (see the
         // parser's note there) and its statements are not checked, so its writes
         // cannot be found — any block at all silences the class's static fields.
