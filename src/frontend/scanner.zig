@@ -70,9 +70,20 @@ pub const max_source_len: usize = (1 << 31) - 1;
 /// scanner onto it — an infinite loop, not a diagnostic.
 pub fn scanJsxName(src: []const u8, at_index: u32) u32 {
     var s = Scanner{ .src = src, .index = at_index };
+    // A JsxNamespacedName (`<svg:path>`, `xlink:href=`) is `ns ':' name` — at
+    // most ONE colon, and only with a name right after it, so an attribute
+    // value's `:` or a conditional's cannot be swallowed. Keeping it inside the
+    // token is what makes the NAME `svg:path`, which is the key tsc looks up in
+    // `JSX.IntrinsicElements`.
+    var colon_used = false;
     while (s.index < src.len) {
         const c = src[s.index];
         if (isIdentCont(c) or c >= 0x80 or c == '-') {
+            s.index += 1;
+        } else if (c == ':' and !colon_used and s.index > at_index and
+            (isIdentStart(s.at(s.index + 1)) or s.at(s.index + 1) >= 0x80))
+        {
+            colon_used = true;
             s.index += 1;
         } else if (c == '\\') {
             if (!s.consumeIdentifierEscape()) break;
@@ -181,6 +192,8 @@ pub fn tokenEnd(src: []const u8, tag: Tag, start: u32) u32 {
                 // A `\uXXXX`-introduced identifier: consume the escape exactly
                 // as `next()` does, then fall into the same rest loop.
                 if (!s.consumeIdentifierEscape()) return s.next().end;
+            } else if (start < src.len) {
+                s.index +|= identStepLen(src, start);
             } else {
                 s.index +|= 1;
             }
@@ -188,7 +201,7 @@ pub fn tokenEnd(src: []const u8, tag: Tag, start: u32) u32 {
             return s.index;
         },
         // These consume to end of file by construction.
-        .unterminated_template, .unterminated_comment => {
+        .binary_content, .unterminated_template, .unterminated_comment => {
             // A middle/tail rescan can also produce unterminated_template
             // starting at `}`; either way it ends at EOF.
             return @intCast(src.len);
@@ -270,6 +283,15 @@ pub const Tag = enum(u8) {
     eof,
     /// Byte(s) that start no token (e.g. stray `\` or control chars).
     unknown,
+    /// `#!` anywhere but the very first line, where it is shebang trivia
+    /// (`Scanner.init` consumes that one). tsc's scanner has the same special
+    /// case and answers TS18026 rather than the generic invalid-character.
+    hash_bang,
+    /// A byte that begins no valid UTF-8 sequence, i.e. the file is not text.
+    /// Consumes the whole rest of the file, exactly as tsc does: tsc decodes
+    /// the source up front, so a malformed sequence becomes U+FFFD, and the
+    /// scanner answers `File appears to be binary.` once and stops.
+    binary_content,
     unterminated_string_literal,
     /// Unterminated template literal (head, middle/tail, or no-substitution).
     unterminated_template,
@@ -758,6 +780,7 @@ pub const Scanner = struct {
                     _ = s.identifierRest();
                     return .private_identifier;
                 }
+                if (c1 == '!') return s.punct(2, .hash_bang);
                 return s.punct(1, .unknown);
             },
             '\\' => {
@@ -768,7 +791,13 @@ pub const Scanner = struct {
                 return s.punct(1, .unknown);
             },
             else => {
-                if (c >= 0x80) return s.scanIdentifierOrKeyword();
+                if (c >= 0x80) {
+                    if (utf8SeqLen(s.src, s.index) == 0) {
+                        s.index = @intCast(s.src.len);
+                        return .binary_content;
+                    }
+                    return s.scanIdentifierOrKeyword();
+                }
                 return s.punct(1, .unknown);
             },
         }
@@ -776,7 +805,11 @@ pub const Scanner = struct {
 
     fn scanIdentifierOrKeyword(s: *Scanner) Tag {
         const start = s.index;
-        s.index += 1; // first byte validated by caller
+        // First byte validated by the caller. A non-ASCII one carries its whole
+        // UTF-8 sequence: `identifierRest` validates the byte it lands on, so
+        // stepping one byte into a multi-byte character would leave it on a
+        // continuation byte and end the identifier there.
+        s.index += identStepLen(s.src, s.index);
         const has_escape = s.identifierRest();
         if (!has_escape) {
             if (keyword_map.get(s.src[start..s.index])) |kw| return kw;
@@ -790,7 +823,15 @@ pub const Scanner = struct {
         var has_escape = false;
         while (s.index < s.src.len) {
             const c = s.src[s.index];
-            if (isIdentCont(c) or c >= 0x80) {
+            if (c >= 0x80) {
+                // Any well-formed non-ASCII sequence continues the name (ztsc
+                // does not table ID_Continue); a malformed one ends it, so the
+                // next `next()` reaches the `binary_content` arm and the file
+                // gets tsc's single "appears to be binary" answer.
+                const n = utf8SeqLen(s.src, s.index);
+                if (n == 0) break;
+                s.index += n;
+            } else if (isIdentCont(c)) {
                 s.index += 1;
             } else if (c == '\\') {
                 if (!s.consumeIdentifierEscape()) break;
@@ -1080,6 +1121,49 @@ inline fn isDigit(c: u8) bool {
     return c >= '0' and c <= '9';
 }
 
+/// How far to step over the FIRST character of an identifier: one byte for
+/// ASCII, the whole UTF-8 sequence for anything else, and one byte for a
+/// malformed sequence (so the caller still makes progress; `identifierRest`
+/// then ends the name and `next` reaches the binary-content arm).
+fn identStepLen(src: []const u8, i: u32) u32 {
+    if (src[i] < 0x80) return 1;
+    const n = utf8SeqLen(src, i);
+    return if (n == 0) 1 else n;
+}
+
+/// Length of the UTF-8 sequence starting at `i`, or 0 when the bytes there are
+/// not a well-formed one (bad lead byte, missing/!0b10 continuation, truncated
+/// at end of input, overlong, surrogate, or above U+10FFFF).
+///
+/// Only ever called on a byte >= 0x80, so the ASCII scanning path pays nothing.
+/// tsc gets this for free by decoding the whole file into UTF-16 up front; ztsc
+/// scans the bytes, so the one place that needs to know text from binary asks
+/// here.
+fn utf8SeqLen(src: []const u8, i: u32) u3 {
+    const c0 = src[i];
+    const n: u3 = switch (c0) {
+        0xC2...0xDF => 2,
+        0xE0...0xEF => 3,
+        0xF0...0xF4 => 4,
+        else => return 0, // continuation byte, overlong C0/C1, or >= 0xF5
+    };
+    if (@as(usize, i) + n > src.len) return 0;
+    for (src[i + 1 ..][0 .. n - 1]) |c| {
+        if (c & 0xC0 != 0x80) return 0;
+    }
+    // Reject the ranges a bare lead-byte test lets through: overlong 3-byte
+    // forms, the UTF-16 surrogate block, and code points past U+10FFFF.
+    const c1 = src[i + 1];
+    switch (c0) {
+        0xE0 => if (c1 < 0xA0) return 0,
+        0xED => if (c1 >= 0xA0) return 0,
+        0xF0 => if (c1 < 0x90) return 0,
+        0xF4 => if (c1 >= 0x90) return 0,
+        else => {},
+    }
+    return n;
+}
+
 inline fn isHexDigit(c: u8) bool {
     return isDigit(c) or (c | 0x20) >= 'a' and (c | 0x20) <= 'f';
 }
@@ -1350,8 +1434,21 @@ test "golden: shebang and BOM" {
     try expectTokens("#!/usr/bin/env node\nlet x", &.{ .keyword_let, .identifier, .eof });
     try expectTokens("\xEF\xBB\xBFconst a", &.{ .keyword_const, .identifier, .eof });
     try expectTokens("\xEF\xBB\xBF#!x\nvar b", &.{ .keyword_var, .identifier, .eof });
-    // `#!` not at the start is not a shebang.
-    try expectTokens("a #! b", &.{ .identifier, .unknown, .bang, .identifier, .eof });
+    // `#!` not at the start is not a shebang: one two-byte `hash_bang` token,
+    // which the parser answers with TS18026 rather than the generic TS1127.
+    try expectTokens("a #! b", &.{ .identifier, .hash_bang, .identifier, .eof });
+    // A `#` that is neither a shebang nor a private name is still `unknown`.
+    try expectTokens("a # b", &.{ .identifier, .unknown, .identifier, .eof });
+}
+
+test "golden: a byte that starts no UTF-8 sequence is binary content to end of file" {
+    try expectTokens("var a\n\x88 var b = 1;", &.{ .keyword_var, .identifier, .binary_content, .eof });
+    // Well-formed non-ASCII is an ordinary identifier, whatever plane it is in.
+    try expectTokens("var \xC3\xA9\xC3\xA8 = 1;", &.{ .keyword_var, .identifier, .eq, .numeric_literal, .semicolon, .eof });
+    try expectTokens("var \xF0\x9D\x92\x9C = 1;", &.{ .keyword_var, .identifier, .eq, .numeric_literal, .semicolon, .eof });
+    // A malformed sequence INSIDE a name ends the name, and the next token is
+    // the binary one — never a silently-truncated identifier.
+    try expectTokens("ab\x88cd", &.{ .identifier, .binary_content, .eof });
 }
 
 test "golden: private identifiers and decorators" {

@@ -1151,7 +1151,7 @@ const Binder = struct {
                     // `export default function f() {}` / `class C {}` is a
                     // declaration with a modifier, not tsc's ExportAssignment.
                     switch (b.nodeTag(d.lhs)) {
-                        .function_decl, .class_decl => {},
+                        .function_decl, .class_decl, .interface_decl => {},
                         else => b.saw_export_declaration = true,
                     }
                 }
@@ -2228,6 +2228,16 @@ const Binder = struct {
             },
             .class_decl => {
                 const data = b.tree.extraData(ast.ClassData, b.tree.nodeData(inner).lhs);
+                if (data.name_token != 0) local = try b.atomOfToken(data.name_token);
+                try b.bindStatement(inner);
+                if (local != 0) sym = b.members.get(memberKey(b.cur_scope, local)) orelse no_symbol;
+            },
+            // `export default interface I { … }` — the one TYPE-side default
+            // export form. Like the class case: a declaration carrying an
+            // export-default modifier, so the name is declared in the file
+            // scope and ALSO recorded as the module's default.
+            .interface_decl => {
+                const data = b.tree.extraData(ast.InterfaceData, b.tree.nodeData(inner).lhs);
                 if (data.name_token != 0) local = try b.atomOfToken(data.name_token);
                 try b.bindStatement(inner);
                 if (local != 0) sym = b.members.get(memberKey(b.cur_scope, local)) orelse no_symbol;
