@@ -204,7 +204,12 @@ pub fn diagAlreadyFiled(c: *Checker, code: u16, span: Span) bool {
 /// collateral from work the probe merely happened to trigger and must
 /// survive. `hi == 0` means "the whole file" (unused today, but it makes an
 /// empty region unrepresentable).
-const SpecRegion = struct { file: FileId, lo: u32, hi: u32 };
+/// `codes`, when given, narrows the withdrawal to those diagnostic CODES:
+/// a probe that replaces one FAMILY of diagnostics with a summary (the JSX
+/// overload set's TS2769) must not also swallow what the same walk said about
+/// the expressions inside — tsc types those regardless of which overload it
+/// settles on.
+const SpecRegion = struct { file: FileId, lo: u32, hi: u32, codes: ?[]const u16 = null };
 
 /// Withdraw the diagnostics a speculative stretch of checking filed inside
 /// `spec`, restoring the state a *silent* probe would have left.
@@ -274,7 +279,8 @@ pub fn rollbackDiags(c: *Checker, saved: usize, spec: SpecRegion) void {
     var w = saved;
     for (c.diags.items[saved..]) |d| {
         if (d.file == spec.file and d.span.start >= spec.lo and
-            (spec.hi == 0 or d.span.start < spec.hi))
+            (spec.hi == 0 or d.span.start < spec.hi) and
+            (spec.codes == null or std.mem.indexOfScalar(u16, spec.codes.?, d.code) != null))
         {
             _ = c.diag_seen.remove((@as(u128, d.file) << 64) | (@as(u128, d.code) << 32) | d.span.start);
             continue;
