@@ -1204,6 +1204,23 @@ fn arrayElemExcessScan(c: *Checker, node: Node, src_t: TypeId, target: TypeId, r
     return any;
 }
 
+/// The type a nested literal is measured against for the name `key`.
+///
+/// The plain lookup is `targetPropType`, but a UNION target only answers a name
+/// its EVERY constituent has, and the descent has to happen anyway: tsc's
+/// recursion is the relation's, which has already picked the constituent the
+/// literal is being related to. So a union that cannot answer as a whole is
+/// asked again through the constituent the reporting path uses everywhere else
+/// (`bestMatchingUnionMember`) — the shape being
+/// `StatelessComponent<TestProps | { props2: … }>`, whose `icon` lives in one
+/// arm and whose nested `INVALID_PROP_NAME` went unreported without this.
+fn nestedTargetPropType(c: *Checker, rt: TypeId, src_t: TypeId, key: Atom) Error!?TypeId {
+    if (try c.targetPropType(rt, key)) |tp| return tp;
+    if (c.ts.kind(rt) != .union_type) return null;
+    const b = (try c.bestMatchingUnionMember(src_t, rt)) orelse return null;
+    return c.targetPropType(try c.resolveStructural(b), key);
+}
+
 pub fn excessPropertyScan(c: *Checker, expr_node: Node, src_t: TypeId, target: TypeId, report: bool) Error!bool {
     var node = expr_node;
     // Unwrap parens and a JSX expression container (`prop={{ … }}`): the
@@ -1311,12 +1328,14 @@ pub fn excessPropertyScan(c: *Checker, expr_node: Node, src_t: TypeId, target: T
             }
             return true; // one excess error per literal, like tsc's early bail
         }
-        // Recurse into nested fresh literals.
+        // Recurse into nested fresh literals (and into a nested ARRAY literal,
+        // whose elements the scan then walks).
         if (tag == .object_property) {
             const pd = c.tree.nodeData(prop);
-            if (c.nodeTag(pd.rhs) == .object_literal) {
+            const rhs_tag = c.nodeTag(pd.rhs);
+            if (rhs_tag == .object_literal or rhs_tag == .array_literal) {
                 if (c.nodeType(pd.rhs)) |nested_t| {
-                    if (try c.targetPropType(rt, key)) |tp| {
+                    if (try nestedTargetPropType(c, rt, src_t, key)) |tp| {
                         if (try c.excessPropertyScan(pd.rhs, nested_t, tp, report)) return true;
                     }
                 }
