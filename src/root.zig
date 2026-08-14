@@ -15,6 +15,7 @@ pub const zeropage = @import("zeropage.zig");
 pub const scanner = @import("frontend/scanner.zig");
 pub const diagnostics = @import("frontend/diagnostics.zig");
 pub const directives = @import("frontend/directives.zig");
+pub const literals = @import("frontend/literals.zig");
 pub const ast = @import("frontend/ast.zig");
 pub const parser = @import("frontend/parser.zig");
 pub const binder = @import("frontend/binder.zig");
@@ -42,6 +43,7 @@ test {
     _ = scanner;
     _ = diagnostics;
     _ = directives;
+    _ = literals;
     _ = ast;
     _ = parser;
     _ = binder;

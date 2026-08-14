@@ -19,6 +19,26 @@ pub const Code = enum(u16) {
     unterminated_comment,
     unexpected_character,
 
+    // --- literal grammar (src/frontend/literals.zig) -----------------------
+    /// TS1121: `010` — a legacy octal literal.
+    octal_literal_not_allowed,
+    /// TS1489: `08` — a decimal that starts with a zero.
+    decimal_with_leading_zero,
+    /// TS1487: `"\101"` — a legacy octal escape.
+    octal_escape_not_allowed,
+    /// TS1488: `"\8"` — not an escape sequence in any mode.
+    escape_sequence_not_allowed,
+    /// TS1125: `0x`, `"\x1"`, `"\u12"` — a hex digit was required here.
+    hex_digit_expected,
+    /// TS1177: `0b` with no digits.
+    binary_digit_expected,
+    /// TS1178: `0o` with no digits.
+    octal_digit_expected,
+    /// TS1198: `"\u{110000}"` — outside the Unicode range.
+    unicode_escape_out_of_range,
+    /// TS1199: `"\u{12"` — no closing brace.
+    unterminated_unicode_escape,
+
     // --- parse errors ------------------------------------------------------
     expected_expression,
     expected_identifier,
@@ -130,6 +150,31 @@ pub const Code = enum(u16) {
     /// TS2492: redeclaring a catch-clause parameter in the catch block.
     catch_redeclare,
 
+    // --- ambient-context and modifier grammar (checked in the parser) ------
+    /// TS1036: an executable statement in an ambient context (`declare
+    /// namespace N { a; }`, or anything non-declarative in a `.d.ts`). tsc
+    /// reports it once per containing block, on the statement's first token.
+    statement_not_allowed_in_ambient,
+    /// TS1183: a function, method, accessor or constructor with a BODY in an
+    /// ambient context. Reported on the body's `{`.
+    implementation_not_allowed_in_ambient,
+    /// TS1028: a second accessibility modifier on one member or parameter
+    /// (`public private x`), reported on the second one.
+    accessibility_modifier_already_seen,
+
+    // --- strict-mode reserved words (tsc's binder, `checkStrictModeIdentifier`)
+    /// TS1212: a future-reserved word (`yield`, `let`, `static`, `public`,
+    /// `private`, `protected`, `implements`, `interface`, `package`) used as an
+    /// Identifier. ztsc is always-strict, and so is every corpus case, so the
+    /// condition is simply "this word is here".
+    strict_reserved_word,
+    /// TS1213: the same, inside a class — tsc says so, because a class body is
+    /// strict whatever the file is.
+    strict_reserved_word_in_class,
+    /// TS1214: the same, in a file that is an external module — likewise strict
+    /// for a reason the reader may not have chosen.
+    strict_reserved_word_in_module,
+
     // --- subset boundary (explicit, never a wrong answer) ------------------------
     unsupported_syntax,
     unsupported_satisfies,
@@ -199,6 +244,12 @@ pub const Code = enum(u16) {
             .line_break_not_allowed,
             .rest_must_be_last,
             .expected_string_literal,
+            .statement_not_allowed_in_ambient,
+            .implementation_not_allowed_in_ambient,
+            .accessibility_modifier_already_seen,
+            .strict_reserved_word,
+            .strict_reserved_word_in_class,
+            .strict_reserved_word_in_module,
             => .grammar,
 
             else => .syntactic,
@@ -216,6 +267,19 @@ pub const Code = enum(u16) {
             .unterminated_regexp => "Unterminated regular expression literal.",
             .unterminated_comment => "'*/' expected.",
             .unexpected_character => "Invalid character.",
+            // tsc appends the corrected spelling (`Use the syntax '0o10'.`) to
+            // the first two; a Diagnostic here is a code plus a span with no
+            // room to interpolate, so the invariant half of the sentence is what
+            // is reported — the same policy the bind diagnostics already follow.
+            .octal_literal_not_allowed => "Octal literals are not allowed.",
+            .decimal_with_leading_zero => "Decimals with leading zeros are not allowed.",
+            .octal_escape_not_allowed => "Octal escape sequences are not allowed.",
+            .escape_sequence_not_allowed => "This escape sequence is not allowed.",
+            .hex_digit_expected => "Hexadecimal digit expected.",
+            .binary_digit_expected => "Binary digit expected.",
+            .octal_digit_expected => "Octal digit expected.",
+            .unicode_escape_out_of_range => "An extended Unicode escape value must be between 0x0 and 0x10FFFF inclusive.",
+            .unterminated_unicode_escape => "Unterminated Unicode escape sequence.",
             .expected_expression => "Expression expected.",
             .expected_identifier => "Identifier expected.",
             .expected_semicolon => "';' expected.",
@@ -253,6 +317,14 @@ pub const Code = enum(u16) {
             .rest_must_be_last => "a rest element must be last",
             .line_break_not_allowed => "Line break not permitted here.",
             .argument_expected => "Argument expression expected.",
+            .statement_not_allowed_in_ambient => "Statements are not allowed in ambient contexts.",
+            .implementation_not_allowed_in_ambient => "An implementation cannot be declared in ambient contexts.",
+            .accessibility_modifier_already_seen => "Accessibility modifier already seen.",
+            // tsc names the word (`'yield' is a reserved word...`); a Diagnostic
+            // is a code plus a span, so the invariant sentence is reported.
+            .strict_reserved_word => "Identifier expected. This is a reserved word in strict mode.",
+            .strict_reserved_word_in_class => "Identifier expected. This is a reserved word in strict mode. Class definitions are automatically in strict mode.",
+            .strict_reserved_word_in_module => "Identifier expected. This is a reserved word in strict mode. Modules are automatically in strict mode.",
             .decorator_not_valid_here => "Decorators are not valid here.",
             .in_modifier_not_valid_here => "'in' modifier can only appear on a type parameter of a class, interface or type alias",
             .out_modifier_not_valid_here => "'out' modifier can only appear on a type parameter of a class, interface or type alias",
@@ -331,11 +403,26 @@ pub const Code = enum(u16) {
             .unterminated_regexp => 1161,
             .unterminated_comment => 1010,
             .unexpected_character => 1127,
+            .octal_literal_not_allowed => 1121,
+            .decimal_with_leading_zero => 1489,
+            .octal_escape_not_allowed => 1487,
+            .escape_sequence_not_allowed => 1488,
+            .hex_digit_expected => 1125,
+            .binary_digit_expected => 1177,
+            .octal_digit_expected => 1178,
+            .unicode_escape_out_of_range => 1198,
+            .unterminated_unicode_escape => 1199,
             .nullish_mixed_with_logical => 5076,
             .tagged_template_in_optional_chain => 1358,
             .newline_before_arrow => 1200,
             .multiple_default_clauses => 1113,
             .line_break_not_allowed => 1142,
+            .statement_not_allowed_in_ambient => 1036,
+            .implementation_not_allowed_in_ambient => 1183,
+            .accessibility_modifier_already_seen => 1028,
+            .strict_reserved_word => 1212,
+            .strict_reserved_word_in_class => 1213,
+            .strict_reserved_word_in_module => 1214,
 
             .duplicate_identifier => 2300,
             .block_scoped_redeclare => 2451,

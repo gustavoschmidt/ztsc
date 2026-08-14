@@ -57,6 +57,7 @@ const scanner = @import("scanner.zig");
 const ast = @import("ast.zig");
 const diagnostics = @import("diagnostics.zig");
 const directives = @import("directives.zig");
+const literals = @import("literals.zig");
 
 const TokTag = scanner.Tag;
 const Token = scanner.Token;
@@ -180,11 +181,36 @@ const Parser = struct {
     /// Speculation depth; > 0 makes expectation failures raise Backtrack.
     spec: u32 = 0,
 
+    /// Start offset of the last SYNTACTIC diagnostic recorded, for tsc's
+    /// one-per-position rule (`addDiag`). Not derivable from `diags` — the last
+    /// entry there may be a grammar-class one, which does not participate.
+    last_syntactic_start: ?u32 = null,
+
+    /// Nesting depth of class bodies, for TS1213 — tsc's `getContainingClass`.
+    /// A class body is strict whatever the file is, and tsc says so in its own
+    /// wording, so the choice between TS1212 and TS1213 is this counter.
+    class_depth: u32 = 0,
+    /// Whether the file has top-level module syntax (`import`/`export`), tsc's
+    /// `externalModuleIndicator`, for TS1214. Only known once the whole file is
+    /// parsed, so the diagnostics are recorded as TS1212 and rewritten in
+    /// `sealInto`.
+    saw_module_syntax: bool = false,
+
     /// Copy the parsed lists into `out` at exact size. `out` is an arena, so
     /// each `dupe`/`setCapacity` is a single tight allocation with no slack
     /// and no stranded intermediate buffers (those stay in the scratch arena
     /// and are freed when `parse` returns).
     fn sealInto(p: *Parser, out: Allocator) Error!ast.Ast {
+        // TS1214: a strict-reserved word in an external module gets tsc's
+        // module-specific wording. Whether the file IS one is only settled at
+        // EOF (any top-level `import`/`export`), so the reports were recorded
+        // under TS1212 and are relabelled here. Not the class ones — a class body
+        // is strict for a reason of its own and tsc prefers to say that.
+        if (p.saw_module_syntax) {
+            for (p.diags.items) |*d| {
+                if (d.code == .strict_reserved_word) d.code = .strict_reserved_word_in_module;
+            }
+        }
         const tags = try out.dupe(TokTag, p.tok_tags.items);
         const starts = try out.dupe(u32, p.tok_starts.items);
         const extra_data = try out.dupe(u32, p.extra.items);
@@ -309,6 +335,40 @@ const Parser = struct {
             p.gpa,
             t.start | @as(u32, if (t.newline_before) scanner.Tokens.newline_flag else 0),
         );
+        try p.checkLiteral(t);
+    }
+
+    /// The literal-TEXT grammar rules (legacy octal, bad escapes, an empty radix
+    /// — `literals.zig`). tsc reports these from its scanner; ztsc's scanner is a
+    /// pure tokenizer, so they run here, on the one funnel every consumed token
+    /// passes through. Speculation is safe: `restore` truncates `diags`, so a
+    /// token consumed twice is diagnosed once.
+    ///
+    /// Both guards are a single byte test, so a literal that has nothing wrong
+    /// with it — which is nearly all of them — costs one comparison.
+    fn checkLiteral(p: *Parser, t: Token) Error!void {
+        switch (t.tag) {
+            .numeric_literal, .bigint_literal => {
+                const text = p.tokenText(t);
+                if (literals.checkNumeric(text, t.start)) |f| {
+                    try p.addDiag(f.code, .{ .code = f.code, .span = f.span });
+                }
+            },
+            .string_literal => {
+                const text = p.tokenText(t);
+                if (!literals.EscapeWalk.any(text)) return;
+                var w: literals.EscapeWalk = .init(text, t.start);
+                while (w.next()) |f| {
+                    try p.addDiag(f.code, .{ .code = f.code, .span = f.span });
+                }
+            },
+            else => {},
+        }
+    }
+
+    fn tokenText(p: *const Parser, t: Token) []const u8 {
+        const end = @min(if (t.end > t.start) t.end else t.start, @as(u32, @intCast(p.src.len)));
+        return p.src[@min(t.start, end)..end];
     }
 
     fn eat(p: *Parser, tag: TokTag) Error!?u32 {
@@ -330,10 +390,35 @@ const Parser = struct {
         try p.errAtCur(code);
     }
 
+    /// Append a diagnostic, applying tsc's one-per-position rule for the
+    /// syntactic ones:
+    ///
+    ///     // Don't report another error if it would just be at the same
+    ///     // position as the last error.
+    ///     const lastError = lastOrUndefined(parseDiagnostics);
+    ///     if (!lastError || start !== lastError.start) { ... push ... }
+    ///
+    /// A recovering parser reaches the same token from several directions and
+    /// has something to say each time ("';' expected", then "Expression
+    /// expected", then "unexpected token"); tsc keeps the first and drops the
+    /// rest, and a report that keeps them all is one right key plus several
+    /// wrong ones. The comparison is against the last SYNTACTIC diagnostic
+    /// only, because the grammar-class ones do not live in tsc's
+    /// `parseDiagnostics` and so neither suppress nor are suppressed by these.
+    fn addDiag(p: *Parser, code: Code, span: ast.Diagnostic) Error!void {
+        if (code.class() == .syntactic) {
+            if (p.last_syntactic_start) |last| {
+                if (last == span.span.start) return;
+            }
+            p.last_syntactic_start = span.span.start;
+        }
+        try p.diags.append(p.gpa, span);
+    }
+
     fn errAtCur(p: *Parser, code: Code) Error!void {
         const t = p.cur();
         const end = if (t.end > t.start) t.end else t.start + 1;
-        try p.diags.append(p.gpa, .{
+        try p.addDiag(code, .{
             .code = code,
             .span = .{ .start = t.start, .end = @min(end, @as(u32, @intCast(p.src.len)) + 1) },
         });
@@ -342,7 +427,7 @@ const Parser = struct {
     fn errAtToken(p: *Parser, code: Code, tok: u32) Error!void {
         const start = p.tok_starts.items[tok] & scanner.Tokens.start_mask;
         const end = scanner.tokenEnd(p.src, p.tok_tags.items[tok], start);
-        try p.diags.append(p.gpa, .{
+        try p.addDiag(code, .{
             .code = code,
             .span = .{ .start = start, .end = if (end > start) end else start + 1 },
         });
@@ -355,7 +440,7 @@ const Parser = struct {
         const start = p.tok_starts.items[from] & scanner.Tokens.start_mask;
         const to_start = p.tok_starts.items[to] & scanner.Tokens.start_mask;
         const end = scanner.tokenEnd(p.src, p.tok_tags.items[to], to_start);
-        try p.diags.append(p.gpa, .{
+        try p.addDiag(code, .{
             .code = code,
             .span = .{ .start = start, .end = if (end > start) end else start + 1 },
         });
@@ -500,6 +585,7 @@ const Parser = struct {
         n_extra: usize,
         n_scratch: usize,
         n_diags: usize,
+        last_syntactic_start: ?u32,
     };
 
     fn save(p: *Parser) State {
@@ -512,6 +598,7 @@ const Parser = struct {
             .n_extra = p.extra.items.len,
             .n_scratch = p.scratch.items.len,
             .n_diags = p.diags.items.len,
+            .last_syntactic_start = p.last_syntactic_start,
         };
     }
 
@@ -525,6 +612,7 @@ const Parser = struct {
         p.extra.shrinkRetainingCapacity(s.n_extra);
         p.scratch.shrinkRetainingCapacity(s.n_scratch);
         p.diags.shrinkRetainingCapacity(s.n_diags);
+        p.last_syntactic_start = s.last_syntactic_start;
     }
 
     // --- node construction -------------------------------------------------
@@ -720,7 +808,7 @@ const Parser = struct {
 
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
-        try p.parseStatementList(top, .eof);
+        try p.parseStatementList(top, .eof, false);
         const range = try p.scratchToSpan(top);
         p.nodes.items(.data)[0] = .{ .lhs = range.start, .rhs = range.end };
 
@@ -732,12 +820,24 @@ const Parser = struct {
 
     /// Parse statements until `terminator` (or eof), pushing them on
     /// scratch. Guarantees progress on every iteration.
-    fn parseStatementList(p: *Parser, top: usize, terminator: TokTag) PE!void {
+    fn parseStatementList(p: *Parser, top: usize, terminator: TokTag, ambient_reported: bool) PE!void {
         _ = top;
+        // TS1036, tsc's `checkGrammarStatementInAmbientContext`: an ambient
+        // context declares, it does not execute. tsc reports it ONCE per
+        // containing block ("we only want to really report an error once to
+        // prevent noisiness"), which is exactly one flag per call of this
+        // function — every block, module block and source file gets its own.
+        var reported_ambient_stmt = ambient_reported;
         while (p.curTag() != terminator and p.curTag() != .eof) {
             const before = p.curIdx();
             const stmt = try p.parseStatement();
             try p.pushScratch(stmt);
+            if (p.ambient and !reported_ambient_stmt and p.spec == 0 and
+                stmt != null_node and isExecutableStatement(p.nodes.items(.tag)[stmt]))
+            {
+                try p.errAtToken(.statement_not_allowed_in_ambient, before);
+                reported_ambient_stmt = true;
+            }
             if (p.curIdx() == before) {
                 // The statement consumed nothing: force progress, then
                 // synchronize at a statement boundary.
@@ -746,6 +846,37 @@ const Parser = struct {
                 p.synchronize();
             }
         }
+    }
+
+    /// A statement that RUNS, as opposed to one that only declares. The
+    /// complement of tsc's ambient-context allowance: `var`/`let`/`const`,
+    /// `function`, `class`, `interface`, `type`, `enum`, `namespace`/`module`,
+    /// every import and export form, and an empty statement are all legal in an
+    /// ambient context; everything else is TS1036.
+    fn isExecutableStatement(tag: ast.Tag) bool {
+        return switch (tag) {
+            .block,
+            .expr_stmt,
+            .if_stmt,
+            .if_else_stmt,
+            .while_stmt,
+            .do_stmt,
+            .for_stmt,
+            .for_in_stmt,
+            .for_of_stmt,
+            .switch_stmt,
+            .try_stmt,
+            .throw_stmt,
+            .return_stmt,
+            .break_stmt,
+            .continue_stmt,
+            .labeled_stmt,
+            .debugger_stmt,
+            // A stray `;` counts: tsc reports TS1036 for `declare namespace N { ; }`.
+            .empty_stmt,
+            => true,
+            else => false,
+        };
     }
 
     /// Skip tokens (silently) until a plausible statement boundary.
@@ -855,20 +986,36 @@ const Parser = struct {
                     },
                     .keyword_function => {
                         _ = try p.bump();
+                        // `declare` puts the whole declaration in an ambient
+                        // context, tsc's `NodeFlags.Ambient` — which is what
+                        // makes a body here TS1183. Only the var arm below used
+                        // to set it, because only declarators needed it.
+                        const was_ambient = p.ambient;
+                        p.ambient = true;
+                        defer p.ambient = was_ambient;
                         return p.parseFunctionDecl(ast.Flags.declare, false);
                     },
                     .keyword_async => {
                         _ = try p.bump();
                         _ = try p.bump();
+                        const was_ambient = p.ambient;
+                        p.ambient = true;
+                        defer p.ambient = was_ambient;
                         return p.parseFunctionDecl(ast.Flags.declare | ast.Flags.async, false);
                     },
                     .keyword_class => {
                         _ = try p.bump();
+                        const was_ambient = p.ambient;
+                        p.ambient = true;
+                        defer p.ambient = was_ambient;
                         return p.parseClassDecl(ast.Flags.declare);
                     },
                     .keyword_abstract => {
                         _ = try p.bump();
                         _ = try p.bump();
+                        const was_ambient = p.ambient;
+                        p.ambient = true;
+                        defer p.ambient = was_ambient;
                         return p.parseClassDecl(ast.Flags.declare | ast.Flags.abstract);
                     },
                     .keyword_interface => {
@@ -968,10 +1115,33 @@ const Parser = struct {
     }
 
     fn parseBlock(p: *Parser) PE!Node {
+        return p.parseBlockAs(.plain);
+    }
+
+    /// The body of a function, method, accessor, constructor or arrow. Same
+    /// grammar as `parseBlock`; the distinction is TS1183 — tsc's
+    /// `checkGrammarStatementInAmbientContext` answers "an implementation cannot
+    /// be declared in ambient contexts" for a block whose parent is function-like
+    /// and "statements are not allowed" for one whose parent is a block, module
+    /// block or source file, and reports either on the block's first token.
+    fn parseFunctionBody(p: *Parser) PE!Node {
+        return p.parseBlockAs(.function_body);
+    }
+
+    const BlockRole = enum { plain, function_body };
+
+    fn parseBlockAs(p: *Parser, role: BlockRole) PE!Node {
+        const at_brace = p.curTag() == .l_brace;
         const l_brace = try p.expect(.l_brace, .expected_l_brace);
+        // An ambient body reports once, on the `{`, and suppresses the TS1036
+        // its own statements would otherwise each be a candidate for — tsc sets
+        // the "already reported" bit on the block, which is the very object the
+        // inner statements consult.
+        const ambient_body = role == .function_body and p.ambient and at_brace and p.spec == 0;
+        if (ambient_body) try p.errAtToken(.implementation_not_allowed_in_ambient, l_brace);
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
-        try p.parseStatementList(top, .r_brace);
+        try p.parseStatementList(top, .r_brace, ambient_body);
         _ = try p.expect(.r_brace, .expected_r_brace);
         const range = try p.scratchToSpan(top);
         return p.addNode(.{ .tag = .block, .main_token = l_brace, .data = .{ .lhs = range.start, .rhs = range.end } });
@@ -1283,6 +1453,7 @@ const Parser = struct {
         if (try p.eat(.asterisk) != null) flags |= ast.Flags.generator;
         var name_tok: u32 = 0;
         if (isIdentLike(p.curTag())) {
+            try p.checkStrictReserved();
             name_tok = try p.bump();
         } else if (!anon_ok) {
             try p.fail(.expected_identifier);
@@ -1290,7 +1461,7 @@ const Parser = struct {
         const proto = try p.parseFnProtoRest(flags, name_tok);
         var body: Node = null_node;
         if (p.curTag() == .l_brace) {
-            body = try p.parseBlock();
+            body = try p.parseFunctionBody();
         } else {
             // Overload signature / ambient declaration.
             try p.expectSemicolon();
@@ -1478,6 +1649,7 @@ const Parser = struct {
         }
         const start_tok = p.curIdx();
         var flags: u32 = 0;
+        var access_reported = false;
         // Constructor parameter properties: visibility/readonly/override.
         while (true) {
             const bit: u32 = switch (p.curTag()) {
@@ -1492,6 +1664,10 @@ const Parser = struct {
             // Only a modifier if a binding follows (else it's the name).
             const t1 = p.peekTag(1);
             if (!(isIdentLike(t1) or t1 == .l_bracket or t1 == .l_brace or t1 == .dot_dot_dot or t1 == .keyword_this)) break;
+            if (!access_reported and p.spec == 0 and accessibilityRepeat(flags, bit)) {
+                try p.errAtCur(.accessibility_modifier_already_seen);
+                access_reported = true;
+            }
             _ = try p.bump();
             flags |= bit;
         }
@@ -1540,6 +1716,7 @@ const Parser = struct {
             .l_brace => return p.parseObjectPattern(),
             else => {
                 if (isIdentLike(p.curTag())) {
+                    try p.checkStrictReserved();
                     const tok = try p.bump();
                     return p.addNode(.{ .tag = .identifier, .main_token = tok, .data = .{ .lhs = 0, .rhs = 0 } });
                 }
@@ -1669,6 +1846,11 @@ const Parser = struct {
         }
 
         _ = try p.expect(.l_brace, .expected_l_brace);
+        // Inside the body every strict-reserved word is TS1213 rather than
+        // TS1212 (tsc's `getContainingClass`), including in nested functions and
+        // nested classes — hence a depth counter rather than a flag.
+        p.class_depth += 1;
+        defer p.class_depth -= 1;
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
         while (p.curTag() != .r_brace and p.curTag() != .eof) {
@@ -1730,6 +1912,19 @@ const Parser = struct {
         return p.addNode(.{ .tag = .decorator, .main_token = at, .data = .{ .lhs = expr, .rhs = 0 } });
     }
 
+    /// TS1028, tsc's `checkGrammarModifiers`: at most one of
+    /// `public`/`private`/`protected` per member or parameter property. `already`
+    /// is the flag set accumulated so far, `bit` the modifier about to be
+    /// consumed; true when `bit` is the second one.
+    ///
+    /// tsc `return`s out of its whole modifier walk on the first hit, so
+    /// `public protected private x` is ONE diagnostic, not two — callers stop
+    /// asking once it has answered true.
+    fn accessibilityRepeat(already: u32, bit: u32) bool {
+        const access = ast.Flags.public | ast.Flags.private | ast.Flags.protected;
+        return bit & access != 0 and already & access != 0;
+    }
+
     fn parseClassMember(p: *Parser) PE!Node {
         const start_tok = p.curIdx();
 
@@ -1738,6 +1933,7 @@ const Parser = struct {
         if (p.curTag() == .at) return p.parseDecorator();
 
         var flags: u32 = 0;
+        var access_reported = false;
         while (true) {
             const bit: u32 = switch (p.curTag()) {
                 .keyword_static => ast.Flags.static,
@@ -1762,6 +1958,10 @@ const Parser = struct {
                 t1 == .numeric_literal or t1 == .l_bracket or t1 == .asterisk;
             if (!name_follows) break;
             if ((bit == ast.Flags.get or bit == ast.Flags.set or bit == ast.Flags.async) and p.peekNewline(1)) break;
+            if (!access_reported and p.spec == 0 and accessibilityRepeat(flags, bit)) {
+                try p.errAtCur(.accessibility_modifier_already_seen);
+                access_reported = true;
+            }
             _ = try p.bump();
             flags |= bit;
             // `static { ... }` initialization block: out of subset.
@@ -1845,7 +2045,7 @@ const Parser = struct {
             const proto = try p.parseFnProtoRest(flags, name_tok);
             var body: Node = null_node;
             if (p.curTag() == .l_brace) {
-                body = try p.parseBlock();
+                body = try p.parseFunctionBody();
             } else {
                 try p.expectSemicolon(); // overload signature / abstract
             }
@@ -1933,9 +2133,35 @@ const Parser = struct {
     }
 
     fn expectIdentLike(p: *Parser) PE!u32 {
-        if (isIdentLike(p.curTag())) return p.bump();
+        if (isIdentLike(p.curTag())) {
+            try p.checkStrictReserved();
+            return p.bump();
+        }
         try p.fail(.expected_identifier);
         return p.lastIdx();
+    }
+
+    /// TS1212/TS1213/TS1214, tsc's `checkStrictModeIdentifier`: a future-reserved
+    /// word standing where an *Identifier* is required. Call sites are the three
+    /// funnels that turn a token into an Identifier — a declaration name
+    /// (`expectIdentLike`), a binding name, and an identifier reference. Deliberately
+    /// NOT the IdentifierName positions, where every reserved word is legal:
+    /// after a `.`, as a member or property name, as an import/export specifier
+    /// name, or as a JSX name. Nor a modifier — `public x` reaches the modifier
+    /// loop, never this.
+    ///
+    /// ztsc is always-strict, so there is no mode to test; tsc reaches the same
+    /// state whenever `alwaysStrict` is on, which `strict` implies.
+    ///
+    /// Skipped while speculating: a construct that only ever gets parsed inside a
+    /// lookahead is not committed source, and the real parse reports it.
+    fn checkStrictReserved(p: *Parser) Error!void {
+        if (p.spec > 0) return;
+        if (!p.curTag().isStrictReservedKeyword()) return;
+        try p.errAtCur(if (p.class_depth > 0)
+            .strict_reserved_word_in_class
+        else
+            .strict_reserved_word);
     }
 
     /// A JSX tag or attribute name: `JsxIdentifier` is an *IdentifierName*, so
@@ -2033,7 +2259,7 @@ const Parser = struct {
         const was_ambient = p.ambient;
         p.ambient = was_ambient or flags & ast.Flags.declare != 0;
         defer p.ambient = was_ambient;
-        try p.parseStatementList(top, .r_brace);
+        try p.parseStatementList(top, .r_brace, false);
         _ = try p.expect(.r_brace, .expected_r_brace);
         const body = try p.scratchToSpan(top);
         const extra = try p.addExtra(ast.NamespaceData{
@@ -2058,7 +2284,7 @@ const Parser = struct {
         const was_ambient = p.ambient;
         p.ambient = true;
         defer p.ambient = was_ambient;
-        try p.parseStatementList(top, .r_brace);
+        try p.parseStatementList(top, .r_brace, false);
         _ = try p.expect(.r_brace, .expected_r_brace);
         const body = try p.scratchToSpan(top);
         const extra = try p.addExtra(ast.NamespaceData{
@@ -2105,7 +2331,7 @@ const Parser = struct {
         const was_ambient = p.ambient;
         p.ambient = true;
         defer p.ambient = was_ambient;
-        try p.parseStatementList(top, .r_brace);
+        try p.parseStatementList(top, .r_brace, false);
         _ = try p.expect(.r_brace, .expected_r_brace);
         const body = try p.scratchToSpan(top);
         const extra = try p.addExtra(ast.NamespaceData{
@@ -2125,6 +2351,7 @@ const Parser = struct {
             return p.parseExpressionStatement();
         }
         const kw = try p.bump(); // `import`
+        p.saw_module_syntax = true;
         var flags: u32 = 0;
 
         // `import "module";`
@@ -2262,6 +2489,7 @@ const Parser = struct {
 
     fn parseExportStatement(p: *Parser) PE!Node {
         const kw = try p.bump(); // `export`
+        p.saw_module_syntax = true;
         switch (p.curTag()) {
             .keyword_default => {
                 _ = try p.bump();
@@ -2667,7 +2895,7 @@ const Parser = struct {
     }
 
     fn parseArrowBody(p: *Parser, ctx: ExprCtx) PE!Node {
-        if (p.curTag() == .l_brace) return p.parseBlock();
+        if (p.curTag() == .l_brace) return p.parseFunctionBody();
         return p.parseAssignExpr(.{ .no_in = ctx.no_in });
     }
 
@@ -3345,7 +3573,10 @@ const Parser = struct {
                 return p.errorNode();
             },
             else => {
-                if (isIdentLike(p.curTag())) return p.leaf(.identifier);
+                if (isIdentLike(p.curTag())) {
+                    try p.checkStrictReserved();
+                    return p.leaf(.identifier);
+                }
                 try p.fail(.expected_expression);
                 return p.errorNode();
             },
@@ -3507,7 +3738,7 @@ const Parser = struct {
                 // Method shorthand: value is a function_expr.
                 const proto = try p.parseFnProtoRest(flags, key_tok);
                 var body: Node = null_node;
-                if (p.curTag() == .l_brace) body = try p.parseBlock() else try p.fail(.expected_l_brace);
+                if (p.curTag() == .l_brace) body = try p.parseFunctionBody() else try p.fail(.expected_l_brace);
                 const func = try p.addNode(.{ .tag = .function_expr, .main_token = key_tok, .data = .{ .lhs = proto, .rhs = body } });
                 return p.addNode(.{ .tag = .object_method, .main_token = key_tok, .data = .{ .lhs = key, .rhs = func } });
             },
@@ -5398,6 +5629,111 @@ test "unsupported constructs still leave following code parsable" {
 }
 
 // --- error recovery ----------------------------------------------------------------
+
+/// The (code, 1-based line, 1-based column) of every parse diagnostic, in the
+/// order recorded — the shape the TS-suite oracle compares, so a position
+/// regression shows up here rather than only in a 20-minute sweep.
+fn expectDiags(src: []const u8, opts: Opts, expected: []const struct { u16, u32, u32 }) !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const tree = try parseOpts(alloc, src, opts);
+    var got: std.ArrayList(u8) = .empty;
+    var want: std.ArrayList(u8) = .empty;
+    for (tree.diagnostics) |d| {
+        var line: u32 = 1;
+        var col: u32 = 1;
+        for (src[0..@min(d.span.start, src.len)]) |c| {
+            if (c == '\n') {
+                line += 1;
+                col = 1;
+            } else col += 1;
+        }
+        try got.print(alloc, "TS{d} {d}:{d}\n", .{ d.code.tsCode(), line, col });
+    }
+    for (expected) |e| try want.print(alloc, "TS{d} {d}:{d}\n", .{ e[0], e[1], e[2] });
+    try testing.expectEqualStrings(want.items, got.items);
+}
+
+test "literal grammar: octal, leading zeros, empty radix, bad escapes" {
+    // Codes and columns are tsgo 7.0.2's, verified by running both compilers
+    // over these exact lines.
+    try expectDiags("var a = 010;\n", .{}, &.{.{ 1121, 1, 9 }});
+    try expectDiags("var a = 08;\n", .{}, &.{.{ 1489, 1, 9 }});
+    try expectDiags("var a = 0x;\n", .{}, &.{.{ 1125, 1, 11 }});
+    try expectDiags("var a = 0b;\n", .{}, &.{.{ 1177, 1, 11 }});
+    try expectDiags("var a = 0o;\n", .{}, &.{.{ 1178, 1, 11 }});
+    try expectDiags("var a = \"\\101\";\n", .{}, &.{.{ 1487, 1, 10 }});
+    try expectDiags("var a = \"\\8\";\n", .{}, &.{.{ 1488, 1, 10 }});
+    try expectDiags("var a = \"\\x1\";\n", .{}, &.{.{ 1125, 1, 13 }});
+    try expectDiags("var a = \"\\u12\";\n", .{}, &.{.{ 1125, 1, 14 }});
+    try expectDiags("var a = \"\\u{110000}\";\n", .{}, &.{.{ 1198, 1, 13 }});
+    // Clean literals stay clean, `\0` alone is the NUL escape, and a tagged
+    // template's raw text is the tag's business (so templates are not walked).
+    try expectDiags("var a = 0;\nvar b = 0.5;\nvar c = 0x1F;\nvar d = 0o17;\nvar e = 0b101;\nvar f = 1e10;\nvar g = 10n;\n", .{}, &.{});
+    try expectDiags("var h = \"a\\nb\\0c\\x41\\u0041\\u{1F600}\";\n", .{}, &.{});
+    try expectDiags("var t = tag`\\101`;\n", .{}, &.{});
+}
+
+test "ambient context: TS1036 once per block, TS1183 on a body" {
+    try expectDiags("declare namespace N { var a: number; a; }\n", .{}, &.{.{ 1036, 1, 38 }});
+    // One per containing block: the second `a;` is silent, the nested block's
+    // own statement is not.
+    try expectDiags("declare namespace N { var a: number; a; a; { a; } }\n", .{}, &.{
+        .{ 1036, 1, 38 }, .{ 1036, 1, 46 },
+    });
+    try expectDiags("declare namespace N { ; }\n", .{}, &.{.{ 1036, 1, 23 }});
+    // Declarations are what an ambient context is for.
+    try expectDiags("declare namespace N { var a: number; function f(): void; class C {} interface I {} type T = number; enum E {} namespace M {} }\n", .{}, &.{});
+    // A body reports on its `{` and suppresses the statements inside it.
+    try expectDiags("declare function f(): void { return; }\n", .{}, &.{.{ 1183, 1, 28 }});
+    try expectDiags("declare class C { m() { } }\n", .{}, &.{.{ 1183, 1, 23 }});
+    // A `.d.ts` is ambient throughout.
+    try expectDiags("declare var a: number;\na;\n", .{ .dts = true }, &.{.{ 1036, 2, 1 }});
+}
+
+test "TS1028: one accessibility modifier per member" {
+    try expectDiags("class C { public private x = 1; }\n", .{}, &.{.{ 1028, 1, 18 }});
+    try expectDiags("class C { constructor(public private x: number) {} }\n", .{}, &.{.{ 1028, 1, 30 }});
+    // tsc returns out of its modifier walk on the first hit: one, not two.
+    try expectDiags("class C { public protected private x = 1; }\n", .{}, &.{.{ 1028, 1, 18 }});
+    try expectDiags("class C { public a = 1; private b = 2; protected c = 3; static d = 4; }\n", .{}, &.{});
+}
+
+test "TS1212/1213/1214: a strict-reserved word as an Identifier" {
+    try expectDiags("var yield = 1;\n", .{}, &.{.{ 1212, 1, 5 }});
+    try expectDiags("var package = 1;\nvar interface = 2;\nvar let = 3;\n", .{}, &.{
+        .{ 1212, 1, 5 }, .{ 1212, 2, 5 }, .{ 1212, 3, 5 },
+    });
+    try expectDiags("function f(public: number) { return public; }\n", .{}, &.{
+        .{ 1212, 1, 12 }, .{ 1212, 1, 37 },
+    });
+    // A class body is strict on its own account, a module likewise.
+    try expectDiags("class C { m() { var static = 1; } }\n", .{}, &.{.{ 1213, 1, 21 }});
+    try expectDiags("export var e = 1;\nvar static = 2;\n", .{}, &.{.{ 1214, 2, 5 }});
+    // IdentifierName positions take every reserved word: a property name, a
+    // member name, a member access, an export alias, an enum member. And a
+    // modifier is a modifier.
+    try expectDiags("var l = { yield: 1, static: 2 };\n", .{}, &.{});
+    try expectDiags("class D { static = 1; public = 2; }\nvar v = d.static + d.public;\n", .{}, &.{});
+    try expectDiags("var q = 1;\nexport { q as yield };\n", .{}, &.{});
+    try expectDiags("enum Col { yield = 1, static = 2 }\n", .{}, &.{});
+    // `yield` in expression position is a YieldExpression, not an identifier.
+    try expectDiags("function* g() { yield 1; yield* [2]; }\n", .{}, &.{});
+}
+
+test "one parse diagnostic per position (tsc's parseErrorAtPosition rule)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // Recovery reaches this token from three directions; tsc keeps the first.
+    const tree = try parse(arena.allocator(), "var a = { + };\n");
+    var seen: ?u32 = null;
+    for (tree.diagnostics) |d| {
+        if (d.code.class() != .syntactic) continue;
+        if (seen) |s| try testing.expect(s != d.span.start);
+        seen = d.span.start;
+    }
+}
 
 test "recovery: N distinct errors produce >= N diagnostics" {
     // Three separate statements, each with one syntax error.
