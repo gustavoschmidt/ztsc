@@ -1518,11 +1518,8 @@ fn checkCallArgumentsAnchored(c: *Checker, node: Node, sig: TypeId, arg_nodes: [
     //
     // Skipped when the call has a spread argument: the packed tuple would be
     // a guess, and guessing here can only invent a rejection.
-    const rest_union: ?TypeId = if (has_spread) null else try c.sigNonArrayRest(sig);
-    const whole_from: u32 = if (rest_union == null)
-        std.math.maxInt(u32)
-    else
-        c.ts.fnParamCount(sig) - 1;
+    const whole_rest = if (has_spread) null else try c.sigNonArrayRest(sig);
+    const whole_from: u32 = if (whole_rest) |w| w.from else std.math.maxInt(u32);
     var packed_elems: std.ArrayList(types.TupleElem) = .empty;
     defer packed_elems.deinit(c.scratch());
     var packed_first: Node = null_node;
@@ -1584,8 +1581,8 @@ fn checkCallArgumentsAnchored(c: *Checker, node: Node, sig: TypeId, arg_nodes: [
             if (reported_arg) noteArgBlame(c, anchor_out, before, c.nodeSpan(an), argErrorSpan(c, an));
         }
     }
-    if (report and !reported_arg and rest_union != null) {
-        const rest_ty = rest_union.?;
+    if (report and !reported_arg and whole_rest != null) {
+        const rest_ty = whole_rest.?.ty;
         const packed_ty = try c.ts.makeTuple(packed_elems.items);
         if (!try c.isAssignable(packed_ty, rest_ty)) {
             // tsc's error node: the single rest argument, or the range from

@@ -28,6 +28,8 @@ const Error = checker_zig.Error;
 const TpMap = @import("enums.zig").TpMap;
 const isUnitLikeKind = @import("assign.zig").isUnitLikeKind;
 const skipParens = @import("expr.zig").skipParens;
+const tuple_relate = @import("tuple_relate.zig");
+const typenode = @import("typenode.zig");
 
 /// tsc's `InferencePriority.ReturnType`: infer still-unbound type params by
 /// unifying the signature's return type against the structurally-resolved
@@ -2042,78 +2044,118 @@ pub fn revSlot(c: *Checker, candidates: []TypeId, i: usize) ?*bool {
     return &rev.flags[i];
 }
 
-/// tsc's `inferFromTupleTypes` prefix/suffix rule, for the one case ztsc's
-/// index-for-index pairing gets wrong: a target tuple with FIXED elements
-/// AFTER a variadic one.
+/// tsc's `inferFromTupleTypes`: how an array-or-tuple ARGUMENT pairs with a
+/// tuple PATTERN.
 ///
-/// `inferFromTupleTypes` does not walk a tuple pair from index 0. It computes
-/// a `startLength` — the fixed elements before the target's first variadic —
-/// and an `endLength` — the fixed elements after its last one — pairs the
-/// prefix from the START, pairs the suffix from the END, and gives whatever
-/// is between them to the variadic element. Index-for-index pairing is what
-/// that reduces to when the target has no variadic at all, which is why this
-/// is a strict addition and the loop below is untouched otherwise.
+/// The pairing is not index-for-index. tsc computes a `startLength` — the fixed
+/// elements before the pattern's first variable element — and an `endLength` —
+/// the fixed elements after its last one — pairs the prefix from the START,
+/// pairs the suffix from the END, and gives everything between them to the one
+/// variable element in the middle. Index-for-index pairing is what that reduces
+/// to when neither side has a variable element, which is why every fully fixed
+/// pair walks exactly as it did before.
 ///
-/// social-app's storage layer is the shape: `useStorage<Store, Key extends
-/// keyof StorageSchema<Store>>(storage: Store, scopes: [...StorageScopes<Store>,
-/// Key])` called as `useStorage(device, ['themeKey'])`, where
-/// `StorageScopes<device>` reduces to `[]`. Paired from index 0, `...Scopes`
-/// swallowed `'themeKey'`, `Key` was never inferred and fell back to its
-/// constraint `keyof Device` — so every read came back as the union of every
-/// value type in the schema, and the write side rejected every value. Writing
-/// the spread out (`[...[], K]`) hides the bug, because `makeTuple` flattens a
-/// rest element whose type is already a tuple.
+/// Three middles are handled, all of them tsc's:
 ///
-/// Returns whether it handled the pair. The middle is packed back into a tuple
-/// and offered to the variadic element's own type, which is what that element
-/// denotes (`checkConstArrayLiteral` stores the whole array/tuple type on a
-/// rest element, not its element type), so both a `...S` type parameter and a
-/// classic `...X[]` rest see the shape they expect.
-fn tupleWithTrailingFixed(
+///   * the ARGUMENT is a plain array, or one rest element covers its whole
+///     middle: every pattern element in the middle infers from that element
+///     type (a *variadic* pattern element infers from the whole array — it
+///     stands for a list, not a member of one);
+///   * one VARIADIC pattern element: it infers from the argument's middle
+///     packed back into a tuple, which is what that element denotes;
+///   * one REST pattern element: it infers from an array over the union of the
+///     argument's middle.
+///
+/// tsc has a fourth for TWO adjacent variadic pattern elements
+/// (`[...T, ...U]`), split by the arity a call site's trailing arguments imply;
+/// that needs the call's `impliedArity` threaded into inference and is not
+/// modelled — those patterns infer from the prefix and suffix only.
+///
+/// social-app's storage layer is the prefix/suffix shape: `useStorage<Store,
+/// Key extends keyof StorageSchema<Store>>(storage: Store, scopes:
+/// [...StorageScopes<Store>, Key])` called as `useStorage(device, ['themeKey'])`,
+/// where `StorageScopes<device>` reduces to `[]`. Paired from index 0,
+/// `...Scopes` swallowed `'themeKey'`, `Key` was never inferred and fell back to
+/// its constraint `keyof Device` — so every read came back as the union of every
+/// value type in the schema, and the write side rejected every value.
+fn inferFromTupleTypes(
     c: *Checker,
     param: TypeId,
     ra: TypeId,
     tp_syms: []const u32,
     candidates: []TypeId,
     depth: u32,
-) Error!bool {
+) Error!void {
     const s = &c.ts;
-    const pn = s.tupleLen(param);
-    const an = s.tupleLen(ra);
-    var rest_at: ?u32 = null;
-    for (0..pn) |i| {
-        if (s.tupleElem(param, @intCast(i)).rest()) {
-            // More than one variadic element: tsc's rule is written for a
-            // single one (`startLength`/`endLength` are measured against the
-            // FIRST and LAST), and nothing in this corpus needs the general
-            // case. Leave those to the existing loop.
-            if (rest_at != null) return false;
-            rest_at = @intCast(i);
-        }
-    }
-    const r = rest_at orelse return false;
-    const suffix = pn - r - 1;
-    if (suffix == 0) return false; // rest is last — today's loop already
+    const src_tuple = s.kind(ra) == .tuple;
+    const p_arity = s.tupleLen(param);
+    const s_arity: u32 = if (src_tuple) s.tupleLen(ra) else 1;
+    const p_fixed = tuple_relate.fixedLength(c, param);
+    const p_variable = p_fixed < p_arity;
+    const start = @min(if (src_tuple) tuple_relate.fixedLength(c, ra) else 0, p_fixed);
+    const end = @min(
+        if (src_tuple) endFixedCount(c, ra) else 0,
+        if (p_variable) endFixedCount(c, param) else 0,
+    );
     // The argument must be long enough to fill both fixed ends; if it is not,
-    // there is no consistent split and the ordinary pairing is no worse.
-    if (an < r + suffix) return false;
-    // A variadic element in the SOURCE would make "which argument element is
-    // at position n from the end" undecidable here.
-    for (0..an) |i| if (s.tupleElem(ra, @intCast(i)).rest()) return false;
-    for (0..r) |i| {
+    // there is no consistent split and nothing here can be trusted.
+    if (start + end > s_arity or start + end > p_arity) return;
+
+    for (0..start) |i| {
         try c.unify(s.tupleElem(param, @intCast(i)).ty, s.tupleElem(ra, @intCast(i)).ty, tp_syms, candidates, depth + 1);
     }
-    for (0..suffix) |i| {
-        const pi: u32 = @intCast(pn - 1 - i);
-        const ai: u32 = @intCast(an - 1 - i);
+
+    const mid_src = s_arity - start - end;
+    const one_rest_middle = !src_tuple or
+        (mid_src == 1 and tuple_relate.elemKind(c, s.tupleElem(ra, start)) == .rest);
+    if (one_rest_middle) {
+        // `rest_arr` is the ARRAY the middle spans; `rest_elem` one member of
+        // it. ztsc stores the array on a rest element where tsc stores the
+        // element type and rebuilds the array with `createArrayType`.
+        const rest_arr = if (src_tuple) s.tupleElem(ra, start).ty else ra;
+        const rest_elem = try c.elemOfArrayish(rest_arr);
+        var i = start;
+        while (i < p_arity - end) : (i += 1) {
+            const pe = s.tupleElem(param, i);
+            const arg_ty = if (tuple_relate.elemKind(c, pe) == .variadic) rest_arr else rest_elem;
+            try c.unify(pe.ty, arg_ty, tp_syms, candidates, depth + 1);
+        }
+    } else if (p_arity - start - end == 1) {
+        const pe = s.tupleElem(param, start);
+        switch (tuple_relate.elemKind(c, pe)) {
+            .variadic => try c.unify(pe.ty, try typenode.sliceTuple(c, ra, start, end), tp_syms, candidates, depth + 1),
+            .rest => {
+                const mid = try c.scratch().alloc(TypeId, mid_src);
+                defer c.scratch().free(mid);
+                for (mid, 0..) |*m, k| {
+                    const e = s.tupleElem(ra, @intCast(start + k));
+                    m.* = if (e.rest()) try c.elemOfArrayish(e.ty) else e.ty;
+                }
+                const u = try s.makeUnion(c.scratch(), mid);
+                try c.unify(pe.ty, try s.makeArray(u), tp_syms, candidates, depth + 1);
+            },
+            // A FIXED pattern element cannot absorb a run of argument
+            // elements; tsc has no arm for it either.
+            .required, .optional => {},
+        }
+    }
+
+    for (0..end) |i| {
+        const pi: u32 = @intCast(p_arity - 1 - i);
+        const ai: u32 = @intCast(s_arity - 1 - i);
         try c.unify(s.tupleElem(param, pi).ty, s.tupleElem(ra, ai).ty, tp_syms, candidates, depth + 1);
     }
-    const mid_len = an - r - suffix;
-    const mid = try c.scratch().alloc(types.TupleElem, mid_len);
-    defer c.scratch().free(mid);
-    for (mid, 0..) |*m, i| m.* = s.tupleElem(ra, @intCast(r + i));
-    try c.unify(s.tupleElem(param, r).ty, try s.makeTuple(mid), tp_syms, candidates, depth + 1);
-    return true;
+}
+
+/// tsc's `getEndElementCount(t, ElementFlags.Fixed)`: how many TRAILING
+/// elements occupy exactly one position each.
+fn endFixedCount(c: *const Checker, tup: TypeId) u32 {
+    const len = c.ts.tupleLen(tup);
+    var n: u32 = 0;
+    while (n < len) : (n += 1) {
+        if (tuple_relate.elemKind(c, c.ts.tupleElem(tup, len - 1 - n)).variable()) break;
+    }
+    return n;
 }
 
 pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, candidates: []TypeId, depth: u32) Error!void {
@@ -2350,12 +2392,8 @@ pub fn unify(c: *Checker, param: TypeId, arg: TypeId, tp_syms: []const u32, cand
                 }
                 return;
             }
-            if (s.kind(ra) == .tuple) {
-                if (try tupleWithTrailingFixed(c, param, ra, tp_syms, candidates, depth)) return;
-                const n = @min(s.tupleLen(param), s.tupleLen(ra));
-                for (0..n) |i| {
-                    try c.unify(s.tupleElem(param, @intCast(i)).ty, s.tupleElem(ra, @intCast(i)).ty, tp_syms, candidates, depth + 1);
-                }
+            if (s.kind(ra) == .tuple or s.kind(ra) == .array) {
+                try inferFromTupleTypes(c, param, ra, tp_syms, candidates, depth);
             }
         },
         .union_type => {
