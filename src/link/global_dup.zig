@@ -89,6 +89,34 @@ fn memberBits(f: SymbolFlags) u32 {
     return f.bits() & bind_result.mask_member;
 }
 
+/// The clash between a class's STATIC member and the same-named EXPORTED member
+/// of the namespace it merges with, or null when they merge.
+///
+/// This is `mergeClash`'s rule read across ztsc's member/value split. tsc has no
+/// such split: `SymbolFlags.Value` *includes* `Property | Method | Accessor`, and
+/// a class's statics ARE its `exports` table, so every `…Excludes` mask that
+/// covers `Value` covers a static member too. `VariableExcludes`,
+/// `FunctionExcludes`, `ClassExcludes` and `ValueModuleExcludes` all do —
+/// meaning any value-meaning namespace export collides with any static of the
+/// same name — while the type-space-only masks (`InterfaceExcludes`,
+/// `TypeAliasExcludes`) do not, so
+///
+///     class C { static X: number }
+///     namespace C { export interface X {} }     // legal
+///     namespace C { export var X = 1 }          // TS2300 on both
+///
+/// The static side must actually BE a member: an entry the binder filed in the
+/// statics table without a member kind (a shape this walk does not model) is not
+/// judged, the same refusal `membersMerge` makes.
+pub fn cloduleClash(static_flags: SymbolFlags, ns_flags: SymbolFlags) ?Code {
+    if (memberBits(static_flags) == 0) return null;
+    if (bind_result.effectiveBits(ns_flags) & bind_result.mask_value == 0) return null;
+    // `mergeClash`'s message order, with the same two special cases.
+    if (ns_flags.enum_decl) return .enum_merge_conflict;
+    if (ns_flags.let_decl or ns_flags.const_decl) return .block_scoped_redeclare;
+    return .duplicate_identifier;
+}
+
 /// The clash among the same-named MEMBERS contributed by the blocks of one
 /// cross-file merged interface, or null when they all merge.
 ///
@@ -163,6 +191,30 @@ pub fn reportAll(
             try diags[c.file].append(arena, .{ .code = ts, .span = span, .msg = msg });
         }
     }
+}
+
+test "cloduleClash: a class static against its namespace's exports" {
+    const t = std.testing;
+    const clash = cloduleClash;
+    // Every value-meaning export collides with a static of the same name.
+    try t.expectEqual(@as(?Code, .duplicate_identifier), clash(.{ .property = true }, .{ .var_decl = true }));
+    try t.expectEqual(@as(?Code, .duplicate_identifier), clash(.{ .method = true }, .{ .function = true }));
+    try t.expectEqual(@as(?Code, .duplicate_identifier), clash(.{ .getter = true }, .{ .function = true }));
+    try t.expectEqual(@as(?Code, .duplicate_identifier), clash(.{ .property = true }, .{ .class = true }));
+    try t.expectEqual(@as(?Code, .duplicate_identifier), clash(.{ .property = true }, .{ .namespace_decl = true }));
+    try t.expectEqual(@as(?Code, .block_scoped_redeclare), clash(.{ .property = true }, .{ .const_decl = true }));
+    try t.expectEqual(@as(?Code, .enum_merge_conflict), clash(.{ .property = true }, .{ .enum_decl = true }));
+    // Type space alone never reaches the statics table.
+    try t.expectEqual(@as(?Code, null), clash(.{ .property = true }, .{ .interface = true }));
+    try t.expectEqual(@as(?Code, null), clash(.{ .property = true }, .{ .type_alias = true }));
+    // A non-instantiated namespace occupies no exclusion space (tsc's
+    // `NamespaceModuleExcludes = 0`), and neither side is judged without a
+    // member kind on the static.
+    try t.expectEqual(@as(?Code, null), clash(
+        .{ .property = true },
+        .{ .namespace_decl = true, .ns_uninstantiated = true },
+    ));
+    try t.expectEqual(@as(?Code, null), clash(.{}, .{ .var_decl = true }));
 }
 
 test "memberClash: two interface blocks' same-named members" {

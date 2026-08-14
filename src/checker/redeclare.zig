@@ -20,6 +20,7 @@ const std = @import("std");
 
 const ast = @import("../frontend/ast.zig");
 const binder = @import("../frontend/binder.zig");
+const diagnostics = @import("../frontend/diagnostics.zig");
 const global_dup = @import("../link/global_dup.zig");
 const intern = @import("../intern.zig");
 const modules = @import("../link/modules.zig");
@@ -318,6 +319,77 @@ pub fn checkSubsequentVarDecl(c: *Checker, decl: Node, is_const: bool) Error!voi
         "Subsequent variable declarations must have the same type.  Variable '{s}' must be of type '{s}', but here has type '{s}'.",
         .{ c.tokenText(tok), try c.typeToString(sym_ty), try c.typeToString(decl_ty) },
     );
+}
+
+// ===========================================================================
+// TS2300 — a clodule's statics against its namespace's exports
+// ===========================================================================
+
+/// A `class C` merged with a `namespace C` (a "clodule") has ONE export table in
+/// tsc: a class's STATIC members *are* its `exports`, and `mergeSymbol` folds the
+/// namespace's exports into them. So a static member and an EXPORTED namespace
+/// member of the same name collide, and tsc reports at every declaration of both:
+///
+///     class Point { static Origin: Point = …; }
+///     namespace Point { export var Origin = ""; }   // TS2300 on both `Origin`s
+///
+/// ztsc keeps the two in separate scopes (`staticsScopeOf`, `namespaceScopeOf`),
+/// which is why neither the binder nor the linker's global merge ever compares
+/// them. This does, with `global_dup.cloduleClash` deciding — so a static method
+/// beside an exported function clashes
+/// (`ClassAndModuleThatMergeWithStaticFunctionAndExportedFunctionThatShareAName`)
+/// while a static beside an exported `interface` does not.
+///
+/// Scope: the class's OWN file. Both halves of a clodule written across files are
+/// a cross-file merge with no diagnostic surface here, and an under-report there
+/// is the safe direction. Cost: two already-sorted member segments merged, and
+/// only for a symbol that is both a class and a namespace.
+pub fn checkCloduleMemberDups(c: *Checker, sym: SymbolId) Error!void {
+    const local = c.localOf(sym);
+    const b = c.bind;
+    const ss = b.staticsScopeOf(local) orelse return;
+    const ns = b.namespaceScopeOf(local) orelse return;
+
+    const s_lo = b.scope_members_start[ss];
+    const s_hi = b.scope_members_start[ss + 1];
+    const n_lo = b.scope_members_start[ns];
+    const n_hi = b.scope_members_start[ns + 1];
+    var i = s_lo;
+    var j = n_lo;
+    while (i < s_hi and j < n_hi) {
+        const sa = b.member_atoms[i];
+        const na = b.member_atoms[j];
+        if (sa < na) {
+            i += 1;
+            continue;
+        }
+        if (na < sa) {
+            j += 1;
+            continue;
+        }
+        defer {
+            i += 1;
+            j += 1;
+        }
+        const s_sym = b.member_syms[i];
+        const n_sym = b.member_syms[j];
+        // Only an EXPORTED namespace member reaches the shared table; a block
+        // local is invisible to the class side (see `mergesAcrossBlocks`).
+        if (!b.symbol_flags[n_sym].exported) continue;
+        const code = global_dup.cloduleClash(b.symbol_flags[s_sym], b.symbol_flags[n_sym]) orelse continue;
+        try reportAtDecls(c, s_sym, code);
+        try reportAtDecls(c, n_sym, code);
+    }
+}
+
+/// Report `code` at the name of every declaration of a LOCAL symbol of the
+/// current file. A declaration whose name is not a single token (a destructuring
+/// pattern) has no span to point at and is skipped.
+fn reportAtDecls(c: *Checker, local: SymbolId, code: diagnostics.Code) Error!void {
+    for (c.bind.declsOf(local)) |decl| {
+        const tok = c.tree.declNameToken(decl) orelse continue;
+        try c.diagFmt(code.tsCode(), c.tokSpan(tok), "Duplicate identifier '{s}'.", .{c.tokenText(tok)});
+    }
 }
 
 // ===========================================================================
