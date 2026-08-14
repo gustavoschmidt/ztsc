@@ -455,6 +455,61 @@ pub fn checkCallExprInner(c: *Checker, node: Node, is_new: bool, ctx: TypeId) Er
             for (0..c.ts.objectConstructSigCount(r)) |i| {
                 try sigs.append(c.scratch(), c.ts.objectConstructSig(r, @intCast(i)));
             }
+        } else if (rk == .union_type) {
+            // `new (A | B)(…)`: tsc's `getUnionSignatures` runs over CONSTRUCT
+            // signatures exactly as it does over call signatures, so this is
+            // the `.union_type` call arm below with the construct list — the
+            // union is constructable iff EVERY constituent is, the gathered
+            // per-constituent lists are combined position-wise when each
+            // contributed exactly one, and an `any`/`err` member makes the
+            // whole `new` an `any`. Without it every `new` on a union of
+            // construct-signature objects was TS2351 (43 of them in
+            // `unionTypeConstructSignatures` alone).
+            var all_ctor = true;
+            var saw_any = false;
+            var starts: std.ArrayList(u32) = .empty;
+            defer starts.deinit(c.scratch());
+            const members = try c.scratch().dupe(TypeId, try c.memberList(r));
+            defer c.scratch().free(members);
+            for (members) |m| {
+                const before: u32 = @intCast(sigs.items.len);
+                const rm = try c.resolveStructural(m);
+                switch (c.ts.kind(rm)) {
+                    .any, .err => saw_any = true,
+                    .never => {},
+                    .object => {
+                        const n = c.ts.objectConstructSigCount(rm);
+                        if (n == 0) {
+                            all_ctor = false;
+                        } else for (0..n) |i| {
+                            try sigs.append(c.scratch(), c.ts.objectConstructSig(rm, @intCast(i)));
+                        }
+                    },
+                    else => all_ctor = false,
+                }
+                if (@as(u32, @intCast(sigs.items.len)) != before) {
+                    try starts.append(c.scratch(), before);
+                }
+            }
+            if (!all_ctor) {
+                try c.diagFmt(2351, c.nodeSpan(shape.callee), "This expression is not constructable.", .{});
+                for (shape.arg_nodes) |an| {
+                    if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
+                }
+                return .{ .ty = types.error_type, .chained = chained };
+            }
+            if (!saw_any and starts.items.len > 1) {
+                if (try combinedUnionSignature(c, sigs.items, starts.items)) |combined| {
+                    sigs.clearRetainingCapacity();
+                    try sigs.append(c.scratch(), combined);
+                }
+            }
+            if (saw_any or sigs.items.len == 0) {
+                for (shape.arg_nodes) |an| {
+                    if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
+                }
+                return .{ .ty = types.any_type, .chained = chained };
+            }
         } else {
             try c.diagFmt(2351, c.nodeSpan(shape.callee), "This expression is not constructable.", .{});
             for (shape.arg_nodes) |an| {
@@ -683,6 +738,32 @@ pub fn countArgs(arg_nodes: []const Node) usize {
     return n;
 }
 
+/// The parameter counts of every candidate an overload set rejected on ARITY,
+/// folded together the way tsc's `getArgumentArityError` folds them: the
+/// smallest minimum, the largest maximum, whether any candidate takes a rest
+/// parameter, and — for the "no overload expects N arguments" form — the
+/// closest counts on either side of the call's own argument count.
+const ArityTally = struct {
+    seen: bool = false,
+    min: u32 = std.math.maxInt(u32),
+    max: u32 = 0,
+    rest: bool = false,
+    below: ?u32 = null, // largest minimum still BELOW the argument count
+    above: ?u32 = null, // smallest maximum still ABOVE it
+
+    fn note(a: *ArityTally, required: u32, total: u32, nargs: usize) void {
+        a.seen = true;
+        if (required < a.min) a.min = required;
+        if (total == std.math.maxInt(u32)) {
+            a.rest = true;
+        } else if (total > a.max) {
+            a.max = total;
+        }
+        if (required < nargs and (a.below == null or required > a.below.?)) a.below = required;
+        if (total != std.math.maxInt(u32) and total > nargs and (a.above == null or total < a.above.?)) a.above = total;
+    }
+};
+
 /// Pick a signature (first match for overloads, like tsc), infer type
 /// arguments, check arguments, and return the (instantiated) return
 /// type; `instance_ret` overrides the return for `new`.
@@ -720,6 +801,7 @@ fn resolveSignatureCall(
     // decides where the report lands — so count them here.
     var arg_err_count: usize = 0;
     var last_arg_err: TypeId = types.no_type;
+    var arity: ArityTally = .{};
     for (sigs) |sig| {
         // With explicit type arguments, only a signature with the matching
         // type-parameter count is a candidate (tsc). Skips e.g. the
@@ -768,7 +850,13 @@ fn resolveSignatureCall(
         const saved_inst_count = c.inst_count;
         const saved_inst_trip = c.inst_limit_tripped;
         const inst = try c.instantiateSigForCall(sig, explicit_targs, arg_nodes, node, ret_ctx);
-        if (nargs < try c.requiredParams(inst) or nargs > try c.paramTotal(inst)) {
+        const req = try c.requiredParams(inst);
+        const tot = try c.paramTotal(inst);
+        if (nargs < req or nargs > tot) {
+            // Fold this candidate into the set-wide arity picture tsc reports
+            // when NO candidate ever reaches argument checking. A truncated
+            // instantiation has no arity to contribute (see `checkCallArguments`).
+            if (c.ts.kind(inst) == .function) arity.note(req, tot, nargs);
             c.rollbackArgDiags(saved_infer, infer_file, arg_nodes);
             c.inst_count = saved_inst_count;
             c.newBudgetWindow();
@@ -785,6 +873,31 @@ fn resolveSignatureCall(
         c.inst_limit_tripped = saved_inst_trip;
         arg_err_count += 1;
         last_arg_err = sig;
+    }
+    // NO candidate reached argument checking: every one of them was rejected on
+    // ARITY. tsc's `reportCallResolutionErrors` then has an empty
+    // `candidatesForArgumentError` pile and reports out of the other one —
+    // `getArgumentArityError` over the whole set — with no TS2769 at all. Twelve
+    // of the suite's TS2769/TS2554 divergences are exactly this pile mix-up.
+    //
+    // A call carrying a SPREAD argument is left alone: its argument count is not
+    // known statically, so tsc answers with TS2556 about the spread instead, and
+    // guessing a count here could only invent an arity claim.
+    if (arg_err_count == 0 and arity.seen and !hasSpreadArg(c, arg_nodes)) {
+        if (nargs > arity.min and nargs < arity.max and !arity.rest) {
+            try c.diagFmt(2575, calleeErrorSpan(c, node), "No overload expects {d} arguments, but overloads do exist that expect either {d} or {d} arguments.", .{
+                nargs, arity.below orelse arity.min, arity.above orelse arity.max,
+            });
+        } else {
+            try reportArityError(c, node, arg_nodes, nargs, arity.min, arity.max, arity.rest);
+        }
+        // Type the arguments (no report) and carry on with the first candidate,
+        // exactly as the TS2769 path below does.
+        const inst_one = try c.instantiateSigForCall(sigs[0], explicit_targs, arg_nodes, node, ret_ctx);
+        for (arg_nodes) |an| {
+            if (an != null_node) _ = try c.checkExprCached(an, types.no_type);
+        }
+        return if (instance_ret != types.no_type) instance_ret else c.ts.fnReturn(inst_one);
     }
     // No candidate matched. tsc does not report at the callee: it re-checks
     // the LAST candidate with error reporting on and files the TS2769 where
@@ -1280,10 +1393,7 @@ fn checkCallArgumentsAnchored(c: *Checker, node: Node, sig: TypeId, arg_nodes: [
     const nargs = countArgs(arg_nodes);
     const required = try c.requiredParams(sig);
     const total = try c.paramTotal(sig);
-    var has_spread = false;
-    for (arg_nodes) |an| {
-        if (an != null_node and c.nodeTag(an) == .spread_element) has_spread = true;
-    }
+    const has_spread = hasSpreadArg(c, arg_nodes);
     // A TRUNCATION IS NOT AN ARITY. `instantiateId`'s depth/count guard fires
     // *before* the `.function` arm runs and collapses the whole signature to
     // `error_type`, and every `fn*` accessor then reads that as a signature
@@ -1305,20 +1415,8 @@ fn checkCallArgumentsAnchored(c: *Checker, node: Node, sig: TypeId, arg_nodes: [
     // parameters `any`.
     const arity_known = c.ts.kind(sig) == .function;
     if (report and !has_spread and arity_known) {
-        if (nargs < required) {
-            if (total == std.math.maxInt(u32)) {
-                try c.diagFmt(2555, c.nodeSpan(node), "Expected at least {d} arguments, but got {d}.", .{ required, nargs });
-            } else if (required != total) {
-                try c.diagFmt(2554, c.nodeSpan(node), "Expected {d}-{d} arguments, but got {d}.", .{ required, total, nargs });
-            } else {
-                try c.diagFmt(2554, c.nodeSpan(node), "Expected {d} arguments, but got {d}.", .{ required, nargs });
-            }
-        } else if (nargs > total) {
-            if (required != total) {
-                try c.diagFmt(2554, c.nodeSpan(node), "Expected {d}-{d} arguments, but got {d}.", .{ required, total, nargs });
-            } else {
-                try c.diagFmt(2554, c.nodeSpan(node), "Expected {d} arguments, but got {d}.", .{ total, nargs });
-            }
+        if (nargs < required or nargs > total) {
+            try reportArityError(c, node, arg_nodes, nargs, required, total, total == std.math.maxInt(u32));
         }
     }
     // tsc reports at most ONE argument error per call. `checkApplicableSignature`
@@ -1461,6 +1559,82 @@ fn noteArgBlame(c: *Checker, anchor_out: ?*?Span, before: usize, arg_span: Span,
 /// The arrow's opening tokens are recovered from the source text rather than the
 /// token array (the AST records only the `=>`); an intervening comment stops the
 /// walk, leaving the span where it already was.
+/// tsc's `getArgumentArityError`, message and SPAN both. `min`/`max` are the
+/// parameter counts over the whole candidate set (a lone signature is a set of
+/// one) and `has_rest` says some candidate takes a rest parameter — which is
+/// what turns "Expected N" into "Expected at least N", and what makes the
+/// too-many branch unreachable (a rest candidate accepts any surplus).
+///
+/// Verified against tsgo 7.0.2, whose three spans are all different:
+/// too FEW arguments blames the callee (the member NAME for `o.m()`, the whole
+/// node for `new`), too MANY blames the surplus ARGUMENTS, and the
+/// "no overload expects N" form blames the callee again.
+fn reportArityError(
+    c: *Checker,
+    node: Node,
+    arg_nodes: []const Node,
+    nargs: usize,
+    min: u32,
+    max: u32,
+    has_rest: bool,
+) Error!void {
+    if (has_rest) {
+        try c.diagFmt(2555, calleeErrorSpan(c, node), "Expected at least {d} arguments, but got {d}.", .{ min, nargs });
+        return;
+    }
+    const span = if (nargs > max)
+        extraArgsSpan(c, arg_nodes, max) orelse calleeErrorSpan(c, node)
+    else
+        calleeErrorSpan(c, node);
+    if (min != max) {
+        try c.diagFmt(2554, span, "Expected {d}-{d} arguments, but got {d}.", .{ min, max, nargs });
+    } else {
+        try c.diagFmt(2554, span, "Expected {d} arguments, but got {d}.", .{ max, nargs });
+    }
+}
+
+/// Where tsc's `getDiagnosticForCallNode` puts a call-level diagnostic: only a
+/// CALL narrows to its callee — and to the member NAME when the callee is a
+/// member access — while `new`, a tagged template and a decorator all report
+/// on the whole node.
+fn calleeErrorSpan(c: *Checker, node: Node) Span {
+    switch (c.nodeTag(node)) {
+        .call_expr, .call_expr_targs, .optional_call => {},
+        else => return c.nodeSpan(node),
+    }
+    const callee = c.callShape(node).callee;
+    return switch (c.nodeTag(callee)) {
+        .member_expr, .optional_member_expr => c.tokSpan(c.tree.nodeData(callee).rhs),
+        else => c.nodeSpan(callee),
+    };
+}
+
+fn hasSpreadArg(c: *Checker, arg_nodes: []const Node) bool {
+    for (arg_nodes) |an| {
+        if (an != null_node and c.nodeTag(an) == .spread_element) return true;
+    }
+    return false;
+}
+
+/// `args[max].pos` through the last argument's end — tsc's span for a call
+/// with too many arguments. Null when there is no argument at that position
+/// (nothing to blame, so the caller falls back to the callee).
+fn extraArgsSpan(c: *Checker, arg_nodes: []const Node, from: u32) ?Span {
+    var i: u32 = 0;
+    var start: ?u32 = null;
+    var end: u32 = 0;
+    for (arg_nodes) |an| {
+        if (an == null_node) continue;
+        defer i += 1;
+        if (i < from) continue;
+        const sp = c.nodeSpan(an);
+        if (start == null) start = sp.start;
+        end = sp.end;
+    }
+    const s = start orelse return null;
+    return .{ .start = s, .end = if (end > s) end else s + 1 };
+}
+
 fn argErrorSpan(c: *Checker, n: Node) Span {
     const span = c.nodeSpan(n);
     switch (c.nodeTag(n)) {

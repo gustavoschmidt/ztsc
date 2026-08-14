@@ -3501,6 +3501,7 @@ pub const Checker = struct {
 
     const assign_zig = @import("checker/assign.zig");
     pub const isComparable = assign_zig.isComparable;
+    pub const relationalComparable = assign_zig.relationalComparable;
     pub const maybeAssignable = assign_zig.maybeAssignable;
     pub const castComparable = assign_zig.castComparable;
     pub const castComparableRec = assign_zig.castComparableRec;

@@ -599,7 +599,7 @@ pub fn holeAccepts(c: *Checker, hole0: TypeId, str: []const u8) Error!bool {
     switch (s.kind(hole)) {
         .string, .any, .err => return true,
         .number => return isNumericString(str),
-        .bigint => return isNumericString(str),
+        .bigint => return isBigIntString(str),
         .boolean => return std.mem.eql(u8, str, "true") or std.mem.eql(u8, str, "false"),
         .bool_true => return std.mem.eql(u8, str, "true"),
         .bool_false => return std.mem.eql(u8, str, "false"),
@@ -611,14 +611,76 @@ pub fn holeAccepts(c: *Checker, hole0: TypeId, str: []const u8) Error!bool {
             }
             return false;
         },
+        // Every conjunct has to admit the text — `${`${string}a` & `a${string}`}`
+        // is satisfied by "aba" and by nothing that fails either pattern. An
+        // EMPTY-OBJECT conjunct is the `NonNullable<string>` spelling
+        // (`string & {}`) and constrains no string at all: tsc reaches such a
+        // hole through plain assignability of the literal, which `{}` always
+        // accepts.
+        .intersection => {
+            const members = try c.scratch().dupe(TypeId, try c.memberList(hole));
+            defer c.scratch().free(members);
+            for (members) |m| {
+                if (try c.holeAccepts(m, str)) continue;
+                if (c.isEmptyObjectType(try c.resolveStructural(m))) continue;
+                return false;
+            }
+            return true;
+        },
         .template_literal_type => return c.matchTemplatePattern(str, hole),
         else => return false,
     }
 }
 
+/// tsc's `isValidNumberString`: a `${number}` hole admits exactly the strings
+/// JS `Number(s)` turns into a FINITE number, minus the empty one. That admits
+/// the radix forms (`0x1`, `0o1`, `0b1`) and exponents and surrounding
+/// whitespace, and rejects `NaN`, the infinities and a numeric separator.
+///
+/// Zig's `parseFloat` disagrees at both ends — it accepts `nan`/`inf` and
+/// refuses `0b1` — so the radix forms are decided here and the non-finite
+/// results screened after. Oracle-verified on
+/// `conformance/types/literal/templateLiteralTypesPatterns`, which names all
+/// eleven shapes.
 pub fn isNumericString(str: []const u8) bool {
-    if (str.len == 0) return false;
-    _ = std.fmt.parseFloat(f64, str) catch return false;
+    // `Number()` applies ToNumber, which trims whitespace first.
+    const s = std.mem.trim(u8, str, " \t\n\r");
+    if (s.len == 0) return false;
+    // A separator is legal in a numeric LITERAL and never in a string.
+    if (std.mem.indexOfScalar(u8, s, '_') != null) return false;
+    if (radixBase(s)) |base| return allDigitsIn(s[2..], base);
+    const n = std.fmt.parseFloat(f64, s) catch return false;
+    return std.math.isFinite(n);
+}
+
+/// tsc's `isValidBigIntString`: `s + "n"` has to scan as one BigInt literal —
+/// an optional `-`, then a decimal integer or a radix form, with no separator,
+/// no fraction and no exponent. Whitespace is NOT trimmed (tsc scans with
+/// `skipTrivia: false`), and a leading zero is not a BigInt literal.
+pub fn isBigIntString(str: []const u8) bool {
+    const s = if (str.len != 0 and str[0] == '-') str[1..] else str;
+    if (s.len == 0) return false;
+    if (std.mem.indexOfScalar(u8, s, '_') != null) return false;
+    if (radixBase(s)) |base| return allDigitsIn(s[2..], base);
+    if (!allDigitsIn(s, 10)) return false;
+    return s.len == 1 or s[0] != '0';
+}
+
+/// The base of a `0x`/`0o`/`0b` prefix, or null. A SIGN is not allowed in front
+/// of one (`Number("-0x1")` is `NaN`), so the caller passes the unsigned text.
+fn radixBase(s: []const u8) ?u8 {
+    if (s.len < 3 or s[0] != '0') return null;
+    return switch (s[1]) {
+        'x', 'X' => 16,
+        'o', 'O' => 8,
+        'b', 'B' => 2,
+        else => null,
+    };
+}
+
+fn allDigitsIn(s: []const u8, base: u8) bool {
+    if (s.len == 0) return false;
+    for (s) |ch| _ = std.fmt.charToDigit(ch, base) catch return false;
     return true;
 }
 

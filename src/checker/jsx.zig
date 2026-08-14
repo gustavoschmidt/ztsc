@@ -66,6 +66,7 @@ pub fn checkJsxElement(c: *Checker, node: Node) Error!TypeId {
     const e = c.tree.extraData(ast.JsxElementData, c.tree.nodeData(node).lhs);
     var props: TypeId = types.no_type; // no_type = unknown target (skip attr typing)
     var is_component = false;
+    var overloads_exhausted = false;
     if (e.tag == null_node) {
         // Fragment `<>…</>`: no attributes, no props.
     } else if (c.isIntrinsicJsxTag(e.tag)) {
@@ -101,9 +102,15 @@ pub fn checkJsxElement(c: *Checker, node: Node) Error!TypeId {
         for (c.tree.extraRange(e.targs_start, e.targs_end)) |tn| {
             if (tn != null_node) try targs.append(c.scratch(), try c.typeFromTypeNode(tn));
         }
-        props = (try c.jsxComponentProps(tag_ty, targs.items, node)) orelse types.no_type;
+        const chosen = try c.jsxComponentProps(tag_ty, targs.items, node);
+        props = chosen.props orelse types.no_type;
+        overloads_exhausted = chosen.overloads_exhausted;
     }
-    try c.checkJsxAttributes(node, e, props, is_component, c.jsxChildrenPresent(e));
+    if (overloads_exhausted) {
+        try reportJsxOverloadFailure(c, node, e, props);
+    } else {
+        try c.checkJsxAttributes(node, e, props, is_component, c.jsxChildrenPresent(e));
+    }
     // tsc's `getContextualTypeForChildJsxExpression`: a JSX child EXPRESSION is
     // contextually typed by the `JSX.ElementChildrenAttribute` prop (usually
     // `children`) of the tag's attributes type — the same type the identical
@@ -151,6 +158,56 @@ pub fn checkJsxElement(c: *Checker, node: Node) Error!TypeId {
         }
     }
     return (try c.jsxNamespaceType(c.atom_Element)) orelse types.any_type;
+}
+
+/// The applicability diagnostics an attribute check files — the ones tsc's
+/// `resolveCall` produces and then REPLACES with a TS2769 when an overload set
+/// is exhausted. Everything else the same walk files (an implicit `any` inside
+/// an attribute value, a duplicate attribute name, a spread of a non-object)
+/// is filed outside `resolveCall` in tsc and survives.
+/// Exactly the codes `checkJsxAttributes`' own report sites emit — the
+/// `checkAssignable` family (TS2322 and the missing-property refinements it
+/// hands off to), the excess-property TS2353 and the no-overlap TS2559 — and
+/// deliberately not TS2769: a nested element inside an attribute VALUE files
+/// its own, and that one is about a different call.
+const jsx_applicability_codes = [_]u16{ 2322, 2353, 2559, 2739, 2740, 2741 };
+
+/// tsc's `reportCallResolutionError` for an OVERLOADED component whose every
+/// signature rejected the attributes: one TS2769 stands in for the
+/// per-attribute complaints. Its span is the complaint's own position when
+/// every complaint sits at the same one (tsc keeps `diags[0]`'s span if
+/// `every(diags, d => d.start === diags[0].start)`), and the whole element
+/// otherwise. Oracle-verified against tsgo 7.0.2 on
+/// `tsxStatelessFunctionComponentOverload4`, whose nine TS2769 keys all land on
+/// the offending attribute rather than on the tag.
+fn reportJsxOverloadFailure(c: *Checker, node: Node, e: ast.JsxElementData, props: TypeId) Error!void {
+    const elem = c.nodeSpan(node);
+    const saved = c.diags.items.len;
+    try c.checkJsxAttributes(node, e, props, true, c.jsxChildrenPresent(e));
+    var anchor: ?Span = null;
+    var one_place = true;
+    for (c.diags.items[saved..]) |d| {
+        if (d.file != c.cur_file) continue;
+        if (d.span.start < elem.start or d.span.start >= elem.end) continue;
+        if (std.mem.indexOfScalar(u16, &jsx_applicability_codes, d.code) == null) continue;
+        if (anchor) |a| {
+            if (a.start != d.span.start) one_place = false;
+        } else {
+            anchor = d.span;
+        }
+    }
+    // Nothing to summarize: the candidate the element is typed against had no
+    // applicability complaint of its own (it was declined for something the
+    // probe counted and this walk does not report). Leave the walk's own
+    // diagnostics standing rather than inventing a TS2769.
+    const first = anchor orelse return;
+    c.rollbackDiags(saved, .{
+        .file = c.cur_file,
+        .lo = elem.start,
+        .hi = elem.end,
+        .codes = &jsx_applicability_codes,
+    });
+    try c.diagFmt(2769, if (one_place) first else elem, "No overload matches this call.", .{});
 }
 
 /// TS7026 at one intrinsic-tag reference (`lt` = the tag's `<`), raised when
@@ -273,7 +330,7 @@ pub fn jsxRuntimeNamespaceMember(c: *Checker, member: Atom) Error!?SymbolId {
 /// the member of the instance type named by `JSX.ElementAttributesProperty`
 /// (typically `props`). Null when it has no discernible props (so attribute
 /// typing is skipped).
-pub fn jsxComponentProps(c: *Checker, tag_ty: TypeId, explicit_targs: []const TypeId, node: Node) Error!?TypeId {
+pub fn jsxComponentProps(c: *Checker, tag_ty: TypeId, explicit_targs: []const TypeId, node: Node) Error!JsxProps {
     const t = try c.resolveStructural(tag_ty);
     // tsc's `resolveCustomJsxElementAttributesType` distributes over a UNION
     // tag type and unions the per-constituent props. @types/react's
@@ -284,19 +341,28 @@ pub fn jsxComponentProps(c: *Checker, tag_ty: TypeId, explicit_targs: []const Ty
     if (c.ts.kind(t) == .union_type) {
         var acc: TypeId = types.no_type;
         for (try c.memberList(t)) |m| {
-            const p = (try jsxComponentProps(c, m, explicit_targs, node)) orelse continue;
+            const p = (try jsxComponentProps(c, m, explicit_targs, node)).props orelse continue;
             acc = if (acc == types.no_type) p else try c.makeUnion2(acc, p);
         }
-        return if (acc == types.no_type) null else acc;
+        return .{ .props = if (acc == types.no_type) null else acc };
     }
-    if (c.ts.kind(t) == .class_value) return c.jsxClassComponentProps(t, explicit_targs, node);
+    if (c.ts.kind(t) == .class_value) return .{ .props = try c.jsxClassComponentProps(t, explicit_targs, node) };
     var sigs: std.ArrayList(TypeId) = .empty;
     defer sigs.deinit(c.scratch());
     try collectJsxCallSigs(c, t, &sigs);
-    if (sigs.items.len == 0) return null;
-    if (sigs.items.len == 1) return try jsxPropsOfSig(c, sigs.items[0], explicit_targs, node);
+    if (sigs.items.len == 0) return .{ .props = null };
+    if (sigs.items.len == 1) return .{ .props = try jsxPropsOfSig(c, sigs.items[0], explicit_targs, node) };
     return try chooseJsxSignature(c, sigs.items, explicit_targs, node);
 }
+
+/// What a component tag offers the attribute check: its props type, plus the
+/// one thing the CHOICE of signature says about reporting — that an overload
+/// SET was tried and every candidate rejected the attributes, which is a
+/// TS2769 about the set rather than a complaint about one attribute.
+pub const JsxProps = struct {
+    props: ?TypeId,
+    overloads_exhausted: bool = false,
+};
 
 /// The call signatures a component tag offers, in declaration order — the list
 /// tsc's `resolveJsxOpeningLikeElement` hands to `resolveCall`.
@@ -362,14 +428,16 @@ fn collectJsxCallSigs(c: *Checker, t: TypeId, out: *std.ArrayList(TypeId)) Error
 /// attributes relation, bounded by the element's attribute count rather than by
 /// a library's type graph, so there is nothing here worth that reach. Measured
 /// both ways on outline: identical key sets.
-fn chooseJsxSignature(c: *Checker, sigs: []const TypeId, explicit_targs: []const TypeId, node: Node) Error!?TypeId {
+fn chooseJsxSignature(c: *Checker, sigs: []const TypeId, explicit_targs: []const TypeId, node: Node) Error!JsxProps {
     const e = c.tree.extraData(ast.JsxElementData, c.tree.nodeData(node).lhs);
     const has_children = c.jsxChildrenPresent(e);
     const elem = c.nodeSpan(node);
     var last: ?TypeId = null;
+    var tried: u32 = 0;
     for (sigs) |s| {
         const props = (try jsxPropsOfSig(c, s, explicit_targs, node)) orelse continue;
         last = props;
+        tried += 1;
         const saved = c.diags.items.len;
         c.no_publish_depth += 1;
         {
@@ -385,11 +453,15 @@ fn chooseJsxSignature(c: *Checker, sigs: []const TypeId, explicit_targs: []const
             break;
         }
         c.rollbackDiags(saved, .{ .file = c.cur_file, .lo = elem.start, .hi = elem.end });
-        if (!rejected) return props;
+        if (!rejected) return .{ .props = props };
     }
-    // No candidate is clean. tsc reports out of the last one it tried, so the
-    // element is checked (and diagnosed) against that one's props.
-    return last;
+    // No candidate is clean. tsc's `reportCallResolutionError` then has an
+    // overload SET to talk about, so the per-attribute complaints are replaced
+    // by one TS2769 — the same rule `resolveSignatureCall` applies to a call
+    // whose candidate pile holds two or more. The element is still checked
+    // against the last candidate's props (that is where the anchor and the
+    // attributes' contextual types come from); only the report changes.
+    return .{ .props = last, .overloads_exhausted = tried > 1 };
 }
 
 /// The props type a single component signature exposes: its first parameter,
