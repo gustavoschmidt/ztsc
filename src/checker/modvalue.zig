@@ -220,6 +220,17 @@ pub fn ambientNamespaceType(c: *Checker, idx: u32) Error!TypeId {
     var props: std.ArrayList(types.Prop) = .empty;
     defer props.deinit(c.scratch());
     const ae = c.prog.ambient_exports[idx];
+    // An ambient module with NO named exports is opaque, not empty: it is the
+    // shorthand `declare module "m";` (every export `any`) or a block that uses
+    // `export =` / the ambient auto-export rule, both out of subset. The linker
+    // already answers `any` for a STATIC `import * as ns from "m"` there
+    // (`ambientOpaque`); answering an empty object here made the same module
+    // read as `{}` through `import("m")`, so `(await import("fs")).readFile` was
+    // a false TS2339 while the static form was clean.
+    if (ae.atoms.len == 0) {
+        try c.ambient_ns_types.put(c.cm(), idx, types.any_type);
+        return types.any_type;
+    }
     for (ae.atoms, ae.targets) |name, tgt| {
         if (name == c.prog.export_equals_atom) continue; // reserved key
         if (tgt.type_only) continue;
