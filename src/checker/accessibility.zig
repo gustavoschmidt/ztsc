@@ -203,14 +203,28 @@ fn declaringClass(c: *Checker, recv: TypeId, name: Atom, site: Site) Error!?Decl
         }
     }
     const recv_norm = t;
-    // Cycle-detection stack, bounded like every other `extends` walk here.
+    if (c.ts.kind(t) != .ref) return null;
+    // Breadth-first over the DECLARED heritage, because an INTERFACE may extend
+    // a class (and several bases at once): `interface I extends Foo {}` inherits
+    // `Foo`'s `private x`, and `i.x` is TS2341 naming `Foo`. A class-only
+    // `extends` walk stops at the interface and reports nothing.
+    //
+    // Bounded and cycle-checked like every other heritage walk here.
+    var queue: [32]SymbolId = undefined;
     var seen: [32]SymbolId = undefined;
+    var qn: usize = 1;
+    var head: usize = 0;
     var n: usize = 0;
-    while (n < seen.len) {
-        if (c.ts.kind(t) != .ref) return null;
-        const sym = c.ts.refSymbol(t);
-        if (!c.symFlags(sym).class) return null;
-        for (seen[0..n]) |s| if (s == sym) return null;
+    queue[0] = c.ts.refSymbol(t);
+    while (head < qn) {
+        const sym = queue[head];
+        head += 1;
+        if (n == seen.len) return null;
+        var dup = false;
+        for (seen[0..n]) |s| if (s == sym) {
+            dup = true;
+        };
+        if (dup) continue;
         seen[n] = sym;
         n += 1;
         {
@@ -227,7 +241,14 @@ fn declaringClass(c: *Checker, recv: TypeId, name: Atom, site: Site) Error!?Decl
                 }
             }
         }
-        t = try c.baseClassRef(sym) orelse return null;
+        // Statics are not inherited through an interface, and an interface has
+        // no static side at all, so the static search stays on the class chain.
+        if (statics and !c.symFlags(sym).class) continue;
+        for (try c.declaredBaseRefs(sym)) |b| {
+            if (c.ts.kind(b) != .ref or qn == queue.len) continue;
+            queue[qn] = c.ts.refSymbol(b);
+            qn += 1;
+        }
     }
     return null;
 }

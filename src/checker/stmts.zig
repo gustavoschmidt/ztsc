@@ -1598,6 +1598,9 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
     // (TS2808) — a property of the declarations alone, so it runs before any
     // member's type is resolved.
     try accessibility.checkAccessorVisibility(c, members);
+    // The same pairing, for the other question the two halves answer together:
+    // whose annotation supplies the property's type (TS7032/TS7033).
+    try implicit_any.reportAccessorImplicitAny(c, members);
     for (members, 0..) |member, mi| {
         if (member == null_node) continue;
         const md = c.tree.nodeData(member);

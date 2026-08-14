@@ -353,6 +353,102 @@ fn enumMemberHasWrittenValue(c: *Checker, esym: SymbolId, name: Atom) Error!bool
     return false;
 }
 
+/// TS2869 "Right operand of ?? is unreachable because the left operand is never
+/// nullish." — the nullish sibling of TS2872/TS2873, and syntactic in exactly the
+/// same way: `"lit" ?? x` is reported while `declare const s: string; s ?? x` is
+/// not, even though neither can be nullish. Anchored on the LEFT operand with its
+/// parentheses skipped, which is where tsgo puts it (`("lit") ?? x` reports at
+/// the literal, not at the paren).
+///
+/// A `??` chain folds through its RIGHT operand: `u ?? "y"` is never nullish
+/// however `u` goes, so `u ?? "y" ?? "x"` reports on `u ?? "y"`.
+pub fn checkNeverNullish(c: *Checker, lhs: Node) Error!void {
+    if (lhs == null_node) return;
+    const loc = skipParens(c, lhs);
+    if (nullishnessOf(c, loc, 0) != .never) return;
+    try c.diagFmt(2869, c.nodeSpan(loc), "Right operand of ?? is unreachable because the left operand is never nullish.", .{});
+}
+
+/// tsc's `getSyntacticNullishnessSemantics`, as a WHITELIST of the shapes that
+/// cannot be `null`/`undefined`. tsc's own switch defaults to "never" and lists
+/// the "sometimes" kinds; inverting it means an unlisted tag under-reports
+/// instead of inventing — the same trade `semanticsOf` makes.
+const Nullishness = enum { always, never, sometimes };
+
+fn nullishnessOf(c: *Checker, node0: Node, depth: u32) Nullishness {
+    if (depth > 8) return .sometimes;
+    // Only the outer expressions `semanticsOf` skips, for the same reason: a
+    // parenthesis, an `as`/`satisfies` and a non-null assertion are all
+    // transparent to a syntactic classification.
+    var node = node0;
+    while (true) {
+        const d = c.tree.nodeData(node);
+        switch (c.nodeTag(node)) {
+            .paren_expr, .non_null, .as_expr, .satisfies_expr => {
+                if (d.lhs == null_node) return .sometimes;
+                node = d.lhs;
+            },
+            else => break,
+        }
+    }
+    const d = c.tree.nodeData(node);
+    switch (c.nodeTag(node)) {
+        .null_literal => return .always,
+        .identifier => return if (std.mem.eql(u8, c.tokenText(c.tree.nodeMainToken(node)), "undefined")) .always else .sometimes,
+        // ztsc folds `await` into the prefix operators; tsc classifies an
+        // `AwaitExpression` as SOMETIMES nullish (it is whatever the promise
+        // resolves to), while `!`/`typeof`/`-`/`delete` produce primitives and
+        // `void e` is always `undefined`.
+        .prefix_unary => return switch (c.tree.tokens.tag(c.tree.nodeMainToken(node))) {
+            .keyword_void => .always,
+            .keyword_await => .sometimes,
+            else => .never,
+        },
+        .string_literal,
+        .number_literal,
+        .bigint_literal,
+        .template_literal,
+        .regex_literal,
+        .array_literal,
+        .object_literal,
+        .arrow_fn,
+        .function_expr,
+        .function_decl,
+        .class_decl,
+        .jsx_element,
+        .postfix_unary,
+        .this_expr,
+        .new_expr,
+        .new_expr_bare,
+        .new_expr_targs,
+        => return .never,
+        .binary => {
+            const op = c.tree.tokens.tag(c.tree.nodeMainToken(node));
+            return switch (op) {
+                // `a ?? b` / `a || b` yield `a`'s non-nullish (resp. truthy)
+                // part or `b`, so only `b` can make them nullish.
+                .question_question, .pipe_pipe, .comma => nullishnessOf(c, d.rhs, depth + 1),
+                // `a && b` can yield `a`'s FALSY part, which `null`/`undefined`
+                // are in.
+                .amp_amp => blk: {
+                    const l = nullishnessOf(c, d.lhs, depth + 1);
+                    const r = nullishnessOf(c, d.rhs, depth + 1);
+                    break :blk if (l == r) l else .sometimes;
+                },
+                // Every other operator produces a primitive.
+                else => .never,
+            };
+        },
+        .cond_expr => {
+            const e = c.tree.extraData(ast.CondExpr, d.rhs);
+            const t = nullishnessOf(c, e.then_expr, depth + 1);
+            const f = nullishnessOf(c, e.else_expr, depth + 1);
+            return if (t == f) t else .sometimes;
+        },
+        else => return .sometimes,
+    }
+}
+
 /// TS2845's other source — tsc's `checkNaNEquality`. A comparison against the
 /// global `NaN` is decided before it runs: `===`/`==` can only be false and
 /// `!==`/`!=` can only be true, because `NaN` equals nothing, itself included.

@@ -705,8 +705,13 @@ fn checkEvolvingVarRead(c: *Checker, sym: SymbolId, node: Node, tok: TokenIndex)
     // needs tsc's per-container last-assignment scan, and under-reporting is the
     // safe half to keep.
     if (f.let_decl and !f.var_decl) {
-        const cont = containerOf(c, c.symScope(sym));
-        if (!(c.bind.scope_kinds[cont] == .file and !c.bind.is_module)) return;
+        // tsc's exclusion is narrow: `declaration.parent.parent.kind ===
+        // VariableStatement && isGlobalSourceFile(declaration.parent.parent.parent)`
+        // — a `let` STATEMENT at the top level of a script, and nothing else. A
+        // `let` in a `for` head or inside a block is a mutable local even there,
+        // so the declaration's own SCOPE has to be the file scope, not merely its
+        // function container (`for (let x;;) { () => x }` reports nothing).
+        if (!(c.bind.scope_kinds[c.symScope(sym)] == .file and !c.bind.is_module)) return;
     }
     // Only a read from another flow container — see above.
     if (flowContainerOf(c, c.cur_scope) == flowContainerOf(c, c.symScope(sym))) return;
@@ -3428,6 +3433,7 @@ fn checkBinary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             const saved = try conditions.enterLogical(c, node, false);
             defer conditions.leaveLogical(c, saved);
             const lt = try c.checkExprCached(d.lhs, types.no_type);
+            try conditions.checkNeverNullish(c, d.lhs);
             conditions.leaveLeftOperand(c, node, saved);
             const rt = try c.checkExprCached(d.rhs, if (ctx == types.no_type) lt else ctx);
             if (!try c.canBeNullish(lt, 0)) return lt;
