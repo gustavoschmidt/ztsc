@@ -1694,6 +1694,16 @@ pub const Checker = struct {
     /// assigned via `this.x` inside the constructor of the class that OWNS the
     /// declaration (tsc allows exactly this; an inherited readonly still errors).
     ctor_class_sym: SymbolId = binder.no_symbol,
+    /// The property-access node a COMPOUND assignment is currently writing, as
+    /// a `nodeKey` (0 = none). tsc runs one member-accessibility check per access node,
+    /// against the setter when the node is an assignment target
+    /// (`isWriteAccess`); ztsc checks the target and then re-reads the very
+    /// same node as an expression, so the re-read consults this to stay silent
+    /// instead of judging the same access a second time as a READ. Only a
+    /// divergent accessor pair (`get x()` public, `private set x(v)`) makes the
+    /// two answers differ, which is exactly when the second report would be
+    /// spurious. See `accessibility.Dir`.
+    write_target_node: u64 = 0,
     /// Set once any method declares a polymorphic `this` return; gates the
     /// per-property-access `this`-substitution walk so codebases without
     /// `this` types pay nothing.

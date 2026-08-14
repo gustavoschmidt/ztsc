@@ -36,6 +36,7 @@ const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
 
 const annTypeMaybeUnique = Checker.annTypeMaybeUnique;
+const implicit_any = @import("implicit_any.zig");
 const inferVarFromNode = @import("generics.zig").inferVarFromNode;
 const mergeBaseObjectPlain = @import("classes.zig").mergeBaseObjectPlain;
 const scratch = Checker.scratch;
@@ -1025,8 +1026,14 @@ pub fn objectTypeFromMembers(c: *Checker, member_nodes: []const Node, obj_flags:
                 if (md.rhs & ast.Flags.readonly != 0) flags |= types.prop_flag_readonly;
                 const ty = if (md.lhs != 0)
                     try c.annTypeMaybeUnique(md.lhs, md.rhs & ast.Flags.readonly != 0, 1330, c.tokSpan(c.tree.nodeMainToken(m)))
-                else
-                    types.any_type;
+                else blk: {
+                    // An un-annotated member of an interface or a type literal
+                    // has nothing to infer from: TS7008. This is tsc's
+                    // `widenTypeForVariableLikeDeclaration` fallback, and it is
+                    // the same report a class field gets from the class walk.
+                    try implicit_any.reportMemberImplicitAny(c, c.tree.nodeMainToken(m), md.rhs);
+                    break :blk types.any_type;
+                };
                 try upsertProp(c.scratch(), &props, &prop_index, .{ .name = name, .ty = ty, .flags = flags });
             },
             .method_signature => {

@@ -23,6 +23,9 @@ const prof_zig = checker_zig.prof_zig;
 const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
 
+const accessibility = @import("accessibility.zig");
+const comma = @import("comma.zig");
+const conditions = @import("conditions.zig");
 const TpMap = @import("enums.zig").TpMap;
 const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
 const buildRefKey = @import("flow.zig").buildRefKey;
@@ -181,6 +184,7 @@ fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         .paren_expr => return c.checkExprCached(d.lhs, ctx),
         .seq_expr => {
             _ = try c.checkExprCached(d.lhs, types.no_type);
+            try comma.checkCommaOperand(c, d.lhs);
             return c.checkExprCached(d.rhs, ctx);
         },
         .template_expr => {
@@ -260,7 +264,9 @@ fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         .assign => return checkAssignExpr(c, node),
         .cond_expr => {
             const e = c.tree.extraData(ast.CondExpr, d.rhs);
-            _ = try c.checkExprCached(d.lhs, types.no_type);
+            const cond_t = try c.checkExprCached(d.lhs, types.no_type);
+            try conditions.checkTruthiness(c, d.lhs, cond_t);
+            try conditions.checkUncalledFunction(c, d.lhs, cond_t, e.then_expr);
             const then_t = try c.checkExprCached(e.then_expr, ctx);
             const else_t = try c.checkExprCached(e.else_expr, ctx);
             // The arms are subtype-reduced, exactly as `||`/`??` are
@@ -2396,7 +2402,15 @@ fn memberChainInner(c: *Checker, node: Node) Error!ChainLink {
     } else {
         obj_t = try checkNonNullType(c, obj_t, d.lhs);
     }
-    var pt = try propertyTypeOf(c, obj_t, name, name_tok);
+    // A compound assignment's target is re-read as an expression after
+    // `checkAssignmentTarget` has already judged it as a WRITE; tsc runs one
+    // accessibility check per access node, so the re-read must not run a
+    // second one in the opposite direction (`accessibility.Dir`).
+    const site: accessibility.Site = .{
+        .dir = if (c.write_target_node != 0 and c.nodeKey(node) == c.write_target_node) .none else .read,
+        .recv_node = d.lhs,
+    };
+    var pt = try propertyTypeOf(c, obj_t, name, name_tok, site);
     // Property-path narrowing: peel the whole access spine into a member
     // path (`x.p`, `this.p`, `x.a.b`, …) capped at `max_deep_ref_depth`.
     if (try c.buildRefKey(node)) |key| {
@@ -2526,7 +2540,12 @@ fn entityNameOf(c: *Checker, node: Node) ?[]const u8 {
 }
 
 /// Property `name` on `t`, with TS2339/TS2551 on failure.
-fn propertyTypeOf(c: *Checker, t: TypeId, name: Atom, name_tok: TokenIndex) Error!TypeId {
+///
+/// `dir` is the access direction the ACCESSIBILITY check reads its modifiers
+/// for (`accessibility.check`); every arm that finds a property runs it, and
+/// the screen is the `prop_flag_non_public` bit already loaded on that
+/// property, so a public member costs one branch.
+fn propertyTypeOf(c: *Checker, t: TypeId, name: Atom, name_tok: TokenIndex, site: accessibility.Site) Error!TypeId {
     const k = c.ts.kind(t);
     switch (k) {
         .any, .err, .none => return types.any_type,
@@ -2549,6 +2568,13 @@ fn propertyTypeOf(c: *Checker, t: TypeId, name: Atom, name_tok: TokenIndex) Erro
             // judge the set as a whole — see `props.unionPropertyDropped`.
             var found: std.ArrayList(types.Prop) = .empty;
             defer found.deinit(c.scratch());
+            // The first constituent contributing a non-public member. The
+            // per-access accessibility check runs against it only AFTER the
+            // whole set has been judged: a union whose constituents contribute
+            // DIFFERENT declarations has no such property at all (TS2339 below),
+            // and reporting per constituent named each class in turn where tsc
+            // names none (`unionTypePropertyAccessibility`).
+            var non_public_of: TypeId = types.no_type;
             for (try c.memberList(t)) |m| {
                 const rm = try c.resolveStructural(m);
                 if (c.ts.kind(rm) == .any or c.ts.kind(rm) == .err) {
@@ -2562,6 +2588,7 @@ fn propertyTypeOf(c: *Checker, t: TypeId, name: Atom, name_tok: TokenIndex) Erro
                     return types.error_type;
                 };
                 try found.append(c.scratch(), p);
+                if (p.nonPublic() and non_public_of == types.no_type) non_public_of = m;
                 var pt = try c.substThis(p.ty, m);
                 if (p.optional()) pt = try c.makeUnion2(pt, types.undefined_type);
                 try parts.append(c.scratch(), pt);
@@ -2571,6 +2598,9 @@ fn propertyTypeOf(c: *Checker, t: TypeId, name: Atom, name_tok: TokenIndex) Erro
                     c.atomText(name), try c.typeToString(t),
                 });
                 return types.error_type;
+            }
+            if (non_public_of != types.no_type) {
+                try accessibility.check(c, non_public_of, name, name_tok, site);
             }
             return c.ts.makeUnion(c.scratch(), parts.items);
         },
@@ -2586,6 +2616,7 @@ fn propertyTypeOf(c: *Checker, t: TypeId, name: Atom, name_tok: TokenIndex) Erro
             // see `lazyRefProp`, already used for the `C["f"]` type
             // position.
             if (try c.lazyThisProp(t, name)) |p| {
+                if (p.nonPublic()) try accessibility.check(c, t, name, name_tok, site);
                 var pt = try c.substThis(p.ty, t);
                 if (p.optional()) pt = try c.makeUnion2(pt, types.undefined_type);
                 return pt;
@@ -2617,6 +2648,7 @@ fn propertyTypeOf(c: *Checker, t: TypeId, name: Atom, name_tok: TokenIndex) Erro
             // more expansions.
             if (k == .ref) {
                 if (try c.lazyIndexedProp(t, name)) |p| {
+                    if (p.nonPublic()) try accessibility.check(c, t, name, name_tok, site);
                     var pt = try c.substThis(p.ty, t);
                     if (p.optional()) pt = try c.makeUnion2(pt, types.undefined_type);
                     return pt;
@@ -2625,6 +2657,7 @@ fn propertyTypeOf(c: *Checker, t: TypeId, name: Atom, name_tok: TokenIndex) Erro
             const r = try c.resolveStructural(t);
             if (c.ts.kind(r) == .any or c.ts.kind(r) == .err) return types.any_type;
             if (try c.propOfType(r, name)) |p| {
+                if (p.nonPublic()) try accessibility.check(c, t, name, name_tok, site);
                 var pt = try c.substThis(p.ty, t);
                 if (p.optional()) pt = try c.makeUnion2(pt, types.undefined_type);
                 return pt;
@@ -3028,7 +3061,8 @@ fn checkPrefixUnary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             return c.typeof_union;
         },
         .bang => {
-            _ = try c.checkExprCached(d.lhs, types.no_type);
+            const operand_t = try c.checkExprCached(d.lhs, types.no_type);
+            try conditions.checkTruthiness(c, d.lhs, operand_t);
             return types.boolean_type;
         },
         .keyword_void => {
@@ -3281,6 +3315,7 @@ fn checkBinary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         // up in the type of every use of the result.
         .amp_amp => {
             const lt = try c.checkExprCached(d.lhs, types.no_type);
+            try conditions.checkTruthiness(c, d.lhs, lt);
             const rt = try c.checkExprCached(d.rhs, ctx);
             const falsy = try c.getFalsyPart(lt, false);
             if (try c.getTruthyPart(lt) == types.never_type) return lt;
@@ -3300,6 +3335,7 @@ fn checkBinary(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
         // because its right operand is not a stand-in for its left.
         .pipe_pipe => {
             const lt = try c.checkExprCached(d.lhs, types.no_type);
+            try conditions.checkTruthiness(c, d.lhs, lt);
             const rt = try c.checkExprCached(d.rhs, if (ctx == types.no_type) lt else ctx);
             const truthy = try c.getTruthyPart(lt);
             if (!try c.canBeFalsy(lt, 0)) return lt;
@@ -3474,10 +3510,13 @@ fn checkAssignExpr(c: *Checker, node: Node) Error!TypeId {
             // the write type there rejected code tsc accepts. Re-checking
             // `d.lhs` as an expression cannot double-report: `diagFmt`
             // dedupes on (file, code, span).
+            const saved_write_target = c.write_target_node;
+            c.write_target_node = c.nodeKey(d.lhs);
             const read_t = if (target_t == types.error_type)
                 types.error_type
             else
                 try c.checkExprCached(d.lhs, types.no_type);
+            c.write_target_node = saved_write_target;
             const lt = try baseOfLiteralType(c, read_t);
             const res = if (op == .plus_eq)
                 try checkPlusOperands(c, node, lt, rt, d.lhs, d.rhs)
@@ -3777,6 +3816,7 @@ fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
             const name = try c.memberAtom(d.rhs);
             const r = try c.resolveStructural(obj_t);
             if (try c.propOfType(r, name)) |p| {
+                if (p.nonPublic()) try accessibility.check(c, obj_t, name, d.rhs, .{ .dir = .write, .recv_node = d.lhs });
                 // A readonly property may be assigned via `this.x` inside the
                 // constructor of the class that OWNS the declaration (tsc:
                 // `checkReferenceExpression`). An inherited readonly still
@@ -3798,7 +3838,7 @@ fn checkAssignmentTarget(c: *Checker, node: Node) Error!TypeId {
                 if (p.optional()) return c.makeUnion2(wt, types.undefined_type);
                 return wt;
             }
-            return propertyTypeOf(c, obj_t, name, d.rhs);
+            return propertyTypeOf(c, obj_t, name, d.rhs, .{ .dir = .write, .recv_node = d.lhs });
         },
         .index_expr => {
             // Writing to a readonly tuple element (from `as const`) is

@@ -231,6 +231,73 @@ pub fn reportMissingReturnType(c: *Checker, node: Node, proto: ast.FnProto) Erro
     try c.diagFmt(7010, c.tokSpan(proto.name_token), "'{s}', which lacks return-type annotation, implicitly has an 'any' return type.", .{c.tokenText(proto.name_token)});
 }
 
+/// The MEMBER member of the family: a property with neither a type annotation
+/// nor an initializer to infer from falls to `any`, and tsc reports TS7008 at
+/// its name (`reportImplicitAny`'s `PropertyDeclaration`/`PropertySignature`
+/// arm). Covers a class field, an interface property signature and a type
+/// literal's property alike — the three forms that share tsc's
+/// `widenTypeForVariableLikeDeclaration` fallback.
+///
+/// A `private` member of an AMBIENT declaration is exempt for the same reason
+/// its parameters are (`isPrivateAmbientMember`): a `.d.ts` cannot spell the
+/// type of something no consumer can name.
+pub fn reportMemberImplicitAny(c: *Checker, name_tok: TokenIndex, flags: u32) Error!void {
+    if (!c.prog.no_implicit_any) return;
+    if (nameIsRecoveredModifier(c, name_tok)) return;
+    // `isPrivateWithinAmbient` counts a `#name` member as private too — it is
+    // even less nameable from outside than a `private` one.
+    const private = flags & ast.Flags.private != 0 or
+        c.tree.tokens.tag(name_tok) == .private_identifier;
+    if (private and inAmbientContext(c)) return;
+    try c.diagFmt(7008, c.tokSpan(name_tok), "Member '{s}' implicitly has an 'any' type.", .{c.tokenText(name_tok)});
+}
+
+/// Is this member's "name" actually a MODIFIER the parser recovered from?
+///
+/// `interface I { public a: any }`, `interface I { static [k: string]: number }`
+/// and `class C { get \n x() {} }` are all grammar errors tsc reports as such
+/// (TS1044/TS1070/…); ztsc's parser recovers by reading the modifier keyword as
+/// a property NAME, which leaves behind a member that is un-annotated by
+/// accident. Reporting an implicit `any` for it is an artifact of the recovery,
+/// not something the source said, so the whole family stays quiet there.
+///
+/// The cost is a real property whose name happens to be a modifier keyword AND
+/// that carries no annotation (`interface I { get }`), which loses its TS7008.
+fn nameIsRecoveredModifier(c: *Checker, name_tok: TokenIndex) bool {
+    return switch (c.tree.tokens.tag(name_tok)) {
+        .keyword_public,
+        .keyword_private,
+        .keyword_protected,
+        .keyword_static,
+        .keyword_readonly,
+        .keyword_abstract,
+        .keyword_declare,
+        .keyword_override,
+        .keyword_accessor,
+        .keyword_get,
+        .keyword_set,
+        .keyword_constructor,
+        => true,
+        else => false,
+    };
+}
+
+/// The VARIABLE member of the family, for the one shape that has no flow to
+/// fall back on: an AMBIENT `declare var x;` (or any un-annotated, un-initialized
+/// `var` in a `.d.ts`) is `any` outright, and tsc reports TS7005 at its name.
+///
+/// A non-ambient `var x;` is deliberately silent here: tsc gives it `autoType`
+/// and lets the control flow supply a type, reporting only where a READ cannot
+/// be resolved (TS7034 at the declaration + TS7005 at that read) — a different
+/// diagnostic pair, and one ztsc does not produce yet.
+pub fn reportAmbientVarImplicitAny(c: *Checker, name_node: Node) Error!void {
+    if (!c.prog.no_implicit_any) return;
+    if (name_node == null_node or c.nodeTag(name_node) != .identifier) return;
+    if (!inAmbientContext(c)) return;
+    const tok = c.tree.nodeMainToken(name_node);
+    try c.diagFmt(7005, c.tokSpan(tok), "Variable '{s}' implicitly has an 'any' type.", .{c.tokenText(tok)});
+}
+
 /// One TS7031, named and located by the binding's own name token.
 fn reportBindingElement(c: *Checker, tok: TokenIndex) Error!void {
     if (!c.prog.no_implicit_any) return;
