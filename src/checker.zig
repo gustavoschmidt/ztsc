@@ -3271,6 +3271,7 @@ pub const Checker = struct {
     pub const checkSubsequentVarDecl = redeclare_zig.checkSubsequentVarDecl;
     pub const checkTypeParamListsIdentical = redeclare_zig.checkTypeParamListsIdentical;
     pub const checkCloduleMemberDups = redeclare_zig.checkCloduleMemberDups;
+    pub const checkSubsequentMemberDecls = redeclare_zig.checkSubsequentMemberDecls;
     pub const setTypeOfSymbol = signatures_zig.setTypeOfSymbol;
     pub const dropSpeculativeSymTypes = signatures_zig.dropSpeculativeSymTypes;
     pub const appendOverloadCandidates = signatures_zig.appendOverloadCandidates;
@@ -3293,6 +3294,13 @@ pub const Checker = struct {
     pub const objectRestType = signatures_zig.objectRestType;
     pub const memberTypeOf = signatures_zig.memberTypeOf;
     pub const BindFlow = signatures_zig.BindFlow;
+
+    // The binding-pattern CHECKS (as opposed to the typing above, which
+    // symbol typing drives and so is named through `signatures.zig`) come
+    // straight from their own module — the declaration walk is their only
+    // caller.
+    const destructure_zig = @import("checker/destructure.zig");
+    pub const checkDeclPattern = destructure_zig.checkDeclPattern;
 
     const instantiate_zig = @import("checker/instantiate.zig");
     pub const aliasInstance = instantiate_zig.aliasInstance;
@@ -3644,6 +3652,7 @@ pub const Checker = struct {
 
     const expr_zig = @import("checker/expr.zig");
     pub const checkExprCached = expr_zig.checkExprCached;
+    pub const numericNameIndexHit = expr_zig.numericNameIndexHit;
     pub const checkJsxElement = expr_zig.checkJsxElement;
     pub const isIntrinsicJsxTag = expr_zig.isIntrinsicJsxTag;
     pub const jsxNamespaceType = expr_zig.jsxNamespaceType;

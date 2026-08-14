@@ -657,6 +657,50 @@ const Binder = struct {
         return (@as(u64, scope) << 32) | atom;
     }
 
+    /// The token a DUPLICATE-NAME diagnostic points at for the declaration
+    /// `decl` whose name token is `name_tok`.
+    ///
+    /// For an ordinary member they are the same token. For a COMPUTED one they
+    /// are not: `name_tok` is the key's last identifier (`iterator` in
+    /// `[Symbol.iterator]`, `staticProp` in `[C1.staticProp]`) because that is
+    /// what the member name is derived from, while tsc reports at the whole
+    /// computed-name node — whose first token is the `[`. Walks back over the
+    /// key's `a.b.c` run, so it answers `name_tok` unchanged for anything that
+    /// is not that shape.
+    ///
+    /// Report-time only: every caller is a diagnostic path, so a declaration
+    /// that never clashes pays nothing.
+    fn dupDiagTok(b: *Binder, decl: Node, name_tok: TokenIndex) TokenIndex {
+        if (decl == null_node or name_tok == 0) return name_tok;
+        if (!declNameIsComputed(b, decl)) return name_tok;
+        var t = name_tok;
+        const floor = if (name_tok > 8) name_tok - 8 else 1;
+        while (t > floor) {
+            t -= 1;
+            switch (b.tree.tokens.tag(t)) {
+                .l_bracket => return t,
+                .identifier, .dot => {},
+                else => return name_tok,
+            }
+        }
+        return name_tok;
+    }
+
+    /// Is this member declaration's name a computed one (`[expr]`)? The flag word
+    /// sits in a different place for each member shape — the same places
+    /// `bindClassMembers` and `bindTypeMember` read it from when they build the
+    /// member key.
+    fn declNameIsComputed(b: *Binder, decl: Node) bool {
+        const d = b.tree.nodeData(decl);
+        const flags: u32 = switch (b.nodeTag(decl)) {
+            .class_field => b.tree.extraData(ast.Field, d.lhs).flags,
+            .class_method => b.tree.extraData(ast.FnProto, d.lhs).flags,
+            .property_signature, .method_signature => d.rhs,
+            else => return false,
+        };
+        return flags & (ast.Flags.computed | ast.Flags.computed_sym) != 0;
+    }
+
     /// Pick the diagnostic code for a declaration that failed the excludes
     /// check against `existing`. Choices documented in the module header;
     /// golden-tested against the codes tsc reports for the common cases.
@@ -699,7 +743,7 @@ const Binder = struct {
     fn diagAtFirstDecl(b: *Binder, sym: SymbolId, code: Code) Error!void {
         const link = b.sym_decl_head.items[sym];
         if (link == 0) return;
-        try b.diag(code, b.decl_name_toks.items[link]);
+        try b.diag(code, b.dupDiagTok(b.decl_links.items[link].value, b.decl_name_toks.items[link]));
     }
 
     /// Do the declarations already in the table and the one now being bound
@@ -737,15 +781,16 @@ const Binder = struct {
         return b.sym_block.items[sym] != b.cur_block;
     }
 
-    fn reportDuplicate(b: *Binder, sym: SymbolId, code: Code, name_tok: TokenIndex) Error!void {
+    fn reportDuplicate(b: *Binder, sym: SymbolId, code: Code, decl: Node, name_tok: TokenIndex) Error!void {
         const already = b.sym_reported.items[sym];
         var link = b.sym_decl_head.items[sym];
         var i: u32 = 0;
         while (link != 0) : (link = b.decl_links.items[link].next) {
-            if (i >= already) try b.diag(code, b.decl_name_toks.items[link]);
+            const l = b.decl_links.items[link];
+            if (i >= already) try b.diag(code, b.dupDiagTok(l.value, b.decl_name_toks.items[link]));
             i += 1;
         }
-        try b.diag(code, name_tok);
+        try b.diag(code, b.dupDiagTok(decl, name_tok));
         b.sym_reported.items[sym] = i + 1;
     }
 
@@ -817,7 +862,7 @@ const Binder = struct {
                     else => if (kind == .type_param or existing.type_param)
                         try b.diag(code, name_tok)
                     else
-                        try b.reportDuplicate(sym, code, name_tok),
+                        try b.reportDuplicate(sym, code, decl_node, name_tok),
                 }
             } else if (kind == .function or kind == .method) {
                 // Overload grouping: at most one implementation. tsc names
@@ -834,7 +879,7 @@ const Binder = struct {
                         .duplicate_constructor_implementation
                     else
                         .duplicate_function_implementation;
-                    try b.reportDuplicate(sym, code, name_tok);
+                    try b.reportDuplicate(sym, code, decl_node, name_tok);
                 }
                 try b.checkFunctionClassMerge(sym, existing, flags, name_tok);
             } else if (kind == .class) {

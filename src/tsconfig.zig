@@ -165,7 +165,12 @@ fn loadInDir(io: Io, arena: Allocator, base: Io.Dir, config_path: []const u8) Lo
     }
     cfg.skip_lib_check = acc.skip_lib_check orelse false;
     cfg.skip_all_lib_check = acc.skip_all_lib_check orelse false;
-    cfg.resolve_json_module = acc.resolve_json_module orelse false;
+    // `resolveJsonModule` defaults ON for the same reason
+    // `resolvePackageJsonExports` does: tsc's `getResolveJsonModule` returns the
+    // explicit value or `moduleResolution === Bundler`, and ztsc always resolves
+    // with the bundler algorithm. Only an explicit `false` makes a `*.json`
+    // specifier TS2307 again.
+    cfg.resolve_json_module = acc.resolve_json_module orelse true;
     cfg.no_unchecked_side_effect_imports = acc.no_unchecked_side_effect_imports orelse false;
     // `resolvePackageJsonExports`/`resolvePackageJsonImports` default ON: tsc
     // derives them from `moduleResolution` (on for node16/nodenext/bundler) and
@@ -417,7 +422,10 @@ pub const Config = struct {
     experimental_decorators: bool = false,
     /// `compilerOptions.resolveJsonModule`: a `*.json` import that names an
     /// existing file resolves (typed opaquely as `any`) rather than TS2307.
-    resolve_json_module: bool = false,
+    /// Default true — tsc's `getResolveJsonModule` is `explicit value ??
+    /// (moduleResolution === Bundler)` and ztsc always resolves with the bundler
+    /// algorithm, so only an explicit `false` turns it off.
+    resolve_json_module: bool = true,
     /// `compilerOptions.resolvePackageJsonExports`: when false, a dependency's
     /// `package.json` `"exports"` map is ignored entirely and every specifier
     /// resolves through the legacy `"types"`/`"typings"`/`"main"`/`index` path.

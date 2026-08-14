@@ -323,6 +323,138 @@ pub fn checkSubsequentVarDecl(c: *Checker, decl: Node, is_const: bool) Error!voi
 }
 
 // ===========================================================================
+// TS2717 — a subsequent PROPERTY declaration's own type
+// ===========================================================================
+
+/// The property half of the same rule: tsc runs one
+/// `checkVariableLikeDeclaration` per property declaration and, for each
+/// declaration that is not the symbol's `valueDeclaration`, compares that
+/// declaration's OWN widened type against the symbol's type —
+/// `errorNextVariableOrPropertyDeclarationMustHaveSameType` files TS2403 for a
+/// variable and TS2717 for a property.
+///
+/// ztsc folds every declaration of a member into ONE `types.Prop`, so the
+/// comparison cannot be made from the member table; it is made from the
+/// declaration list, first declaration against each later one
+/// (`memberDeclOwnType` is `getWidenedTypeForVariableLikeDeclaration`).
+///
+/// Only a PROPERTY declaration is reported at — a method's second declaration
+/// is an overload, which tsc checks in `checkFunctionOrMethodDeclaration` and
+/// never through this path — but the FIRST declaration may be anything, and its
+/// own type is read exactly the way tsc reads it: from its type annotation,
+/// which for a method or accessor is the RETURN annotation. That is what keeps
+/// `class C { a(): number; a: number }` clean while
+/// `class D { c: number; c: string }` reports.
+///
+/// Same file only: another file's node ids are not addressable through `c.tree`,
+/// and a lib interface reopened by a program is the shape where a cross-file
+/// verdict would be about ztsc's merge and not about the code.
+///
+/// `decl` is the declaration this walk is driven from, and it runs only from the
+/// FIRST one: a merged interface's blocks share one members scope while
+/// `checkInterfaceDecl` runs per block, so without that gate every clash would
+/// be reported once per block.
+pub fn checkSubsequentMemberDecls(c: *Checker, sym: SymbolId, decl: Node) Error!void {
+    const decls = c.declsOf(sym);
+    if (decls.len == 0 or decls[0] != decl) return;
+    // Two NON-EXPORTED interfaces of one name in two blocks of a reopened
+    // namespace are ONE symbol here and two unrelated symbols to tsc, so their
+    // members were never redeclared at all — the same gate TS2428 needs, and it
+    // keeps `mergedInterfacesWithConflictingPropertyNames`'s `M` (one namespace
+    // block) reported while its `M2` (two) stays legal.
+    if (decls.len > 1 and namespaceLocalAcrossBlocks(c, sym)) return;
+    const local = c.localOf(sym);
+    const scopes = [_]?binder.ScopeId{ c.bind.membersScopeOf(local), c.bind.staticsScopeOf(local) };
+    for (scopes) |maybe_ms| {
+        const ms = maybe_ms orelse continue;
+        const lo = c.bind.scope_members_start[ms];
+        const hi = c.bind.scope_members_start[ms + 1];
+        for (lo..hi) |i| {
+            try checkMemberRedeclare(c, c.toGlobal(c.bind.member_syms[i]));
+        }
+    }
+}
+
+fn checkMemberRedeclare(c: *Checker, msym: SymbolId) Error!void {
+    if (c.symFile(msym) != c.cur_file) return;
+    const decls = c.declsOf(msym);
+    if (decls.len < 2) return;
+    // A member's annotation is resolved in the MEMBER scope, whose parent chain
+    // carries the container's type parameters. Read from the caller's scope
+    // instead, `interface I<T> { m(): T; … }` cannot see `T` and every generic
+    // member annotation became a TS2304.
+    const saved_scope = c.cur_scope;
+    defer c.cur_scope = saved_scope;
+    c.cur_scope = c.symScope(msym);
+    const first = (try memberDeclOwnType(c, decls[0])) orelse return;
+    if (first == types.error_type) return;
+    for (decls[1..]) |dn| {
+        switch (c.nodeTag(dn)) {
+            .class_field, .property_signature => {},
+            else => continue,
+        }
+        const own = (try memberDeclOwnType(c, dn)) orelse continue;
+        if (own == types.error_type) continue;
+        if (try typesIdentical(c, first, own)) continue;
+        const tok = c.tree.nodeMainToken(dn);
+        try c.diagFmt(
+            2717,
+            c.tokSpan(tok),
+            "Subsequent property declarations must have the same type.  Property '{s}' must be of type '{s}', but here has type '{s}'.",
+            .{ c.tokenText(tok), try c.typeToString(first), try c.typeToString(own) },
+        );
+    }
+}
+
+/// tsc's `getWidenedTypeForVariableLikeDeclaration` for a class or interface
+/// member: the type ANNOTATION when there is one, the widened initializer when
+/// there is not, and `any` when there is neither (`widenTypeForVariableLike-
+/// Declaration`'s fallback, which is what makes an unannotated `get Foo()`
+/// disagree with `Foo = 0`). Null for a member shape this walk does not read —
+/// an index or call signature, which has no name to be redeclared.
+fn memberDeclOwnType(c: *Checker, decl: Node) Error!?TypeId {
+    const d = c.tree.nodeData(decl);
+    switch (c.nodeTag(decl)) {
+        .class_field => {
+            const f = c.tree.extraData(ast.Field, d.lhs);
+            if (f.type_ann != 0) return annOwnType(c, f.type_ann);
+            if (f.init != 0) return try c.widenInitializer(try c.checkExprCached(f.init, types.no_type), false);
+            return types.any_type;
+        },
+        .property_signature => {
+            if (d.lhs != 0) return annOwnType(c, d.lhs);
+            return types.any_type;
+        },
+        .class_method, .method_signature => {
+            const proto = c.tree.extraData(ast.FnProto, d.lhs);
+            if (proto.return_type == 0) return types.any_type;
+            // A signature's OWN type parameters live in its proto scope
+            // (`sel<C extends CB>(cb: C): C`), so its return annotation is read
+            // there and not in the member scope the caller entered.
+            const saved_scope = c.cur_scope;
+            defer c.cur_scope = saved_scope;
+            if (try c.scopeOf(decl)) |s| c.cur_scope = s;
+            return annOwnType(c, proto.return_type);
+        },
+        else => return null,
+    }
+}
+
+/// The annotation's type, or null when the member is one this check declines to
+/// judge.
+///
+/// `unique symbol` is the only such annotation. Its type is NOMINAL — keyed by
+/// the declaration, and legal only in the positions `annTypeMaybeUnique` gates
+/// — so two declarations of one member spelling it are two different types by
+/// construction while tsc accepts the merge (`interface SymbolConstructor {
+/// readonly observer: symbol }` beside `readonly observer: unique symbol`), and
+/// reading the node through the plain `typeFromTypeNode` files TS1335 on top.
+fn annOwnType(c: *Checker, ann: Node) Error!?TypeId {
+    if (c.nodeTag(ann) == .unique_symbol_type) return null;
+    return try c.typeFromTypeNode(ann);
+}
+
+// ===========================================================================
 // TS2300 — a clodule's statics against its namespace's exports
 // ===========================================================================
 

@@ -141,6 +141,10 @@ pub fn checkStatement(c: *Checker, node: Node) Error!void {
                 const saved = c.cur_scope;
                 defer c.cur_scope = saved;
                 if (try c.scopeOf(e.catch_clause)) |s| c.cur_scope = s;
+                // An unannotated catch parameter destructures `unknown`
+                // (useUnknownInCatchVariables, which strict implies), so a
+                // pattern there names properties nothing has.
+                try c.checkDeclPattern(cd.lhs, types.unknown_type);
                 if (cd.rhs != 0) {
                     if (c.nodeTag(cd.rhs) == .block) {
                         for (c.tree.nodeRange(cd.rhs)) |stmt| try c.checkStatement(stmt);
@@ -307,6 +311,11 @@ fn checkDeclarator(c: *Checker, decl: Node, is_const: bool) Error!void {
         },
         else => {},
     }
+    // What the pattern demands of the type it destructures (TS2339/TS2488 per
+    // element, TS2353 for an initializer property the pattern does not name).
+    // After the arms above so the initializer is typed under its own
+    // contextual type first — `checkDeclPattern` reads the cache.
+    try c.checkDeclPattern(decl, types.no_type);
 }
 
 /// Force typeOfSymbol for every name bound by a pattern so inference
@@ -1467,6 +1476,9 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
         // …and a class merged with a same-named `namespace` shares ONE export
         // table with it, where a static and an exported member of one name clash.
         try c.checkCloduleMemberDups(class_sym);
+        // …and a member declared twice with two different types is TS2717 at
+        // the later declaration.
+        try c.checkSubsequentMemberDecls(class_sym, node);
     }
 
     // Class-position decorators (`@deco class C {}`): evaluated in the
@@ -1726,6 +1738,7 @@ fn checkInterfaceDecl(c: *Checker, node: Node) Error!void {
             _ = try c.interfaceGeneric(c.toGlobal(sym));
             try evalTypeParamDecls(c, c.toGlobal(sym));
             try c.checkTypeParamListsIdentical(mergedOrSelf(c, c.toGlobal(sym)), data.name_token);
+            try c.checkSubsequentMemberDecls(c.toGlobal(sym), node);
             try heritage.checkInterfaceExtends(c, c.toGlobal(sym), node, data.name_token);
         }
     }

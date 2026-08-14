@@ -346,11 +346,270 @@ pub fn optionalizePatternDefaults(c: *Checker, t: TypeId, pat: Node) Error!TypeI
 
 /// Does the object binding pattern `pat` destructure `name` with a default?
 pub fn patternDefaultsProp(c: *Checker, pat: Node, name: Atom) Error!bool {
+    const el = (try patternBindingProp(c, pat, name)) orelse return false;
+    return c.tree.nodeData(el).rhs != 0;
+}
+
+/// The `binding_property` of the object pattern `pat` that names `name`, or
+/// null when the pattern does not name it. The one scan every
+/// "what does this pattern say about `name`?" question goes through.
+fn patternBindingProp(c: *Checker, pat: Node, name: Atom) Error!?Node {
     for (c.tree.nodeRange(pat)) |el| {
         if (el == null_node or c.nodeTag(el) != .binding_property) continue;
-        const ed = c.tree.nodeData(el);
-        if (ed.rhs == 0) continue; // no default
-        if ((try c.memberAtom(c.tree.nodeMainToken(el))) == name) return true;
+        if ((try c.memberAtom(c.tree.nodeMainToken(el))) == name) return el;
+    }
+    return null;
+}
+
+// =====================================================================
+// what a pattern demands of the type it destructures
+// =====================================================================
+
+/// TS2339/TS2551 for an object binding property the destructured type does
+/// not have, and TS2488 for an array binding pattern whose source is not
+/// iterable. tsc reaches both from `getBindingElementTypeFromParentType`,
+/// which types each element through `getIndexedAccessType(parentType, <the
+/// property name>, name)` — the missing-property report is that access's —
+/// and an array pattern's elements through
+/// `checkIteratedTypeOrElementType(IterationUse.Destructuring, …)`.
+///
+/// A walk of its own rather than a report inside `findBindingType`: that one
+/// answers ONE name's type and is memoized per symbol, so a diagnostic raised
+/// there would fire once per bound name — and zero times for a symbol whose
+/// type an earlier demand already cached, which makes the report depend on
+/// the order demands arrive in. This runs once, from the declaration check.
+pub fn checkPatternProps(c: *Checker, pat: Node, whole: TypeId) Error!void {
+    if (pat == null_node or whole == types.no_type) return;
+    // A TYPE PARAMETER is left alone. tsc narrows one by its constraint's
+    // constituents (`value.kind === "a"` makes `T` read as `T & { a: string }`),
+    // ztsc does not — `narrowingDestructuring`'s five pre-existing TS2339s on
+    // `value.a` are that gap — so anything this walk concluded about `T` would
+    // be about the missing narrowing rather than about the pattern.
+    if (c.ts.kind(whole) == .type_param) return;
+    switch (c.nodeTag(pat)) {
+        .binding_default => try checkPatternProps(c, c.tree.nodeData(pat).lhs, whole),
+        .object_pattern => try checkObjectPatternProps(c, pat, whole),
+        .array_pattern => try checkArrayPatternProps(c, pat, whole),
+        else => {},
+    }
+}
+
+/// A source nothing can be missing from: `any` and the error type (tsc's
+/// `isTypeAny(parentType)` early return), plus the absent type, which is what
+/// a base this checker could not resolve leaves behind.
+fn patternSourceOpaque(c: *Checker, r: TypeId) bool {
+    return switch (c.ts.kind(r)) {
+        .any, .err, .none => true,
+        else => false,
+    };
+}
+
+fn checkObjectPatternProps(c: *Checker, pat: Node, whole: TypeId) Error!void {
+    const r = try c.resolveStructural(whole);
+    if (patternSourceOpaque(c, r)) return;
+    for (c.tree.nodeRange(pat)) |el| {
+        if (el == null_node or c.nodeTag(el) != .binding_property) continue;
+        const key_tok = c.tree.nodeMainToken(el);
+        const key = try c.memberAtom(key_tok);
+        const p = (try c.propOfType(r, key)) orelse {
+            // A DEFAULT makes the property optional to begin with: tsc passes
+            // `AccessFlags.AllowMissing` for `hasDefaultValue(declaration)`,
+            // which is what keeps `var { x = 1 } = {}` clean.
+            if (c.tree.nodeData(el).rhs != 0) continue;
+            // A NUMERIC-looking name reaches the number index signature (and a
+            // tuple/array element) as well — `isApplicableIndexType`'s
+            // numeric-name disjunct, the same one the `o["0"]` read takes. It
+            // is what makes `var [...{ 0: a }] = [0, 1]` clean.
+            if (try c.numericNameIndexHit(r, c.ts.kind(r), c.atomText(key)) != null) continue;
+            // In a union, a constituent that was WRITTEN as an object literal
+            // and lacks the property contributes `undefined` instead of making
+            // the property unreadable — tsc's `createUnionOrIntersection-
+            // Property` marks that case `WritePartial`, not `ReadPartial`. It
+            // is what makes `let { color } = options || {}` clean while the
+            // same union spelled out in a type annotation stays TS2339.
+            if (try unionLiteralConstituentLacks(c, r, key)) continue;
+            // tsc's `getSuggestionForNonexistentProperty` runs here too, so a
+            // near-miss is TS2551 exactly as it is on a dotted read.
+            if (c.suggestProp(key, r)) |sugg| {
+                try c.diagFmt(2551, c.tokSpan(key_tok), "Property '{s}' does not exist on type '{s}'. Did you mean '{s}'?", .{
+                    c.atomText(key), try c.typeToString(whole), c.atomText(sugg),
+                });
+            } else {
+                try c.diagFmt(2339, c.tokSpan(key_tok), "Property '{s}' does not exist on type '{s}'.", .{
+                    c.atomText(key), try c.typeToString(whole),
+                });
+            }
+            continue;
+        };
+        // A nested pattern destructures the property's own type — with nullish
+        // stripped first, because a possibly-undefined intermediate is tsc's
+        // TS2532 (the access's own diagnostic), not a missing property, and
+        // `never` has no member to be missing.
+        const sub = c.tree.nodeData(el).lhs;
+        if (sub == 0) continue;
+        var pt = p.ty;
+        if (c.containsNullish(pt)) pt = try c.nonNullable(pt);
+        if (c.ts.kind(pt) == .never) continue;
+        try checkPatternProps(c, sub, pt);
+    }
+}
+
+/// Does a union constituent that was written as an OBJECT LITERAL lack `name`?
+/// That is the `WritePartial` half of tsc's `createUnionOrIntersectionProperty`
+/// — the missing member reads as `undefined` rather than as absent — so the
+/// property is readable and nothing is reported. False for anything that is
+/// not a union, and for a union whose lacking constituents are all declared
+/// shapes (which is `ReadPartial`, i.e. genuinely absent).
+fn unionLiteralConstituentLacks(c: *Checker, r: TypeId, name: Atom) Error!bool {
+    if (c.ts.kind(r) != .union_type) return false;
+    for (try c.memberList(r)) |m| {
+        const rm = try c.resolveStructural(m);
+        if (!c.ts.objectIsLiteralOrigin(rm)) continue;
+        if ((try c.propOfType(rm, name)) == null) return true;
     }
     return false;
+}
+
+fn checkArrayPatternProps(c: *Checker, pat: Node, whole: TypeId) Error!void {
+    const r = try c.resolveStructural(whole);
+    if (patternSourceOpaque(c, r)) return;
+    const elem = (try c.iterationElementType(r)) orelse {
+        try c.diagFmt(2488, c.nodeSpan(pat), "Type '{s}' must have a '[Symbol.iterator]()' method that returns an iterator.", .{
+            try c.typeToString(whole),
+        });
+        return;
+    };
+    var i: u32 = 0;
+    for (c.tree.nodeRange(pat)) |el| {
+        if (el == null_node) continue;
+        defer i += 1;
+        if (c.nodeTag(el) == .omitted) continue;
+        if (c.nodeTag(el) == .rest_element) {
+            // `[...{ 0: a, b }]` destructures the REST array, so the nested
+            // pattern's source is `E[]`, not `E`.
+            try checkPatternProps(c, c.tree.nodeData(el).lhs, try c.ts.makeArray(elem));
+            continue;
+        }
+        // Only a TUPLE source gives an element position its own exact type. An
+        // ARRAY source is what an array literal widens to here, whereas tsc
+        // contextually types that literal by the pattern's implied TUPLE
+        // (`getTypeFromArrayBindingPattern`) and so sees each position
+        // separately — descending with the widened element UNION instead would
+        // report a property missing from a sibling's type
+        // (`destructuringVariableDeclaration2`). Left to the day the pattern's
+        // implied type becomes a real contextual type.
+        if (c.ts.kind(r) != .tuple) continue;
+        if (i >= c.ts.tupleLen(r)) continue;
+        try checkPatternProps(c, el, c.ts.tupleElem(r, i).ty);
+    }
+}
+
+/// The checks above driven from a DECLARATION whose name is a binding
+/// pattern. The destructured type is the annotation when there is one and the
+/// initializer's type otherwise — the same `whole` `declaratorType` hands
+/// `bindingElementType`. `fallback` is what a declaration with neither
+/// destructures: `unknown` for a catch parameter, and `no_type` (i.e. no
+/// check) for a bare `var [a]`, whose leaves are implicit `any`.
+pub fn checkDeclPattern(c: *Checker, decl: Node, fallback: TypeId) Error!void {
+    if (decl == null_node) return;
+    const d = c.tree.nodeData(decl);
+    switch (c.nodeTag(decl)) {
+        .declarator, .declarator_init, .declarator_full => {},
+        else => return,
+    }
+    const pat = d.lhs;
+    // Nothing to demand of a plain name — and asking for the source type of one
+    // is not free: a `unique symbol` annotation is legal only on an identifier
+    // name, and reading it here rather than through `annTypeMaybeUnique` files
+    // TS1335 on every one of them.
+    switch (c.nodeTag(pat)) {
+        .object_pattern, .array_pattern => {},
+        else => return,
+    }
+    var init_node: Node = null_node;
+    const src: TypeId = switch (c.nodeTag(decl)) {
+        .declarator => fallback,
+        .declarator_init => blk: {
+            init_node = d.rhs;
+            break :blk try c.checkExprCached(d.rhs, types.no_type);
+        },
+        else => blk: {
+            const e = c.tree.extraData(ast.DeclaratorFull, d.rhs);
+            if (e.type_ann != 0) break :blk try c.typeFromTypeNode(e.type_ann);
+            if (e.init == 0) break :blk fallback;
+            init_node = e.init;
+            break :blk try c.checkExprCached(e.init, types.no_type);
+        },
+    };
+    try checkPatternProps(c, pat, src);
+    // The excess half only applies when the PATTERN is the literal's
+    // contextual type, i.e. when the declaration carries no annotation.
+    if (init_node != null_node and src != types.no_type) try checkPatternExcessProps(c, pat, init_node);
+}
+
+/// The other half of tsc's `contextualTypeHasPattern` branch in
+/// `checkObjectLiteral` (`optionalizePatternDefaults` is the first): a
+/// property of the object literal that INITIALIZES an object binding pattern,
+/// and which the pattern does not name, is TS2353 at the literal's key —
+/// `getPropertyOfType(contextualType, member.escapedName)` coming up empty
+/// with no string index info on the pattern's implied type. Unlike the
+/// relation's excess check this one does not bail after the first find: tsc
+/// walks every member of the literal here.
+fn checkPatternExcessProps(c: *Checker, pat: Node, init: Node) Error!void {
+    if (pat == null_node or init == null_node) return;
+    if (c.nodeTag(pat) != .object_pattern or c.nodeTag(init) != .object_literal) return;
+    const implied = (try objectPatternImpliedType(c, pat)) orelse return;
+    for (c.tree.nodeRange(init)) |prop| {
+        if (prop == null_node) continue;
+        const tag = c.nodeTag(prop);
+        switch (tag) {
+            .object_property, .object_shorthand, .object_method => {},
+            // A spread contributes names this walk cannot enumerate, so the
+            // whole literal is left alone rather than guessed at.
+            .spread_element => return,
+            else => continue,
+        }
+        const pd = c.tree.nodeData(prop);
+        if (tag != .object_shorthand and pd.lhs != 0 and c.nodeTag(pd.lhs) == .computed_name) continue;
+        const key_tok = c.tree.nodeMainToken(prop);
+        const key = try c.memberAtom(key_tok);
+        const el = (try patternBindingProp(c, pat, key)) orelse {
+            try c.diagFmt(2353, c.tokSpan(key_tok), "Object literal may only specify known properties, and '{s}' does not exist in type '{s}'.", .{
+                c.atomText(key), try c.typeToString(implied),
+            });
+            continue;
+        };
+        // A nested literal is contextually typed by the nested pattern, so
+        // the same branch runs one level down.
+        if (tag == .object_property) try checkPatternExcessProps(c, c.tree.nodeData(el).lhs, pd.rhs);
+    }
+}
+
+/// The object type an object binding pattern implies, as tsc's
+/// `getTypeFromObjectBindingPattern` builds it for the contextual type: one
+/// `any`-typed member per named property, optional where the element has a
+/// default. Null when the pattern names something this walk cannot enumerate
+/// — a rest element, whose implied type carries a `[k: string]: any` that
+/// absorbs every unnamed property, or a computed key, which sets tsc's
+/// `ObjectLiteralPatternWithComputedProperties` and takes the branch out of
+/// play. In both cases nothing in the literal is excess.
+fn objectPatternImpliedType(c: *Checker, pat: Node) Error!?TypeId {
+    var props: std.ArrayList(types.Prop) = .empty;
+    defer props.deinit(c.scratch());
+    for (c.tree.nodeRange(pat)) |el| {
+        if (el == null_node) continue;
+        if (c.nodeTag(el) != .binding_property) return null;
+        const ed = c.tree.nodeData(el);
+        try props.append(c.scratch(), .{
+            .name = try c.memberAtom(c.tree.nodeMainToken(el)),
+            .ty = types.any_type,
+            .flags = if (ed.rhs != 0) types.prop_flag_optional else 0,
+        });
+    }
+    // An EMPTY pattern implies nothing and contextually types nothing:
+    // `getContextualTypeForInitializerExpression` only reaches
+    // `getTypeFromBindingPattern` for `elements.length > 0`, so
+    // `var { } = { x: 0 }` has no pattern target to be excess against.
+    if (props.items.len == 0) return null;
+    return try c.ts.makeObject(props.items, 0, 0, 0);
 }
