@@ -282,20 +282,34 @@ fn nameIsRecoveredModifier(c: *Checker, name_tok: TokenIndex) bool {
     };
 }
 
-/// The VARIABLE member of the family, for the one shape that has no flow to
-/// fall back on: an AMBIENT `declare var x;` (or any un-annotated, un-initialized
-/// `var` in a `.d.ts`) is `any` outright, and tsc reports TS7005 at its name.
+/// The VARIABLE member of the family, for the two shapes that have no flow to
+/// fall back on. tsc gives an un-annotated, un-initialized `var`/`let` the
+/// control-flow-tracked `autoType` — but only when it is neither AMBIENT nor
+/// EXPORTED (`!(getCombinedModifierFlags(declaration) & Export) &&
+/// !(declaration.flags & Ambient)`), because neither can be flow-analyzed: one
+/// describes something the runtime already provides, the other something another
+/// file may write. Both are plain `any`, reported at the name.
 ///
-/// A non-ambient `var x;` is deliberately silent here: tsc gives it `autoType`
-/// and lets the control flow supply a type, reporting only where a READ cannot
-/// be resolved (TS7034 at the declaration + TS7005 at that read) — a different
-/// diagnostic pair, and one ztsc does not produce yet.
-pub fn reportAmbientVarImplicitAny(c: *Checker, name_node: Node) Error!void {
+/// Everything else stays silent here: `var x;` in a function or at a module's
+/// top level IS auto-typed, and tsc reports only where a READ cannot be resolved
+/// (TS7034 at the declaration + TS7005 at that read — see
+/// `expr.checkEvolvingVarRead`).
+pub fn reportVarImplicitAny(c: *Checker, name_node: Node, ambient: bool) Error!void {
     if (!c.prog.no_implicit_any) return;
     if (name_node == null_node or c.nodeTag(name_node) != .identifier) return;
-    if (!inAmbientContext(c)) return;
     const tok = c.tree.nodeMainToken(name_node);
+    if (!ambient and !inAmbientContext(c) and !isExportedName(c, tok)) return;
     try c.diagFmt(7005, c.tokSpan(tok), "Variable '{s}' implicitly has an 'any' type.", .{c.tokenText(tok)});
+}
+
+/// Does the name declared at `tok` carry `export`? Asked of the SYMBOL, because
+/// the modifier sits on the statement and the declarator does not see it.
+fn isExportedName(c: *Checker, tok: TokenIndex) bool {
+    const a = c.atomOfToken(tok) catch return false;
+    return switch (c.resolveSpace(a, c.cur_scope, true)) {
+        .sym => |sym| c.symFlags(sym).exported,
+        else => false,
+    };
 }
 
 /// One TS7031, named and located by the binding's own name token.

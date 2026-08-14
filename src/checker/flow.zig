@@ -3103,3 +3103,50 @@ fn assignTargetsSymForDa(c: *Checker, target: Node, sym: SymbolId) Error!bool {
         else => return patternBindsSym(c, target, sym),
     }
 }
+
+/// Does ANY path reaching `flow` assign `sym`, WITHOUT leaving this flow
+/// container? The mirror of `definitelyAssigned`: every-path becomes some-path,
+/// and a `.start` — which is a function body's own entry — is `false` rather
+/// than being followed out to the definition point.
+///
+/// That confinement is the point. tsc types an evolving (`auto`) variable
+/// captured by a closure by re-running the flow from the CLOSURE's start with
+/// the auto type as the initial type, so an assignment in the enclosing function
+/// is invisible there and the reference reads as an implicit `any`
+/// (`var x; x = 1; function g() { x }` is TS7005 — oracle-verified). "Is the
+/// flow type still the auto type" is exactly "did no assignment reach here".
+///
+/// Optimistic on loops: a cycle answers "no assignment yet" and the real answer
+/// comes from the other antecedents. The visited set is per-query and lives in
+/// scratch — the query runs only for an evolving variable read out of its own
+/// container, so there is no memo worth keeping across calls.
+pub fn someAssignmentReaches(c: *Checker, flow: FlowId, sym: SymbolId) Error!bool {
+    if (flow == binder.no_flow or flow == binder.unreachable_flow) return false;
+    const seen = try c.scratch().alloc(bool, c.bind.flow_tags.len);
+    defer c.scratch().free(seen);
+    @memset(seen, false);
+    return saReaches(c, flow, sym, seen);
+}
+
+fn saReaches(c: *Checker, flow: FlowId, sym: SymbolId, seen: []bool) Error!bool {
+    if (flow == binder.no_flow or flow == binder.unreachable_flow) return false;
+    if (flow >= seen.len or seen[flow]) return false;
+    seen[flow] = true;
+    const b = c.bind;
+    switch (b.flow_tags[flow]) {
+        .none, .unreachable_, .start => return false,
+        .assign => {
+            if (try assignTargetsSymForDa(c, b.flowNode(flow), sym)) return true;
+            return saReaches(c, b.flow_a[flow], sym, seen);
+        },
+        .cond_true, .cond_false, .switch_clause, .call_stmt, .switch_no_match => {
+            return saReaches(c, b.flow_a[flow], sym, seen);
+        },
+        .branch_label, .loop_label => {
+            for (b.flowAntecedents(flow)) |a| {
+                if (try saReaches(c, a, sym, seen)) return true;
+            }
+            return false;
+        },
+    }
+}

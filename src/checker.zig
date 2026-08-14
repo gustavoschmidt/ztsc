@@ -3791,6 +3791,7 @@ pub const Checker = struct {
     pub const isNullishKind = flow_zig.isNullishKind;
     pub const admitsNullish = flow_zig.admitsNullish;
     pub const definitelyAssigned = flow_zig.definitelyAssigned;
+    pub const someAssignmentReaches = flow_zig.someAssignmentReaches;
     pub const max_ref_depth = flow_zig.max_ref_depth;
     pub const max_deep_ref_depth = flow_zig.max_deep_ref_depth;
     pub const PathElem = flow_zig.PathElem;

@@ -561,6 +561,7 @@ fn checkIdentifier(c: *Checker, node: Node) Error!TypeId {
                 }
                 if ((f.let_decl or f.var_decl) and !f.param and !f.const_decl) {
                     try checkUseBeforeAssigned(c, sym, node, tok, declared);
+                    try checkEvolvingVarRead(c, sym, node, tok);
                 }
             }
             // Flow narrowing. A binding destructured out of a discriminated
@@ -654,6 +655,66 @@ fn isAmbientDeclarator(c: *Checker, decl: Node) bool {
     if (c.nodeTag(decl) != .declarator_full) return false;
     const e = c.tree.extraData(ast.DeclaratorFull, c.tree.nodeData(decl).rhs);
     return e.flags & ast.Flags.declare != 0;
+}
+
+/// tsc's auto-type arm of `checkIdentifier`:
+///
+/// ```ts
+/// if (!isEvolvingArrayOperationTarget(node) && (type === autoType || type === autoArrayType)) {
+///     if (flowType === autoType || flowType === autoArrayType) {
+///         if (noImplicitAny) { error(nameOfDeclaration, TS7034); error(node, TS7005); }
+/// ```
+///
+/// An evolving (`auto`-typed) variable is one tsc control-flow types instead of
+/// giving it a declared type: `var x;` / `let x = null;`, no annotation, not
+/// `const`, not exported and not ambient. Inside its OWN flow container that
+/// always resolves — the initial type there is `undefined`, so a read before any
+/// assignment is TS2454's business and not this one. Read from a CLOSURE it does
+/// not: tsc re-runs the flow from the closure's start with the auto type as the
+/// initial type, so no assignment anywhere else can help, and a read that no
+/// assignment inside the closure precedes really is an implicit `any`
+/// (`var x; x = 1; function g() { x }` reports — oracle-verified against tsgo).
+///
+/// Both diagnostics are reported: TS7034 on the DECLARATION's name (once, by
+/// `diagFmt`'s span dedupe, however many reads there are) and TS7005 on the read.
+/// Evolving ARRAYS (`let x = []` -> `any[]`) are out of ztsc's subset, so only
+/// the `'any'` half of the pair is spelled here.
+fn checkEvolvingVarRead(c: *Checker, sym: SymbolId, node: Node, tok: TokenIndex) Error!void {
+    if (!c.isEvolvingVar(sym)) return;
+    const f = c.symFlags(sym);
+    // tsc's `!(getCombinedModifierFlags(declaration) & Export) && !(declaration.flags & Ambient)`:
+    // neither shape gets the auto type at all (an ambient `declare var x;` is
+    // plain `any`, and reports its implicit `any` at the declaration instead).
+    if (f.exported) return;
+    const decls = c.declsOf(sym);
+    if (decls.len == 0) return;
+    if (c.ambient_ctx or isAmbientDeclarator(c, decls[0])) return;
+    // tsc's `isParameterOrMutableLocalVariable(symbol) && isPastLastAssignment(…)`
+    // arm of the flow-container walk that precedes the check: for a MUTABLE LOCAL
+    // `let` the analysis is hoisted back out to the declaration's own container,
+    // which makes the initial type `undefined` instead of the auto type — so the
+    // pair is never reported for one. `isMutableLocalVariableDeclaration` reads
+    // `NodeFlags.Let` (a `var` is not one, however local) and excludes an
+    // exported binding and the top level of a SCRIPT, whose top level IS the
+    // global scope. Oracle-verified in both directions: a module-level or
+    // function-local `let` read from a closure is silent, while the same shapes
+    // spelled `var`, and a script-global `let`, report.
+    //
+    // Leaving the `isPastLastAssignment` half out costs a `let` that IS assigned
+    // somewhere (tsgo reports `let v; v = 1; function f() { v }`); reproducing it
+    // needs tsc's per-container last-assignment scan, and under-reporting is the
+    // safe half to keep.
+    if (f.let_decl and !f.var_decl) {
+        const cont = containerOf(c, c.symScope(sym));
+        if (!(c.bind.scope_kinds[cont] == .file and !c.bind.is_module)) return;
+    }
+    // Only a read from another flow container — see above.
+    if (flowContainerOf(c, c.cur_scope) == flowContainerOf(c, c.symScope(sym))) return;
+    const flow = c.bind.flowAt(node) orelse return;
+    if (try c.someAssignmentReaches(flow, sym)) return;
+    const name = c.tokenText(tok);
+    try c.diagFmt(7034, c.tokSpan(c.tree.nodeMainToken(decls[0])), "Variable '{s}' implicitly has type 'any' in some locations where its type cannot be determined.", .{name});
+    try c.diagFmt(7005, c.tokSpan(tok), "Variable '{s}' implicitly has an 'any' type.", .{name});
 }
 
 fn checkUseBeforeAssigned(c: *Checker, sym: SymbolId, node: Node, tok: TokenIndex, declared: TypeId) Error!void {

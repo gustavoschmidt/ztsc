@@ -235,12 +235,12 @@ fn checkVarDeclStatement(c: *Checker, node: Node) Error!void {
     const ambient = c.ambient_ctx or precededByDeclare(c, node);
     if (c.nodeTag(node) == .var_decl_one) {
         if (ambient) try checkAmbientInitializer(c, d.lhs, is_const);
-        try checkDeclarator(c, d.lhs, is_const);
+        try checkDeclarator(c, d.lhs, is_const, ambient);
     } else {
         for (c.tree.nodeRange(node)) |decl| {
             if (decl == null_node) continue;
             if (ambient) try checkAmbientInitializer(c, decl, is_const);
-            try checkDeclarator(c, decl, is_const);
+            try checkDeclarator(c, decl, is_const, ambient);
         }
     }
 }
@@ -266,7 +266,7 @@ fn checkAmbientInitializer(c: *Checker, decl: Node, is_const: bool) Error!void {
     try c.diagFmt(1039, c.nodeSpan(init), "Initializers are not allowed in ambient contexts.", .{});
 }
 
-fn checkDeclarator(c: *Checker, decl: Node, is_const: bool) Error!void {
+fn checkDeclarator(c: *Checker, decl: Node, is_const: bool, ambient: bool) Error!void {
     // TS2403 — every declaration of a name after the first must have an
     // identical type. Runs before the initializer checks so the type demand
     // is the same one `typeOfSymbol` would make on its own.
@@ -280,7 +280,7 @@ fn checkDeclarator(c: *Checker, decl: Node, is_const: bool) Error!void {
         // iterable and is checked elsewhere.
         .declarator => {
             try implicit_any.reportPatternImplicitAny(c, d.lhs);
-            try implicit_any.reportAmbientVarImplicitAny(c, d.lhs);
+            try implicit_any.reportVarImplicitAny(c, d.lhs, ambient);
         },
         .declarator_init => {
             _ = try c.checkExprCached(d.rhs, types.no_type);
