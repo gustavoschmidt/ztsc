@@ -22,3 +22,6 @@ scratchpad/
 # but keep the node_modules fixtures used by conformance tests
 !test/conformance/**/node_modules/
 !test/conformance/**/node_modules/**
+
+# Python bytecode from the bench scripts.
+__pycache__/

@@ -19,6 +19,26 @@ pub const Code = enum(u16) {
     unterminated_comment,
     unexpected_character,
 
+    // --- literal grammar (src/frontend/literals.zig) -----------------------
+    /// TS1121: `010` — a legacy octal literal.
+    octal_literal_not_allowed,
+    /// TS1489: `08` — a decimal that starts with a zero.
+    decimal_with_leading_zero,
+    /// TS1487: `"\101"` — a legacy octal escape.
+    octal_escape_not_allowed,
+    /// TS1488: `"\8"` — not an escape sequence in any mode.
+    escape_sequence_not_allowed,
+    /// TS1125: `0x`, `"\x1"`, `"\u12"` — a hex digit was required here.
+    hex_digit_expected,
+    /// TS1177: `0b` with no digits.
+    binary_digit_expected,
+    /// TS1178: `0o` with no digits.
+    octal_digit_expected,
+    /// TS1198: `"\u{110000}"` — outside the Unicode range.
+    unicode_escape_out_of_range,
+    /// TS1199: `"\u{12"` — no closing brace.
+    unterminated_unicode_escape,
+
     // --- parse errors ------------------------------------------------------
     expected_expression,
     expected_identifier,
@@ -36,7 +56,11 @@ pub const Code = enum(u16) {
     expected_type,
     expected_type_member,
     expected_class_member,
+    /// TS1136: a key the grammar cannot start an object-LITERAL property with.
     expected_property_name,
+    /// TS1180: the same in an object BINDING pattern (`var { + } = o`) — tsc
+    /// words and numbers that one separately.
+    expected_binding_pattern_property,
     expected_binding,
     expected_string_literal,
     expected_from,
@@ -126,53 +150,181 @@ pub const Code = enum(u16) {
     /// TS2492: redeclaring a catch-clause parameter in the catch block.
     catch_redeclare,
 
+    // --- ambient-context and modifier grammar (checked in the parser) ------
+    /// TS1036: an executable statement in an ambient context (`declare
+    /// namespace N { a; }`, or anything non-declarative in a `.d.ts`). tsc
+    /// reports it once per containing block, on the statement's first token.
+    statement_not_allowed_in_ambient,
+    /// TS1183: a function, method, accessor or constructor with a BODY in an
+    /// ambient context. Reported on the body's `{`.
+    implementation_not_allowed_in_ambient,
+    /// TS1028: a second accessibility modifier on one member or parameter
+    /// (`public private x`), reported on the second one.
+    accessibility_modifier_already_seen,
+
+    // --- strict-mode reserved words (tsc's binder, `checkStrictModeIdentifier`)
+    /// TS1212: a future-reserved word (`yield`, `let`, `static`, `public`,
+    /// `private`, `protected`, `implements`, `interface`, `package`) used as an
+    /// Identifier. ztsc is always-strict, and so is every corpus case, so the
+    /// condition is simply "this word is here".
+    strict_reserved_word,
+    /// TS1213: the same, inside a class — tsc says so, because a class body is
+    /// strict whatever the file is.
+    strict_reserved_word_in_class,
+    /// TS1214: the same, in a file that is an external module — likewise strict
+    /// for a reason the reader may not have chosen.
+    strict_reserved_word_in_module,
+
     // --- subset boundary (explicit, never a wrong answer) ------------------------
     unsupported_syntax,
     unsupported_satisfies,
 
+    /// How tsc surfaces the condition — which decides both what a diagnostic
+    /// suppresses and what suppresses it. Established empirically against tsgo
+    /// 7.0.2: each candidate was compiled next to a second root file holding one
+    /// guaranteed TS2322, and the TS2322's survival says which pass produced the
+    /// diagnostic (see `Class.syntactic`).
+    pub const Class = enum {
+        /// tsc's PARSER recorded it in `sourceFile.parseDiagnostics`. tsc's
+        /// driver reports the whole program's syntactic diagnostics and, when
+        /// there is even one, never runs the semantic pass at all:
+        ///
+        ///     addRange(allDiagnostics, program.getSyntacticDiagnostics(...));
+        ///     if (allDiagnostics.length === configFileParsingDiagnosticsLength) {
+        ///         ... getSemanticDiagnostics ...
+        ///     }
+        ///
+        /// So one of these anywhere in the program suppresses every semantic
+        /// diagnostic everywhere in it, and nothing suppresses one of these.
+        syntactic,
+        /// tsc's GRAMMAR-CHECK pass: `checkGrammar*` in the checker and the
+        /// `checkStrictMode*` family in the binder. These carry TS1xxx codes but
+        /// live in the file's bind-and-check diagnostics, so they are semantic —
+        /// a `@ts-ignore` hides one, and a syntactic error anywhere in the
+        /// program suppresses one.
+        grammar,
+        /// ztsc's own subset boundary: tsc parses the construct without
+        /// complaining, so there is no gate of tsc's to mirror. Reporting one
+        /// must NOT suppress the rest of the program (that would trade one
+        /// honest "not supported yet" for a silently unchecked project), and it
+        /// has no TS code to report under.
+        subset,
+    };
+
+    pub fn class(code: Code) Class {
+        return switch (code) {
+            .unsupported_syntax, .unsupported_satisfies => .subset,
+
+            // Every bind diagnostic is semantic by construction, and the
+            // grammar-pass parse diagnostics join them. Each of the TS1xxx ones
+            // below was probed: `function f<in T>()` (TS1274), `<out in T>`
+            // (TS1029), `interface I<const T>` (TS1277), `@d var x` (TS1206),
+            // `a ?? b || c` (TS5076), two `default:` clauses (TS1113), `=>` on
+            // the next line (TS1200), `throw` then a line break (TS1142),
+            // `a?.b`x`` (TS1358) and `import x from y` (TS1141) all let a
+            // sibling file's TS2322 through.
+            .duplicate_identifier,
+            .block_scoped_redeclare,
+            .enum_merge_conflict,
+            .duplicate_function_implementation,
+            .duplicate_constructor_implementation,
+            .class_cannot_implement_overloads,
+            .function_merge_needs_ambient_class,
+            .import_conflict,
+            .catch_redeclare,
+            .decorator_not_valid_here,
+            .in_modifier_not_valid_here,
+            .out_modifier_not_valid_here,
+            .in_must_precede_out,
+            .const_modifier_not_valid_here,
+            .nullish_mixed_with_logical,
+            .tagged_template_in_optional_chain,
+            .newline_before_arrow,
+            .multiple_default_clauses,
+            .line_break_not_allowed,
+            .rest_must_be_last,
+            .expected_string_literal,
+            .statement_not_allowed_in_ambient,
+            .implementation_not_allowed_in_ambient,
+            .accessibility_modifier_already_seen,
+            .strict_reserved_word,
+            .strict_reserved_word_in_class,
+            .strict_reserved_word_in_module,
+            => .grammar,
+
+            else => .syntactic,
+        };
+    }
+
     pub fn message(code: Code) []const u8 {
         return switch (code) {
-            .unterminated_string => "unterminated string literal",
-            .unterminated_template => "unterminated template literal",
-            .unterminated_regexp => "unterminated regular expression literal",
-            .unterminated_comment => "unterminated block comment",
-            .unexpected_character => "unexpected character",
-            .expected_expression => "expected an expression",
-            .expected_identifier => "expected an identifier",
-            .expected_semicolon => "expected ';'",
-            .expected_comma => "expected ','",
-            .expected_colon => "expected ':'",
-            .expected_arrow => "expected '=>'",
-            .expected_l_paren => "expected '('",
-            .expected_r_paren => "expected ')'",
-            .expected_l_brace => "expected '{'",
-            .expected_r_brace => "expected '}'",
-            .expected_r_bracket => "expected ']'",
-            .expected_gt => "expected '>'",
-            .expected_lt => "expected '<'",
-            .expected_type => "expected a type",
-            .expected_type_member => "expected a property, method, or index signature",
-            .expected_class_member => "expected a class member",
-            .expected_property_name => "expected a property name",
-            .expected_binding => "expected a variable name or binding pattern",
-            .expected_string_literal => "expected a string literal",
-            .expected_from => "expected 'from'",
+            // Wherever `tsCode` names a tsc diagnostic, the text is tsc's own
+            // wording for that number — a report reads the same as tsc's and a
+            // reader can look the number up. The still-uncoded ones keep ztsc's
+            // lowercase phrasing so the two groups stay visibly distinct.
+            .unterminated_string => "Unterminated string literal.",
+            .unterminated_template => "Unterminated template literal.",
+            .unterminated_regexp => "Unterminated regular expression literal.",
+            .unterminated_comment => "'*/' expected.",
+            .unexpected_character => "Invalid character.",
+            // tsc appends the corrected spelling (`Use the syntax '0o10'.`) to
+            // the first two; a Diagnostic here is a code plus a span with no
+            // room to interpolate, so the invariant half of the sentence is what
+            // is reported — the same policy the bind diagnostics already follow.
+            .octal_literal_not_allowed => "Octal literals are not allowed.",
+            .decimal_with_leading_zero => "Decimals with leading zeros are not allowed.",
+            .octal_escape_not_allowed => "Octal escape sequences are not allowed.",
+            .escape_sequence_not_allowed => "This escape sequence is not allowed.",
+            .hex_digit_expected => "Hexadecimal digit expected.",
+            .binary_digit_expected => "Binary digit expected.",
+            .octal_digit_expected => "Octal digit expected.",
+            .unicode_escape_out_of_range => "An extended Unicode escape value must be between 0x0 and 0x10FFFF inclusive.",
+            .unterminated_unicode_escape => "Unterminated Unicode escape sequence.",
+            .expected_expression => "Expression expected.",
+            .expected_identifier => "Identifier expected.",
+            .expected_semicolon => "';' expected.",
+            .expected_comma => "',' expected.",
+            .expected_colon => "':' expected.",
+            .expected_arrow => "'=>' expected.",
+            .expected_l_paren => "'(' expected.",
+            .expected_r_paren => "')' expected.",
+            .expected_l_brace => "'{' expected.",
+            .expected_r_brace => "'}' expected.",
+            .expected_r_bracket => "']' expected.",
+            .expected_gt => "'>' expected.",
+            .expected_lt => "'<' expected.",
+            .expected_type => "Type expected.",
+            .expected_type_member => "Property or signature expected.",
+            .expected_class_member => "Unexpected token. A constructor, method, accessor, or property was expected.",
+            .expected_property_name => "Property assignment expected.",
+            .expected_binding_pattern_property => "Property destructuring pattern expected.",
+            .expected_binding => "Variable declaration expected.",
+            .expected_string_literal => "String literal expected.",
+            .expected_from => "'from' expected.",
             .expected_import_clause => "expected an import clause",
             .expected_export_clause => "expected an export clause",
-            .expected_while => "expected 'while'",
-            .expected_case_or_default => "expected 'case' or 'default'",
-            .expected_catch_or_finally => "expected 'catch' or 'finally'",
-            .expected_declaration => "expected a declaration",
-            .expected_eq => "expected '='",
+            .expected_while => "'while' expected.",
+            .expected_case_or_default => "'case' or 'default' expected.",
+            .expected_catch_or_finally => "'catch' or 'finally' expected.",
+            .expected_declaration => "Declaration expected.",
+            .expected_eq => "'=' expected.",
             .expected_of_or_in => "expected 'of' or 'in'",
             .unexpected_token => "unexpected token",
-            .nullish_mixed_with_logical => "'??' cannot be mixed with '||' or '&&' without parentheses",
-            .tagged_template_in_optional_chain => "tagged template expressions are not permitted in an optional chain",
-            .newline_before_arrow => "line break not permitted before '=>'",
-            .multiple_default_clauses => "a 'default' clause cannot appear more than once in a 'switch' statement",
+            .nullish_mixed_with_logical => "'??' and '||' operations cannot be mixed without parentheses.",
+            .tagged_template_in_optional_chain => "Tagged template expressions are not permitted in an optional chain.",
+            .newline_before_arrow => "Line terminator not permitted before arrow.",
+            .multiple_default_clauses => "A 'default' clause cannot appear more than once in a 'switch' statement.",
             .rest_must_be_last => "a rest element must be last",
-            .line_break_not_allowed => "line break not permitted here",
-            .argument_expected => "argument expression expected",
+            .line_break_not_allowed => "Line break not permitted here.",
+            .argument_expected => "Argument expression expected.",
+            .statement_not_allowed_in_ambient => "Statements are not allowed in ambient contexts.",
+            .implementation_not_allowed_in_ambient => "An implementation cannot be declared in ambient contexts.",
+            .accessibility_modifier_already_seen => "Accessibility modifier already seen.",
+            // tsc names the word (`'yield' is a reserved word...`); a Diagnostic
+            // is a code plus a span, so the invariant sentence is reported.
+            .strict_reserved_word => "Identifier expected. This is a reserved word in strict mode.",
+            .strict_reserved_word_in_class => "Identifier expected. This is a reserved word in strict mode. Class definitions are automatically in strict mode.",
+            .strict_reserved_word_in_module => "Identifier expected. This is a reserved word in strict mode. Modules are automatically in strict mode.",
             .decorator_not_valid_here => "Decorators are not valid here.",
             .in_modifier_not_valid_here => "'in' modifier can only appear on a type parameter of a class, interface or type alias",
             .out_modifier_not_valid_here => "'out' modifier can only appear on a type parameter of a class, interface or type alias",
@@ -201,10 +353,77 @@ pub const Code = enum(u16) {
         };
     }
 
-    /// The matching tsc error number, or 0 where we have no tsc analogue
-    /// (scanner/parser codes keep their own messages for now).
+    /// The matching tsc error number, or 0 where we have no tsc analogue.
+    ///
+    /// The parse/scanner half of this table was derived by running both
+    /// compilers over one snippet per code and keeping only the pairs where tsc
+    /// answers with a single, stable code (bench-side script; see the `Class`
+    /// doc comment for the method). A handful of ztsc codes are deliberately
+    /// left at 0 because tsc's answer depends on context in a way one code
+    /// cannot express — `unexpected_token` (a recovery catch-all tsc reaches
+    /// through half a dozen different messages), `expected_export_clause`,
+    /// `expected_of_or_in`, and `expected_import_clause`. Reporting a guess
+    /// there would manufacture a wrong code where reporting none only costs a
+    /// missing one.
     pub fn tsCode(code: Code) u16 {
         return switch (code) {
+            // tsc's `_0_expected`, one code for every "I wanted this token"
+            // failure. tsc's `parseExpected` reports at the CURRENT token, which
+            // is where `Parser.errAtCur` reports too.
+            .expected_semicolon,
+            .expected_comma,
+            .expected_colon,
+            .expected_arrow,
+            .expected_l_paren,
+            .expected_r_paren,
+            .expected_l_brace,
+            .expected_r_brace,
+            .expected_r_bracket,
+            .expected_gt,
+            .expected_lt,
+            .expected_from,
+            .expected_while,
+            .expected_eq,
+            => 1005,
+            .expected_expression => 1109,
+            .expected_identifier => 1003,
+            .expected_type => 1110,
+            .expected_type_member => 1131,
+            .expected_class_member => 1068,
+            .expected_property_name => 1136,
+            .expected_binding_pattern_property => 1180,
+            .expected_binding => 1134,
+            .expected_declaration => 1146,
+            .expected_case_or_default => 1130,
+            .expected_catch_or_finally => 1472,
+            .expected_string_literal => 1141,
+            .argument_expected => 1135,
+            .unterminated_string => 1002,
+            .unterminated_template => 1160,
+            .unterminated_regexp => 1161,
+            .unterminated_comment => 1010,
+            .unexpected_character => 1127,
+            .octal_literal_not_allowed => 1121,
+            .decimal_with_leading_zero => 1489,
+            .octal_escape_not_allowed => 1487,
+            .escape_sequence_not_allowed => 1488,
+            .hex_digit_expected => 1125,
+            .binary_digit_expected => 1177,
+            .octal_digit_expected => 1178,
+            .unicode_escape_out_of_range => 1198,
+            .unterminated_unicode_escape => 1199,
+            .nullish_mixed_with_logical => 5076,
+            .tagged_template_in_optional_chain => 1358,
+            .newline_before_arrow => 1200,
+            .multiple_default_clauses => 1113,
+            .line_break_not_allowed => 1142,
+            .statement_not_allowed_in_ambient => 1036,
+            .implementation_not_allowed_in_ambient => 1183,
+            .accessibility_modifier_already_seen => 1028,
+            .strict_reserved_word => 1212,
+            .strict_reserved_word_in_class => 1213,
+            .strict_reserved_word_in_module => 1214,
+
             .duplicate_identifier => 2300,
             .block_scoped_redeclare => 2451,
             .enum_merge_conflict => 2567,
@@ -260,6 +479,6 @@ test "diagnostic messages are non-empty" {
 
 test "diagnostic carries code and span" {
     const d: Diagnostic = .{ .code = .expected_semicolon, .span = .{ .start = 3, .end = 4 } };
-    try std.testing.expectEqualStrings("expected ';'", d.message());
+    try std.testing.expectEqualStrings("';' expected.", d.message());
     try std.testing.expectEqual(@as(u32, 1), d.span.len());
 }
