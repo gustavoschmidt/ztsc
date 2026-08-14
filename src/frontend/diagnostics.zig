@@ -144,6 +144,19 @@ pub const Code = enum(u16) {
     /// assertion `<T>x ** 2`, which tsc words differently.
     exp_lhs_type_assertion,
 
+    /// TS17019/TS17020: JSDoc's nullability markers written in a `.ts` file —
+    /// `T?`, `?T`, `T!`, `!T`. tsc's parser ACCEPTS all four (they build the
+    /// JSDoc type nodes) and its checker reports them, so the file's semantic
+    /// pass still runs; ztsc desugars them in the parser and reports here.
+    /// tsc's `{0}` is the corrected type, which a code-plus-span Diagnostic
+    /// cannot interpolate — the invariant sentence is what is reported, the
+    /// same policy the octal-literal and reserved-word messages follow. Four
+    /// codes for two tsc numbers because the message names the punctuation.
+    nullable_type_postfix,
+    nullable_type_prefix,
+    non_nullable_type_postfix,
+    non_nullable_type_prefix,
+
     // --- bind errors, tsc-compatible codes via tsCode() ---------------
     /// TS2300: two declarations of the same name that cannot merge
     /// (class+class, function+var, duplicate params, type+interface, ...).
@@ -304,6 +317,13 @@ pub const Code = enum(u16) {
             .arguments_in_class,
             .eval_in_module,
             .arguments_in_module,
+            // `let a: string?` next to a sibling file's TS2322 lets the TS2322
+            // through, and `parseInvalidNullableTypes.ts` answers TS2322/TS2677
+            // alongside its own TS17019s — tsc's checker, not its parser.
+            .nullable_type_postfix,
+            .nullable_type_prefix,
+            .non_nullable_type_postfix,
+            .non_nullable_type_prefix,
             => .grammar,
 
             else => .syntactic,
@@ -408,6 +428,10 @@ pub const Code = enum(u16) {
             .exp_lhs_typeof => expLhsMessage("typeof"),
             .exp_lhs_await => expLhsMessage("await"),
             .exp_lhs_type_assertion => "A type assertion expression is not allowed in the left-hand side of an exponentiation expression. Consider enclosing the expression in parentheses.",
+            .nullable_type_postfix => jsdocMarkerMessage("?", "end"),
+            .nullable_type_prefix => jsdocMarkerMessage("?", "start"),
+            .non_nullable_type_postfix => jsdocMarkerMessage("!", "end"),
+            .non_nullable_type_prefix => jsdocMarkerMessage("!", "start"),
             .duplicate_identifier => "duplicate identifier",
             .block_scoped_redeclare => "cannot redeclare block-scoped variable",
             .enum_merge_conflict => "Enum declarations can only merge with namespace or other enum declarations.",
@@ -528,6 +552,8 @@ pub const Code = enum(u16) {
             .exp_lhs_await,
             => 17006,
             .exp_lhs_type_assertion => 17007,
+            .nullable_type_postfix, .non_nullable_type_postfix => 17019,
+            .nullable_type_prefix, .non_nullable_type_prefix => 17020,
             else => 0,
         };
     }
@@ -548,6 +574,12 @@ fn evalClassMessage(comptime word: []const u8) []const u8 {
 
 fn evalModuleMessage(comptime word: []const u8) []const u8 {
     return "Invalid use of '" ++ word ++ "'. Modules are automatically in strict mode.";
+}
+
+/// TS17019/TS17020 differ only in the punctuation and in which end of the type
+/// it sat on, so the four arms share one comptime template.
+fn jsdocMarkerMessage(comptime mark: []const u8, comptime end: []const u8) []const u8 {
+    return "'" ++ mark ++ "' at the " ++ end ++ " of a type is not valid TypeScript syntax.";
 }
 
 fn expLhsMessage(comptime op: []const u8) []const u8 {
