@@ -288,7 +288,7 @@ pub fn narrowByTypeof(c: *Checker, t0: TypeId, str: Atom, sense: bool) Error!Typ
     for (c.typeof_atoms, 0..) |a, i| {
         if (a == str) which = i;
     }
-    if (which == typeof_names.len) return t0;
+    if (which == typeof_names.len) return narrowByTypeofHostObject(c, t0, sense);
     // A type parameter narrows through its CONSTRAINT (`typeofMatches` only
     // inspects concrete kinds, so filtering `T` itself would collapse
     // `typeof x === 'object'` to `never`) — but the answer must stay a
@@ -310,6 +310,51 @@ pub fn narrowByTypeof(c: *Checker, t0: TypeId, str: Atom, sense: bool) Error!Typ
         }
     }
     return c.narrowByTypeofResolved(t0, which, sense);
+}
+
+/// `typeof x === "Object"` — a string literal that is not one of the eight
+/// values `typeof` can produce. tsc does not give up: the comparison can only
+/// succeed for a "host object" (tsc's `TypeofEQHostObject`/`TypeofNEHostObject`
+/// fact masks, the fallback when the literal is in neither `typeofEQFacts` nor
+/// `typeofNEFacts`), so the asserting branch keeps the OBJECT-ish constituents
+/// and the other branch keeps the primitives.
+///
+/// Oracle-verified on `string | number | boolean | symbol | bigint | undefined
+/// | null | C | (() => void) | {} | object`:
+///   `=== "Object"` → `object | C | () => void`
+///   `!== "Object"` → `string | number | bigint | symbol | boolean | {} | null
+///                     | undefined`
+/// and an `any`/`unknown` subject becomes `object` on the asserting branch.
+/// `null` sides with the primitives even though `typeof null` IS `"object"`,
+/// which is why it is excluded here explicitly.
+///
+/// One knowingly-kept divergence: tsc drops `{}` on the asserting branch (its
+/// empty-object facts carry only the NE bit) while the object-kind test below
+/// keeps it. Reproducing that would need an `emptyObjectType` identity ztsc
+/// does not distinguish from any other member-less object type.
+fn narrowByTypeofHostObject(c: *Checker, t: TypeId, sense: bool) Error!TypeId {
+    const k = c.ts.kind(t);
+    if (k == .any or k == .unknown or k == .err) {
+        return if (sense) types.object_keyword_type else t;
+    }
+    if (k == .union_type) {
+        var parts: std.ArrayList(TypeId) = .empty;
+        defer parts.deinit(c.scratch());
+        for (try c.memberList(t)) |m| {
+            if (try hostObjectMatches(c, m) == sense) try parts.append(c.scratch(), m);
+        }
+        return c.ts.makeUnion(c.scratch(), parts.items);
+    }
+    if (try hostObjectMatches(c, t) == sense) return t;
+    return types.never_type;
+}
+
+/// Could `typeof m` be a value outside the eight standard ones — i.e. is `m`
+/// an object or a function, `null` aside?
+fn hostObjectMatches(c: *Checker, m: TypeId) Error!bool {
+    if (c.ts.kind(m) == .null) return false;
+    if (try c.typeofMatchesFn(m, 7)) return true;
+    return c.typeofMatchesFn(m, 6);
 }
 
 pub fn narrowByTypeofResolved(c: *Checker, t: TypeId, which: usize, sense: bool) Error!TypeId {
@@ -751,7 +796,14 @@ pub fn instanceTypeOfConstructor(c: *Checker, rt: TypeId) Error!TypeId {
             var rets: std.ArrayList(TypeId) = .empty;
             defer rets.deinit(c.scratch());
             for (0..n) |i| {
-                try rets.append(c.scratch(), c.ts.fnReturn(c.ts.objectConstructSig(obj, @intCast(i))));
+                // tsc: `getReturnTypeOfSignature(getErasedSignature(sig))` —
+                // a GENERIC construct signature (`new <T>(): B<T>`) has no
+                // type arguments to infer at an `instanceof`, so its own type
+                // parameters collapse to `any`. Without the erasure the
+                // narrowed instance kept `T` free, and `obj.foo = 1` on a
+                // narrowed `B<T>` reported TS2322.
+                const sig = try c.eraseParamsToAny(c.ts.objectConstructSig(obj, @intCast(i)));
+                try rets.append(c.scratch(), c.ts.fnReturn(sig));
             }
             return c.ts.makeUnion(c.scratch(), rets.items);
         }
@@ -941,4 +993,62 @@ pub fn narrowByInstance(c: *Checker, t: TypeId, instance: TypeId, sense: bool, c
     if (!check_derived and try narrowByInstance(c, t, instance, true, check_derived) == t)
         return types.never_type;
     return t;
+}
+
+/// tsc's `narrowTypeByConstructor`: `x.constructor === C` keeps the
+/// constituents of `x` that are COMPARABLE to `C.prototype`.
+///
+/// `ctor_t` is the type of the right-hand side (`typeof C`); the candidate is
+/// its `prototype` property, which is what makes the guard work for a plain
+/// interface-typed constructor variable as well as for a `class`. Answers `t`
+/// unchanged — no narrowing — in each of tsc's bail cases:
+///
+///   * no `prototype` property (the comparand is not a constructor at all);
+///   * `prototype: any`, which carries no information;
+///   * a candidate that is exactly the global `Object` or `Function`, which
+///     every object satisfies;
+///
+/// and, as tsc does, hands an `any` subject the candidate outright.
+///
+/// The caller applies this on the branch where the equality HOLDS only:
+/// `x.constructor !== C` says nothing, because a subclass instance's
+/// `constructor` is the subclass.
+pub fn narrowByConstructorProp(c: *Checker, t: TypeId, ctor_t: TypeId) Error!TypeId {
+    const proto_atom = try c.atom("prototype");
+    const p = (try c.propOfType(try c.resolveStructural(ctor_t), proto_atom)) orelse return t;
+    const cand = try c.resolveStructural(p.ty);
+    const ck = c.ts.kind(cand);
+    if (ck == .any or ck == .unknown or ck == .err) return t;
+    if (try isObjectOrFunctionIface(c, cand)) return t;
+    const tk = c.ts.kind(t);
+    if (tk == .any or tk == .unknown or tk == .err) return cand;
+    if (tk == .union_type) {
+        var parts: std.ArrayList(TypeId) = .empty;
+        defer parts.deinit(c.scratch());
+        for (try c.memberList(t)) |m| {
+            if (try c.isComparable(m, cand)) try parts.append(c.scratch(), m);
+        }
+        return c.ts.makeUnion(c.scratch(), parts.items);
+    }
+    if (try c.isComparable(t, cand)) return t;
+    return types.never_type;
+}
+
+/// Is `t` exactly the global `Object` or `Function` interface — the two
+/// candidates tsc refuses to narrow an `any` down to, in both the
+/// `instanceof` and the `.constructor` guard (nothing is ruled out by them).
+pub fn isObjectOrFunctionIface(c: *Checker, t: TypeId) Error!bool {
+    if (isGlobalIface(c, t, c.atom_Object)) return true;
+    return isGlobalIface(c, t, try c.atom("Function"));
+}
+
+/// Is `t` the global interface `name` names? A materialized instance still
+/// names the reference it came from (`origin`), which is what `refFacetOf`
+/// reads.
+fn isGlobalIface(c: *Checker, t: TypeId, name: Atom) bool {
+    const sym = c.prog.globals.lookup(name) orelse return false;
+    const k = c.ts.kind(t);
+    if (k == .ref) return sym == c.ts.refSymbol(t);
+    if (c.refFacetOf(t, k)) |r| return sym == c.ts.refSymbol(r);
+    return false;
 }

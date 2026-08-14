@@ -26,6 +26,7 @@ const countArgs = @import("calls.zig").countArgs;
 const atom = Checker.atom;
 const findBindingType = @import("signatures.zig").findBindingType;
 const init = Checker.init;
+const isInstantiableKind = @import("expr.zig").isInstantiableKind;
 const lazy_base_depth = @import("instantiate.zig").lazy_base_depth;
 const propOfType = @import("props.zig").propOfType;
 const reduceSubtypes = @import("typenode.zig").reduceSubtypes;
@@ -93,6 +94,7 @@ pub const instanceofInstanceType = narrow.instanceofInstanceType;
 pub const isNullishKind = narrow.isNullishKind;
 pub const admitsNullish = narrow.admitsNullish;
 const narrowByInstance = narrow.narrowByInstance;
+const narrowByConstructorProp = narrow.narrowByConstructorProp;
 /// Not re-exported: `switchDefaultCovered` is the only reader outside
 /// `narrow.zig`, and it reaches it directly rather than as a `Checker` method.
 const unionFacet = narrow.unionFacet;
@@ -204,11 +206,47 @@ fn patternParentUnion(c: *Checker, decl: Node, is_const: bool, key: u64) Error!T
     const whole = try patternParentType(c, decl, is_const);
     var parent: TypeId = types.no_type;
     if (whole != types.no_type) {
-        const r = try c.resolveStructural(whole);
+        const r = try patternParentConstraint(c, try c.resolveStructural(whole));
         if (c.ts.kind(r) == .union_type) parent = r;
     }
     try c.pattern_parent_types.put(c.cm(), key, parent);
     return parent;
+}
+
+/// tsc's `mapType(parentType, getBaseConstraintOrType)`: the destructured
+/// parent seen through type-parameter constraints, so
+///
+///     function f<T extends { kind: 'A', payload: number }
+///                         | { kind: 'B', payload: string }>({ kind, payload }: T)
+///
+/// destructures the CONSTRAINT's union and a guard on `kind` still narrows
+/// `payload`. Without it the parent type is the bare `T`, "not a union", and
+/// the whole sibling-narrowing rule declined (`dependentDestructuredVariables`
+/// f13/f14).
+///
+/// Only an INSTANTIABLE constituent is replaced — tsc's
+/// `getBaseConstraintOfType` answers `undefined` for a plain object type, and
+/// ztsc's `baseConstraintOf` would otherwise substitute the type parameters
+/// nested INSIDE one (`A<T> | B<T>` becoming `A<con> | B<con>`), which is a
+/// different type than the destructuring is written against.
+fn patternParentConstraint(c: *Checker, r: TypeId) Error!TypeId {
+    if (c.ts.kind(r) != .union_type) return constraintOrSelf(c, r);
+    var parts: std.ArrayList(TypeId) = .empty;
+    defer parts.deinit(c.scratch());
+    var changed = false;
+    for (try c.memberList(r)) |m| {
+        const cm = try constraintOrSelf(c, m);
+        if (cm != m) changed = true;
+        try parts.append(c.scratch(), cm);
+    }
+    if (!changed) return r;
+    return c.ts.makeUnion(c.scratch(), parts.items);
+}
+
+fn constraintOrSelf(c: *Checker, t: TypeId) Error!TypeId {
+    if (!isInstantiableKind(c.ts.kind(t))) return t;
+    const con = try c.baseConstraintOf(t);
+    return try c.resolveStructural(con);
 }
 
 /// The direct `binding_property` of `pat` that binds `name`, if it is one
@@ -1124,6 +1162,88 @@ pub fn thisPropUnassigned(c: *Checker, flow: FlowId, name: Atom, declared: TypeI
     return hasUndefinedMember(c, t);
 }
 
+/// The definite-assignment (TS2454) half of the same walk, for a VARIABLE
+/// reference: the ordinary narrowing walk over `declared | undefined`, run as
+/// an initialization query (`RefKey.opt_init`) so the two rules a plain
+/// narrowing walk deliberately skips both apply here —
+///
+///   • a COMPOUND write (`x += 1`, `x++`) is not an initialization, so
+///     `undefined` survives it exactly as tsc's compound arm does, and
+///   • the branch a literal `true`/`false` condition contradicts does not
+///     exist, so `false ? unassigned : y` and `if (true) { x = 1; } x` are
+///     both silent.
+///
+/// `undefined` still enters only at the top of the flow, which is what makes
+/// "the answer still admits `undefined`" mean "some path left it unwritten".
+pub fn unassignedVarType(c: *Checker, node: Node, sym: SymbolId, optional: TypeId) Error!TypeId {
+    return c.flowTypeOfKey(node, .{ .sym = sym, .opt_init = true }, optional);
+}
+
+/// tsc's `getControlFlowContainer`: the nearest enclosing function, MODULE
+/// BLOCK, or source file.
+///
+/// `Checker.containerOf` stops only at functions and the file, which is the
+/// right answer for the scope questions it is asked but the wrong one for
+/// definite assignment: a `namespace` body has its own flow graph, so a `var`
+/// of an enclosing namespace (or of the file) read inside a nested one is an
+/// OUTER variable to tsc and assumed initialized. Without the distinction
+/// `namespace m2 { var x: string|number; namespace m3 { … x … } }` reported
+/// TS2454 on every such read (`typeGuardsInModule`,
+/// `typeGuardsInFunctionAndModuleBlock`).
+pub fn flowContainerOf(c: *const Checker, s: binder.ScopeId) binder.ScopeId {
+    var cur = s;
+    while (cur != binder.file_scope) {
+        switch (c.bind.scope_kinds[cur]) {
+            .function, .file, .namespace => return cur,
+            else => cur = c.bind.scope_parents[cur],
+        }
+    }
+    return binder.file_scope;
+}
+
+/// Is `node` an identifier that the head of an enclosing `for..in`/`for..of`
+/// statement ASSIGNS — `for (x of xs)`, `for ({ a: x } of xs)`,
+/// `for ([x] of xss)`? Such a reference is a WRITE, and tsc never reports it
+/// unassigned: its binder places the head's flow assignment node *ahead* of
+/// the target expression, so the target's own identifiers read the loop
+/// variable as already written. Only uses after the loop are reported, since
+/// the loop body may never run.
+///
+/// ztsc's binder adds the assign node after binding the target (`bindForInOf`),
+/// which is the right order for narrowing the loop BODY, so the exemption is
+/// drawn here instead of in the graph. Restricted to the assignment form: a
+/// declaration head declares the variable and never reaches TS2454 anyway.
+pub fn inForHeadWriteTarget(c: *Checker, node: Node, sym: SymbolId) Error!bool {
+    const b = c.bind;
+    const stop = c.containerOf(c.cur_scope);
+    var s = c.cur_scope;
+    while (true) {
+        if (b.scope_kinds[s] == .for_head) {
+            const owner = b.scope_owners[s];
+            const is_for_in_of = owner != null_node and switch (c.nodeTag(owner)) {
+                .for_in_stmt, .for_of_stmt => true,
+                else => false,
+            };
+            if (is_for_in_of) {
+                const e = c.tree.extraData(ast.ForInOf, c.tree.nodeData(owner).lhs);
+                switch (c.nodeTag(e.left)) {
+                    .var_decl_one, .var_decl => {},
+                    else => if (try patternBindsSym(c, e.left, sym)) {
+                        // A single-statement loop body shares the head's
+                        // scope, so the name match alone is not enough — the
+                        // reference has to sit inside the target itself.
+                        const span = c.nodeSpan(e.left);
+                        const at = c.nodeSpanStart(node);
+                        if (at >= span.start and at < span.end) return true;
+                    },
+                }
+            }
+        }
+        if (s == stop or s == binder.file_scope) return false;
+        s = b.scope_parents[s];
+    }
+}
+
 /// Is this assign-flow node a `for..in` key binding whose ENUMERATED OBJECT
 /// is the reference being asked about? Then the type inside the loop is the
 /// antecedent's with nullish stripped (tsc's `getTypeAtFlowAssignment`, last
@@ -1249,6 +1369,14 @@ fn assignNarrows(c: *Checker, target: Node, key: RefKey, declared: TypeId) Error
                 if (!try c.identIsSym(d.lhs, root_sym)) return null;
                 // key.len != 0 was caught above by refPrefixWritten.
                 const op = c.tree.tokens.tag(c.tree.nodeMainToken(target));
+                // Same rule the property query draws above, for a variable:
+                // a compound write is not an initialization, so an
+                // initialization query walks PAST it and lets `undefined`
+                // through. The narrowing arm below deliberately answers with
+                // the whole expression's type instead, which is more precise
+                // than tsc's `getBaseTypeOfLiteralType(typeAtAntecedent)` and
+                // would hide every TS2454 after an `x += 1`.
+                if (key.opt_init and !definiteAssignOp(op)) return null;
                 // An evolving (`auto`-typed) variable takes the assigned
                 // type outright — there is no declared type to reduce it
                 // against (tsc `getTypeAtFlowAssignment`, autoType branch).
@@ -1549,8 +1677,16 @@ pub fn narrowByCondition(c: *Checker, t: TypeId, cond: Node, sense: bool, key: R
                         return t;
                     }
                     const rt = try c.checkExprCached(d.rhs, types.no_type);
-                    if (try c.instanceofInstanceType(rt)) |inst|
+                    if (try c.instanceofInstanceType(rt)) |inst| {
+                        // tsc's "don't narrow from 'any' if the target type is
+                        // exactly 'Object' or 'Function'" — every value
+                        // satisfies either, so `x instanceof Object` on an
+                        // `any` would only take members away.
+                        const tk = c.ts.kind(t);
+                        if ((tk == .any or tk == .unknown or tk == .err) and
+                            try narrow.isObjectOrFunctionIface(c, inst)) return t;
                         return narrowByInstance(c, t, inst, sense, true);
+                    }
                     return t;
                 },
                 // `a && b` true implies both operands are truthy; `a || b`
@@ -1652,6 +1788,20 @@ fn narrowByEqualityCond(c: *Checker, t: TypeId, lhs: Node, rhs: Node, strict: bo
     }
     if (try refMatches(c, rhs, key)) {
         return narrowByLiteralEquality(c, t, lhs, strict, sense);
+    }
+    // `<ref>.constructor === C` — tsc's `narrowTypeByConstructor`. Ahead of
+    // the discriminant arm, which would otherwise read `constructor` as a
+    // discriminant property and filter by a literal no constituent carries.
+    // Only the branch where the equality HOLDS narrows (`sense` is already
+    // equals-folded): a subclass instance's `constructor` is the subclass, so
+    // the inequality rules nothing out.
+    if (try constructorRefOf(c, lhs, key)) {
+        if (!sense) return t;
+        return narrowByConstructorProp(c, t, try c.checkExprCached(rhs, types.no_type));
+    }
+    if (try constructorRefOf(c, rhs, key)) {
+        if (!sense) return t;
+        return narrowByConstructorProp(c, t, try c.checkExprCached(lhs, types.no_type));
     }
     // <ref>.k === <literal> narrows <ref> by its discriminant. `<ref>` is
     // the tracked reference — a root symbol (`x.k`, key.len == 0) or a
@@ -1772,6 +1922,27 @@ fn narrowByTypeofChainContainment(c: *Checker, t: TypeId, value: Node, sense: bo
     const is_undef_lit = c.ts.literalAtom(rt) == c.typeof_atoms[5]; // "undefined"
     if (sense != is_undef_lit) return c.nonNullable(t);
     return t;
+}
+
+/// tsc's `isMatchingConstructorReference`: is `node` the access
+/// `<ref>.constructor` (or its element spelling `<ref>["constructor"]`) where
+/// `<ref>` is exactly `key`'s reference? Optional forms are excluded, as they
+/// are in tsc.
+///
+/// The name test is a text compare rather than `atom("constructor")`: every
+/// `===` narrowing over a member access reaches here, and comparing the
+/// already-interned atom's bytes costs a length check where interning the
+/// literal costs a string hash.
+fn constructorRefOf(c: *Checker, node: Node, key: RefKey) Error!bool {
+    if (node == null_node) return false;
+    switch (c.nodeTag(node)) {
+        .member_expr, .index_expr => {},
+        else => return false,
+    }
+    const pe = (try pathElemOfAccess(c, node)) orelse return false;
+    if (pe.isIndex()) return false;
+    if (!std.mem.eql(u8, c.atomText(pe.atom()), "constructor")) return false;
+    return refMatches(c, c.tree.nodeData(node).lhs, key);
 }
 
 /// `<ref>.k` where `<ref>` is exactly `key`'s reference: returns the
@@ -2630,8 +2801,17 @@ fn narrowBySwitchClause(c: *Checker, t: TypeId, clause: Node, key: RefKey, decl:
     // don't back-reference it, so scan: the discriminant condition
     // narrows only when it's the reference or `ref.prop`.
     const sw = switchOfClause(c, clause) orelse return t;
-    const disc = c.tree.nodeData(sw).lhs;
+    var disc = c.tree.nodeData(sw).lhs;
+    while (disc != null_node and c.nodeTag(disc) == .paren_expr) disc = c.tree.nodeData(disc).lhs;
     const is_default = c.nodeTag(clause) == .default_clause;
+
+    // `switch (true) { case <guard>: … }` — TS 5.3's switch-on-`true`
+    // narrowing (tsc's `narrowTypeBySwitchOnTrue`). Each clause expression is
+    // a CONDITION on the reference, not a value to compare it against, so no
+    // discriminant test applies.
+    if (c.nodeTag(disc) == .true_literal) {
+        return narrowBySwitchOnTrue(c, t, sw, clause, key, decl);
+    }
 
     var prop: Atom = 0;
     var direct = false;
@@ -2703,6 +2883,39 @@ fn narrowBySwitchClause(c: *Checker, t: TypeId, clause: Node, key: RefKey, decl:
         return narrowByOptChainContainment(c, narrowed, test_node, true, true);
     }
     return narrowed;
+}
+
+/// tsc's `narrowTypeBySwitchOnTrue`: in `switch (true)` every `case`
+/// expression is a condition, so a clause's own expression narrows with
+/// `assumeTrue` and every clause that could have matched FIRST narrows with
+/// `assumeFalse`. `default:` is reached only when nothing matched, so there
+/// every case expression narrows false — including the ones written after it.
+///
+/// ztsc's binder gives each clause its own `switch_clause` flow node and joins
+/// fallthrough separately, so a clause range (tsc's `clauseStart`/`clauseEnd`,
+/// which exists to model a fallthrough group) is exactly one clause here.
+fn narrowBySwitchOnTrue(c: *Checker, t0: TypeId, sw: Node, clause: Node, key: RefKey, decl: TypeId) Error!TypeId {
+    var t = t0;
+    const r = c.tree.extraData(ast.SubRange, c.tree.nodeData(sw).rhs);
+    const clauses = c.tree.extraRange(r.start, r.end);
+    var past = false;
+    const is_default = c.nodeTag(clause) == .default_clause;
+    for (clauses) |cl| {
+        if (cl == clause) {
+            past = true;
+            continue;
+        }
+        // A clause AFTER this one only constrains the `default:` edge.
+        if (past and !is_default) break;
+        if (cl == null_node or c.nodeTag(cl) != .case_clause) continue;
+        const test_node = c.tree.nodeData(cl).lhs;
+        if (test_node == 0) continue;
+        t = try c.narrowByCondition(t, test_node, false, key, decl);
+    }
+    if (is_default) return t;
+    const own = c.tree.nodeData(clause).lhs;
+    if (own == 0) return t;
+    return c.narrowByCondition(t, own, true, key, decl);
 }
 
 /// Every value the discriminant can take is covered by a `case` label, so
@@ -2876,11 +3089,16 @@ fn assignTargetsSymForDa(c: *Checker, target: Node, sym: SymbolId) Error!bool {
         },
         .assign => {
             const d = c.tree.nodeData(target);
+            // A COMPOUND write reads before it writes and does not
+            // initialize: tsc's `getTypeAtFlowAssignment` hands its compound
+            // arm the (base-widened) type from BEFORE the write, so
+            // `let x: number; x **= 1; x;` reports TS2454 at BOTH uses. `=`,
+            // `||=` and `??=` do initialize — see `definiteAssignOp`.
+            if (!definiteAssignOp(c.tree.tokens.tag(c.tree.nodeMainToken(target)))) return false;
             return patternBindsSym(c, d.lhs, sym);
         },
-        .prefix_unary, .postfix_unary => {
-            return c.identIsSym(c.tree.nodeData(target).lhs, sym);
-        },
+        // `x++` / `--x` is compound in exactly the same sense.
+        .prefix_unary, .postfix_unary => return false,
         .var_decl_one, .var_decl => return varDeclBindsSym(c, target, sym),
         else => return patternBindsSym(c, target, sym),
     }

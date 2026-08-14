@@ -151,13 +151,22 @@ pub const RefKey = struct {
     /// 1-based `deep_path_list` id, or 0 when the path is inline.
     deep: u16 = 0,
     len: u8 = 0,
-    /// A `strictPropertyInitialization` query (`thisPropUnassigned`) rather
-    /// than an ordinary narrowing query: the walk starts from tsc's
-    /// `initialType` — `declared | undefined` — instead of the declared type,
-    /// so that reaching the top of the constructor's flow *is* the answer
-    /// "this path never wrote the property". tsc passes the two types
-    /// separately (`getFlowTypeOfReference(ref, declaredType, initialType)`);
-    /// ztsc's walk carries one, so the difference rides in the reference key.
+    /// A DEFINITE-ASSIGNMENT query — `strictPropertyInitialization` for a
+    /// `this` property (`thisPropUnassigned`, TS2564/TS2565) or use-before-
+    /// assignment for a variable (`unassignedVarType`, TS2454) — rather than
+    /// an ordinary narrowing query: the walk starts from tsc's `initialType`
+    /// — `declared | undefined` — instead of the declared type, so that
+    /// reaching the top of the flow *is* the answer "this path never wrote
+    /// it". tsc passes the two types separately
+    /// (`getFlowTypeOfReference(ref, declaredType, initialType)`); ztsc's walk
+    /// carries one, so the difference rides in the reference key.
+    ///
+    /// Two arms of the walk read it beyond that: a compound write does not
+    /// initialize, and an edge a literal `true`/`false` condition contradicts
+    /// does not exist. Both are tsc's rule for every reference; ztsc applies
+    /// them where the answer is a yes/no about assignment rather than a type
+    /// anyone observes, because the narrowing arms they would replace are
+    /// strictly more precise (see their call sites in `flow.zig`).
     ///
     /// It has to live in the KEY rather than beside it: `FlowQ` interns
     /// `(flow, reference, declared)` and caches the answer under it, and the
