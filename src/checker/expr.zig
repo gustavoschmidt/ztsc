@@ -689,6 +689,16 @@ fn checkEvolvingVarRead(c: *Checker, sym: SymbolId, node: Node, tok: TokenIndex)
     const decls = c.declsOf(sym);
     if (decls.len == 0) return;
     if (c.ambient_ctx or isAmbientDeclarator(c, decls[0])) return;
+    // A `for..in`/`for..of` HEAD declarator takes its type from the iterable, not
+    // from the control flow — tsc's auto-type branch is reached only for a
+    // declarator whose type has no other source. Recognized on the token after
+    // the name, which is the whole of what distinguishes the two shapes
+    // (`for (var v of xs)` vs `var v;`), and `isEvolvingVar` has already
+    // restricted the declarator to a plain identifier binding.
+    switch (c.tree.tokens.tag(c.tree.nodeMainToken(decls[0]) + 1)) {
+        .keyword_of, .keyword_in => return,
+        else => {},
+    }
     // tsc's `isParameterOrMutableLocalVariable(symbol) && isPastLastAssignment(…)`
     // arm of the flow-container walk that precedes the check: for a MUTABLE LOCAL
     // `let` the analysis is hoisted back out to the declaration's own container,
