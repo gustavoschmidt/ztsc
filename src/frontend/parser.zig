@@ -1198,7 +1198,118 @@ const Parser = struct {
         };
     }
 
+    /// A statement in a position that has a PARENT in tsc's tree — a statement
+    /// list, a clause, or the single statement an `if`/`while`/`for`/label
+    /// carries. tsc's `checkGrammarModuleElementContext` asks exactly that
+    /// question of a module element, so the check belongs here and not in
+    /// `parseStatementUnchecked`, which is also how a declaration reached
+    /// THROUGH its own modifiers (`export namespace N`) gets one answer rather
+    /// than two.
     fn parseStatement(p: *Parser) PE!Node {
+        if (!p.module_body and p.spec == 0) {
+            // tsc's `grammarErrorOnFirstToken`, which is the token still under
+            // the cursor here (`errAtToken` cannot be used: the token has not
+            // been consumed yet, so it has no index).
+            if (p.moduleElementCode()) |code| try p.errAtCur(code);
+        }
+        return p.parseStatementUnchecked();
+    }
+
+    /// The single statement an `if`/`else`/`while`/`do`/`for` or a label carries.
+    /// tsc's parent for it is that statement — never a SourceFile or a
+    /// ModuleBlock — so a module element there is out of context whatever list
+    /// encloses the whole thing (`if (x) namespace N {}` is TS1235 even at the
+    /// top level of a file). See `Parser.module_body`.
+    fn parseSubstatement(p: *Parser) PE!Node {
+        const was_module_body = p.module_body;
+        p.module_body = false;
+        defer p.module_body = was_module_body;
+        return p.parseStatement();
+    }
+
+    /// tsc's `checkGrammarModuleElementContext`, as a question about the tokens
+    /// a statement starts with: which code a MODULE ELEMENT earns in a statement
+    /// list that is not a module body, or null when these tokens start no module
+    /// element at all (`import(…)`, `module.exports`, `declare = 1`).
+    ///
+    /// A declaration that merely CARRIES `export`/`declare` as a modifier is
+    /// TS1184 instead, because tsc reaches it through `checkGrammarModifiers`.
+    /// The split follows tsc's node kinds exactly: `export namespace N` is a
+    /// ModuleDeclaration (TS1235) while `export function f` is a
+    /// FunctionDeclaration with an `export` modifier (TS1184), and `export
+    /// default 1` is an ExportAssignment (TS1258) while `export default class C`
+    /// is again a declaration with modifiers (TS1184). Every arm was measured
+    /// against tsgo 7.0.2 rather than inferred.
+    fn moduleElementCode(p: *Parser) ?Code {
+        return switch (p.curTag()) {
+            // `import(…)` and `import.meta` are expressions, not declarations.
+            .keyword_import => if (p.peekTag(1) == .l_paren or p.peekTag(1) == .dot)
+                null
+            else
+                .import_not_at_top_level,
+            .keyword_namespace, .keyword_module => p.namespaceElementCode(0),
+            .keyword_declare => p.declareElementCode(0),
+            .keyword_export => switch (p.peekTag(1)) {
+                .eq => .export_assign_not_at_top_level,
+                .keyword_import => .import_not_at_top_level,
+                .asterisk, .l_brace => .export_not_at_top_level,
+                .keyword_as => .export_as_namespace_not_at_top_level,
+                // `export type { … }` and `export type * from` are export
+                // declarations; `export type X = …` is an alias declaration
+                // whose `export` is a modifier.
+                .keyword_type => if (p.peekTag(2) == .l_brace or p.peekTag(2) == .asterisk)
+                    .export_not_at_top_level
+                else
+                    .modifiers_not_allowed_here,
+                .keyword_namespace, .keyword_module => p.namespaceElementCode(1),
+                .keyword_declare => p.declareElementCode(1),
+                .keyword_default => if (p.defaultExportIsDeclaration())
+                    .modifiers_not_allowed_here
+                else
+                    .export_default_not_at_top_level,
+                else => if (p.startsDeclarationAt(1)) .modifiers_not_allowed_here else null,
+            },
+            else => null,
+        };
+    }
+
+    /// `namespace`/`module` sits `n` tokens ahead: an ambient module when its
+    /// name is a STRING (`declare module "spec"`, TS1234 — not allowed even at
+    /// the top level of a namespace), a namespace when it is an identifier
+    /// (TS1235), and neither when no name follows (`module.exports = …`).
+    fn namespaceElementCode(p: *Parser, n: u32) ?Code {
+        if (p.peekNewline(n + 1)) return null;
+        const t = p.peekTag(n + 1);
+        if (t == .string_literal) return .ambient_module_not_at_top_level;
+        return if (isIdentLike(t)) .namespace_not_at_top_level else null;
+    }
+
+    /// `declare` sits `n` tokens ahead. `declare global { … }` is a
+    /// ModuleDeclaration too (tsc's `isGlobalScopeAugmentation`), and tsc words
+    /// it as the ambient-module case.
+    fn declareElementCode(p: *Parser, n: u32) ?Code {
+        if (p.peekNewline(n + 1)) return null;
+        return switch (p.peekTag(n + 1)) {
+            .keyword_global => .ambient_module_not_at_top_level,
+            .keyword_namespace, .keyword_module => p.namespaceElementCode(n + 1),
+            else => if (p.startsDeclarationAt(n + 1)) .modifiers_not_allowed_here else null,
+        };
+    }
+
+    /// Does `export default` here introduce a DECLARATION rather than an
+    /// expression? `async` only counts before `function` and `abstract` only
+    /// before `class`, because `export default async () => 1` and `export
+    /// default abstract` are expressions.
+    fn defaultExportIsDeclaration(p: *Parser) bool {
+        return switch (p.peekTag(2)) {
+            .keyword_function, .keyword_class, .keyword_interface => true,
+            .keyword_async => p.peekTag(3) == .keyword_function,
+            .keyword_abstract => p.peekTag(3) == .keyword_class,
+            else => false,
+        };
+    }
+
+    fn parseStatementUnchecked(p: *Parser) PE!Node {
         switch (p.curTag()) {
             .keyword_public,
             .keyword_private,
@@ -1208,7 +1319,9 @@ const Parser = struct {
             => {
                 if (p.statementModifierRunLen() == 0) return p.parseExpressionStatement();
                 try p.eatStatementModifiers();
-                return p.parseStatement();
+                // Already reported on the modifier run; the declaration behind
+                // it must not earn a second answer.
+                return p.parseStatementUnchecked();
             },
             .l_brace => return p.parseBlock(),
             .semicolon => {
@@ -1220,6 +1333,21 @@ const Parser = struct {
                 // `let` is a declaration only when a binding follows.
                 const t1 = p.peekTag(1);
                 if (isIdentLike(t1) or t1 == .l_bracket or t1 == .l_brace) return p.parseVarStatement();
+                return p.parseExpressionStatement();
+            },
+            .keyword_using => {
+                // `using x = res;` — an explicit-resource declaration (TS 5.2).
+                if (p.startsUsingDeclaration(0)) return p.parseVarStatement();
+                return p.parseExpressionStatement();
+            },
+            .keyword_await => {
+                // `await using x = res;` — tsc's `isAwaitUsingDeclaration`.
+                // The `await` is consumed here so the declaration list starts at
+                // `using`, which is the token `Binder.declKindOfVar` reads.
+                if (p.peekTag(1) == .keyword_using and !p.peekNewline(1) and p.startsUsingDeclaration(1)) {
+                    _ = try p.bump(); // `await`
+                    return p.parseVarStatement();
+                }
                 return p.parseExpressionStatement();
             },
             .keyword_if => return p.parseIfStatement(),
@@ -1353,6 +1481,18 @@ const Parser = struct {
                         _ = try p.bump(); // `declare`
                         return p.parseGlobalAugmentation();
                     },
+                    .keyword_export => {
+                        // `declare export function f() {}` — the modifiers in
+                        // the order tsc calls TS1029, which it reports while
+                        // still parsing both as one modifier list. Reading
+                        // `declare` as an expression instead cost a false
+                        // TS2304 and lost the TS1183 the body earns.
+                        _ = try p.bump(); // `declare`
+                        const was_ambient = p.ambient;
+                        p.ambient = true;
+                        defer p.ambient = was_ambient;
+                        return p.parseExportStatement();
+                    },
                     else => {},
                 };
                 return p.parseExpressionStatement();
@@ -1420,7 +1560,7 @@ const Parser = struct {
     fn parseLabeledStatement(p: *Parser) PE!Node {
         const label = try p.bump();
         _ = try p.bump(); // ':'
-        const body = try p.parseStatement();
+        const body = try p.parseSubstatement();
         if (isDeclarationTag(p.nodes.items(.tag)[body])) {
             try p.errAtToken(.label_not_allowed, label);
         }
@@ -1559,17 +1699,43 @@ const Parser = struct {
         return node;
     }
 
-    /// `var`/`let`/`const` declarator list (shared with for-init).
+    /// Does `using` — the token `n` ahead — begin a DECLARATION? tsc's
+    /// `nextTokenIsBindingIdentifierOrStartOfObjectDestructuringOnSameLine`: an
+    /// identifier or an OBJECT pattern on the same line. An ARRAY pattern is
+    /// deliberately absent, measured against tsgo — `using [b] = null` stays the
+    /// element access `using[b]`, while `using {a} = null` is a declaration that
+    /// then earns TS1492.
+    fn startsUsingDeclaration(p: *Parser, n: u32) bool {
+        if (p.peekNewline(n + 1)) return false;
+        const t = p.peekTag(n + 1);
+        return isIdentLike(t) or t == .l_brace;
+    }
+
+    /// `var`/`let`/`const`/`using` declarator list (shared with for-init).
     fn parseVarDecl(p: *Parser, no_in: bool) PE!Node {
-        const kw = try p.bump(); // var/let/const
+        const kw = try p.bump(); // var/let/const/using
         if (p.curTag() == .keyword_enum) {
             // `const enum E { ... }` — main_token stays on `const`.
             _ = try p.bump(); // `enum`
             return p.parseEnumDeclFrom(kw, ast.Flags.const_enum);
         }
+        // TS1492: a `using` declaration binds one name, never a pattern. Blamed
+        // on the pattern and reported before it is parsed; the pattern itself
+        // parses and binds as usual, because tsgo answers the TS2339 that
+        // `using { a } = null` earns alongside the TS1492.
+        const pattern_code: ?Code = if (p.tokTagAt(kw) == .keyword_using)
+            if (kw > 0 and p.tokTagAt(kw - 1) == .keyword_await)
+                .await_using_binding_pattern
+            else
+                .using_binding_pattern
+        else
+            null;
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
         while (true) {
+            if (pattern_code) |code| {
+                if (p.curTag() == .l_brace or p.curTag() == .l_bracket) try p.errAtCur(code);
+            }
             try p.pushScratch(try p.parseDeclarator(no_in));
             if (try p.eat(.comma) == null) break;
         }
@@ -1624,9 +1790,9 @@ const Parser = struct {
         _ = try p.expect(.l_paren, .expected_l_paren);
         const cond = try p.parseExpression(.{});
         _ = try p.expect(.r_paren, .expected_r_paren);
-        const then_stmt = try p.parseStatement();
+        const then_stmt = try p.parseSubstatement();
         if (try p.eat(.keyword_else) != null) {
-            const else_stmt = try p.parseStatement();
+            const else_stmt = try p.parseSubstatement();
             const extra = try p.addExtra(ast.IfElse{ .then_stmt = then_stmt, .else_stmt = else_stmt });
             return p.addNode(.{ .tag = .if_else_stmt, .main_token = kw, .data = .{ .lhs = cond, .rhs = extra } });
         }
@@ -1638,13 +1804,13 @@ const Parser = struct {
         _ = try p.expect(.l_paren, .expected_l_paren);
         const cond = try p.parseExpression(.{});
         _ = try p.expect(.r_paren, .expected_r_paren);
-        const body = try p.parseStatement();
+        const body = try p.parseSubstatement();
         return p.addNode(.{ .tag = .while_stmt, .main_token = kw, .data = .{ .lhs = cond, .rhs = body } });
     }
 
     fn parseDoStatement(p: *Parser) PE!Node {
         const kw = try p.bump();
-        const body = try p.parseStatement();
+        const body = try p.parseSubstatement();
         _ = try p.expect(.keyword_while, .expected_while);
         _ = try p.expect(.l_paren, .expected_l_paren);
         const cond = try p.parseExpression(.{});
@@ -1674,7 +1840,7 @@ const Parser = struct {
                 _ = try p.bump();
                 const right = if (is_of) try p.parseAssignExpr(.{}) else try p.parseExpression(.{});
                 _ = try p.expect(.r_paren, .expected_r_paren);
-                const body = try p.parseStatement();
+                const body = try p.parseSubstatement();
                 const extra = try p.addExtra(ast.ForInOf{ .left = init, .right = right, .is_await = is_await });
                 return p.addNode(.{
                     .tag = if (is_of) .for_of_stmt else .for_in_stmt,
@@ -1690,7 +1856,7 @@ const Parser = struct {
         var update: Node = null_node;
         if (p.curTag() != .r_paren and p.curTag() != .eof) update = try p.parseExpression(.{});
         _ = try p.expect(.r_paren, .expected_r_paren);
-        const body = try p.parseStatement();
+        const body = try p.parseSubstatement();
         const extra = try p.addExtra(ast.For{ .init = init, .cond = cond, .update = update });
         return p.addNode(.{ .tag = .for_stmt, .main_token = kw, .data = .{ .lhs = extra, .rhs = body } });
     }
@@ -1740,6 +1906,12 @@ const Parser = struct {
     fn parseClauseStatements(p: *Parser) PE!ast.SubRange {
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
+        // A case/default clause is a statement list but not a module body: the
+        // parent tsc sees is the CaseClause, so `case 1: namespace N {}` is
+        // TS1235 — see `Parser.module_body`.
+        const was_module_body = p.module_body;
+        p.module_body = false;
+        defer p.module_body = was_module_body;
         while (true) {
             switch (p.curTag()) {
                 .keyword_case, .keyword_default, .r_brace, .eof => break,
@@ -3028,7 +3200,10 @@ const Parser = struct {
                     .keyword_class => try p.parseClassDecl(0),
                     // `export default interface I { … }` — legal, and the only
                     // TYPE-side default export form.
-                    .keyword_interface => try p.parseStatement(),
+                    // `export default interface I { … }` — the declaration
+                    // behind the modifiers, already answered for by the
+                    // `export` this statement started with.
+                    .keyword_interface => try p.parseStatementUnchecked(),
                     .keyword_abstract => blk: {
                         if (p.peekTag(1) == .keyword_class) {
                             _ = try p.bump();
@@ -3107,7 +3282,7 @@ const Parser = struct {
                     return p.addNode(.{ .tag = .export_all, .main_token = kw, .data = .{ .lhs = extra, .rhs = mod } });
                 }
                 // `export type X = ...` — a type alias declaration.
-                const decl = try p.parseStatement();
+                const decl = try p.parseStatementUnchecked();
                 return p.addNode(.{ .tag = .export_decl, .main_token = kw, .data = .{ .lhs = decl, .rhs = 0 } });
             },
             .keyword_var,
@@ -3123,7 +3298,7 @@ const Parser = struct {
             .keyword_namespace,
             .keyword_module,
             => {
-                const decl = try p.parseStatement();
+                const decl = try p.parseStatementUnchecked();
                 return p.addNode(.{ .tag = .export_decl, .main_token = kw, .data = .{ .lhs = decl, .rhs = 0 } });
             },
             else => {

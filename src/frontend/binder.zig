@@ -1535,7 +1535,13 @@ const Binder = struct {
 
     fn declKindOfVar(b: *Binder, node: Node) DeclKind {
         return switch (b.tree.tokens.tag(b.tree.nodeMainToken(node))) {
-            .keyword_const => .const_decl,
+            // A `using`/`await using` declaration is block-scoped and immutable,
+            // exactly like `const` — tsc gives it `NodeFlags.Const` and reports
+            // an assignment to one as "Cannot assign to 'x' because it is a
+            // constant". The parser puts the declaration list's `main_token` on
+            // the `using` keyword for both forms so this one arm covers them.
+            // (wave-6 A: the only binder line the `using` work needed.)
+            .keyword_const, .keyword_using => .const_decl,
             .keyword_let => .let_decl,
             else => .var_decl,
         };
