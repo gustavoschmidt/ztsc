@@ -1821,7 +1821,15 @@ const Parser = struct {
     }
 
     fn parseParams(p: *Parser) PE!ast.SubRange {
-        _ = try p.expect(.l_paren, .expected_l_paren);
+        // tsc's `parseParameterList` returns a MISSING list the moment the `(`
+        // is not there — it neither reads parameters nor goes on to expect a
+        // `)`. Reading the list anyway made `function =>` answer with a second
+        // "')' expected" at end of file that tsc never has.
+        if (p.curTag() != .l_paren) {
+            try p.fail(.expected_l_paren);
+            return .{ .start = 0, .end = 0 };
+        }
+        _ = try p.bump();
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
         while (p.curTag() != .r_paren and p.curTag() != .eof) {
