@@ -42,6 +42,7 @@ const scratch = Checker.scratch;
 const signatureOfProto = @import("signatures.zig").signatureOfProto;
 
 const keyof_zig = @import("keyof.zig");
+const tuple_relate = @import("tuple_relate.zig");
 const typeparams_zig = @import("typeparams.zig");
 const typespace_zig = @import("typespace.zig");
 
@@ -418,9 +419,10 @@ pub fn restTupleOf(c: *Checker, p: types.Param) Error!?TypeId {
     // A *variadic* tuple whose spread is not last — rxjs's
     // `[...ObservableInputTuple<T>, SchedulerLike]` — has no positional
     // expansion: the elements after the spread sit at an arity nobody
-    // knows yet. Leave those signatures unexpanded (unbounded rest, the
-    // pre-existing behaviour) rather than mis-assigning position 1 to the
-    // trailing element.
+    // knows yet. Leave those signatures unexpanded rather than mis-assigning
+    // position 1 to the trailing element; `sigNonArrayRest` picks exactly
+    // those up and has the argument list satisfy the tuple as a WHOLE, which
+    // is the only form of the question that has an answer.
     const len = c.ts.tupleLen(r);
     for (0..len) |i| {
         if (c.ts.tupleElem(r, @intCast(i)).rest() and i != len - 1) return null;
@@ -489,23 +491,64 @@ pub fn sigRestUnion(c: *Checker, sig: TypeId) Error!?TypeId {
 /// positionally), and a plain `T[]` rest is an array, so both keep the
 /// per-position walk.
 ///
-/// ztsc narrows that to a UNION, which is where the whole-list rule earns its
-/// keep and where per-position typing provably cannot answer: position 1 of
-/// `[k, o?] | [k, d, o?]` would have to union the options bag with the default
-/// string, which relates to neither arm. Every other non-array rest stays on
-/// the per-position path — a deterministic under-report of the same shape the
-/// per-position check already handles.
-pub fn sigNonArrayRest(c: *Checker, sig: TypeId) Error!?TypeId {
+/// ztsc covers the two shapes where per-position typing provably cannot answer:
+///
+///   * a UNION rest — position 1 of `[k, o?] | [k, d, o?]` would have to union
+///     the options bag with the default string, which relates to neither arm;
+///   * a tuple rest with a rest or variadic element BEFORE its last position
+///     (`...args: [...strs: string[], n: number]`) — which target position an
+///     argument lands on then depends on how many arguments there are, so
+///     "position 1" is a question with no answer (`elemOfArrayish` gave the
+///     union of every element type, which blamed the wrong argument).
+///
+/// `from` is where the whole-list check starts: tsc's `getEffectiveRestType`
+/// slices the tuple at its `fixedLength`, leaving the leading FIXED elements on
+/// the ordinary per-position walk. A fully fixed tuple rest has no effective
+/// rest type at all (it expands positionally) and a plain `T[]` rest is an
+/// array, so both keep the per-position walk entirely.
+pub const NonArrayRest = struct {
+    /// The type the packed argument tuple must satisfy.
+    ty: TypeId,
+    /// The first argument index that goes into the packed tuple.
+    from: u32,
+};
+
+pub fn sigNonArrayRest(c: *Checker, sig: TypeId) Error!?NonArrayRest {
     const count = c.ts.fnParamCount(sig);
     if (count == 0) return null;
     const p = c.ts.fnParam(sig, count - 1);
     if (!p.rest()) return null;
     switch (c.ts.kind(p.ty)) {
-        .union_type, .ref => {},
+        .union_type, .ref, .tuple => {},
         else => return null,
     }
     const r = try c.resolveStructural(p.ty);
-    return if (c.ts.kind(r) == .union_type) r else null;
+    if (c.ts.kind(r) == .union_type) return .{ .ty = r, .from = count - 1 };
+    if (c.ts.kind(r) != .tuple) return null;
+    const fixed = tuple_relate.fixedLength(c, r);
+    const len = c.ts.tupleLen(r);
+    // An empty tuple rest (`...args: []`), nothing variable at all, or a lone
+    // variable element in LAST position: the positional expansion
+    // (`restTupleOf`) already answers every position.
+    if (len == 0 or fixed >= len - 1) return null;
+    const rest_slice = try sliceTuple(c, r, fixed, 0);
+    if (c.ts.kind(rest_slice) != .tuple) return null;
+    return .{ .ty = rest_slice, .from = count - 1 + fixed };
+}
+
+/// tsc's `sliceTupleType`: `tup`'s elements from `index` through
+/// `arity - end_skip`, as a tuple. A slice that starts inside a variable
+/// element has no positional form, and answers with that element's array type
+/// (which is what `makeTuple` collapses a lone rest element to).
+pub fn sliceTuple(c: *Checker, tup: TypeId, index: u32, end_skip: u32) Error!TypeId {
+    const len = c.ts.tupleLen(tup);
+    if (index > len or index + end_skip > len) return c.ts.makeTuple(&.{});
+    var elems: std.ArrayList(types.TupleElem) = .empty;
+    defer elems.deinit(c.scratch());
+    for (index..len - end_skip) |i| {
+        try elems.append(c.scratch(), c.ts.tupleElem(tup, @intCast(i)));
+    }
+    return c.ts.makeTuple(elems.items);
 }
 
 /// Is `index` an OPTIONAL position of a rest parameter typed by a union of

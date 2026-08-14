@@ -12,9 +12,9 @@
 //!     var a = 1;       // TS2403: must be of type 'any', but here has 'number'
 //!
 //! tsc compares the two with its IDENTITY relation, not with assignability:
-//! `any` and `number` are mutually assignable and still an error. ztsc has no
-//! identity relation, so `typesIdentical` approximates one — see there for
-//! exactly which way it errs.
+//! `any` and `number` are mutually assignable and still an error. That relation
+//! is `identity.zig`; `typesIdentical` is the screen in front of it, refusing
+//! the inputs ztsc reached by giving up rather than by reading the program.
 
 const std = @import("std");
 
@@ -37,12 +37,11 @@ const checker_zig = @import("../checker.zig");
 const Checker = checker_zig.Checker;
 const Error = checker_zig.Error;
 
-/// A CONSERVATIVE stand-in for tsc's `isTypeIdenticalTo`, deliberately biased
-/// toward answering "identical".
+const identity = @import("identity.zig");
+
+/// The screen in front of tsc's `isTypeIdenticalTo` (`identity.zig`),
+/// deliberately biased toward answering "identical".
 ///
-/// A real identity relation is a structural walk of its own, and ztsc has
-/// none: the assignability engine answers a different question and belongs to
-/// nobody here to extend. So this decides identity from what is available.
 /// EVERY step below can only *widen* the set of pairs called identical — a
 /// missed TS2403 is an under-report, an invented one is a false error on
 /// legal code, and the check is only worth having in the first place if it
@@ -59,18 +58,15 @@ const Error = checker_zig.Error;
 ///   3. `resolveStructural` on each side, which puts a named type
 ///      (`interface Point`, a `.ref`) and the structure it stands for on the
 ///      same footing.
-///   4. MUTUAL assignability. This is the loose step and the load-bearing
-///      one: `interface Point` versus a widened `{ x: number, y: number }`
-///      object literal, and `{ (s: string): number }` versus `(s: string) =>
-///      number`, are identical to tsc but differ in ztsc's object flags and
-///      in kind respectively. Everything tsc separates and mutual
-///      assignability does not — two spread unions, two signatures differing
-///      only under `any` — is simply not reported.
+///   4. `identity.identical` — the structural relation itself, which puts a
+///      named reference and its structure, and an object type with one call
+///      signature and a function type, on the same footing while keeping
+///      everything tsc separates apart (`any` from `number`, `<T, U>(x: T,
+///      y: U) => T` from `<T, U>(x: any, y: any) => any`).
 ///
-/// `any`/`unknown` is the one place mutual assignability errs in the
-/// REPORTING direction rather than the silent one — it relates to everything
-/// both ways, while tsc's identity relation matches it only with itself — so
-/// the caller settles that case before asking (see `checkSubsequentVarDecl`).
+/// `any`/`unknown` still needs the caller's help: ztsc uses `any` as its "could
+/// not work this out" answer as well as for a written `any`, so the caller
+/// settles that case before asking (see `checkSubsequentVarDecl`).
 pub fn typesIdentical(c: *Checker, a: TypeId, b: TypeId) Error!bool {
     if (a == b) return true;
     if (identityUndecidable(c, a) or identityUndecidable(c, b)) return true;
@@ -97,7 +93,12 @@ pub fn typesIdentical(c: *Checker, a: TypeId, b: TypeId) Error!bool {
     // that against the `{ x: number; y: number }` it should have been is a
     // report about ztsc, not about the two declarations.
     if (isEmptyObject(c, ea) or isEmptyObject(c, eb)) return true;
-    return (try c.isAssignable(ea, eb)) and (try c.isAssignable(eb, ea));
+    // The relation is handed the UNRESOLVED pair: it resolves references
+    // itself, and it has a rule that only applies to two materializations of
+    // the same generic reference (an `any` type argument is ztsc's inference
+    // giving up, not a difference the program wrote). `ea`/`eb` above exist
+    // only for the screens that read a materialized shape.
+    return identity.identical(c, a, b);
 }
 
 fn isEmptyObject(c: *Checker, t: TypeId) bool {

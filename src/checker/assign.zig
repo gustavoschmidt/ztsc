@@ -37,6 +37,7 @@ const propOfType = @import("props.zig").propOfType;
 const lazy_zig = @import("instantiate.zig");
 const resolveStructural = @import("instantiate.zig").resolveStructural;
 const restUnionOptionalAt = @import("typenode.zig").restUnionOptionalAt;
+const tuple_zig = @import("tuple_relate.zig");
 const variance_zig = @import("variance.zig");
 const report_zig = @import("assign_report.zig");
 
@@ -2243,6 +2244,16 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
         if (rs == rt) return true;
         return relateFolded(c, rs, rt, false);
     }
+    // The single-element variadic-tuple bridge: for a generic `T`, `[...T]`
+    // and `T` are two spellings of the same list, and tsc relates them
+    // directly rather than structurally (`structuredTypeRelatedTo`'s
+    // `isSingleElementGenericTupleType` pair). Placed here for the same reason
+    // tsc places it before its type-parameter arms: both directions have a
+    // type PARAMETER on one side, which the arms below answer only through its
+    // constraint — and a constraint of `unknown[]` neither satisfies nor is
+    // satisfied by the tuple form. Falls through when the bridge's own inner
+    // question says no, exactly as tsc's `||` chain does.
+    if ((sk == .tuple or tk == .tuple) and try tuple_zig.singleElementBridge(c, s, t)) return true;
     // Enum types are nominal (identical enums caught by s == t earlier).
     //
     // A generic SOURCE is not one of them. `<T extends E>` is a `.type_param`,
@@ -2285,7 +2296,19 @@ pub fn isAssignableInner(c: *Checker, s: TypeId, t: TypeId, sk: types.Kind, tk: 
         },
         .tuple => {
             if (sk != .tuple) return false;
-            return c.tupleAssignable(s, t);
+            if (try c.tupleAssignable(s, t)) return true;
+            // tsc's `isGenericTupleType(source) && isTupleType(target) &&
+            // !isGenericTupleType(target)` arm: a variadic source element is a
+            // hole no concrete target element can match, so the pair is retried
+            // with each variadic element replaced by its constraint. That is
+            // what makes `[...T, ...T]` with `T extends [unknown]` a
+            // `[unknown, unknown]`.
+            if (!tuple_zig.isGenericTuple(c, t) and tuple_zig.isGenericTuple(c, s)) {
+                if (try tuple_zig.constrainedGenericTuple(c, s)) |cs| {
+                    if (cs != s) return c.isAssignable(cs, t);
+                }
+            }
+            return false;
         },
         .function => {
             if (sk == .function) return c.signatureAssignable(s, t);
@@ -2908,40 +2931,6 @@ pub fn isCallableForFunctionIface(c: *Checker, s: TypeId, sk: types.Kind) Error!
         },
         else => return false,
     }
-}
-
-pub fn tupleAssignable(c: *Checker, s: TypeId, t: TypeId) Error!bool {
-    const s_len = c.ts.tupleLen(s);
-    const t_len = c.ts.tupleLen(t);
-    var t_required: u32 = 0;
-    var t_has_rest = false;
-    for (0..t_len) |i| {
-        const e = c.ts.tupleElem(t, @intCast(i));
-        if (e.rest()) t_has_rest = true else if (!e.optional()) t_required += 1;
-    }
-    var s_min: u32 = 0;
-    var s_has_rest = false;
-    for (0..s_len) |i| {
-        const e = c.ts.tupleElem(s, @intCast(i));
-        if (e.rest()) s_has_rest = true else if (!e.optional()) s_min += 1;
-    }
-    if (s_min < t_required) return false;
-    if (!t_has_rest and (s_len > t_len or s_has_rest)) return false;
-    for (0..s_len) |i| {
-        const se = c.ts.tupleElem(s, @intCast(i));
-        const st = if (se.rest()) try c.elemOfArrayish(se.ty) else se.ty;
-        var tt = try c.tupleElemTypeAt(t, @intCast(i)) orelse return false;
-        // An OPTIONAL target element admits `undefined` — tsc bakes it into
-        // the element's own type (`[a?: T]`'s type argument is
-        // `T | undefined`), where ztsc keeps the bare `T` beside the flag.
-        // Reading only the bare type rejected `[string, O | undefined]`
-        // against `[string, O?]`, which tsc accepts.
-        if (i < t_len and c.ts.tupleElem(t, @intCast(i)).optional()) {
-            tt = try c.makeUnion2(tt, types.undefined_type);
-        }
-        if (!try c.isAssignable(st, tt)) return false;
-    }
-    return true;
 }
 
 /// Is the parameter at position `i` optional? A trailing rest typed by a
@@ -4707,3 +4696,8 @@ pub const intersectionExcessCheckable = report_zig.intersectionExcessCheckable;
 pub const targetIsEmptyish = report_zig.targetIsEmptyish;
 pub const targetKnowsProp = report_zig.targetKnowsProp;
 pub const targetPropType = report_zig.targetPropType;
+
+// The tuple side of the relation, including variadic tuples, lives in
+// `tuple_relate.zig`.
+
+pub const tupleAssignable = tuple_zig.tupleAssignable;

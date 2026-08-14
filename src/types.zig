@@ -1298,6 +1298,38 @@ pub const Store = struct {
     }
 
     pub fn makeTuple(s: *Store, elems: []const TupleElem) Error!TypeId {
+        // tsc's `createNormalizedTupleType` union distribution, which runs
+        // before any of the expansion below: a VARIADIC element whose type is a
+        // UNION spreads the tuple over it, so `[A, ...(X | Y)]` IS
+        // `[A, ...X] | [A, ...Y]`.
+        //
+        // `restTupleAtPosition` depends on it. A rest parameter typed by a union
+        // of tuples (i18next's `TFunction`: `(...args: [key: K, options?: O] |
+        // [key: K, defaultValue: D, options?: O])`) is packed as `[...(A | B)]`,
+        // and the whole point of packing it is that ONE ARM has to accept the
+        // list as a whole — which needs the tuple to be `A | B` again. Left
+        // undistributed it is a single variadic element, and a caller's plain
+        // argument tuple has nothing variadic to offer it.
+        //
+        // Bounded: one element distributes per call (the recursion takes the
+        // next), and a union wider than 32 constituents is left alone rather
+        // than multiplied out — tsc caps the same product with
+        // `checkCrossProductUnion`.
+        for (elems, 0..) |e, ui| {
+            if ((e.flags & elem_flag_rest) == 0 or s.kind(e.ty) != .union_type) continue;
+            const n = s.memberCount(e.ty);
+            if (n == 0 or n > 32) continue;
+            var arms: std.ArrayList(TypeId) = .empty;
+            defer arms.deinit(s.alloc);
+            var buf = try s.alloc.alloc(TupleElem, elems.len);
+            defer s.alloc.free(buf);
+            @memcpy(buf, elems);
+            for (0..n) |k| {
+                buf[ui] = .{ .ty = s.memberAt(e.ty, k), .flags = e.flags };
+                try arms.append(s.alloc, try s.makeTuple(buf));
+            }
+            return s.makeUnion(s.alloc, arms.items);
+        }
         // tsc's `createNormalizedTupleType`: a REST element whose type is
         // itself a TUPLE contributes that tuple's elements positionally, so
         // `[...[A, B], C]` IS `[A, B, C]` — and, the case that reaches this
@@ -1335,6 +1367,58 @@ pub const Store = struct {
                     }
                 } else try out.append(s.alloc, el);
             }
+            return s.makeTuple(out.items);
+        }
+        // tsc's `createNormalizedTupleType` tail: a REST element that is not
+        // the LAST variable element — some optional or rest element follows it
+        // — carries no positional information any more, so the whole run from
+        // the first rest through the last optional-or-rest collapses into ONE
+        // rest element over the union of what that run covered.
+        // `[...number[], string?]` IS `(string | number | undefined)[]`.
+        //
+        // The case that reaches this constantly is a curried higher-order
+        // signature: `curry<T extends unknown[], U extends unknown[], R>(f:
+        // (...args: [...T, ...U]) => R, ...a: T)`. Inferring `T := unknown[]`
+        // and `U := unknown[]` left the parameter type
+        // `(...args: [...unknown[], ...unknown[]]) => R`, a two-rest tuple no
+        // real function's parameter list is assignable to, so every `curry`
+        // call site was TS2345.
+        //
+        // A VARIADIC element (a rest whose type is still an unresolved type
+        // parameter) inside the run has no element type to contribute here —
+        // tsc reaches for `T[number]` — so such a tuple is left alone rather
+        // than approximated.
+        var first_rest: ?usize = null;
+        var last_variable: ?usize = null;
+        for (elems, 0..) |e, i| {
+            const is_rest = (e.flags & elem_flag_rest) != 0;
+            if (is_rest and first_rest == null and s.kind(e.ty) == .array) first_rest = i;
+            if (is_rest or (e.flags & elem_flag_optional) != 0) last_variable = i;
+        }
+        if (first_rest != null and last_variable != null and first_rest.? < last_variable.?) reduce: {
+            const fr = first_rest.?;
+            const lv = last_variable.?;
+            var parts: std.ArrayList(TypeId) = .empty;
+            defer parts.deinit(s.alloc);
+            var ro: u32 = 0;
+            for (elems[fr .. lv + 1]) |e| {
+                ro |= e.flags & elem_flag_readonly;
+                if ((e.flags & elem_flag_rest) != 0) {
+                    if (s.kind(e.ty) != .array) break :reduce;
+                    try parts.append(s.alloc, s.arrayElem(e.ty));
+                } else {
+                    try parts.append(s.alloc, e.ty);
+                    if ((e.flags & elem_flag_optional) != 0) try parts.append(s.alloc, undefined_type);
+                }
+            }
+            var out: std.ArrayList(TupleElem) = .empty;
+            defer out.deinit(s.alloc);
+            try out.appendSlice(s.alloc, elems[0..fr]);
+            try out.append(s.alloc, .{
+                .ty = try s.makeArray(try s.makeUnion(s.alloc, parts.items)),
+                .flags = elem_flag_rest | ro,
+            });
+            try out.appendSlice(s.alloc, elems[lv + 1 ..]);
             return s.makeTuple(out.items);
         }
         // tsc's `getTupleTargetType`: "[...X[]] is equivalent to just X[]".

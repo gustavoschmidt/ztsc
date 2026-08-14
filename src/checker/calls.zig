@@ -25,6 +25,7 @@ const Error = checker_zig.Error;
 const ModuleRef = @import("typenode.zig").ModuleRef;
 const TpMap = @import("enums.zig").TpMap;
 const TypeParamInfo = @import("typenode.zig").TypeParamInfo;
+const tuple_relate = @import("tuple_relate.zig");
 const ambientNamespaceType = @import("signatures.zig").ambientNamespaceType;
 const ChainLink = @import("expr.zig").ChainLink;
 const checkExprCached = @import("expr.zig").checkExprCached;
@@ -1518,11 +1519,8 @@ fn checkCallArgumentsAnchored(c: *Checker, node: Node, sig: TypeId, arg_nodes: [
     //
     // Skipped when the call has a spread argument: the packed tuple would be
     // a guess, and guessing here can only invent a rejection.
-    const rest_union: ?TypeId = if (has_spread) null else try c.sigNonArrayRest(sig);
-    const whole_from: u32 = if (rest_union == null)
-        std.math.maxInt(u32)
-    else
-        c.ts.fnParamCount(sig) - 1;
+    const whole_rest = if (has_spread) null else try c.sigNonArrayRest(sig);
+    const whole_from: u32 = if (whole_rest) |w| w.from else std.math.maxInt(u32);
     var packed_elems: std.ArrayList(types.TupleElem) = .empty;
     defer packed_elems.deinit(c.scratch());
     var packed_first: Node = null_node;
@@ -1535,10 +1533,23 @@ fn checkCallArgumentsAnchored(c: *Checker, node: Node, sig: TypeId, arg_nodes: [
             _ = try c.checkExprCached(an, types.no_type);
             continue;
         }
-        const pt = try c.paramTypeAt(sig, ai) orelse {
+        var pt = try c.paramTypeAt(sig, ai) orelse {
             _ = try c.checkExprCached(an, types.no_type);
             continue;
         };
+        // Inside the whole-list window, `paramTypeAt` has no answer: the target
+        // position an argument lands on is decided by counting back from the
+        // END of the list (tsc's `getContextualTypeForElementExpression`, which
+        // `getSpreadArgumentType` uses for exactly this). Reading position `ai`
+        // from the start gave every callback the union of the tuple's element
+        // types, so `f1(x => str(x))` against
+        // `(...args: [...((a: number) => void)[], (a: string) => void])` typed
+        // `x` as `number | string` and reported inside the callback's own body.
+        if (whole_rest) |w| {
+            if (ai >= w.from and c.ts.kind(w.ty) == .tuple) {
+                if (try tuple_relate.contextualElemType(c, w.ty, ai - w.from, @intCast(nargs -| w.from))) |ct| pt = ct;
+            }
+        }
         const at = try c.checkExprCached(an, pt);
         if (ai >= whole_from) {
             if (packed_first == null_node) packed_first = an;
@@ -1584,8 +1595,8 @@ fn checkCallArgumentsAnchored(c: *Checker, node: Node, sig: TypeId, arg_nodes: [
             if (reported_arg) noteArgBlame(c, anchor_out, before, c.nodeSpan(an), argErrorSpan(c, an));
         }
     }
-    if (report and !reported_arg and rest_union != null) {
-        const rest_ty = rest_union.?;
+    if (report and !reported_arg and whole_rest != null) {
+        const rest_ty = whole_rest.?.ty;
         const packed_ty = try c.ts.makeTuple(packed_elems.items);
         if (!try c.isAssignable(packed_ty, rest_ty)) {
             // tsc's error node: the single rest argument, or the range from

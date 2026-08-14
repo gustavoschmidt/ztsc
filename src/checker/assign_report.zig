@@ -44,6 +44,7 @@ const Error = checker_zig.Error;
 
 const assign = @import("assign.zig");
 const elaborate = @import("elaborate.zig");
+const tuple_zig = @import("tuple_relate.zig");
 
 /// Check `source` (the type of `expr_node`, which may be 0) against
 /// `target`, reporting at `span`. Returns true when assignable.
@@ -297,6 +298,22 @@ pub fn elaborateLiteralError(c: *Checker, expr_node0: Node, src_t: TypeId, targe
                 if (el == null_node) continue;
                 defer i += 1;
                 if (c.nodeTag(el) == .omitted or c.nodeTag(el) == .spread_element) continue;
+                // tsc's `generateLimitedTupleElements`: "skip elements which do
+                // not exist in the target — a length error on the tuple overall
+                // is likely better than an error on a mismatched index
+                // signature". A tuple only has the numeric properties of its
+                // FIXED leading elements, so a target with a rest or variadic
+                // element elaborates up to that point and no further.
+                //
+                // Which target position an element lands on is not `i` at all
+                // once a variable element precedes it: `['abc', 'def', 5, 6]`
+                // against `[...string[], number]` has `6` at the `number` and
+                // everything before it at `string`, and against
+                // `[...string[], number, number]` the split moves again. tsc
+                // reports the whole literal for exactly that reason, where
+                // reading position `i` from the start blamed `'def'` for not
+                // being a `number`.
+                if (c.ts.kind(rt) == .tuple and i >= tuple_zig.fixedLength(c, rt)) continue;
                 // A re-check of this same literal must still answer
                 // "elaborated" (see `diagAlreadyFiled`).
                 if (c.diagAlreadyFiled(2322, c.nodeSpan(el))) {
