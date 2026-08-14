@@ -254,6 +254,13 @@ pub const Code = enum(u16) {
     enum_member_numeric_name,
     /// TS18024: `enum E { #x }` — a private identifier as an enum member name.
     enum_member_private_name,
+    /// TS1539: `{ 1n: 123 }` — a BigInt literal as a property name. The grammar
+    /// accepts it (a BigInt literal is a NumericLiteral-shaped PropertyName), so
+    /// like TS2452 this is a check on a parsed member; tsc reports it in the
+    /// three positions that DECLARE a member — an object literal, a type member
+    /// and a class member — and NOT in a binding pattern, where `{ 0n: f }`
+    /// parses and earns the semantic TS2538 instead (measured against tsgo).
+    bigint_property_name,
     /// TS18016: `#x` as an OBJECT-LITERAL property name (`{ #x: 1 }`) or a TYPE
     /// member name (`interface I { #x: string }`) — the two property positions
     /// that are never inside a class body. tsc's `checkGrammarObjectLiteral…`
@@ -391,6 +398,9 @@ pub const Code = enum(u16) {
             .accessibility_modifier_already_seen,
             .enum_member_numeric_name,
             .enum_member_private_name,
+            // `{ 1n: 123 }` reports TS1539 next to the TS2464/TS2538 its
+            // siblings earn in the same file — tsc's checker.
+            .bigint_property_name,
             .private_name_outside_class,
             // `using {a} = null` reports TS1492 and the TS2339 its pattern
             // earns in the same run — tsc's checker, not its parser.
@@ -495,6 +505,7 @@ pub const Code = enum(u16) {
             .accessibility_modifier_already_seen => "Accessibility modifier already seen.",
             .enum_member_numeric_name => "An enum member cannot have a numeric name.",
             .enum_member_private_name => "An enum member cannot be named with a private identifier.",
+            .bigint_property_name => "A 'bigint' literal cannot be used as a property name.",
             .private_name_outside_class => "Private identifiers are not allowed outside class bodies.",
             .private_name_in_var_decl => "Private identifiers are not allowed in variable declarations.",
             .private_name_as_param => "Private identifiers cannot be used as parameters.",
@@ -636,6 +647,7 @@ pub const Code = enum(u16) {
             .accessibility_modifier_already_seen => 1028,
             .enum_member_numeric_name => 2452,
             .enum_member_private_name => 18024,
+            .bigint_property_name => 1539,
             .private_name_outside_class => 18016,
             .private_name_in_var_decl => 18029,
             .private_name_as_param => 18009,

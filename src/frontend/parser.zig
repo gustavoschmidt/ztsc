@@ -2377,7 +2377,13 @@ const Parser = struct {
                 const target = try p.parseBindingName(.private_name_outside_class);
                 try p.pushScratch(try p.addNode(.{ .tag = .rest_element, .main_token = dots, .data = .{ .lhs = target, .rhs = 0 } }));
                 if (p.curTag() == .comma) try p.errAtCur(.rest_must_be_last);
-            } else if (isNameLike(p.curTag()) or p.curTag() == .string_literal or p.curTag() == .numeric_literal) {
+            } else if (isNameLike(p.curTag()) or p.curTag() == .string_literal or
+                p.curTag() == .numeric_literal or p.curTag() == .bigint_literal)
+            {
+                // A BINDING property name may be a BigInt literal without
+                // TS1539: tsc answers only the semantic TS2538 for `{ 0n: f } =
+                // arr` (measured — the grammar check is on the three positions
+                // that DECLARE a member, not on this one).
                 const key = try p.bump();
                 var value: Node = null_node;
                 if (try p.eat(.colon) != null) value = try p.parseBindingName(.private_name_outside_class);
@@ -2624,6 +2630,11 @@ const Parser = struct {
                 }
             },
             .string_literal, .numeric_literal, .private_identifier => name_tok = try p.bump(),
+            // `class K { 4n = 0 }` — TS1539, exactly as in an object literal.
+            .bigint_literal => {
+                try p.errAtCur(.bigint_property_name);
+                name_tok = try p.bump();
+            },
             else => {
                 if (isNameLike(p.curTag())) {
                     name_tok = try p.bump();
@@ -3032,9 +3043,13 @@ const Parser = struct {
         p.saw_module_syntax = true;
         var flags: u32 = 0;
 
-        // `import "module";`
+        // `import "module";` — a side-effect-only import, which carries import
+        // ATTRIBUTES like every other form (`import "./a.json" with { type:
+        // "json" }`); skipping them only in the clause-ful arms cost a false
+        // TS1005 at the `with`, and the file's whole semantic pass with it.
         if (p.curTag() == .string_literal) {
             const mod = try p.bump();
+            try p.skipImportAttributes();
             try p.expectSemicolon();
             const extra = try p.addExtra(ast.ImportData{
                 .flags = 0,
@@ -4476,6 +4491,14 @@ const Parser = struct {
                 key_tok = p.curIdx();
                 key = try p.leaf(.number_literal);
             },
+            .bigint_literal => {
+                // `{ 1n: 123 }` — TS1539. The grammar accepts a BigInt literal
+                // as a PropertyName, so it parses and the member is real; a
+                // parse error here cost the file its whole semantic pass.
+                try p.errAtCur(.bigint_property_name);
+                key_tok = p.curIdx();
+                key = try p.leaf(.bigint_literal);
+            },
             .l_bracket => {
                 const lb = try p.bump();
                 const expr = try p.parseAssignExpr(.{});
@@ -5298,10 +5321,14 @@ const Parser = struct {
         // Property / method name.
         if (name_tok != 0) {
             // already set by the well-known-symbol path above
-        } else if (isNameLike(p.curTag()) or p.curTag() == .string_literal or p.curTag() == .numeric_literal) {
+        } else if (isNameLike(p.curTag()) or p.curTag() == .string_literal or
+            p.curTag() == .numeric_literal or p.curTag() == .bigint_literal)
+        {
             // `interface I { #x: string }` / `type A = { #m(): string }` — a
             // TYPE member list is never a class body either, so TS18016.
             if (p.curTag() == .private_identifier) try p.errAtCur(.private_name_outside_class);
+            // `interface G { 2n: string }` — TS1539, as in an object literal.
+            if (p.curTag() == .bigint_literal) try p.errAtCur(.bigint_property_name);
             name_tok = try p.bump();
         } else {
             try p.fail(.expected_type_member);
