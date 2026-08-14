@@ -127,6 +127,10 @@ pub fn checkStatement(c: *Checker, node: Node) Error!void {
                 const saved = c.cur_scope;
                 defer c.cur_scope = saved;
                 if (try c.scopeOf(e.catch_clause)) |s| c.cur_scope = s;
+                // An unannotated catch parameter destructures `unknown`
+                // (useUnknownInCatchVariables, which strict implies), so a
+                // pattern there names properties nothing has.
+                try c.checkDeclPattern(cd.lhs, types.unknown_type);
                 if (cd.rhs != 0) {
                     if (c.nodeTag(cd.rhs) == .block) {
                         for (c.tree.nodeRange(cd.rhs)) |stmt| try c.checkStatement(stmt);
@@ -290,6 +294,11 @@ fn checkDeclarator(c: *Checker, decl: Node, is_const: bool) Error!void {
         },
         else => {},
     }
+    // What the pattern demands of the type it destructures (TS2339/TS2488 per
+    // element, TS2353 for an initializer property the pattern does not name).
+    // After the arms above so the initializer is typed under its own
+    // contextual type first — `checkDeclPattern` reads the cache.
+    try c.checkDeclPattern(decl, types.no_type);
 }
 
 /// Force typeOfSymbol for every name bound by a pattern so inference

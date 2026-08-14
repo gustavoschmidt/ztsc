@@ -2749,7 +2749,7 @@ fn numericIndexHit(c: *Checker, r: TypeId, rk: types.Kind, v: f64) Error!?TypeId
 /// `numericIndexHit` for a key given as TEXT: the numeric-name test and the
 /// numeric resolution together, so the caller pays neither unless a
 /// string-literal key actually misses as a property name.
-fn numericNameIndexHit(c: *Checker, r: TypeId, rk: types.Kind, text: []const u8) Error!?TypeId {
+pub fn numericNameIndexHit(c: *Checker, r: TypeId, rk: types.Kind, text: []const u8) Error!?TypeId {
     const v = numericLiteralNameValue(text) orelse return null;
     return numericIndexHit(c, r, rk, v);
 }
