@@ -15,6 +15,7 @@
 const std = @import("std");
 const ast = @import("../frontend/ast.zig");
 const binder = @import("../frontend/binder.zig");
+const scanner = @import("../frontend/scanner.zig");
 
 const Node = ast.Node;
 const null_node = ast.null_node;
@@ -115,7 +116,7 @@ pub fn markReassignTarget(c: *Checker, target: Node, scope: ScopeId, at: Node) E
 /// keeps `undefined` and so cannot INITIALIZE anything. Here the question is
 /// only "does this symbol have a plain assignment somewhere", which is what
 /// tsc records with a negative `lastAssignmentPos`, and there `&&=` counts.
-fn definiteTargetKind(op: @import("../frontend/scanner.zig").Tag) bool {
+fn definiteTargetKind(op: scanner.Tag) bool {
     return switch (op) {
         .eq, .pipe_pipe_eq, .amp_amp_eq, .question_question_eq => true,
         else => false,
