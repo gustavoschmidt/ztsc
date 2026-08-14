@@ -140,12 +140,18 @@ fn propOfTypeIdx(c: *Checker, t: TypeId, name: Atom, allow_index: bool, from_ind
             var parts: std.ArrayList(TypeId) = .empty;
             defer parts.deinit(c.scratch());
             var flags: u32 = 0;
+            // A constituent's answer is kept so `unionPropertyDropped` can judge
+            // the set as a whole (see there).
+            var found: std.ArrayList(types.Prop) = .empty;
+            defer found.deinit(c.scratch());
             for (members) |m| {
                 const r = try c.resolveStructural(m);
                 const p = (try propOfTypeIdx(c, r, name, allow_index, from_index)) orelse return null;
+                try found.append(c.scratch(), p);
                 try parts.append(c.scratch(), p.ty);
                 flags |= p.flags;
             }
+            if (unionPropertyDropped(found.items)) return null;
             return .{ .name = name, .ty = try s.makeUnion(c.scratch(), parts.items), .flags = flags };
         },
         .intersection => {
@@ -276,7 +282,15 @@ fn propOfTypeIdx(c: *Checker, t: TypeId, name: Atom, allow_index: bool, from_ind
             }
             return primitiveInterfaceProp(c, t, name);
         },
-        .number, .number_literal, .number_literal_fresh, .boolean, .bool_true, .bool_false => {
+        .number,
+        .number_literal,
+        .number_literal_fresh,
+        .boolean,
+        .bool_true,
+        .bool_false,
+        .bigint,
+        .bigint_literal,
+        => {
             return primitiveInterfaceProp(c, t, name);
         },
         // tsc's `getApparentType(objectType)` is `globalObjectType`, so the
@@ -543,6 +557,36 @@ pub fn objectInterfaceProp(c: *Checker, name: Atom) Error!?types.Prop {
     return c.propOfType(try c.resolveStructural(ref), name);
 }
 
+/// Does a union have NO property of this name even though every constituent
+/// answered one? tsc's `createUnionOrIntersectionProperty` bails outright when
+/// the constituents contribute DIFFERENT declarations and any one of them is
+/// `private`/`protected` — "a property has a private or protected declaration in
+/// one constituent, but is missing or has a different declaration in another" —
+/// so `v: Public | Protected; v.member` is TS2339 rather than TS2445
+/// (`conformance/types/union/unionTypePropertyAccessibility`).
+///
+/// tsc decides "different declaration" by SYMBOL identity, which ztsc does not
+/// carry on a `Prop`. The stand-in is the pair (type, flags): identical on every
+/// side exactly when the constituents inherited ONE declaration (`Base |
+/// Derived`, the pattern that must keep working), different as soon as the
+/// accessibility or the type disagrees. Two DISTINCT classes declaring the same
+/// `protected x: string` therefore keep the property where tsc drops it — an
+/// under-report, and the safe direction.
+///
+/// Pure, and shared: the member-ACCESS path distributes over a union itself (to
+/// name the whole union in its diagnostic), so it asks this the same question
+/// with the same list rather than re-deriving the rule.
+pub fn unionPropertyDropped(found: []const types.Prop) bool {
+    if (found.len < 2) return false;
+    var non_public = false;
+    var all_same = true;
+    for (found) |p| {
+        if (p.nonPublic()) non_public = true;
+        if (p.ty != found[0].ty or p.flags != found[0].flags) all_same = false;
+    }
+    return non_public and !all_same;
+}
+
 /// Bridge a primitive/array/tuple to its lib interface and look
 /// the property up there: `arr.map` -> `Array<T>.map`, `"x".toUpperCase`
 /// -> `String.toUpperCase`, etc. Returns null when no lib is loaded or
@@ -576,6 +620,12 @@ fn primitiveInterfaceOf(c: *Checker, t: TypeId) Error!?TypeId {
         .string, .string_literal, .template_literal_type, .string_mapping => iface_atom = c.atom_String,
         .number, .number_literal, .number_literal_fresh => iface_atom = c.atom_Number,
         .boolean, .bool_true, .bool_false => iface_atom = c.atom_Boolean,
+        // tsc's `getApparentType` bridges `bigint` to `globalBigIntType`, so
+        // `(1n).toString(2)` and `v.toLocaleString(…)` resolve exactly as their
+        // `number` counterparts do (`bigintWithoutLib`). `symbol` has the same
+        // bridge to `Symbol` in tsc and is deliberately NOT added here yet: it
+        // would also change `keyof symbol` and every `unique symbol` receiver.
+        .bigint, .bigint_literal => iface_atom = c.atom_BigInt,
         else => return null,
     }
     const sym = c.prog.globals.lookup(iface_atom) orelse return null;

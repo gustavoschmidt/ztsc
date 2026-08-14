@@ -145,6 +145,15 @@ pub fn isNodeGlobalName(name: []const u8) bool {
     return false;
 }
 
+/// The globals a test runner's typings would have declared — tsc's
+/// `getCannotFindNameDiagnosticForName` `describe`/`suite`/`it`/`test` arm, which
+/// answers TS2582/TS2593 instead of the plain TS2304.
+pub fn isTestRunnerGlobalName(name: []const u8) bool {
+    const names = [_][]const u8{ "describe", "suite", "it", "test" };
+    for (names) |n| if (std.mem.eql(u8, name, n)) return true;
+    return false;
+}
+
 /// Embedded synthetic source for a resolved JSON or JS any-module (or an
 /// `exports`-blocked subpath), or null for a real file that must be read and
 /// parsed. Centralizes the loader's any-module routing (JSON via
