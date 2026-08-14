@@ -1371,6 +1371,9 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
         _ = try c.resolveStructural(this_t);
         _ = try c.classStaticType(class_sym);
         try evalTypeParamDecls(c, class_sym);
+        // A class merged with a same-named `interface` (or reopened in another
+        // file) is the same TS2428 check as the interface arm's.
+        try c.checkTypeParamListsIdentical(mergedOrSelf(c, class_sym), data.name_token);
     }
 
     // Class-position decorators (`@deco class C {}`): evaluated in the
@@ -1598,6 +1601,13 @@ pub const decoContextRef = decorators.decoContextRef;
 pub const decoSigMatches = decorators.decoSigMatches;
 pub const globalSymNamed = decorators.globalSymNamed;
 
+/// The merged-range id a real global symbol folds into, or the symbol itself.
+/// A cross-file merged class/interface must be asked about ALL its blocks, and
+/// only the merged id knows them (`toGlobal` hands back this file's constituent).
+fn mergedOrSelf(c: *Checker, sym: SymbolId) SymbolId {
+    return c.prog.mergedOf(sym) orelse sym;
+}
+
 fn checkInterfaceDecl(c: *Checker, node: Node) Error!void {
     // Eagerly expand so member-type diagnostics (2304 in bodies, 7006 in
     // method signatures) fire even for unused interfaces.
@@ -1611,6 +1621,7 @@ fn checkInterfaceDecl(c: *Checker, node: Node) Error!void {
         if (c.bind.symbol_flags[sym].interface) {
             _ = try c.interfaceGeneric(c.toGlobal(sym));
             try evalTypeParamDecls(c, c.toGlobal(sym));
+            try c.checkTypeParamListsIdentical(mergedOrSelf(c, c.toGlobal(sym)), data.name_token);
             try heritage.checkInterfaceExtends(c, c.toGlobal(sym), node, data.name_token);
         }
     }

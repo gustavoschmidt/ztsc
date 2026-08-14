@@ -1,5 +1,7 @@
-//! "Subsequent declarations must have the same type" — tsc's
-//! `errorNextVariableOrPropertyDeclarationMustHaveSameType`.
+//! "Subsequent declarations must agree" — the checks tsc runs over a name
+//! declared MORE THAN ONCE: `errorNextVariableOrPropertyDeclarationMustHaveSameType`
+//! (TS2403, below) and `checkTypeParameterListsIdentical` (TS2428, at the end
+//! of this file).
 //!
 //! One name can be declared more than once (`var` merges with `var`, with a
 //! parameter, and across files at global scope). The symbol's TYPE, though,
@@ -14,14 +16,18 @@
 //! identity relation, so `typesIdentical` approximates one — see there for
 //! exactly which way it errs.
 
+const std = @import("std");
+
 const ast = @import("../frontend/ast.zig");
 const binder = @import("../frontend/binder.zig");
+const modules = @import("../link/modules.zig");
 const types = @import("../types.zig");
 
 const Node = ast.Node;
 const null_node = ast.null_node;
 const SymbolId = binder.SymbolId;
 const TypeId = types.TypeId;
+const TypeParamInfo = @import("typeparams.zig").TypeParamInfo;
 
 const checker_zig = @import("../checker.zig");
 const Checker = checker_zig.Checker;
@@ -199,6 +205,63 @@ fn firstValueDecl(c: *Checker, sym: SymbolId) ?Node {
     return null;
 }
 
+/// The value declaration a subsequent declarator is measured against.
+///
+///   * `sym` is the symbol whose TYPE tsc calls the variable's type — the
+///     constituent that owns the value declaration, not the merged view (a
+///     merged view folds every constituent, while tsc reads the first value
+///     declaration alone).
+///   * `own` is the constituent declared in the CURRENT file, which is what the
+///     declarator being checked belongs to.
+///   * `file`/`decl` locate the value declaration for the "is this it?" test.
+const ValueDecl = struct { sym: SymbolId, own: SymbolId, file: modules.FileId, decl: Node };
+
+/// Locate the symbol's value declaration, following a cross-file GLOBAL merge.
+///
+/// A merged id folds constituents tsc sometimes keeps apart: the merged
+/// namespace-member index carries a namespace local that was never `export`ed,
+/// so `namespace A { var Origin: string }` in one file would be compared against
+/// another file's `export var Origin: Point`. What distinguishes tsc's `globals`
+/// merge — where the comparison IS right — is that every constituent sits at its
+/// file's top level, so that is the gate. It is the shape behind the common real
+/// case: a script or `.d.ts` writing `declare var console: { log(…): void }`
+/// beside the lib's `declare var console: Console`.
+///
+/// Declined outright when a constituent carries a value meaning that is not a
+/// variable (a function/class/enum/namespace of the same name), because then
+/// tsc's `valueDeclaration` is that other declaration and not a declarator at
+/// all.
+fn firstValueDeclOf(c: *Checker, sym: SymbolId) Error!?ValueDecl {
+    if (!c.prog.isMergedId(sym)) {
+        const decl = firstValueDecl(c, sym) orelse return null;
+        return .{ .sym = sym, .own = sym, .file = c.cur_file, .decl = decl };
+    }
+    var found: ?ValueDecl = null;
+    var own: SymbolId = 0;
+    for (c.prog.mergedSym(sym).parts) |p| {
+        if (c.symScope(p) != binder.file_scope) return null;
+        const pf = c.symFlags(p);
+        if (pf.function or pf.class or pf.enum_decl or pf.namespace_decl or
+            pf.import_binding or pf.param or pf.catch_param) return null;
+        if (c.symFile(p) == c.cur_file) own = p;
+        if (found != null) continue;
+        const file = c.symFile(p);
+        for (c.prog.files[file].bind.declsOf(p - c.prog.sym_base[file])) |dn| {
+            switch (c.prog.files[file].tree.nodeTag(dn)) {
+                .declarator, .declarator_init, .declarator_full => {
+                    found = .{ .sym = p, .own = p, .file = file, .decl = dn };
+                    break;
+                },
+                else => {},
+            }
+        }
+    }
+    if (own == 0) return null;
+    var v = found orelse return null;
+    v.own = own;
+    return v;
+}
+
 /// TS2403 for one variable declarator. Silent when this declarator IS the
 /// symbol's value declaration, when either type is an error (the divergence
 /// was already reported), or when the two are identical.
@@ -212,24 +275,27 @@ pub fn checkSubsequentVarDecl(c: *Checker, decl: Node, is_const: bool) Error!voi
     };
     const f = c.symFlags(sym);
     if (!(f.var_decl or f.let_decl or f.const_decl)) return;
-    // A cross-file MERGED symbol folds declarations tsc keeps apart: a
-    // namespace local that was never `export`ed still lands in the merged
-    // namespace member index here, so `namespace A { var Origin: string }`
-    // in one file was compared against another file's `export var Origin:
-    // Point`. This check cannot see which constituents are really one
-    // symbol, so it declines them — which also costs the genuine `var x = 3;`
-    // / `var x = true;` spread across two script files.
-    if (c.prog.isMergedId(sym)) return;
-    const first = firstValueDecl(c, sym) orelse return;
-    if (first == decl) return;
-    const sym_ty = try c.typeOfSymbol(sym);
-    const decl_ty = try c.declaratorType(sym, decl, is_const);
+    const value_decl = (try firstValueDeclOf(c, sym)) orelse return;
+    // Node ids are per-file, so "this declarator IS the value declaration" is
+    // only a question within one file.
+    if (value_decl.file == c.cur_file and value_decl.decl == decl) return;
+    const own = value_decl.own;
+    const sym_ty = try c.typeOfSymbol(value_decl.sym);
+    const decl_ty = try c.declaratorType(own, decl, is_const);
     if (sym_ty == types.error_type or decl_ty == types.error_type) return;
     // `any` on exactly one side is tsc's canonical TS2403 (`var a: any; var
     // a = 1;`) and the one verdict mutual assignability cannot reach — but
     // only when the program really asked for it; see `topTypeIsDeclared`.
     if (isAnyLike(c, sym_ty) != isAnyLike(c, decl_ty)) {
-        const any_decl = if (isAnyLike(c, decl_ty)) decl else first;
+        // Reading the OTHER file's declaration node needs that file's tree, and
+        // `topTypeIsDeclared` reads `c.tree`; a cross-file value declaration is
+        // therefore only consulted when it is the one being checked.
+        const any_decl = if (isAnyLike(c, decl_ty))
+            decl
+        else if (value_decl.file == c.cur_file)
+            value_decl.decl
+        else
+            return;
         if (!topTypeIsDeclared(c, any_decl)) return;
     } else if (try typesIdentical(c, sym_ty, decl_ty)) return;
     try c.diagFmt(
@@ -238,4 +304,233 @@ pub fn checkSubsequentVarDecl(c: *Checker, decl: Node, is_const: bool) Error!voi
         "Subsequent variable declarations must have the same type.  Variable '{s}' must be of type '{s}', but here has type '{s}'.",
         .{ c.tokenText(tok), try c.typeToString(sym_ty), try c.typeToString(decl_ty) },
     );
+}
+
+// ===========================================================================
+// TS2428 — "All declarations of 'X' must have identical type parameters"
+// ===========================================================================
+
+/// One class/interface declaration block of a merged symbol: the block node and
+/// the constituent symbol whose FILE it lives in (the file its nodes, scopes and
+/// source bytes must be read against).
+const Block = struct { sym: SymbolId, node: Node };
+
+/// tsc's `checkTypeParameterListsIdentical`/`areTypeParametersIdentical`: a
+/// class/interface declared more than once must spell the SAME type-parameter
+/// list in every block, and when it does not, EVERY declaration is reported —
+/// not just the odd one out.
+///
+/// The verdict is a property of the whole declaration set, so it is recomputed
+/// per block and reported only at the block being checked. Each block's own file
+/// walk therefore files its own key and the set of keys is the one tsc prints,
+/// with no cross-file diagnostic plumbing. Declaration sets are tiny (the lib's
+/// most-reopened generic interface has about a dozen blocks) and a name declared
+/// once returns before reading anything.
+///
+/// What "identical" means, position by position, and why each half is what it
+/// is:
+///
+///   * ARITY. tsc compares against the merged list's MINIMUM and MAXIMUM
+///     argument counts, so a block may omit trailing parameters that have
+///     defaults — and may omit the list entirely when every parameter has one
+///     (`@types/node` reopens `interface Buffer` bare beside
+///     `interface Buffer<TArrayBuffer extends ArrayBufferLike = …>`). Anything
+///     outside that window is a mismatch.
+///   * NAMES. Positional, by name atom: `interface A<T>` beside
+///     `interface A<U>` is an error even though the two lists are otherwise
+///     interchangeable. Purely syntactic, so this half can never invent an
+///     error.
+///   * CONSTRAINTS and DEFAULTS. tsc reads them off the type parameter's whole
+///     declaration set, so a block that OMITS one adopts what another block
+///     declares — `interface C<T>` beside `interface C<T extends number>` is
+///     legal in either order. Only two blocks that both declare position `i`
+///     and disagree are an error, and "disagree" is decided by
+///     `annotationsAgree`, which is deliberately timid.
+pub fn checkTypeParamListsIdentical(c: *Checker, sym: SymbolId, name_tok: ast.TokenIndex) Error!void {
+    var blocks: std.ArrayList(Block) = .empty;
+    defer blocks.deinit(c.scratch());
+    try declarationBlocks(c, sym, &blocks);
+    if (blocks.items.len < 2) return;
+    if (namespaceLocalAcrossBlocks(c, sym)) return;
+
+    // The merged list is the window tsc measures arity against, and it is
+    // already built for every generic declaration this run touches.
+    var target: std.ArrayList(TypeParamInfo) = .empty;
+    defer target.deinit(c.scratch());
+    try c.typeParamsOf(sym, &target);
+
+    if (try listsIdentical(c, target.items, blocks.items)) return;
+    try c.diagFmt(
+        2428,
+        c.tokSpan(name_tok),
+        "All declarations of '{s}' must have identical type parameters.",
+        .{c.tokenText(name_tok)},
+    );
+}
+
+/// Are these declarations two symbols to tsc that ztsc has folded into one?
+///
+/// A namespace reopened in the same file contributes to ONE merged body scope
+/// here, so a NON-EXPORTED member declared in two different blocks becomes a
+/// single symbol with two declarations. tsc keeps those apart — a non-exported
+/// member lives in that block's `locals`, and only an `export`ed one reaches the
+/// merged `exports` table — so comparing them would report on legal code:
+///
+///     namespace M { interface B<T, U> { x: U } }
+///     namespace M { interface B<T, V> { y: V } }   // ok to tsc: two symbols
+///
+/// Two blocks of the SAME namespace declaration are one table in tsc too, so the
+/// gate is "more than one block", not "inside a namespace": that keeps
+/// `namespace M { interface A<T> {} interface A<U> {} }` reported.
+fn namespaceLocalAcrossBlocks(c: *Checker, sym: SymbolId) bool {
+    const s = c.reprSym(sym);
+    if (c.symFlags(s).exported) return false;
+    const scope = c.symScope(s);
+    const file = c.symFile(s);
+    const b = c.prog.files[file].bind;
+    if (scope == binder.file_scope or b.scope_kinds[scope] != .namespace) return false;
+    // The namespace whose body scope this is, and how many blocks it has.
+    for (b.ns_scope_ids, 0..) |sid, i| {
+        if (sid != scope) continue;
+        var blocks: usize = 0;
+        for (b.declsOf(b.ns_scope_syms[i])) |dn| {
+            if (c.prog.files[file].tree.nodeTag(dn) == .namespace_decl) blocks += 1;
+        }
+        return blocks > 1;
+    }
+    return false;
+}
+
+/// Every class/interface declaration block of `sym`, across constituents of a
+/// cross-file merge, in merge order.
+fn declarationBlocks(c: *Checker, sym: SymbolId, out: *std.ArrayList(Block)) Error!void {
+    var one = [_]SymbolId{sym};
+    const parts: []const SymbolId = if (c.prog.isMergedId(sym)) c.prog.mergedSym(sym).parts else one[0..];
+    for (parts) |csym| {
+        const saved = c.enterSymFile(csym);
+        defer c.restoreCtx(saved);
+        for (c.declsOf(csym)) |d| {
+            switch (c.nodeTag(d)) {
+                .class_decl, .interface_decl => try out.append(c.scratch(), .{ .sym = csym, .node = d }),
+                else => {},
+            }
+        }
+    }
+}
+
+/// Does every block's list fall inside the merged list's arity window and agree
+/// with every other block on names, constraints and defaults?
+fn listsIdentical(c: *Checker, target: []const TypeParamInfo, blocks: []const Block) Error!bool {
+    const max_n = target.len;
+    // tsc's `getMinTypeArgumentCount`: the count up to and including the last
+    // parameter that has no default.
+    var min_n: usize = 0;
+    for (target, 0..) |tp, i| {
+        if (tp.default == null_node) min_n = i + 1;
+    }
+
+    // The first constraint/default seen at each position, with the type
+    // parameter symbol whose file and scope it must be read against.
+    const cons = try c.scratch().alloc(Node, max_n);
+    const cons_sym = try c.scratch().alloc(SymbolId, max_n);
+    const defs = try c.scratch().alloc(Node, max_n);
+    const defs_sym = try c.scratch().alloc(SymbolId, max_n);
+    @memset(cons, null_node);
+    @memset(defs, null_node);
+
+    var list: std.ArrayList(TypeParamInfo) = .empty;
+    defer list.deinit(c.scratch());
+    for (blocks) |b| {
+        list.clearRetainingCapacity();
+        {
+            const saved = c.enterSymFile(b.sym);
+            defer c.restoreCtx(saved);
+            try c.declTypeParams(b.node, &list);
+        }
+        if (list.items.len < min_n or list.items.len > max_n) return false;
+        for (list.items, 0..) |tp, i| {
+            if (c.symNameAtom(tp.sym) != c.symNameAtom(target[i].sym)) return false;
+            if (tp.constraint != null_node) {
+                if (cons[i] == null_node) {
+                    cons[i] = tp.constraint;
+                    cons_sym[i] = tp.sym;
+                } else if (!try annotationsAgree(c, cons[i], cons_sym[i], tp.constraint, tp.sym)) {
+                    return false;
+                }
+            }
+            if (tp.default != null_node) {
+                if (defs[i] == null_node) {
+                    defs[i] = tp.default;
+                    defs_sym[i] = tp.sym;
+                } else if (!try annotationsAgree(c, defs[i], defs_sym[i], tp.default, tp.sym)) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+/// Do two type-parameter annotations (two constraints, or two defaults) from
+/// different blocks say the same thing? Two screens, in this order, and both of
+/// them err toward "yes":
+///
+///   1. The SOURCE TEXT of the two nodes. Equal text is equal meaning, and it
+///      is the only screen that can see through a type parameter: each block
+///      binds its OWN parameter symbols, so `interface I<T extends Foo<T>>`
+///      written twice mentions two DIFFERENT `T`s, whose types are unrelated to
+///      the relation engine even though the source is identical.
+///   2. `typesIdentical`, for text that differs. `T extends Date` beside
+///      `T extends Number` is a real mismatch; `T extends string` beside
+///      `T extends S` where `type S = string` is not, and only the types can
+///      tell those apart.
+///
+/// A textually-different annotation that mentions a type parameter is therefore
+/// judged by (2), which will usually call it identical — an under-report, and
+/// the safe direction.
+fn annotationsAgree(c: *Checker, a: Node, a_sym: SymbolId, b: Node, b_sym: SymbolId) Error!bool {
+    if (nodeTextEql(c, a, a_sym, b, b_sym)) return true;
+    const ta = try annotationType(c, a, a_sym);
+    const tb = try annotationType(c, b, b_sym);
+    if (ta == types.error_type or tb == types.error_type) return true;
+    return typesIdentical(c, ta, tb);
+}
+
+/// The type of an annotation node, read in the file and scope of the type
+/// parameter that declared it. A failure to type it at all reads as "agrees":
+/// this check must never turn ztsc's own gap into an error on legal code.
+fn annotationType(c: *Checker, node: Node, tp_sym: SymbolId) Error!TypeId {
+    const saved = c.enterSymFile(tp_sym);
+    defer c.restoreCtx(saved);
+    c.cur_scope = c.symScope(tp_sym);
+    return c.typeFromTypeNode(node) catch types.error_type;
+}
+
+/// The two nodes' source text, compared with ASCII whitespace normalized away.
+/// Each node is read against the tree and source of the file its own type
+/// parameter lives in, so a cross-file merge compares the right bytes.
+fn nodeTextEql(c: *Checker, a: Node, a_sym: SymbolId, b: Node, b_sym: SymbolId) bool {
+    const pa = &c.prog.files[c.symFile(a_sym)];
+    const pb = &c.prog.files[c.symFile(b_sym)];
+    const sa = pa.tree.span(pa.src, a);
+    const sb = pb.tree.span(pb.src, b);
+    return whitespaceInsensitiveEql(pa.src[sa.start..sa.end], pb.src[sb.start..sb.end]);
+}
+
+/// Byte equality ignoring ASCII whitespace — enough to make "the same
+/// annotation, formatted differently" compare equal without running a second
+/// tokenizer. Two spellings differing only inside a string literal's whitespace
+/// are the theoretical false "equal", and calling those identical is the safe
+/// direction anyway.
+fn whitespaceInsensitiveEql(a: []const u8, b: []const u8) bool {
+    var i: usize = 0;
+    var j: usize = 0;
+    while (true) {
+        while (i < a.len and std.ascii.isWhitespace(a[i])) i += 1;
+        while (j < b.len and std.ascii.isWhitespace(b[j])) j += 1;
+        if (i == a.len or j == b.len) return i == a.len and j == b.len;
+        if (a[i] != b[j]) return false;
+        i += 1;
+        j += 1;
+    }
 }
