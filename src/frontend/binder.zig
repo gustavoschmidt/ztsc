@@ -1028,17 +1028,23 @@ const Binder = struct {
     /// than that predicate (no range/sign test): an index the checker rejects
     /// simply leaves an unused flow entry.
     /// The syntactic half of tsc's `isNarrowableReference` element-access arm:
-    /// an index that *could* denote a stable reference — a numeric literal
-    /// (`arr[0]`) or a bare identifier (`map[key]`). The semantic half — is the
-    /// identifier a `const` or a never-assigned local? — needs symbol
-    /// resolution, which is not available here; the checker applies it in
-    /// `stableIndexSymbol` and simply does not build a key when it fails, so an
-    /// index that turns out to be unstable costs one unused flow entry.
+    /// an index that *could* denote a stable reference — a literal
+    /// (`arr[0]`, `s["kind"]`, `` s[`kind`] ``) or a bare identifier
+    /// (`map[key]`). The semantic half — is the identifier a `const` or a
+    /// never-assigned local? — needs symbol resolution, which is not available
+    /// here; the checker applies it in `stableIndexSymbol` and simply does not
+    /// build a key when it fails, so an index that turns out to be unstable
+    /// costs one unused flow entry.
+    ///
+    /// A STRING-literal index has to be here for the same reason a numeric one
+    /// does: it names a property (`Checker.pathElemOfAccess` folds it to the
+    /// same member link `s.kind` gets), so without a flow node attached the
+    /// checker has nothing to query and `s["kind"]` never narrowed at all.
     fn isNarrowableIndex(b: *const Binder, node: Node) bool {
         var n = node;
         while (b.nodeTag(n) == .paren_expr) n = b.tree.nodeData(n).lhs;
         return switch (b.nodeTag(n)) {
-            .number_literal, .identifier => true,
+            .number_literal, .identifier, .string_literal, .template_literal => true,
             else => false,
         };
     }

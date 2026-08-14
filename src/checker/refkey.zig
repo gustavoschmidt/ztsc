@@ -338,6 +338,59 @@ pub fn stableIndexSymbol(c: *Checker, rhs: Node) Error!?SymbolId {
     return sym;
 }
 
+/// A STRING-literal element-access key read as a member name: `o["a-b"]`
+/// names the property `a-b`, exactly as `o.a` names `a`. This is tsc's
+/// `getAccessedPropertyName`, whose element-access arm accepts a
+/// string-literal argument and answers the same `__String` a dotted access
+/// does. Null for any other index expression.
+fn stringKeyAtom(c: *Checker, rhs: Node) Error!?Atom {
+    var n = rhs;
+    while (c.nodeTag(n) == .paren_expr) n = c.tree.nodeData(n).lhs;
+    switch (c.nodeTag(n)) {
+        .string_literal => return try c.memberAtom(c.tree.nodeMainToken(n)),
+        // A NO-SUBSTITUTION template names a property too (tsc's
+        // `getAccessedPropertyName` accepts `isStringOrNumericLiteralLike`,
+        // which covers `NoSubstitutionTemplateLiteral`): `val[`kind`]` is the
+        // `kind` discriminant.
+        .template_literal => {
+            const text = c.tokenText(c.tree.nodeMainToken(n));
+            if (text.len < 2 or text[0] != '`' or text[text.len - 1] != '`') return null;
+            return try c.atom(text[1 .. text.len - 1]);
+        },
+        else => return null,
+    }
+}
+
+/// The path link an access node contributes, or null when it is not a stable
+/// one (a computed index, an unfoldable payload) — in which case the caller
+/// stops tracking the reference.
+///
+/// A string-literal element access yields the same `.member` link the dotted
+/// spelling does, which is what makes `s["kind"]` and `s.kind` ONE reference:
+/// tsc's `isMatchingReference` compares accessed property NAMES, so a
+/// discriminant written either way narrows reads written the other way, and a
+/// write through either spelling invalidates both.
+pub fn pathElemOfAccess(c: *Checker, node: Node) Error!?PathElem {
+    const d = c.tree.nodeData(node);
+    switch (c.nodeTag(node)) {
+        .member_expr, .optional_member_expr => {
+            const ma = try c.memberAtom(d.rhs);
+            if (!PathElem.memberFits(ma)) return null;
+            return .member(ma);
+        },
+        .index_expr, .optional_index_expr => {
+            if (c.constIndexOf(d.rhs)) |iv| return .element(iv);
+            if (try stringKeyAtom(c, d.rhs)) |a| {
+                if (!PathElem.memberFits(a)) return null;
+                return .member(a);
+            }
+            if (try c.stableIndexSymbol(d.rhs)) |is| return .elementSym(is);
+            return null;
+        },
+        else => return null,
+    }
+}
+
 /// Build the tracked reference key for a member/element-access node by
 /// peeling its spine right-to-left, collecting dotted-member atoms and
 /// constant element indices, until it bottoms out at a bare identifier
@@ -351,22 +404,13 @@ pub fn buildRefKey(c: *Checker, node: Node) Error!?RefKey {
     while (true) {
         while (c.nodeTag(n) == .paren_expr) n = c.tree.nodeData(n).lhs;
         const tag = c.nodeTag(n);
-        const d = c.tree.nodeData(n);
-        if (tag == .member_expr or tag == .optional_member_expr) {
-            if (count >= max_deep_ref_depth) return null; // too deep: not tracked
-            const ma = try c.memberAtom(d.rhs);
-            if (!PathElem.memberFits(ma)) return null; // unfoldable atom: not tracked
-            elems[count] = .member(ma);
-        } else if (tag == .index_expr or tag == .optional_index_expr) {
-            if (count >= max_deep_ref_depth) return null;
-            if (c.constIndexOf(d.rhs)) |iv| {
-                elems[count] = .element(iv);
-            } else if (try c.stableIndexSymbol(d.rhs)) |is| {
-                elems[count] = .elementSym(is);
-            } else return null; // unstable index: untracked
-        } else break;
+        if (tag != .member_expr and tag != .optional_member_expr and
+            tag != .index_expr and tag != .optional_index_expr) break;
+        if (count >= max_deep_ref_depth) return null; // too deep: not tracked
+        // Null = an unstable index or an unfoldable atom: not tracked.
+        elems[count] = (try pathElemOfAccess(c, n)) orelse return null;
         count += 1;
-        n = d.lhs;
+        n = c.tree.nodeData(n).lhs;
     }
     // `n` is the root. A bare identifier must resolve to a value symbol
     // (skip the `undefined` keyword, which is not a reference); `this`
@@ -429,23 +473,18 @@ pub fn refMatchesPath(c: *Checker, node: Node, sym: SymbolId, path: []const Path
     var i: usize = path.len;
     while (i > 0) : (i -= 1) {
         n = c.referenceCandidate(n);
-        const tag = c.nodeTag(n);
-        const d = c.tree.nodeData(n);
-        const pe = path[i - 1];
-        if (pe.isIndexSym()) {
-            if (tag != .index_expr and tag != .optional_index_expr) return false;
-            const is = (try c.stableIndexSymbol(d.rhs)) orelse return false;
-            if (is != pe.indexSym()) return false;
-        } else if (pe.isIndex()) {
-            if (tag != .index_expr and tag != .optional_index_expr) return false;
-            const iv = c.constIndexOf(d.rhs) orelse return false;
-            if (iv != pe.index()) return false;
-        } else {
-            if (tag != .member_expr and tag != .optional_member_expr) return false;
-            if ((try c.memberAtom(d.rhs)) != pe.atom()) return false;
-        }
-        n = d.lhs;
+        // One link, read the same way `buildRefKey` wrote it — which is what
+        // lets the two spellings of a property access (`s.kind`, `s["kind"]`)
+        // match each other.
+        const got = (try pathElemOfAccess(c, n)) orelse return false;
+        if (got.bits != path[i - 1].bits) return false;
+        n = c.tree.nodeData(n).lhs;
     }
+    // The ROOT is parenthesizable too (`(this).test`, `(obj).kind` — the shape
+    // Angular's generated type-check blocks write), and `identIsSym` matches a
+    // bare node. `buildRefKey` peels at the top of its own loop, so without
+    // this the two disagreed on exactly these spellings.
+    n = c.referenceCandidate(n);
     return c.identIsSym(n, sym);
 }
 
