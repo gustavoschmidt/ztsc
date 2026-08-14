@@ -1009,15 +1009,28 @@ pub const Scanner = struct {
         if (s.at(s.index) == 'e' or s.at(s.index) == 'E') {
             var i = s.index + 1;
             if (s.at(i) == '+' or s.at(i) == '-') i += 1;
-            if (isDigit(s.at(i))) {
-                integer = false;
-                s.index = i;
-                s.skipDigits(.dec);
-            }
+            // The marker and its sign belong to the LITERAL whether or not a
+            // digit follows: tsc's `scanNumber` consumes both unconditionally
+            // and, when `scanExponentDigits` comes back empty, reports
+            // "Digit expected" (TS1124 — `literals.checkNumeric`) at the
+            // character that should have been one, keeping the value it had
+            // before the `e`. Stopping the token short instead made `1e` scan
+            // as `1` plus an identifier `e` and answer TS1351 one column early.
+            s.index = i;
+            // Scientific notation is never an integer form, so `3en` is `3e`
+            // followed by an identifier rather than a BigInt.
+            integer = false;
+            s.skipDigits(.dec);
         }
-        // BigInt suffix is only valid on integer forms; `1.5n` scans as
-        // numeric `1.5` followed by identifier `n`.
+        // A BigInt suffix is only VALID on an integer form, but tsc consumes a
+        // lone one either way: `checkForIdentifierStartAfterNumericLiteral`
+        // reports TS1353 (`1.5n`) or TS1352 (`3en`) and, unlike the abutting-
+        // identifier case, does not rewind — so the `n` belongs to this token
+        // and `1.5n[x]` reads as one element access rather than two statements.
+        // A longer run (`1.5nfoo`) is an abutting identifier and stays its own
+        // token. `literals.checkNumeric` reports off the resulting text.
         if (integer) return s.bigintSuffix();
+        if (s.at(s.index) == 'n' and !isIdentCont(s.at(s.index + 1))) s.index += 1;
         return .numeric_literal;
     }
 };
@@ -1427,9 +1440,19 @@ test "golden: numeric literals" {
     });
     // Hex floats are not TypeScript: `0x1p3` is `0x1` then identifier `p3`.
     try expectTokens("0x1p3", &.{ .numeric_literal, .identifier, .eof });
-    // BigInt suffix is invalid on non-integers: `1.5n` is `1.5` + `n`.
-    try expectTokens("1.5n", &.{ .numeric_literal, .identifier, .eof });
-    try expectTokens("1e2n", &.{ .numeric_literal, .identifier, .eof });
+    // A BigInt suffix is INVALID on a non-integer, but tsc still folds a lone
+    // one into the token (its `checkForIdentifierStartAfterNumericLiteral`
+    // reports TS1353/TS1352 and does not rewind), so `1.5n[x]` is one element
+    // access. A longer run is an abutting identifier and its own token.
+    try expectTokens("1.5n", &.{ .numeric_literal, .eof });
+    try expectTokens("1e2n", &.{ .numeric_literal, .eof });
+    try expectTokens("1.5nfoo", &.{ .numeric_literal, .identifier, .eof });
+    // An exponent marker and its sign belong to the literal even with no digits
+    // after them (tsc's `scanNumber`, which then reports TS1124).
+    try expectTokens("1e", &.{ .numeric_literal, .eof });
+    try expectTokens("1e+", &.{ .numeric_literal, .eof });
+    try expectTokens("1ee", &.{ .numeric_literal, .identifier, .eof });
+    try expectTokens("1e[x]", &.{ .numeric_literal, .l_bracket, .identifier, .r_bracket, .eof });
     // `1..toString` is numeric `1.` then `.` then identifier.
     try expectTokens("1..toString", &.{ .numeric_literal, .dot, .identifier, .eof });
 }

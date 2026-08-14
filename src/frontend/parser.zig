@@ -167,6 +167,18 @@ const Parser = struct {
     /// declarator has no link back to the statement that carries `declare`.
     ambient: bool = false,
 
+    /// MODULE BODY: true while parsing the statement list of a source file, a
+    /// namespace/module block, or a `declare global` block; false inside any
+    /// other statement list. Saved/restored around each body exactly like
+    /// `ambient`, and read by one rule: a class-member modifier in statement
+    /// position is TS1044 ("cannot appear on a module or namespace element")
+    /// here and TS1184 ("Modifiers cannot appear here.") anywhere else, which is
+    /// tsc's `checkGrammarModifiers` testing the declaration's parent for
+    /// SourceFile-or-ModuleBlock. A SUBSTATEMENT position (`if (x) public var y
+    /// = 1;`) inherits its enclosing list's answer rather than getting its own —
+    /// tsc would say TS1184 there; no corpus case writes it.
+    module_body: bool = true,
+
     /// Lookahead queue of scanned-but-not-consumed tokens; la[0] is current.
     la: [max_la]Token = undefined,
     la_len: u8 = 0,
@@ -361,6 +373,16 @@ const Parser = struct {
                 if (literals.checkNumeric(text, t.start)) |f| {
                     try p.addDiag(f.code, .{ .code = f.code, .span = f.span });
                 }
+                // TS1352/TS1353, in tsc's order: its scanner reports the empty
+                // exponent (above) before the suffix, and the two land on
+                // different characters so both survive the one-per-position
+                // rule. Only a NUMERIC-tagged token can carry a misplaced
+                // suffix; a well-formed BigInt is its own tag.
+                if (t.tag == .numeric_literal) {
+                    if (literals.bigintSuffixMisuse(text, t.start)) |f| {
+                        try p.addDiag(f.code, .{ .code = f.code, .span = f.span });
+                    }
+                }
                 // TS1351: `3a`. Reported at the identifier, which is exactly
                 // where the parser's own "';' expected" would land, so the
                 // one-per-position rule keeps tsc's answer and drops ours.
@@ -377,6 +399,28 @@ const Parser = struct {
                 }
             },
             else => {},
+        }
+    }
+
+    /// The escape-sequence rules for a template part that has just been
+    /// consumed. Not folded into `checkLiteral` (which fires for every token)
+    /// because whether a bad escape is an error depends on WHO consumed the
+    /// token: a TAGGED template legalizes every one of them, since the tag
+    /// function is handed the raw text. tsc reaches the same split by scanning
+    /// template tokens with error emission off (recording
+    /// `TokenFlags.ContainsInvalidEscape`) and re-scanning —
+    /// `reScanTemplateToken(isTaggedTemplate: false)` — only where the parser
+    /// knows there is no tag. Measured against tsgo, the two positions tsc never
+    /// re-scans are a tagged template and a BARE `` `…` `` literal TYPE
+    /// (`type T = ` + "`\\u`" + ` is silent, while `` type T = `\x1${string}` ``
+    /// reports), so neither of those calls this.
+    fn checkTemplateEscapes(p: *Parser, tok: u32) Error!void {
+        const text = p.tokenTextAt(tok);
+        if (!literals.EscapeWalk.any(text)) return;
+        const start = p.tok_starts.items[tok] & scanner.Tokens.start_mask;
+        var w: literals.EscapeWalk = .init(text, start);
+        while (w.next()) |f| {
+            try p.addDiag(f.code, .{ .code = f.code, .span = f.span });
         }
     }
 
@@ -1067,8 +1111,105 @@ const Parser = struct {
         }
     }
 
+    /// The TS1044/TS1024 code a CLASS-MEMBER modifier earns in statement
+    /// position, or null when the word is not one. tsc's `checkGrammarModifiers`
+    /// words the accessibility trio and `static` as "cannot appear on a module
+    /// or namespace element" and `readonly` as "can only appear on a property
+    /// declaration or index signature"; the message names the modifier, which a
+    /// code-plus-span Diagnostic cannot interpolate, so there is one code each.
+    fn statementModifierCode(tag: TokTag) ?Code {
+        return switch (tag) {
+            .keyword_public => .public_not_on_module_element,
+            .keyword_private => .private_not_on_module_element,
+            .keyword_protected => .protected_not_on_module_element,
+            .keyword_static => .static_not_on_module_element,
+            .keyword_readonly => .readonly_not_on_property,
+            else => null,
+        };
+    }
+
+    /// Consume a run of class-member modifiers standing in front of a
+    /// DECLARATION (`public var x`, `static class C`, `export public import …`)
+    /// and report the FIRST one — tsc's grammar pass returns out of its modifier
+    /// walk on the first hit, which is why `public private var x` answers once
+    /// (the same rule TS1028 already follows). Consuming the whole run lets the
+    /// declaration itself parse cleanly, so there is no cascade: measured
+    /// against tsgo, every one of these positions is where ztsc used to answer
+    /// TS1434 or TS1005 instead.
+    ///
+    /// A modifier only when a declaration actually follows: these are all
+    /// contextual keywords, and `readonly = 1` or a bare `public` is an ordinary
+    /// expression. A line break ends the run, because tsc's `isDeclaration`
+    /// lookahead applies ASI to each modifier — `public` alone on its line is
+    /// the expression `public` (TS1212), not a modifier for the next line's
+    /// `var`.
+    fn eatStatementModifiers(p: *Parser) PE!void {
+        const n = p.statementModifierRunLen();
+        if (n == 0) return;
+        const first = p.curIdx();
+        // Outside a module body tsc words the same condition as TS1184 rather
+        // than naming the modifier — see `Parser.module_body`.
+        const code: Code = if (p.module_body)
+            statementModifierCode(p.curTag()).?
+        else
+            .modifiers_not_allowed_here;
+        for (0..n) |_| _ = try p.bump();
+        try p.errAtToken(code, first);
+    }
+
+    /// How many leading tokens are class-member modifiers in front of a
+    /// declaration, or 0 when this is not that shape. Bounded by the lookahead
+    /// window: a run longer than three keeps ztsc's existing answer rather than
+    /// reading past `max_la` (no real code writes even two).
+    fn statementModifierRunLen(p: *Parser) u32 {
+        var n: u32 = 0;
+        while (n < max_la - 2 and statementModifierCode(p.peekTag(n)) != null) {
+            n += 1;
+            if (p.peekNewline(n)) return 0;
+        }
+        if (n == 0 or !p.startsDeclarationAt(n)) return 0;
+        return n;
+    }
+
+    /// Does a DECLARATION begin `n` tokens ahead? tsc's `isDeclaration`
+    /// lookahead, minus the modifier loop `statementModifierRunLen` runs itself.
+    /// Conservative where tsc looks further (`interface`/`type` want an
+    /// identifier on the same line, `let` wants a binding): answering true only
+    /// ever moves a modifier word out of expression position, and the modifier
+    /// diagnostic that follows is tsc's own answer for every such shape.
+    fn startsDeclarationAt(p: *Parser, n: u32) bool {
+        return switch (p.peekTag(n)) {
+            .keyword_var,
+            .keyword_let,
+            .keyword_const,
+            .keyword_function,
+            .keyword_class,
+            .keyword_enum,
+            .keyword_interface,
+            .keyword_type,
+            .keyword_namespace,
+            .keyword_module,
+            .keyword_import,
+            .keyword_declare,
+            .keyword_abstract,
+            .keyword_async,
+            => true,
+            else => false,
+        };
+    }
+
     fn parseStatement(p: *Parser) PE!Node {
         switch (p.curTag()) {
+            .keyword_public,
+            .keyword_private,
+            .keyword_protected,
+            .keyword_static,
+            .keyword_readonly,
+            => {
+                if (p.statementModifierRunLen() == 0) return p.parseExpressionStatement();
+                try p.eatStatementModifiers();
+                return p.parseStatement();
+            },
             .l_brace => return p.parseBlock(),
             .semicolon => {
                 const tok = try p.bump();
@@ -1225,12 +1366,7 @@ const Parser = struct {
                 // when directly followed by `{`; otherwise `global` is an
                 // ordinary contextual-keyword identifier (`global.foo`, a label).
                 if (p.peekTag(1) == .l_brace) return p.parseGlobalAugmentation();
-                if (p.peekTag(1) == .colon) {
-                    const label = try p.bump();
-                    _ = try p.bump(); // ':'
-                    const body = try p.parseStatement();
-                    return p.addNode(.{ .tag = .labeled_stmt, .main_token = label, .data = .{ .lhs = body, .rhs = 0 } });
-                }
+                if (p.peekTag(1) == .colon) return p.parseLabeledStatement();
                 return p.parseExpressionStatement();
             },
             .keyword_enum => return p.parseEnumDecl(0),
@@ -1262,15 +1398,57 @@ const Parser = struct {
             },
             else => {
                 // Labeled statement?
-                if (isIdentLike(p.curTag()) and p.peekTag(1) == .colon) {
-                    const label = try p.bump();
-                    _ = try p.bump(); // ':'
-                    const body = try p.parseStatement();
-                    return p.addNode(.{ .tag = .labeled_stmt, .main_token = label, .data = .{ .lhs = body, .rhs = 0 } });
-                }
+                if (isIdentLike(p.curTag()) and p.peekTag(1) == .colon) return p.parseLabeledStatement();
                 return p.parseExpressionStatement();
             },
         }
+    }
+
+    /// `label: stmt`. Current token is the label, the next one its `:`.
+    ///
+    /// tsc reports TS1344 on the LABEL when what it labels is a DECLARATION
+    /// rather than a statement. Measured against tsgo: `var`/`let`/`const`,
+    /// `function` (plain, `async`, generator), `class`, `interface`, `enum`,
+    /// `type`, `namespace`, `import` and anything carrying a modifier all answer
+    /// it; `if`/`for`/`while`/`do`/`switch`/`try`/`throw`/`debugger`/`;`/a
+    /// block/an expression/a nested LABEL do not (`a: b: var v = 1` reports on
+    /// `b`, the label whose statement is the declaration, and not on `a`, whose
+    /// statement is a labeled statement).
+    ///
+    /// Decided on the parsed NODE rather than on a lookahead, so the questions
+    /// of whether `let` and `async` are keywords here are already answered.
+    fn parseLabeledStatement(p: *Parser) PE!Node {
+        const label = try p.bump();
+        _ = try p.bump(); // ':'
+        const body = try p.parseStatement();
+        if (isDeclarationTag(p.nodes.items(.tag)[body])) {
+            try p.errAtToken(.label_not_allowed, label);
+        }
+        return p.addNode(.{ .tag = .labeled_stmt, .main_token = label, .data = .{ .lhs = body, .rhs = 0 } });
+    }
+
+    /// Statement tags that are DECLARATIONS — the set a label may not carry.
+    /// `.unsupported` is excluded: it stands for a construct ztsc does not
+    /// model, and guessing which side of this line it falls on would invent a
+    /// diagnostic over a parser gap.
+    fn isDeclarationTag(tag: ast.Tag) bool {
+        return switch (tag) {
+            .var_decl,
+            .var_decl_one,
+            .function_decl,
+            .class_decl,
+            .interface_decl,
+            .type_alias,
+            .enum_decl,
+            .namespace_decl,
+            .import_decl,
+            .import_equals,
+            .export_decl,
+            .export_default,
+            .export_assign,
+            => true,
+            else => false,
+        };
     }
 
     fn parseBlock(p: *Parser) PE!Node {
@@ -1300,6 +1478,11 @@ const Parser = struct {
         if (ambient_body) try p.errAtToken(.implementation_not_allowed_in_ambient, l_brace);
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
+        // A block is the one statement list that is NOT a module body — see
+        // `Parser.module_body`.
+        const was_module_body = p.module_body;
+        p.module_body = false;
+        defer p.module_body = was_module_body;
         try p.parseStatementList(top, .r_brace, ambient_body);
         _ = try p.expect(.r_brace, .expected_r_brace);
         const range = try p.scratchToSpan(top);
@@ -1400,7 +1583,7 @@ const Parser = struct {
 
     fn parseDeclarator(p: *Parser, no_in: bool) PE!Node {
         const name_tok = p.curIdx();
-        const name = try p.parseBindingName();
+        const name = try p.parseBindingName(.private_name_in_var_decl);
         var flags: u32 = 0;
         if (p.curTag() == .bang and !p.nlBefore()) {
             _ = try p.bump();
@@ -1906,7 +2089,7 @@ const Parser = struct {
             const tok = try p.bump();
             name = try p.addNode(.{ .tag = .this_expr, .main_token = tok, .data = .{ .lhs = 0, .rhs = 0 } });
         } else {
-            name = try p.parseBindingName();
+            name = try p.parseBindingName(.private_name_as_param);
         }
         if (p.curTag() == .question) {
             _ = try p.bump();
@@ -1939,10 +2122,24 @@ const Parser = struct {
 
     // --- binding patterns ---------------------------------------------------
 
-    fn parseBindingName(p: *Parser) PE!Node {
+    /// A binding name: an identifier or a destructuring pattern.
+    ///
+    /// `private_code` is what a `#name` here earns — tsc's
+    /// `parseIdentifierOrPattern(privateIdentifierDiagnosticMessage)`, whose
+    /// caller picks the wording: TS18029 in a variable declaration, TS18009 in a
+    /// parameter list, TS18016 anywhere else. tsc reports it and then reads the
+    /// token as the name anyway (its `createIdentifier` recurses with
+    /// `isIdentifier: true`), so a `#foo` binding produces exactly one
+    /// diagnostic rather than that one plus a "Variable declaration expected."
+    fn parseBindingName(p: *Parser, private_code: Code) PE!Node {
         switch (p.curTag()) {
             .l_bracket => return p.parseArrayPattern(),
             .l_brace => return p.parseObjectPattern(),
+            .private_identifier => {
+                try p.errAtCur(private_code);
+                const tok = try p.bump();
+                return p.addNode(.{ .tag = .identifier, .main_token = tok, .data = .{ .lhs = 0, .rhs = 0 } });
+            },
             else => {
                 if (isIdentLike(p.curTag())) {
                     try p.checkStrictReserved();
@@ -1969,7 +2166,7 @@ const Parser = struct {
             }
             if (p.curTag() == .dot_dot_dot) {
                 const dots = try p.bump();
-                const target = try p.parseBindingName();
+                const target = try p.parseBindingName(.private_name_outside_class);
                 try p.pushScratch(try p.addNode(.{ .tag = .rest_element, .main_token = dots, .data = .{ .lhs = target, .rhs = 0 } }));
                 if (p.curTag() == .comma) try p.errAtCur(.rest_must_be_last);
             } else {
@@ -1988,7 +2185,7 @@ const Parser = struct {
 
     /// Pattern with optional default: `x`, `[a]`, `{a}`, each `= init`.
     fn parseBindingElement(p: *Parser) PE!Node {
-        const target = try p.parseBindingName();
+        const target = try p.parseBindingName(.private_name_outside_class);
         if (p.curTag() == .eq) {
             const eq_tok = try p.bump();
             const init = try p.parseAssignExpr(.{});
@@ -2005,13 +2202,13 @@ const Parser = struct {
             const before = p.curIdx();
             if (p.curTag() == .dot_dot_dot) {
                 const dots = try p.bump();
-                const target = try p.parseBindingName();
+                const target = try p.parseBindingName(.private_name_outside_class);
                 try p.pushScratch(try p.addNode(.{ .tag = .rest_element, .main_token = dots, .data = .{ .lhs = target, .rhs = 0 } }));
                 if (p.curTag() == .comma) try p.errAtCur(.rest_must_be_last);
             } else if (isNameLike(p.curTag()) or p.curTag() == .string_literal or p.curTag() == .numeric_literal) {
                 const key = try p.bump();
                 var value: Node = null_node;
-                if (try p.eat(.colon) != null) value = try p.parseBindingName();
+                if (try p.eat(.colon) != null) value = try p.parseBindingName(.private_name_outside_class);
                 var init: Node = null_node;
                 if (try p.eat(.eq) != null) init = try p.parseAssignExpr(.{});
                 try p.pushScratch(try p.addNode(.{ .tag = .binding_property, .main_token = key, .data = .{ .lhs = value, .rhs = init } }));
@@ -2024,7 +2221,7 @@ const Parser = struct {
                 const key_expr = try p.parseAssignExpr(.{});
                 _ = try p.expect(.r_bracket, .expected_r_bracket);
                 var target: Node = null_node;
-                if (try p.eat(.colon) != null) target = try p.parseBindingName();
+                if (try p.eat(.colon) != null) target = try p.parseBindingName(.private_name_outside_class);
                 if (try p.eat(.eq)) |eq_tok| {
                     const init = try p.parseAssignExpr(.{});
                     target = try p.addNode(.{ .tag = .binding_default, .main_token = eq_tok, .data = .{ .lhs = target, .rhs = init } });
@@ -2556,6 +2753,10 @@ const Parser = struct {
         const was_ambient = p.ambient;
         p.ambient = was_ambient or flags & ast.Flags.declare != 0;
         defer p.ambient = was_ambient;
+        // A namespace block IS a module body however deeply it is nested.
+        const was_module_body = p.module_body;
+        p.module_body = true;
+        defer p.module_body = was_module_body;
         try p.parseStatementList(top, .r_brace, false);
         _ = try p.expect(.r_brace, .expected_r_brace);
         const body = try p.scratchToSpan(top);
@@ -2581,6 +2782,10 @@ const Parser = struct {
         const was_ambient = p.ambient;
         p.ambient = true;
         defer p.ambient = was_ambient;
+        // A module block IS a module body however deeply it is nested.
+        const was_module_body = p.module_body;
+        p.module_body = true;
+        defer p.module_body = was_module_body;
         try p.parseStatementList(top, .r_brace, false);
         _ = try p.expect(.r_brace, .expected_r_brace);
         const body = try p.scratchToSpan(top);
@@ -2628,6 +2833,10 @@ const Parser = struct {
         const was_ambient = p.ambient;
         p.ambient = true;
         defer p.ambient = was_ambient;
+        // A module block IS a module body however deeply it is nested.
+        const was_module_body = p.module_body;
+        p.module_body = true;
+        defer p.module_body = was_module_body;
         try p.parseStatementList(top, .r_brace, false);
         _ = try p.expect(.r_brace, .expected_r_brace);
         const body = try p.scratchToSpan(top);
@@ -2798,6 +3007,9 @@ const Parser = struct {
     fn parseExportStatement(p: *Parser) PE!Node {
         const kw = try p.bump(); // `export`
         p.saw_module_syntax = true;
+        // `export public import a = x.c;` — a member modifier between `export`
+        // and the declaration, which tsc parses into the same modifier list.
+        try p.eatStatementModifiers();
         switch (p.curTag()) {
             .keyword_default => {
                 _ = try p.bump();
@@ -3419,7 +3631,7 @@ const Parser = struct {
                         },
                         .template_head, .no_substitution_template_literal => {
                             try p.fail(.tagged_template_in_optional_chain);
-                            const tmpl = try p.parseTemplateExpr();
+                            const tmpl = try p.parseTemplateExpr(true);
                             lhs = try p.addNode(.{ .tag = .tagged_template, .main_token = p.nodes.items(.main_token)[tmpl], .data = .{ .lhs = lhs, .rhs = tmpl } });
                         },
                         else => {
@@ -3450,7 +3662,7 @@ const Parser = struct {
                     lhs = try p.addNode(.{ .tag = .non_null, .main_token = tok, .data = .{ .lhs = lhs, .rhs = 0 } });
                 },
                 .template_head, .no_substitution_template_literal => {
-                    const tmpl = try p.parseTemplateExpr();
+                    const tmpl = try p.parseTemplateExpr(true);
                     lhs = try p.addNode(.{ .tag = .tagged_template, .main_token = p.nodes.items(.main_token)[tmpl], .data = .{ .lhs = lhs, .rhs = tmpl } });
                 },
                 .lt, .lt_lt => {
@@ -3726,12 +3938,35 @@ const Parser = struct {
             const tok = try p.expectJsxName();
             break :blk try p.addNode(.{ .tag = .identifier, .main_token = tok, .data = .{ .lhs = 0, .rhs = 0 } });
         };
+        // tsc's `parseJsxTagName` returns a JsxNamespacedName immediately, so a
+        // namespaced tag never carries a `.B.C` chain.
+        if (try p.eatJsxNamespaceTail()) return node;
         while (p.curTag() == .dot) {
             const dot = try p.bump();
             const name = try p.expectMemberName();
             node = try p.addNode(.{ .tag = .member_expr, .main_token = dot, .data = .{ .lhs = node, .rhs = name } });
         }
         return node;
+    }
+
+    /// The `: name` tail of a JsxNamespacedName (`<svg:path>`, `a:b={1}`), in
+    /// either a tag-name or an attribute-name position. Returns true when one
+    /// was there.
+    ///
+    /// The ABUTTING spelling is already a single `.jsx_name` token —
+    /// `rescanJsxName` merges over the `:` — so this only ever fires for the
+    /// SPACED spelling `<svg : path>`, which tsc accepts because its
+    /// `parseJsxTagName` reads an ordinary `:` token with trivia allowed on both
+    /// sides. There the namespace part alone stands as the node: a token is a
+    /// byte range and no single token spans `svg : path`. So a spaced namespaced
+    /// name loses its qualifier for the `JSX.IntrinsicElements` lookup — an
+    /// under-report on a spelling no real code writes (both corpus cases name a
+    /// lowercase namespace, so the intrinsic classification is still right).
+    fn eatJsxNamespaceTail(p: *Parser) PE!bool {
+        if (p.curTag() != .colon) return false;
+        _ = try p.bump(); // ':'
+        _ = try p.expectJsxName();
+        return true;
     }
 
     fn parseJsxAttributes(p: *Parser) PE!ast.SubRange {
@@ -3747,6 +3982,7 @@ const Parser = struct {
                 try p.pushScratch(try p.addNode(.{ .tag = .jsx_spread_attribute, .main_token = lb, .data = .{ .lhs = expr, .rhs = 0 } }));
             } else {
                 const name = try p.expectJsxName();
+                _ = try p.eatJsxNamespaceTail();
                 var value: Node = null_node;
                 if (try p.eat(.eq) != null) value = try p.parseJsxAttributeValue();
                 try p.pushScratch(try p.addNode(.{ .tag = .jsx_attribute, .main_token = name, .data = .{ .lhs = value, .rhs = 0 } }));
@@ -3855,7 +4091,7 @@ const Parser = struct {
                 }
                 return p.leaf(.regex_literal);
             },
-            .no_substitution_template_literal, .template_head => return p.parseTemplateExpr(),
+            .no_substitution_template_literal, .template_head => return p.parseTemplateExpr(false),
             .unterminated_template => {
                 try p.errAtCurEnd(.unterminated_template);
                 return p.leaf(.template_literal);
@@ -3875,6 +4111,25 @@ const Parser = struct {
                 return p.leaf(.identifier);
             },
             .keyword_class => return p.parseClassDecl(0),
+            .at => {
+                // A decorated class EXPRESSION: `({ x: @dec class {} })`,
+                // `f(@dec class {})`. TC39 standard decorators put the
+                // decorator list in the ClassExpression production
+                // (`ClassExpression : DecoratorList? class BindingIdentifier?
+                // ClassTail`), which is why an `@` can start an expression at
+                // all. A decorator anywhere ELSE in expression position is
+                // TS1206, exactly as at statement level.
+                //
+                // The decorator nodes are parsed (so a malformed one still
+                // reports) but not attached: `pending_class_decos` is a
+                // STATEMENT-list protocol, and a class expression is not in
+                // one. Deliberate under-report — the decorator's own signature
+                // check is skipped for this form, never a false positive.
+                while (p.curTag() == .at) _ = try p.parseDecorator();
+                if (p.curTag() == .keyword_class) return p.parseClassDecl(0);
+                try p.errAtToken(.decorator_not_valid_here, p.lastIdx());
+                return p.parseAssignExpr(ctx);
+            },
             .l_paren => {
                 const lp = try p.bump();
                 const inner = try p.parseExpression(.{});
@@ -3919,11 +4174,16 @@ const Parser = struct {
 
     /// Template literal: `plain` → leaf; with substitutions → template_expr.
     /// The parser owns the `}` → middle/tail rescan (grammar context).
-    fn parseTemplateExpr(p: *Parser) PE!Node {
+    /// `tagged` is true for the `` tag`…` `` form, whose parts admit every
+    /// otherwise-invalid escape — see `checkTemplateEscapes`.
+    fn parseTemplateExpr(p: *Parser, tagged: bool) PE!Node {
         if (p.curTag() == .no_substitution_template_literal) {
-            return p.leaf(.template_literal);
+            const tok = try p.bump();
+            if (!tagged) try p.checkTemplateEscapes(tok);
+            return p.addNode(.{ .tag = .template_literal, .main_token = tok, .data = .{ .lhs = 0, .rhs = 0 } });
         }
         const head = try p.bump(); // template_head
+        if (!tagged) try p.checkTemplateEscapes(head);
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
         while (true) {
@@ -3935,11 +4195,13 @@ const Parser = struct {
             p.rescanTemplatePart();
             switch (p.curTag()) {
                 .template_middle => {
-                    _ = try p.bump();
+                    const part = try p.bump();
+                    if (!tagged) try p.checkTemplateEscapes(part);
                     continue;
                 },
                 .template_tail => {
-                    _ = try p.bump();
+                    const part = try p.bump();
+                    if (!tagged) try p.checkTemplateEscapes(part);
                     break;
                 },
                 .unterminated_template => {
@@ -4048,6 +4310,11 @@ const Parser = struct {
             },
             else => {
                 if (isNameLike(p.curTag())) {
+                    // `{ #x: 1 }` / `{ #m() {} }` / `{ get #p() {} }` — an
+                    // object literal is never a class body, so a private name
+                    // here is always TS18016 (tsc's parser reads it as the
+                    // PropertyName and its grammar pass reports).
+                    if (p.curTag() == .private_identifier) try p.errAtCur(.private_name_outside_class);
                     key_tok = p.curIdx();
                     key = try p.leaf(.identifier);
                 } else {
@@ -4087,8 +4354,25 @@ const Parser = struct {
     // types
     // =====================================================================
 
+    /// Who owns a trailing `?` at the very top of a type.
+    ///
+    /// In a plain TUPLE element it is the optional-element marker and the tuple
+    /// owns it (`[string?]`); everywhere else it is tsc's JSDoc postfix-nullable
+    /// marker and `parsePostfixType` reports TS17019 on it (`let x: string?`).
+    /// The distinction is threaded only down the spine of positions where the
+    /// child can still BE the element's top node — which is exactly the reach of
+    /// the `type.pos === type.type.pos` test tsc's `parseTupleElementType` uses
+    /// to convert the nullable node back into an optional one. So a nested
+    /// marker (`[Array<string?>]`, `[A | B?]`, `[keyof string?]`) still reads as
+    /// nullable, as it does in tsc.
+    const TrailingQuestion = enum { nullable_marker, tuple_optional };
+
     fn parseType(p: *Parser) PE!Node {
-        const ty = try p.parseNonConditionalType();
+        return p.parseTypeIn(.nullable_marker);
+    }
+
+    fn parseTypeIn(p: *Parser, tq: TrailingQuestion) PE!Node {
+        const ty = try p.parseNonConditionalType(tq);
         // Conditional type `C extends E ? T : F`. The `extends` clause
         // is a non-conditional type (a nested conditional there needs
         // parentheses, matching tsc); the two branches are full types. The
@@ -4096,7 +4380,7 @@ const Parser = struct {
         // parsing a function type, exactly as before.
         if (p.curTag() == .keyword_extends and !p.nlBefore() and p.spec == 0) {
             const ext_kw = try p.bump();
-            const extends_ty = try p.parseNonConditionalType();
+            const extends_ty = try p.parseNonConditionalType(.nullable_marker);
             _ = try p.expect(.question, .expected_colon);
             const true_ty = try p.parseType();
             _ = try p.expect(.colon, .expected_colon);
@@ -4115,7 +4399,7 @@ const Parser = struct {
     /// union type. Shared by `parseType` (for the check and extends clauses of
     /// a conditional) so a conditional's `extends` clause and check type both
     /// admit function types without recursing into conditional parsing.
-    fn parseNonConditionalType(p: *Parser) PE!Node {
+    fn parseNonConditionalType(p: *Parser, tq: TrailingQuestion) PE!Node {
         // Function type `(params) => R` / `<T>(params) => R`; constructor
         // type `new (...) => R` / `abstract new (...) => R`.
         switch (p.curTag()) {
@@ -4129,7 +4413,7 @@ const Parser = struct {
             },
             else => {},
         }
-        return p.parseUnionType();
+        return p.parseUnionType(tq);
     }
 
     /// Standalone constructor type `new (params) => R` / `abstract new … => R`
@@ -4201,10 +4485,10 @@ const Parser = struct {
         return p.addNode(.{ .tag = .function_type, .main_token = start_tok, .data = .{ .lhs = proto, .rhs = 0 } });
     }
 
-    fn parseUnionType(p: *Parser) PE!Node {
+    fn parseUnionType(p: *Parser, tq: TrailingQuestion) PE!Node {
         var first_pipe: u32 = 0;
         if (p.curTag() == .pipe) first_pipe = try p.bump(); // leading `|`
-        const first = try p.parseIntersectionType();
+        const first = try p.parseIntersectionType(tq);
         if (p.curTag() != .pipe and first_pipe == 0) return first;
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
@@ -4213,17 +4497,17 @@ const Parser = struct {
         while (p.curTag() == .pipe) {
             const tok = try p.bump();
             if (main_tok == 0) main_tok = tok;
-            try p.pushScratch(try p.parseIntersectionType());
+            try p.pushScratch(try p.parseIntersectionType(.nullable_marker));
         }
         if (main_tok == 0) main_tok = p.nodes.items(.main_token)[first];
         const range = try p.scratchToSpan(top);
         return p.addNode(.{ .tag = .union_type, .main_token = main_tok, .data = .{ .lhs = range.start, .rhs = range.end } });
     }
 
-    fn parseIntersectionType(p: *Parser) PE!Node {
+    fn parseIntersectionType(p: *Parser, tq: TrailingQuestion) PE!Node {
         var first_amp: u32 = 0;
         if (p.curTag() == .amp) first_amp = try p.bump();
-        const first = try p.parseTypeOperator();
+        const first = try p.parseTypeOperator(tq);
         if (p.curTag() != .amp and first_amp == 0) return first;
         const top = p.scratchTop();
         defer p.scratch.shrinkRetainingCapacity(top);
@@ -4232,23 +4516,23 @@ const Parser = struct {
         while (p.curTag() == .amp) {
             const tok = try p.bump();
             if (main_tok == 0) main_tok = tok;
-            try p.pushScratch(try p.parseTypeOperator());
+            try p.pushScratch(try p.parseTypeOperator(.nullable_marker));
         }
         if (main_tok == 0) main_tok = p.nodes.items(.main_token)[first];
         const range = try p.scratchToSpan(top);
         return p.addNode(.{ .tag = .intersection_type, .main_token = main_tok, .data = .{ .lhs = range.start, .rhs = range.end } });
     }
 
-    fn parseTypeOperator(p: *Parser) PE!Node {
+    fn parseTypeOperator(p: *Parser, tq: TrailingQuestion) PE!Node {
         switch (p.curTag()) {
             .keyword_keyof => {
                 const kw = try p.bump();
-                const operand = try p.parseTypeOperator();
+                const operand = try p.parseTypeOperator(.nullable_marker);
                 return p.addNode(.{ .tag = .keyof_type, .main_token = kw, .data = .{ .lhs = operand, .rhs = 0 } });
             },
             .keyword_readonly => {
                 const kw = try p.bump();
-                const operand = try p.parseTypeOperator();
+                const operand = try p.parseTypeOperator(.nullable_marker);
                 return p.addNode(.{ .tag = .readonly_type, .main_token = kw, .data = .{ .lhs = operand, .rhs = 0 } });
             },
             .keyword_unique => {
@@ -4260,7 +4544,7 @@ const Parser = struct {
                     return p.addNode(.{ .tag = .unique_symbol_type, .main_token = kw, .data = .{ .lhs = 0, .rhs = 0 } });
                 }
                 const start = try p.bump();
-                _ = try p.parseTypeOperator();
+                _ = try p.parseTypeOperator(.nullable_marker);
                 return p.unsupportedFrom(start);
             },
             .keyword_infer => {
@@ -4274,27 +4558,108 @@ const Parser = struct {
                 var constraint: Node = null_node;
                 if (p.curTag() == .keyword_extends and !p.nlBefore()) {
                     _ = try p.bump();
-                    constraint = try p.parseNonConditionalType();
+                    constraint = try p.parseNonConditionalType(.nullable_marker);
                 }
                 return p.addNode(.{ .tag = .infer_type, .main_token = kw, .data = .{ .lhs = name, .rhs = constraint } });
             },
-            else => return p.parsePostfixType(),
+            else => return p.parsePostfixType(tq),
         }
     }
 
-    fn parsePostfixType(p: *Parser) PE!Node {
+    /// tsc's `parsePostfixTypeOrHigher`: `T[]`, `T[K]`, and JSDoc's postfix
+    /// nullability markers `T?` / `T!`, which tsc's parser accepts in a `.ts`
+    /// file and its CHECKER reports (TS17019) — so the file's semantic pass
+    /// still runs. See `orNull` for the desugaring and `TrailingQuestion` for
+    /// the one position where a `?` is not this marker.
+    fn parsePostfixType(p: *Parser, tq: TrailingQuestion) PE!Node {
+        const start_tok = p.curIdx();
         var ty = try p.parsePrimaryType();
-        while (p.curTag() == .l_bracket and !p.nlBefore()) {
-            const lb = try p.bump();
-            if (try p.eat(.r_bracket) != null) {
-                ty = try p.addNode(.{ .tag = .array_type, .main_token = lb, .data = .{ .lhs = ty, .rhs = 0 } });
-            } else {
-                const index = try p.parseType();
-                _ = try p.expect(.r_bracket, .expected_r_bracket);
-                ty = try p.addNode(.{ .tag = .indexed_access_type, .main_token = lb, .data = .{ .lhs = ty, .rhs = index } });
+        while (!p.nlBefore()) {
+            switch (p.curTag()) {
+                .l_bracket => {
+                    const lb = try p.bump();
+                    if (try p.eat(.r_bracket) != null) {
+                        ty = try p.addNode(.{ .tag = .array_type, .main_token = lb, .data = .{ .lhs = ty, .rhs = 0 } });
+                    } else {
+                        const index = try p.parseType();
+                        _ = try p.expect(.r_bracket, .expected_r_bracket);
+                        ty = try p.addNode(.{ .tag = .indexed_access_type, .main_token = lb, .data = .{ .lhs = ty, .rhs = index } });
+                    }
+                },
+                .bang => {
+                    const mark = try p.bump();
+                    try p.errAtRange(.non_nullable_type_postfix, start_tok, mark);
+                },
+                .question => {
+                    // `T ? X : Y` — a conditional type's `?`, not a marker.
+                    // tsc's `lookAhead(nextTokenIsStartOfType)`, and the only
+                    // reason `string?[]` answers TS1005 rather than TS17019.
+                    if (tq == .tuple_optional or p.startsTypeAt(1)) return ty;
+                    const mark = try p.bump();
+                    try p.errAtRange(.nullable_type_postfix, start_tok, mark);
+                    ty = try p.orNull(ty, mark);
+                },
+                else => return ty,
             }
         }
         return ty;
+    }
+
+    /// `T | null`, the desugaring of a `?T` / `T?` marker: measured, not
+    /// assumed — `let a: ?string; let b: string = a;` answers "Type 'string |
+    /// null' is not assignable to type 'string'" (tsc's
+    /// `getTypeFromJSDocNullableTypeNode` adds `null` under strictNullChecks).
+    /// Synthesizing the union the source should have written keeps the marker
+    /// out of the AST vocabulary entirely, so no consumer downstream has to
+    /// know it existed; `mark` (the `?`) stands in as the `null` member's token,
+    /// which only ever supplies a span.
+    fn orNull(p: *Parser, ty: Node, mark: u32) PE!Node {
+        const null_ty = try p.addNode(.{ .tag = .null_literal, .main_token = mark, .data = .{ .lhs = 0, .rhs = 0 } });
+        const top = p.scratchTop();
+        defer p.scratch.shrinkRetainingCapacity(top);
+        try p.pushScratch(ty);
+        try p.pushScratch(null_ty);
+        const range = try p.scratchToSpan(top);
+        return p.addNode(.{ .tag = .union_type, .main_token = mark, .data = .{ .lhs = range.start, .rhs = range.end } });
+    }
+
+    /// tsc's `isStartOfType` applied `n` tokens ahead. Liberal where tsc looks
+    /// further (`-` only before a numeric literal, `(` only before a
+    /// parenthesized-or-function type): saying "a type starts here" only ever
+    /// declines to read a `?` as a nullability marker, so erring that way costs
+    /// a missing TS17019 rather than a false one.
+    fn startsTypeAt(p: *Parser, n: usize) bool {
+        const tag = p.peekTag(n);
+        return switch (tag) {
+            .keyword_void,
+            .keyword_null,
+            .keyword_true,
+            .keyword_false,
+            .keyword_this,
+            .keyword_typeof,
+            .keyword_new,
+            .keyword_import,
+            .keyword_function,
+            .l_brace,
+            .l_bracket,
+            .l_paren,
+            .lt,
+            .lt_lt,
+            .pipe,
+            .amp,
+            .minus,
+            .asterisk,
+            .question,
+            .bang,
+            .dot_dot_dot,
+            .string_literal,
+            .numeric_literal,
+            .bigint_literal,
+            .no_substitution_template_literal,
+            .template_head,
+            => true,
+            else => isIdentLike(tag),
+        };
     }
 
     fn parsePrimaryType(p: *Parser) PE!Node {
@@ -4339,6 +4704,27 @@ const Parser = struct {
                     targs = try p.addExtra(try p.parseTypeArgs());
                 }
                 return p.addNode(.{ .tag = .typeof_type, .main_token = kw, .data = .{ .lhs = inner, .rhs = targs } });
+            },
+            .question => {
+                // `?T` — tsc's `parseJSDocUnknownOrNullableType`, which takes a
+                // full `parseType()` operand. Measured against tsgo: `Array<?>`
+                // answers TS1110 at the `>`, i.e. the operand is parsed
+                // unconditionally (tsc's JSDocUnknownType lookahead for `?,`
+                // `?)` `?>` is not reached in a `.ts` file).
+                const mark = try p.bump();
+                const inner = try p.parseType();
+                try p.errAtRange(.nullable_type_prefix, mark, p.lastIdx());
+                return p.orNull(inner, mark);
+            },
+            .bang => {
+                // `!T` — tsc's `parseJSDocNonNullableType`, whose operand is a
+                // `parseNonArrayType()`, so the `[]` of `!string[]` binds
+                // outside the marker. The marker itself means nothing in a
+                // `.ts` file, so the operand IS the type.
+                const mark = try p.bump();
+                const inner = try p.parsePrimaryType();
+                try p.errAtRange(.non_nullable_type_prefix, mark, p.lastIdx());
+                return inner;
             },
             .l_brace => return p.parseObjectType(),
             .l_bracket => return p.parseTupleType(),
@@ -4463,7 +4849,7 @@ const Parser = struct {
                 if (q_tok) |q| ty = try p.addNode(.{ .tag = .optional_type, .main_token = q, .data = .{ .lhs = ty, .rhs = 0 } });
                 try p.pushScratch(ty);
             } else {
-                var ty = try p.parseType();
+                var ty = try p.parseTypeIn(.tuple_optional);
                 if (p.curTag() == .question) {
                     const q = try p.bump();
                     ty = try p.addNode(.{ .tag = .optional_type, .main_token = q, .data = .{ .lhs = ty, .rhs = 0 } });
@@ -4531,6 +4917,7 @@ const Parser = struct {
             return p.addNode(.{ .tag = .template_literal_type_node, .main_token = tok, .data = .{ .lhs = extra, .rhs = 0 } });
         }
         const head = try p.bump(); // template_head
+        try p.checkTemplateEscapes(head);
         var chunk_toks: std.ArrayList(u32) = .empty;
         defer chunk_toks.deinit(p.gpa);
         const top = p.scratchTop();
@@ -4545,12 +4932,14 @@ const Parser = struct {
             switch (p.curTag()) {
                 .template_middle => {
                     try chunk_toks.append(p.gpa, p.curIdx());
-                    _ = try p.bump();
+                    const part = try p.bump();
+                    try p.checkTemplateEscapes(part);
                     continue;
                 },
                 .template_tail => {
                     try chunk_toks.append(p.gpa, p.curIdx());
-                    _ = try p.bump();
+                    const part = try p.bump();
+                    try p.checkTemplateEscapes(part);
                     break;
                 },
                 .unterminated_template => {
@@ -4735,6 +5124,9 @@ const Parser = struct {
         if (name_tok != 0) {
             // already set by the well-known-symbol path above
         } else if (isNameLike(p.curTag()) or p.curTag() == .string_literal or p.curTag() == .numeric_literal) {
+            // `interface I { #x: string }` / `type A = { #m(): string }` — a
+            // TYPE member list is never a class body either, so TS18016.
+            if (p.curTag() == .private_identifier) try p.errAtCur(.private_name_outside_class);
             name_tok = try p.bump();
         } else {
             try p.fail(.expected_type_member);

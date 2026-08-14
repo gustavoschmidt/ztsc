@@ -35,6 +35,8 @@ pub const Code = enum(u16) {
     escape_sequence_not_allowed,
     /// TS1125: `0x`, `"\x1"`, `"\u12"` — a hex digit was required here.
     hex_digit_expected,
+    /// TS1124: `1e`, `1E-` — an exponent marker with no digits after it.
+    digit_expected,
     /// TS1177: `0b` with no digits.
     binary_digit_expected,
     /// TS1178: `0o` with no digits.
@@ -45,6 +47,10 @@ pub const Code = enum(u16) {
     unterminated_unicode_escape,
     /// TS1351: `3a` — an identifier or keyword abutting a numeric literal.
     identifier_after_numeric_literal,
+    /// TS1352: `3en` — a BigInt suffix on a literal in exponential notation.
+    bigint_exponential,
+    /// TS1353: `1.5n` — a BigInt suffix on a literal that is not an integer.
+    bigint_not_integer,
 
     // --- parse errors ------------------------------------------------------
     expected_expression,
@@ -113,6 +119,24 @@ pub const Code = enum(u16) {
     /// TS1206: a decorator in a position the grammar forbids (parameter
     /// decorator under TC39 standard decorators).
     decorator_not_valid_here,
+    /// TS1344: `label: var x = 1` — a label on a DECLARATION. tsc's grammar
+    /// pass, so it is gated rather than gating.
+    label_not_allowed,
+    /// TS1044: a class-member accessibility (or `static`) modifier on a
+    /// statement-position DECLARATION — `public var x`, `static class C`,
+    /// `export public import a = x.c`. One code per modifier because tsc's
+    /// message names it and a Diagnostic is a code plus a span.
+    public_not_on_module_element,
+    private_not_on_module_element,
+    protected_not_on_module_element,
+    static_not_on_module_element,
+    /// TS1024: `readonly` in the same position, which tsc words by where the
+    /// modifier DOES belong rather than by where it does not.
+    readonly_not_on_property,
+    /// TS1184: the same modifiers, but on a declaration whose statement list is
+    /// NOT a module body (a function body, a plain block, a method body) — tsc
+    /// stops naming the modifier there and blames the position instead.
+    modifiers_not_allowed_here,
     /// TS1274: an `in` variance annotation outside a class/interface/type
     /// alias type parameter (a function, method, or function/constructor type
     /// has no declaration-site variance).
@@ -143,6 +167,19 @@ pub const Code = enum(u16) {
     /// TS17007: the same grammar rule, reached through the angle-bracket type
     /// assertion `<T>x ** 2`, which tsc words differently.
     exp_lhs_type_assertion,
+
+    /// TS17019/TS17020: JSDoc's nullability markers written in a `.ts` file —
+    /// `T?`, `?T`, `T!`, `!T`. tsc's parser ACCEPTS all four (they build the
+    /// JSDoc type nodes) and its checker reports them, so the file's semantic
+    /// pass still runs; ztsc desugars them in the parser and reports here.
+    /// tsc's `{0}` is the corrected type, which a code-plus-span Diagnostic
+    /// cannot interpolate — the invariant sentence is what is reported, the
+    /// same policy the octal-literal and reserved-word messages follow. Four
+    /// codes for two tsc numbers because the message names the punctuation.
+    nullable_type_postfix,
+    nullable_type_prefix,
+    non_nullable_type_postfix,
+    non_nullable_type_prefix,
 
     // --- bind errors, tsc-compatible codes via tsCode() ---------------
     /// TS2300: two declarations of the same name that cannot merge
@@ -191,6 +228,17 @@ pub const Code = enum(u16) {
     enum_member_numeric_name,
     /// TS18024: `enum E { #x }` — a private identifier as an enum member name.
     enum_member_private_name,
+    /// TS18016: `#x` as an OBJECT-LITERAL property name (`{ #x: 1 }`) or a TYPE
+    /// member name (`interface I { #x: string }`) — the two property positions
+    /// that are never inside a class body. tsc's `checkGrammarObjectLiteral…`
+    /// and its type-member equivalent.
+    private_name_outside_class,
+    /// TS18029: `const #foo = 3` — a private identifier where a variable BINDING
+    /// name belongs. tsc's parser reports and then reads the token as the name
+    /// anyway (`createIdentifier`), which is why there is no cascade after it.
+    private_name_in_var_decl,
+    /// TS18009: `f(#foo: string)` — the same, in a PARAMETER list.
+    private_name_as_param,
 
     // --- strict-mode reserved words (tsc's binder, `checkStrictModeIdentifier`)
     /// TS1212: a future-reserved word (`yield`, `let`, `static`, `public`,
@@ -278,6 +326,13 @@ pub const Code = enum(u16) {
             .import_conflict,
             .catch_redeclare,
             .decorator_not_valid_here,
+            .label_not_allowed,
+            .public_not_on_module_element,
+            .private_not_on_module_element,
+            .protected_not_on_module_element,
+            .static_not_on_module_element,
+            .readonly_not_on_property,
+            .modifiers_not_allowed_here,
             .in_modifier_not_valid_here,
             .out_modifier_not_valid_here,
             .in_must_precede_out,
@@ -294,6 +349,7 @@ pub const Code = enum(u16) {
             .accessibility_modifier_already_seen,
             .enum_member_numeric_name,
             .enum_member_private_name,
+            .private_name_outside_class,
             .strict_reserved_word,
             .strict_reserved_word_in_class,
             .strict_reserved_word_in_module,
@@ -304,6 +360,13 @@ pub const Code = enum(u16) {
             .arguments_in_class,
             .eval_in_module,
             .arguments_in_module,
+            // `let a: string?` next to a sibling file's TS2322 lets the TS2322
+            // through, and `parseInvalidNullableTypes.ts` answers TS2322/TS2677
+            // alongside its own TS17019s — tsc's checker, not its parser.
+            .nullable_type_postfix,
+            .nullable_type_prefix,
+            .non_nullable_type_postfix,
+            .non_nullable_type_prefix,
             => .grammar,
 
             else => .syntactic,
@@ -332,11 +395,14 @@ pub const Code = enum(u16) {
             .octal_escape_not_allowed => "Octal escape sequences are not allowed.",
             .escape_sequence_not_allowed => "This escape sequence is not allowed.",
             .hex_digit_expected => "Hexadecimal digit expected.",
+            .digit_expected => "Digit expected.",
             .binary_digit_expected => "Binary digit expected.",
             .octal_digit_expected => "Octal digit expected.",
             .unicode_escape_out_of_range => "An extended Unicode escape value must be between 0x0 and 0x10FFFF inclusive.",
             .unterminated_unicode_escape => "Unterminated Unicode escape sequence.",
             .identifier_after_numeric_literal => "An identifier or keyword cannot immediately follow a numeric literal.",
+            .bigint_exponential => "A bigint literal cannot use exponential notation.",
+            .bigint_not_integer => "A bigint literal must be an integer.",
             .expected_expression => "Expression expected.",
             .expected_identifier => "Identifier expected.",
             .expected_semicolon => "';' expected.",
@@ -383,6 +449,9 @@ pub const Code = enum(u16) {
             .accessibility_modifier_already_seen => "Accessibility modifier already seen.",
             .enum_member_numeric_name => "An enum member cannot have a numeric name.",
             .enum_member_private_name => "An enum member cannot be named with a private identifier.",
+            .private_name_outside_class => "Private identifiers are not allowed outside class bodies.",
+            .private_name_in_var_decl => "Private identifiers are not allowed in variable declarations.",
+            .private_name_as_param => "Private identifiers cannot be used as parameters.",
             // tsc names the word (`'yield' is a reserved word...`); a Diagnostic
             // is a code plus a span, so the invariant sentence is reported.
             .strict_reserved_word => "Identifier expected. This is a reserved word in strict mode.",
@@ -395,6 +464,13 @@ pub const Code = enum(u16) {
             .eval_in_module => evalModuleMessage("eval"),
             .arguments_in_module => evalModuleMessage("arguments"),
             .decorator_not_valid_here => "Decorators are not valid here.",
+            .label_not_allowed => "A label is not allowed here.",
+            .public_not_on_module_element => moduleElementModifierMessage("public"),
+            .private_not_on_module_element => moduleElementModifierMessage("private"),
+            .protected_not_on_module_element => moduleElementModifierMessage("protected"),
+            .static_not_on_module_element => moduleElementModifierMessage("static"),
+            .readonly_not_on_property => "'readonly' modifier can only appear on a property declaration or index signature.",
+            .modifiers_not_allowed_here => "Modifiers cannot appear here.",
             .in_modifier_not_valid_here => "'in' modifier can only appear on a type parameter of a class, interface or type alias",
             .out_modifier_not_valid_here => "'out' modifier can only appear on a type parameter of a class, interface or type alias",
             .in_must_precede_out => "'in' modifier must precede 'out' modifier.",
@@ -408,6 +484,10 @@ pub const Code = enum(u16) {
             .exp_lhs_typeof => expLhsMessage("typeof"),
             .exp_lhs_await => expLhsMessage("await"),
             .exp_lhs_type_assertion => "A type assertion expression is not allowed in the left-hand side of an exponentiation expression. Consider enclosing the expression in parentheses.",
+            .nullable_type_postfix => jsdocMarkerMessage("?", "end"),
+            .nullable_type_prefix => jsdocMarkerMessage("?", "start"),
+            .non_nullable_type_postfix => jsdocMarkerMessage("!", "end"),
+            .non_nullable_type_prefix => jsdocMarkerMessage("!", "start"),
             .duplicate_identifier => "duplicate identifier",
             .block_scoped_redeclare => "cannot redeclare block-scoped variable",
             .enum_merge_conflict => "Enum declarations can only merge with namespace or other enum declarations.",
@@ -483,10 +563,13 @@ pub const Code = enum(u16) {
             .octal_escape_not_allowed => 1487,
             .escape_sequence_not_allowed => 1488,
             .hex_digit_expected => 1125,
+            .digit_expected => 1124,
             .binary_digit_expected => 1177,
             .octal_digit_expected => 1178,
             .unicode_escape_out_of_range => 1198,
             .identifier_after_numeric_literal => 1351,
+            .bigint_exponential => 1352,
+            .bigint_not_integer => 1353,
             .unterminated_unicode_escape => 1199,
             .nullish_mixed_with_logical => 5076,
             .tagged_template_in_optional_chain => 1358,
@@ -498,6 +581,9 @@ pub const Code = enum(u16) {
             .accessibility_modifier_already_seen => 1028,
             .enum_member_numeric_name => 2452,
             .enum_member_private_name => 18024,
+            .private_name_outside_class => 18016,
+            .private_name_in_var_decl => 18029,
+            .private_name_as_param => 18009,
             .strict_reserved_word => 1212,
             .strict_reserved_word_in_class => 1213,
             .strict_reserved_word_in_module => 1214,
@@ -515,6 +601,14 @@ pub const Code = enum(u16) {
             .import_conflict => 2440,
             .catch_redeclare => 2492,
             .decorator_not_valid_here => 1206,
+            .label_not_allowed => 1344,
+            .public_not_on_module_element,
+            .private_not_on_module_element,
+            .protected_not_on_module_element,
+            .static_not_on_module_element,
+            => 1044,
+            .readonly_not_on_property => 1024,
+            .modifiers_not_allowed_here => 1184,
             .in_modifier_not_valid_here, .out_modifier_not_valid_here => 1274,
             .in_must_precede_out => 1029,
             .const_modifier_not_valid_here => 1277,
@@ -528,6 +622,8 @@ pub const Code = enum(u16) {
             .exp_lhs_await,
             => 17006,
             .exp_lhs_type_assertion => 17007,
+            .nullable_type_postfix, .non_nullable_type_postfix => 17019,
+            .nullable_type_prefix, .non_nullable_type_prefix => 17020,
             else => 0,
         };
     }
@@ -548,6 +644,17 @@ fn evalClassMessage(comptime word: []const u8) []const u8 {
 
 fn evalModuleMessage(comptime word: []const u8) []const u8 {
     return "Invalid use of '" ++ word ++ "'. Modules are automatically in strict mode.";
+}
+
+/// TS17019/TS17020 differ only in the punctuation and in which end of the type
+/// it sat on, so the four arms share one comptime template.
+fn jsdocMarkerMessage(comptime mark: []const u8, comptime end: []const u8) []const u8 {
+    return "'" ++ mark ++ "' at the " ++ end ++ " of a type is not valid TypeScript syntax.";
+}
+
+/// TS1044's four modifiers share one sentence, differing only in the word.
+fn moduleElementModifierMessage(comptime word: []const u8) []const u8 {
+    return "'" ++ word ++ "' modifier cannot appear on a module or namespace element.";
 }
 
 fn expLhsMessage(comptime op: []const u8) []const u8 {

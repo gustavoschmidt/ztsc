@@ -219,10 +219,15 @@ fn jsxIntrinsicImplicitAny(c: *Checker, lt: TokenIndex) Error!void {
 }
 
 /// Whether a JSX tag node is an intrinsic element (simple lowercase-initial
-/// identifier). Uppercase or dotted names are component values.
+/// identifier). Uppercase or dotted names are component values — except a
+/// NAMESPACED name (`<A:foo>`), which tsc's `isJsxIntrinsicTagName` answers
+/// intrinsic whatever its case, because a JsxNamespacedName can never name a
+/// component value. The parser leaves the whole namespaced name in one
+/// `.jsx_name` token, so the `:` is what identifies it.
 pub fn isIntrinsicJsxTag(c: *Checker, tag: Node) bool {
     if (c.nodeTag(tag) != .identifier) return false;
     const text = c.tokenText(c.tree.nodeMainToken(tag));
+    if (std.mem.indexOfScalar(u8, text, ':') != null) return true;
     return text.len > 0 and text[0] >= 'a' and text[0] <= 'z';
 }
 
