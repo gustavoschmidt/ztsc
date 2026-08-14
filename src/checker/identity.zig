@@ -146,15 +146,37 @@ fn identicalAt(c: *Checker, a0: TypeId, b0: TypeId, depth: u32) Error!bool {
     };
 }
 
-/// Types this relation refuses to judge, because ztsc reaches them by giving
-/// up rather than by reading the program: `unknown` is what a failed inference
-/// leaves behind, `err` what a reported error leaves, `void` what an
-/// unresolved value declaration leaves, and a `class_value` is NOMINAL here so
-/// it never matches the structural type tsc calls identical to it.
+/// Types this relation refuses to judge, because ztsc reaches them by giving up
+/// rather than by reading the program:
+///
+///   * `unknown` is what a failed inference leaves behind, `err` what a reported
+///     error leaves, `void` what an unresolved value declaration leaves, and a
+///     `class_value` is NOMINAL here so it never matches the structural type tsc
+///     calls identical to it;
+///   * a polymorphic `this` is resolved to its home class in some positions and
+///     left standing in others, so `{ x: this }` and `{ x: MyClass }` are two
+///     spellings of one type that ztsc cannot line up
+///     (`thisInObjectLiterals.ts`);
+///   * a template-literal pattern and a string mapping have no pattern-to-pattern
+///     matcher here (the relation itself says so — see `isAssignableInner`'s
+///     `.template_literal_type` arm), so the reductions that make `'0' &
+///     \`${number}\`` just `'0'` and `` `${number}` | '0' `` just `` `${number}` ``
+///     do not happen and the two declarations look different
+///     (`templateLiteralTypesPatterns.ts`).
 fn undecidable(c: *const Checker, t: TypeId) bool {
     return switch (c.ts.kind(t)) {
-        .unknown, .void, .err, .class_value => true,
+        .unknown, .void, .err, .class_value, .this_type, .template_literal_type, .string_mapping => true,
         .array => undecidable(c, c.ts.arrayElem(t)),
+        // A union or intersection is refused when any CONSTITUENT is, because
+        // the reduction that would have removed it is the missing piece: `'0' &
+        // `${number}`` never collapses to `'0'`, so the pair does not even reach
+        // the same kind, let alone the same members.
+        .union_type, .intersection => blk: {
+            for (0..c.ts.memberCount(t)) |i| {
+                if (undecidable(c, c.ts.memberAt(t, i))) break :blk true;
+            }
+            break :blk false;
+        },
         else => false,
     };
 }
