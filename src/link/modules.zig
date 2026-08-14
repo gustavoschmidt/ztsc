@@ -51,9 +51,11 @@ const ast = @import("../frontend/ast.zig");
 const scanner = @import("../frontend/scanner.zig");
 const parser = @import("../frontend/parser.zig");
 const binder = @import("../frontend/binder.zig");
+const diagnostics = @import("../frontend/diagnostics.zig");
 const intern = @import("../intern.zig");
 const source = @import("../frontend/source.zig");
 const libs = @import("../libs.zig");
+const global_dup = @import("global_dup.zig");
 const paths = @import("paths.zig");
 const resolve = @import("resolve.zig");
 // Only for `Discovery.paths_map` (the tsconfig `paths` table). tsconfig.zig
@@ -361,7 +363,9 @@ pub fn link(
             .import_targets = try arena.dupe(Target, imports.targets),
             .export_atoms = atoms,
             .export_targets = etargets,
-            .diags = try arena.dupe(LinkDiag, l.diags[i].items),
+            // `.diags` is sealed AFTER the global merge below, which reports the
+            // cross-file duplicate declarations (global_dup.zig) into the same
+            // per-file lists.
         };
     }
 
@@ -369,7 +373,8 @@ pub fn link(
     // every file's harvest slice and every `declare module` augmentation of a
     // resolved real module. Needs the sealed export tables (`out`).
     const sym_base = try computeSymBase(arena, files);
-    const gm = try mergeGlobals(arena, scratch, files, sym_base, out, l.atom_export_equals);
+    const gm = try mergeGlobals(arena, scratch, files, sym_base, out, l.atom_export_equals, l.diags);
+    for (0..files.len) |i| out[i].diags = try arena.dupe(LinkDiag, l.diags[i].items);
 
     // Seal the ambient module export tables in registry order, so
     // `Target.ambient_ns` payloads (assigned from `getIndex`) address them.
@@ -521,7 +526,7 @@ pub fn singleWithLibProgram(
     // Unlinked single-file path: a script user file may still augment lib
     // globals; merge diagnostics (none for the clean case) have no link table
     // to land in here and are dropped.
-    const gm = try mergeGlobals(arena, arena, files, sym_base, &.{}, 0);
+    const gm = try mergeGlobals(arena, arena, files, sym_base, &.{}, 0, null);
     return .{ .files = files, .sym_base = sym_base, .globals = gm.globals, .merged = gm.merged, .constit_keys = gm.constit_keys, .constit_vals = gm.constit_vals };
 }
 
@@ -585,6 +590,133 @@ fn globalSymFlags(files: []const ProgFile, sym_base: []const u32, sym: u32) bind
     return files[f].bind.symbol_flags[sym - sym_base[f]];
 }
 
+/// One global name's contributors, checked for a merge tsc rejects and reported
+/// at every declaration of every contributor. The verdict and the reporting are
+/// global_dup.zig's; this is the bridge that turns program ids into the (flags,
+/// declarations) views it works on.
+fn reportGlobalDup(
+    arena: Allocator,
+    scratch: Allocator,
+    diags: []std.ArrayList(LinkDiag),
+    files: []const ProgFile,
+    sym_base: []const u32,
+    parts: []const u32,
+) Error!void {
+    if (parts.len < 2) return;
+    const flags = try scratch.alloc(binder.SymbolFlags, parts.len);
+    for (parts, 0..) |p, i| {
+        // A UMD global (`export as namespace React`) is harvested as the
+        // module's own `export =` entity, so its contributor is a TOP-LEVEL
+        // symbol of a MODULE file — no other global contributor can be that
+        // (a module offers only its `declare global` blocks, whose members
+        // live in a block scope). tsc publishes the UMD name as an ALIAS,
+        // whose excludes mask is `Alias` alone, so nothing in value space
+        // displaces it: `declare global { const React: … }` beside
+        // `export as namespace React` is legal, and comparing the namespace
+        // itself against the `const` would invent a TS2451.
+        const fid = fileOfGlobal(sym_base, files.len, p);
+        const b = files[fid].bind;
+        if (b.is_module and b.symbol_scopes[p - sym_base[fid]] == binder.file_scope) return;
+        flags[i] = globalSymFlags(files, sym_base, p);
+    }
+    const code = global_dup.mergeClash(flags) orelse {
+        // The name itself merges. When it merges as an INTERFACE, tsc goes on to
+        // merge the blocks' member tables, where a member-kind clash is its own
+        // duplicate — `interface TopLevel { duplicate1: () => string }` in one
+        // file beside `interface TopLevel { duplicate1(): number }` in another.
+        var folded: binder.SymbolFlags = .{};
+        for (flags) |f| folded = binder.SymbolFlags.merge(folded, f);
+        if (folded.interface) try reportMergedMemberDups(arena, scratch, diags, files, sym_base, parts);
+        return;
+    };
+    try reportContributors(arena, scratch, diags, files, sym_base, parts, code);
+}
+
+/// Report `code` at every declaration of every one of `parts`.
+fn reportContributors(
+    arena: Allocator,
+    scratch: Allocator,
+    diags: []std.ArrayList(LinkDiag),
+    files: []const ProgFile,
+    sym_base: []const u32,
+    parts: []const u32,
+    code: diagnostics.Code,
+) Error!void {
+    const contributors = try scratch.alloc(global_dup.Contributor, parts.len);
+    for (parts, 0..) |p, i| {
+        const fid = fileOfGlobal(sym_base, files.len, p);
+        const pf = &files[fid];
+        contributors[i] = .{
+            .file = fid,
+            .tree = pf.tree,
+            .src = pf.src,
+            .decls = pf.bind.declsOf(p - sym_base[fid]),
+        };
+    }
+    try global_dup.reportAll(arena, diags, contributors, code);
+}
+
+/// The same-named members contributed by the blocks of one cross-file merged
+/// interface, checked for a member-KIND clash (`global_dup.memberClash`).
+///
+/// Each contributor's member table is one atom-SORTED segment, so the names are
+/// walked by a k-way merge over the segments rather than gathered into a map: no
+/// allocation proportional to the member count, and a name declared by a single
+/// block is skipped after two comparisons. That matters because the lib's big
+/// merged interfaces (`Array`, `Window`) are exactly this shape and the walk
+/// runs in the serial linker.
+///
+/// Two blocks in the SAME file share one member table, so this only ever sees
+/// cross-FILE pairs; the binder already decided the within-file ones.
+fn reportMergedMemberDups(
+    arena: Allocator,
+    scratch: Allocator,
+    diags: []std.ArrayList(LinkDiag),
+    files: []const ProgFile,
+    sym_base: []const u32,
+    parts: []const u32,
+) Error!void {
+    const Seg = struct { file: FileId, atoms: []const Atom, syms: []const u32, at: usize = 0 };
+    const segs = try scratch.alloc(Seg, parts.len);
+    var n: usize = 0;
+    for (parts) |p| {
+        const fid = fileOfGlobal(sym_base, files.len, p);
+        const b = files[fid].bind;
+        const scope = b.membersScopeOf(p - sym_base[fid]) orelse continue;
+        const lo = b.scope_members_start[scope];
+        const hi = b.scope_members_start[scope + 1];
+        if (hi == lo) continue;
+        segs[n] = .{ .file = fid, .atoms = b.member_atoms[lo..hi], .syms = b.member_syms[lo..hi] };
+        n += 1;
+    }
+    if (n < 2) return;
+
+    const hits = try scratch.alloc(u32, n);
+    const hit_flags = try scratch.alloc(binder.SymbolFlags, n);
+    while (true) {
+        var min_atom: Atom = 0;
+        var live = false;
+        for (segs[0..n]) |*s| {
+            if (s.at == s.atoms.len) continue;
+            if (!live or s.atoms[s.at] < min_atom) min_atom = s.atoms[s.at];
+            live = true;
+        }
+        if (!live) return;
+        var k: usize = 0;
+        for (segs[0..n]) |*s| {
+            if (s.at == s.atoms.len or s.atoms[s.at] != min_atom) continue;
+            const local = s.syms[s.at];
+            hits[k] = sym_base[s.file] + local;
+            hit_flags[k] = files[s.file].bind.symbol_flags[local];
+            k += 1;
+            s.at += 1;
+        }
+        if (k < 2) continue;
+        const code = global_dup.memberClash(hit_flags[0..k]) orelse continue;
+        try reportContributors(arena, scratch, diags, files, sym_base, hits[0..k], code);
+    }
+}
+
 /// Fold every file's global-contribution slice (the binder harvest) into the
 /// program global table, in FileId order (deterministic by construction —
 /// the cross-file merge is a pure function of file order). The lib and script files
@@ -639,6 +771,10 @@ fn mergeGlobals(
     sym_base: []const u32,
     links: []const FileLinks,
     export_equals_atom: Atom,
+    /// Per-file diagnostic lists for the cross-file duplicate declarations the
+    /// merge finds (`global_dup.zig`), or null for a caller with no diagnostic
+    /// surface (`buildGlobals`, which builds a table for tests/tools).
+    dup_diags: ?[]std.ArrayList(LinkDiag),
 ) Error!GlobalMerge {
     // Accumulate name -> constituent global ids in the merge order
     // `eachGlobalDecl` documents.
@@ -672,8 +808,13 @@ fn mergeGlobals(
         const g_atoms = try arena.alloc(Atom, n);
         const g_syms = try arena.alloc(u32, n);
         for (names, 0..) |atom, i| {
+            const parts = acc.get(atom).?.items;
             g_atoms[i] = atom;
-            g_syms[i] = try m.mergeSet(acc.get(atom).?.items);
+            g_syms[i] = try m.mergeSet(parts);
+            // tsc's `mergeSymbol` reports the failed merge as it folds; the
+            // fold itself is unchanged (the merged symbol still carries the OR
+            // of every contributor's flags, so a duplicate name still resolves).
+            if (dup_diags) |ds| try reportGlobalDup(arena, scratch, ds, files, sym_base, parts);
         }
         globals = .{ .atoms = g_atoms, .syms = g_syms };
     }

@@ -1183,6 +1183,34 @@ pub const Ast = struct {
         }
     };
 
+    /// The identifier token a DECLARATION node names, or null when the node is
+    /// not a named declaration (or binds a destructuring pattern, which has no
+    /// single name token). This is where a diagnostic about "the declaration of
+    /// X" lands, and each declaration kind keeps its name in a different place
+    /// — an extra-data `name_token`, a name NODE in `lhs`, or `main_token`
+    /// itself — so the mapping belongs with the node shapes rather than being
+    /// re-derived by every consumer.
+    pub fn declNameToken(a: *const Ast, node: Node) ?TokenIndex {
+        const d = a.nodeData(node);
+        const tok: TokenIndex = switch (a.nodeTag(node)) {
+            .class_decl => a.extraData(ClassData, d.lhs).name_token,
+            .interface_decl => a.extraData(InterfaceData, d.lhs).name_token,
+            .type_alias => a.extraData(TypeAlias, d.lhs).name_token,
+            .enum_decl => a.extraData(EnumData, d.lhs).name_token,
+            .namespace_decl => a.extraData(NamespaceData, d.lhs).name_token,
+            .function_decl, .class_method, .method_signature => a.extraData(FnProto, d.lhs).name_token,
+            .import_equals => a.extraData(ImportEquals, d.lhs).name_token,
+            .enum_member, .type_param, .property_signature, .class_field => a.nodeMainToken(node),
+            // A name NODE: an identifier (reportable) or a binding pattern (not).
+            .declarator, .declarator_init, .declarator_full, .param, .param_full => {
+                if (d.lhs == null_node or a.nodeTag(d.lhs) != .identifier) return null;
+                return a.nodeMainToken(d.lhs);
+            },
+            else => return null,
+        };
+        return if (tok == 0) null else tok;
+    }
+
     const TokenList = struct {
         buf: [3]TokenIndex = undefined,
         len: u8 = 0,

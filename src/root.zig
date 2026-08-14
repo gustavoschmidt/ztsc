@@ -23,6 +23,7 @@ pub const libs = @import("libs.zig");
 pub const paths = @import("link/paths.zig");
 pub const resolve = @import("link/resolve.zig");
 pub const modules = @import("link/modules.zig");
+pub const global_dup = @import("link/global_dup.zig");
 pub const checker = @import("checker.zig");
 pub const driver = @import("driver.zig");
 pub const schedule = @import("schedule.zig");
@@ -50,6 +51,7 @@ test {
     _ = paths;
     _ = resolve;
     _ = modules;
+    _ = global_dup;
     _ = checker;
     _ = driver;
     _ = schedule;

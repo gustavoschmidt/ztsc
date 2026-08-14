@@ -41,8 +41,9 @@
 //!     defaulting to `true` (the bundler value — they do NOT follow the ignored
 //!     `moduleResolution`). `resolvePackageJsonExports: false` makes module
 //!     resolution ignore every dependency's `"exports"` map, falling back to the
-//!     legacy `"types"`/`"typings"`/`"main"`/`index` path; the `"imports"` map is
-//!     not implemented at all, so its flag only records the option.
+//!     legacy `"types"`/`"typings"`/`"main"`/`index` path;
+//!     `resolvePackageJsonImports: false` makes a `#`-prefixed specifier
+//!     unresolvable (there is no `node_modules` fallback for one).
 //!   - `baseUrl` + `paths`: minimal support — exact keys and single-`*`
 //!     patterns mapped to relative directories; feeds module resolution
 //!     (tsc rule: exact match wins, else the pattern with the longest
@@ -179,7 +180,7 @@ fn loadInDir(io: Io, arena: Allocator, base: Io.Dir, config_path: []const u8) Lo
         try cx.note("'resolvePackageJsonExports' is off: 'package.json' \"exports\" maps are ignored entirely — every specifier resolves through the legacy \"types\"/\"typings\"/\"main\"/index path, and a subpath a map does not name is no longer blocked", .{});
     }
     if (!cfg.resolve_pkg_json_imports) {
-        try cx.note("'resolvePackageJsonImports' is off: 'package.json' \"imports\" maps are ignored (ztsc never reads them, so this is already its behavior)", .{});
+        try cx.note("'resolvePackageJsonImports' is off: 'package.json' \"imports\" maps are ignored, so every '#'-prefixed specifier stays unresolved", .{});
     }
     // Effective allowSyntheticDefaultImports = explicit value ?? esModuleInterop
     // ?? (module is system || moduleResolution is bundler). ztsc always resolves
@@ -427,9 +428,8 @@ pub const Config = struct {
     /// the declarations their own `"types"` key points at.
     resolve_pkg_json_exports: bool = true,
     /// `compilerOptions.resolvePackageJsonImports`: when false, a `#`-prefixed
-    /// specifier ignores the importing package's `"imports"` map. Default true.
-    /// ztsc does not implement that map at all, so the option is recorded and
-    /// carried to the resolver but changes nothing today.
+    /// specifier ignores the importing package's `"imports"` map, leaving it
+    /// unresolved (a `#` name is never a `node_modules` directory). Default true.
     resolve_pkg_json_imports: bool = true,
     /// `compilerOptions.noUncheckedSideEffectImports` (TS 5.6+). tsc's default is
     /// OFF: a side-effect-only `import "m"` whose specifier resolves to nothing

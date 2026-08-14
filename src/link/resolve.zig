@@ -349,11 +349,21 @@ pub const ResolveCache = struct {
 
     /// The realpath of `dir` (cached, arena-owned) for re-relativizing canonical
     /// paths, or null if the OS call failed (then canonical paths stay absolute).
+    ///
+    /// `Dir.realPath` fcntls the directory HANDLE, and the CLI's base directory
+    /// is `Io.Dir.cwd()`, whose handle is the sentinel `AT.FDCWD` — not a real
+    /// descriptor, so the fcntl fails with EBADF and every canonicalized
+    /// `node_modules` path used to stay absolute for the whole (normal) run.
+    /// `realPathFile(".")` answers for both shapes: libc `realpath` for the
+    /// cwd sentinel, `openat`+fcntl for a real handle. `realPath` is still
+    /// tried first — it is one syscall and needs no path buffer.
     fn dirRealBase(rc: *ResolveCache, io: Io, dir: Io.Dir) ?[]const u8 {
         if (!rc.real_base_done) {
             rc.real_base_done = true;
             var buf: [std.fs.max_path_bytes]u8 = undefined;
             if (dir.realPath(io, &buf)) |n| {
+                rc.real_base = rc.arena.dupe(u8, buf[0..n]) catch null;
+            } else |_| if (dir.realPathFile(io, ".", &buf)) |n| {
                 rc.real_base = rc.arena.dupe(u8, buf[0..n]) catch null;
             } else |_| {}
         }
@@ -755,14 +765,13 @@ pub const ResolveOpts = struct {
     resolve_pkg_json_exports: bool = true,
     /// tsconfig `resolvePackageJsonImports`. When false, a `#`-prefixed
     /// ("private imports") specifier ignores the importing package's
-    /// `package.json` `"imports"` map.
+    /// `package.json` `"imports"` map and stays unresolved — a `#` name can
+    /// never be a `node_modules` directory, so there is no fallback.
     ///
-    /// ztsc does not implement the `"imports"` map at all — a `#foo` specifier
-    /// is resolved as an ordinary bare specifier, finds no `node_modules/#foo`,
-    /// and stays unresolved — so `false` is already the behavior and this field
-    /// only records the option (accepted, not silently mis-parsed) and marks the
-    /// gate for whenever the map is implemented. Same default reasoning as
-    /// `resolve_pkg_json_exports`.
+    /// Same default reasoning as `resolve_pkg_json_exports`. See
+    /// `resolveImportsSpecifier` for what the map supports (package-relative
+    /// targets, conditions, wildcards) and what it does not (a target that
+    /// names another package by name).
     resolve_pkg_json_imports: bool = true,
     /// tsconfig `moduleSuffixes` (TS 4.7), in the configured order. Every
     /// candidate file name is probed once per suffix, the suffix inserted
@@ -991,15 +1000,20 @@ fn statExportTarget(
         cands[0] = p;
         n = 1;
     } else if (std.mem.endsWith(u8, p, ".mjs")) {
+        // `.mts` closes the same gap the `.js` arm's `.ts` closes: a target
+        // naming the EMITTED file in a project that is itself TypeScript, where
+        // no `.d.mts` was emitted and the source is what exists.
         const base = p[0 .. p.len - ".mjs".len];
         cands[0] = try std.fmt.allocPrint(alloc, "{s}.d.mts", .{base});
         cands[1] = try std.fmt.allocPrint(alloc, "{s}.d.ts", .{base});
-        n = 2;
+        cands[2] = try std.fmt.allocPrint(alloc, "{s}.mts", .{base});
+        n = 3;
     } else if (std.mem.endsWith(u8, p, ".cjs")) {
         const base = p[0 .. p.len - ".cjs".len];
         cands[0] = try std.fmt.allocPrint(alloc, "{s}.d.cts", .{base});
         cands[1] = try std.fmt.allocPrint(alloc, "{s}.d.ts", .{base});
-        n = 2;
+        cands[2] = try std.fmt.allocPrint(alloc, "{s}.cts", .{base});
+        n = 3;
     } else if (endsWithAny(p, &.{ ".js", ".jsx" })) {
         const base = p[0..std.mem.lastIndexOfScalar(u8, p, '.').?];
         cands[0] = try std.fmt.allocPrint(alloc, "{s}.d.ts", .{base});
@@ -1156,6 +1170,100 @@ fn packageHasExports(f: Fs, alloc: Allocator, nm: []const u8) Error!bool {
     const pj = (try f.packageJson(alloc, pj_path)) orelse return false;
     defer pj.deinit(alloc);
     return (try f.exports(alloc, pj)) != null;
+}
+
+// ---------------------------------------------------------------------------
+// the importing package's own `package.json`: `imports` map + self-reference
+// ---------------------------------------------------------------------------
+
+/// The package a file belongs to: the directory of the nearest `package.json`
+/// at or above `dir`, together with that body. tsc's `getPackageScopeForPath`.
+/// `node_modules` is not skipped — a dependency's own files self-reference and
+/// use `#imports` through the dependency's `package.json`, not the project's.
+const PackageScope = struct { dir: []const u8, pj: PkgJson };
+
+fn packageScope(f: Fs, alloc: Allocator, dir: []const u8) Error!?PackageScope {
+    var d = dir;
+    while (true) {
+        const pj_path = if (d.len == 0)
+            try alloc.dupe(u8, "package.json")
+        else
+            try std.fmt.allocPrint(alloc, "{s}/package.json", .{d});
+        if (try f.packageJson(alloc, pj_path)) |pj| return .{ .dir = d, .pj = pj };
+        // `pj_path` is not freed on a miss: the memoized leg keys the negative
+        // answer on it, so the string has to stay valid for the scratch's life.
+        if (d.len == 0 or std.mem.eql(u8, d, "/") or std.mem.eql(u8, d, ".")) return null;
+        d = dirnamePart(d);
+    }
+}
+
+/// Both declaration and JavaScript passes over the importing package's own
+/// `exports` value — the two-phase order `resolvePackage` walks for a
+/// `node_modules` package, collapsed to a single package (there is no walk
+/// here: the scope is the importer's own package and nothing else can answer).
+fn resolveOwnExports(
+    f: Fs,
+    alloc: Allocator,
+    pkg_dir: []const u8,
+    map: tsconfig.Value,
+    subpath: []const u8,
+) Error!?[]u8 {
+    if (try resolveExportsField(f, alloc, pkg_dir, map, subpath, .declarations)) |p| return p;
+    return resolveExportsField(f, alloc, pkg_dir, map, subpath, .javascript);
+}
+
+/// The same two passes over an `imports` map. It goes to `resolveExportsSubpath`
+/// and not to `resolveExportsField`: an `imports` map is ALWAYS a subpath map,
+/// whose keys start with `#` rather than `.`, so the `exports` sugar forms (a
+/// bare target string, a bare conditions object — both meaning ".") do not
+/// apply and the "is this a subpath map" test would reject it.
+fn resolveOwnImports(
+    f: Fs,
+    alloc: Allocator,
+    pkg_dir: []const u8,
+    obj: tsconfig.Value.Object,
+    spec: []const u8,
+) Error!?[]u8 {
+    if (try resolveExportsSubpath(f, alloc, pkg_dir, obj, spec, .declarations)) |p| return p;
+    return resolveExportsSubpath(f, alloc, pkg_dir, obj, spec, .javascript);
+}
+
+/// A `#specifier` — Node's "private imports" — resolved through the
+/// `"imports"` map of the importing file's own package. tsc's
+/// `loadModuleFromImports`: the key space is the raw specifier (`#cjs`,
+/// `#/*`), matched by the same exact-then-longest-wildcard rule as `exports`,
+/// and only the importer's OWN package answers (no `node_modules` walk).
+///
+/// A target that is not package-relative (`"#dep": "some-package"`, which Node
+/// re-resolves as a bare specifier) is rejected by `statExportTarget` and left
+/// unresolved — a documented under-implementation, not a wrong answer.
+fn resolveImportsSpecifier(f: Fs, alloc: Allocator, importer_dir: []const u8, spec: []const u8) Error!?[]u8 {
+    const scope = (try packageScope(f, alloc, importer_dir)) orelse return null;
+    defer scope.pj.deinit(alloc);
+    const map = pkgjson.importsOf(alloc, scope.pj.text) orelse return null;
+    if (map != .object) return null;
+    return resolveOwnImports(f, alloc, scope.dir, map.object, spec);
+}
+
+/// A package importing ITSELF by the name it publishes — Node's
+/// "self-reference", tsc's `loadModuleFromSelfNameReference`. `import
+/// "package/cjs"` inside the package whose `package.json` says `"name":
+/// "package"` resolves `./cjs` against that package's own `exports` map, with
+/// no `node_modules` directory involved. Requires an `exports` map, as Node
+/// does: without one a package is not self-referenceable.
+fn resolveSelfName(f: Fs, alloc: Allocator, importer_dir: []const u8, spec: []const u8) Error!?[]u8 {
+    const scope = (try packageScope(f, alloc, importer_dir)) orelse return null;
+    defer scope.pj.deinit(alloc);
+    const name = pkgjson.packageNameField(scope.pj.text) orelse return null;
+    if (name.len == 0 or !std.mem.startsWith(u8, spec, name)) return null;
+    // Whole-segment match only: `packagex` must not match `"name": "package"`.
+    if (spec.len != name.len and spec[name.len] != '/') return null;
+    const exports_val = (try f.exports(alloc, scope.pj)) orelse return null;
+    const subpath: []const u8 = if (spec.len == name.len)
+        "."
+    else
+        try std.fmt.allocPrint(alloc, "./{s}", .{spec[name.len + 1 ..]});
+    return resolveOwnExports(f, alloc, scope.dir, exports_val, subpath);
 }
 
 /// Resolve a bare (package) specifier by walking `node_modules` up from
@@ -1639,6 +1747,14 @@ fn resolveSpecifierFs(
         if (is_json) return resolveJsonFileFs(f, alloc, stem);
         return resolveStemOrJs(f, alloc, stem, f.opts.allow_js);
     }
+    // A `#`-prefixed specifier is NEVER a package: it names an entry in the
+    // importing package's own `"imports"` map and nothing else (tsc's
+    // `loadModuleFromImports` runs before the `node_modules` walk and a `#`
+    // name can never appear in one).
+    if (spec[0] == '#') {
+        if (!f.opts.resolve_pkg_json_imports) return null;
+        return resolveImportsSpecifier(f, alloc, importer_dir, spec);
+    }
     // A bare `*.json` specifier resolves against `baseUrl` first (tsc's baseUrl
     // rule; the `public/api/x.json` shape), then through the `node_modules` walk
     // like any other bare specifier.
@@ -1659,7 +1775,17 @@ fn resolveSpecifierFs(
         defer alloc.free(stem);
         if (try resolveStemOrJs(f, alloc, stem, f.opts.allow_js)) |p| return p;
     }
-    return resolvePackage(f, alloc, importer_dir, spec, f.opts.allow_js, f.opts.resolve_pkg_json_exports);
+    if (try resolvePackage(f, alloc, importer_dir, spec, f.opts.allow_js, f.opts.resolve_pkg_json_exports)) |p| return p;
+    // Self-reference last. tsc tries it BEFORE the `node_modules` walk, which
+    // differs only when a dependency is installed under the importing package's
+    // own name — and running it as a recovery path instead keeps it off the hot
+    // path entirely: a specifier that resolves normally never reads the
+    // importer's `package.json` at all, and only an otherwise-unresolvable
+    // specifier pays the walk up to the package scope.
+    if (f.opts.resolve_pkg_json_exports) {
+        if (try resolveSelfName(f, alloc, importer_dir, spec)) |p| return p;
+    }
+    return null;
 }
 
 // -------------------------------------------------------------------------
@@ -2453,6 +2579,70 @@ test "resolveSpecifier: resolvePackageJsonExports gates the exports map" {
     try testing.expectEqualStrings(
         "node_modules/mapped/index.d.ts",
         (try resolveSpecifier(io, alloc, d, "src/a.ts", "mapped", off)).?,
+    );
+}
+
+// The importing package's OWN `package.json`: the `"imports"` map a
+// `#specifier` names, and the self-reference by the package's own `"name"`.
+// Shapes taken from the TypeScript suite's `nodeModulesPackageImports` /
+// `nodeModulesPackageExports` / `nodePackageSelfName` cases, whose targets name
+// the EMITTED `.js`/`.mjs`/`.cjs` while only the TypeScript source exists.
+test "resolveSpecifier: package.json imports map and self-reference" {
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const d = tmp.dir;
+    try d.createDirPath(io, "src/deep");
+    try d.writeFile(io, .{ .sub_path = "package.json", .data =
+        \\{ "name": "@scope/pkg", "type": "module",
+        \\  "exports": { ".": "./index.js", "./cjs": "./index.cjs", "./sub/*": "./src/*.js" },
+        \\  "imports": { "#cjs": "./index.cjs", "#mjs": "./index.mjs", "#/*": "./src/*" } }
+    });
+    try d.writeFile(io, .{ .sub_path = "index.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "index.cts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "index.mts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "src/foo.ts", .data = "" });
+    try d.writeFile(io, .{ .sub_path = "src/deep/bar.ts", .data = "" });
+
+    const cases = [_]struct { spec: []const u8, want: ?[]const u8 }{
+        // `imports`: exact keys, and the `.cjs`/`.mjs` targets reaching their
+        // TypeScript source when no declaration file was emitted.
+        .{ .spec = "#cjs", .want = "index.cts" },
+        .{ .spec = "#mjs", .want = "index.mts" },
+        // A wildcard key, including a capture with its own directories.
+        .{ .spec = "#/foo.ts", .want = "src/foo.ts" },
+        .{ .spec = "#/deep/bar.ts", .want = "src/deep/bar.ts" },
+        // An unnamed private import stays unresolved (no node_modules fallback).
+        .{ .spec = "#nope", .want = null },
+        // Self-reference: the package root, an exact subpath, and a wildcard.
+        .{ .spec = "@scope/pkg", .want = "index.ts" },
+        .{ .spec = "@scope/pkg/cjs", .want = "index.cts" },
+        .{ .spec = "@scope/pkg/sub/foo", .want = "src/foo.ts" },
+        // A subpath the map does not name, and a name that only PREFIXES the
+        // package name, are not self-references.
+        .{ .spec = "@scope/pkg/nope", .want = null },
+        .{ .spec = "@scope/pkgx", .want = null },
+    };
+    for (cases) |c| {
+        const got = try resolveSpecifier(io, alloc, d, "src/deep/bar.ts", c.spec, .{});
+        if (c.want) |w| {
+            try testing.expect(got != null);
+            try testing.expectEqualStrings(w, got.?);
+        } else {
+            try testing.expectEqual(@as(?[]u8, null), got);
+        }
+    }
+    // Both features are gated by their own option.
+    try testing.expectEqual(
+        @as(?[]u8, null),
+        try resolveSpecifier(io, alloc, d, "src/deep/bar.ts", "#cjs", .{ .resolve_pkg_json_imports = false }),
+    );
+    try testing.expectEqual(
+        @as(?[]u8, null),
+        try resolveSpecifier(io, alloc, d, "src/deep/bar.ts", "@scope/pkg/cjs", .{ .resolve_pkg_json_exports = false }),
     );
 }
 

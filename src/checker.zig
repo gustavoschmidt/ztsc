@@ -3248,6 +3248,7 @@ pub const Checker = struct {
 
     const redeclare_zig = @import("checker/redeclare.zig");
     pub const checkSubsequentVarDecl = redeclare_zig.checkSubsequentVarDecl;
+    pub const checkTypeParamListsIdentical = redeclare_zig.checkTypeParamListsIdentical;
     pub const setTypeOfSymbol = signatures_zig.setTypeOfSymbol;
     pub const dropSpeculativeSymTypes = signatures_zig.dropSpeculativeSymTypes;
     pub const appendOverloadCandidates = signatures_zig.appendOverloadCandidates;
