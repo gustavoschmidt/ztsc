@@ -1497,6 +1497,9 @@ pub fn checkClass(c: *Checker, node: Node) Error!void {
         // …and a member declared twice with two different types is TS2717 at
         // the later declaration.
         try c.checkSubsequentMemberDecls(class_sym, node);
+        // …and a PRIVATE name shared by the static and the instance side is
+        // TS2804 at every one of its declarations.
+        try c.checkPrivateNameStaticDups(class_sym, node);
     }
 
     // Class-position decorators (`@deco class C {}`): evaluated in the
