@@ -147,7 +147,10 @@ pub fn reduceMapped(c: *Checker, key_param: TypeId, constraint: TypeId, value: T
 }
 
 pub fn applyPropModifiers(base: u32, flags: u32) u32 {
-    var f = base;
+    // tsc's `resolveMappedTypeMembers` makes a fresh `SymbolFlags.Property`
+    // symbol per key, so a mapped type's members are all spreadable even where
+    // the source's were class-declared methods (`prop_flag_class_fn`).
+    var f = base & ~types.prop_flag_class_fn;
     if (flags & types.mapped_flag_readonly_add != 0) f |= types.prop_flag_readonly;
     if (flags & types.mapped_flag_readonly_remove != 0) f &= ~types.prop_flag_readonly;
     if (flags & types.mapped_flag_optional_add != 0) f |= types.prop_flag_optional;

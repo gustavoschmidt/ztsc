@@ -247,7 +247,8 @@ pub fn findBindingType(c: *Checker, pat: Node, name: Atom, whole: TypeId, bf: ?B
 
 /// Object binding-pattern rest type: `whole` with every key named by a
 /// sibling `binding_property` in `pat` removed (tsc's `{a, ...rest}` →
-/// `rest = Omit<whole, "a">`). Objects and intersections of objects are
+/// `rest = Omit<whole, "a">`), and every UNSPREADABLE member dropped as well
+/// (`types.Prop.spreadable`). Objects and intersections of objects are
 /// filtered (index signatures preserved); anything else (unions, generics,
 /// `any`) falls back to `whole` unchanged — lenient, matching how the rest
 /// of the checker treats non-enumerable shapes.
@@ -283,6 +284,12 @@ pub fn objectRestType(c: *Checker, whole: TypeId, pat: Node) Error!TypeId {
         for (0..c.ts.objectPropCount(rm)) |i| {
             const p = c.ts.objectProp(rm, @intCast(i));
             if (containsAtom(excluded.items, p.name)) continue;
+            // tsc's `getRestType` copies only SPREADABLE members: a
+            // `private`/`protected` field and a class-declared method or
+            // accessor both stay behind (the latter lives on the prototype).
+            // Reading one off the rest object is TS2339 —
+            // `destructuringUnspreadableIntoRest`.
+            if (!p.spreadable()) continue;
             var replaced = false;
             for (props.items) |*existing| {
                 if (existing.name == p.name) {

@@ -1124,6 +1124,11 @@ pub fn gatherSpreadProps(
             if (c.ts.objectNumberIndex(st) != 0) try num_index_vals.append(c.scratch(), c.ts.objectNumberIndex(st));
             for (0..c.ts.objectPropCount(st)) |i| {
                 const p = c.ts.objectProp(st, @intCast(i));
+                // tsc's `getSpreadType` copies only SPREADABLE members: a
+                // `private`/`protected` field and a class-declared method or
+                // accessor stay behind, exactly as they do for a destructuring
+                // rest (`types.Prop.spreadable`, `objectRestType`).
+                if (!p.spreadable()) continue;
                 // tsc's `getSpreadType`: when a property is present in both
                 // the accumulated left (`{ a, b, ... }`) and this spread and
                 // the spread's property is OPTIONAL, the result keeps the
