@@ -71,6 +71,77 @@ pub fn checkTruthiness(c: *Checker, node: Node, ty: types.TypeId) Error!void {
     }
 }
 
+/// TS2774 "This condition will always return true since this function is always
+/// defined. Did you mean to call it instead?" — tsc's
+/// `checkTestingKnownTruthyCallableOrAwaitableOrEnumMemberType`, for the one
+/// shape of it that needs no ancestry: the condition IS a plain reference to
+/// something function-typed and non-nullable.
+///
+/// tsc's own version walks the `||`/`??` spine of the condition and each
+/// `&&`/`||` operand, and lets the reference off whenever the same symbol is
+/// used again anywhere in the surrounding binary chain (`isSymbolUsedIn
+/// BinaryExpressionChain`) — `f && f()` is the idiom the escape exists for.
+/// Reproducing that needs the chain ABOVE the operand being judged, which ztsc
+/// (parent-pointer-free) does not have at the point it checks one, so this
+/// implements only the operator-free case and leaves every logical-chain
+/// condition to report nothing. Under-reports; never invents.
+///
+/// `body` is the statement or expression the condition guards; a reference to
+/// the same name inside it is tsc's `isSymbolUsedInConditionBody` escape, and it
+/// is compared by NAME rather than by symbol — a superset of tsc's escape, which
+/// again only ever suppresses.
+pub fn checkUncalledFunction(c: *Checker, node: Node, ty: types.TypeId, body: Node) Error!void {
+    if (node == null_node) return;
+    var loc = node;
+    while (c.nodeTag(loc) == .paren_expr) {
+        const inner = c.tree.nodeData(loc).lhs;
+        if (inner == null_node) return;
+        loc = inner;
+    }
+    const name_tok = switch (c.nodeTag(loc)) {
+        .identifier => c.tree.nodeMainToken(loc),
+        .member_expr => c.tree.nodeData(loc).rhs,
+        else => return,
+    };
+    if (!try isAlwaysDefinedFunction(c, ty)) return;
+    if (nameOccursIn(c, body, c.tokenText(name_tok))) return;
+    try c.diagFmt(2774, c.nodeSpan(loc), "This condition will always return true since this function is always defined. Did you mean to call it instead?", .{});
+}
+
+/// tsc's two conditions on the tested type: it is truthy for certain
+/// (`getTypeFacts(type, Truthy)`, so an optional `(() => void) | undefined` is
+/// out) and it has at least one CALL signature. The promise arm (TS2801) is not
+/// implemented.
+fn isAlwaysDefinedFunction(c: *Checker, ty: types.TypeId) Error!bool {
+    if (ty == types.no_type or ty == types.error_type) return false;
+    if (try c.canBeFalsy(ty, 0)) return false;
+    const r = try c.resolveStructural(ty);
+    return switch (c.ts.kind(r)) {
+        .function, .overloads => true,
+        .object => c.ts.objectCallSigCount(r) > 0,
+        else => false,
+    };
+}
+
+/// Does the identifier (or member name) `text` appear anywhere in `node`?
+fn nameOccursIn(c: *Checker, node: Node, text: []const u8) bool {
+    if (node == null_node) return false;
+    switch (c.nodeTag(node)) {
+        .identifier => {
+            if (std.mem.eql(u8, c.tokenText(c.tree.nodeMainToken(node)), text)) return true;
+        },
+        .member_expr, .optional_member_expr => {
+            if (std.mem.eql(u8, c.tokenText(c.tree.nodeData(node).rhs), text)) return true;
+        },
+        else => {},
+    }
+    var it = c.tree.childIterator(node);
+    while (it.next()) |child| {
+        if (nameOccursIn(c, child, text)) return true;
+    }
+    return false;
+}
+
 /// `&&` / `||` / `??`, through parentheses.
 fn isLogicalBinary(c: *Checker, node0: Node) bool {
     var node = node0;

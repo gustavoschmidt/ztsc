@@ -266,6 +266,7 @@ fn checkExpr(c: *Checker, node: Node, ctx: TypeId) Error!TypeId {
             const e = c.tree.extraData(ast.CondExpr, d.rhs);
             const cond_t = try c.checkExprCached(d.lhs, types.no_type);
             try conditions.checkTruthiness(c, d.lhs, cond_t);
+            try conditions.checkUncalledFunction(c, d.lhs, cond_t, e.then_expr);
             const then_t = try c.checkExprCached(e.then_expr, ctx);
             const else_t = try c.checkExprCached(e.else_expr, ctx);
             // The arms are subtype-reduced, exactly as `||`/`??` are

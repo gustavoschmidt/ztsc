@@ -88,24 +88,28 @@ pub fn checkStatement(c: *Checker, node: Node) Error!void {
         .if_stmt => {
             const cond_t = try c.checkExprCached(d.lhs, types.no_type);
             try conditions.checkTruthiness(c, d.lhs, cond_t);
+            try conditions.checkUncalledFunction(c, d.lhs, cond_t, d.rhs);
             try c.checkStatement(d.rhs);
         },
         .if_else_stmt => {
             const e = c.tree.extraData(ast.IfElse, d.rhs);
             const cond_t = try c.checkExprCached(d.lhs, types.no_type);
             try conditions.checkTruthiness(c, d.lhs, cond_t);
+            try conditions.checkUncalledFunction(c, d.lhs, cond_t, e.then_stmt);
             try c.checkStatement(e.then_stmt);
             try c.checkStatement(e.else_stmt);
         },
         .while_stmt => {
             const cond_t = try c.checkExprCached(d.lhs, types.no_type);
             try conditions.checkTruthiness(c, d.lhs, cond_t);
+            try conditions.checkUncalledFunction(c, d.lhs, cond_t, d.rhs);
             try c.checkStatement(d.rhs);
         },
         .do_stmt => {
             try c.checkStatement(d.lhs);
             const cond_t = try c.checkExprCached(d.rhs, types.no_type);
             try conditions.checkTruthiness(c, d.rhs, cond_t);
+            try conditions.checkUncalledFunction(c, d.rhs, cond_t, d.lhs);
         },
         .for_stmt => {
             const e = c.tree.extraData(ast.For, d.lhs);
@@ -121,6 +125,7 @@ pub fn checkStatement(c: *Checker, node: Node) Error!void {
             if (e.cond != 0) {
                 const cond_t = try c.checkExprCached(e.cond, types.no_type);
                 try conditions.checkTruthiness(c, e.cond, cond_t);
+                try conditions.checkUncalledFunction(c, e.cond, cond_t, d.rhs);
             }
             if (e.update != 0) _ = try c.checkExprCached(e.update, types.no_type);
             try c.checkStatement(d.rhs);
