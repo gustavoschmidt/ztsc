@@ -1292,6 +1292,14 @@ const Parser = struct {
         return switch (p.peekTag(n + 1)) {
             .keyword_global => .ambient_module_not_at_top_level,
             .keyword_namespace, .keyword_module => p.namespaceElementCode(n + 1),
+            // `declare export function f() {}` — the TS1029 modifier order, which
+            // is still one modifier list on one declaration. `startsDeclarationAt`
+            // deliberately omits `export` (it is a modifier, not a declaration
+            // keyword), so the two module-element forms behind it are named here.
+            .keyword_export => switch (p.peekTag(n + 2)) {
+                .keyword_namespace, .keyword_module => p.namespaceElementCode(n + 2),
+                else => .modifiers_not_allowed_here,
+            },
             else => if (p.startsDeclarationAt(n + 1)) .modifiers_not_allowed_here else null,
         };
     }
